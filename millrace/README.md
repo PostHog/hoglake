@@ -92,12 +92,9 @@ incarnation halt, and a compaction observation. Code-level map:
 
 ## Staging format
 
-The staging keyspace is keyed by the destination's partition tuple
-(prepared envelope v5); it shares no key or value shape with the
-#331-era team-keyed layout. millrace requires a FRESH staging root — a
-new `MILLRACE_STAGE_URL` prefix. There is no code guard: pointed at an
-old root it fails at open or at the first sweep with the `ValueError`
-from `keyspace.decode_prepared_value` / `decode_stats_key`.
+The staging keyspace shares no key or value shape with the #331-era
+team-keyed layout, so millrace needs a fresh staging root (a new
+`MILLRACE_STAGE_URL` prefix).
 
 ## Rollouts and fencing (static assignment)
 

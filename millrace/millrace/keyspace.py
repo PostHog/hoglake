@@ -65,19 +65,22 @@ Value formats
 
 - ``stats``:   version(1) staged_bytes(u64) first_staged_ts(i64)
                last_staged_ts(i64) row_count(u64) — 33 bytes fixed.
-- ``prepared``: version(5) key_len(u16) idempotency_key(utf8)
+- ``prepared``: version(6) key_len(u16) idempotency_key(utf8)
                topic_len(u16) topic(utf8) partition(u32)
                arity(u8), then per partition field name_len(u16)
                name(utf8) tag(u8) [value_len(u16) value(utf8)]
                body_len(u32) body(bytes) persisted_at(u64, micros since
-               the Unix epoch) row_count(u64). The body is the
+               the Unix epoch) row_count(u64) digest(32 bytes). The body is the
                byte-exact prepared commit request, written once and
                replayed byte-identically after an ambiguous response.
                ``row_count`` is the number of staged rows the request's
                window held when it was built — the settlement guard's
                expected count at every recovery settle (a window that
                holds a different count by then is not the window the
-               commit published).
+               commit published). ``digest`` is the window's
+               :func:`content_digest` (the raw 32 bytes; hex in the
+               dataclass), the content the key was derived from — kept
+               so a settle can verify content, not only count.
                ``persisted_at`` is forensic: the flusher logs an
                entry's age when it replays one (flush.py) and gates
                nothing on it. ``topic`` / ``partition``
@@ -185,7 +188,7 @@ _SIGN_OFFSET: Final = 1 << 63
 
 STATS_VERSION: Final = 1
 FENCE_PROBE_VERSION: Final = 1
-PREPARED_VERSION: Final = 5
+PREPARED_VERSION: Final = 6
 
 #: Component tags of the partition-tuple encoding.
 GROUP_NULL: Final = 0x00
@@ -200,6 +203,14 @@ PartitionTuple = tuple[str | None, ...]
 _OFFSET_LEN: Final = 8
 STATS_VALUE_LEN: Final = 1 + 8 + 8 + 8 + 8
 FENCE_PROBE_VALUE_LEN: Final = 1 + 8
+#: persisted_at(u64) + row_count(u64) + digest(32 bytes) after the body.
+_PREPARED_TAIL_LEN: Final = 8 + 8 + 32
+#: Bytes buffered per ``hashlib`` update in :func:`content_digest` (well
+#: above CPython's 2048-byte GIL-release threshold).
+_DIGEST_CHUNK: Final = 1 << 20
+
+#: A content digest as the idempotency name line carries it.
+_DIGEST_FORM: Final = re.compile(r"[0-9a-f]{64}")
 
 
 def _require_uint64(name: str, value: int) -> None:
@@ -533,7 +544,12 @@ class PreparedRequest:
 
     ``row_count`` is the number of staged rows the window held when the
     request was built: every recovery settle of the entry deletes the
-    window only if it still holds exactly that many rows.
+    window only if it still holds exactly that many rows. ``digest`` is
+    the window's :func:`content_digest` (64 lowercase hex), the content
+    input of the key — persisted so a settle can verify the window's
+    rows are the published ones, not only their number (a topic
+    recreated under the same name can re-put the same keys with new
+    payloads); that verification is not wired yet.
 
     ``topic`` / ``partition`` / ``group`` (with ``group_fields``, the
     hoglake display names of the tuple's fields) are the derivation
@@ -552,6 +568,7 @@ class PreparedRequest:
     group: PartitionTuple
     group_fields: tuple[str, ...]
     row_count: int
+    digest: str
 
     def __post_init__(self) -> None:
         key_len = len(self.idempotency_key.encode("utf-8"))
@@ -573,6 +590,10 @@ class PreparedRequest:
             )
         _check_group_fields(self.group, self.group_fields)
         _require_uint64("row_count", self.row_count)
+        if not _DIGEST_FORM.fullmatch(self.digest):
+            raise ValueError(
+                f"digest must be 64 lowercase hex characters, got {self.digest!r}"
+            )
 
 
 def prepared_key(group: PartitionTuple, first_offset: int) -> bytes:
@@ -612,9 +633,10 @@ def decode_prepared_key(data: bytes) -> PreparedKey:
 
 
 def encode_prepared_value(request: PreparedRequest) -> bytes:
-    """Version 5: key_len(u16) key(utf8) topic_len(u16) topic(utf8)
+    """Version 6: key_len(u16) key(utf8) topic_len(u16) topic(utf8)
     partition(u32) arity(u8) [name_len(u16) name tag(u8) [value_len(u16)
-    value]]* body_len(u32) body persisted_at(u64) row_count(u64)."""
+    value]]* body_len(u32) body persisted_at(u64) row_count(u64)
+    digest(32 bytes)."""
     out = bytearray([PREPARED_VERSION])
     out += _encode_utf8_u16("idempotency key", request.idempotency_key)
     out += _encode_utf8_u16("topic", request.topic)
@@ -631,12 +653,13 @@ def encode_prepared_value(request: PreparedRequest) -> bytes:
     out += request.body
     out += _encode_u64(request.persisted_at)
     out += _encode_u64(request.row_count)
+    out += bytes.fromhex(request.digest)
     return bytes(out)
 
 
 def decode_prepared_value(data: bytes) -> PreparedRequest:
     """Inverse of :func:`encode_prepared_value`. Refuses any version but
-    5 and any malformed or trailing byte."""
+    6 and any malformed or trailing byte."""
     data = bytes(data)
     if len(data) < 1:
         raise ValueError("prepared value is empty")
@@ -672,17 +695,18 @@ def decode_prepared_value(data: bytes) -> PreparedRequest:
         raise ValueError("truncated prepared value: body length")
     body_len = int.from_bytes(data[pos : pos + 4], "big")
     pos += 4
-    if len(data) != pos + body_len + 16:
+    if len(data) != pos + body_len + _PREPARED_TAIL_LEN:
         raise ValueError(
             f"prepared body length mismatch: field says {body_len}, "
-            f"value holds {len(data) - pos - 16}"
+            f"value holds {len(data) - pos - _PREPARED_TAIL_LEN}"
         )
     tail = pos + body_len
     return PreparedRequest(
         idempotency_key=key,
         body=data[pos:tail],
         persisted_at=int.from_bytes(data[tail : tail + 8], "big", signed=False),
-        row_count=int.from_bytes(data[tail + 8 :], "big", signed=False),
+        row_count=int.from_bytes(data[tail + 8 : tail + 16], "big", signed=False),
+        digest=data[tail + 16 :].hex(),
         topic=topic,
         partition=partition,
         group=tuple(values),
@@ -800,23 +824,30 @@ IDEMPOTENCY_NAMESPACE_DERIVATION: Final = (
 IDEMPOTENCY_NAMESPACE: Final = uuid.UUID("70cd616a-eaef-5359-838c-573cb224e4f9")
 
 
-#: A content digest as the idempotency name line carries it.
-_DIGEST_FORM: Final = re.compile(r"[0-9a-f]{64}")
-
-
 def content_digest(rows: Iterable[tuple[int, bytes]]) -> str:
     """SHA-256 (lowercase hex) of one window's staged rows, given as
     ``(offset, payload)`` in offset order: per row ``offset (i64,
     big-endian two's complement) || payload length (u64, big-endian) ||
     payload``. The length field makes the framing injective — no two
     distinct row sequences share an input byte string. The idempotency
-    key's content input (:func:`idempotency_key`)."""
+    key's content input (:func:`idempotency_key`).
+
+    The framed rows are buffered and fed to ``update`` in chunks of at
+    least :data:`_DIGEST_CHUNK` bytes: CPython releases the GIL inside
+    ``update`` only for inputs of 2048 bytes or more, so per-row updates
+    of typical 0.1–2 KiB events would hash with the GIL held and stall
+    the event loop that shares the process. Same digest either way."""
     h = hashlib.sha256()
+    buf = bytearray()
     for offset, payload in rows:
         _require_int64("offset", offset)
-        h.update(_encode_i64(offset))
-        h.update(_encode_u64(len(payload)))
-        h.update(payload)
+        buf += _encode_i64(offset)
+        buf += _encode_u64(len(payload))
+        buf += payload
+        if len(buf) >= _DIGEST_CHUNK:
+            h.update(buf)
+            buf.clear()
+    h.update(buf)
     return h.hexdigest()
 
 

@@ -94,11 +94,14 @@ Refusal taxonomy (each recovery pinned by its own test):
   up BEFORE it builds: a 200 means this exact content already landed
   (an identical rewind) and the window settles locally
   (``millrace_flush_deduped_total``). A 422 saying the key was reused
-  with a DIFFERENT request halts (``idempotency_key_reused``) on both
-  paths: on a fresh publish it means another writer committed this
-  content after the lookup, on a persisted entry's verbatim replay a
-  foreign writer or broken determinism — never settle rows this
-  process did not publish.
+  with a DIFFERENT request is checked against the receipt on a fresh
+  publish: the key is content-exact, so a receipt under it proves these
+  rows landed (another writer committed them after the lookup — a
+  suspected second owner, logged at WARNING) and the window settles as
+  deduped, this build's uploads orphaned; no receipt is a server
+  inconsistency and halts (``idempotency_key_reused``). On a persisted
+  entry's verbatim replay the bytes are the ones first sent, so a 422
+  there is a foreign writer or broken determinism: halt.
 - EVERY OTHER answered 4xx (a 401/403 from a proxy, a 413 from an
   ingress, a plain 400, any 422 — request-shape ``validation`` or
   otherwise): HALT (``commit_refused``) with the rows staged, exactly
@@ -195,7 +198,7 @@ at-least-once behaviour, counted
 the possibly-live objects in ``millrace_flush_unresolved_uploads_total``).
 Without a snapshot floor the verbatim replay itself executes (a second
 set of file rows over the same objects; ``millrace_prepared_replays_total``).
-The envelope (v5) also carries the idempotency key's derivation inputs
+The envelope (v6) also carries the idempotency key's derivation inputs
 — ``topic``, ``partition`` and the partition tuple as hoglake partition
 values (field names beside wire strings) — cross-checked at recovery
 against the stage's own identity and the ``prepared/`` key: an entry
@@ -474,8 +477,9 @@ class FlushStats:
     ``records_dropped`` maps a flush-time drop reason to its row count;
     ``decisions_dropped`` counts decisions that dropped EVERY row (settled
     without a commit). ``flush_deduped`` counts fresh windows whose
-    content (same bounds, same rows) already had a receipt at the
-    pre-build lookup, settled with nothing new committed.
+    content (same bounds, same rows) already had a receipt — at the
+    pre-build lookup, or behind a 422 reused-key answer to the publish —
+    settled with nothing new committed by this build.
     ``reprepared`` maps a re-prepare reason
     (``ddl_since_read_snapshot``, ``read_snapshot_expired``) to the
     ``prepared/`` entries dropped for it; ``unresolved_uploads`` counts
@@ -1576,6 +1580,14 @@ class FlushReport:
 # -- the hoglake-facing flusher ---------------------------------------------------
 
 
+def _transient_delay(attempts: int, retry_after: float | None) -> float:
+    """The transient ladders' delay before retry ``attempts + 1``:
+    ``min(0.5 × 2^(attempts−1), 30)`` seconds, floored by the server's
+    ``Retry-After`` hint when it sent one."""
+    backoff: float = min(_BASE_DELAY_S * (2 ** (attempts - 1)), _MAX_DELAY_S)
+    return max(backoff, retry_after or 0.0)
+
+
 def _seg(name: object) -> str:
     """Percent-encode one URL path segment (pyhoglake's ``_seg`` rule:
     identifiers are user data and must stay inside their segment)."""
@@ -2278,10 +2290,7 @@ class HoglakeFlusher:
                 if status == 503:
                     self._queue_retries += 1
                 self._commit_retries += 1
-                delay = max(
-                    min(_BASE_DELAY_S * (2 ** (attempts - 1)), _MAX_DELAY_S),
-                    self._retry_after_hint() or 0.0,
-                )
+                delay = _transient_delay(attempts, self._retry_after_hint())
                 log.warning(
                     "commit failed transiently (attempt %d/%d: %s), retrying "
                     "the identical request in %.1fs",
@@ -2301,10 +2310,7 @@ class HoglakeFlusher:
                         "persisted request stays for the next sweep"
                     ) from e
                 self._commit_retries += 1
-                delay = max(
-                    min(_BASE_DELAY_S * (2 ** (attempts - 1)), _MAX_DELAY_S),
-                    self._retry_after_hint() or 0.0,
-                )
+                delay = _transient_delay(attempts, self._retry_after_hint())
                 log.warning(
                     "commit transport failed (attempt %d/%d: %s), retrying "
                     "the identical request in %.1fs",
@@ -2357,10 +2363,7 @@ class HoglakeFlusher:
                     f"receipt lookup for {idempotency_key} failed {attempts} "
                     f"times ({error}); retried next sweep"
                 ) from error
-            delay = max(
-                min(_BASE_DELAY_S * (2 ** (attempts - 1)), _MAX_DELAY_S),
-                self._retry_after_hint() or 0.0,
-            )
+            delay = _transient_delay(attempts, self._retry_after_hint())
             log.warning(
                 "receipt lookup for %s failed transiently (attempt %d/%d: %s), "
                 "retrying in %.1fs",
@@ -2481,7 +2484,15 @@ class HoglakeFlusher:
 
         receipt = await self._lookup_receipt(key)
         if receipt is not None:
-            await self._settle(stage, window, expected, recovery=True)
+            await self._settle(
+                stage,
+                window,
+                expected,
+                where="reconciling a prepared/ entry from its receipt",
+                key=key,
+                snapshot_id=receipt.snapshot_id,
+                entry_stands=True,
+            )
             self._receipt_settlements += 1
             log.info(
                 "reconciled %s[%d] group %s offsets %d-%d from the commit "
@@ -2630,7 +2641,15 @@ class HoglakeFlusher:
                 ) from e
             raise
 
-        await self._settle(stage, window, expected, recovery=True)
+        await self._settle(
+            stage,
+            window,
+            expected,
+            where="after a recovered prepared/ entry's replay landed",
+            key=key,
+            snapshot_id=result.snapshot_id,
+            entry_stands=True,
+        )
         self._prepared_replays += 1
         log.info(
             "replayed the persisted commit for %s[%d] group %s offsets %d-%d "
@@ -2706,7 +2725,10 @@ class HoglakeFlusher:
         window: FlushedKey,
         expected: int,
         *,
-        recovery: bool = False,
+        where: str,
+        key: str | None,
+        snapshot_id: int | None,
+        entry_stands: bool,
     ) -> FlushCommitReport:
         """Settle the window with the guard INSIDE the settlement
         transaction (``commit_flushed(expected_rows=expected)``): the
@@ -2714,25 +2736,42 @@ class HoglakeFlusher:
         ``expected`` is the scanned count on a fresh flush and the
         ``prepared/`` entry's persisted ``row_count`` on every recovery
         settle (never a recount). A disagreement rolls the transaction
-        back and halts ``settlement_mismatch``: nothing was deleted and
-        the ``prepared/`` entry (if any) stands. A restart reconciles that
-        entry against the same persisted count and halts again until an
-        operator resolves it; the structural fix is settling by the
-        scanned keys (hoglake#351)."""
+        back and halts ``settlement_mismatch`` with everything an
+        operator needs: where it happened, the stage, the key, the
+        published snapshot (if any) and whether a ``prepared/`` entry
+        stands — a standing entry makes a restart halt here again (the
+        structural fix is settling by the scanned keys, hoglake#351)."""
         try:
             return await stage.commit_flushed(window, expected_rows=expected)
         except SettlementMismatchError as e:
-            where = "at reconcile" if recovery else "after publishing"
+            published = (
+                f"published snapshot {snapshot_id}"
+                if snapshot_id is not None
+                else "nothing published by this flush"
+            )
+            if entry_stands:
+                action = (
+                    f"A prepared/ entry stands for this window "
+                    f"(prepared/{window.label}/{window.first_offset}): a "
+                    "restart reconciles it against the same count and halts "
+                    "here again. Confirm what the published snapshot holds, "
+                    "then remove the entry (no millrace tool does this yet; "
+                    "an admin subcommand is a follow-up) so the rows re-flush "
+                    "as a new window, or re-consume the window's offsets"
+                )
+            else:
+                action = (
+                    "No prepared/ entry stands for this window: a restart "
+                    "rebuilds it from the rows as they now stand (a new "
+                    "content key; rows already published may land twice)"
+                )
             raise FlushHalted(
                 "settlement_mismatch",
-                f"{e} ({where}). Nothing was settled. The window holds rows "
-                "that were not in the published commit (a rewind or re-key "
-                "after the scan). Confirm what the published snapshot holds, "
-                "then drop the prepared/ entry for this window if one "
-                "stands (its rows re-flush as a new window) or re-consume "
-                "the window's offsets; with an entry standing, a restart "
-                "alone halts here again (hoglake#351: settle by scanned "
-                "keys)",
+                f"{e} — {where}; {stage.topic}[{stage.partition}], "
+                f"idempotency key {key or 'none'}, {published}. Nothing was "
+                "settled. The window holds rows that were not in what the "
+                "flush saw (a rewind or re-key after the scan). "
+                f"{action} (hoglake#351: settle by scanned keys)",
             ) from e
 
     def _scan_budget_bytes(self) -> int:
@@ -2775,8 +2814,10 @@ class HoglakeFlusher:
            rewind re-staged identical rows) — settle locally, nothing
            built, uploaded or published (outcome ``deduped``).
            Different rows under the same bounds have another key and
-           publish as a new commit. A 422 reused-key on the publish
-           halts ``idempotency_key_reused``.
+           publish as a new commit. A 422 reused-key on the publish is
+           re-checked against the receipt: present → settle as deduped
+           (another writer committed this content), absent → halt
+           ``idempotency_key_reused``.
         5. Settlement strictly after the receipt, guarded INSIDE the
            settle transaction against the scanned count (the persisted
            ``row_count`` on recovery).
@@ -2886,6 +2927,7 @@ class HoglakeFlusher:
                 key,
                 f"its receipt exists (snapshot {receipt.snapshot_id})",
                 snapshot_id=receipt.snapshot_id,
+                entry_stands=False,
             )
 
         now_us = self._now_us()
@@ -2943,7 +2985,15 @@ class HoglakeFlusher:
         if plan.payload is None:
             # Every row dropped: nothing may be committed (a commit
             # registers at least one file). Settle WITHOUT a commit.
-            await self._settle(stage, window, len(rows))
+            await self._settle(
+                stage,
+                window,
+                len(rows),
+                where="settling a window whose every row was dropped",
+                key=None,
+                snapshot_id=None,
+                entry_stands=False,
+            )
             self._decisions_dropped += 1
             return FlushReport(
                 topic=stage.topic,
@@ -2989,6 +3039,7 @@ class HoglakeFlusher:
                     group=group,
                     group_fields=fields,
                     row_count=len(rows),
+                    digest=digest,
                 ),
             )
         except BaseException:
@@ -3062,21 +3113,58 @@ class HoglakeFlusher:
         except HoglakeError as e:
             if isinstance(e, ValidationError) and _REUSED_KEY_MARKER in _error_text(e):
                 # The key names this window's CONTENT and its receipt
-                # answered 404 just before this build: a receipt under it
-                # now means another writer (a second owner of the
-                # partition, a foreign process) committed this content
-                # in between. This process never published it, so it
-                # never settles on it: halt, rows and entry staged.
-                raise self._halt(
-                    "idempotency_key_reused",
-                    f"the commit for {stage.topic}[{stage.partition}] group "
-                    f"{label} offsets {first_offset}-{last_offset} (content "
-                    f"digest {digest}, idempotency key {key}) was answered "
-                    "422 reused-key: another writer committed this content "
-                    "between the receipt lookup and this publish. Halting "
-                    "with the rows staged.",
+                # answered 404 just before this build. A receipt under it
+                # now proves these exact rows landed — committed by
+                # another writer (a second owner of the partition?) in
+                # between — so settle from it (this build's uploads are
+                # orphans); a restart would settle the same way from the
+                # persisted entry. No receipt behind the 422 is a server
+                # inconsistency: halt.
+                landed = await self._lookup_receipt(key)
+                if landed is None:
+                    raise self._halt(
+                        "idempotency_key_reused",
+                        f"the commit for {stage.topic}[{stage.partition}] "
+                        f"group {label} offsets {first_offset}-{last_offset} "
+                        f"(content digest {digest}, idempotency key {key}) "
+                        "was answered 422 reused-key, yet the key has no "
+                        "receipt: the server is inconsistent. Halting with "
+                        "the rows and the prepared/ entry staged.",
+                        plan.uris,
+                    ) from e
+                log.warning(
+                    "%s[%d] group %s offsets %d-%d (idempotency key %s): the "
+                    "publish was answered 422 reused-key and the key's "
+                    "receipt now exists (snapshot %d) — another writer "
+                    "committed this exact content after this build's "
+                    "receipt lookup; suspect a second owner of the "
+                    "partition. Settling from that receipt.",
+                    stage.topic,
+                    stage.partition,
+                    label,
+                    first_offset,
+                    last_offset,
+                    key,
+                    landed.snapshot_id,
+                )
+                self._count_orphans(
                     plan.uris,
-                ) from e
+                    f"the commit for group {label} offsets "
+                    f"{first_offset}-{last_offset} landed under another "
+                    "writer's build",
+                    reason="deduped",
+                )
+                return await self._settle_deduped(
+                    stage,
+                    decision,
+                    window,
+                    len(rows),
+                    key,
+                    "the publish was answered 422 reused-key and the "
+                    f"receipt exists (snapshot {landed.snapshot_id})",
+                    snapshot_id=landed.snapshot_id,
+                    entry_stands=True,
+                )
             status = e.status_code
             if status is not None and 400 <= status < 500:
                 # Any OTHER answered 4xx (a proxy's 401/403, an ingress
@@ -3098,7 +3186,15 @@ class HoglakeFlusher:
                 ) from e
             raise
 
-        await self._settle(stage, window, len(rows))
+        await self._settle(
+            stage,
+            window,
+            len(rows),
+            where="after publishing the window",
+            key=key,
+            snapshot_id=result.snapshot_id,
+            entry_stands=True,
+        )
         self._flushes_committed += 1
         self._rows_published += plan.records
         self._files_written += plan.files
@@ -3144,13 +3240,25 @@ class HoglakeFlusher:
         key: str,
         why: str,
         *,
-        snapshot_id: int | None = None,
+        snapshot_id: int | None,
+        entry_stands: bool,
     ) -> FlushReport:
         """Settle a fresh window that already landed under its key —
         nothing new is committed (``millrace_flush_deduped_total``). The
         settle is the ordinary one (rows, stats, any ``prepared/`` entry
         of the window), guarded against the scanned count."""
-        await self._settle(stage, window, scanned)
+        await self._settle(
+            stage,
+            window,
+            scanned,
+            where=(
+                "settling a window whose content's receipt already existed "
+                "(deduped; this build published nothing)"
+            ),
+            key=key,
+            snapshot_id=snapshot_id,
+            entry_stands=entry_stands,
+        )
         self._flush_deduped += 1
         log.info(
             "deduped %s[%d] group %s offsets %d-%d (idempotency key %s): %s; "

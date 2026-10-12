@@ -127,6 +127,7 @@ def _request(**overrides: Any) -> PreparedRequest:
         "group": ("42", None),
         "group_fields": ("team_id", "timestamp_month"),
         "row_count": 3,
+        "digest": GOLDEN_DIGEST,
     }
     return PreparedRequest(**{**base, **overrides})
 
@@ -320,7 +321,7 @@ def test_prepared_golden_vectors():
     assert prepared_key(("1",), 0) == (
         b"prepared/" + b"\x01\x01\x00\x01" + b"1" + b"\x80" + b"\x00" * 7
     )
-    # The v5 value envelope, written out byte by byte — the on-disk
+    # The v6 value envelope, written out byte by byte — the on-disk
     # contract a future codec change must not shift. The tuple travels as
     # hoglake partition values: each field's name beside its wire string.
     assert encode_prepared_value(
@@ -333,9 +334,10 @@ def test_prepared_golden_vectors():
             group=("42", None),
             group_fields=("team_id", "ts_month"),
             row_count=258,
+            digest="ab" * 32,
         )
     ) == (
-        b"\x05"  # version
+        b"\x06"  # version
         + b"\x00\x07"
         + b"key-abc"
         + b"\x00\x06"
@@ -352,6 +354,7 @@ def test_prepared_golden_vectors():
         + b"\x2a"  # persisted_at = 42
         + b"\x00" * 6
         + b"\x01\x02"  # row_count = 258
+        + b"\xab" * 32  # digest, raw
     )
 
 
@@ -383,6 +386,20 @@ def test_content_digest_golden_vectors():
         content_digest([(-1, b"")])
         == hashlib.sha256(b"\xff" * 8 + b"\x00" * 8).hexdigest()
     )
+
+
+def test_content_digest_is_unchanged_across_its_1_mib_update_chunks():
+    # Framed rows are hashed in 1 MiB buffered updates (so hashlib runs
+    # with the GIL released); rows straddling, filling and overshooting a
+    # chunk boundary hash exactly like the one-shot framing.
+    mib = 1 << 20
+    for sizes in ([mib - 16], [mib - 15], [600_000, 600_000, 10], [3 * mib], [0, mib]):
+        rows = [(i, bytes([i % 251]) * n) for i, n in enumerate(sizes)]
+        framed = b"".join(
+            o.to_bytes(8, "big", signed=True) + len(p).to_bytes(8, "big") + p
+            for o, p in rows
+        )
+        assert content_digest(rows) == hashlib.sha256(framed).hexdigest()
 
 
 def test_content_digest_framing_is_injective():
@@ -844,6 +861,7 @@ def test_prepared_keys_sort_by_group_then_first_offset(keys: list[PreparedKey]):
     partition=partitions,
     group=groups,
     row_count=st.integers(min_value=0, max_value=UINT64_MAX),
+    digest=digests,
 )
 def test_prepared_value_round_trip(
     key: str,
@@ -853,6 +871,7 @@ def test_prepared_value_round_trip(
     partition: int,
     group: PartitionTuple,
     row_count: int,
+    digest: str,
 ):
     request = PreparedRequest(
         idempotency_key=key,
@@ -863,6 +882,7 @@ def test_prepared_value_round_trip(
         group=group,
         group_fields=_fields(group),
         row_count=row_count,
+        digest=digest,
     )
     assert decode_prepared_value(encode_prepared_value(request)) == request
 
@@ -875,8 +895,9 @@ def test_prepared_persisted_at_round_trips_across_the_sign_bit(at: int):
     # different value of the other, so a swapped tail reds too.
     request = _request(persisted_at=at, row_count=UINT64_MAX - at)
     encoded = encode_prepared_value(request)
-    assert encoded[-16:-8] == at.to_bytes(8, "big")
-    assert encoded[-8:] == (UINT64_MAX - at).to_bytes(8, "big")
+    assert encoded[-48:-40] == at.to_bytes(8, "big")
+    assert encoded[-40:-32] == (UINT64_MAX - at).to_bytes(8, "big")
+    assert encoded[-32:] == bytes.fromhex(GOLDEN_DIGEST)
     decoded = decode_prepared_value(encoded)
     assert (decoded.persisted_at, decoded.row_count) == (at, UINT64_MAX - at)
 
@@ -890,6 +911,9 @@ def test_prepared_request_validation():
     with pytest.raises(ValueError, match="row_count"):
         _request(row_count=-1)
     _request(row_count=2**64 - 1)
+    for bad in ("", "0" * 63, "0" * 65, "A" * 64, "g" * 64):
+        with pytest.raises(ValueError, match="digest must be 64 lowercase hex"):
+            _request(digest=bad)
     with pytest.raises(ValueError, match="topic"):
         _request(topic="")
     with pytest.raises(ValueError, match="partition"):
@@ -928,11 +952,12 @@ def test_prepared_value_rejects_strict_prefixes(
 
 
 def test_prepared_value_truncation_errors_name_the_failed_parse_stage():
-    # v5 layout for key "some-key", topic "events", group ("42",) named
+    # v6 layout for key "some-key", topic "events", group ("42",) named
     # ("t",): version(1) key_len(2) key(8) topic_len(2) topic(6)
     # partition(4) arity(1) name_len(2) name(1) tag(1) value_len(2)
-    # value(2) body_len(4) body(2) persisted_at(8) row_count(8) — 54
-    # bytes total; the tail's cuts report the body-length mismatch.
+    # value(2) body_len(4) body(2) persisted_at(8) row_count(8)
+    # digest(32) — 86 bytes total; the tail's cuts report the
+    # body-length mismatch (a cut digest included).
     encoded = encode_prepared_value(
         _request(idempotency_key="some-key", group=("42",), group_fields=("t",))
     )
@@ -949,9 +974,9 @@ def test_prepared_value_truncation_errors_name_the_failed_parse_stage():
         + ["field 0 value: length"] * 2
         + ["field 0 value: 2 bytes declared"] * 2
         + ["body length$"] * 4
-        + ["length mismatch"] * 18  # body (2) + persisted_at + row_count tail
+        + ["length mismatch"] * 50  # body (2) + persisted_at + row_count + digest
     )
-    assert len(encoded) == 54
+    assert len(encoded) == 86
     assert len(encoded) == len(expect)
     for cut, stage in enumerate(expect):
         with pytest.raises(ValueError, match=stage):
@@ -985,7 +1010,7 @@ def test_prepared_value_round_trip_with_multi_byte_lengths():
 
 def test_prepared_value_refuses_every_other_version_and_trailing_bytes():
     good = encode_prepared_value(_request(body=b""))
-    for version in (0, 1, 2, 3, 4, 6):
+    for version in (0, 1, 2, 3, 4, 5, 7):
         with pytest.raises(
             ValueError, match=f"unknown prepared value version {version}"
         ):

@@ -56,7 +56,8 @@ the survivor sections are the gate's reference set.
 | 2026-10-10 poison envelope v2 (`quarantined_at_us`), clean-slate | 1261 | 1126 | 135 | 0 |
 | 2026-10-12 partition-tuple keyspace, `(group, offset)` rows, `offsets/` removed, fence probe — clean-slate, first run | 835 | 745 | 90 | 0 |
 | 2026-10-12, same code, after the kill tests below — clean-slate | 835 | 763 | 72 | 0 |
-| **2026-10-12, content digest in the key (`millrace:v3`), `prepared/` v5 (`row_count`) — clean-slate** | **874** | **797** | **77** | **0** |
+| 2026-10-12, content digest in the key (`millrace:v3`), `prepared/` v5 (`row_count`) — clean-slate | 874 | 797 | 77 | 0 |
+| **2026-10-13, chunked digest updates, `prepared/` v6 (persisted `digest`) — clean-slate** | **891** | **813** | **78** | **0** |
 
 The last row is the current ledger: `rm -rf mutants && uv run mutmut
 run` on this tree, `tests/check_mutants.py` exit 0. It adds
@@ -70,13 +71,19 @@ vector and `test_prepared_persisted_at_round_trips_across_the_sign_bit`
 (which pins `persisted_at` and `row_count` against each other). Its 5
 new survivors are default-argument (E1, E2) and message-label (M)
 mutants of those lines; `decode_prepared_value`'s mutants renumbered
-with the v5 tail, so its rows carry new indices. Every row above it
+with the v5 tail, so its rows carry new indices. The 2026-10-13 row
+(the current ledger) adds the buffered 1 MiB `update` chunks of
+`content_digest` and the v6 envelope's persisted `digest`: the first
+run left 79 survivors; `test_content_digest_is_unchanged_across_its_1_mib_update_chunks`
+killed the one non-equivalent (`h.update(None)` on the chunk branch,
+reachable only past 1 MiB of framed rows), leaving the chunk-boundary
+`>=`/`>` flip as class E9. Every row above it
 ran against earlier keyspace code (team-id keys, the `poison/` and
 `offsets/` codecs); their survivor tables are gone with that code (git
 history keeps them), and the earlier phase narratives that cited tests
 of that code were removed with it.
 
-`planner.py`: 0 survivors. All 77 survivors are in `keyspace.py`.
+`planner.py`: 0 survivors. All 78 survivors are in `keyspace.py`.
 
 ## Killed by tests added at the 2026-10-12 reconciliation (18)
 
@@ -111,7 +118,7 @@ key at `INT64_MIN`, -1, 0, 41, `INT64_MAX - 1`),
 the field-name cases of `test_group_label_is_the_hoglake_human_form`
 (`/`, `=`, `:` and non-ASCII in a FIELD NAME percent-encode).
 
-## Surviving mutants — all equivalent (77)
+## Surviving mutants — all equivalent (78)
 
 Each entry: the mutant, its one-line diff, and the argument. The
 arguments are interpreter semantics or an explicit guard upstream of the
@@ -142,8 +149,8 @@ independently by the golden vectors and the boundary round-trips.
 | `x_decode_fence_probe_value__mutmut_11` | `return int.from_bytes(data[1:], "big", signed=True)` → `return int.from_bytes(data[1:], signed=True)` | redundant explicit default (`"big"` / `signed=False`) |
 | `x_decode_prepared_value__mutmut_136` | `persisted_at=int.from_bytes(data[tail : tail + 8], "big", signed=False),` → `persisted_at=int.from_bytes(data[tail : tail + 8], signed=False),` | redundant explicit default (`"big"` / `signed=False`) |
 | `x_decode_prepared_value__mutmut_137` | `persisted_at=int.from_bytes(data[tail : tail + 8], "big", signed=False),` → `persisted_at=int.from_bytes(data[tail : tail + 8], "big", ),` | redundant explicit default (`"big"` / `signed=False`) |
-| `x_decode_prepared_value__mutmut_147` | `row_count=int.from_bytes(data[tail + 8 :], "big", signed=False),` → `row_count=int.from_bytes(data[tail + 8 :], signed=False),` | redundant explicit default (`"big"` / `signed=False`) |
-| `x_decode_prepared_value__mutmut_148` | `row_count=int.from_bytes(data[tail + 8 :], "big", signed=False),` → `row_count=int.from_bytes(data[tail + 8 :], "big", ),` | redundant explicit default (`"big"` / `signed=False`) |
+| `x_decode_prepared_value__mutmut_147` | `row_count=int.from_bytes(data[tail + 8 : tail + 16], "big", signed=False),` → `row_count=int.from_bytes(data[tail + 8 : tail + 16], signed=False),` | redundant explicit default (`"big"` / `signed=False`) |
+| `x_decode_prepared_value__mutmut_148` | `row_count=int.from_bytes(data[tail + 8 : tail + 16], "big", signed=False),` → `row_count=int.from_bytes(data[tail + 8 : tail + 16], "big", ),` | redundant explicit default (`"big"` / `signed=False`) |
 | `x_decode_prepared_value__mutmut_44` | `partition = int.from_bytes(data[pos : pos + 4], "big", signed=False)` → `partition = int.from_bytes(data[pos : pos + 4], signed=False)` | redundant explicit default (`"big"` / `signed=False`) |
 | `x_decode_prepared_value__mutmut_45` | `partition = int.from_bytes(data[pos : pos + 4], "big", signed=False)` → `partition = int.from_bytes(data[pos : pos + 4], "big", )` | redundant explicit default (`"big"` / `signed=False`) |
 | `x_decode_prepared_value__mutmut_98` | `body_len = int.from_bytes(data[pos : pos + 4], "big")` → `body_len = int.from_bytes(data[pos : pos + 4], )` | redundant explicit default (`"big"` / `signed=False`) |
@@ -170,7 +177,7 @@ sign-bit boundary round-trips.
 | `x__decode_i64_ordered__mutmut_4` | `return int.from_bytes(data, "big", signed=False) - _SIGN_OFFSET` → `return int.from_bytes(data, "big", signed=None) - _SIGN_OFFSET` | `signed` parsed by truthiness: `None` ≡ `False` |
 | `x__encode_u64__mutmut_3` | `return value.to_bytes(8, "big", signed=False)` → `return value.to_bytes(8, "big", signed=None)` | `signed` parsed by truthiness: `None` ≡ `False` |
 | `x_decode_prepared_value__mutmut_134` | `persisted_at=int.from_bytes(data[tail : tail + 8], "big", signed=False),` → `persisted_at=int.from_bytes(data[tail : tail + 8], "big", signed=None),` | `signed` parsed by truthiness: `None` ≡ `False` |
-| `x_decode_prepared_value__mutmut_145` | `row_count=int.from_bytes(data[tail + 8 :], "big", signed=False),` → `row_count=int.from_bytes(data[tail + 8 :], "big", signed=None),` | `signed` parsed by truthiness: `None` ≡ `False` |
+| `x_decode_prepared_value__mutmut_145` | `row_count=int.from_bytes(data[tail + 8 : tail + 16], "big", signed=False),` → `row_count=int.from_bytes(data[tail + 8 : tail + 16], "big", signed=None),` | `signed` parsed by truthiness: `None` ≡ `False` |
 | `x_decode_prepared_value__mutmut_42` | `partition = int.from_bytes(data[pos : pos + 4], "big", signed=False)` → `partition = int.from_bytes(data[pos : pos + 4], "big", signed=None)` | `signed` parsed by truthiness: `None` ≡ `False` |
 | `x_decode_stats_value__mutmut_17` | `staged_bytes=int.from_bytes(data[1:9], "big", signed=False),` → `staged_bytes=int.from_bytes(data[1:9], "big", signed=None),` | `signed` parsed by truthiness: `None` ≡ `False` |
 | `x_decode_stats_value__mutmut_50` | `row_count=int.from_bytes(data[25:33], "big", signed=False),` → `row_count=int.from_bytes(data[25:33], "big", signed=None),` | `signed` parsed by truthiness: `None` ≡ `False` |
@@ -221,6 +228,20 @@ for every input. (Verified over names and values holding `X`, `/`, `=`,
 | Mutant | Diff | Why equivalent |
 |---|---|---|
 | `x__decode_group_at__mutmut_8` | `pos += 1` → `pos = 1` | the only call site (`decode_group`) passes `pos=0`, so `pos += 1` and `pos = 1` agree |
+
+### Class E9 — the 1 MiB update boundary of a streaming hash (1)
+
+`content_digest` buffers framed rows and calls `update` once the buffer
+reaches `_DIGEST_CHUNK`. SHA-256 is a streaming hash: how the input is
+split across `update` calls never changes the digest, so `>=` vs `>`
+moves only the flush point of a buffer of exactly 1 MiB. Pinned from
+the other side by `test_content_digest_is_unchanged_across_its_1_mib_update_chunks`
+(an exactly-1-MiB buffer among its cases), which kills the
+`h.update(None)` mutant of the same branch.
+
+| Mutant | Diff | Why equivalent |
+|---|---|---|
+| `x_content_digest__mutmut_17` | `if len(buf) >= _DIGEST_CHUNK:` → `if len(buf) > _DIGEST_CHUNK:` | SHA-256 is a streaming hash: where the buffered input is split between `update` calls never changes the digest; only the flush point at exactly 1 MiB moves |
 
 ### Class U — u16 label text behind the dataclass's own refusal (6)
 
@@ -275,7 +296,7 @@ raise CONDITION is pinned by the test named per row.
 | `x__decode_group_at__mutmut_5` | `raise ValueError("corrupt partition tuple: no arity byte")` → `raise ValueError("XXcorrupt partition tuple: no arity byteXX")` | test_decode_group_is_total_and_refuses_corruption (match='no arity byte') |
 | `x__prefix_successor__mutmut_8` | `raise ValueError("a prefix of only 0xFF bytes has no successor")` → `raise ValueError("XXa prefix of only 0xFF bytes has no successorXX")` | test_prefix_successor_strips_only_trailing_ff (match='no successor') |
 | `x__prefix_successor__mutmut_9` | `raise ValueError("a prefix of only 0xFF bytes has no successor")` → `raise ValueError("a prefix of only 0xff bytes has no successor")` | test_prefix_successor_strips_only_trailing_ff (match='no successor') |
-| `x_content_digest__mutmut_6` | `_require_int64("offset", offset)` → `_require_int64("XXoffsetXX", offset)` | test_content_digest_framing_is_injective (match='offset') |
+| `x_content_digest__mutmut_7` | `_require_int64("offset", offset)` → `_require_int64("XXoffsetXX", offset)` | test_content_digest_framing_is_injective (match='offset') |
 | `x_decode_prepared_value__mutmut_37` | `raise ValueError("truncated prepared value: partition / arity")` → `raise ValueError("XXtruncated prepared value: partition / arityXX")` | test_prepared_value_truncation_errors_name_the_failed_parse_stage (match='partition / arity') |
 | `x_decode_prepared_value__mutmut_6` | `raise ValueError("prepared value is empty")` → `raise ValueError("XXprepared value is emptyXX")` | test_prepared_value_truncation_errors_name_the_failed_parse_stage (match='empty') |
 | `x_encode_fence_probe_value__mutmut_5` | `_require_int64("offset", offset)` → `_require_int64("XXoffsetXX", offset)` | test_fence_probe_value_validation (match='offset') |

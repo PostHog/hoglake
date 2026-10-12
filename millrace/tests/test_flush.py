@@ -309,6 +309,7 @@ def prepared_request(
         group=team_group(team),
         group_fields=SPEC_FIELDS,
         row_count=rows,
+        digest="0" * 64,
     )
 
 
@@ -1697,7 +1698,63 @@ class TestRefusalTaxonomy:
         assert key in line.getMessage()
         assert "offsets 0-2" in line.getMessage()
 
-    async def test_a_fresh_publish_answered_422_reused_halts(
+    async def test_a_fresh_publish_answered_422_reused_settles_from_the_receipt(
+        self,
+        httpx_mock: Any,
+        stage_factory: Any,
+        fake_clock: Any,
+        flusher_factory: Any,
+        store: FakeObjectStore,
+        sleeper: Sleeper,
+        caplog: Any,
+    ) -> None:
+        """The key is content-exact: a 422 reused-key on the fresh publish,
+        with the key's receipt present on a second lookup, proves these
+        rows landed (another writer committed them after this build's
+        lookup). Settle as deduped from that receipt — the persisted entry
+        goes with the window, so a restart has nothing to redo — with this
+        build's uploads orphaned and a WARNING naming a suspected second
+        owner."""
+        stage, capture, flusher = await self._stage_and_flush(
+            httpx_mock,
+            stage_factory,
+            fake_clock,
+            flusher_factory,
+            store,
+            sleeper,
+            [
+                commit_refusal(
+                    422, "validation", "idempotency_key reused with a different request"
+                )
+            ],
+        )
+        key = ikey(0, TEAM, 0, 2)
+        script_receipt(httpx_mock, key, snapshot_id=None)  # before the build
+        script_receipt(httpx_mock, key, snapshot_id=61)  # after the 422
+        with caplog.at_level(logging.WARNING, logger="millrace.flush"):
+            report = await flusher.flush_key(
+                stage,
+                decision(
+                    TEAM, trigger="size", staged_bytes=100, first_staged_ts=JAN_US
+                ),
+            )
+        assert report.outcome == "deduped"
+        assert (report.snapshot_id, report.idempotency_key) == (61, key)
+        assert len(capture.bodies) == 1
+        assert await staged_rows(stage, TEAM) == []
+        assert await stage.load_prepared() == []
+        stats = flusher.stats()
+        assert stats.flush_deduped == 1
+        assert stats.flushes_committed == 0
+        assert stats.orphaned_uploads == len(store.files) == 1
+        assert receipt_server(httpx_mock).lookups == [key, key]
+        assert any(
+            "second owner" in r.getMessage() and key in r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+        )
+
+    async def test_a_fresh_publish_answered_422_reused_without_a_receipt_halts(
         self,
         httpx_mock: Any,
         stage_factory: Any,
@@ -1706,11 +1763,9 @@ class TestRefusalTaxonomy:
         store: FakeObjectStore,
         sleeper: Sleeper,
     ) -> None:
-        """The key names the window's content and its receipt answered 404
-        before the build: a 422 reused-key on the publish means another
-        writer committed this content in between. Never settled on —
-        halt ``idempotency_key_reused`` naming the window and digest,
-        rows and entry staged, uploads orphan-accounted."""
+        """A 422 reused-key whose key has no receipt on the re-check is a
+        server inconsistency: halt ``idempotency_key_reused`` naming the
+        window and digest, rows and entry staged, uploads orphaned."""
         stage, capture, flusher = await self._stage_and_flush(
             httpx_mock,
             stage_factory,
@@ -1734,9 +1789,12 @@ class TestRefusalTaxonomy:
         assert excinfo.value.reason == "idempotency_key_reused"
         digest = window_digest(0, team_group(TEAM), 0, 2)
         assert f"offsets 0-2 (content digest {digest}" in excinfo.value.detail
+        assert "no receipt" in excinfo.value.detail
         assert len(capture.bodies) == 1
+        assert receipt_server(httpx_mock).lookups == [ikey(0, TEAM, 0, 2)] * 2
         assert len(await staged_rows(stage, TEAM)) == 3
-        assert len(await stage.load_prepared()) == 1
+        (entry,) = await stage.load_prepared()
+        assert entry.request.digest == digest
         stats = flusher.stats()
         assert stats.flush_deduped == 0
         assert stats.orphaned_uploads == 1
@@ -3551,6 +3609,7 @@ class TestPreparedReplay:
             group=team_group(TEAM + 1),
             group_fields=SPEC_FIELDS,
             row_count=pending.request.row_count,
+            digest=pending.request.digest,
         )
         foreign_pending = type(pending)(key=pending.key, request=foreign)
         with pytest.raises(StageCorruptionError, match="names partition tuple"):
@@ -4636,6 +4695,14 @@ class TestSettlementGuard:
             keyspace.content_digest(scanned),
         )
         assert entry.request.idempotency_key == key
+        assert entry.request.digest == keyspace.content_digest(scanned)
+        # The first halt's detail is actionable: stage, key, snapshot,
+        # where, and that an entry stands.
+        first = excinfo.value.detail
+        assert "after publishing the window" in first
+        assert f"events[0], idempotency key {key}, published snapshot 50" in first
+        assert "A prepared/ entry stands" in first
+        assert "no millrace tool does this yet" in first
 
         # The documented restart: a fresh flusher reconciles the entry.
         # Its receipt is there (the commit landed), but the guard uses the
@@ -4649,13 +4716,199 @@ class TestSettlementGuard:
                 stage, (await stage.recover()).pending_prepared[0]
             )
         assert again.value.reason == "settlement_mismatch"
-        assert "(at reconcile)" in again.value.detail
-        assert "drop the prepared/ entry" in again.value.detail
+        assert "reconciling a prepared/ entry from its receipt" in again.value.detail
+        assert "published snapshot 50" in again.value.detail
+        assert "A prepared/ entry stands" in again.value.detail
         assert "hoglake#351" in again.value.detail
         assert [rk.offset for rk, _ in await staged_rows(stage, TEAM)] == [0, 1, 2]
         assert await stage.iter_key_stats() == stats_before
         assert len(await stage.load_prepared()) == 1
         assert restarted.stats().receipt_settlements == 0
+
+    async def test_a_replayed_entry_whose_window_gained_a_row_halts_at_settle(
+        self,
+        httpx_mock: Any,
+        stage_factory: Any,
+        fake_clock: Any,
+        flusher_factory: Any,
+        store: FakeObjectStore,
+        sleeper: Sleeper,
+    ) -> None:
+        """The 404-replay reconcile arm: the publish of window [0, 2] (rows
+        0 and 2) is lost, the entry persists ``row_count`` 2, then a row
+        is re-staged INSIDE the window (offset 1: a re-key). Reconcile
+        replays the entry, the replay lands, and the settle — expecting
+        the persisted 2, finding 3 — rolls back and halts: rows and the
+        entry intact."""
+        from millrace.flush import _PUBLISH_MAX_ATTEMPTS
+
+        stage = await stage_factory()
+        await staged(stage, fake_clock, TEAM, [(0, JAN_US), (2, JAN_US)])
+        script_options(httpx_mock)
+        capture = CommitCapture(
+            httpx_mock, [httpx.ConnectError("lost")] * _PUBLISH_MAX_ATTEMPTS
+        )
+        flusher = flusher_factory(store=store, cfg=make_config(target_output_bytes=1))
+        with pytest.raises(FlushPublishExhausted):
+            await flusher.flush_key(
+                stage,
+                decision(
+                    TEAM, trigger="size", staged_bytes=100, first_staged_ts=JAN_US
+                ),
+            )
+        (entry,) = await stage.load_prepared()
+        assert entry.request.row_count == 2
+        await staged(stage, fake_clock, TEAM, [(1, JAN_US)])  # into the window
+        capture.extend([commit_ok(70)])  # the receipt answers 404 by default
+        with pytest.raises(FlushHalted) as excinfo:
+            await flusher.flush_key(
+                stage,
+                decision(
+                    TEAM, trigger="size", staged_bytes=100, first_staged_ts=JAN_US
+                ),
+            )
+        assert excinfo.value.reason == "settlement_mismatch"
+        detail = excinfo.value.detail
+        assert "holds 3 staged rows but the flush published 2" in detail
+        assert "after a recovered prepared/ entry's replay landed" in detail
+        assert "published snapshot 70" in detail
+        assert capture.bodies[-1] == capture.bodies[0]  # the verbatim replay
+        assert [rk.offset for rk, _ in await staged_rows(stage, TEAM)] == [0, 1, 2]
+        assert len(await stage.load_prepared()) == 1
+        assert flusher.stats().prepared_replays == 0
+
+    async def test_a_deduped_window_that_gained_a_row_halts_at_settle(
+        self,
+        httpx_mock: Any,
+        stage_factory: Any,
+        fake_clock: Any,
+        flusher_factory: Any,
+        store: FakeObjectStore,
+        sleeper: Sleeper,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The deduped arm: the fresh build's content (rows 0 and 2) has a
+        receipt, but a row entered the window (offset 1) after the scan.
+        The deduped settle expects the 2 scanned rows, finds 3, rolls back
+        and halts — nothing deleted, nothing built or published."""
+        stage = await stage_factory()
+        await staged(stage, fake_clock, TEAM, [(0, JAN_US), (2, JAN_US)])
+        script_options(httpx_mock)
+        capture = CommitCapture(httpx_mock, [])
+        flusher = flusher_factory(store=store, cfg=make_config(target_output_bytes=1))
+        key = ikey(0, TEAM, 0, 2)  # the content of rows 0 and 2
+        script_receipt(httpx_mock, key, snapshot_id=80)
+
+        real_scan = stage.scan_group_rows_bounded
+
+        async def scan_then_arrival(group: Any, **caps: Any) -> Any:
+            rows = await real_scan(group, **caps)
+            await staged(stage, fake_clock, TEAM, [(1, JAN_US)])
+            return rows
+
+        monkeypatch.setattr(stage, "scan_group_rows_bounded", scan_then_arrival)
+        with pytest.raises(FlushHalted) as excinfo:
+            await flusher.flush_key(
+                stage,
+                decision(
+                    TEAM, trigger="size", staged_bytes=100, first_staged_ts=JAN_US
+                ),
+            )
+        assert excinfo.value.reason == "settlement_mismatch"
+        detail = excinfo.value.detail
+        assert "deduped; this build published nothing" in detail
+        assert f"idempotency key {key}, published snapshot 80" in detail
+        assert "No prepared/ entry stands" in detail
+        assert capture.bodies == [] and store.files == {}
+        assert [rk.offset for rk, _ in await staged_rows(stage, TEAM)] == [0, 1, 2]
+        assert await stage.load_prepared() == []
+        assert flusher.stats().flush_deduped == 0
+
+    async def test_the_content_digest_runs_on_the_flushers_executor(
+        self,
+        httpx_mock: Any,
+        stage_factory: Any,
+        fake_clock: Any,
+        flusher_factory: Any,
+        store: FakeObjectStore,
+        sleeper: Sleeper,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``content_digest`` is CPU work over up to the scan budget: it
+        must run through ``HoglakeFlusher._io`` (the flusher's executor),
+        never on the event loop the consumer shares."""
+        import threading
+
+        stage = await stage_factory()
+        await staged(stage, fake_clock, TEAM, [(0, JAN_US), (1, JAN_US)])
+        script_options(httpx_mock)
+        CommitCapture(httpx_mock, [commit_ok(50)])
+        flusher = flusher_factory(store=store, cfg=make_config(target_output_bytes=1))
+        loop_thread = threading.get_ident()
+        calls: list[tuple[int, bool]] = []
+        real_digest = keyspace.content_digest
+
+        def spy(rows: Any) -> str:
+            calls.append((threading.get_ident(), in_io.get()))
+            return real_digest(rows)
+
+        import contextvars
+
+        in_io: contextvars.ContextVar[bool] = contextvars.ContextVar(
+            "in_io", default=False
+        )
+        real_io = flusher._io
+
+        async def io(fn: Any) -> Any:
+            def tagged() -> Any:
+                in_io.set(True)
+                return fn()
+
+            return await real_io(tagged)
+
+        monkeypatch.setattr(keyspace, "content_digest", spy)
+        monkeypatch.setattr(flusher, "_io", io)
+        report = await flusher.flush_key(
+            stage,
+            decision(TEAM, trigger="size", staged_bytes=100, first_staged_ts=JAN_US),
+        )
+        assert report.outcome == "committed"
+        assert len(calls) == 1
+        thread, through_io = calls[0]
+        assert through_io
+        assert thread != loop_thread
+
+    async def test_a_mismatch_where_nothing_was_published_says_so(
+        self,
+        httpx_mock: Any,
+        stage_factory: Any,
+        fake_clock: Any,
+        flusher_factory: Any,
+        store: FakeObjectStore,
+    ) -> None:
+        """On the paths where this flush published nothing (all rows
+        dropped, deduped from a receipt) the detail must not claim a
+        publish, and with no entry standing it says a restart rebuilds."""
+        stage = await stage_factory()
+        await staged(stage, fake_clock, TEAM, [(0, JAN_US), (1, JAN_US), (2, JAN_US)])
+        flusher = flusher_factory(store=store, cfg=make_config(target_output_bytes=1))
+        window = FlushedKey(team_group(TEAM), 0, 2, group_fields=SPEC_FIELDS)
+        with pytest.raises(FlushHalted) as excinfo:
+            await flusher._settle(
+                stage,
+                window,
+                2,
+                where="settling a window whose every row was dropped",
+                key=None,
+                snapshot_id=None,
+                entry_stands=False,
+            )
+        detail = excinfo.value.detail
+        assert "settling a window whose every row was dropped" in detail
+        assert "idempotency key none, nothing published by this flush" in detail
+        assert "No prepared/ entry stands" in detail
+        assert "after publishing" not in detail
+        assert len(await staged_rows(stage, TEAM)) == 3
 
 
 class TestJunkWindowBoundaries:

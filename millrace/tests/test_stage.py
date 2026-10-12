@@ -391,6 +391,7 @@ async def test_recover_collects_legacy_markers_without_touching_rows(memory_stor
         group=g(9),
         group_fields=FIELDS,
         row_count=4,
+        digest="0" * 64,
     )
 
     db = await DbBuilder(path, memory_store).build()
@@ -528,6 +529,7 @@ async def test_recover_returns_pending_prepared_and_nothing_else(stage_factory):
         group=g(1),
         group_fields=FIELDS,
         row_count=5,
+        digest="0" * 64,
     )
     req_b = PreparedRequest(
         keyspace.idempotency_key(TABLE, "events", 0, g(1), 5, 9, "0" * 64),
@@ -538,6 +540,7 @@ async def test_recover_returns_pending_prepared_and_nothing_else(stage_factory):
         group=g(1),
         group_fields=FIELDS,
         row_count=5,
+        digest="0" * 64,
     )
     await stage.persist_prepared(g(1), 0, req_a)
     await stage.persist_prepared(g(1), 5, req_b)
@@ -566,6 +569,7 @@ async def test_prepared_round_trip(stage_factory):
         group=g(3),
         group_fields=FIELDS,
         row_count=10,
+        digest="0" * 64,
     )
     await stage.persist_prepared(g(3), 10, request)
     assert await stage.get_prepared(g(3), 10) == request
@@ -1199,3 +1203,36 @@ async def test_list_prepared_scans_exactly_one_groups_entries(memory_store):
     assert [p.key.first_offset for p in await stage.list_prepared(g(2))] == [0]
     assert await stage.list_prepared(g(3)) == []
     await manager.close()
+
+
+async def test_a_corrupt_prepared_entry_fails_recovery_by_name(memory_store):
+    """A ``prepared/`` value that does not decode is corruption: recovery,
+    the per-group gate and the point read raise StageCorruptionError
+    naming the partition and the entry's key — never a bare ValueError."""
+    from slatedb.uniffi import DbBuilder, WriteBatch
+
+    path = "millrace/events/0"
+    good = keyspace.encode_prepared_value(prepared("k", team=4, rows=2))
+    key = keyspace.prepared_key(g(4), 0)
+    db = await DbBuilder(path, memory_store).build()
+    batch = WriteBatch()
+    batch.put(key, good[:-1])  # one byte short
+    handle = await db.write(batch)
+    await handle.await_durable()
+    await db.shutdown()
+
+    stage = await PartitionStage.open_store(
+        memory_store, path, topic="events", partition=0, settings=fast_flush_settings()
+    )
+    for read in (
+        stage.recover,
+        lambda: stage.list_prepared(g(4)),
+        lambda: stage.get_prepared(g(4), 0),
+    ):
+        with pytest.raises(StageCorruptionError) as excinfo:
+            await read()
+        text = str(excinfo.value)
+        assert text.startswith(f"events[0]: the prepared/ entry at key {key!r}")
+        assert "is corrupt" in text
+        assert isinstance(excinfo.value.__cause__, ValueError)
+    await stage.close()

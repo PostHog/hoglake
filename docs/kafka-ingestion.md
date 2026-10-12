@@ -121,7 +121,7 @@ dominates. No volumes anywhere.
 rows/<group><offset_ob>                   → event payload bytes
 stats/<group>                             → {staged_bytes, first_staged_ts, last_staged_ts, row_count}
 sched_age/<first_staged_ts_ob><group>     → ∅
-prepared/<group><first_offset_ob>         → persisted commit request (v5 envelope)
+prepared/<group><first_offset_ob>         → persisted commit request (v6 envelope)
 meta/fence                                → the consumer's fence probe (not a row)
 ```
 
@@ -266,7 +266,7 @@ exactly the surviving `prepared/` entries — a crash between commit and
 delete leaves the entry, and recovery receipt-checks it (a 200 settles
 the range locally with zero republication; a 404 replays the persisted
 bytes byte-identically, and the server's receipt dedupes a landing
-replay). The `prepared/` envelope (v5, the only version) carries the
+replay). The `prepared/` envelope carries the
 idempotency key's derivation inputs — `topic`, `partition` and the
 partition tuple as hoglake partition values (field names beside wire
 strings) — beside the key and body, so a recovered entry is
@@ -275,7 +275,11 @@ identity and its `prepared/` key; it records `row_count`, the rows the
 window held when the request was built, which every recovery settle
 uses as its expected count (a window holding a different count by then
 halts `settlement_mismatch`, rolled back, rather than settling a row
-the commit did not publish); and it carries `persisted_at`, which
+the commit did not publish); it records `digest`, the window's
+content digest, so a later settle can verify content and not only
+count (a topic recreated under the same name can re-put the same keys
+with new payloads; that check is not wired yet); and it carries
+`persisted_at`, which
 the replay logs as the entry's age and which gates nothing: a 404 is
 replayed whatever the age, and a replay answered 410 re-prepares from
 the staged rows (§Delivery semantics). Recovery also
@@ -342,10 +346,13 @@ shape (AGENT.md invariant 12 exists because of that shape):
   published (`millrace_flush_deduped_total`). Different rows under the
   same bounds (a recreated topic, an offset restart, a re-key) have
   another key and publish as a new commit — never settled from another
-  commit's receipt. A 422 reused-key halts on both paths: on a fresh
-  publish another writer committed this content after the lookup, on a
-  persisted entry's verbatim replay a foreign writer or broken
-  determinism.
+  commit's receipt. A 422 reused-key on a fresh publish is re-checked
+  against the receipt: the key is content-exact, so a receipt proves
+  these rows landed (another writer committed them after the lookup —
+  a suspected second owner, logged) and the window settles from it; no
+  receipt is a server inconsistency and halts. On a persisted entry's
+  verbatim replay a 422 means a foreign writer or broken determinism,
+  and halts.
 - An answered refusal is judged, not retried, and never deletes staged
   rows. Every answered 4xx outside the named arms — a proxy's 401/403,
   an ingress's 413, a request-shape `validation` 422, a per-record

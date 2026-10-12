@@ -783,8 +783,9 @@ class PartitionStage:
     ) -> PreparedRequest | None:
         """Point-read one persisted prepared request."""
         self._ensure_open()
-        raw = await self._db.get(keyspace.prepared_key(group, first_offset))
-        return keyspace.decode_prepared_value(raw) if raw is not None else None
+        key = keyspace.prepared_key(group, first_offset)
+        raw = await self._db.get(key)
+        return self._decode_prepared(key, raw).request if raw is not None else None
 
     async def list_prepared(self, group: PartitionTuple) -> list[RecoveredPrepared]:
         """Every persisted ``prepared/`` entry of ONE partition tuple, in
@@ -801,10 +802,7 @@ class PartitionStage:
         self._ensure_open()
         start, end = keyspace.group_prepared_range(group)
         return [
-            RecoveredPrepared(
-                key=keyspace.decode_prepared_key(key),
-                request=keyspace.decode_prepared_value(value),
-            )
+            self._decode_prepared(key, value)
             async for key, value in self._iter_range(start, end)
         ]
 
@@ -813,12 +811,24 @@ class PartitionStage:
         order — the flusher's replay set."""
         self._ensure_open()
         return [
-            RecoveredPrepared(
+            self._decode_prepared(key, value)
+            for key, value in await self._scan_prefix(keyspace.PREPARED_PREFIX)
+        ]
+
+    def _decode_prepared(self, key: bytes, value: bytes) -> RecoveredPrepared:
+        """One ``prepared/`` entry, decoded — or, for an entry that does
+        not decode (corruption), a :class:`StageCorruptionError` naming
+        the partition and the raw key rather than a bare ``ValueError``."""
+        try:
+            return RecoveredPrepared(
                 key=keyspace.decode_prepared_key(key),
                 request=keyspace.decode_prepared_value(value),
             )
-            for key, value in await self._scan_prefix(keyspace.PREPARED_PREFIX)
-        ]
+        except ValueError as e:
+            raise StageCorruptionError(
+                f"{self._topic}[{self._partition}]: the prepared/ entry at key "
+                f"{bytes(key)!r} is corrupt: {e}"
+            ) from e
 
     async def drop_prepared(self, group: PartitionTuple, first_offset: int) -> None:
         """Delete one ``prepared/`` entry on its own — for abandoning a
