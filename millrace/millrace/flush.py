@@ -1,10 +1,15 @@
 """The flush path: staged range → Arrow → parquet → prepared commit.
 
 One key's flush (docs/kafka-ingestion.md §The flush planner and §The
-wire contract): scan the staged range → decode payloads (v1: JSON
-values) → clamp/quarantine junk ``event_time`` → one parquet file per
-``(team_id, month(timestamp))`` partition tuple under the table's LIVE
-partition spec → upload → persist the complete prepared request under
+wire contract) — a key is one hoglake partition tuple's staged rows
+(the consumer staged each record under the tuple the destination's spec
+gave it at consume time): scan the staged range → decode payloads (v1:
+JSON values) → clamp/quarantine junk ``event_time`` → one parquet file
+per partition tuple under the table's LIVE partition spec (exactly one
+file in the steady state, where the staged tuple and the live spec
+agree; more when the group was keyed under an older spec or the junk
+policy clamped a temporal source — the fanout is the correctness
+backstop) → upload → persist the complete prepared request under
 ``prepared/`` → ``commit/prepared`` → on receipt, ONE staging
 transaction deletes the staged range and the sched entries and drops
 the persisted request. No ``flushed/`` marker: the settle is atomic and
@@ -130,7 +135,7 @@ under-compression direction and row-boundary quantization — an
 over-sized file is a sizing miss compaction absorbs, an under-sized one
 is the small-file regime the design exists to kill. The window is
 ``[first_scanned_offset, last_scanned_offset]`` when the scan covered
-the team's whole staged slice — the steady state, where caps never
+the group's whole staged slice — the steady state, where caps never
 bind: staged offsets only ever grow past a scan snapshot, so settling
 the span deletes exactly the published rows. Only a TRUNCATED scan
 (one a cap cut short) narrows, to ``[first_scanned_offset, K]`` where
@@ -144,7 +149,7 @@ row larger than the byte budget still flushes (one record is always a
 bounded unit), probed with a one-row scan. Memory shape per decision:
 ≤ ``max(scan_budget, largest row)`` payload bytes materialized plus
 ``≤ flush_scan_max_rows`` decoded records and the Arrow build over
-them; the settlement streams the team's slice within its transaction
+them; the settlement streams the group's slice within its transaction
 but deletes only the window's rows.
 
 Compression-ratio feedback (the planner's size lane is fed an OBSERVED
@@ -181,12 +186,13 @@ receipt may have been purged server-side
 (``HOGLAKE_RECEIPT_RETENTION_SECONDS``, default 7 d), and replaying
 could duplicate an already-executed commit
 (``MILLRACE_RECEIPT_HORIZON_S``, default 6 d — deliberately below;
-``persisted_at`` on the v2+ ``prepared/`` envelope is the guard's
-input, and a legacy v1 entry of unknown age is halt-safe). The current
-envelope is v3: it additionally carries the idempotency key's
-derivation inputs (``topic``, ``partition``), cross-checked against the
-stage's own identity at recovery — an entry naming another partition is
-foreign state, refused as corruption rather than replayed under it.
+``persisted_at`` on the ``prepared/`` envelope is the guard's input).
+The envelope (v4) also carries the idempotency key's derivation inputs
+— ``topic``, ``partition`` and the partition tuple as hoglake partition
+values (field names beside wire strings) — cross-checked at recovery
+against the stage's own identity and the ``prepared/`` key: an entry
+naming another partition or tuple is foreign state, refused as
+corruption rather than replayed under it.
 
 Junk ``event_time`` policy: the check applies to the decoded values of
 the live partition spec's TEMPORAL source columns (a ``month(timestamp)``
@@ -233,8 +239,6 @@ throughout.
 from __future__ import annotations
 
 import asyncio
-import base64
-import binascii
 import importlib.metadata
 import json
 import logging
@@ -242,14 +246,11 @@ import math
 import re
 import struct
 import time
-import uuid as _uuid
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from concurrent.futures import Executor, ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
-from datetime import time as dtime
-from decimal import Decimal, localcontext
+from datetime import timedelta
 from functools import partial
 from typing import Any, Final, Literal, Protocol, TypeVar
 from urllib.parse import quote
@@ -293,7 +294,18 @@ from pyhoglake.upload import (
 from slatedb.uniffi import Error as _SlateError
 
 from . import keyspace
+from .coerce import (
+    EPOCH_DATE,
+    MICROS_PER_DAY,
+    REASON_UNCASTABLE_COLUMN,
+    TIMESTAMP_UNITS,
+    DecodeError,
+    UnsupportedColumnError,
+    coercer_for,
+    load_json_object,
+)
 from .config import Config, EventTimePolicy
+from .grouping import field_names
 from .keyspace import FlushedKey, OffsetRange, PreparedRequest
 from .planner import (
     DEFAULT_COMPRESSION_RATIO,
@@ -319,17 +331,11 @@ log = logging.getLogger(__name__)
 _R = TypeVar("_R")
 
 _MICROS_PER_SECOND: Final = 1_000_000
-_MICROS_PER_DAY: Final = 86_400_000_000
-_EPOCH_DATE: Final = date(1970, 1, 1)
-# Naive-by-construction UTC wall time (ruff's DTZ001 refuses the bare
-# constructor; the function that subtracts this takes naive-UTC inputs).
-_EPOCH_DATETIME: Final = datetime.fromisoformat("1970-01-01T00:00:00")
 
 # -- the flush's bounded quarantine vocabulary (the keyspace poison envelope
-# stores these strings; the consumer's REASON_* constants cover the
-# consume-time half) --
-REASON_UNDECODABLE_PAYLOAD: Final = "undecodable_payload"
-REASON_UNCASTABLE_COLUMN: Final = "uncastable_column"
+# stores these strings; the decode half — undecodable_payload,
+# uncastable_column — lives in coerce.py, and the consumer's REASON_*
+# constants cover the consume-time half) --
 REASON_EVENT_TIME_OUT_OF_WINDOW: Final = "event_time_out_of_window"
 REASON_FLUSH_REFUSED: Final = "flush_refused"
 
@@ -409,8 +415,8 @@ class FlushError(Exception):
 
 
 class FlushStartupError(FlushError):
-    """Startup resolution/validation failed: the catalog, namespace, table,
-    incarnation, the server's capability set or the destination's shape —
+    """Startup resolution/validation failed: the catalog, namespace or
+    table, the server's capability set or the destination's shape —
     fail-fast at boot, never a runtime surprise (docs/kafka-ingestion.md
     §Deployment)."""
 
@@ -426,9 +432,10 @@ class FlushHalted(FlushError):
     commit bound cannot hold, or a persisted ``prepared/`` entry whose
     receipt 404s PAST the receipt horizon (replaying it could duplicate
     an already-executed commit — operator reconciliation, never a blind
-    replay). ``reason`` is the bounded vocabulary for metrics;
-    ``detail`` carries the operator-facing text (for a 410, the server's
-    reconcile instructions)."""
+    replay). ``reason`` is a bounded vocabulary, named in the exception
+    text, the halt log line and the ``/healthz`` 503 body (no metric
+    exports it); ``detail`` carries the operator-facing text (for a 410,
+    the server's reconcile instructions)."""
 
     def __init__(self, reason: str, detail: str) -> None:
         super().__init__(f"{reason}: {detail}")
@@ -441,23 +448,6 @@ class FlushPublishExhausted(FlushError):
     persisted ``prepared/`` entry stays: the next sweep replays it
     (receipt lookup first). Contained per decision by the runner — the
     sweep is never wedged by one key."""
-
-
-class DecodeError(ValueError):
-    """One staged payload cannot become a row: not a JSON document/object,
-    or a value that cannot be coerced to its catalog column. Per-record —
-    the flush quarantines the record and moves on. ``reason`` is the
-    poison-envelope vocabulary."""
-
-    def __init__(self, message: str, *, reason: str) -> None:
-        super().__init__(message)
-        self.reason = reason
-
-
-class UnsupportedColumnError(FlushStartupError):
-    """The destination table carries a column type the v1 JSON decoder
-    does not support (json / list / struct / map / variant). Named at
-    startup, with the column."""
 
 
 # -- counters ------------------------------------------------------------------
@@ -587,439 +577,6 @@ class PayloadDecoder(Protocol):
         ...
 
 
-_INT_BOUNDS: Final = {
-    "int8": (-(1 << 7), (1 << 7) - 1),
-    "int16": (-(1 << 15), (1 << 15) - 1),
-    "int": (-(1 << 31), (1 << 31) - 1),
-    "long": (-(1 << 63), (1 << 63) - 1),
-    "uint8": (0, (1 << 8) - 1),
-    "uint16": (0, (1 << 16) - 1),
-    "uint32": (0, (1 << 32) - 1),
-    "uint64": (0, (1 << 64) - 1),
-}
-
-# Micros per one unit of the column type (and nanos-per-micro for ns).
-_TIMESTAMP_UNITS: Final = {
-    "timestamp_s": 1_000_000,
-    "timestamp_ms": 1_000,
-    "timestamp": 1,
-    "timestamptz": 1,
-}
-
-# int64 bounds for a timestamp column's value IN ITS OWN UNIT. Anything
-# wider dies later and worse: ``pa.array`` raises ``OverflowError`` on an
-# out-of-int64 value at BATCH build time (one bad record killing the
-# flush), and the s→ms storage cast (``_encode_schema``) raises
-# ``ArrowInvalid`` on seconds that overflow milliseconds — so
-# ``timestamp_s`` is bounded by the millisecond-representable range, the
-# others by int64. The junk ``event_time`` window only covers the live
-# spec's temporal partition sources; every OTHER temporal column is
-# covered by exactly this check.
-_INT64_BOUNDS: Final = (-(1 << 63), (1 << 63) - 1)
-_TIMESTAMP_VALUE_BOUNDS: Final = {
-    "timestamp_s": (-((1 << 63) // 1000), ((1 << 63) - 1) // 1000),
-    "timestamp_ms": _INT64_BOUNDS,
-    "timestamp": _INT64_BOUNDS,
-    "timestamp_ns": _INT64_BOUNDS,
-    "timestamptz": _INT64_BOUNDS,
-}
-
-_ISO_FRACTION: Final = re.compile(r"\.(\d+)")
-
-
-def _reject_constant(raw: str) -> Any:
-    """json.loads parse_constant hook: NaN/Infinity are not JSON."""
-    raise DecodeError(
-        f"{raw} is not valid JSON (strict mode: no NaN/Infinity)",
-        reason=REASON_UNDECODABLE_PAYLOAD,
-    )
-
-
-def _coerce_bool(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    raise DecodeError(
-        f"expected a JSON boolean, got {type(value).__name__}",
-        reason=REASON_UNCASTABLE_COLUMN,
-    )
-
-
-def _coerce_int(value: Any, type_name: str, lo: int, hi: int) -> int:
-    # isinstance(bool) is isinstance(int) — exclude it explicitly.
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise DecodeError(
-            f"expected a JSON integer for {type_name}, got {type(value).__name__}",
-            reason=REASON_UNCASTABLE_COLUMN,
-        )
-    if not lo <= value <= hi:
-        raise DecodeError(
-            f"value {value} does not fit in {type_name}",
-            reason=REASON_UNCASTABLE_COLUMN,
-        )
-    return value
-
-
-def _coerce_float(value: Any) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise DecodeError(
-            f"expected a JSON number, got {type(value).__name__}",
-            reason=REASON_UNCASTABLE_COLUMN,
-        )
-    try:
-        result = float(value)
-    except OverflowError as e:
-        # float(10**400): a JSON integer too large for a double.
-        raise DecodeError(
-            f"integer value does not fit in a double: {e}",
-            reason=REASON_UNCASTABLE_COLUMN,
-        ) from e
-    if not math.isfinite(result):
-        # json.loads("1e400") parses to inf WITHOUT tripping
-        # parse_constant (that hook only sees the NaN/Infinity
-        # literals): a magnitude-overflow literal is valid JSON syntax
-        # carrying a value no double holds. Refuse it here, or inf
-        # would land in the column and its stats.
-        raise DecodeError(
-            f"non-finite double ({result!r}): the JSON literal overflows "
-            "a double (e.g. 1e400)",
-            reason=REASON_UNCASTABLE_COLUMN,
-        )
-    return result
-
-
-#: The largest finite float32, exactly representable as a double
-#: (``struct.unpack(">f", bytes.fromhex("7f7fffff"))[0]``). A catalog
-#: ``float`` column narrows coerced doubles through Arrow's float32
-#: conversion, which produces INF WITHOUT ERROR past this magnitude —
-#: so the double-range check alone would publish infinity under the
-#: non-finite guard's nose.
-_FLOAT32_MAX: Final = 3.4028234663852886e38
-
-
-def _coerce_float32(value: Any) -> float:
-    """A catalog ``float`` (float32) column's coercion: the double
-    checks PLUS float32 range. Arrow narrows the Python double with a
-    native float cast that yields +/-inf for out-of-range magnitudes
-    WITHOUT raising (probe-pinned on pyarrow 21–25), so a finite JSON
-    double like ``1e100`` would publish infinity — defeating the
-    non-finite guard — unless the magnitude is refused here. The check
-    is deliberately the simple honest one: |v| > float32 max ⇒ refuse
-    (the half-ulp band just above max that would round DOWN to a finite
-    float32 is refused too — conservatism there is a rounding the
-    producer cannot have meant); non-finite stays refused via
-    :func:`_coerce_float`."""
-    result = _coerce_float(value)
-    if abs(result) > _FLOAT32_MAX:
-        raise DecodeError(
-            f"value {result!r} overflows a float32 (|v| > {_FLOAT32_MAX}); "
-            "Arrow's narrowing cast would store infinity",
-            reason=REASON_UNCASTABLE_COLUMN,
-        )
-    return result
-
-
-def _coerce_str(value: Any) -> str:
-    if not isinstance(value, str):
-        raise DecodeError(
-            f"expected a JSON string, got {type(value).__name__}",
-            reason=REASON_UNCASTABLE_COLUMN,
-        )
-    try:
-        value.encode("utf-8")
-    except UnicodeEncodeError as e:
-        # json.loads('{"event":"\\ud800"}') SUCCEEDS, producing a lone
-        # surrogate Python's str happily holds — but Arrow's UTF-8
-        # string conversion raises UnicodeEncodeError (neither
-        # pa.ArrowException nor OverflowError — outside the batch
-        # build's per-record isolation taxonomy), so one such record
-        # would fail its whole flush window identically forever.
-        # Refuse here instead: per-record quarantine, the batch
-        # survives.
-        raise DecodeError(
-            f"string is not valid UTF-8 ({e}); refusing a surrogate-bearing "
-            "value before the Arrow build",
-            reason=REASON_UNCASTABLE_COLUMN,
-        ) from e
-    return value
-
-
-def _coerce_b64(value: Any) -> bytes:
-    if not isinstance(value, str):
-        raise DecodeError(
-            f"expected a base64 string for a binary column, got {type(value).__name__}",
-            reason=REASON_UNCASTABLE_COLUMN,
-        )
-    try:
-        return base64.b64decode(value.encode("ascii"), validate=True)
-    except (binascii.Error, UnicodeEncodeError) as e:
-        raise DecodeError(
-            f"invalid base64 for a binary column: {e}",
-            reason=REASON_UNCASTABLE_COLUMN,
-        ) from e
-
-
-def _coerce_uuid_bytes(value: Any) -> bytes:
-    if not isinstance(value, str):
-        raise DecodeError(
-            f"expected a UUID string, got {type(value).__name__}",
-            reason=REASON_UNCASTABLE_COLUMN,
-        )
-    try:
-        return _uuid.UUID(value).bytes
-    except ValueError as e:
-        raise DecodeError(
-            f"invalid UUID string {value!r}",
-            reason=REASON_UNCASTABLE_COLUMN,
-        ) from e
-
-
-def _coerce_decimal(value: Any, type_params: dict[str, Any] | None) -> Decimal:
-    """int or decimal string → Decimal, precision/scale checked (never
-    rounded: a value that does not fit exactly is a decode failure, not a
-    silent mutation). JSON floats are refused — a binary float is not the
-    decimal the producer wrote."""
-    if isinstance(value, bool) or not isinstance(value, (int, str)):
-        raise DecodeError(
-            f"expected a JSON integer or decimal string, got {type(value).__name__}",
-            reason=REASON_UNCASTABLE_COLUMN,
-        )
-    params = type_params or {}
-    precision = int(params["precision"])
-    scale = int(params["scale"])
-    try:
-        d = Decimal(str(value))
-    except ArithmeticError as e:
-        raise DecodeError(
-            f"invalid decimal {value!r}", reason=REASON_UNCASTABLE_COLUMN
-        ) from e
-    if not d.is_finite():
-        raise DecodeError(
-            f"non-finite decimal {value!r}", reason=REASON_UNCASTABLE_COLUMN
-        )
-    with localcontext() as ctx:
-        ctx.prec = 60
-        # value * 10^scale must be an integer, or accepting the value
-        # would round it.
-        scaled = d.scaleb(scale)
-        if scaled != scaled.to_integral_value():
-            raise DecodeError(
-                f"decimal {value!r} has more than {scale} fractional digits; "
-                "refusing to round",
-                reason=REASON_UNCASTABLE_COLUMN,
-            )
-        digits = len(scaled.to_integral_value().as_tuple().digits)
-    if digits > precision:
-        raise DecodeError(
-            f"decimal {value!r} exceeds precision {precision}",
-            reason=REASON_UNCASTABLE_COLUMN,
-        )
-    return d
-
-
-def _coerce_date(value: Any) -> date:
-    if isinstance(value, str):
-        try:
-            return date.fromisoformat(value)
-        except ValueError as e:
-            raise DecodeError(
-                f"invalid ISO-8601 date {value!r}",
-                reason=REASON_UNCASTABLE_COLUMN,
-            ) from e
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise DecodeError(
-            f"expected an ISO-8601 date string or epoch-days integer, got "
-            f"{type(value).__name__}",
-            reason=REASON_UNCASTABLE_COLUMN,
-        )
-    try:
-        return _EPOCH_DATE + timedelta(days=value)
-    except OverflowError as e:
-        raise DecodeError(
-            f"epoch-days value {value} is out of range",
-            reason=REASON_UNCASTABLE_COLUMN,
-        ) from e
-
-
-def _time_to_micros(t: dtime) -> int:
-    return (
-        t.hour * 3600 + t.minute * 60 + t.second
-    ) * _MICROS_PER_SECOND + t.microsecond
-
-
-def _coerce_time_micros(value: Any) -> int:
-    if isinstance(value, str):
-        try:
-            t = dtime.fromisoformat(value)
-        except ValueError as e:
-            raise DecodeError(
-                f"invalid ISO-8601 time {value!r}",
-                reason=REASON_UNCASTABLE_COLUMN,
-            ) from e
-        if t.tzinfo is not None:
-            raise DecodeError(
-                f"time column does not take a timezone: {value!r}",
-                reason=REASON_UNCASTABLE_COLUMN,
-            )
-        return _time_to_micros(t)
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise DecodeError(
-            f"expected an ISO-8601 time string or micros-since-midnight "
-            f"integer, got {type(value).__name__}",
-            reason=REASON_UNCASTABLE_COLUMN,
-        )
-    if not 0 <= value < _MICROS_PER_DAY:
-        raise DecodeError(
-            f"micros-since-midnight {value} is out of range",
-            reason=REASON_UNCASTABLE_COLUMN,
-        )
-    return value
-
-
-def _datetime_to_micros(dt: datetime) -> int:
-    """Exact integer micros since the epoch (a naive datetime is read as
-    UTC wall time — the tz-aware caller subtracts its offset first)."""
-    delta = dt - _EPOCH_DATETIME
-    return (
-        delta.days * _MICROS_PER_DAY
-        + delta.seconds * _MICROS_PER_SECOND
-        + delta.microseconds
-    )
-
-
-def _coerce_timestamp(value: Any, type_name: str, *, tz: bool) -> int:
-    """An instant as an integer in the column's own unit (epoch seconds
-    for ``timestamp_s``, millis, micros — ``timestamptz`` is micros — and
-    nanos for ``timestamp_ns``), or a strict ISO-8601 string.
-
-    Strings never silently lose precision: a sub-unit fraction is refused
-    outright (a timestamp_s column takes only whole seconds from text),
-    and sub-microsecond digits are refused even for timestamp_ns (the
-    integer form is the exact one). Naive strings feed naive columns and
-    offset-carrying strings feed ``timestamptz``; the mismatches are
-    refused rather than reinterpreted. The result — from either form —
-    must fit the column's unit in int64 (``timestamp_s`` in stored
-    milliseconds): a magnitude outside it is a coercion failure, never
-    a batch-killing ``OverflowError`` at Arrow build time."""
-    if isinstance(value, bool):
-        raise DecodeError(
-            "expected a timestamp, got a JSON boolean",
-            reason=REASON_UNCASTABLE_COLUMN,
-        )
-    if isinstance(value, int):
-        result = value
-    elif not isinstance(value, str):
-        raise DecodeError(
-            f"expected an epoch integer or ISO-8601 string for {type_name}, "
-            f"got {type(value).__name__}",
-            reason=REASON_UNCASTABLE_COLUMN,
-        )
-    else:
-        fraction = _ISO_FRACTION.search(value)
-        if (
-            fraction is not None
-            and len(fraction.group(1)) > 6
-            and any(d != "0" for d in fraction.group(1)[6:])
-        ):
-            raise DecodeError(
-                f"ISO-8601 timestamp {value!r} has sub-microsecond digits; "
-                "use the integer form for nanosecond precision",
-                reason=REASON_UNCASTABLE_COLUMN,
-            )
-        try:
-            dt = datetime.fromisoformat(value)
-        except ValueError as e:
-            raise DecodeError(
-                f"invalid ISO-8601 timestamp {value!r}",
-                reason=REASON_UNCASTABLE_COLUMN,
-            ) from e
-        if tz:
-            if dt.tzinfo is None:
-                raise DecodeError(
-                    f"timestamptz requires an offset ('Z' or '+hh:mm'): {value!r}",
-                    reason=REASON_UNCASTABLE_COLUMN,
-                )
-            offset = dt.utcoffset()
-            assert offset is not None  # tzinfo present ⇒ offset computable
-            micros = _datetime_to_micros(dt.replace(tzinfo=None) - offset)
-        else:
-            if dt.tzinfo is not None:
-                raise DecodeError(
-                    f"naive {type_name} does not take an offset: {value!r}",
-                    reason=REASON_UNCASTABLE_COLUMN,
-                )
-            micros = _datetime_to_micros(dt)
-        if type_name == "timestamp_ns":
-            result = micros * 1000
-        else:
-            unit_us = _TIMESTAMP_UNITS[type_name]
-            if micros % unit_us:
-                raise DecodeError(
-                    f"timestamp {value!r} is finer than {type_name}'s unit; "
-                    "refusing to truncate",
-                    reason=REASON_UNCASTABLE_COLUMN,
-                )
-            result = micros // unit_us
-    lo, hi = _TIMESTAMP_VALUE_BOUNDS[type_name]
-    if not lo <= result <= hi:
-        raise DecodeError(
-            f"{type_name} value {result} is outside the int64-representable "
-            f"range for its unit [{lo}, {hi}]",
-            reason=REASON_UNCASTABLE_COLUMN,
-        )
-    return result
-
-
-def _coercer_for(column: Column) -> Callable[[Any], Any]:
-    t = column.type
-    if t == "boolean":
-        return _coerce_bool
-    if t in _INT_BOUNDS:
-        lo, hi = _INT_BOUNDS[t]
-        return lambda v: _coerce_int(v, t, lo, hi)
-    if t == "float":
-        # float32: Arrow's narrowing cast produces inf WITHOUT error on
-        # out-of-range doubles — range-checked per record (the coercion
-        # must stay total or one value wedges the batch build).
-        return _coerce_float32
-    if t == "double":
-        return _coerce_float
-    if t == "string":
-        return _coerce_str
-    if t == "binary":
-        return _coerce_b64
-    if t == "uuid":
-        return _coerce_uuid_bytes
-    if t == "decimal":
-        # Eager shape validation: a decimal column whose type_params are
-        # missing or unbuildable (precision outside decimal128's 1..38) is
-        # a STARTUP refusal, not a per-record failure — otherwise the
-        # per-record coercion KeyErrors (or the Arrow schema build raises)
-        # at flush time, wedging the key on a destination defect.
-        params = column.type_params or {}
-        try:
-            pa.decimal128(int(params["precision"]), int(params["scale"]))
-        except (KeyError, TypeError, ValueError) as e:
-            raise UnsupportedColumnError(
-                f"column {column.name!r} is decimal but its type_params "
-                f"({column.type_params!r}) do not build a decimal128: {e}"
-            ) from e
-        return lambda v: _coerce_decimal(v, column.type_params)
-    if t == "date":
-        return _coerce_date
-    if t == "time":
-        return _coerce_time_micros
-    if t in ("timestamp_s", "timestamp_ms", "timestamp", "timestamp_ns"):
-        return lambda v: _coerce_timestamp(v, t, tz=False)
-    if t == "timestamptz":
-        return lambda v: _coerce_timestamp(v, t, tz=True)
-    raise UnsupportedColumnError(
-        f"column {column.name!r} has type {t!r}, which the v1 JSON decoder "
-        "does not support (supported: boolean, the int widths, float/double, "
-        "string, binary, uuid, decimal, date, time and the timestamp family; "
-        "json, nested and variant columns need a later decoder)"
-    )
-
-
 class JsonObjectDecoder:
     """v1 decoder: staged payloads are JSON objects; keys are column
     names. Defensive per record (the flush quarantines failures, never
@@ -1033,7 +590,7 @@ class JsonObjectDecoder:
 
     def __init__(self, columns: tuple[Column, ...] | Sequence[Column]) -> None:
         self._columns = tuple(columns)
-        self._plans = tuple((c, _coercer_for(c)) for c in self._columns)
+        self._plans = tuple((c, coercer_for(c)) for c in self._columns)
         self._names = frozenset(c.name for c in self._columns)
 
     @property
@@ -1041,25 +598,7 @@ class JsonObjectDecoder:
         return self._columns
 
     def decode_record(self, payload: bytes) -> DecodedRecord:
-        try:
-            doc = json.loads(payload, parse_constant=_reject_constant)
-        except DecodeError:
-            raise
-        except (ValueError, RecursionError) as e:
-            # ValueError: not JSON (and the int-digit limit, and invalid
-            # UTF-8 — both ValueError subclasses). RecursionError: a
-            # payload nested past the interpreter limit — the C scanner
-            # reports it that way, and it is just as per-record as a
-            # syntax error.
-            raise DecodeError(
-                f"payload is not a JSON document: {e}",
-                reason=REASON_UNDECODABLE_PAYLOAD,
-            ) from e
-        if not isinstance(doc, dict):
-            raise DecodeError(
-                f"payload is a JSON {type(doc).__name__}, not an object",
-                reason=REASON_UNDECODABLE_PAYLOAD,
-            )
+        doc = load_json_object(payload)
         values: dict[str, Any] = {}
         for column, coerce in self._plans:
             raw = doc.get(column.name)
@@ -1099,20 +638,20 @@ class JunkWindow:
 def _value_to_micros(col_type: str, value: Any) -> int:
     """A coerced temporal value → epoch micros for the window check."""
     if col_type == "date":
-        days: int = (value - _EPOCH_DATE).days
-        return days * _MICROS_PER_DAY
+        days: int = (value - EPOCH_DATE).days
+        return days * MICROS_PER_DAY
     v = int(value)
     if col_type == "timestamp_ns":
         return v // 1000
-    return v * _TIMESTAMP_UNITS[col_type]
+    return v * TIMESTAMP_UNITS[col_type]
 
 
 def _micros_to_value(col_type: str, micros: int) -> Any:
     if col_type == "date":
-        return _EPOCH_DATE + timedelta(days=micros // _MICROS_PER_DAY)
+        return EPOCH_DATE + timedelta(days=micros // MICROS_PER_DAY)
     if col_type == "timestamp_ns":
         return micros * 1000
-    return micros // _TIMESTAMP_UNITS[col_type]
+    return micros // TIMESTAMP_UNITS[col_type]
 
 
 def _temporal_sources(info: TableInfo) -> tuple[tuple[Any, Column], ...]:
@@ -1177,7 +716,7 @@ def _build_arrow(
 ) -> pa.Table:
     """Column-aligned records → the Arrow table at the catalog's schema
     (field ids embedded). Rows keep SCAN order here — (Kafka record
-    timestamp, offset) within the team; :func:`build_prepared_plan` then
+    timestamp, offset) within the group; :func:`build_prepared_plan` then
     sorts the batch by the live catalog sort spec (payload event time)
     before the partition fanout — the sort, not the scan order, is what
     the ingest-sort / catalog-sort-spec convergence rests on
@@ -1402,7 +941,7 @@ def _partition_groups(
 def format_commit_message(
     *,
     table_uuid: str,
-    team_id: int,
+    group: str,
     trigger: FlushTrigger,
     records: int,
     quarantined: int,
@@ -1436,7 +975,7 @@ def format_commit_message(
     elides only middle ranges, which are forensic-only.
     """
     summary = (
-        f"millrace=v1 table={table_uuid} team={team_id} trigger={trigger} "
+        f"millrace=v1 table={table_uuid} group={group} trigger={trigger} "
         f"records={records} quarantined={quarantined} files={files} "
         f"partitions={partitions} staged_bytes={staged_bytes} "
         f"arrow_bytes={arrow_bytes} millrace={_message_token(version)}"
@@ -1531,7 +1070,7 @@ def _covered_window(
 
     A flush publishes exactly the rows the settlement's offset window
     will delete (``keyspace.row_in_flushed_range``), so the window must
-    satisfy: every staged row of the team with offset in the window WAS
+    satisfy: every staged row of the group with offset in the window WAS
     scanned. A capped scan is a prefix in ``(timestamp, offset)`` key
     order, and Kafka record timestamps are not offset-monotone, so the
     naive ``[min, max]`` of scanned offsets can span an UNSCANNED row
@@ -1539,18 +1078,18 @@ def _covered_window(
     would delete a row that was never published (the guard would halt;
     the narrowing avoids the wedge on real catch-up data). The caller
     narrows ONLY when a cap actually cut the scan short: an untruncated
-    scan saw the team's whole staged slice, and its own offset span is
+    scan saw the group's whole staged slice, and its own offset span is
     the window.
 
     The ``offsets/`` record holds one ``[first, last]`` span per staged
-    batch per team (arrival structure — gaps between a batch's own
-    offsets belong to other teams and are NOT representable), so the
-    record is a sound OVER-approximation of the team's staged-offset
+    batch per group (arrival structure — gaps between a batch's own
+    offsets belong to other groups and are NOT representable), so the
+    record is a sound OVER-approximation of the group's staged-offset
     set: every staged offset lies inside some span, but a span's
-    interior can name offsets that are not this team's rows. The walk
+    interior can name offsets that are not this group's rows. The walk
     treats a span interior the scan missed as a hole either way — sound
     (the window never covers an unscanned row), and for interleaved
-    teams potentially tighter than the true covered prefix; the steady
+    groups potentially tighter than the true covered prefix; the steady
     state never truncates, so this conservatism is confined to catch-up
     scans under timestamp inversion.
 
@@ -1559,7 +1098,7 @@ def _covered_window(
     in-record offset in ``[m, K]`` is scanned — ranges are walked
     against the sorted scan; a range fully covered is skipped
     arithmetically, a range with a hole ends the window at the hole.
-    Runs of offsets belonging to other teams or to quarantined records
+    Runs of offsets belonging to other groups or to quarantined records
     (gaps BETWEEN ranges) need no coverage.
 
     Pure; deterministic in its inputs (the window's identity comes from
@@ -1606,7 +1145,8 @@ class FlushContext:
 
     topic: str
     partition: int
-    team_id: int
+    group: keyspace.PartitionTuple
+    group_fields: tuple[str, ...]
     trigger: FlushTrigger
     first_offset: int
     last_offset: int
@@ -1671,9 +1211,9 @@ def build_prepared_plan(
 
     Deterministic object names: ``{data_path}/data/{ns}/{table}/
     {idempotency_key}/{index}.parquet``. The key derives from
-    ``(table_uuid, topic, partition, team_id, first_offset,
+    ``(table_uuid, topic, partition, partition tuple, first_offset,
     last_offset)``, so the same staged range names the same objects
-    forever — and two partitions flushing one team over the same offset
+    forever — and two partitions flushing one tuple over the same offset
     range name DIFFERENT objects (offsets are per partition; PR #331
     review) — and a rebuild after a crash between upload and persist
     rewrites the SAME names instead of doubling the orphans.
@@ -1800,7 +1340,7 @@ def build_prepared_plan(
     # orphan (millpond's rule, pinned by a source-order test).
     message = format_commit_message(
         table_uuid=ctx.table_uuid,
-        team_id=ctx.team_id,
+        group=keyspace.group_label(ctx.group_fields, ctx.group),
         trigger=ctx.trigger,
         records=sum(part.num_rows for _, part in groups),
         quarantined=len(quarantined),
@@ -1902,7 +1442,7 @@ class FlushReport:
 
     topic: str
     partition: int
-    team_id: int
+    group: keyspace.PartitionTuple
     trigger: FlushTrigger | Literal["recovery"]
     outcome: FlushOutcome
     first_offset: int
@@ -2003,6 +1543,116 @@ def _shape_fingerprint(info: TableInfo) -> tuple[Any, ...]:
     )
 
 
+def read_destination(client: HoglakeClient, cfg: Config) -> tuple[Catalog, TableInfo]:
+    """The startup identity read: catalog → namespace → table, the table
+    read ``totals=false`` (the ``Table`` handle is built straight from it
+    rather than through ``Namespace.table()``, which issues a plain GET).
+    A server that does not report ``read_snapshot_id`` is refused: without
+    it there is no conflict basis worth sending. Raises
+    :class:`FlushStartupError`."""
+    try:
+        catalog = client.catalog(cfg.catalog)
+        # Existence-check the namespace (the API has no per-namespace
+        # GET; the listing is the check).
+        catalog.namespace(cfg.namespace)
+        request = getattr(client, "_request", None)
+        if request is None:
+            raise FlushStartupError(
+                "pyhoglake no longer exposes HoglakeClient._request; "
+                "millrace's identity reads and receipt lookups cannot run"
+            )
+        body = request(
+            "GET",
+            f"/catalogs/{_seg(cfg.catalog)}/namespaces/{_seg(cfg.namespace)}"
+            f"/tables/{_seg(cfg.table)}",
+            params={"totals": "false"},
+        )
+        info = TableInfo.from_wire(body)
+    except FlushStartupError:
+        raise
+    except (HoglakeError, httpx.HTTPError, OSError) as e:
+        raise FlushStartupError(
+            f"cannot resolve the hoglake destination "
+            f"{cfg.catalog}/{cfg.namespace}/{cfg.table}: {e}"
+        ) from e
+    if info.read_snapshot_id is None:
+        raise FlushStartupError(
+            f"the hoglake server did not report read_snapshot_id for "
+            f"{cfg.namespace}.{cfg.table}: millrace requires a server "
+            "whose table reads carry the snapshot they resolved at "
+            "(the commit's conflict basis)"
+        )
+    return catalog, info
+
+
+def retention_ttl_s(catalog: Catalog) -> float:
+    """A QUARTER of the catalog's snapshot retention — the destination
+    shape's re-read cadence (:meth:`HoglakeFlusher._retention_ttl_s`
+    carries the argument), with pyhoglake's assumed retention (so 450 s)
+    when the catalog will not say; ``inf`` when retention is disabled."""
+    read = getattr(catalog, "_retention_seconds", None)
+    if read is None:
+        return _ASSUMED_RETENTION_S / 4
+    try:
+        retention = read()
+    except Exception:  # noqa: BLE001 - a retention read must never fail a flush
+        return _ASSUMED_RETENTION_S / 4
+    if (
+        not isinstance(retention, (int, float))
+        or isinstance(retention, bool)
+        or retention <= 0
+    ):
+        return _ASSUMED_RETENTION_S / 4
+    return float(retention) / 4
+
+
+def _group_fields(info: TableInfo, group: keyspace.PartitionTuple) -> tuple[str, ...]:
+    """hoglake's display names for a staged tuple's fields, from the live
+    spec (:func:`millrace.grouping.field_names`). A tuple keyed under a
+    spec of another arity (a spec change while it was staged) gets
+    positional names ``key_<i>`` — the label is identity material, not a
+    claim about the live spec."""
+    names = field_names(info)
+    if len(names) == len(group):
+        return names
+    return tuple(f"key_{i}" for i in range(len(group)))
+
+
+class ShapeReader:
+    """The destination's shape for the CONSUMER's keyer refresh
+    (``consumer.ShapeSource``): its own ``Table`` handle over the
+    flusher's resolved catalog, pinned to the flusher's incarnation.
+    :meth:`read` is a ``totals=false`` identity read that refuses a
+    different ``table_uuid`` (``table_recreated``) or a missing
+    ``read_snapshot_id`` (``server_capability``) the way the flusher's
+    shape cache does; :meth:`ttl_s` is the flusher's cadence
+    (:func:`retention_ttl_s`). Both block (pyhoglake I/O)."""
+
+    def __init__(self, catalog: Catalog, namespace: str, info: TableInfo) -> None:
+        self._catalog = catalog
+        self._table = Table(Namespace(catalog, namespace), info)
+        self._table_uuid = info.table_uuid
+
+    def read(self) -> TableInfo:
+        info = self._table.info(totals=False)
+        if info.table_uuid != self._table_uuid:
+            raise FlushHalted(
+                "table_recreated",
+                f"table {info.namespace}.{info.name} now resolves to "
+                f"{info.table_uuid}, not the pinned incarnation {self._table_uuid}",
+            )
+        if info.read_snapshot_id is None:
+            raise FlushHalted(
+                "server_capability",
+                f"the server stopped reporting read_snapshot_id for "
+                f"{info.namespace}.{info.name}",
+            )
+        return info
+
+    def ttl_s(self) -> float:
+        return retention_ttl_s(self._catalog)
+
+
 class HoglakeFlusher:
     """Owns the hoglake side of the flush path for one pipeline: the
     pyhoglake client, the resolved destination and its pinned
@@ -2030,8 +1680,11 @@ class HoglakeFlusher:
         io_workers: int = 1,
     ) -> HoglakeFlusher:
         """Resolve the catalog → namespace → table and validate the
-        destination, fail-fast (docs/kafka-ingestion.md §Deployment:
-        resolve catalog, table, incarnation; refuse on mismatch).
+        destination, fail-fast (docs/kafka-ingestion.md §Deployment), and
+        PIN the incarnation the read returned: there is no configured
+        ``table_uuid`` to refuse against at boot — the pin is what every
+        commit sends as ``expected_table_uuid``, and a later read naming
+        another uuid halts ``table_recreated``.
 
         EVERY table read this pipeline makes is ``totals=false``,
         starting here: the ``Table`` handle is constructed straight from
@@ -2051,51 +1704,24 @@ class HoglakeFlusher:
             executor=executor,
             io_workers=io_workers,
         )
-        try:
-            catalog = client.catalog(cfg.catalog)
-            # Existence-check the namespace (the API has no per-namespace
-            # GET; the listing is the check).
-            catalog.namespace(cfg.namespace)
-            request = getattr(client, "_request", None)
-            if request is None:
-                raise FlushStartupError(
-                    "pyhoglake no longer exposes HoglakeClient._request; "
-                    "millrace's identity reads and receipt lookups cannot run"
-                )
-            body = request(
-                "GET",
-                f"/catalogs/{_seg(cfg.catalog)}/namespaces/{_seg(cfg.namespace)}"
-                f"/tables/{_seg(cfg.table)}",
-                params={"totals": "false"},
-            )
-            info = TableInfo.from_wire(body)
-        except FlushStartupError:
-            raise
-        except (HoglakeError, httpx.HTTPError, OSError) as e:
-            raise FlushStartupError(
-                f"cannot resolve the hoglake destination "
-                f"{cfg.catalog}/{cfg.namespace}/{cfg.table}: {e}"
-            ) from e
-        if info.read_snapshot_id is None:
-            raise FlushStartupError(
-                f"the hoglake server did not report read_snapshot_id for "
-                f"{cfg.namespace}.{cfg.table}: millrace requires a server "
-                "whose table reads carry the snapshot they resolved at "
-                "(the commit's conflict basis)"
-            )
+        catalog, info = read_destination(client, cfg)
         flusher._catalog = catalog
         flusher._table = Table(Namespace(catalog, cfg.namespace), info)
         flusher._table_uuid = info.table_uuid
         flusher._shape_info = info
         flusher._shape_read_at = flusher._monotonic()
         flusher._shape_fingerprint = _shape_fingerprint(info)
+        flusher._resolved_info = info
         # Startup validation: the decoder supports every column, and the
         # live partition spec is one this writer can honor — top-level
         # sources (v1) with transforms pyhoglake accepts for the source
         # type. `transform_value(..., None)` is the validity dry-run: it
         # checks the vocabulary, the param and the temporal-type gate
         # without fabricating data.
-        JsonObjectDecoder(info.columns)
+        try:
+            JsonObjectDecoder(info.columns)
+        except UnsupportedColumnError as e:
+            raise FlushStartupError(str(e)) from e
         spec = info.partition_spec
         if spec is not None:
             flat = {c.field_id: c for c in info.columns}
@@ -2191,6 +1817,7 @@ class HoglakeFlusher:
         self._catalog: Catalog  # set by resolve()
         self._table: Table  # set by resolve()
         self._table_uuid: str  # set by resolve()
+        self._resolved_info: TableInfo  # set by resolve()
         self._shape_info: TableInfo | None = None
         self._shape_read_at: float | None = None
         self._retry_after: float | None = None
@@ -2236,6 +1863,17 @@ class HoglakeFlusher:
     def table_uuid(self) -> str:
         """The incarnation pinned at startup resolution."""
         return self._table_uuid
+
+    @property
+    def resolved_info(self) -> TableInfo:
+        """The destination shape read at startup resolution (the
+        consumer's first keyer is built from it)."""
+        return self._resolved_info
+
+    def shape_reader(self) -> ShapeReader:
+        """A :class:`ShapeReader` over this flusher's resolved catalog and
+        pinned incarnation, for the consumer's keyer refresh."""
+        return ShapeReader(self._catalog, self._cfg.namespace, self._resolved_info)
 
     def stats(self) -> FlushStats:
         """A snapshot of the run's counters."""
@@ -2346,20 +1984,7 @@ class HoglakeFlusher:
         assumed retention, keeping the factor of two intact). ``inf``
         (retention disabled) correctly means never re-read for staleness.
         """
-        read = getattr(self._catalog, "_retention_seconds", None)
-        if read is None:
-            return _ASSUMED_RETENTION_S / 4
-        try:
-            retention = read()
-        except Exception:  # noqa: BLE001 - a retention read must never fail a flush
-            return _ASSUMED_RETENTION_S / 4
-        if (
-            not isinstance(retention, (int, float))
-            or isinstance(retention, bool)
-            or retention <= 0
-        ):
-            return _ASSUMED_RETENTION_S / 4
-        return float(retention) / 4
+        return retention_ttl_s(self._catalog)
 
     def _drop_shape(self) -> None:
         """Forget the destination's cached shape so the next prepare
@@ -2628,58 +2253,67 @@ class HoglakeFlusher:
         republishes the persisted bytes verbatim (the idempotency key
         makes the server's receipt dedupe a landing replay into one
         logical commit) — but only INSIDE the receipt horizon: past
-        ``_receipt_horizon_s`` (or on an unknown-age legacy v1 envelope)
-        a 404 is ambiguous with a PURGED receipt, and the pipeline halts
+        ``_receipt_horizon_s`` a 404 is ambiguous with a PURGED receipt, and the pipeline halts
         rather than risk duplicating an already-executed commit.
 
         The flush window is parsed out of the persisted request's commit
         message — the ``prepared/`` envelope holds the request body, and
-        the message is where the window lives. A v3 envelope additionally
-        names its idempotency key's derivation inputs (``topic``,
-        ``partition``): they must equal this stage's own identity — an
-        entry that names another partition is foreign state, refused as
-        corruption, never replayed under it (legacy v1/v2 envelopes carry
-        no inputs; the check does not apply to them). The settle deletes
-        EXACTLY the window (never younger rows of the same team), and the
+        the message is where the window lives. The envelope names its
+        idempotency key's derivation inputs (``topic``, ``partition`` and
+        the partition tuple as hoglake partition values): the topic and
+        partition must equal this stage's own identity and the tuple the
+        one its ``prepared/`` key sits under — an entry that names
+        another is foreign state, refused as corruption, never replayed
+        under it. The settle deletes EXACTLY the window (never younger
+        rows of the same tuple), and the
         delete is guarded against the scan: a settlement that removes a
         row the scan did not see is a staging-invariant violation and
         halts the pipeline rather than losing the row silently.
         """
-        team_id = pending.key.team_id
+        group = pending.key.group
         key = pending.request.idempotency_key
         body = pending.request.body
         try:
             payload = json.loads(body)
         except (ValueError, UnicodeDecodeError) as e:
             raise StageCorruptionError(
-                f"prepared/{team_id}/{pending.key.first_offset}: the "
+                f"prepared/{group}/{pending.key.first_offset}: the "
                 f"persisted body is not valid JSON: {e}"
             ) from e
         if not isinstance(payload, dict) or payload.get("idempotency_key") != key:
             raise StageCorruptionError(
-                f"prepared/{team_id}/{pending.key.first_offset}: the "
+                f"prepared/{group}/{pending.key.first_offset}: the "
                 "persisted body does not parse to its own idempotency key"
             )
-        # The v3 envelope's derivation inputs must name THIS partition
+        # The envelope's derivation inputs must name THIS partition
         # instance — an entry that doesn't is foreign state in this
         # SlateDB, and replaying it would publish under another
-        # partition's identity. Legacy (v1/v2) envelopes carry no inputs;
-        # the check simply does not apply to them.
-        if pending.request.topic is not None and (
+        # partition's identity.
+        if (
             pending.request.topic != stage.topic
             or pending.request.partition != stage.partition
         ):
             raise StageCorruptionError(
-                f"prepared/{team_id}/{pending.key.first_offset}: the "
+                f"prepared/{group}/{pending.key.first_offset}: the "
                 f"envelope names {pending.request.topic}"
                 f"[{pending.request.partition}] but this stage is "
                 f"{stage.topic}[{stage.partition}] — foreign state, "
                 "refused rather than replayed"
             )
+        # The envelope names the tuple its key was minted for; it must be
+        # the tuple its prepared/ key sits under.
+        if pending.request.group != group:
+            raise StageCorruptionError(
+                f"prepared/{group}/{pending.key.first_offset}: the envelope "
+                f"names partition tuple {pending.request.group} — foreign "
+                "state, refused rather than replayed"
+            )
+        fields = pending.request.group_fields
+        label = keyspace.group_label(fields, group)
         message = payload.get("message")
         if not isinstance(message, str):
             raise StageCorruptionError(
-                f"prepared/{team_id}/{pending.key.first_offset}: the "
+                f"prepared/{group}/{pending.key.first_offset}: the "
                 "persisted request carries no commit message"
             )
         first_offset, last_offset = parse_message_offsets(
@@ -2687,15 +2321,15 @@ class HoglakeFlusher:
         )
         if first_offset != pending.key.first_offset:
             raise StageCorruptionError(
-                f"prepared/{team_id}/{pending.key.first_offset}: the "
+                f"prepared/{group}/{pending.key.first_offset}: the "
                 f"message's window starts at {first_offset} instead"
             )
-        window = FlushedKey(team_id, first_offset, last_offset)
+        window = FlushedKey(group, first_offset, last_offset, group_fields=fields)
         # The window's rows as they stand now — the settlement guard's
         # count, and (on a 422) the quarantine's payloads.
         window_rows = [
             (row_key, payload_bytes)
-            async for row_key, payload_bytes in stage.scan_team_rows(team_id)
+            async for row_key, payload_bytes in stage.scan_group_rows(group)
             if keyspace.row_in_flushed_range(row_key, window)
         ]
 
@@ -2705,11 +2339,11 @@ class HoglakeFlusher:
             self._guard_settlement(window, len(window_rows), report.rows_deleted)
             self._receipt_settlements += 1
             log.info(
-                "reconciled %s[%d] team %d offsets %d-%d from the commit "
+                "reconciled %s[%d] group %s offsets %d-%d from the commit "
                 "receipt (snapshot %d) — zero republication",
                 stage.topic,
                 stage.partition,
-                team_id,
+                label,
                 first_offset,
                 last_offset,
                 receipt.snapshot_id,
@@ -2717,7 +2351,7 @@ class HoglakeFlusher:
             return FlushReport(
                 topic=stage.topic,
                 partition=stage.partition,
-                team_id=team_id,
+                group=group,
                 trigger="recovery",
                 outcome="receipt_settled",
                 first_offset=first_offset,
@@ -2733,23 +2367,17 @@ class HoglakeFlusher:
         # (HOGLAKE_RECEIPT_RETENTION_SECONDS, default 7 d), so past the
         # receipt horizon a 404 is ambiguous — "never landed" and
         # "landed, receipt purged" look identical, and republishing the
-        # latter duplicates an executed commit. Unknown age (a legacy v1
-        # envelope) is halt-safe too. A 200 receipt settles regardless of
+        # latter duplicates an executed commit. A 200 receipt settles regardless of
         # age (it is ground truth); this guard covers only the blind
         # replay.
         horizon_s = await self._io(self._receipt_horizon_s)
-        persisted_at = pending.request.persisted_at
-        age_us = None if persisted_at is None else self._now_us() - persisted_at
-        if age_us is None or age_us > horizon_s * _MICROS_PER_SECOND:
-            age_text = (
-                "unknown (a pre-v2 prepared/ envelope)"
-                if age_us is None
-                else f"{age_us / _MICROS_PER_SECOND:.0f}s"
-            )
+        age_us = self._now_us() - pending.request.persisted_at
+        if age_us > horizon_s * _MICROS_PER_SECOND:
+            age_text = f"{age_us / _MICROS_PER_SECOND:.0f}s"
             raise self._halt(
                 "receipt_horizon_exceeded",
                 f"the persisted commit for {stage.topic}[{stage.partition}] "
-                f"team {team_id} offsets {first_offset}-{last_offset} "
+                f"group {label} offsets {first_offset}-{last_offset} "
                 f"(idempotency key {key}) has no receipt, and its age "
                 f"({age_text}) is past the receipt horizon "
                 f"({horizon_s:.0f}s): the commit may have landed and had "
@@ -2767,17 +2395,17 @@ class HoglakeFlusher:
             # read. The upload it abandons is accounted.
             self._count_orphans(
                 _payload_uris(payload),
-                f"the persisted commit for team {team_id} was refused with "
+                f"the persisted commit for group {label} was refused with "
                 "ddl_since_read_snapshot; the rows re-prepare against a "
                 "fresh read",
                 reason="ddl_rebuild",
             )
-            await stage.drop_prepared(team_id, first_offset)
+            await stage.drop_prepared(group, first_offset)
             self._reprepares += 1
             return FlushReport(
                 topic=stage.topic,
                 partition=stage.partition,
-                team_id=team_id,
+                group=group,
                 trigger="recovery",
                 outcome="reprepare",
                 first_offset=first_offset,
@@ -2827,7 +2455,7 @@ class HoglakeFlusher:
                 # wedging the loop.
                 self._count_orphans(
                     _payload_uris(payload),
-                    f"the persisted commit for team {team_id} was refused "
+                    f"the persisted commit for group {label} was refused "
                     f"with {status} {_RECORD_VALIDATION_CODE}; the decision "
                     "is quarantined",
                     reason="commit_refused",
@@ -2851,7 +2479,7 @@ class HoglakeFlusher:
                 raise self._halt(
                     "commit_refused",
                     f"the persisted commit for {stage.topic}"
-                    f"[{stage.partition}] team {team_id} offsets "
+                    f"[{stage.partition}] group {label} offsets "
                     f"{first_offset}-{last_offset} (idempotency key {key}) "
                     f"was answered {status}: {_error_text(e)}. An answered "
                     "refusal that does not name a per-record validation "
@@ -2865,12 +2493,12 @@ class HoglakeFlusher:
         self._guard_settlement(window, len(window_rows), report.rows_deleted)
         self._flushes_replayed += 1
         log.info(
-            "replayed the persisted commit for %s[%d] team %d offsets %d-%d "
+            "replayed the persisted commit for %s[%d] group %s offsets %d-%d "
             "(snapshot %d) — the receipt dedupes a landing replay into one "
             "logical commit",
             stage.topic,
             stage.partition,
-            team_id,
+            label,
             first_offset,
             last_offset,
             result.snapshot_id,
@@ -2878,7 +2506,7 @@ class HoglakeFlusher:
         return FlushReport(
             topic=stage.topic,
             partition=stage.partition,
-            team_id=team_id,
+            group=group,
             trigger="recovery",
             outcome="replayed",
             first_offset=first_offset,
@@ -2924,8 +2552,7 @@ class HoglakeFlusher:
                 )
                 for row_key, payload in window_rows
             ),
-            # the purge only reaches v2 envelopes; an unversioned one is
-            # forensic litter retained forever (see README retention)
+            # stamped, so the retention purge reaches them
             now_us=self._now_us(),
         )
         report = await stage.settle_quarantined(window)
@@ -2933,12 +2560,12 @@ class HoglakeFlusher:
         self._decisions_quarantined += 1
         self._records_quarantined += len(window_rows)
         log.warning(
-            "flush decision quarantined: %s[%d] team %d offsets %d-%d "
+            "flush decision quarantined: %s[%d] group %s offsets %d-%d "
             "(%d rows to poison/) — the server refused the commit with %s: "
             "%s",
             stage.topic,
             stage.partition,
-            window.team_id,
+            window.label,
             window.first_offset,
             window.last_offset,
             len(window_rows),
@@ -2948,7 +2575,7 @@ class HoglakeFlusher:
         return FlushReport(
             topic=stage.topic,
             partition=stage.partition,
-            team_id=window.team_id,
+            group=window.group,
             trigger=trigger,
             outcome="quarantined",
             first_offset=window.first_offset,
@@ -2968,7 +2595,7 @@ class HoglakeFlusher:
         if deleted != scanned:
             raise FlushHalted(
                 "settlement_mismatch",
-                f"settling team {window.team_id} offsets "
+                f"settling group {window.label} offsets "
                 f"{window.first_offset}-{window.last_offset} deleted "
                 f"{deleted} rows but the flush saw {scanned}: the staging "
                 "layer's ordering invariants are broken",
@@ -2995,11 +2622,11 @@ class HoglakeFlusher:
 
         Order of operations, each load-bearing:
 
-        1. A persisted ``prepared/`` entry for the team — found by a
-           PER-TEAM lookup, never keyed by the scan's first offset — is
+        1. A persisted ``prepared/`` entry for the group — found by a
+           PER-GROUP lookup, never keyed by the scan's first offset — is
            authoritative: it is replayed (receipt lookup first), never
            regenerated, and no new window is built while one stands.
-           The per-team shape is what makes the bounded scan (below)
+           The per-group shape is what makes the bounded scan (below)
            safe: a capped scan's prefix minimum can move under
            timestamp-inverted arrivals, and keying the lookup by it
            could miss an outstanding entry and double-publish its
@@ -3008,15 +2635,15 @@ class HoglakeFlusher:
            basis) is pinned BEFORE the staged range is scanned.
         3. The scan is BOUNDED (rows and bytes — M4); the flush window
            is derived from the SCANNED rows — their own offset span when
-           the scan covered the team's slice, narrowed to the covered
+           the scan covered the group's slice, narrowed to the covered
            offset prefix (:func:`_covered_window`) only when a cap cut
-           the scan short; one commit per ``(team, window)``; settlement
+           the scan short; one commit per ``(group, window)``; settlement
            strictly after the receipt, guarded against the scanned
            count.
         """
-        team_id = decision.team_id
-        for pending in await stage.list_prepared(team_id):
-            # At most one entry per team by construction; reconcile in
+        group = decision.group
+        for pending in await stage.list_prepared(group):
+            # At most one entry per group by construction; reconcile in
             # window order if corruption says otherwise. The entry is
             # authoritative for ITS OWN window (parsed from its
             # message) — which may be a strict prefix of the staged
@@ -3030,22 +2657,26 @@ class HoglakeFlusher:
         info = await self._io(self._shape_sync)
         read_snapshot = info.read_snapshot_id
         assert read_snapshot is not None  # _shape_sync refuses otherwise
+        # The tuple's hoglake field names, from the live spec (positional
+        # names when the group was keyed under a spec of another arity).
+        fields = _group_fields(info, group)
+        label = keyspace.group_label(fields, group)
 
-        rows, truncated = await stage.scan_team_rows_bounded(
-            team_id,
+        rows, truncated = await stage.scan_group_rows_bounded(
+            group,
             max_rows=self._cfg.flush_scan_max_rows,
             max_bytes=self._scan_budget_bytes(),
         )
         if not rows:
             # The byte cap refuses a FIRST row larger than the budget;
             # an empty scan then is indistinguishable from a genuinely
-            # empty team. Probe one row: a record that staged at all is
+            # empty group. Probe one row: a record that staged at all is
             # bounded by the broker's message limit, so one row is
             # always a flushable unit — wedging on it forever would be
             # the worse failure.
             rows = [
                 (row_key, payload)
-                async for row_key, payload in stage.scan_team_rows(team_id, max_rows=1)
+                async for row_key, payload in stage.scan_group_rows(group, max_rows=1)
             ]
             # The one-row probe is its own exact window below (the byte
             # cap refused this row, so it flushes alone).
@@ -3058,21 +2689,21 @@ class HoglakeFlusher:
             # first_staged_ts would pin the oldest-staged-age gauge
             # forever, so the stats entry is repaired away — race-free
             # inside reconcile_stats' serializable transaction.
-            repaired = await stage.reconcile_stats(team_id)
+            repaired = await stage.reconcile_stats(group)
             if repaired:
                 self._stats_repaired += 1
             log.warning(
-                "flush decision for %s[%d] team %d scanned zero rows with a "
+                "flush decision for %s[%d] group %s scanned zero rows with a "
                 "live stats entry (redelivery residue%s); nothing flushed",
                 stage.topic,
                 stage.partition,
-                team_id,
+                label,
                 " — stats repaired" if repaired else "",
             )
             return FlushReport(
                 topic=stage.topic,
                 partition=stage.partition,
-                team_id=team_id,
+                group=group,
                 trigger=decision.trigger,
                 outcome="empty",
                 first_offset=-1,
@@ -3083,15 +2714,15 @@ class HoglakeFlusher:
         # sort past the window's span and clip away; stage.py's ordering
         # argument makes the record exact inside it), and the window
         # itself: [first_scanned_offset, last_scanned_offset] when the
-        # scan covered the team's whole staged slice (the common case —
+        # scan covered the group's whole staged slice (the common case —
         # every staged row was seen, so settling the span deletes exactly
         # the published rows), narrowed to the covered prefix ONLY when a
         # scan cap cut the read short (a timestamp inversion straddling
         # the cap could otherwise settle a row the flush never saw).
-        record = await stage.read_offsets(team_id)
+        record = await stage.read_offsets(group)
         if not record:
             raise StageCorruptionError(
-                f"team {team_id}: {len(rows)} staged rows but the offsets/ "
+                f"group {label}: {len(rows)} staged rows but the offsets/ "
                 "record names none of them"
             )
         scanned_offsets = [row_key.offset for row_key, _ in rows]
@@ -3118,7 +2749,7 @@ class HoglakeFlusher:
         )
         if not ranges:
             raise StageCorruptionError(
-                f"team {team_id}: {len(rows)} staged rows but the offsets/ "
+                f"group {label}: {len(rows)} staged rows but the offsets/ "
                 "record names none of them"
             )
 
@@ -3126,7 +2757,7 @@ class HoglakeFlusher:
             self._table_uuid,
             stage.topic,
             stage.partition,
-            team_id,
+            group,
             first_offset,
             last_offset,
         )
@@ -3134,7 +2765,8 @@ class HoglakeFlusher:
         ctx = FlushContext(
             topic=stage.topic,
             partition=stage.partition,
-            team_id=team_id,
+            group=group,
+            group_fields=fields,
             trigger=decision.trigger,
             first_offset=first_offset,
             last_offset=last_offset,
@@ -3194,14 +2826,14 @@ class HoglakeFlusher:
         if plan.payload is None:
             # Every row quarantined: nothing may be committed (a commit
             # registers at least one file). Settle WITHOUT a commit.
-            window = FlushedKey(team_id, first_offset, last_offset)
+            window = FlushedKey(group, first_offset, last_offset, group_fields=fields)
             report = await stage.settle_quarantined(window)
             self._guard_settlement(window, len(rows), report.rows_deleted)
             self._decisions_quarantined += 1
             return FlushReport(
                 topic=stage.topic,
                 partition=stage.partition,
-                team_id=team_id,
+                group=group,
                 trigger=decision.trigger,
                 outcome="quarantined",
                 first_offset=first_offset,
@@ -3219,7 +2851,7 @@ class HoglakeFlusher:
         except BaseException as e:
             self._count_orphans(
                 getattr(e, "completed_uris", ()),
-                f"the upload for team {team_id} offsets "
+                f"the upload for group {label} offsets "
                 f"{first_offset}-{last_offset} failed partway through a "
                 f"{plan.files}-file fanout. The file it failed on is not "
                 "among these and is not counted, but a failed close can "
@@ -3231,7 +2863,7 @@ class HoglakeFlusher:
         body = canonical_body(plan.payload)
         try:
             await stage.persist_prepared(
-                team_id,
+                group,
                 first_offset,
                 PreparedRequest(
                     idempotency_key=key,
@@ -3239,12 +2871,14 @@ class HoglakeFlusher:
                     persisted_at=now_us,
                     topic=stage.topic,
                     partition=stage.partition,
+                    group=group,
+                    group_fields=fields,
                 ),
             )
         except BaseException:
             self._count_orphans(
                 plan.uris,
-                f"the upload for team {team_id} offsets "
+                f"the upload for group {label} offsets "
                 f"{first_offset}-{last_offset} completed but the prepared "
                 "request could not be persisted",
                 reason="persist_failed",
@@ -3261,12 +2895,12 @@ class HoglakeFlusher:
             # on a later sweep.
             self._count_orphans(
                 plan.uris,
-                f"the commit for team {team_id} was refused with "
+                f"the commit for group {label} was refused with "
                 "ddl_since_read_snapshot; the flush re-prepares against a "
                 "fresh read",
                 reason="ddl_rebuild",
             )
-            await stage.drop_prepared(team_id, first_offset)
+            await stage.drop_prepared(group, first_offset)
             self._reprepares += 1
             log.warning(
                 "DDL landed on %s.%s while a flush was in flight (%s); "
@@ -3279,7 +2913,7 @@ class HoglakeFlusher:
             return FlushReport(
                 topic=stage.topic,
                 partition=stage.partition,
-                team_id=team_id,
+                group=group,
                 trigger=decision.trigger,
                 outcome="reprepare",
                 first_offset=first_offset,
@@ -3326,12 +2960,14 @@ class HoglakeFlusher:
                 # capped — and settle WITHOUT a commit.
                 self._count_orphans(
                     plan.uris,
-                    f"the commit for team {team_id} was refused with "
+                    f"the commit for group {label} was refused with "
                     f"{status} {_RECORD_VALIDATION_CODE}; the decision is "
                     "quarantined",
                     reason="commit_refused",
                 )
-                window = FlushedKey(team_id, first_offset, last_offset)
+                window = FlushedKey(
+                    group, first_offset, last_offset, group_fields=fields
+                )
                 return await self._quarantine_window(
                     stage,
                     window,
@@ -3351,8 +2987,8 @@ class HoglakeFlusher:
                 # deleted up to a whole flush window on any answered 4xx).
                 raise self._halt(
                     "commit_refused",
-                    f"the commit for {stage.topic}[{stage.partition}] team "
-                    f"{team_id} offsets {first_offset}-{last_offset} "
+                    f"the commit for {stage.topic}[{stage.partition}] group "
+                    f"{label} offsets {first_offset}-{last_offset} "
                     f"(idempotency key {key}) was answered {status}: "
                     f"{_error_text(e)}. An answered refusal that does not "
                     "name a per-record validation proves nothing about the "
@@ -3362,7 +2998,7 @@ class HoglakeFlusher:
                 ) from e
             raise
 
-        window = FlushedKey(team_id, first_offset, last_offset)
+        window = FlushedKey(group, first_offset, last_offset, group_fields=fields)
         report = await stage.commit_flushed(window)
         self._guard_settlement(window, len(rows), report.rows_deleted)
         self._flushes_committed += 1
@@ -3375,10 +3011,10 @@ class HoglakeFlusher:
         # zero-byte shapes are skipped by the estimator itself.
         self._ratio.observe(sum(u.size for u in plan.uploads), plan.staged_bytes)
         log.debug(
-            "flushed %s[%d] team %d offsets %d-%d: %d rows, %d files, snapshot %d (%s)",
+            "flushed %s[%d] group %s offsets %d-%d: %d rows, %d files, snapshot %d (%s)",
             stage.topic,
             stage.partition,
-            team_id,
+            label,
             first_offset,
             last_offset,
             plan.records,
@@ -3389,7 +3025,7 @@ class HoglakeFlusher:
         return FlushReport(
             topic=stage.topic,
             partition=stage.partition,
-            team_id=team_id,
+            group=group,
             trigger=decision.trigger,
             outcome="committed",
             first_offset=first_offset,
@@ -3500,7 +3136,7 @@ class FlushRunner:
        estimated_compression_ratio=...)`` — the ratio is the flusher's
        observed EWMA, the fallback until the first flush lands.
     4. EXECUTE: per decision, :meth:`HoglakeFlusher.flush_key`; commits
-       are per ``(team, window)`` and never exceed
+       are per ``(group, window)`` and never exceed
        ``max_files_per_commit`` files (the fanout guard halts on a
        spec/bound disagreement rather than emit an unbounded commit
        body).
@@ -3512,7 +3148,7 @@ class FlushRunner:
     function of config, not of how many partitions backlog at once).
     Within a partition, dispatch follows the planner's oldest-first
     order; completion may interleave (decisions are independent
-    ``(team, window)`` units — order between teams carries no
+    ``(group, window)`` units — order between groups carries no
     invariant). ``concurrency=1`` is the serial sweep.
 
     Runs as an asyncio task sharing the loop with the consumer (stage
@@ -3813,17 +3449,17 @@ class FlushRunner:
         candidates = await stage.iter_sched_age_through(cutoff)
         if not candidates:
             return stats
-        by_team = {s.team_id: s for s in stats}
+        by_group = {s.group: s for s in stats}
         for candidate in candidates:
-            exact = await stage.read_team_stats(candidate.team_id)
+            exact = await stage.read_group_stats(candidate.group)
             if exact is None:
                 raise StageCorruptionError(
-                    f"team {candidate.team_id}: a sched_age/ entry with no "
+                    f"group {candidate.group}: a sched_age/ entry with no "
                     "stats/ entry (the two are written and removed in one "
                     "batch — a leftover is foreign writes or a bug)"
                 )
-            by_team[candidate.team_id] = exact
-        return list(by_team.values())
+            by_group[candidate.group] = exact
+        return list(by_group.values())
 
     async def _execute(
         self, work: list[tuple[PartitionStage, FlushDecision]]
@@ -3926,10 +3562,10 @@ class FlushRunner:
                         # the next sweep retries. Never wedged.
                         failed += 1
                         log.exception(
-                            "flush decision failed for %s[%d] team %d",
+                            "flush decision failed for %s[%d] group %s",
                             stage.topic,
                             stage.partition,
-                            decision.team_id,
+                            decision.group,
                         )
                         continue
                     reports.append(report)

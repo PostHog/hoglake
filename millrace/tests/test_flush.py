@@ -12,11 +12,14 @@ Pinned here:
   read's ``read_snapshot_id`` and the startup-pinned
   ``expected_table_uuid``; EVERY table read is ``totals=false``; the
   shape cache's TTL is the catalog retention / 4;
-- commit identity is scoped by ``(table, topic, partition, team,
-  offsets)``: two partitions flushing one team over the same offset
-  range produce different idempotency keys AND different object URIs,
-  and a persisted entry whose v3 envelope names another partition is
-  loud corruption at recovery, never a replay (B1);
+- commit identity is scoped by ``(table, topic, partition, partition
+  tuple, offsets)``: two partitions flushing one tuple over the same
+  offset range produce different idempotency keys AND different object
+  URIs, and a persisted entry whose envelope names another partition or
+  another tuple is loud corruption at recovery, never a replay (B1);
+- the staging group is the destination's partition tuple: one flush of
+  a group keyed under the live spec writes exactly one file, and a group
+  keyed under an OLDER spec still fans out correctly by the live one;
 - the full refusal taxonomy, each recovery in its own scripted test
   (retry counts, re-prepare vs verbatim replay, halt vs continue,
   metric/log emitted) — including B2's: ONLY a 422 coded
@@ -31,8 +34,9 @@ Pinned here:
 - determinism: same staged range → byte-identical request, in a fresh
   flusher too; the message is formatted before any upload (source-order
   pin); object names derive from the idempotency key;
-- stats asymmetry: size-triggered flushes ship footer stats, age/slow
-  ship ``record_count`` only;
+- stats asymmetry: footer stats ship when the REALIZED file is at least
+  half of ``target_output_bytes``, whatever lane decided the flush;
+  smaller files register without ``column_stats`` (deferred);
 - orphan accounting: a mid-fanout upload failure counts and names the
   abandoned objects;
 - junk ``event_time``: quarantine lands the original payloads WHOLE in
@@ -46,11 +50,10 @@ Pinned here:
   unaffected — pinned against a real ``file:///`` contested open (B5);
 - the recovery handoff: ``recover()``-surfaced ``prepared/`` entries are
   reconciled by receipt lookup (200 → local settle, 404 → verbatim
-  republish INSIDE the receipt horizon, a loud halt past it or on a
-  legacy unknown-age envelope);
+  republish INSIDE the receipt horizon, a loud halt past it);
 - the runner: per-decision containment (one key's failure never wedges a
-  sweep), the halt taxonomy stopping the pipeline loudly, chunked sweep
-  processing, and the redelivery-inflation stats repair.
+  sweep), the halt taxonomy stopping the pipeline loudly, bounded
+  parallel sweep processing, and the redelivery-inflation stats repair.
 """
 
 from __future__ import annotations
@@ -70,8 +73,10 @@ from flushkit import (
     COLUMNS_WIRE,
     DATA_PATH,
     NAMESPACE,
+    RECREATED_UUID,
     RETENTION_S,
     SORT_WIRE,
+    SPEC_FIELDS,
     SPEC_WIRE,
     TABLE,
     TABLE_URL,
@@ -93,6 +98,8 @@ from flushkit import (
     script_receipt,
     script_table_refresh,
     table_wire,
+    team_group,
+    team_label,
 )
 from pyhoglake.models import Column
 from slatedb.uniffi import CloseReason
@@ -101,13 +108,16 @@ from stagekit import NOW, fast_flush_settings
 
 import millrace.flush as flush_mod
 from millrace import keyspace
+from millrace.coerce import (
+    REASON_UNCASTABLE_COLUMN,
+    REASON_UNDECODABLE_PAYLOAD,
+    DecodeError,
+    UnsupportedColumnError,
+)
 from millrace.config import EventTimePolicy
 from millrace.flush import (
     REASON_EVENT_TIME_OUT_OF_WINDOW,
     REASON_FLUSH_REFUSED,
-    REASON_UNCASTABLE_COLUMN,
-    REASON_UNDECODABLE_PAYLOAD,
-    DecodeError,
     FlushHalted,
     FlushPublishExhausted,
     FlushReport,
@@ -116,7 +126,6 @@ from millrace.flush import (
     HoglakeFlusher,
     JsonObjectDecoder,
     StageCorruptionError,
-    UnsupportedColumnError,
     build_prepared_plan,
     format_commit_message,
     parse_message_offsets,
@@ -203,7 +212,7 @@ async def staged(
     for i, (offset, ts) in enumerate(offsets_ts):
         records.append(
             StagedRecord(
-                team_id=team,
+                group=team_group(team),
                 event_ts_us=ts,
                 offset=offset,
                 payload=(event_payload(team, ts) if payloads is None else payloads[i]),
@@ -213,7 +222,36 @@ async def staged(
 
 
 async def staged_rows(stage: Any, team: int) -> list[tuple[Any, bytes]]:
-    return [kv async for kv in stage.scan_team_rows(team)]
+    return [kv async for kv in stage.scan_group_rows(team_group(team))]
+
+
+def ikey(partition: int, team: int, first: int, last: int) -> str:
+    """The idempotency key of team ``team``'s default-spec group's window
+    ``first..last`` on events[``partition``]."""
+    return keyspace.idempotency_key(
+        TABLE_UUID, "events", partition, team_group(team), first, last
+    )
+
+
+def prepared_request(
+    key: str, team: int, *, partition: int = 0, body: bytes = b"{}"
+) -> PreparedRequest:
+    """A persisted prepared request for team ``team``'s default-spec group."""
+    return PreparedRequest(
+        idempotency_key=key,
+        body=body,
+        persisted_at=NOW,
+        topic="events",
+        partition=partition,
+        group=team_group(team),
+        group_fields=SPEC_FIELDS,
+    )
+
+
+def message_team(message: str) -> int:
+    """The team id out of a commit message's ``group=team_id=<n>/…`` token."""
+    token = next(t for t in message.split() if t.startswith("group="))
+    return int(token.removeprefix("group=team_id=").split("/")[0])
 
 
 def ts_micros(value: Any) -> int:
@@ -591,7 +629,7 @@ class TestCommitMessage:
     def test_golden_shape(self) -> None:
         message = format_commit_message(
             table_uuid=TABLE_UUID,
-            team_id=TEAM,
+            group=team_label(TEAM),
             trigger="size",
             records=5,
             quarantined=1,
@@ -609,7 +647,8 @@ class TestCommitMessage:
         )
         assert message.splitlines() == [
             (
-                f"millrace=v1 table={TABLE_UUID} team=7 trigger=size records=5 "
+                f"millrace=v1 table={TABLE_UUID} group={team_label(7)} trigger=size "
+                "records=5 "
                 "quarantined=1 files=2 partitions=2 staged_bytes=123 arrow_bytes=456 "
                 "millrace=0.1.0.dev0"
             ),
@@ -620,7 +659,7 @@ class TestCommitMessage:
         ranges = [OffsetRange("events", 0, i * 10, i * 10 + 4) for i in range(50)]
         message = format_commit_message(
             table_uuid=TABLE_UUID,
-            team_id=TEAM,
+            group=team_label(TEAM),
             trigger="age",
             records=250,
             quarantined=0,
@@ -645,7 +684,7 @@ class TestCommitMessage:
     def test_parse_round_trip(self) -> None:
         message = format_commit_message(
             table_uuid=TABLE_UUID,
-            team_id=TEAM,
+            group=team_label(TEAM),
             trigger="size",
             records=1,
             quarantined=0,
@@ -739,7 +778,7 @@ class TestHappyPath:
         # ONE commit, and it carries the whole wire contract.
         assert len(capture.bodies) == 1
         body = capture.payloads[0]
-        key = keyspace.idempotency_key(TABLE_UUID, "events", 0, TEAM, 0, 4)
+        key = ikey(0, TEAM, 0, 4)
         assert body["idempotency_key"] == key
         assert body["read_snapshot"] == 88  # the identity read's snapshot
         assert body["author"] == "millrace/events/0"
@@ -766,7 +805,7 @@ class TestHappyPath:
         assert tokens[:4] == [
             "millrace=v1",
             f"table={TABLE_UUID}",
-            "team=7",
+            f"group={team_label(7)}",
             "trigger=size",
         ]
         assert "records=5" in tokens
@@ -784,7 +823,7 @@ class TestHappyPath:
         # could only restate both (the flushed/ prefix stays empty).
         assert await staged_rows(stage, TEAM) == []
         assert await stage.iter_key_stats() == []
-        assert await stage.read_offsets(TEAM) == ()
+        assert await stage.read_offsets(team_group(TEAM)) == ()
         assert await stage.load_prepared() == []
         assert await read_markers(stage) == []
 
@@ -846,6 +885,216 @@ class TestHappyPath:
             assert sweep.failed == 0
             assert len(capture.bodies) == 1
             assert await staged_rows(opened.stage, TEAM) == []
+
+
+# =====================================================================================
+# Staging groups are partition tuples
+# =====================================================================================
+
+
+def _keyed_records(keyer: Any, rows: list[tuple[int, int, int]]) -> list[Any]:
+    """Stage-ready records for (offset, team, payload ts_us) triples,
+    grouped by ``keyer`` exactly as the consumer does."""
+    from millrace.consumer import classify_message
+    from millrace.stage import StagedRecord
+
+    out = []
+    for offset, team, ts in rows:
+        record = classify_message(
+            keyer,
+            offset=offset,
+            key=None,
+            value=event_payload(team, ts),
+            timestamp=(1, JAN_US // 1000),
+            poison_value_max_bytes=1 << 20,
+        )
+        assert isinstance(record, StagedRecord)
+        out.append(record)
+    return out
+
+
+@component
+class TestPartitionTupleGroups:
+    async def test_one_flush_per_group_writes_exactly_one_file_under_a_matching_spec(
+        self,
+        httpx_mock: Any,
+        memory_store: Any,
+        fake_clock: Any,
+        flusher_factory: Any,
+        store: FakeObjectStore,
+        sleeper: Sleeper,
+    ) -> None:
+        """Two teams × two months, keyed by the live spec's keyer: four
+        groups, four decisions, and every commit registers exactly ONE
+        file whose ``partition_values`` ARE the staged group."""
+        from pyhoglake import TableInfo
+
+        from millrace.grouping import GroupKeyer
+
+        keyer = GroupKeyer(TableInfo.from_wire(table_wire()))
+        assert keyer.fields == SPEC_FIELDS
+        cfg = make_config(target_output_bytes=1)
+        async with StageManager(
+            "memory:///", "millrace", settings=fast_flush_settings()
+        ) as manager:
+            stage = (await manager.open_partition("events", 0)).stage
+            await stage.stage_batch(
+                _keyed_records(
+                    keyer,
+                    [
+                        (0, 11, JAN_US),
+                        (1, 22, DEC_US),
+                        (2, 11, DEC_US),
+                        (3, 22, JAN_US),
+                        (4, 11, JAN_US + 1),
+                        (5, 22, DEC_US + 1),
+                    ],
+                ),
+                now_us=fake_clock(),
+            )
+            groups = {s.group for s in await stage.iter_key_stats()}
+            assert groups == {
+                ("11", month_wire(JAN_US)),
+                ("11", month_wire(DEC_US)),
+                ("22", month_wire(JAN_US)),
+                ("22", month_wire(DEC_US)),
+            }
+            script_options(httpx_mock)
+            capture = CommitCapture(httpx_mock, [commit_ok(50 + i) for i in range(4)])
+            flusher = flusher_factory(store=store, cfg=cfg)
+            sweep = await runner(manager, flusher, cfg, fake_clock, sleeper).run_once()
+            assert (sweep.decisions, sweep.committed, sweep.failed) == (4, 4, 0)
+            committed = set()
+            for body in capture.payloads:
+                (file,) = body["appends"][0]["files"]
+                committed.add(tuple(file["partition_values"]))
+                (team, month) = file["partition_values"]
+                assert (
+                    f"group=team_id={team}/timestamp_month={month}" in body["message"]
+                )
+            assert committed == groups
+            assert await stage.iter_key_stats() == []
+
+    async def test_a_group_keyed_under_an_older_spec_still_fans_out_by_the_live_one(
+        self,
+        httpx_mock: Any,
+        stage_factory: Any,
+        fake_clock: Any,
+        flusher_factory: Any,
+        store: FakeObjectStore,
+        sleeper: Sleeper,
+    ) -> None:
+        """The consumer keyed these rows under ``identity(team_id)`` alone
+        (an older spec); the live spec adds ``month(timestamp)``. The one
+        staged group flushes as ONE decision whose fanout splits it by
+        the live spec — two files, correct partition values — and the
+        group is labelled positionally (its arity is not the live spec's)."""
+        from pyhoglake import TableInfo
+
+        from millrace.grouping import GroupKeyer
+
+        old = TableInfo.from_wire(
+            table_wire(
+                spec={
+                    "spec_id": 2,
+                    "fields": [{"source_field_id": 1, "transform": "identity"}],
+                }
+            )
+        )
+        keyer = GroupKeyer(old)
+        stage = await stage_factory()
+        await stage.stage_batch(
+            _keyed_records(keyer, [(0, TEAM, JAN_US), (1, TEAM, DEC_US)]),
+            now_us=fake_clock(),
+        )
+        assert [s.group for s in await stage.iter_key_stats()] == [(str(TEAM),)]
+        script_options(httpx_mock)
+        capture = CommitCapture(httpx_mock, [commit_ok(50)])
+        flusher = flusher_factory(store=store, cfg=make_config(target_output_bytes=1))
+        report = await flusher.flush_key(
+            stage,
+            decision(
+                (str(TEAM),), trigger="size", staged_bytes=100, first_staged_ts=JAN_US
+            ),
+        )
+        assert (report.outcome, report.records, report.files) == ("committed", 2, 2)
+        body = capture.payloads[0]
+        assert {tuple(f["partition_values"]) for f in body["appends"][0]["files"]} == {
+            (str(TEAM), month_wire(JAN_US)),
+            (str(TEAM), month_wire(DEC_US)),
+        }
+        assert f"group=key_0={TEAM}" in body["message"].split()
+        # The key is a function of the staged tuple alone (positional
+        # names), never of the spec live at flush time.
+        assert body["idempotency_key"] == keyspace.idempotency_key(
+            TABLE_UUID, "events", 0, (str(TEAM),), 0, 1
+        )
+        assert await stage.iter_key_stats() == []
+
+
+@component
+class TestShapeReader:
+    """The consumer's view of the destination (``flush.ShapeReader``):
+    pinned to the flusher's incarnation, on the flusher's TTL."""
+
+    async def test_a_reread_returns_the_live_shape_and_the_ttl_is_retention_over_4(
+        self, httpx_mock: Any, flusher_factory: Any, store: FakeObjectStore
+    ) -> None:
+        flusher = flusher_factory(store=store)
+        reader = flusher.shape_reader()
+        script_options(httpx_mock)
+        assert reader.ttl_s() == RETENTION_S / 4
+        moved = {
+            "spec_id": 4,
+            "fields": [{"source_field_id": 1, "transform": "identity"}],
+        }
+        script_table_refresh(
+            httpx_mock, table=table_wire(read_snapshot_id=95, spec=moved)
+        )
+        info = reader.read()
+        assert (info.read_snapshot_id, info.partition_spec.spec_id) == (95, 4)
+        # The flusher's own shape cache is untouched by the reader.
+        assert flusher.resolved_info.partition_spec.spec_id == 3
+
+    async def test_another_incarnation_halts_table_recreated(
+        self, httpx_mock: Any, flusher_factory: Any, store: FakeObjectStore
+    ) -> None:
+        reader = flusher_factory(store=store).shape_reader()
+        script_table_refresh(httpx_mock, table=table_wire(uuid=RECREATED_UUID))
+        with pytest.raises(FlushHalted) as excinfo:
+            reader.read()
+        assert excinfo.value.reason == "table_recreated"
+        assert RECREATED_UUID in excinfo.value.detail
+
+    async def test_a_read_without_read_snapshot_id_halts_server_capability(
+        self, httpx_mock: Any, flusher_factory: Any, store: FakeObjectStore
+    ) -> None:
+        reader = flusher_factory(store=store).shape_reader()
+        script_table_refresh(httpx_mock, table=table_wire(read_snapshot_id=None))
+        with pytest.raises(FlushHalted) as excinfo:
+            reader.read()
+        assert excinfo.value.reason == "server_capability"
+
+    async def test_a_failed_read_is_transient_and_the_next_read_succeeds(
+        self, httpx_mock: Any, flusher_factory: Any, store: FakeObjectStore
+    ) -> None:
+        """A transport-level refusal is an ordinary error (not a halt —
+        the consumer keeps its old keyer on it); the reader holds no
+        state that a failure could poison."""
+        from pyhoglake import HoglakeError
+
+        reader = flusher_factory(store=store).shape_reader()
+        httpx_mock.add_response(
+            method="GET",
+            url=f"{TABLE_URL}?totals=false",
+            status_code=404,
+            json={"error": "not_found", "detail": "briefly gone"},
+        )
+        with pytest.raises(HoglakeError) as excinfo:
+            reader.read()
+        assert not isinstance(excinfo.value, FlushHalted)
+        script_table_refresh(httpx_mock)
+        assert reader.read().table_uuid == TABLE_UUID
 
 
 # =====================================================================================
@@ -969,7 +1218,7 @@ class TestRefusalTaxonomy:
                 )
             ],
         )
-        key = keyspace.idempotency_key(TABLE_UUID, "events", 0, TEAM, 0, 2)
+        key = ikey(0, TEAM, 0, 2)
         report = await flusher.flush_key(
             stage,
             decision(TEAM, trigger="size", staged_bytes=100, first_staged_ts=JAN_US),
@@ -1358,7 +1607,7 @@ class TestRefusalTaxonomy:
         # answered 422 "validation" → HALT, entry and rows intact.
         await stage.close()
         stage2 = await stage_factory()
-        key = keyspace.idempotency_key(TABLE_UUID, "events", 0, TEAM, 0, 1)
+        key = ikey(0, TEAM, 0, 1)
         script_receipt(httpx_mock, key, snapshot_id=None)
         capture.extend(
             [commit_refusal(422, "validation", "column_stats name a dropped field_id")]
@@ -1708,7 +1957,7 @@ class TestDeterminism:
 
 @component
 class TestPartitionScopedIdentity:
-    async def test_two_partitions_same_team_same_offsets_distinct_keys_and_uris(
+    async def test_two_partitions_same_group_same_offsets_distinct_keys_and_uris(
         self,
         httpx_mock: Any,
         stage_factory: Any,
@@ -1743,12 +1992,8 @@ class TestPartitionScopedIdentity:
 
         assert r0.outcome == r1.outcome == "committed"
         # Identical (table, team, first, last); the partition makes the key.
-        assert r0.idempotency_key == keyspace.idempotency_key(
-            TABLE_UUID, "events", 0, TEAM, 0, 1
-        )
-        assert r1.idempotency_key == keyspace.idempotency_key(
-            TABLE_UUID, "events", 1, TEAM, 0, 1
-        )
+        assert r0.idempotency_key == ikey(0, TEAM, 0, 1)
+        assert r1.idempotency_key == ikey(1, TEAM, 0, 1)
         assert r0.idempotency_key != r1.idempotency_key
         # ...and the object names derive from the key, so they are
         # disjoint too — every uploaded object distinct and present.
@@ -1781,14 +2026,14 @@ class TestPartitionScopedIdentity:
         such an entry; the guard is for foreign writes and bugs.)"""
         stage = await stage_factory(partition=0)
         await staged(stage, fake_clock, TEAM, [(0, JAN_US)])
-        key = keyspace.idempotency_key(TABLE_UUID, "events", 1, TEAM, 0, 0)
+        key = ikey(1, TEAM, 0, 0)
         body = flush_mod.canonical_body(
             {"idempotency_key": key, "message": "millrace=v1 synthetic"}
         )
         await stage.persist_prepared(
-            TEAM,
+            team_group(TEAM),
             0,
-            PreparedRequest(key, body, NOW, topic="events", partition=1),
+            prepared_request(key, TEAM, partition=1, body=body),
         )
         flusher = flusher_factory(store=store, cfg=make_config(target_output_bytes=1))
         (pending,) = (await stage.recover()).pending_prepared
@@ -2340,7 +2585,7 @@ class TestOrphanAccounting:
 
         stats = flusher.stats()
         assert stats.orphaned_uploads == 1
-        key = keyspace.idempotency_key(TABLE_UUID, "events", 0, TEAM, 0, 1)
+        key = ikey(0, TEAM, 0, 1)
         orphaned = f"bkt/lake/data/{NAMESPACE}/{TABLE}/{key}/0.parquet"
         with caplog.at_level(logging.WARNING):
             # re-run the accounting read: the warning was logged at failure
@@ -2666,9 +2911,9 @@ class TestBatchBuildIsolation:
             dropped_keys=(),
         )
         rows = [
-            (keyspace.RowKey(7, 100, 0), b"payload-good", good),
-            (keyspace.RowKey(7, 101, 1), b"payload-bad", bad),
-            (keyspace.RowKey(7, 102, 2), b"payload-good-2", good),
+            (keyspace.RowKey(team_group(7), 100, 0), b"payload-good", good),
+            (keyspace.RowKey(team_group(7), 101, 1), b"payload-bad", bad),
+            (keyspace.RowKey(team_group(7), 102, 2), b"payload-good-2", good),
         ]
         table, encoded, guilty = flush_mod._build_batch_isolating(rows, cols)
         assert table.num_rows == 2
@@ -2691,8 +2936,8 @@ class TestBatchBuildIsolation:
             values={"team_id": 7, "timestamp": 5, "event": "x"}, dropped_keys=()
         )
         rows = [
-            (keyspace.RowKey(7, 100, 0), b"p", record),
-            (keyspace.RowKey(7, 101, 1), b"q", record),
+            (keyspace.RowKey(team_group(7), 100, 0), b"p", record),
+            (keyspace.RowKey(team_group(7), 101, 1), b"q", record),
         ]
         real = flush_mod._build_batch
 
@@ -2916,7 +3161,7 @@ class TestReceiptHorizon:
         # lose data)
         assert flusher.stats().orphaned_uploads == 0
 
-    async def test_unknown_age_legacy_entry_halts_on_a_404(
+    async def test_an_envelope_naming_another_partition_tuple_is_corruption(
         self,
         httpx_mock: Any,
         stage_factory: Any,
@@ -2925,34 +3170,27 @@ class TestReceiptHorizon:
         store: FakeObjectStore,
         sleeper: Sleeper,
     ) -> None:
-        """A v1 envelope carries no persisted_at: age unknown ⇒ halt-safe
-        on a receipt 404 (never a blind replay), even fresh off the
-        clock."""
+        """The envelope carries its key's partition tuple (as hoglake
+        partition values); one that disagrees with the ``prepared/`` key
+        it sits under is foreign state — refused, never replayed, and no
+        receipt lookup is even made."""
         stage = await stage_factory()
         flusher = flusher_factory(store=store, cfg=make_config(target_output_bytes=1))
         key, body, pending = await self._crashed_pending(
             httpx_mock, stage, fake_clock, flusher
         )
-        # Re-encode the SAME request as a legacy v1 envelope (no
-        # persisted_at) — what a pre-v2 build would have left behind.
-        raw_key = key.encode("utf-8")
-        v1_envelope = (
-            b"\x01"
-            + len(raw_key).to_bytes(2, "big")
-            + raw_key
-            + len(body).to_bytes(4, "big")
-            + body
+        foreign = PreparedRequest(
+            idempotency_key=key,
+            body=body,
+            persisted_at=pending.request.persisted_at,
+            topic="events",
+            partition=0,
+            group=team_group(TEAM + 1),
+            group_fields=SPEC_FIELDS,
         )
-        legacy = keyspace.decode_prepared_value(v1_envelope)
-        assert legacy.persisted_at is None
-        legacy_pending = type(pending)(key=pending.key, request=legacy)
-
-        script_receipt(httpx_mock, key, snapshot_id=None)
-        capture = CommitCapture(httpx_mock, [])  # no commit may be sent
-        with pytest.raises(FlushHalted) as excinfo:
-            await flusher.reconcile_prepared(stage, legacy_pending)
-        assert excinfo.value.reason == "receipt_horizon_exceeded"
-        assert capture.bodies == []
+        foreign_pending = type(pending)(key=pending.key, request=foreign)
+        with pytest.raises(StageCorruptionError, match="names partition tuple"):
+            await flusher.reconcile_prepared(stage, foreign_pending)
         assert len(await staged_rows(stage, TEAM)) == 2
 
     async def test_receipt_200_settles_regardless_of_age(
@@ -3101,12 +3339,12 @@ class TestReceiptHorizon:
 
 
 # =====================================================================================
-# Chunking and the fanout bound
+# Many decisions per sweep, and the fanout bound
 # =====================================================================================
 
 
 @component
-class TestChunking:
+class TestSweepAndFanoutBound:
     async def test_sweep_commits_stay_within_the_file_bound(
         self,
         httpx_mock: Any,
@@ -3142,10 +3380,8 @@ class TestChunking:
             assert sweep.decisions == 5
             assert sweep.committed == 5
             assert len(capture.bodies) == 5
-            # Oldest first (planner order, preserved through chunking)...
-            assert [
-                p["message"].split(" team=")[1].split(" ")[0] for p in capture.payloads
-            ] == [
+            # Oldest first (planner order, preserved through dispatch)...
+            assert [str(message_team(p["message"])) for p in capture.payloads] == [
                 "11",
                 "22",
                 "33",
@@ -3423,13 +3659,13 @@ class TestWireDiscipline:
             table_get, method="GET", url=f"{TABLE_URL}?totals=false"
         )
 
-        original_scan = stage.scan_team_rows_bounded
+        original_scan = stage.scan_group_rows_bounded
 
-        async def scanning(team_id: int, **kwargs: Any) -> Any:
+        async def scanning(group: Any, **kwargs: Any) -> Any:
             journal.append("scan")
-            return await original_scan(team_id, **kwargs)
+            return await original_scan(group, **kwargs)
 
-        monkeypatch.setattr(stage, "scan_team_rows_bounded", scanning)
+        monkeypatch.setattr(stage, "scan_group_rows_bounded", scanning)
         report = await flusher.flush_key(
             stage,
             decision(TEAM, trigger="size", staged_bytes=100, first_staged_ts=JAN_US),
@@ -3459,10 +3695,10 @@ class TestWireDiscipline:
 
         original_read_offsets = stage.read_offsets
 
-        async def read_offsets_with_arrival(team_id: int) -> Any:
+        async def read_offsets_with_arrival(group: Any) -> Any:
             # The consumer lands a new batch in the scan/offsets gap.
             await staged(stage, fake_clock, TEAM, [(3, JAN_US), (4, JAN_US)])
-            return await original_read_offsets(team_id)
+            return await original_read_offsets(group)
 
         monkeypatch.setattr(stage, "read_offsets", read_offsets_with_arrival)
         report = await flusher.flush_key(
@@ -3701,7 +3937,7 @@ class TestRunner:
 
             # Next tick replays team 11's PERSISTED request (receipt 404 →
             # republish), byte-identical to the crashed attempts.
-            key = keyspace.idempotency_key(TABLE_UUID, "events", 0, 11, 0, 0)
+            key = ikey(0, 11, 0, 0)
             script_receipt(httpx_mock, key, snapshot_id=None)
             capture.extend([commit_ok(51)])
             sweep2 = await runner(manager, flusher, cfg, fake_clock, sleeper).run_once()
@@ -3830,7 +4066,7 @@ class TestRunner:
 
             # The next flush of the team finds the persisted entry and
             # replays it — the entry's window is [0,1], a strict prefix.
-            key = keyspace.idempotency_key(TABLE_UUID, "events", 0, TEAM, 0, 1)
+            key = ikey(0, TEAM, 0, 1)
             script_receipt(httpx_mock, key, snapshot_id=None)
             capture.extend([commit_ok(50), commit_ok(51)])
             report = await flusher.flush_key(
@@ -3876,7 +4112,7 @@ class TestStageQuarantinePrimitives:
         await stage.stage_batch(
             [  # one real row so the partition has live state
                 __import__("millrace.stage", fromlist=["StagedRecord"]).StagedRecord(
-                    team_id=TEAM, event_ts_us=JAN_US, offset=0, payload=b"ok"
+                    group=team_group(TEAM), event_ts_us=JAN_US, offset=0, payload=b"ok"
                 )
             ],
             now_us=fake_clock(),
@@ -3922,20 +4158,23 @@ class TestStageQuarantinePrimitives:
     ) -> None:
         stage = await stage_factory()
         await staged(stage, fake_clock, TEAM, [(0, JAN_US), (1, JAN_US), (2, JAN_US)])
-        from millrace.keyspace import PreparedRequest
 
         await stage.persist_prepared(
-            TEAM, 0, PreparedRequest("k" * 36, b"{}", NOW, topic="events", partition=0)
+            team_group(TEAM), 0, prepared_request("k" * 36, TEAM, partition=0)
         )
 
-        report = await stage.settle_quarantined(FlushedKey(TEAM, 0, 2))
-        assert (report.rows_deleted, report.team_drained) == (3, True)
+        report = await stage.settle_quarantined(
+            FlushedKey(team_group(TEAM), 0, 2, group_fields=SPEC_FIELDS)
+        )
+        assert (report.rows_deleted, report.group_drained) == (3, True)
         assert await staged_rows(stage, TEAM) == []
         assert await stage.iter_key_stats() == []
         assert await stage.load_prepared() == []
         assert await read_markers(stage) == []  # nothing writes flushed/ any more
         # Idempotent replay...
-        again = await stage.settle_quarantined(FlushedKey(TEAM, 0, 2))
+        again = await stage.settle_quarantined(
+            FlushedKey(team_group(TEAM), 0, 2, group_fields=SPEC_FIELDS)
+        )
         assert again.rows_deleted == 0
         # ...and recovery finds nothing to do.
         recovery = await stage.recover()
@@ -4072,7 +4311,7 @@ class TestSettlementGuard:
             return type(report)(
                 rows_deleted=report.rows_deleted + 1,  # a row the scan never saw
                 bytes_deleted=report.bytes_deleted,
-                team_drained=report.team_drained,
+                group_drained=report.group_drained,
             )
 
         monkeypatch.setattr(stage, "commit_flushed", doctored_settle)
@@ -4127,18 +4366,22 @@ class TestJunkWindowBoundaries:
         )
         pre_epoch = -86_400_000_000  # 1969-12-31
         records = [
-            (keyspace.RowKey(7, pre_epoch, 0), event_payload(7, pre_epoch)),
-            (keyspace.RowKey(7, pre_epoch, 1), b'{"team_id": 7, "timestamp": null}'),
+            (keyspace.RowKey(team_group(7), pre_epoch, 0), event_payload(7, pre_epoch)),
+            (
+                keyspace.RowKey(team_group(7), pre_epoch, 1),
+                b'{"team_id": 7, "timestamp": null}',
+            ),
         ]
         ctx = flush_mod.FlushContext(
             topic="events",
             partition=0,
-            team_id=7,
+            group=team_group(7),
+            group_fields=SPEC_FIELDS,
             trigger="size",
             first_offset=0,
             last_offset=1,
             offset_ranges=(OffsetRange("events", 0, 0, 1),),
-            idempotency_key=keyspace.idempotency_key(TABLE_UUID, "events", 0, 7, 0, 1),
+            idempotency_key=ikey(0, 7, 0, 1),
             read_snapshot=88,
             table_uuid=TABLE_UUID,
         )
@@ -4191,16 +4434,17 @@ class TestJunkWindowBoundaries:
                 "read_snapshot_id": 88,
             }
         )
-        records = [(keyspace.RowKey(7, JAN_US, 0), b"not json")]
+        records = [(keyspace.RowKey(team_group(7), JAN_US, 0), b"not json")]
         ctx = flush_mod.FlushContext(
             topic="events",
             partition=0,
-            team_id=7,
+            group=team_group(7),
+            group_fields=SPEC_FIELDS,
             trigger="age",
             first_offset=0,
             last_offset=0,
             offset_ranges=(OffsetRange("events", 0, 0, 0),),
-            idempotency_key=keyspace.idempotency_key(TABLE_UUID, "events", 0, 7, 0, 0),
+            idempotency_key=ikey(0, 7, 0, 0),
             read_snapshot=88,
             table_uuid=TABLE_UUID,
         )
@@ -4300,7 +4544,7 @@ async def stage_sized_rows(
     await stage.stage_batch(
         [
             StagedRecord(
-                team_id=team,
+                group=team_group(team),
                 event_ts_us=ts,
                 offset=offset,
                 payload=sized_payload(team, ts, size),
@@ -4355,9 +4599,7 @@ class TestBoundedFlush:
             # The window is the SCANNED prefix's — the stats snapshot's
             # whole 500-row slice would read offsets 0-499 here.
             assert message_window(capture.payloads[0]) == (0, 49)
-            assert capture.payloads[0]["idempotency_key"] == keyspace.idempotency_key(
-                TABLE_UUID, "events", 0, TEAM, 0, 49
-            )
+            assert capture.payloads[0]["idempotency_key"] == ikey(0, TEAM, 0, 49)
             assert len(await staged_rows(stage, TEAM)) == total - 50
 
             windows = [(0, 49)]
@@ -4416,9 +4658,7 @@ class TestBoundedFlush:
         assert report.outcome == "committed"
         assert report.records == 5  # the covered prefix, not the 50 scanned
         assert message_window(capture.payloads[0]) == (0, 4)
-        assert capture.payloads[0]["idempotency_key"] == keyspace.idempotency_key(
-            TABLE_UUID, "events", 0, TEAM, 0, 4
-        )
+        assert capture.payloads[0]["idempotency_key"] == ikey(0, TEAM, 0, 4)
         assert len(await staged_rows(stage, TEAM)) == 46
 
         # Drain: each flush publishes exactly the rows its window covers
@@ -4475,7 +4715,7 @@ class TestBoundedFlush:
         await stage.stage_batch(
             [
                 StagedRecord(
-                    team_id=TEAM + (i % 2),
+                    group=team_group(TEAM + (i % 2)),
                     event_ts_us=JAN_US + i,
                     offset=i,
                     payload=event_payload(TEAM + (i % 2), JAN_US + i),
@@ -4485,7 +4725,9 @@ class TestBoundedFlush:
             now_us=fake_clock(),
         )
         # The arrival-structure record over-covers by construction.
-        assert await stage.read_offsets(TEAM) == (OffsetRange("events", 0, 0, 6),)
+        assert await stage.read_offsets(team_group(TEAM)) == (
+            OffsetRange("events", 0, 0, 6),
+        )
         script_options(httpx_mock)
         capture = CommitCapture(httpx_mock, [commit_ok(100), commit_ok(101)])
         flusher = flusher_factory(store=store, cfg=make_config())
@@ -4567,7 +4809,7 @@ class TestBoundedFlush:
                 JAN_US + i for i in range(24) if i % 2 == team - TEAM
             ]
             assert await staged_rows(stage, team) == []
-            assert await stage.read_team_stats(team) is None
+            assert await stage.read_group_stats(team_group(team)) is None
 
     async def test_a_single_row_larger_than_the_byte_budget_still_flushes(
         self,
@@ -4674,11 +4916,12 @@ class TestBoundedFlush:
             stage, TEAM, [(2, JAN_US - 10), (3, JAN_US - 9)], size=100
         )
         scanned = [
-            rk.offset async for rk, _ in stage.scan_team_rows(TEAM, max_bytes=250)
+            rk.offset
+            async for rk, _ in stage.scan_group_rows(team_group(TEAM), max_bytes=250)
         ]
         assert scanned[:2] == [2, 3]  # the moved prefix (white-box check)
 
-        key = keyspace.idempotency_key(TABLE_UUID, "events", 0, TEAM, 0, 1)
+        key = ikey(0, TEAM, 0, 1)
         script_receipt(httpx_mock, key, snapshot_id=77)  # it landed
         report = await flusher.flush_key(
             stage,
@@ -4980,20 +5223,20 @@ class TestReadinessRouting:
             await staged(stage, fake_clock, team_c, [(3, JAN_US + 3)])
 
             index_calls: list[int] = []
-            point_reads: list[int] = []
+            point_reads: list[Any] = []
             real_index = stage.iter_sched_age_through
-            real_read = stage.read_team_stats
+            real_read = stage.read_group_stats
 
             async def spy_index(cutoff: int):
                 index_calls.append(cutoff)
                 return await real_index(cutoff)
 
-            async def spy_read(team_id: int):
-                point_reads.append(team_id)
-                return await real_read(team_id)
+            async def spy_read(group: Any):
+                point_reads.append(group)
+                return await real_read(group)
 
             monkeypatch.setattr(stage, "iter_sched_age_through", spy_index)
-            monkeypatch.setattr(stage, "read_team_stats", spy_read)
+            monkeypatch.setattr(stage, "read_group_stats", spy_read)
 
             script_options(httpx_mock)
             capture = CommitCapture(httpx_mock, [commit_ok(50), commit_ok(51)])
@@ -5005,12 +5248,9 @@ class TestReadinessRouting:
             # The index scan ran once, through the age-lane cutoff...
             assert index_calls == [fake_clock() - 900 * 1_000_000]
             # ...and only the age-eligible team was point-read.
-            assert point_reads == [team_a]
+            assert point_reads == [team_group(team_a)]
             # A rode the age lane, B the size lane, C is still staged.
-            by_team = {
-                int(p["message"].split(" team=")[1].split(" ")[0]): p
-                for p in capture.payloads
-            }
+            by_team = {message_team(p["message"]): p for p in capture.payloads}
             assert "trigger=age" in by_team[team_a]["message"]
             assert "trigger=size" in by_team[team_b]["message"]
             assert len(await staged_rows(stage, team_c)) == 1
@@ -5034,14 +5274,14 @@ class TestReadinessRouting:
         ) as manager:
             stage = (await manager.open_partition("events", 0)).stage
             await staged(stage, fake_clock, TEAM, [(0, JAN_US)])
-            point_reads: list[int] = []
-            real_read = stage.read_team_stats
+            point_reads: list[Any] = []
+            real_read = stage.read_group_stats
 
-            async def spy_read(team_id: int):
-                point_reads.append(team_id)
-                return await real_read(team_id)
+            async def spy_read(group: Any):
+                point_reads.append(group)
+                return await real_read(group)
 
-            monkeypatch.setattr(stage, "read_team_stats", spy_read)
+            monkeypatch.setattr(stage, "read_group_stats", spy_read)
             script_options(httpx_mock)
             CommitCapture(httpx_mock, [commit_ok(50)])
             flusher = flusher_factory(store=store, cfg=cfg)
@@ -5074,10 +5314,10 @@ class TestReadinessRouting:
             # flush needs the shape or the commit path.
             flusher = flusher_factory(store=store, cfg=cfg)
 
-            async def drifted_read(team_id: int):
+            async def drifted_read(group: Any):
                 return None
 
-            monkeypatch.setattr(stage, "read_team_stats", drifted_read)
+            monkeypatch.setattr(stage, "read_group_stats", drifted_read)
             with pytest.raises(StageCorruptionError, match="sched_age"):
                 await runner(manager, flusher, cfg, fake_clock, sleeper).run_once()
             assert await staged_rows(stage, TEAM) != []  # nothing flushed away
@@ -5294,7 +5534,7 @@ class TestParallelSweep:
                 inflight[key] = inflight.get(key, 0) + 1
                 peak[key] = max(peak.get(key, 0), inflight[key])
                 try:
-                    if dec.team_id == 11:
+                    if dec.group == team_group(11):
                         started.set()
                         await gate.wait()
                     return await real_flush_key(stage, dec)
@@ -5353,7 +5593,7 @@ class TestParallelSweep:
             real_flush_key = flusher.flush_key
 
             async def broken_flush_key(stage: Any, dec: Any):
-                if dec.team_id == 11:
+                if dec.group == team_group(11):
                     raise RuntimeError("encoder bug")
                 return await real_flush_key(stage, dec)
 
@@ -5447,7 +5687,7 @@ class TestParallelSweep:
             real_flush_key = flusher.flush_key
 
             async def recording_flush_key(stage: Any, dec: Any):
-                starts.append(dec.team_id)
+                starts.append(int(dec.group[0]))
                 return await real_flush_key(stage, dec)
 
             monkeypatch.setattr(flusher, "flush_key", recording_flush_key)
@@ -5488,7 +5728,7 @@ class _FencedOutFlusher:
         return FlushReport(
             topic=stage.topic,
             partition=stage.partition,
-            team_id=decision.team_id,
+            group=decision.group,
             trigger=decision.trigger,
             outcome="committed",
             first_offset=0,
@@ -5655,7 +5895,10 @@ class TestFencedFlusher:
                 await s0.stage_batch(
                     [
                         StagedRecord(
-                            team_id=TEAM, event_ts_us=JAN_US, offset=1, payload=b"x"
+                            group=team_group(TEAM),
+                            event_ts_us=JAN_US,
+                            offset=1,
+                            payload=b"x",
                         )
                     ],
                     now_us=fake_clock(),
@@ -5743,7 +5986,10 @@ class TestFencedFlusher:
                 await s0.stage_batch(
                     [
                         StagedRecord(
-                            team_id=TEAM, event_ts_us=JAN_US, offset=1, payload=b"x"
+                            group=team_group(TEAM),
+                            event_ts_us=JAN_US,
+                            offset=1,
+                            payload=b"x",
                         )
                     ],
                     now_us=fake_clock(),

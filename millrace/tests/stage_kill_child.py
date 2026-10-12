@@ -33,7 +33,7 @@ async def _run(
     for batch_index in range(batch_count):
         records = [
             StagedRecord(
-                team_id=(offset + i) % teams,
+                group=(str((offset + i) % teams),),
                 event_ts_us=1_700_000_000_000_000 + offset + i,
                 offset=offset + i,
                 payload=payload_for(offset + i, payload_size),

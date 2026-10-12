@@ -1,25 +1,36 @@
 """Staging key codecs (docs/kafka-ingestion.md §Staging layout).
 
-    rows/<team_id><timestamp><offset>          → event payload bytes
-    stats/<team_id>                            → StatsValue
-    sched_age/<first_staged_ts><team_id>       → ∅ (empty value)
-    offsets/<team_id>                          → sorted (topic, partition, first, last) ranges
-    prepared/<team_id><first_offset>           → PreparedRequest envelope
-    flushed/<team_id><first_offset><last_offset> → LEGACY: never written
+    rows/<group><timestamp><offset>            → event payload bytes
+    stats/<group>                              → StatsValue
+    sched_age/<first_staged_ts><group>         → ∅ (empty value)
+    offsets/<group>                            → sorted (topic, partition, first, last) ranges
+    prepared/<group><first_offset>             → PreparedRequest envelope
+    flushed/…                                  → LEGACY: never written
     poison/<offset>                            → PoisonValue envelope
+
+``<group>`` is ONE HOGLAKE PARTITION TUPLE of the destination table: the
+wire strings the commit's ``partition_values`` carry for a file of that
+tuple (pyhoglake ``transforms.wire_string`` of each live-spec field's
+transformed source value, in spec order; None for a null component),
+encoded by :func:`encode_group`. The consumer computes it per record at
+consume time (:class:`millrace.grouping.GroupKeyer`); an unpartitioned
+table has the empty tuple. Every key that names "what flushes together"
+names a partition tuple, so a staged slice is one hoglake partition's
+staged rows.
 
 Topology: ONE SlateDB instance per claimed Kafka partition
 (``s3://…/millrace/{topic}/{partition}``). The keyspace therefore
-carries NO partition component — the instance *is* the partition, the
-consumer assignment is the claim, and staged state follows the
-partition to its new owner, never the pod. The ``offsets/`` side prefix
-keeps ``(topic, partition, first_offset, last_offset)`` per staged
-range as the flush's identity material, not as row-key material.
+carries NO Kafka-partition component — the instance *is* the Kafka
+partition, the consumer assignment is the claim, and staged state
+follows the Kafka partition to its new owner, never the pod. The
+``offsets/`` side prefix keeps ``(topic, partition, first_offset,
+last_offset)`` per staged range as the flush's identity material, not
+as row-key material.
 
 The LSM's ordering is load-bearing: ``rows`` key bytes must sort in
-(team, timestamp, offset) order so a flush reads one contiguous, nearly
+(group, timestamp, offset) order so a flush reads one contiguous, nearly
 sorted range, and ``sched_age`` bytes must sort in (first_staged_ts,
-team_id) order so the readiness sweep is a prefix range scan.
+group) order so the readiness sweep is a prefix range scan.
 
 Encoding rules
 --------------
@@ -35,12 +46,19 @@ Encoding rules
   every non-negative and break the sort property above.
 - Signed values inside VALUE envelopes use plain two's complement;
   values have no ordering requirement.
-- ``team_id`` is a non-negative integer, encoded unsigned 8-byte
-  big-endian, which sorts numerically on its own.
-- Every value envelope starts with a 1-byte version. Stored payloads
-  outlive the code that wrote them; a reader refuses any version it does
-  not know and keeps decoding the ones it does (``prepared`` is at
-  version 3; versions 1 and 2 still decode).
+- The group is PREFIX-FREE: ``arity(u8)``, then per component a 1-byte
+  tag — ``0x00`` null, ``0x01`` present — and, when present,
+  ``len(u16) utf8``. The arity byte is what makes the WHOLE tuple
+  prefix-free, not just each component: without it the tuple
+  ``(a,)`` (written under an older one-field spec) would be a byte
+  prefix of ``(a, b)``, and the old tuple's row range would swallow
+  the new tuple's rows. With it, ``prefix + group`` selects exactly one
+  group's keys by prefix successor (:func:`group_rows_range`). Fixed
+  trailing fields (timestamp, offset) parse off the END of a key, and
+  :func:`decode_group` refuses anything that is not exactly one
+  well-formed tuple.
+- Every value envelope starts with a 1-byte version. A reader refuses
+  any version it does not know.
 
 Value formats
 -------------
@@ -53,32 +71,34 @@ Value formats
                sorted by (topic, partition, first_offset, last_offset)
                so the same set encodes to identical bytes regardless of
                assembly order.
-- ``prepared``: version(1) key_len(u16) idempotency_key(utf8)
-               [v3 only: topic_len(u16) topic(utf8) partition(u32)]
+- ``prepared``: version(4) key_len(u16) idempotency_key(utf8)
+               topic_len(u16) topic(utf8) partition(u32)
+               arity(u8), then per partition field name_len(u16)
+               name(utf8) tag(u8) [value_len(u16) value(utf8)]
                body_len(u32) body(bytes) persisted_at(u64, micros since
-               the Unix epoch — v2 and up). The body is the byte-exact
-               prepared commit request, written once and replayed
+               the Unix epoch). The body is the byte-exact prepared
+               commit request, written once and replayed
                byte-identically after an ambiguous response.
                ``persisted_at`` is the receipt-horizon guard's input: a
                persisted request whose receipt lookup 404s may only be
                republished while it is YOUNGER than the receipt horizon —
                past it, a 404 is indistinguishable from a purged receipt
-               and the flusher halts (flush.py). The v3 ``topic`` /
-               ``partition`` fields are the v2 idempotency-key
-               derivation inputs the envelope's key was minted from:
-               they make a persisted entry self-describing, and recovery
-               cross-checks them against the stage's own identity (an
-               entry naming another partition is foreign state, refused
-               loudly). Legacy envelopes decode with the fields they
-               lack set to None — v1 additionally means ``persisted_at``
-               is None: unknown age, halt-safe.
+               and the flusher halts (flush.py). ``topic`` / ``partition``
+               and the partition tuple are the idempotency key's
+               derivation inputs: they make a persisted entry
+               self-describing, and recovery cross-checks them against
+               the stage's own identity and the ``prepared/`` key it
+               sits under (an entry naming another partition or tuple is
+               foreign state, refused loudly). The tuple travels as hoglake partition
+               values — each field's display name beside its wire
+               string — so the envelope reads like the file it
+               registers.
 - ``flushed``:  LEGACY — pre-atomic-settlement builds wrote a marker per
-               committed range (v1 value: key_len(u16) key(utf8)
-               commit_snapshot_id(u64) flushed_at(i64)). Settlement has
-               always been one atomic transaction, so the repair state the
-               marker existed for is unreachable and nothing writes the
-               prefix any more; :meth:`PartitionStage.recover` collects
-               leftover markers in bounded pages WITHOUT decoding them.
+               committed range. Settlement has always been one atomic
+               transaction, so the repair state the marker existed for is
+               unreachable and nothing writes the prefix any more;
+               :meth:`PartitionStage.recover` collects leftover markers in
+               bounded pages WITHOUT decoding them.
 - ``poison``:  version(1) reason_len(u16) reason(utf8) has_key(u8)
                [key_len(u32) key] has_value(u8) [value_len(u32) value]
                value_bytes_original(u32). The consume-time quarantine:
@@ -88,50 +108,52 @@ Value formats
                since the Unix epoch) — the retention purge's age basis
                (``PartitionStage.purge_poison_expired``). v1 envelopes
                decode with ``quarantined_at_us=None``: unknown age,
-               never purged (the safe direction for forensic state —
-               kept, like a pre-``persisted_at`` prepared entry is
-               halt-safe).
+               never purged (the safe direction for forensic state).
 
 The settlement window
 ---------------------
 
 A committed flush settles by deleting EXACTLY its offset window of the
-team's rows. Byte order is (team, timestamp, offset), so no byte range
-narrower than the team's isolates one offset window — a younger range of
-the same team sorts inside the same slice and must survive. The delete
-therefore scans :func:`flushed_rows_scan_range` (the team's whole slice)
-and deletes the keys :func:`row_in_flushed_range` selects; within one
-partition instance a row's Kafka offset is unique, so the window
-identifies its rows exactly.
+partition tuple's staged rows. Byte order is (group, timestamp, offset),
+so no byte range narrower than the group's isolates one offset window —
+a younger range of the same tuple sorts inside the same slice and must
+survive. The delete therefore scans :func:`flushed_rows_scan_range`
+(the group's whole slice) and deletes the keys
+:func:`row_in_flushed_range` selects; within one Kafka-partition
+instance a row's offset is unique, so the window identifies its rows
+exactly.
 
 Ranges
 ------
 
 Range functions return half-open ``[start, end)`` byte pairs built by
-prefix successor, so they select exactly the keys sharing a prefix.
+prefix successor, so they select exactly the keys sharing a prefix
+(prefix-correct for variable-length groups because the group encoding
+is prefix-free).
 
 Idempotency
 -----------
 
 ``idempotency_key`` derives a commit's idempotency key from
-``(table_uuid, topic, partition, team_id, first_offset, last_offset)`` —
-a UUIDv5 over a pinned namespace and a canonical name line
-``millrace:v2:table=<uuid>:topic=<topic>:partition=<n>:team=<n>:offsets=
-<first>-<last>``. Derived, not random: no wall-clock, no randomness, no
+``(table_uuid, topic, partition, partition tuple, first_offset,
+last_offset)`` — a UUIDv5 over a pinned namespace and a canonical name
+line ``millrace:v2:table=<uuid>:topic=<topic>:partition=<n>:group=
+<k0=…/k1=…>:offsets=<first>-<last>``, where the group is
+:func:`group_key_form` — the tuple's wire strings under POSITIONAL names
+(``k0=42/k1=681``, ASCII, percent-encoded), so the key is a pure
+function of the staged tuple and no spec change can move it (display
+names such as ``team_id=42/timestamp_month=681`` appear only in the
+commit message and the ``prepared/`` envelope). Derived, not random: no wall-clock, no randomness, no
 per-attempt state, so the same staged range names the same commit in
 every process, forever, and the server's receipt dedupes the replay
 (docs/kafka-ingestion.md §Delivery semantics). The table INCARNATION is
 in the name because receipts survive a table drop: without it a
 dropped-and-recreated table would answer a flush from its predecessor's
-receipt. TOPIC and PARTITION are in the name (v2) because Kafka offsets
-are PER PARTITION: two partitions flushing one team over the same offset
-range must never produce the same key — the first derivation omitted
-them, and the second partition's upload would overwrite the first's
-committed objects under the shared key before the server refused the
-publish as a key reuse. BOTH offset ends are in the name because
-"everything up to N" is not a row set once a partition rewinds. The
-derivation is versioned (``v2`` in the name); changing it deliberately
-invalidates all outstanding keys.
+receipt. TOPIC and PARTITION are in the name because Kafka offsets are
+PER PARTITION: two Kafka partitions flushing one tuple over the same
+offset range must never produce the same key (or the same object URIs,
+which derive from it). BOTH offset ends are in the name because
+"everything up to N" is not a row set once a partition rewinds.
 
 This module is pure: no I/O, no SlateDB, no clocks.
 """
@@ -141,6 +163,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from typing import Final
+from urllib.parse import quote
 
 ROWS_PREFIX: Final = b"rows/"
 STATS_PREFIX: Final = b"stats/"
@@ -155,31 +178,29 @@ _INT64_MAX: Final = (1 << 63) - 1
 _UINT64_MAX: Final = (1 << 64) - 1
 _UINT32_MAX: Final = (1 << 32) - 1
 _UINT16_MAX: Final = (1 << 16) - 1
+_UINT8_MAX: Final = (1 << 8) - 1
 _SIGN_OFFSET: Final = 1 << 63
 
 STATS_VERSION: Final = 1
 OFFSETS_VERSION: Final = 1
-#: The version NEW ``prepared/`` envelopes are written with. Versions 1
-#: (no ``persisted_at``) and 2 (no ``topic``/``partition``) still decode;
-#: see :func:`decode_prepared_value`.
-PREPARED_VERSION: Final = 3
-PREPARED_VERSION_LEGACY: Final = 1
-#: The intermediate shape this branch wrote before the v2 key derivation:
-#: ``persisted_at`` but no ``topic``/``partition``. Decode-only.
-PREPARED_VERSION_V2: Final = 2
+PREPARED_VERSION: Final = 4
 POISON_VERSION: Final = 2
-#: The pre-retention shape (no ``quarantined_at_us`` tail). Decode-only:
-#: an encode of an entry without the stamp keeps writing these exact
-#: bytes so a mixed-version fleet never produces a value an older build
-#: refuses on a path it reads.
+#: The pre-retention shape (no ``quarantined_at_us`` tail). An encode of
+#: an entry without the stamp writes these exact bytes.
 POISON_VERSION_LEGACY: Final = 1
 
-ROW_KEY_LEN: Final = len(ROWS_PREFIX) + 8 + 8 + 8
-STATS_KEY_LEN: Final = len(STATS_PREFIX) + 8
+#: Component tags of the partition-tuple encoding.
+GROUP_NULL: Final = 0x00
+GROUP_PRESENT: Final = 0x01
+
+#: One hoglake partition tuple in wire form: per live-spec field, in spec
+#: order, the ``partition_values`` string a file of the tuple carries
+#: (None for a null component). The empty tuple is an unpartitioned
+#: table's one group.
+PartitionTuple = tuple[str | None, ...]
+
+_TS_OFFSET_LEN: Final = 8 + 8
 STATS_VALUE_LEN: Final = 1 + 8 + 8 + 8 + 8
-SCHED_AGE_KEY_LEN: Final = len(SCHED_AGE_PREFIX) + 8 + 8
-OFFSETS_KEY_LEN: Final = len(OFFSETS_PREFIX) + 8
-PREPARED_KEY_LEN: Final = len(PREPARED_PREFIX) + 8 + 8
 POISON_KEY_LEN: Final = len(POISON_PREFIX) + 8
 
 
@@ -219,11 +240,113 @@ def _prefix_successor(prefix: bytes) -> bytes:
     return stripped[:-1] + bytes([stripped[-1] + 1])
 
 
-def _require_prefix(prefix: bytes, data: bytes, length: int) -> None:
-    if len(data) != length:
-        raise ValueError(f"expected {length} bytes, got {len(data)}")
+def _require_key(prefix: bytes, data: bytes, *, min_length: int) -> None:
     if not data.startswith(prefix):
         raise ValueError(f"key does not start with {prefix!r}: {data!r}")
+    if len(data) < min_length:
+        raise ValueError(f"expected at least {min_length} bytes, got {len(data)}")
+
+
+def _encode_utf8_u16(name: str, text: str) -> bytes:
+    raw = text.encode("utf-8")
+    if len(raw) > _UINT16_MAX:
+        raise ValueError(f"{name} does not fit in a u16 length: {len(raw)} bytes")
+    return len(raw).to_bytes(2, "big") + raw
+
+
+def _decode_utf8_u16(data: bytes, pos: int, what: str) -> tuple[str, int]:
+    if len(data) < pos + 2:
+        raise ValueError(f"truncated {what}: length")
+    length = int.from_bytes(data[pos : pos + 2], "big")
+    pos += 2
+    if len(data) < pos + length:
+        raise ValueError(f"truncated {what}: {length} bytes declared")
+    try:
+        text = bytes(data[pos : pos + length]).decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise ValueError(f"{what} is not UTF-8: {e}") from e
+    return text, pos + length
+
+
+# -- the partition tuple (group) ---------------------------------------------
+
+
+def encode_group(group: PartitionTuple) -> bytes:
+    """The prefix-free byte form of one partition tuple (module
+    docstring §Encoding rules): ``arity(u8)``, then per component
+    ``0x00`` (null) or ``0x01 len(u16) utf8``."""
+    if len(group) > _UINT8_MAX:
+        raise ValueError(f"a partition tuple has at most {_UINT8_MAX} fields")
+    out = bytearray([len(group)])
+    for component in group:
+        if component is None:
+            out.append(GROUP_NULL)
+        else:
+            if not isinstance(component, str):
+                raise TypeError(
+                    "partition tuple components are wire strings or None, got "
+                    f"{type(component).__name__}"
+                )
+            out.append(GROUP_PRESENT)
+            out += _encode_utf8_u16("partition value", component)
+    return bytes(out)
+
+
+def _decode_group_at(data: bytes, pos: int) -> tuple[PartitionTuple, int]:
+    if len(data) < pos + 1:
+        raise ValueError("corrupt partition tuple: no arity byte")
+    arity = data[pos]
+    pos += 1
+    out: list[str | None] = []
+    for index in range(arity):
+        if len(data) < pos + 1:
+            raise ValueError(f"corrupt partition tuple: component {index} missing")
+        tag = data[pos]
+        pos += 1
+        if tag == GROUP_NULL:
+            out.append(None)
+        elif tag == GROUP_PRESENT:
+            value, pos = _decode_utf8_u16(
+                data, pos, f"corrupt partition tuple component {index}"
+            )
+            out.append(value)
+        else:
+            raise ValueError(
+                f"corrupt partition tuple: component {index} has tag {tag:#04x}"
+            )
+    return tuple(out), pos
+
+
+def decode_group(data: bytes) -> PartitionTuple:
+    """Inverse of :func:`encode_group`. TOTAL: any input either decodes
+    to exactly one tuple or raises ValueError naming the corruption — a
+    truncated component, an unknown tag, non-UTF-8 bytes or trailing
+    bytes are all refused, never guessed at."""
+    group, pos = _decode_group_at(bytes(data), 0)
+    if pos != len(data):
+        raise ValueError(f"corrupt partition tuple: {len(data) - pos} trailing byte(s)")
+    return group
+
+
+def group_label(fields: tuple[str, ...], group: PartitionTuple) -> str:
+    """The human form of one partition tuple, for logs and the commit
+    message (the idempotency key uses it with positional names —
+    :func:`group_key_form`): ``name=value`` per field joined by
+    ``/`` (``team_id=42/timestamp_month=681``), a null component as its
+    bare field name. ASCII and injective: names and values are
+    percent-encoded (``/``, ``=``, ``:`` and anything non-ASCII escape),
+    so no two tuples render alike. ``fields`` are hoglake's display
+    names for the spec's fields (:func:`millrace.grouping.field_names`);
+    an unpartitioned table renders as the empty string."""
+    if len(fields) != len(group):
+        raise ValueError(
+            f"{len(fields)} field name(s) for a {len(group)}-field partition tuple"
+        )
+    parts = []
+    for name, value in zip(fields, group, strict=True):
+        encoded = quote(name, safe="._-")
+        parts.append(encoded if value is None else f"{encoded}={quote(value, safe='')}")
+    return "/".join(parts)
 
 
 # -- rows/ --------------------------------------------------------------------
@@ -231,80 +354,57 @@ def _require_prefix(prefix: bytes, data: bytes, length: int) -> None:
 
 @dataclass(frozen=True, slots=True)
 class RowKey:
-    """Decoded form of a ``rows/`` key.
+    """Decoded form of a ``rows/`` key: one staged row of one partition
+    tuple.
 
-    ``timestamp_us`` is the event timestamp in microseconds since the
-    Unix epoch; negative values (pre-1970 junk) are legal and sort
+    ``timestamp_us`` is the Kafka record timestamp in microseconds since
+    the Unix epoch; negative values (pre-1970 junk) are legal and sort
     correctly. ``offset`` is the Kafka offset of the record.
     """
 
-    team_id: int
+    group: PartitionTuple
     timestamp_us: int
     offset: int
 
     def __post_init__(self) -> None:
-        _require_uint64("team_id", self.team_id)
         _require_int64("timestamp_us", self.timestamp_us)
         _require_int64("offset", self.offset)
 
 
 def encode_row_key(key: RowKey) -> bytes:
-    """Encode so byte order matches (team, timestamp, offset) sort order."""
+    """Encode so byte order matches (group, timestamp, offset) sort order."""
     return (
         ROWS_PREFIX
-        + _encode_u64(key.team_id)
+        + encode_group(key.group)
         + _encode_i64_ordered(key.timestamp_us)
         + _encode_i64_ordered(key.offset)
     )
 
 
 def decode_row_key(data: bytes) -> RowKey:
-    """Inverse of :func:`encode_row_key`."""
-    _require_prefix(ROWS_PREFIX, data, ROW_KEY_LEN)
+    """Inverse of :func:`encode_row_key`: the trailing 16 bytes are the
+    timestamp and offset, the middle is exactly one partition tuple."""
     p = len(ROWS_PREFIX)
+    _require_key(ROWS_PREFIX, data, min_length=p + 1 + _TS_OFFSET_LEN)
     return RowKey(
-        team_id=int.from_bytes(data[p : p + 8], "big", signed=False),
-        timestamp_us=_decode_i64_ordered(data[p + 8 : p + 16]),
-        offset=_decode_i64_ordered(data[p + 16 : p + 24]),
+        group=decode_group(data[p:-_TS_OFFSET_LEN]),
+        timestamp_us=_decode_i64_ordered(data[-16:-8]),
+        offset=_decode_i64_ordered(data[-8:]),
     )
 
 
-def team_rows_prefix(team_id: int) -> bytes:
-    """The shared prefix of every ``rows/`` key of one team."""
-    _require_uint64("team_id", team_id)
-    return ROWS_PREFIX + _encode_u64(team_id)
+def group_rows_prefix(group: PartitionTuple) -> bytes:
+    """The shared prefix of every ``rows/`` key of one partition tuple."""
+    return ROWS_PREFIX + encode_group(group)
 
 
-def team_rows_range(team_id: int) -> tuple[bytes, bytes]:
-    """Half-open byte range selecting exactly the staged rows of one team."""
-    start = team_rows_prefix(team_id)
+def group_rows_range(group: PartitionTuple) -> tuple[bytes, bytes]:
+    """Half-open byte range selecting exactly one partition tuple's
+    staged rows — prefix successor on the FULL ``rows/ + group`` bytes,
+    exact because the group encoding is prefix-free (no other tuple's
+    keys share the prefix)."""
+    start = group_rows_prefix(group)
     return start, _prefix_successor(start)
-
-
-def staged_rows_range(
-    team_id: int, first_offset: int, last_offset: int
-) -> tuple[bytes, bytes]:
-    """Half-open byte range scanned at flush time for the staged batch
-    identified by ``(team_id, first_offset, last_offset)``.
-
-    The range is NOT narrowed by offset and cannot be: offset is the
-    least significant row-key field, so one batch's rows interleave with
-    the team's other rows in (timestamp, offset) order, and no byte
-    range narrower than the team's selects exactly the batch. A flush
-    is per key — it scans the team's whole staged slice — so the exact
-    range is the team's. The offsets are the flush's identity (see
-    ``offsets/`` and :func:`idempotency_key`), not scan bounds.
-
-    The post-receipt DELETE is a different shape: it must remove exactly
-    the flushed range's rows and spare younger same-team rows, so it is
-    the settlement selection (:func:`flushed_rows_scan_range`
-    + :func:`row_in_flushed_range`), not a blind delete of this range.
-    """
-    _require_int64("first_offset", first_offset)
-    _require_int64("last_offset", last_offset)
-    if first_offset > last_offset:
-        raise ValueError(f"first_offset {first_offset} > last_offset {last_offset}")
-    return team_rows_range(team_id)
 
 
 # -- stats/ -------------------------------------------------------------------
@@ -312,13 +412,15 @@ def staged_rows_range(
 
 @dataclass(frozen=True, slots=True)
 class StatsValue:
-    """Decoded form of a ``stats/`` value.
+    """Decoded form of a ``stats/`` value: one partition tuple's staged
+    rows and bytes.
 
-    ``first_staged_ts`` / ``last_staged_ts`` are microseconds since the
-    Unix epoch. ``first_staged_ts`` is set when the key's first row is
-    staged after the key stood empty and is NEVER advanced by later
-    arrivals — the flush planner's age trigger and the tail's freshness
-    SLA stand on that property.
+    ``staged_bytes`` sums the staged payload bytes and ``row_count`` the
+    staged rows. ``first_staged_ts`` / ``last_staged_ts`` are
+    microseconds since the Unix epoch. ``first_staged_ts`` is set when
+    the tuple's first row is staged after the tuple stood empty and is
+    NEVER advanced by later arrivals — the flush planner's age trigger
+    and the tail's freshness SLA stand on that property.
     """
 
     staged_bytes: int
@@ -338,16 +440,16 @@ class StatsValue:
             )
 
 
-def stats_key(team_id: int) -> bytes:
-    """The ``stats/`` key for one tenant."""
-    _require_uint64("team_id", team_id)
-    return STATS_PREFIX + _encode_u64(team_id)
+def stats_key(group: PartitionTuple) -> bytes:
+    """The ``stats/`` key for one partition tuple."""
+    return STATS_PREFIX + encode_group(group)
 
 
-def decode_stats_key(data: bytes) -> int:
-    """The team_id of a ``stats/`` key."""
-    _require_prefix(STATS_PREFIX, data, STATS_KEY_LEN)
-    return int.from_bytes(data[len(STATS_PREFIX) :], "big", signed=False)
+def decode_stats_key(data: bytes) -> PartitionTuple:
+    """The partition tuple of a ``stats/`` key."""
+    p = len(STATS_PREFIX)
+    _require_key(STATS_PREFIX, data, min_length=p + 1)
+    return decode_group(data[p:])
 
 
 def encode_stats_value(value: StatsValue) -> bytes:
@@ -383,11 +485,10 @@ class SchedAgeKey:
     """Decoded form of a ``sched_age/`` key (the value is always empty)."""
 
     first_staged_ts: int
-    team_id: int
+    group: PartitionTuple
 
     def __post_init__(self) -> None:
         _require_int64("first_staged_ts", self.first_staged_ts)
-        _require_uint64("team_id", self.team_id)
 
 
 def encode_sched_age_key(key: SchedAgeKey) -> bytes:
@@ -396,17 +497,17 @@ def encode_sched_age_key(key: SchedAgeKey) -> bytes:
     return (
         SCHED_AGE_PREFIX
         + _encode_i64_ordered(key.first_staged_ts)
-        + _encode_u64(key.team_id)
+        + encode_group(key.group)
     )
 
 
 def decode_sched_age_key(data: bytes) -> SchedAgeKey:
     """Inverse of :func:`encode_sched_age_key`."""
-    _require_prefix(SCHED_AGE_PREFIX, data, SCHED_AGE_KEY_LEN)
     p = len(SCHED_AGE_PREFIX)
+    _require_key(SCHED_AGE_PREFIX, data, min_length=p + 8 + 1)
     return SchedAgeKey(
         first_staged_ts=_decode_i64_ordered(data[p : p + 8]),
-        team_id=int.from_bytes(data[p + 8 : p + 16], "big", signed=False),
+        group=decode_group(data[p + 8 :]),
     )
 
 
@@ -425,8 +526,9 @@ def sched_age_range_through(cutoff_ts: int) -> tuple[bytes, bytes]:
 @dataclass(frozen=True, slots=True)
 class OffsetRange:
     """One Kafka ``(topic, partition, first_offset, last_offset)`` range
-    covering part of a team's staged batch — the flush's identity
-    material (millpond's offsets line, restated as a value envelope)."""
+    covering part of a partition tuple's staged batch — the flush's
+    identity material (millpond's offsets line, restated as a value
+    envelope)."""
 
     topic: str
     partition: int
@@ -451,16 +553,17 @@ class OffsetRange:
             )
 
 
-def offsets_key(team_id: int) -> bytes:
-    """The ``offsets/`` key recording one team's staged Kafka ranges."""
-    _require_uint64("team_id", team_id)
-    return OFFSETS_PREFIX + _encode_u64(team_id)
+def offsets_key(group: PartitionTuple) -> bytes:
+    """The ``offsets/`` key recording one partition tuple's staged Kafka
+    ranges."""
+    return OFFSETS_PREFIX + encode_group(group)
 
 
-def decode_offsets_key(data: bytes) -> int:
-    """The team_id of an ``offsets/`` key."""
-    _require_prefix(OFFSETS_PREFIX, data, OFFSETS_KEY_LEN)
-    return int.from_bytes(data[len(OFFSETS_PREFIX) :], "big", signed=False)
+def decode_offsets_key(data: bytes) -> PartitionTuple:
+    """The partition tuple of an ``offsets/`` key."""
+    p = len(OFFSETS_PREFIX)
+    _require_key(OFFSETS_PREFIX, data, min_length=p + 1)
+    return decode_group(data[p:])
 
 
 def _offset_range_sort_key(r: OffsetRange) -> tuple[str, int, int, int]:
@@ -528,37 +631,46 @@ def decode_offsets_value(data: bytes) -> tuple[OffsetRange, ...]:
 # -- prepared/ ----------------------------------------------------------------
 
 
+def _check_group_fields(group: PartitionTuple, group_fields: tuple[str, ...]) -> None:
+    if len(group_fields) != len(group):
+        raise ValueError(
+            f"{len(group_fields)} field name(s) for a {len(group)}-field "
+            "partition tuple"
+        )
+    if any(not name for name in group_fields):
+        raise ValueError("partition field names must be non-empty")
+
+
 @dataclass(frozen=True, slots=True)
 class PreparedRequest:
-    """A persisted prepared commit request (Phase 4 writes these): the
-    byte-exact request body plus the idempotency key it is published
-    under. Persisted BEFORE publication and replayed byte-identically
-    after an ambiguous response — never regenerated.
+    """A persisted prepared commit request: the byte-exact request body
+    plus the idempotency key it is published under and that key's
+    derivation inputs. Persisted BEFORE publication and replayed
+    byte-identically after an ambiguous response — never regenerated.
 
     ``persisted_at`` is the persistence instant in microseconds since the
     Unix epoch (the flusher's injected clock) and is the receipt-horizon
     guard's input: a receipt 404 may be answered with a blind replay only
     while the entry is younger than the horizon — past it, the receipt
     may have been PURGED server-side and a replay could duplicate an
-    already-executed commit, so the flusher halts (flush.py). It is None
-    ONLY on envelopes written by a v1 build (unknown age → halt-safe):
-    :func:`encode_prepared_value` refuses to write one without it.
+    already-executed commit, so the flusher halts (flush.py).
 
-    ``topic`` / ``partition`` are the v2 idempotency-key derivation
-    inputs the entry's key was minted from (see :func:`idempotency_key`).
-    Carried since v3 so a persisted entry is self-describing: recovery
-    cross-checks them against the stage's own identity, and an entry
-    naming another (topic, partition) is foreign state — loud corruption,
-    never a silent replay. They are None ONLY on envelopes written by a
-    v1/v2 build; :func:`encode_prepared_value` refuses to write one
-    without them.
+    ``topic`` / ``partition`` / ``group`` (with ``group_fields``, the
+    hoglake display names of the tuple's fields) are the derivation
+    inputs the entry's key was minted from (see :func:`idempotency_key`):
+    a persisted entry is self-describing, and recovery cross-checks them
+    against the stage's own identity and the ``prepared/`` key — an entry
+    naming another Kafka partition or another tuple is foreign state,
+    loud corruption, never a silent replay.
     """
 
     idempotency_key: str
     body: bytes
-    persisted_at: int | None = None
-    topic: str | None = None
-    partition: int | None = None
+    persisted_at: int
+    topic: str
+    partition: int
+    group: PartitionTuple
+    group_fields: tuple[str, ...]
 
     def __post_init__(self) -> None:
         key_len = len(self.idempotency_key.encode("utf-8"))
@@ -566,42 +678,35 @@ class PreparedRequest:
             raise ValueError(f"idempotency key too long: {key_len} bytes")
         if len(self.body) > _UINT32_MAX:
             raise ValueError(f"prepared body too long: {len(self.body)} bytes")
-        if self.persisted_at is not None:
-            _require_uint64("persisted_at", self.persisted_at)
-        if (self.topic is None) != (self.partition is None):
+        _require_uint64("persisted_at", self.persisted_at)
+        if not self.topic:
+            raise ValueError("topic must be non-empty")
+        encoded_topic = self.topic.encode("utf-8")
+        if len(encoded_topic) > _UINT16_MAX:
             raise ValueError(
-                "topic and partition travel together (both or neither), got "
-                f"topic={self.topic!r} partition={self.partition!r}"
+                f"topic does not fit in a u16 length: {len(encoded_topic)} bytes"
             )
-        if self.topic is not None:
-            encoded_topic = self.topic.encode("utf-8")
-            if not self.topic:
-                raise ValueError("topic must be non-empty")
-            if len(encoded_topic) > _UINT16_MAX:
-                raise ValueError(
-                    f"topic does not fit in a u16 length: {len(encoded_topic)} bytes"
-                )
-        if self.partition is not None and not 0 <= self.partition <= _UINT32_MAX:
+        if not 0 <= self.partition <= _UINT32_MAX:
             raise ValueError(
                 f"partition must fit in an unsigned 32-bit field, got {self.partition}"
             )
+        _check_group_fields(self.group, self.group_fields)
 
 
-def prepared_key(team_id: int, first_offset: int) -> bytes:
+def prepared_key(group: PartitionTuple, first_offset: int) -> bytes:
     """The ``prepared/`` key of one staged batch. ``first_offset`` is the
     batch's low-water mark and disambiguates successive batches of one
-    team; it sorts numerically, so a team's prepared entries scan in
+    tuple; it sorts numerically, so a tuple's prepared entries scan in
     batch order."""
-    _require_uint64("team_id", team_id)
     _require_int64("first_offset", first_offset)
-    return PREPARED_PREFIX + _encode_u64(team_id) + _encode_i64_ordered(first_offset)
+    return PREPARED_PREFIX + encode_group(group) + _encode_i64_ordered(first_offset)
 
 
-def team_prepared_range(team_id: int) -> tuple[bytes, bytes]:
-    """Half-open byte range selecting exactly one team's ``prepared/``
-    entries (the flush's outstanding-entry gate scans this prefix)."""
-    _require_uint64("team_id", team_id)
-    start = PREPARED_PREFIX + _encode_u64(team_id)
+def group_prepared_range(group: PartitionTuple) -> tuple[bytes, bytes]:
+    """Half-open byte range selecting exactly one partition tuple's
+    ``prepared/`` entries (the flush's outstanding-entry gate scans this
+    prefix) — prefix successor on the full ``prepared/ + group`` bytes."""
+    start = PREPARED_PREFIX + encode_group(group)
     return start, _prefix_successor(start)
 
 
@@ -609,115 +714,94 @@ def team_prepared_range(team_id: int) -> tuple[bytes, bytes]:
 class PreparedKey:
     """Decoded form of a ``prepared/`` key."""
 
-    team_id: int
+    group: PartitionTuple
     first_offset: int
 
 
 def decode_prepared_key(data: bytes) -> PreparedKey:
-    """Inverse of :func:`prepared_key`."""
-    _require_prefix(PREPARED_PREFIX, data, PREPARED_KEY_LEN)
+    """Inverse of :func:`prepared_key`: the trailing 8 bytes are the
+    first offset, the middle is exactly one partition tuple."""
     p = len(PREPARED_PREFIX)
+    _require_key(PREPARED_PREFIX, data, min_length=p + 1 + 8)
     return PreparedKey(
-        team_id=int.from_bytes(data[p : p + 8], "big", signed=False),
-        first_offset=_decode_i64_ordered(data[p + 8 : p + 16]),
+        group=decode_group(data[p:-8]),
+        first_offset=_decode_i64_ordered(data[-8:]),
     )
 
 
 def encode_prepared_value(request: PreparedRequest) -> bytes:
-    """Version 3: key_len(u16) key(utf8) topic_len(u16) topic(utf8)
-    partition(u32) body_len(u32) body persisted_at(u64).
-
-    ``persisted_at`` is REQUIRED on a write — an entry whose age is
-    unknown can never be checked against the receipt horizon, so writing
-    one is refused outright. So are ``topic``/``partition``: the v3
-    envelope carries the v2 idempotency-key derivation inputs so a
-    recovered entry is self-describing (recovery cross-checks them
-    against the stage's identity), and a write that cannot name them is
-    corrupt by omission. (Legacy v1/v2 envelopes, which lack one or both,
-    DECODE with the missing fields None — v1 is halt-safe on the replay
-    path.)"""
-    persisted_at = request.persisted_at
-    if persisted_at is None:
-        raise ValueError(
-            "cannot persist a prepared request without persisted_at: an "
-            "entry of unknown age can never be checked against the "
-            "receipt horizon"
-        )
-    topic = request.topic
-    partition = request.partition
-    if topic is None or partition is None:
-        raise ValueError(
-            "cannot persist a prepared request without topic/partition: "
-            "the v3 envelope carries the idempotency key's derivation "
-            "inputs so a recovered entry is self-describing"
-        )
-    key = request.idempotency_key.encode("utf-8")
-    encoded_topic = topic.encode("utf-8")
-    return (
-        bytes([PREPARED_VERSION])
-        + len(key).to_bytes(2, "big")
-        + key
-        + len(encoded_topic).to_bytes(2, "big")
-        + encoded_topic
-        + partition.to_bytes(4, "big")
-        + len(request.body).to_bytes(4, "big")
-        + request.body
-        + _encode_u64(persisted_at)
-    )
+    """Version 4: key_len(u16) key(utf8) topic_len(u16) topic(utf8)
+    partition(u32) arity(u8) [name_len(u16) name tag(u8) [value_len(u16)
+    value]]* body_len(u32) body persisted_at(u64)."""
+    out = bytearray([PREPARED_VERSION])
+    out += _encode_utf8_u16("idempotency key", request.idempotency_key)
+    out += _encode_utf8_u16("topic", request.topic)
+    out += request.partition.to_bytes(4, "big")
+    out.append(len(request.group))
+    for name, value in zip(request.group_fields, request.group, strict=True):
+        out += _encode_utf8_u16("partition field name", name)
+        if value is None:
+            out.append(GROUP_NULL)
+        else:
+            out.append(GROUP_PRESENT)
+            out += _encode_utf8_u16("partition value", value)
+    out += len(request.body).to_bytes(4, "big")
+    out += request.body
+    out += _encode_u64(request.persisted_at)
+    return bytes(out)
 
 
 def decode_prepared_value(data: bytes) -> PreparedRequest:
-    """Inverse of :func:`encode_prepared_value`, plus the legacy forms:
-    version 1 envelopes carry neither ``persisted_at`` nor
-    ``topic``/``partition`` and decode with all three None — "unknown
-    age", which the flusher treats as halt-safe (a receipt 404 for such
-    an entry is never answered with a blind replay); version 2 envelopes
-    carry ``persisted_at`` only and decode with ``topic``/``partition``
-    None (recovery's derivation-input cross-check simply does not apply
-    to them — nothing was ever deployed that wrote either)."""
-    if len(data) < 3:
-        raise ValueError(f"prepared value too short: {len(data)} bytes")
-    version = data[0]
-    if version not in (PREPARED_VERSION_LEGACY, PREPARED_VERSION_V2, PREPARED_VERSION):
-        raise ValueError(f"unknown prepared value version {version}")
-    key_len = int.from_bytes(data[1:3], "big")
-    pos = 3
-    if len(data) < pos + key_len:
-        raise ValueError("truncated prepared value: key")
-    key = bytes(data[pos : pos + key_len]).decode("utf-8")
-    pos += key_len
-    topic: str | None = None
-    partition: int | None = None
-    if version == PREPARED_VERSION:
-        if len(data) < pos + 2:
-            raise ValueError("truncated prepared value: topic length")
-        topic_len = int.from_bytes(data[pos : pos + 2], "big")
-        pos += 2
-        if len(data) < pos + topic_len + 4:
-            raise ValueError("truncated prepared value: topic")
-        topic = bytes(data[pos : pos + topic_len]).decode("utf-8")
-        pos += topic_len
-        partition = int.from_bytes(data[pos : pos + 4], "big", signed=False)
-        pos += 4
+    """Inverse of :func:`encode_prepared_value`. Refuses any version but
+    4 and any malformed or trailing byte."""
+    data = bytes(data)
+    if len(data) < 1:
+        raise ValueError("prepared value is empty")
+    if data[0] != PREPARED_VERSION:
+        raise ValueError(f"unknown prepared value version {data[0]}")
+    key, pos = _decode_utf8_u16(data, 1, "prepared value: key")
+    topic, pos = _decode_utf8_u16(data, pos, "prepared value: topic")
+    if len(data) < pos + 4 + 1:
+        raise ValueError("truncated prepared value: partition / arity")
+    partition = int.from_bytes(data[pos : pos + 4], "big", signed=False)
+    pos += 4
+    arity = data[pos]
+    pos += 1
+    names: list[str] = []
+    values: list[str | None] = []
+    for index in range(arity):
+        name, pos = _decode_utf8_u16(data, pos, f"prepared value: field {index} name")
+        if len(data) < pos + 1:
+            raise ValueError(f"truncated prepared value: field {index} tag")
+        tag = data[pos]
+        pos += 1
+        if tag == GROUP_NULL:
+            values.append(None)
+        elif tag == GROUP_PRESENT:
+            value, pos = _decode_utf8_u16(
+                data, pos, f"prepared value: field {index} value"
+            )
+            values.append(value)
+        else:
+            raise ValueError(f"prepared value: field {index} has tag {tag:#04x}")
+        names.append(name)
     if len(data) < pos + 4:
         raise ValueError("truncated prepared value: body length")
     body_len = int.from_bytes(data[pos : pos + 4], "big")
     pos += 4
-    tail = 0 if version == PREPARED_VERSION_LEGACY else 8  # persisted_at(u64)
-    if len(data) != pos + body_len + tail:
+    if len(data) != pos + body_len + 8:
         raise ValueError(
             f"prepared body length mismatch: field says {body_len}, "
-            f"value holds {len(data) - pos - tail}"
+            f"value holds {len(data) - pos - 8}"
         )
-    persisted_at = (
-        int.from_bytes(data[pos + body_len :], "big", signed=False) if tail else None
-    )
     return PreparedRequest(
         idempotency_key=key,
-        body=bytes(data[pos : pos + body_len]),
-        persisted_at=persisted_at,
+        body=data[pos : pos + body_len],
+        persisted_at=int.from_bytes(data[pos + body_len :], "big", signed=False),
         topic=topic,
         partition=partition,
+        group=tuple(values),
+        group_fields=tuple(names),
     )
 
 
@@ -726,37 +810,38 @@ def decode_prepared_value(data: bytes) -> PreparedRequest:
 # LEGACY prefix. Pre-atomic-settlement documentation wrote one marker per
 # committed range here; settlement has in fact always been ONE atomic
 # transaction (:meth:`PartitionStage.commit_flushed`), so a readable marker
-# was always fully settled state — written only with the commit's receipt
-# already in hand, and durable together with the deletes it claimed to
-# guard. The marker therefore carried no information the surviving
-# ``prepared/`` entry plus the server-side receipt do not, and nothing
-# writes this prefix any more. :meth:`PartitionStage.recover` deletes
-# whatever it finds under it, in bounded pages, without decoding: an extant
-# marker is settled garbage, and its receipt (possibly long purged) is not
-# consulted. ``FlushedKey`` lives on as the settlement-WINDOW type (the
-# delete selection below); it no longer names a key this build writes.
+# was always fully settled state. Nothing writes this prefix any more;
+# :meth:`PartitionStage.recover` deletes whatever it finds under it, in
+# bounded pages, without decoding. ``FlushedKey`` is the settlement-WINDOW
+# type (the delete selection below); it names no key this build writes.
 
 
 @dataclass(frozen=True, slots=True)
 class FlushedKey:
     """A settled flush window: the committed Kafka offset range
-    ``(team_id, first_offset, last_offset)`` of one team's staged rows.
-    Enough to delete exactly its ``rows/`` entries
-    (:func:`row_in_flushed_range`). (Legacy: also the ``flushed/`` marker
-    key's decoded form — see the module docstring.)"""
+    ``[first_offset, last_offset]`` of one partition tuple's staged rows,
+    with the tuple as hoglake partition values (``group_fields`` the
+    fields' display names, ``group`` the wire strings). Enough to delete
+    exactly its ``rows/`` entries (:func:`row_in_flushed_range`)."""
 
-    team_id: int
+    group: PartitionTuple
     first_offset: int
     last_offset: int
+    group_fields: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        _require_uint64("team_id", self.team_id)
+        _check_group_fields(self.group, self.group_fields)
         _require_int64("first_offset", self.first_offset)
         _require_int64("last_offset", self.last_offset)
         if self.first_offset > self.last_offset:
             raise ValueError(
                 f"first_offset {self.first_offset} > last_offset {self.last_offset}"
             )
+
+    @property
+    def label(self) -> str:
+        """The tuple's human form (:func:`group_label`)."""
+        return group_label(self.group_fields, self.group)
 
 
 def flushed_range() -> tuple[bytes, bytes]:
@@ -766,24 +851,25 @@ def flushed_range() -> tuple[bytes, bytes]:
 
 
 def flushed_rows_scan_range(key: FlushedKey) -> tuple[bytes, bytes]:
-    """The scan bounds of a settlement delete: the team's whole ``rows/``
-    slice. No narrower byte range can isolate the window (row-key order is
-    (team, timestamp, offset)); apply :func:`row_in_flushed_range` to every
-    scanned key and delete exactly those."""
-    return team_rows_range(key.team_id)
+    """The scan bounds of a settlement delete: the tuple's whole
+    ``rows/`` slice. No narrower byte range can isolate the window
+    (row-key order is (group, timestamp, offset)); apply
+    :func:`row_in_flushed_range` to every scanned key and delete exactly
+    those."""
+    return group_rows_range(key.group)
 
 
 def row_in_flushed_range(row: RowKey, flushed: FlushedKey) -> bool:
     """True iff ``row`` is one of the settled window's staged rows — the
     exact settlement-delete selection.
 
-    Within one partition instance a row's Kafka offset is unique to its
-    record, so the window identifies its rows exactly.
-    A younger range of the same team (offsets above ``last_offset``)
-    sorts INSIDE the scan range and must survive the delete.
+    Within one Kafka-partition instance a row's offset is unique to its
+    record, so the window identifies its rows exactly. A younger range of
+    the same tuple (offsets above ``last_offset``) sorts INSIDE the scan
+    range and must survive the delete.
     """
     return (
-        row.team_id == flushed.team_id
+        row.group == flushed.group
         and flushed.first_offset <= row.offset <= flushed.last_offset
     )
 
@@ -791,8 +877,8 @@ def row_in_flushed_range(row: RowKey, flushed: FlushedKey) -> bool:
 # -- poison/ ------------------------------------------------------------------
 #
 # The consume-time quarantine (docs/kafka-ingestion.md §Delivery semantics):
-# a record that can never become a row — an undecodable ``team_id`` key, no
-# usable timestamp, a tombstone — is written here, keyed by its Kafka offset,
+# a record that can never become a row — a payload that is not a JSON object,
+# a malformed partition source, no usable timestamp, a tombstone — is written here, keyed by its Kafka offset,
 # in the SAME write batch as the poll cycle's staged rows. The offset commit
 # that follows the batch therefore covers quarantined records exactly the way
 # it covers staged ones: offsets commit strictly after durable staging, a
@@ -811,7 +897,9 @@ def poison_key(offset: int) -> bytes:
 
 def decode_poison_key(data: bytes) -> int:
     """Inverse of :func:`poison_key`: the quarantined record's Kafka offset."""
-    _require_prefix(POISON_PREFIX, data, POISON_KEY_LEN)
+    if len(data) != POISON_KEY_LEN:
+        raise ValueError(f"expected {POISON_KEY_LEN} bytes, got {len(data)}")
+    _require_key(POISON_PREFIX, data, min_length=POISON_KEY_LEN)
     return _decode_i64_ordered(data[len(POISON_PREFIX) :])
 
 
@@ -990,6 +1078,15 @@ def decode_poison_value(data: bytes) -> PoisonValue:
 
 # -- idempotency --------------------------------------------------------------
 
+
+def group_key_form(group: PartitionTuple) -> str:
+    """The partition tuple as the idempotency key names it:
+    :func:`group_label` with positional field names ``k0``, ``k1``, … —
+    a function of the tuple ALONE (``k0=42/k1=681``; empty for an
+    unpartitioned table; a null component is a bare ``k<i>``)."""
+    return group_label(tuple(f"k{i}" for i in range(len(group))), group)
+
+
 #: The derivation string whose UUIDv5 (URL namespace) is the idempotency
 #: namespace below. Pinned so the constant's provenance is checkable.
 IDEMPOTENCY_NAMESPACE_DERIVATION: Final = (
@@ -1006,27 +1103,33 @@ def idempotency_key(
     table_uuid: str,
     topic: str,
     partition: int,
-    team_id: int,
+    group: PartitionTuple,
     first_offset: int,
     last_offset: int,
 ) -> str:
-    """The commit idempotency key for one staged batch.
+    """The commit idempotency key for one staged window of one partition
+    tuple.
 
     A UUIDv5 over :data:`IDEMPOTENCY_NAMESPACE` and the canonical name
-    ``millrace:v2:table=<table>:topic=<topic>:partition=<n>:team=<n>
-    :offsets=<first>-<last>``. Pure function of its six inputs: same
-    inputs, same key, in every process, forever. ``table_uuid`` is
-    canonicalized (parsed and re-emitted) so case-variant spellings of
-    one incarnation name one key; ``topic`` is NOT canonicalized (Kafka
-    topic names are case-sensitive).
+    ``millrace:v2:table=<table>:topic=<topic>:partition=<n>:group=<k0=…/
+    k1=…>:offsets=<first>-<last>``, the group rendered by
+    :func:`group_key_form` — POSITIONAL names (``k<i>``), never the
+    spec's display names: the key is a pure function of the staged
+    tuple, so a spec change (even one of the same arity) between an
+    upload and its rebuild cannot change the key or the object names
+    derived from it. Display names live in the commit message and the
+    ``prepared/`` envelope only. Same inputs, same key, in every
+    process, forever.
+    ``table_uuid`` is canonicalized (parsed and re-emitted) so
+    case-variant spellings of one incarnation name one key; ``topic`` is
+    NOT canonicalized (Kafka topic names are case-sensitive).
 
-    ``topic``/``partition`` are derivation inputs (v2) because Kafka
-    offsets are per partition: without them, two partitions flushing one
-    team over the same offset range derived the SAME key — and the same
+    ``topic``/``partition`` are derivation inputs because Kafka offsets
+    are per partition: without them, two Kafka partitions flushing one
+    tuple over the same offset range derive the SAME key — and the same
     object URIs, since those derive from the key — so the second
-    partition's upload overwrote the first's committed objects before the
-    server refused the publish as a key reuse (PR #331 review). The
-    stage knows its own topic and partition; the flusher threads them in.
+    partition's upload would overwrite the first's committed objects
+    before the server refused the publish as a key reuse.
     """
     canonical_table = str(uuid.UUID(table_uuid))
     encoded_topic = topic.encode("utf-8")
@@ -1040,13 +1143,13 @@ def idempotency_key(
         raise ValueError(
             f"partition must fit in an unsigned 32-bit field, got {partition}"
         )
-    _require_uint64("team_id", team_id)
     _require_int64("first_offset", first_offset)
     _require_int64("last_offset", last_offset)
     if first_offset > last_offset:
         raise ValueError(f"first_offset {first_offset} > last_offset {last_offset}")
     name = (
         f"millrace:v2:table={canonical_table}:topic={topic}:partition={partition}"
-        f":team={team_id}:offsets={first_offset}-{last_offset}"
+        f":group={group_key_form(group)}"
+        f":offsets={first_offset}-{last_offset}"
     )
     return str(uuid.uuid5(IDEMPOTENCY_NAMESPACE, name))

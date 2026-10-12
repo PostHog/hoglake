@@ -35,6 +35,7 @@ from typing import Any
 
 import httpx
 import pyarrow as pa
+from stagekit import NOW
 
 from millrace import keyspace
 from millrace.config import (
@@ -42,7 +43,6 @@ from millrace.config import (
     Config,
     EventTimePolicy,
     PoisonConfig,
-    TeamKeyCodec,
 )
 from millrace.stage import PartitionStage
 
@@ -347,7 +347,6 @@ def make_config(**overrides: Any) -> Config:
         "kafka_group_id": "millrace-events",
         "assignment_mode": AssignmentMode.STATIC,
         "static_partitions": (0,),
-        "team_key_codec": TeamKeyCodec.UTF8_DECIMAL,
         "catalog": CATALOG,
         "namespace": NAMESPACE,
         "table": TABLE,
@@ -385,18 +384,38 @@ def month_wire(ts_us: int) -> str:
     return str((day.year - 1970) * 12 + (day.month - 1))
 
 
+#: hoglake's display names for the default spec's fields
+#: (``identity(team_id), month(timestamp)`` — ``grouping.field_names``).
+SPEC_FIELDS: tuple[str, ...] = ("team_id", "timestamp_month")
+
+
+def team_group(team: int, ts_us: int = NOW) -> tuple[str | None, ...]:
+    """The partition tuple the default spec gives a team's row at
+    ``ts_us`` (``NOW`` — the suite's January): the staging group the
+    flush tests stage and decide under, computed independently of the
+    keyer."""
+    return (str(team), month_wire(ts_us))
+
+
+def team_label(team: int, ts_us: int = NOW) -> str:
+    """The human form of :func:`team_group` (``team_id=7/timestamp_month=…``)."""
+    return f"team_id={team}/timestamp_month={month_wire(ts_us)}"
+
+
 def decision(
-    team_id: int,
+    group: int | tuple[str | None, ...],
     *,
     trigger: str = "size",
     staged_bytes: int = 1,
     first_staged_ts: int,
     age_us: int = 0,
 ) -> Any:
+    """One planner decision; an int names the team's default-spec group
+    (:func:`team_group`)."""
     from millrace.planner import FlushDecision
 
     return FlushDecision(
-        team_id=team_id,
+        group=team_group(group) if isinstance(group, int) else group,
         trigger=trigger,  # type: ignore[arg-type]
         staged_bytes=staged_bytes,
         first_staged_ts=first_staged_ts,

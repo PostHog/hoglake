@@ -40,10 +40,13 @@ orders of magnitude; a single global flush clock cannot.
 Decouple *when data arrives* from *when it is flushed* by staging it in
 an embedded, object-storage-native LSM ([SlateDB](https://slatedb.io),
 via its official Python bindings), keyed by **partition value** rather
-than by arrival order:
+than by arrival order — precisely, by the destination table's
+**partition tuple**: the `partition_values` a hoglake file of the row
+would carry under the table's live partition spec, computed per record
+at consume time:
 
 ```
-consume loop:   poll → stage rows under (team_id, …) → commit Kafka offsets
+consume loop:   poll → stage rows under (partition tuple, …) → commit Kafka offsets
 flush loop:     per-key readiness scan → staged range → Arrow → parquet
                 → prepared commit → delete staged range
 ```
@@ -52,12 +55,15 @@ Staging is the buffer, so Kafka offsets commit at stage time and neither
 loop waits on the other. Accumulation is bottomless (the state lives on
 object storage, not in pod memory or on a PVC), so a whale's rows can
 accumulate to a full target file size while a median tenant's accumulate
-for fifteen minutes — **per-key** readiness, size-triggered for whales,
-age-triggered for the tail, one mechanism.
+for fifteen minutes — **per-key** readiness (a key is one partition
+tuple's staged rows), size-triggered for whales, age-triggered for the
+tail, one mechanism. With an `identity(team_id)`-led spec the key is
+the tenant (and the month, under `month(timestamp)`); a steady-state
+flush of one key writes exactly one file.
 
 The LSM's ordering is load-bearing, not incidental: keying staged rows
-by `(team_id, timestamp)` means a flush reads one contiguous, nearly
-sorted range. The readiness scheduler's AGE/SLOW lanes are the ordered
+by `(partition tuple, timestamp)` means a flush reads one contiguous,
+nearly sorted range. The readiness scheduler's AGE/SLOW lanes are the ordered
 index scan the staging layout promises (`sched_age/` prefix scan to the
 deadline cutoff, then a point-read per candidate for the exact decision
 input); the SIZE lane has no size-ordered index (`sched_size` is the
@@ -108,12 +114,21 @@ it bounds how small a partition slice may be before S3 chatter
 dominates. No volumes anywhere.
 
 ```
-rows/<team_id>/<timestamp_be><offset_be>  → event payload bytes
-stats/<team_id>                           → {staged_bytes, first_staged_ts, …}
-sched_age/<first_staged_ts><team_id>      → ∅
-poison/<offset_be>                        → quarantine envelope (stamped; purged at
+rows/<group><record_ts_ob><offset_ob>     → event payload bytes
+stats/<group>                             → {staged_bytes, first_staged_ts, last_staged_ts, row_count}
+sched_age/<first_staged_ts_ob><group>     → ∅
+offsets/<group>                           → staged (topic, partition, first, last) spans
+prepared/<group><first_offset_ob>         → persisted commit request (v4 envelope)
+poison/<offset_ob>                        → quarantine envelope (stamped; purged at
                                             MILLRACE_POISON_RETENTION_S, default 7 d)
 ```
+
+`<group>` is the partition tuple, prefix-free: `arity u8`, then per
+component a tag byte (null / present) and, when present, `u16 length +
+UTF-8` wire string; an unpartitioned table's tuple is empty. `_ob` is
+offset binary (`value + 2^63` as a big-endian u64), so byte order is
+numeric order, negatives included. No separators: the group is
+self-delimiting and the timestamp/offset fields are fixed-width.
 
 The keyspace carries no partition component: the instance *is* the
 partition. `poison/` is the quarantine — forensic state with a bounded
@@ -123,32 +138,41 @@ depends on poison presence; a pod down at expiry purges later);
 unstamped (v1) entries are kept forever — unknown age is never
 deleted.
 
-Which team a staged record lands under is the configured extraction
-codec (`MILLRACE_TEAM_KEY_CODEC`): `utf8-decimal`/`be64` decode the
-message key (the topic is keyed by team — the repartitioned-topology
-case), while `value-json:<field>` reads a top-level field of the JSON
-payload and never consults the key — which is what lets millrace
-consume a topic that is NOT keyed by team (`clickhouse_events_json`)
-and drop the repartition hop entirely. The consequence is stated, not
-dodged: with an unkeyed topic a team's records land on whatever
-partition the producer's partitioner chose, so **every instance can
-hold every team**, and a team spread over K partitions is up to K files
+Which group a staged record lands under is computed from its PAYLOAD,
+never from the Kafka key: the consumer parses the value as a JSON object
+once and, per field of the table's live partition spec, reads the source
+scalar by path (the keyer reads a struct leaf such as
+`properties.team_id`, but such a table cannot run yet: the flusher
+refuses struct columns at startup until nested-column support lands),
+coerces it with the same column coercer the flush decoder uses, applies
+the transform and renders the wire string pyhoglake's commit carries
+(`grouping.py:GroupKeyer`). A malformed source scalar quarantines the
+record with the field named; an absent or null source is a null
+component. The consumer reads the table shape at startup (the flusher's
+resolve, same pinned incarnation) and re-reads it on the flusher's TTL;
+a spec change just starts new groups, and the old ones drain by age or
+the slow lane. The tuple is a layout optimization, never the truth: the
+flush fans every window out by the LIVE spec, so a group keyed under an
+older spec flushes correctly, as several files.
+
+The consequence is stated, not dodged: any partition's instance can
+hold any group, and a group spread over K partitions is up to K files
 per flush window — one per instance. The per-partition topology above
-is unchanged; what changes is which teams a partition's instance holds
-— and the readiness lanes now evaluate a team's PER-PARTITION slice:
-the whale pays K full-size files per window (the size lane fires per
-instance, as before), while a medium tenant split thin across K
+is unchanged; what changes is which groups a partition's instance holds
+— and the readiness lanes evaluate a group's PER-PARTITION slice: the
+whale pays K full-size files per window (the size lane fires per
+instance, as before), while a medium group split thin across K
 partitions can fall under `min_flush_bytes` per instance and drift from
-the age lane to the slow lane — exactly the freshness-for-files trade
-the repartition hop used to buy back by concentrating the team. Sizing
+the age lane to the slow lane — exactly the freshness-for-files trade a
+repartition hop would buy back by concentrating the group. Sizing
 `min_flush_bytes` against K is the operator lever.
 Idempotency is unaffected: the flush identity scopes a window by
-`(topic, partition, team, offset range)`, so the same team's windows on
-different partitions are distinct flushes whose idempotency keys never
-collide, and a partition's replay only ever re-puts its own staged
-keys.
+`(topic, partition, partition tuple, offset range)`, so the same
+group's windows on different partitions are distinct flushes whose
+idempotency keys never collide, and a partition's replay only ever
+re-puts its own staged keys.
 
-- `rows` keys are ordered so one tenant's staged slice is a contiguous
+- `rows` keys are ordered so one group's staged slice is a contiguous
   range scan, approximately time-ordered on arrival — approximately,
   because the row key's timestamp is the Kafka RECORD time while the
   catalog's sort spec is the payload's event time, which late and skewed
@@ -204,14 +228,14 @@ staged-range scan is capped in rows and bytes
 `MILLRACE_FLUSH_SCAN_MIN_BYTES`, default 64 MiB — the floor keeps toy
 targets from fragmenting flushes; rows capped at
 `MILLRACE_FLUSH_SCAN_MAX_ROWS`). The flush window is derived from the
-SCANNED rows: their own offset span when the scan covered the team's
+SCANNED rows: their own offset span when the scan covered the group's
 whole staged slice (the steady state — caps do not bind, and staged
 offsets only ever grow past a scan snapshot, so the span's settlement
 deletes exactly the published rows). Only a TRUNCATED scan narrows to
 `[first_scanned_offset, K]`, the covered offset prefix: the `offsets/`
 record holds one `[first, last]` span per staged batch (arrival
-structure — a sound over-approximation of the team's staged offsets,
-since a span's interior can name another team's offsets), so a
+structure — a sound over-approximation of the group's staged offsets,
+since a span's interior can name another group's offsets), so a
 record-timestamp inversion straddling the cap still shrinks the window
 rather than settling a row the flush never saw — conservatively, never
 past the first span offset the scan missed. Leftover rows simply
@@ -235,7 +259,9 @@ this three-lane policy is the default — pluggable policies are a later,
 small step precisely because the planner is pure.)
 
 A flush of one key: scan the staged range → Arrow → filter/quarantine →
-one parquet file per `(team_id, month(timestamp))` partition tuple →
+sort by the live sort spec → one parquet file per partition tuple under
+the table's LIVE partition spec (whatever it is — one file when the
+staged group was keyed under the same spec) →
 upload → persist the complete prepared request under `prepared/` →
 `commit/prepared` → on receipt, one staging transaction that deletes
 the staged range and sched entries and drops the persisted request.
@@ -245,27 +271,29 @@ exactly the surviving `prepared/` entries — a crash between commit and
 delete leaves the entry, and recovery receipt-checks it (a 200 settles
 the range locally with zero republication; a 404 replays the persisted
 bytes byte-identically, and the server's receipt dedupes a landing
-replay). `prepared/` envelopes are versioned: v3 carries the
-idempotency key's derivation inputs (`topic`, `partition`) beside the
-key and body, so a recovered entry is self-describing and recovery
-cross-checks it against the stage's own identity; they also carry
-`persisted_at` (since v2) so the replay is bounded by the receipt
-horizon (§Delivery semantics): a 404 past the horizon is ambiguous with
+replay). The `prepared/` envelope (v4, the only version) carries the
+idempotency key's derivation inputs — `topic`, `partition` and the
+partition tuple as hoglake partition values (field names beside wire
+strings) — beside the key and body, so a recovered entry is
+self-describing and recovery cross-checks it against the stage's own
+identity and its `prepared/` key; it also carries `persisted_at` so the
+replay is bounded by the receipt horizon (§Delivery semantics): a 404 past the horizon is ambiguous with
 a purged receipt and halts the pipeline for operator reconciliation
 rather than risking a duplicate. Recovery also
 collects any `flushed/` markers left by pre-lifecycle builds — settled
 garbage by construction — in bounded pages, one delete batch per page,
 so a partition's recovery never stalls on marker volume. Sweeps across
 keys (and across the pod's partition instances) each become their own
-commit per `(team, window)` — bounded in file count by
+commit per `(group, window)` — bounded in file count by
 `max_files_per_commit` (a spec that fans one decision past the bound is
 a deployment bug the flusher halts on); a sweep is never one unbounded
 commit body.
 
-Team churn: a tenant that stops sending leaves residue below the size
-and age triggers — which is exactly what the slow lane absorbs: any key
-past `slow_lane_deadline` flushes regardless of size, so churned tenants
-leave no residue and the stats keyspace reflects live tenants.
+Churn: a tenant that stops sending (or a group keyed under a retired
+spec, or a month that has passed) leaves residue below the size and age
+triggers — which is exactly what the slow lane absorbs: any key past
+`slow_lane_deadline` flushes regardless of size, so churned groups
+leave no residue and the stats keyspace reflects live groups.
 
 ## The wire contract — from day one, no flags
 
@@ -273,17 +301,30 @@ This writer is born correct; it does not repeat millpond's blind-append
 shape (AGENT.md invariant 12 exists because of that shape):
 
 - Every commit carries a `read_snapshot` taken before the staged range
-  was read, and `expected_table_uuid` pinned at pipeline startup.
-  A 409 `commit_conflict` refreshes and retries; `ddl_since_read_snapshot`,
-  `table_recreated` and 410 are *re-prepare* signals — re-read the table,
-  rebuild the request, never replay the refused payload. 503
-  `commit_queue_timeout` backs off per `Retry-After`.
+  was read, and `expected_table_uuid` — the incarnation the startup
+  resolve READ and pinned (there is no configured uuid to refuse
+  against at boot; a later read or commit naming another incarnation
+  halts `table_recreated`). A 409 `commit_conflict` drops the shape
+  cache and resends the IDENTICAL persisted bytes, up to 5 attempts,
+  then `FlushPublishExhausted` (the entry stays; the next sweep
+  reconciles receipt-first). `ddl_since_read_snapshot` is the
+  *re-prepare* signal — drop the entry, re-read the table, rebuild the
+  request, never replay the refused payload; `table_recreated`,
+  `table_dropped` and 410 halt the pipeline. 503 `commit_queue_timeout`
+  backs off per `Retry-After`.
 - The complete prepared commit request is persisted (SlateDB side
   prefix) **before** publication and is never regenerated after an
   ambiguous response; the idempotency key derives from
-  `(table_uuid, topic, partition, team_id, first_offset, last_offset)`
-  of the staged range — topic and partition are derivation inputs
-  because offsets are per partition: two partitions flushing one team
+  `(table_uuid, topic, partition, partition tuple, first_offset,
+  last_offset)` of the staged range (the name line is
+  `millrace:v2:table=<uuid>:topic=<t>:partition=<n>:group=<k0=…/k1=…>:offsets=<first>-<last>`,
+  the tuple's wire strings under POSITIONAL names, percent-encoded —
+  a function of the staged tuple alone, so no spec change can move the
+  key or its object names; display names such as
+  `team_id=42/timestamp_month=681` appear only in the commit message and
+  the `prepared/` envelope) — topic and
+  partition are derivation inputs because offsets are per partition:
+  two partitions flushing one group
   over the same offset range must never share a key or the object URIs
   derived from it. The same rows re-flushed produce the same request,
   and the server's receipt dedupes the replay.
@@ -297,8 +338,10 @@ shape (AGENT.md invariant 12 exists because of that shape):
   staged rows plus the persisted entry are the operator's
   reconciliation material.
 - Partition values are computed under the spec the `read_snapshot`
-  describes; on spec change, the refusal path above is the only
-  recovery, per invariant 12.
+  describes (the flush recomputes them from the decoded rows — the
+  staged group's tuple, computed under whatever spec the consumer last
+  read, decides only what flushes together); on spec change, the
+  refusal path above is the only recovery, per invariant 12.
 - Table identity reads use `totals=false`; the manifest is never
   aggregated on a request path.
 
@@ -397,7 +440,8 @@ table, 96% under 60 KiB): at a 15-minute deadline and ~10⁵ active
 tenants/day, worst-case arrival is of order 10⁷ small files/day —
 single-digit multiples of the current baseline, not a new regime.
 Per-commit rows grow only by the bounded flush window (≤ the size-lane
-cap); receipts are digests; stats
+cap); receipts are digests and expire server-side
+(`HOGLAKE_RECEIPT_RETENTION_SECONDS`, V24); stats
 rows arrive deferred via the hydrator rather than in the commit body.
 The open question is compaction throughput at that arrival rate, which
 is validation item 1, not an assumption.
@@ -415,7 +459,7 @@ in flight per partition (4× that process-wide — each in-flight decision
 holds its bounded scan in memory). Evidence for the tail-SLA claim
 (M5): the sweep bench (`tests/test_flush_bench.py`, non-gating:
 `uv run pytest --bench tests/test_flush_bench.py -s`) measures 1024
-ready keys × 4 partitions end-to-end at **72 keys/s serial** and **286
+ready keys in total (256 per partition stage × 4 stages) end-to-end at **72 keys/s serial** and **286
 keys/s at the default concurrency** on in-memory stages with a 5 ms WAL
 flush tick — the serial loop sits within 2× of the ~110 ready keys/s
 the design arithmetic wants, so the bound-parallel loop shipped; the
@@ -438,7 +482,9 @@ the 1 MiB `max.partition.fetch.bytes` library default capped millpond's
 hot partition at ~50 MB/s), with the per-poll batch bounded by a record
 cap and an observed-average byte cap. Metrics remain passive
 observability, never control flow. Fail-fast config at
-startup: resolve catalog, table, incarnation; refuse on mismatch. Junk
+startup: resolve catalog, namespace and table (the destination must
+exist and report `read_snapshot_id`) and pin the incarnation the read
+returns. Junk
 `event_time` policy (clamp vs quarantine) is config, validated at boot.
 
 Metrics are passive — they never feed control flow — and scraped from
@@ -453,7 +499,7 @@ stuck partition must be findable, so `millrace_partition_staged_bytes`,
 `millrace_partition_oldest_staged_age_seconds` and
 `millrace_flush_partition_fenced` carry `{topic,partition}` labels —
 cardinality bounded by the pod's ASSIGNED partitions (tens), never by
-teams. The whitelisted series
+partition tuples. The whitelisted series
 (verified against slatedb 0.17.0's actual emission):
 `millrace_slatedb_l0_sst_files`, `millrace_slatedb_l0_ssts_per_segment_max`
 (L0 count/depth), `millrace_slatedb_wal_buffer_flushes_total`,
@@ -595,7 +641,7 @@ cluster.
    housekeeping cost** at the K-instances-per-pod count a real
    assignment implies.
 3. **Commit rate + deferred-stats mix** against a live catalog: sweeps
-   of ~10⁵ tiny registrations at one commit per (team, window), bounded
+   of ~10⁵ tiny registrations at one commit per (group, window), bounded
    per commit by the fanout guard; hydrator keeping up.
 4. **Planner policy** as pure functions over `stats` scans, unit-tested
    against a replayed skewed-distribution sample — before Kafka or

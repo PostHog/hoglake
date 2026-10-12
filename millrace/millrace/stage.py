@@ -9,7 +9,7 @@ keys and values go through :mod:`millrace.keyspace` codecs; nothing here
 hand-encodes a key.
 
 Write path — :meth:`PartitionStage.stage_batch`: ONE write batch per
-call: the row puts, the per-team ``stats/`` merge, the ``sched_age/``
+call: the row puts, the per-tuple ``stats/`` merge, the ``sched_age/``
 readiness entry, the ``offsets/`` identity range and any ``poison/``
 quarantine entries land atomically, so readiness accounting cannot drift
 from the data, not even on a hard kill that lands between them, and the
@@ -17,7 +17,7 @@ offset commit that follows covers quarantined records exactly like
 staged rows. ``first_staged_ts`` is SET-ONCE: an existing stats entry
 keeps its value (the tail's freshness SLA stands on this and the planner
 relies on it); it is born again only after the key stood empty — i.e.
-after a flush drained the team's last staged row.
+after a flush drained the partition tuple's last staged row.
 
 Durability ordering: ``stage_batch`` awaits the batch's REMOTE
 durability (the WAL on the object store, via the write handle's
@@ -32,10 +32,10 @@ the write itself.
 
 Flush settlement — :meth:`PartitionStage.commit_flushed`: ONE
 transaction: the delete of EXACTLY the flush's offset window
-(``keyspace.row_in_flushed_range`` selects within the team's whole
-slice — younger and older rows of the same team outside the window
+(``keyspace.row_in_flushed_range`` selects within the partition tuple's
+whole slice — younger and older rows of the same tuple outside the window
 survive), the stats subtraction (or removal, with its ``sched_age/``
-entry, when the team drains), the ``offsets/`` pruning and the drop of
+entry, when the tuple drains), the ``offsets/`` pruning and the drop of
 the range's persisted ``prepared/`` request. NO ``flushed/`` marker is
 written: the settlement is atomic, so "marker landed, deletes didn't" —
 the state a marker existed to repair — is unreachable, and the commit's
@@ -126,6 +126,7 @@ from . import keyspace
 from .keyspace import (
     FlushedKey,
     OffsetRange,
+    PartitionTuple,
     PoisonValue,
     PreparedKey,
     PreparedRequest,
@@ -206,15 +207,17 @@ class StageCorruptionError(StageError):
 
 @dataclass(frozen=True, slots=True)
 class StagedRecord:
-    """One consumed Kafka record to stage.
+    """One consumed Kafka record to stage, under ``group`` — the
+    destination's partition tuple for it (wire strings, one per live
+    spec field; :class:`millrace.grouping.GroupKeyer`).
 
-    ``event_ts_us`` is the event timestamp in microseconds since the
+    ``event_ts_us`` is the Kafka record timestamp in microseconds since the
     Unix epoch (negatives are legal junk and sort correctly);
     ``offset`` is the record's Kafka offset. Integer ranges are
     validated by the keyspace codecs at encode time.
     """
 
-    team_id: int
+    group: PartitionTuple
     event_ts_us: int
     offset: int
     payload: bytes
@@ -226,8 +229,9 @@ class StagedRecord:
 
 @dataclass(frozen=True, slots=True)
 class PoisonedRecord:
-    """One consumed Kafka record that can never become a staged row — an
-    undecodable ``team_id`` key, no usable timestamp, a tombstone.
+    """One consumed Kafka record that can never become a staged row — a
+    payload that is not a JSON object, a malformed partition source, no
+    usable timestamp, a tombstone.
 
     Quarantined under ``poison/<offset>`` in the SAME write batch as the
     poll cycle's staged rows, so the offset commit that follows covers
@@ -274,15 +278,15 @@ class StageAck:
 class FlushCommitReport:
     """Accounting of one :meth:`PartitionStage.commit_flushed` call.
 
-    ``team_drained`` is true when the settle removed the team's last
+    ``group_drained`` is true when the settle removed the tuple's last
     staged row (its ``stats/`` and ``sched_age/`` entries went with it,
-    so the next stage starts the team's ``first_staged_ts`` fresh).
-    A replayed call reports zeros and ``team_drained=False``.
+    so the next stage starts the tuple's ``first_staged_ts`` fresh).
+    A replayed call reports zeros and ``group_drained=False``.
     """
 
     rows_deleted: int
     bytes_deleted: int
-    team_drained: bool
+    group_drained: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -322,7 +326,7 @@ class StageGauges:
 
     staged_bytes: int
     staged_rows: int
-    staged_teams: int
+    staged_groups: int
     oldest_first_staged_ts: int | None
 
 
@@ -335,7 +339,7 @@ def gauges_from_stats(stats: Iterable[KeyStats]) -> StageGauges:
     return StageGauges(
         staged_bytes=sum(s.staged_bytes for s in entries),
         staged_rows=sum(s.row_count for s in entries),
-        staged_teams=len(entries),
+        staged_groups=len(entries),
         oldest_first_staged_ts=min((s.first_staged_ts for s in entries), default=None),
     )
 
@@ -399,7 +403,7 @@ class _Settlement:
 
     rows_deleted: int
     bytes_deleted: int
-    team_drained: bool
+    group_drained: bool
 
 
 def _merge_offset_ranges(ranges: Iterable[OffsetRange]) -> list[OffsetRange]:
@@ -597,8 +601,8 @@ class PartitionStage:
             for kv in chunk:
                 yield kv.key, kv.value
 
-    async def _read_stats(self, team_id: int) -> StatsValue | None:
-        raw = await self._db.get(keyspace.stats_key(team_id))
+    async def _read_stats(self, group: PartitionTuple) -> StatsValue | None:
+        raw = await self._db.get(keyspace.stats_key(group))
         return keyspace.decode_stats_value(raw) if raw is not None else None
 
     # -- staging --------------------------------------------------------------
@@ -613,9 +617,9 @@ class PartitionStage:
         """Stage one consumed microbatch — ONE write batch, remotely durable
         before return.
 
-        Per team in the batch: row puts, the ``stats/`` merge
+        Per partition tuple in the batch: row puts, the ``stats/`` merge
         (``first_staged_ts`` kept set-once from the entry that already
-        exists; created with ``now_us`` when the team stands empty), the
+        exists; created with ``now_us`` when the tuple stands empty), the
         ``sched_age/`` entry on first stage, and the ``offsets/``
         identity-range merge. ``now_us`` is the injected staging clock —
         never read from the wall here. ``poison`` entries (records that
@@ -636,11 +640,11 @@ class PartitionStage:
         seen: set[bytes] = set()
         for rec in records:
             row_key = keyspace.encode_row_key(
-                RowKey(rec.team_id, rec.event_ts_us, rec.offset)
+                RowKey(rec.group, rec.event_ts_us, rec.offset)
             )
             if row_key in seen:
                 raise ValueError(
-                    f"duplicate row key in batch: team {rec.team_id} "
+                    f"duplicate row key in batch: group {rec.group} "
                     f"ts {rec.event_ts_us} offset {rec.offset}"
                 )
             seen.add(row_key)
@@ -658,49 +662,49 @@ class PartitionStage:
                 "stage_batch requires at least one record (staged or poisoned)"
             )
 
-        by_team: dict[int, list[tuple[bytes, StagedRecord]]] = {}
+        by_group: dict[PartitionTuple, list[tuple[bytes, StagedRecord]]] = {}
         for row_key, rec in keyed:
-            by_team.setdefault(rec.team_id, []).append((row_key, rec))
+            by_group.setdefault(rec.group, []).append((row_key, rec))
 
         total_bytes = 0
         async with self._write_lock:
             batch = WriteBatch()
-            for team_id in sorted(by_team):
-                rows = by_team[team_id]
-                team_bytes = 0
+            for group in sorted(by_group, key=keyspace.encode_group):
+                rows = by_group[group]
+                group_bytes = 0
                 for row_key, rec in rows:
                     batch.put(row_key, rec.payload)
-                    team_bytes += len(rec.payload)
+                    group_bytes += len(rec.payload)
                 offsets = [rec.offset for _, rec in rows]
 
-                current = await self._read_stats(team_id)
+                current = await self._read_stats(group)
                 if current is None:
                     merged = StatsValue(
-                        staged_bytes=team_bytes,
+                        staged_bytes=group_bytes,
                         first_staged_ts=now_us,
                         last_staged_ts=now_us,
                         row_count=len(rows),
                     )
                     batch.put(
-                        keyspace.encode_sched_age_key(SchedAgeKey(now_us, team_id)),
+                        keyspace.encode_sched_age_key(SchedAgeKey(now_us, group)),
                         b"",
                     )
                 else:
                     merged = StatsValue(
-                        staged_bytes=current.staged_bytes + team_bytes,
+                        staged_bytes=current.staged_bytes + group_bytes,
                         # SET-ONCE: later arrivals never advance it.
                         first_staged_ts=current.first_staged_ts,
                         last_staged_ts=now_us,
                         row_count=current.row_count + len(rows),
                     )
                 batch.put(
-                    keyspace.stats_key(team_id), keyspace.encode_stats_value(merged)
+                    keyspace.stats_key(group), keyspace.encode_stats_value(merged)
                 )
 
                 new_range = OffsetRange(
                     self._topic, self._partition, min(offsets), max(offsets)
                 )
-                raw_ranges = await self._db.get(keyspace.offsets_key(team_id))
+                raw_ranges = await self._db.get(keyspace.offsets_key(group))
                 ranges = (
                     list(keyspace.decode_offsets_value(raw_ranges))
                     if raw_ranges is not None
@@ -708,10 +712,10 @@ class PartitionStage:
                 )
                 ranges.append(new_range)
                 batch.put(
-                    keyspace.offsets_key(team_id),
+                    keyspace.offsets_key(group),
                     keyspace.encode_offsets_value(_merge_offset_ranges(ranges)),
                 )
-                total_bytes += team_bytes
+                total_bytes += group_bytes
 
             for entry in quarantined:
                 batch.put(
@@ -745,15 +749,16 @@ class PartitionStage:
     # -- flush inputs -----------------------------------------------------------
 
     async def iter_key_stats(self) -> list[KeyStats]:
-        """The flush planner's input: every team's decoded ``stats/``
-        entry as a :class:`millrace.planner.KeyStats`, in team order."""
+        """The flush planner's input: every partition tuple's decoded
+        ``stats/`` entry as a :class:`millrace.planner.KeyStats`, in key
+        order."""
         self._ensure_open()
         out: list[KeyStats] = []
         for key, value in await self._scan_prefix(keyspace.STATS_PREFIX):
             stats = keyspace.decode_stats_value(value)
             out.append(
                 KeyStats(
-                    team_id=keyspace.decode_stats_key(key),
+                    group=keyspace.decode_stats_key(key),
                     staged_bytes=stats.staged_bytes,
                     first_staged_ts=stats.first_staged_ts,
                     last_staged_ts=stats.last_staged_ts,
@@ -762,9 +767,9 @@ class PartitionStage:
             )
         return out
 
-    async def read_team_stats(self, team_id: int) -> KeyStats | None:
-        """Point-read one team's ``stats/`` entry as a
-        :class:`millrace.planner.KeyStats` (None when the team has none).
+    async def read_group_stats(self, group: PartitionTuple) -> KeyStats | None:
+        """Point-read one partition tuple's ``stats/`` entry as a
+        :class:`millrace.planner.KeyStats` (None when the tuple has none).
 
         The age/slow readiness path's exact decision input
         (M6): the sweep enumerates age-eligible candidate keys from the
@@ -772,11 +777,11 @@ class PartitionStage:
         rather than trusting a shared scan's older snapshot for the
         deadline call."""
         self._ensure_open()
-        stats = await self._read_stats(team_id)
+        stats = await self._read_stats(group)
         if stats is None:
             return None
         return KeyStats(
-            team_id=team_id,
+            group=group,
             staged_bytes=stats.staged_bytes,
             first_staged_ts=stats.first_staged_ts,
             last_staged_ts=stats.last_staged_ts,
@@ -793,15 +798,15 @@ class PartitionStage:
             async for k, _ in self._iter_range(start, end)
         ]
 
-    def scan_team_rows(
+    def scan_group_rows(
         self,
-        team_id: int,
+        group: PartitionTuple,
         *,
         max_rows: int | None = None,
         max_bytes: int | None = None,
     ) -> AsyncIterator[tuple[RowKey, bytes]]:
-        """Stream one team's staged rows in key order — ``(timestamp,
-        offset)`` order within the team — a flush's input.
+        """Stream one partition tuple's staged rows in key order —
+        ``(timestamp, offset)`` order within the tuple — a flush's input.
 
         The optional caps bound the read (a partial prefix of the
         slice): iteration stops before exceeding either. The iterator
@@ -812,13 +817,13 @@ class PartitionStage:
             raise ValueError(f"max_rows must be >= 1, got {max_rows}")
         if max_bytes is not None and max_bytes < 1:
             raise ValueError(f"max_bytes must be >= 1, got {max_bytes}")
-        return self._scan_team_rows(team_id, max_rows=max_rows, max_bytes=max_bytes)
+        return self._scan_group_rows(group, max_rows=max_rows, max_bytes=max_bytes)
 
-    async def _scan_team_rows(
-        self, team_id: int, *, max_rows: int | None, max_bytes: int | None
+    async def _scan_group_rows(
+        self, group: PartitionTuple, *, max_rows: int | None, max_bytes: int | None
     ) -> AsyncIterator[tuple[RowKey, bytes]]:
         self._ensure_open()
-        start, end = keyspace.team_rows_range(team_id)
+        start, end = keyspace.group_rows_range(group)
         rows = 0
         nbytes = 0
         async for key, value in self._iter_range(start, end):
@@ -830,18 +835,18 @@ class PartitionStage:
             nbytes += len(value)
             yield keyspace.decode_row_key(key), value
 
-    async def scan_team_rows_bounded(
-        self, team_id: int, *, max_rows: int, max_bytes: int
+    async def scan_group_rows_bounded(
+        self, group: PartitionTuple, *, max_rows: int, max_bytes: int
     ) -> tuple[list[tuple[RowKey, bytes]], bool]:
-        """The flush's bounded scan, collected: one team's staged rows in
-        key order (``(timestamp, offset)`` within the team), capped in
+        """The flush's bounded scan, collected: one partition tuple's
+        staged rows in key order (``(timestamp, offset)`` within the tuple), capped in
         rows and bytes — plus whether a cap cut the scan short.
 
         ``truncated`` (the second element) is True exactly when the
-        team's slice held at least one row past what the caps admitted
+        tuple's slice held at least one row past what the caps admitted
         (the row that would exceed a cap is NOT included). It is the
         window-narrowing signal (flush.py §Bounded unit of work): an
-        UNtruncated scan saw the team's whole staged slice, so the flush
+        UNtruncated scan saw the tuple's whole staged slice, so the flush
         window is the scan's own offset span; only a truncated scan must
         narrow to the covered offset prefix against the ``offsets/``
         record.
@@ -851,7 +856,7 @@ class PartitionStage:
         if max_bytes < 1:
             raise ValueError(f"max_bytes must be >= 1, got {max_bytes}")
         self._ensure_open()
-        start, end = keyspace.team_rows_range(team_id)
+        start, end = keyspace.group_rows_range(group)
         rows: list[tuple[RowKey, bytes]] = []
         nbytes = 0
         truncated = False
@@ -863,11 +868,11 @@ class PartitionStage:
             nbytes += len(value)
         return rows, truncated
 
-    async def read_offsets(self, team_id: int) -> tuple[OffsetRange, ...]:
-        """One team's still-staged Kafka offset ranges (the flush's
+    async def read_offsets(self, group: PartitionTuple) -> tuple[OffsetRange, ...]:
+        """One partition tuple's still-staged Kafka offset ranges (the flush's
         identity material), canonical order."""
         self._ensure_open()
-        raw = await self._db.get(keyspace.offsets_key(team_id))
+        raw = await self._db.get(keyspace.offsets_key(group))
         return keyspace.decode_offsets_value(raw) if raw is not None else ()
 
     async def scan_poison(self) -> list[PoisonedRecord]:
@@ -968,16 +973,22 @@ class PartitionStage:
     # -- prepared/ lifecycle ----------------------------------------------------
 
     async def persist_prepared(
-        self, team_id: int, first_offset: int, request: PreparedRequest
+        self, group: PartitionTuple, first_offset: int, request: PreparedRequest
     ) -> None:
         """Persist the COMPLETE prepared commit request BEFORE publication
         (durable before return). It is replayed byte-identically after an
         ambiguous response and never regenerated
-        (docs/kafka-ingestion.md §The wire contract)."""
+        (docs/kafka-ingestion.md §The wire contract). The envelope must
+        name the partition tuple its key sits under."""
         self._ensure_open()
+        if request.group != group:
+            raise ValueError(
+                f"prepared request names partition tuple {request.group}, "
+                f"but is persisted under {group}"
+            )
         batch = WriteBatch()
         batch.put(
-            keyspace.prepared_key(team_id, first_offset),
+            keyspace.prepared_key(group, first_offset),
             keyspace.encode_prepared_value(request),
         )
         async with self._write_lock:
@@ -985,27 +996,27 @@ class PartitionStage:
             await handle.await_durable()
 
     async def get_prepared(
-        self, team_id: int, first_offset: int
+        self, group: PartitionTuple, first_offset: int
     ) -> PreparedRequest | None:
         """Point-read one persisted prepared request."""
         self._ensure_open()
-        raw = await self._db.get(keyspace.prepared_key(team_id, first_offset))
+        raw = await self._db.get(keyspace.prepared_key(group, first_offset))
         return keyspace.decode_prepared_value(raw) if raw is not None else None
 
-    async def list_prepared(self, team_id: int) -> list[RecoveredPrepared]:
-        """Every persisted ``prepared/`` entry of ONE team, in
+    async def list_prepared(self, group: PartitionTuple) -> list[RecoveredPrepared]:
+        """Every persisted ``prepared/`` entry of ONE partition tuple, in
         ``first_offset`` order (the key sorts numerically).
 
         The flush path's outstanding-entry gate: at most one entry per
-        team exists by construction (a new request is persisted only
-        when the team has none outstanding), so this is how the flush
+        tuple exists by construction (a new request is persisted only
+        when the tuple has none outstanding), so this is how the flush
         finds that entry REGARDLESS of where the current scan's window
         starts — a bounded scan's prefix minimum can move under it
         (flush.py §Bounded unit of work), and a missed entry would
-        double-publish the window. The prefix holds at most the team's
+        double-publish the window. The prefix holds at most the tuple's
         in-flight entries, so the scan is tiny."""
         self._ensure_open()
-        start, end = keyspace.team_prepared_range(team_id)
+        start, end = keyspace.group_prepared_range(group)
         return [
             RecoveredPrepared(
                 key=keyspace.decode_prepared_key(key),
@@ -1015,7 +1026,7 @@ class PartitionStage:
         ]
 
     async def load_prepared(self) -> list[RecoveredPrepared]:
-        """Every persisted ``prepared/`` entry, in (team, first_offset)
+        """Every persisted ``prepared/`` entry, in (group, first_offset)
         order — the flusher's replay set."""
         self._ensure_open()
         return [
@@ -1026,14 +1037,14 @@ class PartitionStage:
             for key, value in await self._scan_prefix(keyspace.PREPARED_PREFIX)
         ]
 
-    async def drop_prepared(self, team_id: int, first_offset: int) -> None:
+    async def drop_prepared(self, group: PartitionTuple, first_offset: int) -> None:
         """Delete one ``prepared/`` entry on its own — for abandoning a
         quarantined flush decision. Successful flushes need no call:
         :meth:`commit_flushed` drops the entry in the settlement
         transaction."""
         self._ensure_open()
         batch = WriteBatch()
-        batch.delete(keyspace.prepared_key(team_id, first_offset))
+        batch.delete(keyspace.prepared_key(group, first_offset))
         async with self._write_lock:
             handle = await self._db.write(batch)
             await handle.await_durable()
@@ -1116,23 +1127,23 @@ class PartitionStage:
         return FlushCommitReport(
             rows_deleted=settlement.rows_deleted,
             bytes_deleted=settlement.bytes_deleted,
-            team_drained=settlement.team_drained,
+            group_drained=settlement.group_drained,
         )
 
-    async def reconcile_stats(self, team_id: int) -> bool:
-        """Remove a team's ``stats/`` + ``sched_age/`` entries when its rows
+    async def reconcile_stats(self, group: PartitionTuple) -> bool:
+        """Remove a partition tuple's ``stats/`` + ``sched_age/`` entries when its rows
         are gone — the redelivery-inflation residue.
 
         ``stage_batch`` is idempotent at the ROW level but its stats merge
         inflates counters on redelivery (documented there), and a flush
-        settles ACTUALS: afterwards a team can hold ``row_count > 0`` with
+        settles ACTUALS: afterwards a tuple can hold ``row_count > 0`` with
         zero staged rows. Left alone the residue re-decides the key every
         sweep and — worse — its stale ``first_staged_ts`` pins the
         staged-age gauge forever. The flush path calls this when a
         decided key scans empty.
 
         ONE serializable transaction: the stats read and the row scan see
-        one snapshot, so a repair either observes a genuinely empty team
+        one snapshot, so a repair either observes a genuinely empty tuple
         or conflicts with a concurrent ``stage_batch`` on the stats key
         (serializable write-write) — the loser aborts and neither loses
         the new batch's accounting. Returns True when it repaired."""
@@ -1140,11 +1151,11 @@ class PartitionStage:
         async with self._write_lock:
             txn = await self._db.begin(IsolationLevel.SERIALIZABLE_SNAPSHOT)
             try:
-                raw = await txn.get(keyspace.stats_key(team_id))
+                raw = await txn.get(keyspace.stats_key(group))
                 if raw is None:
                     await txn.rollback()
                     return False
-                start, end = keyspace.team_rows_range(team_id)
+                start, end = keyspace.group_rows_range(group)
                 it = await txn.scan(
                     KeyRange(
                         start=start, start_inclusive=True, end=end, end_inclusive=False
@@ -1155,10 +1166,10 @@ class PartitionStage:
                     await txn.rollback()
                     return False
                 stats = keyspace.decode_stats_value(raw)
-                await txn.delete(keyspace.stats_key(team_id))
+                await txn.delete(keyspace.stats_key(group))
                 await txn.delete(
                     keyspace.encode_sched_age_key(
-                        SchedAgeKey(stats.first_staged_ts, team_id)
+                        SchedAgeKey(stats.first_staged_ts, group)
                     )
                 )
             except BaseException:
@@ -1174,9 +1185,9 @@ class PartitionStage:
     async def commit_flushed(self, key: FlushedKey) -> FlushCommitReport:
         """Settle one committed flush — ONE transaction:
 
-        delete EXACTLY the flush's offset window of the team's rows,
+        delete EXACTLY the flush's offset window of the tuple's rows,
         subtract (or remove, with the ``sched_age/`` entry, when
-        drained) the team's ``stats/``, prune the committed range out of
+        drained) the tuple's ``stats/``, prune the committed range out of
         ``offsets/``, and drop the range's ``prepared/`` entry.
 
         No ``flushed/`` marker is written. The caller holds the commit's
@@ -1204,14 +1215,14 @@ class PartitionStage:
         return FlushCommitReport(
             rows_deleted=settlement.rows_deleted,
             bytes_deleted=settlement.bytes_deleted,
-            team_drained=settlement.team_drained,
+            group_drained=settlement.group_drained,
         )
 
     async def _settle_flushed(self, txn: DbTransaction, key: FlushedKey) -> _Settlement:
         """The settlement body shared by :meth:`commit_flushed` and
         :meth:`settle_quarantined`."""
         # The exact settlement selection (keyspace.py §The settlement
-        # window): scan the team's whole slice, delete the rows the
+        # window): scan the tuple's whole slice, delete the rows the
         # window selects.
         start, end = keyspace.flushed_rows_scan_range(key)
         rows_deleted = 0
@@ -1238,24 +1249,24 @@ class PartitionStage:
     async def _settle_stats(
         self, txn: DbTransaction, key: FlushedKey, rows_deleted: int, bytes_deleted: int
     ) -> bool:
-        """Subtract the deleted rows from the team's ``stats/`` entry, or
-        remove it (with its ``sched_age/`` entry) when the team drained.
+        """Subtract the deleted rows from the tuple's ``stats/`` entry, or
+        remove it (with its ``sched_age/`` entry) when the tuple drained.
         ``first_staged_ts`` is left untouched while rows remain: the
         survivors are younger, so keeping the older timestamp can only
         flush them EARLIER than their own deadline — the freshness SLA's
         safe direction."""
-        raw = await txn.get(keyspace.stats_key(key.team_id))
+        raw = await txn.get(keyspace.stats_key(key.group))
         if raw is None:
             if rows_deleted:
                 raise StageCorruptionError(
-                    f"team {key.team_id}: {rows_deleted} staged rows in the "
+                    f"group {key.label}: {rows_deleted} staged rows in the "
                     "settled window but no stats entry"
                 )
             return False
         current = keyspace.decode_stats_value(raw)
         if rows_deleted > current.row_count or bytes_deleted > current.staged_bytes:
             raise StageCorruptionError(
-                f"team {key.team_id}: settling {rows_deleted} rows / "
+                f"group {key.label}: settling {rows_deleted} rows / "
                 f"{bytes_deleted} bytes against stats holding "
                 f"{current.row_count} rows / {current.staged_bytes} bytes"
             )
@@ -1263,15 +1274,15 @@ class PartitionStage:
             return False  # idempotent replay: the landing commit already settled
         remaining = current.row_count - rows_deleted
         if remaining == 0:
-            await txn.delete(keyspace.stats_key(key.team_id))
+            await txn.delete(keyspace.stats_key(key.group))
             await txn.delete(
                 keyspace.encode_sched_age_key(
-                    SchedAgeKey(current.first_staged_ts, key.team_id)
+                    SchedAgeKey(current.first_staged_ts, key.group)
                 )
             )
             return True
         await txn.put(
-            keyspace.stats_key(key.team_id),
+            keyspace.stats_key(key.group),
             keyspace.encode_stats_value(
                 StatsValue(
                     staged_bytes=current.staged_bytes - bytes_deleted,
@@ -1284,12 +1295,12 @@ class PartitionStage:
         return False
 
     async def _settle_offsets(self, txn: DbTransaction, key: FlushedKey) -> None:
-        """Prune the committed window out of the team's ``offsets/``
+        """Prune the committed window out of the tuple's ``offsets/``
         ranges: wholly-covered ranges drop, straddlers clip to their
         surviving piece(s) — a range spanning BOTH window edges splits
         into the piece below and the piece above — and the key leaves
         with its last range."""
-        raw = await txn.get(keyspace.offsets_key(key.team_id))
+        raw = await txn.get(keyspace.offsets_key(key.group))
         if raw is None:
             return
         kept: list[OffsetRange] = []
@@ -1314,16 +1325,16 @@ class PartitionStage:
                 )
         if kept:
             await txn.put(
-                keyspace.offsets_key(key.team_id), keyspace.encode_offsets_value(kept)
+                keyspace.offsets_key(key.group), keyspace.encode_offsets_value(kept)
             )
         else:
-            await txn.delete(keyspace.offsets_key(key.team_id))
+            await txn.delete(keyspace.offsets_key(key.group))
 
     async def _settle_prepared(self, txn: DbTransaction, key: FlushedKey) -> None:
         """Drop the settled range's ``prepared/`` entry: once the settle
         lands, recovery's replay set is exactly what remains under
         ``prepared/``, so the entry must leave with the window."""
-        await txn.delete(keyspace.prepared_key(key.team_id, key.first_offset))
+        await txn.delete(keyspace.prepared_key(key.group, key.first_offset))
 
     # -- recovery ---------------------------------------------------------------
 
@@ -1338,7 +1349,7 @@ class PartitionStage:
            hand — never a repair instruction). Collection is a paged
            delete: one write batch per ``_RECOVERY_PAGE`` keys, the write
            lock taken per page, NO per-marker transaction and no
-           team-slice scan — a partition that accumulated markers for
+           group-slice scan — a partition that accumulated markers for
            days is collected without stalling staging.
         2. Return every surviving ``prepared/`` entry — the ambiguity
            set the flusher reconciles receipt-first (flush.py).
@@ -1421,7 +1432,7 @@ class ManagerGauges:
     partitions: int
     staged_bytes: int
     staged_rows: int
-    staged_teams: int
+    staged_groups: int
     oldest_first_staged_ts: int | None
     oldest_eligible_staged_ts: int | None
     per_partition: Mapping[tuple[str, int], StageGauges]
@@ -1560,7 +1571,7 @@ class StageManager:
             partitions=len(per_partition),
             staged_bytes=sum(g.staged_bytes for g in per_partition.values()),
             staged_rows=sum(g.staged_rows for g in per_partition.values()),
-            staged_teams=sum(g.staged_teams for g in per_partition.values()),
+            staged_groups=sum(g.staged_groups for g in per_partition.values()),
             oldest_first_staged_ts=min(
                 (
                     g.oldest_first_staged_ts

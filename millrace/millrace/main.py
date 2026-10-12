@@ -1,8 +1,8 @@
 """Process entry point: wire config, stage, consumer, planner/flush, server.
 
 One process = one topic → one table (docs/kafka-ingestion.md
-§Deployment). Startup fails fast on config or identity mismatch before
-any consume begins.
+§Deployment). Startup fails fast on invalid config or an unresolvable
+destination before any consume begins.
 
 Assembly: ``MILLRACE_*`` env → :class:`~millrace.config.Config` →
 :class:`~millrace.stage.StageManager` (one SlateDB instance per claimed
@@ -64,6 +64,7 @@ from prometheus_client.core import REGISTRY, CounterMetricFamily, GaugeMetricFam
 from .config import Config, ConfigError, load_config
 from .consumer import ConsumerFencedError, MillraceConsumer, create_kafka_consumer
 from .flush import FlushHalted, FlushRunner, HoglakeFlusher
+from .grouping import GroupKeyer
 from .server import serve
 from .slatedb_metrics import MetricSnapshot, slatedb_families, snapshot_recorder
 from .stage import StageManager, build_slatedb_settings
@@ -315,7 +316,7 @@ class _PipelineCollector:
     to the no-per-partition-series rule: a stuck partition must be
     FINDABLE (PR #331), and the label cardinality is bounded by the
     pod's ASSIGNED partitions (the K of the static list or the group
-    assignment — tens, not the team count). ``millrace_flush_partition_
+    assignment — tens, not the partition-tuple count). ``millrace_flush_partition_
     fenced`` carries the flush runner's fenced set the same way.
     """
 
@@ -453,10 +454,16 @@ class _PipelineCollector:
         yield GaugeMetricFamily(
             "millrace_staged_rows", "Rows currently staged", value=gauges.staged_rows
         )
+        yield GaugeMetricFamily(
+            "millrace_staged_groups",
+            "Partition tuples (staging groups) currently holding staged rows, "
+            "summed over the pod's partitions",
+            value=gauges.staged_groups,
+        )
         per_partition_bytes = GaugeMetricFamily(
             "millrace_partition_staged_bytes",
             "Bytes currently staged, per assigned partition (cardinality "
-            "bounded by the pod's partition count, never by teams)",
+            "bounded by the pod's partition count, never by partition tuples)",
             labels=["topic", "partition"],
         )
         per_partition_age = GaugeMetricFamily(
@@ -538,8 +545,17 @@ async def _run(cfg: Config, hoglake_url: str, s3_kwargs: Mapping[str, Any]) -> i
                 io_workers=4 * cfg.flush_concurrency,
             ),
         )
+        # The consumer stages each record under the destination's
+        # partition tuple: its keyer is built from the shape the flusher
+        # just resolved (same pinned incarnation) and re-read on the
+        # flusher's TTL through its own Table handle.
         consumer = MillraceConsumer(
-            create_kafka_consumer(cfg), stages, cfg, now_us=_now_us
+            create_kafka_consumer(cfg),
+            stages,
+            cfg,
+            keyer=GroupKeyer(flusher.resolved_info),
+            shape=flusher.shape_reader(),
+            now_us=_now_us,
         )
         runner = FlushRunner(
             stages,

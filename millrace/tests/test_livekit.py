@@ -3,9 +3,7 @@
 The live suite only ever runs against the docker stack, so the parts of
 ``livekit`` that are pure (the child env dump) get their unit coverage
 here — a dump bug would otherwise surface only as a boot-refused child
-on the stack (the consumer batch's flag: a ``VALUE_JSON`` config dumped
-as bare ``value-json``, which config refuses at boot for naming no
-payload field).
+on the stack.
 """
 
 from __future__ import annotations
@@ -15,10 +13,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-import pytest
-from flushkit import make_config
-
-from millrace.config import AutoOffsetReset, TeamKeyCodec, load_config
+from millrace.config import AutoOffsetReset
 
 
 def _livekit() -> Any:
@@ -33,31 +28,6 @@ def _livekit() -> Any:
     sys.modules["livekit"] = module
     spec.loader.exec_module(module)
     return module
-
-
-@pytest.mark.parametrize(
-    ("codec", "field", "expected"),
-    [
-        (TeamKeyCodec.UTF8_DECIMAL, None, "utf8-decimal"),
-        (TeamKeyCodec.BE64, None, "be64"),
-        (TeamKeyCodec.VALUE_JSON, "team_id", "value-json:team_id"),
-    ],
-)
-def test_child_env_dumps_the_full_codec_spec(codec, field, expected):
-    livekit = _livekit()
-    cfg = make_config(team_key_codec=codec, team_id_field=field)
-    env = livekit.child_env(cfg, hoglake_url="http://hog.test", metrics_port=0)
-    assert env["MILLRACE_TEAM_KEY_CODEC"] == expected
-    # The proof, not a restatement: the rendered knob must parse back
-    # through the real loader to the same codec configuration (a bare
-    # "value-json" is REFUSED there). (The rest of the child's env is
-    # live-stack-shaped — its s3 stage URL only exists on the stack —
-    # so the round-trip is scoped to the codec knob.)
-    from test_config import MINIMAL_ENV
-
-    reparsed = load_config(MINIMAL_ENV | {"MILLRACE_TEAM_KEY_CODEC": expected})
-    assert reparsed.team_key_codec is codec
-    assert reparsed.team_id_field == field
 
 
 def test_livekit_pins_earliest_offset_reset_for_test_determinism():

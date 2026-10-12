@@ -45,10 +45,10 @@ from millrace.config import (
     Config,
     EventTimePolicy,
     PoisonConfig,
-    TeamKeyCodec,
 )
 from millrace.consumer import MillraceConsumer, create_kafka_consumer
 from millrace.flush import FlushRunner, HoglakeFlusher
+from millrace.grouping import GroupKeyer
 from millrace.stage import StageManager
 
 # ---------------------------------------------------------------------------
@@ -518,7 +518,6 @@ def live_config(
         # The suite produces-then-consumes with a fresh group per test;
         # production's default is LATEST (fleet policy — see config.py).
         kafka_auto_offset_reset=AutoOffsetReset.EARLIEST,
-        team_key_codec=TeamKeyCodec.UTF8_DECIMAL,
         catalog=catalog,
         namespace=namespace,
         table=table,
@@ -613,8 +612,15 @@ class Pipeline:
                 io_workers=4 * cfg.flush_concurrency,
             ),
         )
+        # main.py's wiring: the keyer comes from the resolved shape and
+        # re-reads on the flusher's TTL.
         consumer = MillraceConsumer(
-            create_kafka_consumer(cfg), self.stages, cfg, now_us=now_us
+            create_kafka_consumer(cfg),
+            self.stages,
+            cfg,
+            keyer=GroupKeyer(self.flusher.resolved_info),
+            shape=self.flusher.shape_reader(),
+            now_us=now_us,
         )
         self.consumer = consumer
         self.runner = FlushRunner(
@@ -773,10 +779,6 @@ def child_env(
             # default is `latest` (fleet policy — see config.py). The
             # pipeline under test is identical either way.
             "MILLRACE_KAFKA_AUTO_OFFSET_RESET": cfg.kafka_auto_offset_reset.value,
-            # The FULL codec spec — value-json carries its payload field
-            # inline (value-json:<field>); the bare enum value is refused
-            # at boot. The property is the parser's inverse (config.py).
-            "MILLRACE_TEAM_KEY_CODEC": cfg.team_key_codec_env,
             "MILLRACE_CATALOG": cfg.catalog,
             "MILLRACE_NAMESPACE": cfg.namespace,
             "MILLRACE_TABLE": cfg.table,

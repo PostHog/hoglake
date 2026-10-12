@@ -13,12 +13,14 @@ import asyncio
 from typing import Any
 
 import pytest
-from flushkit import make_config
+from flushkit import make_config, table_wire
 from kafkakit import FakeConsumer
+from pyhoglake import TableInfo
 
 from millrace import main
 from millrace.consumer import ConsumerFencedError, MillraceConsumer
 from millrace.flush import FlushHalted
+from millrace.grouping import GroupKeyer
 from millrace.stage import StageGauges, StageManager
 
 
@@ -71,7 +73,13 @@ def _collector():
     """A _PipelineCollector over real-but-unstarted components."""
     cfg = make_config()
     stages = StageManager("memory:///", "millrace")
-    consumer = MillraceConsumer(FakeConsumer(), stages, cfg, now_us=lambda: 0)
+    consumer = MillraceConsumer(
+        FakeConsumer(),
+        stages,
+        cfg,
+        keyer=GroupKeyer(TableInfo.from_wire(table_wire())),
+        now_us=lambda: 0,
+    )
     from pyhoglake import HoglakeClient
 
     from millrace.flush import HoglakeFlusher
@@ -362,7 +370,7 @@ async def test_pipeline_collector_serves_the_sweep_published_eligible_age():
                 ("events", 0): StageGauges(
                     staged_bytes=4,
                     staged_rows=1,
-                    staged_teams=1,
+                    staged_groups=1,
                     oldest_first_staged_ts=NOW,
                 )
             },
@@ -371,6 +379,8 @@ async def test_pipeline_collector_serves_the_sweep_published_eligible_age():
         raw = await raw_samples()
         assert ("millrace_oldest_eligible_staged_age_seconds", ()) in raw
         assert ("millrace_oldest_staged_age_seconds", ()) not in raw
+        # The pod's staging-group count (partition tuples holding rows).
+        assert raw[("millrace_staged_groups", ())] == 1
 
         # A publish with nothing eligible drops the series (absent, not
         # zero — "no backlog" is not "backlog age zero").
@@ -379,7 +389,7 @@ async def test_pipeline_collector_serves_the_sweep_published_eligible_age():
                 ("events", 0): StageGauges(
                     staged_bytes=4,
                     staged_rows=1,
-                    staged_teams=1,
+                    staged_groups=1,
                     oldest_first_staged_ts=NOW,
                 )
             },
@@ -410,7 +420,7 @@ async def test_poison_sweeper_purges_expired_entries_per_partition():
         await stage.stage_batch(
             [rec(1, 100, 0)],
             poison=[
-                PoisonedRecord(7, "malformed_key", None, b"x", 1),  # stamped NOW
+                PoisonedRecord(7, "malformed_value", None, b"x", 1),  # stamped NOW
             ],
             now_us=NOW,
         )

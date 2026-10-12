@@ -6,7 +6,7 @@ NON-GATING: the ``bench`` marker is deselected from default runs
 
     uv run pytest --bench tests/test_flush_bench.py -s
 
-Shape: 1024 ready keys (256 teams x 4 partition stages, 2 rows each) on
+Shape: 1024 ready keys (256 groups x 4 partition stages, 2 rows each) on
 ``memory:///`` stages, a scripted pyhoglake double (pytest-httpx, the
 flush suite's flushkit) and the fake object store. One
 :meth:`FlushRunner.run_once` is the unit of measurement — per-partition
@@ -64,7 +64,7 @@ async def _stage_all(manager: StageManager, clock: Any) -> None:
                 offset = i * ROWS_PER_TEAM + j
                 records.append(
                     StagedRecord(
-                        team_id=team,
+                        group=(str(team),),
                         event_ts_us=NOW + offset,
                         offset=offset,
                         payload=event_payload(team, NOW + offset),

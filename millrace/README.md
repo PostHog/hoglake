@@ -1,9 +1,11 @@
 # millrace
 
 Kafka → hoglake ingestion daemon with SlateDB staging: consume a topic,
-stage rows in an embedded, object-storage-native LSM keyed by partition
-value, and flush per key on size/age readiness into parquet + prepared
-commits. At-least-once end to end — Kafka offsets commit strictly after
+stage rows in an embedded, object-storage-native LSM keyed by the
+destination table's partition tuple (computed per record from the JSON
+payload under the table's live partition spec), and flush per tuple on
+size/age readiness into parquet + prepared commits — one file per tuple
+in the steady state. At-least-once end to end — Kafka offsets commit strictly after
 durable staging; staged ranges delete strictly after a commit receipt.
 The receipt dedupe rests on server-side receipts, which are purged
 (`HOGLAKE_RECEIPT_RETENTION_SECONDS`, default 7 d — floored per catalog
@@ -27,19 +29,29 @@ Build/test sequence: [docs/kafka-ingestion-plan.md](../docs/kafka-ingestion-plan
 Status: Phase 5 — `keyspace.py` (staging key codecs, side prefixes,
 idempotency-key derivation, the `poison/` quarantine codec),
 `planner.py` (pure per-key flush decisions: the size/age/slow
-three-lane policy behind a policy seam, commit chunking), `stage.py`
+three-lane policy behind a policy seam), `grouping.py` (the
+partition-tuple keyer: payload → the destination's partition tuple; it
+reads nested struct-leaf sources by path, but the flusher still refuses
+struct columns at startup, so such a table cannot run yet), `coerce.py` (the per-column JSON
+coercers the keyer and the flush decoder share), `stage.py`
 (the per-partition SlateDB staging layer:
 `PartitionStage` + `StageManager`), `consumer.py` (the consume loop:
 static and cooperative assignment claiming via `StageManager.sync_assignment`,
 poll → stage → commit with offsets strictly after durable staging and
 the poll's per-partition stage batches overlapped (one WAL durability
-wait per partition, in flight together), the `value-json:<field>` team
-codec for topics not keyed by team, the FENCED halt below, poison
-quarantine), `flush.py` (the flush
-loop: planner-driven sweeps, staged range → Arrow → partition fanout →
+wait per partition, in flight together), staging under the partition
+tuple with the keyer re-read on the flusher's shape TTL (the Kafka key
+is never read), the FENCED halt below, poison quarantine), `flush.py`
+(the flush
+loop: planner-driven sweeps, staged range → Arrow → live-spec partition
+fanout (a fanout past `MILLRACE_MAX_FILES_PER_COMMIT` halts
+`fanout_exceeds_commit_bound`; there is no commit chunking) →
 parquet → persisted prepared commit → settle, the day-one wire contract
-(`read_snapshot` + `expected_table_uuid`, `totals=false` identity reads,
-retention/4 shape cache), the full refusal taxonomy with pinned
+(`read_snapshot` + `expected_table_uuid` pinned at the startup
+resolve — a later uuid change halts `table_recreated`, `totals=false`
+identity reads, retention/4 shape cache), the full refusal taxonomy
+(a 409 `commit_conflict` resends the identical bytes up to 5 attempts,
+then `FlushPublishExhausted`) with pinned
 recoveries, byte-identical replay of persisted requests, receipt-based
 recovery handoff, junk `event_time` clamp/quarantine, orphan
 accounting), `maintenance.py` (the external GC + compaction-debt
@@ -59,7 +71,8 @@ kill -9 mid-flush, the lost commit response (an in-test TCP proxy drops
 the response AFTER the server commits), static and cooperative
 reassignment, junk `event_time` quarantine, whale overload + tail
 freshness, the freshness SLA measurement, the DDL race, drop+recreate
-incarnation halt, and a compaction observation.
+incarnation halt, and a compaction observation. Code-level map:
+[architecture.md](architecture.md).
 
 - `just millrace unit` — unit + component tests (pytest, `memory:///`)
 - `just millrace test` — the whole non-live suite, including `file:///`
@@ -69,6 +82,15 @@ incarnation halt, and a compaction observation.
   (`.artifacts/live-millrace/`); fails on a missing/empty/skipped/failed
   report, wired into CI as the `live-millrace` job of the reusable
   `python-live.yml` workflow
+
+## Staging format
+
+The staging keyspace is keyed by the destination's partition tuple
+(prepared envelope v4); it shares no key or value shape with the
+#331-era team-keyed layout. millrace requires a FRESH staging root — a
+new `MILLRACE_STAGE_URL` prefix. There is no code guard: pointed at an
+old root it fails at open or at the first sweep with the `ValueError`
+from `keyspace.decode_prepared_value` / `decode_stats_key`.
 
 ## Rollouts and fencing (static assignment)
 
@@ -135,7 +157,7 @@ arithmetic, not trust):
   measures ~7.3K msg/s per partition sustained with zero write stalls
   in every arm (the shape is latency-bound at the 100 ms WAL flush
   interval, ~5x the whale's 1.5K msg/s requirement) — the 55 MB/s
-  single-team shape (an L0 SST per ~1.2 s against the compactor's 5 s
+  single-group shape (an L0 SST per ~1.2 s against the compactor's 5 s
   poll) is the one pilot question the local bench cannot answer, and
   the debt series is its tripwire.
 
@@ -148,9 +170,10 @@ entries older than `MILLRACE_POISON_RETENTION_S` (default 7 d, matching
 the server's default receipt retention — the incidents poison matters
 to live inside that window) per partition every
 `MILLRACE_POISON_SWEEP_S` (default 1 h), in bounded batches.
-`millrace_poison_entries_purged_total` counts deletions. Entries
-without a stamp (written before this policy, or by the flush path until
-it passes its clock) are kept forever — unknown age is never deleted.
+`millrace_poison_entries_purged_total` counts deletions. Every write
+path stamps its entries — consume-time and flush-time quarantines alike;
+an entry without a stamp (a v1 envelope, written only by a caller that
+passes no clock) is kept forever — unknown age is never deleted.
 Nothing depends on poison presence, so a pod that is down at expiry
 simply purges at its next sweep.
 
@@ -168,8 +191,9 @@ that lost a partition's ownership is not ready to serve it.
 `millrace_partition_oldest_staged_age_seconds{topic,partition}`,
 `millrace_flush_partition_fenced{topic,partition}` — so a stuck
 partition is findable; cardinality is bounded by the pod's assigned
-partition count (tens), never by teams. The staged gauges —
-`millrace_staged_bytes`, `millrace_staged_rows`,
+partition count (tens), never by partition tuples. The staged gauges —
+`millrace_staged_bytes`, `millrace_staged_rows`, `millrace_staged_groups`
+(partition tuples holding staged rows),
 `millrace_oldest_eligible_staged_age_seconds` (the oldest key that is
 eligible under ANY flush lane, so pathological slow-lane tenants don't
 trip it) — plus SlateDB's own stall series are alert inputs; nothing in
@@ -190,7 +214,8 @@ I/O), `component` = SlateDB on `memory:///`, `integration` = SlateDB on
 `file:///` (no docker), `live` = the docker stack (deselected unless
 `-m live` is passed — see tests/conftest.py). The benches — the SlateDB
 rate bench (validation item 2) and the flush sweep throughput bench
-(M5's measurement) — are non-gating and deselected by default:
+(M5's measurement: 1024 ready keys total, 256 per partition stage × 4
+stages) — are non-gating and deselected by default:
 
 ```
 uv run pytest --bench -m bench -s

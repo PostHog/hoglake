@@ -1,8 +1,8 @@
 """Consume-loop tests (docs/kafka-ingestion-plan.md Phase 3).
 
-Layers: the PURE decisions (team-id extraction — key codecs and the
-``value-json:<field>`` payload codec —, record classification, the
-client-config pins) are unit tests without I/O;
+Layers: the PURE decisions (record classification — the value parsed
+once as a JSON object and keyed by the destination's partition tuple —
+and the client-config pins) are unit tests without I/O;
 the loop itself is driven component-style — a scripted FakeConsumer
 (tests/kafkakit.py, hedgerow's fakes.py shape) over a REAL
 StageManager on ``memory:///``, so poll → stage → ack → commit ordering,
@@ -31,9 +31,16 @@ Pinned here:
   follows every ack;
 - the per-poll byte cap clamps the next consume's message count to
   budget ÷ observed average record size, floored at 1;
-- the ``value-json`` codec: a topic NOT keyed by team stages under the
-  payload's team field, keyless records and all; a payload lacking or
-  mistyping the field quarantines;
+- the staging group is the destination's partition tuple: an
+  unpartitioned table stages everything under one group,
+  ``identity(team_id)`` and ``(identity(team_id), month(timestamp))``
+  group by the payload's values, a nested source (``properties.team_id``)
+  is read by path, the Kafka key is never read, and a malformed source
+  quarantines with a reason naming the field;
+- a spec refresh mid-stream: past the shape TTL the consumer re-reads
+  the destination and new records stage under the new spec's tuples
+  while the old group stays staged and flushable; a failed re-read keeps
+  the old keyer;
 - a fenced partition (a REAL contested open on the stage's path — the
   parity suite's FENCED shape) closes locally and halts the loop with
   the distinct ConsumerFencedError, without committing the failed batch;
@@ -51,14 +58,17 @@ Pinned here:
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 from typing import Any
 
 import pytest
 from confluent_kafka import OFFSET_STORED, KafkaError, KafkaException
-from kafkakit import FakeConsumer, error_event, keyed_msg, msg
+from kafkakit import FakeConsumer, error_event, msg, team_msg, team_payload
+from pyhoglake import TableInfo
 from slatedb.uniffi import CloseReason, DbBuilder
 from slatedb.uniffi import Error as SlateError
-from stagekit import NOW, fast_flush_settings, rec
+from stagekit import NOW, fast_flush_settings, prepared, rec
 
 import millrace.consumer as consumer_mod
 from millrace.config import (
@@ -67,16 +77,12 @@ from millrace.config import (
     Config,
     EventTimePolicy,
     PoisonConfig,
-    TeamKeyCodec,
 )
 from millrace.consumer import (
     REASON_INVALID_OFFSET,
     REASON_INVALID_TIMESTAMP,
-    REASON_MALFORMED_KEY,
-    REASON_MALFORMED_TEAM_FIELD,
+    REASON_MALFORMED_PARTITION_SOURCE,
     REASON_MALFORMED_VALUE,
-    REASON_MISSING_KEY,
-    REASON_MISSING_TEAM_FIELD,
     REASON_MISSING_TIMESTAMP,
     REASON_MISSING_VALUE,
     ConsumerFencedError,
@@ -85,11 +91,11 @@ from millrace.consumer import (
     PoisonLimitExceeded,
     classify_message,
     create_kafka_consumer,
-    decode_team_key,
-    decode_team_value,
     kafka_consumer_config,
 )
-from millrace.keyspace import PreparedRequest
+from millrace.flush import FlushHalted
+from millrace.grouping import GroupKeyer
+from millrace.planner import PlannerKnobs, plan_flush
 from millrace.stage import (
     PartitionStage,
     PoisonedRecord,
@@ -111,7 +117,6 @@ def make_config(**overrides) -> Config:
         "kafka_group_id": "millrace-events",
         "assignment_mode": AssignmentMode.STATIC,
         "static_partitions": (0,),
-        "team_key_codec": TeamKeyCodec.UTF8_DECIMAL,
         "catalog": "prod",
         "namespace": "default",
         "table": "events",
@@ -150,17 +155,97 @@ def make_manager(journal: list[tuple]) -> StageManager:
     )
 
 
+#: The destination's columns: a top-level ``team_id``, the event time,
+#: free text, and a ``properties`` struct whose ``team_id`` leaf is a
+#: legal (nested) partition source.
+COLUMNS_WIRE: list[dict[str, Any]] = [
+    {"name": "team_id", "type": "long", "field_id": 1, "ordinal": 0},
+    {"name": "timestamp", "type": "timestamp", "field_id": 2, "ordinal": 1},
+    {"name": "event", "type": "string", "field_id": 3, "ordinal": 2},
+    {
+        "name": "properties",
+        "type": "struct",
+        "field_id": 4,
+        "ordinal": 3,
+        "children": [
+            {"name": "team_id", "type": "long", "field_id": 5, "ordinal": 0},
+        ],
+    },
+]
+IDENTITY_TEAM: dict[str, Any] = {"source_field_id": 1, "transform": "identity"}
+MONTH_TIMESTAMP: dict[str, Any] = {"source_field_id": 2, "transform": "month"}
+IDENTITY_PROPERTIES_TEAM: dict[str, Any] = {
+    "source_field_id": 5,
+    "transform": "identity",
+}
+
+
+def table_info(spec: list[dict[str, Any]] | None, *, spec_id: int = 1) -> TableInfo:
+    """The destination's shape with ``spec`` as its live partition spec
+    (None: unpartitioned)."""
+    wire: dict[str, Any] = {
+        "name": "events",
+        "namespace": "default",
+        "table_uuid": "0b8ee9ba-79a1-4f3e-b7e5-6a0b6ab6f012",
+        "columns": COLUMNS_WIRE,
+        "read_snapshot_id": 88,
+    }
+    if spec is not None:
+        wire["partition_spec"] = {"spec_id": spec_id, "fields": spec}
+    return TableInfo.from_wire(wire)
+
+
+#: The component tests' keyer: ``identity(team_id)``, so a team's rows
+#: stage under the one-field tuple ``(str(team),)``.
+TEAM_KEYER = GroupKeyer(table_info([IDENTITY_TEAM]))
+
+
+class FakeShape:
+    """The consumer's ``ShapeSource``: scripted re-reads (a TableInfo or
+    an exception per call) and a fixed TTL."""
+
+    def __init__(self, ttl_s: float = 450.0) -> None:
+        self.ttl = ttl_s
+        self.reads: list[TableInfo | Exception] = []
+        self.calls = 0
+
+    def read(self) -> TableInfo:
+        self.calls += 1
+        step = self.reads.pop(0)
+        if isinstance(step, Exception):
+            raise step
+        return step
+
+    def ttl_s(self) -> float:
+        return self.ttl
+
+
+class FakeMonotonic:
+    def __init__(self) -> None:
+        self.now = 1_000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
 def make_consumer(
     fake: FakeConsumer,
     manager: StageManager,
     cfg: Config,
     clock,
     sleeper: Sleeper | None = None,
+    *,
+    keyer: GroupKeyer = TEAM_KEYER,
+    shape: FakeShape | None = None,
+    monotonic: FakeMonotonic | None = None,
 ) -> MillraceConsumer:
     return MillraceConsumer(
         fake,
         manager,
         cfg,
+        keyer=keyer,
+        shape=shape,
+        monotonic=monotonic if monotonic is not None else FakeMonotonic(),
         now_us=clock,
         sleep=sleeper if sleeper is not None else Sleeper(),
     )
@@ -210,192 +295,26 @@ def assert_commits_follow_acks(journal: list[tuple]) -> None:
 
 
 async def team_offsets(stage: PartitionStage, team: int) -> list[int]:
-    return [rk.offset async for rk, _ in stage.scan_team_rows(team)]
+    """The staged offsets of team ``team``'s ``identity(team_id)`` group."""
+    return [rk.offset async for rk, _ in stage.scan_group_rows((str(team),))]
 
 
 # ==================================================================================
-# Pure: the team key codec
+# Pure: record classification under the destination's partition spec
 # ==================================================================================
 
 
-def test_decode_team_key_utf8_decimal():
-    assert decode_team_key(TeamKeyCodec.UTF8_DECIMAL, b"12345") == 12345
-    assert decode_team_key(TeamKeyCodec.UTF8_DECIMAL, b"0") == 0
-    assert decode_team_key(TeamKeyCodec.UTF8_DECIMAL, b"007") == 7
-
-
-@pytest.mark.parametrize(
-    "raw", [b"", b" 12", b"+12", b"1_000", b"12.5", b"abc", b"\xff\xfe"]
-)
-def test_decode_team_key_utf8_decimal_refusals(raw):
-    with pytest.raises(ValueError, match="utf8-decimal"):
-        decode_team_key(TeamKeyCodec.UTF8_DECIMAL, raw)
-
-
-def test_decode_team_key_utf8_decimal_u64_ceiling():
-    assert (
-        decode_team_key(TeamKeyCodec.UTF8_DECIMAL, str(2**64 - 1).encode()) == 2**64 - 1
-    )
-    with pytest.raises(ValueError, match="u64"):
-        decode_team_key(TeamKeyCodec.UTF8_DECIMAL, str(2**64).encode())
-
-
-def test_decode_team_key_be64():
-    assert decode_team_key(TeamKeyCodec.BE64, (12345).to_bytes(8, "big")) == 12345
-    assert decode_team_key(TeamKeyCodec.BE64, b"\xff" * 8) == 2**64 - 1
-    with pytest.raises(ValueError, match="8 bytes"):
-        decode_team_key(TeamKeyCodec.BE64, b"\x00\x00\x00\x01")
-
-
-def test_value_json_has_no_key_decoding():
-    with pytest.raises(ValueError, match="unsupported"):
-        decode_team_key(TeamKeyCodec.VALUE_JSON, b"7")
-
-
-# ==================================================================================
-# Pure: the value-json payload codec (B4 — topics not keyed by team)
-# ==================================================================================
-
-
-def test_decode_team_value_reads_the_configured_field():
-    assert decode_team_value(b'{"team_id": 42, "event": "x"}', "team_id") == 42
-    assert decode_team_value(b'{"team_id": 0}', "team_id") == 0
-    assert decode_team_value(b'{"team_id": %d}' % (2**64 - 1), "team_id") == 2**64 - 1
-    # A differently-named field is the operator's choice.
-    assert decode_team_value(b'{"tenant": 7}', "tenant") == 7
-
-
-@pytest.mark.parametrize(
-    "payload,reason",
-    [
-        (b"not json", REASON_MALFORMED_VALUE),
-        (b"\xff\xfe{}", REASON_MALFORMED_VALUE),
-        (b"[1, 2]", REASON_MALFORMED_VALUE),  # JSON, but not an object
-        (b"42", REASON_MALFORMED_VALUE),
-        (b'"team_id"', REASON_MALFORMED_VALUE),
-        (b'{"other": 1}', REASON_MISSING_TEAM_FIELD),  # field absent
-        (b'{"team_id": null}', REASON_MISSING_TEAM_FIELD),  # null is absent
-        (b'{"team_id": "42"}', REASON_MALFORMED_TEAM_FIELD),  # never coerced
-        (b'{"team_id": 42.0}', REASON_MALFORMED_TEAM_FIELD),  # float, not int
-        (b'{"team_id": true}', REASON_MALFORMED_TEAM_FIELD),  # bool IS int
-        (b'{"team_id": -1}', REASON_MALFORMED_TEAM_FIELD),  # negative
-        (b'{"team_id": %d}' % 2**64, REASON_MALFORMED_TEAM_FIELD),  # > u64
-    ],
-)
-def test_decode_team_value_refusals_carry_the_reason(payload, reason):
-    with pytest.raises(ValueError) as excinfo:
-        decode_team_value(payload, "team_id")
-    # The bounded quarantine reason rides the exception (the poison
-    # envelope stores it); the message detail is for the logs.
-    assert excinfo.value.reason == reason  # type: ignore[attr-defined]
-
-
-def test_classify_value_json_ignores_the_key_entirely():
-    # The topic is not keyed by team: a KEYLESS record stages fine (a
-    # keyed codec would quarantine it as missing_key), and even a junk
-    # key is never consulted.
-    out = classify_message(
-        TeamKeyCodec.VALUE_JSON,
-        offset=41,
-        key=None,
-        value=b'{"team_id": 7, "v": 1}',
-        timestamp=(1, 1_234_567),
-        poison_value_max_bytes=64,
-        value_field="team_id",
-    )
-    assert out == StagedRecord(
-        team_id=7,
-        event_ts_us=1_234_567_000,
-        offset=41,
-        payload=b'{"team_id": 7, "v": 1}',
-    )
-    out = classify_message(
-        TeamKeyCodec.VALUE_JSON,
-        offset=42,
-        key=b"junk-not-a-team",
-        value=b'{"team_id": 9}',
-        timestamp=(1, 1_234_567),
-        poison_value_max_bytes=64,
-        value_field="team_id",
-    )
-    assert isinstance(out, StagedRecord) and out.team_id == 9
-
-
-def test_classify_value_json_poisons_a_payload_without_the_field():
-    out = classify_message(
-        TeamKeyCodec.VALUE_JSON,
-        offset=41,
-        key=None,
-        value=b'{"not_team": 7}',
-        timestamp=(1, 1_234_567),
-        poison_value_max_bytes=64,
-        value_field="team_id",
-    )
-    assert isinstance(out, PoisonedRecord)
-    assert out.reason == REASON_MISSING_TEAM_FIELD
-    out = classify_message(
-        TeamKeyCodec.VALUE_JSON,
-        offset=41,
-        key=None,
-        value=b'{"team_id": "7"}',
-        timestamp=(1, 1_234_567),
-        poison_value_max_bytes=64,
-        value_field="team_id",
-    )
-    assert isinstance(out, PoisonedRecord)
-    assert out.reason == REASON_MALFORMED_TEAM_FIELD
-    out = classify_message(
-        TeamKeyCodec.VALUE_JSON,
-        offset=41,
-        key=None,
-        value=b"not json",
-        timestamp=(1, 1_234_567),
-        poison_value_max_bytes=64,
-        value_field="team_id",
-    )
-    assert isinstance(out, PoisonedRecord)
-    assert out.reason == REASON_MALFORMED_VALUE
-
-
-def test_classify_value_json_tombstone_is_missing_value_not_a_parse_error():
-    # The FIRST failing check names the reason: a tombstone is
-    # missing_value, exactly like under the keyed codecs.
-    out = classify_message(
-        TeamKeyCodec.VALUE_JSON,
-        offset=41,
-        key=None,
-        value=None,
-        timestamp=(1, 1_234_567),
-        poison_value_max_bytes=64,
-        value_field="team_id",
-    )
-    assert isinstance(out, PoisonedRecord) and out.reason == REASON_MISSING_VALUE
-
-
-def test_classify_value_json_without_a_field_is_a_config_bug_not_poison():
-    # Config refuses the pair at construction; a hand-built path must
-    # not silently quarantine every record.
-    with pytest.raises(ValueError, match="value_field"):
-        classify_message(
-            TeamKeyCodec.VALUE_JSON,
-            offset=41,
-            key=None,
-            value=b'{"team_id": 7}',
-            timestamp=(1, 1_234_567),
-            poison_value_max_bytes=64,
-        )
-
-
-# ==================================================================================
-# Pure: record classification (total — never raises)
-# ==================================================================================
-
-
-def classify(
-    codec, *, offset=41, key=b"7", value=b"payload", timestamp=(1, 1_234_567), cap=64
-):
+def _classify(
+    keyer: GroupKeyer,
+    value: bytes | None,
+    *,
+    offset: int = 41,
+    key: bytes | None = b"7",
+    timestamp: tuple[int, int] = (1, 1_234_567),
+    cap: int = 64,
+) -> StagedRecord | PoisonedRecord:
     return classify_message(
-        codec,
+        keyer,
         offset=offset,
         key=key,
         value=value,
@@ -404,46 +323,154 @@ def classify(
     )
 
 
-def test_classify_a_wellformed_record():
-    assert classify(TeamKeyCodec.UTF8_DECIMAL) == StagedRecord(
-        team_id=7, event_ts_us=1_234_567_000, offset=41, payload=b"payload"
+def _group(keyer: GroupKeyer, doc: dict[str, Any]) -> tuple[str | None, ...]:
+    out = _classify(keyer, json.dumps(doc).encode())
+    assert isinstance(out, StagedRecord), out
+    return out.group
+
+
+#: 2027-01-15T08:00:00Z in epoch micros; month 684 (2027-01) since 1970-01.
+JAN_TS = 1_800_000_000_000_000
+JAN_MONTH = "684"
+
+
+def test_an_unpartitioned_table_stages_every_record_under_one_group():
+    keyer = GroupKeyer(table_info(None))
+    assert keyer.fields == ()
+    assert _group(keyer, {"team_id": 7}) == ()
+    assert _group(keyer, {"anything": "at all"}) == ()
+    assert _group(keyer, {}) == ()
+
+
+def test_identity_team_id_groups_by_the_teams_wire_string():
+    keyer = GroupKeyer(table_info([IDENTITY_TEAM]))
+    assert keyer.fields == ("team_id",)
+    out = _classify(keyer, b'{"team_id": 7, "v": 1}', offset=41)
+    assert out == StagedRecord(
+        group=("7",),
+        event_ts_us=1_234_567_000,
+        offset=41,
+        payload=b'{"team_id": 7, "v": 1}',
     )
+    assert _group(keyer, {"team_id": 2**63 - 1}) == (str(2**63 - 1),)
+    assert _group(keyer, {"team_id": -3}) == ("-3",)
+
+
+def test_identity_team_and_month_timestamp_group_by_both_components():
+    keyer = GroupKeyer(table_info([IDENTITY_TEAM, MONTH_TIMESTAMP]))
+    assert keyer.fields == ("team_id", "timestamp_month")
+    assert _group(keyer, {"team_id": 7, "timestamp": JAN_TS}) == ("7", JAN_MONTH)
+    # The ISO form of the same instant lands in the same tuple: the tuple
+    # is computed from the COERCED value, exactly as the flush writes it.
+    iso = {"team_id": 7, "timestamp": "2027-01-15T08:00:00"}
+    assert _group(keyer, iso) == ("7", JAN_MONTH)
+    # One month earlier is another group; a pre-epoch instant floors.
+    assert _group(keyer, {"team_id": 7, "timestamp": "2026-12-31T23:59:59"}) == (
+        "7",
+        "683",
+    )
+    assert _group(keyer, {"team_id": 7, "timestamp": -1}) == ("7", "-1")
+
+
+def test_a_missing_or_null_source_is_a_null_component():
+    keyer = GroupKeyer(table_info([IDENTITY_TEAM, MONTH_TIMESTAMP]))
+    assert _group(keyer, {"timestamp": JAN_TS}) == (None, JAN_MONTH)
+    assert _group(keyer, {"team_id": None, "timestamp": None}) == (None, None)
+
+
+def test_a_nested_source_is_read_by_its_path():
+    keyer = GroupKeyer(table_info([IDENTITY_PROPERTIES_TEAM]))
+    assert keyer.fields == ("properties.team_id",)
+    assert _group(keyer, {"properties": {"team_id": 9, "x": 1}}) == ("9",)
+    # The top-level team_id is a different column: not this source.
+    assert _group(keyer, {"team_id": 7, "properties": {"team_id": 9}}) == ("9",)
+    # Absent or null anywhere along the path is a null component.
+    assert _group(keyer, {"team_id": 7}) == (None,)
+    assert _group(keyer, {"properties": None}) == (None,)
+    assert _group(keyer, {"properties": {}}) == (None,)
+    # A parent that is not an object is a malformed source.
+    out = _classify(keyer, b'{"properties": [1, 2]}')
+    assert isinstance(out, PoisonedRecord)
+    assert out.reason == f"{REASON_MALFORMED_PARTITION_SOURCE}:properties.team_id"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b'{"team_id": "7"}',  # a string, never coerced to a long
+        b'{"team_id": 7.5}',
+        b'{"team_id": true}',  # bool IS int in Python; refused explicitly
+        b'{"team_id": %d}' % 2**63,  # past the long column
+        b'{"team_id": {"id": 7}}',
+    ],
+)
+def test_a_malformed_source_is_poison_naming_the_field(payload):
+    keyer = GroupKeyer(table_info([IDENTITY_TEAM]))
+    out = _classify(keyer, payload, key=b"junk", cap=8)
+    assert isinstance(out, PoisonedRecord)
+    assert out.reason == "malformed_partition_source:team_id"
+    assert out.key == b"junk"  # forensics only
+    assert out.value == payload[:8]
+    assert out.value_bytes_original == len(payload)
+
+
+def test_a_malformed_temporal_source_is_poison_naming_the_field():
+    keyer = GroupKeyer(table_info([IDENTITY_TEAM, MONTH_TIMESTAMP]))
+    for raw in (b'"not a date"', b'"2027-01-15T08:00:00+02:00"', b"1e3"):
+        out = _classify(keyer, b'{"team_id": 7, "timestamp": ' + raw + b"}")
+        assert isinstance(out, PoisonedRecord)
+        assert out.reason == "malformed_partition_source:timestamp"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [b"not json", b"\xff\xfe{}", b"[1, 2]", b"42", b'"team_id"', b'{"x": NaN}'],
+)
+def test_a_payload_that_is_not_a_strict_json_object_is_malformed_value(payload):
+    # Every spec parses the value first — the unpartitioned one too.
+    for spec in (None, [IDENTITY_TEAM]):
+        out = _classify(GroupKeyer(table_info(spec)), payload)
+        assert isinstance(out, PoisonedRecord) and out.reason == REASON_MALFORMED_VALUE
+
+
+def test_the_kafka_key_is_never_read():
+    keyer = GroupKeyer(table_info([IDENTITY_TEAM]))
+    payload = b'{"team_id": 7}'
+    groups = {
+        out.group
+        for key in (None, b"7", b"9", b"junk-not-a-team", b"\x00" * 8)
+        for out in [_classify(keyer, payload, key=key)]
+        if isinstance(out, StagedRecord)
+    }
+    assert groups == {("7",)}
 
 
 def test_classify_poison_reasons():
-    codec = TeamKeyCodec.UTF8_DECIMAL
-    out = classify(codec, key=None)
-    assert isinstance(out, PoisonedRecord) and out.reason == REASON_MISSING_KEY
-    out = classify(codec, key=b"not-a-team")
-    assert isinstance(out, PoisonedRecord) and out.reason == REASON_MALFORMED_KEY
-    out = classify(codec, timestamp=(0, 0))  # TIMESTAMP_NOT_AVAILABLE
+    keyer = GroupKeyer(table_info([IDENTITY_TEAM]))
+    out = _classify(keyer, b'{"team_id": 7}', timestamp=(0, 0))  # NOT_AVAILABLE
     assert isinstance(out, PoisonedRecord) and out.reason == REASON_MISSING_TIMESTAMP
-    out = classify(codec, value=None)
+    out = _classify(keyer, None)
     assert isinstance(out, PoisonedRecord) and out.reason == REASON_MISSING_VALUE
     assert out.value is None and out.value_bytes_original == 0
 
 
 def test_classify_out_of_range_offset_and_timestamp():
-    codec = TeamKeyCodec.UTF8_DECIMAL
-    out = classify(codec, offset=-1)
+    keyer = GroupKeyer(table_info([IDENTITY_TEAM]))
+    out = _classify(keyer, b'{"team_id": 7}', offset=-1)
     assert isinstance(out, PoisonedRecord) and out.reason == REASON_INVALID_OFFSET
     # *1000 overflows int64 µs
-    out = classify(codec, timestamp=(1, 10**18))
+    out = _classify(keyer, b'{"team_id": 7}', timestamp=(1, 10**18))
     assert isinstance(out, PoisonedRecord) and out.reason == REASON_INVALID_TIMESTAMP
 
 
-def test_classify_poison_keeps_the_raw_key_and_truncates_the_value():
-    out = classify(TeamKeyCodec.UTF8_DECIMAL, key=b"bad-key", value=b"x" * 100, cap=10)
-    assert isinstance(out, PoisonedRecord)
-    assert out.key == b"bad-key"
-    assert out.value == b"x" * 10
-    assert out.value_bytes_original == 100
-
-
 def test_classify_names_the_FIRST_failing_check():
-    # A tombstone with an undecodable key quarantines as malformed_key.
-    out = classify(TeamKeyCodec.UTF8_DECIMAL, key=b"bad", value=None)
-    assert isinstance(out, PoisonedRecord) and out.reason == REASON_MALFORMED_KEY
+    keyer = GroupKeyer(table_info([IDENTITY_TEAM]))
+    # A tombstone with no timestamp quarantines as missing_timestamp; a
+    # tombstone is missing_value, never a parse error.
+    out = _classify(keyer, None, timestamp=(0, 0))
+    assert isinstance(out, PoisonedRecord) and out.reason == REASON_MISSING_TIMESTAMP
+    out = _classify(keyer, None)
+    assert isinstance(out, PoisonedRecord) and out.reason == REASON_MISSING_VALUE
 
 
 # ==================================================================================
@@ -591,17 +618,7 @@ async def test_claim_recovers_the_previous_owners_leftovers(fake_clock):
     # went away (close = the claim moved; the state stays on the store).
     previous = await manager.open_partition("events", 0)
     await previous.stage.stage_batch([rec(1, 100, 0), rec(1, 200, 1)], now_us=NOW)
-    await previous.stage.persist_prepared(
-        1,
-        0,
-        PreparedRequest(
-            idempotency_key="idem-1",
-            body=b"{}",
-            persisted_at=NOW,
-            topic="events",
-            partition=0,
-        ),
-    )
+    await previous.stage.persist_prepared(("1",), 0, prepared("idem-1", team=1))
     await manager.close_partition("events", 0)
 
     captured = []
@@ -623,8 +640,8 @@ async def test_claim_recovers_the_previous_owners_leftovers(fake_clock):
     (sync,) = captured
     recovery = sync.opened[("events", 0)].recovery
     assert recovery.legacy_markers_collected == 0
-    assert [(p.key.team_id, p.key.first_offset) for p in recovery.pending_prepared] == [
-        (1, 0)
+    assert [(p.key.group, p.key.first_offset) for p in recovery.pending_prepared] == [
+        (("1",), 0)
     ]
     assert recovery.pending_prepared[0].request.idempotency_key == "idem-1"
     # ...and the staged rows are claimable state, not stranded bytes.
@@ -646,13 +663,13 @@ async def test_end_to_end_staged_rows_and_committed_offsets_cover(fake_clock):
 
     produced: dict[tuple[int, int], bytes] = {}  # (partition, offset) -> payload
     for offset in range(20):
-        value = f"row-0-{offset}".encode()
-        fake.feed(keyed_msg(0, offset, team=1 + offset % 3, value=value))
-        produced[(0, offset)] = value
+        m = team_msg(0, offset, team=1 + offset % 3, tag=f"row-0-{offset}")
+        fake.feed(m)
+        produced[(0, offset)] = m.value()
     for offset in range(10):
-        value = f"row-1-{offset}".encode()
-        fake.feed(keyed_msg(1, offset, team=7, value=value))
-        produced[(1, offset)] = value
+        m = team_msg(1, offset, team=7, tag=f"row-1-{offset}")
+        fake.feed(m)
+        produced[(1, offset)] = m.value()
 
     await run_steps(consumer, fake)
 
@@ -664,7 +681,7 @@ async def test_end_to_end_staged_rows_and_committed_offsets_cover(fake_clock):
     assert stats.records_staged == 30
     assert stats.records_poisoned == 0
 
-    # Every produced row is staged, byte-exact, in (team, ts, offset)
+    # Every produced row is staged, byte-exact, in (group, ts, offset)
     # key order; the stats the planner reads reconcile exactly; the
     # offsets/ identity ranges cover the produced range contiguously.
     total_rows = 0
@@ -672,17 +689,17 @@ async def test_end_to_end_staged_rows_and_committed_offsets_cover(fake_clock):
         stage = manager.stage("events", partition)
         ranges = []
         for ks in await stage.iter_key_stats():
-            rows = [(rk, v) async for rk, v in stage.scan_team_rows(ks.team_id)]
+            rows = [(rk, v) async for rk, v in stage.scan_group_rows(ks.group)]
             assert [(rk.timestamp_us, rk.offset) for rk, _ in rows] == sorted(
                 (rk.timestamp_us, rk.offset) for rk, _ in rows
             )
             for rk, value in rows:
                 assert value == produced[(partition, rk.offset)]
-                assert rk.team_id == ks.team_id
+                assert rk.group == ks.group
             assert ks.row_count == len(rows)
             assert ks.staged_bytes == sum(len(v) for _, v in rows)
             total_rows += len(rows)
-            ranges.extend(await stage.read_offsets(ks.team_id))
+            ranges.extend(await stage.read_offsets(ks.group))
         ordered = sorted(ranges, key=lambda r: r.first_offset)
         assert ordered[0].first_offset == 0
         assert max(r.last_offset for r in ordered) == (19 if partition == 0 else 9)
@@ -711,9 +728,9 @@ async def test_error_events_are_counted_and_never_staged_or_committed(fake_clock
 
     fake.feed(
         error_event(0, 0, KafkaError._PARTITION_EOF),
-        keyed_msg(0, 0, team=1, value=b"good"),
+        team_msg(0, 0, team=1, tag="good"),
         error_event(0, 1, KafkaError._TRANSPORT),
-        keyed_msg(0, 1, team=1, value=b"good2"),
+        team_msg(0, 1, team=1, tag="good2"),
     )
     await run_steps(consumer, fake)
 
@@ -740,11 +757,11 @@ async def test_poison_records_quarantine_durably_and_never_block(fake_clock):
     await consumer.start()
 
     fake.feed(
-        keyed_msg(0, 0, team=3, value=b"good-0"),
-        msg(0, 1, key=b"not-a-team", value=b"junk" * 20),  # malformed key, truncated
+        team_msg(0, 0, team=3, tag="good-0"),
+        msg(0, 1, key=b"not-a-team", value=b"junk" * 20),  # not JSON, truncated
         msg(0, 2, key=b"3", ts_ms=None),  # no timestamp
         msg(0, 3, key=b"3", value=None),  # tombstone
-        keyed_msg(0, 4, team=3, value=b"good-4"),
+        team_msg(0, 4, team=3, tag="good-4"),
     )
     await run_steps(consumer, fake)
 
@@ -759,7 +776,7 @@ async def test_poison_records_quarantine_durably_and_never_block(fake_clock):
     assert await team_offsets(stage, 3) == [0, 4]
     poisoned = await stage.scan_poison()
     assert [(p.offset, p.reason) for p in poisoned] == [
-        (1, REASON_MALFORMED_KEY),
+        (1, REASON_MALFORMED_VALUE),
         (2, REASON_MISSING_TIMESTAMP),
         (3, REASON_MISSING_VALUE),
     ]
@@ -778,7 +795,7 @@ async def test_poison_records_quarantine_durably_and_never_block(fake_clock):
         settings=fast_flush_settings(),
     )
     assert [(p.offset, p.reason) for p in await reopened.scan_poison()] == [
-        (1, REASON_MALFORMED_KEY),
+        (1, REASON_MALFORMED_VALUE),
         (2, REASON_MISSING_TIMESTAMP),
         (3, REASON_MISSING_VALUE),
     ]
@@ -787,34 +804,15 @@ async def test_poison_records_quarantine_durably_and_never_block(fake_clock):
 
 
 @component
-async def test_missing_key_quarantines_too(fake_clock):
+async def test_a_keyless_topic_stages_by_the_payloads_partition_tuple(fake_clock):
+    """The Kafka key is never read: keyless records (and records with
+    junk keys) stage under the tuple their PAYLOAD gives; a payload that
+    is not a JSON object, or whose source scalar is malformed,
+    quarantines with the field named; the commit covers all of it."""
     journal: list[tuple] = []
     manager = make_manager(journal)
     fake = FakeConsumer(journal=journal)
     consumer = make_consumer(fake, manager, make_config(), fake_clock)
-    await consumer.start()
-    fake.feed(msg(0, 0, key=None, value=b"orphan"))
-    await run_steps(consumer, fake)
-    stage = manager.stage("events", 0)
-    assert [(p.offset, p.reason) for p in await stage.scan_poison()] == [
-        (0, REASON_MISSING_KEY)
-    ]
-    assert fake.committed_store == {("events", 0): 1}
-    await manager.close()
-
-
-@component
-async def test_value_json_consumes_an_unkeyed_topic(fake_clock):
-    """B4: a topic NOT keyed by team — the team id rides the payload.
-    Keyless records (and records with junk keys — the key is never
-    consulted) stage under their payload's team field; a payload
-    lacking or mistyping the configured field quarantines; the commit
-    covers all of it."""
-    journal: list[tuple] = []
-    manager = make_manager(journal)
-    fake = FakeConsumer(journal=journal)
-    cfg = make_config(team_key_codec=TeamKeyCodec.VALUE_JSON, team_id_field="team_id")
-    consumer = make_consumer(fake, manager, cfg, fake_clock)
     await consumer.start()
 
     fake.feed(
@@ -831,20 +829,141 @@ async def test_value_json_consumes_an_unkeyed_topic(fake_clock):
     assert_commits_follow_acks(journal)
     assert fake.committed_store == {("events", 0): 7}
     stats = consumer.stats()
-    assert stats.records_staged == 4 and stats.records_poisoned == 3
+    assert stats.records_staged == 5 and stats.records_poisoned == 2
     stage = manager.stage("events", 0)
     assert await team_offsets(stage, 7) == [0, 2]
     assert await team_offsets(stage, 9) == [1, 3]
+    # An absent source is a null component, not poison.
+    assert [rk.offset async for rk, _ in stage.scan_group_rows((None,))] == [4]
     assert [(p.offset, p.reason) for p in await stage.scan_poison()] == [
-        (4, REASON_MISSING_TEAM_FIELD),
-        (5, REASON_MALFORMED_TEAM_FIELD),
+        (5, "malformed_partition_source:team_id"),
         (6, REASON_MALFORMED_VALUE),
     ]
     # The staged payload is the raw value bytes — classify parsed the
-    # JSON once to read the team and never rewrote the record (the
-    # flush parses with its own schema logic).
-    rows = [(rk.offset, v) async for rk, v in stage.scan_team_rows(7)]
+    # JSON once to read the tuple and never rewrote the record.
+    rows = [(rk.offset, v) async for rk, v in stage.scan_group_rows(("7",))]
     assert rows[0] == (0, b'{"team_id": 7, "event": "a"}')
+    await manager.close()
+
+
+@component
+async def test_a_spec_refresh_mid_stream_starts_new_groups_and_keeps_the_old(
+    fake_clock,
+):
+    """Past the shape TTL the consumer re-reads the destination: records
+    after the refresh stage under the NEW spec's tuples, the group staged
+    under the old spec stays staged — and the planner still decides it,
+    so it drains by age (the flush's live-spec fanout splits it; pinned
+    in test_flush.py)."""
+    journal: list[tuple] = []
+    manager = make_manager(journal)
+    fake = FakeConsumer(journal=journal)
+    shape = FakeShape(ttl_s=450.0)
+    mono = FakeMonotonic()
+    consumer = make_consumer(
+        fake,
+        manager,
+        make_config(),
+        fake_clock,
+        keyer=GroupKeyer(table_info([IDENTITY_TEAM], spec_id=1)),
+        shape=shape,
+        monotonic=mono,
+    )
+    await consumer.start()
+    payload = team_payload(7, "x")[:-1] + b',"timestamp":%d}' % JAN_TS
+
+    fake.feed(msg(0, 0, key=None, value=payload))
+    await run_steps(consumer, fake, extra=0)
+    assert shape.calls == 0  # inside the TTL: no re-read
+
+    shape.reads.append(table_info([IDENTITY_TEAM, MONTH_TIMESTAMP], spec_id=2))
+    mono.now += 450.0
+    fake.feed(msg(0, 1, key=None, value=payload))
+    await run_steps(consumer, fake, extra=0)
+    assert shape.calls == 1
+    assert consumer.keyer.spec_id == 2
+    assert consumer.keyer.fields == ("team_id", "timestamp_month")
+
+    stage = manager.stage("events", 0)
+    stats = {ks.group: ks for ks in await stage.iter_key_stats()}
+    assert set(stats) == {("7",), ("7", JAN_MONTH)}
+    assert [rk.offset async for rk, _ in stage.scan_group_rows(("7",))] == [0]
+    assert [rk.offset async for rk, _ in stage.scan_group_rows(("7", JAN_MONTH))] == [1]
+    # Both groups are flushable: past the slow-lane deadline the planner
+    # decides the old group exactly like the new one.
+    knobs = PlannerKnobs(min_flush_bytes=1)
+    later = NOW + knobs.slow_lane_deadline_s * 1_000_000
+    decided = {d.group for d in plan_flush(stats.values(), later, knobs)}
+    assert decided == {("7",), ("7", JAN_MONTH)}
+    assert fake.committed_store == {("events", 0): 2}
+    await manager.close()
+
+
+@component
+async def test_a_failed_shape_reread_keeps_the_old_keyer(fake_clock, caplog):
+    journal: list[tuple] = []
+    manager = make_manager(journal)
+    fake = FakeConsumer(journal=journal)
+    shape = FakeShape(ttl_s=450.0)
+    mono = FakeMonotonic()
+    keyer = GroupKeyer(table_info([IDENTITY_TEAM]))
+    consumer = make_consumer(
+        fake,
+        manager,
+        make_config(),
+        fake_clock,
+        keyer=keyer,
+        shape=shape,
+        monotonic=mono,
+    )
+    await consumer.start()
+    await consumer._step()  # arms the first re-read one TTL out
+    shape.reads.append(RuntimeError("hoglake unreachable"))
+    mono.now += 451.0
+    fake.feed(team_msg(0, 0, team=7))
+    with caplog.at_level(logging.WARNING, logger="millrace.consumer"):
+        await run_steps(consumer, fake, extra=0)
+    assert shape.calls == 1
+    assert consumer.keyer is keyer
+    assert "keeps grouping under partition spec 1" in caplog.text
+    assert await team_offsets(manager.stage("events", 0), 7) == [0]
+    # The next attempt waits a full TTL: no retry storm against hoglake.
+    await consumer._step()
+    assert shape.calls == 1
+    await manager.close()
+
+
+@component
+async def test_a_recreated_table_at_reread_halts_the_loop_without_committing(
+    fake_clock,
+):
+    """``ShapeReader.read`` refuses another incarnation with
+    ``FlushHalted("table_recreated")``: that is not a transient read
+    failure, so the consume loop halts BEFORE polling — nothing further
+    is staged or committed against a table the pipeline no longer
+    writes (main.py maps the halt to exit 3)."""
+    journal: list[tuple] = []
+    manager = make_manager(journal)
+    fake = FakeConsumer(journal=journal)
+    shape = FakeShape(ttl_s=450.0)
+    mono = FakeMonotonic()
+    consumer = make_consumer(
+        fake, manager, make_config(), fake_clock, shape=shape, monotonic=mono
+    )
+    await consumer.start()
+    fake.feed(team_msg(0, 0, team=7))
+    await run_steps(consumer, fake, extra=0)
+    assert fake.committed_store == {("events", 0): 1}
+
+    shape.reads.append(FlushHalted("table_recreated", "another incarnation"))
+    mono.now += 450.0
+    fake.feed(team_msg(0, 1, team=7))
+    consume_calls = fake.consume_calls
+    with pytest.raises(FlushHalted, match="table_recreated"):
+        await consumer._step()
+    assert fake.consume_calls == consume_calls  # never polled
+    assert fake.committed_store == {("events", 0): 1}
+    assert await team_offsets(manager.stage("events", 0), 7) == [0]
     await manager.close()
 
 
@@ -857,16 +976,16 @@ async def test_poison_flood_halts_loudly_without_committing_past_it(fake_clock):
     consumer = make_consumer(fake, manager, cfg, fake_clock)
     await consumer.start()
 
-    fake.feed(keyed_msg(0, 0, team=1, value=b"fine"))
+    fake.feed(team_msg(0, 0, team=1, tag="fine"))
     await run_steps(consumer, fake)
     assert fake.committed_store == {("events", 0): 1}
 
     # A flood: three bad records against a limit of two. The cycle
     # raises BEFORE anything in it is staged or committed.
     fake.feed(
-        msg(0, 1, key=b"bad"),
-        msg(0, 2, key=b"bad"),
-        msg(0, 3, key=b"bad"),
+        msg(0, 1, key=b"bad", value=b"not json"),
+        msg(0, 2, key=b"bad", value=b"not json"),
+        msg(0, 3, key=b"bad", value=b"not json"),
     )
     with pytest.raises(PoisonLimitExceeded, match="MILLRACE_POISON_MAX_RECORDS=2"):
         await consumer._step()
@@ -895,7 +1014,7 @@ async def test_cooperative_assignment_opens_and_recovers_stages(fake_clock):
     assert manager.partitions() == ()
 
     # The group hands us partitions 0 and 1; a record rides the same poll.
-    fake.feed(keyed_msg(0, 0, team=1, value=b"first"))
+    fake.feed(team_msg(0, 0, team=1, tag="first"))
     fake.script_rebalance(assign=[0, 1])
     await consumer._step()
 
@@ -924,14 +1043,14 @@ async def test_revoke_closes_cleanly_and_loses_nothing(fake_clock):
     fake.script_rebalance(assign=[0, 1])
     await consumer._step()
 
-    fake.feed(*[keyed_msg(0, o, team=1, value=f"a{o}".encode()) for o in range(3)])
-    fake.feed(*[keyed_msg(1, o, team=2, value=f"b{o}".encode()) for o in range(2)])
+    fake.feed(*[team_msg(0, o, team=1, tag=f"a{o}") for o in range(3)])
+    fake.feed(*[team_msg(1, o, team=2, tag=f"b{o}") for o in range(2)])
     await run_steps(consumer, fake)
     assert fake.committed_store == {("events", 0): 3, ("events", 1): 2}
     stage0 = manager.stage("events", 0)
 
     # Revoke 0 while two more of its records sit in the fetch buffer.
-    fake.feed(*[keyed_msg(0, o, team=1, value=f"a{o}".encode()) for o in (3, 4)])
+    fake.feed(*[team_msg(0, o, team=1, tag=f"a{o}") for o in (3, 4)])
     fake.script_rebalance(revoke=[0])
     await consumer._step()
 
@@ -988,11 +1107,11 @@ async def test_messages_delivered_with_a_same_poll_revoke_are_skipped(fake_clock
     await consumer.start()
     fake.script_rebalance(assign=[0])
     await consumer._step()
-    fake.feed(*[keyed_msg(0, o, team=1) for o in range(3)])
+    fake.feed(*[team_msg(0, o, team=1) for o in range(3)])
     await run_steps(consumer, fake)
     assert fake.committed_store == {("events", 0): 3}
 
-    fake.feed(*[keyed_msg(0, o, team=1) for o in (3, 4)])
+    fake.feed(*[team_msg(0, o, team=1) for o in (3, 4)])
     fake.script_rebalance(revoke=[0], after_delivery=True)
     await consumer._step()
 
@@ -1017,7 +1136,7 @@ async def test_lost_partitions_close_like_revoked_ones(fake_clock):
     await consumer.start()
     fake.script_rebalance(assign=[0])
     await consumer._step()
-    fake.feed(keyed_msg(0, 0, team=1))
+    fake.feed(team_msg(0, 0, team=1))
     await run_steps(consumer, fake)
     assert fake.committed_store == {("events", 0): 1}
 
@@ -1038,7 +1157,7 @@ async def test_commit_retries_then_succeeds(fake_clock):
     consumer = make_consumer(fake, manager, make_config(), fake_clock, sleeper)
     await consumer.start()
 
-    fake.feed(*[keyed_msg(0, o, team=1) for o in range(3)])
+    fake.feed(*[team_msg(0, o, team=1) for o in range(3)])
     fake.fail_next_commits(2)
     await run_steps(consumer, fake)
 
@@ -1061,7 +1180,7 @@ async def test_commit_exhaustion_raises_without_committing(fake_clock):
     consumer = make_consumer(fake, manager, make_config(), fake_clock, sleeper)
     await consumer.start()
 
-    fake.feed(*[keyed_msg(0, o, team=1) for o in range(3)])
+    fake.feed(*[team_msg(0, o, team=1) for o in range(3)])
     fake.fail_next_commits(3)
     with pytest.raises(KafkaException):
         await consumer._step()
@@ -1084,7 +1203,7 @@ async def test_a_failed_batch_commits_nothing(fake_clock):
     fake = FakeConsumer(journal=journal)
     consumer = make_consumer(fake, manager, make_config(), fake_clock)
     await consumer.start()
-    fake.feed(keyed_msg(0, 0, team=1))
+    fake.feed(team_msg(0, 0, team=1))
 
     # Sabotage: the stage is closed underneath the loop.
     await manager.stage("events", 0).close()
@@ -1116,7 +1235,7 @@ async def test_a_fenced_partition_closes_locally_and_halts_distinctly(fake_clock
         fake, manager, make_config(static_partitions=(0, 1)), fake_clock
     )
     await consumer.start()
-    fake.feed(keyed_msg(0, 0, team=1), keyed_msg(1, 0, team=2))
+    fake.feed(team_msg(0, 0, team=1), team_msg(1, 0, team=2))
     await run_steps(consumer, fake)
     assert fake.committed_store == {("events", 0): 1, ("events", 1): 1}
 
@@ -1124,7 +1243,7 @@ async def test_a_fenced_partition_closes_locally_and_halts_distinctly(fake_clock
     # the open through; the OLD writer — us — is fenced from here).
     new_owner = await DbBuilder(manager.path_for("events", 0), manager.store).build()
     try:
-        fake.feed(keyed_msg(0, 1, team=1), keyed_msg(1, 1, team=2))
+        fake.feed(team_msg(0, 1, team=1), team_msg(1, 1, team=2))
         with pytest.raises(ConsumerFencedError) as excinfo:
             await consumer._step()
         assert excinfo.value.partitions == (("events", 0),)
@@ -1160,7 +1279,7 @@ async def test_a_non_fenced_closed_stage_error_is_not_the_fenced_path(fake_clock
     fake = FakeConsumer(journal=journal)
     consumer = make_consumer(fake, manager, make_config(), fake_clock)
     await consumer.start()
-    fake.feed(keyed_msg(0, 0, team=1))
+    fake.feed(team_msg(0, 0, team=1))
 
     stage = manager.stage("events", 0)
 
@@ -1223,7 +1342,7 @@ async def test_partitions_stage_concurrently_within_one_poll(fake_clock):
         stage = manager.stage(*key)
         stage.stage_batch = make_spy(key, stage.stage_batch)  # type: ignore[method-assign]
 
-    fake.feed(keyed_msg(0, 0, team=1), keyed_msg(1, 0, team=2))
+    fake.feed(team_msg(0, 0, team=1), team_msg(1, 0, team=2))
     await consumer._step()
 
     # Both partitions' batches were in flight together: every start
@@ -1252,12 +1371,14 @@ async def test_the_byte_cap_clamps_the_next_polls_batch_size(fake_clock):
     consumer = make_consumer(fake, manager, cfg, fake_clock)
     await consumer.start()
 
-    # 20 records of 101 observed bytes each (100 value + 1 key):
-    # avg 101, so every later poll requests 1000 // 101 == 9.
-    fake.feed(*[keyed_msg(0, o, team=1, value=b"v" * 100) for o in range(20)])
+    # 20 records of 121 observed bytes each (a 120-byte JSON value + a
+    # 1-byte key): avg 121, so every later poll requests 1000 // 121 == 8.
+    messages = [team_msg(0, o, team=1, tag="v" * 100) for o in range(20)]
+    assert {len(m.value() or b"") + len(m.key() or b"") for m in messages} == {121}
+    fake.feed(*messages)
     await run_steps(consumer, fake)
     assert fake.requested_batch_sizes[0] == 1000
-    assert fake.requested_batch_sizes[1:] and set(fake.requested_batch_sizes[1:]) == {9}
+    assert fake.requested_batch_sizes[1:] and set(fake.requested_batch_sizes[1:]) == {8}
     assert fake.committed_store == {("events", 0): 20}
     assert_commits_follow_acks(journal)
     await manager.close()
@@ -1278,10 +1399,10 @@ async def test_the_byte_cap_never_stalls_an_oversized_record(fake_clock):
     consumer = make_consumer(fake, manager, cfg, fake_clock)
     await consumer.start()
 
-    # 8 records of 101 observed bytes: poll 1 takes 5 (the record cap),
-    # then avg 101 > the 10-byte budget, so every later poll asks for
+    # 8 records of 121 observed bytes: poll 1 takes 5 (the record cap),
+    # then avg 121 > the 10-byte budget, so every later poll asks for
     # exactly 1.
-    fake.feed(*[keyed_msg(0, o, team=1, value=b"v" * 100) for o in range(8)])
+    fake.feed(*[team_msg(0, o, team=1, tag="v" * 100) for o in range(8)])
     for _ in range(8):
         await consumer._step()
     assert fake.requested_batch_sizes[:2] == [5, 1]
@@ -1303,7 +1424,7 @@ async def test_graceful_shutdown_stops_polling_with_offsets_committed(fake_clock
     manager = make_manager(journal)
     fake = FakeConsumer(journal=journal)
     consumer = make_consumer(fake, manager, make_config(poll_timeout_ms=20), fake_clock)
-    fake.feed(*[keyed_msg(0, o, team=1, value=f"r{o}".encode()) for o in range(5)])
+    fake.feed(*[team_msg(0, o, team=1, tag=f"r{o}") for o in range(5)])
 
     task = asyncio.create_task(consumer.run())
     for _ in range(500):
@@ -1353,7 +1474,10 @@ async def test_run_propagates_a_fatal_error_but_still_closes_kafka(fake_clock):
     fake = FakeConsumer(journal=journal)
     cfg = make_config(poison=PoisonConfig(max_records_per_run=1, value_max_bytes=64))
     consumer = make_consumer(fake, manager, cfg, fake_clock)
-    fake.feed(msg(0, 0, key=b"bad"), msg(0, 1, key=b"bad"))
+    fake.feed(
+        msg(0, 0, key=b"bad", value=b"not json"),
+        msg(0, 1, key=b"bad", value=b"not json"),
+    )
     with pytest.raises(PoisonLimitExceeded):
         await consumer.run()
     assert fake.closed
@@ -1372,10 +1496,10 @@ async def test_stats_snapshot_counts_the_run(fake_clock):
     consumer = make_consumer(fake, manager, make_config(), fake_clock)
     await consumer.start()
     fake.feed(
-        keyed_msg(0, 0, team=1),
-        msg(0, 1, key=b"bad"),
+        team_msg(0, 0, team=1),
+        msg(0, 1, key=b"bad", value=b"not json"),
         error_event(0, 2, KafkaError._PARTITION_EOF),
-        keyed_msg(0, 2, team=1),
+        team_msg(0, 2, team=1),
     )
     await run_steps(consumer, fake)
     assert consumer.stats() == ConsumerStats(

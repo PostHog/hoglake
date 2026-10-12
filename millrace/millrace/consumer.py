@@ -3,19 +3,28 @@ problem's consume loop).
 
 Poll → stage → commit: every polled record is staged through
 :meth:`millrace.stage.PartitionStage.stage_batch` — under
-``rows/(team_id, event_ts, offset)`` for well-formed records, under
+``rows/(group, record_ts, offset)`` for well-formed records, under
 ``poison/<offset>`` for records that can never become a row — and the
 partition's Kafka offset commits STRICTLY after the batch's remote
 durability (rows-then-offset, AGENT.md invariant 10 restated for a
 staging area). The consume loop never waits on the flush loop: staging
 is the buffer. There is no in-memory accumulation — every consumed
 record is either durable-and-committed or, on a crash, replayed from the
-last commit (at-least-once by construction). The ``team_id`` a record
-stages under comes from the configured codec
-(``MILLRACE_TEAM_KEY_CODEC``): the message key (``utf8-decimal`` /
-``be64``, team-keyed topics) or a field of the JSON payload
-(``value-json:<field>``, topics not keyed by team — every partition's
-instance can then hold every team; :func:`classify_message`).
+last commit (at-least-once by construction).
+
+The ``group`` a record stages under is the destination table's
+PARTITION TUPLE for it (:class:`millrace.grouping.GroupKeyer`): the
+value is parsed as a JSON object once, each live-spec field's source
+scalar is read by path, coerced, transformed and rendered as the wire
+string the commit's ``partition_values`` carry. The Kafka message key is
+never read. The keyer is built from the table shape the flusher resolved
+at startup (same pinned incarnation) and is re-read on the flusher's TTL
+(a quarter of the catalog's snapshot retention, 450 s when the catalog
+reports none) on the consumer's own schedule; a failed re-read logs and
+keeps the old keyer. A stale keyer only groups under an older spec — the
+flush fans every window out by the LIVE spec, so files stay correct — and
+a spec change therefore just starts new groups while the old ones drain
+by age or the slow lane (:func:`classify_message`).
 
 One poll stages its partitions CONCURRENTLY: every partition's
 ``stage_batch`` (one WAL write + durability wait each) is issued as its
@@ -85,7 +94,8 @@ Poison pills are quarantined, counted and logged, never silently
 dropped: they land in the same durable write batch as the cycle's staged
 rows, the commit covers them, and the loop moves on. A FLOOD of poison
 (records quarantined this run exceeding the configured bound) means a
-misconfigured key codec or a producer bug, and halts the loop loudly —
+producer bug or a payload that does not match the destination's
+partition spec, and halts the loop loudly —
 before committing past the flood — via :class:`PoisonLimitExceeded`.
 
 Async discipline: the confluent-kafka Consumer is single-threaded
@@ -106,9 +116,9 @@ only the Kafka side.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import threading
+import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -125,10 +135,14 @@ from confluent_kafka import (
 from confluent_kafka import (
     Consumer as _KafkaConsumer,
 )
+from pyhoglake import TableInfo
 from slatedb.uniffi import CloseReason
 from slatedb.uniffi import Error as SlateError
 
-from .config import AssignmentMode, Config, TeamKeyCodec
+from .coerce import DecodeError, load_json_object
+from .config import AssignmentMode, Config
+from .flush import FlushHalted
+from .grouping import GroupKeyer, PartitionSourceError
 from .stage import PoisonedRecord, StagedRecord, StageManager
 
 log = logging.getLogger(__name__)
@@ -138,23 +152,19 @@ _T = TypeVar("_T")
 _MICROS_PER_MILLI: Final = 1_000
 _INT64_MIN: Final = -(1 << 63)
 _INT64_MAX: Final = (1 << 63) - 1
-_UINT64_MAX: Final = (1 << 64) - 1
 
 # The bounded poison rejection vocabulary (the keyspace poison envelope
 # stores these strings).
-REASON_MISSING_KEY: Final = "missing_key"
-REASON_MALFORMED_KEY: Final = "malformed_key"
 REASON_INVALID_OFFSET: Final = "invalid_offset"
 REASON_MISSING_TIMESTAMP: Final = "missing_timestamp"
 REASON_INVALID_TIMESTAMP: Final = "invalid_timestamp"
 REASON_MISSING_VALUE: Final = "missing_value"
-# The value-json codec's additions: the payload is not a JSON object,
-# the configured team field is absent/null in it, or the field's value
-# is not a u64 integer (a string, a float, a bool, negative, > u64 max —
-# mistypes are never coerced: coercion hides producer bugs).
+# The payload is not a strict JSON object (the keyer has nothing to read).
 REASON_MALFORMED_VALUE: Final = "malformed_value"
-REASON_MISSING_TEAM_FIELD: Final = "missing_team_field"
-REASON_MALFORMED_TEAM_FIELD: Final = "malformed_team_field"
+# A partition source scalar is the wrong JSON type, uncoercible to its
+# column, or untransformable. The stored reason names the field:
+# ``malformed_partition_source:<dotted path>``.
+REASON_MALFORMED_PARTITION_SOURCE: Final = "malformed_partition_source"
 
 _COMMIT_MAX_ATTEMPTS: Final = 3
 _COMMIT_BASE_DELAY_S: Final = 0.5
@@ -172,7 +182,8 @@ _OFFSET_STORAGE_WARMUP_TIMEOUT_S: Final = 5.0
 
 class PoisonLimitExceeded(Exception):
     """The quarantine outgrew its bound. A flood of unstageable records
-    means a misconfigured key codec or a producer bug, and committing
+    means a producer bug or payloads that do not match the destination's
+    partition spec, and committing
     past it would hide the damage — so the loop halts loudly WITHOUT
     committing past the flood, and the restart replays it and trips
     again until the cause is fixed."""
@@ -256,110 +267,31 @@ class KafkaConsumerLike(Protocol):
     def close(self) -> None: ...
 
 
-def decode_team_key(codec: TeamKeyCodec, raw: bytes) -> int:
-    """Decode a Kafka message key to ``team_id`` under the configured
-    codec. Raises ValueError naming the codec and the problem; the
-    caller quarantines. :attr:`TeamKeyCodec.VALUE_JSON` has no key
-    decoding — the team id comes from the payload
-    (:func:`decode_team_value`) — and raises here."""
-    if codec is TeamKeyCodec.UTF8_DECIMAL:
-        try:
-            text = raw.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise ValueError(f"utf8-decimal team key is not UTF-8: {exc}") from exc
-        # int() alone would accept whitespace, signs and underscores.
-        if not text or any(c < "0" or c > "9" for c in text):
-            raise ValueError(f"utf8-decimal team key is not decimal: {text!r}")
-        value = int(text)
-        if value > _UINT64_MAX:
-            raise ValueError(f"team_id {value} exceeds the u64 key space")
-        return value
-    if codec is TeamKeyCodec.BE64:
-        if len(raw) != 8:
-            raise ValueError(f"be64 team key must be 8 bytes, got {len(raw)}")
-        return int.from_bytes(raw, "big")
-    raise ValueError(f"unsupported team key codec: {codec!r}")
-
-
-class TeamFieldError(ValueError):
-    """A ``value-json`` refusal, carrying the bounded quarantine reason
-    for the poison envelope (the detail message is for the logs)."""
-
-    def __init__(self, reason: str, detail: str) -> None:
-        self.reason = reason
-        super().__init__(detail)
-
-
-def decode_team_value(value: bytes, field: str) -> int:
-    """The ``value-json`` codec: parse the payload JSON ONCE and read the
-    team id from the top-level ``field``.
-
-    Raises :class:`TeamFieldError` (a ValueError) carrying the quarantine
-    reason: ``malformed_value`` (not JSON, or JSON that is not an
-    object), ``missing_team_field`` (the field is absent or null — the
-    operator's misconfigured-field flood), ``malformed_team_field``
-    (present but not a u64 integer; ``bool`` IS ``int`` in Python and is
-    excluded explicitly, and floats/strings are never coerced — coercion
-    hides producer bugs).
-    """
-    try:
-        parsed: Any = json.loads(value)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise TeamFieldError(
-            REASON_MALFORMED_VALUE, f"value-json payload is not JSON: {exc}"
-        ) from exc
-    if not isinstance(parsed, dict):
-        raise TeamFieldError(
-            REASON_MALFORMED_VALUE,
-            f"value-json payload is {type(parsed).__name__}, not a JSON object",
-        )
-    raw = parsed.get(field)
-    if raw is None:
-        raise TeamFieldError(
-            REASON_MISSING_TEAM_FIELD,
-            f"value-json payload lacks the team field {field!r}",
-        )
-    if type(raw) is not int:
-        raise TeamFieldError(
-            REASON_MALFORMED_TEAM_FIELD,
-            f"value-json team field {field!r} is {type(raw).__name__}, not an integer",
-        )
-    if raw < 0 or raw > _UINT64_MAX:
-        raise TeamFieldError(
-            REASON_MALFORMED_TEAM_FIELD,
-            f"value-json team field {field!r} value {raw} is outside u64",
-        )
-    return raw
-
-
 def classify_message(
-    codec: TeamKeyCodec,
+    keyer: GroupKeyer,
     *,
     offset: int,
     key: bytes | None,
     value: bytes | None,
     timestamp: tuple[int, int],
     poison_value_max_bytes: int,
-    value_field: str | None = None,
 ) -> StagedRecord | PoisonedRecord:
-    """One consumed record's fields → the record to stage, or the poison
-    quarantine entry.
+    """One consumed record's fields → the record to stage under its
+    partition tuple, or the poison quarantine entry.
 
     TOTAL over record content — a malformed record routes to the
     quarantine with a reason (the first failing check names it), so the
     loop never wedges on one record and never silently drops one. A
     poison entry's value is truncated to ``poison_value_max_bytes`` with
-    the original length recorded. ``timestamp`` is the Kafka ``(type,
-    milliseconds)`` pair; TIMESTAMP_NOT_AVAILABLE can never key a row, so
-    it quarantines.
+    the original length recorded; ``key`` is carried into the envelope
+    for forensics only (the Kafka key is never read for staging).
+    ``timestamp`` is the Kafka ``(type, milliseconds)`` pair;
+    TIMESTAMP_NOT_AVAILABLE can never key a row, so it quarantines.
 
-    The team extraction follows the codec: the keyed codecs read the
-    message key (a missing key is poison); ``value-json`` ignores the
-    key entirely and reads ``value_field`` from the payload's JSON
-    (parsed once), so a topic not keyed by team stages fine — and a
-    payload lacking or mistyping the field is the poison. A VALUE_JSON
-    codec without ``value_field`` is a configuration bug (Config refuses
-    the pair at construction) and raises rather than quarantining.
+    The value is parsed ONCE as a strict JSON object (not an object →
+    ``malformed_value``) and the keyer extracts the tuple from it; a
+    malformed partition source scalar quarantines with the reason
+    ``malformed_partition_source:<field path>``.
     """
 
     def poison(reason: str) -> PoisonedRecord:
@@ -374,17 +306,6 @@ def classify_message(
 
     if offset < 0 or offset > _INT64_MAX:
         return poison(REASON_INVALID_OFFSET)
-    keyed_team_id: int | None = None
-    if codec is TeamKeyCodec.VALUE_JSON:
-        if not value_field:
-            raise ValueError("classify_message: value-json codec requires value_field")
-    elif key is None:
-        return poison(REASON_MISSING_KEY)
-    else:
-        try:
-            keyed_team_id = decode_team_key(codec, key)
-        except ValueError:
-            return poison(REASON_MALFORMED_KEY)
     ts_type, ts_ms = timestamp
     if ts_type == TIMESTAMP_NOT_AVAILABLE:
         return poison(REASON_MISSING_TIMESTAMP)
@@ -393,19 +314,28 @@ def classify_message(
         return poison(REASON_INVALID_TIMESTAMP)
     if value is None:
         return poison(REASON_MISSING_VALUE)
-    team_id: int
-    if codec is TeamKeyCodec.VALUE_JSON:
-        assert value_field is not None  # the same check above
-        try:
-            team_id = decode_team_value(value, value_field)
-        except TeamFieldError as exc:
-            return poison(exc.reason)
-    else:
-        assert keyed_team_id is not None  # the key path returned otherwise
-        team_id = keyed_team_id
+    try:
+        doc = load_json_object(value)
+    except DecodeError:
+        return poison(REASON_MALFORMED_VALUE)
+    try:
+        group = keyer.group_for(doc)
+    except PartitionSourceError as exc:
+        return poison(f"{REASON_MALFORMED_PARTITION_SOURCE}:{exc.path}")
     return StagedRecord(
-        team_id=team_id, event_ts_us=event_ts_us, offset=offset, payload=value
+        group=group, event_ts_us=event_ts_us, offset=offset, payload=value
     )
+
+
+class ShapeSource(Protocol):
+    """The destination shape the consumer re-reads to refresh its keyer
+    (``flush.ShapeReader`` in production): ``read`` is the
+    ``totals=false`` identity read pinned to the startup incarnation,
+    ``ttl_s`` the re-read cadence. Both block (pyhoglake I/O) and run off
+    the asyncio loop."""
+
+    def read(self) -> TableInfo: ...
+    def ttl_s(self) -> float: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -473,6 +403,15 @@ class MillraceConsumer:
     stages open/recover and close with the assignment
     (:meth:`StageManager.sync_assignment`).
 
+    ``keyer`` maps a payload to its partition tuple (the destination's
+    shape at startup). ``shape``, when given, is re-read every
+    ``shape.ttl_s()`` seconds of the injected ``monotonic`` clock — on
+    the consume loop's own schedule, before a poll's records are
+    classified — and a fresh keyer replaces the old one; a failed
+    re-read (or a shape the keyer refuses) logs and keeps the old keyer
+    (a stale keyer only groups under an older spec; the flush's fanout
+    by the live spec keeps files correct).
+
     ``now_us`` is the injected clock for staging timestamps; ``sleep``
     backs the commit retry ladder (both injectable so tests never
     sleep).
@@ -484,12 +423,20 @@ class MillraceConsumer:
         stages: StageManager,
         config: Config,
         *,
+        keyer: GroupKeyer,
         now_us: Callable[[], int],
+        shape: ShapeSource | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self._kafka = kafka
         self._stages = stages
         self._cfg = config
+        self._keyer = keyer
+        self._shape = shape
+        self._monotonic = monotonic
+        self._next_shape_read: float | None = None
+        self._shape_ttl_s: float | None = None
         self._now_us = now_us
         self._sleep = sleep
         # librdkafka's Consumer is single-threaded: EVERY call (and every
@@ -619,6 +566,11 @@ class MillraceConsumer:
         """The last successfully committed offset per partition this run."""
         return dict(self._committed)
 
+    @property
+    def keyer(self) -> GroupKeyer:
+        """The keyer currently grouping records."""
+        return self._keyer
+
     def stats(self) -> ConsumerStats:
         """A snapshot of the run's counters."""
         return ConsumerStats(
@@ -726,6 +678,7 @@ class MillraceConsumer:
         we got. The floor is 1: a record larger than the whole budget
         still flows, one per poll. The first poll has no observation and
         polls up to the record cap."""
+        await self._maybe_refresh_keyer()
         num_messages = self._cfg.consume_batch_size
         if self._observed_records:
             avg = max(1, self._observed_bytes // self._observed_records)
@@ -743,6 +696,71 @@ class MillraceConsumer:
         if msgs:
             self._messages_consumed += len(msgs)
             await self._stage_and_commit(msgs)
+
+    async def _maybe_refresh_keyer(self) -> None:
+        """Re-read the destination shape once its TTL has passed and swap
+        in a fresh keyer. Blocking reads run on the default executor, off
+        the asyncio loop and off the librdkafka worker. A transient
+        failure is not fatal: the old keyer keeps grouping (under an older
+        spec, at worst — the flush's live-spec fanout is the correctness
+        backstop), and the next attempt waits one more TTL. A
+        :class:`~millrace.flush.FlushHalted` from the read
+        (``table_recreated``: the name now resolves to another
+        incarnation; ``server_capability``) is NOT transient and
+        propagates: the loop halts before polling, so nothing more is
+        staged or committed against a table the pipeline no longer
+        writes (main.py maps it to exit 3)."""
+        shape = self._shape
+        if shape is None:
+            return
+        loop = asyncio.get_running_loop()
+        now = self._monotonic()
+        if self._next_shape_read is None:
+            # First step: the keyer was built from a fresh read, so the
+            # first re-read is one TTL out.
+            try:
+                self._shape_ttl_s = await loop.run_in_executor(None, shape.ttl_s)
+            except Exception:
+                log.warning(
+                    "reading the shape TTL failed; retrying the keyer refresh "
+                    "next poll",
+                    exc_info=True,
+                )
+                return
+            self._next_shape_read = now + self._shape_ttl_s
+            return
+        if now < self._next_shape_read:
+            return
+        try:
+            info = await loop.run_in_executor(None, shape.read)
+            keyer = GroupKeyer(info)
+            self._shape_ttl_s = await loop.run_in_executor(None, shape.ttl_s)
+        except FlushHalted:
+            raise
+        except Exception:
+            log.warning(
+                "destination shape re-read failed; the consumer keeps grouping "
+                "under partition spec %s (the flush's live-spec fanout keeps "
+                "files correct)",
+                self._keyer.spec_id,
+                exc_info=True,
+            )
+        else:
+            if (
+                keyer.spec_id != self._keyer.spec_id
+                or keyer.fields != self._keyer.fields
+            ):
+                log.info(
+                    "partition spec changed (%s → %s, fields %s): new records "
+                    "stage under the new tuples; existing groups drain by age "
+                    "or the slow lane",
+                    self._keyer.spec_id,
+                    keyer.spec_id,
+                    list(keyer.fields),
+                )
+            self._keyer = keyer
+        assert self._shape_ttl_s is not None
+        self._next_shape_read = self._monotonic() + self._shape_ttl_s
 
     async def _apply_assignment_events(self) -> None:
         """Reconcile the open stages with the consumer assignment after
@@ -827,13 +845,12 @@ class MillraceConsumer:
                 continue
             raw_key, raw_value = msg.key(), msg.value()
             outcome = classify_message(
-                self._cfg.team_key_codec,
+                self._keyer,
                 offset=offset,
                 key=raw_key,
                 value=raw_value,
                 timestamp=msg.timestamp(),
                 poison_value_max_bytes=self._cfg.poison.value_max_bytes,
-                value_field=self._cfg.team_id_field,
             )
             # The byte cap's observation (key + value bytes per
             # classified record — the in-memory shape the cap guards).
@@ -867,9 +884,9 @@ class MillraceConsumer:
                 f"{self._poisoned_total + cycle_poison} quarantined records "
                 f"this run would exceed "
                 f"MILLRACE_POISON_MAX_RECORDS={self._cfg.poison.max_records_per_run}; "
-                f"a flood of unstageable records means a misconfigured team "
-                f"key codec or a producer bug — halting WITHOUT committing "
-                f"past the flood"
+                f"a flood of unstageable records means a producer bug or "
+                f"payloads that do not match the destination's partition "
+                f"spec — halting WITHOUT committing past the flood"
             )
 
         now_us = self._now_us()

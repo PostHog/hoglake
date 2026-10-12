@@ -1,8 +1,9 @@
 """Environment-driven configuration, validated at startup.
 
 Fail-fast at boot (docs/kafka-ingestion.md §Deployment): the catalog,
-table and incarnation are resolved and mismatches refused before any
-consume begins; the junk ``event_time`` policy (clamp vs quarantine) is
+namespace and table are resolved before any consume begins and the
+table's incarnation (``table_uuid``) is pinned there — a later change
+halts the flush (``table_recreated``); the junk ``event_time`` policy (clamp vs quarantine) is
 config, validated here. One process = one topic → one table.
 
 Every knob is a ``MILLRACE_*`` environment variable; every validation
@@ -23,17 +24,16 @@ Knobs
 | ``MILLRACE_KAFKA_MAX_PARTITION_FETCH_BYTES`` | 33554432 (32 MiB) | librdkafka ``max.partition.fetch.bytes`` — per-partition fetch response cap. The 1 MiB library default capped millpond's hot partition at ~50 MB/s (dozens of serialized fetch round trips per poll); the whale shape is ~55 MB/s, i.e. ~25 MB per hot partition per 500 ms poll, so one response must hold a poll's worth with headroom |
 | ``MILLRACE_KAFKA_FETCH_MAX_BYTES`` | 268435456 (256 MiB) | librdkafka ``fetch.max.bytes`` — the per-fetch aggregate across the pod's partitions. Must be ≥ the per-partition cap (one hot partition's response must fit) and cover a poll's aggregate when several partitions run hot at once |
 | ``MILLRACE_KAFKA_QUEUED_MAX_MESSAGES_KBYTES`` | 262144 (256 MiB) | librdkafka ``queued.max.messages.kbytes`` — the local fetch queue. Sized at ~5 s of a 50 MB/s pod inflow so a staging-latency spike doesn't stall fetches; past it librdkafka throttles fetches — the only fetch-side throttle there is (nothing pauses the consumer downstream; the staging gauges and alerts carry that job) |
-| ``MILLRACE_TEAM_KEY_CODEC`` | ``utf8-decimal`` | how a record's ``team_id`` is extracted: ``utf8-decimal`` (the key is ``b"12345"``) or ``be64`` (the key is the 8-byte big-endian unsigned) for team-keyed topics, or ``value-json:<field>`` (e.g. ``value-json:team_id``) reading a top-level field of the JSON payload for topics NOT keyed by team — then every partition's instance can hold every team, and a team spread over K partitions flushes up to K files per window (docs/kafka-ingestion.md §Staging layout) |
 | ``MILLRACE_CATALOG`` / ``MILLRACE_NAMESPACE`` / ``MILLRACE_TABLE`` | required | the one destination table's identity |
 | ``MILLRACE_STAGE_URL`` | required | staging root: ``s3://bucket/millrace``, ``file:///path`` or ``memory:///`` (tests). One SlateDB instance per claimed partition lives at ``<base>/<topic>/<partition>`` |
 | ``MILLRACE_TARGET_OUTPUT_BYTES`` | 500 MiB | planner size trigger — the estimated OUTPUT (parquet) size, compression roughly accounted (docs/kafka-ingestion.md §The flush planner) |
 | ``MILLRACE_FLUSH_DEADLINE_S`` | 900 | planner age trigger — the tail's freshness SLA |
 | ``MILLRACE_SLOW_LANE_DEADLINE_S`` | 21600 (6 h) | slow lane: flush any key this old regardless of size; accepted range 6–24 h |
 | ``MILLRACE_MIN_FLUSH_BYTES`` | 1 MiB | the age lane's minimum size — a smaller key at the age deadline waits for the slow lane |
-| ``MILLRACE_MAX_FILES_PER_COMMIT`` | 512 | commit chunking bound |
+| ``MILLRACE_MAX_FILES_PER_COMMIT`` | 512 | the most files one flush decision may fan out to under the live partition spec; a decision past it HALTS the pipeline (``fanout_exceeds_commit_bound``) before any upload — there is no commit chunking |
 | ``MILLRACE_POISON_MAX_RECORDS`` | 1000 | per-run quarantine bound; exceeding it halts the loop loudly instead of committing past a flood |
 | ``MILLRACE_POISON_VALUE_MAX_BYTES`` | 1 MiB | per-record cap on the quarantined value bytes (original length recorded) |
-| ``MILLRACE_POISON_RETENTION_S`` | 604800 (7 d) | how long a quarantined record is kept for forensics before the poison sweeper deletes it (stage.py ``purge_poison_expired``). Entries older than this are deleted in bounded batches; entries WITHOUT a quarantine stamp (v1 envelopes — pre-retention builds, and flush-path quarantines until the flusher passes its clock) are kept forever: unknown age is never deleted. Poison is forensic — nothing depends on its presence, so a pod that is down at expiry simply purges at the next sweep. 7 d matches the server's default receipt retention: the incidents poison matters to are replay/settlement questions, all inside that window |
+| ``MILLRACE_POISON_RETENTION_S`` | 604800 (7 d) | how long a quarantined record is kept for forensics before the poison sweeper deletes it (stage.py ``purge_poison_expired``). Entries older than this are deleted in bounded batches; entries WITHOUT a quarantine stamp (v1 envelopes) are kept forever: unknown age is never deleted. Every write path stamps today (consume-time and flush-time quarantines alike), so v1 entries come only from a caller that passes no clock. Poison is forensic — nothing depends on its presence, so a pod that is down at expiry simply purges at the next sweep. 7 d matches the server's default receipt retention: the incidents poison matters to are replay/settlement questions, all inside that window |
 | ``MILLRACE_POISON_SWEEP_S`` | 3600 | the poison sweeper's cadence (per partition, off the consume/flush path — main.py's side task) |
 | ``MILLRACE_SLATEDB_GC_ENABLED`` | ``false`` | the writer-internal SlateDB GC loop. DEFAULT OFF because the external maintenance service (``python -m millrace.maintenance``) is deployed beside every millrace fleet and owns collection — doubled GC is wasted LIST/DELETE traffic on the replicas (docs/kafka-ingestion.md §Maintenance services; GC itself is idempotent and overlap-safe, so a mixed or misconfigured deployment is wasteful, never corrupt). Boot logs a loud warning when off: the setting ASSUMES the maintenance service exists — without it, garbage accumulates forever. There is deliberately NO knob for ``compactor_options``: disabling the embedded compactor stalls memtable→L0 flushes at ``l0_max_ssts`` with nothing to drain them (parity-pinned, tests/test_slatedb_parity.py) |
 | ``MILLRACE_SLATEDB_MAX_UNFLUSHED_BYTES`` | 268435456 (256 MiB) | per-instance bound on unflushed memtable+WAL bytes before SlateDB stalls writes (the library default is 1 GiB — per INSTANCE, so 64 partitions per pod could hold 64 GiB of unflushed state; the README carries the per-pod memory arithmetic). The binding requires it to exceed ``l0_sst_size_bytes`` (never overridden; 64 MiB), which the validation enforces |
@@ -116,32 +116,6 @@ class AssignmentMode(Enum):
     COOPERATIVE = "cooperative"
 
 
-class TeamKeyCodec(Enum):
-    """How a record's ``team_id`` is extracted (the codec is a
-    pipeline-wide constant: a wrong choice quarantines every record, and
-    the poison limit turns that flood into a loud halt).
-
-    ``UTF8_DECIMAL``: the message key is the ASCII decimal rendering,
-    e.g. ``b"12345"``. ``BE64``: the key is the team id as an 8-byte
-    big-endian unsigned integer. Both require a team-keyed topic.
-
-    ``VALUE_JSON``: the topic is NOT keyed by team (e.g.
-    ``clickhouse_events_json``); the team id is read from a configured
-    top-level field of the JSON payload (``Config.team_id_field``, set
-    via ``MILLRACE_TEAM_KEY_CODEC=value-json:<field>``). The message key
-    is not consulted. Consequence to design: with an unkeyed topic every
-    partition's SlateDB instance can hold every team, so a team spread
-    over K partitions is up to K files per flush window — the
-    per-partition staging topology is unchanged, and the flush identity
-    (topic, partition, offset range) scopes each window, so the files
-    never collide.
-    """
-
-    UTF8_DECIMAL = "utf8-decimal"
-    BE64 = "be64"
-    VALUE_JSON = "value-json"
-
-
 class AutoOffsetReset(Enum):
     """Where a partition with no committed offset starts consuming.
 
@@ -172,8 +146,8 @@ class EventTimePolicy(Enum):
 @dataclass(frozen=True)
 class PoisonConfig:
     """Quarantine bounds and retention. ``max_records_per_run`` is the
-    loud-halt bound: a flood of unstageable records means a misconfigured
-    key codec or a producer bug, and committing past it would hide the
+    loud-halt bound: a flood of unstageable records means a producer bug
+    or payloads that do not match the destination's partition spec, and committing past it would hide the
     damage — the consumer raises instead. ``value_max_bytes`` caps each
     quarantined record's stored value; the original length is recorded.
     ``retention_s`` / ``sweep_s`` drive the poison sweeper (main.py):
@@ -304,12 +278,6 @@ _CATALOG_NAME: Final = re.compile(r"^[a-z][a-z0-9_-]{0,62}$")
 _IDENTIFIER: Final = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,127}$")
 # S3 bucket names (millpond's _S3_URI bucket piece).
 _S3_BUCKET: Final = re.compile(r"^[a-z0-9][a-z0-9.\-]{1,61}[a-z0-9]$")
-#: The ``value-json:<field>`` payload field: a top-level JSON object key,
-#: identifier-shaped (the grammar is deliberately narrower than "any
-#: string" so an operator typo — whitespace, a dot that implies the
-#: nesting we do not support — fails at boot, not as a poison flood).
-_VALUE_JSON_FIELD: Final = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,127}$")
-
 
 #: The slow lane's accepted range, 6–24 h (docs/kafka-ingestion.md §The
 #: flush planner): below 6 h the lane duplicates the age lane's job;
@@ -343,7 +311,6 @@ class Config:
     kafka_group_id: str
     assignment_mode: AssignmentMode
     static_partitions: tuple[int, ...] | None
-    team_key_codec: TeamKeyCodec
     catalog: str
     namespace: str
     table: str
@@ -361,9 +328,6 @@ class Config:
     metrics_port: int
     # Defaulted so existing constructors stay valid; load_config always
     # passes them explicitly.
-    #: The payload field ``value-json`` reads (set iff the codec is
-    #: :attr:`TeamKeyCodec.VALUE_JSON`; enforced by ``__post_init__``).
-    team_id_field: str | None = None
     kafka_auto_offset_reset: AutoOffsetReset = AutoOffsetReset.LATEST
     consume_batch_max_bytes: int = CONSUME_BATCH_MAX_BYTES_DEFAULT
     kafka_max_partition_fetch_bytes: int = KAFKA_MAX_PARTITION_FETCH_BYTES_DEFAULT
@@ -381,24 +345,6 @@ class Config:
     # Per-instance SlateDB writer tuning (T9).
     slatedb: SlateDbConfig = SlateDbConfig()
 
-    def __post_init__(self) -> None:
-        # The codec/field pair is one invariant: value-json is
-        # meaningless without its field, and a field under a key codec
-        # would be silently ignored (an operator's typo deploying a
-        # policy nobody reads).
-        if self.team_key_codec is TeamKeyCodec.VALUE_JSON:
-            if not self.team_id_field:
-                raise ValueError(
-                    "MILLRACE_TEAM_KEY_CODEC=value-json requires a payload "
-                    "field: value-json:<field> (e.g. value-json:team_id)"
-                )
-        elif self.team_id_field is not None:
-            raise ValueError(
-                f"team_id_field {self.team_id_field!r} is set but "
-                f"MILLRACE_TEAM_KEY_CODEC is {self.team_key_codec.value} — "
-                f"the field only applies to value-json"
-            )
-
     def planner_knobs(self) -> PlannerKnobs:
         """The planner's view of the flush-policy knobs."""
         return PlannerKnobs(
@@ -408,19 +354,6 @@ class Config:
             min_flush_bytes=self.min_flush_bytes,
             max_files_per_commit=self.max_files_per_commit,
         )
-
-    @property
-    def team_key_codec_env(self) -> str:
-        """The ``MILLRACE_TEAM_KEY_CODEC`` value that reproduces this
-        configuration — the parser's inverse. ``value-json`` carries its
-        payload field inline (``value-json:<field>``): dumping the bare
-        enum value would boot-refuse the child ("names no payload
-        field"), which is exactly the dump bug this property exists to
-        make impossible (the live harness renders env from a Config)."""
-        if self.team_key_codec is TeamKeyCodec.VALUE_JSON:
-            assert self.team_id_field is not None  # __post_init__'s invariant
-            return f"{TeamKeyCodec.VALUE_JSON.value}:{self.team_id_field}"
-        return str(self.team_key_codec.value)
 
 
 def _required(env: Mapping[str, str], name: str, problems: list[str]) -> str | None:
@@ -555,45 +488,6 @@ def _parse_stage_url(raw: str, problems: list[str]) -> tuple[str, str] | None:
     return None
 
 
-def _parse_team_key_codec(
-    env: Mapping[str, str], problems: list[str]
-) -> tuple[TeamKeyCodec, str | None] | None:
-    """``MILLRACE_TEAM_KEY_CODEC`` → (codec, payload field).
-
-    The keyed codecs are bare enum values; ``value-json`` carries its
-    payload field inline (``value-json:team_id``), validated here so a
-    typo fails at boot instead of quarantining every record at runtime.
-    """
-    raw = env.get("MILLRACE_TEAM_KEY_CODEC", "").strip()
-    if not raw:
-        return TeamKeyCodec.UTF8_DECIMAL, None
-    prefix = f"{TeamKeyCodec.VALUE_JSON.value}:"
-    if raw.startswith(prefix):
-        field = raw[len(prefix) :].strip()
-        if not _VALUE_JSON_FIELD.match(field):
-            problems.append(
-                f"MILLRACE_TEAM_KEY_CODEC {raw!r}: the value-json payload "
-                f"field must be a top-level identifier-shaped JSON key "
-                f"(must match [A-Za-z_][A-Za-z0-9_-]{{0,127}}), got {field!r}"
-            )
-            return None
-        return TeamKeyCodec.VALUE_JSON, field
-    if raw == TeamKeyCodec.VALUE_JSON.value:
-        problems.append(
-            f"MILLRACE_TEAM_KEY_CODEC {raw!r} names no payload field — "
-            f"expected value-json:<field> (e.g. value-json:team_id)"
-        )
-        return None
-    for member in (TeamKeyCodec.UTF8_DECIMAL, TeamKeyCodec.BE64):
-        if member.value == raw:
-            return member, None
-    problems.append(
-        f"MILLRACE_TEAM_KEY_CODEC={raw!r} must be one of: utf8-decimal, "
-        f"be64, value-json:<field>"
-    )
-    return None
-
-
 def load_config(env: Mapping[str, str]) -> Config:
     """Parse and validate the ``MILLRACE_*`` environment variables.
 
@@ -649,10 +543,6 @@ def load_config(env: Mapping[str, str]) -> Config:
             "MILLRACE_KAFKA_ASSIGNMENT=cooperative — the consumer group "
             "hands partitions out"
         )
-
-    codec_pair = _parse_team_key_codec(env, problems)
-    codec = codec_pair[0] if codec_pair is not None else None
-    team_id_field = codec_pair[1] if codec_pair is not None else None
 
     auto_offset_reset = _enum(
         env,
@@ -863,7 +753,6 @@ def load_config(env: Mapping[str, str]) -> Config:
     assert topic is not None
     assert group_id is not None
     assert isinstance(mode, AssignmentMode)
-    assert isinstance(codec, TeamKeyCodec)
     assert isinstance(auto_offset_reset, AutoOffsetReset)
     assert max_partition_fetch_bytes is not None
     assert fetch_max_bytes is not None
@@ -898,8 +787,6 @@ def load_config(env: Mapping[str, str]) -> Config:
         kafka_group_id=group_id,
         assignment_mode=mode,
         static_partitions=partitions,
-        team_key_codec=codec,
-        team_id_field=team_id_field,
         kafka_auto_offset_reset=auto_offset_reset,
         kafka_max_partition_fetch_bytes=max_partition_fetch_bytes,
         kafka_fetch_max_bytes=fetch_max_bytes,

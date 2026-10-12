@@ -101,7 +101,7 @@ async def _verify_after_kill(path: str, acked: list[tuple[int, int, int]]) -> No
             t: {} for t in range(TEAMS)
         }
         for team in range(TEAMS):
-            async for rk, value in stage.scan_team_rows(team):
+            async for rk, value in stage.scan_group_rows((str(team),)):
                 rows_by_team[team][rk.offset] = (rk.timestamp_us, value)
 
         # 1. every acknowledged row survived, byte-exact, with its event ts
@@ -123,7 +123,7 @@ async def _verify_after_kill(path: str, acked: list[tuple[int, int, int]]) -> No
                 assert landed in (0, BATCH_SIZE), f"batch {batch_index} split: {landed}"
 
         # 3. the stats prefix reconciles EXACTLY with the row scans
-        stats = {s.team_id: s for s in await stage.iter_key_stats()}
+        stats = {int(s.group[0] or 0): s for s in await stage.iter_key_stats()}
         assert set(stats) == {t for t in range(TEAMS) if rows_by_team[t]}
         last_landed_batch = max(present) // BATCH_SIZE
         for team, rows in stats.items():
@@ -145,7 +145,7 @@ async def _verify_after_kill(path: str, acked: list[tuple[int, int, int]]) -> No
         ack = await stage.stage_batch(
             [
                 StagedRecord(
-                    team_id=0,
+                    group=("0",),
                     event_ts_us=EVENT_TS_BASE + 10**9,
                     offset=10**9,
                     payload=b"after",
@@ -182,14 +182,14 @@ async def test_assignment_change_between_deploys(tmp_path: Path):
     assert reopened.recovery == RecoveryReport(pending_prepared=())
 
     (s,) = await stage.iter_key_stats()
-    assert s.team_id == 11
+    assert s.group == ("11",)
     assert s.row_count == 20
     assert s.first_staged_ts == NOW  # set once by the first owner, never advanced
     assert s.last_staged_ts == NOW + 1
-    rows = [rk.offset async for rk, _ in stage.scan_team_rows(11)]
+    rows = [rk.offset async for rk, _ in stage.scan_group_rows(("11",))]
     assert rows == list(range(20))
     # adjacent ranges keep their arrival structure (no coalescing)
-    assert await stage.read_offsets(11) == (
+    assert await stage.read_offsets(("11",)) == (
         OffsetRange("events", 3, 0, 9),
         OffsetRange("events", 3, 10, 19),
     )
@@ -201,7 +201,7 @@ async def test_assignment_change_between_deploys(tmp_path: Path):
     (s,) = await stage.iter_key_stats()
     assert s.row_count == 25
     assert s.first_staged_ts == NOW
-    assert await stage.read_offsets(11) == (
+    assert await stage.read_offsets(("11",)) == (
         OffsetRange("events", 3, 0, 9),
         OffsetRange("events", 3, 10, 19),
         OffsetRange("events", 3, 20, 24),
@@ -224,7 +224,7 @@ async def test_clean_reopen_replays_nothing_and_loses_nothing(tmp_path: Path):
     )
     report = await reopened.recover()
     assert report == RecoveryReport(pending_prepared=())  # the settle landed atomically
-    assert [rk.offset async for rk, _ in reopened.scan_team_rows(2)] == [4, 5]
+    assert [rk.offset async for rk, _ in reopened.scan_group_rows((str(2),))] == [4, 5]
     (s,) = await reopened.iter_key_stats()
     assert s.row_count == 2
     await reopened.close()

@@ -27,7 +27,7 @@ async def test_s3_staging_smoke(lake_home, topic_factory):
     base = now_us()
     records = [
         StagedRecord(
-            team_id=7,
+            group=("7",),
             event_ts_us=base + i,
             offset=i,
             payload=livekit.event_payload(7, base + i, i),
@@ -53,7 +53,7 @@ async def test_s3_staging_smoke(lake_home, topic_factory):
         settings=livekit.live_slate_settings(),
     )
     try:
-        rows = [kv async for kv in reopened.scan_team_rows(7)]
+        rows = [kv async for kv in reopened.scan_group_rows(("7",))]
         assert len(rows) == 50
         for i, (row_key, payload) in enumerate(rows):
             assert row_key.offset == i

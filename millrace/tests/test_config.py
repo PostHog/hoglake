@@ -4,8 +4,6 @@ in one refusal, not one per restart."""
 
 from __future__ import annotations
 
-from typing import Any
-
 import pytest
 
 from millrace.config import (
@@ -15,7 +13,6 @@ from millrace.config import (
     ConfigError,
     EventTimePolicy,
     PoisonConfig,
-    TeamKeyCodec,
     load_config,
 )
 
@@ -47,7 +44,6 @@ def test_minimal_env_yields_the_documented_defaults():
     assert cfg.kafka_group_id == "millrace-events"
     assert cfg.assignment_mode is AssignmentMode.STATIC
     assert cfg.static_partitions == (0, 1, 2)
-    assert cfg.team_key_codec is TeamKeyCodec.UTF8_DECIMAL
     assert cfg.catalog == "prod"
     assert cfg.namespace == "default"
     assert cfg.table == "events"
@@ -70,7 +66,6 @@ def test_minimal_env_yields_the_documented_defaults():
     # The fleet policy default: latest (millpond's whole-retention
     # replay incident), earliest still selectable.
     assert cfg.kafka_auto_offset_reset is AutoOffsetReset.LATEST
-    assert cfg.team_id_field is None
     # The whale-shape fetch tuning (millpond's hot-partition ceiling).
     assert cfg.kafka_max_partition_fetch_bytes == 32 * 1024 * 1024
     assert cfg.kafka_fetch_max_bytes == 256 * 1024 * 1024
@@ -249,49 +244,6 @@ def test_cooperative_without_partitions_is_valid():
 def test_assignment_mode_garbage_is_refused():
     (p,) = problems(MINIMAL_ENV | {"MILLRACE_KAFKA_ASSIGNMENT": "eager"})
     assert "MILLRACE_KAFKA_ASSIGNMENT" in p and "static" in p and "cooperative" in p
-
-
-# -- team key codec -----------------------------------------------------------------
-
-
-def test_team_key_codec_choices():
-    assert load(MINIMAL_ENV).team_key_codec is TeamKeyCodec.UTF8_DECIMAL
-    assert (
-        load(MINIMAL_ENV | {"MILLRACE_TEAM_KEY_CODEC": "be64"}).team_key_codec
-        is TeamKeyCodec.BE64
-    )
-    (p,) = problems(MINIMAL_ENV | {"MILLRACE_TEAM_KEY_CODEC": "ascii"})
-    assert "MILLRACE_TEAM_KEY_CODEC" in p and "utf8-decimal" in p and "be64" in p
-
-
-def test_value_json_codec_parses_its_field():
-    cfg = load(MINIMAL_ENV | {"MILLRACE_TEAM_KEY_CODEC": "value-json:team_id"})
-    assert cfg.team_key_codec is TeamKeyCodec.VALUE_JSON
-    assert cfg.team_id_field == "team_id"
-
-
-@pytest.mark.parametrize(
-    "raw",
-    [
-        "value-json",  # no field at all
-        "value-json:",  # empty field
-        "value-json: team id",  # whitespace is a typo, not a key
-        "value-json:a.b",  # dots imply the nesting we do not support
-        "value-json:1field",  # must start alpha/underscore
-    ],
-)
-def test_value_json_codec_refuses_a_bad_field(raw):
-    (p,) = problems(MINIMAL_ENV | {"MILLRACE_TEAM_KEY_CODEC": raw})
-    assert "MILLRACE_TEAM_KEY_CODEC" in p
-    assert "value-json" in p
-
-
-def test_config_constructor_guards_the_codec_field_pair():
-    kwargs: dict[str, Any] = dict(load(MINIMAL_ENV).__dict__)
-    with pytest.raises(ValueError, match="value-json"):
-        Config(**(kwargs | {"team_key_codec": TeamKeyCodec.VALUE_JSON}))
-    with pytest.raises(ValueError, match="team_id_field"):
-        Config(**(kwargs | {"team_id_field": "team_id"}))
 
 
 # -- auto.offset.reset (B6: the fleet policy is latest) ------------------------------
@@ -512,25 +464,6 @@ def test_poison_retention_knobs_parse():
     assert cfg.poison.sweep_s == 60
     (p,) = problems(MINIMAL_ENV | {"MILLRACE_POISON_RETENTION_S": "0"})
     assert "MILLRACE_POISON_RETENTION_S" in p
-
-
-def test_team_key_codec_env_is_the_parsers_inverse():
-    """The env dump of the codec must reproduce the config — a bare
-    ``value-json`` (no ``:<field>``) is refused at boot, which is exactly
-    the bug this property exists to prevent (the live harness dumps a
-    Config to a child's env)."""
-    assert load(MINIMAL_ENV).team_key_codec_env == "utf8-decimal"
-    assert (
-        load(MINIMAL_ENV | {"MILLRACE_TEAM_KEY_CODEC": "be64"}).team_key_codec_env
-        == "be64"
-    )
-    value_json = load(MINIMAL_ENV | {"MILLRACE_TEAM_KEY_CODEC": "value-json:team_id"})
-    assert value_json.team_key_codec_env == "value-json:team_id"
-    # Round-trip: the rendered spec parses back to the same config.
-    assert (
-        load(MINIMAL_ENV | {"MILLRACE_TEAM_KEY_CODEC": value_json.team_key_codec_env})
-        == value_json
-    )
 
 
 # -- remaining knobs ----------------------------------------------------------------------
