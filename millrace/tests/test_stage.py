@@ -33,6 +33,8 @@ import asyncio
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
+from slatedb.uniffi import CloseReason
+from slatedb.uniffi import Error as SlateError
 from stagekit import NOW, TABLE, fast_flush_settings, legacy_marker_kv, rec, window
 
 from millrace import keyspace
@@ -1077,6 +1079,37 @@ async def test_close_guards(stage_factory):
         await managed.stage_batch([rec(1, 100, 0)], now_us=NOW)
     with pytest.raises(StageClosedError):
         await managed.gauges()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        SlateError.Closed(CloseReason.CLEAN, "local shutdown"),
+        SlateError.Closed(CloseReason.PANIC, "writer panicked"),
+        RuntimeError("shutdown failed"),
+    ],
+)
+async def test_close_propagates_other_shutdown_errors(
+    stage_factory, monkeypatch, error
+):
+    stage = await stage_factory()
+    shutdown = stage._db.shutdown
+    shutdown_calls = 0
+
+    async def shutdown_failed():
+        nonlocal shutdown_calls
+        shutdown_calls += 1
+        await shutdown()
+        raise error
+
+    monkeypatch.setattr(stage._db, "shutdown", shutdown_failed)
+    with pytest.raises(type(error)) as excinfo:
+        await stage.close()
+    assert excinfo.value is error
+    await stage.close()
+    assert shutdown_calls == 1
+    with pytest.raises(StageClosedError):
+        await stage.gauges()
 
 
 # -- the manager --------------------------------------------------------------------

@@ -111,6 +111,7 @@ from dataclasses import dataclass
 from typing import Final, Self
 
 from slatedb.uniffi import (
+    CloseReason,
     Db,
     DbBuilder,
     DbTransaction,
@@ -121,6 +122,7 @@ from slatedb.uniffi import (
     Settings,
     WriteBatch,
 )
+from slatedb.uniffi import Error as SlateError
 
 from . import keyspace
 from .keyspace import (
@@ -1377,14 +1379,17 @@ class PartitionStage:
         return gauges_from_stats(await self.iter_key_stats())
 
     async def close(self) -> None:
-        """Flush and shut the instance down. Idempotent. A fenced
-        instance (a newer writer opened the path) surfaces SlateDB's
-        ``Error.Closed(FENCED)`` here if nothing surfaced it earlier —
-        that is the assignment fence working, not damage."""
+        """Flush and shut the instance down. Idempotent. A fenced writer
+        has already yielded the path; SlateDB completes shutdown before
+        reporting the fence. Other shutdown failures propagate."""
         if self._closed:
             return
         self._closed = True
-        await self._db.shutdown()
+        try:
+            await self._db.shutdown()
+        except SlateError.Closed as exc:
+            if exc.reason != CloseReason.FENCED:
+                raise
 
 
 @dataclass(frozen=True, slots=True)
