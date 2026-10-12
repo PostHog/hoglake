@@ -1,0 +1,47 @@
+# millrace Kafka ingestion daemon. Python toolchain from the flox env.
+
+_uv := "flox activate -- uv"
+
+# Default recipe: list all available recipes
+default:
+    @just --list
+
+sync:
+    {{_uv}} sync
+
+# Entire non-live suite (unit + component + file:/// integration; the
+# live marker is deselected by tests/conftest.py — see the live recipe)
+test:
+    {{_uv}} run pytest
+
+unit:
+    {{_uv}} run pytest -m "not integration"
+
+integration:
+    {{_uv}} run pytest -m integration
+
+lint:
+    {{_uv}} run ruff check .
+    {{_uv}} run ruff format --check .
+    {{_uv}} run mypy
+
+fmt:
+    {{_uv}} run ruff format .
+
+# Live stack tests (Phase 5, tests/live/): isolated PG +
+# server-from-checkout + MinIO + kafka, logs and JUnit in
+# .artifacts/live-millrace/. Hard-fails on a missing, empty, skipped or
+# failed report. Wired into CI as the `live-millrace` job of the
+# reusable python-live.yml workflow (every caller gate fans it in).
+live:
+    cd ../server && flox activate -- bash ../ci/live-millrace.sh
+
+# Mutation-test the pure core (keyspace.py + planner.py; [tool.mutmut] in
+# pyproject.toml). Always clean-slate: mutmut 3.8's incremental stats go
+# stale on function renames (tests/MUTATION_TESTING.md carries the
+# gotcha), so `mutants/` is deleted first. The survivors gate fails on
+# any survivor the ledger does not name.
+mutants:
+    rm -rf mutants
+    {{_uv}} run mutmut run
+    {{_uv}} run python tests/check_mutants.py

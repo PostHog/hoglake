@@ -1,0 +1,35 @@
+# Kafka overlay for ci/live-millrace.sh — merged over
+# server/docker-compose.yml with a second -f flag so the dev stack and
+# ci/live-python.sh stay kafka-free. Single-node KRaft, reachable from
+# the host on 127.0.0.1:${HOGLAKE_KAFKA_PORT:-29092} only.
+#
+# The image is pinned BY DIGEST (the lesson of millpond's `:latest`
+# substitution, tests/hoglake_stack/stack.py): a tag is a pointer, and a
+# live suite green against a broker nobody chose proves nothing. 3.9.0
+# is the version millpond's stacks run; the digest is that tag's
+# multi-arch manifest digest.
+services:
+  kafka:
+    image: apache/kafka:3.9.0@sha256:fbc7d7c428e3755cf36518d4976596002477e4c052d1f80b5b9eafd06d0fff2f
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:29093
+      # Empty-host listener form, per the apache/kafka image's own
+      # compose examples — the docker wrapper's storage-format step
+      # rejects 0.0.0.0 outright.
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:29093,HOST://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,HOST://127.0.0.1:${HOGLAKE_KAFKA_PORT:-29092}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,HOST:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+    ports:
+      - "127.0.0.1:${HOGLAKE_KAFKA_PORT:-29092}:29092"
+    healthcheck:
+      test: /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092
+      interval: 5s
+      timeout: 10s
+      retries: 12

@@ -1,0 +1,14 @@
+.venv/
+dist/
+__pycache__/
+*.pyc
+.pytest_cache/
+mutants/  # mutmut's working tree
+.flox/run/
+.flox/cache/
+.flox/lib/
+.flox/log/
+.flox/telemetry_id
+# uv.lock is tracked
+mutants/
+.hypothesis/

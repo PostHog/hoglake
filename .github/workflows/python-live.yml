@@ -36,3 +36,39 @@ jobs:
           path: .artifacts/live-python/
           include-hidden-files: true
           if-no-files-found: error
+
+  # The millrace live docker suite (Phase 5, docs/kafka-ingestion-plan.md).
+  # A second job in THIS reusable workflow rather than a new workflow: every
+  # caller (server.yml's server-checks gate, pyhoglake-checks.yml under
+  # python-checks, bench-image.yml's publish gate) fans it in with no new
+  # required-check name — "require the gate, not the leaf" (AGENT.md), and
+  # no suite lives outside CI. Fails on skips the same as live-python.sh.
+  live-millrace:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      UV_PYTHON: "3.13"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: "25"
+          cache: gradle
+
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+
+      - name: Live millrace suite
+        run: bash ci/live-millrace.sh
+
+      - name: Test reports and service logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: live-millrace-${{ github.workflow }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .artifacts/live-millrace/
+          include-hidden-files: true
+          if-no-files-found: error
