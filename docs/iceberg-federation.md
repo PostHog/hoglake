@@ -372,7 +372,7 @@ thousands of small files the window, not the data, sets the rewrite's
 latency; a small-file table wants it higher.
 
 A compaction OUTPUT is written with `HOGLAKE_COMPACTION_CODEC` (default
-**zstd**, at `HOGLAKE_COMPACTION_ZSTD_LEVEL` default **1**; snappy,
+**zstd**, at `HOGLAKE_COMPACTION_ZSTD_LEVEL` default **3**; snappy,
 gzip, lz4_raw and uncompressed are the other legal names, and an
 unknown one is refused at boot). An input's own codec is never an
 instruction — the rewrite decodes and re-encodes, so a group of mixed

@@ -330,7 +330,7 @@ class ParquetRewriterTest {
         // builds a writer per spill file and one for the output.
         val default = ParquetRewriter.OutputCodec()
         assertThat(ParquetRewriter.writerConfiguration(default)).isSameAs(ParquetRewriter.writerConfiguration(default))
-        assertThat(ParquetRewriter.writerConfiguration(default).get(ParquetRewriter.ZSTD_LEVEL_KEY)).isEqualTo("1")
+        assertThat(ParquetRewriter.writerConfiguration(default).get(ParquetRewriter.ZSTD_LEVEL_KEY)).isEqualTo("3")
         val level9 = ParquetRewriter.OutputCodec(zstdLevel = 9)
         assertThat(ParquetRewriter.writerConfiguration(level9).get(ParquetRewriter.ZSTD_LEVEL_KEY)).isEqualTo("9")
     }

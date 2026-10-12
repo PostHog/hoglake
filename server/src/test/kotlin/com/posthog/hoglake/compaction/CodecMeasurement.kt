@@ -99,15 +99,16 @@ object CodecMeasurement {
         var uncompressed = 0L
         // UNCOMPRESSED first: it is the baseline the other rows divide by,
         // and it is the behaviour this measurement exists to price.
-        // zstd twice: at the default level and at parquet-java's own
-        // default of 3, which DEFAULT_ZSTD_LEVEL was until the rewrite's
-        // profile showed level 3 buying no size on event data for its CPU.
+        // zstd twice: at the default level (3) and at level 1, which
+        // hoglake#134 package D made the default on this measurement's
+        // own numbers and gigahog-dev's real data reversed (12-13% larger
+        // on re-merged compaction outputs; see DEFAULT_ZSTD_LEVEL).
         val order =
             listOf(ParquetRewriter.OutputCodec(CompressionCodecName.UNCOMPRESSED)) +
                 ParquetRewriter.SUPPORTED.filter { it != CompressionCodecName.UNCOMPRESSED }.sortedBy { it.name }
                     .flatMap { name ->
                         if (name == CompressionCodecName.ZSTD) {
-                            listOf(ParquetRewriter.OutputCodec(name), ParquetRewriter.OutputCodec(name, zstdLevel = 3))
+                            listOf(ParquetRewriter.OutputCodec(name), ParquetRewriter.OutputCodec(name, zstdLevel = 1))
                         } else {
                             listOf(ParquetRewriter.OutputCodec(name))
                         }
