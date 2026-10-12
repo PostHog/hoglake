@@ -87,7 +87,7 @@ async def test_ddl_race_reprepares(lake_home, topic_factory, producer_factory, a
         assert report2.committed == 1, f"sweep 2: {report2}"
         assert sum(livekit.lake_team_counts(table, lake_home.head()).values()) == 50
         assert pipe.flusher is not None
-        assert pipe.flusher.stats().reprepares == 1
+        assert pipe.flusher.stats().reprepared == {"ddl_since_read_snapshot": 1}
 
         # Post-alter rows carry the new column; the pipeline keeps working.
         base2 = now_us()

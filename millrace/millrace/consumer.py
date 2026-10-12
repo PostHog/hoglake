@@ -63,7 +63,7 @@ instance is claimed with it):
 policy since millpond's whole-retention replay incident). The full
 tension — ``earliest`` never silently drops a fresh partition's backlog
 but replays all of retention; ``latest`` starts at the head; millrace's
-staged state plus receipt horizon bound the replay damage either way —
+staged state and idempotency keys bound the replay damage either way —
 is carried by :class:`millrace.config.AutoOffsetReset` and
 docs/kafka-ingestion.md §Delivery semantics.
 

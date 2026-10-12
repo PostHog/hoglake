@@ -40,10 +40,10 @@ def test_healthz_reflects_the_live_callback():
     ) as server:
         base = f"http://127.0.0.1:{server.port}"
         assert httpx.get(f"{base}/healthz", timeout=5).status_code == 200
-        state["problem"] = "flush pipeline halted: receipt horizon exceeded"
+        state["problem"] = "flush pipeline halted: table_recreated"
         r = httpx.get(f"{base}/healthz", timeout=5)
         assert r.status_code == 503
-        assert "receipt horizon exceeded" in r.text
+        assert "table_recreated" in r.text
         state["problem"] = None
         assert httpx.get(f"{base}/healthz", timeout=5).status_code == 200
 

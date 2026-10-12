@@ -40,7 +40,6 @@ Knobs
 | ``MILLRACE_EVENT_TIME_POLICY`` | ``drop`` | flush-time junk ``event_time`` handling (``clamp`` or ``drop``; consumed by the flush phase — a dropped record is logged and counted, ``millrace_records_dropped_total{reason="event_time_out_of_window"}``) |
 | ``MILLRACE_EVENT_TIME_MAX_PAST_S`` | 2592000 (30 d) | junk window lower bound: an ``event_time`` older than ``now − this`` is junk (flush phase) |
 | ``MILLRACE_EVENT_TIME_MAX_FUTURE_S`` | 86400 (1 d) | junk window upper bound: an ``event_time`` newer than ``now + this`` is junk (flush phase) |
-| ``MILLRACE_RECEIPT_HORIZON_S`` | 518400 (6 d) | receipt-horizon guard: a persisted ``prepared/`` entry whose receipt lookup 404s is republished ONLY while younger than this; past it the server's receipt may have been purged and a blind replay could duplicate an executed commit, so the pipeline HALTS for operator reconciliation. THE DEPENDENCY IS NOT ON THE WIRE: the server never reports its receipt retention (``CatalogOptions`` carries snapshot retention only; ``GET /v1/info`` is instance identity — verified against hoglake.yaml), so this knob CARRIES the assumption that it stays below the server's effective receipt purge floor. That floor is ``max(HOGLAKE_RECEIPT_RETENTION_SECONDS, 2 × the catalog's snapshot retention)`` capped at 30 d and never below 1 h (server-side ``MIN_RECEIPT_RETENTION_SECONDS``): the 6 d default undercuts the 7 d server default; an operator who lowers the server knob (or runs a snapshot retention above ~3.5 d, which lifts the floor) must lower this knob with it. If pyhoglake grows a ``Catalog._receipt_retention_seconds`` accessor the flusher honors it instead of the knob (the guarded-accessor seam, flush.py ``_receipt_horizon_s``) |
 | ``MILLRACE_FLUSH_SWEEP_S`` | 5 | pause between flush sweeps (one tick = one planning pass over every claimed partition) |
 | ``MILLRACE_FLUSH_SCAN_MIN_BYTES`` | 67108864 (64 MiB) | FLOOR for the flush's staged-byte scan budget (flush.py §Bounded unit of work): the budget itself is derived from the size lane (``target_output_bytes ÷ observed compression ratio``), and the floor keeps toy/miniature targets from fragmenting every flush into single-row windows. The budget's job is bounding post-outage catch-up memory, not sizing steady-state files |
 | ``MILLRACE_FLUSH_SCAN_MAX_ROWS`` | 8000000 | row-count half of the scan budget: bounds the per-row Arrow-build work of one decision against degenerate tiny payloads (at the design's ~1 KB/row the byte budget binds long before this) |
@@ -122,10 +121,10 @@ class AutoOffsetReset(Enum):
     partition with no committed offset never consumes its backlog:
     removal-by-omission, millpond AGENT.md), at the price of the
     whole-retention replay. Millrace's per-partition staged state makes
-    a replay idempotent above the settled floor, and the receipt horizon
-    bounds it below — the boundary is the same under both settings
-    (docs/kafka-ingestion.md §Delivery semantics), which is what makes
-    the fleet default safe to follow here.
+    a replay idempotent above the settled floor; below it re-consumed
+    records publish under new keys — the boundary is the same under
+    both settings (docs/kafka-ingestion.md §Delivery semantics), which
+    is what makes the fleet default safe to follow here.
     """
 
     EARLIEST = "earliest"
@@ -213,20 +212,6 @@ KAFKA_FETCH_MAX_BYTES_DEFAULT: Final = 256 * 1024 * 1024
 #: In KiB, as librdkafka names it: 262144 KiB = 256 MiB ≈ 5 s of a
 #: 50 MB/s pod inflow.
 KAFKA_QUEUED_MAX_MESSAGES_KBYTES_DEFAULT: Final = 262144
-#: One day BELOW the server's default receipt retention
-#: (``HOGLAKE_RECEIPT_RETENTION_SECONDS``, 7 days — purged in bounded
-#: pages by the cleanup sweep, V24). The dependency is NOT on the wire
-#: (the server exposes snapshot retention only, never receipt retention
-#: — verified against hoglake.yaml's ``CatalogOptions`` and ``/v1/info``),
-#: so this knob is the guard and its value must stay below the server's
-#: EFFECTIVE purge floor: ``max(HOGLAKE_RECEIPT_RETENTION_SECONDS, 2 x
-#: snapshot retention)``, capped at 30 d and floored at 1 h server-side.
-#: Within the horizon a receipt 404 can only mean "the commit never
-#: landed" and replaying the persisted request is safe; past it the 404
-#: is ambiguous with a purged receipt and the flusher halts. A pyhoglake
-#: that exposes ``Catalog._receipt_retention_seconds`` overrides this
-#: knob (flush.py ``_receipt_horizon_s``).
-RECEIPT_HORIZON_S_DEFAULT: Final = 6 * 86400
 
 # Kafka topic names: https://kafka.apache.org/documentation/#topicnames
 _TOPIC_NAME: Final = re.compile(r"^[a-zA-Z0-9._-]{1,249}$")
@@ -293,7 +278,6 @@ class Config:
     event_time_max_past_s: int = EVENT_TIME_MAX_PAST_S_DEFAULT
     event_time_max_future_s: int = EVENT_TIME_MAX_FUTURE_S_DEFAULT
     flush_sweep_s: int = FLUSH_SWEEP_S_DEFAULT
-    receipt_horizon_s: int = RECEIPT_HORIZON_S_DEFAULT
     flush_scan_min_bytes: int = FLUSH_SCAN_MIN_BYTES_DEFAULT
     flush_scan_max_rows: int = FLUSH_SCAN_MAX_ROWS_DEFAULT
     compression_ratio_halflife: int = COMPRESSION_RATIO_HALFLIFE_DEFAULT
@@ -640,9 +624,6 @@ def load_config(env: Mapping[str, str]) -> Config:
     flush_sweep_s = _positive_int(
         env, "MILLRACE_FLUSH_SWEEP_S", FLUSH_SWEEP_S_DEFAULT, problems
     )
-    receipt_horizon_s = _positive_int(
-        env, "MILLRACE_RECEIPT_HORIZON_S", RECEIPT_HORIZON_S_DEFAULT, problems
-    )
     flush_scan_min_bytes = _positive_int(
         env, "MILLRACE_FLUSH_SCAN_MIN_BYTES", FLUSH_SCAN_MIN_BYTES_DEFAULT, problems
     )
@@ -704,7 +685,6 @@ def load_config(env: Mapping[str, str]) -> Config:
     assert event_time_max_past_s is not None
     assert event_time_max_future_s is not None
     assert flush_sweep_s is not None
-    assert receipt_horizon_s is not None
     assert flush_scan_min_bytes is not None
     assert flush_scan_max_rows is not None
     assert compression_ratio_halflife is not None
@@ -739,7 +719,6 @@ def load_config(env: Mapping[str, str]) -> Config:
         event_time_max_past_s=event_time_max_past_s,
         event_time_max_future_s=event_time_max_future_s,
         flush_sweep_s=flush_sweep_s,
-        receipt_horizon_s=receipt_horizon_s,
         flush_scan_min_bytes=flush_scan_min_bytes,
         flush_scan_max_rows=flush_scan_max_rows,
         compression_ratio_halflife=compression_ratio_halflife,

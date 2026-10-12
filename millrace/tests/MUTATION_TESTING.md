@@ -92,15 +92,6 @@ not mutate:
   (`test_decimal_column_shape_is_a_startup_refusal`), the batch-build
   isolation arm removed RED
   (`TestBatchBuildIsolation::test_a_record_that_defeats_the_arrow_build_is_isolated`).
-- **Receipt horizon** (flush.py `reconcile_prepared`, hand-flip only):
-  `>` flipped to `>=` RED
-  (`test_entry_at_exactly_the_horizon_still_replays`), the unknown-age
-  arm inverted RED (`test_unknown_age_legacy_entry_halts_on_a_404`), the
-  guard moved ahead of the receipt-200 settle RED
-  (`test_receipt_200_settles_regardless_of_age`), the server accessor
-  never consulted RED
-  (`test_the_horizon_comes_from_the_server_when_exposed`), a raising
-  accessor propagating RED (`test_server_horizon_inf_and_knob_fallback`).
 
 ## Result
 
@@ -408,8 +399,6 @@ f-string fragments separately.)
 | `x_encode_prepared_value__mutmut_4` | `"cannot persist a prepared request without persisted_at: an "` → `"XXcannot persist a prepared request without persisted_at: an XX"` | error text only; the refusal is pinned by test_prepared_value_encode_requires_persisted_at (match='without persisted_at' survives the decoration).
 | `x_encode_prepared_value__mutmut_6` | `"entry of unknown age can never be checked against the "` → `"XXentry of unknown age can never be checked against the XX"` | error text only; an unpinned fragment of the same refusal, same pin.
 | `x_encode_prepared_value__mutmut_7` | `"entry of unknown age can never be checked against the "` → `"ENTRY OF UNKNOWN AGE CAN NEVER BE CHECKED AGAINST THE "` | case flip of an unpinned fragment; same pin.
-| `x_encode_prepared_value__mutmut_8` | `"receipt horizon"` → `"XXreceipt horizonXX"` | error text only; an unpinned fragment of the same refusal, same pin.
-| `x_encode_prepared_value__mutmut_9` | `"receipt horizon"` → `"RECEIPT HORIZON"` | case flip of an unpinned fragment; same pin.
 | `x_encode_prepared_value__mutmut_16` | `"cannot persist a prepared request without topic/partition: "` → `"XXcannot persist a prepared request without topic/partition: XX"` | error text only; the refusal is pinned by test_prepared_value_encode_requires_the_derivation_inputs (match='without topic/partition' survives the decoration).
 | `x_encode_prepared_value__mutmut_18` | `"the v3 envelope carries the idempotency key's derivation "` → `"XXthe v3 envelope carries the idempotency key's derivation XX"` | error text only; an unpinned fragment of the same refusal, same pin.
 | `x_encode_prepared_value__mutmut_19` | `"the v3 envelope carries the idempotency key's derivation "` → `"THE V3 ENVELOPE CARRIES THE IDEMPOTENCY KEY'S DERIVATION "` | case flip of an unpinned fragment; same pin.

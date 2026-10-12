@@ -51,7 +51,7 @@ Pinned here:
   unaffected — pinned against a real ``file:///`` contested open (B5);
 - the recovery handoff: ``recover()``-surfaced ``prepared/`` entries are
   reconciled by receipt lookup (200 → local settle, 404 → verbatim
-  republish INSIDE the receipt horizon, a loud halt past it);
+  republish at any age, counted and logged with the entry's age);
 - the runner: per-decision containment (one key's failure never wedges a
   sweep), the halt taxonomy stopping the pipeline loudly, bounded
   parallel sweep processing, and the redelivery-inflation stats repair.
@@ -60,8 +60,11 @@ Pinned here:
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import inspect
+import json
 import logging
+import re
 from typing import Any
 
 import httpx
@@ -795,8 +798,14 @@ class TestHappyPath:
         # size trigger: full footer stats ride along.
         assert all("column_stats" in f for f in files)
         assert {s["field_id"] for f in files for s in f["column_stats"]} == {1, 2, 3}
+        # Object names: {key}/{build}/{index}.parquet, one fresh uuid4-hex
+        # build token per build, shared by the build's files.
+        (build,) = {f["path"].split("/")[-2] for f in files}
+        assert re.fullmatch(r"[0-9a-f]{32}", build)
         for f in files:
-            assert f["path"].startswith(f"{DATA_PATH}/data/{NAMESPACE}/{TABLE}/{key}/")
+            assert f["path"].startswith(
+                f"{DATA_PATH}/data/{NAMESPACE}/{TABLE}/{key}/{build}/"
+            )
             assert f["file_size_bytes"] > 0 and f["footer_size"] > 0
         # The deterministic message: line 1 fixed key=value, line 2 the
         # staged offsets window.
@@ -831,10 +840,11 @@ class TestHappyPath:
         # ((timestamp, offset)) order: the older December rows group first.
         assert len(store.files) == 2
         assert sorted(store.files) == [
-            f"bkt/lake/data/{NAMESPACE}/{TABLE}/{key}/{i}.parquet" for i in (0, 1)
+            f"bkt/lake/data/{NAMESPACE}/{TABLE}/{key}/{build}/{i}.parquet"
+            for i in (0, 1)
         ]
         dec = parquet_rows(
-            store, f"s3://bkt/lake/data/{NAMESPACE}/{TABLE}/{key}/0.parquet"
+            store, f"s3://bkt/lake/data/{NAMESPACE}/{TABLE}/{key}/{build}/0.parquet"
         )
         assert [r["team_id"] for r in dec.to_pylist()] == [7, 7]
         assert [ts_micros(r["timestamp"]) for r in dec.to_pylist()] == [
@@ -842,7 +852,7 @@ class TestHappyPath:
             DEC_US + 3_600_000_000,
         ]
         jan = parquet_rows(
-            store, f"s3://bkt/lake/data/{NAMESPACE}/{TABLE}/{key}/1.parquet"
+            store, f"s3://bkt/lake/data/{NAMESPACE}/{TABLE}/{key}/{build}/1.parquet"
         )
         assert [ts_micros(r["timestamp"]) for r in jan.to_pylist()] == [
             JAN_US,
@@ -1229,7 +1239,7 @@ class TestRefusalTaxonomy:
         assert await stage.load_prepared() == []
         assert len(await staged_rows(stage, TEAM)) == 3
         stats = flusher.stats()
-        assert stats.reprepares == 1
+        assert stats.reprepared == {"ddl_since_read_snapshot": 1}
         assert stats.orphaned_uploads == 1
         assert stats.commit_attempts == 1  # no retry of the refused payload
 
@@ -1247,12 +1257,13 @@ class TestRefusalTaxonomy:
         assert capture.payloads[1]["idempotency_key"] == key
         # Rebuilt, not replayed: the fresh basis changes the bytes...
         assert capture.bodies[1] != capture.bodies[0]
-        # ...and the deterministic object names are the same, so the
-        # rebuild rewrites the orphaned objects rather than doubling them.
-        assert (
-            capture.payloads[1]["appends"][0]["files"][0]["path"]
-            == capture.payloads[0]["appends"][0]["files"][0]["path"]
-        )
+        # ...and the rebuild mints FRESH object names under the same key:
+        # it never PUTs a path an earlier build of the window used.
+        first_paths = [f["path"] for f in capture.payloads[0]["appends"][0]["files"]]
+        rebuilt_paths = [f["path"] for f in capture.payloads[1]["appends"][0]["files"]]
+        assert set(first_paths).isdisjoint(rebuilt_paths)
+        assert all(f"/{key}/" in p for p in first_paths + rebuilt_paths)
+        assert len(store.opened) == len(set(store.opened))
         assert await staged_rows(stage, TEAM) == []
 
     async def test_table_recreated_halts_loudly_and_keeps_state(
@@ -1325,8 +1336,11 @@ class TestRefusalTaxonomy:
             )
         assert excinfo.value.reason == "read_snapshot_expired"
         assert detail in excinfo.value.detail
-        # A stop sign, never a skip: the rows stay staged.
+        # A stop sign, never a skip: the rows stay staged. A fresh publish
+        # never landed, so its uploads are orphans (not unresolved).
         assert len(await staged_rows(stage, TEAM)) == 3
+        assert flusher.stats().orphaned_uploads == 1
+        assert flusher.stats().unresolved_uploads == 0
 
     async def test_503_commit_queue_timeout_backs_off_per_retry_after(
         self,
@@ -1719,7 +1733,7 @@ class TestCrashDiscipline:
         assert await staged_rows(stage2, TEAM) == []
         assert await stage2.load_prepared() == []
         assert await read_markers(stage2) == []
-        assert flusher2.stats().flushes_replayed == 1
+        assert flusher2.stats().prepared_replays == 1
         assert flusher2.stats().receipt_lookups == 1
 
     async def test_crash_between_commit_and_settle_is_receipt_settled(
@@ -1789,10 +1803,11 @@ class TestDeterminism:
         sleeper: Sleeper,
     ) -> None:
         """Flush, settle, re-stage the IDENTICAL rows, flush again through a
-        FRESH flusher (a new process): the two prepared requests are
-        byte-identical — object names included, since they derive from the
-        idempotency key. (A real server would answer the second with the
-        first's receipt; the scripted one re-accepts.)"""
+        FRESH flusher (a new process): the two prepared requests carry the
+        same idempotency key and are byte-identical apart from the
+        per-build object-name token, which differs. (A real server would
+        answer the second with the first's receipt; the scripted one
+        re-accepts.)"""
         rows = [(0, JAN_US), (1, JAN_US + 3_600_000_000), (2, DEC_US)]
         capture = CommitCapture(httpx_mock, [commit_ok(50), commit_ok(51)])
         for _snapshot in (50, 51):
@@ -1810,7 +1825,16 @@ class TestDeterminism:
             )
             assert report.outcome == "committed"
             await stage.close()
-        assert capture.bodies[0] == capture.bodies[1]
+        first, second = capture.payloads
+        assert first["idempotency_key"] == second["idempotency_key"]
+        builds = [
+            p["appends"][0]["files"][0]["path"].split("/")[-2] for p in (first, second)
+        ]
+        assert builds[0] != builds[1]
+        assert capture.bodies[0].replace(
+            builds[0].encode(), b"BUILD"
+        ) == capture.bodies[1].replace(builds[1].encode(), b"BUILD")
+        assert len(store.opened) == len(set(store.opened))
 
     async def test_prepared_body_is_the_wire_body(
         self,
@@ -2486,7 +2510,8 @@ class TestOrphanAccounting:
         stats = flusher.stats()
         assert stats.orphaned_uploads == 1
         key = ikey(0, TEAM, 0, 1)
-        orphaned = f"bkt/lake/data/{NAMESPACE}/{TABLE}/{key}/0.parquet"
+        (orphaned,) = [k for k in store.files if k.endswith("/0.parquet")]
+        assert orphaned.startswith(f"bkt/lake/data/{NAMESPACE}/{TABLE}/{key}/")
         with caplog.at_level(logging.WARNING):
             # re-run the accounting read: the warning was logged at failure
             pass
@@ -2500,10 +2525,10 @@ class TestOrphanAccounting:
         assert len(await staged_rows(stage, TEAM)) == 2
         assert capture.bodies == []
 
-        # The retry regenerates the identical request and REWRITES the
-        # same object names (deterministic paths reclaim the orphan). The
-        # upload failure was not a HoglakeError, so the shape cache
-        # survived and this flush makes no table read.
+        # The retry rebuilds under the same key with FRESH object names:
+        # the orphan is left alone (it stays counted). The upload failure
+        # was not a HoglakeError, so the shape cache survived and this
+        # flush makes no table read.
         store.fail_at = None
         capture.extend([commit_ok(50)])
         report = await flusher.flush_key(
@@ -2511,9 +2536,14 @@ class TestOrphanAccounting:
             decision(TEAM, trigger="size", staged_bytes=100, first_staged_ts=JAN_US),
         )
         assert report.outcome == "committed"
-        assert (
-            capture.payloads[0]["appends"][0]["files"][0]["path"] == f"s3://{orphaned}"
+        paths = [f["path"] for f in capture.payloads[0]["appends"][0]["files"]]
+        assert f"s3://{orphaned}" not in paths
+        assert all(
+            p.startswith(f"s3://bkt/lake/data/{NAMESPACE}/{TABLE}/{key}/")
+            for p in paths
         )
+        assert orphaned in store.files  # untouched
+        assert len(store.opened) == len(set(store.opened))
         assert await staged_rows(stage, TEAM) == []
 
     async def test_persist_failure_counts_the_whole_fanout(
@@ -2911,13 +2941,14 @@ class TestMagnitudeOverflow:
 
 
 # =====================================================================================
-# The receipt horizon (C3): a receipt 404 past the horizon is a halt, never
-# a blind replay
+# Prepared replay: a receipt 404 republishes the persisted entry verbatim at
+# any age; a replay past the server's receipt retention may land twice, and
+# that is counted
 # =====================================================================================
 
 
 @component
-class TestReceiptHorizon:
+class TestPreparedReplay:
     async def _crashed_pending(
         self,
         httpx_mock: Any,
@@ -2926,7 +2957,7 @@ class TestReceiptHorizon:
         flusher: Any,
     ) -> tuple[str, bytes, Any]:
         """A real flush whose whole publish ladder dies: the partition
-        keeps a v2 persisted entry (persisted_at = the fake clock) and
+        keeps a persisted entry (persisted_at = the fake clock) and
         its two staged rows. Returns (idempotency key, persisted body,
         the RecoveredPrepared)."""
         from millrace.flush import _PUBLISH_MAX_ATTEMPTS
@@ -2947,7 +2978,7 @@ class TestReceiptHorizon:
         assert pending.request.persisted_at == fake_clock()
         return pending.request.idempotency_key, capture.bodies[0], pending
 
-    async def test_entry_inside_the_horizon_replays_byte_identically(
+    async def test_a_receipt_404_replays_byte_identically(
         self,
         httpx_mock: Any,
         stage_factory: Any,
@@ -2969,8 +3000,9 @@ class TestReceiptHorizon:
         assert report.outcome == "replayed"
         assert capture.bodies == [crashed_body]
         assert await staged_rows(stage, TEAM) == []
+        assert flusher.stats().prepared_replays == 1
 
-    async def test_entry_at_exactly_the_horizon_still_replays(
+    async def test_an_entry_older_than_any_retention_replays_and_is_counted(
         self,
         httpx_mock: Any,
         stage_factory: Any,
@@ -2979,25 +3011,150 @@ class TestReceiptHorizon:
         store: FakeObjectStore,
         sleeper: Sleeper,
     ) -> None:
-        """The boundary: age == horizon is INSIDE it (the guard is
-        `age > horizon`; flipped to `>=` this test reds)."""
+        """An entry persisted at the Unix epoch — older than
+        any receipt retention the server can run (30 d cap) — is still
+        republished verbatim on a 404 and counted. Its receipt may have
+        been purged, so the replay may land the window twice: accepted
+        at-least-once behaviour."""
         stage = await stage_factory()
-        flusher = flusher_factory(
-            store=store, cfg=make_config(target_output_bytes=1, receipt_horizon_s=100)
-        )
+        flusher = flusher_factory(store=store, cfg=make_config(target_output_bytes=1))
         key, crashed_body, pending = await self._crashed_pending(
             httpx_mock, stage, fake_clock, flusher
         )
-        fake_clock.advance(100 * 1_000_000)  # exactly the horizon, in micros
+        ancient = type(pending)(
+            key=pending.key,
+            request=dataclasses.replace(pending.request, persisted_at=0),
+        )
 
         script_receipt(httpx_mock, key, snapshot_id=None)
         capture = CommitCapture(httpx_mock, [commit_ok(50)])
-        report = await flusher.reconcile_prepared(stage, pending)
+        report = await flusher.reconcile_prepared(stage, ancient)
 
         assert report.outcome == "replayed"
+        assert report.snapshot_id == 50
         assert capture.bodies == [crashed_body]
+        assert await staged_rows(stage, TEAM) == []
+        assert await stage.load_prepared() == []
+        assert flusher.stats().prepared_replays == 1
+        assert flusher.stats().orphaned_uploads == 0
 
-    async def test_entry_past_the_horizon_halts_without_replaying(
+    async def test_a_replay_logs_the_entrys_age(
+        self,
+        httpx_mock: Any,
+        stage_factory: Any,
+        fake_clock: Any,
+        flusher_factory: Any,
+        store: FakeObjectStore,
+        sleeper: Sleeper,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The entry's age (now − ``persisted_at``) is in the replay's
+        log lines — the only record of how stale a replayed window was."""
+        stage = await stage_factory()
+        flusher = flusher_factory(store=store, cfg=make_config(target_output_bytes=1))
+        key, _body, pending = await self._crashed_pending(
+            httpx_mock, stage, fake_clock, flusher
+        )
+        fake_clock.advance(8 * 86_400 * 1_000_000)  # 8 d, past the 7 d default
+
+        script_receipt(httpx_mock, key, snapshot_id=None)
+        CommitCapture(httpx_mock, [commit_ok(50)])
+        with caplog.at_level(logging.INFO, logger="millrace.flush"):
+            await flusher.reconcile_prepared(stage, pending)
+
+        aged = [
+            r.getMessage()
+            for r in caplog.records
+            if "persisted 691200s ago" in r.getMessage()
+        ]
+        assert len(aged) == 2  # the no-receipt line and the replayed line
+        assert any(key in m for m in aged)
+
+    async def test_a_410_at_reconcile_reprepares_and_never_halts(
+        self,
+        httpx_mock: Any,
+        stage_factory: Any,
+        fake_clock: Any,
+        flusher_factory: Any,
+        store: FakeObjectStore,
+        sleeper: Sleeper,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """An entry older than the server's receipt retention: receipt
+        404, and the verbatim replay is answered 410 (its read_snapshot
+        sank below the expiry floor). No halt: the entry is dropped, its
+        objects are counted UNRESOLVED (they may be live table files of a
+        landed first attempt — never orphan-accounted), and the next
+        sweep rebuilds the window from the staged rows against a fresh
+        read and settles it."""
+        stage = await stage_factory()
+        flusher = flusher_factory(store=store, cfg=make_config(target_output_bytes=1))
+        key, crashed_body, pending = await self._crashed_pending(
+            httpx_mock, stage, fake_clock, flusher
+        )
+        crashed = json.loads(crashed_body)
+        uris = [f["path"] for f in crashed["appends"][0]["files"]]
+        ancient = type(pending)(
+            key=pending.key,
+            request=dataclasses.replace(pending.request, persisted_at=0),
+        )
+
+        script_receipt(httpx_mock, key, snapshot_id=None)
+        capture = CommitCapture(
+            httpx_mock,
+            [
+                commit_refusal(
+                    410,
+                    "expired",
+                    "read_snapshot 88 is below the expiry floor 90",
+                ),
+                commit_ok(51),
+            ],
+        )
+        with caplog.at_level(logging.WARNING, logger="millrace.flush"):
+            report = await flusher.reconcile_prepared(stage, ancient)
+
+        assert report.outcome == "reprepare"
+        assert capture.bodies == [crashed_body]  # the verbatim replay, once
+        assert await stage.load_prepared() == []
+        assert len(await staged_rows(stage, TEAM)) == 2
+        stats = flusher.stats()
+        assert stats.orphaned_uploads == 0
+        assert stats.unresolved_uploads == len(uris) == 1
+        assert stats.reprepared == {"read_snapshot_expired": 1}
+        assert stats.prepared_replays == 0
+        (warning,) = [
+            r.getMessage() for r in caplog.records if "may be live" in r.getMessage()
+        ]
+        assert "reconcile against the catalog before deleting" in warning
+        assert uris[0] in warning
+        assert key in warning
+        assert "orphaned 1 uploaded" not in caplog.text
+
+        # The next sweep re-reads the table (the 410 dropped the shape
+        # cache) and rebuilds the window: the window is unchanged, so the
+        # idempotency key is the SAME; the object names are FRESH (a new
+        # build token) and the read_snapshot is fresh.
+        script_table_refresh(httpx_mock, table=table_wire(read_snapshot_id=95))
+        report2 = await flusher.flush_key(
+            stage,
+            decision(TEAM, trigger="slow", staged_bytes=100, first_staged_ts=JAN_US),
+        )
+        assert report2.outcome == "committed"
+        assert report2.snapshot_id == 51
+        rebuilt = capture.payloads[1]
+        assert rebuilt["read_snapshot"] == 95
+        assert rebuilt["idempotency_key"] == key
+        rebuilt_paths = [f["path"] for f in rebuilt["appends"][0]["files"]]
+        assert set(rebuilt_paths).isdisjoint(uris)
+        assert all(f"/{key}/" in p for p in rebuilt_paths)
+        # No PUT ever targets a path an earlier build of the window used:
+        # the first attempt's (possibly live) objects are never touched.
+        assert len(store.opened) == len(set(store.opened))
+        assert await staged_rows(stage, TEAM) == []
+        assert await stage.load_prepared() == []
+
+    async def test_a_ddl_refusal_at_reconcile_counts_unresolved_not_orphaned(
         self,
         httpx_mock: Any,
         stage_factory: Any,
@@ -3006,34 +3163,36 @@ class TestReceiptHorizon:
         store: FakeObjectStore,
         sleeper: Sleeper,
     ) -> None:
-        """One microsecond past the horizon: the receipt may have been
-        purged, so the 404 is ambiguous and the pipeline HALTS for
-        operator reconciliation — no republish (duplication), nothing
-        settled, the entry and rows stay put."""
+        """``ddl_since_read_snapshot`` answering a recovered entry's replay
+        follows a receipt 404, so the entry's first attempt may have
+        landed with its receipt purged: the entry is dropped and the rows
+        re-prepare, but its objects are counted UNRESOLVED, never
+        orphaned."""
         stage = await stage_factory()
-        flusher = flusher_factory(
-            store=store, cfg=make_config(target_output_bytes=1, receipt_horizon_s=100)
-        )
+        flusher = flusher_factory(store=store, cfg=make_config(target_output_bytes=1))
         key, _body, pending = await self._crashed_pending(
             httpx_mock, stage, fake_clock, flusher
         )
-        fake_clock.advance(100 * 1_000_000 + 1)  # one microsecond past
-
         script_receipt(httpx_mock, key, snapshot_id=None)
-        capture = CommitCapture(httpx_mock, [])  # no commit may be sent
-        with pytest.raises(FlushHalted) as excinfo:
-            await flusher.reconcile_prepared(stage, pending)
+        CommitCapture(
+            httpx_mock,
+            [
+                commit_refusal(
+                    409,
+                    "ddl_since_read_snapshot",
+                    "concurrent DDL since snapshot 88 on table(s): ns1.events",
+                )
+            ],
+        )
+        report = await flusher.reconcile_prepared(stage, pending)
 
-        assert excinfo.value.reason == "receipt_horizon_exceeded"
-        assert key in excinfo.value.detail  # the operator's lookup handle
-        assert capture.bodies == []
-        # nothing settled: the prepared entry and the staged rows survive
-        assert len(await stage.load_prepared()) == 1
+        assert report.outcome == "reprepare"
+        assert await stage.load_prepared() == []
         assert len(await staged_rows(stage, TEAM)) == 2
-        # the possibly-live uploads are NOT orphan-accounted (they may be
-        # referenced by a landed commit — naming them for deletion could
-        # lose data)
-        assert flusher.stats().orphaned_uploads == 0
+        stats = flusher.stats()
+        assert stats.orphaned_uploads == 0
+        assert stats.unresolved_uploads == 1
+        assert stats.reprepared == {"ddl_since_read_snapshot": 1}
 
     async def test_an_envelope_naming_another_partition_tuple_is_corruption(
         self,
@@ -3076,17 +3235,15 @@ class TestReceiptHorizon:
         store: FakeObjectStore,
         sleeper: Sleeper,
     ) -> None:
-        """The horizon gates only the BLIND replay: a 200 receipt is
-        ground truth and settles at ANY age (a receipt still standing
-        past its retention is purge lag — the safe direction)."""
+        """A 200 receipt is ground truth and settles at ANY age with zero
+        republication (a receipt still standing past its retention is
+        purge lag)."""
         stage = await stage_factory()
-        flusher = flusher_factory(
-            store=store, cfg=make_config(target_output_bytes=1, receipt_horizon_s=100)
-        )
+        flusher = flusher_factory(store=store, cfg=make_config(target_output_bytes=1))
         key, _body, pending = await self._crashed_pending(
             httpx_mock, stage, fake_clock, flusher
         )
-        fake_clock.advance(10_000 * 1_000_000)  # 100x past the horizon
+        fake_clock.advance(365 * 86_400 * 1_000_000)  # a year old
 
         script_receipt(httpx_mock, key, snapshot_id=50)
         capture = CommitCapture(httpx_mock, [])  # no commit may be sent
@@ -3095,91 +3252,9 @@ class TestReceiptHorizon:
         assert report.outcome == "receipt_settled"
         assert await staged_rows(stage, TEAM) == []
         assert capture.bodies == []
+        assert flusher.stats().prepared_replays == 0
 
-    async def test_the_horizon_comes_from_the_server_when_exposed(
-        self,
-        httpx_mock: Any,
-        stage_factory: Any,
-        fake_clock: Any,
-        flusher_factory: Any,
-        store: FakeObjectStore,
-        sleeper: Sleeper,
-    ) -> None:
-        """The wire exposes no receipt retention today, but a pyhoglake
-        that grows ``Catalog._receipt_retention_seconds`` is honored when
-        present: its (positive) value, not the knob, is the horizon."""
-
-        class CatalogWithReceiptRetention:
-            def _receipt_retention_seconds(self) -> float:
-                return 100.0  # far below the knob's 6-day default
-
-        stage = await stage_factory()
-        flusher = flusher_factory(store=store, cfg=make_config(target_output_bytes=1))
-        key, _body, pending = await self._crashed_pending(
-            httpx_mock, stage, fake_clock, flusher
-        )
-        flusher._catalog = CatalogWithReceiptRetention()  # type: ignore[assignment]
-        fake_clock.advance(200 * 1_000_000)  # inside the knob, past the server
-
-        script_receipt(httpx_mock, key, snapshot_id=None)
-        with pytest.raises(FlushHalted) as excinfo:
-            await flusher.reconcile_prepared(stage, pending)
-        assert excinfo.value.reason == "receipt_horizon_exceeded"
-
-    async def test_server_horizon_inf_and_knob_fallback(
-        self,
-        httpx_mock: Any,
-        stage_factory: Any,
-        fake_clock: Any,
-        flusher_factory: Any,
-        store: FakeObjectStore,
-        sleeper: Sleeper,
-    ) -> None:
-        """inf from the server means receipts are kept forever: no
-        horizon at all (a 404 can only mean never-landed). A raising
-        accessor falls back to the knob."""
-        stage = await stage_factory()
-        flusher = flusher_factory(
-            store=store, cfg=make_config(target_output_bytes=1, receipt_horizon_s=60)
-        )
-        key, crashed_body, pending = await self._crashed_pending(
-            httpx_mock, stage, fake_clock, flusher
-        )
-
-        class CatalogWithForeverReceipts:
-            def _receipt_retention_seconds(self) -> float:
-                return float("inf")
-
-        flusher._catalog = CatalogWithForeverReceipts()  # type: ignore[assignment]
-        fake_clock.advance(120 * 1_000_000)  # past the knob, "forever" says fine
-        script_receipt(httpx_mock, key, snapshot_id=None)
-        capture = CommitCapture(httpx_mock, [commit_ok(50)])
-        report = await flusher.reconcile_prepared(stage, pending)
-        assert report.outcome == "replayed"
-        assert capture.bodies == [crashed_body]
-
-        # A broken accessor: the knob governs. Fresh entry, age past the
-        # 60s knob → halt.
-        stage2 = await stage_factory(partition=1)
-        flusher2 = flusher_factory(
-            store=store, cfg=make_config(target_output_bytes=1, receipt_horizon_s=60)
-        )
-        key2, _body2, pending2 = await self._crashed_pending(
-            httpx_mock, stage2, fake_clock, flusher2
-        )
-
-        class CatalogWithABrokenAccessor:
-            def _receipt_retention_seconds(self) -> float:
-                raise OSError("the options endpoint is down")
-
-        flusher2._catalog = CatalogWithABrokenAccessor()  # type: ignore[assignment]
-        fake_clock.advance(120 * 1_000_000)
-        script_receipt(httpx_mock, key2, snapshot_id=None)
-        with pytest.raises(FlushHalted) as excinfo:
-            await flusher2.reconcile_prepared(stage2, pending2)
-        assert excinfo.value.reason == "receipt_horizon_exceeded"
-
-    async def test_the_runner_halts_and_stays_halted_past_the_horizon(
+    async def test_the_runner_replays_an_aged_survivor_without_halting(
         self,
         httpx_mock: Any,
         memory_store: Any,
@@ -3188,9 +3263,47 @@ class TestReceiptHorizon:
         store: FakeObjectStore,
         sleeper: Sleeper,
     ) -> None:
-        """At the loop level: a recovery survivor past the horizon stops
-        the pipeline loudly (the halt is sticky), never republishes."""
-        cfg = make_config(target_output_bytes=1, receipt_horizon_s=100)
+        """At the loop level: a recovery survivor a year old with no
+        receipt is republished at the first sweep; the runner does not
+        halt."""
+        cfg = make_config(target_output_bytes=1)
+        async with StageManager(
+            "memory:///", "millrace", settings=fast_flush_settings()
+        ) as manager:
+            stage = (await manager.open_partition("events", 0)).stage
+            flusher = flusher_factory(store=store, cfg=cfg)
+            key, crashed_body, _pending = await self._crashed_pending(
+                httpx_mock, stage, fake_clock, flusher
+            )
+            fake_clock.advance(365 * 86_400 * 1_000_000)
+
+            script_receipt(httpx_mock, key, snapshot_id=None)
+            capture = CommitCapture(httpx_mock, [commit_ok(50)])
+            r = runner(manager, flusher, cfg, fake_clock, sleeper)
+            sweep = await r.run_once()
+
+            assert r.halted is None
+            assert sweep.replayed == 1
+            assert capture.bodies == [crashed_body]
+            assert flusher.stats().prepared_replays == 1
+            assert await staged_rows(stage, TEAM) == []
+
+    async def test_the_runner_reprepares_an_aged_survivor_on_410_without_halting(
+        self,
+        httpx_mock: Any,
+        memory_store: Any,
+        fake_clock: Any,
+        flusher_factory: Any,
+        store: FakeObjectStore,
+        sleeper: Sleeper,
+    ) -> None:
+        """At the loop level: a survivor older than the server's default
+        receipt retention (8 d), receipt 404, replay answered 410 — the
+        runner does not halt, the entry is dropped, and the staged rows
+        publish on a later sweep. (8 d, not a year: a rebuild runs the
+        junk event_time window against the CURRENT clock, and a year on
+        it would drop every row.)"""
+        cfg = make_config(target_output_bytes=1)
         async with StageManager(
             "memory:///", "millrace", settings=fast_flush_settings()
         ) as manager:
@@ -3199,17 +3312,34 @@ class TestReceiptHorizon:
             key, _body, _pending = await self._crashed_pending(
                 httpx_mock, stage, fake_clock, flusher
             )
-            fake_clock.advance(101 * 1_000_000)
+            fake_clock.advance(8 * 86_400 * 1_000_000)
 
             script_receipt(httpx_mock, key, snapshot_id=None)
+            script_table_refresh(httpx_mock, table=table_wire(read_snapshot_id=95))
+            capture = CommitCapture(
+                httpx_mock,
+                [commit_refusal(410, "expired", "below the floor"), commit_ok(51)],
+            )
             r = runner(manager, flusher, cfg, fake_clock, sleeper)
-            with pytest.raises(FlushHalted) as first:
+            for _ in range(3):
                 await r.run_once()
-            assert r.halted is not None
-            assert first.value.reason == "receipt_horizon_exceeded"
-            with pytest.raises(FlushHalted) as again:
-                await r.run_once()
-            assert again.value is first.value  # halted is sticky
+                if not await staged_rows(stage, TEAM):
+                    break
+
+            assert r.halted is None
+            assert flusher.stats().reprepared == {"read_snapshot_expired": 1}
+            assert flusher.stats().orphaned_uploads == 0
+            assert flusher.stats().unresolved_uploads == 1
+            assert len(capture.bodies) == 2
+            assert capture.payloads[1]["read_snapshot"] == 95
+            first, rebuilt = capture.payloads
+            assert rebuilt["idempotency_key"] == first["idempotency_key"] == key
+            assert {f["path"] for f in first["appends"][0]["files"]}.isdisjoint(
+                f["path"] for f in rebuilt["appends"][0]["files"]
+            )
+            assert len(store.opened) == len(set(store.opened))
+            assert await staged_rows(stage, TEAM) == []
+            assert await stage.load_prepared() == []
 
 
 # =====================================================================================
@@ -3412,7 +3542,7 @@ class TestRecoveryHandoff:
             assert capture.bodies == [crashed_body]
             stage = manager.stage("events", 0)
             assert await staged_rows(stage, TEAM) == []
-            assert flusher2.stats().flushes_replayed == 1
+            assert flusher2.stats().prepared_replays == 1
 
 
 # =====================================================================================
@@ -4029,13 +4159,11 @@ class TestFlushConfigKnobs:
             "MILLRACE_EVENT_TIME_MAX_PAST_S": "3600",
             "MILLRACE_EVENT_TIME_MAX_FUTURE_S": "60",
             "MILLRACE_FLUSH_SWEEP_S": "10",
-            "MILLRACE_RECEIPT_HORIZON_S": "432000",
         }
         cfg = load_config(env)
         assert cfg.event_time_max_past_s == 3600
         assert cfg.event_time_max_future_s == 60
         assert cfg.flush_sweep_s == 10
-        assert cfg.receipt_horizon_s == 432000
 
     def test_event_time_window_defaults_and_validation(self) -> None:
         from millrace.config import ConfigError, load_config
@@ -4053,11 +4181,8 @@ class TestFlushConfigKnobs:
         assert cfg.event_time_max_past_s == 30 * 86400
         assert cfg.event_time_max_future_s == 86400
         assert cfg.flush_sweep_s == 5
-        assert cfg.receipt_horizon_s == 6 * 86400
         with pytest.raises(ConfigError):
             load_config(env | {"MILLRACE_EVENT_TIME_MAX_FUTURE_S": "0"})
-        with pytest.raises(ConfigError, match="MILLRACE_RECEIPT_HORIZON_S"):
-            load_config(env | {"MILLRACE_RECEIPT_HORIZON_S": "0"})
 
     def test_scan_budget_ratio_and_concurrency_knobs(self) -> None:
         from millrace.config import ConfigError, load_config
@@ -4209,6 +4334,7 @@ class TestJunkWindowBoundaries:
             idempotency_key=ikey(0, 7, 0, 1),
             read_snapshot=88,
             table_uuid=TABLE_UUID,
+            build="b0",
         )
         # A window wide enough to hold both (the policy is not under test here).
         plan = build_prepared_plan(
@@ -4272,6 +4398,7 @@ class TestJunkWindowBoundaries:
             idempotency_key=ikey(0, 7, 0, 0),
             read_snapshot=88,
             table_uuid=TABLE_UUID,
+            build="b0",
         )
         plan = build_prepared_plan(
             records,
@@ -4336,6 +4463,7 @@ class TestJunkWindowBoundaries:
             idempotency_key=ikey(0, 7, 0, 2),
             read_snapshot=88,
             table_uuid=TABLE_UUID,
+            build="b0",
         )
         plan = build_prepared_plan(
             records,

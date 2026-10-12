@@ -62,7 +62,7 @@ from prometheus_client.core import REGISTRY, CounterMetricFamily, GaugeMetricFam
 
 from .config import Config, ConfigError, load_config
 from .consumer import ConsumerFencedError, MillraceConsumer, create_kafka_consumer
-from .flush import FlushHalted, FlushRunner, HoglakeFlusher
+from .flush import REPREPARE_REASONS, FlushHalted, FlushRunner, HoglakeFlusher
 from .grouping import GroupKeyer
 from .server import serve
 from .slatedb_metrics import MetricSnapshot, slatedb_families, snapshot_recorder
@@ -260,19 +260,14 @@ class _PipelineCollector:
                 f.flushes_committed,
             ),
             (
-                "millrace_flushes_replayed_total",
-                "Persisted commits replayed",
-                f.flushes_replayed,
+                "millrace_prepared_replays_total",
+                "Persisted prepared/ entries republished on a receipt 404",
+                f.prepared_replays,
             ),
             (
                 "millrace_receipt_settlements_total",
                 "Recovered commits settled from the receipt",
                 f.receipt_settlements,
-            ),
-            (
-                "millrace_flush_reprepares_total",
-                "Commits re-prepared after ddl_since_read_snapshot",
-                f.reprepares,
             ),
             (
                 "millrace_flush_rows_published_total",
@@ -289,6 +284,11 @@ class _PipelineCollector:
                 "Uploaded objects abandoned without a commit",
                 f.orphaned_uploads,
             ),
+            (
+                "millrace_flush_unresolved_uploads_total",
+                "Objects of a dropped prepared/ entry that may be live or orphaned",
+                f.unresolved_uploads,
+            ),
         ]
         for name, doc, value in counters:
             yield CounterMetricFamily(name, doc, value=value)
@@ -303,6 +303,15 @@ class _PipelineCollector:
         for reason, count in sorted(by_reason.items()):
             dropped.add_metric([reason], count)
         yield dropped
+        reprepared = CounterMetricFamily(
+            "millrace_prepared_reprepared_total",
+            "prepared/ entries dropped and re-prepared from the staged rows, "
+            "by the refusal that forced it",
+            labels=["reason"],
+        )
+        for reason in REPREPARE_REASONS:
+            reprepared.add_metric([reason], f.reprepared.get(reason, 0))
+        yield reprepared
         if self._runner is not None:
             runner = self._runner  # narrowing survives the lambda below
             fenced = GaugeMetricFamily(

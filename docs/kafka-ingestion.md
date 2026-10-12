@@ -272,10 +272,10 @@ idempotency key's derivation inputs — `topic`, `partition` and the
 partition tuple as hoglake partition values (field names beside wire
 strings) — beside the key and body, so a recovered entry is
 self-describing and recovery cross-checks it against the stage's own
-identity and its `prepared/` key; it also carries `persisted_at` so the
-replay is bounded by the receipt horizon (§Delivery semantics): a 404 past the horizon is ambiguous with
-a purged receipt and halts the pipeline for operator reconciliation
-rather than risking a duplicate. Recovery also
+identity and its `prepared/` key; it also carries `persisted_at`, which
+the replay logs as the entry's age and which gates nothing: a 404 is
+replayed whatever the age, and a replay answered 410 re-prepares from
+the staged rows (§Delivery semantics). Recovery also
 collects any `flushed/` markers left by pre-lifecycle builds — settled
 garbage by construction — in bounded pages, one delete batch per page,
 so a partition's recovery never stalls on marker volume. Sweeps across
@@ -306,7 +306,9 @@ shape (AGENT.md invariant 12 exists because of that shape):
   reconciles receipt-first). `ddl_since_read_snapshot` is the
   *re-prepare* signal — drop the entry, re-read the table, rebuild the
   request, never replay the refused payload; `table_recreated`,
-  `table_dropped` and 410 halt the pipeline. 503 `commit_queue_timeout`
+  `table_dropped` and 410 halt the pipeline, except a 410 answering a
+  recovered entry's replay, which re-prepares (§Delivery semantics).
+  503 `commit_queue_timeout`
   backs off per `Retry-After`.
 - The complete prepared commit request is persisted (SlateDB side
   prefix) **before** publication and is never regenerated after an
@@ -316,14 +318,18 @@ shape (AGENT.md invariant 12 exists because of that shape):
   `millrace:v2:table=<uuid>:topic=<t>:partition=<n>:group=<k0=…/k1=…>:offsets=<first>-<last>`,
   the tuple's wire strings under POSITIONAL names, percent-encoded —
   a function of the staged tuple alone, so no spec change can move the
-  key or its object names; display names such as
+  key; display names such as
   `team_id=42/timestamp_month=681` appear only in the commit message and
   the `prepared/` envelope) — topic and
   partition are derivation inputs because offsets are per partition:
   two partitions flushing one group
   over the same offset range must never share a key or the object URIs
-  derived from it. The same rows re-flushed produce the same request,
-  and the server's receipt dedupes the replay.
+  under it. Object URIs are `…/{key}/{build}/{index}.parquet`, `build`
+  a fresh uuid4 hex per build (millpond's rule: a retry under the same
+  key writes fresh objects). A verbatim replay sends the persisted bytes
+  and so names the persisted objects, and the server's receipt dedupes
+  it; the same rows re-flushed produce the same request apart from the
+  build token.
 - An answered refusal is judged, not retried, and never deletes staged
   rows. Every answered 4xx outside the named arms — a proxy's 401/403,
   an ingress's 413, a request-shape `validation` 422, a per-record
@@ -356,9 +362,13 @@ area: a Kafka offset commits only after every record at or below it is
 durable in SlateDB or was dropped and counted; staged ranges
 are deleted strictly after a commit receipt. Crash between commit and
 delete → the range re-flushes → the persisted prepared request replays
-byte-identically → the receipt dedupes it. Duplicates require a flush
-boundary shift across restart, which the persisted request prevents.
-410 below the retention floor is a stop sign, never a skip.
+byte-identically → the receipt dedupes it. Duplicates otherwise require
+a flush boundary shift across restart, which the persisted request
+prevents, or a recovered entry that outlives the server's receipt
+retention (below).
+410 below the retention floor is a stop sign, never a skip — on a
+fresh publish it halts; on a recovered entry's replay it re-prepares
+from the still-staged rows (below).
 
 That absorption has a precise boundary: replay is idempotent only for
 rows still **staged**. A re-consumed record re-puts the same `rows/`
@@ -384,8 +394,8 @@ unconsumed backlog is silently never consumed — removal-by-omission.
 either setting.) `earliest` remains available for a deployment that
 would rather replay than skip. Either setting faces the same
 settled-floor boundary above — millrace's per-partition staged state
-makes a replay idempotent above it, and the receipt horizon below
-bounds the ambiguity — so the choice is operational, not semantic. The
+makes a replay idempotent above it, and below it re-consumed records
+publish under new keys — so the choice is operational, not semantic. The
 operators' levers are therefore **group-id stability** (a pipeline's
 group never changes) and **offset retention**
 (`offsets.retention.minutes` must outlive any window in which a dark
@@ -399,23 +409,49 @@ server's commit receipts, and receipts are PURGED
 catalog at twice its snapshot retention, capped at 30 days, and refused
 below one hour server-side). A partition dark past that retention can
 hold a `prepared/` entry whose receipt is gone whether or not its
-commit landed; replaying blindly could duplicate an executed commit. So
-a receipt 404 is answered with a replay only while the persisted entry
-is younger than the **receipt horizon** — `MILLRACE_RECEIPT_HORIZON_S`,
-default 6 days, deliberately below the server's default. The dependency
-is NOT on the wire — the server exposes snapshot retention but never
-receipt retention (verified against the OpenAPI: `CatalogOptions`
-carries `snapshot_retention_seconds` only; `GET /v1/info` is instance
-identity) — so the knob CARRIES the assumption that it stays below the
-server's effective purge floor (`max(HOGLAKE_RECEIPT_RETENTION_SECONDS,
-2 × snapshot retention)`, capped 30 d), and an operator who changes the
-server's retention posture must re-check this knob against it. If
-pyhoglake grows a `Catalog._receipt_retention_seconds` accessor the
-flusher honors it over the knob (the guarded seam,
-`flush.py:_receipt_horizon_s`; "receipts kept forever" means no
-horizon). Past the horizon — or on a pre-`persisted_at` (v1) envelope,
-whose age is unknowable — the pipeline HALTS loudly for operator
-reconciliation instead of replaying.
+commit landed. millrace does not guard on the entry's age; the chain
+is:
+
+1. Receipt 404 → the persisted bytes are replayed verbatim under the
+   same key.
+2. On any catalog with snapshot retention ≤ 30 d, a request old enough
+   for its receipt to be purged has a `read_snapshot` below the expiry
+   floor (the receipt outlives the first landing by
+   `min(max(HOGLAKE_RECEIPT_RETENTION_SECONDS, 2 × snapshot retention), 30 d)`,
+   never less than the snapshot retention, and the request's
+   `read_snapshot` precedes that landing), so the replay is answered
+   **410**. That is not a halt at reconcile: the entry is dropped and
+   the still-staged rows **re-prepare** against a fresh read on a later
+   sweep, exactly like `ddl_since_read_snapshot`
+   (`millrace_prepared_reprepared_total{reason="read_snapshot_expired"}`).
+   The dropped entry's objects are NOT orphan-accounted — they may be
+   live files of a landed first attempt — but logged at WARNING and
+   counted in `millrace_flush_unresolved_uploads_total` for an operator
+   to reconcile against the catalog. A `ddl_since_read_snapshot`
+   answering the same replay is handled the same way (reason
+   `ddl_since_read_snapshot`): both follow a receipt 404 on an entry of
+   unknown fate.
+3. The rebuild keeps the idempotency key (a function of the window) but
+   mints fresh object names (a new build token), so it never touches
+   the first attempt's objects. If the first attempt landed, the window
+   now exists twice — two file-row sets over two object sets, exact
+   duplicate rows — accepted at-least-once behaviour, counted; the first
+   attempt's objects are the unresolved uploads above. A rebuild that
+   is itself abandoned leaves orphans, accounted as usual. The rebuild
+   applies the junk `event_time` window against the current clock: under
+   `MILLRACE_EVENT_TIME_POLICY=drop`, an entry older than
+   `MILLRACE_EVENT_TIME_MAX_PAST_S` (30 d) can rebuild with every row
+   dropped (counted under `event_time_out_of_window`) and settle with no
+   commit.
+4. Only with snapshot retention off, above 30 d, a consumer-floor
+   pin holding the floor down, or an expiry sweep that has not yet
+   advanced the floor does the verbatim replay itself execute:
+   a second set of file rows over the same objects
+   (`millrace_prepared_replays_total`). With retention above 30 d and
+   the first landing compacted and expired, its paths sit in the
+   removal queue and the replay is refused 409 `CommitConflict` —
+   retried, then `FlushPublishExhausted` each sweep — until the queue
+   drains.
 
 ## What the server owns (and what this design asks of it)
 

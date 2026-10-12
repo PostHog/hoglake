@@ -39,10 +39,13 @@ publication:
   topic, partition, partition tuple, first_offset, last_offset)`, and the request
   bytes are persisted before the first send. A replay republishes the
   same bytes under the same key and the server's receipt collapses it
-  into one commit, while the persisted request is younger than the
-  receipt horizon (`MILLRACE_RECEIPT_HORIZON_S`, default 6 d); past it a
-  missing receipt halts the pipeline instead of replaying.
-- Duplicates can only appear below the *settled floor*: if consumption
+  into one commit. A `prepared/` entry whose receipt lookup 404s is
+  replayed whatever its age. Past the server's receipt retention that
+  replay is normally answered 410 (its read snapshot is below the
+  expiry floor) and the window is re-prepared from the staged rows; if
+  the first attempt had landed, the window lands a second time. That
+  is accepted at-least-once behaviour and is counted (section 6).
+- Otherwise duplicates appear only below the *settled floor*: if consumption
   restarts at an offset whose rows were already flushed and deleted
   from staging (a changed `MILLRACE_KAFKA_GROUP_ID`, offsets aged out of
   `__consumer_offsets` under `earliest`), those records stage as new rows
@@ -240,7 +243,7 @@ strings under POSITIONAL names `k<i>` (percent-encoded, a null as a bare
 `…:group=k0=42/k1=681:offsets=0-41`. The key is a pure function of the
 staged tuple: a spec change between an upload and a rebuild of the same
 window — even one of the same arity, which would rename the display
-fields — cannot change the key or the object names derived from it.
+fields — cannot change the key.
 
 | Input | Why |
 |---|---|
@@ -248,9 +251,14 @@ fields — cannot change the key or the object names derived from it.
 | `topic`, `partition` | Offsets are per partition. Without them two partitions flushing one group over the same offset range would share a key and object URIs. |
 | group (positional form), `first_offset`, `last_offset` | The flushed window. Both ends, because "up to N" is not a row set after a rewind. |
 
-Parquet object names derive from the key
-(`{data_path}/data/{namespace}/{table}/{idempotency_key}/{index}.parquet`),
-so a rebuild of the same window rewrites the same object names.
+Parquet object names are
+`{data_path}/data/{namespace}/{table}/{idempotency_key}/{build}/{index}.parquet`,
+where `build` is a fresh uuid4 hex minted per build
+(`HoglakeFlusher.flush_key` → `FlushContext.build`; the builder stays
+pure). A verbatim replay sends the persisted bytes and names the
+persisted objects; a rebuild of the same window keeps the key and
+mints new object names, so it never overwrites an earlier build's
+objects (which a landed commit may reference).
 
 ## 4. The consume loop
 
@@ -602,9 +610,9 @@ stateDiagram-v2
   Decided --> Staged: upload or persist fails, orphans counted
   Decided --> Prepared: persist_prepared
   Prepared --> Committed: commit returns, or receipt 200 at recovery
-  Prepared --> Staged: ddl_since_read_snapshot, entry dropped
+  Prepared --> Staged: ddl_since_read_snapshot, or 410 at recovery, entry dropped
   Prepared --> Prepared: ladder exhausted, replayed next sweep
-  Prepared --> Halted: other answered 4xx, table_recreated, table_dropped, 410, past horizon
+  Prepared --> Halted: other answered 4xx, table_recreated, table_dropped, 410 on a fresh publish
   Committed --> Settled: commit_flushed transaction
   Settled --> Empty: group drained
   Settled --> Staged: younger rows remain
@@ -622,9 +630,10 @@ nothing: the payload is never resent.
 |---|---|---|---|
 | 409 `commit_conflict` | retryable | Drop shape cache, resend identical bytes; up to 5 attempts, delay `min(0.5 × 2^(n−1), 30)` s; then `FlushPublishExhausted`, entry kept | `test_commit_conflict_retries_the_identical_request`, `test_commit_conflict_exhaustion_keeps_the_prepared_entry` |
 | 409 `table_dropped` (same exception class) | halt | `FlushHalted("table_dropped")` | `test_table_dropped_409_halts` |
-| 409 `ddl_since_read_snapshot` | re-prepare | Count orphans, `drop_prepared`, outcome `reprepare`; rows re-decide next sweep against a fresh read | `test_ddl_since_read_snapshot_rebuilds_never_replays` |
+| 409 `ddl_since_read_snapshot` | re-prepare | Count orphans (fresh publish) or unresolved uploads (recovered entry's replay, section 6), `drop_prepared`, outcome `reprepare` (`millrace_prepared_reprepared_total{reason="ddl_since_read_snapshot"}`); rows re-decide next sweep against a fresh read, same key, fresh object names | `test_ddl_since_read_snapshot_rebuilds_never_replays`, `test_a_ddl_refusal_at_reconcile_counts_unresolved_not_orphaned` |
 | 409 `table_recreated` | halt | `FlushHalted("table_recreated")`, staged state kept | `test_table_recreated_halts_loudly_and_keeps_state` |
-| 410 read snapshot expired | halt | `FlushHalted("read_snapshot_expired")` with the server's reconcile detail | `test_410_halts_with_the_servers_reconcile_instructions` |
+| 410 read snapshot expired, fresh publish (`flush_key`) | halt | `FlushHalted("read_snapshot_expired")` with the server's reconcile detail; uploads orphan-accounted | `test_410_halts_with_the_servers_reconcile_instructions` |
+| 410 read snapshot expired, recovered entry's replay (`reconcile_prepared`) | re-prepare | Uploads counted unresolved, not orphaned (section 6); `drop_prepared`, outcome `reprepare` (`millrace_prepared_reprepared_total{reason="read_snapshot_expired"}`); rows re-decide next sweep against a fresh read | `test_a_410_at_reconcile_reprepares_and_never_halts`, `test_the_runner_reprepares_an_aged_survivor_on_410_without_halting` |
 | 404 destination | halt | `FlushHalted("destination_missing")` | — |
 | 422 `idempotency_key reused` | halt | `FlushHalted("idempotency_key_reused")`: foreign writer or broken determinism | `test_422_reused_idempotency_key_halts` |
 | Any other answered 4xx (400, 401, 403, 413, any other 422 — request-shape `validation` or `record_validation`) except 408/429 | halt | `FlushHalted("commit_refused")`, rows and `prepared/` entry kept; no answered refusal deletes staged rows | `test_422_request_shape_halts_with_rows_staged`, `test_422_record_validation_halts_with_rows_staged`, `test_answered_4xx_halts_with_rows_staged` |
@@ -633,8 +642,7 @@ nothing: the payload is never resent.
 
 `Retry-After` is captured from 429/503 responses by an httpx response
 hook (delta-seconds only) and consumed once. Every halt with uploaded objects counts and names them in
-`millrace_flush_orphaned_uploads_total` and the log, except
-`receipt_horizon_exceeded`, whose objects may be live data. All tests in
+`millrace_flush_orphaned_uploads_total` and the log. All tests in
 this table are in `tests/test_flush.py`.
 
 ## 6. Recovery and exactly what happens on restart
@@ -672,25 +680,58 @@ ambiguity set.
 3. `GET /v1/catalogs/{catalog}/commit/receipts/{idempotency_key}`.
    - **200**: settle locally with `commit_flushed`, zero republication,
      regardless of the entry's age. Outcome `receipt_settled`.
-   - **404 within horizon** (`now − persisted_at ≤ horizon`): `_publish`
-     the persisted payload verbatim, same key; settle. Outcome
-     `replayed`. Answered refusals follow the taxonomy above.
-   - **404 past horizon**: halt `receipt_horizon_exceeded`. Not
-     orphan-accounted.
+   - **404**: `_publish` the persisted payload verbatim, same key,
+     regardless of the entry's age; the entry's age
+     (`now − persisted_at`) is logged. Accepted → settle, outcome
+     `replayed`, counted in `millrace_prepared_replays_total`. Answered
+     410 → re-prepare (below). Other answered refusals follow the
+     taxonomy above.
 
 The entry is authoritative for its own window, which may be a strict
 prefix of what is now staged; the remainder is decided on a later sweep.
 The same path runs whenever `flush_key` finds an outstanding entry, so a
 ladder-exhausted publish is resolved receipt-first on the next sweep.
 
-The horizon is `MILLRACE_RECEIPT_HORIZON_S` (default 518,400 s = 6 d)
-unless pyhoglake's catalog exposes `_receipt_retention_seconds`
-(positive finite, or `inf` for no horizon), resolved once
-(`_receipt_horizon_s`). The server does not report receipt retention on
-the wire, so the knob must stay below the server's effective purge floor:
-`max(HOGLAKE_RECEIPT_RETENTION_SECONDS, 2 × snapshot retention)` capped
-at 30 d, where the server knob defaults to 7 d and refuses values under
-1 h.
+**Past the receipt retention.** The server purges receipts after
+`min(max(HOGLAKE_RECEIPT_RETENTION_SECONDS, 2 × snapshot retention), 30 d)`
+(the knob defaults to 7 d). A 404 for an entry older than that is
+ambiguous between "never landed" and "landed, receipt purged".
+`persisted_at` gates nothing; what happens is:
+
+1. The verbatim replay is sent. With snapshot retention ≤ 30 d the
+   request's `read_snapshot` (older than the first landing) is below
+   the expiry floor by the time the receipt is purged, so the server
+   answers 410.
+2. 410 at reconcile (`reconcile_prepared`; a `ddl_since_read_snapshot`
+   there is handled identically under its own reason): the dropped entry's objects
+   are logged at WARNING ("may be live … or orphaned; reconcile against
+   the catalog before deleting", with the entry's age and key) and
+   counted in `millrace_flush_unresolved_uploads_total`, not
+   `millrace_flush_orphaned_uploads_total`; the entry is dropped
+   (`drop_prepared`); `millrace_prepared_reprepared_total{reason="read_snapshot_expired"}`
+   increments; outcome `reprepare`; no halt. `_publish` already dropped
+   the shape cache.
+3. A later sweep plans the still-staged rows like any others and
+   rebuilds against a fresh read. An unchanged window keeps the
+   idempotency key; the build mints fresh object names, so the first
+   attempt's objects are never touched. If the first attempt landed,
+   the window now exists twice — two file-row sets over two object
+   sets, exact duplicate rows — and the first attempt's objects are the
+   unresolved uploads from step 2. An abandoned rebuild's objects are
+   orphans, accounted as usual. A rebuild whose own publish is lost and
+   whose read snapshot then expires goes through this step again, and
+   each such cycle leaves another unresolved object set behind. The rebuild applies the junk
+   `event_time` window against the current clock: under `drop`, an
+   entry older than `MILLRACE_EVENT_TIME_MAX_PAST_S` can rebuild with
+   every row dropped and settle with no commit.
+4. With snapshot retention off, above 30 d, a consumer-floor pin, or
+   an expiry sweep that has not yet advanced the floor, the verbatim
+   replay itself executes: a second set of file rows over
+   the same objects, counted in `millrace_prepared_replays_total`. If
+   the first landing was compacted and expired meanwhile, its paths sit
+   in the removal queue and the replay is refused 409 `CommitConflict`,
+   retried, then `FlushPublishExhausted` each sweep until the queue
+   drains.
 
 ### Failure → outcome
 
@@ -698,11 +739,11 @@ at 30 d, where the server knob defaults to 7 d and refuses values under
 |---|---|---|
 | Before `stage_batch` is durable | Nothing committed in Kafka | Records re-consumed from last commit and re-staged; row keys are derived from the record, so re-puts are idempotent |
 | After durable stage, before offset commit | Rows staged, offset behind | Same records re-put in place; `stats/` counters inflate (settle subtracts actuals; residue is removed by `reconcile_stats` when the group scans empty) |
-| After upload, before `persist_prepared` | Objects in lake, no entry | Orphans are counted only when the persist failed in-process (a crash counts nothing); next sweep rebuilds the window, same key and object names if the window is unchanged |
-| After persist, before commit landed | `prepared/` entry | Receipt 404 → verbatim replay inside the horizon |
+| After upload, before `persist_prepared` | Objects in lake, no entry | Orphans are counted only when the persist failed in-process; a crash leaves them uncounted and unnamed. Next sweep rebuilds the window: same key if the window is unchanged, fresh object names |
+| After persist, before commit landed | `prepared/` entry | Receipt 404 → verbatim replay, any age |
 | Commit landed, response lost or crash before settle | `prepared/` entry, server receipt | Receipt 200 → local settle, zero republication |
 | Publish ladder exhausted | `prepared/` entry | Next sweep reconciles receipt-first |
-| Entry older than the horizon with no receipt | `prepared/` entry | Halt (exit 3); operator reconciles against the catalog and drops the entry |
+| Commit landed, entry outlived the server's receipt retention | `prepared/` entry, receipt purged | Receipt 404 → verbatim replay → 410 → entry dropped, objects counted unresolved, rows re-prepared next sweep; the window lands twice (counted). Without a snapshot floor the replay itself lands twice |
 | Partition reassigned to another pod | DB at the partition's path | New owner opens it, `recover()` returns the entries, first sweep reconciles them |
 | Contested open (rollout overlap) | Two writers on one path | Old writer fenced: consumer exits 4, flush fences the partition out |
 | Table dropped and recreated | Pinned uuid stale | Halt `table_recreated` at the next shape refresh or commit |
@@ -797,7 +838,6 @@ default.
 | `MILLRACE_EVENT_TIME_POLICY` | `drop` | `drop` \| `clamp` | Flush-time junk `event_time` handling |
 | `MILLRACE_EVENT_TIME_MAX_PAST_S` | 2592000 (30 d) | positive | Junk window lower bound |
 | `MILLRACE_EVENT_TIME_MAX_FUTURE_S` | 86400 (1 d) | positive | Junk window upper bound |
-| `MILLRACE_RECEIPT_HORIZON_S` | 518400 (6 d) | positive | Max age of a `prepared/` entry that may be replayed on a receipt 404 |
 | `MILLRACE_FLUSH_SWEEP_S` | 5 | positive | Pause between flush sweeps |
 | `MILLRACE_FLUSH_SCAN_MIN_BYTES` | 67108864 (64 MiB) | positive | Floor of the per-decision byte scan budget |
 | `MILLRACE_FLUSH_SCAN_MAX_ROWS` | 8000000 | positive | Per-decision row scan budget |
@@ -830,12 +870,13 @@ feeds control flow.
 | `millrace_records_dropped_total` | counter | `reason` | Malformed records dropped, consume and flush time (section 4, "Dropped records"; section 5, step 6). Consume reasons: `invalid_offset`, `missing_timestamp`, `invalid_timestamp`, `missing_value`, `malformed_value`, `malformed_partition_source`. Flush reasons: `undecodable_payload`, `uncastable_column`, `event_time_out_of_window` |
 | `millrace_kafka_commits_total` | counter | — | Offset commit attempts, including retries |
 | `millrace_flushes_committed_total` | counter | — | Decisions committed by this process |
-| `millrace_flushes_replayed_total` | counter | — | Persisted requests republished at reconciliation |
+| `millrace_prepared_replays_total` | counter | — | `prepared/` entries republished verbatim on a receipt 404 and accepted (any age). The response does not say whether the server deduped it, so there is no outcome label. Each replay logs the entry's age |
+| `millrace_prepared_reprepared_total` | counter | `reason` (`ddl_since_read_snapshot`, `read_snapshot_expired`) | `prepared/` entries dropped and rebuilt from the staged rows (fresh publish or recovered entry); `read_snapshot_expired` is a recovered entry's replay answered 410 (section 6) |
 | `millrace_receipt_settlements_total` | counter | — | Entries settled from a receipt 200 |
-| `millrace_flush_reprepares_total` | counter | — | `ddl_since_read_snapshot` rebuilds |
 | `millrace_flush_rows_published_total` | counter | — | Rows in committed files |
 | `millrace_flush_files_written_total` | counter | — | Parquet files committed |
 | `millrace_flush_orphaned_uploads_total` | counter | — | Uploaded objects no commit references (upper bound; names are logged) |
+| `millrace_flush_unresolved_uploads_total` | counter | — | Objects of a `prepared/` entry dropped after a 410 or `ddl_since_read_snapshot` at reconcile: live files of a landed first attempt or orphans, only the catalog can say (names are logged) |
 | `millrace_flush_partition_fenced` | gauge (1) | `topic`, `partition` | Partition fenced out of flush scheduling |
 | `millrace_staged_bytes` | gauge | — | Staged payload bytes, pod total |
 | `millrace_staged_rows` | gauge | — | Staged rows, pod total |
@@ -915,7 +956,7 @@ object storage.
 | Data | Path | Credentials |
 |---|---|---|
 | Staging | `MILLRACE_STAGE_URL` → `{base}/{topic}/{partition}/` (SlateDB `manifest/`, `wal/`, `compacted/` …) | `AWS_*` |
-| Parquet | `{catalog.data_path}/data/{namespace}/{table}/{idempotency_key}/{index}.parquet` | `HOGLAKE_S3_*` or ambient |
+| Parquet | `{catalog.data_path}/data/{namespace}/{table}/{idempotency_key}/{build}/{index}.parquet` | `HOGLAKE_S3_*` or ambient |
 
 **Staging format.** This keyspace (partition-tuple groups, `prepared/`
 v4) is not readable by, and cannot read, staging written by the
@@ -983,9 +1024,9 @@ Each is pinned by the named test(s) under `tests/`.
 | 6 | Settlement deletes exactly the offset window and spares other rows of the group. | `test_stage.py::test_commit_flushed_deletes_exactly_the_window` (hypothesis), `test_keyspace.py::test_pending_delete_spares_younger_ranges_of_the_same_group` |
 | 7 | Settlement writes no `flushed/` marker; recovery collects legacy ones in bounded pages. | `test_stage.py::test_commit_flushed_writes_no_marker`, `test_stage.py::test_recover_collects_many_legacy_markers_in_bounded_pages` |
 | 8 | A persisted request is replayed byte-identically, in process and across restart; the persisted body is the wire body. | `test_flush.py::test_dropped_commit_response_replays_persisted_bytes_in_process`, `test_flush.py::test_crash_between_upload_and_commit_recovers_byte_identically`, `test_flush.py::test_prepared_body_is_the_wire_body` |
-| 9 | The same staged range produces the same request in a fresh process. | `test_flush.py::test_same_staged_range_flushes_byte_identically_across_processes` |
+| 9 | The same staged range produces the same request (same idempotency key) in a fresh process, apart from the per-build object-name token, which differs; no build PUTs a path an earlier build used. | `test_flush.py::test_same_staged_range_flushes_byte_identically_across_processes` |
 | 10 | A commit that landed without its settle is settled from the receipt with zero republication, at any age. | `test_flush.py::test_crash_between_commit_and_settle_is_receipt_settled`, `test_flush.py::test_receipt_200_settles_regardless_of_age` |
-| 11 | A receipt 404 replays only inside the horizon; past it the pipeline halts and stays halted. | `test_flush.py::test_entry_at_exactly_the_horizon_still_replays`, `test_flush.py::test_entry_past_the_horizon_halts_without_replaying`, `test_flush.py::test_the_runner_halts_and_stays_halted_past_the_horizon` |
+| 11 | A receipt 404 replays the persisted request verbatim at any age; an accepted replay settles, is counted, and logs the entry's age; the runner does not halt on an aged entry whose replay is accepted. | `test_flush.py::test_an_entry_older_than_any_retention_replays_and_is_counted`, `test_flush.py::test_a_replay_logs_the_entrys_age`, `test_flush.py::test_the_runner_replays_an_aged_survivor_without_halting` |
 | 12 | Two partitions flushing one group over the same offsets get distinct keys and object URIs; an entry naming another partition or another partition tuple is corruption. | `test_keyspace.py::test_identical_window_on_two_partitions_yields_different_keys`, `test_flush.py::test_two_partitions_same_group_same_offsets_distinct_keys_and_uris`, `test_flush.py::test_a_prepared_entry_naming_another_partition_is_corruption`, `test_flush.py::test_an_envelope_naming_another_partition_tuple_is_corruption` |
 | 13 | Every commit carries `read_snapshot` and `expected_table_uuid`; every table read is `totals=false`; the shape read precedes the scan; the cache TTL is retention ÷ 4. | `test_flush.py::test_flush_commits_the_wire_contract`, `test_flush.py::test_identity_reads_are_totals_false_everywhere`, `test_flush.py::test_the_shape_read_precedes_the_staged_scan`, `test_flush.py::test_shape_cache_ttl_is_a_quarter_of_retention` |
 | 14 | No answered refusal deletes staged rows: every answered 4xx other than the named arms (`record_validation` 422 included) halts with rows and `prepared/` entry staged. | `test_flush.py::test_422_record_validation_halts_with_rows_staged`, `test_flush.py::test_422_request_shape_halts_with_rows_staged`, `test_flush.py::test_answered_4xx_halts_with_rows_staged`, `test_flush.py::test_recovery_replay_answered_plain_422_halts` |
@@ -1011,6 +1052,7 @@ Each is pinned by the named test(s) under `tests/`.
 | 34 | A spec refresh starts new groups and leaves the old group staged and flushable; a transient re-read failure keeps the old keyer; a recreated table halts the consume loop without committing. | `test_consumer.py::test_a_spec_refresh_mid_stream_starts_new_groups_and_keeps_the_old`, `test_consumer.py::test_a_failed_shape_reread_keeps_the_old_keyer`, `test_consumer.py::test_a_recreated_table_at_reread_halts_the_loop_without_committing`, `test_flush.py::test_another_incarnation_halts_table_recreated` |
 | 35 | The Kafka key is never read; a malformed partition source is dropped naming the field. | `test_consumer.py::test_the_kafka_key_is_never_read`, `test_consumer.py::test_a_malformed_source_is_dropped_naming_the_field`, `test_consumer.py::test_a_keyless_topic_stages_by_the_payloads_partition_tuple` |
 | 36 | The idempotency key is a function of the staged tuple alone (positional names), never of the spec live at flush time. | `test_keyspace.py::test_idempotency_key_new_form_names_the_group_positionally`, `test_keyspace.py::test_idempotency_key_golden_vector`, `test_flush.py::test_a_group_keyed_under_an_older_spec_still_fans_out_by_the_live_one` |
+| 37 | A recovered entry's replay answered 410 or `ddl_since_read_snapshot` never halts: the entry is dropped, its objects are counted unresolved (never orphaned), the re-prepare is counted by reason, and the rows publish on a later sweep against a fresh read under the same key and fresh object names that no earlier build used. A fresh publish's 410 still halts. | `test_flush.py::test_a_410_at_reconcile_reprepares_and_never_halts`, `test_flush.py::test_a_ddl_refusal_at_reconcile_counts_unresolved_not_orphaned`, `test_flush.py::test_the_runner_reprepares_an_aged_survivor_on_410_without_halting`, `test_flush.py::test_410_halts_with_the_servers_reconcile_instructions` |
 
 The live suite (`tests/live/`, `just millrace live`) covers end-to-end
 per-tenant reconciliation, kill -9 mid-flush, a lost commit response,
@@ -1031,7 +1073,6 @@ freshness, the DDL race, drop+recreate halt, and compaction observation.
 | Window | The inclusive offset range `[first_offset, last_offset]` one flush publishes and settles |
 | Prepared commit | The complete commit request body, persisted under `prepared/` before the first send and replayed verbatim |
 | Receipt | The server's record of a committed idempotency key, read at `GET …/commit/receipts/{key}`; purged server-side after `HOGLAKE_RECEIPT_RETENTION_SECONDS` (V24) |
-| Receipt horizon | Max age of a prepared entry that may be replayed on a receipt 404 |
 | Settle | The single transaction that deletes a window's rows and updates `stats/`, `sched_age/`, `offsets/`, `prepared/` |
 | Settled floor | Offsets whose rows were published and deleted from staging; re-consuming below it duplicates |
 | Re-prepare | Dropping a refused prepared entry and rebuilding from staged rows against a fresh read |
@@ -1039,6 +1080,7 @@ freshness, the DDL race, drop+recreate halt, and compaction observation.
 | Fence | SlateDB's single-writer enforcement: a newer open closes the older writer with `Closed(FENCED)`; exit 4 at the consumer, scheduling exclusion at the flush loop |
 | Dropped record | A record that cannot become a row (consume time) or cannot be published (flush time): nothing is written for it, it is logged and counted in `millrace_records_dropped_total{reason}` |
 | Orphan | An uploaded parquet object no commit references |
+| Unresolved upload | An object of a `prepared/` entry dropped after a 410 or `ddl_since_read_snapshot` at reconcile: a live file of a landed first attempt or an orphan; never orphan-accounted |
 | Incarnation | A table's `table_uuid`; pinned at startup and sent as `expected_table_uuid` |
 | Shape | `TableInfo`: columns, partition spec, sort spec, `read_snapshot_id` |
 | Compression ratio | Parquet bytes ÷ staged bytes, the size lane's estimate |

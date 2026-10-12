@@ -78,11 +78,9 @@ Value formats
                the Unix epoch). The body is the byte-exact prepared
                commit request, written once and replayed
                byte-identically after an ambiguous response.
-               ``persisted_at`` is the receipt-horizon guard's input: a
-               persisted request whose receipt lookup 404s may only be
-               republished while it is YOUNGER than the receipt horizon —
-               past it, a 404 is indistinguishable from a purged receipt
-               and the flusher halts (flush.py). ``topic`` / ``partition``
+               ``persisted_at`` is forensic: the flusher logs an
+               entry's age when it replays one (flush.py) and gates
+               nothing on it. ``topic`` / ``partition``
                and the partition tuple are the idempotency key's
                derivation inputs: they make a persisted entry
                self-describing, and recovery cross-checks them against
@@ -140,8 +138,8 @@ in the name because receipts survive a table drop: without it a
 dropped-and-recreated table would answer a flush from its predecessor's
 receipt. TOPIC and PARTITION are in the name because Kafka offsets are
 PER PARTITION: two Kafka partitions flushing one tuple over the same
-offset range must never produce the same key (or the same object URIs,
-which derive from it). BOTH offset ends are in the name because
+offset range must never produce the same key (nor share the
+``…/{key}/`` object prefix under it). BOTH offset ends are in the name because
 "everything up to N" is not a row set once a partition rewinds.
 
 This module is pure: no I/O, no SlateDB, no clocks.
@@ -632,11 +630,9 @@ class PreparedRequest:
     byte-identically after an ambiguous response — never regenerated.
 
     ``persisted_at`` is the persistence instant in microseconds since the
-    Unix epoch (the flusher's injected clock) and is the receipt-horizon
-    guard's input: a receipt 404 may be answered with a blind replay only
-    while the entry is younger than the horizon — past it, the receipt
-    may have been PURGED server-side and a replay could duplicate an
-    already-executed commit, so the flusher halts (flush.py).
+    Unix epoch (the flusher's injected clock). It is forensic: the
+    flusher logs the entry's age when a receipt 404 replays it, and no
+    decision depends on it (flush.py).
 
     ``topic`` / ``partition`` / ``group`` (with ``group_fields``, the
     hoglake display names of the tuple's fields) are the derivation
@@ -897,8 +893,7 @@ def idempotency_key(
     :func:`group_key_form` — POSITIONAL names (``k<i>``), never the
     spec's display names: the key is a pure function of the staged
     tuple, so a spec change (even one of the same arity) between an
-    upload and its rebuild cannot change the key or the object names
-    derived from it. Display names live in the commit message and the
+    upload and its rebuild cannot change the key. Display names live in the commit message and the
     ``prepared/`` envelope only. Same inputs, same key, in every
     process, forever.
     ``table_uuid`` is canonicalized (parsed and re-emitted) so
@@ -907,10 +902,9 @@ def idempotency_key(
 
     ``topic``/``partition`` are derivation inputs because Kafka offsets
     are per partition: without them, two Kafka partitions flushing one
-    tuple over the same offset range derive the SAME key — and the same
-    object URIs, since those derive from the key — so the second
-    partition's upload would overwrite the first's committed objects
-    before the server refused the publish as a key reuse.
+    tuple over the same offset range derive the SAME key, and the
+    server would answer the second partition's commit from the first's
+    receipt (or refuse it as a key reuse) instead of publishing it.
     """
     canonical_table = str(uuid.UUID(table_uuid))
     encoded_topic = topic.encode("utf-8")

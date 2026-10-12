@@ -58,7 +58,6 @@ def test_minimal_env_yields_the_documented_defaults():
     assert cfg.poll_timeout_ms == 500
     assert cfg.event_time_policy is EventTimePolicy.DROP
     assert cfg.metrics_port == 8000
-    assert cfg.receipt_horizon_s == 6 * 86400  # below the server's 7 d default
     # The fleet policy default: latest (millpond's whole-retention
     # replay incident), earliest still selectable.
     assert cfg.kafka_auto_offset_reset is AutoOffsetReset.LATEST
@@ -341,7 +340,6 @@ def test_stage_url_unknown_scheme():
         "MILLRACE_CONSUME_BATCH_SIZE",
         "MILLRACE_CONSUME_BATCH_MAX_BYTES",
         "MILLRACE_POLL_TIMEOUT_MS",
-        "MILLRACE_RECEIPT_HORIZON_S",
         "MILLRACE_KAFKA_MAX_PARTITION_FETCH_BYTES",
         "MILLRACE_KAFKA_FETCH_MAX_BYTES",
         "MILLRACE_KAFKA_QUEUED_MAX_MESSAGES_KBYTES",
@@ -365,7 +363,6 @@ def test_positive_int_knobs_accept_valid_values():
             "MILLRACE_CONSUME_BATCH_SIZE": "11",
             "MILLRACE_CONSUME_BATCH_MAX_BYTES": "4096",
             "MILLRACE_POLL_TIMEOUT_MS": "42",
-            "MILLRACE_RECEIPT_HORIZON_S": "3600",
         }
     )
     assert cfg.target_output_bytes == 1024
@@ -376,7 +373,6 @@ def test_positive_int_knobs_accept_valid_values():
     assert cfg.consume_batch_size == 11
     assert cfg.consume_batch_max_bytes == 4096
     assert cfg.poll_timeout_ms == 42
-    assert cfg.receipt_horizon_s == 3600
 
 
 # -- SlateDB writer tuning (T9) ------------------------------------------------------

@@ -10,18 +10,15 @@ durable staging; staged ranges delete strictly after a commit receipt.
 The receipt dedupe rests on server-side receipts, which are purged
 (`HOGLAKE_RECEIPT_RETENTION_SECONDS`, default 7 d — floored per catalog
 at twice its snapshot retention, capped at 30 d): a persisted request
-whose receipt 404s is replayed only inside the receipt horizon
-(`MILLRACE_RECEIPT_HORIZON_S`, default 6 d — kept deliberately below the
-server's), and the pipeline halts loudly past it rather than risking a
-duplicate. The dependency is **not on the wire** — the server exposes
-snapshot retention but never receipt retention (verified against the
-OpenAPI: `CatalogOptions` carries `snapshot_retention_seconds` only;
-`GET /v1/info` is instance identity) — so the horizon knob CARRIES the
-assumption, and an operator who lowers the server's receipt retention
-(or raises a catalog's snapshot retention past ~3.5 d, which lifts the
-floor) must lower this knob with it. A pyhoglake that grows
-`Catalog._receipt_retention_seconds` is honored instead (the guarded
-seam, `flush.py:_receipt_horizon_s`).
+whose receipt 404s is replayed verbatim whatever its age. Past the
+receipt retention the replay's read snapshot is normally below the
+catalog's expiry floor, so it is answered 410 and re-prepared from the
+staged rows; if the first attempt had landed, the window lands a second
+time (duplicate rows). That is accepted at-least-once behaviour and is
+counted (`millrace_prepared_reprepared_total`,
+`millrace_prepared_replays_total`; the dropped entry's objects, possibly
+live, in `millrace_flush_unresolved_uploads_total`). Details:
+[architecture.md](architecture.md) §6.
 
 Design: [docs/kafka-ingestion.md](../docs/kafka-ingestion.md).
 Build/test sequence: [docs/kafka-ingestion-plan.md](../docs/kafka-ingestion-plan.md).

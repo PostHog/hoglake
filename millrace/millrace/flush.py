@@ -42,21 +42,24 @@ born correct; it does not repeat millpond's blind-append shape):
   from the still-staged rows against a fresh read. The two rules are
   kept deliberately distinct in the code below (``_publish`` retries
   identical bytes; the refusal arms drop the persisted entry).
-- Regeneration is deterministic by construction: same staged rows, same
-  table basis, same clock → byte-identical request. Object names derive
-  from the idempotency key (``…/{key}/{index}.parquet``) rather than a
-  random uuid, so a rebuild after a crash between upload and persist
-  rewrites the SAME object names instead of leaving a second copy —
-  the orphan counter stays honest about this (it counts abandonment
-  events; a same-window rebuild reclaims the names). This is why the
-  payload is assembled here over pyhoglake's primitives
+- Regeneration is deterministic apart from one token: same staged
+  rows, same table basis, same clock → the same request except for the
+  per-build object-name token. The idempotency key is a pure function
+  of the window (a receipt still dedupes a verbatim replay); object
+  names are ``…/{key}/{build}/{index}.parquet`` with ``build`` a fresh
+  uuid4 hex minted per build (millpond's rule: a retry under the SAME
+  key writes fresh objects). A verbatim replay sends the persisted
+  bytes and so names the persisted objects; only a REBUILD mints new
+  names, so a rebuild never overwrites an object a landed first attempt
+  may have registered. The cost: a crash between upload and persist
+  leaves objects nothing names or counts. The payload is assembled here
+  over pyhoglake's primitives
   (:func:`pyhoglake.types.columns_to_arrow_schema`,
   :func:`pyhoglake.parquet_schema.prepared_schema_matches`,
   :func:`pyhoglake.stats.extract_column_stats`,
   :mod:`pyhoglake.transforms`, :mod:`pyhoglake.upload`) instead of via
-  ``Table.prepare_append_tables``: that method mints ``uuid4()`` object
-  names, and "the same rows re-flushed produce the same request"
-  (docs/kafka-ingestion.md §The wire contract) does not survive that.
+  ``Table.prepare_append_tables`` so the builder stays pure: the token
+  arrives in :class:`FlushContext`.
 
 Refusal taxonomy (each recovery pinned by its own test):
 
@@ -70,9 +73,13 @@ Refusal taxonomy (each recovery pinned by its own test):
   read.
 - 409 ``table_recreated``: halt the pipeline loudly (incarnation guard;
   viaduck lesson 3). The pinned uuid never changes hands mid-run.
-- 410 (``ReadSnapshotExpiredError``): halt, carrying the server's
-  reconcile instructions (viaduck lesson 4; "410 below the retention
-  floor is a stop sign, never a skip").
+- 410 (``ReadSnapshotExpiredError``) on a fresh publish: halt, carrying
+  the server's reconcile instructions (viaduck lesson 4; "410 below the
+  retention floor is a stop sign, never a skip"). On a RECOVERED entry's
+  replay (``reconcile_prepared``): re-prepare like
+  ``ddl_since_read_snapshot`` — drop the entry, rebuild from the
+  still-staged rows on a later sweep — but count its objects UNRESOLVED
+  rather than orphaned (a landed first attempt may own them).
 - 503 ``commit_queue_timeout`` (and other 5xx / transport failures):
   ambiguous — back off per ``Retry-After`` (captured through an httpx
   hook, millpond's pattern) floored against an exponential curve, retry
@@ -168,15 +175,24 @@ Recovery handoff: :meth:`FlushRunner.run_once` reconciles every newly
 claimed partition before planning it: ``PartitionStage.recover()``
 collects legacy ``flushed/`` markers (bounded pages) and returns each
 surviving ``prepared/`` entry, which is reconciled by receipt lookup —
-a 200 receipt settles the range locally (zero republication), a 404
-republishes the persisted bytes verbatim INSIDE the receipt horizon
+a 200 receipt settles the range locally (zero republication), and a
+404 republishes the persisted bytes verbatim whatever the entry's age
 (same idempotency key, so the server's receipt dedupes a landing replay
-into one logical commit), and a 404 PAST the horizon halts loudly: the
-receipt may have been purged server-side
-(``HOGLAKE_RECEIPT_RETENTION_SECONDS``, default 7 d), and replaying
-could duplicate an already-executed commit
-(``MILLRACE_RECEIPT_HORIZON_S``, default 6 d — deliberately below;
-``persisted_at`` on the ``prepared/`` envelope is the guard's input).
+into one logical commit), logging the entry's age (``persisted_at`` on
+the ``prepared/`` envelope). The server purges receipts after
+``min(max(HOGLAKE_RECEIPT_RETENTION_SECONDS, 2 × snapshot retention),
+30 d)``; by then a request's ``read_snapshot`` is below the catalog's
+expiry floor (snapshot retention ≤ 30 d), so a replay that old is
+answered 410 and the window re-prepares from the staged rows — under
+the same key when the window is unchanged, always under fresh object
+names (a new build token), so the first attempt's objects are never
+touched. If the first attempt landed, the window lands a second time
+(two file-row sets over two object sets): accepted
+at-least-once behaviour, counted
+(``millrace_prepared_reprepared_total{reason="read_snapshot_expired"}``;
+the possibly-live objects in ``millrace_flush_unresolved_uploads_total``).
+Without a snapshot floor the verbatim replay itself executes (a second
+set of file rows over the same objects; ``millrace_prepared_replays_total``).
 The envelope (v4) also carries the idempotency key's derivation inputs
 — ``topic``, ``partition`` and the partition tuple as hoglake partition
 values (field names beside wire strings) — cross-checked at recovery
@@ -237,6 +253,7 @@ import math
 import re
 import struct
 import time
+import uuid
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from concurrent.futures import Executor, ThreadPoolExecutor
@@ -356,6 +373,10 @@ _ASSUMED_RETENTION_S: Final = 1800.0
 # error AND detail (millpond's `_error_text` rule: hoglake's body is
 # {error, detail} and for a 422 the sentence is in the detail).
 _REUSED_KEY_MARKER: Final = "idempotency_key reused"
+#: ``millrace_prepared_reprepared_total`` reason labels.
+_REPREPARE_DDL: Final = "ddl_since_read_snapshot"
+_REPREPARE_EXPIRED: Final = "read_snapshot_expired"
+REPREPARE_REASONS: Final = (_REPREPARE_DDL, _REPREPARE_EXPIRED)
 
 # How long the offsets line of a commit message may be, in bytes (the
 # server stores `message` as unbounded text; this bound is millrace's own).
@@ -401,15 +422,13 @@ class FlushStartupError(FlushError):
 
 class FlushHalted(FlushError):
     """The pipeline must stop loudly (viaduck lesson 3/4 posture):
-    ``table_recreated``, a 410 below the expiry floor, an idempotency-key
+    ``table_recreated``, a 410 below the expiry floor on a fresh publish
+    (a recovered entry's 410 re-prepares instead), an idempotency-key
     identity anomaly, the destination gone, any other answered 4xx
     (``commit_refused`` — the rows stay staged and the persisted entry
     stays for an operator; no answered refusal deletes rows), a
     settlement that disagrees with the scan, a fanout the
-    commit bound cannot hold, or a persisted ``prepared/`` entry whose
-    receipt 404s PAST the receipt horizon (replaying it could duplicate
-    an already-executed commit — operator reconciliation, never a blind
-    replay). ``reason`` is a bounded vocabulary, named in the exception
+    commit bound cannot hold. ``reason`` is a bounded vocabulary, named in the exception
     text, the halt log line and the ``/healthz`` 503 body (no metric
     exports it); ``detail`` carries the operator-facing text (for a 410,
     the server's reconcile instructions)."""
@@ -438,12 +457,16 @@ class FlushStats:
     ``commit_retries`` counts only the retried ones, split by cause.
     ``records_dropped`` maps a flush-time drop reason to its row count;
     ``decisions_dropped`` counts decisions that dropped EVERY row (settled
-    without a commit)."""
+    without a commit). ``reprepared`` maps a re-prepare reason
+    (``ddl_since_read_snapshot``, ``read_snapshot_expired``) to the
+    ``prepared/`` entries dropped for it; ``unresolved_uploads`` counts
+    objects named by a dropped entry that may be live table files or
+    orphans (never counted as orphans)."""
 
     flushes_committed: int = 0
-    flushes_replayed: int = 0
+    prepared_replays: int = 0
     receipt_settlements: int = 0
-    reprepares: int = 0
+    reprepared: Mapping[str, int] = dataclass_field(default_factory=dict)
     decisions_dropped: int = 0
     records_dropped: Mapping[str, int] = dataclass_field(default_factory=dict)
     rows_published: int = 0
@@ -455,6 +478,7 @@ class FlushStats:
     queue_retries: int = 0
     receipt_lookups: int = 0
     orphaned_uploads: int = 0
+    unresolved_uploads: int = 0
     dropped_payload_keys: int = 0
     stats_repaired: int = 0
 
@@ -1135,6 +1159,16 @@ class FlushContext:
     idempotency_key: str
     read_snapshot: int
     table_uuid: str
+    #: The per-build object-name token (``…/{key}/{build}/{index}.parquet``),
+    #: minted fresh by the flusher for every build so a rebuild of the same
+    #: window never reuses an earlier build's object names.
+    build: str
+
+    def __post_init__(self) -> None:
+        if not self.build or "/" in self.build:
+            raise ValueError(
+                f"build token must be a non-empty path segment: {self.build!r}"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1188,17 +1222,17 @@ def build_prepared_plan(
 ) -> PreparedPlan:
     """Decode → junk policy → Arrow → sort by the live sort spec →
     fanout → parquet → the complete commit request. PURE: no I/O, no
-    clocks, no randomness — the same inputs produce byte-identical output
-    in any process.
+    clocks, no randomness — the same inputs (``ctx.build`` included)
+    produce byte-identical output in any process.
 
-    Deterministic object names: ``{data_path}/data/{ns}/{table}/
-    {idempotency_key}/{index}.parquet``. The key derives from
-    ``(table_uuid, topic, partition, partition tuple, first_offset,
-    last_offset)``, so the same staged range names the same objects
-    forever — and two partitions flushing one tuple over the same offset
-    range name DIFFERENT objects (offsets are per partition; PR #331
-    review) — and a rebuild after a crash between upload and persist
-    rewrites the SAME names instead of doubling the orphans.
+    Object names: ``{data_path}/data/{ns}/{table}/{idempotency_key}/
+    {build}/{index}.parquet``. The key derives from ``(table_uuid, topic,
+    partition, partition tuple, first_offset, last_offset)`` — two
+    partitions flushing one tuple over the same offset range name
+    DIFFERENT objects (offsets are per partition; PR #331 review) — and
+    ``ctx.build`` is the caller's per-build token, so a rebuild of the
+    same window never reuses an earlier build's names (it may be live
+    data of a landed first attempt).
 
     The sort: scan order is Kafka-record time; the catalog's sort spec
     (``info.sort_spec``) is payload-event time. The batch is sorted by
@@ -1348,7 +1382,7 @@ def build_prepared_plan(
                     "destination schema — a millrace encoder bug"
                 )
             metadata = parquet.metadata
-        uri = f"{base}/{ctx.idempotency_key}/{index}.parquet"
+        uri = f"{base}/{ctx.idempotency_key}/{ctx.build}/{index}.parquet"
         registration: dict[str, Any] = {
             "path": uri,
             "record_count": metadata.num_rows,
@@ -1625,6 +1659,7 @@ class HoglakeFlusher:
         monotonic: Callable[[], float] = time.monotonic,
         executor: Executor | None = None,
         io_workers: int = 1,
+        build_token: Callable[[], str] = lambda: uuid.uuid4().hex,
     ) -> HoglakeFlusher:
         """Resolve the catalog → namespace → table and validate the
         destination, fail-fast (docs/kafka-ingestion.md §Deployment), and
@@ -1650,6 +1685,7 @@ class HoglakeFlusher:
             monotonic=monotonic,
             executor=executor,
             io_workers=io_workers,
+            build_token=build_token,
         )
         catalog, info = read_destination(client, cfg)
         flusher._catalog = catalog
@@ -1739,6 +1775,7 @@ class HoglakeFlusher:
         monotonic: Callable[[], float],
         executor: Executor | None,
         io_workers: int = 1,
+        build_token: Callable[[], str] = lambda: uuid.uuid4().hex,
     ) -> None:
         if io_workers < 1:
             raise ValueError(f"io_workers must be >= 1, got {io_workers}")
@@ -1747,6 +1784,7 @@ class HoglakeFlusher:
         self._now_us = now_us
         self._sleep = sleep
         self._monotonic = monotonic
+        self._build_token = build_token
         self._owns_executor = executor is None
         # The blocking pyhoglake I/O pool. Sized to the sweep's
         # process-wide in-flight bound when the runner flushes in
@@ -1772,9 +1810,9 @@ class HoglakeFlusher:
         # Counter attributes, incremented in place (consumer.py's
         # ConsumerStats pattern: plain ints, frozen snapshot on stats()).
         self._flushes_committed = 0
-        self._flushes_replayed = 0
+        self._prepared_replays = 0
         self._receipt_settlements = 0
-        self._reprepares = 0
+        self._reprepared: dict[str, int] = {}
         self._decisions_dropped = 0
         self._records_dropped: dict[str, int] = {}
         self._rows_published = 0
@@ -1786,9 +1824,9 @@ class HoglakeFlusher:
         self._queue_retries = 0
         self._receipt_lookups = 0
         self._orphaned_uploads = 0
+        self._unresolved_uploads = 0
         self._dropped_payload_keys = 0
         self._stats_repaired = 0
-        self._receipt_horizon_cache: float | None = None
         # The observed compression ratio (module docstring): EWMA fed
         # back into the planner's size lane; resets when the table's
         # shape fingerprint changes.
@@ -1826,9 +1864,9 @@ class HoglakeFlusher:
         """A snapshot of the run's counters."""
         return FlushStats(
             flushes_committed=self._flushes_committed,
-            flushes_replayed=self._flushes_replayed,
+            prepared_replays=self._prepared_replays,
             receipt_settlements=self._receipt_settlements,
-            reprepares=self._reprepares,
+            reprepared=dict(self._reprepared),
             decisions_dropped=self._decisions_dropped,
             records_dropped=dict(self._records_dropped),
             rows_published=self._rows_published,
@@ -1840,6 +1878,7 @@ class HoglakeFlusher:
             queue_retries=self._queue_retries,
             receipt_lookups=self._receipt_lookups,
             orphaned_uploads=self._orphaned_uploads,
+            unresolved_uploads=self._unresolved_uploads,
             dropped_payload_keys=self._dropped_payload_keys,
             stats_repaired=self._stats_repaired,
         )
@@ -1887,9 +1926,9 @@ class HoglakeFlusher:
         ones — pyhoglake's shape, and millrace's too when a rebuild
         changes the fanout). Nothing server-side reclaims a client's
         uploads, so this counter is the whole observability story for
-        them. Conservative by construction: with deterministic object
-        names, a same-window rebuild rewrites these exact keys, so the
-        count is an upper bound on objects that STAY orphaned."""
+        them. Every build mints fresh object names, so a later rebuild
+        never reclaims these: the count is of objects that stay orphaned
+        until an operator deletes them."""
         count = len(uris)
         if count <= 0:
             return
@@ -1904,6 +1943,33 @@ class HoglakeFlusher:
             f" — and {omitted} more not listed here" if omitted else "",
         )
         self._orphaned_uploads += count
+
+    def _count_reprepare(self, reason: str) -> None:
+        """One ``prepared/`` entry dropped for a rebuild from the staged
+        rows (``millrace_prepared_reprepared_total{reason}``)."""
+        self._reprepared[reason] = self._reprepared.get(reason, 0) + 1
+
+    def _count_unresolved(self, uris: Sequence[str], why: str) -> None:
+        """Record objects named by a dropped ``prepared/`` entry whose
+        commit may have landed (its receipt may have been purged): they
+        may be live table files or orphans, and only the catalog can say
+        which. Never orphan-accounted — naming them for deletion could
+        delete live data."""
+        count = len(uris)
+        if count <= 0:
+            return
+        listed = list(uris[:_ORPHAN_URIS_LOGGED])
+        omitted = count - len(listed)
+        log.warning(
+            "%d uploaded parquet file(s) may be live (a landed commit whose "
+            "receipt was purged) or orphaned; reconcile against the catalog "
+            "before deleting: %s. Objects: %s%s",
+            count,
+            why,
+            ", ".join(listed),
+            f" — and {omitted} more not listed here" if omitted else "",
+        )
+        self._unresolved_uploads += count
 
     # -- table shape cache ----------------------------------------------------
 
@@ -1994,44 +2060,6 @@ class HoglakeFlusher:
         completed flushes (the fallback ratio until the first
         observation). Read by the sweep's planning pass."""
         return self._ratio.estimate
-
-    # -- receipt horizon ---------------------------------------------------------
-
-    def _receipt_horizon_s(self) -> float:
-        """How old a persisted ``prepared/`` entry may be before a receipt
-        404 becomes ambiguous with a PURGED receipt — the blind-replay
-        guard (C3; the server purges receipts at
-        ``HOGLAKE_RECEIPT_RETENTION_SECONDS``, default 7 d).
-
-        The wire exposes no receipt retention (``CatalogOptions`` carries
-        snapshot retention only), so the guard is the
-        ``MILLRACE_RECEIPT_HORIZON_S`` knob (default 6 d — deliberately
-        BELOW the server's default; config.py documents the assumption).
-        A pyhoglake that grows ``Catalog._receipt_retention_seconds`` is
-        honored when present (millpond's guarded-private-accessor
-        posture, same as ``_retention_ttl_s``): a positive finite value
-        is the horizon; ``inf`` means receipts are kept forever and there
-        is no horizon; anything else (0, negative, absent, raising)
-        falls back to the knob. Resolved once and cached — it is a
-        per-process constant for the lifetime of a Catalog handle.
-        """
-        if self._receipt_horizon_cache is not None:
-            return self._receipt_horizon_cache
-        horizon = float(self._cfg.receipt_horizon_s)
-        read = getattr(self._catalog, "_receipt_retention_seconds", None)
-        if read is not None:
-            try:
-                value = read()
-            except Exception:  # noqa: BLE001 - a horizon read must never fail recovery
-                value = None
-            if (
-                isinstance(value, (int, float))
-                and not isinstance(value, bool)
-                and (value > 0 or value == float("inf"))
-            ):
-                horizon = float(value)
-        self._receipt_horizon_cache = horizon
-        return horizon
 
     # -- the publish ladder -----------------------------------------------------
 
@@ -2199,9 +2227,12 @@ class HoglakeFlusher:
         whatever the entry's age: the receipt is ground truth), a 404
         republishes the persisted bytes verbatim (the idempotency key
         makes the server's receipt dedupe a landing replay into one
-        logical commit) — but only INSIDE the receipt horizon: past
-        ``_receipt_horizon_s`` a 404 is ambiguous with a PURGED receipt, and the pipeline halts
-        rather than risk duplicating an already-executed commit.
+        logical commit), whatever the entry's age. A 404 past the
+        server's receipt retention is ambiguous with a purged receipt;
+        such a replay is normally answered 410 (its read snapshot is
+        below the expiry floor) and the window re-prepares from the
+        staged rows, which can land it a second time: accepted
+        at-least-once behaviour, counted.
 
         The flush window is parsed out of the persisted request's commit
         message — the ``prepared/`` envelope holds the request body, and
@@ -2308,47 +2339,45 @@ class HoglakeFlusher:
                 idempotency_key=key,
             )
 
-        # No receipt. Republish the persisted bytes VERBATIM — but only
-        # while the entry's age PROVES the receipt cannot be gone: the
-        # server purges receipts past its retention
-        # (HOGLAKE_RECEIPT_RETENTION_SECONDS, default 7 d), so past the
-        # receipt horizon a 404 is ambiguous — "never landed" and
-        # "landed, receipt purged" look identical, and republishing the
-        # latter duplicates an executed commit. A 200 receipt settles regardless of
-        # age (it is ground truth); this guard covers only the blind
-        # replay.
-        horizon_s = await self._io(self._receipt_horizon_s)
-        age_us = self._now_us() - pending.request.persisted_at
-        if age_us > horizon_s * _MICROS_PER_SECOND:
-            age_text = f"{age_us / _MICROS_PER_SECOND:.0f}s"
-            raise self._halt(
-                "receipt_horizon_exceeded",
-                f"the persisted commit for {stage.topic}[{stage.partition}] "
-                f"group {label} offsets {first_offset}-{last_offset} "
-                f"(idempotency key {key}) has no receipt, and its age "
-                f"({age_text}) is past the receipt horizon "
-                f"({horizon_s:.0f}s): the commit may have landed and had "
-                "its receipt purged, so replaying it could duplicate rows "
-                "— and its uploaded objects may be live data, so they are "
-                "NOT orphan-accounted. Reconcile the window against the "
-                "catalog by hand, then drop the prepared/ entry.",
-            )
+        # No receipt. Republish the persisted bytes VERBATIM, whatever
+        # the entry's age: past the server's receipt retention a 404 may
+        # be a purged receipt, and the replay (or the 410 re-prepare
+        # below) may land the window twice — accepted at-least-once
+        # behaviour, counted and logged.
+        age_s = max(0, self._now_us() - pending.request.persisted_at) / (
+            _MICROS_PER_SECOND
+        )
+        log.info(
+            "no receipt for the persisted commit for %s[%d] group %s offsets "
+            "%d-%d (idempotency key %s, persisted %.0fs ago); replaying it",
+            stage.topic,
+            stage.partition,
+            label,
+            first_offset,
+            last_offset,
+            key,
+            age_s,
+        )
         try:
             result = await self._publish(payload)
-        except DdlSinceReadSnapshotError:
-            # Definitive refusal, zero writes — the REBUILD case: the
-            # persisted payload is dead, the rows are still staged, the
-            # planner re-decides the key and re-prepares against a fresh
-            # read. The upload it abandons is accounted.
-            self._count_orphans(
+        except DdlSinceReadSnapshotError as e:
+            # Definitive refusal of THIS request, zero writes — the
+            # REBUILD case: the persisted payload is dead, the rows are
+            # still staged, the planner re-decides the key and
+            # re-prepares against a fresh read. The entry follows a
+            # receipt 404, so its first attempt may have landed with the
+            # receipt since purged: its objects are UNRESOLVED (possibly
+            # live), never orphan-accounted.
+            self._count_unresolved(
                 _payload_uris(payload),
-                f"the persisted commit for group {label} was refused with "
-                "ddl_since_read_snapshot; the rows re-prepare against a "
-                "fresh read",
-                reason="ddl_rebuild",
+                f"the persisted commit for {stage.topic}[{stage.partition}] "
+                f"group {label} offsets {first_offset}-{last_offset} "
+                f"(idempotency key {key}, persisted {age_s:.0f}s ago) was "
+                f"refused with ddl_since_read_snapshot ({e}); the rows "
+                "re-prepare against a fresh read",
             )
             await stage.drop_prepared(group, first_offset)
-            self._reprepares += 1
+            self._count_reprepare(_REPREPARE_DDL)
             return FlushReport(
                 topic=stage.topic,
                 partition=stage.partition,
@@ -2368,13 +2397,35 @@ class HoglakeFlusher:
                 _payload_uris(payload),
             ) from e
         except ReadSnapshotExpiredError as e:
-            raise self._halt(
-                "read_snapshot_expired",
-                f"the persisted commit's read_snapshot fell below the "
-                f"catalog's expiry floor: {e.detail or e}. Reconcile from a "
-                "current read of the table; never silently skip.",
+            # The persisted basis sank below the catalog's expiry floor —
+            # the expected answer for an entry older than the server's
+            # receipt retention, whose first attempt may have landed. Not
+            # a halt: drop the entry and let the still-staged rows
+            # re-prepare against a fresh read on a later sweep (the
+            # ddl_since_read_snapshot mechanics). If the first attempt
+            # landed, the rebuild lands the window a second time —
+            # accepted at-least-once behaviour, counted. Its objects may
+            # be live table files, so they are NOT orphan-accounted.
+            self._count_unresolved(
                 _payload_uris(payload),
-            ) from e
+                f"the persisted commit for {stage.topic}[{stage.partition}] "
+                f"group {label} offsets {first_offset}-{last_offset} "
+                f"(idempotency key {key}, persisted {age_s:.0f}s ago) was "
+                f"answered 410 ({e.detail or e}); the rows re-prepare "
+                "against a fresh read",
+            )
+            await stage.drop_prepared(group, first_offset)
+            self._count_reprepare(_REPREPARE_EXPIRED)
+            return FlushReport(
+                topic=stage.topic,
+                partition=stage.partition,
+                group=group,
+                trigger="recovery",
+                outcome="reprepare",
+                first_offset=first_offset,
+                last_offset=last_offset,
+                idempotency_key=key,
+            )
         except NotFoundError as e:
             raise self._halt(
                 "destination_missing",
@@ -2414,17 +2465,17 @@ class HoglakeFlusher:
 
         report = await stage.commit_flushed(window)
         self._guard_settlement(window, len(window_rows), report.rows_deleted)
-        self._flushes_replayed += 1
+        self._prepared_replays += 1
         log.info(
             "replayed the persisted commit for %s[%d] group %s offsets %d-%d "
-            "(snapshot %d) — the receipt dedupes a landing replay into one "
-            "logical commit",
+            "(snapshot %d, persisted %.0fs ago)",
             stage.topic,
             stage.partition,
             label,
             first_offset,
             last_offset,
             result.snapshot_id,
+            age_s,
         )
         return FlushReport(
             topic=stage.topic,
@@ -2662,6 +2713,7 @@ class HoglakeFlusher:
             idempotency_key=key,
             read_snapshot=read_snapshot,
             table_uuid=self._table_uuid,
+            build=self._build_token(),
         )
         cfg = self._cfg
         plan: PreparedPlan = await self._io(
@@ -2779,7 +2831,7 @@ class HoglakeFlusher:
                 reason="ddl_rebuild",
             )
             await stage.drop_prepared(group, first_offset)
-            self._reprepares += 1
+            self._count_reprepare(_REPREPARE_DDL)
             log.warning(
                 "DDL landed on %s.%s while a flush was in flight (%s); "
                 "the prepared request is dropped and the rows re-prepare "
@@ -2968,8 +3020,8 @@ class FlushRunner:
 
     1. RECONCILE (first tick after a (re)claim): ``recover()`` collects
        legacy ``flushed/`` markers in bounded pages, and every surviving
-       ``prepared/`` entry is replayed / receipt-settled by the flusher,
-       inside the receipt horizon. A partition whose reconciliation
+       ``prepared/`` entry is replayed / receipt-settled by the flusher.
+       A partition whose reconciliation
        fails transiently is skipped for the tick and retried on the
        next — it is never marked reconciled.
     2. ASSEMBLE the planner input: one full ``stats/`` scan (the size
@@ -3442,8 +3494,8 @@ class FlushRunner:
         """The recovery handoff for one (re)claimed partition: collect
         legacy ``flushed/`` markers (bounded pages, stage.py), then
         reconcile every surviving ``prepared/`` entry — receipt lookup
-        first, verbatim replay on a 404 inside the receipt horizon, a
-        loud halt past it. The reconciliation reports count toward the
+        first, verbatim replay on a 404 whatever the entry's age. The
+        reconciliation reports count toward the
         sweep's totals."""
         recovery = await stage.recover()
         if recovery.legacy_markers_collected:

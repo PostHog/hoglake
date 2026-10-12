@@ -246,7 +246,7 @@ class RecoveryReport:
     ``pending_prepared``: every ``prepared/`` entry that remains —
     persisted before publication and never settled, so each is a replay
     candidate (reconciled receipt-first by the flusher, and republished
-    only inside the receipt horizon).
+    verbatim on a receipt 404, whatever its age).
     ``legacy_markers_collected``: ``flushed/`` markers deleted. Nothing
     writes that prefix any more — a settlement is one atomic
     transaction, so a marker was always fully-settled state with its
