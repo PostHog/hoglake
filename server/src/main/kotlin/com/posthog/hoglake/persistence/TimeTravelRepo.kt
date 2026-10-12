@@ -1,6 +1,7 @@
 package com.posthog.hoglake.persistence
 
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.SnapshotResolution
 import org.jdbi.v3.core.Handle
 import java.time.Instant
 
@@ -11,6 +12,21 @@ import java.time.Instant
  * the expiry service and the DDL/commit tails, never here.
  */
 object TimeTravelRepo {
+    /**
+     * Reverse PK scan, one result. On the 100,000-snapshot fixture in
+     * TimestampTravelIntegrationTest, head reads 4 shared buffers;
+     * skipping 9,999 later snapshots reads 117. Historical lookup cost
+     * still grows with the later retained snapshots it must filter.
+     */
+    internal const val RESOLVE_SNAPSHOT_SQL: String =
+        """
+        SELECT snapshot_id, snapshot_time FROM hog_snapshot
+        WHERE catalog_id = :catalogId
+          AND snapshot_id >= :earliest
+          AND snapshot_time <= :ts
+        ORDER BY snapshot_id DESC LIMIT 1
+        """
+
     /**
      * The expiry floor with its anchor time: [earliestSnapshotTime] is
      * the floor snapshot's snapshot_time as captured by the sweep that
@@ -83,19 +99,24 @@ object TimeTravelRepo {
         catalogId: Long,
         earliestSnapshotId: Long,
         atTimestamp: Instant,
-    ): Long =
-        handle.createQuery(
-            """
-            SELECT max(snapshot_id) FROM hog_snapshot
-            WHERE catalog_id = :catalogId
-              AND snapshot_id >= :earliest
-              AND snapshot_time <= :ts
-            """,
-        )
+    ): Long = resolveSnapshot(handle, catalogId, earliestSnapshotId, atTimestamp).snapshotId
+
+    fun resolveSnapshot(
+        handle: Handle,
+        catalogId: Long,
+        earliestSnapshotId: Long,
+        atTimestamp: Instant,
+    ): SnapshotResolution =
+        handle.createQuery(RESOLVE_SNAPSHOT_SQL)
             .bind("catalogId", catalogId)
             .bind("earliest", earliestSnapshotId)
             .bind("ts", atTimestamp.atOffset(java.time.ZoneOffset.UTC))
-            .mapTo(Long::class.javaObjectType)
+            .map { rs, _ ->
+                SnapshotResolution(
+                    rs.getLong("snapshot_id"),
+                    rs.getObject("snapshot_time", java.time.OffsetDateTime::class.java).toInstant(),
+                )
+            }
             .findOne()
             .orElse(null)
             ?: throw HoglakeException.Expired(

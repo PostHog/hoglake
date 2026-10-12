@@ -1330,6 +1330,38 @@ paths:
               schema: { $ref: "#/components/schemas/CommitResult" }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  /catalogs/{catalog}/snapshots/resolve:
+    get:
+      operationId: resolveSnapshot
+      summary: Resolve a timestamp to a retained snapshot
+      description: >
+        Returns the largest retained snapshot ID whose recorded snapshot_time
+        is at or before at_timestamp, together with that snapshot's time.
+        An exact timestamp includes that snapshot; between snapshots selects
+        the lower ID; after head selects head. Before retained history returns
+        410. Resolve once and pass snapshot_id as the snapshot selector to
+        share a time pin across clients. Resolution does not prevent expiry.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - name: at_timestamp
+          in: query
+          required: true
+          description: ISO-8601 instant with a UTC offset.
+          schema: { type: string, format: date-time }
+      responses:
+        "200":
+          description: Resolved snapshot identity and recorded time
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SnapshotResolution" }
+        "400":
+          description: Missing at_timestamp or a value that is not an ISO-8601 instant with an offset.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "410": { $ref: "#/components/responses/Gone" }
+
   /catalogs/{catalog}/snapshots:
     get:
       operationId: listSnapshots
@@ -5848,6 +5880,13 @@ components:
             Groups (across the whole result set, not just this page)
             whose spec vintage is not the table's current live spec —
             partitions a spec change left behind.
+
+    SnapshotResolution:
+      type: object
+      required: [snapshot_id, snapshot_time]
+      properties:
+        snapshot_id: { type: integer, format: int64 }
+        snapshot_time: { type: string, format: date-time }
 
     Snapshot:
       type: object

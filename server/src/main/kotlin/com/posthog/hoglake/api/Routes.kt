@@ -305,6 +305,13 @@ fun Application.installApiRoutes(
                     }
                 }
 
+                get("/snapshots/resolve") {
+                    val at =
+                        call.instantQuery("at_timestamp")
+                            ?: throw BadRequestException("query parameter 'at_timestamp' is required")
+                    call.respond(catalogs.resolveSnapshot(call.catalog(), at).toDto())
+                }
+
                 get("/snapshots") {
                     val after = call.longQuery("after") ?: 0L
                     val before = call.longQuery("before")

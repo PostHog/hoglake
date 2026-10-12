@@ -2,7 +2,9 @@
 URL, method, body shape, error mapping, pagination."""
 
 import json
+from datetime import UTC, datetime, timedelta, timezone
 
+import httpx
 import pyarrow as pa
 import pytest
 
@@ -11,6 +13,7 @@ from pyhoglake import (
     CommitConflictError,
     ExpiredError,
     HoglakeClient,
+    MalformedResponseError,
     NotFoundError,
     OffsetRegressionError,
     ReconciliationRequiredError,
@@ -714,6 +717,76 @@ def test_views(client, httpx_mock):
 
 
 # -- snapshots pagination ---------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("timestamp", "expected_timestamp"),
+    [
+        ("2026-02-01T00:01:00+00:00", "2026-02-01T00:01:00+00:00"),
+        (datetime(2026, 2, 1, 0, 1), "2026-02-01T00:01:00+00:00"),
+        (datetime(2026, 2, 1, 0, 1, tzinfo=UTC), "2026-02-01T00:01:00+00:00"),
+        (
+            datetime(2026, 2, 1, 2, 1, tzinfo=timezone(timedelta(hours=2))),
+            "2026-02-01T02:01:00+02:00",
+        ),
+    ],
+)
+@pytest.mark.parametrize("snapshot_id", [0, 9007199254740993, 2**63 - 1])
+def test_resolve_snapshot(
+    client, httpx_mock, timestamp, expected_timestamp, snapshot_id
+):
+    cat = _catalog(client, httpx_mock)
+    httpx_mock.add_response(
+        method="GET",
+        url=httpx.URL(
+            f"{BASE}/v1/catalogs/cat/snapshots/resolve",
+            params={"at_timestamp": expected_timestamp},
+        ),
+        json={"snapshot_id": snapshot_id, "snapshot_time": "2026-02-01T00:01:00Z"},
+    )
+    resolved = cat.resolve_snapshot(timestamp)
+    assert resolved.snapshot_id == snapshot_id
+    assert resolved.snapshot_time == datetime(2026, 2, 1, 0, 1, tzinfo=UTC)
+    sent = httpx_mock.get_requests()[-1]
+    assert sent.url.params["at_timestamp"] == expected_timestamp
+
+
+def test_resolve_snapshot_expired(client, httpx_mock):
+    cat = _catalog(client, httpx_mock)
+    httpx_mock.add_response(
+        status_code=410,
+        json={"error": "expired", "detail": "before retained history"},
+    )
+    with pytest.raises(ExpiredError):
+        cat.resolve_snapshot("1900-01-01T00:00:00Z")
+
+
+@pytest.mark.parametrize(
+    "body", [{"snapshot_id": 1}, {"snapshot_time": "2026-02-01T00:00:00Z"}]
+)
+def test_resolve_snapshot_requires_identity_and_time(client, httpx_mock, body):
+    cat = _catalog(client, httpx_mock)
+    httpx_mock.add_response(json=body)
+    with pytest.raises(MalformedResponseError):
+        cat.resolve_snapshot("2026-02-01T00:00:00Z")
+
+
+@pytest.mark.parametrize("snapshot_id", [None, True, 1.5, "1", -1, 2**63])
+def test_resolve_snapshot_rejects_invalid_identity(client, httpx_mock, snapshot_id):
+    cat = _catalog(client, httpx_mock)
+    httpx_mock.add_response(
+        json={"snapshot_id": snapshot_id, "snapshot_time": "2026-02-01T00:00:00Z"},
+    )
+    with pytest.raises(MalformedResponseError, match="snapshot_id"):
+        cat.resolve_snapshot("2026-02-01T00:00:00Z")
+
+
+@pytest.mark.parametrize("snapshot_time", [None, "invalid", "2026-02-01T00:00:00"])
+def test_resolve_snapshot_rejects_invalid_time(client, httpx_mock, snapshot_time):
+    cat = _catalog(client, httpx_mock)
+    httpx_mock.add_response(json={"snapshot_id": 1, "snapshot_time": snapshot_time})
+    with pytest.raises(MalformedResponseError):
+        cat.resolve_snapshot("2026-02-01T00:00:00Z")
 
 
 def test_snapshots_pagination(client, httpx_mock):

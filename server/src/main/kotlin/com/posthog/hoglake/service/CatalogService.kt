@@ -16,6 +16,7 @@ import com.posthog.hoglake.model.PartitionFieldDef
 import com.posthog.hoglake.model.PartitionFieldValues
 import com.posthog.hoglake.model.PartitionValues
 import com.posthog.hoglake.model.Snapshot
+import com.posthog.hoglake.model.SnapshotResolution
 import com.posthog.hoglake.model.SortFieldDef
 import com.posthog.hoglake.model.StatsState
 import com.posthog.hoglake.model.TableInfo
@@ -1246,10 +1247,15 @@ class CatalogService(private val jdbi: Jdbi) {
     fun resolveTimestamp(
         catalog: String,
         atTimestamp: Instant,
-    ): Long =
+    ): Long = resolveSnapshot(catalog, atTimestamp).snapshotId
+
+    fun resolveSnapshot(
+        catalog: String,
+        atTimestamp: Instant,
+    ): SnapshotResolution =
         jdbi.withHandleUnchecked { h ->
             val cat = requireCatalog(h, catalog)
-            TimeTravelRepo.resolveTimestamp(
+            TimeTravelRepo.resolveSnapshot(
                 h,
                 cat.catalogId,
                 TimeTravelRepo.earliestSnapshotId(h, cat.catalogId),

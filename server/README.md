@@ -394,6 +394,13 @@ resolution is one indexed lookup: the largest snapshot with
 `snapshot_time <= t`; after head resolves to head; before the earliest
 *retained* snapshot is 410.
 
+`GET /catalogs/{c}/snapshots/resolve?at_timestamp=...` returns the largest
+retained `snapshot_id` whose recorded `snapshot_time` is at or before the
+requested instant, together with that recorded time. This works without a
+table read, including a catalog containing only its initial snapshot. Missing
+or offset-less timestamps return 400, unknown catalogs 404, and timestamps
+before retained history 410. Resolving a snapshot does not prevent expiry.
+
 `Table.read_snapshot_id` names the snapshot a read resolved at — the
 catalog head when the request named no `snapshot`/`at_timestamp`, the
 resolved snapshot otherwise. It is required and always present, on every

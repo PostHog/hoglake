@@ -30,6 +30,9 @@ class CommitProxy:
         self.commit_times = []
         self.preparations = []
         self.responses = []
+        self.resolutions = []
+        self.resolution_overrides = []
+        self.on_resolve = lambda: None
         self.on_commit = lambda: None
         self.injected = []
         self.failure = None
@@ -88,6 +91,14 @@ class CommitProxy:
                         )
                     body = response.json()
                     if response.is_success:
+                        if self.command == "GET" and path.path.endswith(
+                            "/snapshots/resolve"
+                        ):
+                            owner.resolutions.append(body)
+                            owner.on_resolve()
+                            owner.on_resolve = lambda: None
+                            if owner.resolution_overrides:
+                                body = owner.resolution_overrides.pop(0)
                         params = parse_qs(path.query)
                         if (
                             self.command == "GET"
@@ -214,6 +225,85 @@ class AppendGuards(unittest.TestCase):
 
     def partition_x(self, field=1):
         self.x.alter([ops.set_partition_spec([ops.partition_field(field, "identity")])])
+
+    def test_time_pin_resolves_empty_catalog(self):
+        name = "duckext-time-empty-" + uuid.uuid4().hex[:10]
+        empty = self.client.create_catalog(
+            name,
+            f"s3://duckext-itest/{name}/",
+        )
+        self.run_sql(f"""
+            ATTACH 'hoglake:{empty.name}' AS pinned
+                (ENDPOINT '{self.proxy.url}', SNAPSHOT_TIME '2999-01-01T00:00:00Z');
+            SELECT CASE WHEN id = 0 THEN 1 ELSE error('wrong initial snapshot') END
+                FROM hoglake_current_snapshot('pinned');
+        """)
+
+    def test_future_time_pin_survives_head_advance_until_commit(self):
+        pin = self.catalog.resolve_snapshot("2999-01-01T00:00:00Z").snapshot_id
+        self.proxy.on_resolve = lambda: self.x.append(
+            pa.Table.from_pydict({"a": [11], "b": [22]}, schema=SCHEMA)
+        )
+        self.run_sql(f"""
+            ATTACH 'hoglake:{self.catalog_name}' AS pinned
+                (ENDPOINT '{self.proxy.url}', SNAPSHOT_TIME '2999-01-01T00:00:00Z');
+            BEGIN;
+            SELECT CASE WHEN id = {pin} THEN 1 ELSE error('wrong first pin') END
+                FROM hoglake_current_snapshot('pinned');
+            SELECT CASE WHEN count(*) = 0 THEN 1 ELSE error('time pin moved') END
+                FROM pinned.{self._testMethodName}.x;
+            SELECT CASE WHEN id = {pin} THEN 1 ELSE error('snapshot changed') END
+                FROM hoglake_current_snapshot('pinned');
+            COMMIT;
+            BEGIN;
+            SELECT CASE WHEN id = {pin + 1} THEN 1 ELSE error('pin did not refresh') END
+                FROM hoglake_current_snapshot('pinned');
+            SELECT CASE WHEN count(*) = 1 THEN 1 ELSE error('new head not visible') END
+                FROM pinned.{self._testMethodName}.x;
+            COMMIT;
+        """)
+        self.assertEqual(
+            [r["snapshot_id"] for r in self.proxy.resolutions], [pin, pin + 1]
+        )
+
+    def test_time_pin_rejects_malformed_resolution(self):
+        valid = {"snapshot_id": 1, "snapshot_time": "2026-02-01T00:00:00Z"}
+        bodies = [
+            {},
+            {"snapshot_id": 1},
+            {"snapshot_time": valid["snapshot_time"]},
+            *[
+                dict(valid, snapshot_id=value)
+                for value in (None, True, 1.5, "1", -1, 2**63)
+            ],
+            *[dict(valid, snapshot_time=value) for value in (None, "", 1)],
+        ]
+        for body in bodies:
+            with self.subTest(body=body):
+                self.proxy.resolution_overrides = [body]
+                result = self.run_sql(
+                    f"""
+                    ATTACH 'hoglake:{self.catalog_name}' AS pinned
+                        (ENDPOINT '{self.proxy.url}', SNAPSHOT_TIME '2999-01-01T00:00:00Z');
+                    SELECT * FROM hoglake_current_snapshot('pinned');
+                """,
+                    succeeds=False,
+                )
+                self.assertIn("snapshot resolution", result.stderr)
+
+    def test_time_pin_protocol_error_fails_table_listing(self):
+        self.proxy.resolution_overrides = [
+            {"snapshot_id": 1.5, "snapshot_time": "2026-02-01T00:00:00Z"}
+        ]
+        result = self.run_sql(
+            f"""
+            ATTACH 'hoglake:{self.catalog_name}' AS pinned
+                (ENDPOINT '{self.proxy.url}', SNAPSHOT_TIME '2999-01-01T00:00:00Z');
+            SELECT * FROM hoglake_table_info('pinned');
+        """,
+            succeeds=False,
+        )
+        self.assertIn("snapshot resolution", result.stderr)
 
     def test_partitioned_insert_uses_preparation_snapshot(self):
         self.partition_x()

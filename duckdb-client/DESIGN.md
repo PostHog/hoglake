@@ -529,11 +529,10 @@ See [PARITY.md](PARITY.md) for the per-capability checklist
    registration.
 10. ~~No timestamp→snapshot resolution on the wire: a SNAPSHOT_TIME
    attach can never produce a client-side snapshot id.~~ **CLOSED** by
-   exactly the proposed fix: `TableInfo.read_snapshot_id` is required and
-   always present — the catalog head when the request named no
-   `snapshot`/`at_timestamp`, the resolved snapshot otherwise. Making
-   `hoglake_current_snapshot` answer from it under a SNAPSHOT_TIME pin,
-   instead of erroring, is client work.
+   `GET /catalogs/{c}/snapshots/resolve?at_timestamp=...`, which returns
+   the resolved snapshot ID and recorded time independently of a table.
+   A SNAPSHOT_TIME attach resolves once per transaction and sends that
+   ID on its reads; `hoglake_current_snapshot` returns the same ID.
 11. Environment note (historical): earlier rounds found the dev
    stack's hydrator hydrating nothing (files stuck `pending`,
    compaction starved). As of 2026-09-12 the stack hydrates and
