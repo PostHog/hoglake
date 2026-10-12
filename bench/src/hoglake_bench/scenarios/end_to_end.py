@@ -98,16 +98,19 @@ def run(bench: Bench, args: argparse.Namespace) -> ScenarioReport:
         schema = E2E_SCHEMA
         metric_name = "append.real_parquet"
     table = ns.create_table("events", schema)
+    start_snapshot = table.snapshot_id
     guard = FailureGuard()
 
     payload_bytes = [0]
+    appended_paths: set[str] = set()
 
     def op(i: int) -> None:
         if typed:
             data = typed_batch(i, args.batch_rows)
         else:
             data = _batch(i * args.batch_rows, args.batch_rows)
-        table.append(data, author="hoglake-bench", message=f"batch {i}")
+        result = table.append(data, author="hoglake-bench", message=f"batch {i}")
+        appended_paths.update(f.path for f in result.files)
         if i >= warmup:
             # arrow_mb_s: numerator and denominator must cover the SAME
             # measured window — warmup bytes stay out of both
@@ -131,22 +134,37 @@ def run(bench: Bench, args: argparse.Namespace) -> ScenarioReport:
     )
 
     # correctness: server-side accounting matches what we wrote
-    info = table.info()
+    snapshot = catalog.refresh().head_snapshot_id
+    info = table.info(snapshot=snapshot)
     check(
         info.record_count == appended * args.batch_rows,
         f"table record_count={info.record_count}, wrote "
         f"{appended * args.batch_rows} rows",
     )
     check(
-        info.file_count == appended,
-        f"file_count={info.file_count}, appended {appended} files",
+        info.file_count <= appended,
+        f"file_count={info.file_count} exceeds {appended} appended files; "
+        "compaction cannot increase the visible file count",
     )
-    files = table.files()
+    files = table.files(snapshot=snapshot)
     check(
-        all(f.stats_state == "provided" for f in files),
+        sum(f.record_count for f in files) == appended * args.batch_rows,
+        "visible files do not account for all appended rows",
+    )
+    check(all(f.stats_state != "failed" for f in files), "visible file stats failed")
+
+    # The feed retains original append files; compaction outputs can carry
+    # noncontiguous explicit row ids and may still be awaiting hydration.
+    written = table.changes(from_snapshot=start_snapshot, to_snapshot=snapshot).files
+    check(
+        {f.path for f in written} == appended_paths,
+        "changefeed files do not match the writer's registered files",
+    )
+    check(
+        all(f.stats_state == "provided" for f in written),
         "footer-shipped stats did not register as provided",
     )
-    assert_row_tiling(table, expected_rows=appended * args.batch_rows)
+    assert_row_tiling(table, expected_rows=appended * args.batch_rows, files=written)
     return report
 
 

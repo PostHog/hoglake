@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from pyhoglake import Catalog, Table
+from pyhoglake.models import DataFile
 
 from ..context import Bench
 from ..fabricate import BENCH_SCHEMA, append_payload
@@ -77,10 +78,17 @@ def check(cond: bool, message: str) -> None:
         raise InvariantViolation(message)
 
 
-def assert_row_tiling(table: Table, *, expected_rows: int | None = None) -> None:
+def assert_row_tiling(
+    table: Table,
+    *,
+    expected_rows: int | None = None,
+    files: list[DataFile] | tuple[DataFile, ...] | None = None,
+) -> None:
     """Row-id ranges must tile [0, total) with no gaps or overlap —
-    the row-lineage contract, checked via the public files API."""
-    files = sorted(table.files(), key=lambda f: f.row_id_start)
+    pass original append files when compaction has rewritten the live set."""
+    files = sorted(
+        table.files() if files is None else files, key=lambda f: f.row_id_start
+    )
     next_start = 0
     for f in files:
         check(
