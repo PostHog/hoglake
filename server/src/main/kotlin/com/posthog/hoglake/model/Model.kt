@@ -932,6 +932,8 @@ data class TableInfo(
     val snapshotId: Long? = null,
 )
 
+data class SnapshotResolution(val snapshotId: Long, val snapshotTime: Instant)
+
 data class Snapshot(
     val snapshotId: Long,
     val snapshotTime: Instant,

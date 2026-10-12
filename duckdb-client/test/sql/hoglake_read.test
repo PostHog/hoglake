@@ -233,12 +233,11 @@ SELECT count(*) FROM laket.ns1.points
 ----
 3
 
-# a SNAPSHOT_TIME attach has no client-resolved snapshot id (wire gap):
-# asking for one errors instead of reporting head
-statement error
-SELECT * FROM hoglake_current_snapshot('laket')
+# a time pin reports the snapshot that produced its reads
+query I
+SELECT id = {DUCKEXT_POINTS_SNAP_V1} FROM hoglake_current_snapshot('laket')
 ----
-<REGEX>:.*cannot resolve a timestamp to a snapshot id.*
+true
 
 statement ok
 DETACH laket
@@ -266,6 +265,11 @@ query I
 SELECT count(*) FROM lakeo2.ns1.points
 ----
 3
+
+query I
+SELECT id = {DUCKEXT_POINTS_SNAP_V1} FROM hoglake_current_snapshot('lakeo2')
+----
+true
 
 statement ok
 DETACH lakeo2

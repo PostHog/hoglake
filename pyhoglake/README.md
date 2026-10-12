@@ -102,6 +102,8 @@ from pyhoglake import ops
 table.alter([ops.add_column("score", pa.float64())])  # schema evolution
 table.info(snapshot=5)  # time travel
 table.files(at_timestamp=some_datetime)  # by timestamp
+pin = catalog.resolve_snapshot(some_datetime)  # ID and recorded snapshot time
+table.files(snapshot=pin.snapshot_id)  # share the same pin with another client
 table.append(big_table, deferred_stats=True)  # register as pending
 catalog.set_retention(7 * 86400, consumer_floor=True)  # retention policy
 catalog.expire()

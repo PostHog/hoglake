@@ -36,14 +36,8 @@ idx_t HoglakeTransaction::GetSnapshotInternal() {
 		return pinned_snapshot.GetIndex();
 	}
 	if (!hoglake_catalog.AttachSnapshotTime().empty()) {
-		// a SNAPSHOT_TIME attach has no client-resolved snapshot id (the
-		// wire offers no timestamp->snapshot resolution; reads re-send
-		// at_timestamp and the server resolves it consistently). Pinning
-		// head here would LIE to anything that asks for the snapshot id.
-		throw NotImplementedException(
-		    "hoglake: this attach is pinned by SNAPSHOT_TIME; the wire cannot resolve a timestamp to a snapshot id "
-		    "client-side (reads are still consistently pinned server-side). Attach with SNAPSHOT_VERSION for an "
-		    "explicit snapshot id");
+		pinned_snapshot = NumericCast<idx_t>(Api().ResolveSnapshot(hoglake_catalog.AttachSnapshotTime()).snapshot_id);
+		return pinned_snapshot.GetIndex();
 	}
 	auto attach_pin = hoglake_catalog.AttachSnapshotVersion();
 	if (attach_pin.IsValid()) {
@@ -63,11 +57,6 @@ idx_t HoglakeTransaction::GetSnapshot() {
 }
 
 HoglakeTravel HoglakeTransaction::Travel() {
-	if (!hoglake_catalog.AttachSnapshotTime().empty()) {
-		HoglakeTravel travel;
-		travel.at_timestamp = hoglake_catalog.AttachSnapshotTime();
-		return travel;
-	}
 	return HoglakeTravel::AtSnapshot(GetSnapshot());
 }
 

@@ -53,6 +53,7 @@ from .models import (
     PartitionSpec,
     ScanFile,
     Snapshot,
+    SnapshotResolution,
     TableInfo,
     TableSummary,
     ViewInfo,
@@ -699,6 +700,19 @@ class Catalog:
         return [ns["name"] for ns in body]
 
     # -- snapshots ---------------------------------------------------------
+
+    def resolve_snapshot(self, at_timestamp: datetime | str) -> SnapshotResolution:
+        """Resolve a time pin to the largest retained snapshot at or before it.
+
+        Before retained history raises ExpiredError; after head resolves to head.
+        """
+        return SnapshotResolution.from_wire(
+            self._client._request(
+                "GET",
+                self._path("/snapshots/resolve"),
+                params={"at_timestamp": _ts_param(at_timestamp)},
+            )
+        )
 
     def snapshots(
         self, after: int = 0, before: int | None = None, limit: int = 1000

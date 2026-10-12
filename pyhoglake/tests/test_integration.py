@@ -571,11 +571,16 @@ def test_time_travel(catalog, ns):
     assert table.info(snapshot=s2).record_count == 10
 
     t1 = next(s.snapshot_time for s in catalog.snapshots() if s.snapshot_id == s1)
+    resolved = catalog.resolve_snapshot(t1)
+    assert resolved.snapshot_id == s1
+    assert resolved.snapshot_time == t1
+    assert table.files(snapshot=resolved.snapshot_id) == table.files(at_timestamp=t1)
     assert table.info(at_timestamp=t1).file_count == 1
     files_t1 = table.files(at_timestamp=t1)
     assert len(files_t1) == 1
     assert sum(f.record_count for f in files_t1) == 5
     # after head -> head
+    assert catalog.resolve_snapshot(datetime(2100, 1, 1)).snapshot_id == s2
     assert table.info(at_timestamp=datetime(2100, 1, 1)).file_count == 2
 
 

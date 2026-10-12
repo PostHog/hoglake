@@ -12,6 +12,7 @@ import com.posthog.hoglake.api.CreateCatalogRequestDto
 import com.posthog.hoglake.api.InstanceInfoDto
 import com.posthog.hoglake.api.PrepareTableCreationDto
 import com.posthog.hoglake.api.PublishTableCreationDto
+import com.posthog.hoglake.api.SnapshotResolutionDto
 import com.posthog.hoglake.api.UploadOwnerDto
 import com.posthog.hoglake.api.parseExpectedTableUuid
 import com.posthog.hoglake.api.parseLongQuery
@@ -200,6 +201,9 @@ class WireDtoParseFuzzTest {
         }
         parseOrNull { mapper.readValue<UploadOwnerDto>(data) }?.let { dto ->
             check(mapper.readValue<UploadOwnerDto>(mapper.writeValueAsBytes(dto)) == dto)
+        }
+        parseOrNull { mapper.readValue<SnapshotResolutionDto>(data) }?.let { dto ->
+            check(mapper.readValue<SnapshotResolutionDto>(mapper.writeValueAsBytes(dto)) == dto)
         }
 
         // The publish half of the two-phase table creation
