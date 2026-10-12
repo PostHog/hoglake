@@ -25,6 +25,7 @@ import pytest
 from test_append_unit import BASE, CATALOG_WIRE, TABLE_WIRE
 
 from pyhoglake import HoglakeClient, HoglakeError, S3Config, ValidationError
+from pyhoglake import upload as upload_module
 from pyhoglake.client import Namespace
 from pyhoglake.types import columns_to_arrow_schema
 from pyhoglake.upload import (
@@ -720,7 +721,9 @@ def test_fifty_groups_upload_concurrently(httpx_mock):
     assert store.pool == 50
 
 
-def test_a_fault_reports_every_upload_that_landed_and_no_cancelled_one(httpx_mock):
+def test_a_fault_reports_every_upload_that_landed_and_no_cancelled_one(
+    httpx_mock, monkeypatch
+):
     """Group 6 fails while group 7 is in flight, with 20 groups two at a
     time.
 
@@ -730,23 +733,31 @@ def test_a_fault_reports_every_upload_that_landed_and_no_cancelled_one(httpx_moc
     than abandoning it), and the groups that never started must not be,
     or a sweep of the reported uris deletes files nobody wrote.
 
-    Group 7's event is what makes that deterministic — group 6 refuses
-    only once group 7 is under way. The 20 ms every other group takes is
-    what makes the cancellation deterministic: a worker freed by the
-    failure can still claim the next queued group before the cancel
-    lands (hence ``<= 8``), but not two.
+    Group 6 refuses only once group 7 is under way. Groups 7 and 8 wait
+    until the coordinator has processed the failure and cancelled queued
+    work, so neither worker can reach group 9 before cancellation.
     """
     in_flight = threading.Event()
+    cancellation_complete = threading.Event()
+    real_as_completed = upload_module.as_completed
+
+    def release_in_flight_after_failure(futures):
+        for future in real_as_completed(futures):
+            yield future
+            # The consumer cancels queued futures before asking for the next one.
+            if not future.cancelled() and future.exception() is not None:
+                cancellation_complete.set()
+
+    monkeypatch.setattr(upload_module, "as_completed", release_in_flight_after_failure)
 
     def hook(index: int) -> None:
         if index == 7:
             in_flight.set()
-            time.sleep(0.2)  # still going when group 6 fails
-        elif index == 6:
+        if index >= 7:
+            assert cancellation_complete.wait(5), "cancellation never completed"
+        if index == 6:
             assert in_flight.wait(5), "group 7 never started"
             raise OSError("object store refused group 6")
-        else:
-            time.sleep(0.02)
 
     store = RecordingS3(hook=hook)
     table = resolved_table(httpx_mock, store)

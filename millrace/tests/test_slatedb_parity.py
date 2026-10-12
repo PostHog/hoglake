@@ -845,12 +845,11 @@ async def test_compacted_sst_gc_waits_for_compactor_checkpoint_then_reclaims(tmp
       now-unreferenced input SSTs, deterministically.
     - DB-B (checkpoint_lifetime 1s): after expiry, later ``run_gc_once``
       calls remove the expired checkpoint (the GC process rewrites the
-      manifest) and reclaim the inputs — all but the SST occupying the
-      manifest's ``last_compacted_l0_sst_view_id`` slot: the cutoff filter
-      is STRICTLY older than the newest-L0 barrier, a one-SST conservatism
-      lag against "an L0 written but not yet visible in the manifest". A
-      newer flush moves the barrier and the old one is reclaimed too —
-      the lag is bounded, not a leak. The live writer is unaffected
+      manifest) and reclaim eligible inputs. The cutoff filter is
+      STRICTLY older than the newest-L0 and compaction watermarks: SSTs
+      sharing the cutoff millisecond, and newer intermediate compaction
+      outputs, remain protected. A newer flush moves the barrier and the
+      old barrier SST is reclaimed too. The live writer is unaffected
       throughout.
     """
     store = ObjectStore.resolve("file:///")
@@ -913,23 +912,47 @@ async def test_compacted_sst_gc_waits_for_compactor_checkpoint_then_reclaims(tmp
     def compacted_ssts() -> set[str]:
         return set(os.listdir(tmp_path / "dbb" / "compacted"))
 
+    first_barrier = (await admin.read_manifest(None)).last_compacted_l0_sst_view_id
+    same_tick_sst = first_barrier[:10] + "0" * 16
+    assert same_tick_sst != first_barrier
+    compacted_dir = tmp_path / "dbb" / "compacted"
+    # An unreferenced SST in the barrier's millisecond must survive GC,
+    # even though its random ULID suffix differs from the barrier's.
+    (compacted_dir / f"{same_tick_sst}.sst").write_bytes(
+        (compacted_dir / f"{first_barrier}.sst").read_bytes()
+    )
     before = compacted_ssts()
     assert len(before) > 1  # inputs + output
+    protected = {name for name in before if name[:10] >= first_barrier[:10]}
 
     # after the 1s self-checkpoint expires, a later GC removes it and
-    # reclaims the inputs. Convergence is the fixpoint: on disk == live set
-    # ∪ {current barrier SST} (the quiescent writer's compactor may cascade,
-    # each generation pinned by its own short-lived self-checkpoint).
+    # reclaims eligible inputs. The first ten ULID characters encode the
+    # timestamp; GC ignores the random suffix and retains SSTs at or above
+    # either watermark, including outputs of cascading compactions.
     async def converged() -> bool:
         await admin.run_gc_once(_gc_options())
-        manifest = await admin.read_manifest(None)
-        live = {v.sst.id.value for r in manifest.compacted for v in r.sst_views}
+        view = await admin.read_compactor_state_view()
+        manifest = view.manifest
+        if (
+            manifest.checkpoints
+            or not view.compactions
+            or not view.compactions.recent_compactions
+        ):
+            return False
+        cutoff = min(
+            manifest.last_compacted_l0_sst_view_id[:10],
+            *(c.id[:10] for c in view.compactions.recent_compactions),
+        )
+        live = {v.sst.id.value for v in manifest.l0} | {
+            v.sst.id.value for r in manifest.compacted for v in r.sst_views
+        }
         on_disk = {name.removesuffix(".sst") for name in compacted_ssts()}
-        return on_disk == live | {manifest.last_compacted_l0_sst_view_id}
+        retained = {sst for sst in on_disk if sst[:10] >= cutoff}
+        return on_disk == live | retained
 
     await _await_until(converged, timeout_s=30.0)
-    assert compacted_ssts() < before, "no compacted SST was ever reclaimed"
-    first_barrier = (await admin.read_manifest(None)).last_compacted_l0_sst_view_id
+    assert protected <= compacted_ssts(), "GC deleted a timestamp-protected SST"
+    assert before - compacted_ssts(), "no compacted SST was ever reclaimed"
 
     # a newer flush moves the barrier — the size-tiered scheduler needs
     # ``min_compaction_sources`` (4 by default) L0 SSTs, so flush four:
@@ -948,7 +971,7 @@ async def test_compacted_sst_gc_waits_for_compactor_checkpoint_then_reclaims(tmp
     async def old_barrier_reclaimed() -> bool:
         await admin.run_gc_once(_gc_options())
         on_disk = {name.removesuffix(".sst") for name in compacted_ssts()}
-        return first_barrier not in on_disk
+        return not {first_barrier, same_tick_sst} & on_disk
 
     await _await_until(old_barrier_reclaimed, timeout_s=30.0)
 
