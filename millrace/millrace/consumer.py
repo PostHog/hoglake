@@ -3,7 +3,7 @@ problem's consume loop).
 
 Poll → stage → commit: every well-formed polled record is staged through
 :meth:`millrace.stage.PartitionStage.stage_batch` under
-``rows/(group, record_ts, offset)``; a record that can never become a
+``rows/(group, offset)``; a record that can never become a
 row is DROPPED — logged and counted, nothing written — and the
 partition's Kafka offset commits STRICTLY after the batch's remote
 durability (rows-then-offset, AGENT.md invariant 10 restated for a
@@ -73,14 +73,18 @@ its next write's durability wait (``Error.Closed(FENCED)``, pinned by
 tests/test_slatedb_parity.py). Under static assignment no rebalance
 event announces the loss (an EKS one-at-a-time StatefulSet rollout
 double-assigns the ordinal, and the new pod opens the same paths). The
-loop therefore catches FENCED at the staging write, closes the stage
+loop therefore catches FENCED at the staging write — or, for a
+partition whose poll handled records but staged none (all dropped), at
+a durable fence-probe write issued in its place
+(:meth:`PartitionStage.probe_fence`), so no poll commits offsets
+without a durable write to the partition's path first — closes the stage
 locally so this process can never touch the path again, and raises
 :class:`ConsumerFencedError` — a halt DISTINCT from a config error or a
 flush halt, so the supervisor can tell "another owner holds this path"
 apart from a crash and never blindly restart this pod back onto the
 same assignment (a restarted fenced pod re-opens the path and fences
 the NEW owner: the flap this distinction exists to prevent). An IDLE
-partition's fence has no write to raise from; it surfaces in the flush
+partition (nothing polled) has no write to raise from; it surfaces in the flush
 sweep's planning scan instead, which fences the partition out of
 scheduling and fails liveness (flush.py ``_note_fenced``). See the
 README's rollout-barrier paragraph.
@@ -131,7 +135,6 @@ from typing import Any, Final, Literal, Protocol, TypeVar
 
 from confluent_kafka import (
     OFFSET_STORED,
-    TIMESTAMP_NOT_AVAILABLE,
     KafkaError,
     KafkaException,
     TopicPartition,
@@ -153,15 +156,11 @@ log = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
 
-_MICROS_PER_MILLI: Final = 1_000
-_INT64_MIN: Final = -(1 << 63)
 _INT64_MAX: Final = (1 << 63) - 1
 
 # The bounded consume-time drop vocabulary (the
 # ``millrace_records_dropped_total`` reason label).
 REASON_INVALID_OFFSET: Final = "invalid_offset"
-REASON_MISSING_TIMESTAMP: Final = "missing_timestamp"
-REASON_INVALID_TIMESTAMP: Final = "invalid_timestamp"
 REASON_MISSING_VALUE: Final = "missing_value"
 # The payload is not a strict JSON object (the keyer has nothing to read).
 REASON_MALFORMED_VALUE: Final = "malformed_value"
@@ -241,7 +240,6 @@ class MessageView(Protocol):
     def offset(self) -> int | None: ...
     def key(self) -> bytes | None: ...
     def value(self) -> bytes | None: ...
-    def timestamp(self) -> tuple[int, int]: ...
 
 
 class KafkaConsumerLike(Protocol):
@@ -271,7 +269,6 @@ def classify_message(
     *,
     offset: int,
     value: bytes | None,
-    timestamp: tuple[int, int],
 ) -> StagedRecord | DroppedRecord:
     """One consumed record's fields → the record to stage under its
     partition tuple, or the drop with its reason.
@@ -279,9 +276,9 @@ def classify_message(
     TOTAL over record content — a malformed record becomes a
     :class:`~millrace.stage.DroppedRecord` with a reason (the first
     failing check names it), so the loop never wedges on one record.
-    ``timestamp`` is the Kafka ``(type, milliseconds)`` pair;
-    TIMESTAMP_NOT_AVAILABLE can never key a row, so it drops. The Kafka
-    message key is never read.
+    The Kafka record timestamp and message key are never read: rows are
+    keyed ``(group, offset)`` and the staging stats use the staging
+    clock.
 
     The value is parsed ONCE as a strict JSON object (not an object →
     ``malformed_value``) and the keyer extracts the tuple from it; a
@@ -290,12 +287,6 @@ def classify_message(
     """
     if offset < 0 or offset > _INT64_MAX:
         return DroppedRecord(offset, REASON_INVALID_OFFSET)
-    ts_type, ts_ms = timestamp
-    if ts_type == TIMESTAMP_NOT_AVAILABLE:
-        return DroppedRecord(offset, REASON_MISSING_TIMESTAMP)
-    event_ts_us = ts_ms * _MICROS_PER_MILLI
-    if not _INT64_MIN <= event_ts_us <= _INT64_MAX:
-        return DroppedRecord(offset, REASON_INVALID_TIMESTAMP)
     if value is None:
         return DroppedRecord(offset, REASON_MISSING_VALUE)
     try:
@@ -306,9 +297,7 @@ def classify_message(
         group = keyer.group_for(doc)
     except PartitionSourceError as exc:
         return DroppedRecord(offset, f"{REASON_MALFORMED_PARTITION_SOURCE}:{exc.path}")
-    return StagedRecord(
-        group=group, event_ts_us=event_ts_us, offset=offset, payload=value
-    )
+    return StagedRecord(group=group, offset=offset, payload=value)
 
 
 def drop_reason_label(reason: str) -> str:
@@ -807,6 +796,7 @@ class MillraceConsumer:
         gather-then-commit is the ordering invariant: all acks before
         the commit, not acks in sequence."""
         claimed = set(self._stages.partitions())
+        now_us = self._now_us()
         staged: dict[tuple[str, int], list[StagedRecord]] = {}
         last_handled: dict[tuple[str, int], int] = {}
         for msg in msgs:
@@ -843,7 +833,6 @@ class MillraceConsumer:
                 self._keyer,
                 offset=offset,
                 value=raw_value,
-                timestamp=msg.timestamp(),
             )
             # The byte cap's observation (key + value bytes per
             # classified record — the in-memory shape the cap guards).
@@ -859,8 +848,13 @@ class MillraceConsumer:
             else:
                 staged.setdefault(key, []).append(outcome)
 
-        now_us = self._now_us()
         keys = sorted(staged)
+        # A partition the poll handled but staged nothing on (every
+        # record dropped) still has offsets to commit: it gets a
+        # durable fence probe instead of a batch, so a fenced writer
+        # learns it lost the path BEFORE committing against the new
+        # owner (stage.py ``probe_fence``).
+        probes = sorted(set(last_handled) - set(staged))
         # One task per partition: the WAL PUTs and durability waits are
         # in flight together; gather (return_exceptions) settles EVERY
         # batch before the outcome is examined, so a failure never
@@ -872,18 +866,25 @@ class MillraceConsumer:
                 name=f"millrace-stage-{key[0]}-{key[1]}",
             )
             for key in keys
+        ] + [
+            asyncio.create_task(
+                self._stages.stage(*key).probe_fence(last_handled[key]),
+                name=f"millrace-probe-{key[0]}-{key[1]}",
+            )
+            for key in probes
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         errors: list[BaseException] = []
         fenced: list[tuple[str, int]] = []
-        for key, result in zip(keys, results, strict=True):
+        for key, result in zip([*keys, *probes], results, strict=True):
             if isinstance(result, BaseException):
                 if _is_fenced(result):
                     fenced.append(key)
                 else:
                     errors.append(result)
                 continue
-            self._records_staged += result.rows
+            if result is not None:
+                self._records_staged += result.rows
         if fenced:
             for exc in errors:
                 log.warning(

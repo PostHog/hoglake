@@ -34,7 +34,6 @@ async def _run(
         records = [
             StagedRecord(
                 group=(str((offset + i) % teams),),
-                event_ts_us=1_700_000_000_000_000 + offset + i,
                 offset=offset + i,
                 payload=payload_for(offset + i, payload_size),
             )

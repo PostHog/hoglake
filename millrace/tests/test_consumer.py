@@ -82,10 +82,8 @@ from millrace.config import (
 from millrace.consumer import (
     DROP_LOG_INTERVAL_S,
     REASON_INVALID_OFFSET,
-    REASON_INVALID_TIMESTAMP,
     REASON_MALFORMED_PARTITION_SOURCE,
     REASON_MALFORMED_VALUE,
-    REASON_MISSING_TIMESTAMP,
     REASON_MISSING_VALUE,
     ConsumerFencedError,
     ConsumerStats,
@@ -319,9 +317,8 @@ def _classify(
     value: bytes | None,
     *,
     offset: int = 41,
-    timestamp: tuple[int, int] = (1, 1_234_567),
 ) -> StagedRecord | DroppedRecord:
-    return classify_message(keyer, offset=offset, value=value, timestamp=timestamp)
+    return classify_message(keyer, offset=offset, value=value)
 
 
 def _group(keyer: GroupKeyer, doc: dict[str, Any]) -> tuple[str | None, ...]:
@@ -349,7 +346,6 @@ def test_identity_team_id_groups_by_the_teams_wire_string():
     out = _classify(keyer, b'{"team_id": 7, "v": 1}', offset=41)
     assert out == StagedRecord(
         group=("7",),
-        event_ts_us=1_234_567_000,
         offset=41,
         payload=b'{"team_id": 7, "v": 1}',
     )
@@ -445,26 +441,39 @@ def test_the_kafka_key_is_never_read():
 
 def test_classify_drop_reasons():
     keyer = GroupKeyer(table_info([IDENTITY_TEAM]))
-    out = _classify(keyer, b'{"team_id": 7}', timestamp=(0, 0))  # NOT_AVAILABLE
-    assert out == DroppedRecord(41, REASON_MISSING_TIMESTAMP)
     assert _classify(keyer, None) == DroppedRecord(41, REASON_MISSING_VALUE)
 
 
-def test_classify_out_of_range_offset_and_timestamp():
+def test_the_record_timestamp_is_never_read():
+    """Rows are keyed (group, offset) and the stats use the staging
+    clock: classification has no timestamp input, so a record without
+    one (TIMESTAMP_NOT_AVAILABLE) stages like any other (the loop-level
+    pin is test_malformed_records_are_dropped_counted_and_never_block)."""
+    import inspect
+
+    assert "timestamp" not in inspect.signature(classify_message).parameters
+    keyer = GroupKeyer(table_info([IDENTITY_TEAM]))
+    out = _classify(keyer, b'{"team_id": 7}')
+    assert out == StagedRecord(("7",), 41, b'{"team_id": 7}')
+
+
+def test_classify_out_of_range_offset():
     keyer = GroupKeyer(table_info([IDENTITY_TEAM]))
     out = _classify(keyer, b'{"team_id": 7}', offset=-1)
     assert out == DroppedRecord(-1, REASON_INVALID_OFFSET)
-    # *1000 overflows int64 µs
-    out = _classify(keyer, b'{"team_id": 7}', timestamp=(1, 10**18))
-    assert out == DroppedRecord(41, REASON_INVALID_TIMESTAMP)
+    out = _classify(keyer, b'{"team_id": 7}', offset=2**63)
+    assert out == DroppedRecord(2**63, REASON_INVALID_OFFSET)
+    assert _classify(keyer, b'{"team_id": 7}', offset=2**63 - 1) == StagedRecord(
+        ("7",), 2**63 - 1, b'{"team_id": 7}'
+    )
 
 
 def test_classify_names_the_FIRST_failing_check():
     keyer = GroupKeyer(table_info([IDENTITY_TEAM]))
-    # A tombstone with no timestamp drops as missing_timestamp; a
-    # tombstone is missing_value, never a parse error.
-    out = _classify(keyer, None, timestamp=(0, 0))
-    assert out == DroppedRecord(41, REASON_MISSING_TIMESTAMP)
+    # An invalid offset outranks everything; a tombstone is
+    # missing_value, never a parse error.
+    out = _classify(keyer, None, offset=-1)
+    assert out == DroppedRecord(-1, REASON_INVALID_OFFSET)
     assert _classify(keyer, None) == DroppedRecord(41, REASON_MISSING_VALUE)
 
 
@@ -689,34 +698,26 @@ async def test_end_to_end_staged_rows_and_committed_offsets_cover(fake_clock):
     assert stats.records_staged == 30
     assert stats.records_dropped == {}
 
-    # Every produced row is staged, byte-exact, in (group, ts, offset)
-    # key order; the stats the planner reads reconcile exactly; the
-    # offsets/ identity ranges cover the produced range contiguously.
+    # Every produced row is staged, byte-exact, in (group, offset) key
+    # order; the stats the planner reads reconcile exactly; the groups'
+    # offsets together are exactly the produced range.
     total_rows = 0
     for partition, team_count in ((0, 3), (1, 1)):
         stage = manager.stage("events", partition)
-        ranges = []
+        seen: list[int] = []
         for ks in await stage.iter_key_stats():
             rows = [(rk, v) async for rk, v in stage.scan_group_rows(ks.group)]
-            assert [(rk.timestamp_us, rk.offset) for rk, _ in rows] == sorted(
-                (rk.timestamp_us, rk.offset) for rk, _ in rows
-            )
+            offsets = [rk.offset for rk, _ in rows]
+            assert offsets == sorted(offsets)
             for rk, value in rows:
                 assert value == produced[(partition, rk.offset)]
                 assert rk.group == ks.group
             assert ks.row_count == len(rows)
             assert ks.staged_bytes == sum(len(v) for _, v in rows)
             total_rows += len(rows)
-            ranges.extend(await stage.read_offsets(ks.group))
-        ordered = sorted(ranges, key=lambda r: r.first_offset)
-        assert ordered[0].first_offset == 0
-        assert max(r.last_offset for r in ordered) == (19 if partition == 0 else 9)
-        # the union covers the produced range contiguously (a sweep, not
-        # a pairwise check — earlier ranges bridge later gaps)
-        covered_through = ordered[0].last_offset
-        for r in ordered[1:]:
-            assert r.first_offset <= covered_through + 1
-            covered_through = max(covered_through, r.last_offset)
+            seen.extend(offsets)
+        assert sorted(seen) == list(range(20 if partition == 0 else 10))
+        assert len(await stage.iter_key_stats()) == team_count
     assert total_rows == 30
 
     gauges = await manager.gauges()
@@ -777,61 +778,88 @@ async def test_malformed_records_are_dropped_counted_and_never_block(
     fake.feed(
         team_msg(0, 0, team=3, tag="good-0"),
         msg(0, 1, key=b"not-a-team", value=b"junk" * 20),  # not JSON
-        msg(0, 2, key=b"3", ts_ms=None),  # no timestamp
+        team_msg(0, 2, team=3, tag="no-ts", ts_ms=None),  # no timestamp: staged
         msg(0, 3, key=b"3", value=None),  # tombstone
         team_msg(0, 4, team=3, tag="good-4"),
     )
     with caplog.at_level(logging.WARNING, logger="millrace.consumer"):
         await run_steps(consumer, fake)
 
-    assert_commits_follow_acks(journal, dropped={("events", 0, o) for o in (1, 2, 3)})
+    assert_commits_follow_acks(journal, dropped={("events", 0, o) for o in (1, 3)})
     # The commit covers the dropped records' offsets.
     assert fake.committed_store == {("events", 0): 5}
     stats = consumer.stats()
-    assert stats.records_staged == 2
+    assert stats.records_staged == 3
     assert stats.records_dropped == {
         REASON_MALFORMED_VALUE: 1,
-        REASON_MISSING_TIMESTAMP: 1,
         REASON_MISSING_VALUE: 1,
     }
 
     stage = manager.stage("events", 0)
-    assert await team_offsets(stage, 3) == [0, 4]
-    assert await stage_key_prefixes(stage) == {
-        b"rows/",
-        b"stats/",
-        b"sched_age/",
-        b"offsets/",
-    }
+    assert await team_offsets(stage, 3) == [0, 2, 4]
+    assert await stage_key_prefixes(stage) == {b"rows/", b"stats/", b"sched_age/"}
     lines = [r.getMessage() for r in caplog.records if "record dropped" in r.message]
     assert [line.split(" (")[0] for line in lines] == [
         "record dropped: topic=events partition=0 offset=1 reason=malformed_value",
-        "record dropped: topic=events partition=0 offset=2 reason=missing_timestamp",
         "record dropped: topic=events partition=0 offset=3 reason=missing_value",
     ]
     await manager.close()
 
 
+def _journal_probes(manager: StageManager, journal: list[tuple]) -> None:
+    """Spy every open stage's fence probe into the journal, after its
+    durable write returns."""
+    for key in manager.partitions():
+        stage = manager.stage(*key)
+
+        def make_spy(key, original):
+            async def spy(offset):
+                await original(offset)
+                journal.append(("probe", key, offset))
+
+            return spy
+
+        stage.probe_fence = make_spy(key, stage.probe_fence)  # type: ignore[method-assign]
+
+
 @component
 async def test_a_poll_of_only_dropped_records_still_commits(fake_clock):
     """Nothing to stage is still handled: the offset advances past a
-    poll whose every record was dropped, with no stage_batch call."""
+    poll whose every record was dropped — after a durable fence probe on
+    the partition (no stage_batch, no row, no stats), so a fenced owner
+    would have halted first. A partition that staged rows in the same
+    poll is not probed."""
     journal: list[tuple] = []
     manager = make_manager(journal)
     fake = FakeConsumer(journal=journal)
-    consumer = make_consumer(fake, manager, make_config(), fake_clock)
+    consumer = make_consumer(
+        fake, manager, make_config(static_partitions=(0, 1)), fake_clock
+    )
     await consumer.start()
+    _journal_probes(manager, journal)
 
-    fake.feed(msg(0, 0, key=None, value=b"x"), msg(0, 1, key=None, value=None))
+    fake.feed(
+        msg(0, 0, key=None, value=b"x"),
+        msg(0, 1, key=None, value=None),
+        team_msg(1, 0, team=2),
+        msg(1, 1, key=None, value=b"x"),
+    )
     await run_steps(consumer, fake)
 
-    assert_commits_follow_acks(journal, dropped={("events", 0, 0), ("events", 0, 1)})
-    assert not [e for e in journal if e[0] == "ack"]  # nothing was staged
-    assert fake.committed_store == {("events", 0): 2}
+    assert_commits_follow_acks(
+        journal, dropped={("events", 0, 0), ("events", 0, 1), ("events", 1, 1)}
+    )
+    kinds = [e[0] for e in journal if e[0] in ("ack", "probe", "commit")]
+    assert kinds.index("probe") < kinds.index("commit")
+    assert [e for e in journal if e[0] == "probe"] == [("probe", ("events", 0), 1)]
+    assert [e[1].partition for e in journal if e[0] == "ack"] == [1]
+    assert fake.committed_store == {("events", 0): 2, ("events", 1): 2}
     stats = consumer.stats()
-    assert stats.records_staged == 0
-    assert sum(stats.records_dropped.values()) == 2
-    assert await manager.stage("events", 0).iter_key_stats() == []
+    assert stats.records_staged == 1
+    assert sum(stats.records_dropped.values()) == 3
+    stage0 = manager.stage("events", 0)
+    assert await stage0.iter_key_stats() == []
+    assert await stage_key_prefixes(stage0) == {b"meta/"}
     await manager.close()
 
 
@@ -1334,6 +1362,38 @@ async def test_a_fenced_partition_closes_locally_and_halts_distinctly(fake_clock
         }
         stage1 = manager.stage("events", 1)
         assert await team_offsets(stage1, 2) == [0, 1]
+    finally:
+        await new_owner.shutdown()
+    await manager.close()
+
+
+@component
+async def test_an_all_drops_poll_on_a_fenced_stage_halts_without_committing(
+    fake_clock,
+):
+    """Under static assignment a fenced old owner whose stream is 100 %
+    drops has no staging write to fail — the fence probe is that write:
+    the poll raises ConsumerFencedError and commits NOTHING against the
+    new owner, and the fenced stage is closed locally."""
+    journal: list[tuple] = []
+    manager = make_manager(journal)
+    fake = FakeConsumer(journal=journal)
+    consumer = make_consumer(fake, manager, make_config(), fake_clock)
+    await consumer.start()
+    fake.feed(team_msg(0, 0, team=1))
+    await run_steps(consumer, fake)
+    assert fake.committed_store == {("events", 0): 1}
+
+    new_owner = await DbBuilder(manager.path_for("events", 0), manager.store).build()
+    try:
+        fake.feed(msg(0, 1, key=None, value=b"x"), msg(0, 2, key=None, value=None))
+        with pytest.raises(ConsumerFencedError) as excinfo:
+            await consumer._step()
+        assert excinfo.value.partitions == (("events", 0),)
+        assert manager.partitions() == ()
+        assert fake.committed_store == {("events", 0): 1}
+        assert consumer.committed_offsets() == {("events", 0): 1}
+        assert len([e for e in journal if e[0] == "commit"]) == 1
     finally:
         await new_owner.shutdown()
     await manager.close()

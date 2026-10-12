@@ -432,3 +432,75 @@ def test_records_dropped_total_merges_consume_and_flush_reasons():
         flusher.close()
         loop.run_until_complete(asyncio.sleep(0.05))
         loop.close()
+
+
+# -- the flush counters, by exact name, labels and value ---------------------------
+
+
+def _raw(collector: Any) -> dict[tuple[str, tuple[tuple[str, str], ...]], float]:
+    return {
+        (s.name, tuple(sorted(s.labels.items()))): s.value
+        for m in collector.collect()
+        for s in m.samples
+    }
+
+
+def test_flush_counters_are_exposed_by_exact_name_labels_and_value():
+    """Each flusher counter reaches its own series: seeded with distinct
+    values, a swapped pair of counters (unresolved vs orphaned, say)
+    reads back wrong. ``millrace_prepared_reprepared_total`` carries
+    every reason in REPREPARE_REASONS, a never-incremented one at 0."""
+    from millrace.flush import REPREPARE_REASONS
+
+    consumer, stages, flusher = _collector()
+    loop = asyncio.new_event_loop()
+    try:
+        collector = main._PipelineCollector(consumer, flusher, stages, loop)
+        zero = _raw(collector)
+        assert {
+            labels: value
+            for (name, labels), value in zero.items()
+            if name == "millrace_prepared_reprepared_total"
+        } == {(("reason", reason),): 0 for reason in REPREPARE_REASONS}
+        assert set(REPREPARE_REASONS) == {
+            "ddl_since_read_snapshot",
+            "read_snapshot_expired",
+        }
+
+        flusher._prepared_replays = 3
+        flusher._reprepared["read_snapshot_expired"] = 5
+        flusher._unresolved_uploads = 7
+        flusher._receipt_settlements = 11
+        flusher._orphaned_uploads = 13
+        flusher._flush_deduped = 17
+        raw = _raw(collector)
+        assert raw[("millrace_prepared_replays_total", ())] == 3
+        assert (
+            raw[
+                (
+                    "millrace_prepared_reprepared_total",
+                    (("reason", "read_snapshot_expired"),),
+                )
+            ]
+            == 5
+        )
+        assert (
+            raw[
+                (
+                    "millrace_prepared_reprepared_total",
+                    (("reason", "ddl_since_read_snapshot"),),
+                )
+            ]
+            == 0
+        )
+        assert raw[("millrace_flush_unresolved_uploads_total", ())] == 7
+        assert raw[("millrace_receipt_settlements_total", ())] == 11
+        assert raw[("millrace_flush_orphaned_uploads_total", ())] == 13
+        assert raw[("millrace_flush_deduped_total", ())] == 17
+        assert len(
+            [k for k in raw if k[0] == "millrace_prepared_reprepared_total"]
+        ) == len(REPREPARE_REASONS)
+    finally:
+        flusher.close()
+        loop.run_until_complete(asyncio.sleep(0.05))
+        loop.close()

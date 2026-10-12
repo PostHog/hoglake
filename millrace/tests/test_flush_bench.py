@@ -65,7 +65,6 @@ async def _stage_all(manager: StageManager, clock: Any) -> None:
                 records.append(
                     StagedRecord(
                         group=(str(team),),
-                        event_ts_us=NOW + offset,
                         offset=offset,
                         payload=event_payload(team, NOW + offset),
                     )

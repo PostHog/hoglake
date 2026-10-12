@@ -270,6 +270,11 @@ class _PipelineCollector:
                 f.receipt_settlements,
             ),
             (
+                "millrace_flush_deduped_total",
+                "Fresh flush windows settled from an existing receipt",
+                f.flush_deduped,
+            ),
+            (
                 "millrace_flush_rows_published_total",
                 "Rows published to the lake",
                 f.rows_published,

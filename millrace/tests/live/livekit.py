@@ -127,6 +127,87 @@ def create_events_table(namespace: Any, name: str) -> Any:
     return table
 
 
+def nested_events_schema() -> pa.Schema:
+    """A destination with nested columns and a json column: the partition
+    and sort sources are struct leaves (``properties.team_id``,
+    ``properties.ts``), beside a list and a map in the same struct."""
+    return pa.schema(
+        [
+            pa.field("seq", pa.int64(), nullable=False),
+            pa.field("event", pa.string(), nullable=True),
+            pa.field(
+                "properties",
+                pa.struct(
+                    [
+                        pa.field("team_id", pa.int64(), nullable=True),
+                        pa.field("ts", pa.timestamp("us", tz="UTC"), nullable=True),
+                        pa.field("tags", pa.list_(pa.string()), nullable=True),
+                        pa.field(
+                            "attrs", pa.map_(pa.string(), pa.string()), nullable=True
+                        ),
+                    ]
+                ),
+                nullable=True,
+            ),
+            pa.field("doc", pa.json_(), nullable=True),
+        ]
+    )
+
+
+def create_nested_events_table(namespace: Any, name: str) -> Any:
+    """Create the nested table, then (in one alter, after the create
+    read-back binds field ids) set the spec ``identity(properties.team_id),
+    month(properties.ts)`` and the sort order ``properties.ts`` asc."""
+    table = namespace.create_table(name, nested_events_schema())
+    (properties,) = [c for c in table.columns if c.name == "properties"]
+    assert properties.children is not None
+    leaf = {c.name: c.field_id for c in properties.children}
+    table.alter(
+        [
+            ops.set_partition_spec(
+                [
+                    ops.partition_field(leaf["team_id"], "identity"),
+                    ops.partition_field(leaf["ts"], "month"),
+                ]
+            ),
+            ops.AlterOp(
+                "set_sort_order",
+                {
+                    "sort_fields": [
+                        {
+                            "source_field_id": leaf["ts"],
+                            "direction": "asc",
+                            "null_order": "nulls_first",
+                        }
+                    ]
+                },
+            ),
+        ]
+    )
+    return table
+
+
+def nested_doc(team_id: int, ts_us: int, seq: int) -> dict[str, Any]:
+    """The nested payload as a dict (the readback's expectation): the
+    struct's two partition/sort leaves, a list, a map, and a json value
+    holding an object, an array and a null."""
+    return {
+        "seq": seq,
+        "event": f"nested-{seq}",
+        "properties": {
+            "team_id": team_id,
+            "ts": ts_us,
+            "tags": [f"t{seq % 3}", "all"],
+            "attrs": {"seq": str(seq), "team": str(team_id)},
+        },
+        "doc": {"seq": seq, "path": ["a", seq], "none": None},
+    }
+
+
+def nested_payload(team_id: int, ts_us: int, seq: int) -> bytes:
+    return json.dumps(nested_doc(team_id, ts_us, seq), separators=(",", ":")).encode()
+
+
 def _pad_fill(n: int, team_id: int, ts_us: int, seq: int) -> str:
     """``n`` pad characters that parquet/snappy cannot compress away:
     chained sha256 hex of the row's coordinates — deterministic per
@@ -229,13 +310,15 @@ class EventProducer:
         pad_bytes: int = 0,
         record_ts_us: int | None = None,
         extra: dict[str, Any] | None = None,
+        value: bytes | None = None,
     ) -> None:
         """Queue one event; the Kafka record timestamp tracks the event
         time (ms) so row keys order like the payloads. ``record_ts_us``
         overrides the record timestamp (junk event_time scenarios keep
         the RECORD timestamp sane — the broker rejects records too far
         out — while the PAYLOAD carries the junk date). ``extra`` adds
-        raw payload keys (a column added mid-test)."""
+        raw payload keys (a column added mid-test); ``value`` replaces the
+        events payload outright (the nested scenario)."""
         with self._lock:
             self._pending[seq] = (team_id, ts_us, time.monotonic())
 
@@ -259,7 +342,9 @@ class EventProducer:
         self._producer.produce(
             self.topic,
             key=str(team_id).encode(),
-            value=event_payload(team_id, ts_us, seq, pad_bytes=pad_bytes, extra=extra),
+            value=value
+            if value is not None
+            else event_payload(team_id, ts_us, seq, pad_bytes=pad_bytes, extra=extra),
             timestamp=(ts_us if record_ts_us is None else record_ts_us) // 1000,
             on_delivery=on_delivery,
         )
@@ -373,6 +458,31 @@ def lake_team_counts(table: Any, snapshot: int) -> Counter[int]:
         assert f.partition_values is not None
         counts[int(f.partition_values[0])] += f.record_count
     return counts
+
+
+def lake_tuple_counts(table: Any, snapshot: int) -> Counter[tuple[str | None, ...]]:
+    """Row counts per FULL partition tuple, from the manifest alone (any
+    spec: no position of ``partition_values`` is assumed to be a team)."""
+    counts: Counter[tuple[str | None, ...]] = Counter()
+    for f in lake_files(table, snapshot):
+        assert f.partition_values is not None
+        counts[tuple(f.partition_values)] += f.record_count
+    return counts
+
+
+def lake_rows_by_tuple(
+    table: Any, snapshot: int, fs: Any
+) -> dict[tuple[str | None, ...], list[pa.Table]]:
+    """Parquet readback of every live file, keyed by the file's full
+    ``partition_values`` tuple — one table per file, in manifest order."""
+    out: dict[tuple[str | None, ...], list[pa.Table]] = {}
+    for f in lake_files(table, snapshot):
+        assert f.partition_values is not None
+        key = f.path[len("s3://") :]
+        out.setdefault(tuple(f.partition_values), []).append(
+            pq.read_table(key, filesystem=fs)
+        )
+    return out
 
 
 def lake_rows(table: Any, snapshot: int, fs: Any) -> pa.Table:

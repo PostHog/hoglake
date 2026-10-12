@@ -101,6 +101,11 @@ class LakeHome:
         self.tables.append(table)
         return table
 
+    def create_nested_events_table(self, name: str = "nested_events") -> Any:
+        table = livekit.create_nested_events_table(self.namespace, name)
+        self.tables.append(table)
+        return table
+
     def head(self) -> int:
         return livekit.head_snapshot(self.catalog)
 

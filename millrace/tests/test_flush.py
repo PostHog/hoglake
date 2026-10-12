@@ -97,6 +97,7 @@ from flushkit import (
     month_wire,
     parquet_rows,
     read_markers,
+    receipt_server,
     script_bootstrap,
     script_options,
     script_receipt,
@@ -135,7 +136,7 @@ from millrace.flush import (
     format_commit_message,
     parse_message_offsets,
 )
-from millrace.keyspace import FlushedKey, OffsetRange, PreparedRequest
+from millrace.keyspace import FlushedKey, PreparedRequest
 from millrace.stage import StageManager
 
 component = pytest.mark.component
@@ -149,6 +150,20 @@ DEC_US = NOW - 20 * 86_400_000_000
 
 def columns(columns_wire: list[dict[str, Any]] | None = None) -> tuple[Column, ...]:
     return tuple(Column.from_wire(c) for c in (columns_wire or COLUMNS_WIRE))
+
+
+@pytest.fixture(autouse=True)
+def receipts(request: pytest.FixtureRequest) -> Any:
+    """Every httpx-scripted test gets the one receipt endpoint
+    (flushkit.ReceiptServer: scripted keys in order, any other key 404 —
+    the lookup every fresh build makes before it builds); at teardown
+    every scripted receipt must have been consumed."""
+    if "httpx_mock" not in request.fixturenames:
+        yield None
+        return
+    server = receipt_server(request.getfixturevalue("httpx_mock"))
+    yield server
+    assert not server.unconsumed(), f"unconsumed receipts: {server.unconsumed()}"
 
 
 @pytest.fixture
@@ -218,7 +233,6 @@ async def staged(
         records.append(
             StagedRecord(
                 group=team_group(team),
-                event_ts_us=ts,
                 offset=offset,
                 payload=(event_payload(team, ts) if payloads is None else payloads[i]),
             )
@@ -230,16 +244,60 @@ async def staged_rows(stage: Any, team: int) -> list[tuple[Any, bytes]]:
     return [kv async for kv in stage.scan_group_rows(team_group(team))]
 
 
+#: Every row staged in the running test, ``(partition, group, offset) →
+#: payload`` (recorded by the autouse ``_record_staged`` fixture), so
+#: :func:`ikey` can derive a window's content digest after the rows
+#: themselves have been settled away.
+_STAGED: dict[tuple[int, Any, int], bytes] = {}
+
+
+@pytest.fixture(autouse=True)
+def _record_staged(monkeypatch: pytest.MonkeyPatch) -> Any:
+    from millrace.stage import PartitionStage
+
+    _STAGED.clear()
+    real = PartitionStage.stage_batch
+
+    async def recording(self: Any, records: Any, *, now_us: int) -> Any:
+        records = list(records)
+        ack = await real(self, records, now_us=now_us)
+        for r in records:
+            _STAGED[(self.partition, r.group, r.offset)] = r.payload
+        return ack
+
+    monkeypatch.setattr(PartitionStage, "stage_batch", recording)
+    yield
+    _STAGED.clear()
+
+
+def window_digest(partition: int, group: Any, first: int, last: int) -> str:
+    """The content digest of the staged rows of ``group`` in
+    ``first..last`` on events[``partition``], as staged in this test."""
+    rows = sorted(
+        (offset, payload)
+        for (p, g, offset), payload in _STAGED.items()
+        if p == partition and g == group and first <= offset <= last
+    )
+    return keyspace.content_digest(rows)
+
+
 def ikey(partition: int, team: int, first: int, last: int) -> str:
     """The idempotency key of team ``team``'s default-spec group's window
-    ``first..last`` on events[``partition``]."""
+    ``first..last`` on events[``partition``] over the rows staged in it."""
+    group = team_group(team)
     return keyspace.idempotency_key(
-        TABLE_UUID, "events", partition, team_group(team), first, last
+        TABLE_UUID,
+        "events",
+        partition,
+        group,
+        first,
+        last,
+        window_digest(partition, group, first, last),
     )
 
 
 def prepared_request(
-    key: str, team: int, *, partition: int = 0, body: bytes = b"{}"
+    key: str, team: int, *, partition: int = 0, body: bytes = b"{}", rows: int = 0
 ) -> PreparedRequest:
     """A persisted prepared request for team ``team``'s default-spec group."""
     return PreparedRequest(
@@ -250,6 +308,7 @@ def prepared_request(
         partition=partition,
         group=team_group(team),
         group_fields=SPEC_FIELDS,
+        row_count=rows,
     )
 
 
@@ -690,10 +749,8 @@ class TestCommitMessage:
             arrow_bytes=456,
             topic="events",
             partition=3,
-            offset_ranges=[
-                OffsetRange("events", 3, 10, 14),
-                OffsetRange("events", 3, 20, 24),
-            ],
+            first_offset=10,
+            last_offset=24,
             version="0.1.0.dev0",
         )
         assert message.splitlines() == [
@@ -703,34 +760,8 @@ class TestCommitMessage:
                 "dropped=1 files=2 partitions=2 staged_bytes=123 arrow_bytes=456 "
                 "millrace=0.1.0.dev0"
             ),
-            "offsets topic=events partition=3 ranges=10-14,20-24",
+            "offsets topic=events partition=3 window=10-24",
         ]
-
-    def test_truncation_keeps_first_and_last_range_verbatim(self) -> None:
-        ranges = [OffsetRange("events", 0, i * 10, i * 10 + 4) for i in range(50)]
-        message = format_commit_message(
-            table_uuid=TABLE_UUID,
-            group=team_label(TEAM),
-            trigger="age",
-            records=250,
-            dropped=0,
-            files=1,
-            partitions=1,
-            staged_bytes=1,
-            arrow_bytes=1,
-            topic="events",
-            partition=0,
-            offset_ranges=ranges,
-            version="x",
-            limit=120,
-        )
-        line = message.splitlines()[1]
-        assert (
-            line
-            == "offsets topic=events partition=0 ranges=0-4,...(+48_elided),490-494"
-        )
-        # ...and the window still parses back out of it.
-        assert parse_message_offsets(message, topic="events", partition=0) == (0, 494)
 
     def test_parse_round_trip(self) -> None:
         message = format_commit_message(
@@ -745,7 +776,8 @@ class TestCommitMessage:
             arrow_bytes=1,
             topic="events",
             partition=2,
-            offset_ranges=[OffsetRange("events", 2, 41, 90)],
+            first_offset=41,
+            last_offset=90,
             version="x",
         )
         assert parse_message_offsets(message, topic="events", partition=2) == (41, 90)
@@ -756,13 +788,21 @@ class TestCommitMessage:
         with pytest.raises(StageCorruptionError):
             # a different partition's line is not ours to settle
             parse_message_offsets(
-                "offsets topic=events partition=1 ranges=0-4",
+                "offsets topic=events partition=1 window=0-4",
                 topic="events",
                 partition=0,
             )
-        with pytest.raises(StageCorruptionError):
+        for line in (
+            "offsets topic=events partition=0 window=garbage",
+            "offsets topic=events partition=0 window=0-4,6-9",
+            "offsets topic=events partition=0 ranges=0-4",
+            "offsets topic=events partition=0 window=-1-4",
+        ):
+            with pytest.raises(StageCorruptionError):
+                parse_message_offsets(line, topic="events", partition=0)
+        with pytest.raises(StageCorruptionError, match="inverted window 5-4"):
             parse_message_offsets(
-                "offsets topic=events partition=0 ranges=garbage",
+                "offsets topic=events partition=0 window=5-4",
                 topic="events",
                 partition=0,
             )
@@ -872,7 +912,7 @@ class TestHappyPath:
         assert any(t.startswith("staged_bytes=") for t in tokens)
         assert any(t.startswith("arrow_bytes=") for t in tokens)
         assert any(t.startswith("millrace=") for t in tokens)
-        assert offsets_line == "offsets topic=events partition=0 ranges=0-4"
+        assert offsets_line == "offsets topic=events partition=0 window=0-4"
 
         # Settlement: the staged range is deleted, stats and offsets are
         # gone, the prepared entry is dropped, and NO marker is written —
@@ -880,32 +920,31 @@ class TestHappyPath:
         # could only restate both (the flushed/ prefix stays empty).
         assert await staged_rows(stage, TEAM) == []
         assert await stage.iter_key_stats() == []
-        assert await stage.read_offsets(team_group(TEAM)) == ()
         assert await stage.load_prepared() == []
         assert await read_markers(stage) == []
 
         # The uploaded parquet is real and carries the rows, in scan
-        # ((timestamp, offset)) order: the older December rows group first.
+        # (offset) order: the January rows (offsets 0-2) group first.
         assert len(store.files) == 2
         assert sorted(store.files) == [
             f"bkt/lake/data/{NAMESPACE}/{TABLE}/{key}/{build}/{i}.parquet"
             for i in (0, 1)
         ]
-        dec = parquet_rows(
+        jan = parquet_rows(
             store, f"s3://bkt/lake/data/{NAMESPACE}/{TABLE}/{key}/{build}/0.parquet"
         )
-        assert [r["team_id"] for r in dec.to_pylist()] == [7, 7]
-        assert [ts_micros(r["timestamp"]) for r in dec.to_pylist()] == [
-            DEC_US,
-            DEC_US + 3_600_000_000,
-        ]
-        jan = parquet_rows(
-            store, f"s3://bkt/lake/data/{NAMESPACE}/{TABLE}/{key}/{build}/1.parquet"
-        )
+        assert [r["team_id"] for r in jan.to_pylist()] == [7, 7, 7]
         assert [ts_micros(r["timestamp"]) for r in jan.to_pylist()] == [
             JAN_US,
             JAN_US + 3_600_000_000,
             JAN_US + 7_200_000_000,
+        ]
+        dec = parquet_rows(
+            store, f"s3://bkt/lake/data/{NAMESPACE}/{TABLE}/{key}/{build}/1.parquet"
+        )
+        assert [ts_micros(r["timestamp"]) for r in dec.to_pylist()] == [
+            DEC_US,
+            DEC_US + 3_600_000_000,
         ]
 
         stats = flusher.stats()
@@ -962,7 +1001,6 @@ def _keyed_records(keyer: Any, rows: list[tuple[int, int, int]]) -> list[Any]:
             keyer,
             offset=offset,
             value=event_payload(team, ts),
-            timestamp=(1, JAN_US // 1000),
         )
         assert isinstance(record, StagedRecord)
         out.append(record)
@@ -1083,7 +1121,13 @@ class TestPartitionTupleGroups:
         # The key is a function of the staged tuple alone (positional
         # names), never of the spec live at flush time.
         assert body["idempotency_key"] == keyspace.idempotency_key(
-            TABLE_UUID, "events", 0, (str(TEAM),), 0, 1
+            TABLE_UUID,
+            "events",
+            0,
+            (str(TEAM),),
+            0,
+            1,
+            window_digest(0, (str(TEAM),), 0, 1),
         )
         assert await stage.iter_key_stats() == []
 
@@ -1470,7 +1514,7 @@ class TestRefusalTaxonomy:
         assert len(capture.bodies) == 1  # an answered 4xx is never retried
         # Nothing is settled, dropped or deleted: the rows stay staged,
         # the prepared entry stays for an operator, the upload is
-        # orphan-accounted — the idempotency_key_reused posture, verbatim.
+        # orphan-accounted (the halt posture of every answered 4xx).
         assert len(await staged_rows(stage, TEAM)) == 3
         assert len(await stage.load_prepared()) == 1
         stats = flusher.stats()
@@ -1607,7 +1651,53 @@ class TestRefusalTaxonomy:
         assert capture.bodies[-1] == capture.bodies[0]  # the replay was verbatim
         await stage2.close()
 
-    async def test_422_reused_idempotency_key_halts(
+    async def test_a_fresh_build_with_a_live_receipt_settles_without_building(
+        self,
+        httpx_mock: Any,
+        stage_factory: Any,
+        fake_clock: Any,
+        flusher_factory: Any,
+        store: FakeObjectStore,
+        sleeper: Sleeper,
+        caplog: Any,
+    ) -> None:
+        """Receipt first: offsets re-consumed below the settled floor
+        re-stage the same rows under the same window and key. The fresh
+        build looks the key up BEFORE it builds; a 200 settles the window
+        locally — no PUT, no POST, nothing persisted — counted in
+        ``flush_deduped`` and logged at INFO with the key and window."""
+        stage, capture, flusher = await self._stage_and_flush(
+            httpx_mock, stage_factory, fake_clock, flusher_factory, store, sleeper, []
+        )
+        key = ikey(0, TEAM, 0, 2)
+        script_receipt(httpx_mock, key, snapshot_id=77)
+        with caplog.at_level(logging.INFO, logger="millrace.flush"):
+            report = await flusher.flush_key(
+                stage,
+                decision(
+                    TEAM, trigger="size", staged_bytes=100, first_staged_ts=JAN_US
+                ),
+            )
+        assert report.outcome == "deduped"
+        assert (report.first_offset, report.last_offset) == (0, 2)
+        assert report.snapshot_id == 77
+        assert report.idempotency_key == key
+        assert capture.bodies == []  # no POST
+        assert store.files == {}  # no PUT
+        assert await staged_rows(stage, TEAM) == []
+        assert await stage.iter_key_stats() == []
+        assert await stage.load_prepared() == []
+        stats = flusher.stats()
+        assert stats.flush_deduped == 1
+        assert stats.flushes_committed == 0
+        assert stats.orphaned_uploads == 0
+        assert stats.receipt_lookups == 1
+        (line,) = [r for r in caplog.records if r.getMessage().startswith("deduped")]
+        assert line.levelno == logging.INFO
+        assert key in line.getMessage()
+        assert "offsets 0-2" in line.getMessage()
+
+    async def test_a_fresh_publish_answered_422_reused_halts(
         self,
         httpx_mock: Any,
         stage_factory: Any,
@@ -1616,7 +1706,12 @@ class TestRefusalTaxonomy:
         store: FakeObjectStore,
         sleeper: Sleeper,
     ) -> None:
-        stage, _capture, flusher = await self._stage_and_flush(
+        """The key names the window's content and its receipt answered 404
+        before the build: a 422 reused-key on the publish means another
+        writer committed this content in between. Never settled on —
+        halt ``idempotency_key_reused`` naming the window and digest,
+        rows and entry staged, uploads orphan-accounted."""
+        stage, capture, flusher = await self._stage_and_flush(
             httpx_mock,
             stage_factory,
             fake_clock,
@@ -1636,12 +1731,199 @@ class TestRefusalTaxonomy:
                     TEAM, trigger="size", staged_bytes=100, first_staged_ts=JAN_US
                 ),
             )
-        # A receipt exists for THIS key with a DIFFERENT payload: with
-        # deterministic derivation that means a foreign writer or broken
-        # determinism — halt, never settle rows a stranger may not have
-        # published.
         assert excinfo.value.reason == "idempotency_key_reused"
+        digest = window_digest(0, team_group(TEAM), 0, 2)
+        assert f"offsets 0-2 (content digest {digest}" in excinfo.value.detail
+        assert len(capture.bodies) == 1
         assert len(await staged_rows(stage, TEAM)) == 3
+        assert len(await stage.load_prepared()) == 1
+        stats = flusher.stats()
+        assert stats.flush_deduped == 0
+        assert stats.orphaned_uploads == 1
+
+    async def test_different_rows_under_the_same_bounds_never_settle_from_the_receipt(
+        self,
+        httpx_mock: Any,
+        stage_factory: Any,
+        fake_clock: Any,
+        flusher_factory: Any,
+        store: FakeObjectStore,
+        sleeper: Sleeper,
+    ) -> None:
+        """A recreated topic, an offset restart or a re-key can stage
+        DIFFERENT rows under bounds whose earlier window has a receipt.
+        The content digest makes their key different: the receipt of the
+        earlier content is never asked for, and the new rows publish as a
+        new commit (the at-least-once duplicate), never a silent delete."""
+        stage, capture, flusher = await self._stage_and_flush(
+            httpx_mock,
+            stage_factory,
+            fake_clock,
+            flusher_factory,
+            store,
+            sleeper,
+            [commit_ok(60)],
+        )
+        group = team_group(TEAM)
+        other = [(o, b"other-content-%d" % o) for o in range(3)]
+        landed_key = keyspace.idempotency_key(
+            TABLE_UUID, "events", 0, group, 0, 2, keyspace.content_digest(other)
+        )
+        script_receipt(httpx_mock, landed_key, snapshot_id=59)
+        receipts = receipt_server(httpx_mock)
+        report = await flusher.flush_key(
+            stage,
+            decision(TEAM, trigger="size", staged_bytes=100, first_staged_ts=JAN_US),
+        )
+        assert report.outcome == "committed"
+        assert report.idempotency_key == ikey(0, TEAM, 0, 2) != landed_key
+        assert receipts.lookups == [ikey(0, TEAM, 0, 2)]
+        assert len(capture.bodies) == 1
+        assert flusher.stats().flush_deduped == 0
+        # the scripted receipt of the other content was never consumed
+        assert receipts.unconsumed() == {landed_key: [59]}
+        receipts._scripted.clear()
+
+    async def test_a_transient_receipt_lookup_retries_on_the_ladder(
+        self,
+        httpx_mock: Any,
+        stage_factory: Any,
+        fake_clock: Any,
+        flusher_factory: Any,
+        store: FakeObjectStore,
+        sleeper: Sleeper,
+        caplog: Any,
+    ) -> None:
+        """The pre-build receipt GET rides the publish ladder's transient
+        arm: a 503 (Retry-After floors the delay) and a transport error
+        are retried with one WARNING line each, then the 404 lets the
+        build proceed."""
+        stage, _capture, flusher = await self._stage_and_flush(
+            httpx_mock,
+            stage_factory,
+            fake_clock,
+            flusher_factory,
+            store,
+            sleeper,
+            [commit_ok(50)],
+        )
+        key = ikey(0, TEAM, 0, 2)
+        receipts = receipt_server(httpx_mock)
+        receipts.script(
+            key,
+            httpx.Response(
+                503,
+                json={"error": "unavailable", "detail": "busy"},
+                headers={"Retry-After": "3"},
+            ),
+        )
+        receipts.script(key, httpx.ConnectError("reset"))
+        receipts.script(key, None)
+        with caplog.at_level(logging.WARNING, logger="millrace.flush"):
+            report = await flusher.flush_key(
+                stage,
+                decision(
+                    TEAM, trigger="size", staged_bytes=100, first_staged_ts=JAN_US
+                ),
+            )
+        assert report.outcome == "committed"
+        assert receipts.lookups == [key] * 3
+        assert sleeper.calls[:2] == [3.0, 1.0]
+        lines = [r for r in caplog.records if "receipt lookup" in r.getMessage()]
+        assert len(lines) == 2
+        assert all(r.exc_info is None for r in lines)
+
+    async def test_an_exhausted_receipt_ladder_defers_the_decision_quietly(
+        self,
+        httpx_mock: Any,
+        memory_store: Any,
+        fake_clock: Any,
+        flusher_factory: Any,
+        store: FakeObjectStore,
+        sleeper: Sleeper,
+        caplog: Any,
+    ) -> None:
+        """Exhaustion is a failed decision retried next sweep: one
+        WARNING line, no stack trace, nothing built or settled."""
+        from millrace.flush import _PUBLISH_MAX_ATTEMPTS
+
+        cfg = make_config(target_output_bytes=1)
+        async with StageManager(
+            "memory:///", "millrace", settings=fast_flush_settings()
+        ) as manager:
+            stage = (await manager.open_partition("events", 0)).stage
+            await staged(stage, fake_clock, TEAM, [(0, JAN_US)])
+            script_options(httpx_mock)
+            capture = CommitCapture(httpx_mock, [])
+            flusher = flusher_factory(store=store, cfg=cfg)
+            receipts = receipt_server(httpx_mock)
+            for _ in range(_PUBLISH_MAX_ATTEMPTS):
+                receipts.script(ikey(0, TEAM, 0, 0), httpx.ConnectError("down"))
+            r = runner(manager, flusher, cfg, fake_clock, sleeper)
+            with caplog.at_level(logging.WARNING, logger="millrace.flush"):
+                sweep = await r.run_once()
+            assert (sweep.decisions, sweep.failed, sweep.committed) == (1, 1, 0)
+            assert capture.bodies == [] and store.files == {}
+            assert len(await staged_rows(stage, TEAM)) == 1
+            (deferred,) = [
+                rec
+                for rec in caplog.records
+                if "deferred to the next sweep" in rec.getMessage()
+            ]
+            assert deferred.exc_info is None
+            assert not [rec for rec in caplog.records if rec.exc_info]
+
+    async def test_a_verbatim_replay_answered_422_reused_still_halts(
+        self,
+        httpx_mock: Any,
+        stage_factory: Any,
+        fake_clock: Any,
+        flusher_factory: Any,
+        store: FakeObjectStore,
+        sleeper: Sleeper,
+    ) -> None:
+        """A persisted entry's replay sends the bytes first sent: a 422
+        reused-key there means the key's receipt is for a DIFFERENT
+        request — a foreign writer or broken determinism. Halt
+        ``idempotency_key_reused``; rows and entry stay."""
+        from millrace.flush import _PUBLISH_MAX_ATTEMPTS
+
+        stage, capture, flusher = await self._stage_and_flush(
+            httpx_mock,
+            stage_factory,
+            fake_clock,
+            flusher_factory,
+            store,
+            sleeper,
+            [httpx.ConnectError("lost")] * _PUBLISH_MAX_ATTEMPTS,
+        )
+        with pytest.raises(FlushPublishExhausted):
+            await flusher.flush_key(
+                stage,
+                decision(
+                    TEAM, trigger="size", staged_bytes=100, first_staged_ts=JAN_US
+                ),
+            )
+        script_receipt(httpx_mock, ikey(0, TEAM, 0, 2), snapshot_id=None)
+        capture.extend(
+            [
+                commit_refusal(
+                    422, "validation", "idempotency_key reused with a different request"
+                )
+            ]
+        )
+        with pytest.raises(FlushHalted) as excinfo:
+            await flusher.flush_key(
+                stage,
+                decision(
+                    TEAM, trigger="size", staged_bytes=100, first_staged_ts=JAN_US
+                ),
+            )
+        assert excinfo.value.reason == "idempotency_key_reused"
+        assert capture.bodies[-1] == capture.bodies[0]  # the replay was verbatim
+        assert len(await staged_rows(stage, TEAM)) == 3
+        assert len(await stage.load_prepared()) == 1
+        assert flusher.stats().flush_deduped == 0
 
     async def test_table_dropped_409_halts(
         self,
@@ -2020,7 +2302,7 @@ class TestPartitionScopedIdentity:
 
 # =====================================================================================
 # B3: files are sorted by the catalog's sort spec (fields, directions, null
-# placement) before the partition fanout — scan order is Kafka-record time,
+# placement) before the partition fanout — scan order is Kafka offset order,
 # the spec is payload-event time
 # =====================================================================================
 
@@ -2049,9 +2331,9 @@ class TestSortSpec:
         store: FakeObjectStore,
         sleeper: Sleeper,
     ) -> None:
-        """The review's red test: record timestamps (the row key's ts)
-        ASCEND through the batch while the payloads' event times DESCEND
-        — late arrivals. The committed file must be key-nondecreasing
+        """The review's red test: offsets (the scan order) and record
+        timestamps ASCEND through the batch while the payloads' event
+        times DESCEND — late arrivals. The committed file must be key-nondecreasing
         under the live spec (timestamp asc); pre-fix it followed scan
         order and inverted."""
         stage = await stage_factory()
@@ -2867,9 +3149,9 @@ class TestBatchBuildIsolation:
             dropped_keys=(),
         )
         rows = [
-            (keyspace.RowKey(team_group(7), 100, 0), b"payload-good", good),
-            (keyspace.RowKey(team_group(7), 101, 1), b"payload-bad", bad),
-            (keyspace.RowKey(team_group(7), 102, 2), b"payload-good-2", good),
+            (keyspace.RowKey(team_group(7), 0), b"payload-good", good),
+            (keyspace.RowKey(team_group(7), 1), b"payload-bad", bad),
+            (keyspace.RowKey(team_group(7), 2), b"payload-good-2", good),
         ]
         table, encoded, guilty = flush_mod._build_batch_isolating(rows, cols)
         assert table.num_rows == 2
@@ -2892,8 +3174,8 @@ class TestBatchBuildIsolation:
             values={"team_id": 7, "timestamp": 5, "event": "x"}, dropped_keys=()
         )
         rows = [
-            (keyspace.RowKey(team_group(7), 100, 0), b"p", record),
-            (keyspace.RowKey(team_group(7), 101, 1), b"q", record),
+            (keyspace.RowKey(team_group(7), 0), b"p", record),
+            (keyspace.RowKey(team_group(7), 1), b"q", record),
         ]
         real = flush_mod._build_batch
 
@@ -3268,6 +3550,7 @@ class TestPreparedReplay:
             partition=0,
             group=team_group(TEAM + 1),
             group_fields=SPEC_FIELDS,
+            row_count=pending.request.row_count,
         )
         foreign_pending = type(pending)(key=pending.key, request=foreign)
         with pytest.raises(StageCorruptionError, match="names partition tuple"):
@@ -3726,7 +4009,7 @@ class TestWireDiscipline:
         assert journal == ["table_get", "scan"]
         assert capture.payloads[0]["read_snapshot"] == 95
 
-    async def test_mid_scan_arrivals_are_clipped_out_of_the_window(
+    async def test_mid_flush_arrivals_stay_out_of_the_window(
         self,
         httpx_mock: Any,
         stage_factory: Any,
@@ -3736,23 +4019,24 @@ class TestWireDiscipline:
         sleeper: Sleeper,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """A batch landing between the scan and the offsets read is NOT
-        flushed (the scan's snapshot predates it) and NOT deleted (the
-        window clips to what was scanned): it flushes next time."""
+        """A batch landing after the scan is NOT flushed (the scan's
+        snapshot predates it) and NOT deleted (its offsets are past the
+        window's last scanned offset): it flushes next time."""
         stage = await stage_factory()
         await staged(stage, fake_clock, TEAM, [(0, JAN_US), (1, JAN_US), (2, JAN_US)])
         script_options(httpx_mock)
         capture = CommitCapture(httpx_mock, [commit_ok(50), commit_ok(51)])
         flusher = flusher_factory(store=store, cfg=make_config(target_output_bytes=1))
 
-        original_read_offsets = stage.read_offsets
+        original_scan = stage.scan_group_rows_bounded
 
-        async def read_offsets_with_arrival(group: Any) -> Any:
-            # The consumer lands a new batch in the scan/offsets gap.
+        async def scan_then_arrival(group: Any, **caps: Any) -> Any:
+            rows = await original_scan(group, **caps)
+            # The consumer lands a new batch right after the scan.
             await staged(stage, fake_clock, TEAM, [(3, JAN_US), (4, JAN_US)])
-            return await original_read_offsets(group)
+            return rows
 
-        monkeypatch.setattr(stage, "read_offsets", read_offsets_with_arrival)
+        monkeypatch.setattr(stage, "scan_group_rows_bounded", scan_then_arrival)
         report = await flusher.flush_key(
             stage,
             decision(TEAM, trigger="size", staged_bytes=100, first_staged_ts=JAN_US),
@@ -3761,7 +4045,7 @@ class TestWireDiscipline:
         assert (report.first_offset, report.last_offset) == (0, 2)
         body = capture.payloads[0]
         assert body["message"].splitlines()[1] == (
-            "offsets topic=events partition=0 ranges=0-2"
+            "offsets topic=events partition=0 window=0-2"
         )
         assert sum(f["record_count"] for f in body["appends"][0]["files"]) == 3
         # The younger rows survived the settle...
@@ -3774,7 +4058,7 @@ class TestWireDiscipline:
         )
         assert (report2.first_offset, report2.last_offset) == (3, 4)
         assert capture.payloads[1]["message"].splitlines()[1] == (
-            "offsets topic=events partition=0 ranges=3-4"
+            "offsets topic=events partition=0 window=3-4"
         )
         assert await staged_rows(stage, TEAM) == []
 
@@ -4152,7 +4436,7 @@ class TestRunner:
             assert report2.outcome == "committed"
             assert (report2.first_offset, report2.last_offset) == (2, 3)
             assert capture.payloads[-1]["message"].splitlines()[1] == (
-                "offsets topic=events partition=0 ranges=2-3"
+                "offsets topic=events partition=0 window=2-3"
             )
             assert await staged_rows(stage, TEAM) == []
 
@@ -4302,27 +4586,28 @@ class TestSettlementGuard:
         sleeper: Sleeper,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """The guard is the last check against losing an unpublished row:
-        a settle deleting a row count the flush did not see is a staging-
-        invariant violation, and the pipeline halts rather than proceed.
-        (Removing the guard turns this test red: no halt is raised.)"""
+        """The guard runs INSIDE the settle transaction: here the window's
+        range holds a row the flush never scanned (the scan is doctored to
+        miss offset 1 of [0, 2]), so settling it would delete an
+        unpublished row. The transaction rolls back before commit and the
+        pipeline halts ``settlement_mismatch`` — every row still staged,
+        stats unchanged, the ``prepared/`` entry intact, so a restart
+        resumes from consistent state. (Moving the guard after the commit
+        turns this red: the rows are gone.)"""
         stage = await stage_factory()
-        await staged(stage, fake_clock, TEAM, [(0, JAN_US), (1, JAN_US)])
+        await staged(stage, fake_clock, TEAM, [(0, JAN_US), (1, JAN_US), (2, JAN_US)])
         script_options(httpx_mock)
-        CommitCapture(httpx_mock, [commit_ok(50)])
+        capture = CommitCapture(httpx_mock, [commit_ok(50)])
         flusher = flusher_factory(store=store, cfg=make_config(target_output_bytes=1))
+        stats_before = await stage.iter_key_stats()
 
-        real_commit_flushed = stage.commit_flushed
+        real_scan = stage.scan_group_rows_bounded
 
-        async def doctored_settle(key: Any) -> Any:
-            report = await real_commit_flushed(key)
-            return type(report)(
-                rows_deleted=report.rows_deleted + 1,  # a row the scan never saw
-                bytes_deleted=report.bytes_deleted,
-                group_drained=report.group_drained,
-            )
+        async def scan_missing_a_row(group: Any, **caps: Any) -> Any:
+            rows = await real_scan(group, **caps)
+            return [kv for kv in rows if kv[0].offset != 1]
 
-        monkeypatch.setattr(stage, "commit_flushed", doctored_settle)
+        monkeypatch.setattr(stage, "scan_group_rows_bounded", scan_missing_a_row)
         with pytest.raises(FlushHalted) as excinfo:
             await flusher.flush_key(
                 stage,
@@ -4331,6 +4616,46 @@ class TestSettlementGuard:
                 ),
             )
         assert excinfo.value.reason == "settlement_mismatch"
+        assert "holds 3 staged rows but the flush published 2" in excinfo.value.detail
+        assert len(capture.bodies) == 1  # the commit had landed
+        assert [rk.offset for rk, _ in await staged_rows(stage, TEAM)] == [0, 1, 2]
+        assert await stage.iter_key_stats() == stats_before
+        (entry,) = await stage.load_prepared()
+        assert entry.key.first_offset == 0
+        assert entry.request.row_count == 2  # what the commit published
+        scanned = [
+            (o, _STAGED[(0, team_group(TEAM), o)]) for o in (0, 2)
+        ]  # the content the doctored scan saw
+        key = keyspace.idempotency_key(
+            TABLE_UUID,
+            "events",
+            0,
+            team_group(TEAM),
+            0,
+            2,
+            keyspace.content_digest(scanned),
+        )
+        assert entry.request.idempotency_key == key
+
+        # The documented restart: a fresh flusher reconciles the entry.
+        # Its receipt is there (the commit landed), but the guard uses the
+        # PERSISTED count, not a recount — the window still holds a row
+        # the commit never published, so it halts again, rolled back.
+        monkeypatch.setattr(stage, "scan_group_rows_bounded", real_scan)
+        restarted = flusher_factory(store=store, cfg=make_config(target_output_bytes=1))
+        script_receipt(httpx_mock, key, snapshot_id=50)
+        with pytest.raises(FlushHalted) as again:
+            await restarted.reconcile_prepared(
+                stage, (await stage.recover()).pending_prepared[0]
+            )
+        assert again.value.reason == "settlement_mismatch"
+        assert "(at reconcile)" in again.value.detail
+        assert "drop the prepared/ entry" in again.value.detail
+        assert "hoglake#351" in again.value.detail
+        assert [rk.offset for rk, _ in await staged_rows(stage, TEAM)] == [0, 1, 2]
+        assert await stage.iter_key_stats() == stats_before
+        assert len(await stage.load_prepared()) == 1
+        assert restarted.stats().receipt_settlements == 0
 
 
 class TestJunkWindowBoundaries:
@@ -4374,9 +4699,9 @@ class TestJunkWindowBoundaries:
         )
         pre_epoch = -86_400_000_000  # 1969-12-31
         records = [
-            (keyspace.RowKey(team_group(7), pre_epoch, 0), event_payload(7, pre_epoch)),
+            (keyspace.RowKey(team_group(7), 0), event_payload(7, pre_epoch)),
             (
-                keyspace.RowKey(team_group(7), pre_epoch, 1),
+                keyspace.RowKey(team_group(7), 1),
                 b'{"team_id": 7, "timestamp": null}',
             ),
         ]
@@ -4388,7 +4713,6 @@ class TestJunkWindowBoundaries:
             trigger="size",
             first_offset=0,
             last_offset=1,
-            offset_ranges=(OffsetRange("events", 0, 0, 1),),
             idempotency_key=ikey(0, 7, 0, 1),
             read_snapshot=88,
             table_uuid=TABLE_UUID,
@@ -4443,7 +4767,7 @@ class TestJunkWindowBoundaries:
                 "read_snapshot_id": 88,
             }
         )
-        records = [(keyspace.RowKey(team_group(7), JAN_US, 0), b"not json")]
+        records = [(keyspace.RowKey(team_group(7), 0), b"not json")]
         ctx = flush_mod.FlushContext(
             topic="events",
             partition=0,
@@ -4452,7 +4776,6 @@ class TestJunkWindowBoundaries:
             trigger="age",
             first_offset=0,
             last_offset=0,
-            offset_ranges=(OffsetRange("events", 0, 0, 0),),
             idempotency_key=ikey(0, 7, 0, 0),
             read_snapshot=88,
             table_uuid=TABLE_UUID,
@@ -4505,9 +4828,9 @@ class TestJunkWindowBoundaries:
 
         monkeypatch.setattr(flush_mod.JsonObjectDecoder, "decode_record", drifting)
         records = [
-            (keyspace.RowKey(team_group(7), JAN_US, 0), event_payload(7, JAN_US)),
-            (keyspace.RowKey(team_group(7), JAN_US, 1), b"drift"),
-            (keyspace.RowKey(team_group(7), JAN_US, 2), event_payload(7, JAN_US)),
+            (keyspace.RowKey(team_group(7), 0), event_payload(7, JAN_US)),
+            (keyspace.RowKey(team_group(7), 1), b"drift"),
+            (keyspace.RowKey(team_group(7), 2), event_payload(7, JAN_US)),
         ]
         ctx = flush_mod.FlushContext(
             topic="events",
@@ -4517,7 +4840,6 @@ class TestJunkWindowBoundaries:
             trigger="age",
             first_offset=0,
             last_offset=2,
-            offset_ranges=(OffsetRange("events", 0, 0, 2),),
             idempotency_key=ikey(0, 7, 0, 2),
             read_snapshot=88,
             table_uuid=TABLE_UUID,
@@ -4623,7 +4945,6 @@ async def stage_sized_rows(
         [
             StagedRecord(
                 group=team_group(team),
-                event_ts_us=ts,
                 offset=offset,
                 payload=sized_payload(team, ts, size),
             )
@@ -4704,7 +5025,7 @@ class TestBoundedFlush:
             assert windows[-1][1] == total - 1  # drained to the end
             assert await stage.iter_key_stats() == []
 
-    async def test_a_timestamp_inversion_at_the_cap_boundary_narrows_the_window(
+    async def test_a_capped_scan_is_an_exact_window_whatever_the_timestamps(
         self,
         httpx_mock: Any,
         stage_factory: Any,
@@ -4713,20 +5034,18 @@ class TestBoundedFlush:
         store: FakeObjectStore,
         sleeper: Sleeper,
     ) -> None:
-        """The capped scan is a prefix in (timestamp, offset) order, and
-        record timestamps are not offset-monotone: row 5 here carries
-        the LATEST timestamp, so the 50-row cap leaves it unscanned while
-        its offset sits inside the scanned span [0, 50]. Settling the
-        naive [min, max] window would delete that unpublished row (the
-        guard would halt): the window must NARROW to the covered prefix
-        [0, 4], and the leftover re-decides later."""
+        """Row keys sort by (group, offset), so the 50-row cap takes
+        offsets 0-49 whatever the record timestamps say — row 5 carries
+        the LATEST timestamp and is still in the first window. The
+        window is exactly the scanned rows, settles exactly them, and
+        the next flush takes the remainder."""
         cfg = make_config(target_output_bytes=800, flush_scan_min_bytes=1)
         stage = await stage_factory()
         rows = [(i, JAN_US + i) for i in range(51) if i != 5]
-        rows.append((5, JAN_US + 1_000_000))  # the inversion: sorts last
+        rows.append((5, JAN_US + 1_000_000))  # the latest record timestamp
         await stage_sized_rows(stage, TEAM, rows, size=100)
         script_options(httpx_mock)
-        capture = CommitCapture(httpx_mock, [commit_ok(100 + i) for i in range(10)])
+        capture = CommitCapture(httpx_mock, [commit_ok(100), commit_ok(101)])
         flusher = flusher_factory(store=store, cfg=cfg)
 
         report = await flusher.flush_key(
@@ -4734,37 +5053,23 @@ class TestBoundedFlush:
             decision(TEAM, trigger="size", staged_bytes=5100, first_staged_ts=JAN_US),
         )
         assert report.outcome == "committed"
-        assert report.records == 5  # the covered prefix, not the 50 scanned
-        assert message_window(capture.payloads[0]) == (0, 4)
-        assert capture.payloads[0]["idempotency_key"] == ikey(0, TEAM, 0, 4)
-        assert len(await staged_rows(stage, TEAM)) == 46
+        assert report.records == 50
+        assert message_window(capture.payloads[0]) == (0, 49)
+        assert capture.payloads[0]["idempotency_key"] == ikey(0, TEAM, 0, 49)
+        assert [rk.offset for rk, _ in await staged_rows(stage, TEAM)] == [50]
 
-        # Drain: each flush publishes exactly the rows its window covers
-        # AT SETTLE TIME (earlier windows' rows are already gone, so a
-        # later window may SPAN their offsets — the identity material in
-        # the message records the true ranges). The check that matters:
-        # the published row sets tile the slice exactly, once each.
-        published_ts: list[int] = []
-        total_records = 5
-        for _ in range(10):
-            if not await staged_rows(stage, TEAM):
-                break
-            report = await flusher.flush_key(
-                stage,
-                decision(
-                    TEAM, trigger="size", staged_bytes=4600, first_staged_ts=JAN_US
-                ),
-            )
-            assert report.outcome == "committed"
-            total_records += report.records
-        assert total_records == 51  # every row published exactly once
+        report = await flusher.flush_key(
+            stage,
+            decision(TEAM, trigger="size", staged_bytes=100, first_staged_ts=JAN_US),
+        )
+        assert (report.first_offset, report.last_offset, report.records) == (50, 50, 1)
         assert await staged_rows(stage, TEAM) == []
-        for payload in capture.payloads:
-            for f in payload["appends"][0]["files"]:
-                table = parquet_rows(store, f["path"])
-                published_ts.extend(
-                    ts_micros(row["timestamp"]) for row in table.to_pylist()
-                )
+        published_ts = [
+            ts_micros(row["timestamp"])
+            for payload in capture.payloads
+            for f in payload["appends"][0]["files"]
+            for row in parquet_rows(store, f["path"]).to_pylist()
+        ]
         assert sorted(published_ts) == sorted(
             [JAN_US + i for i in range(51) if i != 5] + [JAN_US + 1_000_000]
         )
@@ -4778,13 +5083,11 @@ class TestBoundedFlush:
         store: FakeObjectStore,
         sleeper: Sleeper,
     ) -> None:
-        """Two teams staged in ONE interleaved batch: the team's
-        ``offsets/`` span (batch min..max) names the other team's
-        offsets too, so the record is NOT the exact staged set — an
-        UNtruncated scan must not narrow against it (that shrunk every
-        flush to a one-row window, the live-suite trickle). The window
-        of a complete scan is the scan's own span; settlement deletes
-        exactly this team's rows inside it."""
+        """Two teams staged in ONE interleaved batch: a team's window
+        spans the other team's offsets, and that is fine — the window
+        is the scan's own span, and settlement deletes exactly this
+        team's rows inside it (the other team's keys sort under another
+        group)."""
         from millrace.stage import StagedRecord
 
         stage = await stage_factory()
@@ -4794,17 +5097,12 @@ class TestBoundedFlush:
             [
                 StagedRecord(
                     group=team_group(TEAM + (i % 2)),
-                    event_ts_us=JAN_US + i,
                     offset=i,
                     payload=event_payload(TEAM + (i % 2), JAN_US + i),
                 )
                 for i in range(8)
             ],
             now_us=fake_clock(),
-        )
-        # The arrival-structure record over-covers by construction.
-        assert await stage.read_offsets(team_group(TEAM)) == (
-            OffsetRange("events", 0, 0, 6),
         )
         script_options(httpx_mock)
         capture = CommitCapture(httpx_mock, [commit_ok(100), commit_ok(101)])
@@ -4843,34 +5141,35 @@ class TestBoundedFlush:
         store: FakeObjectStore,
         sleeper: Sleeper,
     ) -> None:
-        """The narrowing's remaining job: a scan a cap cut short on an
-        interleaved partition. The over-covering record makes the
-        covered-prefix walk conservative (windows shrink below the true
-        prefix — sound, never settling an unscanned row), and the drain
-        still publishes every row exactly once."""
-        cfg = make_config(target_output_bytes=100, flush_scan_min_bytes=1)
-        # budget = ceil(100 / 0.2 x 1.25) = 625 staged bytes -> 6 rows of
-        # 100 B per scan; each team has 12 interleaved rows.
+        """A group of N rows interleaved with another group in the Kafka
+        partition drains in exactly ⌈N ÷ cap⌉ flushes, each window
+        exactly the rows its capped scan saw (the scan is an exact
+        offset prefix of the group) — no narrowing, no one-row trickle —
+        and every row publishes exactly once."""
+        # The row cap binds (6 rows per scan; the byte budget is far
+        # above 6 x 100 B whatever the observed ratio); the teams
+        # alternate over 26 offsets, 13 rows each.
+        cap, n = 6, 13
+        cfg = make_config(target_output_bytes=100, flush_scan_max_rows=cap)
         stage = await stage_factory()
-        records = []
-        for i in range(24):
-            records.append((TEAM + (i % 2), i, JAN_US + i))
         for team in (TEAM, TEAM + 1):
             await stage_sized_rows(
                 stage,
                 team,
-                [(o, t) for t2, o, t in records if t2 == team],
+                [(o, JAN_US + 26 - o) for o in range(26) if o % 2 == team - TEAM],
                 size=100,
             )
         script_options(httpx_mock)
-        capture = CommitCapture(httpx_mock, [commit_ok(100 + i) for i in range(60)])
+        capture = CommitCapture(httpx_mock, [commit_ok(100 + i) for i in range(10)])
         flusher = flusher_factory(store=store, cfg=cfg)
 
         for team in (TEAM, TEAM + 1):
+            offsets = [o for o in range(26) if o % 2 == team - TEAM]
+            expected = [offsets[k : k + cap] for k in range(0, n, cap)]
+            assert len(expected) == -(-n // cap) == 3
             published: list[int] = []
-            for _ in range(60):
-                if not await staged_rows(stage, team):
-                    break
+            for chunk in expected:
+                before = len(capture.bodies)
                 report = await flusher.flush_key(
                     stage,
                     decision(
@@ -4878,16 +5177,20 @@ class TestBoundedFlush:
                     ),
                 )
                 assert report.outcome == "committed"
-                assert report.records >= 1
+                assert (report.first_offset, report.last_offset) == (
+                    chunk[0],
+                    chunk[-1],
+                )
+                assert report.records == len(chunk)
+                assert len(capture.bodies) == before + 1
+                assert message_window(capture.payloads[-1]) == (chunk[0], chunk[-1])
                 for f in capture.payloads[-1]["appends"][0]["files"]:
                     for row in parquet_rows(store, f["path"]).to_pylist():
                         published.append(ts_micros(row["timestamp"]))
-            # Every row published exactly once, nothing staged left.
-            assert sorted(published) == [
-                JAN_US + i for i in range(24) if i % 2 == team - TEAM
-            ]
+            assert sorted(published) == sorted(JAN_US + 26 - o for o in offsets)
             assert await staged_rows(stage, team) == []
             assert await stage.read_group_stats(team_group(team)) is None
+        assert len(capture.bodies) == 2 * 3
 
     async def test_a_single_row_larger_than_the_byte_budget_still_flushes(
         self,
@@ -4925,30 +5228,6 @@ class TestBoundedFlush:
         assert len(capture.bodies) == 2
         assert await staged_rows(stage, TEAM) == []
 
-    def test_covered_window_pure_cases(self) -> None:
-        """The narrowing arithmetic, without I/O: full coverage returns
-        the scan's own span; a hole ends the window below it; ranges
-        outside the span clip away; gaps between ranges (other teams,
-        consumer drops) need no coverage."""
-        r = lambda a, b: OffsetRange("events", 0, a, b)
-        # No inversion: the window is the scan's span.
-        assert flush_mod._covered_window([3, 1, 2], [r(1, 3)]) == (1, 3)
-        # A hole at 4 (staged, unscanned): the window ends just below
-        # it — K=3 names no row (a gap between ranges needs no
-        # coverage), and settling [1, 3] deletes exactly {1, 2, 3}.
-        assert flush_mod._covered_window([1, 2, 3, 5, 6], [r(1, 6)]) == (1, 3)
-        # The hole can be the first offset of a later range.
-        assert flush_mod._covered_window([1, 2, 7], [r(1, 2), r(4, 5), r(7, 7)]) == (
-            1,
-            3,
-        )
-        # Gaps BETWEEN ranges are not staged rows and need no coverage.
-        assert flush_mod._covered_window([2, 3, 7], [r(2, 3), r(7, 9)]) == (2, 7)
-        # A range clipped by the span contributes only its overlap.
-        assert flush_mod._covered_window([5, 6], [r(0, 100)]) == (5, 6)
-        with pytest.raises(ValueError):
-            flush_mod._covered_window([], [r(0, 1)])
-
     async def test_an_outstanding_prepared_entry_wins_over_a_moved_scan_prefix(
         self,
         httpx_mock: Any,
@@ -4958,27 +5237,27 @@ class TestBoundedFlush:
         store: FakeObjectStore,
         sleeper: Sleeper,
     ) -> None:
-        """The M4 safety pin: with a BOUNDED scan, the prefix's minimum
-        offset can move under timestamp-inverted arrivals — here rows 2
-        and 3 arrive after the crash with an EARLIER timestamp, so the
-        capped scan starts at offset 2 while the persisted entry's
-        window [0, 1] is still outstanding. Keying the
-        outstanding-entry lookup by the scan's first offset would miss
-        it and build a window overlapping it (row 0 or 1 published
-        twice). The lookup is per-team: the entry is authoritative."""
+        """The outstanding-entry pin: the scan's first offset is not the
+        entry's when a rewind re-stages offsets BELOW the entry's window
+        — here rows 2 and 3 are re-staged after the crash, so the capped
+        scan starts at offset 2 while the persisted entry's window
+        [5, 6] is still outstanding. Keying the outstanding-entry lookup
+        by the scan's first offset would miss it and build a window
+        overlapping it (row 5 or 6 published twice). The lookup is
+        per-group: the entry is authoritative."""
         from millrace.flush import _PUBLISH_MAX_ATTEMPTS
 
         # budget = ceil(40 / 0.2 x 1.25) = 300 staged bytes = 3 rows.
         cfg = make_config(target_output_bytes=40, flush_scan_min_bytes=1)
         stage = await stage_factory()
-        await stage_sized_rows(stage, TEAM, [(0, JAN_US), (1, JAN_US)], size=100)
+        await stage_sized_rows(stage, TEAM, [(5, JAN_US), (6, JAN_US)], size=100)
         script_options(httpx_mock)
         capture = CommitCapture(
             httpx_mock, [httpx.ConnectError("lost")] * _PUBLISH_MAX_ATTEMPTS
         )
         flusher = flusher_factory(store=store, cfg=cfg)
-        # The crash: uploaded, persisted, never answered — entry (7, 0)
-        # covers the window [0, 1].
+        # The crash: uploaded, persisted, never answered — entry (7, 5)
+        # covers the window [5, 6].
         with pytest.raises(FlushPublishExhausted):
             await flusher.flush_key(
                 stage,
@@ -4988,18 +5267,16 @@ class TestBoundedFlush:
             )
         assert len(capture.bodies) == _PUBLISH_MAX_ATTEMPTS
 
-        # Post-crash arrivals with EARLIER event timestamps: the capped
-        # scan's prefix no longer starts at the entry's offset.
-        await stage_sized_rows(
-            stage, TEAM, [(2, JAN_US - 10), (3, JAN_US - 9)], size=100
-        )
+        # A rewind re-stages LOWER offsets: the capped scan's prefix no
+        # longer starts at the entry's offset.
+        await stage_sized_rows(stage, TEAM, [(2, JAN_US), (3, JAN_US)], size=100)
         scanned = [
             rk.offset
             async for rk, _ in stage.scan_group_rows(team_group(TEAM), max_bytes=250)
         ]
         assert scanned[:2] == [2, 3]  # the moved prefix (white-box check)
 
-        key = ikey(0, TEAM, 0, 1)
+        key = ikey(0, TEAM, 5, 6)
         script_receipt(httpx_mock, key, snapshot_id=77)  # it landed
         report = await flusher.flush_key(
             stage,
@@ -5008,7 +5285,7 @@ class TestBoundedFlush:
         # The entry won: receipt-settled, zero republication, and NO new
         # window was built over the moved scan's rows.
         assert report.outcome == "receipt_settled"
-        assert (report.first_offset, report.last_offset) == (0, 1)
+        assert (report.first_offset, report.last_offset) == (5, 6)
         assert len(capture.bodies) == _PUBLISH_MAX_ATTEMPTS  # no new publish
         assert [rk.offset for rk, _ in await staged_rows(stage, TEAM)] == [2, 3]
 
@@ -5974,7 +6251,6 @@ class TestFencedFlusher:
                     [
                         StagedRecord(
                             group=team_group(TEAM),
-                            event_ts_us=JAN_US,
                             offset=1,
                             payload=b"x",
                         )
@@ -6065,7 +6341,6 @@ class TestFencedFlusher:
                     [
                         StagedRecord(
                             group=team_group(TEAM),
-                            event_ts_us=JAN_US,
                             offset=1,
                             payload=b"x",
                         )
@@ -6232,10 +6507,7 @@ class TestNestedJsonColumns:
         ]
         stage = await stage_factory()
         await stage.stage_batch(
-            [
-                StagedRecord(group=(), event_ts_us=JAN_US, offset=i, payload=p)
-                for i, p in enumerate(rows)
-            ],
+            [StagedRecord(group=(), offset=i, payload=p) for i, p in enumerate(rows)],
             now_us=fake_clock(),
         )
         script_options(httpx_mock)
@@ -6327,11 +6599,10 @@ class TestNestedJsonColumns:
             [
                 StagedRecord(
                     group=(),
-                    event_ts_us=JAN_US,
                     offset=0,
                     payload=nested_payload(0, 1, JAN_US),
                 ),
-                StagedRecord(group=(), event_ts_us=JAN_US, offset=1, payload=bad),
+                StagedRecord(group=(), offset=1, payload=bad),
             ],
             now_us=fake_clock(),
         )
@@ -6379,7 +6650,6 @@ class TestNestedJsonColumns:
                 keyer,
                 offset=offset,
                 value=nested_payload(offset, team, ts),
-                timestamp=(1, JAN_US // 1000),
             )
             assert isinstance(record, StagedRecord)
             records.append(record)
@@ -6424,7 +6694,7 @@ class TestNestedJsonColumns:
         payload = nested_payload(0, 1, far)
         stage = await stage_factory()
         await stage.stage_batch(
-            [StagedRecord(group=(), event_ts_us=JAN_US, offset=0, payload=payload)],
+            [StagedRecord(group=(), offset=0, payload=payload)],
             now_us=fake_clock(),
         )
         script_options(httpx_mock)

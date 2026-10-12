@@ -97,7 +97,6 @@ async def _run_bench(
         records = [
             StagedRecord(
                 group=(str((offset + i) % TEAMS),),
-                event_ts_us=NOW + offset + i,
                 offset=offset + i,
                 payload=_payload(offset + i),
             )
@@ -211,7 +210,6 @@ def _whale_record(i: int) -> StagedRecord:
     team = 0 if i % 2 == 0 else 1 + (i % (WHALE_TEAMS - 1))
     return StagedRecord(
         group=(str(team),),
-        event_ts_us=NOW + i,
         offset=i,
         payload=bytes([i % 251 + 1]) * WHALE_PAYLOAD,
     )

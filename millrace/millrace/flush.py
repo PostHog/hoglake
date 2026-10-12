@@ -45,7 +45,8 @@ born correct; it does not repeat millpond's blind-append shape):
 - Regeneration is deterministic apart from one token: same staged
   rows, same table basis, same clock → the same request except for the
   per-build object-name token. The idempotency key is a pure function
-  of the window (a receipt still dedupes a verbatim replay); object
+  of the window's bounds and content (a receipt still dedupes a
+  verbatim replay); object
   names are ``…/{key}/{build}/{index}.parquet`` with ``build`` a fresh
   uuid4 hex minted per build (millpond's rule: a retry under the SAME
   key writes fresh objects). A verbatim replay sends the persisted
@@ -86,11 +87,18 @@ Refusal taxonomy (each recovery pinned by its own test):
   the IDENTICAL persisted request, bounded attempts. Exhaustion leaves
   the persisted entry in place; the next sweep replays it (receipt
   lookup first).
-- A 422 saying the idempotency key was reused with a DIFFERENT request
-  is its own halt (``idempotency_key_reused``): with deterministic
-  derivation that means a foreign writer or broken determinism, and the
-  pipeline halts instead of settling rows a stranger may not have
-  published.
+- The idempotency key names the window's CONTENT (a SHA-256 over its
+  rows is a key input), and every build mints a fresh object token, so
+  a rebuild of content that already landed would differ in body from
+  the landed request. A fresh build therefore looks its key's receipt
+  up BEFORE it builds: a 200 means this exact content already landed
+  (an identical rewind) and the window settles locally
+  (``millrace_flush_deduped_total``). A 422 saying the key was reused
+  with a DIFFERENT request halts (``idempotency_key_reused``) on both
+  paths: on a fresh publish it means another writer committed this
+  content after the lookup, on a persisted entry's verbatim replay a
+  foreign writer or broken determinism — never settle rows this
+  process did not publish.
 - EVERY OTHER answered 4xx (a 401/403 from a proxy, a 413 from an
   ingress, a plain 400, any 422 — request-shape ``validation`` or
   otherwise): HALT (``commit_refused``) with the rows staged, exactly
@@ -101,10 +109,10 @@ Refusal taxonomy (each recovery pinned by its own test):
   the whole window on any answered 4xx, which is why this paragraph
   exists.)
 
-The staged scan order is KAFKA-RECORD time (the row key's timestamp is
-the record timestamp the consumer staged under); the catalog's sort spec
-is PAYLOAD-EVENT time (``TableInfo.sort_spec``), which late and skewed
-events invert constantly. :func:`build_prepared_plan` reconciles the two:
+The staged scan order is Kafka OFFSET order (row keys are ``(group,
+offset)``); the catalog's sort spec is PAYLOAD-EVENT time
+(``TableInfo.sort_spec``), which late and skewed events invert
+constantly. :func:`build_prepared_plan` reconciles the two:
 after the Arrow build and BEFORE the partition fanout it sorts the batch
 by the live spec's fields, directions and null placement (native Arrow
 compute), so every registered file is key-nondecreasing under the spec
@@ -130,24 +138,20 @@ arithmetic: the size trigger fires at ``staged × ratio ≥ target``, so
 the headroom (×1.25) absorbs ratio-estimate error in the
 under-compression direction and row-boundary quantization — an
 over-sized file is a sizing miss compaction absorbs, an under-sized one
-is the small-file regime the design exists to kill. The window is
-``[first_scanned_offset, last_scanned_offset]`` when the scan covered
-the group's whole staged slice — the steady state, where caps never
-bind: staged offsets only ever grow past a scan snapshot, so settling
-the span deletes exactly the published rows. Only a TRUNCATED scan
-(one a cap cut short) narrows, to ``[first_scanned_offset, K]`` where
-``K`` is the covered offset prefix (``_covered_window``): a record
-whose record timestamp inverts past the cap boundary could otherwise
-have the settlement delete a row the flush never saw. The window
-identity and the settlement guard both come from the SCANNED rows,
-never the stats snapshot; leftover rows re-decide on the next sweep
-(the window/prepared machinery handles arbitrary sub-windows). A single
-row larger than the byte budget still flushes (one record is always a
-bounded unit), probed with a one-row scan. Memory shape per decision:
-≤ ``max(scan_budget, largest row)`` payload bytes materialized plus
-``≤ flush_scan_max_rows`` decoded records and the Arrow build over
-them; the settlement streams the group's slice within its transaction
-but deletes only the window's rows.
+is the small-file regime the design exists to kill. Row keys sort by
+(group, offset), so a scan — capped or not — is an exact offset PREFIX
+of the group's staged rows, and the window is ``[first_scanned_offset,
+last_scanned_offset]``: every staged row of the group inside it was
+scanned. The window identity and the settlement guard both come from
+the SCANNED rows, never the stats snapshot; rows past a capped scan
+re-decide on the next sweep, so a group of N rows drains in
+``⌈N ÷ cap⌉`` windows however it interleaves with other groups in the
+Kafka partition. A single row larger than the byte budget still
+flushes (one record is always a bounded unit), probed with a one-row
+scan. Memory shape per decision: ≤ ``max(scan_budget, largest row)``
+payload bytes materialized plus ``≤ flush_scan_max_rows`` decoded
+records and the Arrow build over them; the settlement streams exactly
+the window's key range within its transaction.
 
 Compression-ratio feedback (the planner's size lane is fed an OBSERVED
 ratio, docs/kafka-ingestion.md §The flush planner):
@@ -162,14 +166,12 @@ files early, never a small-file regime) — no persisted estimate is
 worth the drift hazard.
 
 The commit message is deterministic (millpond's rules): a fixed
-``key=value`` sequence, no wall-clock/random/per-attempt state, offset
-ranges from the staged ``offsets/`` record (clipped to the flushed
-window), and ``table=`` carries the incarnation uuid. It is formatted
-inside the pure request builder — BEFORE any upload (pinned by a
-source-order test) — and its ``offsets`` line is the recovery material:
-a persisted request's flush window is parsed back out of it
-(``parse_message_offsets``), which is why truncation keeps the first
-and last ranges verbatim.
+``key=value`` sequence, no wall-clock/random/per-attempt state, the
+flushed offset window, and ``table=`` carries the incarnation uuid. It
+is formatted inside the pure request builder — BEFORE any upload
+(pinned by a source-order test) — and its ``offsets`` line is the
+recovery material: a persisted request's flush window is parsed back
+out of it (``parse_message_offsets``).
 
 Recovery handoff: :meth:`FlushRunner.run_once` reconciles every newly
 claimed partition before planning it: ``PartitionStage.recover()``
@@ -193,7 +195,7 @@ at-least-once behaviour, counted
 the possibly-live objects in ``millrace_flush_unresolved_uploads_total``).
 Without a snapshot floor the verbatim replay itself executes (a second
 set of file rows over the same objects; ``millrace_prepared_replays_total``).
-The envelope (v4) also carries the idempotency key's derivation inputs
+The envelope (v5) also carries the idempotency key's derivation inputs
 — ``topic``, ``partition`` and the partition tuple as hoglake partition
 values (field names beside wire strings) — cross-checked at recovery
 against the stage's own identity and the ``prepared/`` key: an entry
@@ -321,7 +323,7 @@ from .coerce import (
 )
 from .config import Config, EventTimePolicy
 from .grouping import column_chains, field_names
-from .keyspace import FlushedKey, OffsetRange, PreparedRequest
+from .keyspace import FlushedKey, PreparedRequest
 from .planner import (
     DEFAULT_COMPRESSION_RATIO,
     FlushDecision,
@@ -332,8 +334,10 @@ from .planner import (
 )
 from .stage import (
     DroppedRecord,
+    FlushCommitReport,
     PartitionStage,
     RecoveredPrepared,
+    SettlementMismatchError,
     StageClosedError,
     StageCorruptionError,
     StageGauges,
@@ -383,12 +387,6 @@ _REUSED_KEY_MARKER: Final = "idempotency_key reused"
 _REPREPARE_DDL: Final = "ddl_since_read_snapshot"
 _REPREPARE_EXPIRED: Final = "read_snapshot_expired"
 REPREPARE_REASONS: Final = (_REPREPARE_DDL, _REPREPARE_EXPIRED)
-
-# How long the offsets line of a commit message may be, in bytes (the
-# server stores `message` as unbounded text; this bound is millrace's own).
-# Truncation keeps the FIRST and LAST range verbatim — the last range's end
-# is the flush window's high-water mark, and recovery parses it back out.
-_MESSAGE_OFFSETS_LIMIT: Final = 16384
 
 # Transforms whose source values the junk event_time policy checks.
 _TEMPORAL_TRANSFORMS: Final = frozenset({"year", "month", "day", "hour"})
@@ -445,11 +443,23 @@ class FlushHalted(FlushError):
         self.detail = detail
 
 
-class FlushPublishExhausted(FlushError):
-    """A retry ladder ran out on an ambiguous or retryable failure. The
-    persisted ``prepared/`` entry stays: the next sweep replays it
+class FlushTransient(FlushError):
+    """A bounded retry ladder ran out on transient server or transport
+    failures. Nothing was settled or deleted; the next sweep retries.
+    The runner counts it as a failed decision and logs ONE warning line
+    (no stack trace)."""
+
+
+class FlushPublishExhausted(FlushTransient):
+    """The publish ladder ran out on an ambiguous or retryable failure.
+    The persisted ``prepared/`` entry stays: the next sweep replays it
     (receipt lookup first). Contained per decision by the runner — the
     sweep is never wedged by one key."""
+
+
+class ReceiptLookupExhausted(FlushTransient):
+    """The receipt-lookup ladder ran out on 5xx/408/429 or transport
+    failures. Nothing was built, published or settled."""
 
 
 # -- counters ------------------------------------------------------------------
@@ -463,7 +473,10 @@ class FlushStats:
     ``commit_retries`` counts only the retried ones, split by cause.
     ``records_dropped`` maps a flush-time drop reason to its row count;
     ``decisions_dropped`` counts decisions that dropped EVERY row (settled
-    without a commit). ``reprepared`` maps a re-prepare reason
+    without a commit). ``flush_deduped`` counts fresh windows whose
+    content (same bounds, same rows) already had a receipt at the
+    pre-build lookup, settled with nothing new committed.
+    ``reprepared`` maps a re-prepare reason
     (``ddl_since_read_snapshot``, ``read_snapshot_expired``) to the
     ``prepared/`` entries dropped for it; ``unresolved_uploads`` counts
     objects named by a dropped entry that may be live table files or
@@ -472,6 +485,7 @@ class FlushStats:
     flushes_committed: int = 0
     prepared_replays: int = 0
     receipt_settlements: int = 0
+    flush_deduped: int = 0
     reprepared: Mapping[str, int] = dataclass_field(default_factory=dict)
     decisions_dropped: int = 0
     records_dropped: Mapping[str, int] = dataclass_field(default_factory=dict)
@@ -860,8 +874,8 @@ def _build_arrow(
     records: Sequence[DecodedRecord], columns: tuple[Column, ...]
 ) -> pa.Table:
     """Column-aligned records → the Arrow table at the catalog's schema
-    (field ids embedded). Rows keep SCAN order here — (Kafka record
-    timestamp, offset) within the group; :func:`build_prepared_plan` then
+    (field ids embedded). Rows keep SCAN order here — Kafka offset order
+    within the group; :func:`build_prepared_plan` then
     sorts the batch by the live catalog sort spec (payload event time)
     before the partition fanout — the sort, not the scan order, is what
     the ingest-sort / catalog-sort-spec convergence rests on
@@ -1141,9 +1155,9 @@ def format_commit_message(
     arrow_bytes: int,
     topic: str,
     partition: int,
-    offset_ranges: Sequence[OffsetRange],
+    first_offset: int,
+    last_offset: int,
     version: str,
-    limit: int = _MESSAGE_OFFSETS_LIMIT,
 ) -> str:
     """The snapshot's ``message``: what the flush was, then where it came
     from in Kafka.
@@ -1156,13 +1170,10 @@ def format_commit_message(
     tables that receipts do not span.
 
     Line 2 is the flush's identity material in machine-readable form:
-    the offset ranges (from the staged ``offsets/`` record, clipped to
-    the flushed window). Recovery parses the window's bounds back out of
-    a persisted request's message (``parse_message_offsets``) — the
+    the offset window ``first-last``. Recovery parses it back out of a
+    persisted request's message (``parse_message_offsets``) — the
     ``prepared/`` value envelope holds only the request body, so the
-    message is where the window lives. Truncation therefore keeps the
-    FIRST and LAST range verbatim (the window's exact min and max) and
-    elides only middle ranges, which are forensic-only.
+    message is where the window lives.
     """
     summary = (
         f"millrace=v1 table={table_uuid} group={group} trigger={trigger} "
@@ -1170,17 +1181,10 @@ def format_commit_message(
         f"partitions={partitions} staged_bytes={staged_bytes} "
         f"arrow_bytes={arrow_bytes} millrace={_message_token(version)}"
     )
-    head = f"offsets topic={_message_token(topic)} partition={partition} ranges="
-    parts = [f"{r.first_offset}-{r.last_offset}" for r in offset_ranges]
-    whole = head + ",".join(parts)
-    if len(whole.encode()) <= limit or len(parts) <= 2:
-        return f"{summary}\n{whole}"
-    # The marker holds no space either: the line survives whitespace
-    # tokenization and the parser keys on the "..." prefix.
-    elided = f"{parts[0]},...(+{len(parts) - 2}_elided),{parts[-1]}"
-    # The floor case (a first+last pair that still exceeds the limit —
-    # a giant topic name) emits anyway: the window's bounds must survive.
-    return f"{summary}\n{head}{elided}"
+    return (
+        f"{summary}\noffsets topic={_message_token(topic)} "
+        f"partition={partition} window={first_offset}-{last_offset}"
+    )
 
 
 def _message_token(value: Any) -> str:
@@ -1193,9 +1197,8 @@ def _message_token(value: Any) -> str:
 
 _OFFSETS_LINE: Final = re.compile(
     r"^offsets topic=(?P<topic>\S+) partition=(?P<partition>\d+) "
-    r"ranges=(?P<ranges>\S+)$"
+    r"window=(?P<first>\d+)-(?P<last>\d+)$"
 )
-_OFFSET_RANGE: Final = re.compile(r"^(?P<first>\d+)-(?P<last>\d+)$")
 
 
 def parse_message_offsets(
@@ -1206,11 +1209,9 @@ def parse_message_offsets(
 
     Strict by construction: the format above is millrace's own, and a
     persisted body whose message does not parse is corruption (foreign
-    writes or a bug), refused loudly rather than guessed at. The first
-    range's start and the LAST range's end are the window's bounds —
-    truncation elides only middle ranges, so they always survive.
-    Staged offsets are non-negative (the consumer drops anything
-    else), which is what makes the ``f-l`` spelling unambiguous."""
+    writes or a bug), refused loudly rather than guessed at. Staged
+    offsets are non-negative (the consumer drops anything else), which
+    is what makes the ``first-last`` spelling unambiguous."""
     for line in message.splitlines():
         match = _OFFSETS_LINE.match(line)
         if match is None:
@@ -1224,21 +1225,12 @@ def parse_message_offsets(
                 f"{match.group('topic')}[{match.group('partition')}], "
                 f"not this stage's {topic}[{partition}]"
             )
-        bounds: list[tuple[int, int]] = []
-        for part in match.group("ranges").split(","):
-            if part.startswith("..."):
-                continue  # the elision marker; middle ranges are forensic
-            rng = _OFFSET_RANGE.match(part)
-            if rng is None:
-                raise StageCorruptionError(
-                    f"unparseable offset range {part!r} in persisted commit message"
-                )
-            bounds.append((int(rng.group("first")), int(rng.group("last"))))
-        if not bounds:
+        first, last = int(match.group("first")), int(match.group("last"))
+        if first > last:
             raise StageCorruptionError(
-                "persisted commit message carries no offset ranges"
+                f"persisted commit message names an inverted window {first}-{last}"
             )
-        return bounds[0][0], bounds[-1][1]
+        return first, last
     raise StageCorruptionError(
         "persisted prepared request has no offsets line in its commit message"
     )
@@ -1248,88 +1240,22 @@ def parse_message_offsets(
 
 #: What one flush becomes on the wire.
 FlushOutcome = Literal[
-    "committed", "replayed", "receipt_settled", "reprepare", "dropped", "empty"
+    "committed",
+    "replayed",
+    "receipt_settled",
+    "deduped",
+    "reprepare",
+    "dropped",
+    "empty",
 ]
-
-
-def _covered_window(
-    scanned_offsets: Sequence[int], ranges: Sequence[OffsetRange]
-) -> tuple[int, int]:
-    """The flush window ``(first_offset, last_offset)`` of a TRUNCATED
-    scan, narrowed to what the scan actually covered (M4).
-
-    A flush publishes exactly the rows the settlement's offset window
-    will delete (``keyspace.row_in_flushed_range``), so the window must
-    satisfy: every staged row of the group with offset in the window WAS
-    scanned. A capped scan is a prefix in ``(timestamp, offset)`` key
-    order, and Kafka record timestamps are not offset-monotone, so the
-    naive ``[min, max]`` of scanned offsets can span an UNSCANNED row
-    (an inversion straddling the cap boundary) — settling that window
-    would delete a row that was never published (the guard would halt;
-    the narrowing avoids the wedge on real catch-up data). The caller
-    narrows ONLY when a cap actually cut the scan short: an untruncated
-    scan saw the group's whole staged slice, and its own offset span is
-    the window.
-
-    The ``offsets/`` record holds one ``[first, last]`` span per staged
-    batch per group (arrival structure — gaps between a batch's own
-    offsets belong to other groups and are NOT representable), so the
-    record is a sound OVER-approximation of the group's staged-offset
-    set: every staged offset lies inside some span, but a span's
-    interior can name offsets that are not this group's rows. The walk
-    treats a span interior the scan missed as a hole either way — sound
-    (the window never covers an unscanned row), and for interleaved
-    groups potentially tighter than the true covered prefix; the steady
-    state never truncates, so this conservatism is confined to catch-up
-    scans under timestamp inversion.
-
-    The walk: the window is ``(m, K)`` where ``m`` is the smallest
-    scanned offset and ``K`` the largest offset such that every
-    in-record offset in ``[m, K]`` is scanned — ranges are walked
-    against the sorted scan; a range fully covered is skipped
-    arithmetically, a range with a hole ends the window at the hole.
-    Runs of offsets belonging to other groups or to records the consumer
-    dropped
-    (gaps BETWEEN ranges) need no coverage.
-
-    Pure; deterministic in its inputs (the window's identity comes from
-    the SCANNED rows, never the stats snapshot). ``scanned_offsets``
-    must be non-empty.
-    """
-    offsets = sorted(set(scanned_offsets))
-    if not offsets:
-        raise ValueError("_covered_window requires a non-empty scan")
-    m, big_m = offsets[0], offsets[-1]
-    i = 0  # offsets[i] is the smallest scanned offset not yet matched
-    n = len(offsets)
-    for r in ranges:
-        a = max(r.first_offset, m)
-        b = min(r.last_offset, big_m)
-        if a > b:
-            continue
-        span = b - a + 1
-        if i + span <= n and offsets[i] == a and offsets[i + span - 1] == b:
-            # span distinct sorted integers with both endpoints matching
-            # inside [a, b] — the whole range is covered; skip it.
-            i += span
-            continue
-        # A hole: the first staged offset of this range the scan missed
-        # ends the window (the offset just below it was covered).
-        x = a
-        while x <= b and i < n and offsets[i] == x:
-            i += 1
-            x += 1
-        return m, x - 1
-    return m, big_m
 
 
 @dataclass(frozen=True, slots=True)
 class FlushContext:
     """The per-decision constants one prepared request is built from.
 
-    ``offset_ranges`` is the staged ``offsets/`` record clipped to the
-    flushed window (the message's identity material). Nothing here reads
-    a clock: the junk window arrives precomputed in
+    ``first_offset`` / ``last_offset`` are the flushed window (the
+    message's identity material). Nothing here reads a clock: the junk window arrives precomputed in
     :func:`build_prepared_plan`'s arguments, so the request's bytes are a
     pure function of the staged rows, the table basis and the window.
     """
@@ -1341,7 +1267,6 @@ class FlushContext:
     trigger: FlushTrigger
     first_offset: int
     last_offset: int
-    offset_ranges: tuple[OffsetRange, ...]
     idempotency_key: str
     read_snapshot: int
     table_uuid: str
@@ -1420,7 +1345,7 @@ def build_prepared_plan(
     same window never reuses an earlier build's names (it may be live
     data of a landed first attempt).
 
-    The sort: scan order is Kafka-record time; the catalog's sort spec
+    The sort: scan order is Kafka offset order; the catalog's sort spec
     (``info.sort_spec``) is payload-event time. The batch is sorted by
     the spec — fields, directions and null placement — right before
     :func:`_partition_groups`, so every registered file is
@@ -1497,7 +1422,7 @@ def build_prepared_plan(
 
     # The catalog's sort spec is the file's contract (BINDING for
     # compaction; SortednessCheck demotes a file at the first inversion).
-    # Scan order is Kafka-record time and the spec is payload-event time,
+    # Scan order is Kafka offset order and the spec is payload-event time,
     # which late/skewed events invert constantly — so the batch is sorted
     # by the live spec HERE, before the fanout (a group filter preserves
     # row order, so every output file is then key-nondecreasing).
@@ -1540,7 +1465,8 @@ def build_prepared_plan(
         arrow_bytes=table.nbytes,
         topic=ctx.topic,
         partition=ctx.partition,
-        offset_ranges=ctx.offset_ranges,
+        first_offset=ctx.first_offset,
+        last_offset=ctx.last_offset,
         version=version,
     )
 
@@ -2009,6 +1935,7 @@ class HoglakeFlusher:
         self._flushes_committed = 0
         self._prepared_replays = 0
         self._receipt_settlements = 0
+        self._flush_deduped = 0
         self._reprepared: dict[str, int] = {}
         self._decisions_dropped = 0
         self._records_dropped: dict[str, int] = {}
@@ -2063,6 +1990,7 @@ class HoglakeFlusher:
             flushes_committed=self._flushes_committed,
             prepared_replays=self._prepared_replays,
             receipt_settlements=self._receipt_settlements,
+            flush_deduped=self._flush_deduped,
             reprepared=dict(self._reprepared),
             decisions_dropped=self._decisions_dropped,
             records_dropped=dict(self._records_dropped),
@@ -2401,6 +2329,49 @@ class HoglakeFlusher:
 
     # -- receipt reconciliation --------------------------------------------------
 
+    async def _lookup_receipt(self, idempotency_key: str) -> CommitResult | None:
+        """The receipt lookup on the publish ladder's transient arm: a
+        5xx, 408, 429 or transport failure retries up to
+        ``_PUBLISH_MAX_ATTEMPTS`` times with the exponential delay floored
+        by ``Retry-After``, one WARNING line per retry; exhaustion raises
+        :class:`ReceiptLookupExhausted` (a failed decision, retried next
+        sweep, no stack trace). Any other answered 4xx propagates."""
+        attempts = 0
+        while True:
+            attempts += 1
+            try:
+                return await self._io(partial(self._receipt_sync, idempotency_key))
+            except HoglakeError as e:
+                status = e.status_code
+                if (
+                    status is not None
+                    and 400 <= status < 500
+                    and status not in (408, 429)
+                ):
+                    raise
+                error: Exception = e
+            except (httpx.HTTPError, OSError) as e:
+                error = e
+            if attempts >= _PUBLISH_MAX_ATTEMPTS:
+                raise ReceiptLookupExhausted(
+                    f"receipt lookup for {idempotency_key} failed {attempts} "
+                    f"times ({error}); retried next sweep"
+                ) from error
+            delay = max(
+                min(_BASE_DELAY_S * (2 ** (attempts - 1)), _MAX_DELAY_S),
+                self._retry_after_hint() or 0.0,
+            )
+            log.warning(
+                "receipt lookup for %s failed transiently (attempt %d/%d: %s), "
+                "retrying in %.1fs",
+                idempotency_key,
+                attempts,
+                _PUBLISH_MAX_ATTEMPTS,
+                error,
+                delay,
+            )
+            await self._sleep(delay)
+
     def _receipt_sync(self, idempotency_key: str) -> CommitResult | None:
         """The durable receipt for one idempotency key, or None (404 —
         the routine state of a commit that never landed, not an error).
@@ -2441,9 +2412,11 @@ class HoglakeFlusher:
         another is foreign state, refused as corruption, never replayed
         under it. The settle deletes EXACTLY the window (never younger
         rows of the same tuple), and the
-        delete is guarded against the scan: a settlement that removes a
-        row the scan did not see is a staging-invariant violation and
-        halts the pipeline rather than losing the row silently.
+        delete is guarded, inside the settle transaction, against the
+        entry's persisted ``row_count``: a window that now holds a
+        different number of rows (one that was not in the published
+        commit) rolls the settle back and halts ``settlement_mismatch``
+        rather than deleting an unpublished row.
         """
         group = pending.key.group
         key = pending.request.idempotency_key
@@ -2500,18 +2473,15 @@ class HoglakeFlusher:
                 f"message's window starts at {first_offset} instead"
             )
         window = FlushedKey(group, first_offset, last_offset, group_fields=fields)
-        # The window's rows as they stand now — the settlement guard's
-        # count.
-        window_rows = [
-            (row_key, payload_bytes)
-            async for row_key, payload_bytes in stage.scan_group_rows(group)
-            if keyspace.row_in_flushed_range(row_key, window)
-        ]
+        # The settlement guard's expected count is the PERSISTED one —
+        # the rows the window held when the request was built — never a
+        # recount now: a row that entered the window after the scan (a
+        # rewind or re-key) was not in the published commit.
+        expected = pending.request.row_count
 
-        receipt = await self._io(partial(self._receipt_sync, key))
+        receipt = await self._lookup_receipt(key)
         if receipt is not None:
-            report = await stage.commit_flushed(window)
-            self._guard_settlement(window, len(window_rows), report.rows_deleted)
+            await self._settle(stage, window, expected, recovery=True)
             self._receipt_settlements += 1
             log.info(
                 "reconciled %s[%d] group %s offsets %d-%d from the commit "
@@ -2660,8 +2630,7 @@ class HoglakeFlusher:
                 ) from e
             raise
 
-        report = await stage.commit_flushed(window)
-        self._guard_settlement(window, len(window_rows), report.rows_deleted)
+        await self._settle(stage, window, expected, recovery=True)
         self._prepared_replays += 1
         log.info(
             "replayed the persisted commit for %s[%d] group %s offsets %d-%d "
@@ -2731,22 +2700,40 @@ class HoglakeFlusher:
                 first_path.get(reason, ""),
             )
 
-    def _guard_settlement(self, window: FlushedKey, scanned: int, deleted: int) -> None:
-        """The settlement must delete EXACTLY the rows the flush saw:
-        every scanned row is in the window by construction, and no row
-        the scan did not see may share it (staged offsets grow past a
-        snapshot — stage.py's ordering argument). A disagreement is a
-        staging-invariant violation — a shortfall leaves published rows
-        to re-flush (a duplicate), an over-delete loses unpublished rows
-        — so it halts the pipeline rather than proceeding."""
-        if deleted != scanned:
+    async def _settle(
+        self,
+        stage: PartitionStage,
+        window: FlushedKey,
+        expected: int,
+        *,
+        recovery: bool = False,
+    ) -> FlushCommitReport:
+        """Settle the window with the guard INSIDE the settlement
+        transaction (``commit_flushed(expected_rows=expected)``): the
+        settle must delete EXACTLY the rows the commit published —
+        ``expected`` is the scanned count on a fresh flush and the
+        ``prepared/`` entry's persisted ``row_count`` on every recovery
+        settle (never a recount). A disagreement rolls the transaction
+        back and halts ``settlement_mismatch``: nothing was deleted and
+        the ``prepared/`` entry (if any) stands. A restart reconciles that
+        entry against the same persisted count and halts again until an
+        operator resolves it; the structural fix is settling by the
+        scanned keys (hoglake#351)."""
+        try:
+            return await stage.commit_flushed(window, expected_rows=expected)
+        except SettlementMismatchError as e:
+            where = "at reconcile" if recovery else "after publishing"
             raise FlushHalted(
                 "settlement_mismatch",
-                f"settling group {window.label} offsets "
-                f"{window.first_offset}-{window.last_offset} deleted "
-                f"{deleted} rows but the flush saw {scanned}: the staging "
-                "layer's ordering invariants are broken",
-            )
+                f"{e} ({where}). Nothing was settled. The window holds rows "
+                "that were not in the published commit (a rewind or re-key "
+                "after the scan). Confirm what the published snapshot holds, "
+                "then drop the prepared/ entry for this window if one "
+                "stands (its rows re-flush as a new window) or re-consume "
+                "the window's offsets; with an entry standing, a restart "
+                "alone halts here again (hoglake#351: settle by scanned "
+                "keys)",
+            ) from e
 
     def _scan_budget_bytes(self) -> int:
         """The per-decision staged-byte scan cap (module docstring
@@ -2770,23 +2757,29 @@ class HoglakeFlusher:
         Order of operations, each load-bearing:
 
         1. A persisted ``prepared/`` entry for the group — found by a
-           PER-GROUP lookup, never keyed by the scan's first offset — is
-           authoritative: it is replayed (receipt lookup first), never
-           regenerated, and no new window is built while one stands.
-           The per-group shape is what makes the bounded scan (below)
-           safe: a capped scan's prefix minimum can move under
-           timestamp-inverted arrivals, and keying the lookup by it
-           could miss an outstanding entry and double-publish its
-           window.
+           PER-GROUP lookup, never keyed by the scan's first offset (a
+           rewind that re-stages offsets below the entry's window moves
+           that) — is authoritative: it is replayed (receipt lookup
+           first), never regenerated, and no new window is built while
+           one stands.
         2. The shape read (and with it the commit's ``read_snapshot``
            basis) is pinned BEFORE the staged range is scanned.
-        3. The scan is BOUNDED (rows and bytes — M4); the flush window
-           is derived from the SCANNED rows — their own offset span when
-           the scan covered the group's slice, narrowed to the covered
-           offset prefix (:func:`_covered_window`) only when a cap cut
-           the scan short; one commit per ``(group, window)``; settlement
-           strictly after the receipt, guarded against the scanned
-           count.
+        3. The scan is BOUNDED (rows and bytes — M4) and, row keys
+           sorting by (group, offset), an exact offset prefix of the
+           group's staged rows: the window is ``[first scanned, last
+           scanned]``; one commit per ``(group, window)``.
+        4. CONTENT KEY, RECEIPT FIRST: the key's inputs include the
+           SHA-256 of the scanned rows. Before anything is built or
+           uploaded the key is looked up (on the transient retry
+           ladder). A 200 means this exact content already landed (a
+           rewind re-staged identical rows) — settle locally, nothing
+           built, uploaded or published (outcome ``deduped``).
+           Different rows under the same bounds have another key and
+           publish as a new commit. A 422 reused-key on the publish
+           halts ``idempotency_key_reused``.
+        5. Settlement strictly after the receipt, guarded INSIDE the
+           settle transaction against the scanned count (the persisted
+           ``row_count`` on recovery).
         """
         group = decision.group
         for pending in await stage.list_prepared(group):
@@ -2809,7 +2802,7 @@ class HoglakeFlusher:
         fields = _group_fields(info, group)
         label = keyspace.group_label(fields, group)
 
-        rows, truncated = await stage.scan_group_rows_bounded(
+        rows = await stage.scan_group_rows_bounded(
             group,
             max_rows=self._cfg.flush_scan_max_rows,
             max_bytes=self._scan_budget_bytes(),
@@ -2825,9 +2818,6 @@ class HoglakeFlusher:
                 (row_key, payload)
                 async for row_key, payload in stage.scan_group_rows(group, max_rows=1)
             ]
-            # The one-row probe is its own exact window below (the byte
-            # cap refused this row, so it flushes alone).
-            truncated = False
         if not rows:
             # A decided key scanning zero rows is the redelivery-inflation
             # residue (stage_batch is idempotent at the row level but its
@@ -2856,50 +2846,24 @@ class HoglakeFlusher:
                 first_offset=-1,
                 last_offset=-1,
             )
-        # The identity material: the offsets/ record (read AFTER the
-        # scan snapshot, so it may name ranges staged mid-scan — those
-        # sort past the window's span and clip away; stage.py's ordering
-        # argument makes the record exact inside it), and the window
-        # itself: [first_scanned_offset, last_scanned_offset] when the
-        # scan covered the group's whole staged slice (the common case —
-        # every staged row was seen, so settling the span deletes exactly
-        # the published rows), narrowed to the covered prefix ONLY when a
-        # scan cap cut the read short (a timestamp inversion straddling
-        # the cap could otherwise settle a row the flush never saw).
-        record = await stage.read_offsets(group)
-        if not record:
-            raise StageCorruptionError(
-                f"group {label}: {len(rows)} staged rows but the offsets/ "
-                "record names none of them"
-            )
-        scanned_offsets = [row_key.offset for row_key, _ in rows]
-        if truncated:
-            first_offset, last_offset = _covered_window(scanned_offsets, record)
-            if last_offset < max(scanned_offsets):
-                # A timestamp inversion straddling the scan cap: the rows
-                # past the covered prefix stay staged and re-decide next
-                # sweep (the window machinery handles arbitrary
-                # sub-windows; this is the M4 catch-up path working).
-                rows = [(rk, p) for rk, p in rows if rk.offset <= last_offset]
-        else:
-            first_offset = min(scanned_offsets)
-            last_offset = max(scanned_offsets)
-        ranges = tuple(
-            OffsetRange(
-                r.topic,
-                r.partition,
-                max(r.first_offset, first_offset),
-                min(r.last_offset, last_offset),
-            )
-            for r in record
-            if r.first_offset <= last_offset and r.last_offset >= first_offset
+        # The window: row keys sort by (group, offset), so the scan —
+        # capped or not — is an exact offset prefix of the group's
+        # staged rows as of its snapshot, and every staged row of the
+        # group inside [first scanned, last scanned] was scanned.
+        # Arrivals after the snapshot normally carry larger offsets; a
+        # row that enters the window after the scan anyway (a rewind
+        # re-keying an in-window offset into this group) makes the
+        # settlement guard halt inside the settle transaction, which
+        # rolls back.
+        first_offset = rows[0][0].offset
+        last_offset = rows[-1][0].offset
+        window = FlushedKey(group, first_offset, last_offset, group_fields=fields)
+        # The key names the window's CONTENT: SHA-256 over the scanned
+        # rows (offset || length || payload, offset order), on the I/O
+        # pool — up to the scan budget of payload bytes.
+        digest = await self._io(
+            lambda: keyspace.content_digest((rk.offset, p) for rk, p in rows)
         )
-        if not ranges:
-            raise StageCorruptionError(
-                f"group {label}: {len(rows)} staged rows but the offsets/ "
-                "record names none of them"
-            )
-
         key = keyspace.idempotency_key(
             self._table_uuid,
             stage.topic,
@@ -2907,7 +2871,23 @@ class HoglakeFlusher:
             group,
             first_offset,
             last_offset,
+            digest,
         )
+        # Receipt first (step 4 above): the same content under the same
+        # window already landed (an identical rewind) — settle from the
+        # receipt with nothing built or uploaded.
+        receipt = await self._lookup_receipt(key)
+        if receipt is not None:
+            return await self._settle_deduped(
+                stage,
+                decision,
+                window,
+                len(rows),
+                key,
+                f"its receipt exists (snapshot {receipt.snapshot_id})",
+                snapshot_id=receipt.snapshot_id,
+            )
+
         now_us = self._now_us()
         ctx = FlushContext(
             topic=stage.topic,
@@ -2917,7 +2897,6 @@ class HoglakeFlusher:
             trigger=decision.trigger,
             first_offset=first_offset,
             last_offset=last_offset,
-            offset_ranges=ranges,
             idempotency_key=key,
             read_snapshot=read_snapshot,
             table_uuid=self._table_uuid,
@@ -2964,9 +2943,7 @@ class HoglakeFlusher:
         if plan.payload is None:
             # Every row dropped: nothing may be committed (a commit
             # registers at least one file). Settle WITHOUT a commit.
-            window = FlushedKey(group, first_offset, last_offset, group_fields=fields)
-            report = await stage.commit_flushed(window)
-            self._guard_settlement(window, len(rows), report.rows_deleted)
+            await self._settle(stage, window, len(rows))
             self._decisions_dropped += 1
             return FlushReport(
                 topic=stage.topic,
@@ -3011,6 +2988,7 @@ class HoglakeFlusher:
                     partition=stage.partition,
                     group=group,
                     group_fields=fields,
+                    row_count=len(rows),
                 ),
             )
         except BaseException:
@@ -3083,12 +3061,20 @@ class HoglakeFlusher:
             ) from e
         except HoglakeError as e:
             if isinstance(e, ValidationError) and _REUSED_KEY_MARKER in _error_text(e):
+                # The key names this window's CONTENT and its receipt
+                # answered 404 just before this build: a receipt under it
+                # now means another writer (a second owner of the
+                # partition, a foreign process) committed this content
+                # in between. This process never published it, so it
+                # never settles on it: halt, rows and entry staged.
                 raise self._halt(
                     "idempotency_key_reused",
-                    f"the server holds a receipt under {key} for a DIFFERENT "
-                    "request: with deterministic derivation that means a "
-                    "foreign writer or broken determinism — halting rather "
-                    "than settling rows a stranger may not have published",
+                    f"the commit for {stage.topic}[{stage.partition}] group "
+                    f"{label} offsets {first_offset}-{last_offset} (content "
+                    f"digest {digest}, idempotency key {key}) was answered "
+                    "422 reused-key: another writer committed this content "
+                    "between the receipt lookup and this publish. Halting "
+                    "with the rows staged.",
                     plan.uris,
                 ) from e
             status = e.status_code
@@ -3112,9 +3098,7 @@ class HoglakeFlusher:
                 ) from e
             raise
 
-        window = FlushedKey(group, first_offset, last_offset, group_fields=fields)
-        report = await stage.commit_flushed(window)
-        self._guard_settlement(window, len(rows), report.rows_deleted)
+        await self._settle(stage, window, len(rows))
         self._flushes_committed += 1
         self._rows_published += plan.records
         self._files_written += plan.files
@@ -3148,6 +3132,46 @@ class HoglakeFlusher:
             files=plan.files,
             dropped=len(plan.dropped_records),
             snapshot_id=result.snapshot_id,
+            idempotency_key=key,
+        )
+
+    async def _settle_deduped(
+        self,
+        stage: PartitionStage,
+        decision: FlushDecision,
+        window: FlushedKey,
+        scanned: int,
+        key: str,
+        why: str,
+        *,
+        snapshot_id: int | None = None,
+    ) -> FlushReport:
+        """Settle a fresh window that already landed under its key —
+        nothing new is committed (``millrace_flush_deduped_total``). The
+        settle is the ordinary one (rows, stats, any ``prepared/`` entry
+        of the window), guarded against the scanned count."""
+        await self._settle(stage, window, scanned)
+        self._flush_deduped += 1
+        log.info(
+            "deduped %s[%d] group %s offsets %d-%d (idempotency key %s): %s; "
+            "settled locally, nothing new committed",
+            stage.topic,
+            stage.partition,
+            window.label,
+            window.first_offset,
+            window.last_offset,
+            key,
+            why,
+        )
+        return FlushReport(
+            topic=stage.topic,
+            partition=stage.partition,
+            group=window.group,
+            trigger=decision.trigger,
+            outcome="deduped",
+            first_offset=window.first_offset,
+            last_offset=window.last_offset,
+            snapshot_id=snapshot_id,
             idempotency_key=key,
         )
 
@@ -3206,6 +3230,7 @@ class SweepReport:
     empty: int
     failed: int
     fenced: int = 0
+    deduped: int = 0
 
 
 def _oldest_eligible_staged_ts(decisions: Sequence[FlushDecision]) -> int | None:
@@ -3393,7 +3418,7 @@ class FlushRunner:
         # re-claim reopens the path under a fresh writer).
         self._reconciled &= open_set
         self._fenced &= open_set
-        decisions = committed = replayed = receipt_settled = 0
+        decisions = committed = replayed = receipt_settled = deduped = 0
         reprepared = dropped = empty = failed = 0
         gauge_map: dict[tuple[str, int], StageGauges] = {}
         eligible_oldest: dict[tuple[str, int], int] = {}
@@ -3417,7 +3442,7 @@ class FlushRunner:
                     # (once), do not retry it next tick.
                     self._note_fenced((topic, partition), fenced, where="recovery")
                     continue
-                except Exception:
+                except Exception as failure:
                     # Transient reconciliation failure: skipped this tick,
                     # retried the next (the partition is never marked
                     # reconciled). Its gauges must still reach the
@@ -3427,12 +3452,20 @@ class FlushRunner:
                     # eligible-age alert exists for). Best-effort: a
                     # partition this broken must not wedge the sweep's
                     # gauge publication either.
-                    log.exception(
-                        "reconciliation failed for %s[%d]; the partition is "
-                        "skipped this tick",
-                        topic,
-                        partition,
-                    )
+                    if isinstance(failure, FlushTransient):
+                        log.warning(
+                            "reconciliation for %s[%d] deferred to the next tick: %s",
+                            topic,
+                            partition,
+                            failure,
+                        )
+                    else:
+                        log.exception(
+                            "reconciliation failed for %s[%d]; the partition "
+                            "is skipped this tick",
+                            topic,
+                            partition,
+                        )
                     failed += 1
                     try:
                         skipped_stats = await stage.iter_key_stats()
@@ -3509,6 +3542,7 @@ class FlushRunner:
             committed += report.outcome == "committed"
             replayed += report.outcome == "replayed"
             receipt_settled += report.outcome == "receipt_settled"
+            deduped += report.outcome == "deduped"
             reprepared += report.outcome == "reprepare"
             dropped += report.outcome == "dropped"
             empty += report.outcome == "empty"
@@ -3524,18 +3558,20 @@ class FlushRunner:
             empty=empty,
             failed=failed,
             fenced=len(self._fenced),
+            deduped=deduped,
         )
         self._last_report = sweep
         if decisions:
             log.info(
                 "flush sweep %d: %d decisions — %d committed, %d replayed, "
-                "%d receipt-settled, %d re-prepared, %d dropped, "
+                "%d receipt-settled, %d deduped, %d re-prepared, %d dropped, "
                 "%d empty, %d failed",
                 self._sweeps,
                 decisions,
                 committed,
                 replayed,
                 receipt_settled,
+                deduped,
                 reprepared,
                 dropped,
                 empty,
@@ -3670,6 +3706,19 @@ class FlushRunner:
                         # new owner. Later queued decisions of the same
                         # partition fail this same fast check.
                         self._reconciled.discard(key)
+                        continue
+                    except FlushTransient as e:
+                        # A ladder ran out on transient server/transport
+                        # failures: one line, no trace; retried next sweep.
+                        failed += 1
+                        log.warning(
+                            "flush decision for %s[%d] group %s deferred to "
+                            "the next sweep: %s",
+                            stage.topic,
+                            stage.partition,
+                            decision.group,
+                            e,
+                        )
                         continue
                     except Exception:
                         # Contained per decision: the rows stay staged,

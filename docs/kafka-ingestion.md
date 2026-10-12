@@ -62,8 +62,9 @@ the tenant (and the month, under `month(timestamp)`); a steady-state
 flush of one key writes exactly one file.
 
 The LSM's ordering is load-bearing, not incidental: keying staged rows
-by `(partition tuple, timestamp)` means a flush reads one contiguous,
-nearly sorted range. The readiness scheduler's AGE/SLOW lanes are the ordered
+by `(partition tuple, offset)` means a flush reads one contiguous
+range, a capped read is an exact offset prefix of the tuple's staged
+rows, and a flushed window is one contiguous key range to delete. The readiness scheduler's AGE/SLOW lanes are the ordered
 index scan the staging layout promises (`sched_age/` prefix scan to the
 deadline cutoff, then a point-read per candidate for the exact decision
 input); the SIZE lane has no size-ordered index (`sched_size` is the
@@ -107,18 +108,21 @@ test, not assumed. When the fence fires (a newer writer opened the
 path), the flush loop treats the partition's `Error.Closed` as
 terminal: the partition leaves flush scheduling with one log line
 (never a stack trace per sweep) until the assignment revokes it, and
-the runner's stats surface the fenced set; the consume side's handling
-is the consumer's own. A pod holding K partitions runs K instances; per-DB
+the runner's stats surface the fenced set. The consumer halts on it at
+the poll's durable write before committing: the staging batch, or, for
+a partition whose polled records all dropped, a one-put fence probe
+(`meta/fence`) written in its place, so a fenced owner never commits
+offsets against the new one. A pod holding K partitions runs K instances; per-DB
 housekeeping overhead (memtable, WAL, manifest) is a bench item, because
 it bounds how small a partition slice may be before S3 chatter
 dominates. No volumes anywhere.
 
 ```
-rows/<group><record_ts_ob><offset_ob>     → event payload bytes
+rows/<group><offset_ob>                   → event payload bytes
 stats/<group>                             → {staged_bytes, first_staged_ts, last_staged_ts, row_count}
 sched_age/<first_staged_ts_ob><group>     → ∅
-offsets/<group>                           → staged (topic, partition, first, last) spans
-prepared/<group><first_offset_ob>         → persisted commit request (v4 envelope)
+prepared/<group><first_offset_ob>         → persisted commit request (v5 envelope)
+meta/fence                                → the consumer's fence probe (not a row)
 ```
 
 `<group>` is the partition tuple, prefix-free: `arity u8`, then per
@@ -126,7 +130,9 @@ component a tag byte (null / present) and, when present, `u16 length +
 UTF-8` wire string; an unpartitioned table's tuple is empty. `_ob` is
 offset binary (`value + 2^63` as a big-endian u64), so byte order is
 numeric order, negatives included. No separators: the group is
-self-delimiting and the timestamp/offset fields are fixed-width.
+self-delimiting and the offset fields are fixed-width. The Kafka record
+timestamp is never read: it is in no key, and the staging stats
+(`first_staged_ts`, `last_staged_ts`) are the consumer's staging clock.
 
 The keyspace carries no partition component: the instance *is* the
 partition. There is no quarantine: a record that can never become a row
@@ -169,11 +175,9 @@ idempotency keys never collide, and a partition's replay only ever
 re-puts its own staged keys.
 
 - `rows` keys are ordered so one group's staged slice is a contiguous
-  range scan, approximately time-ordered on arrival — approximately,
-  because the row key's timestamp is the Kafka RECORD time while the
-  catalog's sort spec is the payload's event time, which late and skewed
-  events invert constantly. The flush therefore does not trust staging
-  order: `build_prepared_plan` sorts the Arrow batch by the live
+  range scan in Kafka offset (arrival) order, while the catalog's sort
+  spec is the payload's event time, which late and skewed events invert
+  constantly. The flush therefore does not trust staging order: `build_prepared_plan` sorts the Arrow batch by the live
   `sort_spec` (fields, directions, null placement) before the partition
   fanout, so every registered file is key-nondecreasing under the spec
   compaction's sortedness checks enforce — the bounded scan stays
@@ -223,20 +227,15 @@ staged-range scan is capped in rows and bytes
 (`ceil(target_output_bytes ÷ ratio × 1.25)` staged bytes, floored at
 `MILLRACE_FLUSH_SCAN_MIN_BYTES`, default 64 MiB — the floor keeps toy
 targets from fragmenting flushes; rows capped at
-`MILLRACE_FLUSH_SCAN_MAX_ROWS`). The flush window is derived from the
-SCANNED rows: their own offset span when the scan covered the group's
-whole staged slice (the steady state — caps do not bind, and staged
-offsets only ever grow past a scan snapshot, so the span's settlement
-deletes exactly the published rows). Only a TRUNCATED scan narrows to
-`[first_scanned_offset, K]`, the covered offset prefix: the `offsets/`
-record holds one `[first, last]` span per staged batch (arrival
-structure — a sound over-approximation of the group's staged offsets,
-since a span's interior can name another group's offsets), so a
-record-timestamp inversion straddling the cap still shrinks the window
-rather than settling a row the flush never saw — conservatively, never
-past the first span offset the scan missed. Leftover rows simply
-re-decide on the next sweep; the window/prepared machinery below
-already handles arbitrary sub-windows. A single record larger than the
+`MILLRACE_FLUSH_SCAN_MAX_ROWS`). The flush window is the SCANNED rows'
+own offset span, `[first_scanned_offset, last_scanned_offset]`, capped
+or not: row keys sort by `(group, offset)`, so a capped scan is an exact
+offset prefix of the group's staged rows and no unscanned row of the
+group lies inside the span (staged offsets only grow past a scan
+snapshot), so the span's settlement deletes exactly the published rows.
+Leftover rows re-decide on the next sweep: a group of N rows drains in
+⌈N ÷ cap⌉ windows however it interleaves with other groups in the
+partition. A single record larger than the
 budget still flushes alone (one staged record is bounded by the
 broker's message limit; the alternative is a wedged key).
 
@@ -267,12 +266,16 @@ exactly the surviving `prepared/` entries — a crash between commit and
 delete leaves the entry, and recovery receipt-checks it (a 200 settles
 the range locally with zero republication; a 404 replays the persisted
 bytes byte-identically, and the server's receipt dedupes a landing
-replay). The `prepared/` envelope (v4, the only version) carries the
+replay). The `prepared/` envelope (v5, the only version) carries the
 idempotency key's derivation inputs — `topic`, `partition` and the
 partition tuple as hoglake partition values (field names beside wire
 strings) — beside the key and body, so a recovered entry is
 self-describing and recovery cross-checks it against the stage's own
-identity and its `prepared/` key; it also carries `persisted_at`, which
+identity and its `prepared/` key; it records `row_count`, the rows the
+window held when the request was built, which every recovery settle
+uses as its expected count (a window holding a different count by then
+halts `settlement_mismatch`, rolled back, rather than settling a row
+the commit did not publish); and it carries `persisted_at`, which
 the replay logs as the entry's age and which gates nothing: a 404 is
 replayed whatever the age, and a replay answered 410 re-prepares from
 the staged rows (§Delivery semantics). Recovery also
@@ -314,8 +317,10 @@ shape (AGENT.md invariant 12 exists because of that shape):
   prefix) **before** publication and is never regenerated after an
   ambiguous response; the idempotency key derives from
   `(table_uuid, topic, partition, partition tuple, first_offset,
-  last_offset)` of the staged range (the name line is
-  `millrace:v2:table=<uuid>:topic=<t>:partition=<n>:group=<k0=…/k1=…>:offsets=<first>-<last>`,
+  last_offset, content digest)` of the staged range — the digest a
+  SHA-256 over the window's rows in offset order, so the key names the
+  window's CONTENT, not only its bounds (the name line is
+  `millrace:v3:table=<uuid>:topic=<t>:partition=<n>:group=<k0=…/k1=…>:offsets=<first>-<last>:digest=<hex>`,
   the tuple's wire strings under POSITIONAL names, percent-encoded —
   a function of the staged tuple alone, so no spec change can move the
   key; display names such as
@@ -329,7 +334,18 @@ shape (AGENT.md invariant 12 exists because of that shape):
   key writes fresh objects). A verbatim replay sends the persisted bytes
   and so names the persisted objects, and the server's receipt dedupes
   it; the same rows re-flushed produce the same request apart from the
-  build token.
+  build token. Because of that token a FRESH build of content that
+  already landed would be answered 422 reused-key, so a fresh build
+  looks its key's receipt up before it builds (retrying transient
+  failures on the publish ladder): a 200 means this exact content
+  landed and the window settles locally with nothing uploaded or
+  published (`millrace_flush_deduped_total`). Different rows under the
+  same bounds (a recreated topic, an offset restart, a re-key) have
+  another key and publish as a new commit — never settled from another
+  commit's receipt. A 422 reused-key halts on both paths: on a fresh
+  publish another writer committed this content after the lookup, on a
+  persisted entry's verbatim replay a foreign writer or broken
+  determinism.
 - An answered refusal is judged, not retried, and never deletes staged
   rows. Every answered 4xx outside the named arms — a proxy's 401/403,
   an ingress's 413, a request-shape `validation` 422, a per-record
@@ -372,13 +388,23 @@ from the still-staged rows (below).
 
 That absorption has a precise boundary: replay is idempotent only for
 rows still **staged**. A re-consumed record re-puts the same `rows/`
-key, so replays of not-yet-flushed ranges rewrite staged state in place.
-Below the settled floor — a range already flushed, receipt-confirmed
-and deleted from staging — a replay re-stages those rows as new keys
-and re-flushes them under **new** idempotency keys: the destination
-sees duplicate rows that nothing dedupes. That replay happens exactly
-when a partition restarts from `earliest` across a settlement boundary:
-a changed `MILLRACE_KAFKA_GROUP_ID`, or offsets aged out of
+key (`(partition tuple, offset)`), so replays of not-yet-flushed ranges
+rewrite staged state in place. Below the settled floor — a range
+already flushed, receipt-confirmed and deleted from staging — the
+re-consumed records stage again, and a fresh build looks its window's
+content-derived key up before building. The dedupe is content-exact:
+only a rebuilt window with the group, bounds AND rows of a published
+one (an identical rewind) has that window's key, and its receipt
+answers 200 and the window settles with nothing republished, as long
+as the receipt is within retention. When the bounds differ (the scan
+caps or the rows staged at flush time cut the window differently) or
+the rows differ under the same bounds, the key is new and the window
+publishes as a new commit — its shared rows land twice, as do rebuilt
+windows whose receipts were purged. A nonzero
+`millrace_flush_deduped_total` therefore means a rewind re-staged
+identical data. That replay happens exactly when a
+partition restarts from `earliest` across a settlement boundary: a
+changed `MILLRACE_KAFKA_GROUP_ID`, or offsets aged out of
 `__consumer_offsets`.
 
 Where consumption starts when no committed offset exists is therefore a
@@ -395,7 +421,8 @@ either setting.) `earliest` remains available for a deployment that
 would rather replay than skip. Either setting faces the same
 settled-floor boundary above — millrace's per-partition staged state
 makes a replay idempotent above it, and below it re-consumed records
-publish under new keys — so the choice is operational, not semantic. The
+dedupe only where a rebuilt window matches a published one in bounds
+and content while its receipt survives — so the choice is operational, not semantic. The
 operators' levers are therefore **group-id stability** (a pipeline's
 group never changes) and **offset retention**
 (`offsets.retention.minutes` must outlive any window in which a dark

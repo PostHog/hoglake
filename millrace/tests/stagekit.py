@@ -44,9 +44,10 @@ def g(team: int) -> tuple[str | None, ...]:
 
 
 def rec(team: int, ts: int, offset: int, payload: bytes | None = None) -> StagedRecord:
+    """A staged record of tuple ``g(team)`` at ``offset``. ``ts`` only
+    shapes the default payload text (records carry no timestamp)."""
     return StagedRecord(
         group=g(team),
-        event_ts_us=ts,
         offset=offset,
         payload=payload
         if payload is not None
@@ -61,7 +62,9 @@ def window(team: int, first: int, last: int) -> FlushedKey:
     return FlushedKey(g(team), first, last, group_fields=FIELDS)
 
 
-def prepared(key: str, *, team: int, first: int = 0, at: int = NOW) -> PreparedRequest:
+def prepared(
+    key: str, *, team: int, first: int = 0, at: int = NOW, rows: int = 0
+) -> PreparedRequest:
     """A persisted prepared request for tuple ``g(team)`` on events[0]."""
     return PreparedRequest(
         idempotency_key=key,
@@ -71,6 +74,7 @@ def prepared(key: str, *, team: int, first: int = 0, at: int = NOW) -> PreparedR
         partition=0,
         group=g(team),
         group_fields=FIELDS,
+        row_count=rows,
     )
 
 

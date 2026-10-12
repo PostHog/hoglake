@@ -28,7 +28,6 @@ async def test_s3_staging_smoke(lake_home, topic_factory):
     records = [
         StagedRecord(
             group=("7",),
-            event_ts_us=base + i,
             offset=i,
             payload=livekit.event_payload(7, base + i, i),
         )

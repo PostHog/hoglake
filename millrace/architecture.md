@@ -18,10 +18,10 @@ Kafka partition. The consume loop parses each record's value as a JSON
 object, computes the destination table's **partition tuple** for it (the
 `partition_values` a file of that row would carry under the table's live
 partition spec), and writes the record into SlateDB keyed by
-`(partition tuple, record timestamp, offset)`; it commits Kafka offsets
-once the write is durable on the object store. An independent flush loop
-decides per partition tuple (a *group*) when enough has accumulated
-(size, age, or slow lane), reads that group's staged range, writes
+`(partition tuple, offset)`; it commits Kafka offsets once the write is
+durable on the object store. An independent flush loop decides per
+partition tuple (a *group*) when enough has accumulated (size, age, or
+slow lane), reads an offset prefix of that group's staged rows, writes
 parquet (one file per tuple under the live spec — exactly one in the
 steady state), persists the complete commit request, publishes it, and
 deletes exactly the published rows after the server's receipt.
@@ -36,7 +36,8 @@ publication:
   commit receipt, or with no commit when the flush dropped every row of
   the window.
 - Every commit carries an idempotency key derived from `(table_uuid,
-  topic, partition, partition tuple, first_offset, last_offset)`, and the request
+  topic, partition, partition tuple, first_offset, last_offset, content
+  digest)` — the digest a SHA-256 over the window's rows — and the request
   bytes are persisted before the first send. A replay republishes the
   same bytes under the same key and the server's receipt collapses it
   into one commit. A `prepared/` entry whose receipt lookup 404s is
@@ -45,11 +46,21 @@ publication:
   expiry floor) and the window is re-prepared from the staged rows; if
   the first attempt had landed, the window lands a second time. That
   is accepted at-least-once behaviour and is counted (section 6).
-- Otherwise duplicates appear only below the *settled floor*: if consumption
-  restarts at an offset whose rows were already flushed and deleted
-  from staging (a changed `MILLRACE_KAFKA_GROUP_ID`, offsets aged out of
-  `__consumer_offsets` under `earliest`), those records stage as new rows
-  and publish under new keys.
+- Otherwise duplicates appear only below the *settled floor*: if
+  consumption restarts at an offset whose rows were already flushed and
+  deleted from staging (a changed `MILLRACE_KAFKA_GROUP_ID`, offsets
+  aged out of `__consumer_offsets` under `earliest`), the re-consumed
+  records stage again. The dedupe is CONTENT-EXACT: a fresh build looks
+  its window's key up before it builds (section 5, step 5), and the key
+  names the window's rows, so only a rebuilt window with the same
+  group, the same bounds AND the same rows (an identical rewind)
+  settles from the published window's receipt with nothing republished
+  (`millrace_flush_deduped_total`), and only while that receipt is
+  within retention. Anything else — bounds the scan caps or the staged
+  set cut differently, or different rows under the same bounds (a
+  recreated topic, an offset restart, a re-key) — has another key and
+  publishes as a new commit: duplicates of the shared rows, never a
+  silent settle.
 
 **What it is not.**
 
@@ -186,8 +197,8 @@ from the live spec's (keyed under an older spec) is named positionally,
 ### Key layout
 
 Encoding rules (`keyspace.py` module docstring): integers are fixed-width
-big-endian with no separators; signed values in keys (timestamps,
-offsets) use offset binary (`value + 2^63` as u64) so byte order equals
+big-endian with no separators; signed values in keys (offsets,
+`first_staged_ts`) use offset binary (`value + 2^63` as u64) so byte order equals
 numeric order, negatives included; every value starts with a 1-byte
 version and readers refuse unknown versions. The group (`<group>` below,
 `keyspace.py:encode_group`) is prefix-free: `arity u8`, then per
@@ -197,17 +208,17 @@ prefix-free, so a tuple whose components are a byte prefix of another's
 (`(a,)` under an older one-field spec vs `(a, b)`) never shares a key
 prefix with it, and the range helpers (`group_rows_range`,
 `group_prepared_range`) take the prefix successor of the full
-`prefix + group` bytes. Keys parse their fixed-width timestamp/offset
-fields off the end; `decode_group` refuses anything that is not exactly
-one well-formed tuple.
+`prefix + group` bytes. Keys parse their fixed-width offset field off
+the end; `decode_group` refuses anything that is not exactly one
+well-formed tuple.
 
 | Prefix | Key bytes | Value | Written by | Read by | Deleted by |
 |---|---|---|---|---|---|
-| `rows/` | `rows/` + group + record_ts_us i64ob + offset i64ob | Raw Kafka payload bytes | `stage.py:PartitionStage.stage_batch` | `scan_group_rows_bounded`, `scan_group_rows` (flush, recovery) | Settlement transaction (`commit_flushed`) |
+| `rows/` | `rows/` + group + offset i64ob | Raw Kafka payload bytes | `stage.py:PartitionStage.stage_batch` | `scan_group_rows_bounded`, `scan_group_rows` (flush, recovery) | Settlement transaction (`commit_flushed`), every key in `keyspace.py:window_rows_range` |
 | `stats/` | `stats/` + group | v1, 33 B: `staged_bytes u64, first_staged_ts i64, last_staged_ts i64, row_count u64` | `stage_batch` (merge) | `iter_key_stats` (planner + gauges), `read_group_stats` (age/slow point reads) | Settlement (subtract, or delete on drain), `reconcile_stats` |
 | `sched_age/` | `sched_age/` + first_staged_ts i64ob + group | empty | `stage_batch`, when the group's stats entry is created | `iter_sched_age_through` (flush sweep) | Settlement on drain, `reconcile_stats` |
-| `offsets/` | `offsets/` + group | v1: count u16, then per range `topic_len u16, topic, partition u32, first i64, last i64`, sorted canonically | `stage_batch` (one span per group per batch; overlapping spans coalesced) | `read_offsets` (flush window and commit message) | Settlement clips the window out; key dropped with its last range |
-| `prepared/` | `prepared/` + group + first_offset i64ob | v4: `idempotency_key, topic, partition`, the group as hoglake partition values (`arity u8`, then per field `name, tag, value?`), `body` (exact request bytes), `persisted_at u64 µs`. Only v4 decodes. | `persist_prepared` (flush, before publication) | `list_prepared` (per-group gate), `load_prepared` via `recover` | Settlement transaction, `drop_prepared` (re-prepare) |
+| `prepared/` | `prepared/` + group + first_offset i64ob | v5: `idempotency_key, topic, partition`, the group as hoglake partition values (`arity u8`, then per field `name, tag, value?`), `body` (exact request bytes), `persisted_at u64 µs`, `row_count u64` (rows the window held at the scan: the recovery settle's expected count). Only v5 decodes. | `persist_prepared` (flush, before publication) | `list_prepared` (per-group gate), `load_prepared` via `recover` | Settlement transaction, `drop_prepared` (re-prepare) |
+| `meta/` | `meta/fence` (one key per instance) | v1, 9 B: `offset i64` (the probing poll's last handled offset; forensic) | `PartitionStage.probe_fence` (consumer, a poll that handled records on the partition but staged none) | nothing (not a row: no scan, stats entry or gauge reads `meta/`) | overwritten by the next probe |
 | `flushed/` | legacy | legacy marker | nothing on this branch | nothing (not decoded) | `recover` collects leftovers in pages of 1000 |
 
 `first_staged_ts` is set once, when a group's stats entry is created, and
@@ -215,22 +226,26 @@ never advanced by later arrivals; it is born again only after a flush
 drains the group's last row. After a partial settlement it keeps the
 older timestamp, which can only make the remaining rows flush earlier.
 
-Three durable units touch these prefixes. Everything one poll stages
-into one partition (rows, stats, sched, offsets) is one
-`WriteBatch`, and `stage_batch` returns only after `await_durable()`, so
-accounting cannot drift from data even on a hard kill. `persist_prepared`
-is one durable `WriteBatch`. Settlement (`commit_flushed`) is one
+Four durable units touch these prefixes. Everything one poll stages
+into one partition (rows, stats, sched) is one `WriteBatch`, and
+`stage_batch` returns only after `await_durable()`, so accounting cannot
+drift from data even on a hard kill. `persist_prepared` is one durable
+`WriteBatch`; so is `probe_fence` (one put). Settlement (`commit_flushed`) is one
 `SERIALIZABLE_SNAPSHOT` transaction run only with the receipt in hand
 (or with no commit at all, when the flush dropped every row of the
 window), so the only ambiguous state after a crash is a
 surviving `prepared/` entry. One asyncio lock per instance serializes
 this process's mutations (consume and flush share the instance); reads
 take no lock, and SlateDB iterators are snapshots as of creation.
-Row-key order is `(group, timestamp, offset)`, so no byte range narrower
-than the group's slice isolates an offset window: settlement scans the
-group's whole slice and deletes the keys whose offset lies in
-`[first_offset, last_offset]` (`keyspace.py:row_in_flushed_range`); other
-rows of the group survive. The settlement window type
+Row-key order is `(group, offset)`, so two things hold by
+construction. A scan of a group's slice cut short by a row or byte cap
+is an exact offset PREFIX of the group's staged rows: every staged row
+of the group between the first and the last scanned offset was scanned,
+however the group interleaves with others in the Kafka partition and
+whatever the record timestamps. And an offset window `[first_offset,
+last_offset]` of a group is one contiguous byte range
+(`keyspace.py:window_rows_range`): settlement deletes every key in it,
+and the group's rows outside it survive. The settlement window type
 (`keyspace.py:FlushedKey`) carries the group as hoglake partition values
 (field names beside wire strings).
 
@@ -238,20 +253,26 @@ rows of the group survive. The settlement window type
 
 `keyspace.py:idempotency_key` = UUIDv5 over namespace
 `70cd616a-eaef-5359-838c-573cb224e4f9` of
-`millrace:v2:table=<uuid>:topic=<topic>:partition=<n>:group=<k0=…/k1=…>:offsets=<first>-<last>`,
+`millrace:v3:table=<uuid>:topic=<topic>:partition=<n>:group=<k0=…/k1=…>:offsets=<first>-<last>:digest=<sha256 hex>`,
 the group rendered by `keyspace.py:group_key_form`: the tuple's wire
 strings under POSITIONAL names `k<i>` (percent-encoded, a null as a bare
 `k<i>`, empty for an unpartitioned table), e.g.
-`…:group=k0=42/k1=681:offsets=0-41`. The key is a pure function of the
-staged tuple: a spec change between an upload and a rebuild of the same
-window — even one of the same arity, which would rename the display
-fields — cannot change the key.
+`…:group=k0=42/k1=681:offsets=0-41:digest=c1d2…bfb5`. The digest is
+`keyspace.py:content_digest`: SHA-256 over the window's scanned rows in
+offset order, each framed `offset (i64 BE) || payload length (u64 BE)
+|| payload` (the length makes the framing injective), computed on the
+flusher's I/O pool right after the scan and before the receipt lookup.
+The key is a pure function of the staged tuple, the bounds and the
+rows: a spec change between an upload and a rebuild of the same window
+— even one of the same arity, which would rename the display fields —
+cannot change it, and different rows under the same bounds always do.
 
 | Input | Why |
 |---|---|
 | `table_uuid` (canonicalized) | Receipts survive a drop; a recreated table must not answer from its predecessor's receipt. |
 | `topic`, `partition` | Offsets are per partition. Without them two partitions flushing one group over the same offset range would share a key and object URIs. |
 | group (positional form), `first_offset`, `last_offset` | The flushed window. Both ends, because "up to N" is not a row set after a rewind. |
+| content digest | The window's rows. The receipt-first lookup settles a fresh window from an existing receipt, so the key must not let one set of rows answer for another: a recreated topic, an offset restart or a re-key can stage different rows under bounds that already have a receipt. |
 
 Parquet object names are
 `{data_path}/data/{namespace}/{table}/{idempotency_key}/{build}/{index}.parquet`,
@@ -287,9 +308,9 @@ sequenceDiagram
     C->>P0: stage_batch(rows)
     P0->>OS: WAL write
     OS-->>P0: durable
-  and
-    C->>P1: stage_batch(rows)
-    P1->>OS: WAL write
+  and a partition whose poll was all drops
+    C->>P1: probe_fence(last handled offset)
+    P1->>OS: WAL write (meta/fence)
     OS-->>P1: durable
   end
   C->>C: gather all results, check fence and errors
@@ -314,15 +335,18 @@ sequenceDiagram
    records without coordinates are counted and skipped, never committed
    past explicitly.
 4. **Stage concurrently**: one `stage_batch` task per partition with
-   staged rows,
+   staged rows, and one `probe_fence` task per partition the poll
+   handled but staged nothing on (every record dropped: a durable
+   one-put `WriteBatch` of `meta/fence`, awaited like a staged batch, so
+   a fenced writer fails here rather than commit; an empty batch cannot
+   serve — SlateDB refuses it, `test_slatedb_parity.py::test_a_single_put_batch_fences_and_an_empty_batch_is_refused`),
    `asyncio.gather(return_exceptions=True)`, so every partition's WAL
-   write and durability wait overlap and every batch settles before any
+   write and durability wait overlap and every write settles before any
    outcome is examined.
 5. **Commit** once, synchronously, for all touched partitions at
-   `last_handled + 1` (handled = staged or dropped; a partition whose
-   poll was all drops commits with no `stage_batch`), only if every
-   batch succeeded. Retry ladder: 3 attempts, 0.5 s then 1.0 s;
-   exhaustion raises (offsets unadvanced, restart replays).
+   `last_handled + 1` (handled = staged or dropped), only if every
+   batch and probe succeeded. Retry ladder: 3 attempts, 0.5 s then
+   1.0 s; exhaustion raises (offsets unadvanced, restart replays).
 
 ### The keyer
 
@@ -386,13 +410,14 @@ at once.
 
 | Where detected | Action |
 |---|---|
-| Consume: a `stage_batch` raises `Closed(FENCED)` | Close the fenced stages locally, raise `ConsumerFencedError` naming them. The failed batch's offsets are not committed. `/healthz` and `/readyz` 503 from that moment; the process exits 4, distinct from a crash because a restart onto the same assignment reopens the path, fences the new owner, and leaves two pods fencing each other with offsets never advancing. Any other `Closed` reason takes the generic error path. |
+| Consume: a `stage_batch` or `probe_fence` raises `Closed(FENCED)` | Close the fenced stages locally, raise `ConsumerFencedError` naming them. The poll's offsets are not committed (a stream of 100 % drops is caught by the probe, `test_consumer.py::test_an_all_drops_poll_on_a_fenced_stage_halts_without_committing`). `/healthz` and `/readyz` 503 from that moment; the process exits 4, distinct from a crash because a restart onto the same assignment reopens the path, fences the new owner, and leaves two pods fencing each other with offsets never advancing. Any other `Closed` reason takes the generic error path. |
 | Flush: any `SlateError.Closed` at recovery, planning or mid-decision | `FlushRunner._note_fenced`: the partition leaves flush scheduling, logged once, listed in `fenced_partitions` and `millrace_flush_partition_fenced`; `/healthz` 503s. The mark clears when the assignment revokes the partition. This is how an idle partition's fence surfaces. |
 
 ### Dropped records
 
-A record that can never become a row is dropped: nothing is written for
-it, and the offset commit covers it trivially. `classify_message`
+A record that can never become a row is dropped: no row is written for
+it, and the offset commit covers it (after the partition's staged batch,
+or its fence probe when the poll staged nothing there). `classify_message`
 returns `stage.py:DroppedRecord(offset, reason)`; `_note_drop` counts it
 in `millrace_records_dropped_total{reason}` and logs it at WARNING with
 topic, partition, offset and the full reason, at most one line per
@@ -400,15 +425,18 @@ topic, partition, offset and the full reason, at most one line per
 monotonic clock — the first drop of a reason always logs, a later line
 carries the count suppressed since the last one.
 
+The Kafka record timestamp is never read: rows are keyed `(group,
+offset)` and the `stats/` timestamps are the staging clock, so a record
+with or without one (`TIMESTAMP_NOT_AVAILABLE`) stages the same way.
+
 | Reason (log) | Label | Cause |
 |---|---|---|
 | `invalid_offset` | same | Offset < 0 or > int64 max |
-| `missing_timestamp` / `invalid_timestamp` | same | `TIMESTAMP_NOT_AVAILABLE`, or ms × 1000 overflows int64 |
 | `missing_value` | same | Tombstone |
 | `malformed_value` | same | The value is not a strict JSON object (not JSON, not an object, NaN/Infinity literals) |
 | `malformed_partition_source:<path>` | `malformed_partition_source` | A partition source scalar is the wrong JSON type, fails its column's coercion, cannot take the transform (e.g. an instant outside Python's datetime range), sits under a non-object parent, or renders past 65,535 bytes; `<path>` is the source's dotted path, kept out of the label (`consumer.py:drop_reason_label`). An absent or null source is a null component, not a drop. |
 
-The flush drops records too (section 5, step 6); those share the
+The flush drops records too (section 5, step 7); those share the
 counter under their own reasons. The count is per classification: a
 poll whose batch fails and replays counts its drops again.
 
@@ -505,15 +533,19 @@ sequenceDiagram
   else none
     FL->>H: table read totals=false (only if shape cache cold or stale)
     FL->>ST: scan_group_rows_bounded(group, max_rows, max_bytes)
-    FL->>ST: read_offsets(group)
-    FL->>FL: window, idempotency key, build_prepared_plan (pure)
-    FL->>FL: count and log dropped records
-    FL->>L: upload parquet files
-    FL->>ST: persist_prepared(group, first_offset, exact body)
-    FL->>H: POST /v1/catalogs/c/commit/prepared
-    H-->>FL: CommitResult (receipt written server-side)
-    FL->>ST: commit_flushed(window) in one transaction
-    FL->>FL: guard deleted == scanned, observe ratio
+    FL->>FL: window = [first scanned, last scanned], idempotency key
+    FL->>H: GET /v1/catalogs/c/commit/receipts/{key}
+    alt 200: the window already landed
+      FL->>ST: commit_flushed(window), outcome deduped
+    else 404
+      FL->>FL: build_prepared_plan (pure); count and log dropped records
+      FL->>L: upload parquet files
+      FL->>ST: persist_prepared(group, first_offset, exact body)
+      FL->>H: POST /v1/catalogs/c/commit/prepared
+      H-->>FL: CommitResult (receipt written server-side)
+      FL->>ST: commit_flushed(window) in one transaction
+      FL->>FL: guard deleted == scanned, observe ratio
+    end
   end
 ```
 
@@ -537,13 +569,33 @@ sequenceDiagram
    flushed alone via a one-row probe. A zero-row scan is redelivery
    residue: `reconcile_stats` removes the stale `stats/` and
    `sched_age/` entries in a serializable transaction; outcome `empty`.
-4. **Window.** Untruncated scan (the steady state): `[min, max]` of the
-   scanned offsets. Truncated scan: `_covered_window` narrows to the
-   longest prefix whose `offsets/` spans the scan fully covers (record
-   timestamps are not offset-monotone); rows past it stay staged. The
-   message's offset ranges are the `offsets/` record clipped to the
-   window.
-5. **Build** (`build_prepared_plan`, pure, on the I/O pool): decode each
+4. **Window.** `[first scanned offset, last scanned offset]`, capped or
+   not: row keys sort by `(group, offset)`, so the scan is an exact
+   offset prefix of the group's staged rows and the window holds no
+   unscanned row of the group. Rows past a capped scan stay staged and
+   re-decide on a later sweep, so a group of N rows drains in
+   ⌈N ÷ cap⌉ windows however it interleaves with other groups
+   (`test_flush.py::test_interleaved_truncated_scans_drain_exactly`).
+   The commit message carries the window.
+5. **Content key, receipt first.** Hash the scanned rows
+   (`content_digest`, on the I/O pool) into the key, then, before
+   anything is built or uploaded, `GET …/commit/receipts/{key}`. The
+   lookup rides the publish ladder's transient arm (5xx, 408, 429 and
+   transport errors retried up to 8 times, delay floored by
+   `Retry-After`, one WARNING line per retry; exhaustion is a failed
+   decision retried next sweep, logged as one line without a trace —
+   `test_flush.py::test_an_exhausted_receipt_ladder_defers_the_decision_quietly`).
+   A 200 means this exact content already landed under these bounds (an
+   identical rewind below the settled floor): settle with
+   `commit_flushed`, guarded as in step 9, with nothing built, uploaded
+   or published; outcome `deduped`, counted in
+   `millrace_flush_deduped_total`, logged at INFO with the key and the
+   window. Without the lookup the rebuild's fresh object token would
+   make its body differ from the landed one and the server would answer
+   422 reused-key. A 404 proceeds; different rows under the same bounds
+   never reach a 200, because their key differs
+   (`test_flush.py::test_different_rows_under_the_same_bounds_never_settle_from_the_receipt`).
+6. **Build** (`build_prepared_plan`, pure, on the I/O pool): decode each
    payload as a JSON object against the table's columns
    (`JsonObjectDecoder`, the per-column coercers of
    `coerce.py:coercer_for`; undecodable or uncastable records are
@@ -567,7 +619,7 @@ sequenceDiagram
    where a container expects one is `uncastable_column`. Every decode
    failure carries the dotted catalog path of the refusing column or
    child (`DecodeError.path`, e.g. `properties.inner.id`, `attrs.key`),
-   which the drop log names (step 6). Nesting is bounded by
+   which the drop log names (step 7). Nesting is bounded by
    pyhoglake's `MAX_COLUMN_NESTING_DEPTH` (8). Apply the junk
    `event_time` window `[now − MILLRACE_EVENT_TIME_MAX_PAST_S, now +
    MILLRACE_EVENT_TIME_MAX_FUTURE_S]` to the decoded values of the
@@ -581,7 +633,7 @@ sequenceDiagram
    catalog type. The one record that still defeats the build is
    isolated and dropped (`uncastable_column`) so it cannot fail the
    batch. Sort by the table's live sort spec (staging
-   order is Kafka record time, the sort spec is payload time; a
+   order is Kafka offset order, the sort spec is payload time; a
    struct-leaf key is read by `pc.struct_field` into a shadow table);
    fan out by the live partition spec (a struct-leaf source likewise),
    one file per tuple (exactly one when the staged group was keyed
@@ -597,7 +649,7 @@ sequenceDiagram
    realized file is ≥ `max(1, int(target × 0.5))` bytes (262,144,000 B
    at default; smaller files register without stats and the server's
    hydrator backfills).
-6. **Drops.** The plan's dropped records are counted in
+7. **Drops.** The plan's dropped records are counted in
    `millrace_records_dropped_total{reason}` and logged, one WARNING per
    reason per decision naming the group, the offsets (the first 20)
    and, for a decode failure, the first refusing column's dotted path
@@ -612,14 +664,37 @@ sequenceDiagram
    a replayed poll). If every row was
    dropped there is no payload: the window settles via `commit_flushed`
    with no commit (outcome `dropped`).
-7. **Upload, then persist, then publish.** Upload failure counts the
+8. **Upload, then persist, then publish.** Upload failure counts the
    completed URIs as orphans and re-raises (contained); persist failure
    counts the whole fanout. The persisted body is
    `canonical_body(payload)`: compact JSON identical to what httpx sends.
-   `_publish` applies the ladders and refusal taxonomy below.
-8. **Settle** with `commit_flushed(window)`, then `_guard_settlement`:
-   rows deleted must equal rows scanned, else halt
-   `settlement_mismatch`. Feed the realized ratio to the EWMA.
+   `_publish` applies the ladders and refusal taxonomy below. The
+   persisted envelope records `row_count`, the rows the window held at
+   the scan. A 422 reused-key here halts `idempotency_key_reused`
+   naming the window and digest: the content's receipt answered 404 at
+   step 5, so another writer committed this content in between, and
+   this process never settles on a commit it did not make.
+9. **Settle** with `flush.py:HoglakeFlusher._settle` →
+   `commit_flushed(window, expected_rows=…)`: one transaction scans and
+   deletes every key in the window's byte range, subtracts `stats/` and
+   drops the `prepared/` entry, and BEFORE committing compares the
+   deleted count with the rows the commit published — the scanned count
+   here, the entry's persisted `row_count` on every recovery settle
+   (section 6), never a recount. On a mismatch it raises
+   `SettlementMismatchError`, the transaction rolls back, and the
+   flusher halts `settlement_mismatch`: nothing was deleted, stats and
+   the `prepared/` entry are untouched. A row that entered the window
+   after the scan (a rewind or re-key into this group) trips it. A
+   restart does not clear it while the entry stands: reconcile settles
+   against the same persisted count and halts again. Operator action:
+   confirm what the published snapshot holds, then drop the window's
+   `prepared/` entry (its rows re-flush as a new window) or re-consume
+   the window's offsets. The structural fix — settling by the scanned
+   KEYS rather than by a count over the range — is hoglake#351
+   (`test_flush.py::test_a_settlement_that_disagrees_with_the_scan_halts`,
+   continued through a restart;
+   `test_stage.py::test_a_settlement_count_mismatch_rolls_back_before_commit`).
+   Feed the realized ratio to the EWMA.
 
 The request body:
 
@@ -638,10 +713,9 @@ The message has no wall-clock or per-attempt content: line 1 is
 `millrace=v1 table=<uuid> group=<human form> trigger=<lane> records=…
 dropped=… files=… partitions=… staged_bytes=… arrow_bytes=…
 millrace=<version>`,
-line 2 is `offsets topic=<t> partition=<p> ranges=a-b,c-d` (above 16,384
-bytes it keeps the first and last ranges and elides the middle).
+line 2 is `offsets topic=<t> partition=<p> window=<first>-<last>`.
 Recovery parses the window back out of line 2
-(`parse_message_offsets`).
+(`parse_message_offsets`, which refuses anything else as corruption).
 
 ### Key lifecycle
 
@@ -653,9 +727,11 @@ stateDiagram-v2
   Staged --> Decided: a lane trips at a sweep
   Decided --> Empty: zero-row scan, reconcile_stats
   Decided --> Settled: every row dropped, commit_flushed with no commit
+  Decided --> Settled: receipt 200 before the build (deduped)
   Decided --> Staged: upload or persist fails, orphans counted
   Decided --> Prepared: persist_prepared
   Prepared --> Committed: commit returns, or receipt 200 at recovery
+  Prepared --> Halted: 422 reused-key (fresh publish or verbatim replay), settlement_mismatch
   Prepared --> Staged: ddl_since_read_snapshot, or 410 at recovery, entry dropped
   Prepared --> Prepared: ladder exhausted, replayed next sweep
   Prepared --> Halted: other answered 4xx, table_recreated, table_dropped, 410 on a fresh publish
@@ -681,7 +757,8 @@ nothing: the payload is never resent.
 | 410 read snapshot expired, fresh publish (`flush_key`) | halt | `FlushHalted("read_snapshot_expired")` with the server's reconcile detail; uploads orphan-accounted | `test_410_halts_with_the_servers_reconcile_instructions` |
 | 410 read snapshot expired, recovered entry's replay (`reconcile_prepared`) | re-prepare | Uploads counted unresolved, not orphaned (section 6); `drop_prepared`, outcome `reprepare` (`millrace_prepared_reprepared_total{reason="read_snapshot_expired"}`); rows re-decide next sweep against a fresh read | `test_a_410_at_reconcile_reprepares_and_never_halts`, `test_the_runner_reprepares_an_aged_survivor_on_410_without_halting` |
 | 404 destination | halt | `FlushHalted("destination_missing")` | — |
-| 422 `idempotency_key reused` | halt | `FlushHalted("idempotency_key_reused")`: foreign writer or broken determinism | `test_422_reused_idempotency_key_halts` |
+| 422 `idempotency_key reused`, fresh publish (`flush_key`) | halt | `FlushHalted("idempotency_key_reused")` naming the window and content digest: the key's receipt answered 404 before the build, so another writer committed this content in between; rows and entry kept, uploads orphan-accounted | `test_a_fresh_publish_answered_422_reused_halts` |
+| 422 `idempotency_key reused`, recovered entry's verbatim replay (`reconcile_prepared`) | halt | `FlushHalted("idempotency_key_reused")`: the bytes are the ones first sent, so the key's receipt is for another request — a foreign writer or broken determinism | `test_a_verbatim_replay_answered_422_reused_still_halts` |
 | Any other answered 4xx (400, 401, 403, 413, any other 422 — request-shape `validation` or `record_validation`) except 408/429 | halt | `FlushHalted("commit_refused")`, rows and `prepared/` entry kept; no answered refusal deletes staged rows | `test_422_request_shape_halts_with_rows_staged`, `test_422_record_validation_halts_with_rows_staged`, `test_answered_4xx_halts_with_rows_staged` |
 | 503 `commit_queue_timeout`, other 5xx, 408, 429 | ambiguous | Resend identical bytes; up to 8 attempts, delay `max(min(0.5 × 2^(n−1), 30), Retry-After)`; then `FlushPublishExhausted`, entry kept | `test_503_commit_queue_timeout_backs_off_per_retry_after` |
 | Transport error (httpx/OSError) | ambiguous | Same as 5xx | `test_dropped_commit_response_replays_persisted_bytes_in_process` |
@@ -722,7 +799,10 @@ ambiguity set.
    `first_offset` differs from the key's. A refused entry is left in
    place: the runner logs it and retries it every tick until an operator
    removes it.
-2. Scan the group's rows in the parsed window (the settle guard's count).
+2. The settle guard's expected count is the envelope's persisted
+   `row_count` (the rows the window held when the request was built),
+   never a recount: a row that entered the window later was not in the
+   published commit.
 3. `GET /v1/catalogs/{catalog}/commit/receipts/{idempotency_key}`.
    - **200**: settle locally with `commit_flushed`, zero republication,
      regardless of the entry's age. Outcome `receipt_settled`.
@@ -790,8 +870,12 @@ ambiguous between "never landed" and "landed, receipt purged".
 | Commit landed, response lost or crash before settle | `prepared/` entry, server receipt | Receipt 200 → local settle, zero republication |
 | Publish ladder exhausted | `prepared/` entry | Next sweep reconciles receipt-first |
 | Commit landed, entry outlived the server's receipt retention | `prepared/` entry, receipt purged | Receipt 404 → verbatim replay → 410 → entry dropped, objects counted unresolved, rows re-prepared next sweep; the window lands twice (counted). Without a snapshot floor the replay itself lands twice |
+| Consumption restarts below the settled floor (changed group id, offsets aged out under `earliest`) | Re-consumed records staged again | Each fresh build hashes its window into the key and looks it up first: a window identical to a published one (same group, bounds and rows) settles from its receipt, outcome `deduped`, nothing republished, while the receipt exists; past receipt retention, with other bounds, or with other rows under the same bounds, it publishes as a new commit (duplicates of the shared rows) |
+| Another writer commits the same content between a fresh build's receipt lookup and its publish | Objects in lake, `prepared/` entry | The publish is answered 422 reused-key: halt `idempotency_key_reused` (window and digest named), rows and entry kept, this build's objects counted orphans |
+| The receipt lookup keeps failing transiently (5xx, 408, 429, transport) | Nothing built | Ladder of 8 attempts, then the decision fails with one WARNING line and retries next sweep |
+| `settlement_mismatch` halt | Nothing: the settle transaction rolled back before commit (rows, `stats/`, `prepared/` entry untouched); exit 3 | The window holds rows that were not in the published commit (a rewind or re-key after the scan). A restart reconciles the entry against its persisted `row_count` and halts again. Operator: confirm what the published snapshot holds, then drop the window's `prepared/` entry (its rows re-flush as a new window) or re-consume its offsets. Structural fix: settle by the scanned keys (hoglake#351) |
 | Partition reassigned to another pod | DB at the partition's path | New owner opens it, `recover()` returns the entries, first sweep reconciles them |
-| Contested open (rollout overlap) | Two writers on one path | Old writer fenced: consumer exits 4, flush fences the partition out |
+| Contested open (rollout overlap) | Two writers on one path | Old writer fenced at its next staged batch or fence probe (a poll of only drops), before that poll commits: consumer exits 4; flush fences the partition out |
 | Table dropped and recreated | Pinned uuid stale | Halt `table_recreated` at the next shape refresh or commit |
 
 ## 7. Maintenance service
@@ -913,12 +997,13 @@ feeds control flow.
 |---|---|---|---|
 | `millrace_messages_consumed_total` | counter | — | Kafka messages returned by `consume()` |
 | `millrace_records_staged_total` | counter | — | Rows durably staged |
-| `millrace_records_dropped_total` | counter | `reason` | Malformed records dropped, consume and flush time (section 4, "Dropped records"; section 5, step 6). Consume reasons: `invalid_offset`, `missing_timestamp`, `invalid_timestamp`, `missing_value`, `malformed_value`, `malformed_partition_source`. Flush reasons: `undecodable_payload`, `uncastable_column`, `event_time_out_of_window` |
+| `millrace_records_dropped_total` | counter | `reason` | Malformed records dropped, consume and flush time (section 4, "Dropped records"; section 5, step 7). Consume reasons: `invalid_offset`, `missing_value`, `malformed_value`, `malformed_partition_source`. Flush reasons: `undecodable_payload`, `uncastable_column`, `event_time_out_of_window` |
 | `millrace_kafka_commits_total` | counter | — | Offset commit attempts, including retries |
 | `millrace_flushes_committed_total` | counter | — | Decisions committed by this process |
 | `millrace_prepared_replays_total` | counter | — | `prepared/` entries republished verbatim on a receipt 404 and accepted (any age). The response does not say whether the server deduped it, so there is no outcome label. Each replay logs the entry's age |
 | `millrace_prepared_reprepared_total` | counter | `reason` (`ddl_since_read_snapshot`, `read_snapshot_expired`) | `prepared/` entries dropped and rebuilt from the staged rows (fresh publish or recovered entry); `read_snapshot_expired` is a recovered entry's replay answered 410 (section 6) |
-| `millrace_receipt_settlements_total` | counter | — | Entries settled from a receipt 200 |
+| `millrace_receipt_settlements_total` | counter | — | `prepared/` entries settled from a receipt 200 at reconcile |
+| `millrace_flush_deduped_total` | counter | — | Fresh windows whose exact content (group, bounds and rows) already had a receipt at the pre-build lookup, settled with nothing new committed (section 5, step 5); each logs the key and window at INFO. Nonzero means a rewind re-staged identical data |
 | `millrace_flush_rows_published_total` | counter | — | Rows in committed files |
 | `millrace_flush_files_written_total` | counter | — | Parquet files committed |
 | `millrace_flush_orphaned_uploads_total` | counter | — | Uploaded objects no commit references (upper bound; names are logged) |
@@ -1004,8 +1089,8 @@ object storage.
 | Staging | `MILLRACE_STAGE_URL` → `{base}/{topic}/{partition}/` (SlateDB `manifest/`, `wal/`, `compacted/` …) | `AWS_*` |
 | Parquet | `{catalog.data_path}/data/{namespace}/{table}/{idempotency_key}/{build}/{index}.parquet` | `HOGLAKE_S3_*` or ambient |
 
-**Staging format.** This keyspace (partition-tuple groups, `prepared/`
-v4) is not readable by, and cannot read, staging written by the
+**Staging format.** This keyspace (partition-tuple groups, `(group,
+offset)` row keys, `prepared/` v5) is not readable by, and cannot read, staging written by the
 #331-era team-keyed layout: every key and value shape changed. Point
 millrace at a FRESH staging root (a new `MILLRACE_STAGE_URL` prefix).
 There is no code guard: an old root fails at open or at the first sweep
@@ -1038,6 +1123,16 @@ cooperative for deployments without a barrier.
   serial and 286 keys/s at concurrency 4 on in-memory stages against
   the ~110 keys/s the design arithmetic requires
   (`tests/test_flush_bench.py`, design doc).
+- Content digest per decision: SHA-256 over at most the scan budget
+  (3,276,800,000 B ≈ 3.05 GiB at defaults) plus 16 framing bytes per
+  row, on the flusher's I/O pool (hashlib releases the GIL), never the
+  event loop. Measured with `keyspace.content_digest` on an Apple M4 Pro
+  (hardware SHA-256): 0.93 GiB of 1,000 B rows in 0.42 s (2.2 GiB/s),
+  so a full-budget scan costs about 1.4 s; at the 8,000,000-row cap
+  with 100 B rows, 1.3 s (per-row overhead dominates). An x86 host
+  without SHA extensions runs SHA-256 at roughly a quarter of that
+  rate, i.e. several seconds per catch-up decision; steady-state windows
+  are a group's staged slice, far smaller.
 - No fixed partition or pod count is prescribed; metric cardinality
   assumes tens of partitions per pod.
 
@@ -1062,12 +1157,12 @@ Each is pinned by the named test(s) under `tests/`.
 
 | # | Invariant | Tests |
 |---|---|---|
-| 1 | Offsets commit only after the staged batch is remotely durable; a dropped record needs no ack. | `test_consumer.py::test_end_to_end_staged_rows_and_committed_offsets_cover`, `test_stage.py::test_offset_commit_invariant_call_order`, `test_stage.py::test_ack_hook_fires_only_after_remote_durability`, `test_stage.py::test_every_write_path_awaits_durability_before_returning` |
+| 1 | Offsets commit only after the staged batch is remotely durable; a poll whose records on a partition all dropped commits after a durable fence probe instead. | `test_consumer.py::test_end_to_end_staged_rows_and_committed_offsets_cover`, `test_consumer.py::test_a_poll_of_only_dropped_records_still_commits`, `test_stage.py::test_offset_commit_invariant_call_order`, `test_stage.py::test_ack_hook_fires_only_after_remote_durability`, `test_stage.py::test_every_write_path_awaits_durability_before_returning` |
 | 2 | One poll's partitions stage concurrently, and the single commit follows every ack. | `test_consumer.py::test_partitions_stage_concurrently_within_one_poll` |
 | 3 | A failed stage or exhausted commit ladder commits nothing. | `test_consumer.py::test_a_failed_batch_commits_nothing`, `test_consumer.py::test_commit_exhaustion_raises_without_committing` |
 | 4 | Every acknowledged row survives SIGKILL, byte-exact, batch-atomic, with stats reconciled. | `test_stage_integration.py::test_durability_across_hard_kill` |
 | 5 | `first_staged_ts` is set once and survives partial flushes. | `test_stage.py::test_first_staged_ts_is_set_once`, `test_stage.py::test_first_staged_ts_survives_a_partial_flush` |
-| 6 | Settlement deletes exactly the offset window and spares other rows of the group. | `test_stage.py::test_commit_flushed_deletes_exactly_the_window` (hypothesis), `test_keyspace.py::test_pending_delete_spares_younger_ranges_of_the_same_group` |
+| 6 | Settlement deletes exactly the offset window — one contiguous key range — and spares other rows of the group. | `test_stage.py::test_commit_flushed_deletes_exactly_the_window` (hypothesis), `test_stage.py::test_successive_capped_windows_settle_exactly`, `test_keyspace.py::test_flushed_window_selects_exactly_its_own_rows`, `test_keyspace.py::test_a_settlement_spares_younger_and_older_rows_of_the_same_group`, `test_keyspace.py::test_window_rows_range_golden_and_boundaries` |
 | 7 | Settlement writes no `flushed/` marker; recovery collects legacy ones in bounded pages. | `test_stage.py::test_commit_flushed_writes_no_marker`, `test_stage.py::test_recover_collects_many_legacy_markers_in_bounded_pages` |
 | 8 | A persisted request is replayed byte-identically, in process and across restart; the persisted body is the wire body. | `test_flush.py::test_dropped_commit_response_replays_persisted_bytes_in_process`, `test_flush.py::test_crash_between_upload_and_commit_recovers_byte_identically`, `test_flush.py::test_prepared_body_is_the_wire_body` |
 | 9 | The same staged range produces the same request (same idempotency key) in a fresh process, apart from the per-build object-name token, which differs; no build PUTs a path an earlier build used. | `test_flush.py::test_same_staged_range_flushes_byte_identically_across_processes` |
@@ -1077,21 +1172,21 @@ Each is pinned by the named test(s) under `tests/`.
 | 13 | Every commit carries `read_snapshot` and `expected_table_uuid`; every table read is `totals=false`; the shape read precedes the scan; the cache TTL is retention ÷ 4. | `test_flush.py::test_flush_commits_the_wire_contract`, `test_flush.py::test_identity_reads_are_totals_false_everywhere`, `test_flush.py::test_the_shape_read_precedes_the_staged_scan`, `test_flush.py::test_shape_cache_ttl_is_a_quarter_of_retention` |
 | 14 | No answered refusal deletes staged rows: every answered 4xx other than the named arms (`record_validation` 422 included) halts with rows and `prepared/` entry staged. | `test_flush.py::test_422_record_validation_halts_with_rows_staged`, `test_flush.py::test_422_request_shape_halts_with_rows_staged`, `test_flush.py::test_answered_4xx_halts_with_rows_staged`, `test_flush.py::test_recovery_replay_answered_plain_422_halts` |
 | 15 | `ddl_since_read_snapshot` rebuilds and never replays. | `test_flush.py::test_ddl_since_read_snapshot_rebuilds_never_replays` |
-| 16 | A fenced consumer closes the stage locally and halts with the distinct error without committing; fenced maps to exit 4 and outranks halted. | `test_consumer.py::test_a_fenced_partition_closes_locally_and_halts_distinctly`, `test_consumer.py::test_a_non_fenced_closed_stage_error_is_not_the_fenced_path`, `test_main.py::test_exit_code_classification` |
+| 16 | A fenced consumer closes the stage locally and halts with the distinct error without committing — a poll of only dropped records included; fenced maps to exit 4 and outranks halted. | `test_consumer.py::test_a_fenced_partition_closes_locally_and_halts_distinctly`, `test_consumer.py::test_an_all_drops_poll_on_a_fenced_stage_halts_without_committing`, `test_consumer.py::test_a_non_fenced_closed_stage_error_is_not_the_fenced_path`, `test_main.py::test_exit_code_classification` |
 | 17 | A fence seen by the flush loop is terminal for that partition, logged once, and other partitions continue. | `test_flush.py::test_a_fence_detected_mid_decision_is_logged_once_and_terminal`, `test_flush.py::test_a_fence_surfacing_at_planning_is_terminal`, `test_flush.py::test_a_real_contested_open_fences_the_live_flusher` |
-| 18 | SlateDB fences lazily on a contested open. | `test_slatedb_parity.py::test_writer_fencing_on_contested_open_memory`, `test_slatedb_parity.py::test_writer_fencing_on_contested_open_file` |
+| 18 | SlateDB fences lazily on a contested open; a one-put batch (the fence probe) fails FENCED on a fenced writer and an empty batch is refused. | `test_slatedb_parity.py::test_writer_fencing_on_contested_open_memory`, `test_slatedb_parity.py::test_writer_fencing_on_contested_open_file`, `test_slatedb_parity.py::test_a_single_put_batch_fences_and_an_empty_batch_is_refused` |
 | 19 | A malformed record is dropped at consume time: nothing staged, counted per bounded reason label, logged rate-limited per (partition, reason), and covered by the commit even when the poll staged nothing. | `test_consumer.py::test_malformed_records_are_dropped_counted_and_never_block`, `test_consumer.py::test_a_poll_of_only_dropped_records_still_commits`, `test_consumer.py::test_drop_logging_is_rate_limited_per_partition_and_reason`, `test_consumer.py::test_drop_reason_label_collapses_only_the_partition_source_path`, `test_main.py::test_records_dropped_total_merges_consume_and_flush_reasons` |
 | 20 | A flush-time drop leaves the record out of the payload, counts it, and its window's settlement deletes it; the one record that defeats the Arrow build is dropped, never the batch; an all-dropped window settles with no commit. | `test_flush.py::test_drop_mode_leaves_junk_out_and_settles_it`, `test_flush.py::test_bad_records_are_dropped_and_good_rows_flush`, `test_flush.py::test_pure_builder_drops_the_record_that_defeats_the_build`, `test_flush.py::test_an_all_junk_window_drops_and_settles_without_a_commit` |
-| 21 | Files are key-nondecreasing under the live sort spec even when record time and payload time invert. | `test_flush.py::test_inverted_kafka_and_payload_timestamps_flush_key_nondecreasing` |
-| 22 | A catch-up slice drains in bounded windows; a cap-boundary inversion narrows the window; an oversized single row still flushes. | `test_flush.py::test_catchup_flush_is_bounded_and_drains_over_sweeps`, `test_flush.py::test_a_timestamp_inversion_at_the_cap_boundary_narrows_the_window`, `test_flush.py::test_a_single_row_larger_than_the_byte_budget_still_flushes` |
-| 23 | Settlement that disagrees with the scan halts. | `test_flush.py::test_a_settlement_that_disagrees_with_the_scan_halts` |
+| 21 | Files are key-nondecreasing under the live sort spec even when arrival (offset) order and payload time invert. | `test_flush.py::test_inverted_kafka_and_payload_timestamps_flush_key_nondecreasing` |
+| 22 | A catch-up slice drains in bounded windows; a capped scan is an exact window (an offset prefix of the group, whatever the record timestamps), so a group of N interleaved rows drains in ⌈N ÷ cap⌉ windows; an oversized single row still flushes. | `test_flush.py::test_catchup_flush_is_bounded_and_drains_over_sweeps`, `test_flush.py::test_a_capped_scan_is_an_exact_window_whatever_the_timestamps`, `test_flush.py::test_interleaved_truncated_scans_drain_exactly`, `test_stage.py::test_a_capped_scan_is_an_exact_offset_prefix`, `test_flush.py::test_a_single_row_larger_than_the_byte_budget_still_flushes` |
+| 23 | Settlement that disagrees with the published row count (the scan, or the entry's persisted `row_count` at recovery) halts inside the settle transaction, which rolls back: no row, stats or `prepared/` entry changes, and a restart halts again rather than settling. | `test_flush.py::test_a_settlement_that_disagrees_with_the_scan_halts`, `test_stage.py::test_a_settlement_count_mismatch_rolls_back_before_commit` |
 | 24 | Fanout past `max_files_per_commit` halts before any I/O. | `test_flush.py::test_fanout_past_the_bound_halts_before_any_io` |
 | 25 | One decision's failure never wedges a sweep; a halt is sticky. | `test_flush.py::test_one_decisions_failure_never_wedges_the_sweep`, `test_flush.py::test_halt_stops_the_pipeline_and_stays_halted`, `test_flush.py::test_a_halt_under_parallelism_is_sticky_and_settles_nothing_past_it` |
 | 26 | Slow outranks age: an age decision's age lies in `[flush_deadline, slow_deadline)` and a key past the slow deadline flushes `slow` regardless of size; planning is deterministic under input order. | `test_planner.py::test_age_decisions_stay_inside_their_window`, `test_planner.py::test_past_slow_deadline_always_flushes_slow_regardless_of_size`, `test_planner.py::test_plan_flush_is_deterministic_under_input_order` |
-| 27 | Key byte order equals logical order (group, then timestamp, then offset), pinned by golden vectors. | `test_keyspace.py::test_group_golden_vectors`, `test_keyspace.py::test_row_key_golden_vectors`, `test_keyspace.py::test_row_key_byte_order_is_logical_order`, `test_keyspace.py::test_sched_age_byte_order_is_age_order` |
-| 28 | Static start opens and recovers stages before `assign()`; revoke closes cleanly and loses nothing. | `test_consumer.py::test_static_start_opens_and_recovers_stages_before_assign`, `test_consumer.py::test_revoke_closes_cleanly_and_loses_nothing` |
+| 27 | Key byte order equals logical order (rows: group, then offset), pinned by golden vectors. | `test_keyspace.py::test_group_golden_vectors`, `test_keyspace.py::test_row_key_golden_vectors`, `test_keyspace.py::test_row_key_byte_order_is_logical_order`, `test_keyspace.py::test_rows_within_a_group_sort_by_offset`, `test_keyspace.py::test_sched_age_byte_order_is_age_order` |
+| 28 | Static start opens and recovers stages before `assign()`; revoke closes cleanly and loses nothing; a claim recovers the previous owner's leftovers. | `test_consumer.py::test_static_start_opens_and_recovers_stages_before_assign`, `test_consumer.py::test_revoke_closes_cleanly_and_loses_nothing`, `test_consumer.py::test_claim_recovers_the_previous_owners_leftovers` |
 | 29 | Liveness latches only terminal states. | `test_main.py::test_liveness_status_latches_only` |
-| 30 | Writers cannot drop their embedded compactor; external GC is safe beside a live writer. | `test_slatedb_parity.py::test_compactor_disabled_stalls_memtable_flushes_at_l0_max_ssts`, `test_slatedb_parity.py::test_external_gc_concurrent_with_active_writer` |
+| 30 | Writers cannot drop their embedded compactor; external GC is safe beside a live writer. | `test_slatedb_parity.py::test_compactor_disabled_stalls_memtable_flushes_at_l0_max_ssts`, `test_slatedb_parity.py::test_external_gc_concurrent_with_active_writer`, `test_stage.py::test_build_slatedb_settings_shape` |
 | 31 | The group encoding round-trips (empty tuple, nulls, unicode), is total on decode, and is prefix-free: a tuple whose components are a byte prefix of another's never leaks into its row or `prepared/` range. | `test_keyspace.py::test_group_round_trip`, `test_keyspace.py::test_decode_group_never_raises_anything_but_value_error`, `test_keyspace.py::test_no_group_encoding_is_a_byte_prefix_of_another`, `test_keyspace.py::test_a_tuple_whose_components_prefix_another_never_leaks_into_its_range` |
 | 32 | The consumer's partition tuple is the flush fanout's tuple for the same payload across the full scalar type × transform matrix and for struct-leaf sources; a pair the keyer refuses at build is one the flush's array path refuses too. | `test_grouping.py::test_the_keyers_tuple_is_the_flush_fanouts_tuple`, `test_grouping.py::test_the_full_type_transform_matrix_keys_like_the_fanout_or_refuses_at_build`, `test_grouping.py::test_a_struct_leaf_sources_tuple_is_the_flush_fanouts_tuple` |
 | 33 | A group keyed under the live spec flushes as exactly one file; one keyed under an older spec still fans out correctly by the live spec. | `test_flush.py::test_one_flush_per_group_writes_exactly_one_file_under_a_matching_spec`, `test_flush.py::test_a_group_keyed_under_an_older_spec_still_fans_out_by_the_live_one` |
@@ -1102,11 +1197,16 @@ Each is pinned by the named test(s) under `tests/`.
 | 38 | Every leaf type at depth 2 and 3 inside a struct, a list and a map coerces, builds and reads back as the payload's value, with a field id on every level; a null into a non-nullable child (at any depth) is `uncastable_column` naming its dotted path; nesting stops at pyhoglake's depth cap; a `variant` column at any depth, and a map keyed by a container or json, is a startup refusal; map keys collide as stored (float32 narrowed); a nested drop's log line names the dotted path and never the value. | `test_coerce.py::test_every_leaf_type_inside_every_container_round_trips`, `test_coerce.py::test_a_null_into_a_non_nullable_child_names_its_path`, `test_coerce.py::test_a_nested_decode_error_carries_its_path`, `test_coerce.py::test_nesting_is_bounded_by_pyhoglakes_depth_cap`, `test_coerce.py::test_a_variant_column_is_refused_at_any_depth`, `test_coerce.py::test_float32_map_keys_collide_as_stored`, `test_flush.py::test_unfillable_columns_are_a_startup_refusal`, `test_flush.py::test_a_nested_drop_logs_the_dotted_path_never_the_value` |
 | 39 | A `json` value is stored as its canonical text; a JSON `null` is SQL NULL (refused when not nullable); a value with no valid text is `uncastable_column`. | `test_coerce.py::test_json_is_stored_as_canonical_text`, `test_coerce.py::test_json_null_is_sql_null_and_refused_when_not_nullable`, `test_coerce.py::test_json_without_valid_text_is_uncastable` |
 | 40 | Struct-leaf partition and sort sources work end to end (fanout by the leaf, a null struct as the null tuple, files key-nondecreasing by the leaf, the junk window applied to a temporal leaf); leaf-only column stats ship for nested leaves and none for a container; a source under a list or a map, on a container, or on a json column is a startup refusal. | `test_flush.py::test_nested_and_json_columns_flush_end_to_end`, `test_flush.py::test_a_nested_partition_source_keyed_by_the_consumer_flushes_one_file`, `test_flush.py::test_a_temporal_struct_leaf_source_takes_the_junk_window`, `test_flush.py::test_an_unreadable_source_refuses_at_resolve` |
+| 41 | The idempotency key names the window's content (SHA-256 over its rows); a fresh build looks it up before building and a receipt 200 settles the window with no upload or publish (counted in `millrace_flush_deduped_total`); different rows under the same bounds publish under another key; a 422 reused-key halts on a fresh publish and on a verbatim replay; the receipt lookup retries transient failures on the ladder. | `test_keyspace.py::test_content_digest_golden_vectors`, `test_keyspace.py::test_idempotency_key_golden_vector`, `test_keyspace.py::test_idempotency_key_is_sensitive_to_every_input_field`, `test_flush.py::test_a_fresh_build_with_a_live_receipt_settles_without_building`, `test_flush.py::test_different_rows_under_the_same_bounds_never_settle_from_the_receipt`, `test_flush.py::test_a_fresh_publish_answered_422_reused_halts`, `test_flush.py::test_a_verbatim_replay_answered_422_reused_still_halts`, `test_flush.py::test_a_transient_receipt_lookup_retries_on_the_ladder`, `test_main.py::test_flush_counters_are_exposed_by_exact_name_labels_and_value` |
 
 The live suite (`tests/live/`, `just millrace live`) covers end-to-end
 per-tenant reconciliation, kill -9 mid-flush, a lost commit response,
 static and cooperative reassignment, junk `event_time`, whale overload,
-freshness, the DDL race, drop+recreate halt, and compaction observation.
+freshness, the DDL race, drop+recreate halt, compaction observation, and
+a nested destination (struct, list, map and json columns) partitioned
+`identity(properties.team_id), month(properties.ts)` and sorted by
+`properties.ts`, accepted by the real server
+(`tests/live/test_live_nested.py::test_nested_columns_flush_under_a_struct_leaf_spec`).
 
 ## 12. Glossary
 
@@ -1122,8 +1222,10 @@ freshness, the DDL race, drop+recreate halt, and compaction observation.
 | Window | The inclusive offset range `[first_offset, last_offset]` one flush publishes and settles |
 | Prepared commit | The complete commit request body, persisted under `prepared/` before the first send and replayed verbatim |
 | Receipt | The server's record of a committed idempotency key, read at `GET …/commit/receipts/{key}`; purged server-side after `HOGLAKE_RECEIPT_RETENTION_SECONDS` (V24) |
-| Settle | The single transaction that deletes a window's rows and updates `stats/`, `sched_age/`, `offsets/`, `prepared/` |
-| Settled floor | Offsets whose rows were published and deleted from staging; re-consuming below it duplicates |
+| Settle | The single transaction that deletes a window's rows (one key range) and updates `stats/`, `sched_age/`, `prepared/` |
+| Settled floor | Offsets whose rows were published and deleted from staging; re-consuming below it stages them again, deduped only when a rebuilt window matches a published one in group, bounds and rows while its receipt exists, duplicated otherwise |
+| Deduped | A fresh window whose exact content already had a receipt at the pre-build lookup, settled with nothing new committed |
+| Fence probe | The consumer's durable one-put write of `meta/fence` for a partition whose poll staged nothing, so a fenced writer halts before committing |
 | Re-prepare | Dropping a refused prepared entry and rebuilding from staged rows against a fresh read |
 | Halt | `FlushHalted`: the flush loop stops; exit 3 |
 | Fence | SlateDB's single-writer enforcement: a newer open closes the older writer with `Closed(FENCED)`; exit 4 at the consumer, scheduling exclusion at the flush loop |

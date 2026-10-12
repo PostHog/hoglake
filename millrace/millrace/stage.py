@@ -9,10 +9,10 @@ keys and values go through :mod:`millrace.keyspace` codecs; nothing here
 hand-encodes a key.
 
 Write path — :meth:`PartitionStage.stage_batch`: ONE write batch per
-call: the row puts, the per-tuple ``stats/`` merge, the ``sched_age/``
-readiness entry and the ``offsets/`` identity range land atomically, so
-readiness accounting cannot drift from the data, not even on a hard kill
-that lands between them. Records the consumer DROPPED (malformed, counted
+call: the row puts (keyed ``(group, offset)``), the per-tuple
+``stats/`` merge and the ``sched_age/`` readiness entry land
+atomically, so readiness accounting cannot drift from the data, not
+even on a hard kill that lands between them. Records the consumer DROPPED (malformed, counted
 and logged there) never reach this module. ``first_staged_ts`` is SET-ONCE: an existing stats entry
 keeps its value (the tail's freshness SLA stands on this and the planner
 relies on it); it is born again only after the key stood empty — i.e.
@@ -30,12 +30,14 @@ shape: durability latency tracks SlateDB's ``flush_interval`` setting
 the write itself.
 
 Flush settlement — :meth:`PartitionStage.commit_flushed`: ONE
-transaction: the delete of EXACTLY the flush's offset window
-(``keyspace.row_in_flushed_range`` selects within the partition tuple's
-whole slice — younger and older rows of the same tuple outside the window
+transaction: the delete of EXACTLY the flush's offset window (row keys
+sort by (group, offset), so the window is one contiguous byte range,
+``keyspace.window_rows_range`` — rows of the same tuple outside it
 survive), the stats subtraction (or removal, with its ``sched_age/``
-entry, when the tuple drains), the ``offsets/`` pruning and the drop of
-the range's persisted ``prepared/`` request. NO ``flushed/`` marker is
+entry, when the tuple drains) and the drop of the range's persisted
+``prepared/`` request — with the caller's published-row count checked
+against the deleted count BEFORE the commit (a mismatch rolls the
+whole transaction back). NO ``flushed/`` marker is
 written: the settlement is atomic, so "marker landed, deletes didn't" —
 the state a marker existed to repair — is unreachable, and the commit's
 receipt is durable server-side (and in the caller's hand) before settle
@@ -116,7 +118,6 @@ from slatedb.uniffi import (
 from . import keyspace
 from .keyspace import (
     FlushedKey,
-    OffsetRange,
     PartitionTuple,
     PreparedKey,
     PreparedRequest,
@@ -152,6 +153,23 @@ class StageClosedError(StageError):
     """An operation was attempted on a closed stage or manager."""
 
 
+class SettlementMismatchError(StageError):
+    """A settlement's window range held a different number of rows than
+    the caller published (``commit_flushed(expected_rows=...)``). Raised
+    BEFORE the settlement transaction commits — it is rolled back, so no
+    row, ``stats/`` entry or ``prepared/`` entry changed."""
+
+    def __init__(self, key: FlushedKey, expected: int, found: int) -> None:
+        self.key = key
+        self.expected = expected
+        self.found = found
+        super().__init__(
+            f"settling group {key.label} offsets {key.first_offset}-"
+            f"{key.last_offset}: the window holds {found} staged rows but "
+            f"the flush published {expected}; the settlement was rolled back"
+        )
+
+
 class StageCorruptionError(StageError):
     """Persisted staging state violates a layout invariant (rows whose
     ``stats/`` entry is gone, stats that underflow a settled window).
@@ -168,14 +186,13 @@ class StagedRecord:
     destination's partition tuple for it (wire strings, one per live
     spec field; :class:`millrace.grouping.GroupKeyer`).
 
-    ``event_ts_us`` is the Kafka record timestamp in microseconds since the
-    Unix epoch (negatives are legal junk and sort correctly);
-    ``offset`` is the record's Kafka offset. Integer ranges are
-    validated by the keyspace codecs at encode time.
+    Rows are keyed ``(group, offset)``: ``offset`` is the record's
+    Kafka offset, validated by the keyspace codec at encode time. The
+    Kafka record timestamp is not carried (the staging stats use the
+    staging clock, ``stage_batch``'s ``now_us``).
     """
 
     group: PartitionTuple
-    event_ts_us: int
     offset: int
     payload: bytes
 
@@ -187,10 +204,11 @@ class StagedRecord:
 @dataclass(frozen=True, slots=True)
 class DroppedRecord:
     """One consumed Kafka record that can never become a staged row — a
-    payload that is not a JSON object, a malformed partition source, no
-    usable timestamp, a tombstone. Nothing is written for it: the
+    payload that is not a JSON object, a malformed partition source, a
+    tombstone. No row is written for it: the
     consumer logs and counts the drop, and the offset commit that follows
-    covers it trivially. ``reason`` is the consumer's bounded rejection
+    covers it (after the partition's staged batch, or its fence probe
+    when the poll staged nothing there). ``reason`` is the consumer's bounded rejection
     vocabulary (``malformed_partition_source:<path>`` names the field).
     The flush drops records with the same shape; ``path`` is the dotted
     catalog path of the column that refused the value (a nested child's
@@ -335,36 +353,6 @@ class _Settlement:
     rows_deleted: int
     bytes_deleted: int
     group_drained: bool
-
-
-def _merge_offset_ranges(ranges: Iterable[OffsetRange]) -> list[OffsetRange]:
-    """Sort, dedupe and coalesce OVERLAPPING ranges (per topic+partition).
-
-    Overlaps arise from at-least-once redelivery (a range staged twice)
-    and must not inflate the list; merely-adjacent ranges stay distinct
-    — their boundaries record arrival structure.
-    """
-    ordered = sorted(
-        ranges, key=lambda r: (r.topic, r.partition, r.first_offset, r.last_offset)
-    )
-    out: list[OffsetRange] = []
-    for r in ordered:
-        prev = out[-1] if out else None
-        if (
-            prev is not None
-            and prev.topic == r.topic
-            and prev.partition == r.partition
-            and r.first_offset <= prev.last_offset
-        ):
-            out[-1] = OffsetRange(
-                prev.topic,
-                prev.partition,
-                prev.first_offset,
-                max(prev.last_offset, r.last_offset),
-            )
-        else:
-            out.append(r)
-    return out
 
 
 class PartitionStage:
@@ -549,10 +537,9 @@ class PartitionStage:
 
         Per partition tuple in the batch: row puts, the ``stats/`` merge
         (``first_staged_ts`` kept set-once from the entry that already
-        exists; created with ``now_us`` when the tuple stands empty), the
-        ``sched_age/`` entry on first stage, and the ``offsets/``
-        identity-range merge. ``now_us`` is the injected staging clock —
-        never read from the wall here.
+        exists; created with ``now_us`` when the tuple stands empty) and
+        the ``sched_age/`` entry on first stage. ``now_us`` is the
+        injected staging clock — never read from the wall here.
 
         Rejects an empty batch and a batch carrying one row key twice
         (both are consumer bugs; redelivery ACROSS batches is fine — the
@@ -564,13 +551,10 @@ class PartitionStage:
         keyed: list[tuple[bytes, StagedRecord]] = []
         seen: set[bytes] = set()
         for rec in records:
-            row_key = keyspace.encode_row_key(
-                RowKey(rec.group, rec.event_ts_us, rec.offset)
-            )
+            row_key = keyspace.encode_row_key(RowKey(rec.group, rec.offset))
             if row_key in seen:
                 raise ValueError(
-                    f"duplicate row key in batch: group {rec.group} "
-                    f"ts {rec.event_ts_us} offset {rec.offset}"
+                    f"duplicate row key in batch: group {rec.group} offset {rec.offset}"
                 )
             seen.add(row_key)
             keyed.append((row_key, rec))
@@ -591,7 +575,6 @@ class PartitionStage:
                 for row_key, rec in rows:
                     batch.put(row_key, rec.payload)
                     group_bytes += len(rec.payload)
-                offsets = [rec.offset for _, rec in rows]
 
                 current = await self._read_stats(group)
                 if current is None:
@@ -616,21 +599,6 @@ class PartitionStage:
                 batch.put(
                     keyspace.stats_key(group), keyspace.encode_stats_value(merged)
                 )
-
-                new_range = OffsetRange(
-                    self._topic, self._partition, min(offsets), max(offsets)
-                )
-                raw_ranges = await self._db.get(keyspace.offsets_key(group))
-                ranges = (
-                    list(keyspace.decode_offsets_value(raw_ranges))
-                    if raw_ranges is not None
-                    else []
-                )
-                ranges.append(new_range)
-                batch.put(
-                    keyspace.offsets_key(group),
-                    keyspace.encode_offsets_value(_merge_offset_ranges(ranges)),
-                )
                 total_bytes += group_bytes
 
             handle = await self._db.write(batch)
@@ -648,6 +616,24 @@ class PartitionStage:
         if self._ack_hook is not None:
             self._ack_hook(ack)
         return ack
+
+    async def probe_fence(self, offset: int) -> None:
+        """One durable no-op write for a poll that handled records on
+        this partition but staged none (every record dropped): a single
+        put of the fence-probe key (``keyspace.FENCE_PROBE_KEY``,
+        holding ``offset``), awaited to remote durability exactly like
+        :meth:`stage_batch`. A fenced writer gets SlateDB's
+        ``Error.Closed(FENCED)`` here, BEFORE the consumer commits the
+        poll's offsets against the new owner (pinned by
+        tests/test_slatedb_parity.py). The key is not a row — no scan,
+        stats entry or gauge reads the ``meta/`` prefix — and is
+        overwritten by the next probe."""
+        self._ensure_open()
+        batch = WriteBatch()
+        batch.put(keyspace.FENCE_PROBE_KEY, keyspace.encode_fence_probe_value(offset))
+        async with self._write_lock:
+            handle = await self._db.write(batch)
+            await handle.await_durable()
 
     # -- flush inputs -----------------------------------------------------------
 
@@ -709,9 +695,9 @@ class PartitionStage:
         max_bytes: int | None = None,
     ) -> AsyncIterator[tuple[RowKey, bytes]]:
         """Stream one partition tuple's staged rows in key order —
-        ``(timestamp, offset)`` order within the tuple — a flush's input.
+        offset order within the tuple — a flush's input.
 
-        The optional caps bound the read (a partial prefix of the
+        The optional caps bound the read (an offset prefix of the
         slice): iteration stops before exceeding either. The iterator
         is a consistent snapshot as of creation, so rows staged while
         it streams are not seen.
@@ -740,19 +726,17 @@ class PartitionStage:
 
     async def scan_group_rows_bounded(
         self, group: PartitionTuple, *, max_rows: int, max_bytes: int
-    ) -> tuple[list[tuple[RowKey, bytes]], bool]:
+    ) -> list[tuple[RowKey, bytes]]:
         """The flush's bounded scan, collected: one partition tuple's
-        staged rows in key order (``(timestamp, offset)`` within the tuple), capped in
-        rows and bytes — plus whether a cap cut the scan short.
+        staged rows in offset order, capped in rows and bytes (the row
+        that would exceed a cap is NOT included).
 
-        ``truncated`` (the second element) is True exactly when the
-        tuple's slice held at least one row past what the caps admitted
-        (the row that would exceed a cap is NOT included). It is the
-        window-narrowing signal (flush.py §Bounded unit of work): an
-        UNtruncated scan saw the tuple's whole staged slice, so the flush
-        window is the scan's own offset span; only a truncated scan must
-        narrow to the covered offset prefix against the ``offsets/``
-        record.
+        Row keys sort by (group, offset), so the result is an exact
+        offset PREFIX of the tuple's staged rows as of the scan's
+        snapshot: every staged row of the tuple with an offset between
+        the first and the last scanned one was scanned, capped or not.
+        The flush window is therefore ``[first scanned, last scanned]``
+        (flush.py §Bounded unit of work).
         """
         if max_rows < 1:
             raise ValueError(f"max_rows must be >= 1, got {max_rows}")
@@ -762,21 +746,12 @@ class PartitionStage:
         start, end = keyspace.group_rows_range(group)
         rows: list[tuple[RowKey, bytes]] = []
         nbytes = 0
-        truncated = False
         async for key, value in self._iter_range(start, end):
             if len(rows) >= max_rows or nbytes + len(value) > max_bytes:
-                truncated = True
                 break
             rows.append((keyspace.decode_row_key(key), value))
             nbytes += len(value)
-        return rows, truncated
-
-    async def read_offsets(self, group: PartitionTuple) -> tuple[OffsetRange, ...]:
-        """One partition tuple's still-staged Kafka offset ranges (the flush's
-        identity material), canonical order."""
-        self._ensure_open()
-        raw = await self._db.get(keyspace.offsets_key(group))
-        return keyspace.decode_offsets_value(raw) if raw is not None else ()
+        return rows
 
     # -- prepared/ lifecycle ----------------------------------------------------
 
@@ -819,9 +794,9 @@ class PartitionStage:
         tuple exists by construction (a new request is persisted only
         when the tuple has none outstanding), so this is how the flush
         finds that entry REGARDLESS of where the current scan's window
-        starts — a bounded scan's prefix minimum can move under it
-        (flush.py §Bounded unit of work), and a missed entry would
-        double-publish the window. The prefix holds at most the tuple's
+        starts — a rewind that re-stages offsets below the entry's
+        window moves the scan's first offset, and a missed entry would
+        publish an overlapping window. The prefix holds at most the tuple's
         in-flight entries, so the scan is tiny."""
         self._ensure_open()
         start, end = keyspace.group_prepared_range(group)
@@ -909,13 +884,15 @@ class PartitionStage:
 
     # -- flush settlement ---------------------------------------------------------
 
-    async def commit_flushed(self, key: FlushedKey) -> FlushCommitReport:
+    async def commit_flushed(
+        self, key: FlushedKey, *, expected_rows: int | None = None
+    ) -> FlushCommitReport:
         """Settle one committed flush — ONE transaction:
 
-        delete EXACTLY the flush's offset window of the tuple's rows,
-        subtract (or remove, with the ``sched_age/`` entry, when
-        drained) the tuple's ``stats/``, prune the committed range out of
-        ``offsets/``, and drop the range's ``prepared/`` entry.
+        delete EXACTLY the flush's offset window of the tuple's rows
+        (every key in ``keyspace.window_rows_range``), subtract (or
+        remove, with the ``sched_age/`` entry, when drained) the tuple's
+        ``stats/``, and drop the range's ``prepared/`` entry.
 
         No ``flushed/`` marker is written. The caller holds the commit's
         receipt before calling (the server commits it in the same
@@ -931,14 +908,29 @@ class PartitionStage:
         receipt and nothing to reconcile, so the settle is a plain
         delete.
 
+        ``expected_rows`` is the guard: the number of rows the caller
+        published from this window. The transaction scans and deletes the
+        window's keys, and when the count differs it raises
+        :class:`SettlementMismatchError` and rolls back BEFORE commit —
+        a disagreement never deletes an unpublished row nor leaves the
+        bookkeeping half-applied. None skips the check.
+
         Idempotent: a replay after an ambiguous failure finds no rows in
-        the window and reports zeros.
+        the window and reports zeros (with ``expected_rows`` it raises
+        instead — the caller's count no longer matches).
         """
         self._ensure_open()
         async with self._write_lock:
             txn = await self._db.begin(IsolationLevel.SERIALIZABLE_SNAPSHOT)
             try:
                 settlement = await self._settle_flushed(txn, key)
+                if (
+                    expected_rows is not None
+                    and settlement.rows_deleted != expected_rows
+                ):
+                    raise SettlementMismatchError(
+                        key, expected_rows, settlement.rows_deleted
+                    )
             except BaseException:
                 await txn.rollback()
                 raise
@@ -954,9 +946,9 @@ class PartitionStage:
     async def _settle_flushed(self, txn: DbTransaction, key: FlushedKey) -> _Settlement:
         """The settlement body of :meth:`commit_flushed`."""
         # The exact settlement selection (keyspace.py §The settlement
-        # window): scan the tuple's whole slice, delete the rows the
-        # window selects.
-        start, end = keyspace.flushed_rows_scan_range(key)
+        # window): the window is one contiguous byte range of the
+        # tuple's slice; every key in it is one of the window's rows.
+        start, end = keyspace.window_rows_range(key)
         rows_deleted = 0
         bytes_deleted = 0
         it = await txn.scan(
@@ -967,14 +959,11 @@ class PartitionStage:
             if not chunk:
                 break
             for kv in chunk:
-                if keyspace.row_in_flushed_range(keyspace.decode_row_key(kv.key), key):
-                    await txn.delete(kv.key)
-                    rows_deleted += 1
-                    bytes_deleted += len(kv.value)
+                await txn.delete(kv.key)
+                rows_deleted += 1
+                bytes_deleted += len(kv.value)
 
         drained = await self._settle_stats(txn, key, rows_deleted, bytes_deleted)
-        if rows_deleted:
-            await self._settle_offsets(txn, key)
         await self._settle_prepared(txn, key)
         return _Settlement(rows_deleted, bytes_deleted, drained)
 
@@ -1025,42 +1014,6 @@ class PartitionStage:
             ),
         )
         return False
-
-    async def _settle_offsets(self, txn: DbTransaction, key: FlushedKey) -> None:
-        """Prune the committed window out of the tuple's ``offsets/``
-        ranges: wholly-covered ranges drop, straddlers clip to their
-        surviving piece(s) — a range spanning BOTH window edges splits
-        into the piece below and the piece above — and the key leaves
-        with its last range."""
-        raw = await txn.get(keyspace.offsets_key(key.group))
-        if raw is None:
-            return
-        kept: list[OffsetRange] = []
-        for r in keyspace.decode_offsets_value(raw):
-            if r.first_offset < key.first_offset:
-                kept.append(
-                    OffsetRange(
-                        r.topic,
-                        r.partition,
-                        r.first_offset,
-                        min(r.last_offset, key.first_offset - 1),
-                    )
-                )
-            if r.last_offset > key.last_offset:
-                kept.append(
-                    OffsetRange(
-                        r.topic,
-                        r.partition,
-                        max(r.first_offset, key.last_offset + 1),
-                        r.last_offset,
-                    )
-                )
-        if kept:
-            await txn.put(
-                keyspace.offsets_key(key.group), keyspace.encode_offsets_value(kept)
-            )
-        else:
-            await txn.delete(keyspace.offsets_key(key.group))
 
     async def _settle_prepared(self, txn: DbTransaction, key: FlushedKey) -> None:
         """Drop the settled range's ``prepared/`` entry: once the settle

@@ -17,8 +17,16 @@ staged rows; if the first attempt had landed, the window lands a second
 time (duplicate rows). That is accepted at-least-once behaviour and is
 counted (`millrace_prepared_reprepared_total`,
 `millrace_prepared_replays_total`; the dropped entry's objects, possibly
-live, in `millrace_flush_unresolved_uploads_total`). Details:
-[architecture.md](architecture.md) §6.
+live, in `millrace_flush_unresolved_uploads_total`). Rows are staged
+under `(partition tuple, offset)`. The idempotency key includes a
+SHA-256 of the window's rows, and a fresh flush looks it up before it
+builds: offsets re-consumed below the settled floor settle from a
+published window's receipt only when the rebuilt window has the same
+group, bounds and rows and the receipt still exists
+(`millrace_flush_deduped_total` — nonzero means a rewind re-staged
+identical data); otherwise they publish as a new commit and the shared
+rows land twice. Details:
+[architecture.md](architecture.md) §1 and §6.
 
 Design: [docs/kafka-ingestion.md](../docs/kafka-ingestion.md).
 Build/test sequence: [docs/kafka-ingestion-plan.md](../docs/kafka-ingestion-plan.md).
@@ -85,7 +93,7 @@ incarnation halt, and a compaction observation. Code-level map:
 ## Staging format
 
 The staging keyspace is keyed by the destination's partition tuple
-(prepared envelope v4); it shares no key or value shape with the
+(prepared envelope v5); it shares no key or value shape with the
 #331-era team-keyed layout. millrace requires a FRESH staging root — a
 new `MILLRACE_STAGE_URL` prefix. There is no code guard: pointed at an
 old root it fails at open or at the first sweep with the `ValueError`
@@ -164,12 +172,14 @@ arithmetic, not trust):
 
 Malformed records are dropped, logged and metered; nothing is
 quarantined or retained. Each drop increments
-`millrace_records_dropped_total{reason}` and logs at WARNING.
+`millrace_records_dropped_total{reason}` and logs at WARNING. The Kafka
+record timestamp is never read (rows are keyed `(partition tuple,
+offset)`; staging stats use the staging clock), so no record is dropped
+for its timestamp.
 
 | Where | `reason` label | Cause |
 |---|---|---|
 | Consume | `invalid_offset` | Offset < 0 or > int64 max |
-| Consume | `missing_timestamp` / `invalid_timestamp` | `TIMESTAMP_NOT_AVAILABLE`, or ms × 1000 overflows int64 |
 | Consume | `missing_value` | Tombstone |
 | Consume | `malformed_value` | Not a strict JSON object |
 | Consume | `malformed_partition_source` | A partition source scalar cannot be keyed; the log line names the path (`malformed_partition_source:<path>`), the label does not |

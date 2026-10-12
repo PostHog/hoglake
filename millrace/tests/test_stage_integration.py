@@ -22,7 +22,6 @@ from pathlib import Path
 import pytest
 from stagekit import NOW, fast_flush_settings, payload_for, rec, window
 
-from millrace.keyspace import OffsetRange
 from millrace.stage import PartitionStage, RecoveryReport, StagedRecord, StageManager
 
 pytestmark = pytest.mark.integration
@@ -97,18 +96,16 @@ async def _verify_after_kill(path: str, acked: list[tuple[int, int, int]]) -> No
         "file:///", path, topic="events", partition=0, settings=fast_flush_settings()
     )
     try:
-        rows_by_team: dict[int, dict[int, tuple[int, bytes]]] = {
-            t: {} for t in range(TEAMS)
-        }
+        rows_by_team: dict[int, dict[int, bytes]] = {t: {} for t in range(TEAMS)}
         for team in range(TEAMS):
             async for rk, value in stage.scan_group_rows((str(team),)):
-                rows_by_team[team][rk.offset] = (rk.timestamp_us, value)
+                rows_by_team[team][rk.offset] = value
 
-        # 1. every acknowledged row survived, byte-exact, with its event ts
+        # 1. every acknowledged row survived, byte-exact, under its
+        # (group, offset) key
         for _, first, last in acked:
             for offset in range(first, last + 1):
-                ts, value = rows_by_team[offset % TEAMS][offset]
-                assert ts == EVENT_TS_BASE + offset
+                value = rows_by_team[offset % TEAMS][offset]
                 assert value == payload_for(offset, PAYLOAD_SIZE)
 
         # 2. batch atomicity: present rows come in whole batches (an
@@ -129,7 +126,7 @@ async def _verify_after_kill(path: str, acked: list[tuple[int, int, int]]) -> No
         for team, rows in stats.items():
             scanned = rows_by_team[team]
             assert rows.row_count == len(scanned)
-            assert rows.staged_bytes == sum(len(v) for _, v in scanned.values())
+            assert rows.staged_bytes == sum(len(v) for v in scanned.values())
             # every team appears in every batch: the first batch set the
             # floor, the last landed batch set the watermark
             assert rows.first_staged_ts == NOW
@@ -146,7 +143,6 @@ async def _verify_after_kill(path: str, acked: list[tuple[int, int, int]]) -> No
             [
                 StagedRecord(
                     group=("0",),
-                    event_ts_us=EVENT_TS_BASE + 10**9,
                     offset=10**9,
                     payload=b"after",
                 )
@@ -188,11 +184,6 @@ async def test_assignment_change_between_deploys(tmp_path: Path):
     assert s.last_staged_ts == NOW + 1
     rows = [rk.offset async for rk, _ in stage.scan_group_rows(("11",))]
     assert rows == list(range(20))
-    # adjacent ranges keep their arrival structure (no coalescing)
-    assert await stage.read_offsets(("11",)) == (
-        OffsetRange("events", 3, 0, 9),
-        OffsetRange("events", 3, 10, 19),
-    )
 
     # the new owner stages on top; totals stay exact
     await stage.stage_batch(
@@ -201,11 +192,8 @@ async def test_assignment_change_between_deploys(tmp_path: Path):
     (s,) = await stage.iter_key_stats()
     assert s.row_count == 25
     assert s.first_staged_ts == NOW
-    assert await stage.read_offsets(("11",)) == (
-        OffsetRange("events", 3, 0, 9),
-        OffsetRange("events", 3, 10, 19),
-        OffsetRange("events", 3, 20, 24),
-    )
+    rows = [rk.offset async for rk, _ in stage.scan_group_rows(("11",))]
+    assert rows == list(range(25))
     await second_owner.close()
 
 
