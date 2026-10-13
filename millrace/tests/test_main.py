@@ -10,6 +10,7 @@ probe status).
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
 
 import pytest
@@ -51,6 +52,69 @@ def test_main_requires_hoglake_url(capsys: pytest.CaptureFixture[str]):
     rc = main._main(_valid_env())
     assert rc == main.EXIT_CONFIG
     assert "HOGLAKE_URL" in capsys.readouterr().err
+
+
+def test_main_maps_a_destination_refusal_to_the_config_exit(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    """A destination the configuration cannot create (destination.py:
+    the catalog is missing and MILLRACE_CATALOG_DATA_PATH is unset) is a
+    ConfigError raised from inside the pipeline's startup: exit 2 with
+    the knob named on stderr, like any other config refusal — not the
+    generic exit 1 a server failure gets."""
+    from millrace.destination import DestinationConfigError
+
+    def refuse(client: Any, cfg: Any) -> None:
+        raise DestinationConfigError(
+            ["catalog 'cat' does not exist and MILLRACE_CATALOG_DATA_PATH is not set"]
+        )
+
+    monkeypatch.setattr(main, "ensure_destination", refuse)
+    rc = main._main(_valid_env() | {"HOGLAKE_URL": "http://hog.test"})
+    assert rc == main.EXIT_CONFIG
+    err = capsys.readouterr().err
+    assert "MILLRACE_CATALOG_DATA_PATH" in err and "problem(s)" in err
+
+
+def test_main_maps_a_destination_server_failure_to_exit_1_in_one_line(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    """Transport / 5xx / 403 while ensuring the destination: exit 1 and
+    ONE error line carrying the cause — no traceback."""
+    from millrace.destination import DestinationError
+
+    def fail(client: Any, cfg: Any) -> None:
+        raise DestinationError("cannot ensure the hoglake destination: HTTP 503")
+
+    monkeypatch.setattr(main, "ensure_destination", fail)
+    with caplog.at_level(logging.ERROR, logger="millrace"):
+        rc = main._main(_valid_env() | {"HOGLAKE_URL": "http://hog.test"})
+    assert rc == main.EXIT_ERROR
+    (record,) = [r for r in caplog.records if r.name == "millrace"]
+    assert record.exc_info is None
+    assert "HTTP 503" in record.message and "startup failed" in record.message
+
+
+def test_main_ensures_the_destination_before_the_flusher_resolves(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The order is the point: the partition tuple is the staging key,
+    so the destination exists (created or verified) before anything
+    resolves and pins it."""
+    calls: list[str] = []
+
+    def ensure(client: Any, cfg: Any) -> None:
+        calls.append("ensure")
+
+    def resolve(cls: Any, client: Any, cfg: Any, **kwargs: Any) -> Any:
+        calls.append("resolve")
+        raise RuntimeError("stop here")
+
+    monkeypatch.setattr(main, "ensure_destination", ensure)
+    monkeypatch.setattr(main.HoglakeFlusher, "resolve", classmethod(resolve))
+    rc = main._main(_valid_env() | {"HOGLAKE_URL": "http://hog.test"})
+    assert rc == main.EXIT_ERROR
+    assert calls == ["ensure", "resolve"]
 
 
 def test_s3_kwargs_maps_only_present_values():

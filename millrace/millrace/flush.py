@@ -1650,6 +1650,30 @@ def _shape_fingerprint(info: TableInfo) -> tuple[Any, ...]:
     )
 
 
+def read_table_identity(
+    client: HoglakeClient, catalog: str, namespace: str, table: str
+) -> TableInfo:
+    """The ``totals=false`` identity read of one table — EVERY table read
+    this pipeline makes (the startup resolve, the shape-cache refresh,
+    destination.py's existence check): name, uuid, columns, specs and
+    the ``read_snapshot_id`` it resolved at, with no manifest aggregate.
+    Raises pyhoglake's errors (``NotFoundError`` for a missing table) and
+    :class:`FlushStartupError` when pyhoglake no longer exposes the
+    transport this read needs."""
+    request = getattr(client, "_request", None)
+    if request is None:
+        raise FlushStartupError(
+            "pyhoglake no longer exposes HoglakeClient._request; "
+            "millrace's identity reads and receipt lookups cannot run"
+        )
+    body = request(
+        "GET",
+        f"/catalogs/{_seg(catalog)}/namespaces/{_seg(namespace)}/tables/{_seg(table)}",
+        params={"totals": "false"},
+    )
+    return TableInfo.from_wire(body)
+
+
 def read_destination(client: HoglakeClient, cfg: Config) -> tuple[Catalog, TableInfo]:
     """The startup identity read: catalog → namespace → table, the table
     read ``totals=false`` (the ``Table`` handle is built straight from it
@@ -1662,19 +1686,7 @@ def read_destination(client: HoglakeClient, cfg: Config) -> tuple[Catalog, Table
         # Existence-check the namespace (the API has no per-namespace
         # GET; the listing is the check).
         catalog.namespace(cfg.namespace)
-        request = getattr(client, "_request", None)
-        if request is None:
-            raise FlushStartupError(
-                "pyhoglake no longer exposes HoglakeClient._request; "
-                "millrace's identity reads and receipt lookups cannot run"
-            )
-        body = request(
-            "GET",
-            f"/catalogs/{_seg(cfg.catalog)}/namespaces/{_seg(cfg.namespace)}"
-            f"/tables/{_seg(cfg.table)}",
-            params={"totals": "false"},
-        )
-        info = TableInfo.from_wire(body)
+        info = read_table_identity(client, cfg.catalog, cfg.namespace, cfg.table)
     except FlushStartupError:
         raise
     except (HoglakeError, httpx.HTTPError, OSError) as e:

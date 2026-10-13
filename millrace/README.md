@@ -31,7 +31,7 @@ rows land twice. Details:
 Design: [docs/kafka-ingestion.md](../docs/kafka-ingestion.md).
 Build/test sequence: [docs/kafka-ingestion-plan.md](../docs/kafka-ingestion-plan.md).
 
-Status: Phase 5 — `keyspace.py` (staging key codecs, side prefixes,
+Status: Phase 5 — `destination.py` (create-if-missing catalog, namespace, table), `keyspace.py` (staging key codecs, side prefixes,
 idempotency-key derivation),
 `planner.py` (pure per-key flush decisions: the size/age/slow
 three-lane policy behind a policy seam), `grouping.py` (the
@@ -121,6 +121,76 @@ every PR and publishes it on every main push, multi-arch, tagged
 Freight by that tag plus the `org.opencontainers.image.revision` and
 `.source` index annotations), by commit sha, and `latest`. Nothing is
 dispatched to PostHog/charts; delivery is Kargo's.
+
+## Destination
+
+Millrace creates its destination the way millpond does: from
+configuration, at startup, before the flusher resolves and pins it
+(`destination.py:ensure_destination`, called from `main.py` ahead of
+`HoglakeFlusher.resolve`). The constraint that shapes this: the
+partition tuple is millrace's staging key, and millrace drops unknown
+payload keys with no schema evolution — so the spec and every column it
+reads must exist before the first record is staged, from a COMPLETE
+configured shape, never inferred from a first batch.
+
+| Knob | Used when | Value |
+|---|---|---|
+| `MILLRACE_CATALOG_DATA_PATH` | the catalog does not exist | the catalog's `data_path`, `s3://bucket/prefix/` (validated like `MILLRACE_STAGE_URL`'s s3 form; a different bucket from the staging root — the lake role's prefix-scoped grants would let SlateDB half-write a staging root into the lake bucket) |
+| `MILLRACE_TABLE_COLUMNS` | the table does not exist | the complete typed column list, `name:type,…` with hoglake type names (`long`, `int`, `double`, `string`, `uuid`, `timestamptz`, `timestamp`, `date`, `boolean`, `json`, `decimal(p,s)`, …). All nullable. Nested types, `variant`, duplicates and the `_hog` prefix are refused |
+| `MILLRACE_PARTITION_BY` | the table does not exist (creation); the table exists (agreement check) | millpond's `HOGLAKE_PARTITION_BY` grammar: `col`, `identity(col)`, `year|month|day|hour(col)`, `bucket(col, N)`, comma separated |
+| `MILLRACE_SORT_BY` | same | a superset of millpond's `MILLPOND_SORT_BY` grammar: comma-separated `col [asc|desc] [nulls_first|nulls_last]`, default `asc nulls_last` (a bare millpond value parses identically) |
+
+What happens at startup, in order:
+
+1. **Catalog.** `GET` it; on 404 create it with `MILLRACE_CATALOG_DATA_PATH`.
+   Unset, the process refuses to start (exit 2, the knob named). An
+   existing catalog whose data path differs from the knob logs a
+   WARNING and continues — a catalog's data path is immutable.
+2. **Namespace.** Same create-if-missing.
+3. **Table.** On 404, `MILLRACE_TABLE_COLUMNS` is required (exit 2
+   otherwise) and the table is created in ONE atomic request —
+   columns, partition spec and sort order together, through the
+   server's table-creations operation (pyhoglake
+   `Namespace.create_table(partition_fields=…, sort_fields=…)`).
+   When `MILLRACE_PARTITION_BY` is set millrace REQUIRES the catalog to
+   advertise `atomic-partitioned-table-creation-v1`, and when
+   `MILLRACE_SORT_BY` is set `atomic-sorted-table-creation-v1`, and
+   refuses to start (exit 1, the capability named) otherwise: it never
+   takes pyhoglake's create + alter fallback, because a sibling replica
+   reading the table between the two requests would stage under an
+   empty spec for a shape-cache TTL. A columns-only table takes the
+   plain create. An existing table that agrees with the configuration
+   logs one INFO line, so every replica's path is visible.
+4. **Agreement.** When the table exists, the live columns, partition
+   spec and sort order are compared with whatever is configured; every
+   difference goes into ONE WARNING carrying both sides in the knobs'
+   own grammar. The live table wins: millrace never alters an existing
+   table.
+
+One INFO line per created object. The replica race is tolerated at
+every step: a StatefulSet's pods boot together, the loser's create
+answers already-exists (for the atomic table create, a `target_exists`
+receipt surfaced as the same error) and it re-reads what the winner
+made.
+
+Recommended dev shape:
+
+```
+MILLRACE_CATALOG_DATA_PATH=s3://posthog-gigahog-mw-dev/millrace/millrace-dev/
+MILLRACE_TABLE_COLUMNS=team_id:long,timestamp:timestamptz,distinct_id:string,event:string,properties:json
+MILLRACE_PARTITION_BY=identity(team_id),day(timestamp)
+MILLRACE_SORT_BY=timestamp
+```
+
+`MILLRACE_STAGE_URL` must point at a DIFFERENT bucket from the data
+path (`s3://<stage-bucket>/millrace`): the same bucket is refused at
+boot.
+
+With `MILLRACE_TABLE_COLUMNS` set, every `MILLRACE_PARTITION_BY` source
+and `MILLRACE_SORT_BY` column must be a configured column and each
+transform valid for its type (checked at boot, all problems at once,
+so the create cannot 422). Without it, the two are only compared
+against an existing table.
 
 ## Staging format
 

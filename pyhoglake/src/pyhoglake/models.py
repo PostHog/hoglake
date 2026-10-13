@@ -54,10 +54,21 @@ class CatalogInfo:
     data_path: str
     head_snapshot_id: int
     schema_version: int
+    #: The server's advertised feature set for this catalog (the wire's
+    #: ``capabilities``: ``atomic-partitioned-table-creation-v1`` and
+    #: friends). Empty against a server too old to advertise any, which
+    #: is how a client learns to take the fallback path rather than
+    #: assume a feature.
+    capabilities: tuple[str, ...] = ()
 
     @classmethod
     def from_wire(cls, d: dict[str, Any]) -> CatalogInfo:
-        return _wire("CatalogInfo", d, lambda d: cls(**_pick(cls, d)))
+        def build(d: Mapping[str, Any]) -> CatalogInfo:
+            kw = dict(_pick(cls, d))
+            kw["capabilities"] = tuple(str(c) for c in (d.get("capabilities") or ()))
+            return cls(**kw)
+
+        return _wire("CatalogInfo", d, build)
 
 
 @dataclass(frozen=True)
@@ -309,6 +320,13 @@ class SortField:
     @classmethod
     def from_wire(cls, d: dict[str, Any]) -> SortField:
         return _wire("SortField", d, lambda d: cls(**_pick(cls, d)))
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "source_field_id": self.source_field_id,
+            "direction": self.direction,
+            "null_order": self.null_order,
+        }
 
 
 @dataclass(frozen=True)

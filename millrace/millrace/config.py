@@ -26,6 +26,10 @@ Knobs
 | ``MILLRACE_KAFKA_FETCH_MAX_BYTES`` | 268435456 (256 MiB) | librdkafka ``fetch.max.bytes`` — the per-fetch aggregate across the pod's partitions. Must be ≥ the per-partition cap (one hot partition's response must fit) and cover a poll's aggregate when several partitions run hot at once |
 | ``MILLRACE_KAFKA_QUEUED_MAX_MESSAGES_KBYTES`` | 262144 (256 MiB) | librdkafka ``queued.max.messages.kbytes`` — the local fetch queue. Sized at ~5 s of a 50 MB/s pod inflow so a staging-latency spike doesn't stall fetches; past it librdkafka throttles fetches — the only fetch-side throttle there is (nothing pauses the consumer downstream; the staging gauges and alerts carry that job) |
 | ``MILLRACE_CATALOG`` / ``MILLRACE_NAMESPACE`` / ``MILLRACE_TABLE`` | required | the one destination table's identity |
+| ``MILLRACE_CATALOG_DATA_PATH`` | none | the catalog's ``data_path`` for CREATING it at startup when it does not exist (``s3://bucket/prefix/``, validated like ``MILLRACE_STAGE_URL``'s s3 form). Unset, a missing catalog is a refusal naming this knob (exit 2). An existing catalog's data path is immutable: a configured value that differs is logged as a WARNING and the live one wins (destination.py) |
+| ``MILLRACE_TABLE_COLUMNS`` | none | the COMPLETE typed column list for creating the table when it does not exist: ``name:type,…`` with hoglake type names (``long``, ``int``, ``double``, ``string``, ``uuid``, ``timestamptz``, ``timestamp``, ``date``, ``boolean``, ``json``, ``decimal(p,s)``, …; every type ``pyhoglake.types.coltype_to_arrow`` knows). All columns nullable. Nested types (``struct``/``list``/``map``), ``variant``, duplicate names and the reserved ``_hog`` prefix are refused. It must be complete: millrace drops unknown payload keys and never evolves the schema, and the partition tuple is its staging key, so the spec and every column it reads must exist before the first record is staged (no infer-from-first-batch). Unset, a missing table is a refusal naming this knob (exit 2) |
+| ``MILLRACE_PARTITION_BY`` | none | the partition spec for creating the table, millpond's ``HOGLAKE_PARTITION_BY`` grammar verbatim: comma-separated ``col`` (= ``identity(col)``), ``identity(col)``, ``year(col)``, ``month(col)``, ``day(col)``, ``hour(col)``, ``bucket(col, N)``. With ``MILLRACE_TABLE_COLUMNS`` every source must be a configured column and the transform valid for its type (``pyhoglake.transforms.check_transform``). Against an existing table it is only compared with the live spec (a difference is a WARNING; the live table wins). Recommended dev shape: ``identity(team_id),day(timestamp)`` |
+| ``MILLRACE_SORT_BY`` | none | the sort order for creating the table, a superset of millpond's ``MILLPOND_SORT_BY`` grammar: comma-separated ``col [asc|desc] [nulls_first|nulls_last]`` entries, default ``asc nulls_last`` (so every millpond value — bare column names — parses identically to how millpond declares it); duplicates de-duplicated, first wins. Same relation to ``MILLRACE_TABLE_COLUMNS`` and to an existing table as ``MILLRACE_PARTITION_BY``. Recommended dev shape: ``timestamp`` |
 | ``MILLRACE_STAGE_URL`` | required | staging root: ``s3://bucket/millrace``, ``file:///path`` or ``memory:///`` (tests). One SlateDB instance per claimed partition lives at ``<base>/<topic>/<partition>`` |
 | ``MILLRACE_TARGET_OUTPUT_BYTES`` | 500 MiB | planner size trigger — the estimated OUTPUT (parquet) size, compression roughly accounted (docs/kafka-ingestion.md §The flush planner) |
 | ``MILLRACE_FLUSH_DEADLINE_S`` | 900 | planner age trigger — the tail's freshness SLA |
@@ -47,6 +51,16 @@ Knobs
 | ``MILLRACE_COMPRESSION_RATIO_HALFLIFE`` | 20 | halflife, in completed flushes, of the EWMA of observed ``parquet bytes ÷ staged bytes`` that feeds the planner's size lane (flush.py ``CompressionRatioEwma``); the estimate is in-memory only (a restart falls back to ``DEFAULT_COMPRESSION_RATIO``, which errs toward over-staging) and resets on a table shape/incarnation change |
 | ``MILLRACE_FLUSH_CONCURRENCY`` | 4 | per-partition in-flight flush decisions (1 = the serial sweep); the process-wide in-flight bound is ``4 ×`` this (flush.py ``FlushRunner``) |
 | ``MILLRACE_METRICS_PORT`` | 8000 | the operational HTTP surface's port (0 = ephemeral) |
+
+Destination creation — millrace creates its destination the way
+millpond does: from configuration, at startup, before the flusher
+resolves (destination.py ``ensure_destination``). Catalog, namespace
+and table are each created when missing (the catalog needs
+``MILLRACE_CATALOG_DATA_PATH``, the table ``MILLRACE_TABLE_COLUMNS``,
+plus the optional ``MILLRACE_PARTITION_BY`` / ``MILLRACE_SORT_BY``),
+tolerating the replica race (another pod created it first → re-read).
+An existing object is never altered: the configured shape is compared
+with the live one and a difference is ONE WARNING carrying both.
 
 Renamed knobs — the pre-three-lane names ``MILLRACE_TARGET_FILE_BYTES``
 and ``MILLRACE_REAP_DEADLINE_S`` are REFUSED at boot, each refusal
@@ -80,7 +94,11 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
-from typing import Final
+from typing import Any, Final
+
+from pyhoglake import UnsupportedTypeError, ValidationError
+from pyhoglake.transforms import check_transform
+from pyhoglake.types import NESTED_TYPES, arrow_type_to_coltype, coltype_to_arrow
 
 from .planner import (
     FLUSH_DEADLINE_S_DEFAULT,
@@ -171,6 +189,65 @@ class SlateDbConfig:
             )
 
 
+@dataclass(frozen=True)
+class ColumnSpec:
+    """One configured destination column (``MILLRACE_TABLE_COLUMNS``):
+    a hoglake type name plus its parameters (``decimal(p,s)`` →
+    ``(("precision", p), ("scale", s))``). Always nullable."""
+
+    name: str
+    col_type: str
+    type_params: tuple[tuple[str, int], ...] = ()
+
+    def params(self) -> dict[str, int] | None:
+        return dict(self.type_params) or None
+
+    def arrow_type(self) -> Any:
+        return coltype_to_arrow(self.col_type, self.params())
+
+
+@dataclass(frozen=True)
+class PartitionFieldSpec:
+    """One configured partition field (``MILLRACE_PARTITION_BY``):
+    millpond's ``(column, transform, param)`` triple."""
+
+    column: str
+    transform: str
+    param: int | None = None
+
+    def describe(self) -> str:
+        """The field in the knob's own grammar (pasteable)."""
+        if self.param is not None:
+            return f"{self.transform}({self.column}, {self.param})"
+        return f"{self.transform}({self.column})"
+
+
+#: millpond's ``_HOGLAKE_TRANSFORMS`` (config.py): the server's
+#: partition-transform vocabulary as the grammar admits it.
+PARTITION_TRANSFORMS: Final = ("identity", "year", "month", "day", "hour", "bucket")
+#: The sort direction and null order a bare ``MILLRACE_SORT_BY`` column
+#: gets (millpond's ``_want_sort_fields``: asc, nulls_last — the order
+#: its own batch sort writes).
+SORT_DIRECTION: Final = "asc"
+SORT_NULL_ORDER: Final = "nulls_last"
+SORT_DIRECTIONS: Final = ("asc", "desc")
+SORT_NULL_ORDERS: Final = ("nulls_first", "nulls_last")
+
+
+@dataclass(frozen=True)
+class SortFieldSpec:
+    """One configured sort field (``MILLRACE_SORT_BY``): a column, its
+    direction and its null order — the server's ``SortField`` by name."""
+
+    column: str
+    direction: str = SORT_DIRECTION
+    null_order: str = SORT_NULL_ORDER
+
+    def describe(self) -> str:
+        """The field in the knob's own grammar (pasteable)."""
+        return f"{self.column} {self.direction} {self.null_order}"
+
+
 _DEFAULT_STAGE_BASE: Final = "millrace"
 
 #: Flush-phase knob defaults (the dataclass fields and the env parsing
@@ -216,6 +293,14 @@ _IDENTIFIER: Final = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,127}$")
 _S3_BUCKET: Final = re.compile(r"^[a-z0-9][a-z0-9.\-]{1,61}[a-z0-9]$")
 # A StatefulSet pod name's trailing ordinal (millpond's _parse_ordinal).
 _POD_ORDINAL: Final = re.compile(r"-(\d+)$")
+# millpond's _HOGLAKE_PARTITION_CALL (config.py): ``transform(args)``.
+_PARTITION_CALL: Final = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*(.*?)\s*\)$")
+# ``decimal(p,s)`` in MILLRACE_TABLE_COLUMNS.
+_DECIMAL_TYPE: Final = re.compile(r"^decimal\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)$")
+#: Decimal bounds (Iceberg's: precision 1..38, scale 0..precision).
+_DECIMAL_MAX_PRECISION: Final = 38
+# Column names the server reserves for its own physical columns.
+_RESERVED_COLUMN_PREFIX: Final = "_hog"
 
 
 #: The librdkafka passthrough prefix (module docstring).
@@ -296,6 +381,12 @@ class Config:
     flush_concurrency: int = FLUSH_CONCURRENCY_DEFAULT
     # Per-instance SlateDB writer tuning (T9).
     slatedb: SlateDbConfig = SlateDbConfig()
+    # Destination creation (module docstring, destination.py). None =
+    # the knob is unset: a missing object is then a refusal.
+    catalog_data_path: str | None = None
+    table_columns: tuple[ColumnSpec, ...] | None = None
+    partition_by: tuple[PartitionFieldSpec, ...] | None = None
+    sort_by: tuple[SortFieldSpec, ...] | None = None
 
     def planner_knobs(self) -> PlannerKnobs:
         """The planner's view of the flush-policy knobs."""
@@ -514,6 +605,361 @@ def _parse_stage_url(raw: str, problems: list[str]) -> tuple[str, str] | None:
     return None
 
 
+def _split_top_level_commas(raw: str) -> list[str]:
+    """millpond's ``_split_top_level_commas`` (config.py): split on
+    commas outside parentheses, so ``bucket(team_id, 16)`` and
+    ``amount:decimal(10,2)`` stay one entry. Blank entries are dropped
+    (trailing commas tolerated). Extended to treat ``<…>`` as brackets
+    too, so a DDL-style ``m:map<string,string>`` reaches the type parser
+    as ONE entry and gets ONE nested-type refusal rather than two
+    half-entries' worth."""
+    entries: list[str] = []
+    depth = 0
+    current: list[str] = []
+    for ch in raw:
+        if ch in "(<":
+            depth += 1
+        elif ch in ")>":
+            depth = max(0, depth - 1)
+        if ch == "," and depth == 0:
+            entries.append("".join(current).strip())
+            current = []
+        else:
+            current.append(ch)
+    entries.append("".join(current).strip())
+    return [e for e in entries if e]
+
+
+def _parse_catalog_data_path(raw: str, problems: list[str]) -> str | None:
+    """``MILLRACE_CATALOG_DATA_PATH``: an ``s3://bucket/prefix`` URL,
+    held to the same bucket-name and non-empty-prefix rules as
+    ``MILLRACE_STAGE_URL``'s s3 form; passed to the server verbatim
+    (a trailing slash included — the catalog's data_path is the lake's
+    root, hoglake's own examples carry one)."""
+    if not raw.startswith("s3://"):
+        problems.append(
+            f"MILLRACE_CATALOG_DATA_PATH {raw!r} must be an s3://bucket/prefix "
+            f"URL (the catalog's data_path when millrace creates it)"
+        )
+        return None
+    bucket, _, prefix = raw[len("s3://") :].partition("/")
+    if not _S3_BUCKET.match(bucket):
+        problems.append(
+            f"MILLRACE_CATALOG_DATA_PATH {raw!r}: {bucket!r} is not a valid s3 "
+            f"bucket name (expected s3://bucket/prefix)"
+        )
+        return None
+    if not prefix.strip("/"):
+        problems.append(
+            f"MILLRACE_CATALOG_DATA_PATH {raw!r} names no prefix below the "
+            f"bucket; a catalog's data path is a lake root, e.g. "
+            f"s3://{bucket}/lake/"
+        )
+        return None
+    return raw
+
+
+def _s3_bucket_url(data_path: str) -> str:
+    """``s3://bucket/prefix/`` → ``s3://bucket`` (the shape
+    ``_parse_stage_url`` returns as the store URL)."""
+    return "s3://" + data_path[len("s3://") :].partition("/")[0]
+
+
+def _parse_column_type(
+    entry: str, type_raw: str, problems: list[str]
+) -> tuple[str, tuple[tuple[str, int], ...]] | None:
+    """A hoglake type name, with ``decimal(p,s)``'s parameters, as
+    ``coltype_to_arrow`` will accept it. Nested containers and
+    ``variant`` are refused here: the grammar cannot express a
+    container's children, and millrace cannot write a variant column
+    (coerce.py) — a column it could never stage is not a column to
+    create."""
+    type_name = type_raw.lower()
+    params: tuple[tuple[str, int], ...] = ()
+    if "<" in type_name or ">" in type_name:
+        # DDL-style ``map<string,string>`` / ``list<long>``: a container.
+        problems.append(
+            f"MILLRACE_TABLE_COLUMNS entry {entry!r}: nested type "
+            f"{type_name!r} cannot be expressed in this grammar (a container "
+            f"needs its children); create the table with pyhoglake and point "
+            f"millrace at it"
+        )
+        return None
+    decimal = _DECIMAL_TYPE.match(type_name)
+    if decimal is not None:
+        type_name = "decimal"
+        precision, scale = int(decimal.group(1)), int(decimal.group(2))
+        if not 1 <= precision <= _DECIMAL_MAX_PRECISION or not 0 <= scale <= precision:
+            problems.append(
+                f"MILLRACE_TABLE_COLUMNS entry {entry!r}: decimal(p,s) needs "
+                f"1 <= p <= {_DECIMAL_MAX_PRECISION} and 0 <= s <= p, got "
+                f"decimal({precision},{scale})"
+            )
+            return None
+        params = (("precision", precision), ("scale", scale))
+    elif type_name == "decimal":
+        problems.append(
+            f"MILLRACE_TABLE_COLUMNS entry {entry!r}: decimal needs its "
+            f"precision and scale, e.g. decimal(10,2)"
+        )
+        return None
+    if type_name in NESTED_TYPES:
+        problems.append(
+            f"MILLRACE_TABLE_COLUMNS entry {entry!r}: nested type {type_name!r} "
+            f"cannot be expressed in this grammar (a container needs its "
+            f"children); create the table with pyhoglake and point millrace "
+            f"at it"
+        )
+        return None
+    if type_name == "variant":
+        problems.append(
+            f"MILLRACE_TABLE_COLUMNS entry {entry!r}: millrace cannot write a "
+            f"variant column (pyarrow has no native Parquet VARIANT writer)"
+        )
+        return None
+    try:
+        arrow_type = coltype_to_arrow(type_name, dict(params) or None)
+    except UnsupportedTypeError as e:
+        problems.append(f"MILLRACE_TABLE_COLUMNS entry {entry!r}: {e}")
+        return None
+    # A type whose Arrow round trip changes it (uint32 → long: pyhoglake's
+    # writer contract) would create a column of ANOTHER type than the
+    # one configured, and the agreement check would then warn forever.
+    stored = arrow_type_to_coltype(arrow_type)[0]
+    if stored != type_name:
+        problems.append(
+            f"MILLRACE_TABLE_COLUMNS entry {entry!r}: {type_name!r} is stored "
+            f"as {stored!r} by the writer; configure {stored}"
+        )
+        return None
+    return type_name, params
+
+
+def _parse_table_columns(
+    raw: str, problems: list[str]
+) -> tuple[ColumnSpec, ...] | None:
+    """``MILLRACE_TABLE_COLUMNS``: ``name:type,name:type,…`` (module
+    docstring). Every problem is recorded; None when any was."""
+    entries = _split_top_level_commas(raw)
+    if not entries:
+        problems.append("MILLRACE_TABLE_COLUMNS is set but contains no entries")
+        return None
+    out: list[ColumnSpec] = []
+    seen: set[str] = set()
+    ok = True
+    for entry in entries:
+        name, sep, type_raw = (part.strip() for part in entry.partition(":"))
+        if not sep or not name or not type_raw:
+            problems.append(
+                f"MILLRACE_TABLE_COLUMNS entry {entry!r} is not name:type "
+                f"(e.g. team_id:long)"
+            )
+            ok = False
+            continue
+        if not _IDENTIFIER.match(name):
+            problems.append(
+                f"MILLRACE_TABLE_COLUMNS column {name!r} is not a valid hoglake "
+                f"identifier (must match [A-Za-z_][A-Za-z0-9_-]{{0,127}})"
+            )
+            ok = False
+            continue
+        if name.startswith(_RESERVED_COLUMN_PREFIX):
+            problems.append(
+                f"MILLRACE_TABLE_COLUMNS column {name!r} uses the reserved prefix "
+                f"{_RESERVED_COLUMN_PREFIX!r} (hoglake's own physical columns)"
+            )
+            ok = False
+            continue
+        if name in seen:
+            problems.append(f"MILLRACE_TABLE_COLUMNS column {name!r} is duplicated")
+            ok = False
+            continue
+        seen.add(name)
+        parsed = _parse_column_type(entry, type_raw, problems)
+        if parsed is None:
+            ok = False
+            continue
+        out.append(ColumnSpec(name, parsed[0], parsed[1]))
+    return tuple(out) if ok else None
+
+
+def _parse_partition_by(
+    raw: str, problems: list[str]
+) -> tuple[PartitionFieldSpec, ...] | None:
+    """``MILLRACE_PARTITION_BY``: millpond's ``_parse_hoglake_partition_by``
+    (config.py) — the same grammar, so a millpond value works here:
+
+    - ``col``                → identity(col)
+    - ``identity(col)``      → identity(col)
+    - ``year(col)`` / ``month(col)`` / ``day(col)`` / ``hour(col)``
+    - ``bucket(col, N)``     → bucket with a positive integer param
+
+    Everything else is refused HERE, with the vocabulary in the message.
+    Column names are held to the hoglake identifier rule (a superset of
+    millpond's SAFE_IDENTIFIER). Every problem is recorded; None when
+    any was."""
+
+    def bad(entry: str, why: str) -> None:
+        problems.append(
+            f"MILLRACE_PARTITION_BY entry {entry!r} {why}; supported forms: "
+            f"col | transform(col) | bucket(col, N) with transforms "
+            f"{', '.join(PARTITION_TRANSFORMS)}"
+        )
+
+    entries = _split_top_level_commas(raw)
+    if not entries:
+        problems.append("MILLRACE_PARTITION_BY is set but contains no entries")
+        return None
+    fields: list[PartitionFieldSpec] = []
+    seen: set[PartitionFieldSpec] = set()
+    ok = True
+    for entry in entries:
+        call = _PARTITION_CALL.match(entry)
+        param: int | None
+        if call is None:
+            if "(" in entry or ")" in entry:
+                bad(entry, "is malformed")
+                ok = False
+                continue
+            transform, column, param = "identity", entry, None
+        else:
+            transform = call.group(1).lower()
+            args = (
+                [a.strip() for a in call.group(2).split(",")] if call.group(2) else []
+            )
+            if transform not in PARTITION_TRANSFORMS:
+                bad(entry, f"uses unknown transform {transform!r}")
+                ok = False
+                continue
+            if transform == "bucket":
+                if len(args) != 2:
+                    bad(entry, "must be bucket(col, N)")
+                    ok = False
+                    continue
+                column = args[0]
+                try:
+                    param = int(args[1])
+                except ValueError:
+                    bad(entry, f"has non-integer bucket count {args[1]!r}")
+                    ok = False
+                    continue
+                if param <= 0:
+                    bad(entry, f"has non-positive bucket count {param}")
+                    ok = False
+                    continue
+            else:
+                if len(args) != 1 or not args[0]:
+                    bad(entry, f"must be {transform}(col)")
+                    ok = False
+                    continue
+                column, param = args[0], None
+        if not _IDENTIFIER.match(column):
+            bad(
+                entry,
+                f"has an invalid column name {column!r} (must match "
+                f"[A-Za-z_][A-Za-z0-9_-]{{0,127}})",
+            )
+            ok = False
+            continue
+        field = PartitionFieldSpec(column, transform, param)
+        if field in seen:
+            bad(entry, "is duplicated")
+            ok = False
+            continue
+        seen.add(field)
+        fields.append(field)
+    return tuple(fields) if ok else None
+
+
+def _parse_sort_by(raw: str, problems: list[str]) -> tuple[SortFieldSpec, ...] | None:
+    """``MILLRACE_SORT_BY``: a superset of millpond's ``_parse_column_list``
+    (config.py, behind ``MILLPOND_SORT_BY``). Comma-separated entries,
+    each ``col [asc|desc] [nulls_first|nulls_last]`` (keywords
+    case-insensitive; ``nulls first`` / ``nulls last`` accepted too),
+    defaulting to ``asc nulls_last`` — so a bare millpond value parses
+    to exactly the order millpond declares. Whitespace trimmed, empty
+    entries dropped, duplicate columns de-duplicated (first wins). None
+    for a value with no entries."""
+    fields: list[SortFieldSpec] = []
+    seen: set[str] = set()
+    ok = True
+
+    def bad(entry: str, why: str) -> None:
+        nonlocal ok
+        problems.append(
+            f"MILLRACE_SORT_BY entry {entry!r} {why}; expected "
+            f"col [asc|desc] [nulls_first|nulls_last]"
+        )
+        ok = False
+
+    for entry in (t.strip() for t in raw.split(",")):
+        if not entry:
+            continue
+        tokens = entry.split()
+        name = tokens[0]
+        if not _IDENTIFIER.match(name):
+            problems.append(
+                f"MILLRACE_SORT_BY column {name!r} is not a valid hoglake "
+                f"identifier (must match [A-Za-z_][A-Za-z0-9_-]{{0,127}})"
+            )
+            ok = False
+            continue
+        # ``nulls first`` → ``nulls_first``, so both spellings read alike.
+        rest = " ".join(t.lower() for t in tokens[1:]).replace("nulls ", "nulls_")
+        modifiers = rest.split()
+        direction, null_order = SORT_DIRECTION, SORT_NULL_ORDER
+        if modifiers and modifiers[0] in SORT_DIRECTIONS:
+            direction = modifiers.pop(0)
+        if modifiers and modifiers[0] in SORT_NULL_ORDERS:
+            null_order = modifiers.pop(0)
+        if modifiers:
+            bad(entry, f"has unrecognised modifier(s) {' '.join(modifiers)!r}")
+            continue
+        if name in seen:
+            continue
+        seen.add(name)
+        fields.append(SortFieldSpec(name, direction, null_order))
+    if not ok:
+        return None
+    return tuple(fields) or None
+
+
+def _check_fields_against_columns(
+    columns: tuple[ColumnSpec, ...],
+    partition_by: tuple[PartitionFieldSpec, ...] | None,
+    sort_by: tuple[SortFieldSpec, ...] | None,
+    problems: list[str],
+) -> None:
+    """The relation between the three: with ``MILLRACE_TABLE_COLUMNS``
+    given, every partition source and sort column names a configured
+    column, and each transform is valid for its source's type (the
+    check the server's ``set_partition_spec`` would make, made at boot
+    so the create cannot 422)."""
+    by_name = {c.name: c for c in columns}
+    for field in partition_by or ():
+        column = by_name.get(field.column)
+        if column is None:
+            problems.append(
+                f"MILLRACE_PARTITION_BY {field.describe()} names column "
+                f"{field.column!r}, which is not in MILLRACE_TABLE_COLUMNS "
+                f"(columns: {sorted(by_name)})"
+            )
+            continue
+        try:
+            check_transform(field.transform, column.col_type, field.param)
+        except ValidationError as e:
+            problems.append(
+                f"MILLRACE_PARTITION_BY {field.describe()} cannot be applied to "
+                f"{field.column}:{column.col_type}: {e.message}"
+            )
+    for sort_field in sort_by or ():
+        if sort_field.column not in by_name:
+            problems.append(
+                f"MILLRACE_SORT_BY column {sort_field.column!r} is not in "
+                f"MILLRACE_TABLE_COLUMNS (columns: {sorted(by_name)})"
+            )
+
+
 def load_config(env: Mapping[str, str]) -> Config:
     """Parse and validate the ``MILLRACE_*`` environment variables.
 
@@ -611,6 +1057,41 @@ def load_config(env: Mapping[str, str]) -> Config:
     stage: tuple[str, str] | None = None
     if stage_raw is not None:
         stage = _parse_stage_url(stage_raw, problems)
+
+    # Destination creation knobs (module docstring): each optional, each
+    # parsed on its own, then the relation between them.
+    catalog_data_path: str | None = None
+    if raw := env.get("MILLRACE_CATALOG_DATA_PATH", "").strip():
+        catalog_data_path = _parse_catalog_data_path(raw, problems)
+    # The staging store and the lake must be DIFFERENT buckets: the lake
+    # role grants prefix-scoped put/list on the lake bucket, so a staging
+    # root pointed there is partially allowed — SlateDB lands a manifest
+    # before the first refused write — and the failure is late and
+    # half-written rather than at boot.
+    if (
+        catalog_data_path is not None
+        and stage is not None
+        and stage[0].startswith("s3://")
+        and stage[0] == _s3_bucket_url(catalog_data_path)
+    ):
+        problems.append(
+            f"MILLRACE_STAGE_URL {stage_raw!r} and MILLRACE_CATALOG_DATA_PATH "
+            f"{catalog_data_path!r} name the same s3 bucket "
+            f"({stage[0][len('s3://') :]!r}): the staging store and the lake "
+            f"must be different buckets (the lake role's prefix-scoped grants "
+            f"would let SlateDB half-write a staging root into the lake bucket)"
+        )
+    table_columns: tuple[ColumnSpec, ...] | None = None
+    if raw := env.get("MILLRACE_TABLE_COLUMNS", "").strip():
+        table_columns = _parse_table_columns(raw, problems)
+    partition_by: tuple[PartitionFieldSpec, ...] | None = None
+    if raw := env.get("MILLRACE_PARTITION_BY", "").strip():
+        partition_by = _parse_partition_by(raw, problems)
+    sort_by: tuple[SortFieldSpec, ...] | None = None
+    if raw := env.get("MILLRACE_SORT_BY", "").strip():
+        sort_by = _parse_sort_by(raw, problems)
+    if table_columns is not None:
+        _check_fields_against_columns(table_columns, partition_by, sort_by, problems)
 
     target_output_bytes = _positive_int(
         env, "MILLRACE_TARGET_OUTPUT_BYTES", TARGET_OUTPUT_BYTES_DEFAULT, problems
@@ -799,4 +1280,8 @@ def load_config(env: Mapping[str, str]) -> Config:
         compression_ratio_halflife=compression_ratio_halflife,
         flush_concurrency=flush_concurrency,
         slatedb=slatedb,
+        catalog_data_path=catalog_data_path,
+        table_columns=table_columns,
+        partition_by=partition_by,
+        sort_by=sort_by,
     )

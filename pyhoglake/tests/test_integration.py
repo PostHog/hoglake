@@ -770,6 +770,38 @@ def test_partitioned_append_fanout(catalog, ns):
     assert _info_at_head(catalog, table).record_count == total
 
 
+def test_create_table_with_initial_partition_and_sort_fields(catalog, ns):
+    """One request installs columns, partition spec and sort order: the
+    read-back carries both, resolved against the ids the server assigned
+    (depth-first from 1), and the race loser gets AlreadyExistsError."""
+    assert "atomic-partitioned-table-creation-v1" in catalog.info.capabilities
+    table = ns.create_table(
+        "part_sorted_events",
+        _part_schema(),
+        partition_fields=[
+            ops.NamedPartitionField("team_id"),
+            ops.NamedPartitionField("ts", "day"),
+        ],
+        sort_fields=[ops.NamedSortField("ts")],
+    )
+    info = table.info()
+    fid = {c.name: c.field_id for c in info.columns}
+    assert info.partition_spec is not None and info.sort_spec is not None
+    assert [(f.source_field_id, f.transform) for f in info.partition_spec.fields] == [
+        (fid["team_id"], "identity"),
+        (fid["ts"], "day"),
+    ]
+    assert [
+        (f.source_field_id, f.direction, f.null_order) for f in info.sort_spec.fields
+    ] == [(fid["ts"], "asc", "nulls_last")]
+    with pytest.raises(AlreadyExistsError):
+        ns.create_table(
+            "part_sorted_events",
+            _part_schema(),
+            partition_fields=[ops.NamedPartitionField("team_id")],
+        )
+
+
 def test_partitioned_compaction_groups_within_partition(catalog, ns):
     """Compaction (metadata-planned server-side: same spec + identical
     partition_values and size tier) must merge only within a partition.

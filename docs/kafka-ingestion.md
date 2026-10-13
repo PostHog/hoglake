@@ -566,9 +566,20 @@ the 1 MiB `max.partition.fetch.bytes` library default capped millpond's
 hot partition at ~50 MB/s), with the per-poll batch bounded by a record
 cap and an observed-average byte cap. Metrics remain passive
 observability, never control flow. Fail-fast config at
-startup: resolve catalog, namespace and table (the destination must
-exist and report `read_snapshot_id`) and pin the incarnation the read
-returns. Junk
+startup: create the destination from configuration when it does not
+exist, millpond's way (`millrace/destination.py`: the catalog with
+`MILLRACE_CATALOG_DATA_PATH`, the namespace, and the table in ONE
+atomic request from `MILLRACE_TABLE_COLUMNS` + `MILLRACE_PARTITION_BY`
++ `MILLRACE_SORT_BY` — the partition tuple is the staging key and
+millrace drops unknown keys with no schema evolution, so the complete
+shape must exist before the first record is staged; a missing object
+the config cannot create is exit 2 naming the knob; the replica race
+is tolerated; an existing table is compared and never altered, a
+difference is one WARNING), then resolve catalog, namespace and table
+(the server must report `read_snapshot_id`) and pin the incarnation
+the read returns. The recommended dev shape is
+`MILLRACE_PARTITION_BY=identity(team_id),day(timestamp)` and
+`MILLRACE_SORT_BY=timestamp`. Junk
 `event_time` policy (clamp vs drop) is config, validated at boot.
 
 Metrics are passive — they never feed control flow — and scraped from

@@ -64,6 +64,13 @@ RUN_ID = uuid.uuid4().hex[:8]
 """Per-run disambiguator for catalogs, topics, groups and stage prefixes."""
 
 BUCKET = "millrace-itest"
+#: The LAKE bucket: catalogs the pipeline creates from config put their
+#: data_path here. A second bucket because config.py refuses a staging
+#: root in the lake's bucket (the lake role's prefix-scoped grants would
+#: let SlateDB half-write a staging root there); ``lake_home``'s
+#: pre-created catalogs stay on BUCKET, where the refusal does not
+#: apply (nothing of theirs is configured on the pipeline).
+LAKE_BUCKET = "millrace-itest-lake"
 """The one bucket: lake data under ``lake/``, SlateDB staging under ``stage/``."""
 
 MICROS_PER_SECOND = 1_000_000
@@ -870,6 +877,11 @@ class Child:
         import httpx
 
         def ready() -> bool:
+            if self.proc is not None and self.proc.poll() is not None:
+                raise AssertionError(
+                    f"child {self.name} exited with {self.proc.returncode} before "
+                    f"/readyz; output:\n{self.output()[-4000:]}"
+                )
             try:
                 return (
                     httpx.get(f"http://127.0.0.1:{port}/readyz", timeout=2).status_code

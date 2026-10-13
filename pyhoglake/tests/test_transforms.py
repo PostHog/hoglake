@@ -921,3 +921,41 @@ def test_transform_strings_month_matches_scalars(values):
     arr = pa.array(values, pa.timestamp("us"))
     got = transform_strings("month", None, arr, "timestamp").to_pylist()
     assert got == _scalar_strings("month", None, values, "timestamp")
+
+
+@pytest.mark.parametrize(
+    ("transform", "col_type", "param"),
+    [
+        ("identity", "long", None),
+        ("identity", "json", None),
+        ("bucket", "long", 16),
+        ("bucket", "uuid", 4),
+        ("year", "date", None),
+        ("day", "timestamptz", None),
+        ("hour", "timestamp", None),
+    ],
+)
+def test_check_transform_accepts_the_server_matrix(transform, col_type, param):
+    transforms.check_transform(transform, col_type, param)
+
+
+@pytest.mark.parametrize(
+    ("transform", "col_type", "param", "needle"),
+    [
+        ("bucket", "double", 16, "bucket cannot be applied"),
+        ("bucket", "json", 16, "bucket cannot be applied"),
+        ("bucket", "long", None, "positive bucket count"),
+        ("bucket", "long", 0, "positive bucket count"),
+        # truncate is a value transform here, not a server partition
+        # transform (Model.kt enum class Transform).
+        ("truncate", "string", 8, "unknown partition transform 'truncate'"),
+        ("hour", "date", None, "hour transform cannot be applied"),
+        ("month", "string", None, "month transform cannot be applied"),
+        ("year", "date", 3, "does not take transform_param"),
+        ("identity", "long", 3, "does not take transform_param"),
+        ("void", "long", None, "unknown partition transform"),
+    ],
+)
+def test_check_transform_refuses_without_a_value(transform, col_type, param, needle):
+    with pytest.raises(ValidationError, match=needle):
+        transforms.check_transform(transform, col_type, param)

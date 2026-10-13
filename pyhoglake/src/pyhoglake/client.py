@@ -50,19 +50,32 @@ from .models import (
     ConsumerOffset,
     DataFile,
     ExpiryResult,
+    PartitionField,
     PartitionSpec,
     ScanFile,
     Snapshot,
     SnapshotResolution,
+    SortField,
     TableInfo,
     TableSummary,
     ViewInfo,
 )
-from .ops import AlterOp
+from .ops import (
+    AlterOp,
+    NamedPartitionField,
+    NamedSortField,
+    set_partition_spec,
+    set_sort_order,
+)
 from .parquet_schema import prepared_schema_matches, validate_variant_file
 from .stats import extract_column_stats
 from .transforms import partition_source_array, transform_strings
-from .types import columns_to_arrow_schema, is_list_family, schema_to_column_defs
+from .types import (
+    column_def_field_ids,
+    columns_to_arrow_schema,
+    is_list_family,
+    schema_to_column_defs,
+)
 from .upload import (
     Upload,
     perform_upload,
@@ -251,6 +264,48 @@ def _check_reserved_columns(schema: pa.Schema) -> None:
             "rename them",
             status_code=None,
         )
+
+
+#: Catalog capabilities (``CatalogInfo.capabilities``) that gate the
+#: atomic creation path of :meth:`Namespace.create_table`.
+ATOMIC_PARTITIONED_CREATION = "atomic-partitioned-table-creation-v1"
+ATOMIC_SORTED_CREATION = "atomic-sorted-table-creation-v1"
+
+
+def _check_creation_receipt(receipt: Any, name: str, *, publish: bool) -> None:
+    """A table-creations receipt is HTTP 200 whatever it says: the state
+    and reason carry the outcome. ``target_exists`` at publish is the
+    create race, surfaced as :class:`AlreadyExistsError` like a plain
+    create's 409 so a caller's race handling is one branch; any other
+    terminal state is a :class:`CommitConflictError` naming the reason."""
+    if not isinstance(receipt, Mapping):
+        raise HoglakeError(
+            f"table creation of {name!r}: expected a receipt object, got "
+            f"{type(receipt).__name__}"
+        )
+    state = receipt.get("state")
+    reason = receipt.get("reason")
+    if state == "committed" or (state == "prepared" and not publish):
+        return
+    if state == "rejected" and reason == "target_exists":
+        raise AlreadyExistsError(
+            f"table {name!r} already exists (atomic creation rejected: target_exists)",
+            status_code=409,
+        )
+    if state == "rejected" and reason == "definition_invalid":
+        # The definition was legal when prepared and is not any more (a
+        # rule tightened between prepare and publish): the request is
+        # wrong, not the timing — never retryable as-is.
+        raise ValidationError(
+            f"table creation of {name!r} was rejected: definition_invalid "
+            f"(the prepared definition is no longer accepted by the server)",
+            status_code=None,
+        )
+    raise CommitConflictError(
+        f"table creation of {name!r} did not {'publish' if publish else 'prepare'}: "
+        f"state={state!r} reason={reason!r}",
+        status_code=None,
+    )
 
 
 def _seg(name: object) -> str:
@@ -983,14 +1038,105 @@ class Namespace:
 
     # -- tables ------------------------------------------------------------
 
-    def create_table(self, name: str, schema: pa.Schema) -> Table:
+    def create_table(
+        self,
+        name: str,
+        schema: pa.Schema,
+        *,
+        partition_fields: Sequence[NamedPartitionField | PartitionField] | None = None,
+        sort_fields: Sequence[NamedSortField | SortField] | None = None,
+    ) -> Table:
+        """Create a table from ``schema``, optionally with its initial
+        partition spec and sort order.
+
+        A :class:`~pyhoglake.ops.NamedPartitionField` /
+        :class:`~pyhoglake.ops.NamedSortField` names its source column by
+        dotted path and is resolved to the field id the server will
+        assign (:func:`pyhoglake.types.column_def_field_ids`); a
+        :class:`PartitionField` / :class:`SortField` carries that id
+        already.
+
+        With either list non-empty, and a catalog advertising
+        ``atomic-partitioned-table-creation-v1`` for partition fields
+        and ``atomic-sorted-table-creation-v1`` for sort fields,
+        the table is created ATOMICALLY through the server's
+        table-creations operation: prepare a definition that carries the
+        fields, then publish it, so the table never exists without its
+        spec and two writers racing to create it cannot interleave a
+        create with an alter — the loser's publish is refused
+        ``target_exists`` and surfaces as :class:`AlreadyExistsError`,
+        exactly as a plain create's 409 does. Against a catalog that does
+        not advertise the capability the client falls back to the plain
+        create followed by one alter carrying both specs — NOT atomic:
+        the table exists unpartitioned (and unsorted) between the two
+        requests, and a concurrent reader can observe and act on that
+        empty spec. A writer that keys state by the spec (millrace)
+        must require the capability instead (``catalog.info.capabilities``).
+        """
         _check_reserved_columns(schema)
-        body = self._catalog._client._request(
-            "POST",
-            self._path("/tables"),
-            json={"name": name, "columns": schema_to_column_defs(schema)},
+        columns = schema_to_column_defs(schema)
+        field_ids = column_def_field_ids(columns)
+        parts = [
+            f.resolve(field_ids) if isinstance(f, NamedPartitionField) else f
+            for f in (partition_fields or ())
+        ]
+        sorts = [
+            f.resolve(field_ids) if isinstance(f, NamedSortField) else f
+            for f in (sort_fields or ())
+        ]
+        if not parts and not sorts:
+            body = self._catalog._client._request(
+                "POST", self._path("/tables"), json={"name": name, "columns": columns}
+            )
+            return Table(self, TableInfo.from_wire(body))
+        # Each list needs its own capability: a partition spec the
+        # partitioned one, a sort order the sorted one. A sort-only
+        # creation rides the sorted endpoint and needs only that.
+        caps = set(self._catalog.info.capabilities)
+        atomic = (not parts or ATOMIC_PARTITIONED_CREATION in caps) and (
+            not sorts or ATOMIC_SORTED_CREATION in caps
         )
-        return Table(self, TableInfo.from_wire(body))
+        if not atomic:
+            table = self.create_table(name, schema)
+            ops: list[AlterOp] = []
+            if parts:
+                ops.append(set_partition_spec(list(parts)))
+            if sorts:
+                ops.append(set_sort_order(list(sorts)))
+            table.alter(ops)
+            return table
+        return self._create_table_atomically(name, columns, parts, sorts)
+
+    def _create_table_atomically(
+        self,
+        name: str,
+        columns: list[dict[str, Any]],
+        parts: Sequence[PartitionField],
+        sorts: Sequence[SortField],
+    ) -> Table:
+        """Prepare + publish one table-creations operation carrying the
+        initial partition and sort fields. The ``/sorted`` preparation
+        endpoint takes both lists (sort fields required there); the
+        ``/partitioned`` one takes partition fields only."""
+        client = self._catalog._client
+        operation = str(_uuid.uuid4())
+        base = self._catalog._path(f"/table-creations/{operation}")
+        definition: dict[str, Any] = {
+            "namespace": self.name,
+            "name": name,
+            "columns": columns,
+        }
+        if parts:
+            definition["partition_fields"] = [f.to_wire() for f in parts]
+        if sorts:
+            definition["sort_fields"] = [f.to_wire() for f in sorts]
+        prepared = client._request(
+            "PUT", base + ("/sorted" if sorts else "/partitioned"), json=definition
+        )
+        _check_creation_receipt(prepared, name, publish=False)
+        receipt = client._request("POST", base + "/commit", json={"files": []})
+        _check_creation_receipt(receipt, name, publish=True)
+        return self.table(name)
 
     def table(self, name: str) -> Table:
         body = self._catalog._client._request(
