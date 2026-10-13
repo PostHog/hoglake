@@ -126,19 +126,48 @@ def test_renamed_knob_with_an_empty_value_is_unset_not_refused():
     assert cfg.slow_lane_deadline_s == 21600
 
 
-# -- the slow lane's 6-24 h range ------------------------------------------------------
+# -- the slow lane sits at or above the age lane -------------------------------------
 
 
-@pytest.mark.parametrize("raw", ["21599", "86401", "3600", "172800"])
-def test_slow_lane_deadline_outside_6_to_24_h_is_refused(raw):
-    (p,) = problems(MINIMAL_ENV | {"MILLRACE_SLOW_LANE_DEADLINE_S": raw})
-    assert "MILLRACE_SLOW_LANE_DEADLINE_S" in p and raw in p
+@pytest.mark.parametrize(
+    "slow,flush", [("899", "900"), ("60", "900"), ("1", "2"), ("3599", "3600")]
+)
+def test_slow_lane_below_the_flush_deadline_is_refused_naming_both(slow, flush):
+    (p,) = problems(
+        MINIMAL_ENV
+        | {"MILLRACE_SLOW_LANE_DEADLINE_S": slow, "MILLRACE_FLUSH_DEADLINE_S": flush}
+    )
+    assert "MILLRACE_SLOW_LANE_DEADLINE_S" in p and "MILLRACE_FLUSH_DEADLINE_S" in p
+    assert slow in p and flush in p
 
 
-@pytest.mark.parametrize("raw", ["21600", "43200", "86400"])
-def test_slow_lane_deadline_inside_6_to_24_h_is_accepted(raw):
-    cfg = load(MINIMAL_ENV | {"MILLRACE_SLOW_LANE_DEADLINE_S": raw})
-    assert cfg.slow_lane_deadline_s == int(raw)
+@pytest.mark.parametrize(
+    "slow,flush",
+    [
+        ("900", "900"),  # equal: the slow lane IS the age lane for tiny keys
+        ("120", "60"),  # dev shape: minutes, not hours
+        ("1", "1"),
+        ("21600", "900"),  # the production default
+        ("172800", "900"),  # no upper bound
+    ],
+)
+def test_slow_lane_at_or_above_the_flush_deadline_is_accepted(slow, flush):
+    cfg = load(
+        MINIMAL_ENV
+        | {"MILLRACE_SLOW_LANE_DEADLINE_S": slow, "MILLRACE_FLUSH_DEADLINE_S": flush}
+    )
+    assert cfg.slow_lane_deadline_s == int(slow)
+    assert cfg.flush_deadline_s == int(flush)
+
+
+def test_slow_lane_relation_is_not_checked_when_either_side_is_already_invalid():
+    # One problem per knob at fault, never a derived one on top: a
+    # refused value is None and the relation stays quiet about it.
+    probs = problems(
+        MINIMAL_ENV
+        | {"MILLRACE_SLOW_LANE_DEADLINE_S": "60", "MILLRACE_FLUSH_DEADLINE_S": "x"}
+    )
+    assert len(probs) == 1 and "MILLRACE_FLUSH_DEADLINE_S" in probs[0]
 
 
 # -- required knobs and the all-problems-at-once refusal ---------------------------

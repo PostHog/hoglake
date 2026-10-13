@@ -209,7 +209,7 @@ lane once per deadline, not on every sweep:
 |---|---|---|
 | size | `staged_bytes × compression_ratio ≥ target_output_bytes` (default 500 MB) | whales — early, often, full-size files |
 | age | `age ≥ flush_deadline` (15 min) **and** `staged_bytes ≥ min_flush_bytes` | medium tenants — the freshness SLA |
-| slow | `age ≥ slow_lane_deadline` (6–24 h) | pathological low-volume keys |
+| slow | `age ≥ slow_lane_deadline` (6 h; must be ≥ `flush_deadline`) | pathological low-volume keys |
 
 The **size lane sizes the output, not the input**: the trigger estimates
 the parquet file size, taking compression roughly into account. The
@@ -246,7 +246,9 @@ broker's message limit; the alternative is a wedged key).
 The **age lane carries a minimum size** so that genuinely tiny keys skip
 it: a tenant with a handful of staged rows at the 15-minute mark does
 not earn a file. The **slow lane** is where those keys live: one flush
-per 6–24 hours, which drops the pathological tail from ~96 files/day to
+per slow-lane deadline (6 h by default; 6–24 h is the production shape,
+and the only constraint is that it sits at or above the flush
+deadline), which drops the pathological tail from ~96 files/day to
 ~4/day per key — the cardinality that used to gum up the works now costs
 almost nothing, and the small-file floor of identity partitioning all
 but disappears as a compaction-arrival rate.
