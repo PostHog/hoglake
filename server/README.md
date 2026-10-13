@@ -30,6 +30,34 @@ storage in exactly three places: the hydrator's footer reads, cleanup's
 physical deletes, and compaction's rewrite (the one background job that
 reads and writes data files — always outside the commit path).
 
+## Internal storage footprint
+
+`GET /v1/catalogs/{catalog}/storage-usage` returns
+`{"tracked_bytes":"1234","pending_delete_files":"2"}`: **decimal int64 strings**,
+so a client must parse them losslessly. The existing v1 API has no application
+authentication; keep the service **network-private**, never expose this route
+publicly, and resolve a caller's catalog through the consuming service's own
+tenant authorization. Database predicates are bound to the resolved catalog id.
+
+`tracked_bytes` sums **all** registered data and delete file sizes, including
+ended files, retained history and dropped tables awaiting retirement. It is
+deliberately not a live-table/read-snapshot metric. Removing a registration
+reduces the total even while its object awaits cleanup; the queue stores no size.
+Unregistered uploads, queued-only objects and object-store versions are excluded.
+`pending_delete_files` counts removal **rows** with `drained_at IS NULL`,
+including claimed and staging tickets, not distinct paths or only delete vectors.
+Settled tickets (`deleted`, `absent`, `registered`) do not count.
+
+The exact aggregates run in one database statement, without the catalog commit
+lock or object-store I/O, and return one row. Exact sums visit manifest rows,
+not cached sampler estimates; the planner can also scan other catalogs' rows.
+Use low-frequency internal polling, not UI refreshes.
+A 15-second query deadline bounds work; a stricter database statement timeout
+still applies. A large catalog can fail this deadline: that is an explicit error,
+never a partial result or zero. Missing catalogs return 404, backend failures
+return 500, and snapshot/timestamp parameters return 400. The sampled **live**
+catalog/table totals remain the right choice for dashboards.
+
 ## The data model
 
 Everything hangs off five ideas (`db/migration/V1__init.sql`, mirrored

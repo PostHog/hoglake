@@ -19,6 +19,7 @@ import com.posthog.hoglake.model.Snapshot
 import com.posthog.hoglake.model.SnapshotResolution
 import com.posthog.hoglake.model.SortFieldDef
 import com.posthog.hoglake.model.StatsState
+import com.posthog.hoglake.model.StorageUsage
 import com.posthog.hoglake.model.TableInfo
 import com.posthog.hoglake.model.TableSummaryInfo
 import com.posthog.hoglake.model.initialColumns
@@ -33,6 +34,7 @@ import com.posthog.hoglake.persistence.OffsetRepo
 import com.posthog.hoglake.persistence.SnapshotRepo
 import com.posthog.hoglake.persistence.SortRepo
 import com.posthog.hoglake.persistence.SpecRepo
+import com.posthog.hoglake.persistence.StorageUsageRepo
 import com.posthog.hoglake.persistence.TableRepo
 import com.posthog.hoglake.persistence.TierTotalsRepo
 import com.posthog.hoglake.persistence.TimeTravelRepo
@@ -157,6 +159,13 @@ class CatalogService(private val jdbi: Jdbi) {
     fun getCatalog(name: String): CatalogInfo = jdbi.withHandleUnchecked { h -> requireCatalog(h, name) }
 
     fun listCatalogs(): List<CatalogInfo> = jdbi.withHandleUnchecked { h -> CatalogRepo.listAll(h) }
+
+    /** Missing catalog/database failures are errors, never an empty footprint. */
+    fun storageUsage(name: String): StorageUsage =
+        jdbi.withHandleUnchecked { h ->
+            val catalog = requireCatalog(h, name)
+            StorageUsageRepo.read(h, catalog.catalogId)
+        }
 
     // ---- namespaces ------------------------------------------------------
 
