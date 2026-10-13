@@ -40,7 +40,6 @@ def test_livekit_pins_earliest_offset_reset_for_test_determinism():
     cfg = livekit.live_config(
         topic="t",
         group="g",
-        partitions=(0,),
         stage_base_path="bench",
         catalog="c",
         namespace="ns",

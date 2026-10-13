@@ -38,7 +38,6 @@ def _cfg(lake_home, topic) -> object:
     return livekit.live_config(
         topic=topic.name,
         group=topic.group,
-        partitions=tuple(range(topic.partitions)),
         stage_base_path=f"stage/{livekit.RUN_ID}/{lake_home.slug}",
         catalog=lake_home.catalog.name,
         namespace="ns1",

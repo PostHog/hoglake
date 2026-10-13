@@ -26,8 +26,11 @@ Beyond the ``MILLRACE_*`` knobs (config.py), the process reads:
   reads for an ``s3://`` ``MILLRACE_STAGE_URL``; millrace neither maps
   nor overrides it.
 
-Exit codes: 0 clean stop (SIGINT/SIGTERM); 2 invalid configuration;
-3 the flush pipeline HALTED loudly (:class:`FlushHalted` — incarnation
+Exit codes: 0 clean stop (SIGINT/SIGTERM); 2 invalid configuration
+(:class:`ConfigError`, or an :class:`AssignmentError` at start — the
+replica count against the topic's partitions, or a topic the metadata
+does not know: a topology problem, logged in one line, nothing
+claimed); 3 the flush pipeline HALTED loudly (:class:`FlushHalted` — incarnation
 guard, expiry floor, idempotency anomaly); 4 the consumer was FENCED off
 a claimed partition's SlateDB path by a newer writer
 (:class:`ConsumerFencedError` — a blind restart re-opens the path and
@@ -63,7 +66,12 @@ from prometheus_client.core import REGISTRY, CounterMetricFamily, GaugeMetricFam
 
 from . import memdebug
 from .config import Config, ConfigError, load_config
-from .consumer import ConsumerFencedError, MillraceConsumer, create_kafka_consumer
+from .consumer import (
+    AssignmentError,
+    ConsumerFencedError,
+    MillraceConsumer,
+    create_kafka_consumer,
+)
 from .flush import REPREPARE_REASONS, FlushHalted, FlushRunner, HoglakeFlusher
 from .grouping import GroupKeyer
 from .server import serve
@@ -108,16 +116,21 @@ def _exit_code_for(outcomes: Sequence[BaseException | None]) -> int:
     """The process exit code for the pipeline's task outcomes — pure, so
     the map is unit-testable without running the pipeline.
 
-    FENCED outranks HALTED outranks a generic error: the fence is the
-    most time-critical signal (a blind restart flaps against the new
-    owner NOW), and a halt's reconciliation can wait for an operator
-    either way. Clean outcomes (None results, plain stops) are 0.
+    FENCED outranks HALTED outranks an assignment refusal outranks a
+    generic error: the fence is the most time-critical signal (a blind
+    restart flaps against the new owner NOW), and a halt's
+    reconciliation can wait for an operator either way. An
+    :class:`AssignmentError` is a topology/config problem (the replica
+    count against the topic), so it shares ``ConfigError``'s exit 2.
+    Clean outcomes (None results, plain stops) are 0.
     """
     errors = [o for o in outcomes if isinstance(o, BaseException)]
     if any(isinstance(o, ConsumerFencedError) for o in errors):
         return EXIT_FENCED
     if any(isinstance(o, FlushHalted) for o in errors):
         return EXIT_HALTED
+    if any(isinstance(o, AssignmentError) for o in errors):
+        return EXIT_CONFIG
     if errors:
         return EXIT_ERROR
     return 0
@@ -215,8 +228,8 @@ class _PipelineCollector:
     The ``millrace_partition_*`` families are the deliberate exception
     to the no-per-partition-series rule: a stuck partition must be
     FINDABLE (PR #331), and the label cardinality is bounded by the
-    pod's ASSIGNED partitions (the K of the static list or the group
-    assignment — tens, not the partition-tuple count). ``millrace_flush_partition_
+    pod's ASSIGNED partitions (the K of the pod's derived share of the
+    topic — tens, not the partition-tuple count). ``millrace_flush_partition_
     fenced`` carries the flush runner's fenced set the same way.
     """
 
@@ -591,6 +604,13 @@ async def _run(cfg: Config, hoglake_url: str, s3_kwargs: Mapping[str, Any]) -> i
                     "millrace HALTED: %s — staged state is durable and the "
                     "pipeline does not recover on its own; fix the cause and "
                     "restart",
+                    outcome,
+                )
+            elif isinstance(outcome, AssignmentError):
+                # A topology refusal, not a crash: one line, no traceback.
+                log.error(
+                    "millrace refused to start: %s — fix MILLRACE_REPLICA_COUNT "
+                    "or the topic and redeploy (nothing was claimed)",
                     outcome,
                 )
             elif isinstance(outcome, BaseException):

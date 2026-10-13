@@ -14,11 +14,12 @@ Pinned here:
 - the call-order invariant: a commit is NEVER observed before the
   durable ack it covers (rows-then-offset, hedgerow's rule), and
   commits are monotone per partition;
-- static assignment uses OFFSET_STORED and opens+recovers the stages
-  BEFORE assign; cooperative assignment drives sync_assignment from the
-  rebalance callbacks — assign opens+recovers, revoke/lost close
-  cleanly with zero staged-data loss and no commit for the revoked
-  partition's in-flight messages;
+- the assignment is derived ONCE at start: the topic's partition count
+  from one ``list_topics`` metadata read, split by millpond's rule
+  (``p % replica_count == ordinal``, uneven counts included); the stages
+  open+recover BEFORE ``assign()`` with OFFSET_STORED; an unknown topic
+  or an ordinal with no partitions refuses to start with nothing
+  claimed;
 - the client-config pins: ``auto.offset.reset`` from the config knob
   (default ``latest``, the fleet policy — millpond's whole-retention
   replay; ``earliest`` stays selectable), ``enable.auto.commit`` /
@@ -74,7 +75,6 @@ from stagekit import NOW, fast_flush_settings, prepared, rec
 
 import millrace.consumer as consumer_mod
 from millrace.config import (
-    AssignmentMode,
     AutoOffsetReset,
     Config,
     EventTimePolicy,
@@ -85,10 +85,12 @@ from millrace.consumer import (
     REASON_MALFORMED_PARTITION_SOURCE,
     REASON_MALFORMED_VALUE,
     REASON_MISSING_VALUE,
+    AssignmentError,
     ConsumerFencedError,
     ConsumerStats,
     MillraceConsumer,
     classify_message,
+    compute_assignment,
     create_kafka_consumer,
     drop_reason_label,
     kafka_consumer_config,
@@ -115,8 +117,11 @@ def make_config(**overrides) -> Config:
         "kafka_bootstrap_servers": "broker:9092",
         "kafka_topic": "events",
         "kafka_group_id": "millrace-events",
-        "assignment_mode": AssignmentMode.STATIC,
-        "static_partitions": (0,),
+        # One replica, ordinal 0: with the fake's default one-partition
+        # topic the consumer claims exactly partition 0. A test wanting
+        # partitions 0 and 1 builds ``FakeConsumer(partitions=2)``.
+        "replica_count": 1,
+        "ordinal": 0,
         "catalog": "prod",
         "namespace": "default",
         "table": "events",
@@ -253,17 +258,16 @@ def make_consumer(
 async def run_steps(
     consumer: MillraceConsumer, fake: FakeConsumer, extra: int = 1
 ) -> None:
-    """Drive the loop until the fake has nothing deliverable and no
-    scripted rebalance pending, plus ``extra`` idle steps (the idle
-    steps matter: a trailing error event or a rebalance callback can
-    land on an otherwise-empty poll, so the drain condition is
+    """Drive the loop until the fake has nothing deliverable, plus
+    ``extra`` idle steps (the idle steps matter: a trailing error event
+    can land on an otherwise-empty poll, so the drain condition is
     re-checked after them)."""
     while True:
-        while fake.deliverable() or fake.has_pending_rebalance():
+        while fake.deliverable():
             await consumer._step()
         for _ in range(extra):
             await consumer._step()
-        if not (fake.deliverable() or fake.has_pending_rebalance()):
+        if not fake.deliverable():
             return
 
 
@@ -506,8 +510,47 @@ def test_consumer_config_defaults_to_latest_and_explicit_commits():
     assert conf["enable.auto.commit"] is False
     assert conf["enable.auto.offset.store"] is False
     assert conf["group.id"] == "millrace-events"
-    # Static assignment: no group rebalancing strategy on the wire.
+    # The consumer never joins the group: no assignment strategy on the
+    # wire. The client id carries the ordinal (millpond's shape) so the
+    # broker side can tell replicas apart.
     assert "partition.assignment.strategy" not in conf
+    assert conf["client.id"] == "millrace-events-0"
+
+
+def test_consumer_config_is_exactly_the_documented_dict_without_passthrough():
+    """No MILLRACE_KAFKA_CONSUMER_* set: the client config is exactly
+    millrace's own keys, nothing added, nothing renamed."""
+    assert kafka_consumer_config(make_config()) == {
+        "bootstrap.servers": "broker:9092",
+        "client.id": "millrace-events-0",
+        "group.id": "millrace-events",
+        "auto.offset.reset": "latest",
+        "enable.auto.commit": False,
+        "enable.auto.offset.store": False,
+        "max.partition.fetch.bytes": 32 * 1024 * 1024,
+        "fetch.max.bytes": 256 * 1024 * 1024,
+        "queued.max.messages.kbytes": 262144,
+    }
+
+
+def test_consumer_config_applies_the_passthrough_last():
+    """The operator's librdkafka passthrough lands AFTER millrace's own
+    keys: it can add security/rack settings and override client.id
+    (WarpStream's ws_az= zone pinning), verbatim strings."""
+    cfg = make_config(
+        kafka_consumer_overrides=(
+            ("client.id", "ws_az=use1-az1,millrace-events-0"),
+            ("client.rack", "use1-az1"),
+            ("security.protocol", "SSL"),
+        )
+    )
+    conf = kafka_consumer_config(cfg)
+    assert conf["client.id"] == "ws_az=use1-az1,millrace-events-0"
+    assert conf["client.rack"] == "use1-az1"
+    assert conf["security.protocol"] == "SSL"
+    # Everything millrace owns is untouched.
+    assert conf["enable.auto.commit"] is False
+    assert conf["group.id"] == "millrace-events"
 
 
 def test_consumer_config_earliest_stays_selectable():
@@ -527,14 +570,6 @@ def test_consumer_config_wires_the_fetch_tuning():
     assert conf["max.partition.fetch.bytes"] == 4 * 1024 * 1024
     assert conf["fetch.max.bytes"] == 64 * 1024 * 1024
     assert conf["queued.max.messages.kbytes"] == 131072
-
-
-def test_consumer_config_cooperative_sets_the_assignor():
-    conf = kafka_consumer_config(
-        make_config(assignment_mode=AssignmentMode.COOPERATIVE, static_partitions=None)
-    )
-    assert conf["partition.assignment.strategy"] == "cooperative-sticky"
-    assert conf["auto.offset.reset"] == "latest"
 
 
 def test_real_consumer_constructs_from_the_config():
@@ -560,9 +595,9 @@ async def test_static_start_opens_and_recovers_stages_before_assign(fake_clock):
         return await original_sync(claimed)
 
     manager.sync_assignment = spied_sync  # type: ignore[method-assign]
-    fake = FakeConsumer(journal=journal)
+    fake = FakeConsumer(journal=journal, partitions=3)
     consumer = make_consumer(
-        fake, manager, make_config(static_partitions=(0, 2)), fake_clock
+        fake, manager, make_config(replica_count=2, ordinal=0), fake_clock
     )
 
     await consumer.start()
@@ -649,9 +684,7 @@ async def test_claim_recovers_the_previous_owners_leftovers(fake_clock):
 
     manager.sync_assignment = spied_sync  # type: ignore[method-assign]
     fake = FakeConsumer(journal=journal)
-    consumer = make_consumer(
-        fake, manager, make_config(static_partitions=(0,)), fake_clock
-    )
+    consumer = make_consumer(fake, manager, make_config(), fake_clock)
     await consumer.start()
 
     (sync,) = captured
@@ -673,8 +706,8 @@ async def test_end_to_end_staged_rows_and_committed_offsets_cover(fake_clock):
     committed offsets exactly cover the produced ranges."""
     journal: list[tuple] = []
     manager = make_manager(journal)
-    fake = FakeConsumer(journal=journal)
-    cfg = make_config(static_partitions=(0, 1), consume_batch_size=7)
+    fake = FakeConsumer(journal=journal, partitions=2)
+    cfg = make_config(consume_batch_size=7)
     consumer = make_consumer(fake, manager, cfg, fake_clock)
     await consumer.start()
 
@@ -831,10 +864,8 @@ async def test_a_poll_of_only_dropped_records_still_commits(fake_clock):
     poll is not probed."""
     journal: list[tuple] = []
     manager = make_manager(journal)
-    fake = FakeConsumer(journal=journal)
-    consumer = make_consumer(
-        fake, manager, make_config(static_partitions=(0, 1)), fake_clock
-    )
+    fake = FakeConsumer(journal=journal, partitions=2)
+    consumer = make_consumer(fake, manager, make_config(), fake_clock)
     await consumer.start()
     _journal_probes(manager, journal)
 
@@ -873,12 +904,12 @@ async def test_drop_logging_is_rate_limited_per_partition_and_reason(
     names the suppressed count. The counter counts every drop."""
     journal: list[tuple] = []
     manager = make_manager(journal)
-    fake = FakeConsumer(journal=journal)
+    fake = FakeConsumer(journal=journal, partitions=2)
     mono = FakeMonotonic()
     consumer = make_consumer(
         fake,
         manager,
-        make_config(static_partitions=(0, 1)),
+        make_config(),
         fake_clock,
         monotonic=mono,
     )
@@ -1097,174 +1128,216 @@ async def test_a_recreated_table_at_reread_halts_the_loop_without_committing(
     await manager.close()
 
 
-@component
-async def test_cooperative_assignment_opens_and_recovers_stages(fake_clock):
-    """Group assignment drives sync_assignment: the on_assign callback
-    (fired inside consume(), as librdkafka does) opens and recovers the
-    claimed partitions' stages before their first record is staged."""
-    journal: list[tuple] = []
-    manager = make_manager(journal)
-    fake = FakeConsumer(journal=journal)
-    cfg = make_config(
-        assignment_mode=AssignmentMode.COOPERATIVE, static_partitions=None
-    )
-    consumer = make_consumer(fake, manager, cfg, fake_clock)
-    await consumer.start()
-    assert fake.subscribed_topics == ["events"]
-    assert manager.partitions() == ()
-
-    # The group hands us partitions 0 and 1; a record rides the same poll.
-    fake.feed(team_msg(0, 0, team=1, tag="first"))
-    fake.script_rebalance(assign=[0, 1])
-    await consumer._step()
-
-    assert ("rebalance_cb", "assign", [("events", 0), ("events", 1)]) in journal
-    assert manager.partitions() == (("events", 0), ("events", 1))
-    assert fake.committed_store == {("events", 0): 1}
-    stage = manager.stage("events", 0)
-    assert await team_offsets(stage, 1) == [0]
-    await manager.close()
-
-
-@component
-@pytest.mark.parametrize("fenced_shutdown", [False, True])
-async def test_revoke_closes_cleanly_and_loses_nothing(
-    fake_clock, monkeypatch, fenced_shutdown
+@pytest.mark.parametrize(
+    ("ordinal", "replica_count", "partition_count", "expected"),
+    [
+        (0, 1, 3, (0, 1, 2)),
+        (0, 2, 4, (0, 2)),
+        (1, 2, 4, (1, 3)),
+        # Uneven: the low ordinals get one more.
+        (0, 2, 5, (0, 2, 4)),
+        (1, 2, 5, (1, 3)),
+        (2, 3, 7, (2, 5)),
+        # More replicas than partitions: the high ordinals get nothing.
+        (3, 4, 3, ()),
+        (2, 3, 2, ()),
+    ],
+)
+def test_compute_assignment_is_millponds_modulo_rule(
+    ordinal, replica_count, partition_count, expected
 ):
-    """On revoke the partition's stage closes (flush nothing, abandon
-    nothing — staged state is durable on the store), its not-yet-
-    delivered messages are never staged or committed, and a later
-    reclaim finds the previous owner's rows intact."""
+    """``p % replica_count == ordinal`` over ``range(partition_count)``
+    — millpond's rule verbatim, so a millpond deployment's
+    ordinal→partition map carries over."""
+    assert compute_assignment(partition_count, replica_count, ordinal) == expected
+
+
+def test_compute_assignment_partitions_the_topic_exactly_once():
+    """Every partition belongs to exactly one ordinal, whatever the
+    counts (the union over ordinals is the topic, disjointly)."""
+    for partition_count in range(1, 12):
+        for replica_count in range(1, 6):
+            sets = [
+                compute_assignment(partition_count, replica_count, o)
+                for o in range(replica_count)
+            ]
+            flat = sorted(p for s in sets for p in s)
+            assert flat == list(range(partition_count)), (
+                partition_count,
+                replica_count,
+            )
+
+
+@component
+@pytest.mark.parametrize(
+    ("ordinal", "replica_count", "partition_count", "expected"),
+    [
+        (0, 1, 2, (0, 1)),
+        (1, 2, 4, (1, 3)),
+        (0, 2, 5, (0, 2, 4)),
+        (2, 3, 7, (2, 5)),
+    ],
+)
+async def test_derived_assignment_claims_exactly_the_expected_partitions(
+    fake_clock, ordinal, replica_count, partition_count, expected
+):
+    """start() reads the topic's partition count from the metadata
+    ONCE, claims this ordinal's share and nothing else — the stages
+    opened, the OFFSET_STORED assign and the warmup probe all name the
+    same set — and never re-reads the metadata on later polls."""
     journal: list[tuple] = []
     manager = make_manager(journal)
-    fake = FakeConsumer(journal=journal)
-    cfg = make_config(
-        assignment_mode=AssignmentMode.COOPERATIVE, static_partitions=None
-    )
+    fake = FakeConsumer(journal=journal, partitions=partition_count)
+    cfg = make_config(replica_count=replica_count, ordinal=ordinal)
     consumer = make_consumer(fake, manager, cfg, fake_clock)
+
     await consumer.start()
-    fake.script_rebalance(assign=[0, 1])
-    await consumer._step()
+    claimed = tuple(("events", p) for p in expected)
+    assert manager.partitions() == claimed
+    assert ("list_topics", "events", 30.0) in journal
+    assert ("assign", [("events", p, OFFSET_STORED) for p in expected]) in journal
+    assert ("committed", list(claimed)) in journal
+    kinds = [e[0] for e in journal]
+    assert kinds.index("list_topics") < kinds.index("committed") < kinds.index("assign")
 
-    fake.feed(*[team_msg(0, o, team=1, tag=f"a{o}") for o in range(3)])
-    fake.feed(*[team_msg(1, o, team=2, tag=f"b{o}") for o in range(2)])
+    # A record on every claimed partition stages and commits; the
+    # metadata is not consulted again.
+    fake.feed(*[team_msg(p, 0, team=1 + p) for p in expected])
     await run_steps(consumer, fake)
-    assert fake.committed_store == {("events", 0): 3, ("events", 1): 2}
-    stage0 = manager.stage("events", 0)
-    shutdown_calls = 0
-    if fenced_shutdown:
-        shutdown = stage0._db.shutdown
+    assert fake.committed_store == {("events", p): 1 for p in expected}
+    assert [e for e in journal if e[0] == "list_topics"] == [
+        ("list_topics", "events", 30.0)
+    ]
+    await manager.close()
 
-        async def shutdown_fenced():
-            nonlocal shutdown_calls
-            shutdown_calls += 1
-            await shutdown()
-            raise SlateError.Closed(CloseReason.FENCED, "newer writer owns the path")
 
-        monkeypatch.setattr(stage0._db, "shutdown", shutdown_fenced)
+@component
+async def test_an_unknown_topic_refuses_startup_with_nothing_claimed(fake_clock):
+    """The metadata answers UNKNOWN_TOPIC_OR_PART for the configured
+    topic: start() raises AssignmentError carrying the broker's error
+    before any stage opens or anything is assigned (main.py: exit 2,
+    one line). Not retried — a missing topic does not come back."""
+    journal: list[tuple] = []
+    manager = make_manager(journal)
+    fake = FakeConsumer(journal=journal, topics={"other": 4})
+    consumer = make_consumer(fake, manager, make_config(), fake_clock)
 
-    # Revoke 0 while two more of its records sit in the fetch buffer.
-    fake.feed(*[team_msg(0, o, team=1, tag=f"a{o}") for o in (3, 4)])
-    fake.feed(*[team_msg(1, o, team=2, tag=f"b{o}") for o in (2, 3)])
-    fake.script_rebalance(revoke=[0])
-    await consumer._step()
+    with pytest.raises(AssignmentError, match="'events'.*UNKNOWN_TOPIC_OR_PART"):
+        await consumer.start()
+    assert manager.partitions() == ()
+    assert [e[0] for e in journal] == ["list_topics"]
+    await manager.close()
 
-    # The stage is closed; nothing of the revoked partition was staged
-    # or committed past 3; partition 1 is unaffected.
-    assert manager.partitions() == (("events", 1),)
-    assert fake.committed_store[("events", 0)] == 3
-    assert fake.committed_store[("events", 1)] == 4
-    assert await team_offsets(manager.stage("events", 1), 2) == [0, 1, 2, 3]
-    await stage0.close()
-    if fenced_shutdown:
-        assert shutdown_calls == 1
-    with pytest.raises(StageClosedError):
-        await stage0.gauges()
-    stats = consumer.stats()
-    assert stats.messages_skipped_revoked == 0  # held, not delivered
 
-    # Zero loss: reopening the partition's path shows exactly the
-    # previously committed rows — the new owner's starting point.
-    reopened = await PartitionStage.open_store(
-        manager.store,
-        manager.path_for("events", 0),
-        topic="events",
-        partition=0,
-        settings=fast_flush_settings(),
-    )
-    assert await reopened.recover() is not None
-    assert await team_offsets(reopened, 1) == [0, 1, 2]
-    await reopened.close()
+@component
+async def test_a_topic_absent_from_the_metadata_refuses_startup(fake_clock):
+    """The other shape of "unknown": the answer simply omits the topic."""
+    journal: list[tuple] = []
+    manager = make_manager(journal)
+    fake = FakeConsumer(journal=journal, topics={}, strict_metadata=True)
+    consumer = make_consumer(fake, manager, make_config(), fake_clock)
 
-    # Reclaim (assignment changed between deploys): the stage reopens
-    # with the old rows intact, and the records that were held while
-    # unassigned now fetch, stage and commit.
-    fake.script_rebalance(assign=[0])
-    await consumer._step()
+    with pytest.raises(AssignmentError, match="unknown to the cluster"):
+        await consumer.start()
+    assert manager.partitions() == ()
+    assert [e[0] for e in journal] == ["list_topics"]
+    await manager.close()
+
+
+@component
+async def test_a_topic_with_no_partitions_refuses_startup(fake_clock):
+    journal: list[tuple] = []
+    manager = make_manager(journal)
+    fake = FakeConsumer(journal=journal, partitions=0)
+    consumer = make_consumer(fake, manager, make_config(), fake_clock)
+
+    with pytest.raises(AssignmentError, match="reports no partitions"):
+        await consumer.start()
+    assert manager.partitions() == ()
+    assert [e[0] for e in journal] == ["list_topics"]
+    await manager.close()
+
+
+@component
+@pytest.mark.parametrize("topic_level", [False, True])
+async def test_partition_discovery_rides_out_a_transient_metadata_failure(
+    fake_clock, topic_level
+):
+    """A transport error (raised KafkaException) or a fresh broker's
+    LEADER_NOT_AVAILABLE on the topic clears on the second probe: the
+    start succeeds with exactly two metadata reads, one sleep between
+    them, and the derived assignment unchanged."""
+    journal: list[tuple] = []
+    manager = make_manager(journal)
+    fake = FakeConsumer(journal=journal, partitions=2)
+    if topic_level:
+        fake.fail_next_list_topics(1, KafkaError.LEADER_NOT_AVAILABLE, topic_level=True)
+    else:
+        fake.fail_next_list_topics(1)
+    sleeper = Sleeper()
+    consumer = make_consumer(fake, manager, make_config(), fake_clock, sleeper)
+
+    await consumer.start()
+    assert [e for e in journal if e[0] == "list_topics"] == [
+        ("list_topics", "events", 30.0),
+        ("list_topics", "events", 30.0),
+    ]
+    assert sleeper.calls == [consumer_mod._METADATA_RETRY_S]
     assert manager.partitions() == (("events", 0), ("events", 1))
-    reclaimed = manager.stage("events", 0)
-    assert set(await team_offsets(reclaimed, 1)) >= {0, 1, 2}
-    await run_steps(consumer, fake)
-    assert await team_offsets(reclaimed, 1) == [0, 1, 2, 3, 4]
-    assert fake.committed_store[("events", 0)] == 5
-    assert_commits_follow_acks(journal)
+    assert ("assign", [("events", 0, OFFSET_STORED), ("events", 1, OFFSET_STORED)]) in (
+        journal
+    )
     await manager.close()
 
 
 @component
-async def test_messages_delivered_with_a_same_poll_revoke_are_skipped(fake_clock):
-    """The other real ordering: librdkafka returns already-queued
-    messages from the call whose callbacks revoke their partition. The
-    loop must skip them (never stage, never commit) — the new owner
-    replays from the last commit."""
+async def test_persistent_metadata_failure_refuses_startup_and_sticks(fake_clock):
+    """Every probe fails: start() raises the last KafkaException with
+    nothing claimed and nothing assigned — and the failure is sticky:
+    run() raises it again instead of polling an unassigned consumer."""
     journal: list[tuple] = []
     manager = make_manager(journal)
-    fake = FakeConsumer(journal=journal)
-    cfg = make_config(
-        assignment_mode=AssignmentMode.COOPERATIVE, static_partitions=None
+    fake = FakeConsumer(journal=journal, partitions=2)
+    fake.fail_next_list_topics(consumer_mod._METADATA_MAX_ATTEMPTS)
+    sleeper = Sleeper()
+    consumer = make_consumer(fake, manager, make_config(), fake_clock, sleeper)
+
+    with pytest.raises(KafkaException) as first:
+        await consumer.start()
+    assert len([e for e in journal if e[0] == "list_topics"]) == (
+        consumer_mod._METADATA_MAX_ATTEMPTS
     )
-    consumer = make_consumer(fake, manager, cfg, fake_clock)
-    await consumer.start()
-    fake.script_rebalance(assign=[0])
-    await consumer._step()
-    fake.feed(*[team_msg(0, o, team=1) for o in range(3)])
-    await run_steps(consumer, fake)
-    assert fake.committed_store == {("events", 0): 3}
-
-    fake.feed(*[team_msg(0, o, team=1) for o in (3, 4)])
-    fake.script_rebalance(revoke=[0], after_delivery=True)
-    await consumer._step()
-
-    assert fake.committed_store == {("events", 0): 3}
-    assert consumer.stats().messages_skipped_revoked == 2
+    assert len(sleeper.calls) == consumer_mod._METADATA_MAX_ATTEMPTS - 1
     assert manager.partitions() == ()
+    assert not any(e[0] == "assign" for e in journal)
+
+    with pytest.raises(KafkaException) as again:
+        await consumer.run()
+    assert again.value is first.value
+    assert fake.consume_calls == 0
     await manager.close()
 
 
 @component
-async def test_lost_partitions_close_like_revoked_ones(fake_clock):
-    """on_lost is the ungraceful revoke: the new owner may already hold
-    the path (SlateDB fences); the local stage still closes cleanly and
-    nothing further is staged."""
+async def test_an_ordinal_with_no_partitions_refuses_startup(fake_clock):
+    """Four replicas over a three-partition topic: ordinal 3's share is
+    empty, and an idle replica that claims nothing is a topology
+    mistake, not a pipeline — refused, naming every number."""
     journal: list[tuple] = []
     manager = make_manager(journal)
-    fake = FakeConsumer(journal=journal)
-    cfg = make_config(
-        assignment_mode=AssignmentMode.COOPERATIVE, static_partitions=None
-    )
+    fake = FakeConsumer(journal=journal, partitions=3)
+    cfg = make_config(replica_count=4, ordinal=3)
     consumer = make_consumer(fake, manager, cfg, fake_clock)
-    await consumer.start()
-    fake.script_rebalance(assign=[0])
-    await consumer._step()
-    fake.feed(team_msg(0, 0, team=1))
-    await run_steps(consumer, fake)
-    assert fake.committed_store == {("events", 0): 1}
 
-    fake.script_rebalance(lost=[0])
-    await consumer._step()
-    assert ("rebalance_cb", "lost", [("events", 0)]) in journal
+    with pytest.raises(AssignmentError) as excinfo:
+        await consumer.start()
+    text = str(excinfo.value)
+    assert "ordinal 3" in text and "3 partition" in text
+    assert "MILLRACE_REPLICA_COUNT=4" in text
     assert manager.partitions() == ()
-    assert fake.committed_store == {("events", 0): 1}
+    assert not any(e[0] == "assign" for e in journal)
+    # Not a transient: refused on the first probe, no retry.
+    assert len([e for e in journal if e[0] == "list_topics"]) == 1
     await manager.close()
 
 
@@ -1350,10 +1423,8 @@ async def test_a_fenced_partition_closes_locally_and_halts_distinctly(fake_clock
     path and fence the NEW owner back)."""
     journal: list[tuple] = []
     manager = make_manager(journal)
-    fake = FakeConsumer(journal=journal)
-    consumer = make_consumer(
-        fake, manager, make_config(static_partitions=(0, 1)), fake_clock
-    )
+    fake = FakeConsumer(journal=journal, partitions=2)
+    consumer = make_consumer(fake, manager, make_config(), fake_clock)
     await consumer.start()
     fake.feed(team_msg(0, 0, team=1), team_msg(1, 0, team=2))
     await run_steps(consumer, fake)
@@ -1467,10 +1538,8 @@ async def test_partitions_stage_concurrently_within_one_poll(fake_clock):
     """
     journal: list[tuple] = []
     manager = make_manager(journal)
-    fake = FakeConsumer(journal=journal)
-    consumer = make_consumer(
-        fake, manager, make_config(static_partitions=(0, 1)), fake_clock
-    )
+    fake = FakeConsumer(journal=journal, partitions=2)
+    consumer = make_consumer(fake, manager, make_config(), fake_clock)
     await consumer.start()
 
     gate = asyncio.Event()
@@ -1661,7 +1730,6 @@ async def test_stats_snapshot_counts_the_run(fake_clock):
         records_staged=2,
         records_dropped={REASON_MALFORMED_VALUE: 1},
         kafka_error_events=1,
-        messages_skipped_revoked=0,
         commit_attempts=1,
         commit_retries=0,
     )
