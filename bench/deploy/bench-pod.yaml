@@ -15,7 +15,7 @@
 # bench/README.md, "Running in-cluster").
 #
 #   kubectl apply -f bench/deploy/bench-pod.yaml
-#   kubectl -n gigahog exec -it bench-shell -- hoglake-bench seed --gb 0.5 --bucket <bucket>
+#   kubectl -n gigahog exec -it bench-shell -- hoglake-bench seed --gb 0.5
 #
 # Delete it when you are done: it is a pod, not a Deployment, so nothing
 # brings it back.
@@ -61,6 +61,8 @@ spec:
         # In-cluster service DNS: same namespace, so the short name resolves.
         - name: HOGLAKE_URL
           value: http://gigahog-server:8080
+        - name: HOGLAKE_BUCKET
+          value: posthog-gigahog-mw-dev
         # Empty on purpose. Empty endpoint means real AWS rather than the
         # local MinIO default; empty keys mean the SDK's credential chain,
         # which IRSA populates from the projected web-identity token.

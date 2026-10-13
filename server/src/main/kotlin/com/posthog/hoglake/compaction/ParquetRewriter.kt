@@ -427,16 +427,19 @@ object ParquetRewriter {
      * default. Named rather than typed because the value travels to the
      * codec through the writer's untyped configuration map.
      *
-     * Level 1, not parquet-java's 3 (hoglake#134 package D): a JFR profile
-     * of the rewrite put zstd at 11-16% of its CPU on the event shape and
-     * 41-48% on JSON-heavy rows at level 3, level 1 cut the rewrite's wall
-     * time by ~12% and ~20-25% respectively, and level 3 bought no
-     * measurable size over level 1 on that data (`CodecMeasurement` prints
-     * both). Level 1 still decompresses at the same speed, which is what
-     * every later scan pays.
+     * Level 3, parquet-java's own default. hoglake#134 package D moved it
+     * to 1 on a synthetic measurement (`CodecMeasurement`: level 3 bought
+     * no size over level 1 on 200k-row event shapes, and level 1 cut the
+     * rewrite's wall time by ~12% on the event shape, ~20-25% on
+     * JSON-heavy rows). Real data said otherwise: on 2026-10-10 the
+     * gigahog-dev catalog re-merged pairs of level-3 compaction outputs
+     * at level 1 and every pair grew 12-13% (968 MiB -> 1.1 GiB,
+     * 872 -> 974 MiB, 3.8 -> 4.3 GiB over four pairs). Compression is
+     * paid once per rewrite; the bytes are paid in S3 until expiry and
+     * by every scan. Decompression speed does not depend on the level.
      */
     const val ZSTD_LEVEL_KEY = "parquet.compression.codec.zstd.level"
-    const val DEFAULT_ZSTD_LEVEL = 1
+    const val DEFAULT_ZSTD_LEVEL = 3
     const val MIN_ZSTD_LEVEL = 1
     const val MAX_ZSTD_LEVEL = 22
 
@@ -474,14 +477,13 @@ object ParquetRewriter {
      * once. Compression happens once per rewrite; the output is then
      * read by every scan, by any later rewrite, and paid for in
      * S3 storage until expiry. zstd lands well under snappy's size on the
-     * text-heavy event shapes this catalog holds (at level 1 as at 3 —
-     * see [DEFAULT_ZSTD_LEVEL]), and its
+     * text-heavy event shapes this catalog holds, and its
      * DEcompression — what readers and later rewrites actually spend —
      * is in snappy's league. The compaction sweep is CPU-bound on a
      * shared maintenance pod, so the level is pinned rather than
-     * inherited: [DEFAULT_ZSTD_LEVEL] is 1, below parquet-java's own
-     * default of 3, and pinning it means a library bump cannot silently
-     * move this pod's CPU budget. parquet-java's zstd workers default to 0
+     * inherited: [DEFAULT_ZSTD_LEVEL] is 3, parquet-java's own default,
+     * and pinning it means a library bump cannot silently move this
+     * pod's CPU budget. parquet-java's zstd workers default to 0
      * (in-thread), which is what a shared pod wants, so nothing here
      * asks for threads.
      *

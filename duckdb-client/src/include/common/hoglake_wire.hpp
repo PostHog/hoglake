@@ -150,6 +150,11 @@ struct HoglakeSnapshotChange {
 	int64_t object_id = 0;
 };
 
+struct HoglakeSnapshotResolution {
+	int64_t snapshot_id = 0;
+	string snapshot_time;
+};
+
 struct HoglakeSnapshotInfo {
 	int64_t snapshot_id = 0;
 	//! ISO-8601 instant

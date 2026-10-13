@@ -89,6 +89,7 @@ public:
 	vector<HoglakeScanFile> PlanScan(const string &ns, const string &table, const HoglakeTravel &travel);
 
 	// -- snapshots ---------------------------------------------------------
+	HoglakeSnapshotResolution ResolveSnapshot(const string &at_timestamp);
 	struct SnapshotPage {
 		vector<HoglakeSnapshotInfo> snapshots;
 		bool has_more = false;

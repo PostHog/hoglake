@@ -110,6 +110,25 @@ class SnapshotChange:
 
 
 @dataclass(frozen=True)
+class SnapshotResolution:
+    snapshot_id: int
+    snapshot_time: datetime
+
+    @classmethod
+    def from_wire(cls, d: dict[str, Any]) -> SnapshotResolution:
+        def build(d: Mapping[str, Any]) -> SnapshotResolution:
+            snapshot_id = d["snapshot_id"]
+            if type(snapshot_id) is not int or not 0 <= snapshot_id <= 2**63 - 1:
+                raise ValueError("snapshot_id must be a non-negative int64")
+            snapshot_time = _parse_dt(d["snapshot_time"])
+            if snapshot_time.tzinfo is None:
+                raise ValueError("snapshot_time must include a UTC offset")
+            return cls(snapshot_id=snapshot_id, snapshot_time=snapshot_time)
+
+        return _wire("SnapshotResolution", d, build)
+
+
+@dataclass(frozen=True)
 class Snapshot:
     snapshot_id: int
     snapshot_time: datetime

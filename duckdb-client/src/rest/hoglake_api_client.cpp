@@ -874,6 +874,32 @@ HoglakeTableInfo HoglakeApiClient::AlterTable(const string &ns, const string &ta
 // Snapshots / maintenance
 //===--------------------------------------------------------------------===//
 
+HoglakeSnapshotResolution HoglakeApiClient::ResolveSnapshot(const string &at_timestamp) {
+	auto path = CatalogPath("/snapshots/resolve") + "?at_timestamp=" + EncodeSegment(at_timestamp);
+	auto response = Request("GET", path, string());
+	if (response.status != 200) {
+		ThrowFor(response, "resolve snapshot", true);
+	}
+	JsonDoc doc(response.body);
+	auto root = ParseObjectResponse(doc, "resolve snapshot");
+	auto id = yyjson_obj_get(root, "snapshot_id");
+	auto time = yyjson_obj_get(root, "snapshot_time");
+	if (!id || yyjson_is_null(id) || !time || yyjson_is_null(time)) {
+		throw IOException("hoglake: snapshot resolution requires snapshot_id and snapshot_time");
+	}
+	try {
+		HoglakeSnapshotResolution result;
+		result.snapshot_id = GetBoundedInt(root, "snapshot_id", 0, 9223372036854775807LL);
+		result.snapshot_time = GetString(root, "snapshot_time");
+		if (result.snapshot_time.empty()) {
+			throw IOException("hoglake: snapshot resolution requires snapshot_time");
+		}
+		return result;
+	} catch (const InvalidInputException &error) {
+		throw IOException("hoglake: invalid snapshot resolution: %s", error.what());
+	}
+}
+
 HoglakeApiClient::SnapshotPage HoglakeApiClient::ListSnapshots(idx_t after, idx_t limit) {
 	auto path = CatalogPath("/snapshots") + "?after=" + to_string(after) + "&limit=" + to_string(limit);
 	auto response = Request("GET", path, string());

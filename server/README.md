@@ -30,6 +30,34 @@ storage in exactly three places: the hydrator's footer reads, cleanup's
 physical deletes, and compaction's rewrite (the one background job that
 reads and writes data files — always outside the commit path).
 
+## Internal storage footprint
+
+`GET /v1/catalogs/{catalog}/storage-usage` returns
+`{"tracked_bytes":"1234","pending_delete_files":"2"}`: **decimal int64 strings**,
+so a client must parse them losslessly. The existing v1 API has no application
+authentication; keep the service **network-private**, never expose this route
+publicly, and resolve a caller's catalog through the consuming service's own
+tenant authorization. Database predicates are bound to the resolved catalog id.
+
+`tracked_bytes` sums **all** registered data and delete file sizes, including
+ended files, retained history and dropped tables awaiting retirement. It is
+deliberately not a live-table/read-snapshot metric. Removing a registration
+reduces the total even while its object awaits cleanup; the queue stores no size.
+Unregistered uploads, queued-only objects and object-store versions are excluded.
+`pending_delete_files` counts removal **rows** with `drained_at IS NULL`,
+including claimed and staging tickets, not distinct paths or only delete vectors.
+Settled tickets (`deleted`, `absent`, `registered`) do not count.
+
+The exact aggregates run in one database statement, without the catalog commit
+lock or object-store I/O, and return one row. Exact sums visit manifest rows,
+not cached sampler estimates; the planner can also scan other catalogs' rows.
+Use low-frequency internal polling, not UI refreshes.
+A 15-second query deadline bounds work; a stricter database statement timeout
+still applies. A large catalog can fail this deadline: that is an explicit error,
+never a partial result or zero. Missing catalogs return 404, backend failures
+return 500, and snapshot/timestamp parameters return 400. The sampled **live**
+catalog/table totals remain the right choice for dashboards.
+
 ## The data model
 
 Everything hangs off five ideas (`db/migration/V1__init.sql`, mirrored
@@ -393,6 +421,13 @@ Every point-in-time read (`getTable`, `/files`, `/scan`) takes
 resolution is one indexed lookup: the largest snapshot with
 `snapshot_time <= t`; after head resolves to head; before the earliest
 *retained* snapshot is 410.
+
+`GET /catalogs/{c}/snapshots/resolve?at_timestamp=...` returns the largest
+retained `snapshot_id` whose recorded `snapshot_time` is at or before the
+requested instant, together with that recorded time. This works without a
+table read, including a catalog containing only its initial snapshot. Missing
+or offset-less timestamps return 400, unknown catalogs 404, and timestamps
+before retained history 410. Resolving a snapshot does not prevent expiry.
 
 `Table.read_snapshot_id` names the snapshot a read resolved at — the
 catalog head when the request named no `snapshot`/`at_timestamp`, the
@@ -849,11 +884,12 @@ on tickets the drain was deliberately leaving alone — and #261 removed
 the check, so nothing bounds it today. Every other reason settles
 `'deleted'`, whether or not the key was there.
 
-The object-store call bound (`RemovalStore.apiCallTimeout`, 10 s at the
-defaults, derived as `min(idle bound, admission bound) / 3` so an
-operator who lowers `HOGLAKE_COMMIT_LOCK_TIMEOUT_MS` gets shorter calls
-with it) is no longer an inequality against a lock hold: nothing is open
-across a call. What a hung call costs is one parked worker holding a
+The object-store call bound (`RemovalStore.apiCallTimeout`) is
+`min(10 s, admission bound / 3)`, so an operator who lowers
+`HOGLAKE_COMMIT_LOCK_TIMEOUT_MS` gets shorter calls with it. An unbounded
+admission wait (0) leaves the 10 s cap in effect. The cap is independent
+of database session timeouts: no transaction is open across a call.
+What a hung call costs is one parked worker holding a
 claim until its lease expires. The `deadline_skipped` counter and the
 `HOLD_BUDGET` arithmetic it belonged to bounded that hold and are gone;
 the counter stays on the wire, always 0, because the maintenance ledger
@@ -1149,7 +1185,7 @@ being an expired claim outliving its table). #261 removed that check,
 so a purge that stops running is unobserved.
 
 `HOGLAKE_COMPACTION_CODEC` (default **zstd**, with
-`HOGLAKE_COMPACTION_ZSTD_LEVEL` default **1**) is the compression the
+`HOGLAKE_COMPACTION_ZSTD_LEVEL` default **3**) is the compression the
 rewrite writes its OUTPUT with; the legal set is zstd, snappy, gzip,
 lz4_raw and uncompressed, case-insensitive, and an unknown name is
 refused at boot. It is not a per-file detail. Compaction rewrites a
@@ -1176,22 +1212,24 @@ pinned rather than inherited because the sweep is CPU-bound on a shared
 maintenance pod and a parquet-java bump must not move that budget
 without a diff. parquet-java's zstd workers stay at 0 (in-thread).
 
-The level is **1**, not parquet-java's default of 3 (hoglake#134
-package D). A JFR profile of the rewrite with native frames (16 inputs
-x 50k rows) put zstd at 11-16% of the rewrite's CPU on the event shape
-and 41-48% on JSON-heavy rows at level 3; level 1 cut the rewrite's wall
-time by ~12% and ~20-25% respectively. Size, from `CodecMeasurement`
-(which now prints both levels; same four 200k-row files as above): level
-1 is SMALLER on the high-cardinality strings (50.6 against 52.1 MiB,
-0.58x against 0.60x the input) and on the mixed table (51.9 against
-53.4 MiB), and 7% larger on the low-cardinality enums (10.2 against
-9.5 MiB, 0.90x against 0.84x), where the dictionary has already done
-most of the work. Level 3 therefore buys no size on event-shaped data
-and a few percent on enum-only columns, for CPU that sets how many
-groups a maintenance pod can rewrite. Decompression speed does not
-depend on the level, so scans and later rewrites pay nothing for it. An
-operator who measures their own data the other way sets
-`HOGLAKE_COMPACTION_ZSTD_LEVEL=3`; no chart sets it today.
+The level is **3**, parquet-java's own default. hoglake#134 package D
+lowered it to 1 on a synthetic measurement: a JFR profile of the
+rewrite with native frames (16 inputs x 50k rows) put zstd at 11-16% of
+the rewrite's CPU on the event shape and 41-48% on JSON-heavy rows at
+level 3, level 1 cut the rewrite's wall time by ~12% and ~20-25%
+respectively, and `CodecMeasurement` (same four 200k-row files as
+above, printing both levels) showed level 1 SMALLER on the
+high-cardinality strings (50.6 against 52.1 MiB) and the mixed table
+(51.9 against 53.4 MiB) and 7% larger only on the low-cardinality enums
+(10.2 against 9.5 MiB). Real data disagreed: on 2026-10-10 the
+gigahog-dev catalog re-merged pairs of level-3 compaction outputs at
+level 1 and every pair grew 12-13% (968 MiB -> 1.1 GiB, 872 -> 974 MiB,
+3.8 -> 4.3 GiB over four pairs), where the synthetic rows had predicted
+no change. Compression is paid once per rewrite; the bytes are paid in
+S3 until expiry and by every scan, so the default went back to 3.
+Decompression speed does not depend on the level. An operator who
+measures their own data the other way sets
+`HOGLAKE_COMPACTION_ZSTD_LEVEL=1`; no chart sets it today.
 
 **A sorted rewrite is an external merge sort** (hoglake#134). It used
 to read the whole group into an `ArrayList<Group>` and call

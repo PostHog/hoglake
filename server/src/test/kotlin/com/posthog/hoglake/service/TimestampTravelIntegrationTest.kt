@@ -3,6 +3,8 @@ package com.posthog.hoglake.service
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.persistence.TimeTravelRepo
+import com.posthog.hoglake.testing.ExplainPlan
 import com.posthog.hoglake.testing.PgTestSupport
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
@@ -82,6 +84,43 @@ class TimestampTravelIntegrationTest {
 
     @AfterAll
     fun tearDown() = db.close()
+
+    @Test
+    fun `resolution retains the reverse index lookup on a large history`() {
+        val id = svc.createCatalog("ts-plan", "s3://bucket/ts-plan").catalogId
+        db.jdbi.withHandleUnchecked { h ->
+            h.createUpdate(
+                """
+                INSERT INTO hog_snapshot (catalog_id, snapshot_id, snapshot_time, schema_version)
+                SELECT :cid, s, timestamptz '2026-02-01T00:00:00Z' + s * interval '1 minute', 0
+                FROM generate_series(1, 100000) s
+                """,
+            ).bind("cid", id).execute()
+            h.createUpdate(
+                """
+                UPDATE hog_catalog SET last_snapshot_id = 100000, earliest_snapshot_id = 90000
+                WHERE catalog_id = :cid
+                """,
+            ).bind("cid", id).execute()
+            h.execute("ANALYZE hog_snapshot")
+            for ((target, budget) in listOf(100_000L to 20L, 90_001L to 500L)) {
+                val timestamp = timeOf(target)
+                assertThat(svc.resolveSnapshot("ts-plan", timestamp).snapshotId).isEqualTo(target)
+                val plan =
+                    h.createQuery(
+                        "EXPLAIN (ANALYZE, BUFFERS, TIMING false, COSTS false, SUMMARY false) " +
+                            TimeTravelRepo.RESOLVE_SNAPSHOT_SQL,
+                    ).bind("catalogId", id).bind("earliest", 90_000)
+                        .bind("ts", timestamp.atOffset(ZoneOffset.UTC)).mapTo(String::class.java)
+                        .list().joinToString("\n")
+                println("snapshot resolution at $target in a 100000-snapshot fixture:\n$plan")
+                assertThat(plan).contains("Index Scan Backward", "hog_snapshot_pkey").doesNotContain("Seq Scan", "Sort")
+                val nodes = ExplainPlan.nodes(plan)
+                assertThat(nodes.first().line).containsPattern("""\brows=1(?:\.0+)? loops=1\b""")
+                assertThat(nodes.first().buffers).isBetween(1L, budget)
+            }
+        }
+    }
 
     @Test
     fun `resolveTimestamp picks exact, lower-between, and head-after targets`() {

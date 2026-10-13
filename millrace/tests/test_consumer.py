@@ -1127,7 +1127,10 @@ async def test_cooperative_assignment_opens_and_recovers_stages(fake_clock):
 
 
 @component
-async def test_revoke_closes_cleanly_and_loses_nothing(fake_clock):
+@pytest.mark.parametrize("fenced_shutdown", [False, True])
+async def test_revoke_closes_cleanly_and_loses_nothing(
+    fake_clock, monkeypatch, fenced_shutdown
+):
     """On revoke the partition's stage closes (flush nothing, abandon
     nothing — staged state is durable on the store), its not-yet-
     delivered messages are never staged or committed, and a later
@@ -1148,9 +1151,21 @@ async def test_revoke_closes_cleanly_and_loses_nothing(fake_clock):
     await run_steps(consumer, fake)
     assert fake.committed_store == {("events", 0): 3, ("events", 1): 2}
     stage0 = manager.stage("events", 0)
+    shutdown_calls = 0
+    if fenced_shutdown:
+        shutdown = stage0._db.shutdown
+
+        async def shutdown_fenced():
+            nonlocal shutdown_calls
+            shutdown_calls += 1
+            await shutdown()
+            raise SlateError.Closed(CloseReason.FENCED, "newer writer owns the path")
+
+        monkeypatch.setattr(stage0._db, "shutdown", shutdown_fenced)
 
     # Revoke 0 while two more of its records sit in the fetch buffer.
     fake.feed(*[team_msg(0, o, team=1, tag=f"a{o}") for o in (3, 4)])
+    fake.feed(*[team_msg(1, o, team=2, tag=f"b{o}") for o in (2, 3)])
     fake.script_rebalance(revoke=[0])
     await consumer._step()
 
@@ -1158,6 +1173,11 @@ async def test_revoke_closes_cleanly_and_loses_nothing(fake_clock):
     # or committed past 3; partition 1 is unaffected.
     assert manager.partitions() == (("events", 1),)
     assert fake.committed_store[("events", 0)] == 3
+    assert fake.committed_store[("events", 1)] == 4
+    assert await team_offsets(manager.stage("events", 1), 2) == [0, 1, 2, 3]
+    await stage0.close()
+    if fenced_shutdown:
+        assert shutdown_calls == 1
     with pytest.raises(StageClosedError):
         await stage0.gauges()
     stats = consumer.stats()

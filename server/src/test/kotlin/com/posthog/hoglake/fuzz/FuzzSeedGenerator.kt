@@ -292,6 +292,8 @@ object FuzzSeedGenerator {
                        {"data_file_id":5,"path":"s3://b/dv.puffin","delete_count":3,
                         "file_size_bytes":99}]}]}""",
                 "commit_empty" to """{}""",
+                "snapshot_resolution" to
+                    """{"snapshot_id":9007199254740993,"snapshot_time":"2026-02-01T02:01:00+02:00"}""",
                 // A footer-shipping registration's split_offsets: one the
                 // contract accepts, and one it refuses (unsorted, and the
                 // last entry at file_size_bytes).

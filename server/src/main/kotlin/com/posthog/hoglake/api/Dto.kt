@@ -25,6 +25,7 @@ import com.posthog.hoglake.model.PartitionFieldValues
 import com.posthog.hoglake.model.PartitionValues
 import com.posthog.hoglake.model.ScanFile
 import com.posthog.hoglake.model.Snapshot
+import com.posthog.hoglake.model.SnapshotResolution
 import com.posthog.hoglake.model.StatsState
 import com.posthog.hoglake.model.TableAppend
 import com.posthog.hoglake.model.TableDeletes
@@ -804,6 +805,10 @@ data class CreateViewRequestDto(
 // ---- snapshots -----------------------------------------------------------
 
 data class SnapshotChangeDto(val kind: String, val objectId: Long)
+
+data class SnapshotResolutionDto(val snapshotId: Long, val snapshotTime: Instant)
+
+fun SnapshotResolution.toDto() = SnapshotResolutionDto(snapshotId, snapshotTime)
 
 data class SnapshotDto(
     val snapshotId: Long,

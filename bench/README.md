@@ -50,6 +50,7 @@ Two options:
    `http://localhost:8080`, MinIO at `:9000`
    (`hoglake`/`hoglake123`, path-style). Overridable via `--url`,
    `--s3-endpoint`, … or `HOGLAKE_URL` / `HOGLAKE_S3_*` env vars.
+   `--bucket` defaults to `HOGLAKE_BUCKET`, or `hoglake-bench` when unset.
 2. **Bring your own**: `just up` at the repo root (Postgres 18 + MinIO
    + the server + the webui, all containerized), or in `../server`,
    `docker compose up -d && flox activate -- gradle run` (ports
@@ -378,7 +379,7 @@ subcommand:
 ```sh
 kubectl apply -f bench/deploy/bench-pod.yaml
 kubectl -n gigahog exec -it bench-shell -- \
-  hoglake-bench stream --rate 50000 --bucket posthog-gigahog-mw-dev
+  hoglake-bench stream --rate 50000
 ```
 
 Ctrl-C reaches it through `exec -it` and it stops cleanly. If you
@@ -404,6 +405,9 @@ endpoint means real AWS instead of the local MinIO default, and empty keys
 mean the SDK's credential chain rather than the local stack's `hoglake` /
 `hoglake123`.
 
+`HOGLAKE_BUCKET` selects the environment's existing bucket; an explicit
+`--bucket` overrides it.
+
 The pod runs `ghcr.io/posthog/hoglake-bench`, which already contains the
 harness and its dependencies (`bench/Dockerfile`, published per commit by
 `.github/workflows/bench-image.yml`). Nothing to copy in, nothing to
@@ -412,7 +416,7 @@ install: apply, exec, run.
 ```sh
 kubectl apply -f bench/deploy/bench-pod.yaml
 kubectl -n gigahog exec -it bench-shell -- \
-  hoglake-bench seed --gb 0.5 --bucket posthog-gigahog-mw-dev
+  hoglake-bench seed --gb 0.5
 ```
 
 `kubectl -n gigahog exec -it bench-shell -- bash` for a shell instead, if you
@@ -426,7 +430,7 @@ release on PyPI, which is a different client (main carries a `.dev0` version
 PyPI has never seen). `uv sync --no-sources` is the escape hatch if you ever
 need the published client instead; nothing in the image uses it.
 
-`--bucket` is the environment's own bucket; bench writes under a per-run
+The bucket is the environment's own bucket; bench writes under a per-run
 prefix and never asks AWS to create it (the role carries no
 `s3:CreateBucket`, and the bucket is terraform's). Catalogs are named
 `bench-<scenario>-<run-id>-<n>`, so a run cannot collide with anything else
@@ -453,7 +457,7 @@ git archive HEAD bench pyhoglake |
   kubectl -n gigahog exec -i bench-shell -- tar x -C /work
 kubectl -n gigahog exec -it bench-shell -- env \
   PYTHONPATH=/work/bench/src:/work/pyhoglake/src \
-  hoglake-bench seed --gb 0.5 --bucket posthog-gigahog-mw-dev
+  hoglake-bench seed --gb 0.5
 ```
 
 Both trees, not just `bench` — bench installs the client from
