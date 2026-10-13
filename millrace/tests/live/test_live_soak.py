@@ -439,7 +439,6 @@ def test_soak(lake_home, topic_factory, admin):
         cfg = livekit.live_config(
             topic=topic.name,
             group=topic.group,
-            partitions=tuple(range(PARTITIONS)),
             stage_base_path=f"stage/{livekit.RUN_ID}/{lake_home.slug}",
             catalog=lake_home.catalog.name,
             namespace="ns1",

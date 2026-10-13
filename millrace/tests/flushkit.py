@@ -45,7 +45,6 @@ from stagekit import NOW
 
 from millrace import keyspace
 from millrace.config import (
-    AssignmentMode,
     Config,
     EventTimePolicy,
 )
@@ -397,8 +396,8 @@ def make_config(**overrides: Any) -> Config:
         "kafka_bootstrap_servers": "broker:9092",
         "kafka_topic": "events",
         "kafka_group_id": "millrace-events",
-        "assignment_mode": AssignmentMode.STATIC,
-        "static_partitions": (0,),
+        "replica_count": 1,
+        "ordinal": 0,
         "catalog": CATALOG,
         "namespace": NAMESPACE,
         "table": TABLE,

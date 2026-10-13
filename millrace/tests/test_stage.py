@@ -1007,6 +1007,29 @@ async def test_close_guards(stage_factory):
         await managed.gauges()
 
 
+async def test_close_swallows_a_fenced_shutdown(stage_factory, monkeypatch):
+    """A fenced writer's shutdown reports ``Closed(FENCED)`` after the
+    instance is already down: close() swallows it (the path belongs to
+    the newer writer; there is nothing left to do) and the stage is
+    closed exactly once."""
+    stage = await stage_factory()
+    shutdown = stage._db.shutdown
+    shutdown_calls = 0
+
+    async def shutdown_fenced():
+        nonlocal shutdown_calls
+        shutdown_calls += 1
+        await shutdown()
+        raise SlateError.Closed(CloseReason.FENCED, "newer writer owns the path")
+
+    monkeypatch.setattr(stage._db, "shutdown", shutdown_fenced)
+    await stage.close()
+    await stage.close()
+    assert shutdown_calls == 1
+    with pytest.raises(StageClosedError):
+        await stage.gauges()
+
+
 @pytest.mark.parametrize(
     "error",
     [

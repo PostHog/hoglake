@@ -40,7 +40,6 @@ from confluent_kafka.admin import AdminClient, NewTopic
 from pyhoglake import HoglakeClient, S3Config, ops
 
 from millrace.config import (
-    AssignmentMode,
     AutoOffsetReset,
     Config,
     EventTimePolicy,
@@ -623,7 +622,6 @@ def live_config(
     *,
     topic: str,
     group: str,
-    partitions: tuple[int, ...],
     stage_base_path: str,
     catalog: str,
     namespace: str,
@@ -638,19 +636,24 @@ def live_config(
     event_time_policy: EventTimePolicy = EventTimePolicy.DROP,
     event_time_max_future_s: int = 86400,
     event_time_max_past_s: int = 30 * 86400,
-    assignment: AssignmentMode = AssignmentMode.STATIC,
+    # One replica owning the whole topic is the suite's default shape;
+    # a split test passes replica_count=N and an ordinal per pipeline.
+    replica_count: int = 1,
+    ordinal: int = 0,
     stage_store_url: str = f"s3://{BUCKET}",
     flush_sweep_s: int = 1,
     metrics_port: int = 0,
 ) -> Config:
     """A validated live-stack Config. Stage instances land at
-    ``{stage_base_path}/{topic}/{partition}`` on the MinIO bucket."""
+    ``{stage_base_path}/{topic}/{partition}`` on the MinIO bucket; the
+    partitions themselves are derived at start from the topic's
+    partition count and ``replica_count``/``ordinal``."""
     return Config(
         kafka_bootstrap_servers=KAFKA_BOOTSTRAP,
         kafka_topic=topic,
         kafka_group_id=group,
-        assignment_mode=assignment,
-        static_partitions=partitions if assignment is AssignmentMode.STATIC else None,
+        replica_count=replica_count,
+        ordinal=ordinal,
         # The suite produces-then-consumes with a fresh group per test;
         # production's default is LATEST (fleet policy — see config.py).
         kafka_auto_offset_reset=AutoOffsetReset.EARLIEST,
@@ -914,7 +917,10 @@ def child_env(
             "MILLRACE_KAFKA_BOOTSTRAP_SERVERS": cfg.kafka_bootstrap_servers,
             "MILLRACE_KAFKA_TOPIC": cfg.kafka_topic,
             "MILLRACE_KAFKA_GROUP_ID": cfg.kafka_group_id,
-            "MILLRACE_KAFKA_ASSIGNMENT": cfg.assignment_mode.value,
+            # The StatefulSet shape: the replica count plus the pod name
+            # the ordinal is parsed from (the downward API's POD_NAME).
+            "MILLRACE_REPLICA_COUNT": str(cfg.replica_count),
+            "POD_NAME": f"millrace-{cfg.kafka_topic}-{cfg.ordinal}",
             # The suite produces-then-consumes with a fresh group per
             # test, so children must start at the beginning; production's
             # default is `latest` (fleet policy — see config.py). The
@@ -943,10 +949,6 @@ def child_env(
             "HOGLAKE_S3_REGION": S3_REGION,
         }
     )
-    if cfg.static_partitions is not None:
-        env["MILLRACE_KAFKA_PARTITIONS"] = ",".join(
-            str(p) for p in cfg.static_partitions
-        )
     if extra:
         env.update(extra)
     return env

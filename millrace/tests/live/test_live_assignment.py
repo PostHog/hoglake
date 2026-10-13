@@ -1,19 +1,19 @@
 """Scenario 4 (Phase 5): reassignment — staged state follows the
 partition, never the pod.
 
-Two halves:
-
 - ``test_static_reassignment_carries_staged_state``: the deploy-time
-  shape. Replica A (static assignment) stages a whole wave and flushes
+  shape. Replica A (ordinal 0 of 1) stages a whole wave and flushes
   NOTHING (long deadline); A stops cleanly; replica B — a different pod
-  claiming the same partitions, same group — opens the same SlateDB
-  instances, recovers them (the staged rows are RIGHT THERE in its
-  gauges), consumes only wave 2 (committed offsets carried over), and
-  flushes everything exactly once.
-- ``test_cooperative_handoff_splits_ownership``: the group shape. Two
-  cooperative consumers in one group; the coordinator moves a partition
-  mid-run; both owners flush disjoint slices; counts reconcile exactly
-  and neither owner double-flushes a range (exactness is the proof).
+  with the same ordinal and replica count, same group — derives the
+  same partitions, opens the same SlateDB instances, recovers them (the
+  staged rows are RIGHT THERE in its gauges), consumes only wave 2
+  (committed offsets carried over), and flushes everything exactly once.
+- ``test_two_replicas_split_the_topic_by_ordinal``: the fleet shape
+  against a real broker's metadata. Two pipelines, ``replica_count=2``,
+  ordinals 0 and 1, over a two-partition topic: each claims exactly its
+  modulo share, both ingest and flush their own partition, the lake
+  reconciles exactly (no range flushed twice), and each replica's
+  committed offsets name only its own partition.
 """
 
 from __future__ import annotations
@@ -30,18 +30,20 @@ pytestmark = pytest.mark.live
 TENANTS = 8
 
 
-def _cfg(lake_home, topic, *, deadline_s: int, assignment, partitions=()) -> object:
+def _cfg(
+    lake_home, topic, *, deadline_s: int, replica_count: int = 1, ordinal: int = 0
+) -> object:
     return livekit.live_config(
         topic=topic.name,
         group=topic.group,
-        partitions=partitions,
         stage_base_path=f"stage/{livekit.RUN_ID}/{lake_home.slug}",
         catalog=lake_home.catalog.name,
         namespace="ns1",
         table="events",
         flush_deadline_s=deadline_s,
         flush_sweep_s=1,
-        assignment=assignment,
+        replica_count=replica_count,
+        ordinal=ordinal,
     )
 
 
@@ -55,21 +57,13 @@ def _produced_by_team(producer) -> Counter[int]:
 async def test_static_reassignment_carries_staged_state(
     lake_home, topic_factory, producer_factory, admin
 ):
-    from millrace.config import AssignmentMode
-
     table = lake_home.create_events_table()
     topic = topic_factory(partitions=2)
     producer = producer_factory(topic.name)
     skew = livekit.Skew(TENANTS, seed=7)
 
     # --- replica A: stage wave 1, flush NOTHING (deadline far away) ---
-    cfg_a = _cfg(
-        lake_home,
-        topic,
-        deadline_s=3600,
-        assignment=AssignmentMode.STATIC,
-        partitions=(0, 1),
-    )
+    cfg_a = _cfg(lake_home, topic, deadline_s=3600)
     wave1 = 500
     async with livekit.Pipeline(cfg_a, sweep_s=0.5) as pipe_a:
         base = now_us()
@@ -98,14 +92,9 @@ async def test_static_reassignment_carries_staged_state(
             "replica A flushed despite the far deadline"
         )
 
-    # --- replica B: the new pod claims the same partitions (same group) ---
-    cfg_b = _cfg(
-        lake_home,
-        topic,
-        deadline_s=3,
-        assignment=AssignmentMode.STATIC,
-        partitions=(0, 1),
-    )
+    # --- replica B: the new pod for the same ordinal derives the same
+    # partitions (same replica count, same group) ---
+    cfg_b = _cfg(lake_home, topic, deadline_s=3)
     pipe_b = livekit.Pipeline(cfg_b, sweep_s=0.5, auto_flush=False)
     try:
         await pipe_b.start()
@@ -159,26 +148,31 @@ async def test_static_reassignment_carries_staged_state(
     assert stats_b.orphaned_uploads == 0
 
 
-async def test_cooperative_handoff_splits_ownership(
-    lake_home, topic_factory, producer_factory, admin
+async def test_two_replicas_split_the_topic_by_ordinal(
+    lake_home, topic_factory, producer_factory
 ):
-    from millrace.config import AssignmentMode
-
+    """Against the broker's real metadata: two replicas over two
+    partitions each derive their modulo share at start — disjoint,
+    covering the topic — then both ingest and flush their own half and
+    the lake reconciles exactly."""
     table = lake_home.create_events_table()
     topic = topic_factory(partitions=2)
     producer = producer_factory(topic.name)
     skew = livekit.Skew(TENANTS, seed=11)
-
-    cfg = {
-        "lake_home": lake_home,
-        "topic": topic,
-        "deadline_s": 3,
-        "assignment": AssignmentMode.COOPERATIVE,
-    }
-    pipe_a = livekit.Pipeline(_cfg(**cfg), sweep_s=0.5)
-    pipe_b: livekit.Pipeline | None = None
+    pipe_a = livekit.Pipeline(
+        _cfg(lake_home, topic, deadline_s=3, replica_count=2, ordinal=0),
+        sweep_s=0.5,
+    )
+    pipe_b = livekit.Pipeline(
+        _cfg(lake_home, topic, deadline_s=3, replica_count=2, ordinal=1),
+        sweep_s=0.5,
+    )
     try:
         await pipe_a.start()
+        await pipe_b.start()
+        assert pipe_a.stages.partitions() == ((topic.name, 0),)
+        assert pipe_b.stages.partitions() == ((topic.name, 1),)
+
         base = now_us()
         teams = skew.sample(400)
         await asyncio.to_thread(
@@ -187,56 +181,26 @@ async def test_cooperative_handoff_splits_ownership(
             [(team, base + i) for i, team in enumerate(teams)],
         )
         await livekit.wait_until_async(
-            lambda: sum(livekit.lake_team_counts(table, lake_home.head()).values()) > 0,
-            60,
-            desc="replica A flushing some of wave 1",
-        )
-
-        # B joins the group: cooperative-sticky hands it one partition.
-        pipe_b = livekit.Pipeline(_cfg(**cfg), sweep_s=0.5)
-        await pipe_b.start()
-        assert pipe_b.consumer is not None and pipe_a.consumer is not None
-        await livekit.wait_until_async(
-            lambda: len(pipe_b.stages.partitions()) == 1,
-            90,
-            desc="the group handing partition(s) to replica B",
-        )
-        # Cooperative-sticky splits 2 partitions over 2 members 1+1; A's
-        # application of the revoke lands on its own consume loop, so
-        # converge rather than sample.
-        await livekit.wait_until_async(
-            lambda: len(pipe_a.stages.partitions()) == 1,
-            90,
-            desc="replica A releasing the moved partition",
-        )
-
-        base2 = now_us()
-        teams2 = skew.sample(400)
-        await asyncio.to_thread(
-            livekit.produce_batch,
-            producer,
-            [(team, base2 + i) for i, team in enumerate(teams2)],
-            seq_start=400,
-        )
-        await livekit.wait_until_async(
             lambda: (
-                sum(livekit.lake_team_counts(table, lake_home.head()).values()) == 800
+                sum(livekit.lake_team_counts(table, lake_home.head()).values()) == 400
             ),
             120,
-            desc="all 800 events queryable across both owners",
+            desc="all 400 events queryable across both replicas",
         )
-        # Both owners really owned: each consumed and each flushed.
+        assert pipe_a.consumer is not None and pipe_b.consumer is not None
         stats_a = pipe_a.consumer.stats()
         stats_b = pipe_b.consumer.stats()
         assert stats_a.messages_consumed > 0 and stats_b.messages_consumed > 0
-        assert stats_a.messages_consumed + stats_b.messages_consumed == 800
+        assert stats_a.messages_consumed + stats_b.messages_consumed == 400
+        assert set(pipe_a.consumer.committed_offsets()) == {(topic.name, 0)}
+        assert set(pipe_b.consumer.committed_offsets()) == {(topic.name, 1)}
         assert pipe_a.flusher is not None and pipe_b.flusher is not None
         assert pipe_a.flusher.stats().flushes_committed > 0
         assert pipe_b.flusher.stats().flushes_committed > 0
     finally:
         await pipe_a.stop()
-        if pipe_b is not None:
-            await pipe_b.stop()
+        await pipe_b.stop()
 
+    # Exact reconciliation: every produced row once, nothing twice.
     counts = livekit.lake_team_counts(table, lake_home.head())
     assert counts == _produced_by_team(producer)

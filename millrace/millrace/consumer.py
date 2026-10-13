@@ -40,23 +40,23 @@ per partition per poll). The batch is bounded by a record cap
 the poll's message count to the byte budget ÷ the run's observed
 average record size.
 
-Claiming follows the consumer assignment (docs/kafka-ingestion.md
+Claiming is static, millpond's model (docs/kafka-ingestion.md
 §Deployment: the assignment *is* the claim, and each partition's SlateDB
-instance is claimed with it):
-
-- ``static`` (millpond's model): an explicit partition list from config,
-  ``assign()`` with ``OFFSET_STORED`` — resume from the committed
-  offset, fall back to ``auto.offset.reset`` where none exists.
-- ``cooperative``: ``subscribe()`` with rebalance callbacks
-  (cooperative-sticky). librdkafka fires the callbacks INSIDE
-  ``consume()``; they only enqueue an event, and the loop applies it on
-  the asyncio side through :meth:`StageManager.sync_assignment` — on
-  assign the partition's stage is opened and recovered, on revoke/lost
-  it is closed cleanly (flush nothing, abandon nothing: staged state is
-  durable by construction and stays on the store for the new owner).
-  Events are applied BEFORE the poll's messages are staged, so a
-  partition revoked mid-poll has its just-fetched messages dropped
-  locally — the new owner replays them from the last commit.
+instance is claimed with it). There is no consumer group membership and
+no rebalance: :meth:`MillraceConsumer.start` reads the topic's partition
+count from Kafka metadata ONCE, keeps every partition ``p`` with
+``p % replica_count == ordinal`` (:func:`compute_assignment`, the rule
+copied from millpond), opens and recovers those partitions' stages
+through :meth:`StageManager.sync_assignment`, and then ``assign()``s
+them with ``OFFSET_STORED`` — resume from the committed offset, fall
+back to ``auto.offset.reset`` where none exists. The set never changes
+while the process runs; a partition that moves to another ordinal
+between deploys is recovered by its new owner from the same store path.
+An ordinal that works out to no partitions (fewer partitions than
+replicas) or a topic the metadata does not know refuses to start
+(:class:`AssignmentError`; main.py exits 2, a topology problem like a
+config error). A failed start is sticky: the consumer never polls, and
+:meth:`MillraceConsumer.run` re-raises.
 
 ``auto.offset.reset`` is a config knob
 (``MILLRACE_KAFKA_AUTO_OFFSET_RESET``, default ``latest`` — the fleet
@@ -70,9 +70,9 @@ docs/kafka-ingestion.md §Delivery semantics.
 Fencing: SlateDB is single-writer per path and fences LAZILY — a newer
 writer's open succeeds, and the older writer learns it lost the path at
 its next write's durability wait (``Error.Closed(FENCED)``, pinned by
-tests/test_slatedb_parity.py). Under static assignment no rebalance
-event announces the loss (an EKS one-at-a-time StatefulSet rollout
-double-assigns the ordinal, and the new pod opens the same paths). The
+tests/test_slatedb_parity.py). Nothing announces the loss to the old
+owner (an EKS one-at-a-time StatefulSet rollout double-assigns the
+ordinal, and the new pod opens the same paths). The
 loop therefore catches FENCED at the staging write — or, for a
 partition whose poll handled records but staged none (all dropped), at
 a durable fence-probe write issued in its place
@@ -125,7 +125,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import threading
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -147,7 +146,7 @@ from slatedb.uniffi import CloseReason
 from slatedb.uniffi import Error as SlateError
 
 from .coerce import DecodeError, load_json_object
-from .config import AssignmentMode, Config
+from .config import Config
 from .flush import FlushHalted
 from .grouping import GroupKeyer, PartitionSourceError
 from .stage import DroppedRecord, StagedRecord, StageManager
@@ -176,7 +175,18 @@ DROP_LOG_INTERVAL_S: Final = 10.0
 _COMMIT_MAX_ATTEMPTS: Final = 3
 _COMMIT_BASE_DELAY_S: Final = 0.5
 
-# Coordinator-warmup probe bounds for static start (see
+# Partition-count discovery bounds (``MillraceConsumer
+# ._discover_partition_count``): one metadata read per attempt with
+# millpond's 30 s bound, a few attempts with a short pause for the
+# broker-side transients (a transport error, a timeout, a topic whose
+# leaders are still being elected), and an overall budget of at most
+# ``attempts × timeout + (attempts - 1) × retry`` ≈ 3 min before startup
+# is refused. Cheap to fail: nothing is claimed until the count is known.
+_METADATA_TIMEOUT_S: Final = 30.0
+_METADATA_MAX_ATTEMPTS: Final = 6
+_METADATA_RETRY_S: Final = 2.0
+
+# Coordinator-warmup probe bounds for the start (see
 # ``MillraceConsumer._await_offset_storage_ready``). A fresh broker's
 # NOT_COORDINATOR answer comes back at once, so quick probes with short
 # sleeps ride out the __consumer_offsets election (observed at ~1 s)
@@ -187,13 +197,23 @@ _OFFSET_STORAGE_WARMUP_RETRY_S: Final = 0.5
 _OFFSET_STORAGE_WARMUP_TIMEOUT_S: Final = 5.0
 
 
+class AssignmentError(Exception):
+    """The startup partition assignment cannot be computed: the topic is
+    unknown to the cluster metadata (or reports an error), or millpond's
+    split rule hands this ordinal nothing (more replicas than
+    partitions). A startup refusal, not a crash — nothing was claimed,
+    nothing staged; main.py maps it to exit 2 beside ``ConfigError``
+    (one log line, no traceback) and the operator fixes the topology
+    (the replica count or the topic)."""
+
+
 class ConsumerFencedError(Exception):
     """A claimed partition's SlateDB path fenced this writer: a NEWER
     writer opened the same path (SlateDB's lazy ``Error.Closed(FENCED)``,
     pinned by tests/test_slatedb_parity.py — an EKS one-at-a-time
-    StatefulSet rollout double-assigning the ordinal is the static-mode
-    shape of this). There is no rebalance event to catch instead, and
-    continuing is pointless: every later write fails the same way.
+    StatefulSet rollout double-assigning the ordinal is the shape of
+    this). Nothing else announces the loss, and continuing is
+    pointless: every later write fails the same way.
 
     The loop closes the fenced stage locally (this process never touches
     the path again) and halts with this DISTINCT exception — distinct
@@ -214,7 +234,7 @@ class ConsumerFencedError(Exception):
             + ", ".join(f"{t}[{p}]" for t, p in self.partitions)
             + " — halting rather than flapping against the new owner; "
             "do not restart this pod onto the same assignment (README: "
-            "static mode needs a rollout barrier)"
+            "the rollout needs a barrier)"
         )
 
 
@@ -253,15 +273,22 @@ class KafkaConsumerLike(Protocol):
     ) -> list[Any]: ...
     def committed(self, partitions: list[Any], timeout: float = -1) -> list[Any]: ...
     def assign(self, partitions: list[Any]) -> None: ...
-    def subscribe(
-        self,
-        topics: list[str],
-        on_assign: Any = None,
-        on_revoke: Any = None,
-        on_lost: Any = None,
-    ) -> None: ...
-    def assignment(self) -> list[Any]: ...
+    def list_topics(self, topic: str | None = None, timeout: float = -1) -> Any: ...
     def close(self) -> None: ...
+
+
+def compute_assignment(
+    partition_count: int, replica_count: int, ordinal: int
+) -> tuple[int, ...]:
+    """The partitions one replica claims: every ``p`` in
+    ``range(partition_count)`` with ``p % replica_count == ordinal``.
+    millpond's rule verbatim (millpond/consumer.py ``compute_assignment``)
+    so a millpond deployment's ordinal→partition map carries over
+    unchanged. With ``partition_count`` a multiple of ``replica_count``
+    every replica gets the same number; otherwise the low ordinals get
+    one more, and an ordinal at or past ``partition_count`` gets none.
+    """
+    return tuple(p for p in range(partition_count) if p % replica_count == ordinal)
 
 
 def classify_message(
@@ -332,7 +359,6 @@ class ConsumerStats:
     records_staged: int
     records_dropped: Mapping[str, int]
     kafka_error_events: int
-    messages_skipped_revoked: int
     commit_attempts: int
     commit_retries: int
 
@@ -344,19 +370,24 @@ def kafka_consumer_config(cfg: Config) -> dict[str, Any]:
     — the fleet policy; the tension is on
     :class:`millrace.config.AutoOffsetReset`); auto-commit and
     auto-offset-store are OFF — offsets move only through the loop's
-    explicit commits, strictly after durable staging. Cooperative mode
-    pins the cooperative-sticky assignor so rebalance callbacks hand out
-    incremental assign/revoke events. The three fetch knobs are the
+    explicit commits, strictly after durable staging. No
+    ``partition.assignment.strategy``: the consumer never joins the
+    group, it only stores offsets under it. The three fetch knobs are the
     whale-shape fetch tuning (config.py's table: the 1 MiB library
     default for ``max.partition.fetch.bytes`` capped millpond's hot
     partition at ~50 MB/s; these defaults let one hot partition's poll
     arrive in one response, keep the per-fetch aggregate ahead of
     several hot partitions, and hold ~5 s of pod inflow in the local
-    queue before librdkafka throttles fetches).
+    queue before librdkafka throttles fetches). The operator's
+    ``MILLRACE_KAFKA_CONSUMER_*`` passthrough (config.py) is applied
+    LAST, verbatim, so it can add ``security.protocol`` / ``sasl.*`` /
+    ``client.rack`` or override ``client.id`` (WarpStream's
+    ``ws_az=…`` zone pinning); the keys millrace owns for correctness
+    were refused at config time, so nothing here can be undone by it.
     """
     config: dict[str, Any] = {
         "bootstrap.servers": cfg.kafka_bootstrap_servers,
-        "client.id": f"millrace-{cfg.kafka_topic}",
+        "client.id": f"millrace-{cfg.kafka_topic}-{cfg.ordinal}",
         "group.id": cfg.kafka_group_id,
         "auto.offset.reset": cfg.kafka_auto_offset_reset.value,
         "enable.auto.commit": False,
@@ -365,8 +396,7 @@ def kafka_consumer_config(cfg: Config) -> dict[str, Any]:
         "fetch.max.bytes": cfg.kafka_fetch_max_bytes,
         "queued.max.messages.kbytes": cfg.kafka_queued_max_messages_kbytes,
     }
-    if cfg.assignment_mode is AssignmentMode.COOPERATIVE:
-        config["partition.assignment.strategy"] = "cooperative-sticky"
+    config.update(cfg.kafka_consumer_overrides)
     return config
 
 
@@ -427,9 +457,10 @@ class MillraceConsumer:
         self._executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="millrace-kafka"
         )
-        self._event_lock = threading.Lock()
-        self._assignment_events: list[tuple[str, tuple[tuple[str, int], ...]]] = []
         self._started = False
+        # A failed start is sticky (nothing was claimed; the process
+        # restarts): run() must never poll an unassigned consumer.
+        self._start_error: BaseException | None = None
         self._stopping = False
         self._closed = False
         # Running observation of record sizes (key + value bytes over
@@ -444,7 +475,6 @@ class MillraceConsumer:
         self._drop_log_at: dict[tuple[str, int, str], float] = {}
         self._drop_log_suppressed: dict[tuple[str, int, str], int] = {}
         self._kafka_error_events = 0
-        self._messages_skipped_revoked = 0
         self._commit_attempts = 0
         self._commit_retries = 0
         self._committed: dict[tuple[str, int], int] = {}
@@ -452,64 +482,138 @@ class MillraceConsumer:
     # -- lifecycle -------------------------------------------------------------
 
     async def start(self) -> None:
-        """Open the partition stages and start consuming. Idempotent.
+        """Discover the assignment, open the partition stages and start
+        consuming. Idempotent.
 
-        Static mode opens and recovers the stages BEFORE ``assign()`` —
-        a record must never arrive before its partition's stage exists.
-        Cooperative mode subscribes; the first poll's rebalance
-        callbacks open stages through the same ``sync_assignment`` path.
+        The topic's partition count is read from the cluster metadata
+        ONCE, here — there is no re-discovery; a topic whose partition
+        count changes needs a redeploy — and :func:`compute_assignment`
+        turns it into this ordinal's set. The stages are opened and
+        recovered BEFORE ``assign()``: a record must never arrive before
+        its partition's stage exists.
         """
         if self._started:
             return
+        if self._start_error is not None:
+            raise self._start_error
         if self._closed:
             raise RuntimeError("consumer is closed")
+        try:
+            await self._claim()
+        except BaseException as exc:
+            self._start_error = exc
+            raise
+        # Latched only once assign() succeeded: a failed start leaves
+        # the consumer unstarted, and the next start() re-raises.
         self._started = True
+
+    async def _claim(self) -> None:
         cfg = self._cfg
-        if cfg.assignment_mode is AssignmentMode.STATIC:
-            partitions = cfg.static_partitions or ()
-            sync = await self._stages.sync_assignment(
-                {(cfg.kafka_topic, p) for p in partitions}
+        partition_count = await self._discover_partition_count()
+        partitions = compute_assignment(partition_count, cfg.replica_count, cfg.ordinal)
+        if not partitions:
+            raise AssignmentError(
+                f"no partitions for ordinal {cfg.ordinal}: {cfg.kafka_topic} has "
+                f"{partition_count} partition(s) and MILLRACE_REPLICA_COUNT="
+                f"{cfg.replica_count} — at most {partition_count} replica(s) "
+                f"can claim anything"
             )
-            for (topic, partition), opened in sorted(sync.opened.items()):
-                log.info(
-                    "claimed %s[%d]: stage %s open (recovery: %d pending "
-                    "prepared, %d legacy markers collected)",
-                    topic,
-                    partition,
-                    opened.stage.path,
-                    len(opened.recovery.pending_prepared),
-                    opened.recovery.legacy_markers_collected,
-                )
-            # OFFSET_STORED: resume from the committed offset, fall back
-            # to auto.offset.reset (the config knob, default latest)
-            # where none exists — so a partition reassigned between
-            # deploys resumes from whichever pod owned it last, and a
-            # fresh one starts where the knob says.
-            # The coordinator warmup is load-bearing: librdkafka resolves
-            # OFFSET_STORED with ONE OffsetFetch at assign time and never
-            # retries it, so a fetch that lands while a fresh broker is
-            # still electing the __consumer_offsets leaders (or right
-            # after a coordinator failover) leaves the partition assigned
-            # but NEVER fetching. The probe rides the warmup out first.
-            await self._await_offset_storage_ready(
-                [TopicPartition(cfg.kafka_topic, p) for p in partitions]
-            )
-            self._kafka.assign(
-                [TopicPartition(cfg.kafka_topic, p, OFFSET_STORED) for p in partitions]
-            )
-            log.info("static assignment on %s: %s", cfg.kafka_topic, list(partitions))
-        else:
-            self._kafka.subscribe(
-                [cfg.kafka_topic],
-                on_assign=self._on_assign,
-                on_revoke=self._on_revoke,
-                on_lost=self._on_lost,
-            )
+        log.info(
+            "assignment: ordinal %d of %d replicas over %d partitions of %s → %s",
+            cfg.ordinal,
+            cfg.replica_count,
+            partition_count,
+            cfg.kafka_topic,
+            list(partitions),
+        )
+        sync = await self._stages.sync_assignment(
+            {(cfg.kafka_topic, p) for p in partitions}
+        )
+        for (topic, partition), opened in sorted(sync.opened.items()):
             log.info(
-                "subscribed to %s (cooperative-sticky); stages follow the "
-                "group assignment",
-                cfg.kafka_topic,
+                "claimed %s[%d]: stage %s open (recovery: %d pending "
+                "prepared, %d legacy markers collected)",
+                topic,
+                partition,
+                opened.stage.path,
+                len(opened.recovery.pending_prepared),
+                opened.recovery.legacy_markers_collected,
             )
+        # OFFSET_STORED: resume from the committed offset, fall back
+        # to auto.offset.reset (the config knob, default latest)
+        # where none exists — so a partition reassigned between
+        # deploys resumes from whichever pod owned it last, and a
+        # fresh one starts where the knob says.
+        # The coordinator warmup is load-bearing: librdkafka resolves
+        # OFFSET_STORED with ONE OffsetFetch at assign time and never
+        # retries it, so a fetch that lands while a fresh broker is
+        # still electing the __consumer_offsets leaders (or right
+        # after a coordinator failover) leaves the partition assigned
+        # but NEVER fetching. The probe rides the warmup out first.
+        await self._await_offset_storage_ready(
+            [TopicPartition(cfg.kafka_topic, p) for p in partitions]
+        )
+        self._kafka.assign(
+            [TopicPartition(cfg.kafka_topic, p, OFFSET_STORED) for p in partitions]
+        )
+        log.info("assigned %s: %s", cfg.kafka_topic, list(partitions))
+
+    async def _discover_partition_count(self) -> int:
+        """The topic's partition count from the cluster metadata: a
+        blocking ``list_topics`` on the Kafka worker, each call bounded
+        by :data:`_METADATA_TIMEOUT_S`, up to :data:`_METADATA_MAX_ATTEMPTS`
+        attempts :data:`_METADATA_RETRY_S` apart — the same probe shape
+        as the coordinator warmup. Retried: librdkafka's own
+        ``KafkaException`` (a transport error, a timeout) and the
+        topic-level LEADER_NOT_AVAILABLE a fresh broker answers while
+        its partition leaders are still being elected. NOT retried,
+        refused at once as an :class:`AssignmentError`: a topic absent
+        from the answer or carrying any other broker error (such as
+        UNKNOWN_TOPIC_OR_PART — the consumer never auto-creates, as
+        ``allow.auto.create.topics`` is off for consumers), or a topic
+        with zero partitions. Persistent transient failure refuses
+        startup with the last ``KafkaException``; a refusal here is
+        cheap, since nothing has been claimed yet, and the supervisor's
+        restart simply probes again."""
+        topic = self._cfg.kafka_topic
+        for attempt in range(1, _METADATA_MAX_ATTEMPTS + 1):
+            transient: BaseException | str
+            try:
+                metadata = await self._call_kafka(
+                    partial(self._kafka.list_topics, topic, timeout=_METADATA_TIMEOUT_S)
+                )
+            except KafkaException as exc:
+                transient = exc
+            else:
+                topic_meta = metadata.topics.get(topic)
+                if topic_meta is None:
+                    raise AssignmentError(f"topic {topic!r} is unknown to the cluster")
+                err = topic_meta.error
+                if err is None:
+                    count = len(topic_meta.partitions)
+                    if count == 0:
+                        raise AssignmentError(f"topic {topic!r} reports no partitions")
+                    if attempt > 1:
+                        log.info("cluster metadata answered after %d probes", attempt)
+                    return count
+                if err.code() != KafkaError.LEADER_NOT_AVAILABLE:
+                    raise AssignmentError(f"topic {topic!r}: {err}")
+                transient = f"topic {topic!r}: {err}"
+            if attempt == _METADATA_MAX_ATTEMPTS:
+                if isinstance(transient, BaseException):
+                    raise transient
+                raise KafkaException(
+                    f"cluster metadata for {topic!r} never settled after "
+                    f"{attempt} attempts ({transient})"
+                )
+            log.info(
+                "waiting for cluster metadata (attempt %d/%d): %s",
+                attempt,
+                _METADATA_MAX_ATTEMPTS,
+                transient,
+            )
+            await self._sleep(_METADATA_RETRY_S)
+        raise AssertionError("unreachable")  # pragma: no cover
 
     async def run(self) -> None:
         """Consume until :meth:`stop`. The in-flight cycle finishes
@@ -564,31 +668,9 @@ class MillraceConsumer:
             records_staged=self._records_staged,
             records_dropped=dict(self._records_dropped),
             kafka_error_events=self._kafka_error_events,
-            messages_skipped_revoked=self._messages_skipped_revoked,
             commit_attempts=self._commit_attempts,
             commit_retries=self._commit_retries,
         )
-
-    # -- rebalance callbacks (fired by librdkafka INSIDE consume()) -------------
-
-    def _record_assignment_event(self, kind: str, partitions: list[Any]) -> None:
-        claimed = tuple((tp.topic, tp.partition) for tp in partitions)
-        with self._event_lock:
-            self._assignment_events.append((kind, claimed))
-
-    def _on_assign(self, _consumer: Any, partitions: list[Any]) -> None:
-        # Runs on the Kafka worker thread, inside consume(). It must not
-        # block on asyncio: enqueue; the loop applies it through
-        # sync_assignment after the poll returns. (Not calling
-        # incremental_assign here is fine — librdkafka then does it
-        # automatically when the callback returns.)
-        self._record_assignment_event("assign", partitions)
-
-    def _on_revoke(self, _consumer: Any, partitions: list[Any]) -> None:
-        self._record_assignment_event("revoke", partitions)
-
-    def _on_lost(self, _consumer: Any, partitions: list[Any]) -> None:
-        self._record_assignment_event("lost", partitions)
 
     # -- the loop ----------------------------------------------------------------
 
@@ -649,11 +731,7 @@ class MillraceConsumer:
             await self._sleep(_OFFSET_STORAGE_WARMUP_RETRY_S)
 
     async def _step(self) -> None:
-        """One loop iteration: poll → apply assignment changes → stage →
-        commit. Assignment changes land BEFORE the poll's messages are
-        staged, so a partition revoked mid-poll is closed first and its
-        just-fetched messages are dropped locally (the new owner replays
-        them from the last commit — zero loss).
+        """One loop iteration: poll → stage → commit.
 
         The poll's message count is the record cap clamped by the byte
         cap: ``batch_max_bytes ÷ observed average record size`` (the
@@ -678,7 +756,6 @@ class MillraceConsumer:
                 timeout=self._cfg.poll_timeout_ms / 1000,
             )
         )
-        await self._apply_assignment_events()
         if msgs:
             self._messages_consumed += len(msgs)
             await self._stage_and_commit(msgs)
@@ -748,44 +825,6 @@ class MillraceConsumer:
         assert self._shape_ttl_s is not None
         self._next_shape_read = self._monotonic() + self._shape_ttl_s
 
-    async def _apply_assignment_events(self) -> None:
-        """Reconcile the open stages with the consumer assignment after
-        a rebalance: newly claimed partitions open + recover;
-        revoked/lost ones close cleanly (flush nothing, abandon nothing
-        — staged state stays on the store for the new owner)."""
-        with self._event_lock:
-            events, self._assignment_events = self._assignment_events, []
-        if not events:
-            return
-        for kind, partitions in events:
-            log.log(
-                logging.WARNING if kind == "lost" else logging.INFO,
-                "rebalance: %s %s",
-                kind,
-                list(partitions),
-            )
-        # assignment() is the settled truth after the callbacks: syncing
-        # to it (rather than to event arithmetic) is self-healing.
-        claimed = {(tp.topic, tp.partition) for tp in self._kafka.assignment()}
-        sync = await self._stages.sync_assignment(claimed)
-        for (topic, partition), opened in sorted(sync.opened.items()):
-            log.info(
-                "claimed %s[%d]: stage %s open (recovery: %d pending "
-                "prepared, %d legacy markers collected)",
-                topic,
-                partition,
-                opened.stage.path,
-                len(opened.recovery.pending_prepared),
-                opened.recovery.legacy_markers_collected,
-            )
-        for topic, partition in sync.closed:
-            log.info(
-                "released %s[%d]: stage closed; staged state stays on the "
-                "store for the new owner",
-                topic,
-                partition,
-            )
-
     async def _stage_and_commit(self, msgs: Sequence[MessageView]) -> None:
         """Stage one poll's records per partition — the partitions'
         batches CONCURRENTLY (one task per ``stage_batch``, so the WAL
@@ -794,8 +833,10 @@ class MillraceConsumer:
         strictly after EVERY partition's batch is durable, the
         contiguous handled offset of each partition the poll touched.
         gather-then-commit is the ordering invariant: all acks before
-        the commit, not acks in sequence."""
-        claimed = set(self._stages.partitions())
+        the commit, not acks in sequence. A message for a partition this
+        process never claimed cannot arrive under ``assign()`` (the
+        assigned set IS the claimed set); if one ever did, the stage
+        lookup's KeyError would halt the loop rather than skip it."""
         now_us = self._now_us()
         staged: dict[tuple[str, int], list[StagedRecord]] = {}
         last_handled: dict[tuple[str, int], int] = {}
@@ -824,10 +865,6 @@ class MillraceConsumer:
                 )
                 continue
             key = (topic, partition)
-            if key not in claimed:
-                # Fetched before a revoke that the same poll delivered.
-                self._messages_skipped_revoked += 1
-                continue
             raw_key, raw_value = msg.key(), msg.value()
             outcome = classify_message(
                 self._keyer,
