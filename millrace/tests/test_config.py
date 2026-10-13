@@ -11,6 +11,8 @@ from millrace.config import (
     Config,
     ConfigError,
     EventTimePolicy,
+    PartitionFieldSpec,
+    SortFieldSpec,
     load_config,
 )
 
@@ -590,3 +592,457 @@ def test_config_error_message_lists_every_problem():
     assert "problem(s)" in text
     for problem in excinfo.value.problems:
         assert problem.removeprefix("  - ") in text
+
+
+# -- destination creation knobs (config.py §Destination creation) -----------------
+
+
+def test_destination_knobs_default_to_unset():
+    cfg = load(MINIMAL_ENV)
+    assert cfg.catalog_data_path is None
+    assert cfg.table_columns is None
+    assert cfg.partition_by is None
+    assert cfg.sort_by is None
+
+
+class TestCatalogDataPath:
+    def test_s3_url_is_kept_verbatim(self):
+        cfg = load(
+            MINIMAL_ENV
+            | {"MILLRACE_CATALOG_DATA_PATH": "s3://posthog-lake/millrace/millrace-dev/"}
+        )
+        assert cfg.catalog_data_path == "s3://posthog-lake/millrace/millrace-dev/"
+
+    @pytest.mark.parametrize(
+        ("value", "needle"),
+        [
+            ("s3://lake-bkt", "prefix"),
+            ("s3://Bad_Bucket/lake/", "bucket"),
+            ("file:///var/lake", "s3://bucket/prefix"),
+            ("gs://lake-bkt/lake/", "s3://bucket/prefix"),
+        ],
+    )
+    def test_invalid_values_refused_naming_the_knob(self, value, needle):
+        (p,) = problems(MINIMAL_ENV | {"MILLRACE_CATALOG_DATA_PATH": value})
+        assert "MILLRACE_CATALOG_DATA_PATH" in p and needle in p
+
+    def test_stage_bucket_equal_to_lake_bucket_is_refused(self):
+        # The lake role's prefix-scoped grants would let SlateDB half-write
+        # a staging root into the lake bucket; the two must differ.
+        (p,) = problems(
+            MINIMAL_ENV
+            | {
+                "MILLRACE_STAGE_URL": "s3://data-bucket/millrace",
+                "MILLRACE_CATALOG_DATA_PATH": "s3://data-bucket/lake/",
+            }
+        )
+        assert "MILLRACE_STAGE_URL" in p and "MILLRACE_CATALOG_DATA_PATH" in p
+        assert "'data-bucket'" in p and "different buckets" in p
+
+    def test_different_buckets_are_fine(self):
+        cfg = load(
+            MINIMAL_ENV
+            | {
+                "MILLRACE_STAGE_URL": "s3://stage-bucket/millrace",
+                "MILLRACE_CATALOG_DATA_PATH": "s3://data-bucket/lake/",
+            }
+        )
+        assert cfg.stage_store_url == "s3://stage-bucket"
+        assert cfg.catalog_data_path == "s3://data-bucket/lake/"
+
+    @pytest.mark.parametrize("stage", ["file:///var/lib/millrace", "memory:///"])
+    def test_non_s3_stage_with_an_s3_data_path_is_fine(self, stage):
+        cfg = load(
+            MINIMAL_ENV
+            | {
+                "MILLRACE_STAGE_URL": stage,
+                "MILLRACE_CATALOG_DATA_PATH": "s3://data-bucket/lake/",
+            }
+        )
+        assert cfg.catalog_data_path == "s3://data-bucket/lake/"
+
+
+class TestTableColumns:
+    """MILLRACE_TABLE_COLUMNS: ``name:type,…`` with hoglake type names."""
+
+    def test_typed_columns_parse_in_order_all_nullable(self):
+        cfg = load(
+            MINIMAL_ENV
+            | {
+                "MILLRACE_TABLE_COLUMNS": (
+                    " team_id:long, timestamp:timestamptz,uuid:UUID, "
+                    "amount:decimal(10,2), props:json ,ok:boolean,"
+                )
+            }
+        )
+        assert cfg.table_columns is not None
+        assert [(c.name, c.col_type, c.params()) for c in cfg.table_columns] == [
+            ("team_id", "long", None),
+            ("timestamp", "timestamptz", None),
+            ("uuid", "uuid", None),
+            ("amount", "decimal", {"precision": 10, "scale": 2}),
+            ("props", "json", None),
+            ("ok", "boolean", None),
+        ]
+        # Every type maps through pyhoglake's coltype_to_arrow.
+        import pyarrow as pa
+
+        assert cfg.table_columns[3].arrow_type() == pa.decimal128(10, 2)
+
+    @pytest.mark.parametrize(
+        ("value", "needle"),
+        [
+            ("team_id", "name:type"),
+            ("team_id:", "name:type"),
+            (":long", "name:type"),
+            ("team_id:bigint", "unknown hoglake column type 'bigint'"),
+            ("amount:decimal", "precision and scale"),
+            ("props:struct", "nested type 'struct'"),
+            ("tags:list", "nested type 'list'"),
+            ("m:map", "nested type 'map'"),
+            ("v:variant", "variant"),
+            ("team_id:long,team_id:string", "duplicated"),
+            ("bad.col:long", "not a valid hoglake identifier"),
+            ("_hog_row_id:long", "reserved prefix"),
+            (",", "contains no entries"),
+        ],
+    )
+    def test_refusals_name_the_knob(self, value, needle):
+        found = problems(MINIMAL_ENV | {"MILLRACE_TABLE_COLUMNS": value})
+        assert any("MILLRACE_TABLE_COLUMNS" in p and needle in p for p in found), found
+
+    def test_every_bad_entry_is_reported_at_once(self):
+        found = problems(
+            MINIMAL_ENV | {"MILLRACE_TABLE_COLUMNS": "a:nope,b:struct,a:long,c:long"}
+        )
+        assert len(found) == 3
+
+
+class TestPartitionBy:
+    """MILLRACE_PARTITION_BY is millpond's HOGLAKE_PARTITION_BY grammar
+    (millpond/config.py ``_parse_hoglake_partition_by``; the cases are
+    its tests/unit/test_config.py::TestHoglakePartitionBy)."""
+
+    def test_bare_column_is_identity(self):
+        cfg = load(MINIMAL_ENV | {"MILLRACE_PARTITION_BY": "team_id"})
+        assert cfg.partition_by == (PartitionFieldSpec("team_id", "identity", None),)
+
+    def test_temporal_transforms(self):
+        cfg = load(
+            MINIMAL_ENV
+            | {
+                "MILLRACE_PARTITION_BY": (
+                    "year(_inserted_at), month(_inserted_at), day(_inserted_at), "
+                    "hour(_inserted_at)"
+                )
+            }
+        )
+        assert cfg.partition_by == (
+            PartitionFieldSpec("_inserted_at", "year", None),
+            PartitionFieldSpec("_inserted_at", "month", None),
+            PartitionFieldSpec("_inserted_at", "day", None),
+            PartitionFieldSpec("_inserted_at", "hour", None),
+        )
+
+    def test_bucket_with_param(self):
+        cfg = load(MINIMAL_ENV | {"MILLRACE_PARTITION_BY": "bucket(team_id, 16)"})
+        assert cfg.partition_by == (PartitionFieldSpec("team_id", "bucket", 16),)
+        assert cfg.partition_by[0].describe() == "bucket(team_id, 16)"
+
+    def test_mixed_expression(self):
+        cfg = load(
+            MINIMAL_ENV | {"MILLRACE_PARTITION_BY": "team_id,month(_inserted_at)"}
+        )
+        assert cfg.partition_by == (
+            PartitionFieldSpec("team_id", "identity", None),
+            PartitionFieldSpec("_inserted_at", "month", None),
+        )
+
+    def test_the_recommended_dev_shape(self):
+        cfg = load(
+            MINIMAL_ENV | {"MILLRACE_PARTITION_BY": "identity(team_id),day(timestamp)"}
+        )
+        assert cfg.partition_by == (
+            PartitionFieldSpec("team_id", "identity", None),
+            PartitionFieldSpec("timestamp", "day", None),
+        )
+
+    @pytest.mark.parametrize(
+        "expr",
+        [
+            "truncate(ts)",  # client-side-only transform; server refuses it
+            "void(ts)",
+            "date_trunc(day, ts)",
+        ],
+    )
+    def test_unknown_transform_refused_listing_vocabulary(self, expr):
+        (p,) = problems(MINIMAL_ENV | {"MILLRACE_PARTITION_BY": expr})
+        assert "MILLRACE_PARTITION_BY" in p
+        assert "identity, year, month, day, hour, bucket" in p
+
+    @pytest.mark.parametrize(
+        "expr",
+        [
+            "year(",  # unbalanced
+            "year()",  # no column
+            "year(a,b)",  # arity
+            "bucket(team_id)",  # bucket needs a param
+            "bucket(team_id, 0)",  # param must be positive
+            "bucket(team_id, x)",  # param must be an int
+            "hour(bad.col)",  # unsafe column name
+            "team_id,team_id",  # duplicated
+            ",",  # empty entries only
+        ],
+    )
+    def test_malformed_expression_refused(self, expr):
+        found = problems(MINIMAL_ENV | {"MILLRACE_PARTITION_BY": expr})
+        assert found and all("MILLRACE_PARTITION_BY" in p for p in found)
+
+    def test_without_columns_it_is_only_an_agreement_check(self):
+        # No MILLRACE_TABLE_COLUMNS: nothing to resolve the sources
+        # against at boot; the live table is what they are compared to.
+        cfg = load(
+            MINIMAL_ENV
+            | {"MILLRACE_PARTITION_BY": "team_id", "MILLRACE_SORT_BY": "timestamp"}
+        )
+        assert cfg.table_columns is None
+        assert cfg.partition_by is not None
+        assert cfg.sort_by == (SortFieldSpec("timestamp", "asc", "nulls_last"),)
+
+    def test_source_must_be_a_configured_column(self):
+        (p,) = problems(
+            MINIMAL_ENV
+            | {
+                "MILLRACE_TABLE_COLUMNS": "team_id:long",
+                "MILLRACE_PARTITION_BY": "day(timestamp)",
+            }
+        )
+        assert "MILLRACE_PARTITION_BY day(timestamp)" in p
+        assert "'timestamp'" in p and "MILLRACE_TABLE_COLUMNS" in p
+
+    @pytest.mark.parametrize(
+        ("columns", "expr", "needle"),
+        [
+            ("ts:string", "day(ts)", "day transform cannot be applied"),
+            ("d:date", "hour(d)", "hour transform cannot be applied"),
+            ("x:double", "bucket(x, 8)", "bucket cannot be applied"),
+            ("j:json", "bucket(j, 8)", "bucket cannot be applied"),
+        ],
+    )
+    def test_transform_must_be_valid_for_the_source_type(self, columns, expr, needle):
+        (p,) = problems(
+            MINIMAL_ENV
+            | {"MILLRACE_TABLE_COLUMNS": columns, "MILLRACE_PARTITION_BY": expr}
+        )
+        assert "MILLRACE_PARTITION_BY" in p and needle in p
+
+    def test_valid_transforms_against_configured_columns(self):
+        cfg = load(
+            MINIMAL_ENV
+            | {
+                "MILLRACE_TABLE_COLUMNS": "team_id:long,timestamp:timestamptz,u:uuid",
+                "MILLRACE_PARTITION_BY": "team_id,day(timestamp),bucket(u, 4)",
+                "MILLRACE_SORT_BY": "timestamp",
+            }
+        )
+        assert cfg.partition_by is not None and len(cfg.partition_by) == 3
+
+
+class TestSortBy:
+    """MILLRACE_SORT_BY is a superset of millpond's MILLPOND_SORT_BY
+    grammar (millpond/config.py ``_parse_column_list``; the bare-name
+    cases are its tests/unit/test_config.py::TestSortByConfig and must
+    parse to the order millpond declares, asc nulls_last): each entry
+    ``col [asc|desc] [nulls_first|nulls_last]``."""
+
+    def test_single_field(self):
+        cfg = load(MINIMAL_ENV | {"MILLRACE_SORT_BY": "team_id"})
+        assert cfg.sort_by == (SortFieldSpec("team_id", "asc", "nulls_last"),)
+
+    def test_multi_field_order_preserved(self):
+        cfg = load(MINIMAL_ENV | {"MILLRACE_SORT_BY": "team_id,timestamp,distinct_id"})
+        assert cfg.sort_by == (
+            SortFieldSpec("team_id"),
+            SortFieldSpec("timestamp"),
+            SortFieldSpec("distinct_id"),
+        )
+
+    def test_whitespace_around_fields_trimmed(self):
+        cfg = load(MINIMAL_ENV | {"MILLRACE_SORT_BY": "  team_id ,  timestamp  "})
+        assert cfg.sort_by == (SortFieldSpec("team_id"), SortFieldSpec("timestamp"))
+
+    def test_empty_tokens_dropped(self):
+        cfg = load(MINIMAL_ENV | {"MILLRACE_SORT_BY": "team_id,,timestamp,"})
+        assert cfg.sort_by == (SortFieldSpec("team_id"), SortFieldSpec("timestamp"))
+
+    def test_duplicates_deduplicated_first_wins(self):
+        cfg = load(
+            MINIMAL_ENV | {"MILLRACE_SORT_BY": "timestamp desc,team_id,timestamp"}
+        )
+        assert cfg.sort_by == (
+            SortFieldSpec("timestamp", "desc", "nulls_last"),
+            SortFieldSpec("team_id"),
+        )
+
+    def test_whitespace_only_value_yields_none(self):
+        cfg = load(MINIMAL_ENV | {"MILLRACE_SORT_BY": "   "})
+        assert cfg.sort_by is None
+
+    def test_unsafe_field_name_rejected(self):
+        found = problems(
+            MINIMAL_ENV | {"MILLRACE_SORT_BY": "team_id, foo; DROP TABLE x"}
+        )
+        assert any(
+            "MILLRACE_SORT_BY" in p and "not a valid hoglake identifier" in p
+            for p in found
+        )
+
+    @pytest.mark.parametrize(
+        ("entry", "direction", "null_order"),
+        [
+            ("timestamp", "asc", "nulls_last"),
+            ("timestamp asc", "asc", "nulls_last"),
+            ("timestamp desc", "desc", "nulls_last"),
+            ("timestamp nulls_first", "asc", "nulls_first"),
+            ("timestamp nulls_last", "asc", "nulls_last"),
+            ("timestamp asc nulls_first", "asc", "nulls_first"),
+            ("timestamp asc nulls_last", "asc", "nulls_last"),
+            ("timestamp desc nulls_first", "desc", "nulls_first"),
+            ("timestamp desc nulls_last", "desc", "nulls_last"),
+            ("timestamp DESC NULLS FIRST", "desc", "nulls_first"),
+            ("timestamp  desc   nulls last", "desc", "nulls_last"),
+        ],
+    )
+    def test_direction_and_null_order_combinations(self, entry, direction, null_order):
+        cfg = load(MINIMAL_ENV | {"MILLRACE_SORT_BY": entry})
+        assert cfg.sort_by == (SortFieldSpec("timestamp", direction, null_order),)
+        assert cfg.sort_by[0].describe() == f"timestamp {direction} {null_order}"
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            "timestamp sideways",
+            "timestamp nulls_first desc",  # order of modifiers is fixed
+            "timestamp asc asc",
+            "timestamp desc nulls",
+        ],
+    )
+    def test_garbage_modifiers_refused(self, entry):
+        (p,) = problems(MINIMAL_ENV | {"MILLRACE_SORT_BY": entry})
+        assert (
+            "MILLRACE_SORT_BY" in p and "col [asc|desc] [nulls_first|nulls_last]" in p
+        )
+
+    def test_column_must_be_configured_when_columns_are(self):
+        (p,) = problems(
+            MINIMAL_ENV
+            | {
+                "MILLRACE_TABLE_COLUMNS": "team_id:long",
+                "MILLRACE_SORT_BY": "timestamp desc",
+            }
+        )
+        assert "MILLRACE_SORT_BY column 'timestamp'" in p
+        assert "MILLRACE_TABLE_COLUMNS" in p
+
+
+# -- review additions: grammar edges ------------------------------------------------
+
+_ID_128 = "c" * 128
+_ID_129 = "c" * 129
+
+
+class TestGrammarEdges:
+    @pytest.mark.parametrize(
+        ("expr", "expected"),
+        [
+            ("bucket(team_id,16)", (PartitionFieldSpec("team_id", "bucket", 16),)),
+            ("day( timestamp )", (PartitionFieldSpec("timestamp", "day"),)),
+            ("DAY(ts)", (PartitionFieldSpec("ts", "day"),)),
+            ("team_id,", (PartitionFieldSpec("team_id", "identity"),)),
+            ("team-id", (PartitionFieldSpec("team-id", "identity"),)),
+            (f"day({_ID_128})", (PartitionFieldSpec(_ID_128, "day"),)),
+        ],
+    )
+    def test_partition_by_accepts(self, expr, expected):
+        assert (
+            load(MINIMAL_ENV | {"MILLRACE_PARTITION_BY": expr}).partition_by == expected
+        )
+
+    @pytest.mark.parametrize(
+        ("expr", "needle"),
+        [
+            ("a,identity(a)", "duplicated"),
+            ("identity(a),a", "duplicated"),
+            (f"day({_ID_129})", "column name"),
+        ],
+    )
+    def test_partition_by_refuses(self, expr, needle):
+        found = problems(MINIMAL_ENV | {"MILLRACE_PARTITION_BY": expr})
+        assert found and all("MILLRACE_PARTITION_BY" in p for p in found)
+        assert any(needle in p for p in found), found
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (
+                "amount:decimal(10, 2)",
+                [("amount", "decimal", {"precision": 10, "scale": 2})],
+            ),
+            (
+                "amount:DECIMAL(10,2)",
+                [("amount", "decimal", {"precision": 10, "scale": 2})],
+            ),
+            (
+                "amount:decimal(38,38)",
+                [("amount", "decimal", {"precision": 38, "scale": 38})],
+            ),
+            (
+                "amount:decimal(1,0)",
+                [("amount", "decimal", {"precision": 1, "scale": 0})],
+            ),
+            ("t:LONG", [("t", "long", None)]),
+            ("team-id:long", [("team-id", "long", None)]),
+            (f"{_ID_128}:long", [(_ID_128, "long", None)]),
+            ("t:long,", [("t", "long", None)]),
+        ],
+    )
+    def test_table_columns_accepts(self, value, expected):
+        cfg = load(MINIMAL_ENV | {"MILLRACE_TABLE_COLUMNS": value})
+        assert cfg.table_columns is not None
+        assert [(c.name, c.col_type, c.params()) for c in cfg.table_columns] == expected
+
+    @pytest.mark.parametrize(
+        ("value", "needle"),
+        [
+            (f"{_ID_129}:long", "not a valid hoglake identifier"),
+            ("amount:decimal(0,0)", "1 <= p <= 38"),
+            ("amount:decimal(39,2)", "1 <= p <= 38"),
+            ("amount:decimal(10,11)", "0 <= s <= p"),
+            ("u:uint32", "'uint32' is stored as 'long' by the writer; configure long"),
+        ],
+    )
+    def test_table_columns_refuses(self, value, needle):
+        found = problems(MINIMAL_ENV | {"MILLRACE_TABLE_COLUMNS": value})
+        assert len(found) == 1 and "MILLRACE_TABLE_COLUMNS" in found[0]
+        assert needle in found[0], found
+
+    def test_ddl_style_map_is_one_nested_type_refusal(self):
+        found = problems(
+            MINIMAL_ENV | {"MILLRACE_TABLE_COLUMNS": "m:map<string,string>,t:long"}
+        )
+        (p,) = found
+        assert "nested type 'map<string,string>'" in p
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (f"{_ID_128}", (SortFieldSpec(_ID_128),)),
+            ("team-id desc", (SortFieldSpec("team-id", "desc", "nulls_last"),)),
+        ],
+    )
+    def test_sort_by_accepts(self, value, expected):
+        assert load(MINIMAL_ENV | {"MILLRACE_SORT_BY": value}).sort_by == expected
+
+    def test_sort_by_refuses_a_129_char_identifier(self):
+        (p,) = problems(MINIMAL_ENV | {"MILLRACE_SORT_BY": _ID_129})
+        assert "MILLRACE_SORT_BY" in p and "not a valid hoglake identifier" in p

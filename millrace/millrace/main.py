@@ -7,6 +7,8 @@ destination before any consume begins.
 Assembly: ``MILLRACE_*`` env → :class:`~millrace.config.Config` →
 :class:`~millrace.stage.StageManager` (one SlateDB instance per claimed
 partition, opened with the ``MILLRACE_SLATEDB_*`` settings — T9) +
+:func:`~millrace.destination.ensure_destination` (creates the catalog,
+namespace and table from config when missing) +
 :class:`~millrace.flush.HoglakeFlusher` (resolves the
 destination and pins its incarnation) + :class:`~millrace.consumer.
 MillraceConsumer` and :class:`~millrace.flush.FlushRunner` sharing the
@@ -27,10 +29,12 @@ Beyond the ``MILLRACE_*`` knobs (config.py), the process reads:
   nor overrides it.
 
 Exit codes: 0 clean stop (SIGINT/SIGTERM); 2 invalid configuration
-(:class:`ConfigError`, or an :class:`AssignmentError` at start — the
-replica count against the topic's partitions, or a topic the metadata
-does not know: a topology problem, logged in one line, nothing
-claimed); 3 the flush pipeline HALTED loudly (:class:`FlushHalted` — incarnation
+(:class:`ConfigError` — including a missing destination the config
+cannot create, :mod:`millrace.destination` — or an
+:class:`AssignmentError` at start — the replica count against the
+topic's partitions, or a topic the metadata does not know: a topology
+problem, logged in one line, nothing claimed); 3 the flush pipeline
+HALTED loudly (:class:`FlushHalted` — incarnation
 guard, expiry floor, idempotency anomaly); 4 the consumer was FENCED off
 a claimed partition's SlateDB path by a newer writer
 (:class:`ConsumerFencedError` — a blind restart re-opens the path and
@@ -72,6 +76,7 @@ from .consumer import (
     MillraceConsumer,
     create_kafka_consumer,
 )
+from .destination import DestinationError, ensure_destination
 from .flush import REPREPARE_REASONS, FlushHalted, FlushRunner, HoglakeFlusher
 from .grouping import GroupKeyer
 from .server import serve
@@ -453,8 +458,15 @@ async def _run(cfg: Config, hoglake_url: str, s3_kwargs: Mapping[str, Any]) -> i
     try:
         # Startup resolution is blocking I/O (fail-fast at boot); keep it
         # off the loop the consumer and flusher are about to share. The
-        # flusher's I/O pool is sized to the sweep's process-wide
-        # in-flight bound (M5's bounded parallelism).
+        # destination is created from config first (destination.py:
+        # catalog, namespace, table — each if missing, the replica race
+        # tolerated; a missing object the config cannot create is a
+        # ConfigError, exit 2), then the flusher resolves and pins it
+        # exactly as before. The flusher's I/O pool is sized to the
+        # sweep's process-wide in-flight bound (M5's bounded parallelism).
+        await asyncio.get_running_loop().run_in_executor(
+            None, partial(ensure_destination, client, cfg)
+        )
         flusher = await asyncio.get_running_loop().run_in_executor(
             None,
             partial(
@@ -649,6 +661,17 @@ def _main(env: Mapping[str, str]) -> int:
         return asyncio.run(_run(cfg, hoglake_url, _s3_kwargs(env)))
     except KeyboardInterrupt:  # pragma: no cover - signal handlers own the stop
         return 0
+    except ConfigError as e:
+        # A destination the configuration cannot create (destination.py):
+        # a config refusal naming the knob, not a crash.
+        print(str(e), file=sys.stderr)
+        return EXIT_CONFIG
+    except DestinationError as e:
+        # The server could not be asked (transport, 5xx, 403): one line,
+        # no traceback — the cause is in the message, and a supervisor's
+        # restart is the right next move.
+        log.error("millrace startup failed: %s", e)
+        return EXIT_ERROR
     except Exception:
         log.exception("millrace startup failed")
         return EXIT_ERROR

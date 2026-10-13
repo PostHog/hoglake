@@ -114,7 +114,7 @@ with the pipeline.
 
 | Entry point | Owns | Exit codes |
 |---|---|---|
-| `millrace` console script (`main.py:main`; also `python -m millrace.main`) | One topic → one table: config, `StageManager` (one SlateDB per claimed partition), `MillraceConsumer`, `HoglakeFlusher` + `FlushRunner`, ops server on `MILLRACE_METRICS_PORT` (default 8000) | 0 clean stop (SIGINT/SIGTERM); 1 failure (startup resolution, an unrecoverable task error, metadata never settling); 2 invalid config or an assignment refusal (`AssignmentError`: no share for this ordinal, unknown topic); 3 flush halted; 4 fenced, 1 other failure (incl. destination resolution failure at startup), 2 invalid config or missing `HOGLAKE_URL`, 3 flush pipeline halted (`FlushHalted`), 4 consumer fenced (`ConsumerFencedError`). Fenced outranks halted outranks generic (`main.py:_exit_code_for`). |
+| `millrace` console script (`main.py:main`; also `python -m millrace.main`) | One topic → one table: config, `StageManager` (one SlateDB per claimed partition), `ensure_destination` (`destination.py`: catalog, namespace and table created from config when missing), `MillraceConsumer`, `HoglakeFlusher` + `FlushRunner`, ops server on `MILLRACE_METRICS_PORT` (default 8000) | 0 clean stop (SIGINT/SIGTERM); 1 failure (startup resolution, an unrecoverable task error, metadata never settling); 2 invalid config or an assignment refusal (`AssignmentError`: no share for this ordinal, unknown topic); 3 flush halted; 4 fenced, 1 other failure (incl. destination resolution failure at startup), 2 invalid config or missing `HOGLAKE_URL`, 3 flush pipeline halted (`FlushHalted`), 4 consumer fenced (`ConsumerFencedError`). Fenced outranks halted outranks generic (`main.py:_exit_code_for`). |
 | `python -m millrace.maintenance` (`maintenance.py:main`) | GC and L0-debt monitoring for every SlateDB under one staging root, all topics; ops server on `MILLRACE_MAINTENANCE_METRICS_PORT` (default 8001) | 0 clean stop, 1 failure, 2 invalid config |
 | Ops HTTP server (`server.py:serve`, a thread inside each process) | `GET /metrics` (Prometheus exposition), `/healthz` (liveness), `/readyz` (readiness); 404 otherwise | n/a |
 
@@ -1018,6 +1018,10 @@ default.
 | `MILLRACE_CATALOG` | required | `[a-z][a-z0-9_-]{0,62}` | Destination catalog |
 | `MILLRACE_NAMESPACE` | required | `[A-Za-z_][A-Za-z0-9_-]{0,127}` | Destination namespace |
 | `MILLRACE_TABLE` | required | `[A-Za-z_][A-Za-z0-9_-]{0,127}` | Destination table |
+| `MILLRACE_CATALOG_DATA_PATH` | none | `s3://<valid bucket>/<non-empty prefix>`; a different bucket from `MILLRACE_STAGE_URL`'s | The catalog's `data_path` for creating it when missing (`destination.py`); unset, a missing catalog is a refusal (exit 2). An existing catalog's differing path is a WARNING; the live one wins |
+| `MILLRACE_TABLE_COLUMNS` | none | `name:type,…`; hoglake type names via `pyhoglake.types.coltype_to_arrow`, `decimal(p,s)`; identifiers; no nested types, `variant`, duplicates or `_hog` names | The complete column list for creating the table when missing (all nullable); unset, a missing table is a refusal (exit 2) |
+| `MILLRACE_PARTITION_BY` | none | millpond's `HOGLAKE_PARTITION_BY` grammar: `col` \| `identity(col)` \| `year/month/day/hour(col)` \| `bucket(col, N)`; with columns given, every source configured and the transform valid for its type (`pyhoglake.transforms.check_transform`) | The partition spec for creating the table; compared with an existing table's (WARNING on a difference). Dev shape: `identity(team_id),day(timestamp)` |
+| `MILLRACE_SORT_BY` | none | superset of millpond's `MILLPOND_SORT_BY` grammar: comma-separated `col [asc|desc] [nulls_first|nulls_last]` (default `asc nulls_last`), de-duplicated; with columns given, each configured | The sort order for creating the table; compared with an existing table's. Dev shape: `timestamp` |
 | `MILLRACE_STAGE_URL` | required | `s3://<valid bucket>/<non-empty prefix>`, `file:///<dir>`, `memory:///` | Staging root; DBs at `<base>/<topic>/<partition>` |
 | `MILLRACE_TARGET_OUTPUT_BYTES` | 524288000 (500 MiB) | positive | Size lane threshold on estimated parquet output; also scan budget and footer-stats threshold input |
 | `MILLRACE_FLUSH_DEADLINE_S` | 900 | positive | Age lane deadline |
@@ -1153,6 +1157,29 @@ object storage.
 |---|---|---|
 | Staging | `MILLRACE_STAGE_URL` → `{base}/{topic}/{partition}/` (SlateDB `manifest/`, `wal/`, `compacted/` …) | `AWS_*` |
 | Parquet | `{catalog.data_path}/data/{namespace}/{table}/{idempotency_key}/{build}/{index}.parquet` | `HOGLAKE_S3_*` or ambient |
+
+**Startup sequence.** `load_config` (every problem at once, exit 2) →
+`StageManager` → `destination.py:ensure_destination` → `HoglakeFlusher.resolve`
+→ consumer + flush runner + ops server. `ensure_destination` runs
+before the flusher resolves because the partition tuple is the staging
+key: catalog (`GET`; on 404 `create_catalog` with
+`MILLRACE_CATALOG_DATA_PATH`, else refuse, exit 2), namespace (same),
+table (`GET ?totals=false`; on 404 one atomic create from
+`MILLRACE_TABLE_COLUMNS` + `MILLRACE_PARTITION_BY` + `MILLRACE_SORT_BY`
+through the server's table-creations operation — prepare with the
+fields, publish with no files — else refuse, exit 2). With a partition
+spec configured millrace requires the catalog to advertise
+`atomic-partitioned-table-creation-v1`, with a sort order
+`atomic-sorted-table-creation-v1`, and exits 1 naming the missing
+capability otherwise (a columns-only table takes the plain create); it never uses pyhoglake's
+create + alter fallback, under which a sibling replica can read the
+table between the two requests and stage under an empty spec for a
+shape-cache TTL. Each create tolerates the replica race
+(already-exists → re-read; the atomic publish's `target_exists` receipt
+is the same error). An existing
+table is compared with the configured shape and every difference goes
+into one WARNING; it is never altered. The flusher then resolves and
+pins the incarnation exactly as before (section 5).
 
 **Staging format.** This keyspace shares no key or value shape with
 the #331-era team-keyed layout, so millrace needs a fresh staging root

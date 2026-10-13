@@ -7,6 +7,7 @@ from pyhoglake import UnsupportedTypeError, arrow_type_to_coltype, coltype_to_ar
 from pyhoglake.models import Column
 from pyhoglake.types import (
     PARQUET_FIELD_ID_KEY,
+    column_def_field_ids,
     columns_to_arrow_schema,
     schema_to_column_defs,
 )
@@ -246,3 +247,47 @@ def test_columns_to_arrow_schema_embeds_field_ids_and_orders_by_ordinal():
     assert not schema.field("a").nullable
     assert schema.field("a").metadata[PARQUET_FIELD_ID_KEY] == b"11"
     assert schema.field("b").metadata[PARQUET_FIELD_ID_KEY] == b"12"
+
+
+def test_column_def_field_ids_are_depth_first_pre_order_from_one():
+    """The server's id assignment for a create: pre-order, a container's
+    children numbered right after it, synthetic names for list/map
+    children — the contract initial partition/sort fields are resolved
+    against."""
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field("addr", pa.struct([("city", pa.string()), ("zip", pa.int32())])),
+            pa.field("tags", pa.list_(pa.string())),
+            pa.field("props", pa.map_(pa.string(), pa.int64())),
+            pa.field("ts", pa.timestamp("us")),
+        ]
+    )
+    assert column_def_field_ids(schema_to_column_defs(schema)) == {
+        "id": 1,
+        "addr": 2,
+        "addr.city": 3,
+        "addr.zip": 4,
+        "tags": 5,
+        "tags.element": 6,
+        "props": 7,
+        "props.key": 8,
+        "props.value": 9,
+        "ts": 10,
+    }
+
+
+def test_column_def_field_ids_number_a_struct_inside_a_list():
+    schema = pa.schema(
+        [
+            pa.field(
+                "items", pa.list_(pa.struct([("a", pa.int64()), ("b", pa.string())]))
+            )
+        ]
+    )
+    assert column_def_field_ids(schema_to_column_defs(schema)) == {
+        "items": 1,
+        "items.element": 2,
+        "items.element.a": 3,
+        "items.element.b": 4,
+    }

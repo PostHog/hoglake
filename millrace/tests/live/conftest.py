@@ -73,6 +73,7 @@ def stack() -> str:
         ) from e
     fs = livekit.s3_config().filesystem()
     fs.create_dir(livekit.BUCKET)  # idempotent; allow_bucket_creation=True
+    fs.create_dir(livekit.LAKE_BUCKET)  # the config-created catalogs' lake
     admin = livekit.kafka_admin()
     admin.list_topics(timeout=30)
     return livekit.HOGLAKE_URL

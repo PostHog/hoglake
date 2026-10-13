@@ -18,7 +18,7 @@ from typing import Any
 import pyarrow as pa
 
 from .errors import ValidationError
-from .models import PartitionField
+from .models import PartitionField, SortField
 from .types import NESTED_TYPES, arrow_type_to_coltype
 from .variant import SHREDDING_KEY, Shredding, _plain, validate_shredding
 
@@ -149,6 +149,68 @@ def set_partition_spec(
     """Set the partition spec. An empty list makes the table unpartitioned."""
     wire = [f.to_wire() if isinstance(f, PartitionField) else dict(f) for f in fields]
     return AlterOp("set_partition_spec", {"fields": wire})
+
+
+def sort_field(
+    source_field_id: int, direction: str = "asc", null_order: str = "nulls_last"
+) -> SortField:
+    return SortField(
+        source_field_id=source_field_id, direction=direction, null_order=null_order
+    )
+
+
+def set_sort_order(fields: list[SortField | dict[str, Any]]) -> AlterOp:
+    """Set the sort order. An empty list makes the table unsorted."""
+    wire = [f.to_wire() if isinstance(f, SortField) else dict(f) for f in fields]
+    return AlterOp("set_sort_order", {"sort_fields": wire})
+
+
+@dataclass(frozen=True)
+class NamedPartitionField:
+    """A partition field naming its source column by dotted path rather
+    than by field id — for :meth:`pyhoglake.Namespace.create_table`,
+    where no id exists yet and the client resolves the name to the id
+    the server will assign (:func:`pyhoglake.types.column_def_field_ids`).
+    """
+
+    column: str
+    transform: str = "identity"
+    transform_param: int | None = None
+
+    def resolve(self, field_ids: dict[str, int]) -> PartitionField:
+        return PartitionField(
+            source_field_id=_resolve_field(self.column, field_ids, "partition"),
+            transform=self.transform,
+            transform_param=self.transform_param,
+        )
+
+
+@dataclass(frozen=True)
+class NamedSortField:
+    """A sort field naming its source column by dotted path (see
+    :class:`NamedPartitionField`)."""
+
+    column: str
+    direction: str = "asc"
+    null_order: str = "nulls_last"
+
+    def resolve(self, field_ids: dict[str, int]) -> SortField:
+        return SortField(
+            source_field_id=_resolve_field(self.column, field_ids, "sort"),
+            direction=self.direction,
+            null_order=self.null_order,
+        )
+
+
+def _resolve_field(column: str, field_ids: dict[str, int], kind: str) -> int:
+    try:
+        return field_ids[column]
+    except KeyError:
+        raise ValidationError(
+            f"{kind} field names column {column!r}, which is not in the "
+            f"table's columns (known: {sorted(field_ids)})",
+            status_code=None,
+        ) from None
 
 
 # Server-side bounds (server/.../service/TableMetadata.kt). Mirrored here

@@ -2,6 +2,7 @@
 URL, method, body shape, error mapping, pagination."""
 
 import json
+import re
 from datetime import UTC, datetime, timedelta, timezone
 
 import httpx
@@ -305,6 +306,436 @@ def test_create_table_body_shape_for_nested_columns(client, httpx_mock):
             },
         ],
     }
+
+
+CATALOG_WIRE_ATOMIC = dict(
+    CATALOG_WIRE,
+    capabilities=[
+        "atomic-table-creation-v1",
+        "atomic-partitioned-table-creation-v1",
+        "atomic-sorted-table-creation-v1",
+    ],
+)
+
+PART_TABLE_WIRE = dict(
+    TABLE_WIRE,
+    columns=[
+        {
+            "name": "team_id",
+            "type": "long",
+            "field_id": 1,
+            "ordinal": 0,
+            "nullable": True,
+        },
+        {
+            "name": "ts",
+            "type": "timestamptz",
+            "field_id": 2,
+            "ordinal": 1,
+            "nullable": True,
+        },
+        {
+            "name": "event",
+            "type": "string",
+            "field_id": 3,
+            "ordinal": 2,
+            "nullable": True,
+        },
+    ],
+    partition_spec={
+        "spec_id": 1,
+        "fields": [
+            {"source_field_id": 1, "transform": "identity"},
+            {"source_field_id": 2, "transform": "day"},
+        ],
+    },
+    sort_spec={
+        "sort_id": 1,
+        "fields": [
+            {"source_field_id": 2, "direction": "asc", "null_order": "nulls_last"}
+        ],
+    },
+)
+
+
+def _part_schema() -> pa.Schema:
+    return pa.schema(
+        [
+            pa.field("team_id", pa.int64()),
+            pa.field("ts", pa.timestamp("us", tz="UTC")),
+            pa.field("event", pa.string()),
+        ]
+    )
+
+
+def _receipt(state: str, reason: str | None = None) -> dict:
+    out = {
+        "operation_id": "11111111-2222-3333-4444-555555555555",
+        "table_uuid": TABLE_WIRE["table_uuid"],
+        "namespace": "ns1",
+        "name": "events",
+        "columns": PART_TABLE_WIRE["columns"],
+        "write_path": "s3://bkt/lake/data/ns1/events/",
+        "state": state,
+        "expires_at": "2026-10-14T00:00:00Z",
+    }
+    if reason is not None:
+        out["reason"] = reason
+    return out
+
+
+def _atomic_catalog(client, httpx_mock):
+    httpx_mock.add_response(
+        method="GET", url=f"{BASE}/v1/catalogs/cat", json=CATALOG_WIRE_ATOMIC
+    )
+    return client.catalog("cat")
+
+
+def test_catalog_info_carries_the_advertised_capabilities(client, httpx_mock):
+    cat = _atomic_catalog(client, httpx_mock)
+    assert "atomic-partitioned-table-creation-v1" in cat.info.capabilities
+    # A server too old to advertise any: empty, never a parse failure.
+    assert _catalog(client, httpx_mock).info.capabilities == ()
+
+
+def test_create_table_with_partition_and_sort_fields_is_one_atomic_operation(
+    client, httpx_mock
+):
+    """Partition + sort fields at create go through the server's
+    table-creations operation (`/sorted` takes both lists): the body
+    names columns by the depth-first field ids the server will assign,
+    the publish carries no files, and the Table comes from a read-back
+    carrying the installed specs. No POST /tables, no /alter."""
+    cat = _atomic_catalog(client, httpx_mock)
+    from pyhoglake.client import Namespace
+
+    creations = re.compile(
+        re.escape(f"{BASE}/v1/catalogs/cat/table-creations/") + "[0-9a-f-]{36}/sorted"
+    )
+    commit = re.compile(
+        re.escape(f"{BASE}/v1/catalogs/cat/table-creations/") + "[0-9a-f-]{36}/commit"
+    )
+    httpx_mock.add_response(method="PUT", url=creations, json=_receipt("prepared"))
+    httpx_mock.add_response(method="POST", url=commit, json=_receipt("committed"))
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events",
+        json=PART_TABLE_WIRE,
+    )
+    t = Namespace(cat, "ns1").create_table(
+        "events",
+        _part_schema(),
+        partition_fields=[
+            ops.NamedPartitionField("team_id"),
+            ops.NamedPartitionField("ts", "day"),
+        ],
+        sort_fields=[ops.NamedSortField("ts")],
+    )
+    put, post, get = httpx_mock.get_requests()[1:]
+    assert put.method == "PUT" and post.method == "POST" and get.method == "GET"
+    # Prepare and publish address the SAME operation.
+    assert put.url.path.rsplit("/", 1)[0] == post.url.path.rsplit("/", 1)[0]
+    assert json.loads(put.content) == {
+        "namespace": "ns1",
+        "name": "events",
+        "columns": [
+            {"name": "team_id", "type": "long", "nullable": True},
+            {"name": "ts", "type": "timestamptz", "nullable": True},
+            {"name": "event", "type": "string", "nullable": True},
+        ],
+        "partition_fields": [
+            {"source_field_id": 1, "transform": "identity"},
+            {"source_field_id": 2, "transform": "day"},
+        ],
+        "sort_fields": [
+            {"source_field_id": 2, "direction": "asc", "null_order": "nulls_last"}
+        ],
+    }
+    assert json.loads(post.content) == {"files": []}
+    # The handle is the read-back: the server's ids, no further request.
+    assert t.table_uuid == TABLE_WIRE["table_uuid"]
+    assert [c.field_id for c in t.columns] == [1, 2, 3]
+    assert len(httpx_mock.get_requests()) == 4
+
+
+def test_create_table_with_partition_fields_only_uses_the_partitioned_endpoint(
+    client, httpx_mock
+):
+    cat = _atomic_catalog(client, httpx_mock)
+    from pyhoglake.client import Namespace
+
+    httpx_mock.add_response(
+        method="PUT",
+        url=re.compile(r".*/table-creations/[0-9a-f-]{36}/partitioned$"),
+        json=_receipt("prepared"),
+    )
+    httpx_mock.add_response(
+        method="POST",
+        url=re.compile(r".*/table-creations/[0-9a-f-]{36}/commit$"),
+        json=_receipt("committed"),
+    )
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events",
+        json=PART_TABLE_WIRE,
+    )
+    Namespace(cat, "ns1").create_table(
+        "events",
+        _part_schema(),
+        partition_fields=[ops.partition_field(1, "bucket", 16)],
+    )
+    put = httpx_mock.get_requests()[1]
+    assert json.loads(put.content) == {
+        "namespace": "ns1",
+        "name": "events",
+        "columns": [
+            {"name": "team_id", "type": "long", "nullable": True},
+            {"name": "ts", "type": "timestamptz", "nullable": True},
+            {"name": "event", "type": "string", "nullable": True},
+        ],
+        "partition_fields": [
+            {"source_field_id": 1, "transform": "bucket", "transform_param": 16}
+        ],
+    }
+
+
+def test_create_table_atomic_target_exists_is_already_exists(client, httpx_mock):
+    """The create race: a publish refused `target_exists` (HTTP 200, the
+    receipt says so) surfaces as AlreadyExistsError — the same class a
+    plain create's 409 raises, so a caller's race branch is one branch."""
+    cat = _atomic_catalog(client, httpx_mock)
+    from pyhoglake.client import Namespace
+
+    httpx_mock.add_response(
+        method="PUT", url=re.compile(r".*/partitioned$"), json=_receipt("prepared")
+    )
+    httpx_mock.add_response(
+        method="POST",
+        url=re.compile(r".*/commit$"),
+        json=_receipt("rejected", "target_exists"),
+    )
+    with pytest.raises(AlreadyExistsError, match="target_exists"):
+        Namespace(cat, "ns1").create_table(
+            "events",
+            _part_schema(),
+            partition_fields=[ops.NamedPartitionField("team_id")],
+        )
+
+
+def test_create_table_atomic_other_rejection_is_a_conflict(client, httpx_mock):
+    cat = _atomic_catalog(client, httpx_mock)
+    from pyhoglake.client import Namespace
+
+    httpx_mock.add_response(
+        method="PUT", url=re.compile(r".*/partitioned$"), json=_receipt("prepared")
+    )
+    httpx_mock.add_response(
+        method="POST",
+        url=re.compile(r".*/commit$"),
+        json=_receipt("rejected", "namespace_changed"),
+    )
+    with pytest.raises(CommitConflictError, match="namespace_changed"):
+        Namespace(cat, "ns1").create_table(
+            "events",
+            _part_schema(),
+            partition_fields=[ops.NamedPartitionField("team_id")],
+        )
+
+
+def test_create_table_atomic_definition_invalid_is_a_validation_error(
+    client, httpx_mock
+):
+    """A definition the server no longer accepts is the request's fault,
+    not the timing's: ValidationError, never a retryable conflict."""
+    cat = _atomic_catalog(client, httpx_mock)
+    from pyhoglake.client import Namespace
+
+    httpx_mock.add_response(
+        method="PUT", url=re.compile(r".*/partitioned$"), json=_receipt("prepared")
+    )
+    httpx_mock.add_response(
+        method="POST",
+        url=re.compile(r".*/commit$"),
+        json=_receipt("rejected", "definition_invalid"),
+    )
+    with pytest.raises(ValidationError, match="definition_invalid") as ei:
+        Namespace(cat, "ns1").create_table(
+            "events",
+            _part_schema(),
+            partition_fields=[ops.NamedPartitionField("team_id")],
+        )
+    assert not ei.value.retryable and not isinstance(ei.value, CommitConflictError)
+
+
+@pytest.mark.parametrize("reason", ["namespace_changed", "target_changed"])
+def test_create_table_atomic_timing_rejections_are_conflicts(
+    client, httpx_mock, reason
+):
+    cat = _atomic_catalog(client, httpx_mock)
+    from pyhoglake.client import Namespace
+
+    httpx_mock.add_response(
+        method="PUT", url=re.compile(r".*/partitioned$"), json=_receipt("prepared")
+    )
+    httpx_mock.add_response(
+        method="POST", url=re.compile(r".*/commit$"), json=_receipt("rejected", reason)
+    )
+    with pytest.raises(CommitConflictError, match=reason):
+        Namespace(cat, "ns1").create_table(
+            "events",
+            _part_schema(),
+            partition_fields=[ops.NamedPartitionField("team_id")],
+        )
+
+
+def test_create_table_atomic_aborted_receipt_is_a_conflict(client, httpx_mock):
+    cat = _atomic_catalog(client, httpx_mock)
+    from pyhoglake.client import Namespace
+
+    httpx_mock.add_response(
+        method="PUT", url=re.compile(r".*/partitioned$"), json=_receipt("prepared")
+    )
+    httpx_mock.add_response(
+        method="POST",
+        url=re.compile(r".*/commit$"),
+        json=_receipt("aborted", "client_abort"),
+    )
+    with pytest.raises(CommitConflictError, match="aborted"):
+        Namespace(cat, "ns1").create_table(
+            "events",
+            _part_schema(),
+            partition_fields=[ops.NamedPartitionField("team_id")],
+        )
+
+
+def test_create_table_resolves_a_struct_leaf_partition_source_by_path(
+    client, httpx_mock
+):
+    """``addr.city`` names the struct's leaf; its id is the depth-first
+    one the server assigns (addr=2, addr.city=3)."""
+    cat = _atomic_catalog(client, httpx_mock)
+    from pyhoglake.client import Namespace
+
+    httpx_mock.add_response(
+        method="PUT", url=re.compile(r".*/partitioned$"), json=_receipt("prepared")
+    )
+    httpx_mock.add_response(
+        method="POST", url=re.compile(r".*/commit$"), json=_receipt("committed")
+    )
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events",
+        json=PART_TABLE_WIRE,
+    )
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field("addr", pa.struct([("city", pa.string()), ("zip", pa.int32())])),
+        ]
+    )
+    Namespace(cat, "ns1").create_table(
+        "events", schema, partition_fields=[ops.NamedPartitionField("addr.city")]
+    )
+    put = httpx_mock.get_requests()[1]
+    assert json.loads(put.content) == {
+        "namespace": "ns1",
+        "name": "events",
+        "columns": [
+            {"name": "id", "type": "long", "nullable": True},
+            {
+                "name": "addr",
+                "type": "struct",
+                "nullable": True,
+                "children": [
+                    {"name": "city", "type": "string", "nullable": True},
+                    {"name": "zip", "type": "int", "nullable": True},
+                ],
+            },
+        ],
+        "partition_fields": [{"source_field_id": 3, "transform": "identity"}],
+    }
+
+
+def test_create_table_falls_back_to_create_plus_alter_without_the_capability(
+    client, httpx_mock
+):
+    """A catalog that does not advertise atomic partitioned creation:
+    plain POST /tables, then ONE alter carrying both specs."""
+    cat = _catalog(client, httpx_mock)
+    from pyhoglake.client import Namespace
+
+    httpx_mock.add_response(
+        method="POST",
+        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables",
+        json=dict(PART_TABLE_WIRE, snapshot_id=7),
+        status_code=201,
+    )
+    httpx_mock.add_response(
+        method="POST",
+        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events/alter",
+        json=dict(PART_TABLE_WIRE, snapshot_id=8),
+    )
+    t = Namespace(cat, "ns1").create_table(
+        "events",
+        _part_schema(),
+        partition_fields=[ops.NamedPartitionField("ts", "day")],
+        sort_fields=[ops.NamedSortField("ts", "desc", "nulls_first")],
+    )
+    create, alter = httpx_mock.get_requests()[1:]
+    assert json.loads(create.content)["name"] == "events"
+    assert "partition_fields" not in json.loads(create.content)
+    assert json.loads(alter.content) == {
+        "ops": [
+            {
+                "op": "set_partition_spec",
+                "fields": [{"source_field_id": 2, "transform": "day"}],
+            },
+            {
+                "op": "set_sort_order",
+                "sort_fields": [
+                    {
+                        "source_field_id": 2,
+                        "direction": "desc",
+                        "null_order": "nulls_first",
+                    }
+                ],
+            },
+        ]
+    }
+    assert t.snapshot_id == 8
+
+
+def test_create_table_without_fields_is_the_plain_create(client, httpx_mock):
+    """Backward compatibility: no fields (or empty lists) → the one POST,
+    whatever the catalog advertises."""
+    cat = _atomic_catalog(client, httpx_mock)
+    from pyhoglake.client import Namespace
+
+    httpx_mock.add_response(
+        method="POST",
+        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables",
+        json=TABLE_WIRE,
+        status_code=201,
+    )
+    Namespace(cat, "ns1").create_table(
+        "events", _part_schema(), partition_fields=[], sort_fields=[]
+    )
+    assert len(httpx_mock.get_requests()) == 2
+
+
+def test_create_table_named_field_unknown_column_fails_before_any_request(
+    client, httpx_mock
+):
+    cat = _atomic_catalog(client, httpx_mock)
+    from pyhoglake.client import Namespace
+
+    with pytest.raises(ValidationError, match="nope"):
+        Namespace(cat, "ns1").create_table(
+            "events",
+            _part_schema(),
+            partition_fields=[ops.NamedPartitionField("nope")],
+        )
+    assert len(httpx_mock.get_requests()) == 1  # the catalog read only
 
 
 def test_reserved_prefix_message_matches_the_server_phrase():
