@@ -4,8 +4,6 @@ in one refusal, not one per restart."""
 
 from __future__ import annotations
 
-from typing import Any
-
 import pytest
 
 from millrace.config import (
@@ -14,8 +12,6 @@ from millrace.config import (
     Config,
     ConfigError,
     EventTimePolicy,
-    PoisonConfig,
-    TeamKeyCodec,
     load_config,
 )
 
@@ -47,7 +43,6 @@ def test_minimal_env_yields_the_documented_defaults():
     assert cfg.kafka_group_id == "millrace-events"
     assert cfg.assignment_mode is AssignmentMode.STATIC
     assert cfg.static_partitions == (0, 1, 2)
-    assert cfg.team_key_codec is TeamKeyCodec.UTF8_DECIMAL
     assert cfg.catalog == "prod"
     assert cfg.namespace == "default"
     assert cfg.table == "events"
@@ -58,19 +53,14 @@ def test_minimal_env_yields_the_documented_defaults():
     assert cfg.slow_lane_deadline_s == 21600
     assert cfg.min_flush_bytes == 1024 * 1024
     assert cfg.max_files_per_commit == 512
-    assert cfg.poison == PoisonConfig(
-        max_records_per_run=1000, value_max_bytes=1024 * 1024
-    )
     assert cfg.consume_batch_size == 65536
     assert cfg.consume_batch_max_bytes == 256 * 1024 * 1024
     assert cfg.poll_timeout_ms == 500
-    assert cfg.event_time_policy is EventTimePolicy.QUARANTINE
+    assert cfg.event_time_policy is EventTimePolicy.DROP
     assert cfg.metrics_port == 8000
-    assert cfg.receipt_horizon_s == 6 * 86400  # below the server's 7 d default
     # The fleet policy default: latest (millpond's whole-retention
     # replay incident), earliest still selectable.
     assert cfg.kafka_auto_offset_reset is AutoOffsetReset.LATEST
-    assert cfg.team_id_field is None
     # The whale-shape fetch tuning (millpond's hot-partition ceiling).
     assert cfg.kafka_max_partition_fetch_bytes == 32 * 1024 * 1024
     assert cfg.kafka_fetch_max_bytes == 256 * 1024 * 1024
@@ -251,49 +241,6 @@ def test_assignment_mode_garbage_is_refused():
     assert "MILLRACE_KAFKA_ASSIGNMENT" in p and "static" in p and "cooperative" in p
 
 
-# -- team key codec -----------------------------------------------------------------
-
-
-def test_team_key_codec_choices():
-    assert load(MINIMAL_ENV).team_key_codec is TeamKeyCodec.UTF8_DECIMAL
-    assert (
-        load(MINIMAL_ENV | {"MILLRACE_TEAM_KEY_CODEC": "be64"}).team_key_codec
-        is TeamKeyCodec.BE64
-    )
-    (p,) = problems(MINIMAL_ENV | {"MILLRACE_TEAM_KEY_CODEC": "ascii"})
-    assert "MILLRACE_TEAM_KEY_CODEC" in p and "utf8-decimal" in p and "be64" in p
-
-
-def test_value_json_codec_parses_its_field():
-    cfg = load(MINIMAL_ENV | {"MILLRACE_TEAM_KEY_CODEC": "value-json:team_id"})
-    assert cfg.team_key_codec is TeamKeyCodec.VALUE_JSON
-    assert cfg.team_id_field == "team_id"
-
-
-@pytest.mark.parametrize(
-    "raw",
-    [
-        "value-json",  # no field at all
-        "value-json:",  # empty field
-        "value-json: team id",  # whitespace is a typo, not a key
-        "value-json:a.b",  # dots imply the nesting we do not support
-        "value-json:1field",  # must start alpha/underscore
-    ],
-)
-def test_value_json_codec_refuses_a_bad_field(raw):
-    (p,) = problems(MINIMAL_ENV | {"MILLRACE_TEAM_KEY_CODEC": raw})
-    assert "MILLRACE_TEAM_KEY_CODEC" in p
-    assert "value-json" in p
-
-
-def test_config_constructor_guards_the_codec_field_pair():
-    kwargs: dict[str, Any] = dict(load(MINIMAL_ENV).__dict__)
-    with pytest.raises(ValueError, match="value-json"):
-        Config(**(kwargs | {"team_key_codec": TeamKeyCodec.VALUE_JSON}))
-    with pytest.raises(ValueError, match="team_id_field"):
-        Config(**(kwargs | {"team_id_field": "team_id"}))
-
-
 # -- auto.offset.reset (B6: the fleet policy is latest) ------------------------------
 
 
@@ -388,16 +335,11 @@ def test_stage_url_unknown_scheme():
         "MILLRACE_SLOW_LANE_DEADLINE_S",
         "MILLRACE_MIN_FLUSH_BYTES",
         "MILLRACE_MAX_FILES_PER_COMMIT",
-        "MILLRACE_POISON_MAX_RECORDS",
-        "MILLRACE_POISON_VALUE_MAX_BYTES",
-        "MILLRACE_POISON_RETENTION_S",
-        "MILLRACE_POISON_SWEEP_S",
         "MILLRACE_SLATEDB_MAX_UNFLUSHED_BYTES",
         "MILLRACE_SLATEDB_L0_MAX_SSTS",
         "MILLRACE_CONSUME_BATCH_SIZE",
         "MILLRACE_CONSUME_BATCH_MAX_BYTES",
         "MILLRACE_POLL_TIMEOUT_MS",
-        "MILLRACE_RECEIPT_HORIZON_S",
         "MILLRACE_KAFKA_MAX_PARTITION_FETCH_BYTES",
         "MILLRACE_KAFKA_FETCH_MAX_BYTES",
         "MILLRACE_KAFKA_QUEUED_MAX_MESSAGES_KBYTES",
@@ -418,12 +360,9 @@ def test_positive_int_knobs_accept_valid_values():
             "MILLRACE_SLOW_LANE_DEADLINE_S": "43200",
             "MILLRACE_MIN_FLUSH_BYTES": "32",
             "MILLRACE_MAX_FILES_PER_COMMIT": "3",
-            "MILLRACE_POISON_MAX_RECORDS": "7",
-            "MILLRACE_POISON_VALUE_MAX_BYTES": "64",
             "MILLRACE_CONSUME_BATCH_SIZE": "11",
             "MILLRACE_CONSUME_BATCH_MAX_BYTES": "4096",
             "MILLRACE_POLL_TIMEOUT_MS": "42",
-            "MILLRACE_RECEIPT_HORIZON_S": "3600",
         }
     )
     assert cfg.target_output_bytes == 1024
@@ -431,26 +370,9 @@ def test_positive_int_knobs_accept_valid_values():
     assert cfg.slow_lane_deadline_s == 43200
     assert cfg.min_flush_bytes == 32
     assert cfg.max_files_per_commit == 3
-    assert cfg.poison.max_records_per_run == 7
-    assert cfg.poison.value_max_bytes == 64
     assert cfg.consume_batch_size == 11
     assert cfg.consume_batch_max_bytes == 4096
     assert cfg.poll_timeout_ms == 42
-    assert cfg.receipt_horizon_s == 3600
-
-
-# -- config-object guards --------------------------------------------------------------
-
-
-def test_poison_config_guards_direct_construction():
-    with pytest.raises(ValueError, match="MILLRACE_POISON_MAX_RECORDS"):
-        PoisonConfig(max_records_per_run=0, value_max_bytes=1)
-    with pytest.raises(ValueError, match="MILLRACE_POISON_VALUE_MAX_BYTES"):
-        PoisonConfig(max_records_per_run=1, value_max_bytes=0)
-    with pytest.raises(ValueError, match="MILLRACE_POISON_RETENTION_S"):
-        PoisonConfig(max_records_per_run=1, value_max_bytes=1, retention_s=0)
-    with pytest.raises(ValueError, match="MILLRACE_POISON_SWEEP_S"):
-        PoisonConfig(max_records_per_run=1, value_max_bytes=1, sweep_s=-5)
 
 
 # -- SlateDB writer tuning (T9) ------------------------------------------------------
@@ -500,50 +422,17 @@ def test_slatedb_knobs_parse_and_validate():
     assert "MILLRACE_SLATEDB_MAX_UNFLUSHED_BYTES" in p and "l0_sst_size_bytes" in p
 
 
-def test_poison_retention_knobs_parse():
-    cfg = load(MINIMAL_ENV)
-    assert cfg.poison.retention_s == 7 * 86400
-    assert cfg.poison.sweep_s == 3600
-    cfg = load(
-        MINIMAL_ENV
-        | {"MILLRACE_POISON_RETENTION_S": "86400", "MILLRACE_POISON_SWEEP_S": "60"}
-    )
-    assert cfg.poison.retention_s == 86400
-    assert cfg.poison.sweep_s == 60
-    (p,) = problems(MINIMAL_ENV | {"MILLRACE_POISON_RETENTION_S": "0"})
-    assert "MILLRACE_POISON_RETENTION_S" in p
-
-
-def test_team_key_codec_env_is_the_parsers_inverse():
-    """The env dump of the codec must reproduce the config — a bare
-    ``value-json`` (no ``:<field>``) is refused at boot, which is exactly
-    the bug this property exists to prevent (the live harness dumps a
-    Config to a child's env)."""
-    assert load(MINIMAL_ENV).team_key_codec_env == "utf8-decimal"
-    assert (
-        load(MINIMAL_ENV | {"MILLRACE_TEAM_KEY_CODEC": "be64"}).team_key_codec_env
-        == "be64"
-    )
-    value_json = load(MINIMAL_ENV | {"MILLRACE_TEAM_KEY_CODEC": "value-json:team_id"})
-    assert value_json.team_key_codec_env == "value-json:team_id"
-    # Round-trip: the rendered spec parses back to the same config.
-    assert (
-        load(MINIMAL_ENV | {"MILLRACE_TEAM_KEY_CODEC": value_json.team_key_codec_env})
-        == value_json
-    )
-
-
 # -- remaining knobs ----------------------------------------------------------------------
 
 
 def test_event_time_policy():
-    assert load(MINIMAL_ENV).event_time_policy is EventTimePolicy.QUARANTINE
+    assert load(MINIMAL_ENV).event_time_policy is EventTimePolicy.DROP
     assert (
         load(MINIMAL_ENV | {"MILLRACE_EVENT_TIME_POLICY": "clamp"}).event_time_policy
         is EventTimePolicy.CLAMP
     )
-    (p,) = problems(MINIMAL_ENV | {"MILLRACE_EVENT_TIME_POLICY": "drop"})
-    assert "MILLRACE_EVENT_TIME_POLICY" in p and "clamp" in p and "quarantine" in p
+    (p,) = problems(MINIMAL_ENV | {"MILLRACE_EVENT_TIME_POLICY": "quarantine"})
+    assert "MILLRACE_EVENT_TIME_POLICY" in p and "clamp" in p and "drop" in p
 
 
 @pytest.mark.parametrize("raw", ["abc", "-1", "65536"])

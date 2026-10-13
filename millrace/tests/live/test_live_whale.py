@@ -48,7 +48,9 @@ TARGET_OUTPUT_BYTES = 200 * 1024
 FLUSH_DEADLINE_S = 12
 TAIL_MARGIN_S = 25.0
 
-_COMMIT = re.compile(r"team=(\d+) trigger=(\w+)")
+# The commit message names the flushed partition tuple in its human form
+# (``group=team_id=<n>/timestamp_month=<m>``).
+_COMMIT = re.compile(r"group=team_id=(\d+)/\S* trigger=(\w+)")
 
 
 def _commit_triggers(catalog) -> list[tuple[int, str]]:

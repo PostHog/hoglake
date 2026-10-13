@@ -28,6 +28,7 @@ durable ``("ack", …)`` it covers).
 
 from __future__ import annotations
 
+import json
 from collections import deque
 from collections.abc import Iterable
 from typing import Any
@@ -116,24 +117,32 @@ def msg(
     )
 
 
-def keyed_msg(
+def team_msg(
     partition: int,
     offset: int,
     *,
     team: int,
-    value: bytes | None = None,
+    tag: str | None = None,
     ts_ms: int | None = TS_MS,
     topic: str = "events",
 ) -> FakeMessage:
-    """A well-formed utf8-decimal-keyed message."""
+    """A well-formed message for ``team``: the JSON object payload
+    ``{"team_id": <team>, "v": <tag>}`` (``tag`` defaults to
+    ``v-<offset>``). The key is the team's decimal id, as a team-keyed
+    producer would send it — millrace never reads it."""
     return msg(
         partition,
         offset,
         key=str(team).encode(),
-        value=value if value is not None else f"v-{offset}".encode(),
+        value=team_payload(team, tag if tag is not None else f"v-{offset}"),
         ts_ms=ts_ms,
         topic=topic,
     )
+
+
+def team_payload(team: int, tag: str) -> bytes:
+    """The payload :func:`team_msg` sends."""
+    return json.dumps({"team_id": team, "v": tag}, separators=(",", ":")).encode()
 
 
 def error_event(

@@ -8,14 +8,15 @@ is what makes memory-backed recovery meaningful at all.
 
 What is pinned here:
 
-- stage → scan round-trips in (team, timestamp, offset) key order;
-- ``stats/`` accounting matches row scans EXACTLY (bytes, counts) and
-  ``offsets/`` matches scanned offset bounds;
+- stage → scan round-trips in (group, offset) key order, and a capped
+  scan is an exact offset prefix of the group;
+- ``stats/`` accounting matches row scans EXACTLY (bytes, counts);
 - set-once ``first_staged_ts`` (the property the tail SLA stands on);
 - ``sched_age/`` entries created on first stage, removed on drain;
 - ``commit_flushed`` deletes EXACTLY the flush's offset window —
-  hypothesis sweeps interleaved (ts, offset) orders so a younger range
-  of the same team, sorting inside the same byte slice, survives;
+  hypothesis sweeps arbitrary offsets and windows, so older and younger
+  rows of the same partition tuple and a neighbouring tuple survive;
+- the consumer's fence probe writes one ``meta/`` key, never a row;
 - a settle writes NO ``flushed/`` marker (the settle transaction is
   atomic and the receipt precedes it — a marker could only restate
   both);
@@ -35,23 +36,28 @@ from hypothesis import given
 from hypothesis import strategies as st
 from slatedb.uniffi import CloseReason
 from slatedb.uniffi import Error as SlateError
-from stagekit import NOW, TABLE, fast_flush_settings, legacy_marker_kv, rec, window
+from stagekit import (
+    FIELDS,
+    NOW,
+    TABLE,
+    fast_flush_settings,
+    g,
+    legacy_marker_kv,
+    prepared,
+    rec,
+    window,
+)
 
 from millrace import keyspace
 from millrace.keyspace import (
-    OffsetRange,
     PreparedKey,
     PreparedRequest,
     RowKey,
     StatsValue,
 )
 from millrace.stage import (
-    _POISON_WRITE_CHUNK as _POISON_PURGE_CHUNK,
-)
-from millrace.stage import (
     AckHook,
     PartitionStage,
-    PoisonedRecord,
     RecoveredPrepared,
     RecoveryReport,
     StageAck,
@@ -66,20 +72,23 @@ from millrace.stage import (
 pytestmark = pytest.mark.component
 
 
-async def team_rows(stage: PartitionStage, team_id: int) -> list[tuple[RowKey, bytes]]:
-    return [kv async for kv in stage.scan_team_rows(team_id)]
+async def group_rows(stage: PartitionStage, team: int) -> list[tuple[RowKey, bytes]]:
+    """The staged rows of tuple ``g(team)``."""
+    return [kv async for kv in stage.scan_group_rows(g(team))]
 
 
 # -- staging and scanning -------------------------------------------------------
 
 
 async def test_stage_batch_round_trip_in_key_order(stage_factory):
+    """Rows scan in (group, offset) order — record timestamps play no
+    part, however they invert against the offsets."""
     stage = await stage_factory()
     records = [
-        rec(7, ts=300, offset=2),
-        rec(3, ts=100, offset=0),
-        rec(7, ts=100, offset=0),
-        rec(3, ts=200, offset=1),
+        rec(7, ts=100, offset=2),
+        rec(3, ts=200, offset=0),
+        rec(7, ts=300, offset=0),
+        rec(3, ts=100, offset=1),
         rec(7, ts=200, offset=1),
     ]
     ack = await stage.stage_batch(records, now_us=NOW)
@@ -91,19 +100,15 @@ async def test_stage_batch_round_trip_in_key_order(stage_factory):
         first_offset=0,
         last_offset=2,
     )
-    rows7 = await team_rows(stage, 7)
-    assert [(rk.timestamp_us, rk.offset) for rk, _ in rows7] == [
-        (100, 0),
-        (200, 1),
-        (300, 2),
-    ]
+    rows7 = await group_rows(stage, 7)
+    assert [rk for rk, _ in rows7] == [RowKey(g(7), o) for o in (0, 1, 2)]
     assert [v for _, v in rows7] == [
-        rec(7, 100, 0).payload,
+        rec(7, 300, 0).payload,
         rec(7, 200, 1).payload,
-        rec(7, 300, 2).payload,
+        rec(7, 100, 2).payload,
     ]
-    rows3 = await team_rows(stage, 3)
-    assert [(rk.timestamp_us, rk.offset) for rk, _ in rows3] == [(100, 0), (200, 1)]
+    rows3 = await group_rows(stage, 3)
+    assert [rk.offset for rk, _ in rows3] == [0, 1]
     await stage.close()
 
 
@@ -118,24 +123,17 @@ async def test_stats_match_row_scans_exactly(stage_factory):
     ]
     for records, now in batches:
         await stage.stage_batch(records, now_us=now)
-    stats = {s.team_id: s for s in await stage.iter_key_stats()}
-    assert set(stats) == {1, 2}
-    for team_id, s in stats.items():
-        rows = await team_rows(stage, team_id)
+    stats = {s.group: s for s in await stage.iter_key_stats()}
+    assert set(stats) == {g(1), g(2)}
+    for group, s in stats.items():
+        rows = [kv async for kv in stage.scan_group_rows(group)]
         assert s.row_count == len(rows)
         assert s.staged_bytes == sum(len(v) for _, v in rows)
-    # one offsets range per staged batch; adjacent batches stay distinct
-    # (arrival structure is identity material, never coalesced)
-    assert await stage.read_offsets(1) == (
-        OffsetRange("events", 0, 0, 2),
-        OffsetRange("events", 0, 3, 4),
+    assert stats[g(1)].first_staged_ts == NOW and stats[g(1)].last_staged_ts == NOW + 20
+    assert (
+        stats[g(2)].first_staged_ts == NOW + 10
+        and stats[g(2)].last_staged_ts == NOW + 30
     )
-    assert await stage.read_offsets(2) == (
-        OffsetRange("events", 0, 10, 11),
-        OffsetRange("events", 0, 12, 12),
-    )
-    assert stats[1].first_staged_ts == NOW and stats[1].last_staged_ts == NOW + 20
-    assert stats[2].first_staged_ts == NOW + 10 and stats[2].last_staged_ts == NOW + 30
     await stage.close()
 
 
@@ -151,7 +149,7 @@ async def test_first_staged_ts_is_set_once(stage_factory):
     assert s.row_count == 3
     # the sched_age entry is still keyed by the ORIGINAL first_staged_ts
     assert await stage.iter_sched_age_through(NOW + 5_000_000) == [
-        keyspace.SchedAgeKey(first_staged_ts=NOW, team_id=9)
+        keyspace.SchedAgeKey(first_staged_ts=NOW, group=g(9))
     ]
     await stage.close()
 
@@ -166,7 +164,7 @@ async def test_first_staged_ts_survives_a_partial_flush(stage_factory):
     key = window(9, 0, 4)
     report = await stage.commit_flushed(key)
     assert report.rows_deleted == 5
-    assert not report.team_drained
+    assert not report.group_drained
     (s,) = await stage.iter_key_stats()
     assert s.first_staged_ts == NOW
     assert s.last_staged_ts == NOW + 60
@@ -181,21 +179,21 @@ async def test_sched_age_entry_lifecycle(stage_factory):
     await stage.stage_batch([rec(2, 100, 1)], now_us=NOW + 50)
     # the age-ordered prefix scan: the cutoff excludes the younger entry
     assert await stage.iter_sched_age_through(NOW) == [
-        keyspace.SchedAgeKey(first_staged_ts=NOW, team_id=1)
+        keyspace.SchedAgeKey(first_staged_ts=NOW, group=g(1))
     ]
     assert await stage.iter_sched_age_through(NOW + 50) == [
-        keyspace.SchedAgeKey(first_staged_ts=NOW, team_id=1),
-        keyspace.SchedAgeKey(first_staged_ts=NOW + 50, team_id=2),
+        keyspace.SchedAgeKey(first_staged_ts=NOW, group=g(1)),
+        keyspace.SchedAgeKey(first_staged_ts=NOW + 50, group=g(2)),
     ]
-    # a second stage for team 1 does not add another entry
+    # a second stage for tuple 1 does not add another entry
     await stage.stage_batch([rec(1, 200, 2)], now_us=NOW + 60)
     assert len(await stage.iter_sched_age_through(NOW + 10**9)) == 2
-    # draining team 1 removes its entry; team 2's survives
+    # draining tuple 1 removes its entry; tuple 2's survives
     key = window(1, 0, 2)
     report = await stage.commit_flushed(key)
-    assert report.team_drained
+    assert report.group_drained
     assert await stage.iter_sched_age_through(NOW + 10**9) == [
-        keyspace.SchedAgeKey(first_staged_ts=NOW + 50, team_id=2)
+        keyspace.SchedAgeKey(first_staged_ts=NOW + 50, group=g(2))
     ]
     await stage.close()
 
@@ -205,9 +203,8 @@ async def test_sched_age_entry_lifecycle(stage_factory):
 
 @given(data=st.data())
 def test_commit_flushed_deletes_exactly_the_window(data: st.DataObject) -> None:
-    """Property: rows with offset in [first, last] of the SAME team die;
-    every other row — older or younger, however the event timestamps
-    interleave the byte order — survives. Neighbouring teams are
+    """Property: rows with offset in [first, last] of the SAME tuple die;
+    every other row — older or younger — survives. Neighbouring tuples are
     untouched, and the surviving stats match a row scan exactly."""
     asyncio.run(_exactly_the_window(data))
 
@@ -224,11 +221,6 @@ async def _exactly_the_window(data: st.DataObject) -> None:
             unique=True,
         )
     )
-    timestamps = data.draw(
-        st.lists(
-            st.integers(min_value=-(2**62), max_value=2**62), min_size=n, max_size=n
-        )
-    )
     first = data.draw(st.integers(min_value=0, max_value=10_000))
     last = data.draw(st.integers(min_value=first, max_value=10_200))
     payloads = {o: f"p:{o}".encode() for o in offsets}
@@ -241,18 +233,12 @@ async def _exactly_the_window(data: st.DataObject) -> None:
         settings=fast_flush_settings(),
     )
     await stage.stage_batch(
-        [
-            StagedRecord(5, t, o, payloads[o])
-            for t, o in zip(timestamps, offsets, strict=True)
-        ],
+        [StagedRecord(g(5), o, payloads[o]) for o in offsets],
         now_us=NOW,
     )
-    # a neighbouring team that must never be touched by team 5's settle
+    # a neighbouring tuple that must never be touched by tuple 5's settle
     await stage.stage_batch(
-        [
-            StagedRecord(6, t, o, b"neighbour")
-            for t, o in zip(timestamps, offsets, strict=True)
-        ],
+        [StagedRecord(g(6), o, b"neighbour") for o in offsets],
         now_us=NOW,
     )
 
@@ -263,26 +249,54 @@ async def _exactly_the_window(data: st.DataObject) -> None:
     expected_survivors = set(offsets) - expected_deleted
     assert report.rows_deleted == len(expected_deleted)
     assert report.bytes_deleted == sum(len(payloads[o]) for o in expected_deleted)
-    assert report.team_drained == (not expected_survivors)
+    assert report.group_drained == (not expected_survivors)
 
-    rows5 = await team_rows(stage, 5)
+    rows5 = await group_rows(stage, 5)
     assert {rk.offset for rk, _ in rows5} == expected_survivors
     assert all(v == payloads[rk.offset] for rk, v in rows5)
-    rows6 = await team_rows(stage, 6)
+    rows6 = await group_rows(stage, 6)
     assert {rk.offset for rk, _ in rows6} == set(offsets)
 
-    stats = {s.team_id: s for s in await stage.iter_key_stats()}
-    assert 6 in stats and stats[6].row_count == n
+    stats = {s.group: s for s in await stage.iter_key_stats()}
+    assert g(6) in stats and stats[g(6)].row_count == n
     if expected_survivors:
-        s5 = stats[5]
+        s5 = stats[g(5)]
         assert s5.row_count == len(expected_survivors)
         assert s5.staged_bytes == sum(len(payloads[o]) for o in expected_survivors)
         assert s5.first_staged_ts == NOW
     else:
-        assert 5 not in stats  # drained: stats and sched_age went with the rows
+        assert g(5) not in stats  # drained: stats and sched_age went with the rows
         assert [
-            k for k in await stage.iter_sched_age_through(NOW) if k.team_id == 5
+            k for k in await stage.iter_sched_age_through(NOW) if k.group == g(5)
         ] == []
+    await stage.close()
+
+
+async def test_a_settlement_count_mismatch_rolls_back_before_commit(stage_factory):
+    """``commit_flushed(expected_rows=…)`` checks the window's row count
+    inside the settlement transaction: on a mismatch (either direction)
+    it raises SettlementMismatchError and the transaction rolls back —
+    rows, stats, sched entry and the prepared/ entry all untouched. The
+    matching count settles normally."""
+    from millrace.stage import SettlementMismatchError
+
+    stage = await stage_factory()
+    await stage.stage_batch([rec(5, 100 + i, i) for i in range(3)], now_us=NOW)
+    await stage.persist_prepared(g(5), 0, prepared("k", team=5))
+    stats_before = await stage.iter_key_stats()
+    for wrong in (2, 4):
+        with pytest.raises(SettlementMismatchError) as excinfo:
+            await stage.commit_flushed(window(5, 0, 2), expected_rows=wrong)
+        assert (excinfo.value.expected, excinfo.value.found) == (wrong, 3)
+        assert [rk.offset for rk, _ in await group_rows(stage, 5)] == [0, 1, 2]
+        assert await stage.iter_key_stats() == stats_before
+        assert await stage.iter_sched_age_through(NOW) == [
+            keyspace.SchedAgeKey(NOW, g(5))
+        ]
+        assert len(await stage.load_prepared()) == 1
+    report = await stage.commit_flushed(window(5, 0, 2), expected_rows=3)
+    assert (report.rows_deleted, report.group_drained) == (3, True)
+    assert await stage.load_prepared() == []
     await stage.close()
 
 
@@ -293,51 +307,42 @@ async def test_commit_flushed_is_idempotent(stage_factory):
     await stage.stage_batch([rec(5, 100 + i, i) for i in range(5)], now_us=NOW)
     key = window(5, 0, 4)
     first = await stage.commit_flushed(key)
-    assert (first.rows_deleted, first.team_drained) == (5, True)
+    assert (first.rows_deleted, first.group_drained) == (5, True)
     second = await stage.commit_flushed(key)
-    assert (second.rows_deleted, second.bytes_deleted, second.team_drained) == (
+    assert (second.rows_deleted, second.bytes_deleted, second.group_drained) == (
         0,
         0,
         False,
     )
     assert await stage.iter_key_stats() == []
-    assert await team_rows(stage, 5) == []
-    assert await stage.read_offsets(5) == ()
+    assert await group_rows(stage, 5) == []
     await stage.close()
 
 
-async def test_commit_flushed_prunes_and_clips_offsets(stage_factory):
+async def test_successive_capped_windows_settle_exactly(stage_factory):
+    """Settlement exactness under the flush's own access pattern: a
+    group interleaved with another in the Kafka partition, record
+    timestamps inverted, drained by capped scans. Each scan is an exact
+    offset prefix, each window ``[first scanned, last scanned]`` deletes
+    exactly the scanned rows, the neighbour is untouched."""
     stage = await stage_factory()
-    await stage.stage_batch([rec(5, 100 + i, i) for i in range(10)], now_us=NOW)
+    # group 5 on even offsets, group 6 on odd ones; timestamps descend.
     await stage.stage_batch(
-        [rec(5, 200 + i, 10 + i) for i in range(10)], now_us=NOW + 1
+        [rec(5 + (o % 2), 10_000 - o, o) for o in range(30)], now_us=NOW
     )
-    await stage.stage_batch(
-        [rec(5, 300 + i, 20 + i) for i in range(10)], now_us=NOW + 2
-    )
-    assert await stage.read_offsets(5) == (
-        OffsetRange("events", 0, 0, 9),
-        OffsetRange("events", 0, 10, 19),
-        OffsetRange("events", 0, 20, 29),
-    )
-    # wholly-covered ranges drop
-    key = window(5, 0, 9)
-    await stage.commit_flushed(key)
-    assert await stage.read_offsets(5) == (
-        OffsetRange("events", 0, 10, 19),
-        OffsetRange("events", 0, 20, 29),
-    )
-    # a window ending mid-range clips the straddler to its surviving head
-    key = window(5, 10, 24)
-    report = await stage.commit_flushed(key)
-    assert report.rows_deleted == 15
-    assert await stage.read_offsets(5) == (OffsetRange("events", 0, 25, 29),)
-    assert {rk.offset for rk, _ in await team_rows(stage, 5)} == set(range(25, 30))
-    # draining the rest removes the offsets key entirely
-    key = window(5, 25, 29)
-    report = await stage.commit_flushed(key)
-    assert report.team_drained
-    assert await stage.read_offsets(5) == ()
+    windows = []
+    while True:
+        scanned = await stage.scan_group_rows_bounded(g(5), max_rows=4, max_bytes=10**9)
+        if not scanned:
+            break
+        offsets = [rk.offset for rk, _ in scanned]
+        assert offsets == sorted(offsets)
+        report = await stage.commit_flushed(window(5, offsets[0], offsets[-1]))
+        assert report.rows_deleted == len(scanned)
+        windows.append((offsets[0], offsets[-1], len(scanned)))
+    assert windows == [(0, 6, 4), (8, 14, 4), (16, 22, 4), (24, 28, 3)]
+    assert [rk.offset for rk, _ in await group_rows(stage, 6)] == list(range(1, 30, 2))
+    assert [s.group for s in await stage.iter_key_stats()] == [g(6)]
     await stage.close()
 
 
@@ -352,7 +357,7 @@ async def test_commit_flushed_writes_no_marker(stage_factory):
     stage = await stage_factory()
     await stage.stage_batch([rec(5, 100 + i, i) for i in range(5)], now_us=NOW)
     report = await stage.commit_flushed(window(5, 0, 4))
-    assert report.rows_deleted == 5 and report.team_drained
+    assert report.rows_deleted == 5 and report.group_drained
     assert await stage._scan_prefix(keyspace.FLUSHED_PREFIX) == []
     # ...and recovery therefore has nothing to collect.
     assert (await stage.recover()).legacy_markers_collected == 0
@@ -380,24 +385,24 @@ async def test_recover_collects_legacy_markers_without_touching_rows(memory_stor
     payloads = {o: f"stuck-{o}".encode() for o in range(6)}
     marker_key, marker_value = legacy_marker_kv(9, 1, 4)
     prepared = PreparedRequest(
-        keyspace.idempotency_key(TABLE, "events", 0, 9, 1, 4),
+        keyspace.idempotency_key(TABLE, "events", 0, g(9), 1, 4, "0" * 64),
         b'{"prepared": "body"}',
         persisted_at=NOW,
         topic="events",
         partition=0,
+        group=g(9),
+        group_fields=FIELDS,
+        row_count=4,
+        digest="0" * 64,
+        scanned_at=None,
     )
 
     db = await DbBuilder(path, memory_store).build()
     batch = WriteBatch()
     for offset, payload in payloads.items():
-        batch.put(
-            keyspace.encode_row_key(
-                RowKey(9, timestamp_us=1_000 + offset, offset=offset)
-            ),
-            payload,
-        )
+        batch.put(keyspace.encode_row_key(RowKey(g(9), offset)), payload)
     batch.put(
-        keyspace.stats_key(9),
+        keyspace.stats_key(g(9)),
         keyspace.encode_stats_value(
             StatsValue(
                 staged_bytes=sum(len(p) for p in payloads.values()),
@@ -407,13 +412,9 @@ async def test_recover_collects_legacy_markers_without_touching_rows(memory_stor
             )
         ),
     )
-    batch.put(keyspace.encode_sched_age_key(keyspace.SchedAgeKey(NOW, 9)), b"")
-    batch.put(
-        keyspace.offsets_key(9),
-        keyspace.encode_offsets_value([OffsetRange("events", 0, 0, 5)]),
-    )
+    batch.put(keyspace.encode_sched_age_key(keyspace.SchedAgeKey(NOW, g(9))), b"")
     batch.put(marker_key, marker_value)
-    batch.put(keyspace.prepared_key(9, 1), keyspace.encode_prepared_value(prepared))
+    batch.put(keyspace.prepared_key(g(9), 1), keyspace.encode_prepared_value(prepared))
     handle = await db.write(batch)
     await handle.await_durable()
     await db.shutdown()
@@ -424,11 +425,13 @@ async def test_recover_collects_legacy_markers_without_touching_rows(memory_stor
     report = await stage.recover()
     assert report.legacy_markers_collected == 1
     assert report.pending_prepared == (
-        RecoveredPrepared(key=PreparedKey(team_id=9, first_offset=1), request=prepared),
+        RecoveredPrepared(
+            key=PreparedKey(group=g(9), first_offset=1), request=prepared
+        ),
     )
     # the rows are NOT deleted by recovery — the legacy marker carries no
     # authority; the prepared/ entry drives the window's reconcile
-    assert {rk.offset for rk, _ in await team_rows(stage, 9)} == set(range(6))
+    assert {rk.offset for rk, _ in await group_rows(stage, 9)} == set(range(6))
     assert await stage._scan_prefix(keyspace.FLUSHED_PREFIX) == []
 
     again = await stage.recover()
@@ -477,11 +480,11 @@ async def test_recover_collects_many_legacy_markers_in_bounded_pages(memory_stor
             batch.put(keyspace.FLUSHED_PREFIX + i.to_bytes(24, "big"), b"\x01x")
         handle = await db.write(batch)
         await handle.await_durable()
-    # a live team whose rows must survive the collection
+    # a live tuple whose rows must survive the collection
     batch = WriteBatch()
-    batch.put(keyspace.encode_row_key(RowKey(3, timestamp_us=100, offset=0)), b"live")
+    batch.put(keyspace.encode_row_key(RowKey(g(3), 0)), b"live")
     batch.put(
-        keyspace.stats_key(3),
+        keyspace.stats_key(g(3)),
         keyspace.encode_stats_value(
             StatsValue(
                 staged_bytes=4, first_staged_ts=NOW, last_staged_ts=NOW, row_count=1
@@ -503,11 +506,11 @@ async def test_recover_collects_many_legacy_markers_in_bounded_pages(memory_stor
     assert report.pending_prepared == ()
     # 2500 markers / 1000 per page = 3 write batches, and not a single
     # transaction opened (the pre-fix shape was one serializable
-    # transaction PLUS a full team-slice scan per marker).
+    # transaction PLUS a full group-slice scan per marker).
     assert counting.writes == 3
     assert counting.begins == 0
     assert await stage._scan_prefix(keyspace.FLUSHED_PREFIX) == []
-    assert [rk.offset for rk, _ in await team_rows(stage, 3)] == [0]
+    assert [rk.offset for rk, _ in await group_rows(stage, 3)] == [0]
 
     # A second recover() is free: no markers, no writes.
     report2 = await stage.recover()
@@ -521,31 +524,41 @@ async def test_recover_returns_pending_prepared_and_nothing_else(stage_factory):
     await stage.stage_batch([rec(1, 100 + i, i) for i in range(5)], now_us=NOW)
     await stage.stage_batch([rec(1, 200 + i, 5 + i) for i in range(5)], now_us=NOW + 1)
     req_a = PreparedRequest(
-        keyspace.idempotency_key(TABLE, "events", 0, 1, 0, 4),
+        keyspace.idempotency_key(TABLE, "events", 0, g(1), 0, 4, "0" * 64),
         b'{"a": 1}',
         persisted_at=NOW,
         topic="events",
         partition=0,
+        group=g(1),
+        group_fields=FIELDS,
+        row_count=5,
+        digest="0" * 64,
+        scanned_at=None,
     )
     req_b = PreparedRequest(
-        keyspace.idempotency_key(TABLE, "events", 0, 1, 5, 9),
+        keyspace.idempotency_key(TABLE, "events", 0, g(1), 5, 9, "0" * 64),
         b'{"b": 2}',
         persisted_at=NOW,
         topic="events",
         partition=0,
+        group=g(1),
+        group_fields=FIELDS,
+        row_count=5,
+        digest="0" * 64,
+        scanned_at=None,
     )
-    await stage.persist_prepared(1, 0, req_a)
-    await stage.persist_prepared(1, 5, req_b)
+    await stage.persist_prepared(g(1), 0, req_a)
+    await stage.persist_prepared(g(1), 5, req_b)
     # settling the first range drops its prepared entry in the same transaction
     await stage.commit_flushed(window(1, 0, 4))
 
     report = await stage.recover()
     assert report.legacy_markers_collected == 0
     assert report.pending_prepared == (
-        RecoveredPrepared(key=PreparedKey(team_id=1, first_offset=5), request=req_b),
+        RecoveredPrepared(key=PreparedKey(group=g(1), first_offset=5), request=req_b),
     )
-    assert await stage.get_prepared(1, 0) is None
-    assert await stage.get_prepared(1, 5) == req_b
+    assert await stage.get_prepared(g(1), 0) is None
+    assert await stage.get_prepared(g(1), 5) == req_b
     await stage.close()
 
 
@@ -553,24 +566,29 @@ async def test_prepared_round_trip(stage_factory):
     stage = await stage_factory()
     body = b'{"files": ["s3://bucket/a.parquet"], "read_snapshot": 42}'
     request = PreparedRequest(
-        keyspace.idempotency_key(TABLE, "events", 0, 3, 10, 19),
+        keyspace.idempotency_key(TABLE, "events", 0, g(3), 10, 19, "0" * 64),
         body,
         persisted_at=NOW,
         topic="events",
         partition=0,
+        group=g(3),
+        group_fields=FIELDS,
+        row_count=10,
+        digest="0" * 64,
+        scanned_at=None,
     )
-    await stage.persist_prepared(3, 10, request)
-    assert await stage.get_prepared(3, 10) == request
+    await stage.persist_prepared(g(3), 10, request)
+    assert await stage.get_prepared(g(3), 10) == request
     assert await stage.load_prepared() == [
-        RecoveredPrepared(key=PreparedKey(team_id=3, first_offset=10), request=request)
+        RecoveredPrepared(key=PreparedKey(group=g(3), first_offset=10), request=request)
     ]
     # a re-persist of the same key overwrites (idempotent), never duplicates
-    await stage.persist_prepared(3, 10, request)
+    await stage.persist_prepared(g(3), 10, request)
     assert len(await stage.load_prepared()) == 1
     # the persisted body comes back byte-identical (the replay contract)
-    assert (await stage.get_prepared(3, 10)).body == body
-    await stage.drop_prepared(3, 10)
-    assert await stage.get_prepared(3, 10) is None
+    assert (await stage.get_prepared(g(3), 10)).body == body
+    await stage.drop_prepared(g(3), 10)
+    assert await stage.get_prepared(g(3), 10) is None
     assert await stage.load_prepared() == []
     await stage.close()
 
@@ -583,9 +601,7 @@ async def test_commit_flushed_requires_consistent_stats(memory_store):
     path = "millrace/events/0"
     db = await DbBuilder(path, memory_store).build()
     batch = WriteBatch()
-    batch.put(
-        keyspace.encode_row_key(RowKey(9, timestamp_us=1_000, offset=0)), b"orphan"
-    )
+    batch.put(keyspace.encode_row_key(RowKey(g(9), 0)), b"orphan")
     handle = await db.write(batch)
     await handle.await_durable()
     await db.shutdown()
@@ -605,7 +621,7 @@ async def test_commit_flushed_requires_consistent_stats(memory_store):
 async def test_gauges_track_the_stats_prefix(stage_factory):
     stage = await stage_factory()
     assert await stage.gauges() == StageGauges(
-        staged_bytes=0, staged_rows=0, staged_teams=0, oldest_first_staged_ts=None
+        staged_bytes=0, staged_rows=0, staged_groups=0, oldest_first_staged_ts=None
     )
     await stage.stage_batch(
         [rec(1, 100 + i, i, payload=b"abcd") for i in range(3)], now_us=NOW
@@ -617,12 +633,12 @@ async def test_gauges_track_the_stats_prefix(stage_factory):
     g = await stage.gauges()
     assert g.staged_bytes == 3 * 4 + 2 * 10
     assert g.staged_rows == 5
-    assert g.staged_teams == 2
+    assert g.staged_groups == 2
     assert g.oldest_first_staged_ts == NOW
     key = window(1, 0, 2)
     await stage.commit_flushed(key)
     g = await stage.gauges()
-    assert (g.staged_bytes, g.staged_rows, g.staged_teams) == (2 * 10, 2, 1)
+    assert (g.staged_bytes, g.staged_rows, g.staged_groups) == (2 * 10, 2, 1)
     assert g.oldest_first_staged_ts == NOW + 5
     await stage.close()
 
@@ -734,32 +750,18 @@ async def test_ack_hook_fires_only_after_remote_durability(stage_factory):
 
 async def test_every_write_path_awaits_durability_before_returning(stage_factory):
     """The same pin for the other "durable before return" contracts:
-    ``persist_prepared`` (the replay-before-publish guard),
-    ``poison_records``, and the settlement transaction's commit handle
-    (``commit_flushed``)."""
+    ``persist_prepared`` (the replay-before-publish guard) and the
+    settlement transaction's commit handle (``commit_flushed``)."""
     stage = await stage_factory()
     db = _RecordingDb(stage._db)
     stage._db = db
 
     await stage.persist_prepared(
-        1,
+        g(1),
         0,
-        PreparedRequest("k", b"{}", persisted_at=NOW, topic="events", partition=0),
+        prepared("k", team=1),
     )
     assert db.write_handles and all(h.awaited for h in db.write_handles)
-
-    await stage.poison_records(
-        [
-            PoisonedRecord(
-                offset=7,
-                reason="missing_key",
-                key=None,
-                value=None,
-                value_bytes_original=0,
-            )
-        ]
-    )
-    assert all(h.awaited for h in db.write_handles)
 
     await stage.stage_batch([rec(1, 100, 0)], now_us=NOW)
     await stage.commit_flushed(window(1, 0, 0))
@@ -816,188 +818,15 @@ async def test_a_stage_opens_writes_and_closes_with_gc_disabled(stage_factory):
         )
     )
     await stage.stage_batch([rec(1, 100, 0)], now_us=NOW)
-    rows = [rk.offset async for rk, _ in stage.scan_team_rows(1)]
+    rows = [rk.offset async for rk, _ in stage.scan_group_rows(g(1))]
     assert rows == [0]
     await stage.close()
-
-
-# -- poison retention: the purge (stage side of MILLRACE_POISON_RETENTION_S) ------
-
-
-def _poison(offset: int, *, ts: int | None = None) -> PoisonedRecord:
-    return PoisonedRecord(
-        offset=offset,
-        reason="malformed_key",
-        key=None,
-        value=b"junk",
-        value_bytes_original=4,
-        quarantined_at_us=ts,
-    )
-
-
-async def test_stage_batch_stamps_poison_with_the_staging_clock(stage_factory):
-    """Consume-side quarantine entries are stamped with the batch's
-    ``now_us`` (the v2 envelope) — the purge's age basis. A batch that
-    lost the stamp would keep its poison forever (red without it)."""
-    stage = await stage_factory()
-    await stage.stage_batch([rec(1, 100, 0)], poison=[_poison(1)], now_us=NOW)
-    (entry,) = await stage.scan_poison()
-    assert entry.offset == 1
-    assert entry.quarantined_at_us == NOW
-    await stage.close()
-
-
-async def test_poison_records_stamp_policy(stage_factory):
-    """``poison_records`` stamps entries from its ``now_us`` argument,
-    keeps an entry's own stamp when it carries one, and writes v1
-    (unstamped, never purged) when no clock is available — the flush
-    caller's seam until it passes its clock (integrator follow-up)."""
-    stage = await stage_factory()
-    await stage.poison_records([_poison(0, ts=NOW - 5), _poison(1)], now_us=NOW)
-    await stage.poison_records([_poison(2)])  # no clock: stays v1
-    by_offset = {p.offset: p for p in await stage.scan_poison()}
-    assert by_offset[0].quarantined_at_us == NOW - 5  # the entry's own wins
-    assert by_offset[1].quarantined_at_us == NOW  # filled from now_us
-    assert by_offset[2].quarantined_at_us is None  # unknown age, kept forever
-    await stage.close()
-
-
-async def test_purge_poison_expired_deletes_only_expired_entries(stage_factory):
-    """The retention rule, exactly: entries stamped before the cutoff go;
-    younger entries, and entries with NO stamp (v1 — unknown age), stay.
-    Staged rows are untouched."""
-    stage = await stage_factory()
-    await stage.poison_records(
-        [_poison(0, ts=NOW - 8 * 86400_000_000), _poison(1, ts=NOW - 60_000_000)],
-        now_us=NOW,
-    )  # entry ts wins over now_us; offsets 0,1
-    await stage.poison_records([_poison(2)], now_us=NOW - 10 * 86400_000_000)
-    await stage.poison_records([_poison(3)])  # v1: unknown age
-    await stage.stage_batch([rec(9, 100, 10)], now_us=NOW)
-
-    cutoff = NOW - 7 * 86400_000_000  # 7-day retention edge
-    await stage.poison_records([_poison(4, ts=cutoff)])  # exactly AT the edge
-    report = await stage.purge_poison_expired(cutoff)
-    assert report.deleted == 2  # offsets 0 and 2
-    assert report.unreadable == 0
-    assert not report.truncated
-    remaining = await stage.scan_poison()
-    # the boundary entry stays: expiry is STRICTLY older than the cutoff
-    assert [p.offset for p in remaining] == [1, 3, 4]
-    # the staged row is not the purge's business
-    assert [rk.offset async for rk, _ in stage.scan_team_rows(9)] == [10]
-
-    # Idempotent: a second pass over the same cutoff deletes nothing.
-    again = await stage.purge_poison_expired(cutoff)
-    assert again.deleted == 0
-    assert again.scanned == 3
-    await stage.close()
-
-
-async def test_purge_poison_expired_bounds_its_scan_and_delete_batches(stage_factory):
-    """Bounded work per pass: the scan stops at the budget (truncated,
-    the next pass restarts at the front), and deletes land one
-    ``_POISON_WRITE_CHUNK``-sized durable batch at a time — never one
-    unbounded batch."""
-    stage = await stage_factory()
-    total = 2 * _POISON_PURGE_CHUNK + 1
-    await stage.poison_records(
-        [_poison(o, ts=NOW - 10) for o in range(total)], now_us=NOW
-    )
-    before = _write_batch_count(stage)
-    report = await stage.purge_poison_expired(NOW)  # everything is expired
-    assert report.deleted == total
-    assert not report.truncated
-    # one write batch per full chunk plus the remainder — not one giant one
-    assert _write_batch_count(stage) - before == 3
-
-    # the scan budget caps one pass; the prefix stays consistent
-    await stage.poison_records([_poison(o, ts=NOW - 10) for o in range(7)], now_us=NOW)
-    capped = await stage.purge_poison_expired(NOW, scan_budget=3)
-    assert capped.scanned == 3 and capped.deleted == 3 and capped.truncated
-    rest = await stage.purge_poison_expired(NOW)
-    assert rest.deleted == 4 and not rest.truncated
-    assert await stage.scan_poison() == []
-    await stage.close()
-
-
-async def test_purge_poison_expired_keeps_and_counts_undecodable_entries(
-    stage_factory,
-):
-    """A poison value that fails to decode (foreign write, or a NEWER
-    build's envelope mid-rollout) is kept and counted — a purge never
-    deletes what it cannot read, and one bad entry never wedges the pass."""
-    stage = await stage_factory()
-    await stage.poison_records([_poison(0, ts=NOW - 10), _poison(2, ts=NOW - 10)])
-    handle = await stage._db.write(_raw_put(keyspace.poison_key(1), b"\x9f garbage"))
-    await handle.await_durable()
-
-    report = await stage.purge_poison_expired(NOW)
-    assert report.scanned == 3
-    assert report.deleted == 2  # the decodable expired entries
-    assert report.unreadable == 1
-    raw = await stage._db.get(keyspace.poison_key(1))
-    assert raw == b"\x9f garbage"  # kept
-    await stage.close()
-
-
-async def test_purge_poison_holds_no_lock_across_the_scan(stage_factory, monkeypatch):
-    """The scan phase takes no write lock: a concurrent ``stage_batch``
-    lands while a purge scan is parked mid-iteration. Reds if the purge
-    ever takes the write lock around the whole pass (the batch would
-    deadlock behind it — this test holds the scan open and requires the
-    batch through first)."""
-    stage = await stage_factory()
-    await stage.poison_records([_poison(o, ts=NOW - 10) for o in range(5)])
-
-    real_iter = stage._iter_range
-    scan_parked = asyncio.Event()
-    release_scan = asyncio.Event()
-    parked = False
-
-    async def parked_iter(start: bytes, end: bytes):
-        nonlocal parked
-        async for k, v in real_iter(start, end):
-            yield k, v
-            if not parked:
-                parked = True
-                scan_parked.set()
-                await release_scan.wait()
-
-    monkeypatch.setattr(stage, "_iter_range", parked_iter)
-    purge = asyncio.create_task(stage.purge_poison_expired(NOW))
-    await asyncio.wait_for(scan_parked.wait(), timeout=10)
-    # With the scan parked, a write batch must complete (the scan holds
-    # no lock; the purge has not reached its first delete batch).
-    await asyncio.wait_for(stage.stage_batch([rec(1, 100, 42)], now_us=NOW), timeout=10)
-    release_scan.set()
-    report = await asyncio.wait_for(purge, timeout=10)
-    assert report.deleted == 5
-    await stage.close()
-
-
-def _write_batch_count(stage: PartitionStage) -> int:
-    from millrace.slatedb_metrics import snapshot_recorder
-
-    return sum(
-        m.value or 0
-        for m in snapshot_recorder(stage.metrics_recorder)
-        if m.name == "slatedb.db.write_batch_count"
-    )
-
-
-def _raw_put(key: bytes, value: bytes) -> object:
-    from slatedb.uniffi import WriteBatch
-
-    batch = WriteBatch()
-    batch.put(key, value)
-    return batch
 
 
 # -- reopen, limits, guards ---------------------------------------------------------
 
 
-async def test_reopen_preserves_rows_stats_and_offsets(stage_factory):
+async def test_reopen_preserves_rows_and_stats(stage_factory):
     """One shared memory store, close + reopen: WAL recovery reproduces
     the acknowledged state exactly (the component-layer shape of the
     file:/// hard-kill test)."""
@@ -1007,7 +836,7 @@ async def test_reopen_preserves_rows_stats_and_offsets(stage_factory):
     await stage.close()
 
     reopened = await stage_factory()
-    rows = await team_rows(reopened, 4)
+    rows = await group_rows(reopened, 4)
     assert [(rk.offset, v) for rk, v in rows] == [
         (i, f"row-{i}".encode()) for i in range(8)
     ]
@@ -1015,29 +844,120 @@ async def test_reopen_preserves_rows_stats_and_offsets(stage_factory):
     assert s.row_count == 8
     assert s.staged_bytes == sum(len(r.payload) for r in records)
     assert s.first_staged_ts == NOW
-    assert await reopened.read_offsets(4) == (OffsetRange("events", 0, 0, 7),)
     assert await reopened.recover() == RecoveryReport(pending_prepared=())
     await reopened.close()
 
 
-async def test_scan_team_rows_limits(stage_factory):
+async def test_scan_group_rows_limits(stage_factory):
     stage = await stage_factory()
     await stage.stage_batch(
         [rec(5, 100 + i, i, payload=b"0123456789") for i in range(10)], now_us=NOW
     )
-    rows = [rk.offset async for rk, _ in stage.scan_team_rows(5, max_rows=4)]
+    rows = [rk.offset async for rk, _ in stage.scan_group_rows(g(5), max_rows=4)]
     assert rows == [0, 1, 2, 3]
-    rows = [rk.offset async for rk, _ in stage.scan_team_rows(5, max_bytes=35)]
+    rows = [rk.offset async for rk, _ in stage.scan_group_rows(g(5), max_bytes=35)]
     assert rows == [0, 1, 2]  # the 4th row would push the total 30 -> 40 > 35
-    rows = [rk.offset async for rk, _ in stage.scan_team_rows(5, max_bytes=40)]
+    rows = [rk.offset async for rk, _ in stage.scan_group_rows(g(5), max_bytes=40)]
     assert rows == [0, 1, 2, 3]
     rows = [
         rk.offset
-        async for rk, _ in stage.scan_team_rows(5, max_rows=50, max_bytes=10**9)
+        async for rk, _ in stage.scan_group_rows(g(5), max_rows=50, max_bytes=10**9)
     ]
     assert rows == list(range(10))
     with pytest.raises(ValueError):
-        stage.scan_team_rows(5, max_rows=0)
+        stage.scan_group_rows(g(5), max_rows=0)
+    await stage.close()
+
+
+@given(data=st.data())
+def test_a_capped_scan_is_an_exact_offset_prefix(data: st.DataObject) -> None:
+    """Property: for any interleaving of groups over the partition's
+    offsets, any record timestamps and any caps, the bounded scan of a
+    group is exactly the first k rows of its full scan, the full scan is
+    offset-ascending, and no staged row of the group with an offset in
+    ``[first scanned, last scanned]`` is missing from it — the flush
+    window can never cover an unscanned row."""
+    asyncio.run(_capped_scan_is_a_prefix(data))
+
+
+async def _capped_scan_is_a_prefix(data: st.DataObject) -> None:
+    from slatedb.uniffi import ObjectStore
+
+    n = data.draw(st.integers(min_value=1, max_value=40))
+    teams = data.draw(st.lists(st.sampled_from([1, 2, 3]), min_size=n, max_size=n))
+    stamps = data.draw(
+        st.lists(
+            st.integers(min_value=-(2**40), max_value=2**40), min_size=n, max_size=n
+        )
+    )
+    sizes = data.draw(
+        st.lists(st.integers(min_value=1, max_value=20), min_size=n, max_size=n)
+    )
+    max_rows = data.draw(st.integers(min_value=1, max_value=n + 2))
+    max_bytes = data.draw(st.integers(min_value=1, max_value=400))
+    stage = await PartitionStage.open_store(
+        ObjectStore.resolve("memory:///"),
+        "millrace/events/0",
+        topic="events",
+        partition=0,
+        settings=fast_flush_settings(),
+    )
+    await stage.stage_batch(
+        [
+            rec(t, ts, o, payload=b"x" * size)
+            for o, (t, ts, size) in enumerate(zip(teams, stamps, sizes, strict=True))
+        ],
+        now_us=NOW,
+    )
+    for team in set(teams):
+        full = await group_rows(stage, team)
+        offsets = [rk.offset for rk, _ in full]
+        assert offsets == sorted(offsets)
+        assert offsets == [o for o, t in enumerate(teams) if t == team]
+        capped = await stage.scan_group_rows_bounded(
+            g(team), max_rows=max_rows, max_bytes=max_bytes
+        )
+        assert capped == full[: len(capped)]
+        assert len(capped) <= max_rows
+        assert sum(len(v) for _, v in capped) <= max_bytes
+        if capped:
+            lo, hi = capped[0][0].offset, capped[-1][0].offset
+            assert [rk.offset for rk, _ in capped] == [
+                o for o in offsets if lo <= o <= hi
+            ]
+        if len(capped) < len(full):
+            # the cap bound: the next row would exceed one of them
+            nxt = full[len(capped)][1]
+            assert (
+                len(capped) == max_rows
+                or sum(len(v) for _, v in capped) + len(nxt) > max_bytes
+            )
+    await stage.close()
+
+
+async def test_probe_fence_writes_one_meta_key_and_no_row(stage_factory):
+    """The consumer's fence probe is one durable put of ``meta/fence``:
+    not a row, so no scan, stats entry, sched entry or gauge sees it."""
+    stage = await stage_factory()
+    await stage.stage_batch([rec(1, 100, 0)], now_us=NOW)
+    before_stats = await stage.iter_key_stats()
+    before_gauges = await stage.gauges()
+    db = _RecordingDb(stage._db)
+    stage._db = db
+    await stage.probe_fence(41)
+    assert len(db.write_handles) == 1 and db.write_handles[0].awaited
+    raw = await stage._db.get(keyspace.FENCE_PROBE_KEY)
+    assert raw is not None and keyspace.decode_fence_probe_value(raw) == 41
+    await stage.probe_fence(42)  # overwritten, never accumulated
+    raw = await stage._db.get(keyspace.FENCE_PROBE_KEY)
+    assert raw is not None and keyspace.decode_fence_probe_value(raw) == 42
+    assert await stage.iter_key_stats() == before_stats
+    assert await stage.gauges() == before_gauges
+    assert [rk.offset for rk, _ in await group_rows(stage, 1)] == [0]
+    assert await stage.iter_sched_age_through(2**63 - 1) == [
+        keyspace.SchedAgeKey(NOW, g(1))
+    ]
+    assert await stage.recover() == RecoveryReport(pending_prepared=())
     await stage.close()
 
 
@@ -1047,10 +967,16 @@ async def test_stage_batch_rejects_bad_input(stage_factory):
         await stage.stage_batch([], now_us=NOW)
     with pytest.raises(ValueError, match="duplicate row key"):
         await stage.stage_batch([rec(1, 100, 0), rec(1, 100, 0)], now_us=NOW)
+    # the row key is (group, offset): another timestamp is the same key
+    with pytest.raises(ValueError, match="duplicate row key"):
+        await stage.stage_batch([rec(1, 100, 0), rec(1, 200, 0)], now_us=NOW)
     with pytest.raises(TypeError, match="payload must be bytes"):
-        StagedRecord(team_id=1, event_ts_us=100, offset=0, payload="str")  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="unsigned 64-bit"):
-        await stage.stage_batch([rec(-1, 100, 0)], now_us=NOW)
+        StagedRecord(group=g(1), offset=0, payload="str")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="u16 length"):
+        await stage.stage_batch(
+            [StagedRecord(group=("x" * 2**16,), offset=0, payload=b"")],
+            now_us=NOW,
+        )
     # nothing from the rejected calls landed
     assert await stage.iter_key_stats() == []
     await stage.close()
@@ -1066,14 +992,14 @@ async def test_close_guards(stage_factory):
     with pytest.raises(StageClosedError):
         await stage.iter_key_stats()
     with pytest.raises(StageClosedError):
-        [rk async for rk, _ in stage.scan_team_rows(1)]
+        [rk async for rk, _ in stage.scan_group_rows(g(1))]
     key = window(1, 0, 0)
     with pytest.raises(StageClosedError):
         await stage.commit_flushed(key)
     with pytest.raises(StageClosedError):
         await stage.gauges()
     with pytest.raises(StageClosedError):
-        await stage.persist_prepared(1, 0, PreparedRequest("k", b"{}"))
+        await stage.persist_prepared(g(1), 0, prepared("k", team=1))
 
     async with await stage_factory(partition=1) as managed:
         await managed.stage_batch([rec(1, 100, 0)], now_us=NOW)
@@ -1132,7 +1058,7 @@ async def test_manager_opens_recovers_and_aggregates():
     assert g.partitions == 2
     assert g.staged_bytes == 4 + 2 * 2
     assert g.staged_rows == 3
-    assert g.staged_teams == 2
+    assert g.staged_groups == 2
     assert g.oldest_first_staged_ts == NOW
     assert set(g.per_partition) == {("events", 0), ("events", 1)}
 
@@ -1172,7 +1098,7 @@ async def test_manager_sync_assignment_and_reopen():
     assert set(sync.opened) == {("events", 0)}
     reclaimed = sync.opened[("events", 0)]
     assert reclaimed.recovery == RecoveryReport(pending_prepared=())
-    rows = [rk.offset async for rk, _ in reclaimed.stage.scan_team_rows(1)]
+    rows = [rk.offset async for rk, _ in reclaimed.stage.scan_group_rows(g(1))]
     assert rows == [0, 1, 2, 3]
     (s,) = await reclaimed.stage.iter_key_stats()
     assert s.row_count == 4 and s.first_staged_ts == NOW
@@ -1210,7 +1136,10 @@ async def test_manager_gauges_serve_the_published_snapshot_while_fresh(memory_st
     assert (await manager.gauges()).staged_rows == 3  # live scan
 
     marker = StageGauges(
-        staged_bytes=999_999, staged_rows=9, staged_teams=1, oldest_first_staged_ts=None
+        staged_bytes=999_999,
+        staged_rows=9,
+        staged_groups=1,
+        oldest_first_staged_ts=None,
     )
     manager.publish_gauges({("events", 0): marker})
     served = await manager.gauges(max_staleness_s=100.0)
@@ -1256,7 +1185,7 @@ async def test_manager_publishes_aggregate_over_partitions(memory_store):
     assert served.partitions == 2
     assert served.staged_bytes == 16
     assert served.staged_rows == 3
-    assert served.staged_teams == 3
+    assert served.staged_groups == 3
     assert served.oldest_first_staged_ts == NOW
     await manager.close()
 
@@ -1296,24 +1225,172 @@ async def test_manager_publishes_the_sweeps_eligible_oldest(memory_store):
     await manager.close()
 
 
-async def test_list_prepared_scans_exactly_one_teams_entries(memory_store):
-    """The flush's outstanding-entry gate: one team's ``prepared/``
-    entries in first_offset order, never another team's."""
+async def test_list_prepared_scans_exactly_one_groups_entries(memory_store):
+    """The flush's outstanding-entry gate: one partition tuple's
+    ``prepared/`` entries in first_offset order, never another tuple's."""
     manager = StageManager("memory:///", "millrace", settings=fast_flush_settings())
     stage = (await manager.open_partition("events", 0)).stage
-    await stage.persist_prepared(
-        1, 5, PreparedRequest("k" * 36, b"{}", NOW, topic="events", partition=0)
-    )
-    await stage.persist_prepared(
-        1, 0, PreparedRequest("j" * 36, b"{}", NOW, topic="events", partition=0)
-    )
-    await stage.persist_prepared(
-        2, 0, PreparedRequest("x" * 36, b"{}", NOW, topic="events", partition=0)
-    )
+    await stage.persist_prepared(g(1), 5, prepared("k" * 36, team=1))
+    await stage.persist_prepared(g(1), 0, prepared("j" * 36, team=1))
+    await stage.persist_prepared(g(2), 0, prepared("x" * 36, team=2))
 
-    mine = await stage.list_prepared(1)
+    mine = await stage.list_prepared(g(1))
     assert [p.key.first_offset for p in mine] == [0, 5]  # key order, not write order
     assert mine[0].request.idempotency_key == "j" * 36
-    assert [p.key.first_offset for p in await stage.list_prepared(2)] == [0]
-    assert await stage.list_prepared(3) == []
+    assert [p.key.first_offset for p in await stage.list_prepared(g(2))] == [0]
+    assert await stage.list_prepared(g(3)) == []
     await manager.close()
+
+
+async def test_a_corrupt_prepared_entry_fails_recovery_by_name(memory_store):
+    """A ``prepared/`` value that does not decode is corruption: recovery,
+    the per-group gate and the point read raise StageCorruptionError
+    naming the partition and the entry's key — never a bare ValueError."""
+    from slatedb.uniffi import DbBuilder, WriteBatch
+
+    path = "millrace/events/0"
+    good = keyspace.encode_prepared_value(prepared("k", team=4, rows=2))
+    key = keyspace.prepared_key(g(4), 0)
+    db = await DbBuilder(path, memory_store).build()
+    batch = WriteBatch()
+    batch.put(key, good[:-1])  # one byte short
+    handle = await db.write(batch)
+    await handle.await_durable()
+    await db.shutdown()
+
+    stage = await PartitionStage.open_store(
+        memory_store, path, topic="events", partition=0, settings=fast_flush_settings()
+    )
+    for read in (
+        stage.recover,
+        lambda: stage.list_prepared(g(4)),
+        lambda: stage.get_prepared(g(4), 0),
+    ):
+        with pytest.raises(StageCorruptionError) as excinfo:
+            await read()
+        text = str(excinfo.value)
+        assert text.startswith(f"events[0]: the prepared/ entry at key {key!r}")
+        assert "is corrupt" in text
+        assert isinstance(excinfo.value.__cause__, ValueError)
+    await stage.close()
+
+
+async def test_a_settle_lifts_first_staged_ts_to_the_scan_start(stage_factory):
+    """Rows at t0, the scan starts at t1, more rows at t2 > t1, then the
+    settle of the scanned window: first_staged_ts becomes t1 (every row
+    left was staged after it), last_staged_ts stays t2, the sched_age/
+    entry is re-keyed; draining the rest deletes stats and the entry."""
+    stage = await stage_factory()
+    t0, t1, t2 = NOW, NOW + 10, NOW + 20
+    await stage.stage_batch([rec(5, 0, 0), rec(5, 0, 1)], now_us=t0)
+    scanned = await stage.scan_window(g(5), max_rows=100, max_bytes=10**9)
+    assert scanned.complete and len(scanned.rows) == 2
+    await stage.stage_batch([rec(5, 0, 2)], now_us=t2)
+    await stage.commit_flushed(window(5, 0, 1), expected_rows=2, scanned_at_us=t1)
+    (s,) = await stage.iter_key_stats()
+    assert (s.first_staged_ts, s.last_staged_ts, s.row_count) == (t1, t2, 1)
+    assert await stage.iter_sched_age_through(2**63 - 1) == [
+        keyspace.SchedAgeKey(t1, g(5))
+    ]
+    report = await stage.commit_flushed(window(5, 2, 2), scanned_at_us=t2 + 5)
+    assert report.group_drained
+    assert await stage.iter_key_stats() == []
+    assert await stage.iter_sched_age_through(2**63 - 1) == []
+    await stage.close()
+
+
+async def test_the_lift_never_lowers_and_never_passes_last_staged_ts(stage_factory):
+    stage = await stage_factory()
+    await stage.stage_batch([rec(5, 0, o) for o in range(4)], now_us=NOW + 50)
+    # an earlier scan start never lowers first_staged_ts
+    await stage.commit_flushed(window(5, 0, 0), scanned_at_us=NOW)
+    (s,) = await stage.iter_key_stats()
+    assert s.first_staged_ts == NOW + 50
+    # no scan start (a capped scan): unchanged
+    await stage.commit_flushed(window(5, 1, 1), scanned_at_us=None)
+    (s,) = await stage.iter_key_stats()
+    assert s.first_staged_ts == NOW + 50
+    # a scan start past last_staged_ts clamps to it (first <= last holds)
+    await stage.stage_batch([rec(5, 0, 9)], now_us=NOW + 60)
+    await stage.commit_flushed(window(5, 2, 2), scanned_at_us=NOW + 999)
+    (s,) = await stage.iter_key_stats()
+    assert (s.first_staged_ts, s.last_staged_ts) == (NOW + 60, NOW + 60)
+    assert await stage.iter_sched_age_through(2**63 - 1) == [
+        keyspace.SchedAgeKey(NOW + 60, g(5))
+    ]
+    await stage.close()
+
+
+@given(data=st.data())
+def test_first_staged_ts_bounds_the_oldest_remaining_row(data: st.DataObject) -> None:
+    """Property over interleavings of stage / scan / stage / settle with a
+    monotone clock: after every settle that leaves rows, first_staged_ts
+    is <= the staging time of the oldest remaining row and >= its
+    previous value, and the sched_age/ index holds exactly
+    (first_staged_ts, group)."""
+    asyncio.run(_first_staged_ts_property(data))
+
+
+async def _first_staged_ts_property(data: st.DataObject) -> None:
+    from slatedb.uniffi import ObjectStore
+
+    stage = await PartitionStage.open_store(
+        ObjectStore.resolve("memory:///"),
+        "millrace/events/0",
+        topic="events",
+        partition=0,
+        settings=fast_flush_settings(),
+    )
+    clock = NOW
+    offset = 0
+    staged_at: dict[int, int] = {}  # offset -> staging time
+
+    async def stage_some(n: int) -> None:
+        nonlocal clock, offset
+        clock += data.draw(st.integers(min_value=0, max_value=50))
+        batch = [rec(5, 0, offset + i) for i in range(n)]
+        await stage.stage_batch(batch, now_us=clock)
+        for i in range(n):
+            staged_at[offset + i] = clock
+        offset += n
+
+    await stage_some(data.draw(st.integers(min_value=1, max_value=5)))
+    previous: int | None = None
+    for _ in range(data.draw(st.integers(min_value=1, max_value=6))):
+        lifted_to: int | None = None
+        if staged_at:
+            clock += data.draw(st.integers(min_value=0, max_value=50))
+            scanned_at = clock
+            cap = data.draw(st.integers(min_value=1, max_value=8))
+            scan = await stage.scan_window(g(5), max_rows=cap, max_bytes=10**9)
+            if data.draw(st.booleans()):
+                await stage_some(data.draw(st.integers(min_value=1, max_value=4)))
+            rows = scan.rows
+            if rows:
+                await stage.commit_flushed(
+                    window(5, rows[0][0].offset, rows[-1][0].offset),
+                    expected_rows=len(rows),
+                    scanned_at_us=scanned_at if scan.complete else None,
+                )
+                for rk, _ in rows:
+                    del staged_at[rk.offset]
+                if scan.complete:
+                    lifted_to = scanned_at
+        stats = await stage.iter_key_stats()
+        sched = await stage.iter_sched_age_through(2**63 - 1)
+        if staged_at:
+            (s,) = stats
+            assert s.first_staged_ts <= min(staged_at.values())
+            if previous is not None:
+                assert s.first_staged_ts >= previous
+            if lifted_to is not None:
+                # a complete scan's settle lifts it to the scan start
+                assert s.first_staged_ts >= min(lifted_to, s.last_staged_ts)
+            previous = s.first_staged_ts
+            assert sched == [keyspace.SchedAgeKey(s.first_staged_ts, g(5))]
+        else:
+            assert stats == [] and sched == []
+            previous = None
+        if data.draw(st.booleans()):
+            await stage_some(data.draw(st.integers(min_value=1, max_value=4)))
+    await stage.close()

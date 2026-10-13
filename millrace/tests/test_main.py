@@ -4,7 +4,7 @@ The wiring itself (config → StageManager → consumer + flusher + ops
 server, signal stops, halt exit codes) is exercised by the live suite's
 subprocess scenarios; these tests pin the parts that fail BEFORE any
 service is needed — plus the pure decisions (exit-code classification,
-probe status) and the poison sweeper's loop discipline.
+probe status).
 """
 
 from __future__ import annotations
@@ -13,12 +13,14 @@ import asyncio
 from typing import Any
 
 import pytest
-from flushkit import make_config
+from flushkit import make_config, table_wire
 from kafkakit import FakeConsumer
+from pyhoglake import TableInfo
 
 from millrace import main
 from millrace.consumer import ConsumerFencedError, MillraceConsumer
 from millrace.flush import FlushHalted
+from millrace.grouping import GroupKeyer
 from millrace.stage import StageGauges, StageManager
 
 
@@ -71,7 +73,13 @@ def _collector():
     """A _PipelineCollector over real-but-unstarted components."""
     cfg = make_config()
     stages = StageManager("memory:///", "millrace")
-    consumer = MillraceConsumer(FakeConsumer(), stages, cfg, now_us=lambda: 0)
+    consumer = MillraceConsumer(
+        FakeConsumer(),
+        stages,
+        cfg,
+        keyer=GroupKeyer(TableInfo.from_wire(table_wire())),
+        now_us=lambda: 0,
+    )
     from pyhoglake import HoglakeClient
 
     from millrace.flush import HoglakeFlusher
@@ -268,17 +276,14 @@ def _collector_with_runner():
 
     cfg = make_config()
     runner = FlushRunner(stages, flusher, cfg.planner_knobs(), now_us=lambda: 0)
-    sweeper = main.PoisonSweeper(
-        stages, retention_s=7 * 86400, sweep_s=3600, now_us=lambda: 0
-    )
-    return consumer, stages, flusher, runner, sweeper
+    return consumer, stages, flusher, runner
 
 
 async def test_pipeline_collector_per_partition_and_fenced_series():
     """A stuck partition must be FINDABLE: per-partition staged bytes and
     oldest-age series (cardinality bounded by assigned partitions), plus
     the flush runner's fenced set as a labeled series."""
-    consumer, stages, flusher, runner, sweeper = _collector_with_runner()
+    consumer, stages, flusher, runner = _collector_with_runner()
     try:
         opened = await stages.open_partition("events", 0)
         from stagekit import NOW, rec
@@ -292,7 +297,6 @@ async def test_pipeline_collector_per_partition_and_fenced_series():
             stages,
             asyncio.get_running_loop(),
             runner=runner,
-            sweeper=sweeper,
         )
         raw: dict[tuple[str, tuple[tuple[str, str], ...]], float] = {}
         for family in await asyncio.to_thread(lambda: list(collector.collect())):
@@ -310,7 +314,6 @@ async def test_pipeline_collector_per_partition_and_fenced_series():
             ]
             == 1.0
         )
-        assert raw[("millrace_poison_entries_purged_total", ())] == 0
     finally:
         flusher.close()
 
@@ -362,7 +365,7 @@ async def test_pipeline_collector_serves_the_sweep_published_eligible_age():
                 ("events", 0): StageGauges(
                     staged_bytes=4,
                     staged_rows=1,
-                    staged_teams=1,
+                    staged_groups=1,
                     oldest_first_staged_ts=NOW,
                 )
             },
@@ -371,6 +374,8 @@ async def test_pipeline_collector_serves_the_sweep_published_eligible_age():
         raw = await raw_samples()
         assert ("millrace_oldest_eligible_staged_age_seconds", ()) in raw
         assert ("millrace_oldest_staged_age_seconds", ()) not in raw
+        # The pod's staging-group count (partition tuples holding rows).
+        assert raw[("millrace_staged_groups", ())] == 1
 
         # A publish with nothing eligible drops the series (absent, not
         # zero — "no backlog" is not "backlog age zero").
@@ -379,7 +384,7 @@ async def test_pipeline_collector_serves_the_sweep_published_eligible_age():
                 ("events", 0): StageGauges(
                     staged_bytes=4,
                     staged_rows=1,
-                    staged_teams=1,
+                    staged_groups=1,
                     oldest_first_staged_ts=NOW,
                 )
             },
@@ -392,83 +397,110 @@ async def test_pipeline_collector_serves_the_sweep_published_eligible_age():
         await stages.close()
 
 
-# -- the poison sweeper -----------------------------------------------------------
+# -- the dropped-records counter ---------------------------------------------------
 
 
-async def test_poison_sweeper_purges_expired_entries_per_partition():
-    """End to end over memory:/// stages: entries past the retention go,
-    fresh ones stay, and the counter tracks the total (the loop's own
-    discipline — bounded purges per partition, failures contained)."""
-    from stagekit import NOW, rec
-
-    from millrace.stage import PoisonedRecord
-
-    stages = StageManager("memory:///", "millrace")
+def test_records_dropped_total_merges_consume_and_flush_reasons():
+    """One labeled counter for both halves: the consumer's and the
+    flusher's per-reason tallies sum per label; no other drop series
+    exists."""
+    consumer, stages, flusher = _collector()
+    loop = asyncio.new_event_loop()
     try:
-        opened = await stages.open_partition("events", 0)
-        stage = opened.stage
-        await stage.stage_batch(
-            [rec(1, 100, 0)],
-            poison=[
-                PoisonedRecord(7, "malformed_key", None, b"x", 1),  # stamped NOW
-            ],
-            now_us=NOW,
+        consumer._records_dropped.update({"malformed_value": 2, "uncastable_column": 1})
+        flusher._records_dropped.update(
+            {"uncastable_column": 3, "event_time_out_of_window": 4}
         )
-        clock = {"now": NOW}
-
-        sweeper = main.PoisonSweeper(
-            stages,
-            retention_s=3600,
-            sweep_s=60,
-            now_us=lambda: clock["now"],
-        )
-        # nothing is old yet
-        assert await sweeper.sweep_once() == 0
-        assert [p.offset for p in await stage.scan_poison()] == [7]
-        # age the world past the retention
-        clock["now"] += 3601 * 1_000_000
-        assert await sweeper.sweep_once() == 1
-        assert await stage.scan_poison() == []
-        assert sweeper.purged_total == 1
-        assert sweeper.sweeps_total == 2
+        collector = main._PipelineCollector(consumer, flusher, stages, loop)
+        raw = {
+            (s.name, tuple(sorted(s.labels.items()))): s.value
+            for m in collector.collect()
+            for s in m.samples
+        }
+        dropped = {
+            labels[0][1]: value
+            for (name, labels), value in raw.items()
+            if name == "millrace_records_dropped_total"
+        }
+        assert dropped == {
+            "malformed_value": 2,
+            "uncastable_column": 4,
+            "event_time_out_of_window": 4,
+        }
+        assert not any("poison" in name or "quarantin" in name for name, _ in raw)
     finally:
-        await stages.close()
+        flusher.close()
+        loop.run_until_complete(asyncio.sleep(0.05))
+        loop.close()
 
 
-async def test_poison_sweeper_contains_partition_failures_and_stops_promptly():
-    """A partition whose purge raises is contained (counted, logged, the
-    sweep continues); stop() wakes the between-sweep pause."""
-    from stagekit import NOW
+# -- the flush counters, by exact name, labels and value ---------------------------
 
-    stages = StageManager("memory:///", "millrace")
+
+def _raw(collector: Any) -> dict[tuple[str, tuple[tuple[str, str], ...]], float]:
+    return {
+        (s.name, tuple(sorted(s.labels.items()))): s.value
+        for m in collector.collect()
+        for s in m.samples
+    }
+
+
+def test_flush_counters_are_exposed_by_exact_name_labels_and_value():
+    """Each flusher counter reaches its own series: seeded with distinct
+    values, a swapped pair of counters (unresolved vs orphaned, say)
+    reads back wrong. ``millrace_prepared_reprepared_total`` carries
+    every reason in REPREPARE_REASONS, a never-incremented one at 0."""
+    from millrace.flush import REPREPARE_REASONS
+
+    consumer, stages, flusher = _collector()
+    loop = asyncio.new_event_loop()
     try:
-        opened = await stages.open_partition("events", 0)
+        collector = main._PipelineCollector(consumer, flusher, stages, loop)
+        zero = _raw(collector)
+        assert {
+            labels: value
+            for (name, labels), value in zero.items()
+            if name == "millrace_prepared_reprepared_total"
+        } == {(("reason", reason),): 0 for reason in REPREPARE_REASONS}
+        assert set(REPREPARE_REASONS) == {
+            "ddl_since_read_snapshot",
+            "read_snapshot_expired",
+        }
 
-        class Boom:
-            async def purge_poison_expired(self, cutoff: int) -> Any:
-                raise RuntimeError("store sad")
-
-        sweeper = main.PoisonSweeper(
-            stages, retention_s=3600, sweep_s=60, now_us=lambda: NOW
+        flusher._prepared_replays = 3
+        flusher._reprepared["read_snapshot_expired"] = 5
+        flusher._unresolved_uploads = 7
+        flusher._receipt_settlements = 11
+        flusher._orphaned_uploads = 13
+        flusher._flush_deduped = 17
+        raw = _raw(collector)
+        assert raw[("millrace_prepared_replays_total", ())] == 3
+        assert (
+            raw[
+                (
+                    "millrace_prepared_reprepared_total",
+                    (("reason", "read_snapshot_expired"),),
+                )
+            ]
+            == 5
         )
-        # break the one partition's purge
-        monkey_target = opened.stage
-        real = monkey_target.purge_poison_expired
-        monkey_target.purge_poison_expired = Boom().purge_poison_expired  # type: ignore[method-assign]
-        assert await sweeper.sweep_once() == 0
-        assert sweeper.partition_failures_total == 1
-        monkey_target.purge_poison_expired = real  # type: ignore[method-assign]
-        assert await sweeper.sweep_once() == 0
-        assert sweeper.partition_failures_total == 1
-
-        # run() loop: stops promptly rather than riding out a long sweep_s
-        sweeper2 = main.PoisonSweeper(
-            stages, retention_s=3600, sweep_s=3600, now_us=lambda: NOW
+        assert (
+            raw[
+                (
+                    "millrace_prepared_reprepared_total",
+                    (("reason", "ddl_since_read_snapshot"),),
+                )
+            ]
+            == 0
         )
-        runner = asyncio.create_task(sweeper2.run())
-        await asyncio.sleep(0.05)  # first sweep + pause begins
-        sweeper2.stop()
-        await asyncio.wait_for(runner, timeout=10)
-        assert sweeper2.sweeps_total == 1
+        assert raw[("millrace_flush_unresolved_uploads_total", ())] == 7
+        assert raw[("millrace_receipt_settlements_total", ())] == 11
+        assert raw[("millrace_flush_orphaned_uploads_total", ())] == 13
+        assert raw[("millrace_flush_deduped_total", ())] == 17
+        assert len(
+            [k for k in raw if k[0] == "millrace_prepared_reprepared_total"]
+        ) == len(REPREPARE_REASONS)
     finally:
-        await stages.close()
+        flusher.close()
+        loop.run_until_complete(asyncio.sleep(0.05))
+        loop.close()

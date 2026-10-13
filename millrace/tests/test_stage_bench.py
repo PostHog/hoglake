@@ -96,8 +96,7 @@ async def _run_bench(
     for batch_index in range(BATCHES):
         records = [
             StagedRecord(
-                team_id=(offset + i) % TEAMS,
-                event_ts_us=NOW + offset + i,
+                group=(str((offset + i) % TEAMS),),
                 offset=offset + i,
                 payload=_payload(offset + i),
             )
@@ -118,7 +117,7 @@ async def _run_bench(
     rows_scanned = 0
     t0 = time.perf_counter()
     for team in range(TEAMS):
-        async for _rk, _v in stage.scan_team_rows(team):
+        async for _rk, _v in stage.scan_group_rows((str(team),)):
             rows_scanned += 1
     row_scan_s = time.perf_counter() - t0
     assert rows_scanned == TOTAL_ROWS
@@ -130,7 +129,7 @@ async def _run_bench(
         report = await stage.commit_flushed(
             window(team, min(team_offsets), max(team_offsets))
         )
-        assert report.team_drained
+        assert report.group_drained
         rows_deleted += report.rows_deleted
     settle_s = time.perf_counter() - t0
     assert rows_deleted == TOTAL_ROWS
@@ -210,8 +209,7 @@ WHALE_TEAMS = 40  # one hot team (0) takes ~half; the tail shares the rest
 def _whale_record(i: int) -> StagedRecord:
     team = 0 if i % 2 == 0 else 1 + (i % (WHALE_TEAMS - 1))
     return StagedRecord(
-        team_id=team,
-        event_ts_us=NOW + i,
+        group=(str(team),),
         offset=i,
         payload=bytes([i % 251 + 1]) * WHALE_PAYLOAD,
     )

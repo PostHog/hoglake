@@ -102,10 +102,14 @@ if [[ "$ready" != true ]]; then
     exit 1
 fi
 
+# Extra pytest arguments, word-split (e.g. "-k soak -s" with
+# MILLRACE_SOAK_S set runs only the soak — README §live suite).
+read -r -a extra_pytest_args <<< "${MILLRACE_LIVE_PYTEST_ARGS:-}"
 result=0
 if ! (
     cd "$repo_dir/millrace"
-    uv run --locked pytest -m live -q --junitxml="$report_dir/millrace.xml"
+    uv run --locked pytest -m live -q --junitxml="$report_dir/millrace.xml" \
+        ${extra_pytest_args[@]+"${extra_pytest_args[@]}"}
 ) 2>&1 | tee "$report_dir/millrace.log"; then
     result=1
 fi

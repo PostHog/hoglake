@@ -1,8 +1,8 @@
 """Process entry point: wire config, stage, consumer, planner/flush, server.
 
 One process = one topic → one table (docs/kafka-ingestion.md
-§Deployment). Startup fails fast on config or identity mismatch before
-any consume begins.
+§Deployment). Startup fails fast on invalid config or an unresolvable
+destination before any consume begins.
 
 Assembly: ``MILLRACE_*`` env → :class:`~millrace.config.Config` →
 :class:`~millrace.stage.StageManager` (one SlateDB instance per claimed
@@ -10,8 +10,7 @@ partition, opened with the ``MILLRACE_SLATEDB_*`` settings — T9) +
 :class:`~millrace.flush.HoglakeFlusher` (resolves the
 destination and pins its incarnation) + :class:`~millrace.consumer.
 MillraceConsumer` and :class:`~millrace.flush.FlushRunner` sharing the
-StageManager on one asyncio loop, plus the poison sweeper (retention for
-the ``poison/`` quarantine) and the operational HTTP surface
+StageManager on one asyncio loop, plus the operational HTTP surface
 (:mod:`millrace.server`).
 
 Beyond the ``MILLRACE_*`` knobs (config.py), the process reads:
@@ -54,16 +53,19 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
-from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from functools import partial
 from typing import Any
 
 from prometheus_client.core import REGISTRY, CounterMetricFamily, GaugeMetricFamily
 
+from . import memdebug
 from .config import Config, ConfigError, load_config
 from .consumer import ConsumerFencedError, MillraceConsumer, create_kafka_consumer
-from .flush import FlushHalted, FlushRunner, HoglakeFlusher
+from .flush import REPREPARE_REASONS, FlushHalted, FlushRunner, HoglakeFlusher
+from .grouping import GroupKeyer
 from .server import serve
 from .slatedb_metrics import MetricSnapshot, slatedb_families, snapshot_recorder
 from .stage import StageManager, build_slatedb_settings
@@ -177,107 +179,6 @@ def _s3_kwargs(env: Mapping[str, str]) -> dict[str, Any]:
     return out
 
 
-class PoisonSweeper:
-    """The ``poison/`` retention loop (S14): quarantine entries are
-    forensic state with a bounded lifetime
-    (``MILLRACE_POISON_RETENTION_S``); without this sweeper the prefix
-    only ever grows.
-
-    One sweep per ``sweep_s``: for every currently open partition,
-    :meth:`millrace.stage.PartitionStage.purge_poison_expired` with the
-    cutoff ``now − retention`` — bounded per call, per-partition
-    contained (a fenced/revoked partition is skipped, a broken one is
-    logged and counted, neither stops the sweep). The loop body never
-    raises: retention is hygiene, not correctness, and a dying sweeper
-    must not take the pipeline with it. It is also SAFE to be down at
-    expiry — nothing depends on poison presence, the next sweep catches
-    up — so it runs as a side task off the consume/flush path.
-    """
-
-    def __init__(
-        self,
-        stages: StageManager,
-        *,
-        retention_s: int,
-        sweep_s: int,
-        now_us: Callable[[], int] = _now_us,
-        sleep: Callable[[float], Awaitable[None]] | None = None,
-    ) -> None:
-        if retention_s < 1:
-            raise ValueError(f"retention_s must be >= 1, got {retention_s}")
-        if sweep_s < 1:
-            raise ValueError(f"sweep_s must be >= 1, got {sweep_s}")
-        self._stages = stages
-        self._retention_us = retention_s * _MICROS_PER_SECOND
-        self._sweep_s = float(sweep_s)
-        self._now_us = now_us
-        self._stop_event = asyncio.Event()
-        self._sleep = sleep if sleep is not None else self._interruptible_sleep
-        self._stopping = False
-        self.purged_total = 0
-        self.sweeps_total = 0
-        self.partition_failures_total = 0
-
-    async def _interruptible_sleep(self, seconds: float) -> None:
-        try:
-            await asyncio.wait_for(self._stop_event.wait(), timeout=seconds)
-        except TimeoutError:
-            pass
-
-    async def sweep_once(self) -> int:
-        """One pass over the open partitions; returns entries purged."""
-        cutoff = self._now_us() - self._retention_us
-        purged = 0
-        for topic, partition in self._stages.partitions():
-            try:
-                stage = self._stages.stage(topic, partition)
-            except KeyError:
-                continue  # revoked mid-sweep
-            try:
-                report = await stage.purge_poison_expired(cutoff)
-            except Exception:
-                # Contained: SlateDB Error.Closed (a fence/revoke under
-                # us), a store hiccup — the partition is retried next
-                # sweep; hygiene never wedges the pipeline.
-                self.partition_failures_total += 1
-                log.exception(
-                    "poison sweep failed for %s[%d]; retried next sweep",
-                    topic,
-                    partition,
-                )
-                continue
-            purged += report.deleted
-            if report.deleted or report.truncated or report.unreadable:
-                log.info(
-                    "poison sweep %s[%d]: deleted=%d scanned=%d unreadable=%d "
-                    "truncated=%s",
-                    topic,
-                    partition,
-                    report.deleted,
-                    report.scanned,
-                    report.unreadable,
-                    report.truncated,
-                )
-        self.purged_total += purged
-        self.sweeps_total += 1
-        return purged
-
-    async def run(self) -> None:
-        """Sweep, pause, repeat until :meth:`stop`. A failed ITERATION is
-        logged and counted and the loop continues."""
-        while not self._stopping:
-            try:
-                await self.sweep_once()
-            except Exception:
-                log.exception("poison sweep iteration failed; continuing")
-            await self._sleep(self._sweep_s)
-
-    def stop(self) -> None:
-        """Stop after the in-flight sweep; wakes the between-sweep pause."""
-        self._stopping = True
-        self._stop_event.set()
-
-
 class _PipelineCollector:
     """Prometheus view of the pipeline counters and staging gauges.
 
@@ -315,7 +216,7 @@ class _PipelineCollector:
     to the no-per-partition-series rule: a stuck partition must be
     FINDABLE (PR #331), and the label cardinality is bounded by the
     pod's ASSIGNED partitions (the K of the static list or the group
-    assignment — tens, not the team count). ``millrace_flush_partition_
+    assignment — tens, not the partition-tuple count). ``millrace_flush_partition_
     fenced`` carries the flush runner's fenced set the same way.
     """
 
@@ -327,7 +228,6 @@ class _PipelineCollector:
         loop: asyncio.AbstractEventLoop,
         *,
         runner: FlushRunner | None = None,
-        sweeper: PoisonSweeper | None = None,
         gauge_max_staleness_s: float | None = None,
     ) -> None:
         self._consumer = consumer
@@ -335,7 +235,6 @@ class _PipelineCollector:
         self._stages = stages
         self._loop = loop
         self._runner = runner
-        self._sweeper = sweeper
         self._gauge_max_staleness_s = gauge_max_staleness_s
 
     def collect(self) -> Any:
@@ -353,11 +252,6 @@ class _PipelineCollector:
                 c.records_staged,
             ),
             (
-                "millrace_records_poisoned_total",
-                "Records quarantined at consume",
-                c.records_poisoned,
-            ),
-            (
                 "millrace_kafka_commits_total",
                 "Kafka offset commit attempts",
                 c.commit_attempts,
@@ -368,9 +262,9 @@ class _PipelineCollector:
                 f.flushes_committed,
             ),
             (
-                "millrace_flushes_replayed_total",
-                "Persisted commits replayed",
-                f.flushes_replayed,
+                "millrace_prepared_replays_total",
+                "Persisted prepared/ entries republished on a receipt 404",
+                f.prepared_replays,
             ),
             (
                 "millrace_receipt_settlements_total",
@@ -378,9 +272,9 @@ class _PipelineCollector:
                 f.receipt_settlements,
             ),
             (
-                "millrace_flush_reprepares_total",
-                "Commits re-prepared after ddl_since_read_snapshot",
-                f.reprepares,
+                "millrace_flush_deduped_total",
+                "Fresh flush windows settled from an existing receipt",
+                f.flush_deduped,
             ),
             (
                 "millrace_flush_rows_published_total",
@@ -398,19 +292,33 @@ class _PipelineCollector:
                 f.orphaned_uploads,
             ),
             (
-                "millrace_flush_records_quarantined_total",
-                "Rows quarantined at flush",
-                f.records_quarantined,
+                "millrace_flush_unresolved_uploads_total",
+                "Objects of a dropped prepared/ entry that may be live or orphaned",
+                f.unresolved_uploads,
             ),
         ]
         for name, doc, value in counters:
             yield CounterMetricFamily(name, doc, value=value)
-        if self._sweeper is not None:
-            yield CounterMetricFamily(
-                "millrace_poison_entries_purged_total",
-                "Quarantined (poison) entries deleted by the retention sweeper",
-                value=self._sweeper.purged_total,
-            )
+        dropped = CounterMetricFamily(
+            "millrace_records_dropped_total",
+            "Records dropped as malformed (consume or flush time), by reason",
+            labels=["reason"],
+        )
+        by_reason: dict[str, int] = dict(c.records_dropped)
+        for reason, count in f.records_dropped.items():
+            by_reason[reason] = by_reason.get(reason, 0) + count
+        for reason, count in sorted(by_reason.items()):
+            dropped.add_metric([reason], count)
+        yield dropped
+        reprepared = CounterMetricFamily(
+            "millrace_prepared_reprepared_total",
+            "prepared/ entries dropped and re-prepared from the staged rows, "
+            "by the refusal that forced it",
+            labels=["reason"],
+        )
+        for reason in REPREPARE_REASONS:
+            reprepared.add_metric([reason], f.reprepared.get(reason, 0))
+        yield reprepared
         if self._runner is not None:
             runner = self._runner  # narrowing survives the lambda below
             fenced = GaugeMetricFamily(
@@ -453,10 +361,16 @@ class _PipelineCollector:
         yield GaugeMetricFamily(
             "millrace_staged_rows", "Rows currently staged", value=gauges.staged_rows
         )
+        yield GaugeMetricFamily(
+            "millrace_staged_groups",
+            "Partition tuples (staging groups) currently holding staged rows, "
+            "summed over the pod's partitions",
+            value=gauges.staged_groups,
+        )
         per_partition_bytes = GaugeMetricFamily(
             "millrace_partition_staged_bytes",
             "Bytes currently staged, per assigned partition (cardinality "
-            "bounded by the pod's partition count, never by teams)",
+            "bounded by the pod's partition count, never by partition tuples)",
             labels=["topic", "partition"],
         )
         per_partition_age = GaugeMetricFamily(
@@ -538,8 +452,17 @@ async def _run(cfg: Config, hoglake_url: str, s3_kwargs: Mapping[str, Any]) -> i
                 io_workers=4 * cfg.flush_concurrency,
             ),
         )
+        # The consumer stages each record under the destination's
+        # partition tuple: its keyer is built from the shape the flusher
+        # just resolved (same pinned incarnation) and re-read on the
+        # flusher's TTL through its own Table handle.
         consumer = MillraceConsumer(
-            create_kafka_consumer(cfg), stages, cfg, now_us=_now_us
+            create_kafka_consumer(cfg),
+            stages,
+            cfg,
+            keyer=GroupKeyer(flusher.resolved_info),
+            shape=flusher.shape_reader(),
+            now_us=_now_us,
         )
         runner = FlushRunner(
             stages,
@@ -548,11 +471,6 @@ async def _run(cfg: Config, hoglake_url: str, s3_kwargs: Mapping[str, Any]) -> i
             now_us=_now_us,
             sweep_s=float(cfg.flush_sweep_s),
             concurrency=cfg.flush_concurrency,
-        )
-        sweeper = PoisonSweeper(
-            stages,
-            retention_s=cfg.poison.retention_s,
-            sweep_s=cfg.poison.sweep_s,
         )
         started = asyncio.Event()
         consumer_fenced = asyncio.Event()
@@ -583,12 +501,51 @@ async def _run(cfg: Config, hoglake_url: str, s3_kwargs: Mapping[str, Any]) -> i
                 stages,
                 asyncio.get_running_loop(),
                 runner=runner,
-                sweeper=sweeper,
                 gauge_max_staleness_s=2.0 * cfg.flush_sweep_s,
             )
         )
 
         loop = asyncio.get_running_loop()
+
+        if memdebug.interval_s(os.environ) > 0:
+
+            def _memdebug_probes() -> dict[str, Any]:
+                sizes = memdebug.container_sizes(
+                    consumer=consumer,
+                    flusher=flusher,
+                    runner=runner,
+                    stages=stages,
+                    client=client,
+                    table=getattr(flusher, "_table", None),
+                    http=getattr(client, "_http", None),
+                )
+                pool = getattr(
+                    getattr(getattr(client, "_http", None), "_transport", None),
+                    "_pool",
+                    None,
+                )
+                if pool is not None:
+                    sizes["http.pool.connections"] = len(
+                        getattr(pool, "_connections", ())
+                    )
+                for part in list(getattr(stages, "_stages", {}).values()):
+                    for k, v in memdebug.container_sizes(partition=part).items():
+                        sizes[k] = sizes.get(k, 0) + v
+                sizes["threads"] = threading.active_count()
+                sizes["asyncio.tasks"] = len(asyncio.all_tasks(loop))
+                sizes["loop._ready"] = len(getattr(loop, "_ready", ()))
+                sizes["loop._scheduled"] = len(getattr(loop, "_scheduled", ()))
+                executor = getattr(flusher, "_executor", None)
+                if executor is not None:
+                    sizes["flusher.executor.queue"] = executor._work_queue.qsize()
+                return {
+                    "sizes": sizes,
+                    "slatedb": memdebug.slatedb_totals(
+                        list(stages.metrics_recorders().values())
+                    ),
+                }
+
+            memdebug.start_reporter(os.environ, _memdebug_probes)
 
         def stop_all() -> None:
             # ONE handler per signal: add_signal_handler REPLACES any
@@ -596,7 +553,6 @@ async def _run(cfg: Config, hoglake_url: str, s3_kwargs: Mapping[str, Any]) -> i
             # stops separately would leave the consumer running forever.
             consumer.stop()
             runner.stop()
-            sweeper.stop()
 
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, stop_all)
@@ -614,14 +570,12 @@ async def _run(cfg: Config, hoglake_url: str, s3_kwargs: Mapping[str, Any]) -> i
 
         consumer_task = asyncio.create_task(consume_loop(), name="millrace-consumer")
         runner_task = asyncio.create_task(runner.run(), name="millrace-flush")
-        sweeper_task = asyncio.create_task(sweeper.run(), name="millrace-poison-sweep")
-        tasks = {consumer_task, runner_task, sweeper_task}
+        tasks = {consumer_task, runner_task}
         await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
         # A halt (or any task failure, or a clean consumer stop) ends the
         # process: stop both loops, then drain every task before leaving.
         consumer.stop()
         runner.stop()
-        sweeper.stop()
         outcomes = await asyncio.gather(*tasks, return_exceptions=True)
         for outcome in outcomes:
             if isinstance(outcome, ConsumerFencedError):
@@ -652,6 +606,7 @@ async def _run(cfg: Config, hoglake_url: str, s3_kwargs: Mapping[str, Any]) -> i
 
 
 def _main(env: Mapping[str, str]) -> int:
+    memdebug.start_tracing(env)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from millrace.keyspace import FlushedKey
+from millrace.keyspace import FlushedKey, PreparedRequest
 from millrace.stage import StagedRecord
 
 NOW = 1_800_000_000_000_000  # an arbitrary fixed staging instant, µs (≈ 2027-01-15)
@@ -32,10 +32,22 @@ def fast_flush_settings() -> Any:
     return s
 
 
+#: The field name tests label one-field tuples with (an identity(team_id)
+#: spec's display name).
+FIELDS = ("team_id",)
+
+
+def g(team: int) -> tuple[str | None, ...]:
+    """The one-field partition tuple an ``identity(team_id)`` spec gives
+    ``team`` — the staging group the stage tests key rows under."""
+    return (str(team),)
+
+
 def rec(team: int, ts: int, offset: int, payload: bytes | None = None) -> StagedRecord:
+    """A staged record of tuple ``g(team)`` at ``offset``. ``ts`` only
+    shapes the default payload text (records carry no timestamp)."""
     return StagedRecord(
-        team_id=team,
-        event_ts_us=ts,
+        group=g(team),
         offset=offset,
         payload=payload
         if payload is not None
@@ -44,9 +56,28 @@ def rec(team: int, ts: int, offset: int, payload: bytes | None = None) -> Staged
 
 
 def window(team: int, first: int, last: int) -> FlushedKey:
-    """The settlement window for the committed range (team, first..last)
-    — what ``commit_flushed`` / ``settle_quarantined`` delete."""
-    return FlushedKey(team, first, last)
+    """The settlement window for the committed range of tuple ``g(team)``
+    over ``first..last`` — what ``commit_flushed``
+    deletes."""
+    return FlushedKey(g(team), first, last, group_fields=FIELDS)
+
+
+def prepared(
+    key: str, *, team: int, first: int = 0, at: int = NOW, rows: int = 0
+) -> PreparedRequest:
+    """A persisted prepared request for tuple ``g(team)`` on events[0]."""
+    return PreparedRequest(
+        idempotency_key=key,
+        body=b"{}",
+        persisted_at=at,
+        topic="events",
+        partition=0,
+        group=g(team),
+        group_fields=FIELDS,
+        row_count=rows,
+        digest="0" * 64,
+        scanned_at=None,
+    )
 
 
 def legacy_marker_kv(team: int, first: int, last: int) -> tuple[bytes, bytes]:

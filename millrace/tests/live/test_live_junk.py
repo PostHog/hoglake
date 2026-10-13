@@ -1,10 +1,11 @@
-"""Scenario 5 (Phase 5): junk ``event_time`` is quarantined per policy.
+"""Scenario 5 (Phase 5): junk ``event_time`` is dropped per policy.
 
 Events whose PAYLOAD ``timestamp`` lies outside the configured window
 (here: 2027+, more than ``event_time_max_future_s`` ahead of now) are
-quarantined at flush time — the staged row is never mutated, the
-original payload lands in the partition's ``poison/`` prefix, and no
-future-dated partition value is ever registered with the server. Good
+dropped at flush time — the staged row is never mutated, the drop is
+counted under ``event_time_out_of_window`` and the row is deleted by its
+window's settlement, and no future-dated partition value is ever
+registered with the server. Good
 rows interleaved with the junk (same teams, same partitions) flush
 normally. The Kafka RECORD timestamp stays "now" throughout — the
 broker itself rejects records dated too far out, and the policy under
@@ -17,7 +18,6 @@ no-file case of the same rule).
 from __future__ import annotations
 
 import asyncio
-import json
 import time
 from collections import Counter
 
@@ -25,13 +25,15 @@ import livekit
 import pytest
 from livekit import now_us
 
+from millrace.coerce import load_json_object
+
 pytestmark = pytest.mark.live
 
 # 2027-06-01T00:00:00Z in micros — 235 days out, far past now+1d.
 JUNK_TS_US = 1_814_803_200_000_000
 
 
-async def test_junk_event_time_quarantined(
+async def test_junk_event_time_dropped(
     lake_home, topic_factory, producer_factory, admin
 ):
     table = lake_home.create_events_table()
@@ -75,8 +77,8 @@ async def test_junk_event_time_quarantined(
             90,
             desc="the 60 good events queryable",
         )
-        # Everything consumed and committed (junk included — the offset
-        # commit covers the quarantine exactly like a staged row).
+        # Everything consumed and committed (junk included — it staged
+        # like any row; only the flush drops it).
         ends = await asyncio.to_thread(
             livekit.end_offsets, admin, topic.name, range(topic.partitions)
         )
@@ -90,24 +92,52 @@ async def test_junk_event_time_quarantined(
             desc="committed offsets covering the junk",
         )
 
-        # The junk is settled out of staging into the quarantine —
-        # including the pure-junk team's commit-less settlement, which no
-        # lake-side condition can see. Wait for the quarantine itself.
-        async def poisoned() -> int:
+        # The junk is counted and settled out of staging — including the
+        # pure-junk team's commit-less settlement, which no lake-side
+        # condition can see. Wait for the counter and an empty stage.
+        assert pipe.flusher is not None
+        flusher = pipe.flusher
+
+        def dropped() -> int:
+            return flusher.stats().records_dropped.get("event_time_out_of_window", 0)
+
+        async def staged_rows() -> int:
             total = 0
             for p in range(topic.partitions):
-                total += len(await pipe.stages.stage(topic.name, p).scan_poison())
+                stats = await pipe.stages.stage(topic.name, p).iter_key_stats()
+                total += sum(s.row_count for s in stats)
             return total
 
         deadline = time.monotonic() + 90
         while time.monotonic() < deadline:
-            if await poisoned() == 15:
+            if dropped() == 15 and await staged_rows() == 0:
                 break
             await asyncio.sleep(0.25)
         else:
             raise AssertionError(
-                f"timed out waiting for 15 quarantined rows; got {await poisoned()}"
+                f"timed out waiting for 15 dropped rows and a drained stage; "
+                f"got {dropped()} dropped, {await staged_rows()} staged"
             )
+
+        # The junk tuples themselves hold no rows on any partition: the
+        # dropped rows were settled out with their windows.
+        keyer = pipe.consumer.keyer
+        junk_groups = {
+            keyer.group_for(
+                load_json_object(
+                    livekit.event_payload(
+                        junk_teams[i % len(junk_teams)], JUNK_TS_US + i, 60 + i
+                    )
+                )
+            )
+            for i in range(15)
+        }
+        assert len(junk_groups) == len(junk_teams)
+        for p in range(topic.partitions):
+            stage = pipe.stages.stage(topic.name, p)
+            for group in junk_groups:
+                rows = [rk async for rk, _ in stage.scan_group_rows(group)]
+                assert rows == [], f"junk group {group} still staged on partition {p}"
 
         # -- the assertions ------------------------------------------------
         counts = livekit.lake_team_counts(table, lake_home.head())
@@ -120,20 +150,5 @@ async def test_junk_event_time_quarantined(
             f"future-dated partitions registered: {months}"
         )
 
-        # The junk rows survive in the quarantine, byte-exact, with the
-        # flush-time reason.
-        junk_seqs = set()
-        reasons = Counter()
-        for p in range(topic.partitions):
-            stage = pipe.stages.stage(topic.name, p)
-            for entry in await stage.scan_poison():
-                reasons[entry.reason] += 1
-                if entry.reason == "event_time_out_of_window":
-                    assert entry.value is not None
-                    junk_seqs.add(json.loads(entry.value)["seq"])
-        assert reasons == Counter({"event_time_out_of_window": 15})
-        assert junk_seqs == set(range(60, 75))
-
-        # And the flusher counted them as quarantined.
-        assert pipe.flusher is not None
-        assert pipe.flusher.stats().records_quarantined == 15
+        # Every drop is the junk window's, and nothing else dropped.
+        assert flusher.stats().records_dropped == {"event_time_out_of_window": 15}

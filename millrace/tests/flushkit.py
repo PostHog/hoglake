@@ -18,31 +18,36 @@ The scripted endpoints, exactly the set the flusher may call:
 - ``POST /v1/catalogs/{c}/commit/prepared`` — the commit (scripted per
   call: a snapshot, a typed refusal, or a dropped connection);
 - ``GET /v1/catalogs/{c}/commit/receipts/{key}`` — the receipt lookup
-  (200 with the receipt, or 404).
+  (200 with the receipt, or 404), served by ONE :class:`ReceiptServer`
+  per test: a key scripted with :func:`script_receipt` answers its
+  scripted responses in order, any other key answers 404 (a window
+  that never landed — every fresh build looks its key up before it
+  builds) and every lookup is recorded.
 
 pytest-httpx fails a test at teardown for registered-but-unconsumed
 responses, so the scriptors below register exactly what a correct
 flusher consumes — a superfluous request reddens the test as surely as
-a missing one.
+a missing one (receipts: the suite's autouse fixture asserts every
+scripted receipt was consumed).
 """
 
 from __future__ import annotations
 
 import io
 import json
+import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
 import pyarrow as pa
+from stagekit import NOW
 
 from millrace import keyspace
 from millrace.config import (
     AssignmentMode,
     Config,
     EventTimePolicy,
-    PoisonConfig,
-    TeamKeyCodec,
 )
 from millrace.stage import PartitionStage
 
@@ -182,28 +187,75 @@ def script_table_refresh(
     )
 
 
-def script_receipt(
-    httpx_mock: Any, idempotency_key: str, *, snapshot_id: int | None
-) -> None:
-    """A receipt lookup: 404 (never landed) when ``snapshot_id`` is None,
-    else the durable 200 receipt."""
-    if snapshot_id is None:
-        httpx_mock.add_response(
+class ReceiptServer:
+    """The scripted ``GET .../commit/receipts/{key}``: one reusable
+    registration for every key (pytest-httpx prefers the first
+    never-matched registration, so per-key registrations would shadow a
+    catch-all). A key scripted with :meth:`script` answers its scripted
+    steps in order; any other lookup answers 404 — the receipt of a
+    window that never landed, which every fresh build asks for before
+    it builds. ``lookups`` records every key asked for, in order."""
+
+    def __init__(self, httpx_mock: Any) -> None:
+        self._scripted: dict[str, list[Any]] = {}
+        self.lookups: list[str] = []
+        httpx_mock.add_callback(
+            self._answer,
             method="GET",
-            url=f"{RECEIPTS_URL}/{idempotency_key}",
-            status_code=404,
-            json={"error": "not_found", "detail": "no receipt for that key"},
+            url=re.compile(re.escape(RECEIPTS_URL) + "/.+"),
+            is_reusable=True,
+            is_optional=True,
         )
-    else:
-        httpx_mock.add_response(
-            method="GET",
-            url=f"{RECEIPTS_URL}/{idempotency_key}",
+
+    def script(self, idempotency_key: str, snapshot_id: Any) -> None:
+        """One scripted answer: a snapshot id (200), None (404), an
+        ``httpx.Response`` (answered as is) or an ``httpx.HTTPError``
+        (raised: a transport failure)."""
+        self._scripted.setdefault(idempotency_key, []).append(snapshot_id)
+
+    def unconsumed(self) -> dict[str, list[Any]]:
+        return {k: v for k, v in self._scripted.items() if v}
+
+    def _answer(self, request: httpx.Request) -> httpx.Response:
+        key = request.url.path.rsplit("/", 1)[-1]
+        self.lookups.append(key)
+        queue = self._scripted.get(key)
+        snapshot_id = queue.pop(0) if queue else None
+        if isinstance(snapshot_id, httpx.Response):
+            return snapshot_id
+        if isinstance(snapshot_id, httpx.HTTPError):
+            raise snapshot_id
+        if snapshot_id is None:
+            return httpx.Response(
+                404, json={"error": "not_found", "detail": "no receipt for that key"}
+            )
+        return httpx.Response(
+            200,
             json={
-                "operation_id": idempotency_key,
+                "operation_id": key,
                 "snapshot_id": snapshot_id,
                 "schema_version": SCHEMA_VERSION,
             },
         )
+
+
+def receipt_server(httpx_mock: Any) -> ReceiptServer:
+    """The test's one :class:`ReceiptServer` (created on first use and
+    kept on the test's ``httpx_mock``)."""
+    server = getattr(httpx_mock, "_millrace_receipts", None)
+    if server is None:
+        server = ReceiptServer(httpx_mock)
+        httpx_mock._millrace_receipts = server
+    return server
+
+
+def script_receipt(
+    httpx_mock: Any, idempotency_key: str, *, snapshot_id: int | None
+) -> None:
+    """A receipt lookup: 404 (never landed) when ``snapshot_id`` is None,
+    else the durable 200 receipt. Consumed in order per key; a key
+    asked for past its script answers 404."""
+    receipt_server(httpx_mock).script(idempotency_key, snapshot_id)
 
 
 class CommitCapture:
@@ -347,7 +399,6 @@ def make_config(**overrides: Any) -> Config:
         "kafka_group_id": "millrace-events",
         "assignment_mode": AssignmentMode.STATIC,
         "static_partitions": (0,),
-        "team_key_codec": TeamKeyCodec.UTF8_DECIMAL,
         "catalog": CATALOG,
         "namespace": NAMESPACE,
         "table": TABLE,
@@ -358,10 +409,9 @@ def make_config(**overrides: Any) -> Config:
         "slow_lane_deadline_s": 21600,
         "min_flush_bytes": 1024 * 1024,
         "max_files_per_commit": 512,
-        "poison": PoisonConfig(max_records_per_run=1000, value_max_bytes=1 << 20),
         "consume_batch_size": 100,
         "poll_timeout_ms": 50,
-        "event_time_policy": EventTimePolicy.QUARANTINE,
+        "event_time_policy": EventTimePolicy.DROP,
         "metrics_port": 8000,
     }
     return Config(**{**base, **overrides})
@@ -385,18 +435,38 @@ def month_wire(ts_us: int) -> str:
     return str((day.year - 1970) * 12 + (day.month - 1))
 
 
+#: hoglake's display names for the default spec's fields
+#: (``identity(team_id), month(timestamp)`` — ``grouping.field_names``).
+SPEC_FIELDS: tuple[str, ...] = ("team_id", "timestamp_month")
+
+
+def team_group(team: int, ts_us: int = NOW) -> tuple[str | None, ...]:
+    """The partition tuple the default spec gives a team's row at
+    ``ts_us`` (``NOW`` — the suite's January): the staging group the
+    flush tests stage and decide under, computed independently of the
+    keyer."""
+    return (str(team), month_wire(ts_us))
+
+
+def team_label(team: int, ts_us: int = NOW) -> str:
+    """The human form of :func:`team_group` (``team_id=7/timestamp_month=…``)."""
+    return f"team_id={team}/timestamp_month={month_wire(ts_us)}"
+
+
 def decision(
-    team_id: int,
+    group: int | tuple[str | None, ...],
     *,
     trigger: str = "size",
     staged_bytes: int = 1,
     first_staged_ts: int,
     age_us: int = 0,
 ) -> Any:
+    """One planner decision; an int names the team's default-spec group
+    (:func:`team_group`)."""
     from millrace.planner import FlushDecision
 
     return FlushDecision(
-        team_id=team_id,
+        group=team_group(group) if isinstance(group, int) else group,
         trigger=trigger,  # type: ignore[arg-type]
         staged_bytes=staged_bytes,
         first_staged_ts=first_staged_ts,

@@ -44,11 +44,10 @@ from millrace.config import (
     AutoOffsetReset,
     Config,
     EventTimePolicy,
-    PoisonConfig,
-    TeamKeyCodec,
 )
 from millrace.consumer import MillraceConsumer, create_kafka_consumer
 from millrace.flush import FlushRunner, HoglakeFlusher
+from millrace.grouping import GroupKeyer
 from millrace.stage import StageManager
 
 # ---------------------------------------------------------------------------
@@ -126,6 +125,87 @@ def create_events_table(namespace: Any, name: str) -> Any:
         ]
     )
     return table
+
+
+def nested_events_schema() -> pa.Schema:
+    """A destination with nested columns and a json column: the partition
+    and sort sources are struct leaves (``properties.team_id``,
+    ``properties.ts``), beside a list and a map in the same struct."""
+    return pa.schema(
+        [
+            pa.field("seq", pa.int64(), nullable=False),
+            pa.field("event", pa.string(), nullable=True),
+            pa.field(
+                "properties",
+                pa.struct(
+                    [
+                        pa.field("team_id", pa.int64(), nullable=True),
+                        pa.field("ts", pa.timestamp("us", tz="UTC"), nullable=True),
+                        pa.field("tags", pa.list_(pa.string()), nullable=True),
+                        pa.field(
+                            "attrs", pa.map_(pa.string(), pa.string()), nullable=True
+                        ),
+                    ]
+                ),
+                nullable=True,
+            ),
+            pa.field("doc", pa.json_(), nullable=True),
+        ]
+    )
+
+
+def create_nested_events_table(namespace: Any, name: str) -> Any:
+    """Create the nested table, then (in one alter, after the create
+    read-back binds field ids) set the spec ``identity(properties.team_id),
+    month(properties.ts)`` and the sort order ``properties.ts`` asc."""
+    table = namespace.create_table(name, nested_events_schema())
+    (properties,) = [c for c in table.columns if c.name == "properties"]
+    assert properties.children is not None
+    leaf = {c.name: c.field_id for c in properties.children}
+    table.alter(
+        [
+            ops.set_partition_spec(
+                [
+                    ops.partition_field(leaf["team_id"], "identity"),
+                    ops.partition_field(leaf["ts"], "month"),
+                ]
+            ),
+            ops.AlterOp(
+                "set_sort_order",
+                {
+                    "sort_fields": [
+                        {
+                            "source_field_id": leaf["ts"],
+                            "direction": "asc",
+                            "null_order": "nulls_first",
+                        }
+                    ]
+                },
+            ),
+        ]
+    )
+    return table
+
+
+def nested_doc(team_id: int, ts_us: int, seq: int) -> dict[str, Any]:
+    """The nested payload as a dict (the readback's expectation): the
+    struct's two partition/sort leaves, a list, a map, and a json value
+    holding an object, an array and a null."""
+    return {
+        "seq": seq,
+        "event": f"nested-{seq}",
+        "properties": {
+            "team_id": team_id,
+            "ts": ts_us,
+            "tags": [f"t{seq % 3}", "all"],
+            "attrs": {"seq": str(seq), "team": str(team_id)},
+        },
+        "doc": {"seq": seq, "path": ["a", seq], "none": None},
+    }
+
+
+def nested_payload(team_id: int, ts_us: int, seq: int) -> bytes:
+    return json.dumps(nested_doc(team_id, ts_us, seq), separators=(",", ":")).encode()
 
 
 def _pad_fill(n: int, team_id: int, ts_us: int, seq: int) -> str:
@@ -230,13 +310,17 @@ class EventProducer:
         pad_bytes: int = 0,
         record_ts_us: int | None = None,
         extra: dict[str, Any] | None = None,
+        value: bytes | None = None,
+        tombstone: bool = False,
     ) -> None:
         """Queue one event; the Kafka record timestamp tracks the event
         time (ms) so row keys order like the payloads. ``record_ts_us``
         overrides the record timestamp (junk event_time scenarios keep
         the RECORD timestamp sane — the broker rejects records too far
         out — while the PAYLOAD carries the junk date). ``extra`` adds
-        raw payload keys (a column added mid-test)."""
+        raw payload keys (a column added mid-test); ``value`` replaces the
+        events payload outright (the nested scenario); ``tombstone``
+        produces a null value (the consume-time ``missing_value`` drop)."""
         with self._lock:
             self._pending[seq] = (team_id, ts_us, time.monotonic())
 
@@ -260,7 +344,11 @@ class EventProducer:
         self._producer.produce(
             self.topic,
             key=str(team_id).encode(),
-            value=event_payload(team_id, ts_us, seq, pad_bytes=pad_bytes, extra=extra),
+            value=None
+            if tombstone
+            else value
+            if value is not None
+            else event_payload(team_id, ts_us, seq, pad_bytes=pad_bytes, extra=extra),
             timestamp=(ts_us if record_ts_us is None else record_ts_us) // 1000,
             on_delivery=on_delivery,
         )
@@ -376,6 +464,31 @@ def lake_team_counts(table: Any, snapshot: int) -> Counter[int]:
     return counts
 
 
+def lake_tuple_counts(table: Any, snapshot: int) -> Counter[tuple[str | None, ...]]:
+    """Row counts per FULL partition tuple, from the manifest alone (any
+    spec: no position of ``partition_values`` is assumed to be a team)."""
+    counts: Counter[tuple[str | None, ...]] = Counter()
+    for f in lake_files(table, snapshot):
+        assert f.partition_values is not None
+        counts[tuple(f.partition_values)] += f.record_count
+    return counts
+
+
+def lake_rows_by_tuple(
+    table: Any, snapshot: int, fs: Any
+) -> dict[tuple[str | None, ...], list[pa.Table]]:
+    """Parquet readback of every live file, keyed by the file's full
+    ``partition_values`` tuple — one table per file, in manifest order."""
+    out: dict[tuple[str | None, ...], list[pa.Table]] = {}
+    for f in lake_files(table, snapshot):
+        assert f.partition_values is not None
+        key = f.path[len("s3://") :]
+        out.setdefault(tuple(f.partition_values), []).append(
+            pq.read_table(key, filesystem=fs)
+        )
+    return out
+
+
 def lake_rows(table: Any, snapshot: int, fs: Any) -> pa.Table:
     """Full parquet readback of every live file (the queryable truth)."""
     tables = []
@@ -387,6 +500,29 @@ def lake_rows(table: Any, snapshot: int, fs: Any) -> pa.Table:
             {name: pa.array([], type=field.type) for name, field in []},
         )
     return pa.concat_tables(tables)
+
+
+def lake_seq_counts(
+    table: Any, snapshot: int, fs: Any, *, workers: int = 16
+) -> Counter[int]:
+    """How many times each ``seq`` is queryable: a parquet readback of
+    the ``seq`` column alone over every live file (both destination
+    schemas carry ``seq`` top-level), files read in parallel. A count
+    above 1 is a duplicate row; a missing seq is a lost one."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(path: str) -> list[int]:
+        column = pq.read_table(
+            path[len("s3://") :], columns=["seq"], filesystem=fs
+        ).column("seq")
+        return [int(v) for v in column.to_pylist() if v is not None]
+
+    counts: Counter[int] = Counter()
+    paths = [f.path for f in lake_files(table, snapshot)]
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for seqs in pool.map(one, paths):
+            counts.update(seqs)
+    return counts
 
 
 def lake_month_partitions(table: Any, snapshot: int) -> set[str]:
@@ -499,7 +635,7 @@ def live_config(
     # below any production floor — the harness drops the age lane's
     # minimum size to 1 so the deadline alone decides.
     min_flush_bytes: int = 1,
-    event_time_policy: EventTimePolicy = EventTimePolicy.QUARANTINE,
+    event_time_policy: EventTimePolicy = EventTimePolicy.DROP,
     event_time_max_future_s: int = 86400,
     event_time_max_past_s: int = 30 * 86400,
     assignment: AssignmentMode = AssignmentMode.STATIC,
@@ -518,7 +654,6 @@ def live_config(
         # The suite produces-then-consumes with a fresh group per test;
         # production's default is LATEST (fleet policy — see config.py).
         kafka_auto_offset_reset=AutoOffsetReset.EARLIEST,
-        team_key_codec=TeamKeyCodec.UTF8_DECIMAL,
         catalog=catalog,
         namespace=namespace,
         table=table,
@@ -529,7 +664,6 @@ def live_config(
         slow_lane_deadline_s=slow_lane_deadline_s,
         min_flush_bytes=min_flush_bytes,
         max_files_per_commit=512,
-        poison=PoisonConfig(max_records_per_run=1000, value_max_bytes=1 << 20),
         consume_batch_size=500,
         poll_timeout_ms=100,
         event_time_policy=event_time_policy,
@@ -613,8 +747,15 @@ class Pipeline:
                 io_workers=4 * cfg.flush_concurrency,
             ),
         )
+        # main.py's wiring: the keyer comes from the resolved shape and
+        # re-reads on the flusher's TTL.
         consumer = MillraceConsumer(
-            create_kafka_consumer(cfg), self.stages, cfg, now_us=now_us
+            create_kafka_consumer(cfg),
+            self.stages,
+            cfg,
+            keyer=GroupKeyer(self.flusher.resolved_info),
+            shape=self.flusher.shape_reader(),
+            now_us=now_us,
         )
         self.consumer = consumer
         self.runner = FlushRunner(
@@ -709,6 +850,12 @@ class Child:
         with self._lock:
             return "\n".join(self.lines)
 
+    def lines_since(self, index: int) -> tuple[list[str], int]:
+        """The output lines from ``index`` on, and the next index (a
+        tail cursor for a long-running scenario)."""
+        with self._lock:
+            return self.lines[index:], len(self.lines)
+
     def wait_for_log(self, needle: str, timeout_s: float) -> None:
         wait_until(
             lambda: needle in self.output(),
@@ -773,10 +920,6 @@ def child_env(
             # default is `latest` (fleet policy — see config.py). The
             # pipeline under test is identical either way.
             "MILLRACE_KAFKA_AUTO_OFFSET_RESET": cfg.kafka_auto_offset_reset.value,
-            # The FULL codec spec — value-json carries its payload field
-            # inline (value-json:<field>); the bare enum value is refused
-            # at boot. The property is the parser's inverse (config.py).
-            "MILLRACE_TEAM_KEY_CODEC": cfg.team_key_codec_env,
             "MILLRACE_CATALOG": cfg.catalog,
             "MILLRACE_NAMESPACE": cfg.namespace,
             "MILLRACE_TABLE": cfg.table,
@@ -807,6 +950,92 @@ def child_env(
     if extra:
         env.update(extra)
     return env
+
+
+MetricSamples = dict[tuple[str, tuple[tuple[str, str], ...]], float]
+"""A parsed /metrics scrape: (sample name, sorted label pairs) → value."""
+
+
+def scrape_metrics(port: int, *, timeout_s: float = 5.0) -> MetricSamples:
+    """GET a child's ``/metrics`` and parse the Prometheus text
+    exposition (prometheus_client's own parser — the format the child
+    serves). Sample names are the exposed ones (a counter's ``_total``
+    included). Raises on a transport error or a non-200."""
+    import httpx
+    from prometheus_client.parser import text_string_to_metric_families
+
+    r = httpx.get(f"http://127.0.0.1:{port}/metrics", timeout=timeout_s)
+    r.raise_for_status()
+    out: MetricSamples = {}
+    for family in text_string_to_metric_families(r.text):
+        for sample in family.samples:
+            out[(sample.name, tuple(sorted(sample.labels.items())))] = float(
+                sample.value
+            )
+    return out
+
+
+def metric(samples: MetricSamples, name: str, **labels: str) -> float | None:
+    """One sample's value (None when the series is absent — e.g. the
+    oldest-eligible gauge with nothing eligible)."""
+    return samples.get((name, tuple(sorted(labels.items()))))
+
+
+def metric_by_label(samples: MetricSamples, name: str, label: str) -> dict[str, float]:
+    """Every series of ``name`` keyed by one label's value."""
+    out: dict[str, float] = {}
+    for (sample_name, pairs), value in samples.items():
+        if sample_name != name:
+            continue
+        for key, label_value in pairs:
+            if key == label:
+                out[label_value] = value
+    return out
+
+
+def probe_status(port: int, path: str, *, timeout_s: float = 2.0) -> int | None:
+    """The HTTP status of a child's probe (``/healthz`` or ``/readyz``);
+    None when nothing answers."""
+    import httpx
+
+    try:
+        return httpx.get(
+            f"http://127.0.0.1:{port}{path}", timeout=timeout_s
+        ).status_code
+    except Exception:  # noqa: BLE001 - "no answer" is the observation
+        return None
+
+
+def process_rss_bytes(pid: int) -> int | None:
+    """Resident set size of a process: psutil when installed, else
+    ``/proc/<pid>/status`` (Linux), else ``ps -o rss=`` (macOS/BSD);
+    None when none of them can say (the process is gone)."""
+    try:
+        import psutil  # type: ignore[import-not-found]
+
+        return int(psutil.Process(pid).memory_info().rss)
+    except ImportError:
+        pass
+    except Exception:  # noqa: BLE001 - a vanished pid
+        return None
+    try:
+        with open(f"/proc/{pid}/status") as status:
+            for line in status:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "rss=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        ).stdout.strip()
+        return int(out) * 1024 if out else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
 
 
 def free_port() -> int:

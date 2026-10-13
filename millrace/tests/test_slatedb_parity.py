@@ -16,6 +16,7 @@ fencing on a contested open.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -334,6 +335,43 @@ async def test_writer_fencing_on_contested_open_file(tmp_path):
     await _probe_fencing(
         ObjectStore.resolve("file:///"), ObjectStore.resolve("file:///"), path
     )
+
+
+@pytest.mark.component
+async def test_a_single_put_batch_fences_and_an_empty_batch_is_refused():
+    """The consumer's fence probe (``PartitionStage.probe_fence``) rests on
+    two 0.17.x facts:
+
+    - a ``WriteBatch`` holding ONE put, written by a fenced writer, fails
+      with ``Error.Closed(reason=FENCED)`` no later than its handle's
+      ``await_durable`` — the same detection a staged batch gets;
+    - an EMPTY ``WriteBatch`` is refused outright (``Error.Invalid``,
+      "empty write batch not allowed") whatever the writer's state, so
+      the probe cannot be an empty batch: it must put a key.
+    """
+    store = ObjectStore.resolve("memory:///")
+    old = await DbBuilder("parity/probe", store).build()
+    await old.put(b"rows/x", b"1")
+    await old.flush()
+
+    with pytest.raises(SlateError.Invalid, match="empty write batch"):
+        await old.write(WriteBatch())
+
+    new = await DbBuilder("parity/probe", store).build()
+    try:
+        batch = WriteBatch()
+        batch.put(b"meta/fence", b"\x01" + b"\x00" * 8)
+        with pytest.raises(SlateError.Closed) as excinfo:
+            handle = await old.write(batch)
+            await handle.await_durable()
+        assert excinfo.value.reason == CloseReason.FENCED
+        # nothing the fenced probe wrote lands for the new owner
+        assert await new.get(b"meta/fence") is None
+        assert await new.get(b"rows/x") == b"1"
+    finally:
+        await new.shutdown()
+        with contextlib.suppress(SlateError.Closed):
+            await old.shutdown()
 
 
 @pytest.mark.component

@@ -6,7 +6,7 @@ NON-GATING: the ``bench`` marker is deselected from default runs
 
     uv run pytest --bench tests/test_flush_bench.py -s
 
-Shape: 1024 ready keys (256 teams x 4 partition stages, 2 rows each) on
+Shape: 1024 ready keys (256 groups x 4 partition stages, 2 rows each) on
 ``memory:///`` stages, a scripted pyhoglake double (pytest-httpx, the
 flush suite's flushkit) and the fake object store. One
 :meth:`FlushRunner.run_once` is the unit of measurement — per-partition
@@ -38,6 +38,7 @@ from flushkit import (
     commit_ok,
     event_payload,
     make_config,
+    receipt_server,
     script_bootstrap,
     script_options,
 )
@@ -64,8 +65,7 @@ async def _stage_all(manager: StageManager, clock: Any) -> None:
                 offset = i * ROWS_PER_TEAM + j
                 records.append(
                     StagedRecord(
-                        team_id=team,
-                        event_ts_us=NOW + offset,
+                        group=(str(team),),
                         offset=offset,
                         payload=event_payload(team, NOW + offset),
                     )
@@ -82,6 +82,9 @@ def _make_flusher(httpx_mock: Any, store: FakeObjectStore, io_workers: int) -> A
 
     script_bootstrap(httpx_mock)
     script_options(httpx_mock)
+    # Every fresh build asks for its window's receipt before building;
+    # none of these windows ever landed, so the catch-all answers 404.
+    receipt_server(httpx_mock)
     client = HoglakeClient("http://hog.test")
     client.s3 = store
     return HoglakeFlusher.resolve(

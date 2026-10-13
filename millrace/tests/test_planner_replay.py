@@ -200,7 +200,8 @@ def _simulate() -> ReplayResult:
         st_, fi, la, ro = staged[name], first[name], last[name], rows[name]
         snapshot = [
             KeyStats(
-                team_id=k,
+                # identity(team_id): the tenant's partition tuple
+                group=(str(k),),
                 staged_bytes=st_[k],
                 first_staged_ts=fi[k],
                 last_staged_ts=la[k],
@@ -228,7 +229,7 @@ def _simulate() -> ReplayResult:
                     <= d.age_us
                     < (SLOW_LANE_DEADLINE_S + TICK_S) * US
                 )
-            team = d.team_id
+            team = int(d.group[0] or 0)
             if name == "after":
                 if team in result.top_tier:
                     result.top_tier[team].append(d)

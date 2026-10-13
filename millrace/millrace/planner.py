@@ -61,9 +61,10 @@ Ordering
 --------
 
 Decisions are ordered oldest ``first_staged_ts`` first, tie-broken by
-``team_id``. The sort is total (a snapshot holds at most one entry per
-team; a duplicate is refused), so the output is a deterministic
-function of the snapshot regardless of its iteration order.
+the partition tuple's staging-key bytes (``keyspace.encode_group``). The
+sort is total (a snapshot holds at most one entry per tuple; a duplicate
+is refused), so the output is a deterministic function of the snapshot
+regardless of its iteration order.
 
 The policy seam
 ---------------
@@ -86,6 +87,8 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Final, Literal, Protocol, runtime_checkable
+
+from .keyspace import PartitionTuple, encode_group
 
 FlushTrigger = Literal["size", "age", "slow"]
 
@@ -123,15 +126,19 @@ MAX_FILES_PER_COMMIT_DEFAULT: Final = 512
 
 @dataclass(frozen=True, slots=True)
 class KeyStats:
-    """One team's staged-state snapshot (a decoded ``stats/`` value plus
-    the team_id from its key).
+    """One hoglake partition tuple's staged rows, as a snapshot: a
+    decoded ``stats/`` value (``staged_bytes`` payload bytes over
+    ``row_count`` rows) plus the tuple from its key (``group`` — the
+    wire strings of the destination's partition values, one per live
+    spec field at staging time).
 
     ``first_staged_ts`` / ``last_staged_ts`` are microseconds since the
-    Unix epoch. ``first_staged_ts`` is set when the key's first row is
-    staged after the key stood empty and is NEVER advanced by later
-    arrivals — the stage writer (Phase 2) enforces that, the age
-    trigger and the tail's freshness SLA rely on it, and the replay
-    suite pins it. ``last_staged_ts`` is informational; no trigger
+    Unix epoch. ``first_staged_ts`` bounds the staging time of the
+    key's oldest staged row from below: it is set when the key's first
+    row is staged after the key stood empty, is NEVER advanced by later
+    arrivals, and a settle that leaves rows lifts it to the settled
+    scan's start (stage.py) — the age trigger and the tail's freshness
+    SLA rely on both, and the replay suite pins the first. ``last_staged_ts`` is informational; no trigger
     reads it.
 
     The planner trusts the snapshot: these values come from the
@@ -139,7 +146,7 @@ class KeyStats:
     (``keyspace.decode_stats_value``).
     """
 
-    team_id: int
+    group: PartitionTuple
     staged_bytes: int
     first_staged_ts: int
     last_staged_ts: int
@@ -186,14 +193,14 @@ class PlannerKnobs:
 
 @dataclass(frozen=True, slots=True)
 class FlushDecision:
-    """One key chosen for flush this pass.
+    """One partition tuple's staged rows chosen for flush this pass.
 
     ``age_us`` is ``now_us - first_staged_ts`` at plan time — how long
     the key's oldest staged byte had waited when the sweep decided it;
     negative only under clock skew in the snapshot.
     """
 
-    team_id: int
+    group: PartitionTuple
     trigger: FlushTrigger
     staged_bytes: int
     first_staged_ts: int
@@ -247,7 +254,7 @@ class ThreeLanePolicy(FlushPolicy):
         else:
             return None
         return FlushDecision(
-            team_id=key.team_id,
+            group=key.group,
             trigger=trigger,
             staged_bytes=key.staged_bytes,
             first_staged_ts=key.first_staged_ts,
@@ -298,7 +305,7 @@ def plan_flush(
     policy: FlushPolicy = DEFAULT_POLICY,
 ) -> list[FlushDecision]:
     """Choose which keys flush this sweep, ordered oldest
-    ``first_staged_ts`` first (tie-break: ``team_id``).
+    ``first_staged_ts`` first (tie-break: the tuple's key bytes).
 
     ``estimated_compression_ratio`` is the observed parquet-bytes ÷
     staged-bytes fraction (an EWMA over this table's completed flushes
@@ -307,19 +314,19 @@ def plan_flush(
     fail the sweep loudly, not skew a day of sizing decisions.
 
     Deterministic: the output depends only on the snapshot's contents,
-    not its iteration order. A snapshot naming one team twice is
+    not its iteration order. A snapshot naming one tuple twice is
     refused — two entries for one key would decide the key twice,
     breaking the one-trigger-per-key rule downstream.
     """
     _check_ratio(estimated_compression_ratio)
     decisions: list[FlushDecision] = []
-    seen: set[int] = set()
+    seen: set[PartitionTuple] = set()
     for key in stats:
-        if key.team_id in seen:
-            raise ValueError(f"duplicate stats entry for team_id {key.team_id}")
-        seen.add(key.team_id)
+        if key.group in seen:
+            raise ValueError(f"duplicate stats entry for partition tuple {key.group}")
+        seen.add(key.group)
         decision = policy.decide(key, now_us, knobs, estimated_compression_ratio)
         if decision is not None:
             decisions.append(decision)
-    decisions.sort(key=lambda d: (d.first_staged_ts, d.team_id))
+    decisions.sort(key=lambda d: (d.first_staged_ts, encode_group(d.group)))
     return decisions

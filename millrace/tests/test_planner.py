@@ -13,6 +13,7 @@ size lane are exact and "one byte each side" means one byte.
 from hypothesis import assume, given
 from hypothesis import strategies as st
 
+from millrace.keyspace import encode_group
 from millrace.planner import (
     DEFAULT_COMPRESSION_RATIO,
     DEFAULT_POLICY,
@@ -46,10 +47,16 @@ KNOBS = PlannerKnobs(
 )
 
 
-def key(team_id: int, *, staged: int, age_us: int, rows: int = 1) -> KeyStats:
-    """A key whose oldest staged byte is exactly ``age_us`` old at NOW_US."""
+def g(n: int) -> tuple[str | None, ...]:
+    """A one-field partition tuple (an ``identity(team_id)`` spec's)."""
+    return (str(n),)
+
+
+def key(n: int, *, staged: int, age_us: int, rows: int = 1) -> KeyStats:
+    """A key (partition tuple ``g(n)``) whose oldest staged byte is
+    exactly ``age_us`` old at NOW_US."""
     return KeyStats(
-        team_id=team_id,
+        group=g(n),
         staged_bytes=staged,
         first_staged_ts=NOW_US - age_us,
         last_staged_ts=NOW_US,
@@ -292,7 +299,7 @@ def test_age_trigger_reads_first_staged_ts_never_last_staged_ts():
     # by later arrivals (KeyStats docstring; enforced by the stage
     # writer in Phase 2, relied on here).
     k = KeyStats(
-        team_id=1,
+        group=g(1),
         staged_bytes=MIN_BYTES,
         first_staged_ts=NOW_US - (FLUSH_S + 1) * US,
         last_staged_ts=NOW_US - US,
@@ -302,7 +309,7 @@ def test_age_trigger_reads_first_staged_ts_never_last_staged_ts():
     assert d is not None and d.trigger == "age"
 
 
-def test_decision_carries_age_bytes_and_team():
+def test_decision_carries_age_bytes_and_group():
     d = decide_key(
         key(7, staged=2 * TARGET, age_us=42 * US),
         NOW_US,
@@ -310,7 +317,7 @@ def test_decision_carries_age_bytes_and_team():
         estimated_compression_ratio=RATIO,
     )
     assert d == FlushDecision(
-        team_id=7,
+        group=g(7),
         trigger="size",
         staged_bytes=2 * TARGET,
         first_staged_ts=NOW_US - 42 * US,
@@ -364,7 +371,7 @@ class _RecordingPolicy:
     "size", and records the arguments it was handed."""
 
     def __init__(self) -> None:
-        self.seen: list[tuple[int, int, PlannerKnobs, float]] = []
+        self.seen: list[tuple[tuple[str | None, ...], int, PlannerKnobs, float]] = []
 
     def decide(
         self,
@@ -373,9 +380,9 @@ class _RecordingPolicy:
         knobs: PlannerKnobs,
         estimated_compression_ratio: float,
     ) -> FlushDecision | None:
-        self.seen.append((key.team_id, now_us, knobs, estimated_compression_ratio))
+        self.seen.append((key.group, now_us, knobs, estimated_compression_ratio))
         return FlushDecision(
-            team_id=key.team_id,
+            group=key.group,
             trigger="size",
             staged_bytes=key.staged_bytes,
             first_staged_ts=key.first_staged_ts,
@@ -396,10 +403,10 @@ def test_plan_flush_dispatches_through_the_given_policy():
     # Every key was routed through the policy with the planner's
     # arguments, and the policy's decisions came back ordered.
     assert policy.seen == [
-        (2, NOW_US, KNOBS, 0.125),
-        (1, NOW_US, KNOBS, 0.125),
+        (g(2), NOW_US, KNOBS, 0.125),
+        (g(1), NOW_US, KNOBS, 0.125),
     ]
-    assert [d.team_id for d in decisions] == [1, 2]
+    assert [d.group for d in decisions] == [g(1), g(2)]
     assert all(d.trigger == "size" for d in decisions)
 
 
@@ -408,7 +415,7 @@ def test_decide_key_dispatches_through_the_given_policy():
     k = key(5, staged=1, age_us=US)
     d = decide_key(k, NOW_US, KNOBS, estimated_compression_ratio=0.75, policy=policy)
     assert d is not None and d.trigger == "size"
-    assert policy.seen == [(5, NOW_US, KNOBS, 0.75)]
+    assert policy.seen == [(g(5), NOW_US, KNOBS, 0.75)]
 
 
 def test_the_default_policy_is_the_three_lane_policy():
@@ -433,14 +440,14 @@ def test_a_snapshot_with_nothing_ready_decides_nothing():
     assert plan_flush(stats, NOW_US, KNOBS) == []
 
 
-def test_duplicate_team_ids_are_refused():
+def test_duplicate_groups_are_refused():
     stats = [key(1, staged=1, age_us=US), key(1, staged=2, age_us=2 * US)]
     try:
         plan_flush(stats, NOW_US, KNOBS)
     except ValueError as e:
-        assert "team_id 1" in str(e)
+        assert "partition tuple ('1',)" in str(e)
     else:  # pragma: no cover - the raise is the assertion
-        raise AssertionError("duplicate team_id accepted")
+        raise AssertionError("duplicate group accepted")
 
 
 def test_decisions_are_ordered_oldest_first_staged_ts_first():
@@ -449,17 +456,25 @@ def test_decisions_are_ordered_oldest_first_staged_ts_first():
     mid = key(3, staged=MIN_BYTES, age_us=(FLUSH_S + 50) * US)  # age
     for order in ([young, old, mid], [mid, young, old], [old, mid, young]):
         decisions = plan_flush(order, NOW_US, KNOBS, estimated_compression_ratio=RATIO)
-        assert [d.team_id for d in decisions] == [2, 3, 1]
+        assert [d.group for d in decisions] == [g(2), g(3), g(1)]
         assert [d.trigger for d in decisions] == ["slow", "age", "size"]
 
 
-def test_decision_ordering_ties_break_by_team_id():
+def test_decision_ordering_ties_break_by_the_groups_key_bytes():
     same_age = (FLUSH_S + 1) * US
     stats = [
+        key(10, staged=MIN_BYTES, age_us=same_age),
         key(9, staged=MIN_BYTES, age_us=same_age),
         key(3, staged=MIN_BYTES, age_us=same_age),
+        KeyStats((None,), MIN_BYTES, NOW_US - same_age, NOW_US, 1),
     ]
-    assert [d.team_id for d in plan_flush(stats, NOW_US, KNOBS)] == [3, 9]
+    # encode_group order: null before present, then length, then bytes.
+    assert [d.group for d in plan_flush(stats, NOW_US, KNOBS)] == [
+        (None,),
+        g(3),
+        g(9),
+        g(10),
+    ]
 
 
 # -- knob validation and defaults -------------------------------------------------------
@@ -510,7 +525,7 @@ def test_knob_validation():
 
 key_stats = st.builds(
     KeyStats,
-    team_id=st.integers(min_value=0, max_value=2**64 - 1),
+    group=st.lists(st.one_of(st.none(), st.text(max_size=4)), max_size=3).map(tuple),
     staged_bytes=st.integers(min_value=0, max_value=2**48),
     first_staged_ts=st.integers(min_value=-(2**62), max_value=2**62),
     last_staged_ts=st.integers(min_value=-(2**62), max_value=2**62),
@@ -556,7 +571,7 @@ def test_decide_key_matches_the_documented_policy(
     assert (d.trigger if d is not None else None) == expected
     if d is not None:
         assert d.age_us == age
-        assert d.team_id == k.team_id
+        assert d.group == k.group
         assert d.staged_bytes == k.staged_bytes
         assert d.first_staged_ts == k.first_staged_ts
 
@@ -707,18 +722,18 @@ def test_size_decisions_are_monotone_in_the_ratio(
         assert d2 is not None and d2.trigger == "size"
 
 
-@given(keys=st.lists(key_stats, unique_by=lambda k: k.team_id, max_size=40), now=nows)
+@given(keys=st.lists(key_stats, unique_by=lambda k: k.group, max_size=40), now=nows)
 def test_plan_flush_is_deterministic_under_input_order(keys: list[KeyStats], now: int):
     forward = plan_flush(keys, now, KNOBS)
     assert plan_flush(list(reversed(keys)), now, KNOBS) == forward
     assert plan_flush(list(keys), now, KNOBS) == forward
 
 
-@given(keys=st.lists(key_stats, unique_by=lambda k: k.team_id, max_size=40), now=nows)
+@given(keys=st.lists(key_stats, unique_by=lambda k: k.group, max_size=40), now=nows)
 def test_at_most_one_decision_per_key_and_output_sorted(keys: list[KeyStats], now: int):
     decisions = plan_flush(keys, now, KNOBS)
-    decided = [d.team_id for d in decisions]
+    decided = [d.group for d in decisions]
     assert len(set(decided)) == len(decided)  # exactly one trigger per key
-    assert set(decided) <= {k.team_id for k in keys}
-    order = [(d.first_staged_ts, d.team_id) for d in decisions]
+    assert set(decided) <= {k.group for k in keys}
+    order = [(d.first_staged_ts, encode_group(d.group)) for d in decisions]
     assert order == sorted(order)

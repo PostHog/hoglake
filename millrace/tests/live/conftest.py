@@ -25,14 +25,29 @@ import pytest
 pytestmark = pytest.mark.live
 
 
-def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+#: The soak (test_live_soak.py) runs only when this names a duration.
+SOAK_ENV = "MILLRACE_SOAK_S"
+
+
+def pytest_collection_modifyitems(
+    config: pytest.Config, items: list[pytest.Item]
+) -> None:
     # NB: collection hooks from EVERY collected conftest see the WHOLE
     # session's items — scope the auto-marker to this directory or a
     # `pytest tests/` run would mark (and then deselect) the world.
     here = os.path.dirname(os.path.abspath(__file__)) + os.sep
+    soak = []
     for item in items:
         if str(item.path).startswith(here):
             item.add_marker(pytest.mark.live)
+            if item.path.name == "test_live_soak.py":
+                soak.append(item)
+    # The soak is DESELECTED, not skipped, without MILLRACE_SOAK_S: the
+    # harness fails a run on a single skip (ci/check_live_results.py),
+    # and the CI suite must never run a 30-minute soak.
+    if soak and not os.environ.get(SOAK_ENV, "").strip():
+        config.hook.pytest_deselected(items=soak)
+        items[:] = [item for item in items if item not in soak]
 
 
 # SlateDB's s3 store resolves from the standard AWS_* environment — map
@@ -98,6 +113,11 @@ class LakeHome:
 
     def create_events_table(self, name: str = "events") -> Any:
         table = livekit.create_events_table(self.namespace, name)
+        self.tables.append(table)
+        return table
+
+    def create_nested_events_table(self, name: str = "nested_events") -> Any:
+        table = livekit.create_nested_events_table(self.namespace, name)
         self.tables.append(table)
         return table
 
