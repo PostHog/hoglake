@@ -20,7 +20,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from stagekit import NOW, fast_flush_settings, payload_for, rec, window
+from stagekit import NOW, fast_flush_settings, payload_for, rec, shared_cache, window
 
 from millrace.stage import PartitionStage, RecoveryReport, StagedRecord, StageManager
 
@@ -93,7 +93,12 @@ def test_durability_across_hard_kill(tmp_path: Path) -> None:
 
 async def _verify_after_kill(path: str, acked: list[tuple[int, int, int]]) -> None:
     stage = await PartitionStage.open(
-        "file:///", path, topic="events", partition=0, settings=fast_flush_settings()
+        "file:///",
+        path,
+        topic="events",
+        partition=0,
+        settings=fast_flush_settings(),
+        **shared_cache(),
     )
     try:
         rows_by_team: dict[int, dict[int, bytes]] = {t: {} for t in range(TEAMS)}
@@ -201,14 +206,24 @@ async def test_clean_reopen_replays_nothing_and_loses_nothing(tmp_path: Path):
     """Clean shutdown then reopen: no WAL loss, no pending recovery work."""
     path = str(tmp_path / "db")
     stage = await PartitionStage.open(
-        "file:///", path, topic="events", partition=0, settings=fast_flush_settings()
+        "file:///",
+        path,
+        topic="events",
+        partition=0,
+        settings=fast_flush_settings(),
+        **shared_cache(),
     )
     await stage.stage_batch([rec(2, 100 + i, i) for i in range(6)], now_us=NOW)
     await stage.commit_flushed(window(2, 0, 3))
     await stage.close()
 
     reopened = await PartitionStage.open(
-        "file:///", path, topic="events", partition=0, settings=fast_flush_settings()
+        "file:///",
+        path,
+        topic="events",
+        partition=0,
+        settings=fast_flush_settings(),
+        **shared_cache(),
     )
     report = await reopened.recover()
     assert report == RecoveryReport(pending_prepared=())  # the settle landed atomically

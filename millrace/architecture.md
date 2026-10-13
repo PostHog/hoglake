@@ -1031,6 +1031,8 @@ default.
 | `MILLRACE_SLATEDB_GC_ENABLED` | `false` | true/false/1/0/yes/no | Writer-embedded SlateDB GC |
 | `MILLRACE_SLATEDB_MAX_UNFLUSHED_BYTES` | 268435456 (256 MiB) | positive, > 67108864 (64 MiB, the unoverridden `l0_sst_size_bytes`) | Per-instance unflushed memtable+WAL bound |
 | `MILLRACE_SLATEDB_L0_MAX_SSTS` | 8 | positive | L0 depth at which writes stall |
+| `MILLRACE_SLATEDB_BLOCK_CACHE_BYTES` | 134217728 (128 MiB) | 0 or [4096, 2**64); 0 only together with `MILLRACE_SLATEDB_META_CACHE_BYTES=0` (disables the cache) | POD-level SST data-block cache, in bytes (moka size weigher, slatedb `db_cache/moka.rs`), shared by every partition instance (one split moka cache, per-partition `db_cache_id`); churns with every memtable flush; the library default is 512 MiB PER INSTANCE |
+| `MILLRACE_SLATEDB_META_CACHE_BYTES` | 134217728 (128 MiB) | same rules | POD-level SST index/filter cache, in bytes, shared likewise — every SST's index and filter blocks, where the hits come from; the library default is 128 MiB per instance |
 | `MILLRACE_CONSUME_BATCH_SIZE` | 65536 | positive | Record cap per poll |
 | `MILLRACE_CONSUME_BATCH_MAX_BYTES` | 268435456 (256 MiB) | positive | Byte cap per poll (via observed mean record size) |
 | `MILLRACE_POLL_TIMEOUT_MS` | 500 | positive | Poll block bound; also stop latency |
@@ -1114,7 +1116,11 @@ family with no observations is not emitted.
 | `millrace_slatedb_wal_buffer_flush_requests_total` | `slatedb.wal.wal_buffer_flush_requests` | counter | sum | — |
 | `millrace_slatedb_wal_flush_bytes_total` | `slatedb.wal.wal_flush_bytes` | counter | sum | — |
 | `millrace_slatedb_wal_buffer_bytes` | `slatedb.wal.wal_buffer_estimated_bytes` | gauge | sum | — |
-| `millrace_slatedb_block_cache_accesses_total` | `slatedb.db_cache.access_count` | counter | sum | `entry_kind`, `result` |
+| `millrace_slatedb_block_cache_accesses_total` | `slatedb.db_cache.access_count` | counter | sum | `entry_kind` (filter/index/data_block/stats), `result` |
+| `millrace_slatedb_cache_capacity_bytes` | — (main.py, from config) | gauge | — | `half` (block/meta); 0 when disabled |
+
+The binding exposes no cache occupancy: the configured capacity gauge
+and the per-`entry_kind` hit ratio are the whole cache surface.
 
 slatedb 0.17 emits no WAL flush-latency histogram; the object-store
 request histogram is not bridged.
@@ -1213,10 +1219,19 @@ picked up as each pod restarts.
 
 **Sizing notes from the README and design doc.**
 
-- Per-pod SlateDB memory worst case: `K × MILLRACE_SLATEDB_MAX_UNFLUSHED_BYTES`
-  for K assigned partitions (64 × 256 MiB = 16 GiB in the README's
-  example; the library default would be 64 GiB).
-- Flush scans on top of that: up to `4 × MILLRACE_FLUSH_CONCURRENCY`
+- Pod memory (README §SlateDB settings and pod memory carries the
+  formula and table): `K × MILLRACE_SLATEDB_MAX_UNFLUSHED_BYTES` (per
+  instance) + ONE shared split cache `(BLOCK + META) × ~1.05` (moka
+  per-entry overhead; 128 + 128 MiB at defaults, against the library's
+  512 + 128 MiB PER instance) + librdkafka (`QUEUED_MAX_MESSAGES_KBYTES`
+  + `FETCH_MAX_BYTES`) + `CONSUME_BATCH_MAX_BYTES` + in-flight decisions
+  × (`max(FLUSH_SCAN_MIN_BYTES, target ÷ ratio × 1.25)` + decoded Arrow
+  + output) + process baseline. In-flight decisions: `4 ×
+  MILLRACE_FLUSH_CONCURRENCY` process-wide (1 when concurrency is 1, the
+  serial sweep). The 16-partition dev chart (96 MiB unflushed, 128 MiB
+  target, concurrency 1): 1,536 + ~269 + 512 + 256 + ~1,728 MiB ≈
+  4.2 GiB before the process baseline.
+- Flush scans at production defaults: up to `4 × MILLRACE_FLUSH_CONCURRENCY`
   decisions in flight, each holding at most `max(scan budget, largest
   row)` payload bytes plus up to `MILLRACE_FLUSH_SCAN_MAX_ROWS` decoded
   records: 16 × 3,125 MiB (about 48.8 GiB) at defaults and the fallback

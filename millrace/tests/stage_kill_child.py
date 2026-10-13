@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import sys
 
-from stagekit import NOW, fast_flush_settings, payload_for
+from stagekit import NOW, fast_flush_settings, payload_for, shared_cache
 
 
 async def _run(
@@ -27,6 +27,7 @@ async def _run(
         topic="events",
         partition=0,
         settings=fast_flush_settings(),
+        **shared_cache(),
     )
     print("READY", flush=True)
     offset = 0

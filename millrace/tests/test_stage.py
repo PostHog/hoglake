@@ -45,6 +45,7 @@ from stagekit import (
     legacy_marker_kv,
     prepared,
     rec,
+    shared_cache,
     window,
 )
 
@@ -231,6 +232,7 @@ async def _exactly_the_window(data: st.DataObject) -> None:
         topic="events",
         partition=0,
         settings=fast_flush_settings(),
+        **shared_cache(),
     )
     await stage.stage_batch(
         [StagedRecord(g(5), o, payloads[o]) for o in offsets],
@@ -420,7 +422,12 @@ async def test_recover_collects_legacy_markers_without_touching_rows(memory_stor
     await db.shutdown()
 
     stage = await PartitionStage.open_store(
-        memory_store, path, topic="events", partition=0, settings=fast_flush_settings()
+        memory_store,
+        path,
+        topic="events",
+        partition=0,
+        settings=fast_flush_settings(),
+        **shared_cache(),
     )
     report = await stage.recover()
     assert report.legacy_markers_collected == 1
@@ -496,7 +503,12 @@ async def test_recover_collects_many_legacy_markers_in_bounded_pages(memory_stor
     await db.shutdown()
 
     stage = await PartitionStage.open_store(
-        memory_store, path, topic="events", partition=0, settings=fast_flush_settings()
+        memory_store,
+        path,
+        topic="events",
+        partition=0,
+        settings=fast_flush_settings(),
+        **shared_cache(),
     )
     counting = _CountingDb(stage._db)
     stage._db = counting
@@ -607,7 +619,12 @@ async def test_commit_flushed_requires_consistent_stats(memory_store):
     await db.shutdown()
 
     stage = await PartitionStage.open_store(
-        memory_store, path, topic="events", partition=0, settings=fast_flush_settings()
+        memory_store,
+        path,
+        topic="events",
+        partition=0,
+        settings=fast_flush_settings(),
+        **shared_cache(),
     )
     key = window(9, 0, 0)
     with pytest.raises(StageCorruptionError):
@@ -901,6 +918,7 @@ async def _capped_scan_is_a_prefix(data: st.DataObject) -> None:
         topic="events",
         partition=0,
         settings=fast_flush_settings(),
+        **shared_cache(),
     )
     await stage.stage_batch(
         [
@@ -1128,6 +1146,204 @@ async def test_manager_sync_assignment_and_reopen():
     await manager.close()
 
 
+# -- the pod-level shared SST cache --------------------------------------------------
+
+
+class _SpyBuilder:
+    """A ``DbBuilder`` subclass factory recording the cache calls each
+    open makes, then delegating to the real builder — the DB really
+    opens, so the pin is on the wiring, not on a mock's echo."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from slatedb.uniffi import DbBuilder
+
+        from millrace import stage as stage_mod
+
+        calls: list[tuple[object, ...]] = []
+
+        class Spy(DbBuilder):  # type: ignore[misc]
+            def with_db_cache(self, db_cache: object, db_cache_id: int) -> None:
+                calls.append(("with_db_cache", db_cache, db_cache_id))
+                super().with_db_cache(db_cache, db_cache_id)
+
+            def with_db_cache_disabled(self) -> None:
+                calls.append(("with_db_cache_disabled",))
+                super().with_db_cache_disabled()
+
+        monkeypatch.setattr(stage_mod, "DbBuilder", Spy)
+        self.calls = calls
+
+
+async def test_manager_opens_every_partition_on_the_shared_cache_with_its_id(
+    monkeypatch,
+):
+    """ONE cache object per manager, every open scoped by
+    ``db_cache_id_for(topic, partition)``: the ids are distinct across
+    partitions AND across topics (the same partition number under two
+    topics never shares a scope), the SAME on a reopen (the binding
+    wants them stable across reopens), and the disabled path is never
+    taken."""
+    from millrace.stage import db_cache_id_for
+
+    spy = _SpyBuilder(monkeypatch)
+    manager = StageManager(
+        "memory:///",
+        "millrace",
+        settings=fast_flush_settings(),
+        block_cache_bytes=1 << 20,
+        meta_cache_bytes=1 << 18,
+    )
+    assert manager.db_cache is not None
+    assert manager.cache_capacity_bytes == (1 << 20, 1 << 18)
+    claimed = [("events", 0), ("events", 1), ("events", 7), ("other", 0), ("other", 1)]
+    await manager.sync_assignment(claimed)
+    assert [c[0] for c in spy.calls] == ["with_db_cache"] * len(claimed)
+    assert all(c[1] is manager.db_cache for c in spy.calls)
+    ids = [c[2] for c in spy.calls]
+    assert ids == [db_cache_id_for(t, p) for t, p in sorted(claimed)]
+    assert len(set(ids)) == len(claimed)
+    assert db_cache_id_for("events", 0) != db_cache_id_for("other", 0)
+
+    reclaimed_id = db_cache_id_for("events", 7)
+    await manager.sync_assignment([k for k in claimed if k != ("events", 7)])
+    await manager.sync_assignment(claimed)
+    assert spy.calls[-1] == ("with_db_cache", manager.db_cache, reclaimed_id)
+    await manager.close()
+
+
+async def test_manager_opens_with_the_cache_disabled_on_the_zero_pair(monkeypatch):
+    spy = _SpyBuilder(monkeypatch)
+    manager = StageManager(
+        "memory:///",
+        "millrace",
+        settings=fast_flush_settings(),
+        block_cache_bytes=0,
+        meta_cache_bytes=0,
+    )
+    assert manager.db_cache is None
+    assert manager.cache_capacity_bytes == (0, 0)
+    await manager.sync_assignment([("events", 0), ("events", 1)])
+    assert spy.calls == [("with_db_cache_disabled",)] * 2
+    stage = manager.stage("events", 1)
+    await stage.stage_batch([rec(1, 100, 0)], now_us=NOW)
+    assert [rk.offset async for rk, _ in stage.scan_group_rows(g(1))] == [0]
+    await manager.close()
+
+
+def test_manager_refuses_a_half_zero_cache_pair():
+    with pytest.raises(ValueError, match="split cache"):
+        StageManager(
+            "memory:///", "millrace", block_cache_bytes=0, meta_cache_bytes=4096
+        )
+    with pytest.raises(ValueError, match="MILLRACE_SLATEDB_BLOCK_CACHE_BYTES"):
+        StageManager(
+            "memory:///", "millrace", block_cache_bytes=-1, meta_cache_bytes=4096
+        )
+
+
+def test_build_slatedb_cache_shape():
+    from slatedb.uniffi import DbCache
+
+    from millrace.stage import build_slatedb_cache
+
+    assert build_slatedb_cache(block_cache_bytes=0, meta_cache_bytes=0) is None
+    cache = build_slatedb_cache(block_cache_bytes=1 << 20, meta_cache_bytes=1 << 20)
+    assert isinstance(cache, DbCache)
+    with pytest.raises(ValueError, match="both"):
+        build_slatedb_cache(block_cache_bytes=4096, meta_cache_bytes=0)
+    with pytest.raises(ValueError, match="non-negative"):
+        build_slatedb_cache(block_cache_bytes=4096, meta_cache_bytes=-1)
+
+
+def test_build_slatedb_cache_puts_each_capacity_in_its_half(monkeypatch):
+    """Deterministic halves: two moka caches built with the block then
+    meta capacity, and ``new_split_cache`` receives them as
+    (block_cache, meta_cache) — a swapped pair would put the churning
+    data blocks in the meta budget and vice versa."""
+    from slatedb.uniffi import DbCache
+
+    from millrace import stage as stage_mod
+
+    events: list[tuple[str, object]] = []
+
+    class RecordingDbCache:
+        @staticmethod
+        def new_moka_cache(options: object) -> object:
+            built = DbCache.new_moka_cache(options)
+            events.append(("moka", options.max_capacity, built))  # type: ignore[attr-defined]
+            return built
+
+        @staticmethod
+        def new_split_cache(block_cache: object, meta_cache: object) -> object:
+            events.append(("split", block_cache, meta_cache))
+            return DbCache.new_split_cache(block_cache, meta_cache)
+
+    monkeypatch.setattr(stage_mod, "DbCache", RecordingDbCache)
+    stage_mod.build_slatedb_cache(block_cache_bytes=8192, meta_cache_bytes=16384)
+    (m1, m2, split) = events
+    assert m1[:2] == ("moka", 8192)
+    assert m2[:2] == ("moka", 16384)
+    assert split == ("split", m1[2], m2[2])  # block first, meta second
+
+    events.clear()
+    assert (
+        stage_mod.build_slatedb_cache(block_cache_bytes=0, meta_cache_bytes=0) is None
+    )
+    assert events == []  # disabled builds nothing
+
+
+def test_db_cache_id_for_is_stable_and_distinct():
+    from millrace.stage import db_cache_id_for
+
+    a = db_cache_id_for("events", 3)
+    assert a == db_cache_id_for("events", 3)  # stable across reopens
+    assert a != db_cache_id_for("events", 4)
+    assert a != db_cache_id_for("other", 3)
+    assert 0 <= a < 1 << 64  # the binding's u64
+    with pytest.raises(ValueError, match="partition"):
+        db_cache_id_for("events", -1)
+
+
+async def test_open_store_refuses_inconsistent_cache_arguments(memory_store):
+    from millrace.stage import build_slatedb_cache
+
+    cache = build_slatedb_cache(block_cache_bytes=1 << 20, meta_cache_bytes=1 << 20)
+    with pytest.raises(ValueError, match="cache choice is required"):
+        await PartitionStage.open_store(  # no silent library default
+            memory_store, "millrace/events/0", topic="events", partition=0
+        )
+    with pytest.raises(ValueError, match="cache choice is required"):
+        await PartitionStage.open(
+            "memory:///", "millrace/events/0", topic="events", partition=0
+        )
+    with pytest.raises(ValueError, match="db_cache_id is required"):
+        await PartitionStage.open_store(
+            memory_store,
+            "millrace/events/0",
+            topic="events",
+            partition=0,
+            db_cache=cache,
+        )
+    with pytest.raises(ValueError, match="meaningless"):
+        await PartitionStage.open_store(
+            memory_store,
+            "millrace/events/0",
+            topic="events",
+            partition=0,
+            db_cache_id=1,
+        )
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        await PartitionStage.open_store(
+            memory_store,
+            "millrace/events/0",
+            topic="events",
+            partition=0,
+            db_cache=cache,
+            db_cache_id=1,
+            cache_disabled=True,
+        )
+
+
 # -- M6: the sweep-published gauges snapshot and its staleness bound ---------------
 
 
@@ -1282,7 +1498,12 @@ async def test_a_corrupt_prepared_entry_fails_recovery_by_name(memory_store):
     await db.shutdown()
 
     stage = await PartitionStage.open_store(
-        memory_store, path, topic="events", partition=0, settings=fast_flush_settings()
+        memory_store,
+        path,
+        topic="events",
+        partition=0,
+        settings=fast_flush_settings(),
+        **shared_cache(),
     )
     for read in (
         stage.recover,
@@ -1363,6 +1584,7 @@ async def _first_staged_ts_property(data: st.DataObject) -> None:
         topic="events",
         partition=0,
         settings=fast_flush_settings(),
+        **shared_cache(),
     )
     clock = NOW
     offset = 0

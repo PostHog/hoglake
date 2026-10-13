@@ -32,6 +32,28 @@ def fast_flush_settings() -> Any:
     return s
 
 
+def shared_cache(topic: str = "events", partition: int = 0) -> dict[str, Any]:
+    """The cache keywords ``PartitionStage.open``/``open_store`` now
+    REQUIRE, at the production shape: a split cache at the config
+    defaults (``build_slatedb_cache``) scoped by ``db_cache_id_for``.
+    A fresh cache per call — correctness never depends on cache warmth,
+    and moka allocates by occupancy, not capacity. Spread it:
+    ``open_store(..., **shared_cache(topic, partition))``."""
+    from millrace.config import (
+        SLATEDB_BLOCK_CACHE_BYTES_DEFAULT,
+        SLATEDB_META_CACHE_BYTES_DEFAULT,
+    )
+    from millrace.stage import build_slatedb_cache, db_cache_id_for
+
+    return {
+        "db_cache": build_slatedb_cache(
+            block_cache_bytes=SLATEDB_BLOCK_CACHE_BYTES_DEFAULT,
+            meta_cache_bytes=SLATEDB_META_CACHE_BYTES_DEFAULT,
+        ),
+        "db_cache_id": db_cache_id_for(topic, partition),
+    }
+
+
 #: The field name tests label one-field tuples with (an identity(team_id)
 #: spec's display name).
 FIELDS = ("team_id",)

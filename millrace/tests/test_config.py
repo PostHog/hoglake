@@ -4,6 +4,8 @@ in one refusal, not one per restart."""
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from millrace.config import (
@@ -526,6 +528,11 @@ def test_slatedb_defaults_match_the_documented_deployment():
     assert cfg.slatedb.gc_enabled is False
     assert cfg.slatedb.max_unflushed_bytes == 256 * 1024 * 1024
     assert cfg.slatedb.l0_max_ssts == 8
+    # The pod-level cache pair: one shared split cache, not 640 MiB per
+    # instance (the library default).
+    assert cfg.slatedb.block_cache_bytes == 128 * 1024 * 1024
+    assert cfg.slatedb.meta_cache_bytes == 128 * 1024 * 1024
+    assert cfg.slatedb.cache_disabled is False
 
 
 def test_slatedb_knobs_parse_and_validate():
@@ -560,6 +567,162 @@ def test_slatedb_knobs_parse_and_validate():
         MINIMAL_ENV | {"MILLRACE_SLATEDB_MAX_UNFLUSHED_BYTES": str(64 * 1024 * 1024)}
     )
     assert "MILLRACE_SLATEDB_MAX_UNFLUSHED_BYTES" in p and "l0_sst_size_bytes" in p
+
+
+def test_slatedb_cache_pair_parses_and_zero_zero_disables():
+    cfg = load(
+        MINIMAL_ENV
+        | {
+            "MILLRACE_SLATEDB_BLOCK_CACHE_BYTES": "1048576",
+            "MILLRACE_SLATEDB_META_CACHE_BYTES": "4096",
+        }
+    )
+    assert cfg.slatedb.block_cache_bytes == 1 << 20
+    assert cfg.slatedb.meta_cache_bytes == 4096  # the floor is inclusive
+    assert cfg.slatedb.cache_disabled is False
+
+    cfg = load(
+        MINIMAL_ENV
+        | {
+            "MILLRACE_SLATEDB_BLOCK_CACHE_BYTES": "0",
+            "MILLRACE_SLATEDB_META_CACHE_BYTES": "0",
+        }
+    )
+    assert cfg.slatedb.block_cache_bytes == 0
+    assert cfg.slatedb.meta_cache_bytes == 0
+    assert cfg.slatedb.cache_disabled is True
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {"MILLRACE_SLATEDB_BLOCK_CACHE_BYTES": "0"},
+        {"MILLRACE_SLATEDB_META_CACHE_BYTES": "0"},
+        {
+            "MILLRACE_SLATEDB_BLOCK_CACHE_BYTES": "0",
+            "MILLRACE_SLATEDB_META_CACHE_BYTES": "8192",
+        },
+        {
+            "MILLRACE_SLATEDB_BLOCK_CACHE_BYTES": "8192",
+            "MILLRACE_SLATEDB_META_CACHE_BYTES": "0",
+        },
+    ],
+)
+def test_slatedb_cache_pair_refuses_exactly_one_zero_naming_both(env):
+    """0 means "no cache" only for the PAIR: the split cache needs both
+    halves, so a lone zero is refused with both knobs and the reason."""
+    (p,) = problems(MINIMAL_ENV | env)
+    assert "MILLRACE_SLATEDB_BLOCK_CACHE_BYTES" in p
+    assert "MILLRACE_SLATEDB_META_CACHE_BYTES" in p
+    assert "both" in p and "split cache" in p
+
+
+CACHE_KNOBS = [
+    "MILLRACE_SLATEDB_BLOCK_CACHE_BYTES",
+    "MILLRACE_SLATEDB_META_CACHE_BYTES",
+]
+
+
+@pytest.mark.parametrize("knob", CACHE_KNOBS)
+@pytest.mark.parametrize(
+    ("raw", "fragment"),
+    [
+        ("-1", "non-negative"),
+        ("abc", "non-negative"),
+        ("1.5", "non-negative"),
+        (str(2**64), "2**64"),
+        (str(2**64 + 1), "2**64"),
+        ("1", "below 4096"),
+        ("4095", "below 4096"),
+    ],
+)
+def test_slatedb_cache_half_refusals_are_config_errors_naming_the_knob(
+    knob, raw, fragment
+):
+    """Each bad half is its own ConfigError problem naming the knob —
+    never a binding OverflowError at the first open (u64), and a
+    sub-block capacity gets its own message pointing at 0/0."""
+    (p,) = problems(MINIMAL_ENV | {knob: raw})
+    assert knob in p and fragment in p
+
+
+def test_slatedb_cache_both_halves_bad_reports_both():
+    probs = problems(
+        MINIMAL_ENV
+        | {
+            "MILLRACE_SLATEDB_BLOCK_CACHE_BYTES": "-1",
+            "MILLRACE_SLATEDB_META_CACHE_BYTES": str(2**64),
+        }
+    )
+    assert len(probs) == 2
+    assert "MILLRACE_SLATEDB_BLOCK_CACHE_BYTES" in probs[0]
+    assert "MILLRACE_SLATEDB_META_CACHE_BYTES" in probs[1]
+
+
+REFUSED = "refused"
+DEFAULT = "default"
+
+
+@pytest.mark.parametrize(
+    ("raw", "cache_pair", "positive_int"),
+    [
+        # raw       both cache halves  a _positive_int knob
+        ("00", 0, REFUSED),  # int("00") == 0: "off" for the pair, refused there
+        (" 0 ", 0, REFUSED),  # stripped first
+        ("8_192", 8192, 8192),  # int() takes underscores
+        ("1_000", REFUSED, 1000),  # parses (1000), then below the 4096 floor
+        ("1e9", REFUSED, REFUSED),  # int() refuses scientific notation
+        ("   ", DEFAULT, DEFAULT),  # whitespace-only is unset
+        ("", DEFAULT, DEFAULT),
+    ],
+)
+def test_slatedb_cache_parse_leniency_matches_positive_int(
+    raw, cache_pair, positive_int
+):
+    """The cache pair parses exactly like ``_positive_int`` knobs —
+    ``int()`` after stripping, blank is the default — and differs only
+    in range (0 allowed for the pair, a 4096 floor, a u64 ceiling). Both
+    halves get the same raw value so the lone-zero rule never fires."""
+
+    def outcome(env: dict[str, str], read: Any, default: Any) -> Any:
+        try:
+            value = read(load_config(env))
+        except ConfigError:
+            return REFUSED
+        return DEFAULT if value == default and raw.strip() == "" else value
+
+    cache_env = MINIMAL_ENV | {knob: raw for knob in CACHE_KNOBS}
+    assert outcome(
+        cache_env,
+        lambda c: (c.slatedb.block_cache_bytes, c.slatedb.meta_cache_bytes),
+        (128 * 1024 * 1024, 128 * 1024 * 1024),
+    ) == (cache_pair if cache_pair in (REFUSED, DEFAULT) else (cache_pair, cache_pair))
+    assert (
+        outcome(
+            MINIMAL_ENV | {"MILLRACE_CONSUME_BATCH_SIZE": raw},
+            lambda c: c.consume_batch_size,
+            65536,
+        )
+        == positive_int
+    )
+
+
+def test_slatedb_config_validates_the_cache_pair_directly():
+    from millrace.config import SlateDbConfig, validate_slatedb_cache_bytes
+
+    with pytest.raises(ValueError, match="split cache"):
+        SlateDbConfig(block_cache_bytes=0, meta_cache_bytes=4096)
+    with pytest.raises(ValueError, match="MILLRACE_SLATEDB_META_CACHE_BYTES"):
+        SlateDbConfig(block_cache_bytes=4096, meta_cache_bytes=-5)
+    with pytest.raises(ValueError, match="below 4096"):
+        SlateDbConfig(block_cache_bytes=1, meta_cache_bytes=4096)
+    with pytest.raises(ValueError, match="2\\*\\*64"):
+        SlateDbConfig(block_cache_bytes=2**64, meta_cache_bytes=4096)
+    assert SlateDbConfig(block_cache_bytes=0, meta_cache_bytes=0).cache_disabled
+    validate_slatedb_cache_bytes(0, 0)
+    validate_slatedb_cache_bytes(4096, 2**64 - 1)
+    with pytest.raises(ValueError, match="non-negative"):
+        validate_slatedb_cache_bytes(-1, 0)
 
 
 # -- remaining knobs ----------------------------------------------------------------------

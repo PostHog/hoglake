@@ -39,6 +39,8 @@ Knobs
 | ``MILLRACE_SLATEDB_GC_ENABLED`` | ``false`` | the writer-internal SlateDB GC loop. DEFAULT OFF because the external maintenance service (``python -m millrace.maintenance``) is deployed beside every millrace fleet and owns collection — doubled GC is wasted LIST/DELETE traffic on the replicas (docs/kafka-ingestion.md §Maintenance services; GC itself is idempotent and overlap-safe, so a mixed or misconfigured deployment is wasteful, never corrupt). Boot logs a loud warning when off: the setting ASSUMES the maintenance service exists — without it, garbage accumulates forever. There is deliberately NO knob for ``compactor_options``: disabling the embedded compactor stalls memtable→L0 flushes at ``l0_max_ssts`` with nothing to drain them (parity-pinned, tests/test_slatedb_parity.py) |
 | ``MILLRACE_SLATEDB_MAX_UNFLUSHED_BYTES`` | 268435456 (256 MiB) | per-instance bound on unflushed memtable+WAL bytes before SlateDB stalls writes (the library default is 1 GiB — per INSTANCE, so 64 partitions per pod could hold 64 GiB of unflushed state; the README carries the per-pod memory arithmetic). The binding requires it to exceed ``l0_sst_size_bytes`` (never overridden; 64 MiB), which the validation enforces |
 | ``MILLRACE_SLATEDB_L0_MAX_SSTS`` | 8 | L0 depth at which a writer's memtable flush stalls until the embedded compactor drains (SlateDB's default; the whale-shape stall margin is a bench topic — tests/test_stage_bench.py) |
+| ``MILLRACE_SLATEDB_BLOCK_CACHE_BYTES`` | 134217728 (128 MiB) | PER-POD bound on the SST data-block cache, in bytes (moka weighs each entry by its size — slatedb 0.17 ``db_cache/moka.rs``), SHARED by every partition instance the pod opens (stage.StageManager builds one split moka cache and hands it to each ``DbBuilder`` with a per-partition ``db_cache_id``) — unlike ``MILLRACE_SLATEDB_MAX_UNFLUSHED_BYTES``, which is per INSTANCE. The library default is a per-instance split cache of 512 MiB block + 128 MiB meta, so 16 unconfigured partitions could cache 10 GiB. This half churns: every memtable flush inserts its data blocks while flush scans read older data. ``0`` together with ``MILLRACE_SLATEDB_META_CACHE_BYTES=0`` disables the DB cache entirely (``with_db_cache_disabled``); ``0`` for exactly one of the pair is refused — the split cache needs both halves. A non-zero value must be ≥ 4096 (one default SST block) and < 2**64 (the binding's u64) |
+| ``MILLRACE_SLATEDB_META_CACHE_BYTES`` | 134217728 (128 MiB) | PER-POD bound on the SST metadata cache (index and filter blocks for every SST of every instance — where the hits come from), in bytes, shared by every partition instance — the meta half of the split cache above; same ``0``, 4096 and 2**64 rules. ``millrace_slatedb_cache_capacity_bytes{half}`` exports both halves (0 when disabled); the binding exposes no occupancy, so ``millrace_slatedb_block_cache_accesses_total{entry_kind,result}`` (``entry_kind`` ∈ filter/index/data_block/stats) is the signal — watch the hit ratio per kind |
 | ``MILLRACE_CONSUME_BATCH_SIZE`` | 65536 | max messages per ``consume()`` call — the RECORD cap, a backstop for degenerate tiny-payload floods; at the design's ~1 KB record shape the byte cap below is the operative bound. Per-partition durability waits overlap within a poll (consumer.py), so a large batch still stages in ~one WAL round trip |
 | ``MILLRACE_CONSUME_BATCH_MAX_BYTES`` | 268435456 (256 MiB) | per-poll byte bound, enforced by clamping the poll's message count to this ÷ the run's observed average record size (key + value bytes, cumulative; floored at 1 message so an oversized record still flows). The first poll after a start has no observation and is bounded by the record cap alone |
 | ``MILLRACE_POLL_TIMEOUT_MS`` | 500 | per-poll block bound; also the stop() latency |
@@ -155,14 +157,28 @@ class EventTimePolicy(Enum):
 #: default (64 MiB) is the effective floor for the knob.
 SLATEDB_L0_SST_SIZE_BYTES: Final = 64 * 1024 * 1024
 
+#: The pod-level DB cache defaults (module docstring knob table). The
+#: library's are per INSTANCE (512 MiB block + 128 MiB meta, slatedb
+#: 0.17 ``db_cache::DEFAULT_*_CACHE_CAPACITY``); these are shared by
+#: every partition instance in the pod (stage.StageManager).
+SLATEDB_BLOCK_CACHE_BYTES_DEFAULT: Final = 128 * 1024 * 1024
+SLATEDB_META_CACHE_BYTES_DEFAULT: Final = 128 * 1024 * 1024
+
+#: A non-zero cache half smaller than one default SST block (4 KiB)
+#: can hold nothing useful; the binding's capacity is a u64.
+SLATEDB_CACHE_MIN_BYTES: Final = 4096
+SLATEDB_CACHE_MAX_BYTES_EXCLUSIVE: Final = 2**64
+
 
 @dataclass(frozen=True)
 class SlateDbConfig:
-    """Per-instance SlateDB tuning for the writer's partition stages
-    (T9 — the library defaults are wrong for this shape: 1 GiB of
-    unflushed state PER INSTANCE and an 8-deep L0, times K partitions
-    per pod, with no pod-level cap). Applied through
-    :func:`millrace.stage.build_slatedb_settings`.
+    """SlateDB tuning for the writer's partition stages (T9 — the
+    library defaults are wrong for this shape: 1 GiB of unflushed state
+    and a 640 MiB split cache PER INSTANCE and an 8-deep L0, times K
+    partitions per pod, with no pod-level cap). The per-instance knobs
+    are applied through :func:`millrace.stage.build_slatedb_settings`;
+    the cache pair is POD-level — :func:`millrace.stage.build_slatedb_cache`
+    builds ONE shared cache the StageManager hands to every instance.
 
     ``gc_enabled`` defaults to False: the external maintenance service
     is part of every millrace deployment and owns collection — see the
@@ -170,11 +186,18 @@ class SlateDbConfig:
     posture. ``compactor_options`` is not represented here on purpose:
     disabling the writer's embedded compactor is a parity-pinned stall
     (stage.build_slatedb_settings says why).
+
+    ``block_cache_bytes`` / ``meta_cache_bytes`` are the two halves of
+    the shared split cache; ``0`` for both disables the DB cache
+    entirely (:attr:`cache_disabled`), ``0`` for exactly one is refused
+    because the split cache needs both halves.
     """
 
     gc_enabled: bool = False
     max_unflushed_bytes: int = 256 * 1024 * 1024
     l0_max_ssts: int = 8
+    block_cache_bytes: int = SLATEDB_BLOCK_CACHE_BYTES_DEFAULT
+    meta_cache_bytes: int = SLATEDB_META_CACHE_BYTES_DEFAULT
 
     def __post_init__(self) -> None:
         if self.max_unflushed_bytes <= SLATEDB_L0_SST_SIZE_BYTES:
@@ -187,6 +210,53 @@ class SlateDbConfig:
             raise ValueError(
                 f"MILLRACE_SLATEDB_L0_MAX_SSTS must be >= 1, got {self.l0_max_ssts}"
             )
+        validate_slatedb_cache_bytes(self.block_cache_bytes, self.meta_cache_bytes)
+
+    @property
+    def cache_disabled(self) -> bool:
+        """Both cache halves at 0: open every instance with the DB cache
+        disabled rather than with an empty shared cache."""
+        return self.block_cache_bytes == 0 and self.meta_cache_bytes == 0
+
+
+def slatedb_cache_half_problem(name: str, value: int) -> str | None:
+    """Why one cache half's byte count is refused, or None."""
+    if value < 0:
+        return f"{name}={value} must be a non-negative integer"
+    if value >= SLATEDB_CACHE_MAX_BYTES_EXCLUSIVE:
+        return f"{name}={value} must be below 2**64 (the binding's u64 capacity)"
+    if 0 < value < SLATEDB_CACHE_MIN_BYTES:
+        return (
+            f"{name}={value} is below {SLATEDB_CACHE_MIN_BYTES} (one default "
+            f"SST block): use 0 for both halves to disable the cache"
+        )
+    return None
+
+
+def validate_slatedb_cache_bytes(block_cache_bytes: int, meta_cache_bytes: int) -> None:
+    """The one rule for the pod-level cache pair, shared by the config
+    and :func:`millrace.stage.build_slatedb_cache`: each half is a
+    byte count that is 0 or in ``[4096, 2**64)``
+    (:func:`slatedb_cache_half_problem`), and ``0`` means "no cache" only for the
+    PAIR — SlateDB's split cache routes data blocks to one half and
+    index/filter/footer blocks to the other, so a zero-capacity half
+    beside a sized one is a cache that holds nothing of one kind (moka
+    evicts an entry heavier than the capacity on insert), never a
+    smaller cache."""
+    for name, value in (
+        ("MILLRACE_SLATEDB_BLOCK_CACHE_BYTES", block_cache_bytes),
+        ("MILLRACE_SLATEDB_META_CACHE_BYTES", meta_cache_bytes),
+    ):
+        problem = slatedb_cache_half_problem(name, value)
+        if problem is not None:
+            raise ValueError(problem)
+    if (block_cache_bytes == 0) != (meta_cache_bytes == 0):
+        raise ValueError(
+            "MILLRACE_SLATEDB_BLOCK_CACHE_BYTES and MILLRACE_SLATEDB_META_CACHE_BYTES "
+            "must both be 0 (DB cache disabled) or both be positive — the split "
+            f"cache needs both halves; got block={block_cache_bytes}, "
+            f"meta={meta_cache_bytes}"
+        )
 
 
 @dataclass(frozen=True)
@@ -424,6 +494,30 @@ def _positive_int(
         return None
     if value <= 0:
         problems.append(f"{name}={value} must be a positive integer")
+        return None
+    return value
+
+
+def _cache_bytes(
+    env: Mapping[str, str], name: str, default: int, problems: list[str]
+) -> int | None:
+    """One half of the pod-level cache pair. ``0`` is a meaningful value
+    ("off", for the pair), not a misrendered unset; parse leniency is
+    ``_positive_int``'s (``int()`` after stripping: ``"00"`` and
+    ``"1_000"`` parse, ``"1e9"`` does not, blank is the default). Each
+    half's range is checked here so every bad half is its own problem;
+    the pair rule is :class:`SlateDbConfig`'s."""
+    raw = env.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        problems.append(f"{name}={raw!r} must be a non-negative integer")
+        return None
+    problem = slatedb_cache_half_problem(name, value)
+    if problem is not None:
+        problems.append(problem)
         return None
     return value
 
@@ -1137,12 +1231,31 @@ def load_config(env: Mapping[str, str]) -> Config:
     slatedb_l0_max_ssts = _positive_int(
         env, "MILLRACE_SLATEDB_L0_MAX_SSTS", 8, problems
     )
-    if slatedb_max_unflushed is not None and slatedb_l0_max_ssts is not None:
+    slatedb_block_cache = _cache_bytes(
+        env,
+        "MILLRACE_SLATEDB_BLOCK_CACHE_BYTES",
+        SLATEDB_BLOCK_CACHE_BYTES_DEFAULT,
+        problems,
+    )
+    slatedb_meta_cache = _cache_bytes(
+        env,
+        "MILLRACE_SLATEDB_META_CACHE_BYTES",
+        SLATEDB_META_CACHE_BYTES_DEFAULT,
+        problems,
+    )
+    if (
+        slatedb_max_unflushed is not None
+        and slatedb_l0_max_ssts is not None
+        and slatedb_block_cache is not None
+        and slatedb_meta_cache is not None
+    ):
         try:
             slatedb = SlateDbConfig(
                 gc_enabled=slatedb_gc,
                 max_unflushed_bytes=slatedb_max_unflushed,
                 l0_max_ssts=slatedb_l0_max_ssts,
+                block_cache_bytes=slatedb_block_cache,
+                meta_cache_bytes=slatedb_meta_cache,
             )
         except ValueError as exc:
             problems.append(str(exc))

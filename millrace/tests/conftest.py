@@ -28,7 +28,7 @@ from typing import Any
 
 import pytest
 from hypothesis import HealthCheck, settings
-from stagekit import NOW, fast_flush_settings
+from stagekit import NOW, fast_flush_settings, shared_cache
 
 from millrace.stage import AckHook, PartitionStage
 
@@ -122,6 +122,7 @@ def stage_factory(memory_store: Any) -> StageFactory:
             partition=partition,
             settings=settings if settings is not None else fast_flush_settings(),
             ack_hook=ack_hook,
+            **shared_cache(topic, partition),
         )
 
     return open_stage

@@ -103,20 +103,23 @@ write/flush path reads it back.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping
 from dataclasses import dataclass
-from typing import Final, Self
+from typing import Final, Literal, Self, overload
 
 from slatedb.uniffi import (
     CloseReason,
     Db,
     DbBuilder,
+    DbCache,
     DbTransaction,
     DefaultMetricsRecorder,
     IsolationLevel,
     KeyRange,
+    MokaCacheOptions,
     ObjectStore,
     Settings,
     WriteBatch,
@@ -124,6 +127,11 @@ from slatedb.uniffi import (
 from slatedb.uniffi import Error as SlateError
 
 from . import keyspace
+from .config import (
+    SLATEDB_BLOCK_CACHE_BYTES_DEFAULT,
+    SLATEDB_META_CACHE_BYTES_DEFAULT,
+    validate_slatedb_cache_bytes,
+)
 from .keyspace import (
     FlushedKey,
     PartitionTuple,
@@ -364,6 +372,58 @@ def build_slatedb_settings(
     return settings
 
 
+def build_slatedb_cache(
+    *, block_cache_bytes: int, meta_cache_bytes: int
+) -> DbCache | None:
+    """The ONE pod-level SST cache every partition instance shares
+    (``MILLRACE_SLATEDB_BLOCK_CACHE_BYTES`` / ``..._META_CACHE_BYTES``;
+    config.py's table), or ``None`` for the 0/0 "disabled" pair — the
+    caller then opens each instance with ``with_db_cache_disabled()``.
+
+    Shape: a split cache (data blocks in one half, index/filter/footer
+    blocks in the other) of two moka caches. ``max_capacity`` is in
+    BYTES — moka's weigher is the cached entry's byte size (slatedb
+    0.17 ``db_cache/moka.rs``), so the pair bounds resident cache
+    memory for the whole pod, not an entry count. The library's own
+    default is the same split shape but PER INSTANCE (512 MiB + 128
+    MiB), which is why K unconfigured partitions grow K × 640 MiB.
+
+    A cache passed to ``DbBuilder.with_db_cache`` stays owned by the
+    caller: ``Db.close`` never closes it, so one object serves every
+    open/close over the manager's lifetime; ``db_cache_id`` keeps the
+    instances' entries apart (:func:`db_cache_id_for`). No TTL/TTI —
+    capacity eviction is the only policy, same as the library default.
+    """
+    validate_slatedb_cache_bytes(block_cache_bytes, meta_cache_bytes)
+    if block_cache_bytes == 0:
+        return None
+    block = DbCache.new_moka_cache(
+        MokaCacheOptions(
+            max_capacity=block_cache_bytes, time_to_live=None, time_to_idle=None
+        )
+    )
+    meta = DbCache.new_moka_cache(
+        MokaCacheOptions(
+            max_capacity=meta_cache_bytes, time_to_live=None, time_to_idle=None
+        )
+    )
+    return DbCache.new_split_cache(block, meta)
+
+
+def db_cache_id_for(topic: str, partition: int) -> int:
+    """The ``db_cache_id`` one partition instance uses in the shared
+    cache: the first 8 bytes of SHA-256 over ``"{topic}\\0{partition}"``
+    as a u64. The binding wants the id unique among the instances
+    sharing a cache and stable across reopens; one process consumes one
+    topic, so the bare partition number would already be unique within
+    a pod — hashing the pair costs nothing and stays unique if a
+    process ever opens two topics' stages against one cache."""
+    if partition < 0:
+        raise ValueError(f"partition must be >= 0, got {partition}")
+    digest = hashlib.sha256(f"{topic}\0{partition}".encode()).digest()
+    return int.from_bytes(digest[:8], "big")
+
+
 @dataclass(frozen=True, slots=True)
 class _Settlement:
     """The accounting of one applied flush settlement."""
@@ -405,6 +465,7 @@ class PartitionStage:
         self._write_lock = asyncio.Lock()
         self._closed = False
 
+    @overload
     @classmethod
     async def open(
         cls,
@@ -416,6 +477,39 @@ class PartitionStage:
         settings: Settings | None = None,
         ack_hook: AckHook | None = None,
         metrics_recorder: DefaultMetricsRecorder | None = None,
+        db_cache: DbCache,
+        db_cache_id: int,
+    ) -> PartitionStage: ...
+
+    @overload
+    @classmethod
+    async def open(
+        cls,
+        object_store_url: str,
+        path: str,
+        *,
+        topic: str,
+        partition: int,
+        settings: Settings | None = None,
+        ack_hook: AckHook | None = None,
+        metrics_recorder: DefaultMetricsRecorder | None = None,
+        cache_disabled: Literal[True],
+    ) -> PartitionStage: ...
+
+    @classmethod
+    async def open(
+        cls,
+        object_store_url: str,
+        path: str,
+        *,
+        topic: str,
+        partition: int,
+        settings: Settings | None = None,
+        ack_hook: AckHook | None = None,
+        metrics_recorder: DefaultMetricsRecorder | None = None,
+        db_cache: DbCache | None = None,
+        db_cache_id: int | None = None,
+        cache_disabled: bool = False,
     ) -> PartitionStage:
         """Open (or create) the partition's SlateDB at ``path`` on the
         store ``object_store_url`` resolves to (``memory:///``,
@@ -424,8 +518,10 @@ class PartitionStage:
         NOTE on ``memory:///``: each ``resolve`` is an isolated store —
         reopening "the same" memory path requires a shared store, which
         is what :meth:`open_store` is for.
+
+        The SST cache choice is REQUIRED (:meth:`open_store`).
         """
-        return await cls.open_store(
+        return await cls._open_store(
             ObjectStore.resolve(object_store_url),
             path,
             topic=topic,
@@ -433,7 +529,41 @@ class PartitionStage:
             settings=settings,
             ack_hook=ack_hook,
             metrics_recorder=metrics_recorder,
+            db_cache=db_cache,
+            db_cache_id=db_cache_id,
+            cache_disabled=cache_disabled,
         )
+
+    @overload
+    @classmethod
+    async def open_store(
+        cls,
+        store: ObjectStore,
+        path: str,
+        *,
+        topic: str,
+        partition: int,
+        settings: Settings | None = None,
+        ack_hook: AckHook | None = None,
+        metrics_recorder: DefaultMetricsRecorder | None = None,
+        db_cache: DbCache,
+        db_cache_id: int,
+    ) -> PartitionStage: ...
+
+    @overload
+    @classmethod
+    async def open_store(
+        cls,
+        store: ObjectStore,
+        path: str,
+        *,
+        topic: str,
+        partition: int,
+        settings: Settings | None = None,
+        ack_hook: AckHook | None = None,
+        metrics_recorder: DefaultMetricsRecorder | None = None,
+        cache_disabled: Literal[True],
+    ) -> PartitionStage: ...
 
     @classmethod
     async def open_store(
@@ -446,6 +576,9 @@ class PartitionStage:
         settings: Settings | None = None,
         ack_hook: AckHook | None = None,
         metrics_recorder: DefaultMetricsRecorder | None = None,
+        db_cache: DbCache | None = None,
+        db_cache_id: int | None = None,
+        cache_disabled: bool = False,
     ) -> PartitionStage:
         """Like :meth:`open` but on a pre-resolved object store.
 
@@ -454,11 +587,61 @@ class PartitionStage:
         snapshots it at scrape time (module docstring). One is created
         per stage when not handed in, so a stage always HAS a recorder —
         the collector never has to know whether wiring happened.
+
+        The SST cache choice is REQUIRED — exactly one of: ``db_cache``
+        + ``db_cache_id`` (the pod-level cache this instance shares with
+        every other, :func:`build_slatedb_cache`, scoped by
+        :func:`db_cache_id_for`), or ``cache_disabled=True`` (the
+        config's 0/0 pair). There is no third path: the binding's own
+        default is a 512 MiB + 128 MiB split cache PER INSTANCE, the
+        shape the pod-level knobs exist to replace, so it is never taken
+        silently (the overloads pin this for mypy; the checks below for
+        everyone else).
         """
+        return await cls._open_store(
+            store,
+            path,
+            topic=topic,
+            partition=partition,
+            settings=settings,
+            ack_hook=ack_hook,
+            metrics_recorder=metrics_recorder,
+            db_cache=db_cache,
+            db_cache_id=db_cache_id,
+            cache_disabled=cache_disabled,
+        )
+
+    @classmethod
+    async def _open_store(
+        cls,
+        store: ObjectStore,
+        path: str,
+        *,
+        topic: str,
+        partition: int,
+        settings: Settings | None,
+        ack_hook: AckHook | None,
+        metrics_recorder: DefaultMetricsRecorder | None,
+        db_cache: DbCache | None,
+        db_cache_id: int | None,
+        cache_disabled: bool,
+    ) -> PartitionStage:
         if not topic:
             raise ValueError("topic must be non-empty")
         if partition < 0:
             raise ValueError(f"partition must be >= 0, got {partition}")
+        if db_cache is not None and cache_disabled:
+            raise ValueError("db_cache and cache_disabled are mutually exclusive")
+        if db_cache is not None and db_cache_id is None:
+            raise ValueError("db_cache_id is required with a shared db_cache")
+        if db_cache is None and db_cache_id is not None:
+            raise ValueError("db_cache_id is meaningless without a db_cache")
+        if db_cache is None and not cache_disabled:
+            raise ValueError(
+                "an SST cache choice is required: db_cache + db_cache_id, or "
+                "cache_disabled=True (the binding's per-instance default is "
+                "never taken silently)"
+            )
         recorder = (
             metrics_recorder
             if metrics_recorder is not None
@@ -468,6 +651,11 @@ class PartitionStage:
         builder.with_metrics_recorder(recorder)
         if settings is not None:
             builder.with_settings(settings)
+        if db_cache is not None:
+            assert db_cache_id is not None  # the checks above
+            builder.with_db_cache(db_cache, db_cache_id)
+        else:
+            builder.with_db_cache_disabled()
         db = await builder.build()
         return cls(
             db,
@@ -1229,6 +1417,17 @@ class StageManager:
     silently frozen gauges. A live fallback scan is NOT
     itself published: a reader in fallback needs a fresh answer on
     every call.
+
+    One SST cache per manager (= per pod): built ONCE at construction
+    from the ``block_cache_bytes`` / ``meta_cache_bytes`` pair
+    (:func:`build_slatedb_cache`; defaults are config.py's) and handed
+    to every instance this manager opens with
+    ``db_cache_id_for(topic, partition)`` as its scope — the 0/0 pair
+    opens every instance with the cache disabled instead. The library
+    default would be one 640 MiB split cache PER INSTANCE. A revoked
+    partition's entries stay in the shared cache until capacity
+    eviction pushes them out — bounded by the pair, and harmless (no
+    other instance's id can address them; a reclaim reuses its id).
     """
 
     def __init__(
@@ -1239,6 +1438,8 @@ class StageManager:
         settings: Settings | None = None,
         ack_hook: AckHook | None = None,
         monotonic: Callable[[], float] = time.monotonic,
+        block_cache_bytes: int = SLATEDB_BLOCK_CACHE_BYTES_DEFAULT,
+        meta_cache_bytes: int = SLATEDB_META_CACHE_BYTES_DEFAULT,
     ) -> None:
         if not base_path.strip("/"):
             raise ValueError("base_path must be non-empty")
@@ -1246,6 +1447,10 @@ class StageManager:
         self._base_path = base_path.strip("/")
         self._settings = settings
         self._ack_hook = ack_hook
+        self._db_cache = build_slatedb_cache(
+            block_cache_bytes=block_cache_bytes, meta_cache_bytes=meta_cache_bytes
+        )
+        self._cache_capacity = (block_cache_bytes, meta_cache_bytes)
         self._monotonic = monotonic
         self._stages: dict[tuple[str, int], PartitionStage] = {}
         self._published: tuple[float, ManagerGauges] | None = None
@@ -1260,6 +1465,19 @@ class StageManager:
     @property
     def store(self) -> ObjectStore:
         return self._store
+
+    @property
+    def db_cache(self) -> DbCache | None:
+        """The pod-level SST cache every open instance shares — ``None``
+        when the manager opens instances with the cache disabled."""
+        return self._db_cache
+
+    @property
+    def cache_capacity_bytes(self) -> tuple[int, int]:
+        """The shared cache's configured ``(block, meta)`` capacities in
+        bytes — ``(0, 0)`` when disabled. Configuration, not occupancy:
+        the binding exposes no cache size."""
+        return self._cache_capacity
 
     def path_for(self, topic: str, partition: int) -> str:
         """The SlateDB path of one claimed partition."""
@@ -1282,14 +1500,28 @@ class StageManager:
         key = (topic, partition)
         if key in self._stages:
             raise StageError(f"partition already open: {key}")
-        stage = await PartitionStage.open_store(
-            self._store,
-            self.path_for(topic, partition),
-            topic=topic,
-            partition=partition,
-            settings=self._settings,
-            ack_hook=self._ack_hook,
-        )
+        path = self.path_for(topic, partition)
+        if self._db_cache is not None:
+            stage = await PartitionStage.open_store(
+                self._store,
+                path,
+                topic=topic,
+                partition=partition,
+                settings=self._settings,
+                ack_hook=self._ack_hook,
+                db_cache=self._db_cache,
+                db_cache_id=db_cache_id_for(topic, partition),
+            )
+        else:
+            stage = await PartitionStage.open_store(
+                self._store,
+                path,
+                topic=topic,
+                partition=partition,
+                settings=self._settings,
+                ack_hook=self._ack_hook,
+                cache_disabled=True,
+            )
         self._stages[key] = stage
         try:
             recovery = await stage.recover()

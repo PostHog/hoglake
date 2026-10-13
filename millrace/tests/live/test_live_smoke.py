@@ -20,8 +20,23 @@ pytestmark = pytest.mark.live
 
 async def test_s3_staging_smoke(lake_home, topic_factory):
     """Stage on s3:// (MinIO), close, reopen: durable, byte-exact."""
-    from millrace.stage import PartitionStage, StagedRecord
+    from millrace.config import (
+        SLATEDB_BLOCK_CACHE_BYTES_DEFAULT,
+        SLATEDB_META_CACHE_BYTES_DEFAULT,
+    )
+    from millrace.stage import (
+        PartitionStage,
+        StagedRecord,
+        build_slatedb_cache,
+        db_cache_id_for,
+    )
 
+    # The production cache shape: one pod-level cache, reused across
+    # the close/reopen exactly as a StageManager would.
+    cache = build_slatedb_cache(
+        block_cache_bytes=SLATEDB_BLOCK_CACHE_BYTES_DEFAULT,
+        meta_cache_bytes=SLATEDB_META_CACHE_BYTES_DEFAULT,
+    )
     topic = topic_factory(partitions=1)
     path = f"stage/{livekit.RUN_ID}/{topic.name}-smoke/{topic.name}/0"
     base = now_us()
@@ -39,6 +54,8 @@ async def test_s3_staging_smoke(lake_home, topic_factory):
         topic=topic.name,
         partition=0,
         settings=livekit.live_slate_settings(),
+        db_cache=cache,
+        db_cache_id=db_cache_id_for(topic.name, 0),
     )
     ack = await stage.stage_batch(records, now_us=base)
     assert ack.rows == 50 and ack.first_offset == 0 and ack.last_offset == 49
@@ -50,6 +67,8 @@ async def test_s3_staging_smoke(lake_home, topic_factory):
         topic=topic.name,
         partition=0,
         settings=livekit.live_slate_settings(),
+        db_cache=cache,
+        db_cache_id=db_cache_id_for(topic.name, 0),
     )
     try:
         rows = [kv async for kv in reopened.scan_group_rows(("7",))]

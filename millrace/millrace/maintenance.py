@@ -287,7 +287,13 @@ class AdminMaintainer:
     """``DbMaintainer`` over slatedb's ``Admin`` binding.
 
     One ``Admin`` handle per DB per operation: ``AdminBuilder.build()`` is a
-    pure constructor (no I/O), so there is nothing to cache. GC options are
+    pure constructor (no I/O), so there is nothing to cache. No SST block
+    cache either: ``AdminBuilder`` exposes none (only ``DbBuilder`` /
+    ``DbReaderBuilder`` take ``with_db_cache``), and the Admin operations
+    this service runs — manifest read, compactor-state view, ``run_gc_once``
+    — read manifests and list/delete objects, never SST blocks, so the
+    writer's pod-level ``MILLRACE_SLATEDB_*_CACHE_BYTES`` pair has no
+    maintenance counterpart. GC options are
     fixed for the process (min age applies to every directory task; boundary
     files — the list/delete race guard — stay enabled).
     """
