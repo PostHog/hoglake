@@ -28,7 +28,7 @@ Knobs
 | ``MILLRACE_STAGE_URL`` | required | staging root: ``s3://bucket/millrace``, ``file:///path`` or ``memory:///`` (tests). One SlateDB instance per claimed partition lives at ``<base>/<topic>/<partition>`` |
 | ``MILLRACE_TARGET_OUTPUT_BYTES`` | 500 MiB | planner size trigger — the estimated OUTPUT (parquet) size, compression roughly accounted (docs/kafka-ingestion.md §The flush planner) |
 | ``MILLRACE_FLUSH_DEADLINE_S`` | 900 | planner age trigger — the tail's freshness SLA |
-| ``MILLRACE_SLOW_LANE_DEADLINE_S`` | 21600 (6 h) | slow lane: flush any key this old regardless of size; accepted range 6–24 h |
+| ``MILLRACE_SLOW_LANE_DEADLINE_S`` | 21600 (6 h) | slow lane: flush any key this old regardless of size. Must be ≥ ``MILLRACE_FLUSH_DEADLINE_S`` (below it the age lane and ``MILLRACE_MIN_FLUSH_BYTES`` are dead letters). 6–24 h is the production shape; a dev table with a long tail of tiny keys can run it at minutes |
 | ``MILLRACE_MIN_FLUSH_BYTES`` | 1 MiB | the age lane's minimum size — a smaller key at the age deadline waits for the slow lane |
 | ``MILLRACE_MAX_FILES_PER_COMMIT`` | 512 | the most files one flush decision may fan out to under the live partition spec; a decision past it HALTS the pipeline (``fanout_exceeds_commit_bound``) before any upload — there is no commit chunking |
 | ``MILLRACE_SLATEDB_GC_ENABLED`` | ``false`` | the writer-internal SlateDB GC loop. DEFAULT OFF because the external maintenance service (``python -m millrace.maintenance``) is deployed beside every millrace fleet and owns collection — doubled GC is wasted LIST/DELETE traffic on the replicas (docs/kafka-ingestion.md §Maintenance services; GC itself is idempotent and overlap-safe, so a mixed or misconfigured deployment is wasteful, never corrupt). Boot logs a loud warning when off: the setting ASSUMES the maintenance service exists — without it, garbage accumulates forever. There is deliberately NO knob for ``compactor_options``: disabling the embedded compactor stalls memtable→L0 flushes at ``l0_max_ssts`` with nothing to drain them (parity-pinned, tests/test_slatedb_parity.py) |
@@ -221,11 +221,6 @@ _IDENTIFIER: Final = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,127}$")
 # S3 bucket names (millpond's _S3_URI bucket piece).
 _S3_BUCKET: Final = re.compile(r"^[a-z0-9][a-z0-9.\-]{1,61}[a-z0-9]$")
 
-#: The slow lane's accepted range, 6–24 h (docs/kafka-ingestion.md §The
-#: flush planner): below 6 h the lane duplicates the age lane's job;
-#: above 24 h churned keys stand unflushed for over a day.
-SLOW_LANE_DEADLINE_S_MIN: Final = 6 * 3600
-SLOW_LANE_DEADLINE_S_MAX: Final = 24 * 3600
 
 #: Pre-three-lane knob names → their successors, REFUSED at boot (module
 #: docstring): the rename narrowed the semantics, so there is no alias.
@@ -557,13 +552,24 @@ def load_config(env: Mapping[str, str]) -> Config:
     slow_lane_deadline_s = _positive_int(
         env, "MILLRACE_SLOW_LANE_DEADLINE_S", SLOW_LANE_DEADLINE_S_DEFAULT, problems
     )
-    if slow_lane_deadline_s is not None and not (
-        SLOW_LANE_DEADLINE_S_MIN <= slow_lane_deadline_s <= SLOW_LANE_DEADLINE_S_MAX
+    # The three lanes are independent knobs (docs/kafka-ingestion.md
+    # §The flush planner): size for the whales, deadline + minimum
+    # bytes for the mediums, the slow lane for the tail. The one
+    # relation that has to hold is slow ≥ flush deadline — a slow lane
+    # below the age lane flushes every key at the shorter cadence and
+    # the minimum-bytes floor never applies. No fixed range otherwise:
+    # 6–24 h is the production shape, and a dev table whose tail is
+    # most of its keys runs the slow lane at minutes.
+    if (
+        slow_lane_deadline_s is not None
+        and flush_deadline_s is not None
+        and slow_lane_deadline_s < flush_deadline_s
     ):
         problems.append(
-            f"MILLRACE_SLOW_LANE_DEADLINE_S={slow_lane_deadline_s} must be "
-            f"within 6-24 h ({SLOW_LANE_DEADLINE_S_MIN}-"
-            f"{SLOW_LANE_DEADLINE_S_MAX} s)"
+            f"MILLRACE_SLOW_LANE_DEADLINE_S={slow_lane_deadline_s} must be >= "
+            f"MILLRACE_FLUSH_DEADLINE_S={flush_deadline_s}: below the age "
+            "lane's deadline the slow lane flushes every key at the shorter "
+            "cadence and MILLRACE_MIN_FLUSH_BYTES never applies"
         )
         slow_lane_deadline_s = None
     min_flush_bytes = _positive_int(

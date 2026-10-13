@@ -1010,7 +1010,7 @@ default.
 | `MILLRACE_STAGE_URL` | required | `s3://<valid bucket>/<non-empty prefix>`, `file:///<dir>`, `memory:///` | Staging root; DBs at `<base>/<topic>/<partition>` |
 | `MILLRACE_TARGET_OUTPUT_BYTES` | 524288000 (500 MiB) | positive | Size lane threshold on estimated parquet output; also scan budget and footer-stats threshold input |
 | `MILLRACE_FLUSH_DEADLINE_S` | 900 | positive | Age lane deadline |
-| `MILLRACE_SLOW_LANE_DEADLINE_S` | 21600 (6 h) | 21600–86400 | Slow lane deadline |
+| `MILLRACE_SLOW_LANE_DEADLINE_S` | 21600 (6 h) | positive, ≥ `MILLRACE_FLUSH_DEADLINE_S` | Slow lane deadline; 6–24 h in production, minutes on a dev table whose tail is most of its keys |
 | `MILLRACE_MIN_FLUSH_BYTES` | 1048576 (1 MiB) | positive | Age lane size floor |
 | `MILLRACE_MAX_FILES_PER_COMMIT` | 512 | positive | Max files one decision may fan out to; exceeding it halts |
 | `MILLRACE_SLATEDB_GC_ENABLED` | `false` | true/false/1/0/yes/no | Writer-embedded SlateDB GC |
@@ -1076,7 +1076,7 @@ does a live scan (2 s timeout on the pipeline loop; a busy loop drops the
 gauges for that scrape). A live scan has no planner input, so the
 eligible-age gauge is absent in fallback rather than frozen. "Eligible"
 matters because a group below `MILLRACE_MIN_FLUSH_BYTES` legitimately
-waits up to the slow-lane deadline (6–24 h): the raw oldest staged age
+waits up to the slow-lane deadline (6 h by default): the raw oldest staged age
 sits at hours in normal operation, while the eligible age measures how
 far the flush loop is behind. Per-partition labels are bounded by the
 pod's assigned partitions; no metric carries a partition-tuple label.

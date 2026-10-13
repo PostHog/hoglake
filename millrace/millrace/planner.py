@@ -18,7 +18,7 @@ Three lanes, evaluated per key; arrivals never reset a key's
   15-minute mark earns NOTHING here, so the tail stops producing a
   small file per key per window.
 - **slow** — ``age >= slow_lane_deadline`` regardless of size: the
-  pathological low-volume keys, one flush per 6–24 h instead of ~96
+  pathological low-volume keys, one flush per slow-lane deadline instead of ~96
   tiny files a day. The slow lane subsumes the old churn reaper: any
   key this old flushes, so churned tenants leave no residue and the
   stats keyspace reflects live tenants.
@@ -111,8 +111,9 @@ DEFAULT_COMPRESSION_RATIO: Final = 0.2
 #: lakehouse-sized file the server-side compaction story is built
 #: around. The flush deadline is the tail's freshness SLA. The slow
 #: lane deadline is the pathological-key cadence — 6 h by default
-#: (config accepts 6–24 h), trading those keys' freshness from ~96
-#: files/day to ~4. The age lane's floor is deliberately low — ~1 row/s
+#: (config requires it at or above the flush deadline; 6–24 h is the
+#: production shape), trading those keys' freshness from ~96 files/day
+#: to ~4. The age lane's floor is deliberately low — ~1 row/s
 #: sustained (~1 MiB of staged bytes per 15-minute window at ~1
 #: KB/row): below it a 15-minute file is the small-file regime the lane
 #: exists to suppress; "medium" tenants sit comfortably above it and
