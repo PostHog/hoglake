@@ -2708,7 +2708,11 @@ paths:
         NOTHING to the sums and is never read from its own manifest for
         them; unsampled_catalogs counts those, so a reader can tell a
         partial sum from a whole one. All three are omitted in the boot
-        window before the first sample.
+        window before the first sample. While catalogs exist but none
+        has published totals (the window after an upgrade that adds
+        them), total_rows and total_size_bytes are omitted and
+        unsampled_catalogs alone is present: a sum over nothing is 0,
+        which would read as an empty warehouse.
       responses:
         "200":
           description: Instance info
@@ -2746,8 +2750,17 @@ paths:
                       "not off the pipeline", not an error. Opaque and
                       display-only: never parse it for ordering you
                       depend on.
-                  total_rows: { type: integer, format: int64 }
-                  total_size_bytes: { type: integer, format: int64 }
+                  total_rows:
+                    type: integer
+                    format: int64
+                    description: >
+                      Omitted before the first sample, and while no
+                      catalog has published totals (see
+                      unsampled_catalogs).
+                  total_size_bytes:
+                    type: integer
+                    format: int64
+                    description: Omitted exactly when total_rows is.
                   unsampled_catalogs:
                     type: integer
                     description: >
@@ -2757,7 +2770,9 @@ paths:
                       generation that did not measure rows. A catalog
                       is in both totals or in neither, so the two
                       always cover the same set. 0 when they cover
-                      every catalog.
+                      every catalog. Present whenever a sample has
+                      run, including when it is every catalog and the
+                      two sums are therefore omitted.
 
   /catalogs/{catalog}/consumers:
     get:

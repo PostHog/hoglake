@@ -158,18 +158,39 @@ function InstanceTotals() {
     refetchIntervalInBackground: false,
     retry: false,
   });
-  if (data?.total_size_bytes === undefined) return null;
+  if (!data) return null;
+  const unsampled = data.unsampled_catalogs ?? 0;
+  const catalogs = `${unsampled} catalog${unsampled === 1 ? "" : "s"}`;
+  if (data.total_size_bytes === undefined) {
+    // Sampled, but no catalog has published totals yet (the window
+    // after an upgrade that adds them): say so rather than nothing,
+    // which looks the same as the boot window and never resolves.
+    if (unsampled === 0) return null;
+    return (
+      <span
+        className="instance-totals"
+        title={
+          `Live totals are not known yet: ${catalogs} awaiting the ` +
+          "maintenance summary's first published generation"
+        }
+      >
+        sampling {catalogs}…
+      </span>
+    );
+  }
   return (
     <span
       className="instance-totals"
       title={
         `${data.total_size_bytes} bytes, ${formatCount(data.total_rows)} ` +
         "rows registered across all live data files (rows are gross of " +
-        "deletion-vector masking; refreshed by the server's metrics sampler)"
+        "deletion-vector masking; refreshed by the server's metrics sampler)" +
+        (unsampled > 0 ? `; ${catalogs} not yet sampled and left out` : "")
       }
     >
       {formatBytes(data.total_size_bytes)} ·{" "}
       {formatCompactCount(data.total_rows)} rows
+      {unsampled > 0 ? ` · ${unsampled} unsampled` : ""}
     </span>
   );
 }
