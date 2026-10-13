@@ -38,7 +38,7 @@ from dataclasses import dataclass
 
 import pytest
 from slatedb.uniffi import ObjectStore, Settings
-from stagekit import NOW, fast_flush_settings, window
+from stagekit import NOW, fast_flush_settings, shared_cache, window
 
 from millrace.slatedb_metrics import snapshot_recorder
 from millrace.stage import PartitionStage, StagedRecord, build_slatedb_settings
@@ -88,7 +88,12 @@ async def _run_bench(
     store: ObjectStore, path: str, settings: Settings, label: str, interval: str
 ) -> BenchResult:
     stage = await PartitionStage.open_store(
-        store, path, topic="events", partition=0, settings=settings
+        store,
+        path,
+        topic="events",
+        partition=0,
+        settings=settings,
+        **shared_cache(),
     )
     offset = 0
     latencies: list[float] = []
@@ -260,7 +265,12 @@ async def _run_whale(
     store: ObjectStore, path: str, settings: Settings, label: str
 ) -> WhaleResult:
     stage = await PartitionStage.open_store(
-        store, path, topic="events", partition=0, settings=settings
+        store,
+        path,
+        topic="events",
+        partition=0,
+        settings=settings,
+        **shared_cache(),
     )
     lat: list[float] = []
     start = time.perf_counter()
@@ -354,6 +364,7 @@ async def test_bench_whale_l0_stress():
                 topic="events",
                 partition=0,
                 settings=stress_settings(l0_max),
+                **shared_cache(),
             )
             lat: list[float] = []
             start = time.perf_counter()

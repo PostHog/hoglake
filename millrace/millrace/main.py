@@ -366,6 +366,21 @@ class _PipelineCollector:
             except Exception:
                 log.debug("a SlateDB metrics recorder snapshot failed", exc_info=True)
         yield from slatedb_families(snapshots)
+        # The pod-level SST cache's CONFIGURED capacity (0/0 when
+        # disabled): static, but on the same page as the access counter
+        # it sizes. The binding exposes no occupancy — the hit ratio per
+        # entry_kind on millrace_slatedb_block_cache_accesses_total is
+        # the only behavioral signal.
+        capacity = GaugeMetricFamily(
+            "millrace_slatedb_cache_capacity_bytes",
+            "Configured capacity of the pod's shared SlateDB SST cache, by "
+            "split-cache half (0 when the cache is disabled)",
+            labels=["half"],
+        )
+        block_bytes, meta_bytes = self._stages.cache_capacity_bytes
+        capacity.add_metric(["block"], block_bytes)
+        capacity.add_metric(["meta"], meta_bytes)
+        yield capacity
         try:
             gauges = asyncio.run_coroutine_threadsafe(
                 self._stages.gauges(max_staleness_s=self._gauge_max_staleness_s),
@@ -451,7 +466,11 @@ async def _run(cfg: Config, hoglake_url: str, s3_kwargs: Mapping[str, Any]) -> i
             "run embedded GC instead (safe under overlap either way)."
         )
     stages = StageManager(
-        cfg.stage_store_url, cfg.stage_base_path, settings=slatedb_settings
+        cfg.stage_store_url,
+        cfg.stage_base_path,
+        settings=slatedb_settings,
+        block_cache_bytes=cfg.slatedb.block_cache_bytes,
+        meta_cache_bytes=cfg.slatedb.meta_cache_bytes,
     )
     flusher: HoglakeFlusher | None = None
     ops = None

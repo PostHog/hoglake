@@ -733,6 +733,8 @@ class Pipeline:
             cfg.stage_store_url,
             cfg.stage_base_path,
             settings=live_slate_settings(),
+            block_cache_bytes=cfg.slatedb.block_cache_bytes,
+            meta_cache_bytes=cfg.slatedb.meta_cache_bytes,
         )
         self.client = HoglakeClient(HOGLAKE_URL, s3=s3_config())
         self.flusher: HoglakeFlusher | None = None

@@ -9,8 +9,9 @@ migration guide.
 Probes: transactions with isolation (commit / rollback / conflict),
 scan ``seek`` and iterator snapshot isolation, the range-delete idiom
 this codebase uses, WriteBatch consumption, checkpoint
-create/list/delete, the ``await_durable`` ack boundary, and writer
-fencing on a contested open.
+create/list/delete, the ``await_durable`` ack boundary, writer
+fencing on a contested open, and the shared split DB cache (wiring,
+reopen, and access_count presence/absence).
 """
 
 from __future__ import annotations
@@ -30,6 +31,8 @@ from slatedb.uniffi import (
     CompactionSpec,
     CompactionStatus,
     DbBuilder,
+    DbCache,
+    DefaultMetricsRecorder,
     FlushOptions,
     FlushType,
     GarbageCollectorDirectoryOptions,
@@ -37,6 +40,7 @@ from slatedb.uniffi import (
     GarbageCollectorScheduleOptions,
     IsolationLevel,
     KeyRange,
+    MokaCacheOptions,
     ObjectStore,
     Settings,
     SourceId,
@@ -249,6 +253,91 @@ async def test_await_durable_means_survives_reopen():
     reopened = await DbBuilder("parity/durable", store).build()
     assert await reopened.get(b"acked") == b"v"
     await reopened.shutdown()
+
+
+# -- the shared split DB cache ---------------------------------------------------------
+
+
+def _cache_accesses(recorder: Any) -> dict[tuple[str, str], int]:
+    """``slatedb.db_cache.access_count`` by (entry_kind, result)."""
+    from millrace.slatedb_metrics import snapshot_recorder
+
+    return {
+        (dict(m.labels)["entry_kind"], dict(m.labels)["result"]): int(m.value or 0)
+        for m in snapshot_recorder(recorder)
+        if m.name == "slatedb.db_cache.access_count"
+    }
+
+
+@pytest.mark.component
+async def test_two_instances_share_one_split_cache():
+    """The pod-level cache shape (stage.build_slatedb_cache) WIRES and
+    METERS: ONE split moka cache handed to two ``DbBuilder`` instances
+    with distinct ``db_cache_id`` values; each reads back exactly its
+    own rows from SSTs, and each instance's recorder sees
+    ``slatedb.db_cache.access_count`` move (the pod metric
+    ``millrace_slatedb_block_cache_accesses_total`` is their sum); the
+    id is reusable on reopen; and a disabled cache emits NO
+    access_count metric at all — the series goes absent, not to zero.
+
+    What this canNOT show: scope isolation. Cache keys carry the SST id,
+    a ULID, so two instances' keys never collide whatever ``db_cache_id``
+    says — a scope bug is not observable through the binding. Nor can it
+    show capacity units (the binding exposes no occupancy); that bytes
+    claim rests on slatedb 0.17 ``db_cache/moka.rs``'s size weigher and
+    is documented, not tested."""
+    store = ObjectStore.resolve("memory:///")
+    cache = DbCache.new_split_cache(
+        DbCache.new_moka_cache(
+            MokaCacheOptions(max_capacity=1 << 20, time_to_live=None, time_to_idle=None)
+        ),
+        DbCache.new_moka_cache(
+            MokaCacheOptions(max_capacity=1 << 20, time_to_live=None, time_to_idle=None)
+        ),
+    )
+    recorders = [DefaultMetricsRecorder(), DefaultMetricsRecorder()]
+    dbs = []
+    for i in range(2):
+        builder = DbBuilder(f"parity/shared-cache/{i}", store)
+        builder.with_metrics_recorder(recorders[i])
+        builder.with_db_cache(cache, i + 1)
+        dbs.append(await builder.build())
+    try:
+        for i, db in enumerate(dbs):
+            for k in range(50):
+                await db.put(f"k{k:03d}".encode(), f"db{i}-v{k}".encode())
+            await _flush_memtable(db)
+        before = [_cache_accesses(r) for r in recorders]
+        for i, db in enumerate(dbs):
+            for k in range(50):
+                assert await db.get(f"k{k:03d}".encode()) == f"db{i}-v{k}".encode()
+        after = [_cache_accesses(r) for r in recorders]
+        for b, a in zip(before, after, strict=True):
+            data_before = b[("data_block", "hit")] + b[("data_block", "miss")]
+            data_after = a[("data_block", "hit")] + a[("data_block", "miss")]
+            assert data_after > data_before
+    finally:
+        for db in dbs:
+            await db.shutdown()
+
+    # The id is reusable on reopen (the binding: "stable across reopens").
+    for i in range(2):
+        builder = DbBuilder(f"parity/shared-cache/{i}", store)
+        builder.with_db_cache(cache, i + 1)
+        reopened = await builder.build()
+        assert await reopened.get(b"k007") == f"db{i}-v7".encode()
+        await reopened.shutdown()
+
+    recorder = DefaultMetricsRecorder()
+    builder = DbBuilder("parity/no-cache", store)
+    builder.with_metrics_recorder(recorder)
+    builder.with_db_cache_disabled()
+    db = await builder.build()
+    await db.put(b"a", b"1")
+    await _flush_memtable(db)
+    assert await db.get(b"a") == b"1"
+    assert _cache_accesses(recorder) == {}
+    await db.shutdown()
 
 
 # -- writer fencing on a contested open ------------------------------------------------

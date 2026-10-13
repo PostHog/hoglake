@@ -262,7 +262,10 @@ drains, `/healthz` and `/readyz` both 503 with the fence named.
 Every partition's SlateDB instance opens with explicit `Settings` wired
 from `MILLRACE_SLATEDB_*` (config.py's table; the binding's defaults
 are per-instance and there are K instances per pod, so defaults need
-arithmetic, not trust):
+arithmetic, not trust), and every instance in the pod shares ONE SST
+cache the `StageManager` builds at startup (the cache choice is
+required at every `PartitionStage` open — the library default is never
+taken silently):
 
 - `MILLRACE_SLATEDB_GC_ENABLED` (default **false**) — the
   writer-internal GC loop is off because the external maintenance
@@ -275,13 +278,33 @@ arithmetic, not trust):
   stalls memtable→L0 flushes at `l0_max_ssts` with nothing to drain
   them (parity-pinned in `tests/test_slatedb_parity.py`).
 - `MILLRACE_SLATEDB_MAX_UNFLUSHED_BYTES` (default 256 MiB) caps one
-  instance's unflushed memtable+WAL backlog. **Per-pod worst case:
-  K × this.** At 64 assigned partitions that is 16 GiB against the
-  library default's 64 GiB — and the flush sweep's in-flight scans
-  (`4 × MILLRACE_FLUSH_CONCURRENCY` bounded scans of at most
-  ~`MILLRACE_TARGET_OUTPUT_BYTES ÷ compression ratio` staged bytes
-  each) sit on top. Size the pod's memory request against the sum, not
-  the library default.
+  instance's unflushed memtable+WAL backlog — **per instance, so the
+  pod's worst case is K × this** (the library default is 1 GiB, 64 GiB
+  at 64 partitions).
+- `MILLRACE_SLATEDB_BLOCK_CACHE_BYTES` (default 128 MiB) and
+  `MILLRACE_SLATEDB_META_CACHE_BYTES` (default 128 MiB) bound the SST
+  data-block cache and the index/filter cache — **per pod**: one split
+  moka cache is built once and handed to every instance with a
+  per-partition `db_cache_id` (`stage.db_cache_id_for`). Capacity is in
+  bytes (moka weighs each entry by its size — slatedb 0.17
+  `db_cache/moka.rs`). The library default is the same split shape but
+  per INSTANCE — 512 MiB + 128 MiB, so 16 unconfigured partitions could
+  cache 10 GiB. The halves are even on purpose: meta holds the index
+  and filter blocks of every SST of every instance and is where the
+  hits come from; the block half churns, because every memtable flush
+  inserts its data blocks while flush scans read older data. A revoked
+  partition's entries stay until capacity eviction (bounded, harmless).
+  `0` for both disables the cache (`with_db_cache_disabled`); `0` for
+  exactly one is refused (the split cache needs both halves), as is a
+  non-zero value below 4096 (one default block) or at/above 2**64.
+  Observability: `millrace_slatedb_cache_capacity_bytes{half="block"|"meta"}`
+  exports the configured pair (0 when disabled). The binding exposes
+  no occupancy, so the behavioral signal is
+  `millrace_slatedb_block_cache_accesses_total{entry_kind,result}` —
+  `entry_kind` is `filter`/`index`/`data_block`/`stats`; watch the hit
+  ratio per kind (it goes absent when the cache is disabled). The
+  maintenance service has no counterpart: its `Admin` handles read
+  manifests, never SST blocks, and `AdminBuilder` takes no cache.
 - `MILLRACE_SLATEDB_L0_MAX_SSTS` (default 8, SlateDB's own) — the L0
   depth at which writes stall when the embedded compactor falls behind.
   The stall precursor is observable before it bites: the maintenance
@@ -296,6 +319,45 @@ arithmetic, not trust):
   single-group shape (an L0 SST per ~1.2 s against the compactor's 5 s
   poll) is the one pilot question the local bench cannot answer, and
   the debt series is its tripwire.
+
+**Pod memory, in terms.** Size the request against this sum, not the
+library defaults:
+
+```
+  K × MILLRACE_SLATEDB_MAX_UNFLUSHED_BYTES        per instance
++ (BLOCK_CACHE_BYTES + META_CACHE_BYTES) × ~1.05  pod-level, once (+~5% moka per-entry overhead)
++ MILLRACE_KAFKA_QUEUED_MAX_MESSAGES_KBYTES × 1 KiB
+  + MILLRACE_KAFKA_FETCH_MAX_BYTES                librdkafka queue + one fetch in flight
++ MILLRACE_CONSUME_BATCH_MAX_BYTES                one consumed batch being staged
++ in-flight decisions × ( max(MILLRACE_FLUSH_SCAN_MIN_BYTES,
+                              MILLRACE_TARGET_OUTPUT_BYTES ÷ ratio × 1.25)   scanned staged bytes
+                          + decoded Arrow (estimate: ~the scanned bytes again)
+                          + output (≤ MILLRACE_TARGET_OUTPUT_BYTES) )
++ process baseline                                interpreter, pyarrow, librdkafka (measure idle RSS)
+```
+
+In-flight decisions are bounded process-wide at
+`4 × MILLRACE_FLUSH_CONCURRENCY` (flush.py `FlushRunner`), except that
+`MILLRACE_FLUSH_CONCURRENCY=1` is the strictly serial sweep — one
+decision in flight. `ratio` is the observed compression ratio (0.2
+until the EWMA has data).
+
+The 16-partition dev example at the dev chart's values
+(`MAX_UNFLUSHED_BYTES` 96 MiB, `TARGET_OUTPUT_BYTES` 128 MiB,
+`FLUSH_CONCURRENCY` 1; everything else at defaults):
+
+| term | value |
+|---|---|
+| 16 × 96 MiB unflushed | 1,536 MiB |
+| shared cache (128 + 128 MiB) × 1.05 | ~269 MiB |
+| librdkafka queue 256 MiB + fetch 256 MiB | 512 MiB |
+| consume batch | 256 MiB |
+| 1 decision × (max(64, 128 ÷ 0.2 × 1.25 = 800) + ~800 decoded + 128 output) | ~1,728 MiB |
+| **sum before process baseline** | **~4,300 MiB (≈ 4.2 GiB)** |
+
+The scan term is the catch-up worst case; steady-state scans are the
+size of a group's staged slice. The library-default cache alone would
+have been 16 × 640 MiB = 10 GiB.
 
 Resident memory grows past the Python heap in two phases, both
 expected: a warm-up while each instance's memtable fills to its first

@@ -572,3 +572,79 @@ def test_flush_counters_are_exposed_by_exact_name_labels_and_value():
         flusher.close()
         loop.run_until_complete(asyncio.sleep(0.05))
         loop.close()
+
+
+# -- the pod-level SlateDB cache ------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("env", "expected"),
+    [
+        (
+            {
+                "MILLRACE_SLATEDB_BLOCK_CACHE_BYTES": "12345678",
+                "MILLRACE_SLATEDB_META_CACHE_BYTES": "87654321",
+            },
+            (12345678, 87654321),
+        ),
+        (
+            {
+                "MILLRACE_SLATEDB_BLOCK_CACHE_BYTES": "0",
+                "MILLRACE_SLATEDB_META_CACHE_BYTES": "0",
+            },
+            (0, 0),
+        ),
+    ],
+    ids=["non-default", "disabled"],
+)
+def test_main_passes_the_cache_pair_to_the_stage_manager(
+    monkeypatch: pytest.MonkeyPatch, env: dict[str, str], expected: tuple[int, int]
+):
+    """The env pair reaches the ONE StageManager the pipeline builds —
+    non-default values (so a dropped kwarg falling back to the
+    StageManager default cannot pass) and the 0/0 disabled pair."""
+    seen: list[dict[str, Any]] = []
+
+    def stub(*args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs)
+        raise RuntimeError("stop here")
+
+    monkeypatch.setattr(main, "StageManager", stub)
+    rc = main._main(_valid_env() | env | {"HOGLAKE_URL": "http://hog.test"})
+    assert rc == main.EXIT_ERROR
+    (kwargs,) = seen
+    assert (kwargs["block_cache_bytes"], kwargs["meta_cache_bytes"]) == expected
+
+
+def _labelled(collector: Any, family: str) -> dict[tuple[tuple[str, str], ...], float]:
+    return {
+        tuple(sorted(s.labels.items())): s.value
+        for m in collector.collect()
+        if m.name == family
+        for s in m.samples
+    }
+
+
+@pytest.mark.parametrize(
+    ("block", "meta"), [(8192, 16384), (0, 0)], ids=["sized", "disabled"]
+)
+async def test_pipeline_collector_exports_the_cache_capacity(block: int, meta: int):
+    """``millrace_slatedb_cache_capacity_bytes{half}``: the configured
+    pair, static, 0/0 when disabled — the binding exposes no occupancy."""
+    import asyncio
+
+    consumer, _, flusher = _collector()
+    stages = StageManager(
+        "memory:///", "millrace", block_cache_bytes=block, meta_cache_bytes=meta
+    )
+    try:
+        collector = main._PipelineCollector(
+            consumer, flusher, stages, asyncio.get_running_loop()
+        )
+        got = await asyncio.to_thread(
+            _labelled, collector, "millrace_slatedb_cache_capacity_bytes"
+        )
+        assert got == {(("half", "block"),): block, (("half", "meta"),): meta}
+    finally:
+        flusher.close()
+        await stages.close()
