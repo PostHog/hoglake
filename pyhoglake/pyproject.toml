@@ -16,12 +16,21 @@ classifiers = [
 ]
 dependencies = [
     "httpx>=0.27",
-    # 21.0, not 18.0: pa.uuid() exists from 18, but pyarrow only stamps
-    # the parquet UUID logical annotation hoglake's uuid wire form
-    # requires from 21 (measured against 18.0/18.1/19.0/20.0, all of
-    # which write a bare FIXED_LEN_BYTE_ARRAY(16)). Current release at
-    # the time of the bump: 25.0.1.
-    "pyarrow>=21.0",
+    # 23.0, not 21.0: pyarrow 21 refuses to open any Parquet file with a
+    # VARIANT-annotated group ("Logical type Variant cannot be applied to
+    # group node"), which is every VARIANT file there is, and 21 and 22
+    # cannot extract the statistics of an INT32/INT64 DECIMAL column
+    # ("Cannot extract statistics for type"): how pyhoglake writes a
+    # decimal4/decimal8 VARIANT leaf, and how DuckDB writes every decimal
+    # of precision 18 or less, which prepare_append_files reads stats from.
+    # Measured against 21.0.0, 22.0.0, 23.0.0, 23.0.1, 24.0.0, 25.0.1 and
+    # 26.0.0; 23.0.0 is the first that reads, stamps and re-reads a VARIANT
+    # file as test_variant_footer.py requires, and millpond pins 23.0.1.
+    # CI's pyarrow matrix runs the unit suite on this floor. (21 was
+    # itself the floor of the parquet UUID annotation hoglake's uuid wire
+    # form requires, which pyarrow 18-20 do not write.) Current release at
+    # the time of the bump: 26.0.0.
+    "pyarrow>=23.0",
     "thrift>=0.22.0,<1",
 ]
 

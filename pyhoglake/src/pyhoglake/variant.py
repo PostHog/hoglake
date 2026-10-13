@@ -811,7 +811,7 @@ def _plain(node: Any) -> Any:
 
 
 def _is_json_type(t: pa.DataType) -> bool:
-    # pa.JsonType is pyarrow >= 19, below the project's floor of 21.
+    # pa.JsonType is pyarrow >= 19, below the project's floor of 23.
     return isinstance(t, getattr(pa, "JsonType", ()))
 
 

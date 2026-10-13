@@ -25,13 +25,103 @@ four are generator-friendly.
   stats extraction vs independently computed ground truth, and
   wire-model parsing under mutated JSON (extra/missing/wrong-typed
   fields must fail cleanly, never leak `KeyError`). The VARIANT codec's
-  properties live in `tests/variant_conformance/qe_prop_variant_codec.py`
-  (beside its other suites, which the `tests/qe_*.py` glob misses):
-  JSON and Python values round-trip to the source value under generated
-  declarations, encoding is deterministic however the rows are chunked,
-  an invalid row becomes SQL NULL and nothing else moves, aware
-  datetimes round-trip or are refused, and mutated Variant bytes are
-  read or refused with `VariantEncodingError`, never another exception.
+  properties live in
+  `tests/variant_conformance/qe_prop_variant_codec.py` (beside its other
+  suites, which the `tests/qe_*.py` glob misses): JSON and Python values
+  round-trip to the source value under generated declarations, encoding
+  is deterministic however the rows are chunked, an invalid row becomes
+  SQL NULL and nothing else moves, aware datetimes round-trip or are
+  refused, and mutated Variant bytes are read or refused with
+  `VariantEncodingError`, never another exception. The VARIANT footer's
+  are beside them, in `qe_prop_variant_footer.py`: a file written for a
+  generated declaration is, byte for byte, what a generic compact-Thrift
+  re-encoding (`tests/footer_oracle.py`) makes of pyarrow's bytes with
+  the annotations added, and passes the strict layout check; schema
+  elements mutated from real footers get a fault or none from
+  `variant_layout_fault`, never an exception; and those files, with
+  footer bytes overwritten and `created_by` forged (non-UTF-8 among it),
+  or with the column chunk fields pyarrow reads lazily forged (type,
+  statistics, SizeStatistics, encryption), or with schema element fields
+  spelled with another wire type, given twice or dropped, and the schema
+  list given twice, whenever pyarrow still opens them, are accepted or
+  refused with `ValidationError` by `validate_variant_file`, strict or
+  not, and by `validate_column_chunks`; what the first accepts
+  `extract_column_stats` reads, and what the last accepts every chunk's
+  metadata and statistics read. The overwrite property found pyarrow
+  (23.0.0 to 26.0.0) aborting the process when it reads the statistics
+  of a chunk whose type is not its schema leaf's, or whose min or max is
+  too short for the type, and review found the same abort when it builds
+  a chunk's metadata (`row_group.column(i)`) with a level histogram that
+  does not fit the leaf, unencoded byte array bytes on a chunk that is
+  not BYTE_ARRAY, or a column-key encryption: the C++ exception is not
+  translated, so no Python handler sees it. Random overwrites rarely
+  spell the latter, which is why the chunk property forges fields
+  instead. Every prepared file's chunks are checked from the footer's
+  bytes before any is read (`parquet_schema._ChunkCheck`, run by
+  `validate_variant_file` and, for a file it does not see, by
+  `validate_column_chunks`), and each finding is a regression test in
+  `test_variant_schema.py` and `test_append_unit.py`. The extended
+  property also found a `path_in_schema` that is not UTF-8 escaping
+  `extract_column_stats` as `UnicodeDecodeError`; the same check refuses
+  it. Review then found the check reading a footer otherwise than
+  pyarrow: Thrift's generated readers skip a field whose wire type is
+  not the declared one (a repetition_type spelled as an i8 is no
+  repetition_type, so the leaf is REQUIRED), merge a repeated struct
+  field into the first copy, and keep the last of two schema lists. So
+  each chunk is now held to pyarrow's own ColumnDescriptors, the footer
+  reader skips a mistyped field as they do, and a footer with a repeated
+  field is refused; the forging properties spell both. A further review
+  found Python's Thrift keeping a varint whole where the generated
+  readers keep its low bits: a field id 65536 + k is field k to pyarrow
+  and parquet-java, which hid a checked field from the guard (and a
+  delta sum wraps the same way), and an i32 or a size likewise. So a
+  field id outside an i16, and an integer or a size wider than its type,
+  are refused. Thrift's own writer will not spell either, so the
+  properties cannot draw them; `footer_oracle.encode_unchecked` spells
+  them for the regression tests. Review then found the reader checking a
+  list's item type only for the lists it declared: the generated readers
+  read every list's items as parquet.thrift declares them, whatever the
+  header says, so an encodings list whose header named one binary hid,
+  inside it, Statistics pyarrow read as the chunk's own, and aborted on.
+  Every list parquet.thrift declares on the way to what the guard reads
+  is now declared, and a header of another item type refused; a further
+  property
+  (`test_list_items_of_another_type_are_accepted_or_refused_never_raised_past`)
+  spells such headers, with chunk fields hidden in an encodings item
+  among them. A list, a set or a map in a field parquet.thrift does not
+  define is refused outright now, wherever it is, so a list a later
+  parquet.thrift declares cannot reopen that; every field it does define
+  in the structs on the way is declared, read or not, so one spelled
+  with another wire type is skipped by its header as the generated
+  readers skip it, and the refusal names the field it is in. Review also
+  found the reader holding every field it read as Python objects, some
+  70 bytes a footer byte, so a 60 MB footer of empty structs pyarrow
+  opened in 105 MB ran the caller out of memory: what no check reads is
+  now read past and not kept, and the row groups are checked as they are
+  read, so the peak is linear in the footer, a few times it for a wide
+  schema, which is kept
+  (`test_a_footer_is_checked_in_memory_linear_in_its_bytes`). No
+  property covers memory; that test pins it. A later review found two
+  disagreements the properties could not draw: a union (a logical type,
+  a time unit, a column order) of two fields, which pyarrow reads as a
+  struct and parquet-java's TUnion as its first field, then reads the
+  rest of the footer out of step, and a group with a physical type, a
+  group to pyarrow and a primitive to parquet-java. Both are refused, on
+  files shared with the server's FooterStatsTest. It also found the
+  skip's map branch and its double reader pinned by nothing; the chunk
+  property now spells maps of keys and values of other types, and two
+  regression tests hide 1-byte bounds behind a map and a double that a
+  misread skip would swallow. A further review found readers parting on
+  what pyarrow opens: an annotation (pyarrow reads the logical type,
+  parquet-java lets a converted type that spells another type win, and
+  builds what fits the element alone), a logical type of no member, a
+  required enum of an undefined value, a chunk path that is not its
+  leaf's, and an IEEE754 column order on an integer. Each is refused;
+  the chunk property now forges codecs, paths and page encoding stats,
+  and holds every accepted chunk's path to pyarrow's own leaf path, and
+  the schema element property forges annotations and column orders. The
+  annotation rule's ground truth is parquet-java, through a vector file
+  (below).
 - **server** (planned, kotest-property or jqwik): the same codec
   properties on `IcebergSingleValue`, expiry `newEarliest` math under
   generated snapshot/offset/time configurations (invariants: never >
@@ -78,6 +168,21 @@ Python whose Unicode data is newer than the server's, the client leaves
 every case pair that is not ASCII to the server, and the Python test
 reads every such refusal as may_accept there (it runs the file under
 both this Python's data and newer data).
+
+`pyhoglake/tests/vectors/schema_annotation_vectors.json`: one schema
+element of each pairing of physical type (or group), logical type,
+converted type and DECIMAL scale and precision fields, each with how
+parquet-java reads it: as pyarrow does (`reads`, the logical type where
+there is one), with the converted type winning over a logical type that
+spells another (`reads_converted`), or not at all (`refuses`). The
+verdicts were recorded from parquet-java 1.18.1, and the Trino
+connector's `ParquetMetadata` measured against them; the JVM-side
+consumer, `SchemaAnnotationVectorFileTest`, builds each footer with
+parquet-format's Thrift classes and asserts the verdict through
+`FooterParse`, and `test_variant_schema.py` that pyhoglake refuses an
+element exactly when it is not `reads`. The count is pinned on both
+sides (`ANNOTATION_VECTOR_COUNT` and
+`SchemaAnnotationVectorFile.EXPECTED_COUNT`).
 
 The VARIANT decoder has no second implementation here to diff against,
 so its external ground truth is apache/parquet-testing's `variant/` and

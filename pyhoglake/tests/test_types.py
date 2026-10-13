@@ -127,7 +127,7 @@ def test_uuid_column_writes_the_parquet_uuid_annotation(tmp_path):
 
 
 def test_uuid_falls_back_to_fixed_binary_without_the_extension(monkeypatch):
-    """Below the pyarrow floor there is no pa.uuid(): the column still
+    """Below pyarrow 18 there is no pa.uuid(): the column still
     writes its 16 bytes, it just loses the annotation — the state every
     file written before this contract is already in."""
     monkeypatch.delattr(pa, "uuid", raising=False)

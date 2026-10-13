@@ -203,3 +203,77 @@ def golden_table():
         ).array
     declarations = json.dumps(DECLARATIONS, sort_keys=True).encode()
     return pa.table(columns).replace_schema_metadata({"declarations": declarations})
+
+
+# -- the corpus as Parquet (test_variant_footer.py, test_variant_schema.py) ----
+
+
+def corpus_columns(table):
+    """A catalog Column for each column of golden_table(): nullable (the
+    corpus has SQL NULL rows), field ids from 1 in table order, and the
+    declaration as its type_params."""
+    from pyhoglake.models import Column
+
+    out = []
+    for index, name in enumerate(table.column_names):
+        declaration = DECLARATIONS[name.split("/", 1)[1]]
+        out.append(
+            Column(
+                name,
+                "variant",
+                index + 1,
+                index,
+                True,
+                type_params=None if declaration is None else {"shredding": declaration},
+            )
+        )
+    return out
+
+
+def integer_view(kind):
+    """``kind`` with its decimal32/decimal64 leaves as int32/int64: what the
+    writer hands pyarrow. Written apart from parquet_schema's own."""
+    import pyarrow as pa
+
+    if pa.types.is_decimal32(kind):
+        return pa.int32()
+    if pa.types.is_decimal64(kind):
+        return pa.int64()
+    if pa.types.is_struct(kind):
+        return pa.struct([f.with_type(integer_view(f.type)) for f in kind])
+    if pa.types.is_list(kind):
+        return pa.list_(kind.value_field.with_type(integer_view(kind.value_field.type)))
+    return kind
+
+
+class Stamp:
+    """A stamp as footer_oracle.stamp takes one."""
+
+    def __init__(self, path, kind, field_id=None, precision=0, scale=0):
+        self.path, self.kind, self.field_id = tuple(path), kind, field_id
+        self.precision, self.scale = precision, scale
+
+
+def oracle_stamps(raw, columns):
+    """The stamps of a file of ``columns``: VARIANT on each group, DECIMAL
+    on each leaf of its plan's stamps, decimal4 or decimal8 as the oracle
+    finds the leaf INT32 or INT64 in ``raw``'s footer."""
+    import footer_oracle
+
+    from pyhoglake._variant_codec import compile_plan
+
+    tree = footer_oracle.decode(footer_oracle.split(raw)[1])
+    elements = footer_oracle.schema(tree)
+    physical = {
+        path: footer_oracle.field(element, 1)
+        for path, element in zip(footer_oracle.paths(elements), elements, strict=True)
+    }
+    out = []
+    for column in columns:
+        out.append(Stamp((column.name,), "variant", column.field_id))
+        plan = compile_plan((column.type_params or {}).get("shredding"))
+        for path, precision, scale in plan.stamps:
+            where = (column.name, *path)
+            kind = {1: "decimal4", 2: "decimal8"}[physical[where]]
+            out.append(Stamp(where, kind, None, precision, scale))
+    return out

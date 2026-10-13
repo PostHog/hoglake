@@ -39,7 +39,8 @@ jobs:
               - "server/**"
               # The Kotlin↔Python parity gates read the shared vector
               # files from the Python tree (QeBoundsVectorsTest,
-              # VariantShreddingVectorFileTest) — a vectors-only PR must
+              # VariantShreddingVectorFileTest,
+              # SchemaAnnotationVectorFileTest) — a vectors-only PR must
               # run the server suite too.
               - "pyhoglake/tests/vectors/**"
               - ".github/workflows/server.yml"

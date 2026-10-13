@@ -8,7 +8,10 @@ Pinned policies (verified here):
 
 * value_count is the row count (nulls included), null_count is exact,
   for every row-group split.
-* Bounds decode back to exactly the true min/max over non-null values.
+* Bounds decode back to exactly the true min/max over non-null values,
+  but that pyarrow before 25 bounds a chunk of +inf below by the largest
+  finite value (and one of -inf above by its negation): looser, and still
+  a bound. The floor (23) writes it, so the properties accept exactly it.
 * NaN: parquet-cpp excludes NaN from min/max, so bounds never contain
   NaN; a column whose only non-null values are NaN gets NO bounds.
   nan_count is NEVER populated by pyhoglake (always absent from the
@@ -35,12 +38,15 @@ Pinned policies (verified here):
 """
 
 import io
+import math
 import struct
+import sys
 from datetime import date, datetime
 from decimal import Decimal
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
@@ -160,6 +166,30 @@ def _normalize(kind, decoded):
     return decoded
 
 
+#: The largest finite value of each floating kind. pyarrow before 25 writes
+#: it, not +inf, as the min of a chunk whose every value is +inf (and its
+#: negation as the max of an all -inf one): looser than the true bound, but
+#: still a bound, and pyhoglake passes on what the footer holds.
+_FINITE_EXTREME = {
+    "double": sys.float_info.max,
+    "float": struct.unpack("<f", b"\xff\xff\x7f\x7f")[0],
+}
+
+
+def _bound_holds(kind, got, want, *, lower):
+    """``got`` is the true bound ``want``, or the one looser bound a
+    supported pyarrow writes in its place. Only inward: a finite lower
+    bound below +inf is a bound, a finite one above -inf is not."""
+    if got == want:
+        return True
+    extreme = _FINITE_EXTREME.get(kind)
+    if extreme is None:
+        return False
+    if lower:
+        return want == math.inf and got == extreme
+    return want == -math.inf and got == -extreme
+
+
 def _write_meta(table, row_group_size):
     sink = io.BytesIO()
     pq.write_table(table, sink, row_group_size=row_group_size)
@@ -200,12 +230,10 @@ def test_extracted_stats_match_ground_truth(case):
         assert s.lower_bound is not None and s.upper_bound is not None
         got_lo = _normalize(c.type, decode_bound(c.type, s.lower_bound, c.type_params))
         got_hi = _normalize(c.type, decode_bound(c.type, s.upper_bound, c.type_params))
-        if c.type in ("double", "float"):
-            # -0.0 == 0.0 makes plain == fine, but keep inf exact
-            assert got_lo == lo and got_hi == hi
-        else:
-            assert got_lo == lo
-            assert got_hi == hi
+        # -0.0 == 0.0 makes plain == fine, and an infinity is exact but
+        # for the one looser bound pyarrow < 25 writes for it.
+        assert _bound_holds(c.type, got_lo, lo, lower=True), (got_lo, lo)
+        assert _bound_holds(c.type, got_hi, hi, lower=False), (got_hi, hi)
 
 
 @STATS_SETTINGS
@@ -234,8 +262,30 @@ def test_every_column_kind_is_exercised_at_least_once(data):
         if lo is None:
             assert s.lower_bound is None and s.upper_bound is None
             continue
-        assert _normalize(kind, decode_bound(kind, s.lower_bound, params)) == lo
-        assert _normalize(kind, decode_bound(kind, s.upper_bound, params)) == hi
+        got_lo = _normalize(kind, decode_bound(kind, s.lower_bound, params))
+        got_hi = _normalize(kind, decode_bound(kind, s.upper_bound, params))
+        assert _bound_holds(kind, got_lo, lo, lower=True), (got_lo, lo)
+        assert _bound_holds(kind, got_hi, hi, lower=False), (got_hi, hi)
+
+
+@pytest.mark.parametrize("kind", ["double", "float"])
+@pytest.mark.parametrize("value", [math.inf, -math.inf])
+def test_an_all_infinite_column_is_bounded_on_every_supported_pyarrow(kind, value):
+    """The draw the property found on pyarrow 23: one infinity alone. The
+    bound on its side is the infinity, or the finite extreme toward it."""
+    col = Column(name="c", type=kind, field_id=1, ordinal=0, nullable=True)
+    schema = columns_to_arrow_schema((col,))
+    table = pa.table({"c": pa.array([value], schema.field("c").type)}, schema=schema)
+    (s,) = extract_column_stats(_write_meta(table, 2), (col,))
+    lo = decode_bound(kind, s.lower_bound)
+    hi = decode_bound(kind, s.upper_bound)
+    assert _bound_holds(kind, lo, value, lower=True), lo
+    assert _bound_holds(kind, hi, value, lower=False), hi
+    # The other side is the infinity itself, on every version.
+    assert (hi if value > 0 else lo) == value
+    # And the looser bound is accepted only inward.
+    assert not _bound_holds(kind, -_FINITE_EXTREME[kind], -math.inf, lower=True)
+    assert not _bound_holds(kind, _FINITE_EXTREME[kind], math.inf, lower=False)
 
 
 # -- foreign footers: a mismatched catalog type must degrade, not raise ----

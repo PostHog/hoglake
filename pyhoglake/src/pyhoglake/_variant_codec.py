@@ -2,13 +2,14 @@
 
 It turns JSON text or Python objects into the Arrow storage of a VARIANT
 column, shredded as a declaration lays it out, and reads any conformant
-storage back. Parquet is not its concern: the storage struct it builds is
+storage back. It writes no Parquet: the storage struct it builds is
 the write form, field for field the Trino connector's
 ``VariantShreddingSchema.toParquetType`` layout. Whoever writes the file
 puts the decimal4/decimal8 leaves, decimal32/decimal64 in Arrow, in the
 file as INT32/INT64 with DECIMAL(p, s), and adds the VARIANT annotation,
 which Arrow cannot carry, to the group; :attr:`Plan.stamps` lists those
-leaves.
+leaves, and :meth:`Plan.expected_elements` the Parquet schema elements the
+finished file holds (parquet_schema stamps the footer and checks it).
 
 The encoder and the decoder share constants, never logic: the decoder is
 the reference the encoder is tested against, and the apache/parquet-testing
@@ -39,6 +40,7 @@ import pyarrow.compute as pc
 from .errors import UnsupportedShreddingError, VariantEncodingError
 
 if TYPE_CHECKING:
+    from .models import Column
     from .variant import Shredding, VariantReport
 
 #: How deeply a value may nest: the root is at depth 0, and the elements
@@ -761,6 +763,39 @@ class Plan:
             return "read"
         return None
 
+    def expected_elements(
+        self, column: Column
+    ) -> list[tuple[tuple[str, ...], ParquetElement]]:
+        """The Parquet schema elements a file holds for ``column`` written
+        from this plan's storage, in schema order, each with its path of
+        names (the column's name first).
+
+        That is the group, REQUIRED or OPTIONAL as the column is NOT NULL or
+        not, with the catalog field id and VARIANT(1), and below it the
+        connector's layout (VS:83-122), with no field id: what pyarrow
+        writes from the write form, decimal4/decimal8 leaves viewed as
+        int32/int64 and no Arrow schema stored, once the footer is stamped.
+        ``parquet_schema.variant_layout_fault`` holds pyhoglake's own files
+        to it, element for element.
+        """
+        name = column.name
+        group: ParquetElement = {
+            3: _PQ_OPTIONAL if column.nullable else _PQ_REQUIRED,
+            4: name,
+            5: 2 if self.root is None else 3,
+            9: column.field_id,
+            10: {16: {1: 1}},
+        }
+        out = [
+            ((name,), group),
+            ((name, "metadata"), _binary("metadata", _PQ_REQUIRED)),
+        ]
+        if self.root is None:
+            out.append(((name, "value"), _binary("value", _PQ_REQUIRED)))
+        else:
+            _node_elements(self.root, (name,), out)
+        return out
+
 
 def _difference(kind: pa.DataType, expected: pa.DataType, path: str) -> str | None:
     """The first column of ``kind`` that is not ``expected``'s, by name,
@@ -932,6 +967,113 @@ def _group(
         pa.struct([_VALUE_FIELD, pa.field("typed_value", read)]),
         **rest,
     )
+
+
+# -- plans -> Parquet schema elements -------------------------------------------
+
+#: A Parquet schema element as parquet_schema reads one out of a footer:
+#: parquet.thrift's ``SchemaElement`` by Thrift field id (1 type, 2
+#: type_length, 3 repetition_type, 4 name, 5 num_children, 6
+#: converted_type, 7 scale, 8 precision, 9 field_id, 10 logicalType), a
+#: struct or a union inside it as a dict of the same kind.
+ParquetElement: TypeAlias = dict[int, Any]
+
+# parquet.thrift's FieldRepetitionType, Type and ConvertedType values.
+_PQ_REQUIRED, _PQ_OPTIONAL, _PQ_REPEATED = 0, 1, 2
+_PQ_BOOLEAN, _PQ_INT32, _PQ_INT64, _PQ_FLOAT, _PQ_DOUBLE = 0, 1, 2, 4, 5
+_PQ_BYTE_ARRAY, _PQ_FIXED = 6, 7
+_PQ_UTF8, _PQ_LIST, _PQ_DECIMAL, _PQ_DATE = 0, 3, 5, 6
+_PQ_TIMESTAMP_MICROS, _PQ_INT_8, _PQ_INT_16 = 10, 15, 16
+
+#: The ``typed_value`` leaf of each primitive node, but for its repetition
+#: and name: the physical type and the logical type of the spec's table
+#: (VS:83-105), which the connector's ``toParquetType`` writes, with the
+#: legacy converted type pyarrow writes beside a logical type that has one.
+#: A converted type is a legacy reader's spelling of the logical type, so
+#: a writer may leave it out; the layout check accepts either, and the
+#: pyarrow matrix pins which one each version writes. The timestamp leaves
+#: carry TIMESTAMP_MICROS whether or not they are adjusted to UTC, as
+#: pyarrow writes them; the logical type is what tells them apart.
+_PARQUET_LEAF: Final[dict[str, ParquetElement]] = {
+    "boolean": {1: _PQ_BOOLEAN},
+    "int8": {1: _PQ_INT32, 6: _PQ_INT_8, 10: {10: {1: 8, 2: True}}},
+    "int16": {1: _PQ_INT32, 6: _PQ_INT_16, 10: {10: {1: 16, 2: True}}},
+    "int32": {1: _PQ_INT32},
+    "int64": {1: _PQ_INT64},
+    "float": {1: _PQ_FLOAT},
+    "double": {1: _PQ_DOUBLE},
+    "date": {1: _PQ_INT32, 6: _PQ_DATE, 10: {6: {}}},
+    "time": {1: _PQ_INT64, 10: {7: {1: False, 2: {2: {}}}}},
+    "timestamp": {
+        1: _PQ_INT64,
+        6: _PQ_TIMESTAMP_MICROS,
+        10: {8: {1: False, 2: {2: {}}}},
+    },
+    "timestamp_ns": {1: _PQ_INT64, 10: {8: {1: False, 2: {3: {}}}}},
+    "timestamptz": {
+        1: _PQ_INT64,
+        6: _PQ_TIMESTAMP_MICROS,
+        10: {8: {1: True, 2: {2: {}}}},
+    },
+    "timestamptz_ns": {1: _PQ_INT64, 10: {8: {1: True, 2: {3: {}}}}},
+    "binary": {1: _PQ_BYTE_ARRAY},
+    "string": {1: _PQ_BYTE_ARRAY, 6: _PQ_UTF8, 10: {1: {}}},
+    "uuid": {1: _PQ_FIXED, 2: 16, 10: {14: {}}},
+}
+
+
+def _binary(name: str, repetition: int) -> ParquetElement:
+    return {1: _PQ_BYTE_ARRAY, 3: repetition, 4: name}
+
+
+def _node_elements(
+    node: Node,
+    path: tuple[str, ...],
+    out: list[tuple[tuple[str, ...], ParquetElement]],
+) -> None:
+    """The elements below the group at ``path`` that ``node`` lays out:
+    its ``value``, then its ``typed_value`` and everything under it."""
+    out.append(((*path, "value"), _binary("value", _PQ_OPTIONAL)))
+    if node.kind == "variant":
+        return
+    typed = (*path, "typed_value")
+    if node.kind == "object":
+        out.append((typed, {3: _PQ_OPTIONAL, 4: "typed_value", 5: len(node.fields)}))
+        for name, child in node.fields:
+            _field_group((*typed, name), child, out)
+    elif node.kind == "array":
+        assert node.element is not None
+        out.append(
+            (typed, {3: _PQ_OPTIONAL, 4: "typed_value", 5: 1, 6: _PQ_LIST, 10: {3: {}}})
+        )
+        out.append(((*typed, "list"), {3: _PQ_REPEATED, 4: "list", 5: 1}))
+        _field_group((*typed, "list", "element"), node.element, out)
+    else:
+        out.append((typed, {**_leaf_element(node), 3: _PQ_OPTIONAL, 4: "typed_value"}))
+
+
+def _field_group(
+    path: tuple[str, ...],
+    node: Node,
+    out: list[tuple[tuple[str, ...], ParquetElement]],
+) -> None:
+    # A field group and a list element are both REQUIRED (VS:122, 166); a
+    # declared variant holds a value and nothing else.
+    children = 1 if node.kind == "variant" else 2
+    out.append((path, {3: _PQ_REQUIRED, 4: path[-1], 5: children}))
+    _node_elements(node, path, out)
+
+
+def _leaf_element(node: Node) -> ParquetElement:
+    if node.kind not in ("decimal4", "decimal8", "decimal16"):
+        return dict(_PARQUET_LEAF[node.kind])
+    p, s = node.precision, node.scale
+    decimal: ParquetElement = {6: _PQ_DECIMAL, 7: s, 8: p, 10: {5: {1: s, 2: p}}}
+    if node.kind == "decimal16":
+        # The fewest bytes that hold every unscaled value of the precision,
+        # sign included: the connector's decimalByteLength, and pyarrow's.
+        return {1: _PQ_FIXED, 2: (((10**p - 1).bit_length() + 1) + 7) // 8, **decimal}
+    return {1: _PQ_INT32 if node.kind == "decimal4" else _PQ_INT64, **decimal}
 
 
 # -- matching a value to a typed leaf (D3) ------------------------------------

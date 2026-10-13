@@ -8,12 +8,15 @@ cheap pre-flight re-resolve as an upload-saving fast-fail)."""
 import base64
 import io
 import json
+import re
 import struct
 import uuid
 
+import footer_oracle
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from thrift.Thrift import TType
 
 from pyhoglake import (
     HoglakeClient,
@@ -224,7 +227,11 @@ def test_footer_size_wire_convention():
     treating footer_size as exact would mis-slice every client-written
     file. Pinned against a real pyarrow-written file with the trailer
     parsed by hand."""
+    from pyhoglake import parquet_schema
     from pyhoglake.client import _footer_size
+
+    # One copy of the convention: the VARIANT writer's footer_size is this.
+    assert parquet_schema._footer_size is _footer_size
 
     sink = io.BytesIO()
     pq.write_table(pa.table({"id": [1, 2, 3], "name": ["a", "b", None]}), sink)
@@ -823,6 +830,519 @@ def test_prepared_native_variant_uploads_original_bytes(table, httpx_mock, fake_
     assert next(iter(fake_s3.files.values())) == path.read_bytes()
     stats = request["appends"][0]["files"][0]["column_stats"]
     assert [stat["field_id"] for stat in stats] == [1]
+
+
+@pytest.mark.parametrize("strict", [False, True])
+@pytest.mark.parametrize(
+    ("name", "fault"),
+    [
+        (
+            "native_variant_typed_subgroup.parquet",
+            "schema element 5 ('typed_value') is a group with a physical type",
+        ),
+        ("native_variant_union_two_fields.parquet", "LogicalType union holds 2 fields"),
+        (
+            "native_variant_converted_unbuildable.parquet",
+            (
+                "schema element 15 ('typed_value') has the logical type IntType beside "
+                "the converted type UTF8"
+            ),
+        ),
+        (
+            "native_variant_lone_member.parquet",
+            "schema element 1 ('id') has a logical type of no member",
+        ),
+    ],
+    ids=["typed_subgroup", "union_two_fields", "converted_unbuildable", "lone_member"],
+)
+def test_prepared_native_variant_the_server_cannot_read_is_refused(
+    table, httpx_mock, fake_s3, name, fault, strict
+):
+    """Shared fixtures parquet-java cannot read, or the Trino connector
+    cannot (FooterStatsTest asserts parquet-java's reading on the same
+    bytes): a group below the VARIANT group given a physical type, the
+    group's LogicalType a union of two fields, a typed_value leaf whose
+    converted UTF8 parquet-java lets win over its logical INT(32, true),
+    and id's LogicalType a union of no member, which parquet-java reads past
+    and the connector cannot. pyarrow reads them all, and the default path,
+    which holds nothing below the group, uploaded all but the second; none
+    is uploaded now."""
+    from pathlib import Path
+
+    from pyhoglake.models import TableInfo
+
+    path = Path(__file__).parent / "data" / name
+    wire = {
+        **TABLE_WIRE,
+        "columns": [
+            TABLE_WIRE["columns"][0],
+            {
+                "name": "properties",
+                "type": "variant",
+                "field_id": 2,
+                "ordinal": 1,
+                "nullable": True,
+            },
+        ],
+    }
+    table._info = TableInfo.from_wire(wire)
+    httpx_mock.add_response(
+        method="GET", url=f"{BASE}/v1/catalogs/cat", json=CATALOG_WIRE
+    )
+    httpx_mock.add_response(method="GET", url=_WRITER_TABLES_URL, json=wire)
+    with pytest.raises(ValidationError, match=re.escape(fault)) as raised:
+        table.prepare_append_files(
+            [(str(path), None)],
+            idempotency_key=str(uuid.uuid4()),
+            strict_variant=strict,
+        )
+    assert raised.value.uploaded_files == 0
+    assert not fake_s3.files
+
+
+def _variant_destination(table, httpx_mock, *, id_type, nullable):
+    from pyhoglake.models import TableInfo
+
+    wire = {
+        **TABLE_WIRE,
+        "columns": [
+            {**TABLE_WIRE["columns"][0], "type": id_type, "nullable": True},
+            {
+                "name": "v",
+                "type": "variant",
+                "field_id": 2,
+                "ordinal": 1,
+                "nullable": nullable,
+            },
+        ],
+    }
+    table._info = TableInfo.from_wire(wire)
+    httpx_mock.add_response(
+        method="GET", url=f"{BASE}/v1/catalogs/cat", json=CATALOG_WIRE
+    )
+    httpx_mock.add_response(method="GET", url=_WRITER_TABLES_URL, json=wire)
+
+
+@pytest.mark.parametrize("strict", [False, True])
+def test_prepared_variant_strict_refuses_a_layout_outside_the_spec(
+    table, httpx_mock, fake_s3, strict
+):
+    """strict_variant reaches the footer check, before any upload; the
+    default is unchanged. DuckDB writes its object's field groups
+    OPTIONAL (here ``properties.typed_value.a``), where the spec says
+    REQUIRED. The connector reads them anyway (it tolerates OPTIONAL
+    groups); strict refuses them as the spec does."""
+    from pathlib import Path
+
+    path = Path(__file__).parent / "data" / "duckdb_unsorted_variant.parquet"
+    _variant_destination(table, httpx_mock, id_type="int", nullable=True)
+    files, key = [(str(path), None)], str(uuid.uuid4())
+    if not strict:
+        table.prepare_append_files(files, idempotency_key=key)
+        assert next(iter(fake_s3.files.values())) == path.read_bytes()
+        return
+    with pytest.raises(ValidationError, match="is not REQUIRED") as raised:
+        table.prepare_append_files(files, idempotency_key=key, strict_variant=True)
+    assert raised.value.uploaded_files == 0
+    assert not fake_s3.files
+
+
+def test_prepared_variant_strict_accepts_a_layout_the_connector_reads(
+    table, httpx_mock, fake_s3
+):
+    """A DuckDB file whose top level shreds as an int, with no SQL NULL in
+    its NOT NULL column, is one strict accepts."""
+    from pathlib import Path
+
+    path = Path(__file__).parent / "data" / "duckdb_variant_int.parquet"
+    _variant_destination(table, httpx_mock, id_type="int", nullable=False)
+    table.prepare_append_files(
+        [(str(path), None)],
+        idempotency_key=str(uuid.uuid4()),
+        strict_variant=True,
+    )
+    assert next(iter(fake_s3.files.values())) == path.read_bytes()
+
+
+def test_prepared_integer_decimal_file_registers_its_bounds(
+    table, httpx_mock, fake_s3, tmp_path
+):
+    """DuckDB writes every decimal of precision 18 or less as an INT32 or
+    INT64 with a DECIMAL annotation, and prepare_append_files reads its
+    footer statistics. pyarrow 21 and 22 cannot extract statistics for
+    such a column at all ("Cannot extract statistics for type"), one of
+    the reasons pyhoglake's floor is 23; CI's pyarrow matrix runs this on
+    the floor."""
+    from decimal import Decimal
+
+    from pyhoglake import decode_bound
+    from pyhoglake.models import TableInfo
+    from pyhoglake.types import columns_to_arrow_schema
+
+    def decimal(name, field_id, precision, scale):
+        return {
+            "name": name,
+            "type": "decimal",
+            "field_id": field_id,
+            "ordinal": field_id - 1,
+            "nullable": True,
+            "type_params": {"precision": precision, "scale": scale},
+        }
+
+    wire = {
+        **TABLE_WIRE,
+        "columns": [
+            TABLE_WIRE["columns"][0],
+            decimal("d4", 2, 9, 2),
+            decimal("d8", 3, 18, 4),
+        ],
+    }
+    table._info = TableInfo.from_wire(wire)
+    _prepare_mocks(httpx_mock, wire)
+    schema = columns_to_arrow_schema(table.columns)
+    path = tmp_path / "decimals.parquet"
+    rows = [
+        {"id": 1, "d4": Decimal("-1234567.89"), "d8": Decimal("12345678901234.5678")},
+        {"id": 2, "d4": Decimal("0.01"), "d8": None},
+    ]
+    pq.write_table(
+        pa.Table.from_pylist(rows, schema=schema), path, store_decimal_as_integer=True
+    )
+    physical = pq.read_metadata(path).schema
+    assert [physical.column(i).physical_type for i in (1, 2)] == ["INT32", "INT64"]
+    request = table.prepare_append_files(
+        [(str(path), None)], idempotency_key=str(uuid.uuid4())
+    )
+    (registration,) = request["appends"][0]["files"]
+    stats = {s["field_id"]: s for s in registration["column_stats"]}
+
+    def bound(column, side):
+        raw = base64.b64decode(stats[column.field_id][side])
+        return decode_bound("decimal", raw, column.type_params)
+
+    _, d4, d8 = table.columns
+    assert bound(d4, "lower_bound") == Decimal("-1234567.89")
+    assert bound(d4, "upper_bound") == Decimal("0.01")
+    assert bound(d8, "upper_bound") == Decimal("12345678901234.5678")
+    assert stats[d8.field_id]["null_count"] == 1
+
+
+def _in_chunk(leaf, field_id, kind, value):
+    """An edit setting ColumnMetaData field ``field_id`` of leaf ``leaf``."""
+    return lambda raw: footer_oracle.edit_chunk(
+        raw, leaf, lambda meta: footer_oracle.put(meta, field_id, kind, value)
+    )
+
+
+def _size_statistics_twice(raw):
+    """The id chunk's SizeStatistics given twice: unencoded byte array
+    bytes, then none. pyarrow's C++ reads the second into the first, so
+    the bytes survive, on an INT64 chunk."""
+
+    def edit(meta):
+        footer_oracle.drop(meta, 16)
+        footer_oracle.repeat(meta, 16, TType.STRUCT, [[1, TType.I64, 5]])
+        footer_oracle.repeat(meta, 16, TType.STRUCT, [])
+
+    return footer_oracle.edit_chunk(raw, 0, edit)
+
+
+def _size_statistics_past_an_i16(raw):
+    """The id chunk's SizeStatistics replaced by unencoded byte array bytes
+    spelled as field 65552: SizeStatistics (16) to pyarrow, whose generated
+    reader keeps an id's low 16 bits, on an INT64 chunk."""
+
+    def edit(meta):
+        footer_oracle.drop(meta, 16)
+        footer_oracle.repeat(meta, 16 + (1 << 16), TType.STRUCT, [[1, TType.I64, 5]])
+
+    return footer_oracle.edit_chunk(
+        raw, 0, edit, encoder=footer_oracle.encode_unchecked
+    )
+
+
+def _statistics_hidden_in_encodings(raw):
+    """Statistics with 1-byte bounds for the INT64 id chunk, inside its
+    encodings list, whose header says it holds a binary: pyarrow's
+    generated reader reads the item as the declared i32, and the bounds as
+    the chunk's own."""
+    statistics = [[5, TType.STRING, b"\x01"], [6, TType.STRING, b"\x01"]]
+    return footer_oracle.hide_in_encodings(raw, 0, [[12, TType.STRUCT, statistics]])
+
+
+def _union_of_two_fields(raw):
+    """id's logicalType a STRING spelled as a bool, then INT(64, true):
+    pyarrow skips the bool and reads the int64 it is, parquet-java's TUnion
+    reads the bool as the union and the rest of the footer out of step."""
+    members = [
+        [1, TType.BOOL, True],
+        [10, TType.STRUCT, [[1, TType.BYTE, 64], [2, TType.BOOL, True]]],
+    ]
+    return footer_oracle.edit_element(
+        raw,
+        ("id",),
+        lambda element: footer_oracle.put(element, 10, TType.STRUCT, members),
+    )
+
+
+@pytest.mark.parametrize("allow_optional_fields", [False, True])
+@pytest.mark.parametrize(
+    ("forge", "fault"),
+    [
+        (_in_chunk(0, 1, TType.I32, 1), "is of type 1, not its schema leaf's 2"),
+        (
+            _in_chunk(0, 16, TType.STRUCT, [[1, TType.I64, 5]]),
+            "unencoded byte array data bytes, but is not BYTE_ARRAY",
+        ),
+        (
+            _in_chunk(1, 16, TType.STRUCT, [[3, TType.LIST, [TType.I64, [1, 2, 3]]]]),
+            "3-entry definition level histogram, for a maximum level of 1",
+        ),
+        (_size_statistics_twice, "a Parquet footer struct repeats field 16"),
+        (_size_statistics_past_an_i16, "field id of 65552 is not an i16"),
+        (
+            _statistics_hidden_in_encodings,
+            "list holds Thrift type 11, not the declared 8",
+        ),
+        (_union_of_two_fields, "LogicalType union holds 2 fields"),
+    ],
+    ids=[
+        "type",
+        "unencoded_bytes",
+        "histogram",
+        "repeated",
+        "field_id_past_i16",
+        "list_item_type",
+        "union_of_two_fields",
+    ],
+)
+def test_prepared_file_whose_chunks_pyarrow_cannot_read_is_refused(
+    table,
+    httpx_mock,
+    fake_s3,
+    tmp_path,
+    allow_optional_fields,
+    forge,
+    fault,
+):
+    """A table without a variant column, by default, is checked by its Arrow
+    schema alone, which pyarrow reads without touching a chunk. The stats
+    read after it build every chunk's metadata and decode its statistics,
+    and pyarrow aborts the process (an uncaught C++ exception) on a footer
+    like these, which it opens. So they are refused before that, and
+    before any upload, on both paths."""
+    from pyhoglake.types import columns_to_arrow_schema
+
+    _prepare_mocks(httpx_mock)
+    schema = columns_to_arrow_schema(table.columns)
+    path = tmp_path / "forged.parquet"
+    pq.write_table(pa.Table.from_pylist([{"id": 1, "name": "a"}], schema=schema), path)
+    path.write_bytes(forge(path.read_bytes()))
+    with pq.ParquetFile(path) as parquet:
+        assert parquet.schema_arrow.names == ["id", "name"]
+    with pytest.raises(ValidationError, match=re.escape(fault)) as raised:
+        table.prepare_append_files(
+            [(str(path), None)],
+            idempotency_key=str(uuid.uuid4()),
+            allow_optional_fields=allow_optional_fields,
+        )
+    assert raised.value.uploaded_files == 0
+    assert not fake_s3.files
+
+
+def _element(path, field_id, kind, value):
+    """An edit setting SchemaElement field ``field_id`` of the element at
+    ``path``."""
+    return lambda raw: footer_oracle.edit_element(
+        raw, path, lambda element: footer_oracle.put(element, field_id, kind, value)
+    )
+
+
+def _column_order_ieee754(raw):
+    def edit(tree):
+        footer_oracle.field(tree, 7)[1][0][:] = [[2, TType.STRUCT, []]]
+
+    return footer_oracle.rebuild(raw, edit)
+
+
+@pytest.mark.parametrize("allow_optional_fields", [False, True])
+@pytest.mark.parametrize(
+    ("forge", "fault"),
+    [
+        # name's converted UTF8 made DATE beside its logical STRING.
+        (
+            _element(("name",), 6, TType.I32, 6),
+            (
+                "schema element 2 ('name') has the logical type StringType beside "
+                "the converted type DATE"
+            ),
+        ),
+        # id's LogicalType an INTEGER spelled as a bool, alone.
+        (
+            _element(("id",), 10, TType.STRUCT, [[10, TType.BOOL, True]]),
+            "schema element 1 ('id') has a logical type of no member",
+        ),
+        (
+            _in_chunk(0, 4, TType.I32, 99),
+            (
+                "field 4 of a Parquet footer ColumnMetaData is 99, which parquet.thrift's "
+                "CompressionCodec does not define"
+            ),
+        ),
+        (
+            _in_chunk(
+                0,
+                13,
+                TType.LIST,
+                [
+                    TType.STRUCT,
+                    [[[1, TType.I32, 99], [2, TType.I32, 0], [3, TType.I32, 1]]],
+                ],
+            ),
+            "field 1 of a Parquet footer PageEncodingStats is 99",
+        ),
+        (
+            _in_chunk(0, 3, TType.LIST, [TType.STRING, [b"name"]]),
+            (
+                "column chunk 0 of row group 0 has the path_in_schema ['name'], not its "
+                "leaf's ['id']"
+            ),
+        ),
+        (
+            _column_order_ieee754,
+            "schema element 1 ('id') has the column order IEEE_754_TOTAL_ORDER",
+        ),
+    ],
+    ids=[
+        "converted_beside_logical",
+        "lone_member",
+        "codec",
+        "page_type",
+        "path",
+        "ieee754_order",
+    ],
+)
+def test_prepared_file_the_server_reads_otherwise_is_refused(
+    table,
+    httpx_mock,
+    fake_s3,
+    tmp_path,
+    allow_optional_fields,
+    forge,
+    fault,
+):
+    """A file pyarrow reads, whose Arrow schema is the table's, which the
+    server's hydrator (parquet-java) or the Trino connector cannot read, or
+    reads as another type: a string column whose converted DATE wins there
+    over its logical STRING (and cannot annotate a BYTE_ARRAY), a logical
+    type of no member (the connector throws NullPointerException), a codec
+    or page type parquet.thrift does not define (a required field absent to
+    parquet-java), a chunk whose path names its sibling (whose statistics
+    extract_column_stats would take it for), and an IEEE754 column order on
+    an integer. Each was uploaded on both paths; none is now."""
+    from pyhoglake.types import columns_to_arrow_schema
+
+    _prepare_mocks(httpx_mock)
+    schema = columns_to_arrow_schema(table.columns)
+    path = tmp_path / "forged.parquet"
+    pq.write_table(pa.Table.from_pylist([{"id": 1, "name": "a"}], schema=schema), path)
+    path.write_bytes(forge(path.read_bytes()))
+    with pq.ParquetFile(path) as parquet:
+        assert parquet.schema_arrow.equals(schema, check_metadata=True)
+    with pytest.raises(ValidationError, match=re.escape(fault)) as raised:
+        table.prepare_append_files(
+            [(str(path), None)],
+            idempotency_key=str(uuid.uuid4()),
+            allow_optional_fields=allow_optional_fields,
+        )
+    assert raised.value.uploaded_files == 0
+    assert not fake_s3.files
+
+
+@pytest.mark.parametrize(
+    ("allow_optional_fields", "fault"),
+    [
+        (False, "prepared Parquet schema/field IDs differ from destination"),
+        (True, "schema element 2 ('name') has no repetition_type"),
+    ],
+)
+@pytest.mark.parametrize(
+    "spelled", [(TType.BYTE, 1), (TType.BOOL, True)], ids=["i8", "bool"]
+)
+def test_prepared_file_read_as_pyarrow_reads_its_repetition_is_refused(
+    table, httpx_mock, fake_s3, tmp_path, spelled, allow_optional_fields, fault
+):
+    """``name``'s repetition_type OPTIONAL spelled as an i8 or a bool, which
+    Thrift's generated readers skip: pyarrow reads ``name`` as REQUIRED,
+    and aborted the process building its chunk, whose 2-entry definition
+    histogram was the OPTIONAL column's. The default path refuses the
+    REQUIRED column pyarrow reads as a schema mismatch; allowing optional
+    fields, the element is refused for having no repetition_type, which
+    parquet-java and the Trino connector cannot read a footer with."""
+    from pyhoglake.types import columns_to_arrow_schema
+
+    _prepare_mocks(httpx_mock)
+    schema = columns_to_arrow_schema(table.columns)
+    path = tmp_path / "forged.parquet"
+    pq.write_table(pa.Table.from_pylist([{"id": 1, "name": "a"}], schema=schema), path)
+    raw = footer_oracle.edit_chunk(
+        path.read_bytes(),
+        1,
+        lambda meta: footer_oracle.put(
+            meta, 16, TType.STRUCT, [[3, TType.LIST, [TType.I64, [0, 1]]]]
+        ),
+    )
+    path.write_bytes(
+        footer_oracle.edit_element(
+            raw, ("name",), lambda element: footer_oracle.put(element, 3, *spelled)
+        )
+    )
+    with pq.ParquetFile(path) as parquet:
+        assert not parquet.schema_arrow.field("name").nullable
+    with pytest.raises(ValidationError, match=re.escape(fault)) as raised:
+        table.prepare_append_files(
+            [(str(path), None)],
+            idempotency_key=str(uuid.uuid4()),
+            allow_optional_fields=allow_optional_fields,
+        )
+    assert raised.value.uploaded_files == 0
+    assert not fake_s3.files
+
+
+@pytest.mark.parametrize("allow_optional_fields", [False, True])
+def test_prepared_file_without_a_repetition_type_is_refused(
+    table, httpx_mock, fake_s3, tmp_path, allow_optional_fields
+):
+    """``id``, NOT NULL in the catalog, written REQUIRED and its
+    repetition_type then dropped: pyarrow reads it REQUIRED still, so the
+    Arrow schema matches and every chunk reads, and the file was
+    published. parquet-java (the server's hydrator) and the Trino connector
+    throw NullPointerException reading the footer, so every query of the
+    table that reached it failed."""
+    from pyhoglake.types import columns_to_arrow_schema
+
+    _prepare_mocks(httpx_mock)
+    schema = columns_to_arrow_schema(table.columns)
+    path = tmp_path / "forged.parquet"
+    pq.write_table(pa.Table.from_pylist([{"id": 1, "name": "a"}], schema=schema), path)
+    path.write_bytes(
+        footer_oracle.edit_element(
+            path.read_bytes(), ("id",), lambda element: footer_oracle.drop(element, 3)
+        )
+    )
+    with pq.ParquetFile(path) as parquet:
+        assert parquet.schema_arrow.equals(schema, check_metadata=True)
+    with pytest.raises(
+        ValidationError,
+        match=re.escape("schema element 1 ('id') has no repetition_type"),
+    ) as raised:
+        table.prepare_append_files(
+            [(str(path), None)],
+            idempotency_key=str(uuid.uuid4()),
+            allow_optional_fields=allow_optional_fields,
+        )
+    assert raised.value.uploaded_files == 0
+    assert not fake_s3.files
 
 
 @pytest.mark.parametrize("null_id", [False, True])
