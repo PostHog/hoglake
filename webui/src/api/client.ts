@@ -403,9 +403,15 @@ export interface InstanceInfo {
   // stamped — every local build, every PR image — which is normal and
   // renders as no suffix, not as an error.
   build?: string;
-  // Absent in the boot window before the server's first metrics sample.
+  // Absent in the boot window before the server's first metrics sample,
+  // and while catalogs exist but none has published totals yet (the
+  // window after an upgrade adds them): a sum over nothing would read
+  // as an empty warehouse, so the server withholds it.
   total_rows?: Int64;
   total_size_bytes?: Int64;
+  // Catalogs left out of both sums. Present whenever a sample has run,
+  // including when it is every catalog and the sums are absent.
+  unsampled_catalogs?: number;
 }
 
 export function getInstanceInfo(): Promise<InstanceInfo> {
