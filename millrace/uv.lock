@@ -793,7 +793,7 @@ wheels = [
 
 [[package]]
 name = "pyhoglake"
-version = "1.3.11.dev0"
+version = "1.3.11"
 source = { editable = "../pyhoglake" }
 dependencies = [
     { name = "httpx" },
