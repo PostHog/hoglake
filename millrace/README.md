@@ -104,6 +104,24 @@ It writes `soak-metrics.csv` (a `/metrics` + RSS + probe row per child
 every 15 s), `soak-warnings.log` and `soak-summary.md` to the report dir
 (`$HOGLAKE_LIVE_MILLRACE_REPORT_DIR`, default `.artifacts/live-millrace/`).
 
+## Image
+
+`millrace/Dockerfile` builds `ghcr.io/posthog/hoglake-millrace`: one
+image, two entrypoints. The default (`millrace`) is the pipeline; the
+maintenance service runs as `python -m millrace.maintenance`. Both read
+only environment and refuse at config (exit 2) when it is empty, which
+is the image's smoke test. The build context is the repo root because
+pyhoglake is installed from the sibling tree, so the image ships the
+client from the same commit as the daemon. Non-root (uid 10001), no
+`.venv`, nothing written outside `/work` and `/tmp`.
+
+`.github/workflows/millrace-image.yml` builds and smokes the image on
+every PR and publishes it on every main push, multi-arch, tagged
+`r<UTC build minute>-<sha6>` for Kargo (whose Warehouse admits it as
+Freight by that tag plus the `org.opencontainers.image.revision` and
+`.source` index annotations), by commit sha, and `latest`. Nothing is
+dispatched to PostHog/charts; delivery is Kargo's.
+
 ## Staging format
 
 The staging keyspace shares no key or value shape with the #331-era
