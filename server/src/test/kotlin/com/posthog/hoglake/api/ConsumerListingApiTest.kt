@@ -92,7 +92,7 @@ class ConsumerListingApiTest {
         catalogs.commitOffset(cat, "hedgerow-a", events.tableUuid, head)
         catalogs.commitOffset(cat, "hedgerow-a", raw.tableUuid, 0)
         catalogs.commitOffset(cat, "hedgerow-b", events.tableUuid, 0)
-        catalogs.dropTable(cat, "analytics", "raw")
+        catalogs.dropTable(cat, "analytics", "raw", author = "integration-test", message = "drop table fixture")
         return cat
     }
 

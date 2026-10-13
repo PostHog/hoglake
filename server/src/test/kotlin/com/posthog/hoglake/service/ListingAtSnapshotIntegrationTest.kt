@@ -58,7 +58,7 @@ class ListingAtSnapshotIntegrationTest {
         catalogs.createTable(cat, "ns", "old", cols)
         val pin = head(cat)
         catalogs.createTable(cat, "ns", "new", cols)
-        catalogs.dropTable(cat, "ns", "old")
+        catalogs.dropTable(cat, "ns", "old", author = "integration-test", message = "drop table fixture")
 
         assertThat(tables(cat, "ns", pin)).containsExactly("old")
         assertThat(tables(cat, "ns")).containsExactly("new")
@@ -72,7 +72,7 @@ class ListingAtSnapshotIntegrationTest {
         catalogs.createNamespace(cat, "a")
         val pin = head(cat)
         catalogs.createNamespace(cat, "b")
-        catalogs.dropNamespace(cat, "a")
+        catalogs.dropNamespace(cat, "a", author = "integration-test", message = "drop namespace fixture")
 
         assertThat(namespaces(cat, pin)).containsExactly("a")
         assertThat(namespaces(cat)).containsExactly("b")
@@ -85,8 +85,8 @@ class ListingAtSnapshotIntegrationTest {
         catalogs.createNamespace(cat, "x")
         catalogs.createTable(cat, "x", "t", cols)
         val first = head(cat)
-        catalogs.dropTable(cat, "x", "t")
-        catalogs.dropNamespace(cat, "x")
+        catalogs.dropTable(cat, "x", "t", author = "integration-test", message = "drop table fixture")
+        catalogs.dropNamespace(cat, "x", author = "integration-test", message = "drop namespace fixture")
         val gap = head(cat)
         catalogs.createNamespace(cat, "x")
         catalogs.createTable(cat, "x", "u", cols)
@@ -104,7 +104,7 @@ class ListingAtSnapshotIntegrationTest {
         val cat = catalog()
         catalogs.createNamespace(cat, "kept")
         catalogs.createNamespace(cat, "gone")
-        catalogs.dropNamespace(cat, "gone")
+        catalogs.dropNamespace(cat, "gone", author = "integration-test", message = "drop namespace fixture")
         val floor = head(cat) + 1
         catalogs.createNamespace(cat, "later")
         // What expiry leaves behind: change rows below the floor are

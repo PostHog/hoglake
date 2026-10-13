@@ -206,7 +206,7 @@ def test_identifier_boundary_names_accepted(client, catalog, ns):
         assert ns.table(name).table_uuid == t.table_uuid
         t.append(_rows(1))
         assert _info_at_head(catalog, ns.table(name)).record_count == 1
-        t.drop()
+        t.drop(author="pyhoglake-tests", message="drop test fixture")
     _sanity(client, catalog)
 
 
@@ -222,7 +222,7 @@ def test_author_message_consumer_id_injection_roundtrip(catalog, ns):
     assert [o.committed_snapshot for o in catalog.offsets(INJECTION)] == [
         res.snapshot_id
     ]
-    t.drop()
+    t.drop(author="pyhoglake-tests", message="drop test fixture")
 
 
 def test_slash_in_table_name_rejected_and_lookup_misses(client, catalog, ns):
@@ -564,7 +564,7 @@ def test_view_with_100kb_sql(catalog, ns):
     ns.create_view(f"big_view_{RUN_ID}", big_sql)
     got = ns.view(f"big_view_{RUN_ID}")
     assert got.sql == big_sql  # byte-for-byte round-trip
-    got.drop()
+    got.drop(author="pyhoglake-tests", message="drop test fixture")
 
 
 # ---------------------------------------------------------------------------
@@ -645,7 +645,7 @@ def test_create_drop_recreate_uuid_uniqueness(catalog, ns):
         t = ns.create_table("phoenix", _schema())
         uuids.append(t.table_uuid)
         t.append(_rows(i))
-        res = t.drop()
+        res = t.drop(author="pyhoglake-tests", message="drop test fixture")
         assert res.snapshot_id > 0
     assert len(set(uuids)) == 10  # every incarnation is a new identity
     with pytest.raises(NotFoundError):

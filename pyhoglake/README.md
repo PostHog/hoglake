@@ -36,6 +36,13 @@ at a one-second interval for the deferred-stats test, and rejects skipped tests.
 
 ## Quickstart — the append path end to end
 
+DDL methods accept keyword arguments `author` and `message`. Both are required
+and must be nonblank for table, view and namespace drops and `Table.truncate()`.
+Pass both to `Catalog.set_retention()` when enabling expiry or shortening
+retention. The server records attribution in the snapshot and audit log.
+Drop and truncate have no operation receipt; do not automatically retry an
+unknown outcome.
+
 ```python
 import pyarrow as pa
 from pyhoglake import HoglakeClient, S3Config

@@ -23,6 +23,10 @@ writes parquet to object storage itself (field ids stamped, footer
 stats collected) and registers it through the commit API, exactly like
 pyhoglake — the same contract, a different language.
 
+DDL snapshots use `duckdb-client` as their author and an operation description
+such as `DROP TABLE ns1.points` as their message. This identifies the client;
+the extension has no authenticated user principal to forward.
+
 ## Status
 
 Read, write, DML, DDL, time travel, metadata functions and maintenance

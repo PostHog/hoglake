@@ -163,7 +163,7 @@ class UploadServiceIntegrationTest {
         expire(claim)
         assertThat(uploads.abandon(catalog, owner, listOf(claim.path))).isZero()
         assertThat(uploads.scheduleExpired(catalog)).isZero()
-        catalogs.dropTable(catalog, "test", "target")
+        catalogs.dropTable(catalog, "test", "target", author = "integration-test", message = "drop table fixture")
         assertThat(commits.commit(catalog, request)).isEqualTo(committed)
         assertThat(uploads.claim(catalog, claim.uploadId, owner, claim.prefix, "data").state).isEqualTo("registered")
     }

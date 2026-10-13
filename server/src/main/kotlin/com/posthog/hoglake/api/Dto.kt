@@ -1,6 +1,7 @@
 package com.posthog.hoglake.api
 
 import com.fasterxml.jackson.databind.JsonNode
+import com.fasterxml.jackson.databind.annotation.JsonDeserialize
 import com.fasterxml.jackson.databind.node.LongNode
 import com.fasterxml.jackson.databind.node.NullNode
 import com.posthog.hoglake.model.CatalogInfo
@@ -144,7 +145,21 @@ fun CatalogInfo.toDto(totals: CatalogTotals? = null) =
         oldestSnapshotTime = totals?.oldestSnapshotTime,
     )
 
-data class CreateCatalogRequestDto(val name: String, val dataPath: String)
+data class CreateCatalogRequestDto(
+    val name: String,
+    val dataPath: String,
+    @JsonDeserialize(using = OperationTextDeserializer::class)
+    val author: String? = null,
+    @JsonDeserialize(using = OperationTextDeserializer::class)
+    val message: String? = null,
+)
+
+data class OperationMetadataDto(
+    @JsonDeserialize(using = OperationTextDeserializer::class)
+    val author: String? = null,
+    @JsonDeserialize(using = OperationTextDeserializer::class)
+    val message: String? = null,
+)
 
 // ---- namespaces ----------------------------------------------------------
 
@@ -152,7 +167,13 @@ data class NamespaceDto(val name: String, val namespaceId: Long)
 
 fun NamespaceInfo.toDto() = NamespaceDto(name, namespaceId)
 
-data class CreateNamespaceRequestDto(val name: String)
+data class CreateNamespaceRequestDto(
+    val name: String,
+    @JsonDeserialize(using = OperationTextDeserializer::class)
+    val author: String? = null,
+    @JsonDeserialize(using = OperationTextDeserializer::class)
+    val message: String? = null,
+)
 
 // ---- tables --------------------------------------------------------------
 
@@ -186,7 +207,14 @@ data class ColumnDefDto(
         )
 }
 
-data class CreateTableRequestDto(val name: String, val columns: List<ColumnDefDto>)
+data class CreateTableRequestDto(
+    val name: String,
+    val columns: List<ColumnDefDto>,
+    @JsonDeserialize(using = OperationTextDeserializer::class)
+    val author: String? = null,
+    @JsonDeserialize(using = OperationTextDeserializer::class)
+    val message: String? = null,
+)
 
 data class ColumnDto(
     val name: String,
@@ -455,7 +483,9 @@ data class CommitRequestDto(
     // which CommitService enforces (422 validation, not a 400).
     val appends: List<TableAppendDto> = emptyList(),
     val deletes: List<TableDeletesDto> = emptyList(),
+    @JsonDeserialize(using = OperationTextDeserializer::class)
     val author: String? = null,
+    @JsonDeserialize(using = OperationTextDeserializer::class)
     val message: String? = null,
     val idempotencyKey: UUID? = null,
 ) {
@@ -800,6 +830,10 @@ data class CreateViewRequestDto(
     /** Stored verbatim — the server never parses view SQL. */
     val sql: String,
     val dialect: String = "trino",
+    @JsonDeserialize(using = OperationTextDeserializer::class)
+    val author: String? = null,
+    @JsonDeserialize(using = OperationTextDeserializer::class)
+    val message: String? = null,
 )
 
 // ---- snapshots -----------------------------------------------------------

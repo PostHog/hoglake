@@ -17,8 +17,7 @@ http://localhost:19000), HOGLAKE_S3_ACCESS_KEY / _SECRET_KEY
 """
 
 import os
-import sys
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 
 import pyarrow as pa
 
@@ -88,7 +87,7 @@ def main() -> None:
         except AlreadyExistsError:
             ns = catalog.namespace("ns1")
         try:
-            ns.table("points").drop()
+            ns.table("points").drop(author="duckdb-client-tests", message="drop test fixture")
         except NotFoundError:
             pass
         table = ns.create_table("points", SCHEMA)
@@ -99,7 +98,7 @@ def main() -> None:
 
         # partitioned table: identity(team) -> one file per team value
         try:
-            ns.table("part_points").drop()
+            ns.table("part_points").drop(author="duckdb-client-tests", message="drop test fixture")
         except NotFoundError:
             pass
         part_schema = pa.schema(
@@ -129,7 +128,7 @@ def main() -> None:
         # the 1-column schema (snapshot E1), then ADD COLUMN, then
         # batch2 under the 2-column schema
         try:
-            ns.table("points_evo").drop()
+            ns.table("points_evo").drop(author="duckdb-client-tests", message="drop test fixture")
         except NotFoundError:
             pass
         evo = ns.create_table(
@@ -168,7 +167,7 @@ def main() -> None:
         }
         for tname, (ktype, kvals) in xclient.items():
             try:
-                ns.table(tname).drop()
+                ns.table(tname).drop(author="duckdb-client-tests", message="drop test fixture")
             except NotFoundError:
                 pass
             t = ns.create_table(
@@ -189,7 +188,7 @@ def main() -> None:
         # refuses binary partition WRITES; its pruning must still read
         # these correctly — the wire value is base64)
         try:
-            ns.table("part_bin").drop()
+            ns.table("part_bin").drop(author="duckdb-client-tests", message="drop test fixture")
         except NotFoundError:
             pass
         pb = ns.create_table(
@@ -211,7 +210,7 @@ def main() -> None:
         # cannot be dropped on the wire, so the pair persists.
         for tname in ("ambig_t", "Ambig_T"):
             try:
-                ns.table(tname).drop()
+                ns.table(tname).drop(author="duckdb-client-tests", message="drop test fixture")
             except NotFoundError:
                 pass
             ns.create_table(tname, pa.schema([pa.field("x", pa.int64())]))
@@ -229,6 +228,8 @@ def main() -> None:
         import httpx
 
         def rest(method, path, **kw):
+            if method == "DELETE":
+                kw["params"] = {"author": "duckdb-client-tests", "message": "drop test fixture"}
             r = httpx.request(method, HOGLAKE_URL.rstrip("/") + "/v1" + path, **kw)
             if r.status_code not in (200, 201, 404, 409):
                 raise RuntimeError(f"{method} {path}: {r.status_code} {r.text[:200]}")
@@ -277,7 +278,7 @@ def main() -> None:
         except AlreadyExistsError:
             sq_ns = sq.namespace("ns1")
         try:
-            sq_ns.table("dup_path").drop()
+            sq_ns.table("dup_path").drop(author="duckdb-client-tests", message="drop test fixture")
         except NotFoundError:
             pass
         dup = sq_ns.create_table("dup_path", pa.schema([pa.field("a", pa.int64())]))
@@ -298,7 +299,7 @@ def main() -> None:
         # must refuse with a typed error, never invalidate the
         # instance (R4-1)
         try:
-            sq_ns.table("dup_incon").drop()
+            sq_ns.table("dup_incon").drop(author="duckdb-client-tests", message="drop test fixture")
         except NotFoundError:
             pass
         dupi = sq_ns.create_table("dup_incon", pa.schema([pa.field("a", pa.int64())]))
@@ -323,10 +324,11 @@ def main() -> None:
         import io as _io
         import time as _time
         import uuid as _uuid
+
         import pyarrow.parquet as _pq
 
         try:
-            sq_ns.table("bad_fieldid").drop()
+            sq_ns.table("bad_fieldid").drop(author="duckdb-client-tests", message="drop test fixture")
         except NotFoundError:
             pass
         fid_tbl = sq_ns.create_table(
@@ -368,7 +370,7 @@ def main() -> None:
         # looks like. Gated: exports DUCKEXT_FID_MISSING only if the
         # swap succeeded.
         try:
-            sq_ns.table("fid_missing").drop()
+            sq_ns.table("fid_missing").drop(author="duckdb-client-tests", message="drop test fixture")
         except NotFoundError:
             pass
         fm_schema = pa.schema([pa.field("id", pa.int64(), nullable=False)])
@@ -437,7 +439,7 @@ def main() -> None:
         # to physical position — a positional-fallback regression reads
         # different rowids
         try:
-            ns.table("points_sorted").drop()
+            ns.table("points_sorted").drop(author="duckdb-client-tests", message="drop test fixture")
         except NotFoundError:
             pass
         srt = ns.create_table(

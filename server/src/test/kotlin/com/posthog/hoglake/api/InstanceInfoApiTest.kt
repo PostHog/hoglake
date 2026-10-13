@@ -266,7 +266,7 @@ class InstanceInfoApiTest {
             app.catalogMetrics.sampleOnce()
 
             // Drop the table: the catalog is now empty in the database.
-            catalogs.dropTable(cat, "analytics", "events")
+            catalogs.dropTable(cat, "analytics", "events", author = "integration-test", message = "drop table fixture")
 
             // The listing still reports the SAMPLED numbers, because it
             // reads the sampler's map rather than summing the manifest
@@ -296,7 +296,7 @@ class InstanceInfoApiTest {
         app.catalogMetrics.sampleOnce()
         val before = app.catalogMetrics.latestTotals!!
 
-        catalogs.dropTable(cat, "analytics", "events")
+        catalogs.dropTable(cat, "analytics", "events", author = "integration-test", message = "drop table fixture")
 
         // No resample yet: the drop is invisible.
         assertThat(app.catalogMetrics.latestTotals).isEqualTo(before)

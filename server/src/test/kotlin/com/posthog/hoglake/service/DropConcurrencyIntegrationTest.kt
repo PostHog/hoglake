@@ -86,7 +86,9 @@ class DropConcurrencyIntegrationTest {
         var dropSnapshot = 0L
         val dropper =
             Thread({
-                dropSnapshot = catalogs.dropTable(catalog, "ns", "t").snapshotId
+                dropSnapshot =
+                    catalogs.dropTable(catalog, "ns", "t", author = "integration-test", message = "drop table fixture")
+                        .snapshotId
                 dropFinishedAt.set(System.nanoTime())
             }, "dropper")
         try {
@@ -138,7 +140,7 @@ class DropConcurrencyIntegrationTest {
             ).bind("c", catalogId).bind("o", owner).bind("p", claimPath).execute()
         }
 
-        catalogs.dropTable(catalog, "ns", "t")
+        catalogs.dropTable(catalog, "ns", "t", author = "integration-test", message = "drop table fixture")
 
         // The reference check's own question, asked the way the drain
         // asks it. Kept as the drain's three-leg UNION rather than a

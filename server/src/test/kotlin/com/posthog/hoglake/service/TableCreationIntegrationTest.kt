@@ -118,6 +118,8 @@ class TableCreationIntegrationTest {
                     name = "renamed",
                     replacement = ReplacementTarget(original.tableUuid, head),
                     comment = "replacement",
+                    author = "integration-test",
+                    message = "replace table fixture",
                 ),
             )
         creations.publish(catalog, replacement.operationId, emptyList())
@@ -502,7 +504,7 @@ class TableCreationIntegrationTest {
         assertThatThrownBy {
             creations.prepare(catalog, id, definition.copy(name = "different"))
         }.isInstanceOf(HoglakeException.CommitConflict::class.java)
-        catalogs.dropTable(catalog, "test", "target")
+        catalogs.dropTable(catalog, "test", "target", author = "integration-test", message = "drop table fixture")
         val replacement = catalogs.createTable(catalog, "test", "target", definition.columns)
         assertThat(creations.publish(catalog, id, listOf(file(prepared)))).isEqualTo(committed)
         assertThat(catalogs.getTable(catalog, "test", "target").tableUuid).isEqualTo(replacement.tableUuid)
@@ -547,7 +549,7 @@ class TableCreationIntegrationTest {
             val results = futures.map { it.get(10, TimeUnit.SECONDS) }
             assertThat(results.map { it.state }).containsExactlyInAnyOrder("committed", "rejected")
             val rejected = results.single { it.state == "rejected" }
-            catalogs.dropTable(catalog, "test", "target")
+            catalogs.dropTable(catalog, "test", "target", author = "integration-test", message = "drop table fixture")
             assertThat(creations.publish(catalog, rejected.operationId, emptyList())).isEqualTo(rejected)
             assertThat(catalogs.listTables(catalog, "test")).isEmpty()
         }

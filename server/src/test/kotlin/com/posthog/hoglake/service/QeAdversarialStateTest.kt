@@ -426,7 +426,7 @@ class QeAdversarialStateTest {
                         ),
                 ),
             )
-            catalogs.dropTable(cat, "ns", "phoenix")
+            catalogs.dropTable(cat, "ns", "phoenix", author = "integration-test", message = "drop table fixture")
         }
         // All ten identities are distinct.
         assertThat(incarnations.map { it.uuid }.toSet()).hasSize(10)

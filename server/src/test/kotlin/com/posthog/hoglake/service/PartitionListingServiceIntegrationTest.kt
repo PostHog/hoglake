@@ -605,7 +605,7 @@ class PartitionListingServiceIntegrationTest {
             .isInstanceOf(HoglakeException.NotFound::class.java)
         assertThatThrownBy { listings.listPartitions(cat, "ns", "nope") }
             .isInstanceOf(HoglakeException.NotFound::class.java)
-        catalogs.dropTable(cat, "ns", "t", null)
+        catalogs.dropTable(cat, "ns", "t", null, author = "integration-test", message = "drop table fixture")
         assertThatThrownBy { listings.listPartitions(cat, "ns", "t") }
             .isInstanceOf(HoglakeException.NotFound::class.java)
     }

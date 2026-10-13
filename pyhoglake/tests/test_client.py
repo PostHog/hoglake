@@ -1050,10 +1050,13 @@ def test_drop_table(client, httpx_mock):
 
     httpx_mock.add_response(
         method="DELETE",
-        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events",
+        url=(
+            f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events"
+            + "?author=pyhoglake-tests&message=drop+test+fixture"
+        ),
         json={"snapshot_id": 9, "schema_version": 3},
     )
-    res = t.drop()
+    res = t.drop(author="pyhoglake-tests", message="drop test fixture")
     assert res.snapshot_id == 9
     # The table is gone; a pin to one of its snapshots would resolve a dead
     # incarnation. drop() clears it.
@@ -1141,10 +1144,15 @@ def test_views(client, httpx_mock):
 
     httpx_mock.add_response(
         method="DELETE",
-        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/views/v1",
+        url=(
+            f"{BASE}/v1/catalogs/cat/namespaces/ns1/views/v1"
+            + "?author=pyhoglake-tests&message=drop+test+fixture"
+        ),
         json={"snapshot_id": 11},
     )
-    assert v.drop().snapshot_id == 11
+    assert (
+        v.drop(author="pyhoglake-tests", message="drop test fixture").snapshot_id == 11
+    )
 
 
 # -- snapshots pagination ---------------------------------------------------

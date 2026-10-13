@@ -173,7 +173,10 @@ class ReadParityApiTest {
                 .containsExactly("top")
 
             // DELETE returns the recording snapshot; the view is then 404.
-            val dropped = client.delete("/v1/catalogs/vw/namespaces/ns/views/top")
+            val dropped =
+                client.delete(
+                    "/v1/catalogs/vw/namespaces/ns/views/top?author=integration-test&message=drop-fixture",
+                )
             assertThat(dropped.status).isEqualTo(HttpStatusCode.OK)
             assertThat(body(dropped)["snapshot_id"].asLong()).isEqualTo(4)
             assertApiError(

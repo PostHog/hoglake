@@ -50,7 +50,14 @@ class TableReplacementIntegrationTest {
     ) = creations.prepare(
         cat,
         UUID.randomUUID(),
-        TableCreationDefinition("ns", "t", columns, ReplacementTarget(uuid, catalogs.getCatalog(cat).headSnapshotId)),
+        TableCreationDefinition(
+            "ns",
+            "t",
+            columns,
+            ReplacementTarget(uuid, catalogs.getCatalog(cat).headSnapshotId),
+            author = "integration-test",
+            message = "replace table fixture",
+        ),
     )
 
     private fun append(cat: String) =
@@ -676,6 +683,8 @@ class TableReplacementIntegrationTest {
                     "renamed",
                     columns,
                     ReplacementTarget(old.tableUuid, catalogs.getCatalog(cat).headSnapshotId),
+                    author = "integration-test",
+                    message = "replace renamed table fixture",
                 ),
             )
         val replacement = creations.publish(cat, prepared.operationId, emptyList()).snapshotId!!
@@ -738,11 +747,26 @@ class TableReplacementIntegrationTest {
             when (mutation) {
                 "insert" -> commits.commit(cat, append(cat))
                 "rename" -> AlterService(db.jdbi).alterTable(cat, "ns", "t", listOf(AlterOp.RenameTable("renamed")))
-                "drop" -> catalogs.dropTable(cat, "ns", "t")
-                "truncate" -> catalogs.truncateTable(cat, "ns", "t", original.tableUuid)
+                "drop" ->
+                    catalogs.dropTable(
+                        cat,
+                        "ns",
+                        "t",
+                        author = "integration-test",
+                        message = "drop table fixture",
+                    )
+                "truncate" ->
+                    catalogs.truncateTable(
+                        cat,
+                        "ns",
+                        "t",
+                        original.tableUuid,
+                        author = "integration-test",
+                        message = "truncate table fixture",
+                    )
                 "replace" -> creations.publish(cat, prepare(cat, original.tableUuid).operationId, emptyList())
                 "reuse" -> {
-                    catalogs.dropTable(cat, "ns", "t")
+                    catalogs.dropTable(cat, "ns", "t", author = "integration-test", message = "drop table fixture")
                     catalogs.createTable(cat, "ns", "t", columns)
                 }
             }

@@ -1,0 +1,2 @@
+{"ops":[{"op":"rename_table","new_name":"next"}],
+                       "author":"fuzz","message":"rename"}

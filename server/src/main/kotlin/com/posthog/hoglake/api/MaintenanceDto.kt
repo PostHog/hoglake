@@ -525,6 +525,8 @@ private val RAW_JSON = ObjectMapper()
 data class OptionsPatchRequest(
     val snapshotRetentionSeconds: PatchField<Long>,
     val consumerFloor: Boolean?,
+    val author: String? = null,
+    val message: String? = null,
 ) {
     companion object {
         private const val RETENTION = "snapshot_retention_seconds"
@@ -550,7 +552,14 @@ data class OptionsPatchRequest(
                         "'$FLOOR' must be a boolean, got ${node.get(FLOOR)}",
                     )
                 }
-            return OptionsPatchRequest(retention, floor)
+
+            fun metadata(field: String): String? {
+                val value = node.get(field) ?: return null
+                if (value.isNull) return null
+                if (!value.isTextual) throw BadRequestException("'$field' must be a string or null")
+                return value.textValue()
+            }
+            return OptionsPatchRequest(retention, floor, metadata("author"), metadata("message"))
         }
     }
 }

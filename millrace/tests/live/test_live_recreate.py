@@ -76,7 +76,9 @@ async def test_drop_recreate_halts_loudly(
         )
 
         # Drop + recreate under the same name → a new incarnation.
-        await asyncio.to_thread(table.drop)
+        await asyncio.to_thread(
+            table.drop, author="integration-test", message="Drop test table"
+        )
         recreated = await asyncio.to_thread(lake_home.create_events_table, "events")
         assert recreated.table_uuid != old_uuid
 

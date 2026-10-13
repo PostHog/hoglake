@@ -128,7 +128,7 @@ class LakeHome:
     def drop_all(self) -> None:
         for table in self.tables:
             try:
-                table.drop()
+                table.drop(author="integration-test", message="Drop test table")
             except Exception as e:  # noqa: BLE001 - teardown is best-effort
                 print(f"teardown: dropping {table.name} failed: {e}")
 

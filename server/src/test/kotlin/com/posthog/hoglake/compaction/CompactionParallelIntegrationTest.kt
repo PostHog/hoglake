@@ -1319,7 +1319,10 @@ class CompactionParallelIntegrationTest {
                 .isTrue()
             // The drop takes the commit lock, marks the table, and
             // commits — all while the rewrite is parked.
-            dropSnapshot = catalogs.dropTable(fx.cat, "ns", "t").snapshotId
+            dropSnapshot =
+                catalogs
+                    .dropTable(fx.cat, "ns", "t", author = "integration-test", message = "drop table fixture")
+                    .snapshotId
         } finally {
             release.countDown()
         }

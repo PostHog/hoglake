@@ -58,6 +58,15 @@ struct JsonMutDoc {
 	yyjson_mut_doc *doc;
 };
 
+void AddDDLMetadata(JsonMutDoc &body, yyjson_mut_val *root, const string &message) {
+	yyjson_mut_obj_add_strcpy(body.doc, root, "author", "duckdb-client");
+	yyjson_mut_obj_add_strcpy(body.doc, root, "message", message.c_str());
+}
+
+string DDLMetadataQuery(const string &message) {
+	return "?author=duckdb-client&message=" + HoglakeApiClient::EncodeSegment(message);
+}
+
 string GetString(yyjson_val *obj, const char *key, const string &default_value = string()) {
 	auto val = yyjson_obj_get(obj, key);
 	if (!val || yyjson_is_null(val)) {
@@ -520,6 +529,7 @@ HoglakeCatalogInfo HoglakeApiClient::CreateCatalog(const string &data_path) {
 	yyjson_mut_doc_set_root(body.doc, root);
 	yyjson_mut_obj_add_strcpy(body.doc, root, "name", catalog_name.c_str());
 	yyjson_mut_obj_add_strcpy(body.doc, root, "data_path", data_path.c_str());
+	AddDDLMetadata(body, root, "CREATE CATALOG " + catalog_name);
 	auto response = Request("POST", "/v1/catalogs", body.Write());
 	if (response.status != 201) {
 		ThrowFor(response, "create catalog");
@@ -553,6 +563,7 @@ void HoglakeApiClient::CreateNamespace(const string &name) {
 	auto root = yyjson_mut_obj(body.doc);
 	yyjson_mut_doc_set_root(body.doc, root);
 	yyjson_mut_obj_add_strcpy(body.doc, root, "name", name.c_str());
+	AddDDLMetadata(body, root, "CREATE SCHEMA " + name);
 	auto response = Request("POST", CatalogPath("/namespaces"), body.Write());
 	if (response.status != 201) {
 		ThrowFor(response, "create namespace \"" + name + "\"");
@@ -603,6 +614,7 @@ HoglakeTableInfo HoglakeApiClient::CreateTable(const string &ns, const string &n
 	auto root = yyjson_mut_obj(body.doc);
 	yyjson_mut_doc_set_root(body.doc, root);
 	yyjson_mut_obj_add_strcpy(body.doc, root, "name", name.c_str());
+	AddDDLMetadata(body, root, "CREATE TABLE " + ns + "." + name);
 	auto cols = yyjson_mut_obj_add_arr(body.doc, root, "columns");
 	for (auto &col : columns) {
 		auto col_obj = yyjson_mut_arr_add_obj(body.doc, cols);
@@ -625,7 +637,8 @@ HoglakeTableInfo HoglakeApiClient::CreateTable(const string &ns, const string &n
 
 HoglakeCommitResult HoglakeApiClient::DropTable(const string &ns, const string &table) {
 	auto response =
-	    Request("DELETE", CatalogPath("/namespaces/" + EncodeSegment(ns) + "/tables/" + EncodeSegment(table)),
+	    Request("DELETE", CatalogPath("/namespaces/" + EncodeSegment(ns) + "/tables/" + EncodeSegment(table)) +
+	                DDLMetadataQuery("DROP TABLE " + ns + "." + table),
 	            string());
 	if (response.status != 200) {
 		ThrowFor(response, "drop table \"" + ns + "." + table + "\"");
@@ -662,6 +675,7 @@ HoglakeViewInfo HoglakeApiClient::CreateView(const string &ns, const string &nam
 	yyjson_mut_obj_add_strcpy(body.doc, root, "name", name.c_str());
 	yyjson_mut_obj_add_strcpy(body.doc, root, "sql", sql.c_str());
 	yyjson_mut_obj_add_strcpy(body.doc, root, "dialect", dialect.c_str());
+	AddDDLMetadata(body, root, "CREATE VIEW " + ns + "." + name);
 	auto response = Request("POST", CatalogPath("/namespaces/" + EncodeSegment(ns) + "/views"), body.Write());
 	if (response.status != 201) {
 		ThrowFor(response, "create view \"" + ns + "." + name + "\"");
@@ -672,7 +686,8 @@ HoglakeViewInfo HoglakeApiClient::CreateView(const string &ns, const string &nam
 
 HoglakeCommitResult HoglakeApiClient::DropView(const string &ns, const string &view) {
 	auto response = Request(
-	    "DELETE", CatalogPath("/namespaces/" + EncodeSegment(ns) + "/views/" + EncodeSegment(view)), string());
+	    "DELETE", CatalogPath("/namespaces/" + EncodeSegment(ns) + "/views/" + EncodeSegment(view)) +
+	                  DDLMetadataQuery("DROP VIEW " + ns + "." + view), string());
 	if (response.status != 200) {
 		ThrowFor(response, "drop view \"" + ns + "." + view + "\"");
 	}
@@ -813,6 +828,7 @@ HoglakeTableInfo HoglakeApiClient::AlterTable(const string &ns, const string &ta
 	JsonMutDoc body;
 	auto root = yyjson_mut_obj(body.doc);
 	yyjson_mut_doc_set_root(body.doc, root);
+	AddDDLMetadata(body, root, "ALTER TABLE " + ns + "." + table);
 	auto ops_arr = yyjson_mut_obj_add_arr(body.doc, root, "ops");
 	for (auto &op : ops) {
 		auto op_obj = yyjson_mut_arr_add_obj(body.doc, ops_arr);
