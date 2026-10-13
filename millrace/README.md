@@ -43,7 +43,8 @@ share: scalars, `json` and `struct`/`list`/`map` at any depth; a
 native Parquet VARIANT annotation), `stage.py`
 (the per-partition SlateDB staging layer:
 `PartitionStage` + `StageManager`), `consumer.py` (the consume loop:
-static and cooperative assignment claiming via `StageManager.sync_assignment`,
+the ordinal's partitions derived once at start from the topic's
+partition count and claimed via `StageManager.sync_assignment`,
 poll → stage → commit with offsets strictly after durable staging and
 the poll's per-partition stage batches overlapped (one WAL durability
 wait per partition, in flight together), staging under the partition
@@ -75,8 +76,8 @@ are implemented and tested. The live docker suite (`tests/live/`,
 marker `live`, run by `ci/live-millrace.sh`) covers the ten Phase 5
 scenarios: end-to-end truth with exact per-tenant reconciliation,
 kill -9 mid-flush, the lost commit response (an in-test TCP proxy drops
-the response AFTER the server commits), static and cooperative
-reassignment, junk `event_time` drop, whale overload + tail
+the response AFTER the server commits), static reassignment between
+deploys and the two-replica ordinal split, junk `event_time` drop, whale overload + tail
 freshness, the freshness SLA measurement, the DDL race, drop+recreate
 incarnation halt, and a compaction observation. Code-level map:
 [architecture.md](architecture.md).
@@ -127,30 +128,60 @@ The staging keyspace shares no key or value shape with the #331-era
 team-keyed layout, so millrace needs a fresh staging root (a new
 `MILLRACE_STAGE_URL` prefix).
 
-## Rollouts and fencing (static assignment)
+## Assignment, rollouts and fencing
+
+Partition assignment is static and derived, millpond's model: a
+StatefulSet of `MILLRACE_REPLICA_COUNT` replicas, each pod's ordinal
+parsed from the trailing `-<n>` of `POD_NAME` (the downward API;
+`HOSTNAME` is the fallback), and at start each replica reads the
+topic's partition count from Kafka metadata ONCE and claims every
+partition `p` with `p % replica_count == ordinal`
+(`consumer.py:compute_assignment`). There is no consumer group
+membership and no rebalance; the group id only namespaces the stored
+offsets. A replica count that divides the partition count is the
+sensible shape (every replica gets the same number; otherwise the low
+ordinals get one more), and an ordinal that works out to no partitions,
+a topic the metadata does not know, or an ordinal at or past the
+replica count all refuse to start with exit **2** (a topology problem,
+logged in one line like a config error; nothing is claimed). The
+metadata read rides out a fresh broker's transients (a few probes, 30 s
+each) and refuses with exit 1 if they never clear. librdkafka settings
+millrace does not own (`security.protocol`, `sasl.*`, `client.rack`,
+even `client.id` — WarpStream's `ws_az=<zone>,…` client-id pinning is
+the motivating case) pass through as `MILLRACE_KAFKA_CONSUMER_<KEY>`,
+applied last; the keys millrace owns for correctness are refused at
+boot (config.py's knob table).
+
+**Topology changes.** `spec.replicas` and `MILLRACE_REPLICA_COUNT`
+must move together, and never under a rolling restart. A bare
+`kubectl scale` down strands the departed ordinal's partitions
+silently (nobody's share covers them; their staged state sits on the
+store untouched). A scale up without the env change makes the new
+ordinals exit 2 (ordinal ≥ replica count). Changing the count is a
+pod-template change, so during a rollout old-count and new-count pods
+overlap, derive overlapping partition sets, open the same SlateDB paths
+and fence each other — the fleet must be fully down before the count
+changes. Expanding the topic's partition count under a rolling restart
+IS safe: the mapping for every existing partition is unchanged, and the
+new partitions are picked up ordinal by ordinal as pods restart.
 
 SlateDB is single-writer per partition path and fences LAZILY: a second
 writer's open succeeds, and the older writer learns it lost the path at
 its next write's durability wait (`Error.Closed(FENCED)`, pinned by
-`tests/test_slatedb_parity.py`). Under static assignment no rebalance
-event announces the loss — an EKS one-at-a-time StatefulSet rollout
-double-assigns the ordinal while the old pod drains, and the new pod
-opens the same SlateDB paths. The consume loop therefore catches FENCED
-at the staging write (and the flush loop's sweep surfaces an idle
-partition's fence at its next planning read), closes the fenced stage
-locally, and halts
+`tests/test_slatedb_parity.py`). Nothing announces the loss to the old
+owner — an EKS one-at-a-time StatefulSet rollout double-assigns the
+ordinal while the old pod drains, and the new pod opens the same
+SlateDB paths. The consume loop therefore catches FENCED at the staging
+write (and the flush loop's sweep surfaces an idle partition's fence at
+its next planning read), closes the fenced stage locally, and halts
 with `ConsumerFencedError` — deliberately DISTINCT from a crash or a
 flush halt: a blind restart would re-open the path and fence the NEW
 owner, and the two pods would fence each other until the rollout
 replaces one, offsets never advancing.
 
-So: **static mode on Kubernetes needs a rollout barrier** — a PreSync
-hook that keeps the new ordinal's pod from starting until the old one
-is fully gone (the compaction work's rollout research) — or run
-`MILLRACE_KAFKA_ASSIGNMENT=cooperative`, where revocation events make
-the ownership handoff explicit and the fence becomes a backstop rather
-than the signal. Cooperative is the recommended mode for new
-deployments without a barrier. The process-level wiring: a fenced
+So: **the rollout needs a barrier** — a PreSync hook that keeps the new
+ordinal's pod from starting until the old one is fully gone (the
+compaction work's rollout research). The process-level wiring: a fenced
 consumer exits with code **4** (`EXIT_FENCED`, distinct from a generic
 failure's 1, a config error's 2 and a flush halt's 3) so a supervisor
 can refuse the restart-into-the-same-path, and while the fenced process

@@ -98,16 +98,17 @@ O(tenants) pass per reader per poll.
 **One SlateDB instance per claimed Kafka partition**, at an
 object-storage path keyed by the partition, not the pod
 (`s3://…/millrace/{topic}/{partition}`). A replica claims partitions the
-way it always has — the consumer assignment *is* the claim — and opening
-a partition's DB is part of claiming it. The set of partitions assigned
-to a replica may change between deploys: staged state follows the
-partition to its new owner, never the pod. SlateDB is single-writer per
+way millpond does — its StatefulSet ordinal's share of the topic, derived
+once at start; the assignment *is* the claim — and opening a partition's
+DB is part of claiming it. The set of partitions assigned to a replica
+may change between deploys (a scale-out, a repartitioned topic): staged
+state follows the partition to its new owner, never the pod. SlateDB is single-writer per
 path, which is exactly the ownership fence assignment already provides;
 the fencing behavior on a contested open is pinned by a binding-parity
 test, not assumed. When the fence fires (a newer writer opened the
 path), the flush loop treats the partition's `Error.Closed` as
 terminal: the partition leaves flush scheduling with one log line
-(never a stack trace per sweep) until the assignment revokes it, and
+(never a stack trace per sweep) for the life of the process, and
 the runner's stats surface the fenced set. The consumer halts on it at
 the poll's durable write before committing: the staging batch, or, for
 a partition whose polled records all dropped, a one-put fence probe
@@ -520,10 +521,21 @@ is validation item 1, not an assumption.
 ## Deployment and operations
 
 One process = one topic → one table (hedgerow idiom: no central
-scheduler, no fleet coupling). Replicas claim partitions the way the
-consumer assignment hands them out — and claim each partition's SlateDB
-instance with it, so rebalancing between deploys moves staged state
-with the partition rather than stranding it on an ordinal.
+scheduler, no fleet coupling). The deployment is a StatefulSet of
+`MILLRACE_REPLICA_COUNT` replicas with `POD_NAME` from the downward
+API; assignment is static and derived, millpond's model: each pod
+parses its ordinal from the pod name's trailing `-<n>`, reads the
+topic's partition count from Kafka metadata once at start, and claims
+every partition `p` with `p % replica_count == ordinal` — there is no
+consumer group membership and no rebalance, and the group id only
+namespaces the stored offsets. A replica count that divides the
+partition count is the sensible shape; an ordinal with no partitions,
+an ordinal at or past the replica count, or an unknown topic refuses
+to start. Each claimed partition's SlateDB instance is claimed with
+it, so a reassignment between deploys (scaling the StatefulSet,
+repartitioning the topic — both take effect at the next start) moves
+staged state with the partition rather than stranding it on an
+ordinal.
 Parallelism by replica count, and bounded-parallel flush within one:
 the sweep runs up to `MILLRACE_FLUSH_CONCURRENCY` (default 4) decisions
 in flight per partition (4× that process-wide — each in-flight decision

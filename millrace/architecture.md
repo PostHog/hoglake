@@ -114,7 +114,7 @@ with the pipeline.
 
 | Entry point | Owns | Exit codes |
 |---|---|---|
-| `millrace` console script (`main.py:main`; also `python -m millrace.main`) | One topic → one table: config, `StageManager` (one SlateDB per claimed partition), `MillraceConsumer`, `HoglakeFlusher` + `FlushRunner`, ops server on `MILLRACE_METRICS_PORT` (default 8000) | 0 clean stop (SIGINT/SIGTERM), 1 other failure (incl. destination resolution failure at startup), 2 invalid config or missing `HOGLAKE_URL`, 3 flush pipeline halted (`FlushHalted`), 4 consumer fenced (`ConsumerFencedError`). Fenced outranks halted outranks generic (`main.py:_exit_code_for`). |
+| `millrace` console script (`main.py:main`; also `python -m millrace.main`) | One topic → one table: config, `StageManager` (one SlateDB per claimed partition), `MillraceConsumer`, `HoglakeFlusher` + `FlushRunner`, ops server on `MILLRACE_METRICS_PORT` (default 8000) | 0 clean stop (SIGINT/SIGTERM); 1 failure (startup resolution, an unrecoverable task error, metadata never settling); 2 invalid config or an assignment refusal (`AssignmentError`: no share for this ordinal, unknown topic); 3 flush halted; 4 fenced, 1 other failure (incl. destination resolution failure at startup), 2 invalid config or missing `HOGLAKE_URL`, 3 flush pipeline halted (`FlushHalted`), 4 consumer fenced (`ConsumerFencedError`). Fenced outranks halted outranks generic (`main.py:_exit_code_for`). |
 | `python -m millrace.maintenance` (`maintenance.py:main`) | GC and L0-debt monitoring for every SlateDB under one staging root, all topics; ops server on `MILLRACE_MAINTENANCE_METRICS_PORT` (default 8001) | 0 clean stop, 1 failure, 2 invalid config |
 | Ops HTTP server (`server.py:serve`, a thread inside each process) | `GET /metrics` (Prometheus exposition), `/healthz` (liveness), `/readyz` (readiness); 404 otherwise | n/a |
 
@@ -315,9 +315,8 @@ sequenceDiagram
   C->>C: re-read the table shape if its TTL passed (new keyer)
   C->>W: consume(n, poll_timeout)
   W->>K: fetch
-  K-->>W: records + rebalance callbacks
+  K-->>W: records
   W-->>C: messages
-  C->>SM: apply queued assign/revoke via sync_assignment
   C->>C: classify each record: parse JSON, key by partition tuple → StagedRecord, or DroppedRecord (logged, counted)
   par one task per partition with staged rows
     C->>P0: stage_batch(rows)
@@ -339,17 +338,13 @@ sequenceDiagram
    value bytes, cumulative over the run), floored at 1; the first poll
    uses the record cap alone. Poll on the worker thread with
    `MILLRACE_POLL_TIMEOUT_MS`.
-2. **Apply assignment events** queued by the rebalance callbacks by
-   syncing to `consumer.assignment()` (`_apply_assignment_events`). This
-   precedes staging, so a partition revoked mid-poll is closed first and
-   its fetched records are skipped; the new owner replays them.
-3. **Classify** each record (`classify_message`): parse the value once
+2. **Classify** each record (`classify_message`): parse the value once
    as a strict JSON object (`coerce.py:load_json_object`) and stage it
    under the keyer's partition tuple; anything else is dropped (below).
    The Kafka message key is never read for staging. Error events and
    records without coordinates are counted and skipped, never committed
    past explicitly.
-4. **Stage concurrently**: one `stage_batch` task per partition with
+3. **Stage concurrently**: one `stage_batch` task per partition with
    staged rows, and one `probe_fence` task per partition the poll
    handled but staged nothing on (every record dropped: a durable
    one-put `WriteBatch` of `meta/fence`, awaited like a staged batch, so
@@ -358,7 +353,7 @@ sequenceDiagram
    `asyncio.gather(return_exceptions=True)`, so every partition's WAL
    write and durability wait overlap and every write settles before any
    outcome is examined.
-5. **Commit** once, synchronously, for all touched partitions at
+4. **Commit** once, synchronously, for all touched partitions at
    `last_handled + 1` (handled = staged or dropped), only if every
    batch and probe succeeded. Retry ladder: 3 attempts, 0.5 s then
    1.0 s; exhaustion raises (offsets unadvanced, restart replays).
@@ -399,34 +394,49 @@ json column, or a leaf under a list or a map
 
 librdkafka config (`kafka_consumer_config`): `enable.auto.commit=false`,
 `enable.auto.offset.store=false`, `auto.offset.reset` from config,
-fetch knobs from config; cooperative mode adds
-`partition.assignment.strategy=cooperative-sticky`.
+fetch knobs from config; no `partition.assignment.strategy` (the
+consumer never joins the group). `client.id` is
+`millrace-{topic}-{ordinal}` — per ordinal, so broker quotas keyed by
+client id apply per pod, not per fleet. The `MILLRACE_KAFKA_CONSUMER_*`
+passthrough (section 8) is applied last, verbatim: it can add
+`security.protocol` / `sasl.*` / `client.rack` or replace `client.id`
+(WarpStream's `ws_az=<zone>,…` pinning); the keys millrace owns were
+refused at config time.
 
 ### Assignment
 
-`StageManager.sync_assignment(claimed)` closes partitions no longer
-claimed (clean SlateDB shutdown; nothing flushed or deleted), then opens
-newly claimed ones, always running `PartitionStage.recover()`
-(section 6).
+Assignment is static and derived once, at `MillraceConsumer.start()`
+(millpond's model; no consumer group membership, no rebalance):
 
-| Mode | Claim | Order |
+| Step | What | Refusal |
 |---|---|---|
-| `static` (default) | `MILLRACE_KAFKA_PARTITIONS`; `assign()` with `OFFSET_STORED` | Stages are opened and recovered before `assign()`. A coordinator warmup probe (`committed()` up to 24 attempts, 0.5 s apart, 5 s timeout each) runs first, because librdkafka resolves `OFFSET_STORED` once and never retries; exhaustion fails startup. |
-| `cooperative` | `subscribe()` with `on_assign` / `on_revoke` / `on_lost` | Callbacks fire on the worker thread inside `consume()` and only enqueue; the loop applies them after the poll. `lost` is handled like `revoke`. |
+| 1. Partition count | `list_topics(topic, timeout=30)` on the Kafka worker, up to 6 probes 2 s apart (a raised `KafkaException` and a topic-level `LEADER_NOT_AVAILABLE` are transients); `len(metadata.topics[topic].partitions)` | Topic absent, with any other broker error (`UNKNOWN_TOPIC_OR_PART`), or with zero partitions → `AssignmentError` at once (exit 2); transients that never clear → the last `KafkaException` (exit 1). Nothing is claimed yet either way |
+| 2. Split | `compute_assignment`: every `p` in `range(partition_count)` with `p % replica_count == ordinal` — millpond's `compute_assignment` verbatim | An empty share (more replicas than partitions) → `AssignmentError` naming the ordinal, the partition count and `MILLRACE_REPLICA_COUNT` (exit 2) |
+| 3. Claim | `StageManager.sync_assignment(claimed)` opens each partition's stage and runs `PartitionStage.recover()` (section 6) | — |
+| 4. Warmup | `committed()` probe, up to 24 attempts 0.5 s apart with a 5 s timeout each, because librdkafka resolves `OFFSET_STORED` once at assign time and never retries | Exhaustion fails startup |
+| 5. Assign | `assign()` with `OFFSET_STORED` | — |
+
+There is no re-discovery: a change to the replica count or the topic's
+partition count takes effect at the next start. A failed start is
+sticky (`_start_error`): `start()` latches `_started` only after
+`assign()` succeeds, and `run()` re-raises rather than polling an
+unassigned consumer. `sync_assignment` is
+also what closes partitions no longer claimed (clean SlateDB shutdown;
+nothing flushed or deleted) — unused by the consumer today, since the
+claimed set is fixed for the life of the process.
 
 ### FENCED halt
 
 SlateDB fences lazily: a newer writer's open of the same path succeeds,
 and the older writer gets `Error.Closed(reason=FENCED)` at its next write's
 durability wait (`tests/test_slatedb_parity.py::test_writer_fencing_on_contested_open_memory`, `..._file`).
-Under static assignment no rebalance event warns the old owner; a
-one-at-a-time StatefulSet rollout runs old and new pods for one ordinal
-at once.
+Nothing warns the old owner; a one-at-a-time StatefulSet rollout runs
+old and new pods for one ordinal at once.
 
 | Where detected | Action |
 |---|---|
 | Consume: a `stage_batch` or `probe_fence` raises `Closed(FENCED)` | Close the fenced stages locally, raise `ConsumerFencedError` naming them. The poll's offsets are not committed (a stream of 100 % drops is caught by the probe, `test_consumer.py::test_an_all_drops_poll_on_a_fenced_stage_halts_without_committing`). `/healthz` and `/readyz` 503 from that moment; the process exits 4, distinct from a crash because a restart onto the same assignment reopens the path, fences the new owner, and leaves two pods fencing each other with offsets never advancing. Any other `Closed` reason takes the generic error path. |
-| Flush: any `SlateError.Closed` at recovery, planning or mid-decision | `FlushRunner._note_fenced`: the partition leaves flush scheduling, logged once, listed in `fenced_partitions` and `millrace_flush_partition_fenced`; `/healthz` 503s. The mark clears when the assignment revokes the partition. This is how an idle partition's fence surfaces. |
+| Flush: any `SlateError.Closed` at recovery, planning or mid-decision | `FlushRunner._note_fenced`: the partition leaves flush scheduling, logged once, listed in `fenced_partitions` and `millrace_flush_partition_fenced`; `/healthz` 503s. The mark holds until the process exits. This is how an idle partition's fence surfaces. |
 
 ### Dropped records
 
@@ -497,8 +507,8 @@ decisions in flight per partition (semaphores) and a worker pool of
 order within a partition; `concurrency = 1` is one worker, strictly
 serial. A failed decision (ladder exhausted, encoder bug, object-store
 fault) is logged and counted; the rows stay staged and the next sweep
-retries. `StageClosedError` (revoked mid-sweep) drops the partition's
-remaining decisions. `SlateError.Closed` fences the partition.
+retries. `StageClosedError` (a stage closed mid-sweep, e.g. a fenced
+partition's local close) drops the partition's remaining decisions. `SlateError.Closed` fences the partition.
 `FlushHalted` is sticky: workers stop pulling, in-flight decisions
 finish, and every later `run_once` re-raises the halt.
 
@@ -930,7 +940,7 @@ entry", that is a manual SlateDB delete of
 | `destination_missing` | The commit is answered 404 for the destination | Restore the catalog/namespace/table or reconfigure | Startup resolution fails (exit 1) until the destination resolves; a recreated table → `table_recreated` |
 | `server_capability` | A shape read lacks `read_snapshot_id` | Upgrade or fix the server | Startup resolution refuses the destination (exit 1) until the server reports it |
 | `fanout_exceeds_commit_bound` | One decision would write more than `MILLRACE_MAX_FILES_PER_COMMIT` files (before any I/O) | Raise `MILLRACE_MAX_FILES_PER_COMMIT` or change the partition spec (the window spans too many tuples) | The same window fans out the same way and halts again |
-| fenced (exit 4; the flush loop's partition fence) | A newer writer opened the partition's SlateDB path | Find the other owner (a rollout overlap, a duplicated assignment). Do not restart this pod onto the same static assignment while the other owner runs | Re-opens the path and fences the other owner: two pods fence each other. With `cooperative`, the revocation resolves it |
+| fenced (exit 4; the flush loop's partition fence) | A newer writer opened the partition's SlateDB path | Find the other owner (a rollout overlap, two pods with the same ordinal). Do not restart this pod onto the same ordinal while the other owner runs | Re-opens the path and fences the other owner: two pods fence each other until the rollout replaces one |
 
 ## 7. Maintenance service
 
@@ -998,8 +1008,9 @@ default.
 | `MILLRACE_KAFKA_BOOTSTRAP_SERVERS` | required | non-empty | librdkafka `bootstrap.servers` |
 | `MILLRACE_KAFKA_TOPIC` | required | `[a-zA-Z0-9._-]{1,249}` | The one consumed topic |
 | `MILLRACE_KAFKA_GROUP_ID` | `millrace-{topic}` | — | Offset-storage group; changing it loses committed offsets |
-| `MILLRACE_KAFKA_ASSIGNMENT` | `static` | `static` \| `cooperative` | Explicit `assign()` or cooperative-sticky group membership |
-| `MILLRACE_KAFKA_PARTITIONS` | required iff static | comma list of unique non-negative ints; forbidden under `cooperative` | Partitions this replica claims |
+| `MILLRACE_REPLICA_COUNT` | required | positive int | The StatefulSet's replica count; this replica claims every partition `p` with `p % replica_count == ordinal` of the topic's partition count, read from Kafka metadata once at start |
+| `POD_NAME` (fallback `HOSTNAME`) | required | ends in `-<n>`; `n < MILLRACE_REPLICA_COUNT` | The pod name the ordinal is parsed from (downward API); a refusal of the fallback says to set `POD_NAME` |
+| `MILLRACE_KAFKA_CONSUMER_<KEY>` | none | key not owned by millrace (`bootstrap.servers`, `group.id`, `auto.offset.reset`, `enable.auto.commit`, `enable.auto.offset.store`, `partition.assignment.strategy` are refused, naming the knob); non-empty value | librdkafka passthrough, millpond's `KAFKA_CONSUMER_*`: `<KEY>` lowercased, `_` → `.`, value verbatim, applied after millrace's own keys (`security.protocol`, `sasl.*`, `client.rack`, `client.id` for WarpStream `ws_az=` zone pinning) |
 | `MILLRACE_KAFKA_AUTO_OFFSET_RESET` | `latest` | `latest` \| `earliest` | Start position when no committed offset exists |
 | `MILLRACE_KAFKA_MAX_PARTITION_FETCH_BYTES` | 33554432 (32 MiB) | positive | librdkafka `max.partition.fetch.bytes` |
 | `MILLRACE_KAFKA_FETCH_MAX_BYTES` | 268435456 (256 MiB) | positive, ≥ max partition fetch bytes | librdkafka `fetch.max.bytes` |
@@ -1147,15 +1158,31 @@ object storage.
 the #331-era team-keyed layout, so millrace needs a fresh staging root
 (a new `MILLRACE_STAGE_URL` prefix).
 
-**Static assignment on Kubernetes.** With `MILLRACE_KAFKA_ASSIGNMENT=static`
-each StatefulSet ordinal carries its own `MILLRACE_KAFKA_PARTITIONS`. A
-one-at-a-time rollout starts the new pod for an ordinal while the old
-one drains; both open the same SlateDB paths and the old one is fenced
-(exit 4). The README requires a rollout barrier (a PreSync hook that
-keeps the new ordinal's pod from starting until the old one is gone) or
-`MILLRACE_KAFKA_ASSIGNMENT=cooperative`, where revocation makes the
-handoff explicit and the fence is only a backstop; it recommends
-cooperative for deployments without a barrier.
+**Assignment on Kubernetes.** A StatefulSet with
+`MILLRACE_REPLICA_COUNT` set to its replica count and `POD_NAME` from
+the downward API (`metadata.name`); each pod parses its ordinal from
+the name and derives its partitions at start (section 4, "Assignment").
+A replica count that divides the topic's partition count is the
+sensible shape. Scaling the StatefulSet or repartitioning the topic is
+a redeploy: every pod re-derives at its next start, and staged state
+follows each partition to its new owner on the store. A one-at-a-time
+rollout starts the new pod for an ordinal while the old one drains;
+both open the same SlateDB paths and the old one is fenced (exit 4).
+The README requires a rollout barrier (a PreSync hook that keeps the
+new ordinal's pod from starting until the old one is gone).
+
+**Topology changes.** `spec.replicas` and `MILLRACE_REPLICA_COUNT`
+move together, never under a rolling restart. A bare `kubectl scale`
+down strands the departed ordinal's partitions silently (no share
+covers them; their staged state stays on the store). A scale up
+without the env change makes the new ordinals exit 2 (ordinal ≥
+replica count). The count is part of the pod template, so a rollout
+that changes it runs old-count and new-count pods at once; they derive
+overlapping partition sets, open the same SlateDB paths and fence each
+other — the fleet must be fully down before the count changes.
+Expanding the topic's partition count under a rolling restart is safe:
+every existing partition keeps its ordinal, and the new ones are
+picked up as each pod restarts.
 
 **Sizing notes from the README and design doc.**
 
@@ -1241,7 +1268,7 @@ Each is pinned by the named test(s) under `tests/`.
 | 25 | One decision's failure never wedges a sweep; a halt is sticky. | `test_flush.py::test_one_decisions_failure_never_wedges_the_sweep`, `test_flush.py::test_halt_stops_the_pipeline_and_stays_halted`, `test_flush.py::test_a_halt_under_parallelism_is_sticky_and_settles_nothing_past_it` |
 | 26 | Slow outranks age: an age decision's age lies in `[flush_deadline, slow_deadline)` and a key past the slow deadline flushes `slow` regardless of size; planning is deterministic under input order. | `test_planner.py::test_age_decisions_stay_inside_their_window`, `test_planner.py::test_past_slow_deadline_always_flushes_slow_regardless_of_size`, `test_planner.py::test_plan_flush_is_deterministic_under_input_order` |
 | 27 | Key byte order equals logical order (rows: group, then offset), pinned by golden vectors. | `test_keyspace.py::test_group_golden_vectors`, `test_keyspace.py::test_row_key_golden_vectors`, `test_keyspace.py::test_row_key_byte_order_is_logical_order`, `test_keyspace.py::test_rows_within_a_group_sort_by_offset`, `test_keyspace.py::test_sched_age_byte_order_is_age_order` |
-| 28 | Static start opens and recovers stages before `assign()`; revoke closes cleanly and loses nothing; a claim recovers the previous owner's leftovers. | `test_consumer.py::test_static_start_opens_and_recovers_stages_before_assign`, `test_consumer.py::test_revoke_closes_cleanly_and_loses_nothing`, `test_consumer.py::test_claim_recovers_the_previous_owners_leftovers` |
+| 28 | The assignment is derived once at start — the topic's partition count from one metadata read, split by `p % replica_count == ordinal` (uneven counts included) — the stages open and recover before `assign()`, an unknown topic or an empty share refuses to start with nothing claimed, and a claim recovers the previous owner's leftovers. | `test_consumer.py::test_compute_assignment_is_millponds_modulo_rule`, `test_consumer.py::test_compute_assignment_partitions_the_topic_exactly_once`, `test_consumer.py::test_derived_assignment_claims_exactly_the_expected_partitions`, `test_consumer.py::test_static_start_opens_and_recovers_stages_before_assign`, `test_consumer.py::test_an_unknown_topic_refuses_startup_with_nothing_claimed`, `test_consumer.py::test_an_ordinal_with_no_partitions_refuses_startup`, `test_consumer.py::test_claim_recovers_the_previous_owners_leftovers`, `test_config.py::test_ordinal_at_or_past_the_replica_count_is_refused` |
 | 29 | Liveness latches only terminal states. | `test_main.py::test_liveness_status_latches_only` |
 | 30 | Writers cannot drop their embedded compactor; external GC is safe beside a live writer. | `test_slatedb_parity.py::test_compactor_disabled_stalls_memtable_flushes_at_l0_max_ssts`, `test_slatedb_parity.py::test_external_gc_concurrent_with_active_writer`, `test_stage.py::test_build_slatedb_settings_shape` |
 | 31 | The group encoding round-trips (empty tuple, nulls, unicode), is total on decode, and is prefix-free: a tuple whose components are a byte prefix of another's never leaks into its row or `prepared/` range. | `test_keyspace.py::test_group_round_trip`, `test_keyspace.py::test_decode_group_never_raises_anything_but_value_error`, `test_keyspace.py::test_no_group_encoding_is_a_byte_prefix_of_another`, `test_keyspace.py::test_a_tuple_whose_components_prefix_another_never_leaks_into_its_range` |
@@ -1258,7 +1285,8 @@ Each is pinned by the named test(s) under `tests/`.
 
 The live suite (`tests/live/`, `just millrace live`) covers end-to-end
 per-tenant reconciliation, kill -9 mid-flush, a lost commit response,
-static and cooperative reassignment, junk `event_time`, whale overload,
+static reassignment between deploys and the two-replica ordinal split,
+junk `event_time`, whale overload,
 freshness, the DDL race, drop+recreate halt, compaction observation, and
 a nested destination (struct, list, map and json columns) partitioned
 `identity(properties.team_id), month(properties.ts)` and sorted by

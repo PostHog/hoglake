@@ -18,7 +18,7 @@ from kafkakit import FakeConsumer
 from pyhoglake import TableInfo
 
 from millrace import main
-from millrace.consumer import ConsumerFencedError, MillraceConsumer
+from millrace.consumer import AssignmentError, ConsumerFencedError, MillraceConsumer
 from millrace.flush import FlushHalted
 from millrace.grouping import GroupKeyer
 from millrace.stage import StageGauges, StageManager
@@ -28,7 +28,8 @@ def _valid_env() -> dict[str, str]:
     return {
         "MILLRACE_KAFKA_BOOTSTRAP_SERVERS": "broker:9092",
         "MILLRACE_KAFKA_TOPIC": "events",
-        "MILLRACE_KAFKA_PARTITIONS": "0",
+        "MILLRACE_REPLICA_COUNT": "1",
+        "POD_NAME": "millrace-events-0",
         "MILLRACE_CATALOG": "cat",
         "MILLRACE_NAMESPACE": "ns1",
         "MILLRACE_TABLE": "events",
@@ -196,6 +197,9 @@ def test_exit_code_classification():
     assert main._exit_code_for([None]) == 0
     assert main._exit_code_for([]) == 0
     assert main._exit_code_for([RuntimeError("boom")]) == main.EXIT_ERROR
+    # A topology refusal at start shares the config exit: the operator
+    # changes the replica count or the topic, never "restart and hope".
+    assert main._exit_code_for([AssignmentError("no share")]) == main.EXIT_CONFIG
     assert main._exit_code_for([_halted()]) == main.EXIT_HALTED
     fenced = ConsumerFencedError([("events", 3)])
     assert main._exit_code_for([fenced]) == main.EXIT_FENCED

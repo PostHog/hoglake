@@ -1,16 +1,18 @@
 """Scripted fake for the confluent-kafka Consumer surface millrace uses
 (hedgerow ``tests/fakes.py`` pattern: one journal, and call ORDER is the
-assertion surface). No broker anywhere: messages are fed, rebalances are
-scripted, commit failures are injected.
+assertion surface). No broker anywhere: messages are fed, the topic's
+partition count is a constructor argument, commit failures are injected.
 
 Fidelity rules the fake keeps — the consume loop's correctness rests on
 them:
 
-- rebalance callbacks (``on_assign`` / ``on_revoke`` / ``on_lost``) fire
-  INSIDE ``consume()``, the way librdkafka fires them inside
-  poll/consume: ``script_rebalance`` queues the event and the next
-  ``consume()`` fires the callbacks (revokes and losts before assigns)
-  before delivering messages;
+- ``list_topics(topic)`` answers a ``ClusterMetadata`` the way the
+  broker does: the requested topic with one ``PartitionMetadata`` per
+  partition, or — for a topic the fake was not given — the topic
+  present with ``UNKNOWN_TOPIC_OR_PART`` as its error and no
+  partitions (``strict_metadata=True`` omits it instead, the other
+  shape a metadata answer can take); ``fail_next_list_topics`` scripts
+  a raised ``KafkaException`` or a topic-level error for the next calls;
 - a paused or unassigned partition's queued messages are NOT delivered
   (librdkafka stops fetching them) and stay queued for a later
   resume/reassignment; error events deliver whenever their partition is
@@ -30,8 +32,7 @@ from __future__ import annotations
 
 import json
 from collections import deque
-from collections.abc import Iterable
-from typing import Any
+from collections.abc import Mapping
 
 from confluent_kafka import (
     OFFSET_INVALID,
@@ -41,6 +42,7 @@ from confluent_kafka import (
     KafkaException,
     TopicPartition,
 )
+from confluent_kafka.admin import ClusterMetadata, PartitionMetadata, TopicMetadata
 
 TS_MS = 1_800_000_000_000  # default message timestamp, ms (≈ 2027-01-15)
 
@@ -164,16 +166,29 @@ def error_event(
 
 
 class FakeConsumer:
-    """The confluent-kafka Consumer surface millrace drives: ``consume``,
-    ``commit``, ``assign``, ``subscribe``, ``assignment``, ``pause``,
-    ``resume``, ``close``."""
+    """The confluent-kafka Consumer surface millrace drives:
+    ``list_topics``, ``committed``, ``assign``, ``consume``, ``commit``,
+    ``close`` (plus ``pause``/``resume``). ``partitions`` is the
+    partition count of the one topic (``topic``) the cluster knows;
+    ``topics`` maps several. ``strict_metadata`` omits unknown topics
+    from a metadata answer instead of reporting them with an error."""
 
-    def __init__(self, *, journal: list[tuple] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        journal: list[tuple] | None = None,
+        partitions: int = 1,
+        topic: str = "events",
+        topics: Mapping[str, int] | None = None,
+        strict_metadata: bool = False,
+    ) -> None:
         self.journal: list[tuple] = journal if journal is not None else []
         self._queue: deque[FakeMessage] = deque()
-        self._pending_rebalance: list[tuple[str, list[TopicPartition]]] = []
-        self._pending_rebalance_after: list[tuple[str, list[TopicPartition]]] = []
-        self._cbs: dict[str, Any] = {}
+        self._topics: dict[str, int] = (
+            dict(topics) if topics is not None else {topic: partitions}
+        )
+        self._strict_metadata = strict_metadata
+        self._fail_list_topics: deque[KafkaException | KafkaError] = deque()
         self._assigned: list[TopicPartition] = []
         self.paused: set[tuple[str, int]] = set()
         self.committed_store: dict[tuple[str, int], int] = {}
@@ -184,46 +199,12 @@ class FakeConsumer:
         #: request surface (the byte-cap clamp's observable).
         self.requested_batch_sizes: list[int] = []
         self.closed = False
-        self.subscribed_topics: list[str] | None = None
 
     # -- scripting -------------------------------------------------------------
 
     def feed(self, *messages: FakeMessage) -> None:
         """Append messages to the fetch queue (as if produced)."""
         self._queue.extend(messages)
-
-    def script_rebalance(
-        self,
-        *,
-        assign: Iterable[int] = (),
-        revoke: Iterable[int] = (),
-        lost: Iterable[int] = (),
-        topic: str = "events",
-        after_delivery: bool = False,
-    ) -> None:
-        """Queue a rebalance; the NEXT ``consume()`` fires the callbacks
-        (librdkafka fires them inside poll/consume, so that is when
-        millrace sees them). Revokes and losts fire before assigns.
-
-        ``after_delivery=False`` (the common shape): the callbacks fire
-        BEFORE this consume delivers, so a revoked partition's queued
-        messages are held back (librdkafka drops the fetch buffer of a
-        revoked partition; the new owner refetches from the last
-        commit). ``after_delivery=True`` models the other real ordering:
-        already-queued messages ARE returned by the call whose callbacks
-        revoke the partition, and the consumer-side guard must skip
-        them."""
-        target = (
-            self._pending_rebalance_after if after_delivery else self._pending_rebalance
-        )
-        for kind, partitions in (
-            ("revoke", revoke),
-            ("lost", lost),
-            ("assign", assign),
-        ):
-            tps = [TopicPartition(topic, p) for p in partitions]
-            if tps:
-                target.append((kind, tps))
 
     def fail_next_commits(self, n: int, code: int = KafkaError._TRANSPORT) -> None:
         """The next ``n`` commit calls raise ``KafkaException``."""
@@ -242,6 +223,21 @@ class FakeConsumer:
                 KafkaException(KafkaError(code, "scripted committed failure"))
             )
 
+    def fail_next_list_topics(
+        self,
+        n: int,
+        code: int = KafkaError._TRANSPORT,
+        *,
+        topic_level: bool = False,
+    ) -> None:
+        """The next ``n`` ``list_topics`` calls fail: raise
+        ``KafkaException`` (a transport error, a timeout), or with
+        ``topic_level=True`` answer with ``code`` as the requested
+        topic's error (``LEADER_NOT_AVAILABLE`` on a fresh broker)."""
+        for _ in range(n):
+            err = KafkaError(code, f"scripted metadata failure {code}")
+            self._fail_list_topics.append(err if topic_level else KafkaException(err))
+
     def deliverable(self) -> int:
         """Messages a ``consume()`` could return right now (assigned and,
         for data messages, unpaused)."""
@@ -257,10 +253,42 @@ class FakeConsumer:
         """Every message still sitting in the fetch queue."""
         return len(self._queue)
 
-    def has_pending_rebalance(self) -> bool:
-        return bool(self._pending_rebalance or self._pending_rebalance_after)
-
     # -- the consumer surface ----------------------------------------------------
+
+    def list_topics(
+        self, topic: str | None = None, timeout: float = -1
+    ) -> ClusterMetadata:
+        """The cluster metadata (the startup partition-count read). A
+        topic the fake was not given comes back the way a broker answers
+        a metadata request for a nonexistent topic: present, with
+        ``UNKNOWN_TOPIC_OR_PART`` as its error and no partitions."""
+        self._assert_open()
+        self.journal.append(("list_topics", topic, timeout))
+        scripted = self._fail_list_topics.popleft() if self._fail_list_topics else None
+        if isinstance(scripted, KafkaException):
+            raise scripted
+        cluster = ClusterMetadata()
+        names = [topic] if topic is not None else list(self._topics)
+        for name in names:
+            meta = TopicMetadata()
+            meta.topic = name
+            count = self._topics.get(name)
+            if scripted is not None:
+                meta.error = scripted
+            elif count is None:
+                if self._strict_metadata:
+                    continue
+                meta.error = KafkaError(
+                    KafkaError.UNKNOWN_TOPIC_OR_PART, f"Unknown topic {name!r}"
+                )
+            else:
+                for i in range(count):
+                    part = PartitionMetadata()
+                    part.id = i
+                    part.leader = 1
+                    meta.partitions[i] = part
+            cluster.topics[name] = meta
+        return cluster
 
     def assign(self, partitions: list[TopicPartition]) -> None:
         self._assert_open()
@@ -269,28 +297,10 @@ class FakeConsumer:
         )
         self._assigned = list(partitions)
 
-    def subscribe(
-        self,
-        topics: list[str],
-        on_assign: Any = None,
-        on_revoke: Any = None,
-        on_lost: Any = None,
-    ) -> None:
-        self._assert_open()
-        self.journal.append(("subscribe", list(topics)))
-        self.subscribed_topics = list(topics)
-        self._cbs = {"on_assign": on_assign, "on_revoke": on_revoke, "on_lost": on_lost}
-
-    def assignment(self) -> list[TopicPartition]:
-        self._assert_open()
-        return list(self._assigned)
-
     def consume(self, num_messages: int = 1, timeout: float = -1) -> list[FakeMessage]:
         self._assert_open()
         self.consume_calls += 1
         self.requested_batch_sizes.append(num_messages)
-        self._fire_pending_rebalance(self._pending_rebalance)
-        self._pending_rebalance = []
         assigned = {(tp.topic, tp.partition) for tp in self._assigned}
         taken: list[FakeMessage] = []
         held: deque[FakeMessage] = deque()
@@ -310,8 +320,6 @@ class FakeConsumer:
             else:
                 held.append(m)
         self._queue = held
-        self._fire_pending_rebalance(self._pending_rebalance_after)
-        self._pending_rebalance_after = []
         if taken:
             self.journal.append(
                 ("consume", [(m.topic(), m.partition(), m.offset()) for m in taken])
@@ -357,7 +365,7 @@ class FakeConsumer:
     def committed(
         self, partitions: list[TopicPartition], timeout: float = -1
     ) -> list[TopicPartition]:
-        """The committed-offset probe (the static start's coordinator
+        """The committed-offset probe (the start's coordinator
         warmup). Answers from the store, ``OFFSET_INVALID`` where no
         offset exists — the broker's answer for a fresh group."""
         self._assert_open()
@@ -385,27 +393,3 @@ class FakeConsumer:
     def _assert_open(self) -> None:
         if self.closed:
             raise RuntimeError("consumer is closed")
-
-    def _fire_pending_rebalance(
-        self, pending: list[tuple[str, list[TopicPartition]]]
-    ) -> None:
-        for kind, tps in pending:
-            cb = self._cbs.get(f"on_{kind}")
-            if cb is not None:
-                self.journal.append(
-                    ("rebalance_cb", kind, [(tp.topic, tp.partition) for tp in tps])
-                )
-                cb(self, tps)
-            # librdkafka's automatic incremental_unassign/incremental_assign
-            # when the app does not call them (millrace does not).
-            tpset = {(tp.topic, tp.partition) for tp in tps}
-            if kind in ("revoke", "lost"):
-                self._assigned = [
-                    tp for tp in self._assigned if (tp.topic, tp.partition) not in tpset
-                ]
-                self.paused -= tpset
-            else:
-                have = {(tp.topic, tp.partition) for tp in self._assigned}
-                self._assigned.extend(
-                    tp for tp in tps if (tp.topic, tp.partition) not in have
-                )

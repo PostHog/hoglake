@@ -4554,7 +4554,8 @@ class TestFlushConfigKnobs:
         env = {
             "MILLRACE_KAFKA_BOOTSTRAP_SERVERS": "b:9092",
             "MILLRACE_KAFKA_TOPIC": "events",
-            "MILLRACE_KAFKA_PARTITIONS": "0",
+            "MILLRACE_REPLICA_COUNT": "1",
+            "POD_NAME": "millrace-events-0",
             "MILLRACE_CATALOG": "prod",
             "MILLRACE_NAMESPACE": "default",
             "MILLRACE_TABLE": "events",
@@ -4574,7 +4575,8 @@ class TestFlushConfigKnobs:
         env = {
             "MILLRACE_KAFKA_BOOTSTRAP_SERVERS": "b:9092",
             "MILLRACE_KAFKA_TOPIC": "events",
-            "MILLRACE_KAFKA_PARTITIONS": "0",
+            "MILLRACE_REPLICA_COUNT": "1",
+            "POD_NAME": "millrace-events-0",
             "MILLRACE_CATALOG": "prod",
             "MILLRACE_NAMESPACE": "default",
             "MILLRACE_TABLE": "events",
@@ -4593,7 +4595,8 @@ class TestFlushConfigKnobs:
         env = {
             "MILLRACE_KAFKA_BOOTSTRAP_SERVERS": "b:9092",
             "MILLRACE_KAFKA_TOPIC": "events",
-            "MILLRACE_KAFKA_PARTITIONS": "0",
+            "MILLRACE_REPLICA_COUNT": "1",
+            "POD_NAME": "millrace-events-0",
             "MILLRACE_CATALOG": "prod",
             "MILLRACE_NAMESPACE": "default",
             "MILLRACE_TABLE": "events",

@@ -17,9 +17,10 @@ Knobs
 |---|---|---|
 | ``MILLRACE_KAFKA_BOOTSTRAP_SERVERS`` | required | librdkafka bootstrap list |
 | ``MILLRACE_KAFKA_TOPIC`` | required | the one topic this pipeline consumes |
-| ``MILLRACE_KAFKA_GROUP_ID`` | ``millrace-{topic}`` | offset-storage group (static mode has no group semantics — it namespaces ``__consumer_offsets``; changing it loses the committed offsets, and where consumption then starts is ``MILLRACE_KAFKA_AUTO_OFFSET_RESET``'s call) |
-| ``MILLRACE_KAFKA_ASSIGNMENT`` | ``static`` | ``static`` (explicit ``assign()`` list, millpond's model) or ``cooperative`` (group assignment with cooperative-sticky rebalancing) |
-| ``MILLRACE_KAFKA_PARTITIONS`` | required iff static | comma-separated partition ids, e.g. ``0,1,2``; forbidden under ``cooperative`` (the group hands partitions out) |
+| ``MILLRACE_KAFKA_GROUP_ID`` | ``millrace-{topic}`` | offset-storage group (static assignment has no group semantics — it namespaces ``__consumer_offsets``; changing it loses the committed offsets, and where consumption then starts is ``MILLRACE_KAFKA_AUTO_OFFSET_RESET``'s call) |
+| ``MILLRACE_REPLICA_COUNT`` | required | the StatefulSet's replica count (positive). Partitions are assigned millpond's way: this replica claims every partition ``p`` of the topic with ``p % replica_count == ordinal`` (consumer.py ``compute_assignment``), the topic's partition count read from Kafka metadata ONCE at startup. Replicas dividing the partition count is the sensible shape; an ordinal that works out to no partitions refuses to start |
+| ``POD_NAME`` (fallback ``HOSTNAME``) | required | the pod's name from the downward API; the ordinal is its trailing ``-<n>`` (``millrace-events-3`` → 3). Must be below ``MILLRACE_REPLICA_COUNT`` |
+| ``MILLRACE_KAFKA_CONSUMER_<KEY>`` | none | librdkafka passthrough, millpond's ``KAFKA_CONSUMER_*``: ``<KEY>`` lowercased with ``_`` → ``.`` becomes the librdkafka key, the value passed verbatim, applied AFTER millrace's own keys (``MILLRACE_KAFKA_CONSUMER_SECURITY_PROTOCOL=SSL`` → ``security.protocol=SSL``; the motivating case is WarpStream zone pinning, ``MILLRACE_KAFKA_CONSUMER_CLIENT_ID=ws_az=use1-az1,millrace-events-0`` or ``..._CLIENT_RACK``). Keys millrace owns for correctness are REFUSED at boot (``bootstrap.servers``, ``group.id``, ``auto.offset.reset`` — each has its own knob — and ``enable.auto.commit``, ``enable.auto.offset.store``, ``partition.assignment.strategy``); an empty value is refused too |
 | ``MILLRACE_KAFKA_AUTO_OFFSET_RESET`` | ``latest`` | where a partition with NO committed offset starts: ``latest`` (fleet policy — the head) or ``earliest`` (the log start). The tension is real and documented below the table |
 | ``MILLRACE_KAFKA_MAX_PARTITION_FETCH_BYTES`` | 33554432 (32 MiB) | librdkafka ``max.partition.fetch.bytes`` — per-partition fetch response cap. The 1 MiB library default capped millpond's hot partition at ~50 MB/s (dozens of serialized fetch round trips per poll); the whale shape is ~55 MB/s, i.e. ~25 MB per hot partition per 500 ms poll, so one response must hold a poll's worth with headroom |
 | ``MILLRACE_KAFKA_FETCH_MAX_BYTES`` | 268435456 (256 MiB) | librdkafka ``fetch.max.bytes`` — the per-fetch aggregate across the pod's partitions. Must be ≥ the per-partition cap (one hot partition's response must fit) and cover a poll's aggregate when several partitions run hot at once |
@@ -102,13 +103,6 @@ class ConfigError(Exception):
             f"invalid millrace configuration ({len(problems)} problem(s)):\n"
             + "\n".join(f"  - {p}" for p in problems)
         )
-
-
-class AssignmentMode(Enum):
-    """How partitions are claimed (docs/kafka-ingestion.md §Deployment)."""
-
-    STATIC = "static"
-    COOPERATIVE = "cooperative"
 
 
 class AutoOffsetReset(Enum):
@@ -220,7 +214,23 @@ _CATALOG_NAME: Final = re.compile(r"^[a-z][a-z0-9_-]{0,62}$")
 _IDENTIFIER: Final = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,127}$")
 # S3 bucket names (millpond's _S3_URI bucket piece).
 _S3_BUCKET: Final = re.compile(r"^[a-z0-9][a-z0-9.\-]{1,61}[a-z0-9]$")
+# A StatefulSet pod name's trailing ordinal (millpond's _parse_ordinal).
+_POD_ORDINAL: Final = re.compile(r"-(\d+)$")
 
+
+#: The librdkafka passthrough prefix (module docstring).
+_KAFKA_CONSUMER_PREFIX: Final = "MILLRACE_KAFKA_CONSUMER_"
+#: librdkafka keys the passthrough may NOT set: millrace owns them for
+#: correctness. The value names the dedicated knob where one exists;
+#: None means there is deliberately no knob at all.
+_OWNED_KAFKA_KEYS: Final[dict[str, str | None]] = {
+    "bootstrap.servers": "MILLRACE_KAFKA_BOOTSTRAP_SERVERS",
+    "group.id": "MILLRACE_KAFKA_GROUP_ID",
+    "auto.offset.reset": "MILLRACE_KAFKA_AUTO_OFFSET_RESET",
+    "enable.auto.commit": None,
+    "enable.auto.offset.store": None,
+    "partition.assignment.strategy": None,
+}
 
 #: Pre-three-lane knob names → their successors, REFUSED at boot (module
 #: docstring): the rename narrowed the semantics, so there is no alias.
@@ -234,8 +244,11 @@ _RENAMED_ENV: Final = {
 class Config:
     """Validated startup configuration for one millrace pipeline.
 
-    ``static_partitions`` is set iff ``assignment_mode`` is
-    :class:`AssignmentMode.STATIC`. ``stage_store_url`` /
+    ``replica_count`` and ``ordinal`` (``0 <= ordinal < replica_count``)
+    are the two halves of the static partition assignment: the consumer
+    reads the topic's partition count from Kafka metadata once at
+    startup and claims the partitions millpond's rule hands this
+    ordinal (consumer.py ``compute_assignment``). ``stage_store_url`` /
     ``stage_base_path`` are the parsed halves of ``MILLRACE_STAGE_URL``,
     ready for :class:`millrace.stage.StageManager`: one SlateDB instance
     per claimed partition lives at ``{stage_base_path}/{topic}/{partition}``
@@ -246,8 +259,8 @@ class Config:
     kafka_bootstrap_servers: str
     kafka_topic: str
     kafka_group_id: str
-    assignment_mode: AssignmentMode
-    static_partitions: tuple[int, ...] | None
+    replica_count: int
+    ordinal: int
     catalog: str
     namespace: str
     table: str
@@ -269,6 +282,10 @@ class Config:
     kafka_max_partition_fetch_bytes: int = KAFKA_MAX_PARTITION_FETCH_BYTES_DEFAULT
     kafka_fetch_max_bytes: int = KAFKA_FETCH_MAX_BYTES_DEFAULT
     kafka_queued_max_messages_kbytes: int = KAFKA_QUEUED_MAX_MESSAGES_KBYTES_DEFAULT
+    #: The ``MILLRACE_KAFKA_CONSUMER_*`` passthrough as sorted
+    #: (librdkafka key, verbatim value) pairs, applied last by
+    #: ``consumer.kafka_consumer_config``.
+    kafka_consumer_overrides: tuple[tuple[str, str], ...] = ()
     # Flush-phase knobs (Phase 4).
     event_time_max_past_s: int = EVENT_TIME_MAX_PAST_S_DEFAULT
     event_time_max_future_s: int = EVENT_TIME_MAX_FUTURE_S_DEFAULT
@@ -353,29 +370,103 @@ def _bool(
     return default
 
 
-def _parse_partitions(raw: str, problems: list[str]) -> tuple[int, ...] | None:
-    """``0,1,2`` → (0, 1, 2): comma-separated, unique, non-negative."""
-    out: list[int] = []
-    ok = True
-    for token in raw.split(","):
-        token = token.strip()
-        if not token or not all("0" <= c <= "9" for c in token):
+def _parse_ordinal(pod_name: str) -> int:
+    """The StatefulSet ordinal from a pod name: its trailing ``-<n>``
+    (``millrace-events-3`` → 3). millpond's ``_parse_ordinal`` verbatim
+    (millpond/config.py), so the two services read the same pod name
+    the same way."""
+    match = _POD_ORDINAL.search(pod_name)
+    if not match:
+        raise ValueError(f"cannot parse an ordinal from pod name {pod_name!r}")
+    return int(match.group(1))
+
+
+def _replica_and_ordinal(
+    env: Mapping[str, str], problems: list[str]
+) -> tuple[int | None, int | None]:
+    """``MILLRACE_REPLICA_COUNT`` and the pod ordinal (``POD_NAME``,
+    falling back to ``HOSTNAME`` — the downward API sets the former,
+    Kubernetes the latter), each a problem on its own, plus the one
+    relation between them: the ordinal names a replica that exists."""
+    replica_count: int | None = None
+    if _required(env, "MILLRACE_REPLICA_COUNT", problems) is not None:
+        # Present, so the default is never used: _positive_int only
+        # parses and refuses zero/negative/garbage.
+        replica_count = _positive_int(env, "MILLRACE_REPLICA_COUNT", 1, problems)
+    pod_var = "POD_NAME" if env.get("POD_NAME", "").strip() else "HOSTNAME"
+    pod_name = env.get(pod_var, "").strip()
+    # A refusal of the fallback must say so: the fix is almost always
+    # "wire POD_NAME from the downward API", not "rename the host".
+    fallback = (
+        " (HOSTNAME was the fallback because POD_NAME is unset; set POD_NAME "
+        "from the downward API, metadata.name)"
+        if pod_var == "HOSTNAME"
+        else ""
+    )
+    ordinal: int | None = None
+    if not pod_name:
+        problems.append(
+            "POD_NAME (or its fallback HOSTNAME) is required and is not set: "
+            "the replica's ordinal is the pod name's trailing -<n>, "
+            "e.g. millrace-events-3; set POD_NAME from the downward API "
+            "(metadata.name)"
+        )
+    else:
+        try:
+            ordinal = _parse_ordinal(pod_name)
+        except ValueError:
             problems.append(
-                f"MILLRACE_KAFKA_PARTITIONS entry {token!r} is not a "
-                f"non-negative integer (expected e.g. 0,1,2)"
+                f"{pod_var}={pod_name!r} carries no trailing -<n> ordinal "
+                f"(expected a StatefulSet pod name, e.g. millrace-events-3)" + fallback
             )
-            ok = False
+    if ordinal is not None and replica_count is not None and ordinal >= replica_count:
+        problems.append(
+            f"{pod_var}={pod_name!r} ordinal {ordinal} >= "
+            f"MILLRACE_REPLICA_COUNT={replica_count}: the ordinal must name "
+            f"one of the replicas (0..{replica_count - 1})" + fallback
+        )
+        ordinal = None
+    return replica_count, ordinal
+
+
+def _kafka_consumer_overrides(
+    env: Mapping[str, str], problems: list[str]
+) -> tuple[tuple[str, str], ...]:
+    """``MILLRACE_KAFKA_CONSUMER_<KEY>=value`` → ``(<key>, value)`` with
+    ``<KEY>`` lowercased and ``_`` → ``.`` (millpond's ``KAFKA_CONSUMER_*``
+    rule), sorted. A key millrace owns is a problem naming the knob
+    that sets it (or saying there is none on purpose); an empty value
+    is a problem (librdkafka would take the empty string literally)."""
+    out: list[tuple[str, str]] = []
+    for name in sorted(env):
+        if not name.startswith(_KAFKA_CONSUMER_PREFIX):
             continue
-        value = int(token)
-        if value in out:
-            problems.append(f"MILLRACE_KAFKA_PARTITIONS lists partition {value} twice")
-            ok = False
+        key = name[len(_KAFKA_CONSUMER_PREFIX) :].lower().replace("_", ".")
+        value = env[name]
+        if not key:
+            problems.append(
+                f"{name} names no librdkafka key (expected e.g. "
+                f"{_KAFKA_CONSUMER_PREFIX}SECURITY_PROTOCOL)"
+            )
             continue
-        out.append(value)
-    if not out and ok:
-        problems.append("MILLRACE_KAFKA_PARTITIONS is empty")
-        return None
-    return tuple(sorted(out)) if ok else None
+        if key in _OWNED_KAFKA_KEYS:
+            knob = _OWNED_KAFKA_KEYS[key]
+            problems.append(
+                f"{name} is refused: millrace owns librdkafka {key!r} — "
+                + (
+                    f"set {knob} instead"
+                    if knob is not None
+                    else "it is pinned for correctness (offsets move only "
+                    "through the loop's explicit commits; there is no "
+                    "group membership) and has no knob on purpose"
+                )
+            )
+            continue
+        if not value.strip():
+            problems.append(f"{name} is empty (librdkafka {key!r} needs a value)")
+            continue
+        out.append((key, value))
+    return tuple(out)
 
 
 def _parse_stage_url(raw: str, problems: list[str]) -> tuple[str, str] | None:
@@ -454,30 +545,8 @@ def load_config(env: Mapping[str, str]) -> Config:
         f"millrace-{topic}" if topic is not None else None
     )
 
-    mode = _enum(
-        env,
-        "MILLRACE_KAFKA_ASSIGNMENT",
-        list(AssignmentMode),
-        AssignmentMode.STATIC,
-        problems,
-    )
-    partitions_raw = env.get("MILLRACE_KAFKA_PARTITIONS", "").strip()
-    partitions: tuple[int, ...] | None = None
-    if mode is AssignmentMode.STATIC:
-        if not partitions_raw:
-            problems.append(
-                "MILLRACE_KAFKA_PARTITIONS is required when "
-                "MILLRACE_KAFKA_ASSIGNMENT=static (the partitions this "
-                "replica claims, e.g. 0,1,2)"
-            )
-        else:
-            partitions = _parse_partitions(partitions_raw, problems)
-    elif mode is AssignmentMode.COOPERATIVE and partitions_raw:
-        problems.append(
-            "MILLRACE_KAFKA_PARTITIONS must not be set when "
-            "MILLRACE_KAFKA_ASSIGNMENT=cooperative — the consumer group "
-            "hands partitions out"
-        )
+    replica_count, ordinal = _replica_and_ordinal(env, problems)
+    kafka_consumer_overrides = _kafka_consumer_overrides(env, problems)
 
     auto_offset_reset = _enum(
         env,
@@ -670,7 +739,8 @@ def load_config(env: Mapping[str, str]) -> Config:
     assert bootstrap is not None
     assert topic is not None
     assert group_id is not None
-    assert isinstance(mode, AssignmentMode)
+    assert replica_count is not None
+    assert ordinal is not None
     assert isinstance(auto_offset_reset, AutoOffsetReset)
     assert max_partition_fetch_bytes is not None
     assert fetch_max_bytes is not None
@@ -695,18 +765,17 @@ def load_config(env: Mapping[str, str]) -> Config:
     assert flush_scan_max_rows is not None
     assert compression_ratio_halflife is not None
     assert flush_concurrency is not None
-    if mode is AssignmentMode.STATIC:
-        assert partitions is not None
     return Config(
         kafka_bootstrap_servers=bootstrap,
         kafka_topic=topic,
         kafka_group_id=group_id,
-        assignment_mode=mode,
-        static_partitions=partitions,
+        replica_count=replica_count,
+        ordinal=ordinal,
         kafka_auto_offset_reset=auto_offset_reset,
         kafka_max_partition_fetch_bytes=max_partition_fetch_bytes,
         kafka_fetch_max_bytes=fetch_max_bytes,
         kafka_queued_max_messages_kbytes=queued_max_messages_kbytes,
+        kafka_consumer_overrides=kafka_consumer_overrides,
         catalog=catalog,
         namespace=namespace,
         table=table,

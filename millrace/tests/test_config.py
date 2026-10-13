@@ -7,7 +7,6 @@ from __future__ import annotations
 import pytest
 
 from millrace.config import (
-    AssignmentMode,
     AutoOffsetReset,
     Config,
     ConfigError,
@@ -22,7 +21,8 @@ MINIMAL_ENV = {
     "MILLRACE_NAMESPACE": "default",
     "MILLRACE_TABLE": "events",
     "MILLRACE_STAGE_URL": "s3://data-bucket/millrace",
-    "MILLRACE_KAFKA_PARTITIONS": "0,1,2",
+    "MILLRACE_REPLICA_COUNT": "3",
+    "POD_NAME": "millrace-events-1",
 }
 
 
@@ -41,8 +41,8 @@ def test_minimal_env_yields_the_documented_defaults():
     assert cfg.kafka_bootstrap_servers == "broker-1:9092,broker-2:9092"
     assert cfg.kafka_topic == "events"
     assert cfg.kafka_group_id == "millrace-events"
-    assert cfg.assignment_mode is AssignmentMode.STATIC
-    assert cfg.static_partitions == (0, 1, 2)
+    assert cfg.replica_count == 3
+    assert cfg.ordinal == 1
     assert cfg.catalog == "prod"
     assert cfg.namespace == "default"
     assert cfg.table == "events"
@@ -175,9 +175,9 @@ def test_slow_lane_relation_is_not_checked_when_either_side_is_already_invalid()
 
 def test_every_missing_required_knob_is_named_in_one_refusal():
     probs = problems({})
-    # The six outright-required knobs plus MILLRACE_KAFKA_PARTITIONS,
-    # which the DEFAULT static assignment mode requires.
-    assert len(probs) == 7
+    # The six outright-required knobs plus the two halves of the
+    # assignment: the replica count and the pod name the ordinal comes from.
+    assert len(probs) == 8
     for knob in (
         "MILLRACE_KAFKA_BOOTSTRAP_SERVERS",
         "MILLRACE_KAFKA_TOPIC",
@@ -185,7 +185,8 @@ def test_every_missing_required_knob_is_named_in_one_refusal():
         "MILLRACE_NAMESPACE",
         "MILLRACE_TABLE",
         "MILLRACE_STAGE_URL",
-        "MILLRACE_KAFKA_PARTITIONS",
+        "MILLRACE_REPLICA_COUNT",
+        "POD_NAME",
     ):
         assert any(knob in p and "required" in p for p in probs), knob
 
@@ -233,41 +234,149 @@ def test_group_id_default_and_override():
     )
 
 
-# -- assignment ------------------------------------------------------------------------
+# -- assignment: replica count + pod ordinal (millpond's model) -------------------------
 
 
-def test_static_partitions_parse_sorted():
-    cfg = load(MINIMAL_ENV | {"MILLRACE_KAFKA_PARTITIONS": "4, 0,2"})
-    assert cfg.static_partitions == (0, 2, 4)
+def _without(env: dict[str, str], *names: str) -> dict[str, str]:
+    return {k: v for k, v in env.items() if k not in names}
 
 
-def test_static_requires_partitions():
-    env = {k: v for k, v in MINIMAL_ENV.items() if k != "MILLRACE_KAFKA_PARTITIONS"}
+def test_ordinal_comes_from_pod_name():
+    cfg = load(MINIMAL_ENV | {"POD_NAME": "millrace-events-2"})
+    assert (cfg.replica_count, cfg.ordinal) == (3, 2)
+
+
+def test_ordinal_falls_back_to_hostname():
+    env = _without(MINIMAL_ENV, "POD_NAME") | {"HOSTNAME": "millrace-events-0"}
+    assert load(env).ordinal == 0
+
+
+def test_a_blank_pod_name_falls_back_to_hostname():
+    env = MINIMAL_ENV | {"POD_NAME": " ", "HOSTNAME": "millrace-events-1"}
+    assert load(env).ordinal == 1
+
+
+@pytest.mark.parametrize(
+    "hostname", ["laptop", "millrace-events-7"]
+)  # no ordinal; ordinal >= replicas
+def test_a_refused_hostname_fallback_says_to_set_pod_name(hostname):
+    """Either refusal of the FALLBACK names the fix: POD_NAME from the
+    downward API, with HOSTNAME named as what was read instead."""
+    env = _without(MINIMAL_ENV, "POD_NAME") | {"HOSTNAME": hostname}
     (p,) = problems(env)
-    assert "MILLRACE_KAFKA_PARTITIONS" in p and "static" in p
+    assert p.startswith(f"HOSTNAME={hostname!r}")
+    assert "fallback" in p and "POD_NAME" in p and "downward API" in p
+    # Read through POD_NAME itself, the message does not mention a fallback.
+    (p2,) = problems(MINIMAL_ENV | {"POD_NAME": hostname})
+    assert p2.startswith(f"POD_NAME={hostname!r}") and "fallback" not in p2
 
 
-@pytest.mark.parametrize("raw", ["0,,1", "0,x", "-1,2", "", "0,0"])
-def test_bad_partition_lists_are_refused(raw):
-    probs = problems(MINIMAL_ENV | {"MILLRACE_KAFKA_PARTITIONS": raw})
-    assert probs and all("MILLRACE_KAFKA_PARTITIONS" in p for p in probs)
+def test_pod_name_wins_over_hostname():
+    env = MINIMAL_ENV | {"POD_NAME": "millrace-events-2", "HOSTNAME": "laptop-0"}
+    assert load(env).ordinal == 2
 
 
-def test_cooperative_forbids_an_explicit_partition_list():
-    (p,) = problems(MINIMAL_ENV | {"MILLRACE_KAFKA_ASSIGNMENT": "cooperative"})
-    assert "MILLRACE_KAFKA_PARTITIONS" in p and "cooperative" in p
+def test_ordinal_is_the_trailing_number_only():
+    """``-<n>$``: a numeric token in the middle is not the ordinal, and
+    the digits are read as one decimal number."""
+    assert (
+        load(
+            MINIMAL_ENV
+            | {"POD_NAME": "millrace-v2-events-12", "MILLRACE_REPLICA_COUNT": "13"}
+        ).ordinal
+        == 12
+    )
 
 
-def test_cooperative_without_partitions_is_valid():
-    env = {k: v for k, v in MINIMAL_ENV.items() if k != "MILLRACE_KAFKA_PARTITIONS"}
-    cfg = load(env | {"MILLRACE_KAFKA_ASSIGNMENT": "cooperative"})
-    assert cfg.assignment_mode is AssignmentMode.COOPERATIVE
-    assert cfg.static_partitions is None
+def test_missing_pod_name_and_hostname_is_refused():
+    (p,) = problems(_without(MINIMAL_ENV, "POD_NAME"))
+    assert "POD_NAME" in p and "HOSTNAME" in p and "required" in p
 
 
-def test_assignment_mode_garbage_is_refused():
-    (p,) = problems(MINIMAL_ENV | {"MILLRACE_KAFKA_ASSIGNMENT": "eager"})
-    assert "MILLRACE_KAFKA_ASSIGNMENT" in p and "static" in p and "cooperative" in p
+@pytest.mark.parametrize("var", ["POD_NAME", "HOSTNAME"])
+@pytest.mark.parametrize(
+    "name", ["millrace", "millrace-", "millrace-a", "3-millrace", "millrace-3x"]
+)
+def test_a_pod_name_without_a_trailing_ordinal_is_refused(var, name):
+    env = _without(MINIMAL_ENV, "POD_NAME") | {var: name}
+    (p,) = problems(env)
+    assert var in p and repr(name) in p and "ordinal" in p
+
+
+def test_ordinal_at_or_past_the_replica_count_is_refused():
+    (p,) = problems(MINIMAL_ENV | {"POD_NAME": "millrace-events-3"})
+    assert "POD_NAME" in p and "3 >= MILLRACE_REPLICA_COUNT=3" in p
+    (p,) = problems(MINIMAL_ENV | {"POD_NAME": "millrace-events-7"})
+    assert "7 >= MILLRACE_REPLICA_COUNT=3" in p
+    assert load(MINIMAL_ENV | {"POD_NAME": "millrace-events-2"}).ordinal == 2
+
+
+def test_missing_replica_count_is_refused():
+    (p,) = problems(_without(MINIMAL_ENV, "MILLRACE_REPLICA_COUNT"))
+    assert "MILLRACE_REPLICA_COUNT" in p and "required" in p
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "two", "1.5"])
+def test_a_non_positive_replica_count_is_refused(raw):
+    (p,) = problems(MINIMAL_ENV | {"MILLRACE_REPLICA_COUNT": raw})
+    assert "MILLRACE_REPLICA_COUNT" in p and "positive" in p
+
+
+# -- MILLRACE_KAFKA_CONSUMER_* librdkafka passthrough -----------------------------------
+
+
+def test_no_passthrough_means_no_overrides():
+    assert load(MINIMAL_ENV).kafka_consumer_overrides == ()
+
+
+def test_passthrough_maps_key_lowercase_with_dots_and_keeps_the_value_verbatim():
+    cfg = load(
+        MINIMAL_ENV
+        | {
+            "MILLRACE_KAFKA_CONSUMER_SECURITY_PROTOCOL": "SSL",
+            "MILLRACE_KAFKA_CONSUMER_CLIENT_ID": "ws_az=use1-az1,millrace-events-0",
+            "MILLRACE_KAFKA_CONSUMER_CLIENT_RACK": "use1-az1",
+            "MILLRACE_KAFKA_CONSUMER_SASL_MECHANISM": " PLAIN ",
+        }
+    )
+    assert cfg.kafka_consumer_overrides == (
+        ("client.id", "ws_az=use1-az1,millrace-events-0"),
+        ("client.rack", "use1-az1"),
+        ("sasl.mechanism", " PLAIN "),
+        ("security.protocol", "SSL"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("suffix", "knob"),
+    [
+        ("BOOTSTRAP_SERVERS", "MILLRACE_KAFKA_BOOTSTRAP_SERVERS"),
+        ("GROUP_ID", "MILLRACE_KAFKA_GROUP_ID"),
+        ("AUTO_OFFSET_RESET", "MILLRACE_KAFKA_AUTO_OFFSET_RESET"),
+        ("ENABLE_AUTO_COMMIT", None),
+        ("ENABLE_AUTO_OFFSET_STORE", None),
+        ("PARTITION_ASSIGNMENT_STRATEGY", None),
+    ],
+)
+def test_passthrough_refuses_the_keys_millrace_owns(suffix, knob):
+    name = f"MILLRACE_KAFKA_CONSUMER_{suffix}"
+    (p,) = problems(MINIMAL_ENV | {name: "x"})
+    assert p.startswith(f"{name} is refused")
+    assert suffix.lower().replace("_", ".") in p
+    if knob is not None:
+        assert f"set {knob} instead" in p
+    else:
+        assert "no knob on purpose" in p
+
+
+def test_passthrough_refuses_an_empty_value_and_an_empty_key():
+    probs = problems(
+        MINIMAL_ENV
+        | {"MILLRACE_KAFKA_CONSUMER_CLIENT_RACK": "  ", "MILLRACE_KAFKA_CONSUMER_": "x"}
+    )
+    assert len(probs) == 2
+    assert any("MILLRACE_KAFKA_CONSUMER_CLIENT_RACK is empty" in p for p in probs)
+    assert any("MILLRACE_KAFKA_CONSUMER_ names no librdkafka key" in p for p in probs)
 
 
 # -- auto.offset.reset (B6: the fleet policy is latest) ------------------------------
