@@ -1,0 +1,209 @@
+name: Millrace image
+
+# Publishes ghcr.io/posthog/hoglake-millrace: the Kafka → hoglake
+# ingestion daemon and its maintenance service (one image, two
+# entrypoints; millrace/Dockerfile).
+#
+# Delivery is Kargo's, not a charts dispatch: a Kargo Warehouse in
+# PostHog/charts subscribes to this repository and admits an image as
+# Freight when its tag matches ^r[0-9]{12}-[0-9a-f]{6}$, its
+# org.opencontainers.image.revision annotation is the 40-hex commit
+# whose first six characters the tag ends with, and its
+# org.opencontainers.image.source annotation names this repository.
+# The publish job below emits exactly that: tag r<UTC build minute>-
+# <sha6>, chosen lexically newest by the Warehouse, plus the <sha> and
+# latest tags for humans. Nothing here writes to PostHog/charts.
+#
+# pyhoglake/** is a trigger path as much as millrace/** is: millrace
+# installs the client from the sibling tree, so a pyhoglake change IS a
+# millrace image change.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "millrace/**"
+      - "pyhoglake/**"
+      - ".github/workflows/millrace-image.yml"
+      - ".github/workflows/python-live.yml"
+      - "ci/**"
+  pull_request:
+    branches: [main]
+    paths:
+      - "millrace/**"
+      - "pyhoglake/**"
+      - ".github/workflows/millrace-image.yml"
+      - ".github/workflows/python-live.yml"
+      - "ci/**"
+
+permissions:
+  contents: read
+
+jobs:
+  python-live:
+    uses: ./.github/workflows/python-live.yml
+
+  # Build and exercise the image on every PR and every main push. The
+  # unit layer is ci-python.yml; this job's job is the IMAGE — that it
+  # assembles for both entrypoints, that it is not root, and that the
+  # client inside it is the repo's, not PyPI's.
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: millrace-image-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # Single-arch and loaded, so the smokes run against it. PRs read
+      # main's cache (scope=millrace), never write it.
+      - name: Build image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: millrace/Dockerfile
+          load: true
+          tags: hoglake-millrace:ci
+          cache-from: type=gha,scope=millrace
+
+      # Both entrypoints must import everything and refuse at config
+      # (exit 2) with no environment, naming the missing knobs: no
+      # server, no broker, no credentials, no network.
+      - name: Smoke - the pipeline refuses an empty env at config
+        run: |
+          set +e
+          out=$(docker run --rm hoglake-millrace:ci 2>&1); code=$?
+          set -e
+          echo "$out"
+          [ "$code" = "2" ]
+          echo "$out" | grep -q MILLRACE_KAFKA_BOOTSTRAP_SERVERS
+          echo "$out" | grep -q MILLRACE_STAGE_URL
+
+      - name: Smoke - the maintenance service refuses an empty env at config
+        run: |
+          set +e
+          out=$(docker run --rm --entrypoint python hoglake-millrace:ci -m millrace.maintenance 2>&1); code=$?
+          set -e
+          echo "$out"
+          [ "$code" = "2" ]
+          echo "$out" | grep -q MILLRACE_MAINTENANCE_STAGE_URL
+
+      - name: Smoke - non-root, no host virtualenv
+        run: |
+          uid=$(docker run --rm --entrypoint id hoglake-millrace:ci -u)
+          echo "uid=$uid"
+          [ "$uid" != "0" ]
+          if docker run --rm --entrypoint find hoglake-millrace:ci / -name .venv -maxdepth 6 | grep .; then
+            echo "::error::image contains a .venv"
+            exit 1
+          fi
+
+      # The client in the image must be the sibling tree's, built from
+      # THIS commit — not a PyPI release that merely shares a name.
+      - name: Smoke - pyhoglake comes from this commit
+        run: |
+          want=$(grep -m1 '^version = ' pyhoglake/pyproject.toml | cut -d'"' -f2)
+          got=$(docker run --rm --entrypoint python hoglake-millrace:ci -c 'import pyhoglake; print(pyhoglake.__version__)')
+          origin=$(docker run --rm --entrypoint python hoglake-millrace:ci -c \
+            'import importlib.metadata as m; print(m.distribution("pyhoglake").read_text("direct_url.json"))')
+          echo "pyproject=$want image=$got origin=$origin"
+          [ "$want" = "$got" ]
+          case "$origin" in *file:///src/pyhoglake*) : ;; *) echo "::error::pyhoglake was not installed from the sibling tree"; exit 1 ;; esac
+
+  publish:
+    # Gated on the image smoke and the live suite: a red main push
+    # never publishes, and Kargo never sees it.
+    needs: [image, python-live]
+    # Forks must not push images.
+    if: github.event_name == 'push' && github.repository == 'PostHog/hoglake'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    concurrency:
+      group: millrace-image-publish
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The Kargo release tag: r<UTC build minute>-<sha6>. Build time,
+      # not commit time, so the Warehouse's lexical selection follows
+      # publish order even when an older commit is re-run.
+      - name: Compute the release tag
+        id: tag
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          stamp=$(date -u +%Y%m%d%H%M)
+          echo "tag=r${stamp}-${SHA:0:6}" >> "$GITHUB_OUTPUT"
+
+      # Multi-arch: the mw fleet runs Graviton. The build stage is not
+      # pinned to $BUILDPLATFORM (millrace/Dockerfile says why), hence
+      # QEMU. Annotations go on the index AND each manifest: the
+      # Warehouse reads the index of a multi-arch image.
+      - name: Build and push image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: millrace/Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ghcr.io/posthog/hoglake-millrace:${{ steps.tag.outputs.tag }}
+            ghcr.io/posthog/hoglake-millrace:${{ github.sha }}
+            ghcr.io/posthog/hoglake-millrace:latest
+          annotations: |
+            index:org.opencontainers.image.revision=${{ github.sha }}
+            index:org.opencontainers.image.source=https://github.com/PostHog/hoglake
+            manifest:org.opencontainers.image.revision=${{ github.sha }}
+            manifest:org.opencontainers.image.source=https://github.com/PostHog/hoglake
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/PostHog/hoglake
+          cache-from: type=gha,scope=millrace
+          cache-to: type=gha,scope=millrace,mode=max
+
+      # The Warehouse admits Freight only when the index carries the
+      # revision and source annotations: verify them on what was pushed
+      # so a silent annotation regression fails here, not as Freight
+      # that never appears.
+      - name: Verify the published index
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          SHA: ${{ github.sha }}
+        run: |
+          raw=$(docker buildx imagetools inspect --raw "ghcr.io/posthog/hoglake-millrace:${TAG}")
+          echo "$raw" | jq -e --arg sha "$SHA" '.annotations["org.opencontainers.image.revision"] == $sha' >/dev/null
+          echo "$raw" | jq -e '(.annotations["org.opencontainers.image.source"] | ascii_downcase) == "https://github.com/posthog/hoglake"' >/dev/null
+          digest=$(echo "$raw" | sha256sum | awk '{print "sha256:"$1}')
+          {
+            echo "### Millrace image published"
+            echo
+            echo '```'
+            echo "ghcr.io/posthog/hoglake-millrace:${TAG}"
+            echo "ghcr.io/posthog/hoglake-millrace:${SHA}"
+            echo "ghcr.io/posthog/hoglake-millrace@${digest}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
