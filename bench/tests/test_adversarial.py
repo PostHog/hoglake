@@ -333,6 +333,7 @@ class TestE2EThroughputAccounting:
                 self._files = []
                 self.name = "events"
                 self.namespace = "bench"
+                self.snapshot_id = 2
 
             def append(self, data, author=None, message=None):
                 time.sleep(0.002)
@@ -345,17 +346,22 @@ class TestE2EThroughputAccounting:
                     )
                 )
                 self.rows += data.num_rows
+                return SimpleNamespace(files=[self._files[-1]])
 
-            def info(self):
+            def info(self, snapshot=None):
                 return SimpleNamespace(
                     record_count=self.rows, file_count=len(self._files)
                 )
 
-            def files(self):
+            def files(self, snapshot=None):
                 return list(self._files)
+
+            def changes(self, from_snapshot, to_snapshot):
+                return SimpleNamespace(files=tuple(self._files))
 
         table = T()
         catalog = SimpleNamespace(
+            refresh=lambda: SimpleNamespace(head_snapshot_id=7),
             create_namespace=lambda name: SimpleNamespace(
                 create_table=lambda n, schema: table
             )
