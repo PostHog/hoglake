@@ -30,6 +30,7 @@ import uuid
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from functools import partial
 from typing import Any, Self
 
@@ -239,6 +240,17 @@ def _pad_fill(n: int, team_id: int, ts_us: int, seq: int) -> str:
     return "".join(out)[:n]
 
 
+def clickhouse_datetime(ts_us: int) -> str:
+    """Epoch micros as the producers' ClickHouse DateTime64(6) string
+    (posthog ``rust/common/types/src/event.rs``): ``YYYY-MM-DD
+    HH:MM:SS.ffffff``, UTC, no offset."""
+    whole, micros = divmod(ts_us, 1_000_000)
+    return (
+        datetime.fromtimestamp(whole, tz=UTC).strftime("%Y-%m-%d %H:%M:%S")
+        + f".{micros:06d}"
+    )
+
+
 def event_payload(
     team_id: int,
     ts_us: int,
@@ -250,12 +262,16 @@ def event_payload(
     extra: dict[str, Any] | None = None,
 ) -> bytes:
     """One JSON event payload (the v1 decoder's input). ``timestamp`` is
-    epoch micros; ``pad_bytes`` grows the ``event`` string to size the
+    sent the way PostHog's producers put it on ``clickhouse_events_json``:
+    a ClickHouse DateTime64(6) string, space separator, no offset, meaning
+    UTC (:func:`clickhouse_datetime`). Integer timestamps never reach the
+    production topic, so the live suite must not depend on them.
+    ``pad_bytes`` grows the ``event`` string to size the
     row (the fill is incompressible BY DESIGN — :func:`_pad_fill`);
     ``extra`` adds raw keys (e.g. a column added by a mid-test alter)."""
     body: dict[str, Any] = {
         "team_id": team_id,
-        "timestamp": ts_us,
+        "timestamp": clickhouse_datetime(ts_us),
         "seq": seq,
         "event": event + _pad_fill(pad_bytes, team_id, ts_us, seq),
         "value": value,

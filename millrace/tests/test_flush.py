@@ -487,13 +487,35 @@ class TestJsonDecoder:
             == 1_800_000_000_123_456_000
         )
 
-    def test_timestamptz_requires_an_offset(self) -> None:
+    @pytest.mark.parametrize(
+        ("raw", "micros"),
+        [
+            # The ClickHouse wire shapes PostHog's producers emit: space
+            # separator, 0/3/6 fractional digits, no offset, meaning UTC.
+            ("2027-01-15 08:00:00", 1_800_000_000_000_000),
+            ("2027-01-15 08:00:00.123", 1_800_000_000_123_000),
+            ("2027-01-15 08:00:00.123456", 1_800_000_000_123_456),
+            ("2027-01-15T08:00:00", 1_800_000_000_000_000),
+            # Offsets still apply.
+            ("2027-01-15T08:00:00Z", 1_800_000_000_000_000),
+            ("2027-01-15 10:00:00+02:00", 1_800_000_000_000_000),
+        ],
+    )
+    def test_timestamptz_reads_a_naive_string_as_utc(self, raw, micros) -> None:
         wire = [
             {"name": "tz", "type": "timestamptz", "field_id": 1, "ordinal": 0},
         ]
         decoder = JsonObjectDecoder(columns(wire))
+        record = decoder.decode_record(json.dumps({"tz": raw}).encode())
+        assert record.values["tz"] == micros
+
+    def test_naive_column_still_refuses_an_offset(self) -> None:
+        wire = [
+            {"name": "us", "type": "timestamp", "field_id": 1, "ordinal": 0},
+        ]
+        decoder = JsonObjectDecoder(columns(wire))
         with pytest.raises(DecodeError):
-            decoder.decode_record(b'{"tz": "2027-01-15T00:00:00"}')
+            decoder.decode_record(b'{"us": "2027-01-15T08:00:00Z"}')
 
     def test_full_scalar_zoo_builds_arrow(self) -> None:
         """Every supported column type decodes and lands in Arrow at the

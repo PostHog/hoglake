@@ -411,9 +411,12 @@ def _coerce_timestamp(value: Any, type_name: str, *, tz: bool) -> int:
     Strings never silently lose precision: a sub-unit fraction is refused
     outright (a timestamp_s column takes only whole seconds from text),
     and sub-microsecond digits are refused even for timestamp_ns (the
-    integer form is the exact one). Naive strings feed naive columns and
-    offset-carrying strings feed ``timestamptz``; the mismatches are
-    refused rather than reinterpreted. The result — from either form —
+    integer form is the exact one). Naive strings feed naive columns;
+    ``timestamptz`` takes offset-carrying strings and, as UTC, naive ones:
+    PostHog's ClickHouse producers emit ``2026-10-13 23:34:10.123456``
+    with no offset and mean UTC (millpond reads them the same way). An
+    offset string into a naive column is still refused rather than
+    reinterpreted. The result — from either form —
     must fit the column's unit in int64 (``timestamp_s`` in stored
     milliseconds): a magnitude outside it is a coercion failure, never
     a batch-killing ``OverflowError`` at Arrow build time."""
@@ -450,14 +453,13 @@ def _coerce_timestamp(value: Any, type_name: str, *, tz: bool) -> int:
                 reason=REASON_UNCASTABLE_COLUMN,
             ) from e
         if tz:
-            if dt.tzinfo is None:
-                raise DecodeError(
-                    f"timestamptz requires an offset ('Z' or '+hh:mm'): {value!r}",
-                    reason=REASON_UNCASTABLE_COLUMN,
-                )
-            offset = dt.utcoffset()
-            assert offset is not None  # tzinfo present ⇒ offset computable
-            micros = _datetime_to_micros(dt.replace(tzinfo=None) - offset)
+            # No offset means UTC: the ClickHouse wire format (module
+            # docstring above).
+            offset = dt.utcoffset() if dt.tzinfo is not None else None
+            naive = dt.replace(tzinfo=None)
+            micros = _datetime_to_micros(
+                naive - offset if offset is not None else naive
+            )
         else:
             if dt.tzinfo is not None:
                 raise DecodeError(
