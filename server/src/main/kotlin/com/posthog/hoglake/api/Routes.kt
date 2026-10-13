@@ -80,6 +80,17 @@ fun Application.installApiRoutes(
                     call.respond(catalogs.getCatalog(call.catalog()).toDto())
                 }
 
+                get("/storage-usage") {
+                    // A footprint has no read snapshot: historical/dropped registrations
+                    // remain tracked until their manifest rows are physically removed.
+                    if (call.request.queryParameters.contains("snapshot") ||
+                        call.request.queryParameters.contains("at_timestamp")
+                    ) {
+                        throw BadRequestException("storage-usage does not accept snapshot or at_timestamp")
+                    }
+                    call.respond(catalogs.storageUsage(call.catalog()).toDto())
+                }
+
                 route("/namespaces") {
                     get {
                         call.respond(

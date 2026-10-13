@@ -13,6 +13,7 @@ import com.posthog.hoglake.api.InstanceInfoDto
 import com.posthog.hoglake.api.PrepareTableCreationDto
 import com.posthog.hoglake.api.PublishTableCreationDto
 import com.posthog.hoglake.api.SnapshotResolutionDto
+import com.posthog.hoglake.api.StorageUsageDto
 import com.posthog.hoglake.api.UploadOwnerDto
 import com.posthog.hoglake.api.parseExpectedTableUuid
 import com.posthog.hoglake.api.parseLongQuery
@@ -123,6 +124,13 @@ class WireDtoParseFuzzTest {
 
         parseOrNull { mapper.readValue<CreateCatalogRequestDto>(data) }?.let { dto ->
             check(mapper.readValue<CreateCatalogRequestDto>(mapper.writeValueAsBytes(dto)) == dto)
+        }
+
+        // This response carries decimal int64 strings, not floating-point JSON numbers.
+        parseOrNull { mapper.readValue<StorageUsageDto>(data) }?.let { dto ->
+            check(mapper.readValue<StorageUsageDto>(mapper.writeValueAsBytes(dto)) == dto)
+            val body = mapper.readTree(mapper.writeValueAsBytes(dto))
+            check(body["tracked_bytes"].isTextual && body["pending_delete_files"].isTextual)
         }
 
         // Instance settings must retain their values and wire field names.

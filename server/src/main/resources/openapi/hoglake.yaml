@@ -108,6 +108,52 @@ paths:
               schema: { $ref: "#/components/schemas/Catalog" }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  /catalogs/{catalog}/storage-usage:
+    get:
+      operationId: getStorageUsage
+      summary: Exact catalog-tracked storage footprint
+      description: >
+        Internal, network-private endpoint under the existing v1 security model
+        (no application authentication). Do not expose the service publicly.
+        Resolves the named catalog and scopes every aggregate to its catalog_id.
+        Sums file_size_bytes of ALL data and delete file registrations, including
+        ended files and dropped tables, without a snapshot predicate. This is not
+        live data, a sampler estimate, or an object-store inventory. Queued objects
+        whose registrations were removed, unregistered uploads, and object-store
+        versions are not in tracked_bytes. pending_delete_files counts undrained
+        removal ledger rows (including claimed/staging tickets), not distinct paths;
+        settled rows are excluded. Both counters are decimal int64 strings.
+        All aggregates share one database statement's MVCC view. Exact reads are
+        proportional to scanned manifest rows (the planner can also scan other
+        catalogs' rows), use constant result memory, take no commit lock,
+        and have a 15-second query deadline (stricter database bounds still apply).
+        Poll infrequently from internal services; never use this on a UI refresh
+        loop. Missing catalogs and backend failures are errors, never zero usage.
+        snapshot and at_timestamp are rejected; this endpoint has no time travel.
+      parameters: [ { $ref: "#/components/parameters/catalog" } ]
+      responses:
+        "200":
+          description: Exact tracked footprint at the aggregate statement's database view
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StorageUsage" }
+        "400":
+          description: Snapshot or timestamp parameters are not supported
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500":
+          description: Backend failure, query timeout, or int64 footprint overflow
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "503":
+          description: Request admission unavailable; retry later
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+
   /catalogs/{catalog}/namespaces:
     get:
       operationId: listNamespaces
@@ -2918,6 +2964,21 @@ components:
             replaying this payload can only be refused again — re-read
             the table and build a new request. Absent on every retryable
             conflict.
+
+    StorageUsage:
+      type: object
+      required: [tracked_bytes, pending_delete_files]
+      properties:
+        tracked_bytes:
+          type: string
+          pattern: '^(0|[1-9][0-9]*)$'
+          description: Sum of all registered data and delete file sizes; decimal non-negative int64.
+          example: "9007199254740993"
+        pending_delete_files:
+          type: string
+          pattern: '^(0|[1-9][0-9]*)$'
+          description: Undrained removal ledger rows, including claims; decimal non-negative int64.
+          example: "2"
 
     Catalog:
       type: object
