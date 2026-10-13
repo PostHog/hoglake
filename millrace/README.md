@@ -178,6 +178,20 @@ arithmetic, not trust):
   poll) is the one pilot question the local bench cannot answer, and
   the debt series is its tripwire.
 
+Resident memory grows past the Python heap in two phases, both
+expected: a warm-up while each instance's memtable fills to its first
+freeze (about 16 minutes at the 100 ms WAL flush interval), then a
+slow slope from pyarrow's allocator retaining freed batch memory
+(mimalloc on macOS; the Linux wheels use jemalloc, which decays). The
+Python heap itself is flat under steady inflow. `MILLRACE_MEMORY_DEBUG_S=<seconds>`
+turns on an opt-in reporter (`memdebug.py`, off by default and
+allocating nothing when off) that logs one JSON line per interval with
+RSS, tracemalloc's top allocation sites by growth, container sizes of
+the long-lived objects, and SlateDB's per-instance totals, to
+`MILLRACE_MEMORY_DEBUG_FILE` (`{pid}` substituted) or the
+`millrace.memdebug` logger. `ARROW_DEFAULT_MEMORY_POOL=system` is the
+first thing to try if a pod's slope does not level off.
+
 ## Dropped records
 
 Malformed records are dropped, logged and metered; nothing is

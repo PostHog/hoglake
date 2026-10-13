@@ -53,6 +53,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
 from collections.abc import Callable, Collection, Mapping, Sequence
 from functools import partial
@@ -60,6 +61,7 @@ from typing import Any
 
 from prometheus_client.core import REGISTRY, CounterMetricFamily, GaugeMetricFamily
 
+from . import memdebug
 from .config import Config, ConfigError, load_config
 from .consumer import ConsumerFencedError, MillraceConsumer, create_kafka_consumer
 from .flush import REPREPARE_REASONS, FlushHalted, FlushRunner, HoglakeFlusher
@@ -505,6 +507,46 @@ async def _run(cfg: Config, hoglake_url: str, s3_kwargs: Mapping[str, Any]) -> i
 
         loop = asyncio.get_running_loop()
 
+        if memdebug.interval_s(os.environ) > 0:
+
+            def _memdebug_probes() -> dict[str, Any]:
+                sizes = memdebug.container_sizes(
+                    consumer=consumer,
+                    flusher=flusher,
+                    runner=runner,
+                    stages=stages,
+                    client=client,
+                    table=getattr(flusher, "_table", None),
+                    http=getattr(client, "_http", None),
+                )
+                pool = getattr(
+                    getattr(getattr(client, "_http", None), "_transport", None),
+                    "_pool",
+                    None,
+                )
+                if pool is not None:
+                    sizes["http.pool.connections"] = len(
+                        getattr(pool, "_connections", ())
+                    )
+                for part in list(getattr(stages, "_stages", {}).values()):
+                    for k, v in memdebug.container_sizes(partition=part).items():
+                        sizes[k] = sizes.get(k, 0) + v
+                sizes["threads"] = threading.active_count()
+                sizes["asyncio.tasks"] = len(asyncio.all_tasks(loop))
+                sizes["loop._ready"] = len(getattr(loop, "_ready", ()))
+                sizes["loop._scheduled"] = len(getattr(loop, "_scheduled", ()))
+                executor = getattr(flusher, "_executor", None)
+                if executor is not None:
+                    sizes["flusher.executor.queue"] = executor._work_queue.qsize()
+                return {
+                    "sizes": sizes,
+                    "slatedb": memdebug.slatedb_totals(
+                        list(stages.metrics_recorders().values())
+                    ),
+                }
+
+            memdebug.start_reporter(os.environ, _memdebug_probes)
+
         def stop_all() -> None:
             # ONE handler per signal: add_signal_handler REPLACES any
             # previous handler for the same signal, so registering the two
@@ -564,6 +606,7 @@ async def _run(cfg: Config, hoglake_url: str, s3_kwargs: Mapping[str, Any]) -> i
 
 
 def _main(env: Mapping[str, str]) -> int:
+    memdebug.start_tracing(env)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
