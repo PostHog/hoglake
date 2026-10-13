@@ -310,6 +310,7 @@ def prepared_request(
         group_fields=SPEC_FIELDS,
         row_count=rows,
         digest="0" * 64,
+        scanned_at=None,
     )
 
 
@@ -3610,6 +3611,7 @@ class TestPreparedReplay:
             group_fields=SPEC_FIELDS,
             row_count=pending.request.row_count,
             digest=pending.request.digest,
+            scanned_at=pending.request.scanned_at,
         )
         foreign_pending = type(pending)(key=pending.key, request=foreign)
         with pytest.raises(StageCorruptionError, match="names partition tuple"):
@@ -4053,13 +4055,13 @@ class TestWireDiscipline:
             table_get, method="GET", url=f"{TABLE_URL}?totals=false"
         )
 
-        original_scan = stage.scan_group_rows_bounded
+        original_scan = stage.scan_window
 
         async def scanning(group: Any, **kwargs: Any) -> Any:
             journal.append("scan")
             return await original_scan(group, **kwargs)
 
-        monkeypatch.setattr(stage, "scan_group_rows_bounded", scanning)
+        monkeypatch.setattr(stage, "scan_window", scanning)
         report = await flusher.flush_key(
             stage,
             decision(TEAM, trigger="size", staged_bytes=100, first_staged_ts=JAN_US),
@@ -4087,7 +4089,7 @@ class TestWireDiscipline:
         capture = CommitCapture(httpx_mock, [commit_ok(50), commit_ok(51)])
         flusher = flusher_factory(store=store, cfg=make_config(target_output_bytes=1))
 
-        original_scan = stage.scan_group_rows_bounded
+        original_scan = stage.scan_window
 
         async def scan_then_arrival(group: Any, **caps: Any) -> Any:
             rows = await original_scan(group, **caps)
@@ -4095,7 +4097,7 @@ class TestWireDiscipline:
             await staged(stage, fake_clock, TEAM, [(3, JAN_US), (4, JAN_US)])
             return rows
 
-        monkeypatch.setattr(stage, "scan_group_rows_bounded", scan_then_arrival)
+        monkeypatch.setattr(stage, "scan_window", scan_then_arrival)
         report = await flusher.flush_key(
             stage,
             decision(TEAM, trigger="size", staged_bytes=100, first_staged_ts=JAN_US),
@@ -4660,13 +4662,17 @@ class TestSettlementGuard:
         flusher = flusher_factory(store=store, cfg=make_config(target_output_bytes=1))
         stats_before = await stage.iter_key_stats()
 
-        real_scan = stage.scan_group_rows_bounded
+        real_scan = stage.scan_window
 
         async def scan_missing_a_row(group: Any, **caps: Any) -> Any:
-            rows = await real_scan(group, **caps)
-            return [kv for kv in rows if kv[0].offset != 1]
+            from millrace.stage import BoundedScan
 
-        monkeypatch.setattr(stage, "scan_group_rows_bounded", scan_missing_a_row)
+            scan = await real_scan(group, **caps)
+            return BoundedScan(
+                [kv for kv in scan.rows if kv[0].offset != 1], scan.complete
+            )
+
+        monkeypatch.setattr(stage, "scan_window", scan_missing_a_row)
         with pytest.raises(FlushHalted) as excinfo:
             await flusher.flush_key(
                 stage,
@@ -4708,7 +4714,7 @@ class TestSettlementGuard:
         # Its receipt is there (the commit landed), but the guard uses the
         # PERSISTED count, not a recount — the window still holds a row
         # the commit never published, so it halts again, rolled back.
-        monkeypatch.setattr(stage, "scan_group_rows_bounded", real_scan)
+        monkeypatch.setattr(stage, "scan_window", real_scan)
         restarted = flusher_factory(store=store, cfg=make_config(target_output_bytes=1))
         script_receipt(httpx_mock, key, snapshot_id=50)
         with pytest.raises(FlushHalted) as again:
@@ -4799,14 +4805,14 @@ class TestSettlementGuard:
         key = ikey(0, TEAM, 0, 2)  # the content of rows 0 and 2
         script_receipt(httpx_mock, key, snapshot_id=80)
 
-        real_scan = stage.scan_group_rows_bounded
+        real_scan = stage.scan_window
 
         async def scan_then_arrival(group: Any, **caps: Any) -> Any:
             rows = await real_scan(group, **caps)
             await staged(stage, fake_clock, TEAM, [(1, JAN_US)])
             return rows
 
-        monkeypatch.setattr(stage, "scan_group_rows_bounded", scan_then_arrival)
+        monkeypatch.setattr(stage, "scan_window", scan_then_arrival)
         with pytest.raises(FlushHalted) as excinfo:
             await flusher.flush_key(
                 stage,
@@ -4902,6 +4908,7 @@ class TestSettlementGuard:
                 key=None,
                 snapshot_id=None,
                 entry_stands=False,
+                scanned_at_us=None,
             )
         detail = excinfo.value.detail
         assert "settling a window whose every row was dropped" in detail
@@ -4909,6 +4916,184 @@ class TestSettlementGuard:
         assert "No prepared/ entry stands" in detail
         assert "after publishing" not in detail
         assert len(await staged_rows(stage, TEAM)) == 3
+
+
+@component
+class TestAgeAccounting:
+    async def test_a_steady_group_flushes_once_per_deadline_not_per_sweep(
+        self,
+        httpx_mock: Any,
+        memory_store: Any,
+        fake_clock: Any,
+        flusher_factory: Any,
+        store: FakeObjectStore,
+        sleeper: Sleeper,
+    ) -> None:
+        """A group with inflow every D/10 never drains. Each settle lifts
+        its first_staged_ts to the settled scan's start, so the age lane
+        fires once per ~D (not on every sweep after the first deadline),
+        and the oldest-eligible age the sweep publishes never exceeds
+        the deadline plus one tick."""
+        deadline_s = 900
+        tick_us = deadline_s * 1_000_000 // 10
+        cfg = make_config(flush_deadline_s=deadline_s, min_flush_bytes=1)
+        async with StageManager(
+            "memory:///", "millrace", settings=fast_flush_settings()
+        ) as manager:
+            stage = (await manager.open_partition("events", 0)).stage
+            script_options(httpx_mock)
+            capture = CommitCapture(
+                httpx_mock, [commit_ok(100 + i) for i in range(200)]
+            )
+            flusher = flusher_factory(store=store, cfg=cfg)
+            r = runner(manager, flusher, cfg, fake_clock, sleeper)
+            # Inflow lands DURING every flush too (after the scan, before
+            # the settle), so the group never drains — the steady state.
+            next_offset = iter(range(1_000, 2_000))
+            real_scan = stage.scan_window
+
+            async def scan_then_arrival(group: Any, **caps: Any) -> Any:
+                scan = await real_scan(group, **caps)
+                await staged(
+                    stage, fake_clock, TEAM, [(next(next_offset), fake_clock())]
+                )
+                return scan
+
+            stage.scan_window = scan_then_arrival  # type: ignore[method-assign]
+            eligible_ages: list[float] = []
+            for offset in range(100):  # 100 ticks = 10 deadlines
+                await staged(stage, fake_clock, TEAM, [(offset, fake_clock())])
+                await r.run_once()
+                eldest = (
+                    await manager.gauges(max_staleness_s=1e9)
+                ).oldest_eligible_staged_ts
+                if eldest is not None:
+                    eligible_ages.append((fake_clock() - eldest) / 1_000_000)
+                fake_clock.advance(tick_us)
+            commits = len(capture.bodies)
+            assert 9 <= commits <= 10, commits  # ~ 10 deadlines, not ~90 sweeps
+            assert max(eligible_ages) <= deadline_s + tick_us / 1_000_000
+            # the group never drained, and nothing was lost
+            published = sum(
+                f["record_count"]
+                for body in capture.payloads
+                for f in body["appends"][0]["files"]
+            )
+            assert await stage.iter_key_stats() != []
+            assert published + len(await staged_rows(stage, TEAM)) == 100 + commits
+
+    async def test_the_settle_lifts_first_staged_ts_to_the_scan_start(
+        self,
+        httpx_mock: Any,
+        stage_factory: Any,
+        fake_clock: Any,
+        flusher_factory: Any,
+        store: FakeObjectStore,
+        sleeper: Sleeper,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Rows staged at t0, the scan starts at t1, more rows land at t2
+        before the settle: after the settle the group's first_staged_ts is
+        t1 (the staging time bound of the rows left), the scan instant is
+        persisted in the entry, and a recovery settle uses the persisted
+        value."""
+        stage = await stage_factory()
+        t0 = fake_clock()
+        await staged(stage, fake_clock, TEAM, [(0, t0), (1, t0)])
+        fake_clock.advance(10_000_000)
+        t1 = fake_clock()
+        script_options(httpx_mock)
+        capture = CommitCapture(httpx_mock, [commit_ok(50)])
+        flusher = flusher_factory(store=store, cfg=make_config(target_output_bytes=1))
+        real_scan = stage.scan_window
+
+        async def scan_then_arrival(group: Any, **caps: Any) -> Any:
+            scan = await real_scan(group, **caps)
+            fake_clock.advance(5_000_000)
+            await staged(stage, fake_clock, TEAM, [(2, fake_clock())])
+            return scan
+
+        monkeypatch.setattr(stage, "scan_window", scan_then_arrival)
+        report = await flusher.flush_key(
+            stage, decision(TEAM, trigger="size", staged_bytes=100, first_staged_ts=t0)
+        )
+        assert report.outcome == "committed"
+        assert len(capture.bodies) == 1
+        (stats,) = await stage.iter_key_stats()
+        assert stats.first_staged_ts == t1
+        assert stats.last_staged_ts == t1 + 5_000_000
+        assert await stage.iter_sched_age_through(2**63 - 1) == [
+            keyspace.SchedAgeKey(t1, team_group(TEAM))
+        ]
+
+    async def test_a_recovery_settle_lifts_by_the_persisted_scan_start(
+        self,
+        httpx_mock: Any,
+        stage_factory: Any,
+        fake_clock: Any,
+        flusher_factory: Any,
+        store: FakeObjectStore,
+        sleeper: Sleeper,
+    ) -> None:
+        """A lost publish persists ``scanned_at``; rows staged later stay
+        when the entry is settled from its receipt, and the group's
+        first_staged_ts becomes the persisted scan start."""
+        from millrace.flush import _PUBLISH_MAX_ATTEMPTS
+
+        stage = await stage_factory()
+        t0 = fake_clock()
+        await staged(stage, fake_clock, TEAM, [(0, t0)])
+        fake_clock.advance(7_000_000)
+        t1 = fake_clock()
+        script_options(httpx_mock)
+        CommitCapture(httpx_mock, [httpx.ConnectError("lost")] * _PUBLISH_MAX_ATTEMPTS)
+        flusher = flusher_factory(store=store, cfg=make_config(target_output_bytes=1))
+        with pytest.raises(FlushPublishExhausted):
+            await flusher.flush_key(
+                stage,
+                decision(TEAM, trigger="size", staged_bytes=100, first_staged_ts=t0),
+            )
+        (entry,) = await stage.load_prepared()
+        assert entry.request.scanned_at == t1
+        fake_clock.advance(3_000_000)
+        await staged(stage, fake_clock, TEAM, [(1, fake_clock())])
+        script_receipt(httpx_mock, entry.request.idempotency_key, snapshot_id=51)
+        report = await flusher.reconcile_prepared(
+            stage, (await stage.recover()).pending_prepared[0]
+        )
+        assert report.outcome == "receipt_settled"
+        (stats,) = await stage.iter_key_stats()
+        assert stats.first_staged_ts == t1
+        assert [rk.offset for rk, _ in await staged_rows(stage, TEAM)] == [1]
+
+    async def test_a_capped_scan_does_not_lift_first_staged_ts(
+        self,
+        httpx_mock: Any,
+        stage_factory: Any,
+        fake_clock: Any,
+        flusher_factory: Any,
+        store: FakeObjectStore,
+        sleeper: Sleeper,
+    ) -> None:
+        """Rows past a capped scan were staged BEFORE it: the settle
+        keeps first_staged_ts (the group stays due and the catch-up
+        continues next sweep) and the entry records no scan start."""
+        stage = await stage_factory()
+        t0 = fake_clock()
+        await staged(stage, fake_clock, TEAM, [(o, t0) for o in range(3)])
+        fake_clock.advance(10_000_000)
+        script_options(httpx_mock)
+        capture = CommitCapture(httpx_mock, [commit_ok(50)])
+        flusher = flusher_factory(
+            store=store, cfg=make_config(target_output_bytes=1, flush_scan_max_rows=2)
+        )
+        report = await flusher.flush_key(
+            stage, decision(TEAM, trigger="size", staged_bytes=100, first_staged_ts=t0)
+        )
+        assert (report.first_offset, report.last_offset) == (0, 1)
+        assert len(capture.bodies) == 1
+        (stats,) = await stage.iter_key_stats()
+        assert stats.first_staged_ts == t0
 
 
 class TestJunkWindowBoundaries:

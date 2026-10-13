@@ -13,10 +13,16 @@ call: the row puts (keyed ``(group, offset)``), the per-tuple
 ``stats/`` merge and the ``sched_age/`` readiness entry land
 atomically, so readiness accounting cannot drift from the data, not
 even on a hard kill that lands between them. Records the consumer DROPPED (malformed, counted
-and logged there) never reach this module. ``first_staged_ts`` is SET-ONCE: an existing stats entry
-keeps its value (the tail's freshness SLA stands on this and the planner
-relies on it); it is born again only after the key stood empty — i.e.
-after a flush drained the partition tuple's last staged row.
+and logged there) never reach this module. ``first_staged_ts`` bounds
+the staging time of the group's OLDEST staged row from below: staging
+never advances it (an existing stats entry keeps its value — the tail's
+freshness SLA stands on this and the planner relies on it); it is born
+when the group stands empty, and a settle that leaves rows behind lifts
+it to the instant the settled window's scan started, when that scan saw
+the group's whole staged slice (every row left behind was staged after
+it). Without that lift a group under steady inflow never drains, its
+``first_staged_ts`` stays at its birth, and it reads age-eligible on
+every sweep after its first deadline.
 
 Durability ordering: ``stage_batch`` awaits the batch's REMOTE
 durability (the WAL on the object store, via the write handle's
@@ -237,6 +243,16 @@ class StageAck:
     staged_bytes: int
     first_offset: int
     last_offset: int
+
+
+@dataclass(frozen=True, slots=True)
+class BoundedScan:
+    """:meth:`PartitionStage.scan_window`'s result: the rows (an exact
+    offset prefix of the tuple's staged rows) and whether the scan saw
+    the tuple's whole staged slice."""
+
+    rows: list[tuple[RowKey, bytes]]
+    complete: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -536,8 +552,9 @@ class PartitionStage:
         before return.
 
         Per partition tuple in the batch: row puts, the ``stats/`` merge
-        (``first_staged_ts`` kept set-once from the entry that already
-        exists; created with ``now_us`` when the tuple stands empty) and
+        (``first_staged_ts`` kept from the entry that already exists —
+        staging never advances it; created with ``now_us`` when the tuple
+        stands empty) and
         the ``sched_age/`` entry on first stage. ``now_us`` is the
         injected staging clock — never read from the wall here.
 
@@ -591,7 +608,7 @@ class PartitionStage:
                 else:
                     merged = StatsValue(
                         staged_bytes=current.staged_bytes + group_bytes,
-                        # SET-ONCE: later arrivals never advance it.
+                        # Arrivals never advance it (only a settle lifts it).
                         first_staged_ts=current.first_staged_ts,
                         last_staged_ts=now_us,
                         row_count=current.row_count + len(rows),
@@ -727,6 +744,14 @@ class PartitionStage:
     async def scan_group_rows_bounded(
         self, group: PartitionTuple, *, max_rows: int, max_bytes: int
     ) -> list[tuple[RowKey, bytes]]:
+        """:meth:`scan_window`'s rows alone."""
+        return (
+            await self.scan_window(group, max_rows=max_rows, max_bytes=max_bytes)
+        ).rows
+
+    async def scan_window(
+        self, group: PartitionTuple, *, max_rows: int, max_bytes: int
+    ) -> BoundedScan:
         """The flush's bounded scan, collected: one partition tuple's
         staged rows in offset order, capped in rows and bytes (the row
         that would exceed a cap is NOT included).
@@ -736,7 +761,10 @@ class PartitionStage:
         snapshot: every staged row of the tuple with an offset between
         the first and the last scanned one was scanned, capped or not.
         The flush window is therefore ``[first scanned, last scanned]``
-        (flush.py §Bounded unit of work).
+        (flush.py §Bounded unit of work). ``complete`` is True when the
+        scan reached the end of the tuple's slice — no cap cut it short —
+        so every row of the tuple left after the window's settle was
+        staged after the scan began.
         """
         if max_rows < 1:
             raise ValueError(f"max_rows must be >= 1, got {max_rows}")
@@ -748,10 +776,10 @@ class PartitionStage:
         nbytes = 0
         async for key, value in self._iter_range(start, end):
             if len(rows) >= max_rows or nbytes + len(value) > max_bytes:
-                break
+                return BoundedScan(rows, complete=False)
             rows.append((keyspace.decode_row_key(key), value))
             nbytes += len(value)
-        return rows
+        return BoundedScan(rows, complete=True)
 
     # -- prepared/ lifecycle ----------------------------------------------------
 
@@ -895,7 +923,11 @@ class PartitionStage:
     # -- flush settlement ---------------------------------------------------------
 
     async def commit_flushed(
-        self, key: FlushedKey, *, expected_rows: int | None = None
+        self,
+        key: FlushedKey,
+        *,
+        expected_rows: int | None = None,
+        scanned_at_us: int | None = None,
     ) -> FlushCommitReport:
         """Settle one committed flush — ONE transaction:
 
@@ -925,6 +957,16 @@ class PartitionStage:
         a disagreement never deletes an unpublished row nor leaves the
         bookkeeping half-applied. None skips the check.
 
+        ``scanned_at_us`` is the staging-clock instant taken just before
+        the window's scan, given only when that scan saw the tuple's
+        whole staged slice: every row left after this settle was then
+        staged after it, so when rows remain the tuple's
+        ``first_staged_ts`` is lifted to ``max(first_staged_ts,
+        scanned_at_us)`` (never past ``last_staged_ts``) and its
+        ``sched_age/`` entry is re-keyed, in the same transaction. None
+        (a capped scan, whose leftovers may predate it) keeps the old
+        value — the flush-earlier direction.
+
         Idempotent: a replay after an ambiguous failure finds no rows in
         the window and reports zeros (with ``expected_rows`` it raises
         instead — the caller's count no longer matches).
@@ -933,7 +975,7 @@ class PartitionStage:
         async with self._write_lock:
             txn = await self._db.begin(IsolationLevel.SERIALIZABLE_SNAPSHOT)
             try:
-                settlement = await self._settle_flushed(txn, key)
+                settlement = await self._settle_flushed(txn, key, scanned_at_us)
                 if (
                     expected_rows is not None
                     and settlement.rows_deleted != expected_rows
@@ -953,7 +995,9 @@ class PartitionStage:
             group_drained=settlement.group_drained,
         )
 
-    async def _settle_flushed(self, txn: DbTransaction, key: FlushedKey) -> _Settlement:
+    async def _settle_flushed(
+        self, txn: DbTransaction, key: FlushedKey, scanned_at_us: int | None
+    ) -> _Settlement:
         """The settlement body of :meth:`commit_flushed`."""
         # The exact settlement selection (keyspace.py §The settlement
         # window): the window is one contiguous byte range of the
@@ -973,19 +1017,31 @@ class PartitionStage:
                 rows_deleted += 1
                 bytes_deleted += len(kv.value)
 
-        drained = await self._settle_stats(txn, key, rows_deleted, bytes_deleted)
+        drained = await self._settle_stats(
+            txn, key, rows_deleted, bytes_deleted, scanned_at_us
+        )
         await self._settle_prepared(txn, key)
         return _Settlement(rows_deleted, bytes_deleted, drained)
 
     async def _settle_stats(
-        self, txn: DbTransaction, key: FlushedKey, rows_deleted: int, bytes_deleted: int
+        self,
+        txn: DbTransaction,
+        key: FlushedKey,
+        rows_deleted: int,
+        bytes_deleted: int,
+        scanned_at_us: int | None,
     ) -> bool:
         """Subtract the deleted rows from the tuple's ``stats/`` entry, or
         remove it (with its ``sched_age/`` entry) when the tuple drained.
-        ``first_staged_ts`` is left untouched while rows remain: the
-        survivors are younger, so keeping the older timestamp can only
-        flush them EARLIER than their own deadline — the freshness SLA's
-        safe direction."""
+        While rows remain, ``first_staged_ts`` is lifted to the scan's
+        start (``scanned_at_us``, when the scan was complete — every
+        survivor was staged after it) and the ``sched_age/`` entry
+        re-keyed; without it the older value stays, which can only flush
+        the survivors EARLIER than their own deadline — the freshness
+        SLA's safe direction. The lift never passes ``last_staged_ts``
+        (a batch whose clock was read before the scan began but which
+        landed after the scan's snapshot stays bounded by its own
+        stamp)."""
         raw = await txn.get(keyspace.stats_key(key.group))
         if raw is None:
             if rows_deleted:
@@ -1012,12 +1068,24 @@ class PartitionStage:
                 )
             )
             return True
+        first = current.first_staged_ts
+        if scanned_at_us is not None:
+            first = min(max(first, scanned_at_us), current.last_staged_ts)
+        if first != current.first_staged_ts:
+            await txn.delete(
+                keyspace.encode_sched_age_key(
+                    SchedAgeKey(current.first_staged_ts, key.group)
+                )
+            )
+            await txn.put(
+                keyspace.encode_sched_age_key(SchedAgeKey(first, key.group)), b""
+            )
         await txn.put(
             keyspace.stats_key(key.group),
             keyspace.encode_stats_value(
                 StatsValue(
                     staged_bytes=current.staged_bytes - bytes_deleted,
-                    first_staged_ts=current.first_staged_ts,
+                    first_staged_ts=first,
                     last_staged_ts=current.last_staged_ts,
                     row_count=remaining,
                 )

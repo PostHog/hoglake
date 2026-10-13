@@ -128,6 +128,7 @@ def _request(**overrides: Any) -> PreparedRequest:
         "group_fields": ("team_id", "timestamp_month"),
         "row_count": 3,
         "digest": GOLDEN_DIGEST,
+        "scanned_at": 1_700_000_000_000_000,
     }
     return PreparedRequest(**{**base, **overrides})
 
@@ -335,6 +336,7 @@ def test_prepared_golden_vectors():
             group_fields=("team_id", "ts_month"),
             row_count=258,
             digest="ab" * 32,
+            scanned_at=-2,
         )
     ) == (
         b"\x06"  # version
@@ -355,7 +357,12 @@ def test_prepared_golden_vectors():
         + b"\x00" * 6
         + b"\x01\x02"  # row_count = 258
         + b"\xab" * 32  # digest, raw
+        + b"\x01"  # scanned_at present
+        + b"\xff" * 7
+        + b"\xfe"  # scanned_at = -2, two's complement
     )
+    # An absent scanned_at is tag 0x00 and eight zero bytes.
+    assert encode_prepared_value(_request(scanned_at=None))[-9:] == b"\x00" * 9
 
 
 #: The content digest of the golden window: rows (0, b"{}") and (41, b"x").
@@ -862,6 +869,7 @@ def test_prepared_keys_sort_by_group_then_first_offset(keys: list[PreparedKey]):
     group=groups,
     row_count=st.integers(min_value=0, max_value=UINT64_MAX),
     digest=digests,
+    scanned_at=st.one_of(st.none(), timestamps),
 )
 def test_prepared_value_round_trip(
     key: str,
@@ -872,6 +880,7 @@ def test_prepared_value_round_trip(
     group: PartitionTuple,
     row_count: int,
     digest: str,
+    scanned_at: int | None,
 ):
     request = PreparedRequest(
         idempotency_key=key,
@@ -883,6 +892,7 @@ def test_prepared_value_round_trip(
         group_fields=_fields(group),
         row_count=row_count,
         digest=digest,
+        scanned_at=scanned_at,
     )
     assert decode_prepared_value(encode_prepared_value(request)) == request
 
@@ -895,11 +905,42 @@ def test_prepared_persisted_at_round_trips_across_the_sign_bit(at: int):
     # different value of the other, so a swapped tail reds too.
     request = _request(persisted_at=at, row_count=UINT64_MAX - at)
     encoded = encode_prepared_value(request)
-    assert encoded[-48:-40] == at.to_bytes(8, "big")
-    assert encoded[-40:-32] == (UINT64_MAX - at).to_bytes(8, "big")
-    assert encoded[-32:] == bytes.fromhex(GOLDEN_DIGEST)
+    assert encoded[-57:-49] == at.to_bytes(8, "big")
+    assert encoded[-49:-41] == (UINT64_MAX - at).to_bytes(8, "big")
+    assert encoded[-41:-9] == bytes.fromhex(GOLDEN_DIGEST)
     decoded = decode_prepared_value(encoded)
     assert (decoded.persisted_at, decoded.row_count) == (at, UINT64_MAX - at)
+
+
+@pytest.mark.parametrize("at", [None, INT64_MIN, -1, 0, 2**63 - 1])
+def test_prepared_scanned_at_round_trips_at_its_bounds(at: int | None):
+    request = _request(scanned_at=at)
+    encoded = encode_prepared_value(request)
+    assert decode_prepared_value(encoded).scanned_at == at
+    if at is not None:
+        assert encoded[-9:] == b"\x01" + at.to_bytes(8, "big", signed=True)
+
+
+@pytest.mark.parametrize("partition", [0, 2**31 - 1, 2**31, 2**32 - 1])
+def test_prepared_partition_decodes_unsigned_at_the_sign_bit(partition: int):
+    # partition is u32: values at and above 2**31 must decode as the same
+    # unsigned value (a signed decode reads them negative).
+    request = _request(partition=partition)
+    assert decode_prepared_value(encode_prepared_value(request)).partition == partition
+
+
+def test_prepared_scanned_at_tag_is_strict():
+    good = encode_prepared_value(_request(scanned_at=None))
+    with pytest.raises(ValueError, match="scanned_at has tag 0x02"):
+        decode_prepared_value(good[:-9] + b"\x02" + b"\x00" * 8)
+    # absent with a nonzero value is not a valid absence
+    with pytest.raises(
+        ValueError, match="scanned_at has tag 0x00 with value 0000000000000001"
+    ):
+        decode_prepared_value(good[:-9] + b"\x00" + b"\x00" * 7 + b"\x01")
+    for bad in (INT64_MIN - 1, INT64_MAX + 1):
+        with pytest.raises(ValueError, match="scanned_at"):
+            _request(scanned_at=bad)
 
 
 def test_prepared_request_validation():
@@ -956,8 +997,8 @@ def test_prepared_value_truncation_errors_name_the_failed_parse_stage():
     # ("t",): version(1) key_len(2) key(8) topic_len(2) topic(6)
     # partition(4) arity(1) name_len(2) name(1) tag(1) value_len(2)
     # value(2) body_len(4) body(2) persisted_at(8) row_count(8)
-    # digest(32) — 86 bytes total; the tail's cuts report the
-    # body-length mismatch (a cut digest included).
+    # digest(32) scanned_tag(1) scanned_at(8) — 95 bytes total; the
+    # tail's cuts report the body-length mismatch.
     encoded = encode_prepared_value(
         _request(idempotency_key="some-key", group=("42",), group_fields=("t",))
     )
@@ -974,9 +1015,9 @@ def test_prepared_value_truncation_errors_name_the_failed_parse_stage():
         + ["field 0 value: length"] * 2
         + ["field 0 value: 2 bytes declared"] * 2
         + ["body length$"] * 4
-        + ["length mismatch"] * 50  # body (2) + persisted_at + row_count + digest
+        + ["length mismatch"] * 59  # body (2) + the 57-byte fixed tail
     )
-    assert len(encoded) == 86
+    assert len(encoded) == 95
     assert len(encoded) == len(expect)
     for cut, stage in enumerate(expect):
         with pytest.raises(ValueError, match=stage):

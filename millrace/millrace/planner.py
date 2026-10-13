@@ -133,11 +133,12 @@ class KeyStats:
     spec field at staging time).
 
     ``first_staged_ts`` / ``last_staged_ts`` are microseconds since the
-    Unix epoch. ``first_staged_ts`` is set when the key's first row is
-    staged after the key stood empty and is NEVER advanced by later
-    arrivals — the stage writer (Phase 2) enforces that, the age
-    trigger and the tail's freshness SLA rely on it, and the replay
-    suite pins it. ``last_staged_ts`` is informational; no trigger
+    Unix epoch. ``first_staged_ts`` bounds the staging time of the
+    key's oldest staged row from below: it is set when the key's first
+    row is staged after the key stood empty, is NEVER advanced by later
+    arrivals, and a settle that leaves rows lifts it to the settled
+    scan's start (stage.py) — the age trigger and the tail's freshness
+    SLA rely on both, and the replay suite pins the first. ``last_staged_ts`` is informational; no trigger
     reads it.
 
     The planner trusts the snapshot: these values come from the

@@ -70,7 +70,8 @@ Value formats
                arity(u8), then per partition field name_len(u16)
                name(utf8) tag(u8) [value_len(u16) value(utf8)]
                body_len(u32) body(bytes) persisted_at(u64, micros since
-               the Unix epoch) row_count(u64) digest(32 bytes). The body is the
+               the Unix epoch) row_count(u64) digest(32 bytes)
+               scanned_tag(u8) scanned_at(i64). The body is the
                byte-exact prepared commit request, written once and
                replayed byte-identically after an ambiguous response.
                ``row_count`` is the number of staged rows the request's
@@ -81,6 +82,12 @@ Value formats
                :func:`content_digest` (the raw 32 bytes; hex in the
                dataclass), the content the key was derived from — kept
                so a settle can verify content, not only count.
+               ``scanned_at`` (tag 0x01, micros) is the staging-clock
+               instant taken just before the window's scan when that scan
+               saw the group's WHOLE staged slice (tag 0x00 and eight
+               zero bytes when a cap cut it short): every row the settle
+               leaves behind was staged after it, so every settle of the
+               entry lifts the group's ``first_staged_ts`` to it.
                ``persisted_at`` is forensic: the flusher logs an
                entry's age when it replays one (flush.py) and gates
                nothing on it. ``topic`` / ``partition``
@@ -203,8 +210,12 @@ PartitionTuple = tuple[str | None, ...]
 _OFFSET_LEN: Final = 8
 STATS_VALUE_LEN: Final = 1 + 8 + 8 + 8 + 8
 FENCE_PROBE_VALUE_LEN: Final = 1 + 8
-#: persisted_at(u64) + row_count(u64) + digest(32 bytes) after the body.
-_PREPARED_TAIL_LEN: Final = 8 + 8 + 32
+#: persisted_at(u64) + row_count(u64) + digest(32 bytes) + scanned_tag(u8)
+#: + scanned_at(i64) after the body.
+_PREPARED_TAIL_LEN: Final = 8 + 8 + 32 + 1 + 8
+#: Tags of the envelope's optional ``scanned_at``.
+SCANNED_ABSENT: Final = 0x00
+SCANNED_PRESENT: Final = 0x01
 #: Bytes buffered per ``hashlib`` update in :func:`content_digest` (well
 #: above CPython's 2048-byte GIL-release threshold).
 _DIGEST_CHUNK: Final = 1 << 20
@@ -416,8 +427,10 @@ class StatsValue:
     staged rows. ``first_staged_ts`` / ``last_staged_ts`` are
     microseconds since the Unix epoch. ``first_staged_ts`` is set when
     the tuple's first row is staged after the tuple stood empty and is
-    NEVER advanced by later arrivals — the flush planner's age trigger
-    and the tail's freshness SLA stand on that property.
+    NEVER advanced by later arrivals; a settle that leaves rows lifts it
+    to the settled scan's start (stage.py), so it bounds the staging
+    time of the oldest staged row from below — the flush planner's age
+    trigger and the tail's freshness SLA stand on that property.
     """
 
     staged_bytes: int
@@ -549,7 +562,11 @@ class PreparedRequest:
     input of the key — persisted so a settle can verify the window's
     rows are the published ones, not only their number (a topic
     recreated under the same name can re-put the same keys with new
-    payloads); that verification is not wired yet.
+    payloads); that verification is not wired yet. ``scanned_at`` is the
+    staging-clock instant (µs) taken just before the window's scan when
+    that scan saw the group's whole staged slice, None when a cap cut it
+    short: a settle of the entry lifts the group's ``first_staged_ts`` to
+    it when rows remain (they were all staged after it).
 
     ``topic`` / ``partition`` / ``group`` (with ``group_fields``, the
     hoglake display names of the tuple's fields) are the derivation
@@ -569,6 +586,7 @@ class PreparedRequest:
     group_fields: tuple[str, ...]
     row_count: int
     digest: str
+    scanned_at: int | None
 
     def __post_init__(self) -> None:
         key_len = len(self.idempotency_key.encode("utf-8"))
@@ -594,6 +612,8 @@ class PreparedRequest:
             raise ValueError(
                 f"digest must be 64 lowercase hex characters, got {self.digest!r}"
             )
+        if self.scanned_at is not None:
+            _require_int64("scanned_at", self.scanned_at)
 
 
 def prepared_key(group: PartitionTuple, first_offset: int) -> bytes:
@@ -636,7 +656,7 @@ def encode_prepared_value(request: PreparedRequest) -> bytes:
     """Version 6: key_len(u16) key(utf8) topic_len(u16) topic(utf8)
     partition(u32) arity(u8) [name_len(u16) name tag(u8) [value_len(u16)
     value]]* body_len(u32) body persisted_at(u64) row_count(u64)
-    digest(32 bytes)."""
+    digest(32 bytes) scanned_tag(u8) scanned_at(i64)."""
     out = bytearray([PREPARED_VERSION])
     out += _encode_utf8_u16("idempotency key", request.idempotency_key)
     out += _encode_utf8_u16("topic", request.topic)
@@ -654,6 +674,12 @@ def encode_prepared_value(request: PreparedRequest) -> bytes:
     out += _encode_u64(request.persisted_at)
     out += _encode_u64(request.row_count)
     out += bytes.fromhex(request.digest)
+    if request.scanned_at is None:
+        out.append(SCANNED_ABSENT)
+        out += bytes(8)
+    else:
+        out.append(SCANNED_PRESENT)
+        out += _encode_i64(request.scanned_at)
     return bytes(out)
 
 
@@ -701,12 +727,25 @@ def decode_prepared_value(data: bytes) -> PreparedRequest:
             f"value holds {len(data) - pos - _PREPARED_TAIL_LEN}"
         )
     tail = pos + body_len
+    scanned_tag = data[tail + 48]
+    scanned_raw = data[tail + 49 :]
+    scanned_at: int | None
+    if scanned_tag == SCANNED_PRESENT:
+        scanned_at = int.from_bytes(scanned_raw, "big", signed=True)
+    elif scanned_tag == SCANNED_ABSENT and scanned_raw == bytes(8):
+        scanned_at = None
+    else:
+        raise ValueError(
+            f"prepared value: scanned_at has tag {scanned_tag:#04x} with "
+            f"value {scanned_raw.hex()}"
+        )
     return PreparedRequest(
         idempotency_key=key,
         body=data[pos:tail],
         persisted_at=int.from_bytes(data[tail : tail + 8], "big", signed=False),
         row_count=int.from_bytes(data[tail + 8 : tail + 16], "big", signed=False),
-        digest=data[tail + 16 :].hex(),
+        digest=data[tail + 16 : tail + 48].hex(),
+        scanned_at=scanned_at,
         topic=topic,
         partition=partition,
         group=tuple(values),

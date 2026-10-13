@@ -2492,6 +2492,7 @@ class HoglakeFlusher:
                 key=key,
                 snapshot_id=receipt.snapshot_id,
                 entry_stands=True,
+                scanned_at_us=pending.request.scanned_at,
             )
             self._receipt_settlements += 1
             log.info(
@@ -2649,6 +2650,7 @@ class HoglakeFlusher:
             key=key,
             snapshot_id=result.snapshot_id,
             entry_stands=True,
+            scanned_at_us=pending.request.scanned_at,
         )
         self._prepared_replays += 1
         log.info(
@@ -2729,6 +2731,7 @@ class HoglakeFlusher:
         key: str | None,
         snapshot_id: int | None,
         entry_stands: bool,
+        scanned_at_us: int | None,
     ) -> FlushCommitReport:
         """Settle the window with the guard INSIDE the settlement
         transaction (``commit_flushed(expected_rows=expected)``): the
@@ -2742,7 +2745,9 @@ class HoglakeFlusher:
         stands — a standing entry makes a restart halt here again (the
         structural fix is settling by the scanned keys, hoglake#351)."""
         try:
-            return await stage.commit_flushed(window, expected_rows=expected)
+            return await stage.commit_flushed(
+                window, expected_rows=expected, scanned_at_us=scanned_at_us
+            )
         except SettlementMismatchError as e:
             published = (
                 f"published snapshot {snapshot_id}"
@@ -2843,11 +2848,20 @@ class HoglakeFlusher:
         fields = _group_fields(info, group)
         label = keyspace.group_label(fields, group)
 
-        rows = await stage.scan_group_rows_bounded(
+        # The staging-clock instant just before the scan: when the scan
+        # sees the group's whole staged slice, every row the settle leaves
+        # behind was staged after it, and the settle lifts the group's
+        # first_staged_ts to it (stage.py: a group under steady inflow
+        # never drains, so without the lift it would read age-eligible on
+        # every sweep after its first deadline).
+        scan_started_us = self._now_us()
+        scan = await stage.scan_window(
             group,
             max_rows=self._cfg.flush_scan_max_rows,
             max_bytes=self._scan_budget_bytes(),
         )
+        rows = scan.rows
+        scanned_at = scan_started_us if scan.complete else None
         if not rows:
             # The byte cap refuses a FIRST row larger than the budget;
             # an empty scan then is indistinguishable from a genuinely
@@ -2859,6 +2873,7 @@ class HoglakeFlusher:
                 (row_key, payload)
                 async for row_key, payload in stage.scan_group_rows(group, max_rows=1)
             ]
+            scanned_at = None  # a one-row probe says nothing about the rest
         if not rows:
             # A decided key scanning zero rows is the redelivery-inflation
             # residue (stage_batch is idempotent at the row level but its
@@ -2928,6 +2943,7 @@ class HoglakeFlusher:
                 f"its receipt exists (snapshot {receipt.snapshot_id})",
                 snapshot_id=receipt.snapshot_id,
                 entry_stands=False,
+                scanned_at=scanned_at,
             )
 
         now_us = self._now_us()
@@ -2993,6 +3009,7 @@ class HoglakeFlusher:
                 key=None,
                 snapshot_id=None,
                 entry_stands=False,
+                scanned_at_us=scanned_at,
             )
             self._decisions_dropped += 1
             return FlushReport(
@@ -3040,6 +3057,7 @@ class HoglakeFlusher:
                     group_fields=fields,
                     row_count=len(rows),
                     digest=digest,
+                    scanned_at=scanned_at,
                 ),
             )
         except BaseException:
@@ -3164,6 +3182,7 @@ class HoglakeFlusher:
                     f"receipt exists (snapshot {landed.snapshot_id})",
                     snapshot_id=landed.snapshot_id,
                     entry_stands=True,
+                    scanned_at=scanned_at,
                 )
             status = e.status_code
             if status is not None and 400 <= status < 500:
@@ -3194,6 +3213,7 @@ class HoglakeFlusher:
             key=key,
             snapshot_id=result.snapshot_id,
             entry_stands=True,
+            scanned_at_us=scanned_at,
         )
         self._flushes_committed += 1
         self._rows_published += plan.records
@@ -3242,6 +3262,7 @@ class HoglakeFlusher:
         *,
         snapshot_id: int | None,
         entry_stands: bool,
+        scanned_at: int | None,
     ) -> FlushReport:
         """Settle a fresh window that already landed under its key —
         nothing new is committed (``millrace_flush_deduped_total``). The
@@ -3258,6 +3279,7 @@ class HoglakeFlusher:
             key=key,
             snapshot_id=snapshot_id,
             entry_stands=entry_stands,
+            scanned_at_us=scanned_at,
         )
         self._flush_deduped += 1
         log.info(

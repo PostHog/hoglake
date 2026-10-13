@@ -199,7 +199,11 @@ re-puts its own staged keys.
 ## The flush planner
 
 Three lanes, evaluated per key; arrivals never reset a key's
-`first_staged_ts`:
+`first_staged_ts`, and a settle that leaves rows lifts it to the
+settled scan's start (when that scan saw the whole slice — every row
+left was staged after it), so `now − first_staged_ts` stays the age of
+the key's oldest staged row and a key under steady inflow trips the age
+lane once per deadline, not on every sweep:
 
 | Trigger | Condition | Catches |
 |---|---|---|
@@ -524,8 +528,9 @@ in flight per partition (4× that process-wide — each in-flight decision
 holds its bounded scan in memory). Evidence for the tail-SLA claim
 (M5): the sweep bench (`tests/test_flush_bench.py`, non-gating:
 `uv run pytest --bench tests/test_flush_bench.py -s`) measures 1024
-ready keys in total (256 per partition stage × 4 stages) end-to-end at **72 keys/s serial** and **286
-keys/s at the default concurrency** on in-memory stages with a 5 ms WAL
+ready keys in total (256 per partition stage × 4 stages) end-to-end at **74 keys/s serial** and **301
+keys/s at the default concurrency** (2026-10-13, with the receipt lookup
+every fresh build now makes) on in-memory stages with a 5 ms WAL
 flush tick — the serial loop sits within 2× of the ~110 ready keys/s
 the design arithmetic wants, so the bound-parallel loop shipped; the
 tick dominates the rig (at a 1 ms interval the same rig reads 189/253

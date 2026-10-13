@@ -311,6 +311,7 @@ class EventProducer:
         record_ts_us: int | None = None,
         extra: dict[str, Any] | None = None,
         value: bytes | None = None,
+        tombstone: bool = False,
     ) -> None:
         """Queue one event; the Kafka record timestamp tracks the event
         time (ms) so row keys order like the payloads. ``record_ts_us``
@@ -318,7 +319,8 @@ class EventProducer:
         the RECORD timestamp sane — the broker rejects records too far
         out — while the PAYLOAD carries the junk date). ``extra`` adds
         raw payload keys (a column added mid-test); ``value`` replaces the
-        events payload outright (the nested scenario)."""
+        events payload outright (the nested scenario); ``tombstone``
+        produces a null value (the consume-time ``missing_value`` drop)."""
         with self._lock:
             self._pending[seq] = (team_id, ts_us, time.monotonic())
 
@@ -342,7 +344,9 @@ class EventProducer:
         self._producer.produce(
             self.topic,
             key=str(team_id).encode(),
-            value=value
+            value=None
+            if tombstone
+            else value
             if value is not None
             else event_payload(team_id, ts_us, seq, pad_bytes=pad_bytes, extra=extra),
             timestamp=(ts_us if record_ts_us is None else record_ts_us) // 1000,
@@ -496,6 +500,29 @@ def lake_rows(table: Any, snapshot: int, fs: Any) -> pa.Table:
             {name: pa.array([], type=field.type) for name, field in []},
         )
     return pa.concat_tables(tables)
+
+
+def lake_seq_counts(
+    table: Any, snapshot: int, fs: Any, *, workers: int = 16
+) -> Counter[int]:
+    """How many times each ``seq`` is queryable: a parquet readback of
+    the ``seq`` column alone over every live file (both destination
+    schemas carry ``seq`` top-level), files read in parallel. A count
+    above 1 is a duplicate row; a missing seq is a lost one."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(path: str) -> list[int]:
+        column = pq.read_table(
+            path[len("s3://") :], columns=["seq"], filesystem=fs
+        ).column("seq")
+        return [int(v) for v in column.to_pylist() if v is not None]
+
+    counts: Counter[int] = Counter()
+    paths = [f.path for f in lake_files(table, snapshot)]
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for seqs in pool.map(one, paths):
+            counts.update(seqs)
+    return counts
 
 
 def lake_month_partitions(table: Any, snapshot: int) -> set[str]:
@@ -823,6 +850,12 @@ class Child:
         with self._lock:
             return "\n".join(self.lines)
 
+    def lines_since(self, index: int) -> tuple[list[str], int]:
+        """The output lines from ``index`` on, and the next index (a
+        tail cursor for a long-running scenario)."""
+        with self._lock:
+            return self.lines[index:], len(self.lines)
+
     def wait_for_log(self, needle: str, timeout_s: float) -> None:
         wait_until(
             lambda: needle in self.output(),
@@ -917,6 +950,92 @@ def child_env(
     if extra:
         env.update(extra)
     return env
+
+
+MetricSamples = dict[tuple[str, tuple[tuple[str, str], ...]], float]
+"""A parsed /metrics scrape: (sample name, sorted label pairs) → value."""
+
+
+def scrape_metrics(port: int, *, timeout_s: float = 5.0) -> MetricSamples:
+    """GET a child's ``/metrics`` and parse the Prometheus text
+    exposition (prometheus_client's own parser — the format the child
+    serves). Sample names are the exposed ones (a counter's ``_total``
+    included). Raises on a transport error or a non-200."""
+    import httpx
+    from prometheus_client.parser import text_string_to_metric_families
+
+    r = httpx.get(f"http://127.0.0.1:{port}/metrics", timeout=timeout_s)
+    r.raise_for_status()
+    out: MetricSamples = {}
+    for family in text_string_to_metric_families(r.text):
+        for sample in family.samples:
+            out[(sample.name, tuple(sorted(sample.labels.items())))] = float(
+                sample.value
+            )
+    return out
+
+
+def metric(samples: MetricSamples, name: str, **labels: str) -> float | None:
+    """One sample's value (None when the series is absent — e.g. the
+    oldest-eligible gauge with nothing eligible)."""
+    return samples.get((name, tuple(sorted(labels.items()))))
+
+
+def metric_by_label(samples: MetricSamples, name: str, label: str) -> dict[str, float]:
+    """Every series of ``name`` keyed by one label's value."""
+    out: dict[str, float] = {}
+    for (sample_name, pairs), value in samples.items():
+        if sample_name != name:
+            continue
+        for key, label_value in pairs:
+            if key == label:
+                out[label_value] = value
+    return out
+
+
+def probe_status(port: int, path: str, *, timeout_s: float = 2.0) -> int | None:
+    """The HTTP status of a child's probe (``/healthz`` or ``/readyz``);
+    None when nothing answers."""
+    import httpx
+
+    try:
+        return httpx.get(
+            f"http://127.0.0.1:{port}{path}", timeout=timeout_s
+        ).status_code
+    except Exception:  # noqa: BLE001 - "no answer" is the observation
+        return None
+
+
+def process_rss_bytes(pid: int) -> int | None:
+    """Resident set size of a process: psutil when installed, else
+    ``/proc/<pid>/status`` (Linux), else ``ps -o rss=`` (macOS/BSD);
+    None when none of them can say (the process is gone)."""
+    try:
+        import psutil  # type: ignore[import-not-found]
+
+        return int(psutil.Process(pid).memory_info().rss)
+    except ImportError:
+        pass
+    except Exception:  # noqa: BLE001 - a vanished pid
+        return None
+    try:
+        with open(f"/proc/{pid}/status") as status:
+            for line in status:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "rss=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        ).stdout.strip()
+        return int(out) * 1024 if out else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
 
 
 def free_port() -> int:

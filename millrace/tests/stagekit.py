@@ -76,6 +76,7 @@ def prepared(
         group_fields=FIELDS,
         row_count=rows,
         digest="0" * 64,
+        scanned_at=None,
     )
 
 

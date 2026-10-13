@@ -392,6 +392,7 @@ async def test_recover_collects_legacy_markers_without_touching_rows(memory_stor
         group_fields=FIELDS,
         row_count=4,
         digest="0" * 64,
+        scanned_at=None,
     )
 
     db = await DbBuilder(path, memory_store).build()
@@ -530,6 +531,7 @@ async def test_recover_returns_pending_prepared_and_nothing_else(stage_factory):
         group_fields=FIELDS,
         row_count=5,
         digest="0" * 64,
+        scanned_at=None,
     )
     req_b = PreparedRequest(
         keyspace.idempotency_key(TABLE, "events", 0, g(1), 5, 9, "0" * 64),
@@ -541,6 +543,7 @@ async def test_recover_returns_pending_prepared_and_nothing_else(stage_factory):
         group_fields=FIELDS,
         row_count=5,
         digest="0" * 64,
+        scanned_at=None,
     )
     await stage.persist_prepared(g(1), 0, req_a)
     await stage.persist_prepared(g(1), 5, req_b)
@@ -570,6 +573,7 @@ async def test_prepared_round_trip(stage_factory):
         group_fields=FIELDS,
         row_count=10,
         digest="0" * 64,
+        scanned_at=None,
     )
     await stage.persist_prepared(g(3), 10, request)
     assert await stage.get_prepared(g(3), 10) == request
@@ -1235,4 +1239,125 @@ async def test_a_corrupt_prepared_entry_fails_recovery_by_name(memory_store):
         assert text.startswith(f"events[0]: the prepared/ entry at key {key!r}")
         assert "is corrupt" in text
         assert isinstance(excinfo.value.__cause__, ValueError)
+    await stage.close()
+
+
+async def test_a_settle_lifts_first_staged_ts_to_the_scan_start(stage_factory):
+    """Rows at t0, the scan starts at t1, more rows at t2 > t1, then the
+    settle of the scanned window: first_staged_ts becomes t1 (every row
+    left was staged after it), last_staged_ts stays t2, the sched_age/
+    entry is re-keyed; draining the rest deletes stats and the entry."""
+    stage = await stage_factory()
+    t0, t1, t2 = NOW, NOW + 10, NOW + 20
+    await stage.stage_batch([rec(5, 0, 0), rec(5, 0, 1)], now_us=t0)
+    scanned = await stage.scan_window(g(5), max_rows=100, max_bytes=10**9)
+    assert scanned.complete and len(scanned.rows) == 2
+    await stage.stage_batch([rec(5, 0, 2)], now_us=t2)
+    await stage.commit_flushed(window(5, 0, 1), expected_rows=2, scanned_at_us=t1)
+    (s,) = await stage.iter_key_stats()
+    assert (s.first_staged_ts, s.last_staged_ts, s.row_count) == (t1, t2, 1)
+    assert await stage.iter_sched_age_through(2**63 - 1) == [
+        keyspace.SchedAgeKey(t1, g(5))
+    ]
+    report = await stage.commit_flushed(window(5, 2, 2), scanned_at_us=t2 + 5)
+    assert report.group_drained
+    assert await stage.iter_key_stats() == []
+    assert await stage.iter_sched_age_through(2**63 - 1) == []
+    await stage.close()
+
+
+async def test_the_lift_never_lowers_and_never_passes_last_staged_ts(stage_factory):
+    stage = await stage_factory()
+    await stage.stage_batch([rec(5, 0, o) for o in range(4)], now_us=NOW + 50)
+    # an earlier scan start never lowers first_staged_ts
+    await stage.commit_flushed(window(5, 0, 0), scanned_at_us=NOW)
+    (s,) = await stage.iter_key_stats()
+    assert s.first_staged_ts == NOW + 50
+    # no scan start (a capped scan): unchanged
+    await stage.commit_flushed(window(5, 1, 1), scanned_at_us=None)
+    (s,) = await stage.iter_key_stats()
+    assert s.first_staged_ts == NOW + 50
+    # a scan start past last_staged_ts clamps to it (first <= last holds)
+    await stage.stage_batch([rec(5, 0, 9)], now_us=NOW + 60)
+    await stage.commit_flushed(window(5, 2, 2), scanned_at_us=NOW + 999)
+    (s,) = await stage.iter_key_stats()
+    assert (s.first_staged_ts, s.last_staged_ts) == (NOW + 60, NOW + 60)
+    assert await stage.iter_sched_age_through(2**63 - 1) == [
+        keyspace.SchedAgeKey(NOW + 60, g(5))
+    ]
+    await stage.close()
+
+
+@given(data=st.data())
+def test_first_staged_ts_bounds_the_oldest_remaining_row(data: st.DataObject) -> None:
+    """Property over interleavings of stage / scan / stage / settle with a
+    monotone clock: after every settle that leaves rows, first_staged_ts
+    is <= the staging time of the oldest remaining row and >= its
+    previous value, and the sched_age/ index holds exactly
+    (first_staged_ts, group)."""
+    asyncio.run(_first_staged_ts_property(data))
+
+
+async def _first_staged_ts_property(data: st.DataObject) -> None:
+    from slatedb.uniffi import ObjectStore
+
+    stage = await PartitionStage.open_store(
+        ObjectStore.resolve("memory:///"),
+        "millrace/events/0",
+        topic="events",
+        partition=0,
+        settings=fast_flush_settings(),
+    )
+    clock = NOW
+    offset = 0
+    staged_at: dict[int, int] = {}  # offset -> staging time
+
+    async def stage_some(n: int) -> None:
+        nonlocal clock, offset
+        clock += data.draw(st.integers(min_value=0, max_value=50))
+        batch = [rec(5, 0, offset + i) for i in range(n)]
+        await stage.stage_batch(batch, now_us=clock)
+        for i in range(n):
+            staged_at[offset + i] = clock
+        offset += n
+
+    await stage_some(data.draw(st.integers(min_value=1, max_value=5)))
+    previous: int | None = None
+    for _ in range(data.draw(st.integers(min_value=1, max_value=6))):
+        lifted_to: int | None = None
+        if staged_at:
+            clock += data.draw(st.integers(min_value=0, max_value=50))
+            scanned_at = clock
+            cap = data.draw(st.integers(min_value=1, max_value=8))
+            scan = await stage.scan_window(g(5), max_rows=cap, max_bytes=10**9)
+            if data.draw(st.booleans()):
+                await stage_some(data.draw(st.integers(min_value=1, max_value=4)))
+            rows = scan.rows
+            if rows:
+                await stage.commit_flushed(
+                    window(5, rows[0][0].offset, rows[-1][0].offset),
+                    expected_rows=len(rows),
+                    scanned_at_us=scanned_at if scan.complete else None,
+                )
+                for rk, _ in rows:
+                    del staged_at[rk.offset]
+                if scan.complete:
+                    lifted_to = scanned_at
+        stats = await stage.iter_key_stats()
+        sched = await stage.iter_sched_age_through(2**63 - 1)
+        if staged_at:
+            (s,) = stats
+            assert s.first_staged_ts <= min(staged_at.values())
+            if previous is not None:
+                assert s.first_staged_ts >= previous
+            if lifted_to is not None:
+                # a complete scan's settle lifts it to the scan start
+                assert s.first_staged_ts >= min(lifted_to, s.last_staged_ts)
+            previous = s.first_staged_ts
+            assert sched == [keyspace.SchedAgeKey(s.first_staged_ts, g(5))]
+        else:
+            assert stats == [] and sched == []
+            previous = None
+        if data.draw(st.booleans()):
+            await stage_some(data.draw(st.integers(min_value=1, max_value=4)))
     await stage.close()

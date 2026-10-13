@@ -38,6 +38,7 @@ from flushkit import (
     commit_ok,
     event_payload,
     make_config,
+    receipt_server,
     script_bootstrap,
     script_options,
 )
@@ -81,6 +82,9 @@ def _make_flusher(httpx_mock: Any, store: FakeObjectStore, io_workers: int) -> A
 
     script_bootstrap(httpx_mock)
     script_options(httpx_mock)
+    # Every fresh build asks for its window's receipt before building;
+    # none of these windows ever landed, so the catch-all answers 404.
+    receipt_server(httpx_mock)
     client = HoglakeClient("http://hog.test")
     client.s3 = store
     return HoglakeFlusher.resolve(

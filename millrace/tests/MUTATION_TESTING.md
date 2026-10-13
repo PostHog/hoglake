@@ -57,7 +57,8 @@ the survivor sections are the gate's reference set.
 | 2026-10-12 partition-tuple keyspace, `(group, offset)` rows, `offsets/` removed, fence probe — clean-slate, first run | 835 | 745 | 90 | 0 |
 | 2026-10-12, same code, after the kill tests below — clean-slate | 835 | 763 | 72 | 0 |
 | 2026-10-12, content digest in the key (`millrace:v3`), `prepared/` v5 (`row_count`) — clean-slate | 874 | 797 | 77 | 0 |
-| **2026-10-13, chunked digest updates, `prepared/` v6 (persisted `digest`) — clean-slate** | **891** | **813** | **78** | **0** |
+| 2026-10-13, chunked digest updates, `prepared/` v6 (persisted `digest`) — clean-slate | 891 | 813 | 78 | 0 |
+| **2026-10-13, `prepared/` `scanned_at` (the settle's `first_staged_ts` lift) — clean-slate** | **936** | **856** | **80** | **0** |
 
 The last row is the current ledger: `rm -rf mutants && uv run mutmut
 run` on this tree, `tests/check_mutants.py` exit 0. It adds
@@ -77,13 +78,20 @@ with the v5 tail, so its rows carry new indices. The 2026-10-13 row
 run left 79 survivors; `test_content_digest_is_unchanged_across_its_1_mib_update_chunks`
 killed the one non-equivalent (`h.update(None)` on the chunk branch,
 reachable only past 1 MiB of framed rows), leaving the chunk-boundary
-`>=`/`>` flip as class E9. Every row above it
+`>=`/`>` flip as class E9. The next row adds the envelope's optional
+`scanned_at` (tag + i64): its first run left 81 survivors; the one
+non-equivalent was `decode_prepared_value`'s `partition` decoded
+`signed=True`, alive only because the round-trip's hypothesis stream
+stopped drawing a partition ≥ 2³¹ once the test drew one more field —
+`test_prepared_partition_decodes_unsigned_at_the_sign_bit` now pins
+2³¹−1, 2³¹ and 2³²−1 deterministically. The rest are E1/E2 renumberings
+of the decode tail and the `scanned_at` label (M). Every row above it
 ran against earlier keyspace code (team-id keys, the `poison/` and
 `offsets/` codecs); their survivor tables are gone with that code (git
 history keeps them), and the earlier phase narratives that cited tests
 of that code were removed with it.
 
-`planner.py`: 0 survivors. All 78 survivors are in `keyspace.py`.
+`planner.py`: 0 survivors. All 80 survivors are in `keyspace.py`.
 
 ## Killed by tests added at the 2026-10-12 reconciliation (18)
 
@@ -118,7 +126,7 @@ key at `INT64_MIN`, -1, 0, 41, `INT64_MAX - 1`),
 the field-name cases of `test_group_label_is_the_hoglake_human_form`
 (`/`, `=`, `:` and non-ASCII in a FIELD NAME percent-encode).
 
-## Surviving mutants — all equivalent (78)
+## Surviving mutants — all equivalent (80)
 
 Each entry: the mutant, its one-line diff, and the argument. The
 arguments are interpreter semantics or an explicit guard upstream of the
@@ -128,7 +136,7 @@ are regenerated from a clean-slate run's actual output whenever the
 mutated modules change (see the header); `tests/check_mutants.py` is the
 mechanical cross-check.
 
-### Class E1 — dropped redundant explicit defaults, `to_bytes`/`from_bytes` (23)
+### Class E1 — dropped redundant explicit defaults, `to_bytes`/`from_bytes` (24)
 
 Since Python 3.11 the `byteorder` parameter of `int.to_bytes` /
 `int.from_bytes` defaults to `"big"`, and `signed` defaults to `False`;
@@ -147,10 +155,11 @@ independently by the golden vectors and the boundary round-trips.
 | `x__encode_u64__mutmut_6` | `return value.to_bytes(8, "big", signed=False)` → `return value.to_bytes(8, "big", )` | redundant explicit default (`"big"` / `signed=False`) |
 | `x__encode_utf8_u16__mutmut_11` | `return len(raw).to_bytes(2, "big") + raw` → `return len(raw).to_bytes(2, ) + raw` | redundant explicit default (`"big"` / `signed=False`) |
 | `x_decode_fence_probe_value__mutmut_11` | `return int.from_bytes(data[1:], "big", signed=True)` → `return int.from_bytes(data[1:], signed=True)` | redundant explicit default (`"big"` / `signed=False`) |
-| `x_decode_prepared_value__mutmut_136` | `persisted_at=int.from_bytes(data[tail : tail + 8], "big", signed=False),` → `persisted_at=int.from_bytes(data[tail : tail + 8], signed=False),` | redundant explicit default (`"big"` / `signed=False`) |
-| `x_decode_prepared_value__mutmut_137` | `persisted_at=int.from_bytes(data[tail : tail + 8], "big", signed=False),` → `persisted_at=int.from_bytes(data[tail : tail + 8], "big", ),` | redundant explicit default (`"big"` / `signed=False`) |
-| `x_decode_prepared_value__mutmut_147` | `row_count=int.from_bytes(data[tail + 8 : tail + 16], "big", signed=False),` → `row_count=int.from_bytes(data[tail + 8 : tail + 16], signed=False),` | redundant explicit default (`"big"` / `signed=False`) |
-| `x_decode_prepared_value__mutmut_148` | `row_count=int.from_bytes(data[tail + 8 : tail + 16], "big", signed=False),` → `row_count=int.from_bytes(data[tail + 8 : tail + 16], "big", ),` | redundant explicit default (`"big"` / `signed=False`) |
+| `x_decode_prepared_value__mutmut_126` | `scanned_at = int.from_bytes(scanned_raw, "big", signed=True)` → `scanned_at = int.from_bytes(scanned_raw, signed=True)` | redundant explicit default (`"big"` / `signed=False`) |
+| `x_decode_prepared_value__mutmut_162` | `persisted_at=int.from_bytes(data[tail : tail + 8], "big", signed=False),` → `persisted_at=int.from_bytes(data[tail : tail + 8], signed=False),` | redundant explicit default (`"big"` / `signed=False`) |
+| `x_decode_prepared_value__mutmut_163` | `persisted_at=int.from_bytes(data[tail : tail + 8], "big", signed=False),` → `persisted_at=int.from_bytes(data[tail : tail + 8], "big", ),` | redundant explicit default (`"big"` / `signed=False`) |
+| `x_decode_prepared_value__mutmut_173` | `row_count=int.from_bytes(data[tail + 8 : tail + 16], "big", signed=False),` → `row_count=int.from_bytes(data[tail + 8 : tail + 16], signed=False),` | redundant explicit default (`"big"` / `signed=False`) |
+| `x_decode_prepared_value__mutmut_174` | `row_count=int.from_bytes(data[tail + 8 : tail + 16], "big", signed=False),` → `row_count=int.from_bytes(data[tail + 8 : tail + 16], "big", ),` | redundant explicit default (`"big"` / `signed=False`) |
 | `x_decode_prepared_value__mutmut_44` | `partition = int.from_bytes(data[pos : pos + 4], "big", signed=False)` → `partition = int.from_bytes(data[pos : pos + 4], signed=False)` | redundant explicit default (`"big"` / `signed=False`) |
 | `x_decode_prepared_value__mutmut_45` | `partition = int.from_bytes(data[pos : pos + 4], "big", signed=False)` → `partition = int.from_bytes(data[pos : pos + 4], "big", )` | redundant explicit default (`"big"` / `signed=False`) |
 | `x_decode_prepared_value__mutmut_98` | `body_len = int.from_bytes(data[pos : pos + 4], "big")` → `body_len = int.from_bytes(data[pos : pos + 4], )` | redundant explicit default (`"big"` / `signed=False`) |
@@ -176,8 +185,8 @@ sign-bit boundary round-trips.
 |---|---|---|
 | `x__decode_i64_ordered__mutmut_4` | `return int.from_bytes(data, "big", signed=False) - _SIGN_OFFSET` → `return int.from_bytes(data, "big", signed=None) - _SIGN_OFFSET` | `signed` parsed by truthiness: `None` ≡ `False` |
 | `x__encode_u64__mutmut_3` | `return value.to_bytes(8, "big", signed=False)` → `return value.to_bytes(8, "big", signed=None)` | `signed` parsed by truthiness: `None` ≡ `False` |
-| `x_decode_prepared_value__mutmut_134` | `persisted_at=int.from_bytes(data[tail : tail + 8], "big", signed=False),` → `persisted_at=int.from_bytes(data[tail : tail + 8], "big", signed=None),` | `signed` parsed by truthiness: `None` ≡ `False` |
-| `x_decode_prepared_value__mutmut_145` | `row_count=int.from_bytes(data[tail + 8 : tail + 16], "big", signed=False),` → `row_count=int.from_bytes(data[tail + 8 : tail + 16], "big", signed=None),` | `signed` parsed by truthiness: `None` ≡ `False` |
+| `x_decode_prepared_value__mutmut_160` | `persisted_at=int.from_bytes(data[tail : tail + 8], "big", signed=False),` → `persisted_at=int.from_bytes(data[tail : tail + 8], "big", signed=None),` | `signed` parsed by truthiness: `None` ≡ `False` |
+| `x_decode_prepared_value__mutmut_171` | `row_count=int.from_bytes(data[tail + 8 : tail + 16], "big", signed=False),` → `row_count=int.from_bytes(data[tail + 8 : tail + 16], "big", signed=None),` | `signed` parsed by truthiness: `None` ≡ `False` |
 | `x_decode_prepared_value__mutmut_42` | `partition = int.from_bytes(data[pos : pos + 4], "big", signed=False)` → `partition = int.from_bytes(data[pos : pos + 4], "big", signed=None)` | `signed` parsed by truthiness: `None` ≡ `False` |
 | `x_decode_stats_value__mutmut_17` | `staged_bytes=int.from_bytes(data[1:9], "big", signed=False),` → `staged_bytes=int.from_bytes(data[1:9], "big", signed=None),` | `signed` parsed by truthiness: `None` ≡ `False` |
 | `x_decode_stats_value__mutmut_50` | `row_count=int.from_bytes(data[25:33], "big", signed=False),` → `row_count=int.from_bytes(data[25:33], "big", signed=None),` | `signed` parsed by truthiness: `None` ≡ `False` |
@@ -280,7 +289,7 @@ absent iterate identically.
 | `x_group_label__mutmut_6` | `for name, value in zip(fields, group, strict=True):` → `for name, value in zip(fields, group, strict=None):` | explicit length check above raises before the `zip` on any mismatch |
 | `x_group_label__mutmut_9` | `for name, value in zip(fields, group, strict=True):` → `for name, value in zip(fields, group, ):` | explicit length check above raises before the `zip` on any mismatch |
 
-### Class M — error-message text the suite deliberately does not pin (26)
+### Class M — error-message text the suite deliberately does not pin (27)
 
 The suite pins exception TYPE plus a stable identifying substring (the
 field name, or the failed parse stage) and leaves the rest of the
@@ -310,6 +319,7 @@ raise CONDITION is pinned by the test named per row.
 | `xǁPreparedRequestǁ__post_init____mutmut_10` | `_require_uint64("persisted_at", self.persisted_at)` → `_require_uint64("XXpersisted_atXX", self.persisted_at)` | test_prepared_request_validation (match='persisted_at') |
 | `xǁPreparedRequestǁ__post_init____mutmut_14` | `raise ValueError("topic must be non-empty")` → `raise ValueError("XXtopic must be non-emptyXX")` | test_prepared_request_validation (match='topic') |
 | `xǁPreparedRequestǁ__post_init____mutmut_35` | `_require_uint64("row_count", self.row_count)` → `_require_uint64("XXrow_countXX", self.row_count)` | test_prepared_request_validation (match='row_count') |
+| `xǁPreparedRequestǁ__post_init____mutmut_45` | `_require_int64("scanned_at", self.scanned_at)` → `_require_int64("XXscanned_atXX", self.scanned_at)` | test_prepared_scanned_at_tag_is_strict (match='scanned_at') |
 | `xǁRowKeyǁ__post_init____mutmut_5` | `_require_int64("offset", self.offset)` → `_require_int64("XXoffsetXX", self.offset)` | test_row_key_field_validation (match='offset') |
 | `xǁSchedAgeKeyǁ__post_init____mutmut_5` | `_require_int64("first_staged_ts", self.first_staged_ts)` → `_require_int64("XXfirst_staged_tsXX", self.first_staged_ts)` | test_sched_age_key_validation (match='first_staged_ts') |
 | `xǁStatsValueǁ__post_init____mutmut_11` | `_require_int64("first_staged_ts", self.first_staged_ts)` → `_require_int64("XXfirst_staged_tsXX", self.first_staged_ts)` | test_stats_value_timestamp_field_bounds (match='first_staged_ts') |

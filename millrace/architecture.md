@@ -217,14 +217,29 @@ well-formed tuple.
 | `rows/` | `rows/` + group + offset i64ob | Raw Kafka payload bytes | `stage.py:PartitionStage.stage_batch` | `scan_group_rows_bounded`, `scan_group_rows` (flush, recovery) | Settlement transaction (`commit_flushed`), every key in `keyspace.py:window_rows_range` |
 | `stats/` | `stats/` + group | v1, 33 B: `staged_bytes u64, first_staged_ts i64, last_staged_ts i64, row_count u64` | `stage_batch` (merge) | `iter_key_stats` (planner + gauges), `read_group_stats` (age/slow point reads) | Settlement (subtract, or delete on drain), `reconcile_stats` |
 | `sched_age/` | `sched_age/` + first_staged_ts i64ob + group | empty | `stage_batch`, when the group's stats entry is created | `iter_sched_age_through` (flush sweep) | Settlement on drain, `reconcile_stats` |
-| `prepared/` | `prepared/` + group + first_offset i64ob | v6: `idempotency_key, topic, partition`, the group as hoglake partition values (`arity u8`, then per field `name, tag, value?`), `body` (exact request bytes), `persisted_at u64 µs`, `row_count u64` (rows the window held at the scan: the recovery settle's expected count). | `persist_prepared` (flush, before publication) | `list_prepared` (per-group gate), `load_prepared` via `recover` | Settlement transaction, `drop_prepared` (re-prepare) |
+| `prepared/` | `prepared/` + group + first_offset i64ob | v6: `idempotency_key, topic, partition`, the group as hoglake partition values (`arity u8`, then per field `name, tag, value?`), `body` (exact request bytes), `persisted_at u64 µs`, `row_count u64` (rows the window held at the scan: the recovery settle's expected count), `digest` (32 B), `scanned_at` (tag `u8` + `i64 µs`: the scan's start when the scan was complete, else absent; every recovery settle lifts `first_staged_ts` by it). | `persist_prepared` (flush, before publication) | `list_prepared` (per-group gate), `load_prepared` via `recover` | Settlement transaction, `drop_prepared` (re-prepare) |
 | `meta/` | `meta/fence` (one key per instance) | v1, 9 B: `offset i64` (the probing poll's last handled offset; forensic) | `PartitionStage.probe_fence` (consumer, a poll that handled records on the partition but staged none) | nothing (not a row: no scan, stats entry or gauge reads `meta/`) | overwritten by the next probe |
 | `flushed/` | legacy | legacy marker | nothing on this branch | nothing (not decoded) | `recover` collects leftovers in pages of 1000 |
 
-`first_staged_ts` is set once, when a group's stats entry is created, and
-never advanced by later arrivals; it is born again only after a flush
-drains the group's last row. After a partial settlement it keeps the
-older timestamp, which can only make the remaining rows flush earlier.
+`first_staged_ts` is a lower bound on the staging time of the group's
+OLDEST staged row. It is set when the group's stats entry is created and
+never advanced by later arrivals. A settle that drains the group deletes
+it (the next arrival starts a new one). A settle that leaves rows
+behind lifts it to `scanned_at`, the staging-clock instant taken just
+before the settled window's scan, when that scan saw the group's whole
+staged slice: every row left was staged after it (row keys are
+`(group, offset)` and the window is the scan's exact offset prefix). It
+becomes `min(max(first_staged_ts, scanned_at), last_staged_ts)` and the
+`sched_age/` entry is re-keyed in the same transaction. A capped scan's
+leftovers may predate the scan, so its settle keeps the older value
+(those rows flush earlier — the catch-up continues). Without the lift a
+group under steady inflow never drains, its `first_staged_ts` stays at
+its birth, and from its first deadline on it reads age-eligible on
+every sweep (the 30-minute live soak's finding: a commit per sweep
+instead of per deadline, and an oldest-eligible gauge growing without
+bound). The bound is exact up to one consumer poll: a batch whose
+clock was read before the scan began but which landed after the scan's
+snapshot is bounded by `last_staged_ts`, not by its own stamp.
 
 Four durable units touch these prefixes. Everything one poll stages
 into one partition (rows, stats, sched) is one `WriteBatch`, and
@@ -499,7 +514,10 @@ finish, and every later `run_once` re-raises the halt.
 | 2 | `slow` | `age ≥ MILLRACE_SLOW_LANE_DEADLINE_S`, any size | Tiny or churned groups (and groups keyed under a retired spec); the only lane that takes a group below `min_flush_bytes` |
 | 3 | `age` | `age ≥ MILLRACE_FLUSH_DEADLINE_S` and `staged_bytes ≥ MILLRACE_MIN_FLUSH_BYTES` | Medium groups: the freshness SLA |
 
-`age = now_us − first_staged_ts`; negative ages (clock skew) trip no
+`age = now_us − first_staged_ts`, the age of the group's oldest staged
+row to within one sweep (section 3: settles lift `first_staged_ts` to
+the settled scan's start), so a group under steady inflow trips the age
+lane once per deadline, not on every sweep; negative ages (clock skew) trip no
 deadline, and because slow outranks age an age-lane decision's age lies
 in `[flush_deadline, slow_lane_deadline)`. `ratio` (parquet bytes ÷
 staged bytes, validated `0 < ratio ≤ 1` on every call) is
@@ -681,9 +699,12 @@ sequenceDiagram
    inconsistency: halt `idempotency_key_reused` naming the window and
    digest.
 9. **Settle** with `flush.py:HoglakeFlusher._settle` →
-   `commit_flushed(window, expected_rows=…)`: one transaction scans and
-   deletes every key in the window's byte range, subtracts `stats/` and
-   drops the `prepared/` entry, and BEFORE committing compares the
+   `commit_flushed(window, expected_rows=…, scanned_at_us=…)`: one
+   transaction scans and deletes every key in the window's byte range,
+   subtracts `stats/` — lifting `first_staged_ts` to the scan's start
+   when rows remain and the scan was complete, the `sched_age/` entry
+   re-keyed with it (section 3) — and drops the `prepared/` entry, and
+   BEFORE committing compares the
    deleted count with the rows the commit published — the scanned count
    here, the entry's persisted `row_count` on every recovery settle
    (section 6), never a recount. On a mismatch it raises
@@ -1001,7 +1022,7 @@ default.
 | `MILLRACE_EVENT_TIME_POLICY` | `drop` | `drop` \| `clamp` | Flush-time junk `event_time` handling |
 | `MILLRACE_EVENT_TIME_MAX_PAST_S` | 2592000 (30 d) | positive | Junk window lower bound |
 | `MILLRACE_EVENT_TIME_MAX_FUTURE_S` | 86400 (1 d) | positive | Junk window upper bound |
-| `MILLRACE_FLUSH_SWEEP_S` | 5 | positive | Pause between flush sweeps |
+| `MILLRACE_FLUSH_SWEEP_S` | 5 | `first_staged_ts` is never advanced by arrivals; a settle that leaves rows lifts it to the settled scan's start when that scan was complete (never lowering it, never past `last_staged_ts`, `sched_age/` re-keyed), keeps it after a capped scan, and deletes it on a drain; it always bounds the oldest remaining row's staging time from below; a recovery settle lifts by the persisted scan start; a steady group flushes once per deadline, not per sweep. | `test_stage.py::test_first_staged_ts_is_set_once`, `test_stage.py::test_first_staged_ts_survives_a_partial_flush`, `test_stage.py::test_a_settle_lifts_first_staged_ts_to_the_scan_start`, `test_stage.py::test_the_lift_never_lowers_and_never_passes_last_staged_ts`, `test_stage.py::test_first_staged_ts_bounds_the_oldest_remaining_row`, `test_flush.py::test_the_settle_lifts_first_staged_ts_to_the_scan_start`, `test_flush.py::test_a_recovery_settle_lifts_by_the_persisted_scan_start`, `test_flush.py::test_a_capped_scan_does_not_lift_first_staged_ts`, `test_flush.py::test_a_steady_group_flushes_once_per_deadline_not_per_sweep`, `test_keyspace.py::test_prepared_scanned_at_round_trips_at_its_bounds` |
 | `MILLRACE_FLUSH_SCAN_MIN_BYTES` | 67108864 (64 MiB) | positive | Floor of the per-decision byte scan budget |
 | `MILLRACE_FLUSH_SCAN_MAX_ROWS` | 8000000 | positive | Per-decision row scan budget |
 | `MILLRACE_COMPRESSION_RATIO_HALFLIFE` | 20 | positive | EWMA halflife, in completed flushes |
@@ -1047,7 +1068,7 @@ feeds control flow.
 | `millrace_staged_groups` | gauge | — | Groups (partition tuples) holding staged rows, summed over the pod's partitions (a tuple staged on two partitions counts twice) |
 | `millrace_partition_staged_bytes` | gauge | `topic`, `partition` | Staged bytes per assigned partition |
 | `millrace_partition_oldest_staged_age_seconds` | gauge | `topic`, `partition` | Age of the oldest `first_staged_ts` in the partition; absent if empty. Forensic, not the alert input. |
-| `millrace_oldest_eligible_staged_age_seconds` | gauge | — | Age of the oldest key the planner found eligible at the last sweep; absent when nothing is eligible or the sweep is not publishing |
+| `millrace_oldest_eligible_staged_age_seconds` | gauge | — | Age of the oldest key the planner found eligible at the last sweep (`now − first_staged_ts`, i.e. the age of that group's oldest staged row to within one sweep); absent when nothing is eligible or the sweep is not publishing. On a healthy pipeline it stays near `MILLRACE_FLUSH_DEADLINE_S` (a group becomes eligible at the deadline and its settle resets the age); sustained growth past it is real backlog |
 
 Staging gauges come from the flush sweep's own `stats/` scan, served
 while younger than `2 × MILLRACE_FLUSH_SWEEP_S`; past that the scrape
@@ -1148,8 +1169,9 @@ cooperative for deployments without a barrier.
   ratio in the all-catch-up worst case; steady-state scans are the size
   of the group's staged slice.
 - Benches: ~7.3K msg/s per partition sustained with zero write stalls
-  (`tests/test_stage_bench.py`, README); 1024 ready keys at 72 keys/s
-  serial and 286 keys/s at concurrency 4 on in-memory stages against
+  (`tests/test_stage_bench.py`, README); 1024 ready keys at 74 keys/s
+  serial and 301 keys/s at concurrency 4 (2026-10-13, receipt lookup
+  included) on in-memory stages against
   the ~110 keys/s the design arithmetic requires
   (`tests/test_flush_bench.py`, design doc).
 - Content digest per decision: SHA-256 over at most the scan budget

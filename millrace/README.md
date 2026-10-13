@@ -90,6 +90,19 @@ incarnation halt, and a compaction observation. Code-level map:
   report, wired into CI as the `live-millrace` job of the reusable
   `python-live.yml` workflow
 
+The live soak (`tests/live/test_live_soak.py`) is deselected unless
+`MILLRACE_SOAK_S` names a duration in seconds, so the CI suite never
+runs it. It drives two `millrace.main` children (the flat `events` table
+and the nested table, one topic each, ~200 events/s per topic with ~1 %
+malformed records), `kill -9`s and restarts one halfway, and checks
+completeness by `seq`, exact drop accounting across the kill, drain,
+probes and the oldest-eligible age. Run it alone through the harness,
+which passes `MILLRACE_LIVE_PYTEST_ARGS` to pytest:
+`MILLRACE_SOAK_S=1800 MILLRACE_LIVE_PYTEST_ARGS="-k soak -s" just millrace live`.
+It writes `soak-metrics.csv` (a `/metrics` + RSS + probe row per child
+every 15 s), `soak-warnings.log` and `soak-summary.md` to the report dir
+(`$HOGLAKE_LIVE_MILLRACE_REPORT_DIR`, default `.artifacts/live-millrace/`).
+
 ## Staging format
 
 The staging keyspace shares no key or value shape with the #331-era
@@ -209,7 +222,9 @@ partition count (tens), never by partition tuples. The staged gauges —
 (partition tuples holding staged rows),
 `millrace_oldest_eligible_staged_age_seconds` (the oldest key that is
 eligible under ANY flush lane, so pathological slow-lane tenants don't
-trip it) — plus SlateDB's own stall series are alert inputs; nothing in
+trip it; a settle that leaves rows lifts the group's `first_staged_ts`
+to the settled scan's start, so on a healthy pipeline the gauge stays
+near the flush deadline and growth past it is real backlog) — plus SlateDB's own stall series are alert inputs; nothing in
 the consume loop reads them.
 
 The maintenance service (`python -m millrace.maintenance`) does GC plus
