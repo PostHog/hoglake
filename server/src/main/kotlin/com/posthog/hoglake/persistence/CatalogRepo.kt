@@ -91,6 +91,17 @@ object CatalogRepo {
             .findOne()
             .orElse(null)
 
+    /** Serialize option validation and updates on the single catalog row. */
+    fun requireForUpdate(
+        handle: Handle,
+        name: String,
+    ): CatalogInfo =
+        handle.createQuery("SELECT $CATALOG_COLUMNS FROM hog_catalog WHERE name = :name FOR UPDATE")
+            .bind("name", name)
+            .map(catalogMapper)
+            .findOne()
+            .orElseThrow { HoglakeException.NotFound("catalog '$name'") }
+
     /** [findByName] or [HoglakeException.NotFound]. */
     fun require(
         handle: Handle,

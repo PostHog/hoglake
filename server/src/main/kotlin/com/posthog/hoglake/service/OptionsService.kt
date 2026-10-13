@@ -53,11 +53,15 @@ class OptionsService(private val jdbi: Jdbi) {
         catalog: String,
         snapshotRetentionSeconds: PatchField<Long>,
         consumerFloor: Boolean?,
+        author: String? = null,
+        message: String? = null,
     ): CatalogOptions =
         Audit.audited(
             "options_patch",
             catalog,
             null,
+            actor = { author },
+            message = { message },
             detail = { opts ->
                 "snapshot_retention_seconds=${opts.snapshotRetentionSeconds} " +
                     "consumer_floor=${opts.consumerFloor}"
@@ -73,8 +77,13 @@ class OptionsService(private val jdbi: Jdbi) {
                 }
             }
             jdbi.inTransactionUnchecked { h ->
-                val cat = CatalogRepo.require(h, catalog)
+                val cat = CatalogRepo.requireForUpdate(h, catalog)
                 if (snapshotRetentionSeconds is PatchField.Set) {
+                    val next = snapshotRetentionSeconds.value
+                    val current = cat.snapshotRetentionSeconds
+                    if (next != null && (current == null || next < current)) {
+                        requireOperationMetadata(author, message)
+                    }
                     h.createUpdate(
                         """
                     UPDATE hog_catalog SET snapshot_retention_seconds = :v

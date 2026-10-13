@@ -59,7 +59,7 @@ class ViewServiceIntegrationTest {
         assertThat(views.list(cat, "life").first().dialect).isEqualTo("duckdb")
 
         // drop produces a snapshot and removes it from head reads.
-        val drop = views.drop(cat, "life", "daily")
+        val drop = views.drop(cat, "life", "daily", author = "integration-test", message = "drop view fixture")
         assertThat(drop.snapshotId).isEqualTo(catalogs.getCatalog(cat).headSnapshotId)
         assertThat(views.list(cat, "life").map { it.name }).containsExactly("a-first")
         assertThatThrownBy { views.get(cat, "life", "daily") }
@@ -86,7 +86,7 @@ class ViewServiceIntegrationTest {
         assertThatThrownBy { views.create(cat, "dup", "v", "SELECT 2") }
             .isInstanceOf(HoglakeException.AlreadyExists::class.java)
 
-        views.drop(cat, "dup", "v")
+        views.drop(cat, "dup", "v", author = "integration-test", message = "drop view fixture")
         val second = views.create(cat, "dup", "v", "SELECT 2")
         assertThat(second.viewUuid).isNotEqualTo(first.viewUuid)
         assertThat(second.viewId).isNotEqualTo(first.viewId)
@@ -117,7 +117,15 @@ class ViewServiceIntegrationTest {
             .isInstanceOf(HoglakeException.NotFound::class.java)
         assertThatThrownBy { views.get(cat, "bad", "ghost") }
             .isInstanceOf(HoglakeException.NotFound::class.java)
-        assertThatThrownBy { views.drop(cat, "bad", "ghost") }
+        assertThatThrownBy {
+            views.drop(
+                cat,
+                "bad",
+                "ghost",
+                author = "integration-test",
+                message = "drop view fixture",
+            )
+        }
             .isInstanceOf(HoglakeException.NotFound::class.java)
 
         // A failed create leaves no snapshot behind (validation precedes

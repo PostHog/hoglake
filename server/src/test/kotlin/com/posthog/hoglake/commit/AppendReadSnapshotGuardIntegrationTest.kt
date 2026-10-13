@@ -166,7 +166,7 @@ class AppendReadSnapshotGuardIntegrationTest {
         val cat = fixture()
         catalogs.createTable(cat, "ns", "other", listOf(ColumnDef("id", ColType.LONG)))
         val readSnapshot = head(cat)
-        catalogs.dropTable(cat, "ns", "other")
+        catalogs.dropTable(cat, "ns", "other", author = "integration-test", message = "drop table fixture")
         assertThatThrownBy {
             commits.commit(
                 cat,
@@ -300,7 +300,7 @@ class AppendReadSnapshotGuardIntegrationTest {
     fun `a drop and recreate under the same name is table_recreated, not a retryable conflict`() {
         val cat = fixture()
         val original = catalogs.getTable(cat, "ns", "t").tableUuid
-        catalogs.dropTable(cat, "ns", "t")
+        catalogs.dropTable(cat, "ns", "t", author = "integration-test", message = "drop table fixture")
         catalogs.createTable(cat, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
         val recreated = catalogs.getTable(cat, "ns", "t").tableUuid
         assertThat(recreated).isNotEqualTo(original)

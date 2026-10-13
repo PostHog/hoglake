@@ -601,9 +601,11 @@ def test_a_drop_clears_the_cache(table, httpx_mock):
     # The table is gone, so a prepare against the cache could only be
     # refused by the incarnation guard.
     httpx_mock.add_response(
-        method="DELETE", url=TABLE_URL, json={"snapshot_id": 99, "schema_version": 3}
+        method="DELETE",
+        url=(TABLE_URL + "?author=pyhoglake-tests&message=drop+test+fixture"),
+        json={"snapshot_id": 99, "schema_version": 3},
     )
-    table.drop()
+    table.drop(author="pyhoglake-tests", message="drop test fixture")
     assert table._cache is None
 
 

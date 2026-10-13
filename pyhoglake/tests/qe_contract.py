@@ -269,12 +269,18 @@ def test_op_drop_table(client, httpx_mock):
     t = _table(client, httpx_mock)
     httpx_mock.add_response(
         method="DELETE",
-        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events",
+        url=(
+            f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events"
+            + "?author=pyhoglake-tests&message=drop+test+fixture"
+        ),
         json=COMMIT_WIRE,
     )
-    t.drop()
+    t.drop(author="pyhoglake-tests", message="drop test fixture")
     _assert_wire(
-        _last(httpx_mock), "DELETE", "/v1/catalogs/cat/namespaces/ns1/tables/events"
+        _last(httpx_mock),
+        "DELETE",
+        "/v1/catalogs/cat/namespaces/ns1/tables/events",
+        params={"author": "pyhoglake-tests", "message": "drop test fixture"},
     )
 
 
@@ -498,11 +504,19 @@ def test_op_get_and_drop_view(client, httpx_mock):
     _assert_wire(_last(httpx_mock), "GET", "/v1/catalogs/cat/namespaces/ns1/views/v")
     httpx_mock.add_response(
         method="DELETE",
-        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/views/v",
+        url=(
+            f"{BASE}/v1/catalogs/cat/namespaces/ns1/views/v"
+            + "?author=pyhoglake-tests&message=drop+test+fixture"
+        ),
         json={"snapshot_id": 3},
     )
-    v.drop()
-    _assert_wire(_last(httpx_mock), "DELETE", "/v1/catalogs/cat/namespaces/ns1/views/v")
+    v.drop(author="pyhoglake-tests", message="drop test fixture")
+    _assert_wire(
+        _last(httpx_mock),
+        "DELETE",
+        "/v1/catalogs/cat/namespaces/ns1/views/v",
+        params={"author": "pyhoglake-tests", "message": "drop test fixture"},
+    )
 
 
 def test_op_list_snapshots_params(client, httpx_mock):
@@ -700,11 +714,16 @@ def _err_cases():
                 lambda t: (
                     m.add_response(
                         method="DELETE",
-                        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events",
+                        url=(
+                            f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events"
+                            + "?author=pyhoglake-tests&message=drop+test+fixture"
+                        ),
                         json=ERR,
                         status_code=404,
                     ),
-                    t.drop,
+                    lambda: t.drop(
+                        author="pyhoglake-tests", message="drop test fixture"
+                    ),
                 )[1]
             )(_table(c, m)),
             NotFoundError,

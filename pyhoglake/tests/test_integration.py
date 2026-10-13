@@ -649,7 +649,7 @@ def test_views(catalog, ns):
         ns.create_view("v_events", "SELECT 1")
 
     assert "v_events" in [x.name for x in ns.list_views()]
-    res = got.drop()
+    res = got.drop(author="pyhoglake-tests", message="drop test fixture")
     assert res.snapshot_id > 0
     with pytest.raises(NotFoundError):
         ns.view("v_events")
@@ -663,7 +663,7 @@ def test_expire_and_cleanup(client):
     table.append(_events_data(3))
     table.append(_events_data(3, start=3))
 
-    opts = cat.set_retention(1)
+    opts = cat.set_retention(1, author="pyhoglake-tests", message="exercise expiry")
     assert opts.snapshot_retention_seconds == 1
     earliest_before = opts.earliest_snapshot_id
 
@@ -849,7 +849,7 @@ def test_partitioned_compaction_groups_within_partition(catalog, ns):
 def test_drop_table(catalog, ns):
     table = ns.create_table("droppable", _events_schema())
     assert "droppable" in [t.name for t in ns.list_tables()]
-    res = table.drop()
+    res = table.drop(author="pyhoglake-tests", message="drop test fixture")
     assert res.snapshot_id > 0
     assert "droppable" not in [t.name for t in ns.list_tables()]
     with pytest.raises(NotFoundError):

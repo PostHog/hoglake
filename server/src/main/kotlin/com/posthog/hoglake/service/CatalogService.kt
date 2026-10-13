@@ -76,8 +76,17 @@ class CatalogService(private val jdbi: Jdbi) {
     fun createCatalog(
         name: String,
         dataPath: String,
+        author: String? = null,
+        message: String? = null,
     ): CatalogInfo =
-        Audit.audited("catalog_create", name, null, detail = { "data_path=$dataPath" }) {
+        Audit.audited(
+            "catalog_create",
+            name,
+            null,
+            detail = { "data_path=$dataPath" },
+            actor = { author },
+            message = { message },
+        ) {
             validateDataPath(dataPath)
             jdbi.inTransactionUnchecked { h ->
                 // data_path prefix-overlap with ANY existing catalog is
@@ -108,7 +117,7 @@ class CatalogService(private val jdbi: Jdbi) {
                 }
                 val info = CatalogRepo.insert(h, name, dataPath)
                 // Snapshot 0: the empty catalog at schema_version 0, no changes.
-                SnapshotRepo.insert(h, info.catalogId, 0, 0)
+                SnapshotRepo.insert(h, info.catalogId, 0, 0, author, message)
                 info
             }
         }
@@ -172,11 +181,15 @@ class CatalogService(private val jdbi: Jdbi) {
     fun createNamespace(
         catalog: String,
         name: String,
+        author: String? = null,
+        message: String? = null,
     ): NamespaceInfo =
         Audit.audited(
             "namespace_create",
             catalog,
             name,
+            actor = { author },
+            message = { message },
         ) {
             Identifiers.validate("namespace", name)
             jdbi.inTransactionUnchecked { h ->
@@ -186,7 +199,7 @@ class CatalogService(private val jdbi: Jdbi) {
                     throw HoglakeException.AlreadyExists("namespace '$name' already exists")
                 }
                 val alloc = CatalogRepo.allocateSnapshot(h, cat.catalogId)
-                SnapshotRepo.insert(h, cat.catalogId, alloc.snapshotId, alloc.schemaVersion)
+                SnapshotRepo.insert(h, cat.catalogId, alloc.snapshotId, alloc.schemaVersion, author, message)
                 val namespaceId = CatalogRepo.allocateNamespaceId(h, cat.catalogId)
                 SnapshotRepo.insertChange(
                     h,
@@ -235,13 +248,18 @@ class CatalogService(private val jdbi: Jdbi) {
         catalog: String,
         namespace: String,
         expectedNamespaceId: Long? = null,
+        author: String? = null,
+        message: String? = null,
     ): CommitResult =
         Audit.audited(
             "namespace_drop",
             catalog,
             namespace,
             detail = { "snapshot=${it.snapshotId}" },
+            actor = { author },
+            message = { message },
         ) {
+            requireOperationMetadata(author, message)
             jdbi.inTransactionUnchecked { h ->
                 val cat = requireCatalog(h, catalog)
                 Locks.acquireCatalogCommitLock(h, cat.catalogId)
@@ -266,7 +284,7 @@ class CatalogService(private val jdbi: Jdbi) {
                     )
                 }
                 val alloc = CatalogRepo.allocateSnapshot(h, cat.catalogId)
-                SnapshotRepo.insert(h, cat.catalogId, alloc.snapshotId, alloc.schemaVersion)
+                SnapshotRepo.insert(h, cat.catalogId, alloc.snapshotId, alloc.schemaVersion, author, message)
                 SnapshotRepo.insertChange(
                     h,
                     cat.catalogId,
@@ -286,14 +304,20 @@ class CatalogService(private val jdbi: Jdbi) {
         namespace: String,
         name: String,
         columns: List<ColumnDef>,
+        author: String? = null,
+        message: String? = null,
     ): TableInfo =
         Audit.audited(
             "table_create",
             catalog,
             "$namespace.$name",
             detail = { "columns=${columns.size}" },
+            actor = { author },
+            message = { message },
         ) {
-            jdbi.inTransactionUnchecked { h -> createTable(h, catalog, namespace, name, columns) }
+            jdbi.inTransactionUnchecked { h ->
+                createTable(h, catalog, namespace, name, columns, author = author, message = message)
+            }
         }
 
     /** Caller may compose creation with file registration in the same transaction. */
@@ -309,7 +333,10 @@ class CatalogService(private val jdbi: Jdbi) {
         sortFields: List<SortFieldDef> = emptyList(),
         comment: String? = null,
         properties: Map<String, String> = emptyMap(),
+        author: String? = null,
+        message: String? = null,
     ): TableInfo {
+        if (replacementTableId != null) requireOperationMetadata(author, message)
         TableMetadata.validateComment(comment)
         TableMetadata.validateProperties(properties)
         validateTableDefinition(name, columns)
@@ -327,7 +354,7 @@ class CatalogService(private val jdbi: Jdbi) {
             )
         }
         val alloc = CatalogRepo.allocateSnapshot(h, cat.catalogId)
-        SnapshotRepo.insert(h, cat.catalogId, alloc.snapshotId, alloc.schemaVersion)
+        SnapshotRepo.insert(h, cat.catalogId, alloc.snapshotId, alloc.schemaVersion, author, message)
         if (replacementTableId != null) {
             SnapshotRepo.insertChange(h, cat.catalogId, alloc.snapshotId, ChangeKind.TABLE_DROPPED, replacementTableId)
             // The retired incarnation is dropped the same way DROP TABLE
@@ -427,13 +454,18 @@ class CatalogService(private val jdbi: Jdbi) {
         namespace: String,
         table: String,
         expectedTableUuid: UUID? = null,
+        author: String? = null,
+        message: String? = null,
     ): CommitResult =
         Audit.audited(
             "table_drop",
             catalog,
             "$namespace.$table",
             detail = { "snapshot=${it.snapshotId}" },
+            actor = { author },
+            message = { message },
         ) {
+            requireOperationMetadata(author, message)
             jdbi.inTransactionUnchecked { h ->
                 val cat = requireCatalog(h, catalog)
                 Locks.acquireCatalogCommitLock(h, cat.catalogId)
@@ -451,7 +483,7 @@ class CatalogService(private val jdbi: Jdbi) {
                     )
                 }
                 val alloc = CatalogRepo.allocateSnapshot(h, cat.catalogId)
-                SnapshotRepo.insert(h, cat.catalogId, alloc.snapshotId, alloc.schemaVersion)
+                SnapshotRepo.insert(h, cat.catalogId, alloc.snapshotId, alloc.schemaVersion, author, message)
                 SnapshotRepo.insertChange(
                     h,
                     cat.catalogId,
@@ -489,8 +521,18 @@ class CatalogService(private val jdbi: Jdbi) {
         namespace: String,
         table: String,
         expectedTableUuid: UUID,
+        author: String? = null,
+        message: String? = null,
     ): CommitResult =
-        Audit.audited("table_truncate", catalog, "$namespace.$table", detail = { "snapshot=${it.snapshotId}" }) {
+        Audit.audited(
+            "table_truncate",
+            catalog,
+            "$namespace.$table",
+            detail = { "snapshot=${it.snapshotId}" },
+            actor = { author },
+            message = { message },
+        ) {
+            requireOperationMetadata(author, message)
             jdbi.inTransactionUnchecked { h ->
                 val cat = requireCatalog(h, catalog)
                 Locks.acquireCatalogCommitLock(h, cat.catalogId)
@@ -508,7 +550,7 @@ class CatalogService(private val jdbi: Jdbi) {
                     )
                 }
                 val alloc = CatalogRepo.allocateSnapshot(h, cat.catalogId)
-                SnapshotRepo.insert(h, cat.catalogId, alloc.snapshotId, alloc.schemaVersion)
+                SnapshotRepo.insert(h, cat.catalogId, alloc.snapshotId, alloc.schemaVersion, author, message)
                 // Reuse the DDL conflict barrier, without changing the table's versioned metadata.
                 SnapshotRepo.insertChange(h, cat.catalogId, alloc.snapshotId, ChangeKind.TABLE_ALTERED, t.tableId)
                 SnapshotRepo.insertChange(h, cat.catalogId, alloc.snapshotId, ChangeKind.TABLE_DELETED_FROM, t.tableId)

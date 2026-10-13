@@ -360,7 +360,10 @@ class ApiIntegrationTest {
                 """{"name": "t", "columns": [{"name": "id", "type": "long"}]}""",
             ) // snapshot 2
 
-            val dropped = client.delete("/v1/catalogs/tt/namespaces/ns/tables/t")
+            val dropped =
+                client.delete(
+                    "/v1/catalogs/tt/namespaces/ns/tables/t?author=integration-test&message=drop-fixture",
+                )
             assertThat(dropped.status).isEqualTo(HttpStatusCode.OK)
             body(dropped).let { r ->
                 assertThat(r["snapshot_id"].asLong()).isEqualTo(3)
@@ -402,15 +405,20 @@ class ApiIntegrationTest {
                 """{"name": "t", "columns": [{"name": "id", "type": "long"}]}""",
             ) // snapshot 2
             assertApiError(
-                client.delete("/v1/catalogs/nsdrop/namespaces/doomed"),
+                client.delete("/v1/catalogs/nsdrop/namespaces/doomed?author=integration-test&message=drop-fixture"),
                 HttpStatusCode.Conflict,
                 "namespace_not_empty",
             )
 
             // Emptiness follows the table: once the table is gone, the
             // namespace drops and returns the snapshot that recorded it.
-            client.delete("/v1/catalogs/nsdrop/namespaces/doomed/tables/t") // snapshot 3
-            val dropped = client.delete("/v1/catalogs/nsdrop/namespaces/doomed") // snapshot 4
+            client.delete(
+                "/v1/catalogs/nsdrop/namespaces/doomed/tables/t?author=integration-test&message=drop-fixture",
+            ) // snapshot 3
+            val dropped =
+                client.delete(
+                    "/v1/catalogs/nsdrop/namespaces/doomed?author=integration-test&message=drop-fixture",
+                ) // snapshot 4
             assertThat(dropped.status).isEqualTo(HttpStatusCode.OK)
             body(dropped).let { r ->
                 assertThat(r["snapshot_id"].asLong()).isEqualTo(4)
@@ -426,7 +434,7 @@ class ApiIntegrationTest {
             assertThat(body(client.get("/v1/catalogs/nsdrop/namespaces"))).isEmpty()
             // Re-drop is a 404, not a silent success.
             assertApiError(
-                client.delete("/v1/catalogs/nsdrop/namespaces/doomed"),
+                client.delete("/v1/catalogs/nsdrop/namespaces/doomed?author=integration-test&message=drop-fixture"),
                 HttpStatusCode.NotFound,
                 "not_found",
             )
@@ -436,13 +444,16 @@ class ApiIntegrationTest {
             client.postJson("/v1/catalogs/nsdrop/namespaces", """{"name": "doomed"}""") // snapshot 5
             assertThat(body(client.get("/v1/catalogs/nsdrop/namespaces")).map { it["name"].asText() })
                 .containsExactly("doomed")
-            val redropped = client.delete("/v1/catalogs/nsdrop/namespaces/doomed")
+            val redropped =
+                client.delete(
+                    "/v1/catalogs/nsdrop/namespaces/doomed?author=integration-test&message=drop-fixture",
+                )
             assertThat(redropped.status).isEqualTo(HttpStatusCode.OK)
             assertThat(body(redropped)["snapshot_id"].asLong()).isEqualTo(6)
 
             // Dropping a namespace that never existed is a 404.
             assertApiError(
-                client.delete("/v1/catalogs/nsdrop/namespaces/neverthere"),
+                client.delete("/v1/catalogs/nsdrop/namespaces/neverthere?author=integration-test&message=drop-fixture"),
                 HttpStatusCode.NotFound,
                 "not_found",
             )
@@ -462,9 +473,9 @@ class ApiIntegrationTest {
                 """{"name": "v", "dialect": "duckdb", "sql": "SELECT 1"}""",
             )
             // The view alone (even with the table dropped) blocks the drop.
-            client.delete("/v1/catalogs/nsdropv/namespaces/ns/tables/t")
+            client.delete("/v1/catalogs/nsdropv/namespaces/ns/tables/t?author=integration-test&message=drop-fixture")
             assertApiError(
-                client.delete("/v1/catalogs/nsdropv/namespaces/ns"),
+                client.delete("/v1/catalogs/nsdropv/namespaces/ns?author=integration-test&message=drop-fixture"),
                 HttpStatusCode.Conflict,
                 "namespace_not_empty",
             )
@@ -478,7 +489,10 @@ class ApiIntegrationTest {
             client.postJson("/v1/catalogs/nsdrophead/namespaces", """{"name": "a"}""") // snapshot 1
             assertThat(body(client.get("/v1/catalogs/nsdrophead"))["head_snapshot_id"].asLong()).isEqualTo(1)
 
-            val dropped = client.delete("/v1/catalogs/nsdrophead/namespaces/a") // snapshot 2
+            val dropped =
+                client.delete(
+                    "/v1/catalogs/nsdrophead/namespaces/a?author=integration-test&message=drop-fixture",
+                ) // snapshot 2
             assertThat(dropped.status).isEqualTo(HttpStatusCode.OK)
             body(dropped).let { r ->
                 assertThat(r["snapshot_id"].asLong()).isEqualTo(2)
@@ -504,9 +518,14 @@ class ApiIntegrationTest {
                 "/v1/catalogs/nsdroporph/namespaces/ns2/tables",
                 """{"name": "t2", "columns": [{"name": "id", "type": "long"}]}""",
             )
-            client.delete("/v1/catalogs/nsdroporph/namespaces/ns1/tables/t1")
+            client.delete(
+                "/v1/catalogs/nsdroporph/namespaces/ns1/tables/t1?author=integration-test&message=drop-fixture",
+            )
 
-            val dropped = client.delete("/v1/catalogs/nsdroporph/namespaces/ns1")
+            val dropped =
+                client.delete(
+                    "/v1/catalogs/nsdroporph/namespaces/ns1?author=integration-test&message=drop-fixture",
+                )
             assertThat(dropped.status).isEqualTo(HttpStatusCode.OK)
 
             // Only ns2 survives; its table is still readable.
@@ -522,7 +541,7 @@ class ApiIntegrationTest {
         api { client ->
             client.postJson("/v1/catalogs", """{"name": "nsdropinc", "data_path": "s3://hog/nsdropinc"}""")
             client.postJson("/v1/catalogs/nsdropinc/namespaces", """{"name": "ns"}""") // incarnation 1
-            client.delete("/v1/catalogs/nsdropinc/namespaces/ns")
+            client.delete("/v1/catalogs/nsdropinc/namespaces/ns?author=integration-test&message=drop-fixture")
             client.postJson("/v1/catalogs/nsdropinc/namespaces", """{"name": "ns"}""") // incarnation 2
 
             // A table created now lives in the NEW incarnation and is readable.
@@ -537,15 +556,18 @@ class ApiIntegrationTest {
             // The table pins incarnation 2 the same as any other: a drop with
             // a live table is still a 409.
             assertApiError(
-                client.delete("/v1/catalogs/nsdropinc/namespaces/ns"),
+                client.delete("/v1/catalogs/nsdropinc/namespaces/ns?author=integration-test&message=drop-fixture"),
                 HttpStatusCode.Conflict,
                 "namespace_not_empty",
             )
 
             // Once the table is gone the new incarnation drops cleanly — the
             // dropped flag did not leak across from incarnation 1.
-            client.delete("/v1/catalogs/nsdropinc/namespaces/ns/tables/t")
-            val redropped = client.delete("/v1/catalogs/nsdropinc/namespaces/ns")
+            client.delete("/v1/catalogs/nsdropinc/namespaces/ns/tables/t?author=integration-test&message=drop-fixture")
+            val redropped =
+                client.delete(
+                    "/v1/catalogs/nsdropinc/namespaces/ns?author=integration-test&message=drop-fixture",
+                )
             assertThat(redropped.status).isEqualTo(HttpStatusCode.OK)
             assertApiError(
                 client.get("/v1/catalogs/nsdropinc/namespaces/ns"),
@@ -742,7 +764,7 @@ class ApiIntegrationTest {
                 "not_found",
             )
             assertApiError(
-                client.delete("/v1/catalogs/nf/namespaces/nope/tables/t"),
+                client.delete("/v1/catalogs/nf/namespaces/nope/tables/t?author=integration-test&message=drop-fixture"),
                 HttpStatusCode.NotFound,
                 "not_found",
             )

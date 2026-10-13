@@ -74,15 +74,40 @@ class TableLifecycleRoutesIntegrationTest {
                     h.execute("UPDATE hog_catalog SET earliest_snapshot_id = ? WHERE name = ?", floor, "schema-guards")
                 }
                 assertThat(alteration("$snapshot", drop).status).isEqualTo(HttpStatusCode.Gone)
-                catalogs.dropTable("schema-guards", "ns", "t")
-                catalogs.dropNamespace("schema-guards", "ns")
+                catalogs.dropTable(
+                    "schema-guards",
+                    "ns",
+                    "t",
+                    author = "integration-test",
+                    message = "drop table fixture",
+                )
+                catalogs.dropNamespace(
+                    "schema-guards",
+                    "ns",
+                    author = "integration-test",
+                    message = "drop namespace fixture",
+                )
                 val replacement = catalogs.createNamespace("schema-guards", "ns")
-                assertThat(client.delete("$base/namespaces/ns?expected_namespace_id=bad").status)
+                assertThat(
+                    client.delete(
+                        "$base/namespaces/ns?expected_namespace_id=bad&author=integration-test&message=drop-fixture",
+                    ).status,
+                )
                     .isEqualTo(HttpStatusCode.BadRequest)
-                assertThat(client.delete("$base/namespaces/ns?expected_namespace_id=${namespace.namespaceId}").status)
+                assertThat(
+                    client.delete(
+                        "$base/namespaces/ns?expected_namespace_id=${namespace.namespaceId}" +
+                            "&author=integration-test&message=drop-fixture",
+                    ).status,
+                )
                     .isEqualTo(HttpStatusCode.Conflict)
                 assertThat(catalogs.getNamespace("schema-guards", "ns")).isEqualTo(replacement)
-                assertThat(client.delete("$base/namespaces/ns?expected_namespace_id=${replacement.namespaceId}").status)
+                assertThat(
+                    client.delete(
+                        "$base/namespaces/ns?expected_namespace_id=${replacement.namespaceId}" +
+                            "&author=integration-test&message=drop-fixture",
+                    ).status,
+                )
                     .isEqualTo(HttpStatusCode.OK)
             }
         }
@@ -109,10 +134,21 @@ class TableLifecycleRoutesIntegrationTest {
                 assertThat(client.post("$path/truncate").status).isEqualTo(HttpStatusCode.BadRequest)
                 assertThat(client.post("$path/truncate?expected_table_uuid=invalid").status)
                     .isEqualTo(HttpStatusCode.BadRequest)
-                assertThat(client.delete("$path?expected_table_uuid=invalid").status)
+                assertThat(
+                    client.delete(
+                        "$path?expected_table_uuid=invalid&author=integration-test&message=drop-fixture",
+                    ).status,
+                )
                     .isEqualTo(HttpStatusCode.BadRequest)
-                assertThat(client.post("$path/truncate$stale").status).isEqualTo(HttpStatusCode.Conflict)
-                assertThat(client.delete("$path$stale").status).isEqualTo(HttpStatusCode.Conflict)
+                assertThat(
+                    client.post("$path/truncate$stale") {
+                        contentType(ContentType.Application.Json)
+                        setBody("""{"author":"integration-test","message":"truncate table fixture"}""")
+                    }.status,
+                ).isEqualTo(HttpStatusCode.Conflict)
+                assertThat(
+                    client.delete("$path$stale&author=integration-test&message=drop-fixture").status,
+                ).isEqualTo(HttpStatusCode.Conflict)
                 val rename = """{"ops":[{"op":"rename_table","new_name":"renamed"}]}"""
                 assertThat(
                     client.post("$path/alter$stale") {
@@ -121,7 +157,12 @@ class TableLifecycleRoutesIntegrationTest {
                     }.status,
                 ).isEqualTo(HttpStatusCode.Conflict)
                 val before = catalogs.getCatalog("wire-lifecycle").headSnapshotId
-                assertThat(client.post("$path/truncate$expected").status).isEqualTo(HttpStatusCode.OK)
+                assertThat(
+                    client.post("$path/truncate$expected") {
+                        contentType(ContentType.Application.Json)
+                        setBody("""{"author":"integration-test","message":"truncate table fixture"}""")
+                    }.status,
+                ).isEqualTo(HttpStatusCode.OK)
                 val changes = client.get("$path/changes?from_snapshot=$before")
                 assertThat(changes.status).isEqualTo(HttpStatusCode.Conflict)
                 assertThat(changes.bodyAsText()).contains("reconciliation_required", "Reconcile")
@@ -131,7 +172,11 @@ class TableLifecycleRoutesIntegrationTest {
                         setBody(rename)
                     }.status,
                 ).isEqualTo(HttpStatusCode.OK)
-                assertThat(client.delete("$base/namespaces/ns/tables/renamed$expected").status)
+                assertThat(
+                    client.delete(
+                        "$base/namespaces/ns/tables/renamed$expected&author=integration-test&message=drop-fixture",
+                    ).status,
+                )
                     .isEqualTo(HttpStatusCode.OK)
             }
         }

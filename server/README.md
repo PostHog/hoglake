@@ -73,6 +73,21 @@ author/message, and a set of **typed change rows**
 simultaneously the commit history humans read and the machine
 vocabulary conflict detection joins against.
 
+DDL accepts caller-supplied `author` and `message`, stored verbatim on its snapshot.
+Create and alter keep them optional. Table, namespace and view drops, truncate,
+and atomic replacement of an existing table require both to be nonblank; a missing
+or blank field returns 422 naming it before mutation. DELETE routes take query
+parameters; truncate takes a JSON body and retains its mandatory UUID guard.
+Retention reductions also require both, including enabling finite retention from
+unlimited retention. Options patches are audited without creating a snapshot.
+Audit `actor` matches the author and `operation_message` carries the reason;
+these fields describe caller attribution, not an authenticated identity.
+Blank includes Unicode space characters and NEXT LINE (U+0085), matching Python.
+Atomic definitions carrying attribution use durable format v7; older servers
+cannot read those receipts. Complete the server rollout before preparing attributed
+atomic operations, and account for those receipts before downgrading.
+
+
 **Versioned rows give time travel.** Mutable metadata (table
 name/namespace, columns, partition specs, data files, deletion vectors,
 views) is stored as rows with `[begin_snapshot, end_snapshot)` validity.

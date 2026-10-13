@@ -103,7 +103,15 @@ class TableLifecycleIntegrationTest {
         val before = catalogs.tableWithExactTotals(cat, "ns", "t")
         val beforeFiles = catalogs.listFiles(cat, "ns", "t")
         val beforeSnapshot = catalogs.getCatalog(cat).headSnapshotId
-        val result = catalogs.truncateTable(cat, "ns", "t", before.tableUuid)
+        val result =
+            catalogs.truncateTable(
+                cat,
+                "ns",
+                "t",
+                before.tableUuid,
+                author = "integration-test",
+                message = "truncate table fixture",
+            )
         // `readSnapshotId` is the one field that legitimately differs
         // between two head reads taken either side of a commit — it is
         // the snapshot the read resolved at, and the truncate moved head
@@ -159,16 +167,37 @@ class TableLifecycleIntegrationTest {
         catalogs.createTable(cat, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
         val replacement = catalogs.tableWithExactTotals(cat, "ns", "t")
         assertThatThrownBy {
-            catalogs.dropTable(cat, "ns", "t", original.tableUuid)
+            catalogs.dropTable(
+                cat,
+                "ns",
+                "t",
+                original.tableUuid,
+                author = "integration-test",
+                message = "drop table fixture",
+            )
         }.isInstanceOf(HoglakeException.TableRecreated::class.java)
         assertThatThrownBy {
-            catalogs.truncateTable(cat, "ns", "t", original.tableUuid)
+            catalogs.truncateTable(
+                cat,
+                "ns",
+                "t",
+                original.tableUuid,
+                author = "integration-test",
+                message = "truncate table fixture",
+            )
         }.isInstanceOf(HoglakeException.TableRecreated::class.java)
         assertThatThrownBy {
             alter.alterTable(cat, "ns", "t", listOf(AlterOp.RenameTable("wrong")), original.tableUuid)
         }.isInstanceOf(HoglakeException.TableRecreated::class.java)
         assertThat(catalogs.tableWithExactTotals(cat, "ns", "t")).isEqualTo(replacement)
-        catalogs.dropTable(cat, "ns", "renamed", original.tableUuid)
+        catalogs.dropTable(
+            cat,
+            "ns",
+            "renamed",
+            original.tableUuid,
+            author = "integration-test",
+            message = "drop table fixture",
+        )
         assertThat(commits.commit(cat, request)).isEqualTo(receipt)
         // The drop above moved head, so a head read now resolves one
         // snapshot later. `readSnapshotId` is the field that says so
@@ -207,7 +236,14 @@ class TableLifecycleIntegrationTest {
                 val truncate =
                     pool.submit<Long> {
                         start.await()
-                        catalogs.truncateTable(cat, "ns", "t", uuid).snapshotId
+                        catalogs.truncateTable(
+                            cat,
+                            "ns",
+                            "t",
+                            uuid,
+                            author = "integration-test",
+                            message = "truncate table fixture",
+                        ).snapshotId
                     }
                 start.countDown()
                 insert.get(10, TimeUnit.SECONDS)
@@ -227,7 +263,7 @@ class TableLifecycleIntegrationTest {
         val cat = fixture()
         val old = append(cat, snapshot = catalogs.getCatalog(cat).headSnapshotId)
         val uuid = catalogs.getTable(cat, "ns", "t").tableUuid
-        catalogs.truncateTable(cat, "ns", "t", uuid)
+        catalogs.truncateTable(cat, "ns", "t", uuid, author = "integration-test", message = "truncate table fixture")
         val refused = catchThrowable { commits.commit(cat, old) }
         assertThat(refused).isInstanceOf(HoglakeException.DdlSinceReadSnapshot::class.java)
         // The EXACT class, separately, because `isInstanceOf` alone
@@ -255,7 +291,15 @@ class TableLifecycleIntegrationTest {
         val cat = fixture()
         val before = commits.commit(cat, append(cat)).snapshotId
         val uuid = catalogs.getTable(cat, "ns", "t").tableUuid
-        val truncated = catalogs.truncateTable(cat, "ns", "t", uuid).snapshotId
+        val truncated =
+            catalogs.truncateTable(
+                cat,
+                "ns",
+                "t",
+                uuid,
+                author = "integration-test",
+                message = "truncate table fixture",
+            ).snapshotId
         val after = commits.commit(cat, append(cat, "after.parquet")).snapshotId
         for ((from, to) in listOf(before to truncated, 0L to after, before to after)) {
             assertThatThrownBy { catalogs.changes(cat, "ns", "t", from, to) }
@@ -311,7 +355,14 @@ class TableLifecycleIntegrationTest {
         }
         try {
             assertThatThrownBy {
-                catalogs.truncateTable(cat, "ns", "t", before.tableUuid)
+                catalogs.truncateTable(
+                    cat,
+                    "ns",
+                    "t",
+                    before.tableUuid,
+                    author = "integration-test",
+                    message = "truncate table fixture",
+                )
             }.hasMessageContaining("publication failure")
             assertThat(catalogs.getCatalog(cat).headSnapshotId).isEqualTo(head)
             assertThat(catalogs.tableWithExactTotals(cat, "ns", "t")).isEqualTo(before)

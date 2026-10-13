@@ -1,5 +1,6 @@
 package com.posthog.hoglake.api
 
+import com.fasterxml.jackson.databind.annotation.JsonDeserialize
 import com.posthog.hoglake.model.AlterOp
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.HoglakeException
@@ -150,7 +151,13 @@ data class AlterOpDto(
     private fun parseColType(s: String): ColType = ColType.parseWire(s) { "unknown column type '$s'" }
 }
 
-data class AlterTableRequestDto(val ops: List<AlterOpDto> = emptyList())
+data class AlterTableRequestDto(
+    val ops: List<AlterOpDto> = emptyList(),
+    @JsonDeserialize(using = OperationTextDeserializer::class)
+    val author: String? = null,
+    @JsonDeserialize(using = OperationTextDeserializer::class)
+    val message: String? = null,
+)
 
 // The alter response reuses TableDto (Dto.kt): the spec's alter operation
 // $refs the same Table schema as create/get, so there is one table DTO,

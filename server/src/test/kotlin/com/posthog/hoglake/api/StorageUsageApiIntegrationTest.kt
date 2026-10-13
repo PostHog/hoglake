@@ -96,7 +96,14 @@ class StorageUsageApiIntegrationTest {
                     )
                 }
             }
-            catalogs.dropTable("footprint", "ns", "dropped", dropped.tableUuid)
+            catalogs.dropTable(
+                "footprint",
+                "ns",
+                "dropped",
+                dropped.tableUuid,
+                author = "integration-test",
+                message = "drop table fixture",
+            )
             val app = App.build(Config(hydratorIntervalMs = 0, metricsIntervalMs = 0), db.jdbi)
             testApplication {
                 application { app.module(this) }

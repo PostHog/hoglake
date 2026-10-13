@@ -19,7 +19,7 @@ import java.util.UUID
  *
  * **Versions.** 0 is the pre-versioned shape (JVM enum names,
  * `typeParams`); 1 added the version marker and wire spellings; 2 adds
- * `children`; 3 adds the replacement identity and snapshot guard; 4 adds initial partition fields; 5 adds initial sort fields; 6 adds comments and custom properties.
+ * `children`; 3 adds the replacement identity and snapshot guard; 4 adds initial partition fields; 5 adds initial sort fields; 6 adds comments and custom properties; 7 adds operation attribution.
  * Without children a nested definition cannot be represented
  * at all.
  *
@@ -52,7 +52,9 @@ internal object TableCreationDefinitionCodec {
         mapper.writeValueAsString(
             mapOf(
                 "version" to
-                    if (definition.comment != null || definition.properties.isNotEmpty() ||
+                    if (definition.author != null || definition.message != null) {
+                        7
+                    } else if (definition.comment != null || definition.properties.isNotEmpty() ||
                         anyComments(definition.columns)
                     ) {
                         6
@@ -70,7 +72,12 @@ internal object TableCreationDefinitionCodec {
                 "namespace" to definition.namespace,
                 "name" to definition.name,
                 "columns" to definition.columns.map { encodeColumn(it) },
-            ) + (definition.comment?.let { mapOf("comment" to it) } ?: emptyMap()) +
+            ) + (definition.author?.let { mapOf("author" to it) } ?: emptyMap()) +
+                (
+                    definition.message?.let {
+                        mapOf("message" to it)
+                    } ?: emptyMap()
+                ) + (definition.comment?.let { mapOf("comment" to it) } ?: emptyMap()) +
                 (
                     if (definition.properties.isNotEmpty()) {
                         mapOf("properties" to definition.properties)
@@ -205,7 +212,7 @@ internal object TableCreationDefinitionCodec {
             }
         }
         val version = versionNode?.takeIf { !it.isNull }?.asInt() ?: 0
-        if (version !in 0..6) {
+        if (version !in 0..7) {
             corrupt("unsupported table creation definition version $version")
         }
         val columns =
@@ -311,6 +318,8 @@ internal object TableCreationDefinitionCodec {
             } else {
                 emptyMap()
             },
+            if (version >= 7 && node.has("author")) text(node, "author", "definition", ::corrupt) else null,
+            if (version >= 7 && node.has("message")) text(node, "message", "definition", ::corrupt) else null,
         )
     }
 

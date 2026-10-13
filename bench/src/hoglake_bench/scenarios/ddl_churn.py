@@ -83,7 +83,7 @@ def run(bench: Bench, args: argparse.Namespace) -> ScenarioReport:
     def churn(i: int) -> None:
         t = ns.create_table(f"churn_{i}", BENCH_SCHEMA)
         catalog._commit(append_payload(catalog, t, 1, RECORD_COUNT))
-        t.drop()
+        t.drop(author="hoglake-bench", message="drop benchmark table")
 
     loop = run_loop(
         churn, ops=args.tables, warmup=0, duration_s=args.duration, guard=guard
