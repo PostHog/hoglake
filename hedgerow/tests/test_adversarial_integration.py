@@ -115,7 +115,9 @@ def test_dest_recreate_mid_window_live(live_server_url, client):
             if state["yields"] == 3:
                 # operator drops + recreates the destination while the
                 # window is mid-flight (between append 1 and append 2)
-                dst_ns.table("t").drop()
+                dst_ns.table("t").drop(
+                    author="integration-test", message="Drop test table"
+                )
                 dst_ns.create_table("t", schema)
             yield b
 

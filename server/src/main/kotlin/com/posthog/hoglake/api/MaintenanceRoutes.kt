@@ -55,6 +55,8 @@ fun Application.installMaintenanceRoutes(
                             call.maintenanceCatalog(),
                             req.snapshotRetentionSeconds,
                             req.consumerFloor,
+                            req.author,
+                            req.message,
                         ).toDto(),
                     )
                 }

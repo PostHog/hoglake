@@ -78,8 +78,10 @@ def _drop(client: Any, catalog_name: str, table: Any) -> None:
     No catalog delete exists; the catalog leaks."""
     try:
         if table is not None:
-            table.drop()
-        client._request("DELETE", f"/catalogs/{catalog_name}/namespaces/ns1")
+            table.drop(author="millrace-tests", message="drop test fixture")
+        client.catalog(catalog_name).namespace("ns1").drop(
+            author="millrace-tests", message="drop test fixture"
+        )
     except Exception as e:  # noqa: BLE001 - teardown is best-effort
         print(f"teardown: dropping {catalog_name}/ns1 failed: {e}")
 

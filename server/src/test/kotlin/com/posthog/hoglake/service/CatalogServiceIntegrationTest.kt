@@ -240,14 +240,29 @@ class CatalogServiceIntegrationTest {
             ).bind("cid", catId).bind("tid", t.tableId).bind("snap", createdAt).execute()
         }
 
-        val drop = svc.dropTable("drop-cat", "ns", "t") // S3
+        val drop =
+            svc.dropTable(
+                "drop-cat",
+                "ns",
+                "t",
+                author = "integration-test",
+                message = "drop table fixture",
+            ) // S3
         assertThat(drop.snapshotId).isEqualTo(createdAt + 1)
 
         // Head: gone.
         assertThatThrownBy { svc.getTable("drop-cat", "ns", "t") }
             .isInstanceOf(HoglakeException.NotFound::class.java)
         assertThat(svc.listTables("drop-cat", "ns")).isEmpty()
-        assertThatThrownBy { svc.dropTable("drop-cat", "ns", "t") }
+        assertThatThrownBy {
+            svc.dropTable(
+                "drop-cat",
+                "ns",
+                "t",
+                author = "integration-test",
+                message = "drop table fixture",
+            )
+        }
             .isInstanceOf(HoglakeException.NotFound::class.java)
 
         // Time travel to the creation snapshot: fully visible.
@@ -333,7 +348,7 @@ class CatalogServiceIntegrationTest {
         svc.createNamespace("recreate-cat", "ns")
         val v1 = svc.createTable("recreate-cat", "ns", "t", listOf(idCol))
         val preDrop = svc.getCatalog("recreate-cat").headSnapshotId
-        svc.dropTable("recreate-cat", "ns", "t")
+        svc.dropTable("recreate-cat", "ns", "t", author = "integration-test", message = "drop table fixture")
         val v2 = svc.createTable("recreate-cat", "ns", "t", listOf(idCol, nameCol))
 
         assertThat(v2.tableId).isNotEqualTo(v1.tableId)

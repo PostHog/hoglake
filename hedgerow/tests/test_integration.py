@@ -396,7 +396,7 @@ def test_halt_on_source_recreate(
     assert daemon.run_once().rows_appended == 5
     old_uuid = src.table_uuid
 
-    src.drop()
+    src.drop(author="integration-test", message="Drop test table")
     reborn = src_ns.create_table("reborn", _schema())  # same name, new identity
     assert reborn.table_uuid != old_uuid
     reborn.append(_data(5, 100))

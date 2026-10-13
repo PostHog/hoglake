@@ -188,7 +188,7 @@ class SnapshotsAndOffsetsIntegrationTest {
         svc.createNamespace("off-drop-cat", "ns")
         val t = svc.createTable("off-drop-cat", "ns", "t", listOf(idCol))
         svc.commitOffset("off-drop-cat", "c", t.tableUuid, 2)
-        svc.dropTable("off-drop-cat", "ns", "t")
+        svc.dropTable("off-drop-cat", "ns", "t", author = "integration-test", message = "drop table fixture")
         val recreated = svc.createTable("off-drop-cat", "ns", "t", listOf(idCol))
 
         // The old incarnation's offset row is still there, keyed to the

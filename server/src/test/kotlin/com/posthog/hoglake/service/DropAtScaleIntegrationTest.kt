@@ -207,7 +207,16 @@ class DropAtScaleIntegrationTest {
         val start = System.nanoTime()
         statements =
             captured { instrumented ->
-                dropSnapshot = CatalogService(instrumented).dropTable(CATALOG, "ns", "events_raw").snapshotId
+                dropSnapshot =
+                    CatalogService(instrumented)
+                        .dropTable(
+                            CATALOG,
+                            "ns",
+                            "events_raw",
+                            author = "integration-test",
+                            message = "drop table fixture",
+                        )
+                        .snapshotId
             }
         dropMillis = (System.nanoTime() - start) / 1_000_000
         println(
@@ -333,7 +342,16 @@ class DropAtScaleIntegrationTest {
     /** The drop runs in the first case; the others tolerate any order. */
     private fun dropSnapshotOrDrop(): Long {
         if (dropSnapshot == 0L) {
-            dropSnapshot = catalogs.dropTable(CATALOG, "ns", "events_raw").snapshotId
+            dropSnapshot =
+                catalogs
+                    .dropTable(
+                        CATALOG,
+                        "ns",
+                        "events_raw",
+                        author = "integration-test",
+                        message = "drop table fixture",
+                    )
+                    .snapshotId
         }
         return dropSnapshot
     }

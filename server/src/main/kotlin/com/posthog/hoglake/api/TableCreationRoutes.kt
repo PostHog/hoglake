@@ -1,5 +1,6 @@
 package com.posthog.hoglake.api
 
+import com.fasterxml.jackson.databind.annotation.JsonDeserialize
 import com.posthog.hoglake.service.ReplacementTarget
 import com.posthog.hoglake.service.TableCreation
 import com.posthog.hoglake.service.TableCreationDefinition
@@ -26,6 +27,10 @@ data class PrepareTableCreationDto(
     val sortFields: List<AlterSortFieldDto> = emptyList(),
     val comment: String? = null,
     val properties: Map<String, String> = emptyMap(),
+    @JsonDeserialize(using = OperationTextDeserializer::class)
+    val author: String? = null,
+    @JsonDeserialize(using = OperationTextDeserializer::class)
+    val message: String? = null,
 )
 
 data class PublishTableCreationDto(val files: List<FileRegistrationDto>)
@@ -127,6 +132,8 @@ private suspend fun ApplicationCall.prepareCreation(
                 request.sortFields.map { it.toModel() },
                 request.comment,
                 request.properties,
+                request.author,
+                request.message,
             ),
         ).toDto(),
     )

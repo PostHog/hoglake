@@ -127,7 +127,10 @@ class TableListingApiTest {
             // end-snapshots every live file, which is the shape the
             // visibility predicate exists for. Both come from the real
             // service rather than from seeded rows.
-            client.postJson("$tables/churned/truncate?expected_table_uuid=$churned", "")
+            client.postJson(
+                "$tables/churned/truncate?expected_table_uuid=$churned",
+                """{"author":"integration-test","message":"truncate table fixture"}""",
+            )
             built = true
         }
 
@@ -267,7 +270,9 @@ class TableListingApiTest {
             client.postJson(tables, """{"name":"doomed","columns":[{"name":"id","type":"long"}]}""")
             assertThat(listed(client)).containsKey("doomed")
 
-            assertThat(client.delete("$tables/doomed").status).isEqualTo(HttpStatusCode.OK)
+            assertThat(
+                client.delete("$tables/doomed?author=integration-test&message=drop-fixture").status,
+            ).isEqualTo(HttpStatusCode.OK)
 
             val rows = listed(client)
             assertThat(rows)
@@ -309,7 +314,8 @@ class TableListingApiTest {
                     setBody(
                         """{"namespace":"ns","name":"phoenix",
                            "columns":[{"name":"id","type":"long"}],
-                           "replacement":{"expected_table_uuid":"$oldUuid","read_snapshot":$head}}""",
+                           "replacement":{"expected_table_uuid":"$oldUuid","read_snapshot":$head},
+                           "author":"integration-test","message":"replace table fixture"}""",
                     )
                 }
             assertThat(prepared.status).describedAs("prepare the replacement").isEqualTo(HttpStatusCode.OK)

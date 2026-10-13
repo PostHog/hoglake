@@ -34,12 +34,16 @@ class ViewService(private val jdbi: Jdbi) {
         name: String,
         sql: String,
         dialect: String = "trino",
+        author: String? = null,
+        message: String? = null,
     ): ViewInfo =
         Audit.audited(
             "view_create",
             catalog,
             "$namespace.$name",
             detail = { "dialect=$dialect" },
+            actor = { author },
+            message = { message },
         ) {
             Identifiers.validate("view", name)
             if (sql.isBlank()) throw HoglakeException.Validation("view sql must not be blank")
@@ -54,7 +58,7 @@ class ViewService(private val jdbi: Jdbi) {
                     )
                 }
                 val alloc = CatalogRepo.allocateSnapshot(h, cat.catalogId)
-                SnapshotRepo.insert(h, cat.catalogId, alloc.snapshotId, alloc.schemaVersion)
+                SnapshotRepo.insert(h, cat.catalogId, alloc.snapshotId, alloc.schemaVersion, author, message)
                 val viewId = ViewRepo.allocateViewId(h, cat.catalogId)
                 SnapshotRepo.insertChange(
                     h,
@@ -114,13 +118,18 @@ class ViewService(private val jdbi: Jdbi) {
         catalog: String,
         namespace: String,
         name: String,
+        author: String? = null,
+        message: String? = null,
     ): CommitResult =
         Audit.audited(
             "view_drop",
             catalog,
             "$namespace.$name",
             detail = { "snapshot=${it.snapshotId}" },
+            actor = { author },
+            message = { message },
         ) {
+            requireOperationMetadata(author, message)
             jdbi.inTransactionUnchecked { h ->
                 val cat = requireCatalog(h, catalog)
                 Locks.acquireCatalogCommitLock(h, cat.catalogId)
@@ -131,7 +140,7 @@ class ViewService(private val jdbi: Jdbi) {
                             "view '$namespace.$name' in catalog '$catalog'",
                         )
                 val alloc = CatalogRepo.allocateSnapshot(h, cat.catalogId)
-                SnapshotRepo.insert(h, cat.catalogId, alloc.snapshotId, alloc.schemaVersion)
+                SnapshotRepo.insert(h, cat.catalogId, alloc.snapshotId, alloc.schemaVersion, author, message)
                 SnapshotRepo.insertChange(
                     h,
                     cat.catalogId,

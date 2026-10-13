@@ -24,7 +24,14 @@ class TruncateExpiryRaceIntegrationTest {
             catalogs.createNamespace("review", "ns")
             val table = catalogs.createTable("review", "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
             val before = catalogs.getCatalog("review").headSnapshotId
-            catalogs.truncateTable("review", "ns", "t", table.tableUuid)
+            catalogs.truncateTable(
+                "review",
+                "ns",
+                "t",
+                table.tableUuid,
+                author = "integration-test",
+                message = "truncate table fixture",
+            )
             catalogs.createNamespace("review", "advance")
             db.jdbi.useHandle<Exception> { h ->
                 h.execute("UPDATE hog_catalog SET snapshot_retention_seconds = 3600, consumer_floor = false")

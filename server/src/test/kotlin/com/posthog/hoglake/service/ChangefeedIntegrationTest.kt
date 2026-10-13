@@ -154,7 +154,7 @@ class ChangefeedIntegrationTest {
                 """,
             ).bind("cid", catalogId).bind("tid", t.tableId).bind("begin", createdAt).execute()
         }
-        val drop = svc.dropTable(cat, "drop-ns", "d")
+        val drop = svc.dropTable(cat, "drop-ns", "d", author = "integration-test", message = "drop table fixture")
 
         // At head the table no longer resolves, for files or changes.
         assertThatThrownBy { svc.listFiles(cat, "drop-ns", "d") }

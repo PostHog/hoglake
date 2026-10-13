@@ -447,7 +447,7 @@ class _Executor:
             if c.type not in NESTED_TYPES and c.type != "variant"
         )
         with self.record("drop_recreate").measure():
-            table.drop()
+            table.drop(author="hoglake-bench", message="drop benchmark table")
             self._create(s.table, recreate)
         new_uuid = self.tables[s.table].table_uuid
         check(

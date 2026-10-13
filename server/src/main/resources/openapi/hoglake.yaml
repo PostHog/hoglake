@@ -188,6 +188,8 @@ paths:
               type: object
               required: [name]
               properties:
+                author: { $ref: "#/components/schemas/OperationAuthor" }
+                message: { $ref: "#/components/schemas/OperationMessage" }
                 name:
                   type: string
                   pattern: "^[A-Za-z_][A-Za-z0-9_-]{0,127}$"
@@ -224,6 +226,8 @@ paths:
         tables or views is refused with 409, matching dropTable's no-CASCADE
         position.
       parameters:
+        - { $ref: "#/components/parameters/operationAuthor" }
+        - { $ref: "#/components/parameters/operationMessage" }
         - { $ref: "#/components/parameters/catalog" }
         - { $ref: "#/components/parameters/namespace" }
         - in: query
@@ -231,6 +235,7 @@ paths:
           description: Optional namespace identity guard, checked under the commit lock; mismatch returns 409. Requires guarded-schema-evolution-v1.
           schema: { type: integer, format: int64 }
       responses:
+        "422": { $ref: "#/components/responses/Validation" }
         "200":
           description: Dropped; returns the snapshot that recorded it
           content:
@@ -354,6 +359,8 @@ paths:
       operationId: dropTable
       summary: Drop a table (DDL commit; produces a snapshot)
       parameters:
+        - { $ref: "#/components/parameters/operationAuthor" }
+        - { $ref: "#/components/parameters/operationMessage" }
         - { $ref: "#/components/parameters/catalog" }
         - { $ref: "#/components/parameters/namespace" }
         - { $ref: "#/components/parameters/table" }
@@ -368,6 +375,7 @@ paths:
             decide, never replay.
           schema: { type: string, format: uuid }
       responses:
+        "422": { $ref: "#/components/responses/Validation" }
         "200":
           description: Dropped; returns the snapshot that recorded it
           content:
@@ -411,7 +419,13 @@ paths:
             `tables` and `retry: re-prepare`: re-read the table and
             decide, never replay.
           schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RequiredOperationMetadata" }
       responses:
+        "422": { $ref: "#/components/responses/Validation" }
         "200":
           description: Truncated; returns the publication snapshot
           content:
@@ -463,6 +477,8 @@ paths:
               type: object
               required: [ops]
               properties:
+                author: { $ref: "#/components/schemas/OperationAuthor" }
+                message: { $ref: "#/components/schemas/OperationMessage" }
                 ops:
                   type: array
                   minItems: 1
@@ -921,6 +937,10 @@ paths:
         Update retention options. snapshot_retention_seconds null
         disables expiry; consumer_floor controls whether expiry stops at
         the min consumer offset.
+      description: >
+        A finite retention below the current value, including enabling expiry from
+        unlimited retention (null), requires nonblank author and message. Attribution
+        is audited; an options patch does not mint a snapshot.
       parameters: [ { $ref: "#/components/parameters/catalog" } ]
       requestBody:
         required: true
@@ -929,6 +949,8 @@ paths:
             schema:
               type: object
               properties:
+                author: { $ref: "#/components/schemas/OperationAuthor" }
+                message: { $ref: "#/components/schemas/OperationMessage" }
                 snapshot_retention_seconds:
                   type: integer
                   format: int64
@@ -1329,6 +1351,8 @@ paths:
               type: object
               required: [name, sql]
               properties:
+                author: { $ref: "#/components/schemas/OperationAuthor" }
+                message: { $ref: "#/components/schemas/OperationMessage" }
                 name:
                   type: string
                   pattern: "^[A-Za-z_][A-Za-z0-9_-]{0,127}$"
@@ -1362,6 +1386,8 @@ paths:
     delete:
       operationId: dropView
       parameters:
+        - { $ref: "#/components/parameters/operationAuthor" }
+        - { $ref: "#/components/parameters/operationMessage" }
         - { $ref: "#/components/parameters/catalog" }
         - { $ref: "#/components/parameters/namespace" }
         - name: view
@@ -1369,6 +1395,7 @@ paths:
           required: true
           schema: { type: string }
       responses:
+        "422": { $ref: "#/components/responses/Validation" }
         "200":
           description: Dropped; the snapshot that recorded it
           content:
@@ -1449,6 +1476,7 @@ paths:
       parameters:
         - { $ref: "#/components/parameters/catalog" }
         - { name: operation, in: path, required: true, schema: { type: string, format: uuid } }
+      description: Replacing an existing table requires nonblank author and message, persisted with the prepared definition and publication snapshot.
       requestBody:
         required: true
         content:
@@ -1457,6 +1485,8 @@ paths:
               type: object
               required: [namespace, name, columns]
               properties:
+                author: { $ref: "#/components/schemas/OperationAuthor" }
+                message: { $ref: "#/components/schemas/OperationMessage" }
                 namespace: { type: string }
                 name: { type: string }
                 columns:
@@ -1542,6 +1572,7 @@ paths:
       parameters:
         - { $ref: "#/components/parameters/catalog" }
         - { name: operation, in: path, required: true, schema: { type: string, format: uuid } }
+      description: Replacing an existing table requires nonblank author and message, persisted with the prepared definition and publication snapshot.
       requestBody:
         required: true
         content:
@@ -1550,6 +1581,8 @@ paths:
               type: object
               required: [namespace, name, columns, partition_fields]
               properties:
+                author: { $ref: "#/components/schemas/OperationAuthor" }
+                message: { $ref: "#/components/schemas/OperationMessage" }
                 namespace: { type: string }
                 name: { type: string }
                 columns:
@@ -1596,6 +1629,7 @@ paths:
       parameters:
         - { $ref: "#/components/parameters/catalog" }
         - { name: operation, in: path, required: true, schema: { type: string, format: uuid } }
+      description: Replacing an existing table requires nonblank author and message, persisted with the prepared definition and publication snapshot.
       requestBody:
         required: true
         content:
@@ -1604,6 +1638,8 @@ paths:
               type: object
               required: [namespace, name, columns, sort_fields]
               properties:
+                author: { $ref: "#/components/schemas/OperationAuthor" }
+                message: { $ref: "#/components/schemas/OperationMessage" }
                 namespace: { type: string }
                 name: { type: string }
                 columns:
@@ -1653,6 +1689,7 @@ paths:
       parameters:
         - { $ref: "#/components/parameters/catalog" }
         - { name: operation, in: path, required: true, schema: { type: string, format: uuid } }
+      description: Replacing an existing table requires nonblank author and message, persisted with the prepared definition and publication snapshot.
       requestBody:
         required: true
         content:
@@ -1661,6 +1698,8 @@ paths:
               type: object
               required: [namespace, name, columns]
               properties:
+                author: { $ref: "#/components/schemas/OperationAuthor" }
+                message: { $ref: "#/components/schemas/OperationMessage" }
                 comment: { type: [string, "null"], maxLength: 16384 }
                 properties: { $ref: "#/components/schemas/CustomProperties" }
                 namespace: { type: string }
@@ -2873,6 +2912,18 @@ paths:
 
 components:
   parameters:
+    operationAuthor:
+      in: query
+      name: author
+      required: true
+      description: Caller-supplied attribution, not an authenticated identity. Missing or blank returns 422.
+      schema: { type: string, minLength: 1 }
+    operationMessage:
+      in: query
+      name: message
+      required: true
+      description: Reason for the destructive operation. Missing or blank returns 422.
+      schema: { type: string, minLength: 1 }
     catalog:
       name: catalog
       in: path
@@ -2949,6 +3000,20 @@ components:
           schema: { $ref: "#/components/schemas/ApiError" }
 
   schemas:
+    OperationAuthor:
+      type: [string, "null"]
+      description: Caller-supplied author recorded on the snapshot and audit actor; not an authenticated identity.
+    OperationMessage:
+      type: [string, "null"]
+      description: Reason recorded on the snapshot and audit operation_message.
+    RequiredOperationMetadata:
+      type: object
+      required: [author, message]
+      description: Both fields must contain non-whitespace text; missing or blank returns 422 naming the field.
+      properties:
+        author: { type: string, minLength: 1 }
+        message: { type: string, minLength: 1 }
+
     ApiError:
       type: object
       required: [error]
@@ -3058,6 +3123,8 @@ components:
       type: object
       required: [name, data_path]
       properties:
+        author: { $ref: "#/components/schemas/OperationAuthor" }
+        message: { $ref: "#/components/schemas/OperationMessage" }
         name: { type: string, pattern: "^[a-z0-9][a-z0-9_-]{0,62}$" }
         data_path: { type: string }
 
@@ -3287,6 +3354,8 @@ components:
       type: object
       required: [name, columns]
       properties:
+        author: { $ref: "#/components/schemas/OperationAuthor" }
+        message: { $ref: "#/components/schemas/OperationMessage" }
         name:
           type: string
           pattern: "^[A-Za-z_][A-Za-z0-9_-]{0,127}$"

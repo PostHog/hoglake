@@ -116,9 +116,9 @@ def run(bench: Bench, args: argparse.Namespace) -> ScenarioReport:
 
     # drop both tables -> every file row becomes unreachable once the
     # floor passes the drop snapshots
-    t_fab.drop()
-    t_real.drop()
-    catalog.set_retention(1)
+    t_fab.drop(author="hoglake-bench", message="drop benchmark table")
+    t_real.drop(author="hoglake-bench", message="drop benchmark table")
+    catalog.set_retention(1, author="hoglake-bench", message="exercise expiry throughput")
     time.sleep(1.6)
 
     # expire drain

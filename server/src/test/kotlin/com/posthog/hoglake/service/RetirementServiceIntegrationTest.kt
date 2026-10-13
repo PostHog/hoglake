@@ -323,8 +323,26 @@ class RetirementServiceIntegrationTest {
     ): Fixture {
         val f = seed(catalog, files = 1)
         bulkFiles(catalog, f.catalogId, rows - 1)
-        val drop = catalogs.dropTable(catalog, "ns", "doomed").snapshotId
-        val last = if (alsoDropKeeper) catalogs.dropTable(catalog, "ns", "keeper").snapshotId else drop
+        val drop =
+            catalogs.dropTable(
+                catalog,
+                "ns",
+                "doomed",
+                author = "integration-test",
+                message = "drop table fixture",
+            ).snapshotId
+        val last =
+            if (alsoDropKeeper) {
+                catalogs.dropTable(
+                    catalog,
+                    "ns",
+                    "keeper",
+                    author = "integration-test",
+                    message = "drop table fixture",
+                ).snapshotId
+            } else {
+                drop
+            }
         setFloor(f.catalogId, last)
         return f
     }
@@ -349,7 +367,14 @@ class RetirementServiceIntegrationTest {
                 ).bind("c", catalogId).bind("n", name).mapTo(Long::class.java).first()
             }
         bulkFiles(catalog, catalogId, 1, table = name, idBase = idBase)
-        val drop = catalogs.dropTable(catalog, "ns", name).snapshotId
+        val drop =
+            catalogs.dropTable(
+                catalog,
+                "ns",
+                name,
+                author = "integration-test",
+                message = "drop table fixture",
+            ).snapshotId
         setFloor(catalogId, drop)
         return tableId
     }
@@ -519,7 +544,14 @@ class RetirementServiceIntegrationTest {
                     "WHERE catalog_id = :c AND data_file_id = :file",
             ).bind("keeper", keeper).bind("c", f.catalogId).bind("file", f.fileIds.first()).execute()
         }
-        val drop = catalogs.dropTable(catalog, "ns", "doomed").snapshotId
+        val drop =
+            catalogs.dropTable(
+                catalog,
+                "ns",
+                "doomed",
+                author = "integration-test",
+                message = "drop table fixture",
+            ).snapshotId
         setFloor(f.catalogId, drop)
         val sleeps = mutableListOf<Long>()
         val svc = service(batch = 2, sleeps = sleeps)
@@ -582,7 +614,14 @@ class RetirementServiceIntegrationTest {
     fun `a drop above the expiry floor retires nothing, and the floor is why`() {
         val catalog = "ret-gate"
         val f = seed(catalog)
-        val drop = catalogs.dropTable(catalog, "ns", "doomed").snapshotId
+        val drop =
+            catalogs.dropTable(
+                catalog,
+                "ns",
+                "doomed",
+                author = "integration-test",
+                message = "drop table fixture",
+            ).snapshotId
 
         // THE ASSERTION IS THE FLOOR VALUE, not "nothing happened": a
         // test that only checked the row count would pass just as well
@@ -601,7 +640,14 @@ class RetirementServiceIntegrationTest {
     fun `a drop exactly AT the floor is eligible, and one below the floor is not`() {
         val catalog = "ret-gate-boundary"
         val f = seed(catalog)
-        val drop = catalogs.dropTable(catalog, "ns", "doomed").snapshotId
+        val drop =
+            catalogs.dropTable(
+                catalog,
+                "ns",
+                "doomed",
+                author = "integration-test",
+                message = "drop table fixture",
+            ).snapshotId
 
         // ONE BELOW: a read at S = drop - 1 is still legal and still
         // needs these rows.
@@ -654,7 +700,14 @@ class RetirementServiceIntegrationTest {
         // second run takes a lock hold for it.
         val catalog = "ret-drained"
         val f = seed(catalog, files = 2)
-        val drop = catalogs.dropTable(catalog, "ns", "doomed").snapshotId
+        val drop =
+            catalogs.dropTable(
+                catalog,
+                "ns",
+                "doomed",
+                author = "integration-test",
+                message = "drop table fixture",
+            ).snapshotId
         setFloor(f.catalogId, drop)
 
         val first = service(batch = 10).runOnce(catalog)
@@ -738,7 +791,14 @@ class RetirementServiceIntegrationTest {
         // time-travel read below loses its files.
         val catalog = "ret-floor-retreat"
         val f = seed(catalog, files = 4)
-        val drop = catalogs.dropTable(catalog, "ns", "doomed").snapshotId
+        val drop =
+            catalogs.dropTable(
+                catalog,
+                "ns",
+                "doomed",
+                author = "integration-test",
+                message = "drop table fixture",
+            ).snapshotId
         setFloor(f.catalogId, drop)
 
         val lowered = java.util.concurrent.atomic.AtomicBoolean(false)
@@ -782,7 +842,7 @@ class RetirementServiceIntegrationTest {
     fun `a catalog with no retention never retires, and that is the design`() {
         val catalog = "ret-no-retention"
         val f = seed(catalog)
-        catalogs.dropTable(catalog, "ns", "doomed")
+        catalogs.dropTable(catalog, "ns", "doomed", author = "integration-test", message = "drop table fixture")
         // Exactly what a production retention-NULL catalog looks like:
         // expiry runs, releases nothing, and never moves the floor.
         ExpiryService(jdbi).runOnce(catalog, batchSize = 1000)
@@ -797,7 +857,14 @@ class RetirementServiceIntegrationTest {
     fun `a consumer-floored catalog retires only once the offset moves`() {
         val catalog = "ret-consumer"
         val f = seed(catalog)
-        val drop = catalogs.dropTable(catalog, "ns", "doomed").snapshotId
+        val drop =
+            catalogs.dropTable(
+                catalog,
+                "ns",
+                "doomed",
+                author = "integration-test",
+                message = "drop table fixture",
+            ).snapshotId
         // A consumer pinned below the drop: expiry cannot pass it, so
         // the floor stays put and retirement has nothing to do.
         jdbi.useHandleUnchecked { h ->
@@ -847,7 +914,14 @@ class RetirementServiceIntegrationTest {
         val supersededPath = "s3://bucket/$catalog/doomed/f0.dv.v2"
         supersede(catalog, f, 0, supersededPath)
 
-        val drop = catalogs.dropTable(catalog, "ns", "doomed").snapshotId
+        val drop =
+            catalogs.dropTable(
+                catalog,
+                "ns",
+                "doomed",
+                author = "integration-test",
+                message = "drop table fixture",
+            ).snapshotId
         // Stats and partition rows that must ride the cascade out.
         jdbi.useHandleUnchecked { h ->
             h.createUpdate(
@@ -927,7 +1001,14 @@ class RetirementServiceIntegrationTest {
     fun `retirement_eligible_at is stamped on first observation and never moved`() {
         val catalog = "ret-stamp"
         val f = seed(catalog, files = 6)
-        val drop = catalogs.dropTable(catalog, "ns", "doomed").snapshotId
+        val drop =
+            catalogs.dropTable(
+                catalog,
+                "ns",
+                "doomed",
+                author = "integration-test",
+                message = "drop table fixture",
+            ).snapshotId
         setFloor(f.catalogId, drop)
 
         fun stamp(): java.time.Instant? =
@@ -962,7 +1043,14 @@ class RetirementServiceIntegrationTest {
     fun `a run interrupted by its budget is continued by the next one`() {
         val catalog = "ret-resume"
         val f = seed(catalog, files = 6)
-        val drop = catalogs.dropTable(catalog, "ns", "doomed").snapshotId
+        val drop =
+            catalogs.dropTable(
+                catalog,
+                "ns",
+                "doomed",
+                author = "integration-test",
+                message = "drop table fixture",
+            ).snapshotId
         setFloor(f.catalogId, drop)
 
         // The clock is spent after the first batch: zero on the first
@@ -994,7 +1082,14 @@ class RetirementServiceIntegrationTest {
     fun `a backed-up cleanup queue stops the run before it starts`() {
         val catalog = "ret-ceiling"
         val f = seed(catalog)
-        val drop = catalogs.dropTable(catalog, "ns", "doomed").snapshotId
+        val drop =
+            catalogs.dropTable(
+                catalog,
+                "ns",
+                "doomed",
+                author = "integration-test",
+                message = "drop table fixture",
+            ).snapshotId
         setFloor(f.catalogId, drop)
         jdbi.useHandleUnchecked { h ->
             h.createUpdate(
@@ -1055,7 +1150,14 @@ class RetirementServiceIntegrationTest {
     fun `a second maintainer skips a catalog rather than queueing behind it`() {
         val catalog = "ret-single-flight"
         val f = seed(catalog)
-        val drop = catalogs.dropTable(catalog, "ns", "doomed").snapshotId
+        val drop =
+            catalogs.dropTable(
+                catalog,
+                "ns",
+                "doomed",
+                author = "integration-test",
+                message = "drop table fixture",
+            ).snapshotId
         setFloor(f.catalogId, drop)
 
         jdbi.open().use { holder ->
@@ -1144,7 +1246,14 @@ class RetirementServiceIntegrationTest {
         bulkFiles(catalog, f.catalogId, bulkRows)
         val before = liveFiles(f.catalogId)
         assertThat(before).isEqualTo(bulkRows + 1L)
-        val drop = catalogs.dropTable(catalog, "ns", "doomed").snapshotId
+        val drop =
+            catalogs.dropTable(
+                catalog,
+                "ns",
+                "doomed",
+                author = "integration-test",
+                message = "drop table fixture",
+            ).snapshotId
         setFloor(f.catalogId, drop)
 
         // A 10 ms statement bound: admission 80 ms / 2 = 40, divided by
@@ -1629,7 +1738,14 @@ class RetirementServiceIntegrationTest {
     fun `a batch that selects rows and deletes none ends the run for that table`() {
         val catalog = "ret-stuck"
         val f = seed(catalog)
-        val drop = catalogs.dropTable(catalog, "ns", "doomed").snapshotId
+        val drop =
+            catalogs.dropTable(
+                catalog,
+                "ns",
+                "doomed",
+                author = "integration-test",
+                message = "drop table fixture",
+            ).snapshotId
         setFloor(f.catalogId, drop)
         // Fault injection: a BEFORE DELETE trigger that swallows the
         // delete. The state is structurally impossible on a healthy
@@ -1679,7 +1795,14 @@ class RetirementServiceIntegrationTest {
         // below does not.
         val catalog = "ret-bound-order"
         val f = seed(catalog, files = 2)
-        val drop = catalogs.dropTable(catalog, "ns", "doomed").snapshotId
+        val drop =
+            catalogs.dropTable(
+                catalog,
+                "ns",
+                "doomed",
+                author = "integration-test",
+                message = "drop table fixture",
+            ).snapshotId
         setFloor(f.catalogId, drop)
 
         val issued = java.util.concurrent.CopyOnWriteArrayList<String>()

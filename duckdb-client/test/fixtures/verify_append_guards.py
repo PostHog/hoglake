@@ -29,6 +29,7 @@ class CommitProxy:
         self.commits = []
         self.commit_times = []
         self.preparations = []
+        self.ddl = []
         self.responses = []
         self.resolutions = []
         self.resolution_overrides = []
@@ -48,6 +49,21 @@ class CommitProxy:
                 try:
                     data = self.rfile.read(int(self.headers.get("Content-Length", "0")))
                     path = urlsplit(self.path)
+                    if self.command == "DELETE" or (
+                        self.command == "POST"
+                        and path.path.endswith(
+                            ("/catalogs", "/namespaces", "/tables", "/views", "/alter")
+                        )
+                    ):
+                        metadata = (
+                            {
+                                key: values[0]
+                                for key, values in parse_qs(path.query).items()
+                            }
+                            if self.command == "DELETE"
+                            else json.loads(data)
+                        )
+                        owner.ddl.append((self.command, path.path, metadata))
                     if self.command == "POST" and path.path.endswith("/commit"):
                         owner.commits.append(json.loads(data))
                         owner.commit_times.append(time.monotonic())
@@ -226,6 +242,37 @@ class AppendGuards(unittest.TestCase):
     def partition_x(self, field=1):
         self.x.alter([ops.set_partition_spec([ops.partition_field(field, "identity")])])
 
+    def test_ddl_metadata_reaches_requests_and_snapshots(self):
+        namespace = self._testMethodName
+        before = self.catalog.refresh().head_snapshot_id
+        self.run_sql(f"""
+            CREATE SCHEMA lake.ddl_metadata;
+            CREATE TABLE lake.{namespace}.ddl_table (id BIGINT);
+            ALTER TABLE lake.{namespace}.ddl_table ADD COLUMN extra BIGINT;
+            DROP TABLE lake.{namespace}.ddl_table;
+        """)
+        expected = [
+            "CREATE SCHEMA ddl_metadata",
+            f"CREATE TABLE {namespace}.ddl_table",
+            f"ALTER TABLE {namespace}.ddl_table",
+            f"DROP TABLE {namespace}.ddl_table",
+        ]
+        self.assertEqual(
+            [metadata["message"] for _, _, metadata in self.proxy.ddl], expected
+        )
+        self.assertTrue(
+            all(
+                metadata["author"] == "duckdb-client"
+                for _, _, metadata in self.proxy.ddl
+            )
+        )
+        snapshots = [
+            snapshot
+            for snapshot in self.catalog.snapshots(after=before)
+            if snapshot.author == "duckdb-client"
+        ]
+        self.assertEqual([snapshot.message for snapshot in snapshots], expected)
+
     def test_time_pin_resolves_empty_catalog(self):
         name = "duckext-time-empty-" + uuid.uuid4().hex[:10]
         empty = self.client.create_catalog(
@@ -324,7 +371,7 @@ class AppendGuards(unittest.TestCase):
 
     def test_recreated_table_refuses_one_attempt(self):
         def recreate():
-            self.x.drop()
+            self.x.drop(author="duckdb-client-tests", message="drop test fixture")
             self.x = self.ns.create_table("x", SCHEMA)
 
         self.proxy.on_commit = recreate

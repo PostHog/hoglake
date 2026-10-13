@@ -2020,6 +2020,8 @@ class CompactionServiceIntegrationTest {
                     "t",
                     listOf(ColumnDef("id", ColType.LONG, nullable = false)),
                     ReplacementTarget(target.tableUuid, catalogs.getCatalog(fx.cat).headSnapshotId),
+                    author = "integration-test",
+                    message = "replace compacted table fixture",
                 ),
             )
 

@@ -315,6 +315,22 @@ def _seg(name: object) -> str:
     return quote(str(name), safe="")
 
 
+def _operation_metadata(
+    author: str | None, message: str | None, *, required: bool = False
+) -> dict[str, str]:
+    if required:
+        for field, value in (("author", author), ("message", message)):
+            if value is None or not value.strip():
+                raise ValidationError(
+                    f"{field} is required and must not be blank", status_code=None
+                )
+    return {
+        key: value
+        for key, value in (("author", author), ("message", message))
+        if value is not None
+    }
+
+
 def _record_uploads(error: BaseException, uploaded: Sequence[str]) -> None:
     """Stamp completed-upload progress on an exception before re-raise.
 
@@ -673,9 +689,22 @@ class HoglakeClient:
 
     # -- catalogs ----------------------------------------------------------
 
-    def create_catalog(self, name: str, data_path: str) -> Catalog:
+    def create_catalog(
+        self,
+        name: str,
+        data_path: str,
+        *,
+        author: str | None = None,
+        message: str | None = None,
+    ) -> Catalog:
         body = self._request(
-            "POST", "/catalogs", json={"name": name, "data_path": data_path}
+            "POST",
+            "/catalogs",
+            json={
+                "name": name,
+                "data_path": data_path,
+                **_operation_metadata(author, message),
+            },
         )
         return Catalog(self, CatalogInfo.from_wire(body))
 
@@ -724,8 +753,14 @@ class Catalog:
 
     # -- namespaces --------------------------------------------------------
 
-    def create_namespace(self, name: str) -> Namespace:
-        self._client._request("POST", self._path("/namespaces"), json={"name": name})
+    def create_namespace(
+        self, name: str, *, author: str | None = None, message: str | None = None
+    ) -> Namespace:
+        self._client._request(
+            "POST",
+            self._path("/namespaces"),
+            json={"name": name, **_operation_metadata(author, message)},
+        )
         return Namespace(self, name)
 
     def namespace(self, name: str) -> Namespace:
@@ -816,9 +851,17 @@ class Catalog:
         return CatalogOptions.from_wire(body)
 
     def set_retention(
-        self, seconds: int | None, consumer_floor: bool | None = None
+        self,
+        seconds: int | None,
+        consumer_floor: bool | None = None,
+        *,
+        author: str | None = None,
+        message: str | None = None,
     ) -> CatalogOptions:
-        payload: dict[str, Any] = {"snapshot_retention_seconds": seconds}
+        payload: dict[str, Any] = {
+            "snapshot_retention_seconds": seconds,
+            **_operation_metadata(author, message),
+        }
         if consumer_floor is not None:
             payload["consumer_floor"] = consumer_floor
         body = self._client._request("PATCH", self._path("/options"), json=payload)
@@ -1036,6 +1079,20 @@ class Namespace:
     def __repr__(self) -> str:  # pragma: no cover
         return f"<Namespace {self._catalog.name}.{self.name}>"
 
+    def drop(
+        self, *, author: str, message: str, expected_namespace_id: int | None = None
+    ) -> CommitResult:
+        """Drop an empty namespace, guarded by its identity. Do not retry an unknown outcome."""
+        params: dict[str, Any] = _operation_metadata(author, message, required=True)
+        if expected_namespace_id is None:
+            namespace = self._catalog._client._request("GET", self._path())
+            expected_namespace_id = namespace["namespace_id"]
+        params["expected_namespace_id"] = expected_namespace_id
+        body = self._catalog._client._request(
+            "DELETE", self._path(), params=params, conflict=CommitConflictError
+        )
+        return CommitResult.from_wire(body)
+
     # -- tables ------------------------------------------------------------
 
     def create_table(
@@ -1045,6 +1102,8 @@ class Namespace:
         *,
         partition_fields: Sequence[NamedPartitionField | PartitionField] | None = None,
         sort_fields: Sequence[NamedSortField | SortField] | None = None,
+        author: str | None = None,
+        message: str | None = None,
     ) -> Table:
         """Create a table from ``schema``, optionally with its initial
         partition spec and sort order.
@@ -1086,7 +1145,13 @@ class Namespace:
         ]
         if not parts and not sorts:
             body = self._catalog._client._request(
-                "POST", self._path("/tables"), json={"name": name, "columns": columns}
+                "POST",
+                self._path("/tables"),
+                json={
+                    "name": name,
+                    "columns": columns,
+                    **_operation_metadata(author, message),
+                },
             )
             return Table(self, TableInfo.from_wire(body))
         # Each list needs its own capability: a partition spec the
@@ -1097,15 +1162,17 @@ class Namespace:
             not sorts or ATOMIC_SORTED_CREATION in caps
         )
         if not atomic:
-            table = self.create_table(name, schema)
+            table = self.create_table(name, schema, author=author, message=message)
             ops: list[AlterOp] = []
             if parts:
                 ops.append(set_partition_spec(list(parts)))
             if sorts:
                 ops.append(set_sort_order(list(sorts)))
-            table.alter(ops)
+            table.alter(ops, author=author, message=message)
             return table
-        return self._create_table_atomically(name, columns, parts, sorts)
+        return self._create_table_atomically(
+            name, columns, parts, sorts, author=author, message=message
+        )
 
     def _create_table_atomically(
         self,
@@ -1113,6 +1180,9 @@ class Namespace:
         columns: list[dict[str, Any]],
         parts: Sequence[PartitionField],
         sorts: Sequence[SortField],
+        *,
+        author: str | None = None,
+        message: str | None = None,
     ) -> Table:
         """Prepare + publish one table-creations operation carrying the
         initial partition and sort fields. The ``/sorted`` preparation
@@ -1125,6 +1195,7 @@ class Namespace:
             "namespace": self.name,
             "name": name,
             "columns": columns,
+            **_operation_metadata(author, message),
         }
         if parts:
             definition["partition_fields"] = [f.to_wire() for f in parts]
@@ -1164,11 +1235,24 @@ class Namespace:
 
     # -- views -------------------------------------------------------------
 
-    def create_view(self, name: str, sql: str, dialect: str = "trino") -> View:
+    def create_view(
+        self,
+        name: str,
+        sql: str,
+        dialect: str = "trino",
+        *,
+        author: str | None = None,
+        message: str | None = None,
+    ) -> View:
         body = self._catalog._client._request(
             "POST",
             self._path("/views"),
-            json={"name": name, "sql": sql, "dialect": dialect},
+            json={
+                "name": name,
+                "sql": sql,
+                "dialect": dialect,
+                **_operation_metadata(author, message),
+            },
         )
         return View(self, ViewInfo.from_wire(body))
 
@@ -1206,9 +1290,11 @@ class View:
     def info(self) -> ViewInfo:
         return self._info
 
-    def drop(self) -> CommitResult:
+    def drop(self, *, author: str, message: str) -> CommitResult:
         body = self._namespace._catalog._client._request(
-            "DELETE", self._namespace._path(f"/views/{_seg(self.name)}")
+            "DELETE",
+            self._namespace._path(f"/views/{_seg(self.name)}"),
+            params=_operation_metadata(author, message, required=True),
         )
         return CommitResult.from_wire(body)
 
@@ -1426,11 +1512,20 @@ class Table:
 
     # -- DDL ---------------------------------------------------------------
 
-    def alter(self, ops: list[AlterOp]) -> TableInfo:
+    def alter(
+        self,
+        ops: list[AlterOp],
+        *,
+        author: str | None = None,
+        message: str | None = None,
+    ) -> TableInfo:
         body = self._namespace._catalog._client._request(
             "POST",
             self._path("/alter"),
-            json={"ops": [op.to_wire() for op in ops]},
+            json={
+                "ops": [op.to_wire() for op in ops],
+                **_operation_metadata(author, message),
+            },
             conflict=CommitConflictError,
         )
         # _adopt, not a bare assignment: the cache's (snapshot, read time)
@@ -1449,8 +1544,12 @@ class Table:
             self._ddl_snapshot_id = self._info.snapshot_id
         return self._info
 
-    def drop(self) -> CommitResult:
-        body = self._namespace._catalog._client._request("DELETE", self._path())
+    def drop(self, *, author: str, message: str) -> CommitResult:
+        body = self._namespace._catalog._client._request(
+            "DELETE",
+            self._path(),
+            params=_operation_metadata(author, message, required=True),
+        )
         result = CommitResult.from_wire(body)
         # The table is gone; a pin to one of its snapshots resolves a dead
         # incarnation, not this table. Drop it rather than hand back a
@@ -1458,6 +1557,20 @@ class Table:
         # recreate, at the wrong table). Same for the writer cache: a
         # prepare against it would be refused by the incarnation guard.
         self._ddl_snapshot_id = None
+        self._cache = None
+        return result
+
+    def truncate(self, *, author: str, message: str) -> CommitResult:
+        """Clear live rows without changing table identity. Do not retry an unknown outcome."""
+        body = self._namespace._catalog._client._request(
+            "POST",
+            self._path("/truncate"),
+            params={"expected_table_uuid": self.table_uuid},
+            json=_operation_metadata(author, message, required=True),
+            conflict=CommitConflictError,
+        )
+        result = CommitResult.from_wire(body)
+        self._ddl_snapshot_id = result.snapshot_id
         self._cache = None
         return result
 

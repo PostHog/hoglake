@@ -8,6 +8,21 @@ import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.posthog.hoglake.App
 import com.posthog.hoglake.Config
+import com.posthog.hoglake.commit.CommitService
+import com.posthog.hoglake.model.AlterOp
+import com.posthog.hoglake.model.ColType
+import com.posthog.hoglake.model.ColumnDef
+import com.posthog.hoglake.model.CommitRequest
+import com.posthog.hoglake.model.FileRegistration
+import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.TableAppend
+import com.posthog.hoglake.service.AlterService
+import com.posthog.hoglake.service.CatalogService
+import com.posthog.hoglake.service.OptionsService
+import com.posthog.hoglake.service.PatchField
+import com.posthog.hoglake.service.TableCreationDefinition
+import com.posthog.hoglake.service.TableCreationService
+import com.posthog.hoglake.service.ViewService
 import com.posthog.hoglake.testing.PgTestSupport
 import io.ktor.client.HttpClient
 import io.ktor.client.request.get
@@ -23,13 +38,16 @@ import io.ktor.server.testing.ApplicationTestBuilder
 import io.ktor.server.testing.testApplication
 import net.logstash.logback.encoder.LogstashEncoder
 import org.assertj.core.api.Assertions.assertThat
+import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.jdbi.v3.core.kotlin.useHandleUnchecked
+import org.jdbi.v3.core.kotlin.withHandleUnchecked
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
 import org.slf4j.LoggerFactory
+import java.util.UUID
 import java.util.concurrent.CopyOnWriteArrayList
 
 /**
@@ -136,6 +154,185 @@ class AuditIntegrationTest {
     private fun events(): List<JsonNode> = capture.lines.map { json.readTree(it) }
 
     private fun eventsFor(action: String): List<JsonNode> = events().filter { it["action"]?.asText() == action }
+
+    private fun assertAttribution(
+        line: JsonNode,
+        author: String?,
+        message: String?,
+        outcome: String,
+    ) {
+        assertThat(line["actor"].asText()).isEqualTo(author ?: "anonymous")
+        assertThat(line["operation_message"]?.asText()).isEqualTo(message)
+        assertThat(line["outcome"].asText()).isEqualTo(outcome)
+        assertThat(line["message"].asText()).isEqualTo("${line["action"].asText()} $outcome")
+    }
+
+    private fun assertSnapshotAttribution(
+        catalog: String,
+        snapshot: Long,
+        author: String,
+        message: String,
+    ) {
+        db.jdbi.withHandleUnchecked { h ->
+            val row =
+                h.createQuery(
+                    """
+                    SELECT s.author, s.commit_message FROM hog_snapshot s
+                    JOIN hog_catalog c ON c.catalog_id = s.catalog_id
+                    WHERE c.name = :catalog AND s.snapshot_id = :snapshot
+                    """,
+                ).bind("catalog", catalog).bind("snapshot", snapshot).mapToMap().one()
+            assertThat(row["author"]).isEqualTo(author)
+            assertThat(row["commit_message"]).isEqualTo(message)
+        }
+    }
+
+    @Test
+    fun `each DDL snapshot and audit preserve exact caller attribution`() {
+        val catalog = "ddl-audit-metadata"
+        val catalogs = CatalogService(db.jdbi)
+        val views = ViewService(db.jdbi)
+        val author = " engineer/λ \t "
+        val message = " explicit reason\n\"quoted\" & preserved "
+
+        fun verify(
+            action: String,
+            snapshot: Long,
+        ) {
+            assertSnapshotAttribution(catalog, snapshot, author, message)
+            val line = eventsFor(action).single { it["catalog"].asText() == catalog }
+            assertAttribution(line, author, message, "ok")
+            assertThat(catalogs.getCatalog(catalog).headSnapshotId).isEqualTo(snapshot)
+        }
+
+        catalogs.createCatalog(catalog, "s3://bucket/$catalog", author, message)
+        verify("catalog_create", 0)
+        catalogs.createNamespace(catalog, "ns", author, message)
+        verify("namespace_create", 1)
+        val table = catalogs.createTable(catalog, "ns", "t", listOf(ColumnDef("id", ColType.LONG)), author, message)
+        verify("table_create", 2)
+        AlterService(db.jdbi).alterTable(
+            catalog,
+            "ns",
+            "t",
+            listOf(AlterOp.SetTableComment("updated")),
+            author = author,
+            message = message,
+        )
+        verify("table_alter", 3)
+        views.create(catalog, "ns", "v", "SELECT id FROM t", author = author, message = message)
+        verify("view_create", 4)
+        catalogs.truncateTable(catalog, "ns", "t", table.tableUuid, author, message)
+        verify("table_truncate", 5)
+        views.drop(catalog, "ns", "v", author, message)
+        verify("view_drop", 6)
+        catalogs.dropTable(catalog, "ns", "t", author = author, message = message)
+        verify("table_drop", 7)
+        catalogs.dropNamespace(catalog, "ns", author = author, message = message)
+        verify("namespace_drop", 8)
+        val options = OptionsService(db.jdbi).patch(catalog, PatchField.Set(60L), false, author, message)
+        assertThat(options.snapshotRetentionSeconds).isEqualTo(60L)
+        assertThat(options.consumerFloor).isFalse()
+        assertThat(catalogs.getCatalog(catalog).headSnapshotId).isEqualTo(8)
+        assertAttribution(eventsFor("options_patch").single(), author, message, "ok")
+    }
+
+    @Test
+    fun `blank destructive attribution emits one validation audit and leaves state unchanged`() {
+        val catalog = "ddl-audit-refusal"
+        val catalogs = CatalogService(db.jdbi)
+        val views = ViewService(db.jdbi)
+        catalogs.createCatalog(catalog, "s3://bucket/$catalog")
+        val namespace = catalogs.createNamespace(catalog, "ns")
+        val table = catalogs.createTable(catalog, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        val view = views.create(catalog, "ns", "v", "SELECT id FROM t")
+        CommitService(db.jdbi).commit(
+            catalog,
+            CommitRequest(
+                appends =
+                    listOf(
+                        TableAppend("ns", "t", listOf(FileRegistration("s3://bucket/$catalog/a.parquet", 1, 100))),
+                    ),
+            ),
+        )
+        val head = catalogs.getCatalog(catalog).headSnapshotId
+        val files = catalogs.listFiles(catalog, "ns", "t")
+        for (field in listOf("author", "message")) {
+            for (blank in listOf(null, "", " \t\n", "\u2003\u00a0")) {
+                val author = if (field == "author") blank else "engineer"
+                val message = if (field == "message") blank else "reason"
+                val attempts =
+                    listOf<Pair<String, () -> Unit>>(
+                        "namespace_drop" to {
+                            catalogs.dropNamespace(catalog, "ns", author = author, message = message)
+                        },
+                        "table_drop" to { catalogs.dropTable(catalog, "ns", "t", author = author, message = message) },
+                        "table_truncate" to {
+                            catalogs.truncateTable(catalog, "ns", "t", table.tableUuid, author, message)
+                        },
+                        "view_drop" to { views.drop(catalog, "ns", "v", author, message) },
+                    )
+                for ((action, attempt) in attempts) {
+                    capture.lines.clear()
+                    assertThatThrownBy { attempt() }
+                        .isInstanceOf(HoglakeException.Validation::class.java).hasMessageContaining(field)
+                    assertThat(events()).hasSize(1)
+                    assertAttribution(eventsFor(action).single(), author, message, "validation")
+                    assertThat(catalogs.getCatalog(catalog).headSnapshotId).isEqualTo(head)
+                    assertThat(catalogs.getNamespace(catalog, "ns")).isEqualTo(namespace)
+                    assertThat(catalogs.getTable(catalog, "ns", "t").tableUuid).isEqualTo(table.tableUuid)
+                    assertThat(catalogs.listFiles(catalog, "ns", "t")).isEqualTo(files)
+                    assertThat(views.get(catalog, "ns", "v")).isEqualTo(view)
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `atomic prepare failure commit and replay audit the stored attribution`() {
+        val catalog = "atomic-audit-attribution"
+        val catalogs = CatalogService(db.jdbi)
+        catalogs.createCatalog(catalog, "s3://bucket/$catalog")
+        catalogs.createNamespace(catalog, "ns")
+        val definition =
+            TableCreationDefinition(
+                "ns",
+                "t",
+                listOf(ColumnDef("id", ColType.LONG)),
+                author = " engineer/λ \t ",
+                message = " exact reason\n\"quoted\" ",
+            )
+        val operation = UUID.randomUUID()
+        TableCreationService(db.jdbi, catalogs, CommitService(db.jdbi)).prepare(catalog, operation, definition)
+        assertAttribution(
+            eventsFor("table_creation_prepare").single(),
+            definition.author,
+            definition.message,
+            "prepared",
+        )
+        val creations = TableCreationService(db.jdbi, CatalogService(db.jdbi), CommitService(db.jdbi))
+        val head = catalogs.getCatalog(catalog).headSnapshotId
+        assertThatThrownBy {
+            creations.publish(catalog, operation, listOf(FileRegistration("s3://outside/a.parquet", 1, 100, 20)))
+        }.isInstanceOf(HoglakeException.Validation::class.java)
+        assertAttribution(
+            eventsFor("table_creation_publish").single(),
+            definition.author,
+            definition.message,
+            "validation",
+        )
+        assertThat(creations.status(catalog, operation).state).isEqualTo("prepared")
+        assertThat(catalogs.getCatalog(catalog).headSnapshotId).isEqualTo(head)
+        assertThat(catalogs.listTables(catalog, "ns")).isEmpty()
+        val committed = creations.publish(catalog, operation, emptyList())
+        assertThat(creations.publish(catalog, operation, emptyList())).isEqualTo(committed)
+        val lines = eventsFor("table_creation_publish")
+        assertThat(lines.map { it["outcome"].asText() }).containsExactly("validation", "committed", "replayed")
+        lines.forEach { assertAttribution(it, definition.author, definition.message, it["outcome"].asText()) }
+        assertThat(committed.snapshotId).isEqualTo(head + 1)
+        assertThat(catalogs.getCatalog(catalog).headSnapshotId).isEqualTo(committed.snapshotId)
+        assertSnapshotAttribution(catalog, committed.snapshotId!!, definition.author!!, definition.message!!)
+    }
 
     private fun api(block: suspend ApplicationTestBuilder.(HttpClient) -> Unit) =
         testApplication {
