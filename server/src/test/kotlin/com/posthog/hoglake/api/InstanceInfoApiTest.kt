@@ -129,12 +129,19 @@ class InstanceInfoApiTest {
             app.catalogMetrics.sampleOnce()
 
             // Sampled, but this catalog's maintenance summary has published
-            // nothing yet: the totals exist and the catalog is counted OUT
-            // of them, not read from its manifest (#269).
+            // nothing yet: the catalog is counted OUT of the totals, not
+            // read from its manifest (#269). The sums themselves are
+            // present exactly when SOME catalog is covered (the app is
+            // shared across tests, so whether one is depends on order);
+            // with none covered they are withheld rather than 0.
             val unsampled = body(client.get("/v1/info"))
-            assertThat(unsampled["total_rows"].isIntegralNumber).isTrue()
             assertThat(unsampled["unsampled_catalogs"].asInt()).isGreaterThanOrEqualTo(1)
-            assertThat(unsampled["total_rows"].asLong()).isEqualTo(sumOfListing(client, "live_rows"))
+            val anyCovered = body(client.get("/v1/catalogs")).any { it.has("live_rows") }
+            assertThat(unsampled.has("total_rows")).isEqualTo(anyCovered)
+            assertThat(unsampled.has("total_size_bytes")).isEqualTo(anyCovered)
+            if (anyCovered) {
+                assertThat(unsampled["total_rows"].asLong()).isEqualTo(sumOfListing(client, "live_rows"))
+            }
 
             publishMaintenanceSample(db.jdbi)
             app.catalogMetrics.sampleOnce()
@@ -295,8 +302,8 @@ class InstanceInfoApiTest {
         assertThat(app.catalogMetrics.latestTotals).isEqualTo(before)
 
         app.catalogMetrics.sampleOnce()
-        assertThat(app.catalogMetrics.latestTotals!!.totalRows).isEqualTo(before.totalRows - 15)
+        assertThat(app.catalogMetrics.latestTotals!!.totalRows).isEqualTo(before.totalRows!! - 15)
         assertThat(app.catalogMetrics.latestTotals!!.totalSizeBytes)
-            .isEqualTo(before.totalSizeBytes - 1_050_624)
+            .isEqualTo(before.totalSizeBytes!! - 1_050_624)
     }
 }

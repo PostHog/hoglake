@@ -850,7 +850,9 @@ data class CommitOffsetRequestDto(val snapshotId: Long)
  * sampler's last pass (each catalog as of its maintenance summary's
  * published generation; a catalog without one contributes nothing and
  * is counted in unsampledCatalogs) and are omitted in the boot window
- * before it.
+ * before it. The two sums are also omitted, with unsampledCatalogs
+ * alone present, while catalogs exist but none has published totals:
+ * a sum over nothing is 0, which would read as an empty warehouse.
  * Version is the running server's own, always present (BuildInfo falls
  * back to "unknown" rather than omitting it — "which version is this?"
  * having no answer is itself the answer an operator needs).
@@ -867,7 +869,7 @@ data class InstanceInfoDto(
     val build: String?,
     val totalRows: Long?,
     val totalSizeBytes: Long?,
-    /** Catalogs left out of BOTH totals: no published live totals, or none for rows. Omitted with them. */
+    /** Catalogs left out of BOTH totals: no published live totals, or none for rows. Omitted before the first sample. */
     val unsampledCatalogs: Int? = null,
     val uiTheme: String? = null,
 )
