@@ -23,6 +23,7 @@ committed to the log ends.
 from __future__ import annotations
 
 import asyncio
+import re
 import signal
 import time
 
@@ -277,11 +278,23 @@ async def test_startup_drain_flushes_before_consuming(
             )
             await asyncio.sleep(0.05)
         assert statuses[-1] == 200, child_b.output()[-4000:]
-        assert 503 in statuses, f"never observed not-ready during the drain: {statuses}"
-
         out = child_b.output()
         drained = out.index("startup drain finished")
-        assert "staged group(s) to drain" in out[:drained]
+        # The streaming drain of one wave can finish before the first
+        # probe lands, so the order is read from the log: the partitions'
+        # streams started, the drain finished, and only then the assign
+        # (readiness turns 200 only after start() returns, test_main).
+        streaming = out.index("streaming its staged rows")
+        assert streaming < drained < out.index("assigned "), out[-4000:]
+        streamed = re.findall(
+            r"startup drain of \S+\[\d+\] streamed: \d+ window\(s\), (\d+) row\(s\)",
+            out[:drained],
+        )
+        assert len(streamed) == topic.partitions, out[-4000:]
+        assert sum(int(rows) for rows in streamed) >= WAVE_EVENTS
+        samples = livekit.scrape_metrics(port_b)
+        drain_rows = livekit.metric(samples, "millrace_drain_rows_total")
+        assert drain_rows is not None and drain_rows >= WAVE_EVENTS
         assert out.index("assigned ") > drained, "assigned before the drain finished"
         # Every wave-1 row was published by the drain itself.
         wave1 = list(range(WAVE_EVENTS))

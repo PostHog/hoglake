@@ -149,10 +149,8 @@ class JournalingStageManager(StageManager):
         super().__init__("memory:///", "millrace", settings=fast_flush_settings())
         self.journal = journal
 
-    async def open_partition(
-        self, topic: str, partition: int, *, now_us: int
-    ) -> PartitionStage:
-        stage = await super().open_partition(topic, partition, now_us=now_us)
+    async def open_partition(self, topic: str, partition: int) -> PartitionStage:
+        stage = await super().open_partition(topic, partition)
         real = stage.stage_batch
 
         async def journaled(records: Any, *, now_us: int) -> Any:
@@ -619,9 +617,9 @@ async def test_static_start_opens_stages_before_assign(fake_clock):
     manager = make_manager(journal)
     original_sync = manager.sync_assignment
 
-    async def spied_sync(claimed, *, now_us):
+    async def spied_sync(claimed):
         journal.append(("sync_assignment", frozenset(claimed)))
-        return await original_sync(claimed, now_us=now_us)
+        return await original_sync(claimed)
 
     manager.sync_assignment = spied_sync  # type: ignore[method-assign]
     fake = FakeConsumer(journal=journal, partitions=3)
@@ -691,13 +689,13 @@ async def test_static_start_fails_loudly_when_the_coordinator_never_answers(
 async def test_start_drains_previously_staged_rows_before_assign_and_consume(
     fake_clock,
 ):
-    """The startup drain: the stages are opened and their staged groups
-    discovered, the caller's drain runs over them, and only then is the
-    partition assigned and consumed."""
+    """The startup drain: the stages are opened, the caller's drain runs
+    over what they hold, and only then is the partition assigned and
+    consumed."""
     journal: list[tuple] = []
     manager = make_manager(journal)
     # A previous process staged rows and went away without flushing.
-    previous = await manager.open_partition("events", 0, now_us=NOW)
+    previous = await manager.open_partition("events", 0)
     await previous.stage_batch([rec(1, 100, 0), rec(1, 200, 1)], now_us=NOW)
     await manager.close_partition("events", 0)
 
@@ -709,13 +707,14 @@ async def test_start_drains_previously_staged_rows_before_assign_and_consume(
     async def drain() -> None:
         journal.append(("drain",))
         stage = manager.stage("events", 0)
-        # Discovered before the drain runs: the index knows the group.
+        # Opened before the drain runs, with the previous rows on disk
+        # (the drain's row stream reads them; the index starts empty).
         seen.append([s.group for s in stage.snapshot()])
         seen.append(await team_offsets(stage, 1))
         assert not any(e[0] in ("assign", "consume") for e in journal)
 
     await consumer.start(drain=drain)
-    assert seen == [[("1",)], [0, 1]]
+    assert seen == [[], [0, 1]]
     kinds = [e[0] for e in journal]
     assert kinds.index("drain") < kinds.index("assign")
     assert consumer.started

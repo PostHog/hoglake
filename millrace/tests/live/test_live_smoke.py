@@ -74,8 +74,12 @@ async def test_s3_staging_smoke(lake_home, topic_factory):
         db_cache_id=db_cache_id_for(topic.name, 0),
     )
     try:
-        # Discovery finds the group a previous process left staged.
-        assert await reopened.discover(now_us=base) == [("7",)]
+        # The drain's row stream reads the group a previous process left.
+        stream = reopened.row_stream(max_bytes=1 << 30, now_us=base)
+        window = await stream.next_window()
+        assert window is not None and window.group == ("7",)
+        assert len(window.rows) == 50 and window.complete
+        assert await stream.next_window() is None
         scan = await reopened.scan(("7",), max_bytes=1 << 30, now_us=base)
         assert scan.complete and len(scan.rows) == 50
         for i, (row_key, payload) in enumerate(scan.rows):

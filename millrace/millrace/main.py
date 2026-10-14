@@ -1,9 +1,10 @@
 """Process entry point: config → stages → destination → flusher →
 startup drain → consumer + flush loop, plus the ops HTTP server.
 
-Startup order matters. The stages are opened (each instance's staged
-groups discovered) and EVERYTHING already staged is flushed (the startup
-drain) before the consumer is assigned its partitions. Staged state
+Startup order matters. The stages are opened and EVERYTHING already
+staged is flushed (the startup drain: one sequential pass over each
+partition's rows, partitions concurrently) before the consumer is
+assigned its partitions. Staged state
 therefore never outlives a process, which is what lets group sizes and
 ages live in memory only. ``/readyz`` answers 503 for the whole drain;
 the deployment's startup probe must allow for it (README).
@@ -224,6 +225,16 @@ class _PipelineCollector:
             "millrace_flush_groups_stuck",
             f"Groups currently at or past {STUCK_AFTER} consecutive flush failures (alert)",
             value=_probe_read(lambda: self._runner.stuck_groups, 0),
+        )
+        yield CounterMetricFamily(
+            "millrace_drain_rows_total",
+            "Staged rows the startup drain flushed (published or dropped)",
+            value=self._runner.drain_rows,
+        )
+        yield CounterMetricFamily(
+            "millrace_drain_bytes_total",
+            "Staged payload bytes the startup drain flushed",
+            value=self._runner.drain_bytes,
         )
         yield GaugeMetricFamily(
             "millrace_draining",
