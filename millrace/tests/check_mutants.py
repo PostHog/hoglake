@@ -1,4 +1,4 @@
-"""The mutmut survivors gate (M8): a clean `mutmut run`'s outcome must
+"""The mutmut survivors gate: a clean `mutmut run`'s outcome must
 reconcile with the survivor ledger in tests/MUTATION_TESTING.md.
 
 Run AFTER `uv run mutmut run`, from anywhere:

@@ -30,7 +30,7 @@ import pytest
 from hypothesis import HealthCheck, settings
 from stagekit import NOW, fast_flush_settings, shared_cache
 
-from millrace.stage import AckHook, PartitionStage
+from millrace.stage import PartitionStage
 
 settings.register_profile(
     "millrace",
@@ -113,7 +113,6 @@ def stage_factory(memory_store: Any) -> StageFactory:
         topic: str = "events",
         partition: int = 0,
         settings: Any = None,
-        ack_hook: AckHook | None = None,
     ) -> PartitionStage:
         return await PartitionStage.open_store(
             memory_store,
@@ -121,7 +120,6 @@ def stage_factory(memory_store: Any) -> StageFactory:
             topic=topic,
             partition=partition,
             settings=settings if settings is not None else fast_flush_settings(),
-            ack_hook=ack_hook,
             **shared_cache(topic, partition),
         )
 
@@ -146,3 +144,69 @@ class FakeClock:
 @pytest.fixture
 def fake_clock() -> FakeClock:
     return FakeClock()
+
+
+# -- the flush suite's shared fixtures (scripted hoglake + fake lake) --
+
+
+@pytest.fixture
+def store() -> Any:
+    from flushkit import FakeObjectStore
+
+    return FakeObjectStore()
+
+
+@pytest.fixture
+def sleeper() -> Any:
+    from flushkit import Sleeper
+
+    return Sleeper()
+
+
+@pytest.fixture
+def mono() -> Any:
+    from flushkit import FakeMonotonic
+
+    return FakeMonotonic()
+
+
+@pytest.fixture
+def flusher_factory(
+    httpx_mock: Any, fake_clock: FakeClock, sleeper: Any, mono: Any
+) -> Any:
+    """Boot HoglakeFlushers against the scripted server (bootstrap reads
+    only; a test that flushes registers the retention read itself);
+    closed at teardown."""
+    from flushkit import BASE, make_config, script_bootstrap
+    from pyhoglake import HoglakeClient
+
+    from millrace.flush import HoglakeFlusher
+
+    created: list[Any] = []
+
+    def make(
+        *,
+        cfg: Any = None,
+        store: Any,
+        table: Any = None,
+        namespaces: list[str] | None = None,
+        new_token: Any = None,
+    ) -> Any:
+        script_bootstrap(httpx_mock, table=table, namespaces=namespaces)
+        client = HoglakeClient(BASE)
+        client.s3 = store
+        extra = {} if new_token is None else {"new_token": new_token}
+        flusher = HoglakeFlusher.resolve(
+            client,
+            cfg if cfg is not None else make_config(),
+            now_us=fake_clock,
+            sleep=sleeper,
+            monotonic=mono,
+            **extra,
+        )
+        created.append(flusher)
+        return flusher
+
+    yield make
+    for flusher in created:
+        flusher.close()

@@ -57,9 +57,8 @@ RUN groupadd --system --gid 10001 hoglake \
 COPY --from=build /opt/hoglake-millrace/venv/ /opt/hoglake-millrace/venv/
 ENV PATH="/opt/hoglake-millrace/venv/bin:$PATH"
 # Nothing is written outside /tmp: staging lives on the object store
-# (SlateDB), parquet is built in memory and uploaded. /work is the cwd
-# so an opt-in memory-debug file (MILLRACE_MEMORY_DEBUG_FILE) has a
-# writable default home. Read-only-rootfs friendly otherwise.
+# (SlateDB), parquet is built in memory and uploaded. /work is a
+# writable cwd. Read-only-rootfs friendly otherwise.
 RUN install -d -o 10001 -g 10001 /work
 WORKDIR /work
 USER 10001

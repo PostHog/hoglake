@@ -7,9 +7,8 @@ NON-GATING: the ``bench`` marker is deselected from default runs
 
 Shape: the design's per-pod slice — batches of 500 records x 1024-byte
 payloads (~0.5 MiB per batch; at the 5K msg/s event rate that is ten
-batches per second) — measuring ``stage_batch`` (rows + stats + sched +
-offsets, durability-acked), ``iter_key_stats``, full row scans, and
-``commit_flushed`` settle throughput, on ``memory:///`` and ``file:///``
+batches per second) — measuring ``stage_batch`` (durability-acked), the
+in-memory index snapshot, full row scans, and ``settle`` throughput, on ``memory:///`` and ``file:///``
 (tmpdir), at the default 100 ms WAL flush interval and at 10 ms.
 
 Results print as a table (``-s``) for the PR body. The only assertions
@@ -38,7 +37,7 @@ from dataclasses import dataclass
 
 import pytest
 from slatedb.uniffi import ObjectStore, Settings
-from stagekit import NOW, fast_flush_settings, shared_cache, window
+from stagekit import NOW, fast_flush_settings, shared_cache
 
 from millrace.slatedb_metrics import snapshot_recorder
 from millrace.stage import PartitionStage, StagedRecord, build_slatedb_settings
@@ -114,31 +113,26 @@ async def _run_bench(
     stage_s = time.perf_counter() - stage_start
 
     t0 = time.perf_counter()
-    stats = await stage.iter_key_stats()
+    stats = stage.snapshot()
     stats_scan_s = time.perf_counter() - t0
-    assert sum(s.row_count for s in stats) == TOTAL_ROWS
+    assert sum(s.rows for s in stats) == TOTAL_ROWS
     assert sum(s.staged_bytes for s in stats) == TOTAL_ROWS * PAYLOAD_BYTES
 
-    rows_scanned = 0
     t0 = time.perf_counter()
-    for team in range(TEAMS):
-        async for _rk, _v in stage.scan_group_rows((str(team),)):
-            rows_scanned += 1
+    scans = [
+        await stage.scan((str(team),), max_bytes=1 << 40, now_us=NOW)
+        for team in range(TEAMS)
+    ]
     row_scan_s = time.perf_counter() - t0
+    rows_scanned = sum(len(scan.rows) for scan in scans)
     assert rows_scanned == TOTAL_ROWS
 
-    rows_deleted = 0
     t0 = time.perf_counter()
-    for team in range(TEAMS):
-        team_offsets = [o for o in range(TOTAL_ROWS) if o % TEAMS == team]
-        report = await stage.commit_flushed(
-            window(team, min(team_offsets), max(team_offsets))
-        )
-        assert report.group_drained
-        rows_deleted += report.rows_deleted
+    for scan in scans:
+        assert await stage.settle(scan)
     settle_s = time.perf_counter() - t0
-    assert rows_deleted == TOTAL_ROWS
-    assert await stage.iter_key_stats() == []
+    rows_deleted = rows_scanned
+    assert stage.snapshot() == []
     await stage.close()
     return BenchResult(
         label,
@@ -286,8 +280,7 @@ async def _run_whale(
         offset += len(batch)
     stage_s = time.perf_counter() - start
     stalls = _stall_counters(stage)
-    stats = await stage.iter_key_stats()
-    assert sum(s.row_count for s in stats) == WHALE_ROWS
+    assert sum(s.rows for s in stage.snapshot()) == WHALE_ROWS
     await stage.close()
     return WhaleResult(label, WHALE_ROWS, stage_s, lat, stalls)
 
@@ -297,7 +290,7 @@ async def test_bench_whale_single_partition():
     library defaults vs the production settings, on memory:/// and
     file:/// — with the stage's own stall counters as evidence."""
     production = build_slatedb_settings(
-        gc_enabled=False, max_unflushed_bytes=256 * 1024 * 1024, l0_max_ssts=8
+        max_unflushed_bytes=256 * 1024 * 1024, l0_max_ssts=8
     )
     results = [
         await _run_whale(
@@ -327,7 +320,6 @@ async def test_bench_whale_single_partition():
                 ObjectStore.resolve("file:///"),
                 f"{td}/whale-prod",
                 build_slatedb_settings(
-                    gc_enabled=False,
                     max_unflushed_bytes=256 * 1024 * 1024,
                     l0_max_ssts=8,
                 ),
@@ -348,7 +340,7 @@ async def test_bench_whale_l0_stress():
 
     def stress_settings(l0_max: int) -> Settings:
         s = build_slatedb_settings(
-            gc_enabled=False, max_unflushed_bytes=256 * 1024 * 1024, l0_max_ssts=l0_max
+            max_unflushed_bytes=256 * 1024 * 1024, l0_max_ssts=l0_max
         )
         s.set("l0_sst_size_bytes", str(1024 * 1024))
         return s
@@ -380,7 +372,7 @@ async def test_bench_whale_l0_stress():
                 offset += len(batch)
             stage_s = time.perf_counter() - start
             stalls = _stall_counters(stage)
-            assert sum(s.row_count for s in await stage.iter_key_stats()) == rows
+            assert sum(s.rows for s in stage.snapshot()) == rows
             await stage.close()
             results.append(
                 WhaleResult(

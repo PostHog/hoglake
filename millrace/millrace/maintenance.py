@@ -1,90 +1,36 @@
 """External maintenance for millrace's per-partition SlateDB staging instances.
 
-Deployed BESIDE a millrace fleet (its own process, its own pod): it loops over
-ALL per-partition SlateDB instances across topics and replicas — discovered by
-prefix listing under the staging root — so the replicas, already hosting many
-DBs, shed the collection traffic.
+Deployed beside a millrace fleet (its own process, its own pod), it loops
+over every per-partition SlateDB instance under the staging root, all
+topics and replicas, discovered by prefix listing. Ingest pods always run
+with the writer-internal GC off (stage.py ``build_slatedb_settings``), so
+this service owns collection and the ingest pods carry no LIST/DELETE
+traffic for it.
 
-SCOPE: GARBAGE COLLECTION + COMPACTION-DEBT MONITORING. There is deliberately
-no compaction EXECUTION loop here. The binding-parity suite
-(tests/test_slatedb_parity.py, "external maintenance" section — the
-load-bearing probes, each pinning observed 0.17.0 behavior) established:
+Scope: garbage collection plus compaction-debt monitoring. There is no
+compaction execution here: the slatedb 0.17 Python binding cannot run a
+compactor (``Admin.submit_compaction`` only enqueues work the writer's own
+compactor executes; tests/test_slatedb_parity.py pins this), and writers
+must keep their embedded compactor or memtable flushes stall at
+``l0_max_ssts``.
 
-* ``Admin.submit_compaction`` only ENQUEUES a ``Submitted`` record into the
-  DB's ``.compactions`` store; execution needs a compactor process. The Rust
-  core has one (``Admin::run_compactor`` / ``run_compaction_worker``) but the
-  slatedb 0.17.0 Python binding does not wrap it (verified at the FFI symbol
-  level). External processes can therefore SCHEDULE compactions — the writer's
-  internal compactor picks them up and executes them — but can never EXECUTE
-  them: the merge's CPU and object-store traffic would stay on the replicas,
-  which is exactly what this service exists to shed. Worse, against a writer
-  running with its compactor disabled the submission FAILS
-  (``Error.Data("invalid DB state")``: the compactions store is created by a
-  running compactor).
-* Disabling the writer's compactor (``compactor_options = null``) is accepted
-  by the settings parser but unsafe: memtable→L0 flushes STALL once L0 holds
-  ``l0_max_ssts`` SSTs and nothing external can drain them. Writers must keep
-  their internal compactor.
-
-If a future binding exposes a compactor runner, the red parity tests are the
-migration guide for growing the compaction half of this service.
-
-The DEBT half exists because this service is the only component that sees
-every DB: per swept DB it reads the compactor state view
-(``Admin.read_compactor_state_view``) and exports the L0 SST count as
+Debt: per swept DB the compactor state view's L0 SST count is exported as
 ``millrace_maintenance_compaction_l0_ssts{topic,partition}`` plus the fleet
-max — a writer's embedded compactor falling behind shows HERE first (L0
-approaching ``l0_max_ssts`` is the write-stall precursor). Per-DB labels are
-fine HERE (PR #331): this service is the fleet authority on debt, so its
-cardinality is the fleet's DB count, not a pod's hot-path labels. The read is
-one manifest+compactions fetch per DB, ridden on the sweep's existing
-``max_dbs_per_sweep`` budget (a DB's series is as fresh as its last rotation
-slot — stated, not hidden).
+max (L0 approaching ``l0_max_ssts`` is the write-stall precursor).
 
-GC is safe to run externally and concurrently with active writers (pinned by
-the parity suite): ``Admin.run_gc_once`` executes synchronously in THIS
-process, never deletes objects referenced by the latest manifest, any
-checkpoint, or in-flight compactions (its cutoffs are conservative: the
-compactor's self-checkpoint — ``compactor_options.checkpoint_lifetime``,
-default 900s — pins a compaction's inputs after the commit, and an empty
-compactions file disables compacted-SST deletion outright).
+GC is safe concurrently with active writers (parity-pinned):
+``Admin.run_gc_once`` never deletes objects referenced by the latest
+manifest, a checkpoint or an in-flight compaction. It never raises for a
+missing or foreign path, so the sweep probes ``read_manifest`` first:
+``None`` means the DB vanished (skipped, counted); an exception is a
+contained per-DB failure.
 
-CONTAINMENT CONTRACT (pinned): ``run_gc_once`` NEVER raises for a missing or
-foreign path — per-task errors are logged inside the binding and swallowed —
-so an Ok return is no evidence a DB was GC'd. The sweep therefore probes
-``read_manifest`` first: ``None`` means "no DB here" (vanished between
-discovery and sweep — skipped, counted); an exception (corrupt manifest) is
-the contained per-DB failure. (``read_compactor_state_view`` cannot replace
-the probe: it raises ``Error.Data`` for a missing DB AND for a corrupt one —
-probe-verified — so it cannot tell "vanished" apart from "broken".)
-
-WRITER SETTINGS (owned by config.py / stage.py — the note this docstring used
-to carry as a TODO is wired): writers run with
-``MILLRACE_SLATEDB_GC_ENABLED=false`` by default — the writer-internal GC
-loop is OFF because this service owns collection (doubled GC is wasted
-LIST/DELETE traffic on the replicas; GC is idempotent and overlap-safe, so a
-misconfigured doubling is wasteful, never corrupt) — and there is no knob at
-all for ``compactor_options`` (above). ``MILLRACE_SLATEDB_MAX_UNFLUSHED_BYTES``
-/ ``MILLRACE_SLATEDB_L0_MAX_SSTS`` tune the per-instance memory/stall shape.
-
-DISCOVERY IS CACHED: a full recursive listing of the staging root runs at
-most once per ``discovery_interval_s`` (default 1 h); sweeps in between work
-the CACHED set (a new partition's DB waits at most one discovery cadence for
-its first sweep — harmless: a fresh DB has no garbage, and GC's own min_age
-exceeds the listing lag; a VANISHED DB's manifest probe answers False and it
-is skipped until the next listing drops it). A listing failure with a warm
-cache degrades to the cache (counted); with a cold one it fails the
-iteration, as before.
-
-Scale doctrine (AGENT.md): sweeps are BUDGETED — at most
-``max_dbs_per_sweep`` databases per sweep, paging through the sorted path
-set in order (a cursor over successive sweeps, so a fleet larger than the
-budget is covered in full every ⌈N/budget⌉ sweeps); a sweep that truncates
-says so in its report (the ledger) and in the
-``millrace_maintenance_sweep_truncated`` gauge. Per-DB failures are
-contained (logged, counted, sweep continues). The cadence is jittered so N
-replicas of this service (or N topics' fleets) do not synchronize their
-sweeps against the object store.
+Discovery is cached: a full listing runs at most once per
+``discovery_interval_s``; sweeps in between work the cached set, and a
+listing failure with a warm cache degrades to it. Sweeps are budgeted
+(``max_dbs_per_sweep``, a cursor over the sorted path set, truncation
+reported), per-DB failures are contained, and the cadence is jittered so
+several services do not synchronize against the object store.
 """
 
 from __future__ import annotations

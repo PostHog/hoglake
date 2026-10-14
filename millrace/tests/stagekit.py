@@ -3,7 +3,7 @@ name does not match ``test_*`` and pytest never collects it).
 
 Lives beside the tests so the component suite, the file:///
 integration suite, the parity probes and the kill-child subprocess all
-build records, windows and payloads the same way (hedgerow's fakes.py
+build records and payloads the same way (hedgerow's fakes.py
 pattern).
 """
 
@@ -11,11 +11,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from millrace.keyspace import FlushedKey, PreparedRequest
 from millrace.stage import StagedRecord
 
 NOW = 1_800_000_000_000_000  # an arbitrary fixed staging instant, µs (≈ 2027-01-15)
-TABLE = "00000000-0000-0000-0000-0000000000aa"  # the "table" idempotency scope
 
 
 def fast_flush_settings() -> Any:
@@ -36,8 +34,7 @@ def shared_cache(topic: str = "events", partition: int = 0) -> dict[str, Any]:
     """The cache keywords ``PartitionStage.open``/``open_store`` now
     REQUIRE, at the production shape: a split cache at the config
     defaults (``build_slatedb_cache``) scoped by ``db_cache_id_for``.
-    A fresh cache per call — correctness never depends on cache warmth,
-    and moka allocates by occupancy, not capacity. Spread it:
+    A fresh cache per call. Spread it:
     ``open_store(..., **shared_cache(topic, partition))``."""
     from millrace.config import (
         SLATEDB_BLOCK_CACHE_BYTES_DEFAULT,
@@ -75,48 +72,6 @@ def rec(team: int, ts: int, offset: int, payload: bytes | None = None) -> Staged
         if payload is not None
         else f"payload-{team}-{ts}-{offset}".encode(),
     )
-
-
-def window(team: int, first: int, last: int) -> FlushedKey:
-    """The settlement window for the committed range of tuple ``g(team)``
-    over ``first..last`` — what ``commit_flushed``
-    deletes."""
-    return FlushedKey(g(team), first, last, group_fields=FIELDS)
-
-
-def prepared(
-    key: str, *, team: int, first: int = 0, at: int = NOW, rows: int = 0
-) -> PreparedRequest:
-    """A persisted prepared request for tuple ``g(team)`` on events[0]."""
-    return PreparedRequest(
-        idempotency_key=key,
-        body=b"{}",
-        persisted_at=at,
-        topic="events",
-        partition=0,
-        group=g(team),
-        group_fields=FIELDS,
-        row_count=rows,
-        digest="0" * 64,
-        scanned_at=None,
-    )
-
-
-def legacy_marker_kv(team: int, first: int, last: int) -> tuple[bytes, bytes]:
-    """A ``flushed/`` (key, value) pair as pre-lifecycle builds wrote it.
-
-    Only tests seed these: no current code writes ``flushed/`` keys, and
-    ``recover()`` collects them WITHOUT decoding — the value here is
-    deliberately not a real envelope, to pin that. The key keeps the
-    legacy byte shape (u64 team + two offset-binary int64s) so the
-    collection is exercised on realistic bytes.
-    """
-
-    def ordered(v: int) -> bytes:
-        return (v + (1 << 63)).to_bytes(8, "big")
-
-    key = b"flushed/" + team.to_bytes(8, "big") + ordered(first) + ordered(last)
-    return key, b"\x01not-a-real-flushed-value"
 
 
 def payload_for(offset: int, size: int) -> bytes:

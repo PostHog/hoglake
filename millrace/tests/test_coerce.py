@@ -647,3 +647,163 @@ def test_a_variant_column_is_refused_at_any_depth(
 ) -> None:
     with pytest.raises(UnsupportedColumnError, match=f"column '{path}' is a variant"):
         coercer_for(col(wire))
+
+
+# -- timestamps outside years 1-9999 are clamped, never dropped ----------------
+
+_MIN_US = -62_135_596_800_000_000  # 0001-01-01T00:00:00
+_MAX_US = 253_402_300_799_999_999  # 9999-12-31T23:59:59.999999
+_INT64 = (-(1 << 63), (1 << 63) - 1)
+
+#: Per timestamp type: (lo, hi) in the column's unit.
+_BOUNDS: dict[str, tuple[int, int]] = {
+    "timestamp_s": (_MIN_US // 1_000_000, _MAX_US // 1_000_000),
+    "timestamp_ms": (_MIN_US // 1_000, _MAX_US // 1_000),
+    "timestamp": (_MIN_US, _MAX_US),
+    "timestamptz": (_MIN_US, _MAX_US),
+    "timestamp_ns": _INT64,  # int64 nanos span only 1677-2262
+}
+
+
+def _ts_coercer(t: str, notes: list[str]) -> Any:
+    return coercer_for(
+        col({"name": "ts", "type": t, "field_id": 1, "ordinal": 0}),
+        on_clamp=notes.append,
+    )
+
+
+def test_timestamp_bounds_are_years_1_to_9999_narrowed_to_int64() -> None:
+    from millrace.coerce import timestamp_bounds
+
+    for t, bounds in _BOUNDS.items():
+        assert timestamp_bounds(t) == bounds
+
+
+@pytest.mark.parametrize("t", sorted(_BOUNDS))
+def test_an_out_of_range_epoch_integer_clamps_and_is_reported(t: str) -> None:
+    notes: list[str] = []
+    coerce = _ts_coercer(t, notes)
+    lo, hi = _BOUNDS[t]
+    assert coerce(hi + 1) == hi
+    assert coerce(lo - 1) == lo
+    assert coerce(10**30) == hi
+    assert coerce(-(10**30)) == lo
+    assert notes == ["ts"] * 4
+    # In range: untouched, not reported.
+    assert coerce(hi) == hi
+    assert coerce(lo) == lo
+    assert coerce(0) == 0
+    assert notes == ["ts"] * 4
+
+
+@pytest.mark.parametrize("t", sorted(_BOUNDS))
+@pytest.mark.parametrize(
+    ("text", "side"),
+    [
+        ("10000-01-01T00:00:00", 1),
+        ("+10000-01-01T00:00:00", 1),
+        ("99999-06-15 12:00:00", 1),
+        ("0000-01-01T00:00:00", -1),
+        ("-0001-12-31T23:59:59", -1),
+    ],
+)
+def test_an_iso_string_outside_years_1_to_9999_clamps(
+    t: str, text: str, side: int
+) -> None:
+    notes: list[str] = []
+    lo, hi = _BOUNDS[t]
+    assert _ts_coercer(t, notes)(text) == (hi if side > 0 else lo)
+    assert notes == ["ts"]
+
+
+@pytest.mark.parametrize("t", sorted(_BOUNDS))
+def test_an_iso_string_at_the_edges_is_exact(t: str) -> None:
+    notes: list[str] = []
+    coerce = _ts_coercer(t, notes)
+    lo, hi = _BOUNDS[t]
+    if t == "timestamp_ns":
+        # Year 1 and 9999 are outside int64 nanos: clamped to int64.
+        assert coerce("0001-01-01T00:00:00") == lo
+        assert coerce("9999-12-31T23:59:59") == hi
+        assert notes == ["ts", "ts"]
+        return
+    assert coerce("0001-01-01T00:00:00") == lo
+    assert notes == []
+    top = "9999-12-31T23:59:59" + (
+        ".999999" if t in ("timestamp", "timestamptz") else ""
+    )
+    if t == "timestamp_ms":
+        top = "9999-12-31T23:59:59.999"
+    assert coerce(top) == hi
+    assert notes == []
+
+
+def test_tz_offsets_near_the_edges_never_overflow_and_clamp() -> None:
+    notes: list[str] = []
+    coerce = _ts_coercer("timestamptz", notes)
+    # 9999-12-31T23:00 at -05:00 is 10000-01-01T04:00 UTC: past the top.
+    assert coerce("9999-12-31T23:00:00-05:00") == _MAX_US
+    # 0001-01-01T01:00 at +05:00 is 0000-12-31T20:00 UTC: below the bottom.
+    assert coerce("0001-01-01T01:00:00+05:00") == _MIN_US
+    assert notes == ["ts", "ts"]
+    # In range with an offset: exact integer arithmetic.
+    assert coerce("9999-12-31T18:59:59.999999-05:00") == _MAX_US
+    assert coerce("0001-01-01T05:00:00+05:00") == _MIN_US
+    assert notes == ["ts", "ts"]
+
+
+def test_an_offset_out_of_range_string_into_a_naive_column_is_refused() -> None:
+    notes: list[str] = []
+    with pytest.raises(DecodeError, match="does not take an offset"):
+        _ts_coercer("timestamp", notes)("10000-01-01T00:00:00+01:00")
+    assert notes == []
+
+
+@pytest.mark.parametrize(
+    "text", ["10000-13-01T00:00:00", "10000-01-01Tnope", "1x000-01-01", "10000"]
+)
+def test_a_malformed_out_of_range_string_is_still_refused(text: str) -> None:
+    notes: list[str] = []
+    with pytest.raises(DecodeError, match="invalid ISO-8601"):
+        _ts_coercer("timestamp", notes)(text)
+    assert notes == []
+
+
+def test_a_clamp_inside_a_container_reports_the_dotted_path() -> None:
+    notes: list[str] = []
+    coerce = coercer_for(
+        col(
+            {
+                "name": "p",
+                "type": "struct",
+                "field_id": 1,
+                "ordinal": 0,
+                "children": [
+                    {"name": "at", "type": "timestamptz", "field_id": 2, "ordinal": 0}
+                ],
+            }
+        ),
+        on_clamp=notes.append,
+    )
+    assert coerce({"at": 10**25}) == {"at": _MAX_US}
+    assert notes == ["p.at"]
+
+
+def test_the_flush_decoder_counts_clamps_per_column_and_builds_them() -> None:
+    cols = columns(
+        [
+            {"name": "ts", "type": "timestamp", "field_id": 1, "ordinal": 0},
+            {"name": "tz", "type": "timestamptz", "field_id": 2, "ordinal": 1},
+        ]
+    )
+    decoder = flush.JsonObjectDecoder(cols)
+    record = decoder.decode_record(
+        json.dumps({"ts": 10**20, "tz": "0000-01-01T00:00:00"}).encode()
+    )
+    assert record.values == {"ts": _MAX_US, "tz": _MIN_US}
+    assert decoder.clamped == {"ts": 1, "tz": 1}
+    table, _ = flush._build_batch([record], cols)
+    assert table.column("ts").to_pylist() == [
+        datetime.fromisoformat("9999-12-31T23:59:59.999999")
+    ]
+    assert table.column("tz").to_pylist() == [datetime(1, 1, 1, tzinfo=UTC)]

@@ -6,7 +6,7 @@ The catalog, namespace and table do NOT pre-exist: the real
 from the staging root, as config.py requires — ``MILLRACE_TABLE_COLUMNS``,
 the recommended dev shape ``MILLRACE_PARTITION_BY=identity(team_id),day(timestamp)``
 and ``MILLRACE_SORT_BY=timestamp``), then consumes and flushes waves
-that reconcile exactly per tenant into files under the created data
+that land at least once per tenant into files under the created data
 path. The live table carries the configured spec and sort order,
 installed in one atomic creation.
 
@@ -18,7 +18,6 @@ it dies with the stack.
 from __future__ import annotations
 
 import asyncio
-from collections import Counter
 from typing import Any
 
 import livekit
@@ -111,7 +110,7 @@ async def test_pipeline_creates_its_destination_from_config(
         namespace="ns1",
         table="events",
         flush_deadline_s=2,
-        flush_sweep_s=1,
+        slow_lane_deadline_s=2,
     )
     port = livekit.free_port()
     child = livekit.Child(
@@ -135,17 +134,17 @@ async def test_pipeline_creates_its_destination_from_config(
 
         base = now_us()
         rows = [(7, base + i) for i in range(60)] + [(9, base + i) for i in range(40)]
-        await asyncio.to_thread(livekit.produce_batch, producer, rows)
-
-        def counts() -> Counter[int]:
-            return livekit.lake_team_counts(table, livekit.head_snapshot(catalog))
-
+        events = await asyncio.to_thread(livekit.produce_batch, producer, rows)
+        seqs = [e.seq for e in events]
+        fs = livekit.s3_config().filesystem()
         await livekit.wait_until_async(
-            lambda: sum(counts().values()) == 100,
+            lambda: livekit.all_landed(table, catalog, fs, seqs),
             120,
             desc="the wave queryable in the created table",
         )
-        assert counts() == Counter({7: 60, 9: 40})
+        livekit.assert_at_least_once(
+            livekit.lake_seq_counts(table, livekit.head_snapshot(catalog), fs), seqs
+        )
         # Every data file of the head snapshot lives under the created
         # catalog's data path — the lake bucket, never the staging one.
         files = livekit.lake_files(table, livekit.head_snapshot(catalog))
@@ -164,7 +163,7 @@ async def test_two_replicas_race_to_create_exactly_one_table(
     boot together against a destination that does not exist, with the
     same creation env. Exactly ONE of them creates the table (the other
     re-reads the winner's — never two creates), neither warns about a
-    disagreement, 400 rows reconcile, and each replica claims (and so
+    disagreement, 400 rows land, and each replica claims (and so
     commits offsets for) only its own partition."""
     slug = _slug(request)
     catalog_name = f"mr-{livekit.RUN_ID}-{slug}".lower()[:60]
@@ -187,7 +186,7 @@ async def test_two_replicas_race_to_create_exactly_one_table(
             replica_count=2,
             ordinal=ordinal,
             flush_deadline_s=2,
-            flush_sweep_s=1,
+            slow_lane_deadline_s=2,
         )
         port = livekit.free_port()
         ports.append(port)
@@ -234,17 +233,17 @@ async def test_two_replicas_race_to_create_exactly_one_table(
 
         base = now_us()
         rows = [(team, base + i) for team in (1, 2, 3, 4) for i in range(100)]
-        await asyncio.to_thread(livekit.produce_batch, producer, rows)
-
-        def counts() -> Counter[int]:
-            return livekit.lake_team_counts(table, livekit.head_snapshot(catalog))
-
+        events = await asyncio.to_thread(livekit.produce_batch, producer, rows)
+        seqs = [e.seq for e in events]
+        fs = livekit.s3_config().filesystem()
         await livekit.wait_until_async(
-            lambda: sum(counts().values()) == 400,
+            lambda: livekit.all_landed(table, catalog, fs, seqs),
             180,
             desc="400 rows queryable in the created table",
         )
-        assert counts() == Counter({1: 100, 2: 100, 3: 100, 4: 100})
+        livekit.assert_at_least_once(
+            livekit.lake_seq_counts(table, livekit.head_snapshot(catalog), fs), seqs
+        )
 
         # Each replica claimed only its own partition (ordinal == p % 2)
         # and the group's offsets reached the end on both.

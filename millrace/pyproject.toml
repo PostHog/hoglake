@@ -85,30 +85,19 @@ markers = [
     "live: the live docker stack (hoglake server built from the checkout + Postgres + MinIO + apache/kafka; ci/live-millrace.sh); deselected unless -m mentions 'live' (see tests/conftest.py)",
     "component: SlateDB on memory:/// — staging behavior and binding-parity probes without docker",
     "bench: non-gating SlateDB rate benches (validation item 2); deselected unless --bench is passed (see README)",
-    "replay: the seeded Zipf-skew planner replay (test_planner_replay.py); excluded from mutmut runs",
 ]
 testpaths = ["tests"]
 
 [tool.mutmut]
-# Mutation-test the pure core (docs/kafka-ingestion-plan.md, Phase 1).
+# Mutation-test the pure core: the key codecs and the flush predicate.
 source_paths = ["millrace/keyspace.py", "millrace/planner.py"]
-# The replay test is the one slow suite and pins distributions, not
-# predicates; every load-bearing predicate is covered by the two fast
-# files. pytest picks up tests/conftest.py: deterministic hypothesis
+# pytest picks up tests/conftest.py: deterministic hypothesis
 # (derandomize), no deadline.
 pytest_add_cli_args_test_selection = ["tests/test_keyspace.py", "tests/test_planner.py"]
 pytest_add_cli_args = ["-x", "-q"]
-# The rest of the package, copied VERBATIM (never mutated) so the mutants/
-# tree is importable: setup_source_paths puts mutants/ first on sys.path,
-# and with only the two mutated files present, conftest's
-# ``from millrace.stage import ...`` (via stagekit) failed collection with
-# ModuleNotFoundError — mutmut run has been broken since Phase 2 added
-# stage imports to conftest. Copying the whole directory (not a file list)
-# keeps a future module from silently reintroducing that failure.
+# The rest of the package, copied verbatim (never mutated) so the mutants/
+# tree is importable (conftest imports millrace.stage via stagekit).
 also_copy = ["millrace/"]
-# Per-mutant CPU budget is (estimated_test_time + timeout_constant) ×
-# timeout_multiplier × 2. CI runners are ~6.5× slower than a dev machine
-# (15.9 vs ~104 mutants/s, PR #331's first run), and a timeout verdict
-# fails the survivors gate as a broken run — the multiplier carries the
-# CI/local speed gap with 4× headroom on top.
+# Generous per-mutant budget: CI runners are several times slower than a
+# laptop, and a timeout verdict fails the survivors gate.
 timeout_multiplier = 60.0

@@ -42,11 +42,7 @@ from confluent_kafka import ConsumerGroupTopicPartitions, Producer, TopicPartiti
 from confluent_kafka.admin import AdminClient, NewTopic
 from pyhoglake import HoglakeClient, S3Config, ops
 
-from millrace.config import (
-    AutoOffsetReset,
-    Config,
-    EventTimePolicy,
-)
+from millrace.config import AutoOffsetReset, Config
 from millrace.consumer import MillraceConsumer, create_kafka_consumer
 from millrace.flush import FlushRunner, HoglakeFlusher
 from millrace.grouping import GroupKeyer
@@ -558,6 +554,28 @@ def lake_seq_counts(
     return counts
 
 
+def missing_seqs(counts: Counter[int], produced: Iterable[int]) -> list[int]:
+    """The at-least-once check: every produced seq queryable at least
+    once (duplicates are allowed). Returns the lost seqs, sorted."""
+    return sorted(s for s in set(produced) if counts[s] < 1)
+
+
+def assert_at_least_once(counts: Counter[int], produced: Iterable[int]) -> None:
+    """No loss (count ≥ 1 for every produced seq) and nothing foreign."""
+    produced_set = set(produced)
+    lost = missing_seqs(counts, produced_set)
+    assert not lost, f"{len(lost)} produced seq(s) never landed: {lost[:20]}"
+    extra = sorted(set(counts) - produced_set)
+    assert not extra, f"seqs in the lake that were never produced: {extra[:20]}"
+
+
+def all_landed(table: Any, catalog: Any, fs: Any, produced: Iterable[int]) -> bool:
+    """Whether every produced seq is queryable (a wait predicate)."""
+    return not missing_seqs(
+        lake_seq_counts(table, head_snapshot(catalog), fs), produced
+    )
+
+
 def lake_month_partitions(table: Any, snapshot: int) -> set[str]:
     """Every distinct month partition value registered (the junk check)."""
     out: set[str] = set()
@@ -660,28 +678,21 @@ def live_config(
     catalog: str,
     namespace: str,
     table: str,
-    target_output_bytes: int = 64 * 1024 * 1024,
+    flush_bytes: int = 64 * 1024 * 1024,
     flush_deadline_s: int = 900,
     slow_lane_deadline_s: int = 21600,
     # The suite's age-triggered flushes stage bytes-to-KB payloads, far
-    # below any production floor — the harness drops the age lane's
-    # minimum size to 1 so the deadline alone decides.
+    # below any production floor: the age lane's minimum drops to 1 so
+    # the deadline alone decides.
     min_flush_bytes: int = 1,
-    event_time_policy: EventTimePolicy = EventTimePolicy.DROP,
-    event_time_max_future_s: int = 86400,
-    event_time_max_past_s: int = 30 * 86400,
-    # One replica owning the whole topic is the suite's default shape;
-    # a split test passes replica_count=N and an ordinal per pipeline.
     replica_count: int = 1,
     ordinal: int = 0,
     stage_store_url: str = f"s3://{BUCKET}",
-    flush_sweep_s: int = 1,
+    flush_sweep_s: float = 0.5,
     metrics_port: int = 0,
 ) -> Config:
     """A validated live-stack Config. Stage instances land at
-    ``{stage_base_path}/{topic}/{partition}`` on the MinIO bucket; the
-    partitions themselves are derived at start from the topic's
-    partition count and ``replica_count``/``ordinal``."""
+    ``{stage_base_path}/{topic}/{partition}`` on the MinIO bucket."""
     return Config(
         kafka_bootstrap_servers=KAFKA_BOOTSTRAP,
         kafka_topic=topic,
@@ -689,24 +700,20 @@ def live_config(
         replica_count=replica_count,
         ordinal=ordinal,
         # The suite produces-then-consumes with a fresh group per test;
-        # production's default is LATEST (fleet policy — see config.py).
+        # production's default is LATEST.
         kafka_auto_offset_reset=AutoOffsetReset.EARLIEST,
         catalog=catalog,
         namespace=namespace,
         table=table,
         stage_store_url=stage_store_url,
         stage_base_path=stage_base_path,
-        target_output_bytes=target_output_bytes,
+        flush_bytes=flush_bytes,
         flush_deadline_s=flush_deadline_s,
         slow_lane_deadline_s=slow_lane_deadline_s,
         min_flush_bytes=min_flush_bytes,
-        max_files_per_commit=512,
         consume_batch_size=500,
         poll_timeout_ms=100,
-        event_time_policy=event_time_policy,
         metrics_port=metrics_port,
-        event_time_max_past_s=event_time_max_past_s,
-        event_time_max_future_s=event_time_max_future_s,
         flush_sweep_s=flush_sweep_s,
     )
 
@@ -771,11 +778,10 @@ class Pipeline:
         self._stopped = False
 
     async def start(self) -> Pipeline:
+        """main.py's wiring: resolve, build the consumer and runner, then
+        ``consumer.start(drain=runner.drain)`` (the startup drain runs
+        before any consume), then the loops."""
         cfg = self.cfg
-        # Mirror main.py's M5 wiring: the flusher's I/O pool is sized to
-        # the sweep's process-wide in-flight bound, or the parallel sweep
-        # serializes on one executor thread (a shape production never
-        # runs).
         self.flusher = await asyncio.get_running_loop().run_in_executor(
             None,
             partial(
@@ -783,11 +789,9 @@ class Pipeline:
                 self.client,
                 cfg,
                 now_us=now_us,
-                io_workers=4 * cfg.flush_concurrency,
+                io_workers=2 * cfg.flush_concurrency,
             ),
         )
-        # main.py's wiring: the keyer comes from the resolved shape and
-        # re-reads on the flusher's TTL.
         consumer = MillraceConsumer(
             create_kafka_consumer(cfg),
             self.stages,
@@ -803,8 +807,9 @@ class Pipeline:
             cfg.planner_knobs(),
             now_us=now_us,
             sweep_s=self._sweep_s,
+            concurrency=cfg.flush_concurrency,
         )
-        await consumer.start()
+        await consumer.start(drain=self.runner.drain)
         self._tasks.append(asyncio.create_task(consumer.run()))
         if self._auto_flush:
             self._tasks.append(asyncio.create_task(self.runner.run()))
@@ -847,9 +852,8 @@ class Pipeline:
         self._tasks.append(asyncio.create_task(self.runner.run()))
 
     def staged_rows(self) -> int:
-        """Sync-free staged-row gauge read is not possible; tests read
-        ``stages.gauges()`` from async context instead."""
-        raise NotImplementedError
+        """Rows staged since the last drain (the in-memory index)."""
+        return self.stages.gauges().staged_rows
 
 
 # ---------------------------------------------------------------------------
@@ -971,17 +975,9 @@ def child_env(
             "MILLRACE_NAMESPACE": cfg.namespace,
             "MILLRACE_TABLE": cfg.table,
             "MILLRACE_STAGE_URL": f"{cfg.stage_store_url.rstrip('/')}/{cfg.stage_base_path}",
-            "MILLRACE_TARGET_OUTPUT_BYTES": str(cfg.target_output_bytes),
+            "MILLRACE_FLUSH_BYTES": str(cfg.flush_bytes),
             "MILLRACE_FLUSH_DEADLINE_S": str(cfg.flush_deadline_s),
             "MILLRACE_SLOW_LANE_DEADLINE_S": str(cfg.slow_lane_deadline_s),
-            "MILLRACE_MIN_FLUSH_BYTES": str(cfg.min_flush_bytes),
-            "MILLRACE_MAX_FILES_PER_COMMIT": str(cfg.max_files_per_commit),
-            "MILLRACE_POLL_TIMEOUT_MS": str(cfg.poll_timeout_ms),
-            "MILLRACE_CONSUME_BATCH_SIZE": str(cfg.consume_batch_size),
-            "MILLRACE_EVENT_TIME_POLICY": cfg.event_time_policy.value,
-            "MILLRACE_EVENT_TIME_MAX_FUTURE_S": str(cfg.event_time_max_future_s),
-            "MILLRACE_EVENT_TIME_MAX_PAST_S": str(cfg.event_time_max_past_s),
-            "MILLRACE_FLUSH_SWEEP_S": str(cfg.flush_sweep_s),
             "MILLRACE_METRICS_PORT": str(metrics_port),
             "HOGLAKE_URL": hoglake_url or HOGLAKE_URL,
             "HOGLAKE_S3_ENDPOINT": S3_ENDPOINT,
@@ -1168,7 +1164,7 @@ class CommitProxy:
     - ``hold``: the response is parked until the test releases it
       (deliver or drop) — a commit in flight while the client is killed.
 
-    Everything else (startup reads, receipt lookups) passes through
+    Everything else (startup reads) passes through
     untouched. The proxy exists because the failure it injects is ON THE
     WIRE — a scripted fake cannot lose a real response.
     """
@@ -1184,6 +1180,8 @@ class CommitProxy:
         self.requests: list[tuple[str, str, str | None]] = []
         self.responses: list[tuple[str, int]] = []  # (idempotency_key, status)
         self.dropped: list[str] = []
+        #: The idempotency key whose response is (or was) parked.
+        self.held_key: str | None = None
         self._lock = threading.Lock()
         self._drop_remaining: int | None = None  # None = not armed
         self._hold_next = False
@@ -1340,6 +1338,7 @@ class CommitProxy:
                     hold = self._hold_next and key is not None
                     if hold:
                         self._hold_next = False
+                        self.held_key = key
                 upstream.sendall(head_block + b"\r\n\r\n" + body)
                 response = self._read_response(upstream)
                 if key is not None:

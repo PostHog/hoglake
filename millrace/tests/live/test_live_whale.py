@@ -7,8 +7,9 @@ SAME run still flush inside the age deadline. Evidence:
 - the commit log (``catalog.snapshots()`` messages — the deterministic
   commit text is the audit trail) shows ``trigger=size`` commits for the
   whale and ``trigger=age`` commits for tail teams;
-- whale files carry ~a target's worth of rows each; tail files stay tiny;
-- every row lands exactly once, whale and tail alike;
+- whale files carry ~a scan budget's worth of rows each; tail files stay
+  tiny;
+- every row lands at least once, whale and tail alike;
 - the tail's worst produce→queryable latency stays within deadline +
   margin while the whale is flushing — the SLA the whole design stands
   on (docs/kafka-ingestion.md §The problem).
@@ -33,18 +34,10 @@ TAIL_TEAMS = list(range(2, 22))  # 20 tail tenants
 WHALE_EVENTS = 4000
 TAIL_EVENTS_PER_TEAM = 3
 PAD_BYTES = 1000  # ~1.1 KB payloads
-# The size lane sizes the estimated parquet OUTPUT: the trigger is
-# `staged_bytes x estimated_ratio >= target_output_bytes`, and the ratio
-# is OBSERVED (the flusher's EWMA replaces the 0.2 fallback with the
-# first completed flush — docs/kafka-ingestion.md §The flush planner).
-# The pads here are INCOMPRESSIBLE by design (livekit's pad fill), so the
-# observed ratio sits at ~1 from the first observation on: the trigger
-# then fires at ~a target's worth of staged bytes (~190 rows) for the
-# whole run — the arithmetic holds under the observed ratio, not just
-# the fallback. (A compressible pad taught the EWMA a tiny ratio after
-# the first flush and the size threshold moved mid-scenario: the whale
-# then staged past it only once, and the remnant rode the age lane.)
-TARGET_OUTPUT_BYTES = 200 * 1024
+# The size lane fires at MILLRACE_FLUSH_BYTES of STAGED bytes and a scan
+# reads at most that much: at ~1.06 KB payloads a size flush carries
+# ~190 rows.
+FLUSH_BYTES = 200 * 1024
 FLUSH_DEADLINE_S = 12
 TAIL_MARGIN_S = 25.0
 
@@ -57,7 +50,7 @@ def _commit_triggers(catalog) -> list[tuple[int, str]]:
     """(team_id, trigger) for every millrace commit in the catalog."""
     out = []
     for snap in catalog.snapshots():
-        if snap.message and snap.message.startswith("millrace=v1"):
+        if snap.message and snap.message.startswith("millrace=v2"):
             m = _COMMIT.search(snap.message)
             assert m is not None, snap.message
             out.append((int(m.group(1)), m.group(2)))
@@ -76,9 +69,8 @@ async def test_whale_overload(lake_home, topic_factory, producer_factory, admin)
         catalog=lake_home.catalog.name,
         namespace="ns1",
         table=table.name,
-        target_output_bytes=TARGET_OUTPUT_BYTES,
+        flush_bytes=FLUSH_BYTES,
         flush_deadline_s=FLUSH_DEADLINE_S,
-        flush_sweep_s=1,
     )
     async with livekit.Pipeline(cfg, sweep_s=0.5):
         base = now_us()
@@ -102,7 +94,7 @@ async def test_whale_overload(lake_home, topic_factory, producer_factory, admin)
         # The tail lands inside deadline + margin, whale storm in flight.
         def tail_visible() -> bool:
             counts = livekit.lake_team_counts(table, lake_home.head())
-            return all(counts.get(t, 0) == TAIL_EVENTS_PER_TEAM for t in TAIL_TEAMS)
+            return all(counts.get(t, 0) >= TAIL_EVENTS_PER_TEAM for t in TAIL_TEAMS)
 
         await livekit.wait_until_async(
             tail_visible, FLUSH_DEADLINE_S + TAIL_MARGIN_S, desc="the tail flushed"
@@ -114,7 +106,7 @@ async def test_whale_overload(lake_home, topic_factory, producer_factory, admin)
         await livekit.wait_until_async(
             lambda: (
                 livekit.lake_team_counts(table, lake_home.head()).get(WHALE, 0)
-                == WHALE_EVENTS
+                >= WHALE_EVENTS
             ),
             240,
             desc=f"all {WHALE_EVENTS} whale events queryable",
@@ -122,29 +114,29 @@ async def test_whale_overload(lake_home, topic_factory, producer_factory, admin)
 
     head = lake_home.head()
 
-    # Exactness, whale and tail alike.
-    counts = livekit.lake_team_counts(table, head)
-    expected = Counter({WHALE: WHALE_EVENTS})
-    expected.update({t: TAIL_EVENTS_PER_TEAM for t in TAIL_TEAMS})
-    assert counts == expected
+    # At least once, whale and tail alike.
+    seq_counts = await asyncio.to_thread(
+        livekit.lake_seq_counts, table, head, lake_home.fs
+    )
+    livekit.assert_at_least_once(seq_counts, [e.seq for e in producer.produced])
 
-    # The trigger audit: whale commits are size-triggered, tail commits
-    # age-triggered. (The whale's trailing remnant — the rows left under
-    # the target when production stops — flushes by AGE by design; the
-    # planner's precedence is per key per pass.)
+    # The trigger audit: whale commits are size-triggered, then drained
+    # as backlog (a capped scan marks the rest due on the next sweep);
+    # tail commits are age-triggered.
     triggers = _commit_triggers(lake_home.catalog)
     whale_triggers = Counter(t for team, t in triggers if team == WHALE)
     tail_triggers = [t for team, t in triggers if team in TAIL_TEAMS]
-    assert whale_triggers["size"] >= 2, f"whale triggers: {whale_triggers}"
+    assert whale_triggers["size"] >= 1, f"whale triggers: {whale_triggers}"
+    assert whale_triggers["size"] + whale_triggers["backlog"] >= 2, (
+        f"whale triggers: {whale_triggers}"
+    )
     assert tail_triggers and set(tail_triggers) == {"age"}, (
         f"tail triggers: {Counter(tail_triggers)}"
     )
 
     # File sizing: a size-triggered whale commit lands ONE file holding
-    # at least a trigger's worth of rows — the trigger fires at
-    # `staged >= target ÷ ratio` and the observed ratio of these
-    # incompressible pads is clamped at <= 1, so >= 200 KiB of ~1.06 KB
-    # payloads ≈ 190 rows, every time. The whale's age remnant — the
+    # about a scan budget's worth of rows (200 KiB of ~1.06 KB payloads
+    # ≈ 190 rows). The whale's age remnant — the
     # rows left under the threshold when production stopped, at most one
     # file — is the only small whale file; tail files stay at their
     # handful of rows.

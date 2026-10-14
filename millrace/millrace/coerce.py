@@ -403,7 +403,59 @@ def _datetime_to_micros(dt: datetime) -> int:
     )
 
 
-def _coerce_timestamp(value: Any, type_name: str, *, tz: bool) -> int:
+#: Called with the dotted column path each time a timestamp is clamped.
+ClampHook = Callable[[str], None]
+
+TIMESTAMP_TYPES: Final = frozenset(
+    {"timestamp_s", "timestamp_ms", "timestamp", "timestamp_ns", "timestamptz"}
+)
+#: Instants outside years 1–9999 (Python's datetime range, which the
+#: partition transforms need) are clamped to these, in micros.
+TIMESTAMP_MIN_US: Final = -62_135_596_800_000_000  # 0001-01-01T00:00:00
+TIMESTAMP_MAX_US: Final = 253_402_300_799_999_999  # 9999-12-31T23:59:59.999999
+
+
+def timestamp_bounds(type_name: str) -> tuple[int, int]:
+    """The clamp range of a timestamp column in its own unit: years
+    1–9999, narrowed to what int64 holds in the unit (``timestamp_ns``
+    spans only 1677–2262)."""
+    if type_name == "timestamp_ns":
+        lo, hi = TIMESTAMP_MIN_US * 1000, TIMESTAMP_MAX_US * 1000 + 999
+    else:
+        unit = TIMESTAMP_UNITS[type_name]
+        lo, hi = -(-TIMESTAMP_MIN_US // unit), TIMESTAMP_MAX_US // unit
+    vlo, vhi = _TIMESTAMP_VALUE_BOUNDS[type_name]
+    return max(lo, vlo), min(hi, vhi)
+
+
+_ISO_YEAR: Final = re.compile(r"^([+-]?\d{4,})(-\d{2}-\d{2}.*)$")
+
+
+def _out_of_range_iso(value: str, *, tz: bool, type_name: str) -> int | None:
+    """For a well-formed ISO-8601 string whose year is outside 1–9999
+    (which ``datetime`` cannot parse), the side to clamp to: -1 below,
+    +1 above. None when the string is not of that shape."""
+    match = _ISO_YEAR.match(value)
+    if match is None:
+        return None
+    year = int(match.group(1))
+    if 1 <= year <= 9999:
+        return None
+    try:
+        probe = datetime.fromisoformat("2000" + match.group(2))
+    except ValueError:
+        return None
+    if not tz and probe.tzinfo is not None:
+        raise DecodeError(
+            f"naive {type_name} does not take an offset: {value!r}",
+            reason=REASON_UNCASTABLE_COLUMN,
+        )
+    return -1 if year < 1 else 1
+
+
+def _coerce_timestamp(
+    value: Any, type_name: str, *, tz: bool, on_clamp: Callable[[], None] | None = None
+) -> int:
     """An instant as an integer in the column's own unit (epoch seconds
     for ``timestamp_s``, millis, micros — ``timestamptz`` is micros — and
     nanos for ``timestamp_ns``), or a strict ISO-8601 string.
@@ -417,9 +469,11 @@ def _coerce_timestamp(value: Any, type_name: str, *, tz: bool) -> int:
     with no offset and mean UTC (millpond reads them the same way). An
     offset string into a naive column is still refused rather than
     reinterpreted. The result — from either form —
-    must fit the column's unit in int64 (``timestamp_s`` in stored
-    milliseconds): a magnitude outside it is a coercion failure, never
-    a batch-killing ``OverflowError`` at Arrow build time."""
+    is clamped to years 1–9999 (narrowed to the unit's int64 range,
+    :func:`timestamp_bounds`), integers and strings alike, and
+    ``on_clamp`` is called: an out-of-range instant is written at the
+    edge, never dropped, and never reaches the Arrow build or the
+    partition transforms as an ``OverflowError``."""
     if isinstance(value, bool):
         raise DecodeError(
             "expected a timestamp, got a JSON boolean",
@@ -448,17 +502,25 @@ def _coerce_timestamp(value: Any, type_name: str, *, tz: bool) -> int:
         try:
             dt = datetime.fromisoformat(value)
         except ValueError as e:
-            raise DecodeError(
-                f"invalid ISO-8601 timestamp {value!r}",
-                reason=REASON_UNCASTABLE_COLUMN,
-            ) from e
+            side = _out_of_range_iso(value, tz=tz, type_name=type_name)
+            if side is None:
+                raise DecodeError(
+                    f"invalid ISO-8601 timestamp {value!r}",
+                    reason=REASON_UNCASTABLE_COLUMN,
+                ) from e
+            lo, hi = timestamp_bounds(type_name)
+            if on_clamp is not None:
+                on_clamp()
+            return lo if side < 0 else hi
         if tz:
             # No offset means UTC: the ClickHouse wire format (module
             # docstring above).
             offset = dt.utcoffset() if dt.tzinfo is not None else None
             naive = dt.replace(tzinfo=None)
-            micros = _datetime_to_micros(
-                naive - offset if offset is not None else naive
+            # Integer arithmetic: a datetime subtraction near year 1 or
+            # 9999 would overflow.
+            micros = _datetime_to_micros(naive) - (
+                0 if offset is None else offset // timedelta(microseconds=1)
             )
         else:
             if dt.tzinfo is not None:
@@ -478,13 +540,12 @@ def _coerce_timestamp(value: Any, type_name: str, *, tz: bool) -> int:
                     reason=REASON_UNCASTABLE_COLUMN,
                 )
             result = micros // unit_us
-    lo, hi = _TIMESTAMP_VALUE_BOUNDS[type_name]
+    lo, hi = timestamp_bounds(type_name)
     if not lo <= result <= hi:
-        raise DecodeError(
-            f"{type_name} value {result} is outside the int64-representable "
-            f"range for its unit [{lo}, {hi}]",
-            reason=REASON_UNCASTABLE_COLUMN,
-        )
+        # Never drop data for its time: clamp to the representable range.
+        if on_clamp is not None:
+            on_clamp()
+        return lo if result < lo else hi
     return result
 
 
@@ -514,7 +575,9 @@ def _coerce_json_text(value: Any, *, reason: str) -> str:
     return text
 
 
-def _scalar_coercer(column: Column) -> Callable[[Any], Any]:
+def _scalar_coercer(
+    column: Column, path: str, on_clamp: ClampHook | None
+) -> Callable[[Any], Any]:
     t = column.type
     if t == "boolean":
         return _coerce_bool
@@ -553,10 +616,10 @@ def _scalar_coercer(column: Column) -> Callable[[Any], Any]:
         return _coerce_date
     if t == "time":
         return _coerce_time_micros
-    if t in ("timestamp_s", "timestamp_ms", "timestamp", "timestamp_ns"):
-        return lambda v: _coerce_timestamp(v, t, tz=False)
-    if t == "timestamptz":
-        return lambda v: _coerce_timestamp(v, t, tz=True)
+    if t in TIMESTAMP_TYPES:
+        note = None if on_clamp is None else (lambda: on_clamp(path))
+        tz = t == "timestamptz"
+        return lambda v: _coerce_timestamp(v, t, tz=tz, on_clamp=note)
     if t == "json":
         return lambda v: _coerce_json_text(v, reason=REASON_UNCASTABLE_COLUMN)
     raise UnsupportedColumnError(
@@ -601,11 +664,13 @@ def _children(column: Column, path: str) -> tuple[Column, ...]:
     return children
 
 
-def _child_coercer(child: Column, path: str, depth: int) -> Callable[[Any], Any]:
+def _child_coercer(
+    child: Column, path: str, depth: int, on_clamp: ClampHook | None
+) -> Callable[[Any], Any]:
     """A container child's coercer: null → None (refused when the child
     is not nullable), anything else coerced, a scalar failure re-raised
     naming the child's dotted path (container failures name their own)."""
-    inner = _coercer(child, path, depth)
+    inner = _coercer(child, path, depth, on_clamp)
     nested = child.type in _CONTAINER_TYPES
     nullable = child.nullable
 
@@ -631,7 +696,9 @@ def _parse_key(text: str) -> Any:
         return None
 
 
-def _coercer(column: Column, path: str, depth: int) -> Callable[[Any], Any]:
+def _coercer(
+    column: Column, path: str, depth: int, on_clamp: ClampHook | None
+) -> Callable[[Any], Any]:
     if depth > MAX_COLUMN_NESTING_DEPTH:
         raise UnsupportedColumnError(
             f"column {path!r} nests deeper than the maximum "
@@ -646,7 +713,7 @@ def _coercer(column: Column, path: str, depth: int) -> Callable[[Any], Any]:
         )
     if t == "struct":
         fields = tuple(
-            (c.name, _child_coercer(c, f"{path}.{c.name}", depth + 1))
+            (c.name, _child_coercer(c, f"{path}.{c.name}", depth + 1, on_clamp))
             for c in _children(column, path)
         )
 
@@ -663,7 +730,7 @@ def _coercer(column: Column, path: str, depth: int) -> Callable[[Any], Any]:
         return coerce_struct
     if t == "list":
         (element,) = _children(column, path)
-        coerce_element = _child_coercer(element, f"{path}.element", depth + 1)
+        coerce_element = _child_coercer(element, f"{path}.element", depth + 1, on_clamp)
 
         def coerce_list(value: Any) -> list[Any]:
             if not isinstance(value, list):
@@ -684,9 +751,9 @@ def _coercer(column: Column, path: str, depth: int) -> Callable[[Any], Any]:
                 f"column {key_path!r} is a {key.type!r} map key: a JSON object "
                 "key is a string, which no such key coerces"
             )
-        coerce_key = _coercer(key, key_path, depth + 1)
+        coerce_key = _coercer(key, key_path, depth + 1, on_clamp)
         narrow = _float32 if key.type == "float" else None
-        coerce_item = _child_coercer(item, f"{path}.value", depth + 1)
+        coerce_item = _child_coercer(item, f"{path}.value", depth + 1, on_clamp)
         key_is_string = key.type == "string"
 
         def key_of(text: str) -> Any:
@@ -726,15 +793,17 @@ def _coercer(column: Column, path: str, depth: int) -> Callable[[Any], Any]:
             return pairs
 
         return coerce_map
-    return _scalar_coercer(column)
+    return _scalar_coercer(column, path, on_clamp)
 
 
-def coercer_for(column: Column) -> Callable[[Any], Any]:
+def coercer_for(
+    column: Column, *, on_clamp: ClampHook | None = None
+) -> Callable[[Any], Any]:
     """The coercer of one catalog column (the module docstring's rules),
     applied to a NON-null JSON value — the caller decides what a null
     or absent top-level value means. Raises
     :class:`UnsupportedColumnError` for a column it cannot fill."""
-    return _coercer(column, column.name, 1)
+    return _coercer(column, column.name, 1, on_clamp)
 
 
 def load_json_object(payload: bytes) -> dict[str, Any]:

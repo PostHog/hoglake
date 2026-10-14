@@ -5,21 +5,21 @@ partition, never the pod.
   shape. Replica A (ordinal 0 of 1) stages a whole wave and flushes
   NOTHING (long deadline); A stops cleanly; replica B — a different pod
   with the same ordinal and replica count, same group — derives the
-  same partitions, opens the same SlateDB instances, recovers them (the
-  staged rows are RIGHT THERE in its gauges), consumes only wave 2
-  (committed offsets carried over), and flushes everything exactly once.
+  same partitions, opens the same SlateDB instances, and its startup
+  drain flushes wave 1 BEFORE it consumes anything; it then consumes
+  only wave 2 (committed offsets carried over). Every seq lands at least
+  once.
 - ``test_two_replicas_split_the_topic_by_ordinal``: the fleet shape
   against a real broker's metadata. Two pipelines, ``replica_count=2``,
   ordinals 0 and 1, over a two-partition topic: each claims exactly its
-  modulo share, both ingest and flush their own partition, the lake
-  reconciles exactly (no range flushed twice), and each replica's
+  modulo share, both ingest and flush their own partition, every seq
+  lands at least once, and each replica's
   committed offsets name only its own partition.
 """
 
 from __future__ import annotations
 
 import asyncio
-from collections import Counter
 
 import livekit
 import pytest
@@ -41,17 +41,10 @@ def _cfg(
         namespace="ns1",
         table="events",
         flush_deadline_s=deadline_s,
-        flush_sweep_s=1,
+        slow_lane_deadline_s=max(deadline_s, 21600),
         replica_count=replica_count,
         ordinal=ordinal,
     )
-
-
-def _produced_by_team(producer) -> Counter[int]:
-    counts: Counter[int] = Counter()
-    for e in producer.produced:
-        counts[e.team_id] += 1
-    return counts
 
 
 async def test_static_reassignment_carries_staged_state(
@@ -84,10 +77,9 @@ async def test_static_reassignment_carries_staged_state(
             60,
             desc="replica A committing wave 1",
         )
-        gauges_a = await pipe_a.stages.gauges()
-        assert gauges_a.staged_rows == wave1
+        assert pipe_a.stages.gauges().staged_rows == wave1
         assert pipe_a.flusher is not None
-        assert pipe_a.flusher.stats().flushes_committed == 0
+        assert pipe_a.flusher.stats().decisions_committed == 0
         assert sum(livekit.lake_team_counts(table, lake_home.head()).values()) == 0, (
             "replica A flushed despite the far deadline"
         )
@@ -95,29 +87,19 @@ async def test_static_reassignment_carries_staged_state(
     # --- replica B: the new pod for the same ordinal derives the same
     # partitions (same replica count, same group) ---
     cfg_b = _cfg(lake_home, topic, deadline_s=3)
-    pipe_b = livekit.Pipeline(cfg_b, sweep_s=0.5, auto_flush=False)
+    pipe_b = livekit.Pipeline(cfg_b, sweep_s=0.5)
     try:
         await pipe_b.start()
-        # The partition's SlateDB instances opened with wave 1 already in
-        # them: staged state followed the partition, not the pod. And the
-        # consumer resumed from A's committed offsets — nothing replayed.
-        gauges_b = await pipe_b.stages.gauges()
-        assert gauges_b.staged_rows == wave1, (
-            f"replica B sees {gauges_b.staged_rows} staged rows, expected "
-            f"wave 1's {wave1}"
-        )
+        # start() returns after the startup drain: wave 1 followed the
+        # partition and is already queryable, and nothing was consumed
+        # before the drain finished.
+        assert livekit.all_landed(
+            table, lake_home.catalog, lake_home.fs, range(wave1)
+        ), "wave 1 not flushed by replica B's startup drain"
         assert pipe_b.consumer is not None
         assert pipe_b.consumer.stats().messages_consumed == 0
+        assert pipe_b.stages.gauges().staged_groups == 0
 
-        pipe_b.start_flush_loop()
-        # Wave 1 flushes under the new owner.
-        await livekit.wait_until_async(
-            lambda: (
-                sum(livekit.lake_team_counts(table, lake_home.head()).values()) == wave1
-            ),
-            60,
-            desc="replica B flushing wave 1",
-        )
         # Wave 2 arrives under B and flushes too.
         base2 = now_us()
         teams2 = skew.sample(200)
@@ -128,23 +110,22 @@ async def test_static_reassignment_carries_staged_state(
             seq_start=wave1,
         )
         await livekit.wait_until_async(
-            lambda: (
-                sum(livekit.lake_team_counts(table, lake_home.head()).values())
-                == wave1 + 200
+            lambda: livekit.all_landed(
+                table, lake_home.catalog, lake_home.fs, range(wave1 + 200)
             ),
             60,
             desc="wave 2 queryable under replica B",
         )
+        # Resumed from A's committed offsets: wave 1 never re-consumed.
+        assert pipe_b.consumer.stats().messages_consumed == 200
     finally:
         await pipe_b.stop()
 
-    counts = livekit.lake_team_counts(table, lake_home.head())
-    assert counts == _produced_by_team(producer)
-    # B committed every flush; A committed none: no range was flushed by
-    # two owners (exactness above is the row-level proof).
+    seq_counts = livekit.lake_seq_counts(table, lake_home.head(), lake_home.fs)
+    livekit.assert_at_least_once(seq_counts, [e.seq for e in producer.produced])
     assert pipe_b.flusher is not None
     stats_b = pipe_b.flusher.stats()
-    assert stats_b.flushes_committed > 0
+    assert stats_b.decisions_committed > 0
     assert stats_b.orphaned_uploads == 0
 
 
@@ -181,8 +162,8 @@ async def test_two_replicas_split_the_topic_by_ordinal(
             [(team, base + i) for i, team in enumerate(teams)],
         )
         await livekit.wait_until_async(
-            lambda: (
-                sum(livekit.lake_team_counts(table, lake_home.head()).values()) == 400
+            lambda: livekit.all_landed(
+                table, lake_home.catalog, lake_home.fs, range(400)
             ),
             120,
             desc="all 400 events queryable across both replicas",
@@ -195,12 +176,11 @@ async def test_two_replicas_split_the_topic_by_ordinal(
         assert set(pipe_a.consumer.committed_offsets()) == {(topic.name, 0)}
         assert set(pipe_b.consumer.committed_offsets()) == {(topic.name, 1)}
         assert pipe_a.flusher is not None and pipe_b.flusher is not None
-        assert pipe_a.flusher.stats().flushes_committed > 0
-        assert pipe_b.flusher.stats().flushes_committed > 0
+        assert pipe_a.flusher.stats().decisions_committed > 0
+        assert pipe_b.flusher.stats().decisions_committed > 0
     finally:
         await pipe_a.stop()
         await pipe_b.stop()
 
-    # Exact reconciliation: every produced row once, nothing twice.
-    counts = livekit.lake_team_counts(table, lake_home.head())
-    assert counts == _produced_by_team(producer)
+    seq_counts = livekit.lake_seq_counts(table, lake_home.head(), lake_home.fs)
+    livekit.assert_at_least_once(seq_counts, [e.seq for e in producer.produced])

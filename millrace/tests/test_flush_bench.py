@@ -1,5 +1,4 @@
-"""Flush sweep throughput bench — M5's measurement (docs/kafka-ingestion.md
-§The flush planner; ADVERSARIAL-REVIEW-2026-10-09 M5).
+"""Flush sweep throughput bench.
 
 NON-GATING: the ``bench`` marker is deselected from default runs
 (conftest removes bench items unless ``--bench`` is passed). Run with::
@@ -9,16 +8,14 @@ NON-GATING: the ``bench`` marker is deselected from default runs
 Shape: 1024 ready keys (256 groups x 4 partition stages, 2 rows each) on
 ``memory:///`` stages, a scripted pyhoglake double (pytest-httpx, the
 flush suite's flushkit) and the fake object store. One
-:meth:`FlushRunner.run_once` is the unit of measurement — per-partition
-assembly (stats scan + sched_age index + point reads), the plan, and
-per-decision scan -> Arrow -> parquet -> upload -> persist -> publish ->
-settle — end to end. Reported: keys/s and commits/s (one commit per
-decision), serial (concurrency=1) vs bounded-parallel (concurrency=4,
-the ``MILLRACE_FLUSH_CONCURRENCY`` default, with the flusher's I/O pool
-sized to match, as main.py wires it).
+:meth:`FlushRunner.run_once` (drain mode: every group due) is the unit
+of measurement: per decision scan -> Arrow -> parquet -> upload ->
+publish -> delete, end to end. Reported: keys/s and commits/s (one
+commit per decision), serial (concurrency=1) vs bounded-parallel
+(concurrency=4, the default).
 
-The only assertions are correctness sanity (every decided key commits
-exactly once; the stage drains): the numbers print for the report.
+The only assertions are correctness sanity (every decided key commits;
+the stage drains): the numbers print for the report.
 Caveat for the numbers: memory:/// and a scripted in-process server make
 the WAL flush tick (5 ms here) the dominant per-commit latency; with S3
 WAL writes (~tens of ms) the serial number would be far lower and the
@@ -38,7 +35,6 @@ from flushkit import (
     commit_ok,
     event_payload,
     make_config,
-    receipt_server,
     script_bootstrap,
     script_options,
 )
@@ -82,14 +78,11 @@ def _make_flusher(httpx_mock: Any, store: FakeObjectStore, io_workers: int) -> A
 
     script_bootstrap(httpx_mock)
     script_options(httpx_mock)
-    # Every fresh build asks for its window's receipt before building;
-    # none of these windows ever landed, so the catch-all answers 404.
-    receipt_server(httpx_mock)
     client = HoglakeClient("http://hog.test")
     client.s3 = store
     return HoglakeFlusher.resolve(
         client,
-        make_config(target_output_bytes=10),
+        make_config(),
         now_us=lambda: NOW,
         sleep=_no_sleep,
         monotonic=FakeMonotonic(),
@@ -121,16 +114,16 @@ async def _run_once_timed(
         concurrency=concurrency,
     )
     start = time.perf_counter()
-    sweep = await runner.run_once()
+    sweep = await runner.run_once(drain=True)
     elapsed = time.perf_counter() - start
     flusher.close()
-    # Correctness sanity: every ready key committed exactly once.
+    # Correctness sanity: every ready key committed; nothing stays staged.
     assert sweep.decisions == KEYS
     assert sweep.committed == KEYS
     assert sweep.failed == 0
     assert len(capture.bodies) == KEYS
     for partition in range(PARTITIONS):
-        assert await manager.stage("events", partition).iter_key_stats() == []
+        assert manager.stage("events", partition).snapshot() == []
     return elapsed, sweep.decisions, sweep.committed
 
 
@@ -140,7 +133,7 @@ async def test_flush_sweep_throughput(httpx_mock: Any, memory_store: Any) -> Non
         "memory:///", "bench", settings=fast_flush_settings()
     ) as manager:
         for partition in range(PARTITIONS):
-            await manager.open_partition("events", partition)
+            await manager.open_partition("events", partition, now_us=NOW)
         clock = lambda: NOW
         store = FakeObjectStore()
 
@@ -165,4 +158,4 @@ async def test_flush_sweep_throughput(httpx_mock: Any, memory_store: Any) -> Non
             f"{label:40s} | {elapsed:7.2f} s | {keys / elapsed:8.1f} keys/s | "
             f"{commits / elapsed:8.1f} commits/s"
         )
-    print("(design requirement: ~110 ready keys/s — ADVERSARIAL-REVIEW M5)")
+    print("(design requirement: ~110 ready keys/s)")

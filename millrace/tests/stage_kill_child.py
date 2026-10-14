@@ -19,10 +19,12 @@ from stagekit import NOW, fast_flush_settings, payload_for, shared_cache
 async def _run(
     path: str, batch_count: int, batch_size: int, payload_size: int, teams: int
 ) -> None:
+    from slatedb.uniffi import ObjectStore
+
     from millrace.stage import PartitionStage, StagedRecord
 
-    stage = await PartitionStage.open(
-        "file:///",
+    stage = await PartitionStage.open_store(
+        ObjectStore.resolve("file:///"),
         path,
         topic="events",
         partition=0,
