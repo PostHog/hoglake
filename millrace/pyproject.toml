@@ -5,7 +5,11 @@ description = "Kafka -> hoglake ingestion daemon with SlateDB staging; per-key f
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "pyhoglake",
+    # fast-upload: boto3's single PutObject for parquet uploads instead of
+    # pyarrow's streaming multipart writer (three S3 requests per object).
+    # Without it every flush file costs 3x the requests and pyhoglake warns
+    # at startup.
+    "pyhoglake[fast-upload]",
     # >=25.0, NOT pyhoglake's 21: flush.py's _sort_batch_by_spec calls
     # pc.sort_indices with (name, direction, null_placement) triples,
     # which pyarrow only accepts from 25.0.0 — on 21–24 the compute
