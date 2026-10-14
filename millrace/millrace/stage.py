@@ -117,10 +117,12 @@ from slatedb.uniffi import (
     DbCache,
     DbTransaction,
     DefaultMetricsRecorder,
+    DurabilityLevel,
     IsolationLevel,
     KeyRange,
     MokaCacheOptions,
     ObjectStore,
+    ScanOptions,
     Settings,
     WriteBatch,
 )
@@ -147,6 +149,36 @@ log = logging.getLogger(__name__)
 
 _SCAN_CHUNK: Final = 1024
 """Rows pulled per ``DbIterator.next_batch`` round trip on scans."""
+
+_BULK_SCAN_READ_AHEAD_BYTES: Final = 4 * 1024 * 1024
+_BULK_SCAN_FETCH_TASKS: Final = 4
+
+
+def _bulk_scan_options() -> ScanOptions:
+    """Scan options for every range scan over row-sized or unbounded key
+    ranges: the flush window (:meth:`PartitionStage._iter_range`), the
+    settlement (:meth:`PartitionStage._settle_flushed`, under the write
+    lock), the reconcile emptiness probe (also under the write lock) and
+    recovery's legacy-marker sweep.
+
+    SlateDB's default ScanOptions fetch ONE block (~4 KiB) per object-store
+    GET with one fetch task, so a range that lives in L0/sorted-run SSTs
+    reads at block_size / GET-latency (~50 KB/s at S3 latencies) — and a
+    settlement scan at that rate holds the write lock, stalling staging,
+    for minutes. Read ahead in multi-MiB ranged GETs with a few concurrent
+    fetches instead (the fetch never runs past the range's last block);
+    blocks stay uncached (a one-pass scan would only churn the shared
+    cache). The small, re-read ``stats/``/``prepared/`` prefix scans
+    (:meth:`PartitionStage._scan_prefix`) keep the defaults, so their
+    blocks stay cached across sweeps."""
+    return ScanOptions(
+        durability_filter=DurabilityLevel.MEMORY,
+        dirty=False,
+        read_ahead_bytes=_BULK_SCAN_READ_AHEAD_BYTES,
+        cache_blocks=False,
+        max_fetch_tasks=_BULK_SCAN_FETCH_TASKS,
+    )
+
 
 _RECOVERY_PAGE: Final = 1000
 """Legacy ``flushed/`` markers deleted per write batch in
@@ -716,8 +748,9 @@ class PartitionStage:
         self, start: bytes, end: bytes
     ) -> AsyncIterator[tuple[bytes, bytes]]:
         """Stream the half-open key range ``[start, end)`` in key order."""
-        it = await self._db.scan(
-            KeyRange(start=start, start_inclusive=True, end=end, end_inclusive=False)
+        it = await self._db.scan_with_options(
+            KeyRange(start=start, start_inclusive=True, end=end, end_inclusive=False),
+            _bulk_scan_options(),
         )
         while True:
             chunk = await it.next_batch(_SCAN_CHUNK)
@@ -1086,10 +1119,11 @@ class PartitionStage:
                     await txn.rollback()
                     return False
                 start, end = keyspace.group_rows_range(group)
-                it = await txn.scan(
+                it = await txn.scan_with_options(
                     KeyRange(
                         start=start, start_inclusive=True, end=end, end_inclusive=False
-                    )
+                    ),
+                    _bulk_scan_options(),
                 )
                 chunk = await it.next_batch(1)
                 if chunk:
@@ -1195,8 +1229,9 @@ class PartitionStage:
         start, end = keyspace.window_rows_range(key)
         rows_deleted = 0
         bytes_deleted = 0
-        it = await txn.scan(
-            KeyRange(start=start, start_inclusive=True, end=end, end_inclusive=False)
+        it = await txn.scan_with_options(
+            KeyRange(start=start, start_inclusive=True, end=end, end_inclusive=False),
+            _bulk_scan_options(),
         )
         while True:
             chunk = await it.next_batch(_SCAN_CHUNK)
@@ -1313,8 +1348,9 @@ class PartitionStage:
         self._ensure_open()
         collected = 0
         start, end = keyspace.flushed_range()
-        it = await self._db.scan(
-            KeyRange(start=start, start_inclusive=True, end=end, end_inclusive=False)
+        it = await self._db.scan_with_options(
+            KeyRange(start=start, start_inclusive=True, end=end, end_inclusive=False),
+            _bulk_scan_options(),
         )
         while True:
             chunk = await it.next_batch(_RECOVERY_PAGE)

@@ -1639,3 +1639,124 @@ async def _first_staged_ts_property(data: st.DataObject) -> None:
         if data.draw(st.booleans()):
             await stage_some(data.draw(st.integers(min_value=1, max_value=4)))
     await stage.close()
+
+
+# -- scan read-ahead -------------------------------------------------------------------
+
+
+class _ScanSpy:
+    """Records every range scan a stage's Db and its transactions make,
+    then delegates — the scans really run, so the pin is on the wiring.
+
+    A plain ``scan`` is the regression: slatedb's default ScanOptions
+    fetch one block per object-store GET, which at S3 latency held the
+    settlement's write lock for minutes (README §Scan read-ahead)."""
+
+    def __init__(self, stage: PartitionStage, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.calls: list[tuple[str, str, object]] = []
+        db = stage._db
+        self._wrap(monkeypatch, db, "db")
+        begin = db.begin
+
+        async def spied_begin(*args: object, **kwargs: object) -> object:
+            return self._Txn(await begin(*args, **kwargs), self.calls)
+
+        monkeypatch.setattr(db, "begin", spied_begin)
+
+    def _wrap(self, monkeypatch: pytest.MonkeyPatch, target: object, who: str) -> None:
+        for name in ("scan", "scan_with_options"):
+            real = getattr(target, name)
+
+            async def spied(*args: object, _real=real, _name=name) -> object:
+                self.calls.append((who, _name, args[-1] if len(args) > 1 else None))
+                return await _real(*args)
+
+            monkeypatch.setattr(target, name, spied)
+
+    class _Txn:
+        def __init__(self, txn: object, calls: list[tuple[str, str, object]]) -> None:
+            self._txn = txn
+            self._calls = calls
+
+        async def scan(self, *args: object) -> object:
+            self._calls.append(("txn", "scan", None))
+            return await self._txn.scan(*args)  # type: ignore[attr-defined]
+
+        async def scan_with_options(self, *args: object) -> object:
+            self._calls.append(("txn", "scan_with_options", args[-1]))
+            return await self._txn.scan_with_options(*args)  # type: ignore[attr-defined]
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._txn, name)
+
+    def take(self) -> list[tuple[str, str, object]]:
+        out, self.calls[:] = list(self.calls), []
+        return out
+
+    @staticmethod
+    def assert_bulk(calls: list[tuple[str, str, object]], who: str) -> None:
+        assert calls, "no range scan ran"
+        for scope, method, options in calls:
+            assert (scope, method) == (who, "scan_with_options"), calls
+            assert options.read_ahead_bytes == 4 * 1024 * 1024  # type: ignore[attr-defined]
+            assert options.max_fetch_tasks == 4  # type: ignore[attr-defined]
+            assert options.cache_blocks is False  # type: ignore[attr-defined]
+
+
+def test_bulk_scan_options_shape():
+    from slatedb.uniffi import DurabilityLevel
+
+    from millrace.stage import _bulk_scan_options
+
+    o = _bulk_scan_options()
+    assert (o.read_ahead_bytes, o.max_fetch_tasks, o.cache_blocks) == (
+        4 * 1024 * 1024,
+        4,
+        False,
+    )
+    # The defaults the read-ahead replaces leave visibility unchanged:
+    # committed-in-memory reads, no dirty reads.
+    assert (o.durability_filter, o.dirty) == (DurabilityLevel.MEMORY, False)
+
+
+async def test_window_scan_reads_ahead(stage_factory, monkeypatch):
+    """The flush window scan (``scan_window``, and ``scan_group_rows``
+    over the same ``_iter_range``) reads with the bulk options."""
+    stage = await stage_factory()
+    await stage.stage_batch([rec(5, 100 + i, i) for i in range(5)], now_us=NOW)
+    spy = _ScanSpy(stage, monkeypatch)
+    scanned = await stage.scan_window(g(5), max_rows=10, max_bytes=10**9)
+    assert [rk.offset for rk, _ in scanned.rows] == list(range(5))
+    _ScanSpy.assert_bulk(spy.take(), "db")
+    assert [rk.offset for rk, _ in await group_rows(stage, 5)] == list(range(5))
+    _ScanSpy.assert_bulk(spy.take(), "db")
+    await stage.close()
+
+
+async def test_settlement_scan_reads_ahead(stage_factory, monkeypatch):
+    """The settlement scan inside ``commit_flushed`` — the one that holds
+    the write lock — reads with the bulk options, in its transaction."""
+    stage = await stage_factory()
+    await stage.stage_batch([rec(5, 100 + i, i) for i in range(5)], now_us=NOW)
+    spy = _ScanSpy(stage, monkeypatch)
+    report = await stage.commit_flushed(window(5, 0, 4))
+    assert (report.rows_deleted, report.group_drained) == (5, True)
+    _ScanSpy.assert_bulk(spy.take(), "txn")
+    await stage.close()
+
+
+async def test_reconcile_and_recovery_scans_read_ahead(stage_factory, monkeypatch):
+    """The reconcile emptiness probe (under the write lock) and recovery's
+    legacy-marker sweep read with the bulk options too."""
+    stage = await stage_factory()
+    await stage.stage_batch([rec(5, 100, 0)], now_us=NOW)
+    # A redelivery inflates the stats; the settle leaves the residue.
+    await stage.stage_batch([rec(5, 100, 0)], now_us=NOW)
+    await stage.commit_flushed(window(5, 0, 0))
+    spy = _ScanSpy(stage, monkeypatch)
+    assert await stage.reconcile_stats(g(5))
+    _ScanSpy.assert_bulk(spy.take(), "txn")
+    await stage.recover()
+    recovery = [c for c in spy.take() if c[0] == "db"]
+    _ScanSpy.assert_bulk(recovery, "db")
+    await stage.close()

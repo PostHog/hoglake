@@ -3,7 +3,8 @@
 # isolated services.
 #
 # Isolated Postgres + hoglake server built from THIS checkout + MinIO +
-# apache/kafka (pinned BY DIGEST in ci/docker-compose.live-millrace.yml —
+# toxiproxy (S3 latency for the stage store) + apache/kafka (pinned BY
+# DIGEST in ci/docker-compose.live-millrace.yml —
 # a tag is a pointer, and a live suite green against a broker nobody
 # chose proves nothing), on high ports that collide with neither the dev
 # stack (5432/8080/9000/9001) nor ci/live-python.sh
@@ -13,8 +14,9 @@
 # PHASE 5 STATE: the suite under millrace/tests/live/ (marker `live`) is
 # the live docker suite of docs/kafka-ingestion-plan.md — end-to-end
 # truth, kill -9 / lost-commit-response recovery, reassignment, junk
-# event_time, the whale/freshness scenarios, the DDL race, drop+recreate
-# and a compaction observation. The pytest run below selects exactly
+# event_time, the whale/freshness scenarios, the DDL race, drop+recreate,
+# a compaction observation and flush progress with the stage store
+# behind toxiproxy latency. The pytest run below selects exactly
 # those (-m live; tests/conftest.py deselects the marker otherwise), and
 # ci/check_live_results.py rejects a missing, empty, skipped or failed
 # report.
@@ -30,6 +32,8 @@ export HOGLAKE_MINIO_PORT=${HOGLAKE_MINIO_PORT:-29000}
 export HOGLAKE_MINIO_CONSOLE_PORT=${HOGLAKE_MINIO_CONSOLE_PORT:-29001}
 export HOGLAKE_PORT=${HOGLAKE_PORT:-28080}
 export HOGLAKE_KAFKA_PORT=${HOGLAKE_KAFKA_PORT:-29092}
+export HOGLAKE_TOXIPROXY_API_PORT=${HOGLAKE_TOXIPROXY_API_PORT:-28474}
+export HOGLAKE_TOXIPROXY_PORT=${HOGLAKE_TOXIPROXY_PORT:-29100}
 export HOGLAKE_URL="http://localhost:$HOGLAKE_PORT"
 export KAFKA_BOOTSTRAP_SERVERS="127.0.0.1:$HOGLAKE_KAFKA_PORT"
 export HOGLAKE_S3_ENDPOINT="http://localhost:$HOGLAKE_MINIO_PORT"
@@ -66,7 +70,7 @@ ci_python=(uv run --no-project --with defusedxml==0.7.1 python)
     cd "$repo_dir/server"
     ./gradlew --no-daemon :installDist -x test -x ktlintCheck --console=plain
 ) 2>&1 | tee "$report_dir/build.log"
-"${compose[@]}" up -d --wait --wait-timeout 120 postgres minio kafka
+"${compose[@]}" up -d --wait --wait-timeout 120 postgres minio kafka toxiproxy
 
 # The maintenance loops the suite drives by hand stay off; the hydrator
 # runs because the deferred-stats flush path (age-triggered flushes ship
