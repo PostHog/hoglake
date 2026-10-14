@@ -79,7 +79,8 @@ kill -9 mid-flush, the lost commit response (an in-test TCP proxy drops
 the response AFTER the server commits), static reassignment between
 deploys and the two-replica ordinal split, junk `event_time` drop, whale overload + tail
 freshness, the freshness SLA measurement, the DDL race, drop+recreate
-incarnation halt, and a compaction observation. Code-level map:
+incarnation halt, a compaction observation, and flush progress with
+the stage store behind S3-like latency (toxiproxy). Code-level map:
 [architecture.md](architecture.md).
 
 - `just millrace unit` — unit + component tests (pytest, `memory:///`)
@@ -372,6 +373,27 @@ the long-lived objects, and SlateDB's per-instance totals, to
 `MILLRACE_MEMORY_DEBUG_FILE` (`{pid}` substituted) or the
 `millrace.memdebug` logger. `ARROW_DEFAULT_MEMORY_POOL=system` is the
 first thing to try if a pod's slope does not level off.
+
+### Scan read-ahead
+
+slatedb 0.17's default `ScanOptions` fetch ONE block (~4 KiB) per
+object-store GET with one fetch task. Rows still in the memtable never
+notice; once a group's rows live in L0 or sorted-run SSTs, a scan
+reads at block size ÷ GET latency — tens of KB/s at S3 latency. The
+settlement scan runs inside `commit_flushed`'s transaction while it
+holds the stage write lock, so a few MiB of window held the lock for
+minutes and staging stalled behind it. Every range scan over rows (the
+flush window, the settlement, the reconcile emptiness probe — also
+under the lock — and recovery's legacy-marker sweep) therefore uses
+`stage._bulk_scan_options()`: 4 MiB read-ahead, 4 concurrent fetches
+(≤ 16 MiB in flight per scan, never past the range's last block), and
+`cache_blocks=False` so a one-pass scan does not churn the shared block
+cache. The small `stats/`/`prepared/` prefix scans keep the defaults
+and their cached blocks. `tests/live/test_live_stage_latency.py` pins
+it end to end with the stage store behind toxiproxy (60 ± 40 ms).
+Read-ahead shortens the lock hold; it does not remove it — the
+follow-up (hoglake#351) settles by the keys the flush already scanned
+and moves the scan out of the write lock.
 
 ## Dropped records
 

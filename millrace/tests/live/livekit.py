@@ -10,7 +10,9 @@ the commit-path fault-injection proxy (lost-response tests).
 Stack env (exported by ci/live-millrace.sh; defaults match it so a
 hand-started stack works the same): ``HOGLAKE_URL``,
 ``KAFKA_BOOTSTRAP_SERVERS``, ``HOGLAKE_S3_ENDPOINT`` /
-``HOGLAKE_S3_ACCESS_KEY`` / ``HOGLAKE_S3_SECRET_KEY``. SlateDB's s3
+``HOGLAKE_S3_ACCESS_KEY`` / ``HOGLAKE_S3_SECRET_KEY``,
+``HOGLAKE_TOXIPROXY_API_PORT`` / ``HOGLAKE_TOXIPROXY_PORT`` (the
+latency proxy in front of MinIO). SlateDB's s3
 stage store resolves from the standard ``AWS_*`` environment; the
 session fixture maps the harness's ``HOGLAKE_S3_*`` onto it.
 """
@@ -60,6 +62,15 @@ S3_ENDPOINT = os.environ.get("HOGLAKE_S3_ENDPOINT", "http://localhost:29000")
 S3_ACCESS_KEY = os.environ.get("HOGLAKE_S3_ACCESS_KEY", "hoglake")
 S3_SECRET_KEY = os.environ.get("HOGLAKE_S3_SECRET_KEY", "hoglake123")
 S3_REGION = os.environ.get("HOGLAKE_S3_REGION", "us-east-1")
+
+#: The toxiproxy admin API and the host port its MinIO proxy listens on
+#: (container :9100 — ci/docker-compose.live-millrace.yml).
+TOXIPROXY_API = (
+    f"http://127.0.0.1:{os.environ.get('HOGLAKE_TOXIPROXY_API_PORT', '28474')}"
+)
+TOXIPROXY_S3_ENDPOINT = (
+    f"http://127.0.0.1:{os.environ.get('HOGLAKE_TOXIPROXY_PORT', '29100')}"
+)
 
 RUN_ID = uuid.uuid4().hex[:8]
 """Per-run disambiguator for catalogs, topics, groups and stage prefixes."""
@@ -1074,6 +1085,69 @@ def free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return int(s.getsockname()[1])
+
+
+# ---------------------------------------------------------------------------
+# S3 latency (toxiproxy in front of MinIO)
+# ---------------------------------------------------------------------------
+
+
+class S3LatencyProxy:
+    """A toxiproxy proxy to MinIO with a latency toxic on every response.
+
+    The compose service maps container :9100 to
+    :data:`TOXIPROXY_S3_ENDPOINT`; this creates the proxy on it at
+    ``__enter__`` (``upstream`` is MinIO by its compose name) and deletes
+    it at ``__exit__``, so a failed run leaves nothing armed. Point a
+    child's ``AWS_ENDPOINT_URL`` (SlateDB's stage store) at
+    :attr:`endpoint`; the lake, written through ``HOGLAKE_S3_ENDPOINT``,
+    stays direct."""
+
+    def __init__(self, *, latency_ms: int, jitter_ms: int) -> None:
+        self.name = f"stage-s3-{RUN_ID}"
+        self.latency_ms = latency_ms
+        self.jitter_ms = jitter_ms
+        self.endpoint = TOXIPROXY_S3_ENDPOINT
+
+    def __enter__(self) -> Self:
+        import httpx
+
+        r = httpx.post(
+            f"{TOXIPROXY_API}/proxies",
+            json={
+                "name": self.name,
+                "listen": "0.0.0.0:9100",
+                "upstream": "minio:9000",
+                "enabled": True,
+            },
+            timeout=10,
+        )
+        r.raise_for_status()
+        try:
+            self._add_latency(httpx)
+        except BaseException:
+            self.__exit__()
+            raise
+        return self
+
+    def _add_latency(self, httpx: Any) -> None:
+        r = httpx.post(
+            f"{TOXIPROXY_API}/proxies/{self.name}/toxics",
+            json={
+                "name": "latency",
+                "type": "latency",
+                "stream": "downstream",
+                "toxicity": 1.0,
+                "attributes": {"latency": self.latency_ms, "jitter": self.jitter_ms},
+            },
+            timeout=10,
+        )
+        r.raise_for_status()
+
+    def __exit__(self, *exc: object) -> None:
+        import httpx
+
+        httpx.delete(f"{TOXIPROXY_API}/proxies/{self.name}", timeout=10)
 
 
 # ---------------------------------------------------------------------------
