@@ -227,7 +227,7 @@ which errs toward over-staging (a bigger file is a sizing miss; the
 reverse would be a new small-file regime).
 
 A flush's unit of work is BOUNDED, so a post-outage catch-up slice is
-not one unbounded scan → Arrow build → settlement transaction: the
+not one unbounded scan → Arrow build → settlement batch: the
 staged-range scan is capped in rows and bytes
 (`ceil(target_output_bytes ÷ ratio × 1.25)` staged bytes, floored at
 `MILLRACE_FLUSH_SCAN_MIN_BYTES`, default 64 MiB — the floor keeps toy
@@ -237,7 +237,10 @@ own offset span, `[first_scanned_offset, last_scanned_offset]`, capped
 or not: row keys sort by `(group, offset)`, so a capped scan is an exact
 offset prefix of the group's staged rows and no unscanned row of the
 group lies inside the span (staged offsets only grow past a scan
-snapshot), so the span's settlement deletes exactly the published rows.
+snapshot). The settlement deletes exactly the scanned keys — the
+published rows — so a row that enters the span after the scan anyway (a
+replay below the settled floor, a re-key) is left staged and flushes in
+a later window.
 Leftover rows re-decide on the next sweep: a group of N rows drains in
 ⌈N ÷ cap⌉ windows however it interleaves with other groups in the
 partition. A single record larger than the
@@ -265,8 +268,13 @@ sort by the live sort spec → one parquet file per partition tuple under
 the table's LIVE partition spec (whatever it is — one file when the
 staged group was keyed under the same spec) →
 upload → persist the complete prepared request under `prepared/` →
-`commit/prepared` → on receipt, one staging transaction that deletes
-the staged range and sched entries and drops the persisted request.
+`commit/prepared` → on receipt, one staging write batch that deletes
+exactly the scanned row keys, settles the stats and sched entries and
+drops the persisted request (a recovered entry, whose keys did not
+survive the restart, deletes the keys a pre-scan of its window read).
+No scan runs under the stage write lock: the lock covers the stats
+point read and the batch write, so its hold time scales with the
+tombstones written, far below a scan's object-store stall.
 That settlement is atomic and runs only with the receipt in hand, so
 there is no `flushed/` marker to repair: recovery's ambiguity set is
 exactly the surviving `prepared/` entries — a crash between commit and
@@ -280,9 +288,9 @@ strings) — beside the key and body, so a recovered entry is
 self-describing and recovery cross-checks it against the stage's own
 identity and its `prepared/` key; it records `row_count`, the rows the
 window held when the request was built, which every recovery settle
-uses as its expected count (a window holding a different count by then
-halts `settlement_mismatch`, rolled back, rather than settling a row
-the commit did not publish); it records `digest`, the window's
+uses as its expected count against the pre-scan (a window holding a
+different count by then halts `settlement_mismatch` and writes nothing,
+rather than settling a row the commit did not publish); it records `digest`, the window's
 content digest, so a later settle can verify content and not only
 count (a topic recreated under the same name can re-put the same keys
 with new payloads; that check is not wired yet); and it carries

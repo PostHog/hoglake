@@ -380,20 +380,22 @@ slatedb 0.17's default `ScanOptions` fetch ONE block (~4 KiB) per
 object-store GET with one fetch task. Rows still in the memtable never
 notice; once a group's rows live in L0 or sorted-run SSTs, a scan
 reads at block size ÷ GET latency — tens of KB/s at S3 latency. The
-settlement scan runs inside `commit_flushed`'s transaction while it
-holds the stage write lock, so a few MiB of window held the lock for
+settlement scan used to run inside `commit_flushed`'s transaction while
+it held the stage write lock, so a few MiB of window held the lock for
 minutes and staging stalled behind it. Every range scan over rows (the
-flush window, the settlement, the reconcile emptiness probe — also
-under the lock — and recovery's legacy-marker sweep) therefore uses
+flush window, the recovery settlement's pre-scan, the reconcile
+emptiness probe and recovery's legacy-marker sweep) therefore uses
 `stage._bulk_scan_options()`: 4 MiB read-ahead, 4 concurrent fetches
 (≤ 16 MiB in flight per scan, never past the range's last block), and
 `cache_blocks=False` so a one-pass scan does not churn the shared block
 cache. The small `stats/`/`prepared/` prefix scans keep the defaults
 and their cached blocks. `tests/live/test_live_stage_latency.py` pins
 it end to end with the stage store behind toxiproxy (60 ± 40 ms).
-Read-ahead shortens the lock hold; it does not remove it — the
-follow-up (hoglake#351) settles by the keys the flush already scanned
-and moves the scan out of the write lock.
+No scan runs under the write lock any more (hoglake#351): a fresh
+settle deletes the keys the flush already scanned, a recovery settle
+and the reconcile probe scan before taking it, and the lock covers only
+the `stats/` point read and one batch write
+(`test_stage.py::test_no_scan_runs_under_the_write_lock`).
 
 ## Dropped records
 

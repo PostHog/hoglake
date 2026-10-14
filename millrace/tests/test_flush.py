@@ -4655,15 +4655,17 @@ class TestFlushConfigKnobs:
 
 
 # =====================================================================================
-# Adversarial pins: the settlement guard, the junk window boundary, the
+# Adversarial pins: settlement exactness, the junk window boundary, the
 # pure builder's edge semantics
 # =====================================================================================
 
 
 @component
 class TestSettlementGuard:
-    async def test_a_settlement_that_disagrees_with_the_scan_halts(
+    @pytest.mark.parametrize("arm", ["committed", "deduped", "reused_422", "dropped"])
+    async def test_a_row_that_enters_the_window_after_the_scan_survives_the_settle(
         self,
+        arm: str,
         httpx_mock: Any,
         stage_factory: Any,
         fake_clock: Any,
@@ -4672,89 +4674,92 @@ class TestSettlementGuard:
         sleeper: Sleeper,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """The guard runs INSIDE the settle transaction: here the window's
-        range holds a row the flush never scanned (the scan is doctored to
-        miss offset 1 of [0, 2]), so settling it would delete an
-        unpublished row. The transaction rolls back before commit and the
-        pipeline halts ``settlement_mismatch`` — every row still staged,
-        stats unchanged, the ``prepared/`` entry intact, so a restart
-        resumes from consistent state. (Moving the guard after the commit
-        turns this red: the rows are gone.)"""
+        """hoglake#351, on every fresh settle arm (published, deduped from
+        the pre-build receipt, deduped after a 422 reused-key, every row
+        dropped): the scan reads rows 0 and 2, then offset 1 is staged
+        INSIDE the window [0, 2] (a replay or re-key) before the settle.
+        The settle deletes exactly the scanned keys — no halt — so
+        offset 1 survives with exact accounting (row_count AND
+        staged_bytes), and the next decision flushes it as window [1, 1]:
+        every row lands exactly once."""
         stage = await stage_factory()
-        await staged(stage, fake_clock, TEAM, [(0, JAN_US), (1, JAN_US), (2, JAN_US)])
+        junk = [b"not json", b"not json either"]
+        await staged(
+            stage,
+            fake_clock,
+            TEAM,
+            [(0, JAN_US), (2, JAN_US)],
+            payloads=junk if arm == "dropped" else None,
+        )
         script_options(httpx_mock)
-        capture = CommitCapture(httpx_mock, [commit_ok(50)])
+        key = ikey(0, TEAM, 0, 2)  # the content of rows 0 and 2
+        first_steps: list[Any] = {
+            "committed": [commit_ok(50)],
+            "deduped": [],
+            "reused_422": [
+                commit_refusal(
+                    422, "validation", "idempotency_key reused with a different request"
+                )
+            ],
+            "dropped": [],
+        }[arm]
+        capture = CommitCapture(httpx_mock, [*first_steps, commit_ok(51)])
+        if arm == "deduped":
+            script_receipt(httpx_mock, key, snapshot_id=80)
+        if arm == "reused_422":
+            script_receipt(httpx_mock, key, snapshot_id=None)  # before the build
+            script_receipt(httpx_mock, key, snapshot_id=61)  # after the 422
         flusher = flusher_factory(store=store, cfg=make_config(target_output_bytes=1))
-        stats_before = await stage.iter_key_stats()
 
         real_scan = stage.scan_window
 
-        async def scan_missing_a_row(group: Any, **caps: Any) -> Any:
-            from millrace.stage import BoundedScan
-
+        async def scan_then_arrival(group: Any, **caps: Any) -> Any:
             scan = await real_scan(group, **caps)
-            return BoundedScan(
-                [kv for kv in scan.rows if kv[0].offset != 1], scan.complete
-            )
+            monkeypatch.setattr(stage, "scan_window", real_scan)
+            await staged(stage, fake_clock, TEAM, [(1, JAN_US)])
+            return scan
 
-        monkeypatch.setattr(stage, "scan_window", scan_missing_a_row)
-        with pytest.raises(FlushHalted) as excinfo:
-            await flusher.flush_key(
-                stage,
-                decision(
-                    TEAM, trigger="size", staged_bytes=100, first_staged_ts=JAN_US
-                ),
-            )
-        assert excinfo.value.reason == "settlement_mismatch"
-        assert "holds 3 staged rows but the flush published 2" in excinfo.value.detail
-        assert len(capture.bodies) == 1  # the commit had landed
-        assert [rk.offset for rk, _ in await staged_rows(stage, TEAM)] == [0, 1, 2]
-        assert await stage.iter_key_stats() == stats_before
-        (entry,) = await stage.load_prepared()
-        assert entry.key.first_offset == 0
-        assert entry.request.row_count == 2  # what the commit published
-        scanned = [
-            (o, _STAGED[(0, team_group(TEAM), o)]) for o in (0, 2)
-        ]  # the content the doctored scan saw
-        key = keyspace.idempotency_key(
-            TABLE_UUID,
-            "events",
-            0,
-            team_group(TEAM),
-            0,
-            2,
-            keyspace.content_digest(scanned),
+        monkeypatch.setattr(stage, "scan_window", scan_then_arrival)
+        report = await flusher.flush_key(
+            stage,
+            decision(TEAM, trigger="size", staged_bytes=100, first_staged_ts=JAN_US),
         )
-        assert entry.request.idempotency_key == key
-        assert entry.request.digest == keyspace.content_digest(scanned)
-        # The first halt's detail is actionable: stage, key, snapshot,
-        # where, and that an entry stands.
-        first = excinfo.value.detail
-        assert "after publishing the window" in first
-        assert f"events[0], idempotency key {key}, published snapshot 50" in first
-        assert "A prepared/ entry stands" in first
-        assert "no millrace tool does this yet" in first
+        assert (
+            report.outcome
+            == {
+                "committed": "committed",
+                "deduped": "deduped",
+                "reused_422": "deduped",
+                "dropped": "dropped",
+            }[arm]
+        )
+        assert (report.first_offset, report.last_offset) == (0, 2)
+        if arm != "dropped":
+            assert report.idempotency_key == key
+        assert [rk.offset for rk, _ in await staged_rows(stage, TEAM)] == [1]
+        (s,) = await stage.iter_key_stats()
+        assert (s.row_count, s.staged_bytes) == (
+            1,
+            len(_STAGED[(0, team_group(TEAM), 1)]),
+        )
+        assert await stage.load_prepared() == []
 
-        # The documented restart: a fresh flusher reconciles the entry.
-        # Its receipt is there (the commit landed), but the guard uses the
-        # PERSISTED count, not a recount — the window still holds a row
-        # the commit never published, so it halts again, rolled back.
-        monkeypatch.setattr(stage, "scan_window", real_scan)
-        restarted = flusher_factory(store=store, cfg=make_config(target_output_bytes=1))
-        script_receipt(httpx_mock, key, snapshot_id=50)
-        with pytest.raises(FlushHalted) as again:
-            await restarted.reconcile_prepared(
-                stage, (await stage.recover()).pending_prepared[0]
-            )
-        assert again.value.reason == "settlement_mismatch"
-        assert "reconciling a prepared/ entry from its receipt" in again.value.detail
-        assert "published snapshot 50" in again.value.detail
-        assert "A prepared/ entry stands" in again.value.detail
-        assert "hoglake#351" in again.value.detail
-        assert [rk.offset for rk, _ in await staged_rows(stage, TEAM)] == [0, 1, 2]
-        assert await stage.iter_key_stats() == stats_before
-        assert len(await stage.load_prepared()) == 1
-        assert restarted.stats().receipt_settlements == 0
+        if arm == "reused_422":
+            script_table_refresh(httpx_mock)  # the 422 arm dropped the shape
+        report2 = await flusher.flush_key(
+            stage,
+            decision(TEAM, trigger="size", staged_bytes=100, first_staged_ts=JAN_US),
+        )
+        assert report2.outcome == "committed"
+        assert (report2.first_offset, report2.last_offset, report2.records) == (
+            1,
+            1,
+            1,
+        )
+        assert len(capture.bodies) == len(first_steps) + 1
+        assert await staged_rows(stage, TEAM) == []
+        assert await stage.iter_key_stats() == []
+        assert await stage.load_prepared() == []
 
     async def test_a_replayed_entry_whose_window_gained_a_row_halts_at_settle(
         self,
@@ -4769,8 +4774,8 @@ class TestSettlementGuard:
         0 and 2) is lost, the entry persists ``row_count`` 2, then a row
         is re-staged INSIDE the window (offset 1: a re-key). Reconcile
         replays the entry, the replay lands, and the settle — expecting
-        the persisted 2, finding 3 — rolls back and halts: rows and the
-        entry intact."""
+        the persisted 2, pre-scanning 3 — writes nothing and halts: rows
+        and the entry intact."""
         from millrace.flush import _PUBLISH_MAX_ATTEMPTS
 
         stage = await stage_factory()
@@ -4808,7 +4813,58 @@ class TestSettlementGuard:
         assert len(await stage.load_prepared()) == 1
         assert flusher.stats().prepared_replays == 0
 
-    async def test_a_deduped_window_that_gained_a_row_halts_at_settle(
+    async def test_a_receipt_settled_entry_whose_window_gained_a_row_halts(
+        self,
+        httpx_mock: Any,
+        stage_factory: Any,
+        fake_clock: Any,
+        flusher_factory: Any,
+        store: FakeObjectStore,
+        sleeper: Sleeper,
+    ) -> None:
+        """The receipt reconcile arm: the publish of window [0, 2] (rows 0
+        and 2) is ambiguous, the entry persists ``row_count`` 2, a row is
+        re-staged INSIDE the window, and the receipt says the commit
+        landed. No keys survive a restart, so the settle pre-scans the
+        window, finds 3 against the persisted 2, writes nothing and
+        halts — rows, stats and the entry intact, the detail actionable."""
+        from millrace.flush import _PUBLISH_MAX_ATTEMPTS
+
+        stage = await stage_factory()
+        await staged(stage, fake_clock, TEAM, [(0, JAN_US), (2, JAN_US)])
+        script_options(httpx_mock)
+        CommitCapture(httpx_mock, [httpx.ConnectError("lost")] * _PUBLISH_MAX_ATTEMPTS)
+        flusher = flusher_factory(store=store, cfg=make_config(target_output_bytes=1))
+        with pytest.raises(FlushPublishExhausted):
+            await flusher.flush_key(
+                stage,
+                decision(
+                    TEAM, trigger="size", staged_bytes=100, first_staged_ts=JAN_US
+                ),
+            )
+        (entry,) = await stage.load_prepared()
+        key = entry.request.idempotency_key
+        await staged(stage, fake_clock, TEAM, [(1, JAN_US)])  # into the window
+        stats_before = await stage.iter_key_stats()
+        restarted = flusher_factory(store=store, cfg=make_config(target_output_bytes=1))
+        script_receipt(httpx_mock, key, snapshot_id=60)
+        with pytest.raises(FlushHalted) as excinfo:
+            await restarted.reconcile_prepared(
+                stage, (await stage.recover()).pending_prepared[0]
+            )
+        assert excinfo.value.reason == "settlement_mismatch"
+        detail = excinfo.value.detail
+        assert "holds 3 staged rows but the flush published 2" in detail
+        assert "reconciling a prepared/ entry from its receipt" in detail
+        assert f"events[0], idempotency key {key}, published snapshot 60" in detail
+        assert "A prepared/ entry stands" in detail
+        assert "no millrace tool does this yet" in detail
+        assert [rk.offset for rk, _ in await staged_rows(stage, TEAM)] == [0, 1, 2]
+        assert await stage.iter_key_stats() == stats_before
+        assert len(await stage.load_prepared()) == 1
+        assert restarted.stats().receipt_settlements == 0
+
+    async def test_a_deduped_window_that_gained_a_row_settles_only_the_scanned_rows(
         self,
         httpx_mock: Any,
         stage_factory: Any,
@@ -4819,13 +4875,13 @@ class TestSettlementGuard:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """The deduped arm: the fresh build's content (rows 0 and 2) has a
-        receipt, but a row entered the window (offset 1) after the scan.
-        The deduped settle expects the 2 scanned rows, finds 3, rolls back
-        and halts — nothing deleted, nothing built or published."""
+        receipt, and a row entered the window (offset 1) after the scan.
+        The deduped settle deletes exactly rows 0 and 2 — nothing built
+        or published, no halt — and offset 1 flushes next."""
         stage = await stage_factory()
         await staged(stage, fake_clock, TEAM, [(0, JAN_US), (2, JAN_US)])
         script_options(httpx_mock)
-        capture = CommitCapture(httpx_mock, [])
+        capture = CommitCapture(httpx_mock, [commit_ok(81)])
         flusher = flusher_factory(store=store, cfg=make_config(target_output_bytes=1))
         key = ikey(0, TEAM, 0, 2)  # the content of rows 0 and 2
         script_receipt(httpx_mock, key, snapshot_id=80)
@@ -4834,26 +4890,210 @@ class TestSettlementGuard:
 
         async def scan_then_arrival(group: Any, **caps: Any) -> Any:
             rows = await real_scan(group, **caps)
+            monkeypatch.setattr(stage, "scan_window", real_scan)
             await staged(stage, fake_clock, TEAM, [(1, JAN_US)])
             return rows
 
         monkeypatch.setattr(stage, "scan_window", scan_then_arrival)
-        with pytest.raises(FlushHalted) as excinfo:
+        report = await flusher.flush_key(
+            stage,
+            decision(TEAM, trigger="size", staged_bytes=100, first_staged_ts=JAN_US),
+        )
+        assert report.outcome == "deduped"
+        assert (report.first_offset, report.last_offset) == (0, 2)
+        assert capture.bodies == [] and store.files == {}
+        assert [rk.offset for rk, _ in await staged_rows(stage, TEAM)] == [1]
+        (s,) = await stage.iter_key_stats()
+        assert (s.row_count, s.staged_bytes) == (
+            1,
+            len(_STAGED[(0, team_group(TEAM), 1)]),
+        )
+        assert flusher.stats().flush_deduped == 1
+
+        report2 = await flusher.flush_key(
+            stage,
+            decision(TEAM, trigger="size", staged_bytes=100, first_staged_ts=JAN_US),
+        )
+        assert report2.outcome == "committed"
+        assert (report2.first_offset, report2.last_offset) == (1, 1)
+        assert len(capture.bodies) == 1
+        assert await staged_rows(stage, TEAM) == []
+        assert await stage.iter_key_stats() == []
+
+    async def test_no_flush_path_scans_under_the_stage_write_lock(
+        self,
+        httpx_mock: Any,
+        stage_factory: Any,
+        fake_clock: Any,
+        flusher_factory: Any,
+        store: FakeObjectStore,
+        sleeper: Sleeper,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The dev hang, end to end: neither a fresh flush (exact-key
+        settle) nor a recovered entry's receipt settle (pre-scan, then
+        exact-key delete) opens or pages a scan while the stage's write
+        lock is held."""
+        from stagekit import LockedScanSpy
+
+        from millrace.flush import _PUBLISH_MAX_ATTEMPTS
+
+        stage = await stage_factory()
+        await staged(stage, fake_clock, TEAM, [(0, JAN_US), (1, JAN_US)])
+        script_options(httpx_mock)
+        capture = CommitCapture(
+            httpx_mock, [httpx.ConnectError("lost")] * _PUBLISH_MAX_ATTEMPTS
+        )
+        flusher = flusher_factory(store=store, cfg=make_config(target_output_bytes=1))
+        spy = LockedScanSpy(stage, monkeypatch)
+        with pytest.raises(FlushPublishExhausted):
             await flusher.flush_key(
                 stage,
                 decision(
                     TEAM, trigger="size", staged_bytes=100, first_staged_ts=JAN_US
                 ),
             )
-        assert excinfo.value.reason == "settlement_mismatch"
-        detail = excinfo.value.detail
-        assert "deduped; this build published nothing" in detail
-        assert f"idempotency key {key}, published snapshot 80" in detail
-        assert "No prepared/ entry stands" in detail
-        assert capture.bodies == [] and store.files == {}
-        assert [rk.offset for rk, _ in await staged_rows(stage, TEAM)] == [0, 1, 2]
+        (entry,) = await stage.load_prepared()
+        script_receipt(httpx_mock, entry.request.idempotency_key, snapshot_id=90)
+        report = await flusher.flush_key(
+            stage,
+            decision(TEAM, trigger="size", staged_bytes=100, first_staged_ts=JAN_US),
+        )
+        assert report.outcome == "receipt_settled"
+        await staged(stage, fake_clock, TEAM, [(2, JAN_US)])
+        capture.extend([commit_ok(91)])
+        report = await flusher.flush_key(
+            stage,
+            decision(TEAM, trigger="size", staged_bytes=100, first_staged_ts=JAN_US),
+        )
+        assert report.outcome == "committed"
+        assert await staged_rows(stage, TEAM) == []
+        assert spy.calls
+        assert spy.under_lock == []
+
+    async def test_the_runner_runs_one_decision_per_group_per_sweep(
+        self,
+        httpx_mock: Any,
+        fake_clock: Any,
+        flusher_factory: Any,
+        store: FakeObjectStore,
+        sleeper: Sleeper,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Two decisions for ONE group fed to the worker pool at
+        concurrency > 1 would scan the same rows and settle them twice.
+        The runner drops the duplicate (WARNING) — one flush, one
+        commit, one settle, exact stats."""
+        cfg = make_config(target_output_bytes=1)
+        async with StageManager(
+            "memory:///", "millrace", settings=fast_flush_settings()
+        ) as manager:
+            stage = (await manager.open_partition("events", 0)).stage
+            await staged(stage, fake_clock, TEAM, [(0, JAN_US), (1, JAN_US)])
+            script_options(httpx_mock)
+            capture = CommitCapture(httpx_mock, [commit_ok(50)])
+            flusher = flusher_factory(store=store, cfg=cfg)
+            r = FlushRunner(
+                manager,
+                flusher,
+                cfg.planner_knobs(),
+                now_us=fake_clock,
+                sleep=sleeper,
+                sweep_s=60.0,
+                concurrency=4,
+            )
+            d = decision(TEAM, trigger="size", staged_bytes=100, first_staged_ts=JAN_US)
+            with caplog.at_level(logging.WARNING, logger="millrace.flush"):
+                reports, failed = await r._execute([(stage, d), (stage, d)])
+            assert failed == 0
+            assert [rep.outcome for rep in reports] == ["committed"]
+            assert len(capture.bodies) == 1
+            assert await staged_rows(stage, TEAM) == []
+            assert await stage.iter_key_stats() == []
+            assert any(
+                "duplicate flush decision" in rec.getMessage() for rec in caplog.records
+            )
+
+    async def test_a_crash_after_the_settle_write_never_double_subtracts(
+        self,
+        httpx_mock: Any,
+        stage_factory: Any,
+        fake_clock: Any,
+        flusher_factory: Any,
+        store: FakeObjectStore,
+        sleeper: Sleeper,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The settle batch is written, then its durability wait fails
+        (the pod dies, or the store errors). The batch is atomic: the
+        next decision on the group sees the window gone (no prepared/
+        entry, rows deleted) and flushes only the later rows — no second
+        subtraction — and after a reopen recovery finds no pending
+        entry and the stats are exact."""
+        stage = await stage_factory()
+        await staged(stage, fake_clock, TEAM, [(0, JAN_US), (1, JAN_US)])
+        script_options(httpx_mock)
+        capture = CommitCapture(httpx_mock, [commit_ok(50), commit_ok(51)])
+        flusher = flusher_factory(store=store, cfg=make_config(target_output_bytes=1))
+
+        real_db = stage._db
+        armed = {"on": False, "fired": False}
+        real_persist = stage.persist_prepared
+
+        async def persist_then_arm(*args: Any, **kwargs: Any) -> None:
+            await real_persist(*args, **kwargs)
+            armed["on"] = not armed["fired"]  # the FIRST flush's settle only
+
+        class _Handle:
+            def __init__(self, real: Any) -> None:
+                self._real = real
+
+            async def await_durable(self) -> None:
+                raise RuntimeError("the store failed after the settle write")
+
+        class _Db:
+            async def write(self, batch: Any) -> Any:
+                handle = await real_db.write(batch)
+                if armed["on"]:
+                    armed["on"], armed["fired"] = False, True
+                    return _Handle(handle)
+                return handle
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(real_db, name)
+
+        monkeypatch.setattr(stage, "persist_prepared", persist_then_arm)
+        stage._db = _Db()  # type: ignore[assignment]
+        with pytest.raises(RuntimeError, match="after the settle write"):
+            await flusher.flush_key(
+                stage,
+                decision(
+                    TEAM, trigger="size", staged_bytes=100, first_staged_ts=JAN_US
+                ),
+            )
+        assert len(capture.bodies) == 1
+        assert await staged_rows(stage, TEAM) == []
         assert await stage.load_prepared() == []
-        assert flusher.stats().flush_deduped == 0
+        assert await stage.iter_key_stats() == []
+
+        await staged(stage, fake_clock, TEAM, [(2, JAN_US), (3, JAN_US)])
+        (s,) = await stage.iter_key_stats()
+        assert s.row_count == 2  # the window's rows were subtracted once
+        report = await flusher.flush_key(
+            stage,
+            decision(TEAM, trigger="size", staged_bytes=100, first_staged_ts=JAN_US),
+        )
+        assert report.outcome == "committed"
+        assert (report.first_offset, report.last_offset) == (2, 3)
+        assert len(capture.bodies) == 2
+        stage._db = real_db
+        await stage.close()
+
+        reopened = await stage_factory()
+        assert (await reopened.recover()).pending_prepared == ()
+        assert await reopened.iter_key_stats() == []
+        assert await staged_rows(reopened, TEAM) == []
+        await reopened.close()
 
     async def test_the_content_digest_runs_on_the_flushers_executor(
         self,
@@ -4908,39 +5148,6 @@ class TestSettlementGuard:
         thread, through_io = calls[0]
         assert through_io
         assert thread != loop_thread
-
-    async def test_a_mismatch_where_nothing_was_published_says_so(
-        self,
-        httpx_mock: Any,
-        stage_factory: Any,
-        fake_clock: Any,
-        flusher_factory: Any,
-        store: FakeObjectStore,
-    ) -> None:
-        """On the paths where this flush published nothing (all rows
-        dropped, deduped from a receipt) the detail must not claim a
-        publish, and with no entry standing it says a restart rebuilds."""
-        stage = await stage_factory()
-        await staged(stage, fake_clock, TEAM, [(0, JAN_US), (1, JAN_US), (2, JAN_US)])
-        flusher = flusher_factory(store=store, cfg=make_config(target_output_bytes=1))
-        window = FlushedKey(team_group(TEAM), 0, 2, group_fields=SPEC_FIELDS)
-        with pytest.raises(FlushHalted) as excinfo:
-            await flusher._settle(
-                stage,
-                window,
-                2,
-                where="settling a window whose every row was dropped",
-                key=None,
-                snapshot_id=None,
-                entry_stands=False,
-                scanned_at_us=None,
-            )
-        detail = excinfo.value.detail
-        assert "settling a window whose every row was dropped" in detail
-        assert "idempotency key none, nothing published by this flush" in detail
-        assert "No prepared/ entry stands" in detail
-        assert "after publishing" not in detail
-        assert len(await staged_rows(stage, TEAM)) == 3
 
 
 @component

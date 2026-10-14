@@ -16,8 +16,12 @@ What is pinned here:
 - ``commit_flushed`` deletes EXACTLY the flush's offset window —
   hypothesis sweeps arbitrary offsets and windows, so older and younger
   rows of the same partition tuple and a neighbouring tuple survive;
+- a fresh settle (``commit_flushed(rows=…)``) deletes exactly the
+  scanned keys, so a row staged into the window after the scan
+  survives; a recovery settle pre-scans and is count-guarded;
+- no scan runs while the stage write lock is held;
 - the consumer's fence probe writes one ``meta/`` key, never a row;
-- a settle writes NO ``flushed/`` marker (the settle transaction is
+- a settle writes NO ``flushed/`` marker (the settle batch is
   atomic and the receipt precedes it — a marker could only restate
   both);
 - ``recover()`` collects legacy ``flushed/`` markers in bounded pages
@@ -40,6 +44,7 @@ from stagekit import (
     FIELDS,
     NOW,
     TABLE,
+    LockedScanSpy,
     fast_flush_settings,
     g,
     legacy_marker_kv,
@@ -274,12 +279,13 @@ async def _exactly_the_window(data: st.DataObject) -> None:
     await stage.close()
 
 
-async def test_a_settlement_count_mismatch_rolls_back_before_commit(stage_factory):
-    """``commit_flushed(expected_rows=…)`` checks the window's row count
-    inside the settlement transaction: on a mismatch (either direction)
-    it raises SettlementMismatchError and the transaction rolls back —
-    rows, stats, sched entry and the prepared/ entry all untouched. The
-    matching count settles normally."""
+async def test_a_recovery_count_mismatch_writes_nothing(stage_factory):
+    """The window form (a recovered entry, no keys in memory):
+    ``commit_flushed(expected_rows=…)`` checks the pre-scanned row count
+    before anything is written: on a mismatch (either direction) it
+    raises SettlementMismatchError — rows, stats, sched entry and the
+    prepared/ entry all untouched. The matching count deletes the
+    pre-scanned keys and drops the entry."""
     from millrace.stage import SettlementMismatchError
 
     stage = await stage_factory()
@@ -348,11 +354,194 @@ async def test_successive_capped_windows_settle_exactly(stage_factory):
     await stage.close()
 
 
+async def test_a_fresh_settle_deletes_exactly_the_scanned_keys(stage_factory):
+    """hoglake#351: ``commit_flushed(rows=…)`` deletes the given rows by
+    exact key — not the window's range. A row staged into ``[first,
+    last]`` after the scan survives with its accounting (stats rows and
+    bytes stay exact against a row scan), the ``prepared/`` entry goes,
+    and the next scan settles the survivor."""
+    stage = await stage_factory()
+    payloads = {o: b"x" * (10 + o) for o in (0, 2, 4)}
+    await stage.stage_batch(
+        [rec(5, 100, o, payloads[o]) for o in (0, 2, 4)], now_us=NOW
+    )
+    await stage.stage_batch([rec(6, 100, 3)], now_us=NOW)  # a neighbour
+    await stage.persist_prepared(g(5), 0, prepared("k", team=5))
+    scan = await stage.scan_window(g(5), max_rows=10, max_bytes=10**9)
+    assert scan.complete
+    # Offsets 1 and 3 enter the window after the scan (a replay / re-key).
+    await stage.stage_batch(
+        [rec(5, 100, 1, b"late-1"), rec(5, 100, 3, b"late-33")], now_us=NOW + 7
+    )
+    report = await stage.commit_flushed(
+        window(5, 0, 4), rows=scan.rows, scanned_at_us=NOW + 5
+    )
+    assert (report.rows_deleted, report.bytes_deleted, report.group_drained) == (
+        3,
+        sum(len(p) for p in payloads.values()),
+        False,
+    )
+    survivors = await group_rows(stage, 5)
+    assert [(rk.offset, v) for rk, v in survivors] == [(1, b"late-1"), (3, b"late-33")]
+    stats = {s.group: s for s in await stage.iter_key_stats()}
+    assert (stats[g(5)].row_count, stats[g(5)].staged_bytes) == (2, 6 + 7)
+    # the complete scan's start lifts first_staged_ts (the survivors
+    # were staged after it), and the sched_age/ entry is RE-KEYED (the
+    # old one gone); last_staged_ts is the late batch's stamp
+    assert (stats[g(5)].first_staged_ts, stats[g(5)].last_staged_ts) == (
+        NOW + 5,
+        NOW + 7,
+    )
+    assert await stage.iter_sched_age_through(2**63 - 1) == [
+        keyspace.SchedAgeKey(NOW, g(6)),
+        keyspace.SchedAgeKey(NOW + 5, g(5)),
+    ]
+    assert stats[g(6)].row_count == 1
+    assert await stage.load_prepared() == []
+
+    rescan = await stage.scan_window(g(5), max_rows=10, max_bytes=10**9)
+    report = await stage.commit_flushed(window(5, 1, 3), rows=rescan.rows)
+    assert (report.rows_deleted, report.group_drained) == (2, True)
+    assert [s.group for s in await stage.iter_key_stats()] == [g(6)]
+    assert [k.group for k in await stage.iter_sched_age_through(2**63 - 1)] == [g(6)]
+    await stage.close()
+
+
+async def test_a_fresh_settle_refuses_rows_that_are_not_a_scan_of_the_window(
+    stage_factory,
+):
+    """The exact-key form takes a scan's shape and nothing else: rows of
+    another tuple, outside the window, out of offset order or repeated
+    — or a count guard alongside them — are refused before anything is
+    written."""
+    stage = await stage_factory()
+    await stage.stage_batch([rec(5, 100, o) for o in range(4)], now_us=NOW)
+    rows = (await stage.scan_window(g(5), max_rows=10, max_bytes=10**9)).rows
+    other = (RowKey(g(6), 1), b"x")
+    bad = {
+        "another tuple": [rows[0], other],
+        "outside the window": rows,  # offset 3 is past window(5, 0, 2)
+        "out of order": [rows[1], rows[0]],
+        "repeated": [rows[0], rows[0]],
+        "empty": [],
+    }
+    stats_before = await stage.iter_key_stats()
+    for why, offered in bad.items():
+        with pytest.raises(ValueError):
+            await stage.commit_flushed(window(5, 0, 2), rows=offered)
+        assert await stage.iter_key_stats() == stats_before, why
+    with pytest.raises(ValueError, match="expected_rows"):
+        await stage.commit_flushed(window(5, 0, 3), rows=rows, expected_rows=4)
+    assert len(await group_rows(stage, 5)) == 4
+    assert await stage.iter_key_stats() == stats_before
+    await stage.close()
+
+
+async def test_a_row_arriving_after_the_recovery_prescan_survives(
+    stage_factory, monkeypatch
+):
+    """The window form deletes exactly the PRE-SCANNED keys: a row staged
+    into the window between the pre-scan and the locked write (staging
+    is not blocked by the pre-scan) is not deleted, and the stats keep
+    its accounting."""
+    stage = await stage_factory()
+    await stage.stage_batch([rec(5, 100, 0), rec(5, 100, 2)], now_us=NOW)
+    await stage.persist_prepared(g(5), 0, prepared("k", team=5, rows=2))
+    real = stage._deletes_for_window
+
+    async def prescan_then_arrival(key):
+        deletes = await real(key)
+        await stage.stage_batch([rec(5, 100, 1, b"arrived")], now_us=NOW + 1)
+        return deletes
+
+    monkeypatch.setattr(stage, "_deletes_for_window", prescan_then_arrival)
+    report = await asyncio.wait_for(
+        stage.commit_flushed(window(5, 0, 2), expected_rows=2), 5
+    )
+    assert (report.rows_deleted, report.group_drained) == (2, False)
+    assert [(rk.offset, v) for rk, v in await group_rows(stage, 5)] == [(1, b"arrived")]
+    (s,) = await stage.iter_key_stats()
+    assert (s.row_count, s.staged_bytes) == (1, len(b"arrived"))
+    assert await stage.load_prepared() == []
+    await stage.close()
+
+
+async def test_a_replayed_exact_key_settle_never_drains_live_rows(
+    stage_factory, caplog
+):
+    """The ``rows`` form point-reads its first and last keys under the
+    lock: a second call with the same rows finds them gone, logs a
+    WARNING and is a no-op (zeros reported) — stats and sched_age/ still
+    cover rows 2-3, which stay staged. A ``prepared/`` entry still
+    standing for the window is dropped by the replay."""
+    import logging
+
+    stage = await stage_factory()
+    await stage.stage_batch([rec(5, 100, o) for o in range(4)], now_us=NOW)
+    scan = await stage.scan_window(g(5), max_rows=2, max_bytes=10**9)
+    first = await stage.commit_flushed(window(5, 0, 1), rows=scan.rows)
+    assert (first.rows_deleted, first.group_drained) == (2, False)
+    stats_after = await stage.iter_key_stats()
+    sched_after = await stage.iter_sched_age_through(2**63 - 1)
+    await stage.persist_prepared(g(5), 0, prepared("k", team=5, rows=2))
+    with caplog.at_level(logging.WARNING, logger="millrace.stage"):
+        again = await stage.commit_flushed(window(5, 0, 1), rows=scan.rows)
+    assert (again.rows_deleted, again.bytes_deleted, again.group_drained) == (
+        0,
+        0,
+        False,
+    )
+    assert any("already settled" in r.getMessage() for r in caplog.records)
+    assert await stage.iter_key_stats() == stats_after
+    (s,) = stats_after
+    assert s.row_count == 2
+    assert await stage.iter_sched_age_through(2**63 - 1) == sched_after != []
+    assert [rk.offset for rk, _ in await group_rows(stage, 5)] == [2, 3]
+    assert await stage.load_prepared() == []
+    await stage.close()
+
+
+async def test_an_exact_key_settle_with_one_edge_gone_is_corruption(stage_factory):
+    """First scanned row gone, last still staged: no write path produces
+    that, so the settle refuses loudly (StageCorruptionError naming the
+    window) and writes nothing."""
+    from slatedb.uniffi import WriteBatch
+
+    stage = await stage_factory()
+    await stage.stage_batch([rec(5, 100, o) for o in range(3)], now_us=NOW)
+    scan = await stage.scan_window(g(5), max_rows=10, max_bytes=10**9)
+    batch = WriteBatch()
+    batch.delete(keyspace.encode_row_key(RowKey(g(5), 0)))
+    await (await stage._db.write(batch)).await_durable()
+    stats_before = await stage.iter_key_stats()
+    with pytest.raises(StageCorruptionError, match=r"window \[0, 2\]"):
+        await stage.commit_flushed(window(5, 0, 2), rows=scan.rows)
+    assert await stage.iter_key_stats() == stats_before
+    assert [rk.offset for rk, _ in await group_rows(stage, 5)] == [1, 2]
+    await stage.close()
+
+
+async def test_a_recovery_settle_of_an_emptied_window_halts(stage_factory):
+    """A persisted entry whose window holds no rows any more (persisted
+    ``row_count`` 2, nothing staged) is a mismatch (found 0), not a
+    silent settle: the entry stands, stats unchanged."""
+    from millrace.stage import SettlementMismatchError
+
+    stage = await stage_factory()
+    await stage.persist_prepared(g(5), 0, prepared("k", team=5, rows=2))
+    with pytest.raises(SettlementMismatchError) as excinfo:
+        await stage.commit_flushed(window(5, 0, 2), expected_rows=2)
+    assert (excinfo.value.expected, excinfo.value.found) == (2, 0)
+    assert len(await stage.load_prepared()) == 1
+    assert await stage.iter_key_stats() == []
+    await stage.close()
+
+
 # -- recovery ---------------------------------------------------------------------
 
 
 async def test_commit_flushed_writes_no_marker(stage_factory):
-    """The settle is one atomic transaction with the receipt already in
+    """The settle is one atomic batch with the receipt already in
     the caller's hand, so NOTHING is written under ``flushed/`` — the
     prefix is legacy-only. (The C2 pin: a marker would be unbounded
     garbage recover() would have to scan forever.)"""
@@ -370,7 +559,7 @@ async def test_recover_collects_legacy_markers_without_touching_rows(memory_stor
     """A legacy ``flushed/`` marker is collected, NOT applied.
 
     "Marker landed, deletes didn't" is unreachable from every build of
-    this code — the settle has always been ONE atomic transaction — so
+    this code — the settle has always been ONE atomic write — so
     there is no real failure path that produces a marker with pending
     work, and recovery must not invent one: the marker is settled
     garbage. (The crash window that IS real — commit landed, settle
@@ -561,7 +750,7 @@ async def test_recover_returns_pending_prepared_and_nothing_else(stage_factory):
     )
     await stage.persist_prepared(g(1), 0, req_a)
     await stage.persist_prepared(g(1), 5, req_b)
-    # settling the first range drops its prepared entry in the same transaction
+    # settling the first range drops its prepared entry in the same batch
     await stage.commit_flushed(window(1, 0, 4))
 
     report = await stage.recover()
@@ -698,15 +887,11 @@ class _RecordingDb:
     def __init__(self, db: object) -> None:
         self._db = db
         self.write_handles: list[_RecordingHandle] = []
-        self.txn_commit_handles: list[_RecordingHandle] = []
 
     async def write(self, batch: object) -> _RecordingHandle:
         handle = _RecordingHandle(await self._db.write(batch))  # type: ignore[attr-defined]
         self.write_handles.append(handle)
         return handle
-
-    async def begin(self, *args: object) -> _RecordingTxn:
-        return _RecordingTxn(await self._db.begin(*args), self)  # type: ignore[attr-defined]
 
     def __getattr__(self, name: str) -> object:
         return getattr(self._db, name)
@@ -720,21 +905,6 @@ class _RecordingHandle:
     async def await_durable(self) -> None:
         self.awaited = True
         await self._real.await_durable()  # type: ignore[attr-defined]
-
-
-class _RecordingTxn:
-    def __init__(self, real: object, owner: _RecordingDb) -> None:
-        self._real = real
-        self._owner = owner
-
-    async def commit(self) -> _RecordingHandle:
-        real_handle = await self._real.commit()  # type: ignore[attr-defined]
-        handle = _RecordingHandle(real_handle)
-        self._owner.txn_commit_handles.append(handle)
-        return handle
-
-    def __getattr__(self, name: str) -> object:
-        return getattr(self._real, name)
 
 
 async def test_ack_hook_fires_only_after_remote_durability(stage_factory):
@@ -768,7 +938,8 @@ async def test_ack_hook_fires_only_after_remote_durability(stage_factory):
 async def test_every_write_path_awaits_durability_before_returning(stage_factory):
     """The same pin for the other "durable before return" contracts:
     ``persist_prepared`` (the replay-before-publish guard) and the
-    settlement transaction's commit handle (``commit_flushed``)."""
+    settlement batch (``commit_flushed``, both forms), and the
+    ``reconcile_stats`` repair."""
     stage = await stage_factory()
     db = _RecordingDb(stage._db)
     stage._db = db
@@ -780,10 +951,21 @@ async def test_every_write_path_awaits_durability_before_returning(stage_factory
     )
     assert db.write_handles and all(h.awaited for h in db.write_handles)
 
-    await stage.stage_batch([rec(1, 100, 0)], now_us=NOW)
+    db.write_handles.clear()
+    await stage.stage_batch([rec(1, 100, 0), rec(1, 100, 1)], now_us=NOW)
     await stage.commit_flushed(window(1, 0, 0))
-    assert db.txn_commit_handles, "the settle committed no transaction"
-    assert all(h.awaited for h in db.txn_commit_handles)
+    scanned = await stage.scan_window(g(1), max_rows=10, max_bytes=10**9)
+    await stage.commit_flushed(window(1, 1, 1), rows=scanned.rows)
+    assert len(db.write_handles) == 3, "a settle wrote no batch"
+    assert all(h.awaited for h in db.write_handles)
+
+    db.write_handles.clear()
+    await stage.stage_batch([rec(1, 100, 2)], now_us=NOW)
+    await stage.stage_batch([rec(1, 100, 2)], now_us=NOW)  # redelivery residue
+    await stage.commit_flushed(window(1, 2, 2))
+    assert await stage.reconcile_stats(g(1))
+    assert len(db.write_handles) == 4
+    assert all(h.awaited for h in db.write_handles)
     await stage.close()
 
 
@@ -1733,21 +1915,25 @@ async def test_window_scan_reads_ahead(stage_factory, monkeypatch):
     await stage.close()
 
 
-async def test_settlement_scan_reads_ahead(stage_factory, monkeypatch):
-    """The settlement scan inside ``commit_flushed`` — the one that holds
-    the write lock — reads with the bulk options, in its transaction."""
+async def test_settlement_prescan_reads_ahead(stage_factory, monkeypatch):
+    """The recovery settlement's window pre-scan reads with the bulk
+    options; the fresh (exact-key) form scans nothing at all."""
     stage = await stage_factory()
     await stage.stage_batch([rec(5, 100 + i, i) for i in range(5)], now_us=NOW)
+    scanned = await stage.scan_window(g(5), max_rows=2, max_bytes=10**9)
     spy = _ScanSpy(stage, monkeypatch)
-    report = await stage.commit_flushed(window(5, 0, 4))
-    assert (report.rows_deleted, report.group_drained) == (5, True)
-    _ScanSpy.assert_bulk(spy.take(), "txn")
+    report = await stage.commit_flushed(window(5, 0, 1), rows=scanned.rows)
+    assert report.rows_deleted == 2
+    assert spy.take() == []
+    report = await stage.commit_flushed(window(5, 2, 4))
+    assert (report.rows_deleted, report.group_drained) == (3, True)
+    _ScanSpy.assert_bulk(spy.take(), "db")
     await stage.close()
 
 
 async def test_reconcile_and_recovery_scans_read_ahead(stage_factory, monkeypatch):
-    """The reconcile emptiness probe (under the write lock) and recovery's
-    legacy-marker sweep read with the bulk options too."""
+    """The reconcile emptiness probe and recovery's legacy-marker sweep
+    read with the bulk options too."""
     stage = await stage_factory()
     await stage.stage_batch([rec(5, 100, 0)], now_us=NOW)
     # A redelivery inflates the stats; the settle leaves the residue.
@@ -1755,8 +1941,102 @@ async def test_reconcile_and_recovery_scans_read_ahead(stage_factory, monkeypatc
     await stage.commit_flushed(window(5, 0, 0))
     spy = _ScanSpy(stage, monkeypatch)
     assert await stage.reconcile_stats(g(5))
-    _ScanSpy.assert_bulk(spy.take(), "txn")
+    _ScanSpy.assert_bulk(spy.take(), "db")
     await stage.recover()
     recovery = [c for c in spy.take() if c[0] == "db"]
     _ScanSpy.assert_bulk(recovery, "db")
+    await stage.close()
+
+
+# -- no scan under the write lock ------------------------------------------------------
+
+
+async def test_the_lock_spy_sees_a_scan_under_the_lock(stage_factory, monkeypatch):
+    """Positive control for :class:`stagekit.LockedScanSpy`: every way of
+    reading a range while the write lock is held is reported — a Db scan
+    and a prefix scan, a transaction's and a snapshot's scan, each
+    iterator call (``next_batch``, ``next``, ``seek``), and a scan opened
+    BEFORE the lock but paged inside it (only its pages count)."""
+    from slatedb.uniffi import IsolationLevel, KeyRange
+
+    stage = await stage_factory()
+    await stage.stage_batch([rec(5, 100, 0), rec(5, 100, 1)], now_us=NOW)
+    spy = LockedScanSpy(stage, monkeypatch)
+    everything = KeyRange(
+        start=None, start_inclusive=False, end=None, end_inclusive=False
+    )
+    early = await stage._db.scan(everything)
+    assert spy.under_lock == []
+    async with stage._write_lock:
+        await early.next_batch(1)
+        it = await stage._db.scan(everything)
+        await it.next_batch(10)
+        prefixed = await stage._db.scan_prefix(keyspace.ROWS_PREFIX, everything)
+        assert await prefixed.next() is not None
+        await prefixed.seek(keyspace.encode_row_key(RowKey(g(5), 1)))
+        txn = await stage._db.begin(IsolationLevel.SNAPSHOT)
+        await (await txn.scan(everything)).next_batch(1)
+        await txn.rollback()
+        snapshot = await stage._db.snapshot()
+        await (await snapshot.scan(everything)).next_batch(1)
+    assert spy.under_lock == [
+        "next_batch",
+        "db.scan",
+        "next_batch",
+        "db.scan_prefix",
+        "next",
+        "seek",
+        "txn.scan",
+        "next_batch",
+        "snapshot.scan",
+        "next_batch",
+    ]
+    await stage.close()
+
+
+async def test_no_scan_runs_under_the_write_lock(stage_factory, monkeypatch):
+    """The dev hang's pin: a settlement (both forms) and the stats repair
+    never scan while holding the write lock — at object-store latency a
+    scan page under it stalls staging and offset commits. Scans happen
+    (the pre-scan, the probe), all with the lock free."""
+    stage = await stage_factory()
+    await stage.stage_batch([rec(5, 100, o) for o in range(6)], now_us=NOW)
+    await stage.stage_batch([rec(5, 100, 5)], now_us=NOW)  # redelivery residue
+    await stage.persist_prepared(g(5), 0, prepared("k", team=5, rows=3))
+    scan = await stage.scan_window(g(5), max_rows=3, max_bytes=10**9)
+    spy = LockedScanSpy(stage, monkeypatch)
+
+    await stage.commit_flushed(window(5, 0, 2), rows=scan.rows)
+    assert spy.calls == []  # the exact-key form reads no range at all
+    await stage.commit_flushed(window(5, 3, 5), expected_rows=3)
+    assert await stage.reconcile_stats(g(5))
+    assert spy.calls, "the pre-scan and the probe should have scanned"
+    assert spy.under_lock == []
+    assert await stage.iter_key_stats() == []
+    await stage.close()
+
+
+async def test_a_stats_repair_racing_a_stage_batch_keeps_the_batch(
+    stage_factory, monkeypatch
+):
+    """``reconcile_stats`` probes emptiness outside the lock, so a batch
+    can land between the probe and the delete. The stats entry, read
+    before the probe and re-read under the lock, catches it: the repair
+    is abandoned and the new rows keep their accounting."""
+    stage = await stage_factory()
+    await stage.stage_batch([rec(5, 100, 0)], now_us=NOW)
+    await stage.stage_batch([rec(5, 100, 0)], now_us=NOW)  # redelivery residue
+    await stage.commit_flushed(window(5, 0, 0))
+    real = stage._range_holds_a_key
+
+    async def probe_then_arrival(start, end):
+        held = await real(start, end)
+        await stage.stage_batch([rec(5, 100, 9)], now_us=NOW + 1)
+        return held
+
+    monkeypatch.setattr(stage, "_range_holds_a_key", probe_then_arrival)
+    assert not await stage.reconcile_stats(g(5))
+    (s,) = await stage.iter_key_stats()
+    assert s.row_count == 2  # the residue's 1 plus the new row
+    assert [rk.offset for rk, _ in await group_rows(stage, 5)] == [9]
     await stage.close()
