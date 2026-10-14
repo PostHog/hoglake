@@ -11,8 +11,8 @@ agree; more when the group was keyed under an older spec or the junk
 policy clamped a temporal source — the fanout is the correctness
 backstop) → upload → persist the complete prepared request under
 ``prepared/`` → ``commit/prepared`` → on receipt, ONE staging
-transaction deletes the staged range and the sched entries and drops
-the persisted request. No ``flushed/`` marker: the settle is atomic and
+write batch deletes exactly the scanned rows, settles the stats and
+sched entries and drops the persisted request. No ``flushed/`` marker: the settle is atomic and
 the receipt is already in hand when it runs, so a marker could only
 restate both (stage.py's docstring carries the argument); recovery's
 ambiguity set is exactly the surviving ``prepared/`` entries.
@@ -145,7 +145,7 @@ is the small-file regime the design exists to kill. Row keys sort by
 (group, offset), so a scan — capped or not — is an exact offset PREFIX
 of the group's staged rows, and the window is ``[first_scanned_offset,
 last_scanned_offset]``: every staged row of the group inside it was
-scanned. The window identity and the settlement guard both come from
+scanned. The window identity and the settled key set both come from
 the SCANNED rows, never the stats snapshot; rows past a capped scan
 re-decide on the next sweep, so a group of N rows drains in
 ``⌈N ÷ cap⌉`` windows however it interleaves with other groups in the
@@ -153,8 +153,9 @@ Kafka partition. A single row larger than the byte budget still
 flushes (one record is always a bounded unit), probed with a one-row
 scan. Memory shape per decision: ≤ ``max(scan_budget, largest row)``
 payload bytes materialized plus ``≤ flush_scan_max_rows`` decoded
-records and the Arrow build over them; the settlement streams exactly
-the window's key range within its transaction.
+records and the Arrow build over them; the settlement's delete batch
+holds one tombstone per scanned row (a recovery settle pre-scans the
+window's keys into the same shape, values discarded as they stream).
 
 Compression-ratio feedback (the planner's size lane is fed an OBSERVED
 ratio, docs/kafka-ingestion.md §The flush planner):
@@ -2425,13 +2426,12 @@ class HoglakeFlusher:
         partition must equal this stage's own identity and the tuple the
         one its ``prepared/`` key sits under — an entry that names
         another is foreign state, refused as corruption, never replayed
-        under it. The settle deletes EXACTLY the window (never younger
-        rows of the same tuple), and the
-        delete is guarded, inside the settle transaction, against the
-        entry's persisted ``row_count``: a window that now holds a
-        different number of rows (one that was not in the published
-        commit) rolls the settle back and halts ``settlement_mismatch``
-        rather than deleting an unpublished row.
+        under it. The settle pre-scans the window (never younger rows of
+        the same tuple) and deletes exactly the keys it read, guarded
+        against the entry's persisted ``row_count``: a window that now
+        holds a different number of rows (one that was not in the
+        published commit) writes nothing and halts
+        ``settlement_mismatch`` rather than deleting an unpublished row.
         """
         group = pending.key.group
         key = pending.request.idempotency_key
@@ -2488,7 +2488,7 @@ class HoglakeFlusher:
                 f"message's window starts at {first_offset} instead"
             )
         window = FlushedKey(group, first_offset, last_offset, group_fields=fields)
-        # The settlement guard's expected count is the PERSISTED one —
+        # The recovery settle's expected count is the PERSISTED one —
         # the rows the window held when the request was built — never a
         # recount now: a row that entered the window after the scan (a
         # rewind or re-key) was not in the published commit.
@@ -2496,14 +2496,13 @@ class HoglakeFlusher:
 
         receipt = await self._lookup_receipt(key)
         if receipt is not None:
-            await self._settle(
+            await self._settle_recovered(
                 stage,
                 window,
                 expected,
                 where="reconciling a prepared/ entry from its receipt",
                 key=key,
                 snapshot_id=receipt.snapshot_id,
-                entry_stands=True,
                 scanned_at_us=pending.request.scanned_at,
             )
             self._receipt_settlements += 1
@@ -2654,14 +2653,13 @@ class HoglakeFlusher:
                 ) from e
             raise
 
-        await self._settle(
+        await self._settle_recovered(
             stage,
             window,
             expected,
             where="after a recovered prepared/ entry's replay landed",
             key=key,
             snapshot_id=result.snapshot_id,
-            entry_stands=True,
             scanned_at_us=pending.request.scanned_at,
         )
         self._prepared_replays += 1
@@ -2733,62 +2731,63 @@ class HoglakeFlusher:
                 first_path.get(reason, ""),
             )
 
-    async def _settle(
+    async def _settle_scanned(
+        self,
+        stage: PartitionStage,
+        window: FlushedKey,
+        rows: Sequence[tuple[keyspace.RowKey, bytes]],
+        *,
+        scanned_at_us: int | None,
+    ) -> FlushCommitReport:
+        """Settle a fresh window by the EXACT row keys its scan read
+        (hoglake#351): those rows are the published set by construction,
+        so there is no count to disagree with — a row that entered
+        ``[first, last]`` after the scan (a replay below the settled
+        floor, a re-key) survives the settle and is flushed by a later
+        decision."""
+        return await stage.commit_flushed(
+            window, rows=rows, scanned_at_us=scanned_at_us
+        )
+
+    async def _settle_recovered(
         self,
         stage: PartitionStage,
         window: FlushedKey,
         expected: int,
         *,
         where: str,
-        key: str | None,
-        snapshot_id: int | None,
-        entry_stands: bool,
+        key: str,
+        snapshot_id: int,
         scanned_at_us: int | None,
     ) -> FlushCommitReport:
-        """Settle the window with the guard INSIDE the settlement
-        transaction (``commit_flushed(expected_rows=expected)``): the
-        settle must delete EXACTLY the rows the commit published —
-        ``expected`` is the scanned count on a fresh flush and the
-        ``prepared/`` entry's persisted ``row_count`` on every recovery
-        settle (never a recount). A disagreement rolls the transaction
-        back and halts ``settlement_mismatch`` with everything an
-        operator needs: where it happened, the stage, the key, the
-        published snapshot (if any) and whether a ``prepared/`` entry
-        stands — a standing entry makes a restart halt here again (the
-        structural fix is settling by the scanned keys, hoglake#351)."""
+        """Settle a recovered ``prepared/`` entry's window. No scanned keys
+        survive a restart, so the stage pre-scans the window (outside its
+        write lock) and deletes exactly the keys it read — guarded by
+        ``expected``, the entry's persisted ``row_count`` (never a
+        recount). A disagreement writes nothing and halts
+        ``settlement_mismatch`` with everything an operator needs: where
+        it happened, the stage, the key and the published snapshot. The
+        entry stands, so a restart halts here again until an operator
+        acts."""
         try:
             return await stage.commit_flushed(
                 window, expected_rows=expected, scanned_at_us=scanned_at_us
             )
         except SettlementMismatchError as e:
-            published = (
-                f"published snapshot {snapshot_id}"
-                if snapshot_id is not None
-                else "nothing published by this flush"
-            )
-            if entry_stands:
-                action = (
-                    f"A prepared/ entry stands for this window "
-                    f"(prepared/{window.label}/{window.first_offset}): a "
-                    "restart reconciles it against the same count and halts "
-                    "here again. Confirm what the published snapshot holds, "
-                    "then remove the entry (no millrace tool does this yet; "
-                    "an admin subcommand is a follow-up) so the rows re-flush "
-                    "as a new window, or re-consume the window's offsets"
-                )
-            else:
-                action = (
-                    "No prepared/ entry stands for this window: a restart "
-                    "rebuilds it from the rows as they now stand (a new "
-                    "content key; rows already published may land twice)"
-                )
             raise FlushHalted(
                 "settlement_mismatch",
                 f"{e} — {where}; {stage.topic}[{stage.partition}], "
-                f"idempotency key {key or 'none'}, {published}. Nothing was "
-                "settled. The window holds rows that were not in what the "
-                "flush saw (a rewind or re-key after the scan). "
-                f"{action} (hoglake#351: settle by scanned keys)",
+                f"idempotency key {key}, published snapshot {snapshot_id}. "
+                "Nothing was settled. The window holds a different number "
+                "of rows than the persisted request published (a rewind or "
+                "re-key after its scan, or rows gone since). A prepared/ "
+                f"entry stands for this window (prepared/{window.label}/"
+                f"{window.first_offset}): a restart reconciles it against "
+                "the same count and halts here again. Confirm what the "
+                "published snapshot holds, then remove the entry (no "
+                "millrace tool does this yet; an admin subcommand is a "
+                "follow-up) so the rows re-flush as a new window, or "
+                "re-consume the window's offsets",
             ) from e
 
     def _scan_budget_bytes(self) -> int:
@@ -2835,9 +2834,9 @@ class HoglakeFlusher:
            re-checked against the receipt: present → settle as deduped
            (another writer committed this content), absent → halt
            ``idempotency_key_reused``.
-        5. Settlement strictly after the receipt, guarded INSIDE the
-           settle transaction against the scanned count (the persisted
-           ``row_count`` on recovery).
+        5. Settlement strictly after the receipt, by the EXACT scanned
+           row keys (a recovered entry pre-scans its window and is
+           guarded by the persisted ``row_count``).
         """
         group = decision.group
         for pending in await stage.list_prepared(group):
@@ -2892,8 +2891,9 @@ class HoglakeFlusher:
             # stats merge inflates on redelivery; a flush settles ACTUALS
             # and the leftover counters survive). Left alone the stale
             # first_staged_ts would pin the oldest-staged-age gauge
-            # forever, so the stats entry is repaired away — race-free
-            # inside reconcile_stats' serializable transaction.
+            # forever, so the stats entry is repaired away — race-free:
+            # reconcile_stats deletes only if the stats entry it read
+            # before its emptiness probe is unchanged under the lock.
             repaired = await stage.reconcile_stats(group)
             if repaired:
                 self._stats_repaired += 1
@@ -2920,9 +2920,8 @@ class HoglakeFlusher:
         # group inside [first scanned, last scanned] was scanned.
         # Arrivals after the snapshot normally carry larger offsets; a
         # row that enters the window after the scan anyway (a rewind
-        # re-keying an in-window offset into this group) makes the
-        # settlement guard halt inside the settle transaction, which
-        # rolls back.
+        # re-keying an in-window offset into this group) is not among
+        # the settled keys: it survives and flushes in a later window.
         first_offset = rows[0][0].offset
         last_offset = rows[-1][0].offset
         window = FlushedKey(group, first_offset, last_offset, group_fields=fields)
@@ -2950,11 +2949,10 @@ class HoglakeFlusher:
                 stage,
                 decision,
                 window,
-                len(rows),
+                rows,
                 key,
                 f"its receipt exists (snapshot {receipt.snapshot_id})",
                 snapshot_id=receipt.snapshot_id,
-                entry_stands=False,
                 scanned_at=scanned_at,
             )
 
@@ -3013,16 +3011,7 @@ class HoglakeFlusher:
         if plan.payload is None:
             # Every row dropped: nothing may be committed (a commit
             # registers at least one file). Settle WITHOUT a commit.
-            await self._settle(
-                stage,
-                window,
-                len(rows),
-                where="settling a window whose every row was dropped",
-                key=None,
-                snapshot_id=None,
-                entry_stands=False,
-                scanned_at_us=scanned_at,
-            )
+            await self._settle_scanned(stage, window, rows, scanned_at_us=scanned_at)
             self._decisions_dropped += 1
             return FlushReport(
                 topic=stage.topic,
@@ -3188,12 +3177,11 @@ class HoglakeFlusher:
                     stage,
                     decision,
                     window,
-                    len(rows),
+                    rows,
                     key,
                     "the publish was answered 422 reused-key and the "
                     f"receipt exists (snapshot {landed.snapshot_id})",
                     snapshot_id=landed.snapshot_id,
-                    entry_stands=True,
                     scanned_at=scanned_at,
                 )
             status = e.status_code
@@ -3217,16 +3205,7 @@ class HoglakeFlusher:
                 ) from e
             raise
 
-        await self._settle(
-            stage,
-            window,
-            len(rows),
-            where="after publishing the window",
-            key=key,
-            snapshot_id=result.snapshot_id,
-            entry_stands=True,
-            scanned_at_us=scanned_at,
-        )
+        await self._settle_scanned(stage, window, rows, scanned_at_us=scanned_at)
         self._flushes_committed += 1
         self._rows_published += plan.records
         self._files_written += plan.files
@@ -3268,31 +3247,18 @@ class HoglakeFlusher:
         stage: PartitionStage,
         decision: FlushDecision,
         window: FlushedKey,
-        scanned: int,
+        rows: Sequence[tuple[keyspace.RowKey, bytes]],
         key: str,
         why: str,
         *,
         snapshot_id: int | None,
-        entry_stands: bool,
         scanned_at: int | None,
     ) -> FlushReport:
         """Settle a fresh window that already landed under its key —
         nothing new is committed (``millrace_flush_deduped_total``). The
-        settle is the ordinary one (rows, stats, any ``prepared/`` entry
-        of the window), guarded against the scanned count."""
-        await self._settle(
-            stage,
-            window,
-            scanned,
-            where=(
-                "settling a window whose content's receipt already existed "
-                "(deduped; this build published nothing)"
-            ),
-            key=key,
-            snapshot_id=snapshot_id,
-            entry_stands=entry_stands,
-            scanned_at_us=scanned_at,
-        )
+        settle is the ordinary one (exactly the scanned rows, stats, any
+        ``prepared/`` entry of the window)."""
+        await self._settle_scanned(stage, window, rows, scanned_at_us=scanned_at)
         self._flush_deduped += 1
         log.info(
             "deduped %s[%d] group %s offsets %d-%d (idempotency key %s): %s; "
@@ -3768,6 +3734,10 @@ class FlushRunner:
         memory, so the global bound is what ties sweep memory to config
         rather than to how many partitions backlog at once).
 
+        A duplicate ``(partition, group)`` in ``work`` is dropped with
+        a WARNING (one decision per group per sweep — the exact-key
+        settle's contract).
+
         Containment per decision, exactly as the serial loop: a failure
         (ladder exhaustion, an encoder bug, an object-store fault) is
         logged, counted, and the sweep moves on; a revoked stage stops
@@ -3783,6 +3753,26 @@ class FlushRunner:
         failed = 0
         if not work:
             return reports, failed
+        # ONE decision per (partition, group) per sweep: two concurrent
+        # flushes of a group would scan overlapping rows and settle them
+        # twice. The planner never emits a duplicate; a duplicate here is
+        # a bug upstream, dropped loudly rather than run.
+        unique: list[tuple[PartitionStage, FlushDecision]] = []
+        seen: set[tuple[str, int, keyspace.PartitionTuple]] = set()
+        for stage, decision in work:
+            ident = (stage.topic, stage.partition, decision.group)
+            if ident in seen:
+                log.warning(
+                    "dropping a duplicate flush decision for %s[%d] group %s "
+                    "in one sweep",
+                    stage.topic,
+                    stage.partition,
+                    decision.group,
+                )
+                continue
+            seen.add(ident)
+            unique.append((stage, decision))
+        work = unique
         pending: deque[tuple[PartitionStage, FlushDecision]] = deque(work)
         per_partition: dict[tuple[str, int], asyncio.Semaphore] = {}
 

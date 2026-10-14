@@ -35,22 +35,27 @@ shape: durability latency tracks SlateDB's ``flush_interval`` setting
 (the WAL flush ticker), so ack latency sits at up to one interval above
 the write itself.
 
-Flush settlement — :meth:`PartitionStage.commit_flushed`: ONE
-transaction: the delete of EXACTLY the flush's offset window (row keys
-sort by (group, offset), so the window is one contiguous byte range,
-``keyspace.window_rows_range`` — rows of the same tuple outside it
-survive), the stats subtraction (or removal, with its ``sched_age/``
-entry, when the tuple drains) and the drop of the range's persisted
-``prepared/`` request — with the caller's published-row count checked
-against the deleted count BEFORE the commit (a mismatch rolls the
-whole transaction back). NO ``flushed/`` marker is
+Flush settlement — :meth:`PartitionStage.commit_flushed`: ONE write
+batch: exact-key deletes of the window's rows, the stats subtraction
+(or removal, with its ``sched_age/`` entry, when the tuple drains) and
+the drop of the window's persisted ``prepared/`` request. A fresh flush
+settles EXACTLY the row keys its scan read (hoglake#351): a row that
+entered the window ``[first, last]`` after the scan (a replay below the
+settled floor, a re-key) is not deleted and flushes in a later window —
+no guard, nothing to disagree with. A recovered ``prepared/`` entry has
+no keys in memory: the window's keys (``keyspace.window_rows_range``)
+are pre-scanned, the count is checked against the entry's persisted
+``row_count`` (a mismatch raises before anything is written), and
+exactly the pre-scanned keys are deleted. NO scan runs under the write
+lock: the lock covers the ``stats/`` point read and the batch write.
+NO ``flushed/`` marker is
 written: the settlement is atomic, so "marker landed, deletes didn't" —
 the state a marker existed to repair — is unreachable, and the commit's
 receipt is durable server-side (and in the caller's hand) before settle
 is even called, so a marker could only ever restate it. A crash before
 the settle leaves the ``prepared/`` entry, which recovery replays
 receipt-first. Deletes and bookkeeping commit atomically, so a crash
-lands them together or not at all, and a replayed call is a no-op.
+lands them together or not at all.
 
 Recovery — :meth:`PartitionStage.recover`: returns every
 still-unpublished ``prepared/`` entry (the flusher's replay set) and
@@ -70,6 +75,9 @@ fails with ``Error.Closed(FENCED)`` no later than its next write's
 durability wait, and nothing it wrote after the contest lands). Read
 paths (stats and row scans, gauges) take no lock: scan iterators are
 consistent snapshots as of creation (also pinned by the parity suite).
+No scan runs while the lock is held — at object-store latency a scan
+under it stalls staging and the consumer's offset commits behind it;
+lock holders do point reads and one batch write.
 
 Gauges — :meth:`PartitionStage.gauges`: derived from the ``stats/``
 prefix, the same snapshot the flush planner reads, so the published
@@ -106,7 +114,7 @@ import asyncio
 import hashlib
 import logging
 import time
-from collections.abc import AsyncIterator, Callable, Iterable, Mapping
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Final, Literal, Self, overload
 
@@ -115,10 +123,8 @@ from slatedb.uniffi import (
     Db,
     DbBuilder,
     DbCache,
-    DbTransaction,
     DefaultMetricsRecorder,
     DurabilityLevel,
-    IsolationLevel,
     KeyRange,
     MokaCacheOptions,
     ObjectStore,
@@ -157,15 +163,14 @@ _BULK_SCAN_FETCH_TASKS: Final = 4
 def _bulk_scan_options() -> ScanOptions:
     """Scan options for every range scan over row-sized or unbounded key
     ranges: the flush window (:meth:`PartitionStage._iter_range`), the
-    settlement (:meth:`PartitionStage._settle_flushed`, under the write
-    lock), the reconcile emptiness probe (also under the write lock) and
-    recovery's legacy-marker sweep.
+    recovery settlement's pre-scan, the reconcile emptiness probe (all
+    outside the write lock) and recovery's legacy-marker sweep.
 
     SlateDB's default ScanOptions fetch ONE block (~4 KiB) per object-store
     GET with one fetch task, so a range that lives in L0/sorted-run SSTs
-    reads at block_size / GET-latency (~50 KB/s at S3 latencies) — and a
-    settlement scan at that rate holds the write lock, stalling staging,
-    for minutes. Read ahead in multi-MiB ranged GETs with a few concurrent
+    reads at block_size / GET-latency (~50 KB/s at S3 latencies) — a
+    window of a few MiB takes minutes (and, when the settlement scan ran
+    under the write lock, stalled staging for as long). Read ahead in multi-MiB ranged GETs with a few concurrent
     fetches instead (the fetch never runs past the range's last block);
     blocks stay uncached (a one-pass scan would only churn the shared
     cache). The small, re-read ``stats/``/``prepared/`` prefix scans
@@ -202,10 +207,10 @@ class StageClosedError(StageError):
 
 
 class SettlementMismatchError(StageError):
-    """A settlement's window range held a different number of rows than
-    the caller published (``commit_flushed(expected_rows=...)``). Raised
-    BEFORE the settlement transaction commits — it is rolled back, so no
-    row, ``stats/`` entry or ``prepared/`` entry changed."""
+    """A recovered window's range held a different number of rows than
+    its ``prepared/`` entry published (``commit_flushed(expected_rows=...)``).
+    Raised by the pre-scan, BEFORE anything is written — no row,
+    ``stats/`` entry or ``prepared/`` entry changed."""
 
     def __init__(self, key: FlushedKey, expected: int, found: int) -> None:
         self.key = key
@@ -214,7 +219,7 @@ class SettlementMismatchError(StageError):
         super().__init__(
             f"settling group {key.label} offsets {key.first_offset}-"
             f"{key.last_offset}: the window holds {found} staged rows but "
-            f"the flush published {expected}; the settlement was rolled back"
+            f"the flush published {expected}; the settlement was not applied"
         )
 
 
@@ -331,7 +336,7 @@ class RecoveryReport:
     verbatim on a receipt 404, whatever its age).
     ``legacy_markers_collected``: ``flushed/`` markers deleted. Nothing
     writes that prefix any more — a settlement is one atomic
-    transaction, so a marker was always fully-settled state with its
+    batch, so a marker was always fully-settled state with its
     receipt already in hand — and recovery removes leftover markers in
     bounded pages without decoding them.
     """
@@ -457,12 +462,19 @@ def db_cache_id_for(topic: str, partition: int) -> int:
 
 
 @dataclass(frozen=True, slots=True)
-class _Settlement:
-    """The accounting of one applied flush settlement."""
+class _SettleDeletes:
+    """One settlement's batch, built before the write lock is taken: the
+    exact row-key deletes plus their accounting (``rows``, ``nbytes`` —
+    the deleted values' sizes, what ``stats/`` subtracts). The
+    bookkeeping writes join it under the lock."""
 
-    rows_deleted: int
-    bytes_deleted: int
-    group_drained: bool
+    batch: WriteBatch
+    rows: int
+    nbytes: int
+    edges: tuple[bytes, bytes] | None = None
+    """The first and last row keys of the ``rows`` form — the replay
+    probe :meth:`PartitionStage.commit_flushed` point-reads under the
+    lock. None for the window form (a pre-scan is its own probe)."""
 
 
 class PartitionStage:
@@ -1085,13 +1097,22 @@ class PartitionStage:
         """Delete one ``prepared/`` entry on its own — for abandoning a
         refused request before a rebuild. Settled windows need no call:
         :meth:`commit_flushed` drops the entry in the settlement
-        transaction."""
+        batch."""
         self._ensure_open()
         batch = WriteBatch()
         batch.delete(keyspace.prepared_key(group, first_offset))
         async with self._write_lock:
             handle = await self._db.write(batch)
             await handle.await_durable()
+
+    async def _range_holds_a_key(self, start: bytes, end: bytes) -> bool:
+        """True when ``[start, end)`` holds at least one key — a one-key
+        probe with the bulk options, never run under the write lock."""
+        it = await self._db.scan_with_options(
+            KeyRange(start=start, start_inclusive=True, end=end, end_inclusive=False),
+            _bulk_scan_options(),
+        )
+        return bool(await it.next_batch(1))
 
     async def reconcile_stats(self, group: PartitionTuple) -> bool:
         """Remove a partition tuple's ``stats/`` + ``sched_age/`` entries when its rows
@@ -1105,43 +1126,33 @@ class PartitionStage:
         staged-age gauge forever. The flush path calls this when a
         decided key scans empty.
 
-        ONE serializable transaction: the stats read and the row scan see
-        one snapshot, so a repair either observes a genuinely empty tuple
-        or conflicts with a concurrent ``stage_batch`` on the stats key
-        (serializable write-write) — the loser aborts and neither loses
-        the new batch's accounting. Returns True when it repaired."""
+        The emptiness probe runs OUTSIDE the write lock (no scan ever
+        holds it — module docstring). Race-freedom comes from the stats
+        entry: it is read BEFORE the probe, and the delete commits only
+        if the entry is byte-identical under the lock. Every
+        ``stage_batch`` touching the tuple rewrites the entry with a
+        larger ``row_count`` (and only this decision's flush settles the
+        tuple), so an unchanged entry means no row landed after the
+        probe's basis, and a row landing before it was seen by the probe.
+        Returns True when it repaired."""
         self._ensure_open()
+        stats_key = keyspace.stats_key(group)
+        basis = await self._db.get(stats_key)
+        if basis is None:
+            return False
+        if await self._range_holds_a_key(*keyspace.group_rows_range(group)):
+            return False
+        stats = keyspace.decode_stats_value(basis)
+        batch = WriteBatch()
+        batch.delete(stats_key)
+        batch.delete(
+            keyspace.encode_sched_age_key(SchedAgeKey(stats.first_staged_ts, group))
+        )
         async with self._write_lock:
-            txn = await self._db.begin(IsolationLevel.SERIALIZABLE_SNAPSHOT)
-            try:
-                raw = await txn.get(keyspace.stats_key(group))
-                if raw is None:
-                    await txn.rollback()
-                    return False
-                start, end = keyspace.group_rows_range(group)
-                it = await txn.scan_with_options(
-                    KeyRange(
-                        start=start, start_inclusive=True, end=end, end_inclusive=False
-                    ),
-                    _bulk_scan_options(),
-                )
-                chunk = await it.next_batch(1)
-                if chunk:
-                    await txn.rollback()
-                    return False
-                stats = keyspace.decode_stats_value(raw)
-                await txn.delete(keyspace.stats_key(group))
-                await txn.delete(
-                    keyspace.encode_sched_age_key(
-                        SchedAgeKey(stats.first_staged_ts, group)
-                    )
-                )
-            except BaseException:
-                await txn.rollback()
-                raise
-            handle = await txn.commit()
-            if handle is not None:
-                await handle.await_durable()
+            if await self._db.get(stats_key) != basis:
+                return False  # a batch staged into the tuple since the probe
+            handle = await self._db.write(batch)
+            await handle.await_durable()
         return True
 
     # -- flush settlement ---------------------------------------------------------
@@ -1150,15 +1161,36 @@ class PartitionStage:
         self,
         key: FlushedKey,
         *,
+        rows: Sequence[tuple[RowKey, bytes]] | None = None,
         expected_rows: int | None = None,
         scanned_at_us: int | None = None,
     ) -> FlushCommitReport:
-        """Settle one committed flush — ONE transaction:
+        """Settle one committed flush — ONE write batch: delete the
+        window's rows by EXACT key, subtract (or remove, with the
+        ``sched_age/`` entry, when drained) the tuple's ``stats/``, and
+        drop the window's ``prepared/`` entry.
 
-        delete EXACTLY the flush's offset window of the tuple's rows
-        (every key in ``keyspace.window_rows_range``), subtract (or
-        remove, with the ``sched_age/`` entry, when drained) the tuple's
-        ``stats/``, and drop the range's ``prepared/`` entry.
+        Which keys (hoglake#351):
+
+        - ``rows`` given (a fresh flush): exactly those rows — the ones
+          the flush scanned, which ARE the published set by construction.
+          A row that entered ``[first_offset, last_offset]`` after the
+          scan (a replay or re-key) is not among them, survives, and is
+          flushed by a later decision. No count guard: there is nothing
+          to disagree with. Each row must be of the window's tuple and
+          inside it, in strictly increasing offset order (a scan's shape).
+        - ``rows`` None (a recovered ``prepared/`` entry, nothing in
+          memory): every key in ``keyspace.window_rows_range``, read by a
+          pre-scan. ``expected_rows`` (the entry's persisted
+          ``row_count``) guards it: a different count raises
+          :class:`SettlementMismatchError` before anything is written. A
+          row arriving between the pre-scan and the write is not
+          deleted.
+
+        Every scan — the pre-scan — runs BEFORE the write lock is taken;
+        under the lock only the ``stats/`` point read and the batch write
+        run, so a settlement never stalls staging behind object-store
+        reads.
 
         No ``flushed/`` marker is written. The caller holds the commit's
         receipt before calling (the server commits it in the same
@@ -1170,16 +1202,8 @@ class PartitionStage:
 
         The same settlement retires a window that will NEVER be committed
         because the flush dropped every row of it (undecodable or junk
-        ``event_time``): there is no
-        receipt and nothing to reconcile, so the settle is a plain
-        delete.
-
-        ``expected_rows`` is the guard: the number of rows the caller
-        published from this window. The transaction scans and deletes the
-        window's keys, and when the count differs it raises
-        :class:`SettlementMismatchError` and rolls back BEFORE commit —
-        a disagreement never deletes an unpublished row nor leaves the
-        bookkeeping half-applied. None skips the check.
+        ``event_time``): there is no receipt and nothing to reconcile, so
+        the settle is a plain delete.
 
         ``scanned_at_us`` is the staging-clock instant taken just before
         the window's scan, given only when that scan saw the tuple's
@@ -1187,95 +1211,168 @@ class PartitionStage:
         staged after it, so when rows remain the tuple's
         ``first_staged_ts`` is lifted to ``max(first_staged_ts,
         scanned_at_us)`` (never past ``last_staged_ts``) and its
-        ``sched_age/`` entry is re-keyed, in the same transaction. None
-        (a capped scan, whose leftovers may predate it) keeps the old
-        value — the flush-earlier direction.
+        ``sched_age/`` entry is re-keyed, in the same batch. None (a
+        capped scan, whose leftovers may predate it) keeps the old value
+        — the flush-earlier direction.
 
-        Idempotent: a replay after an ambiguous failure finds no rows in
-        the window and reports zeros (with ``expected_rows`` it raises
-        instead — the caller's count no longer matches).
+        Idempotence: the window form is idempotent (a replay pre-scans
+        no rows and reports zeros; with ``expected_rows`` it raises
+        instead — the count no longer matches). The ``rows`` form
+        point-reads the first and last given keys under the lock: both
+        gone means the rows were already settled (a replayed call) — a
+        WARNING, zeros reported, nothing but a still-present
+        ``prepared/`` entry deleted, so a replay never subtracts the
+        same rows twice and drains accounting from rows still staged;
+        exactly one gone is :class:`StageCorruptionError`. Nothing in
+        the flusher replays it (a failed settle is retried by a new
+        decision with a new scan); the probe pins the contract.
+
+        Lock hold time scales with the tombstones written (the batch
+        write and its durability wait run under the lock) — far below
+        the old range scan's object-store stall, but not constant.
         """
         self._ensure_open()
+        if rows is not None:
+            if expected_rows is not None:
+                raise ValueError("expected_rows guards the window form only")
+            if not rows:
+                raise ValueError("an exact-key settle needs at least one row")
+            deletes = await self._deletes_for_rows(key, rows)
+        else:
+            deletes = await self._deletes_for_window(key)
+            if expected_rows is not None and deletes.rows != expected_rows:
+                raise SettlementMismatchError(key, expected_rows, deletes.rows)
         async with self._write_lock:
-            txn = await self._db.begin(IsolationLevel.SERIALIZABLE_SNAPSHOT)
-            try:
-                settlement = await self._settle_flushed(txn, key, scanned_at_us)
-                if (
-                    expected_rows is not None
-                    and settlement.rows_deleted != expected_rows
-                ):
-                    raise SettlementMismatchError(
-                        key, expected_rows, settlement.rows_deleted
-                    )
-            except BaseException:
-                await txn.rollback()
-                raise
-            handle = await txn.commit()
-            if handle is not None:
-                await handle.await_durable()
+            if deletes.edges is not None and not await self._edges_staged(
+                key, deletes.edges
+            ):
+                await self._settle_replayed(key)
+                return FlushCommitReport(
+                    rows_deleted=0, bytes_deleted=0, group_drained=False
+                )
+            drained = await self._settle_stats(deletes, key, scanned_at_us)
+            # Recovery's replay set is exactly what remains under
+            # prepared/, so the entry leaves with the window.
+            deletes.batch.delete(keyspace.prepared_key(key.group, key.first_offset))
+            handle = await self._db.write(deletes.batch)
+            await handle.await_durable()
         return FlushCommitReport(
-            rows_deleted=settlement.rows_deleted,
-            bytes_deleted=settlement.bytes_deleted,
-            group_drained=settlement.group_drained,
+            rows_deleted=deletes.rows,
+            bytes_deleted=deletes.nbytes,
+            group_drained=drained,
         )
 
-    async def _settle_flushed(
-        self, txn: DbTransaction, key: FlushedKey, scanned_at_us: int | None
-    ) -> _Settlement:
-        """The settlement body of :meth:`commit_flushed`."""
-        # The exact settlement selection (keyspace.py §The settlement
-        # window): the window is one contiguous byte range of the
-        # tuple's slice; every key in it is one of the window's rows.
+    async def _edges_staged(self, key: FlushedKey, edges: tuple[bytes, bytes]) -> bool:
+        """The ``rows`` form's replay probe (under the lock; point reads
+        only): True when the first and last given rows are both staged,
+        False when both are gone (already settled)."""
+        first, last = edges
+        first_staged = await self._db.get(first) is not None
+        last_staged = (
+            first_staged if last == first else await self._db.get(last) is not None
+        )
+        if first_staged == last_staged:
+            return first_staged
+        staged, gone = ("first", "last") if first_staged else ("last", "first")
+        raise StageCorruptionError(
+            f"{self._topic}[{self._partition}] group {key.label} window "
+            f"[{key.first_offset}, {key.last_offset}]: the {staged} settled row "
+            f"is still staged but the {gone} is gone — a partial settle no "
+            "write path produces"
+        )
+
+    async def _settle_replayed(self, key: FlushedKey) -> None:
+        """A replayed exact-key settle (its rows already gone): delete the
+        window's ``prepared/`` entry if one still stands, touch nothing
+        else (under the lock)."""
+        log.warning(
+            "%s[%d]: an exact-key settle of group %s offsets %d-%d found its "
+            "rows already settled; replay ignored (stats untouched)",
+            self._topic,
+            self._partition,
+            key.label,
+            key.first_offset,
+            key.last_offset,
+        )
+        prepared = keyspace.prepared_key(key.group, key.first_offset)
+        if await self._db.get(prepared) is not None:
+            batch = WriteBatch()
+            batch.delete(prepared)
+            handle = await self._db.write(batch)
+            await handle.await_durable()
+
+    async def _deletes_for_rows(
+        self, key: FlushedKey, rows: Sequence[tuple[RowKey, bytes]]
+    ) -> _SettleDeletes:
+        """The exact-key deletes of a fresh flush's scanned rows (no I/O;
+        yields to the loop every ``_SCAN_CHUNK`` rows)."""
+        batch = WriteBatch()
+        nbytes = 0
+        previous: int | None = None
+        for i, (row, payload) in enumerate(rows):
+            if row.group != key.group or not keyspace.row_in_flushed_range(row, key):
+                raise ValueError(
+                    f"row {row} is outside the settled window {key.label} "
+                    f"[{key.first_offset}, {key.last_offset}]"
+                )
+            if previous is not None and row.offset <= previous:
+                raise ValueError(
+                    f"settled rows must be in strictly increasing offset "
+                    f"order: {row.offset} after {previous}"
+                )
+            previous = row.offset
+            batch.delete(keyspace.encode_row_key(row))
+            nbytes += len(payload)
+            if i % _SCAN_CHUNK == _SCAN_CHUNK - 1:
+                await asyncio.sleep(0)
+        return _SettleDeletes(
+            batch,
+            len(rows),
+            nbytes,
+            (
+                keyspace.encode_row_key(rows[0][0]),
+                keyspace.encode_row_key(rows[-1][0]),
+            ),
+        )
+
+    async def _deletes_for_window(self, key: FlushedKey) -> _SettleDeletes:
+        """The exact-key deletes of every row now in the window (keyspace.py
+        §The settlement window: one contiguous byte range of the tuple's
+        slice) — a bulk pre-scan, outside the write lock."""
         start, end = keyspace.window_rows_range(key)
-        rows_deleted = 0
-        bytes_deleted = 0
-        it = await txn.scan_with_options(
-            KeyRange(start=start, start_inclusive=True, end=end, end_inclusive=False),
-            _bulk_scan_options(),
-        )
-        while True:
-            chunk = await it.next_batch(_SCAN_CHUNK)
-            if not chunk:
-                break
-            for kv in chunk:
-                await txn.delete(kv.key)
-                rows_deleted += 1
-                bytes_deleted += len(kv.value)
-
-        drained = await self._settle_stats(
-            txn, key, rows_deleted, bytes_deleted, scanned_at_us
-        )
-        await self._settle_prepared(txn, key)
-        return _Settlement(rows_deleted, bytes_deleted, drained)
+        batch = WriteBatch()
+        rows = 0
+        nbytes = 0
+        async for row_key, value in self._iter_range(start, end):
+            batch.delete(row_key)
+            rows += 1
+            nbytes += len(value)
+        return _SettleDeletes(batch, rows, nbytes)
 
     async def _settle_stats(
-        self,
-        txn: DbTransaction,
-        key: FlushedKey,
-        rows_deleted: int,
-        bytes_deleted: int,
-        scanned_at_us: int | None,
+        self, deletes: _SettleDeletes, key: FlushedKey, scanned_at_us: int | None
     ) -> bool:
-        """Subtract the deleted rows from the tuple's ``stats/`` entry, or
-        remove it (with its ``sched_age/`` entry) when the tuple drained.
-        While rows remain, ``first_staged_ts`` is lifted to the scan's
-        start (``scanned_at_us``, when the scan was complete — every
-        survivor was staged after it) and the ``sched_age/`` entry
-        re-keyed; without it the older value stays, which can only flush
-        the survivors EARLIER than their own deadline — the freshness
-        SLA's safe direction. The lift never passes ``last_staged_ts``
-        (a batch whose clock was read before the scan began but which
-        landed after the scan's snapshot stays bounded by its own
-        stamp)."""
-        raw = await txn.get(keyspace.stats_key(key.group))
-        if raw is None:
+        """Add the ``stats/`` update to the settlement batch: subtract the
+        deleted rows, or remove the entry (with its ``sched_age/`` entry)
+        when the tuple drained. While rows remain, ``first_staged_ts`` is
+        lifted to the scan's start (``scanned_at_us``, when the scan was
+        complete — every survivor was staged after it) and the
+        ``sched_age/`` entry re-keyed; without it the older value stays,
+        which can only flush the survivors EARLIER than their own
+        deadline — the freshness SLA's safe direction. The lift never
+        passes ``last_staged_ts`` (a batch whose clock was read before
+        the scan began but which landed after the scan's snapshot stays
+        bounded by its own stamp). Runs under the write lock: the point
+        read sees every batch staged before the settle commits."""
+        batch, rows_deleted, bytes_deleted = deletes.batch, deletes.rows, deletes.nbytes
+        current = await self._read_stats(key.group)
+        if current is None:
             if rows_deleted:
                 raise StageCorruptionError(
                     f"group {key.label}: {rows_deleted} staged rows in the "
                     "settled window but no stats entry"
                 )
             return False
-        current = keyspace.decode_stats_value(raw)
         if rows_deleted > current.row_count or bytes_deleted > current.staged_bytes:
             raise StageCorruptionError(
                 f"group {key.label}: settling {rows_deleted} rows / "
@@ -1286,8 +1383,8 @@ class PartitionStage:
             return False  # idempotent replay: the landing commit already settled
         remaining = current.row_count - rows_deleted
         if remaining == 0:
-            await txn.delete(keyspace.stats_key(key.group))
-            await txn.delete(
+            batch.delete(keyspace.stats_key(key.group))
+            batch.delete(
                 keyspace.encode_sched_age_key(
                     SchedAgeKey(current.first_staged_ts, key.group)
                 )
@@ -1297,15 +1394,13 @@ class PartitionStage:
         if scanned_at_us is not None:
             first = min(max(first, scanned_at_us), current.last_staged_ts)
         if first != current.first_staged_ts:
-            await txn.delete(
+            batch.delete(
                 keyspace.encode_sched_age_key(
                     SchedAgeKey(current.first_staged_ts, key.group)
                 )
             )
-            await txn.put(
-                keyspace.encode_sched_age_key(SchedAgeKey(first, key.group)), b""
-            )
-        await txn.put(
+            batch.put(keyspace.encode_sched_age_key(SchedAgeKey(first, key.group)), b"")
+        batch.put(
             keyspace.stats_key(key.group),
             keyspace.encode_stats_value(
                 StatsValue(
@@ -1318,12 +1413,6 @@ class PartitionStage:
         )
         return False
 
-    async def _settle_prepared(self, txn: DbTransaction, key: FlushedKey) -> None:
-        """Drop the settled range's ``prepared/`` entry: once the settle
-        lands, recovery's replay set is exactly what remains under
-        ``prepared/``, so the entry must leave with the window."""
-        await txn.delete(keyspace.prepared_key(key.group, key.first_offset))
-
     # -- recovery ---------------------------------------------------------------
 
     async def recover(self) -> RecoveryReport:
@@ -1332,7 +1421,7 @@ class PartitionStage:
         Two bounded jobs:
 
         1. Collect LEGACY ``flushed/`` markers. Nothing writes that
-           prefix any more (settlement is one atomic transaction, so a
+           prefix any more (settlement is one atomic batch, so a
            marker was always settled state with its receipt already in
            hand — never a repair instruction). Collection is a paged
            delete: one write batch per ``_RECOVERY_PAGE`` keys, the write

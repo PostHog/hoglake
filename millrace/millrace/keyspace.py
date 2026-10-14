@@ -75,8 +75,8 @@ Value formats
                byte-exact prepared commit request, written once and
                replayed byte-identically after an ambiguous response.
                ``row_count`` is the number of staged rows the request's
-               window held when it was built — the settlement guard's
-               expected count at every recovery settle (a window that
+               window held when it was built — the recovery settle's
+               expected count, checked against its pre-scan (a window that
                holds a different count by then is not the window the
                commit published). ``digest`` is the window's
                :func:`content_digest` (the raw 32 bytes; hex in the
@@ -108,7 +108,7 @@ Value formats
                gauge reads the ``meta/`` prefix.
 - ``flushed``:  LEGACY — pre-atomic-settlement builds wrote a marker per
                committed range. Settlement has always been one atomic
-               transaction, so the repair state the marker existed for is
+               write, so the repair state the marker existed for is
                unreachable and nothing writes the prefix any more;
                :meth:`PartitionStage.recover` collects leftover markers in
                bounded pages WITHOUT decoding them.
@@ -116,13 +116,19 @@ Value formats
 The settlement window
 ---------------------
 
-A committed flush settles by deleting EXACTLY its offset window of the
-partition tuple's staged rows. Byte order is (group, offset), so the
-window ``[first_offset, last_offset]`` is one contiguous byte range,
-:func:`window_rows_range`: the settlement deletes every key in it.
-Within one Kafka-partition instance a row's offset is unique, so the
-window identifies its rows exactly; rows of the tuple below or above
-the window sort outside the range and survive.
+A committed flush settles by deleting its window's rows by EXACT key, in
+one of two forms. The FRESH form (the flush that scanned the window)
+deletes exactly the row keys its scan read: a row that entered the
+window after the scan (a replay below the settled floor, a re-key) is
+not one of them and survives to a later window. The WINDOW form (a
+recovered ``prepared/`` entry, whose scanned keys did not survive the
+restart) uses the range: byte order is (group, offset), so the window
+``[first_offset, last_offset]`` is one contiguous byte range,
+:func:`window_rows_range`, which a pre-scan reads (its count checked
+against the entry's persisted ``row_count``) before the read keys are
+deleted. Within one Kafka-partition instance a row's offset is unique,
+so the window identifies its rows exactly; rows of the tuple below or
+above the window sort outside the range and survive either form.
 
 Ranges
 ------
@@ -757,7 +763,7 @@ def decode_prepared_value(data: bytes) -> PreparedRequest:
 #
 # LEGACY prefix. Pre-atomic-settlement documentation wrote one marker per
 # committed range here; settlement has in fact always been ONE atomic
-# transaction (:meth:`PartitionStage.commit_flushed`), so a readable marker
+# write (:meth:`PartitionStage.commit_flushed`), so a readable marker
 # was always fully settled state. Nothing writes this prefix any more;
 # :meth:`PartitionStage.recover` deletes whatever it finds under it, in
 # bounded pages, without decoding. ``FlushedKey`` is the settlement-WINDOW

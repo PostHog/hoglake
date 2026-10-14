@@ -124,3 +124,75 @@ def payload_for(offset: int, size: int) -> bytes:
     the parent re-derives it to verify byte-exact survival."""
     body = f"rec-{offset:012d}|".encode()
     return (body * (size // len(body) + 1))[:size]
+
+
+class LockedScanSpy:
+    """Records, for every range scan a stage's ``Db`` opens — directly,
+    in a transaction (``begin``) or on a snapshot (``snapshot``) — and
+    every iterator call that reads (``next_batch``, ``next``, ``seek``),
+    whether the stage's write lock was held at that moment — then
+    delegates, so the scans really run.
+
+    The pin for "no scan under the write lock": at object-store latency
+    a scan page is one or more GETs, and a lock holder that waits on one
+    stalls staging and the consumer's offset commits behind it (the
+    hoglake-millrace dev hang). Install with
+    ``LockedScanSpy(stage, monkeypatch)``; ``under_lock`` lists the
+    offending calls, ``calls`` all of them. Iterator calls are checked
+    per call, so a scan opened before the lock but paged inside it is
+    caught too."""
+
+    _SCANS = ("scan", "scan_with_options", "scan_prefix", "scan_prefix_with_options")
+
+    def __init__(self, stage: Any, monkeypatch: Any) -> None:
+        self.calls: list[tuple[str, bool]] = []
+        self._stage = stage
+        db = stage._db
+        self._wrap_scans(db, "db", monkeypatch.setattr)
+        for opener, who in (("begin", "txn"), ("snapshot", "snapshot")):
+            real = getattr(db, opener)
+
+            async def spied_open(*args: Any, _real: Any = real, _who: str = who) -> Any:
+                handle = await _real(*args)
+                self._wrap_scans(handle, _who, setattr)
+                return handle
+
+            monkeypatch.setattr(db, opener, spied_open)
+
+    def _wrap_scans(self, target: Any, who: str, set_attr: Any) -> None:
+        for name in self._SCANS:
+            real = getattr(target, name)
+
+            async def spied(*args: Any, _real: Any = real, _name: str = name) -> Any:
+                self._note(f"{who}.{_name}")
+                return _Iter(await _real(*args), self)
+
+            set_attr(target, name, spied)
+
+    def _note(self, what: str) -> None:
+        self.calls.append((what, self._stage._write_lock.locked()))
+
+    @property
+    def under_lock(self) -> list[str]:
+        return [what for what, locked in self.calls if locked]
+
+
+class _Iter:
+    def __init__(self, real: Any, spy: LockedScanSpy) -> None:
+        self._real = real
+        self._spy = spy
+
+    async def next_batch(self, n: int) -> Any:
+        self._spy._note("next_batch")
+        return await self._real.next_batch(n)
+
+    async def next(self) -> Any:
+        self._spy._note("next")
+        return await self._real.next()
+
+    async def seek(self, key: bytes) -> Any:
+        self._spy._note("seek")
+        return await self._real.seek(key)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real, name)
