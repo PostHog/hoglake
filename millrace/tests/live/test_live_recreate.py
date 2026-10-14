@@ -1,11 +1,11 @@
 """Scenario 9 (Phase 5): drop+recreate mid-flight — the incarnation guard.
 
 The destination is dropped and recreated under the same name while the
-pipeline (the real ``millrace.main`` subprocess) holds staged rows. The
-pinned ``expected_table_uuid`` no longer resolves, the server refuses
-``table_recreated``, and millrace HALTS LOUDLY: nonzero exit, the reason
-in the log, and ZERO writes to the new incarnation (viaduck lesson 3 —
-an incarnation change is a stop sign, never a silent retarget).
+pipeline (the real ``millrace.main`` subprocess) is staging. The pinned
+``expected_table_uuid`` no longer resolves, the server refuses
+``table_recreated``, and millrace HALTS for a human: exit 3, the reason
+in the log, and ZERO writes to the new incarnation. The rows stay
+staged.
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ async def test_drop_recreate_halts_loudly(
         namespace="ns1",
         table="events",
         flush_deadline_s=2,
-        flush_sweep_s=1,
+        slow_lane_deadline_s=2,
     )
     port = livekit.free_port()
     child = livekit.Child(livekit.child_env(cfg, metrics_port=port), name="recreate")
@@ -49,8 +49,8 @@ async def test_drop_recreate_halts_loudly(
             livekit.produce_batch, producer, [(7, base + i) for i in range(100)]
         )
         await livekit.wait_until_async(
-            lambda: (
-                sum(livekit.lake_team_counts(table, lake_home.head()).values()) == 100
+            lambda: livekit.all_landed(
+                table, lake_home.catalog, lake_home.fs, range(100)
             ),
             120,
             desc="wave 1 queryable",
@@ -81,6 +81,15 @@ async def test_drop_recreate_halts_loudly(
         )
         recreated = await asyncio.to_thread(lake_home.create_events_table, "events")
         assert recreated.table_uuid != old_uuid
+
+        # Wave 3 guarantees a flush after the recreate (wave 2 may have
+        # flushed into the old incarnation before the drop).
+        await asyncio.to_thread(
+            livekit.produce_batch,
+            producer,
+            [(7, now_us() + i) for i in range(50)],
+            seq_start=150,
+        )
 
         # The pipeline halts loudly: nonzero exit, the reason logged.
         rc = await asyncio.to_thread(child.wait_exit, 180)

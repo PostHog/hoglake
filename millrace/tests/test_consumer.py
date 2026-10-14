@@ -6,7 +6,7 @@ and the client-config pins) are unit tests without I/O;
 the loop itself is driven component-style — a scripted FakeConsumer
 (tests/kafkakit.py, hedgerow's fakes.py shape) over a REAL
 StageManager on ``memory:///``, so poll → stage → ack → commit ordering,
-assignment open/recover/revoke, drops and shutdown are all pinned
+assignment open/discover, the startup drain, drops and shutdown are all pinned
 against durable staged state with no broker anywhere.
 
 Pinned here:
@@ -17,7 +17,8 @@ Pinned here:
 - the assignment is derived ONCE at start: the topic's partition count
   from one ``list_topics`` metadata read, split by millpond's rule
   (``p % replica_count == ordinal``, uneven counts included); the stages
-  open+recover BEFORE ``assign()`` with OFFSET_STORED; an unknown topic
+  open (their staged groups discovered), the caller's drain runs, and
+  only then ``assign()`` with OFFSET_STORED; an unknown topic
   or an ordinal with no partitions refuses to start with nothing
   claimed;
 - the client-config pins: ``auto.offset.reset`` from the config knob
@@ -44,12 +45,11 @@ Pinned here:
   the old keyer;
 - a fenced partition (a REAL contested open on the stage's path — the
   parity suite's FENCED shape) closes locally and halts the loop with
-  the distinct ConsumerFencedError, without committing the failed batch;
+  the distinct FencedError, without committing the failed batch;
 - malformed records are dropped: nothing staged, counted per reason
   label (the partition-source path collapsed), logged at WARNING
   rate-limited per (partition, reason), and covered by the partition's
   commit;
-  The gauges are alert inputs, published by the flush sweep;
 - commit retry ladder and its exhaustion; a failed stage commits
   nothing;
 - graceful shutdown: polling stops, the Kafka side closes, committed
@@ -71,14 +71,10 @@ from kafkakit import FakeConsumer, error_event, msg, team_msg, team_payload
 from pyhoglake import TableInfo
 from slatedb.uniffi import CloseReason, DbBuilder
 from slatedb.uniffi import Error as SlateError
-from stagekit import NOW, fast_flush_settings, prepared, rec
+from stagekit import NOW, fast_flush_settings, rec
 
 import millrace.consumer as consumer_mod
-from millrace.config import (
-    AutoOffsetReset,
-    Config,
-    EventTimePolicy,
-)
+from millrace.config import AutoOffsetReset, Config
 from millrace.consumer import (
     DROP_LOG_INTERVAL_S,
     REASON_INVALID_OFFSET,
@@ -86,7 +82,6 @@ from millrace.consumer import (
     REASON_MALFORMED_VALUE,
     REASON_MISSING_VALUE,
     AssignmentError,
-    ConsumerFencedError,
     ConsumerStats,
     MillraceConsumer,
     classify_message,
@@ -97,9 +92,10 @@ from millrace.consumer import (
 )
 from millrace.flush import FlushHalted
 from millrace.grouping import GroupKeyer
-from millrace.planner import PlannerKnobs, plan_flush
+from millrace.planner import PlannerKnobs, decide
 from millrace.stage import (
     DroppedRecord,
+    FencedError,
     PartitionStage,
     StageClosedError,
     StagedRecord,
@@ -127,15 +123,8 @@ def make_config(**overrides) -> Config:
         "table": "events",
         "stage_store_url": "memory:///",
         "stage_base_path": "millrace",
-        "target_output_bytes": 1000,
-        "flush_deadline_s": 900,
-        "slow_lane_deadline_s": 21600,
-        "min_flush_bytes": 1024 * 1024,
-        "max_files_per_commit": 512,
         "consume_batch_size": 100,
         "poll_timeout_ms": 50,
-        "event_time_policy": EventTimePolicy.DROP,
-        "metrics_port": 8000,
     }
     return Config(**{**base, **overrides})
 
@@ -150,13 +139,33 @@ class Sleeper:
         self.calls.append(seconds)
 
 
+class JournalingStageManager(StageManager):
+    """A real StageManager whose stages journal every durable
+    ``stage_batch`` as ``("ack", StageAck)`` once it returns: the
+    rows-then-offset ordering is checked against the same journal the
+    fake consumer writes its commits to."""
+
+    def __init__(self, journal: list[tuple]) -> None:
+        super().__init__("memory:///", "millrace", settings=fast_flush_settings())
+        self.journal = journal
+
+    async def open_partition(
+        self, topic: str, partition: int, *, now_us: int
+    ) -> PartitionStage:
+        stage = await super().open_partition(topic, partition, now_us=now_us)
+        real = stage.stage_batch
+
+        async def journaled(records: Any, *, now_us: int) -> Any:
+            ack = await real(records, now_us=now_us)
+            self.journal.append(("ack", ack))
+            return ack
+
+        stage.stage_batch = journaled  # type: ignore[method-assign]
+        return stage
+
+
 def make_manager(journal: list[tuple]) -> StageManager:
-    return StageManager(
-        "memory:///",
-        "millrace",
-        settings=fast_flush_settings(),
-        ack_hook=lambda ack: journal.append(("ack", ack)),
-    )
+    return JournalingStageManager(journal)
 
 
 #: The destination's columns: a top-level ``team_id``, the event time,
@@ -308,7 +317,20 @@ def assert_commits_follow_acks(
 
 async def team_offsets(stage: PartitionStage, team: int) -> list[int]:
     """The staged offsets of team ``team``'s ``identity(team_id)`` group."""
-    return [rk.offset async for rk, _ in stage.scan_group_rows((str(team),))]
+    return await group_offsets(stage, (str(team),))
+
+
+async def group_rows(
+    stage: PartitionStage, group: tuple[str | None, ...]
+) -> list[tuple[Any, bytes]]:
+    """Every staged row of ``group`` in key order."""
+    return (await stage.scan(group, max_bytes=1 << 40, now_us=0)).rows
+
+
+async def group_offsets(
+    stage: PartitionStage, group: tuple[str | None, ...]
+) -> list[int]:
+    return [rk.offset for rk, _ in await group_rows(stage, group)]
 
 
 # ==================================================================================
@@ -560,11 +582,18 @@ def test_consumer_config_earliest_stays_selectable():
     assert conf["auto.offset.reset"] == "earliest"
 
 
-def test_consumer_config_wires_the_fetch_tuning():
+def test_consumer_config_fetch_defaults_are_overridable_by_the_passthrough():
+    assert consumer_mod.KAFKA_FETCH_DEFAULTS == {
+        "max.partition.fetch.bytes": 32 * 1024 * 1024,
+        "fetch.max.bytes": 256 * 1024 * 1024,
+        "queued.max.messages.kbytes": 262144,
+    }
     cfg = make_config(
-        kafka_max_partition_fetch_bytes=4 * 1024 * 1024,
-        kafka_fetch_max_bytes=64 * 1024 * 1024,
-        kafka_queued_max_messages_kbytes=131072,
+        kafka_consumer_overrides=(
+            ("fetch.max.bytes", 64 * 1024 * 1024),
+            ("max.partition.fetch.bytes", 4 * 1024 * 1024),
+            ("queued.max.messages.kbytes", 131072),
+        )
     )
     conf = kafka_consumer_config(cfg)
     assert conf["max.partition.fetch.bytes"] == 4 * 1024 * 1024
@@ -585,14 +614,14 @@ def test_real_consumer_constructs_from_the_config():
 
 
 @component
-async def test_static_start_opens_and_recovers_stages_before_assign(fake_clock):
+async def test_static_start_opens_stages_before_assign(fake_clock):
     journal: list[tuple] = []
     manager = make_manager(journal)
     original_sync = manager.sync_assignment
 
-    async def spied_sync(claimed):
+    async def spied_sync(claimed, *, now_us):
         journal.append(("sync_assignment", frozenset(claimed)))
-        return await original_sync(claimed)
+        return await original_sync(claimed, now_us=now_us)
 
     manager.sync_assignment = spied_sync  # type: ignore[method-assign]
     fake = FakeConsumer(journal=journal, partitions=3)
@@ -659,44 +688,83 @@ async def test_static_start_fails_loudly_when_the_coordinator_never_answers(
 
 
 @component
-async def test_claim_recovers_the_previous_owners_leftovers(fake_clock):
-    """Claiming a partition runs recovery, and the recovery report flows
-    to the claimant: a persisted ``prepared/`` entry left by a previous
-    owner (crashed between persist and publication) is handed back as
-    the flusher's replay set."""
+async def test_start_drains_previously_staged_rows_before_assign_and_consume(
+    fake_clock,
+):
+    """The startup drain: the stages are opened and their staged groups
+    discovered, the caller's drain runs over them, and only then is the
+    partition assigned and consumed."""
     journal: list[tuple] = []
     manager = make_manager(journal)
-    # A previous owner staged rows and persisted a prepared request, then
-    # went away (close = the claim moved; the state stays on the store).
-    previous = await manager.open_partition("events", 0)
-    await previous.stage.stage_batch([rec(1, 100, 0), rec(1, 200, 1)], now_us=NOW)
-    await previous.stage.persist_prepared(("1",), 0, prepared("idem-1", team=1))
+    # A previous process staged rows and went away without flushing.
+    previous = await manager.open_partition("events", 0, now_us=NOW)
+    await previous.stage_batch([rec(1, 100, 0), rec(1, 200, 1)], now_us=NOW)
     await manager.close_partition("events", 0)
 
-    captured = []
+    fake = FakeConsumer(journal=journal)
+    fake.feed(team_msg(0, 2, team=1))
+    consumer = make_consumer(fake, manager, make_config(), fake_clock)
+    seen: list[Any] = []
 
-    original_sync = manager.sync_assignment
+    async def drain() -> None:
+        journal.append(("drain",))
+        stage = manager.stage("events", 0)
+        # Discovered before the drain runs: the index knows the group.
+        seen.append([s.group for s in stage.snapshot()])
+        seen.append(await team_offsets(stage, 1))
+        assert not any(e[0] in ("assign", "consume") for e in journal)
 
-    async def spied_sync(claimed):
-        result = await original_sync(claimed)
-        captured.append(result)
-        return result
+    await consumer.start(drain=drain)
+    assert seen == [[("1",)], [0, 1]]
+    kinds = [e[0] for e in journal]
+    assert kinds.index("drain") < kinds.index("assign")
+    assert consumer.started
+    await run_steps(consumer, fake)
+    assert fake.committed_store == {("events", 0): 3}
+    await manager.close()
 
-    manager.sync_assignment = spied_sync  # type: ignore[method-assign]
+
+@component
+async def test_a_failed_drain_never_assigns_and_the_start_sticks(fake_clock):
+    journal: list[tuple] = []
+    manager = make_manager(journal)
     fake = FakeConsumer(journal=journal)
     consumer = make_consumer(fake, manager, make_config(), fake_clock)
-    await consumer.start()
 
-    (sync,) = captured
-    recovery = sync.opened[("events", 0)].recovery
-    assert recovery.legacy_markers_collected == 0
-    assert [(p.key.group, p.key.first_offset) for p in recovery.pending_prepared] == [
-        (("1",), 0)
-    ]
-    assert recovery.pending_prepared[0].request.idempotency_key == "idem-1"
-    # ...and the staged rows are claimable state, not stranded bytes.
-    stage = manager.stage("events", 0)
-    assert await team_offsets(stage, 1) == [0, 1]
+    async def drain() -> None:
+        raise FlushHalted("table_recreated", "scripted")
+
+    with pytest.raises(FlushHalted):
+        await consumer.start(drain=drain)
+    assert not any(e[0] == "assign" for e in journal)
+    assert not consumer.started
+    # Sticky: a second start re-raises without claiming or assigning.
+    with pytest.raises(FlushHalted):
+        await consumer.start()
+    assert not any(e[0] == "assign" for e in journal)
+    await manager.close()
+
+
+@component
+async def test_a_stop_during_the_drain_never_assigns_or_consumes(fake_clock):
+    """SIGTERM during the startup drain: start() returns without
+    assigning, and run() closes without consuming anything."""
+    journal: list[tuple] = []
+    manager = make_manager(journal)
+    fake = FakeConsumer(journal=journal)
+    fake.feed(team_msg(0, 0, team=1))
+    consumer = make_consumer(fake, manager, make_config(), fake_clock)
+
+    async def drain() -> None:
+        consumer.stop()  # the signal handler, mid-drain
+
+    await consumer.start(drain=drain)
+    assert not consumer.started
+    assert not any(e[0] == "assign" for e in journal)
+    await asyncio.wait_for(consumer.run(), timeout=10)
+    assert fake.consume_calls == 0
+    assert fake.closed
+    assert not any(e[0] == "assign" for e in journal)
     await manager.close()
 
 
@@ -738,22 +806,22 @@ async def test_end_to_end_staged_rows_and_committed_offsets_cover(fake_clock):
     for partition, team_count in ((0, 3), (1, 1)):
         stage = manager.stage("events", partition)
         seen: list[int] = []
-        for ks in await stage.iter_key_stats():
-            rows = [(rk, v) async for rk, v in stage.scan_group_rows(ks.group)]
+        for ks in stage.snapshot():
+            rows = await group_rows(stage, ks.group)
             offsets = [rk.offset for rk, _ in rows]
             assert offsets == sorted(offsets)
             for rk, value in rows:
                 assert value == produced[(partition, rk.offset)]
                 assert rk.group == ks.group
-            assert ks.row_count == len(rows)
+            assert ks.rows == len(rows)
             assert ks.staged_bytes == sum(len(v) for _, v in rows)
             total_rows += len(rows)
             seen.extend(offsets)
         assert sorted(seen) == list(range(20 if partition == 0 else 10))
-        assert len(await stage.iter_key_stats()) == team_count
+        assert len(stage.snapshot()) == team_count
     assert total_rows == 30
 
-    gauges = await manager.gauges()
+    gauges = manager.gauges()
     assert gauges.staged_rows == 30
     assert gauges.staged_bytes == sum(len(v) for v in produced.values())
     assert gauges.oldest_first_staged_ts == NOW  # the injected staging clock
@@ -789,10 +857,15 @@ async def test_error_events_are_counted_and_never_staged_or_committed(fake_clock
 async def stage_key_prefixes(stage: PartitionStage) -> set[bytes]:
     """Every key family present in the stage (the bytes up to the first
     ``/``) — what a drop must never add to."""
-    return {
-        key.split(b"/", 1)[0] + b"/"
-        async for key, _ in stage._iter_range(b"\x00", b"\xff")
-    }
+    from slatedb.uniffi import KeyRange
+
+    it = await stage._db.scan(
+        KeyRange(start=None, start_inclusive=False, end=None, end_inclusive=False)
+    )
+    out: set[bytes] = set()
+    while chunk := await it.next_batch(1024):
+        out.update(kv.key.split(b"/", 1)[0] + b"/" for kv in chunk)
+    return out
 
 
 @component
@@ -830,7 +903,7 @@ async def test_malformed_records_are_dropped_counted_and_never_block(
 
     stage = manager.stage("events", 0)
     assert await team_offsets(stage, 3) == [0, 2, 4]
-    assert await stage_key_prefixes(stage) == {b"rows/", b"stats/", b"sched_age/"}
+    assert await stage_key_prefixes(stage) == {b"rows/"}
     lines = [r.getMessage() for r in caplog.records if "record dropped" in r.message]
     assert [line.split(" (")[0] for line in lines] == [
         "record dropped: topic=events partition=0 offset=1 reason=malformed_value",
@@ -889,7 +962,7 @@ async def test_a_poll_of_only_dropped_records_still_commits(fake_clock):
     assert stats.records_staged == 1
     assert sum(stats.records_dropped.values()) == 3
     stage0 = manager.stage("events", 0)
-    assert await stage0.iter_key_stats() == []
+    assert stage0.snapshot() == []
     assert await stage_key_prefixes(stage0) == {b"meta/"}
     await manager.close()
 
@@ -999,10 +1072,10 @@ async def test_a_keyless_topic_stages_by_the_payloads_partition_tuple(fake_clock
     assert await team_offsets(stage, 7) == [0, 2]
     assert await team_offsets(stage, 9) == [1, 3]
     # An absent source is a null component, not a drop.
-    assert [rk.offset async for rk, _ in stage.scan_group_rows((None,))] == [4]
+    assert await group_offsets(stage, (None,)) == [4]
     # The staged payload is the raw value bytes — classify parsed the
     # JSON once to read the tuple and never rewrote the record.
-    rows = [(rk.offset, v) async for rk, v in stage.scan_group_rows(("7",))]
+    rows = [(rk.offset, v) for rk, v in await group_rows(stage, ("7",))]
     assert rows[0] == (0, b'{"team_id": 7, "event": "a"}')
     await manager.close()
 
@@ -1046,15 +1119,24 @@ async def test_a_spec_refresh_mid_stream_starts_new_groups_and_keeps_the_old(
     assert consumer.keyer.fields == ("team_id", "timestamp_month")
 
     stage = manager.stage("events", 0)
-    stats = {ks.group: ks for ks in await stage.iter_key_stats()}
+    stats = {ks.group: ks for ks in stage.snapshot()}
     assert set(stats) == {("7",), ("7", JAN_MONTH)}
-    assert [rk.offset async for rk, _ in stage.scan_group_rows(("7",))] == [0]
-    assert [rk.offset async for rk, _ in stage.scan_group_rows(("7", JAN_MONTH))] == [1]
+    assert await group_offsets(stage, ("7",)) == [0]
+    assert await group_offsets(stage, ("7", JAN_MONTH)) == [1]
     # Both groups are flushable: past the slow-lane deadline the planner
     # decides the old group exactly like the new one.
     knobs = PlannerKnobs(min_flush_bytes=1)
     later = NOW + knobs.slow_lane_deadline_s * 1_000_000
-    decided = {d.group for d in plan_flush(stats.values(), later, knobs)}
+    decided = {
+        g
+        for g, ks in stats.items()
+        if decide(
+            staged_bytes=ks.staged_bytes,
+            first_staged_ts=ks.first_staged_ts,
+            now_us=later,
+            knobs=knobs,
+        )
+    }
     assert decided == {("7",), ("7", JAN_MONTH)}
     assert fake.committed_store == {("events", 0): 2}
     await manager.close()
@@ -1086,7 +1168,7 @@ async def test_a_failed_shape_reread_keeps_the_old_keyer(fake_clock, caplog):
         await run_steps(consumer, fake, extra=0)
     assert shape.calls == 1
     assert consumer.keyer is keyer
-    assert "keeps grouping under partition spec 1" in caplog.text
+    assert "keeping partition spec 1" in caplog.text
     assert await team_offsets(manager.stage("events", 0), 7) == [0]
     # The next attempt waits a full TTL: no retry storm against hoglake.
     await consumer._step()
@@ -1418,7 +1500,7 @@ async def test_a_fenced_partition_closes_locally_and_halts_distinctly(fake_clock
     the open itself succeeds; the fencing is lazy, pinned by
     tests/test_slatedb_parity.py) makes this pod's next staged write
     raise ``Error.Closed(FENCED)``. The loop catches it, closes the
-    fenced stage locally, and raises the DISTINCT ConsumerFencedError —
+    fenced stage locally, and raises the DISTINCT FencedError —
     the anti-flap semantics (a crash-loop restart would re-open the
     path and fence the NEW owner back)."""
     journal: list[tuple] = []
@@ -1435,7 +1517,7 @@ async def test_a_fenced_partition_closes_locally_and_halts_distinctly(fake_clock
     new_owner = await DbBuilder(manager.path_for("events", 0), manager.store).build()
     try:
         fake.feed(team_msg(0, 1, team=1), team_msg(1, 1, team=2))
-        with pytest.raises(ConsumerFencedError) as excinfo:
+        with pytest.raises(FencedError) as excinfo:
             await consumer._step()
         assert excinfo.value.partitions == (("events", 0),)
 
@@ -1464,7 +1546,7 @@ async def test_an_all_drops_poll_on_a_fenced_stage_halts_without_committing(
 ):
     """Under static assignment a fenced old owner whose stream is 100 %
     drops has no staging write to fail — the fence probe is that write:
-    the poll raises ConsumerFencedError and commits NOTHING against the
+    the poll raises FencedError and commits NOTHING against the
     new owner, and the fenced stage is closed locally."""
     journal: list[tuple] = []
     manager = make_manager(journal)
@@ -1478,7 +1560,7 @@ async def test_an_all_drops_poll_on_a_fenced_stage_halts_without_committing(
     new_owner = await DbBuilder(manager.path_for("events", 0), manager.store).build()
     try:
         fake.feed(msg(0, 1, key=None, value=b"x"), msg(0, 2, key=None, value=None))
-        with pytest.raises(ConsumerFencedError) as excinfo:
+        with pytest.raises(FencedError) as excinfo:
             await consumer._step()
         assert excinfo.value.partitions == (("events", 0),)
         assert manager.partitions() == ()
@@ -1494,7 +1576,7 @@ async def test_an_all_drops_poll_on_a_fenced_stage_halts_without_committing(
 async def test_a_non_fenced_closed_stage_error_is_not_the_fenced_path(fake_clock):
     """Only FENCED takes the distinct halt: a ``Closed`` with any other
     reason (a local shutdown racing an in-flight call) propagates as
-    the generic error — no local relinquish, no ConsumerFencedError.
+    the generic error — no local relinquish, no FencedError.
     Pins the reason predicate (``== CloseReason.FENCED``) against its
     mutants."""
     journal: list[tuple] = []
@@ -1684,7 +1766,8 @@ async def test_stop_before_the_first_poll_still_closes_cleanly(fake_clock):
     assert fake.consume_calls == 0
     assert fake.closed
     # The static claim still happened: start() runs before the stop check.
-    assert ("assign", [("events", 0, OFFSET_STORED)]) in journal
+    # A stopped consumer is never assigned.
+    assert not any(entry[0] == "assign" for entry in journal)
     await manager.close()
 
 

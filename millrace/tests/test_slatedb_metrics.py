@@ -152,9 +152,9 @@ class TestRecorderWiring:
         self, memory_store: Any
     ) -> None:
         manager = StageManager("memory:///", "millrace", settings=fast_flush_settings())
-        one = await manager.open_partition("events", 0)
-        two = await manager.open_partition("events", 1)
-        await one.stage.stage_batch([rec(1, 100, 0)], now_us=NOW)
+        one = await manager.open_partition("events", 0, now_us=NOW)
+        two = await manager.open_partition("events", 1, now_us=NOW)
+        await one.stage_batch([rec(1, 100, 0)], now_us=NOW)
 
         def wal_flush_bytes(recorder: Any) -> int:
             return sum(
@@ -163,11 +163,11 @@ class TestRecorderWiring:
                 if m.name == "slatedb.wal.wal_flush_bytes"
             )
 
-        v1 = wal_flush_bytes(one.stage.metrics_recorder)
+        v1 = wal_flush_bytes(one.metrics_recorder)
         assert v1 > 0  # the durability await flushed a WAL buffer
-        await two.stage.stage_batch([rec(2, 100, 0)], now_us=NOW)
-        await two.stage.stage_batch([rec(2, 101, 1)], now_us=NOW)
-        v2 = wal_flush_bytes(two.stage.metrics_recorder)
+        await two.stage_batch([rec(2, 100, 0)], now_us=NOW)
+        await two.stage_batch([rec(2, 101, 1)], now_us=NOW)
+        v2 = wal_flush_bytes(two.metrics_recorder)
         assert v2 > 0
 
         snapshots = [

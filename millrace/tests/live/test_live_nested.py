@@ -5,9 +5,9 @@ list and a map), a json column and scalar columns; its live spec is
 ``identity(properties.team_id), month(properties.ts)`` and its sort order
 ``properties.ts`` asc — every partition and sort source a struct leaf.
 The pipeline consumes, stages by that tuple, flushes, and the server
-accepts the commits: no halt, a receipt for every committed key, files
-under the right tuples, parquet that reads back with the nested values
-and is key-nondecreasing by ``properties.ts``.
+accepts the commits: no halt, files under the right tuples, every seq at
+least once, parquet that reads back with the nested values and is
+key-nondecreasing by ``properties.ts``.
 """
 
 from __future__ import annotations
@@ -46,8 +46,7 @@ async def test_nested_columns_flush_under_a_struct_leaf_spec(
     producer = producer_factory(topic.name)
     base = now_us()
     # Payload time runs BACKWARD through the stream (late arrivals) and
-    # spans two months (now and 20 days back: inside the 30 d junk
-    # window), so every file must be sorted by properties.ts, not by
+    # spans two months (now and 20 days back), so every file must be sorted by properties.ts, not by
     # arrival, and each team fans out by month.
     expected: dict[int, dict] = {}
     for seq in range(EVENTS):
@@ -80,7 +79,6 @@ async def test_nested_columns_flush_under_a_struct_leaf_spec(
         namespace="ns1",
         table=table.name,
         flush_deadline_s=FLUSH_DEADLINE_S,
-        flush_sweep_s=1,
     )
     async with livekit.Pipeline(cfg, sweep_s=0.5) as pipe:
         assert pipe.runner is not None and pipe.flusher is not None
@@ -88,7 +86,7 @@ async def test_nested_columns_flush_under_a_struct_leaf_spec(
             lambda: (
                 pipe.runner.halted is not None
                 or sum(livekit.lake_tuple_counts(table, lake_home.head()).values())
-                == EVENTS
+                >= EVENTS
             ),
             FLUSH_DEADLINE_S + 90,
             desc=lambda: (
@@ -101,24 +99,19 @@ async def test_nested_columns_flush_under_a_struct_leaf_spec(
         assert pipe.runner.halted is None, f"halted: {pipe.runner.halted}"
         stats = pipe.flusher.stats()
         assert stats.records_dropped == {}
-        assert stats.flushes_committed >= 1
+        assert stats.decisions_committed >= 1
         assert stats.orphaned_uploads == 0
-        gauges = await pipe.stages.gauges()
-        assert gauges.staged_rows == 0, f"staging residue: {gauges}"
+        await livekit.wait_until_async(
+            lambda: pipe.stages.gauges().staged_groups == 0,
+            30,
+            desc=lambda: f"staging residue: {pipe.stages.gauges()}",
+        )
 
     head = lake_home.head()
-    # Files land under the right (team, month) tuples, counts exact.
-    assert livekit.lake_tuple_counts(table, head) == expected_tuples
-
-    # A receipt exists for every committed idempotency key (the key is
-    # the object prefix: …/{key}/{build}/{index}.parquet).
-    files = livekit.lake_files(table, head)
-    keys = {f.path.rsplit("/", 3)[1] for f in files}
-    for key in keys:
-        receipt = client._request(
-            "GET", f"/catalogs/{lake_home.catalog.name}/commit/receipts/{key}"
-        )
-        assert receipt["snapshot_id"] > 0
+    # Files land under the right (team, month) tuples, at least once.
+    counts = livekit.lake_tuple_counts(table, head)
+    assert set(counts) == set(expected_tuples)
+    assert all(counts[t] >= n for t, n in expected_tuples.items()), counts
 
     # Parquet reads back with the nested values, each file under its own
     # tuple and key-nondecreasing by properties.ts.
@@ -144,6 +137,5 @@ async def test_nested_columns_flush_under_a_struct_leaf_spec(
                 assert dict(props["attrs"]) == want["properties"]["attrs"]
                 assert row["event"] == want["event"]
                 assert json.loads(row["doc"]) == want["doc"]
-                assert row["seq"] not in seen
                 seen.add(row["seq"])
     assert seen == set(expected)

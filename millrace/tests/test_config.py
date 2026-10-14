@@ -4,15 +4,12 @@ in one refusal, not one per restart."""
 
 from __future__ import annotations
 
-from typing import Any
-
 import pytest
 
 from millrace.config import (
     AutoOffsetReset,
     Config,
     ConfigError,
-    EventTimePolicy,
     PartitionFieldSpec,
     SortFieldSpec,
     load_config,
@@ -52,82 +49,69 @@ def test_minimal_env_yields_the_documented_defaults():
     assert cfg.table == "events"
     assert cfg.stage_store_url == "s3://data-bucket"
     assert cfg.stage_base_path == "millrace"
-    assert cfg.target_output_bytes == 500 * 1024 * 1024
+    assert cfg.flush_bytes == 256 * 1024 * 1024
     assert cfg.flush_deadline_s == 900
     assert cfg.slow_lane_deadline_s == 21600
+    assert cfg.metrics_port == 8000
+    assert cfg.kafka_auto_offset_reset is AutoOffsetReset.LATEST
+    assert cfg.kafka_consumer_overrides == ()
+    # Constants (no environment variable).
     assert cfg.min_flush_bytes == 1024 * 1024
     assert cfg.max_files_per_commit == 512
+    assert cfg.flush_concurrency == 4
+    assert cfg.flush_sweep_s == 1.0
     assert cfg.consume_batch_size == 65536
     assert cfg.consume_batch_max_bytes == 256 * 1024 * 1024
     assert cfg.poll_timeout_ms == 500
-    assert cfg.event_time_policy is EventTimePolicy.DROP
-    assert cfg.metrics_port == 8000
-    # The fleet policy default: latest (millpond's whole-retention
-    # replay incident), earliest still selectable.
-    assert cfg.kafka_auto_offset_reset is AutoOffsetReset.LATEST
-    # The whale-shape fetch tuning (millpond's hot-partition ceiling).
-    assert cfg.kafka_max_partition_fetch_bytes == 32 * 1024 * 1024
-    assert cfg.kafka_fetch_max_bytes == 256 * 1024 * 1024
-    assert cfg.kafka_queued_max_messages_kbytes == 262144
 
 
 def test_planner_knobs_projection():
     cfg = load(
         MINIMAL_ENV
         | {
-            "MILLRACE_TARGET_OUTPUT_BYTES": "4096",
+            "MILLRACE_FLUSH_BYTES": "4096",
             "MILLRACE_FLUSH_DEADLINE_S": "60",
             "MILLRACE_SLOW_LANE_DEADLINE_S": "25200",
-            "MILLRACE_MIN_FLUSH_BYTES": "64",
-            "MILLRACE_MAX_FILES_PER_COMMIT": "17",
         }
     )
     knobs = cfg.planner_knobs()
-    assert knobs.target_output_bytes == 4096
+    assert knobs.flush_bytes == 4096
     assert knobs.flush_deadline_s == 60
     assert knobs.slow_lane_deadline_s == 25200
-    assert knobs.min_flush_bytes == 64
-    assert knobs.max_files_per_commit == 17
+    assert knobs.min_flush_bytes == 1024 * 1024
 
 
-# -- renamed (pre-three-lane) knobs ----------------------------------------------------
-#
-# MILLRACE_TARGET_FILE_BYTES / MILLRACE_REAP_DEADLINE_S are REFUSED —
-# refused, not aliased: the rename narrowed the semantics (the size
-# trigger now sizes the estimated parquet output; the churn reaper
-# became the bounded slow lane), so a silent alias would deploy a policy
-# the value did not ask for. There is no deprecation window: no
-# deployment predates the rename.
+#: Knobs of earlier designs: no longer read, and not refused either.
+RETIRED_KNOBS = {
+    "MILLRACE_TARGET_OUTPUT_BYTES": "abc",
+    "MILLRACE_TARGET_FILE_BYTES": "1",
+    "MILLRACE_REAP_DEADLINE_S": "1",
+    "MILLRACE_MIN_FLUSH_BYTES": "0",
+    "MILLRACE_MAX_FILES_PER_COMMIT": "-1",
+    "MILLRACE_EVENT_TIME_POLICY": "quarantine",
+    "MILLRACE_EVENT_TIME_MAX_PAST_S": "x",
+    "MILLRACE_EVENT_TIME_MAX_FUTURE_S": "x",
+    "MILLRACE_FLUSH_SWEEP_S": "0",
+    "MILLRACE_FLUSH_SCAN_MIN_BYTES": "0",
+    "MILLRACE_FLUSH_SCAN_MAX_ROWS": "0",
+    "MILLRACE_COMPRESSION_RATIO_HALFLIFE": "0",
+    "MILLRACE_FLUSH_CONCURRENCY": "0",
+    "MILLRACE_CONSUME_BATCH_SIZE": "0",
+    "MILLRACE_CONSUME_BATCH_MAX_BYTES": "0",
+    "MILLRACE_POLL_TIMEOUT_MS": "0",
+    "MILLRACE_KAFKA_MAX_PARTITION_FETCH_BYTES": "0",
+    "MILLRACE_KAFKA_FETCH_MAX_BYTES": "0",
+    "MILLRACE_KAFKA_QUEUED_MAX_MESSAGES_KBYTES": "0",
+    "MILLRACE_SLATEDB_GC_ENABLED": "maybe",
+    "MILLRACE_SLATEDB_MAX_UNFLUSHED_BYTES": "0",
+    "MILLRACE_SLATEDB_L0_MAX_SSTS": "0",
+    "MILLRACE_SLATEDB_BLOCK_CACHE_BYTES": "1",
+    "MILLRACE_SLATEDB_META_CACHE_BYTES": "1",
+}
 
 
-@pytest.mark.parametrize(
-    "old,new",
-    [
-        ("MILLRACE_TARGET_FILE_BYTES", "MILLRACE_TARGET_OUTPUT_BYTES"),
-        ("MILLRACE_REAP_DEADLINE_S", "MILLRACE_SLOW_LANE_DEADLINE_S"),
-    ],
-)
-def test_renamed_knobs_are_refused_naming_the_successor(old, new):
-    (p,) = problems(MINIMAL_ENV | {old: "1024"})
-    assert old in p and new in p and "renamed" in p
-
-
-def test_renamed_knobs_refused_even_alongside_the_successor():
-    probs = problems(
-        MINIMAL_ENV
-        | {
-            "MILLRACE_TARGET_FILE_BYTES": "1024",
-            "MILLRACE_TARGET_OUTPUT_BYTES": "2048",
-        }
-    )
-    assert len(probs) == 1
-    assert "MILLRACE_TARGET_FILE_BYTES" in probs[0]
-
-
-def test_renamed_knob_with_an_empty_value_is_unset_not_refused():
-    # Consistent with every other knob: whitespace-only reads as absent.
-    cfg = load(MINIMAL_ENV | {"MILLRACE_REAP_DEADLINE_S": "  "})
-    assert cfg.slow_lane_deadline_s == 21600
+def test_retired_knobs_are_simply_not_read():
+    assert load(MINIMAL_ENV | RETIRED_KNOBS) == load(MINIMAL_ENV)
 
 
 # -- the slow lane sits at or above the age lane -------------------------------------
@@ -394,35 +378,6 @@ def test_auto_offset_reset_defaults_to_latest_and_accepts_earliest():
     assert "MILLRACE_KAFKA_AUTO_OFFSET_RESET" in p and "latest" in p
 
 
-# -- fetch tuning (T8) -----------------------------------------------------------------
-
-
-def test_fetch_tuning_knobs_parse():
-    cfg = load(
-        MINIMAL_ENV
-        | {
-            "MILLRACE_KAFKA_MAX_PARTITION_FETCH_BYTES": "1048576",
-            "MILLRACE_KAFKA_FETCH_MAX_BYTES": "52428800",
-            "MILLRACE_KAFKA_QUEUED_MAX_MESSAGES_KBYTES": "65536",
-        }
-    )
-    assert cfg.kafka_max_partition_fetch_bytes == 1048576
-    assert cfg.kafka_fetch_max_bytes == 52428800
-    assert cfg.kafka_queued_max_messages_kbytes == 65536
-
-
-def test_fetch_max_bytes_must_fit_a_partition_response():
-    (p,) = problems(
-        MINIMAL_ENV
-        | {
-            "MILLRACE_KAFKA_MAX_PARTITION_FETCH_BYTES": "33554432",
-            "MILLRACE_KAFKA_FETCH_MAX_BYTES": "1048576",
-        }
-    )
-    assert "MILLRACE_KAFKA_FETCH_MAX_BYTES" in p
-    assert "MILLRACE_KAFKA_MAX_PARTITION_FETCH_BYTES" in p
-
-
 # -- stage URL ----------------------------------------------------------------------
 
 
@@ -472,19 +427,10 @@ def test_stage_url_unknown_scheme():
 @pytest.mark.parametrize(
     "knob",
     [
-        "MILLRACE_TARGET_OUTPUT_BYTES",
+        "MILLRACE_FLUSH_BYTES",
         "MILLRACE_FLUSH_DEADLINE_S",
         "MILLRACE_SLOW_LANE_DEADLINE_S",
-        "MILLRACE_MIN_FLUSH_BYTES",
-        "MILLRACE_MAX_FILES_PER_COMMIT",
-        "MILLRACE_SLATEDB_MAX_UNFLUSHED_BYTES",
-        "MILLRACE_SLATEDB_L0_MAX_SSTS",
-        "MILLRACE_CONSUME_BATCH_SIZE",
-        "MILLRACE_CONSUME_BATCH_MAX_BYTES",
-        "MILLRACE_POLL_TIMEOUT_MS",
-        "MILLRACE_KAFKA_MAX_PARTITION_FETCH_BYTES",
-        "MILLRACE_KAFKA_FETCH_MAX_BYTES",
-        "MILLRACE_KAFKA_QUEUED_MAX_MESSAGES_KBYTES",
+        "MILLRACE_REPLICA_COUNT",
     ],
 )
 @pytest.mark.parametrize("raw", ["abc", "0", "-3", "1.5"])
@@ -497,245 +443,48 @@ def test_positive_int_knobs_accept_valid_values():
     cfg = load(
         MINIMAL_ENV
         | {
-            "MILLRACE_TARGET_OUTPUT_BYTES": "1024",
+            "MILLRACE_FLUSH_BYTES": "1024",
             "MILLRACE_FLUSH_DEADLINE_S": "5",
             "MILLRACE_SLOW_LANE_DEADLINE_S": "43200",
-            "MILLRACE_MIN_FLUSH_BYTES": "32",
-            "MILLRACE_MAX_FILES_PER_COMMIT": "3",
-            "MILLRACE_CONSUME_BATCH_SIZE": "11",
-            "MILLRACE_CONSUME_BATCH_MAX_BYTES": "4096",
-            "MILLRACE_POLL_TIMEOUT_MS": "42",
         }
     )
-    assert cfg.target_output_bytes == 1024
+    assert cfg.flush_bytes == 1024
     assert cfg.flush_deadline_s == 5
     assert cfg.slow_lane_deadline_s == 43200
-    assert cfg.min_flush_bytes == 32
-    assert cfg.max_files_per_commit == 3
-    assert cfg.consume_batch_size == 11
-    assert cfg.consume_batch_max_bytes == 4096
-    assert cfg.poll_timeout_ms == 42
 
 
-# -- SlateDB writer tuning (T9) ------------------------------------------------------
+# -- SlateDB tuning (constants, validated) ---------------------------------------
 
 
 def test_slatedb_defaults_match_the_documented_deployment():
-    """GC OFF by default (the external maintenance service owns
-    collection), a per-instance unflushed bound sized for K-instances-
-    per-pod, and SlateDB's own L0 stall depth."""
     cfg = load(MINIMAL_ENV)
-    assert cfg.slatedb.gc_enabled is False
     assert cfg.slatedb.max_unflushed_bytes == 256 * 1024 * 1024
     assert cfg.slatedb.l0_max_ssts == 8
-    # The pod-level cache pair: one shared split cache, not 640 MiB per
-    # instance (the library default).
     assert cfg.slatedb.block_cache_bytes == 128 * 1024 * 1024
     assert cfg.slatedb.meta_cache_bytes == 128 * 1024 * 1024
-    assert cfg.slatedb.cache_disabled is False
 
 
-def test_slatedb_knobs_parse_and_validate():
-    cfg = load(
-        MINIMAL_ENV
-        | {
-            "MILLRACE_SLATEDB_GC_ENABLED": "true",
-            "MILLRACE_SLATEDB_MAX_UNFLUSHED_BYTES": "134217728",
-            "MILLRACE_SLATEDB_L0_MAX_SSTS": "32",
-        }
-    )
-    assert cfg.slatedb.gc_enabled is True
-    assert cfg.slatedb.max_unflushed_bytes == 128 * 1024 * 1024
-    assert cfg.slatedb.l0_max_ssts == 32
-
-    (p,) = problems(MINIMAL_ENV | {"MILLRACE_SLATEDB_GC_ENABLED": "maybe"})
-    assert "MILLRACE_SLATEDB_GC_ENABLED" in p and "boolean" in p
-    (p,) = problems(MINIMAL_ENV | {"MILLRACE_SLATEDB_MAX_UNFLUSHED_BYTES": "0"})
-    assert "MILLRACE_SLATEDB_MAX_UNFLUSHED_BYTES" in p
-    (p,) = problems(MINIMAL_ENV | {"MILLRACE_SLATEDB_L0_MAX_SSTS": "-2"})
-    assert "MILLRACE_SLATEDB_L0_MAX_SSTS" in p
-    from millrace.config import SlateDbConfig
-
-    with pytest.raises(ValueError, match="MILLRACE_SLATEDB_MAX_UNFLUSHED_BYTES"):
-        SlateDbConfig(max_unflushed_bytes=0)
-    with pytest.raises(ValueError, match="MILLRACE_SLATEDB_L0_MAX_SSTS"):
-        SlateDbConfig(l0_max_ssts=0)
-    # The binding's own rule, encoded at parse time rather than at first
-    # DB open: the unflushed bound must exceed the (never overridden)
-    # 64 MiB l0_sst_size_bytes library default.
-    (p,) = problems(
-        MINIMAL_ENV | {"MILLRACE_SLATEDB_MAX_UNFLUSHED_BYTES": str(64 * 1024 * 1024)}
-    )
-    assert "MILLRACE_SLATEDB_MAX_UNFLUSHED_BYTES" in p and "l0_sst_size_bytes" in p
-
-
-def test_slatedb_cache_pair_parses_and_zero_zero_disables():
-    cfg = load(
-        MINIMAL_ENV
-        | {
-            "MILLRACE_SLATEDB_BLOCK_CACHE_BYTES": "1048576",
-            "MILLRACE_SLATEDB_META_CACHE_BYTES": "4096",
-        }
-    )
-    assert cfg.slatedb.block_cache_bytes == 1 << 20
-    assert cfg.slatedb.meta_cache_bytes == 4096  # the floor is inclusive
-    assert cfg.slatedb.cache_disabled is False
-
-    cfg = load(
-        MINIMAL_ENV
-        | {
-            "MILLRACE_SLATEDB_BLOCK_CACHE_BYTES": "0",
-            "MILLRACE_SLATEDB_META_CACHE_BYTES": "0",
-        }
-    )
-    assert cfg.slatedb.block_cache_bytes == 0
-    assert cfg.slatedb.meta_cache_bytes == 0
-    assert cfg.slatedb.cache_disabled is True
-
-
-@pytest.mark.parametrize(
-    "env",
-    [
-        {"MILLRACE_SLATEDB_BLOCK_CACHE_BYTES": "0"},
-        {"MILLRACE_SLATEDB_META_CACHE_BYTES": "0"},
-        {
-            "MILLRACE_SLATEDB_BLOCK_CACHE_BYTES": "0",
-            "MILLRACE_SLATEDB_META_CACHE_BYTES": "8192",
-        },
-        {
-            "MILLRACE_SLATEDB_BLOCK_CACHE_BYTES": "8192",
-            "MILLRACE_SLATEDB_META_CACHE_BYTES": "0",
-        },
-    ],
-)
-def test_slatedb_cache_pair_refuses_exactly_one_zero_naming_both(env):
-    """0 means "no cache" only for the PAIR: the split cache needs both
-    halves, so a lone zero is refused with both knobs and the reason."""
-    (p,) = problems(MINIMAL_ENV | env)
-    assert "MILLRACE_SLATEDB_BLOCK_CACHE_BYTES" in p
-    assert "MILLRACE_SLATEDB_META_CACHE_BYTES" in p
-    assert "both" in p and "split cache" in p
-
-
-CACHE_KNOBS = [
-    "MILLRACE_SLATEDB_BLOCK_CACHE_BYTES",
-    "MILLRACE_SLATEDB_META_CACHE_BYTES",
-]
-
-
-@pytest.mark.parametrize("knob", CACHE_KNOBS)
-@pytest.mark.parametrize(
-    ("raw", "fragment"),
-    [
-        ("-1", "non-negative"),
-        ("abc", "non-negative"),
-        ("1.5", "non-negative"),
-        (str(2**64), "2**64"),
-        (str(2**64 + 1), "2**64"),
-        ("1", "below 4096"),
-        ("4095", "below 4096"),
-    ],
-)
-def test_slatedb_cache_half_refusals_are_config_errors_naming_the_knob(
-    knob, raw, fragment
-):
-    """Each bad half is its own ConfigError problem naming the knob —
-    never a binding OverflowError at the first open (u64), and a
-    sub-block capacity gets its own message pointing at 0/0."""
-    (p,) = problems(MINIMAL_ENV | {knob: raw})
-    assert knob in p and fragment in p
-
-
-def test_slatedb_cache_both_halves_bad_reports_both():
-    probs = problems(
-        MINIMAL_ENV
-        | {
-            "MILLRACE_SLATEDB_BLOCK_CACHE_BYTES": "-1",
-            "MILLRACE_SLATEDB_META_CACHE_BYTES": str(2**64),
-        }
-    )
-    assert len(probs) == 2
-    assert "MILLRACE_SLATEDB_BLOCK_CACHE_BYTES" in probs[0]
-    assert "MILLRACE_SLATEDB_META_CACHE_BYTES" in probs[1]
-
-
-REFUSED = "refused"
-DEFAULT = "default"
-
-
-@pytest.mark.parametrize(
-    ("raw", "cache_pair", "positive_int"),
-    [
-        # raw       both cache halves  a _positive_int knob
-        ("00", 0, REFUSED),  # int("00") == 0: "off" for the pair, refused there
-        (" 0 ", 0, REFUSED),  # stripped first
-        ("8_192", 8192, 8192),  # int() takes underscores
-        ("1_000", REFUSED, 1000),  # parses (1000), then below the 4096 floor
-        ("1e9", REFUSED, REFUSED),  # int() refuses scientific notation
-        ("   ", DEFAULT, DEFAULT),  # whitespace-only is unset
-        ("", DEFAULT, DEFAULT),
-    ],
-)
-def test_slatedb_cache_parse_leniency_matches_positive_int(
-    raw, cache_pair, positive_int
-):
-    """The cache pair parses exactly like ``_positive_int`` knobs —
-    ``int()`` after stripping, blank is the default — and differs only
-    in range (0 allowed for the pair, a 4096 floor, a u64 ceiling). Both
-    halves get the same raw value so the lone-zero rule never fires."""
-
-    def outcome(env: dict[str, str], read: Any, default: Any) -> Any:
-        try:
-            value = read(load_config(env))
-        except ConfigError:
-            return REFUSED
-        return DEFAULT if value == default and raw.strip() == "" else value
-
-    cache_env = MINIMAL_ENV | {knob: raw for knob in CACHE_KNOBS}
-    assert outcome(
-        cache_env,
-        lambda c: (c.slatedb.block_cache_bytes, c.slatedb.meta_cache_bytes),
-        (128 * 1024 * 1024, 128 * 1024 * 1024),
-    ) == (cache_pair if cache_pair in (REFUSED, DEFAULT) else (cache_pair, cache_pair))
-    assert (
-        outcome(
-            MINIMAL_ENV | {"MILLRACE_CONSUME_BATCH_SIZE": raw},
-            lambda c: c.consume_batch_size,
-            65536,
-        )
-        == positive_int
-    )
-
-
-def test_slatedb_config_validates_the_cache_pair_directly():
+def test_slatedb_config_validates_its_fields():
     from millrace.config import SlateDbConfig, validate_slatedb_cache_bytes
 
-    with pytest.raises(ValueError, match="split cache"):
+    with pytest.raises(ValueError, match="l0_sst_size_bytes"):
+        SlateDbConfig(max_unflushed_bytes=64 * 1024 * 1024)
+    with pytest.raises(ValueError, match="l0_max_ssts"):
+        SlateDbConfig(l0_max_ssts=0)
+    with pytest.raises(ValueError, match="both be 0"):
         SlateDbConfig(block_cache_bytes=0, meta_cache_bytes=4096)
-    with pytest.raises(ValueError, match="MILLRACE_SLATEDB_META_CACHE_BYTES"):
+    with pytest.raises(ValueError, match="meta_cache_bytes"):
         SlateDbConfig(block_cache_bytes=4096, meta_cache_bytes=-5)
     with pytest.raises(ValueError, match="below 4096"):
         SlateDbConfig(block_cache_bytes=1, meta_cache_bytes=4096)
     with pytest.raises(ValueError, match="2\\*\\*64"):
         SlateDbConfig(block_cache_bytes=2**64, meta_cache_bytes=4096)
-    assert SlateDbConfig(block_cache_bytes=0, meta_cache_bytes=0).cache_disabled
+    SlateDbConfig(block_cache_bytes=0, meta_cache_bytes=0)
     validate_slatedb_cache_bytes(0, 0)
     validate_slatedb_cache_bytes(4096, 2**64 - 1)
-    with pytest.raises(ValueError, match="non-negative"):
-        validate_slatedb_cache_bytes(-1, 0)
 
 
 # -- remaining knobs ----------------------------------------------------------------------
-
-
-def test_event_time_policy():
-    assert load(MINIMAL_ENV).event_time_policy is EventTimePolicy.DROP
-    assert (
-        load(MINIMAL_ENV | {"MILLRACE_EVENT_TIME_POLICY": "clamp"}).event_time_policy
-        is EventTimePolicy.CLAMP
-    )
-    (p,) = problems(MINIMAL_ENV | {"MILLRACE_EVENT_TIME_POLICY": "quarantine"})
-    assert "MILLRACE_EVENT_TIME_POLICY" in p and "clamp" in p and "drop" in p
 
 
 @pytest.mark.parametrize("raw", ["abc", "-1", "65536"])

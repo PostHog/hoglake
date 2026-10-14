@@ -1,17 +1,15 @@
 """Scenario 8 (Phase 5): the DDL race.
 
 A flush whose ``read_snapshot`` basis predates a concurrent
-``add_column`` is refused ``ddl_since_read_snapshot`` — definitive, zero
-writes — and the pipeline re-prepares against a fresh read rather than
-replaying the refused payload (a replay would livelock; AGENT.md
-invariant 12's typed-refusal family).
+``add_column`` is refused ``ddl_since_read_snapshot`` (zero writes), and
+the same decision rebuilds against a fresh read under a fresh key rather
+than replaying the refused payload.
 
 Deterministic by construction: the flusher's shape cache (TTL =
 retention/4, far longer than this test) pins the pre-alter snapshot, so
 the first sweep after the alter commits with a stale basis exactly the
-way a mid-flush race would. No loss, no wedge: the next sweep commits
-the same rows against the fresh shape, and post-alter rows carry the new
-column.
+way a mid-flush race would. No loss, no wedge, and post-alter rows carry
+the new column.
 """
 
 from __future__ import annotations
@@ -28,7 +26,9 @@ from pyhoglake import ops
 pytestmark = pytest.mark.live
 
 
-async def test_ddl_race_reprepares(lake_home, topic_factory, producer_factory, admin):
+async def test_ddl_race_rebuilds_on_a_fresh_basis(
+    lake_home, topic_factory, producer_factory, admin
+):
     table = lake_home.create_events_table()
     topic = topic_factory(partitions=2)
     producer = producer_factory(topic.name)
@@ -72,21 +72,15 @@ async def test_ddl_race_reprepares(lake_home, topic_factory, producer_factory, a
         # pre-alter snapshot.
         await asyncio.to_thread(table.alter, [ops.add_column("region", pa.string())])
 
-        # Sweep 1: stale basis → ddl_since_read_snapshot → re-prepare
-        # (the refused payload is DROPPED, never replayed).
-        report1 = await pipe.runner.run_once()
-        assert report1.reprepared == 1, f"sweep 1: {report1}"
-        assert report1.committed == 0
-        assert sum(livekit.lake_team_counts(table, lake_home.head()).values()) == 0, (
-            "a refused commit wrote rows"
-        )
-
-        # Sweep 2: re-prepared against the fresh shape → commits.
-        report2 = await pipe.runner.run_once()
-        assert report2.committed == 1, f"sweep 2: {report2}"
-        assert sum(livekit.lake_team_counts(table, lake_home.head()).values()) == 50
-        assert pipe.flusher is not None
-        assert pipe.flusher.stats().reprepared == {"ddl_since_read_snapshot": 1}
+        # One sweep: stale basis → ddl_since_read_snapshot → rebuild on
+        # the fresh shape → commit (two attempts, one landed commit).
+        assert pipe.runner is not None and pipe.flusher is not None
+        report = await pipe.runner.run_once()
+        assert report.committed == 1, f"sweep: {report}"
+        stats = pipe.flusher.stats()
+        assert stats.commit_attempts == 2, stats
+        assert stats.commits == 1, stats
+        assert livekit.all_landed(table, lake_home.catalog, lake_home.fs, range(50))
 
         # Post-alter rows carry the new column; the pipeline keeps working.
         base2 = now_us()
@@ -99,8 +93,8 @@ async def test_ddl_race_reprepares(lake_home, topic_factory, producer_factory, a
         await asyncio.to_thread(produce_post_alter)
         pipe.start_flush_loop()
         await livekit.wait_until_async(
-            lambda: (
-                sum(livekit.lake_team_counts(table, lake_home.head()).values()) == 60
+            lambda: livekit.all_landed(
+                table, lake_home.catalog, lake_home.fs, range(60)
             ),
             90,
             desc="post-alter rows queryable",

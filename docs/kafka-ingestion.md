@@ -1,6 +1,6 @@
 # Kafka ingestion via staged keying — design obligations for v1
 
-Status: design. Implementation in progress on `jakob/sluice-ingest`.
+Status: implemented in `millrace/` (code map: millrace/architecture.md).
 The component is **millrace** — the channel (historically, the sluice)
 that conducts the current to the water wheel: narrow where the mill pond
 is broad, swift where it is still. Accumulate, then release — that is
@@ -8,7 +8,7 @@ the whole idea.
 
 Companions: [README.md](../README.md) (architecture),
 [../hedgerow/BUFFERED_INGESTION.md](../hedgerow/BUFFERED_INGESTION.md)
-(the staging precedent — SQLite WAL, persisted prepared commits),
+(the staging precedent — SQLite WAL),
 [../hedgerow/README.md](../hedgerow/README.md) (the daemon idiom and the
 viaduck lessons this component inherits),
 [iceberg-federation.md](iceberg-federation.md) (field IDs and type
@@ -48,7 +48,7 @@ at consume time:
 ```
 consume loop:   poll → stage rows under (partition tuple, …) → commit Kafka offsets
 flush loop:     per-key readiness scan → staged range → Arrow → parquet
-                → prepared commit → delete staged range
+                → commit → delete exactly the published row keys
 ```
 
 Staging is the buffer, so Kafka offsets commit at stage time and neither
@@ -64,30 +64,24 @@ flush of one key writes exactly one file.
 The LSM's ordering is load-bearing, not incidental: keying staged rows
 by `(partition tuple, offset)` means a flush reads one contiguous
 range, a capped read is an exact offset prefix of the tuple's staged
-rows, and a flushed window is one contiguous key range to delete. The readiness scheduler's AGE/SLOW lanes are the ordered
-index scan the staging layout promises (`sched_age/` prefix scan to the
-deadline cutoff, then a point-read per candidate for the exact decision
-input); the SIZE lane has no size-ordered index (`sched_size` is the
-deferred bench question below) and evaluates one `stats/` scan per
-partition per sweep — and that scan is shared with the published
-gauges, so a sweep costs one stats scan per partition, not an
-O(tenants) pass per reader per poll.
+rows, and a flushed window is an exact set of keys to delete. Readiness
+is decided from an in-memory index of the staged groups (sizes and ages
+are never persisted; the startup drain below is what makes that sound),
+so a sweep costs no I/O.
 
 ## Why a new component
 
 - **Not millpond.** Conceptually right pipeline, wrong durability model
   (in-memory buffer, offsets withheld until flush — the coupling this
   design exists to break), and its cruft is structural: destination
-  duality, DuckDB coupling, VARIANT dual-write. We take three ideas —
-  the sink seam, offset-derived flush identity, staging gauges as
-  alert inputs — and no code.
-- **Not hedgerow's buffered mode.** The staging discipline (persist the
-  complete prepared commit request before publication; separate
-  discovery and publication checkpoints) is adopted verbatim, but its
-  SQLite WAL ties a coordinator to a durable volume and its scheduling
-  is known not to scale to this tenant cardinality
-  ("production sizing at 140K teams … still needed"). SlateDB removes
-  the volume and makes the scheduler a range scan.
+  duality, DuckDB coupling, VARIANT dual-write. We take two ideas — the
+  sink seam and staging gauges as alert inputs — and no code.
+- **Not hedgerow's buffered mode.** Its SQLite WAL ties a coordinator
+  to a durable volume and its scheduling is known not to scale to this
+  tenant cardinality ("production sizing at 140K teams … still
+  needed"). SlateDB removes the volume. Hedgerow's persisted
+  prepared-commit discipline (exactly-once across restarts) is
+  deliberately NOT adopted: the contract here is at-least-once.
 - **pyhoglake is reused wholesale.** Field-ID embedding, footer stats,
   the Iceberg bounds codec, transforms, prepared commits — one writer
   implementation, integration-tested against the server. This component
@@ -98,409 +92,158 @@ O(tenants) pass per reader per poll.
 **One SlateDB instance per claimed Kafka partition**, at an
 object-storage path keyed by the partition, not the pod
 (`s3://…/millrace/{topic}/{partition}`). A replica claims partitions the
-way millpond does — its StatefulSet ordinal's share of the topic, derived
-once at start; the assignment *is* the claim — and opening a partition's
-DB is part of claiming it. The set of partitions assigned to a replica
-may change between deploys (a scale-out, a repartitioned topic): staged
-state follows the partition to its new owner, never the pod. SlateDB is single-writer per
-path, which is exactly the ownership fence assignment already provides;
-the fencing behavior on a contested open is pinned by a binding-parity
-test, not assumed. When the fence fires (a newer writer opened the
-path), the flush loop treats the partition's `Error.Closed` as
-terminal: the partition leaves flush scheduling with one log line
-(never a stack trace per sweep) for the life of the process, and
-the runner's stats surface the fenced set. The consumer halts on it at
-the poll's durable write before committing: the staging batch, or, for
-a partition whose polled records all dropped, a one-put fence probe
-(`meta/fence`) written in its place, so a fenced owner never commits
-offsets against the new one. A pod holding K partitions runs K instances; per-DB
-housekeeping overhead (memtable, WAL, manifest) is a bench item, because
-it bounds how small a partition slice may be before S3 chatter
-dominates. No volumes anywhere.
+way millpond does (its StatefulSet ordinal's share of the topic, derived
+once at start; the assignment *is* the claim) and opening a partition's
+DB is part of claiming it. Staged state follows the partition to its
+next owner. SlateDB is single-writer per path; a contested open fences
+the older writer lazily, at its next durable write, and a fenced
+process exits 4. The consumer writes durably on every poll before it
+commits offsets (the staging batch, or a one-put `meta/fence` probe for
+a partition whose records all dropped), so a fenced owner never commits
+offsets against the new one. No volumes anywhere.
 
 ```
-rows/<group><offset_ob>                   → event payload bytes
-stats/<group>                             → {staged_bytes, first_staged_ts, last_staged_ts, row_count}
-sched_age/<first_staged_ts_ob><group>     → ∅
-prepared/<group><first_offset_ob>         → persisted commit request (v6 envelope)
-meta/fence                                → the consumer's fence probe (not a row)
+rows/<group><offset_ob>   → event payload bytes
+meta/fence                → the consumer's fence probe (not a row)
 ```
 
 `<group>` is the partition tuple, prefix-free: `arity u8`, then per
 component a tag byte (null / present) and, when present, `u16 length +
 UTF-8` wire string; an unpartitioned table's tuple is empty. `_ob` is
-offset binary (`value + 2^63` as a big-endian u64), so byte order is
-numeric order, negatives included. No separators: the group is
-self-delimiting and the offset fields are fixed-width. The Kafka record
-timestamp is never read: it is in no key, and the staging stats
-(`first_staged_ts`, `last_staged_ts`) are the consumer's staging clock.
+offset binary, so byte order is numeric order. The Kafka record
+timestamp is never read.
 
-The keyspace carries no partition component: the instance *is* the
-partition. There is no quarantine: a record that can never become a row
+There is no persisted index. Each stage keeps its groups' first staged
+time, staged bytes and a write generation in memory. That is sound
+because **staged state never outlives a process**: at startup each
+replica opens its stages, finds every group with rows (one seek per
+group), and flushes all of them before it consumes anything new (the
+startup drain). After that, every write updates the in-memory index
+before it reaches disk, and a group leaves the index only when a
+complete scan of it was flushed and no write touched it since; so a
+group with staged rows is always in the index, and every group becomes
+due within the slow-lane deadline.
+
+There is no quarantine: a record that can never become a row (not a
+JSON object, a malformed partition source, a value no column can hold)
 is dropped, logged and metered (`millrace_records_dropped_total{reason}`),
 at consume time (nothing is staged for it) or at flush time (it is left
-out of the payload and deleted with its window's settlement).
+out of the payload and deleted with its window). Event times are never
+judged: ancient and far-future events are written, and an instant
+outside years 1–9999 is clamped to the nearest representable one
+(counted in `millrace_values_clamped_total{column}`).
 
 Which group a staged record lands under is computed from its PAYLOAD,
 never from the Kafka key: the consumer parses the value as a JSON object
 once and, per field of the table's live partition spec, reads the source
-scalar by path (a struct leaf such as `properties.team_id` included; a
-source under a list or a map, or on a container or a json column, is
-refused when the keyer is built and at the flusher's
-startup), coerces it with the same column coercer the flush decoder uses, applies
-the transform and renders the wire string pyhoglake's commit carries
-(`grouping.py:GroupKeyer`). A malformed source scalar drops the record
-(the log line names the field); an absent or null source is a null
-component. The consumer reads the table shape at startup (the flusher's
-resolve, same pinned incarnation) and re-reads it on the flusher's TTL;
-a spec change just starts new groups, and the old ones drain by age or
-the slow lane. The tuple is a layout optimization, never the truth: the
-flush fans every window out by the LIVE spec, so a group keyed under an
-older spec flushes correctly, as several files.
+scalar by path (struct leaves included), coerces it with the same
+column coercer the flush decoder uses, applies the transform and
+renders the wire string pyhoglake's commit carries
+(`grouping.py:GroupKeyer`). The consumer re-reads the table shape on the
+flusher's TTL; a spec change just starts new groups. The tuple is a
+layout optimization, never the truth: the flush fans every window out
+by the LIVE spec, so a group keyed under an older spec flushes
+correctly, as several files.
 
-The consequence is stated, not dodged: any partition's instance can
-hold any group, and a group spread over K partitions is up to K files
-per flush window — one per instance. The per-partition topology above
-is unchanged; what changes is which groups a partition's instance holds
-— and the readiness lanes evaluate a group's PER-PARTITION slice: the
-whale pays K full-size files per window (the size lane fires per
-instance, as before), while a medium group split thin across K
-partitions can fall under `min_flush_bytes` per instance and drift from
-the age lane to the slow lane — exactly the freshness-for-files trade a
-repartition hop would buy back by concentrating the group. Sizing
-`min_flush_bytes` against K is the operator lever.
-Idempotency is unaffected: the flush identity scopes a window by
-`(topic, partition, partition tuple, offset range)`, so the same
-group's windows on different partitions are distinct flushes whose
-idempotency keys never collide, and a partition's replay only ever
-re-puts its own staged keys.
+Any partition's instance can hold any group, so a group spread over K
+partitions is up to K files per flush window, and a medium group split
+thin can fall under the age lane's minimum per instance and move to the
+slow lane.
 
-- `rows` keys are ordered so one group's staged slice is a contiguous
-  range scan in Kafka offset (arrival) order, while the catalog's sort
-  spec is the payload's event time, which late and skewed events invert
-  constantly. The flush therefore does not trust staging order: `build_prepared_plan` sorts the Arrow batch by the live
-  `sort_spec` (fields, directions, null placement) before the partition
-  fanout, so every registered file is key-nondecreasing under the spec
-  compaction's sortedness checks enforce — the bounded scan stays
-  contiguous, and the sort is what reconciles record time with event
-  time.
-- `stats` and `sched_age` are maintained in the same write batch /
-  transaction as the row puts, so readiness accounting cannot drift
-  from the data. `sched_age` is the age-ordered readiness index: the
-  sweep for expired keys is a prefix range scan.
-- A size-ordered view (`sched_size`) is either a second index or
-  derived by scanning `stats` — decided by the benchmark, since it is
-  the only prefix whose maintenance cost is per-put.
-- Kafka metadata (`topic, partition, first_offset, last_offset`) is
-  recorded per staged range in a side prefix; it is the flush's
-  identity material (below), not the row key.
-- `event_time` outliers are clamped or dropped **at flush time**
-  (Arrow compute over the staged range), never by mutating staged rows.
+Staging order is Kafka offset order; the catalog's sort spec is event
+time, which late and skewed events invert. The flush sorts each batch
+by the live sort spec before the partition fanout, so every file is
+key-nondecreasing under the spec compaction enforces.
 
 ## The flush planner
 
-Three lanes, evaluated per key; arrivals never reset a key's
-`first_staged_ts`, and a settle that leaves rows lifts it to the
-settled scan's start (when that scan saw the whole slice — every row
-left was staged after it), so `now − first_staged_ts` stays the age of
-the key's oldest staged row and a key under steady inflow trips the age
-lane once per deadline, not on every sweep:
+One predicate per group, first match wins:
 
 | Trigger | Condition | Catches |
 |---|---|---|
-| size | `staged_bytes × compression_ratio ≥ target_output_bytes` (default 500 MB) | whales — early, often, full-size files |
-| age | `age ≥ flush_deadline` (15 min) **and** `staged_bytes ≥ min_flush_bytes` | medium tenants — the freshness SLA |
-| slow | `age ≥ slow_lane_deadline` (6 h; must be ≥ `flush_deadline`) | pathological low-volume keys |
+| size | `staged_bytes ≥ MILLRACE_FLUSH_BYTES` (256 MiB) | whales: early, often |
+| slow | `age ≥ slow_lane_deadline` (6 h; ≥ `flush_deadline`) | pathological low-volume groups, churned groups, groups keyed under a retired spec |
+| age | `age ≥ flush_deadline` (15 min) **and** `staged_bytes ≥ 1 MiB` | medium tenants: the freshness SLA |
 
-The **size lane sizes the output, not the input**: the trigger estimates
-the parquet file size, taking compression roughly into account. The
-ratio is *observed*, not guessed — an exponentially-weighted average of
-(parquet bytes ÷ staged bytes) from this table's completed flushes,
-fed back into the planner as an input (the planner stays pure; a
-configured fallback ratio applies until the first flush lands).
-Implemented as the flusher's in-memory EWMA
-(`MILLRACE_COMPRESSION_RATIO_HALFLIFE`, default 20 flushes), reset when
-the table's shape or incarnation changes — a schema change makes the
-old observations a different quantity. It is deliberately NOT
-persisted: a restart falls back to `DEFAULT_COMPRESSION_RATIO` (0.2),
-which errs toward over-staging (a bigger file is a sizing miss; the
-reverse would be a new small-file regime).
+`age` is measured from the group's first staged row (lifted to the
+start of the last complete flush when rows remain, so a group under
+steady inflow is due once per deadline). The age lane's minimum keeps
+tiny groups from producing a file per deadline; the slow lane drops the
+tail from ~96 files/day to ~4/day per group.
 
-A flush's unit of work is BOUNDED, so a post-outage catch-up slice is
-not one unbounded scan → Arrow build → settlement batch: the
-staged-range scan is capped in rows and bytes
-(`ceil(target_output_bytes ÷ ratio × 1.25)` staged bytes, floored at
-`MILLRACE_FLUSH_SCAN_MIN_BYTES`, default 64 MiB — the floor keeps toy
-targets from fragmenting flushes; rows capped at
-`MILLRACE_FLUSH_SCAN_MAX_ROWS`). The flush window is the SCANNED rows'
-own offset span, `[first_scanned_offset, last_scanned_offset]`, capped
-or not: row keys sort by `(group, offset)`, so a capped scan is an exact
-offset prefix of the group's staged rows and no unscanned row of the
-group lies inside the span (staged offsets only grow past a scan
-snapshot). The settlement deletes exactly the scanned keys — the
-published rows — so a row that enters the span after the scan anyway (a
-replay below the settled floor, a re-key) is left staged and flushes in
-a later window.
-Leftover rows re-decide on the next sweep: a group of N rows drains in
-⌈N ÷ cap⌉ windows however it interleaves with other groups in the
-partition. A single record larger than the
-budget still flushes alone (one staged record is bounded by the
-broker's message limit; the alternative is a wedged key).
+A flush's unit of work is bounded: one scan reads an offset prefix of
+at most `MILLRACE_FLUSH_BYTES` of staged payload, and always at least
+one row, so a record larger than the budget never wedges its group.
+Files come out around a fifth of the budget at typical compression;
+**compaction owns final file sizing**. The pod runs at most 4
+decisions at once, so the flush's memory envelope is about 4 × (budget
++ decoded batch + output).
 
-The **age lane carries a minimum size** so that genuinely tiny keys skip
-it: a tenant with a handful of staged rows at the 15-minute mark does
-not earn a file. The **slow lane** is where those keys live: one flush
-per slow-lane deadline (6 h by default; 6–24 h is the production shape,
-and the only constraint is that it sits at or above the flush
-deadline), which drops the pathological tail from ~96 files/day to
-~4/day per key — the cardinality that used to gum up the works now costs
-almost nothing, and the small-file floor of identity partitioning all
-but disappears as a compaction-arrival rate.
-
-(The lane boundary is deliberately low — `min_flush_bytes` is sized so
-only pathological keys defer; "medium" tenants keep their 15-minute
-SLA. The policy itself is a seam: the planner takes a policy object, and
-this three-lane policy is the default — pluggable policies are a later,
-small step precisely because the planner is pure.)
-
-A flush of one key: scan the staged range → Arrow → filter/drop →
-sort by the live sort spec → one parquet file per partition tuple under
-the table's LIVE partition spec (whatever it is — one file when the
-staged group was keyed under the same spec) →
-upload → persist the complete prepared request under `prepared/` →
-`commit/prepared` → on receipt, one staging write batch that deletes
-exactly the scanned row keys, settles the stats and sched entries and
-drops the persisted request (a recovered entry, whose keys did not
-survive the restart, deletes the keys a pre-scan of its window read).
-No scan runs under the stage write lock: the lock covers the stats
-point read and the batch write, so its hold time scales with the
-tombstones written, far below a scan's object-store stall.
-That settlement is atomic and runs only with the receipt in hand, so
-there is no `flushed/` marker to repair: recovery's ambiguity set is
-exactly the surviving `prepared/` entries — a crash between commit and
-delete leaves the entry, and recovery receipt-checks it (a 200 settles
-the range locally with zero republication; a 404 replays the persisted
-bytes byte-identically, and the server's receipt dedupes a landing
-replay). The `prepared/` envelope carries the
-idempotency key's derivation inputs — `topic`, `partition` and the
-partition tuple as hoglake partition values (field names beside wire
-strings) — beside the key and body, so a recovered entry is
-self-describing and recovery cross-checks it against the stage's own
-identity and its `prepared/` key; it records `row_count`, the rows the
-window held when the request was built, which every recovery settle
-uses as its expected count against the pre-scan (a window holding a
-different count by then halts `settlement_mismatch` and writes nothing,
-rather than settling a row the commit did not publish); it records `digest`, the window's
-content digest, so a later settle can verify content and not only
-count (a topic recreated under the same name can re-put the same keys
-with new payloads; that check is not wired yet); and it carries
-`persisted_at`, which
-the replay logs as the entry's age and which gates nothing: a 404 is
-replayed whatever the age, and a replay answered 410 re-prepares from
-the staged rows (§Delivery semantics). Recovery also
-collects any `flushed/` markers left by pre-lifecycle builds — settled
-garbage by construction — in bounded pages, one delete batch per page,
-so a partition's recovery never stalls on marker volume. Sweeps across
-keys (and across the pod's partition instances) each become their own
-commit per `(group, window)` — bounded in file count by
-`max_files_per_commit` (a spec that fans one decision past the bound is
-a deployment bug the flusher halts on); a sweep is never one unbounded
-commit body.
-
-Churn: a tenant that stops sending (or a group keyed under a retired
-spec, or a month that has passed) leaves residue below the size and age
-triggers — which is exactly what the slow lane absorbs: any key past
-`slow_lane_deadline` flushes regardless of size, so churned groups
-leave no residue and the stats keyspace reflects live groups.
+A flush of one group: scan → decode → Arrow → sort by the live sort
+spec → one parquet file per partition tuple under the table's LIVE
+spec → chunk into commits of ≤ 512 files → per commit, upload,
+`commit/prepared`, then one durable write batch that deletes exactly
+the scanned row keys that commit published (so a split decision that
+fails partway never republishes the parts that landed). A row that entered the scanned
+range after the scan is not among them and flushes later. No scan and
+no payload lowering ever runs under a stage's write lock.
 
 ## The wire contract — from day one, no flags
 
-This writer is born correct; it does not repeat millpond's blind-append
-shape (AGENT.md invariant 12 exists because of that shape):
+- Every commit carries the `read_snapshot` of the shape it was built
+  from and `expected_table_uuid`, the incarnation the startup resolve
+  READ and pinned. A later read or commit naming another incarnation
+  halts the process (exit 3): a human decides whether the staged rows
+  belong in the new table.
+- Every build mints a fresh uuid4 `idempotency_key` per commit. An
+  ambiguous answer (5xx, 408, 429, a transport error) or a plain 409
+  `commit_conflict` resends the IDENTICAL bytes under the same key, and
+  the server's receipt makes that exactly-once within the process. A
+  409 `ddl_since_read_snapshot` or a 410 `read_snapshot_expired`
+  rebuilds against a fresh shape read with a fresh key.
+- Any other refusal (a 400/422 payload refusal, 401, 403, 404, 413,
+  `table_dropped`) fails the decision: nothing is deleted, the group
+  retries with backoff, and after three consecutive failures it is
+  reported stuck (ERROR log, counter, gauge) while every other group
+  keeps flushing. Rows are never dropped for a refusal.
+- Object names are `…/{build}/{index}.parquet`, `build` a fresh token
+  per build, so a rebuild never touches objects a landed commit may
+  name. Every object exists before a commit names it.
+- Table identity reads use `totals=false`; the shape cache's TTL is a
+  quarter of the catalog's snapshot retention, so the commit's
+  conflict window always covers a spec change.
 
-- Every commit carries a `read_snapshot` taken before the staged range
-  was read, and `expected_table_uuid` — the incarnation the startup
-  resolve READ and pinned (there is no configured uuid to refuse
-  against at boot; a later read or commit naming another incarnation
-  halts `table_recreated`). A 409 `commit_conflict` drops the shape
-  cache and resends the IDENTICAL persisted bytes, up to 5 attempts,
-  then `FlushPublishExhausted` (the entry stays; the next sweep
-  reconciles receipt-first). `ddl_since_read_snapshot` is the
-  *re-prepare* signal — drop the entry, re-read the table, rebuild the
-  request, never replay the refused payload; `table_recreated`,
-  `table_dropped` and 410 halt the pipeline, except a 410 answering a
-  recovered entry's replay, which re-prepares (§Delivery semantics).
-  503 `commit_queue_timeout`
-  backs off per `Retry-After`.
-- The complete prepared commit request is persisted (SlateDB side
-  prefix) **before** publication and is never regenerated after an
-  ambiguous response; the idempotency key derives from
-  `(table_uuid, topic, partition, partition tuple, first_offset,
-  last_offset, content digest)` of the staged range — the digest a
-  SHA-256 over the window's rows in offset order, so the key names the
-  window's CONTENT, not only its bounds (the name line is
-  `millrace:v3:table=<uuid>:topic=<t>:partition=<n>:group=<k0=…/k1=…>:offsets=<first>-<last>:digest=<hex>`,
-  the tuple's wire strings under POSITIONAL names, percent-encoded —
-  a function of the staged tuple alone, so no spec change can move the
-  key; display names such as
-  `team_id=42/timestamp_month=681` appear only in the commit message and
-  the `prepared/` envelope) — topic and
-  partition are derivation inputs because offsets are per partition:
-  two partitions flushing one group
-  over the same offset range must never share a key or the object URIs
-  under it. Object URIs are `…/{key}/{build}/{index}.parquet`, `build`
-  a fresh uuid4 hex per build (millpond's rule: a retry under the same
-  key writes fresh objects). A verbatim replay sends the persisted bytes
-  and so names the persisted objects, and the server's receipt dedupes
-  it; the same rows re-flushed produce the same request apart from the
-  build token. Because of that token a FRESH build of content that
-  already landed would be answered 422 reused-key, so a fresh build
-  looks its key's receipt up before it builds (retrying transient
-  failures on the publish ladder): a 200 means this exact content
-  landed and the window settles locally with nothing uploaded or
-  published (`millrace_flush_deduped_total`). Different rows under the
-  same bounds (a recreated topic, an offset restart, a re-key) have
-  another key and publish as a new commit — never settled from another
-  commit's receipt. A 422 reused-key on a fresh publish is re-checked
-  against the receipt: the key is content-exact, so a receipt proves
-  these rows landed (another writer committed them after the lookup —
-  a suspected second owner, logged) and the window settles from it; no
-  receipt is a server inconsistency and halts. On a persisted entry's
-  verbatim replay a 422 means a foreign writer or broken determinism,
-  and halts.
-- An answered refusal is judged, not retried, and never deletes staged
-  rows. Every answered 4xx outside the named arms — a proxy's 401/403,
-  an ingress's 413, a request-shape `validation` 422, a per-record
-  `record_validation` 422 (no server emits one today) — halts the
-  pipeline with the rows staged: nothing about it says the rows can never publish, and the
-  staged rows plus the persisted entry are the operator's
-  reconciliation material.
-- Partition values are computed under the spec the `read_snapshot`
-  describes (the flush recomputes them from the decoded rows — the
-  staged group's tuple, computed under whatever spec the consumer last
-  read, decides only what flushes together); on spec change, the
-  refusal path above is the only recovery, per invariant 12.
-- Table identity reads use `totals=false`; the manifest is never
-  aggregated on a request path.
-
-Stats policy is asymmetric, keyed on the REALIZED file size rather than
-the deciding trigger: a file at or above half of `target_output_bytes`
-ships **full footer stats** (large files are where pruning pays — and
-the size lane's steady state), smaller files ship
-**`stats_mode=deferred`** (a sub-row-count file prunes trivially; the
-hydrator fills bounds in asynchronously, off the commit path). Keying
-on the trigger instead would invert exactly on the bad case: the
-biggest files this pipeline writes are post-outage catch-up flushes,
-which arrive on the age/slow lanes.
+Stats policy is keyed on the realized file size: a file of at least
+32 MiB ships full footer stats; smaller files ship
+`stats_mode=deferred` and the hydrator backfills bounds off the commit
+path.
 
 ## Delivery semantics
 
-At-least-once end to end, hedgerow's contract restated for a staging
-area: a Kafka offset commits only after every record at or below it is
-durable in SlateDB or was dropped and counted; staged ranges
-are deleted strictly after a commit receipt. Crash between commit and
-delete → the range re-flushes → the persisted prepared request replays
-byte-identically → the receipt dedupes it. Duplicates otherwise require
-a flush boundary shift across restart, which the persisted request
-prevents, or a recovered entry that outlives the server's receipt
-retention (below).
-410 below the retention floor is a stop sign, never a skip — on a
-fresh publish it halts; on a recovered entry's replay it re-prepares
-from the still-staged rows (below).
+**At-least-once**: a Kafka offset commits only after every record at or
+below it is durable in SlateDB or was dropped as unrepresentable and
+counted; a staged row is deleted only after every commit naming it
+landed. Duplicates are accepted:
 
-That absorption has a precise boundary: replay is idempotent only for
-rows still **staged**. A re-consumed record re-puts the same `rows/`
-key (`(partition tuple, offset)`), so replays of not-yet-flushed ranges
-rewrite staged state in place. Below the settled floor — a range
-already flushed, receipt-confirmed and deleted from staging — the
-re-consumed records stage again, and a fresh build looks its window's
-content-derived key up before building. The dedupe is content-exact:
-only a rebuilt window with the group, bounds AND rows of a published
-one (an identical rewind) has that window's key, and its receipt
-answers 200 and the window settles with nothing republished, as long
-as the receipt is within retention. When the bounds differ (the scan
-caps or the rows staged at flush time cut the window differently) or
-the rows differ under the same bounds, the key is new and the window
-publishes as a new commit — its shared rows land twice, as do rebuilt
-windows whose receipts were purged. A nonzero
-`millrace_flush_deduped_total` therefore means a rewind re-staged
-identical data. That replay happens exactly when a
-partition restarts from `earliest` across a settlement boundary: a
-changed `MILLRACE_KAFKA_GROUP_ID`, or offsets aged out of
-`__consumer_offsets`.
+- a crash, or a failed delete batch, after a commit landed: the window
+  re-flushes (on restart, by the drain) under a new key;
+- a Kafka rewind below already-flushed offsets (a changed group id,
+  offsets aged out of `__consumer_offsets`): the re-consumed records
+  stage and publish again.
 
-Where consumption starts when no committed offset exists is therefore a
-deliberate knob, `MILLRACE_KAFKA_AUTO_OFFSET_RESET`, and the default is
-**`latest`** — the fleet policy: the same setting pinned to `earliest`
-caused the 7-day whole-retention replay recorded in the millpond
-chart's comments, and a replay storm is the worse operational failure
-of the two. The price is the mirror-image risk millpond's AGENT.md
-names: with `latest`, a partition whose offsets were LOST (a changed
-group.id, aged-out `__consumer_offsets`) starts at the head and any
-unconsumed backlog is silently never consumed — removal-by-omission.
-(A genuinely new partition has no backlog and loses nothing under
-either setting.) `earliest` remains available for a deployment that
-would rather replay than skip. Either setting faces the same
-settled-floor boundary above — millrace's per-partition staged state
-makes a replay idempotent above it, and below it re-consumed records
-dedupe only where a rebuilt window matches a published one in bounds
-and content while its receipt survives — so the choice is operational, not semantic. The
-operators' levers are therefore **group-id stability** (a pipeline's
-group never changes) and **offset retention**
-(`offsets.retention.minutes` must outlive any window in which a dark
-partition could be rediscovered) — with both in place, consumption
-never restarts across a settled range at all, and the knob only ever
-governs genuinely new partitions.
+`MILLRACE_KAFKA_AUTO_OFFSET_RESET` defaults to **`latest`**, the fleet
+policy (a fresh group under `earliest` replays the whole retention,
+the 7-day replay in the millpond chart's comments). The mirror risk:
+with `latest`, a partition whose committed offsets were LOST starts at
+the head and its backlog is never consumed. The operator levers are
+group-id stability and `offsets.retention.minutes` outliving any dark
+period; with both, the knob only governs genuinely new partitions.
 
-One boundary is load-bearing and honest: the dedupe depends on the
-server's commit receipts, and receipts are PURGED
-(`HOGLAKE_RECEIPT_RETENTION_SECONDS`, default 7 days, V24 — floored per
-catalog at twice its snapshot retention, capped at 30 days, and refused
-below one hour server-side). A partition dark past that retention can
-hold a `prepared/` entry whose receipt is gone whether or not its
-commit landed. millrace does not guard on the entry's age; the chain
-is:
-
-1. Receipt 404 → the persisted bytes are replayed verbatim under the
-   same key.
-2. On any catalog with snapshot retention ≤ 30 d, a request old enough
-   for its receipt to be purged has a `read_snapshot` below the expiry
-   floor (the receipt outlives the first landing by
-   `min(max(HOGLAKE_RECEIPT_RETENTION_SECONDS, 2 × snapshot retention), 30 d)`,
-   never less than the snapshot retention, and the request's
-   `read_snapshot` precedes that landing), so the replay is answered
-   **410**. That is not a halt at reconcile: the entry is dropped and
-   the still-staged rows **re-prepare** against a fresh read on a later
-   sweep, exactly like `ddl_since_read_snapshot`
-   (`millrace_prepared_reprepared_total{reason="read_snapshot_expired"}`).
-   The dropped entry's objects are NOT orphan-accounted — they may be
-   live files of a landed first attempt — but logged at WARNING and
-   counted in `millrace_flush_unresolved_uploads_total` for an operator
-   to reconcile against the catalog. A `ddl_since_read_snapshot`
-   answering the same replay is handled the same way (reason
-   `ddl_since_read_snapshot`): both follow a receipt 404 on an entry of
-   unknown fate.
-3. The rebuild keeps the idempotency key (a function of the window) but
-   mints fresh object names (a new build token), so it never touches
-   the first attempt's objects. If the first attempt landed, the window
-   now exists twice — two file-row sets over two object sets, exact
-   duplicate rows — accepted at-least-once behaviour, counted; the first
-   attempt's objects are the unresolved uploads above. A rebuild that
-   is itself abandoned leaves orphans, accounted as usual. The rebuild
-   applies the junk `event_time` window against the current clock: under
-   `MILLRACE_EVENT_TIME_POLICY=drop`, an entry older than
-   `MILLRACE_EVENT_TIME_MAX_PAST_S` (30 d) can rebuild with every row
-   dropped (counted under `event_time_out_of_window`) and settle with no
-   commit.
-4. Only with snapshot retention off, above 30 d, a consumer-floor
-   pin holding the floor down, or an expiry sweep that has not yet
-   advanced the floor does the verbatim replay itself execute:
-   a second set of file rows over the same objects
-   (`millrace_prepared_replays_total`). With retention above 30 d and
-   the first landing compacted and expired, its paths sit in the
-   removal queue and the replay is refused 409 `CommitConflict` —
-   retried, then `FlushPublishExhausted` each sweep — until the queue
-   drains.
+The startup drain makes restart simple: there is no recovery step and
+nothing persisted to reconcile. It costs startup time proportional to
+the staged backlog, during which Kafka lag grows (durably) and the pod
+reports not-ready; the startup probe must allow for it. A pod that
+crashes mid-drain drains again on restart.
 
 ## What the server owns (and what this design asks of it)
 
@@ -519,117 +262,48 @@ is:
 table, 96% under 60 KiB): at a 15-minute deadline and ~10⁵ active
 tenants/day, worst-case arrival is of order 10⁷ small files/day —
 single-digit multiples of the current baseline, not a new regime.
-Per-commit rows grow only by the bounded flush window (≤ the size-lane
-cap); receipts are digests and expire server-side
-(`HOGLAKE_RECEIPT_RETENTION_SECONDS`, V24); stats
-rows arrive deferred via the hydrator rather than in the commit body.
+Per-commit rows grow only by the bounded flush window (≤
+`MILLRACE_FLUSH_BYTES` of staged input, ≤ 512 files per commit);
+receipts expire server-side (`HOGLAKE_RECEIPT_RETENTION_SECONDS`, V24);
+stats rows of files under 32 MiB arrive deferred via the hydrator
+rather than in the commit body.
 The open question is compaction throughput at that arrival rate, which
 is validation item 1, not an assumption.
 
 ## Deployment and operations
 
-One process = one topic → one table (hedgerow idiom: no central
-scheduler, no fleet coupling). The deployment is a StatefulSet of
-`MILLRACE_REPLICA_COUNT` replicas with `POD_NAME` from the downward
-API; assignment is static and derived, millpond's model: each pod
-parses its ordinal from the pod name's trailing `-<n>`, reads the
-topic's partition count from Kafka metadata once at start, and claims
-every partition `p` with `p % replica_count == ordinal` — there is no
-consumer group membership and no rebalance, and the group id only
-namespaces the stored offsets. A replica count that divides the
-partition count is the sensible shape; an ordinal with no partitions,
-an ordinal at or past the replica count, or an unknown topic refuses
-to start. Each claimed partition's SlateDB instance is claimed with
-it, so a reassignment between deploys (scaling the StatefulSet,
-repartitioning the topic — both take effect at the next start) moves
-staged state with the partition rather than stranding it on an
-ordinal.
-Parallelism by replica count, and bounded-parallel flush within one:
-the sweep runs up to `MILLRACE_FLUSH_CONCURRENCY` (default 4) decisions
-in flight per partition (4× that process-wide — each in-flight decision
-holds its bounded scan in memory). Evidence for the tail-SLA claim
-(M5): the sweep bench (`tests/test_flush_bench.py`, non-gating:
-`uv run pytest --bench tests/test_flush_bench.py -s`) measures 1024
-ready keys in total (256 per partition stage × 4 stages) end-to-end at **74 keys/s serial** and **301
-keys/s at the default concurrency** (2026-10-13, with the receipt lookup
-every fresh build now makes) on in-memory stages with a 5 ms WAL
-flush tick — the serial loop sits within 2× of the ~110 ready keys/s
-the design arithmetic wants, so the bound-parallel loop shipped; the
-tick dominates the rig (at a 1 ms interval the same rig reads 189/253
-keys/s), and production WAL latencies (object-store round trips, not an
-in-process tick) are exactly what the parallelism overlaps. The
-consume loop stops only on error. The staged gauges (bytes/rows per
-partition, oldest ELIGIBLE staged age — a key is aged only once any
-flush lane will take it, so pathological slow-lane tenants don't page)
-are alert inputs; the loop never reads them. SlateDB's own write stall
-(L0 at `l0_max_ssts` with no compactor draining) stalls the staging
-write itself and surfaces through the `slatedb.db` stall series.
-On the consume side, one poll's per-partition stage
-batches are in flight CONCURRENTLY (each partition's WAL write and
-durability wait overlap; the single offset commit still follows every
-ack), and the librdkafka fetch knobs are config
-(`MILLRACE_KAFKA_MAX_PARTITION_FETCH_BYTES` / `…_FETCH_MAX_BYTES` /
-`…_QUEUED_MAX_MESSAGES_KBYTES`, defaults sized for the whale shape —
-the 1 MiB `max.partition.fetch.bytes` library default capped millpond's
-hot partition at ~50 MB/s), with the per-poll batch bounded by a record
-cap and an observed-average byte cap. Metrics remain passive
-observability, never control flow. Fail-fast config at
-startup: create the destination from configuration when it does not
-exist, millpond's way (`millrace/destination.py`: the catalog with
-`MILLRACE_CATALOG_DATA_PATH`, the namespace, and the table in ONE
-atomic request from `MILLRACE_TABLE_COLUMNS` + `MILLRACE_PARTITION_BY`
-+ `MILLRACE_SORT_BY` — the partition tuple is the staging key and
-millrace drops unknown keys with no schema evolution, so the complete
-shape must exist before the first record is staged; a missing object
-the config cannot create is exit 2 naming the knob; the replica race
-is tolerated; an existing table is compared and never altered, a
-difference is one WARNING), then resolve catalog, namespace and table
-(the server must report `read_snapshot_id`) and pin the incarnation
-the read returns. The recommended dev shape is
-`MILLRACE_PARTITION_BY=identity(team_id),day(timestamp)` and
-`MILLRACE_SORT_BY=timestamp`. Junk
-`event_time` policy (clamp vs drop) is config, validated at boot.
+One process = one topic → one table (no central scheduler, no fleet
+coupling). The deployment is a StatefulSet of `MILLRACE_REPLICA_COUNT`
+replicas with `POD_NAME` from the downward API; assignment is static
+and derived (`p % replica_count == ordinal`, the partition count read
+once at start); there is no consumer group membership and no
+rebalance. An ordinal with no partitions or an unknown topic refuses to
+start. Each claimed partition's SlateDB instance moves with it between
+deploys.
 
-Metrics are passive — they never feed control flow — and scraped from
-each pod's ops server: millrace's own counters and gauges (staged
-bytes/rows, oldest-eligible staged age, flush counters including
-orphans and `millrace_records_dropped_total{reason}`) plus a whitelist of SlateDB internals, bridged via
-SlateDB's `DefaultMetricsRecorder` polled at scrape time
-(`snapshot()` is in-process atomics — no loop hop) and **aggregated
-across the pod's partition instances** — per-partition series at K
-instances per pod is a cardinality trap. One DELIBERATE exception: a
-stuck partition must be findable, so `millrace_partition_staged_bytes`,
-`millrace_partition_oldest_staged_age_seconds` and
-`millrace_flush_partition_fenced` carry `{topic,partition}` labels —
-cardinality bounded by the pod's ASSIGNED partitions (tens), never by
-partition tuples. The whitelisted series
-(verified against slatedb 0.17.0's actual emission):
-`millrace_slatedb_l0_sst_files`, `millrace_slatedb_l0_ssts_per_segment_max`
-(L0 count/depth), `millrace_slatedb_wal_buffer_flushes_total`,
-`millrace_slatedb_wal_buffer_flush_requests_total`,
-`millrace_slatedb_wal_flush_bytes_total`, `millrace_slatedb_wal_buffer_bytes`
-(the WAL arm), `millrace_slatedb_write_stalls_total` and
-`millrace_slatedb_l0_stalls_total{type=...}` (write-stall state),
-`millrace_slatedb_memtable_bytes`, and
-`millrace_slatedb_block_cache_accesses_total{entry_kind,result}` (the
-hit rate is hit/(hit+miss) in PromQL). 0.17.0 emits NO WAL
-flush-latency histogram (the design's "ack-latency driver" is therefore
-read through the WAL flush rate/bytes and the consumer-visible staging
-latency instead; the one latency histogram SlateDB does emit,
-`object_store.request_duration_seconds`, cannot separate WAL puts from
-SST uploads by label and is deliberately not bridged). Unknown or new
-SlateDB metric names are ignored by the bridge — a SlateDB upgrade can
-never break a scrape. Per-instance compaction debt is not a pod metric
-at all: the maintenance service reads each instance's compactor state
-view on its sweep and exports it as
-`millrace_maintenance_compaction_l0_ssts{topic,partition}` (the fleet
-authority on debt, so the per-DB labels are affordable there) plus the
-fleet-wide max — a writer's embedded compactor falling behind shows
-there first (L0 approaching `l0_max_ssts` is the write-stall
-precursor). The probes follow the same honesty rule: `/healthz` 503s
-with the reason on a latched terminal state (a halted flush runner, a
-fenced partition) rather than always answering 200, and `/readyz` fails
-whenever liveness does.
+Startup: create the destination from configuration when it does not
+exist (`millrace/destination.py`: catalog, namespace, and the table in
+ONE atomic request with its partition spec and sort order; an existing
+table is compared and never altered), resolve and pin the incarnation,
+open the claimed stages, **drain everything staged**, then assign and
+consume. `/readyz` is 503 until then; the chart's startup probe must
+cover the worst expected drain. Recommended dev shape:
+`MILLRACE_PARTITION_BY=identity(team_id),day(timestamp)`,
+`MILLRACE_SORT_BY=timestamp`.
+
+Metrics are passive (never control flow), read from memory on each
+pod's ops server: consume and flush counters,
+`millrace_records_dropped_total{reason}`, commit refusals by status,
+stuck groups (the alert), staged bytes/rows/groups since the last drain,
+the oldest due group's age, `millrace_draining`, and a whitelist of
+SlateDB internals bridged from `DefaultMetricsRecorder` and summed over
+the pod's instances (per-instance series would be a cardinality trap):
+`millrace_slatedb_l0_sst_files`, `…_l0_ssts_per_segment_max`, the WAL
+flush series, `…_write_stalls_total`, `…_l0_stalls_total{type}`,
+`…_memtable_bytes`, `…_block_cache_accesses_total{entry_kind,result}`.
+Per-DB compaction debt comes from the maintenance service
+(`millrace_maintenance_compaction_l0_ssts{topic,partition}` plus the
+fleet max). `/healthz` 503s once a halt or fence has latched.
 
 ## Maintenance services: external compaction and GC
 
@@ -683,12 +357,11 @@ upstream tutorials (slatedb.io/docs/tutorials/standalone-compactor,
   respects checkpoints precisely (a checkpoint pins its manifest's WAL
   range and SSTs; `delete_checkpoint` + a later GC reclaims them), and
   never raises on a missing/foreign path (so the service probes
-  `read_manifest` first). Writers shed the embedded GC's LIST/DELETE
-  traffic by DEFAULT (`MILLRACE_SLATEDB_GC_ENABLED=false`, wired
-  through `stage.build_slatedb_settings`) because this service owns
-  collection — GC is idempotent and overlap-safe, so a misconfigured
-  overlap is wasteful, never corrupt; boot warns loudly that the
-  setting assumes this service exists.
+  `read_manifest` first). Writers always shed the embedded GC
+  (`stage.build_slatedb_settings`; there is no knob) because this
+  service owns collection: with dozens of pipelines planned, one GC
+  service keeps LIST/DELETE work and its scheduling off the ingest
+  pods. GC is idempotent and overlap-safe.
 - **Decision (2026-10-09): the maintenance service is GC +
   debt-monitoring only.** Compaction offload waits on the binding:
   route 1 is upstreaming a `CompactorBuilder` exposure (small, well-
@@ -746,16 +419,15 @@ cluster.
 3. **Commit rate + deferred-stats mix** against a live catalog: sweeps
    of ~10⁵ tiny registrations at one commit per (group, window), bounded
    per commit by the fanout guard; hydrator keeping up.
-4. **Planner policy** as pure functions over `stats` scans, unit-tested
-   against a replayed skewed-distribution sample — before Kafka or
-   hoglake wiring exists.
+4. **Startup drain time** against the worst staged backlog a pod may
+   restart with; it sizes the startup probe.
 
 ## Open questions
 
 - Decoder surface: JSON values at launch; schema-registry (Avro/Proto)
   decoding is a pluggable front, not a v1 requirement.
-- Whether `sched_size` earns its per-put maintenance cost or falls out
-  of the `stats` scan.
+- Whether a dead-letter store for unrepresentable records is worth its
+  cost (today they are dropped and counted).
 - Multi-topic fan-in per process vs. strict one-pipeline-per-pod at
   higher topic counts.
 - SlateDB checkpoint/clone as the disaster-recovery story for staged

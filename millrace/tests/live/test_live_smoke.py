@@ -20,6 +20,8 @@ pytestmark = pytest.mark.live
 
 async def test_s3_staging_smoke(lake_home, topic_factory):
     """Stage on s3:// (MinIO), close, reopen: durable, byte-exact."""
+    from slatedb.uniffi import ObjectStore
+
     from millrace.config import (
         SLATEDB_BLOCK_CACHE_BYTES_DEFAULT,
         SLATEDB_META_CACHE_BYTES_DEFAULT,
@@ -48,8 +50,9 @@ async def test_s3_staging_smoke(lake_home, topic_factory):
         )
         for i in range(50)
     ]
-    stage = await PartitionStage.open(
-        f"s3://{livekit.BUCKET}",
+    store = ObjectStore.resolve(f"s3://{livekit.BUCKET}")
+    stage = await PartitionStage.open_store(
+        store,
         path,
         topic=topic.name,
         partition=0,
@@ -61,8 +64,8 @@ async def test_s3_staging_smoke(lake_home, topic_factory):
     assert ack.rows == 50 and ack.first_offset == 0 and ack.last_offset == 49
     await stage.close()
 
-    reopened = await PartitionStage.open(
-        f"s3://{livekit.BUCKET}",
+    reopened = await PartitionStage.open_store(
+        store,
         path,
         topic=topic.name,
         partition=0,
@@ -71,18 +74,13 @@ async def test_s3_staging_smoke(lake_home, topic_factory):
         db_cache_id=db_cache_id_for(topic.name, 0),
     )
     try:
-        rows = [kv async for kv in reopened.scan_group_rows(("7",))]
-        assert len(rows) == 50
-        for i, (row_key, payload) in enumerate(rows):
+        # Discovery finds the group a previous process left staged.
+        assert await reopened.discover(now_us=base) == [("7",)]
+        scan = await reopened.scan(("7",), max_bytes=1 << 30, now_us=base)
+        assert scan.complete and len(scan.rows) == 50
+        for i, (row_key, payload) in enumerate(scan.rows):
             assert row_key.offset == i
             assert payload == livekit.event_payload(7, base + i, i)
-        stats = await reopened.iter_key_stats()
-        assert len(stats) == 1
-        assert stats[0].row_count == 50
-        recovery = await reopened.recover()
-        assert (
-            recovery.pending_prepared == () and recovery.legacy_markers_collected == 0
-        )
     finally:
         await reopened.close()
 

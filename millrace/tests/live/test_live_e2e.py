@@ -3,10 +3,10 @@
 Produce a seeded Zipf-skewed event stream to the live broker; the
 in-process pipeline (real consumer, real SlateDB-on-MinIO staging, real
 pyhoglake writer against the server built from this checkout) runs until
-everything is queryable. Then the reconciliation is EXACT: per-tenant
-row counts from the manifest equal the produced counts, and a full
-parquet readback carries exactly the produced ``seq`` set — no loss, no
-duplication, nothing extra.
+everything is queryable. Then the reconciliation is AT LEAST ONCE: every
+produced ``seq`` is queryable at least once (duplicates are allowed by
+contract), per-tenant row counts are at least the produced counts, and
+nothing that was never produced appears.
 """
 
 from __future__ import annotations
@@ -42,7 +42,6 @@ async def test_end_to_end_truth(lake_home, topic_factory, producer_factory, admi
         namespace="ns1",
         table=table.name,
         flush_deadline_s=FLUSH_DEADLINE_S,
-        flush_sweep_s=1,
     )
     async with livekit.Pipeline(cfg, sweep_s=0.5) as pipe:
         events = await asyncio.to_thread(
@@ -69,39 +68,35 @@ async def test_end_to_end_truth(lake_home, topic_factory, producer_factory, admi
 
         # ...and every staged row flushes to the lake. The age trigger
         # bounds the tail: deadline + sweep + commit + poll slack.
+        produced_seqs = [e.seq for e in events]
         await livekit.wait_until_async(
-            lambda: (
-                sum(livekit.lake_team_counts(table, lake_home.head()).values())
-                == EVENTS
+            lambda: livekit.all_landed(
+                table, lake_home.catalog, lake_home.fs, produced_seqs
             ),
             FLUSH_DEADLINE_S + 60,
             desc=f"all {EVENTS} events queryable in the lake",
         )
 
-        # Staging drains completely: nothing staged, no team left behind.
-        gauges = await pipe.stages.gauges()
-        assert gauges.staged_rows == 0, f"staging residue: {gauges}"
+        # Staging drains completely.
+        await livekit.wait_until_async(
+            lambda: pipe.stages.gauges().staged_groups == 0,
+            30,
+            desc=lambda: f"staging residue: {pipe.stages.gauges()}",
+        )
 
     head = lake_home.head()
 
-    # Metadata reconciliation (one file = one (team, month) tuple).
-    counts = livekit.lake_team_counts(table, head)
-    assert counts == produced_by_team, (
-        f"per-tenant mismatch: "
-        f"{[(t, produced_by_team[t], counts[t]) for t in sorted(produced_by_team) if produced_by_team[t] != counts[t]]}"
+    # At least once, per seq and per tenant.
+    seq_counts = await asyncio.to_thread(
+        livekit.lake_seq_counts, table, head, lake_home.fs
     )
-
-    # Full parquet readback: exactly the produced seq set, and every row
-    # carries its own team/timestamp.
-    rows = await asyncio.to_thread(livekit.lake_rows, table, head, lake_home.fs)
-    assert rows.num_rows == EVENTS
-    readback_seqs = set(rows.column("seq").to_pylist())
-    assert readback_seqs == {e.seq for e in events}
-    for team, ts in zip(
-        rows.column("team_id").to_pylist(), rows.column("timestamp").to_pylist()
-    ):
-        assert produced_by_team[team] > 0
-        assert ts is not None
+    livekit.assert_at_least_once(seq_counts, [e.seq for e in events])
+    counts = livekit.lake_team_counts(table, head)
+    assert all(counts[t] >= n for t, n in produced_by_team.items()), (
+        f"per-tenant shortfall: "
+        f"{[(t, n, counts[t]) for t, n in sorted(produced_by_team.items()) if counts[t] < n]}"
+    )
+    assert set(counts) == set(produced_by_team)
 
     # Every file lives under the live spec's partitions of THIS month.
     months = livekit.lake_month_partitions(table, head)

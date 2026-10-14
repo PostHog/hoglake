@@ -62,8 +62,6 @@ import livekit
 import pytest
 from livekit import MetricSamples, metric, metric_by_label, now_us
 
-from millrace.flush import REPREPARE_REASONS
-
 pytestmark = pytest.mark.live
 
 SOAK_ENV = "MILLRACE_SOAK_S"
@@ -71,8 +69,8 @@ PARTITIONS = 4
 RATE = 200.0  # events/s per topic
 TEAMS = (3, 7, 11, 19, 42, 64)
 DAY_US = 86_400 * livekit.MICROS_PER_SECOND
-# The second month: 20 days back sits inside the 30 d junk window and,
-# from any date, in a different month half the time — so the run spans
+# The second month: 20 days back is, from any date, in a different month
+# half the time — so the run spans
 # two months whatever day it runs (≥ 2 distinct months either way).
 MONTH_SHIFT_US = 20 * DAY_US
 LATE_SHARE = 0.3  # payload time steps BACK within a team this often
@@ -80,8 +78,6 @@ LATE_MAX_S = 900
 MALFORMED_SHARE = 0.01  # half non-JSON values, half tombstones
 SCRAPE_EVERY_S = 15.0
 FLUSH_DEADLINE_S = 30
-FLUSH_SWEEP_S = 2
-RECOVERY_WINDOW_S = 30.0  # after the restart is ready: recovery's own
 DRAIN_TIMEOUT_S = 4 * FLUSH_DEADLINE_S + 240
 
 DROP_REASONS = (
@@ -89,7 +85,6 @@ DROP_REASONS = (
     "missing_value",
     "malformed_partition_source",
     "invalid_offset",
-    "event_time_out_of_window",
 )
 _LOG_LEVEL = re.compile(r"\b(WARNING|WARN|ERROR|CRITICAL)\b")
 _LOG_NORMALIZE = re.compile(r"\d+")
@@ -97,12 +92,9 @@ _LOG_NORMALIZE = re.compile(r"\d+")
 C_CONSUMED = "millrace_messages_consumed_total"
 C_DROPPED = "millrace_records_dropped_total"
 C_COMMITS = "millrace_flushes_committed_total"
-C_DEDUPED = "millrace_flush_deduped_total"
-C_REPLAYS = "millrace_prepared_replays_total"
-C_REPREPARED = "millrace_prepared_reprepared_total"
+C_FAILURES = "millrace_flush_failures_total"
 C_ORPHANED = "millrace_flush_orphaned_uploads_total"
-C_UNRESOLVED = "millrace_flush_unresolved_uploads_total"
-C_SETTLED = "millrace_receipt_settlements_total"
+G_STUCK = "millrace_flush_groups_stuck"
 G_BYTES = "millrace_staged_bytes"
 G_ROWS = "millrace_staged_rows"
 G_GROUPS = "millrace_staged_groups"
@@ -120,12 +112,9 @@ CSV_COLUMNS = [
     "staged_groups",
     "oldest_eligible_age_s",
     "flushes_committed",
-    "flush_deduped",
-    "prepared_replays",
-    *(f"reprepared_{r}" for r in REPREPARE_REASONS),
+    "flush_failures",
+    "groups_stuck",
     "orphaned_uploads",
-    "unresolved_uploads",
-    "receipt_settlements",
     "rss_bytes",
     "healthz",
     "readyz",
@@ -238,7 +227,6 @@ class Incarnation:
     ready_at: float = 0.0
     last: MetricSamples | None = None
     prekill: MetricSamples | None = None
-    recovery: MetricSamples | None = None  # first scrape ≥ RECOVERY_WINDOW_S in
     max_staged_bytes: float = 0.0
     max_oldest_s: float = 0.0
     rss_min: int | None = None
@@ -368,12 +356,6 @@ def _scrape(report: Report, inc: Incarnation, phase: str) -> MetricSamples | Non
         inc.scrape_errors += 1
     else:
         inc.last = samples
-        if (
-            inc.recovery is None
-            and inc.ready_at
-            and time.monotonic() - inc.ready_at >= RECOVERY_WINDOW_S
-        ):
-            inc.recovery = samples
         drops = inc.drops(samples)
         staged_bytes = metric(samples, G_BYTES)
         oldest = metric(samples, G_OLDEST)
@@ -381,7 +363,6 @@ def _scrape(report: Report, inc: Incarnation, phase: str) -> MetricSamples | Non
             inc.gauges_absent += 1
         inc.max_staged_bytes = max(inc.max_staged_bytes, staged_bytes or 0.0)
         inc.max_oldest_s = max(inc.max_oldest_s, oldest or 0.0)
-        reprepared = metric_by_label(samples, C_REPREPARED, "reason")
         values.update(
             {
                 "consumed": int(inc.counter(samples, C_CONSUMED)),
@@ -394,15 +375,9 @@ def _scrape(report: Report, inc: Incarnation, phase: str) -> MetricSamples | Non
                 "staged_groups": metric(samples, G_GROUPS),
                 "oldest_eligible_age_s": oldest,
                 "flushes_committed": int(inc.counter(samples, C_COMMITS)),
-                "flush_deduped": int(inc.counter(samples, C_DEDUPED)),
-                "prepared_replays": int(inc.counter(samples, C_REPLAYS)),
-                **{
-                    f"reprepared_{r}": int(reprepared.get(r, 0))
-                    for r in REPREPARE_REASONS
-                },
+                "flush_failures": int(inc.counter(samples, C_FAILURES)),
+                "groups_stuck": metric(samples, G_STUCK),
                 "orphaned_uploads": int(inc.counter(samples, C_ORPHANED)),
-                "unresolved_uploads": int(inc.counter(samples, C_UNRESOLVED)),
-                "receipt_settlements": int(inc.counter(samples, C_SETTLED)),
             }
         )
     report.row(values)
@@ -444,7 +419,10 @@ def test_soak(lake_home, topic_factory, admin):
             namespace="ns1",
             table=table.name,
             flush_deadline_s=FLUSH_DEADLINE_S,
-            flush_sweep_s=FLUSH_SWEEP_S,
+            # Children tune only through env and the age lane's 1 MiB
+            # floor is a constant: slow == age makes every group due at
+            # the deadline.
+            slow_lane_deadline_s=FLUSH_DEADLINE_S,
         )
         streams.append(
             Stream(
@@ -655,40 +633,28 @@ def test_soak(lake_home, topic_factory, admin):
                 double_counted = sum(final_drops.values()) - sum(
                     expected_drops.values()
                 )
-            # Orphaned / unresolved: zero everywhere except what the
-            # restarted incarnation's recovery reports in its first
-            # RECOVERY_WINDOW_S (kill-attributable); no growth after that.
+            # No orphans (a killed process counts none of its own) and no
+            # stuck groups anywhere.
             for inc in stream.incarnations:
                 samples = inc.prekill if inc.prekill is not None else inc.last
                 orphaned = inc.counter(samples, C_ORPHANED)
-                unresolved = inc.counter(samples, C_UNRESOLVED)
-                restarted = inc is not stream.incarnations[0]
-                if not restarted:
-                    if orphaned or unresolved:
-                        failures.append(
-                            f"{inc.name}: orphaned={orphaned} unresolved="
-                            f"{unresolved} with no kill to attribute them to"
-                        )
-                elif inc.recovery is not None:
-                    grew = (
-                        orphaned - inc.counter(inc.recovery, C_ORPHANED),
-                        unresolved - inc.counter(inc.recovery, C_UNRESOLVED),
-                    )
-                    if any(grew):
-                        failures.append(
-                            f"{inc.name}: orphaned/unresolved grew by {grew} after "
-                            f"the {RECOVERY_WINDOW_S:.0f}s recovery window"
-                        )
+                if orphaned:
+                    failures.append(f"{inc.name}: orphaned={orphaned}")
+                if samples is not None and (metric(samples, G_STUCK) or 0) > 0:
+                    failures.append(f"{inc.name}: stuck flush groups at the end")
             for inc in stream.incarnations:
                 if (
                     "HALTED" in inc.child.output()
                     or "FlushHalted" in inc.child.output()
                 ):
                     failures.append(f"{inc.name}: FlushHalted in its output")
-                if inc.max_oldest_s > slow_lane_s:
+                # A due group's age keeps growing for the sweep and the
+                # flush that serve it: one more deadline of slack.
+                if inc.max_oldest_s > slow_lane_s + FLUSH_DEADLINE_S:
                     failures.append(
                         f"{inc.name}: oldest eligible age {inc.max_oldest_s:.0f}s "
-                        f"exceeded MILLRACE_SLOW_LANE_DEADLINE_S={slow_lane_s:.0f}"
+                        f"exceeded MILLRACE_SLOW_LANE_DEADLINE_S={slow_lane_s:.0f} "
+                        f"+ {FLUSH_DEADLINE_S}s"
                     )
             cur = stream.current
             alive = cur.child.proc is not None and cur.child.proc.poll() is None
@@ -775,23 +741,19 @@ def _summary(
         "## Per child incarnation (final scrape; the killed one: its last pre-kill scrape)",
         "",
         (
-            "| child | commits | deduped | replays | re-prepared "
-            "| receipt settlements | orphaned | unresolved | max staged MiB "
+            "| child | commits | flush failures | orphaned | max staged MiB "
             "| max oldest eligible s | RSS min MiB | RSS max MiB "
             "| scrapes (errors / gauges absent) |"
         ),
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
     for stream in streams:
         for inc in stream.incarnations:
             s = inc.prekill if inc.prekill is not None else inc.last
-            reprepared = metric_by_label(s, C_REPREPARED, "reason") if s else {}
             out.append(
                 f"| {inc.name} | {int(inc.counter(s, C_COMMITS))} "
-                f"| {int(inc.counter(s, C_DEDUPED))} | {int(inc.counter(s, C_REPLAYS))} "
-                f"| { ({k: int(v) for k, v in reprepared.items()}) } "
-                f"| {int(inc.counter(s, C_SETTLED))} | {int(inc.counter(s, C_ORPHANED))} "
-                f"| {int(inc.counter(s, C_UNRESOLVED))} | {mib(inc.max_staged_bytes)} "
+                f"| {int(inc.counter(s, C_FAILURES))} "
+                f"| {int(inc.counter(s, C_ORPHANED))} | {mib(inc.max_staged_bytes)} "
                 f"| {inc.max_oldest_s:.1f} | {mib(inc.rss_min)} | {mib(inc.rss_max)} "
                 f"| {inc.scrapes} ({inc.scrape_errors} / {inc.gauges_absent}) |"
             )

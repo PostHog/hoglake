@@ -17,25 +17,17 @@ The scripted endpoints, exactly the set the flusher may call:
   shape cache's TTL (once per flusher);
 - ``POST /v1/catalogs/{c}/commit/prepared`` — the commit (scripted per
   call: a snapshot, a typed refusal, or a dropped connection);
-- ``GET /v1/catalogs/{c}/commit/receipts/{key}`` — the receipt lookup
-  (200 with the receipt, or 404), served by ONE :class:`ReceiptServer`
-  per test: a key scripted with :func:`script_receipt` answers its
-  scripted responses in order, any other key answers 404 (a window
-  that never landed — every fresh build looks its key up before it
-  builds) and every lookup is recorded.
 
 pytest-httpx fails a test at teardown for registered-but-unconsumed
 responses, so the scriptors below register exactly what a correct
 flusher consumes — a superfluous request reddens the test as surely as
-a missing one (receipts: the suite's autouse fixture asserts every
-scripted receipt was consumed).
+a missing one.
 """
 
 from __future__ import annotations
 
 import io
 import json
-import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -43,12 +35,7 @@ import httpx
 import pyarrow as pa
 from stagekit import NOW
 
-from millrace import keyspace
-from millrace.config import (
-    Config,
-    EventTimePolicy,
-)
-from millrace.stage import PartitionStage
+from millrace.config import Config
 
 BASE = "http://hog.test"
 CATALOG = "cat"
@@ -65,7 +52,6 @@ NAMESPACES_URL = f"{CATALOG_URL}/namespaces"
 TABLE_URL = f"{CATALOG_URL}/namespaces/{NAMESPACE}/tables/{TABLE}"
 OPTIONS_URL = f"{CATALOG_URL}/options"
 PREPARED_URL = f"{CATALOG_URL}/commit/prepared"
-RECEIPTS_URL = f"{CATALOG_URL}/commit/receipts"
 
 #: The destination table's columns: team_id (the identity partition
 #: source), timestamp (the month partition source — event time, epoch
@@ -186,85 +172,13 @@ def script_table_refresh(
     )
 
 
-class ReceiptServer:
-    """The scripted ``GET .../commit/receipts/{key}``: one reusable
-    registration for every key (pytest-httpx prefers the first
-    never-matched registration, so per-key registrations would shadow a
-    catch-all). A key scripted with :meth:`script` answers its scripted
-    steps in order; any other lookup answers 404 — the receipt of a
-    window that never landed, which every fresh build asks for before
-    it builds. ``lookups`` records every key asked for, in order."""
-
-    def __init__(self, httpx_mock: Any) -> None:
-        self._scripted: dict[str, list[Any]] = {}
-        self.lookups: list[str] = []
-        httpx_mock.add_callback(
-            self._answer,
-            method="GET",
-            url=re.compile(re.escape(RECEIPTS_URL) + "/.+"),
-            is_reusable=True,
-            is_optional=True,
-        )
-
-    def script(self, idempotency_key: str, snapshot_id: Any) -> None:
-        """One scripted answer: a snapshot id (200), None (404), an
-        ``httpx.Response`` (answered as is) or an ``httpx.HTTPError``
-        (raised: a transport failure)."""
-        self._scripted.setdefault(idempotency_key, []).append(snapshot_id)
-
-    def unconsumed(self) -> dict[str, list[Any]]:
-        return {k: v for k, v in self._scripted.items() if v}
-
-    def _answer(self, request: httpx.Request) -> httpx.Response:
-        key = request.url.path.rsplit("/", 1)[-1]
-        self.lookups.append(key)
-        queue = self._scripted.get(key)
-        snapshot_id = queue.pop(0) if queue else None
-        if isinstance(snapshot_id, httpx.Response):
-            return snapshot_id
-        if isinstance(snapshot_id, httpx.HTTPError):
-            raise snapshot_id
-        if snapshot_id is None:
-            return httpx.Response(
-                404, json={"error": "not_found", "detail": "no receipt for that key"}
-            )
-        return httpx.Response(
-            200,
-            json={
-                "operation_id": key,
-                "snapshot_id": snapshot_id,
-                "schema_version": SCHEMA_VERSION,
-            },
-        )
-
-
-def receipt_server(httpx_mock: Any) -> ReceiptServer:
-    """The test's one :class:`ReceiptServer` (created on first use and
-    kept on the test's ``httpx_mock``)."""
-    server = getattr(httpx_mock, "_millrace_receipts", None)
-    if server is None:
-        server = ReceiptServer(httpx_mock)
-        httpx_mock._millrace_receipts = server
-    return server
-
-
-def script_receipt(
-    httpx_mock: Any, idempotency_key: str, *, snapshot_id: int | None
-) -> None:
-    """A receipt lookup: 404 (never landed) when ``snapshot_id`` is None,
-    else the durable 200 receipt. Consumed in order per key; a key
-    asked for past its script answers 404."""
-    receipt_server(httpx_mock).script(idempotency_key, snapshot_id)
-
-
 class CommitCapture:
     """The scripted ``POST .../commit/prepared``: one scripted step per
     request, and every request's raw bytes captured.
 
     A step is a ``httpx.Response`` to answer or an ``httpx.HTTPError`` to
-    raise (the dropped-connection / timeout case — the ambiguous one the
-    persisted request exists for). Over-running the script is a test
-    bug, not a 500.
+    raise (the dropped-connection / timeout case). Over-running the
+    script is a test bug, not a 500.
 
     ONE capture per test (``:meth:`extend`` to append steps between
     flushes): pytest-httpx prefers the first never-matched registration,
@@ -403,15 +317,11 @@ def make_config(**overrides: Any) -> Config:
         "table": TABLE,
         "stage_store_url": "memory:///",
         "stage_base_path": "millrace",
-        "target_output_bytes": 128 * 1024 * 1024,
+        "flush_bytes": 64 * 1024 * 1024,
         "flush_deadline_s": 900,
         "slow_lane_deadline_s": 21600,
-        "min_flush_bytes": 1024 * 1024,
-        "max_files_per_commit": 512,
         "consume_batch_size": 100,
         "poll_timeout_ms": 50,
-        "event_time_policy": EventTimePolicy.DROP,
-        "metrics_port": 8000,
     }
     return Config(**{**base, **overrides})
 
@@ -450,38 +360,6 @@ def team_group(team: int, ts_us: int = NOW) -> tuple[str | None, ...]:
 def team_label(team: int, ts_us: int = NOW) -> str:
     """The human form of :func:`team_group` (``team_id=7/timestamp_month=…``)."""
     return f"team_id={team}/timestamp_month={month_wire(ts_us)}"
-
-
-def decision(
-    group: int | tuple[str | None, ...],
-    *,
-    trigger: str = "size",
-    staged_bytes: int = 1,
-    first_staged_ts: int,
-    age_us: int = 0,
-) -> Any:
-    """One planner decision; an int names the team's default-spec group
-    (:func:`team_group`)."""
-    from millrace.planner import FlushDecision
-
-    return FlushDecision(
-        group=team_group(group) if isinstance(group, int) else group,
-        trigger=trigger,  # type: ignore[arg-type]
-        staged_bytes=staged_bytes,
-        first_staged_ts=first_staged_ts,
-        age_us=age_us,
-    )
-
-
-async def read_markers(stage: PartitionStage) -> list[tuple[bytes, bytes]]:
-    """Every ``flushed/`` key, raw and white-box. Nothing writes this
-    prefix any more (settlement is one atomic transaction with the
-    receipt in hand — a marker could only restate both), so every
-    assertion against this helper is an emptiness pin or a legacy
-    collection check."""
-    return [
-        (kv.key, kv.value) for kv in await stage._scan_prefix(keyspace.FLUSHED_PREFIX)
-    ]
 
 
 def parquet_rows(store: FakeObjectStore, uri: str) -> pa.Table:

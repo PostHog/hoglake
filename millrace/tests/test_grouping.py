@@ -235,6 +235,16 @@ PARITY_DOCS: list[dict[str, Any]] = [
     {"a": None},  # every source null (or absent)
     {"dec": "-0"},  # negative zero: Arrow's unscaled 0 renders 0.00
     {"dec": "-0.0", "f": -0.0, "i": -0},
+    # Outside years 1-9999: clamped identically on both sides, never an
+    # OverflowError in the keyer's transforms.
+    {
+        "ts": 10**20,
+        "tz": "10000-01-01T00:00:00",
+        "tms": -(10**15),
+        "tmsec": 10**20,
+        "ns": 10**25,
+    },
+    {"ts": "0000-06-01T00:00:00", "tz": -(10**20), "tms": 10**15, "ns": -(10**25)},
 ]
 
 
@@ -361,3 +371,33 @@ def test_a_struct_leaf_sources_tuple_is_the_flush_fanouts_tuple(spec, doc):
     assert table.partition_spec is not None
     ((fanout_tuple, _),) = flush._partition_groups(encoded, table, table.partition_spec)
     assert group == fanout_tuple
+
+
+@pytest.mark.parametrize(
+    ("ts", "month", "day"),
+    [
+        # Year 10000 as epoch micros: clamped to 9999-12-31 (month index
+        # (9999-1970)*12+11, day index of 9999-12-31).
+        (253_402_300_800_000_000, "96359", "2932896"),
+        # Year 0 as epoch micros: clamped to 0001-01-01.
+        (-62_167_219_200_000_000, "-23628", "-719162"),
+    ],
+)
+def test_an_out_of_range_partition_source_is_staged_under_the_clamped_tuple(
+    ts: int, month: str, day: str
+) -> None:
+    from millrace.consumer import classify_message
+    from millrace.stage import StagedRecord
+
+    cols = [{"name": "ts", "type": "timestamptz", "field_id": 1, "ordinal": 0}]
+    table = info([(1, "month", None), (1, "day", None)], cols)
+    payload = json.dumps({"ts": ts}).encode()
+    outcome = classify_message(GroupKeyer(table), offset=3, value=payload)
+    assert isinstance(outcome, StagedRecord)
+    assert outcome.group == (month, day)
+    # The flush files it under the same tuple.
+    record = flush.JsonObjectDecoder(table.columns).decode_record(payload)
+    _, encoded = flush._build_batch([record], table.columns)
+    assert table.partition_spec is not None
+    ((fanout_tuple, _),) = flush._partition_groups(encoded, table, table.partition_spec)
+    assert fanout_tuple == (month, day)

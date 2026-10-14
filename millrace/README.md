@@ -1,180 +1,77 @@
 # millrace
 
-Kafka → hoglake ingestion daemon with SlateDB staging: consume a topic,
-stage rows in an embedded, object-storage-native LSM keyed by the
-destination table's partition tuple (computed per record from the JSON
-payload under the table's live partition spec), and flush per tuple on
-size/age readiness into parquet + prepared commits — one file per tuple
-in the steady state. At-least-once end to end — Kafka offsets commit strictly after
-durable staging; staged ranges delete strictly after a commit receipt.
-The receipt dedupe rests on server-side receipts, which are purged
-(`HOGLAKE_RECEIPT_RETENTION_SECONDS`, default 7 d — floored per catalog
-at twice its snapshot retention, capped at 30 d): a persisted request
-whose receipt 404s is replayed verbatim whatever its age. Past the
-receipt retention the replay's read snapshot is normally below the
-catalog's expiry floor, so it is answered 410 and re-prepared from the
-staged rows; if the first attempt had landed, the window lands a second
-time (duplicate rows). That is accepted at-least-once behaviour and is
-counted (`millrace_prepared_reprepared_total`,
-`millrace_prepared_replays_total`; the dropped entry's objects, possibly
-live, in `millrace_flush_unresolved_uploads_total`). Rows are staged
-under `(partition tuple, offset)`. The idempotency key includes a
-SHA-256 of the window's rows, and a fresh flush looks it up before it
-builds: offsets re-consumed below the settled floor settle from a
-published window's receipt only when the rebuilt window has the same
-group, bounds and rows and the receipt still exists
-(`millrace_flush_deduped_total` — nonzero means a rewind re-staged
-identical data); otherwise they publish as a new commit and the shared
-rows land twice. Details:
-[architecture.md](architecture.md) §1 and §6.
+Kafka → hoglake ingestion with durable SlateDB staging. One process
+consumes one topic into one table: each record is staged in a
+per-partition SlateDB instance on object storage under its destination
+partition tuple, and a flush loop turns each due tuple's staged rows
+into parquet and hoglake commits.
 
-Design: [docs/kafka-ingestion.md](../docs/kafka-ingestion.md).
-Build/test sequence: [docs/kafka-ingestion-plan.md](../docs/kafka-ingestion-plan.md).
+**Contract: at-least-once.** A Kafka offset commits only after its
+record is durable in staging (or was dropped as unrepresentable, and
+counted). A staged row is deleted only after every commit naming it
+succeeded. Duplicates are accepted (a crash between a commit and the
+staged-row delete, a Kafka rewind); loss is not.
 
-Status: Phase 5 — `destination.py` (create-if-missing catalog, namespace, table), `keyspace.py` (staging key codecs, side prefixes,
-idempotency-key derivation),
-`planner.py` (pure per-key flush decisions: the size/age/slow
-three-lane policy behind a policy seam), `grouping.py` (the
-partition-tuple keyer: payload → the destination's partition tuple; it
-reads struct-leaf sources such as `properties.team_id` by path),
-`coerce.py` (the per-column JSON coercers the keyer and the flush decoder
-share: scalars, `json` and `struct`/`list`/`map` at any depth; a
-`variant` column is a startup refusal, as pyarrow cannot write the
-native Parquet VARIANT annotation), `stage.py`
-(the per-partition SlateDB staging layer:
-`PartitionStage` + `StageManager`), `consumer.py` (the consume loop:
-the ordinal's partitions derived once at start from the topic's
-partition count and claimed via `StageManager.sync_assignment`,
-poll → stage → commit with offsets strictly after durable staging and
-the poll's per-partition stage batches overlapped (one WAL durability
-wait per partition, in flight together), staging under the partition
-tuple with the keyer re-read on the flusher's shape TTL (the Kafka key
-is never read), the FENCED halt below, malformed-record drops), `flush.py`
-(the flush
-loop: planner-driven sweeps, staged range → Arrow → live-spec partition
-fanout (a fanout past `MILLRACE_MAX_FILES_PER_COMMIT` halts
-`fanout_exceeds_commit_bound`; there is no commit chunking) →
-parquet → persisted prepared commit → settle, the day-one wire contract
-(`read_snapshot` + `expected_table_uuid` pinned at the startup
-resolve — a later uuid change halts `table_recreated`, `totals=false`
-identity reads, retention/4 shape cache), the full refusal taxonomy
-(a 409 `commit_conflict` resends the identical bytes up to 5 attempts,
-then `FlushPublishExhausted`) with pinned
-recoveries, byte-identical replay of persisted requests, receipt-based
-recovery handoff, junk `event_time` clamp/drop, orphan
-accounting), `maintenance.py` (the external GC + compaction-debt
-service, `python -m millrace.maintenance`, deployed beside the
-replicas — writers shed the embedded GC by default
-(`MILLRACE_SLATEDB_GC_ENABLED=false`) because this service owns
-collection, and must never disable `compactor_options`;
-docs/kafka-ingestion.md §Maintenance services),
-`main.py` + `server.py` (the process entry point: env →
-config → StageManager → consumer + flusher + FlushRunner on one asyncio
-loop, plus the `/metrics` `/healthz` `/readyz` surface; halt exit code
-3, fenced exit code 4)
-are implemented and tested. The live docker suite (`tests/live/`,
-marker `live`, run by `ci/live-millrace.sh`) covers the ten Phase 5
-scenarios: end-to-end truth with exact per-tenant reconciliation,
-kill -9 mid-flush, the lost commit response (an in-test TCP proxy drops
-the response AFTER the server commits), static reassignment between
-deploys and the two-replica ordinal split, junk `event_time` drop, whale overload + tail
-freshness, the freshness SLA measurement, the DDL race, drop+recreate
-incarnation halt, a compaction observation, and flush progress with
-the stage store behind S3-like latency (toxiproxy). Code-level map:
-[architecture.md](architecture.md).
+Code map and invariants: [architecture.md](architecture.md). Design:
+[docs/kafka-ingestion.md](../docs/kafka-ingestion.md).
 
-- `just millrace unit` — unit + component tests (pytest, `memory:///`)
+- `just millrace unit` — unit + component tests (`memory:///`)
 - `just millrace test` — the whole non-live suite, including `file:///`
   integration (durability across hard kill, contested-open fencing)
 - `just millrace lint` — ruff check/format + mypy
-- `just millrace live` — the live docker stack suite
-  (`.artifacts/live-millrace/`); fails on a missing/empty/skipped/failed
-  report, wired into CI as the `live-millrace` job of the reusable
-  `python-live.yml` workflow
+- `just millrace mutants` — the mutation gate over keyspace.py and
+  planner.py (tests/MUTATION_TESTING.md)
+- `just millrace live` — the live docker suite (`.artifacts/live-millrace/`)
 
-The live soak (`tests/live/test_live_soak.py`) is deselected unless
-`MILLRACE_SOAK_S` names a duration in seconds, so the CI suite never
-runs it. It drives two `millrace.main` children (the flat `events` table
-and the nested table, one topic each, ~200 events/s per topic with ~1 %
-malformed records), `kill -9`s and restarts one halfway, and checks
-completeness by `seq`, exact drop accounting across the kill, drain,
-probes and the oldest-eligible age. Run it alone through the harness,
-which passes `MILLRACE_LIVE_PYTEST_ARGS` to pytest:
+The live soak (`tests/live/test_live_soak.py`) runs only when
+`MILLRACE_SOAK_S` names a duration:
 `MILLRACE_SOAK_S=1800 MILLRACE_LIVE_PYTEST_ARGS="-k soak -s" just millrace live`.
-It writes `soak-metrics.csv` (a `/metrics` + RSS + probe row per child
-every 15 s), `soak-warnings.log` and `soak-summary.md` to the report dir
-(`$HOGLAKE_LIVE_MILLRACE_REPORT_DIR`, default `.artifacts/live-millrace/`).
 
 ## Image
 
 `millrace/Dockerfile` builds `ghcr.io/posthog/hoglake-millrace`: one
 image, two entrypoints. The default (`millrace`) is the pipeline; the
-maintenance service runs as `python -m millrace.maintenance`. Both read
-only environment and refuse at config (exit 2) when it is empty, which
-is the image's smoke test. The build context is the repo root because
-pyhoglake is installed from the sibling tree, so the image ships the
-client from the same commit as the daemon. Non-root (uid 10001), no
-`.venv`, nothing written outside `/work` and `/tmp`.
+SlateDB GC service runs as `python -m millrace.maintenance`. Both refuse
+an empty environment with exit 2 (the image smoke test). Non-root
+(uid 10001), nothing written outside `/work` and `/tmp`.
+`.github/workflows/millrace-image.yml` builds on every PR and publishes
+on every main push, tagged `r<UTC build minute>-<sha6>`, by sha and
+`latest`.
 
-`.github/workflows/millrace-image.yml` builds and smokes the image on
-every PR and publishes it on every main push, multi-arch, tagged
-`r<UTC build minute>-<sha6>` for Kargo (whose Warehouse admits it as
-Freight by that tag plus the `org.opencontainers.image.revision` and
-`.source` index annotations), by commit sha, and `latest`. Nothing is
-dispatched to PostHog/charts; delivery is Kargo's.
+## Configuration
+
+The knob table is in [config.py](millrace/config.py)'s module docstring
+and [architecture.md §7](architecture.md#7-configuration). The ones that
+shape behavior:
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `MILLRACE_FLUSH_BYTES` | 256 MiB | staged bytes per flush decision: the size lane fires at it and one scan reads at most it (always ≥ 1 row). Compaction owns final file sizing |
+| `MILLRACE_FLUSH_DEADLINE_S` | 900 | a group at least this old with ≥ 1 MiB staged flushes |
+| `MILLRACE_SLOW_LANE_DEADLINE_S` | 21600 | any group this old flushes |
+| `MILLRACE_KAFKA_AUTO_OFFSET_RESET` | `latest` | where a partition with no committed offset starts |
 
 ## Destination
 
-Millrace creates its destination the way millpond does: from
-configuration, at startup, before the flusher resolves and pins it
-(`destination.py:ensure_destination`, called from `main.py` ahead of
-`HoglakeFlusher.resolve`). The constraint that shapes this: the
-partition tuple is millrace's staging key, and millrace drops unknown
-payload keys with no schema evolution — so the spec and every column it
-reads must exist before the first record is staged, from a COMPLETE
-configured shape, never inferred from a first batch.
+Created from configuration at startup when missing
+(`destination.py:ensure_destination`), never inferred from data: the
+partition tuple is the staging key and unknown payload keys are dropped
+(no schema evolution), so the spec and every column must exist before
+the first record is staged.
 
 | Knob | Used when | Value |
 |---|---|---|
-| `MILLRACE_CATALOG_DATA_PATH` | the catalog does not exist | the catalog's `data_path`, `s3://bucket/prefix/` (validated like `MILLRACE_STAGE_URL`'s s3 form; a different bucket from the staging root — the lake role's prefix-scoped grants would let SlateDB half-write a staging root into the lake bucket) |
-| `MILLRACE_TABLE_COLUMNS` | the table does not exist | the complete typed column list, `name:type,…` with hoglake type names (`long`, `int`, `double`, `string`, `uuid`, `timestamptz`, `timestamp`, `date`, `boolean`, `json`, `decimal(p,s)`, …). All nullable. Nested types, `variant`, duplicates and the `_hog` prefix are refused |
-| `MILLRACE_PARTITION_BY` | the table does not exist (creation); the table exists (agreement check) | millpond's `HOGLAKE_PARTITION_BY` grammar: `col`, `identity(col)`, `year|month|day|hour(col)`, `bucket(col, N)`, comma separated |
-| `MILLRACE_SORT_BY` | same | a superset of millpond's `MILLPOND_SORT_BY` grammar: comma-separated `col [asc|desc] [nulls_first|nulls_last]`, default `asc nulls_last` (a bare millpond value parses identically) |
+| `MILLRACE_CATALOG_DATA_PATH` | the catalog does not exist | `s3://bucket/prefix/`; a different bucket from `MILLRACE_STAGE_URL` (same bucket is refused) |
+| `MILLRACE_TABLE_COLUMNS` | the table does not exist | the complete column list `name:type,…` (all nullable; nested, `variant`, duplicates and `_hog*` refused) |
+| `MILLRACE_PARTITION_BY` | creation; compared with an existing table | `col`, `identity(col)`, `year/month/day/hour(col)`, `bucket(col, N)` |
+| `MILLRACE_SORT_BY` | same | `col [asc|desc] [nulls_first|nulls_last]`, … |
 
-What happens at startup, in order:
-
-1. **Catalog.** `GET` it; on 404 create it with `MILLRACE_CATALOG_DATA_PATH`.
-   Unset, the process refuses to start (exit 2, the knob named). An
-   existing catalog whose data path differs from the knob logs a
-   WARNING and continues — a catalog's data path is immutable.
-2. **Namespace.** Same create-if-missing.
-3. **Table.** On 404, `MILLRACE_TABLE_COLUMNS` is required (exit 2
-   otherwise) and the table is created in ONE atomic request —
-   columns, partition spec and sort order together, through the
-   server's table-creations operation (pyhoglake
-   `Namespace.create_table(partition_fields=…, sort_fields=…)`).
-   When `MILLRACE_PARTITION_BY` is set millrace REQUIRES the catalog to
-   advertise `atomic-partitioned-table-creation-v1`, and when
-   `MILLRACE_SORT_BY` is set `atomic-sorted-table-creation-v1`, and
-   refuses to start (exit 1, the capability named) otherwise: it never
-   takes pyhoglake's create + alter fallback, because a sibling replica
-   reading the table between the two requests would stage under an
-   empty spec for a shape-cache TTL. A columns-only table takes the
-   plain create. An existing table that agrees with the configuration
-   logs one INFO line, so every replica's path is visible.
-4. **Agreement.** When the table exists, the live columns, partition
-   spec and sort order are compared with whatever is configured; every
-   difference goes into ONE WARNING carrying both sides in the knobs'
-   own grammar. The live table wins: millrace never alters an existing
-   table.
-
-One INFO line per created object. The replica race is tolerated at
-every step: a StatefulSet's pods boot together, the loser's create
-answers already-exists (for the atomic table create, a `target_exists`
-receipt surfaced as the same error) and it re-reads what the winner
-made.
-
-Recommended dev shape:
+Catalog, namespace and table are each created if missing; the table in
+one atomic request (columns, spec and sort together; millrace requires
+the server's atomic-creation capabilities rather than create + alter).
+An existing object is never altered: a difference from the
+configuration is one WARNING carrying both sides. The replica race is
+tolerated (the loser re-reads). Recommended dev shape:
 
 ```
 MILLRACE_CATALOG_DATA_PATH=s3://posthog-gigahog-mw-dev/millrace/millrace-dev/
@@ -183,287 +80,122 @@ MILLRACE_PARTITION_BY=identity(team_id),day(timestamp)
 MILLRACE_SORT_BY=timestamp
 ```
 
-`MILLRACE_STAGE_URL` must point at a DIFFERENT bucket from the data
-path (`s3://<stage-bucket>/millrace`): the same bucket is refused at
-boot.
+## Startup drain and probes
 
-With `MILLRACE_TABLE_COLUMNS` set, every `MILLRACE_PARTITION_BY` source
-and `MILLRACE_SORT_BY` column must be a configured column and each
-transform valid for its type (checked at boot, all problems at once,
-so the create cannot 422). Without it, the two are only compared
-against an existing table.
+On start each replica opens its partitions' SlateDB instances, finds
+every group that still has staged rows, and **flushes all of them before
+it consumes anything new**. Staged state therefore never outlives a
+process; that is what lets group sizes and ages live in memory only. A
+crash mid-drain drains again on restart (windows that already landed
+land again: duplicates, accepted).
 
-## Staging format
+- `/readyz` answers 503 for the whole drain, then 200 once the consumer
+  is assigned. `millrace_draining` is 1 meanwhile.
+- **The startup probe must allow for the drain.** Drain time grows with
+  the staged backlog (roughly staged bytes ÷ flush throughput; minutes
+  after a long hoglake outage). The chart sets the startup probe; size
+  its `failureThreshold × periodSeconds` to the worst backlog you are
+  willing to drain, or the kubelet restarts the pod mid-drain (safe,
+  but it starts over). Liveness stays 200 during the drain.
+- A StatefulSet rollout waits on readiness pod by pod, so a long drain
+  slows the rollout; Kafka lag grows meanwhile (durable, at-least-once).
+- A group that keeps failing during the drain (see "Stuck groups")
+  does not block it: the drain finishes when every group is flushed or
+  stuck, and stuck groups keep retrying while the pod consumes.
+- `/healthz` 503s once a terminal condition latches: the destination
+  was recreated (exit 3) or a stage was fenced (exit 4).
 
-The staging keyspace shares no key or value shape with the #331-era
-team-keyed layout, so millrace needs a fresh staging root (a new
-`MILLRACE_STAGE_URL` prefix).
+## Stuck groups
+
+Any flush failure leaves the rows staged and retries the group with
+backoff (2 s doubling to 120 s). A server refusal of a payload (400/422)
+is handled the same way. After 3 consecutive failures the group is
+logged at ERROR (`flush STUCK: …`), `millrace_flush_groups_stuck_total`
+increments and `millrace_flush_groups_stuck` counts it until it
+succeeds; other groups keep flushing. Alert on the gauge. Refusals are
+counted by status in `millrace_flush_commit_refusals_total{status}`.
 
 ## Assignment, rollouts and fencing
 
-Partition assignment is static and derived, millpond's model: a
-StatefulSet of `MILLRACE_REPLICA_COUNT` replicas, each pod's ordinal
-parsed from the trailing `-<n>` of `POD_NAME` (the downward API;
-`HOSTNAME` is the fallback), and at start each replica reads the
-topic's partition count from Kafka metadata ONCE and claims every
-partition `p` with `p % replica_count == ordinal`
-(`consumer.py:compute_assignment`). There is no consumer group
-membership and no rebalance; the group id only namespaces the stored
-offsets. A replica count that divides the partition count is the
-sensible shape (every replica gets the same number; otherwise the low
-ordinals get one more), and an ordinal that works out to no partitions,
-a topic the metadata does not know, or an ordinal at or past the
-replica count all refuse to start with exit **2** (a topology problem,
-logged in one line like a config error; nothing is claimed). The
-metadata read rides out a fresh broker's transients (a few probes, 30 s
-each) and refuses with exit 1 if they never clear. librdkafka settings
-millrace does not own (`security.protocol`, `sasl.*`, `client.rack`,
-even `client.id` — WarpStream's `ws_az=<zone>,…` client-id pinning is
-the motivating case) pass through as `MILLRACE_KAFKA_CONSUMER_<KEY>`,
-applied last; the keys millrace owns for correctness are refused at
-boot (config.py's knob table).
+Static assignment (millpond's model): replica `ordinal` (the trailing
+`-<n>` of `POD_NAME`) claims every partition `p` with
+`p % MILLRACE_REPLICA_COUNT == ordinal`, the partition count read once
+at start. An empty share or an unknown topic exits 2. `spec.replicas`
+and `MILLRACE_REPLICA_COUNT` must change together with the fleet fully
+down. **Adding partitions to the topic** requires restarting the fleet
+promptly: assignment is read once at start, and a new partition has no
+committed offset, so under `auto.offset.reset=latest` (the policy) the
+records produced to it before its ordinal restarts are skipped.
 
-**Topology changes.** `spec.replicas` and `MILLRACE_REPLICA_COUNT`
-must move together, and never under a rolling restart. A bare
-`kubectl scale` down strands the departed ordinal's partitions
-silently (nobody's share covers them; their staged state sits on the
-store untouched). A scale up without the env change makes the new
-ordinals exit 2 (ordinal ≥ replica count). Changing the count is a
-pod-template change, so during a rollout old-count and new-count pods
-overlap, derive overlapping partition sets, open the same SlateDB paths
-and fence each other — the fleet must be fully down before the count
-changes. Expanding the topic's partition count under a rolling restart
-IS safe: the mapping for every existing partition is unchanged, and the
-new partitions are picked up ordinal by ordinal as pods restart.
-
-SlateDB is single-writer per partition path and fences LAZILY: a second
-writer's open succeeds, and the older writer learns it lost the path at
-its next write's durability wait (`Error.Closed(FENCED)`, pinned by
-`tests/test_slatedb_parity.py`). Nothing announces the loss to the old
-owner — an EKS one-at-a-time StatefulSet rollout double-assigns the
-ordinal while the old pod drains, and the new pod opens the same
-SlateDB paths. The consume loop therefore catches FENCED at the staging
-write (and the flush loop's sweep surfaces an idle partition's fence at
-its next planning read), closes the fenced stage locally, and halts
-with `ConsumerFencedError` — deliberately DISTINCT from a crash or a
-flush halt: a blind restart would re-open the path and fence the NEW
-owner, and the two pods would fence each other until the rollout
-replaces one, offsets never advancing.
-
-So: **the rollout needs a barrier** — a PreSync hook that keeps the new
-ordinal's pod from starting until the old one is fully gone (the
-compaction work's rollout research). The process-level wiring: a fenced
-consumer exits with code **4** (`EXIT_FENCED`, distinct from a generic
-failure's 1, a config error's 2 and a flush halt's 3) so a supervisor
-can refuse the restart-into-the-same-path, and while the fenced process
-drains, `/healthz` and `/readyz` both 503 with the fence named.
-
-## SlateDB settings and pod memory
-
-Every partition's SlateDB instance opens with explicit `Settings` wired
-from `MILLRACE_SLATEDB_*` (config.py's table; the binding's defaults
-are per-instance and there are K instances per pod, so defaults need
-arithmetic, not trust), and every instance in the pod shares ONE SST
-cache the `StageManager` builds at startup (the cache choice is
-required at every `PartitionStage` open — the library default is never
-taken silently):
-
-- `MILLRACE_SLATEDB_GC_ENABLED` (default **false**) — the
-  writer-internal GC loop is off because the external maintenance
-  service (below) is part of every millrace deployment and owns
-  collection; doubled GC is wasted LIST/DELETE traffic on the replicas
-  (idempotent and overlap-safe, so a misconfigured doubling is
-  wasteful, never corrupt). Boot logs a loud warning when off: the
-  setting ASSUMES the service exists. There is deliberately no knob for
-  `compactor_options` — disabling the writer's embedded compactor
-  stalls memtable→L0 flushes at `l0_max_ssts` with nothing to drain
-  them (parity-pinned in `tests/test_slatedb_parity.py`).
-- `MILLRACE_SLATEDB_MAX_UNFLUSHED_BYTES` (default 256 MiB) caps one
-  instance's unflushed memtable+WAL backlog — **per instance, so the
-  pod's worst case is K × this** (the library default is 1 GiB, 64 GiB
-  at 64 partitions).
-- `MILLRACE_SLATEDB_BLOCK_CACHE_BYTES` (default 128 MiB) and
-  `MILLRACE_SLATEDB_META_CACHE_BYTES` (default 128 MiB) bound the SST
-  data-block cache and the index/filter cache — **per pod**: one split
-  moka cache is built once and handed to every instance with a
-  per-partition `db_cache_id` (`stage.db_cache_id_for`). Capacity is in
-  bytes (moka weighs each entry by its size — slatedb 0.17
-  `db_cache/moka.rs`). The library default is the same split shape but
-  per INSTANCE — 512 MiB + 128 MiB, so 16 unconfigured partitions could
-  cache 10 GiB. The halves are even on purpose: meta holds the index
-  and filter blocks of every SST of every instance and is where the
-  hits come from; the block half churns, because every memtable flush
-  inserts its data blocks while flush scans read older data. A revoked
-  partition's entries stay until capacity eviction (bounded, harmless).
-  `0` for both disables the cache (`with_db_cache_disabled`); `0` for
-  exactly one is refused (the split cache needs both halves), as is a
-  non-zero value below 4096 (one default block) or at/above 2**64.
-  Observability: `millrace_slatedb_cache_capacity_bytes{half="block"|"meta"}`
-  exports the configured pair (0 when disabled). The binding exposes
-  no occupancy, so the behavioral signal is
-  `millrace_slatedb_block_cache_accesses_total{entry_kind,result}` —
-  `entry_kind` is `filter`/`index`/`data_block`/`stats`; watch the hit
-  ratio per kind (it goes absent when the cache is disabled). The
-  maintenance service has no counterpart: its `Admin` handles read
-  manifests, never SST blocks, and `AdminBuilder` takes no cache.
-- `MILLRACE_SLATEDB_L0_MAX_SSTS` (default 8, SlateDB's own) — the L0
-  depth at which writes stall when the embedded compactor falls behind.
-  The stall precursor is observable before it bites: the maintenance
-  service exports `millrace_maintenance_compaction_l0_ssts
-  {topic,partition}` per DB and `..._max` fleet-wide, and the pod's own
-  `millrace_slatedb_l0_stalls_total` / `millrace_slatedb_write_stalls_total`
-  count stalls after the fact. The stage-rate bench at the whale shape
-  (`uv run pytest --bench -m bench -s`, `tests/test_stage_bench.py`)
-  measures ~7.3K msg/s per partition sustained with zero write stalls
-  in every arm (the shape is latency-bound at the 100 ms WAL flush
-  interval, ~5x the whale's 1.5K msg/s requirement) — the 55 MB/s
-  single-group shape (an L0 SST per ~1.2 s against the compactor's 5 s
-  poll) is the one pilot question the local bench cannot answer, and
-  the debt series is its tripwire.
-
-**Pod memory, in terms.** Size the request against this sum, not the
-library defaults:
-
-```
-  K × MILLRACE_SLATEDB_MAX_UNFLUSHED_BYTES        per instance
-+ (BLOCK_CACHE_BYTES + META_CACHE_BYTES) × ~1.05  pod-level, once (+~5% moka per-entry overhead)
-+ MILLRACE_KAFKA_QUEUED_MAX_MESSAGES_KBYTES × 1 KiB
-  + MILLRACE_KAFKA_FETCH_MAX_BYTES                librdkafka queue + one fetch in flight
-+ MILLRACE_CONSUME_BATCH_MAX_BYTES                one consumed batch being staged
-+ in-flight decisions × ( max(MILLRACE_FLUSH_SCAN_MIN_BYTES,
-                              MILLRACE_TARGET_OUTPUT_BYTES ÷ ratio × 1.25)   scanned staged bytes
-                          + decoded Arrow (estimate: ~the scanned bytes again)
-                          + output (≤ MILLRACE_TARGET_OUTPUT_BYTES) )
-+ process baseline                                interpreter, pyarrow, librdkafka (measure idle RSS)
-```
-
-In-flight decisions are bounded process-wide at
-`4 × MILLRACE_FLUSH_CONCURRENCY` (flush.py `FlushRunner`), except that
-`MILLRACE_FLUSH_CONCURRENCY=1` is the strictly serial sweep — one
-decision in flight. `ratio` is the observed compression ratio (0.2
-until the EWMA has data).
-
-The 16-partition dev example at the dev chart's values
-(`MAX_UNFLUSHED_BYTES` 96 MiB, `TARGET_OUTPUT_BYTES` 128 MiB,
-`FLUSH_CONCURRENCY` 1; everything else at defaults):
-
-| term | value |
-|---|---|
-| 16 × 96 MiB unflushed | 1,536 MiB |
-| shared cache (128 + 128 MiB) × 1.05 | ~269 MiB |
-| librdkafka queue 256 MiB + fetch 256 MiB | 512 MiB |
-| consume batch | 256 MiB |
-| 1 decision × (max(64, 128 ÷ 0.2 × 1.25 = 800) + ~800 decoded + 128 output) | ~1,728 MiB |
-| **sum before process baseline** | **~4,300 MiB (≈ 4.2 GiB)** |
-
-The scan term is the catch-up worst case; steady-state scans are the
-size of a group's staged slice. The library-default cache alone would
-have been 16 × 640 MiB = 10 GiB.
-
-Resident memory grows past the Python heap in two phases, both
-expected: a warm-up while each instance's memtable fills to its first
-freeze (about 16 minutes at the 100 ms WAL flush interval), then a
-slow slope from pyarrow's allocator retaining freed batch memory
-(mimalloc on macOS; the Linux wheels use jemalloc, which decays). The
-Python heap itself is flat under steady inflow. `MILLRACE_MEMORY_DEBUG_S=<seconds>`
-turns on an opt-in reporter (`memdebug.py`, off by default and
-allocating nothing when off) that logs one JSON line per interval with
-RSS, tracemalloc's top allocation sites by growth, container sizes of
-the long-lived objects, and SlateDB's per-instance totals, to
-`MILLRACE_MEMORY_DEBUG_FILE` (`{pid}` substituted) or the
-`millrace.memdebug` logger. `ARROW_DEFAULT_MEMORY_POOL=system` is the
-first thing to try if a pod's slope does not level off.
-
-### Scan read-ahead
-
-slatedb 0.17's default `ScanOptions` fetch ONE block (~4 KiB) per
-object-store GET with one fetch task. Rows still in the memtable never
-notice; once a group's rows live in L0 or sorted-run SSTs, a scan
-reads at block size ÷ GET latency — tens of KB/s at S3 latency. The
-settlement scan used to run inside `commit_flushed`'s transaction while
-it held the stage write lock, so a few MiB of window held the lock for
-minutes and staging stalled behind it. Every range scan over rows (the
-flush window, the recovery settlement's pre-scan, the reconcile
-emptiness probe and recovery's legacy-marker sweep) therefore uses
-`stage._bulk_scan_options()`: 4 MiB read-ahead, 4 concurrent fetches
-(≤ 16 MiB in flight per scan, never past the range's last block), and
-`cache_blocks=False` so a one-pass scan does not churn the shared block
-cache. The small `stats/`/`prepared/` prefix scans keep the defaults
-and their cached blocks. `tests/live/test_live_stage_latency.py` pins
-it end to end with the stage store behind toxiproxy (60 ± 40 ms).
-No scan runs under the write lock any more (hoglake#351): a fresh
-settle deletes the keys the flush already scanned, a recovery settle
-and the reconcile probe scan before taking it, and the lock covers only
-the `stats/` point read and one batch write
-(`test_stage.py::test_no_scan_runs_under_the_write_lock`).
+SlateDB is single-writer per path and fences lazily: a newer writer's
+open succeeds and the old one learns at its next write. A fenced
+process exits **4**; do not restart it onto the same assignment (it
+would fence the new owner back). The rollout needs a barrier so an
+ordinal's new pod starts only after the old one is gone. A fenced
+writer can never commit Kafka offsets past unstaged data (every poll
+writes durably first, a fence probe when all its records were dropped)
+nor delete staged rows; at worst it publishes a duplicate.
 
 ## Dropped records
 
-Malformed records are dropped, logged and metered; nothing is
-quarantined or retained. Each drop increments
-`millrace_records_dropped_total{reason}` and logs at WARNING. The Kafka
-record timestamp is never read (rows are keyed `(partition tuple,
-offset)`; staging stats use the staging clock), so no record is dropped
-for its timestamp.
+Timestamps outside years 1–9999 are clamped to the nearest
+representable instant (counted in
+`millrace_values_clamped_total{column}`, rate-limited WARNING), not
+dropped. Only records that cannot be represented at all are dropped; each is
+counted in `millrace_records_dropped_total{reason}` and logged (consume
+side: at most one line per partition and reason per 10 s). Event times
+are never judged: ancient and far-future events are written.
 
-| Where | `reason` label | Cause |
+| Where | `reason` | Cause |
 |---|---|---|
-| Consume | `invalid_offset` | Offset < 0 or > int64 max |
-| Consume | `missing_value` | Tombstone |
-| Consume | `malformed_value` | Not a strict JSON object |
-| Consume | `malformed_partition_source` | A partition source scalar cannot be keyed; the log line names the path (`malformed_partition_source:<path>`), the label does not |
-| Flush | `undecodable_payload` / `uncastable_column` | The payload does not decode or cast against the table's columns (the drop log line names the first refusing column's dotted path, `first_path=properties.inner.id`, never the value), or defeats the Arrow build |
-| Flush | `event_time_out_of_window` | Junk `event_time` under `MILLRACE_EVENT_TIME_POLICY=drop` (the default) |
+| Consume | `invalid_offset` | offset < 0 or > int64 max |
+| Consume | `missing_value` | tombstone |
+| Consume | `malformed_value` | not a strict JSON object |
+| Consume | `malformed_partition_source` | a partition source value of the wrong type or uncoercible (the log names the path) |
+| Flush | `undecodable_payload` / `uncastable_column` | a value no column can hold (the log names the first refusing column path, never the value) |
 
-Consume-time drop lines name topic, partition, offset and reason, at
-most one per (partition, reason) per 10 s (the first drop of a reason
-always logs; later lines carry the suppressed count); the offset commit
-covers a dropped record like a staged one. Flush-time drops log one
-line per reason per decision with the group and offsets; the dropped
-rows are deleted by their window's ordinary settlement.
+## SlateDB and pod memory
 
-## Probes and per-partition metrics
+Every instance opens with explicit settings; the pod shares one SST
+cache. These are constants (`config.SlateDbConfig`): unflushed bytes
+256 MiB per instance, L0 stall depth 8, block and meta cache 128 MiB
+each per pod. The writer's embedded GC is always off: the maintenance
+service (`python -m millrace.maintenance`, one per staging root) owns
+collection for every pipeline, which keeps LIST/DELETE traffic off the
+ingest pods; it also exports L0 depth per DB. The embedded compactor is
+never disabled (that stalls memtable flushes, parity-pinned).
 
-`/healthz` (liveness) is no longer a static 200: it 503s — with the
-reason in the body — when the pipeline is in a latched terminal state
-(the flush runner halted, the consumer fenced, a partition fenced out
-of flush scheduling — e.g. the quiet-partition fence nothing else
-surfaces). Latched states only, so the probe cannot flap. `/readyz`
-503s until the consumer has started and whenever liveness fails: a pod
-that lost a partition's ownership is not ready to serve it.
-`/metrics` carries bounded per-partition series —
-`millrace_partition_staged_bytes{topic,partition}`,
-`millrace_partition_oldest_staged_age_seconds{topic,partition}`,
-`millrace_flush_partition_fenced{topic,partition}` — so a stuck
-partition is findable; cardinality is bounded by the pod's assigned
-partition count (tens), never by partition tuples. The staged gauges —
-`millrace_staged_bytes`, `millrace_staged_rows`, `millrace_staged_groups`
-(partition tuples holding staged rows),
-`millrace_oldest_eligible_staged_age_seconds` (the oldest key that is
-eligible under ANY flush lane, so pathological slow-lane tenants don't
-trip it; a settle that leaves rows lifts the group's `first_staged_ts`
-to the settled scan's start, so on a healthy pipeline the gauge stays
-near the flush deadline and growth past it is real backlog) — plus SlateDB's own stall series are alert inputs; nothing in
-the consume loop reads them.
-
-The maintenance service (`python -m millrace.maintenance`) does GC plus
-compaction-debt monitoring: per swept DB it reads the compactor state
-view and exports the L0 SST count per `{topic,partition}` (it is the
-fleet authority on debt, so the labels are affordable here) plus the
-fleet max. Its discovery listing of the staging root runs at most once
-per `MILLRACE_MAINTENANCE_DISCOVERY_INTERVAL_S` (default 1 h) and is
-cached between listings — a new partition's DB waits at most one
-cadence for its first sweep, and a listing failure with a warm cache
-degrades to the cached set.
-
-Test layers (docs/kafka-ingestion-plan.md): unmarked = unit (pure, no
-I/O), `component` = SlateDB on `memory:///`, `integration` = SlateDB on
-`file:///` (no docker), `live` = the docker stack (deselected unless
-`-m live` is passed — see tests/conftest.py). The benches — the SlateDB
-rate bench (validation item 2) and the flush sweep throughput bench
-(M5's measurement: 1024 ready keys total, 256 per partition stage × 4
-stages) — are non-gating and deselected by default:
+Pod memory, in terms:
 
 ```
-uv run pytest --bench -m bench -s
+  K partitions × 256 MiB unflushed
++ 256 MiB shared cache × ~1.05
++ 256 MiB librdkafka queue + 256 MiB fetch
++ 256 MiB consume batch
++ 4 in-flight decisions × ~1.1 GiB at MILLRACE_FLUSH_BYTES=256 MiB (measured)
++ process baseline
 ```
+
+At 16 partitions per pod that is ~4 GiB unflushed + ~0.8 GiB queues and
+cache + ~4.4 GiB of decisions + baseline: a 1-replica, 16-partition
+pod does **not** fit 10 GiB; 4 partitions per pod (~7 GiB) does. The
+catch-up profile peaked at 6.6 GiB with 4 partitions.
+
+Row scans read ahead in 4 MiB ranged GETs with 4 concurrent fetches and
+do not cache their blocks (`stage._bulk_scan_options`; slatedb's
+default reads one ~4 KiB block per GET). No scan and no payload
+lowering ever runs under a stage's write lock.
+
+**Binding patch.** slatedb 0.17's generated uniffi binding copies every
+lowered bytes value into the Rust buffer one byte per Python iteration
+(90% of GIL time during a catch-up). `millrace/slatedb_patch.py`
+replaces that copy with one `ctypes.memmove` at import of `stage.py`,
+after checking the binding's shape and a self-test round trip; if
+either fails it leaves the binding alone and logs a WARNING.
+
+## Test layers
+
+Unmarked = unit (pure), `component` = SlateDB on `memory:///`,
+`integration` = `file:///`, `live` = the docker stack (deselected unless
+`-m live`). The rate benches are deselected by default:
+`uv run pytest --bench -m bench -s`.
