@@ -39,7 +39,7 @@ from flushkit import (
     table_wire,
     team_group,
 )
-from stagekit import NOW, fast_flush_settings
+from stagekit import NOW, fast_flush_settings, staged_groups
 
 from millrace.flush import STUCK_AFTER, FlushHalted, FlushRunner, HoglakeFlusher
 from millrace.stage import StagedRecord, StageManager
@@ -128,7 +128,7 @@ async def test_a_due_group_commits_once_and_its_rows_go(
     flusher = flusher_factory(cfg=cfg, store=store)
     script_options(httpx_mock)
     capture = CommitCapture(httpx_mock, [commit_ok(91)])
-    await stages.open_partition("events", 0, now_us=fake_clock())
+    await stages.open_partition("events", 0)
     await stage_rows(
         stages, fake_clock, 7, [(o, event_payload(7, NOW, f"e{o}")) for o in range(3)]
     )
@@ -159,7 +159,7 @@ async def test_each_build_mints_a_fresh_key(
     flusher = flusher_factory(cfg=cfg, store=store)
     script_options(httpx_mock)
     capture = CommitCapture(httpx_mock, [commit_ok(91), commit_ok(92)])
-    await stages.open_partition("events", 0, now_us=fake_clock())
+    await stages.open_partition("events", 0)
     r = runner(stages, flusher, cfg, fake_clock, mono, sleeper)
     await stage_rows(stages, fake_clock, 7, [(0, event_payload(7, NOW))])
     await r.run_once(drain=True)
@@ -191,7 +191,7 @@ async def test_an_ambiguous_answer_resends_the_identical_bytes(
             commit_ok(91),
         ],
     )
-    await stages.open_partition("events", 0, now_us=fake_clock())
+    await stages.open_partition("events", 0)
     await stage_rows(stages, fake_clock, 7, [(0, event_payload(7, NOW))])
     report = await runner(stages, flusher, cfg, fake_clock, mono, sleeper).run_once(
         drain=True
@@ -219,7 +219,7 @@ async def test_a_refused_read_basis_rebuilds_under_a_fresh_key(
         httpx_mock,
         [commit_refusal(409, "ddl_since_read_snapshot", "spec moved"), commit_ok(96)],
     )
-    await stages.open_partition("events", 0, now_us=fake_clock())
+    await stages.open_partition("events", 0)
     await stage_rows(stages, fake_clock, 7, [(0, event_payload(7, NOW))])
     report = await runner(stages, flusher, cfg, fake_clock, mono, sleeper).run_once(
         drain=True
@@ -245,7 +245,7 @@ async def test_a_fanout_over_the_files_cap_splits_into_several_commits(
     flusher = flusher_factory(cfg=cfg, store=store)
     script_options(httpx_mock)
     capture = CommitCapture(httpx_mock, [commit_ok(91), commit_ok(92)])
-    await stages.open_partition("events", 0, now_us=fake_clock())
+    await stages.open_partition("events", 0)
     # One staged group whose rows the live spec files under two months.
     await stage_rows(
         stages,
@@ -302,7 +302,7 @@ async def test_a_split_commit_settles_each_part_as_it_lands(
     capture = CommitCapture(
         httpx_mock, [commit_ok(91), refused, refused, refused, commit_ok(92)]
     )
-    await stages.open_partition("events", 0, now_us=fake_clock())
+    await stages.open_partition("events", 0)
     await stage_rows(
         stages,
         fake_clock,
@@ -375,7 +375,7 @@ async def test_a_refused_payload_retries_then_reports_the_group_stuck_and_the_po
     httpx_mock.add_callback(
         answer, method="POST", url=PREPARED_URL, is_reusable=True, is_optional=True
     )
-    await stages.open_partition("events", 0, now_us=fake_clock())
+    await stages.open_partition("events", 0)
     await stage_rows(stages, fake_clock, 7, [(0, event_payload(7, NOW))])
     r = runner(stages, flusher, cfg, fake_clock, mono, sleeper)
     for attempt in range(STUCK_AFTER):
@@ -430,7 +430,7 @@ async def test_ancient_and_far_future_events_are_written_not_dropped(
     capture = CommitCapture(httpx_mock, [commit_ok(91)])
     ancient = 31_536_000_000_000  # 1971-01-01
     future = NOW + 400 * 86_400_000_000
-    await stages.open_partition("events", 0, now_us=fake_clock())
+    await stages.open_partition("events", 0)
     await stage_rows(
         stages,
         fake_clock,
@@ -463,7 +463,7 @@ async def test_unrepresentable_records_are_dropped_and_counted_never_batch_fatal
     flusher = flusher_factory(cfg=cfg, store=store)
     script_options(httpx_mock)
     capture = CommitCapture(httpx_mock, [commit_ok(91)])
-    await stages.open_partition("events", 0, now_us=fake_clock())
+    await stages.open_partition("events", 0)
     await stage_rows(
         stages,
         fake_clock,
@@ -496,7 +496,7 @@ async def test_a_window_of_only_unrepresentable_records_settles_without_a_commit
     cfg = make_config()
     flusher = flusher_factory(cfg=cfg, store=store)
     script_options(httpx_mock)
-    await stages.open_partition("events", 0, now_us=fake_clock())
+    await stages.open_partition("events", 0)
     await stage_rows(stages, fake_clock, 7, [(0, b"[1, 2]")])
     report = await runner(stages, flusher, cfg, fake_clock, mono, sleeper).run_once(
         drain=True
@@ -519,7 +519,7 @@ async def test_a_row_larger_than_the_scan_budget_still_flushes(
     flusher = flusher_factory(cfg=cfg, store=store)
     script_options(httpx_mock)
     capture = CommitCapture(httpx_mock, [commit_ok(91), commit_ok(92)])
-    await stages.open_partition("events", 0, now_us=fake_clock())
+    await stages.open_partition("events", 0)
     await stage_rows(
         stages,
         fake_clock,
@@ -547,7 +547,7 @@ async def test_a_recreated_destination_halts(
     flusher = flusher_factory(cfg=cfg, store=store)
     script_options(httpx_mock)
     script_table_refresh(httpx_mock, table=table_wire(uuid=RECREATED_UUID))
-    await stages.open_partition("events", 0, now_us=fake_clock())
+    await stages.open_partition("events", 0)
     await stage_rows(stages, fake_clock, 7, [(0, event_payload(7, NOW))])
     mono.advance(10 * 3600)  # past the shape TTL
     r = runner(stages, flusher, cfg, fake_clock, mono, sleeper)
@@ -574,7 +574,7 @@ async def test_a_commit_refused_as_table_recreated_halts(
     CommitCapture(
         httpx_mock, [commit_refusal(409, "table_recreated", "new incarnation")]
     )
-    await stages.open_partition("events", 0, now_us=fake_clock())
+    await stages.open_partition("events", 0)
     await stage_rows(stages, fake_clock, 7, [(0, event_payload(7, NOW))])
     with pytest.raises(FlushHalted, match="table_recreated"):
         await runner(stages, flusher, cfg, fake_clock, mono, sleeper).run_once(
@@ -594,8 +594,8 @@ async def test_the_startup_drain_flushes_a_previous_process_rows(
     sleeper: Any,
 ) -> None:
     previous = manager(tmp_path)
-    await previous.open_partition("events", 0, now_us=fake_clock())
-    await previous.open_partition("events", 1, now_us=fake_clock())
+    await previous.open_partition("events", 0)
+    await previous.open_partition("events", 1)
     await stage_rows(previous, fake_clock, 7, [(0, event_payload(7, NOW, "p0"))])
     await stage_rows(
         previous, fake_clock, 8, [(5, event_payload(8, NOW, "p1"))], partition=1
@@ -607,12 +607,17 @@ async def test_the_startup_drain_flushes_a_previous_process_rows(
     script_options(httpx_mock)
     capture = CommitCapture(httpx_mock, [commit_ok(91), commit_ok(92)])
     stages = manager(tmp_path)
-    await stages.sync_assignment({("events", 0), ("events", 1)}, now_us=fake_clock())
-    # Discovery put both groups in the index, sizes unknown.
-    assert stages.gauges().staged_groups == 2
-    await runner(stages, flusher, cfg, fake_clock, mono, sleeper).drain()
+    await stages.sync_assignment({("events", 0), ("events", 1)})
+    # Opening reads nothing: the index starts empty; the drain streams.
+    assert stages.gauges().staged_groups == 0
+    r = runner(stages, flusher, cfg, fake_clock, mono, sleeper)
+    await r.drain()
     assert sorted(committed_offsets(store, capture)) == ["p0", "p1"]
     assert stages.gauges().staged_groups == 0
+    assert (r.drain_rows, r.drain_bytes) == (
+        2,
+        len(event_payload(7, NOW, "p0")) + len(event_payload(8, NOW, "p1")),
+    )
     assert await staged_count(stages, 7) == 0
     assert await staged_count(stages, 8, partition=1) == 0
     await stages.close()
@@ -629,7 +634,7 @@ async def test_a_crash_mid_drain_drains_again_duplicates_allowed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     previous = manager(tmp_path)
-    await previous.open_partition("events", 0, now_us=fake_clock())
+    await previous.open_partition("events", 0)
     await stage_rows(
         previous, fake_clock, 7, [(o, event_payload(7, NOW, f"e{o}")) for o in range(3)]
     )
@@ -643,10 +648,10 @@ async def test_a_crash_mid_drain_drains_again_duplicates_allowed(
     # The first drain's commit lands, then the process dies before the
     # delete batch.
     crashing = manager(tmp_path)
-    await crashing.open_partition("events", 0, now_us=fake_clock())
+    await crashing.open_partition("events", 0)
     from millrace.stage import PartitionStage
 
-    async def crash(self: Any, scan: Any) -> bool:
+    async def crash(self: Any, scan: Any, **_: Any) -> bool:
         raise asyncio.CancelledError("killed before the settle")
 
     with monkeypatch.context() as patch:
@@ -658,7 +663,7 @@ async def test_a_crash_mid_drain_drains_again_duplicates_allowed(
     await crashing.close()
 
     restarted = manager(tmp_path)
-    await restarted.open_partition("events", 0, now_us=fake_clock())
+    await restarted.open_partition("events", 0)
     await runner(restarted, flusher, cfg, fake_clock, mono, sleeper).drain()
     published = committed_offsets(store, capture)
     assert sorted(set(published)) == ["e0", "e1", "e2"]
@@ -678,7 +683,7 @@ async def test_one_flush_in_flight_per_group(
 ) -> None:
     cfg = make_config()
     flusher = flusher_factory(cfg=cfg, store=store)
-    await stages.open_partition("events", 0, now_us=fake_clock())
+    await stages.open_partition("events", 0)
     await stage_rows(stages, fake_clock, 7, [(0, event_payload(7, NOW))])
     release = asyncio.Event()
     calls: list[Any] = []
@@ -757,7 +762,7 @@ async def test_out_of_range_timestamps_are_keyed_and_land_clamped(
     flusher = flusher_factory(cfg=cfg, store=store)
     script_options(httpx_mock)
     capture = CommitCapture(httpx_mock, [commit_ok(91), commit_ok(92)])
-    await stages.open_partition("events", 0, now_us=fake_clock())
+    await stages.open_partition("events", 0)
     await stages.stage("events", 0).stage_batch(records, now_us=fake_clock())
     with caplog.at_level(logging.WARNING, logger="millrace.flush"):
         report = await runner(stages, flusher, cfg, fake_clock, mono, sleeper).run_once(
@@ -805,7 +810,7 @@ async def test_the_first_commit_pins_the_incarnation_and_a_recreate_halts_the_dr
 
     cfg = make_config()
     first = manager(tmp_path)
-    await first.open_partition("events", 0, now_us=fake_clock())
+    await first.open_partition("events", 0)
     flusher = flusher_factory(cfg=cfg, store=store)
     script_options(httpx_mock)
     capture = CommitCapture(httpx_mock, [commit_ok(91)])
@@ -820,7 +825,7 @@ async def test_the_first_commit_pins_the_incarnation_and_a_recreate_halts_the_dr
         cfg=cfg, store=store, table=table_wire(uuid=RECREATED_UUID)
     )
     restarted = manager(tmp_path)
-    await restarted.open_partition("events", 0, now_us=fake_clock())
+    await restarted.open_partition("events", 0)
     r = runner(restarted, recreated, cfg, fake_clock, mono, sleeper)
     with pytest.raises(FlushHalted) as halted:
         await r.drain()
@@ -861,7 +866,7 @@ async def test_an_encoder_bug_fails_the_decision_and_keeps_every_row(
     flusher = flusher_factory(cfg=cfg, store=store)
     script_options(httpx_mock)
     capture = CommitCapture(httpx_mock, [])
-    await stages.open_partition("events", 0, now_us=fake_clock())
+    await stages.open_partition("events", 0)
     await stage_rows(
         stages,
         fake_clock,
@@ -887,12 +892,12 @@ async def test_an_incomplete_scan_is_due_on_the_next_sweep(
     mono: Any,
     sleeper: Any,
 ) -> None:
-    """S4: a discovered group has no counted size, so neither the size
-    nor the age lane would take it; once a capped scan left rows behind
-    it keeps draining on every sweep instead of waiting for the slow
-    lane."""
+    """S4: a group the drain held (its window failed) has an
+    under-counted size, so neither the size nor the age lane would take
+    it; once a capped scan left rows behind it keeps draining on every
+    sweep instead of waiting for the slow lane."""
     previous = manager(tmp_path)
-    await previous.open_partition("events", 0, now_us=fake_clock())
+    await previous.open_partition("events", 0)
     await stage_rows(
         previous, fake_clock, 7, [(o, event_payload(7, NOW, f"e{o}")) for o in range(3)]
     )
@@ -903,7 +908,10 @@ async def test_an_incomplete_scan_is_due_on_the_next_sweep(
     script_options(httpx_mock)
     capture = CommitCapture(httpx_mock, [commit_ok(91), commit_ok(92), commit_ok(93)])
     stages = manager(tmp_path)
-    await stages.open_partition("events", 0, now_us=fake_clock())
+    stage = await stages.open_partition("events", 0)
+    stage.row_stream(max_bytes=1, now_us=fake_clock()).hold(
+        team_group(7), nbytes=0, rows=0, now_us=fake_clock()
+    )
     r = runner(stages, flusher, cfg, fake_clock, mono, sleeper)
     assert (await r.run_once()).decisions == 0  # not due by the planner
     assert (await r.run_once(drain=True)).committed == 1  # capped: 1 of 3
@@ -961,7 +969,7 @@ async def test_shutdown_mid_flush_keeps_the_rows(
 
     # (a) cancel the flush task, then close the stages, while waiting.
     stages = manager(tmp_path)
-    await stages.open_partition("events", 0, now_us=fake_clock())
+    await stages.open_partition("events", 0)
     rows = [(o, event_payload(7, NOW, f"e{o}")) for o in range(3)]
     await stage_rows(stages, fake_clock, 7, rows)
     task = asyncio.create_task(
@@ -975,9 +983,13 @@ async def test_shutdown_mid_flush_keeps_the_rows(
     await stages.close()
     release.set()  # the commit lands after the process "died": a duplicate later
     reopened = manager(tmp_path)
-    await reopened.open_partition("events", 0, now_us=fake_clock())
-    assert reopened.stage("events", 0).has_group(team_group(7))
+    await reopened.open_partition("events", 0)
+    assert await staged_groups(reopened.stage("events", 0)) == [team_group(7)]
     assert await staged_count(reopened, 7) == 3
+    # As the drain leaves a group whose window failed: indexed, staged.
+    reopened.stage("events", 0).row_stream(max_bytes=1, now_us=0).hold(
+        team_group(7), nbytes=0, rows=3, now_us=fake_clock()
+    )
 
     # (b) runner.stop() during run(): the in-flight flush finishes (its
     # commit is refused), run() returns, the rows stay.
@@ -1001,8 +1013,8 @@ async def test_shutdown_mid_flush_keeps_the_rows(
     assert await staged_count(reopened, 7) == 3
     await reopened.close()
     again = manager(tmp_path)
-    await again.open_partition("events", 0, now_us=fake_clock())
-    assert again.stage("events", 0).has_group(team_group(7))
+    await again.open_partition("events", 0)
+    assert await staged_groups(again.stage("events", 0)) == [team_group(7)]
     await again.close()
 
 
@@ -1028,7 +1040,7 @@ async def test_the_drain_retries_a_transiently_failing_group(
         [commit_refusal(500, "internal", "boom")] * _PUBLISH_MAX_ATTEMPTS
         + [commit_ok(91)],
     )
-    await stages.open_partition("events", 0, now_us=fake_clock())
+    await stages.open_partition("events", 0)
     await stage_rows(stages, fake_clock, 7, [(0, event_payload(7, NOW))])
 
     async def advancing(seconds: float) -> None:
@@ -1068,7 +1080,7 @@ async def test_a_steady_group_flushes_once_per_deadline_not_per_sweep(
     flusher = flusher_factory(cfg=cfg, store=store)
     script_options(httpx_mock)
     capture = CommitCapture(httpx_mock, [commit_ok(91), commit_ok(92)])
-    await stages.open_partition("events", 0, now_us=fake_clock())
+    await stages.open_partition("events", 0)
     stage = stages.stage("events", 0)
     await stage_rows(stages, fake_clock, 7, [(0, event_payload(7, NOW))])
     real_scan = PartitionStage.scan
@@ -1110,7 +1122,7 @@ async def test_two_partitions_with_the_same_group_and_offsets_write_distinct_obj
     script_options(httpx_mock)
     capture = CommitCapture(httpx_mock, [commit_ok(91), commit_ok(92)])
     for partition in (0, 1):
-        await stages.open_partition("events", partition, now_us=fake_clock())
+        await stages.open_partition("events", partition)
         await stage_rows(
             stages,
             fake_clock,
@@ -1139,7 +1151,7 @@ async def test_failure_state_is_pruned_when_a_partition_closes(
     flusher = flusher_factory(cfg=cfg, store=store)
     script_options(httpx_mock)
     CommitCapture(httpx_mock, [commit_refusal(422, "record_validation", "no")])
-    await stages.open_partition("events", 1, now_us=fake_clock())
+    await stages.open_partition("events", 1)
     await stage_rows(stages, fake_clock, 7, [(0, event_payload(7, NOW))], partition=1)
     r = runner(stages, flusher, cfg, fake_clock, mono, sleeper)
     assert (await r.run_once(drain=True)).failed == 1
@@ -1164,7 +1176,7 @@ async def test_a_stop_during_the_drain_returns_without_flushing(
     cfg = make_config()
     flusher = flusher_factory(cfg=cfg, store=store)
     capture = CommitCapture(httpx_mock, [])
-    await stages.open_partition("events", 0, now_us=fake_clock())
+    await stages.open_partition("events", 0)
     await stage_rows(stages, fake_clock, 7, [(0, event_payload(7, NOW))])
     r = runner(stages, flusher, cfg, fake_clock, mono, sleeper)
     r.stop()

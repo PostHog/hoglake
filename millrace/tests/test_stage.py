@@ -5,8 +5,10 @@ Pinned here:
 - ``stage_batch`` is one durable write batch; the in-memory index is
   updated before the write (memory always covers disk); duplicate keys
   and empty batches are refused; a redelivered row re-puts in place;
-- ``discover`` finds exactly the groups with rows (prefix-sharing tuples
-  included) without reading their payloads;
+- the startup drain's ``row_stream`` reads every row once, in key order,
+  with ONE read-ahead iterator, cut into one-group windows at group
+  boundaries and at the byte budget (always at least one row); a held
+  group's rows are skipped and counted into its index entry;
 - ``scan`` is an exact offset prefix within the byte budget and always
   holds at least one row; ``complete`` says whether it reached the end;
 - ``settle`` deletes exactly the scanned keys; a group leaves the index
@@ -30,7 +32,16 @@ import threading
 import pytest
 from slatedb.uniffi import CloseReason, DurabilityLevel, KeyRange, WriteBatch
 from slatedb.uniffi import Error as SlateError
-from stagekit import NOW, LockedScanSpy, fast_flush_settings, g, rec, shared_cache
+from stagekit import (
+    NOW,
+    LockedScanSpy,
+    fast_flush_settings,
+    g,
+    rec,
+    shared_cache,
+    staged_groups,
+    stream_windows,
+)
 
 from millrace import keyspace
 from millrace import stage as stage_mod
@@ -172,10 +183,49 @@ async def test_every_write_awaits_durability(stage_factory, monkeypatch):
     await stage.close()
 
 
-# -- discovery ----------------------------------------------------------------------
+async def test_a_drain_settle_skips_the_durability_wait(stage_factory, monkeypatch):
+    """The startup drain settles with ``durable=False`` (deletes need no
+    durability for at-least-once) and ends with :meth:`make_durable`;
+    the deletes are visible to scans at once."""
+    stage = await stage_factory()
+    await stage.stage_batch([rec(1, 0, o) for o in range(3)], now_us=NOW)
+    real_write = stage._db.write
+    real_flush = stage._db.flush
+    events: list[str] = []
+
+    class Handle:
+        def __init__(self, real):
+            self._real = real
+
+        async def await_durable(self):
+            events.append("durable")
+            await self._real.await_durable()
+
+    async def write(batch):
+        events.append("write")
+        return Handle(await real_write(batch))
+
+    async def flush():
+        events.append("flush")
+        await real_flush()
+
+    monkeypatch.setattr(stage._db, "write", write)
+    monkeypatch.setattr(stage._db, "flush", flush)
+    scan = await stage.scan(g(1), max_bytes=BIG, now_us=NOW)
+    assert await stage.settle(scan, durable=False)
+    assert events == ["write"]
+    assert await offsets(stage, 1) == []
+    await stage.make_durable()
+    assert events == ["write", "flush"]
+    await stage.close()
+    with pytest.raises(StageClosedError):
+        await stage.make_durable()
 
 
-async def test_discover_finds_exactly_the_groups_with_rows(memory_store):
+# -- the startup drain's row stream ------------------------------------------------
+
+
+async def test_the_row_stream_reads_every_row_once_in_one_group_windows(memory_store):
     first = await PartitionStage.open_store(
         memory_store,
         "millrace/events/0",
@@ -194,10 +244,11 @@ async def test_discover_finds_exactly_the_groups_with_rows(memory_store):
         ],
         now_us=NOW,
     )
-    # Drained groups and the fence probe are not rows.
+    # Settled rows and the meta/ keys are not rows.
     drained = await first.scan(("a", "b"), max_bytes=BIG, now_us=NOW)
     await first.settle(drained)
     await first.probe_fence(7)
+    await first.pin_table_uuid("u")
     await first.close()
 
     reopened = await PartitionStage.open_store(
@@ -209,22 +260,163 @@ async def test_discover_finds_exactly_the_groups_with_rows(memory_store):
         **shared_cache(),
     )
     assert reopened.snapshot() == []
-    found = await reopened.discover(now_us=NOW + 99)
+    stream = reopened.row_stream(max_bytes=BIG, now_us=NOW + 99)
+    windows = []
+    while (window := await stream.next_window()) is not None:
+        windows.append(window)
     expected = sorted(
         (grp for grp in groups if grp != ("a", "b")), key=keyspace.encode_group
     )
-    assert found == expected  # key order, each once
-    assert {s.group for s in reopened.snapshot()} == set(expected)
-    assert {s.first_staged_ts for s in reopened.snapshot()} == {NOW + 99}
-    assert {(s.staged_bytes, s.rows) for s in reopened.snapshot()} == {(0, 0)}
-    # Discovery reads one row per group, not the payloads.
+    # One window per group (prefix-sharing tuples never mix), key order.
+    assert [w.group for w in windows] == expected
+    assert stream.groups_seen == len(expected)
+    for w in windows:
+        assert w.complete and w.gen is None and w.started_us == NOW + 99
+        assert [p for _, p in w.rows] == [b"p", b"pp", b"ppp"]
+        assert [rk.group for rk, _ in w.rows] == [w.group] * 3
+    # Reading is not flushing: nothing indexed, nothing deleted.
+    assert reopened.snapshot() == []
+    assert len(await disk_rows(reopened)) == 3 * len(expected)
+    assert await stream.next_window() is None
     await reopened.close()
 
 
-async def test_discover_on_an_empty_stage_finds_nothing(stage_factory):
+async def test_the_row_stream_on_an_empty_stage_yields_nothing(stage_factory):
     stage = await stage_factory()
     await stage.probe_fence(1)
-    assert await stage.discover(now_us=NOW) == []
+    await stage.pin_table_uuid("u")
+    assert await stream_windows(stage) == []
+    await stage.close()
+
+
+async def test_the_row_stream_cuts_windows_at_the_budget(stage_factory):
+    """A window is an exact offset run within the budget, always at least
+    one row; only the last window of a group is complete."""
+    stage = await stage_factory()
+    await stage.stage_batch(
+        [rec(1, 0, o, b"x" * 100) for o in range(7)]
+        + [rec(2, 0, 7, b"y" * 500)]
+        + [rec(3, 0, 8, b"z" * 10)],
+        now_us=NOW,
+    )
+    windows = await stream_windows(stage, max_bytes=250)
+    assert [
+        (w.group, [rk.offset for rk, _ in w.rows], w.complete) for w in windows
+    ] == [
+        (g(1), [0, 1], False),
+        (g(1), [2, 3], False),
+        (g(1), [4, 5], False),
+        (g(1), [6], True),
+        (g(2), [7], True),  # larger than the budget: alone, never wedged
+        (g(3), [8], True),
+    ]
+    await stage.close()
+
+
+async def test_the_row_stream_crosses_scan_pages(stage_factory):
+    stage = await stage_factory()
+    n = stage_mod._SCAN_CHUNK * 2 + 17
+    await stage.stage_batch([rec(o % 3, 0, o, b"r") for o in range(n)], now_us=NOW)
+    windows = await stream_windows(stage)
+    assert [w.group for w in windows] == [g(0), g(1), g(2)]
+    offsets_read = sorted(rk.offset for w in windows for rk, _ in w.rows)
+    assert offsets_read == list(range(n))
+    await stage.close()
+
+
+async def test_the_row_stream_skips_and_counts_a_held_groups_rows(stage_factory):
+    """A held group (a drain window of it failed) stays staged: the
+    stream skips the rest of its rows, counting them into its index
+    entry."""
+    stage = await stage_factory()
+    await stage.stage_batch(
+        [rec(1, 0, o, b"a" * 10) for o in range(6)]
+        + [rec(2, 0, 6 + o, b"b" * 10) for o in range(3)],
+        now_us=NOW,
+    )
+    stage.forget_index()
+    assert stage.snapshot() == []
+    stream = stage.row_stream(max_bytes=20, now_us=NOW)
+    first = await stream.next_window()
+    assert first is not None and [rk.offset for rk, _ in first.rows] == [0, 1]
+    stream.hold(g(1), nbytes=first.nbytes, rows=2, now_us=NOW + 3)
+    second = await stream.next_window()
+    assert second is not None and second.group == g(2)
+    assert [rk.offset for rk, _ in second.rows] == [6, 7]
+    assert (stream.rows_skipped, stream.bytes_skipped) == (4, 40)
+    assert index(stage) == {g(1): (NOW + 3, 60, 6)}
+    last = await stream.next_window()
+    assert last is not None and [rk.offset for rk, _ in last.rows] == [8]
+    assert await stream.next_window() is None
+    assert stream.groups_seen == 2
+    # Skipped rows are untouched on disk.
+    assert await offsets(stage, 1) == list(range(6))
+    await stage.close()
+
+
+async def test_a_hold_mid_window_cuts_the_window_there(stage_factory, monkeypatch):
+    stage = await stage_factory()
+    await stage.stage_batch(
+        [rec(1, 0, o, b"a") for o in range(stage_mod._SCAN_CHUNK + 5)], now_us=NOW
+    )
+    stage.forget_index()
+    stream = stage.row_stream(max_bytes=BIG, now_us=NOW)
+    real = stream._peek
+    peeks = 0
+
+    async def peek():
+        nonlocal peeks
+        peeks += 1
+        if peeks == 3:  # another window of the group failed meanwhile
+            stream.hold(g(1), nbytes=0, rows=0, now_us=NOW)
+        return await real()
+
+    monkeypatch.setattr(stream, "_peek", peek)
+    window = await stream.next_window()
+    assert window is not None and not window.complete
+    assert [rk.offset for rk, _ in window.rows] == [0, 1]
+    assert await stream.next_window() is None
+    assert stream.rows_skipped == stage_mod._SCAN_CHUNK + 3
+    assert index(stage)[g(1)][2] == stage_mod._SCAN_CHUNK + 3
+    await stage.close()
+
+
+async def test_the_row_stream_is_one_read_ahead_iterator(stage_factory, monkeypatch):
+    """One sequential pass, never a seek per group: a single
+    ``scan_with_options`` with the bulk read-ahead options, whatever the
+    number of groups (the per-group skip-scan it replaces stalled startup
+    for tens of minutes at S3 latency)."""
+    stage = await stage_factory()
+    await stage.stage_batch([rec(t, 0, t) for t in range(300)], now_us=NOW)
+    opened = []
+    real = stage._db.scan_with_options
+
+    async def spied(range_, options):
+        opened.append((range_, options))
+        return await real(range_, options)
+
+    async def no_default_scan(*_a, **_k):
+        raise AssertionError("a default-options scan")
+
+    monkeypatch.setattr(stage._db, "scan_with_options", spied)
+    monkeypatch.setattr(stage._db, "scan", no_default_scan)
+    assert len(await staged_groups(stage)) == 300
+    ((range_, options),) = opened
+    assert (range_.start, range_.end) == keyspace.rows_range()
+    assert (
+        options.read_ahead_bytes,
+        options.max_fetch_tasks,
+        options.cache_blocks,
+    ) == (stage_mod._DRAIN_READ_AHEAD_BYTES, stage_mod._DRAIN_FETCH_TASKS, False)
+    # Long-lived and per partition: less read-ahead than a window scan.
+    assert options.read_ahead_bytes * options.max_fetch_tasks < 16 * 1024 * 1024
+    await stage.close()
+
+
+async def test_the_row_stream_refuses_a_bad_budget(stage_factory):
+    stage = await stage_factory()
+    with pytest.raises(ValueError, match="max_bytes"):
+        stage.row_stream(max_bytes=0, now_us=NOW)
     await stage.close()
 
 
@@ -470,7 +662,11 @@ async def test_no_scan_runs_under_the_write_lock(stage_factory, monkeypatch):
     stage = await stage_factory()
     spy = LockedScanSpy(stage, monkeypatch)
     await stage.stage_batch([rec(5, 0, o) for o in range(6)], now_us=NOW)
-    await stage.discover(now_us=NOW)
+    stream = stage.row_stream(max_bytes=1, now_us=NOW)
+    window = await stream.next_window()
+    assert window is not None
+    await asyncio.gather(stage.settle(window), stream.next_window())
+    await stage.delete_foreign_keys()
     scan = await stage.scan(g(5), max_bytes=1, now_us=NOW)
     await asyncio.gather(
         stage.settle(scan),
@@ -479,7 +675,7 @@ async def test_no_scan_runs_under_the_write_lock(stage_factory, monkeypatch):
     )
     full = await stage.scan(g(5), max_bytes=BIG, now_us=NOW)
     await stage.settle(full)
-    assert spy.calls, "discovery and the scans should have read"
+    assert spy.calls, "the row stream and the scans should have read"
     assert spy.under_lock == []
     await stage.close()
 
@@ -574,7 +770,9 @@ async def test_close_guards(stage_factory):
     with pytest.raises(StageClosedError):
         await stage.probe_fence(1)
     with pytest.raises(StageClosedError):
-        await stage.discover(now_us=NOW)
+        stage.row_stream(max_bytes=1, now_us=NOW)
+    with pytest.raises(StageClosedError):
+        await stage.delete_foreign_keys()
     async with await stage_factory(partition=1) as managed:
         await managed.stage_batch([rec(1, 0, 0)], now_us=NOW)
     with pytest.raises(StageClosedError):
@@ -630,10 +828,10 @@ def manager(**kwargs) -> StageManager:
     )
 
 
-async def test_manager_opens_discovers_and_aggregates():
+async def test_manager_opens_and_aggregates():
     m = manager()
     assert m.path_for("events", 3) == "millrace/events/3"
-    await m.sync_assignment([("events", 0), ("events", 1)], now_us=NOW)
+    await m.sync_assignment([("events", 0), ("events", 1)])
     assert m.partitions() == (("events", 0), ("events", 1))
     await m.stage("events", 0).stage_batch([rec(1, 0, 0, b"ab")], now_us=NOW + 5)
     await m.stage("events", 1).stage_batch(
@@ -653,30 +851,33 @@ async def test_manager_opens_discovers_and_aggregates():
     )
     assert gauges.oldest_first_staged_ts == NOW + 2
     with pytest.raises(StageError, match="already open"):
-        await m.open_partition("events", 0, now_us=NOW)
-    await m.sync_assignment([("events", 1)], now_us=NOW)
+        await m.open_partition("events", 0)
+    await m.sync_assignment([("events", 1)])
     assert m.partitions() == (("events", 1),)
     with pytest.raises(KeyError):
         m.stage("events", 0)
     await m.close()
     await m.close()
     with pytest.raises(StageClosedError):
-        await m.open_partition("events", 0, now_us=NOW)
+        await m.open_partition("events", 0)
     with pytest.raises(StageClosedError):
-        await m.sync_assignment([], now_us=NOW)
+        await m.sync_assignment([])
     empty = manager().gauges()
     assert (empty.staged_groups, empty.oldest_first_staged_ts) == (0, None)
 
 
-async def test_manager_reopen_discovers_the_previous_owners_groups(tmp_path):
+async def test_manager_reopen_streams_the_previous_owners_rows(tmp_path):
+    """A reopened stage's index starts empty (no per-group discovery);
+    the startup drain's row stream reads what the previous owner left."""
     base = f"{tmp_path}/millrace"
     first = StageManager("file:///", base, settings=fast_flush_settings())
-    await first.open_partition("events", 0, now_us=NOW)
+    await first.open_partition("events", 0)
     await first.stage("events", 0).stage_batch([rec(1, 0, 0), rec(2, 0, 1)], now_us=NOW)
     await first.close()
     second = StageManager("file:///", base, settings=fast_flush_settings())
-    stage = await second.open_partition("events", 0, now_us=NOW + 7)
-    assert sorted(s.group for s in stage.snapshot()) == [g(1), g(2)]
+    stage = await second.open_partition("events", 0)
+    assert stage.snapshot() == []
+    assert await staged_groups(stage) == [g(1), g(2)]
     await second.close()
 
 
@@ -708,7 +909,7 @@ async def test_manager_opens_every_partition_on_the_shared_cache_with_its_id(
     m = manager(block_cache_bytes=1 << 20, meta_cache_bytes=1 << 18)
     assert m.cache_capacity_bytes == (1 << 20, 1 << 18)
     claimed = [("events", 0), ("events", 7), ("other", 0)]
-    await m.sync_assignment(claimed, now_us=NOW)
+    await m.sync_assignment(claimed)
     assert [c[0] for c in spy.calls] == ["with_db_cache"] * 3
     assert len({id(c[1]) for c in spy.calls}) == 1
     assert [c[2] for c in spy.calls] == [
@@ -738,7 +939,7 @@ def test_the_shared_cache_halves_carry_their_configured_capacities(monkeypatch):
 async def test_manager_opens_with_the_cache_disabled_on_the_zero_pair(monkeypatch):
     spy = _SpyBuilder(monkeypatch)
     m = manager(block_cache_bytes=0, meta_cache_bytes=0)
-    await m.sync_assignment([("events", 0)], now_us=NOW)
+    await m.sync_assignment([("events", 0)])
     assert spy.calls == [("with_db_cache_disabled",)]
     await m.close()
 
@@ -843,14 +1044,14 @@ async def test_the_pinned_table_uuid_round_trips_and_survives_a_reopen(stage_fac
     )
     await stage.close()
     reopened = await stage_factory()
-    assert await reopened.discover(now_us=NOW) == []  # not a row
+    assert await stream_windows(reopened) == []  # not a row
     assert await reopened.pinned_table_uuid() == (
         "0b8ee9ba-79a1-4f3e-b7e5-6a0b6ab6f012"
     )
     await reopened.close()
 
 
-async def test_discover_deletes_an_older_layouts_keys_and_keeps_rows_and_meta(
+async def test_delete_foreign_keys_deletes_an_older_layout_and_keeps_rows_and_meta(
     stage_factory,
 ):
     stage = await stage_factory()
@@ -870,8 +1071,7 @@ async def test_discover_deletes_an_older_layouts_keys_and_keeps_rows_and_meta(
     handle = await stage._db.write(batch)
     await handle.await_durable()
     assert len(foreign) > stage_mod._SCAN_CHUNK
-    found = await stage.discover(now_us=NOW)
-    assert sorted(found) == [g(1), g(2)]
+    assert await stage.delete_foreign_keys() == len(foreign)
     for key in foreign:
         assert await stage._db.get(key) is None
     assert await stage._db.get(keyspace.FENCE_PROBE_KEY) is not None
@@ -880,7 +1080,9 @@ async def test_discover_deletes_an_older_layouts_keys_and_keeps_rows_and_meta(
     await stage.close()
 
 
-async def test_discover_on_a_clean_stage_deletes_nothing(stage_factory, monkeypatch):
+async def test_delete_foreign_keys_on_a_clean_stage_deletes_nothing(
+    stage_factory, monkeypatch
+):
     stage = await stage_factory()
     await stage.stage_batch([rec(1, 0, 0)], now_us=NOW)
     writes = []
@@ -891,6 +1093,144 @@ async def test_discover_on_a_clean_stage_deletes_nothing(stage_factory, monkeypa
         return await real(batch)
 
     monkeypatch.setattr(stage._db, "write", spied)
-    await stage.discover(now_us=NOW)
+    assert await stage.delete_foreign_keys() == 0
     assert writes == []
+    await stage.close()
+
+
+async def test_a_held_group_leaves_the_index_only_through_a_scan_of_it(
+    stage_factory,
+):
+    """A drain window's complete settle never releases a held group (the
+    failed window's rows are still staged); a normal-loop scan does."""
+    stage = await stage_factory()
+    await stage.stage_batch([rec(1, 0, o, b"x") for o in range(4)], now_us=NOW)
+    stage.forget_index()
+    stream = stage.row_stream(max_bytes=2, now_us=NOW)
+    first = await stream.next_window()
+    second = await stream.next_window()
+    assert first is not None and second is not None and second.complete
+    stream.hold(g(1), nbytes=first.nbytes, rows=2, now_us=NOW)
+    assert not await stage.settle(second, durable=False)
+    snap = stage.snapshot()
+    assert [(s.group, s.held) for s in snap] == [(g(1), True)]
+    assert await offsets(stage, 1) == [0, 1]
+    full = await stage.scan(g(1), max_bytes=BIG, now_us=NOW)
+    assert full.gen is not None and full.complete
+    assert await stage.settle(full)
+    assert stage.snapshot() == []
+    await stage.close()
+
+
+class _ReadErrors:
+    """Wraps a stage's row-stream iterators; ``fail_at`` names the
+    next_batch calls (counted over all of them) that raise."""
+
+    def __init__(self, stage, monkeypatch, *, fail_at, error):
+        self.opened = 0
+        self.calls = 0
+        real = stage._db.scan_with_options
+
+        async def scan_with_options(range_, options):
+            self.opened += 1
+            it = await real(range_, options)
+            spy = self
+
+            class It:
+                async def next_batch(self, n):
+                    spy.calls += 1
+                    if spy.calls in fail_at:
+                        raise error
+                    return await it.next_batch(n)
+
+            return It()
+
+        monkeypatch.setattr(stage._db, "scan_with_options", scan_with_options)
+
+
+async def test_the_row_stream_reopens_past_the_last_key_after_a_read_error(
+    stage_factory, monkeypatch
+):
+    monkeypatch.setattr(stage_mod, "_PAGE_FETCH", 4)
+    stage = await stage_factory()
+    await stage.stage_batch([rec(o % 7, 0, o) for o in range(60)], now_us=NOW)
+    errors = _ReadErrors(
+        stage, monkeypatch, fail_at={3, 9, 10}, error=SlateError.Data("not found")
+    )
+    stream = stage.row_stream(max_bytes=BIG, now_us=NOW)
+    read = []
+    while (window := await stream.next_window()) is not None:
+        read.extend(rk.offset for rk, _ in window.rows)
+    assert sorted(read) == list(range(60))  # every row once
+    assert stream.reopens == 3 and errors.opened == 4
+    await stage.close()
+
+
+async def test_the_row_stream_gives_up_after_repeated_read_errors(
+    stage_factory, monkeypatch
+):
+    stage = await stage_factory()
+    await stage.stage_batch([rec(1, 0, o) for o in range(5)], now_us=NOW)
+    limit = stage_mod._STREAM_READ_RETRIES
+    _ReadErrors(
+        stage,
+        monkeypatch,
+        fail_at=set(range(1, limit + 2)),
+        error=SlateError.Unavailable("store down"),
+    )
+    with pytest.raises(SlateError.Unavailable):
+        await stage.row_stream(max_bytes=BIG, now_us=NOW).next_window()
+    await stage.close()
+
+
+async def test_the_row_stream_never_retries_a_closed_or_fenced_db(
+    stage_factory, monkeypatch
+):
+    stage = await stage_factory()
+    await stage.stage_batch([rec(1, 0, o) for o in range(5)], now_us=NOW)
+    errors = _ReadErrors(
+        stage,
+        monkeypatch,
+        fail_at={1},
+        error=SlateError.Closed(CloseReason.FENCED, "newer writer"),
+    )
+    with pytest.raises(SlateError.Closed):
+        await stage.row_stream(max_bytes=BIG, now_us=NOW).next_window()
+    assert errors.opened == 1
+    await stage.close()
+
+
+async def test_the_row_stream_reopens_on_a_timer_without_repeating_rows(
+    stage_factory, monkeypatch
+):
+    """A long-lived iterator pins SSTs the GC may delete: the stream
+    reopens past its last key every ``_STREAM_REOPEN_S``."""
+    monkeypatch.setattr(stage_mod, "_PAGE_FETCH", 3)
+    stage = await stage_factory()
+    await stage.stage_batch([rec(o % 5, 0, o) for o in range(40)], now_us=NOW)
+    errors = _ReadErrors(stage, monkeypatch, fail_at=set(), error=None)
+    clock = [0.0]
+
+    def monotonic():
+        clock[0] += stage_mod._STREAM_REOPEN_S / 4  # four reads per reopen
+        return clock[0]
+
+    stream = stage.row_stream(max_bytes=BIG, now_us=NOW, monotonic=monotonic)
+    read = []
+    while (window := await stream.next_window()) is not None:
+        read.extend(rk.offset for rk, _ in window.rows)
+    assert sorted(read) == list(range(40))
+    assert stream.reopens >= 3 and errors.opened == stream.reopens + 1
+    await stage.close()
+
+
+async def test_a_page_stops_fetching_at_its_byte_cap(stage_factory, monkeypatch):
+    monkeypatch.setattr(stage_mod, "_PAGE_FETCH", 2)
+    monkeypatch.setattr(stage_mod, "_PAGE_MAX_BYTES", 250)
+    stage = await stage_factory()
+    await stage.stage_batch([rec(1, 0, o, b"x" * 100) for o in range(10)], now_us=NOW)
+    stream = stage.row_stream(max_bytes=BIG, now_us=NOW)
+    await stream._fetch_page()
+    # Two-row fetches until the page passed 250 bytes: 4 rows, not 1024.
+    assert len(stream._page) == 4
     await stage.close()

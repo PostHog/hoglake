@@ -9,7 +9,8 @@ pattern).
 
 from __future__ import annotations
 
-from typing import Any
+import asyncio
+from typing import Any, Literal
 
 from millrace.stage import StagedRecord
 
@@ -74,6 +75,28 @@ def rec(team: int, ts: int, offset: int, payload: bytes | None = None) -> Staged
     )
 
 
+async def stream_windows(
+    stage: Any, *, max_bytes: int = 1 << 40, now_us: int = NOW
+) -> list[Any]:
+    """Every window of one :class:`~millrace.stage.RowStream` pass (the
+    startup drain's read), in stream order."""
+    stream = stage.row_stream(max_bytes=max_bytes, now_us=now_us)
+    out = []
+    while (window := await stream.next_window()) is not None:
+        out.append(window)
+    return out
+
+
+async def staged_groups(stage: Any) -> list[tuple[str | None, ...]]:
+    """The groups with staged rows, in key order, each once (one
+    :func:`stream_windows` pass)."""
+    groups: list[tuple[str | None, ...]] = []
+    for window in await stream_windows(stage):
+        if not groups or groups[-1] != window.group:
+            groups.append(window.group)
+    return groups
+
+
 def payload_for(offset: int, size: int) -> bytes:
     """The deterministic payload the kill-child writes for ``offset``;
     the parent re-derives it to verify byte-exact survival."""
@@ -95,13 +118,19 @@ class LockedScanSpy:
     ``LockedScanSpy(stage, monkeypatch)``; ``under_lock`` lists the
     offending calls, ``calls`` all of them. Iterator calls are checked
     per call, so a scan opened before the lock but paged inside it is
-    caught too."""
+    caught too. "Held" means held by the CALLING task (:class:`_OwnedLock`):
+    another task reading while a write holds the lock stalls nobody. The
+    blind spot: a holder that offloads a scan to another task or thread
+    and waits for it under the lock is not seen."""
 
     _SCANS = ("scan", "scan_with_options", "scan_prefix", "scan_prefix_with_options")
 
     def __init__(self, stage: Any, monkeypatch: Any) -> None:
         self.calls: list[tuple[str, bool]] = []
         self._stage = stage
+        assert not stage._write_lock.locked()
+        self._lock = _OwnedLock()
+        monkeypatch.setattr(stage, "_write_lock", self._lock)
         db = stage._db
         self._wrap_scans(db, "db", monkeypatch.setattr)
         for opener, who in (("begin", "txn"), ("snapshot", "snapshot")):
@@ -125,11 +154,33 @@ class LockedScanSpy:
             set_attr(target, name, spied)
 
     def _note(self, what: str) -> None:
-        self.calls.append((what, self._stage._write_lock.locked()))
+        self.calls.append((what, self._lock.held_by_current_task()))
 
     @property
     def under_lock(self) -> list[str]:
         return [what for what, locked in self.calls if locked]
+
+
+class _OwnedLock(asyncio.Lock):
+    """An asyncio.Lock that knows its holder: a read by ANOTHER task
+    while the lock is held (the startup drain streams while a window's
+    settle writes) stalls nobody; a read by the holder does."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._owner: asyncio.Task[Any] | None = None
+
+    async def acquire(self) -> Literal[True]:
+        await super().acquire()
+        self._owner = asyncio.current_task()
+        return True
+
+    def release(self) -> None:
+        self._owner = None
+        super().release()
+
+    def held_by_current_task(self) -> bool:
+        return self.locked() and self._owner is asyncio.current_task()
 
 
 class _Iter:

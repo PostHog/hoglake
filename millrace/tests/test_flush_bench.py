@@ -133,7 +133,7 @@ async def test_flush_sweep_throughput(httpx_mock: Any, memory_store: Any) -> Non
         "memory:///", "bench", settings=fast_flush_settings()
     ) as manager:
         for partition in range(PARTITIONS):
-            await manager.open_partition("events", partition, now_us=NOW)
+            await manager.open_partition("events", partition)
         clock = lambda: NOW
         store = FakeObjectStore()
 

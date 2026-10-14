@@ -3,7 +3,7 @@
 What the memory-backed component layer cannot see: persistence across a
 process boundary. The hard-kill test stages through a subprocess that is
 SIGKILLed mid-stream: every ACKNOWLEDGED row must be present and
-byte-exact on reopen, batch-atomic, and found by ``discover``. The
+byte-exact on reopen, batch-atomic, and read by the drain's row stream. The
 reassignment test reopens the same path from a fresh manager; the
 fencing test contests a live writer's path.
 """
@@ -19,7 +19,15 @@ from pathlib import Path
 
 import pytest
 from slatedb.uniffi import ObjectStore
-from stagekit import NOW, fast_flush_settings, g, payload_for, rec, shared_cache
+from stagekit import (
+    NOW,
+    fast_flush_settings,
+    g,
+    payload_for,
+    rec,
+    shared_cache,
+    staged_groups,
+)
 
 from millrace.stage import (
     FencedError,
@@ -110,8 +118,8 @@ def test_durability_across_hard_kill(tmp_path: Path) -> None:
 async def _verify_after_kill(path: str, acked: list[tuple[int, int, int]]) -> None:
     stage = await _open(path)
     try:
-        # 1. discovery finds exactly the groups that hold rows
-        found = await stage.discover(now_us=NOW)
+        # 1. the row stream finds exactly the groups that hold rows
+        found = await staged_groups(stage)
         rows_by_team: dict[int, dict[int, bytes]] = {t: {} for t in range(TEAMS)}
         for team in range(TEAMS):
             scan = await stage.scan((str(team),), max_bytes=BIG, now_us=NOW)
@@ -146,11 +154,11 @@ async def _verify_after_kill(path: str, acked: list[tuple[int, int, int]]) -> No
 
 
 async def test_assignment_change_between_deploys(tmp_path: Path):
-    """A fresh manager opens the same partition path, discovers the
+    """A fresh manager opens the same partition path, reads the
     previous owner's group and rows exactly, and keeps staging on top."""
     base = str(tmp_path / "millrace")
     first_owner = StageManager("file:///", base, settings=fast_flush_settings())
-    stage = await first_owner.open_partition("events", 3, now_us=NOW)
+    stage = await first_owner.open_partition("events", 3)
     assert stage.snapshot() == []
     await stage.stage_batch([rec(11, 0, i) for i in range(10)], now_us=NOW)
     await stage.stage_batch([rec(11, 0, 10 + i) for i in range(10)], now_us=NOW + 1)
@@ -158,8 +166,8 @@ async def test_assignment_change_between_deploys(tmp_path: Path):
 
     second_owner = StageManager("file:///", base, settings=fast_flush_settings())
     assert second_owner.path_for("events", 3) == first_owner.path_for("events", 3)
-    stage = await second_owner.open_partition("events", 3, now_us=NOW + 5)
-    assert [s.group for s in stage.snapshot()] == [g(11)]
+    stage = await second_owner.open_partition("events", 3)
+    assert await staged_groups(stage) == [g(11)]
     scan = await stage.scan(g(11), max_bytes=BIG, now_us=NOW)
     assert [rk.offset for rk, _ in scan.rows] == list(range(20))
     await stage.stage_batch([rec(11, 0, 20 + i) for i in range(5)], now_us=NOW + 6)
@@ -176,13 +184,13 @@ async def test_a_settle_survives_a_clean_reopen(tmp_path: Path):
     assert not await stage.settle(scan)
     await stage.close()
     reopened = await _open(path)
-    assert await reopened.discover(now_us=NOW) == [g(2)]
+    assert await staged_groups(reopened) == [g(2)]
     rest = await reopened.scan(g(2), max_bytes=BIG, now_us=NOW)
     assert [rk.offset for rk, _ in rest.rows] == [4, 5]
     assert await reopened.settle(rest)
     await reopened.close()
     empty = await _open(path)
-    assert await empty.discover(now_us=NOW) == []
+    assert await staged_groups(empty) == []
     await empty.close()
 
 
@@ -203,7 +211,7 @@ async def test_a_contested_open_fences_the_older_stage(tmp_path: Path):
             await old.probe_fence(5)
         assert is_fenced(probe.value)
         assert str(FencedError([("events", 0)])).startswith("stage fenced")
-        assert await new.discover(now_us=NOW) == [g(1)]
+        assert await staged_groups(new) == [g(1)]
         scan = await new.scan(g(1), max_bytes=BIG, now_us=NOW)
         assert [rk.offset for rk, _ in scan.rows] == [0]
     finally:

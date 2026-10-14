@@ -116,9 +116,10 @@ timestamp is never read.
 There is no persisted index. Each stage keeps its groups' first staged
 time, staged bytes and a write generation in memory. That is sound
 because **staged state never outlives a process**: at startup each
-replica opens its stages, finds every group with rows (one seek per
-group), and flushes all of them before it consumes anything new (the
-startup drain). After that, every write updates the in-memory index
+replica opens its stages and flushes everything staged before it
+consumes anything new (the startup drain: one sequential read-ahead
+pass per partition, partitions concurrently, flushed window by window;
+a group that fails is held in the index and its rows stay staged). After that, every write updates the in-memory index
 before it reaches disk, and a group leaves the index only when a
 complete scan of it was flushed and no write touched it since; so a
 group with staged rows is always in the index, and every group becomes

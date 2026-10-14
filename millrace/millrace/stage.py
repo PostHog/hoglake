@@ -7,10 +7,13 @@ second open of a path succeeds and the older writer gets
 ``Error.Closed(FENCED)`` at its next write's durability wait.
 
 Group sizes and ages are kept IN MEMORY only (:class:`GroupState`).
-That is sound because staged state never outlives a process: at open,
-:meth:`PartitionStage.discover` finds every group that has rows (before
-any consumer writes), and the process drains them all before it
-consumes (main.py). From then on every row that reaches disk was first
+That is sound because staged state never outlives a process: before any
+consumer write, the startup drain reads every staged row in ONE
+sequential pass (:class:`RowStream`) and flushes it window by window;
+a group whose window fails is entered in the index
+(:meth:`PartitionStage.hold`) and its remaining rows are skipped and
+counted, so after the drain the index holds exactly the groups that
+still have rows. From then on every row that reaches disk was first
 counted in memory under the write lock, so a group with rows on disk is
 always in the index; a group leaves the index only when a complete scan
 of it was settled and no write touched it since the scan began
@@ -28,7 +31,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-from collections.abc import Iterable, Mapping, Sequence
+import time
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Final, Literal, Self, overload
 
@@ -37,9 +41,11 @@ from slatedb.uniffi import (
     Db,
     DbBuilder,
     DbCache,
+    DbIterator,
     DefaultMetricsRecorder,
     DurabilityLevel,
     KeyRange,
+    KeyValue,
     MokaCacheOptions,
     ObjectStore,
     ScanOptions,
@@ -65,6 +71,37 @@ _SCAN_CHUNK: Final = 1024
 
 _BULK_SCAN_READ_AHEAD_BYTES: Final = 4 * 1024 * 1024
 _BULK_SCAN_FETCH_TASKS: Final = 4
+
+
+#: The startup drain's row stream reads with less read-ahead than a
+#: flush window scan: one iterator stays open per partition for the
+#: whole drain, and read-ahead is per SST iterator of the merge (every
+#: L0 and sorted run), so its buffers scale with partitions x sources.
+_DRAIN_READ_AHEAD_BYTES: Final = 1024 * 1024
+_DRAIN_FETCH_TASKS: Final = 2
+#: The drain stream's page: fetched ``_PAGE_FETCH`` rows at a time until
+#: it holds ``_PAGE_MAX_ROWS`` rows or ``_PAGE_MAX_BYTES`` of payload.
+_PAGE_FETCH: Final = 64
+_PAGE_MAX_ROWS: Final = 1024
+_PAGE_MAX_BYTES: Final = 16 * 1024 * 1024
+#: The drain stream reopens its iterator just past the last key it read
+#: this often, and after a read error (up to ``_STREAM_READ_RETRIES`` in
+#: a row): a long-lived iterator pins SSTs the compactor has retired,
+#: which the maintenance GC deletes once they pass its min age.
+_STREAM_REOPEN_S: Final = 60.0
+_STREAM_READ_RETRIES: Final = 3
+
+
+def _drain_scan_options() -> ScanOptions:
+    """Options for the startup drain's long-lived row stream (see
+    :data:`_DRAIN_READ_AHEAD_BYTES`)."""
+    return ScanOptions(
+        durability_filter=DurabilityLevel.MEMORY,
+        dirty=False,
+        read_ahead_bytes=_DRAIN_READ_AHEAD_BYTES,
+        cache_blocks=False,
+        max_fetch_tasks=_DRAIN_FETCH_TASKS,
+    )
 
 
 def _bulk_scan_options() -> ScanOptions:
@@ -153,18 +190,22 @@ class StageAck:
 class GroupState:
     """In-memory accounting of one staged group. ``staged_bytes`` and
     ``rows`` over-count after a Kafka redelivery (a re-put of the same
-    key is counted again) and under-count for groups found by
-    :meth:`PartitionStage.discover` (zero); neither affects delivery.
+    key is counted again) and are approximate for groups the startup
+    drain held (:meth:`PartitionStage.hold`); neither affects delivery.
     ``gen`` is the stage-wide write generation of the last batch that
     touched the group. ``backlog`` is set when a flush settled only part
     of the group's rows (a capped scan): the rest is due on the next
-    sweep, whatever its counted size."""
+    sweep, whatever its counted size. ``held`` is set when the startup
+    drain kept the group's rows staged (:meth:`PartitionStage.hold`):
+    no drain window's settle removes a held group, only a complete scan
+    of the index (the normal flush loop) does."""
 
     first_staged_ts: int
     staged_bytes: int = 0
     rows: int = 0
     gen: int = 0
     backlog: bool = False
+    held: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,6 +215,7 @@ class GroupSnapshot:
     staged_bytes: int
     rows: int
     backlog: bool = False
+    held: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,6 +235,170 @@ class Scan:
     @property
     def nbytes(self) -> int:
         return sum(len(p) for _, p in self.rows)
+
+
+class RowStream:
+    """The startup drain's single pass over one stage's ``rows/``: ONE
+    iterator with read-ahead (never a seek per group), cut into flush
+    windows. A window is an exact offset run of ONE group, cut at the
+    group's last row or where the next row would exceed ``max_bytes``
+    (always at least one row). The scan never holds the write lock.
+
+    Rows of a group the drain holds (:meth:`hold`, after a window of it
+    failed) are skipped and added to its index entry: they stay staged
+    for the normal flush loop.
+
+    Memory: the window being built (at most ``max_bytes``, plus one
+    row), one page (at most :data:`_PAGE_MAX_ROWS` rows and about
+    :data:`_PAGE_MAX_BYTES` of payload), and the iterator's read-ahead
+    (:func:`_drain_scan_options`, per SST iterator of the merge).
+
+    The iterator is reopened just past the last key read every
+    :data:`_STREAM_REOPEN_S` seconds and after a read error (e.g. an SST
+    the GC deleted under it), so the pass resumes, never repeats."""
+
+    def __init__(
+        self,
+        stage: PartitionStage,
+        *,
+        max_bytes: int,
+        now_us: int,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if max_bytes < 1:
+            raise ValueError(f"max_bytes must be >= 1, got {max_bytes}")
+        self._stage = stage
+        self._max_bytes = max_bytes
+        self._now_us = now_us
+        self._monotonic = monotonic
+        self._it: DbIterator | None = None
+        self._opened_at = 0.0
+        self._resume_after: bytes | None = None
+        #: Iterator reopens after the first open (timer or error).
+        self.reopens = 0
+        self._page: list[tuple[RowKey, bytes]] = []
+        self._pos = 0
+        self._exhausted = False
+        self._last_group: PartitionTuple | None = None
+        self._held: set[PartitionTuple] = set()
+        #: Distinct groups met so far (rows are in group order).
+        self.groups_seen = 0
+        #: Rows / payload bytes skipped because their group is held.
+        self.rows_skipped = 0
+        self.bytes_skipped = 0
+
+    def hold(
+        self, group: PartitionTuple, *, nbytes: int, rows: int, now_us: int
+    ) -> None:
+        """Keep ``group``'s rows staged (a window of it failed): index it
+        (:meth:`PartitionStage.hold`) and skip the rest of its rows."""
+        self._held.add(group)
+        self._stage.hold(group, nbytes=nbytes, rows=rows, now_us=now_us)
+
+    async def _open(self) -> None:
+        start, end = keyspace.rows_range()
+        resume = self._resume_after
+        if self._it is not None or resume is not None:
+            self.reopens += 1
+        self._it = await self._stage._db.scan_with_options(
+            KeyRange(
+                start=start if resume is None else resume,
+                start_inclusive=resume is None,
+                end=end,
+                end_inclusive=False,
+            ),
+            _drain_scan_options(),
+        )
+        self._opened_at = self._monotonic()
+
+    async def _next_batch(self, n: int) -> list[KeyValue]:
+        failures = 0
+        while True:
+            if (
+                self._it is None
+                or self._monotonic() - self._opened_at >= _STREAM_REOPEN_S
+            ):
+                await self._open()
+            assert self._it is not None
+            try:
+                return list(await self._it.next_batch(n))
+            except SlateError.Closed:
+                raise
+            except SlateError as e:
+                failures += 1
+                if failures > _STREAM_READ_RETRIES:
+                    raise
+                log.warning(
+                    "%s[%d]: the drain's row stream failed a read (%s); "
+                    "reopening past the last key read",
+                    self._stage.topic,
+                    self._stage.partition,
+                    e,
+                )
+                self._opened_at = float("-inf")  # reopen on the next try
+
+    async def _fetch_page(self) -> None:
+        page: list[tuple[RowKey, bytes]] = []
+        nbytes = 0
+        while len(page) < _PAGE_MAX_ROWS and nbytes < _PAGE_MAX_BYTES:
+            chunk = await self._next_batch(min(_PAGE_FETCH, _PAGE_MAX_ROWS - len(page)))
+            if not chunk:
+                self._exhausted = True
+                break
+            for kv in chunk:
+                page.append((keyspace.decode_row_key(kv.key), kv.value))
+                nbytes += len(kv.value)
+            self._resume_after = bytes(chunk[-1].key)
+        self._page = page
+        self._pos = 0
+
+    async def _peek(self) -> tuple[RowKey, bytes] | None:
+        while self._pos >= len(self._page):
+            if self._exhausted:
+                return None
+            await self._fetch_page()
+        row = self._page[self._pos]
+        if row[0].group != self._last_group:
+            self._last_group = row[0].group
+            self.groups_seen += 1
+        return row
+
+    async def next_window(self) -> Scan | None:
+        """The next flush window, or None once every row was read. The
+        window's ``complete`` says whether it reached its group's last
+        row; ``gen`` is None (the drain runs before any write)."""
+        self._stage._ensure_open()
+        rows: list[tuple[RowKey, bytes]] = []
+        nbytes = 0
+        group: PartitionTuple | None = None
+        while True:
+            row = await self._peek()
+            if row is None:
+                break
+            key, payload = row
+            if key.group in self._held:
+                # A held group: its rows stay staged for the normal loop.
+                if group is not None and key.group == group:
+                    return Scan(group, rows, False, None, self._now_us)
+                self._stage.hold(
+                    key.group, nbytes=len(payload), rows=1, now_us=self._now_us
+                )
+                self.rows_skipped += 1
+                self.bytes_skipped += len(payload)
+                self._pos += 1
+                continue
+            if group is None:
+                group = key.group
+            elif key.group != group:
+                return Scan(group, rows, True, None, self._now_us)
+            if rows and nbytes + len(payload) > self._max_bytes:
+                return Scan(group, rows, False, None, self._now_us)
+            rows.append(row)
+            nbytes += len(payload)
+            self._pos += 1
+        if group is None:
+            return None
+        return Scan(group, rows, True, None, self._now_us)
 
 
 @dataclass(frozen=True, slots=True)
@@ -413,39 +619,46 @@ class PartitionStage:
         if self._closed:
             raise StageClosedError(f"stage {self._path} is closed")
 
-    # -- discovery ------------------------------------------------------------
+    # -- the startup drain's row stream ---------------------------------------
 
-    async def discover(self, *, now_us: int) -> list[PartitionTuple]:
-        """Find every group with staged rows and enter it in the index
-        (first_staged_ts = ``now_us``, sizes unknown). Called once at
-        open, before any consumer write, so it needs no lock.
-
-        A skip-scan: one single-row seek per group, each starting just
-        past the previous group's range (prefix-free encoding), so the
-        cost is the number of groups, not the staged bytes."""
+    def row_stream(
+        self,
+        *,
+        max_bytes: int,
+        now_us: int,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> RowStream:
+        """One sequential, read-ahead pass over every staged row, cut
+        into flush windows (:class:`RowStream`). Only the startup drain
+        uses it, before any consumer write."""
         self._ensure_open()
-        cursor, end = keyspace.rows_range()
-        found: list[PartitionTuple] = []
-        while True:
-            it = await self._db.scan(
-                KeyRange(
-                    start=cursor, start_inclusive=True, end=end, end_inclusive=False
-                )
-            )
-            chunk = await it.next_batch(1)
-            if not chunk:
-                break
-            group = keyspace.decode_row_key(chunk[0].key).group
-            found.append(group)
-            self._groups.setdefault(group, GroupState(first_staged_ts=now_us))
-            cursor = keyspace.group_rows_range(group)[1]
-        await self._delete_foreign_keys()
-        return found
+        return RowStream(self, max_bytes=max_bytes, now_us=now_us, monotonic=monotonic)
 
-    async def _delete_foreign_keys(self) -> None:
+    def forget_index(self) -> None:
+        """Empty the in-memory index. The startup drain starts here:
+        everything on disk is about to be read, and a group re-enters
+        the index only if its rows stay staged (:meth:`hold`)."""
+        self._groups.clear()
+
+    def hold(
+        self, group: PartitionTuple, *, nbytes: int, rows: int, now_us: int
+    ) -> None:
+        """Keep ``group``'s rows staged past the startup drain: enter it
+        in the index (the normal flush loop retries it) and add
+        ``nbytes``/``rows`` to its counts (:meth:`RowStream.hold`)."""
+        state = self._groups.get(group)
+        if state is None:
+            state = self._groups[group] = GroupState(first_staged_ts=now_us)
+        state.held = True
+        state.staged_bytes += nbytes
+        state.rows += rows
+
+    async def delete_foreign_keys(self) -> int:
         """Delete every key outside ``rows/`` and ``meta/`` (an older
         build's layout: ``stats/``, ``sched_age/``, ``prepared/``,
-        ``flushed/``), in bounded batches; scans run outside the lock."""
+        ``flushed/``), in bounded batches; scans read ahead and run
+        outside the lock. Returns the number deleted."""
+        self._ensure_open()
         rows_start, rows_end = keyspace.rows_range()
         meta_end = keyspace.prefix_successor(keyspace.META_PREFIX)
         ranges = (
@@ -475,13 +688,7 @@ class PartitionStage:
                     handle = await self._db.write(batch)
                     await handle.await_durable()
                 deleted += len(chunk)
-        if deleted:
-            log.info(
-                "%s[%d]: deleted %d key(s) of an older staging layout",
-                self._topic,
-                self._partition,
-                deleted,
-            )
+        return deleted
 
     async def pinned_table_uuid(self) -> str | None:
         """The incarnation this stage's rows were first committed to."""
@@ -553,7 +760,9 @@ class PartitionStage:
     def snapshot(self) -> list[GroupSnapshot]:
         """The in-memory index, copied (planner input and gauges)."""
         return [
-            GroupSnapshot(g, s.first_staged_ts, s.staged_bytes, s.rows, s.backlog)
+            GroupSnapshot(
+                g, s.first_staged_ts, s.staged_bytes, s.rows, s.backlog, s.held
+            )
             for g, s in list(self._groups.items())
         ]
 
@@ -594,9 +803,19 @@ class PartitionStage:
                 rows.append((keyspace.decode_row_key(kv.key), kv.value))
                 nbytes += len(kv.value)
 
-    async def settle(self, scan: Scan) -> bool:
+    async def settle(self, scan: Scan, *, durable: bool = True) -> bool:
         """Delete exactly the scanned row keys in one durable batch, then
         update the index. Returns whether the group left the index.
+
+        ``durable=False`` returns once the deletes are written, without
+        waiting for their durability (the startup drain, which ends with
+        :meth:`make_durable`): at-least-once needs no durable delete (a
+        lost one re-flushes a duplicate after a crash), and the wait,
+        under the lock, would serialize the drain on one object-store PUT
+        per window. The cost: SlateDB fences lazily, at a durability
+        wait, so a drain fenced by a newer owner only learns it at the
+        next WAL flush or :meth:`make_durable`; meanwhile both owners may
+        publish the same windows (duplicates, never a loss).
 
         Exact keys, never a range: a row that entered the scanned offset
         range after the scan (a re-key) is not among them and survives.
@@ -614,11 +833,16 @@ class PartitionStage:
         async with self._write_lock:
             if batch is not None:
                 handle = await self._db.write(batch)
-                await handle.await_durable()
+                if durable:
+                    await handle.await_durable()
             state = self._groups.get(scan.group)
             if state is None:
                 return True
-            if scan.complete and state.gen == scan.gen:
+            # A drain window (gen None) never releases a held group: its
+            # failed window's rows are still staged even when this window
+            # reached the group's end. Only a scan of the index does.
+            drain_window_of_held = state.held and scan.gen is None
+            if scan.complete and state.gen == scan.gen and not drain_window_of_held:
                 del self._groups[scan.group]
                 return True
             state.staged_bytes = max(0, state.staged_bytes - scan.nbytes)
@@ -627,6 +851,13 @@ class PartitionStage:
             if scan.complete:
                 state.first_staged_ts = max(state.first_staged_ts, scan.started_us)
             return False
+
+    async def make_durable(self) -> None:
+        """Wait until every write so far is durable (the end of the
+        startup drain's non-durable settles). Not under the lock: it
+        writes nothing of its own. A fenced writer fails here."""
+        self._ensure_open()
+        await self._db.flush()
 
     async def close(self) -> None:
         """Flush and shut the instance down. Idempotent. A fenced writer
@@ -690,10 +921,9 @@ class StageManager:
     def stage(self, topic: str, partition: int) -> PartitionStage:
         return self._stages[(topic, partition)]
 
-    async def open_partition(
-        self, topic: str, partition: int, *, now_us: int
-    ) -> PartitionStage:
-        """Open one partition's stage and discover its staged groups."""
+    async def open_partition(self, topic: str, partition: int) -> PartitionStage:
+        """Open one partition's stage. Its index starts empty: the startup
+        drain reads what is staged (:class:`RowStream`)."""
         if self._closed:
             raise StageClosedError("stage manager is closed")
         key = (topic, partition)
@@ -719,28 +949,15 @@ class StageManager:
                 settings=self._settings,
                 cache_disabled=True,
             )
-        try:
-            groups = await stage.discover(now_us=now_us)
-        except BaseException:
-            await stage.close()
-            raise
         self._stages[key] = stage
-        log.info(
-            "opened %s[%d] at %s: %d staged group(s) to drain",
-            topic,
-            partition,
-            path,
-            len(groups),
-        )
+        log.info("opened %s[%d] at %s", topic, partition, path)
         return stage
 
     async def close_partition(self, topic: str, partition: int) -> None:
         stage = self._stages.pop((topic, partition))
         await stage.close()
 
-    async def sync_assignment(
-        self, claimed: Iterable[tuple[str, int]], *, now_us: int
-    ) -> None:
+    async def sync_assignment(self, claimed: Iterable[tuple[str, int]]) -> None:
         """Close revoked partitions and open newly claimed ones."""
         if self._closed:
             raise StageClosedError("stage manager is closed")
@@ -748,7 +965,7 @@ class StageManager:
         for topic, partition in sorted(set(self._stages) - want):
             await self.close_partition(topic, partition)
         for topic, partition in sorted(want - set(self._stages)):
-            await self.open_partition(topic, partition, now_us=now_us)
+            await self.open_partition(topic, partition)
 
     def gauges(self) -> StageGauges:
         """Pod totals from the in-memory index (cheap; no I/O)."""

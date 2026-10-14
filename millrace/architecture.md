@@ -76,7 +76,9 @@ are unique within an instance.
 | `meta/table_uuid` | the destination incarnation first committed to |
 
 Any other key (an older build's `stats/`, `sched_age/`, `prepared/`,
-`flushed/`) is deleted by `discover` at open, in bounded batches.
+`flushed/`) is deleted during the startup drain, alongside the row
+stream (`PartitionStage.delete_foreign_keys`: read-ahead scans, bounded
+delete batches; a failure is logged, never drain-fatal).
 
 **Group** = one partition tuple of the destination under the live spec
 at consume time: per spec field, the wire string a file of that tuple
@@ -94,9 +96,15 @@ write generation of the last batch that touched it. Nothing about
 groups is persisted. Invariant I2: *a group with rows on disk is in the
 index*. It holds because:
 
-1. At open (before any consumer write) `PartitionStage.discover`
-   skip-scans `rows/`: one single-row seek per group, each starting
-   past the previous group's range. Cost scales with groups, not bytes.
+1. A stage opens with an EMPTY index. Before any consumer write the
+   startup drain (§6) reads every row in one pass and flushes it; a
+   group whose window fails is entered in the index (`RowStream.hold`)
+   with the rest of its rows counted, so after the drain the index
+   holds exactly the groups that still have rows. (Opening used to
+   discover groups with one fresh default-options seek per group:
+   several sequential GETs each, ~270 ms per group at 60 ms latency,
+   partition after partition — the 18-minute unready startup on a
+   many-group backlog.)
 2. `stage_batch` updates the index **before** its write, under the
    write lock.
 3. A group leaves the index only in `settle`, under the lock, when the
@@ -105,8 +113,9 @@ index*. It holds because:
    write with an older gen had returned before the scan iterator was
    created, so the scan saw its rows; any newer write blocks removal.
 
-`staged_bytes`/`rows` over-count after a redelivery and are zero for
-discovered groups. Only the size lane and gauges read them.
+`staged_bytes`/`rows` over-count after a redelivery and are
+approximate for groups the drain held. Only the size lane and gauges
+read them.
 
 **The write lock** (one `asyncio.Lock` per stage) covers writes only:
 the index update, `db.write(batch)` and `await_durable`. No scan, no
@@ -150,7 +159,7 @@ round-trips every byte value and lengths 0 to 1 MiB.
 **Assignment** (`MillraceConsumer.start(drain)`): partition count from
 metadata once (transients retried), `compute_assignment` (`p %
 replicas == ordinal`; empty share → `AssignmentError`, exit 2),
-`StageManager.sync_assignment` (open + discover), **the drain**, a
+`StageManager.sync_assignment` (open; nothing is read), **the drain**, a
 coordinator warmup (`committed()` probes; librdkafka resolves
 `OFFSET_STORED` once at assign time and never retries), then
 `assign(OFFSET_STORED)`. A failed start is sticky.
@@ -181,8 +190,8 @@ running at once. A sweep reads only memory.
 | age | `age ≥ flush_deadline_s` and `staged_bytes ≥ min_flush_bytes` (1 MiB) |
 
 A group whose last attempt failed is due again when its backoff
-expires (2 s doubling to 120 s), regardless of the predicate. During
-the drain every group is due.
+expires (2 s doubling to 120 s), regardless of the predicate. The
+drain's retry pass (§6) treats every indexed group as due.
 
 **One decision** (`HoglakeFlusher.flush_group`):
 
@@ -249,11 +258,53 @@ the runner, stop it, and re-raise from `run`, `run_once` and `drain`.
 
 `main.py:_run` → `consumer.start(drain=runner.drain)`:
 
-1. Claim and open the stages; `discover` puts every group with rows in
-   the index (`first_staged_ts` = now, sizes unknown).
-2. `FlushRunner.drain`: sweep with every group due, back to back, until
-   each group is gone or stuck (`STUCK_AFTER` failures). Capped scans
-   just take more sweeps.
+1. Claim and open the stages (no reads; the index starts empty).
+2. `FlushRunner.drain`:
+   - check every stage's pinned incarnation (`meta/table_uuid`): a
+     recreated destination halts before anything is flushed;
+   - **stream** each partition, partitions concurrently
+     (`_drain_partition`): ONE iterator over `rows/` with the bulk
+     read-ahead options (`stage.RowStream`), cut into windows of one
+     group each, at the group's last row or where the next row would
+     exceed `flush_bytes` (always ≥ 1 row). Each window is flushed by
+     `HoglakeFlusher.flush_scan` (build, upload, commit, settle exactly
+     its keys; split commits settle per chunk) as the stream proceeds.
+     The stream reads with less read-ahead than a window scan (1 MiB ×
+     2 fetches per SST iterator; it is open per partition for the whole
+     drain), pages of at most 1,024 rows / ~16 MiB, and reopens just
+     past its last key every 60 s and after a read error (up to 3 in a
+     row): a long-lived iterator would pin SSTs the compactor retired
+     and the maintenance GC deletes;
+     A slot of a `flush_concurrency` semaphore shared by all partitions
+     is taken BEFORE a window is read and returned when its flush ends,
+     so at most `flush_concurrency` windows are in memory pod-wide. The
+     stream holds no lock;
+   - drain settles skip the per-window durability wait
+     (`settle(durable=False)`; a lost delete re-flushes a duplicate,
+     which at-least-once allows) and each partition's stream ends with
+     one `make_durable`. SlateDB fences lazily, so a fenced drain only
+     learns it at a WAL flush or `make_durable`; meanwhile both owners
+     may publish the same windows (duplicates only). Waiting per window serialized the drain on one
+     stage PUT per window under the write lock (~70 ms each at 60 ms
+     latency);
+   - a failing window does not block the stream: its group is held
+     (indexed with `held` set, the rest of its rows skipped and
+     counted), its failure noted for backoff. No drain window's settle
+     releases a held group, even a complete one landing after the
+     failure; only a complete scan of the index (the normal loop) does; after the streams, a retry pass flushes the held
+     groups (`run_once(drain=True)`) until each is gone or stuck
+     (`STUCK_AFTER`); stuck ones stay indexed and keep retrying in the
+     normal loop;
+   - older-layout keys are deleted alongside each stream;
+   - progress per partition: a start line, a line every 1,000 windows or
+     30 s (windows, rows, MiB, groups seen, rows/s, MiB/s, failed
+     windows) and an end line on every path (streamed, stopped, failed,
+     cancelled); `millrace_drain_rows_total` / `millrace_drain_bytes_total`
+     count what the streams and the retry pass flushed;
+   - an error a stream cannot contain cancels its sibling streams and
+     fails the drain (exit 1; the next start drains again);
+   - a stop (SIGTERM) reads no further window; in-flight windows finish,
+     the rest stays staged for the next start.
 3. Warm up the coordinator and assign. `/readyz` turns 200.
 
 So staged state never outlives a process, and there is no recovery
@@ -327,6 +378,7 @@ Everything is read from memory on the scrape thread
 | `millrace_staged_bytes`, `…_rows`, `…_groups`, `millrace_oldest_staged_age_seconds` | the in-memory index (since the last drain) |
 | `millrace_oldest_eligible_staged_age_seconds` | oldest group due at the last sweep (the backlog alert) |
 | `millrace_draining` | 1 during the startup drain |
+| `millrace_drain_rows_total`, `millrace_drain_bytes_total` | rows / payload bytes the startup drain flushed |
 | `millrace_slatedb_*` | SlateDB recorder snapshots, summed over the pod's instances |
 
 Probes: `/healthz` 503 once a halt or fence has latched;
@@ -339,17 +391,18 @@ and whenever liveness fails.
 |---|---|---|
 | 1 | Offsets commit only after every touched partition's write is durable; an all-drop poll writes a fence probe | `test_consumer.py` |
 | 2 | A fenced write raises `FencedError`, closes the stage, commits nothing | `test_consumer.py`, `test_stage_integration.py` |
-| 3 | I2: rows on disk ⇒ group in the index (discover, index-before-write, gen-guarded removal) | `test_stage.py` |
+| 3 | I2: rows on disk ⇒ group in the index (drain hold, index-before-write, gen-guarded removal) | `test_stage.py`, `test_drain.py` |
 | 4 | Settle deletes exactly the scanned keys | `test_stage.py` |
 | 5 | A scan returns an offset prefix ≤ budget and always ≥ 1 row | `test_stage.py`, `test_flush_contract.py` |
-| 6 | No scan and no payload lowering under the write lock | `test_stage.py` (lock spies) |
+| 6 | No scan and no payload lowering under the write lock | `test_stage.py`, `test_drain.py` (lock spies) |
 | 7 | Rows are deleted only after every commit of the decision landed | `test_flush_contract.py` |
 | 8 | Each build mints a fresh key; ambiguous answers resend identical bytes | `test_flush_contract.py`, `test_flush.py` |
 | 9 | A fanout over the cap splits into several commits | `test_flush_contract.py` |
 | 10 | A refused payload retries with backoff, then reports the group stuck; other groups continue | `test_flush_contract.py` |
 | 11 | Ancient and far-future events are written | `test_flush_contract.py`, `tests/live/test_live_junk.py` |
 | 12 | A recreated destination halts | `test_flush_contract.py`, `tests/live/test_live_recreate.py` |
-| 13 | The startup drain flushes a previous process's rows before consuming, and again after a crash mid-drain | `test_flush_contract.py`, `test_consumer.py`, `tests/live/test_live_kill.py` |
+| 13 | The startup drain flushes a previous process's rows before consuming, and again after a crash mid-drain | `test_flush_contract.py`, `test_consumer.py`, `test_drain.py`, `tests/live/test_live_kill.py` |
+| 17 | The startup drain is one read-ahead pass per partition, partitions concurrent, windows bounded by `flush_concurrency`; a stuck group stays staged and indexed without blocking it | `test_stage.py`, `test_drain.py`, `tests/live/test_live_drain_latency.py` |
 | 14 | Group encoding is prefix-free; row keys sort by (group, offset) | `test_keyspace.py` (mutation-gated) |
 | 15 | The binding patch round-trips every byte value and length | `test_slatedb_patch.py` |
 | 16 | Every produced record is in the lake at least once, under kills, latency and reassignment | `tests/live/` |

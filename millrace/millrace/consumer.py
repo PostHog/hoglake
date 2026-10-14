@@ -15,10 +15,10 @@ the live spec, so files stay correct.
 
 Assignment is static (millpond's model): at :meth:`MillraceConsumer.start`
 the topic's partition count is read once and this replica claims every
-``p`` with ``p % replica_count == ordinal``. The stages are opened (and
-their staged groups discovered), the caller's ``drain`` flushes
-everything already staged, and only then are the partitions assigned
-with ``OFFSET_STORED``.
+``p`` with ``p % replica_count == ordinal``. The stages are opened, the caller's
+``drain`` flushes everything already staged (one sequential pass per
+partition), and only then are the partitions assigned with
+``OFFSET_STORED``.
 
 Fencing: a stage write (or, for a poll whose records were all dropped, a
 durable fence probe) that fails with SlateDB's FENCED closes the fenced
@@ -345,9 +345,7 @@ class MillraceConsumer:
             cfg.kafka_topic,
             list(partitions),
         )
-        await self._stages.sync_assignment(
-            {(cfg.kafka_topic, p) for p in partitions}, now_us=self._now_us()
-        )
+        await self._stages.sync_assignment({(cfg.kafka_topic, p) for p in partitions})
         return partitions
 
     async def _assign(self, partitions: tuple[int, ...]) -> None:

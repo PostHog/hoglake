@@ -207,7 +207,7 @@ async def test_pipeline_collector_staging_gauges_and_slatedb_bridge():
 
     consumer, stages, flusher, runner = _components()
     try:
-        stage = await stages.open_partition("events", 0, now_us=NOW)
+        stage = await stages.open_partition("events", 0)
         await stage.stage_batch([rec(1, 100, 0, payload=b"abcd")], now_us=NOW)
         collector = _collector(consumer, stages, flusher, runner)
         raw = await asyncio.to_thread(_raw, collector)
@@ -282,6 +282,8 @@ def test_flush_counters_are_exposed_by_exact_name_labels_and_value():
         flusher._orphaned_uploads = 19
         flusher._commit_refusals.update({"422": 23, "400": 29})
         runner._stuck_total = 31
+        runner._drain_rows = 47
+        runner._drain_bytes = 53
         flusher._ambiguous_uploads = 37
         flusher._values_clamped.update({"timestamp": 41, "props.ts": 43})
         runner._failures[("events", 0, ("1",))] = _Failures(STUCK_AFTER, 0.0)
@@ -297,6 +299,8 @@ def test_flush_counters_are_exposed_by_exact_name_labels_and_value():
         assert raw[("millrace_flush_commit_refusals_total", (("status", "422"),))] == 23
         assert raw[("millrace_flush_commit_refusals_total", (("status", "400"),))] == 29
         assert raw[("millrace_flush_groups_stuck_total", ())] == 31
+        assert raw[("millrace_drain_rows_total", ())] == 47
+        assert raw[("millrace_drain_bytes_total", ())] == 53
         assert raw[("millrace_flush_groups_stuck", ())] == 1
         assert raw[("millrace_flush_ambiguous_uploads_total", ())] == 37
         assert raw[("millrace_values_clamped_total", (("column", "timestamp"),))] == 41

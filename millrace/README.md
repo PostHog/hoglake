@@ -82,12 +82,24 @@ MILLRACE_SORT_BY=timestamp
 
 ## Startup drain and probes
 
-On start each replica opens its partitions' SlateDB instances, finds
-every group that still has staged rows, and **flushes all of them before
-it consumes anything new**. Staged state therefore never outlives a
-process; that is what lets group sizes and ages live in memory only. A
-crash mid-drain drains again on restart (windows that already landed
-land again: duplicates, accepted).
+On start each replica opens its partitions' SlateDB instances and
+**flushes everything staged before it consumes anything new**. Staged
+state therefore never outlives a process; that is what lets group sizes
+and ages live in memory only. A crash mid-drain drains again on restart
+(windows that already landed land again: duplicates, accepted).
+
+The drain is a stream: per partition, one sequential read-ahead pass
+over the staged rows, cut into one-group windows (at the group's end or
+at `MILLRACE_FLUSH_BYTES`), each flushed and settled as the pass goes;
+partitions drain concurrently with at most 4 windows (the flush
+concurrency) in memory. Progress is logged per partition (`startup drain of
+<topic>[<p>]: …` at start, every 1,000 windows or 30 s, and at the end)
+and counted in `millrace_drain_rows_total` / `millrace_drain_bytes_total`.
+Drain time is dominated by one commit per window (thousands of small
+groups = thousands of commits), not by the stage reads. The stream
+reopens its iterator past the last key every 60 s and after a read
+error, so an SST the maintenance GC deletes under it costs a reopen,
+not a restart.
 
 - `/readyz` answers 503 for the whole drain, then 200 once the consumer
   is assigned. `millrace_draining` is 1 meanwhile.
@@ -100,8 +112,10 @@ land again: duplicates, accepted).
 - A StatefulSet rollout waits on readiness pod by pod, so a long drain
   slows the rollout; Kafka lag grows meanwhile (durable, at-least-once).
 - A group that keeps failing during the drain (see "Stuck groups")
-  does not block it: the drain finishes when every group is flushed or
-  stuck, and stuck groups keep retrying while the pod consumes.
+  does not block it: the stream skips the rest of its rows (they stay
+  staged), the drain retries it after the stream and finishes when
+  every group is flushed or stuck, and stuck groups keep retrying while
+  the pod consumes.
 - `/healthz` 503s once a terminal condition latches: the destination
   was recreated (exit 3) or a stage was fenced (exit 4).
 
@@ -175,6 +189,19 @@ Pod memory, in terms:
 + 4 in-flight decisions × ~1.1 GiB at MILLRACE_FLUSH_BYTES=256 MiB (measured)
 + process baseline
 ```
+
+During the startup drain the 4 decisions are the drain's in-flight
+windows, and each partition also holds one row stream:
+
+```
+  K partitions × ( (L0 SSTs + sorted runs) × 2 fetches × 1 MiB read-ahead
+                   + ≤ 16 MiB page )
+```
+
+Measured: 4 partitions × 8 overlapping L0 SSTs streamed +157 MiB RSS at
+221 MiB/s (60 ms store latency); the window-scan options (4 × 4 MiB)
+took +316 MiB for 230 MiB/s, so the stream uses the smaller ones
+(`stage._drain_scan_options`).
 
 At 16 partitions per pod that is ~4 GiB unflushed + ~0.8 GiB queues and
 cache + ~4.4 GiB of decisions + baseline: a 1-replica, 16-partition

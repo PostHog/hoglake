@@ -152,8 +152,8 @@ class TestRecorderWiring:
         self, memory_store: Any
     ) -> None:
         manager = StageManager("memory:///", "millrace", settings=fast_flush_settings())
-        one = await manager.open_partition("events", 0, now_us=NOW)
-        two = await manager.open_partition("events", 1, now_us=NOW)
+        one = await manager.open_partition("events", 0)
+        two = await manager.open_partition("events", 1)
         await one.stage_batch([rec(1, 100, 0)], now_us=NOW)
 
         def wal_flush_bytes(recorder: Any) -> int:

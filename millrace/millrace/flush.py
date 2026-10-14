@@ -99,6 +99,7 @@ from .stage import (
     DroppedRecord,
     FencedError,
     PartitionStage,
+    RowStream,
     Scan,
     StageClosedError,
     StageManager,
@@ -971,7 +972,9 @@ FlushOutcome = Literal["committed", "dropped", "empty"]
 @dataclass(frozen=True, slots=True)
 class FlushReport:
     """The outcome of one decision. ``dropped`` counts rows left out of
-    the publication; ``commits`` the commits that landed."""
+    the publication; ``commits`` the commits that landed;
+    ``staged_rows``/``staged_bytes`` the window's rows and payload bytes
+    that were settled (every one, for a committed or dropped outcome)."""
 
     topic: str
     partition: int
@@ -986,6 +989,8 @@ class FlushReport:
     commits: int = 0
     complete: bool = True
     snapshot_ids: tuple[int, ...] = ()
+    staged_rows: int = 0
+    staged_bytes: int = 0
 
 
 def _transient_delay(attempts: int, retry_after: float | None) -> float:
@@ -1559,16 +1564,30 @@ class HoglakeFlusher:
 
     # -- one decision -------------------------------------------------------------
 
+    @property
+    def flush_bytes(self) -> int:
+        """The scan budget of one flush window (``MILLRACE_FLUSH_BYTES``)."""
+        return self._cfg.flush_bytes
+
     async def flush_group(
         self, stage: PartitionStage, group: keyspace.PartitionTuple, trigger: str
     ) -> FlushReport:
-        """Flush one bounded window of ``group`` (module docstring). Each
-        commit's rows are settled as soon as that commit lands, so a
-        split decision that fails partway never republishes the parts
-        that already landed."""
+        """Flush one bounded window of ``group`` (module docstring)."""
         scan = await stage.scan(
             group, max_bytes=self._cfg.flush_bytes, now_us=self._now_us()
         )
+        return await self.flush_scan(stage, scan, trigger)
+
+    async def flush_scan(
+        self, stage: PartitionStage, scan: Scan, trigger: str, *, durable: bool = True
+    ) -> FlushReport:
+        """Flush one scanned window (a :meth:`PartitionStage.scan`, or a
+        window of the startup drain's row stream). Each commit's rows are
+        settled as soon as that commit lands, so a split decision that
+        fails partway never republishes the parts that already landed.
+        ``durable=False`` settles without waiting for the deletes'
+        durability (the startup drain; :meth:`PartitionStage.settle`)."""
+        group = scan.group
         report = partial(
             FlushReport,
             stage.topic,
@@ -1577,10 +1596,11 @@ class HoglakeFlusher:
             trigger,
             complete=scan.complete,
         )
+        settled = partial(report, staged_rows=len(scan.rows), staged_bytes=scan.nbytes)
         if not scan.rows:
             # The index held a group with nothing on disk (a write that
             # failed after the index update): settle removes it.
-            await stage.settle(scan)
+            await stage.settle(scan, durable=durable)
             return report("empty")
         await self.check_stage_identity(stage, pin=True)
         first_offset = scan.rows[0][0].offset
@@ -1625,7 +1645,7 @@ class HoglakeFlusher:
                 dropped += len(plan.dropped_records)
             if not plan.commits:
                 remaining = await self._settle_part(
-                    stage, scan, remaining, set(plan.dropped_row_keys)
+                    stage, scan, remaining, set(plan.dropped_row_keys), durable
                 )
                 break
             try:
@@ -1636,7 +1656,9 @@ class HoglakeFlusher:
                     keys = set(commit.row_keys)
                     if index == 0:
                         keys.update(plan.dropped_row_keys)
-                    remaining = await self._settle_part(stage, scan, remaining, keys)
+                    remaining = await self._settle_part(
+                        stage, scan, remaining, keys, durable
+                    )
                 break
             except (DdlSinceReadSnapshotError, ReadSnapshotExpiredError) as e:
                 if build + 1 >= _REBUILD_ATTEMPTS:
@@ -1653,7 +1675,7 @@ class HoglakeFlusher:
                 )
         if not snapshot_ids:
             self._decisions_dropped += 1
-            return report(
+            return settled(
                 "dropped",
                 first_offset=first_offset,
                 last_offset=last_offset,
@@ -1662,7 +1684,7 @@ class HoglakeFlusher:
         self._decisions_committed += 1
         self._rows_published += records
         self._files_written += files
-        return report(
+        return settled(
             "committed",
             first_offset=first_offset,
             last_offset=last_offset,
@@ -1679,6 +1701,7 @@ class HoglakeFlusher:
         scan: Scan,
         remaining: list[tuple[keyspace.RowKey, bytes]],
         keys: set[keyspace.RowKey],
+        durable: bool,
     ) -> list[tuple[keyspace.RowKey, bytes]]:
         """Delete the scanned rows named by ``keys`` (a landed commit's
         rows, or counted drops). Only the settle that leaves nothing of
@@ -1693,7 +1716,8 @@ class HoglakeFlusher:
                 scan.complete and not rest,
                 scan.gen,
                 scan.started_us,
-            )
+            ),
+            durable=durable,
         )
         return rest
 
@@ -1777,6 +1801,65 @@ class _Failures:
 
 _GroupKey = tuple[str, int, keyspace.PartitionTuple]
 
+#: Startup-drain progress is logged every this many windows or seconds.
+DRAIN_LOG_EVERY_WINDOWS: Final = 1000
+DRAIN_LOG_EVERY_S: Final = 30.0
+
+
+class _DrainProgress:
+    """One partition's startup-drain progress: counted per flushed
+    window, logged every :data:`DRAIN_LOG_EVERY_WINDOWS` windows or
+    :data:`DRAIN_LOG_EVERY_S` seconds, and once at the end."""
+
+    def __init__(
+        self, where: str, stream: RowStream, monotonic: Callable[[], float]
+    ) -> None:
+        self._where = where
+        self._stream = stream
+        self._monotonic = monotonic
+        self._started = self._last_log = monotonic()
+        self._windows_at_log = 0
+        self.windows = 0
+        self.rows = 0
+        self.bytes = 0
+        self.held = 0
+
+    def flushed(self, window: Scan) -> None:
+        self.windows += 1
+        self.rows += len(window.rows)
+        self.bytes += window.nbytes
+        self.maybe_log()
+
+    def _line(self) -> str:
+        stream = self._stream
+        elapsed = max(self._monotonic() - self._started, 1e-9)
+        return (
+            f"{self.windows} window(s), {self.rows} row(s), "
+            f"{self.bytes / 2**20:.1f} MiB flushed from {stream.groups_seen} "
+            f"group(s) in {elapsed:.1f}s ({self.rows / elapsed:.0f} rows/s, "
+            f"{self.bytes / 2**20 / elapsed:.2f} MiB/s); {self.held} failed "
+            f"window(s), {stream.rows_skipped} row(s) of failed groups left staged"
+        )
+
+    def maybe_log(self) -> None:
+        now = self._monotonic()
+        if (
+            self.windows - self._windows_at_log < DRAIN_LOG_EVERY_WINDOWS
+            and now - self._last_log < DRAIN_LOG_EVERY_S
+        ):
+            return
+        self._last_log = now
+        self._windows_at_log = self.windows
+        log.info("startup drain of %s: %s", self._where, self._line())
+
+    def finish(self, outcome: str) -> None:
+        """``outcome``: streamed, stopped (a stop or a terminal
+        condition), failed (an error the drain re-raises) or cancelled (a
+        sibling partition's stream failed)."""
+        (log.info if outcome in ("streamed", "stopped") else log.warning)(
+            "startup drain of %s %s: %s", self._where, outcome, self._line()
+        )
+
 
 class FlushRunner:
     """The flush loop. Every ``sweep_s`` it reads each open stage's
@@ -1785,8 +1868,10 @@ class FlushRunner:
     in flight, and launches one task per group; at most ``concurrency``
     run at once (each holds one bounded scan in memory).
 
-    :meth:`drain` is the startup drain: every staged group is flushed,
-    regardless of the planner, until each is empty or stuck.
+    :meth:`drain` is the startup drain: every staged row is read in one
+    sequential pass per partition and flushed window by window,
+    partitions concurrently; a group whose window fails stays staged and
+    is retried until it is empty or stuck.
 
     Terminal conditions: a :class:`FlushHalted` (table recreated) and a
     fenced stage (:class:`~millrace.stage.FencedError`) stop the loop and
@@ -1823,6 +1908,10 @@ class FlushRunner:
         self._fatal: BaseException | None = None
         self._stopping = False
         self._sweeps = 0
+        self._concurrency = concurrency
+        self._drain_rows = 0
+        self._drain_bytes = 0
+        self._in_drain = False
 
     # -- surface -----------------------------------------------------------------
 
@@ -1845,6 +1934,17 @@ class FlushRunner:
     def stuck_groups(self) -> int:
         """Groups whose consecutive failures reached :data:`STUCK_AFTER`."""
         return sum(1 for f in list(self._failures.values()) if f.count >= STUCK_AFTER)
+
+    @property
+    def drain_rows(self) -> int:
+        """Staged rows the startup drain flushed (published or dropped),
+        by its streams and its retry pass."""
+        return self._drain_rows
+
+    @property
+    def drain_bytes(self) -> int:
+        """Staged payload bytes the startup drain flushed."""
+        return self._drain_bytes
 
     @property
     def stuck_total(self) -> int:
@@ -1890,10 +1990,14 @@ class FlushRunner:
         )
 
     async def drain(self) -> None:
-        """Flush every staged group until each is gone or stuck. Run
-        before the consumer starts, so nothing new arrives meanwhile.
-        First, every stage's pinned incarnation is checked: a
-        recreated destination halts before anything is flushed."""
+        """Flush everything staged, before the consumer starts (nothing
+        new arrives meanwhile). First every stage's pinned incarnation is
+        checked: a recreated destination halts before anything is
+        flushed. Then each partition streams its rows in one sequential
+        pass (:meth:`_drain_partition`), partitions concurrently, at most
+        ``concurrency`` windows in memory at once. A group whose window
+        failed stays staged and indexed; it is retried here until it is
+        gone or stuck, and stuck ones keep retrying in :meth:`run`."""
         for topic, partition in self._stages.partitions():
             try:
                 await self._flusher.check_stage_identity(
@@ -1902,6 +2006,37 @@ class FlushRunner:
             except FlushHalted as halt:
                 self._fatal = halt
                 raise
+        slots = asyncio.Semaphore(self._concurrency)
+        streams = [
+            asyncio.create_task(
+                self._drain_partition(self._stages.stage(t, p), slots),
+                name=f"millrace-drain-{t}-{p}",
+            )
+            for t, p in self._stages.partitions()
+        ]
+        try:
+            # A terminal condition latches and every stream stops at its
+            # next window; any other error stops the siblings at once.
+            await asyncio.wait(streams, return_when=asyncio.FIRST_EXCEPTION)
+        finally:
+            for task in streams:
+                if not task.done():
+                    task.cancel()
+            outcomes = await asyncio.gather(*streams, return_exceptions=True)
+        self._raise_fatal()
+        errors = [o for o in outcomes if isinstance(o, BaseException)]
+        # The first real error, not a sibling cancelled because of it.
+        errors.sort(key=lambda e: isinstance(e, asyncio.CancelledError))
+        if errors:
+            raise errors[0]
+        self._in_drain = True
+        try:
+            await self._drain_retries()
+        finally:
+            self._in_drain = False
+
+    async def _drain_retries(self) -> None:
+        """The drain's retry pass over the groups its streams held."""
         while not self._stopping:
             self._raise_fatal()
             pending = [
@@ -1922,6 +2057,160 @@ class FlushRunner:
             if report.decisions == 0:
                 # Everything pending is waiting out a retry backoff.
                 await self._sleep(min(self._sweep_s, _RETRY_BASE_S))
+
+    async def _drain_partition(
+        self, stage: PartitionStage, slots: asyncio.Semaphore
+    ) -> None:
+        """Stream one partition's staged rows and flush them window by
+        window (stage.py :class:`~millrace.stage.RowStream`). A slot is
+        taken BEFORE a window is read and given back when its flush
+        ends, so ``slots`` bounds the windows in memory across every
+        partition. The older layout's keys are deleted alongside."""
+        where = f"{stage.topic}[{stage.partition}]"
+        stage.forget_index()
+        stream = stage.row_stream(
+            max_bytes=self._flusher.flush_bytes, now_us=self._now_us()
+        )
+        progress = _DrainProgress(where, stream, self._monotonic)
+        log.info("startup drain of %s: streaming its staged rows", where)
+        cleanup = asyncio.create_task(self._delete_foreign_keys(stage, where))
+        flushes: set[asyncio.Task[None]] = set()
+        failed: set[keyspace.PartitionTuple] = set()
+        outcome = "failed"
+        try:
+            await self._stream_partition(
+                stage, stream, slots, progress, failed, flushes
+            )
+            await stage.make_durable()
+            outcome = (
+                "stopped" if self._stopping or self._fatal is not None else "streamed"
+            )
+        except StageClosedError:
+            outcome = "stopped"
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+            raise
+        except Exception as e:
+            if not is_fenced(e):
+                raise
+            self._fatal = FencedError([(stage.topic, stage.partition)])
+            outcome = "stopped"
+        finally:
+            if flushes:
+                await asyncio.gather(*list(flushes), return_exceptions=True)
+            if outcome in ("failed", "cancelled"):
+                cleanup.cancel()
+            await asyncio.gather(cleanup, return_exceptions=True)
+            progress.finish(outcome)
+
+    async def _stream_partition(
+        self,
+        stage: PartitionStage,
+        stream: RowStream,
+        slots: asyncio.Semaphore,
+        progress: _DrainProgress,
+        failed: set[keyspace.PartitionTuple],
+        flushes: set[asyncio.Task[None]],
+    ) -> None:
+        """Read windows (a slot each) and launch their flushes; returns
+        once the stream is exhausted (or stopped) and every launched
+        flush has finished."""
+        try:
+            while not self._stopping and self._fatal is None:
+                await slots.acquire()
+                try:
+                    window = await stream.next_window()
+                except BaseException:
+                    slots.release()
+                    raise
+                if window is None:
+                    slots.release()
+                    break
+                task = asyncio.create_task(
+                    self._drain_window(stage, stream, window, slots, progress, failed)
+                )
+                flushes.add(task)
+                task.add_done_callback(flushes.discard)
+                progress.maybe_log()
+        finally:
+            if flushes:
+                await asyncio.gather(*list(flushes), return_exceptions=True)
+
+    async def _drain_window(
+        self,
+        stage: PartitionStage,
+        stream: RowStream,
+        window: Scan,
+        slots: asyncio.Semaphore,
+        progress: _DrainProgress,
+        failed: set[keyspace.PartitionTuple],
+    ) -> None:
+        key = (stage.topic, stage.partition, window.group)
+        try:
+            if self._fatal is not None or self._stopping:
+                return  # the rows stay staged; the next start drains them
+            # Deletes need no durability for at-least-once (a lost one
+            # re-flushes a duplicate after a crash), and waiting for each
+            # serializes the drain on one object-store PUT per window.
+            # The stream ends with one durable flush (_drain_partition).
+            # A fence is therefore only seen at a WAL flush: until then a
+            # fenced drain may publish windows the new owner also
+            # publishes (duplicates only).
+            await self._flusher.flush_scan(stage, window, "drain", durable=False)
+        except FlushHalted as halt:
+            self._fatal = halt
+        except StageClosedError:
+            pass
+        except Exception as e:  # noqa: BLE001 - contained per window
+            if is_fenced(e):
+                self._fatal = FencedError([(stage.topic, stage.partition)])
+                return
+            # Keep the group staged and indexed: the stream skips the
+            # rest of its rows and the retry loop takes it from here.
+            stream.hold(
+                window.group,
+                nbytes=window.nbytes,
+                rows=len(window.rows),
+                now_us=self._now_us(),
+            )
+            if window.group not in failed:
+                failed.add(window.group)
+                self._note_failure(key, stage, window.group, e)
+            progress.held += 1
+        else:
+            self._drain_rows += len(window.rows)
+            self._drain_bytes += window.nbytes
+            progress.flushed(window)
+        finally:
+            slots.release()
+
+    async def _delete_foreign_keys(self, stage: PartitionStage, where: str) -> None:
+        """Housekeeping alongside the drain: an older build's keys go
+        (bulk scans, bounded delete batches). A failure is logged, never
+        drain-fatal, except a fence."""
+        started = self._monotonic()
+        try:
+            deleted = await stage.delete_foreign_keys()
+        except StageClosedError:
+            return
+        except Exception as e:  # noqa: BLE001 - housekeeping only
+            if is_fenced(e):
+                self._fatal = FencedError([(stage.topic, stage.partition)])
+                return
+            log.warning(
+                "%s: deleting an older staging layout's keys failed (%s); "
+                "the next start retries",
+                where,
+                e,
+            )
+            return
+        if deleted:
+            log.info(
+                "%s: deleted %d key(s) of an older staging layout in %.1fs",
+                where,
+                deleted,
+                self._monotonic() - started,
+            )
 
     # -- internals ---------------------------------------------------------------
 
@@ -2018,6 +2307,10 @@ class FlushRunner:
         finally:
             self._inflight.pop(key, None)
         self._failures.pop(key, None)
+        if self._in_drain:
+            # The drain's retry pass: its rows count as drained too.
+            self._drain_rows += report.staged_rows
+            self._drain_bytes += report.staged_bytes
         return report
 
     def _note_failure(

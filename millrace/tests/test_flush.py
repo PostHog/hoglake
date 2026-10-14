@@ -705,7 +705,7 @@ class TestCommitMessage:
         """Source-order pin: the pure builder runs (and formats every
         message) before the first upload, so a build failure can never
         leave an uncounted orphan."""
-        source = inspect.getsource(HoglakeFlusher.flush_group)
+        source = inspect.getsource(HoglakeFlusher.flush_scan)
         assert source.index("build_flush_plan") < source.index("_upload_and_commit(")
         upload = inspect.getsource(HoglakeFlusher._upload_and_commit)
         assert upload.index("self._upload") < upload.index("self._publish(")
@@ -972,7 +972,7 @@ class TestHappyPath:
         async with StageManager(
             "memory:///", "millrace", settings=fast_flush_settings()
         ) as manager:
-            stage = await manager.open_partition("events", 0, now_us=fake_clock())
+            stage = await manager.open_partition("events", 0)
             await staged(stage, fake_clock, TEAM, [(0, JAN_US), (1, JAN_US)])
             script_options(httpx_mock)
             capture = CommitCapture(httpx_mock, [commit_ok(50)])
@@ -998,7 +998,7 @@ class TestHappyPath:
         async with StageManager(
             "memory:///", "millrace", settings=fast_flush_settings()
         ) as manager:
-            stage = await manager.open_partition("events", 0, now_us=fake_clock())
+            stage = await manager.open_partition("events", 0)
             await staged(stage, fake_clock, TEAM, [(0, JAN_US)])
             flusher = flusher_factory(store=store, cfg=cfg)
             r = runner(manager, flusher, cfg, fake_clock, sleeper)
@@ -1050,7 +1050,7 @@ class TestPartitionTupleGroups:
         async with StageManager(
             "memory:///", "millrace", settings=fast_flush_settings()
         ) as manager:
-            stage = await manager.open_partition("events", 0, now_us=fake_clock())
+            stage = await manager.open_partition("events", 0)
             await stage.stage_batch(
                 _keyed_records(
                     keyer,
@@ -1766,7 +1766,7 @@ class TestRunner:
         async with StageManager(
             "memory:///", "millrace", settings=fast_flush_settings()
         ) as manager:
-            stage = await manager.open_partition("events", 0, now_us=fake_clock())
+            stage = await manager.open_partition("events", 0)
             await staged(stage, fake_clock, 11, [(0, JAN_US)])
             fake_clock.advance(1_000_000)
             await staged(stage, fake_clock, 22, [(1, JAN_US)])
@@ -1812,7 +1812,7 @@ class TestRunner:
         async with StageManager(
             "memory:///", "millrace", settings=fast_flush_settings()
         ) as manager:
-            stage = await manager.open_partition("events", 0, now_us=fake_clock())
+            stage = await manager.open_partition("events", 0)
             await staged(stage, fake_clock, TEAM, [(0, JAN_US)])
             script_options(httpx_mock)
             capture = CommitCapture(
@@ -1844,7 +1844,7 @@ class TestRunner:
         async with StageManager(
             "memory:///", "millrace", settings=fast_flush_settings()
         ) as manager:
-            stage = await manager.open_partition("events", 0, now_us=fake_clock())
+            stage = await manager.open_partition("events", 0)
             await staged(stage, fake_clock, TEAM, [(0, JAN_US)])
             script_options(httpx_mock)
             capture = CommitCapture(httpx_mock, [commit_ok(50)])
@@ -1883,7 +1883,7 @@ class TestRunner:
             "memory:///", "millrace", settings=fast_flush_settings()
         ) as manager:
             for p in range(3):
-                stage = await manager.open_partition("events", p, now_us=fake_clock())
+                stage = await manager.open_partition("events", p)
                 for t in range(4):
                     await staged(stage, fake_clock, p * 4 + t, [(t, JAN_US)])
             gate = asyncio.Event()
@@ -1950,7 +1950,7 @@ class TestFencedFlusher:
         async with StageManager(
             "memory:///", "millrace", settings=fast_flush_settings()
         ) as manager:
-            stage = await manager.open_partition("events", 0, now_us=fake_clock())
+            stage = await manager.open_partition("events", 0)
             await staged(stage, fake_clock, TEAM, [(0, JAN_US)])
             r = runner(manager, Fenced(), cfg, fake_clock, sleeper)
             with pytest.raises(FencedError) as first:
@@ -1977,7 +1977,7 @@ class TestFencedFlusher:
         async with StageManager(
             "memory:///", "millrace", settings=fast_flush_settings()
         ) as manager:
-            stage = await manager.open_partition("events", 0, now_us=fake_clock())
+            stage = await manager.open_partition("events", 0)
             await staged(stage, fake_clock, TEAM, [(0, JAN_US)])
             r = runner(manager, Closed(), cfg, fake_clock, sleeper, mono=mono)
             sweep = await r.run_once(drain=True)
@@ -2003,7 +2003,7 @@ class TestFencedFlusher:
         url = "file:///"
         base = str(tmp_path / "slatedb")
         async with StageManager(url, base, settings=fast_flush_settings()) as mgr:
-            s0 = await mgr.open_partition("events", 0, now_us=fake_clock())
+            s0 = await mgr.open_partition("events", 0)
             await staged(s0, fake_clock, TEAM, [(0, JAN_US)])
             from flushkit import OPTIONS_URL, options_wire
 
