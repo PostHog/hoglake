@@ -427,6 +427,23 @@ def create_topic(admin: AdminClient, name: str, *, partitions: int = 4) -> None:
         [NewTopic(name, num_partitions=partitions, replication_factor=1)]
     )
     futures[name].result(timeout=60)
+    # CreateTopics resolves before metadata necessarily lists the topic;
+    # millrace treats UNKNOWN_TOPIC_OR_PART as fatal (a misconfigured
+    # topic in prod), so wait until metadata serves every partition.
+    deadline = time.monotonic() + 60
+    while True:
+        meta = admin.list_topics(name, timeout=10).topics.get(name)
+        if (
+            meta is not None
+            and meta.error is None
+            and len(meta.partitions) == partitions
+        ):
+            return
+        if time.monotonic() > deadline:
+            raise TimeoutError(
+                f"topic {name!r} never appeared in metadata: {meta and meta.error}"
+            )
+        time.sleep(0.2)
 
 
 def delete_topic(admin: AdminClient, name: str) -> None:
