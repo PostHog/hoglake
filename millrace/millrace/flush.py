@@ -1,11 +1,13 @@
 """The flush: staged rows → parquet → hoglake commits → staged rows deleted.
 
-Per partition, per due group not already in flight, under a process-wide
-semaphore (:class:`FlushRunner`):
+Per stage, the due groups not already in flight, under a process-wide
+semaphore (:class:`FlushRunner`): a size-lane or backlog group alone,
+the others packed into batches whose files share commits
+(:meth:`HoglakeFlusher.flush_batch`). Per group:
 
-1. Scan a bounded window of the group's rows: an exact offset prefix,
-   at most ``flush_bytes`` of payload and always at least one row
-   (stage.py ``PartitionStage.scan``).
+1. Scan a bounded window of the group's rows: a key prefix, at most
+   ``flush_bytes`` of payload and always at least one row (stage.py
+   ``PartitionStage.scan``).
 2. Build parquet (pure, on the I/O pool): decode each payload against
    the table's columns (a record no column can hold is dropped and
    counted, never batch-fatal), sort by the live sort spec, fan out by
@@ -13,10 +15,10 @@ semaphore (:class:`FlushRunner`):
 3. Upload every file, then commit. Each commit carries a FRESH uuid4
    idempotency key minted per build; an ambiguous answer (5xx, 408,
    429, a plain 409 conflict, a transport error) resends the identical
-   bytes under the same key, which the server's receipt dedupes. A
-   fanout wider than ``max_files_per_commit`` splits into several
-   commits.
-4. Delete exactly the scanned keys in one durable batch.
+   bytes under the same key, which the server's receipt dedupes. More
+   files than ``max_files_per_commit`` split into several commits.
+4. Delete exactly the scanned keys in one durable batch (a batch's
+   groups together).
 
 At-least-once: a row is deleted only after every commit naming it
 succeeded (or it was a counted drop). A crash or a failed delete after a
@@ -24,7 +26,9 @@ commit landed re-flushes the window under a new key: a duplicate, never
 a loss.
 
 Failure handling is one rule: any failure fails the decision, the rows
-stay staged, and the group is retried with backoff; after
+stay staged, and the group is retried with backoff (a refused batch
+retries each of its groups alone; a group whose build fails leaves its
+batch); after
 :data:`STUCK_AFTER` consecutive failures it is logged at ERROR and
 counted, and retries continue. Two conditions stop the process: the
 destination table was recreated (:class:`FlushHalted`, exit 3) and a
@@ -94,7 +98,7 @@ from .coerce import (
 )
 from .config import Config
 from .grouping import column_chains, field_names
-from .planner import PlannerKnobs, decide
+from .planner import PlannerKnobs, decide, due_floor_ts
 from .stage import (
     DroppedRecord,
     FencedError,
@@ -702,7 +706,8 @@ def _partition_groups(
 def format_commit_message(
     *,
     table_uuid: str,
-    group: str,
+    group: str | None,
+    groups: int = 1,
     trigger: str,
     records: int,
     dropped: int,
@@ -710,22 +715,20 @@ def format_commit_message(
     commit_index: int,
     commits: int,
     topic: str,
-    partition: int,
-    first_offset: int,
-    last_offset: int,
+    stage: int,
     version: str,
 ) -> str:
     """The snapshot's ``message``: what the flush was (``key=value``
-    pairs, no value holding a space), then where it came from in Kafka."""
+    pairs, no value holding a space), then where it came from. A
+    one-group commit names its group (``group=<label>``); a batched
+    commit says how many it carries (``groups=<n>``, ``group`` None)."""
+    what = f"group={group}" if group is not None else f"groups={groups}"
     summary = (
-        f"millrace=v2 table={table_uuid} group={group} trigger={trigger} "
+        f"millrace=v2 table={table_uuid} {what} trigger={trigger} "
         f"records={records} dropped={dropped} files={files} "
         f"commit={commit_index + 1}/{commits} millrace={_message_token(version)}"
     )
-    return (
-        f"{summary}\noffsets topic={_message_token(topic)} "
-        f"partition={partition} window={first_offset}-{last_offset}"
-    )
+    return f"{summary}\noffsets topic={_message_token(topic)} stage={stage}"
 
 
 def _message_token(value: Any) -> str:
@@ -743,12 +746,11 @@ class FlushContext:
     so a rebuild never overwrites objects a landed commit may name."""
 
     topic: str
-    partition: int
+    #: The stage's slot (its home: the replica's smallest partition).
+    slot: int
     group: keyspace.PartitionTuple
     group_fields: tuple[str, ...]
     trigger: str
-    first_offset: int
-    last_offset: int
     read_snapshot: int
     table_uuid: str
     build: str
@@ -768,8 +770,9 @@ class CommitPlan:
     payload: dict[str, Any]
     uploads: tuple[Upload, ...]
     records: int
-    #: The staged rows this commit publishes: settled as soon as it lands.
-    row_keys: tuple[keyspace.RowKey, ...] = ()
+    #: The staged rows this commit publishes, as indices into the build's
+    #: input: settled as soon as it lands.
+    row_indices: tuple[int, ...] = ()
 
     @property
     def uris(self) -> tuple[str, ...]:
@@ -788,8 +791,8 @@ class FlushPlan:
     files: int
     staged_bytes: int
     dropped_keys: tuple[str, ...]
-    #: Row keys of the dropped records (settled with the first commit).
-    dropped_row_keys: tuple[keyspace.RowKey, ...] = ()
+    #: The dropped records, as indices into the build's input.
+    dropped_indices: tuple[int, ...] = ()
     #: Timestamps clamped to years 1–9999, by dotted column path.
     clamped: Mapping[str, int] = dataclass_field(default_factory=dict)
 
@@ -823,18 +826,22 @@ def build_flush_plan(
     decoder = JsonObjectDecoder(info.columns)
     staged_bytes = sum(len(payload) for _, payload in records)
     good: list[tuple[keyspace.RowKey, bytes, DecodedRecord]] = []
+    good_indices: list[int] = []
     dropped_records: list[DroppedRecord] = []
-    dropped_row_keys: list[keyspace.RowKey] = []
+    dropped_indices: list[int] = []
     dropped_keys: set[str] = set()
-    for row_key, payload_bytes in records:
+    for index, (row_key, payload_bytes) in enumerate(records):
         try:
             record = decoder.decode_record(payload_bytes)
         except DecodeError as e:
-            dropped_records.append(DroppedRecord(row_key.offset, e.reason, e.path))
-            dropped_row_keys.append(row_key)
+            dropped_records.append(
+                DroppedRecord(row_key.offset, e.reason, e.path, row_key.partition)
+            )
+            dropped_indices.append(index)
             continue
         dropped_keys.update(record.dropped_keys)
         good.append((row_key, payload_bytes, record))
+        good_indices.append(index)
     if not good:
         return FlushPlan(
             (),
@@ -843,12 +850,12 @@ def build_flush_plan(
             0,
             staged_bytes,
             tuple(sorted(dropped_keys)),
-            tuple(dropped_row_keys),
+            tuple(dropped_indices),
             dict(decoder.clamped),
         )
 
     encoded = _build_batch_or_raise(good, decoder.columns)
-    good_keys = [row_key for row_key, _, _ in good]
+    good_count = len(good)
     # The decoded rows are the bulk of the build's memory; the parquet
     # writes below need only the encoded table.
     del good
@@ -857,7 +864,7 @@ def build_flush_plan(
     # file knows which staged rows it holds (a commit settles its own
     # rows as soon as it lands); it is dropped before the parquet write.
     encoded = encoded.append_column(
-        _ROW_INDEX, pa.array(range(len(good_keys)), type=pa.int64())
+        _ROW_INDEX, pa.array(range(good_count), type=pa.int64())
     )
     sort_keys = _spec_sort_keys(info)
     if sort_keys:
@@ -924,7 +931,7 @@ def build_flush_plan(
                     "files": [reg for reg, _, _ in chunk],
                 }
             ],
-            "author": f"millrace/{ctx.topic}/{ctx.partition}",
+            "author": f"millrace/{ctx.topic}/{ctx.slot}",
             "message": format_commit_message(
                 table_uuid=ctx.table_uuid,
                 group=label,
@@ -935,9 +942,7 @@ def build_flush_plan(
                 commit_index=index,
                 commits=len(chunks),
                 topic=ctx.topic,
-                partition=ctx.partition,
-                first_offset=ctx.first_offset,
-                last_offset=ctx.last_offset,
+                stage=ctx.slot,
                 version=version,
             ),
         }
@@ -946,8 +951,8 @@ def build_flush_plan(
                 payload=payload,
                 uploads=tuple(u for _, u, _ in chunk),
                 records=records_in,
-                row_keys=tuple(
-                    good_keys[i] for _, _, rows in chunk for i in sorted(rows)
+                row_indices=tuple(
+                    sorted(good_indices[i] for _, _, rows in chunk for i in rows)
                 ),
             )
         )
@@ -958,7 +963,7 @@ def build_flush_plan(
         files=len(files),
         staged_bytes=staged_bytes,
         dropped_keys=tuple(sorted(dropped_keys)),
-        dropped_row_keys=tuple(dropped_row_keys),
+        dropped_indices=tuple(dropped_indices),
         clamped=dict(decoder.clamped),
     )
 
@@ -974,15 +979,14 @@ class FlushReport:
     """The outcome of one decision. ``dropped`` counts rows left out of
     the publication; ``commits`` the commits that landed;
     ``staged_rows``/``staged_bytes`` the window's rows and payload bytes
-    that were settled (every one, for a committed or dropped outcome)."""
+    that were settled (every one, for a committed or dropped outcome).
+    ``partition`` is the stage's slot."""
 
     topic: str
     partition: int
     group: keyspace.PartitionTuple
     trigger: str
     outcome: FlushOutcome
-    first_offset: int = -1
-    last_offset: int = -1
     records: int = 0
     files: int = 0
     dropped: int = 0
@@ -991,6 +995,90 @@ class FlushReport:
     snapshot_ids: tuple[int, ...] = ()
     staged_rows: int = 0
     staged_bytes: int = 0
+
+
+class _GroupProgress:
+    """One group's progress through a :meth:`HoglakeFlusher.flush_batch`:
+    which rows of its scan are settled (a bitmap by position, so a
+    settle never hashes row keys), what landed and in which snapshots."""
+
+    __slots__ = (
+        "_settled",
+        "dropped",
+        "files",
+        "left",
+        "records",
+        "scan",
+        "snapshot_ids",
+    )
+
+    def __init__(self, scan: Scan) -> None:
+        self.scan = scan
+        self._settled = bytearray(len(scan.rows))
+        self.left = len(scan.rows)
+        self.dropped = 0
+        self.records = 0
+        self.files = 0
+        self.snapshot_ids: list[int] = []
+
+    def unsettled(self) -> list[int]:
+        """Positions of the rows still staged, in scan order."""
+        return [k for k, done in enumerate(self._settled) if not done]
+
+    def settle(self, positions: Sequence[int]) -> Scan:
+        """Mark ``positions`` settled; the :class:`Scan` to settle them
+        with (complete only once every row of a complete scan is)."""
+        for k in positions:
+            self._settled[k] = 1
+        self.left -= len(positions)
+        scan = self.scan
+        return Scan(
+            scan.group,
+            [scan.rows[k] for k in positions],
+            scan.complete and self.left == 0,
+            scan.gen,
+            scan.started_us,
+        )
+
+    def landed(self, commit: CommitPlan, snapshot_id: int) -> None:
+        self.records += commit.records
+        self.files += len(commit.uploads)
+        if snapshot_id not in self.snapshot_ids:
+            self.snapshot_ids.append(snapshot_id)
+
+    def report(
+        self, stage: PartitionStage, trigger: str, outcome: FlushOutcome
+    ) -> FlushReport:
+        return FlushReport(
+            stage.topic,
+            stage.partition,
+            self.scan.group,
+            trigger,
+            outcome,
+            records=self.records,
+            files=self.files,
+            dropped=self.dropped,
+            commits=len(self.snapshot_ids),
+            complete=self.scan.complete,
+            snapshot_ids=tuple(self.snapshot_ids),
+            staged_rows=len(self.scan.rows),
+            staged_bytes=self.scan.nbytes,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class BatchReport:
+    """The outcome of one batched decision: a :class:`FlushReport` per
+    group that was published or dropped, and the groups whose build
+    failed (left out of the batch, rows still staged) with their
+    errors."""
+
+    reports: tuple[FlushReport, ...]
+    failed: tuple[tuple[keyspace.PartitionTuple, Exception], ...] = ()
+    commits: int = 0
+    #: Groups a refused commit left unpublished (rows staged), and why.
+    refused: tuple[keyspace.PartitionTuple, ...] = ()
+    refusal: CommitRefused | None = None
 
 
 def _transient_delay(attempts: int, retry_after: float | None) -> float:
@@ -1524,13 +1612,18 @@ class HoglakeFlusher:
         """Count flush-time drops per reason and log one WARNING per
         reason per decision (offsets and the first refusing column path;
         never a payload value)."""
-        by_reason: dict[str, list[int]] = {}
+        by_reason: dict[str, list[str]] = {}
         first_path: dict[str, str] = {}
         for entry in dropped:
-            by_reason.setdefault(entry.reason, []).append(entry.offset)
+            where = (
+                str(entry.offset)
+                if entry.partition is None
+                else f"{entry.partition}:{entry.offset}"
+            )
+            by_reason.setdefault(entry.reason, []).append(where)
             if entry.path is not None:
                 first_path.setdefault(
-                    entry.reason, f" first_path={entry.path} (offset {entry.offset})"
+                    entry.reason, f" first_path={entry.path} (offset {where})"
                 )
         for reason, offsets in sorted(by_reason.items()):
             self._records_dropped[reason] = self._records_dropped.get(reason, 0) + len(
@@ -1544,7 +1637,7 @@ class HoglakeFlusher:
                 stage.partition,
                 label,
                 reason,
-                ",".join(str(o) for o in shown),
+                ",".join(shown),
                 "" if len(offsets) == len(shown) else ",…",
                 first_path.get(reason, ""),
             )
@@ -1565,70 +1658,176 @@ class HoglakeFlusher:
     # -- one decision -------------------------------------------------------------
 
     @property
-    def flush_bytes(self) -> int:
-        """The scan budget of one flush window (``MILLRACE_FLUSH_BYTES``)."""
-        return self._cfg.flush_bytes
+    def max_files_per_commit(self) -> int:
+        return self._cfg.max_files_per_commit
 
-    async def flush_group(
-        self, stage: PartitionStage, group: keyspace.PartitionTuple, trigger: str
-    ) -> FlushReport:
-        """Flush one bounded window of ``group`` (module docstring)."""
-        scan = await stage.scan(
-            group, max_bytes=self._cfg.flush_bytes, now_us=self._now_us()
-        )
-        return await self.flush_scan(stage, scan, trigger)
+    async def flush_batch(
+        self,
+        stage: PartitionStage,
+        scans: Sequence[Scan],
+        trigger: str,
+        *,
+        durable: bool = True,
+    ) -> BatchReport:
+        """Flush one or more groups' scans of ONE stage as one decision:
+        every group's files are built on one read basis, packed into
+        commits of at most ``max_files_per_commit`` files, and each
+        commit's rows are settled in one delete batch as soon as it
+        lands, so a decision that fails partway never republishes what
+        landed. Dropped rows are settled right after the build (they are
+        never published), so a rebuild never drops them twice. A refused
+        read basis rebuilds the unpublished rows on a fresh shape (at
+        most :data:`_REBUILD_ATTEMPTS` builds).
 
-    async def flush_scan(
-        self, stage: PartitionStage, scan: Scan, trigger: str, *, durable: bool = True
-    ) -> FlushReport:
-        """Flush one scanned window (a :meth:`PartitionStage.scan`, or a
-        window of the startup drain's row stream). Each commit's rows are
-        settled as soon as that commit lands, so a split decision that
-        fails partway never republishes the parts that already landed.
-        ``durable=False`` settles without waiting for the deletes'
-        durability (the startup drain; :meth:`PartitionStage.settle`)."""
-        group = scan.group
-        report = partial(
-            FlushReport,
-            stage.topic,
-            stage.partition,
-            group,
-            trigger,
-            complete=scan.complete,
-        )
-        settled = partial(report, staged_rows=len(scan.rows), staged_bytes=scan.nbytes)
-        if not scan.rows:
+        Never raises for one group's trouble: a group whose BUILD fails
+        is reported in ``failed``; a refused commit stops the decision
+        and the groups it did not publish are reported in ``refused``
+        (with ``refusal``), beside reports for those that landed. Any
+        other failure propagates and the decision is retried whole."""
+        reports: list[FlushReport] = []
+        empty = [scan for scan in scans if not scan.rows]
+        if empty:
             # The index held a group with nothing on disk (a write that
             # failed after the index update): settle removes it.
-            await stage.settle(scan, durable=durable)
-            return report("empty")
+            await stage.settle_many(empty, durable=durable)
+            reports += [
+                FlushReport(
+                    stage.topic,
+                    stage.partition,
+                    scan.group,
+                    trigger,
+                    "empty",
+                    complete=scan.complete,
+                )
+                for scan in empty
+            ]
+        live = [scan for scan in scans if scan.rows]
+        if not live:
+            return BatchReport(tuple(reports))
         await self.check_stage_identity(stage, pin=True)
-        first_offset = scan.rows[0][0].offset
-        last_offset = scan.rows[-1][0].offset
-        remaining = list(scan.rows)
-        snapshot_ids: list[int] = []
-        records = files = dropped = 0
+        state = [_GroupProgress(scan) for scan in live]
+        failed: dict[int, Exception] = {}
+        refusal: CommitRefused | None = None
+        commits = 0
         for build in range(_REBUILD_ATTEMPTS):
+            todo = [i for i, g in enumerate(state) if g.left and i not in failed]
+            if not todo:
+                break
             info = await self._io(self._shape_sync)
-            assert info.read_snapshot_id is not None  # _check_identity refuses
-            fields = _group_fields(info, group)
-            label = keyspace.group_label(fields, group)
+            inputs = {i: state[i].unsettled() for i in todo}
+            built: list[tuple[int, FlushPlan, str]] = []
+            for i, result in zip(
+                todo,
+                await self._build_plans(stage, live, inputs, info, trigger),
+                strict=True,
+            ):
+                if isinstance(result, Exception):
+                    failed[i] = result
+                    continue
+                plan, label = result
+                if build == 0:
+                    self._note_dropped_keys(info, plan.dropped_keys)
+                    self._note_clamps(stage, plan.clamped)
+                if plan.dropped_records:
+                    self._note_drops(stage, label, plan.dropped_records)
+                    state[i].dropped += len(plan.dropped_records)
+                built.append((i, plan, label))
+            # Dropped rows are never published: settle them now, once.
+            drops = [
+                state[i].settle([inputs[i][k] for k in plan.dropped_indices])
+                for i, plan, _ in built
+                if plan.dropped_indices
+            ]
+            if drops:
+                await stage.settle_many(drops, durable=durable)
+            chunks = self._chunk(built)
+            try:
+                for index, chunk in enumerate(chunks):
+                    snapshot_id = await self._publish_chunk(
+                        stage, chunk, index, len(chunks), trigger
+                    )
+                    commits += 1
+                    landed: dict[int, list[int]] = {}
+                    for i, commit, _ in chunk:
+                        landed.setdefault(i, []).extend(
+                            inputs[i][k] for k in commit.row_indices
+                        )
+                        state[i].landed(commit, snapshot_id)
+                        self._rows_published += commit.records
+                        self._files_written += len(commit.uploads)
+                    await stage.settle_many(
+                        [state[i].settle(rows) for i, rows in sorted(landed.items())],
+                        durable=durable,
+                    )
+                break
+            except CommitRefused as e:
+                refusal = e
+                break
+            except (DdlSinceReadSnapshotError, ReadSnapshotExpiredError) as e:
+                if build + 1 >= _REBUILD_ATTEMPTS:
+                    raise FlushError(
+                        f"read basis refused {build + 1} times: {e}"
+                    ) from e
+                log.info(
+                    "commit on %s[%d] refused its read basis (%s); rebuilding the "
+                    "unpublished rows on a fresh shape",
+                    stage.topic,
+                    stage.partition,
+                    e,
+                )
+        refused: list[keyspace.PartitionTuple] = []
+        for i, g in enumerate(state):
+            if i in failed:
+                continue
+            if g.left:
+                # Unpublished (a refused commit): not a finished decision.
+                refused.append(g.scan.group)
+                continue
+            outcome: FlushOutcome = "committed" if g.snapshot_ids else "dropped"
+            if outcome == "committed":
+                self._decisions_committed += 1
+            else:
+                self._decisions_dropped += 1
+            reports.append(g.report(stage, trigger, outcome))
+        return BatchReport(
+            tuple(reports),
+            tuple((live[i].group, err) for i, err in sorted(failed.items())),
+            commits,
+            refused=tuple(refused),
+            refusal=refusal if refused else None,
+        )
+
+    async def _build_plans(
+        self,
+        stage: PartitionStage,
+        live: Sequence[Scan],
+        inputs: Mapping[int, Sequence[int]],
+        info: TableInfo,
+        trigger: str,
+    ) -> list[tuple[FlushPlan, str] | Exception]:
+        """Build each group's plan from its unsettled rows (``inputs``:
+        positions in its scan), in parallel on the pool. A halt
+        propagates; any other build error is the group's own."""
+        read_snapshot = info.read_snapshot_id
+        assert read_snapshot is not None  # _check_identity refuses
+
+        async def build(i: int) -> tuple[FlushPlan, str]:
+            scan = live[i]
+            fields = _group_fields(info, scan.group)
             ctx = FlushContext(
                 topic=stage.topic,
-                partition=stage.partition,
-                group=group,
+                slot=stage.partition,
+                group=scan.group,
                 group_fields=fields,
                 trigger=trigger,
-                first_offset=first_offset,
-                last_offset=last_offset,
-                read_snapshot=info.read_snapshot_id,
+                read_snapshot=read_snapshot,
                 table_uuid=self._table_uuid,
                 build=self._new_token(),
             )
             plan = await self._io(
                 partial(
                     build_flush_plan,
-                    remaining,
+                    [scan.rows[k] for k in inputs[i]],
                     info,
                     ctx=ctx,
                     data_path=self._catalog.data_path,
@@ -1637,89 +1836,87 @@ class HoglakeFlusher:
                     version=_millrace_version(),
                 )
             )
-            if build == 0:
-                self._note_dropped_keys(info, plan.dropped_keys)
-                self._note_clamps(stage, plan.clamped)
-            if plan.dropped_records:
-                self._note_drops(stage, label, plan.dropped_records)
-                dropped += len(plan.dropped_records)
-            if not plan.commits:
-                remaining = await self._settle_part(
-                    stage, scan, remaining, set(plan.dropped_row_keys), durable
-                )
-                break
-            try:
-                for index, commit in enumerate(plan.commits):
-                    snapshot_ids.append(await self._upload_and_commit(commit, label))
-                    records += commit.records
-                    files += len(commit.uploads)
-                    keys = set(commit.row_keys)
-                    if index == 0:
-                        keys.update(plan.dropped_row_keys)
-                    remaining = await self._settle_part(
-                        stage, scan, remaining, keys, durable
-                    )
-                break
-            except (DdlSinceReadSnapshotError, ReadSnapshotExpiredError) as e:
-                if build + 1 >= _REBUILD_ATTEMPTS:
-                    raise FlushError(
-                        f"read basis refused {build + 1} times: {e}"
-                    ) from e
-                log.info(
-                    "commit for %s[%d] group %s refused its read basis (%s); "
-                    "rebuilding the unpublished rows on a fresh shape",
-                    stage.topic,
-                    stage.partition,
-                    label,
-                    e,
-                )
-        if not snapshot_ids:
-            self._decisions_dropped += 1
-            return settled(
-                "dropped",
-                first_offset=first_offset,
-                last_offset=last_offset,
-                dropped=dropped,
-            )
-        self._decisions_committed += 1
-        self._rows_published += records
-        self._files_written += files
-        return settled(
-            "committed",
-            first_offset=first_offset,
-            last_offset=last_offset,
-            records=records,
-            files=files,
-            dropped=dropped,
-            commits=len(snapshot_ids),
-            snapshot_ids=tuple(snapshot_ids),
-        )
+            return plan, keyspace.group_label(fields, scan.group)
 
-    async def _settle_part(
+        outcomes = await asyncio.gather(
+            *(build(i) for i in inputs), return_exceptions=True
+        )
+        out: list[tuple[FlushPlan, str] | Exception] = []
+        for outcome in outcomes:
+            if isinstance(outcome, FlushHalted):
+                raise outcome
+            if isinstance(outcome, BaseException) and not isinstance(
+                outcome, Exception
+            ):
+                raise outcome
+            out.append(outcome)
+        return out
+
+    def _chunk(
+        self, built: Sequence[tuple[int, FlushPlan, str]]
+    ) -> list[list[tuple[int, CommitPlan, str]]]:
+        """Pack the groups' commit parts (each with its group's label)
+        into commits of at most ``max_files_per_commit`` files, in
+        order."""
+        chunks: list[list[tuple[int, CommitPlan, str]]] = []
+        files = 0
+        for i, plan, label in built:
+            for commit in plan.commits:
+                if (
+                    chunks
+                    and files + len(commit.uploads) <= self._cfg.max_files_per_commit
+                ):
+                    chunks[-1].append((i, commit, label))
+                    files += len(commit.uploads)
+                else:
+                    chunks.append([(i, commit, label)])
+                    files = len(commit.uploads)
+        return chunks
+
+    async def _publish_chunk(
         self,
         stage: PartitionStage,
-        scan: Scan,
-        remaining: list[tuple[keyspace.RowKey, bytes]],
-        keys: set[keyspace.RowKey],
-        durable: bool,
-    ) -> list[tuple[keyspace.RowKey, bytes]]:
-        """Delete the scanned rows named by ``keys`` (a landed commit's
-        rows, or counted drops). Only the settle that leaves nothing of
-        the window behind carries the scan's completeness, which is what
-        may take the group out of the index."""
-        part = [row for row in remaining if row[0] in keys]
-        rest = [row for row in remaining if row[0] not in keys]
-        await stage.settle(
-            Scan(
-                scan.group,
-                part,
-                scan.complete and not rest,
-                scan.gen,
-                scan.started_us,
+        chunk: Sequence[tuple[int, CommitPlan, str]],
+        index: int,
+        count: int,
+        trigger: str,
+    ) -> int:
+        """Upload and commit one chunk. One group's part keeps its own
+        payload (its per-group message); several groups' parts merge
+        into one append with a batch message."""
+        if len(chunk) == 1:
+            _, commit, label = chunk[0]
+            return await self._upload_and_commit(commit, label)
+        uploads = tuple(u for _, c, _ in chunk for u in c.uploads)
+        records = sum(c.records for _, c, _ in chunk)
+        template = chunk[0][1].payload
+        payload = {
+            **template,
+            "appends": [
+                {
+                    **template["appends"][0],
+                    "files": [
+                        f for _, c, _ in chunk for f in c.payload["appends"][0]["files"]
+                    ],
+                }
+            ],
+            "message": format_commit_message(
+                table_uuid=self._table_uuid,
+                group=None,
+                groups=len(chunk),
+                trigger=trigger,
+                records=records,
+                dropped=0,
+                files=len(uploads),
+                commit_index=index,
+                commits=count,
+                topic=stage.topic,
+                stage=stage.partition,
+                version=_millrace_version(),
             ),
-            durable=durable,
-        )
-        return rest
+        }
+        merged = CommitPlan(payload=payload, uploads=uploads, records=records)
+        return await self._upload_and_commit(merged, f"a batch of {len(chunk)} groups")
 
     def _note_clamps(self, stage: PartitionStage, clamped: Mapping[str, int]) -> None:
         """Count timestamps clamped to years 1–9999; one WARNING per
@@ -1797,9 +1994,15 @@ class SweepReport:
 class _Failures:
     count: int
     retry_at: float
+    #: The group's last failure was a refused batch (or its build failed):
+    #: it retries ALONE until it lands.
+    split: bool = False
 
 
 _GroupKey = tuple[str, int, keyspace.PartitionTuple]
+
+#: Group scans one decision runs at once.
+_SCAN_CONCURRENCY: Final = 8
 
 #: Startup-drain progress is logged every this many windows or seconds.
 DRAIN_LOG_EVERY_WINDOWS: Final = 1000
@@ -1865,13 +2068,15 @@ class FlushRunner:
     """The flush loop. Every ``sweep_s`` it reads each open stage's
     in-memory index, picks the due groups (planner.py, or the retry
     backoff for a group whose last attempt failed) that are not already
-    in flight, and launches one task per group; at most ``concurrency``
-    run at once (each holds one bounded scan in memory).
+    in flight, and launches them as decisions: a size-lane, backlog or
+    split-out group alone, every other due group of a stage packed into
+    batches that share commits. At most ``concurrency`` decisions run at
+    once (each holds at most about ``flush_bytes`` of scans in memory).
 
     :meth:`drain` is the startup drain: every staged row is read in one
-    sequential pass per partition and flushed window by window,
-    partitions concurrently; a group whose window fails stays staged and
-    is retried until it is empty or stuck.
+    sequential pass per stage and flushed in batches of windows, stages
+    concurrently; a group whose window fails stays staged and is retried
+    until it is empty or stuck.
 
     Terminal conditions: a :class:`FlushHalted` (table recreated) and a
     fenced stage (:class:`~millrace.stage.FencedError`) stop the loop and
@@ -1888,11 +2093,15 @@ class FlushRunner:
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         sweep_s: float = 1.0,
         concurrency: int = 4,
+        batch_max_groups: int = 512,
     ) -> None:
         if sweep_s <= 0:
             raise ValueError(f"sweep_s must be > 0, got {sweep_s}")
         if concurrency < 1:
             raise ValueError(f"concurrency must be >= 1, got {concurrency}")
+        if batch_max_groups < 1:
+            raise ValueError(f"batch_max_groups must be >= 1, got {batch_max_groups}")
+        self._batch_max_groups = batch_max_groups
         self._stages = stages
         self._flusher = flusher
         self._knobs = knobs
@@ -1901,7 +2110,7 @@ class FlushRunner:
         self._sleep = sleep
         self._sweep_s = sweep_s
         self._semaphore = asyncio.Semaphore(concurrency)
-        self._inflight: dict[_GroupKey, asyncio.Task[FlushReport | None]] = {}
+        self._inflight: dict[_GroupKey, asyncio.Task[list[FlushReport]]] = {}
         self._failures: dict[_GroupKey, _Failures] = {}
         self._stuck_total = 0
         self._oldest_due_ts: int | None = None
@@ -1926,8 +2135,9 @@ class FlushRunner:
 
     @property
     def oldest_due_staged_ts(self) -> int | None:
-        """The oldest ``first_staged_ts`` among groups due at the last
-        sweep (the alertable backlog signal); None when nothing is due."""
+        """The oldest ``first_staged_ts`` among groups due and not in
+        flight at the last sweep (the alertable backlog signal); None when
+        nothing is due."""
         return self._oldest_due_ts
 
     @property
@@ -1968,6 +2178,7 @@ class FlushRunner:
             while not self._stopping:
                 self._raise_fatal()
                 self._launch(drain=False)
+                await self._close_drained_foreign()
                 await self._sleep(self._sweep_s)
             self._raise_fatal()
         finally:
@@ -1977,25 +2188,27 @@ class FlushRunner:
     async def run_once(self, *, drain: bool = False) -> SweepReport:
         """One sweep, waiting for the decisions it launched."""
         self._raise_fatal()
-        tasks = self._launch(drain=drain)
-        results = await asyncio.gather(*tasks)
+        launched = self._launch(drain=drain)
+        results = await asyncio.gather(*(task for task, _ in launched))
         self._raise_fatal()
-        reports = [r for r in results if r is not None]
+        reports = [r for batch in results for r in batch]
+        groups = sum(n for _, n in launched)
         return SweepReport(
-            decisions=len(tasks),
+            decisions=groups,
             committed=sum(r.outcome == "committed" for r in reports),
             dropped=sum(r.outcome == "dropped" for r in reports),
             empty=sum(r.outcome == "empty" for r in reports),
-            failed=len(tasks) - len(reports),
+            failed=groups - len(reports),
         )
 
     async def drain(self) -> None:
         """Flush everything staged, before the consumer starts (nothing
         new arrives meanwhile). First every stage's pinned incarnation is
         checked: a recreated destination halts before anything is
-        flushed. Then each partition streams its rows in one sequential
-        pass (:meth:`_drain_partition`), partitions concurrently, at most
-        ``concurrency`` windows in memory at once. A group whose window
+        flushed. Then each stage (the home and every foreign slot)
+        streams its rows in one sequential pass (:meth:`_drain_stage`),
+        stages concurrently, at most ``concurrency`` batches in memory at
+        once. A group whose window
         failed stays staged and indexed; it is retried here until it is
         gone or stuck, and stuck ones keep retrying in :meth:`run`."""
         for topic, partition in self._stages.partitions():
@@ -2009,7 +2222,7 @@ class FlushRunner:
         slots = asyncio.Semaphore(self._concurrency)
         streams = [
             asyncio.create_task(
-                self._drain_partition(self._stages.stage(t, p), slots),
+                self._drain_stage(self._stages.stage(t, p), slots),
                 name=f"millrace-drain-{t}-{p}",
             )
             for t, p in self._stages.partitions()
@@ -2034,6 +2247,10 @@ class FlushRunner:
             await self._drain_retries()
         finally:
             self._in_drain = False
+        if not self._stopping and self._fatal is None:
+            # After a stop the streams left rows unread and unindexed: an
+            # "empty" foreign index proves nothing then.
+            await self._close_drained_foreign()
 
     async def _drain_retries(self) -> None:
         """The drain's retry pass over the groups its streams held."""
@@ -2058,10 +2275,10 @@ class FlushRunner:
                 # Everything pending is waiting out a retry backoff.
                 await self._sleep(min(self._sweep_s, _RETRY_BASE_S))
 
-    async def _drain_partition(
+    async def _drain_stage(
         self, stage: PartitionStage, slots: asyncio.Semaphore
     ) -> None:
-        """Stream one partition's staged rows and flush them window by
+        """Stream one stage's staged rows and flush them window by
         window (stage.py :class:`~millrace.stage.RowStream`). A slot is
         taken BEFORE a window is read and given back when its flush
         ends, so ``slots`` bounds the windows in memory across every
@@ -2069,7 +2286,7 @@ class FlushRunner:
         where = f"{stage.topic}[{stage.partition}]"
         stage.forget_index()
         stream = stage.row_stream(
-            max_bytes=self._flusher.flush_bytes, now_us=self._now_us()
+            max_bytes=self._knobs.flush_bytes, now_us=self._now_us()
         )
         progress = _DrainProgress(where, stream, self._monotonic)
         log.info("startup drain of %s: streaming its staged rows", where)
@@ -2078,9 +2295,7 @@ class FlushRunner:
         failed: set[keyspace.PartitionTuple] = set()
         outcome = "failed"
         try:
-            await self._stream_partition(
-                stage, stream, slots, progress, failed, flushes
-            )
+            await self._stream_stage(stage, stream, slots, progress, failed, flushes)
             await stage.make_durable()
             outcome = (
                 "stopped" if self._stopping or self._fatal is not None else "streamed"
@@ -2103,7 +2318,7 @@ class FlushRunner:
             await asyncio.gather(cleanup, return_exceptions=True)
             progress.finish(outcome)
 
-    async def _stream_partition(
+    async def _stream_stage(
         self,
         stage: PartitionStage,
         stream: RowStream,
@@ -2112,22 +2327,44 @@ class FlushRunner:
         failed: set[keyspace.PartitionTuple],
         flushes: set[asyncio.Task[None]],
     ) -> None:
-        """Read windows (a slot each) and launch their flushes; returns
-        once the stream is exhausted (or stopped) and every launched
-        flush has finished."""
+        """Read windows into batches (a slot each, at most about
+        ``flush_bytes`` and ``batch_max_groups`` windows: a window that
+        would overflow a non-empty batch is carried into the next one)
+        and launch their flushes; returns once the stream is exhausted
+        (or stopped) and every launched flush has finished."""
+        budget = self._knobs.flush_bytes
+        carry: Scan | None = None
+        exhausted = False
         try:
-            while not self._stopping and self._fatal is None:
+            while (
+                not self._stopping
+                and self._fatal is None
+                and not (exhausted and carry is None)
+            ):
                 await slots.acquire()
+                batch: list[Scan] = []
+                nbytes = 0
+                if carry is not None:
+                    batch, nbytes, carry = [carry], carry.nbytes, None
                 try:
-                    window = await stream.next_window()
+                    while len(batch) < self._batch_max_groups and nbytes < budget:
+                        window = await stream.next_window()
+                        if window is None:
+                            exhausted = True
+                            break
+                        if batch and nbytes + window.nbytes > budget:
+                            carry = window
+                            break
+                        batch.append(window)
+                        nbytes += window.nbytes
                 except BaseException:
                     slots.release()
                     raise
-                if window is None:
+                if not batch:
                     slots.release()
                     break
                 task = asyncio.create_task(
-                    self._drain_window(stage, stream, window, slots, progress, failed)
+                    self._drain_batch(stage, stream, batch, slots, progress, failed)
                 )
                 flushes.add(task)
                 task.add_done_callback(flushes.discard)
@@ -2136,53 +2373,72 @@ class FlushRunner:
             if flushes:
                 await asyncio.gather(*list(flushes), return_exceptions=True)
 
-    async def _drain_window(
+    async def _drain_batch(
         self,
         stage: PartitionStage,
         stream: RowStream,
-        window: Scan,
+        windows: list[Scan],
         slots: asyncio.Semaphore,
         progress: _DrainProgress,
         failed: set[keyspace.PartitionTuple],
     ) -> None:
-        key = (stage.topic, stage.partition, window.group)
+        held: list[tuple[Scan, Exception, bool]] = []
         try:
             if self._fatal is not None or self._stopping:
                 return  # the rows stay staged; the next start drains them
             # Deletes need no durability for at-least-once (a lost one
             # re-flushes a duplicate after a crash), and waiting for each
-            # serializes the drain on one object-store PUT per window.
-            # The stream ends with one durable flush (_drain_partition).
+            # serializes the drain on one object-store PUT per batch.
+            # The stream ends with one durable flush (_drain_stage).
             # A fence is therefore only seen at a WAL flush: until then a
             # fenced drain may publish windows the new owner also
             # publishes (duplicates only).
-            await self._flusher.flush_scan(stage, window, "drain", durable=False)
+            report = await self._flusher.flush_batch(
+                stage, windows, "drain", durable=False
+            )
         except FlushHalted as halt:
             self._fatal = halt
         except StageClosedError:
             pass
-        except Exception as e:  # noqa: BLE001 - contained per window
+        except Exception as e:  # noqa: BLE001 - contained per batch
             if is_fenced(e):
                 self._fatal = FencedError([(stage.topic, stage.partition)])
                 return
-            # Keep the group staged and indexed: the stream skips the
-            # rest of its rows and the retry loop takes it from here.
-            stream.hold(
-                window.group,
-                nbytes=window.nbytes,
-                rows=len(window.rows),
-                now_us=self._now_us(),
-            )
-            if window.group not in failed:
-                failed.add(window.group)
-                self._note_failure(key, stage, window.group, e)
-            progress.held += 1
+            held = [(w, e, False) for w in windows]
         else:
+            # Build failures and a refused commit's unpublished groups
+            # stay staged and retry alone.
+            errors: dict[keyspace.PartitionTuple, Exception] = dict(report.failed)
+            if report.refusal is not None:
+                errors.update((group, report.refusal) for group in report.refused)
+            held = [(w, errors[w.group], True) for w in windows if w.group in errors]
+            self._drained([w for w in windows if w.group not in errors], progress)
+        finally:
+            # Keep each failed group staged and indexed: the stream skips
+            # the rest of its rows and the retry loop takes it from here.
+            for window, error, split in held:
+                stream.hold(
+                    window.group,
+                    nbytes=window.nbytes,
+                    rows=len(window.rows),
+                    now_us=self._now_us(),
+                )
+                if window.group not in failed:
+                    failed.add(window.group)
+                    self._note_failure(
+                        (stage.topic, stage.partition, window.group),
+                        stage,
+                        error,
+                        split=split,
+                    )
+                progress.held += 1
+            slots.release()
+
+    def _drained(self, windows: Sequence[Scan], progress: _DrainProgress) -> None:
+        for window in windows:
             self._drain_rows += len(window.rows)
             self._drain_bytes += window.nbytes
             progress.flushed(window)
-        finally:
-            slots.release()
 
     async def _delete_foreign_keys(self, stage: PartitionStage, where: str) -> None:
         """Housekeeping alongside the drain: an older build's keys go
@@ -2214,6 +2470,14 @@ class FlushRunner:
 
     # -- internals ---------------------------------------------------------------
 
+    async def _close_drained_foreign(self) -> None:
+        """Close the foreign stages (slots other than the home) whose
+        rows are all flushed; a stuck group keeps its stage open."""
+        try:
+            await self._stages.close_idle_foreign()
+        except StageClosedError:
+            pass
+
     def _raise_fatal(self) -> None:
         if self._fatal is not None:
             raise self._fatal
@@ -2228,106 +2492,280 @@ class FlushRunner:
             keys.extend((topic, partition, s.group) for s in stage.snapshot())
         return keys
 
-    def _launch(self, *, drain: bool) -> list[asyncio.Task[FlushReport | None]]:
-        """Start a task for every due group not in flight, oldest first."""
+    def _launch(
+        self, *, drain: bool
+    ) -> list[tuple[asyncio.Task[list[FlushReport]], int]]:
+        """Start the due groups not in flight, oldest first: a size-lane
+        or backlog group, or one whose last failure split it out of a
+        batch, alone; every other due group of a stage packed into
+        batches of at most ``flush_bytes`` staged and
+        ``batch_max_groups`` groups. Each unit is one decision
+        (:meth:`_flush`). Returns each task with its group count. The
+        index is read in place (no copies): this runs every second."""
         self._sweeps += 1
         now_us = self._now_us()
         now = self._monotonic()
-        due: list[tuple[int, PartitionStage, keyspace.PartitionTuple, str]] = []
-        live: set[_GroupKey] = set()
+        # Most groups are neither failed, in flight nor due: a sweep
+        # skips them on two comparisons, without building a key or
+        # calling the planner.
+        failures_map = self._failures
+        inflight = self._inflight
+        size_cut = self._knobs.flush_bytes
+        age_cut = due_floor_ts(now_us=now_us, knobs=self._knobs)
+        due: list[tuple[int, PartitionStage, keyspace.PartitionTuple, str, int]] = []
         for topic, partition in self._stages.partitions():
             try:
                 stage = self._stages.stage(topic, partition)
             except KeyError:
                 continue
-            for snap in stage.snapshot():
-                key = (topic, partition, snap.group)
-                live.add(key)
-                failures = self._failures.get(key)
+            for group, state in stage.groups():
+                failures = None
+                if failures_map or inflight:
+                    key = (topic, partition, group)
+                    if key in inflight:
+                        continue
+                    failures = failures_map.get(key)
                 if failures is not None:
                     if now < failures.retry_at:
                         continue
                     trigger: str | None = "retry"
+                elif (
+                    not drain
+                    and not state.backlog
+                    and state.staged_bytes < size_cut
+                    and state.first_staged_ts > age_cut
+                ):
+                    continue
                 elif drain:
                     trigger = "drain"
-                elif snap.backlog:
+                elif state.backlog:
                     # A capped scan left rows behind: keep draining them.
                     trigger = "backlog"
                 else:
                     trigger = decide(
-                        staged_bytes=snap.staged_bytes,
-                        first_staged_ts=snap.first_staged_ts,
+                        staged_bytes=state.staged_bytes,
+                        first_staged_ts=state.first_staged_ts,
                         now_us=now_us,
                         knobs=self._knobs,
                     )
                 if trigger is not None:
-                    due.append((snap.first_staged_ts, stage, snap.group, trigger))
-        # A group that left the index (drained, or its partition closed)
-        # has no failure state to keep.
-        for key in list(self._failures):
-            if key not in live:
-                del self._failures[key]
+                    due.append(
+                        (
+                            state.first_staged_ts,
+                            stage,
+                            group,
+                            trigger,
+                            state.staged_bytes,
+                        )
+                    )
+        self._prune_failures()
         self._oldest_due_ts = min((ts for ts, *_ in due), default=None)
-        tasks = []
-        for _ts, stage, group, trigger in sorted(due, key=lambda d: d[0]):
+        units: list[
+            tuple[PartitionStage, str, list[tuple[keyspace.PartitionTuple, int]]]
+        ] = []
+        open_batch: dict[
+            tuple[str, int], tuple[list[tuple[keyspace.PartitionTuple, int]], int]
+        ] = {}
+        budget = self._knobs.flush_bytes
+        for _ts, stage, group, trigger, nbytes in sorted(due, key=lambda d: d[0]):
             key = (stage.topic, stage.partition, group)
-            if key in self._inflight:
+            failures = failures_map.get(key)
+            if trigger in ("size", "backlog") or (
+                failures is not None and failures.split
+            ):
+                units.append((stage, trigger, [(group, nbytes)]))
                 continue
+            skey = (stage.topic, stage.partition)
+            members, used = open_batch.get(skey, ([], 0))
+            if members and (
+                len(members) >= self._batch_max_groups or used + nbytes > budget
+            ):
+                members, used = [], 0
+            if not members:
+                # The batch carries its oldest group's trigger.
+                units.append((stage, trigger, members))
+            members.append((group, nbytes))
+            open_batch[skey] = (members, used + nbytes)
+        launched: list[tuple[asyncio.Task[list[FlushReport]], int]] = []
+        for stage, trigger, members in units:
+            keys = [(stage.topic, stage.partition, group) for group, _ in members]
             task = asyncio.create_task(
-                self._flush_one(key, stage, group, trigger),
+                self._flush(keys, stage, trigger, [nbytes for _, nbytes in members]),
                 name=f"millrace-flush-{stage.topic}-{stage.partition}",
             )
-            self._inflight[key] = task
-            tasks.append(task)
-        return tasks
+            for key in keys:
+                self._inflight[key] = task
+            launched.append((task, len(keys)))
+        return launched
 
-    async def _flush_one(
+    def _prune_failures(self) -> None:
+        """Forget the failure state of groups that left the index (drained,
+        or their stage closed). Failures are few; the index is not
+        walked."""
+        for key in list(self._failures):
+            topic, partition, group = key
+            try:
+                stage = self._stages.stage(topic, partition)
+            except KeyError:
+                del self._failures[key]
+                continue
+            if not stage.has_group(group):
+                del self._failures[key]
+
+    async def _scan_unit(
+        self, stage: PartitionStage, keys: Sequence[_GroupKey], hints: Sequence[int]
+    ) -> list[Scan]:
+        """Scan a decision's groups, at most :data:`_SCAN_CONCURRENCY` at
+        once. Each group's byte cap is its indexed estimate plus an even
+        share of the budget the batch leaves unused, so the caps sum to
+        ``flush_bytes`` (one group: the whole budget); a group the index
+        under-counted is capped and comes back as backlog."""
+        budget = self._knobs.flush_bytes
+        if len(keys) == 1:
+            caps = [budget]
+        else:
+            slack = max(0, budget - sum(hints)) // len(keys)
+            caps = [max(1, hint + slack) for hint in hints]
+        now_us = self._now_us()
+        gate = asyncio.Semaphore(_SCAN_CONCURRENCY)
+
+        async def one(group: keyspace.PartitionTuple, cap: int, hint: int) -> Scan:
+            async with gate:
+                return await stage.scan(
+                    group, max_bytes=cap, now_us=now_us, size_hint=hint
+                )
+
+        return list(
+            await asyncio.gather(
+                *(
+                    one(key[2], cap, hint)
+                    for key, cap, hint in zip(keys, caps, hints, strict=True)
+                )
+            )
+        )
+
+    async def _flush(
         self,
-        key: _GroupKey,
+        keys: list[_GroupKey],
         stage: PartitionStage,
-        group: keyspace.PartitionTuple,
         trigger: str,
-    ) -> FlushReport | None:
+        hints: list[int],
+    ) -> list[FlushReport]:
+        """One decision: scan the unit's groups, then one
+        :meth:`HoglakeFlusher.flush_batch`."""
         try:
             async with self._semaphore:
                 if self._fatal is not None:
-                    return None
-                report = await self._flusher.flush_group(stage, group, trigger)
+                    return []
+                scans = await self._scan_unit(stage, keys, hints)
+                report = await self._flusher.flush_batch(stage, scans, trigger)
         except FlushHalted as halt:
             self._fatal = halt
-            return None
+            return []
         except StageClosedError:
-            return None  # shutdown or a fenced partition closed locally
+            return []  # shutdown or a fenced stage closed locally
         except Exception as e:  # noqa: BLE001 - contained per decision
             if is_fenced(e):
                 self._fatal = FencedError([(stage.topic, stage.partition)])
-                return None
-            self._note_failure(key, stage, group, e)
-            return None
+                return []
+            self._note_failures(keys, stage, e, split=False)
+            return []
         finally:
-            self._inflight.pop(key, None)
-        self._failures.pop(key, None)
+            for key in keys:
+                self._inflight.pop(key, None)
+        # A refused commit splits its unpublished groups out (each then
+        # retries alone, which isolates a poisoned one); a group whose
+        # build failed retries alone too.
+        build_failed = dict(report.failed)
+        refused = set(report.refused)
+        if report.refusal is not None:
+            self._note_failures(
+                [k for k in keys if k[2] in refused], stage, report.refusal, split=True
+            )
+        for key in keys:
+            error = build_failed.get(key[2])
+            if error is not None:
+                self._note_failure(key, stage, error, split=True)
+            elif key[2] not in refused:
+                self._failures.pop(key, None)
+        self._count_drained(report.reports)
+        return list(report.reports)
+
+    def _count_drained(self, reports: Sequence[FlushReport]) -> None:
         if self._in_drain:
             # The drain's retry pass: its rows count as drained too.
-            self._drain_rows += report.staged_rows
-            self._drain_bytes += report.staged_bytes
-        return report
+            for report in reports:
+                self._drain_rows += report.staged_rows
+                self._drain_bytes += report.staged_bytes
+
+    def _note_failures(
+        self,
+        keys: Sequence[_GroupKey],
+        stage: PartitionStage,
+        error: Exception,
+        *,
+        split: bool,
+    ) -> None:
+        """Count a failed decision against each of its groups: one group
+        logs as itself, a batch logs once (and once if any group became
+        stuck)."""
+        if not keys:
+            return
+        if len(keys) == 1:
+            self._note_failure(keys[0], stage, error, split=split)
+            return
+        stuck = sum(
+            self._note_failure(key, stage, error, split=split, quiet=True)
+            for key in keys
+        )
+        what = "retrying each group alone" if split else "retrying the batch"
+        log.warning(
+            "batched flush of %d group(s) on %s[%d] failed (%s); %s",
+            len(keys),
+            stage.topic,
+            stage.partition,
+            error,
+            what,
+        )
+        if stuck:
+            log.error(
+                "flush STUCK: %d group(s) on %s[%d] failed %d times in a row "
+                "(last: %s); their rows stay staged and they keep retrying "
+                "every %.0fs at most",
+                stuck,
+                stage.topic,
+                stage.partition,
+                STUCK_AFTER,
+                error,
+                _RETRY_MAX_S,
+            )
 
     def _note_failure(
         self,
         key: _GroupKey,
         stage: PartitionStage,
-        group: keyspace.PartitionTuple,
         error: Exception,
-    ) -> None:
+        *,
+        split: bool = False,
+        quiet: bool = False,
+    ) -> bool:
+        """Count one group's failure and schedule its retry; returns
+        whether it just became stuck. ``quiet`` leaves the logging to the
+        caller (a batch logs once)."""
         self._flusher.note_failure()
         previous = self._failures.get(key)
+        # Once split out of a batch, a group retries alone until it lands.
+        split = split or (previous is not None and previous.split)
         count = 1 if previous is None else previous.count + 1
         delay = min(_RETRY_BASE_S * (2 ** (count - 1)), _RETRY_MAX_S)
-        self._failures[key] = _Failures(count, self._monotonic() + delay)
-        where = f"{stage.topic}[{stage.partition}] group {group}"
-        if count == STUCK_AFTER:
+        self._failures[key] = _Failures(count, self._monotonic() + delay, split)
+        became_stuck = count == STUCK_AFTER
+        if became_stuck:
             self._stuck_total += 1
+        if quiet:
+            return became_stuck
+        where = f"{stage.topic}[{stage.partition}] group {key[2]}"
+        if became_stuck:
             log.error(
                 "flush STUCK: %s failed %d times in a row (last: %s); its rows "
                 "stay staged and it keeps retrying every %.0fs at most",
@@ -2352,9 +2790,10 @@ class FlushRunner:
                 delay,
                 exc_info=error,
             )
+        return became_stuck
 
     async def _wait_inflight(self) -> None:
-        tasks = list(self._inflight.values())
+        tasks = list(set(self._inflight.values()))
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 

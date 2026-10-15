@@ -512,6 +512,35 @@ async def test_settle_deletes_exactly_the_scanned_keys(stage_factory):
     await stage.close()
 
 
+async def test_settle_many_deletes_several_groups_in_one_write(stage_factory):
+    """A batched commit's groups settle as ONE delete batch: one write,
+    each group's index entry updated on its own scan's terms."""
+    stage = await stage_factory()
+    await stage.stage_batch(
+        [rec(1, 0, o) for o in range(3)]
+        + [rec(2, 0, o, b"x" * 10) for o in range(3, 7)]
+        + [rec(3, 0, 9)],
+        now_us=NOW,
+    )
+    full_1 = await stage.scan(g(1), max_bytes=BIG, now_us=NOW + 10)
+    capped_2 = await stage.scan(g(2), max_bytes=20, now_us=NOW + 10)
+    writes = 0
+    real_write = stage._db.write
+
+    async def counted(batch):
+        nonlocal writes
+        writes += 1
+        return await real_write(batch)
+
+    stage._db.write = counted
+    assert await stage.settle_many([full_1, capped_2]) == [True, False]
+    assert writes == 1
+    assert await offsets(stage, 1) == []
+    assert await offsets(stage, 2) == [5, 6]
+    assert sorted(s.group for s in stage.snapshot()) == [g(2), g(3)]
+    await stage.close()
+
+
 async def test_a_complete_untouched_scan_drains_the_group(stage_factory):
     stage = await stage_factory()
     await stage.stage_batch([rec(1, 0, o) for o in range(3)], now_us=NOW)
@@ -831,8 +860,10 @@ def manager(**kwargs) -> StageManager:
 async def test_manager_opens_and_aggregates():
     m = manager()
     assert m.path_for("events", 3) == "millrace/events/3"
-    await m.sync_assignment([("events", 0), ("events", 1)])
+    await m.claim("events", 0, [1])
     assert m.partitions() == (("events", 0), ("events", 1))
+    assert m.home_stage().partition == 0
+    assert (m.is_foreign("events", 0), m.is_foreign("events", 1)) == (False, True)
     await m.stage("events", 0).stage_batch([rec(1, 0, 0, b"ab")], now_us=NOW + 5)
     await m.stage("events", 1).stage_batch(
         [rec(1, 0, 0, b"c"), rec(2, 0, 1, b"d")], now_us=NOW + 2
@@ -852,7 +883,7 @@ async def test_manager_opens_and_aggregates():
     assert gauges.oldest_first_staged_ts == NOW + 2
     with pytest.raises(StageError, match="already open"):
         await m.open_partition("events", 0)
-    await m.sync_assignment([("events", 1)])
+    await m.close_partition("events", 0)
     assert m.partitions() == (("events", 1),)
     with pytest.raises(KeyError):
         m.stage("events", 0)
@@ -861,7 +892,7 @@ async def test_manager_opens_and_aggregates():
     with pytest.raises(StageClosedError):
         await m.open_partition("events", 0)
     with pytest.raises(StageClosedError):
-        await m.sync_assignment([])
+        await m.claim("events", 0, [])
     empty = manager().gauges()
     assert (empty.staged_groups, empty.oldest_first_staged_ts) == (0, None)
 
@@ -909,7 +940,8 @@ async def test_manager_opens_every_partition_on_the_shared_cache_with_its_id(
     m = manager(block_cache_bytes=1 << 20, meta_cache_bytes=1 << 18)
     assert m.cache_capacity_bytes == (1 << 20, 1 << 18)
     claimed = [("events", 0), ("events", 7), ("other", 0)]
-    await m.sync_assignment(claimed)
+    for topic, partition in claimed:
+        await m.open_partition(topic, partition)
     assert [c[0] for c in spy.calls] == ["with_db_cache"] * 3
     assert len({id(c[1]) for c in spy.calls}) == 1
     assert [c[2] for c in spy.calls] == [
@@ -939,7 +971,7 @@ def test_the_shared_cache_halves_carry_their_configured_capacities(monkeypatch):
 async def test_manager_opens_with_the_cache_disabled_on_the_zero_pair(monkeypatch):
     spy = _SpyBuilder(monkeypatch)
     m = manager(block_cache_bytes=0, meta_cache_bytes=0)
-    await m.sync_assignment([("events", 0)])
+    await m.claim("events", 0, [])
     assert spy.calls == [("with_db_cache_disabled",)]
     await m.close()
 
@@ -1007,12 +1039,13 @@ async def test_open_store_refuses_inconsistent_arguments(memory_store):
 
 
 def test_build_slatedb_settings_shape():
-    """GC always off (the maintenance service owns it), the memory and L0
-    knobs applied, the compactor never touched."""
+    """GC always off (the maintenance service owns it), SSTs zstd, the
+    memory and L0 knobs applied, the compactor never touched."""
     doc = json.loads(
         build_slatedb_settings(max_unflushed_bytes=1234, l0_max_ssts=5).to_json_string()
     )
     assert doc["garbage_collector_options"] is None
+    assert doc["compression_codec"] == "Zstd"
     assert doc["max_unflushed_bytes"] == 1234
     assert doc["l0_max_ssts"] == 5
     assert doc["compactor_options"] is not None
@@ -1234,3 +1267,33 @@ async def test_a_page_stops_fetching_at_its_byte_cap(stage_factory, monkeypatch)
     # Two-row fetches until the page passed 250 bytes: 4 rows, not 1024.
     assert len(stream._page) == 4
     await stage.close()
+
+
+async def test_existing_slots_probes_real_manifests_and_creates_nothing():
+    m = manager()
+    for slot in (1, 5):
+        await m.open_partition("events", slot)
+    assert await m.existing_slots("events", range(8)) == [1, 5]
+    # Probing created nothing: a second probe still sees only those two.
+    assert await m.existing_slots("events", range(8)) == [1, 5]
+    await m.close()
+
+
+async def test_a_manifest_probe_error_propagates(monkeypatch):
+    """A slot holding committed rows must never be skipped as absent."""
+
+    class Broken:
+        def __init__(self, *args: object) -> None:
+            pass
+
+        def build(self) -> Broken:
+            return self
+
+        async def read_manifest(self, _id: object) -> None:
+            raise OSError("GetObject: access denied")
+
+    monkeypatch.setattr(stage_mod, "AdminBuilder", Broken)
+    m = manager()
+    with pytest.raises(OSError, match="access denied"):
+        await m.existing_slots("events", [0, 1])
+    await m.close()

@@ -1,9 +1,16 @@
-"""Durable staging: one SlateDB instance per claimed Kafka partition.
+"""Durable staging: one SlateDB instance per replica, its HOME stage.
 
-Each instance lives at ``{base_path}/{topic}/{partition}`` and holds the
-partition's consumed records under ``rows/(group, offset)``
-(keyspace.py). SlateDB is single-writer per path and fences lazily: a
-second open of a path succeeds and the older writer gets
+A stage lives at ``{base_path}/{topic}/{slot}``. A replica's home slot
+is the smallest Kafka partition it claims (with the ``p % R ==
+ordinal`` assignment, its ordinal), and the home holds every claimed
+partition's records under ``rows/(group, partition, offset)``
+(keyspace.py), so each group is one key range per replica whatever the
+partition count. At startup the replica also opens every OTHER existing
+slot ``j`` with ``j % R == ordinal`` (the home of a replica a scale-down
+removed) and drains it; such a foreign stage is closed once empty and is
+never written by the consumer. For a fixed ``R`` the slot sets of the
+replicas are disjoint. SlateDB is single-writer per path and fences
+lazily: a second open of a path succeeds and the older writer gets
 ``Error.Closed(FENCED)`` at its next write's durability wait.
 
 Group sizes and ages are kept IN MEMORY only (:class:`GroupState`).
@@ -32,11 +39,12 @@ import asyncio
 import hashlib
 import logging
 import time
-from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
 from typing import Final, Literal, Self, overload
 
 from slatedb.uniffi import (
+    AdminBuilder,
     CloseReason,
     Db,
     DbBuilder,
@@ -74,9 +82,9 @@ _BULK_SCAN_FETCH_TASKS: Final = 4
 
 
 #: The startup drain's row stream reads with less read-ahead than a
-#: flush window scan: one iterator stays open per partition for the
-#: whole drain, and read-ahead is per SST iterator of the merge (every
-#: L0 and sorted run), so its buffers scale with partitions x sources.
+#: flush window scan: one iterator stays open per stage for the whole
+#: drain, and read-ahead is per SST iterator of the merge (every L0 and
+#: sorted run), so its buffers scale with stages x sources.
 _DRAIN_READ_AHEAD_BYTES: Final = 1024 * 1024
 _DRAIN_FETCH_TASKS: Final = 2
 #: The drain stream's page: fetched ``_PAGE_FETCH`` rows at a time until
@@ -119,6 +127,23 @@ def _bulk_scan_options() -> ScanOptions:
     )
 
 
+#: A scan expected to read less than this uses the small options: a
+#: tiny group's scan should not pull multi-MiB read-ahead per SST.
+_SMALL_SCAN_BYTES: Final = 1024 * 1024
+
+
+def _small_scan_options() -> ScanOptions:
+    """Options for a scan expected to be small (a tail group in a
+    batch): 64 KiB read-ahead, one fetch task, blocks not cached."""
+    return ScanOptions(
+        durability_filter=DurabilityLevel.MEMORY,
+        dirty=False,
+        read_ahead_bytes=64 * 1024,
+        cache_blocks=False,
+        max_fetch_tasks=1,
+    )
+
+
 class StageError(Exception):
     """Base for staging-layer failures."""
 
@@ -150,11 +175,13 @@ def is_fenced(exc: BaseException) -> bool:
 @dataclass(frozen=True, slots=True)
 class StagedRecord:
     """One consumed record to stage under ``group`` (its partition
-    tuple), keyed ``(group, offset)``."""
+    tuple), keyed ``(group, partition, offset)``; ``partition`` is the
+    record's Kafka partition."""
 
     group: PartitionTuple
     offset: int
     payload: bytes
+    partition: int = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.payload, bytes):
@@ -167,16 +194,20 @@ class DroppedRecord:
     object, malformed partition source, tombstone; flush time: a value
     no column can hold). Counted and logged, never staged or published.
     ``path`` is the dotted catalog path of the refusing column when the
-    decoder knows it."""
+    decoder knows it; ``partition`` the Kafka partition, when known."""
 
     offset: int
     reason: str
     path: str | None = None
+    partition: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class StageAck:
-    """A durable :meth:`PartitionStage.stage_batch`."""
+    """A durable :meth:`PartitionStage.stage_batch`. ``partition`` is the
+    stage's slot; ``last_offsets`` maps each Kafka partition in the
+    batch to its highest staged offset, and ``first_offset`` /
+    ``last_offset`` bound every offset in the batch."""
 
     topic: str
     partition: int
@@ -184,6 +215,7 @@ class StageAck:
     staged_bytes: int
     first_offset: int
     last_offset: int
+    last_offsets: Mapping[int, int] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -220,8 +252,8 @@ class GroupSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class Scan:
-    """A bounded scan of one group: an exact offset prefix of its staged
-    rows. ``complete`` is True when the scan reached the end of the
+    """A bounded scan of one group: a key prefix (in ``(partition,
+    offset)`` order) of its staged rows. ``complete`` is True when the scan reached the end of the
     group's rows. ``gen`` is the group's write generation read under the
     lock just before the scan began (None when the group was not in the
     index); ``started_us`` the staging clock at that moment."""
@@ -231,16 +263,18 @@ class Scan:
     complete: bool
     gen: int | None
     started_us: int
+    #: The rows' payload bytes; computed once when not given.
+    nbytes: int = -1
 
-    @property
-    def nbytes(self) -> int:
-        return sum(len(p) for _, p in self.rows)
+    def __post_init__(self) -> None:
+        if self.nbytes < 0:
+            object.__setattr__(self, "nbytes", sum(len(p) for _, p in self.rows))
 
 
 class RowStream:
     """The startup drain's single pass over one stage's ``rows/``: ONE
     iterator with read-ahead (never a seek per group), cut into flush
-    windows. A window is an exact offset run of ONE group, cut at the
+    windows. A window is a key run of ONE group, cut at the
     group's last row or where the next row would exceed ``max_bytes``
     (always at least one row). The scan never holds the write lock.
 
@@ -417,7 +451,11 @@ def build_slatedb_settings(*, max_unflushed_bytes: int, l0_max_ssts: int) -> Set
     (maintenance.py) owns collection for every pipeline, which keeps
     LIST/DELETE traffic off the ingest pods. The embedded compactor is
     never touched: disabling it stalls memtable flushes at
-    ``l0_max_ssts`` with nothing to drain them."""
+    ``l0_max_ssts`` with nothing to drain them.
+
+    SSTs are zstd-compressed: staged rows are raw event JSON, which
+    compresses several-fold, and every staged byte is written, compacted
+    and re-read through the object store."""
     if max_unflushed_bytes < 1:
         raise ValueError(f"max_unflushed_bytes must be >= 1, got {max_unflushed_bytes}")
     if l0_max_ssts < 1:
@@ -426,6 +464,7 @@ def build_slatedb_settings(*, max_unflushed_bytes: int, l0_max_ssts: int) -> Set
     settings.set("max_unflushed_bytes", str(max_unflushed_bytes))
     settings.set("l0_max_ssts", str(l0_max_ssts))
     settings.set("garbage_collector_options", "null")
+    settings.set("compression_codec", '"Zstd"')
     return settings
 
 
@@ -462,20 +501,25 @@ def db_cache_id_for(topic: str, partition: int) -> int:
 
 def _build_stage_batch(
     records: Iterable[StagedRecord],
-) -> tuple[WriteBatch, dict[PartitionTuple, tuple[int, int]], int, int, int]:
+) -> tuple[
+    WriteBatch, dict[PartitionTuple, tuple[int, int]], int, int, int, dict[int, int]
+]:
     """Encode and lower one poll's records into a WriteBatch (worker
     thread). Returns the batch, per-group ``(bytes, rows)``, the row
-    count and the offset bounds. Refuses an empty batch and a row key
-    repeated within the batch (consumer bugs)."""
+    count, the offset bounds and the highest offset per Kafka partition.
+    Refuses an empty batch and a row key repeated within the batch
+    (consumer bugs)."""
     batch = WriteBatch()
     seen: set[bytes] = set()
     per_group: dict[PartitionTuple, tuple[int, int]] = {}
+    last_offsets: dict[int, int] = {}
     first = last = None
     for rec in records:
-        key = keyspace.encode_row_key(RowKey(rec.group, rec.offset))
+        key = keyspace.encode_row_key(RowKey(rec.group, rec.offset, rec.partition))
         if key in seen:
             raise ValueError(
-                f"duplicate row key in batch: group {rec.group} offset {rec.offset}"
+                f"duplicate row key in batch: group {rec.group} partition "
+                f"{rec.partition} offset {rec.offset}"
             )
         seen.add(key)
         batch.put(key, rec.payload)
@@ -483,9 +527,12 @@ def _build_stage_batch(
         per_group[rec.group] = (nbytes + len(rec.payload), nrows + 1)
         first = rec.offset if first is None else min(first, rec.offset)
         last = rec.offset if last is None else max(last, rec.offset)
+        last_offsets[rec.partition] = max(
+            rec.offset, last_offsets.get(rec.partition, rec.offset)
+        )
     if first is None or last is None:
         raise ValueError("stage_batch requires at least one record")
-    return batch, per_group, len(seen), first, last
+    return batch, per_group, len(seen), first, last, last_offsets
 
 
 def _build_delete_batch(rows: Sequence[tuple[RowKey, bytes]]) -> WriteBatch:
@@ -496,7 +543,9 @@ def _build_delete_batch(rows: Sequence[tuple[RowKey, bytes]]) -> WriteBatch:
 
 
 class PartitionStage:
-    """Owns one SlateDB instance staging one (topic, partition)."""
+    """Owns one stage: one SlateDB instance at ``{base}/{topic}/{slot}``,
+    staging every Kafka partition its replica claims (its home) or being
+    drained (a foreign slot). ``partition`` is the slot."""
 
     def __init__(
         self,
@@ -686,7 +735,7 @@ class PartitionStage:
                     batch.delete(kv.key)
                 async with self._write_lock:
                     handle = await self._db.write(batch)
-                    await handle.await_durable()
+                await handle.await_durable()
                 deleted += len(chunk)
         return deleted
 
@@ -710,16 +759,19 @@ class PartitionStage:
     async def stage_batch(
         self, records: Iterable[StagedRecord], *, now_us: int
     ) -> StageAck:
-        """Stage one poll's records for this partition as ONE write
-        batch, remotely durable before return. The batch is built (and
-        its payloads lowered into the binding) on a worker thread before
-        the lock; under the lock only the in-memory index update, the
-        write and the durability wait run. The index is updated BEFORE
+        """Stage one poll's records (every claimed partition) as ONE
+        write batch, remotely durable before return. The batch is built
+        (and its payloads lowered into the binding) on a worker thread
+        before the lock; under the lock only the in-memory index update
+        and the write run, and the durability wait follows outside it
+        (scans read at MEMORY durability, so visibility needs only the
+        write; a row published before its put is durable can at worst be
+        replayed from Kafka: a duplicate). The index is updated BEFORE
         the write so memory always covers disk; a failed write leaves
         harmless over-counts (and is process-fatal in the consumer)."""
         self._ensure_open()
         recs = list(records)
-        batch, per_group, rows, first, last = await asyncio.to_thread(
+        batch, per_group, rows, first, last, last_offsets = await asyncio.to_thread(
             _build_stage_batch, recs
         )
         async with self._write_lock:
@@ -733,7 +785,7 @@ class PartitionStage:
                 state.rows += nrows
                 state.gen = self._gen
             handle = await self._db.write(batch)
-            await handle.await_durable()
+        await handle.await_durable()
         return StageAck(
             topic=self._topic,
             partition=self._partition,
@@ -741,6 +793,7 @@ class PartitionStage:
             staged_bytes=sum(b for b, _ in per_group.values()),
             first_offset=first,
             last_offset=last,
+            last_offsets=last_offsets,
         )
 
     async def probe_fence(self, offset: int) -> None:
@@ -753,7 +806,7 @@ class PartitionStage:
         batch.put(keyspace.FENCE_PROBE_KEY, keyspace.encode_fence_probe_value(offset))
         async with self._write_lock:
             handle = await self._db.write(batch)
-            await handle.await_durable()
+        await handle.await_durable()
 
     # -- the index ------------------------------------------------------------
 
@@ -769,12 +822,35 @@ class PartitionStage:
     def has_group(self, group: PartitionTuple) -> bool:
         return group in self._groups
 
+    def groups(self) -> Iterable[tuple[PartitionTuple, GroupState]]:
+        """The live index, NOT copied (the flush sweep reads every group
+        every second). Read-only, and only from synchronous code: an
+        ``await`` while iterating could see the index change."""
+        return self._groups.items()
+
+    def is_empty(self) -> bool:
+        return not self._groups
+
+    def group_states(self) -> list[GroupState]:
+        """The index's group states as ONE C-level copy: safe from
+        another thread (the metrics scrape), unlike :meth:`groups`."""
+        return list(self._groups.values())
+
     # -- flush ----------------------------------------------------------------
 
-    async def scan(self, group: PartitionTuple, *, max_bytes: int, now_us: int) -> Scan:
-        """Read an offset prefix of ``group``'s staged rows, at most
+    async def scan(
+        self,
+        group: PartitionTuple,
+        *,
+        max_bytes: int,
+        now_us: int,
+        size_hint: int | None = None,
+    ) -> Scan:
+        """Read a key prefix of ``group``'s staged rows, at most
         ``max_bytes`` of payload but ALWAYS at least one row when any
         exists (a row larger than the budget must not wedge its group).
+        ``size_hint`` (the index's estimate) below
+        :data:`_SMALL_SCAN_BYTES` selects the small read-ahead.
 
         The group's write generation is read under the lock first: every
         write with a generation at or below it has returned, so it is
@@ -787,9 +863,10 @@ class PartitionStage:
             state = self._groups.get(group)
             gen = None if state is None else state.gen
         start, end = keyspace.group_rows_range(group)
+        small = size_hint is not None and size_hint < _SMALL_SCAN_BYTES
         it = await self._db.scan_with_options(
             KeyRange(start=start, start_inclusive=True, end=end, end_inclusive=False),
-            _bulk_scan_options(),
+            _small_scan_options() if small else _bulk_scan_options(),
         )
         rows: list[tuple[RowKey, bytes]] = []
         nbytes = 0
@@ -824,33 +901,48 @@ class PartitionStage:
         a complete scan with later writes lifts ``first_staged_ts`` to
         the scan's start, so a group under steady inflow is due once per
         deadline rather than on every sweep."""
+        (released,) = await self.settle_many([scan], durable=durable)
+        return released
+
+    async def settle_many(
+        self, scans: Sequence[Scan], *, durable: bool = True
+    ) -> list[bool]:
+        """:meth:`settle` for several scans (a batched commit's groups)
+        as ONE delete batch: one write, one durability wait. Returns,
+        per scan, whether its group left the index. The write runs under
+        the lock, the durability wait outside it, and the index update
+        under it again after durability, so a failed wait leaves every
+        group indexed."""
         self._ensure_open()
-        batch = (
-            await asyncio.to_thread(_build_delete_batch, scan.rows)
-            if scan.rows
-            else None
-        )
-        async with self._write_lock:
-            if batch is not None:
+        rows = [row for scan in scans for row in scan.rows]
+        batch = await asyncio.to_thread(_build_delete_batch, rows) if rows else None
+        if batch is not None:
+            async with self._write_lock:
+                self._ensure_open()
                 handle = await self._db.write(batch)
-                if durable:
-                    await handle.await_durable()
-            state = self._groups.get(scan.group)
-            if state is None:
-                return True
-            # A drain window (gen None) never releases a held group: its
-            # failed window's rows are still staged even when this window
-            # reached the group's end. Only a scan of the index does.
-            drain_window_of_held = state.held and scan.gen is None
-            if scan.complete and state.gen == scan.gen and not drain_window_of_held:
-                del self._groups[scan.group]
-                return True
-            state.staged_bytes = max(0, state.staged_bytes - scan.nbytes)
-            state.rows = max(0, state.rows - len(scan.rows))
-            state.backlog = not scan.complete
-            if scan.complete:
-                state.first_staged_ts = max(state.first_staged_ts, scan.started_us)
-            return False
+            if durable:
+                await handle.await_durable()
+        async with self._write_lock:
+            return [self._settle_index(scan) for scan in scans]
+
+    def _settle_index(self, scan: Scan) -> bool:
+        """The index half of a settle (under the write lock)."""
+        state = self._groups.get(scan.group)
+        if state is None:
+            return True
+        # A drain window (gen None) never releases a held group: its
+        # failed window's rows are still staged even when this window
+        # reached the group's end. Only a scan of the index does.
+        drain_window_of_held = state.held and scan.gen is None
+        if scan.complete and state.gen == scan.gen and not drain_window_of_held:
+            del self._groups[scan.group]
+            return True
+        state.staged_bytes = max(0, state.staged_bytes - scan.nbytes)
+        state.rows = max(0, state.rows - len(scan.rows))
+        state.backlog = not scan.complete
+        if scan.complete:
+            state.first_staged_ts = max(state.first_staged_ts, scan.started_us)
+        return False
 
     async def make_durable(self) -> None:
         """Wait until every write so far is durable (the end of the
@@ -872,9 +964,18 @@ class PartitionStage:
                 raise
 
 
+#: Which of the candidate slots exist under a topic (a test seam; the
+#: default probes each slot's SlateDB manifest).
+SlotProber = Callable[[str, Sequence[int]], Awaitable[Iterable[int]]]
+
+#: Slots probed concurrently at startup.
+_SLOT_PROBE_CONCURRENCY: Final = 16
+
+
 class StageManager:
-    """Opens and closes the :class:`PartitionStage` of each claimed
-    partition on one shared object store, with one pod-level SST cache."""
+    """Opens and closes stages on one shared object store, with one
+    pod-level SST cache: the replica's home stage plus the foreign slots
+    its startup drain empties (module docstring)."""
 
     def __init__(
         self,
@@ -884,6 +985,7 @@ class StageManager:
         settings: Settings | None = None,
         block_cache_bytes: int = SLATEDB_BLOCK_CACHE_BYTES_DEFAULT,
         meta_cache_bytes: int = SLATEDB_META_CACHE_BYTES_DEFAULT,
+        slot_prober: SlotProber | None = None,
     ) -> None:
         if not base_path.strip("/"):
             raise ValueError("base_path must be non-empty")
@@ -895,7 +997,23 @@ class StageManager:
         )
         self._cache_capacity = (block_cache_bytes, meta_cache_bytes)
         self._stages: dict[tuple[str, int], PartitionStage] = {}
+        self._home: tuple[str, int] | None = None
+        self._slot_prober = slot_prober or self._probe_manifests
         self._closed = False
+
+    async def _probe_manifests(self, topic: str, slots: Sequence[int]) -> list[int]:
+        """The slots holding a SlateDB manifest, through SlateDB's own
+        store (the stages' credentials and endpoint; nothing is created
+        or fenced)."""
+        gate = asyncio.Semaphore(_SLOT_PROBE_CONCURRENCY)
+
+        async def exists(slot: int) -> bool:
+            async with gate:
+                admin = AdminBuilder(self.path_for(topic, slot), self._store).build()
+                return await admin.read_manifest(None) is not None
+
+        found = await asyncio.gather(*(exists(slot) for slot in slots))
+        return [slot for slot, present in zip(slots, found, strict=True) if present]
 
     async def __aenter__(self) -> Self:
         return self
@@ -957,27 +1075,63 @@ class StageManager:
         stage = self._stages.pop((topic, partition))
         await stage.close()
 
-    async def sync_assignment(self, claimed: Iterable[tuple[str, int]]) -> None:
-        """Close revoked partitions and open newly claimed ones."""
+    async def existing_slots(self, topic: str, candidates: Iterable[int]) -> list[int]:
+        """The candidate slots that hold a stage under ``topic``. A probe
+        error propagates: a slot holding committed rows must never be
+        skipped as absent."""
+        return sorted(await self._slot_prober(topic, sorted(set(candidates))))
+
+    async def claim(self, topic: str, home: int, slots: Iterable[int]) -> None:
+        """Open the home stage and every other slot to drain. Idempotent
+        for the same claim."""
         if self._closed:
             raise StageClosedError("stage manager is closed")
-        want = set(claimed)
-        for topic, partition in sorted(set(self._stages) - want):
-            await self.close_partition(topic, partition)
-        for topic, partition in sorted(want - set(self._stages)):
-            await self.open_partition(topic, partition)
+        self._home = (topic, home)
+        for slot in sorted({home, *slots}):
+            if (topic, slot) not in self._stages:
+                await self.open_partition(topic, slot)
+
+    def home_stage(self) -> PartitionStage:
+        """The stage the consumer writes."""
+        if self._home is None:
+            raise StageError("no home stage claimed")
+        return self._stages[self._home]
+
+    def is_foreign(self, topic: str, partition: int) -> bool:
+        """Whether a claimed stage is a slot being drained, not the home."""
+        return self._home is not None and (topic, partition) != self._home
+
+    async def close_idle_foreign(self) -> list[tuple[str, int]]:
+        """Close every foreign stage with nothing left in its index (its
+        drain is done; the empty DB is left in place). Returns the
+        closed keys."""
+        closed = []
+        for key in sorted(self._stages):
+            if self.is_foreign(*key) and self._stages[key].is_empty():
+                await self.close_partition(*key)
+                log.info("drained and closed foreign stage %s[%d]", *key)
+                closed.append(key)
+        return closed
 
     def gauges(self) -> StageGauges:
-        """Pod totals from the in-memory index (cheap; no I/O)."""
-        snaps = [s for stage in list(self._stages.values()) for s in stage.snapshot()]
+        """Pod totals from the in-memory index (no I/O). Called from the
+        ops server's thread, so each index is copied in one C call
+        (:meth:`PartitionStage.group_states`) rather than iterated live."""
+        staged_bytes = staged_rows = groups = 0
+        oldest: int | None = None
+        for stage in list(self._stages.values()):
+            for state in stage.group_states():
+                staged_bytes += state.staged_bytes
+                staged_rows += state.rows
+                groups += 1
+                if oldest is None or state.first_staged_ts < oldest:
+                    oldest = state.first_staged_ts
         return StageGauges(
             partitions=len(self._stages),
-            staged_bytes=sum(s.staged_bytes for s in snaps),
-            staged_rows=sum(s.rows for s in snaps),
-            staged_groups=len(snaps),
-            oldest_first_staged_ts=min(
-                (s.first_staged_ts for s in snaps), default=None
-            ),
+            staged_bytes=staged_bytes,
+            staged_rows=staged_rows,
+            staged_groups=groups,
+            oldest_first_staged_ts=oldest,
         )
 
     def metrics_recorders(self) -> Mapping[tuple[str, int], DefaultMetricsRecorder]:

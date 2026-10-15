@@ -13,6 +13,7 @@ from millrace.planner import (
     SLOW_LANE_DEADLINE_S_DEFAULT,
     PlannerKnobs,
     decide,
+    due_floor_ts,
 )
 
 S = 1_000_000  # µs per second
@@ -107,3 +108,21 @@ def test_knobs_must_be_positive(field: str):
     for bad in (0, -1):
         with pytest.raises(ValueError, match=rf"^{field} must be >= 1, got {bad}$"):
             PlannerKnobs(**{field: bad})
+
+
+def test_due_floor_ts_is_the_shortest_deadline_back():
+    assert due_floor_ts(now_us=NOW, knobs=KNOBS) == NOW - 60 * S
+    swapped = PlannerKnobs(flush_deadline_s=600, slow_lane_deadline_s=60)
+    assert due_floor_ts(now_us=NOW, knobs=swapped) == NOW - 60 * S
+
+
+@given(
+    staged=st.integers(min_value=0, max_value=5000),
+    age_us=st.integers(min_value=-10 * S, max_value=2000 * S),
+)
+def test_a_group_newer_than_the_floor_is_due_only_by_size(staged, age_us):
+    """The sweep's prefilter is sound: a group staged after the floor
+    and below the size cut is never due."""
+    first = NOW - age_us
+    if first > due_floor_ts(now_us=NOW, knobs=KNOBS) and staged < KNOBS.flush_bytes:
+        assert lane(staged, age_us) is None

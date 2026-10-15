@@ -1,12 +1,12 @@
 """SlateDB → Prometheus metrics bridge (docs/kafka-ingestion.md
 §Deployment and operations).
 
-Every partition's SlateDB instance writes its internals into a
-``DefaultMetricsRecorder`` (wired at open — ``PartitionStage``); this
-module snapshots those recorders AT SCRAPE TIME and folds them into
-the whitelisted operational families, **aggregated across the pod's
-partition instances**: per-partition label series at K instances per
-pod is a cardinality trap, so every family here is a pod-level sum (or
+Every stage's SlateDB instance (the home, and any foreign slot being
+drained) writes its internals into a ``DefaultMetricsRecorder`` (wired
+at open — ``PartitionStage``); this module snapshots those recorders AT
+SCRAPE TIME and folds them into the whitelisted operational families,
+**aggregated across the pod's instances**: per-instance label series
+are a cardinality trap, so every family here is a pod-level sum (or
 max, where the metric is a depth).
 
 The whitelist is introspected from slatedb 0.17.0's actual emission

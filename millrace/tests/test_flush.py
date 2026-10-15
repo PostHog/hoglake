@@ -61,6 +61,7 @@ from flushkit import (
     commit_ok,
     commit_refusal,
     event_payload,
+    flush_group,
     make_config,
     month_wire,
     parquet_rows,
@@ -86,6 +87,7 @@ from millrace.coerce import (
     UnsupportedColumnError,
 )
 from millrace.flush import (
+    BatchReport,
     CommitExhausted,
     CommitRefused,
     FlushHalted,
@@ -158,6 +160,7 @@ def runner(
     *,
     mono: Any = None,
     concurrency: int = 4,
+    batch_max_groups: int = 512,
 ) -> FlushRunner:
     extra = {} if mono is None else {"monotonic": mono}
     return FlushRunner(
@@ -168,6 +171,7 @@ def runner(
         sleep=sleeper,
         sweep_s=60.0,
         concurrency=concurrency,
+        batch_max_groups=batch_max_groups,
         **extra,
     )
 
@@ -176,18 +180,14 @@ def info_for(wire: dict[str, Any] | None = None) -> TableInfo:
     return TableInfo.from_wire(wire or table_wire())
 
 
-def ctx_for(
-    group: Any = None, *, first: int = 0, last: int = 0, build: str = "b0"
-) -> flush_mod.FlushContext:
+def ctx_for(group: Any = None, *, build: str = "b0") -> flush_mod.FlushContext:
     group = team_group(TEAM) if group is None else group
     return flush_mod.FlushContext(
         topic="events",
-        partition=0,
+        slot=0,
         group=group,
         group_fields=SPEC_FIELDS if len(group) == 2 else ("key_0",) * len(group),
         trigger="size",
-        first_offset=first,
-        last_offset=last,
         read_snapshot=88,
         table_uuid=TABLE_UUID,
         build=build,
@@ -205,7 +205,7 @@ def plan_for(
     return build_flush_plan(
         records,
         info,
-        ctx=ctx or ctx_for(last=max(0, len(records) - 1)),
+        ctx=ctx or ctx_for(),
         data_path=DATA_PATH,
         max_files_per_commit=max_files_per_commit,
         footer_stats_min_bytes=footer_stats_min_bytes,
@@ -670,9 +670,7 @@ class TestCommitMessage:
             commit_index=0,
             commits=3,
             topic="events",
-            partition=3,
-            first_offset=10,
-            last_offset=24,
+            stage=3,
             version="0.1.0.dev0",
         )
         assert message.splitlines() == [
@@ -680,7 +678,7 @@ class TestCommitMessage:
                 f"millrace=v2 table={TABLE_UUID} group={team_label(7)} trigger=size "
                 "records=5 dropped=1 files=2 commit=1/3 millrace=0.1.0.dev0"
             ),
-            "offsets topic=events partition=3 window=10-24",
+            "offsets topic=events stage=3",
         ]
 
     def test_no_value_holds_a_space(self) -> None:
@@ -694,9 +692,7 @@ class TestCommitMessage:
             commit_index=0,
             commits=1,
             topic="events",
-            partition=0,
-            first_offset=0,
-            last_offset=0,
+            stage=0,
             version="1.0 dev\tbuild",
         )
         assert "millrace=1.0_dev_build" in message.split()
@@ -705,8 +701,10 @@ class TestCommitMessage:
         """Source-order pin: the pure builder runs (and formats every
         message) before the first upload, so a build failure can never
         leave an uncounted orphan."""
-        source = inspect.getsource(HoglakeFlusher.flush_scan)
-        assert source.index("build_flush_plan") < source.index("_upload_and_commit(")
+        source = inspect.getsource(HoglakeFlusher.flush_batch)
+        assert source.index("_build_plans(") < source.index("_publish_chunk(")
+        assert "build_flush_plan" in inspect.getsource(HoglakeFlusher._build_plans)
+        assert "_upload_and_commit(" in inspect.getsource(HoglakeFlusher._publish_chunk)
         upload = inspect.getsource(HoglakeFlusher._upload_and_commit)
         assert upload.index("self._upload") < upload.index("self._publish(")
 
@@ -755,7 +753,7 @@ class TestPlanBuilder:
             (keyspace.RowKey(team_group(7), 0), event_payload(7, JAN_US)),
             (keyspace.RowKey(team_group(7), 1), event_payload(7, DEC_US)),
         ]
-        plan = plan_for(records, info_for(), ctx=ctx_for(last=1, build="tok"))
+        plan = plan_for(records, info_for(), ctx=ctx_for(build="tok"))
         (commit,) = plan.commits
         assert commit.uris == (
             f"{DATA_PATH}/data/{NAMESPACE}/{TABLE}/tok/0.parquet",
@@ -786,7 +784,7 @@ class TestPlanBuilder:
         plan = plan_for(records, info_for())
         assert plan.commits == ()
         assert plan.dropped_records == (
-            flush_mod.DroppedRecord(0, REASON_UNDECODABLE_PAYLOAD),
+            flush_mod.DroppedRecord(0, REASON_UNDECODABLE_PAYLOAD, partition=0),
         )
 
     def test_a_record_that_defeats_the_build_fails_the_plan_never_drops(
@@ -905,11 +903,11 @@ class TestHappyPath:
         capture = CommitCapture(httpx_mock, [commit_ok(50)])
         flusher = flusher_factory(store=store, cfg=make_config())
 
-        report = await flusher.flush_group(stage, team_group(TEAM), "size")
+        report = await flush_group(flusher, stage, team_group(TEAM), "size")
 
         assert (report.outcome, report.records, report.files) == ("committed", 5, 2)
         assert (report.commits, report.snapshot_ids) == (1, (50,))
-        assert (report.first_offset, report.last_offset) == (0, 4)
+        assert report.staged_rows == 5
         assert report.complete
 
         (body,) = capture.payloads
@@ -942,7 +940,7 @@ class TestHappyPath:
         assert {"records=5", "dropped=0", "files=2", "commit=1/1"} <= set(
             summary.split(" ")
         )
-        assert offsets_line == "offsets topic=events partition=0 window=0-4"
+        assert offsets_line == "offsets topic=events stage=0"
 
         # Settlement: the scanned rows are gone and so is the group.
         assert await staged_rows(stage, TEAM) == []
@@ -1073,20 +1071,18 @@ class TestPartitionTupleGroups:
                 ("22", month_wire(DEC_US)),
             }
             script_options(httpx_mock)
-            capture = CommitCapture(httpx_mock, [commit_ok(50 + i) for i in range(4)])
+            capture = CommitCapture(httpx_mock, [commit_ok(50)])
             flusher = flusher_factory(store=store, cfg=cfg)
             sweep = await runner(manager, flusher, cfg, fake_clock, sleeper).run_once(
                 drain=True
             )
             assert (sweep.decisions, sweep.committed, sweep.failed) == (4, 4, 0)
-            committed = set()
-            for body in capture.payloads:
-                (file,) = body["appends"][0]["files"]
-                committed.add(tuple(file["partition_values"]))
-                (team, month) = file["partition_values"]
-                assert (
-                    f"group=team_id={team}/timestamp_month={month}" in body["message"]
-                )
+            # One batched commit: one file per group.
+            (body,) = capture.payloads
+            files = body["appends"][0]["files"]
+            assert len(files) == 4
+            committed = {tuple(f["partition_values"]) for f in files}
+            assert "groups=4" in body["message"].split()
             assert committed == groups
             assert stage.snapshot() == []
 
@@ -1120,7 +1116,7 @@ class TestPartitionTupleGroups:
         script_options(httpx_mock)
         capture = CommitCapture(httpx_mock, [commit_ok(50)])
         flusher = flusher_factory(store=store, cfg=make_config())
-        report = await flusher.flush_group(stage, (str(TEAM),), "size")
+        report = await flush_group(flusher, stage, (str(TEAM),), "size")
         assert (report.outcome, report.records, report.files) == ("committed", 2, 2)
         body = capture.payloads[0]
         assert {tuple(f["partition_values"]) for f in body["appends"][0]["files"]} == {
@@ -1174,7 +1170,7 @@ class TestCommitLadder:
                 commit_ok(50),
             ],
         )
-        report = await flusher.flush_group(stage, team_group(TEAM), "size")
+        report = await flush_group(flusher, stage, team_group(TEAM), "size")
         assert report.outcome == "committed"
         assert len(capture.bodies) == 2
         assert capture.bodies[0] == capture.bodies[1]  # same key, same bytes
@@ -1201,7 +1197,7 @@ class TestCommitLadder:
             [commit_refusal(409, "commit_conflict", "moved")] * 5,
         )
         with pytest.raises(CommitExhausted):
-            await flusher.flush_group(stage, team_group(TEAM), "size")
+            await flush_group(flusher, stage, team_group(TEAM), "size")
         assert len(capture.bodies) == 5
         assert len(set(capture.bodies)) == 1
         assert sleeper.calls == [0.5, 1.0, 2.0, 4.0]
@@ -1234,7 +1230,7 @@ class TestCommitLadder:
             httpx_mock, stage_factory, fake_clock, flusher_factory, store, steps
         )
         with pytest.raises(CommitExhausted):
-            await flusher.flush_group(stage, team_group(TEAM), "size")
+            await flush_group(flusher, stage, team_group(TEAM), "size")
         assert len(capture.bodies) == _PUBLISH_MAX_ATTEMPTS
         assert len(set(capture.bodies)) == 1
         assert len(await staged_rows(stage, TEAM)) == 3
@@ -1266,7 +1262,7 @@ class TestCommitLadder:
             store,
             [busy, busy, commit_ok(50)],
         )
-        report = await flusher.flush_group(stage, team_group(TEAM), "size")
+        report = await flush_group(flusher, stage, team_group(TEAM), "size")
         assert report.outcome == "committed"
         assert len(set(capture.bodies)) == 1
         # Retry-After floors the backoff above the curve's 0.5s/1.0s.
@@ -1292,7 +1288,7 @@ class TestCommitLadder:
                 commit_ok(50),
             ],
         )
-        await flusher.flush_group(stage, team_group(TEAM), "size")
+        await flush_group(flusher, stage, team_group(TEAM), "size")
         assert sleeper.calls == [0.5]
 
     @pytest.mark.parametrize(
@@ -1329,7 +1325,7 @@ class TestCommitLadder:
             [commit_refusal(status, code, "answered")],
         )
         with pytest.raises(CommitRefused) as excinfo:
-            await flusher.flush_group(stage, team_group(TEAM), "size")
+            await flush_group(flusher, stage, team_group(TEAM), "size")
         assert excinfo.value.status == status
         assert len(capture.bodies) == 1
         assert sleeper.calls == []
@@ -1357,7 +1353,7 @@ class TestCommitLadder:
             [commit_refusal(409, "table_dropped", "dropped at snapshot 91")],
         )
         with pytest.raises(CommitRefused, match="dropped"):
-            await flusher.flush_group(stage, team_group(TEAM), "size")
+            await flush_group(flusher, stage, team_group(TEAM), "size")
         assert len(capture.bodies) == 1
         assert sleeper.calls == []
         assert len(await staged_rows(stage, TEAM)) == 3
@@ -1380,7 +1376,7 @@ class TestCommitLadder:
             [commit_refusal(409, "table_recreated", "new incarnation")],
         )
         with pytest.raises(FlushHalted) as excinfo:
-            await flusher.flush_group(stage, team_group(TEAM), "size")
+            await flush_group(flusher, stage, team_group(TEAM), "size")
         assert excinfo.value.reason == "table_recreated"
         assert len(capture.bodies) == 1
         assert len(await staged_rows(stage, TEAM)) == 3
@@ -1406,7 +1402,7 @@ class TestCommitLadder:
         script_table_refresh(httpx_mock, table=table_wire(read_snapshot_id=95))
         script_table_refresh(httpx_mock, table=table_wire(read_snapshot_id=96))
         with pytest.raises(flush_mod.FlushError, match="read basis refused 3 times"):
-            await flusher.flush_group(stage, team_group(TEAM), "size")
+            await flush_group(flusher, stage, team_group(TEAM), "size")
         assert [p["read_snapshot"] for p in capture.payloads] == [88, 95, 96]
         assert len({p["idempotency_key"] for p in capture.payloads}) == 3
         assert len(await staged_rows(stage, TEAM)) == 3
@@ -1439,7 +1435,7 @@ class TestOrphansAndDrops:
             caplog.at_level(logging.WARNING),
             pytest.raises(OSError, match="object store refused"),
         ):
-            await flusher.flush_group(stage, team_group(TEAM), "size")
+            await flush_group(flusher, stage, team_group(TEAM), "size")
 
         assert flusher.stats().orphaned_uploads == 1
         (orphaned,) = [k for k in store.files if k.endswith("/0.parquet")]
@@ -1454,7 +1450,7 @@ class TestOrphansAndDrops:
         # The retry rebuilds with FRESH object names; the orphan is untouched.
         store.fail_at = None
         capture.extend([commit_ok(50)])
-        report = await flusher.flush_group(stage, team_group(TEAM), "size")
+        report = await flush_group(flusher, stage, team_group(TEAM), "size")
         assert report.outcome == "committed"
         paths = [f["path"] for f in capture.payloads[0]["appends"][0]["files"]]
         assert f"s3://{orphaned}" not in paths
@@ -1494,7 +1490,7 @@ class TestOrphansAndDrops:
         flusher = flusher_factory(store=store, cfg=make_config())
 
         with caplog.at_level(logging.WARNING):
-            report = await flusher.flush_group(stage, team_group(TEAM), "size")
+            report = await flush_group(flusher, stage, team_group(TEAM), "size")
 
         assert (report.outcome, report.records, report.dropped) == ("committed", 2, 4)
         assert flusher.stats().records_dropped == {
@@ -1505,7 +1501,7 @@ class TestOrphansAndDrops:
             r.getMessage() for r in caplog.records if "flush dropped" in r.getMessage()
         ]
         assert len(lines) == 2  # one line per reason per decision
-        assert any("first_path=team_id (offset 3)" in line for line in lines)
+        assert any("first_path=team_id (offset 0:3)" in line for line in lines)
         files = capture.payloads[0]["appends"][0]["files"]
         assert sum(f["record_count"] for f in files) == 2
         assert await staged_rows(stage, TEAM) == []
@@ -1519,7 +1515,7 @@ class TestOrphansAndDrops:
                 stage, fake_clock, TEAM, [(offset, JAN_US)], payloads=[surprise]
             )
             with caplog.at_level(logging.WARNING):
-                await flusher.flush_group(stage, team_group(TEAM), "size")
+                await flush_group(flusher, stage, team_group(TEAM), "size")
         assert flusher.stats().dropped_payload_keys == 2
         warned = [
             r for r in caplog.records if "'surprise' is not a column" in r.getMessage()
@@ -1577,7 +1573,7 @@ class TestOrphansAndDrops:
             store=store, cfg=make_config(), table=table_wire(columns=wire)
         )
 
-        report = await flusher.flush_group(stage, team_group(TEAM), "size")
+        report = await flush_group(flusher, stage, team_group(TEAM), "size")
 
         from millrace.coerce import TIMESTAMP_MAX_US
 
@@ -1609,12 +1605,12 @@ class TestOrphansAndDrops:
         capture = CommitCapture(httpx_mock, [commit_ok(50), commit_ok(51)])
         flusher = flusher_factory(store=store, cfg=make_config())
         # A small file at the production threshold registers deferred.
-        await flusher.flush_group(stage, team_group(TEAM + 1), "age")
+        await flush_group(flusher, stage, team_group(TEAM + 1), "age")
         (small,) = capture.payloads[0]["appends"][0]["files"]
         assert "column_stats" not in small
         # Lower the threshold below the realized size: full footer stats.
         monkeypatch.setattr(flush_mod, "FOOTER_STATS_MIN_BYTES", 1)
-        await flusher.flush_group(stage, team_group(TEAM), "slow")
+        await flush_group(flusher, stage, team_group(TEAM), "slow")
         (big,) = capture.payloads[1]["appends"][0]["files"]
         stats = {s["field_id"]: s for s in big["column_stats"]}
         assert set(stats) == {1, 2, 3}
@@ -1660,7 +1656,7 @@ class TestWireDiscipline:
             if advance:
                 mono.advance(advance)
                 script_table_refresh(httpx_mock, table=table_wire(read_snapshot_id=95))
-            report = await flusher.flush_group(stage, team_group(TEAM), "size")
+            report = await flush_group(flusher, stage, team_group(TEAM), "size")
             assert report.outcome == "committed"
         assert [p["read_snapshot"] for p in capture.payloads] == [88, 88, 95]
         table_reads = [
@@ -1704,15 +1700,15 @@ class TestWireDiscipline:
             return scan
 
         monkeypatch.setattr(stage, "scan", scan_then_arrival)
-        report = await flusher.flush_group(stage, team_group(TEAM), "size")
-        assert (report.first_offset, report.last_offset) == (0, 2)
+        report = await flush_group(flusher, stage, team_group(TEAM), "size")
+        assert report.staged_rows == 3  # offsets 0-2: the arrivals stay out
         assert capture.payloads[0]["message"].splitlines()[1] == (
-            "offsets topic=events partition=0 window=0-2"
+            "offsets topic=events stage=0"
         )
         assert [rk.offset for rk, _ in await staged_rows(stage, TEAM)] == [3, 4]
         assert stage.has_group(team_group(TEAM))  # a later write kept it indexed
-        report2 = await flusher.flush_group(stage, team_group(TEAM), "size")
-        assert (report2.first_offset, report2.last_offset) == (3, 4)
+        report2 = await flush_group(flusher, stage, team_group(TEAM), "size")
+        assert report2.staged_rows == 2
         assert await staged_rows(stage, TEAM) == []
         assert not stage.has_group(team_group(TEAM))
 
@@ -1735,9 +1731,11 @@ class TestWireDiscipline:
         )
         windows = []
         while stage.has_group(team_group(TEAM)):
-            report = await flusher.flush_group(stage, team_group(TEAM), "size")
-            windows.append((report.first_offset, report.last_offset, report.complete))
-        assert windows == [(0, 1, False), (2, 3, False), (4, 4, True)]
+            before = [rk.offset for rk, _ in await staged_rows(stage, TEAM)]
+            report = await flush_group(flusher, stage, team_group(TEAM), "size")
+            after = [rk.offset for rk, _ in await staged_rows(stage, TEAM)]
+            windows.append((sorted(set(before) - set(after)), report.complete))
+        assert windows == [([0, 1], False), ([2, 3], False), ([4], True)]
         assert len(capture.payloads) == 3
 
 
@@ -1778,7 +1776,14 @@ class TestRunner:
             )
             flusher = flusher_factory(store=store, cfg=cfg)
             r = runner(
-                manager, flusher, cfg, fake_clock, sleeper, mono=mono, concurrency=1
+                manager,
+                flusher,
+                cfg,
+                fake_clock,
+                sleeper,
+                mono=mono,
+                concurrency=1,
+                batch_max_groups=1,
             )
 
             sweep = await r.run_once(drain=True)
@@ -1894,23 +1899,38 @@ class TestRunner:
                 def note_failure(self) -> None:
                     raise AssertionError("no failure expected")
 
-                async def flush_group(
-                    self, stage: Any, group: Any, trigger: str
+                async def flush_batch(
+                    self, stage: Any, scans: Any, trigger: str
                 ) -> Any:
                     nonlocal inflight, peak
                     inflight += 1
                     peak = max(peak, inflight)
-                    calls.append((stage.partition, group))
+                    calls.extend((stage.partition, scan.group) for scan in scans)
                     try:
                         await gate.wait()
                     finally:
                         inflight -= 1
-                    return FlushReport(
-                        stage.topic, stage.partition, group, trigger, "committed"
+                    return BatchReport(
+                        tuple(
+                            FlushReport(
+                                stage.topic,
+                                stage.partition,
+                                scan.group,
+                                trigger,
+                                "committed",
+                            )
+                            for scan in scans
+                        )
                     )
 
             r = runner(
-                manager, Gated(), cfg, fake_clock, sleeper, concurrency=concurrency
+                manager,
+                Gated(),
+                cfg,
+                fake_clock,
+                sleeper,
+                concurrency=concurrency,
+                batch_max_groups=1,
             )
             task = asyncio.create_task(r.run_once(drain=True))
             for _ in range(200):
@@ -1943,7 +1963,7 @@ class TestFencedFlusher:
             def note_failure(self) -> None:
                 raise AssertionError("a fence is not a failure")
 
-            async def flush_group(self, stage: Any, group: Any, trigger: str) -> Any:
+            async def flush_batch(self, stage: Any, scans: Any, trigger: str) -> Any:
                 Fenced.calls += 1
                 raise SlateError.Closed(CloseReason.FENCED, "detected newer DB client")
 
@@ -1971,7 +1991,7 @@ class TestFencedFlusher:
             def note_failure(self) -> None:
                 failures.append(1)
 
-            async def flush_group(self, stage: Any, group: Any, trigger: str) -> Any:
+            async def flush_batch(self, stage: Any, scans: Any, trigger: str) -> Any:
                 raise SlateError.Closed(CloseReason.CLEAN, "shut down")
 
         async with StageManager(
@@ -2160,7 +2180,7 @@ class TestSortSpec:
             cfg=make_config(),
         )
 
-        report = await flusher.flush_group(stage, team_group(TEAM), "size")
+        report = await flush_group(flusher, stage, team_group(TEAM), "size")
 
         assert report.outcome == "committed"
         assert report.files == 1  # one month partition
@@ -2224,7 +2244,7 @@ class TestSortSpec:
         capture = CommitCapture(httpx_mock, [commit_ok(50)])
         flusher = flusher_factory(store=store, table=wire, cfg=make_config())
 
-        report = await flusher.flush_group(stage, team_group(TEAM), "size")
+        report = await flush_group(flusher, stage, team_group(TEAM), "size")
 
         assert report.outcome == "committed"
         (file,) = capture.payloads[0]["appends"][0]["files"]
@@ -2286,7 +2306,7 @@ class TestSortSpec:
         capture = CommitCapture(httpx_mock, [commit_ok(50)])
         flusher = flusher_factory(store=store, table=wire, cfg=make_config())
 
-        report = await flusher.flush_group(stage, team_group(TEAM), "size")
+        report = await flush_group(flusher, stage, team_group(TEAM), "size")
 
         assert report.outcome == "committed"
         (file,) = capture.payloads[0]["appends"][0]["files"]
@@ -2357,7 +2377,7 @@ class TestSortSpec:
         capture = CommitCapture(httpx_mock, [commit_ok(50)])
         flusher = flusher_factory(store=store, table=wire, cfg=make_config())
 
-        report = await flusher.flush_group(stage, team_group(TEAM), "size")
+        report = await flush_group(flusher, stage, team_group(TEAM), "size")
 
         assert report.outcome == "committed"
         (file,) = capture.payloads[0]["appends"][0]["files"]
@@ -2403,7 +2423,7 @@ class TestSortSpec:
             ),
         )
         with pytest.raises(flush_mod.FlushError, match="sideways") as excinfo:
-            await flusher.flush_group(stage, team_group(TEAM), "size")
+            await flush_group(flusher, stage, team_group(TEAM), "size")
         assert not isinstance(excinfo.value, FlushHalted)  # contained, not a halt
         assert [rk.offset for rk, _ in await staged_rows(stage, TEAM)] == [0]
 
@@ -2690,7 +2710,7 @@ class TestNestedJsonColumns:
         capture = CommitCapture(httpx_mock, [commit_ok(50)])
         flusher = flusher_factory(store=store, cfg=make_config(), table=wire)
 
-        report = await flusher.flush_group(stage, (), "size")
+        report = await flush_group(flusher, stage, (), "size")
 
         assert (report.outcome, report.records, report.files, report.dropped) == (
             "committed",
@@ -2781,13 +2801,13 @@ class TestNestedJsonColumns:
         CommitCapture(httpx_mock, [commit_ok(50)])
         flusher = flusher_factory(store=store, table=wire)
         with caplog.at_level(logging.WARNING):
-            report = await flusher.flush_group(stage, (), "size")
+            report = await flush_group(flusher, stage, (), "size")
         assert (report.outcome, report.records, report.dropped) == ("committed", 1, 1)
         (line,) = [
             r.getMessage() for r in caplog.records if "flush dropped" in r.getMessage()
         ]
         assert "reason=uncastable_column" in line
-        assert "first_path=attrs.value (offset 1)" in line
+        assert "first_path=attrs.value (offset 0:1)" in line
         assert not [r for r in caplog.records if "secret-value-xyz" in r.getMessage()]
 
     async def test_a_nested_partition_source_keyed_by_the_consumer_flushes_one_file(
@@ -2828,7 +2848,7 @@ class TestNestedJsonColumns:
         capture = CommitCapture(httpx_mock, [commit_ok(50)])
         flusher = flusher_factory(store=store, table=wire)
 
-        report = await flusher.flush_group(stage, ("1",), "size")
+        report = await flush_group(flusher, stage, ("1",), "size")
 
         assert (report.outcome, report.records, report.files) == ("committed", 2, 1)
         (registration,) = capture.payloads[0]["appends"][0]["files"]
@@ -2926,3 +2946,481 @@ class TestNestedSourceStartupRefusals:
         )
         with pytest.raises(FlushStartupError, match=match):
             flusher_factory(store=store, table=wire)
+
+
+# =====================================================================================
+# Batched commits: several groups' files in one commit
+# =====================================================================================
+
+
+@component
+class TestBatchedFlush:
+    async def _stage_teams(
+        self, manager: StageManager, clock: Any, teams: list[int]
+    ) -> tuple[Any, list[Any]]:
+        stage = await manager.open_partition("events", 0)
+        for i, team in enumerate(teams):
+            await staged(stage, clock, team, [(i, JAN_US)])
+        scans = [
+            await stage.scan(team_group(t), max_bytes=1 << 30, now_us=clock())
+            for t in teams
+        ]
+        return stage, scans
+
+    async def test_many_groups_land_in_one_commit_and_settle_together(
+        self,
+        httpx_mock: Any,
+        fake_clock: Any,
+        flusher_factory: Any,
+        store: FakeObjectStore,
+    ) -> None:
+        cfg = make_config()
+        async with StageManager(
+            "memory:///", "millrace", settings=fast_flush_settings()
+        ) as manager:
+            stage, scans = await self._stage_teams(manager, fake_clock, [1, 2, 3, 4])
+            script_options(httpx_mock)
+            capture = CommitCapture(httpx_mock, [commit_ok(70)])
+            flusher = flusher_factory(store=store, cfg=cfg)
+            report = await flusher.flush_batch(stage, scans, "slow")
+
+            (body,) = capture.payloads
+            files = body["appends"][0]["files"]
+            assert sorted(f["partition_values"][0] for f in files) == [
+                "1",
+                "2",
+                "3",
+                "4",
+            ]
+            summary = body["message"].splitlines()[0].split()
+            assert {"groups=4", "trigger=slow", "files=4", "commit=1/1"} <= set(summary)
+            assert report.commits == 1 and report.failed == ()
+            assert [r.outcome for r in report.reports] == ["committed"] * 4
+            assert all(r.snapshot_ids == (70,) for r in report.reports)
+            assert stage.snapshot() == []
+            for team in (1, 2, 3, 4):
+                assert await staged_rows(stage, team) == []
+            stats = flusher.stats()
+            assert (stats.commits, stats.decisions_committed, stats.files_written) == (
+                1,
+                4,
+                4,
+            )
+
+    async def test_a_batch_wider_than_the_file_cap_splits_and_settles_per_commit(
+        self,
+        httpx_mock: Any,
+        fake_clock: Any,
+        flusher_factory: Any,
+        store: FakeObjectStore,
+    ) -> None:
+        """Five groups at two files per commit: three commits. The second
+        is lost: the first commit's groups are published and settled, the
+        rest stay staged and indexed for the retry."""
+        from millrace.flush import _PUBLISH_MAX_ATTEMPTS, CommitExhausted
+
+        cfg = make_config(max_files_per_commit=2)
+        async with StageManager(
+            "memory:///", "millrace", settings=fast_flush_settings()
+        ) as manager:
+            stage, scans = await self._stage_teams(manager, fake_clock, [1, 2, 3, 4, 5])
+            script_options(httpx_mock)
+            CommitCapture(
+                httpx_mock,
+                [commit_ok(80)] + [httpx.ConnectError("lost")] * _PUBLISH_MAX_ATTEMPTS,
+            )
+            flusher = flusher_factory(store=store, cfg=cfg)
+            with pytest.raises(CommitExhausted):
+                await flusher.flush_batch(stage, scans, "slow")
+            assert await staged_rows(stage, 1) == []
+            assert await staged_rows(stage, 2) == []
+            for team in (3, 4, 5):
+                assert len(await staged_rows(stage, team)) == 1
+            assert sorted(s.group for s in stage.snapshot()) == sorted(
+                team_group(t) for t in (3, 4, 5)
+            )
+
+    async def test_a_group_whose_build_fails_leaves_the_batch(
+        self,
+        httpx_mock: Any,
+        fake_clock: Any,
+        flusher_factory: Any,
+        store: FakeObjectStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        cfg = make_config()
+        real = flush_mod.build_flush_plan
+
+        def flaky(records: Any, info: Any, *, ctx: Any, **kwargs: Any) -> Any:
+            if ctx.group == team_group(2):
+                raise flush_mod.FlushError("encoder bug")
+            return real(records, info, ctx=ctx, **kwargs)
+
+        monkeypatch.setattr(flush_mod, "build_flush_plan", flaky)
+        async with StageManager(
+            "memory:///", "millrace", settings=fast_flush_settings()
+        ) as manager:
+            stage, scans = await self._stage_teams(manager, fake_clock, [1, 2, 3])
+            script_options(httpx_mock)
+            capture = CommitCapture(httpx_mock, [commit_ok(90)])
+            flusher = flusher_factory(store=store, cfg=cfg)
+            report = await flusher.flush_batch(stage, scans, "slow")
+
+            (body,) = capture.payloads
+            assert sorted(
+                f["partition_values"][0] for f in body["appends"][0]["files"]
+            ) == ["1", "3"]
+            assert [g for g, _ in report.failed] == [team_group(2)]
+            assert isinstance(report.failed[0][1], flush_mod.FlushError)
+            assert "encoder bug" in str(report.failed[0][1])
+            assert [s.group for s in stage.snapshot()] == [team_group(2)]
+            assert len(await staged_rows(stage, 2)) == 1
+
+    async def test_a_refused_batch_names_its_unpublished_groups(
+        self,
+        httpx_mock: Any,
+        fake_clock: Any,
+        flusher_factory: Any,
+        store: FakeObjectStore,
+    ) -> None:
+        cfg = make_config()
+        async with StageManager(
+            "memory:///", "millrace", settings=fast_flush_settings()
+        ) as manager:
+            stage, scans = await self._stage_teams(manager, fake_clock, [1, 2])
+            script_options(httpx_mock)
+            CommitCapture(
+                httpx_mock, [commit_refusal(422, "record_validation", "bad value")]
+            )
+            flusher = flusher_factory(store=store, cfg=cfg)
+            report = await flusher.flush_batch(stage, scans, "slow")
+            assert sorted(report.refused) == sorted([team_group(1), team_group(2)])
+            assert isinstance(report.refusal, flush_mod.CommitRefused)
+            assert report.reports == ()
+            assert len(stage.snapshot()) == 2
+
+    async def test_a_sweep_batches_due_groups_and_flushes_a_whale_alone(
+        self,
+        httpx_mock: Any,
+        fake_clock: Any,
+        flusher_factory: Any,
+        store: FakeObjectStore,
+        sleeper: Sleeper,
+    ) -> None:
+        """Three small groups past the slow lane share ONE commit; a group
+        at the size lane commits on its own."""
+        cfg = make_config(
+            flush_bytes=3_000, flush_deadline_s=60, slow_lane_deadline_s=60
+        )
+        async with StageManager(
+            "memory:///", "millrace", settings=fast_flush_settings()
+        ) as manager:
+            stage = await manager.open_partition("events", 0)
+            for i, team in enumerate((1, 2, 3)):
+                await staged(stage, fake_clock, team, [(i, JAN_US)])
+            fake_clock.advance(61 * 1_000_000)
+            await staged(stage, fake_clock, 9, [(10 + o, JAN_US) for o in range(60)])
+            assert stage.snapshot()[-1].staged_bytes >= cfg.flush_bytes
+            script_options(httpx_mock)
+            capture = CommitCapture(httpx_mock, [commit_ok(1), commit_ok(2)])
+            flusher = flusher_factory(store=store, cfg=cfg)
+            sweep = await runner(manager, flusher, cfg, fake_clock, sleeper).run_once()
+
+            assert sweep.decisions == 4 and sweep.failed == 0
+            teams = sorted(
+                sorted(f["partition_values"][0] for f in body["appends"][0]["files"])
+                for body in capture.payloads
+            )
+            assert teams == [["1", "2", "3"], ["9"]]
+            for team in (1, 2, 3):
+                assert await staged_rows(stage, team) == []
+
+    async def test_a_batch_caps_each_scan_so_the_caps_sum_to_the_budget(
+        self,
+        httpx_mock: Any,
+        fake_clock: Any,
+        flusher_factory: Any,
+        store: FakeObjectStore,
+        sleeper: Sleeper,
+    ) -> None:
+        """Each group of a batch may read its indexed estimate plus an
+        even share of the unused budget, so a batch never reads more
+        than ``flush_bytes`` however the index under-counts: the
+        under-counted group is capped (no sliver for the others) and its
+        rest flushes as backlog."""
+        cfg = make_config(flush_bytes=10_000)
+        async with StageManager(
+            "memory:///", "millrace", settings=fast_flush_settings()
+        ) as manager:
+            stage = await manager.open_partition("events", 0)
+            for i, team in enumerate((1, 2, 3)):
+                await staged(stage, fake_clock, team, [(i, JAN_US)])
+            # Team 1 really holds far more than the index says.
+            stage._groups[team_group(1)].staged_bytes = 1
+            for o in range(20):
+                await stage._db.put(
+                    keyspace.encode_row_key(keyspace.RowKey(team_group(1), 100 + o)),
+                    event_payload(1, JAN_US, "x" * 300),
+                )
+            script_options(httpx_mock)
+            capture = CommitCapture(httpx_mock, [commit_ok(1), commit_ok(2)])
+            flusher = flusher_factory(store=store, cfg=cfg)
+            r = runner(manager, flusher, cfg, fake_clock, sleeper)
+            first = await r.run_once(drain=True)
+            assert (first.committed, first.failed) == (3, 0)
+            (body,) = capture.payloads
+            records = {
+                f["partition_values"][0]: f["record_count"]
+                for f in body["appends"][0]["files"]
+            }
+            assert records["2"] == records["3"] == 1  # whole, not slivers
+            assert records["1"] < 21  # capped near its share of the budget
+            assert stage.has_group(team_group(1))
+            assert stage.snapshot()[0].backlog
+            second = await r.run_once()
+            assert second.committed == 1
+            assert stage.snapshot() == []
+
+    async def test_a_batchs_scans_run_concurrently_with_small_read_ahead(
+        self,
+        httpx_mock: Any,
+        fake_clock: Any,
+        flusher_factory: Any,
+        store: FakeObjectStore,
+        sleeper: Sleeper,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A batch's group scans overlap (a gate opens only once all three
+        are in flight; sequential scans would time out), and a group the
+        index puts under 1 MiB is scanned with the small read-ahead."""
+        cfg = make_config()
+        async with StageManager(
+            "memory:///", "millrace", settings=fast_flush_settings()
+        ) as manager:
+            stage = await manager.open_partition("events", 0)
+            for i, team in enumerate((1, 2, 3)):
+                await staged(stage, fake_clock, team, [(i, JAN_US)])
+            gate = asyncio.Event()
+            in_flight: list[Any] = []
+            hints: list[Any] = []
+            real = stage.scan
+
+            async def gated(group: Any, **kwargs: Any) -> Any:
+                in_flight.append(group)
+                hints.append(kwargs.get("size_hint"))
+                if len(in_flight) == 3:
+                    gate.set()
+                await asyncio.wait_for(gate.wait(), timeout=5)
+                return await real(group, **kwargs)
+
+            monkeypatch.setattr(stage, "scan", gated)
+            script_options(httpx_mock)
+            CommitCapture(httpx_mock, [commit_ok(1)])
+            flusher = flusher_factory(store=store, cfg=cfg)
+            sweep = await runner(manager, flusher, cfg, fake_clock, sleeper).run_once(
+                drain=True
+            )
+            assert sweep.committed == 3
+            assert all(h is not None and h < 1024 * 1024 for h in hints)
+
+    async def test_a_rebuild_inside_a_batch_republishes_only_the_unpublished(
+        self,
+        httpx_mock: Any,
+        fake_clock: Any,
+        flusher_factory: Any,
+        store: FakeObjectStore,
+    ) -> None:
+        """Two commits (two files each at most): the first lands, the
+        second's read basis is refused. Only the unpublished group is
+        rebuilt on the fresh shape; a dropped row is settled once, right
+        after the build, and counted once."""
+        cfg = make_config(max_files_per_commit=2)
+        async with StageManager(
+            "memory:///", "millrace", settings=fast_flush_settings()
+        ) as manager:
+            stage = await manager.open_partition("events", 0)
+            await staged(stage, fake_clock, 1, [(0, JAN_US)])
+            await staged(
+                stage,
+                fake_clock,
+                2,
+                [(1, JAN_US), (2, JAN_US)],
+                payloads=[event_payload(2, JAN_US), b"not json"],
+            )
+            await staged(stage, fake_clock, 3, [(3, JAN_US)])
+            scans = [
+                await stage.scan(team_group(t), max_bytes=1 << 30, now_us=fake_clock())
+                for t in (1, 2, 3)
+            ]
+            script_options(httpx_mock)
+            ddl = commit_refusal(409, "ddl_since_read_snapshot", "spec moved")
+            capture = CommitCapture(httpx_mock, [commit_ok(1), ddl, commit_ok(2)])
+            script_table_refresh(httpx_mock, table=table_wire(read_snapshot_id=95))
+            flusher = flusher_factory(store=store, cfg=cfg)
+            report = await flusher.flush_batch(stage, scans, "slow")
+
+            files = [
+                sorted(f["partition_values"][0] for f in p["appends"][0]["files"])
+                for p in capture.payloads
+            ]
+            assert files == [["1", "2"], ["3"], ["3"]]
+            # One read basis for the first build, a fresh one for the rebuild.
+            bases = [p["read_snapshot"] for p in capture.payloads]
+            assert bases[0] == bases[1] != bases[2]
+            assert [r.outcome for r in report.reports] == ["committed"] * 3
+            assert [r.dropped for r in report.reports] == [0, 1, 0]
+            assert sum(flusher.stats().records_dropped.values()) == 1
+            assert stage.snapshot() == []
+            for team in (1, 2, 3):
+                assert await staged_rows(stage, team) == []
+
+    async def test_a_refusal_after_a_landed_commit_reports_both(
+        self,
+        httpx_mock: Any,
+        fake_clock: Any,
+        flusher_factory: Any,
+        store: FakeObjectStore,
+    ) -> None:
+        """The first commit lands, the second is refused: the landed
+        groups report committed (and are settled), the rest are named in
+        ``refused`` and stay staged."""
+        cfg = make_config(max_files_per_commit=2)
+        async with StageManager(
+            "memory:///", "millrace", settings=fast_flush_settings()
+        ) as manager:
+            stage, scans = await self._stage_teams(manager, fake_clock, [1, 2, 3])
+            script_options(httpx_mock)
+            CommitCapture(
+                httpx_mock,
+                [commit_ok(1), commit_refusal(422, "record_validation", "bad value")],
+            )
+            flusher = flusher_factory(store=store, cfg=cfg)
+            report = await flusher.flush_batch(stage, scans, "slow")
+            assert [(r.group, r.outcome) for r in report.reports] == [
+                (team_group(1), "committed"),
+                (team_group(2), "committed"),
+            ]
+            assert report.refused == (team_group(3),)
+            assert isinstance(report.refusal, flush_mod.CommitRefused)
+            assert [s.group for s in stage.snapshot()] == [team_group(3)]
+            assert flusher.stats().rows_published == 2
+
+    async def test_the_runner_splits_refused_and_build_failed_groups(
+        self,
+        httpx_mock: Any,
+        fake_clock: Any,
+        flusher_factory: Any,
+        store: FakeObjectStore,
+        sleeper: Sleeper,
+        mono: FakeMonotonic,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A refused batch with a build failure in it: every group it did
+        not publish is split out (retries alone), the landed ones carry
+        no failure state."""
+        real = flush_mod.build_flush_plan
+
+        def flaky(records: Any, info: Any, *, ctx: Any, **kwargs: Any) -> Any:
+            if ctx.group == team_group(2):
+                raise flush_mod.FlushError("encoder bug")
+            return real(records, info, ctx=ctx, **kwargs)
+
+        monkeypatch.setattr(flush_mod, "build_flush_plan", flaky)
+        cfg = make_config()
+        async with StageManager(
+            "memory:///", "millrace", settings=fast_flush_settings()
+        ) as manager:
+            stage = await manager.open_partition("events", 0)
+            for i, team in enumerate((1, 2, 3)):
+                await staged(stage, fake_clock, team, [(i, JAN_US)])
+            script_options(httpx_mock)
+            CommitCapture(
+                httpx_mock, [commit_refusal(422, "record_validation", "bad value")]
+            )
+            flusher = flusher_factory(store=store, cfg=cfg)
+            r = runner(manager, flusher, cfg, fake_clock, sleeper, mono=mono)
+            sweep = await r.run_once(drain=True)
+            assert (sweep.decisions, sweep.failed) == (3, 3)
+            assert {k[2]: f.split for k, f in r._failures.items()} == {
+                team_group(1): True,
+                team_group(2): True,
+                team_group(3): True,
+            }
+
+    async def test_a_decisions_scans_are_capped_and_bounded_in_flight(
+        self,
+        httpx_mock: Any,
+        fake_clock: Any,
+        flusher_factory: Any,
+        store: FakeObjectStore,
+        sleeper: Sleeper,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """At most eight scans run at once; each group's cap is its
+        indexed estimate plus an even share of the unused budget; small
+        groups read with the small scan options."""
+        cfg = make_config(flush_bytes=100_000)
+        async with StageManager(
+            "memory:///", "millrace", settings=fast_flush_settings()
+        ) as manager:
+            stage = await manager.open_partition("events", 0)
+            teams = list(range(1, 13))
+            for i, team in enumerate(teams):
+                await staged(stage, fake_clock, team, [(i, JAN_US)])
+            hints = {s.group: s.staged_bytes for s in stage.snapshot()}
+            in_flight = peak = 0
+            caps: dict[Any, int] = {}
+            real = stage.scan
+
+            async def counted(group: Any, **kwargs: Any) -> Any:
+                nonlocal in_flight, peak
+                in_flight += 1
+                peak = max(peak, in_flight)
+                caps[group] = kwargs["max_bytes"]
+                await asyncio.sleep(0.01)
+                try:
+                    return await real(group, **kwargs)
+                finally:
+                    in_flight -= 1
+
+            monkeypatch.setattr(stage, "scan", counted)
+            options: list[Any] = []
+            real_scan = stage._db.scan_with_options
+
+            async def spied(key_range: Any, opts: Any) -> Any:
+                options.append(opts)
+                return await real_scan(key_range, opts)
+
+            monkeypatch.setattr(stage._db, "scan_with_options", spied)
+            script_options(httpx_mock)
+            CommitCapture(httpx_mock, [commit_ok(1)])
+            flusher = flusher_factory(store=store, cfg=cfg)
+            sweep = await runner(manager, flusher, cfg, fake_clock, sleeper).run_once(
+                drain=True
+            )
+            assert sweep.committed == 12
+            assert 1 < peak <= flush_mod._SCAN_CONCURRENCY
+            slack = (cfg.flush_bytes - sum(hints.values())) // len(teams)
+            assert caps == {g: h + slack for g, h in hints.items()}
+            assert sum(caps.values()) <= cfg.flush_bytes
+            assert {o.read_ahead_bytes for o in options} == {64 * 1024}
+            assert {o.max_fetch_tasks for o in options} == {1}
+
+    async def test_failure_state_is_pruned_when_its_stage_closes(
+        self,
+        fake_clock: Any,
+        sleeper: Sleeper,
+    ) -> None:
+        cfg = make_config()
+        async with StageManager(
+            "memory:///", "millrace", settings=fast_flush_settings()
+        ) as manager:
+            stage = await manager.open_partition("events", 0)
+            await staged(stage, fake_clock, 1, [(0, JAN_US)])
+            r = runner(manager, object(), cfg, fake_clock, sleeper)
+            r._failures[("events", 0, team_group(1))] = flush_mod._Failures(1, 1e18)
+            r._prune_failures()
+            assert len(r._failures) == 1  # still indexed: kept
+            await manager.close_partition("events", 0)
+            r._prune_failures()
+            assert r._failures == {}

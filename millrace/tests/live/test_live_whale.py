@@ -41,19 +41,26 @@ FLUSH_BYTES = 200 * 1024
 FLUSH_DEADLINE_S = 12
 TAIL_MARGIN_S = 25.0
 
-# The commit message names the flushed partition tuple in its human form
-# (``group=team_id=<n>/timestamp_month=<m>``).
+# A single-group commit names the flushed partition tuple in its human
+# form (``group=team_id=<n>/timestamp_month=<m>``); a batched commit
+# (several groups' files) says how many groups it carries.
 _COMMIT = re.compile(r"group=team_id=(\d+)/\S* trigger=(\w+)")
+_BATCH = re.compile(r"groups=(\d+) trigger=(\w+)")
 
 
-def _commit_triggers(catalog) -> list[tuple[int, str]]:
-    """(team_id, trigger) for every millrace commit in the catalog."""
-    out = []
+def _commit_triggers(catalog) -> list[tuple[int | None, str]]:
+    """(team_id, trigger) for every millrace commit in the catalog; the
+    team is None for a batched commit."""
+    out: list[tuple[int | None, str]] = []
     for snap in catalog.snapshots():
         if snap.message and snap.message.startswith("millrace=v2"):
             m = _COMMIT.search(snap.message)
-            assert m is not None, snap.message
-            out.append((int(m.group(1)), m.group(2)))
+            if m is not None:
+                out.append((int(m.group(1)), m.group(2)))
+                continue
+            b = _BATCH.search(snap.message)
+            assert b is not None, snap.message
+            out.append((None, b.group(2)))
     return out
 
 
@@ -125,7 +132,9 @@ async def test_whale_overload(lake_home, topic_factory, producer_factory, admin)
     # tail commits are age-triggered.
     triggers = _commit_triggers(lake_home.catalog)
     whale_triggers = Counter(t for team, t in triggers if team == WHALE)
-    tail_triggers = [t for team, t in triggers if team in TAIL_TEAMS]
+    # The tail tenants are due on the age lane together: they flush in
+    # batched commits (or alone, if only one was due in a sweep).
+    tail_triggers = [t for team, t in triggers if team is None or team in TAIL_TEAMS]
     assert whale_triggers["size"] >= 1, f"whale triggers: {whale_triggers}"
     assert whale_triggers["size"] + whale_triggers["backlog"] >= 2, (
         f"whale triggers: {whale_triggers}"

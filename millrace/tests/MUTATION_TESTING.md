@@ -40,12 +40,12 @@ were killed by `test_codec_refusals_name_exactly_what_failed` (exact
 refusal messages for a truncated u16 length, a value running past the
 end, an empty buffer, an all-`0xFF` prefix, an out-of-range offset).
 
-## Surviving mutants — all equivalent (17)
+## Surviving mutants — all equivalent (19)
 
 Arguments are interpreter semantics or a guard upstream of the mutated
 line (CPython ≥ 3.12), not "the tests happen to pass".
 
-### E1 — dropped or falsy explicit defaults of `to_bytes`/`from_bytes` (9)
+### E1 — dropped or falsy explicit defaults of `to_bytes`/`from_bytes` (11)
 
 Since Python 3.11 `byteorder` defaults to `"big"` and `signed` to
 `False`; `signed=None` is falsy, so it behaves as `False`.
@@ -59,6 +59,8 @@ Since Python 3.11 `byteorder` defaults to `"big"` and `signed` to
 - `x_encode_group__mutmut_27` — `"big"` dropped (u16 length)
 - `x__decode_group_at__mutmut_33` — `"big"` dropped (u16 length)
 - `x_encode_fence_probe_value__mutmut_11` — `"big"` dropped
+- `x_encode_row_key__mutmut_8` — `"big"` dropped (u32 partition)
+- `x_decode_row_key__mutmut_37` — `"big"` dropped (u32 partition)
 
 ### E2 — codec and byte-literal spellings (3)
 

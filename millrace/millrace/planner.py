@@ -69,3 +69,11 @@ def decide(
     ):
         return "age"
     return None
+
+
+def due_floor_ts(*, now_us: int, knobs: PlannerKnobs) -> int:
+    """The latest ``first_staged_ts`` that a deadline lane can make due
+    at ``now_us``: a group staged after it is due only by size. Lets a
+    sweep skip most groups without calling :func:`decide`."""
+    shortest = min(knobs.flush_deadline_s, knobs.slow_lane_deadline_s)
+    return now_us - shortest * _MICROS_PER_SECOND

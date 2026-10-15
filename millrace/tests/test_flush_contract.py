@@ -31,6 +31,7 @@ from flushkit import (
     commit_ok,
     commit_refusal,
     event_payload,
+    flush_group,
     make_config,
     month_wire,
     parquet_rows,
@@ -41,7 +42,14 @@ from flushkit import (
 )
 from stagekit import NOW, fast_flush_settings, staged_groups
 
-from millrace.flush import STUCK_AFTER, FlushHalted, FlushRunner, HoglakeFlusher
+from millrace.flush import (
+    STUCK_AFTER,
+    BatchReport,
+    FlushHalted,
+    FlushReport,
+    FlushRunner,
+    HoglakeFlusher,
+)
 from millrace.stage import StagedRecord, StageManager
 
 DEC_US = NOW - 20 * 86_400_000_000
@@ -357,7 +365,9 @@ async def test_a_refused_payload_retries_then_reports_the_group_stuck_and_the_po
 
     def answer(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
-        if "group=team_id=7/" in body["message"] and not poisoned["healed"]:
+        files = body["appends"][0]["files"]
+        teams = {f["partition_values"][0] for f in files}
+        if "7" in teams and not poisoned["healed"]:
             poisoned["count"] += 1
             return commit_refusal(422, "record_validation", "bad value")
         return commit_ok(100 + poisoned["count"])
@@ -378,7 +388,12 @@ async def test_a_refused_payload_retries_then_reports_the_group_stuck_and_the_po
     await stages.open_partition("events", 0)
     await stage_rows(stages, fake_clock, 7, [(0, event_payload(7, NOW))])
     r = runner(stages, flusher, cfg, fake_clock, mono, sleeper)
-    for attempt in range(STUCK_AFTER):
+    # Sweep 1: teams 7 and 8 share a batch, which is refused: both split
+    # out. Sweep 2: each retries ALONE; 8 lands (and 9, new, too), 7 is
+    # refused again. Sweep 3: 7 is refused a third time (stuck) while
+    # 10 lands: the poisoned group never holds anything else back.
+    expected = [(2, 0), (1, 2), (1, 1)]
+    for attempt, (failed, committed) in enumerate(expected):
         await stage_rows(
             stages,
             fake_clock,
@@ -387,8 +402,7 @@ async def test_a_refused_payload_retries_then_reports_the_group_stuck_and_the_po
         )
         with caplog.at_level(logging.WARNING, logger="millrace.flush"):
             report = await r.run_once(drain=True)
-        assert report.failed == 1  # team 7, again
-        assert report.committed == 1  # the other group still flushed
+        assert (report.failed, report.committed) == (failed, committed)
         mono.advance(3600)
     assert poisoned["count"] == STUCK_AFTER
     assert r.stuck_groups == 1
@@ -607,7 +621,7 @@ async def test_the_startup_drain_flushes_a_previous_process_rows(
     script_options(httpx_mock)
     capture = CommitCapture(httpx_mock, [commit_ok(91), commit_ok(92)])
     stages = manager(tmp_path)
-    await stages.sync_assignment({("events", 0), ("events", 1)})
+    await stages.claim("events", 0, [1])
     # Opening reads nothing: the index starts empty; the drain streams.
     assert stages.gauges().staged_groups == 0
     r = runner(stages, flusher, cfg, fake_clock, mono, sleeper)
@@ -619,8 +633,13 @@ async def test_the_startup_drain_flushes_a_previous_process_rows(
         len(event_payload(7, NOW, "p0")) + len(event_payload(8, NOW, "p1")),
     )
     assert await staged_count(stages, 7) == 0
-    assert await staged_count(stages, 8, partition=1) == 0
+    # The drained foreign slot is closed; its DB stays, empty.
+    assert stages.partitions() == (("events", 0),)
     await stages.close()
+    after = manager(tmp_path)
+    await after.open_partition("events", 1)
+    assert await staged_count(after, 8, partition=1) == 0
+    await after.close()
 
 
 async def test_a_crash_mid_drain_drains_again_duplicates_allowed(
@@ -651,14 +670,14 @@ async def test_a_crash_mid_drain_drains_again_duplicates_allowed(
     await crashing.open_partition("events", 0)
     from millrace.stage import PartitionStage
 
-    async def crash(self: Any, scan: Any, **_: Any) -> bool:
+    async def crash(self: Any, scans: Any, **_: Any) -> list[bool]:
         raise asyncio.CancelledError("killed before the settle")
 
     with monkeypatch.context() as patch:
-        patch.setattr(PartitionStage, "settle", crash)
+        patch.setattr(PartitionStage, "settle_many", crash)
         with pytest.raises(asyncio.CancelledError):
-            await flusher.flush_group(
-                crashing.stage("events", 0), team_group(7), "drain"
+            await flush_group(
+                flusher, crashing.stage("events", 0), team_group(7), "drain"
             )
     await crashing.close()
 
@@ -688,12 +707,19 @@ async def test_one_flush_in_flight_per_group(
     release = asyncio.Event()
     calls: list[Any] = []
 
-    async def slow(stage: Any, group: Any, trigger: str) -> Any:
-        calls.append(group)
+    async def slow(stage: Any, scans: Any, trigger: str) -> Any:
+        calls.extend(scan.group for scan in scans)
         await release.wait()
-        return None
+        return BatchReport(
+            tuple(
+                FlushReport(
+                    stage.topic, stage.partition, scan.group, trigger, "committed"
+                )
+                for scan in scans
+            )
+        )
 
-    flusher.flush_group = slow  # type: ignore[method-assign]
+    flusher.flush_batch = slow  # type: ignore[method-assign]
     r = runner(stages, flusher, cfg, fake_clock, mono, sleeper)
     first = asyncio.create_task(r.run_once(drain=True))
     await asyncio.sleep(0)
@@ -761,7 +787,7 @@ async def test_out_of_range_timestamps_are_keyed_and_land_clamped(
     cfg = make_config()
     flusher = flusher_factory(cfg=cfg, store=store)
     script_options(httpx_mock)
-    capture = CommitCapture(httpx_mock, [commit_ok(91), commit_ok(92)])
+    capture = CommitCapture(httpx_mock, [commit_ok(91)])
     await stages.open_partition("events", 0)
     await stages.stage("events", 0).stage_batch(records, now_us=fake_clock())
     with caplog.at_level(logging.WARNING, logger="millrace.flush"):
@@ -770,8 +796,10 @@ async def test_out_of_range_timestamps_are_keyed_and_land_clamped(
         )
     assert (report.committed, report.dropped) == (2, 0)
     landed: dict[str, int] = {}
-    for payload in capture.payloads:
-        (f,) = payload["appends"][0]["files"]
+    # Both groups in one batched commit, one file each.
+    (payload,) = capture.payloads
+    assert len(payload["appends"][0]["files"]) == 2
+    for f in payload["appends"][0]["files"]:
         rows = parquet_rows(store, f["path"]).to_pylist()
         for row in rows:
             from datetime import datetime, timedelta
@@ -973,7 +1001,7 @@ async def test_shutdown_mid_flush_keeps_the_rows(
     rows = [(o, event_payload(7, NOW, f"e{o}")) for o in range(3)]
     await stage_rows(stages, fake_clock, 7, rows)
     task = asyncio.create_task(
-        flusher.flush_group(stages.stage("events", 0), team_group(7), "size")
+        flush_group(flusher, stages.stage("events", 0), team_group(7), "size")
     )
     await wait_entered()
     task.cancel()

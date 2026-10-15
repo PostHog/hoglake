@@ -24,6 +24,7 @@ Pinned here:
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 from pathlib import Path
 from typing import Any
@@ -39,11 +40,13 @@ import millrace.stage as stage_mod
 from millrace import keyspace
 from millrace.flush import (
     STUCK_AFTER,
+    BatchReport,
     FlushError,
     FlushHalted,
     FlushReport,
     FlushRunner,
 )
+from millrace.planner import FLUSH_BYTES_DEFAULT
 from millrace.stage import FencedError, PartitionStage, StagedRecord, StageManager
 
 pytestmark = pytest.mark.component
@@ -140,6 +143,28 @@ class StreamFlusher:
             staged_bytes=scan.nbytes,
         )
 
+    max_files_per_commit = 512
+
+    async def flush_batch(
+        self, stage: Any, scans: Any, trigger: str, *, durable: bool = True
+    ) -> BatchReport:
+        """The batch: each scan handled as :meth:`flush_scan` would, a
+        scripted group failure reported as a build failure (the group
+        left out, its rows staged) the way ``HoglakeFlusher.flush_batch``
+        isolates it."""
+        reports: list[FlushReport] = []
+        failed: list[tuple[Any, Exception]] = []
+        for scan in scans:
+            try:
+                reports.append(
+                    await self.flush_scan(stage, scan, trigger, durable=durable)
+                )
+            except FlushHalted:
+                raise
+            except FlushError as e:
+                failed.append((scan.group, e))
+        return BatchReport(tuple(reports), tuple(failed), len(reports))
+
 
 class AdvancingSleeper:
     """The drain's backoff sleep: advances the fake monotonic clock."""
@@ -175,7 +200,8 @@ async def previous_process(
 
 async def restarted(root: Path, partitions: list[int]) -> StageManager:
     m = manager(root)
-    await m.sync_assignment({(TOPIC, p) for p in partitions})
+    for p in sorted(partitions):
+        await m.open_partition(TOPIC, p)
     return m
 
 
@@ -209,17 +235,25 @@ def make_runner(
     *,
     concurrency: int = 4,
     mono: FakeMonotonic | None = None,
+    batch_max_groups: int = 512,
 ) -> FlushRunner:
     mono = mono or FakeMonotonic()
+    # The flusher double's scan budget is the runner's too (one source in
+    # production: MILLRACE_FLUSH_BYTES).
+    knobs = dataclasses.replace(
+        make_config().planner_knobs(),
+        flush_bytes=getattr(flusher, "flush_bytes", FLUSH_BYTES_DEFAULT),
+    )
     return FlushRunner(
         stages,
         flusher,
-        make_config().planner_knobs(),
+        knobs,
         now_us=lambda: NOW,
         monotonic=mono,
         sleep=AdvancingSleeper(mono),
         sweep_s=1.0,
         concurrency=concurrency,
+        batch_max_groups=batch_max_groups,
     )
 
 
@@ -341,6 +375,7 @@ async def test_a_stuck_group_stays_staged_and_indexed_without_blocking_the_strea
     # The normal loop picks it up once it is accepted.
     flusher.fail.clear()
     flusher.flush_bytes = 1 << 30
+    r._knobs = dataclasses.replace(r._knobs, flush_bytes=1 << 30)
     r._failures.clear()
     assert (await r.run_once()).committed == 0  # not due by the planner...
     assert (await r.run_once(drain=True)).committed == 1  # ...but flushable
@@ -388,7 +423,8 @@ async def test_partitions_drain_concurrently_with_bounded_windows(
         return window
 
     monkeypatch.setattr(RowStream, "next_window", counted)
-    r = make_runner(stages, flusher, concurrency=3)
+    # One window per batch: the slot bound is then a window bound.
+    r = make_runner(stages, flusher, concurrency=3, batch_max_groups=1)
     task = asyncio.create_task(r.drain())
     for _ in range(400):
         await asyncio.sleep(0.005)
@@ -416,7 +452,7 @@ async def test_a_stop_mid_drain_reads_no_further_window_and_keeps_the_rows(
     stages = await restarted(tmp_path, [0, 1])
     gate = asyncio.Event()
     flusher = StreamFlusher(gate=gate)
-    r = make_runner(stages, flusher, concurrency=2)
+    r = make_runner(stages, flusher, concurrency=2, batch_max_groups=1)
     task = asyncio.create_task(r.drain())
     for _ in range(400):
         await asyncio.sleep(0.005)
@@ -735,4 +771,190 @@ async def test_a_failing_stream_cancels_its_siblings_and_logs_its_end(
     assert any(
         m.startswith("startup drain of events[0] cancelled:") for m in caplog.messages
     )
+    await stages.close()
+
+
+async def test_foreign_slots_are_listed_drained_and_closed_the_home_stays(
+    tmp_path: Path,
+) -> None:
+    """A scale-down leaves an older layout's slots behind: the restarted
+    replica probes the topic's slots for a SlateDB manifest, claims its home plus every
+    slot ``j % R == ordinal``, drains them all, and closes each foreign
+    slot once empty; the home stays open for the consumer."""
+    # R was 4; slots 1, 5, 9 belong to ordinal 1 under R=4 and R=2 alike.
+    layout = {p: [(grp(p, 0), o, b"x" * 8) for o in range(3)] for p in (1, 5, 9)}
+    layout[2] = [(grp(2, 0), 0, b"other ordinal")]
+    await previous_process(tmp_path, layout)
+
+    stages = manager(tmp_path)
+    # The manifest probe finds exactly the stages on disk.
+    assert await stages.existing_slots(TOPIC, range(12)) == [1, 2, 5, 9]
+    await stages.claim(TOPIC, 1, [5, 9])
+    flusher = StreamFlusher()
+    r = make_runner(stages, flusher)
+    await r.drain()
+
+    assert sorted((p, g) for p, g, _, _ in flusher.windows) == [
+        (1, grp(1, 0)),
+        (5, grp(5, 0)),
+        (9, grp(9, 0)),
+    ]
+    assert stages.partitions() == ((TOPIC, 1),)
+    assert stages.home_stage().partition == 1
+    # The other ordinal's slot was never opened, and is untouched.
+    other = manager(tmp_path)
+    await other.claim(TOPIC, 2, [])
+    assert await disk_offsets(other.stage(TOPIC, 2)) == [(grp(2, 0), 0)]
+    await other.close()
+    await stages.close()
+
+
+async def test_a_foreign_slot_with_a_stuck_group_stays_open_until_it_lands(
+    tmp_path: Path,
+) -> None:
+    layout = {1: [(grp(1, 0), 0, b"home")], 3: [(grp(3, 0), 0, b"foreign")]}
+    await previous_process(tmp_path, layout)
+    stages = manager(tmp_path)
+    await stages.claim(TOPIC, 1, [3])
+    flusher = StreamFlusher(fail={grp(3, 0): 10**6})
+    mono = FakeMonotonic()
+    r = make_runner(stages, flusher, mono=mono)
+    await r.drain()
+    assert stages.partitions() == ((TOPIC, 1), (TOPIC, 3))
+
+    flusher.fail.clear()
+    mono.advance(flush_mod._RETRY_MAX_S)
+    await r.run_once()
+    await r._close_drained_foreign()
+    assert stages.partitions() == ((TOPIC, 1),)
+    await stages.close()
+
+
+class BatchCountingFlusher(StreamFlusher):
+    """Records each batch's (stage, window count, bytes)."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.batches: list[tuple[int, int, int]] = []
+
+    async def flush_batch(
+        self, stage: Any, scans: Any, trigger: str, *, durable: bool = True
+    ) -> BatchReport:
+        self.batches.append(
+            (stage.partition, len(scans), sum(scan.nbytes for scan in scans))
+        )
+        return await super().flush_batch(stage, scans, trigger, durable=durable)
+
+
+async def test_the_drain_packs_windows_into_batches_within_the_budget(
+    tmp_path: Path,
+) -> None:
+    """Small groups' windows share one decision (one commit) up to the
+    group cap and the byte budget; a window that would overflow a batch
+    starts the next one; every row still flushes once."""
+    layout = many_groups(partitions=1, teams=10, days=5, pad=100)
+    await previous_process(tmp_path, layout)
+    stages = await restarted(tmp_path, [0])
+    budget = 3_000
+    flusher = BatchCountingFlusher(flush_bytes=budget)
+    r = make_runner(stages, flusher, batch_max_groups=8)
+    await r.drain()
+
+    assert all(n <= 8 for _, n, _ in flusher.batches)
+    # A batch never exceeds the budget unless it is a single window.
+    assert all(nbytes <= budget or n == 1 for _, n, nbytes in flusher.batches)
+    windows = len(flusher.windows)
+    assert len(flusher.batches) < windows  # windows really share batches
+    assert sum(n for _, n, _ in flusher.batches) == windows
+    assert sorted(o for _, _, offs, _ in flusher.windows for o in offs) == sorted(
+        o for _, o, _ in layout[0]
+    )
+    assert await disk_offsets(stages.stage(TOPIC, 0)) == []
+    await stages.close()
+
+
+async def test_a_failing_group_does_not_hold_back_its_batch(tmp_path: Path) -> None:
+    """A group whose build fails leaves its batch: its batch-mates are
+    published and settled, it alone stays staged and indexed."""
+    layout = {0: [(grp(t, 0), t, b"x" * 10) for t in range(5)]}
+    await previous_process(tmp_path, layout)
+    stages = await restarted(tmp_path, [0])
+    flusher = BatchCountingFlusher(fail={grp(2, 0): 10**6})
+    r = make_runner(stages, flusher)
+    await r.drain()
+    assert flusher.batches[0][1] == 5
+    assert await disk_offsets(stages.stage(TOPIC, 0)) == [(grp(2, 0), 2)]
+    assert [s.group for s in stages.stage(TOPIC, 0).snapshot()] == [grp(2, 0)]
+    await stages.close()
+
+
+class RefusingFlusher(BatchCountingFlusher):
+    """A batch where one group's build fails and the commit of the rest
+    is refused."""
+
+    def __init__(self, bad_build: Any, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.bad_build = bad_build
+
+    async def flush_batch(
+        self, stage: Any, scans: Any, trigger: str, *, durable: bool = True
+    ) -> BatchReport:
+        self.batches.append((stage.partition, len(scans), 0))
+        if len(scans) == 1:  # a retry alone lands
+            return await StreamFlusher.flush_batch(
+                self, stage, scans, trigger, durable=durable
+            )
+        return BatchReport(
+            (),
+            ((self.bad_build, FlushError("encoder bug")),),
+            refused=tuple(s.group for s in scans if s.group != self.bad_build),
+            refusal=flush_mod.CommitRefused(422, "refused"),
+        )
+
+
+async def test_a_refused_batch_holds_its_build_failures_too(tmp_path: Path) -> None:
+    """A refused batch holds every group it did not publish: the refused
+    ones AND the ones whose build failed before the commit. All stay
+    indexed (rows on disk ⇒ in the index), split out, and the drain's
+    retry pass then lands each ALONE."""
+    layout = {0: [(grp(t, 0), t, b"x" * 10) for t in range(3)]}
+    await previous_process(tmp_path, layout)
+    stages = await restarted(tmp_path, [0])
+    flusher = RefusingFlusher(grp(1, 0))
+    r = make_runner(stages, flusher)
+    await r.drain()
+    stage = stages.stage(TOPIC, 0)
+    # The stream's one batch was refused; every group then retried alone.
+    assert [n for _, n, _ in flusher.batches] == [3, 1, 1, 1]
+    assert sorted((g, t) for _, g, _, t in flusher.windows) == [
+        (grp(t, 0), "retry") for t in range(3)
+    ]
+    assert stage.snapshot() == []
+    assert await disk_offsets(stage) == []
+    await stages.close()
+
+
+async def test_a_stop_mid_drain_keeps_a_half_streamed_foreign_stage_open(
+    tmp_path: Path,
+) -> None:
+    """After a stop the foreign stream left rows unread (and unindexed):
+    its empty index proves nothing, so the stage is not closed as
+    drained."""
+    layout = {0: [(grp(0, 0), 0, b"h" * 10)]}
+    layout[2] = [(grp(t, 0), t, b"f" * 10) for t in range(6)]
+    await previous_process(tmp_path, layout)
+    stages = manager(tmp_path)
+    await stages.claim(TOPIC, 0, [2])
+    gate = asyncio.Event()
+    flusher = StreamFlusher(gate=gate)
+    r = make_runner(stages, flusher, concurrency=1, batch_max_groups=1)
+    task = asyncio.create_task(r.drain())
+    for _ in range(200):
+        await asyncio.sleep(0.005)
+        if flusher.windows:
+            break
+    r.stop()
+    gate.set()
+    await asyncio.wait_for(task, timeout=30)
+    assert (TOPIC, 2) in stages.partitions()
     await stages.close()

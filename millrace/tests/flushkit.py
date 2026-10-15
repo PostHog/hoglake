@@ -368,3 +368,26 @@ def parquet_rows(store: FakeObjectStore, uri: str) -> pa.Table:
 
     key = uri.removeprefix("s3://")
     return pq.read_table(pa.BufferReader(store.files[key]))
+
+
+async def flush_scan(
+    flusher: Any, stage: Any, scan: Any, trigger: str, *, durable: bool = True
+) -> Any:
+    """One scanned window through ``flusher.flush_batch`` as a batch of
+    one; a build failure or a refusal raises (the production runner
+    reads the same outcomes from the batch report)."""
+    report = await flusher.flush_batch(stage, [scan], trigger, durable=durable)
+    if report.refusal is not None:
+        raise report.refusal
+    if report.failed:
+        raise report.failed[0][1]
+    (only,) = report.reports
+    return only
+
+
+async def flush_group(flusher: Any, stage: Any, group: Any, trigger: str) -> Any:
+    """Scan one bounded window of ``group`` (``flush_bytes``) and flush it."""
+    scan = await stage.scan(
+        group, max_bytes=flusher._cfg.flush_bytes, now_us=flusher._now_us()
+    )
+    return await flush_scan(flusher, stage, scan, trigger)
