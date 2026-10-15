@@ -1,11 +1,12 @@
 """Kafka consumption and offset management.
 
-Poll → stage → commit. Every well-formed record is staged under
-``rows/(group, offset)`` (stage.py); a record that can never become a row
-is dropped, logged and counted. A partition's offset commits only after
-every record at or below it is durable in SlateDB or was dropped: the
-only thing between Kafka and loss. One poll stages its partitions
-concurrently and commits once, after every partition's write is durable.
+Poll → stage → commit. Every well-formed record is staged in the
+replica's home stage under ``rows/(group, partition, offset)``
+(stage.py); a record that can never become a row is dropped, logged and
+counted. A partition's offset commits only after every record at or
+below it is durable in SlateDB or was dropped: the only thing between
+Kafka and loss. One poll is ONE durable write to the home stage, then
+one offset commit for every partition it touched.
 
 The group a record stages under is the destination's partition tuple for
 it (:class:`millrace.grouping.GroupKeyer`), built from the shape the
@@ -15,15 +16,17 @@ the live spec, so files stay correct.
 
 Assignment is static (millpond's model): at :meth:`MillraceConsumer.start`
 the topic's partition count is read once and this replica claims every
-``p`` with ``p % replica_count == ordinal``. The stages are opened, the caller's
+``p`` with ``p % replica_count == ordinal``. Its home stage is the slot of
+the smallest claimed partition; every other existing slot ``j`` with
+``j % replica_count == ordinal`` is opened for draining. The caller's
 ``drain`` flushes everything already staged (one sequential pass per
-partition), and only then are the partitions assigned with
+stage), and only then are the partitions assigned with
 ``OFFSET_STORED``.
 
-Fencing: a stage write (or, for a poll whose records were all dropped, a
-durable fence probe) that fails with SlateDB's FENCED closes the fenced
-stages locally and raises :class:`~millrace.stage.FencedError` (exit 4)
-before any offset of that poll is committed.
+Fencing: a home-stage write (or, for a poll whose records were all
+dropped, a durable fence probe) that fails with SlateDB's FENCED closes
+the home stage locally and raises :class:`~millrace.stage.FencedError`
+(exit 4) before any offset of that poll is committed.
 
 Every blocking librdkafka call runs on one dedicated worker thread (the
 consumer is single-threaded); classification runs on a worker thread
@@ -74,6 +77,10 @@ REASON_MALFORMED_PARTITION_SOURCE: Final = "malformed_partition_source"
 
 #: At most one drop log line per (partition, reason) per this many seconds.
 DROP_LOG_INTERVAL_S: Final = 10.0
+
+#: Slots probed for a stage to drain at startup: ``j % R == ordinal``
+#: for every ``j`` below this (or below the partition count, if larger).
+STAGE_SLOT_SCAN_LIMIT: Final = 1024
 
 _COMMIT_MAX_ATTEMPTS: Final = 3
 _COMMIT_BASE_DELAY_S: Final = 0.5
@@ -143,6 +150,7 @@ def classify_message(
     *,
     offset: int,
     value: bytes | None,
+    partition: int = 0,
 ) -> StagedRecord | DroppedRecord:
     """One record → the row to stage under its partition tuple, or the
     drop with its reason. Total over record content. The Kafka key and
@@ -159,7 +167,7 @@ def classify_message(
         group = keyer.group_for(doc)
     except PartitionSourceError as exc:
         return DroppedRecord(offset, f"{REASON_MALFORMED_PARTITION_SOURCE}:{exc.path}")
-    return StagedRecord(group=group, offset=offset, payload=value)
+    return StagedRecord(group=group, offset=offset, payload=value, partition=partition)
 
 
 def drop_reason_label(reason: str) -> str:
@@ -218,7 +226,9 @@ def _classify_poll(keyer: GroupKeyer, msgs: Sequence[MessageView]) -> _Classifie
             continue
         key = (topic, partition)
         raw_key, raw_value = msg.key(), msg.value()
-        outcome = classify_message(keyer, offset=offset, value=raw_value)
+        outcome = classify_message(
+            keyer, offset=offset, value=raw_value, partition=partition
+        )
         out.records += 1
         out.nbytes += (len(raw_key) if raw_key else 0) + (
             len(raw_value) if raw_value else 0
@@ -337,15 +347,26 @@ class MillraceConsumer:
                 f"{partition_count} partition(s) and MILLRACE_REPLICA_COUNT="
                 f"{cfg.replica_count}"
             )
+        home = partitions[0]
+        # Every slot this ordinal may have to drain: the homes of replicas
+        # a scale-down removed. Each is probed for a SlateDB manifest.
+        limit = max(partition_count, STAGE_SLOT_SCAN_LIMIT)
+        existing = await self._stages.existing_slots(
+            cfg.kafka_topic, range(cfg.ordinal, limit, cfg.replica_count)
+        )
+        drain = [s for s in existing if s != home]
         log.info(
-            "assignment: ordinal %d of %d replicas over %d partitions of %s → %s",
+            "assignment: ordinal %d of %d replicas over %d partitions of %s → %s; "
+            "home stage slot %d, draining slots %s",
             cfg.ordinal,
             cfg.replica_count,
             partition_count,
             cfg.kafka_topic,
             list(partitions),
+            home,
+            drain,
         )
-        await self._stages.sync_assignment({(cfg.kafka_topic, p) for p in partitions})
+        await self._stages.claim(cfg.kafka_topic, home, drain)
         return partitions
 
     async def _assign(self, partitions: tuple[int, ...]) -> None:
@@ -569,10 +590,10 @@ class MillraceConsumer:
         self._next_shape_read = self._monotonic() + self._shape_ttl_s
 
     async def _stage_and_commit(self, msgs: Sequence[MessageView]) -> None:
-        """Classify off the loop, stage every touched partition
-        concurrently, then commit ``last handled + 1`` per partition only
-        after EVERY write is durable. A partition whose records were all
-        dropped gets a durable fence probe in place of a batch."""
+        """Classify off the loop, stage the poll's records (every
+        partition) in ONE durable write to the home stage, then commit
+        ``last handled + 1`` per partition. A poll whose records were all
+        dropped gets a durable fence probe in place of the batch."""
         now_us = self._now_us()
         poll = await asyncio.to_thread(_classify_poll, self._keyer, msgs)
         for text in poll.error_events:
@@ -584,49 +605,32 @@ class MillraceConsumer:
         for topic, partition, dropped in poll.drops:
             self._note_drop(topic, partition, dropped)
 
-        keys = sorted(poll.staged)
-        probes = sorted(set(poll.last_handled) - set(poll.staged))
-        tasks = [
-            asyncio.create_task(
-                self._stages.stage(*key).stage_batch(poll.staged[key], now_us=now_us),
-                name=f"millrace-stage-{key[0]}-{key[1]}",
-            )
-            for key in keys
-        ] + [
-            asyncio.create_task(
-                self._stages.stage(*key).probe_fence(poll.last_handled[key]),
-                name=f"millrace-probe-{key[0]}-{key[1]}",
-            )
-            for key in probes
+        if not poll.last_handled:
+            return
+        home = self._stages.home_stage()
+        staged = [rec for key in sorted(poll.staged) for rec in poll.staged[key]]
+        try:
+            if staged:
+                ack = await home.stage_batch(staged, now_us=now_us)
+                self._records_staged += ack.rows
+            else:
+                # Every handled record was dropped: a durable fence probe
+                # stands in for the batch. Its value is forensic only (the
+                # poll's highest handled offset, any partition).
+                await home.probe_fence(max(poll.last_handled.values()))
+        except Exception as e:
+            if not is_fenced(e):
+                raise
+            key = (home.topic, home.partition)
+            await self._relinquish_fenced([key])
+            raise FencedError([key]) from e
+        offsets = [
+            TopicPartition(topic, partition, last + 1)
+            for (topic, partition), last in sorted(poll.last_handled.items())
         ]
-        # Settle every write before examining any outcome.
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        errors: list[BaseException] = []
-        fenced: list[tuple[str, int]] = []
-        for key, result in zip([*keys, *probes], results, strict=True):
-            if isinstance(result, BaseException):
-                if is_fenced(result):
-                    fenced.append(key)
-                else:
-                    errors.append(result)
-                continue
-            if result is not None:
-                self._records_staged += result.rows
-        if fenced:
-            for exc in errors:
-                log.warning("sibling stage failure beside the fence: %r", exc)
-            await self._relinquish_fenced(fenced)
-            raise FencedError(fenced)
-        if errors:
-            raise errors[0]
-        if poll.last_handled:
-            offsets = [
-                TopicPartition(topic, partition, last + 1)
-                for (topic, partition), last in sorted(poll.last_handled.items())
-            ]
-            await self._commit_offsets(offsets)
-            for key, last in poll.last_handled.items():
-                self._committed[key] = last + 1
+        await self._commit_offsets(offsets)
+        for key, last in poll.last_handled.items():
+            self._committed[key] = last + 1
 
     def _note_drop(self, topic: str, partition: int, dropped: DroppedRecord) -> None:
         """Count a drop; log at most one line per (partition, reason) per

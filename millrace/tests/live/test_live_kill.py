@@ -281,8 +281,8 @@ async def test_startup_drain_flushes_before_consuming(
         out = child_b.output()
         drained = out.index("startup drain finished")
         # The streaming drain of one wave can finish before the first
-        # probe lands, so the order is read from the log: the partitions'
-        # streams started, the drain finished, and only then the assign
+        # probe lands, so the order is read from the log: the home stage's
+        # stream started, the drain finished, and only then the assign
         # (readiness turns 200 only after start() returns, test_main).
         streaming = out.index("streaming its staged rows")
         assert streaming < drained < out.index("assigned "), out[-4000:]
@@ -290,7 +290,8 @@ async def test_startup_drain_flushes_before_consuming(
             r"startup drain of \S+\[\d+\] streamed: \d+ window\(s\), (\d+) row\(s\)",
             out[:drained],
         )
-        assert len(streamed) == topic.partitions, out[-4000:]
+        # One stream: every partition stages into the replica's home stage.
+        assert len(streamed) == 1, out[-4000:]
         assert sum(int(rows) for rows in streamed) >= WAVE_EVENTS
         samples = livekit.scrape_metrics(port_b)
         drain_rows = livekit.metric(samples, "millrace_drain_rows_total")

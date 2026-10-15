@@ -3,7 +3,7 @@ startup drain → consumer + flush loop, plus the ops HTTP server.
 
 Startup order matters. The stages are opened and EVERYTHING already
 staged is flushed (the startup drain: one sequential pass over each
-partition's rows, partitions concurrently) before the consumer is
+stage's rows, stages concurrently) before the consumer is
 assigned its partitions. Staged state
 therefore never outlives a process, which is what lets group sizes and
 ages live in memory only. ``/readyz`` answers 503 for the whole drain;
@@ -341,6 +341,8 @@ async def _run(cfg: Config, hoglake_url: str, s3_kwargs: Mapping[str, Any]) -> i
             now_us=_now_us,
             sweep_s=cfg.flush_sweep_s,
             concurrency=cfg.flush_concurrency,
+            # One file per group in steady state: a batch fills one commit.
+            batch_max_groups=cfg.max_files_per_commit,
         )
         started = asyncio.Event()
         draining = asyncio.Event()

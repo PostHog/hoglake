@@ -1,10 +1,11 @@
 # millrace
 
 Kafka → hoglake ingestion with durable SlateDB staging. One process
-consumes one topic into one table: each record is staged in a
-per-partition SlateDB instance on object storage under its destination
-partition tuple, and a flush loop turns each due tuple's staged rows
-into parquet and hoglake commits.
+consumes one topic into one table: each replica stages every record
+it consumes in ONE SlateDB instance on object storage (its home stage)
+under its destination partition tuple, and a flush loop turns due
+tuples' staged rows into parquet and hoglake commits, batching many
+small groups into one commit.
 
 **Contract: at-least-once.** A Kafka offset commits only after its
 record is durable in staging (or was dropped as unrepresentable, and
@@ -82,21 +83,32 @@ MILLRACE_SORT_BY=timestamp
 
 ## Startup drain and probes
 
-On start each replica opens its partitions' SlateDB instances and
-**flushes everything staged before it consumes anything new**. Staged
-state therefore never outlives a process; that is what lets group sizes
-and ages live in memory only. A crash mid-drain drains again on restart
-(windows that already landed land again: duplicates, accepted).
+On start each replica opens its home stage (the slot of its smallest
+claimed partition) plus every other existing slot `j` with `j % R ==
+ordinal` (the home of a replica removed by a scale-down), and **flushes everything staged before it
+consumes anything new**. Drained foreign slots are closed and left in
+place. Change the replica count with the fleet scaled to zero: a
+mixed-`R` fleet is unsupported. Staged state therefore never outlives
+a process; that is what lets group sizes and ages live in memory only.
+A crash mid-drain drains again on restart (windows that already landed
+land again: duplicates, accepted).
 
-The drain is a stream: per partition, one sequential read-ahead pass
+**The stage format changed** with the home stage (row keys carry the
+Kafka partition): the drain refuses a stage written by an earlier build
+(`StageFormatError`, "wipe MILLRACE_STAGE_URL"). Wipe the stage before
+deploying this build, and before rolling back past it.
+
+The drain is a stream: per stage, one sequential read-ahead pass
 over the staged rows, cut into one-group windows (at the group's end or
-at `MILLRACE_FLUSH_BYTES`), each flushed and settled as the pass goes;
-partitions drain concurrently with at most 4 windows (the flush
-concurrency) in memory. Progress is logged per partition (`startup drain of
+at `MILLRACE_FLUSH_BYTES`), packed into batches of up to
+`MILLRACE_FLUSH_BYTES` and 512 windows (`max_files_per_commit`), each
+batch one commit (more if its groups fan out past 512 files), flushed
+and settled as the pass goes; stages drain concurrently with at most 4
+batches (the flush concurrency) in memory. Progress is logged per stage (`startup drain of
 <topic>[<p>]: …` at start, every 1,000 windows or 30 s, and at the end)
 and counted in `millrace_drain_rows_total` / `millrace_drain_bytes_total`.
-Drain time is dominated by one commit per window (thousands of small
-groups = thousands of commits), not by the stage reads. The stream
+Small groups share commits, so drain time is mostly the stage reads
+and the parquet builds. The stream
 reopens its iterator past the last key every 60 s and after a read
 error, so an SST the maintenance GC deletes under it costs a reopen,
 not a restart.
@@ -122,8 +134,11 @@ not a restart.
 ## Stuck groups
 
 Any flush failure leaves the rows staged and retries the group with
-backoff (2 s doubling to 120 s). A server refusal of a payload (400/422)
-is handled the same way. After 3 consecutive failures the group is
+backoff (2 s doubling to 120 s). Due groups that are not at the size
+lane are flushed in batches, one commit per batch (more past 512
+files); a refused batch
+(400/422) splits: each of its groups retries alone, so one bad group
+never holds the others back. Other batch failures retry the batch. After 3 consecutive failures the group is
 logged at ERROR (`flush STUCK: …`), `millrace_flush_groups_stuck_total`
 increments and `millrace_flush_groups_stuck` counts it until it
 succeeds; other groups keep flushing. Alert on the gauge. Refusals are

@@ -35,7 +35,7 @@ flowchart LR
     F["flush loop<br/>flush.py FlushRunner"]
     OPS["ops server :8000"]
   end
-  S[("SlateDB per partition<br/>{root}/{topic}/{p}")]
+  S[("SlateDB home stage per replica<br/>{root}/{topic}/{slot}")]
   LAKE[("lake object store")]
   H["hoglake /v1"]
   M["maintenance service<br/>python -m millrace.maintenance"]
@@ -62,16 +62,27 @@ thread.
 
 ## 3. Staging data model
 
-**One SlateDB per (topic, partition)** at
-`{stage_base_path}/{topic}/{partition}`. The Kafka assignment is the
-claim; staged state follows the partition, not the pod. Kafka offsets
-are unique within an instance.
+**One SlateDB per replica: its home stage** at
+`{stage_base_path}/{topic}/{slot}`, the slot of the smallest partition
+it claims (its ordinal, under `p % R == ordinal`). The home holds every
+claimed partition's rows, so a group is one key range per replica
+whatever the partition count; `(partition, offset)` makes a row key
+unique. At startup the replica probes every slot `j` with `j % R ==
+ordinal` below `max(1024, partition count)` for a SlateDB manifest
+(`StageManager.existing_slots`, through SlateDB's own store; a probe
+error fails the start) and also opens every other existing one
+(the home of a replica a scale-down removed) to
+drain it; a foreign stage is closed once its index is empty
+(`StageManager.close_idle_foreign`) and is never written by the
+consumer. For a fixed `R` the replicas' slot sets are disjoint.
+Replica-count changes are coordinated on the Kubernetes side (scale to
+zero, change `R`, scale up): a mixed-`R` fleet is unsupported.
 
 **Keyspace** (`keyspace.py`):
 
 | Key | Value |
 |---|---|
-| `rows/` + group + offset (i64 offset-binary) | raw Kafka payload |
+| `rows/` + group + partition (u32 BE) + offset (i64 offset-binary) | raw Kafka payload |
 | `meta/fence` | the probing poll's last handled offset (i64; forensic) |
 | `meta/table_uuid` | the destination incarnation first committed to |
 
@@ -87,8 +98,11 @@ carries in `partition_values` (None for null), computed by
 fanout uses. The encoding is prefix-free (`arity u8`, then per
 component `0x00` or `0x01 len u16 utf8`), so a group's rows are one
 contiguous range (`group_rows_range`) that never reaches another
-group's rows, even `(a,)` vs `(a, b)` after a spec change. A scan cut
-by the byte budget is an exact offset prefix of the group.
+group's rows, even `(a,)` vs `(a, b)` after a spec change. Within a
+group rows sort by `(partition, offset)`, so a scan cut by the byte
+budget is a key prefix, not one partition's offset prefix, and a
+settle deletes exact keys (a range delete would take rows staged after
+the scan).
 
 **In-memory index** (`stage.py:GroupState`, per stage): per group,
 `first_staged_ts`, `staged_bytes`, `rows`, and `gen`, the stage-wide
@@ -107,21 +121,29 @@ index*. It holds because:
    many-group backlog.)
 2. `stage_batch` updates the index **before** its write, under the
    write lock.
-3. A group leaves the index only in `settle`, under the lock, when the
-   settled scan was complete AND the group's `gen` is unchanged since
-   the scan read it (under the lock, before the scan began). Every
-   write with an older gen had returned before the scan iterator was
-   created, so the scan saw its rows; any newer write blocks removal.
+3. A group leaves the index only in `settle` / `settle_many`, under
+   the lock and after the deletes are durable, when the settled scan
+   was complete AND the group's `gen` is unchanged since the scan read
+   it (under the lock, before the scan began). Every write with an
+   older gen had returned before the scan iterator was created, so the
+   scan saw its rows; any newer write blocks removal.
 
 `staged_bytes`/`rows` over-count after a redelivery and are
 approximate for groups the drain held. Only the size lane and gauges
 read them.
 
 **The write lock** (one `asyncio.Lock` per stage) covers writes only:
-the index update, `db.write(batch)` and `await_durable`. No scan, no
+the index update and `db.write(batch)`. The durability wait runs after
+the lock is released (scans read at MEMORY durability, so visibility
+needs only the write; a row published before its put is durable is at
+worst replayed from Kafka: a duplicate), so one stage's consumer is
+never serialized behind settles' WAL flushes. No scan, no
 `next_batch`, and no payload lowering ever runs under it: batches are
 built on a worker thread first (`_build_stage_batch`,
 `_build_delete_batch`). Pinned by the lock spies in `tests/test_stage.py`.
+
+**Compression**: SSTs are zstd (`build_slatedb_settings`); staged rows
+are raw event JSON.
 
 **Scans** use `_bulk_scan_options`: 4 MiB read-ahead, 4 fetch tasks,
 blocks not cached (slatedb's default fetches one ~4 KiB block per GET).
@@ -146,11 +168,11 @@ round-trips every byte value and lengths 0 to 1 MiB.
 3. Classify on a worker thread (`classify_message`): strict JSON object
    → stage under the keyer's tuple; anything else → `DroppedRecord`
    (counted, rate-limited log).
-4. One task per touched partition: `stage_batch` (one durable
-   WriteBatch), or `probe_fence` when every record of the poll on that
-   partition was dropped (an empty batch cannot serve; SlateDB refuses
-   it). Gather all, then examine.
-5. Any FENCED → close those stages locally, raise
+4. ONE home-stage write for the whole poll: `stage_batch` (one
+   durable WriteBatch holding every partition's records), or
+   `probe_fence` when every record of the poll was dropped (an empty
+   batch cannot serve; SlateDB refuses it).
+5. FENCED → close the home stage locally, raise
    `stage.FencedError` (exit 4) with no offsets committed. Any other
    failure raises (offsets unadvanced, restart replays).
 6. Commit `last handled + 1` per partition, once, synchronously
@@ -159,7 +181,8 @@ round-trips every byte value and lengths 0 to 1 MiB.
 **Assignment** (`MillraceConsumer.start(drain)`): partition count from
 metadata once (transients retried), `compute_assignment` (`p %
 replicas == ordinal`; empty share → `AssignmentError`, exit 2),
-`StageManager.sync_assignment` (open; nothing is read), **the drain**, a
+`StageManager.existing_slots` and `claim` (open the home and the slots to
+drain; nothing is read), **the drain**, a
 coordinator warmup (`committed()` probes; librdkafka resolves
 `OFFSET_STORED` once at assign time and never retries), then
 `assign(OFFSET_STORED)`. A failed start is sticky.
@@ -177,9 +200,17 @@ refused at config time).
 
 `flush.py:FlushRunner.run` every `flush_sweep_s` (1 s): for each open
 stage, for each group in the index, compute whether it is due; launch
-one task per due group not already in flight, oldest first; a
-process-wide semaphore (`flush_concurrency`, 4) bounds the tasks
-running at once. A sweep reads only memory.
+the due groups not already in flight, oldest first. A size-lane or
+backlog group, or one whose last failure split it out of a batch,
+is a decision alone; every other due group of a stage is packed into
+**batches** of at most `flush_bytes` staged and `max_files_per_commit`
+groups. Every decision takes the same path (`FlushRunner._flush`):
+scan its groups, at most 8 at once, each capped at its indexed
+estimate plus an even share of the budget the batch leaves unused (so
+the caps sum to `flush_bytes`; a group under 1 MiB scans with 64 KiB
+read-ahead), then `HoglakeFlusher.flush_batch`. A process-wide semaphore
+(`flush_concurrency`, 4) bounds the decisions running at once. A
+sweep reads only memory, in place: the index is not copied.
 
 **Due** (`planner.py:decide`, first match):
 
@@ -193,10 +224,10 @@ A group whose last attempt failed is due again when its backoff
 expires (2 s doubling to 120 s), regardless of the predicate. The
 drain's retry pass (§6) treats every indexed group as due.
 
-**One decision** (`HoglakeFlusher.flush_group`):
+**One group within a decision**:
 
-1. `PartitionStage.scan(group, max_bytes=flush_bytes)`: an offset
-   prefix of at most `flush_bytes` of payload, always ≥ 1 row.
+1. `PartitionStage.scan(group, max_bytes=cap)`: a key prefix of at
+   most its cap of payload, always ≥ 1 row.
 2. Build (`build_flush_plan`, pure, on the pool) against the cached
    shape (re-read `totals=false` past a TTL of a quarter of the
    catalog's retention, or after any commit error): decode each payload
@@ -238,8 +269,26 @@ saw it.
 | 409 `commit_conflict` | resend identical bytes (≤ 5) |
 | 409 `ddl_since_read_snapshot`, 410 `read_snapshot_expired` | rebuild on a fresh shape with a fresh key (≤ 3 builds) |
 | 409 `table_recreated` | `FlushHalted` (exit 3) |
-| other 4xx (400/422 payload refusal, 401, 403, 404, 413, 409 `table_dropped`) | `CommitRefused`, counted by status; the decision fails |
+| other 4xx (400/422 payload refusal, 401, 403, 404, 413, 409 `table_dropped`) | `CommitRefused`, counted by status; the decision stops and its unpublished groups split out |
 | ladder exhausted | `CommitExhausted`; the decision fails; its objects may be live, so they are counted as ambiguous (`millrace_flush_ambiguous_uploads_total`), never as orphans |
+
+**Batched decision** (`HoglakeFlusher.flush_batch`, the only flush
+implementation): every group of the decision is built on ONE shape
+read, in parallel on the pool. Rows the decoder drops are settled
+right after the build (never published; a rebuild cannot drop them
+twice). The files are packed into commits of at most
+`max_files_per_commit` (normally one commit); as each commit lands its
+groups' rows are deleted in ONE batch (`PartitionStage.settle_many`:
+one write, one durability wait), tracked by position in the scan, not
+by key. The outcome is a `BatchReport`: a report per finished group,
+the groups whose BUILD failed (rows staged; each retries alone), and,
+when a commit was refused (`CommitRefused`), the groups it left
+unpublished with the refusal: each retries ALONE (the split), which
+isolates a poisoned group. A refused read basis rebuilds the
+unpublished rows on a fresh shape (≤ 3 builds). Any other failure
+(transport, ladder exhausted) raises and retries the decision whole,
+so a hoglake outage never turns into one commit per group when it
+recovers.
 
 **Failure rule**: any failure fails the decision; nothing is deleted;
 the group retries with backoff; after `STUCK_AFTER` (3) consecutive
@@ -262,23 +311,26 @@ the runner, stop it, and re-raise from `run`, `run_once` and `drain`.
 2. `FlushRunner.drain`:
    - check every stage's pinned incarnation (`meta/table_uuid`): a
      recreated destination halts before anything is flushed;
-   - **stream** each partition, partitions concurrently
-     (`_drain_partition`): ONE iterator over `rows/` with the bulk
-     read-ahead options (`stage.RowStream`), cut into windows of one
-     group each, at the group's last row or where the next row would
-     exceed `flush_bytes` (always ≥ 1 row). Each window is flushed by
-     `HoglakeFlusher.flush_scan` (build, upload, commit, settle exactly
-     its keys; split commits settle per chunk) as the stream proceeds.
+   - **stream** each stage (the home and the foreign slots),
+     stages concurrently (`_drain_partition`): ONE iterator over
+     `rows/` with the bulk read-ahead options (`stage.RowStream`), cut
+     into windows of one group each, at the group's last row or where
+     the next row would exceed `flush_bytes` (always ≥ 1 row).
+     Consecutive windows are packed into batches (at most about
+     `flush_bytes` and `max_files_per_commit` windows; a window that
+     would overflow a non-empty batch starts the next one), each
+     flushed by `HoglakeFlusher.flush_batch` as the stream proceeds.
      The stream reads with less read-ahead than a window scan (1 MiB ×
-     2 fetches per SST iterator; it is open per partition for the whole
+     2 fetches per SST iterator; it is open per stage for the whole
      drain), pages of at most 1,024 rows / ~16 MiB, and reopens just
      past its last key every 60 s and after a read error (up to 3 in a
      row): a long-lived iterator would pin SSTs the compactor retired
      and the maintenance GC deletes;
-     A slot of a `flush_concurrency` semaphore shared by all partitions
-     is taken BEFORE a window is read and returned when its flush ends,
-     so at most `flush_concurrency` windows are in memory pod-wide. The
-     stream holds no lock;
+     A slot of a `flush_concurrency` semaphore shared by all stages
+     is taken BEFORE a batch's windows are read and returned when its
+     flush ends, so at most `flush_concurrency` batches (plus one
+     carried window per stream) are in memory pod-wide. The stream
+     holds no lock;
    - drain settles skip the per-window durability wait
      (`settle(durable=False)`; a lost delete re-flushes a duplicate,
      which at-least-once allows) and each partition's stream ends with
@@ -287,7 +339,9 @@ the runner, stop it, and re-raise from `run`, `run_once` and `drain`.
      may publish the same windows (duplicates only). Waiting per window serialized the drain on one
      stage PUT per window under the write lock (~70 ms each at 60 ms
      latency);
-   - a failing window does not block the stream: its group is held
+   - a failing window does not block the stream (a build failure
+     leaves only its group out of the batch; a refused batch holds its
+     unpublished groups and splits them): its group is held
      (indexed with `held` set, the rest of its rows skipped and
      counted), its failure noted for backoff. No drain window's settle
      releases a held group, even a complete one landing after the
@@ -296,7 +350,7 @@ the runner, stop it, and re-raise from `run`, `run_once` and `drain`.
      (`STUCK_AFTER`); stuck ones stay indexed and keep retrying in the
      normal loop;
    - older-layout keys are deleted alongside each stream;
-   - progress per partition: a start line, a line every 1,000 windows or
+   - progress per stage: a start line, a line every 1,000 windows or
      30 s (windows, rows, MiB, groups seen, rows/s, MiB/s, failed
      windows) and an end line on every path (streamed, stopped, failed,
      cancelled); `millrace_drain_rows_total` / `millrace_drain_bytes_total`
@@ -402,8 +456,10 @@ and whenever liveness fails.
 | 11 | Ancient and far-future events are written | `test_flush_contract.py`, `tests/live/test_live_junk.py` |
 | 12 | A recreated destination halts | `test_flush_contract.py`, `tests/live/test_live_recreate.py` |
 | 13 | The startup drain flushes a previous process's rows before consuming, and again after a crash mid-drain | `test_flush_contract.py`, `test_consumer.py`, `test_drain.py`, `tests/live/test_live_kill.py` |
-| 17 | The startup drain is one read-ahead pass per partition, partitions concurrent, windows bounded by `flush_concurrency`; a stuck group stays staged and indexed without blocking it | `test_stage.py`, `test_drain.py`, `tests/live/test_live_drain_latency.py` |
-| 14 | Group encoding is prefix-free; row keys sort by (group, offset) | `test_keyspace.py` (mutation-gated) |
+| 17 | The startup drain is one read-ahead pass per stage, stages concurrent, batches bounded by `flush_concurrency`; a stuck group stays staged and indexed without blocking it; drained foreign slots close, the home stays | `test_stage.py`, `test_drain.py`, `tests/live/test_live_drain_latency.py` |
+| 18 | One replica stages every claimed partition in one home stage, one durable write per poll | `test_consumer.py` |
+| 19 | Due groups share commits; a group whose build fails leaves its batch; a refused batch splits into single retries | `test_flush.py`, `test_flush_contract.py`, `test_drain.py` |
+| 14 | Group encoding is prefix-free; row keys sort by (group, partition, offset) | `test_keyspace.py` (mutation-gated) |
 | 15 | The binding patch round-trips every byte value and length | `test_slatedb_patch.py` |
 | 16 | Every produced record is in the lake at least once, under kills, latency and reassignment | `tests/live/` |
 

@@ -18,7 +18,7 @@ topic → one table.
 | ``MILLRACE_TABLE_COLUMNS`` | none | ``name:type,…`` for creating a missing table (complete; no schema evolution) |
 | ``MILLRACE_PARTITION_BY`` | none | partition spec for creating the table: ``col``, ``identity(col)``, ``year/month/day/hour(col)``, ``bucket(col, N)`` |
 | ``MILLRACE_SORT_BY`` | none | sort order for creating the table: ``col [asc|desc] [nulls_first|nulls_last]``, … |
-| ``MILLRACE_STAGE_URL`` | required | staging root (``s3://bucket/prefix``, ``file:///path``, ``memory:///``); one SlateDB per claimed partition at ``<root>/<topic>/<partition>`` |
+| ``MILLRACE_STAGE_URL`` | required | staging root (``s3://bucket/prefix``, ``file:///path``, ``memory:///``); one SlateDB per replica (its home stage) at ``<root>/<topic>/<slot>``, the slot of its smallest claimed partition |
 | ``MILLRACE_FLUSH_BYTES`` | 268435456 (256 MiB) | staged bytes per flush decision: the size lane fires at it and a scan reads at most it (always at least one row) |
 | ``MILLRACE_FLUSH_DEADLINE_S`` | 900 | age lane: a group at least this old with at least 1 MiB staged flushes |
 | ``MILLRACE_SLOW_LANE_DEADLINE_S`` | 21600 | slow lane: any group this old flushes; must be ≥ the flush deadline |

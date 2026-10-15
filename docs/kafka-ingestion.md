@@ -89,22 +89,26 @@ so a sweep costs no I/O.
 
 ## Staging layout
 
-**One SlateDB instance per claimed Kafka partition**, at an
-object-storage path keyed by the partition, not the pod
-(`s3://…/millrace/{topic}/{partition}`). A replica claims partitions the
-way millpond does (its StatefulSet ordinal's share of the topic, derived
-once at start; the assignment *is* the claim) and opening a partition's
-DB is part of claiming it. Staged state follows the partition to its
-next owner. SlateDB is single-writer per path; a contested open fences
-the older writer lazily, at its next durable write, and a fenced
+**One SlateDB instance per replica, its home stage**, at
+`s3://…/millrace/{topic}/{slot}`, the slot of the smallest partition the
+replica claims. A replica claims partitions the way millpond does (its
+StatefulSet ordinal's share of the topic, derived once at start; the
+assignment *is* the claim) and stages every claimed partition's records
+in its home, so a group is one key range per replica, not one per
+partition. At startup it also drains every other existing slot `j` with
+`j % R == ordinal` (the home of a replica a scale-down removed) and closes each once empty; the slot sets
+are disjoint for a fixed `R`, and replica-count changes go through
+zero replicas. SlateDB is single-writer per path; a contested open
+fences the older writer lazily, at its next durable write, and a fenced
 process exits 4. The consumer writes durably on every poll before it
-commits offsets (the staging batch, or a one-put `meta/fence` probe for
-a partition whose records all dropped), so a fenced owner never commits
-offsets against the new one. No volumes anywhere.
+commits offsets (one staging batch for all partitions, or a one-put
+`meta/fence` probe when the poll's records all dropped), so a fenced
+owner never commits offsets against the new one. SSTs are zstd. No
+volumes anywhere.
 
 ```
-rows/<group><offset_ob>   → event payload bytes
-meta/fence                → the consumer's fence probe (not a row)
+rows/<group><partition_u32><offset_ob>   → event payload bytes
+meta/fence                               → the consumer's fence probe (not a row)
 ```
 
 `<group>` is the partition tuple, prefix-free: `arity u8`, then per
@@ -118,7 +122,7 @@ time, staged bytes and a write generation in memory. That is sound
 because **staged state never outlives a process**: at startup each
 replica opens its stages and flushes everything staged before it
 consumes anything new (the startup drain: one sequential read-ahead
-pass per partition, partitions concurrently, flushed window by window;
+pass per stage, stages concurrently, flushed in batches of windows;
 a group that fails is held in the index and its rows stay staged). After that, every write updates the in-memory index
 before it reaches disk, and a group leaves the index only when a
 complete scan of it was flushed and no write touched it since; so a
@@ -179,6 +183,15 @@ Files come out around a fifth of the budget at typical compression;
 **compaction owns final file sizing**. The pod runs at most 4
 decisions at once, so the flush's memory envelope is about 4 × (budget
 + decoded batch + output).
+
+Due groups below the size lane are flushed in **batches**: every due
+group of a stage, packed up to `MILLRACE_FLUSH_BYTES` of staged bytes
+and 512 groups (`max_files_per_commit`), built on one shape read and
+published in one commit (more if the groups fan out past 512 files);
+the batch's rows are deleted in one write batch as the commit lands. A
+group whose build fails leaves the batch; a refused batch (4xx) splits,
+each group retrying alone, which isolates a poisoned group; any other
+failure retries the batch. A size-lane group flushes alone.
 
 A flush of one group: scan → decode → Arrow → sort by the live sort
 spec → one parquet file per partition tuple under the table's LIVE
@@ -279,14 +292,15 @@ replicas with `POD_NAME` from the downward API; assignment is static
 and derived (`p % replica_count == ordinal`, the partition count read
 once at start); there is no consumer group membership and no
 rebalance. An ordinal with no partitions or an unknown topic refuses to
-start. Each claimed partition's SlateDB instance moves with it between
-deploys.
+start. A replica's home stage is keyed by its smallest claimed
+partition, so it stays with the ordinal across deploys.
 
 Startup: create the destination from configuration when it does not
 exist (`millrace/destination.py`: catalog, namespace, and the table in
 ONE atomic request with its partition spec and sort order; an existing
 table is compared and never altered), resolve and pin the incarnation,
-open the claimed stages, **drain everything staged**, then assign and
+open the home stage and the slots to drain, **drain everything staged**,
+then assign and
 consume. `/readyz` is 503 until then; the chart's startup probe must
 cover the worst expected drain. Recommended dev shape:
 `MILLRACE_PARTITION_BY=identity(team_id),day(timestamp)`,
@@ -308,7 +322,7 @@ fleet max). `/healthz` 503s once a halt or fence has latched.
 
 ## Maintenance services: external compaction and GC
 
-Compaction and GC for the per-partition SlateDB instances run as
+Compaction and GC for the staging SlateDB instances run as
 **separate services** deployed beside a millrace deployment, looping
 over every replica's instances across topics. The point is traffic
 placement: compaction reads and rewrites the whole staged dataset over
@@ -413,13 +427,13 @@ cluster.
 2. **SlateDB rates**: put / scan / range-delete at the per-pod slice of
    the event rate, with the real record size; confirm binding-level
    parity for the knobs this design uses (write batches, transactions,
-   scans, range deletes) — plus the two the per-partition topology adds:
+   scans, range deletes) — plus the two the staging topology adds:
    **writer fencing on a contested open**, and **per-instance
    housekeeping cost** at the K-instances-per-pod count a real
    assignment implies.
 3. **Commit rate + deferred-stats mix** against a live catalog: sweeps
-   of ~10⁵ tiny registrations at one commit per (group, window), bounded
-   per commit by the fanout guard; hydrator keeping up.
+   of ~10⁵ tiny registrations batched up to 512 files per commit;
+   hydrator keeping up.
 4. **Startup drain time** against the worst staged backlog a pod may
    restart with; it sizes the startup probe.
 

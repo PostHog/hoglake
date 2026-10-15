@@ -62,7 +62,12 @@ def _logical(group: PartitionTuple) -> tuple[Any, ...]:
     return tuple(out)
 
 
-row_keys = st.builds(RowKey, group=groups, offset=kafka_offsets)
+row_keys = st.builds(
+    RowKey,
+    group=groups,
+    offset=kafka_offsets,
+    partition=st.integers(min_value=0, max_value=2**32 - 1),
+)
 
 
 # -- the partition tuple (group) ----------------------------------------------
@@ -185,28 +190,40 @@ def test_group_label_is_injective_and_ascii(a: PartitionTuple, b: PartitionTuple
 
 
 def test_row_key_golden_vectors():
-    # group ("1",), offset 0: zero maps to 0x8000... (the offset-binary
-    # midpoint), so byte order can be numeric order.
+    # group ("1",), partition 0, offset 0: zero maps to 0x8000... (the
+    # offset-binary midpoint), so byte order can be numeric order.
+    P0 = b"\x00" * 4
     assert encode_row_key(RowKey(group=("1",), offset=0)) == (
-        b"rows/" + b"\x01\x01\x00\x01" + b"1" + b"\x80" + b"\x00" * 7
+        b"rows/" + b"\x01\x01\x00\x01" + b"1" + P0 + b"\x80" + b"\x00" * 7
     )
     # The unpartitioned group and INT64_MIN: arity 0, then zero bytes —
     # the smallest encodable offset sorts before everything.
     assert encode_row_key(RowKey(group=(), offset=INT64_MIN)) == (
-        b"rows/" + b"\x00" + b"\x00" * 8
+        b"rows/" + b"\x00" + P0 + b"\x00" * 8
     )
     # A null component and the all-ones corner.
     assert (
-        encode_row_key(RowKey(group=(None,), offset=INT64_MAX))
-        == b"rows/" + b"\x01\x00" + b"\xff" * 8
+        encode_row_key(RowKey(group=(None,), offset=INT64_MAX, partition=2**32 - 1))
+        == b"rows/" + b"\x01\x00" + b"\xff" * 12
     )
     # Offset -1 sorts just below 0, and its bytes show it; 41 is 0x29.
     assert encode_row_key(RowKey(group=("ab",), offset=-1)) == (
-        b"rows/" + b"\x01\x01\x00\x02ab" + b"\x7f\xff\xff\xff\xff\xff\xff\xff"
+        b"rows/" + b"\x01\x01\x00\x02ab" + P0 + b"\x7f\xff\xff\xff\xff\xff\xff\xff"
     )
-    assert encode_row_key(RowKey(group=("ab",), offset=41)) == (
-        b"rows/" + b"\x01\x01\x00\x02ab" + b"\x80\x00\x00\x00\x00\x00\x00\x29"
+    # The partition is a big-endian u32 ahead of the offset: 511 is 0x1ff.
+    assert encode_row_key(RowKey(group=("ab",), offset=41, partition=511)) == (
+        b"rows/"
+        + b"\x01\x01\x00\x02ab"
+        + b"\x00\x00\x01\xff"
+        + b"\x80\x00\x00\x00\x00\x00\x00\x29"
     )
+
+
+def test_row_key_refuses_a_partition_outside_u32():
+    with pytest.raises(ValueError, match="unsigned 32-bit"):
+        RowKey(("1",), 0, partition=-1)
+    with pytest.raises(ValueError, match="unsigned 32-bit"):
+        RowKey(("1",), 0, partition=2**32)
 
 
 @given(key=row_keys)
@@ -216,10 +233,10 @@ def test_row_key_round_trip(key: RowKey):
 
 @given(keys=st.lists(row_keys, max_size=60))
 def test_row_key_byte_order_is_logical_order(keys: list[RowKey]):
-    # Group, then offset: within a group rows sort by offset, so a capped
-    # scan of the group's slice is an exact offset prefix.
+    # Group, then partition, then offset: one group is one contiguous
+    # range, and within it rows sort by Kafka coordinates.
     by_bytes = sorted(keys, key=encode_row_key)
-    by_value = sorted(keys, key=lambda k: (_logical(k.group), k.offset))
+    by_value = sorted(keys, key=lambda k: (_logical(k.group), k.partition, k.offset))
     assert [encode_row_key(k) for k in by_bytes] == [
         encode_row_key(k) for k in by_value
     ]
@@ -326,12 +343,14 @@ def test_decode_row_key_rejects_strict_prefixes_and_wrong_prefix(key: RowKey):
 
 
 def test_decode_row_key_reports_the_minimum_length():
-    # rows/ (5) + the smallest group (1) + the offset (8).
-    with pytest.raises(ValueError, match="at least 14 bytes, got 5"):
+    # rows/ (5) + the smallest group (1) + the partition (4) + the offset (8).
+    with pytest.raises(ValueError, match="at least 18 bytes, got 5"):
         decode_row_key(encode_row_key(RowKey(("1",), 0))[:5])
-    with pytest.raises(ValueError, match="at least 14 bytes, got 13"):
-        decode_row_key(b"rows/" + b"\x00" + b"\x00" * 7)
-    assert decode_row_key(b"rows/" + b"\x00" + b"\x80" + b"\x00" * 7) == RowKey((), 0)
+    with pytest.raises(ValueError, match="at least 18 bytes, got 17"):
+        decode_row_key(b"rows/" + b"\x00" + b"\x00" * 11)
+    assert decode_row_key(
+        b"rows/" + b"\x00" + b"\x00\x00\x00\x07" + b"\x80" + b"\x00" * 7
+    ) == RowKey((), 0, partition=7)
 
 
 def test_codec_refusals_name_exactly_what_failed():
@@ -398,3 +417,33 @@ def test_decode_group_at_reads_from_its_offset(pos: int):
     decoded, end = keyspace._decode_group_at(data, pos)
     assert decoded == group
     assert data[end:] == b"tail"
+
+
+def test_an_earlier_builds_row_key_asks_for_a_wipe():
+    from millrace.keyspace import STAGE_FORMAT_MESSAGE, StageFormatError, encode_group
+
+    legacy = b"rows/" + encode_group(("7", "684")) + b"\x80" + b"\x00" * 7
+    with pytest.raises(StageFormatError) as refused:
+        decode_row_key(legacy)
+    assert str(refused.value) == STAGE_FORMAT_MESSAGE
+    assert "wipe MILLRACE_STAGE_URL" in STAGE_FORMAT_MESSAGE
+
+
+@pytest.mark.parametrize("extra", [1, 2, 5, 13])
+def test_a_row_key_with_a_wrong_suffix_is_corrupt(extra: int):
+    from millrace.keyspace import encode_group
+
+    key = b"rows/" + encode_group(("7",)) + b"\x00" * (8 + extra)
+    if 8 + extra == 12:
+        return
+    with pytest.raises(ValueError, match=rf"^corrupt row key: {8 + extra} byte"):
+        decode_row_key(key)
+
+
+def test_the_minimum_row_key_length_is_exact():
+    """The smallest v2 key (the empty tuple) decodes; one byte less is
+    refused by the length check."""
+    smallest = b"rows/" + b"\x00" + b"\x00\x00\x00\x01" + b"\x80" + b"\x00" * 7
+    assert decode_row_key(smallest) == RowKey((), 0, partition=1)
+    with pytest.raises(ValueError, match="expected at least 18 bytes, got 17"):
+        decode_row_key(smallest[:-1])

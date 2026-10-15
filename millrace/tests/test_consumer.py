@@ -145,8 +145,13 @@ class JournalingStageManager(StageManager):
     rows-then-offset ordering is checked against the same journal the
     fake consumer writes its commits to."""
 
-    def __init__(self, journal: list[tuple]) -> None:
-        super().__init__("memory:///", "millrace", settings=fast_flush_settings())
+    def __init__(self, journal: list[tuple], slot_prober: Any | None = None) -> None:
+        super().__init__(
+            "memory:///",
+            "millrace",
+            settings=fast_flush_settings(),
+            slot_prober=slot_prober,
+        )
         self.journal = journal
 
     async def open_partition(self, topic: str, partition: int) -> PartitionStage:
@@ -162,8 +167,8 @@ class JournalingStageManager(StageManager):
         return stage
 
 
-def make_manager(journal: list[tuple]) -> StageManager:
-    return JournalingStageManager(journal)
+def make_manager(journal: list[tuple], slot_prober: Any | None = None) -> StageManager:
+    return JournalingStageManager(journal, slot_prober)
 
 
 #: The destination's columns: a top-level ``team_id``, the event time,
@@ -292,8 +297,9 @@ def assert_commits_follow_acks(
     for entry in journal:
         if entry[0] == "ack":
             ack = entry[1]
-            key = (ack.topic, ack.partition)
-            acked_through[key] = max(ack.last_offset, acked_through.get(key, -1))
+            for partition, last in ack.last_offsets.items():
+                key = (ack.topic, partition)
+                acked_through[key] = max(last, acked_through.get(key, -1))
         elif entry[0] == "commit":
             for topic, partition, offset in entry[1]:
                 key = (topic, partition)
@@ -612,29 +618,82 @@ def test_real_consumer_constructs_from_the_config():
 
 
 @component
-async def test_static_start_opens_stages_before_assign(fake_clock):
+async def test_static_start_opens_the_home_stage_before_assign(fake_clock):
+    """The home stage is the slot of the smallest claimed partition; it
+    is opened before any partition is assigned."""
     journal: list[tuple] = []
     manager = make_manager(journal)
-    original_sync = manager.sync_assignment
+    original_claim = manager.claim
 
-    async def spied_sync(claimed):
-        journal.append(("sync_assignment", frozenset(claimed)))
-        return await original_sync(claimed)
+    async def spied_claim(topic, home, slots):
+        journal.append(("claim", home, tuple(slots)))
+        return await original_claim(topic, home, slots)
 
-    manager.sync_assignment = spied_sync  # type: ignore[method-assign]
+    manager.claim = spied_claim  # type: ignore[method-assign]
     fake = FakeConsumer(journal=journal, partitions=3)
     consumer = make_consumer(
         fake, manager, make_config(replica_count=2, ordinal=0), fake_clock
     )
 
     await consumer.start()
-    assert manager.partitions() == (("events", 0), ("events", 2))
+    assert manager.partitions() == (("events", 0),)
+    assert manager.home_stage().partition == 0
     assert (
         "assign",
         [("events", 0, OFFSET_STORED), ("events", 2, OFFSET_STORED)],
     ) in journal
     kinds = [e[0] for e in journal]
-    assert kinds.index("sync_assignment") < kinds.index("assign")
+    assert kinds.index("claim") < kinds.index("assign")
+    await manager.close()
+
+
+@component
+async def test_static_start_opens_existing_slots_of_this_ordinal_for_draining(
+    fake_clock,
+):
+    """Every existing slot ``j`` with ``j % R == ordinal`` is opened (to
+    be drained) beside the home; other ordinals' slots are never
+    touched. Scale-down case: R=2, ordinal 1, slots left by R=8."""
+    journal: list[tuple] = []
+    on_disk = {0, 1, 3, 5, 6, 7}
+    probed: list[int] = []
+
+    async def prober(topic: str, slots: list[int]) -> list[int]:
+        probed.extend(slots)
+        return [s for s in slots if s in on_disk]
+
+    manager = make_manager(journal, slot_prober=prober)
+    fake = FakeConsumer(journal=journal, partitions=4)
+    consumer = make_consumer(
+        fake, manager, make_config(replica_count=2, ordinal=1), fake_clock
+    )
+
+    await consumer.start()
+    assert manager.partitions() == (
+        ("events", 1),
+        ("events", 3),
+        ("events", 5),
+        ("events", 7),
+    )
+    assert manager.home_stage().partition == 1
+    assert [p for t, p in manager.partitions() if manager.is_foreign(t, p)] == [3, 5, 7]
+    # Only this ordinal's slots are probed: 1, 3, 5, … below the limit.
+    assert probed == list(range(1, consumer_mod.STAGE_SLOT_SCAN_LIMIT, 2))
+    await manager.close()
+
+
+@component
+async def test_a_slot_probe_failure_fails_the_start(fake_clock):
+    """A slot holding committed rows must never be skipped as absent."""
+
+    async def broken(topic: str, slots: list[int]) -> list[int]:
+        raise OSError("GetObject: access denied")
+
+    manager = make_manager([], slot_prober=broken)
+    consumer = make_consumer(FakeConsumer(), manager, make_config(), fake_clock)
+    with pytest.raises(OSError, match="access denied"):
+        await consumer.start()
+    assert manager.partitions() == ()
     await manager.close()
 
 
@@ -798,27 +857,26 @@ async def test_end_to_end_staged_rows_and_committed_offsets_cover(fake_clock):
     assert stats.records_staged == 30
     assert stats.records_dropped == {}
 
-    # Every produced row is staged, byte-exact, in (group, offset) key
-    # order; the stats the planner reads reconcile exactly; the groups'
-    # offsets together are exactly the produced range.
-    total_rows = 0
-    for partition, team_count in ((0, 3), (1, 1)):
-        stage = manager.stage("events", partition)
-        seen: list[int] = []
-        for ks in stage.snapshot():
-            rows = await group_rows(stage, ks.group)
-            offsets = [rk.offset for rk, _ in rows]
-            assert offsets == sorted(offsets)
-            for rk, value in rows:
-                assert value == produced[(partition, rk.offset)]
-                assert rk.group == ks.group
-            assert ks.rows == len(rows)
-            assert ks.staged_bytes == sum(len(v) for _, v in rows)
-            total_rows += len(rows)
-            seen.extend(offsets)
-        assert sorted(seen) == list(range(20 if partition == 0 else 10))
-        assert len(stage.snapshot()) == team_count
-    assert total_rows == 30
+    # Every produced row is staged in the ONE home stage, byte-exact, in
+    # (group, partition, offset) key order; the stats the planner reads
+    # reconcile exactly; the groups' coordinates together are exactly
+    # the produced ranges.
+    assert manager.partitions() == (("events", 0),)
+    stage = manager.home_stage()
+    seen: list[tuple[int, int]] = []
+    for ks in stage.snapshot():
+        rows = await group_rows(stage, ks.group)
+        coords = [(rk.partition, rk.offset) for rk, _ in rows]
+        assert coords == sorted(coords)
+        for rk, value in rows:
+            assert value == produced[(rk.partition, rk.offset)]
+            assert rk.group == ks.group
+        assert ks.rows == len(rows)
+        assert ks.staged_bytes == sum(len(v) for _, v in rows)
+        seen.extend(coords)
+    assert sorted(seen) == sorted(produced)
+    # teams 1, 2, 3 from partition 0 and team 7 from partition 1
+    assert len(stage.snapshot()) == 4
 
     gauges = manager.gauges()
     assert gauges.staged_rows == 30
@@ -929,11 +987,11 @@ def _journal_probes(manager: StageManager, journal: list[tuple]) -> None:
 
 @component
 async def test_a_poll_of_only_dropped_records_still_commits(fake_clock):
-    """Nothing to stage is still handled: the offset advances past a
-    poll whose every record was dropped — after a durable fence probe on
-    the partition (no stage_batch, no row, no stats), so a fenced owner
-    would have halted first. A partition that staged rows in the same
-    poll is not probed."""
+    """Nothing to stage is still handled: the offsets advance past a
+    poll whose every record was dropped — after ONE durable fence probe
+    on the home stage (no stage_batch, no row, no stats), so a fenced
+    owner would have halted first. A poll that staged any row is not
+    probed: its batch is the durable write."""
     journal: list[tuple] = []
     manager = make_manager(journal)
     fake = FakeConsumer(journal=journal, partitions=2)
@@ -944,25 +1002,35 @@ async def test_a_poll_of_only_dropped_records_still_commits(fake_clock):
     fake.feed(
         msg(0, 0, key=None, value=b"x"),
         msg(0, 1, key=None, value=None),
-        team_msg(1, 0, team=2),
-        msg(1, 1, key=None, value=b"x"),
+        msg(1, 0, key=None, value=b"x"),
     )
-    await run_steps(consumer, fake)
+    await consumer._step()
 
-    assert_commits_follow_acks(
-        journal, dropped={("events", 0, 0), ("events", 0, 1), ("events", 1, 1)}
-    )
     kinds = [e[0] for e in journal if e[0] in ("ack", "probe", "commit")]
-    assert kinds.index("probe") < kinds.index("commit")
+    assert kinds == ["probe", "commit"]
     assert [e for e in journal if e[0] == "probe"] == [("probe", ("events", 0), 1)]
-    assert [e[1].partition for e in journal if e[0] == "ack"] == [1]
-    assert fake.committed_store == {("events", 0): 2, ("events", 1): 2}
+    assert fake.committed_store == {("events", 0): 2, ("events", 1): 1}
+    stage = manager.home_stage()
+    assert stage.snapshot() == []
+    assert await stage_key_prefixes(stage) == {b"meta/"}
+
+    # A mixed poll: the staged row's batch covers the drop beside it.
+    fake.feed(team_msg(1, 1, team=2), msg(1, 2, key=None, value=b"x"))
+    await run_steps(consumer, fake)
+    assert_commits_follow_acks(
+        journal,
+        dropped={
+            ("events", 0, 0),
+            ("events", 0, 1),
+            ("events", 1, 0),
+            ("events", 1, 2),
+        },
+    )
+    assert [e[0] for e in journal if e[0] == "probe"] == ["probe"]
+    assert fake.committed_store == {("events", 0): 2, ("events", 1): 3}
     stats = consumer.stats()
     assert stats.records_staged == 1
-    assert sum(stats.records_dropped.values()) == 3
-    stage0 = manager.stage("events", 0)
-    assert stage0.snapshot() == []
-    assert await stage_key_prefixes(stage0) == {b"meta/"}
+    assert sum(stats.records_dropped.values()) == 4
     await manager.close()
 
 
@@ -1263,9 +1331,10 @@ async def test_derived_assignment_claims_exactly_the_expected_partitions(
     fake_clock, ordinal, replica_count, partition_count, expected
 ):
     """start() reads the topic's partition count from the metadata
-    ONCE, claims this ordinal's share and nothing else — the stages
-    opened, the OFFSET_STORED assign and the warmup probe all name the
-    same set — and never re-reads the metadata on later polls."""
+    ONCE, claims this ordinal's share and nothing else — the
+    OFFSET_STORED assign and the warmup probe name the same set, the
+    home stage is the smallest of it — and never re-reads the metadata
+    on later polls."""
     journal: list[tuple] = []
     manager = make_manager(journal)
     fake = FakeConsumer(journal=journal, partitions=partition_count)
@@ -1274,7 +1343,7 @@ async def test_derived_assignment_claims_exactly_the_expected_partitions(
 
     await consumer.start()
     claimed = tuple(("events", p) for p in expected)
-    assert manager.partitions() == claimed
+    assert manager.partitions() == (("events", expected[0]),)
     assert ("list_topics", "events", 30.0) in journal
     assert ("assign", [("events", p, OFFSET_STORED) for p in expected]) in journal
     assert ("committed", list(claimed)) in journal
@@ -1364,7 +1433,7 @@ async def test_partition_discovery_rides_out_a_transient_metadata_failure(
         ("list_topics", "events", 30.0),
     ]
     assert sleeper.calls == [consumer_mod._METADATA_RETRY_S]
-    assert manager.partitions() == (("events", 0), ("events", 1))
+    assert manager.partitions() == (("events", 0),)
     assert ("assign", [("events", 0, OFFSET_STORED), ("events", 1, OFFSET_STORED)]) in (
         journal
     )
@@ -1495,7 +1564,7 @@ async def test_a_failed_batch_commits_nothing(fake_clock):
 @component
 async def test_a_fenced_partition_closes_locally_and_halts_distinctly(fake_clock):
     """A REAL contested open fences a live consumer. A second writer on
-    partition 0's path (an EKS rollout double-assigning the ordinal —
+    the home stage's path (an EKS rollout double-assigning the ordinal —
     the open itself succeeds; the fencing is lazy, pinned by
     tests/test_slatedb_parity.py) makes this pod's next staged write
     raise ``Error.Closed(FENCED)``. The loop catches it, closes the
@@ -1523,17 +1592,13 @@ async def test_a_fenced_partition_closes_locally_and_halts_distinctly(fake_clock
         # The fenced stage is closed locally — the manager no longer
         # holds it, so this process cannot touch the contested path
         # again (the anti-flap invariant).
-        assert manager.partitions() == (("events", 1),)
-        # NOTHING committed past the fenced batch — not even partition
-        # 1's sibling batch, which IS durable (its rows replay
-        # idempotently): offsets move only after EVERY ack.
+        assert manager.partitions() == ()
+        # NOTHING committed past the fenced batch, on either partition.
         assert fake.committed_store == {("events", 0): 1, ("events", 1): 1}
         assert consumer.committed_offsets() == {
             ("events", 0): 1,
             ("events", 1): 1,
         }
-        stage1 = manager.stage("events", 1)
-        assert await team_offsets(stage1, 2) == [0, 1]
     finally:
         await new_owner.shutdown()
     await manager.close()
@@ -1604,58 +1669,24 @@ async def test_a_non_fenced_closed_stage_error_is_not_the_fenced_path(fake_clock
 
 
 @component
-async def test_partitions_stage_concurrently_within_one_poll(fake_clock):
-    """One poll stages its partitions CONCURRENTLY — the per-partition
-    WAL writes and durability waits overlap — and the single commit
-    still follows EVERY ack (the invariant is "all acks before the
-    commit", not "acks in sequence"; serial per-partition waits would
-    cap the pod at one remote round trip per partition per poll).
-
-    The gate makes overlap deterministic: each partition's spied
-    stage_batch records its start and then waits on a gate that opens
-    only once BOTH partitions are in flight. Sequential staging can
-    never open the gate (partition 1 cannot start before partition 0
-    returns) and the step times out instead of passing.
-    """
+async def test_one_poll_is_one_durable_write_for_every_partition(fake_clock):
+    """One poll stages every partition's records in ONE home-stage
+    batch (one WAL write and durability wait per poll, not one per
+    partition), and the single commit follows that ack."""
     journal: list[tuple] = []
     manager = make_manager(journal)
     fake = FakeConsumer(journal=journal, partitions=2)
     consumer = make_consumer(fake, manager, make_config(), fake_clock)
     await consumer.start()
 
-    gate = asyncio.Event()
-    in_flight: set[tuple[str, int]] = set()
-    order: list[tuple[str, tuple[str, int]]] = []
-
-    def make_spy(key, original):
-        async def spy(records, *, now_us):
-            order.append(("start", key))
-            in_flight.add(key)
-            if len(in_flight) == 2:
-                gate.set()
-            await asyncio.wait_for(gate.wait(), timeout=5)
-            ack = await original(records, now_us=now_us)
-            order.append(("end", key))
-            return ack
-
-        return spy
-
-    for key in (("events", 0), ("events", 1)):
-        stage = manager.stage(*key)
-        stage.stage_batch = make_spy(key, stage.stage_batch)  # type: ignore[method-assign]
-
-    fake.feed(team_msg(0, 0, team=1), team_msg(1, 0, team=2))
+    fake.feed(team_msg(0, 0, team=1), team_msg(1, 0, team=2), team_msg(1, 1, team=1))
     await consumer._step()
 
-    # Both partitions' batches were in flight together: every start
-    # precedes the first end.
-    kinds = [kind for kind, _ in order]
-    assert kinds == ["start", "start", "end", "end"]
-    assert {key for kind, key in order if kind == "start"} == {
-        ("events", 0),
-        ("events", 1),
-    }
-    assert fake.committed_store == {("events", 0): 1, ("events", 1): 1}
+    acks = [e[1] for e in journal if e[0] == "ack"]
+    assert len(acks) == 1
+    assert acks[0].rows == 3
+    assert dict(acks[0].last_offsets) == {0: 0, 1: 1}
+    assert fake.committed_store == {("events", 0): 1, ("events", 1): 2}
     assert_commits_follow_acks(journal)
     await manager.close()
 

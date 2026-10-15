@@ -1,7 +1,7 @@
-"""External maintenance for millrace's per-partition SlateDB staging instances.
+"""External maintenance for millrace's SlateDB staging instances (one per slot).
 
 Deployed beside a millrace fleet (its own process, its own pod), it loops
-over every per-partition SlateDB instance under the staging root, all
+over every SlateDB staging instance under the staging root, all
 topics and replicas, discovered by prefix listing. Ingest pods always run
 with the writer-internal GC off (stage.py ``build_slatedb_settings``), so
 this service owns collection and the ingest pods carry no LIST/DELETE
@@ -94,7 +94,7 @@ Lister = Callable[[], Iterable[str]]
 
 @dataclass(frozen=True, slots=True)
 class DiscoveredDb:
-    """One per-partition SlateDB instance under the staging root.
+    """One SlateDB staging instance (one slot) under the staging root.
 
     ``path`` is exactly what :class:`AdminBuilder` takes; ``topic`` and
     ``partition`` are parsed from the ``{base}/{topic}/{partition}`` layout
@@ -107,7 +107,7 @@ class DiscoveredDb:
 
 
 def parse_db_paths(keys: Iterable[str], base_path: str) -> list[DiscoveredDb]:
-    """Pure: pick per-partition DB roots out of an object listing.
+    """Pure: pick per-slot DB roots out of an object listing.
 
     A directory is a SlateDB instance iff it holds a manifest object, i.e. a
     key of the shape ``{base}/{topic}/{partition}/manifest/<id>.manifest``
@@ -178,7 +178,7 @@ async def discover_databases(
     *,
     lister: Lister | None = None,
 ) -> list[DiscoveredDb]:
-    """Enumerate every per-partition SlateDB DB under ``base_path``.
+    """Enumerate every per-slot SlateDB DB under ``base_path``.
 
     ``lister`` is the test seam (discovery is a prefix listing; the slatedb
     binding exposes no object-store listing, so production defaults are an
@@ -381,7 +381,7 @@ class MaintenanceStats:
 
 
 class MaintenanceService:
-    """The GC + debt-monitoring loop over every discovered per-partition DB.
+    """The GC + debt-monitoring loop over every discovered staging DB.
 
     One sweep: discover (a full listing at most once per
     ``discovery_interval_s``; the cached set in between — module
