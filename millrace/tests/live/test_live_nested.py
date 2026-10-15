@@ -97,9 +97,16 @@ async def test_nested_columns_flush_under_a_struct_leaf_spec(
         # The real server accepted every commit: nothing halted, nothing
         # dropped, nothing left staged.
         assert pipe.runner.halted is None, f"halted: {pipe.runner.halted}"
+        # A decision is counted once its landed commit's rows are settled
+        # (a durability wait behind the stage latency), so the lake can show
+        # the rows before the counter moves.
+        await livekit.wait_until_async(
+            lambda: pipe.flusher.stats().decisions_committed >= 1,
+            30,
+            desc=lambda: f"a committed decision counted ({pipe.flusher.stats()})",
+        )
         stats = pipe.flusher.stats()
         assert stats.records_dropped == {}
-        assert stats.decisions_committed >= 1
         assert stats.orphaned_uploads == 0
         await livekit.wait_until_async(
             lambda: pipe.stages.gauges().staged_groups == 0,
