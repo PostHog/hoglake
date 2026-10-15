@@ -176,8 +176,19 @@ async def test_two_replicas_split_the_topic_by_ordinal(
         assert set(pipe_a.consumer.committed_offsets()) == {(topic.name, 0)}
         assert set(pipe_b.consumer.committed_offsets()) == {(topic.name, 1)}
         assert pipe_a.flusher is not None and pipe_b.flusher is not None
-        assert pipe_a.flusher.stats().decisions_committed > 0
-        assert pipe_b.flusher.stats().decisions_committed > 0
+        flusher_a, flusher_b = pipe_a.flusher, pipe_b.flusher
+        # A decision is counted once its rows are settled, after the lake
+        # already shows them.
+        await livekit.wait_until_async(
+            lambda: (
+                flusher_a.stats().decisions_committed > 0
+                and flusher_b.stats().decisions_committed > 0
+            ),
+            30,
+            desc=lambda: (
+                f"decisions counted ({flusher_a.stats()}, {flusher_b.stats()})"
+            ),
+        )
     finally:
         await pipe_a.stop()
         await pipe_b.stop()
