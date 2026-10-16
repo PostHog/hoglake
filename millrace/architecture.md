@@ -399,7 +399,9 @@ Constants (fields of `config.Config`, overridable in-process by tests):
 `flush_concurrency` 2, `flush_sweep_s` 1, `consume_batch_size` 65536,
 `consume_batch_max_bytes` 256 MiB, `poll_timeout_ms` 500, and
 `SlateDbConfig` (256 MiB unflushed per instance, L0 stall 8, 128 + 128
-MiB shared cache). Also read: `HOGLAKE_URL` (required),
+MiB shared cache), and the embedded compactor's scheduler: merges of
+as few as 2 sorted runs (SlateDB default 4) with 2 subcompactions
+(default 4), so deleted rows are reclaimed (`stage.build_slatedb_settings`). Also read: `HOGLAKE_URL` (required),
 `HOGLAKE_S3_*`, and the `AWS_*` environment for an `s3://` stage.
 
 Destination creation (`destination.py`) is described in the README.
@@ -412,8 +414,14 @@ sweeps a bounded page per interval, runs `Admin.run_gc_once` and
 exports the L0 SST count per DB. Writers never run GC (it is disabled
 in `stage.build_slatedb_settings`); the service keeps that LIST/DELETE
 work off the ingest pods. It does not compact: the binding has no
-external compactor, so every writer keeps its embedded one. Its knobs
-are in its module docstring.
+external compactor, so every writer keeps its embedded one (it can
+only submit a compaction for the writer to run). The writer's
+scheduler is tuned for a queue: SlateDB drops a deleted row's value
+only in a merge that includes its tombstone, and the tombstone only in
+a merge into the oldest sorted run, so at the default 4-run minimum a
+delete-dominated stage never merged its oldest runs and grew to ~100
+GiB of dead rows; at 2 the oldest pair merges whenever within 4x. Its
+knobs are in its module docstring.
 
 ## 9. Observability
 

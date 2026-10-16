@@ -62,6 +62,36 @@ class TestPureFold:
         samples = _samples(families)
         assert samples[("millrace_slatedb_l0_ssts_per_segment_max", ())] == 5
 
+    def test_compactor_families_fold_by_meaning(self) -> None:
+        """Bytes and running merges sum over instances and workers (the
+        worker label is dropped); running merges are a gauge though
+        SlateDB emits an up-down counter; the newest finish is the max."""
+        worker = (("worker_id", "w1"),)
+        families = slatedb_families(
+            [
+                [
+                    _counter("slatedb.compactor.bytes_compacted", 10, worker),
+                    _counter("slatedb.compactor.running_compactions", 1, worker),
+                    _gauge("slatedb.compactor.total_bytes_being_compacted", 100),
+                    _gauge("slatedb.compactor.last_compaction_timestamp_sec", 50),
+                ],
+                [
+                    _counter("slatedb.compactor.bytes_compacted", 5, worker),
+                    _counter("slatedb.compactor.running_compactions", 2, worker),
+                    _gauge("slatedb.compactor.total_bytes_being_compacted", 7),
+                    _gauge("slatedb.compactor.last_compaction_timestamp_sec", 90),
+                ],
+            ]
+        )
+        samples = _samples(families)
+        assert samples[("millrace_slatedb_compacted_bytes_total", ())] == 15
+        assert samples[("millrace_slatedb_running_compactions", ())] == 3
+        assert samples[("millrace_slatedb_bytes_being_compacted", ())] == 107
+        assert samples[("millrace_slatedb_last_compaction_timestamp_seconds", ())] == 90
+        kinds = {family.name: family.type for family in families}
+        assert kinds["millrace_slatedb_running_compactions"] == "gauge"
+        assert kinds["millrace_slatedb_compacted_bytes"] == "counter"
+
     def test_labeled_families_fold_per_label_values(self) -> None:
         families = slatedb_families(
             [

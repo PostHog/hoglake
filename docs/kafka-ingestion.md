@@ -315,7 +315,11 @@ SlateDB internals bridged from `DefaultMetricsRecorder` and summed over
 the pod's instances (per-instance series would be a cardinality trap):
 `millrace_slatedb_l0_sst_files`, `…_l0_ssts_per_segment_max`, the WAL
 flush series, `…_write_stalls_total`, `…_l0_stalls_total{type}`,
-`…_memtable_bytes`, `…_block_cache_accesses_total{entry_kind,result}`.
+`…_memtable_bytes`, `…_block_cache_accesses_total{entry_kind,result}`,
+and the embedded compactors' `…_compacted_bytes_total`,
+`…_running_compactions`, `…_bytes_being_compacted` and
+`…_last_compaction_timestamp_seconds` (whether a merge of the old
+runs, the one that reclaims deleted rows, started and finished).
 Per-DB compaction debt comes from the maintenance service
 (`millrace_maintenance_compaction_l0_ssts{topic,partition}` plus the
 fleet max). `/healthz` 503s once a halt or fence has latched.

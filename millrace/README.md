@@ -87,7 +87,9 @@ On start each replica opens its home stage (the slot of its smallest
 claimed partition) plus every other existing slot `j` with `j % R ==
 ordinal` (the home of a replica removed by a scale-down), and **flushes everything staged before it
 consumes anything new**. Drained foreign slots are closed and left in
-place. Change the replica count with the fleet scaled to zero: a
+place (their compactor may start a merge of the slot's old runs on
+every open and abort it at close: wasted reads, and the aborted job
+holds back that slot's GC until a later open finishes it). Change the replica count with the fleet scaled to zero: a
 mixed-`R` fleet is unsupported. Staged state therefore never outlives
 a process; that is what lets group sizes and ages live in memory only.
 A crash mid-drain drains again on restart (windows that already landed
@@ -192,7 +194,11 @@ each per pod. The writer's embedded GC is always off: the maintenance
 service (`python -m millrace.maintenance`, one per staging root) owns
 collection for every pipeline, which keeps LIST/DELETE traffic off the
 ingest pods; it also exports L0 depth per DB. The embedded compactor is
-never disabled (that stalls memtable flushes, parity-pinned).
+never disabled (that stalls memtable flushes, parity-pinned). Its
+size-tiered scheduler merges as few as 2 sorted runs (default 4): a
+deleted row is reclaimed only when a merge reaches the run holding its
+value (its tombstone, only in a merge into the oldest run), and at 4
+delete-dominated stages never merged their oldest runs.
 
 Pod memory, in terms:
 

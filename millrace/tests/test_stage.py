@@ -1040,12 +1040,17 @@ async def test_open_store_refuses_inconsistent_arguments(memory_store):
 
 def test_build_slatedb_settings_shape():
     """GC always off (the maintenance service owns it), SSTs zstd, the
-    memory and L0 knobs applied, the compactor never touched."""
+    memory and L0 knobs applied, the compactor on with a 2-run minimum
+    and 2 subcompactions."""
     doc = json.loads(
         build_slatedb_settings(max_unflushed_bytes=1234, l0_max_ssts=5).to_json_string()
     )
     assert doc["garbage_collector_options"] is None
     assert doc["compression_codec"] == "Zstd"
+    assert doc["compactor_options"]["scheduler_options"] == {
+        "min_compaction_sources": "2"
+    }
+    assert doc["compactor_options"]["worker"]["max_subcompactions"] == 2
     assert doc["max_unflushed_bytes"] == 1234
     assert doc["l0_max_ssts"] == 5
     assert doc["compactor_options"] is not None
