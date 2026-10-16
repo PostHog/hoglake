@@ -887,7 +887,10 @@ def build_flush_plan(
         rows: list[int] = part.column(_ROW_INDEX).to_pylist()
         part = part.drop_columns([_ROW_INDEX])
         sink = pa.BufferOutputStream()
-        pq.write_table(part, sink)
+        # zstd at compaction's level (ParquetRewriter.DEFAULT_ZSTD_LEVEL):
+        # pyarrow's default snappy left files ~3x larger than compaction's
+        # rewrite of them, in upload bytes and in the spool.
+        pq.write_table(part, sink, compression="zstd", compression_level=3)
         del part
         raw = sink.getvalue()
         with pq.ParquetFile(pa.BufferReader(raw)) as parquet:

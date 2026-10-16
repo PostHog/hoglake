@@ -823,6 +823,20 @@ class TestPlanBuilder:
         assert "column_stats" not in f_small  # deferred: the hydrator backfills
         assert f_small["record_count"] == 1 and f_small["file_size_bytes"] > 0
 
+    def test_files_are_zstd_compressed(self) -> None:
+        """Compaction rewrites at zstd; writing snappy left millrace's
+        files ~3x larger than their rewrite."""
+        records = [(keyspace.RowKey(team_group(7), 0), event_payload(7, JAN_US))]
+        (commit,) = plan_for(records, info_for()).commits
+        (upload,) = commit.uploads
+        meta = pq.ParquetFile(pa.BufferReader(upload.body)).metadata
+        codecs = {
+            meta.row_group(g).column(c).compression
+            for g in range(meta.num_row_groups)
+            for c in range(meta.num_columns)
+        }
+        assert codecs == {"ZSTD"}
+
 
 class TestBatchBuild:
     """The Arrow batch build raises on encoder drift (coercion is total)."""
