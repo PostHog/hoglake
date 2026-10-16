@@ -58,7 +58,7 @@ def test_minimal_env_yields_the_documented_defaults():
     # Constants (no environment variable).
     assert cfg.min_flush_bytes == 1024 * 1024
     assert cfg.max_files_per_commit == 512
-    assert cfg.flush_concurrency == 4
+    assert cfg.flush_concurrency == 2
     assert cfg.flush_sweep_s == 1.0
     assert cfg.consume_batch_size == 65536
     assert cfg.consume_batch_max_bytes == 256 * 1024 * 1024

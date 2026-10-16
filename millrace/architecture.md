@@ -209,7 +209,7 @@ scan its groups, at most 8 at once, each capped at its indexed
 estimate plus an even share of the budget the batch leaves unused (so
 the caps sum to `flush_bytes`; a group under 1 MiB scans with 64 KiB
 read-ahead), then `HoglakeFlusher.flush_batch`. A process-wide semaphore
-(`flush_concurrency`, 4) bounds the decisions running at once. A
+(`flush_concurrency`, 2) bounds the decisions running at once. A
 sweep reads only memory, in place: the index is not copied.
 
 **Due** (`planner.py:decide`, first match):
@@ -396,7 +396,7 @@ commit landed before the crash land again (duplicates).
 
 Constants (fields of `config.Config`, overridable in-process by tests):
 `min_flush_bytes` 1 MiB, `max_files_per_commit` 512,
-`flush_concurrency` 4, `flush_sweep_s` 1, `consume_batch_size` 65536,
+`flush_concurrency` 2, `flush_sweep_s` 1, `consume_batch_size` 65536,
 `consume_batch_max_bytes` 256 MiB, `poll_timeout_ms` 500, and
 `SlateDbConfig` (256 MiB unflushed per instance, L0 stall 8, 128 + 128
 MiB shared cache). Also read: `HOGLAKE_URL` (required),
