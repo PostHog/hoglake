@@ -1298,6 +1298,16 @@ class HoglakeFlusher:
             _spec_sort_keys(info)
         except FlushError as e:
             raise FlushStartupError(str(e)) from e
+        # Build the shared upload client now, on one thread: pyhoglake
+        # builds it unlocked on first use, and the first two decisions
+        # would race to build it. Best-effort: without S3 configuration
+        # the first upload refuses exactly as before.
+        put_client_fn = getattr(client, "_put_client", None)
+        if put_client_fn is not None:
+            try:
+                put_client_fn(flusher._upload_pool)
+            except Exception:  # noqa: BLE001 - the first upload reports it
+                log.debug("could not build the upload client at startup")
         # Retry-After is read off raw responses (pyhoglake drops headers).
         # Best-effort: without it the exponential curve applies.
         try:
@@ -1335,6 +1345,11 @@ class HoglakeFlusher:
             raise ValueError(f"io_workers must be >= 1, got {io_workers}")
         self._client = client
         self._cfg = cfg
+        # The shared upload client's pool: one decision's fan-out times
+        # the decisions in flight, one size for the process (_upload).
+        self._upload_pool = (
+            resolve_concurrency(cfg.max_files_per_commit, None) * cfg.flush_concurrency
+        )
         self._now_us = now_us
         self._sleep = sleep
         self._monotonic = monotonic
@@ -1593,14 +1608,12 @@ class HoglakeFlusher:
             )
         fanout = resolve_concurrency(len(uploads), None)
         # One pool for every decision in flight, the same size on every
-        # call: sized per call it overflowed (2 decisions x 64 uploads on
-        # a 64-connection pool, a fresh TLS handshake per discarded
-        # connection), and a wider request rebuilds the shared client and
-        # closes the old one under a concurrent decision's uploads.
-        put_client = put_client_fn(
-            resolve_concurrency(self._cfg.max_files_per_commit, None)
-            * self._cfg.flush_concurrency
-        )
+        # call (built once, in resolve): sized per call it overflowed (2
+        # decisions x 64 uploads on a 64-connection pool, a fresh TLS
+        # handshake per discarded connection), and a wider request
+        # rebuilt the shared client and closed the old one under a
+        # concurrent decision's uploads (costing them a retry).
+        put_client = put_client_fn(self._upload_pool)
         widen_io_threads_for(list(uploads), put_client, fanout)
         completed: list[str] = []
         try:

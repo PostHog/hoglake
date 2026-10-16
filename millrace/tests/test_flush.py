@@ -1474,40 +1474,47 @@ class TestOrphansAndDrops:
 
     async def test_upload_pool_is_sized_for_every_decision_in_flight(
         self,
+        monkeypatch: pytest.MonkeyPatch,
         httpx_mock: Any,
         stage_factory: Any,
         fake_clock: Any,
         flusher_factory: Any,
         store: FakeObjectStore,
     ) -> None:
-        """The shared upload client is asked for ONE size whatever the
-        decision's file count: fan-out x concurrent decisions. Sized per
+        """The shared upload client is built once, at resolve, and every
+        upload asks for that same size whatever its file count: at least
+        one decision's fan-out times the decisions in flight. Sized per
         call, two decisions overflowed its pool, and a wider request
         rebuilt the client under the other decision's uploads."""
+        from pyhoglake import HoglakeClient
         from pyhoglake.upload import resolve_concurrency
 
-        stage = await stage_factory()
-        await staged(stage, fake_clock, TEAM, [(0, JAN_US), (1, DEC_US)])
-        script_options(httpx_mock)
-        capture = CommitCapture(httpx_mock, [commit_ok(50)])
-        cfg = make_config()
-        flusher = flusher_factory(store=store, cfg=cfg)
         asked: list[int] = []
-        real = flusher._client._put_client
+        real = HoglakeClient._put_client
 
-        def recording(connections: int = 1) -> Any:
+        def recording(client: Any, connections: int = 1) -> Any:
             asked.append(connections)
-            return real(connections)
+            return real(client, connections)
 
-        flusher._client._put_client = recording
+        cfg = make_config()
+        monkeypatch.setattr(HoglakeClient, "_put_client", recording)
+        flusher = flusher_factory(store=store, cfg=cfg)
+        assert len(asked) == 1  # built at resolve, before any upload
+        stage = await stage_factory()
+        await staged(stage, fake_clock, TEAM, [(0, JAN_US)])
+        await staged(stage, fake_clock, TEAM + 1, [(1, JAN_US), (2, DEC_US)])
+        script_options(httpx_mock)
+        capture = CommitCapture(httpx_mock, [commit_ok(50), commit_ok(51)])
+        for team in (TEAM, TEAM + 1):
+            report = await flush_group(flusher, stage, team_group(team), "size")
+            assert report.outcome == "committed"
 
-        report = await flush_group(flusher, stage, team_group(TEAM), "size")
-
-        assert report.outcome == "committed"
-        assert len(capture.payloads[0]["appends"][0]["files"]) == 2
-        assert asked == [
-            resolve_concurrency(cfg.max_files_per_commit, None) * cfg.flush_concurrency
-        ]
+        files = [len(p["appends"][0]["files"]) for p in capture.payloads]
+        assert files == [1, 2]
+        assert len(set(asked)) == 1 and len(asked) == 3
+        assert asked[0] >= cfg.flush_concurrency * resolve_concurrency(
+            cfg.max_files_per_commit, None
+        )
 
     async def test_bad_records_are_dropped_counted_and_logged_good_rows_flush(
         self,

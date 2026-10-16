@@ -465,7 +465,11 @@ def build_slatedb_settings(*, max_unflushed_bytes: int, l0_max_ssts: int) -> Set
     delete-dominated runs never reach: the oldest two runs, holding most
     deleted values, were never merged and stages grew to ~100 GiB of dead
     rows that every scan reads through. At 2, the oldest pair merges
-    whenever it is within 4x."""
+    whenever it is within 4x.
+
+    The compactor runs on the writer's runtime in the ingest pod, beside
+    the consumer and the flush builds: 2 subcompactions per merge
+    (default 4) keep a large merge to about half the pod's CPU."""
     if max_unflushed_bytes < 1:
         raise ValueError(f"max_unflushed_bytes must be >= 1, got {max_unflushed_bytes}")
     if l0_max_ssts < 1:
@@ -476,6 +480,7 @@ def build_slatedb_settings(*, max_unflushed_bytes: int, l0_max_ssts: int) -> Set
     settings.set("garbage_collector_options", "null")
     settings.set("compression_codec", '"Zstd"')
     settings.set("compactor_options.scheduler_options.min_compaction_sources", '"2"')
+    settings.set("compactor_options.worker.max_subcompactions", "2")
     return settings
 
 

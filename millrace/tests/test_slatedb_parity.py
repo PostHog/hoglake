@@ -1138,3 +1138,106 @@ async def test_run_gc_once_on_missing_or_foreign_path_is_a_silent_noop(tmp_path)
     assert (junk_path / "data" / "part-0.parquet").read_bytes() == b"PAR1"  # untouched
     with pytest.raises(SlateError.Data, match="invalid DB state"):
         await foreign.delete_db(True)
+
+
+def _production_settings() -> Settings:
+    """``stage.build_slatedb_settings`` with fast WAL and compactor
+    tickers, so a test sees the production scheduler act in seconds."""
+    from millrace.stage import build_slatedb_settings
+
+    s = build_slatedb_settings(max_unflushed_bytes=1 << 28, l0_max_ssts=8)
+    s.set("flush_interval", '"5ms"')
+    s.set("manifest_poll_interval", '"100ms"')
+    s.set("compactor_options.poll_interval", '"100ms"')
+    return s
+
+
+@pytest.mark.integration
+async def test_production_compactor_merges_two_l0_ssts(tmp_path):
+    """(0.17.0) With millrace's settings (``min_compaction_sources`` 2) the
+    writer's compactor merges L0 at 2 SSTs; at the default (4) two L0
+    SSTs stay in L0 (the external-compaction test above needs 4)."""
+    from millrace.slatedb_metrics import _WHITELIST, snapshot_recorder
+
+    store = ObjectStore.resolve("file:///")
+    path = str(tmp_path / "db")
+    recorder = DefaultMetricsRecorder()
+    builder = DbBuilder(path, store)
+    builder.with_settings(_production_settings())
+    builder.with_metrics_recorder(recorder)
+    db = await builder.build()
+    admin = AdminBuilder(path, store).build()
+    for i in range(2):
+        await db.put(f"k{i}".encode(), b"v" * 100)
+        await _flush_memtable(db)
+
+    async def drained() -> bool:
+        manifest = await admin.read_manifest(None)
+        return len(manifest.l0) == 0 and len(manifest.compacted) == 1
+
+    await _await_until(drained)
+    # The bridged compactor names are the ones this binding emits.
+    emitted = {m.name: m.value for m in snapshot_recorder(recorder)}
+    compactor = {n for n in _WHITELIST if n.startswith("slatedb.compactor.")}
+    assert compactor <= emitted.keys()
+    assert emitted["slatedb.compactor.bytes_compacted"] > 0
+    await db.shutdown()
+
+
+@pytest.mark.integration
+async def test_production_compactor_reclaims_deleted_rows(tmp_path):
+    """(0.17.0) The queue's shape: a sorted run of rows, then a newer run
+    of fresh rows plus tombstones for every old row. With millrace's
+    settings the two runs (within 4x) merge into the oldest, which drops
+    the deleted values AND their tombstones: one run, about the size of
+    the live rows. At the default (4 sources) two runs never merge and
+    the deleted values stay on disk."""
+    store = ObjectStore.resolve("file:///")
+    path = str(tmp_path / "db")
+    db = await _build(path, store, _production_settings())
+    admin = AdminBuilder(path, store).build()
+    old = [f"old{i:04d}".encode() for i in range(200)]
+    new = [f"new{i:04d}".encode() for i in range(200)]
+
+    for half in (old[:100], old[100:]):
+        batch = WriteBatch()
+        for key in half:
+            batch.put(key, os.urandom(1000))  # incompressible under zstd
+        await db.write(batch)
+        await _flush_memtable(db)
+
+    async def one_run() -> bool:
+        manifest = await admin.read_manifest(None)
+        return len(manifest.l0) == 0 and len(manifest.compacted) == 1
+
+    await _await_until(one_run)
+    (first,) = (await admin.read_manifest(None)).compacted
+    assert first.estimated_size_bytes > 150_000
+
+    first_ssts = [view.id for view in first.sst_views]
+    for fresh, deleted in ((new[:100], old[:100]), (new[100:], old[100:])):
+        batch = WriteBatch()
+        for key in fresh:
+            batch.put(key, os.urandom(1000))
+        for key in deleted:
+            batch.delete(key)
+        await db.write(batch)
+        await _flush_memtable(db)
+
+    async def reclaimed() -> bool:
+        # The merge's destination keeps the oldest run's id; its SSTs
+        # are new.
+        manifest = await admin.read_manifest(None)
+        return (
+            len(manifest.l0) == 0
+            and len(manifest.compacted) == 1
+            and [view.id for view in manifest.compacted[0].sst_views] != first_ssts
+        )
+
+    await _await_until(reclaimed)
+    (run,) = (await admin.read_manifest(None)).compacted
+    # live rows only: the 200 old values and their tombstones are gone
+    assert run.estimated_size_bytes < 1.5 * first.estimated_size_bytes
+    assert await db.get(old[0]) is None
+    assert await db.get(new[0]) is not None
+    await db.shutdown()

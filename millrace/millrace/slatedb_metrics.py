@@ -34,6 +34,13 @@ The whitelist is introspected from slatedb 0.17.0's actual emission
 - Block cache: ``slatedb.db_cache.access_count`` (counter with
   ``entry_kind`` × ``result`` labels; the hit rate is
   ``result="hit"`` over the sum, PromQL-side).
+- Embedded compactor: ``slatedb.compactor.bytes_compacted`` (counter,
+  per-worker ``worker_id`` label dropped), ``running_compactions``
+  (up-down counter, exported as a gauge), ``total_bytes_being_compacted``
+  (gauge) and ``last_compaction_timestamp_sec`` (gauge, the pod's
+  newest). Whether a merge started, is running and finished: a merge
+  into the oldest sorted run is what reclaims deleted rows
+  (``stage.build_slatedb_settings``).
 
 Anything SlateDB emits that is NOT whitelisted is ignored — a newer
 SlateDB adding or renaming metrics can never break a scrape
@@ -112,6 +119,9 @@ class _Rule:
     keep_labels: tuple[str, ...] = ()
     # How per-instance values fold into the pod's single series.
     aggregate: Literal["sum", "max"] = "sum"
+    # Export as a gauge whatever SlateDB's kind (an up-down counter is
+    # read as a counter but goes down).
+    gauge: bool = False
 
 
 _WHITELIST: Final[dict[str, _Rule]] = {
@@ -161,6 +171,25 @@ _WHITELIST: Final[dict[str, _Rule]] = {
         "entry kind and result (the hit rate is hit/(hit+miss) in PromQL)",
         keep_labels=("entry_kind", "result"),
     ),
+    "slatedb.compactor.bytes_compacted": _Rule(
+        "millrace_slatedb_compacted_bytes_total",
+        "Bytes written by the embedded compactors across the pod's staging instances",
+    ),
+    "slatedb.compactor.running_compactions": _Rule(
+        "millrace_slatedb_running_compactions",
+        "Compactions running across the pod's staging instances",
+        gauge=True,
+    ),
+    "slatedb.compactor.total_bytes_being_compacted": _Rule(
+        "millrace_slatedb_bytes_being_compacted",
+        "Input bytes of the compactions in flight across the pod's staging instances",
+    ),
+    "slatedb.compactor.last_compaction_timestamp_sec": _Rule(
+        "millrace_slatedb_last_compaction_timestamp_seconds",
+        "Unix time of the newest finished compaction across the pod's staging "
+        "instances",
+        aggregate="max",
+    ),
 }
 
 
@@ -196,7 +225,9 @@ def slatedb_families(
         # instances is a sum, except depth-style gauges whose pod signal
         # is the worst instance (max).
         family_type: Any = (
-            CounterMetricFamily if kinds[name] == "counter" else GaugeMetricFamily
+            CounterMetricFamily
+            if kinds[name] == "counter" and not rule.gauge
+            else GaugeMetricFamily
         )
         family = family_type(rule.family, rule.doc, labels=list(rule.keep_labels))
         for label_values, values in sorted(per_labels.items()):
