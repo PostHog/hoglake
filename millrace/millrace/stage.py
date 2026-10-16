@@ -450,12 +450,22 @@ def build_slatedb_settings(*, max_unflushed_bytes: int, l0_max_ssts: int) -> Set
     The writer's embedded GC is always off: the maintenance service
     (maintenance.py) owns collection for every pipeline, which keeps
     LIST/DELETE traffic off the ingest pods. The embedded compactor is
-    never touched: disabling it stalls memtable flushes at
+    never disabled: that stalls memtable flushes at
     ``l0_max_ssts`` with nothing to drain them.
 
     SSTs are zstd-compressed: staged rows are raw event JSON, which
     compresses several-fold, and every staged byte is written, compacted
-    and re-read through the object store."""
+    and re-read through the object store.
+
+    The size-tiered scheduler merges as few as 2 sorted runs (default 4).
+    Every staged row is eventually deleted. A deleted value is dropped only
+    by a compaction that includes both it and its tombstone, and the
+    tombstone only by one into the oldest sorted run. At the default, a
+    merge needs 4 adjacent runs within 4x of each other in size, which
+    delete-dominated runs never reach: the oldest two runs, holding most
+    deleted values, were never merged and stages grew to ~100 GiB of dead
+    rows that every scan reads through. At 2, the oldest pair merges
+    whenever it is within 4x."""
     if max_unflushed_bytes < 1:
         raise ValueError(f"max_unflushed_bytes must be >= 1, got {max_unflushed_bytes}")
     if l0_max_ssts < 1:
@@ -465,6 +475,7 @@ def build_slatedb_settings(*, max_unflushed_bytes: int, l0_max_ssts: int) -> Set
     settings.set("l0_max_ssts", str(l0_max_ssts))
     settings.set("garbage_collector_options", "null")
     settings.set("compression_codec", '"Zstd"')
+    settings.set("compactor_options.scheduler_options.min_compaction_sources", '"2"')
     return settings
 
 
