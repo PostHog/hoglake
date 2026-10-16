@@ -248,8 +248,10 @@ class Config:
     #: Files per commit; a decision that fans out wider splits into
     #: several commits.
     max_files_per_commit: int = 512
-    #: Flush decisions in flight process-wide (each holds one scan).
-    flush_concurrency: int = 4
+    #: Flush decisions in flight process-wide (each holds one scan and
+    #: its build, ~4x the scan at peak). 2, not more: the builds are
+    #: GIL-bound, so more decisions add memory, not throughput.
+    flush_concurrency: int = 2
     #: Pause between flush sweeps. A sweep reads only the in-memory
     #: index, so it is cheap.
     flush_sweep_s: float = 1.0

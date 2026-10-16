@@ -201,11 +201,12 @@ Pod memory, in terms:
 + 256 MiB shared cache × ~1.05
 + 256 MiB librdkafka queue + 256 MiB fetch
 + 256 MiB consume batch
-+ 4 in-flight decisions × ~1.1 GiB at MILLRACE_FLUSH_BYTES=256 MiB (measured)
++ 2 in-flight decisions × (scan + ~4× scan for the build) at MILLRACE_FLUSH_BYTES
+  (measured: a 405 MiB scan's build peaked 1.5 GiB above the scan)
 + process baseline
 ```
 
-During the startup drain the 4 decisions are the drain's in-flight
+During the startup drain the 2 decisions are the drain's in-flight
 windows, and each partition also holds one row stream:
 
 ```
