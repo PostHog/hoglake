@@ -1592,7 +1592,15 @@ class HoglakeFlusher:
                 "flush cannot write parquet"
             )
         fanout = resolve_concurrency(len(uploads), None)
-        put_client = put_client_fn(fanout)
+        # One pool for every decision in flight, the same size on every
+        # call: sized per call it overflowed (2 decisions x 64 uploads on
+        # a 64-connection pool, a fresh TLS handshake per discarded
+        # connection), and a wider request rebuilds the shared client and
+        # closes the old one under a concurrent decision's uploads.
+        put_client = put_client_fn(
+            resolve_concurrency(self._cfg.max_files_per_commit, None)
+            * self._cfg.flush_concurrency
+        )
         widen_io_threads_for(list(uploads), put_client, fanout)
         completed: list[str] = []
         try:

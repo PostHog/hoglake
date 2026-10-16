@@ -1472,6 +1472,43 @@ class TestOrphansAndDrops:
         assert len(store.opened) == len(set(store.opened))
         assert await staged_rows(stage, TEAM) == []
 
+    async def test_upload_pool_is_sized_for_every_decision_in_flight(
+        self,
+        httpx_mock: Any,
+        stage_factory: Any,
+        fake_clock: Any,
+        flusher_factory: Any,
+        store: FakeObjectStore,
+    ) -> None:
+        """The shared upload client is asked for ONE size whatever the
+        decision's file count: fan-out x concurrent decisions. Sized per
+        call, two decisions overflowed its pool, and a wider request
+        rebuilt the client under the other decision's uploads."""
+        from pyhoglake.upload import resolve_concurrency
+
+        stage = await stage_factory()
+        await staged(stage, fake_clock, TEAM, [(0, JAN_US), (1, DEC_US)])
+        script_options(httpx_mock)
+        capture = CommitCapture(httpx_mock, [commit_ok(50)])
+        cfg = make_config()
+        flusher = flusher_factory(store=store, cfg=cfg)
+        asked: list[int] = []
+        real = flusher._client._put_client
+
+        def recording(connections: int = 1) -> Any:
+            asked.append(connections)
+            return real(connections)
+
+        flusher._client._put_client = recording
+
+        report = await flush_group(flusher, stage, team_group(TEAM), "size")
+
+        assert report.outcome == "committed"
+        assert len(capture.payloads[0]["appends"][0]["files"]) == 2
+        assert asked == [
+            resolve_concurrency(cfg.max_files_per_commit, None) * cfg.flush_concurrency
+        ]
+
     async def test_bad_records_are_dropped_counted_and_logged_good_rows_flush(
         self,
         httpx_mock: Any,
