@@ -56,7 +56,7 @@ class FindingResolutionSpecParityTest {
         val operator = wire(FindingResolution(ResolutionKind.OPERATOR, null, "by hand"))
         assertThat(operator["kind"].asText()).isEqualTo("operator")
         assertThat(operator.has("task")).isFalse()
-        val maintenance = wire(FindingResolution(ResolutionKind.MAINTENANCE, MaintenanceTask.REINDEX, "tomorrow"))
+        val maintenance = wire(FindingResolution(ResolutionKind.MAINTENANCE, MaintenanceTask.REINDEX, "next hour"))
         assertThat(maintenance["kind"].asText()).isEqualTo("maintenance")
         assertThat(maintenance["task"].asText()).isEqualTo("reindex")
     }

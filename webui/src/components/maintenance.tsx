@@ -257,8 +257,8 @@ export function isQuietRun(run: MaintenanceRun): boolean {
     case "reindex": {
       const r = run.result;
       if (!r) return false;
-      // The daily check that found nothing to rebuild: the steady state,
-      // and one row per catalog per day. Loud: anything over threshold
+      // The hourly check that found nothing to rebuild: the steady state,
+      // and one row per catalog per hour. Loud: anything over threshold
       // (which every rebuild, and every retirement/purge skip, implies),
       // a dropped leftover, and a skip on its own — reindex_in_progress
       // and migration_pending are checked before the estimate matters, so

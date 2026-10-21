@@ -261,7 +261,7 @@ class ScanAndDeleteApiTest {
     /**
      * Wire pin for issue #12's scenario: two delete-file registrations
      * for one data file in a single commit. validateRequest has always
-     * refused this (the one-live-DV batch in applyDeletes is never
+     * refused this (the one-live-DV write in CommitTail is never
      * reached) — this pins the 422 CONTRACT at the HTTP layer so the
      * guard can never silently regress into the unique-index 500 the
      * issue feared.

@@ -53,7 +53,7 @@ function Stat({
 /**
  * What happens next, led by who does it: a reader should never have
  * to work out whether "12 indexes are bloated" is their job or the
- * reindex task's tomorrow at 03:00.
+ * reindex task's at the top of the next hour.
  */
 function Resolution({ resolution }: { resolution: FindingResolution }) {
   // Terse like every other badge on the page; the sentence does the talking.
