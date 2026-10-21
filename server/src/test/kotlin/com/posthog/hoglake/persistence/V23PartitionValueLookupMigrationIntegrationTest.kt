@@ -356,11 +356,14 @@ class V23PartitionValueLookupMigrationIntegrationTest {
      * is measured rather than argued about because "EXPLAIN both and
      * ship the one that is an index range" is the only way to choose.
      *
-     * The OTHER shape once listed here — walk V10's size index and
-     * filter by an `EXISTS` per key — is no longer an alternative: it is
-     * what ships (`CompactionService.candidateSql`), because the
-     * `INTERSECT` form that was measured against it bounds the rows
-     * returned and not the work. Its plan is `planAfter`.
+     * The OTHER shapes once listed here are history. The per-key
+     * `EXISTS` on a manifest-driven `LIMIT` shipped and was replaced
+     * (2026-10-21): it left Postgres a plan that walks the table's rows
+     * until the `LIMIT` fills, which is O(table) per bucket probe. What
+     * ships now (`CompactionService.candidateSql`) builds the bucket's id
+     * set from this index as an InitPlan and reaches the manifest by
+     * primary key with the `LIMIT` stopping that scan. Its plan is
+     * `planAfter`.
      */
     private val aggregateAndFilterSql: String =
         """
@@ -399,7 +402,7 @@ class V23PartitionValueLookupMigrationIntegrationTest {
     // ---- the index itself ----------------------------------------------------
 
     @Test
-    fun `the index keys exactly the columns each EXISTS arm probes and returns`() {
+    fun `the index keys exactly the columns each partition arm probes and returns`() {
         val key =
             db.jdbi.withHandleUnchecked { h ->
                 h.createQuery(
@@ -498,11 +501,12 @@ class V23PartitionValueLookupMigrationIntegrationTest {
     @Test
     fun `no sequential scan of the manifest anywhere in the bucket fetch`() {
         // The whole point: the statement being replaced read
-        // hog_data_file end to end. The intersected ids reach it by its
-        // PRIMARY KEY.
+        // hog_data_file end to end. The bucket's ids (an InitPlan over
+        // this index) reach it by its PRIMARY KEY.
         assertThat(planAfter)
             .describedAs("the manifest must be reached by key, never scanned:\n%s", planAfter)
             .doesNotContain("Seq Scan on hog_data_file")
+            .contains("data_file_id = ANY ((InitPlan 1).col1)")
         assertThat(planAfter)
             .describedAs("nor may the partition values be:\n%s", planAfter)
             .doesNotContain("Seq Scan on hog_file_partition_value")

@@ -5,6 +5,7 @@ import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.service.CatalogService
 import com.posthog.hoglake.service.MaintenanceSummarySampler
+import com.posthog.hoglake.testing.ExplainPlan
 import com.posthog.hoglake.testing.PgTestSupport
 import org.assertj.core.api.Assertions.assertThat
 import org.jdbi.v3.core.kotlin.useHandleUnchecked
@@ -52,31 +53,43 @@ import org.junit.jupiter.api.TestInstance
  *
  * # THE PROPERTY BEING PROVEN
  *
- * `CompactionService.candidateSql` has plans available and Postgres
- * picks between them: drive V10's ordered size index and filter by the
- * `EXISTS` arms (bounded by the statement's `LIMIT`), or rewrite the
- * arms into a semi-join and drive from V23's index (bounded by the
- * bucket). The assertion is therefore NOT "the plan is X" — pinning one
- * plan is what the first version's test did, and it pinned the
- * unbounded one — but that whatever Postgres picks, the work is bounded
- * by the SMALLER of those two bounds and never by the table.
+ * `CompactionService.candidateSql` with arms plans as ONE shape on PG
+ * 18: the bucket's ids come from V23's index as an InitPlan, and the
+ * manifest is reached from them by an index condition
+ * (`data_file_id = ANY (...)`), with the `LIMIT` stopping that scan.
+ * The statement it replaced was a statistics call between that direction
+ * and a MANIFEST-DRIVEN plan with the arms as filters, and the
+ * manifest-driven plan is O(table) for any bucket that is small or late
+ * in the walk — which is what the bucket loop multiplied into 18-37
+ * minute plans on gigahog-prod-us (2026-10-21).
  *
- * # THE ONE SHAPE THAT IS NOT BOUNDED, AND WHY IT IS UNREACHABLE
+ * WHY IT IS ONE SHAPE, and it is costing, not plan space: a
+ * manifest-driven plan over the InitPlan still exists (with index scans
+ * disabled PG 18 plans a `Seq Scan on hog_data_file` filtering on the
+ * array), but the array is a Param with no statistics, and
+ * `estimate_array_length()` returns its default of 10 for one, so the
+ * `= ANY` scan is always costed as ~10 descents and no statistic on
+ * `value` can flip it. That is a PG 18 property: a Postgres that
+ * estimates Param arrays from the subplan's rows restores a
+ * statistics-driven choice, and these assertions are what would notice.
+ *
+ * So the assertion here is the shape AND the bound: the probe drives
+ * from the lookup index in its custom and its generic plan, and its work
+ * is bounded by the bucket (catalog-wide, because the arms are) and the
+ * cap, never by the table.
+ *
+ * # THE SHAPE THAT USED TO BE UNBOUNDED
  *
  * Measured here: a probe for a bucket whose files are the table's
- * LARGEST, with a cap smaller than the bucket, gets neither bound. The
- * ordered scan would walk past every smaller file in the table, so
- * Postgres costs it correctly and picks a whole-table plan instead (a
- * hash join over a sequential scan). That combination is real and this
- * fixture can produce it.
- *
- * What makes it unreachable in the planner is the BUCKET ORDERING:
- * `CompactionService.sampledBuckets` orders by bytes-per-file
- * ascending, so a bucket of large files is probed only once the table
- * has nothing smaller left — at which point its files ARE the smallest
- * and the ordered scan stops at the cap. The ordering and the plan's
- * bound are one decision, and the test at the end of this class is what
- * pins it.
+ * LARGEST, with a cap smaller than the bucket. The replaced statement
+ * planned it as a hash join whose outer side is a `Seq Scan on
+ * hog_data_file`, walked until the `LIMIT` filled — 57,342 rows for
+ * 8,192 here, and the whole table for a bucket under the cap. The
+ * replacement reads the bucket's 20,000 index entries and stops the
+ * primary-key scan at the cap. The bucket ORDERING
+ * (`CompactionService.sampledBuckets`, bytes-per-file ascending) used
+ * to be what kept that probe unreachable; it is now a VALUE ordering
+ * only, and the test at the end of this class still pins it.
  */
 @Tag("integration")
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
@@ -275,7 +288,22 @@ class CompactionCandidateFetchPlanIntegrationTest {
                 .bind("tinyBuckets", TINY_BUCKETS)
                 .bind("bigBucket", BIG_BUCKET)
                 .execute()
-            for (relation in listOf("hog_data_file", "hog_file_partition_value")) {
+            // LIVE DVs on every third file, so the DV join's per-row cost
+            // is measured on real statistics. With `hog_delete_file` empty
+            // and unanalyzed its plan flipped between one materialized
+            // scan and a probe per row (QE, #397), and the buffer bounds
+            // below were passing on whichever the planner happened to pick.
+            h.createUpdate(
+                """
+                INSERT INTO hog_delete_file (catalog_id, delete_file_id, table_id, data_file_id,
+                                             begin_snapshot, path, delete_count, file_size_bytes)
+                SELECT f.catalog_id, f.data_file_id, f.table_id, f.data_file_id, 1,
+                       's3://fetchplan/dv-' || f.data_file_id || '.puffin', 3, 100
+                  FROM hog_data_file f
+                 WHERE f.catalog_id = :c AND f.data_file_id % 3 = 0
+                """,
+            ).bind("c", catalogId).execute()
+            for (relation in listOf("hog_data_file", "hog_file_partition_value", "hog_delete_file")) {
                 h.execute("VACUUM (ANALYZE) $relation")
             }
         }
@@ -310,19 +338,25 @@ class CompactionCandidateFetchPlanIntegrationTest {
             ).bind("c", catalogId).bind("v", value).mapTo(Long::class.java).one()
         }
 
-    /** EXPLAIN the planner's own statement for one bucket value. */
-    private fun explainBucket(
-        value: String,
-        limit: Int = cfg.candidateBudget,
-    ): String {
-        val svc = CompactionService(db.jdbi, store, cfg)
-        val sql =
-            svc.candidateSql(
+    /** The planner's own one-key bucket probe. */
+    private val shippedSql: String
+        get() =
+            CompactionService(db.jdbi, store, cfg).candidateSql(
                 arms = listOf(0),
                 nullArms = emptySet(),
                 scopeToSpec = true,
                 withPartitionValues = false,
             )
+
+    /**
+     * EXPLAIN [sql] for one bucket value: the planner's own statement by
+     * default, or [ReplacedCandidateSql] for the before measurement.
+     */
+    private fun explainBucket(
+        value: String,
+        limit: Int = cfg.candidateBudget,
+        sql: String = shippedSql,
+    ): String {
         return db.jdbi.withHandleUnchecked { h ->
             h.begin()
             try {
@@ -345,6 +379,40 @@ class CompactionCandidateFetchPlanIntegrationTest {
             }
         }
     }
+
+    /**
+     * The GENERIC plan of the shipped probe, forced through PREPARE +
+     * `force_generic_plan` (NamespaceListingQueryPlanIntegrationTest's
+     * mechanism). Production never runs it — the probe carries
+     * `Pg.CUSTOM_PLANS_ONLY` — but its shape must not depend on that.
+     */
+    private fun explainBucketGeneric(value: String): String =
+        db.jdbi.withHandleUnchecked { h ->
+            h.begin()
+            try {
+                h.execute("SET LOCAL max_parallel_workers_per_gather = 0")
+                h.execute("SET LOCAL plan_cache_mode = force_generic_plan")
+                val positional =
+                    listOf("catalogId", "tableId", "targetBytes", "specId", "scanLimit", "limit", "k0", "v0")
+                        .foldIndexed(shippedSql) { i, s, name -> s.replace(Regex(":$name\\b"), "\\$${i + 1}") }
+                h.execute("PREPARE fetch_generic(bigint, bigint, bigint, bigint, int, int, int, text) AS $positional")
+                try {
+                    val limit = cfg.candidateBudget
+                    // Literals, not binds: EXPLAIN EXECUTE takes no parameters.
+                    h.createQuery(
+                        "EXPLAIN (ANALYZE, BUFFERS, TIMING false, COSTS false, SUMMARY false) " +
+                            "EXECUTE fetch_generic($catalogId, $tableId, ${cfg.targetBytes}, 1, " +
+                            "$limit, $limit, 0, '$value')",
+                    ).mapTo(String::class.java).list().joinToString("\n")
+                } finally {
+                    // PREPARE is not transactional: the rollback below
+                    // would leave it on the pooled connection.
+                    h.execute("DEALLOCATE fetch_generic")
+                }
+            } finally {
+                h.rollback()
+            }
+        }
 
     /** EXPLAIN the no-published-generation fallback. */
     private fun explainFallback(): String {
@@ -379,7 +447,27 @@ class CompactionCandidateFetchPlanIntegrationTest {
      * restated — the planner probes in this order, so this IS the
      * fairness and boundedness property.
      */
-    private fun sampledOrder(): List<String> =
+    private fun sampledOrder(): List<String> {
+        publishSample()
+        return sampledOrderOfPublished()
+    }
+
+    /**
+     * Run the real sampler to a published generation. Called by every
+     * test that reads the sample, rather than relying on another test
+     * having run first: JUnit's method order is not this class's to
+     * assume, and a rename once made the ordering test read an empty
+     * sample. Idempotent: a second pass publishes the same buckets.
+     */
+    private fun publishSample() {
+        val sampler =
+            MaintenanceSummarySampler(db.jdbi, cfg.targetBytes, cfg.minInputFiles, cfg.maxInputFiles, 3600)
+        var steps = 0
+        while (sampler.runOnce(50_000)) check(++steps < 2_000)
+        db.jdbi.useHandleUnchecked { h -> h.execute("VACUUM (ANALYZE) hog_maintenance_summary_tier") }
+    }
+
+    private fun sampledOrderOfPublished(): List<String> =
         db.jdbi.withHandleUnchecked { h ->
             h.createQuery(
                 """
@@ -491,6 +579,7 @@ class CompactionCandidateFetchPlanIntegrationTest {
         assertThat(actualRows(plan))
             .describedAs("the whole bucket, which is under the cap")
             .isEqualTo(TINY_PER_BUCKET.toLong())
+        assertBucketDriven(plan)
         // Bounded by the CATALOG-WIDE bucket (three tables share the day
         // value) plus the cap, and derived from the fixture rather than
         // written as a constant. What matters is the comparison below.
@@ -505,33 +594,84 @@ class CompactionCandidateFetchPlanIntegrationTest {
             .isLessThan(heapPages("hog_data_file"))
     }
 
+    /**
+     * The one shape an arm'd probe has: the bucket's ids from V23's index
+     * as an InitPlan, and the manifest scan DRIVEN by them — the id set is
+     * an Index Cond of that scan, not a filter on a walk.
+     *
+     * Which index carries the Index Cond is the planner's: usually the
+     * primary key, and on THIS fixture's generic plan for a small bucket
+     * V10's size index, with the id array as a condition on its last
+     * column (a Postgres 18 skip scan, 63 index searches for 30 rows).
+     * Both are bounded by the id set; the second also by the table's
+     * distinct file sizes, which here are one per bucket kind. Production
+     * runs the custom plan (`Pg.CUSTOM_PLANS_ONLY`), and on
+     * `CompactionBucketProbePlanIntegrationTest`'s varied sizes both plans
+     * take the primary key.
+     */
+    private fun assertBucketDriven(plan: String) {
+        assertThat(plan)
+            .describedAs("the bucket's ids come from V23's index, once:\n%s", plan)
+            .contains("InitPlan 1")
+            .contains("Index Only Scan using hog_file_partition_value_lookup")
+        val lines = plan.lines()
+        val at = lines.indexOfFirst { it.contains(" on hog_data_file f0") }
+        assertThat(at).describedAs("no manifest scan in:\n%s", plan).isNotEqualTo(-1)
+        // MUTATION: put the per-key `EXISTS` arms back on the manifest
+        // scan (ReplacedCandidateSql) and this fails: no InitPlan, and
+        // for the fresh-day probe below a sequential scan.
+        assertThat(lines[at])
+            .describedAs("the manifest is an index scan, never walked:\n%s", plan)
+            .contains("Index Scan using hog_data_file_")
+        assertThat(lines[at + 1])
+            .describedAs("driven BY the id set, as an index condition:\n%s", plan)
+            .contains("Index Cond:")
+            .contains("data_file_id = ANY ((InitPlan 1).col1)")
+        assertThat(plan)
+            .describedAs("no manifest-driven plan anywhere:\n%s", plan)
+            .doesNotContain("Seq Scan on hog_data_file")
+    }
+
+    @Test
+    fun `the generic plan has the same shape, for every bucket kind`() {
+        // The probe is never server-prepared (`Pg.CUSTOM_PLANS_ONLY`), so
+        // production runs the custom plan. The generic plan is asserted
+        // anyway, because the SHAPE must not depend on that: a generic
+        // plan cannot see the value's statistics, and the replaced
+        // statement's choice between directions was a statistics call.
+        for (value in listOf("day-00007", BIG_BUCKET, "fresh-1")) {
+            val plan = explainBucketGeneric(value)
+            assertBucketDriven(plan)
+            assertThat(actualRows(plan))
+                .describedAs("generic %s returns what custom does:\n%s", value, plan)
+                .isEqualTo(minOf(bucketSize(value), cfg.candidateBudget.toLong()))
+        }
+    }
+
     @Test
     fun `a bucket larger than the cap stops at the cap, not at the bucket`() {
         // The case the uniform fixture cannot pose: 20,000 candidate
         // files against a cap of 8,192.
         //
-        // WHAT IS BOUNDED, and it is not "no sequential scan". The
-        // manifest may well be scanned — that is often the cheapest way
-        // to find one bucket's rows — and what matters is that the scan
-        // STOPS. With no inner `ORDER BY` the `LIMIT` propagates into
-        // whichever plan Postgres picks, so the work is
-        // `min(the bucket, the cap / the bucket's selectivity)` and
-        // never the table twice. The first version of this statement had
-        // an inner sort, so the same probe read all 140,000 rows and
-        // spilled an external merge sort to disk before the `LIMIT` saw
-        // anything.
+        // WHAT IS BOUNDED: the InitPlan reads the bucket's index entries
+        // (all of them — an array is built whole), and the primary-key
+        // scan over them STOPS at the cap, because there is no inner
+        // `ORDER BY` for the `LIMIT` to wait on. The first version of this
+        // statement had an inner sort, so the same probe read all 140,000
+        // rows and spilled an external merge sort to disk before the
+        // `LIMIT` saw anything.
         val plan = explainBucket(BIG_BUCKET)
         val bucket = bucketSize(BIG_BUCKET)
 
         assertThat(actualRows(plan))
             .describedAs("the statement returns exactly its cap")
             .isEqualTo(cfg.candidateBudget.toLong())
+        assertBucketDriven(plan)
         // The analytic bound, derived from the fixture rather than
-        // written down: to find `cap` rows of a bucket holding
-        // `bucket / subject` of the table, a manifest-driven plan reads
-        // `cap x subject / bucket` of them, and a bucket-driven plan
-        // reads the bucket. Postgres may pick either; neither is the
-        // table.
+        // written down: the bucket's entries plus the cap's manifest
+        // rows. Kept at the replaced statement's ceiling (which also
+        // admitted a manifest-driven `cap x subject / bucket`), so the
+        // two are measured against the same number.
         val analytic = cfg.candidateBudget.toLong() * SUBJECT_FILES / bucket + bucket
         val examined = actualRows(plan) + rowsRemoved(plan) + scannedRows(plan)
         assertThat(examined)
@@ -544,45 +684,76 @@ class CompactionCandidateFetchPlanIntegrationTest {
                 plan,
             )
             .isLessThanOrEqualTo(analytic * 2)
-        // And in buffers: at most ONE pass of the manifest, which is the
-        // ceiling on any plan. The pre-fix shape was 5,429 buffers plus
-        // 379 temp blocks written for the spilled sort; this is ~1,656
-        // with nothing spilled.
-        assertThat(buffers(plan))
-            .describedAs("no plan may cost more than one pass of the manifest:\n%s", plan)
+        // And in buffers, in TWO terms, because the new statement's cost
+        // at the cap is not one term.
+        //
+        // The CANDIDATE READ — everything but the DV join — is at most
+        // one pass of the manifest, the ceiling on any plan. The
+        // inner-sort shape was 5,429 buffers plus 379 temp blocks for the
+        // spilled sort; this is ~1,880 (20,000 index entries and the
+        // cap's 8,192 primary-key rows), nothing spilled.
+        //
+        // The DV JOIN is a nested loop at any result size, because the
+        // outer estimate is the Param-array default (~3 rows) —
+        // `CompactionService.candidateSql` regime (c). Measured with a
+        // live DV on a third of the files: 19,115 buffers for 8,192
+        // probes, ~2.3 per row, where the replaced statement hash-joined
+        // (2,860 buffers in all, recorded by the largest-files test). It
+        // is bounded per ROW, not by the manifest, and this pins that
+        // bound rather than pretending it is the other.
+        val dvJoin =
+            ExplainPlan.nodes(plan).filter { it.line.contains("on hog_delete_file dv") }.sumOf { it.buffers }
+        assertThat(buffers(plan) - dvJoin)
+            .describedAs("the candidate read may cost no more than one pass of the manifest:\n%s", plan)
             .isLessThanOrEqualTo(heapPages("hog_data_file"))
+        assertThat(dvJoin)
+            .describedAs("the DV join is a bounded probe per returned row:\n%s", plan)
+            .isLessThanOrEqualTo(4L * actualRows(plan) + 64)
+        println("RECORDED over-cap probe: buffers ${buffers(plan)}, of which DV join $dvJoin")
         assertThat(plan)
             .describedAs("and nothing may spill: the inner sort is what used to:\n%s", plan)
             .doesNotContain("external merge")
     }
 
     @Test
-    fun `a bucket of the table's LARGEST files has no cheap plan, which is what the ordering avoids`() {
-        // THE HONEST NEGATIVE RESULT, recorded rather than hidden.
+    fun `a bucket of the table's LARGEST files is bounded by the bucket, which the replaced probe was not`() {
+        // THE MANIFEST WALK, measured on both statements.
         //
-        // Probe a fresh-day bucket — 20,000 files of 200 MB, the
-        // table's largest — with a cap below the bucket. Neither bound
-        // applies: the ordered scan would walk every smaller file in the
-        // table to reach these, so Postgres costs it correctly and picks
-        // a whole-table plan instead. Measured on this fixture: a hash
-        // join whose outer side is a sequential scan of the subject
-        // table, ~140,000 rows read.
-        //
-        // This is not a defect in the statement; it is the statement
-        // being asked for the one thing a size-ordered access path
-        // cannot do cheaply. What removes it is the BUCKET ORDERING,
-        // which is asserted below — so this test exists to pin the cost
-        // of the combination and to fail if a future ordering change
-        // makes it reachable while smaller files exist.
+        // Probe a fresh-day bucket — 20,000 files of 200 MB, the table's
+        // largest — with a cap below the bucket. The REPLACED statement
+        // drives the manifest: a hash join whose outer side is a
+        // `Seq Scan on hog_data_file`, walked until the `LIMIT` fills.
+        // Measured: 57,342 manifest rows for 8,192 returned. Here the
+        // walk stops because the bucket is a seventh of the table; for a
+        // bucket under the cap it does not stop until the table ends,
+        // which matches gigahog-prod-us's 2026-10-21 symptoms (1,064,028
+        // sequential scans of hog_data_file, 193 of 200 sweeps over the
+        // plan statement timeout).
+        val before = explainBucket("fresh-1", sql = ReplacedCandidateSql.sql(listOf(0)))
         val plan = explainBucket("fresh-1")
-        val examined = actualRows(plan) + rowsRemoved(plan)
-        assertThat(examined)
-            .describedAs("recorded, not asserted as good: this probe reads the table:\n%s", plan)
-            .isGreaterThan(SUBJECT_FILES / 2L)
+        assertThat(actualRows(plan)).isEqualTo(cfg.candidateBudget.toLong())
+        assertThat(actualRows(before)).describedAs("same answer from both").isEqualTo(cfg.candidateBudget.toLong())
+        assertBucketDriven(plan)
+        // The bucket's entries, then the cap's rows by primary key: the
+        // manifest rows read are the cap, not a walk.
+        assertThat(scannedRows(plan))
+            .describedAs("manifest rows read are the cap's:\n%s", plan)
+            .isEqualTo(cfg.candidateBudget.toLong())
+        // RECORDED, not asserted: what Postgres does with the replaced
+        // statement guards nothing in hoglake, and a point release that
+        // plans it better must not fail this suite. Measured on PG 18.6:
+        // a hash join over `Seq Scan on hog_data_file`, 57,342 rows.
+        println(
+            "RECORDED replaced fresh-1 probe: manifest rows ${scannedRows(before)}, " +
+                "buffers ${ExplainPlan.nodes(before).first().buffers}; new: manifest rows " +
+                "${scannedRows(plan)}, buffers ${ExplainPlan.nodes(plan).first().buffers}",
+        )
 
-        // AND THE ORDERING MAKES IT UNREACHABLE. The sample's own order
-        // is what the planner probes in, so a bucket of 200 MB files
-        // must come after every bucket of 12 KiB files.
+        // AND THE ORDERING STILL PUTS IT LAST. It used to be what kept
+        // the walk above unreachable; it is now a VALUE ordering only
+        // (files retired per byte rewritten), and it is still the order
+        // the planner probes in, so a bucket of 200 MB files must come
+        // after every bucket of 12 KiB files.
         val order = sampledOrder()
         val firstFresh = order.indexOfFirst { it.startsWith("fresh-") }
         val lastTiny = order.indexOfLast { it.startsWith("day-") }
@@ -590,8 +761,8 @@ class CompactionCandidateFetchPlanIntegrationTest {
         assertThat(lastTiny).describedAs("so are the stray ones").isNotEqualTo(-1)
         assertThat(firstFresh)
             .describedAs(
-                "every 12 KiB bucket must be ordered before every 200 MB one, or the plan above " +
-                    "becomes reachable while cheaper work exists (order head: %s)",
+                "every 12 KiB bucket must be ordered before every 200 MB one, or a run spends its " +
+                    "budget on the least valuable work while cheaper work exists (order head: %s)",
                 order.take(5),
             )
             .isGreaterThan(lastTiny)
@@ -634,11 +805,7 @@ class CompactionCandidateFetchPlanIntegrationTest {
     fun `a whole table plan reads at most its budget and does it in a sweep's worth of time`() {
         // The sampler publishes a generation over the fixture, so the
         // planner takes the bucket-scoped path it takes in production.
-        val sampler =
-            MaintenanceSummarySampler(db.jdbi, cfg.targetBytes, cfg.minInputFiles, cfg.maxInputFiles, 3600)
-        var steps = 0
-        while (sampler.runOnce(50_000)) check(++steps < 2_000)
-        db.jdbi.useHandleUnchecked { h -> h.execute("VACUUM (ANALYZE) hog_maintenance_summary_tier") }
+        publishSample()
 
         val svc = CompactionService(db.jdbi, store, cfg)
         val started = System.nanoTime()

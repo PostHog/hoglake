@@ -5,7 +5,11 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import org.jdbi.v3.core.argument.Argument
 import org.jdbi.v3.core.statement.SqlStatement
+import org.jdbi.v3.core.statement.StatementContext
+import org.jdbi.v3.core.statement.StatementCustomizer
 import org.jdbi.v3.core.statement.UnableToExecuteStatementException
+import org.postgresql.PGStatement
+import java.sql.PreparedStatement
 import java.sql.ResultSet
 import java.sql.SQLException
 import java.sql.Types
@@ -50,6 +54,39 @@ internal object Pg {
 
     /** Parse a jsonb column back into type params; null stays null. */
     fun fromJson(s: String?): Map<String, Any?>? = s?.let { json.readValue(it, mapType) }
+
+    /**
+     * pgjdbc `prepareThreshold = 0` for one statement: it is sent unnamed
+     * on every execution, and Postgres plans an unnamed statement custom
+     * each time, so a generic plan is never a candidate.
+     *
+     * For statements whose GENERIC plan is a different, worse shape than
+     * their custom one — the generic plan cannot see the bound values'
+     * statistics, so it cannot tell a selective value from a common one.
+     * Consumers: `TableRepo.listLiveSummaries` and the compaction
+     * planner's bucket probe (`CompactionService.candidateSql`), each of
+     * which records the generic plan it is avoiding.
+     *
+     * SCOPE. `setPrepareThreshold(0)` is set on the one `PgStatement`
+     * object: the statement goes out as the unnamed statement and is
+     * planned custom at Bind. Nothing is set on the connection, and it is
+     * not `plan_cache_mode`. pgjdbc's per-connection `CachedQuery`
+     * execute count for the SQL text still increments on customized
+     * runs, so an UNCUSTOMIZED execution of the same text on that
+     * connection is server-prepared on its first run. Harmless — every
+     * production call site of these statements is customized — and it is
+     * what makes the polarity control in
+     * `CompactionBucketProbePlanIntegrationTest` work.
+     */
+    val CUSTOM_PLANS_ONLY: StatementCustomizer =
+        object : StatementCustomizer {
+            override fun beforeExecution(
+                stmt: PreparedStatement,
+                ctx: StatementContext,
+            ) {
+                stmt.unwrap(PGStatement::class.java).prepareThreshold = 0
+            }
+        }
 }
 
 /**
