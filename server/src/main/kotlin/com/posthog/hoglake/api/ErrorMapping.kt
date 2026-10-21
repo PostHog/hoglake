@@ -26,6 +26,9 @@ private val log = KotlinLogging.logger("com.posthog.hoglake.api.ErrorMapping")
  * - OffsetRegression    -> 409
  * - IdlessFilesPresent  -> 409
  * - NamespaceNotEmpty   -> 409
+ * - CatalogNotEmpty     -> 409 `catalog_not_empty`, carrying `reason`
+ *                          (which emptiness precondition failed first),
+ *                          so a client acts on a code and not on prose
  * - TableDropped        -> 409 (a commit to a table that was dropped;
  *                          the detail names the drop snapshot)
  * - TableRecreated      -> 409 `table_recreated` (the expected
@@ -76,6 +79,8 @@ internal fun errorBody(cause: HoglakeException): Pair<HttpStatusCode, ApiErrorDt
             HttpStatusCode.Conflict to apiError("idless_files_present", cause)
         is HoglakeException.NamespaceNotEmpty ->
             HttpStatusCode.Conflict to apiError("namespace_not_empty", cause)
+        is HoglakeException.CatalogNotEmpty ->
+            HttpStatusCode.Conflict to apiError("catalog_not_empty", cause).copy(reason = cause.reason.wire)
         is HoglakeException.TableDropped -> HttpStatusCode.Conflict to apiError("table_dropped", cause)
         // The one body that carries more than {error, detail}: which
         // tables moved, the read_snapshot they moved after, and the fact

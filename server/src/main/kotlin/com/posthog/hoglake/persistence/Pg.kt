@@ -43,6 +43,22 @@ internal object Pg {
 
     fun isCheckViolation(e: UnableToExecuteStatementException): Boolean = sqlState(e) == CHECK_VIOLATION
 
+    const val FOREIGN_KEY_VIOLATION = "23503"
+
+    /**
+     * A foreign-key violation against `hog_catalog` itself: the INSERT of a
+     * catalog-scoped row whose catalog was deleted after the writer
+     * resolved it — a `DELETE /v1/catalogs/{c}` that won the race (#412).
+     * Matched on the server's detail (`... is not present in table
+     * "hog_catalog"`), so a violation against any OTHER parent stays the
+     * bug it is and is not turned into a 404.
+     */
+    fun isCatalogForeignKeyViolation(e: Throwable): Boolean {
+        val sql = generateSequence(e) { it.cause }.filterIsInstance<org.postgresql.util.PSQLException>().firstOrNull()
+        return sql?.sqlState == FOREIGN_KEY_VIOLATION &&
+            sql.serverErrorMessage?.detail?.contains("table \"hog_catalog\"") == true
+    }
+
     /** lock_timeout expiry ("canceling statement due to lock timeout"). */
     fun isLockTimeout(e: UnableToExecuteStatementException): Boolean = sqlState(e) == LOCK_NOT_AVAILABLE
 

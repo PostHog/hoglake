@@ -1635,8 +1635,9 @@ ran on the local stack and what it showed.
 - pyhoglake implements `truncate[W]` partition transforms; the server's
   Transform vocabulary doesn't include truncate yet (client-ready,
   server gap).
-- No catalog delete API (QE/integration runs leave disposable
-  `qe-*`/`pyhog-*`/`hedgerow-*` catalogs behind on dev stacks).
+- Catalog drop (#412) is server + pyhoglake only: no console action and no
+  DuckDB-client vocabulary yet, and no offset-delete API, so a catalog any
+  consumer ever read is undroppable without hand-deleting its offsets.
 - `bench/` is outside `just lint-all`: it passes `ruff check` but 12
   files fail `ruff format --check`. Format it and wire it in (pin ruff
   in its dev group, add the `lint` recipe) as its own change, so the

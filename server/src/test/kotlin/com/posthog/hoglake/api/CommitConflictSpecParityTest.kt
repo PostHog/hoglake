@@ -1,5 +1,6 @@
 package com.posthog.hoglake.api
 
+import com.posthog.hoglake.model.CatalogNotEmptyReason
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.wireObjectMapper
 import org.assertj.core.api.Assertions.assertThat
@@ -123,6 +124,7 @@ class CommitConflictSpecParityTest {
                 tables = listOf("ns.t"),
                 readSnapshot = 7,
                 retry = "re-prepare",
+                reason = "live_namespaces",
             )
         assertThat(keysOf(full))
             .describedAs("the wire keys of a fully-populated ApiError must be the spec's properties")
@@ -166,9 +168,12 @@ class CommitConflictSpecParityTest {
                         java.util.UUID.randomUUID(),
                     ),
                 ),
+                // The catalog drop's refusal (#412): `reason` is presence-
+                // scoped too, so its claim needs a body to be checked against.
+                bodyFor(HoglakeException.CatalogNotEmpty("d", CatalogNotEmptyReason.LIVE_NAMESPACES)),
             ).associateBy { it["error"] as String }
         assertThat(bodies.keys)
-            .containsExactlyInAnyOrder("ddl_since_read_snapshot", "table_recreated")
+            .containsExactlyInAnyOrder("ddl_since_read_snapshot", "table_recreated", "catalog_not_empty")
         // Only the PRESENCE-SCOPED fields — the ones whose description
         // opens "Present on …" — make a claim about which codes carry
         // them. `retry` is documented by meaning rather than by code, on
@@ -192,7 +197,7 @@ class CommitConflictSpecParityTest {
         }
         assertThat(scoped)
             .describedAs("the presence-scoped ApiError fields must still document their scope")
-            .contains("tables", "read_snapshot")
+            .contains("tables", "read_snapshot", "reason")
     }
 
     @Test
@@ -290,6 +295,9 @@ class CommitConflictSpecParityTest {
                     Long::class -> 1L
                     java.util.UUID::class -> java.util.UUID.randomUUID()
                     List::class -> listOf("ns.t")
+                    // CatalogNotEmpty's reason. One wire code for every
+                    // reason, by design (see the exception's KDoc).
+                    CatalogNotEmptyReason::class -> CatalogNotEmptyReason.entries.first()
                     else ->
                         error(
                             "add a placeholder for ${parameter.type} in instantiate(), and while " +

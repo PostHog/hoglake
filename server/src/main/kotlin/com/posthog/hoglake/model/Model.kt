@@ -664,6 +664,93 @@ data class CatalogInfo(
     val earliestSnapshotId: Long = 0,
 )
 
+/**
+ * What `DELETE /v1/catalogs/{catalog}` answers: the catalog that is gone
+ * and the object-store prefix it owned.
+ *
+ * [dataPath] is the point of the body. The drop deletes METADATA ONLY —
+ * nothing under the prefix is touched — and its preconditions make sure
+ * every object hoglake still knew about was queued and drained first. So
+ * whatever an operator finds under [dataPath] afterwards is either an
+ * orphan nothing tracked (an upload that never registered, a prepared
+ * table creation that never published) or not hoglake's at all, and the
+ * response names the prefix so the listing is one command away rather
+ * than a lookup against a catalog row that no longer exists.
+ */
+data class DroppedCatalog(
+    val name: String,
+    val dataPath: String,
+)
+
+/**
+ * Why a catalog drop was refused (409 `catalog_not_empty`, the body's
+ * `reason`). One value per precondition, each named for the state that
+ * blocks the drop, so a client can branch on what to DO rather than
+ * parse the detail.
+ *
+ * The ORDER IS THE RESOLUTION ORDER and it is load-bearing: the refusal
+ * reports the FIRST failing precondition in declaration order as its
+ * `reason` (the detail names every failing one). Dropping the namespaces
+ * comes first because it is what makes the tables droppable; retirement
+ * and expiry then turn the dropped tables' file rows into removal-queue
+ * rows; the queue has to drain after that; compaction claims expire on
+ * their own. Offsets and uploads are independent of that chain and
+ * come last. A client that acts on `reason` and retries therefore walks the chain front to back instead
+ * of waiting on a removal queue that the next step will refill.
+ *
+ * [wire] is the contract; the OpenAPI enum on `ApiError.reason` is read
+ * against it by `CatalogDropSpecParityTest`.
+ */
+enum class CatalogNotEmptyReason(val wire: String) {
+    /** A namespace is not dropped. Drop its tables and views, then the namespace. */
+    LIVE_NAMESPACES("live_namespaces"),
+
+    /**
+     * Live (`end_snapshot IS NULL`) data or delete file rows remain. With
+     * no live namespace these belong to dropped tables that
+     * `RetirementService` has not reached, which it does only once the
+     * expiry floor passes the drop (invariant 11).
+     */
+    TABLES_PENDING_RETIREMENT("tables_pending_retirement"),
+
+    /**
+     * Ended data-file rows remain (with any deletion vectors riding them)
+     * — history that expiry's paged purge deletes (and queues for
+     * removal) once the floor passes their end snapshot.
+     */
+    FILES_PENDING_EXPIRY("files_pending_expiry"),
+
+    /** Undrained `hog_file_removal` rows: cleanup has not finished. */
+    REMOVALS_PENDING("removals_pending"),
+
+    /**
+     * Unexpired `hog_compaction_claim` rows: a compactor may be mid-rewrite.
+     * Its staging ticket is not a sufficient fence — cleanup can drain a
+     * ticket `absent` while a streaming rewrite still uploads, and the
+     * compactor re-stages at commit — so without this a drop in that
+     * window orphans the output. Expires on its own (one hour at most).
+     */
+    ACTIVE_COMPACTION_CLAIMS("active_compaction_claims"),
+
+    /** `hog_consumer_offset` rows: a consumer still has a position here. */
+    CONSUMER_OFFSETS("consumer_offsets"),
+
+    /** `hog_upload` claims in state `active`: a writer may be mid-PUT. */
+    ACTIVE_UPLOADS("active_uploads"),
+
+    /**
+     * `hog_upload` tombstones that are not yet SETTLED: abandoned but never
+     * offered to cleanup (`last_scheduled_at IS NULL`), or still inside
+     * their claim's expiry window (`expires_at > now()`), during which the
+     * writer's PUT can still land — after a DELETE that cleanup already
+     * made, leaving an object nothing tracks once the catalog is gone.
+     * `POST .../uploads/schedule-expired` offers the first kind; the second
+     * only needs time (at most the claim's 24 h, less any renewal).
+     * Tombstones scheduled once AND past their expiry cascade.
+     */
+    ABANDONED_UPLOADS_UNSETTLED("abandoned_uploads_unsettled"),
+}
+
 data class NamespaceInfo(
     val namespaceId: Long,
     val name: String,
@@ -2391,6 +2478,29 @@ sealed class HoglakeException(message: String) : RuntimeException(message) {
      * no-CASCADE position) -> HTTP 409.
      */
     class NamespaceNotEmpty(detail: String) : HoglakeException(detail)
+
+    /**
+     * A catalog drop was refused because one of its emptiness
+     * preconditions does not hold -> HTTP 409 `catalog_not_empty`, with
+     * [reason] on the body as `reason`.
+     *
+     * ONE type with a reason rather than one type per precondition: the
+     * server's mapping is the same for all of them (a 409 that nothing
+     * retries blindly), and the parity test that gives every type its own
+     * wire code would otherwise mint seven codes for one refusal. The
+     * per-reason TYPES live on the client, where an `except` ladder is
+     * what a caller branches with (pyhoglake's `CatalogNotEmptyError`
+     * subclasses).
+     *
+     * Not a [CommitConflict] subclass, by the rule on [CommitConflict]:
+     * no client maps it into `CommitConflictError`, and none should —
+     * replaying the drop does not succeed until somebody (or some loop)
+     * changes the catalog.
+     */
+    class CatalogNotEmpty(
+        detail: String,
+        val reason: CatalogNotEmptyReason,
+    ) : HoglakeException(detail)
 
     /**
      * A commit named a table that EXISTS but has been dropped -> HTTP

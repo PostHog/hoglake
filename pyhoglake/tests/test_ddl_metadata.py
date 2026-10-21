@@ -1,12 +1,28 @@
 import json
 import re
+from pathlib import Path
 
 import httpx
 import pyarrow as pa
 import pytest
 from test_client import CATALOG_WIRE, TABLE_WIRE, _receipt
 
-from pyhoglake import HoglakeClient, ValidationError, ops
+from pyhoglake import (
+    CatalogFilesPendingExpiryError,
+    CatalogHasAbandonedUploadsError,
+    CatalogHasActiveCompactionClaimsError,
+    CatalogHasActiveUploadsError,
+    CatalogHasConsumerOffsetsError,
+    CatalogHasLiveNamespacesError,
+    CatalogNotEmptyError,
+    CatalogRemovalsPendingError,
+    CatalogTablesPendingRetirementError,
+    DroppedCatalog,
+    HoglakeClient,
+    NotFoundError,
+    ValidationError,
+    ops,
+)
 from pyhoglake.client import Catalog, Namespace, Table, View
 from pyhoglake.models import CatalogInfo, TableInfo, ViewInfo
 
@@ -281,3 +297,163 @@ def test_truncate_sends_identity_guard_and_updates_cache_only_on_success(
     request = httpx_mock.get_requests()[-1]
     assert json.loads(request.content) == METADATA
     assert dict(request.url.params) == {"expected_table_uuid": TABLE_WIRE["table_uuid"]}
+
+
+# ---- Catalog.drop (#412) -----------------------------------------------------
+
+_SPEC = Path(__file__).resolve().parents[2] / (
+    "server/src/main/resources/openapi/hoglake.yaml"
+)
+
+
+def test_catalog_drop_sends_delete_with_metadata_as_query(objects, httpx_mock):
+    _, catalog, _, _, _ = objects
+    path = "/catalogs/cat"
+    httpx_mock.add_response(
+        method="DELETE",
+        url=httpx.URL(BASE + path, params=METADATA),
+        json={"name": "cat", "data_path": "s3://bucket/lake"},
+    )
+    dropped = catalog.drop(**METADATA)
+    assert dropped == DroppedCatalog(name="cat", data_path="s3://bucket/lake")
+    request = httpx_mock.get_requests()[-1]
+    assert request.method == "DELETE"
+    assert request.url.path == "/v1" + path
+    assert dict(request.url.params) == METADATA
+    assert request.content == b""
+    assert b"%25" in request.url.query
+    # Exactly one request: unlike Namespace.drop there is no identity read.
+    assert len(httpx_mock.get_requests()) == 1
+
+
+def test_catalog_drop_clears_the_retention_cache(objects, httpx_mock):
+    # A reused Catalog after a same-name recreate must not apply the
+    # dropped catalog's retention to the new one's writer path.
+    _, catalog, _, _, _ = objects
+    catalog._retention_cache = 3600.0
+    catalog._retention_failed_at = 1.0
+    httpx_mock.add_response(
+        method="DELETE",
+        url=httpx.URL(BASE + "/catalogs/cat", params=METADATA),
+        json={"name": "cat", "data_path": "s3://bucket/lake"},
+    )
+    catalog.drop(**METADATA)
+    assert catalog._retention_cache is None
+    assert catalog._retention_failed_at is None
+
+
+def test_a_refused_catalog_drop_keeps_the_retention_cache(objects, httpx_mock):
+    _, catalog, _, _, _ = objects
+    catalog._retention_cache = 3600.0
+    httpx_mock.add_response(
+        method="DELETE",
+        url=httpx.URL(BASE + "/catalogs/cat", params=METADATA),
+        status_code=409,
+        json={"error": "catalog_not_empty", "reason": "live_namespaces"},
+    )
+    with pytest.raises(CatalogHasLiveNamespacesError):
+        catalog.drop(**METADATA)
+    assert catalog._retention_cache == 3600.0
+
+
+@pytest.mark.parametrize("field", ["author", "message"])
+@pytest.mark.parametrize("blank", [None, "", "\t\n ", "\u2003\u00a0", "\u0085"])
+def test_catalog_drop_metadata_is_validated_before_network(
+    objects, httpx_mock, field, blank
+):
+    _, catalog, _, _, _ = objects
+    with pytest.raises(ValidationError, match=field) as error:
+        catalog.drop(**{**METADATA, field: blank})
+    assert error.value.status_code is None
+    assert httpx_mock.get_requests() == []
+
+
+@pytest.mark.parametrize("field", ["author", "message"])
+def test_catalog_drop_metadata_keywords_are_required(objects, httpx_mock, field):
+    _, catalog, _, _, _ = objects
+    with pytest.raises(TypeError, match=field):
+        catalog.drop(**{k: v for k, v in METADATA.items() if k != field})
+    assert httpx_mock.get_requests() == []
+
+
+_REFUSALS = {
+    "live_namespaces": CatalogHasLiveNamespacesError,
+    "tables_pending_retirement": CatalogTablesPendingRetirementError,
+    "files_pending_expiry": CatalogFilesPendingExpiryError,
+    "removals_pending": CatalogRemovalsPendingError,
+    "active_compaction_claims": CatalogHasActiveCompactionClaimsError,
+    "consumer_offsets": CatalogHasConsumerOffsetsError,
+    "active_uploads": CatalogHasActiveUploadsError,
+    "abandoned_uploads_unsettled": CatalogHasAbandonedUploadsError,
+}
+
+
+@pytest.mark.parametrize("reason", sorted(_REFUSALS))
+def test_catalog_drop_refusal_maps_to_its_typed_error(objects, httpx_mock, reason):
+    _, catalog, _, _, _ = objects
+    httpx_mock.add_response(
+        method="DELETE",
+        url=httpx.URL(BASE + "/catalogs/cat", params=METADATA),
+        status_code=409,
+        json={"error": "catalog_not_empty", "detail": "why", "reason": reason},
+    )
+    with pytest.raises(_REFUSALS[reason]) as error:
+        catalog.drop(**METADATA)
+    # A base-class catch keeps working for every reason, and none of them
+    # tells a retry loop to replay.
+    assert isinstance(error.value, CatalogNotEmptyError)
+    assert error.value.reason == reason
+    assert error.value.status_code == 409
+    assert error.value.detail == "why"
+    assert not error.value.retryable
+    assert not error.value.re_prepare
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"error": "catalog_not_empty", "detail": "why", "reason": "from_the_future"},
+        {"error": "catalog_not_empty", "detail": "why"},
+    ],
+)
+def test_catalog_drop_unknown_reason_is_still_typed(objects, httpx_mock, body):
+    _, catalog, _, _, _ = objects
+    httpx_mock.add_response(
+        method="DELETE",
+        url=httpx.URL(BASE + "/catalogs/cat", params=METADATA),
+        status_code=409,
+        json=body,
+    )
+    with pytest.raises(CatalogNotEmptyError) as error:
+        catalog.drop(**METADATA)
+    assert type(error.value) is CatalogNotEmptyError
+    assert error.value.reason == body.get("reason")
+
+
+@pytest.mark.parametrize(
+    ("status", "error"), [(404, NotFoundError), (422, ValidationError)]
+)
+def test_catalog_drop_other_statuses_map_as_documented(
+    objects, httpx_mock, status, error
+):
+    _, catalog, _, _, _ = objects
+    httpx_mock.add_response(
+        method="DELETE",
+        url=httpx.URL(BASE + "/catalogs/cat", params=METADATA),
+        status_code=status,
+        json={"error": "not_found" if status == 404 else "validation"},
+    )
+    with pytest.raises(error):
+        catalog.drop(**METADATA)
+
+
+def test_catalog_drop_reasons_match_the_spec_enum():
+    # Read off the spec rather than restated: a reason added on the server
+    # without a typed error here fails this, not a caller's except ladder.
+    text = _SPEC.read_text()
+    block = text[text.index("\n    ApiError:\n") :]
+    enum = re.search(
+        r"\n        reason:\n          type: string\n          enum: \[([^]]*)]", block
+    )
+    assert enum, "ApiError.reason has no enum in the spec"
+    assert {r.strip() for r in enum.group(1).split(",")} == set(_REFUSALS)

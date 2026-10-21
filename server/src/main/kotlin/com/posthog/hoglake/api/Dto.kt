@@ -16,6 +16,7 @@ import com.posthog.hoglake.model.ConsumerOffset
 import com.posthog.hoglake.model.DataFile
 import com.posthog.hoglake.model.DeleteFile
 import com.posthog.hoglake.model.DeleteFileRegistration
+import com.posthog.hoglake.model.DroppedCatalog
 import com.posthog.hoglake.model.FileColumnStats
 import com.posthog.hoglake.model.FileOrderingBounds
 import com.posthog.hoglake.model.FileRegistration
@@ -53,14 +54,16 @@ import java.util.UUID
 // ---- errors --------------------------------------------------------------
 
 /**
- * Every error body. `{error, detail}` for all but one of them, and
+ * Every error body. `{error, detail}` for all but a few of them, and
  * NON_NULL omission keeps it exactly that shape — a client that parses
- * only those two is unaffected by the three fields below.
+ * only those two is unaffected by the fields below.
  *
  * `ddl_since_read_snapshot` carries more, because it is the one refusal
  * whose recovery is not "retry": a caller has to know WHICH tables
  * moved and that replaying is futile, and making it regex [detail] for
- * that would be a contract in prose.
+ * that would be a contract in prose. `catalog_not_empty` carries
+ * [reason] for the same reason: seven preconditions, seven different
+ * things to go and do, one code.
  */
 data class ApiErrorDto(
     val error: String,
@@ -71,6 +74,8 @@ data class ApiErrorDto(
     val readSnapshot: Long? = null,
     /** The recovery, when there is exactly one: `re-prepare`. */
     val retry: String? = null,
+    /** `catalog_not_empty` only: the first failing drop precondition. */
+    val reason: String? = null,
 )
 
 // ---- catalogs ------------------------------------------------------------
@@ -131,6 +136,17 @@ data class CatalogDto(
      */
     val oldestSnapshotTime: Instant? = null,
 )
+
+/**
+ * The DELETE /v1/catalogs/{catalog} body: which catalog went, and the
+ * prefix nothing was deleted under (see [DroppedCatalog]).
+ */
+data class DroppedCatalogDto(
+    val name: String,
+    val dataPath: String,
+)
+
+fun DroppedCatalog.toDto() = DroppedCatalogDto(name, dataPath)
 
 fun CatalogInfo.toDto(totals: CatalogTotals? = null) =
     CatalogDto(

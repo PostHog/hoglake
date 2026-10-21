@@ -18,6 +18,8 @@ from conftest import S3_ACCESS_KEY, S3_ENDPOINT, S3_SECRET_KEY
 
 from pyhoglake import (
     AlreadyExistsError,
+    CatalogHasLiveNamespacesError,
+    DroppedCatalog,
     HoglakeClient,
     NotFoundError,
     OffsetRegressionError,
@@ -123,6 +125,28 @@ def test_catalog_visible_in_listing(client, catalog):
 def test_catalog_not_found(client):
     with pytest.raises(NotFoundError):
         client.catalog(f"pyhog-nope-{RUN_ID}")
+
+
+def test_catalog_drop_refuses_until_empty_then_drops(client):
+    # Its own catalog: the module-scoped one is shared by every other test.
+    name = f"pyhog-drop-{RUN_ID}"
+    data_path = f"s3://{BUCKET}/{RUN_ID}-drop/"
+    catalog = client.create_catalog(name, data_path)
+    ns = catalog.create_namespace("doomed")
+    with pytest.raises(CatalogHasLiveNamespacesError) as refused:
+        catalog.drop(author="pyhoglake-live", message="drop a disposable catalog")
+    assert refused.value.reason == "live_namespaces"
+    assert "doomed" in (refused.value.detail or "")
+    assert client.catalog(name).name == name
+
+    ns.drop(author="pyhoglake-live", message="empty the catalog")
+    dropped = catalog.drop(author="pyhoglake-live", message="drop a disposable catalog")
+    assert dropped == DroppedCatalog(name=name, data_path=data_path)
+    with pytest.raises(NotFoundError):
+        client.catalog(name)
+    assert name not in [c.name for c in client.list_catalogs()]
+    with pytest.raises(NotFoundError):
+        catalog.drop(author="pyhoglake-live", message="already gone")
 
 
 def test_namespace_listing_and_lookup(catalog, ns):
