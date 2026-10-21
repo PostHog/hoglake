@@ -331,7 +331,7 @@ wheels = [
 
 [[package]]
 name = "hedgerow"
-version = "1.4.0"
+version = "1.4.1.dev0"
 source = { editable = "hedgerow" }
 dependencies = [
     { name = "duckdb" },
@@ -1087,7 +1087,7 @@ wheels = [
 
 [[package]]
 name = "pyhoglake"
-version = "1.4.0"
+version = "1.4.1.dev0"
 source = { editable = "pyhoglake" }
 dependencies = [
     { name = "httpx" },
