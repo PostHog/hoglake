@@ -14,7 +14,6 @@ import com.posthog.hoglake.model.validateSplitOffsets
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.persistence.Locks
-import com.posthog.hoglake.persistence.bindBigintArrayOrNull
 import com.posthog.hoglake.storedPayloadObjectMapper
 import io.github.oshai.kotlinlogging.KotlinLogging
 import org.jdbi.v3.core.Handle
@@ -141,7 +140,9 @@ class CommitService(
 
         /**
          * THE PATH-REUSE GUARD, issued once per commit under the
-         * per-catalog commit lock (invariant 4). `internal` so
+         * per-catalog commit lock (invariant 4) — VERBATIM as the `queued`
+         * CTE of [CommitTail.READ_SQL], and on its own by the
+         * atomic-creation tail. `internal` so
          * `V16FileRemovalPathIndexMigrationIntegrationTest` can EXPLAIN
          * the statement production runs instead of a hand-written
          * lookalike — V14's first index was proven by a predicate no
@@ -322,9 +323,8 @@ class CommitService(
         validatePathsUnderDataPath(dataPath, request)
         val append =
             validateFiles(
-                h,
-                catalogId,
                 ResolvedAppend(namespace, table, tableId, files, liveSpec(h, catalogId, tableId)),
+                liveColumnTypes(h, catalogId, tableId),
             )
         com.posthog.hoglake.service.UploadService.register(h, catalogId, uploadOwner, files.map { it.path to "data" })
         checkRemovalQueueCollisions(h, catalogId, listOf(append), emptyList())
@@ -342,7 +342,17 @@ class CommitService(
             :snapshotId, 'table_inserted_into', :tableId)
             """,
         ).bind("catalogId", catalogId).bind("snapshotId", snapshotId).bind("tableId", tableId).execute()
-        writeAppends(h, catalogId, snapshotId, firstId, listOf(append))
+        val nextRowId =
+            h.createQuery(
+                "SELECT next_row_id FROM hog_table_stats WHERE catalog_id = :catalogId AND table_id = :tableId",
+            )
+                .bind("catalogId", catalogId)
+                .bind("tableId", tableId)
+                .mapTo(Long::class.javaObjectType)
+                .findOne()
+                .orElse(null)
+        val (rows, _) = planAppends(listOf(append), firstId) { nextRowId }
+        CommitTail.writeAppendRows(h, catalogId, snapshotId, rows)
     }
 
     /**
@@ -411,7 +421,7 @@ class CommitService(
         val spec: LiveSpec?,
     )
 
-    /** The targeted data file's row, as [applyDeletes]'s per-target checks need it. */
+    /** The targeted data file's row, as [planDeletes]'s per-target checks need it. */
     private data class DeleteTarget(
         val tableId: Long,
         val recordCount: Long,
@@ -427,6 +437,14 @@ class CommitService(
         val files: List<DeleteFileRegistration>,
     )
 
+    /**
+     * The commit tail. Under the lock it sends TWO statements
+     * ([CommitTail]): one read of everything the checks below decide on,
+     * and one write of everything the commit publishes. The checks run
+     * between them in Kotlin, in the order and with the refusals they had
+     * when each read was its own statement — the numbered steps below are
+     * that order, and moving one moves what a client is told.
+     */
     private fun doCommit(
         h: Handle,
         catalogName: String,
@@ -444,117 +462,15 @@ class CommitService(
                 .findOne()
                 .orElseThrow { HoglakeException.NotFound("catalog '$catalogName'") }
         if (req.idempotencyKey == null) validatePathsUnderDataPath(dataPath, req)
-        Locks.acquireCatalogCommitLock(h, catalogId, commitLockTimeoutMs)
-
-        // Under the same catalog lock as publication, so concurrent retries
-        // cannot both allocate rows. A receipt is not tied to snapshot
-        // expiry — it has its own retention, which the cleanup sweep
-        // enforces (`HOGLAKE_RECEIPT_RETENTION_SECONDS`, 7 days; see
-        // CleanupService.purgeCommitReceipts for why a receipt has to
-        // outlive any payload a client may still replay).
-        req.idempotencyKey?.let { key ->
-            val receipt =
-                h.createQuery(
-                    """
-                    SELECT snapshot_id, schema_version, fingerprint, request::text AS request
-                    FROM hog_commit_receipt WHERE catalog_id = :catalog AND idempotency_key = :key
-                    """,
-                ).bind("catalog", catalogId).bind("key", key)
-                    .map { rs, _ ->
-                        val stored = rs.getBytes("fingerprint")
-                        val same =
-                            when {
-                                stored == null -> {
-                                    // A PRE-V24 RECEIPT, which carries the body and no
-                                    // digest. Re-canonicalize and compare strings, which
-                                    // is what this check did before the column existed.
-                                    // Deleted with the `request` column once no
-                                    // null-fingerprint row is left (V24's header names
-                                    // the follow-up).
-                                    //
-                                    // storedPayloadObjectMapper, NOT the strict API mapper:
-                                    // this JSON was written by a replica of this service,
-                                    // which during a rolling deploy may be a NEWER one
-                                    // carrying a field this version does not know. A strict
-                                    // decode would throw here, inside the commit tail under
-                                    // the catalog lock, and turn a half-finished deploy into
-                                    // 500s on replay.
-                                    val body =
-                                        storedPayloadObjectMapper().readValue<CommitRequest>(rs.getString("request"))
-                                    commitFingerprint(body) == requestJson
-                                }
-                                stored.firstOrNull() != COMMIT_FINGERPRINT_VERSION -> {
-                                    // A DIGEST THIS BUILD CANNOT COMPARE, and the answer
-                                    // is the stored snapshot rather than a refusal.
-                                    //
-                                    // The byte moves when the canonical string moves (see
-                                    // COMMIT_FINGERPRINT_VERSION), and an old canonical
-                                    // string is unrecoverable — so there is no comparison
-                                    // to make. The two available answers are "this key was
-                                    // published, here is its snapshot" and "422, your
-                                    // request differs". The first is true of every correct
-                                    // client and of the one case a wrong one could reach
-                                    // (a key genuinely reused with a different payload,
-                                    // which then gets the earlier publication's result
-                                    // instead of a refusal — a client bug reported as a
-                                    // success, which is what every idempotency-key API
-                                    // does). The second is a NEW 4xx on a path deployed
-                                    // writers use, for a whole retention window, caused by
-                                    // OUR format change: the failure AGENT.md's "stage
-                                    // every refusal a live client could hit" forbids.
-                                    //
-                                    // Counted, because it is otherwise invisible: a
-                                    // standing nonzero rate means a version bump is being
-                                    // answered by this arm and the operator should know how
-                                    // many replays it covers.
-                                    Metrics.commitReceiptUnknownDigestVersion(catalogName)
-                                    true
-                                }
-                                else ->
-                                    // THE V24 PATH: 33 bytes against 33 bytes, deciding
-                                    // exactly what the string comparison above decided,
-                                    // because the digest is taken OF that string
-                                    // (commitFingerprintDigest). `contentEquals`, not
-                                    // `==`: arrays compare by identity in Kotlin, and
-                                    // reference equality here would refuse every replay.
-                                    stored.contentEquals(fingerprint)
-                            }
-                        if (!same) {
-                            throw HoglakeException.Validation("idempotency_key reused with a different request")
-                        }
-                        CommitResult(rs.getLong("snapshot_id"), rs.getLong("schema_version"))
-                    }.findOne().orElse(null)
-            if (receipt != null) return receipt
-        }
-
-        if (req.idempotencyKey != null) validatePathsUnderDataPath(dataPath, req)
-
-        val catalogHead =
-            h.createQuery(
-                """
-                SELECT last_snapshot_id, schema_version, earliest_snapshot_id, earliest_snapshot_time
-                FROM hog_catalog WHERE catalog_id = ?
-                """,
-            )
-                .bind(0, catalogId)
-                .map { rs, _ ->
-                    CatalogHead(
-                        head = rs.getLong(1),
-                        schemaVersion = rs.getLong(2),
-                        earliestSnapshotId = rs.getLong(3),
-                        earliestSnapshotTime =
-                            rs.getObject(4, java.time.OffsetDateTime::class.java)?.toInstant(),
-                    )
-                }
-                .one()
-        val (head, schemaVersion) = catalogHead.head to catalogHead.schemaVersion
 
         // 2. Merge duplicate (namespace, table) appends/deletes, preserving
         // request order (first occurrence for tables, concatenation for
-        // files), then resolve each to a live table at head. Every
+        // files); they are resolved to live tables at head below. Every
         // expected_table_uuid supplied for a table is collected and checked
         // against the resolved incarnation — merged duplicates that
         // disagree cannot both match, so a stale one still conflicts.
+        // Request-only, so it runs before the lock: the read needs the
+        // names, and nothing here can refuse.
         val mergedAppends = LinkedHashMap<Pair<String, String>, MutableList<FileRegistration>>()
         val expectedUuids = HashMap<Pair<String, String>, MutableSet<UUID>>()
         for (append in req.appends) {
@@ -572,6 +488,73 @@ class CommitService(
                 expectedUuids.getOrPut(deletes.namespace to deletes.table) { mutableSetOf() } += it
             }
         }
+        // The read's table list, in the order resolution decides refusals:
+        // the appended tables, then the tables only deleted from.
+        // requireUnchangedTables binds the DELETE targets, not every
+        // touched table. A delete is published against a read of the
+        // target's file set, so anything that moved that file set is a
+        // conflict; an APPEND carries no such read, so a table this commit
+        // only appends to keeps the DDL-only rule even inside a guarded
+        // transaction — otherwise an append-only explicit transaction would
+        // 409 on a concurrent INSERT into the same table, which is the one
+        // thing appends have never done.
+        val tableKeys =
+            (mergedAppends.keys + mergedDeletes.keys).map { key ->
+                CommitTail.TableKey(
+                    namespace = key.first,
+                    table = key.second,
+                    appending = key in mergedAppends,
+                    unchanged = req.requireUnchangedTables && key in mergedDeletes,
+                )
+            }
+        val ordOf = tableKeys.withIndex().associate { (i, k) -> (k.namespace to k.table) to i + 1 }
+
+        Locks.acquireCatalogCommitLock(h, catalogId, commitLockTimeoutMs)
+
+        // ONE statement reads everything the steps below decide on: the
+        // receipt, the head, every table's resolution, spec, live columns
+        // and allocator, the conflict rows, the upload claims (locked), the
+        // removal queue's claims on these paths, and every DV target and its
+        // live vector. See CommitTail for why one snapshot serves them all.
+        val read =
+            CommitTail.read(
+                h,
+                CommitTail.ReadInputs(
+                    catalogId = catalogId,
+                    idempotencyKey = req.idempotencyKey,
+                    tables = tableKeys,
+                    readSnapshot = req.readSnapshot,
+                    paths =
+                        (
+                            mergedAppends.values.flatMap { files -> files.map { it.path } } +
+                                mergedDeletes.values.flatMap { files -> files.map { it.path } }
+                        ).distinct(),
+                    targetIds =
+                        mergedDeletes.values.flatMap { files ->
+                            files.filter { it.dataFilePath == null }.map { it.dataFileId }
+                        }.distinct(),
+                ),
+            )
+
+        // Under the same catalog lock as publication, so concurrent retries
+        // cannot both allocate rows. A receipt is not tied to snapshot
+        // expiry — it has its own retention, which the cleanup sweep
+        // enforces (`HOGLAKE_RECEIPT_RETENTION_SECONDS`, 7 days; see
+        // CleanupService.purgeCommitReceipts for why a receipt has to
+        // outlive any payload a client may still replay).
+        read.receipt?.let { return replayedReceipt(catalogName, it, requestJson, fingerprint) }
+
+        if (req.idempotencyKey != null) validatePathsUnderDataPath(dataPath, req)
+
+        val catalogHead =
+            CatalogHead(
+                head = read.head.lastSnapshotId,
+                schemaVersion = read.head.schemaVersion,
+                earliestSnapshotId = read.head.earliestSnapshotId,
+                earliestSnapshotTime = read.head.earliestSnapshotTime,
+            )
+        val (head, schemaVersion) = catalogHead.head to catalogHead.schemaVersion
+
         if (mergedAppends.isEmpty() && mergedDeletes.isEmpty()) {
             throw HoglakeException.Validation("commit has no appends or deletes")
         }
@@ -587,10 +570,14 @@ class CommitService(
             )
         }
 
-        fun resolveGuarded(key: Pair<String, String>): LiveTable {
+        // The read's rows for one table: one per live spec, and a spec is
+        // only read for an appended table. Two live incarnations of one
+        // name is a broken invariant (the unique live-name indexes), and is
+        // reported as the per-table lookup's `findOne` reported it.
+        fun resolveGuarded(key: Pair<String, String>): List<CommitTail.ResolvedTable> {
             val (namespace, table) = key
-            val live =
-                resolveLiveTable(h, catalogId, namespace, table)
+            val rows =
+                read.tables[ordOf.getValue(key)]
                     // The miss path, and only the miss path, asks WHY:
                     // a name that never existed is still the 422 it was,
                     // while a name whose table was dropped is a typed
@@ -603,6 +590,10 @@ class CommitService(
                     // dropped table's rows are unreachable, the refusal
                     // says so too.
                     ?: throw droppedTableRefusal(h, catalogId, namespace, table)
+            check(rows.distinctBy { it.tableId }.size == 1) {
+                "more than one live table resolves '$namespace.$table' in catalog_id=$catalogId"
+            }
+            val live = rows.first()
             for (expected in expectedUuids[key].orEmpty()) {
                 // The atomic incarnation guard: the name resolved, but to a
                 // different incarnation than the writer planned against —
@@ -620,20 +611,24 @@ class CommitService(
                     )
                 }
             }
-            return live
+            return rows
         }
+        // hog_table_stats.next_row_id of each appended table, as read; null = no stats row.
+        val nextRowIds = HashMap<Long, Long?>()
         val resolvedAppends =
             mergedAppends.map { (key, files) ->
                 val (namespace, table) = key
-                val live = resolveGuarded(key)
-                ResolvedAppend(namespace, table, live.tableId, files, liveSpec(h, catalogId, live.tableId))
+                val rows = resolveGuarded(key)
+                val live = rows.first()
+                nextRowIds[live.tableId] = live.nextRowId
+                ResolvedAppend(namespace, table, live.tableId, files, liveSpec(rows))
             }
         val appendTableIdByName =
             resolvedAppends.associate { (it.namespace to it.table) to it.tableId }
         val resolvedDeletes =
             mergedDeletes.map { (key, files) ->
                 val (namespace, table) = key
-                val tableId = appendTableIdByName[key] ?: resolveGuarded(key).tableId
+                val tableId = appendTableIdByName[key] ?: resolveGuarded(key).first().tableId
                 ResolvedDeletes(namespace, table, tableId, files)
             }
 
@@ -731,8 +726,8 @@ class CommitService(
         // produced — the resolved table ids and names — and nothing below
         // it depends on having run: validateFiles' sanitized return is
         // consumed at write time, and the removal-queue/upload serializers
-        // key on paths. Both still run inside this transaction under the
-        // same catalog lock.
+        // key on paths. All of them read under the same catalog lock, in
+        // the one read statement above.
         if (readSnapshot != null) {
             if (readSnapshot > head) {
                 throw HoglakeException.Validation(
@@ -760,149 +755,188 @@ class CommitService(
             val names = HashMap<Long, String>()
             resolvedAppends.forEach { names[it.tableId] = "${it.namespace}.${it.table}" }
             resolvedDeletes.forEach { names[it.tableId] = "${it.namespace}.${it.table}" }
-            // requireUnchangedTables binds the DELETE targets, not every
-            // touched table. A delete is published against a read of the
-            // target's file set, so anything that moved that file set is a
-            // conflict; an APPEND carries no such read, so a table this
-            // commit only appends to keeps the DDL-only rule even inside a
-            // guarded transaction — otherwise an append-only explicit
-            // transaction would 409 on a concurrent INSERT into the same
-            // table, which is the one thing appends have never done.
-            val unchangedTableIds =
-                if (req.requireUnchangedTables) resolvedDeletes.mapTo(HashSet()) { it.tableId } else emptySet()
-            checkConflicts(h, catalogId, readSnapshot, names, unchangedTableIds)
+            checkConflicts(readSnapshot, read.conflicts, names)
         }
 
         // 4. Structural validation. Nothing is written unless all of it
         // passes. The RESULT is what gets written: validateFiles also
         // sanitizes each file's stats (StatsSanity).
-        val validatedAppends = resolvedAppends.map { validateFiles(h, catalogId, it) }
+        val validatedAppends = resolvedAppends.map { validateFiles(it, read.columns[it.tableId].orEmpty()) }
         validateDeleteRegistrations(resolvedDeletes)
 
-        // 4b. Removal-queue collision check, and IT IS THE SERIALIZER
-        // NOW RATHER THAN THE COMMIT LOCK: cleanup's drain takes no lock
-        // at all (V21 — it claims rows instead), so what keeps it off a
-        // path this commit is registering is this refusal plus the fact
-        // that the drain reads only UNDRAINED rows. A registered path with
-        // an undrained hog_file_removal row is scheduled for physical
-        // deletion — accepting it would let the drain delete the object
-        // out from under the new live row (path reuse under a
-        // deterministic path scheme / writer retry). A CLAIMED row is
-        // still an undrained row, so the refusal stands for the whole
-        // time the path is somebody's work.
+        // 4b. Upload claims, then the removal-queue collision check, and
+        // THE LATTER IS THE SERIALIZER NOW RATHER THAN THE COMMIT LOCK:
+        // cleanup's drain takes no lock at all (V21 — it claims rows
+        // instead), so what keeps it off a path this commit is registering
+        // is this refusal plus the fact that the drain reads only UNDRAINED
+        // rows. A registered path with an undrained hog_file_removal row is
+        // scheduled for physical deletion — accepting it would let the
+        // drain delete the object out from under the new live row (path
+        // reuse under a deterministic path scheme / writer retry). A
+        // CLAIMED row is still an undrained row, so the refusal stands for
+        // the whole time the path is somebody's work.
         // Duplicate paths against live/historical file rows stay legal —
         // this rejects only paths the cleanup queue currently owns; once
         // the entry drains (drained_at set) the path is registrable again.
-        com.posthog.hoglake.service.UploadService.register(
-            h,
-            catalogId,
-            req.idempotencyKey,
+        // Both read their rows in the read statement, the claims FOR
+        // UPDATE; the claims settle in the write.
+        val registered =
             resolvedAppends.flatMap { a -> a.files.map { it.path to "data" } } +
-                resolvedDeletes.flatMap { d -> d.files.map { it.path to "delete" } },
-        )
-        checkRemovalQueueCollisions(h, catalogId, resolvedAppends, resolvedDeletes)
+                resolvedDeletes.flatMap { d -> d.files.map { it.path to "delete" } }
+        val settleUploads =
+            if (registered.isEmpty()) {
+                emptyList()
+            } else {
+                com.posthog.hoglake.service.UploadService.claimsToSettle(
+                    read.claims,
+                    read.retained,
+                    com.posthog.hoglake.service.UploadService.registrationKinds(registered),
+                    req.idempotencyKey,
+                )
+            }
+        refuseQueuedPaths(read.queued)
 
-        // 5. Allocations, all under the lock via UPDATE..RETURNING. Data
-        // files and DV files share the next_file_id allocator. Neither
-        // appends nor deletes are DDL: schema_version is NOT bumped.
+        // 5. Allocations: the snapshot is head + 1 and the files take ids
+        // from next_file_id as the read returned them — data files and DV
+        // files share the allocator, appends first. The write's guarded
+        // UPDATE advances both. Neither appends nor deletes are DDL:
+        // schema_version is NOT bumped.
         val appendFileCount = resolvedAppends.sumOf { it.files.size }
         val deleteFileCount = resolvedDeletes.sumOf { it.files.size }
         val totalFiles = appendFileCount + deleteFileCount
-        val (snapshotId, firstFileId) =
-            h.createQuery(
-                """
-            UPDATE hog_catalog
-               SET last_snapshot_id = last_snapshot_id + 1,
-                   next_file_id = next_file_id + ?
-             WHERE catalog_id = ?
-            RETURNING last_snapshot_id, next_file_id
-            """,
-            )
-                .bind(0, totalFiles)
-                .bind(1, catalogId)
-                .map { rs, _ -> rs.getLong(1) to (rs.getLong(2) - totalFiles) }
-                .one()
+        val snapshotId = head + 1
+        val firstFileId = read.head.nextFileId
 
-        // 6. Writes: snapshot, change rows, then appends before deletes (a
-        // delete targeting a same-commit data file is detected below by its
-        // begin_snapshot and rejected, rolling the whole commit back).
+        // 6. The rows, appends before deletes (a delete targeting a
+        // same-commit data file is detected by its begin_snapshot and
+        // rejected, rolling the whole commit back) — every check the
+        // separate writes made, in the order they made it, before the one
+        // statement that writes them.
+        val (appendRows, firstDeleteFileId) = planAppends(validatedAppends, firstFileId) { nextRowIds[it] }
+        val deleteRows =
+            planDeletes(resolvedDeletes, readSnapshot, snapshotId, firstDeleteFileId, appendRows.files, read)
+
         // snapshot_time = clock_timestamp(), NOT the column default now():
         // now() is the TRANSACTION start time, which predates the advisory
         // lock wait, so defaulting it would let a queued commit record a
         // time older than an earlier-committed snapshot's. clock_timestamp()
-        // executes here, under the lock, keeping snapshot_time monotone
-        // with snapshot id (modulo the DB clock stepping backwards) — the
-        // premise resolveTimestamp relies on.
-        h.createUpdate(
-            """
-            INSERT INTO hog_snapshot (catalog_id, snapshot_id, snapshot_time, schema_version, author, commit_message)
-            VALUES (:catalogId, :snapshotId, clock_timestamp(), :schemaVersion, :author, :message)
-            """,
+        // executes in the write, under the lock, keeping snapshot_time
+        // monotone with snapshot id (modulo the DB clock stepping
+        // backwards) — the premise resolveTimestamp relies on.
+        //
+        // The receipt is THE FINGERPRINT, AND NO BODY. `request` is left
+        // NULL: it used to hold the whole canonical payload, which on the
+        // prod-us events writer's 270-file x 25-column append is 1.5 MB of
+        // jsonb, 566 KB on disk after TOAST, and ~38 ms of the ~100 ms this
+        // commit holds the per-catalog lock (#240). Nothing reads it that
+        // 32 bytes cannot answer — see [commitFingerprintDigest] for what
+        // is lost with it.
+        //
+        // ROLLING-DEPLOY NOTE, and NULL is the deliberate choice. A
+        // pre-V24 replica replaying a receipt this statement wrote reads
+        // `request` as NULL and throws inside its own commit tail: a
+        // transient 500 on an already-published key, for the length of
+        // the deploy, on a path that retries. The alternative — writing a
+        // placeholder body so the old decode succeeds — makes that
+        // replica compare a placeholder against the real request and
+        // answer `idempotency_key reused with a different request`: a 422
+        // that tells a correct client it is wrong, which is strictly
+        // worse than a retryable 500.
+        CommitTail.write(
+            h,
+            CommitTail.WriteSet(
+                catalogId = catalogId,
+                head = head,
+                firstFileId = firstFileId,
+                fileCount = totalFiles,
+                schemaVersion = schemaVersion,
+                author = req.author,
+                message = req.message,
+                changes =
+                    resolvedAppends.map { "table_inserted_into" to it.tableId } +
+                        resolvedDeletes.map { "table_deleted_from" to it.tableId },
+                appends = appendRows,
+                deletes = deleteRows,
+                settleUploads = settleUploads,
+                idempotencyKey = req.idempotencyKey,
+                fingerprint = fingerprint,
+            ),
         )
-            .bind("catalogId", catalogId)
-            .bind("snapshotId", snapshotId)
-            .bind("schemaVersion", schemaVersion)
-            .bind("author", req.author)
-            .bind("message", req.message)
-            .execute()
-
-        val changeBatch =
-            h.prepareBatch(
-                """
-            INSERT INTO hog_snapshot_change (catalog_id, snapshot_id, kind, object_id)
-            VALUES (:catalogId, :snapshotId, :kind, :tableId)
-            """,
-            )
-        for (append in resolvedAppends) {
-            changeBatch
-                .bind("catalogId", catalogId)
-                .bind("snapshotId", snapshotId)
-                .bind("kind", "table_inserted_into")
-                .bind("tableId", append.tableId)
-                .add()
-        }
-        for (deletes in resolvedDeletes) {
-            changeBatch
-                .bind("catalogId", catalogId)
-                .bind("snapshotId", snapshotId)
-                .bind("kind", "table_deleted_from")
-                .bind("tableId", deletes.tableId)
-                .add()
-        }
-        changeBatch.execute()
-
-        var nextFileId = firstFileId
-        nextFileId = writeAppends(h, catalogId, snapshotId, nextFileId, validatedAppends)
-        applyDeletes(h, catalogId, snapshotId, readSnapshot, nextFileId, resolvedDeletes)
-
-        req.idempotencyKey?.let { key ->
-            // THE FINGERPRINT, AND NO BODY. `request` is left NULL: it used
-            // to hold the whole canonical payload, which on the prod-us
-            // events writer's 270-file x 25-column append is 1.5 MB of jsonb,
-            // 566 KB on disk after TOAST, and ~38 ms of the ~100 ms this
-            // commit holds the per-catalog lock (#240). Nothing reads it that
-            // 32 bytes cannot answer — see [commitFingerprintDigest] for what
-            // is lost with it.
-            //
-            // ROLLING-DEPLOY NOTE, and NULL is the deliberate choice. A
-            // pre-V24 replica replaying a receipt this statement wrote reads
-            // `request` as NULL and throws inside its own commit tail: a
-            // transient 500 on an already-published key, for the length of
-            // the deploy, on a path that retries. The alternative — writing a
-            // placeholder body so the old decode succeeds — makes that
-            // replica compare a placeholder against the real request and
-            // answer `idempotency_key reused with a different request`: a 422
-            // that tells a correct client it is wrong, which is strictly
-            // worse than a retryable 500.
-            h.createUpdate(
-                """
-                INSERT INTO hog_commit_receipt (catalog_id, idempotency_key, fingerprint, snapshot_id, schema_version)
-                VALUES (:catalog, :key, :fingerprint, :snapshot, :schema)
-                """,
-            ).bind("catalog", catalogId).bind("key", key).bind("fingerprint", fingerprint)
-                .bind("snapshot", snapshotId).bind("schema", schemaVersion).execute()
-        }
         return CommitResult(snapshotId, schemaVersion)
+    }
+
+    /**
+     * The answer for an idempotency key that already published: the
+     * stored snapshot, or the refusal for a different request under the
+     * same key.
+     */
+    private fun replayedReceipt(
+        catalogName: String,
+        receipt: CommitTail.Receipt,
+        requestJson: String?,
+        fingerprint: ByteArray?,
+    ): CommitResult {
+        val stored = receipt.fingerprint
+        val same =
+            when {
+                stored == null -> {
+                    // A PRE-V24 RECEIPT, which carries the body and no
+                    // digest. Re-canonicalize and compare strings, which
+                    // is what this check did before the column existed.
+                    // Deleted with the `request` column once no
+                    // null-fingerprint row is left (V24's header names
+                    // the follow-up).
+                    //
+                    // storedPayloadObjectMapper, NOT the strict API mapper:
+                    // this JSON was written by a replica of this service,
+                    // which during a rolling deploy may be a NEWER one
+                    // carrying a field this version does not know. A strict
+                    // decode would throw here, inside the commit tail under
+                    // the catalog lock, and turn a half-finished deploy into
+                    // 500s on replay.
+                    val body = storedPayloadObjectMapper().readValue<CommitRequest>(receipt.request!!)
+                    commitFingerprint(body) == requestJson
+                }
+                stored.firstOrNull() != COMMIT_FINGERPRINT_VERSION -> {
+                    // A DIGEST THIS BUILD CANNOT COMPARE, and the answer
+                    // is the stored snapshot rather than a refusal.
+                    //
+                    // The byte moves when the canonical string moves (see
+                    // COMMIT_FINGERPRINT_VERSION), and an old canonical
+                    // string is unrecoverable — so there is no comparison
+                    // to make. The two available answers are "this key was
+                    // published, here is its snapshot" and "422, your
+                    // request differs". The first is true of every correct
+                    // client and of the one case a wrong one could reach
+                    // (a key genuinely reused with a different payload,
+                    // which then gets the earlier publication's result
+                    // instead of a refusal — a client bug reported as a
+                    // success, which is what every idempotency-key API
+                    // does). The second is a NEW 4xx on a path deployed
+                    // writers use, for a whole retention window, caused by
+                    // OUR format change: the failure AGENT.md's "stage
+                    // every refusal a live client could hit" forbids.
+                    //
+                    // Counted, because it is otherwise invisible: a
+                    // standing nonzero rate means a version bump is being
+                    // answered by this arm and the operator should know how
+                    // many replays it covers.
+                    Metrics.commitReceiptUnknownDigestVersion(catalogName)
+                    true
+                }
+                else ->
+                    // THE V24 PATH: 33 bytes against 33 bytes, deciding
+                    // exactly what the string comparison above decided,
+                    // because the digest is taken OF that string
+                    // (commitFingerprintDigest). `contentEquals`, not
+                    // `==`: arrays compare by identity in Kotlin, and
+                    // reference equality here would refuse every replay.
+                    stored.contentEquals(fingerprint)
+            }
+        if (!same) {
+            throw HoglakeException.Validation("idempotency_key reused with a different request")
+        }
+        return CommitResult(receipt.snapshotId, receipt.schemaVersion)
     }
 
     /**
@@ -975,6 +1009,9 @@ class CommitService(
      * row that is not still queued. See [REMOVAL_QUEUE_COLLISION_SQL] for
      * the other half — which queue inserters race a registration, and
      * what serializes each of them.
+     *
+     * The atomic-creation tail's own statement; a commit runs the same
+     * SQL inside [CommitTail.READ_SQL] and refuses through [refuseQueuedPaths].
      */
     private fun checkRemovalQueueCollisions(
         h: Handle,
@@ -986,12 +1023,17 @@ class CommitService(
             (appends.flatMap { a -> a.files.map { it.path } } + deletes.flatMap { d -> d.files.map { it.path } })
                 .distinct()
         if (paths.isEmpty()) return
-        val queued =
+        refuseQueuedPaths(
             h.createQuery(REMOVAL_QUEUE_COLLISION_SQL)
                 .bind("catalogId", catalogId)
                 .bindArray("paths", String::class.java, paths)
                 .mapTo(String::class.java)
-                .list()
+                .list(),
+        )
+    }
+
+    /** The path-reuse refusal over the [REMOVAL_QUEUE_COLLISION_SQL] hits [queued]; none is a pass. */
+    private fun refuseQueuedPaths(queued: List<String>) {
         if (queued.isNotEmpty()) {
             throw HoglakeException.CommitConflict(
                 "path(s) scheduled for deletion by the cleanup queue: " +
@@ -1002,47 +1044,25 @@ class CommitService(
         }
     }
 
-    /** hog_data_file / hog_file_partition_value / hog_file_column_stats writes. Returns the next free file id. */
-    private fun writeAppends(
-        h: Handle,
-        catalogId: Long,
-        snapshotId: Long,
-        firstFileId: Long,
+    /**
+     * The hog_table_stats / hog_data_file / hog_file_partition_value /
+     * hog_file_column_stats rows for [resolved]: file ids from
+     * [firstFileId] in request order, and each table's row-id range from
+     * [nextRowId] — its hog_table_stats.next_row_id as read under the
+     * lock, null when the table has no stats row. Returns the rows and the
+     * next free file id. Every refusal the per-table statements made is
+     * made here, in the same order, before anything is written.
+     */
+    private fun planAppends(
         resolved: List<ResolvedAppend>,
-    ): Long {
-        if (resolved.isEmpty()) return firstFileId
-        val fileBatch =
-            h.prepareBatch(
-                """
-            INSERT INTO hog_data_file (catalog_id, data_file_id, table_id, begin_snapshot,
-                                       path, record_count, file_size_bytes, footer_size,
-                                       row_id_start, stats_state, spec_id, split_offsets)
-            VALUES (:catalogId, :dataFileId, :tableId, :beginSnapshot,
-                    :path, :recordCount, :fileSizeBytes, :footerSize,
-                    :rowIdStart, :statsState, :specId, :splitOffsets)
-            """,
-            )
-        val statsBatch =
-            h.prepareBatch(
-                """
-            INSERT INTO hog_file_column_stats (catalog_id, data_file_id, field_id, value_count,
-                                               null_count, nan_count, size_bytes,
-                                               lower_bound, upper_bound)
-            VALUES (:catalogId, :dataFileId, :fieldId, :valueCount,
-                    :nullCount, :nanCount, :sizeBytes,
-                    :lowerBound, :upperBound)
-            """,
-            )
-        val partitionBatch =
-            h.prepareBatch(
-                """
-            INSERT INTO hog_file_partition_value (catalog_id, data_file_id, key_index, value)
-            VALUES (:catalogId, :dataFileId, :keyIndex, :value)
-            """,
-            )
+        firstFileId: Long,
+        nextRowId: (Long) -> Long?,
+    ): Pair<CommitTail.AppendRows, Long> {
+        val stats = ArrayList<CommitTail.StatsAdvance>()
+        val files = ArrayList<CommitTail.DataFileRow>()
+        val partitionValues = ArrayList<CommitTail.PartitionValueRow>()
+        val columnStats = ArrayList<CommitTail.ColumnStatsRow>()
         var nextFileId = firstFileId
-        var haveStats = false
-        var havePartitionValues = false
         for (append in resolved) {
             // The per-table record sum and the allocator advancement are
             // both overflow-checked (Math.addExact): a wrapped sum would
@@ -1066,128 +1086,78 @@ class CommitService(
                         "file_size_bytes sum overflows for ${append.namespace}.${append.table}",
                     )
                 }
-            // Per-table row-id range: read the allocator, advance it with
-            // the table's rollup (safe read-then-write — the per-catalog
-            // advisory lock serializes every writer); each file gets a
-            // contiguous slice in request order.
+            // Per-table row-id range: advance the allocator by the table's
+            // rollup (safe read-then-write — the per-catalog advisory lock
+            // serializes every writer, and the write's UPDATE is guarded
+            // by the value read); each file gets a contiguous slice in
+            // request order.
             val rowIdStart =
-                h.createQuery(
-                    """
-                SELECT next_row_id FROM hog_table_stats
-                 WHERE catalog_id = :catalogId AND table_id = :tableId
-                """,
-                )
-                    .bind("catalogId", catalogId)
-                    .bind("tableId", append.tableId)
-                    .mapTo(Long::class.java)
-                    .findOne()
-                    .orElseThrow {
-                        IllegalStateException(
-                            "missing hog_table_stats row for table_id=${append.tableId}",
-                        )
-                    }
+                nextRowId(append.tableId)
+                    ?: throw IllegalStateException("missing hog_table_stats row for table_id=${append.tableId}")
             val newNextRowId =
                 try {
                     Math.addExact(rowIdStart, recordSum)
                 } catch (_: ArithmeticException) {
                     throw HoglakeException.Validation("record_count sum overflows row-id space")
                 }
-            h.createUpdate(
-                """
-                UPDATE hog_table_stats
-                   SET next_row_id = :newNextRowId,
-                       record_count = record_count + :records,
-                       file_size_bytes = file_size_bytes + :bytes
-                 WHERE catalog_id = :catalogId AND table_id = :tableId
-                """,
-            )
-                .bind("newNextRowId", newNextRowId)
-                .bind("records", recordSum)
-                .bind("bytes", byteSum)
-                .bind("catalogId", catalogId)
-                .bind("tableId", append.tableId)
-                .execute()
+            stats += CommitTail.StatsAdvance(append.tableId, rowIdStart, newNextRowId, recordSum, byteSum)
             var rowId = rowIdStart
-
             for (file in append.files) {
                 file.validateFooterSize()
                 val dataFileId = nextFileId++
-                fileBatch
-                    .bind("catalogId", catalogId)
-                    .bind("dataFileId", dataFileId)
-                    .bind("tableId", append.tableId)
-                    .bind("beginSnapshot", snapshotId)
-                    .bind("path", file.path)
-                    .bind("recordCount", file.recordCount)
-                    .bind("fileSizeBytes", file.fileSizeBytes)
-                    .bind("footerSize", file.footerSize)
-                    .bind("rowIdStart", rowId)
-                    .bind("statsState", if (file.columnStats != null) "provided" else "pending")
-                    .bind("specId", append.spec?.specId)
-                    .bindBigintArrayOrNull("splitOffsets", file.splitOffsets)
-                    .add()
+                files +=
+                    CommitTail.DataFileRow(
+                        dataFileId = dataFileId,
+                        tableId = append.tableId,
+                        path = file.path,
+                        recordCount = file.recordCount,
+                        fileSizeBytes = file.fileSizeBytes,
+                        footerSize = file.footerSize,
+                        rowIdStart = rowId,
+                        statsState = if (file.columnStats != null) "provided" else "pending",
+                        specId = append.spec?.specId,
+                        splitOffsets = file.splitOffsets,
+                    )
                 rowId += file.recordCount
                 if (append.spec != null) {
                     for ((keyIndex, value) in file.partitionValues!!.withIndex()) {
-                        havePartitionValues = true
-                        partitionBatch
-                            .bind("catalogId", catalogId)
-                            .bind("dataFileId", dataFileId)
-                            .bind("keyIndex", keyIndex)
-                            .bind("value", value)
-                            .add()
+                        partitionValues += CommitTail.PartitionValueRow(dataFileId, keyIndex, value)
                     }
                 }
-                for (stats in file.columnStats.orEmpty()) {
-                    haveStats = true
-                    statsBatch
-                        .bind("catalogId", catalogId)
-                        .bind("dataFileId", dataFileId)
-                        .bind("fieldId", stats.fieldId)
-                        .bind("valueCount", stats.valueCount)
-                        .bind("nullCount", stats.nullCount)
-                        .bind("nanCount", stats.nanCount)
-                        .bind("sizeBytes", stats.sizeBytes)
-                        .bind("lowerBound", stats.lowerBound)
-                        .bind("upperBound", stats.upperBound)
-                        .add()
+                for (stat in file.columnStats.orEmpty()) {
+                    columnStats += CommitTail.ColumnStatsRow(dataFileId, stat)
                 }
             }
         }
-        fileBatch.execute()
-        if (havePartitionValues) partitionBatch.execute()
-        if (haveStats) statsBatch.execute()
-        return nextFileId
+        return CommitTail.AppendRows(stats, files, partitionValues, columnStats) to nextFileId
     }
 
     /**
      * DV registrations: per-target existence/ownership/liveness checks,
      * the supersession chain (stale-vector -> CommitConflict, shrink ->
-     * Validation), then hog_delete_file inserts. Runs AFTER appends are
-     * written so a same-commit target is visible here and rejected by its
-     * begin_snapshot. hog_table_stats is deliberately untouched (see class
-     * KDoc).
+     * Validation), then the hog_delete_file rows, ids from [firstFileId].
+     * Checked AFTER the appends are planned, against [appended] as well as
+     * the targets the read returned, so a same-commit target is seen
+     * exactly as it was when the appends were inserted before this ran:
+     * rejected by its begin_snapshot, or — a transaction's reference by
+     * path — resolved to it. hog_table_stats is deliberately untouched
+     * (see class KDoc).
      */
-    private fun applyDeletes(
-        h: Handle,
-        catalogId: Long,
-        snapshotId: Long,
-        readSnapshot: Long?,
-        firstFileId: Long,
+    private fun planDeletes(
         resolved: List<ResolvedDeletes>,
-    ) {
-        if (resolved.isEmpty()) return
+        readSnapshot: Long?,
+        snapshotId: Long,
+        firstFileId: Long,
+        appended: List<CommitTail.DataFileRow>,
+        read: CommitTail.ReadSet,
+    ): CommitTail.DeleteRows {
+        if (resolved.isEmpty()) return CommitTail.DeleteRows(emptyList(), emptyList())
         checkNotNull(readSnapshot) { "deletes require a readSnapshot (validated earlier)" }
+        val appendedById = appended.associateBy { it.dataFileId }
+        val appendedByPath = appended.groupBy({ it.tableId to it.path }) { it.dataFileId }
         var nextFileId = firstFileId
-        val insertBatch =
-            h.prepareBatch(
-                """
-            INSERT INTO hog_delete_file (catalog_id, delete_file_id, table_id, data_file_id,
-                                         begin_snapshot, path, delete_count, file_size_bytes)
-            VALUES (:catalogId, :deleteFileId, :tableId, :dataFileId,
-                    :beginSnapshot, :path, :deleteCount, :fileSizeBytes)
-            """,
-            )
+        val ended = ArrayList<Long>()
+        val files = ArrayList<CommitTail.DeleteFileRow>()
         for (deletes in resolved) {
             val qualified = "${deletes.namespace}.${deletes.table}"
             for (registration in deletes.files) {
@@ -1195,17 +1165,10 @@ class CommitService(
                     if (registration.dataFilePath == null) {
                         registration
                     } else {
-                        val ids =
-                            h.createQuery(
-                                """
-                        SELECT data_file_id FROM hog_data_file
-                        WHERE catalog_id = :catalog AND table_id = :table AND begin_snapshot = :snapshot
-                          AND path = :path
-                        LIMIT 2
-                        """,
-                            ).bind("catalog", catalogId).bind("table", deletes.tableId)
-                                .bind("snapshot", snapshotId).bind("path", registration.dataFilePath)
-                                .mapTo(Long::class.java).list()
+                        // This commit's appends to the same table under that
+                        // path — what `begin_snapshot = <this snapshot>`
+                        // found once they were inserted.
+                        val ids = appendedByPath[deletes.tableId to registration.dataFilePath].orEmpty()
                         if (ids.size != 1) {
                             throw HoglakeException.Validation(
                                 "pending delete must target exactly one same-table append in this commit",
@@ -1214,29 +1177,13 @@ class CommitService(
                         registration.copy(dataFileId = ids.single())
                     }
                 val target =
-                    h.createQuery(
-                        """
-                    SELECT table_id, record_count, begin_snapshot, end_snapshot
-                      FROM hog_data_file
-                     WHERE catalog_id = :catalogId AND data_file_id = :dataFileId
-                    """,
-                    )
-                        .bind("catalogId", catalogId)
-                        .bind("dataFileId", reg.dataFileId)
-                        .map { rs, _ ->
-                            DeleteTarget(
-                                tableId = rs.getLong("table_id"),
-                                recordCount = rs.getLong("record_count"),
-                                beginSnapshot = rs.getLong("begin_snapshot"),
-                                endSnapshot = rs.getObject("end_snapshot") as Long?,
-                            )
+                    appendedById[reg.dataFileId]?.let { DeleteTarget(it.tableId, it.recordCount, snapshotId, null) }
+                        ?: read.targets[reg.dataFileId]?.let {
+                            DeleteTarget(it.tableId, it.recordCount, it.beginSnapshot, it.endSnapshot)
                         }
-                        .findOne()
-                        .orElseThrow {
-                            HoglakeException.Validation(
-                                "delete for $qualified targets unknown data_file_id ${reg.dataFileId}",
-                            )
-                        }
+                        ?: throw HoglakeException.Validation(
+                            "delete for $qualified targets unknown data_file_id ${reg.dataFileId}",
+                        )
                 val targetTableId = target.tableId
                 val recordCount = target.recordCount
                 val targetBegin = target.beginSnapshot
@@ -1294,65 +1241,38 @@ class CommitService(
                 // partial index). Staleness is checked before monotonicity: a
                 // DV registered after the writer's readSnapshot means the new
                 // vector was built without seeing it — retryable conflict,
-                // regardless of counts.
-                val current =
-                    h.createQuery(
-                        """
-                    SELECT delete_file_id, delete_count, begin_snapshot
-                      FROM hog_delete_file
-                     WHERE catalog_id = :catalogId AND data_file_id = :dataFileId
-                       AND end_snapshot IS NULL
-                    """,
-                    )
-                        .bind("catalogId", catalogId)
-                        .bind("dataFileId", reg.dataFileId)
-                        .map { rs, _ -> Triple(rs.getLong(1), rs.getLong(2), rs.getLong(3)) }
-                        .findOne()
-                        .orElse(null)
+                // regardless of counts. A same-commit target has no vector.
+                val current = read.liveDvs[reg.dataFileId]?.takeIf { reg.dataFileId !in appendedById }
                 if (current != null) {
-                    val (currentId, currentCount, currentBegin) = current
-                    if (currentBegin > readSnapshot) {
+                    if (current.beginSnapshot > readSnapshot) {
                         throw HoglakeException.CommitConflict(
                             "deletion vector for data_file_id ${reg.dataFileId} in $qualified " +
-                                "was superseded at snapshot $currentBegin, after read snapshot " +
+                                "was superseded at snapshot ${current.beginSnapshot}, after read snapshot " +
                                 "$readSnapshot",
                         )
                     }
-                    if (currentCount > reg.deleteCount) {
+                    if (current.deleteCount > reg.deleteCount) {
                         throw HoglakeException.Validation(
                             "delete_count ${reg.deleteCount} for data_file_id ${reg.dataFileId} " +
                                 "in $qualified shrinks the live deletion vector " +
-                                "(delete_count $currentCount) — vectors only grow",
+                                "(delete_count ${current.deleteCount}) — vectors only grow",
                         )
                     }
-                    h.createUpdate(
-                        """
-                        UPDATE hog_delete_file SET end_snapshot = :snapshotId
-                         WHERE catalog_id = :catalogId AND delete_file_id = :deleteFileId
-                        """,
-                    )
-                        .bind("snapshotId", snapshotId)
-                        .bind("catalogId", catalogId)
-                        .bind("deleteFileId", currentId)
-                        .execute()
+                    ended += current.deleteFileId
                 }
-                insertBatch
-                    .bind("catalogId", catalogId)
-                    .bind("deleteFileId", nextFileId++)
-                    .bind("tableId", deletes.tableId)
-                    .bind("dataFileId", reg.dataFileId)
-                    .bind("beginSnapshot", snapshotId)
-                    .bind("path", reg.path)
-                    .bind("deleteCount", reg.deleteCount)
-                    .bind("fileSizeBytes", reg.fileSizeBytes)
-                    .add()
+                files +=
+                    CommitTail.DeleteFileRow(
+                        deleteFileId = nextFileId++,
+                        tableId = deletes.tableId,
+                        dataFileId = reg.dataFileId,
+                        path = reg.path,
+                        deleteCount = reg.deleteCount,
+                        fileSizeBytes = reg.fileSizeBytes,
+                    )
             }
         }
-        insertBatch.execute()
+        return CommitTail.DeleteRows(ended, files)
     }
-
-    /** A live table's id + identity uuid (the incarnation the name currently binds to). */
-    private data class LiveTable(val tableId: Long, val tableUuid: UUID)
 
     /**
      * The refusal for a commit whose table did not resolve live: a
@@ -1410,42 +1330,14 @@ class CommitService(
         )
     }
 
-    /** A table is live iff its head version row is open and neither it nor its namespace is dropped. */
-    private fun resolveLiveTable(
-        h: Handle,
-        catalogId: Long,
-        namespace: String,
-        table: String,
-    ): LiveTable? =
-        h.createQuery(
-            """
-        SELECT tv.table_id, t.table_uuid
-          FROM hog_table_version tv
-          JOIN hog_namespace ns
-            ON ns.catalog_id = tv.catalog_id AND ns.namespace_id = tv.namespace_id
-          JOIN hog_table t
-            ON t.catalog_id = tv.catalog_id AND t.table_id = tv.table_id
-         WHERE tv.catalog_id = :catalogId
-           AND tv.end_snapshot IS NULL
-           AND tv.name = :table
-           AND ns.name = :namespace
-           AND NOT ns.dropped
-           AND t.dropped_snapshot IS NULL
-        """,
-        )
-            .bind("catalogId", catalogId)
-            .bind("namespace", namespace)
-            .bind("table", table)
-            .map { rs, _ -> LiveTable(rs.getLong(1), rs.getObject(2) as UUID) }
-            .findOne()
-            .orElse(null)
-
     /**
      * The table's live partition spec, or null when unpartitioned. A spec
      * with zero fields (SetPartitionSpec([])) is unpartitioned too.
      * Deliberately inline rather than persistence/SpecRepo.specAt: the
      * commit tail only needs the spec header + field COUNT (one query),
-     * not the full field list.
+     * not the full field list. The atomic-creation tail's own statement;
+     * a commit reads the same columns in [CommitTail.READ_SQL] and takes
+     * them through the overload below.
      */
     private fun liveSpec(
         h: Handle,
@@ -1471,38 +1363,59 @@ class CommitService(
             ?.takeIf { it.fieldCount > 0 }
 
     /**
+     * [liveSpec] from the read's rows for one resolved table: one row per
+     * live spec, so more than one is the broken invariant the per-table
+     * `findOne` refused.
+     */
+    private fun liveSpec(rows: List<CommitTail.ResolvedTable>): LiveSpec? {
+        check(rows.size == 1) { "more than one live partition spec for table_id=${rows.first().tableId}" }
+        val row = rows.single()
+        return row.specId?.let { LiveSpec(it, row.fieldCount ?: 0) }?.takeIf { it.fieldCount > 0 }
+    }
+
+    /**
+     * field_id -> col_type of the table's live columns, for [validateFiles]:
+     * the atomic-creation tail's own statement, which a commit reads in
+     * [CommitTail.READ_SQL] instead.
+     */
+    private fun liveColumnTypes(
+        h: Handle,
+        catalogId: Long,
+        tableId: Long,
+    ): Map<Long, String> =
+        h.createQuery(
+            """
+            SELECT field_id, col_type FROM hog_column
+             WHERE catalog_id = ? AND table_id = ? AND end_snapshot IS NULL
+            """,
+        )
+            .bind(0, catalogId)
+            .bind(1, tableId)
+            .map { rs, _ -> rs.getLong("field_id") to rs.getString("col_type") }
+            .toList()
+            .toMap()
+
+    /**
      * Structural checks on one append's files, returning the append with
      * its stats SANITIZED (StatsSanity): a bound that cannot be decoded
      * as its column's type, or that sorts above its partner, is dropped
      * rather than stored, and impossible counts are clamped. The return
      * value is what gets written — using the argument instead would
      * store exactly the rows this pass exists to repair.
+     *
+     * [liveColumnTypes] is field_id -> col_type of the table's live
+     * columns. The TYPE is carried because a stats row is only
+     * meaningful for a LEAF: hog_file_column_stats holds counts and
+     * bounds, and a list/struct/map has neither. A client shipping stats
+     * for a container id is confused about the shape of its own file,
+     * and a silent accept would put a bound on a column no reader can
+     * decode it for.
      */
     private fun validateFiles(
-        h: Handle,
-        catalogId: Long,
         append: ResolvedAppend,
+        liveColumnTypes: Map<Long, String>,
     ): ResolvedAppend {
         val qualified = "${append.namespace}.${append.table}"
-        // field_id -> col_type. The TYPE is carried because a stats row
-        // is only meaningful for a LEAF: hog_file_column_stats holds
-        // counts and bounds, and a list/struct/map has neither. A client
-        // shipping stats for a container id is confused about the shape
-        // of its own file, and a silent accept would put a bound on a
-        // column no reader can decode it for.
-        val liveColumnTypes: Map<Long, String> by lazy {
-            h.createQuery(
-                """
-                SELECT field_id, col_type FROM hog_column
-                 WHERE catalog_id = ? AND table_id = ? AND end_snapshot IS NULL
-                """,
-            )
-                .bind(0, catalogId)
-                .bind(1, append.tableId)
-                .map { rs, _ -> rs.getLong("field_id") to rs.getString("col_type") }
-                .toList()
-                .toMap()
-        }
         for (file in append.files) {
             if (file.path.isBlank()) {
                 throw HoglakeException.Validation("blank file path in append to $qualified")
@@ -1709,20 +1622,22 @@ class CommitService(
 
     /**
      * One indexed lookup over the typed change table covers appends and
-     * deletes alike.
+     * deletes alike: the `conflicts` CTE of [CommitTail.READ_SQL], whose
+     * rows are [conflicted] — distinct (table id, is-DDL) pairs since
+     * [readSnapshot] on the tables in [nameByTableId].
      *
      * Every touched table gets the DDL check ('table_dropped' /
      * 'table_altered' since readSnapshot), and a refusal where EVERY
      * conflicted row is DDL is the typed, non-retryable
      * [HoglakeException.DdlSinceReadSnapshot] rather than a
      * [HoglakeException.CommitConflict] — see that class for why the two
-     * need opposite client behaviour. The tables in
-     * [unchangedTableIds] — the DELETE targets of a guarded request, see
-     * CommitRequest.requireUnchangedTables — additionally require that
-     * nothing changed their ROW CONTENT, because the delete was planned
-     * against a read of it: 'table_created', 'table_inserted_into' and
-     * 'table_deleted_from'. Legacy writes pass an empty set and retain
-     * the per-file DV staleness checks in [applyDeletes].
+     * need opposite client behaviour. The UNCHANGED tables
+     * ([CommitTail.TableKey.unchanged]) — the DELETE targets of a guarded
+     * request, see CommitRequest.requireUnchangedTables — additionally
+     * require that nothing changed their ROW CONTENT, because the delete
+     * was planned against a read of it: 'table_created',
+     * 'table_inserted_into' and 'table_deleted_from'. Legacy writes mark
+     * none and retain the per-file DV staleness checks in [planDeletes].
      *
      * 'table_compacted' is deliberately NOT in that list, and never was
      * a correct member of it. Compaction changes which FILES back a
@@ -1733,37 +1648,15 @@ class CommitService(
      * whose read-to-publish window exceeded that interval retried into
      * the next compaction forever. What compaction CAN invalidate is a
      * specific DV target, and that is caught per file by the liveness
-     * check in [applyDeletes], which stays.
+     * check in [planDeletes], which stays.
      */
     private fun checkConflicts(
-        h: Handle,
-        catalogId: Long,
         readSnapshot: Long,
+        conflicted: List<CommitTail.Conflict>,
         nameByTableId: Map<Long, String>,
-        unchangedTableIds: Set<Long>,
     ) {
-        val conflicted =
-            h.createQuery(
-                """
-            SELECT DISTINCT object_id,
-                   kind IN ('table_dropped', 'table_altered') AS ddl
-              FROM hog_snapshot_change
-             WHERE catalog_id = :catalogId
-               AND snapshot_id > :readSnapshot
-               AND object_id IN (<tableIds>)
-               AND (kind IN ('table_dropped', 'table_altered') OR
-                    (kind IN ('table_created', 'table_inserted_into', 'table_deleted_from')
-                     AND object_id = ANY(:unchangedTableIds)))
-            """,
-            )
-                .bind("catalogId", catalogId)
-                .bind("readSnapshot", readSnapshot)
-                .bindArray("unchangedTableIds", Long::class.javaObjectType, unchangedTableIds)
-                .bindList("tableIds", nameByTableId.keys.toList())
-                .map { rs, _ -> rs.getLong("object_id") to rs.getBoolean("ddl") }
-                .list()
         if (conflicted.isNotEmpty()) {
-            val names = conflicted.mapNotNull { nameByTableId[it.first] }.distinct().sorted()
+            val names = conflicted.mapNotNull { nameByTableId[it.objectId] }.distinct().sorted()
             // TYPED, because the two answers need opposite client
             // behaviour and used to be the same code. Pure DDL is
             // permanent for this payload: a prepared request's
@@ -1783,7 +1676,7 @@ class CommitService(
             // half the reason was a concurrent insert would send it down
             // the more expensive path for a conflict a plain retry
             // clears.
-            if (conflicted.all { it.second }) {
+            if (conflicted.all { it.ddl }) {
                 throw HoglakeException.DdlSinceReadSnapshot(
                     "concurrent DDL since snapshot $readSnapshot on table(s): " +
                         names.joinToString(", ") +

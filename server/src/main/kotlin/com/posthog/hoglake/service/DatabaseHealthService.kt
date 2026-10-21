@@ -97,7 +97,7 @@ class DatabaseHealthService(
         // if the loop is actually running somewhere; otherwise the honest
         // badge is the operator's, with the knob to set.
         val noReindexLoop =
-            "No reindex loop has recorded a run in two days: set HOGLAKE_REINDEX_INTERVAL_MS on the " +
+            "No reindex loop has recorded a run in three hours: set HOGLAKE_REINDEX_INTERVAL_MS on the " +
                 "maintenance pod, or rebuild by hand off-peak with REINDEX INDEX CONCURRENTLY."
 
         // THE SAME PREDICATE THE REINDEX TASK REBUILDS ON, passed in
@@ -138,7 +138,7 @@ class DatabaseHealthService(
                     "Autovacuum never shrinks an index. On this schema bloat arrives in steps — " +
                         "a retirement, an expiry purge, a large compaction — and stays: every " +
                         "commit writes into the bloated index and every probe descends it. " +
-                        "Several here at once is a backlog of days, not a fault.",
+                        "Several here at once is a backlog of hours, not a fault.",
                     resolution =
                         when {
                             !reindexLoopSeen -> operator(noReindexLoop + overCapText)
@@ -146,10 +146,10 @@ class DatabaseHealthService(
                             else ->
                                 maintenance(
                                     MaintenanceTask.REINDEX,
-                                    "The reindex task rebuilds the index with the largest excess once a day at " +
-                                        "03:00 UTC, roughly one a day, longer while a retirement or expiry purge " +
-                                        "is pending and a week after a failed attempt; its ledger rows say which. " +
-                                        "Nothing to do for the $rebuildable within its cap.$overCapText",
+                                    "The reindex task rebuilds the index with the largest excess at the top of " +
+                                        "every UTC hour, roughly one an hour, longer while a retirement or expiry " +
+                                        "purge is pending and a week after a failed attempt; its ledger rows say " +
+                                        "which. Nothing to do for the $rebuildable within its cap.$overCapText",
                                 )
                         },
                 )
@@ -181,7 +181,7 @@ class DatabaseHealthService(
                                 maintenance(
                                     MaintenanceTask.REINDEX,
                                     "Every name here is a concurrent build's leftover (*_ccnew, *_ccold), " +
-                                        "which the reindex task drops before its next daily run. One that is a " +
+                                        "which the reindex task drops before its next hourly run. One that is a " +
                                         "rebuild in flight right now disappears on its own within the hour.",
                                 )
                             leftovers ->

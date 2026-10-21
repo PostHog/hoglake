@@ -411,7 +411,7 @@ object RetirementGauges {
  * retirement the excess arrives in one step and stays until a REINDEX,
  * so "how much, per index, right now" is the whole question. Published
  * ONLY on the pod running the reindex loop (`ReindexService.publishGauge`):
- * by the daily run (twice when it rebuilds, so the rebuilt index reads
+ * by the hourly run (twice when it rebuilds, so the rebuilt index reads
  * its new size at once) and by every metrics-sampler tick there
  * (`App.metricsTick`). An API pod serving `GET /v1/database/health`
  * computes the same estimate but never publishes it, so the series has

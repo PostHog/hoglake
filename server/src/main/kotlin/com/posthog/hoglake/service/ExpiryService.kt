@@ -1178,7 +1178,7 @@ class ExpiryService(
      * O(files). One row per changed object per snapshot: `kind` is a
      * vocabulary (`table_inserted_into`, `table_altered`, ...) with
      * `object_id` the table id (`V1__init.sql`), and every writer inserts
-     * ONE row per append (`CommitService.writeAppends`,
+     * ONE row per append (`CommitTail.WRITE_SQL`,
      * `SnapshotRepo.recordChange`), so a 270-file commit into one table
      * is ONE change row. A batch of 10,000 snapshots is therefore
      * ~10-30k cascade rows — ~0.2-0.6 s at this repo's measured ~20

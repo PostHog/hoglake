@@ -646,18 +646,19 @@ data class Config(
             "$DEFAULT_RETIREMENT_QUEUE_CEILING",
         ).toLong(),
     /**
-     * How often the reindex loop POLLS whether the day's run is due; <= 0
+     * How often the reindex loop POLLS whether the hour's run is due; <= 0
      * disables it. Default **0 — OFF**, retirement's position and for the
      * same reason: the task belongs to ONE workload, and the chart turns
      * it on for the maintenance Deployment alone.
      *
-     * NOT the cadence. The run itself is once a day at
-     * `ReindexService.RUN_AT_UTC` (03:00 UTC, hardcoded for now), gated
-     * on the run ledger so a restart does not repeat it and a pod that
-     * was down at 03:00 catches up on its first poll that day. This knob
-     * only bounds how late after 03:00 (or after a restart) the run
-     * starts; 300000 (five minutes) is plenty, and a poll costs two
-     * index descents on the ledger.
+     * NOT the cadence. The run itself is once an hour
+     * (`ReindexService.RUN_EVERY`, the top of each UTC hour, hardcoded
+     * for now), gated on the run ledger so a restart does not repeat it
+     * and a pod that was down at the top of the hour catches up on its
+     * first poll in that hour. This knob only bounds how late after the
+     * top of the hour (or after a restart) the run starts; 300000 (five
+     * minutes) is plenty, and a poll costs two index descents on the
+     * ledger.
      *
      * What a run does: estimates every hog_* btree index's bloat from
      * pg_stats and rebuilds at most ONE, the largest over threshold,

@@ -288,13 +288,16 @@ object DatabaseHealthRepo {
         }.one()
 
     /**
-     * Whether the reindex LOOP has recorded a run in the last two days,
+     * Whether the reindex LOOP has recorded a run in the last three hours,
      * on any pod. The health page cannot see another pod's config
      * (`HOGLAKE_REINDEX_INTERVAL_MS` defaults to off, and the API pod
      * answering this request is not the pod that would run it), so the
      * ledger is the only honest answer to "will maintenance take care
-     * of this". Two days: the task runs once a day and a missed day is
-     * a skip row, still a run.
+     * of this". Three hours, three windows: the task runs once an hour,
+     * a skipped hour is a skip row, still a run, and a run's row is
+     * written when it ENDS with `started_at` its start, so an hour-long
+     * rebuild leaves the newest visible row up to two hours old plus a
+     * poll before it lands.
      */
     fun reindexLoopSeen(handle: Handle): Boolean =
         handle.createQuery(
@@ -302,7 +305,7 @@ object DatabaseHealthRepo {
             SELECT EXISTS (
                 SELECT 1 FROM hog_maintenance_run
                  WHERE task = 'reindex' AND run_trigger = 'loop'
-                   AND started_at > now() - interval '2 days'
+                   AND started_at > now() - interval '3 hours'
             )
             """,
         ).mapTo(Boolean::class.java).one()

@@ -510,6 +510,64 @@ class CommitServiceTest {
     }
 
     @Test
+    fun `absent and present stats fields both round-trip through the array write`() {
+        // The commit write binds each stats column as ONE array (bigint[]
+        // and bytea[] through unnest, CommitTail), so a NULL beside a value
+        // in the same array is the case to pin: field 1 ships no bounds,
+        // size or NaN count, field 3 — a double, the one kind of column a
+        // NaN count is kept for — ships all of them.
+        val fx = seed()
+        val (tableId, _) = fx.tables.getValue("events")
+        jdbi.useHandle<Exception> { h ->
+            h.execute(
+                "INSERT INTO hog_column (catalog_id, table_id, field_id, begin_snapshot, name, col_type, ordinal) " +
+                    "VALUES (?, ?, 3, 0, 'col3', 'double', 2)",
+                fx.catalogId,
+                tableId,
+            )
+        }
+
+        // Iceberg's single-value form of a double: 8 bytes, little-endian.
+        fun double(v: Double): ByteArray {
+            val littleEndian = java.nio.ByteOrder.LITTLE_ENDIAN
+            return java.nio.ByteBuffer.allocate(8).order(littleEndian).putDouble(v).array()
+        }
+        val stats =
+            listOf(
+                ColumnStats(1, 10, 0, null, null, null, null),
+                ColumnStats(3, 10, 1, 2, 64, double(1.5), double(2.5)),
+            )
+        service.commit(
+            "cat",
+            CommitRequest(
+                readSnapshot = 0,
+                appends =
+                    listOf(
+                        TableAppend("ns", "events", listOf(file("s3://b/cat/nulls.parquet", 10, stats = stats))),
+                    ),
+            ),
+        )
+        val stored =
+            jdbi.withHandle<Map<Long, List<Any?>>, Exception> { h ->
+                h.createQuery(
+                    """
+                    SELECT field_id, nan_count, size_bytes, lower_bound, upper_bound FROM hog_file_column_stats
+                     WHERE catalog_id = ?
+                    """,
+                ).bind(0, fx.catalogId).map { rs, _ ->
+                    rs.getLong(1) to
+                        listOf(rs.getObject(2), rs.getObject(3), rs.getBytes(4)?.toList(), rs.getBytes(5)?.toList())
+                }.list().toMap()
+            }
+        assertThat(stored).isEqualTo(
+            mapOf(
+                1L to listOf(null, null, null, null),
+                3L to listOf(2L, 64L, double(1.5).toList(), double(2.5).toList()),
+            ),
+        )
+    }
+
+    @Test
     fun `multi table commit and duplicate appends merge`() {
         val fx = seed(tableNames = listOf("events", "persons"))
         val (eventsId, _) = fx.tables.getValue("events")

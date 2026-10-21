@@ -125,7 +125,7 @@ describe("database page", () => {
             resolution: {
               kind: "maintenance",
               task: "reindex",
-              text: "The reindex task rebuilds the largest once a day at 03:00 UTC.",
+              text: "The reindex task rebuilds the largest at the top of every UTC hour.",
             },
           },
           {
@@ -145,7 +145,7 @@ describe("database page", () => {
     const bloat = (await screen.findByText("12 index(es) are over the bloat threshold")).closest("li")!;
     const maint = within(bloat).getByText("reindex task handles it");
     expect(maint).toHaveClass("badge", "resolution-maintenance");
-    expect(within(bloat).getByText(/once a day at 03:00 UTC/)).toBeInTheDocument();
+    expect(within(bloat).getByText(/at the top of every UTC hour/)).toBeInTheDocument();
     const prepared = screen.getByText("1 orphaned prepared transaction(s)").closest("li")!;
     expect(within(prepared).getByText("operator")).toHaveClass("resolution-operator");
     expect(within(prepared).getByText(/ROLLBACK PREPARED each one by hand/)).toBeInTheDocument();

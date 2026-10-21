@@ -93,13 +93,15 @@ internal object Pg {
  * Bind a nullable `bigint[]` (hog_data_file.split_offsets): the list as a
  * Postgres array, or SQL NULL.
  *
- * ONE Argument type for both arms, and that is the point. A
- * PreparedBatch (CommitService.writeAppends inserts every file of a
- * commit in one) prepares its binder from the FIRST row's argument, so
- * `bindArray` on one row and `bindNull` on the next fails the whole
- * commit with "argument must be ... an array; was NullArgument" — a
- * commit mixing files with and without offsets is the ordinary case, not
- * an edge.
+ * Called by `Hydrator.hydrate` (the offsets read off the footer) and
+ * `CompactionService.commitGroup` (the output file's), each binding one
+ * row per statement.
+ *
+ * ONE Argument type for both arms, and that is the point: a
+ * PreparedBatch prepares its binder from the FIRST row's argument, so
+ * `bindArray` on one row and `bindNull` on the next fails the whole batch
+ * with "argument must be ... an array; was NullArgument", and rows with
+ * and without offsets side by side are the ordinary case, not an edge.
  */
 internal fun <T : SqlStatement<T>> T.bindBigintArrayOrNull(
     name: String,

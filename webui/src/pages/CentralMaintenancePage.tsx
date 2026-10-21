@@ -33,7 +33,7 @@ const TASKS: MaintenanceTaskStatus["task"][] = [
   // Retirement feeds cleanup, so it sits at the end rather than beside
   // it.
   "retirement",
-  // Instance-wide: the same daily run on every row.
+  // Instance-wide: the same hourly run on every row.
   "reindex",
 ];
 
@@ -147,8 +147,8 @@ function taskCell(t: MaintenanceTaskStatus): {
         // a guard skip (retirement, purge, migration) is the system working.
         warn: failed || excluded,
         title:
-          "Daily index-bloat check at 03:00 UTC: rebuilds at most one index " +
-          "over threshold (REINDEX INDEX CONCURRENTLY). Instance-wide, so " +
+          "Hourly index-bloat check at the top of each UTC hour: rebuilds at " +
+          "most one index over threshold (REINDEX INDEX CONCURRENTLY). Instance-wide, so " +
           "every catalog shows the same run.",
       };
     }

@@ -72,7 +72,16 @@ no entry in either:
    catalog ever needs sustained >100 commits/s, that's the wall. The
    escape hatch is to move validation in front of the serialization
    point rather than inside it: designed once, never scheduled, and no
-   longer written down anywhere but here.
+   longer written down anywhere but here. Since #393 the tail is two
+   statements after the lock (it was 14-24, one round trip each), so
+   what is left of the fixed per-commit cost is those two, the
+   validation between them and the COMMIT's WAL flush; the >100
+   commits/s figure predates it and has not been re-measured in
+   production. Because the write is one statement, the 60 s session
+   `statement_timeout` bounds a commit's whole write (once per commit,
+   no longer once per batched INSERT): a client sending 10k+ files in
+   one commit meets that bound there (the 270-file x 25-column write
+   measured ~30 ms locally).
 2. **Read scaling.** Facade/Trino planning reads hit the service →
    one PG. Snapshot-pinned reads are replica-able (lag-tolerant by
    construction), but that's not built yet.

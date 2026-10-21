@@ -18,12 +18,10 @@ import org.jdbi.v3.core.Jdbi
 import org.jdbi.v3.core.kotlin.withHandleUnchecked
 import java.time.Duration
 import java.time.Instant
-import java.time.LocalTime
-import java.time.ZoneOffset
 
 /**
- * THE DAILY INDEX-BLOAT CHECK, and at most one `REINDEX INDEX
- * CONCURRENTLY` per day (#268).
+ * THE HOURLY INDEX-BLOAT CHECK, and at most one `REINDEX INDEX
+ * CONCURRENTLY` per hour (#268).
  *
  * WHY A TASK AND NOT A RUNBOOK. Autovacuum reclaims dead heap tuples and
  * marks wholly empty btree pages reusable; it never gives an index's
@@ -31,8 +29,12 @@ import java.time.ZoneOffset
  * `hog_data_file` carried 14.8 GB of indexes over 1.48M rows and the
  * `hog_file_column_stats` primary key 26 GB over 14.9M rows. Bloat on
  * this schema arrives in STEPS — a retirement, an expiry purge, a large
- * compaction — not as a slope, so a measured daily check rebuilds what
- * actually grew, where a calendar REINDEX rebuilds everything or nothing.
+ * compaction — not as a slope, and at any hour, so a measured hourly
+ * check rebuilds what actually grew, where a calendar REINDEX rebuilds
+ * everything or nothing. HOURLY because a step can land at any hour and
+ * a run rebuilds one index: once a day left a bloated 30 GB index waiting
+ * up to a day for its turn, and a backlog of N bloated indexes took N
+ * days to drain where hourly it takes N hours.
  *
  * THE ESTIMATE is the check_postgres / ioguix btree arithmetic
  * ([ESTIMATE_SQL]): expected leaf pages from `reltuples`, the key
@@ -59,7 +61,7 @@ import java.time.ZoneOffset
  * ~1.35x steady state is not dead pages), with the ratio arm floored at
  * [MIN_RATIO_INDEX_BYTES] — the estimate's one-page metapage term makes
  * any index of a few pages read as 2-3x, and rebuilding a 40 KiB index
- * every night is noise in the ledger and nothing on disk.
+ * every hour is noise in the ledger and nothing on disk.
  *
  * ONE INDEX PER RUN, the largest excess first ([rank]), and never one
  * expected to rebuild past [MAX_REBUILD_EXPECTED_BYTES] (16 GiB; its WAL,
@@ -68,7 +70,7 @@ import java.time.ZoneOffset
  * next candidate goes; with none left the row names the first and why
  * (`too_large`, `last_attempt_failed`). A rebuild
  * is minutes of I/O on the instance that serves the commit tail, so the
- * daily budget is one; the next-largest is tomorrow's. Constraint-backing
+ * hourly budget is one; the next-largest is the next hour's. Constraint-backing
  * indexes (primary keys, unique constraints) are ELIGIBLE: `REINDEX INDEX
  * CONCURRENTLY` rebuilds them in place on PG >= 12, keeping the
  * constraint, and the 26 GB `hog_file_column_stats_pkey` is the reason
@@ -86,17 +88,19 @@ import java.time.ZoneOffset
  * index's size in WAL and ~1x in temp files (maintenance_work_mem 16 MB),
  * the old index until the swap, a pooled connection for the duration
  * (priced in Config's pool budget), and a snapshot held per phase that
- * pins the vacuum horizon while it runs — which is why the run is at
- * 03:00 UTC and not whenever bloat is noticed. Its SHARE UPDATE EXCLUSIVE
+ * pins the vacuum horizon while it runs. Its SHARE UPDATE EXCLUSIVE
  * lock also CANCELS an autovacuum already running on the table and makes
  * autovacuum skip the table for the rebuild's duration (30-60 minutes on
- * `hog_file_column_stats`); dead tuples there wait until it ends.
+ * `hog_file_column_stats`); dead tuples there wait until it ends. Both
+ * are paid at whatever hour the index crosses the threshold, peak traffic
+ * included, rather than in a low-traffic trough: that is the price of not
+ * making a bloated index wait up to a day.
  *
  * THE GUARDS ([ReindexSkip]) stop a rebuild when it would be wasted
  * (retirement or an expiry purge still deleting rows, so the index bloats
- * again tomorrow) or would collide with other DDL (a migration, another
+ * again within hours) or would collide with other DDL (a migration, another
  * REINDEX). A skipped run still estimates, still drops leftovers where it
- * safely can, and still writes a ledger row, so a day without a rebuild
+ * safely can, and still writes a ledger row, so an hour without a rebuild
  * says why.
  *
  * FAILURE is a failed ledger row carrying the error and the attempt
@@ -112,15 +116,15 @@ import java.time.ZoneOffset
  * A POD KILLED MID-REBUILD does not stop it: the backend keeps running
  * the REINDEX, holding the single-flight session lock, until it finishes
  * or hits its bound. The killed run writes no ledger row; the next
- * same-day poll finds the lock held and records `reindex_lock_held`,
- * which CLOSES the day — the orphan is today's rebuild.
+ * poll in the same hour finds the lock held and records `reindex_lock_held`,
+ * which CLOSES the hour — the orphan is this hour's rebuild.
  *
  * ON EXACTLY ONE POD: the loop is off unless HOGLAKE_REINDEX_INTERVAL_MS
  * is positive, which the chart sets on the maintenance Deployment alone.
  * A second pod configured by mistake is caught by the single-flight
- * session lock ([Locks.tryAcquireReindexLock]) and the daily gate, which
+ * session lock ([Locks.tryAcquireReindexLock]) and the hourly gate, which
  * reads the shared ledger. The `hoglake_index_bloat_bytes` gauge belongs
- * to that pod too ([publishGauge]): published by the daily run and on
+ * to that pod too ([publishGauge]): published by the hourly run and on
  * every metrics-sampler tick there, never by an API pod serving the
  * health page.
  */
@@ -154,7 +158,7 @@ class ReindexService(
      * rebuild — and a no-op in production.
      */
     private val afterRebuild: (Handle) -> Unit = {},
-    /** Wall clock, injected so the daily gate can be driven across midnight in a test. */
+    /** Wall clock, injected so the hourly gate can be driven across a window boundary in a test. */
     private val clock: () -> Instant = Instant::now,
 ) {
     private val log = KotlinLogging.logger {}
@@ -187,14 +191,14 @@ class ReindexService(
         PartialResult
 
     /**
-     * The loop body: run the day's reindex if it is due, else nothing.
+     * The loop body: run this hour's reindex if it is due, else nothing.
      * Returns the run's result, or null when no run happened.
      *
      * The gate reads the LEDGER, not process memory, so a restart after
-     * today's run does not run again, and a pod that was down at 03:00
-     * runs on its first poll after it comes back the same day. A run that
-     * stepped aside for a migration or another build does NOT close the
-     * day before [RETRY_UNTIL_UTC] ([isDue]).
+     * this hour's run does not run again, and a pod that was down at the
+     * top of the hour runs on its first poll after it comes back. A run
+     * that stepped aside for a migration or another build does NOT close
+     * the hour ([isDue]).
      */
     fun pollOnce(): ReindexResult? {
         val now = clock()
@@ -268,7 +272,7 @@ class ReindexService(
     /**
      * Republish the gauge from a fresh estimate (~4 ms on the compose
      * stack), for the metrics sampler's tick on the pod that owns it, so
-     * the series tracks VACUUM/ANALYZE between daily runs. A no-op
+     * the series tracks VACUUM/ANALYZE between hourly runs. A no-op
      * elsewhere.
      */
     fun refreshGauge() {
@@ -329,7 +333,7 @@ class ReindexService(
             )
         }
         // Only with something to rebuild: these two say the rebuild would
-        // be wasted, and a quiet day must stay quiet in the ledger while
+        // be wasted, and a quiet hour must stay quiet in the ledger while
         // retirement runs for a week.
         val skip = guard(h, beforeDrop = false)
         if (skip != null) return afterDrop.copy(skippedReason = skip.wire)
@@ -426,11 +430,11 @@ class ReindexService(
             h.execute(h.createQuery(REINDEX_DDL_SQL).bind("index", victim.index).mapTo(String::class.java).one())
         } catch (e: Exception) {
             val failed = attempt.copy(durationMs = (System.nanoTime() - started) / 1_000_000)
-            // Drop the copy NOW rather than tomorrow: a build cancelled in
+            // Drop the copy NOW rather than next hour: a build cancelled in
             // its validation phase leaves a `_ccnew` that is READY for
             // writes, so every insert into the table maintains it until it
             // goes. Best-effort: a dead session cannot drop anything, and
-            // tomorrow's run drops whatever is left before it starts.
+            // the next hour's run drops whatever is left before it starts.
             val dropped =
                 runCatching { dropLeftovers(h) }
                     .onFailure { e.addSuppressed(it) }
@@ -441,13 +445,13 @@ class ReindexService(
         val rebuilt = attempt.copy(durationMs = durationMs)
         // THE REBUILD HAPPENED, so nothing after it may turn the row into a
         // failure: a failed `failed` row would also exclude this index
-        // tomorrow (last_attempt_failed) for a rebuild that succeeded. The
+        // from later runs (last_attempt_failed) for a rebuild that succeeded. The
         // post-steps are best-effort and their error rides the ok row.
         return try {
             afterRebuild(h)
             // The rebuild set the new index's relpages/reltuples, so a
             // second estimate publishes its post-rebuild excess rather than
-            // leaving yesterday's figure on the gauge until tomorrow.
+            // leaving the pre-rebuild figure on the gauge until the next sampler tick.
             estimate(h)
             rebuilt.copy(afterBytes = h.relationSize(victim.index))
         } catch (e: Exception) {
@@ -507,17 +511,18 @@ class ReindexService(
 
     internal companion object {
         /**
-         * When the day's run is due, in UTC. HARDCODED for now; Jakob
-         * wants it configurable later (#268). 03:00 UTC is the trough of
-         * the US and EU write curves, and the rebuild's held snapshot pins
-         * the vacuum horizon while it runs, which is cheapest when the
-         * fewest rows are dying.
+         * The run's window: one run is due per [RUN_EVERY], the windows
+         * aligned to the epoch, so one hour is the top of every UTC hour.
+         * HARDCODED for now; Jakob wants it configurable later (#268).
+         * Once a day at the 03:00 UTC write trough kept the held snapshot
+         * off peak but rebuilt one index a day; see the class note for
+         * why that was too slow.
          */
-        val RUN_AT_UTC: LocalTime = LocalTime.of(3, 0)
+        val RUN_EVERY: Duration = Duration.ofHours(1)
 
         /**
          * Rebuild when actual / expected reaches this. Configurable later
-         * (#268), like [RUN_AT_UTC]. 3x is well past what a healthy btree
+         * (#268), like [RUN_EVERY]. 3x is well past what a healthy btree
          * drifts to (page splits leave ~70% full pages, ~1.3-1.5x) and
          * well short of what the prod-us retirement left (14.8 GB over
          * 1.48M rows on hog_data_file).
@@ -536,7 +541,7 @@ class ReindexService(
          * A random-key btree (an md5 path, a uuid) settles at ~1.35x on
          * its own from 50/50 page splits, so without a ratio floor every
          * such index past ~3.9 GiB sits permanently over 1 GiB of
-         * "excess" and is rebuilt every day for nothing —
+         * "excess" and is rebuilt every hour for nothing —
          * `hog_data_file_path` is headed there. 1.5 is above that steady
          * state and below any bloat worth a gigabyte.
          */
@@ -551,7 +556,7 @@ class ReindexService(
          * ~3x its expected size in transient disk and WAL at once. 16 GiB
          * (Jakob, 2026-10-05) admits the first prod-us candidate,
          * hog_file_column_stats_pkey at ~15 GB expected — ~45 GB
-         * transient, so the RDS volume needs that headroom on the night it
+         * transient, so the RDS volume needs that headroom whenever it
          * runs — and stops anything larger. Above the cap the run skips
          * with `too_large`, naming the index and its expected size, and an
          * operator runs it by hand off-peak.
@@ -578,55 +583,50 @@ class ReindexService(
          * with headroom for the phases that wait out older transactions.
          * Past it something other than size is wrong (a foreign snapshot
          * the build is parked behind), and cancelling leaves a `_ccnew`
-         * that tomorrow's run drops before retrying — which is cheaper
-         * than an unbounded statement on the commit-path instance.
+         * that the next hour's run drops before retrying — which is cheaper
+         * than an unbounded statement on the commit-path instance. A
+         * rebuild that runs the full hour ends past the next window's
+         * start, so that window's run starts right after it. Intended:
+         * a backlog keeps draining back to back.
          */
         val REINDEX_STATEMENT_TIMEOUT: Duration = Duration.ofHours(1)
 
         /**
-         * Until when, in UTC, a run that stepped aside for a TRANSIENT
-         * reason ([RETRYABLE_SKIPS]) is retried on the next poll instead
-         * of closing the day. Configurable later (#268), like
-         * [RUN_AT_UTC]. A pod boot holds the migration lock for seconds;
-         * without the retry a 03:00 poll that lands inside it would cost
-         * the whole day. Three hours keeps the retries inside the low-
-         * traffic window the run is scheduled for.
-         */
-        val RETRY_UNTIL_UTC: LocalTime = LocalTime.of(6, 0)
-
-        /**
-         * Skips that say "not now" rather than "not today": a FOREIGN
+         * Skips that say "not now" rather than "not this hour": a FOREIGN
          * build or a migration is in flight and will be gone in seconds to
          * minutes. Retirement and purge skips are not here — those last
          * hours — nor the exclusions of a candidate, nor
          * [ReindexSkip.REINDEX_LOCK_HELD]: that holder is this task's own
-         * rebuild (an orphan of a killed pod, or a second pod), so today's
-         * rebuild is already under way.
+         * rebuild (an orphan of a killed pod, or a second pod), so this
+         * hour's rebuild is already under way.
+         *
+         * One of these is retried on every poll until the window ends. A
+         * pod boot holds the migration lock for seconds; without the retry
+         * a poll that lands inside it would cost the whole hour. There is
+         * no separate retry cut-off: the next window is a fresh run anyway.
          */
         val RETRYABLE_SKIPS: Set<ReindexSkip> = setOf(ReindexSkip.MIGRATION_PENDING, ReindexSkip.REINDEX_IN_PROGRESS)
         private val RETRYABLE_WIRE: Set<String> = RETRYABLE_SKIPS.map { it.wire }.toSet()
 
         /**
-         * True when [now] is past today's [RUN_AT_UTC] and the newest
-         * recorded run started before it — or started after it but only
-         * stepped aside for a transient reason ([lastRetryable]) and it is
-         * not yet [retryUntil]. "Today" is the UTC date of [now]: between
-         * midnight and 03:00 a run is never due, so a run missed yesterday
-         * and not caught up before midnight waits for today's 03:00
-         * rather than running at 00:01 and again at 03:00.
+         * True when the newest recorded run started before the window
+         * [now] falls in — or started inside it but only stepped aside for
+         * a transient reason ([lastRetryable]). The window starts at [now]
+         * truncated to an [every] boundary counted from the EPOCH, so for
+         * one hour it is the top of the UTC hour whatever the pod's zone.
+         * A pod down for several hours runs ONCE on its return, not once
+         * per missed window: the gate asks only whether this window has a
+         * run, and the backlog is the bloat, which the next windows drain.
          */
         fun isDue(
             now: Instant,
             lastStartedAt: Instant?,
             lastRetryable: Boolean = false,
-            runAt: LocalTime = RUN_AT_UTC,
-            retryUntil: LocalTime = RETRY_UNTIL_UTC,
+            every: Duration = RUN_EVERY,
         ): Boolean {
-            val today = now.atOffset(ZoneOffset.UTC).toLocalDate()
-            val window = today.atTime(runAt).toInstant(ZoneOffset.UTC)
-            if (now.isBefore(window)) return false
+            val window = Instant.ofEpochMilli(now.toEpochMilli() / every.toMillis() * every.toMillis())
             if (lastStartedAt == null || lastStartedAt.isBefore(window)) return true
-            return lastRetryable && now.isBefore(today.atTime(retryUntil).toInstant(ZoneOffset.UTC))
+            return lastRetryable
         }
 
         /**
@@ -816,7 +816,7 @@ class ReindexService(
          * own predicate, so the two can never disagree about "pending".
          * Unbounded over catalogs on purpose: `EXISTS` stops at the first
          * hit, and the walk is `hog_table`'s dropped rows with one
-         * `hog_data_file_live` descent each, once a day.
+         * `hog_data_file_live` descent each, once an hour.
          */
         internal const val RETIREMENT_PENDING_SQL: String =
             """
@@ -840,7 +840,7 @@ class ReindexService(
          * the steady state, and steady deletions are what vacuum's page
          * reuse keeps up with — they do not undo a rebuild. A mass,
          * scattered delete does: it leaves the rebuilt index as bloated
-         * tomorrow as it was today. One descent of
+         * a few hours later as it was before. One descent of
          * `hog_maintenance_run_recent` per catalog.
          */
         internal const val PURGE_PENDING_SQL: String =
@@ -876,7 +876,7 @@ class ReindexService(
             )
             """
 
-        /** The newest reindex row: what the daily gate decides on. */
+        /** The newest reindex row: what the hourly gate decides on. */
         internal const val LAST_RUN_SQL: String =
             """
             SELECT started_at, status, result ->> 'skipped_reason' AS skipped_reason
@@ -893,7 +893,8 @@ class ReindexService(
          * exclusion. An index whose newest attempt failed is excluded until
          * that row ages out of the ledger's retention (7 days by default)
          * or an operator rebuilds it by hand. Bounded by the reindex rows
-         * the ledger holds (one per catalog per day), read through
+         * the ledger holds (one per catalog per hour, ~168 per catalog at
+         * the 7-day retention), read through
          * `hog_maintenance_run_task_history`.
          */
         internal const val LAST_ATTEMPT_SQL: String =
