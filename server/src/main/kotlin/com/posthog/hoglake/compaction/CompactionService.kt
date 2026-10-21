@@ -145,6 +145,37 @@ data class CompactionConfig(
      */
     val maxCandidates: Int = DEFAULT_MAX_CANDIDATES,
     /**
+     * How many of a table's NEWEST live small files one plan reads to
+     * DISCOVER buckets the published sample cannot name
+     * (`HOGLAKE_COMPACTION_NEW_BUCKET_WINDOW`; `CompactionService.newBuckets`).
+     * 0 turns the read off, which is the pre-2026-10-21 planner exactly.
+     *
+     * Its own knob, not [maxCandidates], because it bounds a different
+     * read for a different purpose. [maxCandidates] bounds the files a
+     * plan fetches AS CANDIDATES; this bounds the files it walks only to
+     * learn which partition tuples exist, each one costing a heap fetch
+     * and a primary-key descent of `hog_file_partition_value` (4 buffers
+     * per file measured), inside `planSnapshot`'s 15 s `SET LOCAL
+     * statement_timeout`, on every sweep, on every pod that compacts.
+     *
+     * ON A HOT TABLE THE WINDOW IS FULL ON EVERY SWEEP, in normal
+     * operation and not only when the sampler is behind: the read's lower
+     * bound is the published sample's START snapshot, which with a
+     * healthy sampler is one scan plus one refresh old — on
+     * gigahog-prod-us's `events_raw`, ~1-2 h, ~200-400k appends at ~3,600
+     * a minute. So the cost per sweep is this number of files, always.
+     * At 50,000 (what borrowing [maxCandidates] cost) that is ~200k
+     * buffers: sub-second warm, tens of seconds cold, and a timeout fails
+     * the whole table's plan — on the one table that matters.
+     *
+     * 10,000 is ~3 minutes of prod-us appends, newest first: a tuple
+     * being written to now is inside it, which is the case the read
+     * exists for (today's partition, a new team's). A tuple written once
+     * and never again since falls out of it and waits for the next
+     * generation, which a re-anchoring sampler now publishes.
+     */
+    val newBucketWindow: Int = DEFAULT_NEW_BUCKET_WINDOW,
+    /**
      * How many of a sweep's planned groups are REWRITTEN AND COMMITTED
      * at once (`HOGLAKE_COMPACTION_PARALLEL_GROUPS`).
      *
@@ -513,6 +544,14 @@ data class CompactionConfig(
                 "ceiling one plan reads more rows than a run can possibly use — which is the " +
                 "2026-09-30 planning read by another name"
         }
+        // 0 is legal here (the read off); the ceiling is maxCandidates'
+        // for maxCandidates' reason — it refuses a typo that would put
+        // the discovery read back over the plan statement timeout.
+        require(newBucketWindow in 0..MAX_MAX_CANDIDATES) {
+            "HOGLAKE_COMPACTION_NEW_BUCKET_WINDOW must be in 0..$MAX_MAX_CANDIDATES, got " +
+                "$newBucketWindow: it is a per-sweep read of that many files' partition values " +
+                "inside the plan's statement timeout"
+        }
         require(maxFanIn >= maxInputFiles) {
             "HOGLAKE_COMPACTION_MAX_FAN_IN $maxFanIn is below " +
                 "HOGLAKE_COMPACTION_MAX_INPUT_FILES $maxInputFiles: the fan-in ceiling cannot be " +
@@ -732,6 +771,9 @@ data class CompactionConfig(
          * the production settings.
          */
         const val DEFAULT_MAX_CANDIDATES = 50_000
+
+        /** See [newBucketWindow]: ~3 minutes of gigahog-prod-us appends. */
+        const val DEFAULT_NEW_BUCKET_WINDOW = 10_000
 
         /**
          * See [maxFanIn]: 2,048 inputs per group, chosen from
@@ -1500,14 +1542,21 @@ class CompactionService(
      *    statement with no partition arms and the aggregated tuple
      *    projected per returned row, capped at
      *    [CompactionConfig.maxCandidates];
-     *  - **a published generation with no qualifying bucket**: THERE IS
-     *    NO WORK. Return an empty fetch. The first version of this
-     *    change conflated this with the state above and ran the
-     *    50,000-row whole-table statement, every sweep, forever, for a
-     *    table whose debt is real but spread thinner than the file
-     *    minimum — which is the one statement in this change that still
-     *    carries the per-row `array_agg` the incident was about;
-     *  - **a published generation with buckets**: the bucket loop.
+     *  - **a published generation with no qualifying bucket**, in the
+     *    sample OR among the buckets appended to since it began
+     *    ([newBuckets]): THERE IS NO WORK. Return an empty fetch. The
+     *    first version of this change conflated this with the state
+     *    above and ran the 50,000-row whole-table statement, every
+     *    sweep, forever, for a table whose debt is real but spread
+     *    thinner than the file minimum — which is the one statement in
+     *    this change that still carries the per-row `array_agg` the
+     *    incident was about;
+     *  - **a published generation with buckets**: the bucket loop, over
+     *    the sample's buckets merged with [newBuckets]' in one value
+     *    order ([mergeBuckets]). Before the merge existed the planner
+     *    saw only what the generation saw, which on 2026-10-21 was
+     *    five days stale on millpond's `events_raw` (1,794 of 5,036
+     *    partitions) and blind to every partition written since.
      */
     private fun fetchCandidates(
         h: Handle,
@@ -1547,7 +1596,16 @@ class CompactionService(
         if (TierTotalsRepo.publishedGeneration(h, ctx.catalogId) == null) {
             return fetchWholeTable(h, ctx, budget, cfg)
         }
-        val sampled = sampledBuckets(h, ctx, cfg)
+        // The sample, plus every bucket written to since the sample's
+        // scan began. See [newBuckets] for why the sample alone is not
+        // enough, and [mergeBuckets] for the order.
+        val sampled =
+            mergeBuckets(
+                sampledBuckets(h, ctx, cfg),
+                TierTotalsRepo.publishedSampleSnapshot(h, ctx.catalogId)
+                    ?.let { since -> newBuckets(h, ctx, budget, cfg, since) }
+                    .orEmpty(),
+            )
         if (sampled.isEmpty()) return empty()
 
         val candidateBudget = cfg.candidateBudget
@@ -1579,7 +1637,7 @@ class CompactionService(
             val taken = if (rows.size > room) rows.subList(0, room) else rows
             fetched += taken.size
             if (taken.isNotEmpty()) byBucket[bucket.bucket] = taken
-            rememberCursor(ctx, bucket.bucket)
+            rememberCursor(ctx, bucket)
         }
         return CandidateFetch(
             ctx = ctx,
@@ -1742,6 +1800,245 @@ class CompactionService(
             .list()
 
     /**
+     * This table's buckets that hold small live files APPENDED SINCE the
+     * published sample's scan began — the buckets the sample cannot
+     * credit because it never saw their files.
+     *
+     * # Why the sample alone is not enough
+     *
+     * [sampledBuckets] is a generation old by construction: on
+     * gigahog-prod-us a scan takes ~1 h for ~7.6M rows, and the planner
+     * reads the generation published BEFORE the one in flight, so the
+     * newest bucket it can name is one or two scans old. On 2026-10-21 it
+     * was five days old, because the sampler had stopped publishing
+     * (its scan outlasted retention and restarted forever — fixed in
+     * `MaintenanceSummarySampler`, which now re-anchors): millpond's
+     * `events_raw` had 5,036 partitions and the planner saw the 1,794 of
+     * the 2026-10-16 generation. Every day partition written since — the
+     * hottest — was invisible to compaction, and its small-file backlog
+     * grew untouched. A working sampler shrinks that window to a scan
+     * and a refresh, and does not close it: a new day's partition, or a
+     * new team's under a `(team, day)` spec, is invisible until the
+     * first generation that STARTED after it. And a re-anchored scan
+     * misses appends whose key sorted below its cursor, which in size
+     * order is most new ingest files.
+     *
+     * # The lower bound is the sample's START snapshot
+     *
+     * `Sample.snapshotId` ([TierTotalsRepo.publishedSampleSnapshot]):
+     * the snapshot the scan captured when it began, which a re-anchor
+     * never moves. Every live file the sample may have missed began
+     * after it. A file that began after it and that the sample DID see
+     * (above the cursor of a re-anchored scan) is counted in both
+     * lists, so [mergeBuckets]' summed `small_count`/`small_bytes`/
+     * `selected` for that bucket are INFLATED by it. Those measures only
+     * ORDER the bucket loop — no group is sized from them, the probe
+     * reads the bucket's real files — so the cost is a bucket ranked
+     * slightly off, never a wrong plan.
+     *
+     * Not `hog_maintenance_summary.published_snapshot` (V27): it holds
+     * the same value when it is set, but a publish by a pre-V27 build
+     * moves `published_generation` without stamping it, and the sample
+     * is written in the same statement as `published_generation`, so it
+     * is never another generation's.
+     *
+     * # The access path and THE BOUND
+     *
+     * `(catalog_id, table_id, begin_snapshot)`, and WHICH index carrying
+     * it matters. V3's `hog_data_file_changefeed` is that key over every
+     * row; `hog_data_file_live` is the same key partial on `end_snapshot
+     * IS NULL`. The inner `LIMIT` bounds the rows the walk RETURNS, not
+     * the rows it VISITS: over the changefeed index the walk reads and
+     * filters every ENDED row since `since` on the way to its live ones,
+     * and on a stale sample — hours of appends, most of them compacted
+     * away since — that is the whole range, inside the plan's 15 s
+     * bound. Over the live index an ended row is not an entry, so the
+     * walk visits only live rows and the `LIMIT` bounds what it visits.
+     *
+     * The walk is therefore the LIVE index's, and Postgres chooses it
+     * rather than being told: for one range, the partial index's
+     * estimated cost is never above the full one's (fewer index pages,
+     * and no heap fetch for the estimated ended fraction it would then
+     * filter), so it wins whenever the statistics show ANY ended rows,
+     * which a manifest under expiry lag always has. With none (a fixture
+     * of only live rows) the two tie, the planner may take either, and
+     * the two then cost the same. Measured on
+     * `CompactionCandidateFetchPlanIntegrationTest`'s fixture plus
+     * 200,000 ended rows since `since`, NEWER than 1,000 live ones:
+     * `Index Scan Backward using hog_data_file_live`, 1,000 rows, 0
+     * removed, ~30-40 manifest-side buffers, 1.3 ms. The same statement
+     * with the live index dropped walks the changefeed index: `Rows
+     * Removed by Filter: 200000`, 16,679 buffers, 30.6 ms, growing with
+     * the dead rows. That test PINS the live index on the dead-row
+     * shape, so a planner change that flips it is a red test, not an
+     * outage. On the all-live shape the changefeed walk measured 2,000
+     * rows, 63 manifest-side buffers (against 5,307 heap pages for one
+     * pass of the manifest) plus 4 per file for the partition-value
+     * descent.
+     *
+     * A lower bound on `begin_snapshot` (the newest K snapshots) was the
+     * alternative and was not taken: it bounds the dead rows visited by
+     * K snapshots' appends rather than removing them, and it adds a
+     * second horizon — a tuple older than K snapshots and unseen by the
+     * sample would wait for the next generation even with room in the
+     * window.
+     *
+     * Walked NEWEST FIRST and capped at [CompactionConfig.newBucketWindow]
+     * files (`HOGLAKE_COMPACTION_NEW_BUCKET_WINDOW`, default 10,000), with
+     * the per-row `array_agg` in the select list so it is evaluated per
+     * row the `LIMIT` lets through, never per row of the range. Its own
+     * knob and NOT [CompactionConfig.maxCandidates], because this read
+     * DISCOVERS tuples, it does not fetch candidates — and because on a
+     * hot table THE CAP IS HIT ON EVERY SWEEP in normal operation, not
+     * only when the sampler is behind: with a healthy sampler `since` is
+     * one scan plus one refresh old, ~1-2 h and ~200-400k appends on
+     * prod-us's `events_raw`. So the window is a per-sweep cost, paid
+     * inside [PLAN_STATEMENT_TIMEOUT_MS] on every plan of the table, and
+     * a timeout here fails the whole table's plan. At the 50,000 that
+     * borrowing `maxCandidates` meant, ~200k buffers per sweep; at
+     * 10,000, ~40k, of which the cold reads are far fewer than the hits,
+     * because one commit's files have adjacent `data_file_id`s and so
+     * share `hog_file_partition_value` leaf pages. 10,000 is ~3 minutes
+     * of prod-us appends: a tuple being written to now is inside it,
+     * a tuple written once and then never again since may fall outside
+     * it until the next generation names it. That is the stated cost of
+     * the cap. 0 turns the read off. The grouped output is capped at
+     * [MAX_NEW_BUCKETS], independently of the sample's cap (see [mergeBuckets]).
+     *
+     * WHY NOT CHEAPER THAN ONE DESCENT PER FILE. `hog_file_partition_value`
+     * carries neither `table_id` nor `begin_snapshot`, so neither its
+     * primary key nor V23's `hog_file_partition_value_lookup (catalog_id,
+     * key_index, value, data_file_id)` can be driven by "this table's
+     * files since S"; the only way from the window to its tuples is
+     * through the window's ids. A distinct-tuples read would need
+     * `table_id` and `begin_snapshot` in a partition-value index, a
+     * schema change on the second-hottest write in the system, and is not
+     * this change.
+     *
+     * Only files under the target, the planner's own candidate rule, and
+     * only buckets with at least two of them (the packer's floor, which
+     * [sampledBuckets] applies to `selected`). The two floors leave a
+     * gap, stated rather than closed: a tuple the sample saw ONE file of
+     * (`selected` 0, so [sampledBuckets] drops it) that has since gained
+     * ONE more (one new file, under this read's floor) is in NEITHER
+     * list, although together they make a group of two. It is picked up
+     * by the next generation, or by this read once a second new file
+     * lands. Closing it would mean un-flooring one of the two reads.
+     *
+     * The tuple of a file with no partition-value rows is NULL — the
+     * tuple-less bucket, exactly as the sampler and [fetchWholeTable]
+     * derive it — so an unpartitioned table's one bucket and a
+     * mid-life-partitioned table's pre-spec vintage take the same
+     * tuple-less probe in [bucketCandidates] as before.
+     */
+    private fun newBuckets(
+        h: Handle,
+        ctx: TableContext,
+        budget: Long,
+        cfg: CompactionConfig,
+        since: Long,
+    ): List<SampledBucket> {
+        if (cfg.newBucketWindow == 0) return emptyList()
+        return h.createQuery(NEW_BUCKETS_SQL)
+            .bind("catalogId", ctx.catalogId)
+            .bind("tableId", ctx.tableId)
+            .bind("since", since)
+            .bind("targetBytes", budget)
+            .bind("fileCap", cfg.newBucketWindow)
+            .bind("minFiles", 2L)
+            .bind("bucketCap", MAX_NEW_BUCKETS)
+            // Custom plans only: `since` is near the top of the
+            // begin_snapshot range, and only a plan built with the value
+            // knows the range is narrow.
+            .addCustomizer(Pg.CUSTOM_PLANS_ONLY)
+            .map { rs, _ ->
+                val count = rs.getLong("small_count")
+                SampledBucket(
+                    Bucket(
+                        specId = rs.getObject("spec_id")?.let { (it as Number).toLong() },
+                        values = (rs.getArray("partition_values")?.array as? Array<*>)?.map { it as String? },
+                    ),
+                    // An UPPER BOUND on what the packer would take — the
+                    // sampler's mirror of the packer has not run over
+                    // these files — and used for ordering only.
+                    selected = count,
+                    smallCount = count,
+                    smallBytes = rs.getLong("small_bytes"),
+                )
+            }
+            .list()
+    }
+
+    /**
+     * The sample's buckets and [newBuckets]' as ONE list, in the
+     * sample's order.
+     *
+     * # The merge order: one value order, not new-first
+     *
+     * A bucket present in both is ONE entry whose measures are the sum
+     * (the files the generation saw plus the files since). The merged
+     * list is then sorted by the key [sampledBuckets] sorts by —
+     * bytes-per-file ascending, then `selected` descending, then
+     * `small_count` descending — with a STABLE sort, so buckets only the
+     * sample knows keep the exact relative order the SQL gave them.
+     *
+     * Not new-first, deliberately. New-first would put a fresh day's
+     * bucket — prod's ~100k files of up to 200 MB, the four-orders-
+     * of-magnitude worse rewrite [sampledBuckets]' KDoc measures — ahead
+     * of every stray bucket on every sweep, which is the ordering that KDoc
+     * records as having touched one bucket in ten sweeps. Fairness is not
+     * the order's job anyway: [rotated]'s cursor reaches every bucket
+     * of the merged list within `ceil(available / considered)` sweeps,
+     * wherever the order puts it, and a new bucket of small files is
+     * ranked AHEAD of the sample by that same order.
+     *
+     * # Two caps, INDEPENDENT, and the union is not re-capped
+     *
+     * The sample's list is capped at [MAX_SAMPLED_BUCKETS] by
+     * [sampledBuckets], the new-bucket list at [MAX_NEW_BUCKETS] by
+     * [newBuckets] (and in practice by its window: at most
+     * `newBucketWindow / 2` tuples clear its floor of two), and the union
+     * keeps EVERY entry of both. It used to be cut back to
+     * [MAX_SAMPLED_BUCKETS] after the sort, and since new buckets of
+     * small files sort AHEAD of most of the sample, a full sample plus
+     * any new bucket lost its value-last sampled buckets from the list
+     * altogether — not deferred by the rotation, never offered. With the
+     * caps independent, one list cannot starve the other; the union is at
+     * most `MAX_SAMPLED_BUCKETS + MAX_NEW_BUCKETS` small objects in heap,
+     * and the bucket loop's own `bucketLimit` is what bounds the probes.
+     */
+    private fun mergeBuckets(
+        sampled: List<SampledBucket>,
+        fresh: List<SampledBucket>,
+    ): List<SampledBucket> {
+        if (fresh.isEmpty()) return sampled
+        val merged = LinkedHashMap<Bucket, SampledBucket>()
+        for (b in sampled) merged[b.bucket] = b
+        for (b in fresh) {
+            merged.merge(b.bucket, b) { old, new ->
+                old.copy(
+                    selected = old.selected + new.selected,
+                    smallCount = old.smallCount + new.smallCount,
+                    smallBytes = old.smallBytes + new.smallBytes,
+                )
+            }
+        }
+        return merged.values.sortedWith(bucketOrder)
+    }
+
+    /**
+     * [sampledBuckets]' SQL `ORDER BY`, in Kotlin: bytes per file
+     * ascending (`GREATEST(small_count, 1)` as the divisor), `selected`
+     * descending, `small_count` descending. Shared by [mergeBuckets] and
+     * [rotated]'s resume, so the order the list is in and the order the
+     * cursor resumes by cannot drift.
+     */
+    private val bucketOrder: Comparator<SampledBucket> =
+        compareBy<SampledBucket> { it.smallBytes.toDouble() / maxOf(it.smallCount, 1L) }
+            .thenByDescending { it.selected }
+            .thenByDescending { it.smallCount }
+
+    /**
      * Where the last sweep's bucket loop stopped, per (catalog, table).
      *
      * # Why a strict order is not enough
@@ -1771,31 +2068,54 @@ class CompactionService(
      * bucket is what the group claims already arbitrate. Persisting it
      * would mean a write per plan on the maintenance path for a
      * tie-break.
+     *
+     * # The cursor carries the bucket's SORT KEY, not only its identity
+     *
+     * The bucket the last sweep stopped on can be GONE from this sweep's
+     * list: compacted below the floor, the generation moved, or — since
+     * [newBuckets] — a new bucket that this sweep's window no longer
+     * reaches or that the next generation now names under a different
+     * measure. New-bucket membership changes every sweep on a churny
+     * spec, so "gone" is routine, not rare. Restarting from the top when
+     * it happens is the fixed point above by another route: a sweep that
+     * ends on a transient bucket sends the next one back to the head of
+     * the order, and the tail is never reached.
+     *
+     * So the cursor also remembers the bucket's position in the ORDER —
+     * [bucketOrder]'s key, `(bytes per file, selected, small_count)` —
+     * and a sweep whose bucket is gone resumes at the first bucket that
+     * sorts at or after that key. Ties can repeat a bucket, which costs a
+     * probe; they cannot send the loop back to the top.
      */
-    private val bucketCursor = java.util.concurrent.ConcurrentHashMap<Pair<Long, Long>, Bucket>()
+    private val bucketCursor = java.util.concurrent.ConcurrentHashMap<Pair<Long, Long>, SampledBucket>()
 
     /**
      * [sampled] rotated so this sweep starts after the bucket the last
      * one stopped on — the order is preserved, only the entry point
-     * moves.
+     * moves. When that bucket is gone, at the first bucket sorting at or
+     * after where it sat (see [bucketCursor]).
      */
     private fun rotated(
         ctx: TableContext,
         sampled: List<SampledBucket>,
     ): List<SampledBucket> {
         val last = bucketCursor[ctx.catalogId to ctx.tableId] ?: return sampled
-        val at = sampled.indexOfFirst { it.bucket == last }
-        // Not found: the bucket is gone from the sample (compacted away,
-        // or the generation moved), so there is nothing to start after
-        // and the natural order is right.
-        if (at < 0) return sampled
-        val from = (at + 1) % sampled.size
+        if (sampled.isEmpty()) return sampled
+        val at = sampled.indexOfFirst { it.bucket == last.bucket }
+        val from =
+            if (at >= 0) {
+                (at + 1) % sampled.size
+            } else {
+                // Gone: resume where it WOULD sort. None at or after it
+                // means it sat past the end, so the next sweep wraps.
+                sampled.indexOfFirst { bucketOrder.compare(it, last) >= 0 }.takeIf { it >= 0 } ?: 0
+            }
         return sampled.subList(from, sampled.size) + sampled.subList(0, from)
     }
 
     private fun rememberCursor(
         ctx: TableContext,
-        bucket: Bucket,
+        bucket: SampledBucket,
     ) {
         bucketCursor[ctx.catalogId to ctx.tableId] = bucket
     }
@@ -4578,6 +4898,56 @@ class CompactionService(
          * else.
          */
         const val MAX_SAMPLED_BUCKETS = 50_000
+
+        /**
+         * The cap on the buckets `CompactionService.newBuckets` may
+         * offer one plan, INDEPENDENT of [MAX_SAMPLED_BUCKETS] (see
+         * `mergeBuckets`). The window bounds it first — a tuple needs two
+         * files, so at most `newBucketWindow / 2`, 5,000 at the default
+         * — and this is the hard number behind that for a window raised
+         * toward its 200,000 ceiling.
+         */
+        const val MAX_NEW_BUCKETS = 50_000
+
+        /**
+         * [newBuckets]' statement — `internal` so
+         * `CompactionCandidateFetchPlanIntegrationTest` EXPLAINs this
+         * string and not a retyped copy.
+         *
+         * The inner `ORDER BY begin_snapshot DESC LIMIT` is what bounds
+         * it: a backward walk of the `(catalog_id, table_id,
+         * begin_snapshot)` range (`hog_data_file_live`, so no ended row is visited) from the newest
+         * file, stopping at `:fileCap`, with the partition-value lookup
+         * in the select list so it runs once per row that LIMIT passes
+         * and never for a file the size filter drops. The outer
+         * aggregate is over at most `:fileCap` rows.
+         */
+        internal const val NEW_BUCKETS_SQL: String =
+            """
+            SELECT n.spec_id,
+                   n.partition_values,
+                   count(*) AS small_count,
+                   sum(n.file_size_bytes) AS small_bytes
+              FROM (
+                    SELECT f.spec_id, f.file_size_bytes,
+                           (SELECT array_agg(pv.value ORDER BY pv.key_index)
+                              FROM hog_file_partition_value pv
+                             WHERE pv.catalog_id = f.catalog_id
+                               AND pv.data_file_id = f.data_file_id) AS partition_values
+                      FROM hog_data_file f
+                     WHERE f.catalog_id = :catalogId AND f.table_id = :tableId
+                       AND f.begin_snapshot > :since
+                       AND f.end_snapshot IS NULL
+                       AND f.file_size_bytes < :targetBytes
+                     ORDER BY f.begin_snapshot DESC
+                     LIMIT :fileCap
+                   ) n
+             GROUP BY n.spec_id, n.partition_values
+            HAVING count(*) >= :minFiles
+             ORDER BY sum(n.file_size_bytes)::float8 / count(*) ASC,
+                      count(*) DESC
+             LIMIT :bucketCap
+            """
 
         /**
          * The `SET LOCAL statement_timeout` phase (a) of a plan runs

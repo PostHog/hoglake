@@ -174,6 +174,7 @@ class App private constructor(
                 maxGroupsPerRun = cfg.compactionMaxGroupsPerRun,
                 candidateHeadroom = cfg.compactionCandidateHeadroom,
                 maxCandidates = cfg.compactionMaxCandidates,
+                newBucketWindow = cfg.compactionNewBucketWindow,
                 maxFanIn = cfg.compactionMaxFanIn,
                 parallelGroups = cfg.compactionParallelGroups,
                 inputOpenParallelism = cfg.compactionParallelInputOpens,

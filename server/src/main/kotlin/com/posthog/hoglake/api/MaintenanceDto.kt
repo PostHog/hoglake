@@ -480,6 +480,12 @@ data class MaintenanceStatusDto(
     val sampledAt: Instant?,
     val sampleStartedAt: Instant?,
     val sampledSnapshotId: Long?,
+    /**
+     * Absent with the rest of the sample (the app-wide NON_NULL rule),
+     * so `sampled_at` present and this absent can only mean an older
+     * server.
+     */
+    val sampleReanchored: Int?,
 )
 
 fun MaintenanceStatus.toDto() =
@@ -491,6 +497,7 @@ fun MaintenanceStatus.toDto() =
         sampledAt,
         sampleStartedAt,
         sampledSnapshotId,
+        sampleReanchored,
     )
 
 data class InstanceMaintenanceStatusDto(

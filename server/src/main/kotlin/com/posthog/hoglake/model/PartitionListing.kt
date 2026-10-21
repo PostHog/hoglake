@@ -63,7 +63,12 @@ data class PartitionGroup(
      * because the straddling case is invisible in the row.
      */
     val recordCount: Long?,
-    /** max(begin_snapshot) over the partition's files; null on a pre-V22 sample. */
+    /**
+     * max(begin_snapshot) over the partition's files; null on a pre-V22
+     * sample. NOT bounded by [PartitionListing.sampledSnapshotId]: a scan
+     * that re-anchored (`MaintenanceSummarySampler`) judged its later
+     * pages at a newer snapshot, so a file it counted can begin after it.
+     */
     val lastWrittenSnapshot: Long?,
 )
 
@@ -71,8 +76,9 @@ data class PartitionGroup(
  * `GET .../tables/{table}/partitions` — a table's partitions as the
  * maintenance sampler last measured them.
  *
- * THE SAMPLE IS THE POINT. Every number here is at [sampledSnapshotId],
- * not at head, and it is stated on the response rather than implied so a
+ * THE SAMPLE IS THE POINT. Every number here is at [sampledSnapshotId]
+ * (or, for a re-anchored sample, observed over the window starting
+ * there — see `MaintenanceSummarySampler`), not at head, and it is stated on the response rather than implied so a
  * console can date what it shows. That is what buys the listing its
  * cost: no manifest walk, no lock, no per-commit work — the sampler has
  * already walked every file once per generation and this is a read of

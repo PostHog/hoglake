@@ -359,7 +359,9 @@ there would break that gate on every build.
      endpoint too: the writer fleet calls it three times per flush and
      the aggregate it replaced was ~10M manifest rows per call. The
      response carries `totals_snapshot_id` (the snapshot the numbers are
-     exact at) and `totals_as_of`; all three totals are ABSENT, never 0,
+     exact at — or, for a generation whose scan expiry overtook and
+     re-anchored, the start of the window they were observed over; see
+     `MaintenanceSummarySampler`) and `totals_as_of`; all three totals are ABSENT, never 0,
      when the published generation does not cover the table.
    - `totals=false`: absent, and no file read of any kind. The identity
      read. `read_snapshot_id` is present on every one of these paths —
@@ -1083,8 +1085,31 @@ ran on the local stack and what it showed.
   bucket's partial group across pages in `pending_max_bytes`. Default row budget 10,000/tick, interval 1s,
   refresh delay 60s after a completed scan (`HOGLAKE_MAINTENANCE_SUMMARY_*`).
   Incomplete generations are never published; old samples remain visible
-  with freshness timestamps. Expiry overtaking a scan restarts it. The
-  central status endpoint pages catalogs (50 default, max 100).
+  with freshness timestamps. **Expiry overtaking a scan RE-ANCHORS it**
+  (it used to restart it): the scan moves its visibility snapshot to head,
+  counts it in `scan_state`/the sample's `reanchors` (surfaced as
+  `sample_reanchored` on `/maintenance/status`) and continues from its
+  cursor. The restart never finished once a scan outlasted retention —
+  millpond-prod-us (58 min scan, 3,600 s retention) and millrace-prod-us
+  (600 s) published nothing from 2026-10-16 to 10-21. The cursor is over
+  immutable keys, so no row is skipped or paged twice; a re-anchored
+  generation's file measures and V27 totals are an observation over the
+  scan window, and the sample's `snapshotId`/`published_snapshot` stay
+  the scan's START (coverage, dropped-table subtraction and the planner's
+  new-bucket bound read it). A policy change still restarts. The class
+  KDoc has the argument and the error bound. The central status
+  endpoint pages catalogs (50 default, max 100).
+  The COMPACTION PLANNER's bucket list is the published generation's
+  buckets MERGED with the buckets of live small files appended since that
+  sample's start snapshot (`CompactionService.newBuckets`, one bounded
+  read of the `(catalog_id, table_id, begin_snapshot)` range, newest
+  first, capped at `HOGLAKE_COMPACTION_NEW_BUCKET_WINDOW`, 10,000 files,
+  which on a hot table is a per-sweep cost because the window is full on
+  every sweep): a generation cannot name a partition first written after
+  its scan began, and on 2026-10-21 that was every
+  partition millpond's `events_raw` had gained in five days (5,036 live
+  against the 1,794 the planner saw). One value order for the merged
+  list, not new-first; `mergeBuckets`' KDoc says why.
   - **Retirement** (`MaintenanceTask.RETIREMENT`, loop `retirement`,
     invariant 11) is the loop that deletes a dropped table's file rows
     and queues their objects.

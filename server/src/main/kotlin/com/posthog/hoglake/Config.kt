@@ -833,6 +833,18 @@ data class Config(
             "${com.posthog.hoglake.compaction.CompactionConfig.DEFAULT_MAX_CANDIDATES}",
         ).toInt(),
     /**
+     * Newest live small files of a table one plan reads to discover
+     * partition tuples written since the published maintenance sample
+     * began; 0 disables. On a hot table this many files are read on
+     * every sweep, so it is a per-sweep cost, not a backlog cap. See
+     * CompactionConfig.newBucketWindow.
+     */
+    val compactionNewBucketWindow: Int =
+        env(
+            "HOGLAKE_COMPACTION_NEW_BUCKET_WINDOW",
+            "${com.posthog.hoglake.compaction.CompactionConfig.DEFAULT_NEW_BUCKET_WINDOW}",
+        ).toInt(),
+    /**
      * The CEILING of a group's fan-in, whatever the file sizes say;
      * `HOGLAKE_COMPACTION_MAX_INPUT_FILES` is its floor.
      *
