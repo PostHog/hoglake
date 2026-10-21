@@ -897,7 +897,7 @@ class CompactionCandidateFetchPlanIntegrationTest {
                         .bind("targetBytes", cfg.targetBytes)
                         .bind("fileCap", cfg.newBucketWindow)
                         .bind("minFiles", 2L)
-                        .bind("bucketCap", CompactionService.MAX_SAMPLED_BUCKETS)
+                        .bind("bucketCap", CompactionService.MAX_NEW_BUCKETS)
                         .mapTo(String::class.java).list().joinToString("\n")
                 } finally {
                     h.rollback()
@@ -908,9 +908,11 @@ class CompactionCandidateFetchPlanIntegrationTest {
         // THE ACCESS PATH: the (catalog_id, table_id, begin_snapshot) key,
         // walked from the newest file. V3's `hog_data_file_changefeed` is
         // that key over every row and `hog_data_file_live` the same key
-        // partial on live rows; either bounds the read by the range. PG
-        // 18 picks the changefeed index here, `end_snapshot IS NULL` and
-        // the size bound as a Filter (Index Searches: 1).
+        // partial on live rows. With no ended row in range the two TIE
+        // and PG 18 happens to pick the changefeed index here,
+        // `end_snapshot IS NULL` and the size bound as a Filter (Index
+        // Searches: 1). Where ended rows exist the choice matters, and
+        // the next test pins the live index on that shape.
         // MUTATION: drop `f.begin_snapshot > :since` and the scan's rows
         // are the table's newest live small files up to the window (10,000
         // here, not 2,000), most of them the sample's; drop the inner
@@ -976,5 +978,105 @@ class CompactionCandidateFetchPlanIntegrationTest {
             .describedAs("the manifest side is the range, not a pass of the table:\n%s", plan)
             .isLessThanOrEqualTo(newFiles / 10L)
             .isLessThan(heapPages("hog_data_file") / 20)
+    }
+
+    @Test
+    fun `the new-bucket read never visits the ended rows since the snapshot`() {
+        // THE SCANNED RANGE, NOT ONLY THE RETURNED ONE. The inner LIMIT
+        // bounds rows the walk RETURNS. If the index the walk drives from
+        // also holds ENDED rows, the walk reads and filters every one of
+        // them on the way to its live ones — and on a stale sample (hours
+        // of appends since `since`, most already compacted away) that is
+        // the whole range, inside the plan's 15 s statement timeout.
+        //
+        // The shape: `endedFiles` small files that began after the
+        // snapshot and have ENDED since, NEWER than `liveFiles` live
+        // ones, so a walk from the newest entry meets all the dead rows
+        // first. Rolled back, as above.
+        //
+        // Measured on PG 18 on this fixture: the planner walks
+        // `hog_data_file_live` (partial on `end_snapshot IS NULL`, so an
+        // ended row is not an entry at all): 1,000 rows, 0 removed,
+        // ~30-40 manifest-side buffers, 1.3 ms. Forced onto V3's
+        // `hog_data_file_changefeed` (live index dropped in the
+        // transaction): the same answer through `Rows Removed by Filter:
+        // 200000`, 16,679 buffers, 30.6 ms — and that grows with the dead
+        // rows, without bound.
+        val liveFiles = 1_000
+        val endedFiles = 200_000
+        val plan =
+            db.jdbi.withHandleUnchecked { h ->
+                h.begin()
+                try {
+                    h.execute("SET LOCAL max_parallel_workers_per_gather = 0")
+                    for (s in 1..3) {
+                        h.execute(
+                            "INSERT INTO hog_snapshot (catalog_id, snapshot_id, schema_version) VALUES (?, ?, 0) " +
+                                "ON CONFLICT DO NOTHING",
+                            catalogId,
+                            s,
+                        )
+                    }
+                    h.createUpdate(
+                        """
+                        INSERT INTO hog_data_file (catalog_id, data_file_id, table_id, begin_snapshot, end_snapshot,
+                                                   path, record_count, file_size_bytes, row_id_start, spec_id)
+                        SELECT :c, 20000000 + g, :t,
+                               CASE WHEN g <= :live THEN 1 ELSE 2 END,
+                               CASE WHEN g <= :live THEN NULL ELSE 3 END,
+                               's3://fetchplan/' || md5((20000000 + g)::text) || '/e-' || g || '.parquet',
+                               :rows, :bytes, (20000000 + g)::bigint * 1000000, 1
+                          FROM generate_series(1, :n) g
+                        """,
+                    ).bind("c", catalogId).bind("t", tableId).bind("live", liveFiles)
+                        .bind("rows", TINY_ROWS).bind("bytes", TINY_BYTES).bind("n", liveFiles + endedFiles)
+                        .execute()
+                    h.createUpdate(
+                        """
+                        INSERT INTO hog_file_partition_value (catalog_id, data_file_id, key_index, value)
+                        SELECT :c, 20000000 + g, 0, 'e-' || (g % 10) FROM generate_series(1, :n) g
+                        """,
+                    ).bind("c", catalogId).bind("n", liveFiles + endedFiles).execute()
+                    h.execute("ANALYZE hog_data_file")
+                    h.execute("ANALYZE hog_file_partition_value")
+                    h.createQuery(
+                        "EXPLAIN (ANALYZE, BUFFERS, TIMING false, COSTS false, SUMMARY false) " +
+                            CompactionService.NEW_BUCKETS_SQL,
+                    )
+                        .bind("catalogId", catalogId)
+                        .bind("tableId", tableId)
+                        .bind("since", 0L)
+                        .bind("targetBytes", cfg.targetBytes)
+                        .bind("fileCap", cfg.newBucketWindow)
+                        .bind("minFiles", 2L)
+                        .bind("bucketCap", CompactionService.MAX_NEW_BUCKETS)
+                        .mapTo(String::class.java).list().joinToString("\n")
+                } finally {
+                    h.rollback()
+                }
+            }
+        println("RECORDED new-bucket read past $endedFiles ended rows to $liveFiles live:\n$plan")
+
+        val scan =
+            ExplainPlan.nodes(plan).single {
+                it.line.contains("on hog_data_file f") && it.line.contains("Scan")
+            }
+        // PINNED to the live index: the changefeed index would answer the
+        // same, through every dead row.
+        assertThat(scan.line)
+            .describedAs("the walk is over the LIVE index, which holds no ended row:\n%s", plan)
+            .contains("using hog_data_file_live on hog_data_file f")
+        assertThat(rowsRemoved(plan))
+            .describedAs("no ended row is read to be thrown away:\n%s", plan)
+            .isZero()
+        val scanned = Regex("""actual rows=([\d.]+)""").find(scan.line)!!.groupValues[1].toDouble().toLong()
+        assertThat(scanned).isEqualTo(liveFiles.toLong())
+        val subPlan =
+            ExplainPlan.nodes(plan).single { it.line.contains("on hog_file_partition_value pv") }
+        // Bounded by the LIVE files: 30-40 measured, against 16,679 when
+        // the walk is over the changefeed index.
+        assertThat(scan.buffers - subPlan.buffers)
+            .describedAs("the manifest side is bounded by the live files, not the dead ones:\n%s", plan)
+            .isLessThanOrEqualTo(liveFiles / 10L + 64)
     }
 }

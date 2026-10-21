@@ -1844,19 +1844,44 @@ class CompactionService(
      *
      * # The access path and THE BOUND
      *
-     * `(catalog_id, table_id, begin_snapshot)`: V3's
-     * `hog_data_file_changefeed` is that key over every row, and
-     * `hog_data_file_live` the same key partial on `end_snapshot IS
-     * NULL`. PG 18 picks the changefeed index on
-     * `CompactionCandidateFetchPlanIntegrationTest`'s 210,000-file
-     * fixture — `Index Scan Backward`, `Index Searches: 1`, `end_snapshot
-     * IS NULL` and the size bound as a Filter — so a file that began
-     * after the snapshot and has since ended (a compacted input) is read
-     * and dropped. Either index makes the read O(files of THIS table
-     * since the snapshot), never O(table). Measured there: 2,000 new
-     * files, 2,000 rows off the index, 63 manifest-side buffers (against
-     * 5,307 heap pages for one pass of the manifest) plus 4 per file for
-     * the partition-value descent.
+     * `(catalog_id, table_id, begin_snapshot)`, and WHICH index carrying
+     * it matters. V3's `hog_data_file_changefeed` is that key over every
+     * row; `hog_data_file_live` is the same key partial on `end_snapshot
+     * IS NULL`. The inner `LIMIT` bounds the rows the walk RETURNS, not
+     * the rows it VISITS: over the changefeed index the walk reads and
+     * filters every ENDED row since `since` on the way to its live ones,
+     * and on a stale sample — hours of appends, most of them compacted
+     * away since — that is the whole range, inside the plan's 15 s
+     * bound. Over the live index an ended row is not an entry, so the
+     * walk visits only live rows and the `LIMIT` bounds what it visits.
+     *
+     * The walk is therefore the LIVE index's, and Postgres chooses it
+     * rather than being told: for one range, the partial index's
+     * estimated cost is never above the full one's (fewer index pages,
+     * and no heap fetch for the estimated ended fraction it would then
+     * filter), so it wins whenever the statistics show ANY ended rows,
+     * which a manifest under expiry lag always has. With none (a fixture
+     * of only live rows) the two tie, the planner may take either, and
+     * the two then cost the same. Measured on
+     * `CompactionCandidateFetchPlanIntegrationTest`'s fixture plus
+     * 200,000 ended rows since `since`, NEWER than 1,000 live ones:
+     * `Index Scan Backward using hog_data_file_live`, 1,000 rows, 0
+     * removed, ~30-40 manifest-side buffers, 1.3 ms. The same statement
+     * with the live index dropped walks the changefeed index: `Rows
+     * Removed by Filter: 200000`, 16,679 buffers, 30.6 ms, growing with
+     * the dead rows. That test PINS the live index on the dead-row
+     * shape, so a planner change that flips it is a red test, not an
+     * outage. On the all-live shape the changefeed walk measured 2,000
+     * rows, 63 manifest-side buffers (against 5,307 heap pages for one
+     * pass of the manifest) plus 4 per file for the partition-value
+     * descent.
+     *
+     * A lower bound on `begin_snapshot` (the newest K snapshots) was the
+     * alternative and was not taken: it bounds the dead rows visited by
+     * K snapshots' appends rather than removing them, and it adds a
+     * second horizon — a tuple older than K snapshots and unseen by the
+     * sample would wait for the next generation even with room in the
+     * window.
      *
      * Walked NEWEST FIRST and capped at [CompactionConfig.newBucketWindow]
      * files (`HOGLAKE_COMPACTION_NEW_BUCKET_WINDOW`, default 10,000), with
@@ -1878,7 +1903,7 @@ class CompactionService(
      * a tuple written once and then never again since may fall outside
      * it until the next generation names it. That is the stated cost of
      * the cap. 0 turns the read off. The grouped output is capped at
-     * [MAX_SAMPLED_BUCKETS], as the sample is.
+     * [MAX_NEW_BUCKETS], independently of the sample's cap (see [mergeBuckets]).
      *
      * WHY NOT CHEAPER THAN ONE DESCENT PER FILE. `hog_file_partition_value`
      * carries neither `table_id` nor `begin_snapshot`, so neither its
@@ -1921,7 +1946,7 @@ class CompactionService(
             .bind("targetBytes", budget)
             .bind("fileCap", cfg.newBucketWindow)
             .bind("minFiles", 2L)
-            .bind("bucketCap", MAX_SAMPLED_BUCKETS)
+            .bind("bucketCap", MAX_NEW_BUCKETS)
             // Custom plans only: `since` is near the top of the
             // begin_snapshot range, and only a plan built with the value
             // knows the range is narrow.
@@ -1967,8 +1992,20 @@ class CompactionService(
      * wherever the order puts it, and a new bucket of small files is
      * ranked AHEAD of the sample by that same order.
      *
-     * The list is capped at [MAX_SAMPLED_BUCKETS] again after the merge,
-     * because two capped lists are not one.
+     * # Two caps, INDEPENDENT, and the union is not re-capped
+     *
+     * The sample's list is capped at [MAX_SAMPLED_BUCKETS] by
+     * [sampledBuckets], the new-bucket list at [MAX_NEW_BUCKETS] by
+     * [newBuckets] (and in practice by its window: at most
+     * `newBucketWindow / 2` tuples clear its floor of two), and the union
+     * keeps EVERY entry of both. It used to be cut back to
+     * [MAX_SAMPLED_BUCKETS] after the sort, and since new buckets of
+     * small files sort AHEAD of most of the sample, a full sample plus
+     * any new bucket lost its value-last sampled buckets from the list
+     * altogether — not deferred by the rotation, never offered. With the
+     * caps independent, one list cannot starve the other; the union is at
+     * most `MAX_SAMPLED_BUCKETS + MAX_NEW_BUCKETS` small objects in heap,
+     * and the bucket loop's own `bucketLimit` is what bounds the probes.
      */
     private fun mergeBuckets(
         sampled: List<SampledBucket>,
@@ -1986,7 +2023,7 @@ class CompactionService(
                 )
             }
         }
-        return merged.values.sortedWith(bucketOrder).take(MAX_SAMPLED_BUCKETS)
+        return merged.values.sortedWith(bucketOrder)
     }
 
     /**
@@ -4863,13 +4900,23 @@ class CompactionService(
         const val MAX_SAMPLED_BUCKETS = 50_000
 
         /**
+         * The cap on the buckets `CompactionService.newBuckets` may
+         * offer one plan, INDEPENDENT of [MAX_SAMPLED_BUCKETS] (see
+         * `mergeBuckets`). The window bounds it first — a tuple needs two
+         * files, so at most `newBucketWindow / 2`, 5,000 at the default
+         * — and this is the hard number behind that for a window raised
+         * toward its 200,000 ceiling.
+         */
+        const val MAX_NEW_BUCKETS = 50_000
+
+        /**
          * [newBuckets]' statement — `internal` so
          * `CompactionCandidateFetchPlanIntegrationTest` EXPLAINs this
          * string and not a retyped copy.
          *
          * The inner `ORDER BY begin_snapshot DESC LIMIT` is what bounds
          * it: a backward walk of the `(catalog_id, table_id,
-         * begin_snapshot)` range (V3's changefeed index) from the newest
+         * begin_snapshot)` range (`hog_data_file_live`, so no ended row is visited) from the newest
          * file, stopping at `:fileCap`, with the partition-value lookup
          * in the select list so it runs once per row that LIMIT passes
          * and never for a file the size filter drops. The outer

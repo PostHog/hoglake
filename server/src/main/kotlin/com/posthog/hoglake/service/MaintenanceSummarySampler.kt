@@ -259,8 +259,10 @@ class MaintenanceSummarySampler(
         /**
          * Re-anchors so far; published as [Sample.reanchors]. Counts
          * EVENTS — file-phase ticks that found the floor past
-         * [evaluatedAt] — not pages: a tick whose page then only skips a
-         * dropped table's key range counts as one too.
+         * [evaluatedAt] and MOVED [visibleAt] to a newer head — not
+         * pages: a tick whose page then only skips a dropped table's key
+         * range counts as one too, and a tick that would leave the
+         * snapshot where it is counts nothing.
          */
         @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
         var reanchors: Int = 0,
@@ -382,7 +384,15 @@ class MaintenanceSummarySampler(
                         h.createQuery(
                             "SELECT earliest_snapshot_id, last_snapshot_id FROM hog_catalog WHERE catalog_id = :id",
                         ).bind("id", job.catalogId).map { rs, _ -> rs.getLong(1) to rs.getLong(2) }.one()
-                    if (earliest > scan.evaluatedAt) {
+                    // Counted only when the snapshot MOVES. With no commit
+                    // since the last re-anchor, head is still what the
+                    // scan evaluates at, and the floor cannot pass head
+                    // (invariant 5), so `earliest > evaluatedAt` with
+                    // `head == evaluatedAt` is not reachable through
+                    // expiry; the guard keeps the counter honest about
+                    // what it counts — snapshot changes — whatever moved
+                    // the floor.
+                    if (earliest > scan.evaluatedAt && head != scan.evaluatedAt) {
                         scan.visibleAt = head
                         scan.reanchors++
                     }

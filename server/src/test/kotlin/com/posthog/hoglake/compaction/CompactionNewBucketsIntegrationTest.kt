@@ -319,6 +319,56 @@ class CompactionNewBucketsIntegrationTest {
     }
 
     @Test
+    fun `a FULL sample plus new buckets loses no sampled bucket`() {
+        // A few probes a plan, so 50,000 buckets cost a plan of tens of
+        // statements, not thousands: candidateBudget = min(2 x 1 x 64,
+        // 50,000) = 128, bucketLimit = 128 / 2 = 64.
+        val few = cfg.copy(maxGroupsPerRun = 1, maxFanIn = 64)
+        val cat = fixture()
+        appendMetadataOnly(cat, "s-real", 2, 400)
+        publishSample()
+        // Fill the PUBLISHED generation to the sample cap with synthetic
+        // tier rows of larger files (bytes per file 400 KiB), so every
+        // one of them sorts BEHIND the new buckets below. They have no
+        // files, which costs a probe each and changes nothing here.
+        val sampleCap = CompactionService.MAX_SAMPLED_BUCKETS
+        db.jdbi.withHandleUnchecked { h ->
+            h.createUpdate(
+                """
+                INSERT INTO hog_maintenance_summary_tier
+                    (catalog_id, generation, bucket_key, table_id, spec_id, partition_values, quota, remaining,
+                     pending, selected, pending_max_bytes, file_count, small_count, total_bytes, small_bytes,
+                     dv_count, record_count, newest_begin_snapshot)
+                SELECT p.catalog_id, p.generation, 'synthetic-' || g, p.table_id, p.spec_id,
+                       ARRAY['s-' || lpad(g::text, 6, '0')], p.quota, p.remaining,
+                       0, 2, 0, 2, 2, 819200, 819200, 0, 6, p.newest_begin_snapshot
+                  FROM hog_maintenance_summary_tier p
+                  JOIN hog_maintenance_summary s
+                    ON s.catalog_id = p.catalog_id AND s.published_generation = p.generation
+                  JOIN hog_catalog c ON c.catalog_id = p.catalog_id
+                 CROSS JOIN generate_series(1, :n) g
+                 WHERE c.name = :cat
+                """,
+            ).bind("cat", cat).bind("n", sampleCap - 1).execute()
+        }
+        // Three NEW tuples of tiny files: they sort AHEAD of all of it.
+        for (day in listOf("n-1", "n-2", "n-3")) appendMetadataOnly(cat, day, 2, 100)
+
+        // MUTATION: put back `.take(MAX_SAMPLED_BUCKETS)` on the merged
+        // list in `mergeBuckets` and this reads 50,000: the three new
+        // buckets push the three value-last SAMPLED buckets off the
+        // list, where the rotation can never reach them.
+        val plan = CompactionService(db.jdbi, store, few).planTable(cat, "ns", "t", few)
+        assertThat(plan.bucketsAvailable).isEqualTo(sampleCap + 3L)
+        // And the plan groups exactly the buckets with real files: the
+        // three new ones (100 B/file, first in value order) and the one
+        // real SAMPLED bucket (400 B/file, next), ahead of the synthetic
+        // 400 KiB/file rows.
+        assertThat(plan.groups.map { it.partitionValues!!.single() })
+            .containsExactlyInAnyOrder("n-1", "n-2", "n-3", "s-real")
+    }
+
+    @Test
     fun `a window of zero turns the read off and the planner sees the sample alone`() {
         val cat = fixture()
         appendMetadataOnly(cat, "2026-10-16", 2, 100)

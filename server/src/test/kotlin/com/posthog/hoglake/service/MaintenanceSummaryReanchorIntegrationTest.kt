@@ -174,7 +174,9 @@ class MaintenanceSummaryReanchorIntegrationTest {
         // comes back short (or reaches the upper bound) ends the phase.
         assertThat(got.sample.reanchors)
             // `reanchors` counts EVENTS — ticks that found the floor past
-            // the snapshot being evaluated — not pages: a tick that then
+            // the snapshot being evaluated and moved it to a newer head
+            // (every tick here commits first, so each one does) — not
+            // pages: a tick that then
             // only skips a dropped table's key range counts too. This
             // fixture has no dropped table, so here the two coincide.
             .describedAs("one re-anchor per file-phase tick after the first, none in the removal phase")
@@ -328,5 +330,26 @@ class MaintenanceSummaryReanchorIntegrationTest {
         // build republishes it.
         assertThat(published(catalogId)).isNotNull()
         assertThat(published(catalogId)!!.sample.smallFiles).isEqualTo(FILES.toLong())
+    }
+
+    @Test
+    fun `a re-anchor that would not move the snapshot is not counted`() {
+        val (_, catalogId, start) = seed()
+        val sampler = sampler()
+        assertThat(sampler.runOnce(BATCH)).isTrue()
+        // The floor past the captured snapshot with NO commit since, so
+        // head is still the snapshot being evaluated at. Expiry cannot
+        // produce this (the floor never passes head); set directly, it is
+        // the one way to ask what the counter counts.
+        db.jdbi.useHandleUnchecked { h ->
+            h.execute("UPDATE hog_catalog SET earliest_snapshot_id = ? WHERE catalog_id = ?", start + 1, catalogId)
+        }
+        // MUTATION: drop `head != scan.evaluatedAt` from the re-anchor
+        // guard and this reads 3: the counter moves while `visibleAt`
+        // stays at the captured snapshot.
+        while (sampler.runOnce(BATCH)) Unit
+        val got = published(catalogId)!!
+        assertThat(got.sample.reanchors).isZero()
+        assertThat(got.sample.snapshotId).isEqualTo(start)
     }
 }
