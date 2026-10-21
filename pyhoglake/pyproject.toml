@@ -56,10 +56,15 @@ dev = [
     "pytest>=8.0",
     "pytest-httpx>=0.30",
     "hypothesis>=6.100",
-    # Pinned: an unpinned ruff resolves a different rule set per machine
-    # (and silently ignored the per-file-ignores below).
-    "ruff==0.16.10",
-    "mypy==2.4.0",
+    # A floor, not a pin: the exact version is the root uv.lock's, one for
+    # the whole workspace, and `uv run` installs that one on every machine
+    # (`uvx ruff` would resolve a different rule set per machine and
+    # silently ignore the per-file-ignores below). An `==` here and in the
+    # sibling trees gave Dependabot two pins for one package the moment it
+    # bumped one of them, which no workspace resolution can satisfy, so it
+    # skipped ruff and mypy forever; a floor lets it move the lock once.
+    "ruff>=0.16.10",
+    "mypy>=2.4.0",
     # Not optional for the suite: the single-request upload path is only
     # covered if boto3 is importable here. Same floor as the extra, so
     # the suite cannot pass against framing the extra would not install.
