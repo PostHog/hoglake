@@ -10,94 +10,91 @@ import com.posthog.hoglake.service.ReindexService.Companion.pickVictim
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.within
 import org.junit.jupiter.api.Test
+import java.time.Duration
 import java.time.Instant
-import java.time.LocalTime
 
 /**
- * The reindex task's three pure decisions — is today's run due, is this
- * index over threshold, which one goes first — against literal inputs.
- * Unit, not integration: the integration suite proves the SQL feeds
- * these; this proves the decisions at their edges, which a database
- * fixture cannot place precisely (a clock a minute either side of 03:00,
- * a ratio a hair under 3.0).
+ * The reindex task's three pure decisions — is this hour's run due, is
+ * this index over threshold, which one goes first — against literal
+ * inputs. Unit, not integration: the integration suite proves the SQL
+ * feeds these; this proves the decisions at their edges, which a
+ * database fixture cannot place precisely (a clock a millisecond either
+ * side of the top of the hour, a ratio a hair under 3.0).
  */
 class ReindexDecisionTest {
     private fun t(iso: String): Instant = Instant.parse(iso)
 
-    // ---- the daily gate ----------------------------------------------------
+    // ---- the hourly gate ---------------------------------------------------
 
     @Test
-    fun `the run is hardcoded to 03 00 UTC`() {
-        assertThat(ReindexService.RUN_AT_UTC).isEqualTo(LocalTime.of(3, 0))
+    fun `the run is hardcoded to once an hour`() {
+        assertThat(ReindexService.RUN_EVERY).isEqualTo(Duration.ofHours(1))
     }
 
     @Test
-    fun `never due before 03 00 UTC, whatever the ledger says`() {
-        // Midnight to 03:00 is "today" already, and today's window has not
-        // opened. MUTATION: drop the `now.isBefore(window)` return and the
-        // never-run case below reds — it would run at 00:00.
-        assertThat(isDue(t("2026-10-05T00:00:00Z"), null)).isFalse()
-        assertThat(isDue(t("2026-10-05T02:59:59.999Z"), null)).isFalse()
-        assertThat(isDue(t("2026-10-05T02:59:59Z"), t("2026-10-03T03:00:00Z"))).isFalse()
+    fun `due on the first poll when nothing ran this hour`() {
+        assertThat(isDue(t("2026-10-05T14:00:00Z"), null)).isTrue()
+        assertThat(isDue(t("2026-10-05T14:37:12Z"), null)).isTrue()
+        // The previous hour's run, however late in it, is not this hour's.
+        // MUTATION: compute the window as `now - every` (a sliding hour)
+        // instead of truncating, and this reds — 13:59:59 is inside the
+        // last hour of 14:00:30.
+        assertThat(isDue(t("2026-10-05T14:00:30Z"), t("2026-10-05T13:59:59.999Z"))).isTrue()
+        assertThat(isDue(t("2026-10-05T14:00:00Z"), t("2026-10-05T13:00:05Z"))).isTrue()
     }
 
     @Test
-    fun `due at 03 00 exactly when nothing ran today`() {
-        assertThat(isDue(t("2026-10-05T03:00:00Z"), null)).isTrue()
-        assertThat(isDue(t("2026-10-05T03:00:00Z"), t("2026-10-04T03:00:05Z"))).isTrue()
+    fun `a run that started at the window start does not run again`() {
+        // MUTATION: compare `<=` instead of `isBefore` (a run that started
+        // AT the window re-runs) and the first assertion reds.
+        assertThat(isDue(t("2026-10-05T14:05:00Z"), t("2026-10-05T14:00:00Z"))).isFalse()
+        assertThat(isDue(t("2026-10-05T14:00:00Z"), t("2026-10-05T14:00:00Z"))).isFalse()
+        // The last millisecond of the hour is still the same window.
+        assertThat(isDue(t("2026-10-05T14:59:59.999Z"), t("2026-10-05T14:00:00Z"))).isFalse()
     }
 
     @Test
-    fun `a restart after today's run does not run again`() {
-        // The gate reads the LEDGER, so a pod restarted at 07:00 after the
-        // 03:00 run sees that run. MUTATION: compare `<=` instead of
-        // `isBefore` (a run that started AT the window re-runs) and the
-        // first assertion reds.
-        assertThat(isDue(t("2026-10-05T07:00:00Z"), t("2026-10-05T03:00:00Z"))).isFalse()
-        assertThat(isDue(t("2026-10-05T23:59:59Z"), t("2026-10-05T03:04:12Z"))).isFalse()
+    fun `a restart inside the hour does not run again`() {
+        // The gate reads the LEDGER, so a pod restarted at 14:40 after the
+        // 14:00 run sees that run.
+        assertThat(isDue(t("2026-10-05T14:40:00Z"), t("2026-10-05T14:00:31Z"))).isFalse()
+        assertThat(isDue(t("2026-10-05T14:59:59Z"), t("2026-10-05T14:04:12Z"))).isFalse()
     }
 
     @Test
-    fun `a missed window runs on the next poll the same day`() {
-        // The pod was down at 03:00 and came back at 14:00: yesterday's run
-        // is the newest row, so today's is still owed.
-        assertThat(isDue(t("2026-10-05T14:00:00Z"), t("2026-10-04T03:01:00Z"))).isTrue()
-        // A run from BEFORE today's window — yesterday evening's catch-up —
-        // does not count as today's.
-        assertThat(isDue(t("2026-10-05T03:01:00Z"), t("2026-10-04T22:00:00Z"))).isTrue()
+    fun `a pod down for several hours runs once on return, not once per missed hour`() {
+        // Last run 09:00, back at 14:20: due once. The run it makes is
+        // this hour's, so the next poll is not due — five missed windows
+        // are not five owed runs.
+        val back = t("2026-10-05T14:20:00Z")
+        assertThat(isDue(back, t("2026-10-05T09:00:12Z"))).isTrue()
+        assertThat(isDue(t("2026-10-05T14:25:00Z"), back)).isFalse()
+        // And the hour after that is a fresh run.
+        assertThat(isDue(t("2026-10-05T15:00:00Z"), back)).isTrue()
     }
 
     @Test
-    fun `a missed day is not caught up after midnight but at the next 03 00`() {
-        // Missed all of the 4th: at 00:30 on the 5th it is not due (the
-        // 5th's window is not open), at 03:00 it is — once, not twice.
-        val last = t("2026-10-03T03:00:00Z")
-        assertThat(isDue(t("2026-10-05T00:30:00Z"), last)).isFalse()
-        assertThat(isDue(t("2026-10-05T03:00:00Z"), last)).isTrue()
+    fun `the window is the epoch-aligned UTC hour, not the pod's`() {
+        // 2026-10-05T16:30+05:30 is 11:00Z: the top of a UTC hour though
+        // it is half past in the pod's zone. A local-hour truncation would
+        // put the window at 10:30Z and call a 10:45Z run this hour's.
+        val now = java.time.OffsetDateTime.parse("2026-10-05T16:30:00+05:30").toInstant()
+        assertThat(isDue(now, t("2026-10-05T10:45:00Z"))).isTrue()
+        assertThat(isDue(now, t("2026-10-05T11:00:00Z"))).isFalse()
     }
 
     @Test
-    fun `the day is the UTC day, not the pod's`() {
-        // 2026-10-05T01:30+02:00 is 23:30Z on the 4th: past the 4th's
-        // window, so due if the 4th has not run. A local-date reading
-        // would call it the 5th before 03:00 and say no.
-        val now = java.time.OffsetDateTime.parse("2026-10-05T01:30:00+02:00").toInstant()
-        assertThat(isDue(now, t("2026-10-03T03:00:00Z"))).isTrue()
-        assertThat(isDue(now, t("2026-10-04T03:00:00Z"))).isFalse()
-    }
-
-    @Test
-    fun `a run that stepped aside for a migration or another build is retried until 06 00`() {
-        val skipped = t("2026-10-05T03:00:30Z")
+    fun `a run that stepped aside for a migration or another build is retried until the hour ends`() {
+        val skipped = t("2026-10-05T14:00:30Z")
         // MUTATION: ignore `lastRetryable` and both of these red.
-        assertThat(isDue(t("2026-10-05T03:05:00Z"), skipped, lastRetryable = true)).isTrue()
-        assertThat(isDue(t("2026-10-05T05:59:59Z"), skipped, lastRetryable = true)).isTrue()
-        // Past the cut-off the day is closed. MUTATION: drop the cut-off
-        // (retry all day) and this reds.
-        assertThat(isDue(t("2026-10-05T06:00:00Z"), skipped, lastRetryable = true)).isFalse()
-        // A non-transient outcome closes the day at once.
-        assertThat(isDue(t("2026-10-05T03:05:00Z"), skipped, lastRetryable = false)).isFalse()
-        assertThat(ReindexService.RETRY_UNTIL_UTC).isEqualTo(LocalTime.of(6, 0))
+        assertThat(isDue(t("2026-10-05T14:05:00Z"), skipped, lastRetryable = true)).isTrue()
+        assertThat(isDue(t("2026-10-05T14:59:59.999Z"), skipped, lastRetryable = true)).isTrue()
+        // A non-transient outcome closes the hour at once.
+        assertThat(isDue(t("2026-10-05T14:05:00Z"), skipped, lastRetryable = false)).isFalse()
+        // The next hour is a fresh run, not a retry: due whatever the
+        // skip was, because the skip is before the new window.
+        assertThat(isDue(t("2026-10-05T15:00:00Z"), skipped, lastRetryable = false)).isTrue()
+        assertThat(isDue(t("2026-10-05T15:00:00Z"), skipped, lastRetryable = true)).isTrue()
         assertThat(ReindexService.RETRYABLE_SKIPS.map { it.wire })
             .containsExactlyInAnyOrder("migration_pending", "reindex_in_progress")
     }
@@ -164,7 +161,7 @@ class ReindexDecisionTest {
     @Test
     fun `the excess arm needs a ratio past a random-key btree's steady state`() {
         // A 6 GiB md5-path index at its natural ~1.35x: 1.6 GiB of
-        // "excess", forever. Without the ratio floor it is rebuilt daily.
+        // "excess", forever. Without the ratio floor it is rebuilt hourly.
         // MUTATION: drop `ratio >= EXCESS_MIN_RATIO` and this reds.
         val steady = est(size = (6L shl 30) * 135 / 100, expected = 6L shl 30)
         assertThat(steady.excessBytes!!).isGreaterThan(EXCESS_BYTES_THRESHOLD)

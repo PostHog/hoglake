@@ -214,7 +214,7 @@ object Database {
      * Index builds running in this database right now, one line each
      * (`pid`, command, phase, table, index), for the boot log.
      *
-     * A migration behind a running REINDEX CONCURRENTLY (the 03:00 UTC
+     * A migration behind a running REINDEX CONCURRENTLY (the hourly
      * reindex task, or an operator's) fails in one of two loud-but-opaque
      * ways: an `ALTER TABLE` on the same table hits its 5 s lock_timeout
      * and the pod crash-loops for the rebuild's duration, or a concurrent

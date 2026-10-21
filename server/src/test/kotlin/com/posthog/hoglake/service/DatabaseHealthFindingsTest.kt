@@ -584,22 +584,22 @@ class DatabaseHealthFindingsTest {
             findingsOf(bloatedIndexes = bloated, reindexLoopSeen = true).single { it.code == "index_bloat" }
         assertThat(finding.severity).isEqualTo(FindingSeverity.WARN)
         assertThat(finding.title).contains("2 index(es)").contains("29.0 GiB")
-        // Worst first, so the index tomorrow's run rebuilds leads the line.
+        // Worst first, so the index the next run rebuilds leads the line.
         assertThat(finding.detail.indexOf("hog_file_column_stats_pkey"))
             .isLessThan(finding.detail.indexOf("hog_data_file_path"))
         // The reindex task owns this one while its loop is running, and
         // says so with its cadence rather than a promise per index.
         assertThat(finding.resolution.kind).isEqualTo(ResolutionKind.MAINTENANCE)
         assertThat(finding.resolution.task).isEqualTo(MaintenanceTask.REINDEX)
-        assertThat(finding.resolution.text).contains("03:00 UTC").contains("2 within its cap")
-        assertThat(finding.hoglakeImpact).doesNotContain("03:00 UTC")
+        assertThat(finding.resolution.text).contains("every UTC hour").contains("2 within its cap")
+        assertThat(finding.hoglakeImpact).doesNotContain("every UTC hour")
 
         // No loop has run lately: the page cannot promise a rebuild, so the
         // badge is the operator's and names the knob. MUTATION: ignore
         // reindexLoopSeen and this reads maintenance.
         val unattended = findingsOf(bloatedIndexes = bloated).single { it.code == "index_bloat" }
         assertThat(unattended.resolution.kind).isEqualTo(ResolutionKind.OPERATOR)
-        assertThat(unattended.resolution.text).contains("HOGLAKE_REINDEX_INTERVAL_MS")
+        assertThat(unattended.resolution.text).contains("HOGLAKE_REINDEX_INTERVAL_MS").contains("three hours")
 
         // An index past the task's rebuild cap is never the task's: it is
         // named as the operator's, beside the ones the task will take.

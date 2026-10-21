@@ -146,7 +146,7 @@ class App private constructor(
         )
 
     /**
-     * The daily index-bloat check + REINDEX (#268). Built on every pod:
+     * The hourly index-bloat check + REINDEX (#268). Built on every pod:
      * the health page uses its estimate. The loop, and the
      * `hoglake_index_bloat_bytes` gauge, belong to the pod that runs it.
      */
@@ -405,7 +405,7 @@ class App private constructor(
             retirementService.runOnceAllCatalogs()
         }
         // Default 0 = off, like retirement: ONE workload rebuilds indexes.
-        // The interval is a POLL; the run is once a day at 03:00 UTC,
+        // The interval is a POLL; the run is due at the top of each UTC hour,
         // gated on the run ledger inside pollOnce (ReindexService).
         loops.register("reindex", cfg.reindexIntervalMs) { reindexService.pollOnce() }
         loops.register("metrics", cfg.metricsIntervalMs) { metricsTick() }
@@ -419,7 +419,7 @@ class App private constructor(
     /**
      * One metrics-loop iteration. The bloat gauge rides it on the reindex
      * pod only (a no-op elsewhere): ~4 ms of catalog reads, so the series
-     * follows VACUUM/ANALYZE between the daily runs. In a `finally`, so a
+     * follows VACUUM/ANALYZE between the hourly runs. In a `finally`, so a
      * failed sample does not skip it; `refreshGauge` never throws, so its
      * failure neither fails this tick nor counts as a metrics-loop failure
      * (it has `hoglake_reindex_gauge_refresh_failures_total`).

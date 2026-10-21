@@ -415,7 +415,7 @@ class ReindexServiceIntegrationTest {
     }
 
     @Test
-    fun `a failed REINDEX drops its own copy at once, records the attempt, and is not retried next day`() {
+    fun `a failed REINDEX drops its own copy at once, records the attempt, and is not retried next hour`() {
         val db = db()
         val id = catalog(db, "rx-b")
         bloat(db, id, rows = 60_000)
@@ -441,7 +441,7 @@ class ReindexServiceIntegrationTest {
         assertThat(attempted.expectedBytes).isNotNull()
         assertThat(attempted.afterBytes).isNull()
         // MUTATION: drop the catch-path drop and the copy survives until
-        // tomorrow — a ready `_ccnew` every insert keeps maintaining.
+        // the next hour's run — a ready `_ccnew` every insert keeps maintaining.
         assertThat(attempted.invalidDropped).isEqualTo(1)
         assertThat(invalidIndexes(db)).describedAs("the copy went with the failure").isEmpty()
         assertThat(indexValid(db, "hog_data_file_mine_ccnew")).isTrue()
@@ -470,7 +470,7 @@ class ReindexServiceIntegrationTest {
         }
         assertThat(invalidIndexes(db)).containsExactly("hog_data_file_pkey_ccnew")
 
-        // Next day: the leftover goes first, and the index whose last
+        // Next run: the leftover goes first, and the index whose last
         // attempt failed is NOT picked again — the next candidate is.
         // MUTATION: drop the last-attempt exclusion and this reds.
         val next = service.runOnce()
@@ -629,7 +629,7 @@ class ReindexServiceIntegrationTest {
             )
         // MUTATION: let a post-step failure propagate (drop its catch) and
         // this run throws, recording an anonymous failed row that would
-        // also exclude the index tomorrow.
+        // also exclude the index from later runs.
         val result = service.runOnce()
         assertThat(result.index).isNotNull()
         assertThat(result.durationMs).isNotNull()
@@ -737,7 +737,7 @@ class ReindexServiceIntegrationTest {
     }
 
     @Test
-    fun `retirement and purge only skip a rebuild that would happen, so a quiet day stays quiet`() {
+    fun `retirement and purge only skip a rebuild that would happen, so a quiet hour stays quiet`() {
         val db = db()
         val id = catalog(db, "rx-quiet-guard")
         db.jdbi.useHandleUnchecked { h ->
@@ -753,7 +753,7 @@ class ReindexServiceIntegrationTest {
             )
         }
         // Retirement IS pending, but nothing is over threshold: the row
-        // must carry no skip, or every day of a week-long retirement
+        // must carry no skip, or every hour of a week-long retirement
         // would be a loud row saying it skipped nothing. MUTATION: move
         // the retirement/purge guard ahead of the victim check and this
         // reds.
@@ -804,9 +804,9 @@ class ReindexServiceIntegrationTest {
     }
 
     @Test
-    fun `reindex_lock_held closes the day while another session holds the reindex lock`() {
+    fun `reindex_lock_held closes the hour while another session holds the reindex lock`() {
         val (db, _) = bloatedDb()
-        var now = Instant.parse("2026-10-05T03:00:30Z")
+        var now = Instant.parse("2026-10-05T14:00:30Z")
         val other = db.jdbi.open()
         try {
             // The orphaned backend of a pod killed mid-rebuild, or a second
@@ -819,10 +819,10 @@ class ReindexServiceIntegrationTest {
             Locks.releaseReindexLock(other)
             other.close()
         }
-        // The orphan has ended. Its rebuild WAS today's: a fresh instance
-        // polling inside the retry window must not run a second one.
+        // The orphan has ended. Its rebuild WAS this hour's: a fresh
+        // instance polling later in the hour must not run a second one.
         // MUTATION: add REINDEX_LOCK_HELD to RETRYABLE_SKIPS and this reds.
-        now = Instant.parse("2026-10-05T03:10:00Z")
+        now = Instant.parse("2026-10-05T14:10:00Z")
         assertThat(ReindexService(db.jdbi, minRatioIndexBytes = 0, clock = { now }).pollOnce()).isNull()
         // The skipped run released nothing it did not take: a direct run
         // proceeds.
@@ -940,10 +940,10 @@ class ReindexServiceIntegrationTest {
             .containsExactlyInAnyOrder("checked", "over_threshold", "invalid_dropped")
     }
 
-    // ---- the daily gate, through the ledger --------------------------------
+    // ---- the hourly gate, through the ledger -------------------------------
 
     @Test
-    fun `a run whose ledger row could not be written still runs once a day in this process`() {
+    fun `a run whose ledger row could not be written still runs once an hour in this process`() {
         val db = db()
         catalog(db, "rx-unrecorded")
         // A ledger that refuses the row: recording is best-effort and
@@ -955,24 +955,24 @@ class ReindexServiceIntegrationTest {
                     "CHECK (task <> 'reindex')",
             )
         }
-        var now = Instant.parse("2026-10-05T03:05:00Z")
+        var now = Instant.parse("2026-10-05T14:05:00Z")
         val service = ReindexService(db.jdbi, clock = { now })
         assertThat(service.pollOnce()).isNotNull()
         assertThat(ledger(db)).describedAs("the write was refused").isEmpty()
         // MUTATION: drop the in-process backstop and this second poll
         // runs (and would rebuild) again.
-        now = Instant.parse("2026-10-05T03:10:00Z")
+        now = Instant.parse("2026-10-05T14:10:00Z")
         assertThat(service.pollOnce()).isNull()
-        now = Instant.parse("2026-10-06T03:00:00Z")
-        assertThat(service.pollOnce()).describedAs("and tomorrow is a new day").isNotNull()
+        now = Instant.parse("2026-10-05T15:00:00Z")
+        assertThat(service.pollOnce()).describedAs("and the next hour is a new window").isNotNull()
     }
 
     @Test
-    fun `a run that stepped aside for a migration is retried on the next poll, until 06 00`() {
+    fun `a run that stepped aside for a migration is retried on the next poll, and the next hour is a fresh run`() {
         val db = db()
         val id = catalog(db, "rx-retry")
         bloat(db, id, rows = 60_000)
-        var now = Instant.parse("2026-10-05T03:00:30Z")
+        var now = Instant.parse("2026-10-05T14:00:30Z")
         val service = ReindexService(db.jdbi, minRatioIndexBytes = 0, clock = { now })
         val replica = db.jdbi.open()
         try {
@@ -982,62 +982,54 @@ class ReindexServiceIntegrationTest {
             replica.createQuery("SELECT pg_advisory_unlock(${Database.MIGRATION_LOCK_KEY})").mapToMap().one()
             replica.close()
         }
-        // The boot's migration is done; the next poll runs the day's
-        // rebuild. MUTATION: count a retryable skip as the day's run and
+        // The boot's migration is done; the next poll runs the hour's
+        // rebuild. MUTATION: count a retryable skip as the hour's run and
         // this reds — from the LEDGER, so a fresh instance (a restarted
         // pod) is asked too.
-        now = Instant.parse("2026-10-05T03:05:00Z")
+        now = Instant.parse("2026-10-05T14:05:00Z")
         val retried = ReindexService(db.jdbi, minRatioIndexBytes = 0, clock = { now }).pollOnce()
         assertThat(retried).isNotNull()
         assertThat(retried!!.index).isNotNull()
-        now = Instant.parse("2026-10-05T03:10:00Z")
+        now = Instant.parse("2026-10-05T14:10:00Z")
         assertThat(ReindexService(db.jdbi, minRatioIndexBytes = 0, clock = { now }).pollOnce()).isNull()
 
-        // Past 06:00 a retryable skip closes the day.
-        now = Instant.parse("2026-10-06T05:59:00Z")
-        val late = db.jdbi.open()
-        try {
-            late.createQuery("SELECT pg_advisory_lock(${Database.MIGRATION_LOCK_KEY})").mapToMap().one()
-            assertThat(service.pollOnce()!!.skippedReason).isEqualTo(ReindexSkip.MIGRATION_PENDING.wire)
-        } finally {
-            late.createQuery("SELECT pg_advisory_unlock(${Database.MIGRATION_LOCK_KEY})").mapToMap().one()
-            late.close()
-        }
-        now = Instant.parse("2026-10-06T06:00:00Z")
-        assertThat(ReindexService(db.jdbi, minRatioIndexBytes = 0, clock = { now }).pollOnce()).isNull()
+        // The next hour is a fresh run, not a retry: no cut-off to cross,
+        // the 14:05 run is simply before the 15:00 window.
+        now = Instant.parse("2026-10-05T15:00:10Z")
+        assertThat(ReindexService(db.jdbi, minRatioIndexBytes = 0, clock = { now }).pollOnce()).isNotNull()
     }
 
     @Test
-    fun `the loop runs once a day at 03 00 UTC, survives a restart, and catches up a missed window`() {
+    fun `the loop runs once an hour, survives a restart, and catches up missed hours once`() {
         val db = db()
         db.jdbi.useHandleUnchecked { h -> h.execute("ANALYZE") }
-        var now = Instant.parse("2026-10-05T02:55:00Z")
+        var now = Instant.parse("2026-10-05T14:05:00Z")
 
         fun service() = ReindexService(db.jdbi, clock = { now })
 
         // No catalog: nothing could record the run, so nothing runs.
-        now = Instant.parse("2026-10-05T03:05:00Z")
         assertThat(service().pollOnce()).isNull()
 
         catalog(db, "rx-gate-a")
         catalog(db, "rx-gate-b")
-        now = Instant.parse("2026-10-05T02:55:00Z")
-        assertThat(service().pollOnce()).describedAs("before the window").isNull()
-        assertThat(ledger(db)).isEmpty()
-
-        now = Instant.parse("2026-10-05T03:05:00Z")
         assertThat(service().pollOnce()).isNotNull()
         assertThat(ledger(db)).hasSize(2)
 
-        // A restart (a new instance) the same day: the ledger says done.
-        now = Instant.parse("2026-10-05T07:00:00Z")
+        // A restart (a new instance) inside the hour: the ledger says done.
+        now = Instant.parse("2026-10-05T14:40:00Z")
         assertThat(service().pollOnce()).isNull()
 
-        // The pod was down at 03:00 on the 6th and back at 14:00: due.
-        now = Instant.parse("2026-10-06T14:00:00Z")
+        // The pod was down from 15:00 to 19:20: due once on return, not
+        // once per missed hour.
+        now = Instant.parse("2026-10-05T19:20:00Z")
         assertThat(service().pollOnce()).isNotNull()
-        now = Instant.parse("2026-10-06T14:05:00Z")
+        now = Instant.parse("2026-10-05T19:25:00Z")
         assertThat(service().pollOnce()).isNull()
         assertThat(ledger(db)).hasSize(4)
+
+        // And the top of the next hour is the next run.
+        now = Instant.parse("2026-10-05T20:00:00Z")
+        assertThat(service().pollOnce()).isNotNull()
+        assertThat(ledger(db)).hasSize(6)
     }
 }
