@@ -262,6 +262,10 @@ replays once more from the committed offset.
 
 ## Development
 
+hedgerow is a member of the repository's uv workspace: pyhoglake comes
+from `../pyhoglake` as a workspace member, and the lock is the root
+`uv.lock`.
+
 ```sh
 flox activate -- uv sync
 flox activate -- uv run pytest                      # unit + integration

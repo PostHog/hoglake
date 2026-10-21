@@ -45,7 +45,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        # 3.12 is the floor: one workspace lock means one requires-python,
+        # and millrace's PEP 695 syntax needs 3.12 (root pyproject.toml).
+        python-version: ["3.12", "3.13"]
     env:
       UV_PYTHON: ${{ matrix.python-version }}
     defaults:
@@ -87,8 +89,10 @@ jobs:
             exit 1
           fi
 
+      # -o dist: inside the workspace uv writes to the ROOT's dist/ by
+      # default; the smoke test and the artifact read pyhoglake/dist/.
       - name: Build sdist and wheel
-        run: uv build
+        run: uv build -o dist
 
       # A clean env with only the wheel installed catches files missing from
       # the package. The version check fails if __version__ drifts from

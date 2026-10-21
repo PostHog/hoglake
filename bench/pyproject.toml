@@ -3,7 +3,7 @@ name = "hoglake-bench"
 version = "0.1.0"
 description = "Stress-test / benchmark harness for the hoglake control plane"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "pyhoglake",
     "httpx>=0.27",
@@ -29,7 +29,7 @@ dev = [
 ]
 
 [tool.uv.sources]
-pyhoglake = { path = "../pyhoglake", editable = true }
+pyhoglake = { workspace = true }
 
 [build-system]
 requires = ["hatchling"]

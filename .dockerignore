@@ -1,7 +1,9 @@
-# Context filter for the one image built from the REPO ROOT:
-# bench/Dockerfile, which needs bench/ and pyhoglake/ together (bench
-# installs the client from the sibling tree). server/ and webui/ build
-# from their own directories and carry their own .dockerignore files.
+# Context filter for the images built from the REPO ROOT:
+# bench/Dockerfile and millrace/Dockerfile, which need the uv workspace
+# root (pyproject.toml, uv.lock), pyhoglake/, their own tree and every
+# other member's pyproject.toml (they install the client as a workspace
+# member from the one lock). server/ and webui/ build from their own
+# directories and carry their own .dockerignore files.
 #
 # The first block is the one that has actually bitten: a host .venv is
 # macOS-built binaries, and a copy of it into a linux image either
@@ -19,14 +21,18 @@
 .git/
 .github/
 
-# Trees the bench image does not install. Excluded by name so the
-# context stays small and a change over there cannot invalidate a
-# layer here; add a line if a new top-level tree appears.
+# Trees neither image installs. Excluded by name so the context stays
+# small and a change over there cannot invalidate a layer here; add a
+# line if a new top-level tree appears.
 server/
 webui/
 duckdb-client/
-hedgerow/
 docs/
+# hedgerow is a workspace member neither image installs, but a --locked
+# sync validates the lock against every member's manifest: keep its
+# pyproject.toml and nothing else.
+hedgerow/*
+!hedgerow/pyproject.toml
 
 # Local run artifacts.
 **/bench-results.jsonl

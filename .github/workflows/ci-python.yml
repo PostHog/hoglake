@@ -40,6 +40,9 @@ jobs:
               - "hedgerow/**"
               - "millrace/**"
               - "bench/**"
+              # The uv workspace root: one lock for all four trees.
+              - "pyproject.toml"
+              - "uv.lock"
               # The OpenAPI spec is the wire contract the clients
               # conform to.
               - "server/src/main/resources/openapi/hoglake.yaml"

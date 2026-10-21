@@ -5,9 +5,11 @@
 # `python -m millrace.maintenance`; both read only environment.
 #
 # Build context is the REPO ROOT, not millrace/, for the same reason
-# bench/Dockerfile gives: millrace installs pyhoglake from the sibling
-# tree (`[tool.uv.sources] pyhoglake = { path = "../pyhoglake" }`), so
-# both trees must be in the context, and the image ships the client
+# bench/Dockerfile gives: millrace is a member of the repo's uv
+# workspace and installs pyhoglake as a workspace member
+# (`[tool.uv.sources] pyhoglake = { workspace = true }`), so the root
+# pyproject.toml and uv.lock, the pyhoglake tree and every member's
+# pyproject.toml must be in the context, and the image ships the client
 # from the SAME commit as the daemon — the pair the live suite tests.
 #
 #   docker build -f millrace/Dockerfile -t hoglake-millrace .
@@ -20,9 +22,9 @@
 
 # No --platform=$BUILDPLATFORM: the installed tree is a virtualenv of
 # native manylinux wheels (pyarrow, slatedb, confluent-kafka), per
-# target arch by construction. Every wheel in millrace/uv.lock is
-# prebuilt for linux amd64 and arm64, so the foreign-arch pass under
-# qemu only unpacks and never compiles.
+# target arch by construction. Every wheel millrace installs from the
+# root uv.lock is prebuilt for linux amd64 and arm64, so the
+# foreign-arch pass under qemu only unpacks and never compiles.
 FROM python:3.13-slim-trixie AS build
 
 # uv, pinned: an unpinned installer resolves differently per build.
@@ -33,20 +35,26 @@ ENV UV_LINK_MODE=copy \
     UV_PYTHON_DOWNLOADS=never \
     UV_PROJECT_ENVIRONMENT=/opt/hoglake-millrace/venv
 
-WORKDIR /src/millrace
+WORKDIR /src
 
-# pyhoglake first and whole: a path dependency uv builds from source.
-COPY pyhoglake/ /src/pyhoglake/
+# The workspace root: its manifest and the one lock.
+COPY pyproject.toml uv.lock ./
+# pyhoglake first and whole: a workspace member uv builds from source.
+COPY pyhoglake/ pyhoglake/
+# The members millrace does not install: manifests only, which is all
+# the --locked check reads.
+COPY hedgerow/pyproject.toml hedgerow/
+COPY bench/pyproject.toml bench/
 # Manifests only, so the dependency layer survives a millrace
 # source-only change. (pyproject's `readme` resolves at build time.)
-COPY millrace/pyproject.toml millrace/uv.lock millrace/README.md ./
-RUN uv sync --locked --no-dev --no-editable --no-install-project
+COPY millrace/pyproject.toml millrace/README.md millrace/
+RUN uv sync --locked --package millrace --no-dev --no-editable --no-install-project
 
-COPY millrace/millrace/ millrace/
-RUN uv sync --locked --no-dev --no-editable
+COPY millrace/millrace/ millrace/millrace/
+RUN uv sync --locked --package millrace --no-dev --no-editable
 
-# --no-editable makes the venv self-contained (pyhoglake is declared
-# editable for development; here it is installed as a wheel), so the
+# --no-editable makes the venv self-contained (workspace members are
+# editable for development; here they are installed as wheels), so the
 # runtime stage copies one directory and no source tree.
 
 FROM python:3.13-slim-trixie
