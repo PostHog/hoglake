@@ -55,7 +55,7 @@ Issues = "https://github.com/PostHog/hoglake/issues"
 dev = [
     "pytest>=8.0",
     "pytest-httpx>=0.30",
-    "hypothesis>=6.100",
+    "hypothesis>=6.169.1",
     # Pinned: an unpinned ruff resolves a different rule set per machine
     # (and silently ignored the per-file-ignores below).
     "ruff==0.16.10",
