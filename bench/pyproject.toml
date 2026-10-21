@@ -10,11 +10,11 @@ dependencies = [
     # >=21.0, matching pyhoglake: only pyarrow 21+ stamps the parquet
     # UUID logical annotation, and the generator's uuid columns are
     # generated in the catalog's own writer type.
-    "pyarrow>=21.0",
+    "pyarrow>=26.0.0",
     "numpy>=1.26",
     "faker>=30.0",
     # ANALYZE-only stats settling between seed and measure (pg.py).
-    "psycopg[binary]>=3.2",
+    "psycopg[binary]>=3.3.6",
 ]
 
 [project.scripts]
@@ -25,7 +25,7 @@ dev = [
     "pytest>=8.0",
     # A floor: the version is the root uv.lock's, shared with the sibling
     # trees; see pyhoglake's note on why not `==`.
-    "ruff>=0.16.10",
+    "ruff>=0.17.0",
 ]
 
 [tool.uv.sources]
