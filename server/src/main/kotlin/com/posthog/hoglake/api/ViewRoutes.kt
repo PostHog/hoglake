@@ -35,6 +35,8 @@ fun Application.installViewRoutes(views: ViewService) {
                         req.name,
                         req.sql,
                         req.dialect,
+                        req.author,
+                        req.message,
                     ).toDto(),
                 )
             }
@@ -46,7 +48,13 @@ fun Application.installViewRoutes(views: ViewService) {
                 }
                 delete {
                     call.respond(
-                        views.drop(call.catalog(), call.namespace(), call.view()).toDto(),
+                        views.drop(
+                            call.catalog(),
+                            call.namespace(),
+                            call.view(),
+                            call.request.queryParameters["author"],
+                            call.request.queryParameters["message"],
+                        ).toDto(),
                     )
                 }
             }

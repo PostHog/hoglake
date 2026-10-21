@@ -33,10 +33,14 @@ ARG HOGLAKE_BUILD_STAMP=""
 RUN ./gradlew --no-daemon :installDist -x test -x ktlintCheck -PbuildStamp="$HOGLAKE_BUILD_STAMP"
 
 FROM eclipse-temurin:25-jre-noble
-# Non-root: the server needs no filesystem at all for its data path.
-# Parquet footer reads stream from S3, and compaction streams both its
-# inputs and its output (S3InputFile / S3OutputFile) rather than staging
-# to java.io.tmpdir as it once did.
+# Non-root. Parquet footer reads stream from S3, and compaction streams
+# both its inputs and its output (S3InputFile / S3OutputFile). The one
+# local-disk user is the SORTED compaction rewrite's external merge sort
+# (hoglake#134), which spills sorted chunks to HOGLAKE_COMPACTION_SPILL_DIR
+# (default java.io.tmpdir, i.e. /tmp) — so on a read-only root filesystem
+# the pod that runs the compaction loop needs a writable volume there,
+# sized for HOGLAKE_COMPACTION_PARALLEL_GROUPS x HOGLAKE_COMPACTION_SPILL_BYTES.
+# The server refuses to boot with the loop on and the directory unusable.
 RUN useradd --system --uid 10001 hoglake
 COPY --from=build /src/build/install/hoglake-server/ /app/
 USER 10001

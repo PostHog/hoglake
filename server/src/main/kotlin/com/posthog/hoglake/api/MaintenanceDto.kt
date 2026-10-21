@@ -168,6 +168,7 @@ data class CompactionResultDto(
     val dvSuperseded: Long,
     val unconvertibleSchema: Long,
     val invalidData: Long,
+    /** HISTORICAL: always 0 since hoglake#134; see CompactionResult.heapBudgetExceeded. */
     val heapBudgetExceeded: Long,
     val failedGroups: Long,
     /**
@@ -196,6 +197,46 @@ data class CompactionResultDto(
     val bucketsAvailable: Long,
     val candidatesTruncated: Long,
     val planMs: Long,
+    /**
+     * The sorted rewrite's external merge sort (hoglake#134): runs read
+     * in place, spilled and demoted, bytes spilled, the two budget
+     * refusals, and spill directories left behind. See the matching
+     * CompactionResult fields. Serialized unconditionally, like every
+     * counter on this DTO; COMPACTION_COUNTERS_ADDED_LATER fills 0 for
+     * ledger rows written before they existed.
+     */
+    val runsTrusted: Long,
+    val runsSpilled: Long,
+    val runsDemoted: Long,
+    val spillBytes: Long,
+    val spillBudgetExceeded: Long,
+    val mergeBudgetExceeded: Long,
+    val spillCleanupFailures: Long,
+    /**
+     * The sortedness pre-pass's verdicts: verified; out of order, or not
+     * checkable (id-less columns, a key under a container, an unsortable
+     * physical type, a null row-id carrier); under the size floor. See the
+     * matching CompactionResult fields.
+     */
+    val filesVerified: Long,
+    val filesUnsorted: Long,
+    val filesUnchecked: Long,
+    /**
+     * Input row groups appended byte for byte instead of re-encoded, and
+     * their compressed bytes. See CompactionResult.rowGroupsAppended.
+     */
+    val rowGroupsAppended: Long,
+    val bytesAppended: Long,
+    /**
+     * Groups retired with no output because every input was fully
+     * deleted. See CompactionResult.groupsRetired.
+     */
+    val groupsRetired: Long,
+    /**
+     * Sorted-rewrite runs with no usable first-key range, in groups where
+     * that cost an append. See CompactionResult.filesUnranged.
+     */
+    val filesUnranged: Long,
 )
 
 fun CompactionResult.toDto() =
@@ -217,6 +258,20 @@ fun CompactionResult.toDto() =
         bucketsAvailable = bucketsAvailable,
         candidatesTruncated = candidatesTruncated,
         planMs = planMs,
+        runsTrusted = runsTrusted,
+        runsSpilled = runsSpilled,
+        runsDemoted = runsDemoted,
+        spillBytes = spillBytes,
+        spillBudgetExceeded = spillBudgetExceeded,
+        mergeBudgetExceeded = mergeBudgetExceeded,
+        spillCleanupFailures = spillCleanupFailures,
+        filesVerified = filesVerified,
+        filesUnsorted = filesUnsorted,
+        filesUnchecked = filesUnchecked,
+        rowGroupsAppended = rowGroupsAppended,
+        bytesAppended = bytesAppended,
+        groupsRetired = groupsRetired,
+        filesUnranged = filesUnranged,
     )
 
 data class RehydrateResultDto(
@@ -312,6 +367,20 @@ private val COMPACTION_COUNTERS_ADDED_LATER =
         "buckets_available",
         "candidates_truncated",
         "plan_ms",
+        "runs_trusted",
+        "runs_spilled",
+        "runs_demoted",
+        "spill_bytes",
+        "spill_budget_exceeded",
+        "merge_budget_exceeded",
+        "spill_cleanup_failures",
+        "files_verified",
+        "files_unsorted",
+        "files_unchecked",
+        "row_groups_appended",
+        "bytes_appended",
+        "groups_retired",
+        "files_unranged",
     )
 
 /**
@@ -456,6 +525,8 @@ private val RAW_JSON = ObjectMapper()
 data class OptionsPatchRequest(
     val snapshotRetentionSeconds: PatchField<Long>,
     val consumerFloor: Boolean?,
+    val author: String? = null,
+    val message: String? = null,
 ) {
     companion object {
         private const val RETENTION = "snapshot_retention_seconds"
@@ -481,7 +552,14 @@ data class OptionsPatchRequest(
                         "'$FLOOR' must be a boolean, got ${node.get(FLOOR)}",
                     )
                 }
-            return OptionsPatchRequest(retention, floor)
+
+            fun metadata(field: String): String? {
+                val value = node.get(field) ?: return null
+                if (value.isNull) return null
+                if (!value.isTextual) throw BadRequestException("'$field' must be a string or null")
+                return value.textValue()
+            }
+            return OptionsPatchRequest(retention, floor, metadata("author"), metadata("message"))
         }
     }
 }

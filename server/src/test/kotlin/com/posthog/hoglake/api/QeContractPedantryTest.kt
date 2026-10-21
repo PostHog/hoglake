@@ -74,6 +74,95 @@ class QeContractPedantryTest {
                 .isEqualTo(HttpStatusCode.UnprocessableEntity)
         }
 
+    @Test
+    fun `optional DDL attribution survives every create and alter wire request exactly`() =
+        api { client ->
+            val catalog = "ddl-wire-attribution"
+            val base = "/v1/catalogs/$catalog"
+            val author = " engineer/λ \t "
+            val message = " exact reason\n\"quoted\" & preserved "
+            val metadata =
+                """"author":${json.writeValueAsString(author)},"message":${json.writeValueAsString(message)}"""
+            assertThat(
+                client.postJson(
+                    "/v1/catalogs",
+                    """{"name":"$catalog","data_path":"s3://qe/$catalog",$metadata}""",
+                ).status,
+            ).isEqualTo(HttpStatusCode.Created)
+            assertThat(client.postJson("$base/namespaces", """{"name":"ns",$metadata}""").status)
+                .isEqualTo(HttpStatusCode.Created)
+            assertThat(
+                client.postJson(
+                    "$base/namespaces/ns/tables",
+                    """{"name":"t","columns":[{"name":"id","type":"long"}],$metadata}""",
+                ).status,
+            ).isEqualTo(HttpStatusCode.Created)
+            assertThat(
+                client.postJson(
+                    "$base/namespaces/ns/views",
+                    """{"name":"v","sql":"SELECT id FROM t",$metadata}""",
+                ).status,
+            ).isEqualTo(HttpStatusCode.Created)
+            assertThat(
+                client.postJson(
+                    "$base/namespaces/ns/tables/t/alter",
+                    """{"ops":[{"op":"set_table_comment","comment":"updated"}],$metadata}""",
+                ).status,
+            ).isEqualTo(HttpStatusCode.OK)
+            db.jdbi.withHandleUnchecked { h ->
+                val rows =
+                    h.createQuery(
+                        """
+                        SELECT s.snapshot_id, s.author, s.commit_message FROM hog_snapshot s
+                        JOIN hog_catalog c ON c.catalog_id = s.catalog_id
+                        WHERE c.name = :catalog ORDER BY s.snapshot_id
+                        """,
+                    ).bind("catalog", catalog).mapToMap().list()
+                assertThat(rows.map { it["snapshot_id"] }).containsExactly(0L, 1L, 2L, 3L, 4L)
+                rows.forEach { row ->
+                    assertThat(row["author"]).isEqualTo(author)
+                    assertThat(row["commit_message"]).isEqualTo(message)
+                }
+            }
+        }
+
+    @Test
+    fun `options attribution distinguishes malformed fields from missing reduction metadata`() =
+        api { client ->
+            val catalog = "options-wire-attribution"
+            val base = "/v1/catalogs/$catalog"
+            assertThat(
+                client.postJson("/v1/catalogs", """{"name":"$catalog","data_path":"s3://qe/$catalog"}""").status,
+            ).isEqualTo(HttpStatusCode.Created)
+            assertThat(
+                client.patchJson(
+                    "$base/options",
+                    """{"snapshot_retention_seconds":120,"author":"engineer","message":"enable retention"}""",
+                ).status,
+            ).isEqualTo(HttpStatusCode.OK)
+            val before = body(client.get("$base/options"))
+            for (field in listOf("author", "message")) {
+                for (value in listOf("42", "true", "[]", "{}")) {
+                    val request = """{"snapshot_retention_seconds":60,"consumer_floor":false,"$field":$value}"""
+                    expectError(client.patchJson("$base/options", request), HttpStatusCode.BadRequest, "bad_request")
+                    assertThat(body(client.get("$base/options"))).isEqualTo(before)
+                }
+                for (value in listOf(null, "", " \t\r\n", "\u2003\u00a0")) {
+                    val request = json.createObjectNode()
+                    request.put("snapshot_retention_seconds", 60)
+                    request.put("consumer_floor", false)
+                    request.put("author", "engineer")
+                    request.put("message", "reduce retention")
+                    if (value == null) request.remove(field) else request.put(field, value)
+                    val response = client.patchJson("$base/options", request.toString())
+                    assertThat(response.status).isEqualTo(HttpStatusCode.UnprocessableEntity)
+                    assertThat(body(response)["detail"].asText()).contains(field)
+                    assertThat(body(client.get("$base/options"))).isEqualTo(before)
+                }
+            }
+            assertThat(body(client.get(base))["head_snapshot_id"].asLong()).isEqualTo(0)
+        }
+
     private suspend fun HttpClient.postJson(
         url: String,
         body: String,
@@ -669,7 +758,9 @@ class QeContractPedantryTest {
             val doomedUuid =
                 body(client.get("/v1/catalogs/pedantry/namespaces/ns/tables/doomed"))["table_uuid"]
                     .asText()
-            client.delete("/v1/catalogs/pedantry/namespaces/ns/tables/doomed")
+            client.delete(
+                "/v1/catalogs/pedantry/namespaces/ns/tables/doomed?author=integration-test&message=drop-fixture",
+            )
             val r =
                 client.putJson(
                     "/v1/catalogs/pedantry/consumers/pinner/offsets/$doomedUuid",

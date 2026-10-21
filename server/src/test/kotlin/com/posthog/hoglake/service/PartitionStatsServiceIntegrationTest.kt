@@ -478,7 +478,7 @@ class PartitionStatsServiceIntegrationTest {
         assertThat(svc.partitionStats(cat, null, null, 50).partitions.map { it.table })
             .containsExactlyInAnyOrder("t", "doomed")
 
-        catalogs.dropTable(cat, "ns", "doomed")
+        catalogs.dropTable(cat, "ns", "doomed", author = "integration-test", message = "drop table fixture")
         assertThat(svc.partitionStats(cat, null, null, 50).partitions.map { it.table })
             .containsExactly("t")
     }

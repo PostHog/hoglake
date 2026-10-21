@@ -183,6 +183,9 @@ class App private constructor(
                 commitLockTimeoutMs = cfg.commitLockTimeoutMs,
                 nestedSortExpansion = cfg.compactionNestedSortExpansion,
                 sortedHeapBytes = cfg.compactionSortedHeapBytes,
+                spillBytes = cfg.compactionSpillBytes,
+                spillDir = java.nio.file.Path.of(cfg.compactionSpillDir),
+                verifyMinBytes = cfg.compactionVerifyMinBytes,
                 maxNodesPerRow = cfg.compactionMaxNodesPerRow,
                 codec = ParquetRewriter.OutputCodec.parse(cfg.compactionCodec, cfg.compactionZstdLevel),
             ),
@@ -260,6 +263,11 @@ class App private constructor(
                 Metrics.bind(it.meterRegistry)
                 Metrics.registerRequestPoolGauges(it.meterRegistry, it.requestDispatcher)
                 Metrics.registerHealthProbeGauge(it.meterRegistry) { it.healthProbe.outstandingAttempts }
+                // Every pod, not only the loop's: a manual run spills too.
+                val spillDir = java.nio.file.Path.of(cfg.compactionSpillDir)
+                Metrics.registerSpillDirGauge(it.meterRegistry) {
+                    com.posthog.hoglake.compaction.SpillDirectory.measuredBytes(spillDir)
+                }
                 if (dataSource != null) Metrics.registerDbPoolGauges(it.meterRegistry, dataSource)
             }
     }
@@ -364,6 +372,16 @@ class App private constructor(
      * The returned handle stops every loop and closes the stores.
      */
     fun startBackground(): AutoCloseable {
+        // BEFORE any loop starts, once, and only where the compaction loop
+        // runs: a previous container in this pod may have been killed
+        // mid-rewrite, and its `hoglake-compaction-spill-*` directories are on an emptyDir
+        // that outlives it and that nothing else would ever empty. Run
+        // here, synchronously, so it can never race a group — no loop has
+        // started, and Main starts the engine (the manual route) after
+        // this returns.
+        if (cfg.compactionIntervalMs > 0) {
+            com.posthog.hoglake.compaction.SpillDirectory.sweepLeftovers(java.nio.file.Path.of(cfg.compactionSpillDir))
+        }
         val loops = BackgroundLoops()
         loops.register("maintenance_summary", cfg.maintenanceSummaryIntervalMs) {
             maintenanceSummarySampler.tick(cfg.maintenanceSummaryBatch)

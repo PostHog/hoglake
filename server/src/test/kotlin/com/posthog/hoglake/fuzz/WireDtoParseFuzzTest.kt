@@ -9,9 +9,16 @@ import com.posthog.hoglake.api.AlterTableRequestDto
 import com.posthog.hoglake.api.ClaimUploadDto
 import com.posthog.hoglake.api.CommitRequestDto
 import com.posthog.hoglake.api.CreateCatalogRequestDto
+import com.posthog.hoglake.api.CreateNamespaceRequestDto
+import com.posthog.hoglake.api.CreateTableRequestDto
+import com.posthog.hoglake.api.CreateViewRequestDto
 import com.posthog.hoglake.api.InstanceInfoDto
+import com.posthog.hoglake.api.OperationMetadataDto
+import com.posthog.hoglake.api.OptionsPatchRequest
 import com.posthog.hoglake.api.PrepareTableCreationDto
 import com.posthog.hoglake.api.PublishTableCreationDto
+import com.posthog.hoglake.api.SnapshotResolutionDto
+import com.posthog.hoglake.api.StorageUsageDto
 import com.posthog.hoglake.api.UploadOwnerDto
 import com.posthog.hoglake.api.parseExpectedTableUuid
 import com.posthog.hoglake.api.parseLongQuery
@@ -57,6 +64,13 @@ import io.ktor.server.plugins.BadRequestException
  * the whole ktor stack — is pinned in `WireParseErrorMappingTest`.
  */
 class WireDtoParseFuzzTest {
+    private val metadataWhitespace =
+        " \t\r\n\u000b\u000c\u001c\u001d\u001e\u001f\u0085\u00a0\u1680" +
+            "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a" +
+            "\u2028\u2029\u202f\u205f\u3000"
+
+    private fun hasMetadataText(value: String?): Boolean = value?.any { it !in metadataWhitespace } == true
+
     @FuzzTest(maxDuration = "120s")
     fun wireParseFailsOnlyWithMappedExceptions(data: ByteArray) {
         if (data.size > MAX_INPUT_BYTES) return
@@ -124,6 +138,46 @@ class WireDtoParseFuzzTest {
             check(mapper.readValue<CreateCatalogRequestDto>(mapper.writeValueAsBytes(dto)) == dto)
         }
 
+        // This response carries decimal int64 strings, not floating-point JSON numbers.
+        parseOrNull { mapper.readValue<StorageUsageDto>(data) }?.let { dto ->
+            check(mapper.readValue<StorageUsageDto>(mapper.writeValueAsBytes(dto)) == dto)
+            val body = mapper.readTree(mapper.writeValueAsBytes(dto))
+            check(body["tracked_bytes"].isTextual && body["pending_delete_files"].isTextual)
+        }
+
+        parseOrNull { mapper.readValue<CreateNamespaceRequestDto>(data) }?.let { dto ->
+            check(mapper.readValue<CreateNamespaceRequestDto>(mapper.writeValueAsBytes(dto)) == dto)
+        }
+        parseOrNull { mapper.readValue<CreateTableRequestDto>(data) }?.let { dto ->
+            check(mapper.readValue<CreateTableRequestDto>(mapper.writeValueAsBytes(dto)) == dto)
+            try {
+                ColumnTrees.validate(dto.columns.map { it.toModel() })
+            } catch (e: Exception) {
+                checkAllowed("CreateTableRequestDto", e)
+            }
+        }
+        parseOrNull { mapper.readValue<CreateViewRequestDto>(data) }?.let { dto ->
+            check(mapper.readValue<CreateViewRequestDto>(mapper.writeValueAsBytes(dto)) == dto)
+        }
+        parseOrNull { mapper.readValue<OperationMetadataDto>(data) }?.let { dto ->
+            check(mapper.readValue<OperationMetadataDto>(mapper.writeValueAsBytes(dto)) == dto)
+            try {
+                com.posthog.hoglake.service.requireOperationMetadata(dto.author, dto.message)
+                check(hasMetadataText(dto.author) && hasMetadataText(dto.message))
+            } catch (e: HoglakeException.Validation) {
+                check(!hasMetadataText(dto.author) || !hasMetadataText(dto.message))
+            }
+        }
+        parseOrNull { mapper.readTree(data) }?.let { node ->
+            try {
+                val options = OptionsPatchRequest.from(node)
+                check(options.author == node["author"]?.takeUnless { it.isNull }?.textValue())
+                check(options.message == node["message"]?.takeUnless { it.isNull }?.textValue())
+            } catch (e: Exception) {
+                checkAllowed("OptionsPatchRequest", e)
+            }
+        }
+
         // Instance settings must retain their values and wire field names.
         parseOrNull { mapper.readValue<InstanceInfoDto>(data) }?.let { dto ->
             val encoded = mapper.writeValueAsBytes(dto)
@@ -136,9 +190,8 @@ class WireDtoParseFuzzTest {
         // /commit/mutations/prepared, /commit/uploads and
         // /commit/transaction all `call.receive<CommitRequestDto>()`
         // (api/Routes.kt) and differ only in the required-field checks
-        // they run afterwards. /truncate has no body at all: its guard
-        // is the mandatory `expected_table_uuid` query parameter, which
-        // parseExpectedTableUuid above already fuzzes.
+        // they run afterwards. Truncate's attribution body is covered above;
+        // its mandatory expected_table_uuid query parameter is covered too.
         parseOrNull { mapper.readValue<CommitRequestDto>(data) }?.let { dto ->
             try {
                 val request = dto.toModel()
@@ -201,6 +254,9 @@ class WireDtoParseFuzzTest {
         parseOrNull { mapper.readValue<UploadOwnerDto>(data) }?.let { dto ->
             check(mapper.readValue<UploadOwnerDto>(mapper.writeValueAsBytes(dto)) == dto)
         }
+        parseOrNull { mapper.readValue<SnapshotResolutionDto>(data) }?.let { dto ->
+            check(mapper.readValue<SnapshotResolutionDto>(mapper.writeValueAsBytes(dto)) == dto)
+        }
 
         // The publish half of the two-phase table creation
         // (api/TableCreationRoutes.kt): a list of file registrations,
@@ -231,6 +287,8 @@ class WireDtoParseFuzzTest {
                         dto.sortFields.map { it.toModel() },
                         dto.comment,
                         dto.properties,
+                        dto.author,
+                        dto.message,
                     )
                 if ((dto.replacement?.readSnapshot ?: 0) >= 0 &&
                     dto.partitionFields.all {

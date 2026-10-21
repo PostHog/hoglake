@@ -16,7 +16,7 @@ import org.slf4j.MDC
  * transaction commits (or fails), never inside it: the duckgres
  * query_log lesson generalized.
  *
- * actor is fixed to "anonymous" until auth lands. request_id comes from
+ * actor is the caller-supplied author, or "anonymous" when absent. request_id comes from
  * the caller or, when in a request context, from the MDC entry the
  * RequestId plugin + CallLogging maintain; background jobs carry none.
  */
@@ -49,17 +49,20 @@ object Audit {
         outcome: String,
         detail: String? = null,
         requestId: String? = null,
+        actor: String? = null,
+        message: String? = null,
     ) {
         try {
             val args =
                 mutableListOf<StructuredArgument>(
                     kv("action", action),
-                    kv("actor", "anonymous"),
+                    kv("actor", actor ?: "anonymous"),
                     kv("outcome", outcome),
                 )
             catalog?.let { args += kv("catalog", it) }
             obj?.let { args += kv("object", it) }
             detail?.let { args += kv("detail", it) }
+            message?.let { args += kv("operation_message", it) }
             (requestId ?: MDC.get(REQUEST_ID_MDC))?.let { args += kv("request_id", it) }
             log.info("$action $outcome", *args.toTypedArray())
         } catch (t: Throwable) {
@@ -94,6 +97,8 @@ object Audit {
         obj: String?,
         successOutcome: (T) -> String = { "ok" },
         detail: (T) -> String? = { null },
+        actor: (T?) -> String? = { null },
+        message: (T?) -> String? = { null },
         block: () -> T,
     ): T {
         val result =
@@ -101,14 +106,30 @@ object Audit {
                 block()
             } catch (e: Throwable) {
                 try {
-                    event(action, catalog, obj, failureOutcome(e), e.message)
+                    event(
+                        action,
+                        catalog,
+                        obj,
+                        failureOutcome(e),
+                        e.message,
+                        actor = actor(null),
+                        message = message(null),
+                    )
                 } catch (t: Throwable) {
                     e.addSuppressed(t)
                 }
                 throw e
             }
         try {
-            event(action, catalog, obj, successOutcome(result), detail(result))
+            event(
+                action,
+                catalog,
+                obj,
+                successOutcome(result),
+                detail(result),
+                actor = actor(result),
+                message = message(result),
+            )
         } catch (t: Throwable) {
             decorationFailed(action, t)
         }

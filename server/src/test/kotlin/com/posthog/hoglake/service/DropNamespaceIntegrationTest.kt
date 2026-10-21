@@ -93,7 +93,7 @@ class DropNamespaceIntegrationTest {
         catalogs.createNamespace(cat, "ns")
         val namespaceId = catalogs.getNamespace(cat, "ns").namespaceId
 
-        val result = catalogs.dropNamespace(cat, "ns")
+        val result = catalogs.dropNamespace(cat, "ns", author = "integration-test", message = "drop namespace fixture")
 
         // The drop snapshot's change feed is exactly one namespace_dropped
         // row, carrying the namespace's id (not a table's, not a catalog's).
@@ -145,7 +145,7 @@ class DropNamespaceIntegrationTest {
             ).bind("c", catalogId).bind("t", tableId).execute()
         }
 
-        catalogs.dropTable(cat, "ns", "t")
+        catalogs.dropTable(cat, "ns", "t", author = "integration-test", message = "drop table fixture")
 
         // The row is STILL LIVE — that is the state this case is about,
         // and asserting it keeps the test honest if retirement ever
@@ -161,7 +161,7 @@ class DropNamespaceIntegrationTest {
             .isEqualTo(1)
 
         // And the namespace drops, because the table it holds is gone.
-        val result = catalogs.dropNamespace(cat, "ns")
+        val result = catalogs.dropNamespace(cat, "ns", author = "integration-test", message = "drop namespace fixture")
         assertThat(result.snapshotId).isGreaterThan(0)
         assertThatThrownBy { catalogs.getNamespace(cat, "ns") }
             .isInstanceOf(HoglakeException.NotFound::class.java)
@@ -192,7 +192,7 @@ class DropNamespaceIntegrationTest {
         catalogs.createTable(cat, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
         val catalogId = catalogs.getCatalog(cat).catalogId
 
-        catalogs.dropTable(cat, "ns", "t")
+        catalogs.dropTable(cat, "ns", "t", author = "integration-test", message = "drop table fixture")
         // Re-open the version row the drop closed, leaving the identity
         // row dropped: the half-dropped table.
         jdbi.withHandleUnchecked { h ->
@@ -215,7 +215,7 @@ class DropNamespaceIntegrationTest {
             .describedAs("the fixture must really be half-dropped, or this asserts nothing")
             .isEqualTo(1)
 
-        val result = catalogs.dropNamespace(cat, "ns")
+        val result = catalogs.dropNamespace(cat, "ns", author = "integration-test", message = "drop namespace fixture")
         assertThat(result.snapshotId).isGreaterThan(0)
     }
 
@@ -225,7 +225,7 @@ class DropNamespaceIntegrationTest {
         catalogs.createCatalog(cat, "s3://bucket/$cat")
         catalogs.createNamespace(cat, "ns")
 
-        val result = catalogs.dropNamespace(cat, "ns")
+        val result = catalogs.dropNamespace(cat, "ns", author = "integration-test", message = "drop namespace fixture")
 
         val drops =
             auditLines().filter { it["action"]?.asText() == "namespace_drop" && it["catalog"]?.asText() == cat }
@@ -243,7 +243,9 @@ class DropNamespaceIntegrationTest {
         catalogs.createNamespace(cat, "ns")
         catalogs.createTable(cat, "ns", "t", listOf(ColumnDef("id", ColType.LONG, nullable = false)))
 
-        assertThatThrownBy { catalogs.dropNamespace(cat, "ns") }
+        assertThatThrownBy {
+            catalogs.dropNamespace(cat, "ns", author = "integration-test", message = "drop namespace fixture")
+        }
             .isInstanceOf(HoglakeException.NamespaceNotEmpty::class.java)
 
         val drops =
@@ -293,7 +295,7 @@ class DropNamespaceIntegrationTest {
             pool.submit {
                 start.await()
                 try {
-                    catalogs.dropNamespace(cat, "ns")
+                    catalogs.dropNamespace(cat, "ns", author = "integration-test", message = "drop namespace fixture")
                     dropOk.incrementAndGet()
                 } catch (e: HoglakeException.NamespaceNotEmpty) {
                     dropConflict.incrementAndGet() // create won: not empty

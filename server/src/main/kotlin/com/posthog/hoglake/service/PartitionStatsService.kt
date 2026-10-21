@@ -41,26 +41,18 @@ import java.util.UUID
  *    small_file_count and contributes no debt. The execution budget
  *    limits work per run, not reported backlog.
  *
- *    EXACT for ordinary unsorted scalar tables, and OVER-REPORTING for
- *    three cases the sampler cannot see, all of which predate the
- *    one-pass change:
- *      - SORTED (and nested) tables, where the planner packs to a ROW
- *        CEILING as well as to the byte target
- *        (CompactionConfig.sortedRowCeiling, passed to
- *        CompactionGrouping as a second capacity) while the sampler
- *        knows only the bytes. The ceiling is a per-table quantity —
- *        the live sort order and the column forest decide it — and the
- *        sampler's scan walks every table of a catalog in one pass with
- *        no schema in hand, so it cannot mirror it. A dense sorted
- *        table's groups therefore close EARLIER than the debt reported
- *        here, and a nested one's byte budget is derated on top
- *        (CompactionConfig.effectiveTargetBytes).
+ *    EXACT for scalar tables, sorted or not — since hoglake#134 a
+ *    sorted group packs to the byte target like any other (the rewrite
+ *    is an external merge sort; there is no row ceiling to mirror) —
+ *    and OVER-REPORTING for two cases the sampler cannot see:
  *      - VARIANT tables, which CompactionService refuses to plan at all.
- *      - Work the row ceiling cannot group at all: a file above it, or
- *        files dense enough that no two fit (heap_budget_exceeded).
- *    Closing these means teaching a bounded streaming scan the schema,
- *    sort spec and per-table density; until then, read a sorted or
- *    variant table's debt as an upper bound.
+ *      - Sorted groups the planner refuses on the rewrite's budgets
+ *        (spill_budget_exceeded, merge_budget_exceeded). Both are
+ *        configuration against the byte target and per-table (the
+ *        schema's leaf count, the live sort spec), and the sampler's
+ *        scan walks every table of a catalog with no schema in hand.
+ *    Read a variant table's debt, or a sorted table's while those
+ *    counters are nonzero, as an upper bound.
  *  - dv_count counts live DVs over the group's files (at most one per
  *    file by the unique partial index).
  *  - Ordered by debt_score desc, ties by small_file_bytes desc, then a

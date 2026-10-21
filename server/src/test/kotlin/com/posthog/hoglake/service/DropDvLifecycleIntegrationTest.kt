@@ -100,7 +100,14 @@ class DropDvLifecycleIntegrationTest {
             ),
         )
 
-        val dropSnap = catalogs.dropTable(cat, "ns", "t").snapshotId
+        val dropSnap =
+            catalogs.dropTable(
+                cat,
+                "ns",
+                "t",
+                author = "integration-test",
+                message = "drop table fixture",
+            ).snapshotId
 
         // THE DROP LEFT EVERY FILE ROW EXACTLY AS IT WAS. This is the
         // #193 change, and it is asserted here because the rest of this

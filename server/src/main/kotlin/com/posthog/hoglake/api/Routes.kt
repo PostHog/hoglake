@@ -71,13 +71,24 @@ fun Application.installApiRoutes(
                 val req = call.receive<CreateCatalogRequestDto>()
                 call.respond(
                     HttpStatusCode.Created,
-                    catalogs.createCatalog(req.name, req.dataPath).toDto(),
+                    catalogs.createCatalog(req.name, req.dataPath, req.author, req.message).toDto(),
                 )
             }
 
             route("/{catalog}") {
                 get {
                     call.respond(catalogs.getCatalog(call.catalog()).toDto())
+                }
+
+                get("/storage-usage") {
+                    // A footprint has no read snapshot: historical/dropped registrations
+                    // remain tracked until their manifest rows are physically removed.
+                    if (call.request.queryParameters.contains("snapshot") ||
+                        call.request.queryParameters.contains("at_timestamp")
+                    ) {
+                        throw BadRequestException("storage-usage does not accept snapshot or at_timestamp")
+                    }
+                    call.respond(catalogs.storageUsage(call.catalog()).toDto())
                 }
 
                 route("/namespaces") {
@@ -94,7 +105,7 @@ fun Application.installApiRoutes(
                         val req = call.receive<CreateNamespaceRequestDto>()
                         call.respond(
                             HttpStatusCode.Created,
-                            catalogs.createNamespace(call.catalog(), req.name).toDto(),
+                            catalogs.createNamespace(call.catalog(), req.name, req.author, req.message).toDto(),
                         )
                     }
                     get("/{namespace}") {
@@ -108,6 +119,8 @@ fun Application.installApiRoutes(
                                 call.catalog(),
                                 call.namespace(),
                                 call.longQuery("expected_namespace_id"),
+                                call.request.queryParameters["author"],
+                                call.request.queryParameters["message"],
                             ).toDto(),
                         )
                     }
@@ -132,6 +145,8 @@ fun Application.installApiRoutes(
                                     call.namespace(),
                                     req.name,
                                     req.columns.map { it.toModel() },
+                                    req.author,
+                                    req.message,
                                 ).toDto(),
                             )
                         }
@@ -163,6 +178,8 @@ fun Application.installApiRoutes(
                                         call.namespace(),
                                         call.table(),
                                         call.expectedTableUuid(),
+                                        call.request.queryParameters["author"],
+                                        call.request.queryParameters["message"],
                                     ).toDto(),
                                 )
                             }
@@ -170,12 +187,28 @@ fun Application.installApiRoutes(
                                 val expected =
                                     call.expectedTableUuid()
                                         ?: throw BadRequestException("expected_table_uuid is required")
+                                val body = call.receive<ByteArray>()
+                                val req =
+                                    if (body.isEmpty()) {
+                                        OperationMetadataDto()
+                                    } else {
+                                        try {
+                                            com.posthog.hoglake.wireObjectMapper().readValue(
+                                                body,
+                                                OperationMetadataDto::class.java,
+                                            ) ?: throw BadRequestException("request body must be a JSON object")
+                                        } catch (e: Exception) {
+                                            throw BadRequestException("invalid operation metadata JSON", e)
+                                        }
+                                    }
                                 call.respond(
                                     catalogs.truncateTable(
                                         call.catalog(),
                                         call.namespace(),
                                         call.table(),
                                         expected,
+                                        req.author,
+                                        req.message,
                                     ).toDto(),
                                 )
                             }
@@ -303,6 +336,13 @@ fun Application.installApiRoutes(
                             }
                         }
                     }
+                }
+
+                get("/snapshots/resolve") {
+                    val at =
+                        call.instantQuery("at_timestamp")
+                            ?: throw BadRequestException("query parameter 'at_timestamp' is required")
+                    call.respond(catalogs.resolveSnapshot(call.catalog(), at).toDto())
                 }
 
                 get("/snapshots") {

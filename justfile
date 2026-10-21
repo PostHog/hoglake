@@ -6,6 +6,7 @@ mod pyhoglake
 mod webui
 mod hedgerow
 mod bench
+mod millrace
 
 default:
     @just --list
@@ -15,13 +16,14 @@ test-all:
     just server test
     just pyhoglake test
 
-# Style gates: ktlint (server) + ruff check/format (pyhoglake, hedgerow),
-# every tool pinned. bench is not wired in yet — it passes `ruff check`
-# but carries a formatting backlog; see AGENT.md open items.
+# Style gates: ktlint (server) + ruff check/format (pyhoglake, hedgerow,
+# millrace), every tool pinned. bench is not wired in yet — it passes
+# `ruff check` but carries a formatting backlog; see AGENT.md open items.
 lint-all:
     just server lint
     just pyhoglake lint
     just hedgerow lint
+    just millrace lint
 
 # Bring up the dev stack and the server (foreground).
 dev:

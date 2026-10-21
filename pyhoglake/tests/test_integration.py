@@ -571,11 +571,16 @@ def test_time_travel(catalog, ns):
     assert table.info(snapshot=s2).record_count == 10
 
     t1 = next(s.snapshot_time for s in catalog.snapshots() if s.snapshot_id == s1)
+    resolved = catalog.resolve_snapshot(t1)
+    assert resolved.snapshot_id == s1
+    assert resolved.snapshot_time == t1
+    assert table.files(snapshot=resolved.snapshot_id) == table.files(at_timestamp=t1)
     assert table.info(at_timestamp=t1).file_count == 1
     files_t1 = table.files(at_timestamp=t1)
     assert len(files_t1) == 1
     assert sum(f.record_count for f in files_t1) == 5
     # after head -> head
+    assert catalog.resolve_snapshot(datetime(2100, 1, 1)).snapshot_id == s2
     assert table.info(at_timestamp=datetime(2100, 1, 1)).file_count == 2
 
 
@@ -644,7 +649,7 @@ def test_views(catalog, ns):
         ns.create_view("v_events", "SELECT 1")
 
     assert "v_events" in [x.name for x in ns.list_views()]
-    res = got.drop()
+    res = got.drop(author="pyhoglake-tests", message="drop test fixture")
     assert res.snapshot_id > 0
     with pytest.raises(NotFoundError):
         ns.view("v_events")
@@ -658,7 +663,7 @@ def test_expire_and_cleanup(client):
     table.append(_events_data(3))
     table.append(_events_data(3, start=3))
 
-    opts = cat.set_retention(1)
+    opts = cat.set_retention(1, author="pyhoglake-tests", message="exercise expiry")
     assert opts.snapshot_retention_seconds == 1
     earliest_before = opts.earliest_snapshot_id
 
@@ -765,6 +770,38 @@ def test_partitioned_append_fanout(catalog, ns):
     assert _info_at_head(catalog, table).record_count == total
 
 
+def test_create_table_with_initial_partition_and_sort_fields(catalog, ns):
+    """One request installs columns, partition spec and sort order: the
+    read-back carries both, resolved against the ids the server assigned
+    (depth-first from 1), and the race loser gets AlreadyExistsError."""
+    assert "atomic-partitioned-table-creation-v1" in catalog.info.capabilities
+    table = ns.create_table(
+        "part_sorted_events",
+        _part_schema(),
+        partition_fields=[
+            ops.NamedPartitionField("team_id"),
+            ops.NamedPartitionField("ts", "day"),
+        ],
+        sort_fields=[ops.NamedSortField("ts")],
+    )
+    info = table.info()
+    fid = {c.name: c.field_id for c in info.columns}
+    assert info.partition_spec is not None and info.sort_spec is not None
+    assert [(f.source_field_id, f.transform) for f in info.partition_spec.fields] == [
+        (fid["team_id"], "identity"),
+        (fid["ts"], "day"),
+    ]
+    assert [
+        (f.source_field_id, f.direction, f.null_order) for f in info.sort_spec.fields
+    ] == [(fid["ts"], "asc", "nulls_last")]
+    with pytest.raises(AlreadyExistsError):
+        ns.create_table(
+            "part_sorted_events",
+            _part_schema(),
+            partition_fields=[ops.NamedPartitionField("team_id")],
+        )
+
+
 def test_partitioned_compaction_groups_within_partition(catalog, ns):
     """Compaction (metadata-planned server-side: same spec + identical
     partition_values and size tier) must merge only within a partition.
@@ -812,7 +849,7 @@ def test_partitioned_compaction_groups_within_partition(catalog, ns):
 def test_drop_table(catalog, ns):
     table = ns.create_table("droppable", _events_schema())
     assert "droppable" in [t.name for t in ns.list_tables()]
-    res = table.drop()
+    res = table.drop(author="pyhoglake-tests", message="drop test fixture")
     assert res.snapshot_id > 0
     assert "droppable" not in [t.name for t in ns.list_tables()]
     with pytest.raises(NotFoundError):

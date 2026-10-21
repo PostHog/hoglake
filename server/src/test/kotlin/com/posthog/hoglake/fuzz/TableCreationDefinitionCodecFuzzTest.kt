@@ -19,7 +19,7 @@ import java.util.UUID
 /**
  * Fuzz target (docs/fuzzing.md layer 4): the versioned durable format for a
  * prepared table creation — `TableCreationDefinitionCodec.encode` /
- * `decode`, versions 0 through 6.
+ * `decode`, versions 0 through 7.
  *
  * This codec is the only thing standing between a stored receipt and the
  * table that gets published from it, and it is read by binaries OLDER
@@ -110,6 +110,7 @@ class TableCreationDefinitionCodecFuzzTest {
     private fun lowestVersionFor(d: TableCreationDefinition): Int =
         maxOf(
             FLAT_VERSION,
+            if (d.author != null || d.message != null) 7 else FLAT_VERSION,
             if (d.columns.any { anyChildren(it) }) 2 else FLAT_VERSION,
             if (d.replacement != null) 3 else FLAT_VERSION,
             if (d.partitionFields.isNotEmpty()) 4 else FLAT_VERSION,
@@ -173,6 +174,8 @@ class TableCreationDefinitionCodecFuzzTest {
                         NullOrder.entries[e.int(0, NullOrder.entries.size - 1)],
                     )
                 },
+            author = if (e.bool()) e.text(MAX_NAME_BYTES) else null,
+            message = if (e.bool()) e.text(MAX_NAME_BYTES) else null,
             comment = if (e.bool()) e.text(MAX_NAME_BYTES) else null,
             properties = (0 until e.int(0, 2)).associate { e.text(MAX_NAME_BYTES) to e.text(MAX_NAME_BYTES) },
         )

@@ -102,7 +102,7 @@ def _add_common(p: argparse.ArgumentParser) -> None:
         "--s3-secret-key",
         default=os.environ.get("HOGLAKE_S3_SECRET_KEY", "hoglake123"),
     )
-    p.add_argument("--bucket", default="hoglake-bench")
+    p.add_argument("--bucket", default=os.environ.get("HOGLAKE_BUCKET", "hoglake-bench"))
     p.add_argument(
         "--results",
         default="bench-results.jsonl",

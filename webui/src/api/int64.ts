@@ -168,6 +168,26 @@ const INT64_FIELDS = new Set([
   "buckets_available",
   "candidates_truncated",
   "plan_ms",
+  // The external merge sort's counters (CompactionResult, hoglake#134).
+  // int64 on the wire like every counter, and compared with `positive()`
+  // in the console, so they must arrive as strings.
+  "runs_trusted",
+  "runs_spilled",
+  "runs_demoted",
+  "spill_bytes",
+  "spill_budget_exceeded",
+  "merge_budget_exceeded",
+  "spill_cleanup_failures",
+  // The sortedness pre-pass's verdicts (CompactionResult, hoglake#134).
+  "files_verified",
+  "files_unsorted",
+  "files_unchecked",
+  // Row groups appended byte for byte (CompactionResult, hoglake#134).
+  "row_groups_appended",
+  "bytes_appended",
+  // Retirements and append blockers (CompactionResult).
+  "groups_retired",
+  "files_unranged",
   "violations",
 ]);
 

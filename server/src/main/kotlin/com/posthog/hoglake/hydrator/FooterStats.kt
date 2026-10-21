@@ -960,8 +960,8 @@ object FooterStats {
      * values), and any other such chunk had its min/max withheld or
      * refused. Conflating them cost the bounds of every sparse column on
      * every compaction output: an output is many 128 MiB row groups
-     * (`ParquetRewriter.newWriter` sets no block size, so
-     * `ParquetWriter.DEFAULT_BLOCK_SIZE`), and one all-null row group
+     * (`OutputWriter` keeps parquet's `ParquetWriter.DEFAULT_BLOCK_SIZE`
+     * for the output), and one all-null row group
      * nulled the whole column.
      */
     private fun chunkBounds(

@@ -36,6 +36,13 @@ at a one-second interval for the deferred-stats test, and rejects skipped tests.
 
 ## Quickstart — the append path end to end
 
+DDL methods accept keyword arguments `author` and `message`. Both are required
+and must be nonblank for table, view and namespace drops and `Table.truncate()`.
+Pass both to `Catalog.set_retention()` when enabling expiry or shortening
+retention. The server records attribution in the snapshot and audit log.
+Drop and truncate have no operation receipt; do not automatically retry an
+unknown outcome.
+
 ```python
 import pyarrow as pa
 from pyhoglake import HoglakeClient, S3Config
@@ -102,6 +109,8 @@ from pyhoglake import ops
 table.alter([ops.add_column("score", pa.float64())])  # schema evolution
 table.info(snapshot=5)  # time travel
 table.files(at_timestamp=some_datetime)  # by timestamp
+pin = catalog.resolve_snapshot(some_datetime)  # ID and recorded snapshot time
+table.files(snapshot=pin.snapshot_id)  # share the same pin with another client
 table.append(big_table, deferred_stats=True)  # register as pending
 catalog.set_retention(7 * 86400, consumer_floor=True)  # retention policy
 catalog.expire()

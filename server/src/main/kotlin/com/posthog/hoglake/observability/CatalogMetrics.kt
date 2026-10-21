@@ -22,8 +22,16 @@ import java.util.concurrent.atomic.AtomicLong
  * catalogs are left out of both sums (no stamp, or a generation that
  * did not measure rows). All or nothing per catalog, so the two sums
  * always cover the same set.
+ *
+ * The sums are NULL when there are catalogs and none of them is
+ * covered: a sum over nothing is 0, and 0 read as "empty warehouse"
+ * on the header of a full one (every pod in the window after an
+ * upgrade adds the stamps, until the summary sampler has published a
+ * generation per catalog). `unsampledCatalogs` alone is set then. An
+ * instance with no catalogs at all is a real empty warehouse and
+ * sums to 0 with 0 unsampled.
  */
-data class InstanceTotals(val totalRows: Long, val totalSizeBytes: Long, val unsampledCatalogs: Int)
+data class InstanceTotals(val totalRows: Long?, val totalSizeBytes: Long?, val unsampledCatalogs: Int)
 
 /**
  * `hoglake_expiry_purge_remaining{catalog}` — file rows still eligible
@@ -965,11 +973,16 @@ class CatalogMetrics(
         // stamp, or a generation that did not measure rows) is left out
         // of BOTH sums and counted, so the two totals always cover the
         // same catalogs and the count says exactly what they omit.
+        // Catalogs but no coverage is "not yet known", not 0: the sums
+        // are withheld and only the count is published, so the header
+        // never reads 0 B over a full instance in the post-upgrade
+        // window before the first stamps land.
         val covered = rows.filter { it.liveRows != null && it.liveBytes != null }
+        val known = covered.isNotEmpty() || rows.isEmpty()
         latestTotals =
             InstanceTotals(
-                totalRows = covered.sumOf { it.liveRows!! },
-                totalSizeBytes = covered.sumOf { it.liveBytes!! },
+                totalRows = if (known) covered.sumOf { it.liveRows!! } else null,
+                totalSizeBytes = if (known) covered.sumOf { it.liveBytes!! } else null,
                 unsampledCatalogs = rows.size - covered.size,
             )
         // The same rows, kept per catalog for the catalogs listing. The

@@ -283,7 +283,7 @@ class TableListingHistoryIntegrationTest {
     fun `a dropped table is absent at head and present at a snapshot before the drop`() {
         val cat = fixture()
         val beforeDrop = catalogs.getCatalog(cat).headSnapshotId
-        catalogs.dropTable(cat, "ns", "t")
+        catalogs.dropTable(cat, "ns", "t", author = "integration-test", message = "drop table fixture")
 
         assertThat(catalogs.listTables(cat, "ns"))
             .describedAs("a dropped table is not live at head")

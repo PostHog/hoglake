@@ -73,6 +73,21 @@ class TableCreationDefinitionCodecTest {
         )
 
     @Test
+    fun `attribution requires version seven without changing older encodings`() {
+        val encoded = TableCreationDefinitionCodec.encode(flat)
+        assertThat(encoded).contains("\"version\":1").doesNotContain("author", "message")
+        for (metadata in listOf(
+            flat.copy(author = " qe/λ "),
+            flat.copy(message = " reason\nnext "),
+            flat.copy(author = "qe", message = "why"),
+        )) {
+            val attributed = TableCreationDefinitionCodec.encode(metadata)
+            assertThat(attributed).contains("\"version\":7")
+            assertThat(TableCreationDefinitionCodec.decode(attributed)).isEqualTo(metadata)
+        }
+    }
+
+    @Test
     fun `metadata uses version six and preserves empty and nested comments`() {
         val metadata =
             flat.copy(

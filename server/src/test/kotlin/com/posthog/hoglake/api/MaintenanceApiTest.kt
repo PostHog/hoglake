@@ -178,7 +178,8 @@ class MaintenanceApiTest {
                 body(
                     client.patchJson(
                         "/v1/catalogs/mnt-opts/options",
-                        """{"snapshot_retention_seconds": 3600}""",
+                        """{"snapshot_retention_seconds": 3600,
+                           "author":"integration-test","message":"Configure retention"}""",
                     ).also { assertThat(it.status).isEqualTo(HttpStatusCode.OK) },
                 )
             assertThat(set["snapshot_retention_seconds"].asLong()).isEqualTo(3600)
@@ -264,7 +265,10 @@ class MaintenanceApiTest {
                 """,
                 )
             }
-            client.patchJson("/v1/catalogs/mnt-expire/options", """{"snapshot_retention_seconds": 60}""")
+            client.patchJson(
+                "/v1/catalogs/mnt-expire/options",
+                """{"snapshot_retention_seconds": 60,"author":"integration-test","message":"Configure retention"}""",
+            )
 
             val result =
                 body(
@@ -300,7 +304,7 @@ class MaintenanceApiTest {
             }
             client.patchJson(
                 "/v1/catalogs/mnt-expire-batch/options",
-                """{"snapshot_retention_seconds": 60}""",
+                """{"snapshot_retention_seconds": 60,"author":"integration-test","message":"Configure retention"}""",
             )
 
             val first = body(client.postJson("/v1/catalogs/mnt-expire-batch/maintenance/expire?batch=1"))

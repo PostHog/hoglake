@@ -9,9 +9,10 @@ the pre-split commits).
 
 **Do not push until all required tests have run on the exact changes being
 pushed.** This includes the server suite with Docker, Kotlin and Python lint,
-Python type checks, both Python unit suites, both live client suites, and the
-UI tests and build. Run additional component checks for affected code, such as
-the DuckDB extension's live tests.
+Python type checks, all three Python unit suites (`just pyhoglake unit`,
+`just hedgerow unit`, `just millrace unit`), both live client suites plus
+`just millrace live`, and the UI tests and build. Run additional component
+checks for affected code, such as the DuckDB extension's live tests.
 
 A skipped live suite, a missing service, a unit-only run, or checks from an
 older revision do not satisfy this rule. Wait for every command to finish and
@@ -30,10 +31,12 @@ stack and what it showed.)
 
 ```bash
 (cd server && flox activate -- ./gradlew :test)       # Docker required
-just lint-all        # ktlint + ruff (check & format) across both Python trees, mypy on pyhoglake
+just lint-all        # ktlint + ruff (check & format) across the three Python trees, mypy on pyhoglake + millrace
 just pyhoglake unit
 just hedgerow unit
+just millrace unit
 just live-python    # builds this checkout, starts isolated services, fails on skips
+just millrace live  # the Kafka-ingestion live stack (PG + MinIO + Kafka), fails on skips
 just webui test
 just webui build
 ```
@@ -121,6 +124,7 @@ React console, Python replication daemon:
 | `pyhoglake/` | Thin API client; owns the Python writer path (parquet with field IDs, footer stats, Iceberg bounds codec) | Python 3.12 (flox) / uv / httpx / pyarrow | pytest + pytest-httpx + hypothesis |
 | `webui/` | Lakekeeper-style management console: catalog browser (namespaces/tables/files/scan with time travel; the namespace listing is NAME, RECORD_COUNT, FILE_COUNT, FILE_SIZE, SNAPSHOTS, EARLIEST_SNAPSHOT, COMMENT — `table_uuid` stays on the wire but is shown on the table page, not as a column), newest-first snapshot timeline (`before` paging), consumers (grouped, names resolved, dropped badges), compaction-debt page, maintenance pages (central catalog×task matrix + per-catalog task panels over the run ledger), `/metrics` visualizer, instance-name badge; int64 wire fields carried as strings (lossless above 2^53) | Vite / React / TS | vitest (mocked fetch) |
 | `hedgerow/` | viaduck's successor: source table → destination table replication, append-only, single-destination | Python / uv / pyhoglake | pytest; scripted-fake unit + live integration |
+| `millrace/` | Kafka → hoglake ingestion daemon with SlateDB staging; see docs/kafka-ingestion.md | Python / uv / pyhoglake + slatedb | pytest + hypothesis + live stack |
 | `duckdb-client/` | DuckDB extension: ATTACH over REST, scan (partition pruning + deletion vectors), INSERT/UPDATE/DELETE via footer-shipping commits, DDL, time travel, metadata/maintenance functions | C++ / DuckDB (pinned) / cpp-httplib + yyjson (both duckdb-vendored) / roaring via vcpkg | sqllogictests against the live dev stack + cross-client wire vectors |
 
 The REST contract is `server/src/main/resources/openapi/hoglake.yaml`
@@ -141,7 +145,8 @@ path-scoped per component, posthog-monorepo style:
 | `webui.yml` | every PR and push to main; a `changes` job selects `webui/**`, the OpenAPI spec, the shared vectors, the file itself (REQUIRED CHECK `webui-test`) | `npm run build` (tsc gate) + vitest + PR image boot-smoke + gated `deploy` job |
 | `ci-python.yml` | every PR and push to main; a `changes` job selects `pyhoglake/**`, `hedgerow/**`, `bench/**`, the OpenAPI spec, `ci/**`, the workflow files, and the jobs skip otherwise (REQUIRED CHECK `python-checks`) | pyhoglake: `pyhoglake-checks.yml` (ruff, mypy, pytest on 3.11–3.13, build, wheel smoke test). hedgerow and bench: uv sync, ruff (pinned; bench exempt until its format backlog lands), pytest. Unit tests plus both live client suites through `python-live.yml`; a `python-checks` job fails if any dependency fails |
 | `bench-image.yml` | `bench/**` `pyhoglake/**` | builds `bench/Dockerfile` (context = REPO ROOT: bench installs pyhoglake from the sibling tree, so both must be in the context) and smokes it — CLI runs, non-root, no `.venv`, and the installed pyhoglake is this commit's and not PyPI's. A main push then publishes multi-arch `ghcr.io/posthog/hoglake-bench` (sha + `latest`), gated on the smoke and live client tests. NOT CD: no charts dispatch, no chart references it, it is pulled by hand into `bench/deploy/bench-pod.yaml`. Its build stage is deliberately NOT `$BUILDPLATFORM`-pinned — a virtualenv holds native wheels, so each arch installs its own |
-| `python-live.yml` | reusable: server, Python checks, benchmark image | builds the checked-out server, starts PostgreSQL and MinIO, runs both live client suites, rejects skipped or empty reports, and saves logs and JUnit reports. A failed live run blocks server deployment, PyPI publishing, and benchmark image publishing |
+| `millrace-image.yml` | `millrace/**` `pyhoglake/**` `ci/**` | builds `millrace/Dockerfile` (context = REPO ROOT, same reason as bench) and smokes it — both entrypoints (`millrace`, `python -m millrace.maintenance`) refuse an empty env at config with exit 2, non-root, no `.venv`, pyhoglake is this commit's. A main push publishes multi-arch `ghcr.io/posthog/hoglake-millrace` tagged `r<UTC minute>-<sha6>` (the Kargo release tag; `org.opencontainers.image.revision`/`.source` annotations on the index, verified after push), by sha, and `latest`, gated on the smoke and the live suites. No charts dispatch: a Kargo Warehouse in PostHog/charts subscribes to the repository |
+| `python-live.yml` | reusable: server, Python checks, benchmark image | builds the checked-out server, starts PostgreSQL and MinIO, runs both live client suites (`live` job) and the millrace Kafka-ingestion live suite (`live-millrace` job, which adds apache/kafka to the stack via `ci/live-millrace.sh`), rejects skipped or empty reports, and saves logs and JUnit reports. A failed live run blocks server deployment, PyPI publishing, and benchmark image publishing |
 | `publish-pyhoglake.yml` | `pyhoglake-v*` tags; PRs touching the workflow | `pyhoglake-checks.yml`; tags also publish to PyPI (trusted publishing, `pypi` environment) and create a non-latest GitHub release |
 | `fuzz.yml` | nightly cron + dispatch | `./gradlew fuzz` over every Jazzer target (600s each by default), with the generated corpus accumulated across nights through the actions cache. Not a PR check: PR CI only REPLAYS the committed seed corpus, inside `:test` |
 | `semgrep.yml` | all | python / kotlin+java / general packs, pinned container |
@@ -575,20 +580,15 @@ The rules. Every one of them was violated by the code above.
   of it happens between transactions, never inside one. Read what you
   need, commit, compute, open a new transaction for the write, and
   re-check under it what could have changed (liveness, claims). The
-  test suite is where the rule gets enforced, and today it is opt-in:
-  `PgTestSupport.freshDatabase(productionSession = true)` wires the pool
-  with `Database.SESSION_INIT_SQL`, so the test connection carries
-  production's own bounds — a 60 s `statement_timeout` and a 30 s
-  `idle_in_transaction_session_timeout` — and it is default OFF on
-  purpose, because a suite-wide bound would sit under the six-figure bulk
-  seeds and the drain tests that hold a transaction open across MinIO
-  round trips. A suite-wide guard at
-  `idle_in_transaction_session_timeout = '2s'`, so that a transaction
-  left open across slow work fails the test the way production fails the
-  pod, lands with the compaction planner fix on branch
-  `jakob/compaction-plan-bounded` (PR pending). Either way the rule is
-  the rule: do not raise the value to make a test pass; split the
-  transaction.
+  test suite enforces this with `PgTestSupport`'s default 2 s
+  `idle_in_transaction_session_timeout` guard. Tests that need
+  production's statement bound opt into `productionSession = true`:
+  a 60 s `statement_timeout`, with the default 2 s idle guard still
+  applied. The production statement bound is opt-in because bulk
+  fixtures may take longer on a slow machine. Cleanup's object-store
+  calls happen after its claim commits and before its settle transaction
+  opens, so the idle guard does not constrain them. Do not raise the
+  value to make a test pass; split the transaction.
 - **Measure per-row cost, not per-statement cost.** A statement's
   plan says which index it uses; the per-row cost on production's
   access pattern (random heap reads on a 10M-row table versus PK-order
@@ -1420,9 +1420,55 @@ ran on the local stack and what it showed.
 
 - **Compaction (M4) — 100% implemented**, so what belongs here is only
   what is still deferred. The design — one-pass bin packing, the scaling
-  minimum, the two knobs, the claim, the sorted-heap bound, the typed
-  skips and their measurements — is in server/README.md §Sort orders and
-  compaction, the single home for it.
+  minimum, the two knobs, the claim, the sorted rewrite's external merge
+  sort and its budgets, the typed skips and their measurements — is in
+  server/README.md §Sort orders and compaction, the single home for it.
+  Three rules of the sorted rewrite (hoglake#134) that code elsewhere
+  must not break: (1) a TRUSTED run is `explicit_row_ids AND
+  begin_snapshot >= live sort spec's begin_snapshot` and is never
+  verified — so `commitGroup` refuses a group whose live `sort_id`
+  moved during its rewrite (null <-> non-null included), and anything
+  else that registers `explicit_row_ids = true` would be trusted as
+  sorted; only compaction may. (2) The ORDER GUARANTEE, stated
+  precisely: key order is exact whenever every trusted run is
+  key-nondecreasing; ties are (key, row_id) when every trusted input
+  was itself written that way — true of every output since #134 — and
+  otherwise deterministic but unspecified (pre-#134 outputs broke ties
+  in input order). Nothing may depend on more. (3) The spill directory
+  (`HOGLAKE_COMPACTION_SPILL_DIR`) is private to one hoglake process:
+  startup removes every `hoglake-compaction-spill-*` directory in it,
+  and only those (the prefix is hoglake's own because the default is
+  the shared `java.io.tmpdir`; never shorten it to something another
+  tool could also create). The planner's `spill_budget_exceeded`
+  / `merge_budget_exceeded` call `ExternalMergeSort.admit` rather than
+  restating its arithmetic; keep it that way. `heap_budget_exceeded` is
+  historical (reads 0) and stays on the wire. (4) Every other input of
+  at least `HOGLAKE_COMPACTION_VERIFY_MIN_BYTES` (16 MiB) is VERIFIED
+  by the sortedness pre-pass (`SortednessCheck`: a projected read of
+  its key columns, plus the carrier for an explicit-row-id file, every
+  physical row, stop at the first violation) and, if sorted, is a run
+  candidate like a trusted output; smaller files go straight to the
+  chunk phase (`files_unchecked`). The verdict is used once and never
+  recorded — under one-pass compaction a file is compacted once. The
+  planner's refusals stay worst case (assume nothing verifies); keep
+  them that way, since the planner cannot read files. Key comparison
+  in the file's own domain is only valid while every conversion the
+  rewrite makes preserves order: a new promotion that does not (any
+  unit or scale change) must make the pre-pass refuse that pairing.
+  (5) A prior output whose schema EQUALS the output schema, with no
+  live DV and row groups of at least 32 MiB, is APPENDED byte for byte
+  (`ParquetRewriter.appendRefusal`; on a sorted table only with a first-key
+  range strictly disjoint from every other run's). An appended row never
+  passes the column plan, so a change that makes the decode path alter a
+  value of an IDENTICAL schema (a normalization, a new conversion on an
+  identity column) must add a disqualifier there, and a change to
+  `outputSchema` silently stops existing outputs from appending (slower,
+  not wrong). An unsorted output's row order is not its inputs' order:
+  encoded rows land after the appended row groups. Rows are written by
+  their `RowPlan` straight from the decoded source row; there is no
+  output-shaped copy to hang per-row logic on.
+  Not done, by decision: writer-declared sortedness (a client's
+  declared order is never believed, only its rows), a multi-pass merge.
   Remaining rewrite deferrals (all surface as `unconvertible_schema`
   skips, never wrong bytes): INT96, decimal-scale changes, and
   non-native time(stamp) units — each timestamp type accepts only the

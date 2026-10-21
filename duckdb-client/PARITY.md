@@ -77,7 +77,7 @@ client work not yet done. Last checked against `openapi/hoglake.yaml`
 | Capability | Status | Notes |
 |---|---|---|
 | `AT (VERSION => n)` / `AT (TIMESTAMP => t)` | DONE | per-lookup entries at the historical schema; genuinely-historical reads tested (fixture-exported snapshot ids: V1 shows 3 of head's 5 rows; a pre-ADD-COLUMN read shows the 1-column schema) |
-| Attach-level pins | DONE | SNAPSHOT_VERSION and SNAPSHOT_TIME both tested, including the pin FORCING read-only without an explicit flag (INSERT refused; READ_WRITE+pin refused at attach) and explicit-UTC-offset timestamps parsed with instant semantics on both the AT() and SNAPSHOT_TIME paths; `hoglake_current_snapshot` under a SNAPSHOT_TIME pin errors (closed on the wire: `TableInfo.read_snapshot_id` resolves it; answering from it is client work) |
+| Attach-level pins | DONE | SNAPSHOT_VERSION and SNAPSHOT_TIME both tested, including the pin FORCING read-only without an explicit flag (INSERT refused; READ_WRITE+pin refused at attach) and explicit-UTC-offset timestamps parsed with instant semantics on both the AT() and SNAPSHOT_TIME paths; a SNAPSHOT_TIME pin resolves once per transaction and `hoglake_current_snapshot` returns its resolved ID |
 | `ducklake_snapshots` | DONE | `hoglake_snapshots(cat)` — paginated (fixes ducklake's full-list OOM; `page_size` param, page-boundary crossing tested); typed change rows (content asserted) |
 | `ducklake_table_info` | DONE | `hoglake_table_info(cat)` |
 | `ducklake_current_snapshot` | DONE | `hoglake_current_snapshot(cat)` |

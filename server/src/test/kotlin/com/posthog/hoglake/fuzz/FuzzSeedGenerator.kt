@@ -279,6 +279,21 @@ object FuzzSeedGenerator {
         val out = dir(root, "WireDtoParseFuzzTest", "wireParseFailsOnlyWithMappedExceptions")
         val samples =
             mapOf(
+                "operation_metadata" to """{"author":"fuzz/λ","message":"delete & recreate"}""",
+                "operation_metadata_next_line" to """{"author":"\u0085","message":"reason"}""",
+                "operation_metadata_blank" to """{"author":"\t","message":" "}""",
+                "operation_metadata_missing" to """{"message":"reason"}""",
+                "operation_metadata_null" to """{"author":null,"message":null}""",
+                "operation_metadata_wrong_type" to """{"author":[],"message":42}""",
+                "options_attributed" to """{"snapshot_retention_seconds":60,"author":"fuzz","message":"lower"}""",
+                "namespace_attributed" to """{"name":"ns","author":"fuzz","message":"create"}""",
+                "table_attributed" to """{"name":"t","columns":[{"name":"id","type":"long"}],
+                       "author":"fuzz","message":"create"}""",
+                "view_attributed" to """{"name":"v","sql":"SELECT 1","author":"fuzz","message":"create"}""",
+                "alter_attributed" to """{"ops":[{"op":"rename_table","new_name":"next"}],
+                       "author":"fuzz","message":"rename"}""",
+                "prepare_attributed" to """{"namespace":"ns","name":"t","columns":[{"name":"id","type":"long"}],
+                       "author":"fuzz","message":"create"}""",
                 "commit_full" to
                     """{"read_snapshot":7,"appends":[{"namespace":"ns","table":"t","files":[
                        {"path":"s3://b/f.parquet","record_count":10,"file_size_bytes":1024,
@@ -292,6 +307,8 @@ object FuzzSeedGenerator {
                        {"data_file_id":5,"path":"s3://b/dv.puffin","delete_count":3,
                         "file_size_bytes":99}]}]}""",
                 "commit_empty" to """{}""",
+                "snapshot_resolution" to
+                    """{"snapshot_id":9007199254740993,"snapshot_time":"2026-02-01T02:01:00+02:00"}""",
                 // A footer-shipping registration's split_offsets: one the
                 // contract accepts, and one it refuses (unsorted, and the
                 // last entry at file_size_bytes).
@@ -487,9 +504,9 @@ object FuzzSeedGenerator {
     // ---- table creation definition codec ---------------------------------------
 
     /**
-     * One seed per stored format version, 0 through 6.
+     * One seed per stored format version, 0 through 7.
      *
-     * Versions 1-6 are produced BY the codec, so a seed can never claim
+     * Versions 1-7 are produced BY the codec, so a seed can never claim
      * a shape the encoder does not actually write; version 0 is the
      * pre-versioned receipt (JVM enum names, `typeParams`), which no
      * encoder emits any more and which only a hand-written fixture can
@@ -532,6 +549,18 @@ object FuzzSeedGenerator {
                         columns = listOf(scalar.copy(comment = "the id"), nested),
                         comment = "a table",
                         properties = mapOf("owner.team" to "data"),
+                    ),
+                7 to
+                    base.copy(
+                        columns = listOf(scalar.copy(comment = "the id"), nested),
+                        comment = "attributed replacement",
+                        properties = mapOf("owner.team" to "data"),
+                        partitionFields = listOf(PartitionFieldDef(1L, Transform.IDENTITY)),
+                        sortFields = listOf(SortFieldDef(1L, SortDirection.ASC, NullOrder.NULLS_LAST)),
+                        replacement =
+                            ReplacementTarget(UUID.fromString("123e4567-e89b-12d3-a456-426614174000"), 12L),
+                        author = "fuzz/λ",
+                        message = "replace & rebuild",
                     ),
             )
         for ((version, definition) in byVersion) {

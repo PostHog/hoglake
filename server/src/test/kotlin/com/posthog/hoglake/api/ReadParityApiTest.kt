@@ -24,6 +24,7 @@ import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
+import java.time.Instant
 
 /**
  * Wire-level tests for the read-parity surface: the changefeed's
@@ -172,7 +173,10 @@ class ReadParityApiTest {
                 .containsExactly("top")
 
             // DELETE returns the recording snapshot; the view is then 404.
-            val dropped = client.delete("/v1/catalogs/vw/namespaces/ns/views/top")
+            val dropped =
+                client.delete(
+                    "/v1/catalogs/vw/namespaces/ns/views/top?author=integration-test&message=drop-fixture",
+                )
             assertThat(dropped.status).isEqualTo(HttpStatusCode.OK)
             assertThat(body(dropped)["snapshot_id"].asLong()).isEqualTo(4)
             assertApiError(
@@ -249,6 +253,154 @@ class ReadParityApiTest {
             }
             assertApiError(
                 client.get("/v1/catalogs/ls/namespaces/ns/tables?snapshot=1"),
+                HttpStatusCode.Gone,
+                "expired",
+            )
+        }
+
+    @Test
+    fun `snapshot resolution is scoped to its catalog`() =
+        api { client ->
+            client.seed("resolve-own")
+            client.seed("resolve-other")
+            client.postJson("/v1/catalogs/resolve-other/namespaces", """{"name":"later"}""")
+            val response =
+                client.get(
+                    "/v1/catalogs/resolve-own/snapshots/resolve?at_timestamp=2999-01-01T00:00:00Z",
+                )
+            assertThat(response.status).isEqualTo(HttpStatusCode.OK)
+            assertThat(body(response)["snapshot_id"].asLong()).isEqualTo(2L)
+        }
+
+    @Test
+    fun `snapshot resolution works without a table or namespace`() =
+        api { client ->
+            client.postJson(
+                "/v1/catalogs",
+                """{"name":"resolve-empty","data_path":"s3://hog/resolve-empty"}""",
+            )
+            val initialTime =
+                db.jdbi.withHandleUnchecked { h ->
+                    h.createQuery(
+                        """
+                        SELECT snapshot_time FROM hog_snapshot
+                        WHERE catalog_id = (SELECT catalog_id FROM hog_catalog WHERE name = 'resolve-empty')
+                          AND snapshot_id = 0
+                        """,
+                    ).map { rs, _ ->
+                        rs.getObject("snapshot_time", java.time.OffsetDateTime::class.java).toInstant()
+                    }.one()
+                }
+            val response =
+                client.get(
+                    "/v1/catalogs/resolve-empty/snapshots/resolve?at_timestamp=2999-01-01T00:00:00Z",
+                )
+            assertThat(response.status).isEqualTo(HttpStatusCode.OK)
+            val resolved = body(response)
+            assertThat(resolved["snapshot_id"].asLong()).isEqualTo(0L)
+            assertThat(Instant.parse(resolved["snapshot_time"].asText())).isEqualTo(initialTime)
+        }
+
+    @Test
+    fun `snapshot resolution returns the retained identity and recorded time`() =
+        api { client ->
+            client.seed("resolve")
+            db.jdbi.withHandleUnchecked { h ->
+                h.execute(
+                    """
+                    UPDATE hog_snapshot SET snapshot_time = timestamptz '2026-02-01T00:00:00Z'
+                        + snapshot_id * interval '1 minute'
+                    WHERE catalog_id = (SELECT catalog_id FROM hog_catalog WHERE name = 'resolve')
+                    """,
+                )
+            }
+            val url = "/v1/catalogs/resolve/snapshots/resolve"
+            for ((timestamp, expected) in listOf(
+                "2026-02-01T00:00:00Z" to 0L,
+                "2026-02-01T00:01:00Z" to 1L,
+                "2026-02-01T00:01:30Z" to 1L,
+                "2026-02-01T02:01:00%2B02:00" to 1L,
+                "2999-01-01T00:00:00Z" to 2L,
+            )) {
+                val response = client.get("$url?at_timestamp=$timestamp")
+                assertThat(response.status).isEqualTo(HttpStatusCode.OK)
+                val resolved = body(response)
+                assertThat(resolved.fieldNames().asSequence().toList()).containsExactlyInAnyOrder(
+                    "snapshot_id",
+                    "snapshot_time",
+                )
+                assertThat(resolved["snapshot_id"].asLong()).isEqualTo(expected)
+                assertThat(Instant.parse(resolved["snapshot_time"].asText()))
+                    .isEqualTo(Instant.parse("2026-02-01T00:00:00Z").plusSeconds(expected * 60))
+            }
+
+            db.jdbi.withHandleUnchecked { h ->
+                h.execute("UPDATE hog_catalog SET earliest_snapshot_id = 2 WHERE name = 'resolve'")
+            }
+            assertApiError(
+                client.get("$url?at_timestamp=2026-02-01T00:01:00Z"),
+                HttpStatusCode.Gone,
+                "expired",
+            )
+            val floor = body(client.get("$url?at_timestamp=2026-02-01T00:02:00Z"))
+            assertThat(floor["snapshot_id"].asLong()).isEqualTo(2L)
+        }
+
+    @Test
+    fun `snapshot resolution uses ID order when recorded times regress`() =
+        api { client ->
+            client.seed("resolve-clock")
+            db.jdbi.withHandleUnchecked { h ->
+                h.execute(
+                    """
+                    UPDATE hog_snapshot SET snapshot_time = timestamptz '2026-02-01T00:00:00Z'
+                        + CASE snapshot_id WHEN 1 THEN 2 ELSE snapshot_id / 2 END * interval '1 minute'
+                    WHERE catalog_id = (SELECT catalog_id FROM hog_catalog WHERE name = 'resolve-clock')
+                    """,
+                )
+            }
+            val resolved =
+                body(
+                    client.get("/v1/catalogs/resolve-clock/snapshots/resolve?at_timestamp=2026-02-01T00:03:00Z"),
+                )
+            assertThat(resolved["snapshot_id"].asLong()).isEqualTo(2L)
+            assertThat(Instant.parse(resolved["snapshot_time"].asText()))
+                .isEqualTo(Instant.parse("2026-02-01T00:01:00Z"))
+            db.jdbi.withHandleUnchecked { h ->
+                h.execute(
+                    """
+                    UPDATE hog_snapshot SET snapshot_time = timestamptz '2026-02-01T00:01:00Z'
+                    WHERE catalog_id = (SELECT catalog_id FROM hog_catalog WHERE name = 'resolve-clock')
+                    """,
+                )
+            }
+            val tied =
+                body(
+                    client.get("/v1/catalogs/resolve-clock/snapshots/resolve?at_timestamp=2026-02-01T00:01:00Z"),
+                )
+            assertThat(tied["snapshot_id"].asLong()).isEqualTo(2L)
+        }
+
+    @Test
+    fun `snapshot resolution rejects invalid timestamps and unknown catalogs`() =
+        api { client ->
+            client.seed("resolve-errors")
+            val url = "/v1/catalogs/resolve-errors/snapshots/resolve"
+            for (query in listOf(
+                "",
+                "?at_timestamp=",
+                "?at_timestamp=yesterday",
+                "?at_timestamp=2026-02-01T00:00:00",
+            )) {
+                assertApiError(client.get(url + query), HttpStatusCode.BadRequest, "bad_request")
+            }
+            assertApiError(
+                client.get("/v1/catalogs/missing/snapshots/resolve?at_timestamp=2999-01-01T00:00:00Z"),
+                HttpStatusCode.NotFound,
+                "not_found",
+            )
+            assertApiError(
+                client.get("$url?at_timestamp=1900-01-01T00:00:00Z"),
                 HttpStatusCode.Gone,
                 "expired",
             )

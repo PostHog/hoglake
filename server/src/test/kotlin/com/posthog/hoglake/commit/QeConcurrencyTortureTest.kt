@@ -143,7 +143,16 @@ class QeConcurrencyTortureTest {
                                         listOf(ColumnDef("id", ColType.LONG)),
                                     )
                                 }
-                            1 -> tolerate(errors) { catalogs.dropTable(cat, "ns", table) }
+                            1 ->
+                                tolerate(errors) {
+                                    catalogs.dropTable(
+                                        cat,
+                                        "ns",
+                                        table,
+                                        author = "integration-test",
+                                        message = "drop table fixture",
+                                    )
+                                }
                             2 ->
                                 tolerate(errors) {
                                     alters.alterTable(
@@ -278,7 +287,7 @@ class QeConcurrencyTortureTest {
                     tolerate(errors) {
                         catalogs.createTable(cat, "ns", "d", listOf(ColumnDef("id", ColType.LONG)))
                         commits.commit(cat, appendReq(cat, "d", listOf(5L)))
-                        catalogs.dropTable(cat, "ns", "d")
+                        catalogs.dropTable(cat, "ns", "d", author = "integration-test", message = "drop table fixture")
                         gen++
                     }
                     Thread.sleep(40)
@@ -388,7 +397,7 @@ class QeConcurrencyTortureTest {
                     tolerate(errors) {
                         catalogs.createTable(cat, "ns", "d", listOf(ColumnDef("id", ColType.LONG)))
                         commits.commit(cat, appendReq(cat, "d", listOf(3L, 0L)))
-                        catalogs.dropTable(cat, "ns", "d")
+                        catalogs.dropTable(cat, "ns", "d", author = "integration-test", message = "drop table fixture")
                     }
                     Thread.sleep(25)
                 }

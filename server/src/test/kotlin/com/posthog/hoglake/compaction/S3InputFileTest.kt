@@ -117,6 +117,96 @@ class S3InputFileTest {
     }
 
     @Test
+    fun `the sortedness pre-pass's key source fetches the key column, not the file`() {
+        // The pre-pass reads only `id`'s column chunk. Its ranged read is
+        // padded to the readahead: at the merge's 8 MiB that is the rest
+        // of the file (the payload column after it); at
+        // KEY_COLUMN_READAHEAD_BYTES it is the chunk plus at most that.
+        val path = sampleFile()
+        val bytes = Files.readAllBytes(path)
+        val (idChunk, payload) =
+            ParquetFileReader.open(LocalInputFile(path)).use { r ->
+                val cols = r.footer.blocks.flatMap { it.columns }
+                cols.filter { it.path.toDotString() == "id" }.sumOf { it.totalSize } to
+                    cols.filter { it.path.toDotString() == "payload" }.sumOf { it.totalSize }
+            }
+
+        fun fetchedWith(readahead: Int): Long {
+            val store = FakeStore(bytes)
+            val s3 = S3InputFile(store, "s3://b/k.parquet", bytes.size.toLong(), footerSizeOf(path), readahead)
+            val sorted =
+                ParquetFileReader.open(s3).use { reader ->
+                    SortednessCheck.isSorted(
+                        ParquetRewriter.Input(s3, "k", 0),
+                        reader,
+                        listOf(
+                            com.posthog.hoglake.model.SortFieldDef(
+                                1,
+                                com.posthog.hoglake.model.SortDirection.ASC,
+                                com.posthog.hoglake.model.NullOrder.NULLS_LAST,
+                            ),
+                        ),
+                    )
+                }
+            assertThat(sorted).isTrue()
+            // Everything but the footer prefetch.
+            return store.ranges.drop(1).sumOf { it.second.toLong() }
+        }
+        assertThat(fetchedWith(S3InputFile.DEFAULT_READAHEAD_BYTES))
+            .describedAs("the merge's readahead over-reads into the payload")
+            .isGreaterThan(idChunk + payload / 2)
+        assertThat(fetchedWith(S3InputFile.KEY_COLUMN_READAHEAD_BYTES))
+            .isLessThanOrEqualTo(idChunk + S3InputFile.KEY_COLUMN_READAHEAD_BYTES)
+    }
+
+    @Test
+    fun `a data stream does not prefetch the footer, and the append uses one`() {
+        val path = sampleFile()
+        val bytes = Files.readAllBytes(path)
+        val store = FakeStore(bytes)
+        val s3 = S3InputFile(store, "s3://b/k.parquet", bytes.size.toLong(), footerSizeOf(path))
+        s3.newDataStream().use { assertThat(store.ranges).describedAs("no read before the first byte").isEmpty() }
+        s3.newStream().use { assertThat(store.ranges).describedAs("newStream prefetches the tail").hasSize(1) }
+
+        // The byte-level append (package D1): the open reader has the
+        // footer already, so appending must not GET the tail again.
+        val live =
+            listOf(
+                com.posthog.hoglake.model.Column(
+                    1,
+                    0,
+                    com.posthog.hoglake.model.ColumnDef("k", com.posthog.hoglake.model.ColType.LONG),
+                ),
+            )
+        val client = tmp.resolve("append-client.parquet")
+        val clientSchema =
+            Types.buildMessage().addField(
+                Types.optional(PrimitiveTypeName.INT64).id(1).named("k"),
+            ).named("t")
+        ExampleParquetWriter.builder(LocalOutputFile(client)).withType(clientSchema).build().use { w ->
+            val f = SimpleGroupFactory(clientSchema)
+            repeat(5_000) { w.write(f.newGroup().append("k", it.toLong())) }
+        }
+        val prior = tmp.resolve("append-prior.parquet")
+        rewriteToLocal(listOf(localInput(client, 0)), live, emptyList(), prior)
+        val priorBytes = Files.readAllBytes(prior)
+        val priorStore = FakeStore(priorBytes)
+        val source = S3InputFile(priorStore, "s3://b/prior.parquet", priorBytes.size.toLong(), footerSizeOf(prior))
+        ParquetFileReader.open(source).use { reader ->
+            val tail = priorStore.ranges.single()
+            priorStore.ranges.clear()
+            val out = tmp.resolve("append-out.parquet")
+            ParquetRewriter.writingTo(
+                LocalOutputFile(out),
+                ParquetRewriter.outputSchema(live),
+                ParquetRewriter.OutputCodec(),
+            ) { w -> w.appendRowGroups(source, reader, flushPending = false) }
+            assertThat(priorStore.ranges).describedAs("the append re-read the footer tail").doesNotContain(tail)
+            assertThat(rowCount(LocalInputFile(out))).isEqualTo(5_000)
+        }
+    }
+
+    @Test
     fun `a correct footer hint serves the open from one ranged read`() {
         val path = sampleFile()
         val bytes = Files.readAllBytes(path)

@@ -341,6 +341,47 @@ def _check_temporal(transform: str, col_type: str) -> None:
         )
 
 
+def check_transform(transform: str, col_type: str, param: int | None = None) -> None:
+    """Refuse a (transform, source type, param) triple the server's
+    ``set_partition_spec`` would 422 — without a value: the vocabulary
+    (the server's ``Transform`` enum: identity, bucket, year, month,
+    day, hour — ``truncate`` exists in this module for value transforms
+    but is NOT a server partition transform and is refused here), the
+    bucket param, the bucketable gate and the temporal-type gate, in
+    this client's words. ``identity`` takes any scalar type.
+
+    Stricter than the server in one place: ``hour(date)`` is refused
+    here (a date has no hour) though the server admits any
+    date-or-timestamp source for every temporal transform. Raises
+    :class:`ValidationError`."""
+    if transform == "identity":
+        if param is not None:
+            raise ValidationError("identity transform does not take transform_param")
+        return
+    if transform == "bucket":
+        if not isinstance(param, int) or param <= 0:
+            raise ValidationError(
+                f"bucket requires a positive bucket count, got {param!r}"
+            )
+        if col_type not in _BUCKETABLE:
+            raise ValidationError(
+                f"bucket cannot be applied to column type {col_type!r} "
+                f"(Iceberg spec: bucketable types are {sorted(_BUCKETABLE)})"
+            )
+        return
+    if transform in ("year", "month", "day", "hour"):
+        if param is not None:
+            raise ValidationError(
+                f"{transform} transform does not take transform_param"
+            )
+        _check_temporal(transform, col_type)
+        return
+    raise ValidationError(
+        f"unknown partition transform {transform!r} (the server's transforms "
+        f"are identity, bucket, year, month, day, hour)"
+    )
+
+
 def transform_value(
     transform: str,
     param: int | None,

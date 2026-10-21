@@ -1,5 +1,7 @@
 # Hoglake — a lakehouse catalog as a service
 
+![Hoglake logo](./images/hoglake.png)
+
 [![Server](https://img.shields.io/github/actions/workflow/status/PostHog/hoglake/server.yml?branch=main&label=server)](https://github.com/PostHog/hoglake/actions/workflows/server.yml)
 [![Webui](https://img.shields.io/github/actions/workflow/status/PostHog/hoglake/webui.yml?branch=main&label=webui)](https://github.com/PostHog/hoglake/actions/workflows/webui.yml)
 [![CI python](https://img.shields.io/github/actions/workflow/status/PostHog/hoglake/ci-python.yml?branch=main&label=python)](https://github.com/PostHog/hoglake/actions/workflows/ci-python.yml)

@@ -807,9 +807,9 @@ data class Config(
      * the planner's candidate read is bounded by that product times
      * this. The multiplier absorbs the candidates that turn out not to
      * be groupable — a bucket's short remainder, a group a sibling
-     * replica claims, a group the sorted row ceiling closes short — so
-     * a sweep plans as many groups as it can execute. See
-     * CompactionConfig.candidateHeadroom.
+     * replica claims, a group the spill or merge budget refuses in
+     * metadata — so a sweep plans as many groups as it can execute.
+     * See CompactionConfig.candidateHeadroom.
      */
     val compactionCandidateHeadroom: Int =
         env(
@@ -873,7 +873,8 @@ data class Config(
      * an eye on HOGLAKE_COMPACTION_SORTED_HEAP_BYTES — the sorted path's
      * heap budget is DIVIDED by this value so N concurrent sorted groups
      * cannot exceed what one was allowed, which makes every sorted
-     * table's groups proportionally smaller. See
+     * group's chunks smaller (more spill files) — and on the spill volume,
+     * since HOGLAKE_COMPACTION_SPILL_BYTES is per group. See
      * CompactionConfig.parallelGroups.
      */
     val compactionParallelGroups: Int =
@@ -945,14 +946,15 @@ data class Config(
             "${com.posthog.hoglake.compaction.CompactionConfig.DEFAULT_COMMITTED_CLAIM_TTL_SECONDS}",
         ).toLong(),
     /**
-     * Sorted-path heap derate for NESTED tables: the sorted ROW CEILING
-     * of a table with both nested columns and a live sort order is
-     * divided by this. The sorted path materializes a whole group to
-     * sort it, and a nested row's node count is not knowable from the
-     * catalog (list lengths are data) — measured at 30-70x its
-     * compressed bytes — so the per-node accounting below cannot see it.
-     * 1 disables the derate, which is the setting to reach for only with
-     * a heap sized for it. See CompactionConfig.nestedSortExpansion.
+     * Sorted-path CHUNK derate for NESTED tables: the rows per spill
+     * chunk of a table with both nested columns and a live sort order is
+     * divided by this. A chunk is materialized to be sorted, and a nested
+     * row's node count is not knowable from the catalog (list lengths
+     * are data) — measured at 30-70x its compressed bytes — so the
+     * per-node accounting below cannot see it. 1 disables the derate,
+     * which is the setting to reach for only with a heap sized for it.
+     * Sizes chunks only; groups pack to the byte target. See
+     * CompactionConfig.nestedSortExpansion.
      */
     val compactionNestedSortExpansion: Int =
         env(
@@ -960,28 +962,71 @@ data class Config(
             "${com.posthog.hoglake.compaction.CompactionConfig.DEFAULT_NESTED_SORT_EXPANSION}",
         ).toInt(),
     /**
-     * How much HEAP one group's sorted-path materialization may take,
-     * default 1 GiB. This — not compaction_target_bytes — is the
-     * sorted path's bound: the planner converts it to a row ceiling
-     * using the live schema's node count, and converts THAT back to a
-     * group byte budget using the table's own observed bytes-per-row.
+     * How much HEAP one sorted rewrite may hold, per phase (divided by
+     * HOGLAKE_COMPACTION_PARALLEL_GROUPS), default 1 GiB. A sorted rewrite
+     * is an external merge sort: it bounds the CHUNK (rows sorted in
+     * memory before each spill, via the live schema's node count) and
+     * the MERGE (one row group per run; trusted runs admitted largest
+     * first, the rest demoted to the spill path). It no longer bounds the
+     * group, which packs to HOGLAKE_COMPACTION_TARGET_BYTES.
      *
-     * The default is the largest value that is safe on the maintenance
-     * pod AS IT IS TODAY (4 GiB, so ~2.8 GiB of heap at the image's
-     * MaxRAMPercentage=70): worst-case peak ~1260 MiB, 44% of that heap.
-     * Raise it only together with the pod's memory — on a bigger pod the
-     * group bytes it buys scale linearly (server/README.md has the
-     * ladder), and raising it WITHOUT the pod turns a counted refusal
-     * back into the OOM it replaced.
-     *
-     * TEMPORARY. The bound exists only because the sorted rewrite sorts
-     * a whole group in memory; an external merge sort removes it
-     * entirely. See CompactionConfig.sortedHeapBytes.
+     * The default fits the 4 GiB maintenance pod (~2.8 GiB of heap at
+     * the image's MaxRAMPercentage=70): worst-case process peak ~1614
+     * MiB, 56% of that heap — the chunk phase with a target-sized input
+     * row group (or the merge: the budget, the output writer's buffered
+     * row group, flat at ~140 MiB, and the S3 part buffer), plus the
+     * hydrator's whole-object ceiling. Raise it only together
+     * with the pod's memory (server/README.md has the pod table); it buys
+     * fewer spill files and more trusted runs read in place.
+     * See CompactionConfig.sortedHeapBytes.
      */
     val compactionSortedHeapBytes: Long =
         env(
             "HOGLAKE_COMPACTION_SORTED_HEAP_BYTES",
             "${com.posthog.hoglake.compaction.CompactionConfig.DEFAULT_SORTED_HEAP_BYTES}",
+        ).toLong(),
+    /**
+     * Local bytes ONE sorted rewrite may spill, default 4 GiB. Per group:
+     * size the spill volume (the chart's `tmpSizeLimit`) as
+     * HOGLAKE_COMPACTION_PARALLEL_GROUPS x this, with margin. In-process
+     * because an emptyDir overrun is a pod EVICTION, not a write error:
+     * a group whose registered spill input exceeds it is refused in
+     * metadata (`spill_budget_exceeded`), and a rewrite whose actual spill
+     * would cross it stops and discards its output. Expected use is under
+     * ~0.9 GiB per 512 MiB group of zstd client inputs.
+     * See CompactionConfig.spillBytes.
+     */
+    val compactionSpillBytes: Long =
+        env(
+            "HOGLAKE_COMPACTION_SPILL_BYTES",
+            "${com.posthog.hoglake.compaction.CompactionConfig.DEFAULT_SPILL_BYTES}",
+        ).toLong(),
+    /**
+     * Where sorted rewrites stage spill files, default `java.io.tmpdir`
+     * (the chart's `/tmp` emptyDir). Must exist, be writable and be
+     * PRIVATE to this process: checked at boot on a pod whose compaction
+     * loop runs, and swept of `hoglake-compaction-spill-*` leftovers there once at startup.
+     * See CompactionConfig.spillDir.
+     */
+    val compactionSpillDir: String = env("HOGLAKE_COMPACTION_SPILL_DIR", System.getProperty("java.io.tmpdir")),
+    /**
+     * The smallest registered input a sorted rewrite verifies as already
+     * sorted, default 16 MiB (the spill block); 0 verifies every input of
+     * known size. Below it a file goes straight to the chunk phase.
+     * Verifying costs `1 + keys x row groups` ranged GETs (the footer, then
+     * each non-adjacent key column chunk of each row group), and a file
+     * that becomes a run is reopened for the merge (a second footer read);
+     * the chunk path costs one read plus one local spill write and read.
+     * A writer with many small row groups (DuckDB's 122,880-row default:
+     * 40+ in a 500 MB file) multiplies the GETs. At 16 MiB
+     * the local round trip costs about what the extra open does, and
+     * below it the chunk path wins outright. See
+     * CompactionConfig.verifyMinBytes.
+     */
+    val compactionVerifyMinBytes: Long =
+        env(
+            "HOGLAKE_COMPACTION_VERIFY_MIN_BYTES",
+            "${com.posthog.hoglake.compaction.CompactionConfig.DEFAULT_VERIFY_MIN_BYTES}",
         ).toLong(),
     /**
      * Per-ROW node budget for the compaction rewrite. Bounds one row's
@@ -1028,6 +1073,28 @@ data class Config(
 ) {
     init {
         checkRemovedEnv(System::getenv)
+        // THE SPILL DIRECTORY IS CHECKED AT BOOT, and only where the
+        // compaction loop runs — priced per workload like the pool check
+        // below, because an API pod with the loop off may legitimately
+        // have no writable volume. Where the loop runs, a directory that
+        // is missing or read-only is not a boot-time curiosity: every
+        // sorted group's first spill throws NoSuchFileException or
+        // AccessDeniedException, the sweep counts it `failed_groups`, and
+        // re-plans it every interval forever while the pod looks
+        // healthy. The byte bound is checked unconditionally; it costs
+        // nothing.
+        require(compactionSpillBytes >= 1) {
+            "HOGLAKE_COMPACTION_SPILL_BYTES=$compactionSpillBytes must be at least 1 (the default is " +
+                "${com.posthog.hoglake.compaction.CompactionConfig.DEFAULT_SPILL_BYTES})"
+        }
+        require(compactionVerifyMinBytes >= 0) {
+            "HOGLAKE_COMPACTION_VERIFY_MIN_BYTES=$compactionVerifyMinBytes must not be negative " +
+                "(0 verifies every input of known size; the default is " +
+                "${com.posthog.hoglake.compaction.CompactionConfig.DEFAULT_VERIFY_MIN_BYTES})"
+        }
+        if (compactionIntervalMs > 0) {
+            com.posthog.hoglake.compaction.SpillDirectory.requireUsable(java.nio.file.Path.of(compactionSpillDir))
+        }
         // Concurrent compaction takes connections out of the pool the
         // FOREGROUND shares, and it holds each one across a commit-lock
         // wait. Refuse a configuration where it could take enough of

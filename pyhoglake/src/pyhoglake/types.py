@@ -110,6 +110,7 @@ trip to be refused.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import pyarrow as pa
@@ -570,6 +571,33 @@ def schema_to_column_defs(schema: pa.Schema) -> list[dict[str, Any]]:
             f"column nesting depth {depth} exceeds the maximum "
             f"{MAX_COLUMN_NESTING_DEPTH} (a top-level column is depth 1)"
         )
+    return out
+
+
+def column_def_field_ids(defs: Sequence[Mapping[str, Any]]) -> dict[str, int]:
+    """The field ids the server WILL assign to ``defs`` (a
+    ``CreateTableRequest`` column list): depth-first pre-order starting
+    at 1, each container's ``children`` numbered right after it, keyed by
+    dotted path (``a``, ``a.b``, ``items.element``, ``m.key``). The
+    server's contract for the initial ``partition_fields`` /
+    ``sort_fields`` of an atomic creation, which name columns by id
+    before any exist — this is what lets a client resolve a column NAME
+    to that id and create a partitioned table in one request.
+    """
+    out: dict[str, int] = {}
+    counter = 0
+
+    def walk(cols: Sequence[Mapping[str, Any]], prefix: str) -> None:
+        nonlocal counter
+        for col in cols:
+            counter += 1
+            path = f"{prefix}{col['name']}"
+            out[path] = counter
+            kids = col.get("children")
+            if kids:
+                walk(kids, path + ".")
+
+    walk(defs, "")
     return out
 
 

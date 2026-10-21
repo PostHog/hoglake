@@ -54,10 +54,21 @@ class CatalogInfo:
     data_path: str
     head_snapshot_id: int
     schema_version: int
+    #: The server's advertised feature set for this catalog (the wire's
+    #: ``capabilities``: ``atomic-partitioned-table-creation-v1`` and
+    #: friends). Empty against a server too old to advertise any, which
+    #: is how a client learns to take the fallback path rather than
+    #: assume a feature.
+    capabilities: tuple[str, ...] = ()
 
     @classmethod
     def from_wire(cls, d: dict[str, Any]) -> CatalogInfo:
-        return _wire("CatalogInfo", d, lambda d: cls(**_pick(cls, d)))
+        def build(d: Mapping[str, Any]) -> CatalogInfo:
+            kw = dict(_pick(cls, d))
+            kw["capabilities"] = tuple(str(c) for c in (d.get("capabilities") or ()))
+            return cls(**kw)
+
+        return _wire("CatalogInfo", d, build)
 
 
 @dataclass(frozen=True)
@@ -107,6 +118,25 @@ class SnapshotChange:
     @classmethod
     def from_wire(cls, d: dict[str, Any]) -> SnapshotChange:
         return _wire("SnapshotChange", d, lambda d: cls(**_pick(cls, d)))
+
+
+@dataclass(frozen=True)
+class SnapshotResolution:
+    snapshot_id: int
+    snapshot_time: datetime
+
+    @classmethod
+    def from_wire(cls, d: dict[str, Any]) -> SnapshotResolution:
+        def build(d: Mapping[str, Any]) -> SnapshotResolution:
+            snapshot_id = d["snapshot_id"]
+            if type(snapshot_id) is not int or not 0 <= snapshot_id <= 2**63 - 1:
+                raise ValueError("snapshot_id must be a non-negative int64")
+            snapshot_time = _parse_dt(d["snapshot_time"])
+            if snapshot_time.tzinfo is None:
+                raise ValueError("snapshot_time must include a UTC offset")
+            return cls(snapshot_id=snapshot_id, snapshot_time=snapshot_time)
+
+        return _wire("SnapshotResolution", d, build)
 
 
 @dataclass(frozen=True)
@@ -290,6 +320,13 @@ class SortField:
     @classmethod
     def from_wire(cls, d: dict[str, Any]) -> SortField:
         return _wire("SortField", d, lambda d: cls(**_pick(cls, d)))
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "source_field_id": self.source_field_id,
+            "direction": self.direction,
+            "null_order": self.null_order,
+        }
 
 
 @dataclass(frozen=True)

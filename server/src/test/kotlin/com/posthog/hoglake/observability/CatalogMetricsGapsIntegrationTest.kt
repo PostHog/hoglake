@@ -227,8 +227,8 @@ class CatalogMetricsGapsIntegrationTest {
 
         publishMaintenanceSample(db.jdbi, TARGET)
 
-        catalogs.dropTable(CAT, "ns", "gone")
-        catalogs.dropTable(CAT, "ns", "gone2")
+        catalogs.dropTable(CAT, "ns", "gone", author = "integration-test", message = "drop table fixture")
+        catalogs.dropTable(CAT, "ns", "gone2", author = "integration-test", message = "drop table fixture")
         alter.alterTable(CAT, "ns", "oldname", listOf(AlterOp.RenameTable("newname")))
 
         // `late`: created and filled after the generation's snapshot.

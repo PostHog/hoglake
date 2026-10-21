@@ -1,11 +1,11 @@
 plugins {
-    kotlin("jvm") version "2.4.20"
+    kotlin("jvm") version "2.4.21"
     application
     id("org.jlleitschuh.gradle.ktlint") version "12.1.2"
 }
 
 group = "com.posthog.hoglake"
-version = "1.3.11-dev"
+version = "1.3.12-dev"
 
 repositories {
     mavenCentral()
@@ -25,10 +25,10 @@ val jdbiVersion = "3.55.0"
 // the transactional lock through the typed configuration extension. See
 // the comment there — losing that setting HANGS every migration rather
 // than failing it.
-val flywayVersion = "13.9.0"
+val flywayVersion = "13.10.0"
 // >= 1.21.1: older versions pin Docker API 1.32, which OrbStack's Docker 29 rejects.
 val testcontainersVersion = "1.21.4"
-val awsSdkVersion = "2.55.11"
+val awsSdkVersion = "2.55.14"
 
 dependencies {
     // Background loops (BackgroundLoops.kt): explicit pin of the
@@ -46,7 +46,7 @@ dependencies {
     implementation("com.fasterxml.jackson.datatype:jackson-datatype-jsr310:2.22.3")
 
     // Persistence
-    implementation("org.postgresql:postgresql:42.7.13")
+    implementation("org.postgresql:postgresql:42.7.14")
     implementation("com.zaxxer:HikariCP:7.1.0")
     implementation("org.jdbi:jdbi3-core:$jdbiVersion")
     implementation("org.jdbi:jdbi3-kotlin:$jdbiVersion")
@@ -99,7 +99,7 @@ dependencies {
     // Compaction applies DVs at rewrite time (PuffinDeletionVector.kt), and
     // the Java RoaringBitmap serialize/deserialize format IS the portable
     // interoperable format the spec requires.
-    implementation("org.roaringbitmap:RoaringBitmap:1.6.23")
+    implementation("org.roaringbitmap:RoaringBitmap:1.6.24")
 
     // Logging + observability
     implementation("ch.qos.logback:logback-classic:1.6.5")

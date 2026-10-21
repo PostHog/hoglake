@@ -144,24 +144,6 @@ object PgTestSupport {
      *
      * # WHAT IT DOES NOT REACH
      *
-     * Two things, both measured rather than suspected, so this bound's
-     * green is not read as a proof it does not carry.
-     *
-     * **`CleanupService`/`RemovalStore` still hold a transaction across
-     * object-store calls**, and they say so: `Database`'s
-     * `SESSION_INIT_SQL_IDLE_TIMEOUT` KDoc states that "a connection
-     * awaiting an S3 response IS idle in transaction", and the drain
-     * derives its SDK budget from that 30 s bound —
-     * `CleanupService.callBoundFor()` is
-     * `min(idle timeout, admission) / 3` = 10 s, FIVE TIMES this bound.
-     * `CleanupServiceIntegrationTest` is green at 2 s only because the
-     * Testcontainers MinIO answers in milliseconds, so that fixture is a
-     * latent flake whose failure message would be about the machine
-     * rather than about the code. It is known debt with its own
-     * follow-up; a session timeout is not the instrument that will catch
-     * it, and the `pg_stat_activity` assertion in
-     * `CompactionPlannerBoundedIntegrationTest` is the shape that would.
-     *
      * **Five fixtures are outside this guard entirely**, and
      * legitimately: `ApiIntegrationTest`, `HealthProbeIntegrationTest`,
      * `RequestDispatchIntegrationTest`, `DbPoolGaugesIntegrationTest`

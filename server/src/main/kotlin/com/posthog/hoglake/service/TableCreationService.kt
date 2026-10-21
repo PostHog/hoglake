@@ -36,6 +36,8 @@ data class TableCreationDefinition(
     val sortFields: List<SortFieldDef> = emptyList(),
     val comment: String? = null,
     val properties: Map<String, String> = emptyMap(),
+    val author: String? = null,
+    val message: String? = null,
 )
 
 data class TableCreation(
@@ -75,7 +77,7 @@ class TableCreationService(
         definition: TableCreationDefinition,
     ): TableCreation {
         var replay = false
-        return observed("prepare", catalog, operationId, { if (replay) "replayed" else it.state }) {
+        return observed("prepare", catalog, operationId, { if (replay) "replayed" else it.state }, { definition }) {
             operationTransaction { h ->
                 val cat = CatalogRepo.require(h, catalog)
                 val encoded = TableCreationDefinitionCodec.encode(definition)
@@ -102,6 +104,7 @@ class TableCreationService(
                     NamespaceRepo.findLiveByName(h, cat.catalogId, definition.namespace)
                         ?: throw HoglakeException.NotFound("namespace '${definition.namespace}'")
                 definition.replacement?.let {
+                    if (it.expectedTableUuid != null) requireOperationMetadata(definition.author, definition.message)
                     if (it.readSnapshot < cat.earliestSnapshotId || it.readSnapshot > cat.headSnapshotId) {
                         throw HoglakeException.CommitConflict("replacement read snapshot is not retained")
                     }
@@ -144,10 +147,12 @@ class TableCreationService(
         operationId: UUID,
     ): TableCreation {
         var replay = false
-        return observed("abort", catalog, operationId, { if (replay) "replayed" else it.state }) {
+        var attempted: TableCreationDefinition? = null
+        return observed("abort", catalog, operationId, { if (replay) "replayed" else it.state }, { attempted }) {
             operationTransaction { h ->
                 val cat = CatalogRepo.require(h, catalog)
                 val operation = load(h, cat.catalogId, operationId)
+                attempted = operation.definition
                 replay = operation.state != "prepared"
                 if (operation.state == "prepared") transition(h, cat.catalogId, operationId, "aborted", "client_abort")
                 load(h, cat.catalogId, operationId)
@@ -161,12 +166,14 @@ class TableCreationService(
         files: List<FileRegistration>,
     ): TableCreation {
         var replay = false
-        return observed("publish", catalog, operationId, { if (replay) "replayed" else it.state }) {
+        var attempted: TableCreationDefinition? = null
+        return observed("publish", catalog, operationId, { if (replay) "replayed" else it.state }, { attempted }) {
             operationTransaction { h ->
                 val catalogId = CatalogRepo.require(h, catalog).catalogId
                 Locks.acquireCatalogCommitLock(h, catalogId, lockTimeoutMs)
                 val cat = CatalogRepo.require(h, catalog)
                 val operation = load(h, cat.catalogId, operationId)
+                attempted = operation.definition
                 replay = operation.state != "prepared"
                 val encoded = mapper.writeValueAsString(files)
                 if (operation.state == "committed" || operation.state == "rejected") {
@@ -279,6 +286,8 @@ class TableCreationService(
                                 sortFields = definition.sortFields,
                                 comment = definition.comment,
                                 properties = definition.properties,
+                                author = definition.author,
+                                message = definition.message,
                             )
                         } catch (e: HoglakeException.Validation) {
                             log.warn {
@@ -320,6 +329,7 @@ class TableCreationService(
         catalog: String,
         operation: UUID,
         outcome: (TableCreation) -> String,
+        attemptedDefinition: () -> TableCreationDefinition? = { null },
         block: () -> TableCreation,
     ): TableCreation =
         Audit.audited(
@@ -327,6 +337,8 @@ class TableCreationService(
             catalog,
             operation.toString(),
             successOutcome = outcome,
+            actor = { (it?.definition ?: attemptedDefinition())?.author },
+            message = { (it?.definition ?: attemptedDefinition())?.message },
             detail = { "operation=$operation state=${it.state} snapshot=${it.snapshotId}" },
         ) {
             // The block returns only after its database transaction commits or rolls back.

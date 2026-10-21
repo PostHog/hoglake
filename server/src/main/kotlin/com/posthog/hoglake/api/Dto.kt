@@ -1,6 +1,7 @@
 package com.posthog.hoglake.api
 
 import com.fasterxml.jackson.databind.JsonNode
+import com.fasterxml.jackson.databind.annotation.JsonDeserialize
 import com.fasterxml.jackson.databind.node.LongNode
 import com.fasterxml.jackson.databind.node.NullNode
 import com.posthog.hoglake.model.CatalogInfo
@@ -25,6 +26,7 @@ import com.posthog.hoglake.model.PartitionFieldValues
 import com.posthog.hoglake.model.PartitionValues
 import com.posthog.hoglake.model.ScanFile
 import com.posthog.hoglake.model.Snapshot
+import com.posthog.hoglake.model.SnapshotResolution
 import com.posthog.hoglake.model.StatsState
 import com.posthog.hoglake.model.TableAppend
 import com.posthog.hoglake.model.TableDeletes
@@ -143,7 +145,21 @@ fun CatalogInfo.toDto(totals: CatalogTotals? = null) =
         oldestSnapshotTime = totals?.oldestSnapshotTime,
     )
 
-data class CreateCatalogRequestDto(val name: String, val dataPath: String)
+data class CreateCatalogRequestDto(
+    val name: String,
+    val dataPath: String,
+    @JsonDeserialize(using = OperationTextDeserializer::class)
+    val author: String? = null,
+    @JsonDeserialize(using = OperationTextDeserializer::class)
+    val message: String? = null,
+)
+
+data class OperationMetadataDto(
+    @JsonDeserialize(using = OperationTextDeserializer::class)
+    val author: String? = null,
+    @JsonDeserialize(using = OperationTextDeserializer::class)
+    val message: String? = null,
+)
 
 // ---- namespaces ----------------------------------------------------------
 
@@ -151,7 +167,13 @@ data class NamespaceDto(val name: String, val namespaceId: Long)
 
 fun NamespaceInfo.toDto() = NamespaceDto(name, namespaceId)
 
-data class CreateNamespaceRequestDto(val name: String)
+data class CreateNamespaceRequestDto(
+    val name: String,
+    @JsonDeserialize(using = OperationTextDeserializer::class)
+    val author: String? = null,
+    @JsonDeserialize(using = OperationTextDeserializer::class)
+    val message: String? = null,
+)
 
 // ---- tables --------------------------------------------------------------
 
@@ -185,7 +207,14 @@ data class ColumnDefDto(
         )
 }
 
-data class CreateTableRequestDto(val name: String, val columns: List<ColumnDefDto>)
+data class CreateTableRequestDto(
+    val name: String,
+    val columns: List<ColumnDefDto>,
+    @JsonDeserialize(using = OperationTextDeserializer::class)
+    val author: String? = null,
+    @JsonDeserialize(using = OperationTextDeserializer::class)
+    val message: String? = null,
+)
 
 data class ColumnDto(
     val name: String,
@@ -454,7 +483,9 @@ data class CommitRequestDto(
     // which CommitService enforces (422 validation, not a 400).
     val appends: List<TableAppendDto> = emptyList(),
     val deletes: List<TableDeletesDto> = emptyList(),
+    @JsonDeserialize(using = OperationTextDeserializer::class)
     val author: String? = null,
+    @JsonDeserialize(using = OperationTextDeserializer::class)
     val message: String? = null,
     val idempotencyKey: UUID? = null,
 ) {
@@ -799,11 +830,19 @@ data class CreateViewRequestDto(
     /** Stored verbatim — the server never parses view SQL. */
     val sql: String,
     val dialect: String = "trino",
+    @JsonDeserialize(using = OperationTextDeserializer::class)
+    val author: String? = null,
+    @JsonDeserialize(using = OperationTextDeserializer::class)
+    val message: String? = null,
 )
 
 // ---- snapshots -----------------------------------------------------------
 
 data class SnapshotChangeDto(val kind: String, val objectId: Long)
+
+data class SnapshotResolutionDto(val snapshotId: Long, val snapshotTime: Instant)
+
+fun SnapshotResolution.toDto() = SnapshotResolutionDto(snapshotId, snapshotTime)
 
 data class SnapshotDto(
     val snapshotId: Long,
@@ -845,7 +884,9 @@ data class CommitOffsetRequestDto(val snapshotId: Long)
  * sampler's last pass (each catalog as of its maintenance summary's
  * published generation; a catalog without one contributes nothing and
  * is counted in unsampledCatalogs) and are omitted in the boot window
- * before it.
+ * before it. The two sums are also omitted, with unsampledCatalogs
+ * alone present, while catalogs exist but none has published totals:
+ * a sum over nothing is 0, which would read as an empty warehouse.
  * Version is the running server's own, always present (BuildInfo falls
  * back to "unknown" rather than omitting it — "which version is this?"
  * having no answer is itself the answer an operator needs).
@@ -862,7 +903,7 @@ data class InstanceInfoDto(
     val build: String?,
     val totalRows: Long?,
     val totalSizeBytes: Long?,
-    /** Catalogs left out of BOTH totals: no published live totals, or none for rows. Omitted with them. */
+    /** Catalogs left out of BOTH totals: no published live totals, or none for rows. Omitted before the first sample. */
     val unsampledCatalogs: Int? = null,
     val uiTheme: String? = null,
 )

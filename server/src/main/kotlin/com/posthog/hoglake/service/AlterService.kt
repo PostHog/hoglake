@@ -58,12 +58,16 @@ class AlterService(private val jdbi: Jdbi) {
         ops: List<AlterOp>,
         expectedTableUuid: UUID? = null,
         readSnapshot: Long? = null,
+        author: String? = null,
+        message: String? = null,
     ): TableInfo =
         Audit.audited(
             "table_alter",
             catalog,
             "$namespace.$table",
             detail = { "ops=${summarize(ops)}" },
+            actor = { author },
+            message = { message },
         ) {
             if (ops.isEmpty()) {
                 throw HoglakeException.Validation("ops must contain at least one operation")
@@ -122,7 +126,7 @@ class AlterService(private val jdbi: Jdbi) {
                     }
                 }
                 val alloc = CatalogRepo.allocateSnapshot(h, cat.catalogId)
-                SnapshotRepo.insert(h, cat.catalogId, alloc.snapshotId, alloc.schemaVersion)
+                SnapshotRepo.insert(h, cat.catalogId, alloc.snapshotId, alloc.schemaVersion, author, message)
                 SnapshotRepo.insertChange(
                     h,
                     cat.catalogId,
@@ -881,7 +885,7 @@ class AlterService(private val jdbi: Jdbi) {
                 .add()
         }
         batch.execute()
-        return SortSpec(sortId, fields)
+        return SortSpec(sortId, fields, snapshot)
     }
 
     // ---- row lifecycle helpers -------------------------------------------

@@ -322,7 +322,6 @@ class CompactionCandidateFetchPlanIntegrationTest {
                 nullArms = emptySet(),
                 scopeToSpec = true,
                 withPartitionValues = false,
-                boundRows = false,
             )
         return db.jdbi.withHandleUnchecked { h ->
             h.begin()
@@ -356,7 +355,6 @@ class CompactionCandidateFetchPlanIntegrationTest {
                 nullArms = emptySet(),
                 scopeToSpec = false,
                 withPartitionValues = true,
-                boundRows = false,
             )
         return db.jdbi.withHandleUnchecked { h ->
             h.begin()
