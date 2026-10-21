@@ -74,7 +74,9 @@ from typing import Any
 
 _EPOCH_DATE = date(1970, 1, 1)
 _EPOCH_UTC = datetime(1970, 1, 1, tzinfo=UTC)
-_EPOCH_NAIVE = datetime(1970, 1, 1)  # noqa: DTZ001  # naive epoch is the codec's intent for timestamp-without-tz
+_EPOCH_NAIVE = datetime(
+    1970, 1, 1
+)  # naive epoch is the codec's intent for timestamp-without-tz
 
 
 def _minimal_twos_complement(n: int) -> bytes:
