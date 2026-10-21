@@ -7,6 +7,7 @@ import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.CommitResult
 import com.posthog.hoglake.model.ConsumerOffset
 import com.posthog.hoglake.model.DataFile
+import com.posthog.hoglake.model.DroppedCatalog
 import com.posthog.hoglake.model.FileColumnStats
 import com.posthog.hoglake.model.FileOrderingBounds
 import com.posthog.hoglake.model.FileStats
@@ -31,6 +32,7 @@ import com.posthog.hoglake.persistence.FileRepo
 import com.posthog.hoglake.persistence.Locks
 import com.posthog.hoglake.persistence.NamespaceRepo
 import com.posthog.hoglake.persistence.OffsetRepo
+import com.posthog.hoglake.persistence.Pg
 import com.posthog.hoglake.persistence.SnapshotRepo
 import com.posthog.hoglake.persistence.SortRepo
 import com.posthog.hoglake.persistence.SpecRepo
@@ -43,6 +45,7 @@ import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.Jdbi
 import org.jdbi.v3.core.kotlin.inTransactionUnchecked
 import org.jdbi.v3.core.kotlin.withHandleUnchecked
+import org.jdbi.v3.core.statement.UnableToExecuteStatementException
 import java.time.Instant
 import java.util.UUID
 
@@ -168,6 +171,183 @@ class CatalogService(private val jdbi: Jdbi) {
     fun getCatalog(name: String): CatalogInfo = jdbi.withHandleUnchecked { h -> requireCatalog(h, name) }
 
     fun listCatalogs(): List<CatalogInfo> = jdbi.withHandleUnchecked { h -> CatalogRepo.listAll(h) }
+
+    /**
+     * Drop an EMPTY catalog: `DELETE /v1/catalogs/{catalog}` (#412).
+     * Emptiness preconditions, no recursion — the same position as
+     * [dropNamespace] and dropTable, one level up. Dropping a catalog that
+     * still has tables is `drop table` × N, the namespaces, then this.
+     *
+     * THE SHAPE. One transaction: resolve, take the per-catalog commit
+     * lock, row-lock the catalog ([CatalogRepo.lockForDrop] says why the
+     * commit lock alone does not fence every writer), read every
+     * precondition in one statement ([CatalogRepo.DROP_BLOCKERS_SQL]),
+     * refuse with 409 `catalog_not_empty` naming the first failing one as
+     * `reason`, else `DELETE FROM hog_catalog` and let the thirteen
+     * `ON DELETE CASCADE` foreign keys take the rest. Three statements
+     * under the lock on the success path.
+     *
+     * WHAT THE PRECONDITIONS PROTECT, which is the whole design: the
+     * cascade deletes rows and queues nothing, so it must not run while
+     * any row still stands for work in flight or an object nobody has
+     * queued.
+     *  - live namespaces: live tables and views are data, not leftovers.
+     *  - file rows, live or ended: each names an object that is queued
+     *    only when retirement or expiry deletes the row. Any file row,
+     *    not `RetirementService.ELIGIBLE_PREDICATE`: see the SQL's KDoc
+     *    for the two populations that predicate misses.
+     *  - undrained removal rows: the queue IS the record of objects still
+     *    to delete; cascading it orphans them. This includes compaction
+     *    staging tickets, so a compactor mid-upload refuses the drop too.
+     *  - consumer offsets: a consumer's position is the one piece of
+     *    state here owned by somebody outside the catalog, and offsets
+     *    survive table drops on purpose (AGENT.md: whatever mints a new
+     *    identity releases the old one's consumers — a drop mints
+     *    nothing). THERE IS NO OFFSET-DELETE API, so today an operator
+     *    clears these by hand; the refusal names the consumers.
+     *  - active upload claims: a writer may be mid-PUT, and its object
+     *    would land under a prefix nothing tracks.
+     *  - abandoned uploads never offered to cleanup (`last_scheduled_at
+     *    IS NULL`): their objects may exist and no removal row exists for
+     *    them yet. NOT in #412's list; added because the cascade would
+     *    orphan exactly what the removal-queue precondition exists to
+     *    protect, one step earlier in the same pipeline. Tombstones that
+     *    were offered once are NOT blocking — they are re-offered forever
+     *    (a PUT can land after its DELETE), so requiring none would make
+     *    any catalog that ever abandoned an upload undroppable.
+     *
+     * WHAT IS LEFT TO CASCADE, decided rather than inherited:
+     *  - `hog_snapshot` / `hog_snapshot_change`, versioned DDL rows,
+     *    `hog_table` identities: the catalog's history, which goes with it.
+     *    That is also why there is NO SNAPSHOT for this operation: there is
+     *    no catalog left to record one in. The audit event is the record
+     *    (`catalog_drop`, actor = author, operation_message = message).
+     *  - `hog_compaction_claim`, but only EXPIRED claims. An unexpired one
+     *    refuses the drop (`active_compaction_claims`), because the staging
+     *    ticket is not enough: cleanup may drain a ticket `absent` while a
+     *    streaming rewrite is still uploading, and the compactor re-stages
+     *    at commit (CompactionService's group commit). A drop between that
+     *    settle and the commit would pass every other check, and the
+     *    re-stage would then fail its foreign key and orphan the output
+     *    under the data path. The cost: a crashed compactor's claim delays
+     *    a drop by up to its TTL (one hour), a committed group's by its
+     *    committed TTL (ten minutes).
+     *  - `hog_table_creation`: a `prepared` receipt can no longer publish
+     *    once its namespace is dropped (publish rejects it
+     *    `namespace_changed`), and no state of a receipt ever deletes an
+     *    object, so cascading it changes the writer's answer from a
+     *    durable `rejected` to a 404 and orphans nothing that was not
+     *    already orphaned.
+     *  - `hog_commit_receipt`: idempotency for commits that can no longer
+     *    be made; a replay gets 404 instead of the receipt.
+     *  - `hog_maintenance_run`, `hog_maintenance_summary(_tier)`: ledger and
+     *    sampler state about this catalog, meaningless without it.
+     *  - settled `hog_file_removal` rows: forensics, purged after 30 days
+     *    anyway.
+     *
+     * EVERY CASCADE IS AN INDEX PROBE, and one of them needed a migration
+     * for it. Each child's RI trigger runs `DELETE FROM ONLY <child> WHERE
+     * catalog_id = $1`, and every child has a `catalog_id`-leading index
+     * for it — `hog_file_removal` only since V28. Its two older indexes
+     * are partial on `drained_at IS NULL`, and the SETTLED rows are
+     * exactly what the cascade has to find (the drop refuses while any
+     * row is undrained), so without V28 every drop sequentially scanned
+     * the fleet-wide ledger: ~137M rows at steady state, which does not
+     * shrink, so a 60 s `statement_timeout` would have been a permanent
+     * refusal on the environment the route exists for. V28 has the
+     * measurements and the write price.
+     *
+     * LOCK ORDER, and the deadlocks it does and does not rule out. The
+     * drop takes: the commit lock; the catalog's `hog_maintenance_summary`
+     * row `FOR UPDATE`; the catalog row `FOR UPDATE`; then, through the
+     * cascade, every child row. A writer that holds a CHILD row and then
+     * needs the catalog row (`FOR KEY SHARE`, through a foreign key on an
+     * INSERT) is the cycle, and there are two:
+     *  - `MaintenanceSummarySampler` claims the summary row `FOR UPDATE
+     *    SKIP LOCKED` and then inserts tier rows, and it visits every
+     *    catalog every tick, the one being dropped included. Taking the
+     *    summary row FIRST puts the drop in the sampler's order: if the
+     *    sampler has it, the drop waits for the tick to finish; if the
+     *    drop has it, SKIP LOCKED makes the sampler pass the catalog by.
+     *    Two smaller interplays, neither a deadlock: the sampler's
+     *    discovery INSERT (a summary row for every catalog that lacks one)
+     *    takes `FOR KEY SHARE` on each such catalog row, so a drop of a
+     *    never-sampled catalog can wait out one tick's discovery; and the
+     *    sampler runs REPEATABLE READ, so a tick whose snapshot predates
+     *    the drop and then touches the deleted rows takes a serialization
+     *    failure — one skipped tick, retried on the next.
+     *  - `UploadService.fenceAndQueue` UPDATEs a `hog_upload` row and then
+     *    INSERTs its removal row. Not ordered here — that would mean
+     *    locking every unregistered claim of the catalog first — so a
+     *    fence that runs exactly into a drop is a 40P01 after
+     *    `deadlock_timeout` with either side the victim: a 500 to retry,
+     *    never a lost row, because the victim's whole transaction rolls
+     *    back. Only `schedule-expired`, an explicit operator action, runs
+     *    it.
+     * Everything else that holds these locks is this catalog's own
+     * traffic, which by the preconditions has stopped.
+     *
+     * THE DATA PATH IS NOT TOUCHED. The response carries it so an
+     * operator can list what is left: by the preconditions, nothing under
+     * it is an object hoglake still knew about.
+     *
+     * THE NAME IS FREE AFTERWARDS, and a catalog created under it is a new
+     * `catalog_id` whose snapshots restart at 0. Every table in it has a
+     * new `table_uuid`, which is what consumers key on; a client that
+     * cached a snapshot id of the old catalog is reading a different
+     * clock, and nothing can tell it so. The overlap check in
+     * [createCatalog] only compares live catalogs, so the new one may also
+     * reuse the prefix — table-creation write paths carry a server UUID so
+     * a reused prefix cannot collide with old objects.
+     *
+     * LOSERS OF THE RACE get 404, not 500: a DDL tail or commit that
+     * resolved the catalog and queued on the lock behind this finds no
+     * row at its first post-lock statement ([CatalogRepo.allocateSnapshot],
+     * `CommitTail.read`), and a second concurrent drop finds none at
+     * [CatalogRepo.lockForDrop]. The two lock-free writers a client calls
+     * directly — an upload claim and an offset commit — resolve the
+     * catalog, then block on the drop's row lock at their INSERT and fail
+     * its foreign key; both map that 23503 to the same 404.
+     *
+     * Metrics: none of its own, like the other DDL. The commit-lock wait
+     * histogram records it through [Locks.acquireCatalogCommitLock], and
+     * every per-catalog gauge prunes a catalog that stops being listed.
+     */
+    fun dropCatalog(
+        catalog: String,
+        author: String?,
+        message: String?,
+    ): DroppedCatalog =
+        Audit.audited(
+            "catalog_drop",
+            catalog,
+            null,
+            detail = { "data_path=${it.dataPath}" },
+            actor = { author },
+            message = { message },
+        ) {
+            requireOperationMetadata(author, message)
+            jdbi.inTransactionUnchecked { h ->
+                val cat = requireCatalog(h, catalog)
+                Locks.acquireCatalogCommitLock(h, cat.catalogId)
+                // Summary row before catalog row: the sampler's order (see
+                // LOCK ORDER above). MUTATION: removing this deadlocks the
+                // drop against a sampler tick on the same catalog.
+                CatalogRepo.lockSummaryForDrop(h, cat.catalogId)
+                val dataPath =
+                    CatalogRepo.lockForDrop(h, cat.catalogId)
+                        ?: throw HoglakeException.NotFound("catalog '$catalog'")
+                val failing = CatalogRepo.dropBlockers(h, cat.catalogId).failing()
+                if (failing.isNotEmpty()) {
+                    throw HoglakeException.CatalogNotEmpty(
+                        "catalog '$catalog' is not empty: " + failing.joinToString("; ") { it.second },
+                        failing.first().first,
+                    )
+                }
+                CatalogRepo.delete(h, cat.catalogId)
+                DroppedCatalog(cat.name, dataPath)
+            }
+        }
 
     /** Missing catalog/database failures are errors, never an empty footprint. */
     fun storageUsage(name: String): StorageUsage =
@@ -1232,7 +1412,18 @@ class CatalogService(private val jdbi: Jdbi) {
                     )
                 }
                 val committed =
-                    OffsetRepo.upsert(h, cat.catalogId, consumerId, tableUuid, snapshotId)
+                    try {
+                        OffsetRepo.upsert(h, cat.catalogId, consumerId, tableUuid, snapshotId)
+                    } catch (e: UnableToExecuteStatementException) {
+                        // No commit lock here, so an offset commit that
+                        // resolved the catalog and then queued on a catalog
+                        // drop's row lock fails its foreign key once the drop
+                        // commits: the drop won, and the answer is a 404.
+                        if (Pg.isCatalogForeignKeyViolation(e)) {
+                            throw HoglakeException.NotFound("catalog '$catalog'")
+                        }
+                        throw e
+                    }
                         ?: throw HoglakeException.OffsetRegression(
                             "consumer '$consumerId' already committed past snapshot $snapshotId " +
                                 "for table $tableUuid",

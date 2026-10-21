@@ -236,6 +236,93 @@ class UnsupportedShreddingError(UnsupportedTypeError):
     know; upgrade pyhoglake."""
 
 
+class CatalogNotEmptyError(HoglakeError):
+    """409 ``catalog_not_empty`` — :meth:`pyhoglake.Catalog.drop` was
+    refused because a precondition does not hold.
+
+    :attr:`reason` is the server's wire name for the FIRST failing
+    precondition, in the order they are resolved in; ``detail`` names
+    every failing one. Each known reason has its own subclass below, so an
+    ``except`` ladder can say what to do; a reason this version does not
+    know (a newer server) still arrives as this base class with
+    :attr:`reason` set, never as a bare :class:`HoglakeError`.
+
+    Neither retryable nor re-prepare: the same drop succeeds only after
+    the catalog changes — after the operator drops something, or a
+    maintenance loop (retirement, expiry, cleanup) catches up."""
+
+    #: The wire ``reason`` a subclass stands for; ``None`` on the base.
+    wire_reason: str | None = None
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        detail: str | None = None,
+        reason: str | None = None,
+    ) -> None:
+        super().__init__(message, status_code=status_code, detail=detail)
+        self.reason = reason if reason is not None else self.wire_reason
+
+
+class CatalogHasLiveNamespacesError(CatalogNotEmptyError):
+    """``live_namespaces`` — drop the tables and views, then the namespaces."""
+
+    wire_reason = "live_namespaces"
+
+
+class CatalogTablesPendingRetirementError(CatalogNotEmptyError):
+    """``tables_pending_retirement`` — dropped tables still have live file
+    rows. Retirement deletes them (and queues their objects) once the
+    expiry floor passes the drop; a catalog with no retention never gets
+    there."""
+
+    wire_reason = "tables_pending_retirement"
+
+
+class CatalogFilesPendingExpiryError(CatalogNotEmptyError):
+    """``files_pending_expiry`` — ended file rows and their deletion vectors
+    remain; expiry purges them once the floor passes their end snapshot."""
+
+    wire_reason = "files_pending_expiry"
+
+
+class CatalogRemovalsPendingError(CatalogNotEmptyError):
+    """``removals_pending`` — the removal queue is not drained; let cleanup
+    finish (:meth:`pyhoglake.Catalog.cleanup`)."""
+
+    wire_reason = "removals_pending"
+
+
+class CatalogHasActiveCompactionClaimsError(CatalogNotEmptyError):
+    """``active_compaction_claims`` — a compactor may still be writing an
+    output under the data path. Claims expire on their own, within an hour."""
+
+    wire_reason = "active_compaction_claims"
+
+
+class CatalogHasConsumerOffsetsError(CatalogNotEmptyError):
+    """``consumer_offsets`` — a consumer still has a stored position. The
+    server has no offset-delete API."""
+
+    wire_reason = "consumer_offsets"
+
+
+class CatalogHasActiveUploadsError(CatalogNotEmptyError):
+    """``active_uploads`` — upload claims in state ``active``: a writer may
+    be mid-PUT."""
+
+    wire_reason = "active_uploads"
+
+
+class CatalogHasUnscheduledUploadsError(CatalogNotEmptyError):
+    """``unscheduled_abandoned_uploads`` — abandoned uploads that were never
+    offered to cleanup; schedule them, then let cleanup drain."""
+
+    wire_reason = "unscheduled_abandoned_uploads"
+
+
 class ReconciliationRequiredError(HoglakeError):
     """409 — a changefeed window crosses TRUNCATE; reconcile before checkpointing.
 

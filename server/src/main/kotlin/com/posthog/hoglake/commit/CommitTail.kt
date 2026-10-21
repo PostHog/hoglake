@@ -6,6 +6,7 @@ import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
 import com.posthog.hoglake.model.ColumnStats
+import com.posthog.hoglake.persistence.CatalogRepo
 import com.posthog.hoglake.service.UploadClaim
 import com.posthog.hoglake.service.UploadService
 import org.jdbi.v3.core.Handle
@@ -590,7 +591,13 @@ internal object CommitTail {
                 )
             }
             .findOne()
-            .orElseThrow { IllegalStateException("no hog_catalog row for catalog_id=${inputs.catalogId}") }
+            // No `head` row means the catalog was DROPPED while this
+            // commit queued on its lock: the commit resolved it before
+            // queueing, and `DELETE /v1/catalogs/{c}` takes the same lock.
+            // An ordinary lost race, so a 404 — it was an
+            // IllegalStateException (500) when nothing could delete a
+            // catalog. Same statement, no extra round trip under the lock.
+            .orElseThrow { CatalogRepo.droppedWhileQueued(inputs.catalogId) }
 
     /** One JSON section of the read; json_agg over no rows is SQL NULL. */
     private inline fun <reified T> section(json: String?): List<T> =

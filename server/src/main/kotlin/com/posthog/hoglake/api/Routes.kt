@@ -79,6 +79,15 @@ fun Application.installApiRoutes(
                 get {
                     call.respond(catalogs.getCatalog(call.catalog()).toDto())
                 }
+                delete {
+                    call.respond(
+                        catalogs.dropCatalog(
+                            call.catalog(),
+                            call.request.queryParameters["author"],
+                            call.request.queryParameters["message"],
+                        ).toDto(),
+                    )
+                }
 
                 get("/storage-usage") {
                     // A footprint has no read snapshot: historical/dropped registrations

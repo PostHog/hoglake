@@ -160,6 +160,19 @@ object Audit {
             is HoglakeException.OffsetRegression -> "regression"
             is HoglakeException.CommitQueueTimeout -> "timeout"
             is HoglakeException.Validation -> "validation"
+            // The precondition refusals: a DDL the catalog's state does
+            // not allow (a drop of something not empty, a rename while
+            // id-less files would lose their history). Their own outcome
+            // rather than "conflict": nothing raced them, and retrying
+            // changes nothing until the state does — the trail should say
+            // the operation was REFUSED, not that it collided, and above
+            // all not "error". NamespaceNotEmpty and IdlessFilesPresent
+            // fell to the `else` and audited as server faults until the
+            // catalog drop added this arm.
+            is HoglakeException.CatalogNotEmpty,
+            is HoglakeException.NamespaceNotEmpty,
+            is HoglakeException.IdlessFilesPresent,
+            -> "refused"
             is HoglakeException.NotFound -> "not_found"
             else -> "error"
         }

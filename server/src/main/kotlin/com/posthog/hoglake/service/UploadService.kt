@@ -2,6 +2,7 @@ package com.posthog.hoglake.service
 
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.persistence.CatalogRepo
+import com.posthog.hoglake.persistence.Pg
 import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.Jdbi
 import org.jdbi.v3.core.kotlin.inTransactionUnchecked
@@ -207,9 +208,22 @@ class UploadService(
         block: (Handle, Long) -> T,
     ): T =
         com.posthog.hoglake.observability.Audit.audited(action, catalog, null) {
-            jdbi.inTransactionUnchecked { h ->
-                val catalogId = CatalogRepo.require(h, catalog).catalogId
-                block(h, catalogId)
+            try {
+                jdbi.inTransactionUnchecked { h ->
+                    val catalogId = CatalogRepo.require(h, catalog).catalogId
+                    block(h, catalogId)
+                }
+            } catch (e: org.jdbi.v3.core.statement.UnableToExecuteStatementException) {
+                // These transitions take no commit lock, so a claim that
+                // resolved the catalog and then queued on a catalog drop's
+                // row lock (CatalogRepo.lockForDrop) fails its foreign key
+                // once the drop commits. That is the drop winning a race —
+                // a 404, the same answer the request gets one millisecond
+                // later — not a server fault.
+                if (Pg.isCatalogForeignKeyViolation(e)) {
+                    throw HoglakeException.NotFound("catalog '$catalog'")
+                }
+                throw e
             }
         }
 

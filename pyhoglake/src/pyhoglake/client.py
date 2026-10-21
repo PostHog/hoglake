@@ -27,6 +27,15 @@ import pyarrow.parquet as pq
 
 from .errors import (
     AlreadyExistsError,
+    CatalogFilesPendingExpiryError,
+    CatalogHasActiveCompactionClaimsError,
+    CatalogHasActiveUploadsError,
+    CatalogHasConsumerOffsetsError,
+    CatalogHasLiveNamespacesError,
+    CatalogHasUnscheduledUploadsError,
+    CatalogNotEmptyError,
+    CatalogRemovalsPendingError,
+    CatalogTablesPendingRetirementError,
     CommitConflictError,
     DdlSinceReadSnapshotError,
     ExpiredError,
@@ -49,6 +58,7 @@ from .models import (
     CommitResult,
     ConsumerOffset,
     DataFile,
+    DroppedCatalog,
     ExpiryResult,
     PartitionField,
     PartitionSpec,
@@ -124,6 +134,25 @@ UNGUARDED = object()
 _RE_PREPARE_ERRORS: dict[str, type[HoglakeError]] = {
     "ddl_since_read_snapshot": DdlSinceReadSnapshotError,
     "table_recreated": IncarnationChangedError,
+}
+
+# 409 `catalog_not_empty`'s `reason` -> its typed refusal. Keyed off each
+# class's own `wire_reason`, so a class and its key cannot disagree; a
+# reason missing here (a newer server) falls back to the base class, which
+# still carries `reason`.
+_CATALOG_NOT_EMPTY_ERRORS: dict[str, type[CatalogNotEmptyError]] = {
+    cls.wire_reason: cls
+    for cls in (
+        CatalogHasLiveNamespacesError,
+        CatalogTablesPendingRetirementError,
+        CatalogFilesPendingExpiryError,
+        CatalogRemovalsPendingError,
+        CatalogHasActiveCompactionClaimsError,
+        CatalogHasConsumerOffsetsError,
+        CatalogHasActiveUploadsError,
+        CatalogHasUnscheduledUploadsError,
+    )
+    if cls.wire_reason is not None
 }
 
 # Assumed snapshot retention when the catalog will not say: half of this
@@ -622,6 +651,14 @@ class HoglakeClient:
         # was recreated" inside `detail`.
         if resp.status_code == 409 and message in _RE_PREPARE_ERRORS:
             raise _re_prepare_error(message, body, detail)
+        # Same reasoning: the drop's `reason` is the contract, so the TYPE
+        # is chosen off it rather than off the detail prose.
+        if resp.status_code == 409 and message == "catalog_not_empty":
+            reason = body.get("reason") if isinstance(body, dict) else None
+            reason = reason if isinstance(reason, str) else None
+            raise _CATALOG_NOT_EMPTY_ERRORS.get(reason or "", CatalogNotEmptyError)(
+                message, status_code=409, detail=detail, reason=reason
+            )
         cls: type[HoglakeError]
         if resp.status_code == 409 and message == "reconciliation_required":
             cls = ReconciliationRequiredError
@@ -750,6 +787,39 @@ class Catalog:
 
     def __repr__(self) -> str:  # pragma: no cover
         return f"<Catalog {self.name!r} data_path={self.data_path!r}>"
+
+    def drop(self, *, author: str, message: str) -> DroppedCatalog:
+        """Drop this catalog. It must be EMPTY; nothing is dropped for you.
+
+        Refused with a :class:`CatalogNotEmptyError` subclass naming the
+        first precondition that fails: a live namespace, file rows that
+        retirement or expiry has not removed yet, an undrained removal
+        queue, an unexpired compaction claim, a consumer offset, an active
+        upload claim, or an abandoned
+        upload never offered to cleanup. ``detail`` names all of them.
+
+        Metadata only: the returned ``data_path`` is the prefix the
+        catalog owned, and nothing under it is deleted. There is no
+        snapshot to record ``author`` / ``message`` on (the history goes
+        with the catalog); the server's audit log carries them. No
+        operation receipt either — do not retry an unknown outcome
+        blindly, since a 404 on the retry may mean the first one landed.
+        """
+        body = self._client._request(
+            "DELETE",
+            self._path(),
+            params=_operation_metadata(author, message, required=True),
+        )
+        dropped = DroppedCatalog.from_wire(body)
+        # The catalog is gone, so the retention it cached describes nothing
+        # — and after a same-name recreate, a reused object would apply the
+        # OLD catalog's retention to the new one's writer path. Drop both
+        # halves of that cache, as Table.drop drops its own. `info` stays
+        # (it is the last read, and the name and data_path in it are what
+        # an operator needs next); `refresh()` now raises NotFoundError.
+        self._retention_cache = None
+        self._retention_failed_at = None
+        return dropped
 
     # -- namespaces --------------------------------------------------------
 

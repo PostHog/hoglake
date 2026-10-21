@@ -107,6 +107,59 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Catalog" }
         "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      operationId: dropCatalog
+      summary: Drop an empty catalog (metadata only; the data path is not touched)
+      description: >
+        Emptiness preconditions, no CASCADE over live objects — the same
+        position as dropNamespace and dropTable. Under the catalog's commit
+        lock, in one transaction, the drop is refused with 409
+        `catalog_not_empty` unless the catalog has no live namespace, no
+        file row of any kind (live rows of dropped tables wait for
+        retirement, ended rows for expiry's purge), no undrained
+        removal-queue row, no unexpired compaction claim, no consumer
+        offset, no active upload claim and
+        no abandoned upload that was never offered to cleanup. The body's
+        `reason` names the FIRST failing precondition in that order, which
+        is the order to resolve them in; `detail` names every failing one.
+        On success the catalog row is deleted and its history goes with
+        it: there is no snapshot to record `author`/`message` on, so the
+        audit event `catalog_drop` is the record. Objects under the
+        returned `data_path` are not deleted; by the preconditions none of
+        them is an object the catalog still tracked. The name is free
+        afterwards, and a catalog created under it starts a new snapshot
+        clock at 0. No operation receipt: do not retry an unknown outcome
+        blindly — a 404 on retry may mean the first attempt succeeded.
+      parameters:
+        - { $ref: "#/components/parameters/operationAuthor" }
+        - { $ref: "#/components/parameters/operationMessage" }
+        - { $ref: "#/components/parameters/catalog" }
+      responses:
+        "200":
+          description: Dropped; names the catalog and the prefix it owned
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DroppedCatalog" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: >
+            `catalog_not_empty`, with `reason` one of: `live_namespaces`
+            (drop the tables and views, then the namespaces),
+            `tables_pending_retirement` (live file rows of dropped tables;
+            retirement reaches them once the expiry floor passes the drop),
+            `files_pending_expiry` (ended file rows and their deletion vectors;
+            expiry purges them once the floor passes them),
+            `removals_pending` (undrained removal queue; let cleanup
+            finish), `active_compaction_claims` (a compactor may still be
+            writing an output; claims expire within an hour),
+            `consumer_offsets` (there is no offset-delete API),
+            `active_uploads` (register, abandon, or let them expire and
+            schedule them), `unscheduled_abandoned_uploads` (run
+            uploads/schedule-expired, then let cleanup drain).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "422": { $ref: "#/components/responses/Validation" }
 
   /catalogs/{catalog}/storage-usage:
     get:
@@ -3044,6 +3097,24 @@ components:
             replaying this payload can only be refused again — re-read
             the table and build a new request. Absent on every retryable
             conflict.
+        reason:
+          type: string
+          enum: [live_namespaces, tables_pending_retirement, files_pending_expiry, removals_pending, active_compaction_claims, consumer_offsets, active_uploads, unscheduled_abandoned_uploads]
+          description: >
+            Present only on 409 catalog_not_empty: the first failing
+            precondition of the catalog drop, in resolution order. See
+            dropCatalog for what each one asks the caller to do.
+
+    DroppedCatalog:
+      type: object
+      required: [name, data_path]
+      properties:
+        name: { type: string }
+        data_path:
+          type: string
+          description: >
+            The prefix the dropped catalog owned. Nothing under it was
+            deleted; list it to find what is left.
 
     StorageUsage:
       type: object

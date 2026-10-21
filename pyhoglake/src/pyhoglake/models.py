@@ -72,6 +72,23 @@ class CatalogInfo:
 
 
 @dataclass(frozen=True)
+class DroppedCatalog:
+    """What :meth:`pyhoglake.Catalog.drop` returns: the catalog that is
+    gone and the prefix it owned.
+
+    Nothing under ``data_path`` was deleted — the drop is metadata only —
+    and by the drop's preconditions nothing under it is an object the
+    catalog still tracked. List it to see what is left."""
+
+    name: str
+    data_path: str
+
+    @classmethod
+    def from_wire(cls, d: dict[str, Any]) -> DroppedCatalog:
+        return _wire("DroppedCatalog", d, lambda d: cls(**_pick(cls, d)))
+
+
+@dataclass(frozen=True)
 class CatalogOptions:
     consumer_floor: bool
     earliest_snapshot_id: int
