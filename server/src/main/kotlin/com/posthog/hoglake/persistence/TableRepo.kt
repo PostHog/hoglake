@@ -332,9 +332,9 @@ object TableRepo {
     /**
      * Resolve a live (head-visible) table by (namespace, name).
      *
-     * `dropped_snapshot IS NULL` is CommitService's own
-     * `resolveLiveTable` clause, verbatim, and it is here for the same
-     * reason it is there:
+     * `dropped_snapshot IS NULL` is the commit read's own resolution
+     * clause (`CommitTail.READ_SQL`, `resolved`), verbatim, and it is
+     * here for the same reason it is there:
      * the table is the authority on whether its rows are reachable.
      * [markDropped] ends the version row in the same transaction, so on
      * well-formed data the two clauses agree; this one holds when the

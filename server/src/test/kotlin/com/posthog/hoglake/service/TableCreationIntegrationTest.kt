@@ -384,6 +384,39 @@ class TableCreationIntegrationTest {
     }
 
     @Test
+    fun `footer_size is refused by name, missing at publication and out of bounds at commit`() {
+        // Atomic publication requires footer_size (TableCreationService);
+        // every commit bounds it while it plans the append rows
+        // (CommitService.planAppends). The test above pins the class of
+        // the commit-side refusal; these pin both messages.
+        val catalog = catalog()
+        val operation = creations.prepare(catalog, UUID.randomUUID(), definition)
+        assertThatThrownBy {
+            creations.publish(catalog, operation.operationId, listOf(file(operation).copy(footerSize = null)))
+        }.isInstanceOf(HoglakeException.Validation::class.java)
+            .hasMessageContaining("missing footer_size")
+        catalogs.createTable(catalog, "test", "other", definition.columns)
+        val head = catalogs.getCatalog(catalog)
+        assertThatThrownBy {
+            CommitService(db.jdbi).commit(
+                catalog,
+                com.posthog.hoglake.model.CommitRequest(
+                    appends =
+                        listOf(
+                            com.posthog.hoglake.model.TableAppend(
+                                "test",
+                                "other",
+                                listOf(FileRegistration(head.dataPath + "/footer.parquet", 1, 100, 93)),
+                            ),
+                        ),
+                ),
+            )
+        }.isInstanceOf(HoglakeException.Validation::class.java)
+            .hasMessageContaining("invalid footer_size")
+        assertThat(catalogs.getCatalog(catalog)).isEqualTo(head)
+    }
+
+    @Test
     fun `versioned definitions use wire names and legacy receipts still retry and publish`() {
         val catalog = catalog()
         val def =

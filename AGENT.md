@@ -398,7 +398,8 @@ there would break that gate on every build.
     them. One predicate expresses the rule (`t.dropped_snapshot IS
     NULL`, or `:snapshot < t.dropped_snapshot` for a time-travel read)
     and every resolver, loop, gauge and check below uses it:
-    `TableRepo.findLive`/`findAt`, `CommitService.resolveLiveTable`,
+    `TableRepo.findLive`/`findAt`, the commit read's `resolved` CTE
+    (`CommitTail.READ_SQL`),
     `CompactionService`'s planner AND its commit re-verification,
     `Hydrator.claimPending`/`rehydrateFailed`, `CatalogMetrics`'s
     sample, `MaintenanceSummarySampler`'s scan.

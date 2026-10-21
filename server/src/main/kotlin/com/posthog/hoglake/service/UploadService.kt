@@ -338,7 +338,9 @@ class UploadService(
 
         /**
          * [register]: reads and locks the claims of a publication's
-         * `:paths`, in `upload_id` order.
+         * `:paths`, in `upload_id` order. A commit runs it VERBATIM as the
+         * `claims` CTE of `CommitTail.READ_SQL`, so its plan test covers
+         * both.
          *
          * Binds `:catalog` and `:paths`.
          */
@@ -423,10 +425,7 @@ class UploadService(
             files: List<Pair<String, String>>,
         ) {
             if (files.isEmpty()) return
-            val kinds = files.toMap()
-            if (files.any { (path, kind) -> kinds[path] != kind }) {
-                throw HoglakeException.Validation("one upload path cannot hold both data and deletion vectors")
-            }
+            val kinds = registrationKinds(files)
             // FOR UPDATE: the claim transitions no longer serialize on the
             // catalog commit lock, so this read-then-settle pair holds the
             // rows itself. Without it, abort/expiry could flip a row to
@@ -458,6 +457,42 @@ class UploadService(
                     claims.filter { it.state == "registered" }.map { it.path },
                 )
                     .map { rs, _ -> rs.getString("path") to rs.getString("file_kind") }.list().toSet()
+            val settle = claimsToSettle(claims, retained, kinds, owner)
+            h.createUpdate(
+                """
+                UPDATE hog_upload SET state = 'registered'
+                WHERE catalog_id = :catalog AND upload_id = ANY(:ids)
+            """,
+            ).bind("catalog", catalogId).bindArray("ids", UUID::class.java, settle).execute()
+        }
+
+        /**
+         * The path -> file kind map [register] settles, refusing a path
+         * registered as both. Request-only: no claim row is read.
+         */
+        internal fun registrationKinds(files: List<Pair<String, String>>): Map<String, String> {
+            val kinds = files.toMap()
+            if (files.any { (path, kind) -> kinds[path] != kind }) {
+                throw HoglakeException.Validation("one upload path cannot hold both data and deletion vectors")
+            }
+            return kinds
+        }
+
+        /**
+         * [register]'s decision over the claim rows of [kinds]' paths, which
+         * the caller has LOCKED (`REGISTER_CLAIMS_SQL`'s `FOR UPDATE`), and
+         * the subset of their registered paths a file row still claims
+         * ([retained], as (path, file kind)): the ids of the active claims
+         * to settle as 'registered', or the refusal. Shared with the commit
+         * tail (`CommitTail`), which reads the same rows in its one read
+         * statement and settles them in its one write statement.
+         */
+        internal fun claimsToSettle(
+            claims: List<UploadClaim>,
+            retained: Set<Pair<String, String>>,
+            kinds: Map<String, String>,
+            owner: UUID?,
+        ): List<UUID> {
             for (claim in claims) {
                 if (claim.state == "registered" && claim.fileKind == kinds[claim.path] &&
                     (claim.path to claim.fileKind) in retained
@@ -470,18 +505,7 @@ class UploadService(
                     )
                 }
             }
-            h.createUpdate(
-                """
-                UPDATE hog_upload SET state = 'registered'
-                WHERE catalog_id = :catalog AND upload_id = ANY(:ids)
-            """,
-            ).bind("catalog", catalogId).bindArray(
-                "ids",
-                UUID::class.java,
-                claims.filter {
-                    it.state == "active"
-                }.map { it.uploadId },
-            ).execute()
+            return claims.filter { it.state == "active" }.map { it.uploadId }
         }
     }
 }
