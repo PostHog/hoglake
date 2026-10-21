@@ -1,0 +1,20 @@
+# uv workspace root, nothing more: no [project] table, so this is a
+# virtual root that is never built or installed. It exists so the four
+# Python trees share ONE uv.lock (beside this file). With per-directory
+# locks, bench, hedgerow and millrace each embedded pyhoglake's
+# requires-dist and dev group, Dependabot locked every directory on its
+# own, and every bump of a pin pyhoglake carries left the dependents'
+# locks stale and `uv sync --locked` red (#332).
+#
+# One lock means one version of every package across the members, and
+# one requires-python: the intersection of the members' (>=3.12, which
+# millrace's PEP 695 syntax needs). Each member keeps its own
+# dependencies, dev group, pins and tool config ([tool.ruff],
+# [tool.mypy], pytest markers); `uv sync` / `uv run` inside a member
+# directory selects that member and finds this root on its own.
+#
+# The per-member ruff/mypy pins stay duplicated on purpose: a dev group
+# here is not installed by a member's `uv sync`, and the lock already
+# guarantees the duplicates resolve to one version.
+[tool.uv.workspace]
+members = ["pyhoglake", "hedgerow", "bench", "millrace"]

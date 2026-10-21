@@ -43,11 +43,13 @@ updates:
       npm-minor-patch:
         update-types: [minor, patch]
 
+  # One entry for all four Python trees: they are members of ONE uv
+  # workspace (root pyproject.toml) with ONE uv.lock at the root, and
+  # Dependabot follows the workspace members from there. Per-directory
+  # entries locked each tree on its own, so a bump of a pin pyhoglake
+  # carries left the dependents' locks stale (#332).
   - package-ecosystem: uv
-    directories:
-      - /pyhoglake
-      - /hedgerow
-      - /bench
+    directory: /
     schedule:
       interval: weekly
     cooldown:

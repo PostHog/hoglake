@@ -19,7 +19,9 @@ in ONE request (see [Prepared
 appends](#prepared-appends--buffered-encode-one-request-uploads-one-commit));
 without it every object takes pyarrow's three-request multipart write,
 and pyhoglake logs one warning saying so. Development uses the flox env
-in this directory:
+in this directory; pyhoglake is a member of the repository's uv
+workspace, so the lock is the root `uv.lock`, shared with hedgerow,
+bench and millrace (`uv lock` here rewrites it):
 
 ```sh
 flox activate -- uv sync

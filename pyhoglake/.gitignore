@@ -8,5 +8,5 @@ __pycache__/
 .flox/lib/
 .flox/log/
 .flox/telemetry_id
-# uv.lock is tracked
+# uv.lock is tracked: one, at the repo root (the uv workspace lock)
 .hypothesis/

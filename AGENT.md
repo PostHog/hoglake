@@ -41,9 +41,19 @@ just webui test
 just webui build
 ```
 
-`ruff` is **pinned** in both Python trees' dev groups and run through
+`ruff` is **pinned** in every Python tree's dev group and run through
 `uv run` — never `uvx ruff`, which resolves a different rule set per
 machine and silently ignores the projects' `per-file-ignores`.
+
+The four Python trees (`pyhoglake/`, `hedgerow/`, `bench/`, `millrace/`)
+are **one uv workspace**: the root `pyproject.toml` lists the members and
+holds nothing else, and ONE root `uv.lock` pins all of them (Python
+>=3.12, the intersection of the members' floors). Dependents take
+pyhoglake as `{ workspace = true }`. `uv sync`/`uv run` inside a member
+directory select that member against the root lock; never add a
+per-directory `uv.lock` back — separately locked trees went stale on
+every pyhoglake pin bump (#332). The members share one `.venv` at the
+root.
 
 The server builds through the **checked-in Gradle wrapper**
 (`server/gradlew`, pinned in
@@ -121,10 +131,10 @@ React console, Python replication daemon:
 | Component | What | Stack | Tests |
 |---|---|---|---|
 | `server/` | The control plane: DDL, commits (OCC + admission backpressure), scans, changefeed, offsets, retention/expiry/cleanup, hydrator, compaction, retirement, metrics, audit | Kotlin 2.4 / JDK 25 (flox) / Ktor / JDBI / Flyway / parquet-java (footer reads + compaction writes) | JUnit 6 + Testcontainers (PG18, MinIO) + kotest-property |
-| `pyhoglake/` | Thin API client; owns the Python writer path (parquet with field IDs, footer stats, Iceberg bounds codec) | Python 3.12 (flox) / uv / httpx / pyarrow | pytest + pytest-httpx + hypothesis |
+| `pyhoglake/` | Thin API client; owns the Python writer path (parquet with field IDs, footer stats, Iceberg bounds codec) | Python 3.12 (flox) / uv (workspace member; root `uv.lock`) / httpx / pyarrow | pytest + pytest-httpx + hypothesis |
 | `webui/` | Lakekeeper-style management console: catalog browser (namespaces/tables/files/scan with time travel; the namespace listing is NAME, RECORD_COUNT, FILE_COUNT, FILE_SIZE, SNAPSHOTS, EARLIEST_SNAPSHOT, COMMENT — `table_uuid` stays on the wire but is shown on the table page, not as a column), newest-first snapshot timeline (`before` paging), consumers (grouped, names resolved, dropped badges), compaction-debt page, maintenance pages (central catalog×task matrix + per-catalog task panels over the run ledger), `/metrics` visualizer, instance-name badge; int64 wire fields carried as strings (lossless above 2^53) | Vite / React / TS | vitest (mocked fetch) |
-| `hedgerow/` | viaduck's successor: source table → destination table replication, append-only, single-destination | Python / uv / pyhoglake | pytest; scripted-fake unit + live integration |
-| `millrace/` | Kafka → hoglake ingestion daemon with SlateDB staging; see docs/kafka-ingestion.md | Python / uv / pyhoglake + slatedb | pytest + hypothesis + live stack |
+| `hedgerow/` | viaduck's successor: source table → destination table replication, append-only, single-destination | Python / uv (workspace member) / pyhoglake | pytest; scripted-fake unit + live integration |
+| `millrace/` | Kafka → hoglake ingestion daemon with SlateDB staging; see docs/kafka-ingestion.md | Python / uv (workspace member) / pyhoglake + slatedb | pytest + hypothesis + live stack |
 | `duckdb-client/` | DuckDB extension: ATTACH over REST, scan (partition pruning + deletion vectors), INSERT/UPDATE/DELETE via footer-shipping commits, DDL, time travel, metadata/maintenance functions | C++ / DuckDB (pinned) / cpp-httplib + yyjson (both duckdb-vendored) / roaring via vcpkg | sqllogictests against the live dev stack + cross-client wire vectors |
 
 The REST contract is `server/src/main/resources/openapi/hoglake.yaml`
@@ -143,9 +153,9 @@ path-scoped per component, posthog-monorepo style:
 | `server.yml` | every PR and push to main; a `changes` job selects `server/**`, codec vectors, the live-test harness, the file itself, and the heavy jobs skip otherwise (REQUIRED CHECK `server-checks`, the gate over `server-test` and `python-live`; see the ruleset note below) | server-test + ktlint (Docker/Testcontainers; schema-equivalence gate included), both live Python suites, and a `server-checks` gate that requires both suites before deployment, PR image boot-smoke, the gated `deploy` job, and `trino-test` — the integration harness against the fork's public image (`ghcr.io/posthog/trino`, newest ordered release tag; pin via the `HOGLAKE_TRINO_IMAGE` repo variable). trino-test runs on an ARM runner (the image is arm64-only), is NOT in deploy's `needs`, and must stay non-required: a broken fork build must never wedge hoglake CD |
 | `migration-chain.yml` | every PR and push to main, NO path filter | the append-only / no-duplicate-version / numbered-above-main gate on `server/src/main/resources/db/migration`, fetching main fresh at run time. Its own workflow because it is a REQUIRED CHECK, and it was the first to hit the rule below |
 | `webui.yml` | every PR and push to main; a `changes` job selects `webui/**`, the OpenAPI spec, the shared vectors, the file itself (REQUIRED CHECK `webui-test`) | `npm run build` (tsc gate) + vitest + PR image boot-smoke + gated `deploy` job |
-| `ci-python.yml` | every PR and push to main; a `changes` job selects `pyhoglake/**`, `hedgerow/**`, `bench/**`, the OpenAPI spec, `ci/**`, the workflow files, and the jobs skip otherwise (REQUIRED CHECK `python-checks`) | pyhoglake: `pyhoglake-checks.yml` (ruff, mypy, pytest on 3.11–3.13, build, wheel smoke test). hedgerow and bench: uv sync, ruff (pinned; bench exempt until its format backlog lands), pytest. Unit tests plus both live client suites through `python-live.yml`; a `python-checks` job fails if any dependency fails |
-| `bench-image.yml` | `bench/**` `pyhoglake/**` | builds `bench/Dockerfile` (context = REPO ROOT: bench installs pyhoglake from the sibling tree, so both must be in the context) and smokes it — CLI runs, non-root, no `.venv`, and the installed pyhoglake is this commit's and not PyPI's. A main push then publishes multi-arch `ghcr.io/posthog/hoglake-bench` (sha + `latest`), gated on the smoke and live client tests. NOT CD: no charts dispatch, no chart references it, it is pulled by hand into `bench/deploy/bench-pod.yaml`. Its build stage is deliberately NOT `$BUILDPLATFORM`-pinned — a virtualenv holds native wheels, so each arch installs its own |
-| `millrace-image.yml` | `millrace/**` `pyhoglake/**` `ci/**` | builds `millrace/Dockerfile` (context = REPO ROOT, same reason as bench) and smokes it — both entrypoints (`millrace`, `python -m millrace.maintenance`) refuse an empty env at config with exit 2, non-root, no `.venv`, pyhoglake is this commit's. A main push publishes multi-arch `ghcr.io/posthog/hoglake-millrace` tagged `r<UTC minute>-<sha6>` (the Kargo release tag; `org.opencontainers.image.revision`/`.source` annotations on the index, verified after push), by sha, and `latest`, gated on the smoke and the live suites. No charts dispatch: a Kargo Warehouse in PostHog/charts subscribes to the repository |
+| `ci-python.yml` | every PR and push to main; a `changes` job selects `pyhoglake/**`, `hedgerow/**`, `millrace/**`, `bench/**`, the root `pyproject.toml` and `uv.lock`, the OpenAPI spec, `ci/**`, the workflow files, and the jobs skip otherwise (REQUIRED CHECK `python-checks`) | pyhoglake: `pyhoglake-checks.yml` (ruff, mypy, pytest on 3.12–3.13, build, wheel smoke test). hedgerow and bench: uv sync, ruff (pinned; bench exempt until its format backlog lands), pytest. Unit tests plus both live client suites through `python-live.yml`; a `python-checks` job fails if any dependency fails |
+| `bench-image.yml` | `bench/**` `pyhoglake/**` root `pyproject.toml` `uv.lock` | builds `bench/Dockerfile` (context = REPO ROOT: bench installs pyhoglake as a uv workspace member from the root `uv.lock`, so the root manifest, the lock, pyhoglake and every member's `pyproject.toml` must be in the context) and smokes it — CLI runs, non-root, no `.venv`, and the installed pyhoglake is this commit's and not PyPI's. A main push then publishes multi-arch `ghcr.io/posthog/hoglake-bench` (sha + `latest`), gated on the smoke and live client tests. NOT CD: no charts dispatch, no chart references it, it is pulled by hand into `bench/deploy/bench-pod.yaml`. Its build stage is deliberately NOT `$BUILDPLATFORM`-pinned — a virtualenv holds native wheels, so each arch installs its own |
+| `millrace-image.yml` | `millrace/**` `pyhoglake/**` root `pyproject.toml` `uv.lock` `ci/**` | builds `millrace/Dockerfile` (context = REPO ROOT, same reason as bench) and smokes it — both entrypoints (`millrace`, `python -m millrace.maintenance`) refuse an empty env at config with exit 2, non-root, no `.venv`, pyhoglake is this commit's. A main push publishes multi-arch `ghcr.io/posthog/hoglake-millrace` tagged `r<UTC minute>-<sha6>` (the Kargo release tag; `org.opencontainers.image.revision`/`.source` annotations on the index, verified after push), by sha, and `latest`, gated on the smoke and the live suites. No charts dispatch: a Kargo Warehouse in PostHog/charts subscribes to the repository |
 | `python-live.yml` | reusable: server, Python checks, benchmark image | builds the checked-out server, starts PostgreSQL and MinIO, runs both live client suites (`live` job) and the millrace Kafka-ingestion live suite (`live-millrace` job, which adds apache/kafka to the stack via `ci/live-millrace.sh`), rejects skipped or empty reports, and saves logs and JUnit reports. A failed live run blocks server deployment, PyPI publishing, and benchmark image publishing |
 | `publish-pyhoglake.yml` | `pyhoglake-v*` tags; PRs touching the workflow | `pyhoglake-checks.yml`; tags also publish to PyPI (trusted publishing, `pypi` environment) and create a non-latest GitHub release |
 | `fuzz.yml` | nightly cron + dispatch | `./gradlew fuzz` over every Jazzer target (600s each by default), with the generated corpus accumulated across nights through the actions cache. Not a PR check: PR CI only REPLAYS the committed seed corpus, inside `:test` |
@@ -685,7 +695,8 @@ ran on the local stack and what it showed.
   and security scanning never notices staleness without a CVE).
   Dependabot version updates (.github/dependabot.yml) backstop this
   weekly; grouped minor/patch PRs get a normal review, majors get
-  their own.
+  their own. Python is ONE uv entry at `/` (the workspace root and its
+  one lock), so a bump lands in every member's lock at once.
 - **Migrations**: plain SQL in `server/src/main/resources/db/migration/`.
   **The chain is append-only as of v1.0.0** (2026-09-11, the Gigahog
   deploy): `V1__init.sql` is FROZEN — never edit it; schema changes are

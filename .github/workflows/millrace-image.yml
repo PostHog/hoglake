@@ -17,6 +17,8 @@ name: Millrace image
 # pyhoglake/** is a trigger path as much as millrace/** is: millrace
 # installs the client from the sibling tree, so a pyhoglake change IS a
 # millrace image change.
+# The root pyproject.toml and uv.lock likewise: the image installs from
+# the workspace lock, so a lock-only change IS an image change.
 
 on:
   push:
@@ -24,6 +26,8 @@ on:
     paths:
       - "millrace/**"
       - "pyhoglake/**"
+      - "pyproject.toml"
+      - "uv.lock"
       - ".github/workflows/millrace-image.yml"
       - ".github/workflows/python-live.yml"
       - "ci/**"
@@ -32,6 +36,8 @@ on:
     paths:
       - "millrace/**"
       - "pyhoglake/**"
+      - "pyproject.toml"
+      - "uv.lock"
       - ".github/workflows/millrace-image.yml"
       - ".github/workflows/python-live.yml"
       - "ci/**"

@@ -34,7 +34,10 @@ The live soak (`tests/live/test_live_soak.py`) runs only when
 image, two entrypoints. The default (`millrace`) is the pipeline; the
 SlateDB GC service runs as `python -m millrace.maintenance`. Both refuse
 an empty environment with exit 2 (the image smoke test). Non-root
-(uid 10001), nothing written outside `/work` and `/tmp`.
+(uid 10001), nothing written outside `/work` and `/tmp`. The build
+context is the repository root (`docker build -f millrace/Dockerfile .`):
+millrace is a uv workspace member and the image installs it, and
+pyhoglake, from the root `uv.lock`.
 `.github/workflows/millrace-image.yml` builds on every PR and publishes
 on every main push, tagged `r<UTC build minute>-<sha6>`, by sha and
 `latest`.
