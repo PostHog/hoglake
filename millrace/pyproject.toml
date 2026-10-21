@@ -16,7 +16,7 @@ dependencies = [
     # layer unpacks two-tuples and raises "too many values to unpack"
     # for every sorted flush (verified by bisecting 21.0.0–25.0.0 in
     # scratch venvs; the failure mode is every sorted flush refusing).
-    "pyarrow>=25.0",
+    "pyarrow>=26.0.0",
     # Pinned to the 0.17.x line: the binding-parity suite
     # (tests/test_slatedb_parity.py) pins THIS version's observed
     # semantics — lazy FENCED on a contested open, GC-beside-a-writer
