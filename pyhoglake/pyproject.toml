@@ -20,7 +20,7 @@ dependencies = [
     # requires from 21 (measured against 18.0/18.1/19.0/20.0, all of
     # which write a bare FIXED_LEN_BYTE_ARRAY(16)). Current release at
     # the time of the bump: 25.0.1.
-    "pyarrow>=21.0",
+    "pyarrow>=26.0.0",
     "thrift>=0.22.0,<1",
 ]
 
@@ -44,7 +44,7 @@ dependencies = [
 # endpoints before, so an install must not silently get the other
 # framing. boto3 1.36.0 (PyPI, 2025-01-15) is the matching release: it
 # requires botocore >=1.36.0,<1.37.0.
-fast-upload = ["boto3>=1.36.0"]
+fast-upload = ["boto3>=1.43.114"]
 
 [project.urls]
 Repository = "https://github.com/PostHog/hoglake"
@@ -68,7 +68,7 @@ dev = [
     # Not optional for the suite: the single-request upload path is only
     # covered if boto3 is importable here. Same floor as the extra, so
     # the suite cannot pass against framing the extra would not install.
-    "boto3>=1.36.0",
+    "boto3>=1.43.114",
 ]
 
 [build-system]
