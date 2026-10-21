@@ -66,7 +66,7 @@ nonblank, as on the other destructive routes. Under the catalog's commit lock
 it is refused with 409 `catalog_not_empty` and a `reason` — `live_namespaces`,
 `tables_pending_retirement`, `files_pending_expiry`, `removals_pending`,
 `active_compaction_claims`, `consumer_offsets`, `active_uploads`,
-`unscheduled_abandoned_uploads`, the first that applies in that order — unless
+`abandoned_uploads_unsettled`, the first that applies in that order — unless
 no live namespace, file row, undrained removal row, unexpired compaction claim,
 consumer offset or upload in flight remains. Then one `DELETE FROM hog_catalog`
 and the thirteen `ON DELETE CASCADE` foreign keys remove the history with it, so

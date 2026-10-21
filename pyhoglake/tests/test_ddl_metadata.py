@@ -9,11 +9,11 @@ from test_client import CATALOG_WIRE, TABLE_WIRE, _receipt
 
 from pyhoglake import (
     CatalogFilesPendingExpiryError,
+    CatalogHasAbandonedUploadsError,
     CatalogHasActiveCompactionClaimsError,
     CatalogHasActiveUploadsError,
     CatalogHasConsumerOffsetsError,
     CatalogHasLiveNamespacesError,
-    CatalogHasUnscheduledUploadsError,
     CatalogNotEmptyError,
     CatalogRemovalsPendingError,
     CatalogTablesPendingRetirementError,
@@ -384,7 +384,7 @@ _REFUSALS = {
     "active_compaction_claims": CatalogHasActiveCompactionClaimsError,
     "consumer_offsets": CatalogHasConsumerOffsetsError,
     "active_uploads": CatalogHasActiveUploadsError,
-    "unscheduled_abandoned_uploads": CatalogHasUnscheduledUploadsError,
+    "abandoned_uploads_unsettled": CatalogHasAbandonedUploadsError,
 }
 
 

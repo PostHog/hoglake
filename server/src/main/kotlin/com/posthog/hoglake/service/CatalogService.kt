@@ -207,14 +207,18 @@ class CatalogService(private val jdbi: Jdbi) {
      *    clears these by hand; the refusal names the consumers.
      *  - active upload claims: a writer may be mid-PUT, and its object
      *    would land under a prefix nothing tracks.
-     *  - abandoned uploads never offered to cleanup (`last_scheduled_at
-     *    IS NULL`): their objects may exist and no removal row exists for
-     *    them yet. NOT in #412's list; added because the cascade would
-     *    orphan exactly what the removal-queue precondition exists to
-     *    protect, one step earlier in the same pipeline. Tombstones that
-     *    were offered once are NOT blocking — they are re-offered forever
-     *    (a PUT can land after its DELETE), so requiring none would make
-     *    any catalog that ever abandoned an upload undroppable.
+     *  - abandoned uploads that are not SETTLED (`abandoned_uploads_unsettled`):
+     *    one never offered to cleanup (`last_scheduled_at IS NULL`), whose
+     *    object may exist with no removal row for it yet; or one still
+     *    inside its claim's expiry window (`expires_at > now()`), because
+     *    the writer's PUT can land until then — after the DELETE cleanup
+     *    already made — and after the drop nothing would ever re-offer it.
+     *    NOT in #412's list; added because the cascade would orphan exactly
+     *    what the removal-queue precondition protects, one step earlier in
+     *    the same pipeline. A tombstone scheduled once AND past its expiry
+     *    does not block: no PUT can land any more, and requiring none
+     *    would make any catalog that ever abandoned an upload undroppable.
+     *    The window costs a drop at most the claim's lifetime (24 h).
      *
      * WHAT IS LEFT TO CASCADE, decided rather than inherited:
      *  - `hog_snapshot` / `hog_snapshot_change`, versioned DDL rows,
@@ -304,10 +308,25 @@ class CatalogService(private val jdbi: Jdbi) {
      * resolved the catalog and queued on the lock behind this finds no
      * row at its first post-lock statement ([CatalogRepo.allocateSnapshot],
      * `CommitTail.read`), and a second concurrent drop finds none at
-     * [CatalogRepo.lockForDrop]. The two lock-free writers a client calls
-     * directly — an upload claim and an offset commit — resolve the
-     * catalog, then block on the drop's row lock at their INSERT and fail
-     * its foreign key; both map that 23503 to the same 404.
+     * [CatalogRepo.lockForDrop]. The lock-free writers a client calls
+     * directly — upload claim/renew/abandon and schedule-expired
+     * (`UploadService`), an offset commit, a table-creation prepare
+     * (`TableCreationService`) — resolve the catalog, then block on the
+     * drop's row lock at their INSERT and fail its foreign key; each maps
+     * that 23503 (`Pg.isCatalogForeignKeyViolation`, which matches only a
+     * violation against `hog_catalog`) to the same 404.
+     *
+     * THE BACKGROUND LOOPS ARE NOT MAPPED, deliberately. A compaction
+     * sweep's claim or staging-ticket INSERT, a hydrator settle, a
+     * sampler tier write or a maintenance-ledger row that runs into a drop
+     * fails its foreign key, finds its rows gone, or — past the commit
+     * lock — finds no catalog row (`droppedWhileQueued`), and the loop's per-catalog isolation
+     * turns that into ONE failed run for a catalog that no longer exists —
+     * logged, and gone from the next sweep's catalog list. The same is
+     * true of a manual `POST .../maintenance/<task>` trigger racing the drop, which
+     * answers with that run's failure. Mapping each of them would be code
+     * on every hot loop for an event that happens once per catalog's
+     * life.
      *
      * Metrics: none of its own, like the other DDL. The commit-lock wait
      * histogram records it through [Locks.acquireCatalogCommitLock], and

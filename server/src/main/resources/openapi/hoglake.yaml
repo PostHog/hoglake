@@ -119,7 +119,8 @@ paths:
         retirement, ended rows for expiry's purge), no undrained
         removal-queue row, no unexpired compaction claim, no consumer
         offset, no active upload claim and
-        no abandoned upload that was never offered to cleanup. The body's
+        no abandoned upload that is unscheduled or still inside its claim's
+        expiry window (a late PUT can land until then). The body's
         `reason` names the FIRST failing precondition in that order, which
         is the order to resolve them in; `detail` names every failing one.
         On success the catalog row is deleted and its history goes with
@@ -154,8 +155,10 @@ paths:
             writing an output; claims expire within an hour),
             `consumer_offsets` (there is no offset-delete API),
             `active_uploads` (register, abandon, or let them expire and
-            schedule them), `unscheduled_abandoned_uploads` (run
-            uploads/schedule-expired, then let cleanup drain).
+            schedule them), `abandoned_uploads_unsettled` (abandoned
+            uploads unscheduled or inside their claim's expiry window: run
+            uploads/schedule-expired, let cleanup drain, wait out the
+            expiry).
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
@@ -3099,7 +3102,7 @@ components:
             conflict.
         reason:
           type: string
-          enum: [live_namespaces, tables_pending_retirement, files_pending_expiry, removals_pending, active_compaction_claims, consumer_offsets, active_uploads, unscheduled_abandoned_uploads]
+          enum: [live_namespaces, tables_pending_retirement, files_pending_expiry, removals_pending, active_compaction_claims, consumer_offsets, active_uploads, abandoned_uploads_unsettled]
           description: >
             Present only on 409 catalog_not_empty: the first failing
             precondition of the catalog drop, in resolution order. See

@@ -11,6 +11,7 @@ import com.posthog.hoglake.model.TableAppend
 import com.posthog.hoglake.persistence.CatalogRepo
 import com.posthog.hoglake.testing.PgTestSupport
 import org.assertj.core.api.Assertions.assertThat
+import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.jdbi.v3.core.Jdbi
 import org.jdbi.v3.core.kotlin.withHandleUnchecked
 import org.jdbi.v3.core.statement.SqlLogger
@@ -326,6 +327,46 @@ class CatalogDropConcurrencyIntegrationTest {
             assertThat(dropped.outcome().exceptionOrNull()).describedAs("the drop after the tick").isNull()
         }
         assertThat(catalogExists("race-sampler")).isFalse()
+    }
+
+    @Test
+    fun `a table-creation prepare that loses the race is a 404, not a 500`() {
+        // Prepare takes no commit lock: it resolves the catalog and the live
+        // namespace, and only then INSERTs its receipt. The hook fires on
+        // that INSERT and, on another thread, drops the namespace AND the
+        // catalog to completion — prepare holds no lock either would wait
+        // on — so the INSERT then fails the receipt's foreign key.
+        // MUTATION: removing the Pg.isCatalogForeignKeyViolation mapping in
+        // TableCreationService.operationTransaction makes this an
+        // UnableToExecuteStatementException (a 500).
+        catalogs.createCatalog("race-prepare", "s3://bucket/race-prepare")
+        catalogs.createNamespace("race-prepare", "ns")
+        val fired = AtomicBoolean()
+        jdbi.setSqlLogger(
+            object : SqlLogger {
+                override fun logBeforeExecution(context: StatementContext) {
+                    if (!context.rawSql.contains("INSERT INTO hog_table_creation") ||
+                        !fired.compareAndSet(false, true)
+                    ) {
+                        return
+                    }
+                    pool.submit {
+                        catalogs.dropNamespace("race-prepare", "ns", author = "race-test", message = "fixture")
+                        drop("race-prepare")
+                    }.get(BLOCK_DEADLINE_MS, TimeUnit.MILLISECONDS)
+                }
+            },
+        )
+        val creations = TableCreationService(jdbi, catalogs, CommitService(jdbi))
+        assertThatThrownBy {
+            creations.prepare(
+                "race-prepare",
+                UUID.randomUUID(),
+                TableCreationDefinition("ns", "t", listOf(ColumnDef("id", ColType.LONG))),
+            )
+        }.isInstanceOf(HoglakeException.NotFound::class.java)
+        assertThat(fired.get()).isTrue()
+        assertThat(catalogExists("race-prepare")).isFalse()
     }
 
     @Test

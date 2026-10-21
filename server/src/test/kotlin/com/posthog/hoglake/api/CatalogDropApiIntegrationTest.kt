@@ -392,6 +392,32 @@ class CatalogDropApiIntegrationTest {
         }
 
     @Test
+    fun `the consumer sample marks truncation only when there are more than it names`() =
+        api {
+            // The SQL fetches cap + 1 names, so "..." is a fact about the
+            // rows. MUTATION: fetching exactly the cap (and guessing at
+            // `size >= cap`) prints "..." at exactly ten consumers.
+            for ((catalog, consumers) in listOf("cd-ten" to 10, "cd-eleven" to 11)) {
+                create(catalog)
+                val id = catalogs.getCatalog(catalog).catalogId
+                jdbi.useHandleUnchecked { h ->
+                    h.createUpdate(
+                        "INSERT INTO hog_consumer_offset (catalog_id, consumer_id, table_uuid, committed_snapshot) " +
+                            "SELECT :c, 'consumer-' || lpad(g::text, 2, '0'), gen_random_uuid(), 0 " +
+                            "FROM generate_series(1, :n) g",
+                    ).bind("c", id).bind("n", consumers).execute()
+                }
+                val detail = assertRefused(catalog, "consumer_offsets")["detail"].asText()
+                assertThat(detail).contains("$consumers consumer offset(s)").contains("consumer-10")
+                if (consumers == 10) {
+                    assertThat(detail).doesNotContain("...")
+                } else {
+                    assertThat(detail).contains("consumer-10, ...").doesNotContain("consumer-11")
+                }
+            }
+        }
+
+    @Test
     fun `an active upload claim refuses the drop`() =
         api {
             create("cd-upload")
@@ -415,12 +441,42 @@ class CatalogDropApiIntegrationTest {
             val claim = uploads.claim("cd-tombstone", UUID.randomUUID(), owner, "s3://$BUCKET/cd-tombstone", "data")
             assertThat(uploads.abandon("cd-tombstone", owner, listOf(claim.path))).isEqualTo(1)
             val id = catalogs.getCatalog("cd-tombstone").catalogId
-            assertRefused("cd-tombstone", "unscheduled_abandoned_uploads")
+            assertRefused("cd-tombstone", "abandoned_uploads_unsettled")
             // Scheduling it moves the block to the queue, which is the chain
             // the reasons are ordered by.
             assertThat(uploads.scheduleExpired("cd-tombstone")).isEqualTo(1)
             assertRefused("cd-tombstone", "removals_pending")
             assertThat(rows("hog_upload", id, "state = 'abandoned'")).isEqualTo(1)
+        }
+
+    @Test
+    fun `a scheduled tombstone refuses while its PUT can still land, and cascades once expired`() =
+        api {
+            // Abandoned, scheduled, and drained by cleanup (the object was
+            // never PUT, so `absent`): every queue-side check passes. But the
+            // claim is still inside its expiry window, so the writer's PUT
+            // can land AFTER that DELETE, and once the catalog is gone
+            // nothing would ever re-offer the path. MUTATION: dropping the
+            // `expires_at > now()` term lets this drop through.
+            create("cd-late-put")
+            objects // the bucket, for the drain
+            val uploads = UploadService(jdbi)
+            val owner = UUID.randomUUID()
+            val claim = uploads.claim("cd-late-put", UUID.randomUUID(), owner, "s3://$BUCKET/cd-late-put", "data")
+            uploads.abandon("cd-late-put", owner, listOf(claim.path))
+            assertThat(uploads.scheduleExpired("cd-late-put")).isEqualTo(1)
+            CleanupService(jdbi, removals).runOnce("cd-late-put", batchSize = 100)
+            val id = catalogs.getCatalog("cd-late-put").catalogId
+            assertThat(rows("hog_file_removal", id, "drained_at IS NULL")).isZero()
+            assertRefused("cd-late-put", "abandoned_uploads_unsettled")
+            // Past expiry no PUT can land: the tombstone is settled and
+            // cascades with the catalog.
+            jdbi.useHandleUnchecked { h ->
+                h.createUpdate("UPDATE hog_upload SET expires_at = now() - interval '1 second' WHERE catalog_id = :c")
+                    .bind("c", id).execute()
+            }
+            assertThat(drop("cd-late-put").status).isEqualTo(HttpStatusCode.OK)
+            assertThat(rows("hog_upload", id)).isZero()
         }
 
     @Test
@@ -610,6 +666,14 @@ class CatalogDropApiIntegrationTest {
                 assertThat(rows("hog_file_removal", id, "drained_at IS NULL")).isZero()
                 paths.forEach { assertThat(removals.exists(it)).describedAs("cleanup deleted %s", it).isFalse() }
                 views.drop(name, "ns", "v", AUTHOR, "lifecycle: drop view")
+                // The tombstone's claim expiring: the time a production
+                // catalog waits out, after which no late PUT can land.
+                jdbi.useHandleUnchecked { h ->
+                    h.createUpdate(
+                        "UPDATE hog_upload SET expires_at = now() - interval '1 second' WHERE catalog_id = :c",
+                    )
+                        .bind("c", id).execute()
+                }
                 // Every one of these has rows BEFORE the drop, so the cascade
                 // assertions below are about rows that were there, not about
                 // tables that were empty all along.

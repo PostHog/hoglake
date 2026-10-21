@@ -28,11 +28,11 @@ import pyarrow.parquet as pq
 from .errors import (
     AlreadyExistsError,
     CatalogFilesPendingExpiryError,
+    CatalogHasAbandonedUploadsError,
     CatalogHasActiveCompactionClaimsError,
     CatalogHasActiveUploadsError,
     CatalogHasConsumerOffsetsError,
     CatalogHasLiveNamespacesError,
-    CatalogHasUnscheduledUploadsError,
     CatalogNotEmptyError,
     CatalogRemovalsPendingError,
     CatalogTablesPendingRetirementError,
@@ -150,7 +150,7 @@ _CATALOG_NOT_EMPTY_ERRORS: dict[str, type[CatalogNotEmptyError]] = {
         CatalogHasActiveCompactionClaimsError,
         CatalogHasConsumerOffsetsError,
         CatalogHasActiveUploadsError,
-        CatalogHasUnscheduledUploadsError,
+        CatalogHasAbandonedUploadsError,
     )
     if cls.wire_reason is not None
 }
@@ -795,8 +795,8 @@ class Catalog:
         first precondition that fails: a live namespace, file rows that
         retirement or expiry has not removed yet, an undrained removal
         queue, an unexpired compaction claim, a consumer offset, an active
-        upload claim, or an abandoned
-        upload never offered to cleanup. ``detail`` names all of them.
+        upload claim, or an abandoned upload that is unscheduled or still
+        inside its claim's expiry window. ``detail`` names all of them.
 
         Metadata only: the returned ``data_path`` is the prefix the
         catalog owned, and nothing under it is deleted. There is no

@@ -250,7 +250,7 @@ object CatalogRepo {
         val consumerOffsets: Long,
         val consumerSample: List<String>,
         val activeUploads: Long,
-        val unscheduledAbandonedUploads: Long,
+        val abandonedUploadsUnsettled: Long,
     ) {
         /**
          * The failing preconditions in [CatalogNotEmptyReason] order —
@@ -309,22 +309,31 @@ object CatalogRepo {
                             "or let them expire and run uploads/schedule-expired",
                     )
                 }
-                if (unscheduledAbandonedUploads > 0) {
+                if (abandonedUploadsUnsettled > 0) {
                     add(
-                        CatalogNotEmptyReason.UNSCHEDULED_ABANDONED_UPLOADS to
-                            "$unscheduledAbandonedUploads abandoned upload(s) never offered to cleanup; " +
-                            "run uploads/schedule-expired, then let cleanup drain",
+                        CatalogNotEmptyReason.ABANDONED_UPLOADS_UNSETTLED to
+                            "$abandonedUploadsUnsettled abandoned upload(s) unscheduled or still inside " +
+                            "their claim's expiry window (a late PUT can land until then); run " +
+                            "uploads/schedule-expired, let cleanup drain, and wait out the expiry",
                     )
                 }
             }
 
-        /** A capped name list; [total] null when the count is of something else (offset rows, not consumers). */
-        private fun sample(
+        /**
+         * A capped name list. [names] holds up to [DROP_BLOCKER_SAMPLE] + 1
+         * (the SQL fetches one more than it prints), so "there are more"
+         * is a fact about the rows rather than a guess at exactly the cap;
+         * [total] is the counted population when there is one (namespaces),
+         * null when the count is of something else (offset rows, not
+         * consumers).
+         */
+        internal fun sample(
             names: List<String>,
             total: Long?,
         ): String {
-            val truncated = if (total != null) total > names.size else names.size >= DROP_BLOCKER_SAMPLE
-            return names.joinToString(", ") + if (truncated) ", ..." else ""
+            val shown = names.take(DROP_BLOCKER_SAMPLE)
+            val truncated = names.size > DROP_BLOCKER_SAMPLE || (total != null && total > shown.size)
+            return shown.joinToString(", ") + if (truncated) ", ..." else ""
         }
     }
 
@@ -372,7 +381,8 @@ object CatalogRepo {
      * backlog is GET .../storage-usage's job. The counted arms are bounded
      * by what they count (namespaces, consumers, uploads in flight).
      *
-     * Binds `:catalogId` and `:sample`. No interpolated values (invariant 9).
+     * Binds `:catalogId` and `:sample` (the name cap plus one). No
+     * interpolated values (invariant 9).
      */
     internal const val DROP_BLOCKERS_SQL: String =
         """
@@ -399,7 +409,7 @@ object CatalogRepo {
             WHERE catalog_id = :catalogId AND state = 'active') AS active_uploads,
           (SELECT count(*) FROM hog_upload
             WHERE catalog_id = :catalogId AND state = 'abandoned'
-              AND last_scheduled_at IS NULL) AS unscheduled_abandoned_uploads
+              AND (last_scheduled_at IS NULL OR expires_at > now())) AS abandoned_uploads_unsettled
         """
 
     fun dropBlockers(
@@ -408,7 +418,8 @@ object CatalogRepo {
     ): DropBlockers =
         handle.createQuery(DROP_BLOCKERS_SQL)
             .bind("catalogId", catalogId)
-            .bind("sample", DROP_BLOCKER_SAMPLE)
+            // One past the cap, so sample() can tell "exactly ten" from "more".
+            .bind("sample", DROP_BLOCKER_SAMPLE + 1)
             .map { rs, _ ->
                 fun names(column: String): List<String> = (rs.getArray(column).array as Array<*>).map { it as String }
                 DropBlockers(
@@ -421,7 +432,7 @@ object CatalogRepo {
                     consumerOffsets = rs.getLong("consumer_offsets"),
                     consumerSample = names("consumer_sample"),
                     activeUploads = rs.getLong("active_uploads"),
-                    unscheduledAbandonedUploads = rs.getLong("unscheduled_abandoned_uploads"),
+                    abandonedUploadsUnsettled = rs.getLong("abandoned_uploads_unsettled"),
                 )
             }
             .one()

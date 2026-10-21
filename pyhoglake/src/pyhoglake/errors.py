@@ -316,11 +316,13 @@ class CatalogHasActiveUploadsError(CatalogNotEmptyError):
     wire_reason = "active_uploads"
 
 
-class CatalogHasUnscheduledUploadsError(CatalogNotEmptyError):
-    """``unscheduled_abandoned_uploads`` — abandoned uploads that were never
-    offered to cleanup; schedule them, then let cleanup drain."""
+class CatalogHasAbandonedUploadsError(CatalogNotEmptyError):
+    """``abandoned_uploads_unsettled`` — abandoned uploads never offered to
+    cleanup, or still inside their claim's expiry window (a late PUT can
+    land until then). Schedule them, let cleanup drain, wait out the
+    expiry."""
 
-    wire_reason = "unscheduled_abandoned_uploads"
+    wire_reason = "abandoned_uploads_unsettled"
 
 
 class ReconciliationRequiredError(HoglakeError):

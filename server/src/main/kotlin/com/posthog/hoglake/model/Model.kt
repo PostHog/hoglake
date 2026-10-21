@@ -739,11 +739,16 @@ enum class CatalogNotEmptyReason(val wire: String) {
     ACTIVE_UPLOADS("active_uploads"),
 
     /**
-     * `hog_upload` tombstones that were abandoned but never offered to
-     * cleanup (`last_scheduled_at IS NULL`). Their objects may exist, and
-     * nothing has queued them; `POST .../uploads/schedule-expired` does.
+     * `hog_upload` tombstones that are not yet SETTLED: abandoned but never
+     * offered to cleanup (`last_scheduled_at IS NULL`), or still inside
+     * their claim's expiry window (`expires_at > now()`), during which the
+     * writer's PUT can still land — after a DELETE that cleanup already
+     * made, leaving an object nothing tracks once the catalog is gone.
+     * `POST .../uploads/schedule-expired` offers the first kind; the second
+     * only needs time (at most the claim's 24 h, less any renewal).
+     * Tombstones scheduled once AND past their expiry cascade.
      */
-    UNSCHEDULED_ABANDONED_UPLOADS("unscheduled_abandoned_uploads"),
+    ABANDONED_UPLOADS_UNSETTLED("abandoned_uploads_unsettled"),
 }
 
 data class NamespaceInfo(

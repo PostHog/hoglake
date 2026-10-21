@@ -159,7 +159,16 @@ class UploadService(
             // of taking the commit lock off this path. Selection above is
             // still one query; a candidate that stops qualifying between
             // the two is rejected by the fence, not by the snapshot.
-            claims.sumOf { id -> jdbi.inTransactionUnchecked { h -> fenceAndQueue(h, catalogId, id) } }
+            try {
+                claims.sumOf { id -> jdbi.inTransactionUnchecked { h -> fenceAndQueue(h, catalogId, id) } }
+            } catch (e: org.jdbi.v3.core.statement.UnableToExecuteStatementException) {
+                // The queue INSERT after a fence takes no commit lock either:
+                // a catalog drop that commits mid-sweep fails its foreign key.
+                // (Or deadlocks it first — CatalogService.dropCatalog's LOCK
+                // ORDER — which stays a 500 to retry.)
+                if (Pg.isCatalogForeignKeyViolation(e)) throw HoglakeException.NotFound("catalog '$catalog'")
+                throw e
+            }
         }
 
     /**
