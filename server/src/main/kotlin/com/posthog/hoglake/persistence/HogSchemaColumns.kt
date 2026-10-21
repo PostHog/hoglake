@@ -83,7 +83,7 @@ object HogSchemaColumns {
                     // request path reads it.
                     "retirement_eligible_at",
                 ),
-            // TableRepo versioned-name mappers, CommitService.resolveLiveTable.
+            // TableRepo versioned-name mappers, CommitTail.READ_SQL (resolution).
             "hog_table_version" to
                 setOf(
                     "catalog_id", "table_id", "begin_snapshot", "end_snapshot",
@@ -97,10 +97,10 @@ object HogSchemaColumns {
                     // V9: the tree edge; NULL = top-level column.
                     "parent_field_id", "comment",
                 ),
-            // CommitService.writeAppends (rollup + row-id allocator).
+            // CommitTail's append rows (rollup + row-id allocator).
             "hog_table_stats" to
                 setOf("catalog_id", "table_id", "record_count", "file_size_bytes", "next_row_id"),
-            // FileRepo mappers, CommitService.writeAppends, Hydrator,
+            // FileRepo mappers, CommitTail's append rows, Hydrator,
             // CompactionService (candidates + output insert).
             "hog_data_file" to
                 setOf(
@@ -109,14 +109,14 @@ object HogSchemaColumns {
                     "row_id_start", "stats_state", "spec_id", "explicit_row_ids",
                     "missing_field_ids",
                     // V18: row-group start offsets. Written by
-                    // CommitService.writeAppends, Hydrator.hydrate and
+                    // CommitTail's append rows, Hydrator.hydrate and
                     // CompactionService.commitGroup; read by
                     // ScanService.planScan (include=split_offsets) only.
                     "split_offsets",
                 ),
             // FileRepo.columnStatsMapper / scanColumnStatsMapper (the
             // shared read shapes) and AlterService's promote re-encode on
-            // the read side; CommitService.writeAppends,
+            // the read side; CommitTail's append rows,
             // Hydrator.upsertStats and CompactionService.commitGroup on
             // the write side.
             "hog_file_column_stats" to
@@ -145,7 +145,7 @@ object HogSchemaColumns {
                     "catalog_id", "table_id", "sort_id", "key_index", "source_field_id",
                     "direction", "null_order",
                 ),
-            // DeleteFileReadRepo, CommitService.applyDeletes.
+            // DeleteFileReadRepo, CommitTail (DV targets, supersession, inserts).
             "hog_delete_file" to
                 setOf(
                     "catalog_id", "delete_file_id", "table_id", "data_file_id", "begin_snapshot",

@@ -387,6 +387,34 @@ class UploadServiceIntegrationTest {
     }
 
     @Test
+    fun `a replay answers from its receipt without locking its claims`() {
+        // The commit tail reads everything in one statement (#393), the
+        // claims FOR UPDATE among it, and a receipt hit must still touch
+        // nothing a publication would: before it, a replay read its receipt
+        // and returned. MUTATION: drop the receipt filter over the claims
+        // in CommitTail.READ_SQL and the replay queues behind the holder.
+        val catalog = catalog()
+        val owner = UUID.randomUUID()
+        val claim = claim(catalog, owner)
+        val request = request(catalog, owner, claim)
+        val published = commits.commit(catalog, request)
+        val holder = db.jdbi.open()
+        val pool = java.util.concurrent.Executors.newSingleThreadExecutor()
+        try {
+            holder.begin()
+            // Stand in for any transaction holding the now-registered claim row.
+            holder.createQuery("SELECT state FROM hog_upload WHERE upload_id = :id FOR UPDATE")
+                .bind("id", claim.uploadId).mapTo(String::class.java).one()
+            val replay = pool.submit<com.posthog.hoglake.model.CommitResult> { commits.commit(catalog, request) }
+            assertThat(replay.get(5, java.util.concurrent.TimeUnit.SECONDS)).isEqualTo(published)
+        } finally {
+            pool.shutdownNow()
+            if (holder.isInTransaction) holder.rollback()
+            holder.close()
+        }
+    }
+
+    @Test
     fun `a deletion-vector path a delete file row still claims is never queued`() {
         val catalog = catalog()
         val owner = UUID.randomUUID()

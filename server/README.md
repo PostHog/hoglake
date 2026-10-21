@@ -132,6 +132,19 @@ snapshot ids dense and allocator math trivial; everything expensive a
 client does (writing parquet) happened before the request, so the
 serialized section is milliseconds of metadata writes.
 
+A commit's serialized section is TWO statements after the lock, whatever
+its shape (#393, `commit/CommitTail.kt`): one read of everything its
+checks decide on — receipt, head, table resolution, specs, live columns,
+the row-id allocators, the conflict rows, the upload claims (locked), the
+removal-queue collisions, DV targets — and one write of everything it
+publishes, every CTE hanging off an allocator UPDATE guarded by the values
+the read returned. The checks run between the two in Kotlin, in the order
+and with the refusals they always had. It used to be 14-24 statements, one
+round trip each, and on a catalog taking many small commits that fixed
+per-commit cost, not the per-file work, was the commits/s ceiling. The
+lock stays its own statement: under READ COMMITTED a statement's snapshot
+predates its own lock wait.
+
 Conflicts are optimistic and typed. A writer says which snapshot it
 planned against (`read_snapshot`); the service runs one indexed query
 over `hog_snapshot_change` for changes after that point that actually
