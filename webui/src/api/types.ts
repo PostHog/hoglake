@@ -1178,6 +1178,8 @@ export interface MaintenanceStatus {
   sampled_at?: string;
   sample_started_at?: string;
   sampled_snapshot_id?: Int64;
+  /** Re-anchors of the sample's scan; >0 means its file measures are a window observation. */
+  sample_reanchored?: number;
 }
 
 /** GET /v1/maintenance/status: every catalog's MaintenanceStatus, by name. */

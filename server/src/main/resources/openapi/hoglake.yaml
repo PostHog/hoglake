@@ -1196,8 +1196,11 @@ paths:
         exists, hydration, cleanup and compaction counts are absent
         (unknown, not zero). sample_started_at and sampled_at bound the
         observation window; sampled_snapshot_id identifies the file
-        visibility snapshot. Hydration state and removal-queue counts
-        are observations over that window. Backlog keys are
+        visibility snapshot the scan began at. Hydration state and
+        removal-queue counts are observations over that window, and so
+        are the file measures when sample_reanchored is above 0 (expiry
+        overtook the scan and it moved its visibility snapshot forward
+        rather than restart). Backlog keys are
         task-specific: hydrator -> pending_files, failed_files (its
         stats_state backlog); expiry -> snapshot_retention_seconds
         (absent when expiry is disabled), consumer_floor,
@@ -3535,7 +3538,11 @@ components:
             ones, and its value is what a client can reconcile against a
             time-travel read of the same table. Absent on a time-travel
             read, on a DDL receipt, under totals=false, and when the
-            sample does not cover the table.
+            sample does not cover the table. When the catalog's
+            `sample_reanchored` (MaintenanceStatus) is above 0, expiry
+            overtook that scan and it judged later files at a newer
+            snapshot, so the totals are an observation over the window
+            starting here rather than exact at it.
 
 
             THE SAME VALUE the sibling endpoints call
@@ -5762,7 +5769,21 @@ components:
         sampled_snapshot_id:
           type: integer
           format: int64
-          description: Catalog snapshot used for sampled file visibility.
+          description: >
+            Catalog snapshot the sample's scan began at, and its file
+            visibility snapshot unless sample_reanchored is above 0.
+        sample_reanchored:
+          type: integer
+          minimum: 0
+          description: >
+            How many times expiry overtook the sample's scan, which then
+            moved its file-visibility snapshot to the catalog head and
+            continued from its cursor instead of restarting. 0: the file
+            measures are exact at sampled_snapshot_id. Above 0: they are
+            an observation over the window from sample_started_at, like
+            the hydration and removal counts — files that ended inside
+            it may still be counted, files appended inside it may not
+            be. Absent with the rest of the sample.
         tasks:
           type: array
           description: All five maintenance tasks, always present.
@@ -5951,7 +5972,10 @@ components:
           description: >
             max(begin_snapshot) over the partition's files; null on a
             sample that predates the measure, and on a group with no
-            files.
+            files. Not bounded by sampled_snapshot_id: when the
+            catalog's sample_reanchored (MaintenanceStatus) is above 0
+            the scan judged later files at a newer snapshot, so this can
+            name a snapshot after it.
 
     PartitionListing:
       type: object
@@ -5981,7 +6005,11 @@ components:
           type: integer
           format: int64
           nullable: true
-          description: The snapshot the sample measured at. Every number below is at it, not at head.
+          description: >
+            The snapshot the sample's scan began at. Every number below
+            is at it, not at head — or, when the catalog's
+            sample_reanchored (MaintenanceStatus) is above 0, observed
+            over the window starting at it.
         spec:
           $ref: "#/components/schemas/PartitionSpecSummary"
         total:

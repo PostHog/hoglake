@@ -734,6 +734,18 @@ class CompactionConfigTest {
                 .isInstanceOf(IllegalArgumentException::class.java)
                 .hasMessageContaining("HOGLAKE_COMPACTION_MAX_CANDIDATES")
         }
+        // The new-bucket window: 0 is the read OFF and legal; a negative
+        // value or one past the ceiling is a per-sweep read over the plan
+        // statement timeout by typo.
+        for (bad in listOf(-1, CompactionConfig.MAX_MAX_CANDIDATES + 1)) {
+            assertThatThrownBy {
+                CompactionConfig(targetBytes = 1024, maxGroupsPerRun = 1, newBucketWindow = bad)
+            }.describedAs("newBucketWindow=%d", bad)
+                .isInstanceOf(IllegalArgumentException::class.java)
+                .hasMessageContaining("HOGLAKE_COMPACTION_NEW_BUCKET_WINDOW")
+        }
+        assertThat(CompactionConfig(targetBytes = 1024, maxGroupsPerRun = 1, newBucketWindow = 0).newBucketWindow)
+            .isZero()
         // The fan-in CEILING cannot be under its own floor.
         assertThatThrownBy {
             CompactionConfig(targetBytes = 1024, maxGroupsPerRun = 1, maxInputFiles = 64, maxFanIn = 8)
@@ -800,6 +812,7 @@ class CompactionConfigTest {
         assertThat(Config().compactionCandidateHeadroom)
             .isEqualTo(CompactionConfig.DEFAULT_CANDIDATE_HEADROOM)
         assertThat(Config().compactionMaxCandidates).isEqualTo(CompactionConfig.DEFAULT_MAX_CANDIDATES)
+        assertThat(Config().compactionNewBucketWindow).isEqualTo(CompactionConfig.DEFAULT_NEW_BUCKET_WINDOW)
         assertThat(Config().compactionMaxFanIn).isEqualTo(CompactionConfig.DEFAULT_MAX_FAN_IN)
     }
 

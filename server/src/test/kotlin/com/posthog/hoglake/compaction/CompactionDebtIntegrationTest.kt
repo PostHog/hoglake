@@ -236,7 +236,12 @@ class CompactionDebtIntegrationTest {
 
         // Exactly what an older build left behind: the bounds this build
         // requires are absent, and a field it has never heard of is
-        // present. Both break a strict Jackson bind.
+        // present. The unknown field alone is tolerated now
+        // (`MaintenanceSummarySampler.sampleFrom` ignores extra keys);
+        // the MISSING bounds are what must still drop the sample.
+        // MUTATION: drop `FAIL_ON_NULL_FOR_PRIMITIVES` from the lenient
+        // reader and this reds: the absent bounds read as 0 and the
+        // sample is served.
         db.jdbi.withHandleUnchecked { h ->
             h.createUpdate(
                 """
@@ -345,7 +350,7 @@ class CompactionDebtIntegrationTest {
     }
 
     @Test
-    fun `expiry overtaking a scan restarts it without publishing partial counts`() {
+    fun `expiry overtaking a scan re-anchors it without publishing partial counts`() {
         val (name, id) = seed(List(17) { 1024L })
         val worker = MaintenanceSummarySampler(db.jdbi, 65536, minFiles, maxFiles, 3600)
         worker.runOnce(3)
@@ -357,10 +362,16 @@ class CompactionDebtIntegrationTest {
             )
         }
         worker.runOnce(3)
+        // Still unpublished mid-scan: a re-anchor continues the scan, it
+        // does not publish what it has.
         assertThat(db.jdbi.withHandleUnchecked { MaintenanceSummarySampler.read(it, listOf(id)) }).isEmpty()
         complete(CompactionGrouping.of(65536), minFiles, maxFiles, batch = 3)
         val result = db.jdbi.withHandleUnchecked { MaintenanceSummarySampler.read(it, listOf(id)).getValue(id) }
-        assertThat(result.sample.snapshotId).isEqualTo(3)
+        // The scan's START, which a re-anchor does not move (it used to
+        // restart here and report 3); the re-anchor is on the sample.
+        // MaintenanceSummaryReanchorIntegrationTest has the full contract.
+        assertThat(result.sample.snapshotId).isEqualTo(2)
+        assertThat(result.sample.reanchors).isEqualTo(1)
         assertThat(result.sample.smallFiles).isEqualTo(17)
     }
 }

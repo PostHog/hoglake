@@ -2299,6 +2299,14 @@ data class MaintenanceStatus(
     val sampledAt: Instant? = null,
     val sampleStartedAt: Instant? = null,
     val sampledSnapshotId: Long? = null,
+    /**
+     * How many times the published sample's scan re-anchored because
+     * expiry overtook it (`MaintenanceSummarySampler`): 0 = its file
+     * measures are exact at [sampledSnapshotId], more = they are an
+     * observation over the window that starts there. Null with the rest
+     * of the sample.
+     */
+    val sampleReanchored: Int? = null,
 )
 
 /** Instance-wide rollup (GET /v1/maintenance/status): every catalog, by name. */

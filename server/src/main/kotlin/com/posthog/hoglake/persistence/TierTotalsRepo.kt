@@ -137,6 +137,41 @@ object TierTotalsRepo {
             ?.takeIf { it > 0 }
 
     /**
+     * The snapshot the PUBLISHED sample's scan captured when it BEGAN
+     * (`Sample.snapshotId`), or null when nothing is published.
+     *
+     * The lower bound of `CompactionService.newBuckets`: every live file
+     * the published generation may not have seen began after it. A
+     * re-anchored scan (`MaintenanceSummarySampler`) evaluated its later
+     * pages at a newer snapshot, but this value is the scan's start and
+     * never moves, which is the property that read needs.
+     *
+     * Read off the `sample` jsonb by key rather than through
+     * [MaintenanceSummarySampler.sampleFrom]: the strict parser drops a
+     * sample whose SHAPE this build does not know, and the planner must
+     * not lose its bound because a newer replica added a field. The key
+     * is Jackson's name for `Sample.snapshotId`, which every published
+     * shape has carried. `sample` is written by the same statement as
+     * `published_generation`, so it is never another generation's —
+     * unlike V27's `published_snapshot`, which a pre-V27 publish leaves
+     * behind.
+     */
+    fun publishedSampleSnapshot(
+        handle: Handle,
+        catalogId: Long,
+    ): Long? =
+        handle.createQuery(
+            """
+            SELECT (sample->>'snapshotId')::bigint FROM hog_maintenance_summary
+             WHERE catalog_id = :catalogId AND published_generation > 0
+            """,
+        )
+            .bind("catalogId", catalogId)
+            .mapTo(Long::class.javaObjectType)
+            .findOne()
+            .orElse(null)
+
+    /**
      * One table's totals over the catalog's PUBLISHED generation, with
      * that generation's own identity and freshness alongside.
      *

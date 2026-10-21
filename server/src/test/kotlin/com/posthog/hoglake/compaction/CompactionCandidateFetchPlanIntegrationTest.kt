@@ -834,4 +834,147 @@ class CompactionCandidateFetchPlanIntegrationTest {
             assertThat(group.partitionValues).hasSize(1)
         }
     }
+
+    // ---- the new-bucket read (CompactionService.newBuckets) -------------------
+
+    @Test
+    fun `the new-bucket read drives from the begin_snapshot index and reads only the files since the snapshot`() {
+        // THE BOUND IS THE APPENDS, NOT THE TABLE. `newBuckets` runs on
+        // every plan of every table once a generation is published, so
+        // the only acceptable cost is O(live files of this table since
+        // the sample's start snapshot) — on prod-us the last tens of
+        // minutes of ingest against a 7.6M-file table.
+        //
+        // In ONE ROLLED-BACK TRANSACTION, so the fixture every other test
+        // here measures is untouched: `newFiles` small files at snapshot
+        // 1 (the fixture's files are all at 0, which is the sample's
+        // snapshot) across `newTuples` tuples no file had before, plus
+        // the same again on a NEIGHBOUR table, which the read must not
+        // touch. ANALYZE inside the transaction rolls back with it.
+        val newFiles = 2_000
+        val newTuples = 20
+        val plan =
+            db.jdbi.withHandleUnchecked { h ->
+                h.begin()
+                try {
+                    h.execute("SET LOCAL max_parallel_workers_per_gather = 0")
+                    h.execute(
+                        "INSERT INTO hog_snapshot (catalog_id, snapshot_id, schema_version) VALUES (?, 1, 0) " +
+                            "ON CONFLICT DO NOTHING",
+                        catalogId,
+                    )
+                    for ((i, table) in listOf(tableId, tableIdOf(NEIGHBOURS.first())).withIndex()) {
+                        val base = 10_000_000L * (i + 1)
+                        h.createUpdate(
+                            """
+                            INSERT INTO hog_data_file (catalog_id, data_file_id, table_id, begin_snapshot,
+                                                       path, record_count, file_size_bytes, row_id_start, spec_id)
+                            SELECT :c, :base + g, :t, 1,
+                                   's3://fetchplan/' || md5((:base + g)::text) || '/new-' || g || '.parquet',
+                                   :rows, :bytes, (:base + g) * 1000000, 1
+                              FROM generate_series(1, :n) g
+                            """,
+                        ).bind("c", catalogId).bind("base", base).bind("t", table)
+                            .bind("rows", TINY_ROWS).bind("bytes", TINY_BYTES).bind("n", newFiles).execute()
+                        h.createUpdate(
+                            """
+                            INSERT INTO hog_file_partition_value (catalog_id, data_file_id, key_index, value)
+                            SELECT :c, :base + g, 0, 'new-' || lpad((g % :tuples)::text, 3, '0')
+                              FROM generate_series(1, :n) g
+                            """,
+                        ).bind("c", catalogId).bind("base", base).bind("tuples", newTuples)
+                            .bind("n", newFiles).execute()
+                    }
+                    h.execute("ANALYZE hog_data_file")
+                    h.execute("ANALYZE hog_file_partition_value")
+                    h.createQuery(
+                        "EXPLAIN (ANALYZE, BUFFERS, TIMING false, COSTS false, SUMMARY false) " +
+                            CompactionService.NEW_BUCKETS_SQL,
+                    )
+                        .bind("catalogId", catalogId)
+                        .bind("tableId", tableId)
+                        .bind("since", 0L)
+                        .bind("targetBytes", cfg.targetBytes)
+                        .bind("fileCap", cfg.newBucketWindow)
+                        .bind("minFiles", 2L)
+                        .bind("bucketCap", CompactionService.MAX_SAMPLED_BUCKETS)
+                        .mapTo(String::class.java).list().joinToString("\n")
+                } finally {
+                    h.rollback()
+                }
+            }
+        println("RECORDED new-bucket read over $newFiles new files on a $totalFiles-file fixture:\n$plan")
+
+        // THE ACCESS PATH: the (catalog_id, table_id, begin_snapshot) key,
+        // walked from the newest file. V3's `hog_data_file_changefeed` is
+        // that key over every row and `hog_data_file_live` the same key
+        // partial on live rows; either bounds the read by the range. PG
+        // 18 picks the changefeed index here, `end_snapshot IS NULL` and
+        // the size bound as a Filter (Index Searches: 1).
+        // MUTATION: drop `f.begin_snapshot > :since` and the scan's rows
+        // are the table's newest live small files up to the window (10,000
+        // here, not 2,000), most of them the sample's; drop the inner
+        // `ORDER BY f.begin_snapshot DESC` and Postgres is free to walk
+        // another index of the table until the cap fills.
+        val scan =
+            ExplainPlan.nodes(plan).single {
+                it.line.contains("on hog_data_file f") && it.line.contains("Scan")
+            }
+        // TWO SHAPES ARE ACCEPTED, both driven from that key. Here PG 18
+        // walks it backward and the LIMIT stops the walk. When it
+        // estimates the range at or below the window it may instead take
+        // a Bitmap Heap Scan over the same index plus a Sort (QE,
+        // measured): self-bounding, because it only does so when the
+        // whole range is at most the window, and the sort of at most
+        // `newBucketWindow` rows is in memory. What neither may be is a
+        // walk of the table.
+        val bitmap = scan.line.contains("Bitmap Heap Scan on hog_data_file f")
+        if (bitmap) {
+            assertThat(plan)
+                .describedAs("the bitmap is over the begin_snapshot key:\n%s", plan)
+                .containsPattern("Bitmap Index Scan on (hog_data_file_live|hog_data_file_changefeed)")
+        } else {
+            assertThat(scan.line)
+                .describedAs("driven from the begin_snapshot key:\n%s", plan)
+                .containsPattern(
+                    "Index Scan( Backward)? using (hog_data_file_live|hog_data_file_changefeed) on hog_data_file f",
+                )
+        }
+        val cond =
+            plan.lines().dropWhile { !it.contains(scan.line) }.drop(1).first { it.contains("Index Cond:") }
+        assertThat(cond).contains("table_id = ").contains("begin_snapshot > ")
+        assertThat(plan).doesNotContain("Seq Scan on hog_data_file")
+
+        // ROWS EXAMINED: exactly the new files of THIS table — none of
+        // the neighbour's 2,000 and none of the table's 140,000 older ones.
+        val scanned = Regex("""actual rows=([\d.]+)""").find(scan.line)!!.groupValues[1].toDouble().toLong()
+        assertThat(scanned)
+            .describedAs("rows read off the index are the files since the snapshot:\n%s", plan)
+            .isEqualTo(newFiles.toLong())
+        assertThat(rowsRemoved(plan)).describedAs("and nothing is read to be thrown away").isZero()
+        // The grouped answer: every new tuple, with all its files.
+        assertThat(actualRows(plan)).isEqualTo(newTuples.toLong())
+
+        // BUFFERS, split the way the cost splits. The scan node's count
+        // INCLUDES its per-row partition-value SubPlan, so the two are
+        // separated:
+        //  - the MANIFEST side (scan minus SubPlan): the index range and
+        //    the heap pages the appends sit on, adjacent as one commit's
+        //    are. Measured on PG 18: 63 buffers for 2,000 files, against
+        //    5,307 heap pages for one pass of the manifest;
+        //  - the SubPlan: one primary-key descent of
+        //    hog_file_partition_value per file, 4 buffers each (8,000).
+        //    Per-file, so bounded by the files since the snapshot and,
+        //    through the LIMIT, by `newBucketWindow`.
+        val subPlan =
+            ExplainPlan.nodes(plan).single { it.line.contains("on hog_file_partition_value pv") }
+        assertThat(subPlan.loops).isEqualTo(newFiles.toLong())
+        assertThat(subPlan.buffers)
+            .describedAs("one partition-value descent per new file:\n%s", plan)
+            .isLessThanOrEqualTo(5L * newFiles)
+        assertThat(scan.buffers - subPlan.buffers)
+            .describedAs("the manifest side is the range, not a pass of the table:\n%s", plan)
+            .isLessThanOrEqualTo(newFiles / 10L)
+            .isLessThan(heapPages("hog_data_file") / 20)
+    }
 }

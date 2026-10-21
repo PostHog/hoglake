@@ -156,6 +156,7 @@ class MaintenanceStatusService(
             sampledAt = valid?.sampledAt,
             sampleStartedAt = sample?.startedAt,
             sampledSnapshotId = sample?.snapshotId,
+            sampleReanchored = sample?.reanchors,
             tasks =
                 listOf(
                     MaintenanceTaskStatus(

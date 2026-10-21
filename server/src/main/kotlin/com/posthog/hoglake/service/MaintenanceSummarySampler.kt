@@ -1,5 +1,8 @@
 package com.posthog.hoglake.service
 
+import com.fasterxml.jackson.annotation.JsonIgnore
+import com.fasterxml.jackson.annotation.JsonInclude
+import com.fasterxml.jackson.databind.DeserializationFeature
 import com.fasterxml.jackson.databind.SerializationFeature
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
@@ -17,13 +20,139 @@ import java.time.OffsetDateTime
  * and saves the cursor + bucket accumulators atomically. No long-lived DB
  * snapshot, no manifest walk on a dashboard request, no work on commits.
  *
- * Files are evaluated at the captured catalog snapshot, traversed in
- * `(table_id, file_size_bytes, data_file_id)` order — the order
- * compaction BIN-PACKS in, which is why V10 adds an index for it. The
- * rule mirrored here is only decidable in size order. If expiry overtakes the
- * captured snapshot, restart without publishing a partial sample. Hydration
- * state and the removal queue are mutable: those counts are observations
- * over the sampling window, not a transactional point-in-time guarantee.
+ * Files are traversed in `(table_id, file_size_bytes, data_file_id)`
+ * order — the order compaction BIN-PACKS in, which is why V10 adds an
+ * index for it. The rule mirrored here is only decidable in size order.
+ * Hydration state and the removal queue are mutable: those counts are
+ * observations over the sampling window, not a transactional
+ * point-in-time guarantee. Since the re-anchor below, so is file
+ * visibility, whenever the published sample's `reanchors` is nonzero.
+ *
+ * # Expiry overtaking a scan RE-ANCHORS it; it no longer restarts it
+ *
+ * A scan captures `Scan.snapshot` (the catalog head when it began) and
+ * evaluates each page's visibility at `Scan.visibleAt`, which starts
+ * equal to it. When expiry advances `earliest_snapshot_id` past the
+ * snapshot being evaluated at, the rows that decided visibility there
+ * are being purged (expiry deletes ended rows below the floor in pages
+ * outside its lock, invariant 5), so a later page evaluated at the old
+ * snapshot could silently miss files that were visible at it. The scan
+ * used to answer that by DISCARDING itself and starting over at head.
+ *
+ * That restart is unbounded once a scan takes longer than retention,
+ * and on gigahog-prod-us (2026-10-21) both did: millpond's last
+ * complete scan was 58 min for ~7.6M rows (~0.36 ms/row at 10,000 rows
+ * per 1 s tick) against a 3,600 s retention, millrace's against 600 s.
+ * Neither published a generation after 2026-10-16. The gauges went
+ * stale, and worse, the compaction planner — which picks buckets only
+ * from the published generation — stopped seeing every partition
+ * written after it, i.e. the hottest ones.
+ *
+ * Now the scan RE-ANCHORS: `visibleAt` moves to the catalog's current
+ * head (`last_snapshot_id`), `reanchors` counts it, and the scan
+ * continues FROM ITS CURSOR. Head is always legal — expiry never passes
+ * head (invariant 5) — and it maximises the time until the next
+ * re-anchor. Any snapshot at or above the new floor is decidable: a row
+ * ended at or below the floor is invisible at every such snapshot, so
+ * its purge cannot change the answer.
+ *
+ * The RACE is the one the restart already relied on: expiry commits the
+ * floor advance under the commit lock BEFORE it purges a single row, and
+ * this transaction is REPEATABLE READ from its first statement, so a
+ * tick either sees the new floor (and re-anchors before its page) or
+ * sees none of the purge either.
+ *
+ * The other restart triggers stay restarts: a changed target, min or
+ * max input files changes what `selected`/`small_count` MEAN, and a
+ * generation mixing two definitions is not an observation of anything.
+ *
+ * # The keyset argument: no row is skipped or counted twice
+ *
+ * The cursor is a strict `>` on `(table_id, file_size_bytes,
+ * data_file_id)` and the upper bound an inclusive `<=` captured at
+ * `begin()`. All three columns are IMMUTABLE on a `hog_data_file` row
+ * (a file is never resized or re-tabled; compaction writes a NEW row)
+ * and `data_file_id` is unique within the catalog, so the key is a
+ * total order over rows that no snapshot changes. A re-anchor moves the
+ * snapshot that `visible` and the DV probe are evaluated at and NOTHING
+ * ELSE: it happens between pages, before the tick's page is read, so
+ * every page is evaluated at exactly one snapshot, every row at or below
+ * the cursor was paged exactly once (at the old one) and every row above
+ * it will be paged exactly once (at the new one). The page boundary is
+ * the cursor itself, so a row cannot sit on both sides of it.
+ *
+ * What a re-anchor DOES change is which DATA the rows describe, and the
+ * error is bounded by the files committed or ended inside the scan's
+ * window, `(snapshot, visibleAt]`:
+ *
+ *  - ABOVE the cursor the sample is strictly more current: a file ended
+ *    in the window is invisible at `visibleAt` and is not counted, and a
+ *    file appended in the window is.
+ *  - BELOW the cursor it is the old snapshot's: a file paged before the
+ *    re-anchor and ended since stays counted, and a file appended since
+ *    with a key below the cursor is not seen. Size order makes the
+ *    second case the common one (new ingest files are SMALL), which is
+ *    why the compaction planner does not trust the sample alone for new
+ *    files — `CompactionService.newBuckets` reads them from the
+ *    changefeed since `snapshot`.
+ *  - ACROSS the cursor, a compaction in the window can be counted on
+ *    both sides: its small inputs paged at the old snapshot, its larger
+ *    output above the cursor at the new one. The live totals (V27) can
+ *    therefore over-count by up to the bytes and rows compacted in the
+ *    window, and the small-file measure can over-count those inputs.
+ *
+ * So for a re-anchored generation the V27 live totals and every tier
+ * measure are an OBSERVATION OVER THE SCAN WINDOW, like the hydration
+ * and removal counts already were; `reanchors` on the published
+ * [Sample] is what says so. Rows above the upper bound — files
+ * registered after `begin()` that sort past the last key it saw, and
+ * every table created since — are outside the generation as before.
+ *
+ * `Scan.snapshot` is deliberately NOT moved, and three readers depend on
+ * it staying the scan's START:
+ *
+ *  - the COVERAGE rule (`TierTotalsRepo`, `CatalogService.getTable`): a
+ *    table created at or before `Sample.snapshotId` is covered. A table
+ *    created later has a `table_id` above `begin()`'s upper bound and
+ *    was never scanned, so advancing the snapshot would report it as
+ *    covered and empty;
+ *  - `published_snapshot` (V27): the metrics tick subtracts buckets of
+ *    tables dropped AFTER it. A table dropped inside the window may have
+ *    been paged before its drop, so a later snapshot would leave its
+ *    buckets in the totals;
+ *  - the planner's new-bucket read, whose lower bound must be the
+ *    earliest snapshot the sample may have missed appends after.
+ *
+ * The dropped-table key-range skip is unaffected: it reads the CURRENT
+ * set of dropped tables every tick, not a snapshot. The removal phase
+ * reads no file row, so it neither checks nor re-anchors.
+ *
+ * # Before a rollout or a rollback: read this
+ *
+ * A catalog whose scan outlasts its retention — millpond-prod-us and
+ * millrace-prod-us today — RE-ANCHORS ON EVERY GENERATION, and a build
+ * from before this change cannot read a re-anchored checkpoint: it
+ * discards it and starts over, which is the old restart. While old and
+ * new pods both run the sampler, the two take ticks of the same catalog
+ * in turn, and every old pod's tick throws the scan away. Measured (QE,
+ * old and new pods alternating ticks under expiry pressure): 120 ticks,
+ * 40 generations started, NOTHING published. So:
+ *
+ *  - DURING A ROLLOUT, a re-anchoring catalog publishes nothing until
+ *    the last old sampler pod is gone. Its published sample, gauges,
+ *    table-GET totals and the planner's bucket list stay at the last
+ *    generation published before the rollout began. Catalogs whose scan
+ *    fits inside retention never re-anchor and are unaffected. The
+ *    sampler runs only where `HOGLAKE_MAINTENANCE_SUMMARY_INTERVAL_MS >
+ *    0` (the maintenance pod on gigahog), so the window is that pod's
+ *    replacement, not the API fleet's.
+ *  - A ROLLBACK TO A BUILD BEFORE THIS ONE returns those catalogs to the
+ *    no-publish state of 2026-10-16 to 10-21, for as long as it runs.
+ *    It also cannot read a sample this build published with a nonzero
+ *    `reanchors` (the older parser is strict), so their status page,
+ *    head table-GET totals and partition listing go ABSENT on that build
+ *    rather than stale, and the compaction planner, which reads only the
+ *    generation number, keeps planning from that sample's buckets.
  */
 class MaintenanceSummarySampler(
     private val jdbi: Jdbi,
@@ -50,6 +179,26 @@ class MaintenanceSummarySampler(
         val targetBytes: Long,
         val minInputFiles: Int,
         val maxInputFiles: Int,
+        /**
+         * How many times the scan behind this sample RE-ANCHORED its
+         * visibility snapshot because expiry overtook it (see the class
+         * KDoc). Zero means every file measure is exact at [snapshotId];
+         * nonzero means they are an observation over the scan window
+         * that starts there, as the hydration and removal counts always
+         * were.
+         *
+         * OMITTED FROM THE JSON WHEN ZERO, for the deploy straddle: a
+         * build BEFORE this one parses the sample strictly, so a key it
+         * does not know makes it drop the WHOLE sample — every
+         * dashboard and every head table GET's totals on that build go
+         * absent until it republishes, which on a rollback is the very
+         * build that cannot finish a large catalog's scan. Written only
+         * when nonzero, the sample an older build sees is byte-for-byte
+         * the shape it knows for every catalog that never re-anchored.
+         * This build and later ignore unknown sample keys ([sampleFrom]).
+         */
+        @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+        val reanchors: Int = 0,
     )
 
     data class Published(val sampledAt: Instant, val sample: Sample)
@@ -90,7 +239,36 @@ class MaintenanceSummarySampler(
         var debt: Long = 0,
         var queued: Long = 0,
         var oldest: Instant? = null,
-    )
+        /**
+         * The snapshot file visibility is evaluated at, when a re-anchor
+         * has moved it off [snapshot]; null means [snapshot]. See the
+         * class KDoc for why [snapshot] itself never moves.
+         *
+         * NULL AND ZERO ARE OMITTED from the checkpoint for the same
+         * reason [Sample.reanchors] is: the checkpoint is parsed
+         * strictly and an unknown key DISCARDS the in-flight scan, so a
+         * rollback past this build keeps every scan that never
+         * re-anchored. One that did re-anchor is discarded by an old pod
+         * on each tick it claims the catalog, and the next new-build
+         * tick starts it over: during a rolling deploy (or a rollback in
+         * progress) a re-anchoring catalog can lose its in-flight scan
+         * once per tick on an old pod, bounded by the rollout's length.
+         */
+        @get:JsonInclude(JsonInclude.Include.NON_NULL)
+        var visibleAt: Long? = null,
+        /**
+         * Re-anchors so far; published as [Sample.reanchors]. Counts
+         * EVENTS — file-phase ticks that found the floor past
+         * [evaluatedAt] — not pages: a tick whose page then only skips a
+         * dropped table's key range counts as one too.
+         */
+        @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+        var reanchors: Int = 0,
+    ) {
+        /** The snapshot this scan's next page is evaluated at. */
+        @get:JsonIgnore
+        val evaluatedAt: Long get() = visibleAt ?: snapshot
+    }
 
     private data class Job(val catalogId: Long, val generation: Long, val publishedGeneration: Long, val scan: Scan?)
 
@@ -182,14 +360,32 @@ class MaintenanceSummarySampler(
             var generation = job.generation
             var scan = job.scan
             if (scan != null) {
-                val earliest =
-                    h.createQuery("SELECT earliest_snapshot_id FROM hog_catalog WHERE catalog_id = :id")
-                        .bind("id", job.catalogId).mapTo(Long::class.javaObjectType).one()
-                if (earliest > scan.snapshot || scan.targetBytes != target || scan.minInputFiles != minInputFiles ||
+                // A POLICY CHANGE RESTARTS: it changes what the
+                // accumulators measure, so a generation spanning it would
+                // be two definitions summed.
+                if (scan.targetBytes != target || scan.minInputFiles != minInputFiles ||
                     scan.maxInputFiles != maxInputFiles
                 ) {
                     checkpoint(h, job.catalogId, generation, null)
                     return@inTransactionUnchecked true
+                }
+                // EXPIRY OVERTAKING THE SCAN RE-ANCHORS IT, and only in
+                // the file phase, the one that reads visibility. The
+                // class KDoc has the argument; the short form is that the
+                // cursor is over immutable keys, so moving the snapshot
+                // between pages neither skips nor repeats a row, and
+                // restarting instead never finishes once a scan outlasts
+                // retention (millpond and millrace on prod-us, 2026-10-16
+                // to 10-21).
+                if (scan.phase == "files") {
+                    val (earliest, head) =
+                        h.createQuery(
+                            "SELECT earliest_snapshot_id, last_snapshot_id FROM hog_catalog WHERE catalog_id = :id",
+                        ).bind("id", job.catalogId).map { rs, _ -> rs.getLong(1) to rs.getLong(2) }.one()
+                    if (earliest > scan.evaluatedAt) {
+                        scan.visibleAt = head
+                        scan.reanchors++
+                    }
                 }
             } else {
                 // Garbage collection is bounded too. Preserve the published
@@ -280,7 +476,7 @@ class MaintenanceSummarySampler(
                       AND (f.table_id, f.file_size_bytes, f.data_file_id) <= (:upperTable, :upperSize, :upperFile)
                     ORDER BY f.table_id, f.file_size_bytes, f.data_file_id LIMIT :batch
                     """,
-                    ).bind("id", job.catalogId).bind("snapshot", scan.snapshot)
+                    ).bind("id", job.catalogId).bind("snapshot", scan.evaluatedAt)
                         .bind("table", scan.table).bind("size", scan.size).bind("file", scan.file)
                         .bind(
                             "upperTable",
@@ -368,7 +564,15 @@ class MaintenanceSummarySampler(
                         Sample(
                             scan.pending, scan.failed, scan.debt, scan.queued, scan.oldest,
                             scan.snapshot, scan.startedAt, target, minInputFiles, maxInputFiles,
+                            reanchors = scan.reanchors,
                         )
+                    // A RE-ANCHORED GENERATION PUBLISHES LIKE ANY OTHER.
+                    // `published_snapshot` and the sample's `snapshotId`
+                    // stay the scan's START (`scan.snapshot`), never the
+                    // last re-anchor: see the class KDoc for the three
+                    // readers that need the start. `live_as_of` is the
+                    // start too, so a re-anchored generation's totals read
+                    // as "observed since then", which is what they are.
                     // THE LIVE TOTALS ARE SUMMED HERE, ONCE PER GENERATION
                     // (V27, #269). The metrics sampler used to sum the
                     // manifest every 15 s on every pod; summing the tier
@@ -751,8 +955,39 @@ class MaintenanceSummarySampler(
          * for [read]'s reason: a sample a newer replica published in a
          * shape this build does not know must degrade the numbers to
          * "not sampled", never 500 a request path.
+         *
+         * UNKNOWN PROPERTIES ARE IGNORED, which narrows "a shape this
+         * build does not know" to a missing or mistyped field. [Sample]
+         * is additive counters and stamps: a field a newer build adds
+         * carries no meaning this build's readers depend on, so dropping
+         * the WHOLE sample over it — every status page, head table GET
+         * and partition listing for the catalog absent until this build
+         * republishes — was all cost. That matters most for exactly the
+         * catalogs that re-anchor on every generation (millpond's,
+         * millrace's), which [Sample.reanchors]' NON_DEFAULT does not
+         * protect. It protects rollbacks TO this build and later; a
+         * rollback past it still drops a re-anchored sample, because the
+         * older parser is the strict one.
+         *
+         * [Scan] stays strict, deliberately: its fields are a CURSOR, and
+         * resuming a cursor whose shape this build only partly
+         * understands is how the row-id-to-size keyset change would have
+         * skipped or repeated rows.
          */
         internal fun sampleFrom(text: String?): Sample? =
-            text?.let { runCatching { json.readValue(it, Sample::class.java) }.getOrNull() }
+            text?.let { runCatching { lenientSample.readValue<Sample>(it) }.getOrNull() }
+
+        /**
+         * Lenient about EXTRA keys only. A MISSING required field must
+         * still drop the sample: Jackson's default would read an absent
+         * `minInputFiles` as 0 and serve the sample as one measured under
+         * a policy nobody runs, so `FAIL_ON_NULL_FOR_PRIMITIVES` is on.
+         * Fields with a Kotlin default (`reanchors`) take the default when
+         * absent, which is what lets every older sample keep parsing.
+         */
+        private val lenientSample =
+            json.readerFor(Sample::class.java)
+                .without(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
+                .with(DeserializationFeature.FAIL_ON_NULL_FOR_PRIMITIVES)
     }
 }

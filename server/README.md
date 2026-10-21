@@ -1652,13 +1652,53 @@ remainders included. A group under its scaled minimum contributes zero
 debt; raw small-file counts remain visible on the partition page. Neither endpoint scans the manifest. `sampled_at` exposes freshness;
 before the first sample, counts are unknown. `MaintenanceSummarySampler`
 checkpoints indexed keyset pages and per-bucket accumulators in Postgres, so a
-restart resumes progress. It scans files at a captured catalog snapshot;
-if expiry overtakes that snapshot it restarts without publishing partial
-counts. Hydration and removal counts are observations over the sampling
-window. Defaults: 10,000 metadata rows per 1s tick, 60s between completed
+restart resumes progress. It scans files at a captured catalog snapshot.
+If expiry overtakes the snapshot it is evaluating at, it **re-anchors**:
+later pages are evaluated at the catalog head and the scan continues from
+its cursor, without publishing partial counts. It used to restart from
+scratch instead, which never finishes once a scan takes longer than
+retention: at ~0.36 ms/row and 10,000 rows a tick, millpond-prod-us's
+~7.6M rows took 58 min against a 3,600 s retention, and neither it nor
+millrace-prod-us (600 s) published from 2026-10-16 to 10-21. The cursor
+is a keyset over `(table_id, file_size_bytes, data_file_id)`, immutable
+per row, so a re-anchor neither skips nor repeats a row. What it changes
+is the snapshot the rows are judged at: above the cursor, files that ended
+are excluded and new ones counted; below it, rows paged earlier keep their
+old answer, and appends sorting below the cursor are not seen. A
+re-anchored sample's file measures and live totals are therefore an
+observation over the scan window, like hydration and removal counts
+always were; `sample_reanchored` on `/maintenance/status` says how many
+times it happened, and `sampled_snapshot_id` stays the scan's start. A
+change to the target or the min/max input files still restarts the scan.
+Defaults: 10,000 metadata rows per 1s tick, 60s between completed
 refreshes, controlled by `HOGLAKE_MAINTENANCE_SUMMARY_BATCH`,
 `HOGLAKE_MAINTENANCE_SUMMARY_INTERVAL_MS` (0 disables), and
 `HOGLAKE_MAINTENANCE_SUMMARY_REFRESH_SECONDS`.
+
+The **compaction planner picks buckets** from the same published sample:
+a table's buckets with at least two groupable files, ordered by bytes per
+file ascending (files retired per byte rewritten), capped at 50,000, and
+probed from a rotating cursor so every bucket is reached. A sample cannot
+name a partition first written after its scan began, so the planner
+merges in the buckets of the table's live small files appended since the
+sample's start snapshot: one read of the `(catalog_id, table_id,
+begin_snapshot)` index, newest first, capped at
+`HOGLAKE_COMPACTION_NEW_BUCKET_WINDOW` files (default 10,000, about three
+minutes of prod-us appends; 0 disables), grouped by partition tuple. On a
+hot table that window is full on every sweep, not only when the sampler
+is behind, because the sample's start snapshot is always a scan and a
+refresh old. So the window size is a fixed per-sweep cost: one heap fetch
+and one partition-value lookup per file, inside the plan's 15 s statement
+timeout. A tuple written once and never again since can fall outside the
+window until the next generation names it.
+A bucket in both lists becomes one entry, and the merged list is sorted by
+the same bytes-per-file order. New buckets do not go first, because a
+fresh day's large files would then outrank every bucket of tiny files.
+Without the merge, on 2026-10-21 the planner saw the 1,794 buckets of
+millpond's 2026-10-16 generation while `events_raw` had 5,036, so no
+partition written in those five days was compacted. With no published
+generation at all, the planner still reads the table's smallest
+candidates directly.
 
 Coverage is 100% of live layouts, not just the easy ones:
 
