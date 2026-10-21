@@ -144,12 +144,13 @@ class MaintenanceRunStore(private val jdbi: Jdbi) {
      * and every read path (per-catalog status and history, the central
      * matrix) is keyed by catalog. Recording the run against every catalog
      * keeps all of those surfaces showing it with no read-path change, at
-     * the cost of N rows per run — one run a day, so N rows a day, purged
-     * per catalog with the rest of the ledger. With no catalog at all
+     * the cost of N rows per run — one run an hour, so N rows an hour
+     * (~168 per catalog at the 7-day retention), purged per catalog with
+     * the rest of the ledger. With no catalog at all
      * nothing is recorded, which is why the caller checks first.
      *
      * [clock] stamps `started_at`/`finished_at`, injected because the
-     * reindex gate reads `started_at` back to decide whether today's run
+     * reindex gate reads `started_at` back to decide whether this hour's run
      * has happened, and a test of that gate drives a fake clock.
      */
     fun <T> recordedAllCatalogs(

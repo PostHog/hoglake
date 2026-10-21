@@ -1211,10 +1211,12 @@ ran on the local stack and what it showed.
     `hog_data_file` until it runs, which is what V19's partial index and
     the gauges' `hog_table` join both exist to survive.
   - **Reindex** (`MaintenanceTask.REINDEX`, loop `reindex`,
-    `ReindexService`, #268) is the daily index-bloat check: autovacuum
-    never shrinks an index, and on this schema bloat arrives in steps
-    (the 13.9M-row prod-us retirement left `hog_data_file` with 14.8 GB of
-    indexes over 1.48M rows). It estimates every valid btree index on a
+    `ReindexService`, #268) is the hourly index-bloat check: autovacuum
+    never shrinks an index, and on this schema bloat arrives in steps, at
+    any hour (the 13.9M-row prod-us retirement left `hog_data_file` with
+    14.8 GB of indexes over 1.48M rows). Hourly, not daily, because a run
+    rebuilds one index: a backlog of N bloated indexes drains in N hours,
+    where once a day left a bloated 30 GB index waiting up to a day. It estimates every valid btree index on a
     hog_* table from `pg_stats` (the check_postgres / ioguix arithmetic,
     `ReindexService.ESTIMATE_SQL`: catalog reads only) and rebuilds at
     most ONE — the largest estimated excess over threshold — with
@@ -1229,7 +1231,7 @@ ran on the local stack and what it showed.
     `too_large` — a concurrent rebuild writes ~0.9x its size in WAL and
     ~1x in temp files while the old copy still exists, so ~3x its size in
     transient disk: `hog_file_column_stats_pkey` at ~15 GB expected is
-    admitted and needs ~45 GB of headroom that night; anything larger is
+    admitted and needs ~45 GB of headroom whenever it runs; anything larger is
     an operator's off-peak job) and one whose newest attempt failed
     (`last_attempt_failed`). With every candidate excluded the row names
     the first, with `expected_bytes`. TWO CONSEQUENCES, stated so nobody
@@ -1242,28 +1244,31 @@ ran on the local stack and what it showed.
     candidates were passed over), and the health page's `index_bloat`
     finding names them. A rebuild that succeeded but whose read-back
     failed stays an `ok` row with `post_step_error` and no `after_bytes`. Every number above is a constant, not a knob, and so is the
-    schedule: **due once a day at 03:00 UTC** (`RUN_AT_UTC`; configurable
-    later). `HOGLAKE_REINDEX_INTERVAL_MS` (**0 = off**) is only the POLL;
+    schedule: **due once an hour, at the top of each UTC hour** (`RUN_EVERY`,
+    epoch-aligned windows; configurable later). `HOGLAKE_REINDEX_INTERVAL_MS` (**0 = off**) is only the POLL;
     the chart turns it on for the maintenance Deployment alone, and its
     one rebuild connection is priced in the pool budget. The gate
     reads the LEDGER (newest `reindex` row's `started_at`), so a restart
-    does not repeat the day's run and a pod down at 03:00 runs on its
-    first poll that day; a `migration_pending` / `reindex_in_progress`
-    row does not close the day before 06:00 UTC (`RETRY_UNTIL_UTC`). GUARDS, each a `skipped_reason`:
+    does not repeat the hour's run, a pod down at the top of the hour runs
+    on its first poll in that hour, and a pod down for several hours runs
+    ONCE on return, not once per missed hour; a `migration_pending` /
+    `reindex_in_progress` row does not close the hour, so it is retried on
+    every poll until the hour ends (the next hour is a fresh run anyway,
+    so there is no separate retry cut-off). GUARDS, each a `skipped_reason`:
     `reindex_in_progress` (ANY index build in this database in
     `pg_stat_progress_create_index` — not filtered on `command`, which is
     NULL to a non-superuser for another role's backend),
     `reindex_lock_held` (the instance-wide single-flight lock
     `Locks.REINDEX_LOCK_CLASS` held by another session — this task's own
-    rebuild, so it closes the day rather than retrying), `migration_pending` (the migration advisory lock held, or a
+    rebuild, so it closes the hour rather than retrying), `migration_pending` (the migration advisory lock held, or a
     failed Flyway history row) — both checked BEFORE invalid `*_ccnew` /
     `*_ccold` leftovers of a failed rebuild are dropped, because an
     in-flight build's copy is exactly such an index — then
     `retirement_pending` (`RetirementService.ELIGIBLE_PREDICATE`
     anywhere) and `purge_pending` (any catalog's latest expiry row has
     `purge_remaining` at `ExpiryService.PURGE_REMAINING_CAP`, or is
-    truncated with the count unknown — routine lag is not a mass delete), which would re-bloat the index tomorrow and
-    are asked only when something IS over threshold, so a quiet day
+    truncated with the count unknown — routine lag is not a mass delete), which would re-bloat the index within hours and
+    are asked only when something IS over threshold, so a quiet hour
     stays a quiet row through a week-long retirement. A
     failed REINDEX is a `failed` row carrying the attempt, never retried
     in-run, and drops its own `_ccnew` at once (one cancelled in
@@ -1278,7 +1283,7 @@ ran on the local stack and what it showed.
     steady state. `GET /v1/database/health` carries the same estimate
     (`indexes[].estimated_bloat_bytes` / `_ratio`, finding
     `index_bloat`), and `hoglake_index_bloat_bytes{table,index}` is the
-    gauge — published only by the pod running the loop (daily run plus
+    gauge — published only by the pod running the loop (hourly run plus
     every metrics tick there), never by an API pod serving the health
     page, so the series does not flap between pods. The estimate is as fresh as the table's last VACUUM/ANALYZE
     and under-reports deduplicated indexes — `hog_data_file_changefeed` /
@@ -1288,13 +1293,17 @@ ran on the local stack and what it showed.
     two heap passes of its table, its size in WAL, one pooled connection
     for the duration, a held snapshot per phase (the health page's
     `long_transaction` finding will name it while it runs), and no
-    autovacuum on that table until it ends (it cancels a running one). A
+    autovacuum on that table until it ends (it cancels a running one) —
+    paid at whatever hour the index crosses threshold, peak included,
+    which is the price of not waiting a day. A
     pod killed mid-rebuild leaves the backend running it with the session
     lock; the killed run writes no row and the next poll records
-    `reindex_lock_held`, which closes the day (the orphan IS today's
-    rebuild).
+    `reindex_lock_held`, which closes the hour (the orphan IS this hour's
+    rebuild). A rebuild that runs its full hour ends past the next
+    window's start, so that window's run starts right after it; intended.
     DEPLOY NOTE: do not promote a release with a migration while a
-    rebuild runs (03:00 UTC onward, up to an hour). An `ALTER TABLE` on
+    rebuild runs; a rebuild can start at the top of any hour and run up
+    to an hour, so check every time. An `ALTER TABLE` on
     the table being rebuilt hits its 5 s `lock_timeout` and the pod
     crash-loops until the rebuild ends; a `CREATE INDEX CONCURRENTLY`
     waits out the rebuild's snapshot and dies on the 120 s

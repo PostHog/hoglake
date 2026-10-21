@@ -1910,7 +1910,7 @@ enum class ReindexSkip {
      * A dropped table's rows are eligible for retirement in some catalog
      * (`RetirementService.ELIGIBLE_PREDICATE`). Retirement is what MAKES
      * the bloat — 13.9M deleted manifest rows on prod-us — so an index
-     * rebuilt mid-retirement is rebuilt again tomorrow.
+     * rebuilt mid-retirement is rebuilt again within hours.
      */
     RETIREMENT_PENDING,
 
@@ -1944,10 +1944,10 @@ enum class ReindexSkip {
      * because the two ask for opposite gates: the holder is THIS task's
      * own rebuild — a second pod configured by mistake, or the orphaned
      * backend of a pod killed mid-rebuild, which runs on until it ends —
-     * so today's rebuild is already happening, and retrying until 06:00
-     * would rebuild a second index the same day (or the same one again
-     * if the orphan timed out without writing an attempt row). This one
-     * CLOSES the day; [REINDEX_IN_PROGRESS] is retried.
+     * so this hour's rebuild is already happening, and retrying on every
+     * poll would rebuild a second index the same hour (or the same one
+     * again if the orphan timed out without writing an attempt row). This
+     * one CLOSES the hour; [REINDEX_IN_PROGRESS] is retried.
      */
     REINDEX_LOCK_HELD,
 
@@ -1961,7 +1961,7 @@ enum class ReindexSkip {
 
     /**
      * Every candidate is excluded, and the first of them failed its newest
-     * rebuild attempt. Retrying daily would repeat the same hour of I/O
+     * rebuild attempt. Retrying hourly would repeat the same hour of I/O
      * and the same failure; the exclusion lasts until that attempt's row
      * leaves the ledger (7 days) or a human rebuilds it.
      */
@@ -1972,7 +1972,7 @@ enum class ReindexSkip {
 }
 
 /**
- * One reindex run's outcome (#268): the daily index-bloat check and at
+ * One reindex run's outcome (#268): the hourly index-bloat check and at
  * most one `REINDEX INDEX CONCURRENTLY`.
  *
  * The run is INSTANCE-WIDE — an index belongs to the database, not to a
@@ -2015,7 +2015,7 @@ data class ReindexResult(
      * Set when the REINDEX SUCCEEDED but reading the result back (the
      * post-rebuild estimate, `pg_relation_size`) failed: the row stays
      * `ok` — the rebuild happened, and a failed row would exclude the
-     * index tomorrow — with [afterBytes] null and this error text. Not the
+     * index from later runs — with [afterBytes] null and this error text. Not the
      * row's `error`: the ledger's CHECK ties `error` to `status =
      * 'failed'`.
      */
@@ -2121,11 +2121,11 @@ enum class MaintenanceTask(
     // a row per sweep can do that.
     RETIREMENT(hasLoop = true, loopRecordsEverySweep = true),
 
-    // The daily index-bloat check (#268). Its loop POLLS on
-    // HOGLAKE_REINDEX_INTERVAL_MS and records only when the 03:00 UTC
-    // run is due, so the polls are not recorded — but every RUN is, and
+    // The hourly index-bloat check (#268). Its loop POLLS on
+    // HOGLAKE_REINDEX_INTERVAL_MS and records only when the hour's run
+    // is due, so the polls are not recorded — but every RUN is, and
     // the gap between runs is the cadence an operator wants to read
-    // (~24 h). True, because silence here does mean nothing is running
+    // (~1 h). True, because silence here does mean nothing is running
     // the task.
     REINDEX(hasLoop = true, loopRecordsEverySweep = true),
     ;

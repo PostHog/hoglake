@@ -983,8 +983,8 @@ describe("reindex runs", () => {
     catalog: "analytics",
     task: "reindex",
     trigger: "loop",
-    started_at: "2026-10-05T03:00:00Z",
-    finished_at: "2026-10-05T03:07:00Z",
+    started_at: "2026-10-05T14:00:00Z",
+    finished_at: "2026-10-05T14:07:00Z",
     status: "ok",
   } as const;
   const noop = {
@@ -1014,7 +1014,7 @@ describe("reindex runs", () => {
     },
   } as MaintenanceRun;
 
-  it("calls the daily check that found nothing quiet, and every other shape loud", () => {
+  it("calls the hourly check that found nothing quiet, and every other shape loud", () => {
     expect(isQuietRun(noop)).toBe(true);
     expect(isQuietRun(rebuilt)).toBe(false);
     expect(isQuietRun(skipped)).toBe(false);

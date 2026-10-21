@@ -230,7 +230,7 @@ data class FindingResolution(
  * dashboard can produce the first half; the second is the reason this
  * endpoint exists rather than a link to one — and [resolution] what
  * happens next, and by whom: a page that says "12 indexes are bloated"
- * without "the reindex task takes one a day" sends an operator to a
+ * without "the reindex task takes one an hour" sends an operator to a
  * runbook for work that is already scheduled.
  */
 data class DatabaseFinding(

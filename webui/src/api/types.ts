@@ -1036,7 +1036,7 @@ export type ReindexSkip =
   | "last_attempt_failed";
 
 /**
- * One run of the daily index-bloat check: every hog_* btree index
+ * One run of the hourly index-bloat check: every hog_* btree index
  * estimated, at most one rebuilt with REINDEX INDEX CONCURRENTLY.
  * Instance-wide, so the same payload is on every catalog's row of a run.
  * Null fields are ABSENT: a run that rebuilt nothing carries only the three
