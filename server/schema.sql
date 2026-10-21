@@ -617,6 +617,13 @@ CREATE INDEX hog_file_removal_drain
 CREATE INDEX hog_file_removal_undrained_path
     ON hog_file_removal (catalog_id, path)
     WHERE drained_at IS NULL;
+-- The catalog drop's cascade probe (V28, #412). NOT partial: the RI
+-- trigger's `DELETE ... WHERE catalog_id = $1` has to find the SETTLED
+-- rows, which both indexes above exclude, so without this every catalog
+-- drop is a sequential scan of the fleet-wide ledger (~137M rows at
+-- steady state). See the V28 migration for the measurements and price.
+CREATE INDEX hog_file_removal_catalog
+    ON hog_file_removal (catalog_id);
 -- The maintenance run ledger: one row per maintenance-task run, whether
 -- the BackgroundLoops sweep or the manual /maintenance/* trigger drove
 -- it. The queryable answer to "is the loop alive, when did it last run,

@@ -368,6 +368,14 @@ class TableCreationService(
             if (Pg.isLockTimeout(e)) {
                 throw HoglakeException.CommitQueueTimeout("table creation lock timed out after ${lockTimeoutMs}ms")
             }
+            // `prepare` takes no commit lock, so one that resolved the
+            // catalog (and its live namespace) and whose INSERT then ran into
+            // a catalog drop — the namespace dropped and the catalog deleted
+            // in between — fails the receipt's foreign key. The drop won the
+            // race; the answer is the 404 the request gets a moment later.
+            if (Pg.isCatalogForeignKeyViolation(e)) {
+                throw HoglakeException.NotFound("catalog dropped while this table creation was in flight")
+            }
             throw e
         }
 

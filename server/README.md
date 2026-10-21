@@ -58,6 +58,26 @@ never a partial result or zero. Missing catalogs return 404, backend failures
 return 500, and snapshot/timestamp parameters return 400. The sampled **live**
 catalog/table totals remain the right choice for dashboards.
 
+## Dropping a catalog
+
+`DELETE /v1/catalogs/{catalog}?author=&message=` drops an **empty** catalog and
+returns `{"name":…,"data_path":…}`; both query parameters are required and
+nonblank, as on the other destructive routes. Under the catalog's commit lock
+it is refused with 409 `catalog_not_empty` and a `reason` — `live_namespaces`,
+`tables_pending_retirement`, `files_pending_expiry`, `removals_pending`,
+`active_compaction_claims`, `consumer_offsets`, `active_uploads`,
+`abandoned_uploads_unsettled`, the first that applies in that order — unless
+no live namespace, file row, undrained removal row, unexpired compaction claim,
+consumer offset or upload in flight remains. Then one `DELETE FROM hog_catalog`
+and the thirteen `ON DELETE CASCADE` foreign keys remove the history with it, so
+there is no snapshot: the `catalog_drop` audit event carries the attribution.
+Nothing under `data_path` is deleted. Every cascade is an index probe; the
+removal ledger's needed `hog_file_removal_catalog` (V28), without which each drop
+was a sequential scan of the whole settled ledger. The drop locks the catalog's
+maintenance-summary row before the catalog row, the sampler's order, so a sampler
+tick cannot deadlock it. `CatalogService.dropCatalog`
+has the reasoning for each precondition and for what is left to cascade.
+
 ## The data model
 
 Everything hangs off five ideas (`db/migration/V1__init.sql`, mirrored

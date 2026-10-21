@@ -43,7 +43,12 @@ and must be nonblank for table, view and namespace drops and `Table.truncate()`.
 Pass both to `Catalog.set_retention()` when enabling expiry or shortening
 retention. The server records attribution in the snapshot and audit log.
 Drop and truncate have no operation receipt; do not automatically retry an
-unknown outcome.
+unknown outcome. `Catalog.drop(author=..., message=...)` drops an EMPTY catalog
+(metadata only; it returns the `data_path` it owned, untouched) and raises a
+`CatalogNotEmptyError` subclass naming the first blocker otherwise — a live
+namespace, file rows retirement or expiry has not removed, an undrained
+removal queue, an unexpired compaction claim, consumer offsets, or uploads in
+flight.
 
 ```python
 import pyarrow as pa
@@ -134,7 +139,7 @@ for s in catalog.snapshots(before=head + 1):
 | Object store | `S3Config(access_key, secret_key, endpoint_override, region, allow_bucket_creation, single_request_uploads)`; the write path uses `pyarrow.fs.S3FileSystem` (path-style with an endpoint override), and `boto3` built from the same settings for single-request uploads (`single_request_uploads=False` sends everything through the streaming writer) |
 | Upload fan-out | `concurrency=` on the prepared-append calls, else `PYHOGLAKE_UPLOAD_CONCURRENCY`, else 64 — capped at the number of objects. Arrow's process-global IO thread pool is raised to match only when the flush actually routes an object through Arrow |
 | `User-Agent` | `pyhoglake/<version>` on every request, from the installed package metadata (`pyhoglake/unknown` from a source checkout). The server names the client in its transition warnings by this header — notably the blind-partitioned-append WARN — so it identifies which writer has to change |
-| Errors | Typed, all under `HoglakeError`, and every one of them answers two questions — `retryable` (replay the SAME request) and `re_prepare` (replay cannot work; re-read the table and build a NEW one). `CommitConflictError` (`retryable=True` — refresh the read snapshot and retry) · `DdlSinceReadSnapshotError` (`re_prepare=True` — DDL landed on a touched table after the request's `read_snapshot`, so replaying is a livelock) · `IncarnationChangedError` (`re_prepare=True` — the table was dropped and recreated; the append incarnation guard, enforced server-side at commit, see below) · `ReadSnapshotExpiredError` (`re_prepare=True`, a subclass of `ExpiredError` — a commit whose `read_snapshot` sank below the expiry floor) · `NotFoundError` · `AlreadyExistsError` · `ValidationError` · `OffsetRegressionError` · `ExpiredError` (410 on a changefeed window — reconcile from a full scan) · `MalformedResponseError` (every wire-parse failure — a structurally defective response body, an unexpected redirect (3xx is never success), a field of the wrong shape — one exception type naming the model and field) |
+| Errors | Typed, all under `HoglakeError`, and every one of them answers two questions — `retryable` (replay the SAME request) and `re_prepare` (replay cannot work; re-read the table and build a NEW one). `CommitConflictError` (`retryable=True` — refresh the read snapshot and retry) · `DdlSinceReadSnapshotError` (`re_prepare=True` — DDL landed on a touched table after the request's `read_snapshot`, so replaying is a livelock) · `IncarnationChangedError` (`re_prepare=True` — the table was dropped and recreated; the append incarnation guard, enforced server-side at commit, see below) · `ReadSnapshotExpiredError` (`re_prepare=True`, a subclass of `ExpiredError` — a commit whose `read_snapshot` sank below the expiry floor) · `NotFoundError` · `AlreadyExistsError` · `ValidationError` · `OffsetRegressionError` · `ExpiredError` (410 on a changefeed window — reconcile from a full scan) · `CatalogNotEmptyError` (409 on `Catalog.drop`, one subclass per `reason`, e.g. `CatalogHasLiveNamespacesError`; neither flag set) · `MalformedResponseError` (every wire-parse failure — a structurally defective response body, an unexpected redirect (3xx is never success), a field of the wrong shape — one exception type naming the model and field) |
 
 ## Type mapping
 
