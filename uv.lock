@@ -368,7 +368,7 @@ dev = [
     { name = "prometheus-client", specifier = ">=0.20" },
     { name = "pytest", specifier = ">=8.0" },
     { name = "pytest-httpx", specifier = ">=0.30" },
-    { name = "ruff", specifier = "==0.16.10" },
+    { name = "ruff", specifier = ">=0.16.10" },
 ]
 
 [[package]]
@@ -403,7 +403,7 @@ requires-dist = [
 [package.metadata.requires-dev]
 dev = [
     { name = "pytest", specifier = ">=8.0" },
-    { name = "ruff", specifier = "==0.16.10" },
+    { name = "ruff", specifier = ">=0.16.10" },
 ]
 
 [[package]]
@@ -777,11 +777,11 @@ requires-dist = [
 dev = [
     { name = "hypothesis", specifier = ">=6.100" },
     { name = "mutmut", specifier = "==3.8.0" },
-    { name = "mypy", specifier = "==2.4.0" },
+    { name = "mypy", specifier = ">=2.4.0" },
     { name = "pytest", specifier = ">=8.0" },
     { name = "pytest-httpx", specifier = ">=0.30" },
     { name = "pyyaml", specifier = ">=6.0" },
-    { name = "ruff", specifier = "==0.16.10" },
+    { name = "ruff", specifier = ">=0.16.10" },
 ]
 
 [[package]]
@@ -1123,10 +1123,10 @@ provides-extras = ["fast-upload"]
 dev = [
     { name = "boto3", specifier = ">=1.36.0" },
     { name = "hypothesis", specifier = ">=6.100" },
-    { name = "mypy", specifier = "==2.4.0" },
+    { name = "mypy", specifier = ">=2.4.0" },
     { name = "pytest", specifier = ">=8.0" },
     { name = "pytest-httpx", specifier = ">=0.30" },
-    { name = "ruff", specifier = "==0.16.10" },
+    { name = "ruff", specifier = ">=0.16.10" },
 ]
 
 [[package]]

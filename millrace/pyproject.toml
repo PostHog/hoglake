@@ -37,13 +37,14 @@ dev = [
     "pytest>=8.0",
     "pytest-httpx>=0.30",
     "hypothesis>=6.100",
-    # Pinned like pyhoglake's, so the type check is the same on every machine.
-    "mypy==2.4.0",
+    # A floor, like pyhoglake's: the root uv.lock holds the one version the
+    # whole workspace type-checks with.
+    "mypy>=2.4.0",
     # The CI-gate meta-test parses the workflow file (tests/test_ci_gate.py).
     "pyyaml>=6.0",
-    # Pinned: see pyhoglake's note — an unpinned ruff resolves a
-    # different rule set per machine.
-    "ruff==0.16.10",
+    # A floor: the version is the root uv.lock's, shared with the sibling
+    # trees; see pyhoglake's note on why not `==`.
+    "ruff>=0.16.10",
     # Pinned for the same reason: mutant generation changes between
     # releases. Scoped to the pure core (keyspace, planner); run on
     # changes to those files (docs/kafka-ingestion-plan.md, Phase 1).

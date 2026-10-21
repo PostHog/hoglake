@@ -47,7 +47,10 @@ updates:
   # workspace (root pyproject.toml) with ONE uv.lock at the root, and
   # Dependabot follows the workspace members from there. Per-directory
   # entries locked each tree on its own, so a bump of a pin pyhoglake
-  # carries left the dependents' locks stale (#332).
+  # carries left the dependents' locks stale (#332). Tool versions
+  # (ruff, mypy) are floors in the members and exact only in the lock:
+  # an `==` repeated across members cannot be bumped one member at a
+  # time, and that is how Dependabot bumps, so it skipped them.
   - package-ecosystem: uv
     directory: /
     schedule:

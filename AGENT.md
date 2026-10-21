@@ -41,9 +41,14 @@ just webui test
 just webui build
 ```
 
-`ruff` is **pinned** in every Python tree's dev group and run through
+`ruff` (and `mypy`) are held to ONE version by the root `uv.lock`, with a
+floor rather than an `==` in each tree's dev group, and run through
 `uv run` — never `uvx ruff`, which resolves a different rule set per
-machine and silently ignores the projects' `per-file-ignores`.
+machine and silently ignores the projects' `per-file-ignores`. The
+floors exist because an `==` repeated across the members gave Dependabot
+two pins for one package as soon as it bumped one of them, which no
+workspace resolution satisfies, so it skipped the tool with a "handled
+error" on every run; with floors it moves the lock once.
 
 The four Python trees (`pyhoglake/`, `hedgerow/`, `bench/`, `millrace/`)
 are **one uv workspace**: the root `pyproject.toml` lists the members and
