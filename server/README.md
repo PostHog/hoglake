@@ -1973,7 +1973,7 @@ transaction (`observability/`):
   happens next and by whom: `kind` is `maintenance` (one of hoglake's
   own loops closes it on its schedule, and `task` names it, e.g.
   `reindex` for bloated indexes while that loop has recorded a run in
-  the last two days), `operator` (nothing in hoglake will; `text` says
+  the last three hours), `operator` (nothing in hoglake will; `text` says
   what to do) or `watch` (no action; `text` says what would change
   that). A finding's kind can follow its severity: `xid_wraparound` and
   `dead_tuples` are a watch at WARN and an operator's at CRITICAL. The CRITICAL-capable codes are

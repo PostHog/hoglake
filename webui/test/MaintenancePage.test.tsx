@@ -68,12 +68,12 @@ describe("MaintenancePage", () => {
       expect.stringContaining("reindex"),
     ]);
 
-    // Reindex: the ledger's DAILY cadence, not the pod's poll interval
+    // Reindex: the ledger's HOURLY cadence, not the pod's poll interval
     // ("0" here), and a pointer to where its numbers live.
     const reindex = screen
       .getByRole("heading", { name: /reindex/ })
       .closest(".task-panel")!;
-    expect(within(reindex as HTMLElement).getByText("every ~24h")).toBeInTheDocument();
+    expect(within(reindex as HTMLElement).getByText("every ~60min")).toBeInTheDocument();
     expect(
       within(reindex as HTMLElement).getByRole("link", { name: "database page" }),
     ).toHaveAttribute("href", "/database");

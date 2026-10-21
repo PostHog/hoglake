@@ -167,7 +167,7 @@ function Backlog({
       // numbers live on the database page, and this panel says where.
       return (
         <p className="empty">
-          Once a day at 03:00 UTC, estimates every catalog index&rsquo;s bloat
+          Once an hour, estimates every catalog index&rsquo;s bloat
           and rebuilds at most one — the largest over threshold — with REINDEX
           INDEX CONCURRENTLY. The run covers the whole database, so every
           catalog shows the same runs. Per-index estimates are on the{" "}

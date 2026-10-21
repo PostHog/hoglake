@@ -807,9 +807,9 @@ export const maintenanceStatusFixture: MaintenanceStatus = {
       },
     },
     {
-      // The daily run, on the maintenance workload like retirement: the
-      // API pod's own POLL interval is 0, and the ledger shows one run a
-      // day. Instance-wide, so this row is on every catalog.
+      // The hourly run, on the maintenance workload like retirement: the
+      // API pod's own POLL interval is 0, and the ledger shows one run an
+      // hour. Instance-wide, so this row is on every catalog.
       task: "reindex",
       loop_interval_ms: "0",
       last_run: {
@@ -817,8 +817,8 @@ export const maintenanceStatusFixture: MaintenanceStatus = {
         catalog: "analytics",
         task: "reindex",
         trigger: "loop",
-        started_at: "2026-09-11T03:00:12Z",
-        finished_at: "2026-09-11T03:07:40.000Z",
+        started_at: "2026-09-11T09:00:12Z",
+        finished_at: "2026-09-11T09:07:40.000Z",
         status: "ok",
         result: {
           checked: "67",
@@ -833,8 +833,8 @@ export const maintenanceStatusFixture: MaintenanceStatus = {
       },
       backlog: {},
       loop: {
-        observed_interval_ms: "86400000",
-        last_run_at: "2026-09-11T03:00:12Z",
+        observed_interval_ms: "3600000",
+        last_run_at: "2026-09-11T09:00:12Z",
         records_every_sweep: true,
       },
     },

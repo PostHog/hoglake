@@ -217,8 +217,8 @@ class MaintenanceStatusService(
                     // Appended, for the reason above. The run is
                     // instance-wide and recorded against every catalog,
                     // so every catalog's panel shows the same last run.
-                    // `loop_interval_ms` is the POLL, not the daily
-                    // cadence; `loop` (the ledger) reads ~24 h.
+                    // `loop_interval_ms` is the POLL, not the hourly
+                    // cadence; `loop` (the ledger) reads ~1 h.
                     MaintenanceTaskStatus(
                         MaintenanceTask.REINDEX,
                         reindexIntervalMs,
