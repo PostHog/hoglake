@@ -74,10 +74,16 @@ import java.util.UUID
  * RETURNED by the UPDATE, and the guard keeps the two the same (the old
  * `UPDATE ... RETURNING` was atomic and could not disagree with itself).
  * The table-stats UPDATE is guarded by each next_row_id, which closes the
- * read-then-write the old per-table SELECT and UPDATE already had. Under
- * the lock nothing can move either; a writer that ever broke that
- * discipline now fails the commit (the counts [write] checks) where it
- * used to hand out overlapping row-id ranges.
+ * read-then-write the old per-table SELECT and UPDATE already had. The
+ * DV-ending UPDATE touches only rows still live (`end_snapshot IS NULL`),
+ * the state the read selected them in. Under the lock nothing can move
+ * any of these; a writer that ever broke that discipline now fails the
+ * commit (the counts [write] checks) where it used to hand out
+ * overlapping row-id ranges or end a DV twice. The claim settlement
+ * carries no such guard: the read holds those rows `FOR UPDATE` in this
+ * transaction, so no state can change under it, and a `state = 'active'`
+ * predicate moved the generic plan off `hog_upload_pkey` onto the
+ * cleanup index for nothing.
  *
  * Foreign keys are checked at the end of the statement, so column
  * stats, partition values and a transaction's DV on its own staged file
@@ -101,8 +107,14 @@ internal object CommitTail {
      * Rows of [READ_SQL]'s JSON sections. Snake-case keys are the CTEs'
      * own column names; a `RowMapper` per section would be one query per
      * section, which is the cost this file exists to remove.
+     *
+     * A `timestamptz` arrives as `json_agg` renders it: ISO 8601 in the
+     * SESSION's time zone with that zone's offset, `+00:00` on a UTC
+     * session and `+02:00` on one that is not. The `Instant`
+     * deserializer normalizes any offset, so the session zone does not
+     * reach a value; `CommitTailJsonTest` pins that with a non-UTC offset.
      */
-    private val readSetMapper: ObjectMapper =
+    internal val readSetMapper: ObjectMapper =
         jacksonObjectMapper()
             .registerModule(JavaTimeModule())
             .setPropertyNamingStrategy(PropertyNamingStrategies.SNAKE_CASE)
@@ -368,6 +380,7 @@ internal object CommitTail {
                SET end_snapshot = s.snapshot_id
               FROM snapshot s
              WHERE d.catalog_id = :catalogId AND d.delete_file_id = ANY(CAST(:endedDvs AS bigint[]))
+               AND d.end_snapshot IS NULL
             RETURNING 1
         ),
         delete_files AS (
@@ -697,6 +710,8 @@ internal object CommitTail {
                     "$allocator moved under the commit lock: its guarded UPDATE matched no row"
                 written["table_stats"] != expected["table_stats"] ->
                     "a next_row_id moved under the commit lock: its guarded UPDATE matched no row"
+                written["ended_dvs"] != expected["ended_dvs"] ->
+                    "a DV it read as live was ended under the commit lock: its guarded UPDATE skipped it"
                 else -> "its row counts disagree with the rows it was given"
             }
         return "$what for catalog_id=$catalogId wrote $diff; $cause"
