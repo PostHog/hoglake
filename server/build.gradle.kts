@@ -28,7 +28,7 @@ val jdbiVersion = "3.55.0"
 val flywayVersion = "13.10.0"
 // >= 1.21.1: older versions pin Docker API 1.32, which OrbStack's Docker 29 rejects.
 val testcontainersVersion = "1.21.4"
-val awsSdkVersion = "2.55.14"
+val awsSdkVersion = "2.55.16"
 
 dependencies {
     // Background loops (BackgroundLoops.kt): explicit pin of the
@@ -120,7 +120,7 @@ dependencies {
     testImplementation("io.ktor:ktor-server-test-host:$ktorVersion")
     testImplementation("io.ktor:ktor-client-content-negotiation:$ktorVersion")
     testImplementation("org.awaitility:awaitility:4.3.0")
-    testImplementation("io.kotest:kotest-property:6.2.5")
+    testImplementation("io.kotest:kotest-property:6.2.6")
 
     // Coverage-guided fuzzing (docs/fuzzing.md layer 4): jazzer-junit @FuzzTest
     // targets in src/test/kotlin/com/posthog/hoglake/fuzz. Inside the normal
