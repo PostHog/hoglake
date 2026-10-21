@@ -20,7 +20,7 @@ dependencies = [
     # requires from 21 (measured against 18.0/18.1/19.0/20.0, all of
     # which write a bare FIXED_LEN_BYTE_ARRAY(16)). Current release at
     # the time of the bump: 25.0.1.
-    "pyarrow>=21.0",
+    "pyarrow>=26.0.0",
     "thrift>=0.22.0,<1",
 ]
 
