@@ -246,6 +246,13 @@ for the console, and [just](https://github.com/casey/just). Each component
 carries its own recipes — `just server test`, `just pyhoglake unit`,
 `just webui test`.
 
+The Python trees (`pyhoglake/`, `hedgerow/`, `bench/`, `millrace/`) are the
+members of one uv workspace: the root `pyproject.toml` names them, and one
+`uv.lock` beside it pins every member's dependencies. `uv sync` and `uv run`
+inside a member directory select that member against the root lock; after a
+dependency change, `uv lock` (from any member, or `just pyhoglake lock`)
+rewrites the one lock. All of them need Python 3.12 or newer.
+
 [AGENT.md](AGENT.md) holds the pre-push checklist, the repository invariants
 and the working conventions.
 

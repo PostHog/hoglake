@@ -27,7 +27,8 @@ worse than none, so an invariant failure aborts with exit code 4.
 ## Running
 
 Toolchain: [flox](https://flox.dev) (python312 + uv). Dependencies:
-pyhoglake (editable, from `../pyhoglake`), pyarrow, httpx — no locust,
+pyhoglake (an editable workspace member, `../pyhoglake`; the lock is
+the repository's root `uv.lock`), pyarrow, httpx — no locust,
 no k6; latency capture is hand-rolled (`time.perf_counter_ns`, sorted
 lists for percentiles). numpy + Faker come along for the `seed` task
 only (vocabularies and vectorized row fabrication); no scenario's

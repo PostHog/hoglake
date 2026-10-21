@@ -5,11 +5,10 @@ description = "Python client for hoglake, the Postgres-native lakehouse-catalog 
 readme = "README.md"
 license = "MIT"
 authors = [{ name = "PostHog" }]
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 classifiers = [
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Typing :: Typed",
@@ -75,7 +74,7 @@ build-backend = "hatchling.build"
 packages = ["src/pyhoglake"]
 
 [tool.hatch.build.targets.sdist]
-# Keeps the flox env, justfile, and uv.lock out of the sdist. Hatchling
+# Keeps the flox env and justfile out of the sdist. Hatchling
 # adds pyproject.toml, README.md, and LICENSE on its own.
 only-include = ["src", "tests"]
 
@@ -83,6 +82,15 @@ only-include = ["src", "tests"]
 # Vendored verbatim (tests/data/parquet-testing/NOTICE): its regen.py is
 # Apache Parquet's, not ours to restyle.
 extend-exclude = ["tests/data/parquet-testing"]
+
+[tool.ruff.lint]
+# UP040 (TypeAlias -> `type`) and UP047 (TypeVar -> PEP 695 parameters)
+# fire since the requires-python floor became 3.12 (the uv workspace,
+# root pyproject.toml). `type X = ...` turns the public aliases (Reason,
+# DecimalStamp, Shredding, InvalidReason) into TypeAliasType objects at
+# runtime, a change for any caller that introspects them: that rewrite
+# is a diff of its own, not part of the floor bump.
+ignore = ["UP040", "UP047"]
 
 [tool.ruff.lint.per-file-ignores]
 # Default rule selection applies; src/ stays strict.
@@ -94,7 +102,7 @@ extend-exclude = ["tests/data/parquet-testing"]
 
 [tool.mypy]
 files = ["src"]
-python_version = "3.11"
+python_version = "3.12"
 
 [[tool.mypy.overrides]]
 # pyarrow ships no type information.

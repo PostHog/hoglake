@@ -13,13 +13,15 @@
 # pulled BY HAND; no CD deploys it.
 #
 # Build context is the REPO ROOT, not bench/ (unlike server/ and
-# webui/, which build from their own directories). bench installs
-# pyhoglake from the sibling tree — `[tool.uv.sources] pyhoglake =
-# { path = "../pyhoglake" }` — so both trees must be in the context or
-# the relative path does not resolve ("Distribution not found at:
-# file:///work/pyhoglake"). That is the point: the image ships the
-# client from the SAME commit as the harness, which is the pair the
-# repo tests, rather than whatever PyPI's newest release happens to be.
+# webui/, which build from their own directories). bench is a member of
+# the repo's uv workspace (root pyproject.toml) and installs pyhoglake
+# as a workspace member — `[tool.uv.sources] pyhoglake = { workspace =
+# true }` — so the context must carry the root pyproject.toml and
+# uv.lock, the pyhoglake tree, and every other member's pyproject.toml
+# (a --locked sync checks the lock against the whole workspace). That
+# is the point: the image ships the client from the SAME commit as the
+# harness, which is the pair the repo tests, rather than whatever
+# PyPI's newest release happens to be.
 #
 #   docker build -f bench/Dockerfile -t hoglake-bench .
 #
@@ -35,9 +37,9 @@
 # native manylinux wheels (pyarrow, numpy, psycopg-binary), which are
 # per-target-arch by construction. Pinning this stage to $BUILDPLATFORM
 # would install amd64 wheels into the arm64 image and fail at import on
-# the Graviton fleet. Every wheel in bench/uv.lock is prebuilt for both
-# arches, so the foreign-arch pass under qemu only unpacks — it never
-# compiles.
+# the Graviton fleet. Every wheel bench installs from the root uv.lock
+# is prebuilt for both arches, so the foreign-arch pass under qemu only
+# unpacks — it never compiles.
 FROM python:3.13-slim-trixie AS build
 
 # uv, the same installer the trees are developed and CI-tested with
@@ -50,19 +52,25 @@ ENV UV_LINK_MODE=copy \
     UV_PYTHON_DOWNLOADS=never \
     UV_PROJECT_ENVIRONMENT=/opt/hoglake-bench/venv
 
-WORKDIR /src/bench
+WORKDIR /src
 
-# pyhoglake first and whole: it is a path dependency, so uv builds it
-# from source, and a stub would make the dependency layer lie.
-COPY pyhoglake/ /src/pyhoglake/
+# The workspace root: its manifest and the one lock.
+COPY pyproject.toml uv.lock ./
+# pyhoglake first and whole: it is a workspace member uv builds from
+# source, and a stub would make the dependency layer lie.
+COPY pyhoglake/ pyhoglake/
+# The members bench does not install: manifests only, which is all the
+# --locked check reads.
+COPY hedgerow/pyproject.toml hedgerow/
+COPY millrace/pyproject.toml millrace/
 # Manifests only, so the dependency layer survives a bench source-only
 # change. (pyproject's `readme` is resolved at build time, hence
 # README.md.)
-COPY bench/pyproject.toml bench/uv.lock bench/README.md ./
-RUN uv sync --locked --no-dev --no-editable --no-install-project
+COPY bench/pyproject.toml bench/README.md bench/
+RUN uv sync --locked --package hoglake-bench --no-dev --no-editable --no-install-project
 
-COPY bench/src/ src/
-RUN uv sync --locked --no-dev --no-editable
+COPY bench/src/ bench/src/
+RUN uv sync --locked --package hoglake-bench --no-dev --no-editable
 
 # --no-editable above matters twice. It keeps the venv self-contained,
 # so the runtime stage copies one directory and no source tree; and it

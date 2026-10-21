@@ -14,6 +14,9 @@ name: Bench image
 # the client from the sibling tree, so a pyhoglake change IS a bench
 # image change, and a workflow scoped to bench/** alone would leave the
 # published image quietly shipping a stale client.
+# The root pyproject.toml and uv.lock are trigger paths for the same
+# reason: the image installs from the workspace lock, so a lock-only
+# change (a Dependabot bump) IS an image change too.
 
 on:
   push:
@@ -21,6 +24,8 @@ on:
     paths:
       - "bench/**"
       - "pyhoglake/**"
+      - "pyproject.toml"
+      - "uv.lock"
       - ".github/workflows/bench-image.yml"
       - ".github/workflows/python-live.yml"
       - "ci/**"
@@ -29,6 +34,8 @@ on:
     paths:
       - "bench/**"
       - "pyhoglake/**"
+      - "pyproject.toml"
+      - "uv.lock"
       - ".github/workflows/bench-image.yml"
       - ".github/workflows/python-live.yml"
       - "ci/**"

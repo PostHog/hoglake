@@ -27,5 +27,6 @@ lint:
 fmt:
     {{_uv}} run ruff format .
 
+# Rewrites the ONE lock, the workspace root's uv.lock (every Python tree)
 lock:
     {{_uv}} lock

@@ -51,7 +51,7 @@ dev = [
 ]
 
 [tool.uv.sources]
-pyhoglake = { path = "../pyhoglake", editable = true }
+pyhoglake = { workspace = true }
 
 [build-system]
 requires = ["hatchling"]
@@ -61,7 +61,7 @@ build-backend = "hatchling.build"
 packages = ["millrace"]
 
 [tool.hatch.build.targets.sdist]
-# Keeps the flox env, justfile, and uv.lock out of the sdist. Hatchling
+# Keeps the flox env and justfile out of the sdist. Hatchling
 # adds pyproject.toml, README.md, and LICENSE on its own.
 only-include = ["millrace", "tests"]
 
