@@ -66,6 +66,17 @@ internal object Pg {
      * Consumers: `TableRepo.listLiveSummaries` and the compaction
      * planner's bucket probe (`CompactionService.candidateSql`), each of
      * which records the generic plan it is avoiding.
+     *
+     * SCOPE. `setPrepareThreshold(0)` is set on the one `PgStatement`
+     * object: the statement goes out as the unnamed statement and is
+     * planned custom at Bind. Nothing is set on the connection, and it is
+     * not `plan_cache_mode`. pgjdbc's per-connection `CachedQuery`
+     * execute count for the SQL text still increments on customized
+     * runs, so an UNCUSTOMIZED execution of the same text on that
+     * connection is server-prepared on its first run. Harmless — every
+     * production call site of these statements is customized — and it is
+     * what makes the polarity control in
+     * `CompactionBucketProbePlanIntegrationTest` work.
      */
     val CUSTOM_PLANS_ONLY: StatementCustomizer =
         object : StatementCustomizer {

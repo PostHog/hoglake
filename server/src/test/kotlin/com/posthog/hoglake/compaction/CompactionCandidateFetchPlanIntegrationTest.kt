@@ -5,6 +5,7 @@ import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.service.CatalogService
 import com.posthog.hoglake.service.MaintenanceSummarySampler
+import com.posthog.hoglake.testing.ExplainPlan
 import com.posthog.hoglake.testing.PgTestSupport
 import org.assertj.core.api.Assertions.assertThat
 import org.jdbi.v3.core.kotlin.useHandleUnchecked
@@ -52,15 +53,25 @@ import org.junit.jupiter.api.TestInstance
  *
  * # THE PROPERTY BEING PROVEN
  *
- * `CompactionService.candidateSql` with arms has ONE plan shape: the
- * bucket's ids come from V23's index as an InitPlan, and the manifest is
- * reached from them by primary key (`data_file_id = ANY (...)`), with
- * the `LIMIT` stopping that scan. The statement it replaced left
- * Postgres a choice between that direction and a MANIFEST-DRIVEN plan
- * with the arms as filters, and the manifest-driven plan is O(table) for
- * any bucket that is small or late in the walk — which is what the
- * bucket loop multiplied into 18-37 minute plans on gigahog-prod-us
- * (2026-10-21).
+ * `CompactionService.candidateSql` with arms plans as ONE shape on PG
+ * 18: the bucket's ids come from V23's index as an InitPlan, and the
+ * manifest is reached from them by an index condition
+ * (`data_file_id = ANY (...)`), with the `LIMIT` stopping that scan.
+ * The statement it replaced was a statistics call between that direction
+ * and a MANIFEST-DRIVEN plan with the arms as filters, and the
+ * manifest-driven plan is O(table) for any bucket that is small or late
+ * in the walk — which is what the bucket loop multiplied into 18-37
+ * minute plans on gigahog-prod-us (2026-10-21).
+ *
+ * WHY IT IS ONE SHAPE, and it is costing, not plan space: a
+ * manifest-driven plan over the InitPlan still exists (with index scans
+ * disabled PG 18 plans a `Seq Scan on hog_data_file` filtering on the
+ * array), but the array is a Param with no statistics, and
+ * `estimate_array_length()` returns its default of 10 for one, so the
+ * `= ANY` scan is always costed as ~10 descents and no statistic on
+ * `value` can flip it. That is a PG 18 property: a Postgres that
+ * estimates Param arrays from the subplan's rows restores a
+ * statistics-driven choice, and these assertions are what would notice.
  *
  * So the assertion here is the shape AND the bound: the probe drives
  * from the lookup index in its custom and its generic plan, and its work
@@ -277,7 +288,22 @@ class CompactionCandidateFetchPlanIntegrationTest {
                 .bind("tinyBuckets", TINY_BUCKETS)
                 .bind("bigBucket", BIG_BUCKET)
                 .execute()
-            for (relation in listOf("hog_data_file", "hog_file_partition_value")) {
+            // LIVE DVs on every third file, so the DV join's per-row cost
+            // is measured on real statistics. With `hog_delete_file` empty
+            // and unanalyzed its plan flipped between one materialized
+            // scan and a probe per row (QE, #397), and the buffer bounds
+            // below were passing on whichever the planner happened to pick.
+            h.createUpdate(
+                """
+                INSERT INTO hog_delete_file (catalog_id, delete_file_id, table_id, data_file_id,
+                                             begin_snapshot, path, delete_count, file_size_bytes)
+                SELECT f.catalog_id, f.data_file_id, f.table_id, f.data_file_id, 1,
+                       's3://fetchplan/dv-' || f.data_file_id || '.puffin', 3, 100
+                  FROM hog_data_file f
+                 WHERE f.catalog_id = :c AND f.data_file_id % 3 = 0
+                """,
+            ).bind("c", catalogId).execute()
+            for (relation in listOf("hog_data_file", "hog_file_partition_value", "hog_delete_file")) {
                 h.execute("VACUUM (ANALYZE) $relation")
             }
         }
@@ -592,8 +618,8 @@ class CompactionCandidateFetchPlanIntegrationTest {
         val at = lines.indexOfFirst { it.contains(" on hog_data_file f0") }
         assertThat(at).describedAs("no manifest scan in:\n%s", plan).isNotEqualTo(-1)
         // MUTATION: put the per-key `EXISTS` arms back on the manifest
-        // scan (ReplacedCandidateSql) and this fails for the fresh-day
-        // probe below, whose plan is then a sequential scan.
+        // scan (ReplacedCandidateSql) and this fails: no InitPlan, and
+        // for the fresh-day probe below a sequential scan.
         assertThat(lines[at])
             .describedAs("the manifest is an index scan, never walked:\n%s", plan)
             .contains("Index Scan using hog_data_file_")
@@ -658,15 +684,32 @@ class CompactionCandidateFetchPlanIntegrationTest {
                 plan,
             )
             .isLessThanOrEqualTo(analytic * 2)
-        // And in buffers: at most ONE pass of the manifest, which is the
-        // ceiling on any plan. The inner-sort shape was 5,429 buffers
-        // plus 379 temp blocks written for the spilled sort; the
-        // replaced statement's hash join over a sequential scan ~1,656
-        // (57,340 manifest rows); this ~1,877 (20,000 index entries and
-        // the cap's 8,192 primary-key rows), with nothing spilled.
-        assertThat(buffers(plan))
-            .describedAs("no plan may cost more than one pass of the manifest:\n%s", plan)
+        // And in buffers, in TWO terms, because the new statement's cost
+        // at the cap is not one term.
+        //
+        // The CANDIDATE READ — everything but the DV join — is at most
+        // one pass of the manifest, the ceiling on any plan. The
+        // inner-sort shape was 5,429 buffers plus 379 temp blocks for the
+        // spilled sort; this is ~1,880 (20,000 index entries and the
+        // cap's 8,192 primary-key rows), nothing spilled.
+        //
+        // The DV JOIN is a nested loop at any result size, because the
+        // outer estimate is the Param-array default (~3 rows) —
+        // `CompactionService.candidateSql` regime (c). Measured with a
+        // live DV on a third of the files: 19,115 buffers for 8,192
+        // probes, ~2.3 per row, where the replaced statement hash-joined
+        // (2,860 buffers in all, recorded by the largest-files test). It
+        // is bounded per ROW, not by the manifest, and this pins that
+        // bound rather than pretending it is the other.
+        val dvJoin =
+            ExplainPlan.nodes(plan).filter { it.line.contains("on hog_delete_file dv") }.sumOf { it.buffers }
+        assertThat(buffers(plan) - dvJoin)
+            .describedAs("the candidate read may cost no more than one pass of the manifest:\n%s", plan)
             .isLessThanOrEqualTo(heapPages("hog_data_file"))
+        assertThat(dvJoin)
+            .describedAs("the DV join is a bounded probe per returned row:\n%s", plan)
+            .isLessThanOrEqualTo(4L * actualRows(plan) + 64)
+        println("RECORDED over-cap probe: buffers ${buffers(plan)}, of which DV join $dvJoin")
         assertThat(plan)
             .describedAs("and nothing may spill: the inner sort is what used to:\n%s", plan)
             .doesNotContain("external merge")
@@ -686,7 +729,7 @@ class CompactionCandidateFetchPlanIntegrationTest {
         // which matches gigahog-prod-us's 2026-10-21 symptoms (1,064,028
         // sequential scans of hog_data_file, 193 of 200 sweeps over the
         // plan statement timeout).
-        val before = explainBucket("fresh-1", sql = ReplacedCandidateSql.sql(1))
+        val before = explainBucket("fresh-1", sql = ReplacedCandidateSql.sql(listOf(0)))
         val plan = explainBucket("fresh-1")
         assertThat(actualRows(plan)).isEqualTo(cfg.candidateBudget.toLong())
         assertThat(actualRows(before)).describedAs("same answer from both").isEqualTo(cfg.candidateBudget.toLong())
@@ -696,11 +739,15 @@ class CompactionCandidateFetchPlanIntegrationTest {
         assertThat(scannedRows(plan))
             .describedAs("manifest rows read are the cap's:\n%s", plan)
             .isEqualTo(cfg.candidateBudget.toLong())
-        // RECORDED, not asserted as the property: the replaced statement
-        // walked the manifest past the cap.
-        assertThat(scannedRows(before))
-            .describedAs("the replaced probe walks the manifest:\n%s", before)
-            .isGreaterThan(2L * cfg.candidateBudget)
+        // RECORDED, not asserted: what Postgres does with the replaced
+        // statement guards nothing in hoglake, and a point release that
+        // plans it better must not fail this suite. Measured on PG 18.6:
+        // a hash join over `Seq Scan on hog_data_file`, 57,342 rows.
+        println(
+            "RECORDED replaced fresh-1 probe: manifest rows ${scannedRows(before)}, " +
+                "buffers ${ExplainPlan.nodes(before).first().buffers}; new: manifest rows " +
+                "${scannedRows(plan)}, buffers ${ExplainPlan.nodes(plan).first().buffers}",
+        )
 
         // AND THE ORDERING STILL PUTS IT LAST. It used to be what kept
         // the walk above unreachable; it is now a VALUE ordering only

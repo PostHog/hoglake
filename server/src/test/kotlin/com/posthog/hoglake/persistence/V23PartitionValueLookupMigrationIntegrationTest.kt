@@ -402,7 +402,7 @@ class V23PartitionValueLookupMigrationIntegrationTest {
     // ---- the index itself ----------------------------------------------------
 
     @Test
-    fun `the index keys exactly the columns each EXISTS arm probes and returns`() {
+    fun `the index keys exactly the columns each partition arm probes and returns`() {
         val key =
             db.jdbi.withHandleUnchecked { h ->
                 h.createQuery(

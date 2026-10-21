@@ -1445,8 +1445,10 @@ class CompactionService(
      * manifest with one `EXISTS` per key, which left Postgres free to
      * walk the table's rows until the `LIMIT` filled — O(table) per
      * probe, and the bucket loop made that minutes per plan on
-     * gigahog-prod-us. Both halves are kept now: no inner sort, and no
-     * manifest-driven plan to choose. See [candidateSql], which also
+     * gigahog-prod-us. Both halves are kept now: no inner sort, and an
+     * id-set InitPlan that PG 18 always costs as a handful of primary-key
+     * descents, so no statistic makes the walk look cheaper. See
+     * [candidateSql] for why that holds and where it costs, which also
      * states what the arms still cost: they are CATALOG-scoped
      * (`hog_file_partition_value` carries no `table_id`), so a probe is
      * bounded by the bucket across the catalog.
@@ -1816,15 +1818,16 @@ class CompactionService(
      *        AND file_size_bytes < ?
      *        [AND data_file_id = ANY (ARRAY(            -- ARMS: the bucket's ids,
      *              SELECT pv.data_file_id                --   V23's index, as ONE
-     *                FROM hog_file_partition_value pv    --   InitPlan, the first key
+     *                FROM hog_file_partition_value pv    --   InitPlan; keys
      *               WHERE catalog_id = ? AND key_index = ? AND value = ?
-     *                 [AND EXISTS (each further key, probed per id)])))]
+     *                 [AND EXISTS (each further key)])))] --   intersected by cost
+     *        [AND spec_id IS NOT DISTINCT FROM ?]        -- bucket identity, ARMS only
      *      [ORDER BY file_size_bytes, data_file_id]      -- ONLY when there are no arms
      *      LIMIT ?                                       -- THE SCAN CAP
      * ) f
      * LEFT JOIN hog_delete_file dv …                    -- the planned DV
      * [LEFT JOIN LATERAL (array_agg of the tuple) …]     -- no-sample fallback only
-     * [WHERE f.spec_id IS NOT DISTINCT FROM ?]           -- bucket identity
+     * [WHERE f.spec_id IS NOT DISTINCT FROM ?]           -- bucket identity, NO arms
      * ORDER BY f.file_size_bytes, f.data_file_id         -- over at most the cap
      * LIMIT ?                                            -- THE RESULT CAP
      * ```
@@ -1882,37 +1885,106 @@ class CompactionService(
      * manifest is reached FROM it — `data_file_id = ANY (that array)` as
      * an index condition, normally on the primary key, the `table_id`
      * and size predicates checked per id, and the `LIMIT` stopping that
-     * scan at the cap. An InitPlan cannot be turned around: there is no
-     * plan left in which the manifest drives and the arms filter, so the
-     * estimate the old choice rested on no longer chooses anything.
+     * scan at the cap.
      *
-     * Inside the array the FIRST key drives (an index-only range on
-     * `(catalog_id, key_index, value)`) and each further key is an
-     * `EXISTS` correlated to the driver's id. That subquery has no
-     * `LIMIT`, so Postgres costs it whole and picks how to intersect the
-     * keys: in a custom plan, with the bound values' statistics, it
-     * drives from the SELECTIVE key and probes the common one per id
-     * through the same index (measured: 250 team-arm entries, 250 probes
-     * of an 80,000-entry month arm, 957 buffers for a 50-file bucket).
+     * WHY POSTGRES PICKS THAT, and it is a costing property rather than
+     * a missing plan. A manifest-driven plan still exists — with index
+     * scans disabled PG 18 plans `Seq Scan on hog_data_file … Filter:
+     * data_file_id = ANY ((InitPlan 1).col1)` — but the InitPlan's output
+     * is a Param with no statistics, and `estimate_array_length()`
+     * returns its constant default of 10 for a Param. So the `= ANY`
+     * primary-key scan is always costed as about ten descents (EXPLAIN
+     * shows the InitPlan at ~19 rows and the scan at ~3), and no
+     * statistic on `value`, however wrong, makes a walk of the table look
+     * cheaper. Two consequences, both deliberate costs:
+     *
+     *  - the planner also cannot prefer a TABLE-scoped path when one
+     *    would be cheaper (regimes (a) and (b) below);
+     *  - everything above the scan is costed at ~3 rows, which is what
+     *    makes the DV join a nested loop at any result size (regime (c)).
+     *
+     * This is a PG 18 property. A future Postgres that estimates a Param
+     * array from its subplan's row estimate restores a statistics-driven
+     * choice, and with it the old failure mode; the plan tests pin the
+     * shape so that upgrade is noticed rather than inherited.
+     *
+     * INSIDE THE ARRAY the planner intersects the keys BY COST: it pulls
+     * the `EXISTS` up into a semi-join within the InitPlan and picks the
+     * driving side itself. The SQL's first key is syntactic only —
+     * `arms = [1, 0]` (month first) produces the identical plan to
+     * `[0, 1]`. That subquery has no `LIMIT`, so it is costed whole: in a
+     * custom plan, with the bound values' statistics, Postgres drives
+     * from the SELECTIVE key and probes the common one per id through
+     * the same index (measured: 250 team-key entries, 250 probes of an
+     * 80,000-entry month key, 957 buffers for a 50-file bucket); where
+     * no key is selective it merge-joins both.
      *
      * # THE BOUND, stated rather than implied
      *
      * A probe reads:
      *
-     *  - the smallest arm's index entries (or, where no arm is selective,
-     *    the arms' entries in a merge join), CATALOG-wide;
+     *  - the cheapest intersection of the keys' index entries,
+     *    CATALOG-wide (the selective key's entries plus a probe each, or
+     *    both keys' entries in a merge join);
      *  - one primary-key visit per id in the CATALOG-WIDE bucket, until
      *    the cap's worth match this table.
      *
      * So it is O(the bucket across the catalog), not O(the table). The
-     * catalog-wide part is the cost of the arms being catalog-scoped, and
-     * it is real: a big customer's stray bucket — 50 files on this table,
-     * 20,064 across the catalog — costs 13,235 buffers (one sorted
-     * `= ANY` scan of the primary key; the replaced statement paid a
-     * descent per id, 81,857). A value that is most of the catalog makes
-     * the array most of the catalog. Bounding it by the TABLE would need
-     * `table_id` in V23's index, which is a schema change and not this
-     * one.
+     * catalog-wide part is the cost of the keys being catalog-scoped: a
+     * big customer's stray bucket — 50 files on this table, 20,064 across
+     * the catalog — costs 13,235 buffers (one sorted `= ANY` scan of the
+     * primary key; the replaced statement paid a descent per id, 81,857).
+     * Bounding it by the TABLE would need `table_id` in V23's index, a
+     * schema change and the real fix for (a) and (b); not this one.
+     *
+     * WHERE THIS STATEMENT IS WORSE THAN THE ONE IT REPLACED, measured on
+     * a reproduction of `CompactionBucketProbePlanIntegrationTest`'s
+     * fixture on PG 18:
+     *
+     *  - (a) A SMALL TABLE WHOSE VALUES A BIG SIBLING SHARES (millpond's
+     *    small `day(ts)` tables beside its 7.6M-file one). A one-key
+     *    probe for month 682 on a 50-file table: 825 buffers, against
+     *    163 for the old statement. The whole catalog-wide key is read
+     *    index-only, then the manifest is walked over ids that mostly
+     *    belong to the sibling; the old statement walked the small table.
+     *  - (b) A ONE-KEY PROBE ON A WIDELY SHARED VALUE, where no key is
+     *    selective and the id set is the value's files across the whole
+     *    catalog. Over the cap (month 682: 20,000 files on this table,
+     *    80,000 across the catalog, cap 8,193): 21,830 buffers against
+     *    4,898 with no DVs, of which 16,386 is (c); with a live DV on a
+     *    third of the files, 33,137 against 7,524, 27,700 of it (c).
+     *    Under the cap (a big team: 250 files here, 100,263 across the
+     *    catalog): 13,270 against 13,625 with DVs, 12,925 against 10,992
+     *    without — the same order, not cheaper. The direction is MORE
+     *    than before, bounded by the value's catalog-wide files;
+     *    `CompactionBucketProbePlanIntegrationTest` pins the bound and
+     *    records both figures.
+     *  - (c) THE DV LEFT JOIN is a nested loop at any result size, 2-3.4
+     *    buffers per returned row, because the outer estimate is ~3 rows;
+     *    the old statement estimated thousands and used a hash left
+     *    join. At the cap it is the dominant term. NOT FENCED, on
+     *    purpose: an `OFFSET 0` (or any fence) does not change the row
+     *    estimate, which comes from the same Param-array default; a hash
+     *    join's alternative is a read of every live DV of the CATALOG,
+     *    which on production is not cheaper than 8,192 probes of
+     *    `hog_delete_file_data_lookup`; and gigahog's buckets are a
+     *    median of 66 files, where the nested loop is ~130-225 buffers.
+     *  - (d) MEMORY. `ARRAY(subquery)` accumulates in the per-query
+     *    memory context — ~32 bytes per id, doubling growth plus a copy,
+     *    then `_bt_preprocess_array_keys` copies and sorts it again — and
+     *    none of it is governed by `work_mem`. `scanLimit` bounds nothing
+     *    here: the array is built whole before the scan starts. 1M ids is
+     *    ~32 MB, 10M ~320 MB, and the hard ceiling is Postgres's 1 GB
+     *    array limit at ~134M ids. n is |team ∩ month| across the catalog
+     *    for a two-key spec, and for a single-key `day(ts)` spec it is
+     *    that day's files across EVERY table in the catalog.
+     *
+     * The millpond verdict, per catalog: the big table gets better —
+     * stray days under the cap cost O(that day's files catalog-wide)
+     * instead of a potential O(7.6M) walk, and over-cap fresh days are
+     * the same to 4x worse but bounded — and the small siblings get worse
+     * by (a). Net better, and the `table_id`-in-index follow-up removes
+     * (a) and (b).
      *
      * # NEVER A GENERIC PLAN ([Pg.CUSTOM_PLANS_ONLY])
      *
@@ -1921,7 +1993,7 @@ class CompactionService(
      * of times on one handle. Postgres may then switch to a GENERIC plan,
      * built without the bound values — which cannot tell a selective
      * key from a common one, and merge-joins both: measured, every
-     * month-arm entry in the catalog (78,432) read to find a 50-file
+     * month-key entry in the catalog (78,432) read to find a 50-file
      * bucket. The array keeps even that plan driven from V23's index,
      * but the probe is sent unnamed so it is never planned generic at
      * all.
@@ -1950,7 +2022,8 @@ class CompactionService(
             if (keyIndex in nullArms) "pv$keyIndex.value IS NULL" else "pv$keyIndex.value = :v$keyIndex"
         // ONE id set for the whole tuple, evaluated ONCE as an InitPlan,
         // and the manifest reached by primary key from it. See the KDoc
-        // for why this is an array and not a semi-join.
+        // for why this is an array and not a semi-join. `driver` is only
+        // where the SQL starts: the planner intersects the keys by cost.
         val armSql =
             if (arms.isEmpty()) {
                 ""
@@ -1973,11 +2046,26 @@ class CompactionService(
                                 AND ${valuePredicate(driver)}$probes))
                 """.trimEnd()
             }
-        // THE INNER ORDER BY EXISTS ONLY WHEN THERE ARE NO ARMS, and
-        // that asymmetry is the whole bound. See the KDoc.
+        // THE INNER ORDER BY EXISTS ONLY WHEN THERE ARE NO ARMS: there it
+        // is the index's own order and free. With arms the bound is the
+        // InitPlan plus the LIMIT on the scan it drives, and a sort would
+        // make the LIMIT wait for the whole bucket. See the KDoc.
         val innerOrder =
             if (arms.isEmpty()) "\n                     ORDER BY f0.file_size_bytes, f0.data_file_id" else ""
-        val specFilter = if (scopeToSpec) "\n             WHERE f.spec_id IS NOT DISTINCT FROM :specId" else ""
+        // THE SPEC PREDICATE: inside the scan cap for an arm'd probe, where
+        // it is a plain filter on the id-driven scan and the cap then
+        // counts only this bucket's spec. Outside it for the no-arm probe,
+        // where inside would make the ordered size scan walk past every
+        // smaller file of other vintages; [bucketCandidates] states that
+        // cost and the scan cap that covers it.
+        val specInner =
+            if (scopeToSpec && arms.isNotEmpty()) {
+                "\n                       AND f0.spec_id IS NOT DISTINCT FROM :specId"
+            } else {
+                ""
+            }
+        val specFilter =
+            if (scopeToSpec && arms.isEmpty()) "\n             WHERE f.spec_id IS NOT DISTINCT FROM :specId" else ""
         val valuesProjection = if (withPartitionValues) ",\n                   pvs.partition_values" else ""
         val valuesJoin =
             if (withPartitionValues) {
@@ -2003,7 +2091,7 @@ class CompactionService(
                       FROM hog_data_file f0
                      WHERE f0.catalog_id = :catalogId AND f0.table_id = :tableId
                        AND f0.end_snapshot IS NULL
-                       AND f0.file_size_bytes < :targetBytes$armSql$innerOrder
+                       AND f0.file_size_bytes < :targetBytes$armSql$specInner$innerOrder
                      LIMIT :scanLimit
                    ) f
               LEFT JOIN hog_delete_file dv
@@ -2020,12 +2108,22 @@ class CompactionService(
      * no tuple; an arbitrary [limit] of it otherwise — see
      * [candidateSql]).
      *
-     * A bucket WITH a tuple gets its ids from V23's index, one key
-     * driving and the rest probed (see [candidateSql]); the
+     * A bucket WITH a tuple gets its ids from V23's index, the planner
+     * intersecting the keys by cost (see [candidateSql]); the
      * TUPLE-LESS bucket — an unpartitioned table, or the vintage a
      * mid-life-partitioned table wrote before its spec — gets none, and
      * is separated from the partitioned buckets by the `spec_id` filter
      * alone.
+     *
+     * THE SPEC FILTER IS INSIDE THE SCAN CAP WITH A TUPLE. The same tuple
+     * can exist under two `spec_id`s of one table (a spec change that
+     * keeps the keys and adds one, say), and with the filter outside the
+     * cap the cap counted both vintages and the probe under-fetched this
+     * one: QE's equivalence fixture recorded `values=[1,a] spec=2
+     * scanLimit=40: truth=20 new=15 old=10`. Inside, it is a plain
+     * filter on the id-driven primary-key scan — same plan shape — and
+     * the cap counts only this bucket. `CandidateSqlEquivalenceIntegrationTest`
+     * asserts the truth count.
      *
      * That is why the tuple-less case reads a SCAN CAP of
      * [CompactionConfig.maxCandidates] rather than its share of the

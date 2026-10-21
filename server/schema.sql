@@ -445,11 +445,11 @@ CREATE TABLE hog_file_partition_value (
 -- file's partition values"; the compaction planner needs "which files
 -- are in this bucket", because a group never spans a (spec_id,
 -- partition_values) bucket and the planner picks buckets before files.
--- The candidate fetch builds a bucket's id set from this index (the
--- first key an index-only range on (catalog_id, key_index, value)
--- returning data_file_id — hence that column in the key — and each
--- further key a probe on the same columns plus data_file_id), then
--- reaches hog_data_file by primary key from it. Without it the planner
+-- The candidate fetch builds a bucket's id set from this index — each
+-- key an index-only range on (catalog_id, key_index, value) returning
+-- data_file_id, hence that column in the key, or a probe on all four;
+-- the planner intersects the keys by cost — then reaches hog_data_file
+-- by primary key from it. Without it the planner
 -- read every live file of the table with a correlated array_agg per row
 -- (~9.9M on gigahog-prod-us's ingest.events_raw) to find the at most
 -- 50,000 candidates a table plan may fetch. NOT partial: every live

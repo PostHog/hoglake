@@ -64,11 +64,15 @@ import org.junit.jupiter.api.TestInstance
  * WHAT THIS FIXTURE DOES NOT REPRODUCE: production's O(table) walk on a
  * two-key bucket. On these rows Postgres 18 drove the REPLACED statement
  * from V23's index too (1,056 buffers for the selective bucket, against
- * 957 now). The manifest-driven plans it could pick are measured in
+ * 957 now, measured before DVs were seeded). The manifest-driven plans it could pick are measured in
  * `CompactionCandidateFetchPlanIntegrationTest` (a `Seq Scan on
- * hog_data_file` under a hash join, walked until the `LIMIT` fills), and
- * the new statement's point is that it leaves Postgres no such plan to
- * pick, whatever the statistics say.
+ * hog_data_file` under a hash join, walked until the `LIMIT` fills). The
+ * new statement's point is that PG 18 costs its id-set InitPlan as a
+ * handful of primary-key descents whatever the statistics say
+ * (`estimate_array_length()` defaults a Param array to 10), so no
+ * misestimate makes that walk look cheaper — see
+ * `CompactionService.candidateSql`, which also states the regimes where
+ * the new statement costs more.
  *
  * Plus one bucket whose month is NULL (`value IS NULL` arm), and a
  * tuple-less vintage ([TUPLELESS] files, `spec_id` NULL, no partition
@@ -115,6 +119,9 @@ class CompactionBucketProbePlanIntegrationTest {
         const val NULL_TEAM = "0"
 
         const val TINY_BYTES = 12L * 1024
+
+        /** A live DV on every this-many'th file: ~133k live DVs. */
+        const val DV_EVERY = 3
     }
 
     private val db = PgTestSupport.freshDatabase()
@@ -242,7 +249,26 @@ class CompactionBucketProbePlanIntegrationTest {
             ).bind("c", catalogId).bind("buckets", BUCKETS).bind("neighbourTeams", NEIGHBOUR_TEAMS)
                 .bind("bigTeam", BIG_TEAM)
                 .bind("firstMonth", FIRST_MONTH).bind("n", PARTITIONED_FILES).execute()
-            for (relation in listOf("hog_data_file", "hog_file_partition_value")) {
+            // LIVE DVs on every [DV_EVERY]th file, and an ENDED one on a
+            // few more. With `hog_delete_file` empty and unanalyzed the
+            // DV join's plan flipped on default statistics between one
+            // materialized scan (1 buffer) and a probe per row (2 per
+            // row) — a ±100-buffer wobble at 50 rows and ±16k at the cap
+            // (QE, #397) — so the join's per-row term was assumed, not
+            // measured.
+            h.createUpdate(
+                """
+                INSERT INTO hog_delete_file (catalog_id, delete_file_id, table_id, data_file_id,
+                                             begin_snapshot, end_snapshot, path, delete_count, file_size_bytes)
+                SELECT f.catalog_id, f.data_file_id, f.table_id, f.data_file_id, 1,
+                       CASE WHEN f.data_file_id % (:every * 7) = 1 THEN 2 END,
+                       's3://bucketprobe/dv-' || f.data_file_id || '.puffin', 3, 100
+                  FROM hog_data_file f
+                 WHERE f.catalog_id = :c
+                   AND (f.data_file_id % :every = 0 OR f.data_file_id % (:every * 7) = 1)
+                """,
+            ).bind("c", catalogId).bind("every", DV_EVERY).execute()
+            for (relation in listOf("hog_data_file", "hog_file_partition_value", "hog_delete_file")) {
                 h.execute("VACUUM (ANALYZE) $relation")
             }
         }
@@ -426,7 +452,7 @@ class CompactionBucketProbePlanIntegrationTest {
         return (rows * loops).toLong()
     }
 
-    private val replacedSql: String = ReplacedCandidateSql.sql(2)
+    private val replacedSql: String = ReplacedCandidateSql.sql(listOf(0, 1))
 
     /**
      * Per-entry budget for a btree probe: a descent of the lookup index or
@@ -436,8 +462,32 @@ class CompactionBucketProbePlanIntegrationTest {
      */
     private val perProbe = 4L
 
-    /** The DV left join's per-returned-row probe and the plan's own fixed pages. */
-    private fun overhead(rows: Long) = 2 * rows + 64
+    /**
+     * Print a budgeted plan's measured buffers, its budget and the DV
+     * join's share, so a margin is read rather than inferred.
+     */
+    private fun recordBudget(
+        plan: String,
+        budget: Long,
+    ) {
+        val dv = ExplainPlan.nodes(plan).filter { it.line.contains("on hog_delete_file dv") }.sumOf { it.buffers }
+        println(
+            "RECORDED budget: buffers ${buffers(plan)} of $budget " +
+                "(${"%.2f".format(budget.toDouble() / buffers(plan))}x), DV join $dv",
+        )
+    }
+
+    /**
+     * The DV left join's per-returned-row probe and the plan's own fixed
+     * pages. The join is a nested loop at any result size (the outer
+     * estimate is the Param-array default, ~3 rows; see
+     * `CompactionService.candidateSql` regime (c)), and each probe is a
+     * descent of `hog_delete_file_data_lookup` plus the heap page of a
+     * match — [perProbe], like every other probe here. Measured with
+     * ~133k live DVs seeded: 3.4 buffers per returned row (169 for 50,
+     * 27,700 for 8,193).
+     */
+    private fun overhead(rows: Long) = perProbe * rows + 64
 
     // ---- the fixture is the shape it claims to be -----------------------------
 
@@ -483,27 +533,60 @@ class CompactionBucketProbePlanIntegrationTest {
             .isLessThanOrEqualTo(teamArm)
         // In BUFFERS, derived: one probe per selective-arm entry, one per
         // catalog-wide bucket id, the DV join per returned row. Measured
-        // 957 against this budget's 1,364; the manifest's heap is 10,019
-        // pages, and the budget must stay under a fifth of it.
+        // 1,125 (169 of it the DV join) against this budget's 1,464; the
+        // manifest's heap is 10,019 pages, and the budget must stay under
+        // a fifth of it.
         val budget = perProbe * (teamArm + catalogBucket(TEAM)) + overhead(PER_BUCKET.toLong())
         assertThat(buffers(plan))
             .describedAs("buffers against the bucket's budget %d:\n%s", budget, plan)
             .isLessThanOrEqualTo(budget)
+        recordBudget(plan, budget)
         assertThat(budget)
             .describedAs("and that budget is far under the table")
             .isLessThan(relpages("hog_data_file") / 5)
     }
 
     @Test
+    fun `the common key first in the spec is still probed, not ranged`() {
+        // A table declared `month(ts), identity(team_id)` puts the COMMON
+        // key first, so `candidateSql` starts its SQL from it. That order
+        // is syntactic only: the planner pulls the `EXISTS` up into a
+        // semi-join inside the InitPlan and picks the driving side by
+        // cost. Same bucket, same budget as the test above, arms reversed.
+        // Measured: the identical plan — the team key ranged (250), the
+        // month key probed 250 times, the same buffers as the test above.
+        val plan = custom(sql(listOf(1, 0)))
+        assertThat(rootRows(plan)).describedAs("the whole bucket:\n%s", plan).isEqualTo(PER_BUCKET.toLong())
+        assertThat(plan)
+            .describedAs("the arms are an InitPlan over V23's index:\n%s", plan)
+            .contains("InitPlan 1")
+            .contains("data_file_id = ANY ((InitPlan 1).col1)")
+            .doesNotContain("Seq Scan on hog_data_file")
+        // MUTATION: make the team key's `EXISTS` unpullable (`OFFSET 0`
+        // in it), so the month key drives as written, and this test fails
+        // — measured: 240,912 buffers, the month key's catalog-wide range
+        // read and the team key a correlated SubPlan per entry (the plan
+        // then renumbers its subplans, so the InitPlan check trips first).
+        assertThat(touched(armNode(plan, "key_index = 1")))
+            .describedAs("month-key entries touched, against a selective key of %d:\n%s", teamArm, plan)
+            .isLessThanOrEqualTo(teamArm)
+        val budget = perProbe * (teamArm + catalogBucket(TEAM)) + overhead(PER_BUCKET.toLong())
+        assertThat(buffers(plan))
+            .describedAs("buffers against the bucket's budget %d:\n%s", budget, plan)
+            .isLessThanOrEqualTo(budget)
+        recordBudget(plan, budget)
+    }
+
+    @Test
     fun `the generic plan also drives from the lookup index, but ranges over the common arm`() {
         // What Postgres would switch to if pgjdbc server-prepared the
         // probe. Its id set still comes from V23's index and the manifest
-        // is still reached by primary key — the ARRAY form leaves no
-        // manifest-driven plan to choose — so it is bounded by the ARMS.
-        // But a generic plan cannot see which arm is selective, so it
-        // merge-joins both and reads every table's files for the month.
-        // That is why the probe carries `Pg.CUSTOM_PLANS_ONLY`; the next
-        // test pins that it does.
+        // is still reached by primary key — the array is costed at its
+        // default length in this plan too — so it is bounded by the ARMS.
+        // But a generic plan cannot see which arm is selective, so on PG
+        // 18.6 it merge-joins both and reads every table's files for the
+        // month. That is why the probe carries `Pg.CUSTOM_PLANS_ONLY`;
+        // the next test pins that it does.
         val plan = generic(sql(listOf(0, 1)))
         assertThat(plan)
             .describedAs("generic: the id set is still the lookup index:\n%s", plan)
@@ -513,10 +596,14 @@ class CompactionBucketProbePlanIntegrationTest {
             .doesNotContain("Seq Scan on hog_data_file")
             .doesNotContain("hog_data_file_maintenance_size_scan")
         assertThat(rootRows(plan)).isEqualTo(PER_BUCKET.toLong())
-        // RECORDED, not asserted as good: the month arm read as a range.
-        assertThat(touched(armNode(plan, "key_index = \$9")))
-            .describedAs("the generic plan ranges over the common arm:\n%s", plan)
-            .isGreaterThan(monthArm / 2)
+        // RECORDED, not asserted: how the generic plan intersects the
+        // arms guards nothing (production never runs it), and a point
+        // release that plans it better must not fail this suite.
+        // Measured on PG 18.6: 78,432 month-arm entries of 80,000.
+        println(
+            "RECORDED generic month-arm entries touched: " +
+                "${touched(armNode(plan, "key_index = \$9"))} of $monthArm",
+        )
     }
 
     @Test
@@ -580,7 +667,7 @@ class CompactionBucketProbePlanIntegrationTest {
     // ---- the big team: bounded by the catalog-wide bucket ---------------------
 
     @Test
-    fun `a big team's stray bucket is bounded by the catalog-wide bucket, and the replaced probe was not`() {
+    fun `a big team's stray bucket is bounded by the catalog-wide bucket`() {
         // THE CASE THE ARMS CANNOT MAKE CHEAP, measured honestly. Both
         // arms are common catalog-wide, so the id set is the big team's
         // (team, month) files in EVERY table: `hog_file_partition_value`
@@ -589,8 +676,8 @@ class CompactionBucketProbePlanIntegrationTest {
         // one sorted `= ANY` primary-key scan over those ids, instead of
         // one primary-key descent per id.
         //
-        // Measured: the replaced statement 81,857 buffers (merge join of
-        // both arms, then 20,064 nested-loop descents), this one 13,235
+        // Measured: the replaced statement 84,490 buffers (merge join of
+        // both arms, then 20,064 nested-loop descents), this one 13,305
         // (the same merge join, then one sorted array scan).
         val plan = custom(sql(listOf(0, 1)), team = BIG_TEAM)
         val before = custom(replacedSql, team = BIG_TEAM)
@@ -609,10 +696,92 @@ class CompactionBucketProbePlanIntegrationTest {
         assertThat(buffers(plan))
             .describedAs("buffers against the catalog-wide bucket's budget %d:\n%s", budget, plan)
             .isLessThanOrEqualTo(budget)
-        // RECORDED: the replaced statement paid a descent per id.
-        assertThat(buffers(before))
-            .describedAs("the replaced probe:\n%s", before)
-            .isGreaterThan(3 * buffers(plan))
+        recordBudget(plan, budget)
+        // RECORDED, not asserted: the replaced statement's plan guards
+        // nothing in hoglake. Measured on PG 18.6: a descent per id,
+        // 84,490 buffers against 13,305.
+        println("RECORDED big-team probe buffers: replaced ${buffers(before)}, new ${buffers(plan)}")
+    }
+
+    /** EXPLAIN a ONE-key probe on [keyIndex] = [value] at the cap, as `bucketCandidates` binds it. */
+    private fun customOneKey(
+        statement: String,
+        keyIndex: Int,
+        value: String,
+    ): String =
+        db.jdbi.withHandleUnchecked { h ->
+            serial(h) {
+                val cap = cfg.candidateBudget + 1
+                h.createQuery(explain + statement)
+                    .bind("catalogId", catalogId).bind("tableId", tableId)
+                    .bind("targetBytes", cfg.targetBytes).bind("specId", 1L)
+                    .bind("scanLimit", cap).bind("limit", cap)
+                    .bind("k$keyIndex", keyIndex).bind("v$keyIndex", value)
+                    .mapTo(String::class.java).list().joinToString("\n")
+            }
+        }
+
+    /** Files with [keyIndex] = [value] on the subject table only. */
+    private fun tableKeyCount(
+        keyIndex: Int,
+        value: String,
+    ): Long =
+        count(
+            """
+            SELECT count(*) FROM hog_data_file f
+              JOIN hog_file_partition_value pv
+                ON pv.catalog_id = f.catalog_id AND pv.data_file_id = f.data_file_id
+             WHERE f.catalog_id = :c AND f.table_id = :t AND pv.key_index = :k AND pv.value = :v
+            """,
+            "t" to tableId,
+            "k" to keyIndex,
+            "v" to value,
+        )
+
+    @Test
+    fun `a one-key probe on a widely shared value is bounded by that value's catalog-wide files`() {
+        // THE DOMINATING-DRIVER CASE, which the KDoc states and this pins:
+        // ONE key, so there is no selective key to drive from, and the id
+        // set is every file in the CATALOG with that value. Two values:
+        //
+        //  - month 682: 80,000 files catalog-wide, 20,000 on this table —
+        //    OVER the cap, so the primary-key scan stops at the cap;
+        //  - the big team: 100,000+ catalog-wide, 250 on this table —
+        //    under the cap, so the scan visits every id.
+        //
+        // The bound is the value's catalog-wide entries (index-only,
+        // ~100 to a page, generously), one buffer per id the sorted
+        // `= ANY` scan visits, and the DV join per returned row. It is
+        // NOT the replaced statement's cost: the new statement costs MORE
+        // here. Measured with DVs seeded: month 682 33,137 vs 7,524 (27,700
+        // of the new figure the per-row DV join, regime (c)); the big team
+        // 13,270 vs 13,625. QE, before DVs: 21,823 vs 4,891 and 12,925 vs
+        // 10,992. The old statement walked this table and stopped at the
+        // cap; the new one first builds the catalog-wide id set and then
+        // pays the DV join per row. Recorded, not asserted.
+        for ((key, value) in listOf(1 to MONTH, 0 to BIG_TEAM)) {
+            val plan = customOneKey(sql(listOf(key)), key, value)
+            val before = customOneKey(ReplacedCandidateSql.sql(listOf(key)), key, value)
+            val cap = (cfg.candidateBudget + 1).toLong()
+            val rows = minOf(tableKeyCount(key, value), cap)
+            val entries = armSize(key, value)
+            assertThat(rootRows(plan)).describedAs("key %d = %s:\n%s", key, value, plan).isEqualTo(rows)
+            assertThat(rootRows(before)).describedAs("same answer from both").isEqualTo(rows)
+            assertThat(plan)
+                .describedAs("driven by the id set:\n%s", plan)
+                .contains("InitPlan 1")
+                .contains("data_file_id = ANY ((InitPlan 1).col1)")
+                .doesNotContain("Seq Scan on hog_data_file")
+            val budget = entries / 100 + entries + overhead(rows)
+            assertThat(buffers(plan))
+                .describedAs("key %d = %s against the catalog-wide budget %d:\n%s", key, value, budget, plan)
+                .isLessThanOrEqualTo(budget)
+            recordBudget(plan, budget)
+            println(
+                "RECORDED one-key probe key=$key value=$value (catalog $entries, table rows $rows): " +
+                    "replaced ${buffers(before)}, new ${buffers(plan)}",
+            )
+        }
     }
 
     // ---- the NULL arm, and the tuple-less bucket ------------------------------
@@ -638,6 +807,7 @@ class CompactionBucketProbePlanIntegrationTest {
         assertThat(buffers(plan))
             .describedAs("bounded by the bucket's arms %d:\n%s", budget, plan)
             .isLessThanOrEqualTo(budget)
+        recordBudget(plan, budget)
     }
 
     @Test
