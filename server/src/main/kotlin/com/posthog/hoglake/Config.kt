@@ -166,6 +166,34 @@ data class Config(
      */
     val hydratorClaimTimeoutMs: Long = env("HOGLAKE_HYDRATOR_CLAIM_TIMEOUT_MS", "10000").toLong(),
     /**
+     * The hydrator's SIZE FLOOR (#432), and it gates the STATS ROWS only:
+     * a pending file under this many bytes is still claimed, its footer
+     * still read and field-id checked (so `add_column`/`rename_column`
+     * are not held up by it), and it flips to `provided` with
+     * `missing_field_ids` and `split_offsets` set, but with NO
+     * `hog_file_column_stats` rows, which readers already treat as no
+     * bounds. 0 writes rows for every file (the behaviour before the
+     * floor); negative is refused. Default 1 MiB.
+     *
+     * Why: the stats of a file this small never prune anything (one row
+     * group, cheaper to read than to skip), and compaction registers its
+     * output `provided` from its own writer's footer, so the input's rows
+     * were inserted only for the expiry purge to cascade-delete once the
+     * input is compacted and expired. gigahog-prod-us on 2026-10-22:
+     * millrace-prod-us had 24.7M files pending at ~13 KB each (a sweep
+     * compacts 2,382 of them, 30 MiB, into 64 outputs), millpond's
+     * stray-day files are ~0.1 MB, and the stats table they fill is
+     * 136 GB of the RDS volume. 24.7M x 26 columns is ~642M rows the
+     * floor spares the hydrator inserting and the purge deleting. What it
+     * does NOT spare: the footer GET and the one UPDATE per file, which
+     * stay at today's rate.
+     */
+    val hydratorMinFileBytes: Long =
+        env(
+            "HOGLAKE_HYDRATOR_MIN_FILE_BYTES",
+            com.posthog.hoglake.hydrator.Hydrator.DEFAULT_MIN_FILE_BYTES.toString(),
+        ).toLong(),
+    /**
      * Expiry sweep interval; 0 disables. Sweeps are incremental (bounded
      * per run).
      *
@@ -1139,6 +1167,10 @@ data class Config(
         require(compactionSpillBytes >= 1) {
             "HOGLAKE_COMPACTION_SPILL_BYTES=$compactionSpillBytes must be at least 1 (the default is " +
                 "${com.posthog.hoglake.compaction.CompactionConfig.DEFAULT_SPILL_BYTES})"
+        }
+        require(hydratorMinFileBytes >= 0) {
+            "HOGLAKE_HYDRATOR_MIN_FILE_BYTES=$hydratorMinFileBytes must not be negative (0 writes stats " +
+                "rows for every file; the default is ${com.posthog.hoglake.hydrator.Hydrator.DEFAULT_MIN_FILE_BYTES})"
         }
         require(compactionVerifyMinBytes >= 0) {
             "HOGLAKE_COMPACTION_VERIFY_MIN_BYTES=$compactionVerifyMinBytes must not be negative " +

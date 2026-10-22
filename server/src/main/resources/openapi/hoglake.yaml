@@ -4410,7 +4410,9 @@ components:
           description: >
             One entry per stored stats row whose field id is a visible
             leaf, field-id order. Empty when the file has no stats
-            rows. Columns absent from this array have no recorded
+            rows — including a 'provided' file the hydrator hydrated
+            under its size floor (HOGLAKE_HYDRATOR_MIN_FILE_BYTES),
+            which is footer-checked but gets no rows. Columns absent from this array have no recorded
             statistics (variant columns never do; containers never
             carry rows) — absent bounds mean the caller must not prune
             on them.
@@ -4716,6 +4718,42 @@ components:
             nothing is corrupt and the next run retries from the oldest
             eligible receipt. Not required, for the same reason as the
             counters above.
+
+    HydratorSweepResult:
+      type: object
+      description: >
+        One hydrator sweep's outcome for ONE catalog, as a ledger row's
+        `result` (GET .../maintenance/runs). There is no trigger endpoint
+        for a sweep; the loop is its only producer.
+      required: [claimed, hydrated, failed, transient]
+      properties:
+        claimed:
+          type: integer
+          format: int64
+          description: Pending files the sweep claimed in this catalog.
+        hydrated:
+          type: integer
+          format: int64
+          description: Claimed files flipped to provided.
+        failed:
+          type: integer
+          format: int64
+          description: >
+            Claimed files marked failed (structural: object missing,
+            unparseable footer, registration mismatch, over-cap).
+        transient:
+          type: integer
+          format: int64
+          description: Claimed files left pending after a retryable object-store failure.
+        stats_skipped_below_floor:
+          type: integer
+          format: int64
+          description: >
+            Of `hydrated`, the files under the hydrator's size floor
+            (HOGLAKE_HYDRATOR_MIN_FILE_BYTES, #432): footer read and
+            field-id checked, flipped to provided with no per-column
+            stats rows. Optional: absent from rows written before the
+            counter existed, and the read path fills 0.
 
     RehydrateResult:
       type: object
@@ -5538,9 +5576,9 @@ components:
             on every catalog's row of one run), and VerifyReport for the
             historical `verify` rows still inside the ledger's retention
             window.
-            Hydrator loop rows carry the sweep's per-catalog counts
-            (claimed, hydrated, failed, transient); manual hydrator rows
-            carry RehydrateResult.
+            Hydrator loop rows carry HydratorSweepResult, the sweep's
+            per-catalog counts; manual hydrator rows carry
+            RehydrateResult.
 
     MaintenanceRunPage:
       type: object

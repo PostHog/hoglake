@@ -1793,6 +1793,19 @@ data class HydratorSweepResult(
     val hydrated: Long,
     val failed: Long,
     val transient: Long,
+    /**
+     * Of [hydrated], the files under the hydrator's size floor
+     * (`HOGLAKE_HYDRATOR_MIN_FILE_BYTES`, #432): footer read and field-id
+     * checked like any other, flipped to `provided` with NO
+     * `hog_file_column_stats` rows. Always <= [hydrated].
+     *
+     * Defaulted and `@JsonInclude(NON_DEFAULT)` for the stored-payload
+     * rule ([CleanupResult.objectsRemoved]'s): ledger rows written before
+     * the counter lack it, a zero is omitted, and the read path fills 0
+     * (`MaintenanceDto`'s added-later list).
+     */
+    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    val statsSkippedBelowFloor: Long = 0,
 )
 
 /** One cleanup drain's outcome. */

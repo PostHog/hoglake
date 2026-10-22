@@ -683,6 +683,12 @@ export interface HydratorSweepResult {
   hydrated: Int64;
   failed: Int64;
   transient: Int64;
+  /**
+   * Of `hydrated`, files under HOGLAKE_HYDRATOR_MIN_FILE_BYTES: footer-checked
+   * and provided, with no per-column stats rows (#432). Absent on rows written
+   * before the counter; the server fills 0 on read.
+   */
+  stats_skipped_below_floor?: Int64;
 }
 
 /** Manual hydrator rows are rehydrate calls. */

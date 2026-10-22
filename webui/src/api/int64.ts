@@ -90,6 +90,7 @@ const INT64_FIELDS = new Set([
   "hydrated",
   "failed",
   "transient",
+  "stats_skipped_below_floor",
   "requeued",
   "snapshots_expired",
   "data_files_queued",

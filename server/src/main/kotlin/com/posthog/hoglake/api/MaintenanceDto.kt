@@ -349,6 +349,9 @@ private fun normalizeLedgerResult(
             MaintenanceTask.COMPACTION -> COMPACTION_COUNTERS_ADDED_LATER
             MaintenanceTask.EXPIRY -> EXPIRY_COUNTERS_ADDED_LATER
             MaintenanceTask.CLEANUP -> CLEANUP_COUNTERS_ADDED_LATER
+            // Sweep rows only: a manual hydrator row is a RehydrateResult
+            // (`requeued`), which never carries the sweep's counters.
+            MaintenanceTask.HYDRATOR -> if (node.has("claimed")) HYDRATOR_COUNTERS_ADDED_LATER else return node
             else -> return node
         }
     val obj = node as ObjectNode
@@ -357,6 +360,12 @@ private fun normalizeLedgerResult(
     }
     return obj
 }
+
+/**
+ * Hydrator sweep counters added after the ledger started recording
+ * (`stats_skipped_below_floor`, #432). Append-only, like the others.
+ */
+private val HYDRATOR_COUNTERS_ADDED_LATER = listOf("stats_skipped_below_floor")
 
 /**
  * Compaction result counters added after the ledger started recording.

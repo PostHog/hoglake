@@ -294,6 +294,40 @@ class MaintenanceLedgerIntegrationTest {
     }
 
     @Test
+    fun `a pre-upgrade hydrator sweep row reads zero below the floor, and a rehydrate row is left alone`() {
+        // #432's stats_skipped_below_floor postdates the ledger and is
+        // NON_DEFAULT on the model, so the read path fills 0 for a sweep
+        // row. A manual row is a RehydrateResult and must not grow the
+        // sweep's counter. MUTATION: drop the HYDRATOR arm of
+        // normalizeLedgerResult and the first reads null; drop its
+        // `claimed` guard and the rehydrate row gains the field.
+        val catalogId = seedCatalog("led-preupgrade-hydrator")
+        jdbi.useHandleUnchecked { h ->
+            for ((trigger, stored) in listOf(
+                "loop" to """{"claimed":2,"hydrated":2,"failed":0,"transient":0}""",
+                "manual" to """{"requeued":3}""",
+            )) {
+                h.createUpdate(
+                    """
+                    INSERT INTO hog_maintenance_run
+                        (catalog_id, task, run_trigger, started_at, finished_at, status, result)
+                    VALUES (:catalogId, 'hydrator', :trigger, now(), now(), 'ok', CAST(:result AS jsonb))
+                    """,
+                ).bind("catalogId", catalogId).bind("trigger", trigger).bind("result", stored).execute()
+            }
+        }
+        val runs =
+            jdbi.withHandleUnchecked { h ->
+                MaintenanceRunStore(jdbi).history(h, catalogId, null, null, 10)
+            }.map { wireObjectMapper().valueToTree<JsonNode>(it.toDto())["result"] }
+        val sweep = runs.single { it.has("claimed") }
+        assertThat(sweep["stats_skipped_below_floor"].asLong()).isZero()
+        assertThat(sweep["hydrated"].asLong()).isEqualTo(2)
+        val manual = runs.single { it.has("requeued") }
+        assertThat(manual.fieldNames().asSequence().toList()).containsExactly("requeued")
+    }
+
+    @Test
     fun `a pre-upgrade expiry row is returned with the purge counters it predates`() {
         // The expiry twin of the two above, for the two-phase sweep's
         // four new counters — and for the ONE deliberate exclusion.
