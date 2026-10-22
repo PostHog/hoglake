@@ -188,6 +188,8 @@ const INT64_FIELDS = new Set([
   // Retirements and append blockers (CompactionResult).
   "groups_retired",
   "files_unranged",
+  // Pre-probe bucket-claim skips (CompactionResult).
+  "buckets_skipped_claimed",
   "violations",
 ]);
 

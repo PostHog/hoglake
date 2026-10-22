@@ -183,6 +183,9 @@ class MaintenanceLedgerIntegrationTest {
                 "buckets_available",
                 "candidates_truncated",
                 "plan_ms",
+                // The pre-probe bucket-claim skips, a later plan measure
+                // under the same rule.
+                "buckets_skipped_claimed",
             )
         for (planMeasure in planMeasures) {
             assertThat(result[planMeasure].asLong())

@@ -52,6 +52,51 @@ import java.util.UUID
  * A heartbeat would buy a shorter TTL at the price of a second failure
  * mode (a live maintainer whose renewals are starved losing a claim it
  * is working), for a lease nothing depends on for correctness.
+ *
+ * # Bucket claims: the same table, a second kind of row
+ *
+ * A group claim is found by OVERLAP with a plan's packed groups, so a
+ * sibling can only honour it AFTER it has probed the bucket and read
+ * every candidate row — which is exactly the work that multiplied on
+ * gigahog-prod-us on 2026-10-21. Nine maintenance pods planned
+ * millpond-prod-us one after another under the catalog planning lock,
+ * each probing the same 123 buckets (`candidates_fetched` 50,029 every
+ * time) and discarding its predecessors' groups (`claimed_elsewhere`
+ * 0, 64, 128, ... 320), and the probes were millpond's day buckets —
+ * one-key arms over catalog-wide day values, the expensive regime —
+ * which then crossed the 15 s plan timeout on all nine at once.
+ *
+ * The planner knows a bucket's TUPLE before it probes, not its files,
+ * so the skip it needs is keyed by the tuple. Three ways to get one:
+ *
+ *  - a check after the probe and before packing saves nothing: the
+ *    probe IS the cost;
+ *  - an `EXISTS` over the bucket's sampled file ids would be cheap, but
+ *    `hog_maintenance_summary_tier` carries per-bucket measures only,
+ *    no file ids, and adding them is a per-file column on the sampler's
+ *    hottest table;
+ *  - a per-bucket marker row. A new table would need a migration and a
+ *    second purge for no new semantics, because THIS table already is
+ *    "a lease on some work, keyed by its identity, scoped to (catalog,
+ *    table), expired by wall clock, released by its claimant". So the
+ *    marker is a row here: [bucketKey] (`bucket:` + a hash over spec id
+ *    and partition values, which can never equal a 64-hex [groupKey])
+ *    and an EMPTY `input_file_ids` — admissible under V15's
+ *    `NOT NULL`, and invisible to [liveClaimedFileIds]' overlap set.
+ *
+ * Reuse buys [acquire]'s arbitration and expired-row takeover,
+ * [release]'s claimant fence and [purgeExpired] for nothing, and adds
+ * no migration. A marker is taken only for a bucket whose every packed
+ * group this plan claimed (so a bucket with work left over for a
+ * sibling is not hidden from it) and released when the last of those
+ * groups settles; see `CompactionService.planAndClaim`. Its lease is
+ * SHORT (`CompactionConfig.bucketClaimTtlSeconds`, 600 s, against the
+ * group claims' hour) and renewed by [refresh] before each of its
+ * groups' IO, because a pod killed mid-sweep releases nothing and a
+ * leaked bucket claim hides a whole bucket, new files included. It is the same
+ * OPTIMIZATION a group claim is: a sibling that ignored it would probe
+ * the bucket, find its groups by overlap and drop them as
+ * `claimed_elsewhere`, which is the pre-marker behaviour.
  */
 internal object CompactionClaimRepo {
     /**
@@ -65,7 +110,40 @@ internal object CompactionClaimRepo {
      * containing the separator cannot collide with two values that do
      * not, and a null value is distinguishable from an empty one.
      */
-    fun groupKey(group: CompactionGroup): String {
+    fun groupKey(group: CompactionGroup): String =
+        tupleDigest(group.specId, group.partitionValues) { feed ->
+            group.files.map { it.dataFileId }.sorted().forEach { feed("f$it") }
+        }
+
+    /** The prefix that marks a bucket claim; see the class KDoc. */
+    const val BUCKET_KEY_PREFIX: String = "bucket:"
+
+    /**
+     * A bucket claim's key: [BUCKET_KEY_PREFIX] and a hex SHA-256 over
+     * the bucket's spec id and partition values, fed exactly as
+     * [groupKey] feeds them (length-prefixed, null distinct from empty)
+     * and with no file ids. The prefix is what keeps the two key spaces
+     * disjoint — a group key is 64 hex characters and nothing else.
+     */
+    fun bucketKey(
+        specId: Long?,
+        partitionValues: List<String?>?,
+    ): String {
+        // The prefix IS the type tag that keeps the two kinds of row apart
+        // (the overlap read, the pre-probe read, anything that counts
+        // groups); an empty one would make every bucket claim look like a
+        // group claim to a reader that filters on it.
+        require(BUCKET_KEY_PREFIX.isNotEmpty()) { "BUCKET_KEY_PREFIX must be non-empty" }
+        val key = BUCKET_KEY_PREFIX + tupleDigest(specId, partitionValues) { }
+        check(key.startsWith(BUCKET_KEY_PREFIX) && key.length == BUCKET_KEY_PREFIX.length + 64)
+        return key
+    }
+
+    private fun tupleDigest(
+        specId: Long?,
+        partitionValues: List<String?>?,
+        rest: ((String) -> Unit) -> Unit,
+    ): String {
         val digest = MessageDigest.getInstance("SHA-256")
 
         fun feed(s: String) {
@@ -74,12 +152,43 @@ internal object CompactionClaimRepo {
             digest.update(':'.code.toByte())
             digest.update(bytes)
         }
-        feed("spec=${group.specId ?: "none"}")
-        feed("values=${group.partitionValues?.size ?: -1}")
-        group.partitionValues?.forEach { feed(if (it == null) "null:" else "v:$it") }
-        group.files.map { it.dataFileId }.sorted().forEach { feed("f$it") }
+        feed("spec=${specId ?: "none"}")
+        feed("values=${partitionValues?.size ?: -1}")
+        partitionValues?.forEach { feed(if (it == null) "null:" else "v:$it") }
+        rest(::feed)
         return digest.digest().joinToString("") { "%02x".format(it) }
     }
+
+    /**
+     * The pre-probe read: every LIVE bucket claim's key for one table.
+     *
+     * Rides the primary key's `(catalog_id, table_id)` prefix, as
+     * [LIVE_CLAIMS_SQL] does, with the prefix and the expiry as filters
+     * on the rows it reaches; the rows are this table's live claims,
+     * which the queue bound (`maxGroupsPerRun` group claims plus at most
+     * one marker per claimed bucket, per concurrent run) keeps small.
+     */
+    internal const val LIVE_BUCKET_CLAIMS_SQL: String =
+        """
+        SELECT group_key
+        FROM hog_compaction_claim
+        WHERE catalog_id = :catalogId AND table_id = :tableId
+          AND expires_at > now()
+          AND starts_with(group_key, :prefix)
+        """
+
+    /** The keys of every live bucket claim on this table ([bucketKey]s). */
+    fun liveBucketKeys(
+        h: Handle,
+        catalogId: Long,
+        tableId: Long,
+    ): Set<String> =
+        h.createQuery(LIVE_BUCKET_CLAIMS_SQL)
+            .bind("catalogId", catalogId)
+            .bind("tableId", tableId)
+            .bind("prefix", BUCKET_KEY_PREFIX)
+            .mapTo(String::class.java)
+            .set()
 
     /**
      * The planner's read, as a named constant so the migration test can
@@ -166,7 +275,24 @@ internal object CompactionClaimRepo {
             .findOne()
             .isPresent
 
-    /** Refresh only a live claim that this run owns. An expired or replaced claim must stop execution. */
+    /**
+     * Refresh only a live claim that this run owns. An expired or replaced claim must stop execution.
+     *
+     * With [bucketKeys] — the run's still-outstanding BUCKET claims on
+     * this table — those rows are renewed in the same statement on their
+     * own [bucketTtlSeconds] lease: the renewal that keeps short-leased
+     * bucket claims alive exactly as long as the run's queue is being
+     * worked (`CompactionConfig.bucketClaimTtlSeconds`). Every row is
+     * fenced on ours-and-still-live, and a bucket row additionally on
+     * the GROUP row being ours and live: a run whose group lease was lost
+     * (expired, or taken over) is not making progress on this queue, and
+     * must not keep its buckets hidden while it finds that out. An
+     * expired bucket claim is NOT revived either, because a sibling may
+     * already have read the bucket as free; reviving it would hide a
+     * bucket that sibling is now planning. The answer is the GROUP row's
+     * alone. The `EXISTS` reads the statement's snapshot, i.e. the group
+     * row as it was before this UPDATE extended it.
+     */
     fun refresh(
         h: Handle,
         catalogId: Long,
@@ -174,22 +300,35 @@ internal object CompactionClaimRepo {
         groupKey: String,
         claimant: UUID,
         ttlSeconds: Long,
+        bucketKeys: Collection<String> = emptyList(),
+        bucketTtlSeconds: Long = ttlSeconds,
     ): Boolean =
-        h.createUpdate(
-            """
-            UPDATE hog_compaction_claim
-               SET expires_at = now() + make_interval(secs => :ttlSeconds)
-             WHERE catalog_id = :catalogId AND table_id = :tableId
-               AND group_key = :groupKey AND claimant = :claimant
-               AND expires_at > now()
-            """,
-        )
-            .bind("catalogId", catalogId)
-            .bind("tableId", tableId)
-            .bind("groupKey", groupKey)
-            .bind("claimant", claimant)
-            .bind("ttlSeconds", ttlSeconds.toDouble())
-            .execute() == 1
+        groupKey in
+            h.createQuery(
+                """
+                UPDATE hog_compaction_claim
+                   SET expires_at = now() + make_interval(
+                           secs => CASE WHEN group_key = :groupKey THEN :ttlSeconds ELSE :bucketTtlSeconds END)
+                 WHERE catalog_id = :catalogId AND table_id = :tableId
+                   AND group_key = ANY(:keys) AND claimant = :claimant
+                   AND expires_at > now()
+                   AND (group_key = :groupKey
+                        OR EXISTS (SELECT 1 FROM hog_compaction_claim g
+                                    WHERE g.catalog_id = :catalogId AND g.table_id = :tableId
+                                      AND g.group_key = :groupKey AND g.claimant = :claimant
+                                      AND g.expires_at > now()))
+                RETURNING group_key
+                """,
+            )
+                .bind("catalogId", catalogId)
+                .bind("tableId", tableId)
+                .bind("groupKey", groupKey)
+                .bindArray("keys", String::class.java, (listOf(groupKey) + bucketKeys).distinct())
+                .bind("claimant", claimant)
+                .bind("ttlSeconds", ttlSeconds.toDouble())
+                .bind("bucketTtlSeconds", bucketTtlSeconds.toDouble())
+                .mapTo(String::class.java)
+                .list()
 
     /**
      * Drop our own claim, whatever the group's outcome was.

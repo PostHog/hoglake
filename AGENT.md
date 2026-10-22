@@ -552,7 +552,12 @@ across ~2,800 partitions, 96% of them under 60 KiB; ~50 commits/min of
 uploads; ~3,600 files added per minute; compaction retiring 64 files
 per 4-minute run. The pod it all runs on: one maintenance replica with
 `dbPoolSize` raised to 16, which is what makes 6 compaction groups plus
-a cleanup worker legal against the reserve of 4. Any code path that is
+a cleanup worker legal against the reserve of 4. (That was 2026-09-30.
+By 2026-10-21 `gigahog-maintenance-compaction` ran 8 replicas, nine
+compaction loops in all, and the planners herded on one catalog — see
+the compaction bullet under Known deferrals. A per-pod in-memory loop
+is per-pod times N once the Deployment scales; ask what N of it do
+together.) Any code path that is
 O(files of a table), O(snapshots) or O(commits) is O(ten million) here,
 and the growth rates are as important as the counts. Note also that
 these are PROD-US numbers and prod-us settings: dev and prod-eu carry no
@@ -1503,6 +1508,27 @@ ran on the local stack and what it showed.
   encoded rows land after the appended row groups. Rows are written by
   their `RowPlan` straight from the decoded source row; there is no
   output-shaped copy to hang per-row logic on.
+  (6) N maintenance pods share a catalog through CLAIMS, and the claims
+  are rows in ONE table (`hog_compaction_claim`, V15): group claims
+  (64-hex `group_key`, the input ids in `input_file_ids`) make execution
+  disjoint, and BUCKET claims (`bucket:` + a hash of spec id and
+  partition values, empty `input_file_ids`) make planning disjoint — a
+  plan that claimed every free group of a fully probed bucket marks it,
+  the next plan skips it before probing (`buckets_skipped_claimed`), and
+  the last of its groups to settle releases it. Its lease is short
+  (`HOGLAKE_COMPACTION_BUCKET_CLAIM_TTL_SECONDS`, 600 s) and renewed by
+  the per-group refresh, because a killed pod releases nothing and a
+  leaked bucket claim hides the whole bucket; never give it the group
+  claims' hour. Anything that reads the
+  table must keep the two kinds apart (`starts_with(group_key,
+  'bucket:')`), and nothing may treat either as authorization. The skip
+  is only sound because execution plans serialize on the planning lock
+  and commit their claims before releasing it; a plan path that claims
+  without that lock reopens the 2026-10-21 herd. Each pod's bucket cursor
+  starts at a hash of its identity (`POD_NAME`/`HOSTNAME`), and the
+  compaction loop — and only it — sleeps with ±25% jitter
+  (`BackgroundLoops.Jitter`); server/README.md has the incident and the
+  arithmetic.
   Not done, by decision: writer-declared sortedness (a client's
   declared order is never believed, only its rows), a multi-pass merge.
   Remaining rewrite deferrals (all surface as `unconvertible_schema`

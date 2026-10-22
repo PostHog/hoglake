@@ -113,6 +113,7 @@ class CompactionResultSpecParityTest {
                 bytesAppended = 29,
                 groupsRetired = 30,
                 filesUnranged = 31,
+                bucketsSkippedClaimed = 32,
             )
         val dto = result.toDto()
         assertThat(dto.groupsCompacted).isEqualTo(1)
@@ -157,6 +158,10 @@ class CompactionResultSpecParityTest {
         // range blocked an append.
         assertThat(dto.groupsRetired).isEqualTo(30)
         assertThat(dto.filesUnranged).isEqualTo(31)
+        // The pre-probe bucket-claim skips: a plan measure beside
+        // bucketsConsidered, so a `toDto` that copied one into the other
+        // is exactly what the distinct value catches.
+        assertThat(dto.bucketsSkippedClaimed).isEqualTo(32)
     }
 
     @Test
@@ -201,6 +206,9 @@ class CompactionResultSpecParityTest {
                 // whose unknown range blocked an append.
                 "groups_retired",
                 "files_unranged",
+                // The pre-probe bucket-claim skips, added after the
+                // ledger like every counter in this list.
+                "buckets_skipped_claimed",
             )
         assertThat(properties(block)).containsAll(added)
         assertThat(requiredOf(block)).doesNotContainAnyElementsOf(added)

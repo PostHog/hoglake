@@ -944,6 +944,14 @@ export interface CompactionResult {
    * claimed_elsewhere is.
    */
   files_unranged?: Int64;
+  /**
+   * Partition buckets the planners skipped WITHOUT probing, because
+   * another run (a sibling maintenance pod) holds a live bucket claim on
+   * them. The pre-probe half of claimed_elsewhere: pods that divide a
+   * catalog's buckets show skips here and claimed_elsewhere near zero.
+   * OPTIONAL for the same reason claimed_elsewhere is.
+   */
+  buckets_skipped_claimed?: Int64;
 }
 
 /** HISTORICAL, with VerifyReport: only a `verify` ledger row carries it. */

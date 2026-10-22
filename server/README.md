@@ -1199,6 +1199,65 @@ budget. Existing explicit TTL settings override the new default. Update shorter
 settings before adding concurrent compactors. All compactors must use the new
 planning lock before the full queue protection applies.
 
+**How N maintenance pods share one catalog.** Group claims make
+EXECUTION disjoint; three more pieces make PLANNING disjoint, after
+gigahog-prod-us on 2026-10-21. With the maintenance Deployment raised
+from 2 to 8 replicas, every pod's planner walked the same buckets in the
+same order: six millpond-prod-us sweeps started within two seconds with
+identical `buckets_considered 123 / candidates_fetched 50,029` and
+`claimed_elsewhere` 0, 64, 128, ... 320 — each pod, in turn under the
+planning lock, re-probed the buckets its predecessors had already
+claimed and dropped their groups only after reading them. The sweeps
+then finished together and re-planned together on their 30 s interval:
+nine copies of the expensive day-bucket probes at once, every one past
+the 15 s plan timeout, 19 failures in nine minutes.
+
+- **Bucket claims, checked before the probe.** An execution plan that
+  claims EVERY free group a bucket packed into (and probed the bucket in
+  full, not cut by the candidate budget) also writes a bucket claim: a
+  `hog_compaction_claim` row keyed `bucket:` + a hash of the spec id and
+  partition values, with an empty `input_file_ids`. No new table and no
+  migration — the row has the same lease, claimant fence, expiry
+  takeover and purge as a group claim. The next planner reads the
+  table's live bucket claims on its candidate snapshot and skips those
+  buckets without probing them (`buckets_skipped_claimed` in the run
+  result, `hoglake_compaction_buckets_skipped_claimed_total{catalog}`).
+  Because plans serialize on the planning lock and a plan's claims commit
+  before it releases the lock, the next plan always sees them. The claim
+  is released when the last of the bucket's groups settles (committed,
+  skipped, failed, or released unstarted). Its lease is SHORT —
+  `HOGLAKE_COMPACTION_BUCKET_CLAIM_TTL_SECONDS`, default **600**, against
+  the group claims' hour — and is renewed in the same UPDATE as each of
+  its groups' pre-IO refresh, so a live queue keeps it and a dead one
+  loses it in minutes. That matters because a pod SIGTERMed mid-sweep
+  releases nothing (`BackgroundLoops.close` abandons the sweep after
+  5 s), and a leaked bucket claim hides a whole bucket, new files
+  included; on the group lease a rolling deploy would take a share of a
+  hot table's buckets out of compaction for an hour. A bucket with a group left
+  over (the run's room ran out, or a claim insert lost) is NOT marked,
+  so a sibling can still take what is left, and finds the held groups by
+  overlap as before. Like group claims it is an optimization: ignore it
+  and the cost is the old re-probe, never a wrong commit. The tier rows
+  carry no file ids, so a cheaper per-file check was not available.
+- **Per-pod cursor start.** Each pod's bucket cursor starts, per
+  (catalog, table), at a position hashed from its identity (`POD_NAME`,
+  else `HOSTNAME`, else `local`) and the table, then advances as before.
+  The server does not know N and the pods have no ordinal, so this is a
+  hash rather than `k x len / N`; the overlaps a hash leaves are what the
+  bucket claims cover. `HOGLAKE_INSTANCE_NAME` is not used: it names the
+  deployment and is the same on every pod.
+- **Loop jitter, compaction only.** The compaction loop sleeps
+  `HOGLAKE_COMPACTION_INTERVAL_MS x (1 ± 0.25)`, drawn from a generator
+  seeded by the pod identity, so sweeps that end together do not
+  re-plan together; the mean interval is unchanged. Every other loop
+  keeps its exact interval — the sampler's tick cadence and expiry's
+  interval are sized arithmetic.
+
+Read the pair `buckets_skipped_claimed` / `claimed_elsewhere` together: a
+fleet dividing a catalog shows the first and keeps the second near zero;
+both at zero with more than one pod means claims are off or the pods are
+not planning the same buckets.
+
 **A claim is an optimization and never authorization.** Correctness
 against a concurrent rewrite is, and stays, the plan-to-commit
 re-verification under the commit lock; turning claims off costs work and

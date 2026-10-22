@@ -1541,10 +1541,13 @@ data class CompactionResult(
      * rewrite and upload thrown away).
      *
      * Read it as the feature working. It spends no object-store IO, so
-     * it does NOT consume HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN. A
-     * standing ZERO on a fleet with two or more maintenance replicas
-     * means either HOGLAKE_COMPACTION_CLAIMS_ENABLED is off or the
-     * replicas are not in fact planning the same groups.
+     * it does NOT consume HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN. Since
+     * bucket claims, a standing ZERO here with two or more maintenance
+     * replicas is ALSO the feature working, as long as
+     * [bucketsSkippedClaimed] is nonzero: the planners found each
+     * other's claims before probing instead of after. Both zero means
+     * HOGLAKE_COMPACTION_CLAIMS_ENABLED is off or the replicas are not
+     * in fact planning the same buckets.
      *
      * Defaulted, and `@JsonInclude(NON_DEFAULT)` for the stored-payload
      * rule: the maintenance ledger holds rows an older replica wrote and
@@ -1747,6 +1750,27 @@ data class CompactionResult(
      */
     @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
     val filesUnranged: Long = 0,
+    /**
+     * Partition buckets the sweep's planners SKIPPED WITHOUT PROBING,
+     * because another run holds a live bucket claim on them: it planned
+     * the bucket and claimed every group the bucket packed into
+     * (`CompactionClaimRepo`, a `bucket:` row in `hog_compaction_claim`).
+     * A plan measure, like [bucketsConsidered], and not in it.
+     *
+     * The pre-probe half of [claimedElsewhere]. On gigahog-prod-us on
+     * 2026-10-21, nine maintenance pods each probed the same 123 buckets
+     * of millpond-prod-us and dropped their predecessors' groups after
+     * the probe — `claimed_elsewhere` 0, 64, 128, ... with 50,029
+     * candidate rows read every time. A fleet whose planners divide the
+     * buckets shows the skips here instead, with `claimed_elsewhere`
+     * near zero. Zero on a single maintenance pod, and on a catalog with
+     * no published sample (the whole-table fallback has no buckets to
+     * skip).
+     *
+     * `NON_DEFAULT`, for [claimedElsewhere]'s stored-payload reason.
+     */
+    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    val bucketsSkippedClaimed: Long = 0,
 )
 
 /**

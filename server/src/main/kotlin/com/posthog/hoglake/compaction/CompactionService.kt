@@ -287,6 +287,42 @@ data class CompactionConfig(
      */
     val committedClaimTtlSeconds: Long = DEFAULT_COMMITTED_CLAIM_TTL_SECONDS,
     /**
+     * How long a BUCKET claim lives between refreshes
+     * (`HOGLAKE_COMPACTION_BUCKET_CLAIM_TTL_SECONDS`), against
+     * [claimTtlSeconds] for a group claim.
+     *
+     * # Why short, and why that is safe
+     *
+     * A bucket claim hides a WHOLE BUCKET from every sibling's planner —
+     * every file in it, including the ones appended after the claim —
+     * where a group claim hides only its own inputs. So a LEAKED one is
+     * far more expensive, and leaks are routine: on SIGTERM
+     * `BackgroundLoops.close` cancels, waits 5 s and abandons, so a
+     * sweep mid-rewrite never reaches the release, and every bucket
+     * claim its plan wrote would outlive the pod by the full lease. At
+     * [claimTtlSeconds]' hour, a rolling deploy of nine pods takes a
+     * large share of a hot table's buckets — today's day bucket among
+     * them, where new small files land — out of compaction fleet-wide.
+     *
+     * So the claim takes this shorter lease and is RENEWED by the
+     * per-group refresh that already runs before every group's IO
+     * (`CompactionClaimRepo.refresh`, one UPDATE): each refresh renews
+     * EVERY still-outstanding bucket claim of the run's current plan,
+     * not only the group's own, so a bucket whose groups sit at the back
+     * of the queue stays claimed as long as the queue ahead of it makes
+     * progress. The lease therefore has to cover the longest gap between
+     * two consecutive group starts — one group's rewrite — not the
+     * whole queue: a live
+     * queue keeps its claims, a dead one loses them within this many
+     * seconds. 600 s ([committedClaimTtlSeconds]' figure) is ~70 times
+     * the measured ~8.5 s a group.
+     *
+     * Too short costs nothing but the old behaviour: an expired bucket
+     * claim lets a sibling probe the bucket, and its held groups are
+     * then dropped by overlap as `claimed_elsewhere`.
+     */
+    val bucketClaimTtlSeconds: Long = DEFAULT_BUCKET_CLAIM_TTL_SECONDS,
+    /**
      * The admission bound each group's COMMIT queues under
      * (`HOGLAKE_COMMIT_LOCK_TIMEOUT_MS`, shared with the commit path).
      *
@@ -521,6 +557,9 @@ data class CompactionConfig(
         require(committedClaimTtlSeconds >= 1) {
             "HOGLAKE_COMPACTION_COMMITTED_CLAIM_TTL_SECONDS must be at least 1, got " +
                 "$committedClaimTtlSeconds"
+        }
+        require(bucketClaimTtlSeconds >= 1) {
+            "HOGLAKE_COMPACTION_BUCKET_CLAIM_TTL_SECONDS must be at least 1, got $bucketClaimTtlSeconds"
         }
         // Validated at CONSTRUCTION, which is boot, like every knob
         // above: a zero here would make the planner fetch no candidates
@@ -759,6 +798,9 @@ data class CompactionConfig(
          */
         const val DEFAULT_COMMITTED_CLAIM_TTL_SECONDS = 600L
 
+        /** See [bucketClaimTtlSeconds]: ten minutes between refreshes. */
+        const val DEFAULT_BUCKET_CLAIM_TTL_SECONDS = 600L
+
         /**
          * See [candidateHeadroom]: fetch twice the files a run can
          * possibly consume, because not every candidate is groupable.
@@ -899,9 +941,11 @@ data class CompactionPlan(
      * those files right now, and everything this one would spend on them
      * would be thrown away at its own commit. Counted so the value is
      * visible: on a two-replica fleet a steady nonzero here is the
-     * feature working, and a steady ZERO with two replicas running means
-     * claims are off or the planners are seeing different candidate
-     * sets.
+     * feature working. So, since bucket claims, is a steady ZERO here
+     * with a nonzero [bucketsSkippedClaimed] — the sibling's claims were
+     * found before the probe rather than after it. Both zero with two
+     * replicas running means claims are off or the planners are seeing
+     * different candidate sets.
      *
      * Like [spillRefusedGroups] and [mergeRefusedGroups], and unlike
      * every other skip flavor, it spends no IO, so it does NOT consume
@@ -940,6 +984,21 @@ data class CompactionPlan(
      * is why the fallback exists rather than a refusal.
      */
     val bucketsAvailable: Long = 0,
+    /**
+     * Buckets this plan did NOT probe because another run holds a live
+     * BUCKET claim on them (`CompactionClaimRepo.bucketKey`): it planned
+     * the bucket, claimed every group the bucket packed into, and has
+     * not settled them yet.
+     *
+     * The pre-probe counterpart of [claimedGroups]. That one is counted
+     * after the probe, so every unit of it is a bucket's candidate rows
+     * read and thrown away; this one is counted instead of the probe.
+     * On a fleet of N maintenance pods sharing a catalog a nonzero value
+     * here, with [claimedGroups] near zero, is the planners dividing the
+     * buckets between them rather than each re-reading its
+     * predecessor's. Not in [bucketsConsidered], which counts probes.
+     */
+    val bucketsSkippedClaimed: Long = 0,
     /** 1 when the fetch hit its own cap; see [candidatesFetched]. */
     val candidatesTruncated: Long = 0,
     /**
@@ -1052,6 +1111,23 @@ class CompactionService(
     private val jdbi: Jdbi,
     private val store: ObjectStore,
     private val defaults: CompactionConfig,
+    /**
+     * This process's STABLE identity among the maintenance pods, which
+     * seeds where each table's bucket loop starts
+     * ([initialCursorOffset]). `App` passes the pod name
+     * ([defaultPlannerIdentity]); a test passes two different strings to
+     * get two pods. Not `HOGLAKE_INSTANCE_NAME`, which names the
+     * DEPLOYMENT for the webui and is the same on every pod.
+     *
+     * NULL — the default — starts every table's first sweep at the head
+     * of the order, the pre-seed behaviour. The default is null rather
+     * than the pod name so that a test's plan does not depend on the
+     * HOSTNAME of the machine it runs on: tests that pin which bucket a
+     * fresh planner probes first would otherwise pass on one runner and
+     * fail on the next. The production construction is the one place
+     * that must pass it, and does.
+     */
+    private val plannerIdentity: String? = null,
 ) {
     private val log = KotlinLogging.logger {}
 
@@ -1124,7 +1200,17 @@ class CompactionService(
         val sortSpill: SortSpill? = null,
     )
 
-    private data class PlanWithContext(val ctx: TableContext, val plan: CompactionPlan)
+    private data class PlanWithContext(
+        val ctx: TableContext,
+        val plan: CompactionPlan,
+        /**
+         * Buckets this plan probed IN FULL (not cut by the candidate
+         * budget), the only ones [planAndClaim] may take a bucket claim
+         * on: a truncated bucket has files the plan never saw, and
+         * hiding them from a sibling would be hiding work nobody took.
+         */
+        val markable: Set<Bucket> = emptySet(),
+    )
 
     /** How one group's execution+commit resolved (the sweep's accounting unit). */
     internal sealed class GroupOutcome {
@@ -1355,9 +1441,11 @@ class CompactionService(
                 candidatesFetched = fetched.candidatesFetched,
                 bucketsConsidered = fetched.bucketsConsidered,
                 bucketsAvailable = fetched.bucketsAvailable,
+                bucketsSkippedClaimed = fetched.bucketsSkippedClaimed,
                 candidatesTruncated = if (fetched.truncated) 1 else 0,
                 planMs = planMs,
             ),
+            fetched.markable,
         )
     }
 
@@ -1448,6 +1536,10 @@ class CompactionService(
         val bucketsAvailable: Long,
         /** The fetch hit its own cap, so the table has debt this plan cannot see. */
         val truncated: Boolean,
+        /** Buckets skipped unprobed under a live bucket claim; see [CompactionPlan.bucketsSkippedClaimed]. */
+        val bucketsSkippedClaimed: Long = 0,
+        /** See [PlanWithContext.markable]. */
+        val markable: Set<Bucket> = emptySet(),
     )
 
     /**
@@ -1618,14 +1710,28 @@ class CompactionService(
         // N rows cannot be spent by more than N/minInputFiles useful
         // buckets.
         val bucketLimit = maxOf(1, candidateBudget / cfg.minInputFiles)
+        val held = liveBucketClaims(h, ctx, cfg)
         val byBucket = LinkedHashMap<Bucket, List<CompactionCandidate>>()
+        val markable = HashSet<Bucket>()
         var fetched = 0L
         var considered = 0L
+        var skipped = 0L
         var truncated = false
         for (bucket in rotated(ctx, sampled)) {
             if (fetched >= candidateBudget || considered >= bucketLimit) {
                 truncated = true
                 break
+            }
+            // THE PRE-PROBE CLAIM FILTER. Another run planned this bucket
+            // and claimed every group it packed into; probing it would
+            // read its candidate rows only for phase (c) to drop each of
+            // those groups as `claimed_elsewhere`. Not charged to
+            // `considered` or the budget, because no statement ran.
+            if (held.isNotEmpty() &&
+                CompactionClaimRepo.bucketKey(bucket.bucket.specId, bucket.bucket.values) in held
+            ) {
+                skipped++
+                continue
             }
             // `room + 1` so the truncation flag is EXACT: a bucket that
             // holds exactly its remaining room was truncated by nothing,
@@ -1633,7 +1739,7 @@ class CompactionService(
             val room = (candidateBudget - fetched).toInt()
             val rows = bucketCandidates(h, ctx, budget, cfg, bucket.bucket, room + 1)
             considered++
-            if (rows.size > room) truncated = true
+            if (rows.size > room) truncated = true else markable += bucket.bucket
             val taken = if (rows.size > room) rows.subList(0, room) else rows
             fetched += taken.size
             if (taken.isNotEmpty()) byBucket[bucket.bucket] = taken
@@ -1647,7 +1753,60 @@ class CompactionService(
             bucketsConsidered = considered,
             bucketsAvailable = sampled.size.toLong(),
             truncated = truncated,
+            bucketsSkippedClaimed = skipped,
+            markable = markable,
         )
+    }
+
+    /**
+     * The live bucket claims on this table, read on phase (a)'s own
+     * snapshot, for [fetchCandidates]' pre-probe filter.
+     *
+     * # Why phase (a)'s snapshot sees every claim it must
+     *
+     * An execution plan holds the catalog planning lock
+     * (`Locks.acquireCatalogCompactionPlanLock`) from before this
+     * transaction began until after its claim transaction COMMITTED. So
+     * the previous planner's bucket claims are committed before this
+     * planner's lock wait returns, and phase (a)'s snapshot, taken after
+     * that, sees all of them. A planner can only miss a marker that a
+     * metadata-only preview — which takes neither the lock nor any
+     * claim — would have had to write, and none does.
+     *
+     * # Fail open, behind a savepoint
+     *
+     * An optimization, like [withoutClaimedGroups]' read: a failing read
+     * plans the table as if no bucket were claimed, which is the
+     * pre-filter behaviour and still correct (phase (c) and the claim
+     * insert drop the overlapping groups). Unlike that read this one is
+     * INSIDE the planning transaction, and a failed statement poisons a
+     * Postgres transaction, so it runs behind a savepoint and rewinds
+     * to it on failure rather than taking the candidate fetch down with
+     * it.
+     *
+     * Skipped when claims are off: nothing in this configuration writes
+     * a marker, and a sibling configured differently is a mixed fleet the
+     * README tells operators not to run.
+     */
+    private fun liveBucketClaims(
+        h: Handle,
+        ctx: TableContext,
+        cfg: CompactionConfig,
+    ): Set<String> {
+        if (!cfg.claimsEnabled) return emptySet()
+        h.savepoint(BUCKET_CLAIM_SAVEPOINT)
+        return try {
+            CompactionClaimRepo.liveBucketKeys(h, ctx.catalogId, ctx.tableId).also {
+                h.releaseSavepoint(BUCKET_CLAIM_SAVEPOINT)
+            }
+        } catch (e: Exception) {
+            h.rollbackToSavepoint(BUCKET_CLAIM_SAVEPOINT)
+            log.warn(e) {
+                "compaction bucket-claim read failed for ${ctx.namespace}.${ctx.table}; " +
+                    "probing every bucket (a claim is an optimization)"
+            }
+            emptySet()
+        }
     }
 
     /** One sampled bucket and the debt the sample credits it with. */
@@ -2057,17 +2216,41 @@ class CompactionService(
      * reached within `ceil(available / considered)` sweeps whatever the
      * order says.
      *
-     * # In memory, and that is a deliberate limitation
+     * # In memory, per pod, and SEEDED per pod
      *
      * Keyed by (catalog, table) — `table_id` is scoped per catalog, so
      * a table-only key would let one catalog's sweep move another's
      * cursor (the bug `lastBudgetRefusal`'s key already records). It is
-     * lost on restart and NOT shared between replicas, which costs a
-     * repeated bucket after a deploy and nothing else: the cursor is
-     * fairness, never correctness, and two replicas planning the same
-     * bucket is what the group claims already arbitrate. Persisting it
+     * lost on restart and NOT shared between replicas. Persisting it
      * would mean a write per plan on the maintenance path for a
-     * tie-break.
+     * tie-break, so it stays in memory.
+     *
+     * What being per pod used to cost is the 2026-10-21 herd on
+     * gigahog-prod-us. Every pod's cursor started EMPTY, so every pod's
+     * first sweep started at the head of the same list, and every pod
+     * then advanced by the same `considered` — so nine pods walked the
+     * same buckets in lockstep for as long as they ran: six sweeps
+     * inside two seconds with identical `buckets_considered 123 /
+     * candidates_fetched 50,029`, and `claimed_elsewhere` 0, 64, 128,
+     * 192, 256, 320 as each pod re-probed the buckets its predecessors
+     * had already claimed. The group claims made the EXECUTION disjoint;
+     * nothing made the PLANNING disjoint.
+     *
+     * Two things do now. An empty cursor starts at
+     * [initialCursorOffset] — a position hashed from this pod's
+     * [plannerIdentity] and the table — so pods begin on different
+     * slices and then advance side by side. And a bucket another run has
+     * claimed in full is skipped before it is probed
+     * ([fetchCandidates]' pre-probe filter, `CompactionClaimRepo`'s
+     * bucket claims), which covers the slices that the hash happens to
+     * overlap. The cursor is still fairness, never correctness.
+     *
+     * The cursor records the last bucket PROBED, not the last one
+     * visited: a bucket the pre-probe filter skips does not move it. So a
+     * sweep whose final visits were skips resumes, next time, just after
+     * its last probe and walks over those (by then usually released)
+     * buckets again — deliberately, since a skipped bucket was not
+     * looked at and should get its turn.
      *
      * # The cursor carries the bucket's SORT KEY, not only its identity
      *
@@ -2093,14 +2276,23 @@ class CompactionService(
      * [sampled] rotated so this sweep starts after the bucket the last
      * one stopped on — the order is preserved, only the entry point
      * moves. When that bucket is gone, at the first bucket sorting at or
-     * after where it sat (see [bucketCursor]).
+     * after where it sat (see [bucketCursor]). When this pod has no
+     * cursor for the table yet, at [initialCursorOffset]'s position for
+     * this pod.
      */
     private fun rotated(
         ctx: TableContext,
         sampled: List<SampledBucket>,
     ): List<SampledBucket> {
-        val last = bucketCursor[ctx.catalogId to ctx.tableId] ?: return sampled
         if (sampled.isEmpty()) return sampled
+        val last = bucketCursor[ctx.catalogId to ctx.tableId]
+        if (last == null) {
+            // No sweep of this table yet on this pod: start on THIS
+            // pod's slice, not at the head every pod starts at.
+            val identity = plannerIdentity ?: return sampled
+            val from = initialCursorOffset(identity, ctx.catalogId, ctx.tableId, sampled.size)
+            return sampled.subList(from, sampled.size) + sampled.subList(0, from)
+        }
         val at = sampled.indexOfFirst { it.bucket == last.bucket }
         val from =
             if (at >= 0) {
@@ -2907,6 +3099,7 @@ class CompactionService(
                     "files_unranged=${r.filesUnranged} " +
                     "candidates_fetched=${r.candidatesFetched} " +
                     "buckets_considered=${r.bucketsConsidered}/${r.bucketsAvailable} " +
+                    "buckets_skipped_claimed=${r.bucketsSkippedClaimed} " +
                     "candidates_truncated=${r.candidatesTruncated} plan_ms=${r.planMs}"
             },
         ) {
@@ -2939,6 +3132,10 @@ class CompactionService(
             // Its own reason label, because it is the one "skip" that is
             // GOOD news: it is duplicated work that did not happen.
             Metrics.compactionSkipped(catalog, "claimed_elsewhere", result.claimedElsewhere)
+            // Buckets, not groups, so not a `skipped` reason: a bucket
+            // can hold any number of groups, and summing the two in one
+            // series would make neither readable.
+            Metrics.compactionBucketsSkippedClaimed(catalog, result.bucketsSkippedClaimed)
             result
         }
 
@@ -3031,6 +3228,7 @@ class CompactionService(
         val bucketsAvailable: Long = 0,
         val candidatesTruncated: Long = 0,
         val planMs: Long = 0,
+        val bucketsSkippedClaimed: Long = 0,
     ) {
         /**
          * What this tally has spent of `maxGroupsPerRun`.
@@ -3100,6 +3298,7 @@ class CompactionService(
                 bucketsAvailable + other.bucketsAvailable,
                 candidatesTruncated + other.candidatesTruncated,
                 planMs + other.planMs,
+                bucketsSkippedClaimed + other.bucketsSkippedClaimed,
             )
 
         companion object {
@@ -3108,12 +3307,33 @@ class CompactionService(
         }
     }
 
+    /**
+     * A bucket claim this run holds, shared by the WorkItems of every
+     * group the bucket packed into. [outstanding] counts the groups not
+     * yet settled; the one that takes it to zero releases the claim
+     * ([settleBucketClaim]).
+     */
+    private class BucketClaim(
+        val key: String,
+        groups: Int,
+    ) {
+        val outstanding = java.util.concurrent.atomic.AtomicInteger(groups)
+    }
+
     /** One planned group with the table context its execution needs. */
     private data class WorkItem(
         val ctx: TableContext,
         val group: CompactionGroup,
         val claimant: UUID? = null,
         val started: java.util.concurrent.atomic.AtomicBoolean = java.util.concurrent.atomic.AtomicBoolean(false),
+        val bucketClaim: BucketClaim? = null,
+        /**
+         * Every bucket claim the same plan took — this item's own among
+         * them — so each group's pre-IO refresh can renew all of them
+         * that are still outstanding ([refreshClaim]). Bounded by the
+         * plan's queue, so at most `maxGroupsPerRun` keys.
+         */
+        val planBuckets: List<BucketClaim> = emptyList(),
     )
 
     private data class PlannedWork(val plan: CompactionPlan, val items: List<WorkItem>)
@@ -3122,6 +3342,45 @@ class CompactionService(
      * Reserve this table's queue before another planner can read candidates.
      * One connection holds the session lock across short transactions and packing.
      * Claims are bounded by the remaining run budget. File I/O starts after unlock.
+     *
+     * # Bucket claims, in the same transaction as the group claims
+     *
+     * After the group claims, a BUCKET claim (`CompactionClaimRepo`'s
+     * class KDoc has why it is a row in the same table) for every bucket
+     * that is (1) in [PlanWithContext.markable] — probed in full, not
+     * cut by the candidate budget — and (2) whose every free group this
+     * plan just claimed. The next planner skips such a bucket before
+     * probing it ([fetchCandidates]), so the 2026-10-21 shape — a pod
+     * re-reading 50,029 candidate rows to drop its predecessors' 64
+     * groups — cannot recur for the claim's lifetime.
+     *
+     * (2) is what keeps the skip from HIDING work. A bucket that packed
+     * into more groups than the run's remaining room still has groups
+     * nobody holds; marking it would hide them from every sibling until
+     * this run settled. Such a bucket is left unmarked and the sibling
+     * finds its held groups the old way, by overlap. The room-ran-out
+     * path is the one (2) exists for. The other way a bucket can end up
+     * partly claimed — a group's claim insert losing to a sibling — is
+     * unreachable under the planning lock (every sibling's claims were
+     * committed before this plan read its candidates, and phase (c)
+     * already dropped their groups); the same check covers it as
+     * belt-and-braces for a plan path that ever claims without the lock. A bucket that packed into NO
+     * free group is not marked either: there is no group whose
+     * settlement would release the claim, and a marker this run cannot
+     * tell from its own next sweep's would make that sweep skip a bucket
+     * whose files may have grown into a group.
+     *
+     * The marker's lease is the SHORT [CompactionConfig.bucketClaimTtlSeconds],
+     * renewed by EVERY group's pre-IO refresh ([refreshClaim]) — each
+     * renews all of the plan's still-outstanding markers, so a bucket at
+     * the back of the queue is covered while the groups ahead of it run.
+     * A pod killed mid-sweep — `BackgroundLoops.close` abandons the sweep
+     * after 5 s, and no release runs — therefore hides its buckets for
+     * one short lease and not for the hour-long group lease. A marker
+     * that still expires (one group's rewrite outlasting the lease) costs
+     * a sibling one probe and the overlap skip, never a duplicate rewrite. A lost marker insert (a sibling holds a
+     * live one — only a plan without the lock could get there) is simply
+     * not tracked.
      */
     private fun planAndClaim(
         catalog: String,
@@ -3137,7 +3396,7 @@ class CompactionService(
                 if (cfg.claimsEnabled) {
                     h.inTransaction<Unit, Exception> { Locks.acquireCatalogCompactionPlanLock(h, catalogId) }
                 }
-                val (ctx, plan) = planSnapshot(h, catalog, namespace, table, cfg)
+                val (ctx, plan, markable) = planSnapshot(h, catalog, namespace, table, cfg)
                 if (!cfg.claimsEnabled) {
                     return@withHandleUnchecked PlannedWork(plan, plan.groups.take(room).map { WorkItem(ctx, it) })
                 }
@@ -3164,7 +3423,10 @@ class CompactionService(
                                 claimed++
                             }
                         }
-                        PlannedWork(plan.copy(claimedGroups = claimed), items)
+                        PlannedWork(
+                            plan.copy(claimedGroups = claimed),
+                            withBucketClaims(h, ctx, plan, markable, items, claimant, cfg),
+                        )
                     }
                 } catch (e: Exception) {
                     if (e is InterruptedException || Thread.currentThread().isInterrupted) throw e
@@ -3176,12 +3438,95 @@ class CompactionService(
             }
         }
 
-    /** Release queued work on cancellation or a heap refusal. Started groups settle their own claims. */
+    /**
+     * Take the bucket claims [planAndClaim]'s KDoc describes, inside its
+     * claim transaction, and return [items] with each covered group's
+     * [WorkItem.bucketClaim] set.
+     */
+    private fun withBucketClaims(
+        h: Handle,
+        ctx: TableContext,
+        plan: CompactionPlan,
+        markable: Set<Bucket>,
+        items: List<WorkItem>,
+        claimant: UUID,
+        cfg: CompactionConfig,
+    ): List<WorkItem> {
+        if (markable.isEmpty() || items.isEmpty()) return items
+
+        fun bucketOf(g: CompactionGroup) = Bucket(g.specId, g.partitionValues)
+        val taken = items.groupBy { bucketOf(it.group) }
+        val free = plan.groups.groupingBy { bucketOf(it) }.eachCount()
+        val claims = HashMap<Bucket, BucketClaim>()
+        for ((bucket, mine) in taken) {
+            // Every free group of the bucket is ours, or the bucket keeps
+            // work a sibling should be able to reach: no marker.
+            if (bucket !in markable || mine.size != free[bucket]) continue
+            val key = CompactionClaimRepo.bucketKey(bucket.specId, bucket.values)
+            if (CompactionClaimRepo.acquire(
+                    h,
+                    ctx.catalogId,
+                    ctx.tableId,
+                    key,
+                    emptyList(),
+                    claimant,
+                    cfg.bucketClaimTtlSeconds,
+                )
+            ) {
+                claims[bucket] = BucketClaim(key, mine.size)
+            }
+        }
+        if (claims.isEmpty()) return items
+        val all = claims.values.toList()
+        return items.map { item ->
+            item.copy(bucketClaim = claims[bucketOf(item.group)], planBuckets = all)
+        }
+    }
+
+    /**
+     * One of a bucket claim's groups has SETTLED — committed, skipped,
+     * failed, lost its lease, or released unstarted. The last one to do
+     * so deletes the claim, so a sibling's next plan probes the bucket
+     * again.
+     *
+     * Deleted rather than shortened on a commit, unlike a group claim
+     * (`executeGroup`'s release): a group claim outlives its commit for a
+     * sibling's plan that ALREADY names the dead inputs, and no sibling
+     * plan can name this bucket's groups without having probed it —
+     * which the marker stopped. A sibling that probes it after the
+     * release reads the live rows, so it sees the outputs, not the
+     * inputs. Best effort: a failed DELETE leaves a lease that expires.
+     */
+    private fun settleBucketClaim(item: WorkItem) {
+        val bucket = item.bucketClaim ?: return
+        val claimant = item.claimant ?: return
+        if (bucket.outstanding.decrementAndGet() != 0) return
+        runCatching {
+            jdbi.withHandleUnchecked { h ->
+                CompactionClaimRepo.release(h, item.ctx.catalogId, item.ctx.tableId, bucket.key, claimant)
+            }
+        }.onFailure { e -> log.warn(e) { "could not release a compaction bucket claim; it will expire" } }
+    }
+
+    /**
+     * Release queued work on cancellation or a heap refusal. Started groups settle their own claims.
+     *
+     * An item is released here only if this call WINS it from the worker
+     * (`started.compareAndSet`, the same flag [executeGroup] takes), so a
+     * pool worker that starts the group a moment later cannot settle it a
+     * second time — a double settle would release the bucket claim one
+     * group early. Bucket claims are settled in a first pass, BEFORE the
+     * group releases: they are the costlier leak (a whole bucket), so if
+     * this is cut short by the process dying they are the ones to have
+     * gone.
+     */
     private fun releaseQueuedClaims(items: List<WorkItem>) {
         val interrupted = Thread.interrupted()
         try {
-            for (item in items) {
-                if (item.claimant == null || item.started.get()) continue
+            val won = items.filter { it.claimant != null && it.started.compareAndSet(false, true) }
+            for (item in won) settleBucketClaim(item)
+            for (item in won) {
+                val claimant = item.claimant ?: continue
                 runCatching {
                     jdbi.withHandleUnchecked { h ->
                         CompactionClaimRepo.release(
@@ -3189,7 +3534,7 @@ class CompactionService(
                             item.ctx.catalogId,
                             item.ctx.tableId,
                             CompactionClaimRepo.groupKey(item.group),
-                            item.claimant,
+                            claimant,
                         )
                     }
                 }.onFailure { e -> log.warn(e) { "could not release queued compaction claim; it will expire" } }
@@ -3291,6 +3636,7 @@ class CompactionService(
                         bucketsAvailable = plan.bucketsAvailable,
                         candidatesTruncated = plan.candidatesTruncated,
                         planMs = plan.planMs,
+                        bucketsSkippedClaimed = plan.bucketsSkippedClaimed,
                     )
                 val queue = ArrayDeque(items)
                 while (queue.isNotEmpty() && !heapExhausted.get()) {
@@ -3388,6 +3734,7 @@ class CompactionService(
             bucketsAvailable = bucketsAvailable,
             candidatesTruncated = candidatesTruncated,
             planMs = planMs,
+            bucketsSkippedClaimed = bucketsSkippedClaimed,
         )
 
     /**
@@ -3582,10 +3929,14 @@ class CompactionService(
     ): GroupTally {
         val (ctx, group) = item
         if (heapExhausted.get()) return GroupTally.NOT_ATTEMPTED
-        item.started.set(true)
+        // Take the item, or find that `releaseQueuedClaims` already did
+        // (cancellation racing a pool worker): exactly one of the two
+        // settles its claims.
+        if (!item.started.compareAndSet(false, true)) return GroupTally.NOT_ATTEMPTED
         // Refresh the reservation before file I/O. A lost lease spends no I/O.
         val claimKey = item.claimant?.let { CompactionClaimRepo.groupKey(group) }
-        if (claimKey != null && !refreshClaim(ctx, claimKey, item.claimant, cfg)) {
+        val liveBuckets = item.planBuckets.filter { it.outstanding.get() > 0 }.map { it.key }
+        if (claimKey != null && !refreshClaim(ctx, claimKey, liveBuckets, item.claimant, cfg)) {
             log.debug {
                 "compaction group of ${group.files.size} files for " +
                     "$catalog/${ctx.namespace}.${ctx.table} is claimed by another maintainer; " +
@@ -3593,6 +3944,7 @@ class CompactionService(
             }
             // No IO spent, so no budget spent: GroupTally.attempts does
             // not count this and doRunOnce pulls the next candidate.
+            settleBucketClaim(item)
             return GroupTally(claimedElsewhere = 1)
         }
 
@@ -3887,6 +4239,7 @@ class CompactionService(
                     }
                 }
             }
+            settleBucketClaim(item)
         }
     }
 
@@ -3907,10 +4260,21 @@ class CompactionService(
         filesUnchecked = filesUnchecked.toLong(),
     )
 
-    /** A broken claim table still permits work; a lost claim does not. */
+    /**
+     * A broken claim table still permits work; a lost claim does not.
+     *
+     * Renews the plan's still-outstanding bucket claims ([bucketKeys])
+     * in the same statement, on their own short lease — see
+     * [CompactionConfig.bucketClaimTtlSeconds] for why a bucket claim
+     * must lapse quickly once nothing is working its queue, and why
+     * every group renews all of them rather than only its own. Only the
+     * GROUP claim's survival decides the answer: a lapsed bucket claim
+     * costs a sibling a probe, never this group its run.
+     */
     private fun refreshClaim(
         ctx: TableContext,
         claimKey: String,
+        bucketKeys: List<String>,
         claimant: UUID,
         cfg: CompactionConfig,
     ): Boolean =
@@ -3923,6 +4287,8 @@ class CompactionService(
                     claimKey,
                     claimant,
                     cfg.claimTtlSeconds,
+                    bucketKeys = bucketKeys,
+                    bucketTtlSeconds = cfg.bucketClaimTtlSeconds,
                 )
             }
         }.getOrElse { e ->
@@ -4997,5 +5363,86 @@ class CompactionService(
          * to leave the supervisor margin to do its own bookkeeping.
          */
         const val SHUTDOWN_WAIT_SECONDS = 3L
+
+        /** The savepoint [liveBucketClaims] rewinds to when its read fails. */
+        const val BUCKET_CLAIM_SAVEPOINT = "compaction_bucket_claims"
+
+        /**
+         * This pod's planner identity: `POD_NAME` (the downward-API name,
+         * if a chart passes one), else `HOSTNAME` (the pod name on
+         * Kubernetes, the machine name locally — the source
+         * `CleanupService.defaultWorkerIdPrefix` already uses), else
+         * `local`.
+         *
+         * Deliberately WITHOUT a per-process UUID, unlike the cleanup
+         * claimant: the point here is a STABLE spread, and a restarted
+         * container in the same pod should resume the same slice of the
+         * bucket list rather than land on a fresh random one. Two pods
+         * that both fall through to `local` (only possible off
+         * Kubernetes) share a start, which costs what every pod sharing
+         * one cost before this existed and nothing more: the bucket
+         * claims still keep their probes apart.
+         */
+        fun defaultPlannerIdentity(): String =
+            listOf("POD_NAME", "HOSTNAME")
+                .firstNotNullOfOrNull { System.getenv(it)?.takeIf { v -> v.isNotBlank() } }
+                ?: "local"
+
+        /**
+         * Where a pod's FIRST sweep of (catalog, table) starts in a
+         * bucket list of [size]: a position derived from [identity] and
+         * the table, the same on every call, different between pods.
+         *
+         * # Why hash, and not `k * size / N`
+         *
+         * An even split — pod k of N at `k * size / N` — is the ideal,
+         * and the server cannot compute it: the maintenance pods are a
+         * Deployment, so they have no ordinal, and nothing tells a pod
+         * how many siblings it has. A hash of the identity modulo the
+         * size is the best an unknowing pod can do: uniform in
+         * expectation, so with N pods each probing `considered` buckets a
+         * sweep, a pair overlaps on a fraction ~`2 x considered / size`
+         * of its first sweep. At 2026-10-21's shape (9 pods, 123 buckets
+         * probed a sweep, ~2,200 offered) the expected number of pairs
+         * starting closer than one sweep apart is ~3.3, and the chance of
+         * none is under 1%: overlap on the FIRST sweep is the norm, not
+         * the exception. The bucket claims absorb it — the later planner
+         * skips what the earlier one claimed — and the cursors then
+         * leapfrog rather than walk together, where before all 36 pairs
+         * walked the same buckets forever.
+         *
+         * SHA-256, not `String.hashCode`: pod names differ in their last
+         * few characters, and the polynomial hash maps two names that
+         * differ only in the last character to values one apart — which
+         * modulo the size are ADJACENT starts, the herd again.
+         * `catalogId` and `tableId` are hashed in so that one pod's
+         * tables do not all start at the same fraction of their lists.
+         *
+         * Only the first sweep: after it, the cursor ([bucketCursor])
+         * carries on from where this pod stopped, so the pods' slices
+         * advance side by side instead of converging.
+         */
+        fun initialCursorOffset(
+            identity: String,
+            catalogId: Long,
+            tableId: Long,
+            size: Int,
+        ): Int {
+            if (size <= 0) return 0
+            return Math.floorMod(identitySeed("$identity/$catalogId/$tableId"), size.toLong()).toInt()
+        }
+
+        /**
+         * The first 8 bytes of SHA-256 over [identity]: a well-mixed
+         * 64-bit value for a string whose variants differ in their last
+         * characters (pod names). [initialCursorOffset]'s hash, and the
+         * compaction loop's jitter seed (`BackgroundLoops.Jitter`), where
+         * `String.hashCode`'s near-equal values for near-equal names would
+         * give `java.util.Random` near-equal seeds.
+         */
+        fun identitySeed(identity: String): Long =
+            java.nio.ByteBuffer.wrap(
+                java.security.MessageDigest.getInstance("SHA-256").digest(identity.toByteArray(Charsets.UTF_8)),
+            ).long
     }
 }

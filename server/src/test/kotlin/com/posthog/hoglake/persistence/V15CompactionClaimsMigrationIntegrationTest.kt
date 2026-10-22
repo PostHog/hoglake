@@ -84,11 +84,13 @@ class V15CompactionClaimsMigrationIntegrationTest {
         sql: String,
         catalogId: Long,
         tableId: Long?,
+        extra: Map<String, Any> = emptyMap(),
     ): String =
         db.jdbi.withHandleUnchecked { h ->
             h.createQuery("EXPLAIN (COSTS OFF) $sql")
                 .bind("catalogId", catalogId)
                 .also { q -> if (tableId != null) q.bind("tableId", tableId) }
+                .also { q -> extra.forEach { (k, v) -> q.bind(k, v) } }
                 .mapTo(String::class.java).list().joinToString("\n")
         }
 
@@ -114,6 +116,24 @@ class V15CompactionClaimsMigrationIntegrationTest {
                 .contains("hog_compaction_claim_pkey")
             assertThat(plannerPlan)
                 .describedAs("planner read plan:%n%s", plannerPlan)
+                .doesNotContain("Seq Scan on hog_compaction_claim")
+
+            // The pre-probe bucket-claim read (`bucket:` rows, the
+            // planner's skip set) rides the same key prefix, with the
+            // prefix and the expiry as filters on the table's live claims.
+            val bucketPlan =
+                explain(
+                    db,
+                    CompactionClaimRepo.LIVE_BUCKET_CLAIMS_SQL,
+                    catalogId,
+                    tableId = 7,
+                    extra = mapOf("prefix" to CompactionClaimRepo.BUCKET_KEY_PREFIX),
+                )
+            assertThat(bucketPlan)
+                .describedAs("bucket-claim read plan:%n%s", bucketPlan)
+                .contains("hog_compaction_claim_pkey")
+            assertThat(bucketPlan)
+                .describedAs("bucket-claim read plan:%n%s", bucketPlan)
                 .doesNotContain("Seq Scan on hog_compaction_claim")
 
             // The purge is per CATALOG across its tables, which the

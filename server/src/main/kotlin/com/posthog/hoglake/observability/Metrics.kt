@@ -516,6 +516,25 @@ object Metrics {
     }
 
     /**
+     * hoglake_compaction_buckets_skipped_claimed_total{catalog} — buckets
+     * a planner skipped WITHOUT probing because another run holds a live
+     * bucket claim on them (`CompactionClaimRepo.bucketKey`). Its rate
+     * against `hoglake_compaction_skipped_total{reason="claimed_elsewhere"}`
+     * says how the maintenance pods divide a catalog: claims found before
+     * the probe here, after it (the candidate rows read and discarded)
+     * there. Buckets, not groups, so its own series rather than a reason
+     * on the groups counter.
+     */
+    fun compactionBucketsSkippedClaimed(
+        catalog: String,
+        count: Long,
+    ) {
+        if (count > 0) {
+            increment("hoglake_compaction_buckets_skipped_claimed_total", count.toDouble(), "catalog", catalog)
+        }
+    }
+
+    /**
      * hoglake_compaction_spill_bytes_total{catalog} — local bytes sorted
      * rewrites spilled (hoglake#134). Its rate against
      * `hoglake_compaction_groups_total` is the spill a sorted group costs;

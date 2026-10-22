@@ -340,6 +340,25 @@ describe("maintenance outcome and history", () => {
     expect(screen.queryByText(/not appended:/)).not.toBeInTheDocument();
   });
 
+  it("shows work other runs held: buckets skipped before probing and groups dropped after", () => {
+    render(
+      <RunSummary
+        run={{
+          ...compaction,
+          result: { ...compaction.result!, buckets_skipped_claimed: "7", claimed_elsewhere: "2" },
+        }}
+      />,
+    );
+    expect(
+      screen.getByText(/held by other runs: 7 bucket\(s\) skipped before probing, 2 group\(s\) dropped after/),
+    ).toHaveAttribute("title", expect.stringContaining("their files were not read"));
+  });
+
+  it("hides the held-elsewhere counts when both are zero or absent", () => {
+    render(<RunSummary run={compaction} />);
+    expect(screen.queryByText(/held by other runs:/)).not.toBeInTheDocument();
+  });
+
   it("explains the heap-budget count on hover", () => {
     render(
       <RunSummary

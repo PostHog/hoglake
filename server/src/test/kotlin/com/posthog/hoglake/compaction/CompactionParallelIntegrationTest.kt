@@ -2305,13 +2305,19 @@ class CompactionParallelIntegrationTest {
             ).bind("n", cat).execute()
         }
 
+    /**
+     * The catalog's GROUP claims. Bucket claims (`bucket:` keys) share the
+     * table and are excluded: these fixtures publish no sample, so none
+     * is written today, but a count of groups must not start counting
+     * buckets if one ever does.
+     */
     private fun claimRows(cat: String): List<String> =
         db.jdbi.withHandleUnchecked { h ->
             h.createQuery(
                 """
                 SELECT cc.group_key FROM hog_compaction_claim cc
                 JOIN hog_catalog c ON c.catalog_id = cc.catalog_id
-                WHERE c.name = :n
+                WHERE c.name = :n AND NOT starts_with(cc.group_key, 'bucket:')
                 """,
             )
                 .bind("n", cat)
