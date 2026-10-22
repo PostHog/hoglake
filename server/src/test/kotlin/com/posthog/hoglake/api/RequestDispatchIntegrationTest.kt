@@ -327,7 +327,12 @@ class RequestDispatchIntegrationTest {
                 while (!Thread.currentThread().isInterrupted) {
                     peakActive.accumulateAndGet(app.requestDispatcher.active, ::maxOf)
                     peakQueued.accumulateAndGet(app.requestDispatcher.queued, ::maxOf)
-                    Thread.sleep(5)
+                    // Caught: uncaught, Awaitility's handler fails whichever test is inside await() (#425).
+                    try {
+                        Thread.sleep(5)
+                    } catch (_: InterruptedException) {
+                        return@Thread
+                    }
                 }
             }.apply {
                 isDaemon = true
@@ -338,6 +343,7 @@ class RequestDispatchIntegrationTest {
         val responses = (1..n + 1).map { fire("/test/sleep") }.map { it.get(60, TimeUnit.SECONDS) }
         val elapsedMs = (System.nanoTime() - started) / 1_000_000
         sampling.interrupt()
+        sampling.join(5_000)
 
         assertThat(responses.map { it.statusCode() }).containsOnly(200)
         assertThat(responses.map { it.body() }).containsOnly("slept")
