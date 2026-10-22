@@ -220,10 +220,7 @@ internal object CompactionClaimRepo {
      * (c), an early drop), and again inside the claim transaction under
      * the catalog planning lock, where it is exact because every sibling
      * commits its claims before releasing that lock. Metadata-only
-     * previews read it once and take no lock and no claim. (The probe
-     * itself also excludes these ids, in SQL — `CompactionService.candidateSql`
-     * — so the overlap these reads find is only what was claimed after the
-     * probe's snapshot.)
+     * previews read it once and take no lock and no claim.
      */
     fun liveClaimedFileIds(
         h: Handle,

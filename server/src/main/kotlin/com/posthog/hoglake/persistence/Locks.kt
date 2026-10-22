@@ -59,7 +59,9 @@ object Locks {
      * transaction ahead of the claim transaction, so a timed-out wait fails
      * the plan before any claim work and is never released by a caller that
      * did not get it. The wait is bounded by the 15 s `lock_timeout` set
-     * here, and it queues only behind siblings' claim transactions.
+     * here, and it queues only behind siblings' claim transactions, which
+     * run under `CompactionService.CLAIM_STATEMENT_TIMEOUT_MS` — the same
+     * 15 s, deliberately: a waiter never outlives the holder's bound.
      */
     fun acquireCatalogCompactionPlanLock(
         handle: Handle,

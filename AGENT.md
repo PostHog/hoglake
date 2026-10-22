@@ -1537,13 +1537,13 @@ ran on the local stack and what it showed.
   transaction commits. A plan path that claims without the lock or
   without the re-read can hold overlapping groups under different keys,
   and a failed claim transaction plans nothing (never the unclaimed
-  plan). Every probe also excludes files under a live claim, so planners
-  on one hot bucket read successive windows rather than colliding.
+  plan).
   Holding the lock across the probes (1.4.1) made one slow probe every
   sibling's 15 s lock wait: 38 of 40 millpond-prod-us sweeps failed on
-  2026-10-22. The plan's statement bound is
+  2026-10-22. The probe's statement bound is
   `HOGLAKE_COMPACTION_PLAN_STATEMENT_TIMEOUT_MS` (default 60 s, the
-  session's), no longer the 15 s fail-fast that shape needed. Each pod's bucket cursor
+  session's), no longer the 15 s fail-fast that shape needed; the claim
+  transaction keeps a fixed 15 s equal to the lock wait. Each pod's bucket cursor
   starts at a hash of its identity (`POD_NAME`/`HOSTNAME`), and the
   compaction loop — and only it — sleeps with ±25% jitter
   (`BackgroundLoops.Jitter`); server/README.md has the incident and the

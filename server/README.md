@@ -1232,19 +1232,22 @@ probe. On gigahog-prod-us (1.4.1, 2026-10-22, nine planners) one pod in a 15 s
 probe made the other eight queue on `pg_advisory_lock` and hit their own 15 s
 bound there — 38 of 40 millpond-prod-us sweeps failed, most of them on the lock
 wait. What the lock protected is two plans reserving different group keys for
-the same files; the in-lock re-read protects that on its own. Two more pieces
-came with the move:
+the same files; the in-lock re-read protects that on its own. What concurrent
+planning costs instead: two planners can probe the same hot bucket at once, pack
+the same groups, and the later one drops them in phase (c) or the in-lock
+re-read — a wasted probe, never a duplicate rewrite. Excluding live-claimed
+files inside the probe's SQL was measured and rejected: it is O(claimed ids) per
+probe and goes linear past `work_mem` (576 live claims of 5,000 ids, 2.88M ids,
+`work_mem` 4 MB: the `NOT IN` probe ran over 10 minutes; `NOT EXISTS` / `NOT IN`
+against a materialized CTE were still running at a 120 s cancel), so collisions between planners on one hot bucket
+are left to phase (c) and the in-lock re-read.
 
-- **Claimed files are not candidates.** Every probe excludes files under a
-  live claim (an uncorrelated `NOT IN` over the table's claimed ids, hashed once
-  per probe), so planners on one hot bucket read successive windows instead of
-  packing the same groups and dropping them as `claimed_elsewhere`. A claim
-  committed after a probe's snapshot is still caught by phase (c) or the
-  in-lock re-read: a wasted probe, never a duplicate rewrite.
 - **`HOGLAKE_COMPACTION_PLAN_STATEMENT_TIMEOUT_MS`** (default **60,000**, the
   session's bound; at least 1,000) replaces the fixed 15 s plan statement
   bound. That was a fail-fast for a slow probe under the lock; without the lock
   a slow probe costs one pod one sweep and yields the bucket's whole window.
+  It bounds the probe only: the claim transaction keeps a fixed 15 s, equal to
+  the lock wait, so a waiter never outlives the holder's bound.
 
 `HOGLAKE_COMPACTION_CLAIM_TTL_SECONDS` defaults to **3600** seconds. Set it above
 the longest full run, including queue time. Each group refreshes its live claim
@@ -1284,9 +1287,9 @@ the 15 s plan timeout, 19 failures in nine minutes.
   buckets without probing them (`buckets_skipped_claimed` in the run
   result, `hoglake_compaction_buckets_skipped_claimed_total{catalog}`).
   Planning takes no lock (#418), so a marker committed after a planner's
-  snapshot is missed by that planner: it probes the bucket, its probe skips
-  the files already claimed, and its claim transaction drops any overlap
-  under the lock. The claim
+  snapshot is missed by that planner: it probes the bucket, and phase (c)
+  or its claim transaction's in-lock re-read drops the overlapping groups.
+  The claim
   is released when the last of the bucket's groups settles (committed,
   skipped, failed, or released unstarted). Its lease is SHORT —
   `HOGLAKE_COMPACTION_BUCKET_CLAIM_TTL_SECONDS`, default **600**, against
@@ -1301,8 +1304,8 @@ the 15 s plan timeout, 19 failures in nine minutes.
   hidden until the last of its own groups settles, wherever they sit in the
   run's queue — that is the intent: the marker means "this run holds all of
   it". A bucket with a group left over (the run's room ran out, or a claim
-  insert lost) is NOT marked, so a sibling can still take what is left; its
-  probe skips the claimed files and reads the rest. Like group claims it is an optimization: ignore it
+  insert lost) is NOT marked, so a sibling can still take what is left, and
+  finds the held groups by overlap as before. Like group claims it is an optimization: ignore it
   and the cost is the old re-probe, never a wrong commit. The tier rows
   carry no file ids, so a cheaper per-file check was not available.
 - **Per-pod cursor start.** Each pod's bucket cursor starts, per

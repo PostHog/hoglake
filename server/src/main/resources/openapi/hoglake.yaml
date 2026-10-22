@@ -4937,13 +4937,10 @@ components:
             count as the feature working — and so, since bucket claims,
             is a standing ZERO alongside a nonzero
             buckets_skipped_claimed: the replicas found each other's
-            claims before probing rather than after. Since the probe
-            itself excludes files already under a live claim, this
-            counts only claims taken AFTER the probe read — dropped
-            after packing or by the claim transaction's re-read under
-            the planning lock — so near zero is the normal reading on
-            a fleet of replicas, and both counters zero no longer means
-            claims are off.
+            claims before probing rather than after. Both zero on a
+            fleet with two or more maintenance replicas means either
+            HOGLAKE_COMPACTION_CLAIMS_ENABLED is off or the replicas
+            are not in fact planning the same buckets.
 
             It spends no object-store IO, so it does NOT consume
             HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN — the same treatment

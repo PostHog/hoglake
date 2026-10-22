@@ -492,11 +492,7 @@ class CompactionParallelIntegrationTest {
             assertThat(claimLeasesSeconds(fx.cat)).allMatch { it > 3500 }
             val other = second.runOnce(fx.cat)
             assertThat(other.groupsCompacted).isZero()
-            // #418: the probe excludes files under a live claim, so the
-            // queued groups never reach packing — nothing is dropped after
-            // the probe, and nothing is planned.
-            assertThat(other.claimedElsewhere).isZero()
-            assertThat(other.candidatesFetched).isZero()
+            assertThat(other.claimedElsewhere).isEqualTo(fx.groups.toLong())
             assertThat(other.skippedConflicts).isZero()
             release.countDown()
             assertThat(run.get(60, TimeUnit.SECONDS).groupsCompacted).isEqualTo(fx.groups.toLong())
@@ -524,9 +520,7 @@ class CompactionParallelIntegrationTest {
             assertThat(claimRows(fx.cat)).hasSize(2)
             val other = second.runOnce(fx.cat)
             assertThat(other.groupsCompacted).isEqualTo(3)
-            // #418: the first run's two claimed groups are excluded at the
-            // probe, not dropped after it.
-            assertThat(other.claimedElsewhere).isZero()
+            assertThat(other.claimedElsewhere).isEqualTo(2)
             assertThat(other.skippedConflicts).isZero()
             release.countDown()
             val result = run.get(60, TimeUnit.SECONDS)
@@ -610,8 +604,7 @@ class CompactionParallelIntegrationTest {
             // The same service can start a second run after the planning lock is released.
             val second = svc.runOnce(fx.cat)
             assertThat(second.groupsCompacted).isZero()
-            // Excluded at the probe (#418), not dropped after it.
-            assertThat(second.claimedElsewhere).isZero()
+            assertThat(second.claimedElsewhere).isEqualTo(2)
             releaseRewrite.countDown()
             assertThat(run.get(60, TimeUnit.SECONDS).groupsCompacted).isEqualTo(2)
         } finally {
@@ -932,27 +925,18 @@ class CompactionParallelIntegrationTest {
         assertThat(before.groups).hasSize(2)
 
         // Claim ONE file of the first group under a key no planner would
-        // ever compute — the overlap is all the skip may use. Taken AFTER
-        // the probe's snapshot (the `beforePacking` seam): a claim that was
-        // already live when the probe read is excluded there (#418), so the
-        // overlap skip is what catches the one committed since, which is
-        // the case it exists for.
+        // ever compute — the overlap is all the skip may use.
         val victim = before.groups.first().files.first().dataFileId
-        val claimOnce = java.util.concurrent.atomic.AtomicBoolean(true)
-        svc.beforePacking = {
-            if (claimOnce.getAndSet(false)) {
-                db.jdbi.useHandleUnchecked { h ->
-                    CompactionClaimRepo.acquire(
-                        h,
-                        catalogId,
-                        tableId,
-                        "not-a-real-group-key",
-                        listOf(victim),
-                        UUID.randomUUID(),
-                        900,
-                    )
-                }
-            }
+        db.jdbi.useHandleUnchecked { h ->
+            CompactionClaimRepo.acquire(
+                h,
+                catalogId,
+                tableId,
+                "not-a-real-group-key",
+                listOf(victim),
+                UUID.randomUUID(),
+                900,
+            )
         }
         val after = svc.planTable(fx.cat, "ns", "t", cfg)
         assertThat(after.groups)
@@ -961,13 +945,10 @@ class CompactionParallelIntegrationTest {
         assertThat(after.groups.single().files.map { it.dataFileId }).doesNotContain(victim)
         assertThat(after.claimedGroups).isEqualTo(1)
 
-        // And the sweep spends its budget on the other group only. The
-        // claim is live now, so this probe excludes the victim and packs
-        // around it rather than dropping a group.
-        svc.beforePacking = {}
+        // And the sweep spends its budget on the other group only.
         val result = svc.runOnce(fx.cat, cfg)
         assertThat(result.groupsCompacted).isEqualTo(1)
-        assertThat(result.claimedElsewhere).isZero()
+        assertThat(result.claimedElsewhere).isEqualTo(1)
     }
 
     // ---- 4: the budget, and what may spend it ------------------------------

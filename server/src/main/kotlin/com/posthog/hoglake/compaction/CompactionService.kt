@@ -323,8 +323,10 @@ data class CompactionConfig(
      */
     val bucketClaimTtlSeconds: Long = DEFAULT_BUCKET_CLAIM_TTL_SECONDS,
     /**
-     * The `SET LOCAL statement_timeout` a plan's read transaction and its
-     * claim transaction run under
+     * The `SET LOCAL statement_timeout` a plan's READ (probe) transaction
+     * runs under — not its claim transaction, which has its own fixed
+     * bound equal to the plan lock's wait
+     * (`CompactionService.CLAIM_STATEMENT_TIMEOUT_MS`)
      * (`HOGLAKE_COMPACTION_PLAN_STATEMENT_TIMEOUT_MS`, default 60,000 —
      * the session's own bound, `Database.SESSION_INIT_SQL`).
      *
@@ -1806,11 +1808,9 @@ class CompactionService(
      * Planning takes no lock (#418; `planAndClaim` has the argument), so
      * a sibling may commit a marker after this transaction's snapshot
      * was taken, and this planner then probes a bucket it could have
-     * skipped. The cost is that probe: the files the sibling claimed are
-     * excluded from it by the probe's own live-claim filter when their
-     * claims were committed before the snapshot, and otherwise the groups
-     * it packs overlap the sibling's and `planAndClaim`'s in-lock re-read
-     * drops them as `claimed_elsewhere` before any claim is inserted.
+     * skipped. The cost is that probe: the groups it packs overlap the
+     * sibling's, and phase (c) or `planAndClaim`'s in-lock re-read drops
+     * them as `claimed_elsewhere` before any claim is inserted.
      * Never a duplicate rewrite. Until #418 the planning lock was held
      * from before this snapshot, which made the read exact and made one
      * slow probe every sibling's lock wait.
@@ -2376,7 +2376,6 @@ class CompactionService(
      *               WHERE catalog_id = ? AND key_index = ? AND value = ?
      *                 [AND EXISTS (each further key)])))] --   intersected by cost
      *        [AND spec_id IS NOT DISTINCT FROM ?]        -- bucket identity, ARMS only
-     *        AND data_file_id NOT IN (live claims' ids)  -- hashed once (#418)
      *      [ORDER BY file_size_bytes, data_file_id]      -- ONLY when there are no arms
      *      LIMIT ?                                       -- THE SCAN CAP
      * ) f
@@ -2541,61 +2540,6 @@ class CompactionService(
      * by (a). Net better, and the `table_id`-in-index follow-up removes
      * (a) and (b).
      *
-     * # CLAIMED FILES ARE NOT CANDIDATES (#418)
-     *
-     * Every shape's inner scan carries
-     * `f0.data_file_id NOT IN (SELECT unnest(input_file_ids) FROM
-     * hog_compaction_claim WHERE <this table> AND expires_at > now())`, so
-     * a planner probing a bucket a sibling is working reads PAST the
-     * sibling's claimed files and packs the next window, instead of
-     * packing the same groups and dropping them as `claimed_elsewhere`
-     * after the probe. Without it, nine planners on one hot bucket read
-     * the same first window nine times (prod-us 1.4.1: `claimed_elsewhere`
-     * 1,460 over six sweeps). Phase (c) and the in-lock re-read stay: a
-     * claim committed after this probe's snapshot is theirs to catch.
-     *
-     * The claim table holds this table's live claims only — at most
-     * `maxGroupsPerRun` group claims plus markers (empty arrays, which
-     * contribute no id) per concurrent run — reached by its primary key's
-     * `(catalog_id, table_id)` prefix. The uncorrelated `NOT IN` is
-     * planned as a HASHED SubPlan: the claimed ids are read once per
-     * probe and each scanned row costs a hash probe, and the manifest
-     * side keeps its shape. Measured on PG 18 (a 500,000-file catalog, a
-     * 20,000-file bucket, 200 live claims of 64 ids on its lowest ids, 20
-     * markers, 50 expired; cap 8,193):
-     *
-     *  - correlated `NOT EXISTS (… f0.data_file_id = ANY (c.input_file_ids))`:
-     *    a nested-loop anti join, the claim table re-scanned per manifest
-     *    row — 20,000 loops, 2.86M array comparisons, 265,889 buffers,
-     *    458 ms;
-     *  - `NOT (f0.data_file_id = ANY (ARRAY(SELECT unnest(…))))` as an
-     *    InitPlan: one claim read, but a LINEAR array search per row
-     *    (`<> ALL`) — 334 ms;
-     *  - `NOT IN (SELECT unnest(…))`: one claim read, hashed, 24 ms and
-     *    10,355 buffers, against 28.9 ms for the probe with no claims at
-     *    all. The buffers it adds are the manifest rows it reads PAST —
-     *    the claimed files the sorted scan meets first — which is the
-     *    point.
-     *
-     * Pinned on `CompactionBucketProbePlanIntegrationTest`'s fixture
-     * (401,000 files; the month-682 one-key probe, 20,000 of them on the
-     * subject table; 200 live claims over its 12,800 lowest ids, 20
-     * markers, 50 expired): the manifest side is still the primary-key
-     * `= ANY ((InitPlan 1).col1)` scan, the claim side ONE scan of 18
-     * buffers under a `hashed SubPlan`, 36,606 buffers in all with the
-     * DV join (33,137 for the same probe with no claims).
-     *
-     * THE NULL HAZARD of `NOT IN`, closed in the statement rather than by
-     * convention: `x NOT IN (…, NULL)` is NULL for every `x`, so ONE NULL
-     * element in ONE live claim's `input_file_ids` would make the probe
-     * return nothing for the whole table, silently, for the claim's lease.
-     * Nothing writes a NULL element today (every writer builds the array
-     * from file ids) and nothing in the schema prevents one, so the
-     * subquery unnests through a lateral and filters `u.id IS NOT NULL`;
-     * the plan keeps the hashed SubPlan with one claim scan.
-     * `CompactionBucketProbePlanIntegrationTest` pins the shape and the
-     * NULL case.
-     *
      * # NEVER A GENERIC PLAN ([Pg.CUSTOM_PLANS_ONLY])
      *
      * pgjdbc server-prepares a statement on its fifth execution on a
@@ -2627,7 +2571,6 @@ class CompactionService(
         nullArms: Set<Int>,
         scopeToSpec: Boolean,
         withPartitionValues: Boolean,
-        excludeClaimed: Boolean = true,
     ): String {
         fun valuePredicate(keyIndex: Int) =
             if (keyIndex in nullArms) "pv$keyIndex.value IS NULL" else "pv$keyIndex.value = :v$keyIndex"
@@ -2677,24 +2620,6 @@ class CompactionService(
             }
         val specFilter =
             if (scopeToSpec && arms.isEmpty()) "\n             WHERE f.spec_id IS NOT DISTINCT FROM :specId" else ""
-        // FILES UNDER A LIVE CLAIM ARE NOT CANDIDATES (#418): an
-        // uncorrelated NOT IN, so Postgres hashes the table's claimed ids
-        // ONCE per probe (`hashed SubPlan`) and filters the scan with a
-        // hash probe per row. See the KDoc's "CLAIMED FILES" section for
-        // the shapes measured against it. After the arms in the text so
-        // the arms' id set stays `InitPlan 1`.
-        // Off with claims off: nothing in that configuration writes a
-        // claim, and the switch must work without the table.
-        val claimed =
-            if (!excludeClaimed) {
-                ""
-            } else {
-                """
-                       AND f0.data_file_id NOT IN (
-                             SELECT u.id FROM hog_compaction_claim cl, unnest(cl.input_file_ids) AS u(id)
-                              WHERE cl.catalog_id = :catalogId AND cl.table_id = :tableId
-                                AND cl.expires_at > now() AND u.id IS NOT NULL)""".trimEnd()
-            }
         val valuesProjection = if (withPartitionValues) ",\n                   pvs.partition_values" else ""
         val valuesJoin =
             if (withPartitionValues) {
@@ -2720,7 +2645,7 @@ class CompactionService(
                       FROM hog_data_file f0
                      WHERE f0.catalog_id = :catalogId AND f0.table_id = :tableId
                        AND f0.end_snapshot IS NULL
-                       AND f0.file_size_bytes < :targetBytes$armSql$specInner$claimed$innerOrder
+                       AND f0.file_size_bytes < :targetBytes$armSql$specInner$innerOrder
                      LIMIT :scanLimit
                    ) f
               LEFT JOIN hog_delete_file dv
@@ -2785,7 +2710,6 @@ class CompactionService(
                     nullArms = nullArms,
                     scopeToSpec = true,
                     withPartitionValues = false,
-                    excludeClaimed = cfg.claimsEnabled,
                 ),
             )
                 .bind("catalogId", ctx.catalogId)
@@ -2830,7 +2754,6 @@ class CompactionService(
                     nullArms = emptySet(),
                     scopeToSpec = false,
                     withPartitionValues = true,
-                    excludeClaimed = cfg.claimsEnabled,
                 ),
             )
                 .bind("catalogId", ctx.catalogId)
@@ -3504,10 +3427,11 @@ class CompactionService(
      * milliseconds against the probe this change took out from under it.
      *
      * What concurrency costs instead, stated: two planners may PROBE the
-     * same bucket at once. The probe's live-claim filter ([candidateSql])
-     * makes the later one read past files already claimed when it took
-     * its snapshot; a claim committed after that snapshot is caught here
-     * by the re-read. A wasted probe at worst, never a duplicate rewrite.
+     * same bucket at once, pack the same groups, and the later one drops
+     * them — in phase (c), or here by the re-read. A wasted probe, never a
+     * duplicate rewrite. Excluding live-claimed files inside the probe's
+     * SQL was measured and rejected: it costs O(claimed ids) per probe and
+     * goes linear past `work_mem` (server/README.md has the numbers).
      *
      * # A failed claim transaction plans NOTHING for the table
      *
@@ -3536,8 +3460,7 @@ class CompactionService(
      * into more groups than the run's remaining room still has groups
      * nobody holds; marking it would hide them from every sibling until
      * this run settled. Such a bucket is left unmarked and the sibling
-     * reaches its remaining files through the probe's live-claim filter
-     * (and, failing that, finds the held groups by overlap). A group
+     * finds its held groups the old way, by overlap. A group
      * claim insert that loses to a sibling's live row is not in `items`,
      * so its bucket is not marked either. A bucket that packed into NO
      * free group is not marked: there is no group whose settlement would
@@ -3584,7 +3507,13 @@ class CompactionService(
                 // No catch: a failed claim transaction plans nothing for
                 // this table (see the KDoc).
                 h.inTransaction<PlannedWork, Exception> {
-                    h.execute("SET LOCAL statement_timeout = '${cfg.planStatementTimeoutMs}ms'")
+                    // ITS OWN BOUND, not the probe's knob, and EQUAL to the
+                    // plan lock's wait (`Locks.acquireCatalogCompactionPlanLock`,
+                    // 15 s) on purpose: a sibling waiting on this lock is never
+                    // made to outlive the holder's bound, so a slow claim
+                    // transaction fails here before it fails every waiter. The
+                    // work is one re-read and a few inserts — milliseconds.
+                    h.execute("SET LOCAL statement_timeout = '${CLAIM_STATEMENT_TIMEOUT_MS}ms'")
                     insideClaims(h)
                     // THE RE-READ UNDER THE LOCK. Every sibling's claims
                     // committed before it released the lock, so this sees
@@ -5444,6 +5373,14 @@ class CompactionService(
     }
 
     internal companion object {
+        /**
+         * The claim transaction's `statement_timeout`, fixed and EQUAL to
+         * the plan lock's 15 s wait (`Locks.acquireCatalogCompactionPlanLock`):
+         * a waiter never outlives the holder's bound. Not
+         * [CompactionConfig.planStatementTimeoutMs], which bounds the probe.
+         */
+        const val CLAIM_STATEMENT_TIMEOUT_MS = 15_000L
+
         /**
          * The cap on how many of a table's sampled buckets one plan may
          * READ — see `CompactionService.sampledBuckets`. 50,000 is an

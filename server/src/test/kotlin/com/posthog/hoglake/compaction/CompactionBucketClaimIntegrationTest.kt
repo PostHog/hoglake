@@ -388,9 +388,7 @@ class CompactionBucketClaimIntegrationTest {
         // group: the sibling skips it (`bucketsSkippedClaimed` 1) and the
         // second group waits a whole sweep for nobody.
         assertThat(second.bucketsSkippedClaimed).isZero()
-        // The held group's files are excluded at the probe (#418) rather
-        // than found by overlap after it.
-        assertThat(second.claimedElsewhere).isZero()
+        assertThat(second.claimedElsewhere).isEqualTo(1)
         assertThat(second.groupsCompacted).isEqualTo(1)
         assertThat(first.groupsCompacted).isEqualTo(1)
         assertThat(liveByDay(cat)).isEqualTo(mapOf("2026-10-01" to 2))
@@ -450,13 +448,8 @@ class CompactionBucketClaimIntegrationTest {
         // the first run to settle.
         assertThat(first.candidatesTruncated).isEqualTo(1)
         assertThat(second.bucketsSkippedClaimed).isEqualTo(1)
-        // y's first group is held by the first run; its files are excluded
-        // at the sibling's probe (#418), so nothing is dropped after it.
-        assertThat(second.claimedElsewhere).isZero()
-        // With the first run's two claimed files excluded at the probe, the
-        // sibling's whole budget of 4 goes to y's four unread files: two
-        // groups (one, before #418, when the claimed pair still took room).
-        assertThat(second.groupsCompacted).describedAs("y's four unread files").isEqualTo(2)
+        assertThat(second.claimedElsewhere).describedAs("y's first group, held by the first run").isEqualTo(1)
+        assertThat(second.groupsCompacted).describedAs("y's next two files, past the first run's cut").isEqualTo(1)
         assertThat(first.groupsCompacted).isEqualTo(2)
     }
 
@@ -620,49 +613,6 @@ class CompactionBucketClaimIntegrationTest {
         }
     }
 
-    @Test
-    fun `a sibling reads past a held bucket's claimed files instead of colliding on them`() {
-        // ONE bucket of twelve files, fan-in 3: four groups. The first run
-        // has room for two, claims them, and (holding only half the
-        // bucket) does not mark it. The second planner probes the same
-        // bucket while those claims are live: the probe's live-claim filter
-        // (#418) excludes the six claimed files, so it packs the OTHER two
-        // groups — nothing dropped after the probe, no file in both runs.
-        val cat = fixture(days = listOf("2026-10-01"), filesPerDay = 12)
-        val narrow = cfg.copy(maxInputFiles = 3, maxFanIn = 3, minInputFiles = 2)
-        val (catalogId, tableId) = ids(cat)
-        val podA = CompactionService(db.jdbi, store, narrow, plannerIdentity = "maintenance-a")
-        val podB = CompactionService(db.jdbi, store, narrow, plannerIdentity = "maintenance-b")
-        val before = liveByDay(cat).getValue("2026-10-01")
-
-        fun claimedIds(): Set<Long> =
-            db.jdbi.withHandleUnchecked { h ->
-                h.createQuery(
-                    "SELECT unnest(input_file_ids) FROM hog_compaction_claim " +
-                        "WHERE catalog_id = :c AND table_id = :t AND expires_at > now()",
-                ).bind("c", catalogId).bind("t", tableId).mapTo(Long::class.java).set()
-            }
-        val (first, inWindow) =
-            whileHeld(podA, cat, narrow.copy(maxGroupsPerRun = 2)) {
-                assertThat(bucketClaims(cat)).describedAs("half the bucket held: no marker").isEmpty()
-                val aClaims = claimedIds()
-                val second = podB.runOnce(cat, narrow.copy(maxGroupsPerRun = 2))
-                Triple(aClaims, claimedIds(), second)
-            }
-        val (aClaims, allClaims, second) = inWindow
-        assertThat(aClaims).hasSize(6)
-        // MUTATION: drop the live-claim filter from `candidateSql` and the
-        // second planner packs the first run's two groups again, drops them
-        // after the probe (`claimedElsewhere` 2) and takes the other two.
-        assertThat(second.claimedElsewhere).describedAs("nothing collided").isZero()
-        assertThat(second.groupsCompacted).isEqualTo(2)
-        assertThat(first.groupsCompacted).isEqualTo(2)
-        assertThat(allClaims).describedAs("both runs' claims, disjoint, every file once").hasSize(12)
-        assertThat(liveByDay(cat).getValue("2026-10-01"))
-            .describedAs("twelve inputs became four outputs")
-            .isEqualTo(before - 12 + 4)
-    }
-
     /** Seconds until [key]'s claim row expires (negative once it has). */
     private fun leftSeconds(
         cat: String,
@@ -721,9 +671,9 @@ class CompactionBucketClaimIntegrationTest {
         // reaches that window.)
         assertThat(lapsed.bucketsSkippedClaimed).describedAs("the marker lapsed after its 2 s lease").isZero()
         assertThat(lapsed.bucketsConsidered).isEqualTo(2)
-        // The group claims are still live, so the probe excludes the held
-        // groups' files (#418): no duplicate rewrite, and nothing to drop.
-        assertThat(lapsed.claimedGroups).isZero()
+        // The group claim is still live, so the probe finds the held group
+        // by overlap: the pre-marker behaviour, not a duplicate rewrite.
+        assertThat(lapsed.claimedGroups).isEqualTo(2)
         assertThat(lapsed.groups).isEmpty()
     }
 
