@@ -298,6 +298,35 @@ internal object CompactionClaimRepo {
      * bucket that sibling is now planning. The answer is the GROUP row's
      * alone. The `EXISTS` reads the statement's snapshot, i.e. the group
      * row as it was before this UPDATE extended it.
+     *
+     * # The rows are locked in `group_key` order, first (the claim refresh deadlock)
+     *
+     * Two workers of ONE run refresh concurrently (`parallelGroups` > 1),
+     * and each renews its own group row plus EVERY outstanding bucket
+     * marker of the run's plan, so the markers are rows both statements
+     * update. A plain multi-row UPDATE takes its row locks in the order
+     * its scan meets the rows, and that order is not stable: every
+     * refresh rewrites the marker tuples, so the next statement meets
+     * them at new heap positions, and two statements can take the same
+     * two markers in opposite orders — A holds m1 and waits for m2, B
+     * holds m2 and waits for m1. gigahog-prod-us (1.4.2) logged 21
+     * `deadlock detected` in 17 minutes, every pair this UPDATE on both
+     * sides from two workers of one pod.
+     *
+     * So [REFRESH_SQL] locks its target rows in a subquery, `ORDER BY
+     * group_key FOR UPDATE` — the LockRows node takes them in that order,
+     * the same for every statement — and updates only the rows it locked,
+     * by `ctid`. ONE shared row would not have needed this (two statements
+     * contending for one row just queue on it; a cycle needs two rows
+     * taken in opposite orders); it is the several markers renewed together
+     * that do.
+     *
+     * One consequence, stated: if a sibling worker's refresh updated a
+     * marker between this statement's snapshot and its lock, the lock
+     * follows the row to its new version, whose `ctid` this statement's
+     * snapshot does not see, so this statement leaves that marker as the
+     * sibling just renewed it — the same run, the same lease. Harmless,
+     * and never the group row: only its own worker refreshes that.
      */
     fun refresh(
         h: Handle,
@@ -310,22 +339,7 @@ internal object CompactionClaimRepo {
         bucketTtlSeconds: Long = ttlSeconds,
     ): Boolean =
         groupKey in
-            h.createQuery(
-                """
-                UPDATE hog_compaction_claim
-                   SET expires_at = now() + make_interval(
-                           secs => CASE WHEN group_key = :groupKey THEN :ttlSeconds ELSE :bucketTtlSeconds END)
-                 WHERE catalog_id = :catalogId AND table_id = :tableId
-                   AND group_key = ANY(:keys) AND claimant = :claimant
-                   AND expires_at > now()
-                   AND (group_key = :groupKey
-                        OR EXISTS (SELECT 1 FROM hog_compaction_claim g
-                                    WHERE g.catalog_id = :catalogId AND g.table_id = :tableId
-                                      AND g.group_key = :groupKey AND g.claimant = :claimant
-                                      AND g.expires_at > now()))
-                RETURNING group_key
-                """,
-            )
+            h.createQuery(REFRESH_SQL)
                 .bind("catalogId", catalogId)
                 .bind("tableId", tableId)
                 .bind("groupKey", groupKey)
@@ -335,6 +349,32 @@ internal object CompactionClaimRepo {
                 .bind("bucketTtlSeconds", bucketTtlSeconds.toDouble())
                 .mapTo(String::class.java)
                 .list()
+
+    /**
+     * [refresh]'s statement — `internal` so the claims plan test EXPLAINs
+     * this text. The subquery takes the row locks in `group_key` order
+     * (see [refresh]); the outer UPDATE touches only the rows it locked,
+     * and the gate is the 1.4.2 one, unchanged.
+     */
+    internal const val REFRESH_SQL: String =
+        """
+        UPDATE hog_compaction_claim c
+           SET expires_at = now() + make_interval(
+                   secs => CASE WHEN c.group_key = :groupKey THEN :ttlSeconds ELSE :bucketTtlSeconds END)
+          FROM (SELECT ctid FROM hog_compaction_claim
+                 WHERE catalog_id = :catalogId AND table_id = :tableId
+                   AND group_key = ANY(:keys) AND claimant = :claimant
+                   AND expires_at > now()
+                 ORDER BY group_key
+                 FOR UPDATE) locked
+         WHERE c.ctid = locked.ctid
+           AND (c.group_key = :groupKey
+                OR EXISTS (SELECT 1 FROM hog_compaction_claim g
+                            WHERE g.catalog_id = :catalogId AND g.table_id = :tableId
+                              AND g.group_key = :groupKey AND g.claimant = :claimant
+                              AND g.expires_at > now()))
+        RETURNING c.group_key
+        """
 
     /**
      * Drop our own claim, whatever the group's outcome was.
