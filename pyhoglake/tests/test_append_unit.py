@@ -213,6 +213,74 @@ def test_append_reserved_hog_column_fast_fails(table, httpx_mock, fake_s3):
     assert fake_s3.files == {}
 
 
+def test_append_default_codec_is_still_snappy(table, httpx_mock, fake_s3):
+    _mock_refresh_and_commit(httpx_mock)
+    table.append(pa.table({"id": [1], "name": ["a"]}), read_snapshot=5)
+    (raw,) = fake_s3.files.values()
+    assert pq.read_metadata(io.BytesIO(raw)).row_group(0).column(0).compression == (
+        "SNAPPY"
+    )
+
+
+def _all_codecs(raw: bytes) -> set[str]:
+    metadata = pq.read_metadata(io.BytesIO(raw))
+    return {
+        metadata.row_group(r).column(c).compression
+        for r in range(metadata.num_row_groups)
+        for c in range(metadata.num_columns)
+    }
+
+
+def test_append_writes_the_requested_codec(table, httpx_mock, fake_s3):
+    _mock_refresh_and_commit(httpx_mock)
+    table.append(
+        pa.table({"id": [1], "name": ["a"]}),
+        read_snapshot=5,
+        compression="Zstd",
+        compression_level=3,
+    )
+    (raw,) = fake_s3.files.values()
+    assert _all_codecs(raw) == {"ZSTD"}
+
+
+def test_append_codec_survives_row_group_size(table, httpx_mock, fake_s3):
+    """`row_group_size` and the codec travel together: every row group of
+    a multi-row-group file is ZSTD, not just the call shape without it."""
+    _mock_refresh_and_commit(httpx_mock)
+    table.append(
+        pa.table({"id": list(range(10)), "name": [f"n{i}" for i in range(10)]}),
+        read_snapshot=5,
+        row_group_size=3,
+        compression="zstd",
+        compression_level=9,
+    )
+    (raw,) = fake_s3.files.values()
+    assert pq.read_metadata(io.BytesIO(raw)).num_row_groups == 4
+    assert _all_codecs(raw) == {"ZSTD"}
+
+
+@pytest.mark.parametrize(
+    ("compression", "level", "match"),
+    [
+        ("brotli", None, "not allowed"),
+        ("zstd", 10, r"outside \[1, 9\]"),
+        ("zstd", True, "must be an int"),
+    ],
+)
+def test_append_bad_compression_fast_fails(
+    table, httpx_mock, fake_s3, compression, level, match
+):
+    with pytest.raises(ValidationError, match=match):
+        table.append(
+            pa.table({"id": [1], "name": ["a"]}),
+            compression=compression,
+            compression_level=level,
+        )
+    # No request beyond the fixture's catalog + table resolves, no upload.
+    assert len(httpx_mock.get_requests()) == 2
+    assert not fake_s3.files
+
+
 def test_footer_size_wire_convention():
     """bugs.md #7 regression: ``footer_size`` is the serialized thrift
     FileMetaData length — the DB convention proven by the server's

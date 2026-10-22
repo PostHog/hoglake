@@ -870,6 +870,42 @@ def test_partitioned_compaction_groups_within_partition(catalog, ns):
         assert sum(f.record_count for f in group) == 24
 
 
+# Every codec `parquet_write_options` allows, twice, so one compaction
+# group has to decode all of them. Eight files, over the server's default
+# HOGLAKE_COMPACTION_MIN_INPUT_FILES=5.
+_ALLOWED_CODECS = [("zstd", 3), ("zstd", 9), ("snappy", None), ("none", None)] * 2
+
+
+def test_compaction_decodes_every_allowed_client_codec(catalog, ns):
+    """The client allow-list must be a subset of what the server's
+    compactor can decode: a file it cannot read fails its group on every
+    sweep and strands the files packed with it (brotli did exactly that).
+    Compaction replacing every input proves each codec was read."""
+    table = ns.create_table("codec_compact", _events_schema())
+    inputs: set[str] = set()
+    for index, (codec, level) in enumerate(_ALLOWED_CODECS):
+        result = table.append(
+            _events_data(10, start=index * 10),
+            compression=codec,
+            compression_level=level,
+        )
+        inputs |= {f.path for f in result.files}
+    assert len(inputs) == len(_ALLOWED_CODECS)
+
+    for _ in range(5):
+        result = catalog._client._request(
+            "POST", catalog._path("/maintenance/compact"), params={"batch": 10}
+        )
+        if result["groups_compacted"] == 0:
+            break
+
+    files = table.files(snapshot=catalog.refresh().head_snapshot_id)
+    # A background sweep may win the race with the manual trigger; the
+    # durable result is the same either way.
+    assert not inputs & {f.path for f in files}
+    assert sum(f.record_count for f in files) == 10 * len(_ALLOWED_CODECS)
+
+
 def test_drop_table(catalog, ns):
     table = ns.create_table("droppable", _events_schema())
     assert "droppable" in [t.name for t in ns.list_tables()]
