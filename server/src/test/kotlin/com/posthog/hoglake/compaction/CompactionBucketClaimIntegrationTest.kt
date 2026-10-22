@@ -485,9 +485,9 @@ class CompactionBucketClaimIntegrationTest {
         // the owner is held inside its only group's rewrite, so nothing
         // refreshes the claims after that group's pre-IO refresh — the
         // same state, from the claim table's point of view. TWO buckets:
-        // the held group's, renewed once by its pre-IO refresh, and one
-        // whose group is still QUEUED and never refreshed at all — its
-        // lease is the one the claim was taken with.
+        // the held group's and one whose group is still QUEUED. The held
+        // group's pre-IO refresh renewed both, once, to the short lease;
+        // nothing renews them after it.
         val cat = fixture(days = listOf("2026-10-01", "2026-10-02"))
         val short = cfg.copy(bucketClaimTtlSeconds = 2)
         val owner = CompactionService(db.jdbi, store, short, plannerIdentity = "maintenance-a")
@@ -500,10 +500,13 @@ class CompactionBucketClaimIntegrationTest {
             }
         val (held, lapsed) = plans
         assertThat(held.bucketsSkippedClaimed).isEqualTo(2)
-        // MUTATION: take the bucket claim with `cfg.claimTtlSeconds` in
-        // `withBucketClaims` (the hour-long group lease) and the queued
-        // bucket is still skipped here — hidden for an hour after its
-        // owner died.
+        // MUTATION: renew bucket claims on `cfg.claimTtlSeconds` in
+        // `refreshClaim` (the hour-long group lease) and both buckets are
+        // still skipped here — hidden for an hour after their owner died.
+        // (The lease the claim is TAKEN with is overwritten by the first
+        // group's refresh moments later, so it only matters for a pod
+        // killed between the claim transaction and that refresh; no test
+        // reaches that window.)
         assertThat(lapsed.bucketsSkippedClaimed).describedAs("the marker lapsed after its 2 s lease").isZero()
         assertThat(lapsed.bucketsConsidered).isEqualTo(2)
         // The group claim is still live, so the probe finds the held group
@@ -512,49 +515,69 @@ class CompactionBucketClaimIntegrationTest {
         assertThat(lapsed.groups).isEmpty()
     }
 
+    /** Seconds left on every bucket-claim row of [cat], expired ones included. */
+    private fun bucketClaimsLeft(cat: String): List<Double> =
+        db.jdbi.withHandleUnchecked { h ->
+            h.createQuery(
+                """
+                SELECT extract(epoch FROM cc.expires_at - now())::float8 FROM hog_compaction_claim cc
+                JOIN hog_catalog c ON c.catalog_id = cc.catalog_id
+                WHERE c.name = :n AND starts_with(cc.group_key, 'bucket:')
+                """,
+            ).bind("n", cat).mapTo(Double::class.java).list()
+        }
+
     @Test
-    fun `each group's pre-IO refresh renews its bucket claim on the short lease`() {
-        // One bucket, two groups (fan-in 2, four files), a 6 s bucket
-        // lease. The first group's rewrite is held 3.5 s, so the SECOND
-        // group's refresh runs ~3.5 s after the claim was taken; the
-        // marker is read ~7 s in, inside the second rewrite — past the
-        // unrenewed expiry (~6 s), inside the renewed one (~9.5 s).
-        val cat = fixture(days = listOf("2026-10-01"), filesPerDay = 4)
-        val two = cfg.copy(maxInputFiles = 2, maxFanIn = 2, bucketClaimTtlSeconds = 6)
-        val owner = CompactionService(db.jdbi, store, two, plannerIdentity = "maintenance-a")
+    fun `every group's pre-IO refresh renews all the plan's outstanding bucket claims, queued ones included`() {
+        // Three buckets of one group each and a 6 s bucket lease. The
+        // first group's rewrite is held 3.5 s, so the SECOND group's
+        // refresh runs ~3.5 s after the claims were taken; the claims are
+        // read ~7 s in, inside the second rewrite — past the unrenewed
+        // expiry (~6 s), inside the renewed one (~9.5 s). The first
+        // bucket's claim is gone (its only group settled); the second's
+        // is renewed by its own group's refresh; the THIRD's group is
+        // still queued, so only the second group's refresh renewing
+        // every outstanding claim of the plan keeps it.
+        val cat = fixture(days = listOf("2026-10-01", "2026-10-02", "2026-10-03"), filesPerDay = 2)
+        val short = cfg.copy(bucketClaimTtlSeconds = 6)
+        val owner = CompactionService(db.jdbi, store, short, plannerIdentity = "maintenance-a")
         val rewrites = AtomicInteger(0)
         val inSecond = CountDownLatch(1)
         val release = CountDownLatch(1)
         owner.beforeRewrite = {
-            if (rewrites.incrementAndGet() == 1) {
-                Thread.sleep(3_500)
-            } else {
-                inSecond.countDown()
-                check(release.await(60, TimeUnit.SECONDS))
+            when (rewrites.incrementAndGet()) {
+                1 -> Thread.sleep(3_500)
+                2 -> {
+                    inSecond.countDown()
+                    check(release.await(60, TimeUnit.SECONDS))
+                }
+                else -> {}
             }
         }
         val pool = Executors.newSingleThreadExecutor()
         try {
-            val run = pool.submit<CompactionResult> { owner.runOnce(cat, two) }
+            val run = pool.submit<CompactionResult> { owner.runOnce(cat, short) }
             assertThat(inSecond.await(60, TimeUnit.SECONDS)).isTrue()
             Thread.sleep(3_500)
-            // MUTATION: stop passing `item.bucketClaim?.key` to
-            // `refreshClaim` (or drop the key from the UPDATE's `ANY`)
-            // and the marker expired ~1 s ago: a live queue loses its
-            // bucket to siblings mid-sweep.
-            assertThat(leftSeconds(cat, bucketKey(cat, "2026-10-01")))
-                .describedAs("renewed by the second group's refresh")
-                .isGreaterThan(0.0)
-                .isLessThanOrEqualTo(6.0)
+            // MUTATION: renew only the group's own bucket (pass
+            // `listOfNotNull(item.bucketClaim?.key)` to `refreshClaim`) and
+            // the queued bucket's claim expired ~1 s ago, mid-sweep; pass
+            // no keys at all and both have.
+            val left = bucketClaimsLeft(cat)
+            assertThat(left).describedAs("the in-flight bucket's and the queued bucket's").hasSize(2)
+            assertThat(left)
+                .describedAs("all renewed by the second group's refresh: %s", left)
+                .allMatch { it > 0.0 && it <= 6.0 }
             // The in-flight group's claim is on the hour; the first,
             // committed, group's is on the committed lease.
             assertThat(groupClaimsLeft(cat).max()).isGreaterThan(3_000.0)
             release.countDown()
-            assertThat(run.get(120, TimeUnit.SECONDS).groupsCompacted).isEqualTo(2)
+            assertThat(run.get(120, TimeUnit.SECONDS).groupsCompacted).isEqualTo(3)
         } finally {
             release.countDown()
             pool.shutdownNow()
         }
+        assertThat(bucketClaims(cat)).isEmpty()
     }
 
     @Test
@@ -574,7 +597,7 @@ class CompactionBucketClaimIntegrationTest {
                     "g",
                     me,
                     3600,
-                    bucketKey = bucket,
+                    bucketKeys = listOf(bucket),
                     bucketTtlSeconds = 600,
                 ),
             ).isTrue()
@@ -596,7 +619,7 @@ class CompactionBucketClaimIntegrationTest {
                     "g",
                     me,
                     3600,
-                    bucketKey = bucket,
+                    bucketKeys = listOf(bucket),
                     bucketTtlSeconds = 600,
                 ),
             ).describedAs("the group's answer, unaffected by the bucket row").isTrue()
@@ -605,13 +628,15 @@ class CompactionBucketClaimIntegrationTest {
         // expired bucket claim comes back to life over a sibling's plan.
         assertThat(leftSeconds(cat, bucket)).isLessThan(0.0)
 
-        // A lost group claim is false even with a live bucket claim beside it.
+        // A LOST group claim — expired, then taken over by another run —
+        // answers false, and does not renew the live bucket claim beside
+        // it: a run that lost its lease is not working this queue.
         db.jdbi.useHandleUnchecked { h ->
             h.execute(
-                "UPDATE hog_compaction_claim SET expires_at = now() + interval '1 hour' WHERE group_key = ?",
+                "UPDATE hog_compaction_claim SET expires_at = now() + interval '60 seconds' WHERE group_key = ?",
                 bucket,
             )
-            h.execute("DELETE FROM hog_compaction_claim WHERE group_key = 'g'")
+            h.execute("UPDATE hog_compaction_claim SET expires_at = now() - interval '1 second' WHERE group_key = 'g'")
             assertThat(
                 CompactionClaimRepo.refresh(
                     h,
@@ -620,7 +645,28 @@ class CompactionBucketClaimIntegrationTest {
                     "g",
                     me,
                     3600,
-                    bucketKey = bucket,
+                    bucketKeys = listOf(bucket),
+                    bucketTtlSeconds = 600,
+                ),
+            ).describedAs("expired group row").isFalse()
+            assertThat(CompactionClaimRepo.acquire(h, catalogId, tableId, "g", listOf(1L), UUID.randomUUID(), 3600))
+                .describedAs("taken over by another run")
+                .isTrue()
+        }
+        // MUTATION: drop the `OR EXISTS (... g.group_key = :groupKey ...)`
+        // gate from the refresh and the bucket claim is renewed to 600 s
+        // by a run whose group lease is already gone.
+        assertThat(leftSeconds(cat, bucket)).describedAs("not renewed by the lost group").isLessThanOrEqualTo(60.0)
+        db.jdbi.useHandleUnchecked { h ->
+            assertThat(
+                CompactionClaimRepo.refresh(
+                    h,
+                    catalogId,
+                    tableId,
+                    "g",
+                    me,
+                    3600,
+                    bucketKeys = listOf(bucket),
                     bucketTtlSeconds = 600,
                 ),
             ).isFalse()

@@ -305,12 +305,17 @@ data class CompactionConfig(
      * them, where new small files land — out of compaction fleet-wide.
      *
      * So the claim takes this shorter lease and is RENEWED by the
-     * per-group refresh that already runs before each of its groups'
-     * IO (`CompactionClaimRepo.refresh`, one UPDATE over both keys): a
-     * live queue keeps it, a dead one loses it within this many
-     * seconds. 600 s, [committedClaimTtlSeconds]' figure, covers the
-     * ~544 s 64-group sweep that a bucket whose groups sit at the back of
-     * the queue may wait before its first refresh.
+     * per-group refresh that already runs before every group's IO
+     * (`CompactionClaimRepo.refresh`, one UPDATE): each refresh renews
+     * EVERY still-outstanding bucket claim of the run's current plan,
+     * not only the group's own, so a bucket whose groups sit at the back
+     * of the queue stays claimed as long as the queue ahead of it makes
+     * progress. The lease therefore has to cover the longest gap between
+     * two consecutive group starts — one group's rewrite — not the
+     * whole queue: a live
+     * queue keeps its claims, a dead one loses them within this many
+     * seconds. 600 s ([committedClaimTtlSeconds]' figure) is ~70 times
+     * the measured ~8.5 s a group.
      *
      * Too short costs nothing but the old behaviour: an expired bucket
      * claim lets a sibling probe the bucket, and its held groups are
@@ -3322,6 +3327,13 @@ class CompactionService(
         val claimant: UUID? = null,
         val started: java.util.concurrent.atomic.AtomicBoolean = java.util.concurrent.atomic.AtomicBoolean(false),
         val bucketClaim: BucketClaim? = null,
+        /**
+         * Every bucket claim the same plan took — this item's own among
+         * them — so each group's pre-IO refresh can renew all of them
+         * that are still outstanding ([refreshClaim]). Bounded by the
+         * plan's queue, so at most `maxGroupsPerRun` keys.
+         */
+        val planBuckets: List<BucketClaim> = emptyList(),
     )
 
     private data class PlannedWork(val plan: CompactionPlan, val items: List<WorkItem>)
@@ -3359,12 +3371,14 @@ class CompactionService(
      * whose files may have grown into a group.
      *
      * The marker's lease is the SHORT [CompactionConfig.bucketClaimTtlSeconds],
-     * renewed by each of its groups' pre-IO refresh ([refreshClaim]), so
-     * a pod killed mid-sweep — `BackgroundLoops.close` abandons the
-     * sweep after 5 s, and no release runs — hides the bucket for that
-     * lease and not for the hour-long group lease. A marker that expires
-     * under a long queue costs a sibling one probe and the overlap skip,
-     * never a duplicate rewrite. A lost marker insert (a sibling holds a
+     * renewed by EVERY group's pre-IO refresh ([refreshClaim]) — each
+     * renews all of the plan's still-outstanding markers, so a bucket at
+     * the back of the queue is covered while the groups ahead of it run.
+     * A pod killed mid-sweep — `BackgroundLoops.close` abandons the sweep
+     * after 5 s, and no release runs — therefore hides its buckets for
+     * one short lease and not for the hour-long group lease. A marker
+     * that still expires (one group's rewrite outlasting the lease) costs
+     * a sibling one probe and the overlap skip, never a duplicate rewrite. A lost marker insert (a sibling holds a
      * live one — only a plan without the lock could get there) is simply
      * not tracked.
      */
@@ -3463,7 +3477,10 @@ class CompactionService(
             }
         }
         if (claims.isEmpty()) return items
-        return items.map { item -> claims[bucketOf(item.group)]?.let { item.copy(bucketClaim = it) } ?: item }
+        val all = claims.values.toList()
+        return items.map { item ->
+            item.copy(bucketClaim = claims[bucketOf(item.group)], planBuckets = all)
+        }
     }
 
     /**
@@ -3918,7 +3935,8 @@ class CompactionService(
         if (!item.started.compareAndSet(false, true)) return GroupTally.NOT_ATTEMPTED
         // Refresh the reservation before file I/O. A lost lease spends no I/O.
         val claimKey = item.claimant?.let { CompactionClaimRepo.groupKey(group) }
-        if (claimKey != null && !refreshClaim(ctx, claimKey, item.bucketClaim?.key, item.claimant, cfg)) {
+        val liveBuckets = item.planBuckets.filter { it.outstanding.get() > 0 }.map { it.key }
+        if (claimKey != null && !refreshClaim(ctx, claimKey, liveBuckets, item.claimant, cfg)) {
             log.debug {
                 "compaction group of ${group.files.size} files for " +
                     "$catalog/${ctx.namespace}.${ctx.table} is claimed by another maintainer; " +
@@ -4245,17 +4263,18 @@ class CompactionService(
     /**
      * A broken claim table still permits work; a lost claim does not.
      *
-     * Renews the group's bucket claim ([bucketKey]) in the same
-     * statement, on its own short lease — see
+     * Renews the plan's still-outstanding bucket claims ([bucketKeys])
+     * in the same statement, on their own short lease — see
      * [CompactionConfig.bucketClaimTtlSeconds] for why a bucket claim
-     * must lapse quickly once nothing is working its queue. Only the
+     * must lapse quickly once nothing is working its queue, and why
+     * every group renews all of them rather than only its own. Only the
      * GROUP claim's survival decides the answer: a lapsed bucket claim
      * costs a sibling a probe, never this group its run.
      */
     private fun refreshClaim(
         ctx: TableContext,
         claimKey: String,
-        bucketKey: String?,
+        bucketKeys: List<String>,
         claimant: UUID,
         cfg: CompactionConfig,
     ): Boolean =
@@ -4268,7 +4287,7 @@ class CompactionService(
                     claimKey,
                     claimant,
                     cfg.claimTtlSeconds,
-                    bucketKey = bucketKey,
+                    bucketKeys = bucketKeys,
                     bucketTtlSeconds = cfg.bucketClaimTtlSeconds,
                 )
             }

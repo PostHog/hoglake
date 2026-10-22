@@ -278,14 +278,20 @@ internal object CompactionClaimRepo {
     /**
      * Refresh only a live claim that this run owns. An expired or replaced claim must stop execution.
      *
-     * With [bucketKey], the group's BUCKET claim is renewed in the same
-     * statement on its own [bucketTtlSeconds] lease — the renewal that
-     * keeps a short-leased bucket claim alive exactly as long as its
-     * queue is being worked (`CompactionConfig.bucketClaimTtlSeconds`).
-     * Same fences for both rows: ours, and still live. An expired bucket
-     * claim is NOT revived, because a sibling may already have read the
-     * bucket as free; reviving it would hide a bucket that sibling is now
-     * planning. The answer is the GROUP row's alone.
+     * With [bucketKeys] — the run's still-outstanding BUCKET claims on
+     * this table — those rows are renewed in the same statement on their
+     * own [bucketTtlSeconds] lease: the renewal that keeps short-leased
+     * bucket claims alive exactly as long as the run's queue is being
+     * worked (`CompactionConfig.bucketClaimTtlSeconds`). Every row is
+     * fenced on ours-and-still-live, and a bucket row additionally on
+     * the GROUP row being ours and live: a run whose group lease was lost
+     * (expired, or taken over) is not making progress on this queue, and
+     * must not keep its buckets hidden while it finds that out. An
+     * expired bucket claim is NOT revived either, because a sibling may
+     * already have read the bucket as free; reviving it would hide a
+     * bucket that sibling is now planning. The answer is the GROUP row's
+     * alone. The `EXISTS` reads the statement's snapshot, i.e. the group
+     * row as it was before this UPDATE extended it.
      */
     fun refresh(
         h: Handle,
@@ -294,7 +300,7 @@ internal object CompactionClaimRepo {
         groupKey: String,
         claimant: UUID,
         ttlSeconds: Long,
-        bucketKey: String? = null,
+        bucketKeys: Collection<String> = emptyList(),
         bucketTtlSeconds: Long = ttlSeconds,
     ): Boolean =
         groupKey in
@@ -306,13 +312,18 @@ internal object CompactionClaimRepo {
                  WHERE catalog_id = :catalogId AND table_id = :tableId
                    AND group_key = ANY(:keys) AND claimant = :claimant
                    AND expires_at > now()
+                   AND (group_key = :groupKey
+                        OR EXISTS (SELECT 1 FROM hog_compaction_claim g
+                                    WHERE g.catalog_id = :catalogId AND g.table_id = :tableId
+                                      AND g.group_key = :groupKey AND g.claimant = :claimant
+                                      AND g.expires_at > now()))
                 RETURNING group_key
                 """,
             )
                 .bind("catalogId", catalogId)
                 .bind("tableId", tableId)
                 .bind("groupKey", groupKey)
-                .bindArray("keys", String::class.java, listOfNotNull(groupKey, bucketKey))
+                .bindArray("keys", String::class.java, (listOf(groupKey) + bucketKeys).distinct())
                 .bind("claimant", claimant)
                 .bind("ttlSeconds", ttlSeconds.toDouble())
                 .bind("bucketTtlSeconds", bucketTtlSeconds.toDouble())
