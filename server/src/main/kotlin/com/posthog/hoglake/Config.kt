@@ -974,6 +974,18 @@ data class Config(
             "${com.posthog.hoglake.compaction.CompactionConfig.DEFAULT_BUCKET_CLAIM_TTL_SECONDS}",
         ).toLong(),
     /**
+     * The statement bound of a compaction plan's read (probe) transaction
+     * (default 60,000 ms, the session's; at least 1,000) — see
+     * `CompactionConfig.planStatementTimeoutMs` for why it is no longer
+     * 15 s. The claim transaction keeps a fixed 15 s, equal to the plan
+     * lock's wait (`CompactionService.CLAIM_STATEMENT_TIMEOUT_MS`).
+     */
+    val compactionPlanStatementTimeoutMs: Long =
+        env(
+            "HOGLAKE_COMPACTION_PLAN_STATEMENT_TIMEOUT_MS",
+            "${com.posthog.hoglake.compaction.CompactionConfig.DEFAULT_PLAN_STATEMENT_TIMEOUT_MS}",
+        ).toLong(),
+    /**
      * Sorted-path CHUNK derate for NESTED tables: the rows per spill
      * chunk of a table with both nested columns and a live sort order is
      * divided by this. A chunk is materialized to be sorted, and a nested

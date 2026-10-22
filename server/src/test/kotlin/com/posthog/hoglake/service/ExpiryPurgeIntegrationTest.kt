@@ -869,6 +869,85 @@ class ExpiryPurgeIntegrationTest {
     }
 
     @Test
+    fun `the purge accounts for every foreign key that cascades from hog_data_file`() {
+        // The page relies on ON DELETE CASCADE for two children and
+        // deletes the third (`hog_delete_file`) itself, because a cascaded
+        // vector queues nothing. A FOURTH cascading child would be taken
+        // silently by every page — and if it named an object, leaked —
+        // so the set is pinned BY NAME against pg_constraint, the way
+        // CatalogDropApiIntegrationTest pins the catalog's.
+        val cascades =
+            jdbi.withHandleUnchecked { h ->
+                // `conenforced` exists from PG 18; before it every FK is
+                // enforced, and the suite is rehearsed on older images
+                // (`-PpgImage=postgres:16`).
+                val pg18 =
+                    h.createQuery("SELECT current_setting('server_version_num')::int >= 180000")
+                        .mapTo(Boolean::class.java).one()
+                val enforced =
+                    if (pg18) "CASE WHEN conenforced THEN 'enforced' ELSE 'not-enforced' END" else "'enforced'"
+                h.createQuery(
+                    """
+                    SELECT conrelid::regclass::text || ':' || confdeltype::text || ':' || $enforced
+                    FROM pg_constraint
+                    WHERE contype = 'f' AND confrelid = 'hog_data_file'::regclass
+                    """,
+                ).mapTo(String::class.java).list().toSet()
+            }
+        assertThat(cascades)
+            .describedAs(
+                "every FK into hog_data_file, its ON DELETE action ('c' = CASCADE) and enforcement; " +
+                    "a new or unenforced one needs DATA_FILE_EXPIRY_SQL (and RetirementService) to say " +
+                    "whether it queues an object",
+            )
+            .isEqualTo(
+                setOf(
+                    "hog_delete_file:c:enforced",
+                    "hog_file_column_stats:c:enforced",
+                    "hog_file_partition_value:c:enforced",
+                ),
+            )
+    }
+
+    @Test
+    fun `a page removes exactly its files' stats and partition values and no live file's`() {
+        // The cascade is keyed by (catalog_id, data_file_id), and so is
+        // anything that ever replaces it (#419 measured an explicit
+        // per-page delete and kept the cascade; ExpiryPurgeCostMeasurement
+        // has the figures). Either way the property is the same: the
+        // doomed files' dependents go, and a LIVE file in the SAME catalog
+        // keeps every stats row and partition value it had.
+        val catalogId = seed("purge-dependents", endedBelowFloor = 30, live = 10, stats = true)
+        val other = seed("purge-dependents-other", endedBelowFloor = 0, live = 5, stats = true)
+        val liveIds =
+            jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    "SELECT data_file_id FROM hog_data_file WHERE catalog_id = :c AND end_snapshot IS NULL",
+                ).bind("c", catalogId).mapTo(Long::class.java).list().toSet()
+            }
+        assertThat(liveIds).hasSize(10)
+        val result = ExpiryService(jdbi).runOnce("purge-dependents", batchSize = 100)
+        assertThat(result.dataFilesPurged).isEqualTo(30)
+
+        fun idsIn(table: String): Map<Long, Long> =
+            jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    "SELECT data_file_id, count(*) FROM $table WHERE catalog_id = :c GROUP BY data_file_id",
+                ).bind("c", catalogId).map { rs, _ -> rs.getLong(1) to rs.getLong(2) }.list().toMap()
+            }
+        assertThat(idsIn("hog_file_column_stats"))
+            .describedAs("each live file keeps all 26 stats rows; no doomed file keeps any")
+            .isEqualTo(liveIds.associateWith { 26L })
+        assertThat(idsIn("hog_file_partition_value"))
+            .describedAs("each live file keeps its partition value; no doomed file keeps one")
+            .isEqualTo(liveIds.associateWith { 1L })
+        assertThat(
+            count("SELECT count(*) FROM hog_file_column_stats WHERE catalog_id = :c", other) +
+                count("SELECT count(*) FROM hog_file_partition_value WHERE catalog_id = :c", other),
+        ).describedAs("another catalog's dependents are untouched").isEqualTo(5L * 27)
+    }
+
+    @Test
     fun `the walk continues on a page that purged fewer rows than it examined`() {
         // EXAMINED, NOT PURGED, is what ends the walk, and the
         // difference is a correctness one rather than a throughput one.

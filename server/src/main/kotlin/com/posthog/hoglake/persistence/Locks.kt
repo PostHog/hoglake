@@ -35,7 +35,12 @@ object Locks {
      */
     const val CATALOG_RETIREMENT_LOCK_CLASS: Int = 4740872
 
-    /** Separate from commit and retirement locks. Held only while planning and claiming work. */
+    /**
+     * Separate from commit and retirement locks. Held only across a
+     * compaction plan's CLAIM transaction (the in-lock claim re-read and
+     * the claim inserts), never across its probes or packing — #418,
+     * `CompactionService.planAndClaim` has why.
+     */
     const val CATALOG_COMPACTION_PLAN_LOCK_CLASS: Int = 4740873
 
     /**
@@ -49,8 +54,14 @@ object Locks {
 
     /**
      * Take the session lock inside a short transaction with a bounded wait.
-     * The caller must release it on this handle after all plan claims commit.
-     * A session lock permits packing outside a transaction.
+     * The caller must release it on this handle after its claim transaction
+     * commits or rolls back. Session-scoped so it can be taken in its own
+     * transaction ahead of the claim transaction, so a timed-out wait fails
+     * the plan before any claim work and is never released by a caller that
+     * did not get it. The wait is bounded by the 15 s `lock_timeout` set
+     * here, and it queues only behind siblings' claim transactions, which
+     * run under `CompactionService.CLAIM_STATEMENT_TIMEOUT_MS` — the same
+     * 15 s, deliberately: a waiter never outlives the holder's bound.
      */
     fun acquireCatalogCompactionPlanLock(
         handle: Handle,
