@@ -222,6 +222,10 @@ export function isQuietRun(run: MaintenanceRun): boolean {
         // signal that says the claims are working, so hiding it would
         // hide the feature from the only screen that shows a sweep.
         r.claimed_elsewhere,
+        // Its pre-probe half, for the same reason: a sweep that skipped
+        // every bucket because sibling pods hold them is the fleet
+        // dividing the catalog, not an idle loop.
+        r.buckets_skipped_claimed,
         r.spill_cleanup_failures,
         // A retirement commits a snapshot and ends files without a single
         // groups_compacted or files_in: hiding it would hide the commit.
@@ -472,6 +476,12 @@ export function RunSummary({ run }: { run: MaintenanceRun }) {
               not appended: {formatCount(r.files_unranged ?? "0")} file(s) with no usable sort-key range
             </span>
           )}
+          {(positive(r.buckets_skipped_claimed) || positive(r.claimed_elsewhere)) && (
+            <span className="subtle mono" title={CLAIMED_TITLE}>
+              held by other runs: {formatCount(r.buckets_skipped_claimed ?? "0")} bucket(s) skipped before
+              probing, {formatCount(r.claimed_elsewhere ?? "0")} group(s) dropped after
+            </span>
+          )}
         </>
       );
     }
@@ -654,6 +664,14 @@ const APPENDED_TITLE =
   "sorted table only when an input's sort-key range does not overlap " +
   "any other input's, so its rows stay one sorted block. Several times " +
   "cheaper than rewriting the same bytes.";
+
+const CLAIMED_TITLE =
+  "Work another compaction run (usually another maintenance pod) had " +
+  "already claimed. Buckets skipped before probing cost this run nothing: " +
+  "the other run had claimed every group in them, so their files were not " +
+  "read. Groups dropped after probing were found only after this run had " +
+  "read the bucket's files. Pods that divide a catalog between them show " +
+  "the first number and keep the second near zero.";
 
 const RETIRED_TITLE =
   "Groups in which every row of every file had already been deleted. " +

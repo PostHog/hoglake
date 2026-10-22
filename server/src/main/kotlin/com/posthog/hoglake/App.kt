@@ -163,6 +163,10 @@ class App private constructor(
             maxWholeObjectBytes = cfg.hydratorMaxWholeObjectBytes,
             claimTimeoutMs = cfg.hydratorClaimTimeoutMs,
         )
+
+    /** This pod's name, for the compaction planner's cursor spread and loop jitter. */
+    private val plannerIdentity = CompactionService.defaultPlannerIdentity()
+
     private val compactionService =
         CompactionService(
             jdbi,
@@ -181,6 +185,7 @@ class App private constructor(
                 claimsEnabled = cfg.compactionClaimsEnabled,
                 claimTtlSeconds = cfg.compactionClaimTtlSeconds,
                 committedClaimTtlSeconds = cfg.compactionCommittedClaimTtlSeconds,
+                bucketClaimTtlSeconds = cfg.compactionBucketClaimTtlSeconds,
                 commitLockTimeoutMs = cfg.commitLockTimeoutMs,
                 nestedSortExpansion = cfg.compactionNestedSortExpansion,
                 sortedHeapBytes = cfg.compactionSortedHeapBytes,
@@ -190,6 +195,10 @@ class App private constructor(
                 maxNodesPerRow = cfg.compactionMaxNodesPerRow,
                 codec = ParquetRewriter.OutputCodec.parse(cfg.compactionCodec, cfg.compactionZstdLevel),
             ),
+            // The pod's identity spreads N pods' bucket cursors (and seeds
+            // the compaction loop's jitter below). Passed HERE because the
+            // constructor's default is no seeding, for the tests' sake.
+            plannerIdentity = plannerIdentity,
         )
 
     /** The run ledger's read side: status + history routes (webui maintenance page). */
@@ -395,7 +404,18 @@ class App private constructor(
             cleanupService.runOnceAllCatalogs(cfg.cleanupBatchSize)
         }
         // Default interval 0 = off for now; the manual trigger stays live.
-        loops.register("compaction", cfg.compactionIntervalMs) {
+        // The ONE jittered loop: N maintenance pods whose sweeps end
+        // together must not re-plan together (BackgroundLoops.Jitter has
+        // the 2026-10-21 incident). Seeded by the same pod identity that
+        // spreads the planners' bucket cursors.
+        loops.register(
+            "compaction",
+            cfg.compactionIntervalMs,
+            BackgroundLoops.Jitter(
+                BackgroundLoops.COMPACTION_JITTER_FRACTION,
+                CompactionService.identitySeed(plannerIdentity),
+            ),
+        ) {
             compactionService.runOnceAllCatalogs()
         }
         // Default 0 = off, like compaction, and for a sharper reason: a retirement batch TAKES THE PER-CATALOG

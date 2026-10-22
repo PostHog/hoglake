@@ -758,6 +758,9 @@ data class Config(
      * Compaction sweep interval; default 0 = OFF for now (the manual
      * /maintenance/compact trigger still works). Rate-awareness is by
      * construction: tiny bites (see the batch knobs), never a storm.
+     * The loop sleeps this x (1 ± 0.25), drawn from a generator seeded
+     * per pod, so N pods' sweeps do not re-plan in lockstep; the mean
+     * interval is unchanged (`BackgroundLoops.Jitter`).
      */
     val compactionIntervalMs: Long = env("HOGLAKE_COMPACTION_INTERVAL_MS", "0").toLong(),
     /** The size a compaction group packs to, in one rewrite. */
@@ -957,6 +960,18 @@ data class Config(
         env(
             "HOGLAKE_COMPACTION_COMMITTED_CLAIM_TTL_SECONDS",
             "${com.posthog.hoglake.compaction.CompactionConfig.DEFAULT_COMMITTED_CLAIM_TTL_SECONDS}",
+        ).toLong(),
+    /**
+     * How long a compaction BUCKET claim lives between the per-group
+     * refreshes that renew it (default 600 s). Short against the hour of
+     * HOGLAKE_COMPACTION_CLAIM_TTL_SECONDS because a bucket claim hides a
+     * whole bucket from sibling planners and a pod killed mid-sweep
+     * releases nothing — see `CompactionConfig.bucketClaimTtlSeconds`.
+     */
+    val compactionBucketClaimTtlSeconds: Long =
+        env(
+            "HOGLAKE_COMPACTION_BUCKET_CLAIM_TTL_SECONDS",
+            "${com.posthog.hoglake.compaction.CompactionConfig.DEFAULT_BUCKET_CLAIM_TTL_SECONDS}",
         ).toLong(),
     /**
      * Sorted-path CHUNK derate for NESTED tables: the rows per spill

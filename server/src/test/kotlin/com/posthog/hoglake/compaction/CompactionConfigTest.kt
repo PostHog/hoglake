@@ -1076,4 +1076,24 @@ class CompactionConfigTest {
         }.isInstanceOf(IllegalArgumentException::class.java)
             .hasMessageContaining("HOGLAKE_COMPACTION_COMMITTED_CLAIM_TTL_SECONDS")
     }
+
+    @Test
+    fun `a bucket claim is on a SHORT lease that still covers a sweep's queue`() {
+        val cfg = Config()
+        assertThat(cfg.compactionBucketClaimTtlSeconds)
+            .isEqualTo(CompactionConfig.DEFAULT_BUCKET_CLAIM_TTL_SECONDS)
+        // Short: a leaked bucket claim (a pod killed mid-sweep releases
+        // nothing) hides a whole bucket, so it must lapse in minutes, not
+        // the group lease's hour.
+        assertThat(cfg.compactionBucketClaimTtlSeconds)
+            .isLessThan(cfg.compactionClaimTtlSeconds)
+            .isLessThanOrEqualTo(600)
+        // But not shorter than the wait a bucket at the back of a 64-group
+        // queue has before its first group's refresh renews it.
+        assertThat(cfg.compactionBucketClaimTtlSeconds).isGreaterThanOrEqualTo((64 * 8.5).toLong())
+        assertThatThrownBy {
+            CompactionConfig(targetBytes = 1024, maxGroupsPerRun = 1, bucketClaimTtlSeconds = 0)
+        }.isInstanceOf(IllegalArgumentException::class.java)
+            .hasMessageContaining("HOGLAKE_COMPACTION_BUCKET_CLAIM_TTL_SECONDS")
+    }
 }

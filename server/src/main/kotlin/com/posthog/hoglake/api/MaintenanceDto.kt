@@ -237,6 +237,11 @@ data class CompactionResultDto(
      * that cost an append. See CompactionResult.filesUnranged.
      */
     val filesUnranged: Long,
+    /**
+     * Buckets the planners skipped unprobed under another run's live
+     * bucket claim. See CompactionResult.bucketsSkippedClaimed.
+     */
+    val bucketsSkippedClaimed: Long,
 )
 
 fun CompactionResult.toDto() =
@@ -272,6 +277,7 @@ fun CompactionResult.toDto() =
         bytesAppended = bytesAppended,
         groupsRetired = groupsRetired,
         filesUnranged = filesUnranged,
+        bucketsSkippedClaimed = bucketsSkippedClaimed,
     )
 
 data class RehydrateResultDto(
@@ -381,6 +387,7 @@ private val COMPACTION_COUNTERS_ADDED_LATER =
         "bytes_appended",
         "groups_retired",
         "files_unranged",
+        "buckets_skipped_claimed",
     )
 
 /**

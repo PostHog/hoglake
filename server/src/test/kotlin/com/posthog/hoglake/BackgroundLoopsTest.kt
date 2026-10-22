@@ -85,4 +85,87 @@ class BackgroundLoopsTest {
             Metrics.clear()
         }
     }
+
+    @Test
+    fun `a jittered delay stays inside interval x (1 +- fraction) and averages the interval`() {
+        val interval = 30_000L
+        val f = BackgroundLoops.COMPACTION_JITTER_FRACTION
+        // The two ends of the draw, exactly.
+        assertThat(BackgroundLoops.jitteredDelayMs(interval, f, 0.0)).isEqualTo(22_500L)
+        assertThat(BackgroundLoops.jitteredDelayMs(interval, f, 0.5)).isEqualTo(interval)
+        assertThat(BackgroundLoops.jitteredDelayMs(interval, f, Math.nextDown(1.0))).isEqualTo(37_500L)
+
+        val random = java.util.Random(CompactionSeed.of("gigahog-maintenance-compaction-7d9f8-x2k4q"))
+        val draws = (0 until 10_000).map { BackgroundLoops.jitteredDelayMs(interval, f, random.nextDouble()) }
+        assertThat(draws).allMatch { it in 22_500L..37_500L }
+        // MUTATION: drop the `2u - 1` centring (scale by `1 + f x u`) and
+        // the mean moves to 1.125 x interval — the loop silently slows —
+        // and nothing lands below the interval.
+        assertThat(draws.average()).isBetween(interval * 0.99, interval * 1.01)
+        assertThat(draws.count { it < interval }).isGreaterThan(4_000)
+        assertThat(draws.count { it > interval }).isGreaterThan(4_000)
+        // Spread, not a constant: a herd disperses only if pods draw
+        // different delays.
+        assertThat(draws.toSet().size).isGreaterThan(1_000)
+    }
+
+    @Test
+    fun `a zero fraction is exact, a tiny interval never sleeps zero, and a fraction of 1 or more is refused`() {
+        assertThat(BackgroundLoops.jitteredDelayMs(30_000, 0.0, 0.0)).isEqualTo(30_000L)
+        assertThat(BackgroundLoops.jitteredDelayMs(30_000, 0.0, 0.999)).isEqualTo(30_000L)
+        assertThat(BackgroundLoops.jitteredDelayMs(1, 0.9, 0.0)).isEqualTo(1L)
+        org.assertj.core.api.Assertions.assertThatThrownBy { BackgroundLoops.Jitter(1.0, 0) }
+            .isInstanceOf(IllegalArgumentException::class.java)
+        org.assertj.core.api.Assertions.assertThatThrownBy { BackgroundLoops.Jitter(-0.1, 0) }
+            .isInstanceOf(IllegalArgumentException::class.java)
+    }
+
+    @Test
+    fun `two pods' jitter sequences differ, and one pod's is reproducible`() {
+        fun sequence(pod: String): List<Long> {
+            val random = java.util.Random(CompactionSeed.of(pod))
+            return (0 until 8).map { BackgroundLoops.jitteredDelayMs(30_000, 0.25, random.nextDouble()) }
+        }
+        val a = sequence("gigahog-maintenance-compaction-7d9f8-x2k4q")
+        val b = sequence("gigahog-maintenance-compaction-7d9f8-x2k4r")
+        assertThat(sequence("gigahog-maintenance-compaction-7d9f8-x2k4q")).isEqualTo(a)
+        // Two pods whose sweeps end in the same millisecond re-plan in
+        // the same millisecond only if their first draws agree.
+        assertThat(a.first()).isNotEqualTo(b.first())
+        assertThat(a).isNotEqualTo(b)
+    }
+
+    @Test
+    fun `an unjittered loop sleeps exactly its interval, a jittered one draws around it`() {
+        // The KDoc's "only compaction is jittered" rests on this: the
+        // sampler's tick cadence and expiry's interval are sized
+        // arithmetic, and a register() that jittered by default would
+        // move them silently.
+        val delays = java.util.concurrent.ConcurrentHashMap<String, MutableList<Long>>()
+        BackgroundLoops().use { loops ->
+            loops.onDelay = {
+                    name,
+                    ms,
+                ->
+                delays.computeIfAbsent(name) { java.util.Collections.synchronizedList(mutableListOf()) }.add(ms)
+            }
+            loops.register("jittered", 40, BackgroundLoops.Jitter(0.25, 7)) { }
+            loops.register("exact", 40) { }
+            await().atMost(Duration.ofSeconds(10)).untilAsserted {
+                assertThat(delays["jittered"].orEmpty().size).isGreaterThanOrEqualTo(8)
+                assertThat(delays["exact"].orEmpty().size).isGreaterThanOrEqualTo(8)
+            }
+        }
+        // MUTATION: default `register`'s `jitter` to a Jitter (jitter
+        // every loop) and the exact loop's delays stop being 40.
+        assertThat(delays.getValue("exact").toList()).containsOnly(40L)
+        val jittered = delays.getValue("jittered").toList()
+        assertThat(jittered).allMatch { it in 30L..50L }
+        assertThat(jittered.toSet().size).describedAs("drawn, not constant: %s", jittered).isGreaterThan(1)
+    }
+
+    /** The production seed derivation, so these tests draw what a pod draws. */
+    private object CompactionSeed {
+        fun of(pod: String): Long = com.posthog.hoglake.compaction.CompactionService.identitySeed(pod)
+    }
 }

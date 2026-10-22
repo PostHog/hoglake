@@ -4934,10 +4934,13 @@ components:
             sibling replica is rewriting those files right now, and
             everything this sweep would have spent on them would have
             been discarded at its own commit. Read a steady nonzero
-            count as the feature working — a standing ZERO on a fleet
-            with two or more maintenance replicas means either
+            count as the feature working — and so, since bucket claims,
+            is a standing ZERO alongside a nonzero
+            buckets_skipped_claimed: the replicas found each other's
+            claims before probing rather than after. Both zero on a
+            fleet with two or more maintenance replicas means either
             HOGLAKE_COMPACTION_CLAIMS_ENABLED is off or the replicas
-            are not in fact planning the same groups.
+            are not in fact planning the same buckets.
 
             It spends no object-store IO, so it does NOT consume
             HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN — the same treatment
@@ -5197,6 +5200,28 @@ components:
             appended without them. Nothing is known to be disjoint from
             an unranged run, so the group merges instead. Slower, never
             wrong. Optional.
+        buckets_skipped_claimed:
+          type: integer
+          format: int64
+          description: >
+            Partition buckets the sweep's planners skipped WITHOUT
+            PROBING them, because another run holds a live bucket claim
+            on them: it planned the bucket and claimed every group the
+            bucket packed into (a `bucket:` row in hog_compaction_claim,
+            released when the last of those groups settles). A plan
+            measure, not counted in buckets_considered.
+
+            The pre-probe half of claimed_elsewhere: that one is counted
+            after a probe has read the bucket's candidate rows, this one
+            instead of the probe. Maintenance pods sharing a catalog
+            that divide its buckets between them show a nonzero count
+            here and claimed_elsewhere near zero; a fleet whose planners
+            re-read each other's buckets shows the opposite. Zero on a
+            single maintenance pod and on the whole-table fallback.
+
+            OPTIONAL, for claimed_elsewhere's reason: the ledger holds
+            rows written before it existed, and the read path fills 0
+            for them.
     RetirementResult:
       type: object
       required: [tables, rows_retired, dvs_retired, paths_queued, batches,
