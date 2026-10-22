@@ -299,6 +299,21 @@ describe("maintenance outcome and history", () => {
     expect(screen.getByText(/100(\.0)? MiB/)).toBeInTheDocument();
   });
 
+  it("shows hydrated files under the size floor, and only when there are some", () => {
+    // #432: below-floor files hydrate with no stats rows; the sweep row says how many.
+    const sweep = maintenanceRunsFixture.find((r) => r.task === "hydrator" && r.trigger === "loop")!;
+    const below = {
+      ...sweep,
+      result: { claimed: "5", hydrated: "5", failed: "0", transient: "0", stats_skipped_below_floor: "3" },
+    } as MaintenanceRun;
+    const { unmount } = render(<RunSummary run={below} />);
+    expect(screen.getByText(/3 below floor/)).toBeInTheDocument();
+    unmount();
+    // A pre-#432 row (no counter) and a zero read the same: nothing shown.
+    render(<RunSummary run={sweep} />);
+    expect(screen.queryByText(/below floor/)).not.toBeInTheDocument();
+  });
+
   it("hides the appended count when nothing was appended", () => {
     render(<RunSummary run={compaction} />);
     expect(screen.queryByText(/appended:/)).not.toBeInTheDocument();
@@ -576,6 +591,7 @@ describe("isQuietRun", () => {
     ["hydrator", "hydrated"],
     ["hydrator", "failed"],
     ["hydrator", "transient"],
+    ["hydrator", "stats_skipped_below_floor"],
     ["expiry", "snapshots_expired"],
     ["expiry", "data_files_queued"],
     ["expiry", "delete_files_queued"],

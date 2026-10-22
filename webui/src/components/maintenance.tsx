@@ -153,7 +153,7 @@ export function isQuietRun(run: MaintenanceRun): boolean {
       // Manual rows are rehydrate calls; loop rows are sweeps.
       if ("requeued" in r) return !positive(r.requeued);
       if ("claimed" in r) {
-        return ![r.claimed, r.hydrated, r.failed, r.transient].some(positive);
+        return ![r.claimed, r.hydrated, r.failed, r.transient, r.stats_skipped_below_floor].some(positive);
       }
       return false;
     }
@@ -328,6 +328,11 @@ export function RunSummary({ run }: { run: MaintenanceRun }) {
             claimed {formatCount(r.claimed)}, hydrated {formatCount(r.hydrated)}
             {r.failed !== "0" && <>, failed {formatCount(r.failed)}</>}
             {r.transient !== "0" && <>, transient {formatCount(r.transient)}</>}
+            {r.stats_skipped_below_floor !== undefined && r.stats_skipped_below_floor !== "0" && (
+              <span title="Hydrated under HOGLAKE_HYDRATOR_MIN_FILE_BYTES: footer-checked, no per-column stats rows">
+                , {formatCount(r.stats_skipped_below_floor)} below floor
+              </span>
+            )}
           </>
         );
       }

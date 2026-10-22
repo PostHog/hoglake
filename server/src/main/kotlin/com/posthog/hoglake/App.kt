@@ -167,6 +167,7 @@ class App private constructor(
             objectStore,
             maxWholeObjectBytes = cfg.hydratorMaxWholeObjectBytes,
             claimTimeoutMs = cfg.hydratorClaimTimeoutMs,
+            minFileBytes = cfg.hydratorMinFileBytes,
         )
 
     /** This pod's name, for the compaction planner's cursor spread and loop jitter. */

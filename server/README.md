@@ -248,6 +248,32 @@ retirement deletes it) loses its share and is counted
 (`hoglake_hydrator_claim_timeouts_total{catalog}`); no other catalog
 waits on it.
 
+The hydrator has a **size floor for stats rows** (#432):
+`HOGLAKE_HYDRATOR_MIN_FILE_BYTES`, default 1 MiB, 0 = rows for every
+file. It gates the ROWS, not the read. Every pending file is still
+claimed, its footer read, its field ids checked and its stats
+aggregated; a file under the floor then flips to `provided` with
+`missing_field_ids` and `split_offsets` set but no
+`hog_file_column_stats` rows, the "provided, no stats" state readers
+already treat as no bounds (a full read). The ledger row counts these as
+`stats_skipped_below_floor`, a subset of `hydrated`. The reasoning: the
+stats of a file that small never prune anything (one row group, cheaper
+to read than to skip), and compaction registers its output `provided`
+from the footer its own writer just produced (`FooterStats.aggregate`,
+§Sort orders and compaction), so a tiny input's ~26 rows were inserted
+only for the expiry purge to delete through the FK cascade once
+compaction ended the file (the purge ceiling of §Retention).
+gigahog-prod-us on 2026-10-22: millrace-prod-us had 24.7M files pending
+at ~13 KB each (a sweep compacts 2,382 of them, 30 MiB, into 64
+outputs), millpond's stray-day files are ~0.1 MB, and the stats table
+was 136 GB of the RDS volume; 24.7M × 26 is ~642M rows the floor spares.
+The footer GET and the one `UPDATE` per file stay, at today's rate. They
+stay on purpose: the field-id verdict is what lets `add_column` and
+`rename_column` through (the guard below refuses while any live file is
+`pending`), and a floor that left tiny files `pending` would block those
+on any table whose tiny files compaction never rewrites. That is every
+bucket under compaction's minimum input count.
+
 `null_count` is mandatory in `hog_file_column_stats`, so a leaf whose
 footer omits it in any row group gets **no row** — unless the leaf's
 max definition level is 0 (it and every ancestor REQUIRED), where the

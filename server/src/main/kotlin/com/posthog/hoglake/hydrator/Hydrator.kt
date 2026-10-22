@@ -79,6 +79,21 @@ import java.time.Instant
  * is PER CATALOG, each under its own savepoint and timeout
  * ([claimPending], #269): catalogs share the sweep's limit evenly, and
  * a catalog whose claim is slow loses its share, not the sweep.
+ *
+ * THE SIZE FLOOR (#432, [minFileBytes]) gates the STATS ROWS, not the
+ * footer read. Every pending file is claimed, its footer read and
+ * field-id checked, and its stats aggregated, exactly as before; a file
+ * under the floor then flips to `provided` with `missing_field_ids` and
+ * `split_offsets` set but NO `hog_file_column_stats` rows (the "provided,
+ * no stats" state a reader already treats as no bounds), counted in the
+ * ledger as `stats_skipped_below_floor`. Its stats would never prune
+ * anything, and its rows would be inserted only for the expiry purge to
+ * cascade-delete them once compaction ends the file. The footer read
+ * stays because the field-id verdict is not optional: a file left
+ * `pending` would block `add_column`/`rename_column` on its table for as
+ * long as it lived, and compaction never rewrites a bucket under its
+ * minimum input count, so for a table with a handful of tiny files that
+ * is forever.
  */
 class Hydrator(
     private val jdbi: Jdbi,
@@ -100,7 +115,19 @@ class Hydrator(
      * path without writing a 100,001-row-group parquet file.
      */
     private val maxSplitOffsetRowGroups: Int = SplitOffsets.MAX_ROW_GROUPS,
+    /**
+     * Files under this many bytes hydrate with no stats rows (class
+     * KDoc). `HOGLAKE_HYDRATOR_MIN_FILE_BYTES` (Config.hydratorMinFileBytes,
+     * default [DEFAULT_MIN_FILE_BYTES]); 0 writes rows for every file.
+     * The constructor's default is 0 so the suite's kilobyte-sized
+     * fixtures keep their rows; `App` passes the configured floor.
+     */
+    private val minFileBytes: Long = 0,
 ) {
+    init {
+        require(minFileBytes >= 0) { "minFileBytes=$minFileBytes must not be negative" }
+    }
+
     private val log = KotlinLogging.logger {}
     private val json = ObjectMapper()
 
@@ -317,14 +344,21 @@ class Hydrator(
                 jdbi.inTransaction<Int, Exception> { h ->
                     val pending = claimPending(h, limit)
                     for ((catalogId, files) in pending.groupBy { it.catalogId }) {
-                        tallies[catalogId] = mutableListOf(files.size.toLong(), 0, 0, 0)
+                        tallies[catalogId] = mutableListOf(files.size.toLong(), 0, 0, 0, 0)
                     }
                     for (file in pending) {
-                        // [claimed, hydrated, failed, transient]
+                        // [claimed, hydrated, failed, transient, stats skipped below floor]
                         val tally = tallies.getValue(file.catalogId)
                         h.savepoint(FILE_SAVEPOINT)
                         try {
-                            if (hydrate(h, file)) tally[1]++ else tally[2]++
+                            when (hydrate(h, file)) {
+                                Outcome.HYDRATED -> tally[1]++
+                                Outcome.HYDRATED_WITHOUT_STATS -> {
+                                    tally[1]++
+                                    tally[4]++
+                                }
+                                Outcome.FAILED -> tally[2]++
+                            }
                         } catch (e: TransientFetchException) {
                             h.rollbackToSavepoint(FILE_SAVEPOINT)
                             // Transient: the file STAYS pending; the next sweep
@@ -367,6 +401,7 @@ class Hydrator(
                     hydrated = tally[1],
                     failed = tally[2],
                     transient = tally[3],
+                    statsSkippedBelowFloor = tally[4],
                 ),
             )
         }
@@ -457,10 +492,21 @@ class Hydrator(
             }
         }
 
+    /** How one claimed file resolved; see [hydrate]. */
+    private enum class Outcome { HYDRATED, HYDRATED_WITHOUT_STATS, FAILED }
+
+    /**
+     * Read [file]'s footer and resolve it: `provided` with its stats rows,
+     * `provided` with none when it is under [minFileBytes] (class KDoc),
+     * or `failed`. Everything but the row inserts is the same for both
+     * `provided` outcomes — the field-id verdict, the split offsets, and
+     * the aggregate itself, whose structural refusals still fail a file
+     * of any size.
+     */
     private fun hydrate(
         h: Handle,
         file: PendingFile,
-    ): Boolean {
+    ): Outcome {
         val footer = readFooter(file)
         // The field-id contract check rides the footer we already hold.
         val missingFieldIds = FooterStats.missingFieldIds(footer.fileMetaData.schema)
@@ -472,7 +518,7 @@ class Hydrator(
                     "is ${file.recordCount}; marking failed, writing no stats"
             }
             markFailed(h, file, missingFieldIds)
-            return false
+            return Outcome.FAILED
         }
         // Column binding: id-bearing files map by field id, a stable
         // identity — the LIVE column set is correct at any time. Id-less
@@ -493,7 +539,11 @@ class Hydrator(
         // here (same rule the commit path runs on client-supplied
         // column_stats).
         val aggs = FooterStats.aggregate(footer, columns, file.path)
-        for (agg in aggs) upsertStats(h, file, agg)
+        // THE SIZE FLOOR (#432): below it the aggregate is computed and
+        // discarded. Strictly below: a file of exactly [minFileBytes]
+        // gets its rows.
+        val belowFloor = file.fileSizeBytes < minFileBytes
+        if (!belowFloor) for (agg in aggs) upsertStats(h, file, agg)
         // Row-group start offsets ride the same footer and the same flip,
         // so a file is never `provided` in one statement and offset-less
         // in the next. The FOOTER is authoritative: it overwrites any
@@ -539,8 +589,15 @@ class Hydrator(
                     "flagged missing_field_ids (column renames on its table are blocked while it is live)"
             }
         }
-        log.debug { "hydrated file ${file.dataFileId} (${file.path}): ${aggs.size} column stats" }
-        return true
+        log.debug {
+            if (belowFloor) {
+                "hydrated file ${file.dataFileId} (${file.path}) without stats rows: " +
+                    "${file.fileSizeBytes} bytes is under the $minFileBytes-byte floor"
+            } else {
+                "hydrated file ${file.dataFileId} (${file.path}): ${aggs.size} column stats"
+            }
+        }
+        return if (belowFloor) Outcome.HYDRATED_WITHOUT_STATS else Outcome.HYDRATED
     }
 
     private fun upsertStats(
@@ -979,6 +1036,15 @@ class Hydrator(
          * loses a tenth the work.
          */
         const val DEFAULT_SWEEP_LIMIT = 1_000
+
+        /**
+         * Config's default size floor, 1 MiB (#432): files under it hydrate
+         * without stats rows. The production files it covers are
+         * millrace-prod-us's ~13 KB files and millpond's ~0.1 MB stray-day
+         * files; the floor is about the rows, so see Config's KDoc for the
+         * arithmetic.
+         */
+        const val DEFAULT_MIN_FILE_BYTES: Long = 1L shl 20
 
         /** 4-byte footer length + 4-byte "PAR1" magic at the end of the file. */
         private const val FOOTER_SUFFIX = 8L

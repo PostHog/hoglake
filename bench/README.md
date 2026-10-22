@@ -229,7 +229,11 @@ hoglake-bench stream --rate 20000 --defer-stats --bucket posthog-gigahog-mw-dev
 
 The summary says so (`files written N (stats deferred — left pending for
 the hydrator)`), and the maintenance page's hydrator backlog stops
-reading `0 pending`. Note the hydrator polls every fifteen minutes by
+reading `0 pending`. Files under the hydrator's size floor
+(`HOGLAKE_HYDRATOR_MIN_FILE_BYTES`, default 1 MiB, #432) still cost the
+hydrator its footer GET and field-id check but get no stats rows (the
+sweep row's `below floor` count), so set the floor to 0 on the target
+server when the point is to load the stats-row writes too. Note the hydrator polls every fifteen minutes by
 default, so a queue builds before it drains — which is the point.
 
 Files registered this way carry no bounds until the hydrator fills them

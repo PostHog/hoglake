@@ -811,6 +811,140 @@ class HydratorIntegrationTest {
         }
     }
 
+    // ---- the size floor (#432): it gates the stats rows, not the read ----
+
+    private fun lastSweep(catalogId: Long): com.fasterxml.jackson.databind.JsonNode =
+        jdbi.withHandle<String, Exception> { h ->
+            h.createQuery(
+                "SELECT result::text FROM hog_maintenance_run WHERE catalog_id = ? ORDER BY run_id DESC LIMIT 1",
+            ).bind(0, catalogId).mapTo(String::class.java).one()
+        }.let { com.fasterxml.jackson.databind.ObjectMapper().readTree(it) }
+
+    /** A real sample file registered pending; returns its size. */
+    private fun seedRealFile(
+        catalogId: Long,
+        dataFileId: Long,
+        bytes: ByteArray = parquetBytes,
+    ): Long {
+        val path = "s3://$BUCKET/t1/floor-$dataFileId.parquet"
+        store.put(path, bytes)
+        seedDataFile(catalogId, dataFileId, path, ROWS.toLong(), bytes.size.toLong(), footerSizeOf(bytes))
+        return bytes.size.toLong()
+    }
+
+    @Test
+    fun `a file below the floor is provided with no stats rows, its footer still checked`() {
+        // MUTATION: ignore the floor (write the rows anyway) and the stats
+        // rows appear; drop the counter increment and the ledger reads 0.
+        val catalogId = seedCatalogAndTable()
+        val size = seedRealFile(catalogId, 1)
+        assertThat(Hydrator(jdbi, store, minFileBytes = size + 1).runOnce()).isEqualTo(1)
+
+        assertThat(statsState(catalogId, 1)).isEqualTo("provided")
+        assertThat(statsRows(catalogId, 1)).describedAs("no rows under the floor").isEmpty()
+        // Everything else the footer read decides is decided as for any file.
+        assertThat(missingFieldIds(catalogId, 1)).isFalse()
+        assertThat(splitOffsets(catalogId, 1)).isNotNull().isNotEmpty()
+        val sweep = lastSweep(catalogId)
+        assertThat(sweep["hydrated"].asLong()).isEqualTo(1)
+        assertThat(sweep["stats_skipped_below_floor"].asLong()).isEqualTo(1)
+    }
+
+    @Test
+    fun `a file exactly at the floor gets its rows, and floor 0 writes rows for every file`() {
+        // MUTATION: `<` -> `<=` in the floor test and the at-the-floor
+        // file loses its rows.
+        val catalogId = seedCatalogAndTable()
+        val size = seedRealFile(catalogId, 1)
+        assertThat(Hydrator(jdbi, store, minFileBytes = size).runOnce()).isEqualTo(1)
+        assertThat(statsState(catalogId, 1)).isEqualTo("provided")
+        assertThat(statsRows(catalogId, 1)).hasSize(4)
+        assertThat(lastSweep(catalogId).has("stats_skipped_below_floor"))
+            .describedAs("a zero is omitted from the stored row (NON_DEFAULT)")
+            .isFalse()
+
+        val other = seedCatalogAndTable()
+        seedRealFile(other, 1)
+        assertThat(Hydrator(jdbi, store, minFileBytes = 0).runOnce()).isEqualTo(1)
+        assertThat(statsRows(other, 1)).hasSize(4)
+    }
+
+    @Test
+    fun `an id-less file below the floor is still flagged missing_field_ids`() {
+        // The field-id verdict is the reason the footer is still read.
+        val catalogId = seedCatalogAndTable()
+        val idless = writeSampleParquet(sampleSchema(withIds = false))
+        val size = seedRealFile(catalogId, 1, idless)
+        assertThat(Hydrator(jdbi, store, minFileBytes = size + 1).runOnce()).isEqualTo(1)
+        assertThat(statsState(catalogId, 1)).isEqualTo("provided")
+        assertThat(statsRows(catalogId, 1)).isEmpty()
+        assertThat(missingFieldIds(catalogId, 1)).isTrue()
+    }
+
+    @Test
+    fun `add_column and rename_column succeed after one sweep when the only pending files were below the floor`() {
+        // The QE finding behind #432's shape: had the floor left tiny files
+        // 'pending', the field-id guard would refuse both DDLs for as long
+        // as they lived, and compaction never rewrites a bucket under its
+        // minimum input count, so 1-4 tiny files would block the table
+        // forever. MUTATION: skip below-floor files in the claim (leave
+        // them pending) and the post-sweep alters are refused.
+        val cat = "floor-ddl"
+        val catalogs = com.posthog.hoglake.service.CatalogService(jdbi)
+        val alter = com.posthog.hoglake.service.AlterService(jdbi)
+        catalogs.createCatalog(cat, "s3://$BUCKET/")
+        catalogs.createNamespace(cat, "ns")
+        catalogs.createTable(
+            cat,
+            "ns",
+            "t",
+            listOf(
+                com.posthog.hoglake.model.ColumnDef("id", com.posthog.hoglake.model.ColType.LONG, nullable = false),
+                com.posthog.hoglake.model.ColumnDef("score", com.posthog.hoglake.model.ColType.DOUBLE),
+                com.posthog.hoglake.model.ColumnDef("name", com.posthog.hoglake.model.ColType.STRING),
+                com.posthog.hoglake.model.ColumnDef("ts", com.posthog.hoglake.model.ColType.TIMESTAMPTZ),
+            ),
+        )
+        val paths = (1..2).map { "s3://$BUCKET/floor-ddl/f$it.parquet" }
+        for (p in paths) store.put(p, parquetBytes)
+        com.posthog.hoglake.commit.CommitService(jdbi).commit(
+            cat,
+            com.posthog.hoglake.model.CommitRequest(
+                appends =
+                    listOf(
+                        com.posthog.hoglake.model.TableAppend(
+                            "ns",
+                            "t",
+                            paths.map {
+                                com.posthog.hoglake.model.FileRegistration(
+                                    path = it,
+                                    recordCount = ROWS.toLong(),
+                                    fileSizeBytes = parquetBytes.size.toLong(),
+                                    footerSize = footerSize,
+                                )
+                            },
+                        ),
+                    ),
+            ),
+        )
+        val addOp =
+            com.posthog.hoglake.model.AlterOp.AddColumn(
+                com.posthog.hoglake.model.ColumnDef("added", com.posthog.hoglake.model.ColType.LONG),
+            )
+        val renameOp = com.posthog.hoglake.model.AlterOp.RenameColumn("name", "label")
+        // Pending: the ids are unverified, so both are refused (as on main).
+        for (op in listOf(addOp, renameOp)) {
+            org.assertj.core.api.Assertions.assertThatThrownBy { alter.alterTable(cat, "ns", "t", listOf(op)) }
+                .isInstanceOf(com.posthog.hoglake.model.HoglakeException.IdlessFilesPresent::class.java)
+        }
+
+        val floored = Hydrator(jdbi, store, minFileBytes = parquetBytes.size + 1L)
+        assertThat(floored.runOnce()).isEqualTo(2)
+
+        val columns = alter.alterTable(cat, "ns", "t", listOf(addOp, renameOp)).columns.map { it.def.name }
+        assertThat(columns).contains("added", "label").doesNotContain("name")
+    }
+
     @Test
     fun `the claim's starting catalog rotates by the catalogs served`() {
         // Two catalogs, one pending row each, a limit of 1: the first

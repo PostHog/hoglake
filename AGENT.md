@@ -1585,6 +1585,22 @@ ran on the local stack and what it showed.
   else covers it: the verify endpoint was metadata-only by design and
   could not do the S3 footer reads this check needs, and #261 removed it
   anyway.
+- **The hydrator's size floor gates stats ROWS, never the footer read**
+  (#432, `HOGLAKE_HYDRATOR_MIN_FILE_BYTES`, default 1 MiB, 0 = rows for
+  every file). Every pending file is claimed and footer-checked as
+  before; one under the floor flips to `provided` with
+  `missing_field_ids` and `split_offsets` set and no
+  `hog_file_column_stats` rows, counted as the sweep result's
+  `stats_skipped_below_floor` (a subset of `hydrated`). Do not "optimise"
+  this into skipping the claim or the GET: a file left `pending` holds
+  the field-id guard (`add_column` and `rename_column` refuse while any
+  live file is unverified), and compaction never rewrites a bucket under
+  its minimum input count, so a table with a few tiny deferred-stats
+  files would be blocked forever. That shape was the first draft and
+  QE killed it. The rows are the cost the floor removes: ~26 per tiny
+  file, inserted only for the expiry purge to cascade-delete (~642M of
+  them on millrace-prod-us's 24.7M pending files on 2026-10-22).
+  server/README.md §File registration has the reasoning.
 - **Maintenance verify — REMOVED (#261, 2026-10-01)**: `POST
   /v1/catalogs/{c}/maintenance/verify`, its background loop
   (`HOGLAKE_VERIFY_INTERVAL_MS`), its `hoglake_verify_violations` /
