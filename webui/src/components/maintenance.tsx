@@ -562,6 +562,11 @@ export function RunSummary({ run }: { run: MaintenanceRun }) {
               {formatCount(r.over_threshold)} over threshold of {formatCount(r.checked)}
             </span>
           )}
+          {r.purge_pending_overridden === true && (
+            <span className="badge badge-warn" title={REINDEX_PURGE_OVERRIDE_TITLE}>
+              purge_pending overridden
+            </span>
+          )}
           {positive(r.invalid_dropped) && (
             <span className="badge badge-warn" title={REINDEX_LEFTOVER_TITLE}>
               dropped {formatCount(r.invalid_dropped)} failed-rebuild leftover
@@ -708,6 +713,14 @@ const REINDEX_LEFTOVER_TITLE =
   "write to the table keeps maintaining it and no query reads it. The " +
   "reindex task drops these before each run, so a count here means an " +
   "earlier rebuild failed — its own failed run is further down the list.";
+
+const REINDEX_PURGE_OVERRIDE_TITLE =
+  "An expiry purge was still at its remaining-rows cap, which normally " +
+  "makes the reindex task wait (the purge's deletes would re-bloat the " +
+  "index). It had stayed at the cap without draining for " +
+  "HOGLAKE_REINDEX_PURGE_WAIT_WINDOWS hours, so waiting longer would buy " +
+  "nothing and the task rebuilt anyway. The purge itself is behind — see " +
+  "the expiry runs' purge_remaining.";
 
 // For an operator who sees "7 page halvings" and does not know the
 // mechanism. The count is pages, not rows.

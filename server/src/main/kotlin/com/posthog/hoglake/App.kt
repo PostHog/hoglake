@@ -150,7 +150,12 @@ class App private constructor(
      * the health page uses its estimate. The loop, and the
      * `hoglake_index_bloat_bytes` gauge, belong to the pod that runs it.
      */
-    private val reindexService = ReindexService(jdbi, publishGauge = cfg.reindexIntervalMs > 0)
+    private val reindexService =
+        ReindexService(
+            jdbi,
+            publishGauge = cfg.reindexIntervalMs > 0,
+            purgeWaitWindows = cfg.reindexPurgeWaitWindows,
+        )
 
     /** Shared read/put store: hydrator footer reads + compaction rewrites. */
     private val objectStore = ObjectStore(cfg)

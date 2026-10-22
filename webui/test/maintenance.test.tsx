@@ -1083,6 +1083,17 @@ describe("reindex runs", () => {
     expect(screen.getByText(/dropped 1 failed-rebuild leftover$/)).toBeInTheDocument();
   });
 
+  it("badges a rebuild that overrode a stuck purge, and only that", () => {
+    render(<RunSummary run={withField(rebuilt, "purge_pending_overridden", true)} />);
+    expect(screen.getByText("purge_pending overridden")).toBeInTheDocument();
+    expect(screen.getByText("hog_data_file_path 14.8 GiB→614 MiB")).toBeInTheDocument();
+  });
+
+  it("does not badge an ordinary rebuild, an older row without the field", () => {
+    render(<RunSummary run={rebuilt} />);
+    expect(screen.queryByText("purge_pending overridden")).not.toBeInTheDocument();
+  });
+
   it("is a task the runs table can filter on", async () => {
     const { RUN_TASK_FILTERS } = await import("../src/components/maintenance");
     expect(RUN_TASK_FILTERS).toContain("reindex");

@@ -2030,6 +2030,13 @@ enum class ReindexSkip {
      * `ExpiryService.PURGE_REMAINING_CAP`, or was truncated with the count
      * unknown: a mass below-floor delete is still under way, the same
      * argument as [RETIREMENT_PENDING]. Routine lag does not count.
+     *
+     * BOUNDED (#429): once every such catalog's purge has sat at the cap
+     * for `HOGLAKE_REINDEX_PURGE_WAIT_WINDOWS` hours without once
+     * draining below it, the purge is not going to finish, waiting buys
+     * nothing, and the run proceeds with
+     * [ReindexResult.purgePendingOverridden] set. See
+     * `ReindexService.PURGE_PENDING_SQL`.
      */
     PURGE_PENDING,
 
@@ -2141,6 +2148,15 @@ data class ReindexResult(
     /** One of [ReindexSkip]'s wire values, or null when no guard fired. */
     val skippedReason: String? = null,
     /**
+     * True when [ReindexSkip.PURGE_PENDING] WOULD have fired but every
+     * catalog it fired for has had its purge at the cap for the whole
+     * bounded wait (#429), so this run rebuilt (or attempted) [index]
+     * anyway. Null — ABSENT on the wire — otherwise, which is also what
+     * every row written before the field existed reads as: none of them
+     * overrode anything.
+     */
+    val purgePendingOverridden: Boolean? = null,
+    /**
      * Invalid `*_ccnew` / `*_ccold` leftovers of a failed REINDEX
      * CONCURRENTLY dropped before the run. Each one is maintained on
      * every write to its table and read by nothing.
@@ -2165,6 +2181,13 @@ data class IndexBloatEstimate(
     val sizeBytes: Long,
     val expectedBytes: Long?,
     val constraintBacking: Boolean,
+    /** The index has a predicate (`pg_index.indpred`): it covers only the rows matching it. */
+    val partial: Boolean = false,
+    /**
+     * The index's `reltuples` — for a [partial] index, the rows matching
+     * its predicate at the last VACUUM/ANALYZE. Null when never vacuumed.
+     */
+    val liveEntries: Long? = null,
 ) {
     /** Bytes beyond the freshly-built size; never negative. */
     val excessBytes: Long?

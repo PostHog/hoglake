@@ -667,6 +667,19 @@ data class Config(
      */
     val reindexIntervalMs: Long = env("HOGLAKE_REINDEX_INTERVAL_MS", "0").toLong(),
     /**
+     * How many hourly windows the reindex task's `purge_pending` guard
+     * waits on an expiry purge stuck at its cap before rebuilding anyway
+     * (#429; `ReindexService.PURGE_PENDING_SQL` has the argument). Default
+     * 3: long enough that a purge catching up after an outage or a large
+     * retirement — which drains below the cap within a few sweeps — keeps
+     * the guard, short enough that one that never drains (prod-us,
+     * 2026-10-22, every hour for days) costs three hours of growth, not
+     * the index. At least 1. A value past the ledger's retention (7 days =
+     * 168) can never be met, so it restores the unbounded wait.
+     */
+    val reindexPurgeWaitWindows: Int =
+        env("HOGLAKE_REINDEX_PURGE_WAIT_WINDOWS", "$DEFAULT_REINDEX_PURGE_WAIT_WINDOWS").toInt(),
+    /**
      * Catalog-health gauge sample interval; <= 0 disables the sampler
      * loop.
      *
@@ -1186,6 +1199,12 @@ data class Config(
         // client waits until it gives up. There is no reading of 0 that
         // means "do not dispatch" — that is what the bypass list is for
         // — so refuse it at boot rather than hang at the first request.
+        require(reindexPurgeWaitWindows >= 1) {
+            "HOGLAKE_REINDEX_PURGE_WAIT_WINDOWS=$reindexPurgeWaitWindows: the purge_pending guard " +
+                "waits at least one hourly window (the default is " +
+                "$DEFAULT_REINDEX_PURGE_WAIT_WINDOWS). 0 would rebuild under every stuck purge " +
+                "at once; to wait without bound, set it past the ledger's retention."
+        }
         require(requestThreads >= 1) {
             "HOGLAKE_REQUEST_THREADS=$requestThreads: the blocking request dispatcher needs at " +
                 "least one thread (the default is HOGLAKE_DB_POOL_SIZE, currently $dbPoolSize). " +
@@ -1424,6 +1443,9 @@ data class Config(
          * literal the property already carries.
          */
         const val DEFAULT_RETIREMENT_QUEUE_CEILING = 500_000L
+
+        /** The default `HOGLAKE_REINDEX_PURGE_WAIT_WINDOWS`, named for the boot refusal's message. */
+        const val DEFAULT_REINDEX_PURGE_WAIT_WINDOWS = 3
 
         /** Env vars that no longer exist, and what replaced them. */
         private val REMOVED_ENV =

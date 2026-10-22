@@ -1,5 +1,6 @@
 package com.posthog.hoglake.service
 
+import com.posthog.hoglake.Config
 import com.posthog.hoglake.Database
 import com.posthog.hoglake.model.IndexBloatEstimate
 import com.posthog.hoglake.model.MaintenanceTask
@@ -101,7 +102,10 @@ import java.time.Instant
  * again within hours) or would collide with other DDL (a migration, another
  * REINDEX). A skipped run still estimates, still drops leftovers where it
  * safely can, and still writes a ledger row, so an hour without a rebuild
- * says why.
+ * says why. The purge guard's wait is BOUNDED (#429, [PURGE_PENDING_SQL]):
+ * a purge that has sat at its cap for `HOGLAKE_REINDEX_PURGE_WAIT_WINDOWS`
+ * hours is not going to finish, and the run proceeds with
+ * `purge_pending_overridden` on its row.
  *
  * FAILURE is a failed ledger row carrying the error and the attempt
  * ([ReindexFailed]); it is never retried inside the run. A failed REINDEX
@@ -160,6 +164,12 @@ class ReindexService(
     private val afterRebuild: (Handle) -> Unit = {},
     /** Wall clock, injected so the hourly gate can be driven across a window boundary in a test. */
     private val clock: () -> Instant = Instant::now,
+    /**
+     * `HOGLAKE_REINDEX_PURGE_WAIT_WINDOWS`: how many [RUN_EVERY] windows a
+     * purge may sit at the cap before `purge_pending` stops waiting for
+     * it ([PURGE_PENDING_SQL]).
+     */
+    private val purgeWaitWindows: Int = Config.DEFAULT_REINDEX_PURGE_WAIT_WINDOWS,
 ) {
     private val log = KotlinLogging.logger {}
     private val runStore = MaintenanceRunStore(jdbi)
@@ -181,6 +191,7 @@ class ReindexService(
         require(!statementTimeout.isNegative && !statementTimeout.isZero) {
             "reindex statement timeout must be positive (got $statementTimeout): 0 means UNLIMITED to Postgres"
         }
+        require(purgeWaitWindows >= 1) { "purge wait windows must be at least 1 (got $purgeWaitWindows)" }
     }
 
     /** Thrown when the REINDEX itself failed; the funnel records [partial] on the failed row. */
@@ -256,6 +267,7 @@ class ReindexService(
                         "table=${result.table} expected_bytes=${result.expectedBytes} " +
                         "before_bytes=${result.beforeBytes} after_bytes=${result.afterBytes} " +
                         "duration_ms=${result.durationMs} skipped_reason=${result.skippedReason} " +
+                        "purge_pending_overridden=${result.purgePendingOverridden} " +
                         "invalid_dropped=${result.invalidDropped}",
             )
             result
@@ -303,7 +315,7 @@ class ReindexService(
                     // Before the leftovers are dropped: an in-flight build's
                     // own `_ccnew` IS an invalid index, and a migration's
                     // half-built one is the operator's to look at.
-                    guard(h, beforeDrop = true)?.let { return@preservingPrimary base.copy(skippedReason = it.wire) }
+                    preDropGuard(h)?.let { return@preservingPrimary base.copy(skippedReason = it.wire) }
                     withStatementTimeout(h) { locked(h, over, base) }
                 },
                 cleanup = { Locks.releaseReindexLock(h) },
@@ -335,37 +347,50 @@ class ReindexService(
         // Only with something to rebuild: these two say the rebuild would
         // be wasted, and a quiet hour must stay quiet in the ledger while
         // retirement runs for a week.
-        val skip = guard(h, beforeDrop = false)
-        if (skip != null) return afterDrop.copy(skippedReason = skip.wire)
+        if (h.queryBool(RETIREMENT_PENDING_SQL)) {
+            return afterDrop.copy(skippedReason = ReindexSkip.RETIREMENT_PENDING.wire)
+        }
+        val purge = purgePending(h)
+        if (purge == PurgePending.WAITING) return afterDrop.copy(skippedReason = ReindexSkip.PURGE_PENDING.wire)
         val excluded = ranked.count { it.index in failedLast || (it.expectedBytes ?: 0L) > maxRebuildExpectedBytes }
-        return rebuild(h, victim, afterDrop.copy(excluded = excluded.toLong()))
+        return rebuild(
+            h,
+            victim,
+            afterDrop.copy(
+                excluded = excluded.toLong(),
+                purgePendingOverridden = (purge == PurgePending.OVERRIDDEN).takeIf { it },
+            ),
+        )
     }
 
     /**
-     * The first guard that fires, or null. Split in two because the
-     * in-progress and migration checks must precede the leftover drop and
-     * the retirement and purge checks need not.
+     * The guards that must precede the leftover drop, or null. The
+     * retirement and purge guards need not, and run in [locked] only
+     * once something is selected for rebuild.
      */
-    private fun guard(
-        h: Handle,
-        beforeDrop: Boolean,
-    ): ReindexSkip? =
-        if (beforeDrop) {
-            when {
-                h.queryBool(INDEX_BUILD_IN_PROGRESS_SQL) -> ReindexSkip.REINDEX_IN_PROGRESS
-                migrationPending(h) -> ReindexSkip.MIGRATION_PENDING
-                else -> null
-            }
-        } else {
-            when {
-                h.queryBool(RETIREMENT_PENDING_SQL) -> ReindexSkip.RETIREMENT_PENDING
-                h.createQuery(PURGE_PENDING_SQL)
-                    .bind("cap", ExpiryService.PURGE_REMAINING_CAP)
-                    .mapTo(Boolean::class.javaObjectType)
-                    .one() -> ReindexSkip.PURGE_PENDING
-                else -> null
-            }
+    private fun preDropGuard(h: Handle): ReindexSkip? =
+        when {
+            h.queryBool(INDEX_BUILD_IN_PROGRESS_SQL) -> ReindexSkip.REINDEX_IN_PROGRESS
+            migrationPending(h) -> ReindexSkip.MIGRATION_PENDING
+            else -> null
         }
+
+    /** What `purge_pending` says this run: nothing pending, wait, or pending past the bounded wait. */
+    private enum class PurgePending { NONE, WAITING, OVERRIDDEN }
+
+    private fun purgePending(h: Handle): PurgePending {
+        val (pending, overridable) =
+            h.createQuery(PURGE_PENDING_SQL)
+                .bind("cap", ExpiryService.PURGE_REMAINING_CAP)
+                .bind("since", clock().minus(RUN_EVERY.multipliedBy(purgeWaitWindows.toLong())))
+                .map { rs, _ -> rs.getBoolean("pending") to rs.getBoolean("overridable") }
+                .one()
+        return when {
+            !pending -> PurgePending.NONE
+            overridable -> PurgePending.OVERRIDDEN
+            else -> PurgePending.WAITING
+        }
+    }
 
     private fun migrationPending(h: Handle): Boolean {
         val lockHeld =
@@ -497,6 +522,8 @@ class ReindexService(
                     sizeBytes = rs.getLong("size_bytes"),
                     expectedBytes = rs.getLong("expected_bytes").takeUnless { rs.wasNull() },
                     constraintBacking = rs.getBoolean("constraint_backing"),
+                    partial = rs.getBoolean("partial"),
+                    liveEntries = rs.getLong("live_entries").takeUnless { rs.wasNull() },
                 )
             }
             .list()
@@ -572,6 +599,17 @@ class ReindexService(
          * size below which it calls an index noise.
          */
         const val MIN_RATIO_INDEX_BYTES = 8L shl 20
+
+        /**
+         * Below this many entries a PARTIAL index is out of the ratio arm
+         * ([ratioMeaningful]). Constant, like the rest of the threshold.
+         * 10,000 entries of the narrowest key on this schema (~20 bytes
+         * with header and line pointer) is ~30 leaf pages, so below it the
+         * expected size is a few hundred KiB and every [MIN_RATIO_INDEX_BYTES]
+         * index reads past 30x whatever its state; above it the ratio is
+         * back to describing pages a probe walks.
+         */
+        const val MIN_RATIO_PARTIAL_LIVE_ENTRIES = 10_000L
 
         /**
          * The REINDEX statement's bound. An hour, against the session's
@@ -687,8 +725,28 @@ class ReindexService(
             val ratio = e.ratio ?: return false
             val excess = e.excessBytes ?: return false
             return (excess >= EXCESS_BYTES_THRESHOLD && ratio >= EXCESS_MIN_RATIO) ||
-                (ratio >= RATIO_THRESHOLD && e.sizeBytes >= minRatioIndexBytes)
+                (ratio >= RATIO_THRESHOLD && e.sizeBytes >= minRatioIndexBytes && ratioMeaningful(e))
         }
+
+        /**
+         * False for a PARTIAL index holding fewer than
+         * [MIN_RATIO_PARTIAL_LIVE_ENTRIES] entries, whose ratio measures
+         * nothing worth a rebuild. Its expected size is a page or two, so
+         * any high-water mark reads as thousands of x —
+         * `hog_file_removal_undrained_path` at 542 MiB read "69372x" on
+         * prod-us with ~0 rows matching its predicate. That index is a
+         * QUEUE's: rows enter it on insert and leave it as the drain
+         * settles them, so its size is the deepest the queue has been,
+         * its emptied pages are recycled by VACUUM for the next burst,
+         * and a probe descends only the live part of the tree. A rebuild
+         * gives back disk until the next burst refills it. Such an index
+         * is judged by the EXCESS arm alone — a gigabyte of it is still
+         * a gigabyte — and the health finding reports its excess without
+         * a ratio. Non-partial indexes are untouched: an empty table's
+         * index is the [minRatioIndexBytes] floor's case.
+         */
+        fun ratioMeaningful(e: IndexBloatEstimate): Boolean =
+            !e.partial || (e.liveEntries ?: 0L) >= MIN_RATIO_PARTIAL_LIVE_ENTRIES
 
         /**
          * Candidates in the order a run tries them: largest excess, then
@@ -760,6 +818,7 @@ class ReindexService(
                        t.oid AS table_oid, c.oid AS index_oid,
                        c.reltuples, c.relpages, i.indnatts, i.indkey,
                        i.indisunique OR i.indisprimary AS constraint_backing,
+                       i.indpred IS NOT NULL AS partial,
                        COALESCE(substring(array_to_string(c.reloptions, ' ')
                                           FROM 'fillfactor=([0-9]+)')::int, 90) AS fillfactor
                   FROM pg_index i
@@ -797,7 +856,8 @@ class ReindexService(
                   FROM cols
                  GROUP BY index_oid
             )
-            SELECT idx.table_name, idx.index_name, idx.constraint_backing,
+            SELECT idx.table_name, idx.index_name, idx.constraint_backing, idx.partial,
+                   CASE WHEN idx.reltuples >= 0 THEN idx.reltuples::bigint END AS live_entries,
                    idx.relpages::bigint * current_setting('block_size')::bigint AS size_bytes,
                    CASE WHEN w.complete AND idx.reltuples >= 0 THEN
                        (1 + ceil(idx.reltuples / floor(
@@ -834,28 +894,100 @@ class ReindexService(
          * more than any sweep will catch up"), or a truncated purge whose
          * count is unknown (NULL: the count timed out, and NULL compared
          * with anything is not true, so an unguarded `> 0` let exactly the
-         * worst case through).
+         * worst case through). Returns `pending` and `overridable`.
          *
          * NOT `> 0`. A purge that routinely lags by a few pages deletes in
          * the steady state, and steady deletions are what vacuum's page
          * reuse keeps up with — they do not undo a rebuild. A mass,
          * scattered delete does: it leaves the rebuilt index as bloated
-         * a few hours later as it was before. One descent of
-         * `hog_maintenance_run_recent` per catalog.
+         * a few hours later as it was before.
+         *
+         * WHAT THE GUARD PROTECTS AGAINST is that, and only that: a
+         * WASTED rebuild. It is not a correctness guard and not a lock
+         * one. REINDEX CONCURRENTLY tolerates the purge's DML (its SHARE
+         * UPDATE EXCLUSIVE does not conflict with the DELETE's ROW
+         * EXCLUSIVE; its phase waits wait out the in-flight purge page,
+         * which `ExpiryService.PURGE_STATEMENT_TIMEOUT` bounds at 5 s).
+         * The tables a purge page writes are `hog_data_file` and
+         * `hog_delete_file` (DELETE, `ExpiryService.DATA_FILE_EXPIRY_SQL`
+         * and the superseded-vector purge), `hog_file_column_stats`,
+         * `hog_file_partition_value` and `hog_delete_file` again (the FK
+         * cascades of the `hog_data_file` delete), and `hog_file_removal`
+         * (INSERT, the cleanup queue) — which covers every large index
+         * this task has ever had a reason to rebuild, so scoping the guard
+         * to the victim's table would not have unblocked one.
+         *
+         * BOUNDED (#429). The guard assumed a mass delete ENDS. One that
+         * does not — gigahog-prod-us, 2026-10-22: `purge_remaining` at the
+         * cap every sweep, because the purge's per-file cascade into the
+         * stats table (#419) costs more than compaction's output gives it
+         * — turned it into a permanent block, every hour on every catalog,
+         * while `hog_file_column_stats_pkey` grew to 30.3 GiB at 1.8x.
+         * Waiting for such a purge buys nothing: its delete RATE is bounded
+         * by `HOGLAKE_EXPIRY_PURGE_BUDGET_MS` per sweep whether the backlog
+         * is a hundred rows or a million, so a rebuild now is re-bloated by
+         * exactly the holes the same purge would punch after a rebuild a
+         * week from now, minus the excess accumulated in between — and the
+         * index left bloated is the one the purge's own cascade descends
+         * per row. So `overridable`: every catalog that is `pending` has
+         * had no expiry row drain BELOW the cap since `:since` (now minus
+         * `HOGLAKE_REINDEX_PURGE_WAIT_WINDOWS` x [RUN_EVERY]) — its streak
+         * of not-drained rows starts at or before `:since`. A row that
+         * reports `purge_remaining < :cap` breaks the streak; a row with no
+         * count (failed, or unknown) neither breaks nor starts one, and a
+         * catalog whose ledger does not reach back to `:since` is not
+         * overridable (no evidence yet). A purge that does drain, even
+         * once, keeps the guard waiting, which is the case it was written
+         * for.
+         *
+         * WHAT THE OVERRIDDEN REBUILD COSTS beyond an ordinary one, on the
+         * 30 GiB stats pkey: the build and validation phases each hold a
+         * snapshot (30-60 minutes in all on `hog_file_column_stats`'
+         * ~66 GiB heap, [REINDEX_STATEMENT_TIMEOUT] bounds it at an hour),
+         * so the dead tuples the purge makes meanwhile — at most one
+         * sweep's budget of file rows and their cascades — stay
+         * unreclaimable until it ends, and autovacuum skips the table for
+         * the duration. The new index is built with entries for the rows
+         * the purge deletes during the build, which ordinary VACUUM then
+         * removes. That is the ordinary rebuild's price plus one hour of
+         * purge output, against an excess that grows every hour the guard
+         * waits.
+         *
+         * COST: one descent of `hog_maintenance_run_recent` per catalog for
+         * `pending`, and for each pending catalog only, two range scans of
+         * its expiry rows on the same index — bounded by the ledger's
+         * retention (~168 rows per catalog at the hourly default). Asked
+         * once an hour, only when a rebuild would otherwise happen.
          */
         internal const val PURGE_PENDING_SQL: String =
             """
-            SELECT EXISTS (
-                SELECT 1 FROM hog_catalog c
-                CROSS JOIN LATERAL (
+            WITH pending AS (
+                SELECT c.catalog_id
+                  FROM hog_catalog c
+                 CROSS JOIN LATERAL (
                     SELECT r.result FROM hog_maintenance_run r
-                    WHERE r.catalog_id = c.catalog_id AND r.task = 'expiry'
-                    ORDER BY r.run_id DESC LIMIT 1
-                ) last
-                WHERE (last.result ->> 'purge_remaining')::bigint >= :cap
-                   OR (COALESCE((last.result ->> 'purge_truncated')::boolean, false)
-                       AND last.result ->> 'purge_remaining' IS NULL)
+                     WHERE r.catalog_id = c.catalog_id AND r.task = 'expiry'
+                     ORDER BY r.run_id DESC LIMIT 1
+                 ) last
+                 WHERE (last.result ->> 'purge_remaining')::bigint >= :cap
+                    OR (COALESCE((last.result ->> 'purge_truncated')::boolean, false)
+                        AND last.result ->> 'purge_remaining' IS NULL)
+            ),
+            streak AS (
+                SELECT p.catalog_id,
+                       (SELECT min(r.started_at) FROM hog_maintenance_run r
+                         WHERE r.catalog_id = p.catalog_id AND r.task = 'expiry'
+                           AND r.run_id > COALESCE((
+                               SELECT max(d.run_id) FROM hog_maintenance_run d
+                                WHERE d.catalog_id = p.catalog_id AND d.task = 'expiry'
+                                  AND (d.result ->> 'purge_remaining')::bigint < :cap
+                           ), 0)
+                       ) AS since
+                  FROM pending p
             )
+            SELECT count(*) > 0 AS pending,
+                   count(*) > 0 AND bool_and(since <= :since) AS overridable
+              FROM streak
             """
 
         /**
