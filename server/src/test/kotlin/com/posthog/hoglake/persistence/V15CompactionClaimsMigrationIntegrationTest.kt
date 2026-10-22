@@ -136,6 +136,41 @@ class V15CompactionClaimsMigrationIntegrationTest {
                 .describedAs("bucket-claim read plan:%n%s", bucketPlan)
                 .doesNotContain("Seq Scan on hog_compaction_claim")
 
+            // The refresh takes its row locks in a subquery, in group_key
+            // order (the claim refresh deadlock: `CompactionClaimRepo.refresh`).
+            // Pinned: the lock order is the ORDERED pkey scan's under a
+            // LockRows node — no Sort, so the order is the index's — and
+            // the update is a TID join to exactly the rows locked.
+            val refreshPlan =
+                db.jdbi.withHandleUnchecked { h ->
+                    h.createQuery("EXPLAIN (COSTS OFF) ${CompactionClaimRepo.REFRESH_SQL}")
+                        .bind("catalogId", catalogId).bind("tableId", 7L)
+                        .bind("groupKey", "g")
+                        .bindArray("keys", String::class.java, listOf("g", "bucket:b", "bucket:a"))
+                        .bind("claimant", java.util.UUID.randomUUID())
+                        .bind("ttlSeconds", 3600.0).bind("bucketTtlSeconds", 600.0)
+                        .mapTo(String::class.java).list().joinToString("\n")
+                }
+            // PG 18 plans it as LockRows directly over the pkey scan with
+            // `group_key = ANY(...)` in the Index Cond, which returns rows
+            // in index order (the array keys are sorted), so no Sort node:
+            // the lock order is the key order. The `ORDER BY group_key` is
+            // what makes that a guarantee rather than a plan accident — any
+            // other path the planner chose would get a Sort under LockRows.
+            // The deadlock itself is pinned by
+            // `CompactionClaimRefreshDeadlockIntegrationTest`.
+            assertThat(refreshPlan).describedAs("refresh plan:%n%s", refreshPlan)
+                .contains("LockRows")
+                .contains("Index Scan using hog_compaction_claim_pkey on hog_compaction_claim")
+                .contains("Tid")
+                .doesNotContain("Seq Scan on hog_compaction_claim")
+            val lines = refreshPlan.lines()
+            val lockRows = lines.indexOfFirst { it.contains("LockRows") }
+            assertThat(lines.drop(lockRows + 1).firstOrNull { it.contains("->") })
+                .describedAs("the node LockRows reads is the ordered pkey scan:%n%s", refreshPlan)
+                .contains("Index Scan using hog_compaction_claim_pkey")
+            println("RECORDED refresh plan:\n$refreshPlan")
+
             // The purge is per CATALOG across its tables, which the
             // primary key cannot serve: its second column is a gap in
             // this predicate, so the key alone would scan every claim
