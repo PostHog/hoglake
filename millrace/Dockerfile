@@ -28,7 +28,7 @@
 FROM python:3.13-slim-trixie AS build
 
 # uv, pinned: an unpinned installer resolves differently per build.
-COPY --from=ghcr.io/astral-sh/uv:0.12.17 /uv /usr/local/bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.13.4 /uv /usr/local/bin/uv
 
 ENV UV_LINK_MODE=copy \
     UV_COMPILE_BYTECODE=1 \

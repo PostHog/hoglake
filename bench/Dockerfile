@@ -45,7 +45,7 @@ FROM python:3.13-slim-trixie AS build
 # uv, the same installer the trees are developed and CI-tested with
 # (ci-python.yml uses astral-sh/setup-uv). Pinned: an unpinned
 # installer resolves differently per build.
-COPY --from=ghcr.io/astral-sh/uv:0.12.17 /uv /usr/local/bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.13.4 /uv /usr/local/bin/uv
 
 ENV UV_LINK_MODE=copy \
     UV_COMPILE_BYTECODE=1 \
