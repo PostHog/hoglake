@@ -1096,4 +1096,23 @@ class CompactionConfigTest {
         }.isInstanceOf(IllegalArgumentException::class.java)
             .hasMessageContaining("HOGLAKE_COMPACTION_BUCKET_CLAIM_TTL_SECONDS")
     }
+
+    @Test
+    fun `the plan statement bound defaults to the session's and refuses a useless one`() {
+        // #418: the 15 s fail-fast belonged to the probes-under-the-lock
+        // shape; with the lock over the claim transaction only, a slow
+        // probe costs one pod one sweep and the bound is the session's.
+        assertThat(Config().compactionPlanStatementTimeoutMs).isEqualTo(60_000L)
+        assertThat(CompactionConfig(targetBytes = 1024, maxGroupsPerRun = 1).planStatementTimeoutMs)
+            .isEqualTo(CompactionConfig.DEFAULT_PLAN_STATEMENT_TIMEOUT_MS)
+        assertThat(
+            CompactionConfig(targetBytes = 1024, maxGroupsPerRun = 1, planStatementTimeoutMs = 1_000)
+                .planStatementTimeoutMs,
+        ).isEqualTo(1_000L)
+        // MUTATION: drop the require and this constructs.
+        assertThatThrownBy {
+            CompactionConfig(targetBytes = 1024, maxGroupsPerRun = 1, planStatementTimeoutMs = 999)
+        }.isInstanceOf(IllegalArgumentException::class.java)
+            .hasMessageContaining("HOGLAKE_COMPACTION_PLAN_STATEMENT_TIMEOUT_MS")
+    }
 }

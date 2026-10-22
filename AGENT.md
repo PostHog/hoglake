@@ -845,7 +845,14 @@ ran on the local stack and what it showed.
     WORK. It also does NOT bound the row work: the RI triggers for the
     three cascading children (~4 s per 300k rows against an EMPTY child
     table) and the CTE's tuplestore spilling at `work_mem` 4 MB are the
-    dominant costs of that DELETE, and neither moves. PARTIAL here where V17's is not, because V17's
+    dominant costs of that DELETE, and neither moves. (#419 measured
+    the alternatives: an explicit dependent delete beside the cascade
+    costs MORE — 112,564 against 83,436 buffers per 1,000-file page —
+    because the trigger still fires and re-reads the dead tuples; with
+    the three FKs `NOT ENFORCED` it saves 12% of the buffers and no
+    reads. The page's cost is ~3.9 cold reads per file on the stats
+    primary key, which no delete shape changes; neither shipped —
+    server/README.md §Retention has the table.) PARTIAL here where V17's is not, because V17's
     statement covers "any file row, live or not" while this one carries
     `end_snapshot IS NOT NULL` in its own text — and the rows the
     predicate excludes are the overwhelming majority (4.94M of
@@ -1521,10 +1528,22 @@ ran on the local stack and what it showed.
   leaked bucket claim hides the whole bucket; never give it the group
   claims' hour. Anything that reads the
   table must keep the two kinds apart (`starts_with(group_key,
-  'bucket:')`), and nothing may treat either as authorization. The skip
-  is only sound because execution plans serialize on the planning lock
-  and commit their claims before releasing it; a plan path that claims
-  without that lock reopens the 2026-10-21 herd. Each pod's bucket cursor
+  'bucket:')`), and nothing may treat either as authorization. PLANNING
+  TAKES NO LOCK (#418): the catalog planning lock covers only the claim
+  transaction, which re-reads the live claims under it and drops every
+  planned group that overlaps one before inserting — that re-read, not
+  serialized probes, is what keeps two runs off the same files, and it
+  is exact only because every claimant releases the lock AFTER its claim
+  transaction commits. A plan path that claims without the lock or
+  without the re-read can hold overlapping groups under different keys,
+  and a failed claim transaction plans nothing (never the unclaimed
+  plan).
+  Holding the lock across the probes (1.4.1) made one slow probe every
+  sibling's 15 s lock wait: 38 of 40 millpond-prod-us sweeps failed on
+  2026-10-22. The probe's statement bound is
+  `HOGLAKE_COMPACTION_PLAN_STATEMENT_TIMEOUT_MS` (default 60 s, the
+  session's), no longer the 15 s fail-fast that shape needed; the claim
+  transaction keeps a fixed 15 s equal to the lock wait. Each pod's bucket cursor
   starts at a hash of its identity (`POD_NAME`/`HOSTNAME`), and the
   compaction loop — and only it — sleeps with ±25% jitter
   (`BackgroundLoops.Jitter`); server/README.md has the incident and the

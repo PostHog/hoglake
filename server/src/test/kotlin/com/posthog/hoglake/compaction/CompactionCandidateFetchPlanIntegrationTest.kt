@@ -827,7 +827,9 @@ class CompactionCandidateFetchPlanIntegrationTest {
         // again, which is what the incident was.
         assertThat(elapsedMs)
             .describedAs("plan wall time on a %d-file table", totalFiles)
-            .isLessThan(CompactionService.PLAN_STATEMENT_TIMEOUT_MS)
+            // 15 s: the fail-fast plan bound this was written against
+            // (it was the plan statement timeout until #418).
+            .isLessThan(15_000L)
         // And every group is inside one bucket, which is what the
         // bucket-first design rests on.
         for (group in plan.groups) {
