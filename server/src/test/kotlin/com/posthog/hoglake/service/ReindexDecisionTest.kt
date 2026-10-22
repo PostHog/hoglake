@@ -201,6 +201,34 @@ class ReindexDecisionTest {
     }
 
     @Test
+    fun `a near-empty partial index is judged by its excess alone`() {
+        // prod-us, 2026-10-22: hog_file_removal_undrained_path at 542 MiB
+        // over one expected page (~0 rows match `drained_at IS NULL`), read
+        // as "69372x". The ratio is a queue's high-water mark, not bloat a
+        // probe walks. MUTATION: drop `ratioMeaningful` from the ratio arm
+        // and this reds.
+        val undrained =
+            est(size = 542L shl 20, expected = 8L shl 10, name = "hog_file_removal_undrained_path")
+                .copy(partial = true, liveEntries = 0)
+        assertThat(undrained.ratio!!).isGreaterThan(60_000.0)
+        assertThat(overThreshold(undrained)).isFalse()
+        // At the floor the ratio is back. MUTATION: `>=` to `>` in
+        // ratioMeaningful reds this.
+        val atFloor = undrained.copy(liveEntries = ReindexService.MIN_RATIO_PARTIAL_LIVE_ENTRIES)
+        assertThat(overThreshold(atFloor)).isTrue()
+        assertThat(overThreshold(atFloor.copy(liveEntries = ReindexService.MIN_RATIO_PARTIAL_LIVE_ENTRIES - 1)))
+            .isFalse()
+        // The same shape on a NON-partial index keeps the ratio arm: only
+        // a predicate makes the population a queue's. MUTATION: drop the
+        // `!e.partial` term and this reds.
+        assertThat(overThreshold(undrained.copy(partial = false))).isTrue()
+        // And a gigabyte of it is still a gigabyte: the excess arm takes it.
+        // MUTATION: apply ratioMeaningful to both arms and this reds.
+        assertThat(overThreshold(undrained.copy(sizeBytes = 2L shl 30))).isTrue()
+        assertThat(ReindexService.MIN_RATIO_PARTIAL_LIVE_ENTRIES).isEqualTo(10_000L)
+    }
+
+    @Test
     fun `no estimate is never over threshold`() {
         assertThat(overThreshold(est(size = 100L shl 30, expected = null))).isFalse()
     }

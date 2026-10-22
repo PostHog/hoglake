@@ -736,6 +736,131 @@ class ReindexServiceIntegrationTest {
         assertThat(guarded(db).runOnce().index).isNotNull()
     }
 
+    /**
+     * The bounded wait (#429): a purge at its cap for the whole of
+     * HOGLAKE_REINDEX_PURGE_WAIT_WINDOWS hours no longer blocks the
+     * rebuild, and the row says it overrode the guard. Expiry rows carry
+     * explicit `started_at`s against a fixed clock, inserted in time order
+     * (the streak is cut by run_id).
+     */
+    @Test
+    fun `purge_pending yields once the purge has sat at the cap for N windows, and not one window sooner`() {
+        val (db, id) = bloatedDb()
+        val stuck = catalog(db, "rx-stuck")
+        val young = catalog(db, "rx-young")
+        val cap = ExpiryService.PURGE_REMAINING_CAP
+        val t0 = Instant.parse("2026-10-22T12:00:00Z")
+
+        fun expiryRow(
+            catalogId: Long,
+            at: Instant,
+            payload: String,
+        ) = db.jdbi.useHandleUnchecked { h ->
+            val ts = java.time.OffsetDateTime.ofInstant(at, java.time.ZoneOffset.UTC)
+            h.execute(
+                "INSERT INTO hog_maintenance_run (catalog_id, task, run_trigger, started_at, finished_at, " +
+                    "status, result) VALUES (?, 'expiry', 'loop', ?, ?, 'ok', CAST(? AS jsonb))",
+                catalogId,
+                ts,
+                ts,
+                payload,
+            )
+        }
+        val atCap = """{"snapshots_expired": 0, "purge_truncated": true, "purge_remaining": $cap}"""
+        val drained = """{"snapshots_expired": 0, "purge_remaining": 0}"""
+
+        fun hoursBefore(n: Double) = t0.minusSeconds((n * 3600).toLong())
+
+        expiryRow(id, hoursBefore(6.0), drained)
+        // At the cap long ago, then ONE sweep that drained below it, then
+        // at the cap again for two hours. MUTATION: drop the drained-row
+        // cut (count the streak from the oldest row) and the first run
+        // below reds, T-6h being past any wait.
+        expiryRow(stuck, hoursBefore(6.0), atCap)
+        expiryRow(
+            stuck,
+            hoursBefore(2.5),
+            """{"snapshots_expired": 0, "purge_truncated": true, "purge_remaining": 412}""",
+        )
+        expiryRow(stuck, hoursBefore(2.0), atCap)
+        expiryRow(stuck, hoursBefore(1.0), atCap)
+        // The latest with the count UNKNOWN: pending, and it neither breaks
+        // nor starts the streak.
+        expiryRow(stuck, t0, """{"snapshots_expired": 0, "purge_truncated": true}""")
+
+        fun service(now: Instant) =
+            ReindexService(db.jdbi, minRatioIndexBytes = 0, clock = { now }, purgeWaitWindows = 3)
+
+        // N-1 windows at the cap: still waiting. MUTATION: N-1 for N in
+        // `:since` and this reds.
+        val waiting = service(t0).runOnce()
+        assertSkipped(waiting, ReindexSkip.PURGE_PENDING)
+        assertThat(waiting.purgePendingOverridden).isNull()
+        assertThat(ledger(db).last().result!!.has("purge_pending_overridden")).isFalse()
+
+        // One hour on, the streak (from T-2h) covers three windows, but a
+        // SECOND pending catalog whose purge only just hit the cap keeps the
+        // guard: every pending catalog must be stuck. MUTATION: bool_or for
+        // bool_and and this reds.
+        val t1 = t0.plusSeconds(3600)
+        expiryRow(stuck, t1, atCap)
+        expiryRow(young, t1, atCap)
+        assertSkipped(service(t1).runOnce(), ReindexSkip.PURGE_PENDING)
+
+        // That one drains: only the stuck catalog is pending, at the cap for
+        // exactly N windows, and the rebuild goes ahead and says so.
+        // MUTATION: drop the override (always WAITING) and this reds; N+1
+        // for N and this reds.
+        expiryRow(young, t1, drained)
+        val overridden = service(t1).runOnce()
+        assertThat(overridden.skippedReason).isNull()
+        assertThat(overridden.index).isNotNull()
+        assertThat(overridden.afterBytes).isNotNull()
+        assertThat(overridden.purgePendingOverridden).isTrue()
+        val rows = ledger(db).takeLast(3)
+        assertThat(rows.map { it.catalog }).containsExactlyInAnyOrder("rx-guard", "rx-stuck", "rx-young")
+        assertThat(rows.map { it.result!!["purge_pending_overridden"].asBoolean() }).containsOnly(true)
+    }
+
+    @Test
+    fun `the purge wait must be at least one window`() {
+        val db = db()
+        assertThatThrownBy { ReindexService(db.jdbi, purgeWaitWindows = 0) }
+            .isInstanceOf(IllegalArgumentException::class.java)
+    }
+
+    /**
+     * #429's other half against real pages: a partial index whose rows all
+     * left its predicate. The estimate must say it is PARTIAL and how many
+     * entries it holds, so the ratio arm can stand down for it.
+     */
+    @Test
+    fun `a drained queue's partial index reads as partial with no live entries, and is not over threshold`() {
+        val db = db()
+        val id = catalog(db, "rx-queue")
+        db.jdbi.useHandleUnchecked { h ->
+            h.createUpdate(
+                "INSERT INTO hog_file_removal (catalog_id, path, file_kind, reason) " +
+                    "SELECT :c, 's3://reindex/garbage/' || md5(g::text) || '.parquet', 'data', 'snapshot_expiry' " +
+                    "FROM generate_series(1, 50000) g",
+            ).bind("c", id).execute()
+            h.execute("UPDATE hog_file_removal SET drained_at = now(), drained_outcome = 'deleted'")
+            h.execute("VACUUM (ANALYZE) hog_file_removal")
+        }
+        val byName = estimates(db).associateBy { it.index }
+        val queue = byName.getValue("hog_file_removal_undrained_path")
+        assertThat(queue.partial).isTrue()
+        assertThat(queue.liveEntries).isZero()
+        // The shape prod-us read as "69372x": megabytes over one page.
+        assertThat(queue.ratio!!).isGreaterThan(ReindexService.RATIO_THRESHOLD)
+        assertThat(queue.sizeBytes).isGreaterThan(1L shl 20)
+        assertThat(ReindexService.overThreshold(queue, minRatioIndexBytes = 0)).isFalse()
+        // The table's own primary key is not partial and holds every row.
+        val pkey = byName.getValue("hog_file_removal_pkey")
+        assertThat(pkey.partial).isFalse()
+        assertThat(pkey.liveEntries).isEqualTo(50_000L)
+    }
+
     @Test
     fun `retirement and purge only skip a rebuild that would happen, so a quiet hour stays quiet`() {
         val db = db()

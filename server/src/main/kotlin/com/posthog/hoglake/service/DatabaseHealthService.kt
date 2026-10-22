@@ -129,12 +129,20 @@ class DatabaseHealthService(
                         "${bytes(worst.sumOf { it.excessBytes ?: 0L })} estimated excess",
                     worst.joinToString("; ") {
                         "${it.table}.${it.index}: ${bytes(it.sizeBytes)}, ~${bytes(it.excessBytes ?: 0L)} " +
-                            "excess (%.1fx)".format(it.ratio ?: 0.0)
+                            // A near-empty partial index's ratio is its
+                            // high-water mark over a page or two (#429:
+                            // "69372x"); the excess is the honest figure.
+                            if (ReindexService.ratioMeaningful(it)) {
+                                "excess (%.1fx)".format(it.ratio ?: 0.0)
+                            } else {
+                                "excess (partial, ${it.liveEntries ?: 0} live entries)"
+                            }
                     } + ". Estimated from pg_stats (check_postgres arithmetic) as of the last " +
                         "VACUUM/ANALYZE; threshold ${ReindexService.RATIO_THRESHOLD}x, or " +
                         "${bytes(ReindexService.EXCESS_BYTES_THRESHOLD)} excess at " +
-                        "${ReindexService.EXCESS_MIN_RATIO}x. Deduplicated indexes (many equal " +
-                        "keys) are under-reported.",
+                        "${ReindexService.EXCESS_MIN_RATIO}x; a partial index under " +
+                        "${ReindexService.MIN_RATIO_PARTIAL_LIVE_ENTRIES} live entries by excess alone. " +
+                        "Deduplicated indexes (many equal keys) are under-reported.",
                     "Autovacuum never shrinks an index. On this schema bloat arrives in steps — " +
                         "a retirement, an expiry purge, a large compaction — and stays: every " +
                         "commit writes into the bloated index and every probe descends it. " +

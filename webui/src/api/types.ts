@@ -1066,6 +1066,11 @@ export interface ReindexResult {
   after_bytes?: Int64;
   duration_ms?: Int64;
   skipped_reason?: ReindexSkip;
+  /**
+   * purge_pending would have fired, but the purge has sat at its cap for the
+   * whole bounded wait, so this run rebuilt anyway. Absent otherwise.
+   */
+  purge_pending_overridden?: boolean;
   /** The rebuild succeeded but reading it back failed (row stays ok). */
   post_step_error?: string;
   /** Candidates passed over (too large / last attempt failed) by a run that rebuilt. */

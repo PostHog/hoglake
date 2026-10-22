@@ -5360,7 +5360,8 @@ components:
         check_postgres / ioguix arithmetic, no extension), and at most
         ONE — the largest estimated excess among those over threshold
         (ratio >= 3.0 on an index of at least 8 MiB, or >= 1 GiB of
-        excess at a ratio of at least 1.5) — is rebuilt with REINDEX INDEX CONCURRENTLY, on its own
+        excess at a ratio of at least 1.5; a partial index with fewer
+        than 10,000 live entries by the excess rule alone) — is rebuilt with REINDEX INDEX CONCURRENTLY, on its own
         connection, outside every commit lock. Primary-key and unique
         indexes are eligible (PG >= 12 rebuilds them in place); on equal
         excess a non-constraint index goes first.
@@ -5431,7 +5432,11 @@ components:
             dropped table whose rows retirement may delete now (it is
             what creates the bloat). purge_pending: some catalog's latest
             expiry run left purge_remaining at its cap, or truncated with
-            the count unknown (routine lag does not count).
+            the count unknown (routine lag does not count) — until every
+            such catalog's purge has stayed at the cap, never once
+            draining below it, for HOGLAKE_REINDEX_PURGE_WAIT_WINDOWS
+            hours (default 3), after which the run rebuilds anyway and
+            says so in purge_pending_overridden.
             migration_pending: a replica holds the migration lock, or
             Flyway's history has a failed row. reindex_in_progress: any
             index build is running in this database.
@@ -5446,6 +5451,15 @@ components:
             leaves the ledger or a human rebuilds it).
             migration_pending and reindex_in_progress do not close the
             hour: the next poll retries until the hour ends.
+        purge_pending_overridden:
+          type: boolean
+          description: >
+            True when purge_pending would have fired but every catalog it
+            fired for has had its expiry purge at the cap for
+            HOGLAKE_REINDEX_PURGE_WAIT_WINDOWS hours, so this run rebuilt
+            (or attempted) `index` anyway: a purge that does not drain
+            is not waited on forever. Absent otherwise, including on
+            every row written before the field existed.
         post_step_error:
           type: string
           description: >
@@ -5818,7 +5832,9 @@ components:
             Estimated actual / freshly-built size (1.0 = no bloat). The
             reindex task rebuilds at >= 3.0 on an index of at least
             8 MiB, or at >= 1 GiB of estimated_bloat_bytes with a ratio
-            of at least 1.5; the
+            of at least 1.5 (a partial index under 10,000 live entries,
+            whose ratio is its high-water mark over a page or two, by the
+            second rule only); the
             index_bloat finding fires on the same predicate. Absent under
             the same conditions as estimated_bloat_bytes.
 

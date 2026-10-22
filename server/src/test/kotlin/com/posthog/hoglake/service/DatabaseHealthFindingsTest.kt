@@ -632,6 +632,64 @@ class DatabaseHealthFindingsTest {
     }
 
     /**
+     * `index_bloat` on prod-us's 2026-10-22 shape (#429): the stats pkey
+     * genuinely bloated, and two partial indexes on `hog_file_removal`
+     * with ~0 rows matching `drained_at IS NULL` that read "69372x" and
+     * "20764x". Fed through the SAME filter `report()` applies.
+     */
+    @Test
+    fun `a near-empty partial index is not reported by its ratio, and a gigabyte of it by excess alone`() {
+        val estimates =
+            listOf(
+                IndexBloatEstimate(
+                    "hog_file_column_stats",
+                    "hog_file_column_stats_pkey",
+                    sizeBytes = 31_000L shl 20,
+                    expectedBytes = 17_200L shl 20,
+                    constraintBacking = true,
+                    liveEntries = 400_000_000,
+                ),
+                IndexBloatEstimate(
+                    "hog_file_removal",
+                    "hog_file_removal_undrained_path",
+                    sizeBytes = 542L shl 20,
+                    expectedBytes = 8L shl 10,
+                    constraintBacking = false,
+                    partial = true,
+                    liveEntries = 0,
+                ),
+                IndexBloatEstimate(
+                    "hog_file_removal",
+                    "hog_file_removal_drain",
+                    sizeBytes = 162L shl 20,
+                    expectedBytes = 8L shl 10,
+                    constraintBacking = false,
+                    partial = true,
+                    liveEntries = 3,
+                ),
+            )
+        val bloated = estimates.filter { ReindexService.overThreshold(it) }
+        assertThat(bloated.map { it.index }).containsExactly("hog_file_column_stats_pkey")
+        val finding =
+            findingsOf(bloatedIndexes = bloated, reindexLoopSeen = true).single { it.code == "index_bloat" }
+        assertThat(finding.title).contains("1 index(es)")
+        assertThat(finding.detail).doesNotContain("hog_file_removal").contains("(1.8x)")
+
+        // Past a gigabyte of excess the same partial index IS reported —
+        // and rebuilt — with its excess and population, never its ratio.
+        // MUTATION: render `%.1fx` for every index and this reds.
+        val deep = estimates[1].copy(sizeBytes = 2L shl 30)
+        val withDeep = (estimates.take(1) + deep).filter { ReindexService.overThreshold(it) }
+        assertThat(withDeep.map { it.index }).contains("hog_file_removal_undrained_path")
+        val detail =
+            findingsOf(bloatedIndexes = withDeep, reindexLoopSeen = true).single { it.code == "index_bloat" }.detail
+        assertThat(
+            detail,
+        ).contains("hog_file_removal_undrained_path: 2.0 GiB, ~2.0 GiB excess (partial, 0 live entries)")
+        assertThat(detail).doesNotContain("262144").doesNotContain("262143")
+    }
+
+    /**
      * The `toast_dominant` finding, which exists because #240 was
      * invisible for a year: `hog_commit_receipt` was 58.2 GiB of which
      * 58.1 GiB was TOAST, and the console's tables list carried

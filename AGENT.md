@@ -1307,7 +1307,20 @@ ran on the local stack and what it showed.
     `purge_remaining` at `ExpiryService.PURGE_REMAINING_CAP`, or is
     truncated with the count unknown — routine lag is not a mass delete), which would re-bloat the index within hours and
     are asked only when something IS over threshold, so a quiet hour
-    stays a quiet row through a week-long retirement. A
+    stays a quiet row through a week-long retirement. `purge_pending` is
+    a WASTED-WORK guard, not a correctness or lock one (REINDEX
+    CONCURRENTLY tolerates the purge's DML), and its wait is BOUNDED
+    (#429): once every pending catalog's purge has stayed at the cap,
+    never once draining below it, for `HOGLAKE_REINDEX_PURGE_WAIT_WINDOWS`
+    hours (default 3, at least 1), the run rebuilds anyway and the row
+    carries `purge_pending_overridden: true` — a purge that cannot drain
+    (prod-us 2026-10-22, the #419 cascade cost) deletes at its budgeted
+    rate whether the rebuild waits or not, so waiting only lets the
+    excess grow. The ratio arm skips a PARTIAL index under
+    `MIN_RATIO_PARTIAL_LIVE_ENTRIES` (10,000) live entries — a drained
+    queue's index (`hog_file_removal_undrained_path` read "69372x") is
+    its high-water mark over a page — so it is rebuilt, and reported by
+    `index_bloat`, on the 1 GiB excess arm only. A
     failed REINDEX is a `failed` row carrying the attempt, never retried
     in-run, and drops its own `_ccnew` at once (one cancelled in
     validation is ready for writes). READING THE
