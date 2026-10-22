@@ -186,6 +186,7 @@ class App private constructor(
                 claimTtlSeconds = cfg.compactionClaimTtlSeconds,
                 committedClaimTtlSeconds = cfg.compactionCommittedClaimTtlSeconds,
                 bucketClaimTtlSeconds = cfg.compactionBucketClaimTtlSeconds,
+                planStatementTimeoutMs = cfg.compactionPlanStatementTimeoutMs,
                 commitLockTimeoutMs = cfg.commitLockTimeoutMs,
                 nestedSortExpansion = cfg.compactionNestedSortExpansion,
                 sortedHeapBytes = cfg.compactionSortedHeapBytes,

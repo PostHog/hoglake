@@ -30,9 +30,12 @@ import java.util.UUID
  * [groupKey] is a hex SHA-256 over the group's spec id, its partition
  * values and its sorted input `data_file_id`s. Two replicas planning
  * from the same catalog metadata form the same group and compute the
- * same key. `INSERT ... ON CONFLICT` arbitrates each key. A separate
- * catalog planning lock prevents overlapping plans from reserving
- * different keys for the same input files.
+ * same key. `INSERT ... ON CONFLICT` arbitrates each key. Overlapping
+ * plans reserving DIFFERENT keys for the same input files is stopped one
+ * level up: `CompactionService.planAndClaim` takes the catalog planning
+ * lock for its claim transaction and re-reads [liveClaimedFileIds] under
+ * it before inserting, dropping every group that overlaps a live claim.
+ * Planning itself takes no lock (#418).
  *
  * The planner's skip is nevertheless by **overlap**, not by key
  * equality ([liveClaimedFileIds]). Bin packing is a function of the
@@ -59,7 +62,8 @@ import java.util.UUID
  * sibling can only honour it AFTER it has probed the bucket and read
  * every candidate row — which is exactly the work that multiplied on
  * gigahog-prod-us on 2026-10-21. Nine maintenance pods planned
- * millpond-prod-us one after another under the catalog planning lock,
+ * millpond-prod-us one after another under the catalog planning lock
+ * (which covered the probes then, and since #418 covers only the claims),
  * each probing the same 123 buckets (`candidates_fetched` 50,029 every
  * time) and discarding its predecessors' groups (`claimed_elsewhere`
  * 0, 64, 128, ... 320), and the probes were millpond's day buckets —
@@ -212,9 +216,14 @@ internal object CompactionClaimRepo {
      * Every file id under a LIVE claim for this table — the planner's
      * skip set.
      *
-     * Read after packing. Execution plans hold the catalog planning lock
-     * until they claim all selected groups. Metadata-only previews do not
-     * take the lock or create claims.
+     * Read twice by an execution plan: after packing, unlocked (phase
+     * (c), an early drop), and again inside the claim transaction under
+     * the catalog planning lock, where it is exact because every sibling
+     * commits its claims before releasing that lock. Metadata-only
+     * previews read it once and take no lock and no claim. (The probe
+     * itself also excludes these ids, in SQL — `CompactionService.candidateSql`
+     * — so the overlap these reads find is only what was claimed after the
+     * probe's snapshot.)
      */
     fun liveClaimedFileIds(
         h: Handle,

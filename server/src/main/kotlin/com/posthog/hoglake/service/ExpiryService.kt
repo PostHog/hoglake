@@ -452,6 +452,38 @@ class ExpiryService(
          * no cross-arm gate to get wrong. The cascade still fires at end
          * of statement and finds nothing, which is the point.
          *
+         * # The stats and partition-value cascades stay (#419, measured)
+         *
+         * `hog_file_column_stats` and `hog_file_partition_value` are left
+         * to their FKs' `ON DELETE CASCADE`, and that is a measurement,
+         * not an oversight. Deleting them explicitly here, keyed off
+         * `doomed`, does not stop the RI trigger: it still fires once per
+         * deleted file, still descends `hog_file_column_stats_pkey`, and
+         * still fetches each of the file's ~26 heap tuples to see they are
+         * already deleted (index entries stay until VACUUM). On
+         * `ExpiryPurgeCostMeasurement`'s fixture (100,000 files, 26 stats
+         * rows + 1 partition value each, one page of 1,000, evicted pool,
+         * every buffer including trigger work) the production shape
+         * touches 83,436 buffers and reads 3,922; the explicit
+         * `= ANY (ARRAY(SELECT … FROM doomed))` shape touches 112,564 and
+         * reads 3,947, and the page goes 28.1 ms -> 34.1 ms. The reads —
+         * production's cost on a stats relation that does not fit cache —
+         * are the same pages either way.
+         *
+         * Taking the trigger away was measured too, and not shipped: the
+         * three FKs made `NOT ENFORCED` (PG 18), with this page deleting
+         * the dependents itself, costs 73,515 buffers, 3,947 reads,
+         * 22.4 ms (against the cascade's 83,436 / 3,922 / 28.1 ms in the
+         * same run) — 12% of the buffers and NONE of the reads. The
+         * page's cost is ~3.9 cold reads per file on the stats primary key
+         * and its heap, and no delete shape changes that. Against 12%:
+         * the `ALTER` takes ACCESS EXCLUSIVE on `hog_data_file`, every
+         * deleter of file rows (this page, `RetirementService`, the
+         * catalog drop) must then delete dependents itself, and a pod on
+         * the older code orphans them during a rollout.
+         * `ExpiryPurgeCostMeasurement` has the three shapes; the cascade
+         * set is pinned by `ExpiryPurgeIntegrationTest`.
+         *
          * THE OUTER DELETES REPEAT THE ELIGIBILITY PREDICATE, and that
          * is a correctness fix rather than belt-and-braces. Under READ
          * COMMITTED a row updated between the InitPlan and the DELETE

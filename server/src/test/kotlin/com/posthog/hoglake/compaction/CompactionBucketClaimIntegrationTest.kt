@@ -11,6 +11,7 @@ import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.PartitionFieldDef
 import com.posthog.hoglake.model.TableAppend
 import com.posthog.hoglake.model.Transform
+import com.posthog.hoglake.persistence.Locks
 import com.posthog.hoglake.service.AlterService
 import com.posthog.hoglake.service.CatalogService
 import com.posthog.hoglake.service.MaintenanceSummarySampler
@@ -36,6 +37,7 @@ import java.nio.file.Files
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
+import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -386,7 +388,9 @@ class CompactionBucketClaimIntegrationTest {
         // group: the sibling skips it (`bucketsSkippedClaimed` 1) and the
         // second group waits a whole sweep for nobody.
         assertThat(second.bucketsSkippedClaimed).isZero()
-        assertThat(second.claimedElsewhere).isEqualTo(1)
+        // The held group's files are excluded at the probe (#418) rather
+        // than found by overlap after it.
+        assertThat(second.claimedElsewhere).isZero()
         assertThat(second.groupsCompacted).isEqualTo(1)
         assertThat(first.groupsCompacted).isEqualTo(1)
         assertThat(liveByDay(cat)).isEqualTo(mapOf("2026-10-01" to 2))
@@ -446,9 +450,217 @@ class CompactionBucketClaimIntegrationTest {
         // the first run to settle.
         assertThat(first.candidatesTruncated).isEqualTo(1)
         assertThat(second.bucketsSkippedClaimed).isEqualTo(1)
-        assertThat(second.claimedElsewhere).describedAs("y's first group, held by the first run").isEqualTo(1)
-        assertThat(second.groupsCompacted).describedAs("y's next two files, past the first run's cut").isEqualTo(1)
+        // y's first group is held by the first run; its files are excluded
+        // at the sibling's probe (#418), so nothing is dropped after it.
+        assertThat(second.claimedElsewhere).isZero()
+        // With the first run's two claimed files excluded at the probe, the
+        // sibling's whole budget of 4 goes to y's four unread files: two
+        // groups (one, before #418, when the claimed pair still took room).
+        assertThat(second.groupsCompacted).describedAs("y's four unread files").isEqualTo(2)
         assertThat(first.groupsCompacted).isEqualTo(2)
+    }
+
+    @Test
+    fun `a planner blocked inside its probe does not hold up a sibling's plan and claims`() {
+        // #418: the planning lock was held across every probe, so one pod
+        // inside a 15 s probe made every sibling queue on
+        // `pg_advisory_lock` and hit its own 15 s bound there (38 of 40
+        // millpond-prod-us sweeps, 2026-10-22). Pod A is held inside its
+        // probe transaction — snapshot taken, before any bucket — while
+        // pod B plans, claims and compacts the whole table.
+        val cat = fixture()
+        val podA = CompactionService(db.jdbi, store, cfg, plannerIdentity = "maintenance-a")
+        val podB = CompactionService(db.jdbi, store, cfg, plannerIdentity = "maintenance-b")
+        val inProbe = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        podA.beforeFetch = { h ->
+            // Pin phase (a)'s REPEATABLE READ snapshot before B runs, so A
+            // plans the table as it was: B's groups, B's files.
+            h.createQuery("SELECT 1").mapTo(Int::class.java).one()
+            inProbe.countDown()
+            // Busy, not idle, as a probe is: a statement every 100 ms keeps
+            // the suite's 2 s idle-in-transaction guard off A's connection
+            // however long B takes.
+            var waited = 0
+            while (!release.await(100, TimeUnit.MILLISECONDS)) {
+                h.createQuery("SELECT 1").mapTo(Int::class.java).one()
+                check(++waited < 600)
+            }
+        }
+        val pool = Executors.newFixedThreadPool(2)
+        try {
+            val a = pool.submit<CompactionResult> { podA.runOnce(cat, cfg) }
+            assertThat(inProbe.await(60, TimeUnit.SECONDS)).isTrue()
+            val started = System.nanoTime()
+            // MUTATION: take the planning lock before `planSnapshot` again
+            // (as 1.4.1 did) and B waits on it for its 15 s lock_timeout
+            // and fails: this get times out, or B throws.
+            val second = pool.submit<CompactionResult> { podB.runOnce(cat, cfg) }.get(10, TimeUnit.SECONDS)
+            val waitedMs = (System.nanoTime() - started) / 1_000_000
+            assertThat(second.groupsCompacted).isEqualTo(DAYS.size.toLong())
+            assertThat(second.claimedElsewhere).isZero()
+            assertThat(second.bucketsSkippedClaimed).isZero()
+            assertThat(waitedMs).describedAs("B planned and compacted without A's probe in its way").isLessThan(10_000)
+            release.countDown()
+            val first = a.get(60, TimeUnit.SECONDS)
+            // A's snapshot predates B's markers, so A probes all four
+            // buckets and packs B's groups again; B's committed claims are
+            // still live (shortened, not deleted), so every one is dropped
+            // as claimed elsewhere and nothing is rewritten twice.
+            assertThat(first.bucketsSkippedClaimed).isZero()
+            assertThat(first.bucketsConsidered).isEqualTo(DAYS.size.toLong())
+            assertThat(first.claimedElsewhere).isEqualTo(DAYS.size.toLong())
+            assertThat(first.groupsCompacted).isZero()
+            assertThat(first.skippedConflicts).isZero()
+            assertThat(first.failedGroups).isZero()
+        } finally {
+            release.countDown()
+            pool.shutdownNow()
+        }
+        assertThat(liveByDay(cat)).isEqualTo(DAYS.associateWith { 1 })
+        assertThat(bucketClaims(cat)).isEmpty()
+    }
+
+    @Test
+    fun `claims are re-read under the planning lock, so a sibling's claims since phase (c) are honoured`() {
+        // The race the lock used to close by covering the probes: A has
+        // planned (its phase (c) found nothing held) and not yet claimed;
+        // one more file lands in the first day, and B plans with it and
+        // claims every bucket — so B's group for that day has a DIFFERENT
+        // key over three of A's four files. A's claim transaction must
+        // drop all four of its groups by overlap, under the lock, before
+        // inserting anything.
+        val cat = fixture()
+        val podA = CompactionService(db.jdbi, store, cfg, plannerIdentity = "maintenance-a")
+        val podB = CompactionService(db.jdbi, store, cfg, plannerIdentity = "maintenance-b")
+        val planned = CountDownLatch(1)
+        val resume = CountDownLatch(1)
+        podA.beforeClaims = {
+            planned.countDown()
+            check(resume.await(60, TimeUnit.SECONDS))
+        }
+        val pool = Executors.newSingleThreadExecutor()
+        try {
+            val a = pool.submit<CompactionResult> { podA.runOnce(cat, cfg) }
+            assertThat(planned.await(60, TimeUnit.SECONDS)).isTrue()
+            append(cat, DAYS.first(), 1)
+            val (second, first) =
+                whileHeld(podB, cat, cfg) {
+                    assertThat(bucketClaims(cat))
+                        .containsExactlyInAnyOrderElementsOf(DAYS.map { bucketKey(cat, it) })
+                    resume.countDown()
+                    a.get(60, TimeUnit.SECONDS)
+                }
+            // MUTATION: drop the in-lock `liveClaimedFileIds` re-read from
+            // `planAndClaim` and A claims the first day's group under its
+            // own key (the other three collide on B's keys): A rewrites
+            // three files B is rewriting (`groupsCompacted` 1,
+            // `claimedElsewhere` 3), and one of the two loses at commit.
+            assertThat(first.claimedElsewhere).isEqualTo(DAYS.size.toLong())
+            assertThat(first.groupsCompacted).isZero()
+            assertThat(first.skippedConflicts).isZero()
+            assertThat(second.groupsCompacted).isEqualTo(DAYS.size.toLong())
+            assertThat(second.skippedConflicts).isZero()
+        } finally {
+            resume.countDown()
+            pool.shutdownNow()
+        }
+        assertThat(liveByDay(cat)).isEqualTo(DAYS.associateWith { 1 })
+        assertThat(bucketClaims(cat)).isEmpty()
+    }
+
+    @Test
+    fun `the planning lock is released only after the claims commit`() {
+        // A sibling granted the lock must re-read with our claims VISIBLE,
+        // or the in-lock re-read is not exact. A waiter is parked on the
+        // lock while the claim transaction is between its last insert and
+        // its commit; when it is granted the lock it counts the table's
+        // live group claims on its own session.
+        val cat = fixture()
+        val (catalogId, tableId) = ids(cat)
+        val pod = CompactionService(db.jdbi, store, cfg, plannerIdentity = "maintenance-a")
+        val waiter = Executors.newSingleThreadExecutor()
+        val seen = java.util.concurrent.atomic.AtomicReference<Future<Long>>()
+        pod.beforeClaimCommit = {
+            seen.set(
+                waiter.submit<Long> {
+                    db.jdbi.withHandleUnchecked { h ->
+                        h.createQuery("SELECT pg_advisory_lock((:cls::bigint << 32) | (:id::bigint & 4294967295))")
+                            .bind("cls", Locks.CATALOG_COMPACTION_PLAN_LOCK_CLASS).bind("id", catalogId)
+                            .mapToMap().one()
+                        try {
+                            h.createQuery(
+                                "SELECT count(*) FROM hog_compaction_claim WHERE catalog_id = :c AND table_id = :t " +
+                                    "AND NOT starts_with(group_key, 'bucket:')",
+                            ).bind("c", catalogId).bind("t", tableId).mapTo(Long::class.java).one()
+                        } finally {
+                            h.createQuery(
+                                "SELECT pg_advisory_unlock((:cls::bigint << 32) | (:id::bigint & 4294967295))",
+                            ).bind("cls", Locks.CATALOG_COMPACTION_PLAN_LOCK_CLASS).bind("id", catalogId)
+                                .mapToMap().one()
+                        }
+                    }
+                },
+            )
+            // Give the waiter time to block on the lock (or, under the
+            // mutation, to be granted it before the commit and read).
+            Thread.sleep(500)
+        }
+        try {
+            val (run, _) = whileHeld(pod, cat, cfg) { }
+            // MUTATION: release the lock inside the claim transaction,
+            // before `beforeClaimCommit` (i.e. before the commit), and the
+            // waiter reads 0 claims.
+            assertThat(seen.get().get(30, TimeUnit.SECONDS))
+                .describedAs("the waiter, granted the lock, sees every group claim committed")
+                .isEqualTo(DAYS.size.toLong())
+            assertThat(run.groupsCompacted).isEqualTo(DAYS.size.toLong())
+        } finally {
+            waiter.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `a sibling reads past a held bucket's claimed files instead of colliding on them`() {
+        // ONE bucket of twelve files, fan-in 3: four groups. The first run
+        // has room for two, claims them, and (holding only half the
+        // bucket) does not mark it. The second planner probes the same
+        // bucket while those claims are live: the probe's live-claim filter
+        // (#418) excludes the six claimed files, so it packs the OTHER two
+        // groups — nothing dropped after the probe, no file in both runs.
+        val cat = fixture(days = listOf("2026-10-01"), filesPerDay = 12)
+        val narrow = cfg.copy(maxInputFiles = 3, maxFanIn = 3, minInputFiles = 2)
+        val (catalogId, tableId) = ids(cat)
+        val podA = CompactionService(db.jdbi, store, narrow, plannerIdentity = "maintenance-a")
+        val podB = CompactionService(db.jdbi, store, narrow, plannerIdentity = "maintenance-b")
+        val before = liveByDay(cat).getValue("2026-10-01")
+
+        fun claimedIds(): Set<Long> =
+            db.jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    "SELECT unnest(input_file_ids) FROM hog_compaction_claim " +
+                        "WHERE catalog_id = :c AND table_id = :t AND expires_at > now()",
+                ).bind("c", catalogId).bind("t", tableId).mapTo(Long::class.java).set()
+            }
+        val (first, inWindow) =
+            whileHeld(podA, cat, narrow.copy(maxGroupsPerRun = 2)) {
+                assertThat(bucketClaims(cat)).describedAs("half the bucket held: no marker").isEmpty()
+                val aClaims = claimedIds()
+                val second = podB.runOnce(cat, narrow.copy(maxGroupsPerRun = 2))
+                Triple(aClaims, claimedIds(), second)
+            }
+        val (aClaims, allClaims, second) = inWindow
+        assertThat(aClaims).hasSize(6)
+        // MUTATION: drop the live-claim filter from `candidateSql` and the
+        // second planner packs the first run's two groups again, drops them
+        // after the probe (`claimedElsewhere` 2) and takes the other two.
+        assertThat(second.claimedElsewhere).describedAs("nothing collided").isZero()
+        assertThat(second.groupsCompacted).isEqualTo(2)
+        assertThat(first.groupsCompacted).isEqualTo(2)
+        assertThat(allClaims).describedAs("both runs' claims, disjoint, every file once").hasSize(12)
+        assertThat(liveByDay(cat).getValue("2026-10-01"))
+            .describedAs("twelve inputs became four outputs")
+            .isEqualTo(before - 12 + 4)
     }
 
     /** Seconds until [key]'s claim row expires (negative once it has). */
@@ -509,9 +721,9 @@ class CompactionBucketClaimIntegrationTest {
         // reaches that window.)
         assertThat(lapsed.bucketsSkippedClaimed).describedAs("the marker lapsed after its 2 s lease").isZero()
         assertThat(lapsed.bucketsConsidered).isEqualTo(2)
-        // The group claim is still live, so the probe finds the held group
-        // by overlap: the pre-marker behaviour, not a duplicate rewrite.
-        assertThat(lapsed.claimedGroups).isEqualTo(2)
+        // The group claims are still live, so the probe excludes the held
+        // groups' files (#418): no duplicate rewrite, and nothing to drop.
+        assertThat(lapsed.claimedGroups).isZero()
         assertThat(lapsed.groups).isEmpty()
     }
 

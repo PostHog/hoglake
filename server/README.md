@@ -704,6 +704,40 @@ in meaning: it bounds SNAPSHOTS, and therefore phase A's
 when phase A's own statement bound fires
 (`hoglake_expiry_halvings_total{phase="advance"}`).
 
+**The stats cascade is where a page's time goes, and no way of deleting
+the dependents moves it (#419, measured).** Production's cancelled pages
+carry `CONTEXT: … DELETE FROM ONLY "hog_file_column_stats" WHERE $1 =
+"catalog_id" AND $2 = "data_file_id"` — the RI trigger, one call per
+doomed file. Two alternatives were measured and neither shipped:
+deleting `hog_file_column_stats` and `hog_file_partition_value`
+explicitly in the page's CTE (keyed off the rows the page actually
+deleted) beside the cascade, which leaves the trigger nothing to delete
+but not nothing to do — it still fires per file, descends the stats pkey
+and fetches each dead heap tuple, because index entries outlive the
+delete until VACUUM; and the same explicit delete with the three FKs into
+`hog_data_file` made `NOT ENFORCED` (PG 18), so no trigger runs at all.
+`ExpiryPurgeCostMeasurement` (100,000 files, 26 stats rows + 1 partition
+value each, one page of 1,000 from an evicted pool, every buffer the
+transaction touched including trigger work):
+
+| page shape | buffers | read | page |
+|---|---|---|---|
+| production (cascade deletes) | 83,436 | 3,922 | 28.1 ms |
+| explicit `= ANY (ARRAY(SELECT … FROM doomed))` beside the cascade | 112,564 | 3,947 | 34.1 ms |
+| explicit, FKs `NOT ENFORCED` | 73,515 | 3,947 | 22.4 ms |
+
+The reads — ~3.9 cold pages per file, the dependents themselves on the
+stats primary key and its heap, the whole of the cost on a stats relation
+that does not fit cache — are the same pages in every shape. At RDS
+random-read latency they are why a 1,000-file page meets the 5 s bound and
+halves. `NOT ENFORCED` saves the per-row probe, 12% of the buffers and no
+reads, and was not shipped for that: its `ALTER` takes ACCESS EXCLUSIVE
+on `hog_data_file`, every deleter of file rows (expiry, retirement, the
+catalog drop) would have to delete dependents itself, and a pod on the
+older code would orphan them during the rollout. `ExpiryPurgeIntegrationTest`
+pins the cascade set into `hog_data_file`, and its enforcement, against
+`pg_constraint`.
+
 **What to alert on.** A sweep that spends its budget, hits a failed page,
 or cannot read the floor reports `purge_truncated` with `purge_remaining`
 (saturating at 100,000) and `purge_failures` on its ledger row, and the
@@ -1180,12 +1214,37 @@ window is per GROUP and is not divided by `parallelGroups`; an operator
 running both knobs high on a small pod should lower one of them.
 
 `HOGLAKE_COMPACTION_CLAIMS_ENABLED` (default **on**) enables group claims.
-Each execution plan holds a per-catalog advisory lock while it reads candidates,
-packs groups, and claims the selected queue. The queue is limited to the remaining
-run budget. Planning and claims use one connection and separate transactions;
-packing has no open transaction. The lock is separate from the commit and
-retirement locks. Its wait is limited to 15 seconds. File I/O starts after unlock.
-Metadata-only plan previews do not lock or claim work.
+Each execution plan reads candidates and packs groups with NO lock held, then
+takes a per-catalog advisory lock for its claim transaction only: under it, the
+transaction re-reads the table's live claims, drops every planned group that
+overlaps one (`claimed_elsewhere`), and claims the selected queue, limited to the
+remaining run budget. The lock is released after that transaction commits, so the
+next holder's re-read sees these claims. Planning and claims use one connection
+and separate transactions; packing has no open transaction. The lock is separate
+from the commit and retirement locks. Its wait is bounded by a 15 s
+`lock_timeout` and queues only behind siblings' claim transactions. A claim
+transaction that fails plans nothing for the table (the catalog's run fails and
+the ledger records it); it never falls back to an unclaimed plan. File I/O starts
+after unlock. Metadata-only plan previews do not lock or claim work.
+
+Until #418 the lock was taken before the candidate read and held through every
+probe. On gigahog-prod-us (1.4.1, 2026-10-22, nine planners) one pod in a 15 s
+probe made the other eight queue on `pg_advisory_lock` and hit their own 15 s
+bound there — 38 of 40 millpond-prod-us sweeps failed, most of them on the lock
+wait. What the lock protected is two plans reserving different group keys for
+the same files; the in-lock re-read protects that on its own. Two more pieces
+came with the move:
+
+- **Claimed files are not candidates.** Every probe excludes files under a
+  live claim (an uncorrelated `NOT IN` over the table's claimed ids, hashed once
+  per probe), so planners on one hot bucket read successive windows instead of
+  packing the same groups and dropping them as `claimed_elsewhere`. A claim
+  committed after a probe's snapshot is still caught by phase (c) or the
+  in-lock re-read: a wasted probe, never a duplicate rewrite.
+- **`HOGLAKE_COMPACTION_PLAN_STATEMENT_TIMEOUT_MS`** (default **60,000**, the
+  session's bound; at least 1,000) replaces the fixed 15 s plan statement
+  bound. That was a fail-fast for a slow probe under the lock; without the lock
+  a slow probe costs one pod one sweep and yields the bucket's whole window.
 
 `HOGLAKE_COMPACTION_CLAIM_TTL_SECONDS` defaults to **3600** seconds. Set it above
 the longest full run, including queue time. Each group refreshes its live claim
@@ -1196,8 +1255,10 @@ heap refusal release claims for groups that did not start.
 The next planner sees all queued claims and excludes groups with overlapping
 inputs. Claim skips increment `claimed_elsewhere` and do not consume the run
 budget. Existing explicit TTL settings override the new default. Update shorter
-settings before adding concurrent compactors. All compactors must use the new
-planning lock before the full queue protection applies.
+settings before adding concurrent compactors. A fleet mixing this version with
+1.4.1 is safe: 1.4.1 holds the planning lock across its read and its claims, and
+this version re-reads the live claims under the same lock. Only a version from
+before the planning lock existed is unsafe beside either.
 
 **How N maintenance pods share one catalog.** Group claims make
 EXECUTION disjoint; three more pieces make PLANNING disjoint, after
@@ -1222,8 +1283,10 @@ the 15 s plan timeout, 19 failures in nine minutes.
   table's live bucket claims on its candidate snapshot and skips those
   buckets without probing them (`buckets_skipped_claimed` in the run
   result, `hoglake_compaction_buckets_skipped_claimed_total{catalog}`).
-  Because plans serialize on the planning lock and a plan's claims commit
-  before it releases the lock, the next plan always sees them. The claim
+  Planning takes no lock (#418), so a marker committed after a planner's
+  snapshot is missed by that planner: it probes the bucket, its probe skips
+  the files already claimed, and its claim transaction drops any overlap
+  under the lock. The claim
   is released when the last of the bucket's groups settles (committed,
   skipped, failed, or released unstarted). Its lease is SHORT —
   `HOGLAKE_COMPACTION_BUCKET_CLAIM_TTL_SECONDS`, default **600**, against
@@ -1233,10 +1296,13 @@ the 15 s plan timeout, 19 failures in nine minutes.
   releases nothing (`BackgroundLoops.close` abandons the sweep after
   5 s), and a leaked bucket claim hides a whole bucket, new files
   included; on the group lease a rolling deploy would take a share of a
-  hot table's buckets out of compaction for an hour. A bucket with a group left
-  over (the run's room ran out, or a claim insert lost) is NOT marked,
-  so a sibling can still take what is left, and finds the held groups by
-  overlap as before. Like group claims it is an optimization: ignore it
+  hot table's buckets out of compaction for an hour. Because every group's
+  refresh renews ALL of the run's outstanding markers, a marked bucket stays
+  hidden until the last of its own groups settles, wherever they sit in the
+  run's queue — that is the intent: the marker means "this run holds all of
+  it". A bucket with a group left over (the run's room ran out, or a claim
+  insert lost) is NOT marked, so a sibling can still take what is left; its
+  probe skips the claimed files and reads the rest. Like group claims it is an optimization: ignore it
   and the cost is the old re-probe, never a wrong commit. The tier rows
   carry no file ids, so a cheaper per-file check was not available.
 - **Per-pod cursor start.** Each pod's bucket cursor starts, per
@@ -1767,7 +1833,7 @@ minutes of prod-us appends; 0 disables), grouped by partition tuple. On a
 hot table that window is full on every sweep, not only when the sampler
 is behind, because the sample's start snapshot is always a scan and a
 refresh old. So the window size is a fixed per-sweep cost: one heap fetch
-and one partition-value lookup per file, inside the plan's 15 s statement
+and one partition-value lookup per file, inside the plan's statement
 timeout. A tuple written once and never again since can fall outside the
 window until the next generation names it.
 A bucket in both lists becomes one entry, and the merged list is sorted by

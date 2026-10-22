@@ -323,6 +323,27 @@ data class CompactionConfig(
      */
     val bucketClaimTtlSeconds: Long = DEFAULT_BUCKET_CLAIM_TTL_SECONDS,
     /**
+     * The `SET LOCAL statement_timeout` a plan's read transaction and its
+     * claim transaction run under
+     * (`HOGLAKE_COMPACTION_PLAN_STATEMENT_TIMEOUT_MS`, default 60,000 —
+     * the session's own bound, `Database.SESSION_INIT_SQL`).
+     *
+     * It was a 15 s constant, a FAIL-FAST chosen while the probes ran
+     * under the catalog planning lock: a slow probe then held the lock,
+     * every sibling planner queued behind it, and failing that table fast
+     * was the only way to let the fleet move on. Since #418 the lock
+     * covers only the claim transaction, so a slow probe costs ONE pod
+     * ONE sweep, and a probe that finishes yields the bucket's whole
+     * window; cutting it at 15 s threw that work away on exactly the hot
+     * buckets (millpond's 50k-127k-file days) that need it. So the bound
+     * is the session's, and this knob exists to lower it again if a
+     * deployment wants the fail-fast back.
+     *
+     * At least 1,000 ms: below that every non-trivial probe fails and the
+     * planner reports failed sweeps forever.
+     */
+    val planStatementTimeoutMs: Long = DEFAULT_PLAN_STATEMENT_TIMEOUT_MS,
+    /**
      * The admission bound each group's COMMIT queues under
      * (`HOGLAKE_COMMIT_LOCK_TIMEOUT_MS`, shared with the commit path).
      *
@@ -560,6 +581,9 @@ data class CompactionConfig(
         }
         require(bucketClaimTtlSeconds >= 1) {
             "HOGLAKE_COMPACTION_BUCKET_CLAIM_TTL_SECONDS must be at least 1, got $bucketClaimTtlSeconds"
+        }
+        require(planStatementTimeoutMs >= 1_000) {
+            "HOGLAKE_COMPACTION_PLAN_STATEMENT_TIMEOUT_MS must be at least 1000, got $planStatementTimeoutMs"
         }
         // Validated at CONSTRUCTION, which is boot, like every knob
         // above: a zero here would make the planner fetch no candidates
@@ -800,6 +824,9 @@ data class CompactionConfig(
 
         /** See [bucketClaimTtlSeconds]: ten minutes between refreshes. */
         const val DEFAULT_BUCKET_CLAIM_TTL_SECONDS = 600L
+
+        /** See [planStatementTimeoutMs]: the session's own 60 s bound. */
+        const val DEFAULT_PLAN_STATEMENT_TIMEOUT_MS = 60_000L
 
         /**
          * See [candidateHeadroom]: fetch twice the files a run can
@@ -1248,13 +1275,38 @@ class CompactionService(
      * the statement AFTER it with `FATAL: terminating connection due to
      * idle-in-transaction timeout`.
      *
-     * No transaction remains open across packing. Execution plans hold
-     * one idle connection for the session advisory lock. The test makes packing
+     * No transaction remains open across packing, and no lock is held
+     * across it either (the planning lock covers only the claim
+     * transaction; see `planAndClaim`). The test makes packing
      * take longer than the session's idle bound — hence a seam rather
      * than a sleep in production code. Default is a no-op, called
      * exactly once per table plan, and nothing but a test ever sets it.
      */
     internal var beforePacking: () -> Unit = {}
+
+    /**
+     * A hook [planAndClaim] calls after the plan is formed and BEFORE it
+     * takes the catalog planning lock — the window in which a sibling can
+     * plan and claim the same files, which the in-lock claim re-read
+     * exists for. Default is a no-op; nothing but a test sets it.
+     */
+    internal var beforeClaims: () -> Unit = {}
+
+    /**
+     * A hook [planAndClaim] calls inside its claim transaction with the
+     * planning lock held, so a test can observe the lock from another
+     * session or make the claim transaction fail. Default is a no-op;
+     * nothing but a test sets it.
+     */
+    internal var insideClaims: (Handle) -> Unit = {}
+
+    /**
+     * A hook [planAndClaim] calls as the LAST statement of its claim
+     * transaction — every claim inserted, nothing committed — so a test
+     * can pin that the planning lock outlives the commit. Default is a
+     * no-op; nothing but a test sets it.
+     */
+    internal var beforeClaimCommit: (Handle) -> Unit = {}
 
     /**
      * A hook phase (a) calls on its OWN handle, before the candidate
@@ -1318,7 +1370,8 @@ class CompactionService(
 
     /**
      * Plan one table in three phases on one connection. No transaction
-     * remains open across packing. Execution plans also hold a session lock.
+     * remains open across packing, and no lock is held during it: execution plans take the
+     * catalog planning lock afterwards, for their claim transaction only (`planAndClaim`).
      *
      * # Why it is split, and what each phase may do
      *
@@ -1393,30 +1446,16 @@ class CompactionService(
         val fetched =
             h.inTransaction<CandidateFetch, Exception> {
                 h.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-                // A BOUND TIGHTER THAN THE SESSION'S, because the
-                // doctrine asks every statement inside a transaction for
-                // one and the session's is 60 s
-                // (`Database.SESSION_INIT_SQL`).
-                //
-                // 15 s, and the number is derived rather than picked: a
-                // sweep plans one table at a time and executes its
-                // groups before planning the next
-                // (`doRunOnce`, for freshness), and a group costs a
-                // measured ~8.5 s of object-store latency. So a plan
-                // that spends more than about two groups' worth of wall
-                // clock on metadata has stopped being the cheap half of
-                // the sweep, and the honest outcome is to fail THIS
-                // TABLE fast and let the sweep move on rather than to
-                // sit on a statement whose bound is four minutes of
-                // groups.
-                //
-                // It is a fail-fast, not a correctness bound: the throw
-                // leaves the read-only transaction rolled back with
-                // nothing staged, and `runOnceAllCatalogs` treats it as
-                // a per-catalog failure the ledger counts. `SET LOCAL`,
-                // so it expires with the transaction and the pooled
-                // connection goes back carrying the session's 60 s.
-                h.execute("SET LOCAL statement_timeout = '${PLAN_STATEMENT_TIMEOUT_MS}ms'")
+                // THE PLAN'S STATEMENT BOUND,
+                // `CompactionConfig.planStatementTimeoutMs`
+                // (`HOGLAKE_COMPACTION_PLAN_STATEMENT_TIMEOUT_MS`, default
+                // the session's 60 s) — see that field for why it is no
+                // longer the 15 s fail-fast it was. A throw leaves the
+                // read-only transaction rolled back with nothing staged,
+                // and `runOnceAllCatalogs` treats it as a per-catalog
+                // failure the ledger counts. `SET LOCAL`, so it expires
+                // with the transaction.
+                h.execute("SET LOCAL statement_timeout = '${cfg.planStatementTimeoutMs}ms'")
                 beforeFetch(h)
                 fetchCandidates(h, catalog, namespace, table, cfg)
             }
@@ -1762,16 +1801,19 @@ class CompactionService(
      * The live bucket claims on this table, read on phase (a)'s own
      * snapshot, for [fetchCandidates]' pre-probe filter.
      *
-     * # Why phase (a)'s snapshot sees every claim it must
+     * # What phase (a)'s snapshot can miss, and what that costs
      *
-     * An execution plan holds the catalog planning lock
-     * (`Locks.acquireCatalogCompactionPlanLock`) from before this
-     * transaction began until after its claim transaction COMMITTED. So
-     * the previous planner's bucket claims are committed before this
-     * planner's lock wait returns, and phase (a)'s snapshot, taken after
-     * that, sees all of them. A planner can only miss a marker that a
-     * metadata-only preview — which takes neither the lock nor any
-     * claim — would have had to write, and none does.
+     * Planning takes no lock (#418; `planAndClaim` has the argument), so
+     * a sibling may commit a marker after this transaction's snapshot
+     * was taken, and this planner then probes a bucket it could have
+     * skipped. The cost is that probe: the files the sibling claimed are
+     * excluded from it by the probe's own live-claim filter when their
+     * claims were committed before the snapshot, and otherwise the groups
+     * it packs overlap the sibling's and `planAndClaim`'s in-lock re-read
+     * drops them as `claimed_elsewhere` before any claim is inserted.
+     * Never a duplicate rewrite. Until #418 the planning lock was held
+     * from before this snapshot, which made the read exact and made one
+     * slow probe every sibling's lock wait.
      *
      * # Fail open, behind a savepoint
      *
@@ -2052,7 +2094,7 @@ class CompactionService(
      * only when the sampler is behind: with a healthy sampler `since` is
      * one scan plus one refresh old, ~1-2 h and ~200-400k appends on
      * prod-us's `events_raw`. So the window is a per-sweep cost, paid
-     * inside [PLAN_STATEMENT_TIMEOUT_MS] on every plan of the table, and
+     * inside [CompactionConfig.planStatementTimeoutMs] (then 15 s) on every plan of the table, and
      * a timeout here fails the whole table's plan. At the 50,000 that
      * borrowing `maxCandidates` meant, ~200k buffers per sweep; at
      * 10,000, ~40k, of which the cold reads are far fewer than the hits,
@@ -2334,6 +2376,7 @@ class CompactionService(
      *               WHERE catalog_id = ? AND key_index = ? AND value = ?
      *                 [AND EXISTS (each further key)])))] --   intersected by cost
      *        [AND spec_id IS NOT DISTINCT FROM ?]        -- bucket identity, ARMS only
+     *        AND data_file_id NOT IN (live claims' ids)  -- hashed once (#418)
      *      [ORDER BY file_size_bytes, data_file_id]      -- ONLY when there are no arms
      *      LIMIT ?                                       -- THE SCAN CAP
      * ) f
@@ -2389,7 +2432,7 @@ class CompactionService(
      * buckets of median 66, a catalog of 41M live files and 67M partition
      * values): 1,064,028 sequential scans of `hog_data_file`, plans of
      * 18-37 minutes for 240-480 probes, and 193 of 200 sweeps failing
-     * [PLAN_STATEMENT_TIMEOUT_MS] on one probe. The bucket loop
+     * [CompactionConfig.planStatementTimeoutMs] (then 15 s) on one probe. The bucket loop
      * multiplies an O(table) probe by the bucket count.
      *
      * WHAT THEY ARE NOW: the tuple becomes ONE id set, `ARRAY(...)` over
@@ -2498,6 +2541,61 @@ class CompactionService(
      * by (a). Net better, and the `table_id`-in-index follow-up removes
      * (a) and (b).
      *
+     * # CLAIMED FILES ARE NOT CANDIDATES (#418)
+     *
+     * Every shape's inner scan carries
+     * `f0.data_file_id NOT IN (SELECT unnest(input_file_ids) FROM
+     * hog_compaction_claim WHERE <this table> AND expires_at > now())`, so
+     * a planner probing a bucket a sibling is working reads PAST the
+     * sibling's claimed files and packs the next window, instead of
+     * packing the same groups and dropping them as `claimed_elsewhere`
+     * after the probe. Without it, nine planners on one hot bucket read
+     * the same first window nine times (prod-us 1.4.1: `claimed_elsewhere`
+     * 1,460 over six sweeps). Phase (c) and the in-lock re-read stay: a
+     * claim committed after this probe's snapshot is theirs to catch.
+     *
+     * The claim table holds this table's live claims only — at most
+     * `maxGroupsPerRun` group claims plus markers (empty arrays, which
+     * contribute no id) per concurrent run — reached by its primary key's
+     * `(catalog_id, table_id)` prefix. The uncorrelated `NOT IN` is
+     * planned as a HASHED SubPlan: the claimed ids are read once per
+     * probe and each scanned row costs a hash probe, and the manifest
+     * side keeps its shape. Measured on PG 18 (a 500,000-file catalog, a
+     * 20,000-file bucket, 200 live claims of 64 ids on its lowest ids, 20
+     * markers, 50 expired; cap 8,193):
+     *
+     *  - correlated `NOT EXISTS (… f0.data_file_id = ANY (c.input_file_ids))`:
+     *    a nested-loop anti join, the claim table re-scanned per manifest
+     *    row — 20,000 loops, 2.86M array comparisons, 265,889 buffers,
+     *    458 ms;
+     *  - `NOT (f0.data_file_id = ANY (ARRAY(SELECT unnest(…))))` as an
+     *    InitPlan: one claim read, but a LINEAR array search per row
+     *    (`<> ALL`) — 334 ms;
+     *  - `NOT IN (SELECT unnest(…))`: one claim read, hashed, 24 ms and
+     *    10,355 buffers, against 28.9 ms for the probe with no claims at
+     *    all. The buffers it adds are the manifest rows it reads PAST —
+     *    the claimed files the sorted scan meets first — which is the
+     *    point.
+     *
+     * Pinned on `CompactionBucketProbePlanIntegrationTest`'s fixture
+     * (401,000 files; the month-682 one-key probe, 20,000 of them on the
+     * subject table; 200 live claims over its 12,800 lowest ids, 20
+     * markers, 50 expired): the manifest side is still the primary-key
+     * `= ANY ((InitPlan 1).col1)` scan, the claim side ONE scan of 18
+     * buffers under a `hashed SubPlan`, 36,606 buffers in all with the
+     * DV join (33,137 for the same probe with no claims).
+     *
+     * THE NULL HAZARD of `NOT IN`, closed in the statement rather than by
+     * convention: `x NOT IN (…, NULL)` is NULL for every `x`, so ONE NULL
+     * element in ONE live claim's `input_file_ids` would make the probe
+     * return nothing for the whole table, silently, for the claim's lease.
+     * Nothing writes a NULL element today (every writer builds the array
+     * from file ids) and nothing in the schema prevents one, so the
+     * subquery unnests through a lateral and filters `u.id IS NOT NULL`;
+     * the plan keeps the hashed SubPlan with one claim scan.
+     * `CompactionBucketProbePlanIntegrationTest` pins the shape and the
+     * NULL case.
+     *
      * # NEVER A GENERIC PLAN ([Pg.CUSTOM_PLANS_ONLY])
      *
      * pgjdbc server-prepares a statement on its fifth execution on a
@@ -2529,6 +2627,7 @@ class CompactionService(
         nullArms: Set<Int>,
         scopeToSpec: Boolean,
         withPartitionValues: Boolean,
+        excludeClaimed: Boolean = true,
     ): String {
         fun valuePredicate(keyIndex: Int) =
             if (keyIndex in nullArms) "pv$keyIndex.value IS NULL" else "pv$keyIndex.value = :v$keyIndex"
@@ -2578,6 +2677,24 @@ class CompactionService(
             }
         val specFilter =
             if (scopeToSpec && arms.isEmpty()) "\n             WHERE f.spec_id IS NOT DISTINCT FROM :specId" else ""
+        // FILES UNDER A LIVE CLAIM ARE NOT CANDIDATES (#418): an
+        // uncorrelated NOT IN, so Postgres hashes the table's claimed ids
+        // ONCE per probe (`hashed SubPlan`) and filters the scan with a
+        // hash probe per row. See the KDoc's "CLAIMED FILES" section for
+        // the shapes measured against it. After the arms in the text so
+        // the arms' id set stays `InitPlan 1`.
+        // Off with claims off: nothing in that configuration writes a
+        // claim, and the switch must work without the table.
+        val claimed =
+            if (!excludeClaimed) {
+                ""
+            } else {
+                """
+                       AND f0.data_file_id NOT IN (
+                             SELECT u.id FROM hog_compaction_claim cl, unnest(cl.input_file_ids) AS u(id)
+                              WHERE cl.catalog_id = :catalogId AND cl.table_id = :tableId
+                                AND cl.expires_at > now() AND u.id IS NOT NULL)""".trimEnd()
+            }
         val valuesProjection = if (withPartitionValues) ",\n                   pvs.partition_values" else ""
         val valuesJoin =
             if (withPartitionValues) {
@@ -2603,7 +2720,7 @@ class CompactionService(
                       FROM hog_data_file f0
                      WHERE f0.catalog_id = :catalogId AND f0.table_id = :tableId
                        AND f0.end_snapshot IS NULL
-                       AND f0.file_size_bytes < :targetBytes$armSql$specInner$innerOrder
+                       AND f0.file_size_bytes < :targetBytes$armSql$specInner$claimed$innerOrder
                      LIMIT :scanLimit
                    ) f
               LEFT JOIN hog_delete_file dv
@@ -2668,6 +2785,7 @@ class CompactionService(
                     nullArms = nullArms,
                     scopeToSpec = true,
                     withPartitionValues = false,
+                    excludeClaimed = cfg.claimsEnabled,
                 ),
             )
                 .bind("catalogId", ctx.catalogId)
@@ -2712,6 +2830,7 @@ class CompactionService(
                     nullArms = emptySet(),
                     scopeToSpec = false,
                     withPartitionValues = true,
+                    excludeClaimed = cfg.claimsEnabled,
                 ),
             )
                 .bind("catalogId", ctx.catalogId)
@@ -3339,9 +3458,67 @@ class CompactionService(
     private data class PlannedWork(val plan: CompactionPlan, val items: List<WorkItem>)
 
     /**
-     * Reserve this table's queue before another planner can read candidates.
-     * One connection holds the session lock across short transactions and packing.
-     * Claims are bounded by the remaining run budget. File I/O starts after unlock.
+     * Plan one table with NO lock held, then claim its queue under the
+     * catalog planning lock. The queue is bounded by the remaining run
+     * budget; file I/O starts after unlock.
+     *
+     * # What the planning lock covers, and why only that (#418)
+     *
+     * `Locks.acquireCatalogCompactionPlanLock` is taken AFTER
+     * [planSnapshot] returns, in its own short transaction, and released
+     * after the claim transaction has committed (or rolled back), so the
+     * probes, the packing and phase (c) all run unlocked and two planners
+     * of one catalog plan at the same time.
+     *
+     * The lock used to be taken before [planSnapshot] and held across
+     * every probe. Its job was to stop two overlapping plans from
+     * reserving DIFFERENT group keys for the same input files: a claim
+     * insert arbitrates one key ([CompactionClaimRepo.acquire]), and bin
+     * packing is a function of the candidate set, so a plan formed one
+     * ingest file later packs the same files under another key. With the
+     * probes serialized, every sibling's claims were committed before
+     * this plan read anything, and phase (c)'s overlap read was exact.
+     *
+     * What production showed is what that cost (gigahog-prod-us, 1.4.1,
+     * 2026-10-22, nine planners): one pod in a 15 s probe held the lock,
+     * the other eight queued on `pg_advisory_lock` and hit their own 15 s
+     * bound there, and one slow bucket cost the fleet a sweep — 38 of 40
+     * millpond-prod-us sweeps failed, most of them on the lock wait.
+     *
+     * The claim transaction keeps that guarantee on its own: under the
+     * lock it RE-READS the table's live claims
+     * ([CompactionClaimRepo.liveClaimedFileIds]) and drops every planned
+     * group that overlaps one before inserting anything, counted as
+     * `claimed_elsewhere` like phase (c)'s drops. The lock is released
+     * only after the claim transaction COMMITS (the release is a session
+     * statement after `inTransaction` returns), so a sibling granted the
+     * lock next re-reads with our rows visible, and two runs never hold
+     * overlapping groups. Phase (c) stays: it is the preview's only claim
+     * read, and it spares an execution plan the lock wait for a table a
+     * sibling already holds. The re-read materializes every live claim's
+     * `input_file_ids` a second time per plan, under the lock; at the
+     * queue bound (`maxGroupsPerRun` claims per concurrent run, each at
+     * most `maxInputFiles` ids) that is tens of thousands of ids, and an
+     * SQL-side `input_file_ids && :planned` returning keys would shorten
+     * the hold further — not done, because the hold it would save is
+     * milliseconds against the probe this change took out from under it.
+     *
+     * What concurrency costs instead, stated: two planners may PROBE the
+     * same bucket at once. The probe's live-claim filter ([candidateSql])
+     * makes the later one read past files already claimed when it took
+     * its snapshot; a claim committed after that snapshot is caught here
+     * by the re-read. A wasted probe at worst, never a duplicate rewrite.
+     *
+     * # A failed claim transaction plans NOTHING for the table
+     *
+     * Not the unclaimed plan. Before #418 that fallback ran groups phase
+     * (c) had filtered under the lock; now phase (c) ran unlocked and the
+     * re-read either never ran or rolled back, so executing the plan
+     * unclaimed could rewrite files a sibling holds — a duplicate rewrite
+     * that one side then loses at commit. So the failure throws, the
+     * sweep's catalog run fails the way a failed probe does, and the
+     * ledger records it. A lock timeout does the same (the acquire is
+     * outside the claim transaction's scope for that reason too).
      *
      * # Bucket claims, in the same transaction as the group claims
      *
@@ -3349,38 +3526,37 @@ class CompactionService(
      * class KDoc has why it is a row in the same table) for every bucket
      * that is (1) in [PlanWithContext.markable] — probed in full, not
      * cut by the candidate budget — and (2) whose every free group this
-     * plan just claimed. The next planner skips such a bucket before
-     * probing it ([fetchCandidates]), so the 2026-10-21 shape — a pod
-     * re-reading 50,029 candidate rows to drop its predecessors' 64
-     * groups — cannot recur for the claim's lifetime.
+     * plan just claimed, "free" meaning after the in-lock re-read. The
+     * next planner skips such a bucket before probing it
+     * ([fetchCandidates]), so the 2026-10-21 shape — a pod re-reading
+     * 50,029 candidate rows to drop its predecessors' 64 groups — cannot
+     * recur for the claim's lifetime.
      *
      * (2) is what keeps the skip from HIDING work. A bucket that packed
      * into more groups than the run's remaining room still has groups
      * nobody holds; marking it would hide them from every sibling until
      * this run settled. Such a bucket is left unmarked and the sibling
-     * finds its held groups the old way, by overlap. The room-ran-out
-     * path is the one (2) exists for. The other way a bucket can end up
-     * partly claimed — a group's claim insert losing to a sibling — is
-     * unreachable under the planning lock (every sibling's claims were
-     * committed before this plan read its candidates, and phase (c)
-     * already dropped their groups); the same check covers it as
-     * belt-and-braces for a plan path that ever claims without the lock. A bucket that packed into NO
-     * free group is not marked either: there is no group whose
-     * settlement would release the claim, and a marker this run cannot
-     * tell from its own next sweep's would make that sweep skip a bucket
-     * whose files may have grown into a group.
+     * reaches its remaining files through the probe's live-claim filter
+     * (and, failing that, finds the held groups by overlap). A group
+     * claim insert that loses to a sibling's live row is not in `items`,
+     * so its bucket is not marked either. A bucket that packed into NO
+     * free group is not marked: there is no group whose settlement would
+     * release the claim, and a marker this run cannot tell from its own
+     * next sweep's would make that sweep skip a bucket whose files may
+     * have grown into a group.
      *
      * The marker's lease is the SHORT [CompactionConfig.bucketClaimTtlSeconds],
      * renewed by EVERY group's pre-IO refresh ([refreshClaim]) — each
-     * renews all of the plan's still-outstanding markers, so a bucket at
-     * the back of the queue is covered while the groups ahead of it run.
-     * A pod killed mid-sweep — `BackgroundLoops.close` abandons the sweep
-     * after 5 s, and no release runs — therefore hides its buckets for
-     * one short lease and not for the hour-long group lease. A marker
+     * renews all of the plan's still-outstanding markers, so a marked
+     * bucket stays hidden until the last of its own groups settles, however
+     * far back in the run's queue they are, and not for one lease. A pod
+     * killed mid-sweep — `BackgroundLoops.close` abandons the sweep after
+     * 5 s, and no release runs — hides its buckets for one short lease
+     * after its last refresh, not for the hour-long group lease. A marker
      * that still expires (one group's rewrite outlasting the lease) costs
-     * a sibling one probe and the overlap skip, never a duplicate rewrite. A lost marker insert (a sibling holds a
-     * live one — only a plan without the lock could get there) is simply
-     * not tracked.
+     * a sibling one probe and the overlap skip, never a duplicate rewrite.
+     * A lost marker insert (a sibling marked the bucket after this plan's
+     * snapshot) is simply not tracked.
      */
     private fun planAndClaim(
         catalog: String,
@@ -3391,50 +3567,63 @@ class CompactionService(
         claimant: UUID,
     ): PlannedWork =
         jdbi.withHandleUnchecked { h ->
-            val catalogId = catalogIdOf(h, catalog)
+            val (ctx, plan, markable) = planSnapshot(h, catalog, namespace, table, cfg)
+            if (!cfg.claimsEnabled) {
+                return@withHandleUnchecked PlannedWork(plan, plan.groups.take(room).map { WorkItem(ctx, it) })
+            }
+            if (plan.groups.isEmpty()) return@withHandleUnchecked PlannedWork(plan, emptyList())
+            beforeClaims()
+            // THE LOCK, across the claim transaction and nothing else, in
+            // its own short transaction and outside the try below: a lock
+            // timeout fails the plan, and a lock this call never took is
+            // never released (1.4.1 released unconditionally, which is the
+            // `you don't own a lock of type ExclusiveLock` WARNING after
+            // every timed-out wait on prod).
+            h.inTransaction<Unit, Exception> { Locks.acquireCatalogCompactionPlanLock(h, ctx.catalogId) }
             try {
-                if (cfg.claimsEnabled) {
-                    h.inTransaction<Unit, Exception> { Locks.acquireCatalogCompactionPlanLock(h, catalogId) }
-                }
-                val (ctx, plan, markable) = planSnapshot(h, catalog, namespace, table, cfg)
-                if (!cfg.claimsEnabled) {
-                    return@withHandleUnchecked PlannedWork(plan, plan.groups.take(room).map { WorkItem(ctx, it) })
-                }
-                try {
-                    h.inTransaction<PlannedWork, Exception> {
-                        h.execute("SET LOCAL statement_timeout = '${PLAN_STATEMENT_TIMEOUT_MS}ms'")
-                        val items = mutableListOf<WorkItem>()
-                        var claimed = plan.claimedGroups
-                        for (group in plan.groups) {
-                            if (items.size >= room) break
-                            if (Thread.currentThread().isInterrupted) throw InterruptedException()
-                            if (CompactionClaimRepo.acquire(
-                                    h,
-                                    ctx.catalogId,
-                                    ctx.tableId,
-                                    CompactionClaimRepo.groupKey(group),
-                                    group.files.map { it.dataFileId },
-                                    claimant,
-                                    cfg.claimTtlSeconds,
-                                )
-                            ) {
-                                items += WorkItem(ctx, group, claimant)
-                            } else {
-                                claimed++
-                            }
+                // No catch: a failed claim transaction plans nothing for
+                // this table (see the KDoc).
+                h.inTransaction<PlannedWork, Exception> {
+                    h.execute("SET LOCAL statement_timeout = '${cfg.planStatementTimeoutMs}ms'")
+                    insideClaims(h)
+                    // THE RE-READ UNDER THE LOCK. Every sibling's claims
+                    // committed before it released the lock, so this sees
+                    // all of them; phase (c)'s read, unlocked, may not have.
+                    val held = CompactionClaimRepo.liveClaimedFileIds(h, ctx.catalogId, ctx.tableId)
+                    val (free, lost) = plan.groups.partition { g -> g.files.none { it.dataFileId in held } }
+                    val rechecked = plan.copy(groups = free, claimedGroups = plan.claimedGroups + lost.size)
+                    val items = mutableListOf<WorkItem>()
+                    var claimed = rechecked.claimedGroups
+                    for (group in free) {
+                        if (items.size >= room) break
+                        if (Thread.currentThread().isInterrupted) throw InterruptedException()
+                        if (CompactionClaimRepo.acquire(
+                                h,
+                                ctx.catalogId,
+                                ctx.tableId,
+                                CompactionClaimRepo.groupKey(group),
+                                group.files.map { it.dataFileId },
+                                claimant,
+                                cfg.claimTtlSeconds,
+                            )
+                        ) {
+                            items += WorkItem(ctx, group, claimant)
+                        } else {
+                            claimed++
                         }
-                        PlannedWork(
-                            plan.copy(claimedGroups = claimed),
-                            withBucketClaims(h, ctx, plan, markable, items, claimant, cfg),
-                        )
                     }
-                } catch (e: Exception) {
-                    if (e is InterruptedException || Thread.currentThread().isInterrupted) throw e
-                    log.warn(e) { "compaction plan claims failed for $namespace.$table; continuing without claims" }
-                    PlannedWork(plan, plan.groups.take(room).map { WorkItem(ctx, it) })
+                    val work =
+                        PlannedWork(
+                            rechecked.copy(claimedGroups = claimed),
+                            withBucketClaims(h, ctx, rechecked, markable, items, claimant, cfg),
+                        )
+                    beforeClaimCommit(h)
+                    work
                 }
             } finally {
-                if (cfg.claimsEnabled) Locks.releaseCatalogCompactionPlanLock(h, catalogId)
+                // After the claim transaction has committed or rolled back:
+                // a sibling granted the lock next sees our claims.
+                Locks.releaseCatalogCompactionPlanLock(h, ctx.catalogId)
             }
         }
 
@@ -5314,14 +5503,6 @@ class CompactionService(
                       count(*) DESC
              LIMIT :bucketCap
             """
-
-        /**
-         * The `SET LOCAL statement_timeout` phase (a) of a plan runs
-         * under — see `planSnapshot`. Two groups' measured wall time,
-         * which is the point at which the cheap half of a sweep has
-         * stopped being cheap.
-         */
-        const val PLAN_STATEMENT_TIMEOUT_MS = 15_000L
 
         /**
          * Does this throwable's cause chain hold an interrupt?

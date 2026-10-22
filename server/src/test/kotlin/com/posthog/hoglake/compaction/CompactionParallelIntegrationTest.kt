@@ -492,7 +492,11 @@ class CompactionParallelIntegrationTest {
             assertThat(claimLeasesSeconds(fx.cat)).allMatch { it > 3500 }
             val other = second.runOnce(fx.cat)
             assertThat(other.groupsCompacted).isZero()
-            assertThat(other.claimedElsewhere).isEqualTo(fx.groups.toLong())
+            // #418: the probe excludes files under a live claim, so the
+            // queued groups never reach packing — nothing is dropped after
+            // the probe, and nothing is planned.
+            assertThat(other.claimedElsewhere).isZero()
+            assertThat(other.candidatesFetched).isZero()
             assertThat(other.skippedConflicts).isZero()
             release.countDown()
             assertThat(run.get(60, TimeUnit.SECONDS).groupsCompacted).isEqualTo(fx.groups.toLong())
@@ -520,7 +524,9 @@ class CompactionParallelIntegrationTest {
             assertThat(claimRows(fx.cat)).hasSize(2)
             val other = second.runOnce(fx.cat)
             assertThat(other.groupsCompacted).isEqualTo(3)
-            assertThat(other.claimedElsewhere).isEqualTo(2)
+            // #418: the first run's two claimed groups are excluded at the
+            // probe, not dropped after it.
+            assertThat(other.claimedElsewhere).isZero()
             assertThat(other.skippedConflicts).isZero()
             release.countDown()
             val result = run.get(60, TimeUnit.SECONDS)
@@ -534,7 +540,11 @@ class CompactionParallelIntegrationTest {
     }
 
     @Test
-    fun `the planning lock covers packing but permits commits and other catalogs`() {
+    fun `the planning lock covers the claim transaction only, and never commits or other catalogs`() {
+        // #418: the lock used to be taken before the probes and held through
+        // packing, so a slow probe was every sibling planner's lock wait.
+        // It is held across the claim transaction alone now: free while
+        // this run packs, held while it claims.
         val fx = fixture("compact-par-z-planning-lock", groups = 2)
         val other = fixture("compact-par-z-other-planning-lock", groups = 1)
         val (catalogId, _) = ids(fx.cat)
@@ -552,6 +562,23 @@ class CompactionParallelIntegrationTest {
             packed.countDown()
             check(releasePacking.await(30, TimeUnit.SECONDS))
         }
+        val heldWhileClaiming = java.util.concurrent.atomic.AtomicReference<Boolean?>(null)
+        val probe = Executors.newSingleThreadExecutor()
+        svc.insideClaims = {
+            // From ANOTHER session, on another thread: Jdbi hands a nested
+            // call on the planner's thread the planner's own handle, whose
+            // session would be granted its own lock again.
+            heldWhileClaiming.set(
+                probe.submit<Boolean> {
+                    !db.jdbi.inTransactionUnchecked { other ->
+                        other.createQuery(
+                            "SELECT pg_try_advisory_xact_lock((:cls::bigint << 32) | (:id::bigint & 4294967295))",
+                        ).bind("cls", Locks.CATALOG_COMPACTION_PLAN_LOCK_CLASS).bind("id", catalogId)
+                            .mapTo(Boolean::class.java).one()
+                    }
+                }.get(30, TimeUnit.SECONDS),
+            )
+        }
         val pool = Executors.newSingleThreadExecutor()
         try {
             val run = pool.submit<CompactionResult> { svc.runOnce(fx.cat) }
@@ -563,7 +590,9 @@ class CompactionParallelIntegrationTest {
                 ): Boolean =
                     h.createQuery("SELECT pg_try_advisory_xact_lock((:cls::bigint << 32) | (:id::bigint & 4294967295))")
                         .bind("cls", lockClass).bind("id", id).mapTo(Boolean::class.java).one()
-                assertThat(canLock(Locks.CATALOG_COMPACTION_PLAN_LOCK_CLASS, catalogId)).isFalse()
+                // MUTATION: take the planning lock before `planSnapshot`
+                // again (the 1.4.1 shape) and this is false.
+                assertThat(canLock(Locks.CATALOG_COMPACTION_PLAN_LOCK_CLASS, catalogId)).isTrue()
                 assertThat(canLock(Locks.CATALOG_COMPACTION_PLAN_LOCK_CLASS, otherId)).isTrue()
                 assertThat(canLock(Locks.CATALOG_COMMIT_LOCK_CLASS, catalogId)).isTrue()
                 assertThat(canLock(Locks.CATALOG_RETIREMENT_LOCK_CLASS, catalogId)).isTrue()
@@ -574,16 +603,22 @@ class CompactionParallelIntegrationTest {
             }
             releasePacking.countDown()
             assertThat(rewrite.await(30, TimeUnit.SECONDS)).isTrue()
+            // MUTATION: drop the acquire ahead of the claim transaction and
+            // this is false: nothing serializes the claim re-read and inserts.
+            assertThat(heldWhileClaiming.get()).describedAs("held across the claim transaction").isTrue()
+            svc.insideClaims = {}
             // The same service can start a second run after the planning lock is released.
             val second = svc.runOnce(fx.cat)
             assertThat(second.groupsCompacted).isZero()
-            assertThat(second.claimedElsewhere).isEqualTo(2)
+            // Excluded at the probe (#418), not dropped after it.
+            assertThat(second.claimedElsewhere).isZero()
             releaseRewrite.countDown()
             assertThat(run.get(60, TimeUnit.SECONDS).groupsCompacted).isEqualTo(2)
         } finally {
             releasePacking.countDown()
             releaseRewrite.countDown()
             pool.shutdownNow()
+            probe.shutdownNow()
             blocking.close()
         }
     }
@@ -659,7 +694,39 @@ class CompactionParallelIntegrationTest {
         }
         assertThat(claimRows(fx.cat)).isEmpty()
         svc.beforePacking = {}
-        assertThat(svc.runOnce(fx.cat).groupsCompacted).isEqualTo(1)
+        // Since #418 the lock is taken only for the claim transaction, so
+        // the failure that has to release it is one INSIDE that
+        // transaction — and that failure plans NOTHING for the table. It
+        // used to degrade to the unclaimed plan, which was safe only while
+        // phase (c) had run under the lock; now it could rewrite files a
+        // sibling holds. A sibling's live claim is seeded to show that
+        // nothing of its is touched either.
+        val (cid, tableId) = ids(fx.cat)
+        val sibling = UUID.randomUUID()
+        db.jdbi.useHandleUnchecked { h ->
+            assertThat(
+                CompactionClaimRepo.acquire(h, cid, tableId, "sibling-group", listOf(-1L), sibling, 3600),
+            ).isTrue()
+        }
+        svc.insideClaims = { error("injected claim failure") }
+        // MUTATION: restore the degrade-to-unclaimed catch in `planAndClaim`
+        // and this run compacts the group without a claim instead of
+        // failing.
+        org.assertj.core.api.Assertions.assertThatThrownBy { svc.runOnce(fx.cat) }
+            .hasStackTraceContaining("injected claim failure")
+        assertThat(stagingTicketOutcomes(fx.cat)).describedAs("nothing was executed").isEmpty()
+        assertThat(claimRows(fx.cat)).describedAs("only the sibling's claim").hasSize(1)
+        // MUTATION: drop the `finally` release in `planAndClaim` and the
+        // pooled connection keeps the lock: `held` is 1.
+        db.jdbi.withHandleUnchecked { h ->
+            val held =
+                h.createQuery(
+                    "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND classid = :cls AND objid = :id",
+                ).bind("cls", Locks.CATALOG_COMPACTION_PLAN_LOCK_CLASS).bind("id", catalogId)
+                    .mapTo(Int::class.java).one()
+            assertThat(held).isZero()
+        }
+        svc.insideClaims = {}
     }
 
     @Test
@@ -865,18 +932,27 @@ class CompactionParallelIntegrationTest {
         assertThat(before.groups).hasSize(2)
 
         // Claim ONE file of the first group under a key no planner would
-        // ever compute — the overlap is all the skip may use.
+        // ever compute — the overlap is all the skip may use. Taken AFTER
+        // the probe's snapshot (the `beforePacking` seam): a claim that was
+        // already live when the probe read is excluded there (#418), so the
+        // overlap skip is what catches the one committed since, which is
+        // the case it exists for.
         val victim = before.groups.first().files.first().dataFileId
-        db.jdbi.useHandleUnchecked { h ->
-            CompactionClaimRepo.acquire(
-                h,
-                catalogId,
-                tableId,
-                "not-a-real-group-key",
-                listOf(victim),
-                UUID.randomUUID(),
-                900,
-            )
+        val claimOnce = java.util.concurrent.atomic.AtomicBoolean(true)
+        svc.beforePacking = {
+            if (claimOnce.getAndSet(false)) {
+                db.jdbi.useHandleUnchecked { h ->
+                    CompactionClaimRepo.acquire(
+                        h,
+                        catalogId,
+                        tableId,
+                        "not-a-real-group-key",
+                        listOf(victim),
+                        UUID.randomUUID(),
+                        900,
+                    )
+                }
+            }
         }
         val after = svc.planTable(fx.cat, "ns", "t", cfg)
         assertThat(after.groups)
@@ -885,10 +961,13 @@ class CompactionParallelIntegrationTest {
         assertThat(after.groups.single().files.map { it.dataFileId }).doesNotContain(victim)
         assertThat(after.claimedGroups).isEqualTo(1)
 
-        // And the sweep spends its budget on the other group only.
+        // And the sweep spends its budget on the other group only. The
+        // claim is live now, so this probe excludes the victim and packs
+        // around it rather than dropping a group.
+        svc.beforePacking = {}
         val result = svc.runOnce(fx.cat, cfg)
         assertThat(result.groupsCompacted).isEqualTo(1)
-        assertThat(result.claimedElsewhere).isEqualTo(1)
+        assertThat(result.claimedElsewhere).isZero()
     }
 
     // ---- 4: the budget, and what may spend it ------------------------------
@@ -1940,14 +2019,19 @@ class CompactionParallelIntegrationTest {
     // ---- 6: the claim table is an optimization, including when broken ------
 
     @Test
-    fun `a broken claim table never stops compaction - the group runs unclaimed`() {
-        // The position the whole design rests on, exercised rather than
-        // asserted in a comment: claims are an optimization, so a claim
-        // table that is missing, locked or broken must cost duplicated
-        // work between replicas and cost NOTHING else. Both sides have
-        // to hold — the planner's read (inside the planning transaction,
-        // outside the per-group catch, so an error there kills the sweep
-        // for every catalog on every interval) and the claim insert.
+    fun `a broken claim table stops claimed compaction loudly instead of running it unclaimed`() {
+        // REVERSED by #418, deliberately. This test used to pin "a broken
+        // claim table never stops compaction — the group runs unclaimed",
+        // and that was sound while the planning lock covered the probes:
+        // every sibling's claims were committed before this plan read
+        // anything, so the unclaimed plan could not overlap a sibling's
+        // work. With planning unlocked, an unclaimed plan CAN rewrite
+        // files a sibling holds. So with claims enabled, the claim table
+        // is now a dependency: the probe reads it (live claims are not
+        // candidates) and a failed claim transaction plans nothing. A
+        // missing table fails the catalog's sweep, which the ledger
+        // records, and nothing is rewritten. `claimsEnabled = false` is
+        // the switch for running without one.
         //
         // Its own database, because the fix is to drop the table.
         PgTestSupport.freshDatabase().use { db2 ->
@@ -1981,14 +2065,16 @@ class CompactionParallelIntegrationTest {
                     maxGroupsPerRun = 4,
                     claimsEnabled = true,
                 )
-            val result = CompactionService(db2.jdbi, store, cfg).runOnce(cat, cfg)
-            assertThat(result.groupsCompacted)
-                .describedAs("a broken optimization must not stop compaction: %s", result)
-                .isEqualTo(1)
-            assertThat(result.failedGroups).isZero()
-            assertThat(result.claimedElsewhere)
-                .describedAs("a claim that cannot be read fences nothing")
-                .isZero()
+            org.assertj.core.api.Assertions.assertThatThrownBy {
+                CompactionService(db2.jdbi, store, cfg).runOnce(cat, cfg)
+            }.hasStackTraceContaining("hog_compaction_claim")
+            assertThat(CatalogService(db2.jdbi).listFiles(cat, "ns", "t"))
+                .describedAs("nothing was rewritten")
+                .hasSize(2)
+            // And with claims off, the same table compacts: the switch an
+            // operator has for running without a claim table.
+            val off = CompactionService(db2.jdbi, store, cfg.copy(claimsEnabled = false)).runOnce(cat)
+            assertThat(off.groupsCompacted).isEqualTo(1)
         }
     }
 
