@@ -5,6 +5,7 @@ import com.posthog.hoglake.model.ChangeKind
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.MAX_COLUMN_NESTING_DEPTH
 import com.posthog.hoglake.model.PartitionFieldDef
 import com.posthog.hoglake.model.Transform
 import com.posthog.hoglake.testing.PgTestSupport
@@ -104,6 +105,15 @@ class AlterServiceIntegrationTest {
                 // And the path itself, unresolvable from its first
                 // segment.
                 AlterOp.DropColumn(huge),
+                // A REQUIRED column whose name is unbounded (#446): the
+                // no-defaults refusal quotes the path whole, which is
+                // only safe because it runs after ColumnTrees.validate
+                // has applied the identifier policy to every name. Moved
+                // ahead of it, these two would echo 5,000 characters.
+                AlterOp.AddColumn(ColumnDef(huge, ColType.LONG, nullable = false)),
+                AlterOp.AddColumn(
+                    ColumnDef("s", ColType.STRUCT, children = listOf(ColumnDef(huge, ColType.LONG, nullable = false))),
+                ),
             )
         for (op in ops) {
             val thrown = catchThrowable { alter.alterTable(cat, ns, "t", listOf(op)) }
@@ -113,6 +123,9 @@ class AlterServiceIntegrationTest {
             assertThat(thrown.message!!.length)
                 .describedAs("%s message length", op::class.simpleName)
                 .isLessThan(300)
+            assertThat(thrown.message!!)
+                .describedAs("%s answered by the earlier check", op::class.simpleName)
+                .doesNotContain(noDefaults)
         }
     }
 
@@ -402,6 +415,269 @@ class AlterServiceIntegrationTest {
         assertThat(info.columns).hasSize(6)
         assertThat(catalogs.getTable(cat, ns, "t").columns.map { it.def.name })
             .containsExactly("id", "name", "score", "count", "ts", "tags")
+    }
+
+    // ---- add_column: no required nodes (#446) ---------------------------
+    //
+    // hoglake has no column defaults, so a column added after files exist
+    // reads NULL from every one of them; a schema calling it required
+    // would lie. The refusal is UNCONDITIONAL: every fixture here has no
+    // data files at all, and the add is still refused.
+
+    private val noDefaults = "hoglake has no column defaults"
+
+    private fun addRefused(
+        cat: String,
+        ns: String,
+        def: ColumnDef,
+        parent: String? = null,
+    ): Throwable =
+        catchThrowable {
+            alter.alterTable(cat, ns, "t", listOf(AlterOp.AddColumn(def, parent)))
+        }.also { assertThat(it).isInstanceOf(HoglakeException.Validation::class.java) }
+
+    @Test
+    fun `add column refuses a required top-level column`() {
+        val (cat, ns) = fixture()
+        val err = addRefused(cat, ns, ColumnDef("team_id", ColType.INT, nullable = false))
+        assertThat(err.message)
+            .contains("cannot add column 'team_id'")
+            .contains("declared required (nullable=false)")
+            .contains(noDefaults)
+            .contains("files written before the column read NULL")
+        // Nothing landed, and no field id was burned: the next legal add
+        // still gets 6.
+        assertThat(catalogs.getTable(cat, ns, "t").columns).hasSize(5)
+        val added =
+            alter.alterTable(cat, ns, "t", listOf(AlterOp.AddColumn(ColumnDef("team_id", ColType.INT))))
+                .columns.single { it.def.name == "team_id" }
+        assertThat(added.fieldId).isEqualTo(6)
+    }
+
+    @Test
+    fun `add column refuses a required field added into a struct parent`() {
+        val (cat, ns) = fixture()
+        alter.alterTable(
+            cat,
+            ns,
+            "t",
+            listOf(
+                AlterOp.AddColumn(ColumnDef("addr", ColType.STRUCT, children = listOf(ColumnDef("zip", ColType.LONG)))),
+            ),
+        )
+        val err = addRefused(cat, ns, ColumnDef("city", ColType.STRING, nullable = false), parent = "addr")
+        // The path is the FULL one, parent included: that is the column
+        // the operator has to find.
+        assertThat(err.message).contains("cannot add column 'addr.city'").contains(noDefaults)
+        assertThat(
+            catalogs.getTable(cat, ns, "t").columns.single { it.def.name == "addr" }.children.map { it.def.name },
+        )
+            .containsExactly("zip")
+    }
+
+    @Test
+    fun `add column refuses an optional container whose nested child is required, naming the child`() {
+        val (cat, ns) = fixture()
+        // Optional struct, required leaf two levels down.
+        val struct =
+            ColumnDef(
+                "prefs",
+                ColType.STRUCT,
+                children =
+                    listOf(
+                        ColumnDef(
+                            "ui",
+                            ColType.STRUCT,
+                            children = listOf(ColumnDef("theme", ColType.STRING, nullable = false)),
+                        ),
+                    ),
+            )
+        assertThat(addRefused(cat, ns, struct).message)
+            .contains("cannot add column 'prefs': 'prefs.ui.theme' inside it is declared required")
+            .contains(noDefaults)
+        // Optional list, required element.
+        val list =
+            ColumnDef("tags", ColType.LIST, children = listOf(ColumnDef("element", ColType.STRING, nullable = false)))
+        assertThat(addRefused(cat, ns, list).message)
+            .contains("cannot add column 'tags': 'tags.element' inside it is declared required")
+        // Optional map, required VALUE (the key is required by the type
+        // model and is exempt — next test).
+        val map =
+            ColumnDef(
+                "attrs",
+                ColType.MAP,
+                children =
+                    listOf(
+                        ColumnDef("key", ColType.STRING, nullable = false),
+                        ColumnDef("value", ColType.LONG, nullable = false),
+                    ),
+            )
+        assertThat(addRefused(cat, ns, map).message)
+            .contains("cannot add column 'attrs': 'attrs.value' inside it is declared required")
+        // The refused container never went in, and the struct parent
+        // case is the same walk one level down.
+        assertThat(catalogs.getTable(cat, ns, "t").columns).hasSize(5)
+        alter.alterTable(
+            cat,
+            ns,
+            "t",
+            listOf(AlterOp.AddColumn(ColumnDef("s", ColType.STRUCT, children = listOf(leafCol)))),
+        )
+        assertThat(addRefused(cat, ns, struct, parent = "s").message)
+            .contains("cannot add column 's.prefs': 's.prefs.ui.theme' inside it is declared required")
+        // The map-key exemption is the KEY NODE only: a struct-typed key
+        // (required, as the type model demands) with a required field is
+        // refused for that field.
+        val structKey =
+            ColumnDef(
+                "by_point",
+                ColType.MAP,
+                children =
+                    listOf(
+                        ColumnDef(
+                            "key",
+                            ColType.STRUCT,
+                            nullable = false,
+                            children = listOf(ColumnDef("x", ColType.LONG, nullable = false)),
+                        ),
+                        ColumnDef("value", ColType.LONG),
+                    ),
+            )
+        assertThat(addRefused(cat, ns, structKey).message)
+            .contains("cannot add column 'by_point': 'by_point.key.x' inside it is declared required")
+    }
+
+    @Test
+    fun `add column required refusal comes after shape checks and before the file-state guard`() {
+        // The ORDER in addColumn is load-bearing (the quoted path is
+        // bounded only because the identifier policy ran first), so each
+        // earlier check is pinned as the one that answers, and the
+        // id-less guard as the one that does not.
+        val (cat, ns) = fixture()
+        // Duplicate sibling name: "already exists" wins.
+        assertThat(addRefused(cat, ns, ColumnDef("id", ColType.LONG, nullable = false)).message)
+            .contains("already exists")
+            .doesNotContain(noDefaults)
+        // Identifier policy: the reserved prefix wins.
+        assertThat(addRefused(cat, ns, ColumnDef("_hog_x", ColType.LONG, nullable = false)).message)
+            .contains("reserved prefix")
+            .doesNotContain(noDefaults)
+        // Depth cap: one past MAX_COLUMN_NESTING_DEPTH, required leaf.
+        var deep: ColumnDef = ColumnDef("leaf", ColType.LONG, nullable = false)
+        for (i in 1..MAX_COLUMN_NESTING_DEPTH) deep = ColumnDef("l$i", ColType.STRUCT, children = listOf(deep))
+        assertThat(addRefused(cat, ns, deep).message)
+            .contains("exceeds the maximum $MAX_COLUMN_NESTING_DEPTH")
+            .doesNotContain(noDefaults)
+        // A LIVE id-less file: the field-id guard would answer 409 for a
+        // nullable add, but a required one is a 422 before that query runs.
+        db.jdbi.withHandleUnchecked { h ->
+            h.execute(
+                """
+                INSERT INTO hog_data_file (catalog_id, data_file_id, table_id, begin_snapshot,
+                    path, record_count, file_size_bytes, row_id_start, missing_field_ids)
+                VALUES (?, 1, ?, 2, 's3://bucket/idless.parquet', 10, 100, 0, true)
+                """,
+                catId(cat),
+                catalogs.getTable(cat, ns, "t").tableId,
+            )
+        }
+        assertThatThrownBy {
+            alter.alterTable(cat, ns, "t", listOf(AlterOp.AddColumn(ColumnDef("ok", ColType.LONG))))
+        }.isInstanceOf(HoglakeException.IdlessFilesPresent::class.java)
+        assertThat(
+            addRefused(cat, ns, ColumnDef("strict", ColType.LONG, nullable = false)).message,
+        ).contains(noDefaults)
+    }
+
+    @Test
+    fun `add column refuses a required column on a table with a committed live file`() {
+        // The "unconditional" half with files present: the same refusal,
+        // and a nullable add on the same table goes through.
+        val (cat, ns) = fixture()
+        db.jdbi.withHandleUnchecked { h ->
+            h.execute(
+                """
+                INSERT INTO hog_data_file (catalog_id, data_file_id, table_id, begin_snapshot,
+                    path, record_count, file_size_bytes, row_id_start)
+                VALUES (?, 1, ?, 2, 's3://bucket/live.parquet', 10, 100, 0)
+                """,
+                catId(cat),
+                catalogs.getTable(cat, ns, "t").tableId,
+            )
+        }
+        assertThat(addRefused(cat, ns, ColumnDef("strict", ColType.LONG, nullable = false)).message)
+            .contains("cannot add column 'strict'")
+            .contains(noDefaults)
+        val info = alter.alterTable(cat, ns, "t", listOf(AlterOp.AddColumn(ColumnDef("loose", ColType.LONG))))
+        assertThat(info.columns.map { it.def.name }).contains("loose").doesNotContain("strict")
+    }
+
+    @Test
+    fun `add column accepts nullable true, nullable omitted, and a map whose key is required`() {
+        val (cat, ns) = fixture()
+        // ColumnTrees.validate REQUIRES a map key be nullable=false (Iceberg
+        // map keys are non-nullable), so a map could never be added if the
+        // key counted; it is structural, and only the value is checked.
+        val map =
+            ColumnDef(
+                "attrs",
+                ColType.MAP,
+                children =
+                    listOf(
+                        ColumnDef("key", ColType.STRING, nullable = false),
+                        ColumnDef("value", ColType.LONG),
+                    ),
+            )
+        val info =
+            alter.alterTable(
+                cat,
+                ns,
+                "t",
+                listOf(
+                    AlterOp.AddColumn(ColumnDef("explicit", ColType.STRING, nullable = true)),
+                    AlterOp.AddColumn(ColumnDef("omitted", ColType.STRING)),
+                    AlterOp.AddColumn(map),
+                ),
+            )
+        val names = info.columns.map { it.def.name }
+        assertThat(names).containsExactly("id", "name", "score", "count", "ts", "explicit", "omitted", "attrs")
+        val attrs = info.columns.single { it.def.name == "attrs" }
+        assertThat(attrs.children.map { it.def.name to it.def.nullable })
+            .containsExactly("key" to false, "value" to true)
+        // And the sanity check on the exemption's premise: a NULLABLE key
+        // is refused by the type model, not by the no-defaults rule.
+        val nullableKey =
+            map.copy(
+                name = "attrs2",
+                children = listOf(ColumnDef("key", ColType.STRING), ColumnDef("value", ColType.LONG)),
+            )
+        assertThat(addRefused(cat, ns, nullableKey).message)
+            .contains("must be required (nullable=false)")
+            .doesNotContain(noDefaults)
+    }
+
+    @Test
+    fun `create table still accepts a required column`() {
+        // The rule is add_column's alone: at creation no earlier file exists.
+        val (cat, ns) = fixture()
+        val info =
+            catalogs.createTable(
+                cat,
+                ns,
+                "strict",
+                listOf(
+                    idCol,
+                    ColumnDef("s", ColType.STRUCT, children = listOf(ColumnDef("n", ColType.LONG, nullable = false))),
+                ),
+            )
+        assertThat(info.columns.map { it.def.nullable }).containsExactly(false, true)
+        assertThat(info.columns[1].children.single().def.nullable).isFalse()
+        // Re-read from hog_column, not the request echoed back: the flag
+        // survives the DB round trip at both levels.
+        val stored = catalogs.getTable(cat, ns, "strict").columns
+        assertThat(stored[0].def.nullable).isFalse()
+        assertThat(stored[1].def.nullable).isTrue()
+        assertThat(stored[1].children.single().def.nullable).isFalse()
     }
 
     @Test

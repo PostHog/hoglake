@@ -104,6 +104,20 @@ def add_column(
 ) -> AlterOp:
     """Add a column. ``type_`` is a pyarrow DataType or a hoglake type name.
 
+    An added column must be nullable. hoglake has no column defaults, so
+    every file written before the alter reads NULL for the new column,
+    and a schema declaring it required would lie about those files; the
+    server refuses ``nullable=False`` anywhere in an added column's
+    subtree (a map's key excepted: the type model requires it non-null)
+    with a 422, unconditionally, even on a table with no files. This
+    builder expresses a single node (it has no children support), so the
+    refusal made here, as :class:`ValidationError` with no
+    ``status_code`` and in the server's words, is the whole check for
+    what it can express; it comes after the type mapping, so an
+    unsupported type is still :class:`UnsupportedTypeError`. A required
+    column is still expressible at ``create_table``, where no earlier
+    file exists.
+
     ``shredding`` declares the shredded layout of a ``variant`` column
     (``type_="variant"``, in any case; see :mod:`pyhoglake.variant`). It
     is validated here, refused on any other type the server knows, and
@@ -111,9 +125,18 @@ def add_column(
     nothing. A declaration is fixed once the column exists: no alter op
     changes it.
     """
-    return AlterOp(
-        "add_column", {"column": _column_def(name, type_, nullable, shredding)}
-    )
+    column = _column_def(name, type_, nullable, shredding)
+    if not nullable:
+        # AlterService.requireAddedSubtreeNullable, for the one node this
+        # builder can express.
+        raise ValidationError(
+            f"cannot add column '{name}': it is declared required "
+            "(nullable=false), but hoglake has no column defaults; files "
+            "written before the column read NULL for it, so every node of "
+            "an added column must be nullable (a map's key excepted)",
+            status_code=None,
+        )
+    return AlterOp("add_column", {"column": column})
 
 
 def drop_column(name: str) -> AlterOp:

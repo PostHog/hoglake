@@ -1598,6 +1598,17 @@ ran on the local stack and what it showed.
   could not do the S3 footer reads this check needs, and #261 removed it
   anyway. `AlterGuardPlanIntegrationTest` pins the guard's count to the
   `hog_data_file_missing_field_ids` partial index.
+- **An added column must be nullable at every node** (#446,
+  `AlterService.requireAddedSubtreeNullable`): hoglake has no column
+  defaults (no Iceberg v3 `initial-default`), so every file written
+  before an `add_column` reads NULL for it, and `nullable: false`
+  anywhere in the added subtree — top-level, under a struct `parent`, or
+  nested inside an added container — is a 422 naming the path. A map's
+  `key` is the one exception (the type model requires it non-null).
+  Unconditional, files or not, matching Iceberg v2's "added columns must
+  be optional"; `create_table` still takes a required column.
+  `pyhoglake.ops.add_column` refuses `nullable=False` before the round
+  trip.
 - **The hydrator's size floor gates stats ROWS, never the footer read**
   (#432, `HOGLAKE_HYDRATOR_MIN_FILE_BYTES`, default 1 MiB, 0 = rows for
   every file). Every pending file is claimed and footer-checked as
