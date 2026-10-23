@@ -5,6 +5,7 @@ import com.posthog.hoglake.model.BoundReencode
 import com.posthog.hoglake.model.ChangeKind
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.Column
+import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.PartitionFieldDef
 import com.posthog.hoglake.model.PartitionSpec
@@ -301,6 +302,11 @@ class AlterService(private val jdbi: Jdbi) {
             depthOffset = parent?.let { depthOf(state, it) } ?: 0,
             existingNodes = state.cols.allNodes().size,
         )
+        // After the shape check (so the walk below sees a legal tree and
+        // every name it quotes has met the identifier policy) and before
+        // any file-state query or id allocation: an added column must be
+        // nullable at every node. See [requireAddedSubtreeNullable].
+        requireAddedSubtreeNullable(op)
         // A name-bound file may already contain the added name (for example
         // after DROP + ADD). Without field IDs its old values would become
         // values of this new column instead of nulls. Pending files are unknown.
@@ -316,6 +322,71 @@ class AlterService(private val jdbi: Jdbi) {
             } else {
                 replaceNode(state.cols, parent.fieldId) { it.copy(children = it.children + col) }
             }
+    }
+
+    /**
+     * Refuse an add_column whose subtree declares ANY node required
+     * (`nullable=false`): the added column itself, a field added into a
+     * struct `parent`, or a child at any depth inside an added
+     * container.
+     *
+     * hoglake has no column defaults — nothing like Iceberg v3's
+     * `initial-default` / `write-default`; a hog_column row is name,
+     * type, type_params, nullable, ordinal, comment — so every file
+     * written before the alter reads NULL for the new column, and a
+     * schema that declares it required is a lie about those files.
+     * Readers that trust the flag (Arrow/DuckDB non-nullable fields,
+     * Iceberg federation) misbehave on them, and compaction's rewriter
+     * fills a column an input lacks with nulls, so compacted output
+     * would carry NULLs under a required column. Iceberg v2's rule is
+     * the same: "added columns must be optional". A v3-style
+     * initial-default would relax this; until one exists, refuse.
+     *
+     * UNCONDITIONAL, even on a table with no live files: the rule is
+     * then one sentence rather than a file-state query whose answer can
+     * change between the check and the commit (a pending file's id
+     * state is unknown; a file committed concurrently is not yet
+     * visible), and a required column is still expressible at
+     * create_table, where no earlier file exists.
+     *
+     * The one exception is a MAP's `key` NODE: [ColumnTrees.validate]
+     * forces `key.nullable=false` (Iceberg map keys are non-nullable), so
+     * exempting that node is the only way a map is addable at all. The
+     * exemption stops there: every other node — the map's `value`, a
+     * list's `element`, every struct field, and the fields of a
+     * STRUCT-typed key — is checked uniformly.
+     *
+     * The ORDER is deliberate: this runs after the duplicate-sibling
+     * check and [ColumnTrees.validate], and before [requireFieldIds], so
+     * "already exists", the identifier policy and the depth cap answer
+     * first, and the quoted path is bounded by construction (every
+     * non-synthetic name has met the identifier policy, synthetic names
+     * are the literal element/key/value, depth is capped, and
+     * `op.parent` was resolved against stored names by
+     * [requireStructParent]); and a required column is refused as a 422
+     * before any file-state query could answer 409 for it.
+     */
+    private fun requireAddedSubtreeNullable(op: AlterOp.AddColumn) {
+        val top = op.parent?.let { "$it.${op.def.name}" } ?: op.def.name
+
+        fun walk(
+            def: ColumnDef,
+            qualified: String,
+            isMapKey: Boolean,
+        ) {
+            if (!def.nullable && !isMapKey) {
+                val which = if (qualified == top) "it is" else "'$qualified' inside it is"
+                throw HoglakeException.Validation(
+                    "cannot add column '$top': $which declared required (nullable=false), but " +
+                        "hoglake has no column defaults; files written before the column read NULL " +
+                        "for it, so every node of an added column must be nullable (a map's key excepted)",
+                )
+            }
+            def.children?.forEachIndexed { i, child ->
+                walk(child, "$qualified.${child.name}", isMapKey = def.type == ColType.MAP && i == 0)
+            }
+        }
+        walk(op.def, top, isMapKey = false)
     }
 
     /**

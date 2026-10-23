@@ -20,6 +20,7 @@ from pyhoglake import (
     NotFoundError,
     OffsetRegressionError,
     ReconciliationRequiredError,
+    UnsupportedTypeError,
     ValidationError,
     ops,
 )
@@ -1037,6 +1038,34 @@ def test_alter_wire_shape_and_errors(client, httpx_mock):
     )
     with pytest.raises(ValidationError):
         t.alter([ops.drop_column("ghost")])
+
+
+@pytest.mark.parametrize("type_", ["int", pa.int32(), "variant"])
+def test_add_column_refuses_a_required_column_before_the_round_trip(
+    client, httpx_mock, type_
+):
+    """hoglake has no column defaults, so a column added after files exist
+    reads NULL from every one of them; the server refuses nullable=false
+    anywhere in an added column (#446) and the builder refuses the one
+    node it can express, in the server's words and without a request."""
+    with pytest.raises(ValidationError, match="hoglake has no column defaults") as ei:
+        ops.add_column("team_id", type_, nullable=False)
+    assert ei.value.status_code is None
+    assert "cannot add column 'team_id'" in str(ei.value)
+    assert httpx_mock.get_requests() == []
+    # Positional, as test_variant_ddl once spelt it.
+    with pytest.raises(ValidationError):
+        ops.add_column("team_id", type_, False)
+    # The type mapping answers first: an unsupported type is still its
+    # own error, required or not.
+    with pytest.raises(UnsupportedTypeError):
+        ops.add_column("team_id", pa.float16(), nullable=False)
+    # Both legal spellings still build the op.
+    assert ops.add_column("team_id", type_).to_wire()["column"]["nullable"] is True
+    assert (
+        ops.add_column("team_id", type_, nullable=True).to_wire()["column"]["nullable"]
+        is True
+    )
 
 
 def test_drop_table(client, httpx_mock):
