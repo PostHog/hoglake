@@ -139,11 +139,16 @@ data class Config(
      * it directly).
      *
      * Fifteen minutes, not seconds: hydration is a backfill for files
-     * registered WITHOUT stats, and every writer in the fleet ships its
-     * own footer, so the queue is empty in the steady state and a fast
-     * poll only records that it was empty. The cost of the interval is
-     * the delay before a stats-less file becomes prunable, which is a
-     * backfill's latency rather than a reader's.
+     * registered WITHOUT stats. A writer that ships its own footer
+     * (every millpond file) never enters the queue; one that defers
+     * stats (`deferred_stats`, what millrace does and millpond may) adds
+     * a pending file per flush, so on such a fleet the queue is never
+     * empty between sweeps and each sweep drains up to
+     * `Hydrator.DEFAULT_SWEEP_LIMIT` of it. The cost of the interval is
+     * the delay before a deferred file becomes prunable and before its
+     * field-id audit lands (`missing_field_ids`), a backfill's latency
+     * rather than a reader's; since #445 nothing a client does waits on
+     * it.
      */
     val hydratorIntervalMs: Long = env("HOGLAKE_HYDRATOR_INTERVAL_MS", "900000").toLong(),
     /**
@@ -168,12 +173,13 @@ data class Config(
     /**
      * The hydrator's SIZE FLOOR (#432), and it gates the STATS ROWS only:
      * a pending file under this many bytes is still claimed, its footer
-     * still read and field-id checked (so `add_column`/`rename_column`
-     * are not held up by it), and it flips to `provided` with
-     * `missing_field_ids` and `split_offsets` set, but with NO
+     * still read, and it flips to `provided` with `missing_field_ids`
+     * (the field-id audit flag) and `split_offsets` set, but with NO
      * `hog_file_column_stats` rows, which readers already treat as no
-     * bounds. 0 writes rows for every file (the behaviour before the
-     * floor); negative is refused. Default 1 MiB.
+     * bounds. That read buys only the flag and the offsets: since #445
+     * the DDL guard refuses over FLAGGED files alone, so a file left
+     * `pending` holds nothing up. 0 writes rows for every file (the
+     * behaviour before the floor); negative is refused. Default 1 MiB.
      *
      * Why: the stats of a file this small never prune anything (one row
      * group, cheaper to read than to skip), and compaction registers its

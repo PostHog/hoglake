@@ -255,11 +255,12 @@ Prepared replacement already checks target changes and namespace identity: an
 alteration committed first rejects replacement, and replacement committed first
 rejects an alteration using the old UUID.
 
-ADD COLUMN now shares RENAME COLUMN's refusal of live id-less files and files
-with pending or failed hydration.
+ADD COLUMN now shares RENAME COLUMN's refusal of live id-less files: those the
+hydrator's footer read has flagged `missing_field_ids`. A file with pending or
+failed hydration is trusted (#445) and does not block either.
 Without IDs, an old file can contain a name being added (including DROP + ADD),
 and name-based readers could expose those old values under the new field ID.
-Hydrate, rewrite, or retire blocking files first. All clients using `/alter`
+Rewrite (compact) or retire blocking files first. All clients using `/alter`
 (including Python, DuckDB and the console) receive `idless_files_present` for
 this unsafe case. Existing requests otherwise retain their semantics; the new
 guards are optional for legacy callers. Namespace identity is additive response

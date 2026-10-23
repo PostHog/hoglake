@@ -520,95 +520,148 @@ class AlterServiceIntegrationTest {
         assertThat(old.single { it.def.name == "score" }.def.type).isEqualTo(ColType.FLOAT)
     }
 
-    @Test
-    fun `rename column is refused while a live file is still pending hydration`() {
-        // Pinned regression (bug hunt #6, the rename-guard TOCTOU): a
-        // deferred-stats file has missing_field_ids=false (schema default)
-        // until the hydrator's footer read — its id state is UNKNOWN, so
-        // the guard must block on 'pending' too, not only on the flag.
-        val (cat, ns) = fixture()
-        val tableId = catalogs.getTable(cat, ns, "t").tableId
+    /** One live file row on the fixture table; the defaults are CommitTail's (provided, unflagged). */
+    private fun insertFile(
+        cat: String,
+        tableId: Long,
+        dataFileId: Long,
+        path: String,
+        statsState: String = "provided",
+        missingFieldIds: Boolean = false,
+    ) {
         db.jdbi.withHandleUnchecked { h ->
             h.execute(
                 """
                 INSERT INTO hog_data_file (catalog_id, data_file_id, table_id, begin_snapshot,
-                    path, record_count, file_size_bytes, row_id_start, stats_state)
-                VALUES (?, 1, ?, 2, 's3://bucket/deferred.parquet', 10, 100, 0, 'pending')
+                    path, record_count, file_size_bytes, row_id_start, stats_state, missing_field_ids)
+                VALUES (?, ?, ?, 2, ?, 10, 100, ?, ?, ?)
                 """,
                 catId(cat),
+                dataFileId,
                 tableId,
+                path,
+                dataFileId * 10,
+                statsState,
+                missingFieldIds,
             )
         }
-        assertThatThrownBy {
-            alter.alterTable(cat, ns, "t", listOf(AlterOp.AddColumn(ColumnDef("new_column", ColType.LONG))))
-        }.isInstanceOf(HoglakeException.IdlessFilesPresent::class.java)
-        assertThatThrownBy {
-            alter.alterTable(cat, ns, "t", listOf(AlterOp.RenameColumn("name", "label")))
-        }
-            .isInstanceOf(HoglakeException.IdlessFilesPresent::class.java)
-            .hasMessageContaining("1 not-yet-hydrated")
-        assertThat(catalogs.getTable(cat, ns, "t").columns.map { it.def.name }).contains("name")
+    }
 
-        // Failure before reading the footer (for example, the whole-object cap)
-        // leaves missing_field_ids=false without ever verifying the IDs.
+    @Test
+    fun `add_column and rename_column succeed over a pending file and over one that failed before its footer read`() {
+        // #445. Until then the guard refused while any live file was
+        // `pending` or `failed`, reasoning that an unread footer leaves
+        // the id state unknown. A file registered with inline stats is
+        // never read either and was never refused, so the clause
+        // verified only the deferred-stats path, and on a busy table
+        // with deferred stats (a new pending file every flush, one sweep
+        // per interval) it refused forever. The guard now trusts a file
+        // until the hydrator PROVES it id-less. MUTATION: restore the
+        // `stats_state IN ('pending', 'failed')` clause and every alter
+        // here is refused.
+        val (cat, ns) = fixture()
+        val tableId = catalogs.getTable(cat, ns, "t").tableId
+        insertFile(cat, tableId, 1, "s3://bucket/deferred.parquet", statsState = "pending")
+
+        val pendingShape =
+            alter.alterTable(
+                cat,
+                ns,
+                "t",
+                listOf(
+                    AlterOp.AddColumn(ColumnDef("added_while_pending", ColType.LONG)),
+                    AlterOp.RenameColumn("name", "label"),
+                ),
+            ).columns.map { it.def.name }
+        assertThat(pendingShape).contains("added_while_pending", "label").doesNotContain("name")
+
+        // A failure BEFORE the footer parse (object missing, over the
+        // whole-object cap): markFailed with a null verdict COALESCEs the
+        // flag to its current value, so the file is unflagged and, like
+        // every inline-stats file, unguarded.
         db.jdbi.withHandleUnchecked { h ->
             h.execute(
                 "UPDATE hog_data_file SET stats_state = 'failed' WHERE catalog_id = ? AND data_file_id = 1",
                 catId(cat),
             )
         }
-        val beforeFailureChecks = head(cat)
+        val failedShape =
+            alter.alterTable(
+                cat,
+                ns,
+                "t",
+                listOf(
+                    AlterOp.AddColumn(ColumnDef("added_while_failed", ColType.LONG)),
+                    AlterOp.RenameColumn("label", "title"),
+                ),
+            ).columns.map { it.def.name }
+        assertThat(failedShape).contains("added_while_failed", "title").doesNotContain("label")
+    }
+
+    @Test
+    fun `a flagged file refuses both DDLs whatever its pending neighbours, and the message names only id-less files`() {
+        // The 409 survives for a PROVEN id-less file, and the message no
+        // longer has a "not-yet-hydrated" branch to mention: the pending
+        // file beside it is neither counted nor named. MUTATION: drop
+        // the `missing_field_ids` predicate from the count and both
+        // alters go through.
+        val (cat, ns) = fixture()
+        val tableId = catalogs.getTable(cat, ns, "t").tableId
+        insertFile(cat, tableId, 1, "s3://bucket/idless.parquet", missingFieldIds = true)
+        insertFile(cat, tableId, 2, "s3://bucket/pending.parquet", statsState = "pending")
+        insertFile(cat, tableId, 3, "s3://bucket/failed.parquet", statsState = "failed")
+
+        val before = head(cat)
         for (op in listOf(
             AlterOp.AddColumn(ColumnDef("new_column", ColType.LONG)),
             AlterOp.RenameColumn("name", "label"),
         )) {
             assertThatThrownBy { alter.alterTable(cat, ns, "t", listOf(op)) }
+                .describedAs("%s", op::class.simpleName)
                 .isInstanceOf(HoglakeException.IdlessFilesPresent::class.java)
+                .hasMessageContaining("1 id-less")
+                .hasMessageContaining("live data file(s)")
+                .satisfies({ assertThat(it.message).doesNotContain("not-yet-hydrated").doesNotContain("pending") })
         }
-        assertThat(head(cat)).isEqualTo(beforeFailureChecks)
-
-        // Hydration lands an id-bearing verdict: failed -> provided with
-        // missing_field_ids=false. The rename is now allowed.
-        db.jdbi.withHandleUnchecked { h ->
-            h.execute(
-                "UPDATE hog_data_file SET stats_state = 'provided' WHERE catalog_id = ? AND data_file_id = 1",
-                catId(cat),
-            )
-        }
-        val info = alter.alterTable(cat, ns, "t", listOf(AlterOp.RenameColumn("name", "label")))
-        assertThat(info.columns.map { it.def.name }).contains("label")
+        assertThat(head(cat)).describedAs("a refused alter mints nothing").isEqualTo(before)
+        assertThat(catalogs.getTable(cat, ns, "t").columns.map { it.def.name }).contains("name")
     }
 
     @Test
-    fun `rename guard message distinguishes id-less from not-yet-hydrated blockers`() {
+    fun `a failed verdict that parsed the footer keeps the flag and the refusal`() {
+        // `failed` WITH a verdict: the footer parsed (the record count
+        // contradicted the registration) and markFailed wrote the
+        // id-less verdict with it. Trusting `failed` files (#445) does
+        // not trust THIS one: the flag, not the state, is what the guard
+        // reads. HydratorIntegrationTest carries the same file through a
+        // rehydrate and a second sweep.
         val (cat, ns) = fixture()
         val tableId = catalogs.getTable(cat, ns, "t").tableId
-        db.jdbi.withHandleUnchecked { h ->
-            h.execute(
-                """
-                INSERT INTO hog_data_file (catalog_id, data_file_id, table_id, begin_snapshot,
-                    path, record_count, file_size_bytes, row_id_start, missing_field_ids)
-                VALUES (?, 1, ?, 2, 's3://bucket/idless.parquet', 10, 100, 0, true)
-                """,
-                catId(cat),
-                tableId,
-            )
-            h.execute(
-                """
-                INSERT INTO hog_data_file (catalog_id, data_file_id, table_id, begin_snapshot,
-                    path, record_count, file_size_bytes, row_id_start, stats_state)
-                VALUES (?, 2, ?, 2, 's3://bucket/pending.parquet', 10, 100, 10, 'pending')
-                """,
-                catId(cat),
-                tableId,
-            )
+        insertFile(cat, tableId, 1, "s3://bucket/idless-failed.parquet", statsState = "failed", missingFieldIds = true)
+        for (op in listOf(
+            AlterOp.AddColumn(ColumnDef("new_column", ColType.LONG)),
+            AlterOp.RenameColumn("name", "label"),
+        )) {
+            assertThatThrownBy { alter.alterTable(cat, ns, "t", listOf(op)) }
+                .describedAs("%s", op::class.simpleName)
+                .isInstanceOf(HoglakeException.IdlessFilesPresent::class.java)
+                .hasMessageContaining("1 id-less")
         }
+    }
+
+    @Test
+    fun `drop_column is not guarded by a flagged file`() {
+        // Dropping needs no binding at all: a name-bound file's column
+        // simply stops being read. Only the two ops that give a name a
+        // NEW meaning (add, rename) consult the flag.
+        val (cat, ns) = fixture()
+        val tableId = catalogs.getTable(cat, ns, "t").tableId
+        insertFile(cat, tableId, 1, "s3://bucket/idless.parquet", missingFieldIds = true)
         assertThatThrownBy {
             alter.alterTable(cat, ns, "t", listOf(AlterOp.RenameColumn("name", "label")))
-        }
-            .isInstanceOf(HoglakeException.IdlessFilesPresent::class.java)
-            .hasMessageContaining("1 id-less")
-            .hasMessageContaining("1 not-yet-hydrated")
+        }.isInstanceOf(HoglakeException.IdlessFilesPresent::class.java)
+        val info = alter.alterTable(cat, ns, "t", listOf(AlterOp.DropColumn("score")))
+        assertThat(info.columns.map { it.def.name }).doesNotContain("score").contains("name")
     }
 
     @Test

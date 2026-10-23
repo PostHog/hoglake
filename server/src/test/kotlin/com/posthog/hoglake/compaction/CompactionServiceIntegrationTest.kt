@@ -52,6 +52,7 @@ import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName
 import org.apache.parquet.schema.Types
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
+import org.assertj.core.api.Assertions.entry
 import org.jdbi.v3.core.kotlin.useHandleUnchecked
 import org.jdbi.v3.core.kotlin.withHandleUnchecked
 import org.junit.jupiter.api.AfterAll
@@ -3039,6 +3040,93 @@ class CompactionServiceIntegrationTest {
             HetRow(20, null, 1),
             HetRow(30, 1.5, 2),
         )
+    }
+
+    @Test
+    fun `compacting an id-less group lifts the rename guard - the output carries ids and the inputs are ended`() {
+        // The whole arc of the field-id contract, end to end: an id-less
+        // file is committed with deferred stats, the sweep FLAGS it,
+        // rename_column is refused 409, compaction rewrites the group
+        // under the live schema (ids stamped on every node, the inputs
+        // end-snapshotted), and the same rename goes through. This is
+        // the remedy the 409's message prescribes, exercised rather than
+        // described.
+        val cat = "compact-idless-${counter.incrementAndGet()}"
+        catalogs.createCatalog(cat, "s3://$BUCKET/$cat")
+        catalogs.createNamespace(cat, "ns")
+        catalogs.createTable(
+            cat,
+            "ns",
+            "t",
+            listOf(ColumnDef("id", ColType.LONG, nullable = false), ColumnDef("name", ColType.STRING)),
+        )
+        val idlessSchema =
+            Types.buildMessage()
+                .addField(Types.required(PrimitiveTypeName.INT64).named("id"))
+                .addField(
+                    Types.optional(PrimitiveTypeName.BINARY).`as`(LogicalTypeAnnotation.stringType()).named("name"),
+                )
+                .named("t")
+        val paths =
+            (1..2).map { i ->
+                val bytes =
+                    customParquetBytes(
+                        idlessSchema,
+                        listOf({ g ->
+                            g.add("id", i.toLong())
+                            g.add("name", "row-$i")
+                        }),
+                    )
+                val path = "s3://$BUCKET/$cat/data/ns/t/idless-$i.parquet"
+                store.put(path, bytes)
+                commits.commit(
+                    cat,
+                    CommitRequest(
+                        appends =
+                            listOf(
+                                TableAppend("ns", "t", listOf(FileRegistration(path, 1, bytes.size.toLong()))),
+                            ),
+                    ),
+                )
+                path
+            }
+
+        fun flagged(): Map<String, Boolean> =
+            db.jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    """
+                    SELECT f.path, f.missing_field_ids FROM hog_data_file f
+                    JOIN hog_catalog c ON c.catalog_id = f.catalog_id
+                    WHERE c.name = :cat AND f.end_snapshot IS NULL
+                    """,
+                ).bind("cat", cat).map { rs, _ -> rs.getString("path") to rs.getBoolean("missing_field_ids") }
+                    .list().toMap()
+            }
+        val rename = listOf(AlterOp.RenameColumn("name", "label"))
+
+        // The class shares one database, so the sweep may also drain
+        // another test's pending files; what matters is these two.
+        assertThat(Hydrator(db.jdbi, store).runOnce()).isGreaterThanOrEqualTo(2)
+        assertThat(flagged()).containsExactlyInAnyOrderEntriesOf(paths.associateWith { true })
+        assertThatThrownBy { alter.alterTable(cat, "ns", "t", rename) }
+            .isInstanceOf(HoglakeException.IdlessFilesPresent::class.java)
+            .hasMessageContaining("2 id-less")
+
+        val result = svc.runOnce(cat, cfg)
+        assertThat(result.groupsCompacted).isEqualTo(1)
+        val output = catalogs.listFiles(cat, "ns", "t").single()
+        assertThat(output.path).isNotIn(paths)
+        // The output registers unflagged (compaction stamps an id on
+        // every node it writes) and the inputs are no longer live, so
+        // the guard's population is empty.
+        assertThat(flagged()).containsExactly(entry(output.path, false))
+        var outSchema: MessageType? = null
+        readGroups(store.get(output.path)) { s, _ -> outSchema = s }
+        assertThat(outSchema!!.getType("id").id.intValue()).isEqualTo(1)
+        assertThat(outSchema!!.getType("name").id.intValue()).isEqualTo(2)
+
+        val renamed = alter.alterTable(cat, "ns", "t", rename).columns.map { it.def.name }
+        assertThat(renamed).contains("label").doesNotContain("name")
     }
 
     @Test

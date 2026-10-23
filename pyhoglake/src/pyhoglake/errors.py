@@ -327,23 +327,24 @@ class CatalogHasAbandonedUploadsError(CatalogNotEmptyError):
 
 class IdlessFilesPresentError(HoglakeError):
     """409 ``idless_files_present`` — an ``add_column`` or ``rename_column``
-    refused because the table has live data files whose field ids are not
-    known to be present, so their columns may bind by NAME and the new or
-    renamed name could adopt another column's values.
+    refused because the table has a live data file the server's hydrator
+    has PROVEN id-less (``missing_field_ids``): its parquet schema carries
+    no field ids, so its columns bind by NAME and the new or renamed name
+    could adopt another column's values.
 
     Deliberately NOT a :class:`CommitConflictError`: no concurrent DDL
     happened, and refreshing the read snapshot changes nothing. Neither
-    :attr:`retryable` nor :attr:`re_prepare` — the SAME alter succeeds
-    only once the blocking files are gone, which :attr:`detail` (the
-    server's prose) counts. It clears:
+    :attr:`retryable` nor :attr:`re_prepare`, and retrying never helps:
+    the flag never clears on its own. The SAME alter succeeds only once
+    the id-less files — :attr:`detail` (the server's prose) counts them —
+    have been rewritten by compaction or retired. A pending or failed
+    hydration does NOT raise this (the server trusts a file until its
+    footer proves otherwise), so there is no sweep to wait for.
 
-    - for files still ``stats_state='pending'`` (a ``deferred_stats``
-      append), once the hydrator has read their footers and verified the
-      ids — a wait, typically seconds, so retrying the alter on a bounded
-      backoff is the right response;
-    - for ``'failed'`` files, only after a successful rehydrate;
-    - NEVER on its own for files with ``missing_field_ids`` genuinely
-      true: those must be rewritten (compaction) or retired first.
+    The right response is to fail loudly: surface the alter's failure to
+    whoever can compact or retire the file. Do not retry on a backoff,
+    and do not fall back to dropping or skipping the column — the data
+    the alter was for has nowhere else to go.
     """
 
 

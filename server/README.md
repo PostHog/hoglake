@@ -267,25 +267,22 @@ gigahog-prod-us on 2026-10-22: millrace-prod-us had 24.7M files pending
 at ~13 KB each (a sweep compacts 2,382 of them, 30 MiB, into 64
 outputs), millpond's stray-day files are ~0.1 MB, and the stats table
 was 136 GB of the RDS volume; 24.7M × 26 is ~642M rows the floor spares.
-The footer GET and the one `UPDATE` per file stay, at today's rate. They
-stay on purpose: the field-id verdict is what lets `add_column` and
-`rename_column` through (the guard below refuses while any live file is
-`pending`), and a floor that left tiny files `pending` would block those
-on any table whose tiny files compaction never rewrites. That is every
-bucket under compaction's minimum input count.
+The footer GET and the one `UPDATE` per file stay, at today's rate. What
+the under-floor read buys is the field-id audit flag
+(`missing_field_ids`) and `split_offsets`; it no longer unblocks any DDL,
+because the guard below stopped refusing over `pending` files (#445).
 
-For a writer, **deferring has two costs and one upside**. While a
-deferred file is live and unhydrated (`pending`, or `failed` until a
-rehydrate succeeds), `add_column` and `rename_column` on its table
-refuse 409 `idless_files_present` (the field-id guard below);
-pyhoglake raises `IdlessFilesPresentError`, not `CommitConflictError`,
-so the writer waits and retries the alter instead of treating it as
-concurrent DDL. And a deferred file under the floor above never gets
-stats rows: no bounds until compaction rewrites it. The upside is the
-field-id check itself (`missing_field_ids`), which a file registered
-with inline stats never gets, because the server never opens it.
-Registering `"column_stats": []` is not deferring: the file is
-`provided` with no stats and the hydrator never claims it.
+For a writer, **deferring has one cost and one upside**. A deferred file
+under the floor above never gets stats rows: no bounds until compaction
+rewrites it. The upside is the field-id audit itself
+(`missing_field_ids`), which a file registered with inline stats never
+gets, because the server never opens it. `add_column` and
+`rename_column` are NOT held up by a deferred file: the guard refuses
+only over a file the sweep has already flagged, so a pending or failed
+file is trusted on field ids the way its stats and `record_count` are
+(and the way every inline-stats file always was). Registering
+`"column_stats": []` is not deferring: the file is `provided` with no
+stats and the hydrator never claims it.
 
 `null_count` is mandatory in `hog_file_column_stats`, so a leaf whose
 footer omits it in any row group gets **no row** — unless the leaf's
@@ -320,18 +317,30 @@ becoming an OOM vector), and the sweep claims its batch
 `FOR UPDATE SKIP LOCKED`, so concurrent replicas hydrate disjoint sets
 instead of amplifying S3 GETs against the same head.
 
-The footer read doubles as the **field-id contract check**: any leaf
-without a `PARQUET:field_id` flags the row
-(`hog_data_file.missing_field_ids`, gauged as
-`hoglake_missing_field_id_files{catalog}`; the reserved `_hog_row_id`
-id on compacted files is fine). Id-less files bind columns by name, so
-while one is LIVE the table's `rename_column` fails with 409
-`idless_files_present` — renaming would silently NULL that column's
-history in readers. The guard blocks on live **`pending`** files too:
-their id state is unknown until the footer is read, so a rename can't
-slip through the commit-to-hydration window. `rename_table` is
-unaffected, and the flag clears from relevance when the file is
-compacted away, dropped, or expired.
+The footer read doubles as the **field-id audit**: any leaf without a
+`PARQUET:field_id` flags the row (`hog_data_file.missing_field_ids`,
+gauged as `hoglake_missing_field_id_files{catalog}`; the reserved
+`_hog_row_id` id on compacted files is fine). Id-less files bind
+columns by name, so while a FLAGGED file is LIVE the table's
+`add_column` and `rename_column` fail with 409 `idless_files_present` —
+renaming would silently NULL that column's history in readers, and an
+added name could adopt an old column's values. The flag is an
+after-the-fact audit, not a timely guard: a file is trusted until the
+sweep reaches it, and the sweep is a queue (each catalog's pending
+files in `data_file_id` order, `Hydrator.DEFAULT_SWEEP_LIMIT` per
+replica per `HOGLAKE_HYDRATOR_INTERVAL_MS`, SKIP LOCKED across
+replicas, the limit split across the catalogs with work), so a new
+file waits behind the whole backlog — backlog / (limit × replicas)
+intervals at best, which for the 24.7M above is ~250 replica-days at
+1,000 per 15 min; a file registered with
+inline stats is never read at all, and a `failed` file is trusted too
+unless its footer parsed far enough to write the verdict. Until #445
+the guard also refused over `pending`/`failed` files; that verified
+only the deferred path, which the inline path never got, and on a busy
+deferred-stats table it never cleared. `rename_table` is unaffected,
+the 409 never clears on its own (rewrite or retire the file), and the
+flag leaves the count when the file is compacted away, dropped, or
+expired.
 
 The same footer read also records the file's **row-group start
 offsets** (`hog_data_file.split_offsets`, served on

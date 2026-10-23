@@ -1573,33 +1573,45 @@ ran on the local stack and what it showed.
   `time` stays micros-only. No unit CONVERSION exists, because no legal
   promotion produces a unit mismatch: `PROMOTIONS` follows DuckLake's
   documented table, which has no timestamp rungs.
-- **Field ids are a contract**: the hydrator's footer read flags files
-  whose parquet schema has any leaf without `PARQUET:field_id`
-  (`hog_data_file.missing_field_ids`; gauge
+- **Field ids are a contract, audited after the fact**: the hydrator's
+  footer read flags files whose parquet schema has any leaf without
+  `PARQUET:field_id` (`hog_data_file.missing_field_ids`; gauge
   `hoglake_missing_field_id_files{catalog}`; the reserved `_hog_row_id`
-  id 2147483646 is fine). While a flagged file — or a still-`pending`
-  file, whose id state is unknown until the footer is read — is LIVE,
-  `rename_column` is refused with 409 `idless_files_present` (id-less
-  files bind columns by name; renaming would silently NULL their
-  history in readers). `rename_table` is unaffected. Files registered
-  with inline stats never pass through the hydrator, so only
-  deferred-stats files get checked — still a known gap, and nothing
+  id 2147483646 is fine). While a FLAGGED file is LIVE, `add_column`
+  and `rename_column` are refused with 409 `idless_files_present`
+  (id-less files bind columns by name; renaming would silently NULL
+  their history in readers). A `pending` or `failed` file is trusted
+  (#445): the clause that refused over those verified only the
+  deferred-stats path, and on a busy deferred-stats table it never
+  cleared, so the writer crash-looped on schema drift. The flag's lag
+  is the sweep's, and the sweep is a queue: each catalog's pending
+  files in `data_file_id` order, `Hydrator.DEFAULT_SWEEP_LIMIT` per
+  replica per `HOGLAKE_HYDRATOR_INTERVAL_MS` (SKIP LOCKED across
+  replicas, the limit split across the catalogs with work), so a new
+  file waits behind the whole backlog — backlog / (limit × replicas)
+  intervals at best, unbounded while the backlog grows — and
+  DDL can land before the flag; what the flag buys is that no further
+  DDL does, and that the gauge says why. `rename_table` is unaffected. Files
+  registered with inline stats never pass through the hydrator, so only
+  deferred-stats files get audited — still a known gap, and nothing
   else covers it: the verify endpoint was metadata-only by design and
   could not do the S3 footer reads this check needs, and #261 removed it
-  anyway.
+  anyway. `AlterGuardPlanIntegrationTest` pins the guard's count to the
+  `hog_data_file_missing_field_ids` partial index.
 - **The hydrator's size floor gates stats ROWS, never the footer read**
   (#432, `HOGLAKE_HYDRATOR_MIN_FILE_BYTES`, default 1 MiB, 0 = rows for
   every file). Every pending file is claimed and footer-checked as
   before; one under the floor flips to `provided` with
   `missing_field_ids` and `split_offsets` set and no
   `hog_file_column_stats` rows, counted as the sweep result's
-  `stats_skipped_below_floor` (a subset of `hydrated`). Do not "optimise"
-  this into skipping the claim or the GET: a file left `pending` holds
-  the field-id guard (`add_column` and `rename_column` refuse while any
-  live file is unverified), and compaction never rewrites a bucket under
-  its minimum input count, so a table with a few tiny deferred-stats
-  files would be blocked forever. That shape was the first draft and
-  QE killed it. The rows are the cost the floor removes: ~26 per tiny
+  `stats_skipped_below_floor` (a subset of `hydrated`). The under-floor
+  read buys the field-id audit flag and `split_offsets`, nothing else:
+  since #445 the DDL guard refuses over FLAGGED files only, so a file
+  left `pending` holds nothing up, and the first-draft argument for
+  keeping the GET (a pending tiny file blocking DDL forever on a bucket
+  compaction never rewrites) died with the pending clause. Whether the
+  GET is worth keeping at millrace's file rate is the floor's own
+  question. The rows are the cost the floor removes: ~26 per tiny
   file, inserted only for the expiry purge to cascade-delete (~642M of
   them on millrace-prod-us's 24.7M pending files on 2026-10-22).
   server/README.md §File registration has the reasoning.

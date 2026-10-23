@@ -641,7 +641,7 @@ class CatalogMetrics(
     private val missingFieldIdFiles =
         multiGauge(
             "hoglake_missing_field_id_files",
-            "Live data files whose parquet schema lacks field ids (rename-blocking); " +
+            "Live data files whose parquet schema lacks field ids (DDL-blocking: add_column/rename_column); " +
                 "dropped tables excluded",
         )
     private val liveTotalsSampled =

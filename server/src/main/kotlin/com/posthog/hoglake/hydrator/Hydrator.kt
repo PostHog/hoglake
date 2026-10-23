@@ -41,12 +41,21 @@ import java.time.Instant
  * when the object is missing/unparseable or the registered record_count
  * does not match the footer.
  *
- * The footer read doubles as the field-id contract check: any primitive
- * leaf without a `PARQUET:field_id` flags the row
+ * The footer read doubles as the field-id AUDIT: any primitive leaf
+ * without a `PARQUET:field_id` flags the row
  * (`hog_data_file.missing_field_ids`) — such files bind columns by name,
- * so AlterService refuses column renames while one is live, and
- * CatalogMetrics gauges the flagged population
- * (`hoglake_missing_field_id_files`).
+ * so AlterService refuses `add_column`/`rename_column` while a FLAGGED
+ * file is live, and CatalogMetrics gauges the flagged population
+ * (`hoglake_missing_field_id_files`). After the fact, not before: a
+ * file is trusted until this sweep reaches it, and the sweep is a
+ * queue — [CLAIM_PENDING_SQL] walks each catalog's pending files in
+ * `data_file_id` order from the lowest pending id each sweep,
+ * [DEFAULT_SWEEP_LIMIT] per replica per HOGLAKE_HYDRATOR_INTERVAL_MS
+ * split across the catalogs with work, SKIP LOCKED across replicas —
+ * so a new file waits behind the whole backlog: backlog / (limit ×
+ * replicas) intervals at best, unbounded on a catalog whose backlog
+ * grows. A file registered with client-shipped
+ * stats is never claimed and never checked at all (#445).
  *
  * The same footer also yields the file's row-group start offsets
  * (`hog_data_file.split_offsets`, [FooterSplitOffsets]), written in the
@@ -88,12 +97,12 @@ import java.time.Instant
  * no stats" state a reader already treats as no bounds), counted in the
  * ledger as `stats_skipped_below_floor`. Its stats would never prune
  * anything, and its rows would be inserted only for the expiry purge to
- * cascade-delete them once compaction ends the file. The footer read
- * stays because the field-id verdict is not optional: a file left
- * `pending` would block `add_column`/`rename_column` on its table for as
- * long as it lived, and compaction never rewrites a bucket under its
- * minimum input count, so for a table with a handful of tiny files that
- * is forever.
+ * cascade-delete them once compaction ends the file. What the
+ * under-floor footer read still buys is the field-id audit flag and
+ * `split_offsets`; it no longer unblocks anything, since the DDL guard
+ * stopped refusing over `pending` files (#445). Whether that read is
+ * worth its GET at millrace's file rate is the floor's own question,
+ * not this guard's.
  */
 class Hydrator(
     private val jdbi: Jdbi,
@@ -586,7 +595,7 @@ class Hydrator(
         if (missingFieldIds) {
             log.warn {
                 "file ${file.dataFileId} (${file.path}) has leaves without parquet field ids; " +
-                    "flagged missing_field_ids (column renames on its table are blocked while it is live)"
+                    "flagged missing_field_ids (add_column/rename_column on its table are refused while it is live)"
             }
         }
         log.debug {

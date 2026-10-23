@@ -42,9 +42,10 @@ import java.util.UUID
  * `column_stats` lands `stats_state='pending'`; one with them — or with
  * `[]` — lands `'provided'` in the same commit and is never claimed. One
  * hydrator sweep reads the pending file's footer outside the commit lock:
- * field ids verified, split offsets stored, stats written (or, under
- * [Hydrator.DEFAULT_MIN_FILE_BYTES], none). Until then add_column is
- * refused `idless_files_present`.
+ * field ids audited, split offsets stored, stats written (or, under
+ * [Hydrator.DEFAULT_MIN_FILE_BYTES], none). add_column is NOT held up
+ * by the pending file (#445): the guard refuses only over a file the
+ * sweep has flagged, so it goes through before the sweep and after.
  */
 @Tag("integration")
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
@@ -94,15 +95,18 @@ class PreparedCommitDeferredStatsHydrationIntegrationTest {
 
     private suspend fun body(response: HttpResponse): JsonNode = json.readTree(response.bodyAsText())
 
-    /** `id` = [base] until [base] + ROWS - 1, field id [idFieldId]. */
+    /** `id` = [base] until [base] + ROWS - 1, field id [idFieldId] — or no id at all when [withId] is false. */
     private fun write(
         idFieldId: Int,
         base: Long,
+        withId: Boolean = true,
     ): ByteArray {
         val schema =
             MessageType(
                 "prep",
-                Types.required(PrimitiveType.PrimitiveTypeName.INT64).id(idFieldId).named("id"),
+                Types.required(PrimitiveType.PrimitiveTypeName.INT64)
+                    .let { if (withId) it.id(idFieldId) else it }
+                    .named("id"),
             )
         val tmp = Files.createTempFile("hoglake-prepdeferred", ".parquet")
         try {
@@ -126,7 +130,12 @@ class PreparedCommitDeferredStatsHydrationIntegrationTest {
 
     private fun statsStates(): Map<String, String> =
         db.jdbi.withHandle<Map<String, String>, Exception> { h ->
-            h.createQuery("SELECT path, stats_state FROM hog_data_file")
+            h.createQuery(
+                """
+                SELECT f.path, f.stats_state FROM hog_data_file f
+                JOIN hog_catalog c USING (catalog_id) WHERE c.name = ?
+                """,
+            ).bind(0, catalog)
                 .map { rs, _ -> rs.getString(1) to rs.getString(2) }
                 .list().toMap()
         }
@@ -135,17 +144,22 @@ class PreparedCommitDeferredStatsHydrationIntegrationTest {
         db.jdbi.withHandle<Map<String, Any?>, Exception> { h ->
             h.createQuery(
                 """
-                SELECT data_file_id, missing_field_ids,
+                SELECT catalog_id, data_file_id, missing_field_ids,
                        coalesce(cardinality(split_offsets), 0) AS split_offset_count
                 FROM hog_data_file WHERE path = ?
                 """,
             ).bind(0, path).mapToMap().one()
         }
 
-    private fun statsRowCount(dataFileId: Long): Long =
+    /** Stats rows of the file at [path]; by path, so another catalog's same data_file_id is never counted. */
+    private fun statsRowCount(path: String): Long =
         db.jdbi.withHandle<Long, Exception> { h ->
-            h.createQuery("SELECT count(*) FROM hog_file_column_stats WHERE data_file_id = ?")
-                .bind(0, dataFileId).mapTo(Long::class.java).one()
+            h.createQuery(
+                """
+                SELECT count(*) FROM hog_file_column_stats s
+                JOIN hog_data_file f USING (catalog_id, data_file_id) WHERE f.path = ?
+                """,
+            ).bind(0, path).mapTo(Long::class.java).one()
         }
 
     private fun lastSweep(): JsonNode =
@@ -171,11 +185,12 @@ class PreparedCommitDeferredStatsHydrationIntegrationTest {
     private suspend fun HttpClient.commitPrepared(
         tableUuid: String,
         vararg files: String,
+        cat: String = catalog,
     ) {
-        val head = body(get("/v1/catalogs/$catalog"))["head_snapshot_id"].asLong()
+        val head = body(get("/v1/catalogs/$cat"))["head_snapshot_id"].asLong()
         val commit =
             postJson(
-                "/v1/catalogs/$catalog/commit/prepared",
+                "/v1/catalogs/$cat/commit/prepared",
                 """{"idempotency_key": "${UUID.randomUUID()}", "read_snapshot": $head,
                     "appends": [{"namespace": "ns", "table": "events",
                                  "expected_table_uuid": "$tableUuid",
@@ -184,11 +199,28 @@ class PreparedCommitDeferredStatsHydrationIntegrationTest {
         assertThat(commit.status).describedAs(commit.bodyAsText()).isEqualTo(HttpStatusCode.OK)
     }
 
-    private suspend fun HttpClient.addColumn(name: String): HttpResponse =
+    private suspend fun HttpClient.addColumn(
+        name: String,
+        cat: String = catalog,
+    ): HttpResponse =
         postJson(
-            "$tablesUrl/events/alter",
+            "/v1/catalogs/$cat/namespaces/ns/tables/events/alter",
             """{"ops": [{"op": "add_column", "column": {"name": "$name", "type": "long"}}]}""",
         )
+
+    /** Catalog [cat] with `ns.events(id long)`; returns (table_uuid, id field id). */
+    private suspend fun HttpClient.createEvents(cat: String): Pair<String, Int> {
+        postJson("/v1/catalogs", """{"name": "$cat", "data_path": "s3://$BUCKET/$cat"}""")
+        postJson("/v1/catalogs/$cat/namespaces", """{"name": "ns"}""")
+        val created =
+            postJson(
+                "/v1/catalogs/$cat/namespaces/ns/tables",
+                """{"name": "events", "columns": [{"name": "id", "type": "long"}]}""",
+            )
+        assertThat(created.status).describedAs(created.bodyAsText()).isEqualTo(HttpStatusCode.Created)
+        val table = body(created)
+        return table["table_uuid"].asText() to table["columns"].single()["field_id"].asInt()
+    }
 
     @Test
     fun `a prepared registration without column_stats lands pending and one hydrator sweep provides it`() =
@@ -227,11 +259,13 @@ class PreparedCommitDeferredStatsHydrationIntegrationTest {
                 mapOf(deferredPath to "pending", shippedPath to "provided", emptyPath to "provided"),
             )
 
-            // While the deferred file is unhydrated its field ids are
-            // unverified, so add_column is refused with the typed code.
-            val refused = client.addColumn("extra")
-            assertThat(refused.status).describedAs(refused.bodyAsText()).isEqualTo(HttpStatusCode.Conflict)
-            assertThat(body(refused)["error"].asText()).isEqualTo("idless_files_present")
+            // The deferred file is pending and its footer unread; it is
+            // trusted on field ids the way the shipped-stats files are
+            // (#445), so add_column goes through now. MUTATION: restore
+            // the pending clause in AlterService.requireFieldIds and
+            // this is a 409 `idless_files_present`.
+            val whilePending = client.addColumn("extra_while_pending")
+            assertThat(whilePending.status).describedAs(whilePending.bodyAsText()).isEqualTo(HttpStatusCode.OK)
 
             // Exactly the absent-stats file is the sweep's work: the `[]`
             // file is provided-with-no-stats and never claimed.
@@ -239,7 +273,7 @@ class PreparedCommitDeferredStatsHydrationIntegrationTest {
             assertThat(statsStates()).containsExactlyInAnyOrderEntriesOf(
                 mapOf(deferredPath to "provided", shippedPath to "provided", emptyPath to "provided"),
             )
-            assertThat(statsRowCount(fileRow(emptyPath)["data_file_id"] as Long)).isZero()
+            assertThat(statsRowCount(emptyPath)).isZero()
 
             // What the deferred file's footer read decided: ids verified,
             // row-group offsets stored, and the stats themselves.
@@ -252,16 +286,19 @@ class PreparedCommitDeferredStatsHydrationIntegrationTest {
                     h.createQuery(
                         """
                         SELECT value_count, null_count, lower_bound, upper_bound
-                        FROM hog_file_column_stats WHERE data_file_id = ? AND field_id = ?
+                        FROM hog_file_column_stats
+                        WHERE catalog_id = ? AND data_file_id = ? AND field_id = ?
                         """,
-                    ).bind(0, deferredId).bind(1, idField.toLong()).mapToMap().one()
+                    ).bind(0, deferredRow["catalog_id"] as Long).bind(1, deferredId).bind(2, idField.toLong())
+                        .mapToMap().one()
                 }
             assertThat(row["value_count"]).isEqualTo(ROWS.toLong())
             assertThat(row["null_count"]).isEqualTo(0L)
             assertThat(row["lower_bound"] as ByteArray).isEqualTo(IcebergSingleValue.encodeLong(100))
             assertThat(row["upper_bound"] as ByteArray).isEqualTo(IcebergSingleValue.encodeLong(100L + ROWS - 1))
 
-            // Hydrated, the guard clears.
+            // Hydrated with ids found, the file stays unflagged and DDL
+            // still goes through.
             val added = client.addColumn("extra")
             assertThat(added.status).describedAs(added.bodyAsText()).isEqualTo(HttpStatusCode.OK)
 
@@ -278,7 +315,34 @@ class PreparedCommitDeferredStatsHydrationIntegrationTest {
             assertThat(statsStates()[tinyPath]).isEqualTo("provided")
             val tinyRow = fileRow(tinyPath)
             assertThat(tinyRow["missing_field_ids"]).isEqualTo(false)
-            assertThat(statsRowCount(tinyRow["data_file_id"] as Long)).isZero()
+            assertThat(statsRowCount(tinyPath)).isZero()
             assertThat(lastSweep()["stats_skipped_below_floor"].asLong()).isEqualTo(1)
+        }
+
+    @Test
+    fun `a flagged file refuses add_column on the wire with idless_files_present`() =
+        api { client ->
+            // THE 409 ON THE WIRE: a deferred file written WITHOUT field
+            // ids, once the sweep has flagged it, refuses add_column with
+            // the typed code and a detail naming the id-less file. The
+            // refuse half only (the case above is the allow half):
+            // MUTATION: negate the missing_field_ids predicate and this
+            // is a 200.
+            val cat = "prepidless"
+            val (tableUuid, idField) = client.createEvents(cat)
+            val idless = write(idField, base = 1_100, withId = false)
+            val idlessPath = "s3://$BUCKET/$cat/data/ns/events/idless.parquet"
+            store.put(idlessPath, idless)
+            client.commitPrepared(tableUuid, registration(idlessPath, idless, stats = null), cat = cat)
+
+            assertThat(hydrator.runOnce()).isEqualTo(1)
+            assertThat(fileRow(idlessPath)["missing_field_ids"]).isEqualTo(true)
+            val refused = client.addColumn("extra_after_flag", cat)
+            assertThat(refused.status).describedAs(refused.bodyAsText()).isEqualTo(HttpStatusCode.Conflict)
+            val refusal = body(refused)
+            assertThat(refusal["error"].asText()).isEqualTo("idless_files_present")
+            assertThat(refusal["detail"].asText())
+                .contains("1 id-less")
+                .doesNotContain("not-yet-hydrated")
         }
 }
