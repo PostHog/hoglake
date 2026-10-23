@@ -244,11 +244,19 @@ Pending note for the 1.4.5 release body: `Table.prepare_append_tables`
 and `Table.prepare_append_files` take `deferred_stats=` (keyword-only,
 default `False`, unchanged), as `Table.append` has since 1.3.7. When set,
 each registration omits `column_stats`, the server registers the file
-`stats_state='pending'`, and the hydrator supplies the stats later —
-outside the per-catalog commit lock, where shipping them is the dominant
+`stats_state='pending'`, and the hydrator reads its footer later —
+outside the per-catalog commit lock, where shipping stats is the dominant
 cost of a wide prepared commit. Readers see no column bounds for those
-files until it has. No server change: `/commit/prepared` already
-registered a stats-less file `pending`.
+files until then, and files under `HOGLAKE_HYDRATOR_MIN_FILE_BYTES`
+(1 MiB by default) never get stats rows: no bounds until compaction
+rewrites them. While any such file is live and unhydrated, `add_column`
+and `rename_column` on its table are refused 409 `idless_files_present`,
+which pyhoglake now raises as the new `IdlessFilesPresentError` (a
+`HoglakeError`, NOT a `CommitConflictError` — it used to arrive as one,
+`retryable=True`, through `Table.alter`); retry the alter after the
+sweep. In exchange deferred files get the hydrator's `missing_field_ids`
+check, which inline-stats files never get. No server change:
+`/commit/prepared` already registered a stats-less file `pending`.
 
 Because that version is constant between releases, it cannot tell two
 deploys apart. The image build therefore also carries a BUILD STAMP: the

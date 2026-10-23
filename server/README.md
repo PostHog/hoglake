@@ -274,6 +274,19 @@ stay on purpose: the field-id verdict is what lets `add_column` and
 on any table whose tiny files compaction never rewrites. That is every
 bucket under compaction's minimum input count.
 
+For a writer, **deferring has two costs and one upside**. While a
+deferred file is live and unhydrated (`pending`, or `failed` until a
+rehydrate succeeds), `add_column` and `rename_column` on its table
+refuse 409 `idless_files_present` (the field-id guard below);
+pyhoglake raises `IdlessFilesPresentError`, not `CommitConflictError`,
+so the writer waits and retries the alter instead of treating it as
+concurrent DDL. And a deferred file under the floor above never gets
+stats rows: no bounds until compaction rewrites it. The upside is the
+field-id check itself (`missing_field_ids`), which a file registered
+with inline stats never gets, because the server never opens it.
+Registering `"column_stats": []` is not deferring: the file is
+`provided` with no stats and the hydrator never claims it.
+
 `null_count` is mandatory in `hog_file_column_stats`, so a leaf whose
 footer omits it in any row group gets **no row** — unless the leaf's
 max definition level is 0 (it and every ancestor REQUIRED), where the

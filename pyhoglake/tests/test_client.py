@@ -14,6 +14,8 @@ from pyhoglake import (
     CommitConflictError,
     ExpiredError,
     HoglakeClient,
+    HoglakeError,
+    IdlessFilesPresentError,
     MalformedResponseError,
     NotFoundError,
     OffsetRegressionError,
@@ -1659,6 +1661,60 @@ def test_changes_truncate_requires_reconciliation(client, httpx_mock):
     with pytest.raises(ReconciliationRequiredError, match="Reconcile") as failure:
         table.changes(3)
     assert failure.value.retryable is False
+
+
+_IDLESS_DETAIL = (
+    "cannot add column 'extra': 1 not-yet-hydrated (pending or failed; field IDs "
+    "not verified) live data file(s) may bind columns by name; hydrate, rewrite, "
+    "or retire them first"
+)
+
+
+def _alter_answers(httpx_mock, status, body):
+    httpx_mock.add_response(
+        method="POST",
+        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events/alter",
+        status_code=status,
+        json=body,
+    )
+
+
+def test_alter_idless_files_present_is_its_own_error_not_a_conflict(client, httpx_mock):
+    """A deferred-stats file blocks add/rename until hydrated. Classified
+    as CommitConflictError (retryable) it read as concurrent DDL, and a
+    writer that drops the column on a conflict dropped it here."""
+    table = _table(client, httpx_mock)
+    _alter_answers(
+        httpx_mock, 409, {"error": "idless_files_present", "detail": _IDLESS_DETAIL}
+    )
+    with pytest.raises(IdlessFilesPresentError) as failure:
+        table.alter([ops.add_column("extra", pa.int64())])
+    error = failure.value
+    assert type(error) is IdlessFilesPresentError
+    assert isinstance(error, HoglakeError)
+    assert not isinstance(error, CommitConflictError)
+    assert (error.retryable, error.re_prepare) == (False, False)
+    assert error.status_code == 409
+    assert error.message == "idless_files_present"
+    assert error.detail == _IDLESS_DETAIL
+
+
+def test_alter_other_409s_still_raise_commit_conflict(client, httpx_mock):
+    table = _table(client, httpx_mock)
+    _alter_answers(
+        httpx_mock, 409, {"error": "commit_conflict", "detail": "concurrent DDL"}
+    )
+    with pytest.raises(CommitConflictError) as failure:
+        table.alter([ops.rename_column("name", "label")])
+    assert type(failure.value) is CommitConflictError
+    assert failure.value.retryable is True
+
+
+def test_idless_files_present_is_exported():
+    import pyhoglake
+
+    assert pyhoglake.IdlessFilesPresentError is IdlessFilesPresentError
+    assert "IdlessFilesPresentError" in pyhoglake.__all__
 
 
 # -- table/column comments and properties (#169) ----------------------------

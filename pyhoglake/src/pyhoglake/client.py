@@ -40,6 +40,7 @@ from .errors import (
     DdlSinceReadSnapshotError,
     ExpiredError,
     HoglakeError,
+    IdlessFilesPresentError,
     IncarnationChangedError,
     NotFoundError,
     OffsetRegressionError,
@@ -766,6 +767,11 @@ class HoglakeClient:
         cls: type[HoglakeError]
         if resp.status_code == 409 and message == "reconciliation_required":
             cls = ReconciliationRequiredError
+        elif resp.status_code == 409 and message == "idless_files_present":
+            # By code, before the generic 409 below: that one is the
+            # caller's `conflict` class, CommitConflictError for an
+            # alter, which a retry loop reads as concurrent DDL.
+            cls = IdlessFilesPresentError
         elif resp.status_code == 404:
             cls = NotFoundError
         elif resp.status_code == 409:
@@ -1693,6 +1699,15 @@ class Table:
         author: str | None = None,
         message: str | None = None,
     ) -> TableInfo:
+        """Apply ``ops`` as one DDL commit and return the new shape.
+
+        A 409 from concurrent DDL is :class:`CommitConflictError`. An
+        ``add_column`` or ``rename_column`` refused because the table has
+        live files whose field ids are unverified (pending or failed
+        hydration, or ``missing_field_ids``) is
+        :class:`IdlessFilesPresentError` instead — not a conflict, and
+        not cleared by refreshing.
+        """
         body = self._namespace._catalog._client._request(
             "POST",
             self._path("/alter"),
@@ -1780,7 +1795,11 @@ class Table:
         The parquet schema carries the catalog's field ids
         (``PARQUET:field_id``). Unless ``deferred_stats``, per-column stats
         are extracted from the writer's own footer metadata (never re-read
-        from object storage) and shipped with the commit.
+        from object storage) and shipped with the commit. With it, the
+        files register ``pending`` for the hydrator, with the consequences
+        :meth:`prepare_append_tables` lists: no bounds under the
+        hydrator's size floor, and ``add_column`` / ``rename_column``
+        refused with :class:`IdlessFilesPresentError` until hydrated.
 
         **Partitioned tables.** Each row's partition tuple is computed
         client-side under the table's CURRENT spec (Iceberg-semantics
@@ -1999,12 +2018,27 @@ class Table:
         **Deferred stats.** ``deferred_stats=True`` leaves ``column_stats``
         out of every file registration, exactly as :meth:`append` does: the
         server registers each file ``stats_state='pending'`` and its
-        hydrator reads the footers and supplies the stats later, outside
-        the commit lock. Until it has, readers see no column bounds for
-        those files and cannot prune them. The footer is still read here
-        — for the schema check, ``record_count`` and ``footer_size`` — so
-        what this saves is the server's per-file stats work under the
-        per-catalog commit lock, not a client-side read.
+        hydrator reads the footer later, outside the commit lock. Until
+        then readers see no column bounds for the file, and:
+
+        - Bounds are not guaranteed even after. The hydrator writes stats
+          rows only for files at or over ``HOGLAKE_HYDRATOR_MIN_FILE_BYTES``
+          (1 MiB by default); a smaller file goes ``provided`` with none,
+          and has no bounds until compaction rewrites it.
+        - ``add_column`` and ``rename_column`` on the table are refused
+          with :class:`IdlessFilesPresentError` (409
+          ``idless_files_present``) while any such file is live and
+          unhydrated: its field ids are unverified. Retry the alter once
+          the sweep has run; it is not a :class:`CommitConflictError`.
+
+        In exchange each deferred file gets the hydrator's field-id check
+        (``missing_field_ids``), which a file registered with inline stats
+        never gets.
+
+        The footer is still read here — for the schema check,
+        ``record_count`` and ``footer_size`` — so what this saves is the
+        server's per-file stats work under the per-catalog commit lock and
+        the client's stats extraction, not the footer read.
 
         Each file is read only when its own upload runs — whole, by the
         uploading thread, when it is at or under
@@ -2089,10 +2123,26 @@ class Table:
         **Deferred stats.** ``deferred_stats=True`` leaves ``column_stats``
         out of every file registration, exactly as :meth:`append` does: the
         server registers each file ``stats_state='pending'`` and its
-        hydrator reads the footers and supplies the stats later, outside
-        the commit lock. Until it has, readers see no column bounds for
-        those files and cannot prune them. Default ``False`` ships the
-        stats with the commit, as before.
+        hydrator reads the footer later, outside the commit lock. Until
+        then readers see no column bounds for the file, and:
+
+        - Bounds are not guaranteed even after. The hydrator writes stats
+          rows only for files at or over ``HOGLAKE_HYDRATOR_MIN_FILE_BYTES``
+          (1 MiB by default); a smaller file goes ``provided`` with none,
+          and has no bounds until compaction rewrites it.
+        - ``add_column`` and ``rename_column`` on the table are refused
+          with :class:`IdlessFilesPresentError` (409
+          ``idless_files_present``) while any such file is live and
+          unhydrated: its field ids are unverified. Retry the alter once
+          the sweep has run; it is not a :class:`CommitConflictError`.
+
+        In exchange each deferred file gets the hydrator's field-id check
+        (``missing_field_ids``), which a file registered with inline stats
+        never gets.
+
+        What it saves is the server's per-file stats work under the
+        per-catalog commit lock, and the client's stats extraction.
+        Default ``False`` ships the stats with the commit, as before.
 
         For a writer that already holds its rows in Arrow — one table per
         partition tuple — a temp file is pure overhead: write, fsync,
@@ -2100,8 +2150,8 @@ class Table:
         registrations this produces are the ones the file path produces
         for the same rows (same path shape, ``record_count``,
         ``file_size_bytes``, ``footer_size``, ``column_stats`` unless
-        deferred, ``partition_values``), because it is the same code reading the
-        same footer — out of a buffer instead of off a disk.
+        deferred, ``partition_values``), because it is the same code
+        reading the same footer — out of a buffer instead of off a disk.
 
         The caller still owns row-to-partition correctness, sort order,
         and the schema: each table's schema must be the destination's,

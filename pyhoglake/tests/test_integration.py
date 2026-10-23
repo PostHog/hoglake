@@ -356,7 +356,11 @@ def test_deferred_append_hydrates_with_exact_footer_size(
 def test_prepared_deferred_append_registers_pending_and_hydrates(catalog, ns):
     """``prepare_append_tables(deferred_stats=True)`` + ``commit_prepared``:
     the request carries no ``column_stats``, the server registers the file
-    without them, and the hydrator fills them in. A 'pending' read is not
+    without them, and the hydrator reads its footer. The 40-row file is far
+    under the live runner's ``HOGLAKE_HYDRATOR_MIN_FILE_BYTES`` (the 1 MiB
+    default), so 'provided' here proves the claim and the footer read
+    (field-id verdict included), NOT that stats rows were written; the
+    server suite covers both sides of the floor. A 'pending' read is not
     asserted for the reason the append test above gives (the runner's
     hydrator sweeps every second); the server suite's
     PreparedCommitDeferredStatsHydrationIntegrationTest pins the 'pending'
