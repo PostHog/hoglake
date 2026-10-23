@@ -13,6 +13,7 @@ from .client import (
     S3Config,
     Table,
     View,
+    parquet_write_options,
 )
 from .errors import (
     AlreadyExistsError,
@@ -149,6 +150,7 @@ __all__ = [
     "decode_bound",
     "encode_bound",
     "ops",
+    "parquet_write_options",
     "transforms",
     "upload",
     "variant",

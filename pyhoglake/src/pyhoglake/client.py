@@ -178,6 +178,110 @@ _RETENTION_RETRY_SECONDS = 60.0
 # Namespace/table/view names are NOT affected.
 _RESERVED_COLUMN_PREFIX = "_hog"
 
+# !!! THE DEFAULT CODEC IS SNAPPY, AND THAT IS PROBABLY NOT WHAT YOU WANT. !!!
+#
+# A writer that passes no `compression` gets pyarrow's default, SNAPPY,
+# which is ~4x larger than zstd on event data. pyhoglake keeps that default
+# on purpose (changing every existing writer's bytes is the caller's call,
+# not a library upgrade's). The measurements and the reasoning live in ONE
+# place, `parquet_write_options` below; read it before choosing.
+#
+# The allowed codecs are the ones the server's compactor can DECODE
+# (ParquetRewriter.SUPPORTED, minus gzip, which is too slow to encode on a
+# writer's flush path). Anything else writes files compaction fails on
+# every sweep; brotli was the case that proved it.
+_PARQUET_CODECS = frozenset({"none", "snappy", "zstd"})
+# zstd levels a writer may choose. The floor matches the server's own
+# zstd range (ParquetRewriter.MIN_ZSTD_LEVEL); pyarrow accepts down to
+# -131072, where the output is effectively uncompressed but labelled
+# ZSTD. The ceiling is encode cost: see `parquet_write_options`.
+_ZSTD_LEVELS = range(1, 10)
+
+
+def parquet_write_options(
+    compression: str | None = None, compression_level: int | None = None
+) -> dict[str, Any]:
+    """Validate a writer's codec settings and return them as
+    ``pq.write_table`` keyword arguments: exactly what ``Table.append``
+    and ``Table.prepare_append_tables`` do with their ``compression`` /
+    ``compression_level`` arguments, exported so a caller can refuse a
+    bad setting at startup instead of on its first write.
+
+    Raises :class:`ValidationError` for any setting the writer path
+    would refuse. ``compression=None`` (with no level) returns ``{}``:
+    pyarrow's default codec, **SNAPPY**.
+
+    **Why SNAPPY is rarely the right choice.** Measured 2026-10-22 on one
+    413K-row prod-us events slice (JSON-heavy ``properties`` is 84% of
+    the bytes), pyarrow 23: snappy 1,138 MB, zstd-1 313 MB (3.6x
+    smaller), zstd-3 281 MB (4.0x smaller).
+
+    **Encode cost is not free.** A synthetic events-shaped benchmark
+    (112 MB of Arrow, pyarrow 23) took snappy 0.14 s, zstd-1 0.17 s,
+    zstd-3 0.27 s, zstd-9 1.09 s, zstd-19 20.5 s. Hence levels 1-9: a
+    writer that encodes on its flush path cannot afford the top of
+    zstd's range.
+
+    **When the choice is permanent.** Files under the compaction target
+    are rewritten by compaction in the server's own codec
+    (``HOGLAKE_COMPACTION_CODEC``, zstd by default), so for them the
+    client's codec is transient. Files at or over the target are never
+    compaction candidates, so for them it is permanent.
+
+    Allowed: ``"zstd"`` (levels 1-9), ``"snappy"``, ``"none"``
+    (uncompressed), matched case-insensitively.
+    """
+    if compression is None:
+        if compression_level is not None:
+            raise ValidationError(
+                "compression_level requires an explicit compression: the "
+                "default codec (pyarrow's SNAPPY) takes no level",
+                status_code=None,
+            )
+        return {}
+    if not isinstance(compression, str):
+        raise ValidationError(
+            f"compression must be a codec name, got {type(compression).__name__}",
+            status_code=None,
+        )
+    codec = compression.lower()
+    if codec not in _PARQUET_CODECS:
+        raise ValidationError(
+            f"parquet compression {compression!r} is not allowed; expected one "
+            f"of {sorted(_PARQUET_CODECS)} (the codecs hoglake compaction can "
+            "decode and a writer can afford to encode)",
+            status_code=None,
+        )
+    if codec != "none" and not pa.Codec.is_available(codec):
+        raise ValidationError(
+            f"parquet compression {codec!r} is not available in this pyarrow build",
+            status_code=None,
+        )
+    options: dict[str, Any] = {"compression": codec}
+    if compression_level is not None:
+        if codec != "zstd":
+            raise ValidationError(
+                f"parquet compression {codec!r} takes no compression_level",
+                status_code=None,
+            )
+        # bool is an int subclass; True would silently mean level 1.
+        if not isinstance(compression_level, int) or isinstance(
+            compression_level, bool
+        ):
+            raise ValidationError(
+                "compression_level must be an int, got "
+                f"{type(compression_level).__name__}",
+                status_code=None,
+            )
+        if compression_level not in _ZSTD_LEVELS:
+            raise ValidationError(
+                f"zstd compression_level {compression_level} is outside "
+                f"[{_ZSTD_LEVELS.start}, {_ZSTD_LEVELS.stop - 1}]",
+                status_code=None,
+            )
+        options["compression_level"] = compression_level
+    return options
+
 
 def _basis_was_cached(table: Table, payload: Mapping[str, Any]) -> bool:
     """Whether this payload's `read_snapshot` is the one the Table cached.
@@ -1656,12 +1760,22 @@ class Table:
         author: str | None = None,
         message: str | None = None,
         row_group_size: int | None = None,
+        compression: str | None = None,
+        compression_level: int | None = None,
     ) -> AppendResult:
         """Write ``data`` to the catalog's data path and register it via a
         footer-shipping commit: one parquet file for an unpartitioned
         table, or — when the table has a live partition spec — one file
         per distinct partition tuple (fanout), all registered in ONE
         atomic commit.
+
+        **Compression defaults to SNAPPY.** With no ``compression``, the
+        files get pyarrow's default codec, which is SNAPPY — about 4x
+        larger than ``compression="zstd", compression_level=3`` on
+        JSON-heavy event data, and permanent for any file at or over the
+        compaction target. Pass a codec explicitly; see
+        :func:`parquet_write_options` for the allowed values and the
+        measurements. A bad setting is refused before any request.
 
         The parquet schema carries the catalog's field ids
         (``PARQUET:field_id``). Unless ``deferred_stats``, per-column stats
@@ -1710,6 +1824,7 @@ class Table:
         # `_hog*` field could otherwise reach parquet on a pre-reservation
         # table and waste the S3 write.
         _check_reserved_columns(data.schema)
+        write_options = parquet_write_options(compression, compression_level)
 
         if expected_table_uuid is UNGUARDED:
             expected = None
@@ -1815,6 +1930,7 @@ class Table:
                 client,
                 deferred_stats=deferred_stats,
                 row_group_size=row_group_size,
+                write_options=write_options,
                 partition_values=partition_values,
             )
             file_regs.append(reg)
@@ -1942,10 +2058,20 @@ class Table:
         expected_table_uuid: str | None = None,
         expected_table_info: TableInfo | None = None,
         concurrency: int | None = None,
+        compression: str | None = None,
+        compression_level: int | None = None,
     ) -> dict[str, Any]:
         """:meth:`prepare_append_files` without the disk: encode each
         already-partitioned Arrow table straight to a parquet buffer,
         upload the buffers, and return the same immutable commit request.
+
+        **Compression defaults to SNAPPY.** With no ``compression``, every
+        buffer is encoded with pyarrow's default codec, SNAPPY — about 4x
+        larger than ``compression="zstd", compression_level=3`` on
+        JSON-heavy event data, and permanent for any file at or over the
+        compaction target. Pass a codec explicitly; see
+        :func:`parquet_write_options` for the allowed values and the
+        measurements. A bad setting is refused before any request.
 
         For a writer that already holds its rows in Arrow — one table per
         partition tuple — a temp file is pure overhead: write, fsync,
@@ -1992,6 +2118,8 @@ class Table:
             expected_table_info=expected_table_info,
             allow_optional_fields=False,
             concurrency=concurrency,
+            compression=compression,
+            compression_level=compression_level,
         )
 
     def _prepare_append(
@@ -2004,6 +2132,8 @@ class Table:
         expected_table_info: TableInfo | None,
         allow_optional_fields: bool,
         concurrency: int | None,
+        compression: str | None = None,
+        compression_level: int | None = None,
     ) -> dict[str, Any]:
         """The prepared-append path both public entry points are: resolve,
         validate every group, upload them all, build the commit request.
@@ -2022,6 +2152,10 @@ class Table:
         uploaded: list[str] = []
         try:
             _uuid.UUID(idempotency_key)
+            # Pure, so it runs before the reads: a bad codec costs no
+            # request. Only the Arrow-table path encodes; a prepared
+            # file's codec is whatever its writer chose.
+            write_options = parquet_write_options(compression, compression_level)
             catalog = self._namespace._catalog
             client = catalog._client
             expected = expected_table_uuid or self.table_uuid
@@ -2084,7 +2218,7 @@ class Table:
             uploads: list[Upload] = []
             for index, (source, partition) in enumerate(groups):
                 part = (
-                    _encode_group(source, schema)
+                    _encode_group(source, schema, write_options)
                     if from_tables
                     else _describe_prepared_file(
                         source,
@@ -2406,18 +2540,22 @@ def _write_one_file(
     *,
     deferred_stats: bool,
     row_group_size: int | None,
+    write_options: dict[str, Any],
     partition_values: tuple[str | None, ...] | None,
 ) -> dict[str, Any]:
     """THE single-file writer path: serialize ``part`` to parquet (field
     ids already on the schema), upload it under the catalog's data path,
     and build its FileRegistration wire dict — unchanged conventions
     (footer stats from the writer's own metadata, exact ``footer_size``),
-    plus ``partition_values`` when the table is partitioned."""
+    plus ``partition_values`` when the table is partitioned.
+
+    ``write_options`` comes from ``parquet_write_options``; empty means
+    pyarrow's default codec, SNAPPY."""
     sink = io.BytesIO()
+    options = dict(write_options)
     if row_group_size is not None:
-        pq.write_table(part, sink, row_group_size=row_group_size)
-    else:
-        pq.write_table(part, sink)
+        options["row_group_size"] = row_group_size
+    pq.write_table(part, sink, **options)
     raw = sink.getvalue()
     metadata = pq.read_metadata(io.BytesIO(raw))
 
@@ -2462,7 +2600,9 @@ class _PreparedPart:
     path: str | None = None
 
 
-def _encode_group(data: pa.Table, schema: pa.Schema) -> _PreparedPart:
+def _encode_group(
+    data: pa.Table, schema: pa.Schema, write_options: dict[str, Any]
+) -> _PreparedPart:
     """Encode one group's parquet into a buffer — never to disk — and read
     back everything the registration needs out of that same buffer.
 
@@ -2471,9 +2611,12 @@ def _encode_group(data: pa.Table, schema: pa.Schema) -> _PreparedPart:
     error text, so a table that would have been refused as a file is
     refused here, and conversions the writer performs (timestamp_s stored
     as milliseconds) are compared as written rather than as intended.
+
+    ``write_options`` comes from ``parquet_write_options``; empty means
+    pyarrow's default codec, SNAPPY.
     """
     sink = pa.BufferOutputStream()
-    pq.write_table(data, sink)
+    pq.write_table(data, sink, **write_options)
     raw = sink.getvalue()
     with pq.ParquetFile(pa.BufferReader(raw)) as parquet:
         if not prepared_schema_matches(parquet.schema_arrow, schema):

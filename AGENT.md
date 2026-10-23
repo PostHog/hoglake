@@ -240,6 +240,13 @@ tree gets a "Pending note for the X.Y.Z release body" paragraph here,
 removed by the release PR that states it (the 1.3.8 `Catalog.verify()`
 removal and the 1.4.0 VARIANT-shaped struct refusal were the first two).
 
+Pending note for the 1.4.3 release body: `Table.append` and
+`Table.prepare_append_tables` take `compression=` / `compression_level=`
+(allowed: `zstd` levels 1-9, `snappy`, `none`), and
+`pyhoglake.parquet_write_options` exports the same validation. The
+default is UNCHANGED: no codec passed still means pyarrow's SNAPPY, ~4x
+larger than zstd-3 on event data. Writers should pass a codec.
+
 Because that version is constant between releases, it cannot tell two
 deploys apart. The image build therefore also carries a BUILD STAMP: the
 CD job passes `HOGLAKE_BUILD_STAMP` (a UTC `date -u +%Y%m%dT%H%MZ`) as a

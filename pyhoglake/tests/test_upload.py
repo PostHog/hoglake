@@ -16,6 +16,7 @@ import re
 import struct
 import threading
 import time
+import types
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -24,7 +25,14 @@ import pyarrow.parquet as pq
 import pytest
 from test_append_unit import BASE, CATALOG_WIRE, TABLE_WIRE
 
-from pyhoglake import HoglakeClient, HoglakeError, S3Config, ValidationError
+from pyhoglake import (
+    HoglakeClient,
+    HoglakeError,
+    S3Config,
+    ValidationError,
+    parquet_write_options,
+)
+from pyhoglake import client as client_module
 from pyhoglake import upload as upload_module
 from pyhoglake.client import Namespace
 from pyhoglake.types import columns_to_arrow_schema
@@ -858,6 +866,193 @@ def test_a_broken_concurrency_argument_reports_zero_uploads(prepared, recording_
         )
     assert excinfo.value.uploaded_uris == ()
     assert not recording_s3.files
+
+
+# --- compression ---------------------------------------------------------
+
+
+def _codecs(raw: bytes) -> set[str]:
+    metadata = pq.read_metadata(pa.BufferReader(raw))
+    return {
+        metadata.row_group(r).column(c).compression
+        for r in range(metadata.num_row_groups)
+        for c in range(metadata.num_columns)
+    }
+
+
+def test_prepare_tables_default_codec_is_still_snappy(prepared, recording_s3):
+    """The library default is pyarrow's, deliberately unchanged: a writer
+    that passes nothing keeps producing the bytes it produced before. If
+    this starts failing, every caller relying on the default just changed
+    codec without asking."""
+    request = prepared.prepare_append_tables(
+        _groups(prepared, [5]), idempotency_key=str(uuid.uuid4())
+    )
+    (reg,) = request["appends"][0]["files"]
+    assert _codecs(recording_s3.files[reg["path"].removeprefix("s3://")]) == {"SNAPPY"}
+
+
+def _object(recording_s3, reg) -> bytes:
+    return recording_s3.files[reg["path"].removeprefix("s3://")]
+
+
+def _compressible(table, rows: int) -> pa.Table:
+    """Enough repetitive text that zstd levels produce different bytes."""
+    schema = columns_to_arrow_schema(table.columns)
+    return pa.Table.from_pylist(
+        [{"id": i, "name": f"event-{i % 37}-" + "x" * (i % 200)} for i in range(rows)],
+        schema=schema,
+    )
+
+
+def test_prepare_tables_writes_the_requested_codec(prepared, recording_s3):
+    request = prepared.prepare_append_tables(
+        _groups(prepared, [5, 5]),
+        idempotency_key=str(uuid.uuid4()),
+        compression="ZSTD",
+        compression_level=3,
+    )
+    for reg in request["appends"][0]["files"]:
+        raw = _object(recording_s3, reg)
+        assert _codecs(raw) == {"ZSTD"}
+        # The registration describes the bytes that were actually written.
+        assert reg["file_size_bytes"] == len(raw)
+
+
+@pytest.mark.parametrize("level", [1, 9])
+def test_prepare_tables_applies_the_level(prepared, recording_s3, level):
+    """The level reaches the encoder: the object is byte-identical to
+    pyarrow's own encode at that level, and the two levels differ. A
+    dropped level would encode at pyarrow's default and match neither."""
+    data = _compressible(prepared, 5_000)
+    request = prepared.prepare_append_tables(
+        [(data, None)],
+        idempotency_key=str(uuid.uuid4()),
+        compression="zstd",
+        compression_level=level,
+    )
+    (reg,) = request["appends"][0]["files"]
+
+    def encode(at: int) -> bytes:
+        sink = pa.BufferOutputStream()
+        pq.write_table(data, sink, compression="zstd", compression_level=at)
+        return sink.getvalue().to_pybytes()
+
+    assert encode(1) != encode(9)
+    assert _object(recording_s3, reg) == encode(level)
+
+
+def test_prepare_tables_none_writes_uncompressed(prepared, recording_s3):
+    request = prepared.prepare_append_tables(
+        _groups(prepared, [5]), idempotency_key=str(uuid.uuid4()), compression="None"
+    )
+    (reg,) = request["appends"][0]["files"]
+    assert _codecs(_object(recording_s3, reg)) == {"UNCOMPRESSED"}
+
+
+@pytest.mark.parametrize(
+    ("compression", "level"),
+    [("zstd", 3), ("zstd", None), ("snappy", None), ("none", None)],
+)
+def test_registrations_match_prepare_files_for_every_codec(
+    prepared, recording_s3, tmp_path, compression, level
+):
+    """The two entry points stay wire-identical under a non-default
+    codec: same rows encoded by the caller at codec X, or by pyhoglake
+    at codec X, produce the same registration and the same bytes."""
+    data = _compressible(prepared, 50)
+    options = parquet_write_options(compression, level)
+    path = tmp_path / "group.parquet"
+    pq.write_table(data, path, **options)
+
+    from_files = prepared.prepare_append_files(
+        [(str(path), None)], idempotency_key=str(uuid.uuid4())
+    )
+    from_tables = prepared.prepare_append_tables(
+        [(data, None)],
+        idempotency_key=str(uuid.uuid4()),
+        compression=compression,
+        compression_level=level,
+    )
+    file_reg = from_files["appends"][0]["files"][0]
+    table_reg = from_tables["appends"][0]["files"][0]
+    assert {k: v for k, v in table_reg.items() if k != "path"} == {
+        k: v for k, v in file_reg.items() if k != "path"
+    }
+    assert table_reg["footer_size"] == struct.unpack("<I", path.read_bytes()[-8:-4])[0]
+    assert _object(recording_s3, table_reg) == path.read_bytes()
+
+
+# Every setting the writer path refuses: codecs compaction cannot decode
+# (brotli) or a writer cannot afford (gzip), names pyarrow knows but the
+# allow-list does not, levels on codecs without them, out-of-range and
+# wrongly typed levels (a bool is an int subclass), and per-column dicts.
+_BAD_SETTINGS = [
+    ("brotli", None, "not allowed"),
+    ("gzip", None, "not allowed"),
+    ("lz4", None, "not allowed"),
+    ("lzo", None, "not allowed"),
+    ({"id": "zstd"}, None, "must be a codec name"),
+    (None, 3, "requires an explicit compression"),
+    ("snappy", 3, "takes no compression_level"),
+    ("none", 1, "takes no compression_level"),
+    ("zstd", 0, r"outside \[1, 9\]"),
+    ("zstd", 10, r"outside \[1, 9\]"),
+    ("zstd", -1, r"outside \[1, 9\]"),
+    ("zstd", 3.0, "must be an int"),
+    ("zstd", "3", "must be an int"),
+    ("zstd", True, "must be an int"),
+]
+
+
+@pytest.mark.parametrize(("compression", "level", "match"), _BAD_SETTINGS)
+def test_parquet_write_options_refuses(compression, level, match):
+    with pytest.raises(ValidationError, match=match):
+        parquet_write_options(compression, level)
+
+
+@pytest.mark.parametrize(("compression", "level", "match"), _BAD_SETTINGS)
+def test_a_bad_compression_setting_costs_no_request_and_no_upload(
+    httpx_mock, prepared, recording_s3, compression, level, match
+):
+    before = len(httpx_mock.get_requests())
+    with pytest.raises(ValidationError, match=match) as excinfo:
+        prepared.prepare_append_tables(
+            _groups(prepared, [1]),
+            idempotency_key=str(uuid.uuid4()),
+            compression=compression,
+            compression_level=level,
+        )
+    assert len(httpx_mock.get_requests()) == before
+    assert excinfo.value.uploaded_uris == ()
+    assert not recording_s3.files
+
+
+@pytest.mark.parametrize(
+    ("compression", "level", "expected"),
+    [
+        (None, None, {}),
+        ("ZSTD", 3, {"compression": "zstd", "compression_level": 3}),
+        ("zstd", None, {"compression": "zstd"}),
+        ("Snappy", None, {"compression": "snappy"}),
+        ("none", None, {"compression": "none"}),
+    ],
+)
+def test_parquet_write_options_accepts(compression, level, expected):
+    assert parquet_write_options(compression, level) == expected
+
+
+def test_an_unavailable_codec_is_refused(monkeypatch):
+    # pyarrow's Codec type is immutable, so stand in for the module the
+    # validator reads it from; nothing else runs inside this call.
+    unavailable = types.SimpleNamespace(
+        Codec=types.SimpleNamespace(is_available=lambda name: False)
+    )
+    monkeypatch.setattr(client_module, "pa", unavailable)
+    with pytest.raises(ValidationError, match="not available"):
+        parquet_write_options("zstd", 3)
+    # `none` needs no codec library at all.
+    assert parquet_write_options("none") == {"compression": "none"}
 
 
 @pytest.fixture(autouse=True)
