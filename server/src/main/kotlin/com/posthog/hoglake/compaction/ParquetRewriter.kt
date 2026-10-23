@@ -2016,9 +2016,23 @@ object ParquetRewriter {
      * `maxUnsignedParquetWidth` exists to prevent.
      *
      * The positional fallback is the same exemption `missingFieldIds`
-     * grants the repetition layer, and safe for the same reason: such a
-     * file is already flagged, so renames on its table are blocked and
-     * position cannot drift out from under it.
+     * grants the repetition layer, and safe on its own terms: a list has
+     * one element and a map a key then a value, so the position is the
+     * format's, not the writer's, and no rename moves it. What a rename
+     * DOES move is the NAMED fallback in [planChildren], and that one is
+     * not backed by the rename guard the way an earlier draft of this
+     * comment assumed: the guard refuses only over a file the hydrator
+     * has already flagged, and the flag lands when the sweep's queue
+     * reaches the file — behind the catalog's whole pending backlog,
+     * never for an inline-stats file — so DDL can precede it. The
+     * named fallback (`FooterStats.bindIndex` with `useFieldIds` false)
+     * matches the LIVE name: after a rename an id-less input's old name
+     * finds nothing, [planChildren] yields null, and the renamed column
+     * NULL-FILLS in the compacted output, permanently; after an
+     * add_column that reuses a dropped name, the input's old values
+     * bind to the new column. Binding id-less inputs at their
+     * `begin_snapshot` schema, as the hydrator does, is the fix, and a
+     * separate issue.
      */
     private fun planSynthetic(
         srcFields: List<Type>,

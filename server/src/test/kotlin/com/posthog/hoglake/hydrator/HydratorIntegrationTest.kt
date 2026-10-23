@@ -1,10 +1,22 @@
 package com.posthog.hoglake.hydrator
 
+import com.posthog.hoglake.commit.CommitService
+import com.posthog.hoglake.model.AlterOp
+import com.posthog.hoglake.model.ColType
+import com.posthog.hoglake.model.ColumnDef
+import com.posthog.hoglake.model.CommitRequest
+import com.posthog.hoglake.model.FileRegistration
+import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.TableAppend
+import com.posthog.hoglake.observability.CatalogMetrics
 import com.posthog.hoglake.persistence.getBigintListOrNull
+import com.posthog.hoglake.service.AlterService
+import com.posthog.hoglake.service.CatalogService
 import com.posthog.hoglake.stats.IcebergSingleValue
 import com.posthog.hoglake.testing.PgTestSupport
 import com.posthog.hoglake.testing.TestImages
 import com.posthog.hoglake.testing.ThriftRowGroupStarts
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry
 import org.apache.parquet.example.data.simple.SimpleGroupFactory
 import org.apache.parquet.hadoop.example.ExampleParquetWriter
 import org.apache.parquet.hadoop.metadata.CompressionCodecName
@@ -14,6 +26,7 @@ import org.apache.parquet.schema.MessageType
 import org.apache.parquet.schema.PrimitiveType
 import org.apache.parquet.schema.Types
 import org.assertj.core.api.Assertions.assertThat
+import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.awaitility.Awaitility.await
 import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
@@ -869,29 +882,15 @@ class HydratorIntegrationTest {
         assertThat(statsRows(other, 1)).hasSize(4)
     }
 
-    @Test
-    fun `an id-less file below the floor is still flagged missing_field_ids`() {
-        // The field-id verdict is the reason the footer is still read.
-        val catalogId = seedCatalogAndTable()
-        val idless = writeSampleParquet(sampleSchema(withIds = false))
-        val size = seedRealFile(catalogId, 1, idless)
-        assertThat(Hydrator(jdbi, store, minFileBytes = size + 1).runOnce()).isEqualTo(1)
-        assertThat(statsState(catalogId, 1)).isEqualTo("provided")
-        assertThat(statsRows(catalogId, 1)).isEmpty()
-        assertThat(missingFieldIds(catalogId, 1)).isTrue()
-    }
+    // ---- DDL over the hydrator's verdicts (#445) -------------------------
+    //
+    // A REAL catalog (CatalogService, CommitService) rather than the raw
+    // seed above, because the guard under test is AlterService's and it
+    // addresses the table by name.
 
-    @Test
-    fun `add_column and rename_column succeed after one sweep when the only pending files were below the floor`() {
-        // The QE finding behind #432's shape: had the floor left tiny files
-        // 'pending', the field-id guard would refuse both DDLs for as long
-        // as they lived, and compaction never rewrites a bucket under its
-        // minimum input count, so 1-4 tiny files would block the table
-        // forever. MUTATION: skip below-floor files in the claim (leave
-        // them pending) and the post-sweep alters are refused.
-        val cat = "floor-ddl"
-        val catalogs = com.posthog.hoglake.service.CatalogService(jdbi)
-        val alter = com.posthog.hoglake.service.AlterService(jdbi)
+    /** Catalog [cat] with `ns.t` under the sample schema; every service built on the test's Jdbi. */
+    private fun ddlTable(cat: String): Triple<CatalogService, CommitService, AlterService> {
+        val catalogs = CatalogService(jdbi)
         catalogs.createCatalog(cat, "s3://$BUCKET/")
         catalogs.createNamespace(cat, "ns")
         catalogs.createTable(
@@ -899,50 +898,231 @@ class HydratorIntegrationTest {
             "ns",
             "t",
             listOf(
-                com.posthog.hoglake.model.ColumnDef("id", com.posthog.hoglake.model.ColType.LONG, nullable = false),
-                com.posthog.hoglake.model.ColumnDef("score", com.posthog.hoglake.model.ColType.DOUBLE),
-                com.posthog.hoglake.model.ColumnDef("name", com.posthog.hoglake.model.ColType.STRING),
-                com.posthog.hoglake.model.ColumnDef("ts", com.posthog.hoglake.model.ColType.TIMESTAMPTZ),
+                ColumnDef("id", ColType.LONG, nullable = false),
+                ColumnDef("score", ColType.DOUBLE),
+                ColumnDef("name", ColType.STRING),
+                ColumnDef("ts", ColType.TIMESTAMPTZ),
             ),
         )
-        val paths = (1..2).map { "s3://$BUCKET/floor-ddl/f$it.parquet" }
-        for (p in paths) store.put(p, parquetBytes)
-        com.posthog.hoglake.commit.CommitService(jdbi).commit(
+        return Triple(catalogs, CommitService(jdbi), AlterService(jdbi))
+    }
+
+    /**
+     * Upload [bytes] under [cat] and register them DEFERRED (no
+     * column_stats, so `pending`). [footerSize] null registers without
+     * one, which sends the hydrator down the whole-object fallback.
+     */
+    private fun commitDeferred(
+        cat: String,
+        commits: CommitService,
+        name: String,
+        bytes: ByteArray,
+        recordCount: Long = ROWS.toLong(),
+        footerSize: Long? = footerSizeOf(bytes),
+    ): String {
+        val path = "s3://$BUCKET/$cat/$name.parquet"
+        store.put(path, bytes)
+        commits.commit(
             cat,
-            com.posthog.hoglake.model.CommitRequest(
+            CommitRequest(
                 appends =
                     listOf(
-                        com.posthog.hoglake.model.TableAppend(
+                        TableAppend(
                             "ns",
                             "t",
-                            paths.map {
-                                com.posthog.hoglake.model.FileRegistration(
-                                    path = it,
-                                    recordCount = ROWS.toLong(),
-                                    fileSizeBytes = parquetBytes.size.toLong(),
-                                    footerSize = footerSize,
-                                )
-                            },
+                            listOf(FileRegistration(path, recordCount, bytes.size.toLong(), footerSize)),
                         ),
                     ),
             ),
         )
-        val addOp =
-            com.posthog.hoglake.model.AlterOp.AddColumn(
-                com.posthog.hoglake.model.ColumnDef("added", com.posthog.hoglake.model.ColType.LONG),
-            )
-        val renameOp = com.posthog.hoglake.model.AlterOp.RenameColumn("name", "label")
-        // Pending: the ids are unverified, so both are refused (as on main).
-        for (op in listOf(addOp, renameOp)) {
-            org.assertj.core.api.Assertions.assertThatThrownBy { alter.alterTable(cat, "ns", "t", listOf(op)) }
-                .isInstanceOf(com.posthog.hoglake.model.HoglakeException.IdlessFilesPresent::class.java)
+        return path
+    }
+
+    private fun rowByPath(path: String): Map<String, Any?> =
+        jdbi.withHandle<Map<String, Any?>, Exception> { h ->
+            h.createQuery("SELECT stats_state, missing_field_ids FROM hog_data_file WHERE path = ?")
+                .bind(0, path).mapToMap().one()
         }
+
+    private fun addOp(name: String) = AlterOp.AddColumn(ColumnDef(name, ColType.LONG))
+
+    private fun assertRefusedIdless(
+        alter: AlterService,
+        cat: String,
+        vararg ops: AlterOp,
+    ) {
+        for (op in ops) {
+            assertThatThrownBy { alter.alterTable(cat, "ns", "t", listOf(op)) }
+                .describedAs("%s", op::class.simpleName)
+                .isInstanceOf(HoglakeException.IdlessFilesPresent::class.java)
+                .hasMessageContaining("id-less")
+        }
+    }
+
+    @Test
+    fun `an id-less file below the floor is still flagged missing_field_ids, and the flag blocks DDL`() {
+        // The field-id verdict is what the under-floor footer read still
+        // buys (#432 kept the read; #445 narrowed what the verdict gates).
+        val cat = "floor-idless"
+        val (_, commits, alter) = ddlTable(cat)
+        val idless = writeSampleParquet(sampleSchema(withIds = false))
+        val path = commitDeferred(cat, commits, "tiny-idless", idless)
+        assertThat(Hydrator(jdbi, store, minFileBytes = idless.size + 1L).runOnce()).isEqualTo(1)
+        val row = rowByPath(path)
+        assertThat(row["stats_state"]).isEqualTo("provided")
+        assertThat(row["missing_field_ids"]).isEqualTo(true)
+        assertThat(
+            jdbi.withHandle<Long, Exception> { h ->
+                h.createQuery(
+                    """
+                    SELECT count(*) FROM hog_file_column_stats s
+                    JOIN hog_data_file f USING (catalog_id, data_file_id) WHERE f.path = ?
+                    """,
+                )
+                    .bind(0, path).mapTo(Long::class.java).one()
+            },
+        ).isZero()
+        // A flagged file under the floor is as much of a blocker as one
+        // over it: the floor spares the rows, not the verdict.
+        assertRefusedIdless(alter, cat, addOp("added"), AlterOp.RenameColumn("name", "label"))
+    }
+
+    @Test
+    fun `add_column and rename_column succeed over pending files, before and after the floored sweep`() {
+        // #432's shape left tiny files `provided` without rows so that
+        // the DDL guard of the day — which refused over `pending` — would
+        // clear. #445 removed that clause: the DDLs go through WHILE the
+        // files are pending, and go through again once the floored sweep
+        // has read the footers and found ids. MUTATION: restore the
+        // pending clause and the first alter is refused.
+        val cat = "floor-ddl"
+        val (_, commits, alter) = ddlTable(cat)
+        for (i in 1..2) commitDeferred(cat, commits, "f$i", parquetBytes)
+
+        val pendingShape =
+            alter.alterTable(
+                cat,
+                "ns",
+                "t",
+                listOf(addOp("added_while_pending"), AlterOp.RenameColumn("name", "label")),
+            )
+                .columns.map { it.def.name }
+        assertThat(pendingShape).contains("added_while_pending", "label").doesNotContain("name")
 
         val floored = Hydrator(jdbi, store, minFileBytes = parquetBytes.size + 1L)
         assertThat(floored.runOnce()).isEqualTo(2)
 
-        val columns = alter.alterTable(cat, "ns", "t", listOf(addOp, renameOp)).columns.map { it.def.name }
-        assertThat(columns).contains("added", "label").doesNotContain("name")
+        val columns =
+            alter.alterTable(cat, "ns", "t", listOf(addOp("added"), AlterOp.RenameColumn("label", "title")))
+                .columns.map { it.def.name }
+        assertThat(columns).contains("added", "title").doesNotContain("label")
+    }
+
+    @Test
+    fun `a rename can precede the flag - the sweep then flags the file, the gauge rises, the next rename is refused`() {
+        // THE RACE, pinned as what it is: the flag is an after-the-fact
+        // audit, not a guard. A deferred id-less file is trusted until
+        // the sweep reaches it, so the first rename lands; what the
+        // sweep buys is that no SECOND rename does, and that the
+        // operator can see why (`hoglake_missing_field_id_files`). The
+        // first rename's damage (the id-less file's `name` column now
+        // reads as NULL under `label`) is the same damage an inline-stats
+        // id-less file has always done, undetected.
+        val cat = "rename-race"
+        val (_, commits, alter) = ddlTable(cat)
+        val registry = SimpleMeterRegistry()
+        val metrics = CatalogMetrics(jdbi, registry)
+
+        fun flaggedGauge(): Double? {
+            metrics.sampleOnce()
+            return registry.find("hoglake_missing_field_id_files").tag("catalog", cat).gauge()?.value()
+        }
+        val path = commitDeferred(cat, commits, "idless", writeSampleParquet(sampleSchema(withIds = false)))
+        assertThat(flaggedGauge()).isEqualTo(0.0)
+
+        val renamed =
+            alter.alterTable(cat, "ns", "t", listOf(AlterOp.RenameColumn("name", "label")))
+                .columns.map { it.def.name }
+        assertThat(renamed).describedAs("before the sweep the file is trusted").contains("label")
+
+        assertThat(hydrator.runOnce()).isEqualTo(1)
+        assertThat(rowByPath(path)["missing_field_ids"]).isEqualTo(true)
+        assertThat(flaggedGauge()).isEqualTo(1.0)
+        assertRefusedIdless(alter, cat, AlterOp.RenameColumn("label", "title"), addOp("added"))
+    }
+
+    /**
+     * The production path for "failed without a verdict": an id-less
+     * file registered without a footer_size and over the whole-object
+     * cap fails structurally BEFORE any byte is parsed, so markFailed has
+     * no verdict and COALESCE keeps the default. Returns the file's path.
+     */
+    private fun failWithoutVerdict(
+        cat: String,
+        commits: CommitService,
+    ): String {
+        val idless = writeSampleParquet(sampleSchema(withIds = false))
+        val path = commitDeferred(cat, commits, "idless-over-cap", idless, footerSize = null)
+        assertThat(Hydrator(jdbi, store, maxWholeObjectBytes = idless.size - 1L).runOnce()).isEqualTo(1)
+        assertThat(rowByPath(path)).containsEntry("stats_state", "failed").containsEntry("missing_field_ids", false)
+        return path
+    }
+
+    @Test
+    fun `a failure before the footer parse leaves the file unflagged, and the guard trusts it`() {
+        // #445: an unflagged `failed` file is trusted exactly as an
+        // inline-stats file is. MUTATION: restore the pending/failed
+        // clause and both alters are refused.
+        val cat = "no-verdict"
+        val (_, commits, alter) = ddlTable(cat)
+        failWithoutVerdict(cat, commits)
+        val shape =
+            alter.alterTable(cat, "ns", "t", listOf(addOp("added_while_failed"), AlterOp.RenameColumn("name", "label")))
+                .columns.map { it.def.name }
+        assertThat(shape).contains("added_while_failed", "label").doesNotContain("name")
+    }
+
+    @Test
+    fun `the late verdict - a rehydrate under a cap the file fits flags it, and the next DDL is refused`() {
+        // The same file, read on a second sweep whose cap it fits: the
+        // footer parses, the flag lands, the guard refuses. MUTATION:
+        // negate the missing_field_ids predicate and the refusal is gone.
+        val cat = "late-verdict"
+        val (_, commits, alter) = ddlTable(cat)
+        val path = failWithoutVerdict(cat, commits)
+        assertThat(hydrator.rehydrateFailed(cat).requeued).isEqualTo(1)
+        assertThat(hydrator.runOnce()).isEqualTo(1)
+        assertThat(rowByPath(path)).containsEntry("stats_state", "provided").containsEntry("missing_field_ids", true)
+        assertRefusedIdless(alter, cat, AlterOp.RenameColumn("name", "label"), addOp("added_after_flag"))
+    }
+
+    @Test
+    fun `a failed verdict keeps its flag through a rehydrate and a second sweep`() {
+        // An id-less file whose registration lies about its row count:
+        // the footer parses, the verdict is written, and the file fails
+        // on the mismatch. `failed` is trusted now (#445), but the FLAG
+        // is what the guard reads, and nothing on the rehydrate path
+        // clears it: the requeue flips only stats_state, and the second
+        // sweep writes the same verdict again.
+        val cat = "failed-verdict"
+        val (_, commits, alter) = ddlTable(cat)
+        val idless = writeSampleParquet(sampleSchema(withIds = false))
+        val path = commitDeferred(cat, commits, "idless-miscounted", idless, recordCount = ROWS + 1L)
+        val rename = AlterOp.RenameColumn("name", "label")
+
+        assertThat(hydrator.runOnce()).isEqualTo(1)
+        assertThat(rowByPath(path)).containsEntry("stats_state", "failed").containsEntry("missing_field_ids", true)
+        assertRefusedIdless(alter, cat, rename, addOp("added"))
+
+        assertThat(hydrator.rehydrateFailed(cat).requeued).isEqualTo(1)
+        assertThat(rowByPath(path))
+            .describedAs("the requeue flips the state and leaves the verdict")
+            .containsEntry("stats_state", "pending").containsEntry("missing_field_ids", true)
+        assertRefusedIdless(alter, cat, rename, addOp("added"))
+
+        assertThat(hydrator.runOnce()).isEqualTo(1)
+        assertThat(rowByPath(path)).containsEntry("stats_state", "failed").containsEntry("missing_field_ids", true)
+        assertRefusedIdless(alter, cat, rename, addOp("added"))
     }
 
     @Test

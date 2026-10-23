@@ -1,9 +1,11 @@
 # name: test/sql/hoglake_dml_alter.test
 # description: M4 against the live dev stack: DELETE/UPDATE via
 #   deletion vectors, ALTER TABLE per the wire's AlterOp vocabulary.
-#   NOTE: RENAME COLUMN with live data requires hydrated stats (the
-#   server refuses on not-yet-hydrated files) — tested on an empty
-#   table because the dev stack's hydrator may lag.
+#   NOTE: RENAME COLUMN is not exercised here. The server refuses it
+#   (409 idless_files_present) only over a live file its hydrator has
+#   flagged missing_field_ids; a file whose hydration is pending does
+#   not block it (#445), so nothing here depends on the dev stack's
+#   hydrator keeping up.
 # group: [hoglake]
 
 require hoglake

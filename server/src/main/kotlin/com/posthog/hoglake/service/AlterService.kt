@@ -309,7 +309,10 @@ class AlterService(private val jdbi: Jdbi) {
         requireAddedSubtreeNullable(op)
         // A name-bound file may already contain the added name (for example
         // after DROP + ADD). Without field IDs its old values would become
-        // values of this new column instead of nulls. Pending files are unknown.
+        // values of this new column instead of nulls. The guard refuses
+        // while a file PROVEN id-less (missing_field_ids) is live; a file
+        // whose footer nobody has read is trusted, the way every
+        // inline-stats file always was — see requireFieldIds.
         requireFieldIds(h, catalogId, tableId, "cannot add column '${op.def.name}'")
         val count = ColumnTrees.nodeCount(listOf(op.def))
         val firstFieldId = TableRepo.allocateFieldIds(h, catalogId, tableId, count)
@@ -481,13 +484,16 @@ class AlterService(private val jdbi: Jdbi) {
         // is live (visible at head) would silently NULL that column's
         // history in readers, so the rename is refused (409) until the
         // id-less files are compacted, expired, or otherwise retired.
-        // 'pending' files count too — missing_field_ids is only written by
-        // the hydrator's footer read, so a not-yet-hydrated file's id state
-        // is UNKNOWN and must be treated as id-less until proven otherwise
-        // (the TOCTOU: commit deferred-stats id-less file -> rename slips
-        // through before the sweep -> the flag arrives too late).
-        // A failed footer read also leaves the ID state unknown. Conservatively
-        // block failed hydration until a successful rehydrate verifies the IDs.
+        // Only a file the hydrator has PROVEN id-less counts
+        // (missing_field_ids); a `pending` or `failed` file is trusted.
+        // Until #445 the guard also refused over those, on the grounds
+        // that an unread footer leaves the id state unknown — but a file
+        // registered with client-shipped stats is never read either and
+        // was never refused, so the clause verified only the deferred
+        // path, and on a busy table with deferred stats (a new pending
+        // file every flush, one sweep per HOGLAKE_HYDRATOR_INTERVAL_MS)
+        // it refused forever and crash-looped the writer. See
+        // requireFieldIds for what the flag is and is not.
         // RenameTable is unaffected — table binding rides table_uuid.
         requireFieldIds(h, catalogId, tableId, "cannot rename column '${op.from}' to '${op.to}'")
         endOrDeleteColumnRow(h, catalogId, tableId, col.fieldId, snapshot)
@@ -507,40 +513,82 @@ class AlterService(private val jdbi: Jdbi) {
         state.cols = replaceNode(state.cols, col.fieldId) { renamed }
     }
 
+    /**
+     * The field-id guard for `add_column` and `rename_column`: refuse
+     * (409 `idless_files_present`) while any LIVE file of the table is
+     * flagged `missing_field_ids`. Runs under the per-catalog commit
+     * lock, so its cost is lock-held cost.
+     *
+     * WHAT THE FLAG IS. The hydrator's footer read sets it when a leaf
+     * lacks `PARQUET:field_id`, and ONLY the hydrator sets it:
+     * `CommitTail` inserts file rows without the column, so every file
+     * lands at the column default (false). A file registered with
+     * client-shipped stats is never claimed by the hydrator, so it never
+     * gets a server-side field-id check at all and the flag stays false
+     * for its whole life. The flag is therefore an AFTER-THE-FACT AUDIT
+     * of the deferred-stats path, not a timely guard. Its lag is the
+     * sweep's, and the sweep is a queue, not a scan: `CLAIM_PENDING_SQL`
+     * walks each catalog's pending files in `data_file_id` order from
+     * the lowest pending id each sweep (rows leave the pending index as
+     * they resolve, so it looks like a continuation),
+     * [com.posthog.hoglake.hydrator.Hydrator.DEFAULT_SWEEP_LIMIT] rows per
+     * replica per HOGLAKE_HYDRATOR_INTERVAL_MS split evenly across the
+     * catalogs with work (FOR UPDATE SKIP LOCKED keeps replicas
+     * disjoint). A newly committed file therefore waits behind the
+     * catalog's whole backlog — backlog / (limit × replicas) intervals
+     * at best, slower on a busy instance, unbounded on a catalog whose
+     * backlog grows (millrace's 24.7M on 2026-10-22 is ~250 replica-days
+     * at 1,000 per 15 min) — and any number of renames can land in that
+     * window. Once set the
+     * flag holds: a `failed`
+     * verdict that parsed the footer keeps it (`markFailed` writes the
+     * verdict), a rehydrate leaves it alone, and only ending the row
+     * (compaction, expiry, drop) takes the file out of the count.
+     *
+     * WHAT IT IS NOT. Until #445 the guard also refused while any live
+     * file was `stats_state IN ('pending', 'failed')`, treating an unread
+     * footer as id-less until proven otherwise. That clause protected
+     * only the deferred-stats path — the inline-stats path, which is
+     * every millpond file, was never checked and never refused — and on
+     * a busy table it never cleared: a writer fleet flushing deferred
+     * files every ~90 s keeps the table permanently non-empty of pending
+     * files between 15-minute sweeps, so a client adding a column
+     * retried the same 409 until its flush budget expired and the pod
+     * restarted (#445). `failed` files are trusted the same way now,
+     * which includes the pre-parse failure (object missing, over the
+     * whole-object cap): `markFailed` with a null verdict COALESCEs the
+     * flag to its current value, so such a file is unflagged and
+     * unguarded, exactly as an inline-stats file is.
+     *
+     * COST. The count is a range over the V26 partial index
+     * `hog_data_file_missing_field_ids (catalog_id, table_id) WHERE
+     * missing_field_ids AND end_snapshot IS NULL`: O(flagged live files
+     * of the table), a handful of pages on any instance, and zero rows
+     * walked for a table with none. The OR'd statement this replaces
+     * could not be served by a partial index at all (no BitmapOr was
+     * chosen): measured, it was an Index Scan over `hog_data_file_live`
+     * on `(catalog_id, table_id)` with the OR applied as a per-row
+     * filter — the table's WHOLE live set under the lock, every
+     * add_column and rename_column — or a Seq Scan of the manifest when
+     * the planner went sequential. `AlterGuardPlanIntegrationTest` pins
+     * the new plan.
+     */
     private fun requireFieldIds(
         h: Handle,
         catalogId: Long,
         tableId: Long,
         action: String,
     ) {
-        val (idlessLive, unverifiedLive) =
-            h.createQuery(
-                """
-                SELECT count(*) FILTER (WHERE missing_field_ids) AS idless,
-                       count(*) FILTER (WHERE stats_state IN ('pending', 'failed') AND NOT missing_field_ids) AS pending
-                FROM hog_data_file
-                WHERE catalog_id = :catalogId AND table_id = :tableId
-                  AND end_snapshot IS NULL
-                  AND (missing_field_ids OR stats_state IN ('pending', 'failed'))
-                """,
-            )
+        val idlessLive =
+            h.createQuery(REQUIRE_FIELD_IDS_SQL)
                 .bind("catalogId", catalogId)
                 .bind("tableId", tableId)
-                .map { rs, _ -> rs.getLong("idless") to rs.getLong("pending") }
+                .mapTo(Long::class.java)
                 .one()
-        if (idlessLive > 0 || unverifiedLive > 0) {
-            val blockers =
-                buildList {
-                    if (idlessLive > 0) add("$idlessLive id-less")
-                    if (unverifiedLive > 0) {
-                        add(
-                            "$unverifiedLive not-yet-hydrated (pending or failed; field IDs not verified)",
-                        )
-                    }
-                }.joinToString(" and ")
+        if (idlessLive > 0) {
             throw HoglakeException.IdlessFilesPresent(
-                "$action: $blockers live data " +
-                    "file(s) may bind columns by name; hydrate, rewrite, or retire them first",
+                "$action: $idlessLive id-less live data file(s) bind columns by name; " +
+                    "rewrite (compact) or retire them first",
             )
         }
     }
@@ -1304,6 +1352,21 @@ class AlterService(private val jdbi: Jdbi) {
      * pyhoglake's parity test compares against its own allowlist.
      */
     companion object {
+        /**
+         * The field-id guard's count ([requireFieldIds]); the statement
+         * production issues, exposed for `AlterGuardPlanIntegrationTest`
+         * to EXPLAIN. Every predicate is the partial index's own
+         * (`hog_data_file_missing_field_ids`, V26), so the planner has
+         * nothing to answer from the heap.
+         */
+        internal const val REQUIRE_FIELD_IDS_SQL: String =
+            """
+            SELECT count(*)
+            FROM hog_data_file
+            WHERE catalog_id = :catalogId AND table_id = :tableId
+              AND missing_field_ids AND end_snapshot IS NULL
+            """
+
         val TEMPORAL_TRANSFORMS =
             setOf(Transform.YEAR, Transform.MONTH, Transform.DAY, Transform.HOUR)
 

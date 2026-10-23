@@ -1703,10 +1703,10 @@ class Table:
 
         A 409 from concurrent DDL is :class:`CommitConflictError`. An
         ``add_column`` or ``rename_column`` refused because the table has
-        live files whose field ids are unverified (pending or failed
-        hydration, or ``missing_field_ids``) is
-        :class:`IdlessFilesPresentError` instead — not a conflict, and
-        not cleared by refreshing.
+        a live file the server has proven id-less (``missing_field_ids``)
+        is :class:`IdlessFilesPresentError` instead — not a conflict, not
+        cleared by refreshing or retrying, and not raised for a file
+        whose hydration is merely pending or failed.
 
         An ``add_column`` whose column (or any node nested inside it,
         a map's key excepted) is ``nullable: false`` is a 422
@@ -1803,10 +1803,9 @@ class Table:
         (``PARQUET:field_id``). Unless ``deferred_stats``, per-column stats
         are extracted from the writer's own footer metadata (never re-read
         from object storage) and shipped with the commit. With it, the
-        files register ``pending`` for the hydrator, with the consequences
+        files register ``pending`` for the hydrator, with the consequence
         :meth:`prepare_append_tables` lists: no bounds under the
-        hydrator's size floor, and ``add_column`` / ``rename_column``
-        refused with :class:`IdlessFilesPresentError` until hydrated.
+        hydrator's size floor. DDL on the table is not held up by it.
 
         **Partitioned tables.** Each row's partition tuple is computed
         client-side under the table's CURRENT spec (Iceberg-semantics
@@ -2032,13 +2031,14 @@ class Table:
           rows only for files at or over ``HOGLAKE_HYDRATOR_MIN_FILE_BYTES``
           (1 MiB by default); a smaller file goes ``provided`` with none,
           and has no bounds until compaction rewrites it.
-        - ``add_column`` and ``rename_column`` on the table are refused
-          with :class:`IdlessFilesPresentError` (409
-          ``idless_files_present``) while any such file is live and
-          unhydrated: its field ids are unverified. Retry the alter once
-          the sweep has run; it is not a :class:`CommitConflictError`.
+        - ``add_column`` and ``rename_column`` on the table are NOT held
+          up by a pending file: the server trusts its field ids until the
+          hydrator's footer read proves otherwise, the way it trusts a
+          file registered with inline stats. Only a file so proven
+          (``missing_field_ids``) refuses them, with
+          :class:`IdlessFilesPresentError` — which no sweep clears.
 
-        In exchange each deferred file gets the hydrator's field-id check
+        In exchange each deferred file gets the hydrator's field-id audit
         (``missing_field_ids``), which a file registered with inline stats
         never gets.
 
@@ -2137,13 +2137,14 @@ class Table:
           rows only for files at or over ``HOGLAKE_HYDRATOR_MIN_FILE_BYTES``
           (1 MiB by default); a smaller file goes ``provided`` with none,
           and has no bounds until compaction rewrites it.
-        - ``add_column`` and ``rename_column`` on the table are refused
-          with :class:`IdlessFilesPresentError` (409
-          ``idless_files_present``) while any such file is live and
-          unhydrated: its field ids are unverified. Retry the alter once
-          the sweep has run; it is not a :class:`CommitConflictError`.
+        - ``add_column`` and ``rename_column`` on the table are NOT held
+          up by a pending file: the server trusts its field ids until the
+          hydrator's footer read proves otherwise, the way it trusts a
+          file registered with inline stats. Only a file so proven
+          (``missing_field_ids``) refuses them, with
+          :class:`IdlessFilesPresentError` — which no sweep clears.
 
-        In exchange each deferred file gets the hydrator's field-id check
+        In exchange each deferred file gets the hydrator's field-id audit
         (``missing_field_ids``), which a file registered with inline stats
         never gets.
 

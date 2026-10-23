@@ -552,11 +552,13 @@ paths:
             Conflict. add_column and rename_column additionally fail with error
             `idless_files_present` while any LIVE data file of the table
             is flagged missing_field_ids (its parquet schema carries no
-            field ids): such files bind columns by name, so evolution
-            could misbind their history in readers. Files with pending or failed hydration also block both
-            operations until successfully hydrated. Rewrite
-            (compact) or retire the id-less files first. rename_table is
-            unaffected.
+            field ids, as the hydrator's footer read found): such files
+            bind columns by name, so evolution could misbind their
+            history in readers. Only a flagged file blocks; a file whose
+            footer has not been read (pending or failed hydration, or
+            registered with client-shipped stats) is trusted. The error
+            never clears on its own: rewrite (compact) or retire the
+            id-less files first. rename_table is unaffected.
 
 
             `table_recreated` when expected_table_uuid names an

@@ -1693,9 +1693,8 @@ def test_changes_truncate_requires_reconciliation(client, httpx_mock):
 
 
 _IDLESS_DETAIL = (
-    "cannot add column 'extra': 1 not-yet-hydrated (pending or failed; field IDs "
-    "not verified) live data file(s) may bind columns by name; hydrate, rewrite, "
-    "or retire them first"
+    "cannot add column 'extra': 1 id-less live data file(s) bind columns by name; "
+    "rewrite (compact) or retire them first"
 )
 
 
@@ -1709,8 +1708,9 @@ def _alter_answers(httpx_mock, status, body):
 
 
 def test_alter_idless_files_present_is_its_own_error_not_a_conflict(client, httpx_mock):
-    """A deferred-stats file blocks add/rename until hydrated. Classified
-    as CommitConflictError (retryable) it read as concurrent DDL, and a
+    """A file the hydrator proved id-less blocks add/rename until it is
+    rewritten or retired; no retry clears it. Classified as
+    CommitConflictError (retryable) it read as concurrent DDL, and a
     writer that drops the column on a conflict dropped it here."""
     table = _table(client, httpx_mock)
     _alter_answers(

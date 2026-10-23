@@ -31,7 +31,7 @@ client work not yet done. Last checked against `openapi/hoglake.yaml`
 | `CREATE TABLE AS` | DONE | eager create at plan time (prepared-statement re-exec caveat) |
 | `DROP TABLE` | DONE | no CASCADE (as ducklake) |
 | `ALTER TABLE ADD/DROP COLUMN` | DONE | ADD with DEFAULT refused (no wire defaults) |
-| `ALTER TABLE RENAME COLUMN/TABLE` | DONE | rename-column 409s while id-less/not-yet-hydrated files are live (server invariant, surfaced verbatim) |
+| `ALTER TABLE RENAME COLUMN/TABLE` | DONE | rename-column 409s while id-less files are live (server invariant, surfaced verbatim) |
 | `ALTER COLUMN TYPE` | DONE | server promotion lattice (int→long, float→double) |
 | `SET PARTITIONED BY` | DONE | identity/year/month/day/hour/bucket parsed to the wire spec |
 | `SET SORTED BY` | PARTIAL | DDL committed; sort-on-insert NOT applied by the writer yet |
