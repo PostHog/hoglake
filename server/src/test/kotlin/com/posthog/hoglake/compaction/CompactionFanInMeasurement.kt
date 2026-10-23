@@ -1,5 +1,6 @@
 package com.posthog.hoglake.compaction
 
+import com.posthog.hoglake.persistence.CommitLockPath
 import com.posthog.hoglake.persistence.Locks
 import com.posthog.hoglake.testing.Measuring
 import com.posthog.hoglake.testing.PgTestSupport
@@ -188,7 +189,7 @@ class CompactionFanInMeasurement {
         return db.jdbi.withHandleUnchecked { h ->
             h.begin()
             try {
-                Locks.acquireCatalogCommitLock(h, catalogId, 0)
+                Locks.acquireCatalogCommitLock(h, catalogId, "test-holder", CommitLockPath.COMMIT, 0)
                 val started = System.nanoTime()
                 h.createQuery(
                     """

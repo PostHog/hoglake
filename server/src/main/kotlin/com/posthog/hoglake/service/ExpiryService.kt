@@ -12,6 +12,7 @@ import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.ExpiryGauges
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.persistence.CatalogRepo
+import com.posthog.hoglake.persistence.CommitLockPath
 import com.posthog.hoglake.persistence.Locks
 import com.posthog.hoglake.persistence.MaintenanceRunStore
 import com.posthog.hoglake.persistence.OffsetRepo
@@ -1012,7 +1013,7 @@ class ExpiryService(
     ): Advance =
         jdbi.inTransactionUnchecked { h ->
             val pre = CatalogRepo.require(h, catalog)
-            Locks.acquireCatalogCommitLock(h, pre.catalogId)
+            Locks.acquireCatalogCommitLock(h, pre.catalogId, pre.name, CommitLockPath.EXPIRY)
             // THE BOUND GOES ON FIRST, before anything it has to bound —
             // `RetirementService.batch`'s rule, and for its reason: a
             // statement left under the SESSION's 60 s inside a

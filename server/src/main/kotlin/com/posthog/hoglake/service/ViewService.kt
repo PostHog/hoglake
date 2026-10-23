@@ -7,6 +7,7 @@ import com.posthog.hoglake.model.NamespaceInfo
 import com.posthog.hoglake.model.ViewInfo
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.persistence.CatalogRepo
+import com.posthog.hoglake.persistence.CommitLockPath
 import com.posthog.hoglake.persistence.Locks
 import com.posthog.hoglake.persistence.NamespaceRepo
 import com.posthog.hoglake.persistence.SnapshotRepo
@@ -50,7 +51,7 @@ class ViewService(private val jdbi: Jdbi) {
             if (dialect.isBlank()) throw HoglakeException.Validation("view dialect must not be blank")
             jdbi.inTransactionUnchecked { h ->
                 val cat = requireCatalog(h, catalog)
-                Locks.acquireCatalogCommitLock(h, cat.catalogId)
+                Locks.acquireCatalogCommitLock(h, cat.catalogId, cat.name, CommitLockPath.DDL)
                 val ns = requireNamespace(h, cat.catalogId, catalog, namespace)
                 if (ViewRepo.findLiveByName(h, cat.catalogId, ns.namespaceId, ns.name, name) != null) {
                     throw HoglakeException.AlreadyExists(
@@ -132,7 +133,7 @@ class ViewService(private val jdbi: Jdbi) {
             requireOperationMetadata(author, message)
             jdbi.inTransactionUnchecked { h ->
                 val cat = requireCatalog(h, catalog)
-                Locks.acquireCatalogCommitLock(h, cat.catalogId)
+                Locks.acquireCatalogCommitLock(h, cat.catalogId, cat.name, CommitLockPath.DROP)
                 val ns = requireNamespace(h, cat.catalogId, catalog, namespace)
                 val view =
                     ViewRepo.findLiveByName(h, cat.catalogId, ns.namespaceId, ns.name, name)

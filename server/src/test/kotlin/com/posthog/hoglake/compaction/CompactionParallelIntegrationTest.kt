@@ -12,6 +12,7 @@ import com.posthog.hoglake.model.NullOrder
 import com.posthog.hoglake.model.SortDirection
 import com.posthog.hoglake.model.SortFieldDef
 import com.posthog.hoglake.model.TableAppend
+import com.posthog.hoglake.persistence.CommitLockPath
 import com.posthog.hoglake.persistence.Locks
 import com.posthog.hoglake.service.AlterService
 import com.posthog.hoglake.service.CatalogService
@@ -337,7 +338,13 @@ class CompactionParallelIntegrationTest {
             val heldElsewhere =
                 Executors.newSingleThreadExecutor().submit<Boolean> {
                     db.jdbi.inTransactionUnchecked { h ->
-                        Locks.acquireCatalogCommitLock(h, catalogId, lockTimeoutMs = 5_000)
+                        Locks.acquireCatalogCommitLock(
+                            h,
+                            catalogId,
+                            "test-holder",
+                            CommitLockPath.COMMIT,
+                            lockTimeoutMs = 5_000,
+                        )
                         true
                     }
                 }
@@ -1104,7 +1111,7 @@ class CompactionParallelIntegrationTest {
         val holder =
             Thread({
                 db.jdbi.inTransactionUnchecked { h ->
-                    Locks.acquireCatalogCommitLock(h, catalogId)
+                    Locks.acquireCatalogCommitLock(h, catalogId, "test-holder", CommitLockPath.COMMIT)
                     holding.countDown()
                     release.await(60, TimeUnit.SECONDS)
                 }
