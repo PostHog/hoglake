@@ -27,6 +27,7 @@ from pyhoglake import (
     ops,
     variant_field,
 )
+from pyhoglake.types import columns_to_arrow_schema
 
 pytestmark = pytest.mark.integration
 
@@ -345,6 +346,39 @@ def test_deferred_append_hydrates_with_exact_footer_size(
 
     # The live runner enables the hydrator. Allow time for the adversarial
     # suite's pending registrations to drain ahead of this file.
+    deadline = time.monotonic() + 180
+    while f.stats_state == "pending" and time.monotonic() < deadline:
+        time.sleep(0.2)
+        (f,) = table.files(snapshot=result.snapshot_id)
+    assert f.stats_state == "provided"
+
+
+def test_prepared_deferred_append_registers_pending_and_hydrates(catalog, ns):
+    """``prepare_append_tables(deferred_stats=True)`` + ``commit_prepared``:
+    the request carries no ``column_stats``, the server registers the file
+    without them, and the hydrator reads its footer. The 40-row file is far
+    under the live runner's ``HOGLAKE_HYDRATOR_MIN_FILE_BYTES`` (the 1 MiB
+    default), so 'provided' here proves the claim and the footer read
+    (field-id verdict included), NOT that stats rows were written; the
+    server suite covers both sides of the floor. A 'pending' read is not
+    asserted for the reason the append test above gives (the runner's
+    hydrator sweeps every second); the server suite's
+    PreparedCommitDeferredStatsHydrationIntegrationTest pins the 'pending'
+    registration with the hydrator stopped."""
+    table = ns.create_table("prepared_deferred", _events_schema())
+    request = table.prepare_append_tables(
+        [(_events_data(40).cast(columns_to_arrow_schema(table.columns)), None)],
+        idempotency_key=str(uuid.uuid4()),
+        deferred_stats=True,
+    )
+    (registration,) = request["appends"][0]["files"]
+    assert "column_stats" not in registration
+    result = table.commit_prepared(request)
+    (f,) = table.files(snapshot=result.snapshot_id)
+    assert f.path == registration["path"]
+    assert f.record_count == 40
+    assert f.stats_state in ("pending", "provided")
+
     deadline = time.monotonic() + 180
     while f.stats_state == "pending" and time.monotonic() < deadline:
         time.sleep(0.2)

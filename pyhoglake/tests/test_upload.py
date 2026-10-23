@@ -11,6 +11,7 @@ flush against 18 ms of server commit.
 
 import builtins
 import contextlib
+import json
 import logging
 import re
 import struct
@@ -35,6 +36,7 @@ from pyhoglake import (
 from pyhoglake import client as client_module
 from pyhoglake import upload as upload_module
 from pyhoglake.client import Namespace
+from pyhoglake.stats import extract_column_stats
 from pyhoglake.types import columns_to_arrow_schema
 from pyhoglake.upload import (
     CONCURRENCY_ENV,
@@ -1053,6 +1055,106 @@ def test_an_unavailable_codec_is_refused(monkeypatch):
         parquet_write_options("zstd", 3)
     # `none` needs no codec library at all.
     assert parquet_write_options("none") == {"compression": "none"}
+
+
+# --- deferred stats -------------------------------------------------------
+
+# The registration keys, in wire order, of an unpartitioned file.
+_DEFERRED_KEYS = ["path", "record_count", "file_size_bytes", "footer_size"]
+_SHIPPED_KEYS = [*_DEFERRED_KEYS, "column_stats"]
+
+
+def _prepare(table, tmp_path, entry: str, counts, **kwargs):
+    """``counts`` groups through ``entry`` (``files`` or ``tables``),
+    unpartitioned; returns the registrations."""
+    groups = _groups(table, counts)
+    if entry == "files":
+        paths = []
+        for index, (data, _) in enumerate(groups):
+            path = tmp_path / f"group-{index}.parquet"
+            pq.write_table(data, path)
+            paths.append((str(path), None))
+        request = table.prepare_append_files(
+            paths, idempotency_key=str(uuid.uuid4()), **kwargs
+        )
+    else:
+        request = table.prepare_append_tables(
+            groups, idempotency_key=str(uuid.uuid4()), **kwargs
+        )
+    return request["appends"][0]["files"]
+
+
+@pytest.mark.parametrize("entry", ["files", "tables"])
+def test_deferred_stats_omits_column_stats_from_every_registration(
+    prepared, recording_s3, tmp_path, entry
+):
+    """The key is ABSENT, not empty: absent is what the server registers
+    'pending' for the hydrator; ``[]`` would register 'provided' with no
+    stats and never be hydrated."""
+    regs = _prepare(prepared, tmp_path, entry, [3, 4], deferred_stats=True)
+    assert [list(reg) for reg in regs] == [_DEFERRED_KEYS, _DEFERRED_KEYS]
+    assert [reg["record_count"] for reg in regs] == [3, 4]
+    # The files still uploaded, and the registration still describes them.
+    for reg in regs:
+        assert reg["file_size_bytes"] == len(_object(recording_s3, reg))
+
+
+@pytest.mark.parametrize("entry", ["files", "tables"])
+@pytest.mark.parametrize("kwargs", [{}, {"deferred_stats": False}])
+def test_default_registration_still_ships_column_stats(
+    prepared, recording_s3, tmp_path, entry, kwargs
+):
+    """Default unchanged on the wire: same keys in the same order, and
+    ``column_stats`` is the footer of the uploaded object itself, read
+    back out of the store rather than taken from the writer."""
+    regs = _prepare(prepared, tmp_path, entry, [3], **kwargs)
+    (reg,) = regs
+    assert list(reg) == _SHIPPED_KEYS
+    footer = pq.read_metadata(pa.BufferReader(_object(recording_s3, reg)))
+    expected = [s.to_wire() for s in extract_column_stats(footer, prepared.columns)]
+    assert expected  # a vacuous [] == [] would pass with the stats dropped
+    assert reg["column_stats"] == expected
+
+
+@pytest.mark.parametrize("entry", ["files", "tables"])
+def test_explicit_false_is_byte_identical_to_the_default(
+    prepared, recording_s3, tmp_path, entry
+):
+    def wire(**kwargs) -> list[str]:
+        regs = _prepare(prepared, tmp_path, entry, [3, 4], **kwargs)
+        return [
+            json.dumps({k: v for k, v in reg.items() if k != "path"}) for reg in regs
+        ]
+
+    assert wire() == wire(deferred_stats=False)
+
+
+@pytest.mark.parametrize("deferred", [True, False])
+def test_append_and_prepare_tables_register_the_same_shape(
+    httpx_mock, prepared, recording_s3, deferred
+):
+    """``Table.append(deferred_stats=...)`` and
+    ``prepare_append_tables(deferred_stats=...)`` hand the server the same
+    registration for the same rows: same keys in the same order, and the
+    same values for everything but the uuid-bearing path."""
+    httpx_mock.add_response(
+        method="POST",
+        url=f"{BASE}/v1/catalogs/cat/commit",
+        json={"snapshot_id": 6, "schema_version": 2},
+    )
+    (data, _) = _groups(prepared, [5])[0]
+    prepared.append(data, deferred_stats=deferred)
+    (commit,) = [r for r in httpx_mock.get_requests() if r.method == "POST"]
+    (appended,) = json.loads(commit.content)["appends"][0]["files"]
+    (staged,) = prepared.prepare_append_tables(
+        [(data, None)], idempotency_key=str(uuid.uuid4()), deferred_stats=deferred
+    )["appends"][0]["files"]
+
+    assert list(staged) == list(appended)
+    assert ("column_stats" in staged) is not deferred
+    assert {k: v for k, v in staged.items() if k != "path"} == {
+        k: v for k, v in appended.items() if k != "path"
+    }
 
 
 @pytest.fixture(autouse=True)

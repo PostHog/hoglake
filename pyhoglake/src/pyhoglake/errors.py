@@ -325,6 +325,28 @@ class CatalogHasAbandonedUploadsError(CatalogNotEmptyError):
     wire_reason = "abandoned_uploads_unsettled"
 
 
+class IdlessFilesPresentError(HoglakeError):
+    """409 ``idless_files_present`` — an ``add_column`` or ``rename_column``
+    refused because the table has live data files whose field ids are not
+    known to be present, so their columns may bind by NAME and the new or
+    renamed name could adopt another column's values.
+
+    Deliberately NOT a :class:`CommitConflictError`: no concurrent DDL
+    happened, and refreshing the read snapshot changes nothing. Neither
+    :attr:`retryable` nor :attr:`re_prepare` — the SAME alter succeeds
+    only once the blocking files are gone, which :attr:`detail` (the
+    server's prose) counts. It clears:
+
+    - for files still ``stats_state='pending'`` (a ``deferred_stats``
+      append), once the hydrator has read their footers and verified the
+      ids — a wait, typically seconds, so retrying the alter on a bounded
+      backoff is the right response;
+    - for ``'failed'`` files, only after a successful rehydrate;
+    - NEVER on its own for files with ``missing_field_ids`` genuinely
+      true: those must be rewritten (compaction) or retired first.
+    """
+
+
 class ReconciliationRequiredError(HoglakeError):
     """409 — a changefeed window crosses TRUNCATE; reconcile before checkpointing.
 
