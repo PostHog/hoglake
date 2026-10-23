@@ -476,7 +476,12 @@ class TableCreationIntegrationTest {
         val id = catalogs.getCatalog(catalog).catalogId
         db.jdbi.open().use { lock ->
             lock.begin()
-            com.posthog.hoglake.persistence.Locks.acquireCatalogCommitLock(lock, id)
+            com.posthog.hoglake.persistence.Locks.acquireCatalogCommitLock(
+                lock,
+                id,
+                catalog,
+                com.posthog.hoglake.persistence.CommitLockPath.COMMIT,
+            )
             try {
                 Executors.newVirtualThreadPerTaskExecutor().use { executor ->
                     executor.submit {

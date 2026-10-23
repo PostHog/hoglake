@@ -6,7 +6,10 @@ import com.zaxxer.hikari.HikariDataSource
 import io.micrometer.core.instrument.Gauge
 import io.micrometer.core.instrument.MeterRegistry
 import io.micrometer.core.instrument.Timer
+import java.time.Duration
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Source-incremented counters (README.md §8): counted where the event
@@ -20,12 +23,13 @@ object Metrics {
     private var registry: MeterRegistry? = null
 
     /**
-     * The two histograms on per-request / per-commit paths, resolved
-     * ONCE per bound registry.
+     * The meters on per-request / per-commit paths — the two histograms
+     * and the commit-lock families — resolved ONCE per bound registry
+     * (once per label set for the labelled ones).
      *
      * `Timer.builder(...).register(r)` is idempotent but not free: it
      * allocates a builder and walks the registry's meter map on every
-     * call, and these two are hit on every request and every commit.
+     * call, and these are hit on every request and every commit.
      * Held beside the registry rather than in a lazy of their own so
      * that [bind] and [clear] cannot leave a timer pointing at a
      * registry nobody scrapes — which is the shape a test that rebinds
@@ -51,6 +55,57 @@ object Metrics {
                 .publishPercentileHistogram()
                 .register(registry)
         }
+
+        // The commit-lock families are per catalog (and the hold per path),
+        // so they are cached by label rather than lazy: the same
+        // register-once argument, keyed. Each is minted on its first event,
+        // so a catalog nobody commits to has no series.
+        private val lockHold = ConcurrentHashMap<Pair<String, String>, Timer>()
+        private val lockWaiting = ConcurrentHashMap<String, AtomicInteger>()
+        private val lockHeld = ConcurrentHashMap<String, AtomicInteger>()
+
+        fun commitLockHold(
+            catalog: String,
+            path: String,
+        ): Timer =
+            lockHold.computeIfAbsent(catalog to path) {
+                Timer.builder("hoglake_commit_lock_hold")
+                    .description(
+                        "Per-catalog commit lock hold, from grant to the end of the transaction that took it",
+                    )
+                    .tags("catalog", catalog, "path", path)
+                    .publishPercentileHistogram()
+                    // Holds of tens of seconds are the incident this family
+                    // exists for (millpond, 8-29 s), and the default timer
+                    // ceiling of 30 s would fold them into +Inf.
+                    .maximumExpectedValue(Duration.ofMinutes(5))
+                    .register(registry)
+            }
+
+        fun commitLockWaiting(catalog: String): AtomicInteger =
+            lockWaiting.computeIfAbsent(catalog) { name ->
+                AtomicInteger().also { n ->
+                    Gauge.builder("hoglake_commit_lock_waiting", n) { it.get().toDouble() }
+                        .description("Sessions of this process waiting for the catalog's commit lock")
+                        .tag("catalog", name)
+                        .strongReference(true)
+                        .register(registry)
+                }
+            }
+
+        fun commitLockHeld(catalog: String): AtomicInteger =
+            lockHeld.computeIfAbsent(catalog) { name ->
+                AtomicInteger().also { n ->
+                    // 0/1, not the count: the lock is exclusive, so a count
+                    // above 1 is only the re-entrant case, which the
+                    // observer already folds into one hold.
+                    Gauge.builder("hoglake_commit_lock_held", n) { if (it.get() > 0) 1.0 else 0.0 }
+                        .description("1 while a transaction of this process holds the catalog's commit lock")
+                        .tag("catalog", name)
+                        .strongReference(true)
+                        .register(registry)
+                }
+            }
     }
 
     @Volatile
@@ -711,6 +766,50 @@ object Metrics {
     fun commitLockWait(nanos: Long) {
         timers?.commitLockWait?.record(nanos, TimeUnit.NANOSECONDS)
     }
+
+    /**
+     * `hoglake_commit_lock_hold_seconds{catalog,path}` histogram (#439):
+     * grant to the end (commit or rollback) of the transaction that took
+     * the per-catalog commit lock, by the kind of work holding it —
+     * `commit`, `compaction`, `expiry`, `retirement`, `ddl` or `drop`
+     * (`persistence.CommitLockPath`). Recorded by
+     * `persistence.CommitLockObserver`, never by a caller.
+     *
+     * The wait histogram above says how long writers queued; this says
+     * WHO made them queue. With FIFO admission a waiter's expected wait is
+     * the holders ahead of it times their hold, so a hold p99 that rises
+     * on one path is the cause and the wait p99 is its symptom.
+     */
+    fun commitLockHold(
+        catalog: String,
+        path: String,
+        nanos: Long,
+    ) {
+        timers?.commitLockHold(catalog, path)?.record(nanos, TimeUnit.NANOSECONDS)
+    }
+
+    /**
+     * `hoglake_commit_lock_waiting{catalog}` gauge (#439): the counter
+     * behind it, or null with no registry bound. The CALLER increments and
+     * decrements the instance returned here, rather than calling an inc
+     * and a dec that each resolve their own: a registry rebound between
+     * the two would otherwise decrement a fresh counter to -1.
+     *
+     * Sessions of THIS process inside `Locks.acquireCatalogCommitLock`
+     * right now. Summed over pods it is the fleet's queue depth; it sees
+     * no other pod's sessions and no psql session, which is what
+     * `hoglake_commit_lock_db_waiters` (sampled from `pg_locks`) is for.
+     */
+    fun commitLockWaiting(catalog: String): AtomicInteger? = timers?.commitLockWaiting(catalog)
+
+    /**
+     * `hoglake_commit_lock_held{catalog}` gauge (#439), 0/1: whether a
+     * transaction of THIS process holds the catalog's commit lock. The
+     * same instance-returning contract as [commitLockWaiting]. A holder
+     * that never ends is a flat line at 1 here and a rising
+     * `hoglake_commit_lock_db_held_seconds`.
+     */
+    fun commitLockHeld(catalog: String): AtomicInteger? = timers?.commitLockHeld(catalog)
 
     /**
      * `hoglake_request_queue_wait_seconds` histogram (#218): how long a

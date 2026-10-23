@@ -6,6 +6,7 @@ import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.CommitRequest
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.TableAppend
+import com.posthog.hoglake.persistence.CommitLockPath
 import com.posthog.hoglake.persistence.Locks
 import com.posthog.hoglake.testing.PgTestSupport
 import org.assertj.core.api.Assertions.assertThat
@@ -76,7 +77,7 @@ class DropConcurrencyIntegrationTest {
                     // The REAL key, from the production helper: a copy
                     // of this SQL that computed a different key would
                     // make this test pass while proving nothing.
-                    Locks.acquireCatalogCommitLock(h, catalogId)
+                    Locks.acquireCatalogCommitLock(h, catalogId, "test-holder", CommitLockPath.COMMIT)
                     holding.countDown()
                     release.await(60, TimeUnit.SECONDS)
                     h.rollback()

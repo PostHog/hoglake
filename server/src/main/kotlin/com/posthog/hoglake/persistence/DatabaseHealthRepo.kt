@@ -214,6 +214,30 @@ object DatabaseHealthRepo {
         }.list()
 
     /**
+     * [commitLocks]' statement, shared with the metrics sampler's
+     * `hoglake_commit_lock_db_*` gauges (#439) and visible to the plan
+     * test that pins its cost (`CommitLockMetricsIntegrationTest`).
+     */
+    internal val COMMIT_LOCKS_SQL =
+        """
+        SELECT l.objid::bigint AS catalog_id,
+               c.name AS catalog,
+               l.pid,
+               l.granted,
+               extract(epoch FROM now() - a.xact_start) AS held_seconds,
+               (SELECT count(*) FROM pg_locks w
+                 WHERE w.locktype = 'advisory'
+                   AND w.classid = l.classid AND w.objid = l.objid
+                   AND NOT w.granted) AS waiters
+          FROM pg_locks l
+          LEFT JOIN pg_stat_activity a ON a.pid = l.pid
+          LEFT JOIN hog_catalog c ON c.catalog_id = l.objid::bigint
+         WHERE l.locktype = 'advisory'
+           AND l.classid = $CATALOG_COMMIT_LOCK_CLASS
+         ORDER BY l.granted DESC, held_seconds DESC NULLS LAST
+        """.trimIndent()
+
+    /**
      * Holders of and waiters for hoglake's per-catalog commit locks.
      *
      * Postgres splits the single-bigint advisory key into classid (the
@@ -223,25 +247,7 @@ object DatabaseHealthRepo {
      * beyond the one-row catalog lookup that gives it a name.
      */
     fun commitLocks(handle: Handle): List<CommitLockHolder> =
-        handle.createQuery(
-            """
-            SELECT l.objid::bigint AS catalog_id,
-                   c.name AS catalog,
-                   l.pid,
-                   l.granted,
-                   extract(epoch FROM now() - a.xact_start) AS held_seconds,
-                   (SELECT count(*) FROM pg_locks w
-                     WHERE w.locktype = 'advisory'
-                       AND w.classid = l.classid AND w.objid = l.objid
-                       AND NOT w.granted) AS waiters
-              FROM pg_locks l
-              LEFT JOIN pg_stat_activity a ON a.pid = l.pid
-              LEFT JOIN hog_catalog c ON c.catalog_id = l.objid::bigint
-             WHERE l.locktype = 'advisory'
-               AND l.classid = $CATALOG_COMMIT_LOCK_CLASS
-             ORDER BY l.granted DESC, held_seconds DESC NULLS LAST
-            """.trimIndent(),
-        ).map { rs, _ ->
+        handle.createQuery(COMMIT_LOCKS_SQL).map { rs, _ ->
             CommitLockHolder(
                 catalogId = rs.getLong("catalog_id"),
                 catalog = rs.getString("catalog"),

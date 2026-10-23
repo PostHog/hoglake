@@ -2,8 +2,8 @@ package com.posthog.hoglake.persistence
 
 import com.posthog.hoglake.RequestAdmission
 import com.posthog.hoglake.model.HoglakeException
-import com.posthog.hoglake.observability.Metrics
 import org.jdbi.v3.core.Handle
+import org.jdbi.v3.core.statement.Cleanable
 import org.jdbi.v3.core.statement.UnableToExecuteStatementException
 
 /**
@@ -109,10 +109,43 @@ object Locks {
      * serialization silently breaks (two writers would take DIFFERENT
      * locks for the same catalog and interleave the commit tail).
      *
-     * Observability + admission control (B2):
+     * Observability + admission control (B2, #439):
      *  - the wait is always recorded into the
      *    `hoglake_commit_lock_wait_seconds` histogram (commit path and
-     *    every DDL/maintenance tail alike);
+     *    every DDL/maintenance tail alike), and the session is counted
+     *    in `hoglake_commit_lock_waiting{catalog}` from before the lock
+     *    statement until it is granted or throws;
+     *  - from the grant to the END OF THE TRANSACTION, the hold is
+     *    counted in `hoglake_commit_lock_held{catalog}` and then recorded
+     *    into `hoglake_commit_lock_hold_seconds{catalog,path}`, [path]
+     *    saying which kind of work held it ([CommitLockPath]). [catalog]
+     *    is the catalog's NAME, the label every other per-catalog series
+     *    carries; each caller has it from the same row as [catalogId].
+     *
+     * WHY THE HOLD ENDS ON THE HANDLE'S HOOKS, NOT IN A WRAPPER OR A
+     * TOKEN. The lock is transaction-scoped, so its release is the
+     * transaction's COMMIT or ROLLBACK, and both alternatives put that
+     * moment in the callers' hands:
+     *  - a `withCatalogCommitLock(h, ...) { }` block running INSIDE the
+     *    caller's transaction returns before the COMMIT, so it measures
+     *    to the wrong point; one that OWNS the transaction would have to
+     *    restructure most of the fourteen call sites, which take the
+     *    lock mid-transaction after pre-lock reads (`CommitService`), or
+     *    re-entrantly inside another acquirer's transaction
+     *    (`TableCreationService.publish` -> `CatalogService.createTable`);
+     *  - a token returned here and settled in each caller's `finally`
+     *    is fourteen `finally`s placed OUTSIDE fourteen transactions,
+     *    and the fifteenth caller that forgets one is a held gauge
+     *    stuck at 1 that nothing reds.
+     * JDBI already knows when the transaction ends: [CommitLockObserver]
+     * settles the hold on the handle's `afterCommit` / `afterRollback`,
+     * with a close-time `Cleanable` as the backstop. The release is
+     * registered by the acquire itself, so there is no caller code to
+     * miss, and "every caller is covered" reduces to "every lock goes
+     * through this function", which the private [lockStatement] and
+     * `CommitLockCallSitesTest` pin.
+     *
+     * Admission control:
      *  - [lockTimeoutMs] > 0 sets a transaction-local `lock_timeout`
      *    (via set_config(..., is_local => true), so it dies with the
      *    transaction) BEFORE queuing; a timeout expiry surfaces as
@@ -142,6 +175,8 @@ object Locks {
     fun acquireCatalogCommitLock(
         handle: Handle,
         catalogId: Long,
+        catalog: String,
+        path: CommitLockPath,
         lockTimeoutMs: Long = 0,
     ) {
         val effectiveTimeoutMs = RequestAdmission.remainingLockTimeoutMs(lockTimeoutMs)
@@ -151,7 +186,23 @@ object Locks {
                 .mapToMap()
                 .one()
         }
-        val start = System.nanoTime()
+        CommitLockObserver.observe(catalogId, catalog, path, HandleEnd(handle)) {
+            lockStatement(handle, catalogId, lockTimeoutMs, effectiveTimeoutMs)
+        }
+    }
+
+    /**
+     * The one statement that takes the per-catalog commit lock. PRIVATE:
+     * reachable only through [acquireCatalogCommitLock], so no caller can
+     * take the lock outside the observer. `CommitLockCallSitesTest` pins
+     * that this SQL appears nowhere else in the main sources.
+     */
+    private fun lockStatement(
+        handle: Handle,
+        catalogId: Long,
+        lockTimeoutMs: Long,
+        effectiveTimeoutMs: Long,
+    ) {
         try {
             handle.createQuery(
                 "SELECT pg_advisory_xact_lock(($CATALOG_COMMIT_LOCK_CLASS::bigint << 32) | (?::bigint & 4294967295))",
@@ -168,8 +219,35 @@ object Locks {
                 )
             }
             throw e
-        } finally {
-            Metrics.commitLockWait(System.nanoTime() - start)
+        }
+    }
+
+    /**
+     * The handle's transaction end, for [CommitLockObserver]. Three
+     * routes, because the observer settles once and a hold that is never
+     * settled is a held gauge stuck at 1: JDBI's `afterCommit` and
+     * `afterRollback` (every `inTransaction`, and a hand-rolled
+     * `begin`/`commit`), and a `Cleanable` that runs when the handle
+     * closes — the backstop for a transaction that ended without either
+     * hook firing (a failed `COMMIT`, an aborted connection). A
+     * transaction rewound to a SAVEPOINT taken before the lock is not
+     * seen as an end; no caller does that today.
+     */
+    private class HandleEnd(private val handle: Handle) : CommitLockObserver.TransactionEnd {
+        override val owner: Any get() = handle
+        override val open: Boolean get() = handle.isInTransaction
+
+        override fun onEnd(settle: () -> Unit) {
+            val onClose = Cleanable { settle() }
+            val once = {
+                settle()
+                // A long-lived handle runs many transactions; without this
+                // its cleanable set would grow by one per lock taken.
+                handle.removeCleanable(onClose)
+            }
+            handle.afterCommit(once)
+            handle.afterRollback(once)
+            handle.addCleanable(onClose)
         }
     }
 
