@@ -1,10 +1,13 @@
 package com.posthog.hoglake.service
 
+import com.posthog.hoglake.testing.Measuring
 import com.posthog.hoglake.testing.PgTestSupport
 import org.assertj.core.api.Assertions.assertThat
+import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.kotlin.useHandleUnchecked
 import org.jdbi.v3.core.kotlin.withHandleUnchecked
 import org.junit.jupiter.api.AfterAll
+import org.junit.jupiter.api.Assumptions
 import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
@@ -28,11 +31,16 @@ import org.junit.jupiter.api.TestInstance
  * a different statement, and would make the batch default look safe at
  * a size that holds the commit lock for seconds.
  *
- * It ASSERTS almost nothing, deliberately: a wall-clock bound in a test
- * suite is a flake on a busy machine. What it asserts is the SHAPE the
- * design depends on — that the cost is LINEAR in the batch, so the
- * per-row cost is FLAT in it — and it prints the constants. That
- * flatness is load-bearing twice over: it is what makes
+ * The linearity case asserts no CONSTANT, and no wall clock outside a
+ * measuring host: a wall-clock bound in a test suite is a flake on a
+ * busy machine, and its 1.5x microsecond spread was (#407's restore PR,
+ * #443). What CI asserts is the SHAPE the design depends on — that the
+ * cost is LINEAR in the batch, so the per-row cost is FLAT in it — on
+ * the two measures that belong to the statement and the fixture rather
+ * than the machine: shared buffers per row and WAL bytes per row. The
+ * microseconds are printed everywhere and held to the same flatness
+ * only under `HOGLAKE_MEASURE=1` (see [Measuring]). That flatness is
+ * load-bearing twice over: it is what makes
  * HOGLAKE_RETIREMENT_BATCH a hold-length knob an operator can set, and
  * it is the whole argument for why the loop does NOT resize itself on a
  * timeout (#263 — a cancelled batch is cold, not big, and halving it
@@ -56,6 +64,9 @@ class RetirementCostIntegrationTest {
 
         /** The batch sizes measured, so linearity is observable. */
         val BATCHES = listOf(2_000, 4_000, 8_000)
+
+        /** Wall-clock assertions run on a measuring host only; see [Measuring]. */
+        val MEASURING: Boolean = Measuring.enabled
     }
 
     private val db = PgTestSupport.freshDatabase()
@@ -113,14 +124,55 @@ class RetirementCostIntegrationTest {
         }
     }
 
-    private data class Cost(val batch: Int, val millis: Long, val walBytes: Long)
+    private data class Cost(val batch: Int, val millis: Long, val walBytes: Long, val buffers: Long)
 
-    /** One batch, timed and WAL-measured, exactly as the service issues it. */
+    /**
+     * Shared buffers this backend has requested from every relation in
+     * the schema — heap and index, hit or read alike — as counted by
+     * `pg_stat_get_xact_blocks_fetched`.
+     *
+     * WHY THIS COUNTER, out of the three that could carry the figure:
+     *  - `pg_stat_statements` is not loaded: [PgTestSupport] starts the
+     *    stock image with no `shared_preload_libraries`.
+     *  - `EXPLAIN (ANALYZE, BUFFERS)` attributes buffers to PLAN NODES,
+     *    and the FK cascades — `hog_file_column_stats`,
+     *    `hog_file_partition_value`, `hog_delete_file` — run as RI
+     *    trigger queries after the plan finishes, under no node. It
+     *    would report the data-file DELETE and miss the cascade, which
+     *    is most of the batch and the part a rescan would live in.
+     *  - `pg_statio_user_tables` deltas see the cascade, but each backend
+     *    flushes into them on its own schedule (at most once a second,
+     *    and only when idle) and they sum EVERY backend, so a delta
+     *    around the batch is late and carries autovacuum.
+     *
+     * The xact form is the third one done exactly: it reads THIS
+     * backend's pending counters, which are bumped at every buffer
+     * request (a hit is a fetch that found the page) by any statement
+     * the backend runs, RI trigger queries included, and are not
+     * flushed inside a transaction block. A delta taken between BEGIN
+     * and COMMIT is therefore the batch and nothing else. FETCHED rather
+     * than read, because hit-versus-read is the cache — the machine —
+     * and the total is the statement and the fixture.
+     */
+    private fun buffersFetched(h: Handle): Long =
+        h.createQuery(
+            """
+            SELECT coalesce(sum(pg_stat_get_xact_blocks_fetched(c.oid)), 0)::bigint
+              FROM pg_class c
+             WHERE c.relnamespace = current_schema()::regnamespace AND c.relkind IN ('r', 'i')
+            """,
+        ).mapTo(Long::class.java).one()
+
+    /**
+     * One batch, timed, WAL-measured and buffer-counted, exactly as the
+     * service issues it.
+     */
     private fun oneBatch(n: Int): Cost =
         db.jdbi.withHandleUnchecked { h ->
             val before =
                 h.createQuery("SELECT pg_current_wal_insert_lsn()").mapTo(String::class.java).one()
             h.begin()
+            val buffersBefore = buffersFetched(h)
             val start = System.nanoTime()
             val victims =
                 h.createQuery(RetirementService.VICTIM_SELECT_SQL)
@@ -143,13 +195,17 @@ class RetirementCostIntegrationTest {
             // A measurement of a batch that deleted nothing would be the
             // flattest of all.
             check(deleted == n.toLong()) { "deleted $deleted of $n victims" }
+            // Read BEFORE the commit: the counters are this transaction's
+            // until then. The read is one catalog scan inside the timed
+            // span, and touches no schema relation.
+            val buffers = buffersFetched(h) - buffersBefore
             h.commit()
             val millis = (System.nanoTime() - start) / 1_000_000
             val wal =
                 h.createQuery(
                     "SELECT pg_wal_lsn_diff(pg_current_wal_insert_lsn(), CAST(:before AS pg_lsn))::bigint",
                 ).bind("before", before).mapTo(Long::class.java).one()
-            Cost(n, millis, wal)
+            Cost(n, millis, wal, buffers)
         }
 
     /**
@@ -249,16 +305,25 @@ class RetirementCostIntegrationTest {
             .isLessThan(maxOf(empty.millis * 4, 200L))
     }
 
-    @Test
-    fun `a batch's cost is linear in its size, and here is the per-row constant`() {
+    /**
+     * The warm-up and the three measured batches, run ONCE and shared by
+     * the linearity case (buffers and WAL, everywhere) and the
+     * wall-clock case (microseconds, on a measuring host). Lazy so that
+     * a CI run, which skips the wall-clock case before touching it,
+     * consumes the fixture's rows exactly once whichever case JUnit
+     * runs first.
+     */
+    private val measured: List<Cost> by lazy {
         // ONE DISCARDED WARM-UP BATCH, and it is the difference between
         // a test that measures the code and one that measures the first
         // batch's cache misses. The fixture is seeded, VACUUMed and
         // CHECKPOINTed and then never read, so the FIRST measured batch
         // pays every miss the later ones do not: observed 30.0, 19.8,
         // 19.0 us/row across 2,000/4,000/8,000 — monotonically
-        // DECREASING, a 1.58x spread, and the two-sided 1.5x bound
-        // below red about one run in seven. The cost being measured is
+        // DECREASING, a 1.58x spread, and the two-sided 1.5x wall-clock
+        // bound red about one run in seven. (Buffers and WAL
+        // do not see the miss — a read and a hit are both a fetch — so
+        // the warm-up is for the microseconds.) The cost being measured is
         // the per-row cascade, not the buffer cache, and the batch the
         // warm-up runs is `BATCHES.first()` so the smallest measured
         // batch is the one whose pages are already touched.
@@ -273,15 +338,26 @@ class RetirementCostIntegrationTest {
                 "[#193] retirement batch of ${c.batch} rows " +
                     "($STATS_PER_FILE stats + $PARTITION_VALUES_PER_FILE partition values each): " +
                     "${c.millis}ms hold (${"%.1f".format(c.millis * 1000.0 / c.batch)} us/row), " +
-                    "${c.walBytes} bytes of WAL (${c.walBytes / c.batch} B/row)",
+                    "${c.walBytes} bytes of WAL (${c.walBytes / c.batch} B/row), " +
+                    "${c.buffers} shared buffers (${"%.1f".format(c.buffers.toDouble() / c.batch)}/row)",
             )
         }
-        val perRowMicros = costs.map { it.millis * 1000.0 / it.batch }
+        costs
+    }
+
+    private fun perRowMicros(costs: List<Cost>): List<Double> = costs.map { it.millis * 1000.0 / it.batch }
+
+    @Test
+    fun `a batch's cost is linear in its size, and here is the per-row constant`() {
+        val costs = measured
+        val perRowMicros = perRowMicros(costs)
         val perRowWal = costs.map { it.walBytes.toDouble() / it.batch }
+        val perRowBuffers = costs.map { it.buffers.toDouble() / it.batch }
         println(
             "[#193] retirement per-row cost across batches ${BATCHES.joinToString()}: " +
                 perRowMicros.joinToString { "%.1f us".format(it) } + "; WAL " +
-                perRowWal.joinToString { "%.0f B".format(it) },
+                perRowWal.joinToString { "%.0f B".format(it) } + "; buffers " +
+                perRowBuffers.joinToString { "%.1f".format(it) },
         )
 
         // LINEARITY is what the design leans on: the batch size is a
@@ -294,19 +370,55 @@ class RetirementCostIntegrationTest {
         // batch would genuinely be the problem, and the knob would have
         // to come down.
         //
+        // WHAT CI ASSERTS IS FLATNESS IN THE TWO MEASURES THAT ARE THE
+        // STATEMENT'S, NOT THE MACHINE'S: shared buffers per row (every
+        // heap and index page request the batch makes, cascade included
+        // — see [buffersFetched]) and WAL bytes per row. Both are fixed
+        // by the plan and the fixture; neither moves with the
+        // scheduler, the cache or a noisy neighbour, so a bound on them
+        // fails only when the statement changed. The wall-clock spread
+        // is the same claim in microseconds, and it is asserted in its
+        // own case below, on a measuring host only (see [Measuring]): on
+        // a shared runner it is scheduler noise, and it flaked here.
+        //
         // THE BOUND IS TIGHTER THAN THE RANGE IT SPANS, which is the
         // only way it discriminates. The batch sizes span 4x, so a
         // tolerance of 4x would be satisfied by a cost that grows
         // exactly LINEARLY IN THE BATCH — i.e. quadratically in total,
         // the very shape being excluded. 1.5x across a 4x range is a
-        // real claim about flatness and still leaves room for a CI
-        // machine's scheduler, which is the noise this has to survive.
-        val spread = perRowMicros.max() / perRowMicros.min()
-        assertThat(spread)
+        // real claim about flatness, and it is the bound WAL carries.
+        //
+        // BUFFERS CARRY A MUCH TIGHTER ONE, because they are a count
+        // rather than a measurement: 100,850 / 201,631 / 403,231 at
+        // 2,000 / 4,000 / 8,000 (50.4 per row, a 1.0005x spread — the
+        // ~50-buffer remainder is the per-batch fixed cost), and it
+        // does not move between runs. 1.5x would miss the regression
+        // that actually threatens this loop, which is not a superlinear
+        // cascade but a PER-BATCH RESCAN: a fixed cost per batch makes
+        // the per-row figure FALL with the batch, so its spread is
+        // bounded by how big the rescan is against 50 buffers a row.
+        //
+        // MUTATION: `(data_file_id + 0) = ANY(:victims)` in
+        // DATA_DELETE_SQL (the victim column wrapped, so the pkey can
+        // no longer be probed per victim and the DELETE walks every row
+        // of the catalog instead) costs ~3,900 extra buffers a batch on
+        // this fixture: 52.4 / 51.4 / 50.9 per row, a 1.03x spread —
+        // green at 1.5, red here. The fixture, the WAL (2,966 / 2,968 /
+        // 2,965 B/row) and the row counts are unchanged by it; only the
+        // plan moved. On production's 13.9M-row tables the same mutation
+        // is a full rescan per 8,000-row batch.
+        val bufferSpread = perRowBuffers.max() / perRowBuffers.min()
+        assertThat(bufferSpread)
             .describedAs(
-                "per-row cost must be FLAT across a 4x range of batch sizes, not merely " +
-                    "sub-quadratic: %s us/row",
-                perRowMicros.joinToString { "%.1f".format(it) },
+                "shared buffers per row must be FLAT across a 4x range of batch sizes: %s",
+                perRowBuffers.joinToString { "%.1f".format(it) },
+            )
+            .isLessThan(1.01)
+        val walSpread = perRowWal.max() / perRowWal.min()
+        assertThat(walSpread)
+            .describedAs(
+                "WAL per row must be FLAT across a 4x range of batch sizes: %s B/row",
+                perRowWal.joinToString { "%.0f".format(it) },
             )
             .isLessThan(1.5)
         // WAL per row is the number an operator sizes max_wal_size and
@@ -368,5 +480,28 @@ class RetirementCostIntegrationTest {
         // warm-up batch, which consumes rows like any other.
         assertThat(remaining.first)
             .isLessThanOrEqualTo(FILES - BATCHES.sum().toLong() - BATCHES.first().toLong())
+    }
+
+    /**
+     * The linearity case's claim in MICROSECONDS, on a quiet host only
+     * (see [Measuring]): the figure HOGLAKE_RETIREMENT_BATCH is a hold
+     * length in, and the one the 19.5 us/row in the README and AGENT.md
+     * was read off. Same batches, same 1.5x across the 4x range, and the
+     * same reason the bound is tighter than the range. On a shared CI
+     * runner it is scheduler noise — it red #407's restore PR and #443
+     * while buffers and WAL per row did not move — so CI skips it and
+     * carries the shape on [buffersFetched] and WAL instead.
+     */
+    @Test
+    fun `on a measuring host, a batch's wall-clock cost per row is flat in its size`() {
+        Assumptions.assumeTrue(MEASURING, "set HOGLAKE_MEASURE=1 to apply the wall-clock spread")
+        val perRowMicros = perRowMicros(measured)
+        assertThat(perRowMicros.max() / perRowMicros.min())
+            .describedAs(
+                "per-row cost must be FLAT across a 4x range of batch sizes, not merely " +
+                    "sub-quadratic: %s us/row",
+                perRowMicros.joinToString { "%.1f".format(it) },
+            )
+            .isLessThan(1.5)
     }
 }
