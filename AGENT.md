@@ -1137,8 +1137,10 @@ ran on the local stack and what it showed.
     ~160 ms lock hold at the measured 19.6 us/row and 2,902 B of WAL per
     row — `RetirementCostIntegrationTest`, on a fixture with the
     production 9:1 stats ratio; the time moves with the machine and the
-    WAL does not, and what the test asserts is that both are FLAT in the
-    batch size), `HOGLAKE_RETIREMENT_PAUSE_MS` (**750**,
+    WAL does not, so what CI asserts is that shared buffers per row
+    (50.4) and WAL per row are FLAT in the batch size, and the
+    microseconds are held to the same flatness only under
+    `HOGLAKE_MEASURE=1`), `HOGLAKE_RETIREMENT_PAUSE_MS` (**750**,
     so an 18-25% duty cycle on the lock — a foreground commit's p99 tax
     is about one hold), `HOGLAKE_RETIREMENT_RUN_BUDGET_MS`
     (**60,000** of wall clock per run per catalog, so a 50M-row table
