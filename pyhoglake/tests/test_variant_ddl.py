@@ -972,9 +972,12 @@ def test_add_column_sends_the_declaration(httpx_mock):
         },
     }
     # Without one: no type_params, as before (bench's step_add_variant).
-    assert ops.add_column("raw", "variant", False).to_wire() == {
+    # Nullable, as every added column must be since #446 (no column
+    # defaults); the refusal of nullable=False has its own test in
+    # test_client.
+    assert ops.add_column("raw", "variant").to_wire() == {
         "op": "add_column",
-        "column": {"name": "raw", "type": "variant", "nullable": False},
+        "column": {"name": "raw", "type": "variant", "nullable": True},
     }
     # Through Table.alter, on the wire.
     httpx_mock.add_response(

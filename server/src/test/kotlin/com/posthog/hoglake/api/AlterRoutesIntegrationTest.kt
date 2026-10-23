@@ -103,6 +103,9 @@ class AlterRoutesIntegrationTest {
 
     // ---- happy path ------------------------------------------------------
 
+    // The added column is nullable: an add_column with nullable=false is
+    // refused since #446 (no column defaults), and this test is about the
+    // wire shape, not that rule, which has its own test below.
     @Test
     fun `alter happy path - add column and set spec, snake_case wire shape`() =
         api { client ->
@@ -113,7 +116,7 @@ class AlterRoutesIntegrationTest {
                     """
             {"ops": [
                 {"op": "add_column",
-                 "column": {"name": "team_id", "type": "int", "nullable": false}},
+                 "column": {"name": "team_id", "type": "int", "nullable": true}},
                 {"op": "set_partition_spec",
                  "fields": [
                     {"source_field_id": 2, "transform": "day"},
@@ -138,7 +141,7 @@ class AlterRoutesIntegrationTest {
             assertThat(cols.map { it["name"].asText() }).containsExactly("id", "ts", "team_id")
             val added = cols[2]
             assertThat(added["type"].asText()).isEqualTo("int")
-            assertThat(added["nullable"].asBoolean()).isFalse()
+            assertThat(added["nullable"].asBoolean()).isTrue()
             assertThat(added["field_id"].asLong()).isEqualTo(3)
             assertThat(added["ordinal"].asInt()).isEqualTo(2)
 
@@ -272,6 +275,61 @@ class AlterRoutesIntegrationTest {
                 HttpStatusCode.UnprocessableEntity,
                 "validation",
             )
+        }
+
+    @Test
+    fun `add_column of a required column is 422 validation naming the path`() =
+        api { client ->
+            val url = fixture()
+            // Top level, and the same rule one level down inside an
+            // optional struct: both are the "validation" error shape with
+            // the offending path in `detail`.
+            val top =
+                assertApiError(
+                    client.alterJson(
+                        url,
+                        """{"ops": [{"op": "add_column",
+                            "column": {"name": "team_id", "type": "int", "nullable": false}}]}""",
+                    ),
+                    HttpStatusCode.UnprocessableEntity,
+                    "validation",
+                )
+            assertThat(top["detail"].asText())
+                .contains("cannot add column 'team_id'")
+                .contains("hoglake has no column defaults")
+            val nested =
+                assertApiError(
+                    client.alterJson(
+                        url,
+                        """{"ops": [{"op": "add_column",
+                            "column": {"name": "prefs", "type": "struct", "children": [
+                                {"name": "theme", "type": "string", "nullable": false}]}}]}""",
+                    ),
+                    HttpStatusCode.UnprocessableEntity,
+                    "validation",
+                )
+            assertThat(nested["detail"].asText()).contains("'prefs.theme' inside it is declared required")
+            // Via `parent`: the struct goes in, the required field does
+            // not, and the detail carries the parent-qualified path.
+            assertThat(
+                client.alterJson(
+                    url,
+                    """{"ops": [{"op": "add_column",
+                        "column": {"name": "addr", "type": "struct", "children": [
+                            {"name": "zip", "type": "long"}]}}]}""",
+                ).status,
+            ).isEqualTo(HttpStatusCode.OK)
+            val viaParent =
+                assertApiError(
+                    client.alterJson(
+                        url,
+                        """{"ops": [{"op": "add_column", "parent": "addr",
+                            "column": {"name": "city", "type": "string", "nullable": false}}]}""",
+                    ),
+                    HttpStatusCode.UnprocessableEntity,
+                    "validation",
+                )
+            assertThat(viaParent["detail"].asText()).contains("cannot add column 'addr.city'")
         }
 
     @Test

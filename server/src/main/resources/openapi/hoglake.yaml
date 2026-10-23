@@ -568,8 +568,14 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
         "422":
-          description: Invalid op (unknown column, illegal promotion,
-            duplicate name, bad spec)
+          description: >
+            Invalid op (unknown column, illegal promotion, duplicate
+            name, bad spec), or an add_column whose column — or any
+            node nested inside it, a map's key excepted — has
+            `nullable: false`: hoglake has no column defaults, so files
+            written before the column read NULL for it. Refused on
+            every table, files or not; the detail names the offending
+            path.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
@@ -3398,7 +3404,20 @@ components:
             variant. A two-phase creation prepared before these checks
             existed is re-checked when it is published, and becomes
             `rejected` with reason `definition_invalid`.
-        nullable: { type: boolean, default: true }
+        nullable:
+          type: boolean
+          default: true
+          description: >
+            Whether the column admits NULL. `false` is accepted at
+            create_table (no file predates the column) and required on
+            a map's `key`. Under an add_column it is a 422 at every
+            node of the added subtree except a map's key: hoglake has
+            no column defaults (nothing like Iceberg v3's
+            initial-default), so every file written before the alter
+            reads NULL for the new column, and a schema calling it
+            required would misreport those files to readers that trust
+            the flag. Refused unconditionally, even on a table with no
+            files.
         children:
           type: array
           items: { $ref: "#/components/schemas/ColumnDef" }
@@ -3992,7 +4011,17 @@ components:
           enum: [add_column, drop_column, rename_column, promote_column,
                  rename_table, set_partition_spec, set_sort_order, add_column_with_metadata,
                  set_table_comment, set_column_comment, set_properties]
-        column: { $ref: "#/components/schemas/ColumnDef" }   # add_column
+        column:                       # add_column
+          allOf: [{ $ref: "#/components/schemas/ColumnDef" }]
+          description: >
+            The column to add, possibly nested (add_column and
+            add_column_with_metadata alike). Every node of it must
+            be nullable (a map's `key`, which the type model requires
+            non-null, excepted): hoglake has no column defaults, so
+            files written before the alter read NULL for the new
+            column, and a `nullable: false` anywhere in the subtree is
+            a 422 naming the path — on every table, files or not. See
+            ColumnDef.nullable.
         parent:                       # add_column, optional
           type: string
           description: >

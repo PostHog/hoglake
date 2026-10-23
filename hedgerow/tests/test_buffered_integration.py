@@ -56,7 +56,9 @@ def test_buffered_cli_restart_publishes_native_variant(live_server_url, tmp_path
                 + [pa.field("event_date", pa.date32(), nullable=False)]
             ),
         )
-        destination.alter([ops.add_column("properties", "variant", nullable=False)])
+        # Nullable: an added column cannot be required (hoglake #446, no
+        # column defaults). The source's non-null strings still land in it.
+        destination.alter([ops.add_column("properties", "variant")])
         ids = {c.name: c.field_id for c in destination.info().columns}
         destination.alter(
             [

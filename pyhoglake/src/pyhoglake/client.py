@@ -1707,6 +1707,13 @@ class Table:
         hydration, or ``missing_field_ids``) is
         :class:`IdlessFilesPresentError` instead — not a conflict, and
         not cleared by refreshing.
+
+        An ``add_column`` whose column (or any node nested inside it,
+        a map's key excepted) is ``nullable: false`` is a 422
+        :class:`ValidationError`, on every table: hoglake has no column
+        defaults, so files written before the alter read NULL for the
+        column. :func:`pyhoglake.ops.add_column` refuses it before the
+        round trip; a hand-built op meets the server's refusal.
         """
         body = self._namespace._catalog._client._request(
             "POST",
