@@ -218,7 +218,12 @@ loudly rather than reporting numbers it cannot stand behind.
 A feature-complete control plane, with a Python client, a replication daemon, a
 management console, a native Trino connector, a DuckDB extension and a
 benchmark harness. Everything is tested, and it is deployed as Gigahog in three
-environments — dev, prod-us and prod-eu. Authentication is still out of scope.
+environments — dev, prod-us and prod-eu. Authentication is opt-in: the server
+verifies ES256 bearer tokens and authorizes per catalog when
+`HOGLAKE_AUTH_MODE` is `warn` or `enforce`, and is unauthenticated at `off`,
+which is the default and today's behaviour. Token issuance and per-tenant S3
+credential vending are still to come — see
+[docs/auth-tenancy.md](docs/auth-tenancy.md).
 
 Known gaps are tracked as [issues](https://github.com/PostHog/hoglake/issues).
 The larger ones: [#240](https://github.com/PostHog/hoglake/issues/240) (every
@@ -267,6 +272,7 @@ implementations together.
 | Doc | What |
 |---|---|
 | [docs/iceberg-federation.md](docs/iceberg-federation.md) | What the Iceberg REST facade requires of v1: field ids, type mapping, transforms, delete encoding, bounds |
+| [docs/auth-tenancy.md](docs/auth-tenancy.md) | Auth, tenancy and S3 data-plane entitlement: the threat model, per-catalog scopes, STS credential vending, and the phased plan |
 | [docs/trino-integration.md](docs/trino-integration.md) | The native connector, and the commit shapes that keep Trino writes a translation away |
 | [docs/operational-notes.md](docs/operational-notes.md) | What hoglake changes operationally and what it does not; sizing, and the ceilings to watch |
 | [docs/fuzzing.md](docs/fuzzing.md) | Property testing and fuzzing: hypothesis, kotest-property, cross-language codec vectors |

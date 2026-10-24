@@ -1,5 +1,6 @@
 package com.posthog.hoglake.api
 
+import com.posthog.hoglake.auth.actorOrRefuse
 import com.posthog.hoglake.service.ViewService
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.Application
@@ -35,7 +36,7 @@ fun Application.installViewRoutes(views: ViewService) {
                         req.name,
                         req.sql,
                         req.dialect,
-                        req.author,
+                        call.actorOrRefuse(req.author),
                         req.message,
                     ).toDto(),
                 )
@@ -52,7 +53,7 @@ fun Application.installViewRoutes(views: ViewService) {
                             call.catalog(),
                             call.namespace(),
                             call.view(),
-                            call.request.queryParameters["author"],
+                            call.actorOrRefuse(call.request.queryParameters["author"]),
                             call.request.queryParameters["message"],
                         ).toDto(),
                     )

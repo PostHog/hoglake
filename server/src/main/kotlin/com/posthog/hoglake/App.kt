@@ -14,6 +14,7 @@ import com.posthog.hoglake.api.installScanRoutes
 import com.posthog.hoglake.api.installTableCreationRoutes
 import com.posthog.hoglake.api.installUploadRoutes
 import com.posthog.hoglake.api.installViewRoutes
+import com.posthog.hoglake.auth.installAuth
 import com.posthog.hoglake.commit.CommitService
 import com.posthog.hoglake.compaction.CompactionConfig
 import com.posthog.hoglake.compaction.CompactionService
@@ -290,7 +291,22 @@ class App private constructor(
     }
 
     fun module(app: Application) {
-        // FIRST, and once: every handler installed below this line runs
+        // ABSOLUTELY FIRST: authenticate and authorize before anything
+        // else in the pipeline, so a refused request never reaches the
+        // blocking dispatcher, never borrows a connection, and never runs
+        // a handler that could have been written without a check. The
+        // routes below are installed by a dozen `install*Routes`
+        // functions; the plugin's rule table (auth/AuthPolicy.kt) is what
+        // makes "every route has a policy" a property of the build rather
+        // than a property of the reviewer.
+        //
+        // Inert unless HOGLAKE_AUTH_MODE says otherwise: `off` is the
+        // default and resolves no callers, which is precisely today's
+        // behaviour. A mis-set `enforce` (no issuer, no key source) fails
+        // here, at boot, naming the variable — not with a fleet-wide 401.
+        app.installAuth(com.posthog.hoglake.auth.AuthService.fromConfig(cfg))
+
+        // Then, and once: every handler installed below this line runs
         // its blocking database/object-store work on requestDispatcher
         // rather than on the Netty event loop. The probe paths are
         // bypassed, the queue wait is stamped and measured, and a
@@ -317,8 +333,14 @@ class App private constructor(
         }
         app.install(StatusPages) { installErrorMapping() }
         app.routing {
-            // Prometheus scrape endpoint — unauthenticated like /healthz,
-            // and excluded from the http request metrics + audit log.
+            // Prometheus scrape endpoint, excluded from the http request
+            // metrics + audit log. GATED by auth/AuthPolicy.kt as
+            // operator-only: the exposition carries per-catalog labels,
+            // i.e. the tenant roster, so it is not a public surface.
+            // docs/auth-tenancy.md §6.7 moves it to a second
+            // cluster-internal listener, which is the right home; until
+            // that lands, flipping HOGLAKE_AUTH_MODE=enforce in a cluster
+            // requires the scrape job to hold an operator token.
             get("/metrics") {
                 call.respondText(
                     this@App.meterRegistry.scrape(),
