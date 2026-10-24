@@ -1,10 +1,12 @@
 """Scenario: pipelined commits — the stage-A/stage-B split.
 
-One logical producer builds commit payloads in order (the validate +
-allocate stage of a pipelined hoglake server). A bounded number of
-commits stay in flight to the server at once (the durability stage).
-That is the ONLY difference from commit-throughput's strictly sequential
-loop — and exactly the queue shape of the proposed pipelined committer.
+One logical producer builds commit payloads in order in the producer
+thread (the validate + allocate stage of a pipelined hoglake server). A
+bounded number of commits stay in flight to the server at once (the
+durability stage). That is the ONLY difference from commit-throughput's
+strictly sequential loop — and exactly the queue shape of the proposed
+pipelined committer. Payload construction is deliberately serial; only
+the durability wait overlaps.
 
 Every commit is still acknowledged by the server only when durable. The
 producer never learns a snapshot id before the server durably committed
@@ -44,8 +46,9 @@ def _stage(report, catalog, table, depth, ops, fpc, guard):
     sem = threading.Semaphore(depth)
     errors = [0]
 
-    def submit(i: int) -> None:
-        payload = append_payload(catalog, table, fpc, RECORD_COUNT)
+    def submit(i: int, payload) -> None:
+        # payload is prepared by the PRODUCER thread (the serial stage-A
+        # stand-in); workers only await durability (stage B)
         t0 = time.perf_counter_ns()
         try:
             r = catalog._commit(payload)
@@ -63,8 +66,9 @@ def _stage(report, catalog, table, depth, ops, fpc, guard):
     start = time.perf_counter()
     with ThreadPoolExecutor(max_workers=depth) as pool:
         for i in range(ops):
+            payload = append_payload(catalog, table, fpc, RECORD_COUNT)
             sem.acquire()
-            pool.submit(submit, i)
+            pool.submit(submit, i, payload)
         pool.shutdown(wait=True)
     wall = time.perf_counter() - start
 
