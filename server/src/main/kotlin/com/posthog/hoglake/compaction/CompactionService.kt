@@ -5313,7 +5313,13 @@ class CompactionService(
      * (Expiry pattern).
      */
     fun runOnceAllCatalogs(cfg: CompactionConfig = defaults): List<Pair<String, CompactionResult>> {
-        val names = jdbi.withHandleUnchecked { h -> CatalogRepo.listAll(h) }.map { it.name }
+        // Shuffled per sweep (#455): in list order every replica ran the
+        // same first catalog to completion before the next, so a catalog
+        // with long runs took the fleet's time and the rest got the
+        // remainder (prod-us: millpond ~32 min a run, millrace ~3.6 min,
+        // millrace got ~10% of each pod's cycle). Every catalog still runs
+        // once per sweep.
+        val names = jdbi.withHandleUnchecked { h -> CatalogRepo.listAll(h) }.map { it.name }.shuffled()
         val results = mutableListOf<Pair<String, CompactionResult>>()
         for (name in names) {
             try {

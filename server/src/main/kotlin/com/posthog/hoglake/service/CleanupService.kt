@@ -1759,7 +1759,8 @@ class CleanupService(
      * failure is logged and the rest proceed.
      */
     fun runOnceAllCatalogs(batchSize: Int): List<Pair<String, CleanupResult>> {
-        val names = jdbi.withHandleUnchecked { h -> CatalogRepo.listAll(h) }.map { it.name }
+        // Shuffled per sweep (#455): no catalog is always first.
+        val names = jdbi.withHandleUnchecked { h -> CatalogRepo.listAll(h) }.map { it.name }.shuffled()
         // ONE receipt-purge budget for the whole sweep, computed here and
         // shared by every catalog's drain. Inside `doRunOnce` the purge is
         // necessarily PER CATALOG — V24's index leads on `catalog_id` and
