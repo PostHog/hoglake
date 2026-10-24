@@ -11,7 +11,6 @@ import contextlib
 import importlib.metadata
 import io
 import logging
-import struct
 import time
 import uuid as _uuid
 from collections.abc import Iterator, Mapping, Sequence
@@ -78,7 +77,11 @@ from .ops import (
     set_partition_spec,
     set_sort_order,
 )
-from .parquet_schema import prepared_schema_matches, validate_variant_file
+from .parquet_schema import (
+    _footer_size,
+    prepared_schema_matches,
+    validate_variant_file,
+)
 from .stats import extract_column_stats
 from .transforms import partition_source_array, transform_strings
 from .types import (
@@ -2713,7 +2716,8 @@ def _encode_group(
         metadata = parquet.metadata
     # Only the 8-byte trailer is copied out of the buffer, so the one
     # definition of the footer_size wire convention keeps its bytes
-    # signature and stays shared with the file path.
+    # signature and stays shared with the file path and the VARIANT writer;
+    # it lives in parquet_schema (_footer_size).
     return _PreparedPart(
         metadata=metadata,
         size=raw.size,
@@ -2842,21 +2846,6 @@ def _partition_groups(
             mask = field_mask if mask is None else pc.and_(mask, field_mask)
         out.append((values, data.filter(mask)))
     return out
-
-
-def _footer_size(raw: bytes) -> int:
-    """Thrift footer-metadata length for the commit's ``footer_size``.
-
-    Wire convention (bugs.md #7): ``footer_size`` is EXACTLY the 4-byte
-    LE length stored in the parquet trailer — the serialized thrift
-    FileMetaData size, EXCLUDING the trailing 8-byte suffix (4-byte
-    length + ``PAR1`` magic). The server's hydrator tail-reads
-    ``[file_size - footer_size - 8, file_size)`` and compaction stores
-    the same value for its own outputs; shipping ``meta_len + 8`` here
-    (the old behavior) made every client-written file 8 bytes off.
-    """
-    (meta_len,) = struct.unpack("<I", raw[-8:-4])
-    return meta_len
 
 
 def _upload(fs, uri: str, raw: bytes) -> None:

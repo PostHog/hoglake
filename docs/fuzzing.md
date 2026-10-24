@@ -32,6 +32,11 @@ four are generator-friendly.
   an invalid row becomes SQL NULL and nothing else moves, aware
   datetimes round-trip or are refused, and mutated Variant bytes are
   read or refused with `VariantEncodingError`, never another exception.
+  The VARIANT writer's round trip reuses those declarations and values
+  (`tests/test_variant_footer.py::test_written_files_are_the_oracles_stamp_and_read_back_as_written`):
+  the stamped file equals the generic Thrift codec's re-encoding of
+  pyarrow's footer with the same annotations added (`tests/footer_oracle.py`),
+  passes the exact layout check, and reads back as the source rows.
 - **server** (planned, kotest-property or jqwik): the same codec
   properties on `IcebergSingleValue`, expiry `newEarliest` math under
   generated snapshot/offset/time configurations (invariants: never >

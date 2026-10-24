@@ -66,6 +66,75 @@ jobs:
       - name: Tests
         run: uv run pytest -m "not integration" -q
 
+  # The VARIANT suites on the pyarrow pyhoglake's floor claims, and on the
+  # newest release; the Test job above runs everything on the lock. The
+  # footer splice and the layout check rest on what pyarrow writes into a
+  # footer (which fields, in what order) and on how it reads a stamped file
+  # back, and the lock alone pins neither for an install that resolves
+  # another version. "floor" is read from pyproject.toml when the job runs,
+  # so a floor Dependabot raises with the lock needs no edit here;
+  # tests/test_pyarrow_floor.py holds the floor to what the writer needs
+  # and this list to these two entries. While Dependabot raises the floor
+  # with the lock, as it does now, this leg repeats the Test job's variant
+  # run: it adds coverage only once the two diverge (a lowered floor, or a
+  # lock bump the floor does not follow). The writer's measured minimum
+  # (23) is not run: the declared floor is above it, so no install resolves it.
+  #
+  # "latest" is a canary, not a gate: it resolves whatever pyarrow is newest
+  # when it runs, so a release would otherwise turn python-checks (and the
+  # pyhoglake publish, which runs these checks) red on a change that did
+  # nothing. It still reports its failure on the run. It installs the
+  # newest pyarrow at least 7 days old, not the newest: it runs a release's
+  # native code, in the publish run too, so it keeps dependabot.yml's
+  # cooldown, and a malicious or broken release ages out before it runs
+  # here. Its canaries (test_variant_footer.py) are what say pyarrow has
+  # started writing VARIANT itself, or reading it as an extension type.
+  pyarrow:
+    name: Variant suites (pyarrow ${{ matrix.pyarrow }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: ${{ matrix.pyarrow == 'latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        pyarrow: ["floor", "latest"]
+    defaults:
+      run:
+        working-directory: pyhoglake
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+
+      - run: uv sync --locked
+
+      # Over the locked environment, so everything else stays as tested;
+      # `uv run --no-sync` below keeps uv from putting the lock back.
+      - name: Install pyarrow ${{ matrix.pyarrow }}
+        env:
+          PYARROW: ${{ matrix.pyarrow }}
+        run: |
+          if [ "$PYARROW" = latest ]; then
+            uv pip install --upgrade \
+              --exclude-newer "$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ)" pyarrow
+          else
+            floor=$(uv run --no-sync python -c 'import tomllib; (d,) = [d for d in tomllib.load(open("pyproject.toml", "rb"))["project"]["dependencies"] if d.startswith("pyarrow")]; print(d.removeprefix("pyarrow>="))')
+            uv pip install "pyarrow==$floor"
+            echo "PYARROW_FLOOR=$floor" >> "$GITHUB_ENV"
+          fi
+
+      - name: Report the pyarrow under test
+        run: |
+          uv run --no-sync python -c "import pyarrow; print('pyarrow', pyarrow.__version__)"
+          if [ -n "${PYARROW_FLOOR:-}" ]; then
+            uv run --no-sync python -c "import sys, pyarrow; from packaging.version import Version; sys.exit(Version(pyarrow.__version__) != Version(sys.argv[1]))" "$PYARROW_FLOOR"
+          fi
+
+      - name: Variant suites
+        run: uv run --no-sync pytest -m "not integration" -q -k variant
+
   build:
     name: Build sdist and wheel
     runs-on: ubuntu-latest
