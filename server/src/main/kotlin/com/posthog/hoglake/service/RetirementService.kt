@@ -939,7 +939,8 @@ class RetirementService(
      * proceed.
      */
     fun runOnceAllCatalogs(): List<Pair<String, RetirementResult>> {
-        val names = jdbi.withHandleUnchecked { h -> CatalogRepo.listAll(h) }.map { it.name }
+        // Shuffled per sweep (#455): no catalog is always first.
+        val names = jdbi.withHandleUnchecked { h -> CatalogRepo.listAll(h) }.map { it.name }.shuffled()
         // THE ONE CALLER THAT KNOWS THE WHOLE SET, which is what
         // retiring a DELETED catalog's timeout series needs: a
         // per-catalog run can only prune tables, never the catalog

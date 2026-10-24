@@ -1929,7 +1929,8 @@ class ExpiryService(
      */
     fun runOnceAllCatalogs(batchSize: Int): List<Pair<String, ExpiryResult>> {
         val catalogs = jdbi.withHandleUnchecked { h -> CatalogRepo.listAll(h) }
-        val names = catalogs.map { it.name }
+        // Shuffled per sweep (#455): no catalog is always first.
+        val names = catalogs.map { it.name }.shuffled()
         val results = mutableListOf<Pair<String, ExpiryResult>>()
         for (name in names) {
             try {
