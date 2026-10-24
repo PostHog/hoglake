@@ -1738,8 +1738,8 @@ class CompactionParallelIntegrationTest {
         val inRewrite = java.util.concurrent.CountDownLatch(1)
         val release = java.util.concurrent.CountDownLatch(1)
         val blocking = BlockingStore(inRewrite, release)
-        // Both catalogs, in name order, from ONE service — the shape the
-        // background loop runs.
+        // Both catalogs (in a per-sweep shuffled order, #455) from ONE
+        // service — the shape the background loop runs.
         val cfg = policy(a).copy(inputOpenParallelism = 1)
         val svc = CompactionService(db.jdbi, blocking, cfg)
         val outcome = java.util.concurrent.atomic.AtomicReference<Throwable?>()

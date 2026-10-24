@@ -1759,7 +1759,8 @@ class CleanupService(
      * failure is logged and the rest proceed.
      */
     fun runOnceAllCatalogs(batchSize: Int): List<Pair<String, CleanupResult>> {
-        val names = jdbi.withHandleUnchecked { h -> CatalogRepo.listAll(h) }.map { it.name }
+        // Shuffled per sweep (#455): no catalog is always first.
+        val names = jdbi.withHandleUnchecked { h -> CatalogRepo.listAll(h) }.map { it.name }.shuffled()
         // ONE receipt-purge budget for the whole sweep, computed here and
         // shared by every catalog's drain. Inside `doRunOnce` the purge is
         // necessarily PER CATALOG — V24's index leads on `catalog_id` and
@@ -1767,10 +1768,11 @@ class CleanupService(
         // must not be, or a sweep's receipt-purge cost is
         // `N x receiptPurgeBudgetMs` and grows with the catalog count
         // while nothing in the loop bounds it. The first catalogs in the
-        // list can therefore spend the whole budget; that is the intended
-        // behaviour and it self-corrects, because a catalog whose
-        // receipts went unpurged this sweep is first in line next sweep
-        // once the earlier ones have nothing eligible left.
+        // sweep can therefore spend the whole budget; that is the intended
+        // behaviour, and because the order is shuffled per sweep (#455)
+        // the budget lands on a different prefix each time, so a catalog
+        // whose receipts went unpurged this sweep gets its turn at the
+        // front soon enough.
         val receiptDeadline = receiptPurgeDeadline()
         val results = mutableListOf<Pair<String, CleanupResult>>()
         for (name in names) {

@@ -787,6 +787,25 @@ class ExpiryServiceIntegrationTest {
     }
 
     @Test
+    fun `runOnceAllCatalogs visits every catalog once per sweep, in an order that varies between sweeps`() {
+        // #455: in list order every replica ran the same first catalog to
+        // completion before the next. Each sweep now shuffles; every
+        // catalog still runs exactly once. 30 sweeps of three catalogs
+        // all landing in one order has probability 6^-29, so a repeat
+        // here is a bug, not bad luck.
+        val names = listOf("exp-order-a", "exp-order-b", "exp-order-c")
+        names.forEach { seedCatalog(it, head = 2, retentionSeconds = null) }
+
+        val orders =
+            (1..30).map { _ ->
+                val visited = svc.runOnceAllCatalogs(batchSize = 100).map { it.first }.filter { it in names }
+                assertThat(visited).containsExactlyInAnyOrderElementsOf(names)
+                visited
+            }
+        assertThat(orders.toSet().size).isGreaterThan(1)
+    }
+
+    @Test
     fun `background loop expires and a non-positive interval is a no-op`() {
         com.posthog.hoglake.BackgroundLoops().use { it.register("expiry", 0) { svc.runOnceAllCatalogs(100) } }
         com.posthog.hoglake.BackgroundLoops().use { it.register("expiry", -1) { svc.runOnceAllCatalogs(100) } }
