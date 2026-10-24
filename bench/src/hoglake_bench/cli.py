@@ -37,6 +37,7 @@ from .scenarios import (
     commit_throughput,
     ddl_churn,
     delete_contention,
+    commit_pipelined,
     end_to_end,
     expiry_throughput,
     lifecycle,
@@ -46,6 +47,7 @@ from .scenarios.common import ScenarioReport
 SCENARIOS: dict[str, Any] = {
     "commit-throughput": commit_throughput,
     "commit-contention": commit_contention,
+    "commit-pipelined": commit_pipelined,
     "delete-contention": delete_contention,
     "changefeed-scan": changefeed_scan,
     "expiry-throughput": expiry_throughput,
@@ -64,6 +66,7 @@ QUICK_PROFILE: dict[str, dict[str, Any]] = {
         "tables": 150,
     },
     "commit-contention": {"writers": [1, 4, 8], "ops": 25},
+    "commit-pipelined": {"depths": [1, 16, 64], "ops": 100},
     "delete-contention": {
         "writers": 4,
         "files_per_writer": 3,
