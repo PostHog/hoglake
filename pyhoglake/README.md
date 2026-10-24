@@ -180,9 +180,9 @@ server-side compaction writes on every file it rewrites, and the form an
 Iceberg-conformant reader needs to see a UUID rather than opaque bytes.
 pyarrow stamps that annotation only for its canonical uuid extension
 type, so `coltype_to_arrow("uuid")` returns `pa.uuid()` and every file
-this client writes is annotated. It needs **pyarrow >= 21** (the package
-floor): `pa.uuid()` exists from 18, but 18 through 20 write the bytes
-with no annotation.
+this client writes is annotated. It needs **pyarrow >= 21**, below the
+package floor: `pa.uuid()` exists from 18, but 18 through 20 write the
+bytes with no annotation.
 
 Both spellings are accepted everywhere on the way in:
 
@@ -441,6 +441,58 @@ PostHog-like `properties` (about 1 KB and 26 keys a row) with a 12-field
 declaration, `encode_json` costs about 16 µs of CPU a row on CPython
 3.12 and an Apple M4 Pro (`bench/variant_bench.py`, which is not part of
 CI).
+
+### variant columns: the footer stamp
+
+`pyhoglake.parquet_schema.write_variant_parquet` writes a table whose
+variant columns are in their plans' write form as the Parquet file of
+their declarations. It is internal, not part of the public API, and **not
+wired into the write paths yet** (that is the next step): nothing in
+`Table.append` or `prepare_append_tables` calls it. It takes the codec
+options of `parquet_write_options(compression, compression_level)`, as
+the other write paths do, and refuses SQL NULL rows in a NOT NULL
+column, which pyarrow would write into the REQUIRED group as an invalid
+variant.
+
+pyarrow cannot write the file the Trino connector reads: it writes a
+VARIANT group as the plain struct it is stored as, and a decimal4/decimal8
+leaf, viewed as its unscaled int32/int64, as a plain INT32/INT64. So the
+writer views those leaves as integers (zero-copy), writes with
+`store_schema=False` (a stored Arrow schema would describe the plain
+struct, and pyarrow would read that back), and splices the annotations
+into the footer (`stamp_variant_footer`): 7 bytes of VARIANT(1) on each
+top-level variant group, 14 bytes of DECIMAL(p, s), converted and
+logical, on each decimal4/decimal8 leaf, each inserted before the
+element's STOP byte. The body is untouched, so every offset into it
+stays valid; the size of the patch is asserted, and `size` and
+`footer_size` are measured on the patched file. Each precondition refuses
+loudly: an encrypted (`PARE`) footer, a path not in the footer exactly
+once, a group already annotated or whose field id is not the column's, a
+leaf of another physical type or already carrying part of a DECIMAL, a
+field after the one the splice follows. A pyarrow that starts writing
+VARIANT itself stops the writes rather than gets a second annotation.
+
+Each variant column's subtree is then held to its declaration, element
+for element (`variant_layout_fault`): names, order, repetition, child
+counts, physical type and length, logical type with its flags, scale and
+precision, the field id on the group and nowhere below it, VARIANT(1) on
+the group. A converted type, the legacy spelling of the logical type
+beside it, may be left out by a writer, but not spelt otherwise. The
+check reads the elements the splice already parsed, and the file is not
+opened again: the FileMetaData returned for the stats is the one pyarrow
+collected as it wrote. A failure is pyhoglake's (or a pyarrow it does not
+know), raised as `ValidationError` before anything is uploaded. This is
+for pyhoglake's own files; it says nothing of another writer's.
+
+pyarrow 23 is the lowest the writer works on: 21 cannot open a file with
+a VARIANT group at all, and 21 and 22 cannot read the statistics of an
+INT32/INT64 DECIMAL column, which is how a decimal4/decimal8 leaf is
+written (the package floor is higher, and `tests/test_pyarrow_floor.py`
+refuses one below 23). CI runs the variant suites on the declared floor
+(the same pyarrow as the lock while Dependabot raises the two together),
+and on the newest pyarrow as a canary that does not gate: if pyarrow
+starts writing VARIANT itself, or reads it back as an extension type
+rather than the plain struct, `test_variant_footer.py`'s canaries fail.
 
 ### Identifiers and reserved names
 
