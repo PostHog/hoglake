@@ -193,9 +193,10 @@ Both spellings are accepted everywhere on the way in:
   annotated **or** bare. A hoglake table holds both: compaction outputs
   have always been annotated, while files this client registered before
   the contract — and any writer below the pyarrow floor, or one that
-  simply does not annotate — carry the bare form. Nothing else about the
-  schema check is loosened, so a file with the right type and the wrong
-  `PARQUET:field_id` is refused exactly as before.
+  simply does not annotate — carry the bare form. Beyond this and a
+  map's synthetic names (see "Prepared appends" below), nothing about
+  the schema check is loosened, so a file with the right type and the
+  wrong `PARQUET:field_id` is refused exactly as before.
 - Reading, `arrow_type_to_coltype` maps both to `uuid`, and footer
   bounds are read from either (the bytes are unsigned-lexicographic in
   both).
@@ -603,6 +604,20 @@ produces the same registrations `prepare_append_files` produces for the
 same rows. Use `prepare_append_files` for files another writer produced
 (native VARIANT, `allow_optional_fields`); Arrow tables are refused for
 a VARIANT destination, because an Arrow rewrite loses the annotation.
+
+Both entry points check each file's schema against the catalog's
+(a VARIANT destination and `allow_optional_fields` validate their own
+way): names, nullability, types and `PARQUET:field_id`, at every depth.
+Two differences are allowed. One is a uuid column's two spellings (above).
+The other is a map's synthetic names: pyarrow reads the entries struct
+back named after the map's own field (the column, for a top-level map),
+and other writers rename the key and value too. The server binds a map's
+key and value by field id, not by name. A map whose key or value has a
+different field id, nullability or type is still refused. The footer's
+key-value metadata is compared too, both the schema's own and any a
+field carries beyond `PARQUET:field_id`. The catalog's schema has none,
+so a file whose writer stamps its own (pandas, Spark, parquet-mr) is
+refused.
 
 | | |
 |---|---|

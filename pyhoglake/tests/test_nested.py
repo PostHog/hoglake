@@ -972,6 +972,195 @@ def test_deeper_than_the_catalog_cap_is_not_normalized():
     assert "extension" in str(uuid_storage_form(over_cap))
 
 
+# -- map entry names (hoglake#359) --------------------------------------------
+#
+# pyarrow reads a map's entries struct back named after the map's own
+# field (`map<string, int64 ('c')>` for a column `c`), while the catalog
+# schema carries arrow's default, so the prepared-file check refused
+# every map-bearing file, including the ones prepare_append_tables had
+# just encoded. The "found" side here is therefore a real footer round
+# trip, never hand-renamed.
+
+
+def _map(name, field_id, value, ordinal=0, *, key_id=None, key_kind="string"):
+    key = _col("key", key_kind, key_id or field_id + 1, 0, nullable=False)
+    return _col(name, "map", field_id, ordinal, children=(key, value))
+
+
+def _deepest_legal_map():
+    # A map whose key and value sit AT the cap, under a chain of lists
+    # numbered by depth.
+    depth = MAX_COLUMN_NESTING_DEPTH - 1
+    inner = _map("element", depth, _col("value", "long", depth + 2, 1))
+    for field_id in range(depth - 1, 0, -1):
+        name = "c" if field_id == 1 else "element"
+        inner = _col(name, "list", field_id, children=(inner,))
+    return inner
+
+
+def _map_of_map(*, key_id=4, key_kind="string", value_id=5, nullable=True, kind="long"):
+    """The defects below land on the INNER map's key and value."""
+    leaf = _col("value", kind, value_id, 1, nullable=nullable)
+    inner = _map("value", 3, leaf, 1, key_id=key_id, key_kind=key_kind)
+    return _map("c", 1, inner)
+
+
+MAP_SHAPES = {
+    "top-level": lambda: _map("c", 1, _col("value", "long", 3, 1)),
+    "in-struct": lambda: _col(
+        "c", "struct", 1, children=(_map("m", 2, _col("value", "long", 4, 1)),)
+    ),
+    "list-of-maps": lambda: _col(
+        "c", "list", 1, children=(_map("element", 2, _col("value", "long", 4, 1)),)
+    ),
+    "map-of-map": _map_of_map,
+    "map-of-list": lambda: _map(
+        "c",
+        1,
+        _col("value", "list", 3, 1, children=(_col("element", "long", 4),)),
+    ),
+    "deepest-legal": _deepest_legal_map,
+    # Container keys are legal (see above), so a map can sit under a KEY.
+    "map-in-key": lambda: _col(
+        "c",
+        "map",
+        1,
+        children=(
+            _col(
+                "key",
+                "struct",
+                2,
+                nullable=False,
+                children=(_map("m", 3, _col("value", "long", 5, 1)),),
+            ),
+            _col("value", "long", 6, 1),
+        ),
+    ),
+}
+
+
+def _read_back(schema: pa.Schema) -> pa.Schema:
+    sink = pa.BufferOutputStream()
+    pq.write_table(schema.empty_table(), sink)
+    return pq.ParquetFile(pa.BufferReader(sink.getvalue())).schema_arrow
+
+
+@pytest.mark.parametrize("shape", MAP_SHAPES)
+def test_a_map_read_back_from_its_footer_matches_at_any_depth(shape):
+    from pyhoglake.parquet_schema import prepared_schema_matches
+
+    want = columns_to_arrow_schema([MAP_SHAPES[shape]()])
+    found = _read_back(want)
+    assert not found.equals(want, check_metadata=True), "the names must really differ"
+    assert prepared_schema_matches(found, want)
+    assert prepared_schema_matches(want, found)
+
+
+def test_a_writer_that_renames_key_and_value_still_matches():
+    from pyhoglake.parquet_schema import prepared_schema_matches
+
+    renamed = pa.map_(
+        pa.field(
+            "k", pa.string(), nullable=False, metadata={PARQUET_FIELD_ID_KEY: b"2"}
+        ),
+        pa.field("v", pa.int64(), metadata={PARQUET_FIELD_ID_KEY: b"3"}),
+    )
+    want = columns_to_arrow_schema([MAP_SHAPES["top-level"]()])
+    assert prepared_schema_matches(_wrap(renamed), want)
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        {"key_id": 9},
+        {"key_kind": "long"},
+        {"value_id": 9},
+        {"nullable": False},
+        {"kind": "int"},
+    ],
+    ids=[
+        "key-field-id",
+        "key-type",
+        "value-field-id",
+        "value-nullability",
+        "value-type",
+    ],
+)
+def test_a_map_differing_in_anything_but_its_names_is_refused(defect):
+    """The licence is the NAMES. The inner map's key and value are still
+    bound by field id, nullability and type."""
+    from pyhoglake.parquet_schema import prepared_schema_matches
+
+    want = columns_to_arrow_schema([_map_of_map()])
+    found = _read_back(columns_to_arrow_schema([_map_of_map(**defect)]))
+    assert not prepared_schema_matches(found, want)
+
+
+def _struct_in_map(name="a", nullable=True):
+    child = _col(name, "long", 4, nullable=nullable)
+    return _map("c", 1, _col("value", "struct", 3, 1, children=(child,)))
+
+
+def _list(nullable=True):
+    return _col(
+        "c", "list", 1, children=(_col("element", "long", 2, nullable=nullable),)
+    )
+
+
+def _list_in_map(nullable=True):
+    element = _col("element", "long", 4, nullable=nullable)
+    return _map("c", 1, _col("value", "list", 3, 1, children=(element,)))
+
+
+#: (catalog, file) pairs that differ only below a map or a list, in a
+#: struct child or a list element that map_names_form rebuilds on BOTH
+#: sides; same field id, so only the rebuild keeping it can refuse them.
+NESTED_DEFECTS = {
+    "struct-child-name": (_struct_in_map, lambda: _struct_in_map(name="b")),
+    "struct-child-nullability": (
+        _struct_in_map,
+        lambda: _struct_in_map(nullable=False),
+    ),
+    "list-element-nullability": (_list, lambda: _list(nullable=False)),
+    "list-in-map-element-nullability": (
+        _list_in_map,
+        lambda: _list_in_map(nullable=False),
+    ),
+}
+
+
+@pytest.mark.parametrize("defect", NESTED_DEFECTS)
+def test_a_nested_field_rebuilt_by_map_names_form_is_still_compared(defect):
+    """map_names_form rebuilds every struct and list it walks through,
+    and only a MAP's names are licensed: a struct child's name and
+    nullability, and a list element's nullability, still decide."""
+    from pyhoglake.parquet_schema import prepared_schema_matches
+
+    catalog, file = NESTED_DEFECTS[defect]
+    want = columns_to_arrow_schema([catalog()])
+    assert prepared_schema_matches(_read_back(want), want)
+    found = _read_back(columns_to_arrow_schema([file()]))
+    assert not prepared_schema_matches(found, want)
+
+
+def test_a_map_at_the_cap_is_not_normalized():
+    """A map AT the cap is illegal (its key and value would be past it),
+    so its names are left alone and the file is refused."""
+    from pyhoglake.types import map_names_form
+
+    def key_name(levels):
+        t = pa.map_(pa.field("k", pa.string(), nullable=False), pa.int64())
+        for _ in range(levels):
+            t = pa.list_(t)
+        t = map_names_form(t)
+        for _ in range(levels):
+            t = t.value_type
+        return t.key_field.name
+
+    assert key_name(MAX_COLUMN_NESTING_DEPTH - 2) == "key"
+    assert key_name(MAX_COLUMN_NESTING_DEPTH - 1) == "k"
+
+
 def test_nested_uuid_is_annotated_in_parquet(tmp_path):
     """The parquet form, at depth: pyarrow stamps the UUID annotation on
     a struct field and a list element, not only on a top-level column,

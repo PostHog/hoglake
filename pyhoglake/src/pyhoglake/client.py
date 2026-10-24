@@ -11,6 +11,7 @@ import contextlib
 import importlib.metadata
 import io
 import logging
+import threading
 import time
 import uuid as _uuid
 from collections.abc import Iterator, Mapping, Sequence
@@ -875,6 +876,8 @@ class Catalog:
         self._retention_cache: float | None = None
         # ...and, when the read FAILS, one per _RETENTION_RETRY_SECONDS.
         self._retention_failed_at: float | None = None
+        # ...however many threads ask at once.
+        self._retention_lock = threading.Lock()
 
     # -- identity ----------------------------------------------------------
 
@@ -1233,8 +1236,25 @@ class Catalog:
         round trip this whole path exists to remove, in the one situation
         where nobody is watching. Bounded at one read a minute, the
         assumption costs nothing and still heals within a minute.
+
+        Thread-safe: one Catalog is shared by every flusher thread a
+        writer runs (millrace's pool and its default executor), so the
+        check and the fetch are one critical section, or N threads
+        arriving at an empty cache issue N options GETs. The lock is held
+        across the GET on purpose: the threads behind it want that answer,
+        not one of their own. So a transport failure (a timeout, a refused
+        connection) is remembered like a 5xx: were it to escape unrecorded,
+        each queued thread would make its own GET in turn, and the k-th
+        would wait k timeouts. For the same reason the failure is stamped
+        when the read fails, not when it began: a read slower than the
+        window would otherwise leave it already expired for the queue. The
+        value is returned from a local, because set_retention, drop and the
+        410 path clear the cache without the lock.
         """
-        if self._retention_cache is None:
+        with self._retention_lock:
+            cached = self._retention_cache
+            if cached is not None:
+                return cached
             now = time.monotonic()
             if (
                 self._retention_failed_at is not None
@@ -1243,12 +1263,16 @@ class Catalog:
                 return _ASSUMED_RETENTION_SECONDS
             try:
                 seconds = self.options().snapshot_retention_seconds
-            except HoglakeError:
-                self._retention_failed_at = now
+            except (HoglakeError, httpx.HTTPError):
+                # Stamped at the failure, not at `now`: a read that took
+                # longer than the window to fail would otherwise leave it
+                # already expired for every thread queued behind it.
+                self._retention_failed_at = time.monotonic()
                 return _ASSUMED_RETENTION_SECONDS
             self._retention_failed_at = None
-            self._retention_cache = float("inf") if seconds is None else float(seconds)
-        return self._retention_cache
+            cached = float("inf") if seconds is None else float(seconds)
+            self._retention_cache = cached
+            return cached
 
 
 class Namespace:

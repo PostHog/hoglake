@@ -23,7 +23,10 @@ uploaded costs a re-encode and a set of orphaned objects.
 """
 
 import json
+import threading
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 import pyarrow as pa
@@ -786,6 +789,85 @@ def test_a_persistent_options_failure_costs_one_read_a_minute_not_one_a_flush(
     assert cat._retention_seconds() == _ASSUMED_RETENTION_SECONDS
     assert options_reads() == 2
     client.close()
+
+
+@pytest.mark.parametrize(
+    ("status", "retry_window"),
+    [(200, None), (503, None), (None, None), (None, 0.02)],
+    ids=["read", "failed-read", "transport-failure", "slow-transport-failure"],
+)
+def test_concurrent_callers_share_one_retention_read(
+    httpx_mock, fake_s3, monkeypatch, status, retry_window
+):
+    """One Catalog is shared by every flusher thread (hoglake#359), and
+    threads arriving together at an empty cache must not each issue the
+    GET — nor, while the endpoint fails, each restart the retry window.
+    The read is slowed so that, without the lock, every thread is inside
+    it before the first one caches anything. A timeout is a failed read
+    too: unrecorded, the queued threads would each wait out their own.
+    And one that takes longer than the retry window to fail (a timeout of
+    60 s or more) must still answer the queue: the window is measured
+    from the failure, not from when the read began."""
+    import pyhoglake.client as client_module
+    from pyhoglake.client import _ASSUMED_RETENTION_SECONDS
+
+    if retry_window is not None:
+        monkeypatch.setattr(client_module, "_RETENTION_RETRY_SECONDS", retry_window)
+    client, cat = _client(httpx_mock, fake_s3)
+
+    def slow_options(request):
+        time.sleep(0.05)
+        if status is None:
+            raise httpx.ReadTimeout("options timed out", request=request)
+        return httpx.Response(status, json=OPTIONS_WIRE if status == 200 else {})
+
+    httpx_mock.add_callback(
+        slow_options, method="GET", url=OPTIONS_URL, is_reusable=True
+    )
+    threads = 8
+    barrier = threading.Barrier(threads)
+
+    def call(_):
+        barrier.wait()
+        return cat._retention_seconds()
+
+    with ThreadPoolExecutor(threads) as pool:
+        answers = list(pool.map(call, range(threads)))
+    want = 3600.0 if status == 200 else _ASSUMED_RETENTION_SECONDS
+    assert answers == [want] * threads
+    assert len(_gets(httpx_mock, "/options")) == 1
+    client.close()
+
+
+def test_an_unlocked_clear_mid_call_cannot_make_the_retention_none():
+    """set_retention, drop and the 410 path clear the cache without the
+    lock, so it can empty between the store (or the check) and the
+    return. The answer comes from a local: re-reading the field there
+    would hand _cache_is_usable a None to halve. The cache here empties
+    after every read and drops every write, a clear at each instant."""
+    from pyhoglake import Catalog, CatalogOptions
+
+    class ClearedEveryRead(Catalog):
+        stored: float | None = None
+
+        @property
+        def _retention_cache(self):
+            value, self.stored = self.stored, None
+            return value
+
+        @_retention_cache.setter
+        def _retention_cache(self, value):
+            pass
+
+        def options(self):
+            return CatalogOptions.from_wire(OPTIONS_WIRE)
+
+    cat = object.__new__(ClearedEveryRead)
+    cat._retention_lock = threading.Lock()
+    cat._retention_failed_at = None
+    assert cat._retention_seconds() == 3600.0  # cleared after the store
+    cat.stored = 7.0
+    assert cat._retention_seconds() == 7.0  # cleared after the check
 
 
 def test_a_response_without_totals_parses_as_none_not_zero(table, httpx_mock):
