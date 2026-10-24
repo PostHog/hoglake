@@ -1728,9 +1728,16 @@ ran on the local stack and what it showed.
   [docs/iceberg-federation.md](docs/iceberg-federation.md) /
   [docs/trino-integration.md](docs/trino-integration.md); v1 schema already
   conforms (typed bounds, Iceberg transforms, DV-only deletes).
-- **Auth**: out of scope for v1; audit actor is `anonymous` until it
-  lands. README §Status says the same and there is no decision record
-  beyond it.
+- **Auth**: the ENFORCEMENT layer has landed — JWT verification, the
+  route-to-scope table ([server/src/main/kotlin/com/posthog/hoglake/auth/AuthPolicy.kt](server/src/main/kotlin/com/posthog/hoglake/auth/AuthPolicy.kt)),
+  per-catalog scopes, the `HOGLAKE_AUTH_MODE=off|warn|enforce` flag. It is
+  `off` by default, i.e. today's behaviour. TOKEN ISSUANCE does not exist
+  yet, so `enforce` in a real cluster refuses everything; deploy `warn`
+  and watch `hoglake_auth_requests_total{outcome="missing"}` until it is
+  zero. `/metrics` is now operator-only, which the Prometheus scrape job
+  needs a token for before `enforce`. The plan for the remaining halves
+  (tenancy, issuance, S3 credential vending) is
+  [docs/auth-tenancy.md](docs/auth-tenancy.md).
 - pyhoglake implements `truncate[W]` partition transforms; the server's
   Transform vocabulary doesn't include truncate yet (client-ready,
   server gap).

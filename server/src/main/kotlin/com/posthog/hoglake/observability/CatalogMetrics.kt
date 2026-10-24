@@ -34,6 +34,61 @@ import java.util.concurrent.atomic.AtomicLong
 data class InstanceTotals(val totalRows: Long?, val totalSizeBytes: Long?, val unsampledCatalogs: Int)
 
 /**
+ * The same totals, restricted to the catalogs ONE caller may see.
+ *
+ * Exists because `GET /v1/info` is served to a tenant as well as to an
+ * operator, and the instance-wide sums are every org's storage. Omitting the
+ * fields for a tenant would be the cheaper answer and the wrong one: a customer
+ * looking at their own warehouse would see "no data" where they have 40 TB, and
+ * the natural reading of that is a broken product.
+ *
+ * The accounting matches the instance sum's own rule, which is what makes the
+ * two comparable: a catalog counts toward `totalRows` / `totalSizeBytes` only
+ * when the sampler published BOTH measures for it, and otherwise counts in
+ * [unsampledCatalogs]. A partial sum is never presented as a whole one.
+ *
+ * [visible] is a catalog-name allowlist; `null` means "every catalog", i.e. the
+ * operator case, which delegates to the instance totals so the two paths cannot
+ * drift.
+ */
+fun instanceTotalsFor(
+    instanceTotals: InstanceTotals?,
+    catalogTotals: Map<String, CatalogTotals>,
+    visible: Set<String>?,
+): InstanceTotals? {
+    if (visible == null) return instanceTotals
+    // Nothing sampled yet: the boot window, and the only window in which the
+    // sampler has no opinion to project.
+    if (instanceTotals == null) return null
+    var rows = 0L
+    var bytes = 0L
+    var unsampled = 0
+    for (catalog in visible) {
+        val totals =
+            catalogTotals[catalog] ?: run {
+                unsampled += 1
+                null
+            } ?: continue
+        val r = totals.liveRows
+        val b = totals.liveBytes
+        if (r == null || b == null) {
+            unsampled += 1
+        } else {
+            rows += r
+            bytes += b
+        }
+    }
+    return InstanceTotals(
+        // A sum over nothing is 0, which reads as an empty warehouse; the
+        // instance path omits the fields in exactly this situation and so does
+        // this one.
+        totalRows = if (rows == 0L && unsampled > 0) null else rows,
+        totalSizeBytes = if (rows == 0L && unsampled > 0) null else bytes,
+        unsampledCatalogs = unsampled,
+    )
+}
+
+/**
  * `hoglake_expiry_purge_remaining{catalog}` — file rows still eligible
  * below the floor after the catalog's last expiry sweep, SATURATING at
  * `ExpiryService.PURGE_REMAINING_CAP`.

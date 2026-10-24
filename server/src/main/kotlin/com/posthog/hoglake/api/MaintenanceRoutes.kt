@@ -1,6 +1,7 @@
 package com.posthog.hoglake.api
 
 import com.fasterxml.jackson.databind.JsonNode
+import com.posthog.hoglake.auth.actorOrRefuse
 import com.posthog.hoglake.compaction.CompactionService
 import com.posthog.hoglake.hydrator.Hydrator
 import com.posthog.hoglake.model.HoglakeException
@@ -55,7 +56,7 @@ fun Application.installMaintenanceRoutes(
                             call.maintenanceCatalog(),
                             req.snapshotRetentionSeconds,
                             req.consumerFloor,
-                            req.author,
+                            call.actorOrRefuse(req.author),
                             req.message,
                         ).toDto(),
                     )
