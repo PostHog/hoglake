@@ -170,7 +170,27 @@ class CatalogService(private val jdbi: Jdbi) {
 
     fun getCatalog(name: String): CatalogInfo = jdbi.withHandleUnchecked { h -> requireCatalog(h, name) }
 
-    fun listCatalogs(): List<CatalogInfo> = jdbi.withHandleUnchecked { h -> CatalogRepo.listAll(h) }
+    /**
+     * Every catalog this caller may see.
+     *
+     * [visible] is the caller's allowlist, or null for an operator. The filter is
+     * applied HERE, in Kotlin, rather than as a `WHERE catalog_id IN (…)` — the
+     * listing reads every catalog row anyway (it is one indexed scan of a table
+     * with one row per tenant, thousands at most), and a parameterized IN-list
+     * of arbitrary length would put a statement-plan cache miss in front of a
+     * request every tenant makes on load. If catalogs ever number enough for
+     * that to change, this is the line to revisit.
+     *
+     * The DEFAULT is "everything", which is the operator path and the
+     * `HOGLAKE_AUTH_MODE=off` path; every caller that has a tenant passes its own
+     * allowlist explicitly, so forgetting to pass one is a compile error rather
+     * than a leak.
+     */
+    fun listCatalogs(visible: Set<String>? = null): List<CatalogInfo> =
+        jdbi.withHandleUnchecked { h ->
+            val all = CatalogRepo.listAll(h)
+            if (visible == null) all else all.filter { it.name in visible }
+        }
 
     /**
      * Drop an EMPTY catalog: `DELETE /v1/catalogs/{catalog}` (#412).

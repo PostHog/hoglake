@@ -1,10 +1,14 @@
 package com.posthog.hoglake.api
 
 import com.posthog.hoglake.BuildInfo
+import com.posthog.hoglake.auth.AuthState
+import com.posthog.hoglake.auth.actorOrRefuse
+import com.posthog.hoglake.auth.hoglakeAuth
 import com.posthog.hoglake.commit.CommitService
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.observability.CatalogTotals
 import com.posthog.hoglake.observability.InstanceTotals
+import com.posthog.hoglake.observability.instanceTotalsFor
 import com.posthog.hoglake.persistence.FileRepo
 import com.posthog.hoglake.service.CatalogService
 import com.posthog.hoglake.service.ColumnTrees
@@ -47,7 +51,24 @@ fun Application.installApiRoutes(
             // computed here (a live-manifest sum per request would tax
             // the commit tail's RDS at fleet scale). Null (fields
             // omitted) only in the boot window before the first sample.
-            val totals = instanceTotals()
+            //
+            // The instance-wide sums are every tenant's storage, so they are
+            // PROJECTED onto what this caller may see. Three cases, and the
+            // table in auth/AuthPolicy.kt says why /v1/info is PUBLIC while
+            // still caring:
+            //   operator   -> the instance totals, unchanged
+            //   tenant     -> the same accounting over its own catalogs
+            //   anonymous  -> no totals at all (the fields are omitted)
+            val totals =
+                when (val auth = call.hoglakeAuth) {
+                    // Auth off: unauthenticated by configuration, so the
+                    // instance totals are what this route has always returned.
+                    // The distinction matters — see auth/AuthState.
+                    is AuthState.Off -> instanceTotals()
+                    is AuthState.Anonymous -> null
+                    is AuthState.Authenticated ->
+                        instanceTotalsFor(instanceTotals(), catalogTotals(), auth.caller.visibleCatalogs())
+                }
             call.respond(
                 InstanceInfoDto(
                     name = instanceName.ifBlank { null },
@@ -64,14 +85,26 @@ fun Application.installApiRoutes(
             get {
                 // Totals ride the sampler's last pass (catalogTotals), so
                 // listing catalogs never sums the manifest per request.
+                //
+                // The LIST is filtered, not merely gated: without this a tenant
+                // token reads the whole fleet's catalog roster off the first
+                // request it makes. Under HOGLAKE_AUTH_MODE=off the caller is
+                // null and the filter is "everything", i.e. today's behaviour.
                 val totals = catalogTotals()
-                call.respond(catalogs.listCatalogs().map { it.toDto(totals[it.name]) })
+                val visible =
+                    when (val auth = call.hoglakeAuth) {
+                        is AuthState.Off -> null
+                        // Only reachable in `warn`, which lets a refusal through.
+                        is AuthState.Anonymous -> emptySet()
+                        is AuthState.Authenticated -> auth.caller.visibleCatalogs()
+                    }
+                call.respond(catalogs.listCatalogs(visible).map { it.toDto(totals[it.name]) })
             }
             post {
                 val req = call.receive<CreateCatalogRequestDto>()
                 call.respond(
                     HttpStatusCode.Created,
-                    catalogs.createCatalog(req.name, req.dataPath, req.author, req.message).toDto(),
+                    catalogs.createCatalog(req.name, req.dataPath, call.actorOrRefuse(req.author), req.message).toDto(),
                 )
             }
 
@@ -83,7 +116,7 @@ fun Application.installApiRoutes(
                     call.respond(
                         catalogs.dropCatalog(
                             call.catalog(),
-                            call.request.queryParameters["author"],
+                            call.actorOrRefuse(call.request.queryParameters["author"]),
                             call.request.queryParameters["message"],
                         ).toDto(),
                     )
@@ -114,7 +147,12 @@ fun Application.installApiRoutes(
                         val req = call.receive<CreateNamespaceRequestDto>()
                         call.respond(
                             HttpStatusCode.Created,
-                            catalogs.createNamespace(call.catalog(), req.name, req.author, req.message).toDto(),
+                            catalogs.createNamespace(
+                                call.catalog(),
+                                req.name,
+                                call.actorOrRefuse(req.author),
+                                req.message,
+                            ).toDto(),
                         )
                     }
                     get("/{namespace}") {
@@ -128,7 +166,7 @@ fun Application.installApiRoutes(
                                 call.catalog(),
                                 call.namespace(),
                                 call.longQuery("expected_namespace_id"),
-                                call.request.queryParameters["author"],
+                                call.actorOrRefuse(call.request.queryParameters["author"]),
                                 call.request.queryParameters["message"],
                             ).toDto(),
                         )
@@ -154,7 +192,7 @@ fun Application.installApiRoutes(
                                     call.namespace(),
                                     req.name,
                                     req.columns.map { it.toModel() },
-                                    req.author,
+                                    call.actorOrRefuse(req.author),
                                     req.message,
                                 ).toDto(),
                             )
@@ -187,7 +225,7 @@ fun Application.installApiRoutes(
                                         call.namespace(),
                                         call.table(),
                                         call.expectedTableUuid(),
-                                        call.request.queryParameters["author"],
+                                        call.actorOrRefuse(call.request.queryParameters["author"]),
                                         call.request.queryParameters["message"],
                                     ).toDto(),
                                 )
@@ -216,7 +254,7 @@ fun Application.installApiRoutes(
                                         call.namespace(),
                                         call.table(),
                                         expected,
-                                        req.author,
+                                        call.actorOrRefuse(req.author),
                                         req.message,
                                     ).toDto(),
                                 )

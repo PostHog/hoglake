@@ -1728,9 +1728,24 @@ ran on the local stack and what it showed.
   [docs/iceberg-federation.md](docs/iceberg-federation.md) /
   [docs/trino-integration.md](docs/trino-integration.md); v1 schema already
   conforms (typed bounds, Iceberg transforms, DV-only deletes).
-- **Auth**: out of scope for v1; audit actor is `anonymous` until it
-  lands. README §Status says the same and there is no decision record
-  beyond it.
+- **Auth**: the ENFORCEMENT layer has landed — JWT verification, the
+  route-to-scope table ([server/src/main/kotlin/com/posthog/hoglake/auth/AuthPolicy.kt](server/src/main/kotlin/com/posthog/hoglake/auth/AuthPolicy.kt)),
+  per-catalog scopes, the `HOGLAKE_AUTH_MODE=off|warn|enforce` flag. It is
+  `off` by default, i.e. today's behaviour. TOKEN ISSUANCE does not exist
+  yet, so `enforce` in a real cluster refuses everything; deploy `warn`
+  and watch `hoglake_auth_requests_total{outcome="missing"}` until it is
+  zero. `warn` PERMITS EVERYTHING `enforce` WOULD REFUSE, including
+  `DELETE /v1/catalogs/{catalog}` and the maintenance routes: it is a
+  measurement mode, not a partial enforcement, and a `read`-only tenant
+  writes freely while it is on. Deploy it where that is acceptable, which
+  is anywhere the current behaviour is already "no auth at all". `/metrics` is now operator-only, which the Prometheus scrape job
+  needs a token for before `enforce`. Issuance and per-tenant S3 credential
+  vending live in `PostHog/hogtower`, not here: it already holds the
+  tenant→catalog→IAM-role→bucket mapping, an `sts:AssumeRole` broker and the
+  warehouse-scoped machine credentials. hoglake is a resource server — set
+  `HOGLAKE_AUTH_ISSUER` and `HOGLAKE_AUTH_JWKS_URL` to hogtower's, then flip
+  the mode. [docs/auth-tenancy.md](docs/auth-tenancy.md) §17 has the
+  reasoning and the two-repo stack.
 - pyhoglake implements `truncate[W]` partition transforms; the server's
   Transform vocabulary doesn't include truncate yet (client-ready,
   server gap).
