@@ -223,9 +223,7 @@ def _roundtrip(cols: tuple[Column, ...], docs: list[dict[str, Any]]) -> pa.Table
     sink = pa.BufferOutputStream()
     pq.write_table(encoded, sink)
     with pq.ParquetFile(pa.BufferReader(sink.getvalue())) as parquet:
-        assert prepared_schema_matches(
-            flush.file_schema(parquet.schema_arrow), encoded.schema
-        )
+        assert prepared_schema_matches(parquet.schema_arrow, encoded.schema)
         return parquet.read()
 
 

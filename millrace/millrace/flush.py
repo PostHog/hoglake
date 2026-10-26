@@ -389,39 +389,6 @@ def _encode_field(f: pa.Field) -> pa.Field:
     return f.with_type(_encode_type(f.type))
 
 
-def _map_entries_type(t: pa.DataType) -> pa.DataType:
-    """``t`` with every map's entries struct under Arrow's default name.
-    A parquet round trip names a map's entries after the COLUMN (pyarrow
-    reads ``map<k, v ('m')>`` back for a column ``m`` it wrote as
-    ``entries``), and Arrow type equality compares that name; nothing
-    else about the type, field ids included, is touched."""
-    if pa.types.is_map(t):
-        return pa.map_(
-            t.key_field.with_type(_map_entries_type(t.key_type)),
-            t.item_field.with_type(_map_entries_type(t.item_type)),
-            keys_sorted=t.keys_sorted,
-        )
-    if pa.types.is_struct(t):
-        return pa.struct(
-            [
-                t.field(i).with_type(_map_entries_type(t.field(i).type))
-                for i in range(t.num_fields)
-            ]
-        )
-    if pa.types.is_list(t):
-        return pa.list_(t.value_field.with_type(_map_entries_type(t.value_type)))
-    return t
-
-
-def file_schema(schema: pa.Schema) -> pa.Schema:
-    """A written file's Arrow schema, comparable with the encoding schema
-    (:func:`_map_entries_type`)."""
-    return pa.schema(
-        [f.with_type(_map_entries_type(f.type)) for f in schema],
-        metadata=schema.metadata,
-    )
-
-
 def _encode_schema(schema: pa.Schema) -> pa.Schema:
     """The parquet-encoding schema: the catalog schema with field ids,
     plus the one storage conversion pyhoglake's writer path makes —
@@ -894,9 +861,7 @@ def build_flush_plan(
         del part
         raw = sink.getvalue()
         with pq.ParquetFile(pa.BufferReader(raw)) as parquet:
-            if not prepared_schema_matches(
-                file_schema(parquet.schema_arrow), encode_schema
-            ):
+            if not prepared_schema_matches(parquet.schema_arrow, encode_schema):
                 raise FlushError(
                     "encoded parquet schema/field ids differ from the "
                     "destination schema (a millrace encoder bug)"
