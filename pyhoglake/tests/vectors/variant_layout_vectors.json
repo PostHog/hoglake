@@ -1,0 +1,10558 @@
+{
+ "format": "hoglake-variant-layout-vectors",
+ "version": 1,
+ "description": "Plan.expected_elements of a variant column 'v' (field id 7) per declaration: parquet.thrift SchemaElements by Thrift field id, in schema order. Converted types (6, with 7 and 8) are legacy spellings a writer may add or omit. Written by regen_variant_layout_vectors.py.",
+ "consumers": [
+  "pyhoglake/tests/test_variant_layout_vectors.py",
+  "server/src/test/kotlin/com/posthog/hoglake/compaction/VariantLayoutTest.kt"
+ ],
+ "vectors": [
+  {
+   "id": "undeclared",
+   "nullable": true,
+   "declaration": null,
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 2,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "undeclared_not_null",
+   "nullable": false,
+   "declaration": null,
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 0,
+      "4": "v",
+      "5": 2,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "root_variant",
+   "nullable": true,
+   "declaration": {
+    "type": "variant"
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 2,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "root_boolean",
+   "nullable": true,
+   "declaration": {
+    "type": "boolean"
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 3,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value"
+     ],
+     "element": {
+      "1": 0,
+      "3": 1,
+      "4": "typed_value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "root_int8",
+   "nullable": true,
+   "declaration": {
+    "type": "int8"
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 3,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value"
+     ],
+     "element": {
+      "1": 1,
+      "6": 15,
+      "10": {
+       "10": {
+        "1": 8,
+        "2": true
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "root_int16",
+   "nullable": true,
+   "declaration": {
+    "type": "int16"
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 3,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value"
+     ],
+     "element": {
+      "1": 1,
+      "6": 16,
+      "10": {
+       "10": {
+        "1": 16,
+        "2": true
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "root_int32",
+   "nullable": true,
+   "declaration": {
+    "type": "int32"
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 3,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value"
+     ],
+     "element": {
+      "1": 1,
+      "3": 1,
+      "4": "typed_value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "root_int64",
+   "nullable": true,
+   "declaration": {
+    "type": "int64"
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 3,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value"
+     ],
+     "element": {
+      "1": 2,
+      "3": 1,
+      "4": "typed_value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "root_float",
+   "nullable": true,
+   "declaration": {
+    "type": "float"
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 3,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value"
+     ],
+     "element": {
+      "1": 4,
+      "3": 1,
+      "4": "typed_value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "root_double",
+   "nullable": true,
+   "declaration": {
+    "type": "double"
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 3,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value"
+     ],
+     "element": {
+      "1": 5,
+      "3": 1,
+      "4": "typed_value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "root_date",
+   "nullable": true,
+   "declaration": {
+    "type": "date"
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 3,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value"
+     ],
+     "element": {
+      "1": 1,
+      "6": 6,
+      "10": {
+       "6": {}
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "root_time",
+   "nullable": true,
+   "declaration": {
+    "type": "time"
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 3,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value"
+     ],
+     "element": {
+      "1": 2,
+      "10": {
+       "7": {
+        "1": false,
+        "2": {
+         "2": {}
+        }
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "root_timestamp",
+   "nullable": true,
+   "declaration": {
+    "type": "timestamp"
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 3,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value"
+     ],
+     "element": {
+      "1": 2,
+      "6": 10,
+      "10": {
+       "8": {
+        "1": false,
+        "2": {
+         "2": {}
+        }
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "root_timestamp_ns",
+   "nullable": true,
+   "declaration": {
+    "type": "timestamp_ns"
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 3,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value"
+     ],
+     "element": {
+      "1": 2,
+      "10": {
+       "8": {
+        "1": false,
+        "2": {
+         "3": {}
+        }
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "root_timestamptz",
+   "nullable": true,
+   "declaration": {
+    "type": "timestamptz"
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 3,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value"
+     ],
+     "element": {
+      "1": 2,
+      "6": 10,
+      "10": {
+       "8": {
+        "1": true,
+        "2": {
+         "2": {}
+        }
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "root_timestamptz_ns",
+   "nullable": true,
+   "declaration": {
+    "type": "timestamptz_ns"
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 3,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value"
+     ],
+     "element": {
+      "1": 2,
+      "10": {
+       "8": {
+        "1": true,
+        "2": {
+         "3": {}
+        }
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "root_binary",
+   "nullable": true,
+   "declaration": {
+    "type": "binary"
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 3,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "typed_value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "root_string",
+   "nullable": true,
+   "declaration": {
+    "type": "string"
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 3,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value"
+     ],
+     "element": {
+      "1": 6,
+      "6": 0,
+      "10": {
+       "1": {}
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "root_uuid",
+   "nullable": true,
+   "declaration": {
+    "type": "uuid"
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 3,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value"
+     ],
+     "element": {
+      "1": 7,
+      "2": 16,
+      "10": {
+       "14": {}
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "root_decimal4_1_0",
+   "nullable": true,
+   "declaration": {
+    "type": "decimal4",
+    "precision": 1,
+    "scale": 0
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 3,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value"
+     ],
+     "element": {
+      "1": 1,
+      "6": 5,
+      "7": 0,
+      "8": 1,
+      "10": {
+       "5": {
+        "1": 0,
+        "2": 1
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "root_decimal4_9_2",
+   "nullable": true,
+   "declaration": {
+    "type": "decimal4",
+    "precision": 9,
+    "scale": 2
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 3,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value"
+     ],
+     "element": {
+      "1": 1,
+      "6": 5,
+      "7": 2,
+      "8": 9,
+      "10": {
+       "5": {
+        "1": 2,
+        "2": 9
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "root_decimal4_9_9",
+   "nullable": true,
+   "declaration": {
+    "type": "decimal4",
+    "precision": 9,
+    "scale": 9
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 3,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value"
+     ],
+     "element": {
+      "1": 1,
+      "6": 5,
+      "7": 9,
+      "8": 9,
+      "10": {
+       "5": {
+        "1": 9,
+        "2": 9
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "root_decimal8_10_0",
+   "nullable": true,
+   "declaration": {
+    "type": "decimal8",
+    "precision": 10,
+    "scale": 0
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 3,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value"
+     ],
+     "element": {
+      "1": 2,
+      "6": 5,
+      "7": 0,
+      "8": 10,
+      "10": {
+       "5": {
+        "1": 0,
+        "2": 10
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "root_decimal8_18_2",
+   "nullable": true,
+   "declaration": {
+    "type": "decimal8",
+    "precision": 18,
+    "scale": 2
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 3,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value"
+     ],
+     "element": {
+      "1": 2,
+      "6": 5,
+      "7": 2,
+      "8": 18,
+      "10": {
+       "5": {
+        "1": 2,
+        "2": 18
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "root_decimal8_18_18",
+   "nullable": true,
+   "declaration": {
+    "type": "decimal8",
+    "precision": 18,
+    "scale": 18
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 3,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value"
+     ],
+     "element": {
+      "1": 2,
+      "6": 5,
+      "7": 18,
+      "8": 18,
+      "10": {
+       "5": {
+        "1": 18,
+        "2": 18
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "root_decimal16_1_0",
+   "nullable": true,
+   "declaration": {
+    "type": "decimal16",
+    "precision": 1,
+    "scale": 0
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 3,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value"
+     ],
+     "element": {
+      "1": 7,
+      "2": 1,
+      "6": 5,
+      "7": 0,
+      "8": 1,
+      "10": {
+       "5": {
+        "1": 0,
+        "2": 1
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "root_decimal16_2_0",
+   "nullable": true,
+   "declaration": {
+    "type": "decimal16",
+    "precision": 2,
+    "scale": 0
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 3,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value"
+     ],
+     "element": {
+      "1": 7,
+      "2": 1,
+      "6": 5,
+      "7": 0,
+      "8": 2,
+      "10": {
+       "5": {
+        "1": 0,
+        "2": 2
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "root_decimal16_3_2",
+   "nullable": true,
+   "declaration": {
+    "type": "decimal16",
+    "precision": 3,
+    "scale": 2
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 3,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value"
+     ],
+     "element": {
+      "1": 7,
+      "2": 2,
+      "6": 5,
+      "7": 2,
+      "8": 3,
+      "10": {
+       "5": {
+        "1": 2,
+        "2": 3
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "root_decimal16_9_2",
+   "nullable": true,
+   "declaration": {
+    "type": "decimal16",
+    "precision": 9,
+    "scale": 2
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 3,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value"
+     ],
+     "element": {
+      "1": 7,
+      "2": 4,
+      "6": 5,
+      "7": 2,
+      "8": 9,
+      "10": {
+       "5": {
+        "1": 2,
+        "2": 9
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "root_decimal16_10_2",
+   "nullable": true,
+   "declaration": {
+    "type": "decimal16",
+    "precision": 10,
+    "scale": 2
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 3,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value"
+     ],
+     "element": {
+      "1": 7,
+      "2": 5,
+      "6": 5,
+      "7": 2,
+      "8": 10,
+      "10": {
+       "5": {
+        "1": 2,
+        "2": 10
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "root_decimal16_18_2",
+   "nullable": true,
+   "declaration": {
+    "type": "decimal16",
+    "precision": 18,
+    "scale": 2
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 3,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value"
+     ],
+     "element": {
+      "1": 7,
+      "2": 8,
+      "6": 5,
+      "7": 2,
+      "8": 18,
+      "10": {
+       "5": {
+        "1": 2,
+        "2": 18
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "root_decimal16_19_2",
+   "nullable": true,
+   "declaration": {
+    "type": "decimal16",
+    "precision": 19,
+    "scale": 2
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 3,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value"
+     ],
+     "element": {
+      "1": 7,
+      "2": 9,
+      "6": 5,
+      "7": 2,
+      "8": 19,
+      "10": {
+       "5": {
+        "1": 2,
+        "2": 19
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "root_decimal16_20_4",
+   "nullable": true,
+   "declaration": {
+    "type": "decimal16",
+    "precision": 20,
+    "scale": 4
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 3,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value"
+     ],
+     "element": {
+      "1": 7,
+      "2": 9,
+      "6": 5,
+      "7": 4,
+      "8": 20,
+      "10": {
+       "5": {
+        "1": 4,
+        "2": 20
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "root_decimal16_27_4",
+   "nullable": true,
+   "declaration": {
+    "type": "decimal16",
+    "precision": 27,
+    "scale": 4
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 3,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value"
+     ],
+     "element": {
+      "1": 7,
+      "2": 12,
+      "6": 5,
+      "7": 4,
+      "8": 27,
+      "10": {
+       "5": {
+        "1": 4,
+        "2": 27
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "root_decimal16_28_4",
+   "nullable": true,
+   "declaration": {
+    "type": "decimal16",
+    "precision": 28,
+    "scale": 4
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 3,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value"
+     ],
+     "element": {
+      "1": 7,
+      "2": 12,
+      "6": 5,
+      "7": 4,
+      "8": 28,
+      "10": {
+       "5": {
+        "1": 4,
+        "2": 28
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "root_decimal16_37_4",
+   "nullable": true,
+   "declaration": {
+    "type": "decimal16",
+    "precision": 37,
+    "scale": 4
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 3,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value"
+     ],
+     "element": {
+      "1": 7,
+      "2": 16,
+      "6": 5,
+      "7": 4,
+      "8": 37,
+      "10": {
+       "5": {
+        "1": 4,
+        "2": 37
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "root_decimal16_38_4",
+   "nullable": true,
+   "declaration": {
+    "type": "decimal16",
+    "precision": 38,
+    "scale": 4
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 3,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value"
+     ],
+     "element": {
+      "1": 7,
+      "2": 16,
+      "6": 5,
+      "7": 4,
+      "8": 38,
+      "10": {
+       "5": {
+        "1": 4,
+        "2": 38
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "object_of_every_leaf",
+   "nullable": true,
+   "declaration": {
+    "type": "object",
+    "fields": [
+     {
+      "name": "boolean",
+      "type": "boolean"
+     },
+     {
+      "name": "int8",
+      "type": "int8"
+     },
+     {
+      "name": "int16",
+      "type": "int16"
+     },
+     {
+      "name": "int32",
+      "type": "int32"
+     },
+     {
+      "name": "int64",
+      "type": "int64"
+     },
+     {
+      "name": "float",
+      "type": "float"
+     },
+     {
+      "name": "double",
+      "type": "double"
+     },
+     {
+      "name": "date",
+      "type": "date"
+     },
+     {
+      "name": "time",
+      "type": "time"
+     },
+     {
+      "name": "timestamp",
+      "type": "timestamp"
+     },
+     {
+      "name": "timestamp_ns",
+      "type": "timestamp_ns"
+     },
+     {
+      "name": "timestamptz",
+      "type": "timestamptz"
+     },
+     {
+      "name": "timestamptz_ns",
+      "type": "timestamptz_ns"
+     },
+     {
+      "name": "binary",
+      "type": "binary"
+     },
+     {
+      "name": "string",
+      "type": "string"
+     },
+     {
+      "name": "uuid",
+      "type": "uuid"
+     },
+     {
+      "name": "decimal4_1",
+      "type": "decimal4",
+      "precision": 1,
+      "scale": 0
+     },
+     {
+      "name": "decimal8_10",
+      "type": "decimal8",
+      "precision": 10,
+      "scale": 0
+     },
+     {
+      "name": "decimal16_1",
+      "type": "decimal16",
+      "precision": 1,
+      "scale": 0
+     },
+     {
+      "name": "decimal16_9",
+      "type": "decimal16",
+      "precision": 9,
+      "scale": 2
+     },
+     {
+      "name": "decimal16_19",
+      "type": "decimal16",
+      "precision": 19,
+      "scale": 2
+     },
+     {
+      "name": "decimal16_28",
+      "type": "decimal16",
+      "precision": 28,
+      "scale": 4
+     }
+    ]
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 3,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 22
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "boolean"
+     ],
+     "element": {
+      "3": 0,
+      "4": "boolean",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "boolean",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "boolean",
+      "typed_value"
+     ],
+     "element": {
+      "1": 0,
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "int8"
+     ],
+     "element": {
+      "3": 0,
+      "4": "int8",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "int8",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "int8",
+      "typed_value"
+     ],
+     "element": {
+      "1": 1,
+      "6": 15,
+      "10": {
+       "10": {
+        "1": 8,
+        "2": true
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "int16"
+     ],
+     "element": {
+      "3": 0,
+      "4": "int16",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "int16",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "int16",
+      "typed_value"
+     ],
+     "element": {
+      "1": 1,
+      "6": 16,
+      "10": {
+       "10": {
+        "1": 16,
+        "2": true
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "int32"
+     ],
+     "element": {
+      "3": 0,
+      "4": "int32",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "int32",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "int32",
+      "typed_value"
+     ],
+     "element": {
+      "1": 1,
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "int64"
+     ],
+     "element": {
+      "3": 0,
+      "4": "int64",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "int64",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "int64",
+      "typed_value"
+     ],
+     "element": {
+      "1": 2,
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "float"
+     ],
+     "element": {
+      "3": 0,
+      "4": "float",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "float",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "float",
+      "typed_value"
+     ],
+     "element": {
+      "1": 4,
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "double"
+     ],
+     "element": {
+      "3": 0,
+      "4": "double",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "double",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "double",
+      "typed_value"
+     ],
+     "element": {
+      "1": 5,
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "date"
+     ],
+     "element": {
+      "3": 0,
+      "4": "date",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "date",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "date",
+      "typed_value"
+     ],
+     "element": {
+      "1": 1,
+      "6": 6,
+      "10": {
+       "6": {}
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "time"
+     ],
+     "element": {
+      "3": 0,
+      "4": "time",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "time",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "time",
+      "typed_value"
+     ],
+     "element": {
+      "1": 2,
+      "10": {
+       "7": {
+        "1": false,
+        "2": {
+         "2": {}
+        }
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "timestamp"
+     ],
+     "element": {
+      "3": 0,
+      "4": "timestamp",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "timestamp",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "timestamp",
+      "typed_value"
+     ],
+     "element": {
+      "1": 2,
+      "6": 10,
+      "10": {
+       "8": {
+        "1": false,
+        "2": {
+         "2": {}
+        }
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "timestamp_ns"
+     ],
+     "element": {
+      "3": 0,
+      "4": "timestamp_ns",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "timestamp_ns",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "timestamp_ns",
+      "typed_value"
+     ],
+     "element": {
+      "1": 2,
+      "10": {
+       "8": {
+        "1": false,
+        "2": {
+         "3": {}
+        }
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "timestamptz"
+     ],
+     "element": {
+      "3": 0,
+      "4": "timestamptz",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "timestamptz",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "timestamptz",
+      "typed_value"
+     ],
+     "element": {
+      "1": 2,
+      "6": 10,
+      "10": {
+       "8": {
+        "1": true,
+        "2": {
+         "2": {}
+        }
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "timestamptz_ns"
+     ],
+     "element": {
+      "3": 0,
+      "4": "timestamptz_ns",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "timestamptz_ns",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "timestamptz_ns",
+      "typed_value"
+     ],
+     "element": {
+      "1": 2,
+      "10": {
+       "8": {
+        "1": true,
+        "2": {
+         "3": {}
+        }
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "binary"
+     ],
+     "element": {
+      "3": 0,
+      "4": "binary",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "binary",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "binary",
+      "typed_value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "string"
+     ],
+     "element": {
+      "3": 0,
+      "4": "string",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "string",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "string",
+      "typed_value"
+     ],
+     "element": {
+      "1": 6,
+      "6": 0,
+      "10": {
+       "1": {}
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "uuid"
+     ],
+     "element": {
+      "3": 0,
+      "4": "uuid",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "uuid",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "uuid",
+      "typed_value"
+     ],
+     "element": {
+      "1": 7,
+      "2": 16,
+      "10": {
+       "14": {}
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "decimal4_1"
+     ],
+     "element": {
+      "3": 0,
+      "4": "decimal4_1",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "decimal4_1",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "decimal4_1",
+      "typed_value"
+     ],
+     "element": {
+      "1": 1,
+      "6": 5,
+      "7": 0,
+      "8": 1,
+      "10": {
+       "5": {
+        "1": 0,
+        "2": 1
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "decimal8_10"
+     ],
+     "element": {
+      "3": 0,
+      "4": "decimal8_10",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "decimal8_10",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "decimal8_10",
+      "typed_value"
+     ],
+     "element": {
+      "1": 2,
+      "6": 5,
+      "7": 0,
+      "8": 10,
+      "10": {
+       "5": {
+        "1": 0,
+        "2": 10
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "decimal16_1"
+     ],
+     "element": {
+      "3": 0,
+      "4": "decimal16_1",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "decimal16_1",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "decimal16_1",
+      "typed_value"
+     ],
+     "element": {
+      "1": 7,
+      "2": 1,
+      "6": 5,
+      "7": 0,
+      "8": 1,
+      "10": {
+       "5": {
+        "1": 0,
+        "2": 1
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "decimal16_9"
+     ],
+     "element": {
+      "3": 0,
+      "4": "decimal16_9",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "decimal16_9",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "decimal16_9",
+      "typed_value"
+     ],
+     "element": {
+      "1": 7,
+      "2": 4,
+      "6": 5,
+      "7": 2,
+      "8": 9,
+      "10": {
+       "5": {
+        "1": 2,
+        "2": 9
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "decimal16_19"
+     ],
+     "element": {
+      "3": 0,
+      "4": "decimal16_19",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "decimal16_19",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "decimal16_19",
+      "typed_value"
+     ],
+     "element": {
+      "1": 7,
+      "2": 9,
+      "6": 5,
+      "7": 2,
+      "8": 19,
+      "10": {
+       "5": {
+        "1": 2,
+        "2": 19
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "decimal16_28"
+     ],
+     "element": {
+      "3": 0,
+      "4": "decimal16_28",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "decimal16_28",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "decimal16_28",
+      "typed_value"
+     ],
+     "element": {
+      "1": 7,
+      "2": 12,
+      "6": 5,
+      "7": 4,
+      "8": 28,
+      "10": {
+       "5": {
+        "1": 4,
+        "2": 28
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "object_of_every_leaf_not_null",
+   "nullable": false,
+   "declaration": {
+    "type": "object",
+    "fields": [
+     {
+      "name": "boolean",
+      "type": "boolean"
+     },
+     {
+      "name": "int8",
+      "type": "int8"
+     },
+     {
+      "name": "int16",
+      "type": "int16"
+     },
+     {
+      "name": "int32",
+      "type": "int32"
+     },
+     {
+      "name": "int64",
+      "type": "int64"
+     },
+     {
+      "name": "float",
+      "type": "float"
+     },
+     {
+      "name": "double",
+      "type": "double"
+     },
+     {
+      "name": "date",
+      "type": "date"
+     },
+     {
+      "name": "time",
+      "type": "time"
+     },
+     {
+      "name": "timestamp",
+      "type": "timestamp"
+     },
+     {
+      "name": "timestamp_ns",
+      "type": "timestamp_ns"
+     },
+     {
+      "name": "timestamptz",
+      "type": "timestamptz"
+     },
+     {
+      "name": "timestamptz_ns",
+      "type": "timestamptz_ns"
+     },
+     {
+      "name": "binary",
+      "type": "binary"
+     },
+     {
+      "name": "string",
+      "type": "string"
+     },
+     {
+      "name": "uuid",
+      "type": "uuid"
+     },
+     {
+      "name": "decimal4_1",
+      "type": "decimal4",
+      "precision": 1,
+      "scale": 0
+     },
+     {
+      "name": "decimal8_10",
+      "type": "decimal8",
+      "precision": 10,
+      "scale": 0
+     },
+     {
+      "name": "decimal16_1",
+      "type": "decimal16",
+      "precision": 1,
+      "scale": 0
+     },
+     {
+      "name": "decimal16_9",
+      "type": "decimal16",
+      "precision": 9,
+      "scale": 2
+     },
+     {
+      "name": "decimal16_19",
+      "type": "decimal16",
+      "precision": 19,
+      "scale": 2
+     },
+     {
+      "name": "decimal16_28",
+      "type": "decimal16",
+      "precision": 28,
+      "scale": 4
+     }
+    ]
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 0,
+      "4": "v",
+      "5": 3,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 22
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "boolean"
+     ],
+     "element": {
+      "3": 0,
+      "4": "boolean",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "boolean",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "boolean",
+      "typed_value"
+     ],
+     "element": {
+      "1": 0,
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "int8"
+     ],
+     "element": {
+      "3": 0,
+      "4": "int8",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "int8",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "int8",
+      "typed_value"
+     ],
+     "element": {
+      "1": 1,
+      "6": 15,
+      "10": {
+       "10": {
+        "1": 8,
+        "2": true
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "int16"
+     ],
+     "element": {
+      "3": 0,
+      "4": "int16",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "int16",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "int16",
+      "typed_value"
+     ],
+     "element": {
+      "1": 1,
+      "6": 16,
+      "10": {
+       "10": {
+        "1": 16,
+        "2": true
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "int32"
+     ],
+     "element": {
+      "3": 0,
+      "4": "int32",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "int32",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "int32",
+      "typed_value"
+     ],
+     "element": {
+      "1": 1,
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "int64"
+     ],
+     "element": {
+      "3": 0,
+      "4": "int64",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "int64",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "int64",
+      "typed_value"
+     ],
+     "element": {
+      "1": 2,
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "float"
+     ],
+     "element": {
+      "3": 0,
+      "4": "float",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "float",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "float",
+      "typed_value"
+     ],
+     "element": {
+      "1": 4,
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "double"
+     ],
+     "element": {
+      "3": 0,
+      "4": "double",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "double",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "double",
+      "typed_value"
+     ],
+     "element": {
+      "1": 5,
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "date"
+     ],
+     "element": {
+      "3": 0,
+      "4": "date",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "date",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "date",
+      "typed_value"
+     ],
+     "element": {
+      "1": 1,
+      "6": 6,
+      "10": {
+       "6": {}
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "time"
+     ],
+     "element": {
+      "3": 0,
+      "4": "time",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "time",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "time",
+      "typed_value"
+     ],
+     "element": {
+      "1": 2,
+      "10": {
+       "7": {
+        "1": false,
+        "2": {
+         "2": {}
+        }
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "timestamp"
+     ],
+     "element": {
+      "3": 0,
+      "4": "timestamp",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "timestamp",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "timestamp",
+      "typed_value"
+     ],
+     "element": {
+      "1": 2,
+      "6": 10,
+      "10": {
+       "8": {
+        "1": false,
+        "2": {
+         "2": {}
+        }
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "timestamp_ns"
+     ],
+     "element": {
+      "3": 0,
+      "4": "timestamp_ns",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "timestamp_ns",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "timestamp_ns",
+      "typed_value"
+     ],
+     "element": {
+      "1": 2,
+      "10": {
+       "8": {
+        "1": false,
+        "2": {
+         "3": {}
+        }
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "timestamptz"
+     ],
+     "element": {
+      "3": 0,
+      "4": "timestamptz",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "timestamptz",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "timestamptz",
+      "typed_value"
+     ],
+     "element": {
+      "1": 2,
+      "6": 10,
+      "10": {
+       "8": {
+        "1": true,
+        "2": {
+         "2": {}
+        }
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "timestamptz_ns"
+     ],
+     "element": {
+      "3": 0,
+      "4": "timestamptz_ns",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "timestamptz_ns",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "timestamptz_ns",
+      "typed_value"
+     ],
+     "element": {
+      "1": 2,
+      "10": {
+       "8": {
+        "1": true,
+        "2": {
+         "3": {}
+        }
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "binary"
+     ],
+     "element": {
+      "3": 0,
+      "4": "binary",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "binary",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "binary",
+      "typed_value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "string"
+     ],
+     "element": {
+      "3": 0,
+      "4": "string",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "string",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "string",
+      "typed_value"
+     ],
+     "element": {
+      "1": 6,
+      "6": 0,
+      "10": {
+       "1": {}
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "uuid"
+     ],
+     "element": {
+      "3": 0,
+      "4": "uuid",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "uuid",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "uuid",
+      "typed_value"
+     ],
+     "element": {
+      "1": 7,
+      "2": 16,
+      "10": {
+       "14": {}
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "decimal4_1"
+     ],
+     "element": {
+      "3": 0,
+      "4": "decimal4_1",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "decimal4_1",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "decimal4_1",
+      "typed_value"
+     ],
+     "element": {
+      "1": 1,
+      "6": 5,
+      "7": 0,
+      "8": 1,
+      "10": {
+       "5": {
+        "1": 0,
+        "2": 1
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "decimal8_10"
+     ],
+     "element": {
+      "3": 0,
+      "4": "decimal8_10",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "decimal8_10",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "decimal8_10",
+      "typed_value"
+     ],
+     "element": {
+      "1": 2,
+      "6": 5,
+      "7": 0,
+      "8": 10,
+      "10": {
+       "5": {
+        "1": 0,
+        "2": 10
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "decimal16_1"
+     ],
+     "element": {
+      "3": 0,
+      "4": "decimal16_1",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "decimal16_1",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "decimal16_1",
+      "typed_value"
+     ],
+     "element": {
+      "1": 7,
+      "2": 1,
+      "6": 5,
+      "7": 0,
+      "8": 1,
+      "10": {
+       "5": {
+        "1": 0,
+        "2": 1
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "decimal16_9"
+     ],
+     "element": {
+      "3": 0,
+      "4": "decimal16_9",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "decimal16_9",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "decimal16_9",
+      "typed_value"
+     ],
+     "element": {
+      "1": 7,
+      "2": 4,
+      "6": 5,
+      "7": 2,
+      "8": 9,
+      "10": {
+       "5": {
+        "1": 2,
+        "2": 9
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "decimal16_19"
+     ],
+     "element": {
+      "3": 0,
+      "4": "decimal16_19",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "decimal16_19",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "decimal16_19",
+      "typed_value"
+     ],
+     "element": {
+      "1": 7,
+      "2": 9,
+      "6": 5,
+      "7": 2,
+      "8": 19,
+      "10": {
+       "5": {
+        "1": 2,
+        "2": 19
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "decimal16_28"
+     ],
+     "element": {
+      "3": 0,
+      "4": "decimal16_28",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "decimal16_28",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "decimal16_28",
+      "typed_value"
+     ],
+     "element": {
+      "1": 7,
+      "2": 12,
+      "6": 5,
+      "7": 4,
+      "8": 28,
+      "10": {
+       "5": {
+        "1": 4,
+        "2": 28
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "object_with_variant_field",
+   "nullable": true,
+   "declaration": {
+    "type": "object",
+    "fields": [
+     {
+      "name": "any",
+      "type": "variant"
+     }
+    ]
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 3,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 1
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "any"
+     ],
+     "element": {
+      "3": 0,
+      "4": "any",
+      "5": 1
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "any",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "array_of_strings",
+   "nullable": true,
+   "declaration": {
+    "type": "array",
+    "element": {
+     "type": "string"
+    }
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 3,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 1,
+      "6": 3,
+      "10": {
+       "3": {}
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list"
+     ],
+     "element": {
+      "3": 2,
+      "4": "list",
+      "5": 1
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element"
+     ],
+     "element": {
+      "3": 0,
+      "4": "element",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value"
+     ],
+     "element": {
+      "1": 6,
+      "6": 0,
+      "10": {
+       "1": {}
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "array_of_variants",
+   "nullable": true,
+   "declaration": {
+    "type": "array",
+    "element": {
+     "type": "variant"
+    }
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 3,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 1,
+      "6": 3,
+      "10": {
+       "3": {}
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list"
+     ],
+     "element": {
+      "3": 2,
+      "4": "list",
+      "5": 1
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element"
+     ],
+     "element": {
+      "3": 0,
+      "4": "element",
+      "5": 1
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "array_of_objects",
+   "nullable": true,
+   "declaration": {
+    "type": "array",
+    "element": {
+     "type": "object",
+     "fields": [
+      {
+       "name": "boolean",
+       "type": "boolean"
+      },
+      {
+       "name": "int8",
+       "type": "int8"
+      },
+      {
+       "name": "int16",
+       "type": "int16"
+      },
+      {
+       "name": "int32",
+       "type": "int32"
+      }
+     ]
+    }
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 3,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 1,
+      "6": 3,
+      "10": {
+       "3": {}
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list"
+     ],
+     "element": {
+      "3": 2,
+      "4": "list",
+      "5": 1
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element"
+     ],
+     "element": {
+      "3": 0,
+      "4": "element",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 4
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "boolean"
+     ],
+     "element": {
+      "3": 0,
+      "4": "boolean",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "boolean",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "boolean",
+      "typed_value"
+     ],
+     "element": {
+      "1": 0,
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "int8"
+     ],
+     "element": {
+      "3": 0,
+      "4": "int8",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "int8",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "int8",
+      "typed_value"
+     ],
+     "element": {
+      "1": 1,
+      "6": 15,
+      "10": {
+       "10": {
+        "1": 8,
+        "2": true
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "int16"
+     ],
+     "element": {
+      "3": 0,
+      "4": "int16",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "int16",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "int16",
+      "typed_value"
+     ],
+     "element": {
+      "1": 1,
+      "6": 16,
+      "10": {
+       "10": {
+        "1": 16,
+        "2": true
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "int32"
+     ],
+     "element": {
+      "3": 0,
+      "4": "int32",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "int32",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "int32",
+      "typed_value"
+     ],
+     "element": {
+      "1": 1,
+      "3": 1,
+      "4": "typed_value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "array_of_arrays",
+   "nullable": true,
+   "declaration": {
+    "type": "array",
+    "element": {
+     "type": "array",
+     "element": {
+      "type": "int64"
+     }
+    }
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 3,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 1,
+      "6": 3,
+      "10": {
+       "3": {}
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list"
+     ],
+     "element": {
+      "3": 2,
+      "4": "list",
+      "5": 1
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element"
+     ],
+     "element": {
+      "3": 0,
+      "4": "element",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 1,
+      "6": 3,
+      "10": {
+       "3": {}
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "list"
+     ],
+     "element": {
+      "3": 2,
+      "4": "list",
+      "5": 1
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "list",
+      "element"
+     ],
+     "element": {
+      "3": 0,
+      "4": "element",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "list",
+      "element",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value"
+     ],
+     "element": {
+      "1": 2,
+      "3": 1,
+      "4": "typed_value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "depth_16_objects",
+   "nullable": true,
+   "declaration": {
+    "type": "object",
+    "fields": [
+     {
+      "name": "f",
+      "type": "object",
+      "fields": [
+       {
+        "name": "f",
+        "type": "object",
+        "fields": [
+         {
+          "name": "f",
+          "type": "object",
+          "fields": [
+           {
+            "name": "f",
+            "type": "object",
+            "fields": [
+             {
+              "name": "f",
+              "type": "object",
+              "fields": [
+               {
+                "name": "f",
+                "type": "object",
+                "fields": [
+                 {
+                  "name": "f",
+                  "type": "object",
+                  "fields": [
+                   {
+                    "name": "f",
+                    "type": "object",
+                    "fields": [
+                     {
+                      "name": "f",
+                      "type": "object",
+                      "fields": [
+                       {
+                        "name": "f",
+                        "type": "object",
+                        "fields": [
+                         {
+                          "name": "f",
+                          "type": "object",
+                          "fields": [
+                           {
+                            "name": "f",
+                            "type": "object",
+                            "fields": [
+                             {
+                              "name": "f",
+                              "type": "object",
+                              "fields": [
+                               {
+                                "name": "f",
+                                "type": "object",
+                                "fields": [
+                                 {
+                                  "name": "f",
+                                  "type": "object",
+                                  "fields": [
+                                   {
+                                    "name": "f",
+                                    "type": "string"
+                                   }
+                                  ]
+                                 }
+                                ]
+                               }
+                              ]
+                             }
+                            ]
+                           }
+                          ]
+                         }
+                        ]
+                       }
+                      ]
+                     }
+                    ]
+                   }
+                  ]
+                 }
+                ]
+               }
+              ]
+             }
+            ]
+           }
+          ]
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 3,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 1
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f"
+     ],
+     "element": {
+      "3": 0,
+      "4": "f",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 1
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f"
+     ],
+     "element": {
+      "3": 0,
+      "4": "f",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 1
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f"
+     ],
+     "element": {
+      "3": 0,
+      "4": "f",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 1
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f"
+     ],
+     "element": {
+      "3": 0,
+      "4": "f",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 1
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f"
+     ],
+     "element": {
+      "3": 0,
+      "4": "f",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 1
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f"
+     ],
+     "element": {
+      "3": 0,
+      "4": "f",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 1
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f"
+     ],
+     "element": {
+      "3": 0,
+      "4": "f",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 1
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f"
+     ],
+     "element": {
+      "3": 0,
+      "4": "f",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 1
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f"
+     ],
+     "element": {
+      "3": 0,
+      "4": "f",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 1
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f"
+     ],
+     "element": {
+      "3": 0,
+      "4": "f",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 1
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f"
+     ],
+     "element": {
+      "3": 0,
+      "4": "f",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 1
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f"
+     ],
+     "element": {
+      "3": 0,
+      "4": "f",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 1
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f"
+     ],
+     "element": {
+      "3": 0,
+      "4": "f",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 1
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f"
+     ],
+     "element": {
+      "3": 0,
+      "4": "f",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 1
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f"
+     ],
+     "element": {
+      "3": 0,
+      "4": "f",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 1
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f"
+     ],
+     "element": {
+      "3": 0,
+      "4": "f",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value",
+      "f",
+      "typed_value"
+     ],
+     "element": {
+      "1": 6,
+      "6": 0,
+      "10": {
+       "1": {}
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "depth_16_objects_and_arrays",
+   "nullable": true,
+   "declaration": {
+    "type": "array",
+    "element": {
+     "type": "object",
+     "fields": [
+      {
+       "name": "f",
+       "type": "array",
+       "element": {
+        "type": "object",
+        "fields": [
+         {
+          "name": "f",
+          "type": "array",
+          "element": {
+           "type": "object",
+           "fields": [
+            {
+             "name": "f",
+             "type": "array",
+             "element": {
+              "type": "object",
+              "fields": [
+               {
+                "name": "f",
+                "type": "array",
+                "element": {
+                 "type": "object",
+                 "fields": [
+                  {
+                   "name": "f",
+                   "type": "array",
+                   "element": {
+                    "type": "object",
+                    "fields": [
+                     {
+                      "name": "f",
+                      "type": "array",
+                      "element": {
+                       "type": "object",
+                       "fields": [
+                        {
+                         "name": "f",
+                         "type": "array",
+                         "element": {
+                          "type": "object",
+                          "fields": [
+                           {
+                            "name": "f",
+                            "type": "uuid"
+                           }
+                          ]
+                         }
+                        }
+                       ]
+                      }
+                     }
+                    ]
+                   }
+                  }
+                 ]
+                }
+               }
+              ]
+             }
+            }
+           ]
+          }
+         }
+        ]
+       }
+      }
+     ]
+    }
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 3,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 1,
+      "6": 3,
+      "10": {
+       "3": {}
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list"
+     ],
+     "element": {
+      "3": 2,
+      "4": "list",
+      "5": 1
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element"
+     ],
+     "element": {
+      "3": 0,
+      "4": "element",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 1
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f"
+     ],
+     "element": {
+      "3": 0,
+      "4": "f",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 1,
+      "6": 3,
+      "10": {
+       "3": {}
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list"
+     ],
+     "element": {
+      "3": 2,
+      "4": "list",
+      "5": 1
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element"
+     ],
+     "element": {
+      "3": 0,
+      "4": "element",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 1
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f"
+     ],
+     "element": {
+      "3": 0,
+      "4": "f",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 1,
+      "6": 3,
+      "10": {
+       "3": {}
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list"
+     ],
+     "element": {
+      "3": 2,
+      "4": "list",
+      "5": 1
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element"
+     ],
+     "element": {
+      "3": 0,
+      "4": "element",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 1
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f"
+     ],
+     "element": {
+      "3": 0,
+      "4": "f",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 1,
+      "6": 3,
+      "10": {
+       "3": {}
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list"
+     ],
+     "element": {
+      "3": 2,
+      "4": "list",
+      "5": 1
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element"
+     ],
+     "element": {
+      "3": 0,
+      "4": "element",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 1
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f"
+     ],
+     "element": {
+      "3": 0,
+      "4": "f",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 1,
+      "6": 3,
+      "10": {
+       "3": {}
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list"
+     ],
+     "element": {
+      "3": 2,
+      "4": "list",
+      "5": 1
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element"
+     ],
+     "element": {
+      "3": 0,
+      "4": "element",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 1
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f"
+     ],
+     "element": {
+      "3": 0,
+      "4": "f",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 1,
+      "6": 3,
+      "10": {
+       "3": {}
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list"
+     ],
+     "element": {
+      "3": 2,
+      "4": "list",
+      "5": 1
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element"
+     ],
+     "element": {
+      "3": 0,
+      "4": "element",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 1
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f"
+     ],
+     "element": {
+      "3": 0,
+      "4": "f",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 1,
+      "6": 3,
+      "10": {
+       "3": {}
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list"
+     ],
+     "element": {
+      "3": 2,
+      "4": "list",
+      "5": 1
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element"
+     ],
+     "element": {
+      "3": 0,
+      "4": "element",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 1
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f"
+     ],
+     "element": {
+      "3": 0,
+      "4": "f",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 1,
+      "6": 3,
+      "10": {
+       "3": {}
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list"
+     ],
+     "element": {
+      "3": 2,
+      "4": "list",
+      "5": 1
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element"
+     ],
+     "element": {
+      "3": 0,
+      "4": "element",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 1
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f"
+     ],
+     "element": {
+      "3": 0,
+      "4": "f",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "f",
+      "typed_value"
+     ],
+     "element": {
+      "1": 7,
+      "2": 16,
+      "10": {
+       "14": {}
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "names_spec_and_unicode",
+   "nullable": true,
+   "declaration": {
+    "type": "object",
+    "fields": [
+     {
+      "name": "a.b",
+      "type": "int8"
+     },
+     {
+      "name": "value",
+      "type": "string"
+     },
+     {
+      "name": "typed_value",
+      "type": "variant"
+     },
+     {
+      "name": "ключ ☃",
+      "type": "date"
+     }
+    ]
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 3,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 4
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "a.b"
+     ],
+     "element": {
+      "3": 0,
+      "4": "a.b",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "a.b",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "a.b",
+      "typed_value"
+     ],
+     "element": {
+      "1": 1,
+      "6": 15,
+      "10": {
+       "10": {
+        "1": 8,
+        "2": true
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "value"
+     ],
+     "element": {
+      "3": 0,
+      "4": "value",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "value",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "value",
+      "typed_value"
+     ],
+     "element": {
+      "1": 6,
+      "6": 0,
+      "10": {
+       "1": {}
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "typed_value"
+     ],
+     "element": {
+      "3": 0,
+      "4": "typed_value",
+      "5": 1
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "typed_value",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "ключ ☃"
+     ],
+     "element": {
+      "3": 0,
+      "4": "ключ ☃",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "ключ ☃",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "ключ ☃",
+      "typed_value"
+     ],
+     "element": {
+      "1": 1,
+      "6": 6,
+      "10": {
+       "6": {}
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "mixed_object",
+   "nullable": true,
+   "declaration": {
+    "type": "object",
+    "fields": [
+     {
+      "name": "$browser",
+      "type": "string"
+     },
+     {
+      "name": "price",
+      "type": "decimal8",
+      "precision": 18,
+      "scale": 2
+     },
+     {
+      "name": "tags",
+      "type": "array",
+      "element": {
+       "type": "string"
+      }
+     },
+     {
+      "name": "objs",
+      "type": "array",
+      "element": {
+       "type": "object",
+       "fields": [
+        {
+         "name": "k",
+         "type": "string"
+        }
+       ]
+      }
+     },
+     {
+      "name": "nested",
+      "type": "object",
+      "fields": [
+       {
+        "name": "a",
+        "type": "int64"
+       },
+       {
+        "name": "z",
+        "type": "int32"
+       }
+      ]
+     },
+     {
+      "name": "payload",
+      "type": "variant"
+     }
+    ]
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 3,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 6
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$browser"
+     ],
+     "element": {
+      "3": 0,
+      "4": "$browser",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$browser",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$browser",
+      "typed_value"
+     ],
+     "element": {
+      "1": 6,
+      "6": 0,
+      "10": {
+       "1": {}
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "price"
+     ],
+     "element": {
+      "3": 0,
+      "4": "price",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "price",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "price",
+      "typed_value"
+     ],
+     "element": {
+      "1": 2,
+      "6": 5,
+      "7": 2,
+      "8": 18,
+      "10": {
+       "5": {
+        "1": 2,
+        "2": 18
+       }
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "tags"
+     ],
+     "element": {
+      "3": 0,
+      "4": "tags",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "tags",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "tags",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 1,
+      "6": 3,
+      "10": {
+       "3": {}
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "tags",
+      "typed_value",
+      "list"
+     ],
+     "element": {
+      "3": 2,
+      "4": "list",
+      "5": 1
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "tags",
+      "typed_value",
+      "list",
+      "element"
+     ],
+     "element": {
+      "3": 0,
+      "4": "element",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "tags",
+      "typed_value",
+      "list",
+      "element",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "tags",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value"
+     ],
+     "element": {
+      "1": 6,
+      "6": 0,
+      "10": {
+       "1": {}
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "objs"
+     ],
+     "element": {
+      "3": 0,
+      "4": "objs",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "objs",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "objs",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 1,
+      "6": 3,
+      "10": {
+       "3": {}
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "objs",
+      "typed_value",
+      "list"
+     ],
+     "element": {
+      "3": 2,
+      "4": "list",
+      "5": 1
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "objs",
+      "typed_value",
+      "list",
+      "element"
+     ],
+     "element": {
+      "3": 0,
+      "4": "element",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "objs",
+      "typed_value",
+      "list",
+      "element",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "objs",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 1
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "objs",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "k"
+     ],
+     "element": {
+      "3": 0,
+      "4": "k",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "objs",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "k",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "objs",
+      "typed_value",
+      "list",
+      "element",
+      "typed_value",
+      "k",
+      "typed_value"
+     ],
+     "element": {
+      "1": 6,
+      "6": 0,
+      "10": {
+       "1": {}
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "nested"
+     ],
+     "element": {
+      "3": 0,
+      "4": "nested",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "nested",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "nested",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "nested",
+      "typed_value",
+      "a"
+     ],
+     "element": {
+      "3": 0,
+      "4": "a",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "nested",
+      "typed_value",
+      "a",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "nested",
+      "typed_value",
+      "a",
+      "typed_value"
+     ],
+     "element": {
+      "1": 2,
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "nested",
+      "typed_value",
+      "z"
+     ],
+     "element": {
+      "3": 0,
+      "4": "z",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "nested",
+      "typed_value",
+      "z",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "nested",
+      "typed_value",
+      "z",
+      "typed_value"
+     ],
+     "element": {
+      "1": 1,
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "payload"
+     ],
+     "element": {
+      "3": 0,
+      "4": "payload",
+      "5": 1
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "payload",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    }
+   ]
+  },
+  {
+   "id": "properties_sv",
+   "nullable": true,
+   "declaration": {
+    "type": "object",
+    "fields": [
+     {
+      "name": "$session_id",
+      "type": "string"
+     },
+     {
+      "name": "$window_id",
+      "type": "string"
+     },
+     {
+      "name": "$group_0",
+      "type": "string"
+     },
+     {
+      "name": "$group_1",
+      "type": "string"
+     },
+     {
+      "name": "$group_2",
+      "type": "string"
+     },
+     {
+      "name": "$group_3",
+      "type": "string"
+     },
+     {
+      "name": "$group_4",
+      "type": "string"
+     },
+     {
+      "name": "$current_url",
+      "type": "string"
+     },
+     {
+      "name": "$pathname",
+      "type": "string"
+     },
+     {
+      "name": "$host",
+      "type": "string"
+     },
+     {
+      "name": "$browser",
+      "type": "string"
+     },
+     {
+      "name": "$os",
+      "type": "string"
+     },
+     {
+      "name": "$device_type",
+      "type": "string"
+     },
+     {
+      "name": "$lib",
+      "type": "string"
+     },
+     {
+      "name": "$referring_domain",
+      "type": "string"
+     },
+     {
+      "name": "$device_id",
+      "type": "string"
+     }
+    ]
+   },
+   "elements": [
+    {
+     "path": [
+      "v"
+     ],
+     "element": {
+      "3": 1,
+      "4": "v",
+      "5": 3,
+      "9": 7,
+      "10": {
+       "16": {
+        "1": 1
+       }
+      }
+     }
+    },
+    {
+     "path": [
+      "v",
+      "metadata"
+     ],
+     "element": {
+      "1": 6,
+      "3": 0,
+      "4": "metadata"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value"
+     ],
+     "element": {
+      "3": 1,
+      "4": "typed_value",
+      "5": 16
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$session_id"
+     ],
+     "element": {
+      "3": 0,
+      "4": "$session_id",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$session_id",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$session_id",
+      "typed_value"
+     ],
+     "element": {
+      "1": 6,
+      "6": 0,
+      "10": {
+       "1": {}
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$window_id"
+     ],
+     "element": {
+      "3": 0,
+      "4": "$window_id",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$window_id",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$window_id",
+      "typed_value"
+     ],
+     "element": {
+      "1": 6,
+      "6": 0,
+      "10": {
+       "1": {}
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$group_0"
+     ],
+     "element": {
+      "3": 0,
+      "4": "$group_0",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$group_0",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$group_0",
+      "typed_value"
+     ],
+     "element": {
+      "1": 6,
+      "6": 0,
+      "10": {
+       "1": {}
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$group_1"
+     ],
+     "element": {
+      "3": 0,
+      "4": "$group_1",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$group_1",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$group_1",
+      "typed_value"
+     ],
+     "element": {
+      "1": 6,
+      "6": 0,
+      "10": {
+       "1": {}
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$group_2"
+     ],
+     "element": {
+      "3": 0,
+      "4": "$group_2",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$group_2",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$group_2",
+      "typed_value"
+     ],
+     "element": {
+      "1": 6,
+      "6": 0,
+      "10": {
+       "1": {}
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$group_3"
+     ],
+     "element": {
+      "3": 0,
+      "4": "$group_3",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$group_3",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$group_3",
+      "typed_value"
+     ],
+     "element": {
+      "1": 6,
+      "6": 0,
+      "10": {
+       "1": {}
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$group_4"
+     ],
+     "element": {
+      "3": 0,
+      "4": "$group_4",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$group_4",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$group_4",
+      "typed_value"
+     ],
+     "element": {
+      "1": 6,
+      "6": 0,
+      "10": {
+       "1": {}
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$current_url"
+     ],
+     "element": {
+      "3": 0,
+      "4": "$current_url",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$current_url",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$current_url",
+      "typed_value"
+     ],
+     "element": {
+      "1": 6,
+      "6": 0,
+      "10": {
+       "1": {}
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$pathname"
+     ],
+     "element": {
+      "3": 0,
+      "4": "$pathname",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$pathname",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$pathname",
+      "typed_value"
+     ],
+     "element": {
+      "1": 6,
+      "6": 0,
+      "10": {
+       "1": {}
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$host"
+     ],
+     "element": {
+      "3": 0,
+      "4": "$host",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$host",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$host",
+      "typed_value"
+     ],
+     "element": {
+      "1": 6,
+      "6": 0,
+      "10": {
+       "1": {}
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$browser"
+     ],
+     "element": {
+      "3": 0,
+      "4": "$browser",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$browser",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$browser",
+      "typed_value"
+     ],
+     "element": {
+      "1": 6,
+      "6": 0,
+      "10": {
+       "1": {}
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$os"
+     ],
+     "element": {
+      "3": 0,
+      "4": "$os",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$os",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$os",
+      "typed_value"
+     ],
+     "element": {
+      "1": 6,
+      "6": 0,
+      "10": {
+       "1": {}
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$device_type"
+     ],
+     "element": {
+      "3": 0,
+      "4": "$device_type",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$device_type",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$device_type",
+      "typed_value"
+     ],
+     "element": {
+      "1": 6,
+      "6": 0,
+      "10": {
+       "1": {}
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$lib"
+     ],
+     "element": {
+      "3": 0,
+      "4": "$lib",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$lib",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$lib",
+      "typed_value"
+     ],
+     "element": {
+      "1": 6,
+      "6": 0,
+      "10": {
+       "1": {}
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$referring_domain"
+     ],
+     "element": {
+      "3": 0,
+      "4": "$referring_domain",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$referring_domain",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$referring_domain",
+      "typed_value"
+     ],
+     "element": {
+      "1": 6,
+      "6": 0,
+      "10": {
+       "1": {}
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$device_id"
+     ],
+     "element": {
+      "3": 0,
+      "4": "$device_id",
+      "5": 2
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$device_id",
+      "value"
+     ],
+     "element": {
+      "1": 6,
+      "3": 1,
+      "4": "value"
+     }
+    },
+    {
+     "path": [
+      "v",
+      "typed_value",
+      "$device_id",
+      "typed_value"
+     ],
+     "element": {
+      "1": 6,
+      "6": 0,
+      "10": {
+       "1": {}
+      },
+      "3": 1,
+      "4": "typed_value"
+     }
+    }
+   ]
+  }
+ ]
+}

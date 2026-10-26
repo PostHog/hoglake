@@ -1625,7 +1625,10 @@ class ExternalMergeSortTest {
     @Test
     fun `every scalar type reads back from a spill file exactly as it was written`() {
         // The test pins the type list against the enum, so a new scalar
-        // type cannot skip this.
+        // type cannot skip this. VARIANT is a catalog scalar but a Parquet
+        // group: its spill read-back is VariantPassthroughTest's sorted
+        // rewrite, over pyhoglake-written layouts this generic writer
+        // cannot produce.
         assertThat(scalarTypes.toSet())
             .isEqualTo(ColType.entries.filter { !it.isNested && it != ColType.VARIANT }.toSet())
         val live =

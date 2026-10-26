@@ -999,6 +999,77 @@ def test_compaction_decodes_every_allowed_client_codec(catalog, ns):
     assert sum(f.record_count for f in files) == 10 * len(_ALLOWED_CODECS)
 
 
+def test_compaction_copies_a_declared_variant_table(catalog, ns, s3config):
+    """With HOGLAKE_COMPACTION_VARIANT on (ci/live-python.sh sets it), the
+    files ``Table.append`` writes into a declared variant column compact,
+    and every row reads back as the same Python value: declared keys
+    missing, values of the wrong type, a Variant null beside an SQL NULL,
+    and rows that are not objects. A dev server started without the flag
+    fails this test, since nothing compacts; set it there by hand."""
+    decl = {
+        "type": "object",
+        "fields": [
+            {"name": n, "type": "string"}
+            for n in ("$session_id", "$current_url", "$browser", "$os", "$device_id")
+        ],
+    }
+    table = ns.create_table(
+        "variant_compact",
+        pa.schema(
+            [
+                pa.field("id", pa.int64(), nullable=False),
+                variant_field("properties", decl),
+            ]
+        ),
+    )
+    rows = [
+        '{"$session_id": "s", "$browser": "Chrome", "$os": "Mac", "extra": [1, null]}',
+        '{"$browser": 5, "$os": {"v": 1}}',
+        '{"$current_url": "https://ex.am/ple?q=1"}',
+        "{}",
+        "null",
+        None,
+        '"text"',
+        "[1, 2]",
+    ]
+    column = {c.name: c for c in table.columns}["properties"]
+    schema = columns_to_arrow_schema(table.columns, variant="json")
+    inputs: set[str] = set()
+    # Six appends, over the server's default HOGLAKE_COMPACTION_MIN_INPUT_FILES=5.
+    for index in range(6):
+        ids = list(range(index * len(rows), (index + 1) * len(rows)))
+        texts = rows[index:] + rows[:index]
+        data = pa.table(
+            {"id": ids, "properties": pa.array(texts, pa.string()).cast(pa.json_())},
+            schema=schema,
+        )
+        inputs |= {f.path for f in table.append(data).files}
+
+    def values() -> dict[int, object]:
+        fs = s3config.filesystem()
+        out: dict[int, object] = {}
+        for f in table.files(snapshot=catalog.refresh().head_snapshot_id):
+            body = fs.open_input_file(f.path[len("s3://") :]).read()
+            back = pq.read_table(pa.BufferReader(body))
+            props = variant.to_python(back.column("properties"), column)
+            out.update(zip(back.column("id").to_pylist(), props, strict=True))
+        return out
+
+    before = values()
+    assert len(before) == 6 * len(rows)
+    for _ in range(5):
+        result = catalog._client._request(
+            "POST", catalog._path("/maintenance/compact"), params={"batch": 10}
+        )
+        if result["groups_compacted"] == 0:
+            break
+
+    files = table.files(snapshot=catalog.refresh().head_snapshot_id)
+    assert not inputs & {f.path for f in files}
+    assert len(files) < len(inputs)
+    assert values() == before
+
+
 def test_drop_table(catalog, ns):
     table = ns.create_table("droppable", _events_schema())
     assert "droppable" in [t.name for t in ns.list_tables()]

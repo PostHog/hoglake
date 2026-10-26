@@ -45,7 +45,10 @@ import java.util.UUID
  *    sorted group packs to the byte target like any other (the rewrite
  *    is an external merge sort; there is no row ceiling to mirror) —
  *    and OVER-REPORTING for two cases the sampler cannot see:
- *      - VARIANT tables, which CompactionService refuses to plan at all.
+ *      - VARIANT tables, which CompactionService does not plan unless
+ *        HOGLAKE_COMPACTION_VARIANT is on for the catalog, and then
+ *        refuses any group holding a file in another variant layout
+ *        than the declared one (VariantLayoutMismatchException).
  *      - Sorted groups the planner refuses on the rewrite's budgets
  *        (spill_budget_exceeded, merge_budget_exceeded). Both are
  *        configuration against the byte target and per-table (the

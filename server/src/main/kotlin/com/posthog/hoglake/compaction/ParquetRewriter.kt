@@ -44,10 +44,11 @@ import java.util.concurrent.TimeUnit
  * A compaction group whose inputs cannot be rewritten under the live
  * schema: some live column's type cannot be produced from an input
  * file's parquet type (anything outside identity or the int->long /
- * float->double promotions). The sweep treats this as skip-with-reason
- * (CompactionResult.unconvertibleSchema), never a failure.
+ * float->double promotions), or a VARIANT input in another layout
+ * ([VariantLayoutMismatchException]). The sweep treats this as
+ * skip-with-reason (CompactionResult.unconvertibleSchema), never a failure.
  */
-class UnconvertibleSchemaException(message: String) : IllegalArgumentException(message)
+open class UnconvertibleSchemaException(message: String) : IllegalArgumentException(message)
 
 /**
  * A compaction group whose SCHEMA is convertible but whose DATA is not:
@@ -252,6 +253,20 @@ class InvalidDataException(message: String) : IllegalArgumentException(message)
  * parquet spec says those names are not significant — but an input whose
  * shape disagrees with the live column's type is
  * [UnconvertibleSchemaException], never a guess.
+ *
+ * **VARIANT is copied, never decoded** (`HOGLAKE_COMPACTION_VARIANT`; off,
+ * a table with a variant at any depth is refused). hoglake#70 is in
+ * parquet-java's Variant reader, which this pipeline never uses: a
+ * variant's storage decodes as plain groups like any struct, and is
+ * written back leaf by leaf, so the bytes and the definition levels of
+ * `metadata`, `value` and every `typed_value` survive. The output's
+ * subtree is the column's DECLARED layout ([VariantLayout]), so the output
+ * schema stays a function of the catalog, and the copy is positional, so
+ * every input's subtree must BE that layout ([VariantLayout.layoutMismatch]):
+ * pyhoglake's and the Trino connector's files are; a file whose layout is
+ * any other (DuckDB shreds per file) is [VariantLayoutMismatchException],
+ * and so is one DuckDB wrote, whose top-level Variant nulls Trino reads as
+ * SQL NULL by its `created_by`, which the output does not keep.
  */
 object ParquetRewriter {
     /** The explicit row-id column compaction outputs carry. */
@@ -890,6 +905,7 @@ object ParquetRewriter {
         inputOpenParallelism: Int = DEFAULT_INPUT_OPEN_PARALLELISM,
         spill: SortSpill? = null,
         appendFloorBytes: Long = APPEND_MIN_ROW_GROUP_BYTES,
+        variantCompaction: Boolean = false,
     ): RewriteResult {
         require(inputs.isNotEmpty()) { "rewrite needs at least one input" }
         // A caller that forgot the bounds must not get an unbounded sort:
@@ -909,19 +925,21 @@ object ParquetRewriter {
         //
         // CompactionService excludes such tables from candidates by the
         // same rule, so in production this is the backstop rather than
-        // the gate.
-        if (liveColumns.allNodes().any { it.def.type == ColType.VARIANT }) {
+        // the gate. [variantCompaction] (HOGLAKE_COMPACTION_VARIANT) lifts
+        // it: a variant is then copied as its declared layout (class doc),
+        // and a declaration no layout can be derived from is refused by
+        // [VariantLayout.groupType] when the output schema is built.
+        if (!variantCompaction && liveColumns.allNodes().any { it.def.type == ColType.VARIANT }) {
             // TYPED, like every other "this shape cannot be rewritten"
             // in here. #77 used `require`, which is an
             // IllegalArgumentException: the sweep's catch-all counts
             // that as `failed_groups` and retries it every run, when the
             // honest reading is `unconvertible_schema` — a shape this
-            // rewriter cannot produce YET, which clears the day variant
-            // compaction lands rather than blaming a writer.
+            // rewriter is configured not to produce, which clears when the
+            // flag goes on rather than blaming a writer.
             throw UnconvertibleSchemaException(
-                "variant compaction is not supported: no released parquet-java can read a " +
-                    "realistic shredded variant (hoglake#70), so the rewrite would have to drop " +
-                    "or guess the payload",
+                "variant compaction is off (HOGLAKE_COMPACTION_VARIANT): a table with a variant " +
+                    "at any depth is not rewritten",
             )
         }
         // A refusal mid-write leaves a partial output — a truncated
@@ -1312,7 +1330,8 @@ object ParquetRewriter {
                 // Resolved FIRST: its refusals (a duplicated reserved id is
                 // invalid_data) take precedence over the plan's.
                 val carrier = rowIdCarrier(fileSchema, input)
-                projectRead(fileSchema, columnPlan(fileSchema, shape.liveColumns, input.label), carrier)
+                val createdBy = reader.footer.fileMetaData.createdBy
+                projectRead(fileSchema, columnPlan(fileSchema, shape.liveColumns, input.label, createdBy), carrier)
             }
 
         /** What this reader decodes: the file schema pruned to the plan. */
@@ -1764,7 +1783,9 @@ object ParquetRewriter {
         fun prim(physical: PrimitiveType.PrimitiveTypeName) = Types.primitive(physical, repetition)
 
         return when (column.def.type) {
-            ColType.VARIANT -> error("variant compaction is not supported")
+            // The group stays [repetition] like every column; below it the
+            // declared layout's own repetitions, which are structure.
+            ColType.VARIANT -> VariantLayout.groupType(column, repetition)
             ColType.BOOLEAN ->
                 prim(PrimitiveType.PrimitiveTypeName.BOOLEAN).id(id).named(name)
             ColType.INT8 -> intColumn(id, name, 8, signed = true, repetition = repetition)
@@ -1934,6 +1955,7 @@ object ParquetRewriter {
         schema: MessageType,
         liveColumns: List<Column>,
         inputPath: String,
+        createdBy: String?,
     ): List<Step?> {
         // DUPLICATE IDS, before any binding. planChildren elects the
         // FIRST field with a matching id, so a file declaring one id
@@ -1951,7 +1973,7 @@ object ParquetRewriter {
         // The FILE-level gate, computed once and threaded down — the
         // reader's gate, so the two surfaces answer the same question
         // about the same file.
-        return planChildren(schema.fields, liveColumns, FooterStats.usesFieldIds(schema), inputPath)
+        return planChildren(schema.fields, liveColumns, FooterStats.usesFieldIds(schema), inputPath, createdBy)
     }
 
     /** Field ids [fields] declares more than once, at any depth. */
@@ -1990,6 +2012,7 @@ object ParquetRewriter {
         liveColumns: List<Column>,
         useFieldIds: Boolean,
         inputPath: String,
+        createdBy: String?,
     ): List<Step?> =
         liveColumns.map { column ->
             val srcIndex =
@@ -1997,7 +2020,7 @@ object ParquetRewriter {
                     .bindIndex(srcFields, column.fieldId, column.def.name, useFieldIds)
                     .takeIf { it >= 0 }
                     ?: return@map null
-            planNode(srcFields[srcIndex], srcIndex, column, useFieldIds, inputPath)
+            planNode(srcFields[srcIndex], srcIndex, column, useFieldIds, inputPath, createdBy)
         }
 
     /**
@@ -2040,6 +2063,7 @@ object ParquetRewriter {
         column: Column,
         useFieldIds: Boolean,
         inputPath: String,
+        createdBy: String?,
     ): Step? {
         // POSITION decides, and the id only VERIFIES — the reader's rule
         // (FooterStats.childBinds), and the two have to hold the same
@@ -2056,7 +2080,7 @@ object ParquetRewriter {
         // ...and only when the FILE binds by id at all, matching the
         // reader's file-level gate.
         if (id != null && (!useFieldIds || id.intValue().toLong() != column.fieldId)) return null
-        return planNode(candidate, position, column, useFieldIds, inputPath)
+        return planNode(candidate, position, column, useFieldIds, inputPath, createdBy)
     }
 
     /**
@@ -2088,6 +2112,7 @@ object ParquetRewriter {
         column: Column,
         useFieldIds: Boolean,
         inputPath: String,
+        createdBy: String?,
     ): Step {
         fun refuseShape(detail: String): Nothing =
             throw UnconvertibleSchemaException(
@@ -2095,9 +2120,46 @@ object ParquetRewriter {
                     "produced from $inputPath: $detail",
             )
 
-        // REPETITION, before anything else. Every catalog type reachable
-        // here holds AT MOST ONE value per row: a scalar, a struct, or a
-        // container whose repetition lives in its own synthetic layer
+        // VARIANT, before the repetition check below so that every
+        // refusal of it is the typed one its counter reads. The storage is
+        // copied as it is, field by field into the output's derived layout
+        // (hoglake#70 is in parquet-java's Variant reader, which this never
+        // uses), and the copy is POSITIONAL: StructStep writes source child
+        // j as output child j, so a subtree that is not the declared layout
+        // exactly would put values under the wrong names, or fail mid-write.
+        if (column.def.type == ColType.VARIANT) {
+            fun mismatch(
+                detail: String,
+                reason: String = "layout",
+            ): Nothing =
+                throw VariantLayoutMismatchException(
+                    "variant column '${column.def.name}' in $inputPath is not the layout compaction " +
+                        "writes for it: $detail",
+                    reason,
+                )
+            // The Trino connector reads a top-level variant null in a file
+            // DuckDB wrote as SQL NULL, keyed on the file's created_by
+            // (PostHog/trino HoglakePageSourceProvider). The output is
+            // stamped parquet-mr, so copying would turn those SQL NULLs
+            // into Variant nulls. FIRST, so that it is what a DuckDB file is
+            // counted as: DuckDB shreds by what each file holds, so its
+            // files almost never match a layout either, and counting them
+            // `layout` would read as the drift that reason exists to show.
+            if (createdBy?.startsWith("DuckDB") == true) {
+                mismatch("it was written by '$createdBy', whose Variant nulls Trino reads as SQL NULL", "duckdb")
+            }
+            if (src.isPrimitive || src.isRepetition(Type.Repetition.REPEATED)) {
+                mismatch("the input field is `${VariantLayout.describe(src)}`, not one VARIANT group")
+            }
+            VariantLayout.layoutMismatch(src, VariantLayout.groupType(column, Type.Repetition.OPTIONAL))?.let {
+                mismatch(it)
+            }
+            return identityStep(src, srcIndex)
+        }
+
+        // REPETITION, before anything else but the VARIANT arm. Every
+        // catalog type reachable here holds AT MOST ONE value per row: a
+        // scalar, a struct, or a container whose repetition lives in its own synthetic layer
         // (which planNode is never handed — it descends THROUGH it). A
         // REPEATED node says "many per row", and the copy below reads
         // repetition 0 and only repetition 0. Measured before this
@@ -2144,7 +2206,10 @@ object ParquetRewriter {
                             "wearing a struct's field id is a type mismatch, not a schema evolution",
                     )
                 }
-                Step.StructStep(srcIndex, planChildren(group.fields, column.children, useFieldIds, inputPath))
+                Step.StructStep(
+                    srcIndex,
+                    planChildren(group.fields, column.children, useFieldIds, inputPath, createdBy),
+                )
             }
             ColType.LIST -> {
                 val entry =
@@ -2162,7 +2227,7 @@ object ParquetRewriter {
                     )
                 }
                 val element =
-                    planSynthetic(entry.fields, 0, column.children[0], useFieldIds, inputPath)
+                    planSynthetic(entry.fields, 0, column.children[0], useFieldIds, inputPath, createdBy)
                         ?: refuseShape("the input list's element does not match the live element field id")
                 Step.ListStep(srcIndex, element)
             }
@@ -2187,10 +2252,10 @@ object ParquetRewriter {
                     )
                 }
                 val key =
-                    planSynthetic(entry.fields, 0, column.children[0], useFieldIds, inputPath)
+                    planSynthetic(entry.fields, 0, column.children[0], useFieldIds, inputPath, createdBy)
                         ?: refuseShape("the input map's key does not match the live key field id")
                 val value =
-                    planSynthetic(entry.fields, 1, column.children[1], useFieldIds, inputPath)
+                    planSynthetic(entry.fields, 1, column.children[1], useFieldIds, inputPath, createdBy)
                         ?: refuseShape("the input map's value does not match the live value field id")
                 Step.MapStep(srcIndex, key, value)
             }
@@ -2243,7 +2308,8 @@ object ParquetRewriter {
         if (unsignedWidth != null && unsignedWidth > live.maxUnsignedParquetWidth) refuse()
 
         return when (live) {
-            ColType.VARIANT -> error("variant compaction is not supported")
+            // Unreachable: planNode copies a variant whole and never asks.
+            ColType.VARIANT -> refuse()
             ColType.BOOLEAN ->
                 if (srcName == PrimitiveType.PrimitiveTypeName.BOOLEAN) CopyMode.IDENTITY else refuse()
             // Every width <= 16 (signed or not) rides parquet INT32 and

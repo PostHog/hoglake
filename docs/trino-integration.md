@@ -405,8 +405,14 @@ reads a stored declaration as an ordinary `type_params` map; the console does no
 show `type_params`. DuckDB clients refuse VARIANT at bind (#87) and read only
 decimal parameters. Hedgerow compares `type_params` exactly, so it refuses a
 destination variant that has a declaration as a schema mismatch; it writes
-through DuckDB, which honours no declaration. Compaction still skips every table
-with a VARIANT column (#70).
+through DuckDB, which honours no declaration. Compaction skips every table with a
+VARIANT column (#70) unless the server sets `HOGLAKE_COMPACTION_VARIANT`. With it,
+compaction copies each VARIANT's storage as it is, in the layout the declaration
+gives it (the connector's, and pyhoglake's), and skips a group holding a file in
+any other layout, or one DuckDB wrote: the connector reads a DuckDB file's top-level
+Variant null as SQL NULL by its `created_by`, which a compacted file does not keep.
+A read-back of compacted variant files (parquet-mr's `created_by`, `TIME_MICROS`
+beside time leaves) through the connector is not yet in the harness either.
 
 ### Reclaiming abandoned Trino uploads
 

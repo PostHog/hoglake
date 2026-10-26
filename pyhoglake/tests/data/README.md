@@ -105,6 +105,23 @@ cp -R variant shredded_variant ../pyhoglake/tests/data/parquet-testing/
 then update the commit in this file and in `NOTICE`, and the counts the
 test pins (a silently shrunken copy must not pass).
 
+# variant/regen_passthrough_fixtures.py
+
+Writes the server's VARIANT compaction fixtures into
+`server/src/test/resources/variant/passthrough/`, which
+`VariantPassthroughTest` copies through the rewriter and compares leaf by
+leaf: `columns.json` (the live table, in the catalog's wire spelling),
+`a.parquet` and `b.parquet` (pyhoglake's declared layout, rows out of id
+order), `mismatch.parquet` (one column laid out from another declaration)
+and `duckdb.parquet` (`b` with DuckDB's `created_by` stamped over its
+own). A re-run reproduces them byte for byte:
+
+```sh
+flox activate -- uv run python tests/data/variant/regen_passthrough_fixtures.py
+```
+
+Written with pyarrow 26.0.0 on CPython 3.13.
+
 # variant/golden_storage.arrow
 
 The Variant encoder's output, as an Arrow IPC file, over the fixed corpus of
