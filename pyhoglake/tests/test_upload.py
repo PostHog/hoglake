@@ -365,9 +365,9 @@ def test_prepare_tables_refuses_a_group_without_its_variant_column(
     httpx_mock, recording_s3
 ):
     """A variant destination is written from Arrow tables now
-    (test_variant_write.py), but each group still holds every column: the
-    file comparison runs over the other columns, so a missing variant
-    column is refused by name, before any upload."""
+    (test_variant_write.py), but each group still holds every column: a
+    missing variant column is refused by the schema comparison, before any
+    upload."""
     with_variant = {
         **TABLE_WIRE,
         "columns": [
