@@ -556,6 +556,61 @@ def uuid_storage_form_schema(schema: pa.Schema) -> pa.Schema:
     return pa.schema(fields, metadata=schema.metadata)
 
 
+def _map_names_field(f: pa.Field, depth: int) -> pa.Field:
+    return f.with_type(map_names_form(f.type, depth))
+
+
+def map_names_form(t: pa.DataType, _depth: int = 1) -> pa.DataType:
+    """``t`` with every map's key and value fields named ``key`` and
+    ``value`` and its entries struct given arrow's default name.
+
+    Those names are synthetic, and no two places agree on them: parquet
+    calls the repetition group ``key_value``, pyarrow names it after the
+    map's own FIELD when it reads a footer back (the column for a
+    top-level map, ``map<string, int64 ('attrs')>``; ``element`` for a
+    list's), and other writers rename the key and value as well. Arrow's
+    ``==`` ignores them, but ``Schema.equals(check_metadata=True)``
+    compares them, so
+    :func:`~pyhoglake.parquet_schema.prepared_schema_matches`
+    refused every map-bearing prepared file, including the ones
+    ``prepare_append_tables`` had just encoded itself (hoglake#359). The
+    server binds a map's key and value by field id, never by name, and
+    accepts those files.
+
+    Only the names change. The key and value keep their
+    ``PARQUET:field_id`` metadata, nullability and type, and
+    ``keys_sorted`` rides along, so a map whose ids, nullability or shape
+    differ is still refused. The entries struct is rebuilt by arrow: it
+    is the repetition group, which carries no field id
+    (:func:`column_to_arrow_field`).
+
+    Bounded by :data:`MAX_COLUMN_NESTING_DEPTH`, as
+    :func:`uuid_storage_form` is and for the same reason. A map AT the
+    cap is not legal (its key and value would be past it), so it is
+    compared un-normalized, i.e. refused.
+    """
+    if _depth >= MAX_COLUMN_NESTING_DEPTH:
+        return t
+    deeper = _depth + 1
+    if pa.types.is_struct(t):
+        return pa.struct([_map_names_field(f, deeper) for f in t])
+    # is_map before the list family, for the reason is_list_family states.
+    if pa.types.is_map(t):
+        return pa.map_(
+            _map_names_field(t.key_field, deeper).with_name("key"),
+            _map_names_field(t.item_field, deeper).with_name("value"),
+            keys_sorted=t.keys_sorted,
+        )
+    if is_list_family(t):
+        value = _map_names_field(t.value_field, deeper)
+        if pa.types.is_large_list(t):
+            return pa.large_list(value)
+        if pa.types.is_fixed_size_list(t):
+            return pa.list_(value, t.list_size)
+        return pa.list_(value)
+    return t
+
+
 def schema_to_column_defs(schema: pa.Schema) -> list[dict[str, Any]]:
     """Convert a pyarrow schema into CreateTableRequest column defs.
 

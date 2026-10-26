@@ -33,6 +33,7 @@ from .types import (
     PARQUET_FIELD_ID_KEY,
     coltype_to_arrow,
     column_to_arrow_field,
+    map_names_form,
     uuid_storage_form,
     uuid_storage_form_schema,
 )
@@ -298,21 +299,33 @@ def prepared_schema_matches(found: pa.Schema, want: pa.Schema) -> bool:
 
     Field for field, names, nullability and the ``PARQUET:field_id``
     metadata compared exactly — the identity check that binds a file to
-    the catalog. The ONE licence is the uuid column's two legal
-    spellings: hoglake's uuid wire form is
+    the catalog. There are TWO licences. The first is the uuid column's
+    two legal spellings: hoglake's uuid wire form is
     ``FIXED_LEN_BYTE_ARRAY(16) + UUID``, which pyarrow produces only for
     ``pa.uuid()``, while every file registered before that contract (and
     any writer below the pyarrow floor) carries the bare fixed(16). The
     bytes are identical, so both are accepted, at any nesting depth
     (:func:`~pyhoglake.types.uuid_storage_form`).
 
+    The second is a map's synthetic names. Every writer and reader names
+    the entries struct, key and value differently, and pyarrow names the
+    entries after the map's own field on read, so both sides are normalized
+    (:func:`~pyhoglake.types.map_names_form`).
+
     Nothing else is loosened: the field ids still have to match, so a
-    file that annotates its uuid column but misnumbers it is refused
-    exactly as before.
+    file that annotates its uuid column but misnumbers it, or that
+    numbers a map's key or value differently, is refused exactly as
+    before.
     """
-    return uuid_storage_form_schema(found).equals(
-        uuid_storage_form_schema(want), check_metadata=True
-    )
+
+    def comparable(schema: pa.Schema) -> pa.Schema:
+        schema = uuid_storage_form_schema(schema)
+        return pa.schema(
+            [f.with_type(map_names_form(f.type)) for f in schema],
+            metadata=schema.metadata,
+        )
+
+    return comparable(found).equals(comparable(want), check_metadata=True)
 
 
 def validate_variant_file(path: str, parquet: Any, columns: tuple[Column, ...]) -> None:
