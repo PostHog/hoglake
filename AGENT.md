@@ -240,6 +240,24 @@ tree gets a "Pending note for the X.Y.Z release body" paragraph here,
 removed by the release PR that states it (the 1.3.8 `Catalog.verify()`
 removal and the 1.4.0 VARIANT-shaped struct refusal were the first two).
 
+Pending note for the 1.4.8 release body: `Table.append` and
+`Table.prepare_append_tables` write top-level `variant` columns, in the
+layout of each column's `type_params.shredding`, and take
+`variant_on_invalid=` (`"raise"`, the default, or `"null"`, refused for
+a NOT NULL variant column) and `variant_report=`. A variant column's
+values come as `pa.json_()` text, the null type (all SQL NULL), or
+storage in its declaration's write form; a plain string is refused.
+`columns_to_arrow_schema` and `column_to_arrow_field` take `variant=`
+(`"json"`, `"storage"`, `"read"`; the default still refuses), and the
+`"json"` form carries `variant_field`'s marker. `prepare_append_tables`
+no longer refuses a variant destination, and the `_hog*` check stops at
+a variant column's own name. Caveats: read-back through the Trino
+connector is not yet verified by a harness; compaction skips tables
+with a variant column (#70); DuckDB's own Parquet reader folds a
+Variant null into SQL NULL, and the hoglake DuckDB extension refuses a
+variant table at bind (#87); the files of a partitioned variant
+`append` are all in memory before the first upload.
+
 Because that version is constant between releases, it cannot tell two
 deploys apart. The image build therefore also carries a BUILD STAMP: the
 CD job passes `HOGLAKE_BUILD_STAMP` (a UTC `date -u +%Y%m%dT%H%MZ`) as a

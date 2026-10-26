@@ -3365,9 +3365,9 @@ components:
 
             A TOP-LEVEL `variant` takes `shredding`, the shredded layout
             that a writer which shreds VARIANT values (the Trino
-            connector) gives the column in its Parquet files: which
-            object fields and array elements get Parquet columns of
-            their own, and the Variant type of each. Readers use the
+            connector, pyhoglake) gives the column in its Parquet files:
+            which object fields and array elements get Parquet columns
+            of their own, and the Variant type of each. Readers use the
             layout each file's footer records, so a declaration never
             changes a read, and files written before it or without it
             stay as they are. A declaration is a tree of JSON objects,
