@@ -25,8 +25,10 @@ from pyhoglake import (
     OffsetRegressionError,
     S3Config,
     ops,
+    variant,
     variant_field,
 )
+from pyhoglake.parquet_schema import _schema_elements, _top_level
 from pyhoglake.types import columns_to_arrow_schema
 
 pytestmark = pytest.mark.integration
@@ -585,6 +587,63 @@ def test_variant_declarations_round_trip_through_the_server(ns):
     later = next(c for c in info.columns if c.name == "later")
     assert later.type_params == {"shredding": {"type": "int64"}}
     assert ns.table("variant_ddl").columns[-1].type_params == later.type_params
+
+
+def test_variant_append_round_trips_through_pyarrow(catalog, ns, s3config):
+    """JSON rows appended to a declared and an undeclared variant column
+    land as VARIANT files the server registers: the group annotated
+    VARIANT(1), no stats for the variant field ids, and the values back
+    through pyarrow and to_python."""
+    decl = {
+        "type": "object",
+        "fields": [
+            {"name": "$browser", "type": "string"},
+            {"name": "price", "type": "decimal8", "precision": 18, "scale": 2},
+        ],
+    }
+    table = ns.create_table(
+        "variant_write",
+        pa.schema(
+            [
+                pa.field("id", pa.int64(), nullable=False),
+                variant_field("properties", decl),
+                variant_field("raw", nullable=False),
+            ]
+        ),
+    )
+    props = ['{"$browser": "Chrome", "price": 9.5, "x": [1, null]}', "null", None]
+    raw = ["1", '"a"', "18446744073709551616"]
+    data = pa.table(
+        {
+            "id": [1, 2, 3],
+            "properties": pa.array(props, pa.string()).cast(pa.json_()),
+            "raw": pa.array(raw, pa.string()).cast(pa.json_()),
+        },
+        schema=columns_to_arrow_schema(table.columns, variant="json"),
+    )
+    res = table.append(data, compression="zstd", compression_level=3)
+    (f,) = table.files(snapshot=res.snapshot_id)
+    assert f.record_count == 3
+    by_name = {c.name: c for c in table.columns}
+    fs = s3config.filesystem()
+    body = fs.open_input_file(f.path[len("s3://") :]).read()
+    assert f.file_size_bytes == len(body)
+    groups = {e.get(4): e for e, _, _ in _top_level(_schema_elements(body))}
+    for name in ("properties", "raw"):
+        assert groups[name][10] == {16: {1: 1}}
+        assert groups[name][9] == by_name[name].field_id
+    back = pq.read_table(pa.BufferReader(body))
+    assert back.column("id").to_pylist() == [1, 2, 3]
+    assert variant.to_python(back.column("properties"), by_name["properties"]) == [
+        {"$browser": "Chrome", "price": 9.5, "x": [1, None]},
+        variant.VARIANT_NULL,
+        None,
+    ]
+    assert variant.to_python(back.column("raw"), by_name["raw"]) == [
+        1,
+        "a",
+        Decimal(18446744073709551616),
+    ]
 
 
 def test_alter_add_column_then_append(catalog, ns):

@@ -361,9 +361,13 @@ def test_prepare_tables_carries_partition_values_and_input_order(httpx_mock):
     ]
 
 
-def test_prepare_tables_refuses_a_variant_destination(httpx_mock, recording_s3):
-    """An Arrow rewrite drops the native VARIANT annotation, so there is
-    no honest way to serve a variant destination from an Arrow table."""
+def test_prepare_tables_refuses_a_group_without_its_variant_column(
+    httpx_mock, recording_s3
+):
+    """A variant destination is written from Arrow tables now
+    (test_variant_write.py), but each group still holds every column: the
+    file comparison runs over the other columns, so a missing variant
+    column is refused by name, before any upload."""
     with_variant = {
         **TABLE_WIRE,
         "columns": [
@@ -379,7 +383,7 @@ def test_prepare_tables_refuses_a_variant_destination(httpx_mock, recording_s3):
     }
     table = resolved_table(httpx_mock, recording_s3, with_variant)
     schema = columns_to_arrow_schema(table.columns[:2])
-    with pytest.raises(ValidationError, match="native Parquet VARIANT") as excinfo:
+    with pytest.raises(ValidationError, match="schema/field IDs") as excinfo:
         table.prepare_append_tables(
             [(_rows(1, schema), None)], idempotency_key=str(uuid.uuid4())
         )
