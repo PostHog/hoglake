@@ -2790,7 +2790,7 @@ class TestNestedJsonColumns:
             path.write_bytes(store.files[key])
             with pq.ParquetFile(path) as parquet:
                 assert prepared_schema_matches(
-                    flush_mod.file_schema(parquet.schema_arrow),
+                    parquet.schema_arrow,
                     flush_mod._encode_schema(flush_mod.arrow_schema(info.columns)),
                 )
                 table = parquet.read()
