@@ -40,7 +40,6 @@ from __future__ import annotations
 import asyncio
 import importlib.metadata
 import logging
-import struct
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -54,7 +53,6 @@ from urllib.parse import quote
 import httpx
 import pyarrow as pa
 import pyarrow.compute as pc
-import pyarrow.parquet as pq
 from pyhoglake import (
     Catalog,
     Column,
@@ -70,10 +68,10 @@ from pyhoglake import (
     TableInfo,
     UnsupportedTypeError,
     ValidationError,
+    parquet_write_options,
+    write_part,
 )
 from pyhoglake.models import PartitionSpec
-from pyhoglake.parquet_schema import prepared_schema_matches
-from pyhoglake.stats import extract_column_stats
 from pyhoglake.transforms import (
     partition_source_array,
     transform_strings,
@@ -214,6 +212,10 @@ class FlushStats:
     ambiguous_uploads: int = 0
     dropped_payload_keys: int = 0
     values_clamped: Mapping[str, int] = dataclass_field(default_factory=dict)
+    #: Seconds the builds that returned a plan spent per stage (``BUILD_STAGES``).
+    build_seconds: Mapping[str, float] = dataclass_field(default_factory=dict)
+    #: Seconds builds (raised ones too) waited, after submission, for a pool thread.
+    build_queue_seconds: float = 0.0
 
 
 # -- the payload decoder --------------------------------------------------------
@@ -391,10 +393,12 @@ def _encode_field(f: pa.Field) -> pa.Field:
 
 def _encode_schema(schema: pa.Schema) -> pa.Schema:
     """The parquet-encoding schema: the catalog schema with field ids,
-    plus the one storage conversion pyhoglake's writer path makes —
-    Parquet has no seconds timestamp unit, so ``timestamp_s`` is stored
-    as milliseconds (mirrors ``Table._prepare_append``, which does it for
-    top-level columns; this does it at every depth)."""
+    every ``timestamp_s`` (at any depth) as the milliseconds Parquet
+    stores. ``write_part`` takes seconds as well, but writes the Arrow
+    schema it is given into the footer, so seconds would be other bytes
+    than this cast writes (the golden fixture pins them); and the cast
+    belongs to the batch build, where a value that fails it is isolated
+    to its record (:data:`_BUILD_FAILURES`)."""
     return pa.schema(
         [_encode_field(field) for field in schema], metadata=schema.metadata
     )
@@ -431,15 +435,16 @@ _SORT_NULL_ORDERS: Final = {"nulls_first": "at_start", "nulls_last": "at_end"}
 
 
 #: Column types that are no partition or sort source: containers have no
-#: single value per row, and a json value has no order or transform this
-#: writer (or the server) defines.
-_UNORDERED_TYPES: Final = frozenset({"struct", "list", "map", "json"})
+#: single value per row, and a json or variant value has no order or
+#: transform this writer (or the server) defines. variant is listed, not
+#: left to the decoder's refusal, so it stays refused when that lifts.
+_UNORDERED_TYPES: Final = frozenset({"struct", "list", "map", "json", "variant"})
 _REPEATED_TYPES: Final = frozenset({"list", "map"})
 
 
 def _source_fault(chain: tuple[Column, ...]) -> str | None:
     """Why a partition/sort source chain cannot be read as one scalar per
-    row, or None: a container or json leaf, or a leaf under a
+    row, or None: a container, json or variant leaf, or a leaf under a
     list or a map (many values per row). A struct leaf is fine — it is
     read by path."""
     leaf = chain[-1]
@@ -461,8 +466,8 @@ def _spec_sort_keys(info: TableInfo) -> list[tuple[tuple[str, ...], str, str]]:
     is its root-to-leaf name path); ``[]`` for an unsorted table.
 
     A field that does not resolve to a live column, resolves to one that
-    is not one scalar per row (a container, json, or a leaf
-    under a list or a map), or carries a direction/null_order outside the
+    is not one scalar per row (a container, a json or variant
+    column, or a leaf under a list or a map), or carries a direction/null_order outside the
     wire vocabulary, is a shape this writer cannot honor — refused
     LOUDLY (the same posture as the partition-spec guard below), never
     silently unsorted: an unsorted file under a sorted spec is exactly
@@ -762,13 +767,16 @@ class FlushPlan:
     dropped_indices: tuple[int, ...] = ()
     #: Timestamps clamped to years 1–9999, by dotted column path.
     clamped: Mapping[str, int] = dataclass_field(default_factory=dict)
+    #: Seconds the build spent per stage (:data:`BUILD_STAGES`).
+    stage_seconds: Mapping[str, float] = dataclass_field(default_factory=dict)
 
 
-def _footer_size(raw: bytes) -> int:
-    """The 4-byte LE thrift footer length stored in the parquet trailer,
-    excluding the 8-byte suffix (pyhoglake's wire convention)."""
-    (meta_len,) = struct.unpack("<I", raw[-8:-4])
-    return int(meta_len)
+#: The build's timed stages, in order (``millrace_flush_build_seconds_total``).
+BUILD_STAGES: Final = ("decode", "build", "sort", "fanout", "write")
+#: zstd at compaction's level (ParquetRewriter.DEFAULT_ZSTD_LEVEL): pyarrow's
+#: default snappy left files ~3x larger than compaction's rewrite of them, in
+#: upload bytes and in the spool. Validated at import, so at startup.
+_WRITE_OPTIONS: Final = parquet_write_options("zstd", 3)
 
 
 def build_flush_plan(
@@ -780,16 +788,27 @@ def build_flush_plan(
     max_files_per_commit: int,
     footer_stats_min_bytes: int,
     version: str,
+    clock: Callable[[], float] = time.perf_counter,
 ) -> FlushPlan:
     """Decode → Arrow → sort by the live sort spec → fan out by the live
-    partition spec → parquet → commit requests of at most
-    ``max_files_per_commit`` files each. Pure: no I/O, no clock.
+    partition spec → parquet (pyhoglake's ``write_part``, one file per
+    tuple) → commit requests of at most ``max_files_per_commit`` files
+    each. Pure: no I/O; ``clock`` only times the stages.
 
     Sorting happens before the fanout (a group filter keeps row order),
     so every file is key-nondecreasing under the sort spec compaction
     enforces; staging order is Kafka offset order, not event time."""
     if max_files_per_commit < 1:
         raise ValueError("max_files_per_commit must be >= 1")
+    seconds = dict.fromkeys(BUILD_STAGES, 0.0)
+    mark = clock()
+
+    def lap(stage: str) -> None:
+        nonlocal mark
+        now = clock()
+        seconds[stage] += now - mark
+        mark = now
+
     decoder = JsonObjectDecoder(info.columns)
     staged_bytes = sum(len(payload) for _, payload in records)
     good: list[tuple[keyspace.RowKey, bytes, DecodedRecord]] = []
@@ -809,6 +828,7 @@ def build_flush_plan(
         dropped_keys.update(record.dropped_keys)
         good.append((row_key, payload_bytes, record))
         good_indices.append(index)
+    lap("decode")
     if not good:
         return FlushPlan(
             (),
@@ -819,6 +839,7 @@ def build_flush_plan(
             tuple(sorted(dropped_keys)),
             tuple(dropped_indices),
             dict(decoder.clamped),
+            seconds,
         )
 
     encoded = _build_batch_or_raise(good, decoder.columns)
@@ -826,16 +847,17 @@ def build_flush_plan(
     # The decoded rows are the bulk of the build's memory; the parquet
     # writes below need only the encoded table.
     del good
-    encode_schema = encoded.schema
     # A row-index column rides through the sort and the fanout so each
     # file knows which staged rows it holds (a commit settles its own
     # rows as soon as it lands); it is dropped before the parquet write.
     encoded = encoded.append_column(
         _ROW_INDEX, pa.array(range(good_count), type=pa.int64())
     )
+    lap("build")
     sort_keys = _spec_sort_keys(info)
     if sort_keys:
         encoded = _sort_batch_by_spec(encoded, sort_keys)
+    lap("sort")
     spec = info.partition_spec
     parts: list[tuple[tuple[str | None, ...] | None, pa.Table]]
     if spec is not None and spec.fields:
@@ -843,6 +865,7 @@ def build_flush_plan(
     else:
         parts = [(None, encoded)]
     del encoded
+    lap("fanout")
 
     label = keyspace.group_label(ctx.group_fields, ctx.group)
     base = f"{data_path.rstrip('/')}/data/{info.namespace}/{info.name}/{ctx.build}"
@@ -853,34 +876,27 @@ def build_flush_plan(
         parts[index] = (partition_values, _EMPTY)
         rows: list[int] = part.column(_ROW_INDEX).to_pylist()
         part = part.drop_columns([_ROW_INDEX])
-        sink = pa.BufferOutputStream()
-        # zstd at compaction's level (ParquetRewriter.DEFAULT_ZSTD_LEVEL):
-        # pyarrow's default snappy left files ~3x larger than compaction's
-        # rewrite of them, in upload bytes and in the spool.
-        pq.write_table(part, sink, compression="zstd", compression_level=3)
+        try:
+            written = write_part(part, info.columns, write_options=_WRITE_OPTIONS)
+        except ValidationError as e:
+            # The core reads the footer back and holds it to the
+            # destination's schema; the table was built at that schema.
+            raise FlushError(
+                f"the encoded parquet is not the destination's (a millrace "
+                f"encoder bug): {e}"
+            ) from e
         del part
-        raw = sink.getvalue()
-        with pq.ParquetFile(pa.BufferReader(raw)) as parquet:
-            if not prepared_schema_matches(parquet.schema_arrow, encode_schema):
-                raise FlushError(
-                    "encoded parquet schema/field ids differ from the "
-                    "destination schema (a millrace encoder bug)"
-                )
-            metadata = parquet.metadata
         uri = f"{base}/{index}.parquet"
-        registration: dict[str, Any] = {
-            "path": uri,
-            "record_count": metadata.num_rows,
-            "file_size_bytes": raw.size,
-            "footer_size": _footer_size(bytes(raw[-8:])),
-        }
-        if raw.size >= footer_stats_min_bytes:
-            registration["column_stats"] = [
-                stat.to_wire() for stat in extract_column_stats(metadata, info.columns)
-            ]
-        if partition_values is not None:
-            registration["partition_values"] = list(partition_values)
-        files.append((registration, Upload(uri=uri, size=raw.size, body=raw), rows))
+        registration = written.registration(
+            uri,
+            info.columns,
+            stats=written.size >= footer_stats_min_bytes,
+            partition_values=partition_values,
+        )
+        files.append(
+            (registration, Upload(uri=uri, size=written.size, body=written.body), rows)
+        )
+        lap("write")
 
     chunks = [
         files[i : i + max_files_per_commit]
@@ -933,10 +949,19 @@ def build_flush_plan(
         dropped_keys=tuple(sorted(dropped_keys)),
         dropped_indices=tuple(dropped_indices),
         clamped=dict(decoder.clamped),
+        stage_seconds=seconds,
     )
 
 
 _EMPTY: Final = pa.table({})
+
+
+def _started[R](fn: Callable[[], R], clock: Callable[[], float], at: list[float]) -> R:
+    """``fn``'s result, after appending to ``at`` when it began on
+    ``clock``: the submitter subtracts its submit time for the wait for a
+    pool thread, and reads it whether ``fn`` returns or raises."""
+    at.append(clock())
+    return fn()
 
 
 FlushOutcome = Literal["committed", "dropped", "empty"]
@@ -1353,6 +1378,8 @@ class HoglakeFlusher:
         self._pinned_stages: set[str] = set()
         self._values_clamped: dict[str, int] = {}
         self._clamp_logged: dict[str, float] = {}
+        self._build_seconds = dict.fromkeys(BUILD_STAGES, 0.0)
+        self._build_queue_seconds = 0.0
 
     def close(self) -> None:
         """Close the HTTP client and (if owned) the executor. Idempotent."""
@@ -1393,6 +1420,8 @@ class HoglakeFlusher:
             ambiguous_uploads=self._ambiguous_uploads,
             values_clamped=dict(self._values_clamped),
             dropped_payload_keys=self._dropped_payload_keys,
+            build_seconds=dict(self._build_seconds),
+            build_queue_seconds=self._build_queue_seconds,
         )
 
     async def check_stage_identity(
@@ -1813,18 +1842,34 @@ class HoglakeFlusher:
                 table_uuid=self._table_uuid,
                 build=self._new_token(),
             )
-            plan = await self._io(
-                partial(
-                    build_flush_plan,
-                    [scan.rows[k] for k in inputs[i]],
-                    info,
-                    ctx=ctx,
-                    data_path=self._catalog.data_path,
-                    max_files_per_commit=self._cfg.max_files_per_commit,
-                    footer_stats_min_bytes=FOOTER_STATS_MIN_BYTES,
-                    version=_millrace_version(),
+            started: list[float] = []
+            submitted = self._monotonic()
+            try:
+                plan = await self._io(
+                    partial(
+                        _started,
+                        partial(
+                            build_flush_plan,
+                            [scan.rows[k] for k in inputs[i]],
+                            info,
+                            ctx=ctx,
+                            data_path=self._catalog.data_path,
+                            max_files_per_commit=self._cfg.max_files_per_commit,
+                            footer_stats_min_bytes=FOOTER_STATS_MIN_BYTES,
+                            version=_millrace_version(),
+                        ),
+                        self._monotonic,
+                        started,
+                    )
                 )
-            )
+            finally:
+                # Summed here, on the loop, never on the pool's threads; a
+                # build that raised waited all the same. Its stage seconds
+                # ride on the plan, so only a returned plan's are counted.
+                if started:
+                    self._build_queue_seconds += started[0] - submitted
+            for name, seconds in plan.stage_seconds.items():
+                self._build_seconds[name] += seconds
             return plan, keyspace.group_label(fields, scan.group)
 
         outcomes = await asyncio.gather(

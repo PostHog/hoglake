@@ -1,0 +1,1926 @@
+{
+ "cases": {
+  "fanout-deferred-stats": [
+   {
+    "registration": {
+     "file_size_bytes": 12994,
+     "footer_size": 9472,
+     "partition_values": [
+      "1",
+      "20833"
+     ],
+     "path": "s3://bkt/lake/data/ns1/events/golden/0.parquet",
+     "record_count": 4
+    },
+    "sha256": "5c51e9548c17f96c0282d9aa56f370c2f5a14aa4ac047f35fd96192591f0618a"
+   },
+   {
+    "registration": {
+     "file_size_bytes": 12959,
+     "footer_size": 9463,
+     "partition_values": [
+      "2",
+      "20833"
+     ],
+     "path": "s3://bkt/lake/data/ns1/events/golden/1.parquet",
+     "record_count": 4
+    },
+    "sha256": "42755676d472e7431200c72d95df82d8d1f10656bf4c1361119141d22cf5c207"
+   },
+   {
+    "registration": {
+     "file_size_bytes": 13071,
+     "footer_size": 9463,
+     "partition_values": [
+      "0",
+      "20833"
+     ],
+     "path": "s3://bkt/lake/data/ns1/events/golden/2.parquet",
+     "record_count": 4
+    },
+    "sha256": "520a861ebf02fabe5a5caef7750b691403710dda213eff32efc233ea6b1fbb43"
+   },
+   {
+    "registration": {
+     "file_size_bytes": 13059,
+     "footer_size": 9467,
+     "partition_values": [
+      "2",
+      "20834"
+     ],
+     "path": "s3://bkt/lake/data/ns1/events/golden/3.parquet",
+     "record_count": 4
+    },
+    "sha256": "123830ab36f54e67f1dca83c59dd04deed3c291d33aac328e31a9e6b95449763"
+   },
+   {
+    "registration": {
+     "file_size_bytes": 12974,
+     "footer_size": 9467,
+     "partition_values": [
+      "0",
+      "20834"
+     ],
+     "path": "s3://bkt/lake/data/ns1/events/golden/4.parquet",
+     "record_count": 4
+    },
+    "sha256": "a509782cdf6f946f055bfae011ba31ca5cce4a5753a9f664679feb940ae4e908"
+   },
+   {
+    "registration": {
+     "file_size_bytes": 12950,
+     "footer_size": 9463,
+     "partition_values": [
+      "1",
+      "20834"
+     ],
+     "path": "s3://bkt/lake/data/ns1/events/golden/5.parquet",
+     "record_count": 4
+    },
+    "sha256": "36ade18292cb45ee5c769eb738ef02884b1b3250685180457c7baa2048756c5d"
+   }
+  ],
+  "fanout-footer-stats": [
+   {
+    "registration": {
+     "column_stats": [
+      {
+       "field_id": 1,
+       "lower_bound": "AQAAAAAAAAA=",
+       "null_count": 0,
+       "size_bytes": 106,
+       "upper_bound": "AQAAAAAAAAA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 2,
+       "lower_bound": "gKVqHxdlBgA=",
+       "null_count": 0,
+       "size_bytes": 131,
+       "upper_bound": "AEHtJhdlBgA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 3,
+       "lower_bound": "AQ==",
+       "null_count": 1,
+       "size_bytes": 51,
+       "upper_bound": "AQ==",
+       "value_count": 4
+      },
+      {
+       "field_id": 4,
+       "lower_bound": "6v///w==",
+       "null_count": 1,
+       "size_bytes": 101,
+       "upper_bound": "9v///w==",
+       "value_count": 4
+      },
+      {
+       "field_id": 5,
+       "lower_bound": "uAsAAA==",
+       "null_count": 1,
+       "size_bytes": 101,
+       "upper_bound": "yBkAAA==",
+       "value_count": 4
+      },
+      {
+       "field_id": 6,
+       "lower_bound": "YIDo/w==",
+       "null_count": 1,
+       "size_bytes": 101,
+       "upper_bound": "oFH1/w==",
+       "value_count": 4
+      },
+      {
+       "field_id": 7,
+       "lower_bound": "CgAAAA==",
+       "null_count": 1,
+       "size_bytes": 89,
+       "upper_bound": "FgAAAA==",
+       "value_count": 4
+      },
+      {
+       "field_id": 8,
+       "lower_bound": "cBcAAA==",
+       "null_count": 1,
+       "size_bytes": 89,
+       "upper_bound": "kDMAAA==",
+       "value_count": 4
+      },
+      {
+       "field_id": 9,
+       "lower_bound": "6idr7gAAAAA=",
+       "null_count": 1,
+       "size_bytes": 129,
+       "upper_bound": "9idr7gAAAAA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 10,
+       "lower_bound": "AAAgQA==",
+       "null_count": 1,
+       "size_bytes": 101,
+       "upper_bound": "AACwQA==",
+       "value_count": 4
+      },
+      {
+       "field_id": 11,
+       "lower_bound": "q6qqqqqqCkA=",
+       "null_count": 1,
+       "size_bytes": 129,
+       "upper_bound": "VVVVVVVVHUA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 12,
+       "lower_bound": "ZXZlbnQtMTAtw6k=",
+       "null_count": 1,
+       "size_bytes": 120,
+       "upper_bound": "ZXZlbnQtMjItw6k=",
+       "value_count": 4
+      },
+      {
+       "field_id": 13,
+       "lower_bound": "AAEC/w==",
+       "null_count": 1,
+       "size_bytes": 84,
+       "upper_bound": "AAEC/w==",
+       "value_count": 4
+      },
+      {
+       "field_id": 14,
+       "lower_bound": "C47punmhTz635WoLarbwEA==",
+       "null_count": 1,
+       "size_bytes": 127,
+       "upper_bound": "C47punmhTz635WoLarbwIg==",
+       "value_count": 4
+      },
+      {
+       "field_id": 15,
+       "lower_bound": "A/I=",
+       "null_count": 1,
+       "size_bytes": 108,
+       "upper_bound": "CK4=",
+       "value_count": 4
+      },
+      {
+       "field_id": 16,
+       "lower_bound": "YVEAAA==",
+       "null_count": 1,
+       "size_bytes": 92,
+       "upper_bound": "YVEAAA==",
+       "value_count": 4
+      },
+      {
+       "field_id": 17,
+       "lower_bound": "QLRLawAAAAA=",
+       "null_count": 1,
+       "size_bytes": 129,
+       "upper_bound": "QIzBcgUAAAA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 18,
+       "lower_bound": "gBYxKRdlBgA=",
+       "null_count": 1,
+       "size_bytes": 129,
+       "upper_bound": "gDHoKRdlBgA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 19,
+       "lower_bound": "EKeYKBdlBgA=",
+       "null_count": 1,
+       "size_bytes": 129,
+       "upper_bound": "8NWYKBdlBgA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 20,
+       "lower_bound": "H80Pm3bi+hg=",
+       "null_count": 1,
+       "size_bytes": 129,
+       "upper_bound": "K80Pm3bi+hg=",
+       "value_count": 4
+      },
+      {
+       "field_id": 21,
+       "lower_bound": "AICYKBdlBgA=",
+       "null_count": 1,
+       "size_bytes": 112,
+       "upper_bound": "AICYKBdlBgA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 22,
+       "lower_bound": "eyJrIjpbMTAsbnVsbCx7InoiOnRydWV9XSwiYSI6IngifQ==",
+       "null_count": 1,
+       "size_bytes": 191,
+       "upper_bound": "eyJrIjpbMjIsbnVsbCx7InoiOnRydWV9XSwiYSI6IngifQ==",
+       "value_count": 4
+      },
+      {
+       "field_id": 24,
+       "lower_bound": "gPcmLxdlBgA=",
+       "null_count": 1,
+       "size_bytes": 130,
+       "upper_bound": "gCAFNxdlBgA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 25,
+       "lower_bound": "cDEw",
+       "null_count": 1,
+       "size_bytes": 97,
+       "upper_bound": "cDIy",
+       "value_count": 4
+      },
+      {
+       "field_id": 27,
+       "lower_bound": "YQ==",
+       "null_count": 4,
+       "size_bytes": 111,
+       "upper_bound": "dDIy",
+       "value_count": 10
+      },
+      {
+       "field_id": 30,
+       "lower_bound": "czEw",
+       "null_count": 4,
+       "size_bytes": 104,
+       "upper_bound": "czIy",
+       "value_count": 7
+      },
+      {
+       "field_id": 31,
+       "lower_bound": "gM5IJxdlBgA=",
+       "null_count": 4,
+       "size_bytes": 137,
+       "upper_bound": "gOn/JxdlBgA=",
+       "value_count": 7
+      },
+      {
+       "field_id": 33,
+       "lower_bound": "eA==",
+       "null_count": 1,
+       "size_bytes": 87,
+       "upper_bound": "eQ==",
+       "value_count": 7
+      },
+      {
+       "field_id": 34,
+       "lower_bound": "AAAAAAAALkA=",
+       "null_count": 4,
+       "size_bytes": 136,
+       "upper_bound": "AAAAAACAQEA=",
+       "value_count": 7
+      },
+      {
+       "field_id": 35,
+       "lower_bound": "APnM2KHFB//q",
+       "null_count": 1,
+       "size_bytes": 109,
+       "upper_bound": "APnM2KHFB//2",
+       "value_count": 4
+      },
+      {
+       "field_id": 37,
+       "lower_bound": "Cg==",
+       "null_count": 4,
+       "size_bytes": 121,
+       "upper_bound": "AP/////////1",
+       "value_count": 10
+      }
+     ],
+     "file_size_bytes": 12994,
+     "footer_size": 9472,
+     "partition_values": [
+      "1",
+      "20833"
+     ],
+     "path": "s3://bkt/lake/data/ns1/events/golden/0.parquet",
+     "record_count": 4
+    },
+    "sha256": "5c51e9548c17f96c0282d9aa56f370c2f5a14aa4ac047f35fd96192591f0618a"
+   },
+   {
+    "registration": {
+     "column_stats": [
+      {
+       "field_id": 1,
+       "lower_bound": "AgAAAAAAAAA=",
+       "null_count": 0,
+       "size_bytes": 106,
+       "upper_bound": "AgAAAAAAAAA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 2,
+       "lower_bound": "AEVAIBdlBgA=",
+       "null_count": 0,
+       "size_bytes": 131,
+       "upper_bound": "gODCJxdlBgA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 3,
+       "lower_bound": "AQ==",
+       "null_count": 1,
+       "size_bytes": 51,
+       "upper_bound": "AQ==",
+       "value_count": 4
+      },
+      {
+       "field_id": 4,
+       "lower_bound": "7P///w==",
+       "null_count": 1,
+       "size_bytes": 101,
+       "upper_bound": "/v///w==",
+       "value_count": 4
+      },
+      {
+       "field_id": 5,
+       "lower_bound": "WAIAAA==",
+       "null_count": 1,
+       "size_bytes": 101,
+       "upper_bound": "cBcAAA==",
+       "value_count": 4
+      },
+      {
+       "field_id": 6,
+       "lower_bound": "QKPq/w==",
+       "null_count": 1,
+       "size_bytes": 101,
+       "upper_bound": "IN39/w==",
+       "value_count": 4
+      },
+      {
+       "field_id": 7,
+       "lower_bound": "AgAAAA==",
+       "null_count": 1,
+       "size_bytes": 89,
+       "upper_bound": "FAAAAA==",
+       "value_count": 4
+      },
+      {
+       "field_id": 8,
+       "lower_bound": "sAQAAA==",
+       "null_count": 1,
+       "size_bytes": 89,
+       "upper_bound": "4C4AAA==",
+       "value_count": 4
+      },
+      {
+       "field_id": 9,
+       "lower_bound": "7Cdr7gAAAAA=",
+       "null_count": 1,
+       "size_bytes": 129,
+       "upper_bound": "/idr7gAAAAA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 10,
+       "lower_bound": "AAAAPw==",
+       "null_count": 1,
+       "size_bytes": 101,
+       "upper_bound": "AACgQA==",
+       "value_count": 4
+      },
+      {
+       "field_id": 11,
+       "lower_bound": "VVVVVVVV5T8=",
+       "null_count": 1,
+       "size_bytes": 123,
+       "upper_bound": "q6qqqqqqGkA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 12,
+       "lower_bound": "ZXZlbnQtMi3DqQ==",
+       "null_count": 1,
+       "size_bytes": 119,
+       "upper_bound": "ZXZlbnQtOC3DqQ==",
+       "value_count": 4
+      },
+      {
+       "field_id": 13,
+       "lower_bound": "AAEC/w==",
+       "null_count": 1,
+       "size_bytes": 84,
+       "upper_bound": "AAEC/w==",
+       "value_count": 4
+      },
+      {
+       "field_id": 14,
+       "lower_bound": "C47punmhTz635WoLarbwAg==",
+       "null_count": 1,
+       "size_bytes": 127,
+       "upper_bound": "C47punmhTz635WoLarbwIA==",
+       "value_count": 4
+      },
+      {
+       "field_id": 15,
+       "lower_bound": "AMo=",
+       "null_count": 1,
+       "size_bytes": 108,
+       "upper_bound": "B+Q=",
+       "value_count": 4
+      },
+      {
+       "field_id": 16,
+       "lower_bound": "YVEAAA==",
+       "null_count": 1,
+       "size_bytes": 92,
+       "upper_bound": "YVEAAA==",
+       "value_count": 4
+      },
+      {
+       "field_id": 17,
+       "lower_bound": "QLRLawAAAAA=",
+       "null_count": 1,
+       "size_bytes": 129,
+       "upper_bound": "QNToHwcAAAA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 18,
+       "lower_bound": "gAS3KBdlBgA=",
+       "null_count": 1,
+       "size_bytes": 129,
+       "upper_bound": "AK3JKRdlBgA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 19,
+       "lower_bound": "0IeYKBdlBgA=",
+       "null_count": 1,
+       "size_bytes": 129,
+       "upper_bound": "IM6YKBdlBgA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 20,
+       "lower_bound": "F80Pm3bi+hg=",
+       "null_count": 1,
+       "size_bytes": 129,
+       "upper_bound": "Kc0Pm3bi+hg=",
+       "value_count": 4
+      },
+      {
+       "field_id": 21,
+       "lower_bound": "AICYKBdlBgA=",
+       "null_count": 1,
+       "size_bytes": 112,
+       "upper_bound": "AICYKBdlBgA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 22,
+       "lower_bound": "eyJrIjpbMixudWxsLHsieiI6dHJ1ZX1dLCJhIjoieCJ9",
+       "null_count": 1,
+       "size_bytes": 189,
+       "upper_bound": "eyJrIjpbOCxudWxsLHsieiI6dHJ1ZX1dLCJhIjoieCJ9",
+       "value_count": 4
+      },
+      {
+       "field_id": 24,
+       "lower_bound": "gDHoKRdlBgA=",
+       "null_count": 1,
+       "size_bytes": 130,
+       "upper_bound": "AG+1NRdlBgA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 25,
+       "lower_bound": "cDI=",
+       "null_count": 1,
+       "size_bytes": 93,
+       "upper_bound": "cDg=",
+       "value_count": 4
+      },
+      {
+       "field_id": 27,
+       "lower_bound": "YQ==",
+       "null_count": 4,
+       "size_bytes": 108,
+       "upper_bound": "dDg=",
+       "value_count": 10
+      },
+      {
+       "field_id": 30,
+       "lower_bound": "czI=",
+       "null_count": 4,
+       "size_bytes": 100,
+       "upper_bound": "czg=",
+       "value_count": 7
+      },
+      {
+       "field_id": 31,
+       "lower_bound": "AFNnJxdlBgA=",
+       "null_count": 4,
+       "size_bytes": 137,
+       "upper_bound": "gPt5KBdlBgA=",
+       "value_count": 7
+      },
+      {
+       "field_id": 33,
+       "lower_bound": "eA==",
+       "null_count": 1,
+       "size_bytes": 87,
+       "upper_bound": "eQ==",
+       "value_count": 7
+      },
+      {
+       "field_id": 34,
+       "lower_bound": "AAAAAAAACEA=",
+       "null_count": 4,
+       "size_bytes": 130,
+       "upper_bound": "AAAAAAAAPkA=",
+       "value_count": 7
+      },
+      {
+       "field_id": 35,
+       "lower_bound": "APnM2KHFB//s",
+       "null_count": 1,
+       "size_bytes": 109,
+       "upper_bound": "APnM2KHFB//+",
+       "value_count": 4
+      },
+      {
+       "field_id": 37,
+       "lower_bound": "Ag==",
+       "null_count": 4,
+       "size_bytes": 121,
+       "upper_bound": "AP/////////9",
+       "value_count": 10
+      }
+     ],
+     "file_size_bytes": 12959,
+     "footer_size": 9463,
+     "partition_values": [
+      "2",
+      "20833"
+     ],
+     "path": "s3://bkt/lake/data/ns1/events/golden/1.parquet",
+     "record_count": 4
+    },
+    "sha256": "42755676d472e7431200c72d95df82d8d1f10656bf4c1361119141d22cf5c207"
+   },
+   {
+    "registration": {
+     "column_stats": [
+      {
+       "field_id": 1,
+       "lower_bound": "AAAAAAAAAAA=",
+       "null_count": 0,
+       "size_bytes": 106,
+       "upper_bound": "AAAAAAAAAAA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 2,
+       "lower_bound": "gOQVIRdlBgA=",
+       "null_count": 0,
+       "size_bytes": 131,
+       "upper_bound": "AICYKBdlBgA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 3,
+       "lower_bound": "AQ==",
+       "null_count": 0,
+       "size_bytes": 51,
+       "upper_bound": "AQ==",
+       "value_count": 4
+      },
+      {
+       "field_id": 4,
+       "lower_bound": "7v///w==",
+       "null_count": 0,
+       "size_bytes": 105,
+       "upper_bound": "AAAAAA==",
+       "value_count": 4
+      },
+      {
+       "field_id": 5,
+       "lower_bound": "AAAAAA==",
+       "null_count": 0,
+       "size_bytes": 105,
+       "upper_bound": "GBUAAA==",
+       "value_count": 4
+      },
+      {
+       "field_id": 6,
+       "lower_bound": "IMbs/w==",
+       "null_count": 0,
+       "size_bytes": 105,
+       "upper_bound": "AAAAAA==",
+       "value_count": 4
+      },
+      {
+       "field_id": 7,
+       "lower_bound": "AAAAAA==",
+       "null_count": 0,
+       "size_bytes": 93,
+       "upper_bound": "EgAAAA==",
+       "value_count": 4
+      },
+      {
+       "field_id": 8,
+       "lower_bound": "AAAAAA==",
+       "null_count": 0,
+       "size_bytes": 93,
+       "upper_bound": "MCoAAA==",
+       "value_count": 4
+      },
+      {
+       "field_id": 9,
+       "lower_bound": "7idr7gAAAAA=",
+       "null_count": 0,
+       "size_bytes": 131,
+       "upper_bound": "AChr7gAAAAA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 10,
+       "lower_bound": "AAAAgA==",
+       "null_count": 0,
+       "size_bytes": 105,
+       "upper_bound": "AACQQA==",
+       "value_count": 4
+      },
+      {
+       "field_id": 11,
+       "lower_bound": "AAAAAAAAAIA=",
+       "null_count": 0,
+       "size_bytes": 124,
+       "upper_bound": "AAAAAAAAGEA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 12,
+       "lower_bound": "ZXZlbnQtMC3DqQ==",
+       "null_count": 0,
+       "size_bytes": 125,
+       "upper_bound": "ZXZlbnQtNi3DqQ==",
+       "value_count": 4
+      },
+      {
+       "field_id": 13,
+       "lower_bound": "AAEC/w==",
+       "null_count": 0,
+       "size_bytes": 84,
+       "upper_bound": "AAEC/w==",
+       "value_count": 4
+      },
+      {
+       "field_id": 14,
+       "lower_bound": "C47punmhTz635WoLarbwAA==",
+       "null_count": 0,
+       "size_bytes": 130,
+       "upper_bound": "C47punmhTz635WoLarbwGA==",
+       "value_count": 4
+      },
+      {
+       "field_id": 15,
+       "lower_bound": "AA==",
+       "null_count": 0,
+       "size_bytes": 113,
+       "upper_bound": "Bxo=",
+       "value_count": 4
+      },
+      {
+       "field_id": 16,
+       "lower_bound": "YVEAAA==",
+       "null_count": 0,
+       "size_bytes": 92,
+       "upper_bound": "YVEAAA==",
+       "value_count": 4
+      },
+      {
+       "field_id": 17,
+       "lower_bound": "QLRLawAAAAA=",
+       "null_count": 0,
+       "size_bytes": 137,
+       "upper_bound": "QNToHwcAAAA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 18,
+       "lower_bound": "AICYKBdlBgA=",
+       "null_count": 0,
+       "size_bytes": 133,
+       "upper_bound": "gCirKRdlBgA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 19,
+       "lower_bound": "AICYKBdlBgA=",
+       "null_count": 0,
+       "size_bytes": 131,
+       "upper_bound": "UMaYKBdlBgA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 20,
+       "lower_bound": "Fc0Pm3bi+hg=",
+       "null_count": 0,
+       "size_bytes": 131,
+       "upper_bound": "J80Pm3bi+hg=",
+       "value_count": 4
+      },
+      {
+       "field_id": 21,
+       "lower_bound": "AICYKBdlBgA=",
+       "null_count": 0,
+       "size_bytes": 112,
+       "upper_bound": "AICYKBdlBgA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 22,
+       "lower_bound": "eyJrIjpbMCxudWxsLHsieiI6dHJ1ZX1dLCJhIjoieCJ9",
+       "null_count": 0,
+       "size_bytes": 198,
+       "upper_bound": "eyJrIjpbNixudWxsLHsieiI6dHJ1ZX1dLCJhIjoieCJ9",
+       "value_count": 4
+      },
+      {
+       "field_id": 24,
+       "lower_bound": "AICYKBdlBgA=",
+       "null_count": 0,
+       "size_bytes": 137,
+       "upper_bound": "gL1lNBdlBgA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 25,
+       "lower_bound": "cDA=",
+       "null_count": 0,
+       "size_bytes": 99,
+       "upper_bound": "cDY=",
+       "value_count": 4
+      },
+      {
+       "field_id": 27,
+       "lower_bound": "YQ==",
+       "null_count": 4,
+       "size_bytes": 116,
+       "upper_bound": "dDY=",
+       "value_count": 12
+      },
+      {
+       "field_id": 30,
+       "lower_bound": "czA=",
+       "null_count": 4,
+       "size_bytes": 107,
+       "upper_bound": "czY=",
+       "value_count": 8
+      },
+      {
+       "field_id": 31,
+       "lower_bound": "gNeFJxdlBgA=",
+       "null_count": 4,
+       "size_bytes": 141,
+       "upper_bound": "AICYKBdlBgA=",
+       "value_count": 8
+      },
+      {
+       "field_id": 33,
+       "lower_bound": "eA==",
+       "null_count": 0,
+       "size_bytes": 86,
+       "upper_bound": "eQ==",
+       "value_count": 8
+      },
+      {
+       "field_id": 34,
+       "lower_bound": "AAAAAAAAAIA=",
+       "null_count": 4,
+       "size_bytes": 132,
+       "upper_bound": "AAAAAAAAO0A=",
+       "value_count": 8
+      },
+      {
+       "field_id": 35,
+       "lower_bound": "APnM2KHFB//u",
+       "null_count": 0,
+       "size_bytes": 111,
+       "upper_bound": "APnM2KHFCAAA",
+       "value_count": 4
+      },
+      {
+       "field_id": 37,
+       "lower_bound": "AA==",
+       "null_count": 4,
+       "size_bytes": 132,
+       "upper_bound": "AP//////////",
+       "value_count": 12
+      }
+     ],
+     "file_size_bytes": 13071,
+     "footer_size": 9463,
+     "partition_values": [
+      "0",
+      "20833"
+     ],
+     "path": "s3://bkt/lake/data/ns1/events/golden/2.parquet",
+     "record_count": 4
+    },
+    "sha256": "520a861ebf02fabe5a5caef7750b691403710dda213eff32efc233ea6b1fbb43"
+   },
+   {
+    "registration": {
+     "column_stats": [
+      {
+       "field_id": 1,
+       "lower_bound": "AgAAAAAAAAA=",
+       "null_count": 0,
+       "size_bytes": 106,
+       "upper_bound": "AgAAAAAAAAA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 2,
+       "lower_bound": "wDXXPCtlBgA=",
+       "null_count": 0,
+       "size_bytes": 131,
+       "upper_bound": "QNFZRCtlBgA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 3,
+       "lower_bound": "AA==",
+       "null_count": 0,
+       "size_bytes": 51,
+       "upper_bound": "AA==",
+       "value_count": 4
+      },
+      {
+       "field_id": 4,
+       "lower_bound": "6f///w==",
+       "null_count": 0,
+       "size_bytes": 105,
+       "upper_bound": "+////w==",
+       "value_count": 4
+      },
+      {
+       "field_id": 5,
+       "lower_bound": "3AUAAA==",
+       "null_count": 0,
+       "size_bytes": 105,
+       "upper_bound": "9BoAAA==",
+       "value_count": 4
+      },
+      {
+       "field_id": 6,
+       "lower_bound": "8G7n/w==",
+       "null_count": 0,
+       "size_bytes": 105,
+       "upper_bound": "0Kj6/w==",
+       "value_count": 4
+      },
+      {
+       "field_id": 7,
+       "lower_bound": "BQAAAA==",
+       "null_count": 0,
+       "size_bytes": 93,
+       "upper_bound": "FwAAAA==",
+       "value_count": 4
+      },
+      {
+       "field_id": 8,
+       "lower_bound": "uAsAAA==",
+       "null_count": 0,
+       "size_bytes": 93,
+       "upper_bound": "6DUAAA==",
+       "value_count": 4
+      },
+      {
+       "field_id": 9,
+       "lower_bound": "6Sdr7gAAAAA=",
+       "null_count": 0,
+       "size_bytes": 131,
+       "upper_bound": "+ydr7gAAAAA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 10,
+       "lower_bound": "AACgPw==",
+       "null_count": 0,
+       "size_bytes": 105,
+       "upper_bound": "AAC4QA==",
+       "value_count": 4
+      },
+      {
+       "field_id": 11,
+       "lower_bound": "q6qqqqqq+j8=",
+       "null_count": 0,
+       "size_bytes": 128,
+       "upper_bound": "q6qqqqqqHkA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 12,
+       "lower_bound": "ZXZlbnQtMTEtw6k=",
+       "null_count": 0,
+       "size_bytes": 126,
+       "upper_bound": "ZXZlbnQtNS3DqQ==",
+       "value_count": 4
+      },
+      {
+       "field_id": 13,
+       "lower_bound": "AAEC/w==",
+       "null_count": 0,
+       "size_bytes": 84,
+       "upper_bound": "AAEC/w==",
+       "value_count": 4
+      },
+      {
+       "field_id": 14,
+       "lower_bound": "C47punmhTz635WoLarbwBQ==",
+       "null_count": 0,
+       "size_bytes": 130,
+       "upper_bound": "C47punmhTz635WoLarbwIw==",
+       "value_count": 4
+      },
+      {
+       "field_id": 15,
+       "lower_bound": "Afk=",
+       "null_count": 0,
+       "size_bytes": 113,
+       "upper_bound": "CRM=",
+       "value_count": 4
+      },
+      {
+       "field_id": 16,
+       "lower_bound": "YVEAAA==",
+       "null_count": 0,
+       "size_bytes": 92,
+       "upper_bound": "YVEAAA==",
+       "value_count": 4
+      },
+      {
+       "field_id": 17,
+       "lower_bound": "QFjfQQEAAAA=",
+       "null_count": 0,
+       "size_bytes": 137,
+       "upper_bound": "QDBVSQYAAAA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 18,
+       "lower_bound": "QMvkKBdlBgA=",
+       "null_count": 0,
+       "size_bytes": 133,
+       "upper_bound": "wHP3KRdlBgA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 19,
+       "lower_bound": "iJOYKBdlBgA=",
+       "null_count": 0,
+       "size_bytes": 131,
+       "upper_bound": "2NmYKBdlBgA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 20,
+       "lower_bound": "Gs0Pm3bi+hg=",
+       "null_count": 0,
+       "size_bytes": 131,
+       "upper_bound": "LM0Pm3bi+hg=",
+       "value_count": 4
+      },
+      {
+       "field_id": 21,
+       "lower_bound": "AICYKBdlBgA=",
+       "null_count": 0,
+       "size_bytes": 112,
+       "upper_bound": "AICYKBdlBgA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 22,
+       "lower_bound": "eyJrIjpbMTEsbnVsbCx7InoiOnRydWV9XSwiYSI6IngifQ==",
+       "null_count": 0,
+       "size_bytes": 197,
+       "upper_bound": "eyJrIjpbNSxudWxsLHsieiI6dHJ1ZX1dLCJhIjoieCJ9",
+       "value_count": 4
+      },
+      {
+       "field_id": 24,
+       "lower_bound": "QNDOLxdlBgA=",
+       "null_count": 2,
+       "size_bytes": 121,
+       "upper_bound": "QPmsNxdlBgA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 25,
+       "lower_bound": "cDEx",
+       "null_count": 0,
+       "size_bytes": 98,
+       "upper_bound": "cDU=",
+       "value_count": 4
+      },
+      {
+       "field_id": 27,
+       "lower_bound": "YQ==",
+       "null_count": 4,
+       "size_bytes": 114,
+       "upper_bound": "dDU=",
+       "value_count": 12
+      },
+      {
+       "field_id": 30,
+       "lower_bound": "czEx",
+       "null_count": 4,
+       "size_bytes": 106,
+       "upper_bound": "czU=",
+       "value_count": 8
+      },
+      {
+       "field_id": 31,
+       "lower_bound": "QIw5JxdlBgA=",
+       "null_count": 4,
+       "size_bytes": 142,
+       "upper_bound": "wDRMKBdlBgA=",
+       "value_count": 8
+      },
+      {
+       "field_id": 33,
+       "lower_bound": "eA==",
+       "null_count": 0,
+       "size_bytes": 86,
+       "upper_bound": "eQ==",
+       "value_count": 8
+      },
+      {
+       "field_id": 34,
+       "lower_bound": "AAAAAAAAHkA=",
+       "null_count": 4,
+       "size_bytes": 137,
+       "upper_bound": "AAAAAABAQUA=",
+       "value_count": 8
+      },
+      {
+       "field_id": 35,
+       "lower_bound": "APnM2KHFB//p",
+       "null_count": 0,
+       "size_bytes": 111,
+       "upper_bound": "APnM2KHFB//7",
+       "value_count": 4
+      },
+      {
+       "field_id": 37,
+       "lower_bound": "BQ==",
+       "null_count": 4,
+       "size_bytes": 126,
+       "upper_bound": "AP/////////6",
+       "value_count": 12
+      }
+     ],
+     "file_size_bytes": 13059,
+     "footer_size": 9467,
+     "partition_values": [
+      "2",
+      "20834"
+     ],
+     "path": "s3://bkt/lake/data/ns1/events/golden/3.parquet",
+     "record_count": 4
+    },
+    "sha256": "123830ab36f54e67f1dca83c59dd04deed3c291d33aac328e31a9e6b95449763"
+   },
+   {
+    "registration": {
+     "column_stats": [
+      {
+       "field_id": 1,
+       "lower_bound": "AAAAAAAAAAA=",
+       "null_count": 0,
+       "size_bytes": 106,
+       "upper_bound": "AAAAAAAAAAA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 2,
+       "lower_bound": "QNWsPStlBgA=",
+       "null_count": 0,
+       "size_bytes": 131,
+       "upper_bound": "wHAvRStlBgA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 3,
+       "lower_bound": "AA==",
+       "null_count": 1,
+       "size_bytes": 51,
+       "upper_bound": "AA==",
+       "value_count": 4
+      },
+      {
+       "field_id": 4,
+       "lower_bound": "6////w==",
+       "null_count": 1,
+       "size_bytes": 101,
+       "upper_bound": "/f///w==",
+       "value_count": 4
+      },
+      {
+       "field_id": 5,
+       "lower_bound": "hAMAAA==",
+       "null_count": 1,
+       "size_bytes": 101,
+       "upper_bound": "nBgAAA==",
+       "value_count": 4
+      },
+      {
+       "field_id": 6,
+       "lower_bound": "0JHp/w==",
+       "null_count": 1,
+       "size_bytes": 101,
+       "upper_bound": "sMv8/w==",
+       "value_count": 4
+      },
+      {
+       "field_id": 7,
+       "lower_bound": "AwAAAA==",
+       "null_count": 1,
+       "size_bytes": 89,
+       "upper_bound": "FQAAAA==",
+       "value_count": 4
+      },
+      {
+       "field_id": 8,
+       "lower_bound": "CAcAAA==",
+       "null_count": 1,
+       "size_bytes": 89,
+       "upper_bound": "ODEAAA==",
+       "value_count": 4
+      },
+      {
+       "field_id": 9,
+       "lower_bound": "6ydr7gAAAAA=",
+       "null_count": 1,
+       "size_bytes": 129,
+       "upper_bound": "/Sdr7gAAAAA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 10,
+       "lower_bound": "AABAPw==",
+       "null_count": 1,
+       "size_bytes": 101,
+       "upper_bound": "AACoQA==",
+       "value_count": 4
+      },
+      {
+       "field_id": 11,
+       "lower_bound": "AAAAAAAA8D8=",
+       "null_count": 1,
+       "size_bytes": 123,
+       "upper_bound": "AAAAAAAAHEA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 12,
+       "lower_bound": "ZXZlbnQtMTUtw6k=",
+       "null_count": 1,
+       "size_bytes": 123,
+       "upper_bound": "ZXZlbnQtMy3DqQ==",
+       "value_count": 4
+      },
+      {
+       "field_id": 13,
+       "lower_bound": "AAEC/w==",
+       "null_count": 1,
+       "size_bytes": 84,
+       "upper_bound": "AAEC/w==",
+       "value_count": 4
+      },
+      {
+       "field_id": 14,
+       "lower_bound": "C47punmhTz635WoLarbwAw==",
+       "null_count": 1,
+       "size_bytes": 127,
+       "upper_bound": "C47punmhTz635WoLarbwIQ==",
+       "value_count": 4
+      },
+      {
+       "field_id": 15,
+       "lower_bound": "AS8=",
+       "null_count": 1,
+       "size_bytes": 108,
+       "upper_bound": "CEk=",
+       "value_count": 4
+      },
+      {
+       "field_id": 16,
+       "lower_bound": "YVEAAA==",
+       "null_count": 1,
+       "size_bytes": 92,
+       "upper_bound": "YVEAAA==",
+       "value_count": 4
+      },
+      {
+       "field_id": 17,
+       "lower_bound": "QFjfQQEAAAA=",
+       "null_count": 1,
+       "size_bytes": 129,
+       "upper_bound": "QOgtnAQAAAA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 18,
+       "lower_bound": "wEbGKBdlBgA=",
+       "null_count": 1,
+       "size_bytes": 129,
+       "upper_bound": "QO/YKRdlBgA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 19,
+       "lower_bound": "uIuYKBdlBgA=",
+       "null_count": 1,
+       "size_bytes": 129,
+       "upper_bound": "CNKYKBdlBgA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 20,
+       "lower_bound": "GM0Pm3bi+hg=",
+       "null_count": 1,
+       "size_bytes": 129,
+       "upper_bound": "Ks0Pm3bi+hg=",
+       "value_count": 4
+      },
+      {
+       "field_id": 21,
+       "lower_bound": "AICYKBdlBgA=",
+       "null_count": 1,
+       "size_bytes": 112,
+       "upper_bound": "AICYKBdlBgA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 22,
+       "lower_bound": "eyJrIjpbMTUsbnVsbCx7InoiOnRydWV9XSwiYSI6IngifQ==",
+       "null_count": 1,
+       "size_bytes": 194,
+       "upper_bound": "eyJrIjpbMyxudWxsLHsieiI6dHJ1ZX1dLCJhIjoieCJ9",
+       "value_count": 4
+      },
+      {
+       "field_id": 24,
+       "lower_bound": "QAqQKhdlBgA=",
+       "null_count": 2,
+       "size_bytes": 121,
+       "upper_bound": "QDNuMhdlBgA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 25,
+       "lower_bound": "cDE1",
+       "null_count": 1,
+       "size_bytes": 95,
+       "upper_bound": "cDM=",
+       "value_count": 4
+      },
+      {
+       "field_id": 27,
+       "lower_bound": "YQ==",
+       "null_count": 4,
+       "size_bytes": 109,
+       "upper_bound": "dDM=",
+       "value_count": 10
+      },
+      {
+       "field_id": 30,
+       "lower_bound": "czE1",
+       "null_count": 4,
+       "size_bytes": 102,
+       "upper_bound": "czM=",
+       "value_count": 7
+      },
+      {
+       "field_id": 31,
+       "lower_bound": "wBBYJxdlBgA=",
+       "null_count": 4,
+       "size_bytes": 137,
+       "upper_bound": "QLlqKBdlBgA=",
+       "value_count": 7
+      },
+      {
+       "field_id": 33,
+       "lower_bound": "eA==",
+       "null_count": 1,
+       "size_bytes": 87,
+       "upper_bound": "eQ==",
+       "value_count": 7
+      },
+      {
+       "field_id": 34,
+       "lower_bound": "AAAAAAAAEkA=",
+       "null_count": 4,
+       "size_bytes": 136,
+       "upper_bound": "AAAAAACAP0A=",
+       "value_count": 7
+      },
+      {
+       "field_id": 35,
+       "lower_bound": "APnM2KHFB//r",
+       "null_count": 1,
+       "size_bytes": 109,
+       "upper_bound": "APnM2KHFB//9",
+       "value_count": 4
+      },
+      {
+       "field_id": 37,
+       "lower_bound": "Aw==",
+       "null_count": 4,
+       "size_bytes": 121,
+       "upper_bound": "AP/////////8",
+       "value_count": 10
+      }
+     ],
+     "file_size_bytes": 12974,
+     "footer_size": 9467,
+     "partition_values": [
+      "0",
+      "20834"
+     ],
+     "path": "s3://bkt/lake/data/ns1/events/golden/4.parquet",
+     "record_count": 4
+    },
+    "sha256": "a509782cdf6f946f055bfae011ba31ca5cce4a5753a9f664679feb940ae4e908"
+   },
+   {
+    "registration": {
+     "column_stats": [
+      {
+       "field_id": 1,
+       "lower_bound": "AQAAAAAAAAA=",
+       "null_count": 0,
+       "size_bytes": 106,
+       "upper_bound": "AQAAAAAAAAA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 2,
+       "lower_bound": "wHSCPitlBgA=",
+       "null_count": 0,
+       "size_bytes": 131,
+       "upper_bound": "QBAFRitlBgA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 3,
+       "lower_bound": "AA==",
+       "null_count": 1,
+       "size_bytes": 51,
+       "upper_bound": "AA==",
+       "value_count": 4
+      },
+      {
+       "field_id": 4,
+       "lower_bound": "8////w==",
+       "null_count": 1,
+       "size_bytes": 101,
+       "upper_bound": "/////w==",
+       "value_count": 4
+      },
+      {
+       "field_id": 5,
+       "lower_bound": "LAEAAA==",
+       "null_count": 1,
+       "size_bytes": 101,
+       "upper_bound": "PA8AAA==",
+       "value_count": 4
+      },
+      {
+       "field_id": 6,
+       "lower_bound": "UB3y/w==",
+       "null_count": 1,
+       "size_bytes": 101,
+       "upper_bound": "kO7+/w==",
+       "value_count": 4
+      },
+      {
+       "field_id": 7,
+       "lower_bound": "AQAAAA==",
+       "null_count": 1,
+       "size_bytes": 89,
+       "upper_bound": "DQAAAA==",
+       "value_count": 4
+      },
+      {
+       "field_id": 8,
+       "lower_bound": "WAIAAA==",
+       "null_count": 1,
+       "size_bytes": 89,
+       "upper_bound": "eB4AAA==",
+       "value_count": 4
+      },
+      {
+       "field_id": 9,
+       "lower_bound": "8ydr7gAAAAA=",
+       "null_count": 1,
+       "size_bytes": 129,
+       "upper_bound": "/ydr7gAAAAA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 10,
+       "lower_bound": "AACAPg==",
+       "null_count": 1,
+       "size_bytes": 101,
+       "upper_bound": "AABQQA==",
+       "value_count": 4
+      },
+      {
+       "field_id": 11,
+       "lower_bound": "VVVVVVVV1T8=",
+       "null_count": 1,
+       "size_bytes": 129,
+       "upper_bound": "VVVVVVVVEUA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 12,
+       "lower_bound": "ZXZlbnQtMS3DqQ==",
+       "null_count": 1,
+       "size_bytes": 119,
+       "upper_bound": "ZXZlbnQtNy3DqQ==",
+       "value_count": 4
+      },
+      {
+       "field_id": 13,
+       "lower_bound": "AAEC/w==",
+       "null_count": 1,
+       "size_bytes": 84,
+       "upper_bound": "AAEC/w==",
+       "value_count": 4
+      },
+      {
+       "field_id": 14,
+       "lower_bound": "C47punmhTz635WoLarbwAQ==",
+       "null_count": 1,
+       "size_bytes": 127,
+       "upper_bound": "C47punmhTz635WoLarbwEw==",
+       "value_count": 4
+      },
+      {
+       "field_id": 15,
+       "lower_bound": "ZQ==",
+       "null_count": 1,
+       "size_bytes": 108,
+       "upper_bound": "BSE=",
+       "value_count": 4
+      },
+      {
+       "field_id": 16,
+       "lower_bound": "YVEAAA==",
+       "null_count": 1,
+       "size_bytes": 92,
+       "upper_bound": "YVEAAA==",
+       "value_count": 4
+      },
+      {
+       "field_id": 17,
+       "lower_bound": "QFjfQQEAAAA=",
+       "null_count": 1,
+       "size_bytes": 129,
+       "upper_bound": "QDBVSQYAAAA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 18,
+       "lower_bound": "QMKnKBdlBgA=",
+       "null_count": 1,
+       "size_bytes": 129,
+       "upper_bound": "QN1eKRdlBgA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 19,
+       "lower_bound": "6IOYKBdlBgA=",
+       "null_count": 1,
+       "size_bytes": 129,
+       "upper_bound": "yLKYKBdlBgA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 20,
+       "lower_bound": "Fs0Pm3bi+hg=",
+       "null_count": 1,
+       "size_bytes": 129,
+       "upper_bound": "Is0Pm3bi+hg=",
+       "value_count": 4
+      },
+      {
+       "field_id": 21,
+       "lower_bound": "AICYKBdlBgA=",
+       "null_count": 1,
+       "size_bytes": 112,
+       "upper_bound": "AICYKBdlBgA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 22,
+       "lower_bound": "eyJrIjpbMSxudWxsLHsieiI6dHJ1ZX1dLCJhIjoieCJ9",
+       "null_count": 1,
+       "size_bytes": 189,
+       "upper_bound": "eyJrIjpbNyxudWxsLHsieiI6dHJ1ZX1dLCJhIjoieCJ9",
+       "value_count": 4
+      },
+      {
+       "field_id": 24,
+       "lower_bound": "QG0vLRdlBgA=",
+       "null_count": 3,
+       "size_bytes": 113,
+       "upper_bound": "QG0vLRdlBgA=",
+       "value_count": 4
+      },
+      {
+       "field_id": 25,
+       "lower_bound": "cDE=",
+       "null_count": 1,
+       "size_bytes": 93,
+       "upper_bound": "cDc=",
+       "value_count": 4
+      },
+      {
+       "field_id": 27,
+       "lower_bound": "YQ==",
+       "null_count": 4,
+       "size_bytes": 108,
+       "upper_bound": "dDc=",
+       "value_count": 10
+      },
+      {
+       "field_id": 30,
+       "lower_bound": "czE=",
+       "null_count": 4,
+       "size_bytes": 100,
+       "upper_bound": "czc=",
+       "value_count": 7
+      },
+      {
+       "field_id": 31,
+       "lower_bound": "wCLSJxdlBgA=",
+       "null_count": 4,
+       "size_bytes": 137,
+       "upper_bound": "wD2JKBdlBgA=",
+       "value_count": 7
+      },
+      {
+       "field_id": 33,
+       "lower_bound": "eA==",
+       "null_count": 1,
+       "size_bytes": 87,
+       "upper_bound": "eQ==",
+       "value_count": 7
+      },
+      {
+       "field_id": 34,
+       "lower_bound": "AAAAAAAA+D8=",
+       "null_count": 4,
+       "size_bytes": 132,
+       "upper_bound": "AAAAAACAM0A=",
+       "value_count": 7
+      },
+      {
+       "field_id": 35,
+       "lower_bound": "APnM2KHFB//z",
+       "null_count": 1,
+       "size_bytes": 109,
+       "upper_bound": "APnM2KHFB///",
+       "value_count": 4
+      },
+      {
+       "field_id": 37,
+       "lower_bound": "AQ==",
+       "null_count": 4,
+       "size_bytes": 121,
+       "upper_bound": "AP/////////+",
+       "value_count": 10
+      }
+     ],
+     "file_size_bytes": 12950,
+     "footer_size": 9463,
+     "partition_values": [
+      "1",
+      "20834"
+     ],
+     "path": "s3://bkt/lake/data/ns1/events/golden/5.parquet",
+     "record_count": 4
+    },
+    "sha256": "36ade18292cb45ee5c769eb738ef02884b1b3250685180457c7baa2048756c5d"
+   }
+  ],
+  "unpartitioned": [
+   {
+    "registration": {
+     "column_stats": [
+      {
+       "field_id": 1,
+       "lower_bound": "AAAAAAAAAAA=",
+       "null_count": 0,
+       "size_bytes": 123,
+       "upper_bound": "AgAAAAAAAAA=",
+       "value_count": 24
+      },
+      {
+       "field_id": 2,
+       "lower_bound": "gKVqHxdlBgA=",
+       "null_count": 0,
+       "size_bytes": 261,
+       "upper_bound": "QBAFRitlBgA=",
+       "value_count": 24
+      },
+      {
+       "field_id": 3,
+       "lower_bound": "AA==",
+       "null_count": 4,
+       "size_bytes": 55,
+       "upper_bound": "AQ==",
+       "value_count": 24
+      },
+      {
+       "field_id": 4,
+       "lower_bound": "6f///w==",
+       "null_count": 4,
+       "size_bytes": 152,
+       "upper_bound": "AAAAAA==",
+       "value_count": 24
+      },
+      {
+       "field_id": 5,
+       "lower_bound": "AAAAAA==",
+       "null_count": 4,
+       "size_bytes": 176,
+       "upper_bound": "9BoAAA==",
+       "value_count": 24
+      },
+      {
+       "field_id": 6,
+       "lower_bound": "8G7n/w==",
+       "null_count": 4,
+       "size_bytes": 186,
+       "upper_bound": "AAAAAA==",
+       "value_count": 24
+      },
+      {
+       "field_id": 7,
+       "lower_bound": "AAAAAA==",
+       "null_count": 4,
+       "size_bytes": 129,
+       "upper_bound": "FwAAAA==",
+       "value_count": 24
+      },
+      {
+       "field_id": 8,
+       "lower_bound": "AAAAAA==",
+       "null_count": 4,
+       "size_bytes": 165,
+       "upper_bound": "6DUAAA==",
+       "value_count": 24
+      },
+      {
+       "field_id": 9,
+       "lower_bound": "6Sdr7gAAAAA=",
+       "null_count": 4,
+       "size_bytes": 195,
+       "upper_bound": "AChr7gAAAAA=",
+       "value_count": 24
+      },
+      {
+       "field_id": 10,
+       "lower_bound": "AAAAgA==",
+       "null_count": 4,
+       "size_bytes": 163,
+       "upper_bound": "AAC4QA==",
+       "value_count": 24
+      },
+      {
+       "field_id": 11,
+       "lower_bound": "AAAAAAAAAIA=",
+       "null_count": 4,
+       "size_bytes": 204,
+       "upper_bound": "q6qqqqqqHkA=",
+       "value_count": 24
+      },
+      {
+       "field_id": 12,
+       "lower_bound": "ZXZlbnQtMC3DqQ==",
+       "null_count": 4,
+       "size_bytes": 191,
+       "upper_bound": "ZXZlbnQtOC3DqQ==",
+       "value_count": 24
+      },
+      {
+       "field_id": 13,
+       "lower_bound": "AAEC/w==",
+       "null_count": 4,
+       "size_bytes": 86,
+       "upper_bound": "AAEC/w==",
+       "value_count": 24
+      },
+      {
+       "field_id": 14,
+       "lower_bound": "C47punmhTz635WoLarbwAA==",
+       "null_count": 4,
+       "size_bytes": 183,
+       "upper_bound": "C47punmhTz635WoLarbwIw==",
+       "value_count": 24
+      },
+      {
+       "field_id": 15,
+       "lower_bound": "AA==",
+       "null_count": 4,
+       "size_bytes": 190,
+       "upper_bound": "CRM=",
+       "value_count": 24
+      },
+      {
+       "field_id": 16,
+       "lower_bound": "YVEAAA==",
+       "null_count": 4,
+       "size_bytes": 94,
+       "upper_bound": "YVEAAA==",
+       "value_count": 24
+      },
+      {
+       "field_id": 17,
+       "lower_bound": "QLRLawAAAAA=",
+       "null_count": 4,
+       "size_bytes": 171,
+       "upper_bound": "QNToHwcAAAA=",
+       "value_count": 24
+      },
+      {
+       "field_id": 18,
+       "lower_bound": "AICYKBdlBgA=",
+       "null_count": 4,
+       "size_bytes": 203,
+       "upper_bound": "wHP3KRdlBgA=",
+       "value_count": 24
+      },
+      {
+       "field_id": 19,
+       "lower_bound": "AICYKBdlBgA=",
+       "null_count": 4,
+       "size_bytes": 183,
+       "upper_bound": "2NmYKBdlBgA=",
+       "value_count": 24
+      },
+      {
+       "field_id": 20,
+       "lower_bound": "Fc0Pm3bi+hg=",
+       "null_count": 4,
+       "size_bytes": 183,
+       "upper_bound": "LM0Pm3bi+hg=",
+       "value_count": 24
+      },
+      {
+       "field_id": 21,
+       "lower_bound": "AICYKBdlBgA=",
+       "null_count": 4,
+       "size_bytes": 114,
+       "upper_bound": "AICYKBdlBgA=",
+       "value_count": 24
+      },
+      {
+       "field_id": 22,
+       "lower_bound": "eyJrIjpbMCxudWxsLHsieiI6dHJ1ZX1dLCJhIjoieCJ9",
+       "null_count": 4,
+       "size_bytes": 283,
+       "upper_bound": "eyJrIjpbOCxudWxsLHsieiI6dHJ1ZX1dLCJhIjoieCJ9",
+       "value_count": 24
+      },
+      {
+       "field_id": 24,
+       "lower_bound": "AICYKBdlBgA=",
+       "null_count": 9,
+       "size_bytes": 193,
+       "upper_bound": "QPmsNxdlBgA=",
+       "value_count": 24
+      },
+      {
+       "field_id": 25,
+       "lower_bound": "cDA=",
+       "null_count": 4,
+       "size_bytes": 164,
+       "upper_bound": "cDg=",
+       "value_count": 24
+      },
+      {
+       "field_id": 27,
+       "lower_bound": "YQ==",
+       "null_count": 24,
+       "size_bytes": 212,
+       "upper_bound": "dDg=",
+       "value_count": 64
+      },
+      {
+       "field_id": 30,
+       "lower_bound": "czA=",
+       "null_count": 24,
+       "size_bytes": 187,
+       "upper_bound": "czg=",
+       "value_count": 44
+      },
+      {
+       "field_id": 31,
+       "lower_bound": "QIw5JxdlBgA=",
+       "null_count": 24,
+       "size_bytes": 240,
+       "upper_bound": "AICYKBdlBgA=",
+       "value_count": 44
+      },
+      {
+       "field_id": 33,
+       "lower_bound": "eA==",
+       "null_count": 4,
+       "size_bytes": 106,
+       "upper_bound": "eQ==",
+       "value_count": 44
+      },
+      {
+       "field_id": 34,
+       "lower_bound": "AAAAAAAAAIA=",
+       "null_count": 24,
+       "size_bytes": 216,
+       "upper_bound": "AAAAAABAQUA=",
+       "value_count": 44
+      },
+      {
+       "field_id": 35,
+       "lower_bound": "APnM2KHFB//p",
+       "null_count": 4,
+       "size_bytes": 175,
+       "upper_bound": "APnM2KHFCAAA",
+       "value_count": 24
+      },
+      {
+       "field_id": 37,
+       "lower_bound": "AA==",
+       "null_count": 24,
+       "size_bytes": 275,
+       "upper_bound": "AP//////////",
+       "value_count": 64
+      }
+     ],
+     "file_size_bytes": 14938,
+     "footer_size": 9468,
+     "path": "s3://bkt/lake/data/ns1/events/golden/0.parquet",
+     "record_count": 24
+    },
+    "sha256": "66c52a0462e42436916c76847d8e94829ca939a3ed44a658816b953d07ad6ce1"
+   }
+  ]
+ },
+ "created_by": "parquet-cpp-arrow version 26.0.0"
+}
