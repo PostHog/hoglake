@@ -1734,7 +1734,7 @@ ran on the local stack and what it showed.
   `off` by default, i.e. today's behaviour. TOKEN ISSUANCE does not exist
   yet, so `enforce` in a real cluster refuses everything; deploy `warn`
   and watch `hoglake_auth_requests_total{outcome="missing"}` until it is
-  zero. `warn` PERMITS EVERYTHING `enforce` WOULD REFUSE, including
+  zero for every `client` class. `warn` PERMITS EVERYTHING `enforce` WOULD REFUSE, including
   `DELETE /v1/catalogs/{catalog}` and the maintenance routes: it is a
   measurement mode, not a partial enforcement, and a `read`-only tenant
   writes freely while it is on. Deploy it where that is acceptable, which

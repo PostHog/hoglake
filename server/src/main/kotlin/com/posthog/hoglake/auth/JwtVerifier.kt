@@ -19,10 +19,16 @@ import java.util.concurrent.atomic.AtomicReference
 /**
  * Where signing public keys come from.
  *
- * TWO REFRESH ENTRY POINTS, and the split is the security property.
+ * THREE READ ENTRY POINTS, and the split is the security property.
  *
- * [refresh] is the BOOT path: it runs once, before the first request, and it is
- * allowed to block.
+ * [load] is the BOOT path: it runs once, before the first request, it is
+ * allowed to block, and it is STRICT. A source that cannot be read, or that
+ * holds no keys, fails boot. The alternative is what the first cut did: boot a
+ * healthy-looking server holding zero keys that 401s every request, with one
+ * `warn` line as the only evidence.
+ *
+ * [refresh] is the ROTATION path: a re-read that keeps the previous set on any
+ * failure, because a ConfigMap caught mid-write must not 401 the fleet.
  *
  * [refreshInBackground] is the REQUEST path. It must not block, because the
  * caller is an attacker-controlled request and the work is a network round trip
@@ -38,7 +44,16 @@ interface SigningKeys {
     /** The key named [keyId], or null when this source does not have it. */
     fun byKeyId(keyId: String?): ECPublicKey?
 
-    /** Re-read the source synchronously. BOOT ONLY — never call this from a request. */
+    /** How many keys the source holds now; exported as `hoglake_auth_signing_keys`. */
+    val keyCount: Int
+
+    /**
+     * Read the source synchronously and THROW if it cannot be read or holds no
+     * keys. BOOT ONLY — never call this from a request.
+     */
+    fun load() = refresh()
+
+    /** Re-read the source synchronously, keeping the previous set on failure. */
     fun refresh()
 
     /**
@@ -63,6 +78,8 @@ class StaticSigningKeys(
     // otherwise here would be the verifier's only path to accepting a token the
     // issuer never labelled.
     override fun byKeyId(keyId: String?): ECPublicKey? = if (keyId == this.keyId) key else null
+
+    override val keyCount: Int = 1
 
     override fun refresh() = Unit
 }
@@ -98,6 +115,28 @@ class JwksSigningKeys internal constructor(
         return keys.get()[keyId]
     }
 
+    override val keyCount: Int
+        get() = keys.get().size
+
+    /**
+     * The strict boot read. Any failure — unreadable file, unreachable URL,
+     * unparseable document, or `{"keys":[]}` — propagates and fails boot, naming
+     * the source. Every one of those would otherwise be a server that refuses
+     * every token while its probes report healthy.
+     */
+    override fun load() {
+        val parsed =
+            try {
+                parseJwks(fetch())
+            } catch (e: Exception) {
+                throw IllegalStateException("could not load signing keys from $describe: ${e.message}", e)
+            }
+        check(parsed.isNotEmpty()) {
+            "signing-key source $describe holds no keys; every token would be refused"
+        }
+        keys.set(parsed)
+    }
+
     /**
      * Ask for a re-read, at most once per [minRefreshIntervalMs], off the caller's
      * thread.
@@ -125,6 +164,13 @@ class JwksSigningKeys internal constructor(
     override fun refresh() {
         try {
             val parsed = parseJwks(fetch())
+            // An EMPTY document is a failed read, not a rotation: no issuer
+            // retires its last key on purpose, and taking it at its word would
+            // 401 the fleet exactly as a missing file would.
+            if (parsed.isEmpty()) {
+                log.warn { "signing-key source $describe is empty; keeping the previous set" }
+                return
+            }
             keys.set(parsed)
         } catch (e: Exception) {
             // A failed refresh KEEPS the previous set. Dropping every key because
@@ -174,7 +220,7 @@ class JwksSigningKeys internal constructor(
                 fetch = { Files.readAllBytes(path) },
                 describe = path.toString(),
                 minRefreshIntervalMs = minRefreshIntervalMs,
-            ).also { it.refresh() }
+            ).also { it.load() }
 
         fun fromUrl(
             url: URI,
@@ -194,7 +240,7 @@ class JwksSigningKeys internal constructor(
                     http.send(request, HttpResponse.BodyHandlers.ofByteArray()).body()
                 },
                 describe = url.toString(),
-            ).also { it.refresh() }
+            ).also { it.load() }
         }
 
         private fun defaultHttpClient(): HttpClient =

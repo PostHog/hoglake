@@ -942,7 +942,8 @@ New metrics (Prometheus, existing `observability/Metrics.kt` idiom):
 
 | Metric | Why |
 |---|---|
-| `hoglake_auth_requests_total{mode,outcome}` | the `warn`-mode onboarding checklist |
+| `hoglake_auth_requests_total{mode,outcome,client}` | the `warn`-mode onboarding checklist; `client` is a closed class from `User-Agent`, and the enforce gate is zero refusals per class |
+| `hoglake_auth_signing_keys` | keys the verifier holds; alert on 0 (boot refuses an empty source, this catches a rotation that never lands) |
 | `hoglake_auth_missing_token_total{catalog}` | who is still anonymous |
 | `hoglake_auth_denials_total{catalog,required_scope,reason}` | distinguishes "client misconfigured" from "attack" by `reason` |
 | `hoglake_token_issued_total{grant_type}`, `_failures_total` | token endpoint health |

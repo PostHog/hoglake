@@ -1,6 +1,7 @@
 package com.posthog.hoglake.auth
 
 import io.ktor.http.HttpMethod
+import io.ktor.http.decodeURLPart
 
 /**
  * What a route demands of its caller before the handler runs.
@@ -320,9 +321,13 @@ object AuthPolicy {
         method: HttpMethod,
         path: String,
     ): RouteMatch? {
-        val actual = path.split('/').filter { it.isNotEmpty() }
+        val actual = routerSegments(path) ?: return null
+        // HEAD is GET without a body (RFC 9110 §9.3.2), so it demands what GET
+        // does. Without this a HEAD probe on a PUBLIC path matched no rule and
+        // was refused as unauthenticated the moment the mode left `off`.
+        val lookup = if (method == HttpMethod.Head) HttpMethod.Get else method
         for (entry in rules) {
-            if (entry.method != method) continue
+            if (entry.method != lookup) continue
             val pattern = segmentsByPattern.getValue(entry)
             if (pattern.size != actual.size) continue
             var catalog: String? = null
@@ -340,6 +345,51 @@ object AuthPolicy {
             if (ok) return RouteMatch(entry.requirement, catalog, entry.pattern)
         }
         return null
+    }
+
+    /**
+     * The methods the table lists for [path], for a 405's `Allow` header. Empty
+     * when no rule's shape matches the path at all, which is a 404, not a 405.
+     */
+    fun allowedMethods(path: String): Set<HttpMethod> {
+        val actual = routerSegments(path) ?: return emptySet()
+        return rules
+            .filter { entry ->
+                val pattern = segmentsByPattern.getValue(entry)
+                pattern.size == actual.size &&
+                    pattern.indices.all { i -> (pattern[i] as? Seg.Literal)?.value?.equals(actual[i]) ?: true }
+            }.mapTo(LinkedHashSet()) { it.method }
+    }
+
+    /**
+     * [path] split exactly as Ktor 3's router splits it, or null when it cannot
+     * be split.
+     *
+     * THE POLICY AND THE ROUTER MUST AGREE ON EVERY SEGMENT, because the policy
+     * authorizes the `{catalog}` it sees and the handler serves the `{catalog}`
+     * the router resolved. If the two ever differ, a token for one catalog
+     * reaches another. So this mirrors `RoutingResolveContext.parse` rather than
+     * approximating it:
+     *
+     * - empty segments (`//`) are skipped, as the router skips them;
+     * - each segment is percent-decoded, as the router decodes it — so
+     *   `/v1/catalogs/org%31` is authorized as `org1`, the catalog it will serve;
+     * - a trailing slash is a trailing EMPTY segment, because `IgnoreTrailingSlash`
+     *   is not installed (BlockingDispatch.kt) and the router keeps it. No rule
+     *   has one, so such a path matches nothing, as it routes to nothing.
+     *
+     * A segment that does not decode (a malformed `%` escape) is unroutable; null.
+     * AuthPolicyTest pins the agreement against a real Ktor router.
+     */
+    internal fun routerSegments(path: String): List<String>? {
+        if (path.isEmpty() || path == "/") return emptyList()
+        val segments =
+            try {
+                path.split('/').filter { it.isNotEmpty() }.map { it.decodeURLPart() }
+            } catch (_: Exception) {
+                return null
+            }
+        return if (path.endsWith('/')) segments + "" else segments
     }
 
     /** One row of the table. */

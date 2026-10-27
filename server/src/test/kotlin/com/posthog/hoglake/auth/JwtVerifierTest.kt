@@ -165,9 +165,11 @@ class JwtVerifierTest {
             object : SigningKeys {
                 override fun byKeyId(keyId: String?) = null
 
+                override val keyCount = 0
+
                 // The request path must never re-read synchronously: this used to be
                 // one outbound fetch per unauthenticated request, on the event loop.
-                override fun refresh() = error("refresh() is the boot path; a request called it")
+                override fun refresh() = error("refresh() is synchronous; a request called it")
 
                 override fun refreshInBackground() {
                     refreshes += 1
@@ -187,6 +189,8 @@ class JwtVerifierTest {
         val keys =
             object : SigningKeys {
                 override fun byKeyId(keyId: String?) = null
+
+                override val keyCount = 0
 
                 override fun refresh() {
                     touches += 1
@@ -468,5 +472,62 @@ class JwtVerifierTest {
         keys.refresh()
         // Keeping a retired key one extra window beats 401-ing the fleet.
         assertThat(keys.byKeyId(TestTokens.KID)).isNotNull()
+    }
+
+    // ---- boot is strict ---------------------------------------------------
+    //
+    // Every source that cannot yield a key fails boot. The first cut booted these
+    // as healthy servers holding zero keys that refused every token, with one
+    // `warn` line as the only evidence.
+
+    @Test
+    fun `a missing jwks file fails boot`(
+        @org.junit.jupiter.api.io.TempDir dir: java.nio.file.Path,
+    ) {
+        assertThatThrownBy { JwksSigningKeys.fromFile(dir.resolve("absent.json")) }
+            .isInstanceOf(IllegalStateException::class.java)
+            .hasMessageContaining("absent.json")
+    }
+
+    @Test
+    fun `an unparseable jwks file fails boot`(
+        @org.junit.jupiter.api.io.TempDir dir: java.nio.file.Path,
+    ) {
+        val file = dir.resolve("jwks.json")
+        java.nio.file.Files.writeString(file, "{")
+        assertThatThrownBy { JwksSigningKeys.fromFile(file) }
+            .isInstanceOf(IllegalStateException::class.java)
+    }
+
+    @Test
+    fun `an empty jwks document fails boot`(
+        @org.junit.jupiter.api.io.TempDir dir: java.nio.file.Path,
+    ) {
+        val file = dir.resolve("jwks.json")
+        java.nio.file.Files.writeString(file, """{"keys":[]}""")
+        assertThatThrownBy { JwksSigningKeys.fromFile(file) }
+            .isInstanceOf(IllegalStateException::class.java)
+            .hasMessageContaining("holds no keys")
+    }
+
+    @Test
+    fun `an unreachable jwks url fails boot`() {
+        // Port 1 on loopback: refused immediately, no network needed.
+        assertThatThrownBy { JwksSigningKeys.fromUrl(java.net.URI.create("http://127.0.0.1:1/jwks.json")) }
+            .isInstanceOf(IllegalStateException::class.java)
+            .hasMessageContaining("127.0.0.1:1")
+    }
+
+    @Test
+    fun `a rotation to an empty document keeps the previous key set`(
+        @org.junit.jupiter.api.io.TempDir dir: java.nio.file.Path,
+    ) {
+        val file = dir.resolve("jwks.json")
+        java.nio.file.Files.writeString(file, TestTokens.jwks(pair))
+        val keys = JwksSigningKeys.fromFile(file)
+        java.nio.file.Files.writeString(file, """{"keys":[]}""")
+        keys.refresh()
+        assertThat(keys.byKeyId(TestTokens.KID)).isNotNull()
+        assertThat(keys.keyCount).isEqualTo(1)
     }
 }

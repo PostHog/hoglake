@@ -140,8 +140,34 @@ class AuthPolicyTest {
     }
 
     @Test
-    fun `a trailing slash does not slip past the table`() {
-        assertThat(AuthPolicy.match(HttpMethod.Get, "/v1/catalogs/lake/")?.requirement).isEqualTo(Requirement.READ)
+    fun `a trailing slash matches no rule, as it matches no route`() {
+        // The router keeps a trailing slash as an empty segment (IgnoreTrailingSlash
+        // is not installed), so this path serves nothing; the table must not
+        // authorize it as though it were the catalog route.
+        assertThat(AuthPolicy.match(HttpMethod.Get, "/v1/catalogs/lake/")).isNull()
+    }
+
+    @Test
+    fun `a percent-encoded catalog is authorized as the catalog it decodes to`() {
+        assertThat(AuthPolicy.match(HttpMethod.Get, "/v1/catalogs/la%6Be")?.catalog).isEqualTo("lake")
+        assertThat(AuthPolicy.match(HttpMethod.Post, "/v1/catalogs/lake/%63ommit")?.requirement)
+            .isEqualTo(Requirement.WRITE)
+        // A segment the router cannot decode routes nowhere; it authorizes nothing.
+        assertThat(AuthPolicy.match(HttpMethod.Get, "/v1/catalogs/%")).isNull()
+    }
+
+    @Test
+    fun `head demands what get demands`() {
+        assertThat(AuthPolicy.match(HttpMethod.Head, "/livez")?.requirement).isEqualTo(Requirement.PUBLIC)
+        assertThat(AuthPolicy.match(HttpMethod.Head, "/v1/catalogs/lake")?.requirement).isEqualTo(Requirement.READ)
+    }
+
+    @Test
+    fun `allowed methods lists the table's methods for a path, and none for an unknown path`() {
+        assertThat(AuthPolicy.allowedMethods("/livez")).containsExactly(HttpMethod.Get)
+        assertThat(AuthPolicy.allowedMethods("/v1/catalogs/lake"))
+            .containsExactlyInAnyOrder(HttpMethod.Get, HttpMethod.Delete)
+        assertThat(AuthPolicy.allowedMethods("/v1/nothing-here")).isEmpty()
     }
 
     // ---- the decision matrix --------------------------------------------

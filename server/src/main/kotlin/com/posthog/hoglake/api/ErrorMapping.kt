@@ -1,5 +1,6 @@
 package com.posthog.hoglake.api
 
+import com.posthog.hoglake.auth.bearerChallenge
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.service.CorruptDefinitionException
 import io.github.oshai.kotlinlogging.KotlinLogging
@@ -130,13 +131,7 @@ fun StatusPagesConfig.installErrorMapping() {
             call.response.headers.append(HttpHeaders.RetryAfter, RETRY_AFTER_SECONDS)
         }
         if (cause is HoglakeException.Unauthenticated) {
-            // RFC 6750 §3: the challenge names the scheme and the failure,
-            // and carries no error_description — that field would put our
-            // prose in a header a proxy may log.
-            call.response.headers.append(
-                HttpHeaders.WWWAuthenticate,
-                "Bearer error=\"${cause.reason}\"",
-            )
+            call.response.headers.append(HttpHeaders.WWWAuthenticate, bearerChallenge(cause))
         }
         call.respond(status, body)
     }

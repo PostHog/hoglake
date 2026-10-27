@@ -5,8 +5,10 @@ import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.observability.REQUEST_ID_HEADER
 import com.posthog.hoglake.observability.RequestId
 import io.ktor.client.request.get
+import io.ktor.client.request.head
 import io.ktor.client.request.header
 import io.ktor.client.request.post
+import io.ktor.client.request.put
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
@@ -14,6 +16,8 @@ import io.ktor.serialization.jackson.jackson
 import io.ktor.server.application.Application
 import io.ktor.server.application.install
 import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
+import io.ktor.server.request.httpMethod
+import io.ktor.server.request.path
 import io.ktor.server.response.respondText
 import io.ktor.server.routing.get
 import io.ktor.server.routing.post
@@ -271,5 +275,87 @@ class AuthPluginTest {
             // The burn-in period has to produce the attribution `enforce` will
             // rely on, so a good token is honoured even while refusals are not.
             assertThat(response.bodyAsText()).isEqualTo("client:hedgerow-prod")
+        }
+
+    // ---- the policy and the router agree -----------------------------------
+
+    /**
+     * The property normalisation exists for: on every request a handler serves,
+     * the catalog the POLICY authorized is the catalog the ROUTER resolved. Both
+     * are read server-side from the same request, so whatever the client or the
+     * test host does to the path, the comparison is of what the server saw.
+     */
+    @Test
+    fun `the policy authorizes exactly the catalog the router serves`() =
+        testApplication {
+            application {
+                installAuth(service(AuthMode.OFF))
+                routing {
+                    val echo: suspend io.ktor.server.routing.RoutingContext.() -> Unit = {
+                        val policy = AuthPolicy.match(call.request.httpMethod, call.request.path())?.catalog
+                        call.respondText("${call.parameters["catalog"]}|$policy")
+                    }
+                    get("/v1/catalogs/{catalog}", echo)
+                    get("/v1/catalogs/{catalog}/namespaces", echo)
+                    post("/v1/catalogs/{catalog}/commit", echo)
+                }
+            }
+            val paths =
+                listOf(
+                    "/v1/catalogs/lake",
+                    "/v1/catalogs/lake/",
+                    "/v1//catalogs//lake",
+                    "/v1/catalogs/la%6Be",
+                    "/v1/catalogs/lake%2Fx",
+                    "/v1/catalogs/LAKE",
+                    "/v1/catalogs/lake/namespaces",
+                    "/v1/catalogs/lake/namespaces/",
+                    "/v1/%63atalogs/lake",
+                    "/v1/catalogs/lake/%6Eamespaces",
+                    "/v1/catalogs/lake;x",
+                )
+            var served = 0
+            for (path in paths) {
+                val response = client.get(path)
+                if (response.status != HttpStatusCode.OK) continue
+                served++
+                val (router, policy) = response.bodyAsText().split('|')
+                assertThat(policy).describedAs("policy vs router on $path").isEqualTo(router)
+            }
+            val commit = client.post("/v1/catalogs/la%6Be/%63ommit")
+            if (commit.status == HttpStatusCode.OK) {
+                val (router, policy) = commit.bodyAsText().split('|')
+                assertThat(policy).isEqualTo(router)
+            }
+            // Not vacuous: the plain path and at least one encoded variant served.
+            assertThat(served).isGreaterThanOrEqualTo(2)
+        }
+
+    @Test
+    fun `an encoded spelling of the caller's own catalog is served, and of another is 404`() =
+        testApplication {
+            application { harness(AuthMode.ENFORCE) }
+            val auth = "Bearer ${token()}"
+            assertThat(client.get("/v1/catalogs/la%6Be") { header(HttpHeaders.Authorization, auth) }.status)
+                .isEqualTo(HttpStatusCode.OK)
+            assertThat(client.get("/v1/catalogs/their%2Dlake") { header(HttpHeaders.Authorization, auth) }.status)
+                .isEqualTo(HttpStatusCode.NotFound)
+        }
+
+    @Test
+    fun `a head probe is not refused as unauthenticated under enforce`() =
+        testApplication {
+            application { harness(AuthMode.ENFORCE) }
+            assertThat(client.head("/livez").status).isNotEqualTo(HttpStatusCode.Unauthorized)
+        }
+
+    @Test
+    fun `an unlisted method on a listed path is a 405 with an allow header, not a 401`() =
+        testApplication {
+            application { harness(AuthMode.ENFORCE) }
+            val response = client.put("/livez")
+            assertThat(response.status).isEqualTo(HttpStatusCode.MethodNotAllowed)
+            assertThat(response.headers[HttpHeaders.Allow]).isEqualTo("GET, HEAD")
+            assertThat(client.post("/v1/nothing-here").status).isEqualTo(HttpStatusCode.Unauthorized)
         }
 }

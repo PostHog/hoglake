@@ -1,11 +1,14 @@
 package com.posthog.hoglake.auth
 
+import com.posthog.hoglake.api.ApiErrorDto
 import com.posthog.hoglake.api.errorBody
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
 import io.github.oshai.kotlinlogging.KotlinLogging
 import io.ktor.http.HttpHeaders
+import io.ktor.http.HttpMethod
+import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
 import io.ktor.server.application.createApplicationPlugin
@@ -53,6 +56,9 @@ class AuthService(
             require(audience.isNotEmpty()) { "HOGLAKE_AUTH_AUDIENCE must not be blank" }
 
             val keys = signingKeys(cfg)
+            // Boot already refused an empty source; the gauge is for the case boot
+            // cannot see — a later rotation that never lands. Alert on 0.
+            Metrics.authSigningKeys { keys.keyCount }
             return AuthService(
                 mode = mode,
                 verifier =
@@ -202,7 +208,9 @@ val HoglakeAuth =
 
             if (!service.mode.resolvesCallers) return@onCall
 
-            val match = AuthPolicy.match(call.request.httpMethod, call.request.path())
+            val method = call.request.httpMethod
+            val path = call.request.path()
+            val match = AuthPolicy.match(method, path)
             val token = bearerToken(call)
 
             var caller: Caller? = null
@@ -235,31 +243,50 @@ val HoglakeAuth =
             if (decision is AuthDecision.Allow) {
                 // The token was still parsed, so a valid one still yields its
                 // caller and its per-tenant totals.
-                Metrics.authRequest(service.mode.wire, "ok")
+                Metrics.authRequest(service.mode.wire, "ok", clientClass(call))
                 return@onCall
             }
+            // A listed path asked with an unlisted method is a 405, whatever the
+            // token: nothing would serve it, and answering 401 sent probes and
+            // clients looking for a credential problem that did not exist. The
+            // route table is public (it is /openapi.yaml), so the Allow header
+            // discloses nothing.
+            if (match == null) {
+                val allowed = AuthPolicy.allowedMethods(path)
+                if (allowed.isNotEmpty()) {
+                    if (service.mode.isEnforcing) {
+                        call.respondMethodNotAllowed(allowed)
+                    } else {
+                        Metrics.authRequest(service.mode.wire, "unmapped", clientClass(call))
+                    }
+                    return@onCall
+                }
+            }
+
             // A failure already recorded against the token wins over the decision:
             // it names the actual violation (`expired`, a bad signature) where the
             // decision can only say that a token was required.
             failure = failure ?: failureFor(decision, match)
             val refusal = failure ?: return@onCall
 
+            // Counted in BOTH modes: the warn numbers are the forecast and the
+            // enforce numbers are the outcome, and a flip is judged by comparing
+            // the two per client class.
+            countRefusal(service.mode, clientClass(call), caller, match, refusal)
             if (service.mode.isEnforcing) {
                 call.respondRefusal(refusal)
                 return@onCall
             }
-
-            // WARN: count it, name it, and let it through. The caller (when the
-            // token verified) is already attached, so the burn-in period produces
-            // the attribution `enforce` will rely on.
-            countWarn(service.mode, caller, match, refusal)
+            // WARN: counted above, and let through. The caller (when the token
+            // verified) is already attached, so the burn-in period produces the
+            // attribution `enforce` will rely on.
         }
     }
 
 private suspend fun ApplicationCall.respondRefusal(failure: HoglakeException) {
     val (status, body) = errorBody(failure)
     if (failure is HoglakeException.Unauthenticated) {
-        response.header(HttpHeaders.WWWAuthenticate, "Bearer error=\"${failure.reason}\"")
+        response.header(HttpHeaders.WWWAuthenticate, bearerChallenge(failure))
     }
     // respond() from a plugin's Plugins phase: the handler never runs, so the
     // refusal is the whole response. The detail stays in the log — the client
@@ -268,8 +295,49 @@ private suspend fun ApplicationCall.respondRefusal(failure: HoglakeException) {
     respond(status, body)
 }
 
-private fun countWarn(
+private suspend fun ApplicationCall.respondMethodNotAllowed(allowed: Set<HttpMethod>) {
+    val methods = (allowed + if (HttpMethod.Get in allowed) setOf(HttpMethod.Head) else emptySet())
+    response.header(HttpHeaders.Allow, methods.joinToString(", ") { it.value })
+    respond(
+        HttpStatusCode.MethodNotAllowed,
+        ApiErrorDto(error = "method_not_allowed", detail = "${request.httpMethod.value} is not served on this path"),
+    )
+}
+
+/**
+ * Which kind of client sent a request, for the `client` metric label.
+ *
+ * The enforce flip is gated on zero refusals PER CLIENT CLASS — the Trino
+ * connector, the provisioner, the SDKs, the console, the scrape — and an
+ * unauthenticated request has no identity to label it by, so the class comes
+ * from `User-Agent`. A closed allowlist rather than the raw header: the header
+ * is caller-chosen, and a free-text label is a cardinality attack. Anything
+ * unrecognised is `other`, which is itself a signal worth chasing before a flip.
+ */
+internal fun clientClass(call: ApplicationCall): String {
+    val ua = call.request.headers[HttpHeaders.UserAgent]?.trim()?.lowercase() ?: return "none"
+    return CLIENT_CLASSES.firstOrNull { (prefix, _) -> ua.startsWith(prefix) }?.second ?: "other"
+}
+
+private val CLIENT_CLASSES =
+    listOf(
+        "trino" to "trino",
+        "pyhoglake" to "pyhoglake",
+        "python-requests" to "pyhoglake",
+        "python-httpx" to "pyhoglake",
+        "hedgerow" to "hedgerow",
+        "duckdb" to "duckdb",
+        "hogtower" to "hogtower",
+        "go-http-client" to "hogtower",
+        "prometheus" to "prometheus",
+        "kube-probe" to "probe",
+        "mozilla" to "browser",
+        "curl" to "curl",
+    )
+
+private fun countRefusal(
     mode: AuthMode,
+    client: String,
     caller: Caller?,
     match: RouteMatch?,
     failure: HoglakeException,
@@ -282,7 +350,7 @@ private fun countWarn(
             is HoglakeException.NotFound -> "not_entitled"
             else -> "other"
         }
-    Metrics.authRequest(mode.wire, outcome)
+    Metrics.authRequest(mode.wire, outcome, client)
     val catalog = match?.catalog ?: ""
     if (failure is HoglakeException.Forbidden) {
         Metrics.authDenial(catalog, match?.requirement?.wire() ?: "", outcome)
@@ -291,7 +359,7 @@ private fun countWarn(
         action = "auth_refused",
         catalog = match?.catalog,
         obj = null,
-        outcome = "warn_allowed",
+        outcome = if (mode.isEnforcing) "refused" else "warn_allowed",
         detail = "${failure::class.simpleName}: ${failure.message} pattern=${match?.pattern}",
         actor = caller?.actor,
         tenant = caller?.orgId,
@@ -334,6 +402,14 @@ private fun bearerToken(call: ApplicationCall): String? {
     if (token.isEmpty() || token.any(Char::isWhitespace)) return null
     return token
 }
+
+/**
+ * The RFC 6750 §3 challenge for a 401: the scheme and the closed reason code,
+ * and no `error_description` — that field would put our prose in a header a
+ * proxy may log. ONE builder for both 401 paths (this plugin and
+ * ErrorMapping's), so adding `scope=` later changes both or neither.
+ */
+fun bearerChallenge(failure: HoglakeException.Unauthenticated): String = "Bearer error=\"${failure.reason}\""
 
 private val AuthServiceKey = AttributeKey<AuthService>("HoglakeAuthService")
 

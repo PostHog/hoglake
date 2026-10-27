@@ -971,27 +971,9 @@ class CommitService(
                     offending.sorted().take(5).joinToString(", ") +
                     (if (offending.size > 5) " (+${offending.size - 5} more)" else "") +
                     "; registered files must live under the catalog's data_path, " +
-                    "with no whitespace, dot, or empty path segments",
+                    "with no whitespace, backslash, dot (literal or %2E), %2F, or empty path segments",
             )
         }
-    }
-
-    /**
-     * A literal startsWith is not enough: `s3://b/demo/../victim/x` starts
-     * with `s3://b/demo/` but some reader stacks normalize dot segments,
-     * re-addressing the object OUTSIDE the prefix. Whitespace/control
-     * characters are refused outright (they survive into removal-queue
-     * rows and reader URIs), as are empty and dot segments.
-     */
-    private fun pathStaysUnder(
-        path: String,
-        prefix: String,
-    ): Boolean {
-        if (!path.startsWith(prefix)) return false
-        if (path.any { it.isWhitespace() || it.isISOControl() }) return false
-        val relative = path.removePrefix(prefix)
-        if (relative.isEmpty()) return false
-        return relative.split('/').none { it.isEmpty() || it == "." || it == ".." }
     }
 
     /**
@@ -1692,3 +1674,28 @@ class CommitService(
         }
     }
 }
+
+/**
+ * A literal startsWith is not enough: `s3://b/demo/../victim/x` starts
+ * with `s3://b/demo/` but some reader stacks normalize dot segments,
+ * re-addressing the object OUTSIDE the prefix. Whitespace/control
+ * characters are refused outright (they survive into removal-queue
+ * rows and reader URIs), as are empty and dot segments. So are their
+ * ENCODED spellings — `%2E`, `%2F` — and backslashes: S3 stores them
+ * literally, but this check is the only tenant boundary the maintenance
+ * plane has (it runs under one IAM identity for every tenant), and it must
+ * not depend on no reader stack ever decoding a key.
+ */
+internal fun pathStaysUnder(
+    path: String,
+    prefix: String,
+): Boolean {
+    if (!path.startsWith(prefix)) return false
+    if (path.any { it.isWhitespace() || it.isISOControl() || it == '\\' }) return false
+    if (ENCODED_DOT_OR_SLASH.containsMatchIn(path)) return false
+    val relative = path.removePrefix(prefix)
+    if (relative.isEmpty()) return false
+    return relative.split('/').none { it.isEmpty() || it == "." || it == ".." }
+}
+
+private val ENCODED_DOT_OR_SLASH = Regex("%2[eEfF]")
