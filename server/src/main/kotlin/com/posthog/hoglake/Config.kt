@@ -1153,6 +1153,22 @@ data class Config(
             "HOGLAKE_COMPACTION_ZSTD_LEVEL",
             "${com.posthog.hoglake.compaction.ParquetRewriter.DEFAULT_ZSTD_LEVEL}",
         ).toInt(),
+    /**
+     * Whether compaction rewrites tables with a VARIANT column, copying
+     * each variant as its declared layout and refusing a group with an
+     * input in any other (`hoglake_compaction_variant_layout_mismatch_total`).
+     * Off by default: off, those tables are never planned, as before.
+     * A refused group spends a run slot on every sweep, so allowlist only
+     * catalogs that pyhoglake or Trino write. See CompactionConfig.variantCompaction.
+     */
+    val compactionVariant: Boolean = boolEnv("HOGLAKE_COMPACTION_VARIANT", false),
+    /**
+     * The catalogs, by name and comma-separated, whose variant tables
+     * compact when [compactionVariant] is on; empty means every catalog.
+     * For a rollout one catalog at a time.
+     */
+    val compactionVariantCatalogs: Set<String> =
+        nameList(env("HOGLAKE_COMPACTION_VARIANT_CATALOGS", "")),
     /** Dashboard sampling: one bounded metadata page per tick, persisted between ticks/restarts. */
     val maintenanceSummaryIntervalMs: Long = env("HOGLAKE_MAINTENANCE_SUMMARY_INTERVAL_MS", "1000").toLong(),
     val maintenanceSummaryBatch: Int = env("HOGLAKE_MAINTENANCE_SUMMARY_BATCH", "10000").toInt(),
@@ -1578,6 +1594,10 @@ data class Config(
                 }
             }
         }
+
+        /** A comma-separated list of names, each trimmed: `"a, b"` names `b`, not `" b"`. */
+        internal fun nameList(raw: String): Set<String> =
+            raw.split(',').map { it.trim() }.filter { it.isNotEmpty() }.toSet()
 
         private fun env(
             name: String,

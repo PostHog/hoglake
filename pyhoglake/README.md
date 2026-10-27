@@ -932,5 +932,10 @@ lose the annotation.
 
 VARIANT columns cannot be partition or sort keys, and have no whole-column
 statistics. Shredded child statistics are not published as catalog bounds.
-The server skips VARIANT tables during scalar compaction. Reader interoperability
-and the buffered-ingestion coordinator are separate work.
+The server skips VARIANT tables during compaction unless it sets
+`HOGLAKE_COMPACTION_VARIANT`; then it copies files whose VARIANT layout is the
+one their declaration gives, which every file `Table.append` writes has
+(`tests/vectors/variant_layout_vectors.json` pins the server's port of that
+layout to `Plan.expected_elements`), and skips any compaction group holding a
+file in another layout or written by DuckDB, with that group's other files.
+Reader interoperability and the buffered-ingestion coordinator are separate work.

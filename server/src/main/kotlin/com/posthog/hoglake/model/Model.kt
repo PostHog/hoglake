@@ -1483,8 +1483,13 @@ data class CompactionResult(
     /**
      * Groups skipped because some live column's type cannot be produced
      * from an input file's parquet type (anything outside identity or
-     * the int->long / float->double promotions). Deterministic until the
-     * schema or the file set changes; skip-with-reason, not a failure.
+     * the int->long / float->double promotions). With
+     * HOGLAKE_COMPACTION_VARIANT on, also groups holding a VARIANT input
+     * not in its declared layout or written by DuckDB
+     * (VariantLayoutMismatchException, counted again by reason in
+     * hoglake_compaction_variant_layout_mismatch_total). Deterministic
+     * until the schema or the file set changes; skip-with-reason, not a
+     * failure.
      */
     val unconvertibleSchema: Long = 0,
     /**
