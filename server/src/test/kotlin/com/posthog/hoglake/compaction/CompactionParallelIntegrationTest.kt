@@ -146,6 +146,8 @@ class CompactionParallelIntegrationTest {
         prefix: String,
         groups: Int,
         filesPerGroup: Int = 2,
+        catalogs: CatalogService = this.catalogs,
+        commits: CommitService = this.commits,
     ): Fixture {
         val cat = "$prefix-${counter.incrementAndGet()}"
         catalogs.createCatalog(cat, "s3://$BUCKET/$cat")
@@ -207,7 +209,10 @@ class CompactionParallelIntegrationTest {
         inputOpenParallelism = 4,
     )
 
-    private fun liveFileCount(cat: String): Int = catalogs.listFiles(cat, "ns", "t").size
+    private fun liveFileCount(
+        cat: String,
+        catalogs: CatalogService = this.catalogs,
+    ): Int = catalogs.listFiles(cat, "ns", "t").size
 
     // ---- 1: concurrent groups within one sweep -----------------------------
 
@@ -1733,41 +1738,59 @@ class CompactionParallelIntegrationTest {
         // logged the cancelled catalog and swept every remaining one,
         // each paying a purge, a plan, a wave and a bounded shutdown
         // after the supervisor had asked the loop to stop.
-        val a = fixture("compact-par-allcat-a", groups = 2)
-        val b = fixture("compact-par-allcat-b", groups = 2)
-        val inRewrite = java.util.concurrent.CountDownLatch(1)
-        val release = java.util.concurrent.CountDownLatch(1)
-        val blocking = BlockingStore(inRewrite, release)
-        // Both catalogs (in a per-sweep shuffled order, #455) from ONE
-        // service — the shape the background loop runs.
-        val cfg = policy(a).copy(inputOpenParallelism = 1)
-        val svc = CompactionService(db.jdbi, blocking, cfg)
-        val outcome = java.util.concurrent.atomic.AtomicReference<Throwable?>()
-        val sweep =
-            Thread({
-                try {
-                    svc.runOnceAllCatalogs(cfg)
-                } catch (e: Throwable) {
-                    outcome.set(e)
-                }
-            }, "allcat-sweep")
-        try {
-            sweep.start()
-            assertThat(inRewrite.await(60, TimeUnit.SECONDS)).isTrue()
-            sweep.interrupt()
-            release.countDown()
-            sweep.join(60_000)
-            assertThat(sweep.isAlive).isFalse()
-        } finally {
-            release.countDown()
-            blocking.close()
+        //
+        // Its own database, so the sweep lists these two catalogs and
+        // nothing else. In the class database `runOnceAllCatalogs` also
+        // sweeps every earlier test's catalog, and since the per-sweep
+        // shuffle (#455) one of those usually came first, so the read
+        // this test blocked was a stranger's. Many of them hold earlier
+        // compaction OUTPUTS, which carry a footer size, so that read
+        // was the best-effort footer prefetch, which drops a failed read
+        // (S3InputFile.prefetchFooter). The stub's InterruptedException
+        // had already cleared the flag, so the interrupt went with it:
+        // the group committed and the sweep visited every catalog and
+        // returned normally. With the real S3 client the flag survives
+        // (the SDK sets it again when it raises AbortedException), so
+        // the next read still stops the group.
+        PgTestSupport.freshDatabase().use { own ->
+            val ownCatalogs = CatalogService(own.jdbi)
+            val ownCommits = CommitService(own.jdbi)
+            val a = fixture("compact-par-allcat-a", groups = 2, catalogs = ownCatalogs, commits = ownCommits)
+            val b = fixture("compact-par-allcat-b", groups = 2, catalogs = ownCatalogs, commits = ownCommits)
+            val inRewrite = java.util.concurrent.CountDownLatch(1)
+            val release = java.util.concurrent.CountDownLatch(1)
+            val blocking = BlockingStore(inRewrite, release)
+            // Both catalogs (in a per-sweep shuffled order, #455) from ONE
+            // service — the shape the background loop runs.
+            val cfg = policy(a).copy(inputOpenParallelism = 1)
+            val svc = CompactionService(own.jdbi, blocking, cfg)
+            val outcome = java.util.concurrent.atomic.AtomicReference<Throwable?>()
+            val sweep =
+                Thread({
+                    try {
+                        svc.runOnceAllCatalogs(cfg)
+                    } catch (e: Throwable) {
+                        outcome.set(e)
+                    }
+                }, "allcat-sweep")
+            try {
+                sweep.start()
+                assertThat(inRewrite.await(60, TimeUnit.SECONDS)).isTrue()
+                sweep.interrupt()
+                release.countDown()
+                sweep.join(60_000)
+                assertThat(sweep.isAlive).isFalse()
+            } finally {
+                release.countDown()
+                blocking.close()
+            }
+            assertThat(outcome.get())
+                .describedAs("the fan-out must surface cancellation, not swallow it per catalog")
+                .isInstanceOf(InterruptedException::class.java)
+            assertThat(liveFileCount(a.cat, ownCatalogs) + liveFileCount(b.cat, ownCatalogs))
+                .describedAs("no catalog may be swept after the fan-out was asked to stop")
+                .isEqualTo(a.expectedFiles + b.expectedFiles)
         }
-        assertThat(outcome.get())
-            .describedAs("the fan-out must surface cancellation, not swallow it per catalog")
-            .isInstanceOf(InterruptedException::class.java)
-        assertThat(liveFileCount(a.cat) + liveFileCount(b.cat))
-            .describedAs("no catalog may be swept after the fan-out was asked to stop")
-            .isEqualTo(a.expectedFiles + b.expectedFiles)
     }
 
     @Test
