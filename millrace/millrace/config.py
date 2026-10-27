@@ -789,7 +789,10 @@ def _check_fields_against_columns(
     given, every partition source and sort column names a configured
     column, and each transform is valid for its source's type (the
     check the server's ``set_partition_spec`` would make, made at boot
-    so the create cannot 422)."""
+    so the create cannot 422), and none is a variant: the server refuses
+    a variant partition or sort source (``AlterService.requireSourceField``)
+    and pyhoglake's ``check_transform`` takes identity of one, so it is
+    refused here by type, once, before any transform check."""
     by_name = {c.name: c for c in columns}
     for field in partition_by or ():
         column = by_name.get(field.column)
@@ -800,6 +803,12 @@ def _check_fields_against_columns(
                 f"(columns: {sorted(by_name)})"
             )
             continue
+        if column.col_type == "variant":
+            problems.append(
+                f"MILLRACE_PARTITION_BY {field.describe()}: {field.column!r} is a "
+                "variant column, which is no partition source"
+            )
+            continue
         try:
             check_transform(field.transform, column.col_type, field.param)
         except ValidationError as e:
@@ -808,10 +817,16 @@ def _check_fields_against_columns(
                 f"{field.column}:{column.col_type}: {e.message}"
             )
     for sort_field in sort_by or ():
-        if sort_field.column not in by_name:
+        sort_column = by_name.get(sort_field.column)
+        if sort_column is None:
             problems.append(
                 f"MILLRACE_SORT_BY column {sort_field.column!r} is not in "
                 f"MILLRACE_TABLE_COLUMNS (columns: {sorted(by_name)})"
+            )
+        elif sort_column.col_type == "variant":
+            problems.append(
+                f"MILLRACE_SORT_BY column {sort_field.column!r} is a variant "
+                "column, which is no sort source"
             )
 
 

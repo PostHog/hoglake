@@ -42,8 +42,8 @@ Inside a container a null element, child or value is SQL NULL, refused
 (naming the dotted path) where the catalog says the child is not
 nullable. Nesting is bounded by pyhoglake's
 ``MAX_COLUMN_NESTING_DEPTH``. A ``variant`` column, at any depth, is
-refused (:class:`UnsupportedColumnError`): pyarrow cannot write the
-native Parquet VARIANT annotation hoglake requires.
+refused (:class:`UnsupportedColumnError`): this decoder has no variant
+path yet, although pyhoglake's writer core writes a top-level one.
 """
 
 from __future__ import annotations
@@ -98,8 +98,8 @@ class UnsupportedColumnError(ValueError):
     """The destination table carries a column the JSON decoder cannot
     fill: an unknown type, a decimal whose type_params do not build, a
     container whose children do not match its type, a column nested past
-    ``MAX_COLUMN_NESTING_DEPTH``, or a ``variant`` (pyarrow cannot write
-    the native Parquet VARIANT annotation hoglake requires).
+    ``MAX_COLUMN_NESTING_DEPTH``, or a ``variant`` (no variant path in this
+    decoder yet).
     Named with the column; the flusher's startup resolution re-raises it
     as a startup refusal."""
 
@@ -707,9 +707,9 @@ def _coercer(
     t = column.type
     if t == "variant":
         raise UnsupportedColumnError(
-            f"column {path!r} is a variant: hoglake takes a variant only as a "
-            "native Parquet VARIANT group, and pyarrow cannot write that "
-            "annotation (pyhoglake's Arrow writer refuses it for the same reason)"
+            f"column {path!r} is a variant: millrace does not ingest variant "
+            "columns yet (pyhoglake's write_part writes a top-level one from "
+            "JSON text; millrace's decoder has no variant path)"
         )
     if t == "struct":
         fields = tuple(

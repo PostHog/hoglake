@@ -168,13 +168,16 @@ def test_construction_refuses_a_spec_it_cannot_key(spec, columns, match):
         GroupKeyer(info(spec, columns))
 
 
-@pytest.mark.parametrize(
-    ("col_type", "match"),
-    [("json", "'j' cannot be keyed: a 'json'"), ("variant", "'j' cannot be keyed")],
-)
-def test_a_json_or_variant_source_is_refused(col_type, match):
+@pytest.mark.parametrize("col_type", ["json", "variant"])
+def test_a_json_or_variant_source_is_refused_as_unkeyable(col_type):
+    """Both by type, with the same refusal. A variant used to be refused
+    only because its coercer is (a different message), which lifting the
+    coercer's refusal would have turned into a keyable variant."""
     columns = [{"name": "j", "type": col_type, "field_id": 1, "ordinal": 0}]
-    with pytest.raises(GroupKeyError, match=match):
+    with pytest.raises(
+        GroupKeyError,
+        match=f"'j' cannot be keyed: a '{col_type}' column is not a partition source",
+    ):
         GroupKeyer(info([(1, "identity", None)], columns))
 
 

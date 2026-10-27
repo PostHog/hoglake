@@ -113,7 +113,9 @@ batches (the flush concurrency) in memory. Progress is logged per stage (`startu
 <topic>[<p>]: …` at start, every 1,000 windows or 30 s, and at the end)
 and counted in `millrace_drain_rows_total` / `millrace_drain_bytes_total`.
 Small groups share commits, so drain time is mostly the stage reads
-and the parquet builds. The stream
+and the parquet builds (`millrace_flush_build_seconds_total{stage}`,
+and their wait for a pool thread in
+`millrace_flush_build_queue_seconds_total`). The stream
 reopens its iterator past the last key every 60 s and after a read
 error, so an SST the maintenance GC deletes under it costs a reopen,
 not a restart.
