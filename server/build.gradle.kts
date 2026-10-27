@@ -474,3 +474,5 @@ tasks.register("checkOpenapiVersion") {
 tasks.named("check") { dependsOn("checkOpenapiVersion") }
 
 // Scratch runner for the imported fuzz repro mains (temporary).
+
+// CI dummy comment to trigger the server image build for PR testing.
