@@ -143,10 +143,19 @@ def build() -> dict[str, Any]:
     }
 
 
+def _dumps(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
 def main() -> None:
     doc = build()
+    # One vector per line, as variant_shredding_vectors.json is laid out;
+    # indented, the file runs past ten thousand lines.
+    head = [f" {_dumps(k)}: {_dumps(v)}," for k, v in doc.items() if k != "vectors"]
+    body = ",\n".join(f"  {_dumps(v)}" for v in doc["vectors"])
     OUT.write_text(
-        json.dumps(doc, indent=1, ensure_ascii=False) + "\n", encoding="utf-8"
+        "{\n" + "\n".join(head) + '\n "vectors": [\n' + body + "\n ]\n}\n",
+        encoding="utf-8",
     )
     print(f"wrote {len(doc['vectors'])} vectors to {OUT.name}")
 
