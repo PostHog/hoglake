@@ -123,6 +123,51 @@ class S3Settings:
 
 
 @dataclass(frozen=True)
+class AuthSettings:
+    """Client credentials for the hoglake API, minted at ``token_url``.
+
+    Absent means no credential, which a hoglake in
+    ``HOGLAKE_AUTH_MODE=enforce`` refuses. Keep ``client_secret`` out of the
+    file: ``HEDGEROW__SOURCE__AUTH__CLIENT_SECRET`` sets it from the env.
+    """
+
+    token_url: str
+    client_id: str
+    client_secret: str
+    audience: str = "hoglake"
+
+    @classmethod
+    def parse(cls, d: Mapping[str, Any] | None, where: str) -> AuthSettings | None:
+        if d is None:
+            return None
+        if not isinstance(d, Mapping):
+            raise ConfigError(f"{where} must be a mapping")
+        _check_keys(d, {"token_url", "client_id", "client_secret", "audience"}, where)
+        return cls(
+            token_url=_str(d, "token_url", where),
+            client_id=_str(d, "client_id", where),
+            client_secret=_str(d, "client_secret", where),
+            audience=_str(d, "audience", where, required=False) or "hoglake",
+        )
+
+    def to_pyhoglake(self):
+        from pyhoglake import ClientCredentials
+
+        return ClientCredentials(
+            self.token_url, self.client_id, self.client_secret, audience=self.audience
+        )
+
+
+def hoglake_client(url: str, s3: S3Settings, auth: AuthSettings | None):
+    """The pyhoglake client for one side of the pipeline."""
+    from pyhoglake import HoglakeClient
+
+    return HoglakeClient(
+        url, s3=s3.to_pyhoglake(), auth=auth.to_pyhoglake() if auth else None
+    )
+
+
+@dataclass(frozen=True)
 class SourceConfig:
     url: str
     catalog: str
@@ -131,6 +176,7 @@ class SourceConfig:
     consumer_id: str
     start_snapshot: int = 0
     s3: S3Settings = field(default_factory=S3Settings)
+    auth: AuthSettings | None = None
 
     @classmethod
     def parse(cls, d: Any, where: str = "source") -> SourceConfig:
@@ -144,6 +190,7 @@ class SourceConfig:
                 "namespace",
                 "table",
                 "s3",
+                "auth",
                 "consumer_id",
                 "start_snapshot",
             },
@@ -157,6 +204,7 @@ class SourceConfig:
             consumer_id=_str(d, "consumer_id", where),
             start_snapshot=_int(d, "start_snapshot", where, default=0),
             s3=S3Settings.parse(d.get("s3"), f"{where}.s3"),
+            auth=AuthSettings.parse(d.get("auth"), f"{where}.auth"),
         )
 
 
@@ -167,18 +215,20 @@ class DestinationConfig:
     namespace: str
     table: str
     s3: S3Settings = field(default_factory=S3Settings)
+    auth: AuthSettings | None = None
 
     @classmethod
     def parse(cls, d: Any, where: str = "destination") -> DestinationConfig:
         if not isinstance(d, Mapping):
             raise ConfigError(f"{where} must be a mapping")
-        _check_keys(d, {"url", "catalog", "namespace", "table", "s3"}, where)
+        _check_keys(d, {"url", "catalog", "namespace", "table", "s3", "auth"}, where)
         return cls(
             url=_str(d, "url", where),
             catalog=_str(d, "catalog", where),
             namespace=_str(d, "namespace", where),
             table=_str(d, "table", where),
             s3=S3Settings.parse(d.get("s3"), f"{where}.s3"),
+            auth=AuthSettings.parse(d.get("auth"), f"{where}.auth"),
         )
 
 
