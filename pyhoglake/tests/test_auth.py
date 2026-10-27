@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import base64
+import threading
+import types
 
 import httpx
 import pytest
@@ -14,7 +16,8 @@ from pyhoglake.client import USER_AGENT
 class Fakes:
     """A token endpoint and a hoglake that accepts exactly one token."""
 
-    def __init__(self) -> None:
+    def __init__(self, expires_in: int = 900) -> None:
+        self.expires_in = expires_in
         self.mints = 0
         self.accepted = "t1"
         self.token_status = 200
@@ -31,7 +34,7 @@ class Fakes:
             json={
                 "access_token": f"t{self.mints}",
                 "token_type": "Bearer",
-                "expires_in": 900,
+                "expires_in": self.expires_in,
             },
         )
 
@@ -47,14 +50,16 @@ class Fakes:
             )
         return httpx.Response(200, json=[])
 
-    def client(self) -> HoglakeClient:
-        creds = ClientCredentials(
+    def credentials(self) -> ClientCredentials:
+        return ClientCredentials(
             "http://issuer/oauth/token",
             "hlc_test",
             "s3cret",
             http=httpx.Client(transport=httpx.MockTransport(self.token)),
         )
-        client = HoglakeClient("http://hoglake", auth=creds)
+
+    def client(self) -> HoglakeClient:
+        client = HoglakeClient("http://hoglake", auth=self.credentials())
         client._http._transport = httpx.MockTransport(self.api)
         return client
 
@@ -106,3 +111,87 @@ def test_a_fixed_bearer_token() -> None:
     with client:
         client._request("GET", "/catalogs")
     assert fakes.api_auth == ["Bearer t1"]
+
+
+class Clock:
+    """Stands in for ``time`` inside pyhoglake.auth, which only reads monotonic()."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+@pytest.fixture
+def clock(monkeypatch: pytest.MonkeyPatch) -> Clock:
+    fake = Clock()
+    monkeypatch.setattr(
+        "pyhoglake.auth.time", types.SimpleNamespace(monotonic=fake.monotonic)
+    )
+    return fake
+
+
+@pytest.mark.parametrize(
+    ("expires_in", "refresh_after"),
+    [
+        # Long-lived: refreshed 60s before expiry.
+        (900, 840.0),
+        # Short-lived: the margin is capped at a fifth of the lifetime.
+        (100, 80.0),
+    ],
+)
+def test_a_token_is_reused_until_its_refresh_point_then_reminted(
+    clock: Clock, expires_in: int, refresh_after: float
+) -> None:
+    fakes = Fakes(expires_in=expires_in)
+    creds = fakes.credentials()
+    assert creds._current() == "t1"
+    clock.now += refresh_after - 0.001
+    assert creds._current() == "t1"
+    clock.now += 0.001
+    assert creds._current() == "t2"
+    assert fakes.mints == 2
+
+
+def test_threads_that_find_the_token_stale_together_mint_once() -> None:
+    threads = 8
+    fakes = Fakes()
+    creds = fakes.credentials()
+
+    # Count arrivals at the lock, and hold the one mint until every thread has
+    # arrived, so all of them have seen the token missing before it exists.
+    real_lock = creds._lock
+    arrivals = threading.Semaphore(0)
+
+    class CountingLock:
+        def __enter__(self) -> None:
+            arrivals.release()
+            real_lock.acquire()
+
+        def __exit__(self, *exc: object) -> None:
+            real_lock.release()
+
+    creds._lock = CountingLock()  # type: ignore[assignment]
+    mint = fakes.token
+
+    def held_mint(request: httpx.Request) -> httpx.Response:
+        if fakes.mints == 0:
+            for _ in range(threads):
+                assert arrivals.acquire(timeout=5), "not every thread reached the lock"
+        return mint(request)
+
+    fakes.token = held_mint  # type: ignore[method-assign]
+    creds._http = httpx.Client(transport=httpx.MockTransport(fakes.token))
+
+    tokens: list[str] = []
+    workers = [
+        threading.Thread(target=lambda: tokens.append(creds._current()))
+        for _ in range(threads)
+    ]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=10)
+    assert tokens == ["t1"] * threads
+    assert fakes.mints == 1
