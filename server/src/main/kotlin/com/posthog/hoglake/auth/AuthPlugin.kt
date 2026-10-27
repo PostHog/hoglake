@@ -178,12 +178,37 @@ internal fun resolveActor(
     // `anonymous`.
     if (caller.kind.isOperator()) return claimed ?: caller.actor
     if (claimed != null && claimed != caller.actor) {
+        // A delegating client (a query engine) names the end user it runs for.
+        // The token's own actor is kept beside the claim, so the record says
+        // who vouched for it: `alice via client:trino-org1`, never bare `alice`.
+        if (caller.delegates) return delegatedActor(claimed, caller)
         throw HoglakeException.Validation(
             "author '$claimed' is not permitted: a tenant token's actor is its own subject; " +
                 "omit `author` to have it filled in",
         )
     }
     return caller.actor
+}
+
+private const val MAX_DELEGATED_AUTHOR_LENGTH = 200
+
+private fun delegatedActor(
+    claimed: String,
+    caller: Caller,
+): String {
+    // The claim lands in snapshot history and audit lines verbatim, so it is
+    // held to a printable, bounded shape, and it may not contain the separator:
+    // `bob via client:x` claimed by `client:y` would otherwise read as a chain
+    // `client:x` never vouched for.
+    if (claimed.isBlank() || claimed.length > MAX_DELEGATED_AUTHOR_LENGTH ||
+        claimed.any { it.isISOControl() } || claimed.contains(" via ")
+    ) {
+        throw HoglakeException.Validation(
+            "author is not a valid delegated user: non-blank, at most $MAX_DELEGATED_AUTHOR_LENGTH printable " +
+                "characters, and not containing ' via '",
+        )
+    }
+    return "$claimed via ${caller.actor}"
 }
 
 /**

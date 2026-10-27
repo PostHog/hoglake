@@ -585,7 +585,14 @@ drop, commit payload). Once a caller has an identity:
 - the server **overrides** `author` with the token's `sub`, and
 - a non-operator supplying a *different* `author` gets `422
   author_not_permitted` (not a silent override — silent override makes a client
-  believe its attribution landed).
+  believe its attribution landed),
+- **except a delegating client.** A token carrying `"dlg": true` belongs to a
+  client that runs statements for end users (the Trino pool), and it may name
+  the user: the server records `alice via client:trino-org1`, so the token's own
+  actor is always on the record beside the claim. The claim must be printable,
+  at most 200 characters, and may not contain ` via ` (no forged chains). The
+  issuer sets `dlg` only on service credentials it provisions itself, never on
+  a customer's own, so a customer SDK token still cannot name anybody else.
 
 The `CommitRequest.author` / `SnapshotAuthor` fields stay in the wire contract for
 operator/bulk paths and become operator-only. This also finally makes
@@ -932,7 +939,7 @@ The additions specific to auth:
 | **Token verification vectors** | Cross-language vectors for the JWS: valid, bad `kid`, bad signature, `exp` skew edge, `nbf` future, wrong `aud`, `ep` stale, `cat` absent. Ship as `vectors/jwt_vectors.json` beside `bounds_vectors.json`, because the Trino connector (Java) and `pyhoglake` (Python) must agree |
 | **Fuzz the token parser** | The repo already runs nightly property/fuzz suites (`docs/fuzzing.md`); a JWS parser is a parser and gets the same treatment |
 | **Migration test** | `V29`/`V30` applied to a populated database, in the shape of the existing `V*MigrationIntegrationTest`s |
-| **Audit attribution** | Every audited action carries a non-`anonymous` actor when a token is present, and a caller-supplied `author` is refused for tenants |
+| **Audit attribution** | Every audited action carries a non-`anonymous` actor when a token is present, and a caller-supplied `author` is refused for tenants unless the token delegates (`dlg`), in which case it is recorded as `<user> via <actor>` |
 
 ---
 

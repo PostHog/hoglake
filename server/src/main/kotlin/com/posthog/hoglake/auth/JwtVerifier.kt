@@ -422,6 +422,18 @@ class JwtVerifier(
                 if (scopes.isEmpty()) {
                     throw JwtViolation(JwtViolation.MISSING_CLAIM, "a tenant token must grant at least one catalog")
                 }
+                // Optional and strictly boolean: `"dlg": "false"` is a malformed
+                // token, not a truthy string that grants delegation.
+                val delegates =
+                    when (val dlg = claims.get("dlg")) {
+                        null -> false
+                        else ->
+                            if (dlg.isBoolean) {
+                                dlg.asBoolean()
+                            } else {
+                                throw JwtViolation(JwtViolation.MALFORMED, "claim 'dlg' is not a boolean")
+                            }
+                    }
                 Caller(
                     subject = subject,
                     orgId = orgId,
@@ -429,6 +441,7 @@ class JwtVerifier(
                     catalogScopes = scopes,
                     tokenId = tokenId,
                     clientName = clientName,
+                    delegates = delegates,
                 )
             }
 

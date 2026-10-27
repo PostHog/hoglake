@@ -27,6 +27,13 @@ data class Caller(
     val tokenId: String,
     /** `cli`: the human-facing client name, for the audit log. */
     val clientName: String?,
+    /**
+     * `dlg`: this client acts for end users and may name the one it acts for
+     * as `author` (a query engine running a user's statement). The issuer sets
+     * it only on service credentials it provisions itself, never on a
+     * customer's own; without it a tenant may name nobody but itself.
+     */
+    val delegates: Boolean = false,
 ) {
     enum class Kind {
         /** A tenant. Every catalog it may touch is enumerated in [catalogScopes]. */
@@ -39,7 +46,11 @@ data class Caller(
         fun isOperator(): Boolean = this == OPERATOR
     }
 
-    /** The audit `actor`: stable, attributable, and never client-chosen. */
+    /**
+     * The audit `actor`: stable, attributable, and never client-chosen. A
+     * delegated end user is recorded beside it, never instead of it — see
+     * `resolveActor`.
+     */
     val actor: String
         get() = if (kind.isOperator()) "operator:$subject" else subject
 

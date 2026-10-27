@@ -56,6 +56,18 @@ class JwtVerifierTest {
     }
 
     @Test
+    fun `delegation is off unless the token says so, and only a boolean says so`() {
+        val plain = TestTokens.tenantClaims()
+        assertThat(verifier().verify(mint(plain)).delegates).isFalse()
+        val delegating = plain.replace("\"ten\":\"tenant\"", "\"ten\":\"tenant\",\"dlg\":true")
+        assertThat(verifier().verify(mint(delegating)).delegates).isTrue()
+        val stringly = plain.replace("\"ten\":\"tenant\"", "\"ten\":\"tenant\",\"dlg\":\"true\"")
+        assertThatThrownBy { verifier().verify(mint(stringly)) }
+            .isInstanceOf(JwtViolation::class.java)
+            .extracting("reason").isEqualTo(JwtViolation.MALFORMED)
+    }
+
+    @Test
     fun `an operator token carries no catalog list but may see everything`() {
         val caller = verifier().verify(mint(TestTokens.operatorClaims()))
         assertThat(caller.kind).isEqualTo(Caller.Kind.OPERATOR)

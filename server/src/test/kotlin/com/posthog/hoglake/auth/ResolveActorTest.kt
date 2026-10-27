@@ -64,4 +64,37 @@ class ResolveActorTest {
     fun `an operator with no claim still lands under its own identity`() {
         assertThat(resolveActor(authed(operator), null)).isEqualTo("operator:sa:bulk")
     }
+
+    // ---- delegation --------------------------------------------------------
+
+    private fun engine() =
+        Caller(
+            "client:trino-org1",
+            "org-1",
+            Caller.Kind.TENANT,
+            mapOf("lake" to setOf(Scope.WRITE)),
+            "jti",
+            "trino",
+            true,
+        )
+
+    @Test
+    fun `a delegating client names its end user, and stays on the record beside it`() {
+        assertThat(resolveActor(authed(engine()), "alice")).isEqualTo("alice via client:trino-org1")
+    }
+
+    @Test
+    fun `a delegating client with no claim is recorded as itself`() {
+        assertThat(resolveActor(authed(engine()), null)).isEqualTo("client:trino-org1")
+        assertThat(resolveActor(authed(engine()), "client:trino-org1")).isEqualTo("client:trino-org1")
+    }
+
+    @Test
+    fun `a delegated claim cannot forge a chain or smuggle control characters`() {
+        for (claim in listOf("bob via client:other", "alice\nforged", " ", "x".repeat(201))) {
+            assertThatThrownBy { resolveActor(authed(engine()), claim) }
+                .describedAs(claim)
+                .isInstanceOf(HoglakeException.Validation::class.java)
+        }
+    }
 }
