@@ -35,7 +35,7 @@
       },
       "audience": "hoglake",
       "jti": "00000000-0000-4000-8000-000000000001",
-      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6IjAzNGYxMDIzNmE4YWNkMDgifQ.eyJpc3MiOiJodHRwczovL2hvZ3Rvd2VyLmNvbnRyYWN0LnRlc3QiLCJhdWQiOiJob2dsYWtlIiwic3ViIjoiaGxjXzAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2NyIsImp0aSI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMSIsInRlbiI6InRlbmFudCIsIm9yZyI6IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiIsImNhdCI6eyIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wYzFkMmUzZjRhNWIiOlsicmVhZCJdfSwiY2xpIjoicHlob2dsYWtlLXJlYWRlciIsImV4cCI6MTc2NzIyNjUwMCwiaWF0IjoxNzY3MjI1NjAwLCJuYmYiOjE3NjcyMjU2MDB9.Y64tsSnXTF4tU45QRk3uDuZoH3QAMGfj3KS5W8sKvwi5c3fnOeGCjyBV2gUhsF9Fk4qDcpqCaFL1fHSF2BhQ6A",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6IjAzNGYxMDIzNmE4YWNkMDgifQ.eyJpc3MiOiJodHRwczovL2hvZ3Rvd2VyLmNvbnRyYWN0LnRlc3QiLCJhdWQiOiJob2dsYWtlIiwic3ViIjoiaGxjXzAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2NyIsImp0aSI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMSIsInRlbiI6InRlbmFudCIsIm9yZyI6IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiIsImNhdCI6eyIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wYzFkMmUzZjRhNWIiOlsicmVhZCJdfSwiY2xpIjoicHlob2dsYWtlLXJlYWRlciIsImV4cCI6MTc2NzIyNjUwMCwiaWF0IjoxNzY3MjI1NjAwLCJuYmYiOjE3NjcyMjU2MDB9.32W_w4nCdV3CSOy77sRL51pkHuZe2MsSSzAM1EQWb2B2uLUXrdbFQv99HmJew60oorecxuBXNyG2M98aKZAN5w",
       "header": {
         "alg": "ES256",
         "kid": "034f10236a8acd08",
@@ -71,7 +71,7 @@
       },
       "audience": "hoglake",
       "jti": "00000000-0000-4000-8000-000000000002",
-      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6IjAzNGYxMDIzNmE4YWNkMDgifQ.eyJpc3MiOiJodHRwczovL2hvZ3Rvd2VyLmNvbnRyYWN0LnRlc3QiLCJhdWQiOiJob2dsYWtlIiwic3ViIjoiaGxjXzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZiIsImp0aSI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMiIsInRlbiI6InRlbmFudCIsIm9yZyI6IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiIsImNhdCI6eyIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wYzFkMmUzZjRhNWIiOlsid3JpdGUiXX0sImNsaSI6InRyaW5vLXBvb2wiLCJkbGciOnRydWUsImV4cCI6MTc2NzIyNjUwMCwiaWF0IjoxNzY3MjI1NjAwLCJuYmYiOjE3NjcyMjU2MDB9.kCrrjGQ6ViuQo_zNpJpvWIdC77g1yV2-BT9ZbEAP9ghGCyIw7hFI4Loa6-dfeAvwXbDeTs2-gi6MkNmnp8jEfQ",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6IjAzNGYxMDIzNmE4YWNkMDgifQ.eyJpc3MiOiJodHRwczovL2hvZ3Rvd2VyLmNvbnRyYWN0LnRlc3QiLCJhdWQiOiJob2dsYWtlIiwic3ViIjoiaGxjXzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZiIsImp0aSI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMiIsInRlbiI6InRlbmFudCIsIm9yZyI6IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiIsImNhdCI6eyIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wYzFkMmUzZjRhNWIiOlsid3JpdGUiXX0sImNsaSI6InRyaW5vLXBvb2wiLCJkbGciOnRydWUsImV4cCI6MTc2NzIyNjUwMCwiaWF0IjoxNzY3MjI1NjAwLCJuYmYiOjE3NjcyMjU2MDB9.IRi2c_ZFwhhAvVilmI2_KkBPfCL88EjqIFk8pTjdOOSZpNCqzy5Mdpa-dARZrJneDwS7H2V_QcroT72Of8Xnkw",
       "header": {
         "alg": "ES256",
         "kid": "034f10236a8acd08",
@@ -108,7 +108,7 @@
       },
       "audience": "hogtower-vend",
       "jti": "00000000-0000-4000-8000-000000000003",
-      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6IjAzNGYxMDIzNmE4YWNkMDgifQ.eyJpc3MiOiJodHRwczovL2hvZ3Rvd2VyLmNvbnRyYWN0LnRlc3QiLCJhdWQiOiJob2d0b3dlci12ZW5kIiwic3ViIjoiaGxjX2ZlZGNiYTk4NzY1NDMyMTBmZWRjYmE5OCIsImp0aSI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMyIsInRlbiI6InRlbmFudCIsIm9yZyI6IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiIsImNhdCI6eyIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wYzFkMmUzZjRhNWIiOlsid3JpdGUiXX0sImNsaSI6ImR1Y2tkYi1jbGllbnQiLCJleHAiOjE3NjcyMjY1MDAsImlhdCI6MTc2NzIyNTYwMCwibmJmIjoxNzY3MjI1NjAwfQ.oDbSX-5UBa-BwQWwfTlHdCe1QVJOtkVc23hL16EukcTJsc1ZpX7BOiMYLUrnljM5fOIE_O6YJIqrCjqml3rG2A",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6IjAzNGYxMDIzNmE4YWNkMDgifQ.eyJpc3MiOiJodHRwczovL2hvZ3Rvd2VyLmNvbnRyYWN0LnRlc3QiLCJhdWQiOiJob2d0b3dlci12ZW5kIiwic3ViIjoiaGxjX2ZlZGNiYTk4NzY1NDMyMTBmZWRjYmE5OCIsImp0aSI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMyIsInRlbiI6InRlbmFudCIsIm9yZyI6IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiIsImNhdCI6eyIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wYzFkMmUzZjRhNWIiOlsid3JpdGUiXX0sImNsaSI6ImR1Y2tkYi1jbGllbnQiLCJleHAiOjE3NjcyMjY1MDAsImlhdCI6MTc2NzIyNTYwMCwibmJmIjoxNzY3MjI1NjAwfQ.G2uQfcBodpCy8LumNp7POwILPhoZiINd6bHPVqtmgwKQ4nOBhFWEJOj32FfaB715Y-Mdt_WNLzKiRLeKChiUvw",
       "header": {
         "alg": "ES256",
         "kid": "034f10236a8acd08",
@@ -130,6 +130,33 @@
         "org": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
         "sub": "hlc_fedcba9876543210fedcba98",
         "ten": "tenant"
+      }
+    },
+    {
+      "name": "operator_provisioner",
+      "description": "The token the provisioner signs for itself: ten operator, no org, cat or dlg, 5 minutes.",
+      "operator": {
+        "subject": "hogtower:provisioner",
+        "client": "hogtower"
+      },
+      "audience": "hoglake",
+      "jti": "00000000-0000-4000-8000-000000000004",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6IjAzNGYxMDIzNmE4YWNkMDgifQ.eyJpc3MiOiJodHRwczovL2hvZ3Rvd2VyLmNvbnRyYWN0LnRlc3QiLCJhdWQiOiJob2dsYWtlIiwic3ViIjoiaG9ndG93ZXI6cHJvdmlzaW9uZXIiLCJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDQiLCJ0ZW4iOiJvcGVyYXRvciIsImNsaSI6ImhvZ3Rvd2VyIiwiZXhwIjoxNzY3MjI1OTAwLCJpYXQiOjE3NjcyMjU2MDAsIm5iZiI6MTc2NzIyNTYwMH0.PSzswYQjV7c14Jx8PDbZjybHSA-0ptL4P6_2PIRyMytOc7oaZTyquL0Pp9--XskgofLu5PhJbJEhvp6Y1YiUBQ",
+      "header": {
+        "alg": "ES256",
+        "kid": "034f10236a8acd08",
+        "typ": "JWT"
+      },
+      "claims": {
+        "aud": "hoglake",
+        "cli": "hogtower",
+        "exp": 1767225900,
+        "iat": 1767225600,
+        "iss": "https://hogtower.contract.test",
+        "jti": "00000000-0000-4000-8000-000000000004",
+        "nbf": 1767225600,
+        "sub": "hogtower:provisioner",
+        "ten": "operator"
       }
     }
   ]

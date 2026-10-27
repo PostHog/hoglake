@@ -38,9 +38,9 @@ class ContractVectorsTest {
     private fun vectors(): List<JsonNode> = root["vectors"].toList()
 
     @TestFactory
-    fun `every hoglake-audience vector verifies to the caller its claims describe`(): List<DynamicTest> =
+    fun `every hoglake-audience tenant vector verifies to the caller its claims describe`(): List<DynamicTest> =
         vectors()
-            .filter { it["audience"].asText() == "hoglake" }
+            .filter { it["audience"].asText() == "hoglake" && it["claims"]["ten"].asText() == "tenant" }
             .map { vector ->
                 DynamicTest.dynamicTest(vector["name"].asText()) {
                     val claims = vector["claims"]
@@ -62,11 +62,31 @@ class ContractVectorsTest {
             }
 
     @Test
-    fun `the vectors cover a reader, a delegating writer and a vend token`() {
+    fun `the vectors cover a reader, a delegating writer, a vend token and the provisioner`() {
         val byName = vectors().associateBy { it["name"].asText() }
-        assertThat(byName.keys).contains("tenant_read", "tenant_write_delegating", "tenant_vend")
+        assertThat(byName.keys).contains(
+            "tenant_read",
+            "tenant_write_delegating",
+            "tenant_vend",
+            "operator_provisioner",
+        )
         val delegating = byName.getValue("tenant_write_delegating")["token"].asText()
         assertThat(verifier().verify(delegating).delegates).isTrue()
+    }
+
+    @Test
+    fun `the provisioner's operator token verifies as an operator with no tenant scope`() {
+        val vector = vectors().single { it["claims"]["ten"].asText() == "operator" }
+        val claims = vector["claims"]
+        val caller = verifier().verify(vector["token"].asText())
+
+        assertThat(caller.kind).isEqualTo(Caller.Kind.OPERATOR)
+        assertThat(caller.subject).isEqualTo(claims["sub"].asText())
+        assertThat(caller.orgId).isNull()
+        assertThat(caller.catalogScopes).isEmpty()
+        assertThat(caller.delegates).isFalse()
+        assertThat(caller.clientName).isEqualTo(claims["cli"].asText())
+        assertThat(caller.tokenId).isEqualTo(claims["jti"].asText())
     }
 
     @Test
