@@ -29,6 +29,10 @@ name: ECR release
 # dry run. A person can also start a dry run by hand on any branch. The
 # dry run pushes both images to a local registry. Then it does the same
 # checks. The dry run does not use AWS.
+#
+# A person can also dispatch this workflow on main with dry_run false.
+# That path reads the same test gates as a push to main, so a commit
+# whose gates failed is not released.
 
 on:
   workflow_run:
@@ -69,12 +73,12 @@ defaults:
 
 jobs:
   gate:
-    # Forks must not publish. Only a push to main of this repository
-    # can start a release. A person can start a dry run on any branch.
-    # A dispatch on a branch that is not main must be a dry run. The
-    # role trust accepts only refs/heads/main, so a real publish from
-    # another branch fails at the credential step. The gate refuses it
-    # first, so the run says why.
+    # Forks must not publish. A push to main of this repository starts a
+    # release, and so does a dispatch on main. A person can start a dry
+    # run on any branch. A dispatch on a branch that is not main must be
+    # a dry run. The role trust accepts only refs/heads/main, so a real
+    # publish from another branch fails at the credential step. The gate
+    # refuses it first, so the run says why.
     if: >-
       github.repository == 'PostHog/hoglake' &&
       (
@@ -162,7 +166,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     # The dry run does not use id-token. The AWS steps do not run for a
-    # pull request. The role trust also accepts only refs/heads/main.
+    # dry run, from a pull request or from a dispatch. The role trust
+    # also accepts only refs/heads/main.
     permissions:
       contents: read
       id-token: write
