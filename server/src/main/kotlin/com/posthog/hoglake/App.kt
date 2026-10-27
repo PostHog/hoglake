@@ -346,10 +346,10 @@ class App private constructor(
             // metrics + audit log. GATED by auth/AuthPolicy.kt as
             // operator-only: the exposition carries per-catalog labels,
             // i.e. the tenant roster, so it is not a public surface.
-            // docs/auth-tenancy.md §6.7 moves it to a second
-            // cluster-internal listener, which is the right home; until
-            // that lands, flipping HOGLAKE_AUTH_MODE=enforce in a cluster
-            // requires the scrape job to hold an operator token.
+            // The scraper uses the infra listener instead
+            // (HOGLAKE_METRICS_PORT, observability/MetricsListener.kt,
+            // docs/auth-tenancy.md §6.7), which serves the same registry
+            // with no auth plugin on a port the Service does not expose.
             get("/metrics") {
                 call.respondText(
                     this@App.meterRegistry.scrape(),
