@@ -324,7 +324,11 @@ def _differences(cfg: Config, info: TableInfo) -> list[str]:
                     f"column {name} is {live_type} in the live table, "
                     f"{want_type} in MILLRACE_TABLE_COLUMNS"
                 )
-        extra = [f"{n}:{t}" for n, t in live.items() if n not in want]
+        # A variant column is an operator's (the grammar cannot declare
+        # one) and millrace fills it through MILLRACE_VARIANT_SOURCES.
+        extra = [
+            f"{n}:{t}" for n, t in live.items() if n not in want and t != "variant"
+        ]
         if extra:
             out.append(
                 f"the live table carries column(s) MILLRACE_TABLE_COLUMNS does "

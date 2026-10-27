@@ -72,8 +72,9 @@ _CONTAINER_TYPES: Final = frozenset({"list", "struct", "map"})
 _REPEATED_TYPES: Final = frozenset({"list", "map"})
 #: Column types no partition source may be: a json or variant value has
 #: no transform domain (flush.py refuses the same sources at startup).
-#: variant is listed, not left to the coercer's refusal, so it stays
-#: refused when that lifts.
+#: variant is listed by type, beside json: coercer_for still refuses
+#: one, but because the decoder fills it from a payload key, which
+#: says nothing about keying.
 _UNKEYABLE_TYPES: Final = frozenset({"json", "variant"})
 _TEMPORAL_TRANSFORMS: Final = frozenset({"year", "month", "day", "hour"})
 _EPOCH_NAIVE: Final = datetime.fromisoformat("1970-01-01T00:00:00")

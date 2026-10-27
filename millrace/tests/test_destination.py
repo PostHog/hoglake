@@ -764,6 +764,28 @@ def test_a_not_null_live_column_is_reported(
     assert "column event is NOT NULL" not in msg
 
 
+def test_an_operator_added_variant_column_is_no_difference(
+    client: Any, httpx_mock: Any, caplog: pytest.LogCaptureFixture
+):
+    """MILLRACE_TABLE_COLUMNS cannot declare a variant, so a live one is
+    not reported as a column the knob lacks (millrace fills it through
+    MILLRACE_VARIANT_SOURCES); another extra column still is."""
+    live = [
+        *COLUMNS_WIRE,
+        {"name": "properties_sv", "type": "variant", "field_id": 4, "ordinal": 3},
+        {"name": "extra", "type": "string", "field_id": 5, "ordinal": 4},
+    ]
+    msg = _warning(
+        client,
+        httpx_mock,
+        caplog,
+        make_config(table_columns=COLUMNS),
+        table_wire(columns=live),
+    )
+    assert "does not: extra:string (millrace never writes them)" in msg
+    assert "properties_sv" not in msg
+
+
 def test_a_nested_live_partition_source_is_rendered_by_path(
     client: Any, httpx_mock: Any, caplog: pytest.LogCaptureFixture
 ):

@@ -12,7 +12,8 @@ The columns are the dev chart's ``MILLRACE_TABLE_COLUMNS`` (PostHog/charts
 ``apps/millrace-events/values.yaml``: millpond's live events table, in its
 order) and the spec is the chart's ``identity(team_id),day(timestamp)``.
 A record shaped like the producer's must decode with zero drops and key
-to the right partition tuple.
+to the right partition tuple, and its ``properties`` text must fill the
+operator-added VARIANT companion ``properties_sv`` with zero drops.
 """
 
 from __future__ import annotations
@@ -20,12 +21,16 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 from pyhoglake import TableInfo
+from pyhoglake.variant import to_python
 
+from millrace import keyspace
 from millrace.config import load_config
 from millrace.consumer import classify_message
-from millrace.flush import JsonObjectDecoder
+from millrace.flush import FlushContext, JsonObjectDecoder, build_flush_plan
 from millrace.grouping import GroupKeyer
 from millrace.stage import StagedRecord
 
@@ -68,10 +73,10 @@ def producer_event(**overrides: Any) -> dict[str, Any]:
     return {k: v for k, v in event.items() if v is not None}
 
 
-def dev_info() -> TableInfo:
+def dev_info(*extra: dict[str, Any]) -> TableInfo:
     """The table the dev chart's config creates, parsed by the real
     config grammar (so a grammar change that alters the shape shows
-    up here too)."""
+    up here too), plus ``extra`` columns an operator added."""
     cfg = load_config(
         {
             "MILLRACE_KAFKA_BOOTSTRAP_SERVERS": "broker:9092",
@@ -90,6 +95,9 @@ def dev_info() -> TableInfo:
     wire_columns = [
         {"name": spec.name, "type": spec.col_type, "field_id": i + 1, "ordinal": i}
         for i, spec in enumerate(specs)
+    ]
+    wire_columns += [
+        {"field_id": 27 + i, "ordinal": 26 + i, **c} for i, c in enumerate(extra)
     ]
     ids = {c["name"]: c["field_id"] for c in wire_columns}
     return TableInfo.from_wire(
@@ -148,3 +156,60 @@ def test_every_person_mode_stages(person_mode: str) -> None:
     staged, values = stage_and_decode(producer_event(person_mode=person_mode))
     assert values["person_mode"] == person_mode
     assert staged.group[0] == "2"
+
+
+def test_a_properties_sv_companion_takes_every_producer_event() -> None:
+    """``properties_sv`` (a nullable variant an operator added) mapped from
+    ``properties``, through the real build: no event is dropped, a valid
+    text reads back as ``json.loads(properties)``, an absent one and an
+    invalid one (a duplicate key) as SQL NULL."""
+    info = dev_info(
+        {
+            "name": "properties_sv",
+            "type": "variant",
+            "type_params": {
+                "shredding": {
+                    "type": "object",
+                    "fields": [{"name": "$current_url", "type": "string"}],
+                }
+            },
+        }
+    )
+    events = [
+        producer_event(),
+        producer_event(properties=json.dumps({"$current_url": 1, "list": [None]})),
+        producer_event(properties=None),
+        producer_event(properties='{"a":1,"a":2}'),
+    ]
+    plan = build_flush_plan(
+        [
+            (keyspace.RowKey(("2", "20739"), i), json.dumps(e).encode())
+            for i, e in enumerate(events)
+        ],
+        info,
+        ctx=FlushContext(
+            topic="clickhouse_events_json",
+            slot=0,
+            group=("2", "20739"),
+            group_fields=("team_id", "timestamp_day"),
+            trigger="size",
+            read_snapshot=2,
+            table_uuid=info.table_uuid,
+            build="b0",
+        ),
+        data_path="s3://lake/prefix",
+        max_files_per_commit=512,
+        footer_stats_min_bytes=1,
+        version="test",
+        variant_sources={"properties_sv": "properties"},
+    )
+    assert plan.dropped_records == () and plan.records == len(events)
+    (upload,) = plan.commits[0].uploads
+    table = pq.read_table(pa.BufferReader(upload.body))
+    (column,) = [c for c in info.columns if c.name == "properties_sv"]
+    assert to_python(table.column("properties_sv"), column) == [
+        json.loads(events[0]["properties"]),
+        json.loads(events[1]["properties"]),
+        None,
+        None,
+    ]
