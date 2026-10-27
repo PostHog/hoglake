@@ -54,7 +54,13 @@ permissions:
 # cancel each other. For one commit, a waiting run can replace another
 # waiting run. Both runs do the same work, so this has no effect.
 concurrency:
-  group: ecr-release-${{ github.event.workflow_run.head_sha || github.ref }}
+  # A real dispatch joins the commit's group. Otherwise it races the
+  # automatic workflow_run publish for the same commit, and two tags
+  # are made for one commit or the second push fails on immutability.
+  group: >-
+    ecr-release-${{ github.event.workflow_run.head_sha
+    || (github.event_name == 'workflow_dispatch' && !inputs.dry_run && github.sha)
+    || github.ref }}
   cancel-in-progress: false
 
 defaults:
@@ -127,12 +133,19 @@ jobs:
             fi
             if [[ $DISPATCH_DRY_RUN == true ]]; then
               echo "Dry run for ${DISPATCH_SHA} on ${DISPATCH_REF}. Nothing goes to ECR."
-            else
-              echo "Release for ${DISPATCH_SHA} on ${DISPATCH_REF}."
+              {
+                echo "publish=true"
+                echo "dry-run=true"
+                echo "sha=${DISPATCH_SHA}"
+              } >> "$GITHUB_OUTPUT"
+              exit 0
             fi
+            # A real dispatch reads the same test gates as a workflow_run.
+            # A person must not publish a commit whose tests failed.
+            echo "Release for ${DISPATCH_SHA} on ${DISPATCH_REF}."
             {
-              echo "publish=true"
-              echo "dry-run=${DISPATCH_DRY_RUN}"
+              .release-tools/.github/scripts/ecr-release.sh gate "$GITHUB_REPOSITORY" "$DISPATCH_SHA"
+              echo "dry-run=false"
               echo "sha=${DISPATCH_SHA}"
             } >> "$GITHUB_OUTPUT"
             exit 0
