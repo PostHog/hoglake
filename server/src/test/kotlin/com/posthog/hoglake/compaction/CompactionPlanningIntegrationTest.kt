@@ -441,4 +441,37 @@ class CompactionPlanningIntegrationTest {
         append(cat, file("variant-a", 600), file("variant-b", 600))
         assertThat(svc.planTable(cat, "ns", "t", cfg).groups).isEmpty()
     }
+
+    @Test
+    fun `with HOGLAKE_COMPACTION_VARIANT on, variant tables plan in the catalogs it names`() {
+        val declaration =
+            mapOf("type" to "object", "fields" to listOf(mapOf("name" to "\$browser", "type" to "string")))
+        // Two variants, so the refusal below must be of ANY column's
+        // declaration: `raw`'s unshredded layout always derives.
+        val cat =
+            fixture(
+                listOf(
+                    ColumnDef("properties", ColType.VARIANT, mapOf("shredding" to declaration)),
+                    ColumnDef("raw", ColType.VARIANT),
+                ),
+            )
+        append(cat, file("variant-a", 600), file("variant-b", 600))
+        val on = cfg.copy(variantCompaction = true)
+        assertThat(svc.planTable(cat, "ns", "t", on).groups.single().files).hasSize(2)
+        assertThat(svc.planTable(cat, "ns", "t", on.copy(variantCompactionCatalogs = setOf(cat))).groups).hasSize(1)
+        assertThat(svc.planTable(cat, "ns", "t", on.copy(variantCompactionCatalogs = setOf("another"))).groups)
+            .describedAs("a catalog the allowlist does not name")
+            .isEmpty()
+        // A declaration no layout can be derived from (one stored before a
+        // grammar rule) is never planned, flag or not: the rewriter would
+        // refuse it on every sweep.
+        db.jdbi.useHandleUnchecked { h ->
+            h.execute(
+                "UPDATE hog_column SET type_params = '{\"shredding\": {\"type\": \"object\", \"fields\": []}}' " +
+                    "WHERE name = 'properties' AND catalog_id = (SELECT catalog_id FROM hog_catalog WHERE name = ?)",
+                cat,
+            )
+        }
+        assertThat(svc.planTable(cat, "ns", "t", on).groups).isEmpty()
+    }
 }

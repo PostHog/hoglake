@@ -25,7 +25,7 @@ Supported mappings (both directions):
     pa.timestamp("us", tz)   <-> timestamptz
     pa.decimal128(p, s)      <-> decimal  (type_params: {"precision": p, "scale": s})
     pa.uuid()                <-> uuid   (pa.binary(16) also reads as uuid)
-    variant_field(name[, shredding]) -> variant  (DDL only; see below)
+    variant_field(name[, shredding]) -> variant  (a marked pa.json_(); see below)
 
 Note on uuid: hoglake's ``uuid`` column is parquet
 ``FIXED_LEN_BYTE_ARRAY(16)`` carrying the ``UUID`` logical annotation
@@ -74,8 +74,17 @@ Note on variant: Arrow has no VARIANT type, so no Arrow TYPE maps to
 metadata carries :data:`pyhoglake.variant.VARIANT_FIELD_KEY`; the
 marker, not the type, is what :func:`schema_to_column_defs` reads, and
 it carries the column's ``type_params.shredding`` when one is declared.
-The other direction stays refused: ``coltype_to_arrow("variant")``
-raises, and the Arrow write paths do not construct VARIANT values. The
+The other direction is the caller's to pick, because a variant column
+has three Arrow forms: ``coltype_to_arrow("variant")`` raises, and so
+do :func:`columns_to_arrow_schema` and :func:`column_to_arrow_field` by
+default; with ``variant="json"`` the column is ``pa.json_()`` (the JSON
+text ``Table.append`` and ``Table.prepare_append_tables`` encode),
+marked as :func:`~pyhoglake.variant.variant_field` marks it, so the
+schema declares the same column again; with
+``"storage"`` its storage in the write form of its declaration, and with
+``"read"`` the read form, as pyarrow reads it out of a Parquet file. A
+variant nested in a struct, list or map has none of them: no writer
+shreds one, and the write paths refuse it. The
 one shape that looks like a variant without the marker — a struct of
 exactly ``metadata`` (binary, not null), ``value`` (binary) and an
 optional ``typed_value``, which is how pyarrow reads a VARIANT group out
@@ -111,13 +120,13 @@ trip to be refused.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import Any, Literal, TypeAlias, get_args
 
 import pyarrow as pa
 
 from .errors import UnsupportedTypeError
 from .models import Column
-from .variant import _variant_column_def
+from .variant import SHREDDING_KEY, _column_plan, _variant_column_def, _variant_marker
 
 PARQUET_FIELD_ID_KEY = b"PARQUET:field_id"
 
@@ -128,6 +137,11 @@ MAX_COLUMN_NESTING_DEPTH = 8
 
 #: The container column types. They have children and no values.
 NESTED_TYPES = frozenset({"list", "struct", "map"})
+
+#: How a top-level ``variant`` column is given an Arrow type (see the
+#: module docstring): refused, ``pa.json_()``, or its storage's write or
+#: read form.
+VariantForm: TypeAlias = Literal["refuse", "json", "storage", "read"]
 
 #: Iceberg's synthetic child names, by container type and position.
 SYNTHETIC_CHILD_NAMES = {"list": ("element",), "map": ("key", "value")}
@@ -556,6 +570,61 @@ def uuid_storage_form_schema(schema: pa.Schema) -> pa.Schema:
     return pa.schema(fields, metadata=schema.metadata)
 
 
+def _map_names_field(f: pa.Field, depth: int) -> pa.Field:
+    return f.with_type(map_names_form(f.type, depth))
+
+
+def map_names_form(t: pa.DataType, _depth: int = 1) -> pa.DataType:
+    """``t`` with every map's key and value fields named ``key`` and
+    ``value`` and its entries struct given arrow's default name.
+
+    Those names are synthetic, and no two places agree on them: parquet
+    calls the repetition group ``key_value``, pyarrow names it after the
+    map's own FIELD when it reads a footer back (the column for a
+    top-level map, ``map<string, int64 ('attrs')>``; ``element`` for a
+    list's), and other writers rename the key and value as well. Arrow's
+    ``==`` ignores them, but ``Schema.equals(check_metadata=True)``
+    compares them, so
+    :func:`~pyhoglake.parquet_schema.prepared_schema_matches`
+    refused every map-bearing prepared file, including the ones
+    ``prepare_append_tables`` had just encoded itself (hoglake#359). The
+    server binds a map's key and value by field id, never by name, and
+    accepts those files.
+
+    Only the names change. The key and value keep their
+    ``PARQUET:field_id`` metadata, nullability and type, and
+    ``keys_sorted`` rides along, so a map whose ids, nullability or shape
+    differ is still refused. The entries struct is rebuilt by arrow: it
+    is the repetition group, which carries no field id
+    (:func:`column_to_arrow_field`).
+
+    Bounded by :data:`MAX_COLUMN_NESTING_DEPTH`, as
+    :func:`uuid_storage_form` is and for the same reason. A map AT the
+    cap is not legal (its key and value would be past it), so it is
+    compared un-normalized, i.e. refused.
+    """
+    if _depth >= MAX_COLUMN_NESTING_DEPTH:
+        return t
+    deeper = _depth + 1
+    if pa.types.is_struct(t):
+        return pa.struct([_map_names_field(f, deeper) for f in t])
+    # is_map before the list family, for the reason is_list_family states.
+    if pa.types.is_map(t):
+        return pa.map_(
+            _map_names_field(t.key_field, deeper).with_name("key"),
+            _map_names_field(t.item_field, deeper).with_name("value"),
+            keys_sorted=t.keys_sorted,
+        )
+    if is_list_family(t):
+        value = _map_names_field(t.value_field, deeper)
+        if pa.types.is_large_list(t):
+            return pa.large_list(value)
+        if pa.types.is_fixed_size_list(t):
+            return pa.list_(value, t.list_size)
+        return pa.list_(value)
+    return t
+
+
 def schema_to_column_defs(schema: pa.Schema) -> list[dict[str, Any]]:
     """Convert a pyarrow schema into CreateTableRequest column defs.
 
@@ -605,18 +674,39 @@ def _field_id_metadata(field_id: int) -> dict[bytes, bytes]:
     return {PARQUET_FIELD_ID_KEY: str(field_id).encode("ascii")}
 
 
-def column_to_arrow_field(c: Column, _depth: int = 1) -> pa.Field:
+def column_to_arrow_field(
+    c: Column, _depth: int = 1, *, variant: VariantForm = "refuse"
+) -> pa.Field:
     """One catalog column as an Arrow field, field ids on every level.
 
     Containers recurse. The synthetic repetition groups parquet inserts
     (``list``, ``key_value``) are arrow's own business and carry no field
     id — Iceberg has nothing to match one against.
+
+    ``variant`` picks a top-level variant column's form (the module
+    docstring); a storage form carries the field id on the group only,
+    as the file does.
     """
+    if variant not in get_args(VariantForm):
+        # On every column, not a variant's alone: a typo would otherwise
+        # pass on every table until the first with a variant column.
+        raise ValueError(
+            f"variant is 'refuse', 'json', 'storage' or 'read', not {variant!r}"
+        )
     if _depth > MAX_COLUMN_NESTING_DEPTH:
         raise UnsupportedTypeError(
             f"column {c.name!r} nests deeper than the maximum "
             f"{MAX_COLUMN_NESTING_DEPTH} (a top-level column is depth 1)"
         )
+    if c.type == "variant":
+        kind = _variant_type(c, _depth, variant)
+        metadata = _field_id_metadata(c.field_id)
+        if variant == "json":
+            # The marker too, as variant_field sets it: the schema then
+            # declares the variant again (create_table, schema_to_column_defs)
+            # rather than a json column. Parquet has no slot for it.
+            metadata |= _variant_marker((c.type_params or {}).get(SHREDDING_KEY))
+        return pa.field(c.name, kind, nullable=c.nullable, metadata=metadata)
     if c.type not in NESTED_TYPES:
         return pa.field(
             c.name,
@@ -657,11 +747,36 @@ def column_to_arrow_field(c: Column, _depth: int = 1) -> pa.Field:
     )
 
 
-def columns_to_arrow_schema(columns: list[Column] | tuple[Column, ...]) -> pa.Schema:
+def _variant_type(c: Column, depth: int, form: VariantForm) -> pa.DataType:
+    if depth > 1:
+        # Whatever the form: no writer shreds a nested variant (D17), and
+        # its JSON text would be appended as a json column's would.
+        raise UnsupportedTypeError(
+            f"variant column {c.name!r} is nested in a struct, list or map: only "
+            "a top-level variant column can be written"
+        )
+    if form == "json":
+        return pa.json_()
+    if form in ("storage", "read"):
+        plan = _column_plan(c, (c.type_params or {}).get(SHREDDING_KEY))
+        return plan.write_type if form == "storage" else plan.read_type
+    raise UnsupportedTypeError(
+        f"column {c.name!r} is variant, which has no one Arrow type: pass "
+        "variant='json' (JSON text), 'storage' (its storage as written) or "
+        "'read' (as pyarrow reads it from Parquet)"
+    )
+
+
+def columns_to_arrow_schema(
+    columns: list[Column] | tuple[Column, ...], *, variant: VariantForm = "refuse"
+) -> pa.Schema:
     """Build the target Arrow schema for a table's columns, with parquet
     field ids embedded as ``PARQUET:field_id`` field metadata (pyarrow
     writes these into the parquet SchemaElement field_id slots, at every
-    nesting level)."""
+    nesting level). ``variant`` is as for :func:`column_to_arrow_field`."""
     return pa.schema(
-        [column_to_arrow_field(c) for c in sorted(columns, key=lambda c: c.ordinal)]
+        [
+            column_to_arrow_field(c, variant=variant)
+            for c in sorted(columns, key=lambda c: c.ordinal)
+        ]
     )

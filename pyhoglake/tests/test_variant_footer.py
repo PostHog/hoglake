@@ -169,6 +169,13 @@ def _footer(raw):
     return footer_oracle.split(raw)[1]
 
 
+def _splice(raw, stamps):
+    """``raw`` stamped, as one file: stamp_variant_footer returns where the
+    footer starts and what replaces it, the body being the caller's."""
+    start, tail, elements = stamp_variant_footer(raw, stamps)
+    return bytes(raw[:start]) + tail, elements
+
+
 def _one_decimal():
     column = _column("v", 3, {"type": "decimal4", "precision": 9, "scale": 2})
     raw = _pyarrow_bytes(_table([column], [_storage(column, [Decimal("1.00")])]))
@@ -178,7 +185,7 @@ def _one_decimal():
 def _written(column, rows):
     """pyhoglake's own file of ``rows``, and its schema elements."""
     table = _table([column], [_storage(column, rows)])
-    written = write_variant_parquet(table, [column], {column.name: _plan(column)})
+    written = write_variant_parquet(table, [column])
     return written, _schema_elements(written.body)
 
 
@@ -418,7 +425,7 @@ def test_splice_equals_the_generic_oracle_byte_for_byte(scenario):
     table, columns = build()
     raw = _pyarrow_bytes(table, **options)
     stamps = _stamps(columns)
-    patched, elements = stamp_variant_footer(raw, stamps)
+    patched, elements = _splice(raw, stamps)
     assert patched == footer_oracle.stamp(raw, stamps)
     start, footer = footer_oracle.split(raw)
     # The body is untouched: every offset into it (column chunks, page
@@ -447,11 +454,9 @@ def test_the_splice_takes_its_stamps_in_any_order():
     stamps = _stamps(columns)
     assert len(stamps) > 2
     expected = footer_oracle.stamp(raw, stamps)
-    assert stamp_variant_footer(raw, stamps[::-1])[0] == expected
+    assert _splice(raw, stamps[::-1])[0] == expected
     a, b = _stamps(columns[2:3]), _stamps(columns[1:2])
-    assert stamp_variant_footer(raw, [*a[::-1], *b[::-1]])[0] == footer_oracle.stamp(
-        raw, [*b, *a]
-    )
+    assert _splice(raw, [*a[::-1], *b[::-1]])[0] == footer_oracle.stamp(raw, [*b, *a])
 
 
 def test_the_variant_bytes_follow_the_field_id():
@@ -463,7 +468,7 @@ def test_the_variant_bytes_follow_the_field_id():
     footer = _footer(raw)
     (group,) = [e for e in _positioned_elements(footer) if e.path == ("v",)]
     assert group.last == 9
-    patched = _footer(stamp_variant_footer(raw, _stamps([column]))[0])
+    patched = _footer(_splice(raw, _stamps([column]))[0])
     blob = bytes.fromhex("1C 0C 20 13 01 00 00")
     assert patched == footer[: group.stop] + blob + footer[group.stop :]
 
@@ -478,7 +483,7 @@ def test_the_decimal_bytes_follow_the_name():
         e for e in _positioned_elements(footer) if e.path == ("v", "typed_value")
     ]
     assert leaf.last == 4
-    patched = _footer(stamp_variant_footer(raw, _stamps([column]))[0])
+    patched = _footer(_splice(raw, _stamps([column]))[0])
     blob = bytes.fromhex("25 0A 15 0E 15 24 2C 5C 15 0E 15 24 00 00")
     # The group's 7 bytes come before the leaf's.
     assert patched[leaf.stop + 7 : leaf.stop + 21] == blob
@@ -499,9 +504,7 @@ def test_a_decimal_leaf_ending_at_another_field_is_spliced_as_the_oracle_does():
     ]
     assert leaf.last == 5
     stamps = _stamps([column])
-    assert stamp_variant_footer(forged, stamps)[0] == footer_oracle.stamp(
-        forged, stamps
-    )
+    assert _splice(forged, stamps)[0] == footer_oracle.stamp(forged, stamps)
 
 
 @pytest.mark.parametrize("path", FOREIGN, ids=lambda p: p.name)
@@ -509,7 +512,7 @@ def test_an_empty_splice_leaves_a_footer_alone(path):
     """A splice of nothing changes nothing, on what other writers produce
     too (DuckDB's, and parquet-java's in parquet-testing)."""
     raw = path.read_bytes()
-    assert stamp_variant_footer(raw, [])[0] == raw
+    assert _splice(raw, [])[0] == raw
 
 
 # -- the splice's refusals ---------------------------------------------------
@@ -533,7 +536,7 @@ def test_refuses_a_group_already_annotated():
     duckdb = (DATA / "native_variant.parquet").read_bytes()
     _refused(duckdb, [FooterStamp(("properties",), "variant", 2)], "already annotated")
     column, raw = _one_decimal()
-    once, _ = stamp_variant_footer(raw, _stamps([column]))
+    once, _ = _splice(raw, _stamps([column]))
     _refused(once, _stamps([column])[:1], "already annotated")
     _refused(once, _stamps([column])[1:], r"already has fields \[6, 7, 8, 10\]")
 
@@ -743,8 +746,7 @@ def test_canary_pyarrow_reads_a_variant_group_as_its_plain_struct(source):
         raw = (DATA / "native_variant.parquet").read_bytes()
     else:
         table, columns = _many_columns()
-        plans = {c.name: _plan(c) for c in columns}
-        raw = write_variant_parquet(table, columns, plans).body
+        raw = write_variant_parquet(table, columns).body
     with pq.ParquetFile(pa.BufferReader(raw)) as parquet:
         read = parquet.schema_arrow
         back = parquet.read()
@@ -762,9 +764,8 @@ def test_canary_pyarrow_reads_a_variant_group_as_its_plain_struct(source):
 
 def test_write_variant_parquet_round_trips_the_corpus_and_measures_after_the_patch():
     table, columns = _corpus()
-    plans = {c.name: _plan(c) for c in columns}
-    written = write_variant_parquet(table, columns, plans)
-    body = written.body
+    written = write_variant_parquet(table, columns)
+    body = written.body.to_pybytes()
     assert written.size == len(body)
     assert written.footer_size == struct.unpack("<I", body[-8:-4])[0]
     # Measured on the patched footer, not pyarrow's: they differ by the stamps.
@@ -779,7 +780,7 @@ def test_write_variant_parquet_round_trips_the_corpus_and_measures_after_the_pat
     assert _schema_elements_from_footer(tail[:-8])[1][10] == {16: {1: 1}}
     back = pq.read_table(pa.BufferReader(body))
     for column in columns:
-        assert back.schema.field(column.name).type == plans[column.name].read_type
+        assert back.schema.field(column.name).type == _plan(column).read_type
         # repr, which tells NaN from NaN as equal and -0.0 from 0.0 apart.
         got = variant.to_python(back.column(column.name), column)
         want = variant.to_python(table.column(column.name), column)
@@ -793,8 +794,7 @@ def test_write_variant_parquet_metadata_is_the_files_for_the_stats():
     statistics of the decimal leaves are not (no DECIMAL annotation there:
     see VariantParquet.metadata)."""
     table, columns = _many_columns()
-    plans = {c.name: _plan(c) for c in columns}
-    written = write_variant_parquet(table, columns, plans, row_group_size=1)
+    written = write_variant_parquet(table, columns, row_group_size=1)
     read = pq.read_metadata(pa.BufferReader(written.body))
     catalog = (*columns, Column("n", "long", 5, 4, True))
     stats = extract_column_stats(written.metadata, catalog)
@@ -823,16 +823,15 @@ def test_write_variant_parquet_takes_the_write_options_and_row_group_size():
     from pyhoglake import parquet_write_options
 
     table, columns = _decimal_table()
-    plans = {"v": _plan(columns[0])}
     options = {**parquet_write_options("zstd", 3), "store_schema": True}
     written = write_variant_parquet(
-        table, columns, plans, row_group_size=2, write_options=options
+        table, columns, row_group_size=2, write_options=options
     )
     metadata = pq.read_metadata(pa.BufferReader(written.body))
     assert metadata.num_row_groups == 2
     assert metadata.row_group(0).column(0).compression == "ZSTD"
     assert b"ARROW:schema" not in (metadata.metadata or {})
-    plain = write_variant_parquet(table, columns, plans)
+    plain = write_variant_parquet(table, columns)
     assert plain.metadata.row_group(0).column(0).compression == "SNAPPY"
 
 
@@ -853,9 +852,9 @@ def test_write_variant_parquet_refuses_sql_null_rows_in_a_not_null_column():
         storage = _storage(nullable, [1, None, {"p": Decimal("1.00")}])
         table = _table([column], [storage])
         with pytest.raises(ValueError, match="v is NOT NULL but has SQL NULL rows"):
-            write_variant_parquet(table, [column], {"v": _plan(column)})
+            write_variant_parquet(table, [column])
         table = _table([nullable], [storage])
-        write_variant_parquet(table, [nullable], {"v": _plan(nullable)})
+        write_variant_parquet(table, [nullable])
 
 
 def _null_below(storage, kind):
@@ -923,8 +922,8 @@ def test_write_variant_parquet_refuses_a_null_in_a_required_field_of_a_present_r
     )
     table = _table([column], [broken])
     with pytest.raises(ValueError, match=fault):
-        write_variant_parquet(table, [column], {"v": _plan(column)})
-    write_variant_parquet(_table([column], [storage]), [column], {"v": _plan(column)})
+        write_variant_parquet(table, [column])
+    write_variant_parquet(_table([column], [storage]), [column])
 
 
 @pytest.mark.parametrize(
@@ -951,12 +950,8 @@ def test_write_variant_parquet_refuses_nulls_under_a_sql_null_row(decl, build):
         match="v has a null in a non-nullable field under a SQL NULL row or "
         "outside its rows",
     ):
-        write_variant_parquet(
-            _table([column], [broken]), [column], {"v": _plan(column)}
-        )
-    written = write_variant_parquet(
-        _table([column], [storage]), [column], {"v": _plan(column)}
-    )
+        write_variant_parquet(_table([column], [broken]), [column])
+    written = write_variant_parquet(_table([column], [storage]), [column])
     back = pq.read_table(pa.BufferReader(written.body)).column("v")
     assert variant.to_python(back) == [1, None]
 
@@ -967,7 +962,7 @@ def test_write_variant_parquet_views_sliced_storage_at_its_offset():
     column = _column("v", 1, DECIMALS)
     whole = _table([column], [_storage(column, DECIMAL_ROWS * 3)])
     part = whole.slice(5, 4)
-    written = write_variant_parquet(part, [column], {"v": _plan(column)})
+    written = write_variant_parquet(part, [column])
     back = pq.read_table(pa.BufferReader(written.body)).column("v")
     assert variant.to_python(back) == variant.to_python(part.column("v"))
 
@@ -981,7 +976,7 @@ def test_write_variant_parquet_writes_every_chunk_of_a_chunked_column():
     batches = [storage.slice(0, 2), storage.slice(3, 5)]
     table = pa.concat_tables(_table([nullable], [batch]) for batch in batches)
     assert table.column("v").num_chunks == 2
-    written = write_variant_parquet(table, [nullable], {"v": _plan(nullable)})
+    written = write_variant_parquet(table, [nullable])
     back = pq.read_table(pa.BufferReader(written.body)).column("v")
     assert len(back) == 7
     assert variant.to_python(back) == variant.to_python(table.column("v"))
@@ -990,7 +985,7 @@ def test_write_variant_parquet_writes_every_chunk_of_a_chunked_column():
     table = pa.concat_tables(_table([column], [batch]) for batch in batches)
     assert table.column("v").chunk(0).null_count == 0
     with pytest.raises(ValueError, match="v is NOT NULL but has SQL NULL rows"):
-        write_variant_parquet(table, [column], {"v": _plan(column)})
+        write_variant_parquet(table, [column])
 
 
 def test_stamped_decimal_leaves_read_back_with_their_statistics():
@@ -999,7 +994,7 @@ def test_stamped_decimal_leaves_read_back_with_their_statistics():
     for an INT32/INT64 DECIMAL column at all: one reason the floor is at
     least 23 (test_pyarrow_floor.py)."""
     table, columns = _decimal_table()
-    written = write_variant_parquet(table, columns, {"v": _plan(columns[0])})
+    written = write_variant_parquet(table, columns)
     group = pq.read_metadata(pa.BufferReader(written.body)).row_group(0)
     chunks = {group.column(i).path_in_schema: i for i in range(group.num_columns)}
     p = group.column(chunks["v.typed_value.p.typed_value"]).statistics
@@ -1011,46 +1006,37 @@ def test_stamped_decimal_leaves_read_back_with_their_statistics():
     assert (arr.statistics.min, arr.statistics.max) == (Decimal("-0.9"), Decimal("0.5"))
 
 
-def test_write_variant_parquet_refuses_what_is_not_a_planned_variant_column():
+def test_write_variant_parquet_refuses_what_is_not_a_variant_in_its_write_form():
     column = _column("v", 1, DECIMALS)
     read_form = variant.storage_type(DECIMALS, form="read")
     table = _table([column], [pa.nulls(1, read_form)])
     with pytest.raises(ValueError, match="v is not in its plan's write form"):
-        write_variant_parquet(table, [column], {"v": _plan(column)})
+        write_variant_parquet(table, [column])
+    # A table whose variant storage no catalog column claims as a variant
+    # would go out a plain struct with no annotation.
+    table = _table([column], [_storage(column, [1])])
     with pytest.raises(ValueError, match="no variant columns"):
-        write_variant_parquet(table, [column], {})
-    with pytest.raises(ValueError, match="not in the table"):
-        write_variant_parquet(table, [column], {"v": _plan(column), "w": _plan(column)})
-    scalar = replace(column, type="long")
-    with pytest.raises(ValueError, match="v is not a variant column of the table"):
-        write_variant_parquet(table, [scalar], {"v": _plan(column)})
-    with pytest.raises(ValueError, match="v is not a variant column of the table"):
-        write_variant_parquet(table, [], {"v": _plan(column)})
-    # Written as it stands, an unplanned variant column would go out a
-    # plain struct with no annotation.
-    a, b = _column("a", 1, None), _column("b", 2, {"type": "int64"})
-    table = _table([a, b], [_storage(a, [1]), _storage(b, [2])])
-    with pytest.raises(ValueError, match="variant column b has no plan"):
-        write_variant_parquet(table, [a, b], {"a": _plan(a)})
+        write_variant_parquet(table, [replace(column, type="long")])
+    with pytest.raises(ValueError, match="no variant columns"):
+        write_variant_parquet(table, [])
 
 
-def test_write_variant_parquet_refuses_a_plan_that_is_not_the_columns():
-    """The exact layout check holds the file to the plan it is given, so a
-    stale or swapped plan would write, stamp and pass, in a layout that is
-    not the column's."""
+def test_write_variant_parquet_holds_storage_to_its_columns_own_declaration():
+    """Each plan is the column's declaration's, so storage another
+    declaration built is not its write form, even when the two read back
+    alike; a root variant declares the unshredded layout, as no
+    declaration does."""
     declared = _column(
         "v", 1, {"type": "object", "fields": [{"name": "a", "type": "int64"}]}
     )
     other = _column("v", 1, {"type": "string"})
     table = _table([other], [_storage(other, ["x"])])
-    with pytest.raises(ValueError, match="the plan of v is not its declaration's"):
-        write_variant_parquet(table, [declared], {"v": _plan(other)})
-    undeclared = _column("v", 1, None)
-    with pytest.raises(ValueError, match="the plan of v is not its declaration's"):
-        write_variant_parquet(table, [undeclared], {"v": _plan(other)})
+    with pytest.raises(ValueError, match="v is not in its plan's write form"):
+        write_variant_parquet(table, [declared])
+    with pytest.raises(ValueError, match="v is not in its plan's write form"):
+        write_variant_parquet(table, [_column("v", 1, None)])
 
-    # One read type (decimal128(9, 2)), two layouts (INT32, INT64): a check
-    # of read types would write the INT64 leaf the declaration does not have.
+    # One read type (decimal128(9, 2)), two layouts (INT32, INT64).
     def p(kind):
         field = {"name": "p", "type": kind, "precision": 9, "scale": 2}
         return _column("v", 1, {"type": "object", "fields": [field]})
@@ -1058,48 +1044,109 @@ def test_write_variant_parquet_refuses_a_plan_that_is_not_the_columns():
     declared, other = p("decimal4"), p("decimal8")
     assert _plan(declared).read_type == _plan(other).read_type
     table = _table([other], [_storage(other, [{"p": Decimal("1.25")}])])
-    with pytest.raises(ValueError, match="the plan of v is not its declaration's"):
-        write_variant_parquet(table, [declared], {"v": _plan(other)})
-    # A root variant declares the unshredded layout, as no declaration does.
-    plain = _column("v", 1, {"type": "variant"})
+    with pytest.raises(ValueError, match="v is not in its plan's write form"):
+        write_variant_parquet(table, [declared])
+    plain, undeclared = _column("v", 1, {"type": "variant"}), _column("v", 1, None)
     unshredded = _table([plain], [_storage(plain, [1])])
-    assert write_variant_parquet(unshredded, [plain], {"v": _plan(undeclared)}).size
-    assert write_variant_parquet(unshredded, [undeclared], {"v": _plan(plain)}).size
+    assert write_variant_parquet(unshredded, [plain]).size
+    assert write_variant_parquet(unshredded, [undeclared]).size
 
 
 @pytest.mark.parametrize(
     ("change", "refusal"),
     [
-        ("field_id", "cannot annotate VARIANT footer: v has field id 7, not 1"),
-        ("no_field_id", "cannot annotate VARIANT footer: v has field id None, not 1"),
-        ("nullable", "in a layout that is not its declaration's: v is"),
-        ("child_id", "in a layout that is not its declaration's: v.metadata is"),
+        ("field_id", "v carries field id 7, not its column's 1"),
+        ("no_field_id", "v carries no field id, not its column's 1"),
+        ("nullable", "v is nullable, and its column NOT NULL"),
     ],
 )
 def test_write_variant_parquet_refuses_a_field_that_is_not_the_columns(change, refusal):
-    """The table carries the column's field id and nullability, and no field
-    id below it: anything else is written, then refused by the splice or
-    the layout check before it can be uploaded."""
+    """The table's field carries the column's field id and nullability: a
+    caller's table that does not is the caller's mistake, refused before
+    anything is written, not a layout fault blaming the writer."""
     column = _column("v", 1, DECIMALS, nullable=False)
     rows = [row for row in DECIMAL_ROWS if row is not None]
     table = _table([column], [_storage(column, rows)])
     field = table.schema.field("v")
     if change == "nullable":
         field = field.with_nullable(True)
-    elif change == "child_id":
-        children = [
-            f.with_metadata({b"PARQUET:field_id": b"99"}) if f.name == "metadata" else f
-            for f in field.type
-        ]
-        field = field.with_type(pa.struct(children))
     else:
         field = field.remove_metadata()
         if change == "field_id":
             field = field.with_metadata({b"PARQUET:field_id": b"7"})
-    forged = pa.table([table.column("v").cast(field.type)], schema=pa.schema([field]))
-    with pytest.raises(ValidationError, match=re.escape(refusal)):
-        write_variant_parquet(forged, [column], {"v": _plan(column)})
-    write_variant_parquet(table, [column], {"v": _plan(column)})
+    forged = pa.table([table.column("v")], schema=pa.schema([field]))
+    with pytest.raises(ValueError, match=re.escape(refusal)) as refused:
+        write_variant_parquet(forged, [column])
+    assert not isinstance(refused.value, ValidationError)
+    write_variant_parquet(table, [column])
+    # The other way round: a NOT NULL field for a nullable column.
+    nullable = replace(column, nullable=True)
+    with pytest.raises(ValueError, match="v is NOT NULL, and its column nullable"):
+        write_variant_parquet(table, [nullable])
+
+
+def test_write_variant_parquet_writes_no_field_id_below_the_group():
+    """A field id the caller's storage carries below the group is not
+    written (D14): the type written is the plan's, and its only field id is
+    the group's, so the file is the declaration's, not a layout fault."""
+    column = _column("v", 1, DECIMALS, nullable=False)
+    rows = [row for row in DECIMAL_ROWS if row is not None]
+    table = _table([column], [_storage(column, rows)])
+    field = table.schema.field("v")
+    children = [
+        f.with_metadata({b"PARQUET:field_id": str(90 + i).encode()})
+        for i, f in enumerate(field.type)
+    ]
+    field = field.with_type(pa.struct(children))
+    tagged = pa.table([table.column("v").cast(field.type)], schema=pa.schema([field]))
+    written = write_variant_parquet(tagged, [column])
+    ids = [element.get(9) for element in _schema_elements(written.body.to_pybytes())]
+    assert ids[:2] == [None, 1]  # the root, then the group
+    assert set(ids[2:]) == {None}
+    # Byte for byte the file of the same storage with no tags.
+    assert written.body.equals(write_variant_parquet(table, [column]).body)
+
+
+@pytest.mark.parametrize("container", ["struct", "list"])
+def test_write_variant_parquet_refuses_a_variant_nested_in_a_container(container):
+    """No writer shreds a nested variant (D17): a container holding one is
+    refused, not written as the plain struct its storage would be."""
+    from pyhoglake.errors import UnsupportedTypeError
+
+    top = _column("v", 1, None)
+    child = Column("x" if container == "struct" else "element", "variant", 3, 0, True)
+    nested = Column("c", container, 2, 1, True, children=(child,))
+    storage = _storage(top, [1])
+    kind = (
+        pa.struct([pa.field("x", storage.type)])
+        if container == "struct"
+        else pa.list_(pa.field("element", storage.type))
+    )
+    table = _table([top], [storage], extra=[(pa.field("c", kind), pa.nulls(1, kind))])
+    with pytest.raises(UnsupportedTypeError, match="'(x|element)' is nested in a"):
+        write_variant_parquet(table, [top, nested])
+
+
+def test_write_variant_parquet_stamps_the_file_where_pyarrow_wrote_it():
+    """The stamps replace the footer in the buffer pyarrow wrote, and the
+    body (hundreds of MiB for a big flush) is not joined to a new tail:
+    Python's peak while writing is one file and the buffer's slack, not
+    two files."""
+    import tracemalloc
+
+    column = _column("v", 1, None)
+    rows = [{"k": "x" * 200, "n": i} for i in range(20_000)]
+    table = _table([column], [_storage(column, rows)])
+    tracemalloc.start()
+    try:
+        written = write_variant_parquet(
+            table, [column], write_options={"compression": "none"}
+        )
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert written.size > 4_000_000
+    assert peak < 1.5 * written.size
 
 
 def test_write_variant_parquet_raises_a_layout_fault_as_a_validation_error(
@@ -1108,9 +1155,9 @@ def test_write_variant_parquet_raises_a_layout_fault_as_a_validation_error(
     import pyhoglake.parquet_schema as ps
 
     table, columns = _decimal_table()
-    monkeypatch.setattr(ps, "variant_layout_fault", lambda *a: "forced")
+    monkeypatch.setattr(ps, "variant_layout_fault", lambda *a, **k: "forced")
     with pytest.raises(ValidationError, match="not its declaration's: forced"):
-        write_variant_parquet(table, columns, {"v": _plan(columns[0])})
+        write_variant_parquet(table, columns)
 
 
 #: Every node type but object and array (which the positions below are),
@@ -1169,7 +1216,7 @@ def test_write_variant_parquet_writes_every_node_type_as_declared(
     column = _column("v", 7, _positioned(node, position), nullable=nullable)
     storage = variant.encode_json(["null", "1", '{"x": 1}', "[1]"], column).array
     table = _table([column], [storage])
-    written = write_variant_parquet(table, [column], {"v": _plan(column)})
+    written = write_variant_parquet(table, [column])
     elements = _schema_elements(written.body)
     expected = [want for _, want in _plan(column).expected_elements(column)]
     assert elements[1:] == expected
@@ -1324,8 +1371,7 @@ def test_the_check_accepts_pyhoglakes_file_for_every_corpus_declaration(name, nu
     table = _table(
         [other, column], [_storage(other, DECIMAL_ROWS), _storage(column, rows)]
     )
-    plans = {"a": _plan(other), "v": _plan(column)}
-    written = write_variant_parquet(table, [other, column], plans)
+    written = write_variant_parquet(table, [other, column])
     elements = _schema_elements(written.body)
     (start,) = [i for e, _, i in _top_level(elements) if e[4] == "v"]
     assert elements[start][3] == (1 if nullable else 0)
@@ -1417,10 +1463,10 @@ def test_written_files_are_the_oracles_stamp_and_read_back_as_written(
     plan = _plan(column)
     if not nullable and any(row is None for row in rows):
         with pytest.raises(ValueError, match="v is NOT NULL but has SQL NULL rows"):
-            write_variant_parquet(table, [column], {"v": plan})
+            write_variant_parquet(table, [column])
         return
-    written = write_variant_parquet(table, [column], {"v": plan})
-    assert written.body == footer_oracle.stamp(
+    written = write_variant_parquet(table, [column])
+    assert written.body.to_pybytes() == footer_oracle.stamp(
         _pyarrow_bytes(table), variant_stamps(column, plan)
     )
     assert written.footer_size == len(_footer(written.body))

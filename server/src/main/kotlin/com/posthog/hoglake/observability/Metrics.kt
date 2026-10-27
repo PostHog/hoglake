@@ -516,6 +516,31 @@ object Metrics {
     }
 
     /**
+     * hoglake_compaction_variant_layout_mismatch_total{catalog, reason} —
+     * groups refused because a VARIANT column's storage in an input is
+     * not the layout compaction copies it as (`reason="layout"`), or the
+     * input was written by DuckDB (`reason="duckdb"`, whatever its
+     * layout); see VariantLayoutMismatchException.
+     *
+     * Its own series rather than a reason of
+     * `hoglake_compaction_skipped_total`, because those groups are already
+     * in that one's `unconvertible_schema`, and a second reason for them
+     * would count each twice in its sum. The compaction warning logged
+     * with each one names the table, column and input file. A `layout`
+     * refusal of a file pyhoglake's Table.append or prepare_append_tables
+     * or the Trino connector wrote means the server's layout port has
+     * drifted from theirs: turn HOGLAKE_COMPACTION_VARIANT off. One of a
+     * file registered from another writer (prepare_append_files) is just
+     * another layout.
+     */
+    fun compactionVariantLayoutMismatch(
+        catalog: String,
+        reason: String,
+    ) {
+        increment("hoglake_compaction_variant_layout_mismatch_total", 1.0, "catalog", catalog, "reason", reason)
+    }
+
+    /**
      * hoglake_compaction_buckets_skipped_claimed_total{catalog} — buckets
      * a planner skipped WITHOUT probing because another run holds a live
      * bucket claim on them (`CompactionClaimRepo.bucketKey`). Its rate

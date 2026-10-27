@@ -1368,7 +1368,7 @@ class CompactionServiceIntegrationTest {
     }
 
     @Test
-    fun `a table holding a variant at ANY depth produces no candidates`() {
+    fun `a table holding a variant at ANY depth produces no candidates unless the flag is on`() {
         // THE GATE, which had no test: the rewriter's refusal is only
         // the backstop, and reverting the planner to #77's top-level
         // check left the whole suite green. A nested variant would then
@@ -1452,6 +1452,89 @@ class CompactionServiceIntegrationTest {
             assertThat(svc.runOnce(cat, cfg).groupsCompacted)
                 .describedAs("%s variant: and nothing is compacted", label)
                 .isZero()
+
+            // HOGLAKE_COMPACTION_VARIANT on: the same files compact, the
+            // variant null-filled in its declared layout.
+            val on = cfg.copy(variantCompaction = true)
+            assertThat(svc.planTable(cat, "ns", "t", on).groups)
+                .describedAs("%s variant, flag on: the files are planned", label)
+                .isNotEmpty()
+            assertThat(svc.runOnce(cat, on).groupsCompacted)
+                .describedAs("%s variant, flag on: and compacted", label)
+                .isPositive()
+        }
+    }
+
+    @Test
+    fun `a variant table compacts pyhoglake's files, and a group with another layout is skipped and counted`() {
+        // The service end to end, over pyhoglake-written files (see
+        // VariantPassthroughTest for the bytes): the declarations come from
+        // the catalog, the inputs are hydrated, the output is registered.
+        val defs =
+            com.posthog.hoglake.wireObjectMapper()
+                .readTree(javaClass.getResource("/variant/passthrough/columns.json"))
+                .map {
+                    ColumnDef(
+                        it["name"].asText(),
+                        ColType.fromWire(it["type"].asText()),
+                        it["type_params"]?.let {
+                                p ->
+                            com.posthog.hoglake.wireObjectMapper().convertValue(p, Map::class.java)
+                        }
+                            ?.let { p -> p.entries.associate { (k, v) -> k as String to v } },
+                        nullable = it["nullable"]?.asBoolean() ?: true,
+                    )
+                }
+        val on = cfg.copy(targetBytes = 1L shl 20, variantCompaction = true)
+        val registry = io.micrometer.core.instrument.simple.SimpleMeterRegistry()
+        com.posthog.hoglake.observability.Metrics.bind(registry)
+        try {
+            for ((second, compacts) in listOf("b" to true, "mismatch" to false)) {
+                val cat = "compact-variant-files-$second-${counter.incrementAndGet()}"
+                catalogs.createCatalog(cat, "s3://$BUCKET/$cat")
+                catalogs.createNamespace(cat, "ns")
+                catalogs.createTable(cat, "ns", "t", defs)
+                // b twice, not a and b: a is over twice b's size, and the
+                // planner would not pack the two.
+                for ((i, name) in listOf("b", second).withIndex()) {
+                    val bytes = javaClass.getResourceAsStream("/variant/passthrough/$name.parquet")!!.readAllBytes()
+                    val path = "s3://$BUCKET/$cat/data/ns/t/$i-$name.parquet"
+                    store.put(path, bytes)
+                    val rows =
+                        ParquetFileReader.open(
+                            LocalInputFile(
+                                java.nio.file.Path.of(
+                                    javaClass.getResource("/variant/passthrough/$name.parquet")!!.toURI(),
+                                ),
+                            ),
+                        ).use {
+                            it.recordCount
+                        }
+                    commits.commit(
+                        cat,
+                        CommitRequest(
+                            appends =
+                                listOf(
+                                    TableAppend("ns", "t", listOf(FileRegistration(path, rows, bytes.size.toLong()))),
+                                ),
+                        ),
+                    )
+                }
+                Hydrator(db.jdbi, store).runOnce()
+                val result = svc.runOnce(cat, on)
+                assertThat(result.groupsCompacted).describedAs(second).isEqualTo(if (compacts) 1L else 0L)
+                assertThat(result.unconvertibleSchema).describedAs(second).isEqualTo(if (compacts) 0L else 1L)
+                assertThat(
+                    registry.find(
+                        "hoglake_compaction_variant_layout_mismatch_total",
+                    ).tag("catalog", cat).tag("reason", "layout").counter()?.count(),
+                )
+                    .describedAs(second)
+                    .isEqualTo(if (compacts) null else 1.0)
+            }
+        } finally {
+            com.posthog.hoglake.observability.Metrics.clear()
+            registry.close()
         }
     }
 

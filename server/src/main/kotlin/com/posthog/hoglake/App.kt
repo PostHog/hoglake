@@ -202,6 +202,8 @@ class App private constructor(
                 verifyMinBytes = cfg.compactionVerifyMinBytes,
                 maxNodesPerRow = cfg.compactionMaxNodesPerRow,
                 codec = ParquetRewriter.OutputCodec.parse(cfg.compactionCodec, cfg.compactionZstdLevel),
+                variantCompaction = cfg.compactionVariant,
+                variantCompactionCatalogs = cfg.compactionVariantCatalogs,
             ),
             // The pod's identity spreads N pods' bucket cursors (and seeds
             // the compaction loop's jitter below). Passed HERE because the

@@ -221,6 +221,19 @@ class _PipelineCollector:
             "(the commit may have landed; never counted as orphans)",
             value=f.ambiguous_uploads,
         )
+        built = CounterMetricFamily(
+            "millrace_flush_build_seconds_total",
+            "Seconds the flush's group builds that returned a plan spent, by stage",
+            labels=["stage"],
+        )
+        for stage, seconds in f.build_seconds.items():
+            built.add_metric([stage], seconds)
+        yield built
+        yield CounterMetricFamily(
+            "millrace_flush_build_queue_seconds_total",
+            "Seconds group builds waited for a millrace-hoglake pool thread",
+            value=f.build_queue_seconds,
+        )
         yield GaugeMetricFamily(
             "millrace_flush_groups_stuck",
             f"Groups currently at or past {STUCK_AFTER} consecutive flush failures (alert)",

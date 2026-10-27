@@ -3400,7 +3400,12 @@ components:
             which is the membership rule. VARIANT maps to Iceberg v3 variant and
             requires native Parquet VARIANT(1), with its field ID on the group.
             VARIANT has no whole-column statistics and cannot be a partition or
-            sort source. Scalar compaction skips tables containing VARIANT.
+            sort source. Compaction skips tables containing VARIANT unless
+            the server enables it (HOGLAKE_COMPACTION_VARIANT); then it copies
+            each VARIANT in the layout its declaration gives it, and skips
+            any compaction group holding a file in another VARIANT layout or
+            written by DuckDB, so that group's other files stay uncompacted
+            with it.
             A top-level VARIANT may declare the shredded layout of the files
             written to it in `type_params.shredding`.
 
@@ -3450,9 +3455,9 @@ components:
 
             A TOP-LEVEL `variant` takes `shredding`, the shredded layout
             that a writer which shreds VARIANT values (the Trino
-            connector) gives the column in its Parquet files: which
-            object fields and array elements get Parquet columns of
-            their own, and the Variant type of each. Readers use the
+            connector, pyhoglake) gives the column in its Parquet files:
+            which object fields and array elements get Parquet columns
+            of their own, and the Variant type of each. Readers use the
             layout each file's footer records, so a declaration never
             changes a read, and files written before it or without it
             stay as they are. A declaration is a tree of JSON objects,
@@ -5030,7 +5035,10 @@ components:
           description: >
             Groups skipped because a live column's type cannot be
             produced from an input file's parquet type (outside identity
-            and the int->long / float->double promotions).
+            and the int->long / float->double promotions). With
+            HOGLAKE_COMPACTION_VARIANT on, also groups holding a VARIANT
+            input not in its declared layout or written by DuckDB, which
+            hoglake_compaction_variant_layout_mismatch_total counts apart.
         invalid_data:
           type: integer
           format: int64

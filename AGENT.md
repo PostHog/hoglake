@@ -161,6 +161,7 @@ path-scoped per component, posthog-monorepo style:
 | `ci-python.yml` | every PR and push to main; a `changes` job selects `pyhoglake/**`, `hedgerow/**`, `millrace/**`, `bench/**`, the root `pyproject.toml` and `uv.lock`, the OpenAPI spec, `ci/**`, the workflow files, the server files and `.github/dependabot.yml` the client's tests read (the filter's comment names each), and the jobs skip otherwise (REQUIRED CHECK `python-checks`) | pyhoglake: `pyhoglake-checks.yml` (ruff, mypy, pytest on 3.12–3.13, the variant suites on the pyarrow floor `pyproject.toml` declares and — non-blocking — on the newest pyarrow at least 7 days old, build, wheel smoke test). hedgerow and bench: uv sync, ruff (pinned; bench exempt until its format backlog lands), pytest. Unit tests plus both live client suites through `python-live.yml`; a `python-checks` job fails if any dependency fails |
 | `bench-image.yml` | `bench/**` `pyhoglake/**` root `pyproject.toml` `uv.lock` | builds `bench/Dockerfile` (context = REPO ROOT: bench installs pyhoglake as a uv workspace member from the root `uv.lock`, so the root manifest, the lock, pyhoglake and every member's `pyproject.toml` must be in the context) and smokes it — CLI runs, non-root, no `.venv`, and the installed pyhoglake is this commit's and not PyPI's. A main push then publishes multi-arch `ghcr.io/posthog/hoglake-bench` (sha + `latest`), gated on the smoke and live client tests. NOT CD: no charts dispatch, no chart references it, it is pulled by hand into `bench/deploy/bench-pod.yaml`. Its build stage is deliberately NOT `$BUILDPLATFORM`-pinned — a virtualenv holds native wheels, so each arch installs its own |
 | `millrace-image.yml` | `millrace/**` `pyhoglake/**` root `pyproject.toml` `uv.lock` `ci/**` | builds `millrace/Dockerfile` (context = REPO ROOT, same reason as bench) and smokes it — both entrypoints (`millrace`, `python -m millrace.maintenance`) refuse an empty env at config with exit 2, non-root, no `.venv`, pyhoglake is this commit's. A main push publishes multi-arch `ghcr.io/posthog/hoglake-millrace` tagged `r<UTC minute>-<sha6>` (the Kargo release tag; `org.opencontainers.image.revision`/`.source` annotations on the index, verified after push), by sha, and `latest`, gated on the smoke and the live suites. No charts dispatch: a Kargo Warehouse in PostHog/charts subscribes to the repository |
+| `ecr-release.yml` | runs when `Server` or `Webui` completes on main (`workflow_run`); PRs that change the workflow or `.github/scripts/ecr-release.sh` run a dry run, and `workflow_dispatch` runs one on any branch | the Kargo path for the customer hoglake instance, ADDITIVE to the gigahog CD below. A `gate` job reads `server-checks` and `webui-test` for the commit. It publishes when no gate failed and at least one passed. It does not read the `deploy` jobs. One `publish` job builds BOTH images (same contexts and platforms as the `deploy` jobs) and pushes BOTH to the shared-services ECR with ONE tag, `r<UTC minute>-<sha6>`, plus the `org.opencontainers.image.revision`/`.source` annotations on the index and each manifest. ECR gets that tag only: the repositories have immutable tags. A rerun uses the commit's existing release again and pushes only a missing image. The job reads the role ARN from the `HOGLAKE_AWS_ECR_PUBLISH_IAM_ROLE` secret. The Warehouse makes Freight only when both repositories have the same newest tag, so never publish one image alone. The dry run, from a PR or from a manual dispatch, pushes to a local registry and runs the same checks without AWS. A dispatch on main with `dry_run` false publishes, and reads the same test gates as a push to main. A dispatch on a branch other than main must set `dry_run`, because the role trust accepts only `refs/heads/main`. Not a required check |
 | `python-live.yml` | reusable: server, Python checks, benchmark image | builds the checked-out server, starts PostgreSQL and MinIO, runs both live client suites (`live` job) and the millrace Kafka-ingestion live suite (`live-millrace` job, which adds apache/kafka to the stack via `ci/live-millrace.sh`), rejects skipped or empty reports, and saves logs and JUnit reports. A failed live run blocks server deployment, PyPI publishing, and benchmark image publishing |
 | `publish-pyhoglake.yml` | `pyhoglake-v*` tags; PRs touching the workflow | `pyhoglake-checks.yml`; tags also publish to PyPI (trusted publishing, `pypi` environment) and create a non-latest GitHub release |
 | `fuzz.yml` | nightly cron + dispatch | `./gradlew fuzz` over every Jazzer target (600s each by default), with the generated corpus accumulated across nights through the actions cache. Not a PR check: PR CI only REPLAYS the committed seed corpus, inside `:test` |
@@ -219,6 +220,14 @@ green deploys on the rerun — the procedure in
 millpond's AGENT.md applies verbatim with `app=gigahog-server` /
 `app=gigahog-webui`.
 
+The customer hoglake instance uses a second, separate path:
+`ecr-release.yml` (table above) publishes both images to ECR for a
+Kargo Warehouse in PostHog/charts. It does not replace or gate the
+ghcr push or the state-file dispatch. A change to the `deploy` jobs
+must keep the gigahog path working without it. Keep the `name:` fields
+`Server` and `Webui` and the job names `changes`, `server-checks` and
+`webui-test`: the ECR gate reads them by name.
+
 ### Versioning
 
 Images deploy per-commit by SHA+digest (above); semver is release-only.
@@ -239,6 +248,36 @@ that needs a line in the next release body and has no changelog in the
 tree gets a "Pending note for the X.Y.Z release body" paragraph here,
 removed by the release PR that states it (the 1.3.8 `Catalog.verify()`
 removal and the 1.4.0 VARIANT-shaped struct refusal were the first two).
+
+Pending note for the 1.4.8 release body: `Table.append` and
+`Table.prepare_append_tables` write top-level `variant` columns, in the
+layout of each column's `type_params.shredding`, and take
+`variant_on_invalid=` (`"raise"`, the default, or `"null"`, refused for
+a NOT NULL variant column) and `variant_report=`. A variant column's
+values come as `pa.json_()` text, the null type (all SQL NULL), or
+storage in its declaration's write form; a plain string is refused.
+`columns_to_arrow_schema` and `column_to_arrow_field` take `variant=`
+(`"json"`, `"storage"`, `"read"`; the default still refuses), and the
+`"json"` form carries `variant_field`'s marker. `prepare_append_tables`
+no longer refuses a variant destination, and the `_hog*` check stops at
+a variant column's own name. Caveats: read-back through the Trino
+connector is not yet verified by a harness; compaction skips tables
+with a variant column unless the server sets
+`HOGLAKE_COMPACTION_VARIANT`, and then skips any group holding a file
+in another layout or written by DuckDB (#70); DuckDB's own Parquet
+reader folds a Variant null into SQL NULL, and the hoglake DuckDB
+extension refuses a variant table at bind (#87); the files of a
+partitioned variant `append` are all in memory before the first upload.
+New public writer core:
+`pyhoglake.write_part(table, columns, *, write_options, ...)` writes
+one partition group as a `PreparedPart` (body, size,
+footer_size, metadata) whose `registration(uri, columns, *, stats,
+partition_values=None)` is the FileRegistration dict; `append` and
+`prepare_append_tables` are built on it, with the same bytes for a
+table with no variant column. `Table.append` now checks the footer of
+every file it writes, and `timestamp_s` below the top level (in a
+struct, list or map) is accepted by `prepare_append_tables` and
+`prepare_append_files`, which refused it.
 
 Because that version is constant between releases, it cannot tell two
 deploys apart. The image build therefore also carries a BUILD STAMP: the
@@ -1384,7 +1423,13 @@ ran on the local stack and what it showed.
     cannot pass), and the VARIANT `type_params.shredding` grammar through
     `pyhoglake/tests/vectors/variant_shredding_vectors.json` (declarations
     with the exact refusal each gets, pinned the same way in
-    `test_variant_ddl.py` and `VariantShreddingVectorFile.EXPECTED_COUNT`).
+    `test_variant_ddl.py` and `VariantShreddingVectorFile.EXPECTED_COUNT`),
+    and each declaration's Parquet layout through
+    `pyhoglake/tests/vectors/variant_layout_vectors.json` (49 vectors,
+    pinned in `test_variant_layout_vectors.py` and
+    `VariantLayoutVectorFile.EXPECTED_COUNT`): a change to
+    `Plan.expected_elements` or to `VariantLayout.kt` regenerates it
+    (`regen_variant_layout_vectors.py`) and moves the other side with it.
     It mirrors the server's type mapping and validation gates, which
     therefore move with the server: a change to `VariantShredding.kt`'s
     rules or messages updates that file and `pyhoglake/variant.py`

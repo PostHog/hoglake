@@ -257,6 +257,82 @@ def test_prepare_tables_registrations_match_prepare_files(
     )
 
 
+def _wire_map(name, field_id, ordinal, value):
+    key = {"name": "key", "type": "string", "field_id": field_id + 1, "ordinal": 0}
+    return {
+        "name": name,
+        "type": "map",
+        "field_id": field_id,
+        "ordinal": ordinal,
+        "children": [{**key, "nullable": False}, {**value, "ordinal": 1}],
+    }
+
+
+# A flat map, and a list of maps whose values are maps (hoglake#359).
+MAP_TABLE_WIRE = {
+    **TABLE_WIRE,
+    "columns": [
+        TABLE_WIRE["columns"][0],
+        _wire_map("attrs", 2, 1, {"name": "value", "type": "string", "field_id": 4}),
+        {
+            "name": "nested",
+            "type": "list",
+            "field_id": 5,
+            "ordinal": 2,
+            "children": [
+                _wire_map(
+                    "element",
+                    6,
+                    0,
+                    _wire_map(
+                        "value", 8, 1, {"name": "value", "type": "long", "field_id": 10}
+                    ),
+                )
+            ],
+        },
+    ],
+}
+
+
+def test_map_columns_prepare_through_both_paths(httpx_mock, recording_s3, tmp_path):
+    """pyarrow reads a map's entries struct back named after its field,
+    and the prepared-file check compared that name, so every map-bearing
+    table was refused by BOTH entry points, including the bytes
+    prepare_append_tables had just encoded itself (hoglake#359)."""
+    table = resolved_table(httpx_mock, recording_s3, MAP_TABLE_WIRE)
+    schema = columns_to_arrow_schema(table.columns)
+    data = pa.Table.from_pylist(
+        [
+            {"id": 1, "attrs": [("a", "x")], "nested": [[("k", [("v", 2)])]]},
+            {"id": 2, "attrs": None, "nested": [[]]},
+        ],
+        schema=schema,
+    )
+    path = tmp_path / "maps.parquet"
+    pq.write_table(data, path)
+
+    from_files = table.prepare_append_files(
+        [(str(path), None)], idempotency_key=str(uuid.uuid4())
+    )
+    from_tables = table.prepare_append_tables(
+        [(data, None)], idempotency_key=str(uuid.uuid4())
+    )
+    file_reg = from_files["appends"][0]["files"][0]
+    table_reg = from_tables["appends"][0]["files"][0]
+    assert {k: v for k, v in table_reg.items() if k != "path"} == {
+        k: v for k, v in file_reg.items() if k != "path"
+    }
+    assert table_reg["record_count"] == 2
+    # The innermost map value (field 10) is registered, through all three
+    # repetition layers.
+    assert 10 in {s["field_id"] for s in table_reg["column_stats"]}
+    for reg in (file_reg, table_reg):
+        assert recording_s3.files[reg["path"].removeprefix("s3://")] == (
+            path.read_bytes()
+        )
+    table._namespace._catalog._client.close()
+
+
 def test_prepare_tables_carries_partition_values_and_input_order(httpx_mock):
     """Registrations follow the INPUT order, not the order the uploads
     finished — the server assigns row ids in registration order, so the
@@ -285,9 +361,13 @@ def test_prepare_tables_carries_partition_values_and_input_order(httpx_mock):
     ]
 
 
-def test_prepare_tables_refuses_a_variant_destination(httpx_mock, recording_s3):
-    """An Arrow rewrite drops the native VARIANT annotation, so there is
-    no honest way to serve a variant destination from an Arrow table."""
+def test_prepare_tables_refuses_a_group_without_its_variant_column(
+    httpx_mock, recording_s3
+):
+    """A variant destination is written from Arrow tables now
+    (test_variant_write.py), but each group still holds every column: a
+    missing variant column is refused by the schema comparison, before any
+    upload."""
     with_variant = {
         **TABLE_WIRE,
         "columns": [
@@ -303,7 +383,7 @@ def test_prepare_tables_refuses_a_variant_destination(httpx_mock, recording_s3):
     }
     table = resolved_table(httpx_mock, recording_s3, with_variant)
     schema = columns_to_arrow_schema(table.columns[:2])
-    with pytest.raises(ValidationError, match="native Parquet VARIANT") as excinfo:
+    with pytest.raises(ValidationError, match="schema/field IDs") as excinfo:
         table.prepare_append_tables(
             [(_rows(1, schema), None)], idempotency_key=str(uuid.uuid4())
         )

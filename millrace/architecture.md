@@ -235,8 +235,14 @@ drain's retry pass (§6) treats every indexed group as due.
    dropped and counted; unknown top-level keys are dropped from the row
    and warned once); build Arrow (one record that defeats the batch
    build is isolated and dropped); sort by the live sort spec; fan out
-   by the live partition spec, one parquet file per tuple; chunk the
-   files into commits of at most `max_files_per_commit` (512).
+   by the live partition spec, one parquet file per tuple, each written
+   by pyhoglake's writer core (`write_part`: zstd level 3, the footer
+   read back and held to the destination's schema, `footer_size` and
+   `file_size_bytes` measured on the body; `column_stats` only for a
+   file of at least 32 MiB, the rest left to the server's hydrator);
+   chunk the files into commits of at most `max_files_per_commit` (512).
+   Each build times its stages (decode, Arrow build, sort, fanout,
+   write) and its wait for a pool thread (§9).
 3. Per commit: upload every file (objects at
    `{data_path}/data/{ns}/{table}/{build}/{index}.parquet`, `build` a
    fresh token per build), then publish with a fresh uuid4
@@ -253,8 +259,9 @@ Timestamps outside years 1–9999 are clamped at decode (`coerce.py`,
 every timestamp type, ints and ISO strings) so the keyer, the
 partition transforms and the Arrow build see the same value;
 counted in `millrace_values_clamped_total{column}`. An Arrow build
-failure after total coercion is an encoder bug: the decision fails
-with every row staged (never a drop).
+failure after total coercion is an encoder bug, and so is a part
+`write_part` refuses (a `ValidationError`, raised as `FlushError`): the
+decision fails with every row staged (never a drop).
 
 The first commit from a stage pins the destination incarnation in
 `meta/table_uuid`; the drain checks it before flushing anything, so a
@@ -437,6 +444,8 @@ Everything is read from memory on the scrape thread
 | `millrace_flush_commit_refusals_total{status}` | 4xx answers |
 | `millrace_flush_groups_stuck` / `…_stuck_total` | groups at ≥ 3 consecutive failures (alert) |
 | `millrace_flush_orphaned_uploads_total` | uploaded objects no commit names |
+| `millrace_flush_build_seconds_total{stage}` | seconds the group builds that returned a plan spent per stage (a build that raises is not counted): `decode`, `build` (Arrow), `sort`, `fanout`, `write` (`write_part` and the registration) |
+| `millrace_flush_build_queue_seconds_total` | seconds the group builds waited, from submit to start (a build that raises included), for a `millrace-hoglake` pool thread (shared with uploads, commits and shape reads) |
 | `millrace_staged_bytes`, `…_rows`, `…_groups`, `millrace_oldest_staged_age_seconds` | the in-memory index (since the last drain) |
 | `millrace_oldest_eligible_staged_age_seconds` | oldest group due at the last sweep (the backlog alert) |
 | `millrace_draining` | 1 during the startup drain |
@@ -470,10 +479,13 @@ and whenever liveness fails.
 | 14 | Group encoding is prefix-free; row keys sort by (group, partition, offset) | `test_keyspace.py` (mutation-gated) |
 | 15 | The binding patch round-trips every byte value and length | `test_slatedb_patch.py` |
 | 16 | Every produced record is in the lake at least once, under kills, latency and reassignment | `tests/live/` |
+| 20 | A flush writes the same parquet bytes and registrations as before it moved onto `write_part` | `test_flush_golden.py` |
+| 21 | A variant column is never a partition or sort source, refused by type | `test_flush.py`, `test_grouping.py`, `test_config.py` |
 
 ## Not yet built
 
-- A `variant` column is a startup refusal (pyarrow cannot write the
-  Parquet VARIANT annotation).
+- A `variant` column is a startup refusal: millrace's decoder has no
+  variant path yet (pyhoglake's `write_part` writes a top-level one from
+  JSON text).
 - No schema evolution: unknown payload keys are dropped from rows.
 - No dead-letter store for unrepresentable records.

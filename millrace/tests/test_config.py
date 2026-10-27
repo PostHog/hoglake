@@ -8,10 +8,12 @@ import pytest
 
 from millrace.config import (
     AutoOffsetReset,
+    ColumnSpec,
     Config,
     ConfigError,
     PartitionFieldSpec,
     SortFieldSpec,
+    _check_fields_against_columns,
     load_config,
 )
 
@@ -855,6 +857,39 @@ class TestSortBy:
         )
         assert "MILLRACE_SORT_BY column 'timestamp'" in p
         assert "MILLRACE_TABLE_COLUMNS" in p
+
+
+def test_a_variant_column_is_no_partition_or_sort_source():
+    """Refused by type in the cross-check itself, not only because the
+    column grammar refuses a variant today: the server refuses a variant
+    partition or sort source, pyhoglake's check_transform takes
+    identity(v), and lifting the grammar refusal must not let the create
+    422. One problem per field: bucket(v) is not also handed to
+    check_transform, whose own refusal would be a second, other reason.
+    Driven directly, since the grammar stops a variant before it."""
+    columns = (ColumnSpec("team_id", "long"), ColumnSpec("v", "variant"))
+    found: list[str] = []
+    _check_fields_against_columns(
+        columns,
+        (
+            PartitionFieldSpec("v", "identity"),
+            PartitionFieldSpec("v", "bucket", 16),
+            PartitionFieldSpec("team_id", "identity"),
+        ),
+        (SortFieldSpec("v"), SortFieldSpec("team_id")),
+        found,
+    )
+    assert found == [
+        (
+            "MILLRACE_PARTITION_BY identity(v): 'v' is a variant column, which is "
+            "no partition source"
+        ),
+        (
+            "MILLRACE_PARTITION_BY bucket(v, 16): 'v' is a variant column, which "
+            "is no partition source"
+        ),
+        "MILLRACE_SORT_BY column 'v' is a variant column, which is no sort source",
+    ]
 
 
 # -- review additions: grammar edges ------------------------------------------------

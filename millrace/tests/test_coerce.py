@@ -17,6 +17,8 @@ Pinned here:
 - the depth limit is pyhoglake's MAX_COLUMN_NESTING_DEPTH;
 - json canonical text (unicode, nesting, scalars, big ints, floats,
   non-finite refused); JSON null is SQL NULL;
+- a decimal is accepted exactly when its column holds it (no rounding,
+  any spelling), and every accepted decimal builds;
 - a ``variant`` column, at any depth, is a startup refusal.
 """
 
@@ -27,11 +29,14 @@ import uuid
 from datetime import UTC, date, datetime
 from datetime import time as dtime
 from decimal import Decimal
+from fractions import Fraction
 from typing import Any
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 from pyhoglake import Column
 from pyhoglake.parquet_schema import prepared_schema_matches
 from pyhoglake.types import MAX_COLUMN_NESTING_DEPTH, PARQUET_FIELD_ID_KEY
@@ -223,9 +228,7 @@ def _roundtrip(cols: tuple[Column, ...], docs: list[dict[str, Any]]) -> pa.Table
     sink = pa.BufferOutputStream()
     pq.write_table(encoded, sink)
     with pq.ParquetFile(pa.BufferReader(sink.getvalue())) as parquet:
-        assert prepared_schema_matches(
-            flush.file_schema(parquet.schema_arrow), encoded.schema
-        )
+        assert prepared_schema_matches(parquet.schema_arrow, encoded.schema)
         return parquet.read()
 
 
@@ -621,6 +624,111 @@ def test_json_null_is_sql_null_and_refused_when_not_nullable() -> None:
     assert strict.decode_record(b'{"j": [null]}').values["j"] == "[null]"
 
 
+# -- decimal -------------------------------------------------------------------
+
+
+def _decimal_col(precision: int, scale: int) -> Column:
+    return col(
+        {
+            "name": "d",
+            "type": "decimal",
+            "field_id": 1,
+            "ordinal": 0,
+            "type_params": {"precision": precision, "scale": scale},
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    ("precision", "scale", "raw", "want"),
+    [
+        # The largest magnitude decimal(10, 2) holds: 10**8 - 10**-2.
+        (10, 2, "99999999.99", "99999999.99"),
+        (10, 2, "-99999999.99", "-99999999.99"),
+        (10, 2, 99999999, "99999999"),
+        (10, 2, "9.999999999E+7", "99999999.99"),
+        (1, 1, "0.9", "0.9"),
+        (38, 0, "9" * 38, "9" * 38),
+        (38, 38, "0." + "9" * 38, "0." + "9" * 38),
+        # Zeros the scale does not need are not digits the column holds,
+        # however the payload spells them.
+        (10, 2, "1.230", "1.23"),
+        (10, 2, "1." + "0" * 70, "1"),
+        (10, 2, "0E+50", "0"),
+    ],
+)
+def test_a_decimal_that_fits_builds_exactly(
+    precision: int, scale: int, raw: Any, want: str
+) -> None:
+    cols = (_decimal_col(precision, scale),)
+    value = coercer_for(cols[0])(raw)
+    assert value == Decimal(want)
+    assert value.as_tuple().exponent == -scale
+    table = _roundtrip(cols, [{"d": raw}])
+    assert table.column("d").to_pylist() == [Decimal(want)]
+
+
+@pytest.mark.parametrize(
+    ("precision", "scale", "raw", "match"),
+    [
+        # One unit of the scale past the boundary, in every spelling. The
+        # integer-valued and exponent forms carry fewer significant digits
+        # than the column needs at its scale.
+        (10, 2, "100000000.00", r"does not fit decimal\(10, 2\)"),
+        (10, 2, 100000000, r"does not fit decimal\(10, 2\)"),
+        (10, 2, -100000000, r"does not fit decimal\(10, 2\)"),
+        (10, 2, "1E+8", r"does not fit decimal\(10, 2\)"),
+        (10, 2, "1.0E+8", r"does not fit decimal\(10, 2\)"),
+        (10, 2, 123456789, r"does not fit decimal\(10, 2\)"),
+        (1, 1, "1", r"does not fit decimal\(1, 1\)"),
+        (1, 1, 1, r"does not fit decimal\(1, 1\)"),
+        (38, 0, "1E+38", r"does not fit decimal\(38, 0\)"),
+        (38, 38, 1, r"does not fit decimal\(38, 38\)"),
+        (10, 2, "1E+999999", r"does not fit decimal\(10, 2\)"),
+        (10, 2, "99999999.995", r"does not fit decimal\(10, 2\)"),
+        # A fractional digit past the scale is refused, never rounded,
+        # however far past the scale it sits.
+        (10, 2, "1.234", "more than 2 fractional digits; refusing to round"),
+        (10, 0, "1." + "0" * 70 + "1", "more than 0 fractional digits"),
+        (10, 2, "1E-1000000", "more than 2 fractional digits"),
+        (10, 2, 1.5, "expected a JSON integer or decimal string, got float"),
+        (10, 2, "abc", "invalid decimal 'abc'"),
+        (10, 2, "-Infinity", "non-finite decimal '-Infinity'"),
+    ],
+)
+def test_a_decimal_that_does_not_fit_is_uncastable(
+    precision: int, scale: int, raw: Any, match: str
+) -> None:
+    with pytest.raises(DecodeError, match=match) as excinfo:
+        coercer_for(_decimal_col(precision, scale))(raw)
+    assert excinfo.value.reason == REASON_UNCASTABLE_COLUMN
+
+
+@given(
+    coefficient=st.integers(-(10**40), 10**40),
+    exponent=st.integers(-45, 45),
+    precision=st.integers(1, 38),
+    data=st.data(),
+)
+def test_a_decimal_is_accepted_exactly_when_the_column_holds_it(
+    coefficient: int, exponent: int, precision: int, data: st.DataObject
+) -> None:
+    """The oracle is exact rational arithmetic: the value fits when it
+    times 10**scale is an integer below 10**precision in magnitude."""
+    scale = data.draw(st.integers(0, precision))
+    raw = f"{coefficient}E{exponent}"
+    units = Fraction(Decimal(raw)) * 10**scale
+    fits = units.denominator == 1 and abs(units) < 10**precision
+    cols = (_decimal_col(precision, scale),)
+    if not fits:
+        with pytest.raises(DecodeError) as excinfo:
+            coercer_for(cols[0])(raw)
+        assert excinfo.value.reason == REASON_UNCASTABLE_COLUMN
+        return
+    table = _roundtrip(cols, [{"d": raw}])
+    assert table.column("d").to_pylist() == [Decimal(raw)]
+
+
 # -- variant -------------------------------------------------------------------
 
 
@@ -645,8 +753,14 @@ def test_json_null_is_sql_null_and_refused_when_not_nullable() -> None:
 def test_a_variant_column_is_refused_at_any_depth(
     wire: dict[str, Any], path: str
 ) -> None:
-    with pytest.raises(UnsupportedColumnError, match=f"column '{path}' is a variant"):
+    with pytest.raises(
+        UnsupportedColumnError, match=f"column '{path}' is a variant"
+    ) as e:
         coercer_for(col(wire))
+    # Says what is true since pyhoglake gained a variant writer (#464/#465):
+    # millrace's own decoder is what lacks it, not pyarrow.
+    assert "millrace does not ingest variant columns yet" in str(e.value)
+    assert "pyarrow" not in str(e.value)
 
 
 # -- timestamps outside years 1-9999 are clamped, never dropped ----------------

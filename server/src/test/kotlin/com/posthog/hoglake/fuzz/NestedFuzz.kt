@@ -107,9 +107,11 @@ object NestedFuzz {
      * `deriveSchema` would emit a primitive for it — a file no writer
      * would produce, exercising the reader's variant arm against
      * nonsense rather than against variants. Including it properly
-     * means teaching the generator that shape, which is worth doing
-     * when variant compaction exists to test; until then the honest
-     * move is to leave it out and say so.
+     * means teaching the generator that shape, laid out from a
+     * generated declaration, and running the agreement with variant
+     * compaction on: a follow-up to the passthrough (VariantLayout),
+     * which until then is covered by VariantPassthroughTest's
+     * byte-for-byte fixtures instead.
      */
     val SCALARS: List<ColType> = ColType.entries.filter { !it.isNested && it != ColType.VARIANT }
 
