@@ -58,7 +58,7 @@ import uuid as _uuid
 from collections.abc import Callable
 from datetime import date, datetime, timedelta
 from datetime import time as dtime
-from decimal import Decimal, localcontext
+from decimal import Context, Decimal, Inexact, InvalidOperation, localcontext
 from typing import Any, Final
 
 import pyarrow as pa
@@ -291,10 +291,10 @@ def _coerce_uuid_bytes(value: Any) -> bytes:
 
 
 def _coerce_decimal(value: Any, type_params: dict[str, Any] | None) -> Decimal:
-    """int or decimal string → Decimal, precision/scale checked (never
-    rounded: a value that does not fit exactly is a decode failure, not a
-    silent mutation). JSON floats are refused — a binary float is not the
-    decimal the producer wrote."""
+    """int or decimal string → Decimal at the column's scale, precision
+    checked (never rounded: a value that does not fit exactly is a decode
+    failure, not a silent mutation). JSON floats are refused — a binary
+    float is not the decimal the producer wrote."""
     if isinstance(value, bool) or not isinstance(value, (int, str)):
         raise DecodeError(
             f"expected a JSON integer or decimal string, got {type(value).__name__}",
@@ -313,24 +313,26 @@ def _coerce_decimal(value: Any, type_params: dict[str, Any] | None) -> Decimal:
         raise DecodeError(
             f"non-finite decimal {value!r}", reason=REASON_UNCASTABLE_COLUMN
         )
-    with localcontext() as ctx:
-        ctx.prec = 60
-        # value * 10^scale must be an integer, or accepting the value
-        # would round it.
-        scaled = d.scaleb(scale)
-        if scaled != scaled.to_integral_value():
+    # Arrow builds a Decimal from its own digits, so the value is returned
+    # with exactly `scale` fractional digits: "0E+50", or "1." and seventy
+    # zeros, fail the build as given although the value fits. quantize
+    # under prec=precision signals Inexact when it would round and
+    # InvalidOperation when the result needs more than `precision` digits.
+    # A fresh Context traps exactly those two, whatever the caller's is.
+    with localcontext(Context(prec=precision, traps=[Inexact, InvalidOperation])):
+        try:
+            return d.quantize(Decimal(1).scaleb(-scale))
+        except Inexact as e:
             raise DecodeError(
                 f"decimal {value!r} has more than {scale} fractional digits; "
                 "refusing to round",
                 reason=REASON_UNCASTABLE_COLUMN,
-            )
-        digits = len(scaled.to_integral_value().as_tuple().digits)
-    if digits > precision:
-        raise DecodeError(
-            f"decimal {value!r} exceeds precision {precision}",
-            reason=REASON_UNCASTABLE_COLUMN,
-        )
-    return d
+            ) from e
+        except InvalidOperation as e:
+            raise DecodeError(
+                f"decimal {value!r} does not fit decimal({precision}, {scale})",
+                reason=REASON_UNCASTABLE_COLUMN,
+            ) from e
 
 
 def _coerce_date(value: Any) -> date:

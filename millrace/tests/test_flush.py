@@ -37,6 +37,7 @@ import logging
 import re
 import threading
 import uuid
+from decimal import Decimal
 from typing import Any
 
 import httpx
@@ -2133,6 +2134,62 @@ class TestRunner:
             )
             assert await staged_rows(stage, 11) == []
             assert r.stuck_groups == 0
+
+    async def test_a_decimal_past_its_precision_is_dropped_never_wedges(
+        self,
+        httpx_mock: Any,
+        fake_clock: Any,
+        flusher_factory: Any,
+        store: FakeObjectStore,
+        sleeper: Sleeper,
+    ) -> None:
+        """123456789 has nine significant digits but needs eleven at
+        decimal(10, 2). It is dropped as uncastable, so the batch builds
+        and the group drains, rather than failing every sweep with its
+        rows staged."""
+        wire = COLUMNS_WIRE + [
+            {
+                "name": "amt",
+                "type": "decimal",
+                "field_id": 4,
+                "ordinal": 3,
+                "nullable": True,
+                "type_params": {"precision": 10, "scale": 2},
+            }
+        ]
+        cfg = make_config()
+        async with StageManager(
+            "memory:///", "millrace", settings=fast_flush_settings()
+        ) as manager:
+            stage = await manager.open_partition("events", 0)
+            payloads = [
+                event_payload(TEAM, JAN_US, amt="99999999.99"),
+                event_payload(TEAM, JAN_US, amt=123456789),
+                event_payload(TEAM, JAN_US, amt=99999999),
+            ]
+            await staged(
+                stage,
+                fake_clock,
+                TEAM,
+                [(i, JAN_US) for i in range(len(payloads))],
+                payloads=payloads,
+            )
+            script_options(httpx_mock)
+            capture = CommitCapture(httpx_mock, [commit_ok(50)])
+            flusher = flusher_factory(
+                store=store, cfg=cfg, table=table_wire(columns=wire)
+            )
+            r = runner(manager, flusher, cfg, fake_clock, sleeper)
+
+            sweep = await r.run_once(drain=True)
+
+            assert (sweep.decisions, sweep.committed, sweep.failed) == (1, 1, 0)
+            assert r.stuck_groups == 0
+            assert flusher.stats().records_dropped == {REASON_UNCASTABLE_COLUMN: 1}
+            assert await staged_rows(stage, TEAM) == []
+            (f,) = capture.payloads[0]["appends"][0]["files"]
+            amts = parquet_rows(store, f["path"]).column("amt").to_pylist()
+            assert sorted(amts) == [Decimal(99999999), Decimal("99999999.99")]
 
     async def test_halt_is_sticky(
         self,
