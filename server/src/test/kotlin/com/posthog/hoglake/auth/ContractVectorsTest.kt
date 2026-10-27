@@ -75,7 +75,9 @@ class ContractVectorsTest {
         // credentials must not also open the metadata API, and the reverse.
         val vend = vectors().single { it["audience"].asText() == "hogtower-vend" }
         assertThatThrownBy { verifier().verify(vend["token"].asText()) }
-            .isInstanceOfSatisfying(JwtViolation::class.java) { assertThat(it.reason).isEqualTo(JwtViolation.WRONG_AUDIENCE) }
+            .isInstanceOfSatisfying(JwtViolation::class.java) {
+                assertThat(it.reason).isEqualTo(JwtViolation.WRONG_AUDIENCE)
+            }
     }
 
     @Test
@@ -85,6 +87,8 @@ class ContractVectorsTest {
         assertThat(exp - read["claims"]["iat"].asLong()).isEqualTo(15 * 60L)
         // Past exp and the skew allowance, the same token is refused.
         assertThatThrownBy { verifier(now = exp + 61).verify(read["token"].asText()) }
-            .isInstanceOfSatisfying(JwtViolation::class.java) { assertThat(it.reason).isEqualTo(JwtViolation.EXPIRED) }
+            .isInstanceOfSatisfying(JwtViolation::class.java) {
+                assertThat(it.reason).isEqualTo(JwtViolation.EXPIRED)
+            }
     }
 }
