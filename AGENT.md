@@ -256,7 +256,16 @@ connector is not yet verified by a harness; compaction skips tables
 with a variant column (#70); DuckDB's own Parquet reader folds a
 Variant null into SQL NULL, and the hoglake DuckDB extension refuses a
 variant table at bind (#87); the files of a partitioned variant
-`append` are all in memory before the first upload.
+`append` are all in memory before the first upload. New public writer
+core: `pyhoglake.write_part(table, columns, *, write_options, ...)`
+writes one partition group as a `PreparedPart` (body, size,
+footer_size, metadata) whose `registration(uri, columns, *, stats,
+partition_values=None)` is the FileRegistration dict; `append` and
+`prepare_append_tables` are built on it, with the same bytes for a
+table with no variant column. `Table.append` now checks the footer of
+every file it writes, and `timestamp_s` below the top level (in a
+struct, list or map) is accepted by `prepare_append_tables` and
+`prepare_append_files`, which refused it.
 
 Because that version is constant between releases, it cannot tell two
 deploys apart. The image build therefore also carries a BUILD STAMP: the
