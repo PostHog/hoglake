@@ -4,6 +4,7 @@ import com.posthog.hoglake.BuildInfo
 import com.posthog.hoglake.auth.AuthState
 import com.posthog.hoglake.auth.actorOrRefuse
 import com.posthog.hoglake.auth.hoglakeAuth
+import com.posthog.hoglake.auth.resolveActor
 import com.posthog.hoglake.commit.CommitService
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.observability.CatalogTotals
@@ -404,7 +405,7 @@ fun Application.installApiRoutes(
                 // Dedicated endpoint prevents old servers silently ignoring the
                 // new request key and degrading retries to at-least-once.
                 post("/commit/prepared") {
-                    val req = call.receive<CommitRequestDto>()
+                    val req = call.receiveCommit()
                     if (req.idempotencyKey == null) {
                         throw com.posthog.hoglake.model.HoglakeException.Validation("idempotency_key is required")
                     }
@@ -415,7 +416,7 @@ fun Application.installApiRoutes(
 
                 // Distinct endpoint fences replicas that predate the DELETE contract.
                 post("/commit/deletes/prepared") {
-                    val req = call.receive<CommitRequestDto>()
+                    val req = call.receiveCommit()
                     if (req.idempotencyKey == null || req.readSnapshot == null || req.appends.isNotEmpty() ||
                         req.deletes.isEmpty() || req.deletes.any { it.expectedTableUuid == null }
                     ) {
@@ -435,7 +436,7 @@ fun Application.installApiRoutes(
                 // A separate endpoint fences old replicas and includes the stronger
                 // conflict contract in the durable full-payload receipt.
                 post("/commit/mutations/prepared") {
-                    val req = call.receive<CommitRequestDto>()
+                    val req = call.receiveCommit()
                     if (req.idempotencyKey == null || req.readSnapshot == null || req.deletes.isEmpty() ||
                         req.deletes.any { it.expectedTableUuid == null } ||
                         req.appends.any { it.expectedTableUuid == null }
@@ -454,7 +455,7 @@ fun Application.installApiRoutes(
                 }
 
                 post("/commit/uploads") {
-                    val req = call.receive<CommitRequestDto>()
+                    val req = call.receiveCommit()
                     if (req.idempotencyKey == null || req.readSnapshot == null ||
                         req.appends.any { it.expectedTableUuid == null } ||
                         req.deletes.any { it.expectedTableUuid == null }
@@ -479,7 +480,7 @@ fun Application.installApiRoutes(
                 // append-only transaction keeps the ordinary DDL-only
                 // conflict rule and does not 409 on a concurrent INSERT.
                 post("/commit/transaction") {
-                    val req = call.receive<CommitRequestDto>()
+                    val req = call.receiveCommit()
                     if (req.idempotencyKey == null || req.readSnapshot == null ||
                         req.appends.any { it.expectedTableUuid == null } ||
                         req.deletes.any { it.expectedTableUuid == null }
@@ -510,7 +511,7 @@ fun Application.installApiRoutes(
                 }
 
                 post("/commit") {
-                    val req = call.receive<CommitRequestDto>()
+                    val req = call.receiveCommit()
                     call.respond(
                         commits.commit(call.catalog(), req.toModel(), call.request.userAgent()).toDto(),
                     )
@@ -859,3 +860,16 @@ internal fun parseExpectedTableUuid(raw: String): UUID =
     } catch (_: IllegalArgumentException) {
         throw BadRequestException("expected_table_uuid must be a UUID")
     }
+
+/**
+ * Every commit route reads its body through here, so the snapshot's `author`
+ * is decided by the same rule as every other write ([resolveActor]). Under
+ * auth, a tenant's commit is recorded as its own subject, or `<user> via
+ * <subject>` for a delegating client, and naming anyone else is refused. A
+ * commit route that read the body directly would take its `author` as given:
+ * `CommitAttributionTest` fails if one does.
+ */
+internal suspend fun ApplicationCall.receiveCommit(): CommitRequestDto =
+    receive<CommitRequestDto>().attributed(hoglakeAuth)
+
+internal fun CommitRequestDto.attributed(auth: AuthState): CommitRequestDto = copy(author = resolveActor(auth, author))
