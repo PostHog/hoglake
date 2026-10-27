@@ -572,6 +572,24 @@ void HoglakeApiClient::ThrowFor(const Response &response, const string &what, bo
 	case 400:
 	case 422:
 		throw InvalidInputException("%s", message);
+	case 401:
+		// the server's code (invalid_request, invalid_signature, expired, ...)
+		// does not say which ATTACH option is at fault; this does
+		if (!auth.Configured()) {
+			throw PermissionException("%s (HTTP 401: the server requires a credential; ATTACH with TOKEN '...' or "
+			                          "TOKEN_URL, CLIENT_ID and CLIENT_SECRET)",
+			                          message);
+		}
+		if (!auth.UsesClientCredentials()) {
+			throw PermissionException("%s (HTTP 401: the server refused TOKEN; a fixed token is never refreshed)",
+			                          message);
+		}
+		throw PermissionException("%s (HTTP 401: the server refused the token minted from %s, also after minting "
+		                          "a fresh one)",
+		                          message, auth.token_url);
+	case 403:
+		throw PermissionException("%s (HTTP 403: the credential lacks the scope this needs on catalog \"%s\")",
+		                          message, catalog_name);
 	case 404:
 		throw CatalogException("%s", message);
 	case 409:

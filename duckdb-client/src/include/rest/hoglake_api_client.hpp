@@ -44,13 +44,6 @@ struct HoglakeTravel {
 	}
 };
 
-//! One client per attached catalog. Every method throws a duckdb
-//! exception mapped from the hoglake error taxonomy on failure:
-//!   400/422 -> InvalidInputException     (never retryable)
-//!   404     -> CatalogException          (or nullptr on Try* methods)
-//!   409     -> TransactionException      (commit conflicts; retryable upstream)
-//!   410     -> InvalidInputException     (below the expiry floor)
-//!   503     -> IOException               (commit_queue_timeout backpressure)
 //! How the client authenticates to hoglake. Empty = no credential, which a
 //! server in HOGLAKE_AUTH_MODE=enforce refuses.
 struct HoglakeAuthOptions {
@@ -70,6 +63,14 @@ struct HoglakeAuthOptions {
 	}
 };
 
+//! One client per attached catalog. Every method throws a duckdb
+//! exception mapped from the hoglake error taxonomy on failure:
+//!   400/422 -> InvalidInputException     (never retryable)
+//!   401/403 -> PermissionException       (credential missing, refused or under-scoped)
+//!   404     -> CatalogException          (or nullptr on Try* methods)
+//!   409     -> TransactionException      (commit conflicts; retryable upstream)
+//!   410     -> InvalidInputException     (below the expiry floor)
+//!   503     -> IOException               (commit_queue_timeout backpressure)
 class HoglakeApiClient {
 public:
 	HoglakeApiClient(string endpoint_url, string catalog_name, HoglakeAuthOptions auth = HoglakeAuthOptions());

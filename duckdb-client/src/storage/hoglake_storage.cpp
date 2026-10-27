@@ -78,6 +78,14 @@ static unique_ptr<Catalog> HoglakeAttach(optional_ptr<StorageExtensionInfo> stor
 	for (auto &entry : attach_options.options) {
 		HandleHoglakeOption(context, options, entry.first, entry.second);
 	}
+	// AttachedDatabase keeps these options after attach returns and
+	// duckdb_databases() prints them, so the secrets must not survive in them.
+	for (auto &entry : attach_options.options) {
+		auto lcase = StringUtil::Lower(entry.first);
+		if (lcase == "token" || lcase == "client_secret") {
+			entry.second = Value("<redacted>");
+		}
+	}
 	if (options.endpoint.empty()) {
 		Value endpoint_setting;
 		if (context.TryGetCurrentSetting("hoglake_default_endpoint", endpoint_setting) &&
