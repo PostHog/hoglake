@@ -249,6 +249,36 @@ tree gets a "Pending note for the X.Y.Z release body" paragraph here,
 removed by the release PR that states it (the 1.3.8 `Catalog.verify()`
 removal and the 1.4.0 VARIANT-shaped struct refusal were the first two).
 
+Pending note for the 1.4.8 release body: `Table.append` and
+`Table.prepare_append_tables` write top-level `variant` columns, in the
+layout of each column's `type_params.shredding`, and take
+`variant_on_invalid=` (`"raise"`, the default, or `"null"`, refused for
+a NOT NULL variant column) and `variant_report=`. A variant column's
+values come as `pa.json_()` text, the null type (all SQL NULL), or
+storage in its declaration's write form; a plain string is refused.
+`columns_to_arrow_schema` and `column_to_arrow_field` take `variant=`
+(`"json"`, `"storage"`, `"read"`; the default still refuses), and the
+`"json"` form carries `variant_field`'s marker. `prepare_append_tables`
+no longer refuses a variant destination, and the `_hog*` check stops at
+a variant column's own name. Caveats: read-back through the Trino
+connector is not yet verified by a harness; compaction skips tables
+with a variant column unless the server sets
+`HOGLAKE_COMPACTION_VARIANT`, and then skips any group holding a file
+in another layout or written by DuckDB (#70); DuckDB's own Parquet
+reader folds a Variant null into SQL NULL, and the hoglake DuckDB
+extension refuses a variant table at bind (#87); the files of a
+partitioned variant `append` are all in memory before the first upload.
+New public writer core:
+`pyhoglake.write_part(table, columns, *, write_options, ...)` writes
+one partition group as a `PreparedPart` (body, size,
+footer_size, metadata) whose `registration(uri, columns, *, stats,
+partition_values=None)` is the FileRegistration dict; `append` and
+`prepare_append_tables` are built on it, with the same bytes for a
+table with no variant column. `Table.append` now checks the footer of
+every file it writes, and `timestamp_s` below the top level (in a
+struct, list or map) is accepted by `prepare_append_tables` and
+`prepare_append_files`, which refused it.
+
 Because that version is constant between releases, it cannot tell two
 deploys apart. The image build therefore also carries a BUILD STAMP: the
 CD job passes `HOGLAKE_BUILD_STAMP` (a UTC `date -u +%Y%m%dT%H%MZ`) as a
@@ -1393,7 +1423,13 @@ ran on the local stack and what it showed.
     cannot pass), and the VARIANT `type_params.shredding` grammar through
     `pyhoglake/tests/vectors/variant_shredding_vectors.json` (declarations
     with the exact refusal each gets, pinned the same way in
-    `test_variant_ddl.py` and `VariantShreddingVectorFile.EXPECTED_COUNT`).
+    `test_variant_ddl.py` and `VariantShreddingVectorFile.EXPECTED_COUNT`),
+    and each declaration's Parquet layout through
+    `pyhoglake/tests/vectors/variant_layout_vectors.json` (49 vectors,
+    pinned in `test_variant_layout_vectors.py` and
+    `VariantLayoutVectorFile.EXPECTED_COUNT`): a change to
+    `Plan.expected_elements` or to `VariantLayout.kt` regenerates it
+    (`regen_variant_layout_vectors.py`) and moves the other side with it.
     It mirrors the server's type mapping and validation gates, which
     therefore move with the server: a change to `VariantShredding.kt`'s
     rules or messages updates that file and `pyhoglake/variant.py`

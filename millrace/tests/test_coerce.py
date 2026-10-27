@@ -643,8 +643,14 @@ def test_json_null_is_sql_null_and_refused_when_not_nullable() -> None:
 def test_a_variant_column_is_refused_at_any_depth(
     wire: dict[str, Any], path: str
 ) -> None:
-    with pytest.raises(UnsupportedColumnError, match=f"column '{path}' is a variant"):
+    with pytest.raises(
+        UnsupportedColumnError, match=f"column '{path}' is a variant"
+    ) as e:
         coercer_for(col(wire))
+    # Says what is true since pyhoglake gained a variant writer (#464/#465):
+    # millrace's own decoder is what lacks it, not pyarrow.
+    assert "millrace does not ingest variant columns yet" in str(e.value)
+    assert "pyarrow" not in str(e.value)
 
 
 # -- timestamps outside years 1-9999 are clamped, never dropped ----------------

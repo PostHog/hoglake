@@ -13,6 +13,7 @@ layout (:func:`variant_layout_fault`).
 
 from __future__ import annotations
 
+import io
 import os
 import struct
 from collections.abc import Mapping, Sequence
@@ -25,7 +26,7 @@ from thrift.protocol.TCompactProtocol import TCompactProtocol
 from thrift.Thrift import TType
 from thrift.transport.TTransport import TMemoryBuffer
 
-from ._variant_codec import Plan, member, structure_fault
+from ._variant_codec import ParquetElement, Plan, member, structure_fault
 from .errors import UnsupportedTypeError, ValidationError
 from .models import Column
 from .types import (
@@ -471,16 +472,23 @@ class FooterStamp:
             )
 
 
-def variant_stamps(column: Column, plan: Plan) -> list[FooterStamp]:
+#: :meth:`Plan.expected_elements` of one column.
+Expected: TypeAlias = list[tuple[tuple[str, ...], ParquetElement]]
+
+
+def variant_stamps(
+    column: Column, plan: Plan, *, expected: Expected | None = None
+) -> list[FooterStamp]:
     """The stamps a file of ``column`` written from ``plan``'s storage
     needs: VARIANT(1) on its group and DECIMAL on each leaf of
     :attr:`Plan.stamps`, which the file holds as INT32 (decimal4) or INT64
-    (decimal8) as :meth:`Plan.expected_elements` says."""
-    expected = dict(plan.expected_elements(column))
+    (decimal8) as :meth:`Plan.expected_elements` says (``expected``, when
+    the caller has it already)."""
+    by_path = dict(plan.expected_elements(column) if expected is None else expected)
     stamps = [FooterStamp((column.name,), "variant", field_id=column.field_id)]
     for path, precision, scale in plan.stamps:
         where = (column.name, *path)
-        physical = expected[where][_TYPE]
+        physical = by_path[where][_TYPE]
         stamps.append(
             FooterStamp(
                 where,
@@ -494,9 +502,12 @@ def variant_stamps(column: Column, plan: Plan) -> list[FooterStamp]:
 
 def stamp_variant_footer(
     raw: bytes | bytearray | memoryview | pa.Buffer, stamps: Sequence[FooterStamp]
-) -> tuple[bytes, list[dict[int, Any]]]:
-    """The file ``raw`` with ``stamps`` added to its footer, and the
-    patched footer's schema elements.
+) -> tuple[int, bytes, list[dict[int, Any]]]:
+    """The file ``raw`` with ``stamps`` added to its footer, as the offset
+    at which its footer starts and what replaces everything from there
+    (the patched footer, its length and ``PAR1``), and the patched
+    footer's schema elements. The file is ``raw[:start] + tail``: the
+    body is the caller's to keep, unchanged and uncopied.
 
     pyarrow writes a VARIANT group as the struct it is stored as, with no
     annotation (it reads one, but drops it on write), and a decimal4 or
@@ -556,9 +567,8 @@ def stamp_variant_footer(
     groups = sum(stamp.kind == "variant" for stamp in stamps)
     if len(patched) != len(footer) + 7 * groups + 14 * (len(stamps) - groups):
         raise ValueError("stamped footer has the wrong length")
-    view = memoryview(raw).cast("B")
-    body = b"".join((view[:start], patched, struct.pack("<I", len(patched)), b"PAR1"))
-    return body, [_stamped(e.fields, stamped.get(e.path)) for e in elements]
+    tail = b"".join((patched, struct.pack("<I", len(patched)), b"PAR1"))
+    return start, tail, [_stamped(e.fields, stamped.get(e.path)) for e in elements]
 
 
 def _annotation(stamp: FooterStamp, element: SchemaElement) -> bytes:
@@ -644,18 +654,24 @@ def _where(path: Sequence[str]) -> str:
 
 
 def variant_layout_fault(
-    elements: list[dict[int, Any]], start: int, column: Column, plan: Plan
+    elements: list[dict[int, Any]],
+    start: int,
+    column: Column,
+    plan: Plan,
+    *,
+    expected: Expected | None = None,
 ) -> str | None:
     """What is wrong with the VARIANT layout pyhoglake wrote for
     ``column``, whose group is ``elements[start]``, or None.
 
-    The subtree must be ``plan``'s :meth:`~Plan.expected_elements`,
-    element for element: names, order, repetition, child counts, physical
-    type and length, logical type with its BOOLs, scale and precision, the
-    field id on the group and on nothing below it, and VARIANT(1) on the
-    group. The one licence is a converted type, the legacy spelling of the
-    logical type beside it (with a DECIMAL's scale and precision), which a
-    writer may leave out whole, but not spell otherwise. Every element's
+    The subtree must be ``plan``'s :meth:`~Plan.expected_elements`
+    (``expected``, when the caller has it already), element for element:
+    names, order, repetition, child counts, physical type and length,
+    logical type with its BOOLs, scale and precision, the field id on the
+    group and on nothing below it, and VARIANT(1) on the group. The one
+    licence is a converted type, the legacy spelling of the logical type
+    beside it (with a DECIMAL's scale and precision), which a writer may
+    leave out whole, but not spell otherwise. Every element's
     child count is compared, so a subtree whose elements all match has the
     expected extent too.
 
@@ -672,7 +688,9 @@ def variant_layout_fault(
             return "negative schema child count"
         pending += children - 1
         cursor += 1
-    for offset, (path, want) in enumerate(plan.expected_elements(column)):
+    if expected is None:
+        expected = plan.expected_elements(column)
+    for offset, (path, want) in enumerate(expected):
         index = start + offset
         found = elements[index] if index < cursor else None
         if found is None or not _same_element(found, want):
@@ -698,7 +716,10 @@ class VariantParquet:
     checked: the bytes to upload, and what the registration reads off
     them, the sizes measured AFTER the footer was patched."""
 
-    body: bytes
+    #: The whole file, in the buffer pyarrow wrote it into: the stamps
+    #: replace the footer in place, with no whole-file join (at worst,
+    #: one realloc as the slightly longer tail is written).
+    body: pa.Buffer
     #: The footer's length from the patched trailer: the wire's
     #: ``footer_size`` (the Thrift FileMetaData, without the 8-byte suffix).
     footer_size: int
@@ -717,25 +738,32 @@ class VariantParquet:
         return len(self.body)
 
 
+class _RefusedTable(ValueError):
+    """:func:`write_variant_parquet`'s refusal of the caller's table, made
+    before anything is written. A ValueError, as documented; its own type
+    lets the append paths name VARIANT for these alone and leave an error
+    of pyarrow's write (an option, a null in a non-nullable column) as the
+    other write paths raise it."""
+
+
 def write_variant_parquet(
     table: pa.Table,
     columns: Sequence[Column],
-    plans: Mapping[str, Plan],
     *,
     row_group_size: int | None = None,
     write_options: Mapping[str, Any] | None = None,
 ) -> VariantParquet:
-    """Write ``table``, whose variant columns are in the write form of
-    their plans, as the Parquet file of their declarations.
+    """Write ``table``, whose variant columns hold their storage in the
+    write form of their declarations, as the Parquet file of those
+    declarations.
 
-    ``plans`` maps each variant column's name to its plan, the compiled
-    ``type_params.shredding`` of that column in ``columns`` (another
-    declaration's is refused, with ValueError), and every variant column of
-    ``table`` must have one; ``columns`` are the catalog's, and ``table``
-    carries the catalog's field ids. ``write_options`` comes from
-    :func:`pyhoglake.parquet_write_options` (empty means pyarrow's default
-    codec, SNAPPY), as for the other write paths. Each step is what the
-    file must be for the Trino connector:
+    ``columns`` are the catalog's, and ``table`` carries their field ids:
+    each variant field its column's nullability and ``PARQUET:field_id``,
+    as :func:`~pyhoglake.types.columns_to_arrow_schema` builds them, and a
+    variant column's plan is its own declaration's. ``write_options``
+    comes from :func:`pyhoglake.parquet_write_options` (empty means
+    pyarrow's default codec, SNAPPY), as for the other write paths. Each
+    step is what the file must be for the Trino connector:
 
     1. Each decimal4/decimal8 leaf is viewed (zero-copy) as the int32/int64
        its decimal32/decimal64 already holds: pyarrow writes a decimal32 or
@@ -745,15 +773,23 @@ def write_variant_parquet(
     2. ``store_schema=False``: a stored Arrow schema would describe the
        group as the plain struct, with integer leaves, and pyarrow reads
        that back instead of the footer.
-    3. The footer is stamped (:func:`stamp_variant_footer`).
+    3. The footer is stamped (:func:`stamp_variant_footer`), in the buffer
+       pyarrow wrote: the body before it stays where it is.
     4. Each variant column's subtree is held to its declaration, element
        for element (:func:`variant_layout_fault`), on the elements the
        splice read: the file is not opened again.
 
-    Storage with a null in a non-nullable field below the top is refused
-    with ValueError: under a present row pyarrow would write it as other
-    values, and under a SQL NULL row it cannot view it. The encoder's
-    output holds neither.
+    The caller's mistakes are refused with ValueError before anything is
+    written: a table with no variant column, a variant field whose
+    nullability or field id is not its column's, or whose type is not its
+    declaration's write form, SQL NULL rows in a NOT NULL column, and a
+    null in a non-nullable field below the top (under a present row
+    pyarrow would write it as other values, and under a SQL NULL row it
+    cannot view it; the encoder's output holds neither). An error of
+    pyarrow's own write (an option, SQL NULL in another NOT NULL column)
+    is raised as pyarrow raises it. A variant nested in a container is
+    refused with UnsupportedTypeError, as
+    :func:`~pyhoglake.types.column_to_arrow_field` refuses it.
 
     A failure at 3 or 4 is pyhoglake's, or a pyarrow it does not know, and
     raises ValidationError before anything is uploaded. How pyarrow reads
@@ -761,37 +797,52 @@ def write_variant_parquet(
     the tests' canaries, on every pyarrow CI runs.
     """
     by_name = {column.name: column for column in columns}
-    if not plans:
-        raise ValueError("no variant columns to write; use pq.write_table")
-    if set(plans) - set(table.column_names):
-        raise ValueError("a planned variant column is not in the table")
     fields, data, stamps = [], [], []
+    # column, plan and expected elements of each variant column, in order:
+    # the elements are derived once and serve both the stamps and the check.
+    planned: list[tuple[Column, Plan, Expected]] = []
     for field in table.schema:
-        plan = plans.get(field.name)
         column = by_name.get(field.name)
-        if plan is None:
-            if column is not None and column.type == "variant":
-                # Written as it stands, it would be a plain struct with no
-                # annotation, and nothing below would look at it.
-                raise ValueError(f"variant column {field.name} has no plan")
+        if column is not None and column.type in NESTED_TYPES:
+            # Built for its refusal: a container holding a variant is
+            # refused, as the other write paths refuse it, rather than
+            # written as the plain struct it would be.
+            column_to_arrow_field(column)
+        if column is None or column.type != "variant":
             fields.append(field)
             data.append(table.column(field.name))
             continue
-        if column is None or column.type != "variant":
-            raise ValueError(f"{field.name} is not a variant column of the table")
-        # The layout check holds the file to the plan, so a plan of another
-        # declaration would pass it, in a layout that is not the column's.
-        declared = _column_plan(column, (column.type_params or {}).get(SHREDDING_KEY))
-        if plan.expected_elements(column) != declared.expected_elements(column):
-            raise ValueError(f"the plan of {field.name} is not its declaration's")
+        # The caller's table, not pyhoglake's layout: either would
+        # otherwise surface as a footer or layout fault blaming the writer.
+        field_id = (field.metadata or {}).get(PARQUET_FIELD_ID_KEY)
+        if field_id != str(column.field_id).encode():
+            held = (
+                "no field id"
+                if field_id is None
+                else f"field id {field_id.decode(errors='replace')}"
+            )
+            raise _RefusedTable(
+                f"{field.name} carries {held}, not its column's {column.field_id}"
+            )
+        if field.nullable != column.nullable:
+            nullable = {True: "nullable", False: "NOT NULL"}
+            raise _RefusedTable(
+                f"{field.name} is {nullable[field.nullable]}, and its column "
+                f"{nullable[column.nullable]}"
+            )
+        plan = _column_plan(column, (column.type_params or {}).get(SHREDDING_KEY))
         if plan.form_of(field.type) != "write":
-            raise ValueError(f"{field.name} is not in its plan's write form")
+            raise _RefusedTable(f"{field.name} is not in its plan's write form")
         # pyarrow writes a null struct in a REQUIRED group as its children's
         # bytes, here an empty metadata: an invalid variant that both the
         # splice and the layout check pass, since the layout is right.
         if not column.nullable and table.column(field.name).null_count:
-            raise ValueError(f"{field.name} is NOT NULL but has SQL NULL rows")
-        kind = _integer_view(field.type)
+            raise _RefusedTable(f"{field.name} is NOT NULL but has SQL NULL rows")
+        # From the plan, not the caller's type: form_of ignores field
+        # metadata, so a caller's PARQUET:field_id on a child would
+        # otherwise be written below the group (D14) and blamed on the
+        # writer by the layout check.
+        kind = _integer_view(plan.write_type)
         fields.append(field.with_type(kind))
         chunks = table.column(field.name).chunks
         # A null in a REQUIRED field under a present parent (metadata, an
@@ -800,7 +851,7 @@ def write_variant_parquet(
         for chunk in chunks:
             fault = structure_fault(chunk)
             if fault is not None:
-                raise ValueError(f"{field.name}: {fault}")
+                raise _RefusedTable(f"{field.name}: {fault}")
         # Arrow's view refuses a null anywhere in a non-nullable child's
         # buffer, so what is left for it is a null under a SQL NULL row (as
         # take on a null index and pa.nulls build) or outside a slice's rows:
@@ -808,44 +859,66 @@ def write_variant_parquet(
         try:
             views = [chunk.view(kind) for chunk in chunks]
         except pa.ArrowInvalid as error:
-            raise ValueError(
+            raise _RefusedTable(
                 f"{field.name} has a null in a non-nullable field under a SQL "
                 "NULL row or outside its rows, which the writer cannot view: "
                 "build the storage with the encoder"
             ) from error
         data.append(pa.chunked_array(views, kind))
-        stamps += variant_stamps(column, plan)
+        expected = plan.expected_elements(column)
+        stamps += variant_stamps(column, plan, expected=expected)
+        planned.append((column, plan, expected))
+    if not planned:
+        raise _RefusedTable("no variant columns to write; use pq.write_table")
     schema = pa.schema(fields, metadata=table.schema.metadata)
-    sink = pa.BufferOutputStream()
-    # The writer's own FileMetaData, collected as it closes: the stats need
-    # no second parse of the footer.
-    collected: list[Any] = []
+    # A Python buffer, not a BufferOutputStream: its bytes can be cut at
+    # the footer and appended to where they lie, so the stamps cost the
+    # footer, not a copy of a file of hundreds of MiB.
+    sink = io.BytesIO()
     # store_schema last, so no option can put the Arrow schema back.
     options = {**(write_options or {}), "store_schema": False}
-    pq.write_table(
-        pa.table(data, schema=schema),
-        sink,
-        row_group_size=row_group_size,
-        metadata_collector=collected,
-        **options,
-    )
+    # A writer of our own, not write_table's metadata_collector: after a
+    # failed write, write_table's close would ask the failed writer for its
+    # metadata, and that RuntimeError would hide the write's own error.
+    writer = pq.ParquetWriter(sink, schema, **options)
     try:
-        body, elements = stamp_variant_footer(sink.getvalue(), stamps)
+        writer.write_table(pa.table(data, schema=schema), row_group_size=row_group_size)
+    finally:
+        writer.close()
+    # The writer's own FileMetaData, once it closed cleanly: the stats need
+    # no second parse of the footer.
+    metadata = writer.writer.metadata
+    try:
+        with sink.getbuffer() as written:
+            start, tail, elements = stamp_variant_footer(written, stamps)
     except ValueError as error:
         raise ValidationError(
             f"cannot annotate VARIANT footer: {error}", status_code=None
         ) from error
+    # The tail is a few bytes longer than the footer it replaces, and
+    # BytesIO keeps room to spare from the writes before, so it almost
+    # always lands after the body without moving it (at worst, one
+    # realloc: the copy the old join made every time).
+    sink.seek(start)
+    sink.truncate()
+    sink.write(tail)
     starts = {element.get(_NAME): index for element, _, index in _top_level(elements)}
-    for name, plan in plans.items():
-        fault = variant_layout_fault(elements, starts[name], by_name[name], plan)
+    for column, plan, expected in planned:
+        fault = variant_layout_fault(
+            elements, starts[column.name], column, plan, expected=expected
+        )
         if fault is not None:
             raise ValidationError(
-                f"pyhoglake wrote VARIANT column {name} in a layout that is not its "
-                f"declaration's: {fault}",
+                f"pyhoglake wrote VARIANT column {column.name} in a layout that is "
+                f"not its declaration's: {fault}",
                 status_code=None,
             )
-    (metadata,) = collected
-    return VariantParquet(body, _footer_size(body), metadata)
+    # getvalue, with no buffer exported, trims BytesIO's own bytes object to
+    # the file and hands it over: no copy, and no growth slack held until
+    # the upload.
+    body = pa.py_buffer(sink.getvalue())
+    # The tail ends with the file's trailer.
+    return VariantParquet(body, _footer_size(tail), metadata)
 
 
 def _footer_size(raw: bytes) -> int:

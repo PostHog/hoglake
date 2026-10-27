@@ -1249,12 +1249,11 @@ def test_extract_column_stats_production_callers_are_known():
     # File and call text, not line numbers: a line number pins where the
     # call sits, which every edit above moves, and the claim is about
     # WHICH callers exist.
-    assert sorted(callers) == sorted(
-        [
-            "client.py: column_stats = extract_column_stats(metadata, info.columns)",
-            "client.py: for stat in extract_column_stats(part.metadata, info.columns)",
-        ]
-    ), f"unexpected caller(s) of extract_column_stats: {callers}"
+    # ONE call since the writer core: writer._registration builds every
+    # registration, a footer this process wrote and a prepared file's alike.
+    assert callers == [
+        "writer.py: for stat in extract_column_stats(part.metadata, tuple(columns))",
+    ], f"unexpected caller(s) of extract_column_stats: {callers}"
 
 
 # -- ordinal is the contract; array order is not ------------------------------

@@ -41,9 +41,9 @@ It also holds the codec, at the Arrow level: :func:`encode_json` and
 :func:`encode_python` turn JSON text or Python objects into the storage of
 a VARIANT column, shredded as a declaration lays it out, and
 :func:`to_python` and :func:`verify` read any conformant storage back. The
-Arrow write paths do not call it yet (``Table.append`` and
-``prepare_append_tables`` still refuse a VARIANT column, and
-``Table.prepare_append_files`` publishes files another writer produced).
+Arrow write paths, ``Table.append`` and ``Table.prepare_append_tables``,
+encode JSON text with :func:`encode_json` and write the storage as the
+Parquet file of its declaration (``parquet_schema.write_variant_parquet``).
 The storage is the write form, field for field the Trino connector's
 ``VariantShreddingSchema.toParquetType`` layout once the writer puts the
 decimal32/decimal64 leaves in the file as INT32/INT64 with DECIMAL(p, s)
@@ -185,9 +185,9 @@ def json_unshreddable_paths(shredding: Shredding | None) -> list[tuple[str, str]
 
     A declaration is immutable, so a leaf that data written from JSON
     can never reach is a column that stays empty for the life of the
-    table. The report follows the rules by which pyhoglake's own writer
-    will encode JSON text (from 1.4): an integer within the int64 range
-    is the smallest integer type that holds it, a larger one decimal16
+    table. The report follows the rules by which pyhoglake's write paths
+    encode JSON text (from 1.4.8): an integer within the int64 range is
+    the smallest integer type that holds it, a larger one decimal16
     with scale 0, any other number a double, a string a string. A value
     shreds only into a leaf of its own type class, which is the Trino
     connector's rule: an integer into any integer leaf that holds it, a
@@ -235,15 +235,18 @@ def variant_field(
     column definitions, as the server would refuse it.
     """
     validate_shredding(shredding, column=name)
+    return pa.field(
+        name, pa.json_(), nullable=nullable, metadata=_variant_marker(shredding)
+    )
+
+
+def _variant_marker(shredding: Shredding | None) -> dict[bytes, bytes]:
+    """The field metadata that marks a variant column, carrying its
+    declaration (validated by the caller, or the catalog's own)."""
     marker: dict[str, Any] = (
         {} if shredding is None else {SHREDDING_KEY: _plain(shredding)}
     )
-    return pa.field(
-        name,
-        pa.json_(),
-        nullable=nullable,
-        metadata={VARIANT_FIELD_KEY: _canonical_json(marker).encode("ascii")},
-    )
+    return {VARIANT_FIELD_KEY: _canonical_json(marker).encode("ascii")}
 
 
 # -- values -------------------------------------------------------------------

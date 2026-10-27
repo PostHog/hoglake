@@ -3,11 +3,17 @@
 import pyarrow as pa
 import pytest
 
-from pyhoglake import UnsupportedTypeError, arrow_type_to_coltype, coltype_to_arrow
+from pyhoglake import (
+    UnsupportedTypeError,
+    arrow_type_to_coltype,
+    coltype_to_arrow,
+    variant,
+)
 from pyhoglake.models import Column
 from pyhoglake.types import (
     PARQUET_FIELD_ID_KEY,
     column_def_field_ids,
+    column_to_arrow_field,
     columns_to_arrow_schema,
     schema_to_column_defs,
 )
@@ -291,3 +297,97 @@ def test_column_def_field_ids_number_a_struct_inside_a_list():
         "items.element.a": 3,
         "items.element.b": 4,
     }
+
+
+# A decimal8 leaf, so the write form (decimal64) and the read form
+# (decimal128) differ.
+_DECL = {
+    "type": "object",
+    "fields": [
+        {"name": "a", "type": "int64"},
+        {"name": "p", "type": "decimal8", "precision": 18, "scale": 2},
+    ],
+}
+_VARIANT_COLUMNS = (
+    Column("props", "variant", 3, 0, True, type_params={"shredding": _DECL}),
+    Column("raw", "variant", 4, 1, False),
+)
+
+
+# -- the variant forms of the schema builders --------------------------------------
+
+
+def test_schema_builders_refuse_a_variant_by_default():
+    with pytest.raises(UnsupportedTypeError, match="'props' is variant, which has no"):
+        columns_to_arrow_schema(_VARIANT_COLUMNS)
+
+
+def test_schema_builders_give_each_variant_form():
+    columns = _VARIANT_COLUMNS
+    plan = variant.storage_type(_DECL)
+    assert plan != variant.storage_type(_DECL, form="read")
+    for form, props, raw in (
+        ("json", pa.json_(), pa.json_()),
+        ("storage", plan, variant.storage_type()),
+        ("read", variant.storage_type(_DECL, form="read"), variant.storage_type()),
+    ):
+        schema = columns_to_arrow_schema(columns, variant=form)
+        assert schema.field("props").type == props, form
+        assert schema.field("raw").type == raw, form
+        assert schema.field("raw").nullable is False
+        metadata = schema.field("props").metadata
+        if form == "json":
+            # Marked as variant_field marks it: the schema declares the
+            # same columns again.
+            marker = variant.variant_field("props", _DECL).metadata
+            assert metadata == {b"PARQUET:field_id": b"3", **marker}
+            assert schema_to_column_defs(schema) == [
+                {"name": "props", "type": "variant", "nullable": True}
+                | {"type_params": {"shredding": _DECL}},
+                {"name": "raw", "type": "variant", "nullable": False},
+            ]
+        else:
+            assert metadata == {b"PARQUET:field_id": b"3"}
+            # The field id is on the group only, as in the file.
+            assert all(not f.metadata for f in schema.field("props").type)
+    # Checked on a table with no variant column too, and per column.
+    plain = [Column("id", "long", 1, 0, False)]
+    for given in (columns, plain):
+        with pytest.raises(ValueError, match="not 'storge'"):
+            columns_to_arrow_schema(given, variant="storge")
+        with pytest.raises(ValueError, match="not 'storge'"):
+            column_to_arrow_field(given[0], variant="storge")
+
+
+@pytest.mark.parametrize("form", ["refuse", "json", "storage", "read"])
+@pytest.mark.parametrize("container", ["struct", "list", "map"])
+def test_schema_builders_refuse_a_nested_variant_in_every_form(form, container):
+    child = {"name": "v", "type": "variant", "field_id": 2, "ordinal": 0}
+    if container == "struct":
+        children = [child]
+    elif container == "list":
+        children = [{**child, "name": "element"}]
+    else:
+        children = [
+            {
+                "name": "key",
+                "type": "string",
+                "field_id": 3,
+                "ordinal": 0,
+                "nullable": False,
+            },
+            {**child, "name": "value", "ordinal": 1},
+        ]
+    column = Column.from_wire(
+        {
+            "name": "c",
+            "type": container,
+            "field_id": 1,
+            "ordinal": 0,
+            "children": children,
+        }
+    )
+    with pytest.raises(
+        UnsupportedTypeError, match="is nested in a struct, list or map"
+    ):
+        columns_to_arrow_schema((column,), variant=form)

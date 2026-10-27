@@ -531,7 +531,21 @@ data class CompactionConfig(
      * then on, not a per-file detail.
      */
     val codec: ParquetRewriter.OutputCodec = ParquetRewriter.OutputCodec(),
+    /**
+     * Whether tables with a VARIANT column compact
+     * (`HOGLAKE_COMPACTION_VARIANT`, default off), each variant copied as
+     * its declared layout (see the ParquetRewriter class doc); off, they
+     * are never planned. [variantCompactionCatalogs]
+     * (`HOGLAKE_COMPACTION_VARIANT_CATALOGS`) narrows it to those catalogs
+     * by name, empty meaning every catalog.
+     */
+    val variantCompaction: Boolean = false,
+    val variantCompactionCatalogs: Set<String> = emptySet(),
 ) {
+    /** Whether [catalog]'s variant tables compact: see [variantCompaction]. */
+    fun variantCompactionFor(catalog: String): Boolean =
+        variantCompaction && (variantCompactionCatalogs.isEmpty() || catalog in variantCompactionCatalogs)
+
     init {
         CompactionGrouping.of(targetBytes)
         // Validated HERE, at construction, which is boot — not in
@@ -744,13 +758,19 @@ data class CompactionConfig(
      * plus one for the `_hog_row_id` carrier every output writes), which
      * is exact for flat tables and a floor for nested ones — hence the
      * [nestedSortExpansion] division, which is the only thing standing in
-     * for list lengths the catalog cannot know.
+     * for list lengths the catalog cannot know. A VARIANT is one catalog
+     * node but a Parquet group of up to thousands ([VariantLayout.shape]),
+     * so it counts as its layout's nodes, and as nested when that layout
+     * holds a list.
      */
     fun spillChunkRows(columns: List<Column>): Long {
-        val nodes = columns.allNodes().size + 1L // + the _hog_row_id carrier
+        val variants = columns.allNodes().filter { it.def.type == ColType.VARIANT }
+        val layouts = variants.map { VariantLayout.shape(it) ?: (1 to false) }
+        // + the _hog_row_id carrier, and each variant's nodes beyond the one counted
+        val nodes = columns.allNodes().size + 1L + layouts.sumOf { (n, _) -> n - 1L }
         val perRow = SORTED_HEAP_BYTES_PER_NODE * nodes
         val ceiling = sortedHeapBytesPerGroup / perRow
-        val nested = columns.allNodes().any { it.def.type.isNested }
+        val nested = columns.allNodes().any { it.def.type.isNested } || layouts.any { (_, list) -> list }
         return maxOf(1L, if (nested) ceiling / nestedSortExpansion else ceiling)
     }
 
@@ -1227,6 +1247,8 @@ class CompactionService(
          * empty, because the rewriter refuses a sort without them.
          */
         val sortSpill: SortSpill? = null,
+        /** Whether this catalog's variant tables compact (CompactionConfig.variantCompactionFor). */
+        val variantCompaction: Boolean = false,
     )
 
     private data class PlanWithContext(
@@ -1533,6 +1555,7 @@ class CompactionService(
             inputOpenParallelism = cfg.inputOpenParallelism,
             commitLockTimeoutMs = cfg.commitLockTimeoutMs,
             sortSpill = if (sortFields.isEmpty()) null else cfg.sortSpill(columns),
+            variantCompaction = cfg.variantCompactionFor(catalog),
         )
     }
 
@@ -1712,16 +1735,24 @@ class CompactionService(
             available: Long = 0,
             truncated: Boolean = false,
         ) = CandidateFetch(ctx, budget, emptyMap(), 0, 0, available, truncated)
-        // The scalar rewriter cannot preserve VARIANT groups yet. Do not enqueue
-        // work that could drop payloads or repeatedly fail the maintenance loop.
-        // allNodes, not the top level: a variant nested inside a struct
-        // is still a variant the rewriter cannot write, and `struct{v:
+        // A VARIANT table compacts only with HOGLAKE_COMPACTION_VARIANT on
+        // for its catalog, which copies each variant as its declared layout
+        // (ParquetRewriter's class doc). Off, do not enqueue work the
+        // rewriter refuses on every sweep. allNodes, not the top level: a
+        // variant nested inside a struct is still a variant, and `struct{v:
         // variant}` has no top-level one. #77's check predates
-        // containers, where the two were the same question.
+        // containers, where the two were the same question. On, a
+        // declaration no layout can be derived from (one predating a
+        // grammar rule) is still never planned.
         //
         // Checked BEFORE the fetch, not after: a variant table's
         // candidate rows were read and thrown away on every sweep.
-        if (ctx.columns.allNodes().any { it.def.type == ColType.VARIANT }) return empty()
+        val variants = ctx.columns.allNodes().filter { it.def.type == ColType.VARIANT }
+        if (variants.isNotEmpty() &&
+            (!ctx.variantCompaction || variants.any { VariantLayout.shape(it) == null })
+        ) {
+            return empty()
+        }
 
         // Does a published generation exist AT ALL? That is a different
         // question from "does it credit this table with a compactable
@@ -4190,6 +4221,7 @@ class CompactionService(
         } catch (e: UnconvertibleSchemaException) {
             // Skip-with-reason, not a failure: the group stays
             // uncompacted until the schema or the file set moves.
+            if (e is VariantLayoutMismatchException) Metrics.compactionVariantLayoutMismatch(catalog, e.reason)
             log.warn {
                 "compaction group of ${group.files.size} files for " +
                     "$catalog/${ctx.namespace}.${ctx.table} is not convertible to the live " +
@@ -4611,6 +4643,7 @@ class CompactionService(
                 ctx.inputOpenParallelism,
                 ctx.sortSpill,
                 appendFloorBytes,
+                ctx.variantCompaction,
             )
         onRewritten(rewritten)
         check(rewritten.rowsWritten == group.survivingRecords) {
