@@ -9,12 +9,11 @@ from __future__ import annotations
 
 import contextlib
 import importlib.metadata
-import io
 import logging
 import threading
 import time
 import uuid as _uuid
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal, Self
@@ -47,7 +46,6 @@ from .errors import (
     ReadSnapshotExpiredError,
     ReconciliationRequiredError,
     ValidationError,
-    VariantEncodingError,
 )
 from .models import (
     AppendedFile,
@@ -80,14 +78,10 @@ from .ops import (
     set_sort_order,
 )
 from .parquet_schema import (
-    VariantParquet,
     _footer_size,
-    _RefusedTable,
     prepared_schema_matches,
     validate_variant_file,
-    write_variant_parquet,
 )
-from .stats import extract_column_stats
 from .transforms import partition_source_array, transform_strings
 from .types import (
     _is_variant_storage,
@@ -104,12 +98,15 @@ from .upload import (
     s3_key,
     widen_io_threads_for,
 )
-from .variant import (
-    SHREDDING_KEY,
-    VariantReport,
-    _column_plan,
-    _is_json_type,
-    encode_json,
+from .variant import VariantReport, _is_json_type
+from .writer import (
+    PreparedPart,
+    _check_variant_on_invalid,
+    _check_variant_values,
+    _registration,
+    _stored_schema,
+    _variant_columns,
+    write_part,
 )
 
 DEFAULT_TIMEOUT = 30.0
@@ -2019,35 +2016,34 @@ class Table:
         else:
             groups = [(None, data)]
 
-        parts: Sequence[pa.Table | VariantParquet] = [part for _, part in groups]
-        if variants:
-            # Every group is encoded and written before the first upload,
-            # as on the prepared path: an invalid row in the last partition
-            # must not leave the files of the ones before it orphaned.
-            parts = [
-                _write_variant_group(
-                    part,
-                    info.columns,
-                    variants,
-                    on_invalid=variant_on_invalid,
-                    report=variant_report,
-                    row_group_size=row_group_size,
-                    write_options=write_options,
-                )
-                for part in parts
-            ]
+        def write(part: pa.Table) -> PreparedPart:
+            return write_part(
+                part,
+                info.columns,
+                write_options=write_options,
+                row_group_size=row_group_size,
+                variant_on_invalid=variant_on_invalid,
+                variant_report=variant_report,
+            )
+
+        tables = [part for _, part in groups]
+        # With variant columns every group is encoded and written before the
+        # first upload, as on the prepared path: an invalid row in the last
+        # partition must not leave the files of the ones before it orphaned.
+        # Without, each file is written as its upload comes, as it always was.
+        parts: Iterable[PreparedPart] = (
+            [write(part) for part in tables] if variants else map(write, tables)
+        )
 
         file_regs: list[dict[str, Any]] = []
         appended: list[AppendedFile] = []
-        for (partition_values, _), part in zip(groups, parts, strict=True):
-            reg = _write_one_file(
-                part,
+        for (partition_values, _), prepared in zip(groups, parts, strict=True):
+            reg = _upload_one_file(
+                prepared,
                 info,
                 catalog,
                 client,
                 deferred_stats=deferred_stats,
-                row_group_size=row_group_size,
-                write_options=write_options,
                 partition_values=partition_values,
             )
             file_regs.append(reg)
@@ -2285,8 +2281,10 @@ class Table:
         options. A variant column's field carries the destination's field
         id and nullability like any other
         (``columns_to_arrow_schema(table.columns, variant="json")`` builds
-        a schema for JSON text), and the comparison above runs over the
-        other columns of the written file.
+        a schema for JSON text); one that does not is refused before the
+        write (``cannot write VARIANT columns: ...``). The comparison above
+        then runs over the whole written file, each variant field in its
+        read form, with the same error.
         """
         return self._prepare_append(
             groups,
@@ -2371,27 +2369,12 @@ class Table:
                     "prepared append destination layout changed", status_code=None
                 )
             has_variant = any(c.type == "variant" for c in info.columns)
-            variants = (
-                _variant_columns(info.columns, variant_on_invalid)
-                if from_tables
-                else []
-            )
             # Without the variant columns: a prepared file's are checked by
-            # validate_variant_file, and an Arrow table's are written to
-            # their declarations by write_variant_parquet.
-            schema = columns_to_arrow_schema(
-                tuple(c for c in info.columns if c.type != "variant")
-            )
-            # Parquet has no seconds timestamp unit: our writer stores timestamp_s
-            # as milliseconds. Preserve all field IDs/nullability/metadata checks.
-            schema = pa.schema(
-                [
-                    field.with_type(pa.timestamp("ms"))
-                    if field.type == pa.timestamp("s")
-                    else field
-                    for field in schema
-                ],
-                metadata=schema.metadata,
+            # validate_variant_file. An Arrow table's are write_part's.
+            schema = _stored_schema(
+                columns_to_arrow_schema(
+                    tuple(c for c in info.columns if c.type != "variant")
+                )
             )
             # Resolved before any encode or footer read so a bad
             # setting costs nothing. The object-store clients are NOT
@@ -2402,6 +2385,7 @@ class Table:
             registrations = []
             uploads: list[Upload] = []
             for index, (source, partition) in enumerate(groups):
+                part: _PreparedFile | PreparedPart
                 if not from_tables:
                     part = _describe_prepared_file(
                         source,
@@ -2410,18 +2394,14 @@ class Table:
                         has_variant=has_variant,
                         allow_optional_fields=allow_optional_fields,
                     )
-                elif variants:
-                    part = _encode_variant_group(
-                        source,
-                        schema,
-                        info.columns,
-                        variants,
-                        write_options=write_options,
-                        on_invalid=variant_on_invalid,
-                        report=variant_report,
-                    )
                 else:
-                    part = _encode_group(source, schema, write_options)
+                    part = write_part(
+                        source,
+                        info.columns,
+                        write_options=write_options,
+                        variant_on_invalid=variant_on_invalid,
+                        variant_report=variant_report,
+                    )
                 arity = len(info.partition_spec.fields) if info.partition_spec else 0
                 if (arity and (partition is None or len(partition) != arity)) or (
                     not arity and partition is not None
@@ -2436,26 +2416,15 @@ class Table:
                     )
                 uri = f"{catalog.data_path.rstrip('/')}/data/{info.namespace}/{info.name}/{idempotency_key}/{_uuid.uuid4()}-{index}.parquet"
                 uploads.append(
-                    Upload(uri=uri, size=part.size, body=part.body, path=part.path)
+                    Upload(uri=uri, size=part.size, path=part.path)
+                    if isinstance(part, _PreparedFile)
+                    else Upload(uri=uri, size=part.size, body=part.body)
                 )
-                reg: dict[str, Any] = {
-                    "path": uri,
-                    "record_count": part.metadata.num_rows,
-                    "file_size_bytes": part.size,
-                    "footer_size": part.footer_size,
-                }
-                # Omitted, not empty: an absent key is what the server
-                # registers 'pending' for the hydrator; `[]` would be
-                # 'provided' with no stats, forever. Same rule as
-                # _write_one_file.
-                if not deferred_stats:
-                    reg["column_stats"] = [
-                        stat.to_wire()
-                        for stat in extract_column_stats(part.metadata, info.columns)
-                    ]
-                if partition is not None:
-                    reg["partition_values"] = list(partition)
-                registrations.append(reg)
+                registrations.append(
+                    _registration(
+                        part, uri, info.columns, not deferred_stats, partition
+                    )
+                )
             if not registrations:
                 raise ValidationError(
                     "prepared append must contain files", status_code=None
@@ -2776,289 +2745,47 @@ def _json_off_string_view(values: pa.ChunkedArray) -> pa.ChunkedArray:
     )
 
 
-# -- VARIANT columns on the Arrow write paths ----------------------------------
-
-
-def _check_variant_on_invalid(on_invalid: object) -> None:
-    # Pure, so it runs before any request, as the codec settings do.
-    if on_invalid not in ("raise", "null"):
-        raise ValidationError(
-            f"variant_on_invalid is 'raise' or 'null', not {on_invalid!r}",
-            status_code=None,
-        )
-
-
-def _variant_columns(
-    columns: Sequence[Column], on_invalid: Literal["raise", "null"]
-) -> list[Column]:
-    """The destination's variant columns (top-level: a nested one fails
-    building the schema), refusing ``"null"`` when one is NOT NULL, whatever
-    form its values come in: an invalid row would have nowhere to go."""
-    variants = [column for column in columns if column.type == "variant"]
-    not_null = [column.name for column in variants if not column.nullable]
-    if on_invalid == "null" and not_null:
-        raise ValidationError(
-            "variant_on_invalid='null' writes an invalid row as SQL NULL, and "
-            f"variant column(s) {not_null} are NOT NULL",
-            status_code=None,
-        )
-    return variants
-
-
-def _check_variant_values(column: Column, values: pa.ChunkedArray) -> None:
-    """Refuse a variant column's values before anything is written: a type
-    they do not come in (JSON text as ``pa.json_()``, over any of its
-    storage types; the null type; or the storage in the declaration's write
-    form), and SQL NULL in a NOT NULL column, as the encoder refuses it
-    (D5), whatever the form."""
-    _check_variant_type(column, values.type)
-    if not column.nullable and values.null_count:
-        row = pc.index(values.is_null(), True).as_py()
-        raise VariantEncodingError(
-            f"variant column '{column.name}' row {row}: SQL NULL into a NOT NULL "
-            "column",
-            reason="sql_null_in_not_null",
-            column=column.name,
-            row=row,
-        )
-
-
-def _check_variant_type(column: Column, kind: pa.DataType) -> None:
-    if _is_json_type(kind) or pa.types.is_null(kind):
-        return
-    plan = _column_plan(column, (column.type_params or {}).get(SHREDDING_KEY))
-    if plan.form_of(kind) == "write":
-        return
-    if (
-        pa.types.is_string(kind)
-        or pa.types.is_large_string(kind)
-        or pa.types.is_string_view(kind)
-    ):
-        # A plain string makes no claim to be JSON (types.py), so it is not
-        # read as JSON here either: the caller says so by casting.
-        raise ValidationError(
-            f"variant column {column.name!r} takes JSON text as pa.json_(), not "
-            f"{kind}: cast it to pa.json_() to append it as JSON",
-            status_code=None,
-        )
-    raise ValidationError(
-        f"variant column {column.name!r} takes pa.json_() text, the null type "
-        "(all SQL NULL), or its storage in its declaration's write form "
-        "(columns_to_arrow_schema(columns, variant='storage')), not "
-        f"{kind}",
-        status_code=None,
-    )
-
-
-def _write_variant_group(
-    data: pa.Table,
-    columns: Sequence[Column],
-    variants: Sequence[Column],
-    *,
-    on_invalid: Literal["raise", "null"],
-    report: VariantReport | None,
-    row_group_size: int | None,
-    write_options: dict[str, Any],
-) -> VariantParquet:
-    """One group's file: each variant column's JSON text (or nulls)
-    encoded as its storage, then written, stamped and checked by
-    ``write_variant_parquet``. The values were checked by
-    :func:`_check_variant_values`.
-
-    Pre-encoded storage is checked by structure (write_variant_parquet's
-    ``structure_fault`` and integer view: no null pyarrow would write as
-    other bytes), not by :func:`pyhoglake.variant.verify`, which decodes
-    every row in Python at the encoder's cost and would undo what encoding
-    elsewhere saves. Its bytes are the caller's to verify.
-    """
-    for column in variants:
-        index = data.schema.get_field_index(column.name)
-        field, values = data.schema.field(index), data.column(index)
-        if pa.types.is_struct(values.type):
-            continue  # storage already
-        encoded = encode_json(values, column, on_invalid=on_invalid)
-        if report is not None:
-            report.merge(encoded.report)
-        data = data.set_column(
-            index, field.with_type(encoded.array.type), encoded.array
-        )
-    try:
-        return write_variant_parquet(
-            data, columns, row_group_size=row_group_size, write_options=write_options
-        )
-    except _RefusedTable as error:
-        # The caller's table: a field that is not its column's, or storage
-        # with a null pyarrow would write as other values. An error of
-        # pyarrow's write is raised as the other write paths raise it.
-        raise ValidationError(
-            f"cannot write VARIANT columns: {error}", status_code=None
-        ) from error
-
-
-def _write_one_file(
-    part: pa.Table | VariantParquet,
+def _upload_one_file(
+    part: PreparedPart,
     info: TableInfo,
     catalog: Catalog,
     client: HoglakeClient,
     *,
     deferred_stats: bool,
-    row_group_size: int | None,
-    write_options: dict[str, Any],
     partition_values: tuple[str | None, ...] | None,
 ) -> dict[str, Any]:
-    """THE single-file writer path: serialize ``part`` to parquet (field
-    ids already on the schema), upload it under the catalog's data path,
-    and build its FileRegistration wire dict — unchanged conventions
-    (footer stats from the writer's own metadata, exact ``footer_size``),
-    plus ``partition_values`` when the table is partitioned.
-
-    ``write_options`` comes from ``parquet_write_options``; empty means
-    pyarrow's default codec, SNAPPY. A table with variant columns arrives
-    written already (:func:`_write_variant_group`), with these options,
-    its sizes measured on the stamped file."""
-    if isinstance(part, VariantParquet):
-        raw, metadata, footer_size = part.body, part.metadata, part.footer_size
-    else:
-        sink = io.BytesIO()
-        options = dict(write_options)
-        if row_group_size is not None:
-            options["row_group_size"] = row_group_size
-        pq.write_table(part, sink, **options)
-        raw = sink.getvalue()
-        metadata = pq.read_metadata(io.BytesIO(raw))
-        footer_size = _footer_size(raw)
-
-    column_stats = None
-    if not deferred_stats:
-        column_stats = extract_column_stats(metadata, info.columns)
-
+    """``Table.append``'s half of one file: upload the part
+    :func:`~pyhoglake.writer.write_part` wrote under the catalog's data
+    path, and return its FileRegistration wire dict."""
     data_path = catalog.data_path
     if not data_path.endswith("/"):
         data_path += "/"
     file_uri = f"{data_path}data/{info.namespace}/{info.name}/{_uuid.uuid4()}.parquet"
-    _upload(client._filesystem(), file_uri, raw)
-
-    file_reg: dict[str, Any] = {
-        "path": file_uri,
-        "record_count": metadata.num_rows,
-        "file_size_bytes": len(raw),
-        "footer_size": footer_size,
-    }
-    if column_stats is not None:
-        file_reg["column_stats"] = [s.to_wire() for s in column_stats]
-    if partition_values is not None:
-        file_reg["partition_values"] = list(partition_values)
-    return file_reg
+    # Stats before the upload, as before the core: a file whose stats fail
+    # is refused without leaving an object behind.
+    reg = part.registration(
+        file_uri,
+        info.columns,
+        stats=not deferred_stats,
+        partition_values=partition_values,
+    )
+    _upload(client._filesystem(), file_uri, part.body)
+    return reg
 
 
 @dataclass(frozen=True)
-class _PreparedPart:
-    """One prepared group, measured and validated, ready to register.
-
-    ``metadata`` is the parquet footer the registration's ``record_count``
-    and ``column_stats`` come from; ``size`` and ``footer_size`` are the
-    wire fields the server's tail read depends on. Exactly one of ``body``
-    (an in-memory buffer this process encoded) and ``path`` (a file the
-    caller wrote, still unread) says where the bytes are.
+class _PreparedFile:
+    """One prepared file, measured and validated, ready to register: the
+    parquet footer the registration's ``record_count`` and ``column_stats``
+    come from, and ``size`` and ``footer_size``, the wire fields the
+    server's tail read depends on. The bytes stay at ``path``, the file
+    the caller wrote, until its upload reads them.
     """
 
     metadata: Any
     size: int
     footer_size: int
-    body: Any | None = None
-    path: str | None = None
-
-
-def _encode_group(
-    data: pa.Table, schema: pa.Schema, write_options: dict[str, Any]
-) -> _PreparedPart:
-    """Encode one group's parquet into a buffer — never to disk — and read
-    back everything the registration needs out of that same buffer.
-
-    The schema check is the prepared-FILE check, run on the ENCODED
-    footer rather than on the caller's Arrow schema: same helper, same
-    error text, so a table that would have been refused as a file is
-    refused here, and conversions the writer performs (timestamp_s stored
-    as milliseconds) are compared as written rather than as intended.
-
-    ``write_options`` comes from ``parquet_write_options``; empty means
-    pyarrow's default codec, SNAPPY.
-    """
-    sink = pa.BufferOutputStream()
-    pq.write_table(data, sink, **write_options)
-    raw = sink.getvalue()
-    with pq.ParquetFile(pa.BufferReader(raw)) as parquet:
-        if not prepared_schema_matches(parquet.schema_arrow, schema):
-            raise ValidationError(
-                "prepared Parquet schema/field IDs differ from destination",
-                status_code=None,
-            )
-        metadata = parquet.metadata
-    # Only the 8-byte trailer is copied out of the buffer, so the one
-    # definition of the footer_size wire convention keeps its bytes
-    # signature and stays shared with the file path and the VARIANT writer;
-    # it lives in parquet_schema (_footer_size).
-    return _PreparedPart(
-        metadata=metadata,
-        size=raw.size,
-        footer_size=_footer_size(bytes(raw[-8:])),
-        body=raw,
-    )
-
-
-def _encode_variant_group(
-    data: pa.Table,
-    schema: pa.Schema,
-    columns: Sequence[Column],
-    variants: Sequence[Column],
-    *,
-    write_options: dict[str, Any],
-    on_invalid: Literal["raise", "null"],
-    report: VariantReport | None,
-) -> _PreparedPart:
-    """:func:`_encode_group` for a destination with variant columns.
-
-    The columns must be the destination's, in its order; the variant
-    columns' values are encoded and the group written by
-    :func:`_write_variant_group`, which holds each variant field to its
-    column's field id and nullability; and ``schema``, the destination's
-    without its variant columns, is compared with the written file's
-    other columns as :func:`_encode_group` compares a whole file.
-    """
-    order = [column.name for column in sorted(columns, key=lambda c: c.ordinal)]
-    if data.schema.names != order:
-        raise ValidationError(
-            "prepared Parquet schema/field IDs differ from destination",
-            status_code=None,
-        )
-    for column in variants:
-        _check_variant_values(column, data.column(column.name))
-    written = _write_variant_group(
-        data,
-        columns,
-        variants,
-        on_invalid=on_invalid,
-        report=report,
-        row_group_size=None,
-        write_options=write_options,
-    )
-    with pq.ParquetFile(pa.BufferReader(written.body)) as parquet:
-        found = parquet.schema_arrow
-    names = {column.name for column in variants}
-    others = pa.schema(
-        [field for field in found if field.name not in names], metadata=found.metadata
-    )
-    if not prepared_schema_matches(others, schema):
-        raise ValidationError(
-            "prepared Parquet schema/field IDs differ from destination",
-            status_code=None,
-        )
-    return _PreparedPart(
-        metadata=written.metadata,
-        size=written.size,
-        footer_size=written.footer_size,
-        body=written.body,
-    )
+    path: str
 
 
 def _describe_prepared_file(
@@ -3068,7 +2795,7 @@ def _describe_prepared_file(
     *,
     has_variant: bool,
     allow_optional_fields: bool,
-) -> _PreparedPart:
+) -> _PreparedFile:
     """Validate and measure one prepared file WITHOUT reading its data:
     the footer for schema and stats, the 8-byte trailer for
     ``footer_size``, the file length for ``file_size_bytes``.
@@ -3091,7 +2818,7 @@ def _describe_prepared_file(
         size = source.tell()
         source.seek(-8, 2)
         trailer = source.read(8)
-    return _PreparedPart(
+    return _PreparedFile(
         metadata=metadata,
         size=size,
         footer_size=_footer_size(trailer),

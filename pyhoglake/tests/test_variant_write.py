@@ -31,7 +31,7 @@ from pyhoglake import (
     VariantReport,
     variant,
 )
-from pyhoglake import client as client_module
+from pyhoglake import writer as writer_module
 from pyhoglake.client import Namespace
 from pyhoglake.errors import UnsupportedTypeError
 from pyhoglake.models import Column
@@ -232,13 +232,13 @@ def test_append_encodes_each_partition_group_on_its_own(httpx_mock, store, monke
     """The JSON is encoded after the split, a group at a time: the encoder
     sees each group's rows, never the batch's, and each group is a file."""
     seen = []
-    real = client_module.encode_json
+    real = writer_module.encode_json
 
     def spy(values, column, **kwargs):
         seen.append((column.name, len(values)))
         return real(values, column, **kwargs)
 
-    monkeypatch.setattr(client_module, "encode_json", spy)
+    monkeypatch.setattr(writer_module, "encode_json", spy)
     table = _append_table(httpx_mock, store, PARTITIONED)
     report = VariantReport()
     data = _json_table(ids=[7, 8, 7, 7])
@@ -765,8 +765,8 @@ def _refuse_variant_writer(monkeypatch):
     def refuse(*args, **kwargs):
         raise AssertionError("a table without variant columns reached the writer")
 
-    monkeypatch.setattr(client_module, "write_variant_parquet", refuse)
-    monkeypatch.setattr(client_module, "encode_json", refuse)
+    monkeypatch.setattr(writer_module, "write_variant_parquet", refuse)
+    monkeypatch.setattr(writer_module, "encode_json", refuse)
 
 
 def test_append_without_variant_columns_is_byte_identical(

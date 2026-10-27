@@ -449,7 +449,8 @@ CI).
 variant columns hold their storage in their declarations' write form as
 the Parquet file of those declarations; each column's plan is derived
 from its own declaration. It is internal, not part of the public API:
-`Table.append` and `prepare_append_tables` call it for each file. It
+`write_part`, and through it `Table.append` and `prepare_append_tables`,
+calls it for each file. It
 takes the codec options of `parquet_write_options(compression,
 compression_level)`, as the other write paths do. A caller's mistake is a
 `ValueError` before anything is written: a variant field whose field id
@@ -524,8 +525,10 @@ of:
 Anything else is refused, naming these. The JSON is encoded after the
 partition split, one group at a time, so the encoder's output never goes
 through the split (storage encoded beforehand is split like any other
-column); each group is written by `write_variant_parquet` with the codec
-options and `row_group_size` the other columns get. Every group is
+column); each group is written by the writer core, `write_part` (see
+"Writer core" below), through `write_variant_parquet` with the codec
+options and `row_group_size` the other columns get. An ingester that owns
+its own uploads and commit writes VARIANT through `write_part` too. Every group is
 encoded and written before the first upload, so an invalid row orphans
 nothing, and the files of a partitioned `append` are in memory together,
 as `prepare_append_tables`' always were. A variant column registers no
@@ -729,6 +732,60 @@ logger naming the condition — so a process that configures logging hears
 about it, while the library itself only attaches a `NullHandler` and
 never writes to stderr uninvited. `single_request_uploads=False` is how
 to choose the streaming path deliberately, and it logs nothing.
+
+## Writer core — one file per group, your upload and commit
+
+`Table.append` and `prepare_append_tables` are built on one function,
+`pyhoglake.write_part`: one partition group's Arrow table in, one
+Parquet file ready to register out. An ingester that owns its own
+partition split, uploads, commit chunking and idempotency (millrace, for
+one) calls it per group and keeps all of that:
+
+```python
+from pyhoglake import parquet_write_options, write_part
+
+options = parquet_write_options("zstd", 3)  # validated once
+part = write_part(group, info.columns, write_options=options)
+uri = f"{data_path}/data/{info.namespace}/{info.name}/{build}/{index}.parquet"
+my_upload(uri, part.body)  # a pa.Buffer of part.size bytes
+registration = part.registration(
+    uri,
+    info.columns,
+    stats=part.size >= 32 * 1024 * 1024,  # False defers stats to the hydrator
+    partition_values=values,  # None for an unpartitioned table
+)
+```
+
+`write_part(table, columns, *, write_options, row_group_size=None,
+variant_on_invalid="raise", variant_report=None)` owns what makes the
+file the catalog's:
+
+- **The schema.** `table` holds the catalog columns in their order, with
+  their field ids and nullability (`columns_to_arrow_schema(columns)`, or
+  with `variant="json"` / `"storage"`). The footer of every file is read
+  back and compared with the destination's, as a prepared file is
+  ("Prepared appends" above).
+- **`timestamp_s`**, at any depth, given as seconds or as milliseconds:
+  Parquet has no seconds unit, and the file stores milliseconds.
+- **VARIANT**: JSON text, the null type or storage, encoded and written as
+  "Writing VARIANT" describes, with `variant_on_invalid` and
+  `variant_report`.
+- **The sizes**: `PreparedPart.size` and `footer_size` are measured on
+  `body`, and `metadata` is the writer's FileMetaData, which the
+  registration's `record_count` and `column_stats` come from.
+
+A refusal is raised before there is anything to upload: a
+`ValidationError` for a table that is not the destination's, a
+`VariantEncodingError` for a value that cannot be encoded, an
+`UnsupportedTypeError` for a destination whose variant column is nested in
+a struct, list or map, and pyarrow's own error for what pyarrow refuses (a
+null in a NOT NULL column).
+`registration(..., stats=False)` leaves `column_stats` out, never empty:
+the server registers the file `pending` for its hydrator, with the
+consequences the "Deferred stats" row under "Configuration" lists. For a table with no variant
+column, `write_part` writes `pq.write_table`'s bytes with the given
+options, byte for byte what `append` wrote before it was built on the
+core (`tests/data/writer_golden.json`).
 
 ## The append incarnation guard — atomic at commit
 

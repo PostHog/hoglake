@@ -136,3 +136,16 @@ flox activate -- uv run python tests/data/variant/regen_golden_storage.py
 ```
 
 Written with pyarrow 25.0.1 on CPython 3.13.
+
+# Writer golden file
+
+`writer_golden.json` holds what `Table.append` and
+`Table.prepare_append_tables` wrote for one table with no variant column
+(`long`, `string`, `double`, `boolean`, `date`, `timestamp_s`, `decimal`,
+`uuid`, a list, a map, and a struct of `timestamptz` and `int`) before they
+were rebuilt on `pyhoglake.writer.write_part`: the file bytes, `footer_size`,
+`file_size_bytes`, `record_count` and `column_stats`, per codec and row-group
+setting. `test_writer.py` holds both paths and the core to it, with the
+`created_by` of the pyarrow it ran on put back to the captured one. Recapture
+it with `PYHOGLAKE_RECAPTURE_WRITER_GOLDEN=1` only after a pyarrow upgrade
+that changes its bytes, never to make a writer change pass.
