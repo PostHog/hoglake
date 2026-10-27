@@ -26,8 +26,9 @@ name: ECR release
 # with the name: fields of server.yml and webui.yml.
 #
 # A pull request that changes this workflow or its script starts a
-# dry run. The dry run pushes both images to a local registry. Then it
-# does the same checks. The dry run does not use AWS.
+# dry run. A person can also start a dry run by hand on any branch. The
+# dry run pushes both images to a local registry. Then it does the same
+# checks. The dry run does not use AWS.
 
 on:
   workflow_run:
@@ -39,6 +40,12 @@ on:
     paths:
       - ".github/workflows/ecr-release.yml"
       - ".github/scripts/ecr-release.sh"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Run the build and the checks against a local registry. Push nothing to ECR. Any branch.
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -57,11 +64,16 @@ defaults:
 jobs:
   gate:
     # Forks must not publish. Only a push to main of this repository
-    # can start a release.
+    # can start a release. A person can start a dry run on any branch.
+    # A dispatch on a branch that is not main must be a dry run. The
+    # role trust accepts only refs/heads/main, so a real publish from
+    # another branch fails at the credential step. The gate refuses it
+    # first, so the run says why.
     if: >-
       github.repository == 'PostHog/hoglake' &&
       (
         github.event_name == 'pull_request' ||
+        github.event_name == 'workflow_dispatch' ||
         (
           github.event.workflow_run.event == 'push' &&
           github.event.workflow_run.head_branch == 'main' &&
@@ -84,7 +96,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ github.workflow_sha }}
+          ref: ${{ github.workflow_sha || github.sha }}
           path: .release-tools
           sparse-checkout: .github/scripts
 
@@ -95,6 +107,9 @@ jobs:
           EVENT: ${{ github.event_name }}
           RUN_SHA: ${{ github.event.workflow_run.head_sha }}
           PR_SHA: ${{ github.event.pull_request.head.sha }}
+          DISPATCH_SHA: ${{ github.sha }}
+          DISPATCH_REF: ${{ github.ref }}
+          DISPATCH_DRY_RUN: ${{ inputs.dry_run }}
         run: |
           if [[ $EVENT == pull_request ]]; then
             echo "Dry run for ${PR_SHA}. Nothing goes to ECR."
@@ -102,6 +117,23 @@ jobs:
               echo "publish=true"
               echo "dry-run=true"
               echo "sha=${PR_SHA}"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ $EVENT == workflow_dispatch ]]; then
+            if [[ $DISPATCH_DRY_RUN != true && $DISPATCH_REF != refs/heads/main ]]; then
+              echo "::error::A dispatch on ${DISPATCH_REF} must set dry_run. Only refs/heads/main can publish to ECR."
+              exit 1
+            fi
+            if [[ $DISPATCH_DRY_RUN == true ]]; then
+              echo "Dry run for ${DISPATCH_SHA} on ${DISPATCH_REF}. Nothing goes to ECR."
+            else
+              echo "Release for ${DISPATCH_SHA} on ${DISPATCH_REF}."
+            fi
+            {
+              echo "publish=true"
+              echo "dry-run=${DISPATCH_DRY_RUN}"
+              echo "sha=${DISPATCH_SHA}"
             } >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -149,7 +181,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ github.workflow_sha }}
+          ref: ${{ github.workflow_sha || github.sha }}
           path: .release-tools
           sparse-checkout: .github/scripts
 
