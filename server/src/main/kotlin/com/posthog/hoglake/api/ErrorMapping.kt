@@ -1,5 +1,6 @@
 package com.posthog.hoglake.api
 
+import com.posthog.hoglake.auth.bearerChallenge
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.service.CorruptDefinitionException
 import io.github.oshai.kotlinlogging.KotlinLogging
@@ -106,6 +107,14 @@ internal fun errorBody(cause: HoglakeException): Pair<HttpStatusCode, ApiErrorDt
         // and a `when` would otherwise answer the base code for it.
         is HoglakeException.CommitConflict -> HttpStatusCode.Conflict to apiError("commit_conflict", cause)
         is HoglakeException.Validation -> HttpStatusCode.UnprocessableEntity to apiError("validation", cause)
+        // 401, and the ONLY arm whose status is added by a header the
+        // caller must also honour (WWW-Authenticate, below). `error`
+        // carries the verifier's closed reason vocabulary rather than a
+        // constant, so a client can tell "renew your token" from "you
+        // signed with the wrong key" without parsing prose.
+        is HoglakeException.Unauthenticated ->
+            HttpStatusCode.Unauthorized to ApiErrorDto(error = cause.reason, detail = cause.message)
+        is HoglakeException.Forbidden -> HttpStatusCode.Forbidden to apiError("forbidden", cause)
         is HoglakeException.Expired -> HttpStatusCode.Gone to apiError("expired", cause)
         // Explicit backpressure: the commit queued too long on the catalog
         // lock. Clients back off and retry; the Retry-After header is
@@ -120,6 +129,9 @@ fun StatusPagesConfig.installErrorMapping() {
         val (status, body) = errorBody(cause)
         if (cause is HoglakeException.CommitQueueTimeout) {
             call.response.headers.append(HttpHeaders.RetryAfter, RETRY_AFTER_SECONDS)
+        }
+        if (cause is HoglakeException.Unauthenticated) {
+            call.response.headers.append(HttpHeaders.WWWAuthenticate, bearerChallenge(cause))
         }
         call.respond(status, body)
     }

@@ -2516,6 +2516,35 @@ sealed class HoglakeException(message: String) : RuntimeException(message) {
 
     class Validation(detail: String) : HoglakeException(detail)
 
+    /**
+     * No credential, or one that does not verify -> HTTP 401 with
+     * `WWW-Authenticate: Bearer`. [reason] is a closed token from the
+     * verifier's vocabulary (`invalid_token`, `token_expired`, …), never
+     * a parser message: a 401 body that echoed "illegal base64 character
+     * at index 43" would tell an attacker which byte to change.
+     *
+     * Deliberately NOT a [NotFound]: a caller with no credential is told
+     * it has no credential. Only a caller that authenticated and asked
+     * about someone else's catalog is given the 404 treatment.
+     */
+    class Unauthenticated(
+        val reason: String,
+        detail: String,
+    ) : HoglakeException(detail)
+
+    /**
+     * Authenticated, entitled to the catalog, but short of the scope the
+     * route requires -> HTTP 403 `forbidden`.
+     *
+     * The distinction from a 404 is a security property, not a nicety
+     * (docs/auth-tenancy.md §7): a tenant asking about a catalog it does
+     * not own must be indistinguishable from one asking about a catalog
+     * that does not exist, or an org UUID becomes an enumeration oracle.
+     * A 403 is only ever returned for a catalog the caller already knows
+     * is its own.
+     */
+    class Forbidden(detail: String) : HoglakeException(detail)
+
     class OffsetRegression(detail: String) : HoglakeException(detail)
 
     /** Requested range fell below the catalog's expiry floor -> HTTP 410. */

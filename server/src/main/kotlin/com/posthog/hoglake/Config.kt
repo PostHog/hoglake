@@ -135,6 +135,54 @@ data class Config(
     val s3SecretKey: String = env("HOGLAKE_S3_SECRET_KEY", ""),
     val s3PathStyle: Boolean = env("HOGLAKE_S3_PATH_STYLE", "true").toBoolean(),
     /**
+     * Authentication at the HTTP boundary (docs/auth-tenancy.md):
+     * `off` | `warn` | `enforce` (§11).
+     *
+     * Parsed by `AuthMode.parse`, which refuses anything else BY NAME at boot.
+     * The default is `off`, i.e. exactly today's behaviour, so this whole change
+     * is inert until an operator asks for it — and `off` stays in the binary
+     * indefinitely as the rollback for a bad `enforce` flip.
+     */
+    val authMode: String = env("HOGLAKE_AUTH_MODE", "off"),
+    /**
+     * This instance's issuer identity, e.g. `https://hoglake-prod-us.internal`.
+     *
+     * Required whenever [authMode] is not `off`, and it must match the `iss` a
+     * token carries exactly: two regional instances with different issuers is
+     * what stops a prod-us token being replayed at prod-eu, and that property
+     * only exists if the value is configured rather than derived from a host
+     * header an attacker controls.
+     */
+    val authIssuer: String = env("HOGLAKE_AUTH_ISSUER", ""),
+    /**
+     * The `aud` a token must carry. One value for the whole estate.
+     *
+     * Not per-region: `iss` already separates regions, and making the audience
+     * regional too would mean a token could not be used by an in-cluster caller
+     * that legitimately talks to whichever instance its catalog lives on.
+     */
+    val authAudience: String = env("HOGLAKE_AUTH_AUDIENCE", "hoglake"),
+    /**
+     * A JWKS document on local disk — the in-cluster source.
+     *
+     * A FILE rather than an inline public key because the kubelet rotates a
+     * projected volume without a restart, and the verifier re-reads it on a key
+     * miss. Exactly one of this and [authJwksUrl] must be set when auth is on;
+     * setting both is refused rather than silently preferred.
+     */
+    val authJwksFile: String = env("HOGLAKE_AUTH_JWKS_FILE", ""),
+    /** A JWKS document at a URL — the external-issuer source. */
+    val authJwksUrl: String = env("HOGLAKE_AUTH_JWKS_URL", ""),
+    /**
+     * Tolerated clock skew, in seconds, for `exp` / `nbf` / `iat`.
+     *
+     * 60s covers an un-synced pod clock comfortably. It is CAPPED at 600 by
+     * `JwtVerifier`'s own `require`, because a large skew is not a tolerance —
+     * it is an extension of every token's lifetime, which is the one thing the
+     * TTL exists to bound.
+     */
+    val authClockSkewSeconds: Long = env("HOGLAKE_AUTH_CLOCK_SKEW_SECONDS", "60").toLong(),
+    /**
      * Hydrator poll interval; 0 disables the background loop (tests drive
      * it directly).
      *

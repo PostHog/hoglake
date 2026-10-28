@@ -8,13 +8,52 @@ info:
     storage and is written by clients, registered here via
     footer-shipping commits. Row-level deletes are deletion vectors
     (client-written puffin DVs, registered like files). Retention is a
-    catalog property with a consumer-offset floor. Auth is out of scope
-    for v1.
+    catalog property with a consumer-offset floor.
+
+    ## Authentication
+
+    Every operation except the four marked `security: []` below
+    (`/livez`, `/healthz`, `/metrics`, `/info`) requires
+    `Authorization: Bearer <jwt>`; `/metrics` requires an OPERATOR
+    credential rather than none. The token is an ES256 compact JWS
+    issued by this instance, carrying the
+    caller's kind (`ten`), org (`org`), and — for a tenant — a `cat`
+    map from catalog name to the scopes held on it. Scopes are
+    PER-CATALOG, not global: `read`, `write`, `maintenance`, `admin`,
+    nested so that `admin` implies all of them and `maintenance`
+    implies `write`.
+
+    Two refusals are worth distinguishing, because they mean different
+    things to a client:
+
+    - **401** (`error`: `invalid_request`, `invalid_token`,
+      `token_expired`, `invalid_signature`, …) with a
+      `WWW-Authenticate: Bearer error="…"` challenge: no credential, or
+      one that does not verify. Renew and retry.
+    - **403** `forbidden`: the credential verifies and the catalog is
+      the caller's own, but it is short of the scope this route needs.
+    - **404** — NOT 403 — for a catalog the caller is not entitled to.
+      This is deliberate: a 403 would confirm the catalog exists and
+      turn an org id the caller was never given into an enumeration
+      oracle, so an unentitled catalog is indistinguishable from one
+      that does not exist.
+
+    Instance-wide operational surfaces (`/metrics`, `/v1/database/health`,
+    `/v1/debug/*`, `/v1/maintenance/{status,runs}`, `POST /v1/catalogs`)
+    are OPERATOR-only: they report across tenants and cannot be
+    meaningfully scoped. The per-catalog twins of the maintenance feeds
+    are the tenant-facing ones.
+
+    `author` (query or body) is ADJUDICATED, not trusted: for a tenant
+    token it must be absent or equal to the token's own subject, and is
+    otherwise filled in from it. A claim to any other name is 422.
 
     Malformed bodies/params and unknown request fields are 400
     bad_request; semantic failures are 422.
 servers:
   - url: /v1
+security:
+  - bearerAuth: []
 paths:
   # ---- operational endpoints (served at the ROOT, not under /v1) ----
   # Probe guidance: liveness -> /livez (process-only; a database outage
@@ -24,6 +63,7 @@ paths:
   # /openapi.yaml through to the server.
   /livez:
     servers: [{ url: / }]
+    security: []
     get:
       operationId: livez
       summary: >
@@ -38,6 +78,7 @@ paths:
               schema: { type: string, example: ok }
   /healthz:
     servers: [{ url: / }]
+    security: []
     get:
       operationId: healthz
       summary: >
@@ -53,6 +94,7 @@ paths:
           description: The catalog database did not answer inside the probe's deadline.
   /metrics:
     servers: [{ url: / }]
+    security: []
     get:
       operationId: metrics
       summary: Prometheus text exposition (scrape endpoint).
@@ -2794,6 +2836,7 @@ paths:
               schema: { $ref: "#/components/schemas/ApiError" }
 
   /info:
+    security: []
     get:
       operationId: getInstanceInfo
       summary: >
@@ -2978,12 +3021,32 @@ paths:
         "409": { $ref: "#/components/responses/Conflict" }
 
 components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        An ES256 compact JWS issued by this instance. Minimum claim
+        set: `iss` (this instance), `aud`, `sub` (client id or
+        service-account subject), `jti`, `exp`, `iat`, `ten`
+        (`tenant` | `operator`), and for a tenant `org` plus a `cat`
+        map from catalog name to the scopes held on it. A token NEVER
+        carries an object-store credential: S3 access is vended
+        separately as short-lived, prefix-confined STS credentials, so
+        a leaked control-plane token cannot be replayed against the
+        bucket.
   parameters:
     operationAuthor:
       in: query
       name: author
       required: true
-      description: Caller-supplied attribution, not an authenticated identity. Missing or blank returns 422.
+      description: >
+        Attribution for the operation. ADJUDICATED, not trusted: for a
+        tenant token it must be absent or equal the token's own subject
+        (an omitted value is filled in from it), and a claim to any
+        other name returns 422. An OPERATOR may attribute work to
+        another name.
       schema: { type: string, minLength: 1 }
     operationMessage:
       in: query
@@ -3040,6 +3103,28 @@ components:
       schema: { type: integer }
 
   responses:
+    Unauthenticated:
+      description: >
+        No credential, or one that does not verify. `error` is a closed
+        vocabulary (`invalid_request`, `invalid_token`, `token_expired`,
+        `not_yet_valid`, `invalid_signature`, `unknown_signing_key`,
+        `invalid_audience`, `invalid_issuer`, `unsupported_algorithm`),
+        and the same value appears in the `WWW-Authenticate` challenge.
+      headers:
+        WWW-Authenticate:
+          schema: { type: string }
+          description: '`Bearer error="<reason>"`, per RFC 6750 §3, also sent on 401 responses.'
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
+    Forbidden:
+      description: >
+        The credential verifies and the catalog is the caller's own, but it
+        does not hold the scope this route requires. A catalog the caller is
+        NOT entitled to is 404, never 403 — a 403 would confirm it exists.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
     NotImplemented:
       description: Specified but not yet implemented.
       content:
