@@ -50,6 +50,17 @@ import java.time.Instant
 import java.util.UUID
 
 /**
+ * The answer to an idempotent create: the object as it exists after the
+ * call, and whether THIS call created it. `created = false` means an
+ * object with an IDENTICAL definition already existed — the create was
+ * a no-op (no snapshot allocated, no change row), so the wire answer is
+ * 200 with the existing object rather than 201. A same-named object
+ * with a DIFFERENT definition is still the [HoglakeException.AlreadyExists]
+ * 409.
+ */
+data class CreateOutcome<T>(val value: T, val created: Boolean)
+
+/**
  * Catalog DDL + read paths. Every DDL operation is one transaction that
  * (1) takes the per-catalog commit lock, (2) allocates the next
  * snapshot id / schema version off hog_catalog, (3) records the
@@ -81,7 +92,14 @@ class CatalogService(private val jdbi: Jdbi) {
         dataPath: String,
         author: String? = null,
         message: String? = null,
-    ): CatalogInfo =
+    ): CatalogInfo = createCatalogOutcome(name, dataPath, author, message).value
+
+    fun createCatalogOutcome(
+        name: String,
+        dataPath: String,
+        author: String? = null,
+        message: String? = null,
+    ): CreateOutcome<CatalogInfo> =
         Audit.audited(
             "catalog_create",
             name,
@@ -91,37 +109,59 @@ class CatalogService(private val jdbi: Jdbi) {
             message = { message },
         ) {
             validateDataPath(dataPath)
-            jdbi.inTransactionUnchecked { h ->
-                // data_path prefix-overlap with ANY existing catalog is
-                // refused, both directions: cleanup's drain-time liveness
-                // check is per-catalog, so two catalogs sharing a prefix
-                // let catalog A's drain physically delete an object
-                // catalog B still references (invariant 4, made global
-                // here at the only place overlap can be introduced).
-                // Runs inside the insert transaction; the hog_catalog
-                // name-unique insert serializes concurrent creates enough
-                // for this dev-era check.
-                val newPrefix = dataPath.trimEnd('/') + "/"
-                CatalogRepo.listAll(h).forEach { existing ->
-                    // Same-name recreate falls through to the insert's
-                    // unique constraint -> AlreadyExists (409), the
-                    // canonical duplicate answer; overlap 422s are for
-                    // OTHER catalogs' prefixes.
-                    if (existing.name == name) return@forEach
-                    val theirPrefix = existing.dataPath.trimEnd('/') + "/"
-                    if (newPrefix.startsWith(theirPrefix) || theirPrefix.startsWith(newPrefix)) {
-                        throw HoglakeException.Validation(
-                            "data_path '${Identifiers.cap(dataPath)}' overlaps catalog " +
-                                "'${existing.name}' (data_path " +
-                                "'${Identifiers.cap(existing.dataPath)}'); " +
-                                "catalog data_paths must be disjoint",
-                        )
+            try {
+                jdbi.inTransactionUnchecked { h ->
+                    // Idempotent create: a live catalog of this name with
+                    // the SAME data_path is this create's own earlier
+                    // success, so the answer is the existing row with
+                    // created = false — no second snapshot 0. A same name
+                    // with a DIFFERENT data_path keeps the 409.
+                    CatalogRepo.findByName(h, name)?.let { existing ->
+                        if (existing.dataPath == dataPath) {
+                            return@inTransactionUnchecked CreateOutcome(existing, created = false)
+                        }
+                        throw HoglakeException.AlreadyExists("catalog '$name' already exists")
                     }
+                    // data_path prefix-overlap with ANY existing catalog is
+                    // refused, both directions: cleanup's drain-time liveness
+                    // check is per-catalog, so two catalogs sharing a prefix
+                    // let catalog A's drain physically delete an object
+                    // catalog B still references (invariant 4, made global
+                    // here at the only place overlap can be introduced).
+                    // Runs inside the insert transaction; the hog_catalog
+                    // name-unique insert serializes concurrent creates enough
+                    // for this dev-era check.
+                    val newPrefix = dataPath.trimEnd('/') + "/"
+                    CatalogRepo.listAll(h).forEach { existing ->
+                        // Same-name is settled by the pre-check above;
+                        // overlap 422s are for OTHER catalogs' prefixes.
+                        val theirPrefix = existing.dataPath.trimEnd('/') + "/"
+                        if (newPrefix.startsWith(theirPrefix) || theirPrefix.startsWith(newPrefix)) {
+                            throw HoglakeException.Validation(
+                                "data_path '${Identifiers.cap(dataPath)}' overlaps catalog " +
+                                    "'${existing.name}' (data_path " +
+                                    "'${Identifiers.cap(existing.dataPath)}'); " +
+                                    "catalog data_paths must be disjoint",
+                            )
+                        }
+                    }
+                    val info = CatalogRepo.insert(h, name, dataPath)
+                    // Snapshot 0: the empty catalog at schema_version 0, no changes.
+                    SnapshotRepo.insert(h, info.catalogId, 0, 0, author, message)
+                    CreateOutcome(info, created = true)
                 }
-                val info = CatalogRepo.insert(h, name, dataPath)
-                // Snapshot 0: the empty catalog at schema_version 0, no changes.
-                SnapshotRepo.insert(h, info.catalogId, 0, 0, author, message)
-                info
+            } catch (e: HoglakeException.AlreadyExists) {
+                // A same-name create RACE is decided by the insert's unique
+                // constraint, not the pre-check, and the aborted transaction
+                // cannot answer the retry — so re-read on a fresh handle:
+                // the winner's row answers an identical create, anything
+                // else (different data_path, or a drop in between) rethrows.
+                val existing = jdbi.withHandleUnchecked { h -> CatalogRepo.findByName(h, name) }
+                if (existing != null && existing.dataPath == dataPath) {
+                    CreateOutcome(existing, created = false)
+                } else {
+                    throw e
+                }
             }
         }
 
@@ -382,7 +422,14 @@ class CatalogService(private val jdbi: Jdbi) {
         name: String,
         author: String? = null,
         message: String? = null,
-    ): NamespaceInfo =
+    ): NamespaceInfo = createNamespaceOutcome(catalog, name, author, message).value
+
+    fun createNamespaceOutcome(
+        catalog: String,
+        name: String,
+        author: String? = null,
+        message: String? = null,
+    ): CreateOutcome<NamespaceInfo> =
         Audit.audited(
             "namespace_create",
             catalog,
@@ -394,8 +441,13 @@ class CatalogService(private val jdbi: Jdbi) {
             jdbi.inTransactionUnchecked { h ->
                 val cat = requireCatalog(h, catalog)
                 Locks.acquireCatalogCommitLock(h, cat.catalogId)
-                if (NamespaceRepo.findLiveByName(h, cat.catalogId, name) != null) {
-                    throw HoglakeException.AlreadyExists("namespace '$name' already exists")
+                // Idempotent create. A namespace's whole definition IS its
+                // name, so a live namespace of this name is definitionally
+                // identical and there is no different-definition 409: the
+                // repeat create is a no-op answering the existing row with
+                // created = false — no snapshot, no change row.
+                NamespaceRepo.findLiveByName(h, cat.catalogId, name)?.let {
+                    return@inTransactionUnchecked CreateOutcome(it, created = false)
                 }
                 val alloc = CatalogRepo.allocateSnapshot(h, cat.catalogId)
                 SnapshotRepo.insert(h, cat.catalogId, alloc.snapshotId, alloc.schemaVersion, author, message)
@@ -407,7 +459,7 @@ class CatalogService(private val jdbi: Jdbi) {
                     ChangeKind.NAMESPACE_CREATED,
                     namespaceId,
                 )
-                NamespaceRepo.insert(h, cat.catalogId, namespaceId, name)
+                CreateOutcome(NamespaceRepo.insert(h, cat.catalogId, namespaceId, name), created = true)
             }
         }
 
@@ -505,7 +557,16 @@ class CatalogService(private val jdbi: Jdbi) {
         columns: List<ColumnDef>,
         author: String? = null,
         message: String? = null,
-    ): TableInfo =
+    ): TableInfo = createTableOutcome(catalog, namespace, name, columns, author, message).value
+
+    fun createTableOutcome(
+        catalog: String,
+        namespace: String,
+        name: String,
+        columns: List<ColumnDef>,
+        author: String? = null,
+        message: String? = null,
+    ): CreateOutcome<TableInfo> =
         Audit.audited(
             "table_create",
             catalog,
@@ -514,9 +575,58 @@ class CatalogService(private val jdbi: Jdbi) {
             actor = { author },
             message = { message },
         ) {
-            jdbi.inTransactionUnchecked { h ->
-                createTable(h, catalog, namespace, name, columns, author = author, message = message)
+            try {
+                jdbi.inTransactionUnchecked { h ->
+                    CreateOutcome(
+                        createTable(h, catalog, namespace, name, columns, author = author, message = message),
+                        created = true,
+                    )
+                }
+            } catch (e: HoglakeException.AlreadyExists) {
+                // Idempotent create: a live table whose definition is
+                // EXACTLY the requested one is this create's own earlier
+                // success — answer the existing table with created = false
+                // (the identity read, so no DDL receipt fields: no snapshot
+                // was allocated and snapshotId stays null). A different
+                // definition keeps the 409. The catch — not a pre-check —
+                // is the arbiter because it also covers the create race,
+                // where the AlreadyExists comes out of insertVersion's
+                // unique violation inside an already-aborted transaction.
+                if (!isIdenticalTableDefinition(catalog, namespace, name, columns)) throw e
+                CreateOutcome(getTable(catalog, namespace, name), created = false)
             }
+        }
+
+    /**
+     * The idempotent-create identity check: is the live table
+     * `namespace`.`name` EXACTLY what a plain create of [columns] would
+     * make? Exact means the materialized column list — field ids
+     * included, so the comparison is [initialColumns] against the stored
+     * columns verbatim — and none of the definition a plain create never
+     * sets: no comment, no properties, no partition or sort spec. A
+     * table that merely ARRIVED at the same column names (an alter
+     * history, a metadata carry-over) has different field ids or extra
+     * definition and stays a 409: only the unmodified success of THIS
+     * definition is a 200.
+     */
+    private fun isIdenticalTableDefinition(
+        catalog: String,
+        namespace: String,
+        name: String,
+        columns: List<ColumnDef>,
+    ): Boolean =
+        jdbi.withHandleUnchecked { h ->
+            val cat = requireCatalog(h, catalog)
+            val ns = requireNamespace(h, cat, namespace)
+            val t =
+                TableRepo.findLive(h, cat.catalogId, ns.namespaceId, name)
+                    ?: return@withHandleUnchecked false
+            val at = cat.headSnapshotId
+            t.comment == null &&
+                t.properties.isEmpty() &&
+                TableRepo.columnsAt(h, cat.catalogId, t.tableId, at) == initialColumns(columns) &&
+                SpecRepo.specAt(h, cat.catalogId, t.tableId, at) == null &&
+                SortRepo.sortSpecAt(h, cat.catalogId, t.tableId, at) == null
         }
 
     /** Caller may compose creation with file registration in the same transaction. */

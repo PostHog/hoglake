@@ -102,6 +102,7 @@ data class CatalogDto(
             "versioned-table-metadata-v1",
             "claimed-uploads-v1",
             "atomic-dml-transactions-v1",
+            "idempotent-create-v1",
         ),
     /**
      * Live totals from the metrics sampler's last pass — display

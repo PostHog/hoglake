@@ -782,30 +782,74 @@ class ApiIntegrationTest {
         }
 
     @Test
-    fun `duplicate catalog namespace and table - 409`() =
+    fun `duplicate create - identical definition is a 200, a different one is a 409`() =
         api { client ->
             val mk = """{"name": "dup", "data_path": "s3://hog/dup"}"""
             assertThat(client.postJson("/v1/catalogs", mk).status).isEqualTo(HttpStatusCode.Created)
+            // Identical re-create: 200 with the existing catalog, not 409.
+            val catAgain = client.postJson("/v1/catalogs", mk)
+            assertThat(catAgain.status).isEqualTo(HttpStatusCode.OK)
+            assertThat(body(catAgain)["name"].asText()).isEqualTo("dup")
+            assertThat(body(catAgain)["data_path"].asText()).isEqualTo("s3://hog/dup")
+            // Same name, different data_path: still the conflict.
             assertApiError(
-                client.postJson("/v1/catalogs", mk),
+                client.postJson("/v1/catalogs", """{"name": "dup", "data_path": "s3://hog/dup2"}"""),
                 HttpStatusCode.Conflict,
                 "already_exists",
             )
 
-            client.postJson("/v1/catalogs/dup/namespaces", """{"name": "ns"}""")
-            assertApiError(
-                client.postJson("/v1/catalogs/dup/namespaces", """{"name": "ns"}"""),
-                HttpStatusCode.Conflict,
-                "already_exists",
-            )
+            assertThat(
+                client.postJson("/v1/catalogs/dup/namespaces", """{"name": "ns"}""").status,
+            ).isEqualTo(HttpStatusCode.Created)
+            // A namespace's whole definition is its name, so the repeat
+            // create is always the identical one: 200 with the same id.
+            val nsAgain = client.postJson("/v1/catalogs/dup/namespaces", """{"name": "ns"}""")
+            assertThat(nsAgain.status).isEqualTo(HttpStatusCode.OK)
+            assertThat(body(nsAgain)["namespace_id"].asLong())
+                .isEqualTo(body(client.get("/v1/catalogs/dup/namespaces/ns"))["namespace_id"].asLong())
 
             val mkTable = """{"name": "t", "columns": [{"name": "id", "type": "long"}]}"""
-            client.postJson("/v1/catalogs/dup/namespaces/ns/tables", mkTable)
+            assertThat(
+                client.postJson("/v1/catalogs/dup/namespaces/ns/tables", mkTable).status,
+            ).isEqualTo(HttpStatusCode.Created)
+            val tableAgain = client.postJson("/v1/catalogs/dup/namespaces/ns/tables", mkTable)
+            assertThat(tableAgain.status).isEqualTo(HttpStatusCode.OK)
+            // The SAME table (uuid and columns), and no DDL receipt: the
+            // no-op created no snapshot, so snapshot_id is absent.
+            assertThat(body(tableAgain)["table_uuid"].asText())
+                .isEqualTo(body(client.get("/v1/catalogs/dup/namespaces/ns/tables/t"))["table_uuid"].asText())
+            assertThat(body(tableAgain)["columns"].map { it["name"].asText() }).containsExactly("id")
+            assertThat(body(tableAgain).has("snapshot_id")).isFalse()
+            // Same name, different definition: still the conflict.
             assertApiError(
-                client.postJson("/v1/catalogs/dup/namespaces/ns/tables", mkTable),
+                client.postJson(
+                    "/v1/catalogs/dup/namespaces/ns/tables",
+                    """{"name": "t", "columns": [{"name": "id", "type": "long"}, {"name": "s", "type": "string"}]}""",
+                ),
                 HttpStatusCode.Conflict,
                 "already_exists",
             )
+        }
+
+    @Test
+    fun `an idempotent create retry allocates no snapshot`() =
+        api { client ->
+            client.postJson("/v1/catalogs", """{"name": "idem", "data_path": "s3://hog/idem"}""")
+            client.postJson("/v1/catalogs/idem/namespaces", """{"name": "ns"}""")
+            val mkTable = """{"name": "t", "columns": [{"name": "id", "type": "long"}]}"""
+            client.postJson("/v1/catalogs/idem/namespaces/ns/tables", mkTable)
+            val head = body(client.get("/v1/catalogs/idem"))["head_snapshot_id"].asLong()
+
+            // Every no-op retry leaves the head where it was: nothing was
+            // allocated, nothing was recorded.
+            assertThat(client.postJson("/v1/catalogs/idem/namespaces", """{"name": "ns"}""").status)
+                .isEqualTo(HttpStatusCode.OK)
+            assertThat(client.postJson("/v1/catalogs/idem/namespaces/ns/tables", mkTable).status)
+                .isEqualTo(HttpStatusCode.OK)
+            assertThat(client.postJson("/v1/catalogs", """{"name": "idem", "data_path": "s3://hog/idem"}""").status)
+                .isEqualTo(HttpStatusCode.OK)
+            assertThat(body(client.get("/v1/catalogs/idem"))["head_snapshot_id"].asLong())
+                .isEqualTo(head)
         }
 
     // ---- helpers ---------------------------------------------------------

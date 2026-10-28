@@ -69,9 +69,13 @@ fun Application.installApiRoutes(
             }
             post {
                 val req = call.receive<CreateCatalogRequestDto>()
+                // Idempotent create: 201 when this call created the
+                // catalog, 200 with the existing object when an identical
+                // definition already existed (a different one is the 409).
+                val outcome = catalogs.createCatalogOutcome(req.name, req.dataPath, req.author, req.message)
                 call.respond(
-                    HttpStatusCode.Created,
-                    catalogs.createCatalog(req.name, req.dataPath, req.author, req.message).toDto(),
+                    if (outcome.created) HttpStatusCode.Created else HttpStatusCode.OK,
+                    outcome.value.toDto(),
                 )
             }
 
@@ -112,9 +116,11 @@ fun Application.installApiRoutes(
                     }
                     post {
                         val req = call.receive<CreateNamespaceRequestDto>()
+                        val outcome =
+                            catalogs.createNamespaceOutcome(call.catalog(), req.name, req.author, req.message)
                         call.respond(
-                            HttpStatusCode.Created,
-                            catalogs.createNamespace(call.catalog(), req.name, req.author, req.message).toDto(),
+                            if (outcome.created) HttpStatusCode.Created else HttpStatusCode.OK,
+                            outcome.value.toDto(),
                         )
                     }
                     get("/{namespace}") {
@@ -147,16 +153,18 @@ fun Application.installApiRoutes(
                         }
                         post {
                             val req = call.receive<CreateTableRequestDto>()
-                            call.respond(
-                                HttpStatusCode.Created,
-                                catalogs.createTable(
+                            val outcome =
+                                catalogs.createTableOutcome(
                                     call.catalog(),
                                     call.namespace(),
                                     req.name,
                                     req.columns.map { it.toModel() },
                                     req.author,
                                     req.message,
-                                ).toDto(),
+                                )
+                            call.respond(
+                                if (outcome.created) HttpStatusCode.Created else HttpStatusCode.OK,
+                                outcome.value.toDto(),
                             )
                         }
 

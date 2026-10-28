@@ -76,7 +76,12 @@ paths:
                 items: { $ref: "#/components/schemas/Catalog" }
     post:
       operationId: createCatalog
-      summary: Create a catalog
+      summary: Create a catalog (idempotent)
+      description: >
+        Creates are IDEMPOTENT: a catalog of this name with an identical
+        data_path already existing is this create's own earlier success,
+        answered 200 with the existing catalog (no new snapshot 0). Only
+        a same-named catalog with a DIFFERENT data_path is the 409.
       requestBody:
         required: true
         content:
@@ -85,6 +90,11 @@ paths:
       responses:
         "201":
           description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Catalog" }
+        "200":
+          description: Already existed with an identical data_path; the existing catalog, unchanged
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Catalog" }
@@ -255,7 +265,15 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Namespace" }
-        "409": { $ref: "#/components/responses/Conflict" }
+        "200":
+          description: >
+            The namespace already existed; the existing namespace,
+            unchanged (no new snapshot). A namespace's whole definition
+            is its name, so a repeat create is always identical and
+            there is no different-definition 409 here.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Namespace" }
         "422":
           description: Name fails the identifier pattern.
           content:
@@ -342,7 +360,16 @@ paths:
         "422": { $ref: "#/components/responses/Validation" }
     post:
       operationId: createTable
-      summary: Create a table (DDL commit; produces a snapshot)
+      summary: Create a table (DDL commit; produces a snapshot; idempotent)
+      description: >
+        Creates are IDEMPOTENT: a live table of this name whose
+        definition is EXACTLY the requested one — the materialized
+        columns, assigned field ids included, and no comment, properties
+        or partition/sort spec, which is all this request can set — is
+        this create's own earlier success, answered 200 with the existing
+        table as the identity read reports it (no DDL happened, so the
+        receipt field snapshot_id is absent). A same-named table with a
+        DIFFERENT definition stays the 409.
       parameters:
         - { $ref: "#/components/parameters/catalog" }
         - { $ref: "#/components/parameters/namespace" }
@@ -354,6 +381,11 @@ paths:
       responses:
         "201":
           description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Table" }
+        "200":
+          description: Already existed with an identical definition; the existing table, unchanged
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Table" }
@@ -3173,7 +3205,7 @@ components:
       properties:
         name: { type: string }
         data_path: { type: string }
-        capabilities: { type: array, items: { type: string }, description: "Includes atomic-table-creation-v1, idempotent-append-v1, idempotent-delete-v1, idempotent-mutation-v1, guarded-table-lifecycle-v1, atomic-table-replacement-v1 guarded-schema-evolution-v1 recursive-write-schema-v1 atomic-partitioned-table-creation-v1 atomic-sorted-table-creation-v1 and versioned-table-metadata-v1 and claimed-uploads-v1 and atomic-dml-transactions-v1 when supported" }
+        capabilities: { type: array, items: { type: string }, description: "Includes atomic-table-creation-v1, idempotent-append-v1, idempotent-delete-v1, idempotent-mutation-v1, guarded-table-lifecycle-v1, atomic-table-replacement-v1 guarded-schema-evolution-v1 recursive-write-schema-v1 atomic-partitioned-table-creation-v1 atomic-sorted-table-creation-v1 and versioned-table-metadata-v1 and claimed-uploads-v1 and atomic-dml-transactions-v1 and idempotent-create-v1 when supported" }
         head_snapshot_id: { type: integer, format: int64 }
         schema_version: { type: integer, format: int64 }
         earliest_snapshot_time:

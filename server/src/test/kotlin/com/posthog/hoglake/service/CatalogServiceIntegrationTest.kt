@@ -55,6 +55,18 @@ class CatalogServiceIntegrationTest {
     }
 
     @Test
+    fun `duplicate catalog create with an identical data_path is an idempotent no-op`() {
+        val cat = svc.createCatalog("cat-idem", "s3://bucket/idem")
+        val again = svc.createCatalogOutcome("cat-idem", "s3://bucket/idem")
+        assertThat(again.created).isFalse()
+        assertThat(again.value).isEqualTo(cat)
+        // No second snapshot 0: the head stayed where the first create left it.
+        assertThat(svc.getCatalog("cat-idem").headSnapshotId).isEqualTo(0)
+        // And the plain create entry point answers the same object.
+        assertThat(svc.createCatalog("cat-idem", "s3://bucket/idem")).isEqualTo(cat)
+    }
+
+    @Test
     fun `catalog name failing the schema check is a validation error`() {
         assertThatThrownBy { svc.createCatalog("Bad_Name", "s3://bucket/x") }
             .isInstanceOf(HoglakeException.Validation::class.java)
@@ -98,11 +110,16 @@ class CatalogServiceIntegrationTest {
     }
 
     @Test
-    fun `duplicate namespace conflicts`() {
+    fun `duplicate namespace create is an idempotent no-op`() {
         svc.createCatalog("ns-dup-cat", "s3://bucket/nd")
-        svc.createNamespace("ns-dup-cat", "ns")
-        assertThatThrownBy { svc.createNamespace("ns-dup-cat", "ns") }
-            .isInstanceOf(HoglakeException.AlreadyExists::class.java)
+        val ns = svc.createNamespace("ns-dup-cat", "ns")
+        // A namespace's whole definition is its name, so the repeat
+        // create is always the identical one: the existing row, no
+        // snapshot allocated.
+        val again = svc.createNamespaceOutcome("ns-dup-cat", "ns")
+        assertThat(again.created).isFalse()
+        assertThat(again.value).isEqualTo(ns)
+        assertThat(svc.getCatalog("ns-dup-cat").headSnapshotId).isEqualTo(1)
     }
 
     // ---- tables ----------------------------------------------------------
@@ -165,12 +182,20 @@ class CatalogServiceIntegrationTest {
     }
 
     @Test
-    fun `duplicate table name in a namespace conflicts, other namespace does not`() {
+    fun `duplicate table name in a namespace - identical definition is a no-op, different conflicts`() {
         svc.createCatalog("tbl-dup-cat", "s3://bucket/td")
         svc.createNamespace("tbl-dup-cat", "ns1")
         svc.createNamespace("tbl-dup-cat", "ns2")
-        svc.createTable("tbl-dup-cat", "ns1", "t", listOf(idCol))
-        assertThatThrownBy { svc.createTable("tbl-dup-cat", "ns1", "t", listOf(idCol)) }
+        val t = svc.createTable("tbl-dup-cat", "ns1", "t", listOf(idCol))
+        // Identical definition: the existing table, no snapshot allocated.
+        val head = svc.getCatalog("tbl-dup-cat").headSnapshotId
+        val again = svc.createTableOutcome("tbl-dup-cat", "ns1", "t", listOf(idCol))
+        assertThat(again.created).isFalse()
+        assertThat(again.value.tableUuid).isEqualTo(t.tableUuid)
+        assertThat(again.value.columns).isEqualTo(t.columns)
+        assertThat(svc.getCatalog("tbl-dup-cat").headSnapshotId).isEqualTo(head)
+        // A DIFFERENT definition keeps the conflict.
+        assertThatThrownBy { svc.createTable("tbl-dup-cat", "ns1", "t", listOf(idCol, nameCol)) }
             .isInstanceOf(HoglakeException.AlreadyExists::class.java)
         // Same name in a different namespace is fine.
         val other = svc.createTable("tbl-dup-cat", "ns2", "t", listOf(idCol))
