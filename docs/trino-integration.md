@@ -395,13 +395,24 @@ pyhoglake declares a layout too, with `variant.variant_field` in a `create_table
 schema or `ops.add_column(..., "variant", shredding=...)`, and checks it locally
 against the same rules (a shared vector file keeps its copy of them in step with
 the server's), leaving to the server the few case collisions it cannot decide as
-the JDK does (around `Σ`, or past its Unicode data). It writes no VARIANT values
-from Arrow, so it honours no declaration yet, and it reads a stored declaration
-as an ordinary `type_params` map; the console does not show `type_params`. DuckDB
-clients refuse VARIANT at bind (#87) and read only decimal parameters. Hedgerow
-compares `type_params` exactly, so it refuses a destination variant that has a
-declaration as a schema mismatch; it writes through DuckDB, which honours no
-declaration. Compaction still skips every table with a VARIANT column (#70).
+the JDK does (around `Σ`, or past its Unicode data). It writes VARIANT values
+from Arrow (`Table.append`, `Table.prepare_append_tables`) and honours the
+declaration, writing the connector's layout for it: JSON text encoded with exact
+numbers and the connector's same-class shredding rule, the group annotated
+VARIANT(1) and each file's layout checked against the declaration before upload.
+A read-back of those files through the connector is not yet in the harness. It
+reads a stored declaration as an ordinary `type_params` map; the console does not
+show `type_params`. DuckDB clients refuse VARIANT at bind (#87) and read only
+decimal parameters. Hedgerow compares `type_params` exactly, so it refuses a
+destination variant that has a declaration as a schema mismatch; it writes
+through DuckDB, which honours no declaration. Compaction skips every table with a
+VARIANT column (#70) unless the server sets `HOGLAKE_COMPACTION_VARIANT`. With it,
+compaction copies each VARIANT's storage as it is, in the layout the declaration
+gives it (the connector's, and pyhoglake's), and skips a group holding a file in
+any other layout, or one DuckDB wrote: the connector reads a DuckDB file's top-level
+Variant null as SQL NULL by its `created_by`, which a compacted file does not keep.
+A read-back of compacted variant files (parquet-mr's `created_by`, `TIME_MICROS`
+beside time leaves) through the connector is not yet in the harness either.
 
 ### Reclaiming abandoned Trino uploads
 

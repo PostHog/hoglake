@@ -9,14 +9,14 @@ from __future__ import annotations
 
 import contextlib
 import importlib.metadata
-import io
 import logging
+import threading
 import time
 import uuid as _uuid
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Self
+from typing import Any, Literal, Self
 from urllib.parse import quote
 
 import httpx
@@ -82,9 +82,9 @@ from .parquet_schema import (
     prepared_schema_matches,
     validate_variant_file,
 )
-from .stats import extract_column_stats
 from .transforms import partition_source_array, transform_strings
 from .types import (
+    _is_variant_storage,
     column_def_field_ids,
     columns_to_arrow_schema,
     is_list_family,
@@ -97,6 +97,16 @@ from .upload import (
     run_uploads,
     s3_key,
     widen_io_threads_for,
+)
+from .variant import VariantReport, _is_json_type
+from .writer import (
+    PreparedPart,
+    _check_variant_on_invalid,
+    _check_variant_values,
+    _registration,
+    _stored_schema,
+    _variant_columns,
+    write_part,
 )
 
 DEFAULT_TIMEOUT = 30.0
@@ -363,6 +373,11 @@ def _reserved_field_paths(fields: object, prefix: str = "") -> list[str]:
         if f.name.startswith(_RESERVED_COLUMN_PREFIX):
             out.append(path)
         t = f.type
+        if pa.types.is_struct(t) and _is_variant_storage(t):
+            # A variant column's storage: the names below its top are the
+            # keys of its values (typed_value's fields), user data the
+            # catalog never sees as columns. Its own name was checked above.
+            continue
         if pa.types.is_struct(t):
             out += _reserved_field_paths(
                 [t.field(i) for i in range(t.num_fields)], path
@@ -875,6 +890,8 @@ class Catalog:
         self._retention_cache: float | None = None
         # ...and, when the read FAILS, one per _RETENTION_RETRY_SECONDS.
         self._retention_failed_at: float | None = None
+        # ...however many threads ask at once.
+        self._retention_lock = threading.Lock()
 
     # -- identity ----------------------------------------------------------
 
@@ -1233,8 +1250,25 @@ class Catalog:
         round trip this whole path exists to remove, in the one situation
         where nobody is watching. Bounded at one read a minute, the
         assumption costs nothing and still heals within a minute.
+
+        Thread-safe: one Catalog is shared by every flusher thread a
+        writer runs (millrace's pool and its default executor), so the
+        check and the fetch are one critical section, or N threads
+        arriving at an empty cache issue N options GETs. The lock is held
+        across the GET on purpose: the threads behind it want that answer,
+        not one of their own. So a transport failure (a timeout, a refused
+        connection) is remembered like a 5xx: were it to escape unrecorded,
+        each queued thread would make its own GET in turn, and the k-th
+        would wait k timeouts. For the same reason the failure is stamped
+        when the read fails, not when it began: a read slower than the
+        window would otherwise leave it already expired for the queue. The
+        value is returned from a local, because set_retention, drop and the
+        410 path clear the cache without the lock.
         """
-        if self._retention_cache is None:
+        with self._retention_lock:
+            cached = self._retention_cache
+            if cached is not None:
+                return cached
             now = time.monotonic()
             if (
                 self._retention_failed_at is not None
@@ -1243,12 +1277,16 @@ class Catalog:
                 return _ASSUMED_RETENTION_SECONDS
             try:
                 seconds = self.options().snapshot_retention_seconds
-            except HoglakeError:
-                self._retention_failed_at = now
+            except (HoglakeError, httpx.HTTPError):
+                # Stamped at the failure, not at `now`: a read that took
+                # longer than the window to fail would otherwise leave it
+                # already expired for every thread queued behind it.
+                self._retention_failed_at = time.monotonic()
                 return _ASSUMED_RETENTION_SECONDS
             self._retention_failed_at = None
-            self._retention_cache = float("inf") if seconds is None else float(seconds)
-        return self._retention_cache
+            cached = float("inf") if seconds is None else float(seconds)
+            self._retention_cache = cached
+            return cached
 
 
 class Namespace:
@@ -1787,6 +1825,8 @@ class Table:
         row_group_size: int | None = None,
         compression: str | None = None,
         compression_level: int | None = None,
+        variant_on_invalid: Literal["raise", "null"] = "raise",
+        variant_report: VariantReport | None = None,
     ) -> AppendResult:
         """Write ``data`` to the catalog's data path and register it via a
         footer-shipping commit: one parquet file for an unpartitioned
@@ -1844,6 +1884,27 @@ class Table:
         Pass ``expected_table_uuid=pyhoglake.UNGUARDED`` to opt out: no
         pre-flight uuid check, and the commit carries no
         ``expected_table_uuid`` field (name-only resolution).
+
+        **VARIANT columns.** A top-level ``variant`` column is given as
+        ``pa.json_()`` text, the null type (all SQL NULL), or its storage in
+        the write form of its declaration
+        (``columns_to_arrow_schema(columns, variant="storage")``); a plain
+        string is refused, since it makes no claim to be JSON. The JSON is
+        encoded after the partition split, one group at a time, as
+        :func:`pyhoglake.variant.encode_json` encodes it, and each group is
+        written by ``parquet_schema.write_variant_parquet`` with the same
+        codec options. Every group is encoded and written before the first
+        upload, so the files of a partitioned append are in memory at once.
+        Pre-encoded storage is checked by structure, not byte by byte: call
+        :func:`pyhoglake.variant.verify` first to check the bytes.
+        ``variant_on_invalid="null"`` writes a row that cannot be encoded as
+        SQL NULL instead of raising :class:`VariantEncodingError`, and is
+        refused when the table has a NOT NULL variant column; SQL NULL into a
+        NOT NULL variant column is always refused, naming its row in
+        ``data``. ``variant_report``, when given, has each group's counts
+        added to it; the row of an invalid value, in it or in an error, is
+        the row's in its partition group. A variant column has no
+        ``column_stats``.
         """
         catalog = self._namespace._catalog
         client = catalog._client
@@ -1853,6 +1914,7 @@ class Table:
         # table and waste the S3 write.
         _check_reserved_columns(data.schema)
         write_options = parquet_write_options(compression, compression_level)
+        _check_variant_on_invalid(variant_on_invalid)
 
         if expected_table_uuid is UNGUARDED:
             expected = None
@@ -1931,8 +1993,14 @@ class Table:
                 else self._namespace._catalog.refresh().head_snapshot_id
             )
 
-        target_schema = columns_to_arrow_schema(info.columns)
-        data = _align_table(data, target_schema)
+        variants = _variant_columns(info.columns, variant_on_invalid)
+        target_schema = columns_to_arrow_schema(info.columns, variant="json")
+        for column in variants:
+            if column.name in data.schema.names:  # else _align_table names it
+                _check_variant_values(column, data.column(column.name))
+        data = _align_table(
+            data, target_schema, uncast=frozenset(column.name for column in variants)
+        )
 
         groups: Sequence[tuple[tuple[str | None, ...] | None, pa.Table]]
         spec = info.partition_spec
@@ -1948,17 +2016,34 @@ class Table:
         else:
             groups = [(None, data)]
 
+        def write(part: pa.Table) -> PreparedPart:
+            return write_part(
+                part,
+                info.columns,
+                write_options=write_options,
+                row_group_size=row_group_size,
+                variant_on_invalid=variant_on_invalid,
+                variant_report=variant_report,
+            )
+
+        tables = [part for _, part in groups]
+        # With variant columns every group is encoded and written before the
+        # first upload, as on the prepared path: an invalid row in the last
+        # partition must not leave the files of the ones before it orphaned.
+        # Without, each file is written as its upload comes, as it always was.
+        parts: Iterable[PreparedPart] = (
+            [write(part) for part in tables] if variants else map(write, tables)
+        )
+
         file_regs: list[dict[str, Any]] = []
         appended: list[AppendedFile] = []
-        for partition_values, part in groups:
-            reg = _write_one_file(
-                part,
+        for (partition_values, _), prepared in zip(groups, parts, strict=True):
+            reg = _upload_one_file(
+                prepared,
                 info,
                 catalog,
                 client,
                 deferred_stats=deferred_stats,
-                row_group_size=row_group_size,
-                write_options=write_options,
                 partition_values=partition_values,
             )
             file_regs.append(reg)
@@ -2117,6 +2202,8 @@ class Table:
         compression: str | None = None,
         compression_level: int | None = None,
         deferred_stats: bool = False,
+        variant_on_invalid: Literal["raise", "null"] = "raise",
+        variant_report: VariantReport | None = None,
     ) -> dict[str, Any]:
         """:meth:`prepare_append_files` without the disk: encode each
         already-partitioned Arrow table straight to a parquet buffer,
@@ -2187,10 +2274,17 @@ class Table:
         pods. Nothing is held twice, though — there is no temp file, and
         the upload reads the buffer it was handed.
 
-        Destinations with ``variant`` columns are refused: an Arrow
-        rewrite drops the native Parquet VARIANT annotation, so those
-        files have to come from a variant-aware writer through
-        :meth:`prepare_append_files`.
+        **VARIANT columns** are taken as :meth:`append` takes them, and
+        ``variant_on_invalid`` and ``variant_report`` are its: each group's
+        JSON is encoded on its own and the group written by
+        ``parquet_schema.write_variant_parquet``, with the same codec
+        options. A variant column's field carries the destination's field
+        id and nullability like any other
+        (``columns_to_arrow_schema(table.columns, variant="json")`` builds
+        a schema for JSON text); one that does not is refused before the
+        write (``cannot write VARIANT columns: ...``). The comparison above
+        then runs over the whole written file, each variant field in its
+        read form, with the same error.
         """
         return self._prepare_append(
             groups,
@@ -2203,6 +2297,8 @@ class Table:
             compression=compression,
             compression_level=compression_level,
             deferred_stats=deferred_stats,
+            variant_on_invalid=variant_on_invalid,
+            variant_report=variant_report,
         )
 
     def _prepare_append(
@@ -2218,6 +2314,8 @@ class Table:
         compression: str | None = None,
         compression_level: int | None = None,
         deferred_stats: bool = False,
+        variant_on_invalid: Literal["raise", "null"] = "raise",
+        variant_report: VariantReport | None = None,
     ) -> dict[str, Any]:
         """The prepared-append path both public entry points are: resolve,
         validate every group, upload them all, build the commit request.
@@ -2240,6 +2338,7 @@ class Table:
             # request. Only the Arrow-table path encodes; a prepared
             # file's codec is whatever its writer chose.
             write_options = parquet_write_options(compression, compression_level)
+            _check_variant_on_invalid(variant_on_invalid)
             catalog = self._namespace._catalog
             client = catalog._client
             expected = expected_table_uuid or self.table_uuid
@@ -2270,27 +2369,12 @@ class Table:
                     "prepared append destination layout changed", status_code=None
                 )
             has_variant = any(c.type == "variant" for c in info.columns)
-            if has_variant and from_tables:
-                raise ValidationError(
-                    "cannot prepare Arrow tables for a destination with variant "
-                    "columns: an Arrow rewrite loses the native Parquet VARIANT "
-                    "annotation — use prepare_append_files with files a "
-                    "variant-aware writer produced",
-                    status_code=None,
+            # Without the variant columns: a prepared file's are checked by
+            # validate_variant_file. An Arrow table's are write_part's.
+            schema = _stored_schema(
+                columns_to_arrow_schema(
+                    tuple(c for c in info.columns if c.type != "variant")
                 )
-            schema = columns_to_arrow_schema(
-                tuple(c for c in info.columns if c.type != "variant")
-            )
-            # Parquet has no seconds timestamp unit: our writer stores timestamp_s
-            # as milliseconds. Preserve all field IDs/nullability/metadata checks.
-            schema = pa.schema(
-                [
-                    field.with_type(pa.timestamp("ms"))
-                    if field.type == pa.timestamp("s")
-                    else field
-                    for field in schema
-                ],
-                metadata=schema.metadata,
             )
             # Resolved before any encode or footer read so a bad
             # setting costs nothing. The object-store clients are NOT
@@ -2301,17 +2385,23 @@ class Table:
             registrations = []
             uploads: list[Upload] = []
             for index, (source, partition) in enumerate(groups):
-                part = (
-                    _encode_group(source, schema, write_options)
-                    if from_tables
-                    else _describe_prepared_file(
+                part: _PreparedFile | PreparedPart
+                if not from_tables:
+                    part = _describe_prepared_file(
                         source,
                         info,
                         schema,
                         has_variant=has_variant,
                         allow_optional_fields=allow_optional_fields,
                     )
-                )
+                else:
+                    part = write_part(
+                        source,
+                        info.columns,
+                        write_options=write_options,
+                        variant_on_invalid=variant_on_invalid,
+                        variant_report=variant_report,
+                    )
                 arity = len(info.partition_spec.fields) if info.partition_spec else 0
                 if (arity and (partition is None or len(partition) != arity)) or (
                     not arity and partition is not None
@@ -2326,26 +2416,15 @@ class Table:
                     )
                 uri = f"{catalog.data_path.rstrip('/')}/data/{info.namespace}/{info.name}/{idempotency_key}/{_uuid.uuid4()}-{index}.parquet"
                 uploads.append(
-                    Upload(uri=uri, size=part.size, body=part.body, path=part.path)
+                    Upload(uri=uri, size=part.size, path=part.path)
+                    if isinstance(part, _PreparedFile)
+                    else Upload(uri=uri, size=part.size, body=part.body)
                 )
-                reg: dict[str, Any] = {
-                    "path": uri,
-                    "record_count": part.metadata.num_rows,
-                    "file_size_bytes": part.size,
-                    "footer_size": part.footer_size,
-                }
-                # Omitted, not empty: an absent key is what the server
-                # registers 'pending' for the hydrator; `[]` would be
-                # 'provided' with no stats, forever. Same rule as
-                # _write_one_file.
-                if not deferred_stats:
-                    reg["column_stats"] = [
-                        stat.to_wire()
-                        for stat in extract_column_stats(part.metadata, info.columns)
-                    ]
-                if partition is not None:
-                    reg["partition_values"] = list(partition)
-                registrations.append(reg)
+                registrations.append(
+                    _registration(
+                        part, uri, info.columns, not deferred_stats, partition
+                    )
+                )
             if not registrations:
                 raise ValidationError(
                     "prepared append must contain files", status_code=None
@@ -2574,9 +2653,19 @@ def _nested_field_mismatch(
     return missing, extra
 
 
-def _align_table(data: pa.Table, target: pa.Schema) -> pa.Table:
+def _align_table(
+    data: pa.Table, target: pa.Schema, uncast: frozenset[str] = frozenset()
+) -> pa.Table:
     """Reorder ``data`` to the catalog column order and cast to the target
     schema (which carries the field-id metadata).
+
+    The ``uncast`` columns (variant columns) keep their type and take only
+    the target's name, field id and nullability: their values are JSON
+    text, nulls or storage, each encoded or written as it is, and a cast
+    would refuse storage's nulls below the top, or SQL NULL into a NOT NULL
+    column, with a pyarrow error before the checks that name them. Only
+    JSON over string_view changes, to JSON over large_string, so the
+    partition split can take its rows.
 
     The name comparison is RECURSIVE. At top level a missing or unknown
     column has always been a refusal; below it, ``cast`` quietly
@@ -2618,112 +2707,85 @@ def _align_table(data: pa.Table, target: pa.Schema) -> pa.Table:
             status_code=None,
         )
     data = data.select(want)
-    return data.cast(target)
+    if not uncast:
+        return data.cast(target)
+    others = [name for name in want if name not in uncast]
+    cast = data.select(others).cast(pa.schema([target.field(n) for n in others]))
+    kept = {name: _json_off_string_view(data.column(name)) for name in uncast}
+    return pa.table(
+        [kept[name] if name in uncast else cast.column(name) for name in want],
+        schema=pa.schema(
+            [
+                target.field(name).with_type(kept[name].type)
+                if name in uncast
+                else target.field(name)
+                for name in want
+            ],
+            metadata=target.metadata,
+        ),
+    )
 
 
-def _write_one_file(
-    part: pa.Table,
+def _json_off_string_view(values: pa.ChunkedArray) -> pa.ChunkedArray:
+    """JSON over string_view as JSON over large_string, and anything else
+    as it is. pyarrow has no take kernel for string_view, so the partition
+    split's filter would refuse the column with an ArrowNotImplementedError;
+    a cast between json types is refused too, so the storage is cast."""
+    if not (
+        _is_json_type(values.type) and pa.types.is_string_view(values.type.storage_type)
+    ):
+        return values
+    kind = pa.json_(pa.large_string())
+    return pa.chunked_array(
+        [
+            pa.ExtensionArray.from_storage(kind, chunk.storage.cast(pa.large_string()))
+            for chunk in values.chunks
+        ],
+        kind,
+    )
+
+
+def _upload_one_file(
+    part: PreparedPart,
     info: TableInfo,
     catalog: Catalog,
     client: HoglakeClient,
     *,
     deferred_stats: bool,
-    row_group_size: int | None,
-    write_options: dict[str, Any],
     partition_values: tuple[str | None, ...] | None,
 ) -> dict[str, Any]:
-    """THE single-file writer path: serialize ``part`` to parquet (field
-    ids already on the schema), upload it under the catalog's data path,
-    and build its FileRegistration wire dict — unchanged conventions
-    (footer stats from the writer's own metadata, exact ``footer_size``),
-    plus ``partition_values`` when the table is partitioned.
-
-    ``write_options`` comes from ``parquet_write_options``; empty means
-    pyarrow's default codec, SNAPPY."""
-    sink = io.BytesIO()
-    options = dict(write_options)
-    if row_group_size is not None:
-        options["row_group_size"] = row_group_size
-    pq.write_table(part, sink, **options)
-    raw = sink.getvalue()
-    metadata = pq.read_metadata(io.BytesIO(raw))
-
-    column_stats = None
-    if not deferred_stats:
-        column_stats = extract_column_stats(metadata, info.columns)
-
+    """``Table.append``'s half of one file: upload the part
+    :func:`~pyhoglake.writer.write_part` wrote under the catalog's data
+    path, and return its FileRegistration wire dict."""
     data_path = catalog.data_path
     if not data_path.endswith("/"):
         data_path += "/"
     file_uri = f"{data_path}data/{info.namespace}/{info.name}/{_uuid.uuid4()}.parquet"
-    _upload(client._filesystem(), file_uri, raw)
-
-    file_reg: dict[str, Any] = {
-        "path": file_uri,
-        "record_count": metadata.num_rows,
-        "file_size_bytes": len(raw),
-        "footer_size": _footer_size(raw),
-    }
-    if column_stats is not None:
-        file_reg["column_stats"] = [s.to_wire() for s in column_stats]
-    if partition_values is not None:
-        file_reg["partition_values"] = list(partition_values)
-    return file_reg
+    # Stats before the upload, as before the core: a file whose stats fail
+    # is refused without leaving an object behind.
+    reg = part.registration(
+        file_uri,
+        info.columns,
+        stats=not deferred_stats,
+        partition_values=partition_values,
+    )
+    _upload(client._filesystem(), file_uri, part.body)
+    return reg
 
 
 @dataclass(frozen=True)
-class _PreparedPart:
-    """One prepared group, measured and validated, ready to register.
-
-    ``metadata`` is the parquet footer the registration's ``record_count``
-    and ``column_stats`` come from; ``size`` and ``footer_size`` are the
-    wire fields the server's tail read depends on. Exactly one of ``body``
-    (an in-memory buffer this process encoded) and ``path`` (a file the
-    caller wrote, still unread) says where the bytes are.
+class _PreparedFile:
+    """One prepared file, measured and validated, ready to register: the
+    parquet footer the registration's ``record_count`` and ``column_stats``
+    come from, and ``size`` and ``footer_size``, the wire fields the
+    server's tail read depends on. The bytes stay at ``path``, the file
+    the caller wrote, until its upload reads them.
     """
 
     metadata: Any
     size: int
     footer_size: int
-    body: Any | None = None
-    path: str | None = None
-
-
-def _encode_group(
-    data: pa.Table, schema: pa.Schema, write_options: dict[str, Any]
-) -> _PreparedPart:
-    """Encode one group's parquet into a buffer — never to disk — and read
-    back everything the registration needs out of that same buffer.
-
-    The schema check is the prepared-FILE check, run on the ENCODED
-    footer rather than on the caller's Arrow schema: same helper, same
-    error text, so a table that would have been refused as a file is
-    refused here, and conversions the writer performs (timestamp_s stored
-    as milliseconds) are compared as written rather than as intended.
-
-    ``write_options`` comes from ``parquet_write_options``; empty means
-    pyarrow's default codec, SNAPPY.
-    """
-    sink = pa.BufferOutputStream()
-    pq.write_table(data, sink, **write_options)
-    raw = sink.getvalue()
-    with pq.ParquetFile(pa.BufferReader(raw)) as parquet:
-        if not prepared_schema_matches(parquet.schema_arrow, schema):
-            raise ValidationError(
-                "prepared Parquet schema/field IDs differ from destination",
-                status_code=None,
-            )
-        metadata = parquet.metadata
-    # Only the 8-byte trailer is copied out of the buffer, so the one
-    # definition of the footer_size wire convention keeps its bytes
-    # signature and stays shared with the file path and the VARIANT writer;
-    # it lives in parquet_schema (_footer_size).
-    return _PreparedPart(
-        metadata=metadata,
-        size=raw.size,
-        footer_size=_footer_size(bytes(raw[-8:])),
-        body=raw,
-    )
+    path: str
 
 
 def _describe_prepared_file(
@@ -2733,7 +2795,7 @@ def _describe_prepared_file(
     *,
     has_variant: bool,
     allow_optional_fields: bool,
-) -> _PreparedPart:
+) -> _PreparedFile:
     """Validate and measure one prepared file WITHOUT reading its data:
     the footer for schema and stats, the 8-byte trailer for
     ``footer_size``, the file length for ``file_size_bytes``.
@@ -2756,7 +2818,7 @@ def _describe_prepared_file(
         size = source.tell()
         source.seek(-8, 2)
         trailer = source.read(8)
-    return _PreparedPart(
+    return _PreparedFile(
         metadata=metadata,
         size=size,
         footer_size=_footer_size(trailer),
@@ -2848,7 +2910,7 @@ def _partition_groups(
     return out
 
 
-def _upload(fs, uri: str, raw: bytes) -> None:
+def _upload(fs, uri: str, raw: bytes | pa.Buffer) -> None:
     """``Table.append``'s upload: pyarrow's streaming multipart write,
     unchanged.
 

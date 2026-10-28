@@ -1833,6 +1833,36 @@ wrote the file. The axis separating the last two is DURABILITY AND
 FAULT, not values-versus-schema: an `invalid_data` group is re-planned
 and re-refused every sweep, because nothing about it will change.
 
+**VARIANT tables** compact only with `HOGLAKE_COMPACTION_VARIANT=true`
+(default **false**), in the catalogs `HOGLAKE_COMPACTION_VARIANT_CATALOGS`
+names (comma-separated; empty means all). The rewrite copies each
+variant's storage leaf by leaf as plain Parquet groups, never through
+parquet-java's Variant reader (hoglake#70), into the layout the column's
+`type_params.shredding` declares (`compaction/VariantLayout.kt`, pinned
+to pyhoglake's by `pyhoglake/tests/vectors/variant_layout_vectors.json`).
+The copy is positional, so a group holding a file in any other layout,
+or one DuckDB wrote (Trino reads its top-level Variant nulls as SQL NULL
+by `created_by`), is refused as `unconvertible_schema` and also counted
+in `hoglake_compaction_variant_layout_mismatch_total{catalog,
+reason="layout"|"duckdb"}`. Such a group is refused again every sweep
+until its files change, and each refusal spends one of the sweep's
+`HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN` slots after rewriting every input
+ahead of the refused one (an input is checked when the rewrite reaches
+it, and the partial output is discarded); tables plan in name order, so
+refused groups can starve the catalog's other tables. Enable the flag
+only for catalogs whose variant tables pyhoglake or the Trino connector
+write (the allowlist), not one holding DuckDB-written variant files
+(hedgerow). A group refused at a variant column of a DuckDB-written
+input counts as `duckdb`, whatever that column's layout. The warning
+logged with each refusal names the table, column and input file: a
+`layout` refusal of a
+file that pyhoglake's `Table.append` or `prepare_append_tables` or the
+connector wrote means the layout port has drifted, and the flag should
+go off; one of a file registered from another writer
+(`prepare_append_files`) is just another layout. A variant's chunk in
+the sorted rewrite is sized by its layout's Parquet nodes, not as one
+catalog node.
+
 Each table's candidate list is fixed before rewriting starts, so an
 output cannot feed another group in the **same run**. Input bytes only
 estimate the output size: encoding, schema changes and DV removal all
@@ -2393,6 +2423,11 @@ just run
 requires.) When the server runs in a container instead, use
 `http://host.docker.internal:9000` — or `http://minio:9000` with the
 container attached to the compose network — as the endpoint.
+
+pyhoglake's `test_compaction_copies_a_declared_variant_table` needs
+`HOGLAKE_COMPACTION_VARIANT=true` on the server it runs against; it
+fails, not skips, without it. `ci/live-python.sh` sets it; a dev server
+must set it by hand.
 
 
 ## Layout

@@ -18,6 +18,7 @@ topic → one table.
 | ``MILLRACE_TABLE_COLUMNS`` | none | ``name:type,…`` for creating a missing table (complete; no schema evolution) |
 | ``MILLRACE_PARTITION_BY`` | none | partition spec for creating the table: ``col``, ``identity(col)``, ``year/month/day/hour(col)``, ``bucket(col, N)`` |
 | ``MILLRACE_SORT_BY`` | none | sort order for creating the table: ``col [asc|desc] [nulls_first|nulls_last]``, … |
+| ``MILLRACE_VARIANT_SOURCES`` | none | ``column=payload_key,…``: each top-level variant column of the live table filled from the JSON text at that payload key; an unlisted (nullable) variant column is written as SQL NULL |
 | ``MILLRACE_STAGE_URL`` | required | staging root (``s3://bucket/prefix``, ``file:///path``, ``memory:///``); one SlateDB per replica (its home stage) at ``<root>/<topic>/<slot>``, the slot of its smallest claimed partition |
 | ``MILLRACE_FLUSH_BYTES`` | 268435456 (256 MiB) | staged bytes per flush decision: the size lane fires at it and a scan reads at most it (always at least one row) |
 | ``MILLRACE_FLUSH_DEADLINE_S`` | 900 | age lane: a group at least this old with at least 1 MiB staged flushes |
@@ -242,6 +243,9 @@ class Config:
     table_columns: tuple[ColumnSpec, ...] | None = None
     partition_by: tuple[PartitionFieldSpec, ...] | None = None
     sort_by: tuple[SortFieldSpec, ...] | None = None
+    #: ``(column, payload key)`` per mapped variant column, checked against
+    #: the live catalog by the flusher at startup.
+    variant_sources: tuple[tuple[str, str], ...] = ()
     # -- constants --
     #: The age lane's minimum staged bytes.
     min_flush_bytes: int = MIN_FLUSH_BYTES_DEFAULT
@@ -526,9 +530,9 @@ def _parse_column_type(
     """A hoglake type name, with ``decimal(p,s)``'s parameters, as
     ``coltype_to_arrow`` will accept it. Nested containers and
     ``variant`` are refused here: the grammar cannot express a
-    container's children, and millrace cannot write a variant column
-    (coerce.py) — a column it could never stage is not a column to
-    create."""
+    container's children, nor a variant's shredding declaration, which
+    an operator gives when adding the column with pyhoglake; millrace
+    then fills it through ``MILLRACE_VARIANT_SOURCES``."""
     type_name = type_raw.lower()
     params: tuple[tuple[str, int], ...] = ()
     if "<" in type_name or ">" in type_name:
@@ -568,8 +572,9 @@ def _parse_column_type(
         return None
     if type_name == "variant":
         problems.append(
-            f"MILLRACE_TABLE_COLUMNS entry {entry!r}: millrace cannot write a "
-            f"variant column (pyarrow has no native Parquet VARIANT writer)"
+            f"MILLRACE_TABLE_COLUMNS entry {entry!r}: millrace does not create "
+            f"variant columns; add one with pyhoglake (ops.add_column(name, "
+            f"'variant', shredding=...)) and map it in MILLRACE_VARIANT_SOURCES"
         )
         return None
     try:
@@ -635,6 +640,42 @@ def _parse_table_columns(
             ok = False
             continue
         out.append(ColumnSpec(name, parsed[0], parsed[1]))
+    return tuple(out) if ok else None
+
+
+def _parse_variant_sources(
+    raw: str, problems: list[str]
+) -> tuple[tuple[str, str], ...] | None:
+    """``MILLRACE_VARIANT_SOURCES``: ``column=payload_key,…`` (module
+    docstring). Whether each column is a top-level variant of the table
+    is the flusher's startup check, against the live catalog. Every
+    problem is recorded; None when any was."""
+    out: list[tuple[str, str]] = []
+    ok = True
+    for entry in (e.strip() for e in raw.split(",")):
+        if not entry:
+            continue
+        column, sep, key = (part.strip() for part in entry.partition("="))
+        if not sep or not column or not key:
+            problems.append(
+                f"MILLRACE_VARIANT_SOURCES entry {entry!r} is not "
+                f"column=payload_key (e.g. properties_sv=properties)"
+            )
+            ok = False
+        elif not _IDENTIFIER.match(column):
+            problems.append(
+                f"MILLRACE_VARIANT_SOURCES column {column!r} is not a valid "
+                f"hoglake identifier (must match [A-Za-z_][A-Za-z0-9_-]{{0,127}})"
+            )
+            ok = False
+        elif column in dict(out):
+            problems.append(f"MILLRACE_VARIANT_SOURCES column {column!r} is duplicated")
+            ok = False
+        else:
+            out.append((column, key))
+    if ok and not out:
+        problems.append("MILLRACE_VARIANT_SOURCES is set but contains no entries")
+        ok = False
     return tuple(out) if ok else None
 
 
@@ -789,7 +830,10 @@ def _check_fields_against_columns(
     given, every partition source and sort column names a configured
     column, and each transform is valid for its source's type (the
     check the server's ``set_partition_spec`` would make, made at boot
-    so the create cannot 422)."""
+    so the create cannot 422), and none is a variant: the server refuses
+    a variant partition or sort source (``AlterService.requireSourceField``)
+    and pyhoglake's ``check_transform`` takes identity of one, so it is
+    refused here by type, once, before any transform check."""
     by_name = {c.name: c for c in columns}
     for field in partition_by or ():
         column = by_name.get(field.column)
@@ -800,6 +844,12 @@ def _check_fields_against_columns(
                 f"(columns: {sorted(by_name)})"
             )
             continue
+        if column.col_type == "variant":
+            problems.append(
+                f"MILLRACE_PARTITION_BY {field.describe()}: {field.column!r} is a "
+                "variant column, which is no partition source"
+            )
+            continue
         try:
             check_transform(field.transform, column.col_type, field.param)
         except ValidationError as e:
@@ -808,10 +858,16 @@ def _check_fields_against_columns(
                 f"{field.column}:{column.col_type}: {e.message}"
             )
     for sort_field in sort_by or ():
-        if sort_field.column not in by_name:
+        sort_column = by_name.get(sort_field.column)
+        if sort_column is None:
             problems.append(
                 f"MILLRACE_SORT_BY column {sort_field.column!r} is not in "
                 f"MILLRACE_TABLE_COLUMNS (columns: {sorted(by_name)})"
+            )
+        elif sort_column.col_type == "variant":
+            problems.append(
+                f"MILLRACE_SORT_BY column {sort_field.column!r} is a variant "
+                "column, which is no sort source"
             )
 
 
@@ -897,6 +953,9 @@ def load_config(env: Mapping[str, str]) -> Config:
         sort_by = _parse_sort_by(raw, problems)
     if table_columns is not None:
         _check_fields_against_columns(table_columns, partition_by, sort_by, problems)
+    variant_sources: tuple[tuple[str, str], ...] | None = ()
+    if raw := env.get("MILLRACE_VARIANT_SOURCES", "").strip():
+        variant_sources = _parse_variant_sources(raw, problems)
 
     flush_bytes = _positive_int(
         env, "MILLRACE_FLUSH_BYTES", FLUSH_BYTES_DEFAULT, problems
@@ -944,6 +1003,7 @@ def load_config(env: Mapping[str, str]) -> Config:
     assert flush_bytes is not None
     assert flush_deadline_s is not None and slow_lane_deadline_s is not None
     assert metrics_port is not None
+    assert variant_sources is not None
     return Config(
         kafka_bootstrap_servers=bootstrap,
         kafka_topic=topic,
@@ -965,4 +1025,5 @@ def load_config(env: Mapping[str, str]) -> Config:
         table_columns=table_columns,
         partition_by=partition_by,
         sort_by=sort_by,
+        variant_sources=variant_sources,
     )

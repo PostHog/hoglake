@@ -221,6 +221,44 @@ class _PipelineCollector:
             "(the commit may have landed; never counted as orphans)",
             value=f.ambiguous_uploads,
         )
+        built = CounterMetricFamily(
+            "millrace_flush_build_seconds_total",
+            "Seconds the flush's group builds that returned a plan spent, by stage",
+            labels=["stage"],
+        )
+        for stage, seconds in f.build_seconds.items():
+            built.add_metric([stage], seconds)
+        yield built
+        variant_families = (
+            (
+                "millrace_variant_rows_total",
+                "Mapped variant column rows per build: encoded, sql_null, invalid",
+                ["column", "outcome"],
+                f.variant_rows,
+            ),
+            (
+                "millrace_variant_invalid_total",
+                "Mapped variant values written as SQL NULL as invalid, by reason",
+                ["column", "reason"],
+                f.variant_invalid,
+            ),
+            (
+                "millrace_variant_values_total",
+                "Mapped variant values per declared path: typed, fallback, variant_null",
+                ["column", "path", "outcome"],
+                f.variant_values,
+            ),
+        )
+        for name, doc, labels, counts in variant_families:
+            family = CounterMetricFamily(name, doc, labels=labels)
+            for key, count in sorted(counts.items()):
+                family.add_metric(list(key), count)
+            yield family
+        yield CounterMetricFamily(
+            "millrace_flush_build_queue_seconds_total",
+            "Seconds group builds waited for a millrace-hoglake pool thread",
+            value=f.build_queue_seconds,
+        )
         yield GaugeMetricFamily(
             "millrace_flush_groups_stuck",
             f"Groups currently at or past {STUCK_AFTER} consecutive flush failures (alert)",

@@ -148,10 +148,11 @@ for s in catalog.snapshots(before=head + 1):
 The Arrow writer path maps 26 of the catalog's 27 wire names, both
 directions. `variant` is the exception: Arrow has no VARIANT type, so a
 schema DECLARES one with `variant.variant_field` (see "variant columns:
-declaring a shredded layout" below), and the data arrives only through
-`Table.prepare_append_files` (see "Native VARIANT files" below). An
-Arrow type outside the table is rejected with an error listing the
-supported set.
+declaring a shredded layout" below), and its values are appended as
+JSON text, `pa.json_()` (see "Writing VARIANT" below), or as files
+another writer produced through `Table.prepare_append_files` (see
+"Native VARIANT files" below). An Arrow type outside the table is
+rejected with an error listing the supported set.
 
 | pyarrow | hoglake |
 |---|---|
@@ -170,7 +171,7 @@ supported set.
 | `decimal128(p, s)` | `decimal` (`type_params: {precision, scale}`) |
 | `pa.uuid()` or `binary(16)` (fixed) | `uuid` — 16 big-endian bytes, i.e. `uuid.UUID(...).bytes` |
 | `list` family / `struct` / `map` | `list` / `struct` / `map` — children validated recursively; an empty struct is refused, and so is a struct shaped like VARIANT storage (below) |
-| `variant.variant_field(name[, shredding])` — a `pa.json_()` field with a marker | `variant`, with `type_params.shredding` when declared — DDL only |
+| `variant.variant_field(name[, shredding])` — a `pa.json_()` field with a marker | `variant`, with `type_params.shredding` when declared; its values are appended as `pa.json_()` text (Writing VARIANT) |
 
 ### uuid columns: the wire form, and the two spellings
 
@@ -193,9 +194,10 @@ Both spellings are accepted everywhere on the way in:
   annotated **or** bare. A hoglake table holds both: compaction outputs
   have always been annotated, while files this client registered before
   the contract — and any writer below the pyarrow floor, or one that
-  simply does not annotate — carry the bare form. Nothing else about the
-  schema check is loosened, so a file with the right type and the wrong
-  `PARQUET:field_id` is refused exactly as before.
+  simply does not annotate — carry the bare form. Beyond this and a
+  map's synthetic names (see "Prepared appends" below), nothing about
+  the schema check is loosened, so a file with the right type and the
+  wrong `PARQUET:field_id` is refused exactly as before.
 - Reading, `arrow_type_to_coltype` maps both to `uuid`, and footer
   bounds are read from either (the bytes are unsigned-lexicographic in
   both).
@@ -203,12 +205,13 @@ Both spellings are accepted everywhere on the way in:
 ### variant columns: declaring a shredded layout
 
 A top-level `variant` column may declare in `type_params.shredding` the
-layout that writers which shred VARIANT values (the Trino connector)
-give it: which object fields and array elements get Parquet columns of
-their own, and the Variant type of each. Readers use each file's own
-layout, so a declaration changes no read, and it is fixed once the
-column exists — no alter op changes it, so a different layout is a new
-column. pyhoglake declares one in either DDL call:
+layout that writers which shred VARIANT values (the Trino connector, and
+pyhoglake's own write paths) give it: which object fields and array
+elements get Parquet columns of their own, and the Variant type of each.
+Readers use each file's own layout, so a declaration changes no read,
+and it is fixed once the column exists — no alter op changes it, so a
+different layout is a new column. pyhoglake declares one in either DDL
+call:
 
 ```python
 from pyhoglake import ops, variant
@@ -284,7 +287,7 @@ used to become a plain `struct` column without a word.
 
 Choose a declaration with the data's source in mind.
 `variant.json_unshreddable_paths(decl)` lists the leaves that values
-pyhoglake's writer will encode from JSON text (from 1.4) fill rarely or
+pyhoglake's writer will encode from JSON text (from 1.4.8) fill rarely or
 never: JSON has no temporal, binary, uuid or float values; an integer
 within the int64 range is an integer and never fills a `double` or
 `decimal` leaf, and a larger one fills only `decimal16` with scale 0
@@ -296,12 +299,10 @@ writer only.
 
 ### variant columns: encoding values
 
-`pyhoglake.variant` also holds a Variant codec at the Arrow level. **It is
-not wired into the write paths yet:** `Table.append` and
-`prepare_append_tables` still refuse a VARIANT column, and nothing here
-writes Parquet. What it gives is the storage a VARIANT column's Parquet
-group is written from, shredded as its declaration lays it out, and the
-reader of any such storage:
+`pyhoglake.variant` also holds a Variant codec at the Arrow level, which
+the write paths use (see "Writing VARIANT" below). What it gives is the
+storage a VARIANT column's Parquet group is written from, shredded as its
+declaration lays it out, and the reader of any such storage:
 
 ```python
 from decimal import Decimal
@@ -425,7 +426,7 @@ and
 | D10 | An object under an object declaration always has a `typed_value`; its residual holds only undeclared keys and is null when there are none. An array has `value` null and every element exactly one side set. A primitive has exactly one side. | The spec's writer rules. |
 | D11 | A column that declares nothing (`type_params` absent, `{}` or `{"shredding": null}`) or declares a root `variant` is unshredded: required `metadata` and required `value`. pyhoglake never shreds by itself. | The layout never depends on the data, and it is the only unshredded shape Trino reads. |
 | D12 | The writer uses exactly the declaration it is given. An unknown node type, or any fault in a catalog column's declaration, raises `UnsupportedShreddingError`, from the encoders and from a reader given the column; a `shredding=` the caller passes is checked as the server would, with its `ValidationError`. Storage built for another declaration is no form of this one (D15). | Fail closed on a newer grammar. |
-| D13 | No catalog statistics for a variant column or its leaves. | The server refuses them (applies from the write paths, 1.4). |
+| D13 | No catalog statistics for a variant column or its leaves. | The server refuses them (applies from the write paths, 1.4.8). |
 | D14 | Field ids belong to the group only; nothing inside the storage struct carries one. | The server's footer reader expects them there. |
 | D15 | decimal4/decimal8 leaves are `decimal32(p, s)`/`decimal64(p, s)` in Arrow, and in the file their unscaled int32/int64 with DECIMAL(p, s) in the footer; decimal16 is `decimal128(p, s)`. | Spec- and Trino-exact without touching other decimal columns. Each leaf's type names its precision and scale, so the storage says how to read itself, and declarations of different types never share storage; decimal4/8/16 of one (p, s) read back alike, holding the same values. |
 | D16 | uuid leaves are 16 big-endian bytes, as the Variant value is; strings that look like uuids stay strings. | |
@@ -445,14 +446,19 @@ CI).
 ### variant columns: the footer stamp
 
 `pyhoglake.parquet_schema.write_variant_parquet` writes a table whose
-variant columns are in their plans' write form as the Parquet file of
-their declarations. It is internal, not part of the public API, and **not
-wired into the write paths yet** (that is the next step): nothing in
-`Table.append` or `prepare_append_tables` calls it. It takes the codec
-options of `parquet_write_options(compression, compression_level)`, as
-the other write paths do, and refuses SQL NULL rows in a NOT NULL
-column, which pyarrow would write into the REQUIRED group as an invalid
-variant.
+variant columns hold their storage in their declarations' write form as
+the Parquet file of those declarations; each column's plan is derived
+from its own declaration. It is internal, not part of the public API:
+`write_part`, and through it `Table.append` and `prepare_append_tables`,
+calls it for each file. It
+takes the codec options of `parquet_write_options(compression,
+compression_level)`, as the other write paths do. A caller's mistake is a
+`ValueError` before anything is written: a variant field whose field id
+or nullability is not its column's, storage not in the write form, SQL
+NULL rows in a NOT NULL column (which pyarrow would write into the
+REQUIRED group as an invalid variant), and a null below the top that
+pyarrow would write as other bytes. A variant nested in a container is
+refused (`UnsupportedTypeError`).
 
 pyarrow cannot write the file the Trino connector reads: it writes a
 VARIANT group as the plain struct it is stored as, and a decimal4/decimal8
@@ -460,7 +466,9 @@ leaf, viewed as its unscaled int32/int64, as a plain INT32/INT64. So the
 writer views those leaves as integers (zero-copy), writes with
 `store_schema=False` (a stored Arrow schema would describe the plain
 struct, and pyarrow would read that back), and splices the annotations
-into the footer (`stamp_variant_footer`): 7 bytes of VARIANT(1) on each
+into the footer (`stamp_variant_footer`), in the buffer pyarrow wrote,
+with no whole-file join (at worst, one realloc as the slightly longer
+tail is written): 7 bytes of VARIANT(1) on each
 top-level variant group, 14 bytes of DECIMAL(p, s), converted and
 logical, on each decimal4/decimal8 leaf, each inserted before the
 element's STOP byte. The body is untouched, so every offset into it
@@ -494,6 +502,92 @@ and on the newest pyarrow as a canary that does not gate: if pyarrow
 starts writing VARIANT itself, or reads it back as an extension type
 rather than the plain struct, `test_variant_footer.py`'s canaries fail.
 
+### Writing VARIANT
+
+`Table.append` and `Table.prepare_append_tables` write a table with
+top-level `variant` columns. Each variant column's values come as one
+of:
+
+- JSON text, `pa.json_()` over any of its storage types: a schema made
+  with `variant.variant_field`, or
+  `columns_to_arrow_schema(table.columns, variant="json")` (which
+  carries the same marker, so it declares the same columns to
+  `create_table`), is one. A plain `pa.string()` is refused with a hint
+  to cast it to `pa.json_()`: a plain string makes no claim to be JSON.
+- the null type, `pa.nulls(n)`: every row SQL NULL.
+- storage already encoded (`variant.encode_json` / `encode_python`), in
+  the write form of the column's declaration,
+  `columns_to_arrow_schema(table.columns, variant="storage")`. It is
+  checked by structure (no null where its declaration has none), not byte
+  by byte: `variant.verify(storage, column)` decodes every row, at about
+  the encoder's cost, and is the caller's to run.
+
+Anything else is refused, naming these. The JSON is encoded after the
+partition split, one group at a time, so the encoder's output never goes
+through the split (storage encoded beforehand is split like any other
+column); each group is written by the writer core, `write_part` (see
+"Writer core" below), through `write_variant_parquet` with the codec
+options and `row_group_size` the other columns get. An ingester that owns
+its own uploads and commit writes VARIANT through `write_part` too. Every group is
+encoded and written before the first upload, so an invalid row orphans
+nothing, and the files of a partitioned `append` are in memory together,
+as `prepare_append_tables`' always were. A variant column registers no
+`column_stats` (D13); the other columns' stats come from the writer's
+own FileMetaData (the stamps touch none of them), and `footer_size` and
+`file_size_bytes` are measured on the stamped file. A table with no
+variant column is written exactly as before.
+
+```python
+from pyhoglake import VariantReport
+from pyhoglake.types import columns_to_arrow_schema
+
+schema = columns_to_arrow_schema(events.columns, variant="json")
+json = ['{"$browser": "Chrome", "price": 12.5}', "null", None]
+report = VariantReport()
+events.append(
+    pa.table(
+        {
+            "id": [1, 2, 3],
+            "properties": json,
+            "props_raw": ["1", '"a"', "[]"],
+            "extra": [None] * 3,
+        },
+        schema=schema,
+    ),
+    compression="zstd",
+    compression_level=3,
+    variant_on_invalid="null",  # default "raise"
+    variant_report=report,
+)
+report.sql_null_rows, report.invalid_by_reason  # (4, {})
+```
+
+`variant_on_invalid="raise"` (the default) raises `VariantEncodingError`
+at the first row that cannot be encoded (text that is not JSON, a
+duplicate key, NaN, Infinity or a number beyond the double range, an
+integer of more than 38 digits, a lone surrogate, nesting deeper than
+128), naming the column, the row in its partition group (in its group,
+for `prepare_append_tables`) and the path. `"null"` writes such a row as
+SQL NULL and counts it, and is refused when the table has a NOT NULL
+variant column. SQL NULL into a NOT NULL variant column is always
+refused, as a `VariantEncodingError` with reason `sql_null_in_not_null`
+naming the row in the table given, before anything is written.
+`variant_report`, when given, has every group's counts added to it
+(`rows`, `sql_null_rows`, `invalid_rows`, `invalid_by_reason`, and
+`typed` / `fallback` / `variant_null` per declared path), which says how
+well an immutable declaration fits the data. A variant nested in a
+struct, list or map is refused (`UnsupportedTypeError`): no writer
+shreds one (D17).
+
+Readers differ on these files. The layout is the Trino connector's, and
+the files are written for it to read; a read-back check through the
+connector is still to come. DuckDB's own Parquet reader (`read_parquet`)
+reads the files, but folds a Variant null (JSON `null`) into SQL NULL;
+the hoglake DuckDB extension refuses a variant table at bind (#87).
+polars cannot open a file with a VARIANT column. pyarrow reads the
+storage as a plain struct, which
+`variant.to_python(table.column(name), column)` turns back into values.
+
 ### Identifiers and reserved names
 
 Identifiers (namespace/table/view/column names) must match
@@ -505,9 +599,11 @@ Column names starting with `_hog` are additionally reserved for hoglake
 internals (`_hog_row_id` is compaction's row-id carrier) — the server
 422s them at create/add/rename, and the client fast-fails them at
 table-create and append time before any request or upload;
-namespace/table/view names are not affected. Deletion-vector positions
-are per-file **physical row ordinals** (0-based position within that
-parquet file), not row ids.
+namespace/table/view names are not affected. Below a variant column's
+own name the check stops: the fields of its storage are the keys of its
+values (a declared `_hog_x`), which are data, not columns.
+Deletion-vector positions are per-file **physical row ordinals**
+(0-based position within that parquet file), not row ids.
 
 ## Partitioned writes — client-side transforms, fanout appends
 
@@ -600,9 +696,23 @@ catalog.commit_prepared(request)  # idempotent: safe to retry
 `prepare_append_tables` encodes each group to a parquet buffer in memory
 — nothing to write, fsync, re-read for the footer and unlink — and
 produces the same registrations `prepare_append_files` produces for the
-same rows. Use `prepare_append_files` for files another writer produced
-(native VARIANT, `allow_optional_fields`); Arrow tables are refused for
-a VARIANT destination, because an Arrow rewrite loses the annotation.
+same rows, VARIANT columns included (see "Writing VARIANT": it writes
+them itself). Use `prepare_append_files` for files another writer
+produced, or when `allow_optional_fields` is needed.
+
+Both entry points check each file's schema against the catalog's
+(a VARIANT destination and `allow_optional_fields` validate their own
+way): names, nullability, types and `PARQUET:field_id`, at every depth.
+Two differences are allowed. One is a uuid column's two spellings (above).
+The other is a map's synthetic names: pyarrow reads the entries struct
+back named after the map's own field (the column, for a top-level map),
+and other writers rename the key and value too. The server binds a map's
+key and value by field id, not by name. A map whose key or value has a
+different field id, nullability or type is still refused. The footer's
+key-value metadata is compared too, both the schema's own and any a
+field carries beyond `PARQUET:field_id`. The catalog's schema has none,
+so a file whose writer stamps its own (pandas, Spark, parquet-mr) is
+refused.
 
 | | |
 |---|---|
@@ -622,6 +732,60 @@ logger naming the condition — so a process that configures logging hears
 about it, while the library itself only attaches a `NullHandler` and
 never writes to stderr uninvited. `single_request_uploads=False` is how
 to choose the streaming path deliberately, and it logs nothing.
+
+## Writer core — one file per group, your upload and commit
+
+`Table.append` and `prepare_append_tables` are built on one function,
+`pyhoglake.write_part`: one partition group's Arrow table in, one
+Parquet file ready to register out. An ingester that owns its own
+partition split, uploads, commit chunking and idempotency (millrace, for
+one) calls it per group and keeps all of that:
+
+```python
+from pyhoglake import parquet_write_options, write_part
+
+options = parquet_write_options("zstd", 3)  # validated once
+part = write_part(group, info.columns, write_options=options)
+uri = f"{data_path}/data/{info.namespace}/{info.name}/{build}/{index}.parquet"
+my_upload(uri, part.body)  # a pa.Buffer of part.size bytes
+registration = part.registration(
+    uri,
+    info.columns,
+    stats=part.size >= 32 * 1024 * 1024,  # False defers stats to the hydrator
+    partition_values=values,  # None for an unpartitioned table
+)
+```
+
+`write_part(table, columns, *, write_options, row_group_size=None,
+variant_on_invalid="raise", variant_report=None)` owns what makes the
+file the catalog's:
+
+- **The schema.** `table` holds the catalog columns in their order, with
+  their field ids and nullability (`columns_to_arrow_schema(columns)`, or
+  with `variant="json"` / `"storage"`). The footer of every file is read
+  back and compared with the destination's, as a prepared file is
+  ("Prepared appends" above).
+- **`timestamp_s`**, at any depth, given as seconds or as milliseconds:
+  Parquet has no seconds unit, and the file stores milliseconds.
+- **VARIANT**: JSON text, the null type or storage, encoded and written as
+  "Writing VARIANT" describes, with `variant_on_invalid` and
+  `variant_report`.
+- **The sizes**: `PreparedPart.size` and `footer_size` are measured on
+  `body`, and `metadata` is the writer's FileMetaData, which the
+  registration's `record_count` and `column_stats` come from.
+
+A refusal is raised before there is anything to upload: a
+`ValidationError` for a table that is not the destination's, a
+`VariantEncodingError` for a value that cannot be encoded, an
+`UnsupportedTypeError` for a destination whose variant column is nested in
+a struct, list or map, and pyarrow's own error for what pyarrow refuses (a
+null in a NOT NULL column).
+`registration(..., stats=False)` leaves `column_stats` out, never empty:
+the server registers the file `pending` for its hydrator, with the
+consequences the "Deferred stats" row under "Configuration" lists. For a table with no variant
+column, `write_part` writes `pq.write_table`'s bytes with the given
+options, byte for byte what `append` wrote before it was built on the
+core (`tests/data/writer_golden.json`).
 
 ## The append incarnation guard — atomic at commit
 
@@ -761,10 +925,17 @@ stats), and everything transactional happens server-side.
 Catalog columns may use `variant` (Iceberg v3). Publish native Parquet VARIANT(1)
 files with `Table.prepare_append_files` and the existing prepared-commit API.
 The client validates top-level field IDs, native annotations, scalar types and
-required-column null counts, then uploads the original bytes. Arrow `Table.append`
-does not construct VARIANT; an Arrow rewrite loses the annotation.
+required-column null counts, then uploads the original bytes. `Table.append` and
+`Table.prepare_append_tables` write VARIANT columns themselves from JSON text
+(see "Writing VARIANT"); a plain Arrow rewrite of another writer's file would
+lose the annotation.
 
 VARIANT columns cannot be partition or sort keys, and have no whole-column
 statistics. Shredded child statistics are not published as catalog bounds.
-The server skips VARIANT tables during scalar compaction. Reader interoperability
-and the buffered-ingestion coordinator are separate work.
+The server skips VARIANT tables during compaction unless it sets
+`HOGLAKE_COMPACTION_VARIANT`; then it copies files whose VARIANT layout is the
+one their declaration gives, which every file `Table.append` writes has
+(`tests/vectors/variant_layout_vectors.json` pins the server's port of that
+layout to `Plan.expected_elements`), and skips any compaction group holding a
+file in another layout or written by DuckDB, with that group's other files.
+Reader interoperability and the buffered-ingestion coordinator are separate work.

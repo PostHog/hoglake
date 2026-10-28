@@ -3,7 +3,7 @@
 import importlib.metadata
 import logging
 
-from . import ops, transforms, upload, variant
+from . import ops, transforms, upload, variant, writer
 from .bounds import decode_bound, encode_bound
 from .client import (
     UNGUARDED,
@@ -72,6 +72,7 @@ from .models import (
 from .ops import AlterOp
 from .types import arrow_type_to_coltype, coltype_to_arrow
 from .variant import VARIANT_NULL, VariantReport, variant_field
+from .writer import PreparedPart, write_part
 
 # Read from the installed metadata so it cannot drift from pyproject.toml.
 __version__ = importlib.metadata.version("pyhoglake")
@@ -127,6 +128,7 @@ __all__ = [
     "OffsetRegressionError",
     "PartitionField",
     "PartitionSpec",
+    "PreparedPart",
     "ReadSnapshotExpiredError",
     "ReconciliationRequiredError",
     "S3Config",
@@ -157,4 +159,6 @@ __all__ = [
     "upload",
     "variant",
     "variant_field",
+    "write_part",
+    "writer",
 ]

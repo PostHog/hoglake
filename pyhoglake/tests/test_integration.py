@@ -25,8 +25,10 @@ from pyhoglake import (
     OffsetRegressionError,
     S3Config,
     ops,
+    variant,
     variant_field,
 )
+from pyhoglake.parquet_schema import _schema_elements, _top_level
 from pyhoglake.types import columns_to_arrow_schema
 
 pytestmark = pytest.mark.integration
@@ -587,6 +589,63 @@ def test_variant_declarations_round_trip_through_the_server(ns):
     assert ns.table("variant_ddl").columns[-1].type_params == later.type_params
 
 
+def test_variant_append_round_trips_through_pyarrow(catalog, ns, s3config):
+    """JSON rows appended to a declared and an undeclared variant column
+    land as VARIANT files the server registers: the group annotated
+    VARIANT(1), no stats for the variant field ids, and the values back
+    through pyarrow and to_python."""
+    decl = {
+        "type": "object",
+        "fields": [
+            {"name": "$browser", "type": "string"},
+            {"name": "price", "type": "decimal8", "precision": 18, "scale": 2},
+        ],
+    }
+    table = ns.create_table(
+        "variant_write",
+        pa.schema(
+            [
+                pa.field("id", pa.int64(), nullable=False),
+                variant_field("properties", decl),
+                variant_field("raw", nullable=False),
+            ]
+        ),
+    )
+    props = ['{"$browser": "Chrome", "price": 9.5, "x": [1, null]}', "null", None]
+    raw = ["1", '"a"', "18446744073709551616"]
+    data = pa.table(
+        {
+            "id": [1, 2, 3],
+            "properties": pa.array(props, pa.string()).cast(pa.json_()),
+            "raw": pa.array(raw, pa.string()).cast(pa.json_()),
+        },
+        schema=columns_to_arrow_schema(table.columns, variant="json"),
+    )
+    res = table.append(data, compression="zstd", compression_level=3)
+    (f,) = table.files(snapshot=res.snapshot_id)
+    assert f.record_count == 3
+    by_name = {c.name: c for c in table.columns}
+    fs = s3config.filesystem()
+    body = fs.open_input_file(f.path[len("s3://") :]).read()
+    assert f.file_size_bytes == len(body)
+    groups = {e.get(4): e for e, _, _ in _top_level(_schema_elements(body))}
+    for name in ("properties", "raw"):
+        assert groups[name][10] == {16: {1: 1}}
+        assert groups[name][9] == by_name[name].field_id
+    back = pq.read_table(pa.BufferReader(body))
+    assert back.column("id").to_pylist() == [1, 2, 3]
+    assert variant.to_python(back.column("properties"), by_name["properties"]) == [
+        {"$browser": "Chrome", "price": 9.5, "x": [1, None]},
+        variant.VARIANT_NULL,
+        None,
+    ]
+    assert variant.to_python(back.column("raw"), by_name["raw"]) == [
+        1,
+        "a",
+        Decimal(18446744073709551616),
+    ]
+
+
 def test_alter_add_column_then_append(catalog, ns):
     table = ns.create_table(
         "evolving",
@@ -938,6 +997,77 @@ def test_compaction_decodes_every_allowed_client_codec(catalog, ns):
     # durable result is the same either way.
     assert not inputs & {f.path for f in files}
     assert sum(f.record_count for f in files) == 10 * len(_ALLOWED_CODECS)
+
+
+def test_compaction_copies_a_declared_variant_table(catalog, ns, s3config):
+    """With HOGLAKE_COMPACTION_VARIANT on (ci/live-python.sh sets it), the
+    files ``Table.append`` writes into a declared variant column compact,
+    and every row reads back as the same Python value: declared keys
+    missing, values of the wrong type, a Variant null beside an SQL NULL,
+    and rows that are not objects. A dev server started without the flag
+    fails this test, since nothing compacts; set it there by hand."""
+    decl = {
+        "type": "object",
+        "fields": [
+            {"name": n, "type": "string"}
+            for n in ("$session_id", "$current_url", "$browser", "$os", "$device_id")
+        ],
+    }
+    table = ns.create_table(
+        "variant_compact",
+        pa.schema(
+            [
+                pa.field("id", pa.int64(), nullable=False),
+                variant_field("properties", decl),
+            ]
+        ),
+    )
+    rows = [
+        '{"$session_id": "s", "$browser": "Chrome", "$os": "Mac", "extra": [1, null]}',
+        '{"$browser": 5, "$os": {"v": 1}}',
+        '{"$current_url": "https://ex.am/ple?q=1"}',
+        "{}",
+        "null",
+        None,
+        '"text"',
+        "[1, 2]",
+    ]
+    column = {c.name: c for c in table.columns}["properties"]
+    schema = columns_to_arrow_schema(table.columns, variant="json")
+    inputs: set[str] = set()
+    # Six appends, over the server's default HOGLAKE_COMPACTION_MIN_INPUT_FILES=5.
+    for index in range(6):
+        ids = list(range(index * len(rows), (index + 1) * len(rows)))
+        texts = rows[index:] + rows[:index]
+        data = pa.table(
+            {"id": ids, "properties": pa.array(texts, pa.string()).cast(pa.json_())},
+            schema=schema,
+        )
+        inputs |= {f.path for f in table.append(data).files}
+
+    def values() -> dict[int, object]:
+        fs = s3config.filesystem()
+        out: dict[int, object] = {}
+        for f in table.files(snapshot=catalog.refresh().head_snapshot_id):
+            body = fs.open_input_file(f.path[len("s3://") :]).read()
+            back = pq.read_table(pa.BufferReader(body))
+            props = variant.to_python(back.column("properties"), column)
+            out.update(zip(back.column("id").to_pylist(), props, strict=True))
+        return out
+
+    before = values()
+    assert len(before) == 6 * len(rows)
+    for _ in range(5):
+        result = catalog._client._request(
+            "POST", catalog._path("/maintenance/compact"), params={"batch": 10}
+        )
+        if result["groups_compacted"] == 0:
+            break
+
+    files = table.files(snapshot=catalog.refresh().head_snapshot_id)
+    assert not inputs & {f.path for f in files}
+    assert len(files) < len(inputs)
+    assert values() == before
 
 
 def test_drop_table(catalog, ns):
