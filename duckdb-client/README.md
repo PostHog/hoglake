@@ -23,9 +23,27 @@ writes parquet to object storage itself (field ids stamped, footer
 stats collected) and registers it through the commit API, exactly like
 pyhoglake — the same contract, a different language.
 
-DDL snapshots use `duckdb-client` as their author and an operation description
-such as `DROP TABLE ns1.points` as their message. This identifies the client;
-the extension has no authenticated user principal to forward.
+Authentication, for a server running `HOGLAKE_AUTH_MODE=warn|enforce`:
+
+```sql
+-- client credentials, minted and refreshed by the extension
+ATTACH 'hoglake:my_catalog' AS lake (ENDPOINT 'http://hoglake:8080',
+    TOKEN_URL 'http://hogtower:8080/oauth/token', CLIENT_ID 'hlc_…', CLIENT_SECRET '…');
+-- or a token you already hold (not refreshed; a 401 is final)
+ATTACH 'hoglake:my_catalog' AS lake (ENDPOINT 'http://hoglake:8080', TOKEN '…');
+```
+
+`AUDIENCE` defaults to `hoglake`. A 401 under client credentials mints a fresh
+token and retries once. Both URLs must be `http://`: the vendored HTTP client is
+built without TLS. Every request sends `User-Agent: duckdb-hoglake/1`.
+A 401 or 403 surfaces as a `Permission Error` naming the ATTACH option at
+fault. `TOKEN` and `CLIENT_SECRET` are replaced by `<redacted>` in the options
+`duckdb_databases()` reports.
+
+Without a credential, DDL snapshots use `duckdb-client` as their author and an
+operation description such as `DROP TABLE ns1.points` as their message. With
+one, the extension sends no author and the server records the token's
+principal: a tenant token claiming any other author is refused.
 
 ## Status
 
@@ -110,6 +128,20 @@ the test reads the `_hog_row_id` carrier), extension-written and
 pyhoglake-written partition values land in byte-identical partition
 strings, and both directions of the reserved-field-id contract refuse
 typed instead of killing the instance.
+
+The bearer-auth cases are a separate script, because they need the server in
+`HOGLAKE_AUTH_MODE=enforce` (or `warn`) trusting hogtower's contract key
+(`HOGLAKE_AUTH_ISSUER=https://hogtower.contract.test`, `HOGLAKE_AUTH_JWKS_FILE`
+holding the `jwks` object of `server/src/test/resources/oauth/contract-vectors.json`):
+
+```bash
+cd "$PYHOGLAKE_DIR" && DUCKEXT_AUTH_MODE=enforce HOGLAKE_URL=... DUCKEXT_S3_ENDPOINT=... \
+    uv run --with cryptography python <duckdb-client>/test/fixtures/verify_auth.py
+```
+
+`DUCKEXT_AUTH_MODE` names the server's mode and gates the script; it mints
+ES256 tokens from the contract file's published test key and runs its own
+client-credentials token endpoint.
 
 The harness also runs append guard regressions through an HTTP proxy.
 They cover DDL between file preparation and commit, table recreation,

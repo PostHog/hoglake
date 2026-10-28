@@ -23,6 +23,8 @@ struct HoglakeOptions {
 	bool create_if_not_exists = false;
 	string data_path;
 	AccessMode access_mode = AccessMode::AUTOMATIC;
+	//! TOKEN, or TOKEN_URL + CLIENT_ID + CLIENT_SECRET (+ AUDIENCE)
+	HoglakeAuthOptions auth;
 };
 
 class HoglakeCatalog : public Catalog {

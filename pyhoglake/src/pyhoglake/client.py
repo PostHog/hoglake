@@ -698,13 +698,20 @@ class HoglakeClient:
         *,
         s3: S3Config | None = None,
         timeout: float = DEFAULT_TIMEOUT,
+        auth: httpx.Auth | None = None,
     ) -> None:
+        """``auth`` attaches a credential to every request: a
+        :class:`pyhoglake.auth.ClientCredentials` against the token endpoint
+        that issued yours, or a :class:`pyhoglake.auth.BearerToken`. ``None``
+        sends none, which a server in ``HOGLAKE_AUTH_MODE=enforce`` refuses.
+        """
         self.base_url = base_url.rstrip("/")
         self.s3 = s3
         self._http = httpx.Client(
             base_url=self.base_url + "/v1",
             timeout=timeout,
             headers={"User-Agent": USER_AGENT},
+            auth=auth,
         )
         self._fs = None
         self._put: Any = None

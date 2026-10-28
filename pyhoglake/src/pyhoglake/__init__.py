@@ -4,6 +4,7 @@ import importlib.metadata
 import logging
 
 from . import ops, transforms, upload, variant, writer
+from .auth import BearerToken, ClientCredentials
 from .bounds import decode_bound, encode_bound
 from .client import (
     UNGUARDED,
@@ -93,6 +94,7 @@ __all__ = [
     "AlterOp",
     "AppendResult",
     "AppendedFile",
+    "BearerToken",
     "Catalog",
     "CatalogFilesPendingExpiryError",
     "CatalogHasAbandonedUploadsError",
@@ -107,6 +109,7 @@ __all__ = [
     "CatalogTablesPendingRetirementError",
     "ChangesPlan",
     "CleanupResult",
+    "ClientCredentials",
     "Column",
     "ColumnStats",
     "CommitConflictError",
