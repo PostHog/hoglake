@@ -83,6 +83,7 @@ env HOGLAKE_JDBC_URL="jdbc:postgresql://localhost:$HOGLAKE_PG_PORT/hoglake" \
     HOGLAKE_CLEANUP_INTERVAL_MS=0 HOGLAKE_COMPACTION_INTERVAL_MS=0 \
     HOGLAKE_RETIREMENT_INTERVAL_MS=0 HOGLAKE_REINDEX_INTERVAL_MS=0 \
     HOGLAKE_METRICS_INTERVAL_MS=0 HOGLAKE_MAINTENANCE_SUMMARY_INTERVAL_MS=0 \
+    HOGLAKE_COMPACTION_VARIANT=true \
     "$repo_dir/server/build/install/hoglake-server/bin/hoglake-server" \
     > "$report_dir/server.log" 2>&1 &
 server_pid=$!

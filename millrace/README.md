@@ -54,6 +54,7 @@ shape behavior:
 | `MILLRACE_FLUSH_DEADLINE_S` | 900 | a group at least this old with ≥ 1 MiB staged flushes |
 | `MILLRACE_SLOW_LANE_DEADLINE_S` | 21600 | any group this old flushes |
 | `MILLRACE_KAFKA_AUTO_OFFSET_RESET` | `latest` | where a partition with no committed offset starts |
+| `MILLRACE_VARIANT_SOURCES` | unset | `column=payload_key,…`: the variant columns filled from a payload key's JSON text (see "VARIANT columns") |
 
 ## Destination
 
@@ -83,6 +84,124 @@ MILLRACE_TABLE_COLUMNS=team_id:long,timestamp:timestamptz,distinct_id:string,eve
 MILLRACE_PARTITION_BY=identity(team_id),day(timestamp)
 MILLRACE_SORT_BY=timestamp
 ```
+
+## VARIANT columns
+
+millrace never creates a variant column (`MILLRACE_TABLE_COLUMNS`
+refuses `variant`): an operator adds a nullable one to the live table
+with pyhoglake, `ops.add_column("properties_sv", "variant",
+shredding=...)`, and maps it to the payload key it is filled from:
+
+```
+MILLRACE_VARIANT_SOURCES=properties_sv=properties
+```
+
+The shredded layout comes from the live column's
+`type_params.shredding` only (no alter changes it), never from millrace
+configuration. A live variant column is not reported as a difference
+from `MILLRACE_TABLE_COLUMNS`, which cannot name one, so the operator
+adds it without touching that knob.
+
+**Text mode.** The producer sends the field as a JSON string holding
+JSON text (`JSON.stringify`). millrace takes that string, unparsed (the
+same value a `properties` string column stores), and each file's rows
+are encoded by pyhoglake's encoder, which reads the producer's own text
+strictly, in the build on the `millrace-hoglake` pool thread, never on
+the event loop.
+
+| The payload key holds | The column gets | Counted as |
+|---|---|---|
+| JSON text | the Variant value | `encoded` |
+| the text `null` | a Variant null | `encoded` |
+| nothing (absent), JSON `null`, `""` | SQL NULL | `sql_null` |
+| invalid text: not JSON, a duplicate key, a lone surrogate escape, `NaN`/`Infinity` or a number beyond the double range, an integer of more than 38 digits, nesting deeper than 128 | SQL NULL | `invalid` (by the encoder's reason) |
+| a value that is not a string (an object, a number) | SQL NULL | `invalid` (`not_text`) |
+| a string with a lone surrogate in the outer payload | SQL NULL | `invalid` (`invalid_unicode`) |
+
+The last two rows are reached only from a payload key no string column
+reads. When the mapped key is also a string column's, as `properties`
+is, that column's rules apply first: a value that is not a string, or
+an outer string holding a lone surrogate (which Arrow cannot store),
+drops the record (`uncastable_column`) before the variant is read. A
+key a `json` or numeric column also reads keeps that column's value,
+and the variant counts it `not_text`.
+
+**The variant never drops a row**: an invalid value is SQL NULL in the
+variant column and the row is kept. A variant column that is not mapped
+is written as all SQL NULL. Only the mapped key is read: a payload key
+of the variant column's own name is an unknown key, dropped from the
+row and counted like any other.
+
+**Refused at startup**: a NOT NULL variant column, mapped or not (its
+invalid and unmapped values have nowhere to go); a variant nested in a
+container, mapped or not (no writer shreds one); a mapping that names
+no top-level variant column of the table (missing, or another type); a
+declaration this pyhoglake cannot write; and a malformed entry (exit 2,
+at config).
+
+**Rollout**, in this order:
+
+1. deploy an image that reads `MILLRACE_VARIANT_SOURCES` on every
+   replica;
+2. enable server compaction of variant tables for the catalog
+   (`HOGLAKE_COMPACTION_VARIANT=true`, narrowed by
+   `HOGLAKE_COMPACTION_VARIANT_CATALOGS`): without it the server skips
+   the whole table and its small files are never rolled up;
+3. add the column (nullable, with its declaration);
+4. set `MILLRACE_VARIANT_SOURCES` and roll the fleet. Set it only on the
+   deployments whose table has the column: a mapping that names no
+   column of the table refuses startup.
+
+**Kill switch**: remove the column's entry and roll the fleet. The
+column is then written as SQL NULL, with no schema change. Rows written
+while the column is unmapped (before step 4, during its roll, or after
+the kill switch) keep it SQL NULL; nothing backfills them.
+
+**Dropping or renaming the column**: remove its entry and roll the
+fleet first. The next commit after the drop is refused
+(`ddl_since_read_snapshot`), and every rebuild on the re-read shape
+fails while the mapping names a column the table no longer has: the
+rows stay staged, but the groups go stuck until the entry is removed.
+
+**Rollback floor**: the first image that reads
+`MILLRACE_VARIANT_SOURCES` (the commit that added it to this README) is
+the oldest that starts on a table with a variant column. An image
+without that knob refuses to start once the column exists (and a
+running one fails every build), so never roll back past it after
+step 3.
+
+**CPU**: the encode costs about 33 µs per row and holds the GIL (about
+4.6 s per 256 MiB flush, so a build takes roughly 2.5× the CPU it did),
+so the startup drain and the steady-state build both get longer. Watch
+`millrace_flush_build_seconds_total{stage="variant_encode"}` against the
+other stages, and size the startup probe for the longer drain.
+
+**Memory**: the build carries a mapped column's source text twice (the
+string column and the variant's JSON text) through the sort and the
+fanout, plus each file's encoded storage, so a properties-heavy flush
+needs about twice the build's peak Arrow memory. Size the pod's memory
+limit before step 4.
+
+**Metrics** (labels come from the catalog and closed vocabularies only,
+never from payload keys):
+
+- `millrace_variant_rows_total{column, outcome}`, outcome `encoded`,
+  `sql_null` or `invalid`;
+- `millrace_variant_invalid_total{column, reason}`;
+- `millrace_variant_values_total{column, path, outcome}`, per declared
+  path, outcome `typed`, `fallback` (kept in `value`: the type did not
+  match) or `variant_null`. A high fallback share means the immutable
+  declaration does not fit the data.
+
+They count per build, so a rebuild counts its rows again.
+
+**Readers.** The files are in the Trino connector's layout
+(`VARIANT(1)`, the declared shredding); a variant registers no
+`column_stats`. Read-back through the Trino connector is not yet
+verified by a harness. Server compaction copies the layout only with
+`HOGLAKE_COMPACTION_VARIANT`. The hoglake DuckDB extension refuses a
+table with a variant column at bind (#87), so after step 3 the whole
+table is unreadable through it.
 
 ## Startup drain and probes
 

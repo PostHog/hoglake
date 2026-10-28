@@ -445,8 +445,9 @@ class TestJsonDecoder:
             decoder.decode_record(b'{"d": 12345678901}')  # precision 10 exceeded
 
     def test_unfillable_columns_are_a_startup_refusal(self) -> None:
-        """What is still refused by shape: an unknown type, a variant (top
-        level or below a container), a container whose children do not
+        """What is still refused by shape: an unknown type, a variant below
+        a container (a top-level one is test_flush_variant.py's), a
+        container whose children do not
         match its type, and a map whose key is a container or json (a
         JSON object key is a string, which no such key coerces — without
         the refusal every non-empty map would drop at flush time)."""
@@ -464,7 +465,6 @@ class TestJsonDecoder:
             "ordinal": 0,
             "children": [{"name": "item", "type": "long", "field_id": 2, "ordinal": 0}],
         }
-        variant = {"name": "c", "type": "variant", "field_id": 1, "ordinal": 0}
 
         def map_keyed_by(key: dict[str, Any]) -> dict[str, Any]:
             return {
@@ -500,7 +500,6 @@ class TestJsonDecoder:
         for wire in (
             variant_in_struct,
             bad_list,
-            variant,
             unknown,
             struct_key,
             list_key,
@@ -995,6 +994,7 @@ class TestBuildStages:
             "build": 10.0,
             "sort": 100.0,
             "fanout": 1000.0,
+            "variant_encode": 0.0,
             "write": 20000.0,
         }
 
@@ -1021,13 +1021,14 @@ class TestBuildStages:
             "build": 0.0,
             "sort": 0.0,
             "fanout": 0.0,
+            "variant_encode": 0.0,
             "write": 0.0,
         }
 
 
 class TestVariantIsNoKey:
-    """A variant is refused as a sort or partition source by its type,
-    not only because the decoder refuses the column today."""
+    """A variant is refused as a sort or partition source by its type:
+    the decoder takes a top-level variant column now."""
 
     def test_a_variant_sort_source_is_refused(self) -> None:
         wire = table_wire(
@@ -1053,7 +1054,7 @@ class TestVariantIsNoKey:
 
     def test_a_variant_partition_source_is_refused(self) -> None:
         """The predicate startup validation applies to each partition
-        field (``resolve`` reaches it once the decoder takes a variant)."""
+        field."""
         props = Column.from_wire(
             {
                 "name": "p",
@@ -1848,7 +1849,7 @@ class TestOrphansAndDrops:
                 await flush_group(flusher, stage, team_group(TEAM), "size")
         assert flusher.stats().dropped_payload_keys == 2
         warned = [
-            r for r in caplog.records if "'surprise' is not a column" in r.getMessage()
+            r for r in caplog.records if "'surprise' fills no column" in r.getMessage()
         ]
         assert len(warned) == 1
         assert "surprise" not in str(capture.payloads[1])

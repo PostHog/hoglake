@@ -61,7 +61,6 @@ from pyhoglake import (
     AlreadyExistsError,
     CommitConflictError,
     ExpiredError,
-    HoglakeClient,
     NotFoundError,
     OffsetRegressionError,
     ReconciliationRequiredError,
@@ -70,7 +69,7 @@ from pyhoglake import (
 from pyhoglake import IncarnationChangedError as ClientIncarnationChangedError
 from pyhoglake.types import columns_to_arrow_schema
 
-from .config import HedgerowConfig
+from .config import HedgerowConfig, hoglake_client
 from .filtering import RowFilter, build_filter
 from .halts import (
     DataIntegrityError,
@@ -182,12 +181,12 @@ class Hedgerow:
         cfg = self.config
 
         if self._source_client is None:
-            self._source_client = HoglakeClient(
-                cfg.source.url, s3=cfg.source.s3.to_pyhoglake()
+            self._source_client = hoglake_client(
+                cfg.source.url, cfg.source.s3, cfg.source.auth
             )
         if self._dest_client is None:
-            self._dest_client = HoglakeClient(
-                cfg.destination.url, s3=cfg.destination.s3.to_pyhoglake()
+            self._dest_client = hoglake_client(
+                cfg.destination.url, cfg.destination.s3, cfg.destination.auth
             )
 
         self._source_catalog = self._source_client.catalog(cfg.source.catalog)

@@ -64,7 +64,7 @@ Issues = "https://github.com/PostHog/hoglake/issues"
 dev = [
     "pytest>=8.0",
     "pytest-httpx>=0.30",
-    "hypothesis>=6.100",
+    "hypothesis>=6.170.1",
     # A floor, not a pin: the exact version is the root uv.lock's, one for
     # the whole workspace, and `uv run` installs that one on every machine
     # (`uvx ruff` would resolve a different rule set per machine and

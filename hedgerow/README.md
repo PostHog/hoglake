@@ -84,6 +84,11 @@ source:
     access_key: hoglake
     secret_key: hoglake123
     path_style: true
+  auth:                             # optional; required once hoglake enforces auth
+    token_url: https://hogtower.example/oauth/token
+    client_id: hlc_...
+    client_secret: ...              # prefer HEDGEROW__SOURCE__AUTH__CLIENT_SECRET
+    # audience: hoglake             # default
 
 destination:                        # may be the same server
   url: http://localhost:8080
@@ -128,6 +133,7 @@ hedgerow --config config.yaml --once   # exactly one cycle (ops/debug)
 Env-var overrides: `HEDGEROW__<PATH>__<TO>__<KEY>=value` (double
 underscore separators, YAML-parsed values), e.g.
 `HEDGEROW__SOURCE__S3__SECRET_KEY=...`,
+`HEDGEROW__DESTINATION__AUTH__CLIENT_SECRET=...`,
 `HEDGEROW__REPLICATION__POLL_INTERVAL_S=1`.
 
 Column projection: the destination table's columns define the projected

@@ -25,7 +25,7 @@ namespace duckdb {
 
 HoglakeCatalog::HoglakeCatalog(AttachedDatabase &db_p, HoglakeOptions options_p)
     : Catalog(db_p), options(std::move(options_p)) {
-	api_client = make_uniq<HoglakeApiClient>(options.endpoint, options.catalog_name);
+	api_client = make_uniq<HoglakeApiClient>(options.endpoint, options.catalog_name, options.auth);
 }
 
 HoglakeCatalog::~HoglakeCatalog() {

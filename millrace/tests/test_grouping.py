@@ -170,9 +170,9 @@ def test_construction_refuses_a_spec_it_cannot_key(spec, columns, match):
 
 @pytest.mark.parametrize("col_type", ["json", "variant"])
 def test_a_json_or_variant_source_is_refused_as_unkeyable(col_type):
-    """Both by type, with the same refusal. A variant used to be refused
-    only because its coercer is (a different message), which lifting the
-    coercer's refusal would have turned into a keyable variant."""
+    """Both by type, with the same refusal. The decoder takes a
+    top-level variant column now; its coercer's refusal (a different
+    message, about the payload-key mapping) is no keying rule."""
     columns = [{"name": "j", "type": col_type, "field_id": 1, "ordinal": 0}]
     with pytest.raises(
         GroupKeyError,

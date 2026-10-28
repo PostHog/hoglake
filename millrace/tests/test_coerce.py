@@ -19,7 +19,9 @@ Pinned here:
   non-finite refused); JSON null is SQL NULL;
 - a decimal is accepted exactly when its column holds it (no rounding,
   any spelling), and every accepted decimal builds;
-- a ``variant`` column, at any depth, is a startup refusal.
+- a ``variant`` below the top level is a startup refusal, and a
+  top-level one is never coerced: its source is JSON text
+  (:func:`variant_text`'s semantics table).
 """
 
 from __future__ import annotations
@@ -44,10 +46,13 @@ from pyhoglake.types import MAX_COLUMN_NESTING_DEPTH, PARQUET_FIELD_ID_KEY
 from millrace import flush
 from millrace.coerce import (
     REASON_UNCASTABLE_COLUMN,
+    VARIANT_INVALID_UNICODE,
+    VARIANT_NOT_TEXT,
     DecodeError,
     UnsupportedColumnError,
     canonical_json,
     coercer_for,
+    variant_text,
 )
 
 
@@ -733,9 +738,15 @@ def test_a_decimal_is_accepted_exactly_when_the_column_holds_it(
 
 
 @pytest.mark.parametrize(
-    ("wire", "path"),
+    ("wire", "message"),
     [
-        ({"name": "v", "type": "variant", "field_id": 1, "ordinal": 0}, "v"),
+        (
+            {"name": "v", "type": "variant", "field_id": 1, "ordinal": 0},
+            (
+                "column 'v' is a variant, which is filled from its "
+                "MILLRACE_VARIANT_SOURCES payload key, not coerced"
+            ),
+        ),
         (
             {
                 "name": "s",
@@ -746,21 +757,62 @@ def test_a_decimal_is_accepted_exactly_when_the_column_holds_it(
                     {"name": "v", "type": "variant", "field_id": 2, "ordinal": 0}
                 ],
             },
-            "s.v",
+            (
+                "column 's.v' is a variant below the top level: only a top-level "
+                "variant column is written"
+            ),
         ),
     ],
 )
-def test_a_variant_column_is_refused_at_any_depth(
-    wire: dict[str, Any], path: str
-) -> None:
-    with pytest.raises(
-        UnsupportedColumnError, match=f"column '{path}' is a variant"
-    ) as e:
+def test_a_variant_is_never_coerced(wire: dict[str, Any], message: str) -> None:
+    """A nested variant has no writer (a startup refusal through the
+    decoder); a top-level one is the decoder's, filled from its payload
+    key's JSON text, so reaching the coercer is a wiring mistake."""
+    with pytest.raises(UnsupportedColumnError) as e:
         coercer_for(col(wire))
-    # Says what is true since pyhoglake gained a variant writer (#464/#465):
-    # millrace's own decoder is what lacks it, not pyarrow.
-    assert "millrace does not ingest variant columns yet" in str(e.value)
-    assert "pyarrow" not in str(e.value)
+    assert message in str(e.value)
+
+
+@pytest.mark.parametrize(
+    ("value", "want"),
+    [
+        # Absent or JSON null, and the empty string: SQL NULL, not invalid.
+        (None, (None, None)),
+        ("", (None, None)),
+        # Text, unparsed: the encoder reads it (and "null" is a Variant null).
+        ("null", ("null", None)),
+        ('{"a":1,"a":2}', ('{"a":1,"a":2}', None)),
+        ("not json", ("not json", None)),
+        # An inner surrogate escape is ASCII text here; the encoder nulls it.
+        ('{"k":"\\ud800"}', ('{"k":"\\ud800"}', None)),
+        # Not text: SQL NULL, invalid, never encoded from the parsed value.
+        (5, (None, VARIANT_NOT_TEXT)),
+        (0, (None, VARIANT_NOT_TEXT)),
+        (False, (None, VARIANT_NOT_TEXT)),
+        ({"a": 1}, (None, VARIANT_NOT_TEXT)),
+        ([], (None, VARIANT_NOT_TEXT)),
+        # A lone surrogate in the OUTER payload cannot reach Arrow.
+        ("\ud800", (None, VARIANT_INVALID_UNICODE)),
+    ],
+)
+def test_variant_text_semantics(value: Any, want: tuple[Any, Any]) -> None:
+    assert variant_text(value) == want
+
+
+def test_the_variant_reasons_are_labels_beside_the_encoders() -> None:
+    """Both share millrace_variant_invalid_total{reason} with pyhoglake's
+    own reasons, read from its Literal: invalid_unicode must be the
+    encoder's name for it (one label, not two), not_text none of them."""
+    from typing import get_args
+
+    from pyhoglake.variant import InvalidReason
+
+    assert (VARIANT_NOT_TEXT, VARIANT_INVALID_UNICODE) == (
+        "not_text",
+        "invalid_unicode",
+    )
+    assert VARIANT_INVALID_UNICODE in get_args(InvalidReason)
+    assert VARIANT_NOT_TEXT not in get_args(InvalidReason)
 
 
 # -- timestamps outside years 1-9999 are clamped, never dropped ----------------
