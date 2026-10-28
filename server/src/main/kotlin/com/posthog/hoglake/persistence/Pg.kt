@@ -62,6 +62,33 @@ internal object Pg {
     /** lock_timeout expiry ("canceling statement due to lock timeout"). */
     fun isLockTimeout(e: UnableToExecuteStatementException): Boolean = sqlState(e) == LOCK_NOT_AVAILABLE
 
+    /**
+     * A unique violation on one of the commit tail's allocator-ordered
+     * keys — hog_snapshot / hog_data_file / hog_commit_receipt. Under
+     * `CommitPipeline` this is the cross-pod race surfacing as a
+     * constraint error instead of a count mismatch: two pods' commits
+     * interleaved a read and a write, and the loser's planned ids (from
+     * a read that predates the winner's commit) collide with the
+     * winner's rows. The statement failed, so nothing was written; the
+     * commit retries whole, and a RECEIPT collision's retry re-reads,
+     * finds the winner's durable receipt, and replays it — exactly the
+     * answer the receipt is for. Matched on constraint names so a
+     * unique violation anywhere else (a genuine bug) stays one.
+     */
+    fun isCommitAllocatorUniqueViolation(e: UnableToExecuteStatementException): Boolean {
+        if (!isUniqueViolation(e)) return false
+        val constraint =
+            generateSequence(e as Throwable) { it.cause }
+                .filterIsInstance<org.postgresql.util.PSQLException>()
+                .firstOrNull()
+                ?.serverErrorMessage
+                ?.constraint
+        return constraint in COMMIT_ALLOCATOR_UNIQUE_CONSTRAINTS
+    }
+
+    private val COMMIT_ALLOCATOR_UNIQUE_CONSTRAINTS =
+        setOf("hog_snapshot_pkey", "hog_data_file_pkey", "hog_commit_receipt_pkey")
+
     /** statement_timeout expiry (or a cancel): "canceling statement due to ...". */
     fun isQueryCanceled(e: UnableToExecuteStatementException): Boolean = sqlState(e) == QUERY_CANCELED
 

@@ -764,20 +764,35 @@ data class Config(
      * > 1 enables the adaptive pipeline: stage A (read, checks,
      * allocation, write) stays serial per catalog under a
      * session-scoped advisory lock, and the durability wait (the JDBC
-     * COMMIT's WAL flush) moves OUTSIDE that serialization so up to N
-     * commits of one catalog flush concurrently and Postgres group
-     * commit batches them. Depth starts at 1 per catalog and doubles
-     * only while commits queue behind an in-flight one, halving back
-     * when the queue drains — a quiet catalog takes the old code path
-     * (a catalog at rest commits through the xact-locked tail
-     * unchanged). Commits carrying deletes are never pipelined: they
-     * drain in-flight commits first (one row lock) and keep the
-     * lock-to-commit tail. Durability and OCC semantics are unchanged;
-     * see CommitPipeline's KDoc.
+     * COMMIT's WAL flush) moves OUTSIDE that serialization. Depth
+     * starts at 1 per catalog and doubles while commits queue behind
+     * an in-flight one, decaying back when the queue drains — a quiet
+     * catalog takes the old code path (a catalog at rest commits
+     * through the xact-locked tail unchanged). Commits carrying
+     * deletes are never pipelined: they drain in-flight commits first
+     * (one row lock) and keep the lock-to-commit tail. Durability and
+     * OCC semantics are unchanged; see CommitPipeline's KDoc.
+     *
+     * WHAT IT BUYS, stated plainly: consecutive commits UPDATE the
+     * same hog_catalog row and Postgres holds that row lock until
+     * after the sync flush, so one catalog's flushes stay serial. What
+     * overlaps is the lock wait, the read, the checks and the row
+     * building of the next commit with the predecessor's flush — the
+     * ceiling is 1/(write + flush) per catalog instead of
+     * 1/(tail + flush). No group commit batches these flushes.
+     *
+     * FLEET-UNIFORM DURING ROLLOUT: a pod with this OFF (or older
+     * code) racing a pipelined pod's commit fails its guarded write
+     * with a 500 (the pre-pipeline path has no retry). Enable it
+     * everywhere or nowhere; a mixed fleet is tolerable only for the
+     * length of a rolling deploy, expecting a trickle of
+     * retryable-by-hand 500s.
      *
      * Capped at CommitPipeline.MAX_DEPTH (64). The effective
      * concurrency is also bounded by HOGLAKE_DB_POOL_SIZE: every
      * in-flight commit holds its connection until its COMMIT returns.
+     * Requires direct connections: session-scoped advisory locks
+     * cannot cross a transaction-mode pooler (PgBouncer, RDS Proxy).
      */
     val commitMaxInFlight: Int = env("HOGLAKE_COMMIT_MAX_IN_FLIGHT", "1").toInt(),
     /**

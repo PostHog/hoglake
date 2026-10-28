@@ -33,31 +33,63 @@ import java.util.concurrent.ConcurrentHashMap
  *    an in-memory one: that keeps stage A exclusive against DDL,
  *    expiry, retirement and compaction tails on ANY pod, keeps the
  *    `lock_timeout` -> 503 admission contract where it is, and keeps
- *    cross-pod stage As off each other. The lock is released by the
- *    write statement itself ([CommitTail.PIPELINED_WRITE_SQL]) — before
- *    COMMIT.
+ *    cross-pod stage As off each other. The lock is released by an
+ *    explicit statement after the write returns — a separate statement,
+ *    not a write CTE, because Postgres does not order independent CTEs
+ *    (an unlock CTE was observed to run BEFORE the write's UPDATE).
  *  - **Stage B (overlapped).** The JDBC COMMIT — the flush wait — runs
  *    after the lock is gone, on the commit's own connection, with up to
- *    `depth` commits of one catalog in flight at once. Postgres group
- *    commit batches the flushes of concurrently-committing backends,
- *    so the slow part overlaps instead of convoying.
+ *    `depth` commits of one catalog in flight at once.
  *
  * The durability contract is UNCHANGED: a commit's response is sent
  * only after its own COMMIT returns. Pipelining overlaps the waits; it
  * never acks early.
  *
- * ## Why the order is still the order
+ * ## Why the order is still the order — and the real ceiling
  *
  * Stage A assigns snapshot ids serially, and stage B cannot reorder
  * them: every commit's write UPDATEs the catalog's hog_catalog row
- * (the guarded `alloc` CTE), a row lock held until COMMIT, so commit
- * N+1's write cannot execute until commit N's COMMIT has completed.
- * The WAL sees the commits in stage-A order, a reader never observes
- * snapshot N+1 without N, and snapshot ids stay dense and ordered with
- * commit order — the lineage premise, intact. What pipelining buys is
- * that N+1's read and checks (and N+2's, ...) run DURING N's flush
- * instead of after it: the serial residue per commit is the write plus
- * the flush, not the whole tail.
+ * (the `alloc` CTE), and its qual is KEY-ONLY, so under READ COMMITTED
+ * the UPDATE blocks on an in-flight predecessor's row lock until the
+ * predecessor's COMMIT (Postgres releases row locks after the sync
+ * flush) and then applies RELATIVE increments to the newest version,
+ * re-validating against the merged view after the wait
+ * (`alloc_moved`/`stats_moved` in the write's counts). An earlier form
+ * of the guard predicated the UPDATE on the merged values, which READ
+ * COMMITTED evaluates against the stale visible version: it matched no
+ * row, never waited, and turned every overlap into a fail-and-retry.
+ *
+ * Two consequences, stated plainly:
+ *
+ *  - **The WAL sees one catalog's commits in stage-A order**; a reader
+ *    never observes snapshot N+1 without N; ids stay dense and ordered
+ *    with commit order — the lineage premise, intact.
+ *  - **The flushes of one catalog's commits CANNOT overlap.** N+1's
+ *    COMMIT can only start after its write returns, and its write
+ *    waits for N's COMMIT. What pipelining overlaps is the LOCK WAIT,
+ *    the READ, the CHECKS and the ROW BUILDING of N+1 (and N+2, ...)
+ *    with N's flush: the serial residue per commit is the write round
+ *    trip plus the flush, not the whole tail. Against network storage
+ *    (RDS), where the pre-write tail is several round trips of
+ *    milliseconds each, that is the win; it is not N×, and no group
+ *    commit batches these flushes.
+ *
+ * ## Read visibility under pipelining
+ *
+ * A pipelined commit is invisible to readers between its stage A and
+ * its COMMIT — but so is every tail that could interleave: DDL,
+ * expiry, retirement and compaction all serialize on the same advisory
+ * lock (so they start no earlier than the commit's unlock) AND
+ * allocate by UPDATEing the hog_catalog row (so their writes queue on
+ * the in-flight commit's row lock and become visible only after it).
+ * The invariant that keeps them safe: every hog_catalog/
+ * hog_table_stats allocation anywhere in the codebase is a RELATIVE
+ * increment (`SET x = x + 1 ... RETURNING`), never an absolute SET
+ * computed from a pre-lock read — an absolute-SET allocator added
+ * later would corrupt under pipelining, and the alloc_moved check is
+ * what catches it. Commit-to-commit order cannot invert (the row-lock
+ * chain above), so there is no window that could produce a visibility
+ * GAP in the snapshot sequence.
  *
  * READ-VISIBILITY NOTE. Because stage A ends before the flush, a
  * maintenance or DDL tail on this catalog (advisory-lock holders all)
@@ -133,10 +165,13 @@ import java.util.concurrent.ConcurrentHashMap
  * permit is held across the COMMIT, so the next commit's stage A cannot
  * start until the previous COMMIT returned — and commits that find the
  * catalog at rest (depth 1, nothing in flight) take the original
- * xact-locked tail verbatim, no session lock, no unlock CTE. A commit
- * that has to WAIT for a permit doubles the depth (to the cap); a
- * catalog whose pipeline drains (nothing in flight, nothing queued)
- * halves it back toward 1. Quiet catalogs are byte-for-byte the old
+ * xact-locked tail verbatim, no session lock, no unlock statement. A
+ * commit that arrives at a FULL pipeline doubles the depth (to the cap)
+ * and enters through the slot the doubling opened; only at the cap does
+ * a contender actually wait. A catalog whose pipeline drains (nothing
+ * in flight, nothing queued) decays: halved when the drained cycle
+ * contended, straight to 1 when it did not — one quiet commit after a
+ * lull is the old path again. Quiet catalogs are byte-for-byte the old
  * behavior; the machinery only exists while contention does.
  *
  * `CommitPipelineTest` pins the adaptation arithmetic;
@@ -156,15 +191,19 @@ internal class CommitPipeline(
 
     /**
      * Drop [pipe] from the map when it is at rest, so the map does not
-     * grow with the catalog count. A racing submit gets a fresh pipe at
-     * depth 1 with no deltas — the state a retired pipe had, so the swap
-     * is invisible.
+     * grow with the catalog count. Retirement is atomic with admission:
+     * the pipe is marked retired under its monitor BEFORE the map
+     * remove, so a thread that already holds the reference but has not
+     * yet acquired gets [CatalogPipe.Acquire.RETIRED] from
+     * [CatalogPipe.acquire] and re-looks-up the fresh pipe — two live
+     * pipes for one catalog would split the depth budget, the deltas
+     * and the deferred receipts.
      */
     fun retireIfIdle(
         catalogId: Long,
         pipe: CatalogPipe,
     ) {
-        if (pipe.atRest()) pipes.remove(catalogId, pipe)
+        if (pipe.markRetiredIfAtRest()) pipes.remove(catalogId, pipe)
     }
 
     companion object {
@@ -218,7 +257,13 @@ internal class CommitPipeline(
         /** Commits blocked in [acquire]. */
         private var waiters = 0
 
-        /** Current in-flight depth limit; 1 at rest, doubles under pressure, halves when drained. */
+        /** Set by [markRetiredIfAtRest]; a retired pipe never admits again. */
+        private var retired = false
+
+        /** True when the current burst actually contended; an uncontended drain decays depth straight to 1. */
+        private var sawContention = false
+
+        /** Current in-flight depth limit; 1 at rest, doubles under pressure, decays when drained. */
         @Volatile
         internal var depth = 1
             private set
@@ -232,58 +277,78 @@ internal class CommitPipeline(
         private var nextSeq = 0L
 
         /**
-         * True when nothing is in flight, nothing waits, and the depth
-         * has decayed to 1 — the state a fresh pipe would have, so the
-         * map entry can be dropped.
+         * Mark the pipe retired when it is at rest (nothing in flight,
+         * nobody waiting, depth decayed to 1 — the state a fresh pipe
+         * would have). Atomic with [acquire] under [monitor]: after
+         * this returns true, every future [acquire] on this instance
+         * answers [Acquire.RETIRED].
          */
-        fun atRest(): Boolean =
+        fun markRetiredIfAtRest(): Boolean =
             synchronized(monitor) {
-                inFlight == 0 && waiters == 0 && depth == 1
+                if (inFlight == 0 && waiters == 0 && depth == 1 && !retired) {
+                    retired = true
+                }
+                retired
             }
 
+        /** Outcome of [acquire]; RETIRED sends the caller back to the map for the fresh pipe. */
+        internal enum class Acquire { ACQUIRED, TIMED_OUT, RETIRED }
+
         /**
-         * Take an in-flight permit, waiting while [inFlight] >= [depth]
-         * and DOUBLING the depth (to the cap) on contention — a wait
-         * means commits are queueing behind the flush of the one ahead,
-         * which is exactly when widening helps. [timeoutMs] <= 0 waits
-         * unbounded (the configured admission bound's documented
-         * meaning); expiry returns false and the caller maps it to the
-         * typed CommitQueueTimeout, the same 503 the lock wait produces.
+         * Take an in-flight permit. A commit that arrives at a FULL
+         * pipeline doubles the depth (to the cap) and enters through the
+         * slot the doubling opened — queueing behind an in-flight
+         * commit's flush is exactly when widening helps, and the
+         * widened slot is the help. Only at the cap does the caller
+         * actually wait; [timeoutMs] <= 0 waits unbounded (the
+         * configured admission bound's documented meaning); expiry is
+         * [Acquire.TIMED_OUT], which the caller maps to the typed
+         * CommitQueueTimeout, the same 503 the lock wait produces.
          */
-        fun acquire(timeoutMs: Long): Boolean {
+        fun acquire(timeoutMs: Long): Acquire {
             val deadline = if (timeoutMs > 0) System.nanoTime() + timeoutMs * 1_000_000 else 0L
             synchronized(monitor) {
-                while (inFlight >= depth) {
-                    if (depth < cap) depth = minOf(cap, depth * 2)
+                while (true) {
+                    if (retired) return Acquire.RETIRED
+                    if (inFlight < depth) {
+                        inFlight++
+                        return Acquire.ACQUIRED
+                    }
+                    sawContention = true
+                    if (depth < cap) {
+                        depth = minOf(cap, depth * 2)
+                        continue
+                    }
                     waiters++
                     try {
                         if (deadline == 0L) {
                             monitor.wait()
                         } else {
                             val remainMs = (deadline - System.nanoTime()) / 1_000_000
-                            if (remainMs <= 0) return false
+                            if (remainMs <= 0) return Acquire.TIMED_OUT
                             monitor.wait(remainMs)
                         }
                     } finally {
                         waiters--
                     }
                 }
-                inFlight++
-                return true
             }
         }
 
         /**
          * Return a permit at stage-B completion. When the pipeline
-         * DRAINED (nothing in flight, nobody waiting) the depth halves
-         * toward 1 — the burst is over, and the next quiet commit takes
-         * the lock-to-commit path again.
+         * DRAINED (nothing in flight, nobody waiting) the depth decays:
+         * halved when the drained cycle contended, straight to 1 when it
+         * did not — one quiet commit after an uncontended lull takes the
+         * lock-to-commit path again instead of lingering on the
+         * session-lock path for log2(depth) commits.
          */
         fun release() {
             synchronized(monitor) {
                 inFlight--
                 if (inFlight == 0 && waiters == 0 && depth > 1) {
-                    depth = maxOf(1, depth / 2)
+                    depth = if (sawContention) maxOf(1, depth / 2) else 1
+                    sawContention = false
                 }
                 if (inFlight == 0 && deltas.isNotEmpty()) {
                     // Every delta's stage B has completed: nothing a
@@ -352,10 +417,10 @@ internal class CommitPipeline(
 
         /**
          * Register the commit's allocations BEFORE the write statement
-         * (whose unlock CTE frees the next stage A) runs: the delta is
-         * what the next stage A merges, so it must be visible no later
-         * than the lock release the write performs. Returns the delta
-         * with its sequence number — stage-A order — assigned.
+         * runs: the explicit unlock right after the write frees the
+         * next stage A, and the delta is what that stage A merges, so
+         * registration must win the race against the release. Returns
+         * the delta with its sequence number — stage-A order — assigned.
          *
          * Runs inside stage A (serialized per catalog by the database
          * lock), which is what makes the idempotency-key re-check here

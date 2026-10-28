@@ -15,10 +15,12 @@ import com.posthog.hoglake.model.validateSplitOffsets
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.persistence.Locks
+import com.posthog.hoglake.persistence.Pg
 import com.posthog.hoglake.storedPayloadObjectMapper
 import io.github.oshai.kotlinlogging.KotlinLogging
 import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.Jdbi
+import org.jdbi.v3.core.statement.UnableToExecuteStatementException
 import java.util.UUID
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.TimeUnit
@@ -348,8 +350,6 @@ class CommitService(
          * the read IS authoritative.
          */
         val view: CommitPipeline.CatalogPipe.View?,
-        /** PIPELINED only: the write releases the session lock (CommitTail.PIPELINED_WRITE_SQL's unlock CTE). */
-        val releaseLockInWrite: Boolean,
         /**
          * PIPELINED only: handed the commit's allocations (snapshot id,
          * next_file_id after, per-table next_row_id after, registered
@@ -388,14 +388,44 @@ class CommitService(
                     .findOne()
                     .orElseThrow { HoglakeException.NotFound("catalog '$catalog'") }
             }
-        val pipe = pipeline.pipe(catalogId)
+        // ONE admission budget across the permit wait, every replay
+        // wait, and every attempt's lock waits: a deadline, computed
+        // once from the queue-wait-adjusted configured bound. <= 0 is
+        // the documented unbounded sentinel and stays unbounded; an
+        // EXPIRED positive budget is a typed 503, never a zero that
+        // Locks would read as unbounded.
         val budgetMs = RequestAdmission.remainingLockTimeoutMs(commitLockTimeoutMs)
-        val enteredNanos = System.nanoTime()
-        if (!pipe.acquire(budgetMs)) {
-            throw HoglakeException.CommitQueueTimeout(
-                "commit admission timed out after ${budgetMs}ms waiting for a commit pipeline " +
-                    "slot (catalog_id=$catalogId); the catalog is busy — retry",
-            )
+        val deadlineNanos =
+            if (budgetMs > 0) System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(budgetMs) else 0L
+
+        fun remainingMs(): Long = if (deadlineNanos == 0L) 0L else (deadlineNanos - System.nanoTime()) / 1_000_000
+
+        fun remainingOrExpired(phase: String): Long {
+            if (deadlineNanos == 0L) return 0L
+            val left = remainingMs()
+            if (left <= 0) {
+                throw HoglakeException.CommitQueueTimeout(
+                    "commit admission budget of ${budgetMs}ms exhausted $phase " +
+                        "(catalog_id=$catalogId); the catalog is busy — retry",
+                )
+            }
+            return left
+        }
+
+        var pipe = pipeline.pipe(catalogId)
+        while (true) {
+            when (pipe.acquire(remainingOrExpired("before queueing for a commit pipeline slot"))) {
+                CommitPipeline.CatalogPipe.Acquire.ACQUIRED -> break
+                CommitPipeline.CatalogPipe.Acquire.RETIRED ->
+                    // Lost the retire race (a fresh pipe was installed
+                    // after our lookup); re-lookup and acquire there.
+                    pipe = pipeline.pipe(catalogId)
+                CommitPipeline.CatalogPipe.Acquire.TIMED_OUT ->
+                    throw HoglakeException.CommitQueueTimeout(
+                        "commit admission timed out after ${budgetMs}ms waiting for a commit pipeline " +
+                            "slot (catalog_id=$catalogId); the catalog is busy — retry",
+                    )
+            }
         }
         try {
             var firstPath: CommitPipeline.Path? = null
@@ -410,7 +440,7 @@ class CommitService(
                         if (!original.fingerprint.contentEquals(fingerprint)) {
                             throw HoglakeException.Validation("idempotency_key reused with a different request")
                         }
-                        awaitInFlight(original, catalogId, budgetMs)?.let { return it }
+                        awaitInFlight(original, catalogId, remainingMs())?.let { return it }
                         // The original rolled back before publishing; a
                         // missing receipt is not a fence — publish anew.
                     }
@@ -438,7 +468,7 @@ class CommitService(
                         userAgent,
                         path,
                         drain,
-                        lockBudgetMs(budgetMs, enteredNanos),
+                        remainingOrExpired("before the stage-A lock wait"),
                     )
                 } catch (e: CommitPipeline.CatalogPipe.DeferredReplay) {
                     // Stage A found this key already in flight (the
@@ -447,10 +477,15 @@ class CommitService(
                     if (!e.original.fingerprint.contentEquals(fingerprint)) {
                         throw HoglakeException.Validation("idempotency_key reused with a different request")
                     }
-                    awaitInFlight(e.original, catalogId, budgetMs)?.let { return it }
+                    awaitInFlight(e.original, catalogId, remainingMs())?.let { return it }
                     // The original rolled back before publishing — loop
                     // and publish anew.
                 } catch (e: CommitTail.AllocationMoved) {
+                    // A DRAINED attempt already waited out every
+                    // in-flight commit and holds the advisory lock: a
+                    // moved allocator there is a bug, not a race, and
+                    // retrying would mask it.
+                    if (path == CommitPipeline.Path.DRAINED) throw e
                     attempts++
                     if (attempts >= MAX_PIPELINE_ATTEMPTS) {
                         throw HoglakeException.CommitQueueTimeout(
@@ -472,27 +507,48 @@ class CommitService(
     }
 
     /**
-     * The admission budget left for the stage-A lock wait: the
-     * (request-queue-adjusted) bound less what this commit already spent
-     * on the permit wait, in-flight replay waits and earlier attempts —
-     * one bounded wait per request, however many queues it stood in.
-     * [Locks.acquireCatalogCommitLock]'s floor keeps a sliver regardless.
+     * The exception mapping one attempt owes its callers. A
+     * `lock_timeout` firing ANYWHERE in the attempt — the drain's row
+     * wait and the write's row-lock wait are the waits the pipeline
+     * added, and the transaction-local lock_timeout covers them — is
+     * the same admission backpressure the advisory-lock wait produces,
+     * so it maps to the typed, retryable CommitQueueTimeout (503), not
+     * a generic 500. A unique violation on the allocator-ordered keys
+     * is the cross-pod race surfacing as a constraint error (the
+     * loser's planned ids collide with the winner's committed rows;
+     * for a receipt key the retry's fresh read finds the winner's
+     * durable receipt and replays it) — [CommitTail.AllocationMoved],
+     * which the driver retries with a drain.
      */
-    private fun lockBudgetMs(
-        budgetMs: Long,
-        enteredNanos: Long,
-    ): Long {
-        if (budgetMs <= 0) return budgetMs
-        return maxOf(0L, budgetMs - (System.nanoTime() - enteredNanos) / 1_000_000)
+    private fun mapLockTimeouts(
+        e: Throwable,
+        catalogId: Long,
+    ): Throwable {
+        if (e is UnableToExecuteStatementException) {
+            if (Pg.isLockTimeout(e)) {
+                return HoglakeException.CommitQueueTimeout(
+                    "commit admission timed out waiting on the catalog's in-flight commits " +
+                        "(catalog_id=$catalogId); the catalog is busy — retry",
+                )
+            }
+            if (Pg.isCommitAllocatorUniqueViolation(e)) {
+                return CommitTail.AllocationMoved(
+                    "commit write for catalog_id=$catalogId collided with a commit it never saw " +
+                        "(${Pg.sqlState(e)}): the allocator moved under it",
+                )
+            }
+        }
+        return e
     }
 
     /**
      * One attempt: one connection, one transaction, then the COMMIT —
      * stage B — which for [CommitPipeline.Path.PIPELINED] runs AFTER the
-     * session lock was released by the write's unlock CTE, so the flush
-     * wait overlaps the next commit's stage A. The permit is the
-     * caller's; this function's finally only manages the handle, the
-     * session lock, and the delta it registered.
+     * session lock was released (an explicit statement once the write
+     * has returned), so the flush wait overlaps the next commit's stage
+     * A. The permit is the caller's; this function's finally only
+     * manages the handle, the session lock, and the delta it
+     * registered.
      */
     private fun attemptOnce(
         pipe: CommitPipeline.CatalogPipe,
@@ -515,7 +571,7 @@ class CommitService(
             val result =
                 when (path) {
                     CommitPipeline.Path.LOCKED, CommitPipeline.Path.DRAINED -> {
-                        Locks.acquireCatalogCommitLock(h, catalogId, lockBudgetMs)
+                        Locks.acquireCatalogCommitLock(h, catalogId, lockBudgetMs, preAdjusted = true)
                         if (drain) drainInFlightCommits(h, catalogId)
                         doCommit(
                             h,
@@ -529,14 +585,22 @@ class CommitService(
                                     catalogId,
                                     dataPath,
                                     view = null,
-                                    releaseLockInWrite = false,
                                     deltaSink = null,
                                 ),
                         )
                     }
                     CommitPipeline.Path.PIPELINED -> {
-                        Locks.acquireCatalogCommitLockSession(h, catalogId, lockBudgetMs)
+                        // BEFORE the acquire, deliberately: Postgres can
+                        // GRANT the lock and then fail the statement
+                        // (the lock_timeout interrupt landing after the
+                        // grant — LockErrorCleanup keeps a granted
+                        // SESSION lock), and an xact ROLLBACK would not
+                        // release it. Treating acquisition as
+                        // maybe-succeeded on every exit below is what
+                        // keeps a pooled connection from carrying the
+                        // catalog's lock back to the pool.
                         sessionLockHeld = true
+                        Locks.acquireCatalogCommitLockSession(h, catalogId, lockBudgetMs, preAdjusted = true)
                         if (drain) drainInFlightCommits(h, catalogId)
                         pipe.pruneDeltas()
                         val staged =
@@ -552,7 +616,6 @@ class CommitService(
                                         catalogId,
                                         dataPath,
                                         view = if (drain) null else pipe.view(),
-                                        releaseLockInWrite = true,
                                         deltaSink = { snapshotId, nextFileIdAfter, nextRowIdsAfter, registeredPaths ->
                                             delta =
                                                 pipe.registerDelta(
@@ -566,19 +629,17 @@ class CommitService(
                                         },
                                     ),
                             )
-                        if (delta == null) {
-                            // doCommit returned BEFORE the write — the
-                            // durable-receipt replay's early return — so
-                            // the write's unlock CTE never ran and the
-                            // session lock is still ours. Release it
-                            // explicitly: a leaked session advisory lock
-                            // outlives the connection's return to the
-                            // pool and blocks this catalog for the full
-                            // lock_timeout on every later commit.
-                            Locks.releaseCatalogCommitLock(h, catalogId)
-                        }
-                        // Either way the stage-A lock is gone: released
-                        // by the write's unlock CTE, or just now.
+                        // Stage A ends HERE: an explicit unlock
+                        // statement AFTER the write returned (CTE
+                        // ordering cannot be relied on — an unlock CTE
+                        // was observed to run before the write's
+                        // UPDATE). expectHeld: when the write ran
+                        // (delta != null) the lock must be ours; when
+                        // doCommit returned early (the durable-receipt
+                        // replay, no delta) the lock is still ours too
+                        // — the acquire above took it and nothing else
+                        // released it — so expectHeld either way.
+                        Locks.releaseCatalogCommitLock(h, catalogId, expectHeld = true)
                         sessionLockHeld = false
                         staged
                     }
@@ -602,7 +663,7 @@ class CommitService(
                     e.addSuppressed(unlock)
                 }
             }
-            throw e
+            throw mapLockTimeouts(e, catalogId)
         } finally {
             h.close()
         }
@@ -882,9 +943,10 @@ class CommitService(
         val ordOf = tableKeys.withIndex().associate { (i, k) -> (k.namespace to k.table) to i + 1 }
 
         // The pipeline driver takes the lock itself (xact-scoped for
-        // LOCKED/DRAINED, session-scoped for PIPELINED, released by the
-        // write's unlock CTE there) and, for DRAINED, has already waited
-        // out every in-flight commit (drainInFlightCommits).
+        // LOCKED/DRAINED, session-scoped for PIPELINED, released by an
+        // explicit unlock statement after the write returns there) and,
+        // for DRAINED, has already waited out every in-flight commit
+        // (drainInFlightCommits).
         if (pipeCtx == null) {
             Locks.acquireCatalogCommitLock(h, catalogId, commitLockTimeoutMs)
         }
@@ -1242,10 +1304,10 @@ class CommitService(
         // that tells a correct client it is wrong, which is strictly
         // worse than a retryable 500.
         // The pipeline's in-flight delta is registered BEFORE the
-        // write: the write's unlock CTE frees the next stage A, and the
-        // delta is what that stage A merges — registration must win the
-        // race against the lock release. On a failed write the driver
-        // removes it again (failDelta).
+        // write: the explicit unlock right after the write frees the
+        // next stage A, and the delta is what that stage A merges —
+        // registration must win the race against the lock release. On a
+        // failed write the driver removes it again (failDelta).
         pipeCtx?.deltaSink?.invoke(
             snapshotId,
             firstFileId + totalFiles,
@@ -1271,7 +1333,6 @@ class CommitService(
                 idempotencyKey = req.idempotencyKey,
                 fingerprint = fingerprint,
             ),
-            unlockKey = if (pipeCtx?.releaseLockInWrite == true) Locks.catalogCommitLockKey(catalogId) else null,
         )
         return CommitResult(snapshotId, schemaVersion)
     }

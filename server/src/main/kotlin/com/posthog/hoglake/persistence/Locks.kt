@@ -158,15 +158,22 @@ object Locks {
         handle: Handle,
         catalogId: Long,
         lockTimeoutMs: Long = 0,
-    ) = acquireCatalogCommitLock(handle, catalogId, lockTimeoutMs, sessionScoped = false)
+        preAdjusted: Boolean = false,
+    ) = acquireCatalogCommitLock(handle, catalogId, lockTimeoutMs, sessionScoped = false, preAdjusted = preAdjusted)
 
     private fun acquireCatalogCommitLock(
         handle: Handle,
         catalogId: Long,
         lockTimeoutMs: Long,
         sessionScoped: Boolean,
+        preAdjusted: Boolean,
     ) {
-        val effectiveTimeoutMs = RequestAdmission.remainingLockTimeoutMs(lockTimeoutMs)
+        // [preAdjusted]: the caller (the commit pipeline's driver)
+        // already charged the request-queue wait against this bound and
+        // tracks ONE deadline across the permit wait, replay waits and
+        // every attempt; charging it again here would double-count it.
+        val effectiveTimeoutMs =
+            if (preAdjusted) lockTimeoutMs else RequestAdmission.remainingLockTimeoutMs(lockTimeoutMs)
         if (effectiveTimeoutMs > 0) {
             handle.createQuery("SELECT set_config('lock_timeout', ?, true)")
                 .bind(0, effectiveTimeoutMs.toString())
@@ -200,46 +207,68 @@ object Locks {
     /**
      * [acquireCatalogCommitLock]'s SESSION-scoped twin, for the
      * pipelined commit path (`CommitPipeline`): the lock outlives the
-     * transaction it is taken in and is released explicitly —
-     * `CommitTail.PIPELINED_WRITE_SQL`'s unlock CTE on success,
-     * [releaseCatalogCommitLock] on every other exit — so the
-     * per-catalog serialization covers stage A (the read, the checks,
-     * the write) and NOT the JDBC COMMIT's flush wait. The wait
-     * recording, the [RequestAdmission] budget charge and the
-     * `lock_timeout` -> CommitQueueTimeout mapping are identical to the
-     * xact-scoped form: queueing for stage A is the admission wait it
-     * always was.
+     * transaction it is taken in and is released EXPLICITLY, by
+     * [releaseCatalogCommitLock], after the write statement returns and
+     * before the JDBC COMMIT — so the per-catalog serialization covers
+     * stage A (the read, the checks, the write) and NOT the COMMIT's
+     * flush wait. The release is a separate statement, not a CTE in the
+     * write: Postgres does not order independent CTEs, and an unlock
+     * CTE was OBSERVED (PG 18) to run before the write's alloc UPDATE,
+     * ending stage A's exclusion early. The wait recording, the
+     * [RequestAdmission] budget charge and the `lock_timeout` ->
+     * CommitQueueTimeout mapping are identical to the xact-scoped form.
      *
-     * SESSION scope is a leak risk an xact lock never had: a pooled
-     * connection returned with the lock still held would poison every
-     * later borrower. The caller's finally must run
-     * [releaseCatalogCommitLock] whenever the write's unlock CTE may not
-     * have run, and a failed release aborts the connection rather than
-     * return it locked.
+     * SESSION scope is a leak risk an xact lock never had — a pooled
+     * connection returned with the lock still held poisons every later
+     * borrower — and Postgres makes it worse than it looks: a
+     * `lock_timeout` (or statement_timeout) interrupt can fire AFTER
+     * the lock manager granted the lock, so the acquire statement can
+     * throw with the lock HELD, and ROLLBACK does not release a session
+     * lock. Callers must therefore treat acquisition as
+     * maybe-succeeded on ANY throw and always run
+     * [releaseCatalogCommitLock] on the failure path; a failed release
+     * aborts the connection rather than return it locked. Session locks
+     * also pin this path to direct connections: behind a
+     * transaction-mode pooler (PgBouncer, RDS Proxy) acquire and
+     * release could land on different backends, so the pipelined commit
+     * path requires none in between.
      */
     fun acquireCatalogCommitLockSession(
         handle: Handle,
         catalogId: Long,
         lockTimeoutMs: Long = 0,
-    ) = acquireCatalogCommitLock(handle, catalogId, lockTimeoutMs, sessionScoped = true)
+        preAdjusted: Boolean = false,
+    ) = acquireCatalogCommitLock(handle, catalogId, lockTimeoutMs, sessionScoped = true, preAdjusted = preAdjusted)
 
     /**
      * Release what [acquireCatalogCommitLockSession] took, on the same
-     * connection. Best-effort about double release (the write's unlock
-     * CTE may already have run — Postgres answers false and a WARNING,
-     * harmless on a failure path that is about to roll back) but NOT
-     * about failure: a connection whose unlock failed is aborted, never
-     * returned to the pool still holding the lock.
+     * connection. [expectHeld] = the success path, where the lock must
+     * be ours (a false answer means the write ran WITHOUT the lock held
+     * — a leak in the other direction — so it throws and the commit
+     * rolls back); the failure path leaves it false, where a double
+     * release or a never-granted acquire (the lock-timeout-after-grant
+     * race) answers false plus a WARNING, both harmless on a path that
+     * is about to roll back. NOT best-effort about failure: a
+     * connection whose unlock failed is aborted, never returned to the
+     * pool still holding the lock.
      */
     fun releaseCatalogCommitLock(
         handle: Handle,
         catalogId: Long,
+        expectHeld: Boolean = false,
     ) {
         try {
-            handle.createQuery("SELECT pg_advisory_unlock(:key)")
-                .bind("key", catalogCommitLockKey(catalogId))
-                .mapTo(Boolean::class.javaObjectType)
-                .one()
+            val released =
+                handle.createQuery("SELECT pg_advisory_unlock(:key)")
+                    .bind("key", catalogCommitLockKey(catalogId))
+                    .mapTo(Boolean::class.javaObjectType)
+                    .one()
+            if (expectHeld && !released) {
+                throw IllegalStateException(
+                    "commit write for catalog_id=$catalogId ran without the commit lock held " +
+                        "(pg_advisory_unlock answered false)",
+                )
+            }
         } catch (e: Exception) {
             // A pooled connection must never retain this session lock.
             handle.connection.abort { it.run() }

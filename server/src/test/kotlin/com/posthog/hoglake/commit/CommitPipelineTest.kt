@@ -6,7 +6,6 @@ import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.Test
 import java.util.UUID
-import kotlin.concurrent.thread
 
 /**
  * The pipeline's admission, depth adaptation and delta bookkeeping,
@@ -17,80 +16,103 @@ import kotlin.concurrent.thread
 class CommitPipelineTest {
     private val pipe = CommitPipeline.CatalogPipe(cap = 8)
 
-    private fun spinUntilTrue(
-        timeoutMs: Long = 5_000,
-        cond: () -> Boolean,
-    ) {
-        val deadline = System.nanoTime() + timeoutMs * 1_000_000
-        while (!cond()) {
-            if (System.nanoTime() > deadline) throw AssertionError("condition not met within ${timeoutMs}ms")
-            Thread.sleep(2)
-        }
-    }
-
     @Test
     fun `a catalog at rest takes the locked path at depth 1`() {
         assertThat(pipe.depth).isEqualTo(1)
-        assertThat(pipe.acquire(1_000)).isTrue()
+        assertThat(pipe.acquire(1_000)).isEqualTo(CommitPipeline.CatalogPipe.Acquire.ACQUIRED)
         assertThat(pipe.pathFor(hasDeletes = false)).isEqualTo(CommitPipeline.Path.LOCKED)
-        assertThat(pipe.atRest()).isFalse()
+        assertThat(pipe.depth).isEqualTo(1)
         pipe.release()
         assertThat(pipe.depth).isEqualTo(1)
-        assertThat(pipe.atRest()).isTrue()
     }
 
     @Test
     fun `a commit with deletes takes the drained path even at rest`() {
-        assertThat(pipe.acquire(1_000)).isTrue()
+        assertThat(pipe.acquire(1_000)).isEqualTo(CommitPipeline.CatalogPipe.Acquire.ACQUIRED)
         assertThat(pipe.pathFor(hasDeletes = true)).isEqualTo(CommitPipeline.Path.DRAINED)
         pipe.release()
     }
 
     @Test
-    fun `contention doubles the depth up to the cap, draining halves it back`() {
-        assertThat(pipe.acquire(1_000)).isTrue() // in-flight 1 at depth 1
-        val second =
-            thread {
-                // Contention: queues behind the first, so the depth doubles,
-                // then waits for a slot to free.
-                assertThat(pipe.acquire(5_000)).isTrue()
-            }
-        spinUntilTrue { pipe.depth == 2 }
-        // The widened slot admits a third commit while the waiter sleeps.
-        assertThat(pipe.acquire(1_000)).isTrue()
-        val fourth =
-            thread {
-                // Full again (in-flight 2 >= depth 2): doubles to 4, waits.
-                assertThat(pipe.acquire(5_000)).isTrue()
-            }
-        spinUntilTrue { pipe.depth == 4 }
-        // Freeing a slot wakes both waiters into the widened pipeline.
-        pipe.release()
-        second.join(5_000)
-        fourth.join(5_000)
-        assertThat(second.isAlive).isFalse()
-        assertThat(fourth.isAlive).isFalse()
-        // Three in flight; the draining release halves 4 -> 2.
-        repeat(3) { pipe.release() }
+    fun `a full pipeline doubles the depth and admits through the widened slot, up to the cap`() {
+        assertThat(pipe.acquire(1_000)).isEqualTo(CommitPipeline.CatalogPipe.Acquire.ACQUIRED) // (inFlight 1, depth 1)
+        // Arriving at a full pipeline doubles the depth and enters
+        // through the slot the doubling opened — no sleep.
+        assertThat(pipe.acquire(1_000)).isEqualTo(CommitPipeline.CatalogPipe.Acquire.ACQUIRED)
         assertThat(pipe.depth).isEqualTo(2)
-        // One quiet commit cycle drains to 1 again.
-        assertThat(pipe.acquire(1_000)).isTrue()
-        pipe.release()
-        assertThat(pipe.depth).isEqualTo(1)
-        assertThat(pipe.atRest()).isTrue()
+        assertThat(pipe.acquire(1_000)).isEqualTo(CommitPipeline.CatalogPipe.Acquire.ACQUIRED)
+        assertThat(pipe.depth).isEqualTo(4)
+        assertThat(pipe.acquire(1_000)).isEqualTo(CommitPipeline.CatalogPipe.Acquire.ACQUIRED) // 3 < 4: room
+        assertThat(pipe.depth).isEqualTo(4)
+        assertThat(pipe.acquire(1_000)).isEqualTo(CommitPipeline.CatalogPipe.Acquire.ACQUIRED)
+        assertThat(pipe.depth).isEqualTo(8)
+        // Fill to the cap (8 in flight)...
+        repeat(3) { assertThat(pipe.acquire(1_000)).isEqualTo(CommitPipeline.CatalogPipe.Acquire.ACQUIRED) }
+        assertThat(pipe.depth).isEqualTo(8)
+        // ...beyond the cap the waiter actually waits out its budget.
+        val started = System.nanoTime()
+        assertThat(pipe.acquire(200)).isEqualTo(CommitPipeline.CatalogPipe.Acquire.TIMED_OUT)
+        assertThat((System.nanoTime() - started) / 1_000_000).isGreaterThanOrEqualTo(150)
+        // A contended drain halves: the last release of the burst takes 8 -> 4.
+        repeat(8) { pipe.release() }
+        assertThat(pipe.depth).isEqualTo(4)
     }
 
     @Test
-    fun `the permit wait honours the admission budget`() {
-        val single = CommitPipeline.CatalogPipe(cap = 1)
-        assertThat(single.acquire(1_000)).isTrue()
-        val started = System.nanoTime()
-        assertThat(single.acquire(200)).isFalse()
-        val waitedMs = (System.nanoTime() - started) / 1_000_000
-        assertThat(waitedMs).isGreaterThanOrEqualTo(150)
-        single.release()
-        assertThat(single.acquire(1_000)).isTrue()
-        single.release()
+    fun `an uncontended drain decays the depth straight to 1`() {
+        // Contend up to depth 4, drain: halves to 2.
+        repeat(3) { assertThat(pipe.acquire(1_000)).isEqualTo(CommitPipeline.CatalogPipe.Acquire.ACQUIRED) }
+        assertThat(pipe.depth).isEqualTo(4)
+        repeat(3) { pipe.release() }
+        assertThat(pipe.depth).isEqualTo(2)
+        // One quiet cycle — no contention — decays straight to 1, so a
+        // catalog gone quiet takes the lock-to-commit path again at once
+        // instead of lingering on the session-lock path.
+        assertThat(pipe.acquire(1_000)).isEqualTo(CommitPipeline.CatalogPipe.Acquire.ACQUIRED)
+        pipe.release()
+        assertThat(pipe.depth).isEqualTo(1)
+    }
+
+    @Test
+    fun `depth adapts within the configured cap`() {
+        val pipeline = CommitPipeline(maxInFlight = 3)
+        val p = pipeline.pipe(1)
+        assertThat(p.acquire(1_000)).isEqualTo(CommitPipeline.CatalogPipe.Acquire.ACQUIRED)
+        assertThat(p.acquire(1_000)).isEqualTo(CommitPipeline.CatalogPipe.Acquire.ACQUIRED)
+        assertThat(p.depth).isEqualTo(2)
+        assertThat(p.acquire(1_000)).isEqualTo(CommitPipeline.CatalogPipe.Acquire.ACQUIRED)
+        assertThat(p.depth).isEqualTo(3) // capped: 2 * 2 would exceed it
+        assertThat(p.acquire(200)).isEqualTo(CommitPipeline.CatalogPipe.Acquire.TIMED_OUT)
+        repeat(3) { p.release() }
+        assertThat(p.depth).isEqualTo(1) // 3 / 2, floored
+    }
+
+    @Test
+    fun `a retired pipe never admits, and the map hands out its fresh replacement`() {
+        val pipeline = CommitPipeline(maxInFlight = 16)
+        val p = pipeline.pipe(7)
+        assertThat(p.acquire(1_000)).isEqualTo(CommitPipeline.CatalogPipe.Acquire.ACQUIRED)
+        p.release()
+        pipeline.retireIfIdle(7, p)
+        val fresh = pipeline.pipe(7)
+        assertThat(fresh).isNotSameAs(p)
+        // A thread still holding the stale reference is turned away and
+        // re-looks-up, so one catalog can never have two live pipes.
+        assertThat(p.acquire(1_000)).isEqualTo(CommitPipeline.CatalogPipe.Acquire.RETIRED)
+        assertThat(fresh.acquire(1_000)).isEqualTo(CommitPipeline.CatalogPipe.Acquire.ACQUIRED)
+        fresh.release()
+    }
+
+    @Test
+    fun `a busy pipe is not retired`() {
+        val pipeline = CommitPipeline(maxInFlight = 16)
+        val p = pipeline.pipe(9)
+        assertThat(p.acquire(1_000)).isEqualTo(CommitPipeline.CatalogPipe.Acquire.ACQUIRED)
+        pipeline.retireIfIdle(9, p)
+        assertThat(pipeline.pipe(9)).isSameAs(p)
+        p.release()
+        pipeline.retireIfIdle(9, p)
+        assertThat(pipeline.pipe(9)).isNotSameAs(p)
     }
 
     @Test
@@ -157,69 +179,13 @@ class CommitPipelineTest {
     }
 
     @Test
-    fun `the session lock key function computes the acquisition SQL's key`() {
-        // The acquisition SQL builds (class << 32) | (catalog_id & 0xFFFFFFFF);
-        // the unlock CTE binds this function's value. They must agree or the
-        // pipelined path stops serializing (Locks.catalogCommitLockKey's KDoc).
+    fun `the lock key function computes the acquisition SQL's key`() {
+        // The acquisition SQL binds this function's value; the unlock
+        // statement binds it too. They must agree or the pipelined path
+        // stops serializing (Locks.catalogCommitLockKey's KDoc).
         for (catalogId in listOf(0L, 1L, 42L, Int.MAX_VALUE.toLong(), Int.MAX_VALUE + 5L, 4_000_000_000L)) {
             assertThat(Locks.catalogCommitLockKey(catalogId))
                 .isEqualTo((Locks.CATALOG_COMMIT_LOCK_CLASS.toLong() shl 32) or (catalogId and 0xFFFFFFFFL))
         }
-    }
-
-    @Test
-    fun `the pipeline retires an idle catalog's pipe`() {
-        val pipeline = CommitPipeline(maxInFlight = 16)
-        val p = pipeline.pipe(7)
-        assertThat(p.acquire(1_000)).isTrue()
-        p.release()
-        pipeline.retireIfIdle(7, p)
-        assertThat(pipeline.pipe(7)).isNotSameAs(p)
-    }
-
-    @Test
-    fun `a busy pipe is not retired`() {
-        val pipeline = CommitPipeline(maxInFlight = 16)
-        val p = pipeline.pipe(9)
-        assertThat(p.acquire(1_000)).isTrue()
-        pipeline.retireIfIdle(9, p)
-        assertThat(pipeline.pipe(9)).isSameAs(p)
-        p.release()
-        pipeline.retireIfIdle(9, p)
-        assertThat(pipeline.pipe(9)).isNotSameAs(p)
-    }
-
-    @Test
-    fun `depth adapts within the configured cap`() {
-        val pipeline = CommitPipeline(maxInFlight = 3)
-        val p = pipeline.pipe(1)
-        assertThat(p.acquire(1_000)).isTrue() // in-flight 1, depth 1
-        val t =
-            thread {
-                // Contention doubles 1 -> 2; the waiter sleeps for a slot.
-                assertThat(p.acquire(5_000)).isTrue()
-            }
-        spinUntilTrue { p.depth == 2 }
-        assertThat(p.acquire(1_000)).isTrue() // the widened slot: in-flight 2
-        val t2 =
-            thread {
-                // Full again (2 >= 2): doubles 2 -> 3, capped (2 * 2 would exceed it).
-                assertThat(p.acquire(5_000)).isTrue()
-            }
-        spinUntilTrue { p.depth == 3 }
-        assertThat(p.acquire(1_000)).isTrue() // in-flight 3, the cap
-        // Cap reached and full: a further commit waits out the budget.
-        assertThat(p.acquire(200)).isFalse()
-        // Freeing two slots wakes both waiters, in either order.
-        p.release()
-        p.release()
-        t.join(5_000)
-        t2.join(5_000)
-        assertThat(t.isAlive).isFalse()
-        assertThat(t2.isAlive).isFalse()
-        // Drain: the last release halves 3 -> 1.
-        repeat(3) { p.release() }
-        assertThat(p.depth).isEqualTo(1)
-        assertThat(p.atRest()).isTrue()
     }
 }

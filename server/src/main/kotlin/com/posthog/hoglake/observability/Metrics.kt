@@ -339,12 +339,14 @@ object Metrics {
 
     /**
      * hoglake_commit_pipeline_retries_total{catalog} — commits retried
-     * whole after a guarded allocator write found the row moved
-     * (CommitTail.AllocationMoved): the signature of TWO SERVER
-     * INSTANCES pipelining one catalog at once. Within one pod the race
-     * is unreachable, so a standing nonzero rate means cross-pod
-     * writers, and the retry budget (CommitService.MAX_PIPELINE_ATTEMPTS)
-     * is what stands between them and 503s.
+     * whole after the guarded allocator write found the row moved
+     * (CommitTail.AllocationMoved). In-pod overlap does NOT retry (the
+     * write blocks on the predecessor's row lock and proceeds), so a
+     * nonzero rate means a genuine race: cross-pod writers on one
+     * catalog, or an in-pod predecessor whose COMMIT rolled back after
+     * a successor merged its delta. The retry budget
+     * (CommitService.MAX_PIPELINE_ATTEMPTS) is what stands between
+     * those and 503s.
      */
     fun commitPipelineRetry(catalog: String) =
         increment("hoglake_commit_pipeline_retries_total", 1.0, "catalog", catalog)
