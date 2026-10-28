@@ -50,14 +50,18 @@ class CommitPipelineIntegrationTest {
     /** The service under test: pipeline enabled, generous cap. */
     private val commits = CommitService(db.jdbi, commitMaxInFlight = CommitPipeline.MAX_DEPTH)
 
-    /** Every statement the pipelined service sends, raw SQL — for the lock-form assertions. */
+    /** Every statement the pipelined service attempts, raw SQL — for the lock-form assertions. */
     private val issued = CopyOnWriteArrayList<String>()
 
     private val instrumented =
         Database.jdbi(db.dataSource).also {
             it.setSqlLogger(
                 object : SqlLogger {
-                    override fun logAfterExecution(context: StatementContext) {
+                    override fun logBeforeExecution(context: StatementContext) {
+                        // BEFORE execution: a statement that FAILS (the
+                        // allocator-race PK collision, say) never
+                        // reaches logAfterExecution, and a retry's
+                        // first write is exactly such a statement.
                         issued += context.rawSql
                     }
                 },
@@ -130,11 +134,14 @@ class CommitPipelineIntegrationTest {
      * the catalog's pipe widened (depth >= 2 survives the halving
      * drain), so the NEXT commit takes the PIPELINED path even alone.
      */
-    private fun warmPipe(cat: String) {
+    private fun warmPipe(
+        cat: String,
+        service: CommitService = commits,
+    ) {
         setGate(200)
         try {
             val pool = Executors.newFixedThreadPool(4)
-            val tasks = (1..4).map { pool.submit { commits.commit(cat, append(cat)) } }
+            val tasks = (1..4).map { pool.submit { service.commit(cat, append(cat)) } }
             pool.shutdown()
             tasks.forEach { it.get(30, TimeUnit.SECONDS) }
         } finally {
@@ -144,6 +151,9 @@ class CommitPipelineIntegrationTest {
 
     @org.junit.jupiter.api.BeforeAll
     fun installGate() = installCommitGate()
+
+    @org.junit.jupiter.api.AfterAll
+    fun closeDb() = db.close()
 
     @org.junit.jupiter.api.AfterEach
     fun resetGate() = setGate(0)
@@ -876,6 +886,221 @@ class CommitPipelineIntegrationTest {
         } finally {
             setGate(0)
             inFlight.get(30, TimeUnit.SECONDS)
+        }
+        assertThat(advisoryLocksHeld()).isZero()
+    }
+
+    @Test
+    fun `a LOCKED commit overtaken to the lock by a PIPELINED one merges its delta — one write, no retry`() {
+        // The burst-onset race, made deterministic: the LOCKED commit
+        // (first arrival, depth 1) is stalled BEFORE its advisory
+        // acquire, so the PIPELINED sibling wins the lock, writes,
+        // registers its delta, unlocks and flushes slowly. The LOCKED
+        // commit then reads: it must merge the in-flight delta (fix)
+        // or it plans the same ids, collides on hog_data_file_pkey
+        // after the row-lock wait, and retries — a second write
+        // (counted at BEFORE-execution: the colliding write fails the
+        // statement, which logAfterExecution would never see).
+        val cat = fixture()
+        val baseSnapshots = snapshotCount(cat)
+        val baseHead = head(cat)
+        val stalled = AtomicBoolean(false)
+        val writes = AtomicInteger(0)
+        val delaying =
+            Database.jdbi(db.dataSource).also {
+                it.setSqlLogger(
+                    object : SqlLogger {
+                        override fun logBeforeExecution(context: StatementContext) {
+                            if (context.rawSql == CommitTail.WRITE_SQL) writes.incrementAndGet()
+                            if (context.rawSql.contains("pg_advisory") && stalled.compareAndSet(false, true)) {
+                                Thread.sleep(400)
+                            }
+                        }
+                    },
+                )
+            }
+        val service = CommitService(delaying, commitMaxInFlight = CommitPipeline.MAX_DEPTH)
+
+        setGate(600)
+        val pool = Executors.newFixedThreadPool(2)
+        try {
+            val locked = pool.submit { service.commit(cat, append(cat)) }
+            Thread.sleep(100) // the LOCKED commit is parked before its acquire
+            val pipelined = pool.submit { service.commit(cat, append(cat)) }
+            locked.get(30, TimeUnit.SECONDS)
+            pipelined.get(30, TimeUnit.SECONDS)
+        } finally {
+            pool.shutdown()
+            setGate(0)
+        }
+        assertThat(stalled).isTrue()
+        assertThat(writes.get())
+            .describedAs("one write statement per commit — no retry after the lost advisory race")
+            .isEqualTo(2)
+        assertThat(snapshotCount(cat)).isEqualTo(baseSnapshots + 2)
+        assertThat(head(cat)).isEqualTo(baseHead + 2)
+        assertThat(advisoryLocksHeld()).isZero()
+    }
+
+    @Test
+    fun `burst onsets never retry — a LOCKED commit overtaken by a PIPELINED one still lands in one write`() {
+        // The same race, statistical: every burst onset (quiet catalog,
+        // then concurrency) puts a LOCKED first commit against
+        // PIPELINED siblings for the advisory lock. Pin: every burst
+        // costs exactly one write statement per commit.
+        val cat = fixture()
+        val baseSnapshots = snapshotCount(cat)
+        val baseHead = head(cat)
+        setGate(20)
+        try {
+            repeat(12) { round ->
+                // The quiet commit between rounds takes the drain's
+                // uncontended decay back to depth 1, so the next
+                // burst's first commit is LOCKED again.
+                instrumentedCommits.commit(cat, append(cat))
+                issued.clear()
+                val pool = Executors.newFixedThreadPool(4)
+                val tasks = (1..4).map { pool.submit { instrumentedCommits.commit(cat, append(cat)) } }
+                pool.shutdown()
+                tasks.forEach { it.get(30, TimeUnit.SECONDS) }
+                assertThat(issued.count { it == CommitTail.WRITE_SQL })
+                    .describedAs("write statements for 4 burst commits (round $round)")
+                    .isEqualTo(4)
+                issued.clear()
+            }
+        } finally {
+            setGate(0)
+        }
+        // Dense and ordered throughout: one snapshot per commit.
+        assertThat(snapshotCount(cat)).isEqualTo(baseSnapshots + 12 * 5L)
+        assertThat(head(cat)).isEqualTo(baseHead + 12 * 5L)
+        assertThat(advisoryLocksHeld()).isZero()
+    }
+
+    @Test
+    fun `a replay whose budget expires before the deferred-replay wait is shed as a 503, not a hang`() {
+        // The replay must reach the DeferredReplay catch with its
+        // admission budget ALREADY spent: it passes the in-flight
+        // pre-check before the original registers its delta, then is
+        // parked client-side (a SqlLogger stall before its advisory
+        // acquire — no lock_timeout covers a client-side park) until
+        // after the deadline. Stage A then finds the original's delta
+        // and throws DeferredReplay; the wait on the original must
+        // throw the typed 503 (fix), not wait unbounded for the
+        // original's 2s flush (the bug).
+        val cat = fixture()
+        val parked = AtomicBoolean(false)
+        val parking =
+            Database.jdbi(db.dataSource).also {
+                it.setSqlLogger(
+                    object : SqlLogger {
+                        override fun logBeforeExecution(context: StatementContext) {
+                            if (Thread.currentThread().name == "replay" &&
+                                context.rawSql.contains("pg_advisory") &&
+                                parked.compareAndSet(false, true)
+                            ) {
+                                Thread.sleep(1_200) // burn the 1000ms budget client-side
+                            }
+                        }
+                    },
+                )
+            }
+        val tight =
+            CommitService(parking, commitLockTimeoutMs = 1_000, commitMaxInFlight = CommitPipeline.MAX_DEPTH)
+        // Warm the pipe: the original must take PIPELINED (stage A's
+        // lock released before the flush) so the replay can run its
+        // stage A while the original is in flight.
+        warmPipe(cat, tight)
+        val req = append(cat, key = UUID.randomUUID())
+
+        setGate(2_000)
+        val replayPool =
+            Executors.newSingleThreadExecutor { r -> Thread(r, "replay") }
+        val originalPool = Executors.newSingleThreadExecutor()
+        try {
+            val replay =
+                replayPool.submit<CommitResult?> {
+                    try {
+                        tight.commit(cat, req)
+                    } catch (e: HoglakeException.CommitQueueTimeout) {
+                        null
+                    }
+                }
+            Thread.sleep(50) // the replay is parked before its acquire
+            val original = originalPool.submit { tight.commit(cat, req) }
+            val start = System.nanoTime()
+            assertThat(replay.get(30, TimeUnit.SECONDS))
+                .describedAs("an expired replay budget sheds the replay as a 503 instead of answering")
+                .isNull()
+            val elapsedMs = (System.nanoTime() - start) / 1_000_000
+            assertThat(elapsedMs)
+                .describedAs("the replay did not wait out the original's 2s flush")
+                .isLessThan(1_600)
+            original.get(30, TimeUnit.SECONDS)
+        } finally {
+            setGate(0)
+            replayPool.shutdown()
+            originalPool.shutdown()
+        }
+        assertThat(parked).isTrue()
+        assertThat(advisoryLocksHeld()).isZero()
+    }
+
+    @Test
+    fun `one admission deadline covers every wait of the attempt`() {
+        // The attempt's lock_timeout is re-stated from the budget
+        // REMAINDER before each wait: a commit that spends most of its
+        // budget on the advisory wait gets only what is left for the
+        // allocator row-lock wait, not a second full bound. Holder:
+        // the session advisory lock AND the catalog row lock; the
+        // advisory is released mid-budget, the row lock is not.
+        val cat = fixture()
+        val budgetMs = 800L
+        val tight =
+            CommitService(db.jdbi, commitLockTimeoutMs = budgetMs, commitMaxInFlight = CommitPipeline.MAX_DEPTH)
+        // Warm the SAME service's pipe: the test commit must take
+        // PIPELINED (its stage A releases the advisory lock it waits
+        // on here — the LOCKED path would hold it through COMMIT).
+        tight.commit(cat, append(cat))
+        warmPipe(cat, tight)
+        val catalogId =
+            db.jdbi.withHandleUnchecked { h ->
+                h.createQuery("SELECT catalog_id FROM hog_catalog WHERE name = :cat")
+                    .bind("cat", cat).mapTo(Long::class.java).one()
+            }
+        val lockKey = com.posthog.hoglake.persistence.Locks.catalogCommitLockKey(catalogId)
+
+        val holder = db.jdbi.open()
+        holder.createQuery("SELECT pg_advisory_lock(:key)").bind("key", lockKey).mapToMap().one()
+        holder.begin()
+        holder.execute("UPDATE hog_catalog SET next_file_id = next_file_id WHERE catalog_id = $catalogId")
+        try {
+            val pool = Executors.newSingleThreadExecutor()
+            val start = System.nanoTime()
+            val attempt =
+                pool.submit<Throwable?> {
+                    try {
+                        tight.commit(cat, append(cat))
+                        null
+                    } catch (e: Throwable) {
+                        e
+                    }
+                }
+            pool.shutdown()
+            Thread.sleep(600) // the attempt waits on the advisory lock
+            holder.createQuery("SELECT pg_advisory_unlock(:key)").bind("key", lockKey).mapToMap().one()
+            // The advisory wait consumed ~600ms of the 800ms budget:
+            // the row-lock wait must get the ~200ms REMAINDER (failing
+            // at ~800ms), not a fresh 800ms (failing at ~1400ms).
+            val thrown = attempt.get(30, TimeUnit.SECONDS)
+            val elapsedMs = (System.nanoTime() - start) / 1_000_000
+            assertThat(thrown).isInstanceOf(HoglakeException.CommitQueueTimeout::class.java)
+            assertThat(elapsedMs)
+                .describedAs("the row-lock wait shared the attempt's deadline instead of renewing it")
+                .isLessThan(1_200)
+        } finally {
+            holder.rollback()
+            holder.close()
         }
         assertThat(advisoryLocksHeld()).isZero()
     }

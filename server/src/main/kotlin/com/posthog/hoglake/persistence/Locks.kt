@@ -29,9 +29,9 @@ object Locks {
      * (`(class << 32) | (catalog_id & 0xFFFFFFFF)`). The SQL keeps its
      * inline form (a bound catalog id, no interpolation — invariant 9);
      * this function exists for callers that must name the SAME key as a
-     * bound value — `CommitTail.PIPELINED_WRITE_SQL`'s unlock CTE and
-     * [releaseCatalogCommitLock] — and a test pins that the two agree.
-     * ANY change to one without the other silently breaks commit
+     * bound value — [releaseCatalogCommitLock] and the pipelined commit
+     * path's session-scoped acquire — and a test pins that the two
+     * agree. ANY change to one without the other silently breaks commit
      * serialization (the unlock would release a lock nobody holds, and
      * stage A would stop serializing).
      */

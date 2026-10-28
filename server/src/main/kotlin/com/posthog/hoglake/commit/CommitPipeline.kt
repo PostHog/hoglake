@@ -69,10 +69,10 @@ import java.util.concurrent.ConcurrentHashMap
  *    waits for N's COMMIT. What pipelining overlaps is the LOCK WAIT,
  *    the READ, the CHECKS and the ROW BUILDING of N+1 (and N+2, ...)
  *    with N's flush: the serial residue per commit is the write round
- *    trip plus the flush, not the whole tail. Against network storage
- *    (RDS), where the pre-write tail is several round trips of
- *    milliseconds each, that is the win; it is not N×, and no group
- *    commit batches these flushes.
+ *    trip, the explicit unlock's round trip, and the flush — not the
+ *    whole tail. Against network storage (RDS), where the pre-write
+ *    tail is several round trips of milliseconds each, that is the
+ *    win; it is not N×, and no group commit batches these flushes.
  *
  * ## Read visibility under pipelining
  *
@@ -90,16 +90,6 @@ import java.util.concurrent.ConcurrentHashMap
  * what catches it. Commit-to-commit order cannot invert (the row-lock
  * chain above), so there is no window that could produce a visibility
  * GAP in the snapshot sequence.
- *
- * READ-VISIBILITY NOTE. Because stage A ends before the flush, a
- * maintenance or DDL tail on this catalog (advisory-lock holders all)
- * can now commit in the window between a commit's stage A and its
- * COMMIT, and so become visible to readers a few milliseconds before
- * that commit does. Both orders were always reachable lock-race
- * outcomes — the database state that results is identical; what changed
- * is which side of the race the reader observes first. Commit-to-commit
- * order cannot invert (the row-lock chain above), so this window can
- * never produce a visibility GAP in the snapshot sequence.
  *
  * ## What stage A must know about in-flight commits
  *
@@ -149,15 +139,19 @@ import java.util.concurrent.ConcurrentHashMap
  * Two pods pipelining one catalog can interleave a read and a write
  * across the stage-A boundary (the advisory lock excludes their stage
  * As from each other, not one's stage A from the other's stage B).
- * Every commit's write is guarded on the allocator values it read, so
- * the pod whose write reaches the hog_catalog row SECOND fails its
- * guard, rolls back having written nothing, and retries whole against
- * a fresh (post-drain) read — [CommitTail.AllocationMoved]. OCC is
- * preserved exactly: the loser's conflict checks re-run against state
- * that includes the winner. Bounded attempts; exhaustion is the typed,
- * retryable CommitQueueTimeout the admission contract already uses.
- * Within one pod this race is unreachable (stage A is serial and the
- * deltas make the read whole).
+ * Every commit's write re-validates the allocator values it read
+ * AFTER the row-lock wait (key-only quals + RETURNING counts), so the
+ * pod whose write reaches the hog_catalog row SECOND blocks on the
+ * winner's row lock, fails the post-wait check, rolls back everything
+ * it wrote, and retries whole against a fresh (post-drain) read —
+ * [CommitTail.AllocationMoved]. OCC is preserved exactly: the loser's
+ * conflict checks re-run against state that includes the winner.
+ * Bounded attempts; exhaustion is the typed, retryable
+ * CommitQueueTimeout the admission contract already uses. Within one
+ * pod the only reachable trigger is a rolled-back in-flight
+ * predecessor (its delta was merged; its rows never land) — same
+ * retry, and [CommitPipeline.CatalogPipe.failDelta] has already
+ * unpublished the phantom allocation.
  *
  * ## Adaptive depth
  *
@@ -231,8 +225,9 @@ internal class CommitPipeline(
 
         /**
          * Stage A under the session-scoped lock with the in-flight
-         * deltas merged, the write releasing the lock; stage B is the
-         * COMMIT, outside the serialization.
+         * deltas merged, the lock released by an explicit statement
+         * right after the write returns; stage B is the COMMIT,
+         * outside the serialization.
          */
         PIPELINED,
     }

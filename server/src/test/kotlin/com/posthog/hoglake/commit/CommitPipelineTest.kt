@@ -59,8 +59,27 @@ class CommitPipelineTest {
     }
 
     @Test
-    fun `an uncontended drain decays the depth straight to 1`() {
-        // Contend up to depth 4, drain: halves to 2.
+    fun `an uncontended drain decays the depth straight to 1 from a deep burst`() {
+        // The 2->1 case alone cannot distinguish "straight to 1" from
+        // unconditional halving (4->2->1 and 4->1 agree at depth 2).
+        // Contend to depth 8; the CONTENDED drain halves it to 4.
+        repeat(5) { assertThat(pipe.acquire(1_000)).isEqualTo(CommitPipeline.CatalogPipe.Acquire.ACQUIRED) }
+        assertThat(pipe.depth).isEqualTo(8)
+        repeat(5) { pipe.release() }
+        assertThat(pipe.depth).isEqualTo(4)
+        // A quiet cycle — no contention — drains 4 straight to 1.
+        assertThat(pipe.acquire(1_000)).isEqualTo(CommitPipeline.CatalogPipe.Acquire.ACQUIRED)
+        assertThat(pipe.pathFor(hasDeletes = false)).isEqualTo(CommitPipeline.Path.PIPELINED)
+        pipe.release()
+        assertThat(pipe.depth).isEqualTo(1)
+        // And the next quiet commit is the LOCKED path again.
+        assertThat(pipe.acquire(1_000)).isEqualTo(CommitPipeline.CatalogPipe.Acquire.ACQUIRED)
+        assertThat(pipe.pathFor(hasDeletes = false)).isEqualTo(CommitPipeline.Path.LOCKED)
+        pipe.release()
+    }
+
+    @Test
+    fun `an uncontended drain decays the depth straight to 1`() { // Contend up to depth 4, drain: halves to 2.
         repeat(3) { assertThat(pipe.acquire(1_000)).isEqualTo(CommitPipeline.CatalogPipe.Acquire.ACQUIRED) }
         assertThat(pipe.depth).isEqualTo(4)
         repeat(3) { pipe.release() }

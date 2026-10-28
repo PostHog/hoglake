@@ -778,7 +778,7 @@ data class Config(
      * after the sync flush, so one catalog's flushes stay serial. What
      * overlaps is the lock wait, the read, the checks and the row
      * building of the next commit with the predecessor's flush — the
-     * ceiling is 1/(write + flush) per catalog instead of
+     * ceiling is 1/(write + unlock + flush) per catalog instead of
      * 1/(tail + flush). No group commit batches these flushes.
      *
      * FLEET-UNIFORM DURING ROLLOUT: a pod with this OFF (or older

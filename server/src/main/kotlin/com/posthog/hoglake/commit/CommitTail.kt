@@ -292,7 +292,7 @@ internal object CommitTail {
             -- value qual (`next_row_id = from_row_id`) evaluated
             -- against the STALE visible version matches no row and
             -- returns without ever waiting — the fail-fast that turned
-            -- same-pod pipelined overlap into a retry storm (#review).
+            -- same-pod pipelined overlap into a retry storm.
             -- Key-only quals make the row a candidate, so the UPDATE
             -- blocks on an in-flight predecessor's row lock until its
             -- COMMIT, then applies the RELATIVE advance to the newest

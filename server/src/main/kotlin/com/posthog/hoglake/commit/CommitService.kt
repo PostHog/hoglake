@@ -123,11 +123,12 @@ class CommitService(
         const val DEFAULT_COMMIT_LOCK_TIMEOUT_MS: Long = 30_000
 
         /**
-         * Whole-commit retries after a cross-pod allocator race
+         * Whole-commit retries after a lost allocator race
          * ([CommitTail.AllocationMoved]) before the commit is shed as a
-         * retryable CommitQueueTimeout. The race needs two pods
-         * pipelining one catalog at once; losing it three times running
-         * means a streaming opponent, not bad luck.
+         * retryable CommitQueueTimeout. The race is a cross-pod
+         * overlap or a rolled-back in-flight predecessor; losing it
+         * three times running means a streaming opponent, not bad
+         * luck.
          */
         internal const val MAX_PIPELINE_ATTEMPTS: Int = 3
 
@@ -354,10 +355,17 @@ class CommitService(
          * PIPELINED only: handed the commit's allocations (snapshot id,
          * next_file_id after, per-table next_row_id after, registered
          * paths) immediately BEFORE the write, so the in-memory delta
-         * precedes the lock release the write performs — the next stage
-         * A merges it rather than tripping its allocator guard.
+         * precedes the explicit unlock that follows the write — the
+         * next stage A merges it rather than tripping its allocator
+         * guard.
          */
         val deltaSink: ((Long, Long, Map<Long, Long>, Set<Pair<String, String>>) -> Unit)?,
+        /**
+         * Re-states the transaction's lock_timeout from the admission
+         * budget's REMAINDER; invoked right before the tail write so
+         * the write's row-lock wait cannot outspend the deadline.
+         */
+        val refreshLockTimeout: (Handle) -> Unit = {},
     )
 
     /**
@@ -412,6 +420,27 @@ class CommitService(
             return left
         }
 
+        // Re-state the transaction-local lock_timeout from the budget
+        // REMAINDER before each wait an attempt performs, so the
+        // advisory wait, the drain's row wait and the write's row-lock
+        // wait share ONE deadline instead of each spending the full
+        // bound (lock_timeout is per wait, not per transaction). An
+        // expired budget degrades to a 1ms bound: the next contended
+        // wait fails fast and surfaces as the typed 503. Unbounded
+        // mode (no deadline) is untouched — nothing is ever set.
+        val refreshLockTimeout: (Handle) -> Unit =
+            if (deadlineNanos == 0L) {
+                {}
+            } else {
+                { handle ->
+                    handle
+                        .createQuery("SELECT set_config('lock_timeout', ?, true)")
+                        .bind(0, maxOf(remainingMs(), 1L).toString())
+                        .mapToMap()
+                        .one()
+                }
+            }
+
         var pipe = pipeline.pipe(catalogId)
         while (true) {
             when (pipe.acquire(remainingOrExpired("before queueing for a commit pipeline slot"))) {
@@ -440,7 +469,13 @@ class CommitService(
                         if (!original.fingerprint.contentEquals(fingerprint)) {
                             throw HoglakeException.Validation("idempotency_key reused with a different request")
                         }
-                        awaitInFlight(original, catalogId, remainingMs())?.let { return it }
+                        awaitInFlight(
+                            original,
+                            catalogId,
+                            remainingOrExpired("waiting for the in-flight original's durability"),
+                        )?.let {
+                            return it
+                        }
                         // The original rolled back before publishing; a
                         // missing receipt is not a fence — publish anew.
                     }
@@ -469,6 +504,7 @@ class CommitService(
                         path,
                         drain,
                         remainingOrExpired("before the stage-A lock wait"),
+                        refreshLockTimeout,
                     )
                 } catch (e: CommitPipeline.CatalogPipe.DeferredReplay) {
                     // Stage A found this key already in flight (the
@@ -477,7 +513,13 @@ class CommitService(
                     if (!e.original.fingerprint.contentEquals(fingerprint)) {
                         throw HoglakeException.Validation("idempotency_key reused with a different request")
                     }
-                    awaitInFlight(e.original, catalogId, remainingMs())?.let { return it }
+                    awaitInFlight(
+                        e.original,
+                        catalogId,
+                        remainingOrExpired("waiting for the in-flight original's durability"),
+                    )?.let {
+                        return it
+                    }
                     // The original rolled back before publishing — loop
                     // and publish anew.
                 } catch (e: CommitTail.AllocationMoved) {
@@ -562,6 +604,7 @@ class CommitService(
         path: CommitPipeline.Path,
         drain: Boolean,
         lockBudgetMs: Long,
+        refreshLockTimeout: (Handle) -> Unit,
     ): CommitResult {
         val h = jdbi.open()
         var delta: CommitPipeline.CatalogPipe.Delta? = null
@@ -572,7 +615,20 @@ class CommitService(
                 when (path) {
                     CommitPipeline.Path.LOCKED, CommitPipeline.Path.DRAINED -> {
                         Locks.acquireCatalogCommitLock(h, catalogId, lockBudgetMs, preAdjusted = true)
-                        if (drain) drainInFlightCommits(h, catalogId)
+                        if (drain) {
+                            // The drain's row wait gets the budget
+                            // REMAINDER, not the acquire's fresh value.
+                            refreshLockTimeout(h)
+                            drainInFlightCommits(h, catalogId)
+                        }
+                        if (!drain) {
+                            // A LOCKED commit can lose the advisory
+                            // race to a later PIPELINED arrival (burst
+                            // onset): that commit may be in flight
+                            // behind the row lock — merge its delta or
+                            // we plan its ids and 23505 into a retry.
+                            pipe.pruneDeltas()
+                        }
                         doCommit(
                             h,
                             catalog,
@@ -584,8 +640,9 @@ class CommitService(
                                 PipeCtx(
                                     catalogId,
                                     dataPath,
-                                    view = null,
+                                    view = if (drain) null else pipe.view(),
                                     deltaSink = null,
+                                    refreshLockTimeout = refreshLockTimeout,
                                 ),
                         )
                     }
@@ -601,7 +658,10 @@ class CommitService(
                         // catalog's lock back to the pool.
                         sessionLockHeld = true
                         Locks.acquireCatalogCommitLockSession(h, catalogId, lockBudgetMs, preAdjusted = true)
-                        if (drain) drainInFlightCommits(h, catalogId)
+                        if (drain) {
+                            refreshLockTimeout(h)
+                            drainInFlightCommits(h, catalogId)
+                        }
                         pipe.pruneDeltas()
                         val staged =
                             doCommit(
@@ -616,6 +676,7 @@ class CommitService(
                                         catalogId,
                                         dataPath,
                                         view = if (drain) null else pipe.view(),
+                                        refreshLockTimeout = refreshLockTimeout,
                                         deltaSink = { snapshotId, nextFileIdAfter, nextRowIdsAfter, registeredPaths ->
                                             delta =
                                                 pipe.registerDelta(
@@ -1314,6 +1375,10 @@ class CommitService(
             appendRows.stats.associate { it.tableId to it.toRowId },
             registered.toSet(),
         )
+        // The write's row-lock wait (the pipelined predecessor's
+        // commit in flight) is the last wait of the attempt: bound it
+        // by the budget REMAINDER, not the value the acquire set.
+        pipeCtx?.refreshLockTimeout?.invoke(h)
         CommitTail.write(
             h,
             CommitTail.WriteSet(
