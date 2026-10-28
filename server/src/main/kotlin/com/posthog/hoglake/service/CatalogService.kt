@@ -1005,6 +1005,7 @@ class CatalogService(private val jdbi: Jdbi) {
         limit: Int? = null,
         offset: Int = 0,
         partitionFilter: Map<Int, String> = emptyMap(),
+        after: Long? = null,
     ): List<DataFile> =
         jdbi.withHandleUnchecked { h ->
             val cat = requireCatalog(h, catalog)
@@ -1037,7 +1038,7 @@ class CatalogService(private val jdbi: Jdbi) {
                 cat.catalogId,
                 t.tableId,
                 at,
-                FileRepo.listAt(h, cat.catalogId, t.tableId, at, sort, desc, limit, offset, partitionFilter),
+                FileRepo.listAt(h, cat.catalogId, t.tableId, at, sort, desc, limit, offset, partitionFilter, after),
             )
         }
 

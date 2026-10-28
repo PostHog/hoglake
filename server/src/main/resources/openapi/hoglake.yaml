@@ -751,6 +751,28 @@ paths:
           required: false
           description: Rows to skip; use with `limit` to page. Defaults to 0.
           schema: { type: integer, minimum: 0 }
+        - name: after
+          in: query
+          required: false
+          description: >
+            Keyset paging on the primary key: only files with
+            data_file_id greater than `after`, in ascending data_file_id
+            order. The key is commit-ordered, so the page order is stable
+            on its own, and the predicate is an index range scan that pays
+            for the page ONLY — where a deep OFFSET page re-reads every
+            row it skips (at 3.37M files, a deep offset page scans
+            millions of skipped rows; on the sibling hoglite engine the
+            same switch took a 16M-file listing from 18.5s to ~300ms per
+            page). Page by passing the last data_file_id of the previous
+            page until a short page comes back. Composes with `limit`,
+            `partition` and the snapshot parameters (the snapshot filter
+            still decides visibility; `after` only restricts the ids).
+            Mutually exclusive with `sort`, `order` and a non-zero
+            `offset` — keyset paging defines its own order and never
+            skips — and the combination is a 400, not a silently ignored
+            parameter. Prefer this over `offset` for any listing that
+            walks more than a few pages.
+          schema: { type: integer, format: int64, minimum: 0 }
         - name: partition
           in: query
           required: false

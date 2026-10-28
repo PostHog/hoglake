@@ -78,6 +78,17 @@ object FileRepo {
      * pages). [limit] null returns everything (the historical, unbounded
      * behavior); a non-null [limit]/[offset] pages the result.
      *
+     * [after] is KEYSET paging on the primary key: only files with
+     * `data_file_id > after`, ordered by `data_file_id` ascending.
+     * data_file_id is commit-ordered, so the keyset order is stable
+     * without a tiebreak, and the predicate is an index range scan that
+     * pays for the page only — where a deep OFFSET re-reads every row
+     * it skips. The predicate composes with the snapshot visibility
+     * clause unchanged: keyset restricts WHICH IDS, the clause still
+     * decides AT WHICH SNAPSHOT. [after] wins the ORDER BY over [sort];
+     * the route refuses the combination, so this branch is the defense,
+     * not the contract.
+     *
      * [sort.sql] is a controlled literal from a closed enum, never client
      * text, so interpolating it into ORDER BY carries no injection.
      */
@@ -91,16 +102,20 @@ object FileRepo {
         limit: Int? = null,
         offset: Int = 0,
         partitionFilter: Map<Int, String> = emptyMap(),
+        after: Long? = null,
     ): List<DataFile> {
         val dir = if (desc) "DESC" else "ASC"
         val orderBy =
-            if (sort == null) {
+            if (after != null) {
+                "data_file_id"
+            } else if (sort == null) {
                 "begin_snapshot, row_id_start, data_file_id"
             } else {
                 // Fixed ascending id tiebreak: a stable total order under
                 // paging regardless of the primary direction.
                 "${sort.sql} $dir, data_file_id ASC"
             }
+        val keysetWhere = if (after == null) "" else "\n              AND f.data_file_id > :after"
         val paging = if (limit == null) "" else "LIMIT :limit OFFSET :offset"
         // One EXISTS per requested (key_index, value): the values are the
         // stored, transformed strings the writer produced, so the match is
@@ -125,7 +140,7 @@ object FileRepo {
                 FROM hog_data_file f
                 WHERE f.catalog_id = :catalogId AND f.table_id = :tableId
                   AND f.begin_snapshot <= :snapshot
-                  AND (f.end_snapshot IS NULL OR :snapshot < f.end_snapshot)$partitionWhere
+                  AND (f.end_snapshot IS NULL OR :snapshot < f.end_snapshot)$partitionWhere$keysetWhere
                 ORDER BY $orderBy
                 $paging
                 """,
@@ -139,6 +154,7 @@ object FileRepo {
         }
         return query
             .apply {
+                if (after != null) bind("after", after)
                 if (limit != null) {
                     bind("limit", limit)
                     bind("offset", offset)

@@ -260,6 +260,39 @@ fun Application.installApiRoutes(
                                             )
                                         }
                                     } ?: 0
+                                // Keyset paging on the commit-ordered
+                                // primary key: `after` names the last
+                                // data_file_id of the previous page and
+                                // the answer is the next page in ascending
+                                // id order. It DEFINES the page order, so
+                                // the order-bearing parameters are a 400
+                                // beside it rather than silently ignored.
+                                val after =
+                                    call.longQuery("after")?.also {
+                                        if (it < 0) {
+                                            throw BadRequestException(
+                                                "query parameter 'after' must be >= 0, got '$it'",
+                                            )
+                                        }
+                                        if (sort != null) {
+                                            throw BadRequestException(
+                                                "query parameter 'after' cannot be combined with 'sort' " +
+                                                    "(keyset paging orders by id)",
+                                            )
+                                        }
+                                        if (call.request.queryParameters.contains("order")) {
+                                            throw BadRequestException(
+                                                "query parameter 'after' cannot be combined with 'order' " +
+                                                    "(keyset paging orders by id ascending)",
+                                            )
+                                        }
+                                        if (offset != 0) {
+                                            throw BadRequestException(
+                                                "query parameter 'after' cannot be combined with 'offset' " +
+                                                    "(keyset paging never skips rows)",
+                                            )
+                                        }
+                                    }
                                 // partition=key_index:value, repeatable. The
                                 // value is the stored, transformed string the
                                 // caller got from /partitions/values, so the
@@ -301,6 +334,7 @@ fun Application.installApiRoutes(
                                         limit = limit,
                                         offset = offset,
                                         partitionFilter = partitionFilter,
+                                        after = after,
                                     ).map { it.toDto() },
                                 )
                             }
