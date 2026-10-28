@@ -42,6 +42,7 @@ import importlib.metadata
 import logging
 import time
 import uuid
+from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from concurrent.futures import Executor, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -68,6 +69,8 @@ from pyhoglake import (
     TableInfo,
     UnsupportedTypeError,
     ValidationError,
+    VariantEncodingError,
+    VariantReport,
     parquet_write_options,
     write_part,
 )
@@ -85,6 +88,7 @@ from pyhoglake.upload import (
     run_uploads,
     widen_io_threads_for,
 )
+from pyhoglake.variant import encode_json
 
 from . import keyspace
 from .coerce import (
@@ -93,6 +97,7 @@ from .coerce import (
     UnsupportedColumnError,
     coercer_for,
     load_json_object,
+    variant_text,
 )
 from .config import Config
 from .grouping import column_chains, field_names
@@ -216,6 +221,16 @@ class FlushStats:
     build_seconds: Mapping[str, float] = dataclass_field(default_factory=dict)
     #: Seconds builds (raised ones too) waited, after submission, for a pool thread.
     build_queue_seconds: float = 0.0
+    #: Mapped variant columns' rows per build, by ``(column, outcome)``.
+    variant_rows: Mapping[tuple[str, str], int] = dataclass_field(default_factory=dict)
+    #: Their invalid rows (written as SQL NULL), by ``(column, reason)``.
+    variant_invalid: Mapping[tuple[str, str], int] = dataclass_field(
+        default_factory=dict
+    )
+    #: Their values per declared path, by ``(column, path, outcome)``.
+    variant_values: Mapping[tuple[str, str, str], int] = dataclass_field(
+        default_factory=dict
+    )
 
 
 # -- the payload decoder --------------------------------------------------------
@@ -225,8 +240,8 @@ class FlushStats:
 class DecodedRecord:
     """One staged payload decoded to column-aligned values. ``values``
     holds every destination column (null where the payload lacked a
-    nullable key); ``dropped_keys`` are payload keys the table does not
-    have (dropped, never silently: the flusher counts and logs them)."""
+    nullable key); ``dropped_keys`` are payload keys no column is filled
+    from (dropped, never silently: the flusher counts and logs them)."""
 
     values: dict[str, Any]
     dropped_keys: tuple[str, ...]
@@ -253,16 +268,33 @@ class JsonObjectDecoder:
     non-finite), per-column coercion with int64-per-unit bounds,
     missing nullable keys → null, missing/explicit-null non-nullable
     keys → failure, unknown keys dropped (counted and logged by the
-    flusher)."""
+    flusher). A top-level variant column takes the JSON text at its
+    ``variant_sources`` payload key (:func:`variant_text`), or SQL NULL
+    when unmapped; it never drops a record."""
 
-    def __init__(self, columns: tuple[Column, ...] | Sequence[Column]) -> None:
+    def __init__(
+        self,
+        columns: tuple[Column, ...] | Sequence[Column],
+        variant_sources: Mapping[str, str] | None = None,
+    ) -> None:
         self._columns = tuple(columns)
+        sources = dict(variant_sources or {})
         #: Timestamps clamped to years 1–9999, by dotted column path.
         self.clamped: dict[str, int] = {}
+        #: Mapped variant values written as SQL NULL, by (column, reason).
+        self.variant_invalid: Counter[tuple[str, str]] = Counter()
+        self._variants = _variant_plans(self._columns, sources)
         self._plans = tuple(
-            (c, coercer_for(c, on_clamp=self._note_clamp)) for c in self._columns
+            (c, coercer_for(c, on_clamp=self._note_clamp))
+            for c in self._columns
+            if c.type != "variant"
         )
-        self._names = frozenset(c.name for c in self._columns)
+        # A variant column's own name is no payload key millrace reads:
+        # only its mapped key is consumed, so a key of the column's name
+        # is an unknown key like any other.
+        self._names = frozenset(
+            c.name for c in self._columns if c.type != "variant"
+        ) | set(sources.values())
         # The Arrow schema is built once here too, so a column the batch
         # build could not describe (a malformed container) is a startup
         # refusal like any other.
@@ -298,8 +330,46 @@ class JsonObjectDecoder:
                 if e.path is None:
                     e.path = column.name
                 raise
+        # After every column that can drop the record: only kept rows count.
+        for name, key in self._variants:
+            text, reason = (None, None) if key is None else variant_text(doc.get(key))
+            values[name] = text
+            if reason is not None:
+                self.variant_invalid[(name, reason)] += 1
         dropped = tuple(sorted(k for k in doc if k not in self._names))
         return DecodedRecord(values=values, dropped_keys=dropped)
+
+
+def _variant_plans(
+    columns: tuple[Column, ...], sources: Mapping[str, str]
+) -> tuple[tuple[str, str | None], ...]:
+    """Each top-level variant column with the payload key its JSON text
+    comes from, or None: unmapped, it is written as SQL NULL, so adding
+    one to a live table needs no millrace change and removing its
+    mapping is the kill switch. Raises :class:`UnsupportedColumnError`
+    for a mapping that names no top-level variant column, and for a NOT
+    NULL variant column: an invalid value is written as SQL NULL with
+    its row kept (``on_invalid="null"``), and an unmapped one has none."""
+    by_name = {c.name: c for c in columns}
+    for name in sources:
+        column = by_name.get(name)
+        if column is None or column.type != "variant":
+            what = "no top-level column" if column is None else f"a {column.type}"
+            raise UnsupportedColumnError(
+                f"MILLRACE_VARIANT_SOURCES maps column {name!r}, which is {what} "
+                "of the table: only a top-level variant column takes a payload key"
+            )
+    plans = []
+    for column in columns:
+        if column.type != "variant":
+            continue
+        if not column.nullable:
+            raise UnsupportedColumnError(
+                f"variant column {column.name!r} is NOT NULL: millrace writes an "
+                "invalid or unmapped variant value as SQL NULL, keeping the row"
+            )
+        plans.append((column.name, sources.get(column.name)))
+    return tuple(plans)
 
 
 # -- Arrow building -------------------------------------------------------------
@@ -308,12 +378,16 @@ class JsonObjectDecoder:
 def arrow_schema(columns: Sequence[Column]) -> pa.Schema:
     """The batch's Arrow schema: pyhoglake's
     (:func:`~pyhoglake.types.column_to_arrow_field` — field ids on every
-    level). Raises :class:`UnsupportedColumnError` naming a column it
-    cannot describe."""
+    level), a top-level variant as its JSON text (``pa.json_()``). Raises
+    :class:`UnsupportedColumnError` naming a column it cannot describe."""
     fields = []
     for column in sorted(columns, key=lambda c: c.ordinal):
         try:
-            fields.append(column_to_arrow_field(column))
+            if column.type == "variant":
+                # Compiles the declaration: one this pyhoglake cannot write
+                # is refused at startup, not at every build.
+                column_to_arrow_field(column, variant="storage")
+            fields.append(column_to_arrow_field(column, variant="json"))
         except (UnsupportedTypeError, ValidationError) as e:
             raise UnsupportedColumnError(
                 f"column {column.name!r} has no Arrow form this writer can build: {e}"
@@ -436,8 +510,9 @@ _SORT_NULL_ORDERS: Final = {"nulls_first": "at_start", "nulls_last": "at_end"}
 
 #: Column types that are no partition or sort source: containers have no
 #: single value per row, and a json or variant value has no order or
-#: transform this writer (or the server) defines. variant is listed, not
-#: left to the decoder's refusal, so it stays refused when that lifts.
+#: transform this writer (or the server) defines. variant is listed by
+#: type: the decoder takes a top-level variant column, so no decode
+#: refusal stands in for this one.
 _UNORDERED_TYPES: Final = frozenset({"struct", "list", "map", "json", "variant"})
 _REPEATED_TYPES: Final = frozenset({"list", "map"})
 
@@ -769,10 +844,12 @@ class FlushPlan:
     clamped: Mapping[str, int] = dataclass_field(default_factory=dict)
     #: Seconds the build spent per stage (:data:`BUILD_STAGES`).
     stage_seconds: Mapping[str, float] = dataclass_field(default_factory=dict)
+    #: Per mapped variant column, what encoding its rows found.
+    variant: Mapping[str, VariantReport] = dataclass_field(default_factory=dict)
 
 
 #: The build's timed stages, in order (``millrace_flush_build_seconds_total``).
-BUILD_STAGES: Final = ("decode", "build", "sort", "fanout", "write")
+BUILD_STAGES: Final = ("decode", "build", "sort", "fanout", "variant_encode", "write")
 #: zstd at compaction's level (ParquetRewriter.DEFAULT_ZSTD_LEVEL): pyarrow's
 #: default snappy left files ~3x larger than compaction's rewrite of them, in
 #: upload bytes and in the spool. Validated at import, so at startup.
@@ -788,12 +865,18 @@ def build_flush_plan(
     max_files_per_commit: int,
     footer_stats_min_bytes: int,
     version: str,
+    variant_sources: Mapping[str, str] | None = None,
     clock: Callable[[], float] = time.perf_counter,
 ) -> FlushPlan:
     """Decode → Arrow → sort by the live sort spec → fan out by the live
     partition spec → parquet (pyhoglake's ``write_part``, one file per
     tuple) → commit requests of at most ``max_files_per_commit`` files
     each. Pure: no I/O; ``clock`` only times the stages.
+
+    Each mapped variant column (``variant_sources``) is encoded per file,
+    after the fanout, with ``on_invalid="null"``: an invalid value is SQL
+    NULL and its row is kept. It is encoded here rather than inside
+    ``write_part`` for a report per column (the core's sums them all).
 
     Sorting happens before the fanout (a group filter keeps row order),
     so every file is key-nondecreasing under the sort spec compaction
@@ -809,7 +892,10 @@ def build_flush_plan(
         seconds[stage] += now - mark
         mark = now
 
-    decoder = JsonObjectDecoder(info.columns)
+    sources = dict(variant_sources or {})
+    decoder = JsonObjectDecoder(info.columns, sources)
+    mapped = [c for c in info.columns if c.name in sources]
+    reports = {c.name: VariantReport() for c in mapped}
     staged_bytes = sum(len(payload) for _, payload in records)
     good: list[tuple[keyspace.RowKey, bytes, DecodedRecord]] = []
     good_indices: list[int] = []
@@ -874,10 +960,29 @@ def build_flush_plan(
         partition_values, part = parts[index]
         # Release each fanout slice once written.
         parts[index] = (partition_values, _EMPTY)
-        rows: list[int] = part.column(_ROW_INDEX).to_pylist()
-        part = part.drop_columns([_ROW_INDEX])
         try:
+            # Lapped only for a mapped column, and before the row-index
+            # bookkeeping, so the stage times the encode alone.
+            if mapped:
+                for column in mapped:
+                    i = part.schema.get_field_index(column.name)
+                    storage = encode_json(part.column(i), column, on_invalid="null")
+                    reports[column.name].merge(storage.report)
+                    field = part.schema.field(i).with_type(storage.array.type)
+                    part = part.set_column(i, field, storage.array)
+                    del storage
+                lap("variant_encode")
+            rows: list[int] = part.column(_ROW_INDEX).to_pylist()
+            part = part.drop_columns([_ROW_INDEX])
             written = write_part(part, info.columns, write_options=_WRITE_OPTIONS)
+        except VariantEncodingError as e:
+            # Its column and reason only: the message and path may quote
+            # payload keys. With on_invalid="null" no value raises; this is
+            # a NOT NULL column or the encoder failing its own output.
+            raise FlushError(
+                f"variant column {e.column!r} could not be written ({e.reason}): "
+                "a millrace encoder bug; the rows stay staged"
+            ) from None
         except ValidationError as e:
             # The core reads the footer back and holds it to the
             # destination's schema; the table was built at that schema.
@@ -897,6 +1002,15 @@ def build_flush_plan(
             (registration, Upload(uri=uri, size=written.size, body=written.body), rows)
         )
         lap("write")
+    # A value the decoder nulled reached the encoder as SQL NULL; it is an
+    # invalid row all the same.
+    for (name, reason), count in decoder.variant_invalid.items():
+        report = reports[name]
+        report.sql_null_rows -= count
+        report.invalid_rows += count
+        report.invalid_by_reason[reason] = (
+            report.invalid_by_reason.get(reason, 0) + count
+        )
 
     chunks = [
         files[i : i + max_files_per_commit]
@@ -950,6 +1064,7 @@ def build_flush_plan(
         dropped_indices=tuple(dropped_indices),
         clamped=dict(decoder.clamped),
         stage_seconds=seconds,
+        variant=reports,
     )
 
 
@@ -1248,7 +1363,7 @@ class HoglakeFlusher:
         flusher._shape_read_at = flusher._monotonic()
         flusher._resolved_info = info
         try:
-            JsonObjectDecoder(info.columns)
+            JsonObjectDecoder(info.columns, flusher._variant_sources)
         except UnsupportedColumnError as e:
             raise FlushStartupError(str(e)) from e
         spec = info.partition_spec
@@ -1335,6 +1450,7 @@ class HoglakeFlusher:
             raise ValueError(f"io_workers must be >= 1, got {io_workers}")
         self._client = client
         self._cfg = cfg
+        self._variant_sources = dict(cfg.variant_sources)
         # The shared upload client's pool: one decision's fan-out times
         # the decisions in flight, one size for the process (_upload).
         self._upload_pool = (
@@ -1380,6 +1496,9 @@ class HoglakeFlusher:
         self._clamp_logged: dict[str, float] = {}
         self._build_seconds = dict.fromkeys(BUILD_STAGES, 0.0)
         self._build_queue_seconds = 0.0
+        self._variant_rows: Counter[tuple[str, str]] = Counter()
+        self._variant_invalid: Counter[tuple[str, str]] = Counter()
+        self._variant_values: Counter[tuple[str, str, str]] = Counter()
 
     def close(self) -> None:
         """Close the HTTP client and (if owned) the executor. Idempotent."""
@@ -1422,6 +1541,9 @@ class HoglakeFlusher:
             dropped_payload_keys=self._dropped_payload_keys,
             build_seconds=dict(self._build_seconds),
             build_queue_seconds=self._build_queue_seconds,
+            variant_rows=dict(self._variant_rows),
+            variant_invalid=dict(self._variant_invalid),
+            variant_values=dict(self._variant_values),
         )
 
     async def check_stage_identity(
@@ -1665,8 +1787,8 @@ class HoglakeFlusher:
             if key not in self._warned_dropped:
                 self._warned_dropped.add(key)
                 log.warning(
-                    "payload key %r is not a column of %s.%s; dropping it from "
-                    "every flush (no schema evolution)",
+                    "payload key %r fills no column of %s.%s (a variant takes only its "
+                    "mapped key); dropping it from every flush (no schema evolution)",
                     key,
                     info.namespace,
                     info.name,
@@ -1857,6 +1979,7 @@ class HoglakeFlusher:
                             max_files_per_commit=self._cfg.max_files_per_commit,
                             footer_stats_min_bytes=FOOTER_STATS_MIN_BYTES,
                             version=_millrace_version(),
+                            variant_sources=self._variant_sources,
                         ),
                         self._monotonic,
                         started,
@@ -1870,6 +1993,8 @@ class HoglakeFlusher:
                     self._build_queue_seconds += started[0] - submitted
             for name, seconds in plan.stage_seconds.items():
                 self._build_seconds[name] += seconds
+            for column, report in plan.variant.items():
+                self._note_variant(column, report)
             return plan, keyspace.group_label(fields, scan.group)
 
         outcomes = await asyncio.gather(
@@ -1885,6 +2010,27 @@ class HoglakeFlusher:
                 raise outcome
             out.append(outcome)
         return out
+
+    def _note_variant(self, column: str, report: VariantReport) -> None:
+        """Count one build's encode of a mapped variant column. Every
+        label is the catalog's (the column, a declared path) or a closed
+        vocabulary; ``first_invalid`` holds payload keys and is never read."""
+        rows = (
+            ("encoded", report.rows - report.sql_null_rows - report.invalid_rows),
+            ("sql_null", report.sql_null_rows),
+            ("invalid", report.invalid_rows),
+        )
+        for outcome, count in rows:
+            self._variant_rows[(column, outcome)] += count
+        for reason, count in report.invalid_by_reason.items():
+            self._variant_invalid[(column, reason)] += count
+        for outcome, counts in (
+            ("typed", report.typed),
+            ("fallback", report.fallback),
+            ("variant_null", report.variant_null),
+        ):
+            for (_, path), count in counts.items():
+                self._variant_values[(column, path, outcome)] += count
 
     def _chunk(
         self, built: Sequence[tuple[int, FlushPlan, str]]

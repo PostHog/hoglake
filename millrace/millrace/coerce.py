@@ -41,9 +41,11 @@ Column types (:func:`coercer_for`):
 Inside a container a null element, child or value is SQL NULL, refused
 (naming the dotted path) where the catalog says the child is not
 nullable. Nesting is bounded by pyhoglake's
-``MAX_COLUMN_NESTING_DEPTH``. A ``variant`` column, at any depth, is
-refused (:class:`UnsupportedColumnError`): this decoder has no variant
-path yet, although pyhoglake's writer core writes a top-level one.
+``MAX_COLUMN_NESTING_DEPTH``. A top-level ``variant`` column is not
+coerced: the decoder takes the JSON text at its mapped payload key
+(:func:`variant_text`) and pyhoglake's encoder reads it at the write. A
+variant below the top level is refused (:class:`UnsupportedColumnError`):
+no writer shreds one.
 """
 
 from __future__ import annotations
@@ -64,6 +66,7 @@ from typing import Any, Final
 import pyarrow as pa
 from pyhoglake import Column
 from pyhoglake.types import MAX_COLUMN_NESTING_DEPTH
+from pyhoglake.variant import InvalidReason
 
 _MICROS_PER_SECOND: Final = 1_000_000
 MICROS_PER_DAY: Final = 86_400_000_000
@@ -98,8 +101,8 @@ class UnsupportedColumnError(ValueError):
     """The destination table carries a column the JSON decoder cannot
     fill: an unknown type, a decimal whose type_params do not build, a
     container whose children do not match its type, a column nested past
-    ``MAX_COLUMN_NESTING_DEPTH``, or a ``variant`` (no variant path in this
-    decoder yet).
+    ``MAX_COLUMN_NESTING_DEPTH``, a ``variant`` below the top level, or a
+    variant the ``MILLRACE_VARIANT_SOURCES`` rules refuse.
     Named with the column; the flusher's startup resolution re-raises it
     as a startup refusal."""
 
@@ -142,6 +145,43 @@ _TIMESTAMP_VALUE_BOUNDS: Final = {
 }
 
 _ISO_FRACTION: Final = re.compile(r"\.(\d+)")
+
+
+#: Why a variant source value is SQL NULL before the encoder reads it: the
+#: ``reason`` label of ``millrace_variant_invalid_total``, beside the
+#: encoder's own (pyhoglake ``InvalidReason``): ``invalid_unicode`` is
+#: typed as one, so the two sides count under one label, and
+#: ``not_text`` is none of them (test_coerce reads the Literal).
+VARIANT_NOT_TEXT: Final = "not_text"
+VARIANT_INVALID_UNICODE: Final[InvalidReason] = "invalid_unicode"
+
+
+def variant_text(value: Any) -> tuple[str | None, str | None]:
+    """A variant column's source value as ``(JSON text, None)``, or as SQL
+    NULL: ``(None, None)``, or ``(None, reason)`` when it counts as
+    invalid. Never raises, and never drops the record.
+
+    Text mode: the producer sends the field as a JSON string holding JSON
+    text, and the encoder reads THAT text strictly (``json.loads`` of the
+    payload has already let a duplicate key's last value win and turned
+    ``1e400`` into ``inf``). Absent, JSON null and ``""`` are SQL NULL;
+    a value that is not a string is not text (``not_text``), never encoded
+    from its parsed form. A string holding a lone surrogate (an escape in
+    the OUTER payload) would raise UnicodeEncodeError in the Arrow build,
+    outside its per-record isolation, so it is ``invalid_unicode`` here; a
+    surrogate escape inside the text reaches the encoder as ASCII and it
+    nulls that row itself."""
+    if value is None:
+        return None, None
+    if not isinstance(value, str):
+        return None, VARIANT_NOT_TEXT
+    if not value:
+        return None, None
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return None, VARIANT_INVALID_UNICODE
+    return value, None
 
 
 def reject_constant(raw: str) -> Any:
@@ -708,10 +748,13 @@ def _coercer(
         )
     t = column.type
     if t == "variant":
+        # A top-level one is the decoder's (variant_text), never coerced.
         raise UnsupportedColumnError(
-            f"column {path!r} is a variant: millrace does not ingest variant "
-            "columns yet (pyhoglake's write_part writes a top-level one from "
-            "JSON text; millrace's decoder has no variant path)"
+            f"column {path!r} is a variant below the top level: only a "
+            "top-level variant column is written (no writer shreds a nested one)"
+            if depth > 1
+            else f"column {path!r} is a variant, which is filled from its "
+            "MILLRACE_VARIANT_SOURCES payload key, not coerced"
         )
     if t == "struct":
         fields = tuple(

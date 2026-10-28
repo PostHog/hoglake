@@ -27,7 +27,7 @@ dev = [
     "prometheus-client>=0.20",
     # A floor: the version is the root uv.lock's, shared with the sibling
     # trees; see pyhoglake's note on why not `==`.
-    "ruff>=0.17.0",
+    "ruff>=0.17.1",
 ]
 
 [tool.uv.sources]

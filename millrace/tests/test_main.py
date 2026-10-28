@@ -322,6 +322,50 @@ def test_flush_counters_are_exposed_by_exact_name_labels_and_value():
                 59.0 + i
             )
         assert raw[("millrace_flush_build_queue_seconds_total", ())] == 67.5
+        # Variant families: present with no series until a mapped column
+        # is built, then one series per label tuple.
+        variant = ("millrace_variant_rows_total", "millrace_variant_invalid_total")
+        assert not any(name in variant for name, _ in raw)
+        flusher._variant_rows.update({("sv", "encoded"): 71, ("sv", "invalid"): 73})
+        flusher._variant_invalid[("sv", "duplicate_key")] = 79
+        flusher._variant_values[("sv", "$.$os", "fallback")] = 83
+        raw = _raw(_collector(consumer, stages, flusher, runner))
+        assert (
+            raw[
+                (
+                    "millrace_variant_rows_total",
+                    (("column", "sv"), ("outcome", "encoded")),
+                )
+            ]
+            == 71
+        )
+        assert (
+            raw[
+                (
+                    "millrace_variant_rows_total",
+                    (("column", "sv"), ("outcome", "invalid")),
+                )
+            ]
+            == 73
+        )
+        assert (
+            raw[
+                (
+                    "millrace_variant_invalid_total",
+                    (("column", "sv"), ("reason", "duplicate_key")),
+                )
+            ]
+            == 79
+        )
+        assert (
+            raw[
+                (
+                    "millrace_variant_values_total",
+                    (("column", "sv"), ("outcome", "fallback"), ("path", "$.$os")),
+                )
+            ]
+            == 83
+        )
         # The removed exactly-once machinery exports nothing.
         assert not any(
             word in name
