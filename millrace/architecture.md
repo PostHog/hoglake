@@ -233,16 +233,20 @@ drain's retry pass (§6) treats every indexed group as due.
    catalog's retention, or after any commit error): decode each payload
    with the column coercers (`coerce.py`; a value no column can hold is
    dropped and counted; unknown top-level keys are dropped from the row
-   and warned once); build Arrow (one record that defeats the batch
-   build is isolated and dropped); sort by the live sort spec; fan out
-   by the live partition spec, one parquet file per tuple, each written
+   and warned once; a mapped variant column takes its payload key's
+   JSON text, never dropping the record, see the README); build Arrow
+   (one record that defeats the batch build is isolated and dropped);
+   sort by the live sort spec; fan out by the live partition spec, one
+   parquet file per tuple; encode each mapped variant column of the
+   file (`encode_json`, `on_invalid="null"`: an invalid value is SQL
+   NULL, its row kept), each file then written
    by pyhoglake's writer core (`write_part`: zstd level 3, the footer
    read back and held to the destination's schema, `footer_size` and
    `file_size_bytes` measured on the body; `column_stats` only for a
    file of at least 32 MiB, the rest left to the server's hydrator);
    chunk the files into commits of at most `max_files_per_commit` (512).
    Each build times its stages (decode, Arrow build, sort, fanout,
-   write) and its wait for a pool thread (§9).
+   variant encode, write) and its wait for a pool thread (§9).
 3. Per commit: upload every file (objects at
    `{data_path}/data/{ns}/{table}/{build}/{index}.parquet`, `build` a
    fresh token per build), then publish with a fresh uuid4
@@ -260,8 +264,10 @@ every timestamp type, ints and ISO strings) so the keyer, the
 partition transforms and the Arrow build see the same value;
 counted in `millrace_values_clamped_total{column}`. An Arrow build
 failure after total coercion is an encoder bug, and so is a part
-`write_part` refuses (a `ValidationError`, raised as `FlushError`): the
-decision fails with every row staged (never a drop).
+`write_part` refuses (a `ValidationError`, raised as `FlushError`; a
+`VariantEncodingError` names only its column and reason, as its path
+may quote payload keys): the decision fails with every row staged
+(never a drop).
 
 The first commit from a stage pins the destination incarnation in
 `meta/table_uuid`; the drain checks it before flushing anything, so a
@@ -395,6 +401,7 @@ commit landed before the crash land again (duplicates).
 | `MILLRACE_REPLICA_COUNT`, `POD_NAME` | required |
 | `MILLRACE_CATALOG`, `MILLRACE_NAMESPACE`, `MILLRACE_TABLE` | required |
 | `MILLRACE_CATALOG_DATA_PATH`, `MILLRACE_TABLE_COLUMNS`, `MILLRACE_PARTITION_BY`, `MILLRACE_SORT_BY` | unset (creation only) |
+| `MILLRACE_VARIANT_SOURCES` | unset: every nullable top-level variant column written as SQL NULL; `column=payload_key,…`, checked against the live columns at startup |
 | `MILLRACE_STAGE_URL` | required |
 | `MILLRACE_FLUSH_BYTES` | 256 MiB |
 | `MILLRACE_FLUSH_DEADLINE_S` | 900 |
@@ -444,8 +451,9 @@ Everything is read from memory on the scrape thread
 | `millrace_flush_commit_refusals_total{status}` | 4xx answers |
 | `millrace_flush_groups_stuck` / `…_stuck_total` | groups at ≥ 3 consecutive failures (alert) |
 | `millrace_flush_orphaned_uploads_total` | uploaded objects no commit names |
-| `millrace_flush_build_seconds_total{stage}` | seconds the group builds that returned a plan spent per stage (a build that raises is not counted): `decode`, `build` (Arrow), `sort`, `fanout`, `write` (`write_part` and the registration) |
+| `millrace_flush_build_seconds_total{stage}` | seconds the group builds that returned a plan spent per stage (a build that raises is not counted): `decode`, `build` (Arrow), `sort`, `fanout`, `variant_encode` (the mapped variant columns), `write` (`write_part` and the registration) |
 | `millrace_flush_build_queue_seconds_total` | seconds the group builds waited, from submit to start (a build that raises included), for a `millrace-hoglake` pool thread (shared with uploads, commits and shape reads) |
+| `millrace_variant_rows_total{column,outcome}`, `millrace_variant_invalid_total{column,reason}`, `millrace_variant_values_total{column,path,outcome}` | per mapped variant column and build (a rebuild counts again): rows `encoded`/`sql_null`/`invalid`, invalid rows by reason, values per declared path `typed`/`fallback`/`variant_null`; labels never come from payload keys |
 | `millrace_staged_bytes`, `…_rows`, `…_groups`, `millrace_oldest_staged_age_seconds` | the in-memory index (since the last drain) |
 | `millrace_oldest_eligible_staged_age_seconds` | oldest group due at the last sweep (the backlog alert) |
 | `millrace_draining` | 1 during the startup drain |
@@ -481,11 +489,12 @@ and whenever liveness fails.
 | 16 | Every produced record is in the lake at least once, under kills, latency and reassignment | `tests/live/` |
 | 20 | A flush writes the same parquet bytes and registrations as before it moved onto `write_part` | `test_flush_golden.py` |
 | 21 | A variant column is never a partition or sort source, refused by type | `test_flush.py`, `test_grouping.py`, `test_config.py` |
+| 22 | A variant value never drops its record: an invalid one is SQL NULL with the row kept, an unmapped column all SQL NULL; a NOT NULL variant column is a startup refusal | `test_flush_variant.py`, `test_coerce.py`, `test_events_wire.py`, `tests/live/test_live_variant.py` |
 
 ## Not yet built
 
-- A `variant` column is a startup refusal: millrace's decoder has no
-  variant path yet (pyhoglake's `write_part` writes a top-level one from
-  JSON text).
+- VARIANT is text mode only (a payload object is not encoded) and only
+  for mapped top-level columns; the encoder runs on the shared pool
+  thread, with no process pool of its own.
 - No schema evolution: unknown payload keys are dropped from rows.
 - No dead-letter store for unrepresentable records.
