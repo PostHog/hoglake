@@ -34,10 +34,10 @@ from .runner import BenchAbort, InvariantViolation
 from .scenarios import (
     changefeed_scan,
     commit_contention,
+    commit_pipelined,
     commit_throughput,
     ddl_churn,
     delete_contention,
-    commit_pipelined,
     end_to_end,
     expiry_throughput,
     lifecycle,
@@ -105,7 +105,9 @@ def _add_common(p: argparse.ArgumentParser) -> None:
         "--s3-secret-key",
         default=os.environ.get("HOGLAKE_S3_SECRET_KEY", "hoglake123"),
     )
-    p.add_argument("--bucket", default=os.environ.get("HOGLAKE_BUCKET", "hoglake-bench"))
+    p.add_argument(
+        "--bucket", default=os.environ.get("HOGLAKE_BUCKET", "hoglake-bench")
+    )
     p.add_argument(
         "--results",
         default="bench-results.jsonl",
