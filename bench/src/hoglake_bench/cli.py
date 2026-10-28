@@ -34,6 +34,7 @@ from .runner import BenchAbort, InvariantViolation
 from .scenarios import (
     changefeed_scan,
     commit_contention,
+    commit_pipelined,
     commit_throughput,
     ddl_churn,
     delete_contention,
@@ -46,6 +47,7 @@ from .scenarios.common import ScenarioReport
 SCENARIOS: dict[str, Any] = {
     "commit-throughput": commit_throughput,
     "commit-contention": commit_contention,
+    "commit-pipelined": commit_pipelined,
     "delete-contention": delete_contention,
     "changefeed-scan": changefeed_scan,
     "expiry-throughput": expiry_throughput,
@@ -64,6 +66,7 @@ QUICK_PROFILE: dict[str, dict[str, Any]] = {
         "tables": 150,
     },
     "commit-contention": {"writers": [1, 4, 8], "ops": 25},
+    "commit-pipelined": {"depths": [1, 16, 64], "ops": 100},
     "delete-contention": {
         "writers": 4,
         "files_per_writer": 3,
@@ -102,7 +105,9 @@ def _add_common(p: argparse.ArgumentParser) -> None:
         "--s3-secret-key",
         default=os.environ.get("HOGLAKE_S3_SECRET_KEY", "hoglake123"),
     )
-    p.add_argument("--bucket", default=os.environ.get("HOGLAKE_BUCKET", "hoglake-bench"))
+    p.add_argument(
+        "--bucket", default=os.environ.get("HOGLAKE_BUCKET", "hoglake-bench")
+    )
     p.add_argument(
         "--results",
         default="bench-results.jsonl",

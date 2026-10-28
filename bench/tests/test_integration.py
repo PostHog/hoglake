@@ -34,6 +34,7 @@ def test_all_quick_smoke(live_server_url, tmp_path):
     assert scenarios == {
         "commit-throughput",
         "commit-contention",
+        "commit-pipelined",
         "delete-contention",
         "changefeed-scan",
         "expiry-throughput",

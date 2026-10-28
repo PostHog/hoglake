@@ -25,6 +25,7 @@ class TestScenarioIoModes:
         for name in (
             "commit-throughput",
             "commit-contention",
+            "commit-pipelined",
             "delete-contention",
             "changefeed-scan",
             "ddl-churn",

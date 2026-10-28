@@ -105,6 +105,25 @@ internal object CommitTail {
     private val LONG = Long::class.javaObjectType
 
     /**
+     * The allocator state the write found — AFTER waiting out any
+     * in-flight predecessor on the row lock — differs from the values
+     * the commit read and merged: `last_snapshot_id` / `next_file_id`
+     * on hog_catalog or a table's `next_row_id` advanced by a commit
+     * this one's stage A never saw. Under the whole-transaction commit
+     * lock that is unreachable, and it stays an IllegalStateException
+     * there; under `CommitPipeline` it is the signature of a commit on
+     * ANOTHER pod landing between this commit's read and its write
+     * (stage A releases the per-catalog lock before the database
+     * commit), or of an in-pod predecessor whose COMMIT rolled back
+     * after this stage A merged its delta. The commit is rolled back
+     * and retried whole against a fresh read. Being an
+     * IllegalStateException keeps the pre-pipeline contract (and its
+     * guard tests) intact for the non-pipelined path, which never
+     * retries.
+     */
+    internal class AllocationMoved(message: String) : IllegalStateException(message)
+
+    /**
      * Rows of [READ_SQL]'s JSON sections. Snake-case keys are the CTEs'
      * own column names; a `RowMapper` per section would be one query per
      * section, which is the cost this file exists to remove.
@@ -268,8 +287,22 @@ internal object CommitTail {
     private const val APPEND_ROWS_CTES: String =
         """
         table_stats AS (
+            -- KEY-ONLY quals, deliberately: under READ COMMITTED an
+            -- UPDATE finds candidates by statement snapshot, and a
+            -- value qual (`next_row_id = from_row_id`) evaluated
+            -- against the STALE visible version matches no row and
+            -- returns without ever waiting — the fail-fast that turned
+            -- same-pod pipelined overlap into a retry storm.
+            -- Key-only quals make the row a candidate, so the UPDATE
+            -- blocks on an in-flight predecessor's row lock until its
+            -- COMMIT, then applies the RELATIVE advance to the newest
+            -- version. The value check happens AFTER, on the RETURNING
+            -- values (`stats_moved` in the counts): a mismatch means a
+            -- writer this commit's stage A never saw, and the commit
+            -- rolls back and retries (AllocationMoved). The applied
+            -- advance is discarded by the rollback.
             UPDATE hog_table_stats ts
-               SET next_row_id = u.to_row_id,
+               SET next_row_id = ts.next_row_id + (u.to_row_id - u.from_row_id),
                    record_count = ts.record_count + u.records,
                    file_size_bytes = ts.file_size_bytes + u.bytes
               FROM snapshot s,
@@ -280,8 +313,7 @@ internal object CommitTail {
              WHERE ts.catalog_id = :catalogId
                AND ts.table_id = ANY(CAST(:statsTables AS bigint[]))
                AND ts.table_id = u.table_id
-               AND ts.next_row_id = u.from_row_id
-            RETURNING 1
+            RETURNING ts.table_id, ts.next_row_id
         ),
         data_files AS (
             INSERT INTO hog_data_file (catalog_id, data_file_id, table_id, begin_snapshot,
@@ -328,6 +360,10 @@ internal object CommitTail {
     private const val APPEND_ROWS_COUNTS: String =
         """
                (SELECT count(*) FROM table_stats) AS table_stats,
+               (SELECT count(*) FROM table_stats t
+                       JOIN unnest(CAST(:statsTables AS bigint[]), CAST(:statsTo AS bigint[]))
+                            AS u(table_id, to_row_id)
+                         ON t.table_id = u.table_id AND t.next_row_id <> u.to_row_id) AS stats_moved,
                (SELECT count(*) FROM data_files) AS data_files,
                (SELECT count(*) FROM partition_values) AS partition_values,
                (SELECT count(*) FROM column_stats) AS column_stats"""
@@ -355,11 +391,20 @@ internal object CommitTail {
     internal const val WRITE_SQL: String =
         """
         WITH alloc AS (
+            -- KEY-ONLY qual, deliberately — see the table_stats CTE for
+            -- why a value qual here would fail fast instead of waiting.
+            -- The UPDATE blocks on an in-flight predecessor's
+            -- hog_catalog row lock until its COMMIT (which is what
+            -- chains database-visible commit order to stage-A order),
+            -- then applies the RELATIVE increments to the newest
+            -- version; the value check is the `alloc_moved` count in
+            -- the final SELECT, comparing the RETURNING values against
+            -- what the read plus the merged in-flight deltas predicted.
             UPDATE hog_catalog
                SET last_snapshot_id = last_snapshot_id + 1,
                    next_file_id = next_file_id + :fileCount
-             WHERE catalog_id = :catalogId AND last_snapshot_id = :head AND next_file_id = :firstFileId
-            RETURNING catalog_id, last_snapshot_id
+             WHERE catalog_id = :catalogId
+            RETURNING catalog_id, last_snapshot_id, next_file_id
         ),
         snapshot AS (
             INSERT INTO hog_snapshot (catalog_id, snapshot_id, snapshot_time, schema_version, author, commit_message)
@@ -412,6 +457,10 @@ internal object CommitTail {
             RETURNING 1
         )
         SELECT (SELECT snapshot_id FROM snapshot) AS snapshot_id,
+               (SELECT count(*) FROM alloc
+                       WHERE last_snapshot_id <> CAST(:head AS bigint) + 1
+                          OR next_file_id <> CAST(:firstFileId AS bigint) + CAST(:fileCount AS bigint))
+                   AS alloc_moved,
                (SELECT count(*) FROM changes) AS changes,
                $APPEND_ROWS_COUNTS,
                (SELECT count(*) FROM ended_dvs) AS ended_dvs,
@@ -673,11 +722,13 @@ internal object CommitTail {
     )
 
     /** The counts [APPEND_SQL] selects, one per append CTE. */
-    private val APPEND_COUNTS = listOf("table_stats", "data_files", "partition_values", "column_stats")
+    private val APPEND_COUNTS = listOf("table_stats", "stats_moved", "data_files", "partition_values", "column_stats")
 
     /** The counts [WRITE_SQL] selects: the allocator's snapshot id (null when its guard matched no row), then one per CTE. */
     private val WRITE_COUNTS =
-        listOf("snapshot_id", "changes") + APPEND_COUNTS + listOf("ended_dvs", "delete_files", "uploads", "receipts")
+        listOf("snapshot_id", "alloc_moved", "changes") +
+            APPEND_COUNTS +
+            listOf("ended_dvs", "delete_files", "uploads", "receipts")
 
     /** What each CTE wrote, by name, off the statement's own counts. */
     private fun written(
@@ -689,6 +740,7 @@ internal object CommitTail {
     private fun AppendRows.expected(): Map<String, Long?> =
         mapOf(
             "table_stats" to stats.size.toLong(),
+            "stats_moved" to 0L,
             "data_files" to files.size.toLong(),
             "partition_values" to partitionValues.size.toLong(),
             "column_stats" to columnStats.size.toLong(),
@@ -706,23 +758,48 @@ internal object CommitTail {
         catalogId: Long,
         written: Map<String, Long?>,
         expected: Map<String, Long?>,
-        allocator: String? = null,
     ): String {
         val diff =
             expected.keys.filter { written[it] != expected[it] }
                 .joinToString(", ") { "$it ${written[it]} (expected ${expected[it]})" }
         val cause =
             when {
-                allocator != null && written["snapshot_id"] == null ->
-                    "$allocator moved under the commit lock: its guarded UPDATE matched no row"
+                written["snapshot_id"] == null ->
+                    "the catalog row moved under the commit lock: the alloc UPDATE matched no row"
+                (written["alloc_moved"] ?: 0L) > 0L ->
+                    "the allocator (last_snapshot_id, next_file_id) moved under the commit lock: " +
+                        "the committed values after the row-lock wait differ from the read"
+                (written["stats_moved"] ?: 0L) > 0L ->
+                    "a next_row_id moved under the commit lock: " +
+                        "the committed value after the row-lock wait differs from the read"
                 written["table_stats"] != expected["table_stats"] ->
-                    "a next_row_id moved under the commit lock: its guarded UPDATE matched no row"
+                    "a table's stats row moved under the commit lock: its UPDATE matched no row"
                 written["ended_dvs"] != expected["ended_dvs"] ->
                     "a DV it read as live was ended under the commit lock: its guarded UPDATE skipped it"
                 else -> "its row counts disagree with the rows it was given"
             }
         return "$what for catalog_id=$catalogId wrote $diff; $cause"
     }
+
+    /**
+     * Whether a short-write diff is an allocator RACE (retryable whole,
+     * [AllocationMoved]) or a bug. The alloc and next_row_id checks
+     * re-validate AFTER their UPDATEs' row-lock waits, so a mismatch
+     * there is a writer this commit never saw — a cross-pod commit or a
+     * rolled-back predecessor — and nothing it wrote survives the
+     * rollback. `ended_dvs` is deliberately NOT a race: delete commits
+     * drain every in-flight commit before reading, so a DV guard miss
+     * after the drain can only be a bug, and classifying it as a race
+     * would mask exactly that.
+     */
+    private fun isAllocatorRace(
+        written: Map<String, Long?>,
+        expected: Map<String, Long?>,
+    ): Boolean =
+        written["snapshot_id"] == null ||
+            (written["alloc_moved"] ?: 0L) > 0L ||
+            (written["stats_moved"] ?: 0L) > 0L ||
+            written["table_stats"] != expected["table_stats"]
 
     /** Binds [set] to a statement carrying [WRITE_SQL]'s parameters, as [bindRead] does for the read. */
     internal fun bindWrite(
@@ -753,18 +830,24 @@ internal object CommitTail {
 
     /**
      * Publish [set]: returns the snapshot id. Every CTE's row count is
-     * checked against what was asked, and a short one is an
-     * IllegalStateException that rolls the commit back — under the lock
-     * the guards cannot miss, so a guard that misses is a writer outside
-     * it ([shortWrite] says which).
+     * checked against what was asked, and a short one rolls the commit
+     * back. The allocator checks (`alloc_moved`, `stats_moved`, a short
+     * table_stats count) are [AllocationMoved] — the race the pipelined
+     * driver retries, the IllegalStateException it always was on the
+     * lock-to-commit path. A short `ended_dvs` or any other count is a
+     * plain IllegalStateException: delete commits drain in-flight
+     * commits before reading, so their guards cannot legitimately miss.
      */
     fun write(
         h: Handle,
         set: WriteSet,
     ): Long {
-        val written = bindWrite(h.createQuery(WRITE_SQL), set).map { rs, _ -> written(rs, WRITE_COUNTS) }.one()
+        val written =
+            bindWrite(h.createQuery(WRITE_SQL), set)
+                .map { rs, _ -> written(rs, WRITE_COUNTS) }
+                .one()
         val expected =
-            mapOf("snapshot_id" to set.head + 1, "changes" to set.changes.size.toLong()) +
+            mapOf("snapshot_id" to set.head + 1, "alloc_moved" to 0L, "changes" to set.changes.size.toLong()) +
                 set.appends.expected() +
                 mapOf(
                     "ended_dvs" to set.deletes.ended.size.toLong(),
@@ -772,14 +855,9 @@ internal object CommitTail {
                     "uploads" to set.settleUploads.size.toLong(),
                     "receipts" to if (set.idempotencyKey != null) 1L else 0L,
                 )
-        check(written == expected) {
-            shortWrite(
-                "commit write",
-                set.catalogId,
-                written,
-                expected,
-                allocator = "the allocator (last_snapshot_id ${set.head}, next_file_id ${set.firstFileId} as read)",
-            )
+        if (written != expected) {
+            val message = shortWrite("commit write", set.catalogId, written, expected)
+            throw if (isAllocatorRace(written, expected)) AllocationMoved(message) else IllegalStateException(message)
         }
         return set.head + 1
     }
