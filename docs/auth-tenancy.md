@@ -600,6 +600,16 @@ operator/bulk paths and become operator-only. This also finally makes
 
 ### 6.7 Listeners
 
+*Landed for `/metrics`:* `HOGLAKE_METRICS_PORT` (default `0`, off) starts an
+infra listener serving `GET /metrics` alone, with no auth plugin
+(`observability/MetricsListener.kt`). The API port's `/metrics` stays
+`OPERATOR`. The scraper uses the infra port, which the chart exposes on the pod
+and not on the Service, so it needs no token. That matters for rollout as well
+as for safety: under `warn` an untokened scrape on the API port counts as a
+refusal, so the zero-refusals gate (§11) could never pass. `/healthz` and
+`/livez` stay on the API port, where the kubelet probes them and the route
+table already exempts them.
+
 Split the process's ports:
 
 - **public listener (8080)**: `/v1/*` with the auth plugin, plus `/livez` and

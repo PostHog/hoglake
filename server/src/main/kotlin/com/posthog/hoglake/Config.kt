@@ -4,6 +4,16 @@ package com.posthog.hoglake
 data class Config(
     val port: Int = env("HOGLAKE_PORT", "8080").toInt(),
     /**
+     * The infra listener's port (docs/auth-tenancy.md §6.7): `GET /metrics`
+     * and nothing else, with no auth plugin. 0 = no infra listener; the
+     * scrape then has to use [port], where `/metrics` is operator-only.
+     *
+     * The exposition carries per-catalog labels, i.e. the tenant roster,
+     * so this port is for the cluster's scraper only: the chart exposes it
+     * on the pod and not on the Service.
+     */
+    val metricsPort: Int = env("HOGLAKE_METRICS_PORT", "0").toInt(),
+    /**
      * Human-facing name for THIS hoglake instance (e.g. "GigaHog"),
      * shown by the webui so operators can tell deployments apart.
      * Empty = unnamed.
@@ -1322,6 +1332,9 @@ data class Config(
             "HOGLAKE_HEALTH_PROBE_TIMEOUT_MS=$healthProbeTimeoutMs is below Hikari's " +
                 "$MIN_HEALTH_PROBE_TIMEOUT_MS ms connectionTimeout floor, which Hikari would " +
                 "silently replace with its own default — set at least $MIN_HEALTH_PROBE_TIMEOUT_MS"
+        }
+        require(metricsPort == 0 || (metricsPort in 1..65535 && metricsPort != port)) {
+            "HOGLAKE_METRICS_PORT=$metricsPort must be 0 (off) or a port other than HOGLAKE_PORT=$port"
         }
         // Netty refuses a group of zero with an IllegalArgumentException
         // from deep inside its own constructor, naming neither the knob
