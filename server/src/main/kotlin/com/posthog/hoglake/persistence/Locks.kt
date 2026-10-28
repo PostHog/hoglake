@@ -24,6 +24,21 @@ object Locks {
     const val CATALOG_COMMIT_LOCK_CLASS: Int = 4740871
 
     /**
+     * The single-bigint advisory lock key for [catalogId], computed
+     * exactly as the acquisition SQL below computes it
+     * (`(class << 32) | (catalog_id & 0xFFFFFFFF)`). The SQL keeps its
+     * inline form (a bound catalog id, no interpolation — invariant 9);
+     * this function exists for callers that must name the SAME key as a
+     * bound value — `CommitTail.PIPELINED_WRITE_SQL`'s unlock CTE and
+     * [releaseCatalogCommitLock] — and a test pins that the two agree.
+     * ANY change to one without the other silently breaks commit
+     * serialization (the unlock would release a lock nobody holds, and
+     * stage A would stop serializing).
+     */
+    fun catalogCommitLockKey(catalogId: Long): Long =
+        (CATALOG_COMMIT_LOCK_CLASS.toLong() shl 32) or (catalogId and 0xFFFFFFFFL)
+
+    /**
      * Discriminator for the per-catalog RETIREMENT lock: a distinct
      * class, so a retirement sweep excluding its own siblings can never
      * collide with the commit lock's key space.
@@ -143,6 +158,13 @@ object Locks {
         handle: Handle,
         catalogId: Long,
         lockTimeoutMs: Long = 0,
+    ) = acquireCatalogCommitLock(handle, catalogId, lockTimeoutMs, sessionScoped = false)
+
+    private fun acquireCatalogCommitLock(
+        handle: Handle,
+        catalogId: Long,
+        lockTimeoutMs: Long,
+        sessionScoped: Boolean,
     ) {
         val effectiveTimeoutMs = RequestAdmission.remainingLockTimeoutMs(lockTimeoutMs)
         if (effectiveTimeoutMs > 0) {
@@ -153,10 +175,12 @@ object Locks {
         }
         val start = System.nanoTime()
         try {
+            // pg_advisory_lock vs pg_advisory_xact_lock: same key space,
+            // same wait semantics; only the release point differs.
             handle.createQuery(
-                "SELECT pg_advisory_xact_lock(($CATALOG_COMMIT_LOCK_CLASS::bigint << 32) | (?::bigint & 4294967295))",
+                "SELECT ${if (sessionScoped) "pg_advisory_lock" else "pg_advisory_xact_lock"}(:key)",
             )
-                .bind(0, catalogId)
+                .bind("key", catalogCommitLockKey(catalogId))
                 .mapToMap()
                 .one()
         } catch (e: UnableToExecuteStatementException) {
@@ -170,6 +194,56 @@ object Locks {
             throw e
         } finally {
             Metrics.commitLockWait(System.nanoTime() - start)
+        }
+    }
+
+    /**
+     * [acquireCatalogCommitLock]'s SESSION-scoped twin, for the
+     * pipelined commit path (`CommitPipeline`): the lock outlives the
+     * transaction it is taken in and is released explicitly —
+     * `CommitTail.PIPELINED_WRITE_SQL`'s unlock CTE on success,
+     * [releaseCatalogCommitLock] on every other exit — so the
+     * per-catalog serialization covers stage A (the read, the checks,
+     * the write) and NOT the JDBC COMMIT's flush wait. The wait
+     * recording, the [RequestAdmission] budget charge and the
+     * `lock_timeout` -> CommitQueueTimeout mapping are identical to the
+     * xact-scoped form: queueing for stage A is the admission wait it
+     * always was.
+     *
+     * SESSION scope is a leak risk an xact lock never had: a pooled
+     * connection returned with the lock still held would poison every
+     * later borrower. The caller's finally must run
+     * [releaseCatalogCommitLock] whenever the write's unlock CTE may not
+     * have run, and a failed release aborts the connection rather than
+     * return it locked.
+     */
+    fun acquireCatalogCommitLockSession(
+        handle: Handle,
+        catalogId: Long,
+        lockTimeoutMs: Long = 0,
+    ) = acquireCatalogCommitLock(handle, catalogId, lockTimeoutMs, sessionScoped = true)
+
+    /**
+     * Release what [acquireCatalogCommitLockSession] took, on the same
+     * connection. Best-effort about double release (the write's unlock
+     * CTE may already have run — Postgres answers false and a WARNING,
+     * harmless on a failure path that is about to roll back) but NOT
+     * about failure: a connection whose unlock failed is aborted, never
+     * returned to the pool still holding the lock.
+     */
+    fun releaseCatalogCommitLock(
+        handle: Handle,
+        catalogId: Long,
+    ) {
+        try {
+            handle.createQuery("SELECT pg_advisory_unlock(:key)")
+                .bind("key", catalogCommitLockKey(catalogId))
+                .mapTo(Boolean::class.javaObjectType)
+                .one()
+        } catch (e: Exception) {
+            // A pooled connection must never retain this session lock.
+            handle.connection.abort { it.run() }
+            throw e
         }
     }
 

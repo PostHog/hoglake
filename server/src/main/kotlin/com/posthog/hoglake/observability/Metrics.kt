@@ -338,6 +338,18 @@ object Metrics {
     fun statsHydrated(result: String) = increment("hoglake_stats_hydrated_total", 1.0, "result", result)
 
     /**
+     * hoglake_commit_pipeline_retries_total{catalog} — commits retried
+     * whole after a guarded allocator write found the row moved
+     * (CommitTail.AllocationMoved): the signature of TWO SERVER
+     * INSTANCES pipelining one catalog at once. Within one pod the race
+     * is unreachable, so a standing nonzero rate means cross-pod
+     * writers, and the retry budget (CommitService.MAX_PIPELINE_ATTEMPTS)
+     * is what stands between them and 503s.
+     */
+    fun commitPipelineRetry(catalog: String) =
+        increment("hoglake_commit_pipeline_retries_total", 1.0, "catalog", catalog)
+
+    /**
      * hoglake_hydrator_transient_errors_total — footer fetches that
      * failed transiently (S3 throttle/5xx, connection/timeout): the
      * file STAYS 'pending' and the next sweep retries it, so this is

@@ -754,6 +754,33 @@ data class Config(
             com.posthog.hoglake.commit.CommitService.DEFAULT_COMMIT_LOCK_TIMEOUT_MS.toString(),
         ).toLong(),
     /**
+     * Per-catalog commit pipeline depth cap (`CommitPipeline`).
+     *
+     * 1 (THE DEFAULT) disables pipelining: every commit takes the
+     * pre-pipeline path verbatim — the xact-scoped per-catalog advisory
+     * lock held through the JDBC COMMIT, no extra statements, no
+     * in-memory state.
+     *
+     * > 1 enables the adaptive pipeline: stage A (read, checks,
+     * allocation, write) stays serial per catalog under a
+     * session-scoped advisory lock, and the durability wait (the JDBC
+     * COMMIT's WAL flush) moves OUTSIDE that serialization so up to N
+     * commits of one catalog flush concurrently and Postgres group
+     * commit batches them. Depth starts at 1 per catalog and doubles
+     * only while commits queue behind an in-flight one, halving back
+     * when the queue drains — a quiet catalog takes the old code path
+     * (a catalog at rest commits through the xact-locked tail
+     * unchanged). Commits carrying deletes are never pipelined: they
+     * drain in-flight commits first (one row lock) and keep the
+     * lock-to-commit tail. Durability and OCC semantics are unchanged;
+     * see CommitPipeline's KDoc.
+     *
+     * Capped at CommitPipeline.MAX_DEPTH (64). The effective
+     * concurrency is also bounded by HOGLAKE_DB_POOL_SIZE: every
+     * in-flight commit holds its connection until its COMMIT returns.
+     */
+    val commitMaxInFlight: Int = env("HOGLAKE_COMMIT_MAX_IN_FLIGHT", "1").toInt(),
+    /**
      * Whether a blind append (no `read_snapshot`) carrying
      * `partition_values` is REFUSED with 422 or merely logged at WARN.
      *

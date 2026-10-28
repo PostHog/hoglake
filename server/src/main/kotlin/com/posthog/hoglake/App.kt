@@ -89,6 +89,7 @@ class App private constructor(
             jdbi,
             commitLockTimeoutMs = cfg.commitLockTimeoutMs,
             refuseBlindPartitionedAppends = cfg.refuseBlindPartitionedAppends,
+            commitMaxInFlight = cfg.commitMaxInFlight,
         )
     private val alterService = AlterService(jdbi)
     private val scanService = ScanService(jdbi)

@@ -105,6 +105,25 @@ internal object CommitTail {
     private val LONG = Long::class.javaObjectType
 
     /**
+     * A guarded allocator UPDATE in [WRITE_SQL] matched no row: the
+     * value the commit read — `last_snapshot_id` / `next_file_id` on
+     * hog_catalog, a table's `next_row_id`, or a DV's liveness — moved
+     * between the read and the write. Under the whole-transaction
+     * commit lock that is unreachable, and it stays an
+     * IllegalStateException there; under `CommitPipeline` it is the
+     * EXPECTED signature of a commit on ANOTHER pod landing between
+     * this commit's read and its write (stage A releases the per-catalog
+     * lock before the database commit, so two pods' commits to one
+     * catalog can interleave their reads and flush waits). Nothing was
+     * written — every CTE hangs off the guarded `alloc` — so the commit
+     * is rolled back and retried whole against a fresh read. Being an
+     * IllegalStateException keeps the pre-pipeline contract (and its
+     * guard tests) intact for the non-pipelined path, which never
+     * retries.
+     */
+    internal class AllocationMoved(message: String) : IllegalStateException(message)
+
+    /**
      * Rows of [READ_SQL]'s JSON sections. Snake-case keys are the CTEs'
      * own column names; a `RowMapper` per section would be one query per
      * section, which is the cost this file exists to remove.
@@ -421,6 +440,48 @@ internal object CommitTail {
         """
 
     /**
+     * [WRITE_SQL] for the PIPELINED commit path (`CommitPipeline`): the
+     * same statement with one CTE appended, `unlock`, which releases the
+     * SESSION-scoped per-catalog commit lock as the write executes —
+     * stage A ends here and the JDBC COMMIT (the WAL flush wait) happens
+     * after it, outside the per-catalog serialization. Riding the write
+     * is what keeps the pipelined path at the same statement count as
+     * the locked one: a separate `pg_advisory_unlock` would be a third
+     * round trip under the lock on every commit, paid by exactly the
+     * contended catalogs the pipeline exists for.
+     *
+     * Safety of releasing mid-statement: the next stage A can start the
+     * moment the lock drops, but its WRITE_SQL's guarded `alloc` UPDATE
+     * blocks on THIS transaction's hog_catalog row lock until our COMMIT
+     * lands, so database-visible order stays stage-A order; and its
+     * checks merge this commit's in-flight allocations from the
+     * pipeline's delta (registered before this statement runs), so its
+     * read being taken at the pre-commit snapshot is made whole there.
+     *
+     * `unlock` is referenced by the final SELECT so it always executes;
+     * [write] checks `lock_released` came back true. Binds `:unlockKey`
+     * in addition to [WRITE_SQL]'s parameters. Built textually so the
+     * two statements cannot drift apart in the parts they share.
+     */
+    internal val PIPELINED_WRITE_SQL: String =
+        WRITE_SQL.replace(
+            "        SELECT (SELECT snapshot_id FROM snapshot) AS snapshot_id,",
+            """        ,
+        unlock AS (
+            SELECT pg_advisory_unlock(CAST(:unlockKey AS bigint)) AS released
+        )
+        SELECT (SELECT released FROM unlock) AS lock_released,
+               (SELECT snapshot_id FROM snapshot) AS snapshot_id,""",
+        ).also {
+            // The anchor above is WRITE_SQL's final SELECT; if it moved,
+            // the replace silently did nothing and the lock would leak
+            // onto the pooled connection — refuse to run instead.
+            check(it.contains("pg_advisory_unlock")) {
+                "PIPELINED_WRITE_SQL lost its WRITE_SQL anchor; the unlock CTE was not injected"
+            }
+        }
+
+    /**
      * The append rows alone, into a snapshot the caller already
      * published: `CommitService.registerInitialFiles`, whose DDL tail
      * allocates its own snapshot and file ids. Binds `:snapshotId`,
@@ -724,12 +785,19 @@ internal object CommitTail {
         return "$what for catalog_id=$catalogId wrote $diff; $cause"
     }
 
-    /** Binds [set] to a statement carrying [WRITE_SQL]'s parameters, as [bindRead] does for the read. */
+    /**
+     * Binds [set] to a statement carrying [WRITE_SQL]'s parameters, as
+     * [bindRead] does for the read. [unlockKey] is bound only when the
+     * statement is [PIPELINED_WRITE_SQL] — the legacy statement has no
+     * such parameter.
+     */
     internal fun bindWrite(
         query: Query,
         set: WriteSet,
+        unlockKey: Long? = null,
     ): Query =
         query
+            .also { if (unlockKey != null) it.bind("unlockKey", unlockKey) }
             .bind("catalogId", set.catalogId)
             .bind("head", set.head)
             .bind("firstFileId", set.firstFileId)
@@ -753,16 +821,38 @@ internal object CommitTail {
 
     /**
      * Publish [set]: returns the snapshot id. Every CTE's row count is
-     * checked against what was asked, and a short one is an
-     * IllegalStateException that rolls the commit back — under the lock
-     * the guards cannot miss, so a guard that misses is a writer outside
-     * it ([shortWrite] says which).
+     * checked against what was asked, and a short one rolls the commit
+     * back. A short count on one of the GUARDED writes (the alloc UPDATE,
+     * the per-table next_row_id advance, the DV-ending UPDATE) is an
+     * [AllocationMoved]: under the whole-transaction commit lock that is
+     * unreachable and it surfaces as the IllegalStateException it always
+     * was; under `CommitPipeline` it is the cross-pod race the driver
+     * retries. Any other short count is a plain IllegalStateException —
+     * a bug, not a race.
+     *
+     * [unlockKey] selects [PIPELINED_WRITE_SQL]: the session-scoped
+     * commit lock is released by the statement itself, and its
+     * `lock_released` column is checked true — a false would mean the
+     * lock was never ours to release, which is a bug in the caller, and
+     * a leaked lock on a pooled connection is worse than a failed
+     * commit.
      */
     fun write(
         h: Handle,
         set: WriteSet,
+        unlockKey: Long? = null,
     ): Long {
-        val written = bindWrite(h.createQuery(WRITE_SQL), set).map { rs, _ -> written(rs, WRITE_COUNTS) }.one()
+        val sql = if (unlockKey != null) PIPELINED_WRITE_SQL else WRITE_SQL
+        var lockReleased: Boolean? = null
+        val written =
+            bindWrite(h.createQuery(sql), set, unlockKey)
+                .map { rs, _ ->
+                    if (unlockKey != null) lockReleased = rs.getBoolean("lock_released")
+                    written(rs, WRITE_COUNTS)
+                }.one()
+        check(
+            lockReleased != false,
+        ) { "commit write for catalog_id=${set.catalogId} did not hold the commit lock to release" }
         val expected =
             mapOf("snapshot_id" to set.head + 1, "changes" to set.changes.size.toLong()) +
                 set.appends.expected() +
@@ -772,14 +862,20 @@ internal object CommitTail {
                     "uploads" to set.settleUploads.size.toLong(),
                     "receipts" to if (set.idempotencyKey != null) 1L else 0L,
                 )
-        check(written == expected) {
-            shortWrite(
-                "commit write",
-                set.catalogId,
-                written,
-                expected,
-                allocator = "the allocator (last_snapshot_id ${set.head}, next_file_id ${set.firstFileId} as read)",
-            )
+        if (written != expected) {
+            val message =
+                shortWrite(
+                    "commit write",
+                    set.catalogId,
+                    written,
+                    expected,
+                    allocator = "the allocator (last_snapshot_id ${set.head}, next_file_id ${set.firstFileId} as read)",
+                )
+            val moved =
+                written["snapshot_id"] == null ||
+                    written["table_stats"] != expected["table_stats"] ||
+                    written["ended_dvs"] != expected["ended_dvs"]
+            throw if (moved) AllocationMoved(message) else IllegalStateException(message)
         }
         return set.head + 1
     }
