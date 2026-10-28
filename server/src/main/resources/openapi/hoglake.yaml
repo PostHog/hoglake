@@ -790,20 +790,34 @@ paths:
             Keyset paging on the primary key: only files with
             data_file_id greater than `after`, in ascending data_file_id
             order. The key is commit-ordered, so the page order is stable
-            on its own, and the predicate is an index range scan that pays
-            for the page ONLY — where a deep OFFSET page re-reads every
-            row it skips (at 3.37M files, a deep offset page scans
-            millions of skipped rows; on the sibling hoglite engine the
-            same switch took a 16M-file listing from 18.5s to ~300ms per
-            page). Page by passing the last data_file_id of the previous
-            page until a short page comes back. Composes with `limit`,
+            on its own. Start a walk with `after=0` (ids allocate from 1)
+            and page by passing the last data_file_id of the previous
+            page until a SHORT page comes back — with a `limit` at or
+            under the 10000-row cap, because a larger limit is silently
+            clamped to the cap and the clamped full page would read as a
+            short one and end the walk early. Composes with `limit`,
             `partition` and the snapshot parameters (the snapshot filter
             still decides visibility; `after` only restricts the ids).
             Mutually exclusive with `sort`, `order` and a non-zero
             `offset` — keyset paging defines its own order and never
             skips — and the combination is a 400, not a silently ignored
             parameter. Prefer this over `offset` for any listing that
-            walks more than a few pages.
+            walks more than a few pages: a deep OFFSET page re-reads
+            every row it skips (at 3.37M files, millions of skipped rows
+            per deep page; on the sibling hoglite engine the same switch
+            took a 16M-file listing from 18.5s to ~300ms per page), while
+            the keyset predicate is a range scan on the (catalog_id,
+            data_file_id) primary key. The scan's cost tracks the page
+            when the table dominates its catalog; a small table among big
+            ones filters other tables' rows off the range, and a
+            selective `partition` pays its EXISTS check per skipped row —
+            the bound is the catalog's size class, never the page DEPTH.
+            An UNPINNED walk reads a moving head: each page resolves head
+            on its own, so a compaction, truncate or replace between
+            pages can duplicate or drop rows ACROSS the walk. For a
+            consistent listing, read `head_snapshot_id` from
+            GET /catalogs/{catalog} first and pass `snapshot=` on every
+            page.
           schema: { type: integer, format: int64, minimum: 0 }
         - name: partition
           in: query

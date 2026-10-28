@@ -239,6 +239,18 @@ class FileListingPaginationApiTest {
         }
 
     @Test
+    fun `a limit above the cap is clamped, not refused`() =
+        api { client ->
+            // The clamp is why the documented stop rule requires a limit
+            // at or under the cap: an oversized limit returns a clamped
+            // FULL page (here: the whole 25-file table), which a client
+            // would misread as the short page that ends the walk.
+            val page = ids(client.get("$filesUrl?after=0&limit=50000"))
+            assertThat(page).hasSize(fileCount)
+            assertThat(client.get("$filesUrl?limit=50000").status).isEqualTo(HttpStatusCode.OK)
+        }
+
+    @Test
     fun `after refuses the order-bearing parameters it replaces`() =
         api { client ->
             // sort/order/offset all describe an order or a skip, which

@@ -46,6 +46,7 @@ import org.jdbi.v3.core.Jdbi
 import org.jdbi.v3.core.kotlin.inTransactionUnchecked
 import org.jdbi.v3.core.kotlin.withHandleUnchecked
 import org.jdbi.v3.core.statement.UnableToExecuteStatementException
+import org.jdbi.v3.core.transaction.TransactionIsolationLevel
 import java.time.Instant
 import java.util.UUID
 
@@ -104,6 +105,9 @@ class CatalogService(private val jdbi: Jdbi) {
             "catalog_create",
             name,
             null,
+            // A no-op (created = false) audits as "exists": the trail
+            // must not show two creates for one creation.
+            successOutcome = { if (it.created) "ok" else "exists" },
             detail = { "data_path=$dataPath" },
             actor = { author },
             message = { message },
@@ -133,8 +137,15 @@ class CatalogService(private val jdbi: Jdbi) {
                     // for this dev-era check.
                     val newPrefix = dataPath.trimEnd('/') + "/"
                     CatalogRepo.listAll(h).forEach { existing ->
-                        // Same-name is settled by the pre-check above;
-                        // overlap 422s are for OTHER catalogs' prefixes.
+                        // Same-name recreate is NOT settled by the
+                        // pre-check: that ran on a different READ
+                        // COMMITTED statement, so a same-name row can
+                        // appear between them, and 422-ing it here would
+                        // bypass the identical/different arbitration.
+                        // Skip it — the insert's unique constraint
+                        // decides, and the catch/re-read below answers
+                        // 200 or 409.
+                        if (existing.name == name) return@forEach
                         val theirPrefix = existing.dataPath.trimEnd('/') + "/"
                         if (newPrefix.startsWith(theirPrefix) || theirPrefix.startsWith(newPrefix)) {
                             throw HoglakeException.Validation(
@@ -434,6 +445,7 @@ class CatalogService(private val jdbi: Jdbi) {
             "namespace_create",
             catalog,
             name,
+            successOutcome = { if (it.created) "ok" else "exists" },
             actor = { author },
             message = { message },
         ) {
@@ -571,6 +583,9 @@ class CatalogService(private val jdbi: Jdbi) {
             "table_create",
             catalog,
             "$namespace.$name",
+            // A no-op (created = false) audits as "exists": the trail
+            // must not show two creates for one creation.
+            successOutcome = { if (it.created) "ok" else "exists" },
             detail = { "columns=${columns.size}" },
             actor = { author },
             message = { message },
@@ -583,51 +598,76 @@ class CatalogService(private val jdbi: Jdbi) {
                     )
                 }
             } catch (e: HoglakeException.AlreadyExists) {
-                // Idempotent create: a live table whose definition is
-                // EXACTLY the requested one is this create's own earlier
-                // success — answer the existing table with created = false
-                // (the identity read, so no DDL receipt fields: no snapshot
-                // was allocated and snapshotId stays null). A different
-                // definition keeps the 409. The catch — not a pre-check —
-                // is the arbiter because it also covers the create race,
-                // where the AlreadyExists comes out of insertVersion's
-                // unique violation inside an already-aborted transaction.
-                if (!isIdenticalTableDefinition(catalog, namespace, name, columns)) throw e
-                CreateOutcome(getTable(catalog, namespace, name), created = false)
+                // Idempotent create: a live table whose CURRENT definition
+                // is exactly the requested one is a create already
+                // satisfied — answer the existing table with created =
+                // false (the identity read, so no DDL receipt fields: no
+                // snapshot was allocated and snapshotId stays null). A
+                // different definition keeps the 409. The catch — not a
+                // pre-check — is the arbiter because it also covers the
+                // create race, where the AlreadyExists comes out of
+                // insertVersion's unique violation inside an
+                // already-aborted transaction.
+                //
+                // The identity check and the answer come out of ONE
+                // REPEATABLE READ transaction: a drop or alter landing
+                // between them would otherwise turn into a 404, or a 200
+                // describing a different definition than the one just
+                // checked. Here a concurrent mutation lands AFTER this
+                // transaction's snapshot, and the answer is the checked
+                // representation.
+                jdbi.inTransactionUnchecked(TransactionIsolationLevel.REPEATABLE_READ) { h ->
+                    if (!isIdenticalTableDefinition(h, catalog, namespace, name, columns)) throw e
+                    CreateOutcome(
+                        tableInfo(h, catalog, namespace, name, snapshot = null, atTimestamp = null, totals = true),
+                        created = false,
+                    )
+                }
             }
         }
 
     /**
      * The idempotent-create identity check: is the live table
-     * `namespace`.`name` EXACTLY what a plain create of [columns] would
-     * make? Exact means the materialized column list — field ids
-     * included, so the comparison is [initialColumns] against the stored
-     * columns verbatim — and none of the definition a plain create never
-     * sets: no comment, no properties, no partition or sort spec. A
-     * table that merely ARRIVED at the same column names (an alter
-     * history, a metadata carry-over) has different field ids or extra
-     * definition and stays a 409: only the unmodified success of THIS
-     * definition is a 200.
+     * `namespace`.`name`'s CURRENT definition exactly what a plain create
+     * of [columns] would make? Exact means the materialized column list —
+     * field ids included, so the comparison is [initialColumns] against
+     * the stored columns verbatim — and none of the definition a plain
+     * create never sets: no comment, no properties, no partition or sort
+     * spec.
+     *
+     * This is CURRENT-DEFINITION equality, not provenance: a table that
+     * reached this definition through alters compares identical when the
+     * alters preserved the materialized shape (a rename round trip keeps
+     * field ids) and gets the 200 — its definition IS the requested one.
+     *
+     * Runs on the caller's handle, inside the one transaction that also
+     * builds the answer (see [createTableOutcome]).
+     *
+     * Column typeParams compare as a structural `Map<String, Any?>`, so
+     * number types matter: over the wire both sides are Jackson/jsonb
+     * Ints and match, but an internal caller passing `10L` where the
+     * stored map holds `10` gets a false 409. Known; service-internal
+     * only.
      */
     private fun isIdenticalTableDefinition(
+        h: Handle,
         catalog: String,
         namespace: String,
         name: String,
         columns: List<ColumnDef>,
-    ): Boolean =
-        jdbi.withHandleUnchecked { h ->
-            val cat = requireCatalog(h, catalog)
-            val ns = requireNamespace(h, cat, namespace)
-            val t =
-                TableRepo.findLive(h, cat.catalogId, ns.namespaceId, name)
-                    ?: return@withHandleUnchecked false
-            val at = cat.headSnapshotId
-            t.comment == null &&
-                t.properties.isEmpty() &&
-                TableRepo.columnsAt(h, cat.catalogId, t.tableId, at) == initialColumns(columns) &&
-                SpecRepo.specAt(h, cat.catalogId, t.tableId, at) == null &&
-                SortRepo.sortSpecAt(h, cat.catalogId, t.tableId, at) == null
-        }
+    ): Boolean {
+        val cat = requireCatalog(h, catalog)
+        val ns = requireNamespace(h, cat, namespace)
+        val t =
+            TableRepo.findLive(h, cat.catalogId, ns.namespaceId, name)
+                ?: return false
+        val at = cat.headSnapshotId
+        return t.comment == null &&
+            t.properties.isEmpty() &&
+            TableRepo.columnsAt(h, cat.catalogId, t.tableId, at) == initialColumns(columns) &&
+            SpecRepo.specAt(h, cat.catalogId, t.tableId, at) == null &&
+            SortRepo.sortSpecAt(h, cat.catalogId, t.tableId, at) == null
+    }
 
     /** Caller may compose creation with file registration in the same transaction. */
     internal fun createTable(
@@ -949,58 +989,76 @@ class CatalogService(private val jdbi: Jdbi) {
         totals: Boolean = true,
     ): TableInfo =
         jdbi.withHandleUnchecked { h ->
-            val cat = requireCatalog(h, catalog)
-            val at = resolveReadSnapshot(h, cat, snapshot, atTimestamp)
-            val ns = requireNamespace(h, cat, namespace)
-            val t =
-                TableRepo.findAt(h, cat.catalogId, ns.namespaceId, table, at)
-                    ?: throw HoglakeException.NotFound(
-                        "table '$namespace.$table' in catalog '$catalog' at snapshot $at",
-                    )
-            // Asked for by the CALLER, not derived from `at`:
-            // resolveReadSnapshot returns head when neither parameter is
-            // given, so `at` alone cannot tell a head read from a
-            // time-travel read that happens to name head — and the two
-            // must answer differently, one from the sample and one from
-            // the manifest.
-            val timeTravel = snapshot != null || atTimestamp != null
-            val sampled =
-                if (totals && !timeTravel) {
-                    sampledTotals(h, cat.catalogId, t.tableId)
-                } else {
-                    null
-                }
-            val exact =
-                if (totals && timeTravel) {
-                    FileRepo.aggregateAt(h, cat.catalogId, t.tableId, at)
-                } else {
-                    null
-                }
-            TableInfo(
-                tableId = t.tableId,
-                tableUuid = t.tableUuid,
-                comment = t.comment,
-                properties = t.properties,
-                namespace = ns.name,
-                name = t.name,
-                columns = TableRepo.columnsAt(h, cat.catalogId, t.tableId, at),
-                // The snapshot every field above was resolved at, which
-                // a writer sends back as a commit's read_snapshot.
-                readSnapshotId = at,
-                recordCount = exact?.recordCount ?: sampled?.recordCount,
-                fileCount = exact?.fileCount ?: sampled?.fileCount,
-                fileSizeBytes = exact?.fileSizeBytes ?: sampled?.fileSizeBytes,
-                // Only a SAMPLE is dated. An exact aggregate carries no
-                // freshness, and stamping it would tell a client the
-                // number might be stale when it cannot be.
-                totalsSnapshotId = sampled?.snapshotId,
-                totalsAsOf = sampled?.asOf,
-                // The specs visible at the requested snapshot (null =
-                // unpartitioned/unsorted there); listTables skips both.
-                partitionSpec = SpecRepo.specAt(h, cat.catalogId, t.tableId, at),
-                sortSpec = SortRepo.sortSpecAt(h, cat.catalogId, t.tableId, at),
-            )
+            tableInfo(h, catalog, namespace, table, snapshot, atTimestamp, totals)
         }
+
+    /**
+     * [getTable] on the caller's handle, so a caller can compose the
+     * read with others in one transaction — [createTableOutcome]'s
+     * idempotent-retry path, where the identity check and this answer
+     * must describe the SAME snapshot.
+     */
+    private fun tableInfo(
+        h: Handle,
+        catalog: String,
+        namespace: String,
+        table: String,
+        snapshot: Long?,
+        atTimestamp: Instant?,
+        totals: Boolean,
+    ): TableInfo {
+        val cat = requireCatalog(h, catalog)
+        val at = resolveReadSnapshot(h, cat, snapshot, atTimestamp)
+        val ns = requireNamespace(h, cat, namespace)
+        val t =
+            TableRepo.findAt(h, cat.catalogId, ns.namespaceId, table, at)
+                ?: throw HoglakeException.NotFound(
+                    "table '$namespace.$table' in catalog '$catalog' at snapshot $at",
+                )
+        // Asked for by the CALLER, not derived from `at`:
+        // resolveReadSnapshot returns head when neither parameter is
+        // given, so `at` alone cannot tell a head read from a
+        // time-travel read that happens to name head — and the two
+        // must answer differently, one from the sample and one from
+        // the manifest.
+        val timeTravel = snapshot != null || atTimestamp != null
+        val sampled =
+            if (totals && !timeTravel) {
+                sampledTotals(h, cat.catalogId, t.tableId)
+            } else {
+                null
+            }
+        val exact =
+            if (totals && timeTravel) {
+                FileRepo.aggregateAt(h, cat.catalogId, t.tableId, at)
+            } else {
+                null
+            }
+        return TableInfo(
+            tableId = t.tableId,
+            tableUuid = t.tableUuid,
+            comment = t.comment,
+            properties = t.properties,
+            namespace = ns.name,
+            name = t.name,
+            columns = TableRepo.columnsAt(h, cat.catalogId, t.tableId, at),
+            // The snapshot every field above was resolved at, which
+            // a writer sends back as a commit's read_snapshot.
+            readSnapshotId = at,
+            recordCount = exact?.recordCount ?: sampled?.recordCount,
+            fileCount = exact?.fileCount ?: sampled?.fileCount,
+            fileSizeBytes = exact?.fileSizeBytes ?: sampled?.fileSizeBytes,
+            // Only a SAMPLE is dated. An exact aggregate carries no
+            // freshness, and stamping it would tell a client the
+            // number might be stale when it cannot be.
+            totalsSnapshotId = sampled?.snapshotId,
+            totalsAsOf = sampled?.asOf,
+            // The specs visible at the requested snapshot (null =
+            // unpartitioned/unsorted there); listTables skips both.
+            partitionSpec = SpecRepo.specAt(h, cat.catalogId, t.tableId, at),
+            sortSpec = SortRepo.sortSpecAt(h, cat.catalogId, t.tableId, at),
+        )
+    }
 
     /** A usable per-table sample: the three totals plus what dates them. */
     private data class SampledTotals(

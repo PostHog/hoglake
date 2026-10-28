@@ -81,13 +81,18 @@ object FileRepo {
      * [after] is KEYSET paging on the primary key: only files with
      * `data_file_id > after`, ordered by `data_file_id` ascending.
      * data_file_id is commit-ordered, so the keyset order is stable
-     * without a tiebreak, and the predicate is an index range scan that
-     * pays for the page only — where a deep OFFSET re-reads every row
-     * it skips. The predicate composes with the snapshot visibility
-     * clause unchanged: keyset restricts WHICH IDS, the clause still
-     * decides AT WHICH SNAPSHOT. [after] wins the ORDER BY over [sort];
-     * the route refuses the combination, so this branch is the defense,
-     * not the contract.
+     * without a tiebreak, and the predicate is a range scan on the
+     * (catalog_id, data_file_id) primary key — where a deep OFFSET
+     * re-reads every row it skips. The cost tracks the page when the
+     * table dominates its catalog; a small table among big ones filters
+     * other tables' rows off the range (or, small enough, rides the
+     * changefeed index plus a top-N sort), and a selective partition
+     * filter pays its EXISTS check per skipped row — so the bound is
+     * the catalog's size class, never the page DEPTH. The predicate
+     * composes with the snapshot visibility clause unchanged: keyset
+     * restricts WHICH IDS, the clause still decides AT WHICH SNAPSHOT.
+     * [after] wins the ORDER BY over [sort]; the route refuses the
+     * combination, so this branch is the defense, not the contract.
      *
      * [sort.sql] is a controlled literal from a closed enum, never client
      * text, so interpolating it into ORDER BY carries no injection.

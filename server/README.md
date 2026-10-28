@@ -532,6 +532,23 @@ path including `totals=false`, because it describes the READ and not the
 totals; a writer caches the response and sends it back as a commit's
 `read_snapshot`, which the existing OCC then validates.
 
+`GET .../tables/{t}/files` pages two ways. `limit`/`offset` is offset
+paging over a stable order; `after=<data_file_id>` is keyset paging on
+the commit-ordered primary key — `WHERE data_file_id > :after ORDER BY
+data_file_id` — which a deep walk should prefer: an OFFSET page
+re-reads every row it skips (at 3.37M files, millions per deep page;
+hoglite measured 18.5s -> ~300ms per page at 16M files) while the
+keyset predicate is a range scan on the `(catalog_id, data_file_id)`
+primary key whose cost tracks the page when the table dominates its
+catalog (a small table among big ones filters other tables' rows off
+the range; a selective `partition=` pays its EXISTS check per skipped
+row). Start with `after=0`; `sort`, `order` and a non-zero `offset`
+beside `after` are a 400. `limit` caps silently at 10000, and an
+oversized limit reads as a short page under the short-page stop rule —
+keep `limit` at or under the cap. An unpinned walk reads a moving head:
+pin it by reading `head_snapshot_id` first and passing `snapshot=` on
+every page.
+
 The three table-level aggregates (`record_count`, `file_count`,
 `file_size_bytes`) are three-way, and OPTIONAL on the wire:
 
@@ -2471,6 +2488,25 @@ unversioned receipts remain readable and retryable.
 A supplied `footer_size` must be nonnegative and fit within `file_size_bytes - 8`
 for both initial publication and INSERT. Atomic publication requires this field;
 ordinary INSERT retains support for omitted footer metadata.
+
+### Idempotent creates
+
+`idempotent-create-v1` advertises that `POST /v1/catalogs`,
+`POST .../namespaces` and `POST .../tables` are idempotent. When the
+object already exists with an IDENTICAL definition, the create is a
+no-op answered 200 with the existing object — no new snapshot, so the
+table answer carries no `snapshot_id` receipt. A same-named object with
+a DIFFERENT definition stays 409 `already_exists`. Identity: a catalog
+is name + `data_path`; a namespace's whole definition is its name; a
+table is the materialized column list, assigned field ids included,
+plus none of the definition the plain create never sets (comment,
+properties, partition/sort spec). The table check is current-definition
+equality, not provenance: a table that reached the same definition
+through alters compares identical. No-op creates audit as `exists`, not
+`ok`. Follow-up: duckdb-client still requires 201 on its create calls,
+so an object another session created first fails there with a nonsense
+"HTTP 200" message — it should accept 200 (and its `IF NOT EXISTS`
+could then succeed outright).
 
 ### Recovering an INSERT response
 

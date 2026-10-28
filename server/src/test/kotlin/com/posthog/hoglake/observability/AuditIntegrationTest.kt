@@ -153,6 +153,28 @@ class AuditIntegrationTest {
 
     private fun events(): List<JsonNode> = capture.lines.map { json.readTree(it) }
 
+    @Test
+    fun `an idempotent no-op create audits as exists, not ok`() {
+        val catalogs = CatalogService(db.jdbi)
+        val catalog = "audit-idem"
+        catalogs.createCatalog(catalog, "s3://bucket/$catalog")
+        catalogs.createNamespace(catalog, "ns")
+        catalogs.createTable(catalog, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        // The no-op retries: identical definitions, nothing created.
+        catalogs.createCatalogOutcome(catalog, "s3://bucket/$catalog")
+        catalogs.createNamespaceOutcome(catalog, "ns")
+        catalogs.createTableOutcome(catalog, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        // One "ok" (the real create) and one "exists" (the no-op) each —
+        // the trail must not read as two creations of the same object.
+        for (action in listOf("catalog_create", "namespace_create", "table_create")) {
+            assertThat(
+                eventsFor(action)
+                    .filter { it["catalog"].asText() == catalog }
+                    .map { it["outcome"].asText() },
+            ).containsExactly("ok", "exists")
+        }
+    }
+
     private fun eventsFor(action: String): List<JsonNode> = events().filter { it["action"]?.asText() == action }
 
     private fun assertAttribution(

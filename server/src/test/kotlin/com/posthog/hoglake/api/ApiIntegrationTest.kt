@@ -791,6 +791,13 @@ class ApiIntegrationTest {
             assertThat(catAgain.status).isEqualTo(HttpStatusCode.OK)
             assertThat(body(catAgain)["name"].asText()).isEqualTo("dup")
             assertThat(body(catAgain)["data_path"].asText()).isEqualTo("s3://hog/dup")
+            // The wire advertises the behavior, on both the read and the
+            // no-op create answer.
+            assertThat(body(catAgain)["capabilities"].map { it.asText() })
+                .contains("idempotent-create-v1")
+            assertThat(
+                body(client.get("/v1/catalogs/dup"))["capabilities"].map { it.asText() },
+            ).contains("idempotent-create-v1")
             // Same name, different data_path: still the conflict.
             assertApiError(
                 client.postJson("/v1/catalogs", """{"name": "dup", "data_path": "s3://hog/dup2"}"""),

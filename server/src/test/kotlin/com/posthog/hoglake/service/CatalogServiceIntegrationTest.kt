@@ -1,9 +1,15 @@
 package com.posthog.hoglake.service
 
+import com.posthog.hoglake.model.AlterOp
 import com.posthog.hoglake.model.ChangeKind
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.NullOrder
+import com.posthog.hoglake.model.PartitionFieldDef
+import com.posthog.hoglake.model.SortDirection
+import com.posthog.hoglake.model.SortFieldDef
+import com.posthog.hoglake.model.Transform
 import com.posthog.hoglake.service.CatalogService.Companion.MAX_DATA_PATH_LENGTH
 import com.posthog.hoglake.testing.PgTestSupport
 import org.assertj.core.api.Assertions.assertThat
@@ -200,6 +206,98 @@ class CatalogServiceIntegrationTest {
         // Same name in a different namespace is fine.
         val other = svc.createTable("tbl-dup-cat", "ns2", "t", listOf(idCol))
         assertThat(other.namespace).isEqualTo("ns2")
+    }
+
+    @Test
+    fun `table create identity - metadata and specs are definition a plain create never sets`() {
+        svc.createCatalog("tbl-meta-cat", "s3://bucket/tm")
+        svc.createNamespace("tbl-meta-cat", "ns")
+        val alters = AlterService(db.jdbi)
+
+        // A comment is a DIFFERENT definition; clearing it is the same one
+        // again — the check is current-definition equality, not history.
+        svc.createTable("tbl-meta-cat", "ns", "t", listOf(idCol))
+        alters.alterTable("tbl-meta-cat", "ns", "t", listOf(AlterOp.SetTableComment("documented")))
+        assertThatThrownBy { svc.createTable("tbl-meta-cat", "ns", "t", listOf(idCol)) }
+            .isInstanceOf(HoglakeException.AlreadyExists::class.java)
+        alters.alterTable("tbl-meta-cat", "ns", "t", listOf(AlterOp.SetTableComment(null)))
+        assertThat(svc.createTableOutcome("tbl-meta-cat", "ns", "t", listOf(idCol)).created).isFalse()
+
+        // Properties, partition spec, sort spec: same rule.
+        svc.createTable("tbl-meta-cat", "ns", "tp", listOf(idCol))
+        alters.alterTable("tbl-meta-cat", "ns", "tp", listOf(AlterOp.SetProperties(mapOf("k" to "v"))))
+        assertThatThrownBy { svc.createTable("tbl-meta-cat", "ns", "tp", listOf(idCol)) }
+            .isInstanceOf(HoglakeException.AlreadyExists::class.java)
+
+        svc.createTable("tbl-meta-cat", "ns", "ts", listOf(idCol))
+        alters.alterTable(
+            "tbl-meta-cat",
+            "ns",
+            "ts",
+            listOf(AlterOp.SetPartitionSpec(listOf(PartitionFieldDef(1, Transform.IDENTITY)))),
+        )
+        assertThatThrownBy { svc.createTable("tbl-meta-cat", "ns", "ts", listOf(idCol)) }
+            .isInstanceOf(HoglakeException.AlreadyExists::class.java)
+
+        svc.createTable("tbl-meta-cat", "ns", "to", listOf(idCol))
+        alters.alterTable(
+            "tbl-meta-cat",
+            "ns",
+            "to",
+            listOf(AlterOp.SetSortOrder(listOf(SortFieldDef(1, SortDirection.ASC, NullOrder.NULLS_FIRST)))),
+        )
+        assertThatThrownBy { svc.createTable("tbl-meta-cat", "ns", "to", listOf(idCol)) }
+            .isInstanceOf(HoglakeException.AlreadyExists::class.java)
+    }
+
+    @Test
+    fun `table create identity - field ids, nullability and nested shapes compare exactly`() {
+        svc.createCatalog("tbl-ids-cat", "s3://bucket/ti")
+        svc.createNamespace("tbl-ids-cat", "ns")
+        val alters = AlterService(db.jdbi)
+
+        // Nullability is part of the definition.
+        svc.createTable("tbl-ids-cat", "ns", "t", listOf(idCol))
+        assertThatThrownBy {
+            svc.createTable("tbl-ids-cat", "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        }.isInstanceOf(HoglakeException.AlreadyExists::class.java)
+
+        // A drop+add round trip re-allocates the field id: the shape is
+        // the same, the materialized definition is not — 409.
+        svc.createTable("tbl-ids-cat", "ns", "t2", listOf(idCol, nameCol))
+        alters.alterTable("tbl-ids-cat", "ns", "t2", listOf(AlterOp.DropColumn("name")))
+        alters.alterTable("tbl-ids-cat", "ns", "t2", listOf(AlterOp.AddColumn(nameCol)))
+        assertThatThrownBy { svc.createTable("tbl-ids-cat", "ns", "t2", listOf(idCol, nameCol)) }
+            .isInstanceOf(HoglakeException.AlreadyExists::class.java)
+
+        // A rename round trip PRESERVES the field id: the definition is
+        // the requested one, so the answer is the 200 — this is the
+        // documented current-definition semantics, not provenance.
+        svc.createTable("tbl-ids-cat", "ns", "t3", listOf(ColumnDef("other", ColType.LONG, nullable = false)))
+        alters.alterTable("tbl-ids-cat", "ns", "t3", listOf(AlterOp.RenameColumn("other", "id")))
+        val renamed = svc.createTableOutcome("tbl-ids-cat", "ns", "t3", listOf(idCol))
+        assertThat(renamed.created).isFalse()
+        assertThat(renamed.value.columns.map { it.def.name }).containsExactly("id")
+
+        // Nested columns compare structurally, children included.
+        val struct =
+            ColumnDef(
+                "s",
+                ColType.STRUCT,
+                children = listOf(ColumnDef("x", ColType.INT), ColumnDef("y", ColType.STRING)),
+            )
+        val nested = svc.createTable("tbl-ids-cat", "ns", "t4", listOf(idCol, struct))
+        val retry = svc.createTableOutcome("tbl-ids-cat", "ns", "t4", listOf(idCol, struct))
+        assertThat(retry.created).isFalse()
+        assertThat(retry.value.columns).isEqualTo(nested.columns)
+        assertThatThrownBy {
+            svc.createTable(
+                "tbl-ids-cat",
+                "ns",
+                "t4",
+                listOf(idCol, struct.copy(children = listOf(ColumnDef("x", ColType.INT)))),
+            )
+        }.isInstanceOf(HoglakeException.AlreadyExists::class.java)
     }
 
     @Test
