@@ -569,6 +569,13 @@ data class CatalogTotals(
  *    rows are the soft-deleted cleanup ledger, not pending work.
  *  - hoglake_missing_field_id_files counts LIVE flagged files — the
  *    same population the rename guard refuses on.
+ *  - hoglake_stats_pending_head_file_id is the data_file_id at the head
+ *    of the hydrator's queue, read by key ([PENDING_HEAD_FILE_ID_SQL]);
+ *    0 when the catalog has no live pending file.
+ *  - hoglake_object_prefix_quarantined_files counts LIVE files the
+ *    hydrator flipped to provided with `prefix_quarantined` set: a
+ *    deferred-stats file of an object-prefix table whose footer does not
+ *    prove its prefix value. Nothing clears the flag in this version.
  *  - EVERY hog_data_file gauge joins hog_table and excludes dropped
  *    tables. Since #193 a drop touches no file row, so `end_snapshot IS
  *    NULL` is no longer the whole of "live" — the rows of a dropped
@@ -688,6 +695,12 @@ class CatalogMetrics(
             "hoglake_stats_pending_files",
             "Data files with stats_state = 'pending' on a live table — the hydrator's actual queue",
         )
+    private val statsPendingHeadFileId =
+        multiGauge(
+            "hoglake_stats_pending_head_file_id",
+            "data_file_id at the head of the hydrator's queue: the oldest live pending file on a live table, " +
+                "the next one a sweep claims; 0 when nothing is pending",
+        )
     private val statsFailedFiles =
         multiGauge(
             "hoglake_stats_failed_files",
@@ -698,6 +711,12 @@ class CatalogMetrics(
             "hoglake_missing_field_id_files",
             "Live data files whose parquet schema lacks field ids (DDL-blocking: add_column/rename_column); " +
                 "dropped tables excluded",
+        )
+    private val prefixQuarantinedFiles =
+        multiGauge(
+            "hoglake_object_prefix_quarantined_files",
+            "Live data files the hydrator quarantined because their footer does not prove the object-prefix " +
+                "value of their path (excluded from a per-value read); dropped tables excluded",
         )
     private val liveTotalsSampled =
         multiGauge(
@@ -893,8 +912,10 @@ class CatalogMetrics(
         val headAgeSeconds: Double?,
         val removalDepth: Long,
         val statsPending: Long,
+        val statsPendingHeadFileId: Long,
         val statsFailed: Long,
         val missingFieldIds: Long,
+        val prefixQuarantined: Long,
         val tables: Long,
         /** Whether the maintenance summary has stamped this catalog's live totals (V27). */
         val liveSampled: Boolean,
@@ -1000,8 +1021,10 @@ class CatalogMetrics(
         )
         removalQueueDepth.register(rowsOf { it.removalDepth }, true)
         statsPendingFiles.register(rowsOf { it.statsPending }, true)
+        statsPendingHeadFileId.register(rowsOf { it.statsPendingHeadFileId }, true)
         statsFailedFiles.register(rowsOf { it.statsFailed }, true)
         missingFieldIdFiles.register(rowsOf { it.missingFieldIds }, true)
+        prefixQuarantinedFiles.register(rowsOf { it.prefixQuarantined }, true)
         tableCount.register(rowsOf { it.tables }, true)
 
         // The live totals are ABSENT, not zero, on a catalog the
@@ -1276,8 +1299,10 @@ class CatalogMetrics(
                                 },
                             removalDepth = rs.getLong("removal_depth"),
                             statsPending = rs.getLong("stats_pending"),
+                            statsPendingHeadFileId = rs.getLong("stats_pending_head_file_id"),
                             statsFailed = rs.getLong("stats_failed"),
                             missingFieldIds = rs.getLong("missing_field_ids"),
+                            prefixQuarantined = rs.getLong("prefix_quarantined"),
                             tables = rs.getLong("table_count"),
                             liveSampled = rs.getBoolean("live_sampled"),
                             liveTotalsAgeSeconds =
@@ -1383,6 +1408,63 @@ class CatalogMetrics(
         const val MAINTENANCE_RUN_LOOKBACK = 1_000
 
         /**
+         * `hoglake_stats_pending_head_file_id{catalog}` (alert A3: a
+         * stalled hydrator leaves pending files out of every per-value
+         * mount): the `data_file_id` at the head of the catalog's pending
+         * queue — its oldest live pending file on a live table, the next
+         * one the claim takes — or 0 when nothing is pending. A fragment
+         * of [SAMPLE_SQL] over its `hog_catalog c`, `internal` so the plan
+         * test EXPLAINs it.
+         *
+         * READ IT AS: the head unchanged for three hydrator sweep
+         * intervals while `hoglake_stats_pending_files` > 0 is a stalled
+         * hydrator (or a file it keeps failing to read transiently, which
+         * is stuck all the same); `hoglake_stats_pending_files` rising for
+         * six hours is a hydrator that is behind. Not an age: a pending
+         * file's commit snapshot is normally expired by the next sweep on
+         * a short-retention catalog (600 s on millrace-dev/-prod-us, a
+         * 15-minute sweep), so no commit time is left to age it from.
+         * `rehydrate` re-pends old failed files at their old ids, so the
+         * head moves back to them — correctly: they are now the oldest
+         * work. Ids come from the per-catalog counter
+         * `hog_catalog.next_file_id`, far below 2^53, so the gauge's
+         * float64 carries them exactly.
+         *
+         * BY KEY, NEVER AN AGGREGATE (prod-us held 1.89M pending files):
+         * the head of `hog_data_file_pending` for the catalog in
+         * `data_file_id` order, `LIMIT 1`, index-only (`table_id` is the
+         * index's INCLUDE). THE ORDER IS STRUCTURAL: the live-table check
+         * is a `LATERAL` probe with its own `LIMIT 1`, which the planner
+         * cannot pull up into a join. As a plain join to `hog_table`, on a
+         * catalog of mostly dropped tables, it was planned as a merge join
+         * over the catalog's WHOLE pending range sorted by `table_id`,
+         * then sorted again by id — the backlog read and sorted every
+         * tick, at the moment A3 matters. Now the ordered pending range is
+         * the only possible driver, probing `hog_table` per entry
+         * (memoized). A dropped table's pending rows are skipped, as the
+         * claim and the count skip them; any at the head are walked,
+         * index-only, which is the claim's own cost, bounded by the same
+         * backlog. 0 rather than an absent series with nothing pending, so
+         * an absent series keeps meaning the sampler or the catalog is
+         * gone (the counts' COALESCE rule below).
+         */
+        internal const val PENDING_HEAD_FILE_ID_SQL: String =
+            """
+            COALESCE((
+              SELECT f.data_file_id FROM hog_data_file f
+               CROSS JOIN LATERAL (SELECT 1 FROM hog_table t
+                                    WHERE t.catalog_id = f.catalog_id AND t.table_id = f.table_id
+                                      AND t.dropped_snapshot IS NULL
+                                    LIMIT 1) live
+               WHERE f.catalog_id = c.catalog_id
+                 AND f.stats_state = 'pending'
+                 AND f.end_snapshot IS NULL
+               ORDER BY f.data_file_id
+               LIMIT 1
+            ), 0)
+            """
+
+        /**
          * The per-catalog sample, `internal` so the plan test EXPLAINs
          * the SQL PRODUCTION runs rather than a lookalike.
          *
@@ -1438,14 +1520,15 @@ class CatalogMetrics(
          *    buckets. The cost is the catalog's tables (the same range
          *    `table_count` reads) plus the buckets of its recent drops,
          *    never the whole generation.
-         *  - `stats_pending`, `stats_failed`, `missing_field_ids`: one
-         *    index-only range per catalog each, over the partial indexes
-         *    that hold exactly that LIVE population —
-         *    `hog_data_file_pending`, `hog_data_file_failed` and
-         *    `hog_data_file_missing_field_ids` (all V26, each carrying
-         *    `table_id`). Each is joined to `hog_table` per distinct
+         *  - `stats_pending`, `stats_failed`, `missing_field_ids`,
+         *    `prefix_quarantined`: one index-only range per catalog each,
+         *    over the partial indexes that hold exactly that LIVE
+         *    population — `hog_data_file_pending`, `hog_data_file_failed`,
+         *    `hog_data_file_missing_field_ids` (all V26) and
+         *    `hog_data_file_prefix_quarantined` (V31), each carrying
+         *    `table_id`. Each is joined to `hog_table` per distinct
          *    table of the rare population, not per manifest row.
-         *    `end_snapshot IS NULL` on all three for the reason the
+         *    `end_snapshot IS NULL` on all four for the reason the
          *    indexes carry it: the hydrator's claim skips ended rows, so
          *    an ended pending row is not a backlog anything drains.
          *
@@ -1526,6 +1609,7 @@ class CatalogMetrics(
                              GROUP BY f.table_id) b
                       JOIN hog_table t ON t.catalog_id = c.catalog_id AND t.table_id = b.table_id
                      WHERE t.dropped_snapshot IS NULL) AS stats_pending,
+                   $PENDING_HEAD_FILE_ID_SQL AS stats_pending_head_file_id,
                    (SELECT COALESCE(SUM(b.n), 0)::bigint
                       FROM (SELECT f.table_id, count(*) AS n FROM hog_data_file f
                              WHERE f.catalog_id = c.catalog_id
@@ -1542,6 +1626,14 @@ class CatalogMetrics(
                              GROUP BY f.table_id) b
                       JOIN hog_table t ON t.catalog_id = c.catalog_id AND t.table_id = b.table_id
                      WHERE t.dropped_snapshot IS NULL) AS missing_field_ids,
+                   (SELECT COALESCE(SUM(b.n), 0)::bigint
+                      FROM (SELECT f.table_id, count(*) AS n FROM hog_data_file f
+                             WHERE f.catalog_id = c.catalog_id
+                               AND f.prefix_quarantined
+                               AND f.end_snapshot IS NULL
+                             GROUP BY f.table_id) b
+                      JOIN hog_table t ON t.catalog_id = c.catalog_id AND t.table_id = b.table_id
+                     WHERE t.dropped_snapshot IS NULL) AS prefix_quarantined,
                    ms.catalog_id IS NOT NULL AS live_sampled,
                    extract(epoch FROM (now() - ms.live_as_of)) AS live_totals_age_seconds,
                    CASE WHEN ms.measures_generation = ms.published_generation

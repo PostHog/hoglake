@@ -113,6 +113,9 @@ object HogSchemaColumns {
                     // CompactionService.commitGroup; read by
                     // ScanService.planScan (include=split_offsets) only.
                     "split_offsets",
+                    // V30: written by Hydrator.hydrate's flip only; read by
+                    // CatalogMetrics.SAMPLE_SQL's count. Not on any wire shape.
+                    "prefix_quarantined",
                 ),
             // FileRepo.columnStatsMapper / scanColumnStatsMapper (the
             // shared read shapes) and AlterService's promote re-encode on

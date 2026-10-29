@@ -46,9 +46,11 @@ import java.util.concurrent.atomic.AtomicInteger
 /**
  * The commit-time rule of the object-prefix layout (model/ObjectPrefix.kt):
  * on a table with the option, every data file sits under
- * `<table root>team_id=<value>/` for its canonical identity value, ships
- * its stats inline, and proves with them that every row holds the value;
- * every deletion vector sits under its target's prefix.
+ * `<table root>team_id=<value>/` for its canonical identity value and, when
+ * it ships its stats inline, proves with them that every row holds the
+ * value (deferred stats register pending, and the hydrator makes the proof
+ * from the footer: HydratorObjectPrefixIntegrationTest); every deletion
+ * vector sits under its target's prefix.
  *
  * EVERY REFUSAL HAS A TWIN. Each file shape refused on `ingest.events`
  * (the option on) is committed to `ingest.plain` (the same columns and
@@ -190,7 +192,6 @@ class CommitObjectPrefixIntegrationTest {
                     file(under(cat, table, "9223372036854775808") + id(), "9223372036854775808", null) to
                         "not a canonical long"
                 ),
-            "deferred stats" to (file(under(cat, table, "4") + id(), "4", null) to "without column_stats"),
             "no stats row for the field" to
                 (file(under(cat, table, "4") + id(), "4", stats(le8(4), le8(4)).drop(1)) to "no stats row"),
             "an empty stats list" to (file(under(cat, table, "4") + id(), "4", emptyList()) to "no stats row"),
@@ -255,8 +256,10 @@ class CommitObjectPrefixIntegrationTest {
         val refused = refusal(cat) { blindAppend(cat, "events", atRoot) }
         assertThat(refused.table).isEqualTo("ingest.events")
         assertThat(refused.message).contains(atRoot.path).contains("expected under ${under(cat, "events", "4")}")
-        val deferred = file(under(cat, "events", "4") + "${UUID.randomUUID()}.parquet", "4", null)
-        assertThat(refusal(cat) { blindAppend(cat, "events", deferred) }.message).contains("without column_stats")
+        val deferred = file(under(cat, "events", "42") + "${UUID.randomUUID()}.parquet", "4", null)
+        assertThat(refusal(cat) { blindAppend(cat, "events", deferred) }.message)
+            .describedAs("deferred stats do not lift the path rule")
+            .contains("expected under ${under(cat, "events", "4")}")
         val before = db.head(cat)
         blindAppend(cat, "events", good(cat))
         assertThat(db.head(cat)).describedAs("a conforming blind append registers").isEqualTo(before + 1)
@@ -277,7 +280,7 @@ class CommitObjectPrefixIntegrationTest {
     @Test
     fun `over the wire the refusal is a 422 object_prefix_violation that says re-prepare`() {
         val cat = fixture()
-        val path = under(cat, "events", "4") + "${UUID.randomUUID()}.parquet"
+        val path = under(cat, "events", "42") + "${UUID.randomUUID()}.parquet"
         testApplication {
             application { app.module(this) }
             val response =
@@ -294,7 +297,46 @@ class CommitObjectPrefixIntegrationTest {
             assertThat(body["error"].asText()).isEqualTo("object_prefix_violation")
             assertThat(body["tables"].map { it.asText() }).containsExactly("ingest.events")
             assertThat(body["retry"].asText()).isEqualTo("re-prepare")
-            assertThat(body["detail"].asText()).contains(path).contains("without column_stats")
+            assertThat(body["detail"].asText()).contains(path).contains("expected under ${under(cat, "events", "4")}")
+        }
+    }
+
+    private fun statsState(
+        cat: String,
+        path: String,
+    ): String =
+        db.jdbi.withHandleUnchecked { h ->
+            h.createQuery(
+                "SELECT f.stats_state FROM hog_data_file f JOIN hog_catalog c USING (catalog_id) " +
+                    "WHERE c.name = :cat AND f.path = :path",
+            ).bind("cat", cat).bind("path", path).mapTo(String::class.java).one()
+        }
+
+    /**
+     * Stop-gap (1) of 2.1b is gone: the hydrator now makes the stats proof
+     * from the footer, so deferred stats register `pending` on a table with
+     * the option. The path and the value are still checked at commit.
+     */
+    @Test
+    fun `deferred stats register pending under the right prefix and are still refused outside it`() {
+        val cat = fixture()
+        val id = { "${UUID.randomUUID()}.parquet" }
+        val readFenced = file(under(cat, "events", "4") + id(), "4", null)
+        val blind = file(under(cat, "events", "7") + "sub/" + id(), "7", null)
+        append(cat, "events", readFenced)
+        blindAppend(cat, "events", blind)
+        assertThat(statsState(cat, readFenced.path)).isEqualTo("pending")
+        assertThat(statsState(cat, blind.path)).isEqualTo("pending")
+        for ((shape, reason) in listOf(
+            file(under(cat, "events", "42") + id(), "4", null) to "expected under ${under(cat, "events", "4")}",
+            file(root(cat, "events") + id(), "4", null) to "expected under ${under(cat, "events", "4")}",
+            file(under(cat, "events", "042") + id(), "042", null) to "not a canonical long",
+            file(under(cat, "events", "4") + id(), null, null) to "value null",
+        )) {
+            assertThat(refusal(cat) { append(cat, "events", shape) }.message).contains(shape.path).contains(reason)
+            val before = db.head(cat)
+            append(cat, "plain", shape.copy(path = shape.path.replace("/events/", "/plain/")))
+            assertThat(db.head(cat)).describedAs("the option-off twin takes %s", shape.path).isEqualTo(before + 1)
         }
     }
 
