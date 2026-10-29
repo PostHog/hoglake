@@ -17,6 +17,7 @@ import com.posthog.hoglake.model.allNodes
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.persistence.CatalogRepo
+import com.posthog.hoglake.persistence.CommitLockPath
 import com.posthog.hoglake.persistence.Locks
 import com.posthog.hoglake.persistence.MaintenanceRunStore
 import com.posthog.hoglake.persistence.NamespaceRepo
@@ -1204,6 +1205,8 @@ class CompactionService(
     /** Everything execution needs beyond the group list. */
     private data class TableContext(
         val catalogId: Long,
+        /** The catalog's name: the `catalog` label of the commit-lock series. */
+        val catalog: String,
         val dataPath: String,
         val namespace: String,
         val table: String,
@@ -1542,6 +1545,7 @@ class CompactionService(
         val sortFields = sortSpec?.fields ?: emptyList()
         return TableContext(
             catalogId = cat.catalogId,
+            catalog = cat.name,
             dataPath = cat.dataPath,
             namespace = ns.name,
             table = t.name,
@@ -4825,7 +4829,13 @@ class CompactionService(
         stagingId: Long,
     ): GroupOutcome =
         jdbi.inTransactionUnchecked { h ->
-            Locks.acquireCatalogCommitLock(h, ctx.catalogId, ctx.commitLockTimeoutMs)
+            Locks.acquireCatalogCommitLock(
+                h,
+                ctx.catalogId,
+                ctx.catalog,
+                CommitLockPath.COMPACTION,
+                ctx.commitLockTimeoutMs,
+            )
             beforeCommitTail(h)
 
             // RE-CLAIM THE STAGING TICKET: THE OBJECT IS ONLY OURS TO

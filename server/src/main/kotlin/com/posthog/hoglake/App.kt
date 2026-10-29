@@ -257,7 +257,7 @@ class App private constructor(
         CatalogMetrics(
             jdbi,
             meterRegistry,
-            // The five extended groups run where the maintenance summary
+            // The six extended groups run where the maintenance summary
             // is produced (the maintenance Deployment), so API replicas do
             // not each republish the same instance-wide series.
             extendedGroups = cfg.maintenanceSummaryIntervalMs > 0,

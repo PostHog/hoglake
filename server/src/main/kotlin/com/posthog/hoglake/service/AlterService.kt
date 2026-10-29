@@ -19,6 +19,7 @@ import com.posthog.hoglake.model.canPromoteTo
 import com.posthog.hoglake.model.icebergType
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.persistence.CatalogRepo
+import com.posthog.hoglake.persistence.CommitLockPath
 import com.posthog.hoglake.persistence.FileRepo
 import com.posthog.hoglake.persistence.Locks
 import com.posthog.hoglake.persistence.NamespaceRepo
@@ -77,7 +78,7 @@ class AlterService(private val jdbi: Jdbi) {
                 val cat =
                     CatalogRepo.findByName(h, catalog)
                         ?: throw HoglakeException.NotFound("catalog '$catalog'")
-                Locks.acquireCatalogCommitLock(h, cat.catalogId)
+                Locks.acquireCatalogCommitLock(h, cat.catalogId, cat.name, CommitLockPath.DDL)
                 val ns =
                     NamespaceRepo.findLiveByName(h, cat.catalogId, namespace)
                         ?: throw HoglakeException.NotFound("namespace '$namespace' in catalog '$catalog'")

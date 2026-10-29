@@ -10,6 +10,7 @@ import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.observability.RetirementGauges
 import com.posthog.hoglake.persistence.CatalogRepo
+import com.posthog.hoglake.persistence.CommitLockPath
 import com.posthog.hoglake.persistence.Locks
 import com.posthog.hoglake.persistence.MaintenanceRunStore
 import com.posthog.hoglake.persistence.Pg
@@ -548,7 +549,7 @@ class RetirementService(
             var touched = false
             var done = false
             while (!done && !budgetSpent(started)) {
-                when (val outcome = batch(catalogId, candidate, n)) {
+                when (val outcome = batch(catalogId, catalog, candidate, n)) {
                     is BatchOutcome.Retired -> {
                         rows += outcome.rows
                         dvs += outcome.dvs
@@ -852,12 +853,13 @@ class RetirementService(
      */
     private fun batch(
         catalogId: Long,
+        catalog: String,
         candidate: Candidate,
         n: Int,
     ): BatchOutcome =
         try {
             jdbi.inTransactionUnchecked { h ->
-                Locks.acquireCatalogCommitLock(h, catalogId, commitLockTimeoutMs)
+                Locks.acquireCatalogCommitLock(h, catalogId, catalog, CommitLockPath.RETIREMENT, commitLockTimeoutMs)
                 // THE BOUND GOES ON FIRST, before anything it has to
                 // bound. It used to sit after the floor read, which
                 // left that statement running under the SESSION's 60 s

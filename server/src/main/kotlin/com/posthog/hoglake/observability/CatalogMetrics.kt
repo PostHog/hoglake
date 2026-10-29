@@ -556,7 +556,7 @@ data class CatalogTotals(
  * retiring the metrics-cron layer). A lightweight periodic sampler
  * refreshes per-catalog MultiGauges in GROUPS: the core group is ONE
  * batched query over all catalogs (scalar subselects, no per-gauge round
- * trips) plus one grouped query for consumer offsets; the five extended
+ * trips) plus one grouped query for consumer offsets; the six extended
  * groups below are each their own statement.
  *
  * Notes on semantics:
@@ -605,9 +605,10 @@ data class CatalogTotals(
  *
  * GROUPS FAIL INDEPENDENTLY. The core per-catalog read, the per-table
  * summary read, the deletion-vector totals, the snapshot/retirement
- * lifecycle read, the relation sizes and the maintenance ledger are each
- * their own statement in their own try. One that throws leaves ITS
- * gauges at their last published values and does not stop the others;
+ * lifecycle read, the relation sizes, the commit-lock read and the
+ * maintenance ledger are each their own statement in their own try. One
+ * that throws leaves ITS gauges at their last published values and does
+ * not stop the others;
  * the sample then counts ONE `hoglake_metrics_sample_errors_total` (that
  * counter's unit is a sample, as its description has always said) and
  * one `hoglake_metrics_group_failures_total{group}` per failed group,
@@ -620,7 +621,7 @@ data class CatalogTotals(
  *
  * WHERE THE EXTENDED GROUPS RUN. The core group runs on every pod that
  * samples (`HOGLAKE_METRICS_INTERVAL_MS > 0`), because `/v1/info` and the
- * catalogs listing are served from it. The five extended groups run only
+ * catalogs listing are served from it. The six extended groups run only
  * when [extendedGroups] is true, which `App` sets from
  * `HOGLAKE_MAINTENANCE_SUMMARY_INTERVAL_MS > 0` — the maintenance
  * Deployment, which also produces the summary the tables group reads.
@@ -645,7 +646,7 @@ class CatalogMetrics(
     private val droppedTableProbeCap: Int = DROPPED_TABLE_PROBE_CAP,
     /** Ledger rows read per (catalog, task); see [MAINTENANCE_RUN_LOOKBACK]. */
     private val maintenanceRunLookback: Int = MAINTENANCE_RUN_LOOKBACK,
-    /** Whether the five extended groups run on this pod; see the class KDoc. */
+    /** Whether the six extended groups run on this pod; see the class KDoc. */
     private val extendedGroups: Boolean = true,
 ) {
     init {
@@ -825,6 +826,21 @@ class CatalogMetrics(
     private val relationDeadTuples =
         multiGauge("hoglake_relation_dead_tuples", "Estimated dead tuples per hog_* relation (pg_stat_user_tables)")
 
+    // --- per-catalog commit lock, as Postgres sees it ---
+    private val commitLockDbWaiters =
+        multiGauge(
+            "hoglake_commit_lock_db_waiters",
+            "Sessions waiting for the catalog's commit lock, from pg_locks at the sampler tick (every pod and " +
+                "any psql session); absent while nobody holds or waits for it",
+        )
+    private val commitLockDbHeldSeconds =
+        multiGauge(
+            "hoglake_commit_lock_db_held_seconds",
+            "Transaction age of the session holding the catalog's commit lock, at the sampler tick: an upper " +
+                "bound on the hold so far (the transaction may have begun before the lock); absent while " +
+                "nobody holds it",
+        )
+
     // --- maintenance ledger ---
     private val maintenanceLastRunEpoch =
         multiGauge(
@@ -964,6 +980,7 @@ class CatalogMetrics(
             group(GROUP_DELETE_FILES) { sampleDeleteFiles() }
             group(GROUP_LIFECYCLE) { sampleLifecycle() }
             group(GROUP_RELATIONS) { sampleRelations() }
+            group(GROUP_COMMIT_LOCKS) { sampleCommitLocks() }
             group(GROUP_MAINTENANCE_RUNS) { sampleMaintenanceRuns() }
         }
 
@@ -1207,6 +1224,49 @@ class CatalogMetrics(
         )
     }
 
+    /**
+     * The commit lock as POSTGRES sees it (#439), through
+     * [DatabaseHealthRepo.commitLocks] — the read `GET /v1/database/health`
+     * makes, so the gauge and the page cannot disagree. One statement
+     * over `pg_locks` and `pg_stat_activity` plus the one-row catalog
+     * lookup per lock, so it costs the same on a manifest of a billion
+     * rows as on an empty one; `CommitLockMetricsIntegrationTest` pins
+     * the plan.
+     *
+     * What it sees and the in-process gauges cannot: holders and waiters
+     * of EVERY session — other pods, a psql session, a migration. What it
+     * cannot: anything between ticks. A convoy that forms and drains
+     * inside one interval is invisible here and visible in
+     * `hoglake_commit_lock_waiting` and `hoglake_commit_lock_hold_seconds`.
+     *
+     * In the extended groups because it is instance-wide: published by
+     * every API replica it would multiply under a `sum`. A lock whose
+     * catalog row is gone (or whose id is past the 32-bit mask) has no
+     * name to label it with and is skipped; the health page still lists
+     * it.
+     */
+    private fun sampleCommitLocks() {
+        val byCatalog =
+            jdbi.withHandleUnchecked { h -> DatabaseHealthRepo.commitLocks(h) }
+                .filter { it.catalog != null }
+                .groupBy { it.catalog!! }
+        commitLockDbWaiters.register(
+            byCatalog.map {
+                    (catalog, rows) ->
+                MultiGauge.Row.of(Tags.of("catalog", catalog), rows.count { !it.granted })
+            },
+            true,
+        )
+        commitLockDbHeldSeconds.register(
+            byCatalog.mapNotNull { (catalog, rows) ->
+                rows.filter { it.granted }.mapNotNull { it.heldSeconds }.maxOrNull()?.let {
+                    MultiGauge.Row.of(Tags.of("catalog", catalog), it)
+                }
+            },
+            true,
+        )
+    }
+
     private fun sampleMaintenanceRuns() {
         data class LastRuns(
             val catalog: String,
@@ -1327,6 +1387,7 @@ class CatalogMetrics(
         const val GROUP_DELETE_FILES = "delete_files"
         const val GROUP_LIFECYCLE = "lifecycle"
         const val GROUP_RELATIONS = "relations"
+        const val GROUP_COMMIT_LOCKS = "commit_locks"
         const val GROUP_MAINTENANCE_RUNS = "maintenance_runs"
 
         /** The closed set of sample groups, in the order a sample runs them. */
@@ -1337,6 +1398,7 @@ class CatalogMetrics(
                 GROUP_DELETE_FILES,
                 GROUP_LIFECYCLE,
                 GROUP_RELATIONS,
+                GROUP_COMMIT_LOCKS,
                 GROUP_MAINTENANCE_RUNS,
             )
 

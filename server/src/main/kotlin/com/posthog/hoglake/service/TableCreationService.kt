@@ -14,6 +14,7 @@ import com.posthog.hoglake.model.validateFooterSize
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.persistence.CatalogRepo
+import com.posthog.hoglake.persistence.CommitLockPath
 import com.posthog.hoglake.persistence.Locks
 import com.posthog.hoglake.persistence.NamespaceRepo
 import com.posthog.hoglake.persistence.Pg
@@ -170,7 +171,7 @@ class TableCreationService(
         return observed("publish", catalog, operationId, { if (replay) "replayed" else it.state }, { attempted }) {
             operationTransaction { h ->
                 val catalogId = CatalogRepo.require(h, catalog).catalogId
-                Locks.acquireCatalogCommitLock(h, catalogId, lockTimeoutMs)
+                Locks.acquireCatalogCommitLock(h, catalogId, catalog, CommitLockPath.DDL, lockTimeoutMs)
                 val cat = CatalogRepo.require(h, catalog)
                 val operation = load(h, cat.catalogId, operationId)
                 attempted = operation.definition

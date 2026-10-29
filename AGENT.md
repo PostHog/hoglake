@@ -1030,6 +1030,19 @@ ran on the local stack and what it showed.
   that locks more than one takes them in `upload_id` order, and updates
   them in a second statement (UploadService's class comment). Concurrent
   renewals of one owner deadlocked before they did.
+  EVERY ACQUIRER IS OBSERVED AND SAYS WHAT IT IS (#439): it passes the
+  catalog's name and a `CommitLockPath` (`commit`, `compaction`,
+  `expiry`, `retirement`, `ddl`, `drop`), the lock statement itself is
+  private to `Locks`, and the hold is settled on the JDBI handle's
+  commit/rollback/close hooks rather than by the caller, so there is no
+  release to forget. `CommitLockCallSitesTest` pins the path of every
+  call site by file and function; a new acquirer edits that table, and
+  adds a `CommitLockPath` only when none of the six fits. What the
+  series can see: the in-process `hoglake_commit_lock_waiting` /
+  `_held` / `_hold_seconds{path}` see queueing between scrapes but only
+  their own pod; the sampled `hoglake_commit_lock_db_waiters` /
+  `_db_held_seconds` see every session (other pods, psql) but only at
+  the metrics tick. server/README.md §Observability has the rest.
 - **A new guard never edits an existing test out of its way.** When a
   new refusal reds a test, that test either asserts the refusal or has
   its fixture changed to satisfy the guard legitimately, with the reason

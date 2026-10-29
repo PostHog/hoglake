@@ -209,7 +209,9 @@ a writer that can't get the tail in time receives **503
 catalog is convoyed" signal instead of unbounded queueing. Lock waits
 are measured (`hoglake_commit_lock_wait_seconds`) on every commit, DDL,
 and maintenance tail, so a forming convoy is visible before it's an
-incident.
+incident; so are the queue (`hoglake_commit_lock_waiting`) and each
+holder's hold by kind of work (`hoglake_commit_lock_hold_seconds{path}`),
+which is what says WHO the queue is waiting behind (§Observability).
 
 ### File registration: footer-shipping and deferred stats
 
@@ -2105,7 +2107,7 @@ transaction (`observability/`):
   catalog with no published totals yet publishes NO live series
   (`hoglake_live_totals_sampled{catalog}` = 0) and `null` on the wire,
   and is never read from its own manifest for them.
-  The five EXTENDED groups — the gauges that replaced the DuckLake
+  The six EXTENDED groups — the gauges that replaced the DuckLake
   catalog-metrics cron's (millpond `tools/ducklake_metrics.py`) — run
   ONLY where `HOGLAKE_MAINTENANCE_SUMMARY_INTERVAL_MS > 0`, i.e. on the
   maintenance pod, so API replicas do not each publish the same
@@ -2143,6 +2145,17 @@ transaction (`observability/`):
     `hoglake_relation_dead_tuples{relation}` — instance-wide, every
     `hog_*` relation, from the same function `GET /v1/database/health`
     calls.
+  - `hoglake_commit_lock_db_waiters{catalog}` (sessions waiting for the
+    catalog's commit lock) and `hoglake_commit_lock_db_held_seconds{catalog}`
+    (the holder's TRANSACTION age — an upper bound on its hold, since
+    the transaction may have begun before the lock) (#439), from the
+    `pg_locks` read the health page makes (`DatabaseHealthRepo.commitLocks`:
+    one statement, a `hog_catalog` key probe per lock row, 0.27 ms with
+    a holder and three waiters). They see EVERY session — other pods, a
+    psql session — but only at the tick: a convoy that forms and drains
+    between two samples is invisible here. Absent while nobody holds or
+    waits; `hoglake_commit_lock_db_waiters > 10 for 5m` is the alert
+    candidate.
   - `hoglake_maintenance_last_run_epoch{catalog, task, status=ok|failed}`
     (finish time of the latest run with that status among the task's
     last 1,000 ledger rows; when a status scrolls out of that window
@@ -2155,7 +2168,7 @@ transaction (`observability/`):
   publish, and the sample counts one `hoglake_metrics_sample_errors_total`
   plus one `hoglake_metrics_group_failures_total{group}` per failed group
   (`catalogs`, `tables`, `delete_files`, `lifecycle`, `relations`,
-  `maintenance_runs`; all six registered at 0, so a first failure is a
+  `commit_locks`, `maintenance_runs`; all seven registered at 0, so a first failure is a
   visible step). `hoglake_metrics_last_sample_epoch` is LIVENESS:
   it advances whenever the core `catalogs` group succeeds, whatever the
   others did, so alert on the per-group counter for those. #261 removed
@@ -2198,7 +2211,19 @@ transaction (`observability/`):
   files removed,
   hydrations by result (transient errors counted separately), and the
   `hoglake_commit_lock_wait_seconds` histogram on every commit/DDL/
-  maintenance tail (the convoy early-warning). HTTP server metrics
+  maintenance tail (the convoy early-warning). Beside it, the commit
+  lock's in-process trio (#439), recorded by `Locks.acquireCatalogCommitLock`
+  for every taker: `hoglake_commit_lock_waiting{catalog}` (sessions of
+  this pod inside the acquire — summed over pods, the fleet's queue
+  depth), `hoglake_commit_lock_held{catalog}` (0/1 while a transaction
+  of this pod holds it; a holder that never ends is a flat line) and
+  `hoglake_commit_lock_hold_seconds{catalog, path}` (grant to the
+  transaction's commit or rollback, `path` = `commit`, `compaction`,
+  `expiry`, `retirement`, `ddl` or `drop`). These see queueing BETWEEN
+  scrapes but only THIS pod's sessions; the `_db_` pair above sees every
+  session but only at the sampler tick. With FIFO admission a waiter's
+  wait is the holds ahead of it, so a hold p99 rising on one path is the
+  cause and the wait p99 its symptom. HTTP server metrics
   come with the Ktor Micrometer plugin. The webui renders a `/metrics`
   snapshot visually on its metrics page.
   Plus the two POOL gauge families (#218), read straight off the pools

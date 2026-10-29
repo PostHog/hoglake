@@ -13,6 +13,7 @@ import com.posthog.hoglake.model.validateFooterSize
 import com.posthog.hoglake.model.validateSplitOffsets
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
+import com.posthog.hoglake.persistence.CommitLockPath
 import com.posthog.hoglake.persistence.Locks
 import com.posthog.hoglake.storedPayloadObjectMapper
 import io.github.oshai.kotlinlogging.KotlinLogging
@@ -509,7 +510,7 @@ class CommitService(
             }
         val ordOf = tableKeys.withIndex().associate { (i, k) -> (k.namespace to k.table) to i + 1 }
 
-        Locks.acquireCatalogCommitLock(h, catalogId, commitLockTimeoutMs)
+        Locks.acquireCatalogCommitLock(h, catalogId, catalogName, CommitLockPath.COMMIT, commitLockTimeoutMs)
 
         // ONE statement reads everything the steps below decide on: the
         // receipt, the head, every table's resolution, spec, live columns

@@ -27,6 +27,7 @@ import com.posthog.hoglake.model.initialColumns
 import com.posthog.hoglake.model.nodeCount
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.persistence.CatalogRepo
+import com.posthog.hoglake.persistence.CommitLockPath
 import com.posthog.hoglake.persistence.DeleteFileReadRepo
 import com.posthog.hoglake.persistence.FileRepo
 import com.posthog.hoglake.persistence.Locks
@@ -368,7 +369,7 @@ class CatalogService(private val jdbi: Jdbi) {
             requireOperationMetadata(author, message)
             jdbi.inTransactionUnchecked { h ->
                 val cat = requireCatalog(h, catalog)
-                Locks.acquireCatalogCommitLock(h, cat.catalogId)
+                Locks.acquireCatalogCommitLock(h, cat.catalogId, cat.name, CommitLockPath.DROP)
                 // Summary row before catalog row: the sampler's order (see
                 // LOCK ORDER above). MUTATION: removing this deadlocks the
                 // drop against a sampler tick on the same catalog.
@@ -413,7 +414,7 @@ class CatalogService(private val jdbi: Jdbi) {
             Identifiers.validate("namespace", name)
             jdbi.inTransactionUnchecked { h ->
                 val cat = requireCatalog(h, catalog)
-                Locks.acquireCatalogCommitLock(h, cat.catalogId)
+                Locks.acquireCatalogCommitLock(h, cat.catalogId, cat.name, CommitLockPath.DDL)
                 if (NamespaceRepo.findLiveByName(h, cat.catalogId, name) != null) {
                     throw HoglakeException.AlreadyExists("namespace '$name' already exists")
                 }
@@ -481,7 +482,7 @@ class CatalogService(private val jdbi: Jdbi) {
             requireOperationMetadata(author, message)
             jdbi.inTransactionUnchecked { h ->
                 val cat = requireCatalog(h, catalog)
-                Locks.acquireCatalogCommitLock(h, cat.catalogId)
+                Locks.acquireCatalogCommitLock(h, cat.catalogId, cat.name, CommitLockPath.DROP)
                 val ns = requireNamespace(h, cat, namespace)
                 if (expectedNamespaceId != null && ns.namespaceId != expectedNamespaceId) {
                     throw HoglakeException.CommitConflict("namespace '$namespace' no longer has the expected identity")
@@ -565,7 +566,7 @@ class CatalogService(private val jdbi: Jdbi) {
         AlterService(jdbi).validatePartitionFields(cols, partitionFields)
         AlterService(jdbi).validateSortFields(cols, sortFields)
         val cat = requireCatalog(h, catalog)
-        Locks.acquireCatalogCommitLock(h, cat.catalogId)
+        Locks.acquireCatalogCommitLock(h, cat.catalogId, cat.name, CommitLockPath.DDL)
         val ns = requireNamespace(h, cat, namespace)
         if (TableRepo.findLive(h, cat.catalogId, ns.namespaceId, name)?.tableId != replacementTableId) {
             throw HoglakeException.AlreadyExists(
@@ -687,7 +688,7 @@ class CatalogService(private val jdbi: Jdbi) {
             requireOperationMetadata(author, message)
             jdbi.inTransactionUnchecked { h ->
                 val cat = requireCatalog(h, catalog)
-                Locks.acquireCatalogCommitLock(h, cat.catalogId)
+                Locks.acquireCatalogCommitLock(h, cat.catalogId, cat.name, CommitLockPath.DROP)
                 val ns = requireNamespace(h, cat, namespace)
                 val t =
                     TableRepo.findLive(h, cat.catalogId, ns.namespaceId, table)
@@ -754,7 +755,7 @@ class CatalogService(private val jdbi: Jdbi) {
             requireOperationMetadata(author, message)
             jdbi.inTransactionUnchecked { h ->
                 val cat = requireCatalog(h, catalog)
-                Locks.acquireCatalogCommitLock(h, cat.catalogId)
+                Locks.acquireCatalogCommitLock(h, cat.catalogId, cat.name, CommitLockPath.DDL)
                 val ns = requireNamespace(h, cat, namespace)
                 val t =
                     TableRepo.findLive(h, cat.catalogId, ns.namespaceId, table)
