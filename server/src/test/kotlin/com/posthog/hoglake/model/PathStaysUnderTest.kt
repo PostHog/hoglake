@@ -1,4 +1,4 @@
-package com.posthog.hoglake.commit
+package com.posthog.hoglake.model
 
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.params.ParameterizedTest
