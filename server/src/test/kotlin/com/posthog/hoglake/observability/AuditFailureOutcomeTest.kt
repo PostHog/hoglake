@@ -29,6 +29,14 @@ class AuditFailureOutcomeTest {
     }
 
     @Test
+    fun `an object-prefix violation audits as itself, never as error`() {
+        // MUTATION: drop its arm and it falls to the `else`, i.e. a writer
+        // missing a table's layout reads as a server fault in the trail.
+        assertThat(Audit.failureOutcome(HoglakeException.ObjectPrefixViolation("d", "ns.t")))
+            .isEqualTo("object_prefix_violation")
+    }
+
+    @Test
     fun `a genuine fault is still error`() {
         assertThat(Audit.failureOutcome(IllegalStateException("boom"))).isEqualTo("error")
     }

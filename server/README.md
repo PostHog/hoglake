@@ -489,14 +489,53 @@ This is the one deliberate waiver of the server-validates-structure
 rule; registration *paths*, by contrast, are validated against the
 catalog's `data_path` prefix at commit.
 
+**Object-prefix layout** (`set_object_prefix_field`, V29
+`hog_table_layout`, capability `object-prefix-layout-v1`): a table may
+name a top-level integer column (int8 to long, uint8 to uint32; not
+uint64) whose identity partition value names every file's prefix,
+`<data_path>/data/<ns>/<table>/<field>=<value>/`, so one IAM statement on
+that prefix grants exactly one value's objects (`model/ObjectPrefix.kt`
+holds the path function; `pyhoglake/tests/vectors/object_prefix_vectors.json`
+holds the vectors it and any writer are held to). With the option on,
+the commit refuses (422 `object_prefix_violation`, naming the expected
+prefix, up to five paths, `tables` and `retry: re-prepare`) a data file
+whose value is missing or not canonical (`042`, `+4`, out of range),
+that is not under its value's prefix, that ships deferred stats, or
+whose stats do not prove every row holds the value (both bounds equal to
+it, `null_count` 0); and a deletion vector that is not under its
+target's prefix. Here the partition value is checked, not trusted: the
+stats are the proof, because the prefix is a tenant boundary. The DDL
+keeps the layout true: the option is set only on an EMPTY table whose
+spec has exactly one identity field on the column, once (the same field
+again changes nothing, though the request still commits its DDL
+snapshot like every alter, and there is no unset); while it is on, a spec change must
+keep that identity field, the column cannot be dropped or renamed, the
+table cannot be renamed, and an atomic replacement of it is refused at
+prepare. GET reports `object_prefix_field` as of the snapshot read.
+Until compaction writes under the layout it skips such tables
+(`hoglake_compaction_skipped_total{reason="object_prefix_layout"}`), and
+deferred stats stay refused until the hydrator checks pending files
+against the layout. Set the option only once every server, compaction and
+hydrator replica runs a version that knows it: an older one ignores the
+row and would accept or compact files outside the prefixes. No in-tree
+writer produces conforming files yet, and each is refused with
+`object_prefix_violation`: millrace/millpond
+(`{data_path}/data/{ns}/{table}/{build}`, deferred stats), pyhoglake
+(`.../{table}/{idempotency_key}/`), duckdb-client (deletion vectors at
+the table root, `hoglake-dv-<uuid>.puffin`) and Trino writes (their
+upload claims are not under a value's prefix). Enable the option only
+on a table whose writer is layout-aware, in this order: create the table
+with its spec, set the option, then start the writers. Never roll a
+server back below this version once a table has the option.
+
 ### Schema evolution
 
 `service/AlterService.kt`, `POST /alter`: a list of typed operations —
 `add_column`, `drop_column`, `rename_column`, `promote_column`,
-`rename_table`, `set_partition_spec`, `set_sort_order`, and the V11
+`rename_table`, `set_partition_spec`, `set_sort_order`, the V11
 metadata ops `add_column_with_metadata`, `set_table_comment`,
-`set_column_comment`, `set_properties` (`versioned-table-metadata-v1`)
-— applied **in
+`set_column_comment`, `set_properties` (`versioned-table-metadata-v1`),
+and `set_object_prefix_field` (see Partitioning) — applied **in
 order, atomically, as one DDL commit** (one snapshot, one
 `table_altered` change row, one schema-version bump). Renames keep the
 `field_id` (end the old row, begin a new one with the same id), so
@@ -646,11 +685,15 @@ was reached; requests reaching below it get **410 Gone** with
 reconcile instructions citing that time — a consumer is told its feed
 has a hole (and since when) rather than silently skipping one. A fifth
 step applies the same reachability rule to the accumulating versioned
-DDL tables (`hog_table_version`, `hog_column`, `hog_partition_spec`,
-`hog_sort_spec`, `hog_view`): rows with
-`end_snapshot <= earliest_snapshot_id` are invisible at every retained
-snapshot and are deleted (spec fields cascade), so DDL churn cannot
-grow the metadata without bound. Those five tables are bounded by DDL
+DDL tables (`hog_table_version`, `hog_column`, `hog_sort_spec`,
+`hog_view`, `hog_table_layout`): rows with `end_snapshot <= earliest_snapshot_id` are
+invisible at every retained snapshot and are deleted (sort fields
+cascade), so DDL churn cannot grow the metadata without bound.
+`hog_partition_spec` is kept: a file row names its spec by `spec_id` at
+every snapshot, and spec ids are allocated as `MAX(spec_id) + 1`, so
+deleting a retired spec would strip the labels from the live files
+written under it and, when it held the table's highest id, let the next
+spec reuse that id and relabel them. Those tables are bounded by DDL
 volume rather than by file volume — thousands of rows on prod-us, not
 millions — which is why they stay in the locked transaction while the
 file rows do not.
@@ -1819,7 +1862,11 @@ contradicts its `explicit_row_ids` registration — and `failed` is the
 outright failure that gets retried next run. The first two never show up as failures — a sweep with either can
 look perfectly healthy — which is why they get a line rather than only a
 log and a ledger row. The self-healing skips (commit conflicts, DV
-supersession) stay uncounted: they re-plan on the next run.
+supersession) stay uncounted: they re-plan on the next run. A fourth
+reason, `object_prefix_layout`, counts TABLES, not groups: one per sweep
+for each table with the object-prefix layout (see Partitioning), which
+compaction leaves alone until it writes under the layout. It is a steady
+rate while such tables exist, not an alert.
 
 **`reason="failed"` is a FAILURE filed under a metric named
 `skipped`.** That is deliberate — one series for "groups that did not

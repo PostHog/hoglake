@@ -492,6 +492,27 @@ CREATE TABLE hog_sort_field (
         REFERENCES hog_sort_spec ON DELETE CASCADE
 );
 
+-- ---- Object layout (V29) ----
+-- Versioned per-table layout option, the sort-spec shape: a live row
+-- means every data file and deletion vector of the table lives under
+-- <data_path>/data/<ns>/<table>/<field>=<value>/ (model/ObjectPrefix.kt),
+-- enforced at commit. object_prefix_field_id has no foreign key
+-- (hog_column's key includes begin_snapshot); the DDL refuses dropping or
+-- renaming the field while the option is on. At most one live row per
+-- table (the unique partial index).
+CREATE TABLE hog_table_layout (
+    catalog_id             bigint NOT NULL,
+    table_id               bigint NOT NULL,
+    begin_snapshot         bigint NOT NULL,
+    end_snapshot           bigint,
+    object_prefix_field_id bigint NOT NULL,
+    PRIMARY KEY (catalog_id, table_id, begin_snapshot),
+    FOREIGN KEY (catalog_id, table_id) REFERENCES hog_table ON DELETE CASCADE,
+    CHECK (end_snapshot IS NULL OR end_snapshot > begin_snapshot)
+);
+CREATE UNIQUE INDEX hog_table_layout_live
+    ON hog_table_layout (catalog_id, table_id) WHERE end_snapshot IS NULL;
+
 -- ---- Row-level deletes: deletion vectors ----
 -- One DV file per data file per range; a new DV supersedes the old
 -- (end_snapshot) and must cover it (delete_count monotonic — DVs only
