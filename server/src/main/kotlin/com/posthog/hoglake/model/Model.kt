@@ -2508,6 +2508,10 @@ data class ChangesPlan(
 
 /** Service-level failures the API layer maps to status codes. */
 sealed class HoglakeException(message: String) : RuntimeException(message) {
+    class PartitionLookupInvalidRequest(detail: String) : HoglakeException(detail)
+
+    class PartitionLookupUnavailable(val reason: String, detail: String) : HoglakeException(detail)
+
     class NotFound(what: String) : HoglakeException(what)
 
     class AlreadyExists(what: String) : HoglakeException(what)

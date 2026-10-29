@@ -2,9 +2,9 @@ package com.posthog.hoglake.model
 
 import java.util.UUID
 
-class PartitionLookupInvalidRequest(detail: String) : RuntimeException(detail)
+typealias PartitionLookupInvalidRequest = HoglakeException.PartitionLookupInvalidRequest
 
-class PartitionLookupUnavailable(val reason: String, detail: String) : RuntimeException(detail)
+typealias PartitionLookupUnavailable = HoglakeException.PartitionLookupUnavailable
 
 internal fun validatePartitionLookupValues(values: List<String?>) {
     if (values.isEmpty() || values.size > 64) {

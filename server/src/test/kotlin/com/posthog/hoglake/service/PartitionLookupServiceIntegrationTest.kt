@@ -14,8 +14,11 @@ import com.posthog.hoglake.model.TableAppend
 import com.posthog.hoglake.model.Transform
 import com.posthog.hoglake.testing.PartitionLookupFixture
 import com.posthog.hoglake.testing.PgTestSupport
+import com.zaxxer.hikari.HikariConfig
+import com.zaxxer.hikari.HikariDataSource
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
+import org.awaitility.Awaitility.await
 import org.jdbi.v3.core.kotlin.useHandleUnchecked
 import org.jdbi.v3.core.statement.SqlLogger
 import org.jdbi.v3.core.statement.StatementContext
@@ -23,10 +26,16 @@ import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
+import org.postgresql.PGConnection
+import org.postgresql.util.PSQLException
+import java.sql.SQLException
+import java.time.Duration
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 
 @Tag("integration")
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
@@ -284,7 +293,7 @@ class PartitionLookupServiceIntegrationTest {
             if (cursor != null) assertThat(cursors.add(cursor)).isTrue()
             assertThat(cursors.size).isLessThan(10)
         } while (cursor != null)
-        assertThat(emptyPages).isEqualTo(2)
+        assertThat(emptyPages).isEqualTo(1)
         assertThat(seen).hasSize(2).doesNotHaveDuplicates()
     }
 
@@ -486,6 +495,145 @@ class PartitionLookupServiceIntegrationTest {
             assertThat(totals.lastFileWriteSnapshot).isEqualTo(first)
         }
     }
+
+    @Test
+    fun `omitted continuation limit inherits fifty while an explicit hundred is refused`() {
+        val f = PartitionLookupFixture(db)
+        f.append(*Array(101) { listOf("a", "b") })
+        val first = service.lookup(f.name, "ns", "t", f.specId, listOf("a", "b"), limit = 50)
+        assertThat(first.files).hasSize(50)
+        val second = service.lookup(f.name, "ns", "t", f.specId, listOf("a", "b"), cursor = first.nextCursor)
+        assertThat(second.files).hasSize(50)
+        assertThat(second.files.map { it.dataFileId }).doesNotContainAnyElementsOf(first.files.map { it.dataFileId })
+        assertThat(PartitionLookupCursor.parse(second.nextCursor!!).limit).isEqualTo(50)
+        assertThatThrownBy {
+            service.lookup(f.name, "ns", "t", f.specId, listOf("a", "b"), limit = 100, cursor = first.nextCursor)
+        }.isInstanceOf(PartitionLookupInvalidRequest::class.java)
+    }
+
+    @Test
+    fun `remaining statement budget cancels with 57014 and reuses the same pooled backend`() {
+        val f = PartitionLookupFixture(db)
+        f.append(listOf("a", "b"))
+        lookupPool().use { pool ->
+            val instrumented = Database.jdbi(pool)
+            val firstPid = pool.connection.use { it.unwrap(PGConnection::class.java).backendPID }
+            val failure = AtomicReference<SQLException>()
+            val backstopMargin = AtomicReference<Long>()
+            val delayed = AtomicInteger()
+            instrumented.setSqlLogger(
+                object : SqlLogger {
+                    override fun logBeforeExecution(context: StatementContext) {
+                        if (context.rawSql.trimStart().startsWith("SELECT") && !context.rawSql.contains("set_config")) {
+                            val queryNumber = delayed.incrementAndGet()
+                            if (queryNumber == 1) {
+                                context.connection.createStatement().use { statement ->
+                                    statement.executeQuery(
+                                        "SELECT EXTRACT(EPOCH FROM " +
+                                            "current_setting('transaction_timeout')::interval) * 1000 - " +
+                                            "EXTRACT(EPOCH FROM current_setting('statement_timeout')::interval) * 1000",
+                                    ).use { rows ->
+                                        check(rows.next())
+                                        backstopMargin.set(rows.getLong(1))
+                                    }
+                                }
+                            }
+                            if (queryNumber <= 2) Thread.sleep(200)
+                        }
+                    }
+
+                    override fun logException(
+                        context: StatementContext,
+                        ex: SQLException,
+                    ) {
+                        failure.set(ex)
+                    }
+                },
+            )
+            val bounded = PartitionLookupService(instrumented, statementTimeoutMs = 700)
+            db.jdbi.useHandleUnchecked { lock ->
+                lock.begin()
+                lock.execute("LOCK TABLE hog_data_file IN ACCESS EXCLUSIVE MODE")
+                try {
+                    val started = System.nanoTime()
+                    assertThatThrownBy { bounded.lookup(f.name, "ns", "t", f.specId, listOf("a", "b")) }
+                        .isInstanceOf(PartitionLookupUnavailable::class.java).extracting("reason").isEqualTo("timeout")
+                    assertThat(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started)).isLessThan(950)
+                    assertThat(backstopMargin.get()!!).isGreaterThan(3_000)
+                    assertThat(failure.get()?.sqlState).isEqualTo("57014")
+                    assertThat((failure.get() as PSQLException).serverErrorMessage?.severity).isEqualTo("ERROR")
+                } finally {
+                    lock.rollback()
+                }
+            }
+            pool.connection.use { connection ->
+                assertThat(connection.unwrap(PGConnection::class.java).backendPID).isEqualTo(firstPid)
+                connection.createStatement().use { statement ->
+                    statement.executeQuery(
+                        "SELECT current_setting('transaction_timeout'), current_setting('statement_timeout'), 1",
+                    )
+                        .use { rows ->
+                            assertThat(rows.next()).isTrue()
+                            assertThat(rows.getString(1)).isEqualTo("0")
+                            assertThat(rows.getString(2)).isEqualTo("1min")
+                            assertThat(rows.getInt(3)).isEqualTo(1)
+                        }
+                }
+            }
+            instrumented.setSqlLogger(SqlLogger.NOP_SQL_LOGGER)
+            assertThat(bounded.lookup(f.name, "ns", "t", f.specId, listOf("a", "b")).files).hasSize(1)
+        }
+    }
+
+    @Test
+    fun `connection acquisition consumes the request budget before opening a transaction`() {
+        val f = PartitionLookupFixture(db)
+        lookupPool().use { pool ->
+            val instrumented = Database.jdbi(pool)
+            val began = AtomicBoolean()
+            instrumented.setSqlLogger(
+                object : SqlLogger {
+                    override fun logBeforeExecution(context: StatementContext) {
+                        if (context.rawSql.startsWith("SET TRANSACTION")) began.set(true)
+                    }
+                },
+            )
+            val bounded = PartitionLookupService(instrumented, statementTimeoutMs = 100)
+            val borrowed = pool.connection
+            Executors.newSingleThreadExecutor().use { executor ->
+                val result =
+                    executor.submit<Throwable?> {
+                        try {
+                            bounded.lookup(f.name, "ns", "t", f.specId, listOf("a", "b"))
+                            null
+                        } catch (e: Throwable) {
+                            e
+                        }
+                    }
+                try {
+                    await().pollInterval(Duration.ofMillis(1)).atMost(Duration.ofSeconds(1))
+                        .until { pool.hikariPoolMXBean.threadsAwaitingConnection == 1 }
+                    Thread.sleep(150)
+                } finally {
+                    borrowed.close()
+                }
+                assertThat(result.get(1, TimeUnit.SECONDS)).isInstanceOf(PartitionLookupUnavailable::class.java)
+                    .extracting("reason").isEqualTo("timeout")
+                assertThat(began.get()).isFalse()
+            }
+        }
+    }
+
+    private fun lookupPool() =
+        HikariDataSource(
+            HikariConfig().apply {
+                jdbcUrl = db.jdbcUrl
+                username = PgTestSupport.USER
+                password = PgTestSupport.PASSWORD
+                maximumPoolSize = 1
+                connectionInitSql = Database.SESSION_INIT_SQL
+            },
+        )
 
     @Test
     fun `one catalog cannot occupy both lookup permits`() {

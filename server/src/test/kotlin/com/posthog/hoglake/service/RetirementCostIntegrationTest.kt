@@ -224,7 +224,7 @@ class RetirementCostIntegrationTest {
      * THE ANSWER IS THAT IT IS INDEX-DRIVEN, and the test asks rather
      * than asserts it from reading the schema: `V2__maintenance.sql`
      * added `hog_delete_file_data_lookup (catalog_id, data_file_id)`;
-     * V30 replaces it with `hog_delete_file_snapshot_lookup`, retaining
+     * V32 replaces it with `hog_delete_file_snapshot_lookup`, retaining
      * the same non-partial prefix for the RI query's key. (The partial
      * `hog_delete_file_one_live_per_data_file` could not have served
      * it — the trigger's query carries no `end_snapshot` predicate for

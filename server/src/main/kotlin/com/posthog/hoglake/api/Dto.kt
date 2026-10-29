@@ -78,7 +78,7 @@ data class ApiErrorDto(
     val readSnapshot: Long? = null,
     /** The recovery, when there is exactly one: `re-prepare`. */
     val retry: String? = null,
-    /** `catalog_not_empty` only: the first failing drop precondition. */
+    /** Catalog drop precondition, or the partition lookup's busy/timeout reason. */
     val reason: String? = null,
 )
 

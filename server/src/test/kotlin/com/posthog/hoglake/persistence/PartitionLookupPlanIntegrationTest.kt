@@ -72,6 +72,14 @@ class PartitionLookupPlanIntegrationTest {
             )
             h.execute(
                 """
+                INSERT INTO hog_file_partition_value (catalog_id, data_file_id, key_index, value)
+                SELECT catalog_id, data_file_id, k, 'common'
+                FROM hog_data_file CROSS JOIN generate_series(2, 63) k
+                WHERE data_file_id <= 3000
+                """,
+            )
+            h.execute(
+                """
                 INSERT INTO hog_delete_file (catalog_id, delete_file_id, table_id, data_file_id,
                     begin_snapshot, end_snapshot, path, delete_count, file_size_bytes)
                 SELECT f.catalog_id, f.data_file_id * 3 + v, f.table_id, f.data_file_id,
@@ -95,7 +103,7 @@ class PartitionLookupPlanIntegrationTest {
         values: List<String?>,
         cap: Int,
         generic: Boolean,
-        page: Boolean,
+        includeAggregates: Boolean,
         after: Long = -1,
     ): JsonNode =
         db.jdbi.withHandleUnchecked { h ->
@@ -117,7 +125,8 @@ class PartitionLookupPlanIntegrationTest {
                                 "candidateProbeLimit" to ("integer" to (cap + 1).toString()),
                                 "arity" to ("integer" to values.size.toString()),
                             )
-                        if (page) params["pageLimit"] = "integer" to "101"
+                        params["pageLimit"] = "integer" to "101"
+                        params["includeAggregates"] = "boolean" to includeAggregates.toString()
                         values.forEachIndexed {
                                 i,
                                 value,
@@ -149,7 +158,7 @@ class PartitionLookupPlanIntegrationTest {
                                 after,
                                 cap,
                             )
-                        if (page) q.bind("pageLimit", 101)
+                        q.bind("pageLimit", 101).bind("includeAggregates", includeAggregates)
                         q.mapTo(String::class.java).one()
                     }
                 json.readTree(text)[0]
@@ -160,20 +169,26 @@ class PartitionLookupPlanIntegrationTest {
 
     @Test
     fun `custom and generic plans bound index and manifest work before materialization`() {
-        for (values in listOf(listOf("common", "wanted"), listOf(null, "wanted"), listOf("rare", "wanted"))) {
+        for (values in listOf(
+            listOf("common", "wanted"),
+            listOf(null, "wanted"),
+            listOf("rare", "wanted"),
+            listOf("common", "missing"),
+            List(64) { if (it == 1) "wanted" else "common" },
+        )) {
             for (cap in listOf(100, 1000, 10_000)) {
-                for (page in listOf(false, true)) {
+                for (includeAggregates in listOf(true, false)) {
                     for (generic in listOf(false, true)) {
-                        for (after in if (page) listOf(-1L, 100_000L) else listOf(-1L)) {
-                            val sql =
-                                if (page) {
-                                    PartitionLookupRepo.pageSql(
-                                        values,
-                                    )
-                                } else {
-                                    PartitionLookupRepo.aggregateSql(values)
-                                }
-                            val result = explain(sql, values, cap, generic, page, after)
+                        for (after in if (includeAggregates) listOf(-1L) else listOf(-1L, 100_000L)) {
+                            val result =
+                                explain(
+                                    PartitionLookupRepo.lookupSql(values),
+                                    values,
+                                    cap,
+                                    generic,
+                                    includeAggregates,
+                                    after,
+                                )
                             val all = nodes(result["Plan"])
                             val candidates =
                                 all.singleOrNull { it.path("Subplan Name").asText() == "CTE candidates" }
@@ -182,6 +197,20 @@ class PartitionLookupPlanIntegrationTest {
                             val probes =
                                 all.singleOrNull { it.path("Subplan Name").asText() == "CTE probes" }
                                     ?: error("missing probes: ${result.toPrettyString()}")
+                            assertThat(probes.path("Actual Loops").asDouble()).isEqualTo(1.0)
+                            val probeReaders = all.filter { it.path("CTE Name").asText() == "probes" }
+                            assertThat(probeReaders).hasSize(2)
+                            assertThat(probeReaders.all { it.path("Actual Loops").asDouble() <= 1.0 }).isTrue()
+                            assertThat(
+                                probeReaders.sumOf {
+                                    (it.path("Actual Rows").asDouble() + it.path("Rows Removed by Filter").asDouble()) *
+                                        it.path("Actual Loops").asDouble()
+                                },
+                            ).isLessThanOrEqualTo(2.0 * values.size * (cap + 1))
+                            val dvSeeks = all.filter { it.path("Relation Name").asText() == "hog_delete_file" }
+                            if (!includeAggregates || candidates.path("Actual Rows").asDouble() > cap) {
+                                assertThat(dvSeeks.sumOf { it.path("Actual Loops").asDouble() }).isZero()
+                            }
                             val keyProbes =
                                 nodes(probes).filter {
                                     it.path("Relation Name").asText() == "hog_file_partition_value"
@@ -209,12 +238,19 @@ class PartitionLookupPlanIntegrationTest {
                                         node["Actual Loops"].asDouble()
                                 assertThat(
                                     examined,
-                                ).describedAs("bounded relation work %s", node).isLessThanOrEqualTo((cap + 1) * 4.0)
+                                ).describedAs("bounded relation work %s", node).isLessThanOrEqualTo(
+                                    (cap + 1) *
+                                        if (node.path("Alias").asText() == "extra") {
+                                            maxOf(4.0, values.size.toDouble())
+                                        } else {
+                                            4.0
+                                        },
+                                )
                             }
                             val root = result["Plan"]
                             val buffers =
                                 root.path("Shared Hit Blocks").asLong() + root.path("Shared Read Blocks").asLong()
-                            assertThat(buffers).isLessThan(40L * cap + 2000)
+                            assertThat(buffers).isLessThan((24L + 8L * values.size) * cap + 2000)
                             val materialized = all.filter { it.path("Subplan Name").asText() == "CTE matched" }
                             assertThat(materialized).isNotEmpty()
                             for (node in materialized + listOf(root)) {
@@ -223,8 +259,10 @@ class PartitionLookupPlanIntegrationTest {
                                 ).doesNotContain("split_offsets", "missing_field_ids")
                             }
                             println(
-                                "partition lookup plan pivot=${values[0]} cap=$cap page=$page generic=$generic " +
-                                    "after=$after buffers=$buffers elapsed_ms=${result["Execution Time"]}",
+                                "partition lookup plan arity=${values.size} pivot=${values[0]} cap=$cap " +
+                                    "aggregates=$includeAggregates generic=$generic " +
+                                    "after=$after candidates=${candidates.path("Actual Rows").asLong()} " +
+                                    "buffers=$buffers elapsed_ms=${result["Execution Time"]}",
                             )
                         }
                     }

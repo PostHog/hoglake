@@ -1,6 +1,6 @@
 import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   pagedPartitionListingFixture,
   partitionListingFixture,
@@ -15,10 +15,10 @@ import { jsonResponse, mockFetch, renderApp } from "./helpers";
 const base = "/v1/catalogs/analytics/namespaces/events/tables/pageviews";
 const route = "/catalogs/analytics/namespaces/events/tables/pageviews";
 
-function lookupResult(params: URLSearchParams) {
+function lookupResult(params: URLSearchParams, init?: RequestInit) {
   return {
     snapshot_id: params.get("snapshot") ?? "4211", table_uuid: tableFixture.table_uuid,
-    spec_id: params.get("spec_id"), values: JSON.parse(params.get("values")!),
+    spec_id: params.get("spec_id"), values: JSON.parse(init?.body as string),
     aggregates: { status: "exact", reason: null, totals: {
       file_count: "2", physical_rows: "980000", total_bytes: "520093696", dv_count: "0",
       stats_state: { provided: "1", pending: "1", failed: "0" }, last_file_write_snapshot: "4100",
@@ -29,7 +29,7 @@ function lookupResult(params: URLSearchParams) {
 /** Every request the page can make, plus the URLs it made, in order. */
 function harness(listing = partitionListingFixture) {
   const urls: string[] = [];
-  mockFetch((url) => {
+  mockFetch((url, init) => {
     urls.push(url);
     const [path] = url.split("?");
     if (path === base) return jsonResponse(tableFixture);
@@ -38,7 +38,7 @@ function harness(listing = partitionListingFixture) {
     if (path === `${base}/partitions`) return jsonResponse(listing);
     if (path === `${base}/partitions/lookup`) {
       const params = new URL(url, "http://localhost").searchParams;
-      return jsonResponse(lookupResult(params));
+      return jsonResponse(lookupResult(params, init));
     }
     return undefined;
   });
@@ -327,7 +327,10 @@ describe("TablePage partitions tab", () => {
     );
     const lookupUrl = new URL(urls.find((u) => u.split("?")[0] === `${base}/partitions/lookup`)!, "http://localhost");
     expect(lookupUrl.searchParams.get("spec_id")).toBe("1");
-    expect(JSON.parse(lookupUrl.searchParams.get("values")!)).toEqual(["20697", "7"]);
+    expect(lookupUrl.searchParams.has("values")).toBe(false);
+    const lookupInit = vi.mocked(fetch).mock.calls.find(([url]) => String(url).split("?")[0] === `${base}/partitions/lookup`)![1]!;
+    expect(lookupInit.method).toBe("POST");
+    expect(JSON.parse(lookupInit.body as string)).toEqual(["20697", "7"]);
     expect(urls.filter((u) => u.split("?")[0] === `${base}/files`)).toHaveLength(0);
     await screen.findByRole("button", { name: "Inspect file 101" });
     expect(urls).toContain(`${base}?totals=false`);
@@ -359,11 +362,11 @@ describe("TablePage partitions tab", () => {
   it("opens a pinned lookup without table metadata and keeps historical inspector errors local", async () => {
     const snapshot = "9007199254740993";
     const urls: string[] = [];
-    mockFetch((url) => {
+    mockFetch((url, init) => {
       urls.push(url);
       const parsed = new URL(url, "http://localhost");
       if (parsed.pathname === base) return jsonResponse({ error: "not_found", detail: "No table metadata" }, 404);
-      if (parsed.pathname === `${base}/partitions/lookup`) return jsonResponse(lookupResult(parsed.searchParams));
+      if (parsed.pathname === `${base}/partitions/lookup`) return jsonResponse(lookupResult(parsed.searchParams, init));
       if (parsed.pathname === `${base}/files/101/stats`) return jsonResponse({ error: "not_found", detail: "Historical column stats unavailable" }, 404);
       return undefined;
     });
@@ -383,12 +386,12 @@ describe("TablePage partitions tab", () => {
 
   it("keeps exact inspection reachable after the sample listing exceeds its limit", async () => {
     const urls: string[] = [];
-    mockFetch((url) => {
+    mockFetch((url, init) => {
       urls.push(url);
       const parsed = new URL(url, "http://localhost");
       if (parsed.pathname === base) return jsonResponse(tableFixture);
       if (parsed.pathname === `${base}/partitions`) return jsonResponse({ error: "partition_limit", detail: "Sample listing limit exceeded" }, 422);
-      if (parsed.pathname === `${base}/partitions/lookup`) return jsonResponse(lookupResult(parsed.searchParams));
+      if (parsed.pathname === `${base}/partitions/lookup`) return jsonResponse(lookupResult(parsed.searchParams, init));
       return undefined;
     });
     const user = userEvent.setup();
@@ -403,7 +406,9 @@ describe("TablePage partitions tab", () => {
     await user.click(screen.getByRole("button", { name: "Inspect partition" }));
     await screen.findByRole("button", { name: "Inspect file 101" });
     const lookup = new URL(urls.find((url) => url.split("?")[0] === `${base}/partitions/lookup`)!, "http://localhost");
-    expect(JSON.parse(lookup.searchParams.get("values")!)).toEqual(["20697", null]);
+    expect(lookup.searchParams.has("values")).toBe(false);
+    const lookupInit = vi.mocked(fetch).mock.calls.find(([url]) => String(url).split("?")[0] === `${base}/partitions/lookup`)![1]!;
+    expect(JSON.parse(lookupInit.body as string)).toEqual(["20697", null]);
     expect(partitionsUrls(urls)).toHaveLength(1);
     expect(urls.some((url) => [`${base}/partitions/values`, `${base}/files`].includes(url.split("?")[0]))).toBe(false);
   });

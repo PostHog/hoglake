@@ -5,6 +5,7 @@ import com.posthog.hoglake.model.PartitionLookup
 import com.posthog.hoglake.model.PartitionLookupAggregates
 import com.posthog.hoglake.model.PartitionLookupStatsState
 import com.posthog.hoglake.model.PartitionLookupTotals
+import com.posthog.hoglake.model.PartitionLookupUnavailable
 import com.posthog.hoglake.wireObjectMapper
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.Test
@@ -14,6 +15,23 @@ import java.util.UUID
 class PartitionLookupSpecParityTest {
     private val spec = File("src/main/resources/openapi/hoglake.yaml").readText()
     private val mapper = wireObjectMapper()
+
+    @Test
+    fun `lookup publishes POST with a complete tuple body and lossless int64 query controls`() {
+        val path = "/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/partitions/lookup"
+        val block = spec.substringAfter("  $path:\n").substringBefore("\n  /catalogs/")
+        assertThat(block).startsWith("    post:\n")
+        assertThat(block).doesNotContain("    get:", "        - name: values")
+        assertThat(block).contains(
+            "      requestBody:\n        required: true",
+            "              type: array",
+            "              minItems: 1",
+            "              maxItems: 64",
+            "              items: { type: string, nullable: true, maxLength: 8192 }",
+            "          schema: { type: integer, format: int64, minimum: 1 }",
+            "        - { \$ref: \"#/components/parameters/snapshot\" }",
+        )
+    }
 
     private fun schema(name: String): String {
         val header = "    $name:\n"
@@ -80,7 +98,7 @@ class PartitionLookupSpecParityTest {
     fun `lookup unavailable error has its own schema without extending catalog drop reasons`() {
         val body =
             mapper.valueToTree<JsonNode>(
-                PartitionLookupUnavailableErrorDto("partition_lookup_unavailable", "busy", "busy"),
+                errorBody(PartitionLookupUnavailable("busy", "busy")).second,
             )
         assertShape("PartitionLookupUnavailableError", body)
         assertThat(schema("PartitionLookupUnavailableError")).contains("enum: [busy, timeout]")

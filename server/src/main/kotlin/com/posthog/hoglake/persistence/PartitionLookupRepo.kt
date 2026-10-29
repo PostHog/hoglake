@@ -4,7 +4,6 @@ import com.posthog.hoglake.model.DataFile
 import com.posthog.hoglake.model.PartitionLookupAggregates
 import com.posthog.hoglake.model.PartitionLookupStatsState
 import com.posthog.hoglake.model.PartitionLookupTotals
-import com.posthog.hoglake.model.StatsState
 import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.statement.Query
 import java.sql.ResultSet
@@ -12,7 +11,11 @@ import java.sql.ResultSet
 /**
  * Probe each tuple key through the inverse index, then examine the smallest bounded candidate set.
  * Each key reads at most cap + 1 entries; unrelated tables and retained ended files still count.
- * The plan fixture checks custom and generic plans at the production candidate cap.
+ * Equal counts choose the probe covering the widest id range, then the lowest key index.
+ * Aggregates and the page share one materialized match set; continuations skip aggregate DV seeks.
+ * PG18 warm serial fixture: 120k files / 426k partition values; the two-key first page examines
+ * 4,706 candidates in 47–50 ms (10–11 us/candidate), with 40,011 shared buffers. The plan fixture
+ * checks custom and generic plans at the production 10k cap, including 64-key tuples.
  */
 internal object PartitionLookupRepo {
     private const val FILE_COLUMNS =
@@ -20,6 +23,8 @@ internal object PartitionLookupRepo {
             "footer_size, row_id_start, stats_state, begin_snapshot, explicit_row_ids"
 
     data class Page(val files: List<DataFile>, val candidateCount: Int, val lastExamined: Long?)
+
+    data class Result(val aggregates: PartitionLookupAggregates, val page: Page)
 
     fun specArity(
         h: Handle,
@@ -58,32 +63,36 @@ internal object PartitionLookupRepo {
             ),
             catalogId, tableId, specId, values, snapshot, upper, -1, candidateLimit,
         )
-            .map { rs, _ ->
-                if (rs.getInt("candidate_count") > candidateLimit) {
-                    PartitionLookupAggregates("unavailable", "candidate_scan_limit", null)
-                } else {
-                    try {
-                        PartitionLookupAggregates(
-                            "exact",
-                            null,
-                            PartitionLookupTotals(
-                                exactLong(rs, "file_count"),
-                                exactLong(rs, "physical_rows"),
-                                exactLong(rs, "total_bytes"),
-                                exactLong(rs, "dv_count"),
-                                PartitionLookupStatsState(
-                                    exactLong(rs, "provided"),
-                                    exactLong(rs, "pending"),
-                                    exactLong(rs, "failed"),
-                                ),
-                                rs.getObject("last_write")?.let { (it as Number).toLong() },
-                            ),
-                        )
-                    } catch (_: ArithmeticException) {
-                        PartitionLookupAggregates("unavailable", "overflow", null)
-                    }
-                }
-            }.one()
+            .map { rs, _ -> aggregate(rs, candidateLimit) }.one()
+
+    private fun aggregate(
+        rs: ResultSet,
+        candidateLimit: Int,
+    ): PartitionLookupAggregates =
+        if (rs.getInt("candidate_count") > candidateLimit) {
+            PartitionLookupAggregates("unavailable", "candidate_scan_limit", null)
+        } else {
+            try {
+                PartitionLookupAggregates(
+                    "exact",
+                    null,
+                    PartitionLookupTotals(
+                        exactLong(rs, "file_count"),
+                        exactLong(rs, "physical_rows"),
+                        exactLong(rs, "total_bytes"),
+                        exactLong(rs, "dv_count"),
+                        PartitionLookupStatsState(
+                            exactLong(rs, "provided"),
+                            exactLong(rs, "pending"),
+                            exactLong(rs, "failed"),
+                        ),
+                        rs.getObject("last_write")?.let { (it as Number).toLong() },
+                    ),
+                )
+            } catch (_: ArithmeticException) {
+                PartitionLookupAggregates("unavailable", "overflow", null)
+            }
+        }
 
     private fun exactLong(
         rs: ResultSet,
@@ -93,7 +102,7 @@ internal object PartitionLookupRepo {
             column,
         ).toBigIntegerExact().longValueExact()
 
-    fun page(
+    fun lookup(
         h: Handle,
         catalogId: Long,
         tableId: Long,
@@ -104,41 +113,31 @@ internal object PartitionLookupRepo {
         after: Long,
         candidateLimit: Int,
         limit: Int,
-    ): Page {
+        includeAggregates: Boolean,
+    ): Result {
+        var aggregates = PartitionLookupAggregates("unavailable", "continuation", null)
         var count = 0
         var last: Long? = null
         val files =
             bind(
                 h.createQuery(
-                    pageSql(values),
+                    lookupSql(values),
                 ),
                 catalogId, tableId, specId, values, snapshot, upper, after, candidateLimit,
             )
                 .bind("pageLimit", limit + 1)
+                .bind("includeAggregates", includeAggregates)
                 .map { rs, _ ->
+                    if (includeAggregates) aggregates = aggregate(rs, candidateLimit)
                     count = rs.getInt("candidate_count")
                     last = rs.getObject("last_examined")?.let { (it as Number).toLong() }
                     if (rs.getObject("data_file_id") == null) {
                         null
                     } else {
-                        DataFile(
-                            dataFileId = rs.getLong("data_file_id"),
-                            tableId = rs.getLong("table_id"),
-                            path = rs.getString("path"),
-                            fileFormat = rs.getString("file_format"),
-                            recordCount = rs.getLong("record_count"),
-                            fileSizeBytes = rs.getLong("file_size_bytes"),
-                            footerSize = rs.getObject("footer_size")?.let { (it as Number).toLong() },
-                            rowIdStart = rs.getLong("row_id_start"),
-                            statsState = StatsState.fromWire(rs.getString("stats_state")),
-                            beginSnapshot = rs.getLong("begin_snapshot"),
-                            specId = specId,
-                            partitionValues = values,
-                            explicitRowIds = rs.getBoolean("explicit_row_ids"),
-                        )
+                        FileRepo.mapFile(rs, specId, values)
                     }
                 }.list().filterNotNull()
-        return Page(files, count, last)
+        return Result(aggregates, Page(files, count, last))
     }
 
     internal fun bind(
@@ -178,9 +177,10 @@ internal object PartitionLookupRepo {
         pivot AS MATERIALIZED (
             SELECT keys.key_index FROM (VALUES $keys) keys(key_index)
             LEFT JOIN (
-                SELECT key_index, count(*) AS candidate_count FROM probes GROUP BY key_index
+                SELECT key_index, count(*) AS candidate_count, max(data_file_id) AS covered_through
+                FROM probes GROUP BY key_index
             ) counts USING (key_index)
-            ORDER BY coalesce(candidate_count, 0), keys.key_index LIMIT 1
+            ORDER BY coalesce(candidate_count, 0), covered_through DESC, keys.key_index LIMIT 1
         ),
         candidates AS MATERIALIZED (
             SELECT data_file_id FROM probes WHERE key_index = (SELECT key_index FROM pivot)
@@ -223,12 +223,17 @@ internal object PartitionLookupRepo {
         """
     }
 
-    internal fun pageSql(values: List<String?>): String =
+    internal fun lookupSql(values: List<String?>): String =
         windows(values) + matched(values, aggregate = false) +
             """
-            SELECT ${FILE_COLUMNS.split(", ").joinToString(", ") { "p.$it" }}, meta.candidate_count, meta.last_examined
+            , totals AS MATERIALIZED (
+                ${totalsSql("WHERE :includeAggregates AND (SELECT count(*) FROM candidates) <= :candidateLimit")}
+            )
+            SELECT ${FILE_COLUMNS.split(", ").joinToString(", ") { "p.$it" }}, totals.*,
+                   meta.candidate_count, meta.last_examined
             FROM (SELECT (SELECT count(*) FROM candidates) AS candidate_count,
                          (SELECT max(data_file_id) FROM scan_window) AS last_examined) meta
+            CROSS JOIN totals
             LEFT JOIN LATERAL (
                 SELECT $FILE_COLUMNS FROM matched ORDER BY data_file_id LIMIT :pageLimit
             ) p ON true
@@ -237,9 +242,11 @@ internal object PartitionLookupRepo {
 
     internal fun aggregateSql(values: List<String?>): String =
         windows(values) + matched(values, aggregate = true) +
-            """
-            SELECT (SELECT count(*) FROM candidates) AS candidate_count,
-                   count(*) AS file_count, coalesce(sum(f.record_count), 0) AS physical_rows,
+            "SELECT (SELECT count(*) FROM candidates) AS candidate_count, totals.* FROM (${totalsSql("")}) totals"
+
+    private fun totalsSql(gate: String): String =
+        """
+            SELECT count(*) AS file_count, coalesce(sum(f.record_count), 0) AS physical_rows,
                    coalesce(sum(f.file_size_bytes), 0) AS total_bytes,
                    count(*) FILTER (WHERE dv.delete_file_id IS NOT NULL
                        AND (dv.end_snapshot IS NULL OR :snapshot < dv.end_snapshot)) AS dv_count,
@@ -247,12 +254,12 @@ internal object PartitionLookupRepo {
                    count(*) FILTER (WHERE f.stats_state = 'pending') AS pending,
                    count(*) FILTER (WHERE f.stats_state = 'failed') AS failed,
                    max(f.begin_snapshot) AS last_write
-            FROM matched f
+            FROM (SELECT * FROM matched $gate) f
             LEFT JOIN LATERAL (
                 SELECT d.delete_file_id, d.end_snapshot FROM hog_delete_file d
                 WHERE d.catalog_id = :catalogId AND d.data_file_id = f.data_file_id
                   AND d.begin_snapshot <= :snapshot
                 ORDER BY d.begin_snapshot DESC, d.delete_file_id DESC LIMIT 1
             ) dv ON true
-            """
+        """
 }

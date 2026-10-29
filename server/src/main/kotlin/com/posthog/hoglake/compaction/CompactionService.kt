@@ -2569,7 +2569,7 @@ class CompactionService(
      *    estimate, which comes from the same Param-array default; a hash
      *    join's alternative is a read of every live DV of the CATALOG,
      *    which on production is not cheaper than 8,192 probes of
-     *    `hog_delete_file_data_lookup`; and gigahog's buckets are a
+     *    `hog_delete_file_snapshot_lookup`; and gigahog's buckets are a
      *    median of 66 files, where the nested loop is ~130-225 buffers.
      *  - (d) MEMORY. `ARRAY(subquery)` accumulates in the per-query
      *    memory context — ~32 bytes per id, doubling growth plus a copy,

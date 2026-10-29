@@ -58,10 +58,11 @@ export function readPartitionLookupRequest(params: URLSearchParams): {
   error: string | null;
 } {
   try {
-    for (const name of ["lookup_spec", "lookup_values", "lookup_snapshot", "lookup_at", "snapshot"]) {
+    const snapshotNames = params.get("lookup_at") === "head" ? ["lookup_snapshot"] : ["snapshot", "lookup_snapshot"];
+    for (const name of ["lookup_spec", "lookup_values", "lookup_at", ...snapshotNames]) {
       if (params.getAll(name).length > 1) throw new Error(`The link repeats ${name}; enter one value.`);
     }
-    for (const name of ["snapshot", "lookup_snapshot"]) {
+    for (const name of snapshotNames) {
       const value = params.get(name);
       if (value !== null) id(value, "Snapshot", false);
     }

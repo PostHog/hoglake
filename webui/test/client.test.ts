@@ -51,7 +51,10 @@ describe("api client", () => {
     });
     const url = new URL(fetchMock.mock.calls[0][0] as string, "http://localhost");
     expect(url.pathname).toBe("/v1/catalogs/c%2F1/namespaces/ns/tables/t/partitions/lookup");
-    expect(JSON.parse(url.searchParams.get("values")!)).toEqual(values);
+    expect(url.searchParams.has("values")).toBe(false);
+    expect(fetchMock.mock.calls[0][1]).toMatchObject({
+      method: "POST", body: JSON.stringify(values), headers: { "Content-Type": "application/json" },
+    });
     expect(url.searchParams.get("spec_id")).toBe("9007199254740993");
     expect(url.searchParams.get("snapshot")).toBe("9007199254740995");
     expect(url.searchParams.get("cursor")).toBe("opaque-_");

@@ -243,6 +243,19 @@ class AuthPolicyTest {
             .isEqualTo(AuthDecision.Allow)
     }
 
+    @Test
+    fun `partition lookup POST is a catalog metadata read`() {
+        val match =
+            AuthPolicy.match(
+                HttpMethod.Post,
+                "/v1/catalogs/lake/namespaces/ns/tables/t/partitions/lookup",
+            )!!
+        assertThat(match.requirement).isEqualTo(Requirement.READ)
+        assertThat(AuthPolicy.authorize(tenant(read = listOf("lake")), match)).isEqualTo(AuthDecision.Allow)
+        assertThat(AuthPolicy.authorize(tenant(read = listOf("other")), match))
+            .isEqualTo(AuthDecision.UnknownCatalog("lake"))
+    }
+
     // ---- fixtures -------------------------------------------------------
 
     private fun tenant(

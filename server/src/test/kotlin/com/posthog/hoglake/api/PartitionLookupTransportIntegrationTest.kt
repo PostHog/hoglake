@@ -2,6 +2,8 @@ package com.posthog.hoglake.api
 
 import com.posthog.hoglake.App
 import com.posthog.hoglake.Config
+import com.posthog.hoglake.auth.AuthMode
+import com.posthog.hoglake.auth.TestTokens
 import com.posthog.hoglake.configureApiListener
 import com.posthog.hoglake.testing.PartitionLookupFixture
 import com.posthog.hoglake.testing.PgTestSupport
@@ -16,11 +18,10 @@ import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
 import java.net.URI
-import java.net.URLEncoder
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
-import java.nio.charset.StandardCharsets.UTF_8
+import java.nio.file.Files
 import java.time.Duration
 
 @Tag("integration")
@@ -49,18 +50,31 @@ class PartitionLookupTransportIntegrationTest {
         db.close()
     }
 
-    private fun lookup(values: List<String?>): HttpResponse<String> {
-        val encoded = URLEncoder.encode(json.writeValueAsString(values), UTF_8)
-        assertThat(encoded.length).isGreaterThan(4096)
-        val uri = URI.create("http://127.0.0.1:$port${f.url}?spec_id=${f.specId}&values=$encoded")
-        return http.send(
-            HttpRequest.newBuilder(uri).timeout(Duration.ofSeconds(10)).GET().build(),
-            HttpResponse.BodyHandlers.ofString(),
-        )
+    private fun post(
+        raw: String,
+        listenerPort: Int = port,
+        path: String = "${f.url}?spec_id=${f.specId}",
+        token: String? = null,
+        chunked: Boolean = false,
+    ): HttpResponse<String> {
+        val request =
+            HttpRequest.newBuilder(URI.create("http://127.0.0.1:$listenerPort$path"))
+                .timeout(Duration.ofSeconds(10))
+                .header("Content-Type", "application/json")
+        if (token != null) request.header("Authorization", "Bearer $token")
+        val publisher =
+            if (chunked) {
+                HttpRequest.BodyPublishers.ofInputStream { raw.byteInputStream() }
+            } else {
+                HttpRequest.BodyPublishers.ofString(raw)
+            }
+        return http.send(request.POST(publisher).build(), HttpResponse.BodyHandlers.ofString())
     }
 
+    private fun lookup(values: List<String?>): HttpResponse<String> = post(json.writeValueAsString(values))
+
     @Test
-    fun `maximum length Unicode partition values reach the production route over Netty`() {
+    fun `maximum length Unicode partition values reach the production POST route over Netty`() {
         val tuple = listOf("東".repeat(8192), "京".repeat(8192))
         val response = lookup(tuple)
         assertThat(response.statusCode()).isEqualTo(200)
@@ -68,7 +82,7 @@ class PartitionLookupTransportIntegrationTest {
     }
 
     @Test
-    fun `near maximum encoded tuple reaches semantic validation instead of transport rejection`() {
+    fun `near maximum tuple reaches semantic validation instead of transport rejection`() {
         val tuple = List(8) { "東".repeat(8188) }
         assertThat(json.writeValueAsString(tuple).length).isBetween(65_500, 65_536)
         val response = lookup(tuple)
@@ -82,5 +96,69 @@ class PartitionLookupTransportIntegrationTest {
         assertThat(response.statusCode()).isEqualTo(400)
         assertThat(json.readTree(response.body()).isObject).isTrue()
         assertThat(response.body()).contains("8192")
+    }
+
+    @Test
+    fun `malformed tuple types are refused without coercion over Netty`() {
+        for (raw in listOf("", "null", "[1, true]", "[{}, null]", "[null, null] {}")) {
+            val response = post(raw)
+            assertThat(response.statusCode()).describedAs(raw).isEqualTo(400)
+            assertThat(json.readTree(response.body())["error"].textValue()).isEqualTo("bad_request")
+        }
+    }
+
+    @Test
+    fun `body bytes are bounded before JSON parsing for fixed and chunked bodies`() {
+        for (chunked in listOf(false, true)) {
+            val response = post(" ".repeat(262_145), chunked = chunked)
+            assertThat(response.statusCode()).describedAs("chunked=%s", chunked).isEqualTo(400)
+            assertThat(response.body()).contains("262144 bytes")
+        }
+    }
+
+    @Test
+    fun `unrelated GET retains the default request line cap`() {
+        val request =
+            HttpRequest.newBuilder(URI.create("http://127.0.0.1:$port/healthz?ignored=${"x".repeat(5000)}"))
+                .timeout(Duration.ofSeconds(10)).GET().build()
+        val response = http.send(request, HttpResponse.BodyHandlers.ofString())
+        assertThat(response.statusCode()).isEqualTo(400)
+        assertThat(response.body()).contains("4096")
+    }
+
+    @Test
+    fun `POST lookup is readable while mutation remains forbidden in enforce and modes keep their semantics`() {
+        val pair = TestTokens.keyPair()
+        val keyFile = Files.createTempFile("hoglake-lookup-auth-", ".json")
+        Files.writeString(keyFile, TestTokens.jwks(pair))
+        val reader = TestTokens.mint(pair, TestTokens.tenantClaims(catalogs = mapOf(f.name to listOf("read"))))
+        val foreign = TestTokens.mint(pair, TestTokens.tenantClaims(catalogs = mapOf("other" to listOf("read"))))
+        try {
+            for (mode in AuthMode.entries) {
+                val authCfg =
+                    cfg.copy(authMode = mode.wire, authIssuer = TestTokens.ISSUER, authJwksFile = keyFile.toString())
+                val authApp = App.build(authCfg, db.jdbi)
+                val authServer =
+                    embeddedServer(Netty, configure = { configureApiListener(authCfg) }) { authApp.module(this) }
+                try {
+                    authServer.start(wait = false)
+                    val authPort = runBlocking { authServer.engine.resolvedConnectors().first().port }
+                    assertThat(post("[null, null]", authPort, token = reader).statusCode())
+                        .describedAs("%s reader lookup", mode).isEqualTo(200)
+                    assertThat(post("[null, null]", authPort).statusCode())
+                        .describedAs("%s missing token", mode).isEqualTo(if (mode == AuthMode.ENFORCE) 401 else 200)
+                    assertThat(post("[null, null]", authPort, token = foreign).statusCode())
+                        .describedAs("%s foreign catalog", mode).isEqualTo(if (mode == AuthMode.ENFORCE) 404 else 200)
+                    val alter = f.url.removeSuffix("/partitions/lookup") + "/alter"
+                    assertThat(post("{}", authPort, alter, reader).statusCode())
+                        .describedAs("%s reader mutation", mode).isEqualTo(if (mode == AuthMode.ENFORCE) 403 else 400)
+                } finally {
+                    authServer.stop(0, 1000)
+                    authApp.close()
+                }
+            }
+        } finally {
+            Files.deleteIfExists(keyFile)
+        }
     }
 }

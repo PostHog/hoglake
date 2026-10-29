@@ -9,7 +9,7 @@
 -- snapshot-expiry purge removes those entries with their owning rows.
 -- Its non-partial (catalog_id, data_file_id) prefix also serves maintenance
 -- and FK cascades, so retire the narrower V2 index after the build succeeds.
--- V30DeleteFileSnapshotLookupMigrationIntegrationTest measures the build,
+-- V32DeleteFileSnapshotLookupMigrationIntegrationTest measures the build,
 -- index bytes and before/after production query on interleaved histories.
 -- PG18 fixture: 200,000 versions, two interleaved catalogs, 100,000 per
 -- file. At the middle snapshot the old changefeed/bitmap path examined
@@ -25,8 +25,12 @@
 --   CREATE INDEX CONCURRENTLY IF NOT EXISTS hog_delete_file_snapshot_lookup
 --     ON hog_delete_file
 --       (catalog_id, data_file_id, begin_snapshot DESC, delete_file_id DESC);
--- Check for old transactions first: a concurrent build can wait beyond the
--- pod's startup budget. A cancelled build leaves an invalid index. Before
+-- After verifying the replacement index is valid, retire the old index
+-- out of band before promotion too:
+--   DROP INDEX CONCURRENTLY IF EXISTS hog_delete_file_data_lookup;
+-- Check for old transactions first: both the concurrent build and drop
+-- can wait beyond the pod's startup budget with statement_timeout disabled.
+-- A cancelled build leaves an invalid index. Before
 -- retrying on a busy installation, remove that invalid index out of band:
 --   DROP INDEX CONCURRENTLY IF EXISTS hog_delete_file_snapshot_lookup;
 -- Then pre-build the replacement with the CREATE above before promotion.

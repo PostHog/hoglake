@@ -6,7 +6,8 @@ import com.posthog.hoglake.testing.PartitionLookupFixture
 import com.posthog.hoglake.testing.PgTestSupport
 import com.posthog.hoglake.wireObjectMapper
 import io.ktor.client.HttpClient
-import io.ktor.client.request.get
+import io.ktor.client.request.post
+import io.ktor.client.request.setBody
 import io.ktor.client.statement.HttpResponse
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.HttpStatusCode
@@ -39,10 +40,10 @@ class PartitionLookupApiTest {
         values: String = """[null,""]""",
         vararg extra: Pair<String, String>,
     ): HttpResponse =
-        get(f.url) {
+        post(f.url) {
+            setBody(values)
             url {
                 parameters.append("spec_id", f.specId.toString())
-                parameters.append("values", values)
                 extra.forEach { (name, value) -> parameters.append(name, value) }
             }
         }
@@ -74,13 +75,12 @@ class PartitionLookupApiTest {
     @Test
     fun `malformed missing repeated and unsupported parameters are 400`() =
         api { client ->
-            for (query in listOf("", "?spec_id=1", "?values=%5Bnull%5D")) {
-                assertThat(client.get(f.url + query).status).isEqualTo(HttpStatusCode.BadRequest)
+            for (query in listOf("", "?spec_id=1", "?snapshot=1")) {
+                assertThat(client.post(f.url + query).status).isEqualTo(HttpStatusCode.BadRequest)
             }
             val extras =
                 listOf(
                     "spec_id" to "1",
-                    "values" to "[]",
                     "limit" to "0",
                     "limit" to "501",
                     "limit" to "x",
@@ -118,10 +118,10 @@ class PartitionLookupApiTest {
         api { client ->
             assertThat(client.lookup("[null]").status).isEqualTo(HttpStatusCode.UnprocessableEntity)
             val future =
-                client.get(f.url) {
+                client.post(f.url) {
+                    setBody("[null,null]")
                     url {
                         parameters.append("spec_id", (f.specId + 100).toString())
-                        parameters.append("values", "[null,null]")
                     }
                 }
             assertThat(future.status).isEqualTo(HttpStatusCode.UnprocessableEntity)
@@ -129,12 +129,26 @@ class PartitionLookupApiTest {
                 client.lookup(extra = arrayOf("snapshot" to (db.head(f.name) + 1).toString())).status,
             ).isEqualTo(HttpStatusCode.UnprocessableEntity)
             assertThat(
-                client.get(f.url.replace("/tables/t/", "/tables/missing/")) {
+                client.post(f.url.replace("/tables/t/", "/tables/missing/")) {
+                    setBody("[null,null]")
                     url {
                         parameters.append("spec_id", "1")
-                        parameters.append("values", "[null,null]")
                     }
                 }.status,
             ).isEqualTo(HttpStatusCode.NotFound)
+        }
+
+    @Test
+    fun `omitted continuation limit inherits the initial page limit`() =
+        api { client ->
+            val values = """["route-page", "inherit-limit"]"""
+            f.append(*List(3) { listOf("route-page", "inherit-limit") }.toTypedArray())
+            val first = json.readTree(client.lookup(values, "limit" to "1").bodyAsText())
+            assertThat(first["files"].size()).isEqualTo(1)
+            val cursor = first["next_cursor"].textValue()
+            assertThat(cursor).isNotBlank()
+            val response = client.lookup(values, "cursor" to cursor)
+            assertThat(response.status).isEqualTo(HttpStatusCode.OK)
+            assertThat(json.readTree(response.bodyAsText())["files"].size()).isEqualTo(1)
         }
 }

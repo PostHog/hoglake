@@ -240,12 +240,12 @@ export function lookupPartition(
       `/catalogs/${seg(catalog)}/namespaces/${seg(namespace)}/tables/${seg(table)}/partitions/lookup`,
       {
         spec_id: opts.specId,
-        values: JSON.stringify(opts.values),
         snapshot: opts.snapshot,
         cursor: opts.cursor,
         limit: opts.limit,
       },
     ),
+    { method: "POST", body: JSON.stringify(opts.values) },
   );
 }
 

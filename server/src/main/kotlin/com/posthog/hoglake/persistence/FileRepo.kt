@@ -5,6 +5,7 @@ import com.posthog.hoglake.model.DataFile
 import com.posthog.hoglake.model.StatsState
 import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.mapper.RowMapper
+import java.sql.ResultSet
 
 /**
  * hog_data_file reads for planning (listFiles) and the changefeed, plus
@@ -38,25 +39,35 @@ object FileRepo {
 
     private val fileMapper =
         RowMapper { rs, _ ->
-            DataFile(
-                dataFileId = rs.getLong("data_file_id"),
-                tableId = rs.getLong("table_id"),
-                path = rs.getString("path"),
-                fileFormat = rs.getString("file_format"),
-                recordCount = rs.getLong("record_count"),
-                fileSizeBytes = rs.getLong("file_size_bytes"),
-                footerSize = rs.getObject("footer_size")?.let { (it as Number).toLong() },
-                rowIdStart = rs.getLong("row_id_start"),
-                statsState = StatsState.fromWire(rs.getString("stats_state")),
-                beginSnapshot = rs.getLong("begin_snapshot"),
-                specId = rs.getObject("spec_id")?.let { (it as Number).toLong() },
-                partitionValues =
-                    (rs.getArray("partition_values")?.array as? Array<*>)
-                        ?.map { it as String? }
-                        ?.takeIf { it.isNotEmpty() },
-                explicitRowIds = rs.getBoolean("explicit_row_ids"),
+            mapFile(
+                rs,
+                rs.getObject("spec_id")?.let { (it as Number).toLong() },
+                (rs.getArray("partition_values")?.array as? Array<*>)
+                    ?.map { it as String? }
+                    ?.takeIf { it.isNotEmpty() },
             )
         }
+
+    internal fun mapFile(
+        rs: ResultSet,
+        specId: Long?,
+        partitionValues: List<String?>?,
+    ): DataFile =
+        DataFile(
+            dataFileId = rs.getLong("data_file_id"),
+            tableId = rs.getLong("table_id"),
+            path = rs.getString("path"),
+            fileFormat = rs.getString("file_format"),
+            recordCount = rs.getLong("record_count"),
+            fileSizeBytes = rs.getLong("file_size_bytes"),
+            footerSize = rs.getObject("footer_size")?.let { (it as Number).toLong() },
+            rowIdStart = rs.getLong("row_id_start"),
+            statsState = StatsState.fromWire(rs.getString("stats_state")),
+            beginSnapshot = rs.getLong("begin_snapshot"),
+            specId = specId,
+            partitionValues = partitionValues,
+            explicitRowIds = rs.getBoolean("explicit_row_ids"),
+        )
 
     private const val COLUMNS =
         """f.data_file_id, f.table_id, f.path, f.file_format, f.record_count,

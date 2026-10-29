@@ -21,10 +21,12 @@ internal data class PartitionLookupCursor(
 
     companion object {
         const val MAX_LENGTH = 1024
+        private val encodingPattern = Regex("[A-Za-z0-9_-]+")
+        private val scopePattern = Regex("[0-9a-f]{64}")
 
         fun parse(raw: String): PartitionLookupCursor {
             fun invalid(): Nothing = throw PartitionLookupInvalidRequest("invalid partition lookup cursor")
-            if (raw.length !in 1..MAX_LENGTH || !raw.matches(Regex("[A-Za-z0-9_-]+"))) invalid()
+            if (raw.length !in 1..MAX_LENGTH || !encodingPattern.matches(raw)) invalid()
             val decoded =
                 try {
                     Base64.getUrlDecoder().decode(raw).toString(Charsets.US_ASCII)
@@ -38,7 +40,7 @@ internal data class PartitionLookupCursor(
             val upper = parts[3].toLongOrNull() ?: invalid()
             val limit = parts[4].toIntOrNull() ?: invalid()
             if (snapshot < 0 || after < 0 || upper <= after || limit !in 1..500 ||
-                !parts[5].matches(Regex("[0-9a-f]{64}"))
+                !scopePattern.matches(parts[5])
             ) {
                 invalid()
             }

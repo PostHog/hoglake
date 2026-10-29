@@ -11,41 +11,64 @@ import com.posthog.hoglake.service.PartitionLookupService
 import com.posthog.hoglake.wireObjectMapper
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
+import io.ktor.server.application.createRouteScopedPlugin
+import io.ktor.server.request.receiveText
 import io.ktor.server.response.respond
-import io.ktor.server.routing.get
+import io.ktor.server.routing.post
+import io.ktor.server.routing.route
 import io.ktor.server.routing.routing
+import io.ktor.utils.io.ByteReadChannel
+import io.ktor.utils.io.readRemaining
+import kotlinx.io.readByteArray
 import java.util.UUID
+
+private const val MAX_LOOKUP_BODY_BYTES = 4 * 65_536
+
+private val PartitionLookupBodyLimit =
+    createRouteScopedPlugin("PartitionLookupBodyLimit") {
+        onCallReceive {
+            transformBody { body ->
+                val bytes = body.readRemaining(MAX_LOOKUP_BODY_BYTES.toLong() + 1).readByteArray()
+                if (bytes.size > MAX_LOOKUP_BODY_BYTES) {
+                    throw PartitionLookupInvalidRequest("values exceeds $MAX_LOOKUP_BODY_BYTES bytes")
+                }
+                ByteReadChannel(bytes)
+            }
+        }
+    }
 
 fun Application.installPartitionLookupRoutes(lookups: PartitionLookupService) {
     routing {
-        get("/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/partitions/lookup") {
-            if (call.request.queryParameters.contains("at_timestamp")) {
-                throw PartitionLookupInvalidRequest("at_timestamp is unsupported; use snapshot")
-            }
-            val specId =
-                call.lookupScalar("spec_id")?.toLongOrNull()
-                    ?: throw PartitionLookupInvalidRequest("spec_id is required and must be an int64")
-            val values = call.lookupScalar("values") ?: throw PartitionLookupInvalidRequest("values is required")
-            val snapshot =
-                call.lookupScalar("snapshot")?.let {
-                    it.toLongOrNull() ?: throw PartitionLookupInvalidRequest("snapshot must be an int64")
+        route("/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/partitions/lookup") {
+            install(PartitionLookupBodyLimit)
+            post {
+                if (call.request.queryParameters.contains("at_timestamp")) {
+                    throw PartitionLookupInvalidRequest("at_timestamp is unsupported; use snapshot")
                 }
-            val limit =
-                call.lookupScalar("limit")?.let {
-                    it.toIntOrNull() ?: throw PartitionLookupInvalidRequest("limit must be an integer")
-                } ?: 100
-            call.respond(
-                lookups.lookup(
-                    call.catalog(),
-                    call.namespace(),
-                    call.table(),
-                    specId,
-                    parsePartitionLookupValues(values),
-                    snapshot,
-                    limit,
-                    call.lookupScalar("cursor"),
-                ).toDto(),
-            )
+                val specId =
+                    call.lookupScalar("spec_id")?.toLongOrNull()
+                        ?: throw PartitionLookupInvalidRequest("spec_id is required and must be an int64")
+                val snapshot =
+                    call.lookupScalar("snapshot")?.let {
+                        it.toLongOrNull() ?: throw PartitionLookupInvalidRequest("snapshot must be an int64")
+                    }
+                val limit =
+                    call.lookupScalar("limit")?.let {
+                        it.toIntOrNull() ?: throw PartitionLookupInvalidRequest("limit must be an integer")
+                    }
+                call.respond(
+                    lookups.lookup(
+                        call.catalog(),
+                        call.namespace(),
+                        call.table(),
+                        specId,
+                        parsePartitionLookupValues(call.receiveText()),
+                        snapshot,
+                        limit,
+                        call.lookupScalar("cursor"),
+                    ).toDto(),
+                )
+            }
         }
     }
 }
@@ -64,15 +87,15 @@ internal fun parsePartitionLookupValues(raw: String): List<String?> {
         } catch (_: JacksonException) {
             throw PartitionLookupInvalidRequest("values must be a JSON array of strings or nulls")
         }
-    if (node == null || !node.isArray || node.size() !in 1..64) {
-        throw PartitionLookupInvalidRequest("values must be a JSON array containing 1..64 strings or nulls")
+    if (node == null || !node.isArray) {
+        throw PartitionLookupInvalidRequest("values must be a JSON array of strings or nulls")
     }
     return node.map { value ->
         when {
             value.isNull -> null
-            value.isTextual && value.textValue().length <= 8192 -> value.textValue()
+            value.isTextual -> value.textValue()
             else -> throw PartitionLookupInvalidRequest(
-                "each partition value must be a string of at most 8192 characters or null",
+                "each partition value must be a string or null",
             )
         }
     }.also { validatePartitionLookupValues(it) }

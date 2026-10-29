@@ -76,6 +76,10 @@ private val log = KotlinLogging.logger("com.posthog.hoglake.api.ErrorMapping")
 
 internal fun errorBody(cause: HoglakeException): Pair<HttpStatusCode, ApiErrorDto> =
     when (cause) {
+        is PartitionLookupInvalidRequest -> HttpStatusCode.BadRequest to apiError("bad_request", cause)
+        is PartitionLookupUnavailable ->
+            HttpStatusCode.ServiceUnavailable to
+                apiError("partition_lookup_unavailable", cause).copy(reason = cause.reason)
         is HoglakeException.NotFound -> HttpStatusCode.NotFound to apiError("not_found", cause)
         is HoglakeException.AlreadyExists -> HttpStatusCode.Conflict to apiError("already_exists", cause)
         is HoglakeException.ReconciliationRequired ->
@@ -140,19 +144,9 @@ internal fun errorBody(cause: HoglakeException): Pair<HttpStatusCode, ApiErrorDt
 
 /** Installs [errorBody] plus the malformed-input and catch-all handlers. */
 fun StatusPagesConfig.installErrorMapping() {
-    exception<PartitionLookupInvalidRequest> { call, cause ->
-        call.respond(HttpStatusCode.BadRequest, ApiErrorDto("bad_request", cause.message))
-    }
-    exception<PartitionLookupUnavailable> { call, cause ->
-        call.response.headers.append(HttpHeaders.RetryAfter, RETRY_AFTER_SECONDS)
-        call.respond(
-            HttpStatusCode.ServiceUnavailable,
-            PartitionLookupUnavailableErrorDto("partition_lookup_unavailable", cause.message, cause.reason),
-        )
-    }
     exception<HoglakeException> { call, cause ->
         val (status, body) = errorBody(cause)
-        if (cause is HoglakeException.CommitQueueTimeout) {
+        if (cause is HoglakeException.CommitQueueTimeout || cause is PartitionLookupUnavailable) {
             call.response.headers.append(HttpHeaders.RetryAfter, RETRY_AFTER_SECONDS)
         }
         if (cause is HoglakeException.Unauthenticated) {
@@ -209,12 +203,6 @@ fun StatusPagesConfig.installErrorMapping() {
         )
     }
 }
-
-data class PartitionLookupUnavailableErrorDto(
-    val error: String,
-    val detail: String?,
-    val reason: String,
-)
 
 /** Retry-After for 503 commit_queue_timeout: back off a beat, then retry. */
 private const val RETRY_AFTER_SECONDS = "1"

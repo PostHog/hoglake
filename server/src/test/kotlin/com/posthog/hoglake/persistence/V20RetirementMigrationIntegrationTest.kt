@@ -427,7 +427,7 @@ class V20RetirementMigrationIntegrationTest {
         // superseded vector must go too, or the data-file cascade takes
         // it away un-queued — so the PARTIAL
         // `hog_delete_file_one_live_per_data_file` cannot serve it. It
-        // does not have to: V30 replaces V2's narrower index with
+        // does not have to: V32 replaces V2's narrower index with
         // `hog_delete_file_snapshot_lookup`, non-partial with prefix
         // `(catalog_id, data_file_id)`, which is
         // both this statement's key and the FK cascade's. The table

@@ -21,8 +21,6 @@ private const val SHUTDOWN_TIMEOUT_MS = 10_000L
 internal fun NettyApplicationEngine.Configuration.configureApiListener(cfg: Config) {
     connector { port = cfg.port }
     callGroupSize = cfg.nettyCallGroupSize
-    // A 65,536-character JSON tuple can expand ninefold when UTF-8 URL encoded.
-    maxInitialLineLength = 1024 * 1024
 }
 
 fun main() {

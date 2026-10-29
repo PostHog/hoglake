@@ -66,12 +66,14 @@ function setup(initial = `${route}?tab=partitions&lookup=1`, client = new QueryC
   return { ...view, client, user: userEvent.setup() };
 }
 
-function fetches(handler: (params: URLSearchParams, call: number) => Response | Promise<Response>) {
+function fetches(handler: (params: URLSearchParams, call: number, values: (string | null)[]) => Response | Promise<Response>) {
   const urls: string[] = [];
-  vi.stubGlobal("fetch", vi.fn(async (input: string) => {
+  vi.stubGlobal("fetch", vi.fn(async (input: string, init?: RequestInit) => {
+    expect(init?.method).toBe("POST");
+    expect(new URL(input, "http://localhost").searchParams.has("values")).toBe(false);
     expect(input.split("?")[0]).toBe(base);
     urls.push(input);
-    return handler(new URL(input, "http://localhost").searchParams, urls.length);
+    return handler(new URL(input, "http://localhost").searchParams, urls.length, JSON.parse(init?.body as string));
   }));
   return urls;
 }
@@ -99,6 +101,16 @@ describe("exact partition lookup input", () => {
     }
     expect(readPartitionLookupRequest(new URLSearchParams("lookup_spec=1"))).toMatchObject({ request: null, error: expect.any(String) });
   });
+
+  it.each(["", "-1", "9223372036854775808", "bad", "1&snapshot=2"])("ignores page snapshot %s under explicit lookup head intent", (snapshot) => {
+    const params = new URLSearchParams(`lookup_spec=1&lookup_values=%5B%22x%22%5D&lookup_at=head&snapshot=${snapshot}`);
+    expect(readPartitionLookupRequest(params)).toEqual({ request: { specId: "1", values: ["x"], snapshot: undefined }, error: null });
+    params.set("lookup_snapshot", big);
+    expect(readPartitionLookupRequest(params).request?.snapshot).toBe(big);
+    params.set("lookup_snapshot", "bad");
+    expect(readPartitionLookupRequest(params)).toMatchObject({ request: null, error: expect.any(String) });
+  });
+
 });
 
 describe("PartitionLookupPanel", () => {
@@ -123,7 +135,7 @@ describe("PartitionLookupPanel", () => {
     expect(urls).toHaveLength(1);
     const request = new URL(urls[0], "http://localhost").searchParams;
     expect(request.get("spec_id")).toBe(big);
-    expect(JSON.parse(request.get("values")!)).toEqual(tuple);
+    expect(JSON.parse(vi.mocked(fetch).mock.calls[0][1]!.body as string)).toEqual(tuple);
     expect(request.has("snapshot")).toBe(false);
     expect(screen.getAllByText("9,007,199,254,740,993").length).toBeGreaterThan(0);
     await user.click(screen.getByRole("button", { name: "Inspect file 71" }));
@@ -145,9 +157,9 @@ describe("PartitionLookupPanel", () => {
   });
 
   it("looks up the next tuple at head after automatically pinning the first", async () => {
-    const urls = fetches((params, call) => {
+    const urls = fetches((params, call, values) => {
       expect(params.has("snapshot")).toBe(false);
-      return jsonResponse(page({ snapshot_id: String(20 + call), values: JSON.parse(params.get("values")!) }));
+      return jsonResponse(page({ snapshot_id: String(20 + call), values }));
     });
     const { user } = setup(link());
     await screen.findByText("s3://bucket/original.parquet");
@@ -384,7 +396,7 @@ describe("PartitionLookupPanel", () => {
   });
 
   it("resets the inspector and cursor when changing the lookup identity", async () => {
-    const urls = fetches((params) => jsonResponse(page({ snapshot_id: params.get("snapshot") ?? big, spec_id: params.get("spec_id")!, values: JSON.parse(params.get("values")!) })));
+    const urls = fetches((params, _call, values) => jsonResponse(page({ snapshot_id: params.get("snapshot") ?? big, spec_id: params.get("spec_id")!, values })));
     const { user } = setup(link(tuple, big));
     await user.click(await screen.findByRole("button", { name: "Inspect file 71" }));
     expect(screen.getByText(`Inspector 71 at ${big}`)).toBeInTheDocument();
@@ -398,9 +410,9 @@ describe("PartitionLookupPanel", () => {
     const nextSpec = dimension === "spec" ? "2" : "1";
     const nextTuple = dimension === "tuple" ? ["different"] : tuple;
     const nextSnapshot = dimension === "snapshot" ? "9007199254740995" : big;
-    const urls = fetches((params, call) => jsonResponse(page(call === 1 ? { next_cursor: "old-next" } : {
+    const urls = fetches((params, call, values) => jsonResponse(page(call === 1 ? { next_cursor: "old-next" } : {
       spec_id: params.get("spec_id")!,
-      values: JSON.parse(params.get("values")!),
+      values,
       snapshot_id: params.get("snapshot")!,
       files: [{ ...filesFixture[0], data_file_id: "72", path: "s3://bucket/changed.parquet" }],
     })));
@@ -418,9 +430,25 @@ describe("PartitionLookupPanel", () => {
     expect(urls).toHaveLength(2);
     const request = new URL(urls[1], "http://localhost").searchParams;
     expect(request.get("spec_id")).toBe(nextSpec);
-    expect(JSON.parse(request.get("values")!)).toEqual(nextTuple);
+    expect(JSON.parse(vi.mocked(fetch).mock.calls[1][1]!.body as string)).toEqual(nextTuple);
     expect(request.get("snapshot")).toBe(nextSnapshot);
     expect(request.has("cursor")).toBe(false);
+  });
+
+  it("keeps a head form draft usable beside a malformed page snapshot", async () => {
+    const urls = fetches((params, call, values) => {
+      expect(params.has("snapshot")).toBe(false);
+      return jsonResponse(page({ snapshot_id: String(40 + call), values }));
+    });
+    const { user } = setup(link() + "&lookup_at=head&snapshot=bad");
+    await screen.findByText("s3://bucket/original.parquet");
+    expect(screen.getByLabelText("Snapshot (blank for head)")).toHaveValue("");
+    await user.clear(screen.getByLabelText("Complete tuple (JSON)"));
+    await user.click(screen.getByLabelText("Complete tuple (JSON)"));
+    await user.paste('["next"]');
+    await user.click(screen.getByRole("button", { name: "Inspect partition" }));
+    await waitFor(() => expect(urls).toHaveLength(2));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
   it("rejects an invalid snapshot URL instead of requesting head", () => {
