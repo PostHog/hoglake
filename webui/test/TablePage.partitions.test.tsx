@@ -4,7 +4,6 @@ import { describe, expect, it } from "vitest";
 import {
   pagedPartitionListingFixture,
   partitionListingFixture,
-  partitionValuesFixture,
   unpartitionedPartitionListingFixture,
   filesFixture,
   scanFixture,
@@ -25,7 +24,6 @@ function harness(listing = partitionListingFixture) {
     if (path === base) return jsonResponse(tableFixture);
     if (path === `${base}/files`) return jsonResponse(filesFixture);
     if (path === `${base}/scan`) return jsonResponse(scanFixture);
-    if (path === `${base}/partitions/values`) return jsonResponse(partitionValuesFixture);
     if (path === `${base}/partitions`) return jsonResponse(listing);
     return undefined;
   });
@@ -255,7 +253,7 @@ describe("TablePage partitions tab", () => {
     expect(screen.queryByRole("button", { name: "Load more" })).not.toBeInTheDocument();
   });
 
-  it("the files tab seeds from the link once, and the URL keeps the params", async () => {
+  it("the files tab preserves linked filters until explicitly cleared", async () => {
     const urls = harness();
     const user = userEvent.setup();
     renderApp(route);
@@ -268,19 +266,21 @@ describe("TablePage partitions tab", () => {
     const first = urls.filter((u) => u.split("?")[0] === `${base}/files`).at(-1)!;
     expect(decodeURIComponent(first)).toContain("partition=0:20697");
 
-    // Leaving and coming back must NOT re-seed from the URL, even
-    // though the params are still on it — the page remembers that they
-    // have been spent, so the view stays addressable while a filter the
-    // user has since changed cannot be resurrected. (MemoryRouter, so
-    // `window.location` is not the router's location and asserting on
-    // it would pass whatever the code did.)
+    expect(screen.getByLabelText("filter by day(ts)")).toHaveValue("20697");
     await user.click(screen.getByRole("tab", { name: "schema" }));
     await user.click(screen.getByRole("tab", { name: "files" }));
-    await waitFor(() =>
-      expect(urls.filter((u) => u.split("?")[0] === `${base}/files`).length).toBeGreaterThan(1),
-    );
-    const second = urls.filter((u) => u.split("?")[0] === `${base}/files`).at(-1)!;
-    expect(decodeURIComponent(second)).not.toContain("partition=");
+    expect(await screen.findByLabelText("filter by day(ts)")).toHaveValue("20697");
+
+    await user.click(screen.getByRole("button", { name: "Clear partition filters" }));
+    await waitFor(() => {
+      const last = urls.filter((u) => u.split("?")[0] === `${base}/files`).at(-1)!;
+      expect(decodeURIComponent(last)).not.toContain("partition=");
+    });
+    await user.click(screen.getByRole("tab", { name: "schema" }));
+    await user.click(screen.getByRole("tab", { name: "files" }));
+    expect(await screen.findByLabelText("filter by day(ts)")).toHaveValue("");
+    const last = urls.filter((u) => u.split("?")[0] === `${base}/files`).at(-1)!;
+    expect(decodeURIComponent(last)).not.toContain("partition=");
   });
 
   it("links a partition to its own files, carrying the STORED values", async () => {
@@ -340,8 +340,6 @@ describe("TablePage partitions snapshot id tooltips", () => {
       if (path === base) return jsonResponse(tableFixture);
       if (path === `${base}/partitions`)
         return jsonResponse(partitionListingFixture);
-      if (path === `${base}/partitions/values`)
-        return jsonResponse(partitionValuesFixture);
       if (path === snapshotsPath)
         return jsonResponse({
           snapshots: [

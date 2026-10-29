@@ -1,12 +1,56 @@
-import { screen, within } from "@testing-library/react";
+import { act, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { focusManager, QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { PartitionsPage } from "../src/pages/PartitionsPage";
 import { partitionStatsFixture } from "./fixtures";
 import { jsonResponse, mockFetch, renderApp } from "./helpers";
 
 const baseUrl = "/v1/catalogs/analytics/stats/partitions?limit=50";
 
 describe("PartitionsPage", () => {
+  it("polls once per minute in the foreground and refreshes on focus", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    focusManager.setFocused(true);
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, refetchOnWindowFocus: false } },
+    });
+    let calls = 0;
+    mockFetch((url) => {
+      if (url !== baseUrl) return undefined;
+      calls++;
+      return jsonResponse(partitionStatsFixture);
+    });
+    const view = render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter initialEntries={["/catalogs/analytics/partitions"]}>
+          <Routes>
+            <Route path="/catalogs/:catalog/partitions" element={<PartitionsPage />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    try {
+      await act(async () => { await vi.advanceTimersByTimeAsync(100); });
+      expect(calls).toBe(1);
+      await act(async () => { await vi.advanceTimersByTimeAsync(5_000); });
+      expect(calls).toBe(1);
+      await act(async () => { await vi.advanceTimersByTimeAsync(55_000); });
+      expect(calls).toBe(2);
+      focusManager.setFocused(false);
+      await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+      expect(calls).toBe(2);
+      await act(async () => { focusManager.setFocused(true); });
+      expect(calls).toBe(3);
+    } finally {
+      view.unmount();
+      queryClient.clear();
+      focusManager.setFocused(undefined);
+      vi.useRealTimers();
+    }
+  });
+
   it("renders partitions ranked by debt with rendered partition values", async () => {
     mockFetch((url) =>
       url === baseUrl ? jsonResponse(partitionStatsFixture) : undefined,
