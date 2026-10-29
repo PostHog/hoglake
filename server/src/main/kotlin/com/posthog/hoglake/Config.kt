@@ -1,5 +1,21 @@
 package com.posthog.hoglake
 
+/**
+ * The database backend a hoglake deployment serves (HOGLAKE_DATABASE).
+ * One per process, chosen at boot, immutable for the process's life.
+ */
+enum class DatabaseBackend {
+    POSTGRES,
+    HOGLITE,
+    ;
+
+    val wire: String get() = name.lowercase()
+
+    companion object {
+        fun fromWire(s: String): DatabaseBackend? = entries.firstOrNull { it.wire == s }
+    }
+}
+
 /** Process configuration, environment-sourced. No config files in v1. */
 data class Config(
     val port: Int = env("HOGLAKE_PORT", "8080").toInt(),
@@ -11,10 +27,84 @@ data class Config(
     val instanceName: String = env("HOGLAKE_INSTANCE_NAME", ""),
     /** Color theme for the webui. Empty keeps the default palette. */
     val uiTheme: String = env("HOGLAKE_UI_THEME", ""),
+    /**
+     * Which database backend serves EVERY catalog this deployment
+     * knows: [DatabaseBackend.POSTGRES] (the default; the `gigahog`
+     * deployment's RDS) or [DatabaseBackend.HOGLITE] (each catalog is a
+     * hoglite tenant; the new per-warehouse deployment). A process
+     * serves exactly one backend — there is no per-catalog branching,
+     * so a mixed fleet is two Deployments, not one pod deciding per
+     * request.
+     */
+    val database: DatabaseBackend = backendEnv("HOGLAKE_DATABASE", DatabaseBackend.POSTGRES),
     val jdbcUrl: String = env("HOGLAKE_JDBC_URL", "jdbc:postgresql://localhost:5432/hoglake"),
     val dbUser: String = env("HOGLAKE_DB_USER", "hoglake"),
     val dbPassword: String = env("HOGLAKE_DB_PASSWORD", "hoglake"),
     val dbPoolSize: Int = env("HOGLAKE_DB_POOL_SIZE", "10").toInt(),
+
+    // ---- hoglite backend (HOGLAKE_DATABASE=hoglite) -------------------
+
+    /**
+     * Base URL of the hoglite STANDARD pool's service (any replica;
+     * hoglite's owner-proxy forwards to the owning pod). Required when
+     * [database] is [DatabaseBackend.HOGLITE].
+     */
+    val hogliteUrl: String = env("HOGLAKE_HOGLITE_URL", ""),
+    /**
+     * Base URL of the hoglite WHALE pool's service. Empty = whale
+     * tenants are reached through [hogliteUrl]'s proxy instead of
+     * pinned direct (correct either way; pinning skips a hop after a
+     * 421 class hint).
+     */
+    val hogliteWhaleUrl: String = env("HOGLAKE_HOGLITE_WHALE_URL", ""),
+    /**
+     * URL pattern for addressing one hoglite pod directly, with
+     * `{owner}` where the pod's stable name goes — e.g.
+     * `http://{owner}.hoglite-headless.hoglite.svc:8080`. Empty =
+     * owner-direct routing off: 421 owner hints are followed only to
+     * the class level and the service proxy does the rest. The pattern
+     * is config rather than convention because the headless service
+     * names belong to the hoglite chart, not to this repo.
+     */
+    val hogliteOwnerUrlPattern: String = env("HOGLAKE_HOGLITE_OWNER_URL_PATTERN", ""),
+    /** TCP connect bound per hoglite call. Failing fast is the point: a request must 503 quickly, never hang. */
+    val hogliteConnectTimeoutMs: Long = env("HOGLAKE_HOGLITE_CONNECT_TIMEOUT_MS", "2000").toLong(),
+    /**
+     * Per-attempt response bound for READS (`/query`, `/status`).
+     * Interactive reads must fail fast; a slow hoglite owner is
+     * surfaced as `backend_unavailable`, never as a hung handler.
+     */
+    val hogliteReadTimeoutMs: Long = env("HOGLAKE_HOGLITE_READ_TIMEOUT_MS", "5000").toLong(),
+    /**
+     * Per-attempt response bound for COMMITS (`/tx`). Longer than the
+     * read bound because a commit's latency includes hoglite's group
+     * commit window and the S3 segment PUT that makes it durable — the
+     * p50 is milliseconds but the degraded-window shape (S3 stalls) is
+     * tens of milliseconds to seconds, and an attempt killed mid-flight
+     * is safely retried with the same txid (exactly-once), so the cost
+     * of a bound that is too small is a retry, not corruption.
+     */
+    val hogliteCommitTimeoutMs: Long = env("HOGLAKE_HOGLITE_COMMIT_TIMEOUT_MS", "10000").toLong(),
+    /**
+     * Total wall-clock budget one request will spend RETRYING hoglite
+     * (421 re-routes, 503 owner-loss, transport errors) before it gives
+     * up with `backend_unavailable`. Deterministic refusals (409/422)
+     * never consume it — they surface on first sight. Kept well under
+     * the commit admission bound so the typed backpressure a caller
+     * gets first is `commit_queue_timeout`'s, not this.
+     */
+    val hogliteRetryBudgetMs: Long = env("HOGLAKE_HOGLITE_RETRY_BUDGET_MS", "8000").toLong(),
+    /**
+     * Circuit breaker, per hoglite POOL (standard/whale — the two pools
+     * fail independently, so the breaker is per pool and not global):
+     * after this many CONSECUTIVE transport/5xx failures the pool's
+     * breaker OPENS and calls fail fast with `backend_unavailable` for
+     * [hogliteCircuitOpenMs], turning a down pool into instant typed
+     * 503s instead of timeout convoys. 0 disables.
+     */
+    val hogliteCircuitFailureThreshold: Int = env("HOGLAKE_HOGLITE_CIRCUIT_FAILURE_THRESHOLD", "10").toInt(),
+    /** How long an open breaker refuses calls before one trial is let through (half-open). */
+    val hogliteCircuitOpenMs: Long = env("HOGLAKE_HOGLITE_CIRCUIT_OPEN_MS", "5000").toLong(),
     /**
      * How many threads serve blocking route handlers (#218).
      *
@@ -1340,11 +1430,33 @@ data class Config(
         // dispatcher is therefore a PAIR of knobs, and this is what
         // makes forgetting the second one a boot failure that names
         // both rather than a fleet-wide 500 rate nobody can attribute.
-        require(requestThreads <= dbPoolSize) {
+        // POSTGRES-only: under HOGLAKE_DATABASE=hoglite there is no
+        // Hikari pool for the arithmetic to protect, and dbPoolSize is
+        // inert — the dispatcher is then bounded by hoglite's client
+        // timeouts instead.
+        require(database != DatabaseBackend.POSTGRES || requestThreads <= dbPoolSize) {
             "HOGLAKE_REQUEST_THREADS=$requestThreads exceeds HOGLAKE_DB_POOL_SIZE=$dbPoolSize: " +
                 "handler threads past the pool queue inside HikariPool.getConnection and 500 " +
                 "after its 5s connectionTimeout instead of queueing in the dispatcher, where a " +
                 "wait is measured and shed with a typed 503. Raise HOGLAKE_DB_POOL_SIZE with it."
+        }
+        require(database != DatabaseBackend.HOGLITE || hogliteUrl.isNotBlank()) {
+            "HOGLAKE_DATABASE=hoglite requires HOGLAKE_HOGLITE_URL (the standard pool's service " +
+                "base URL, e.g. http://hoglite.hoglite.svc:8080); without it every catalog call " +
+                "would fail at request time instead of refusing the boot"
+        }
+        require(hogliteOwnerUrlPattern.isEmpty() || hogliteOwnerUrlPattern.contains("{owner}")) {
+            "HOGLAKE_HOGLITE_OWNER_URL_PATTERN must contain the literal {owner} where the owning " +
+                "pod's stable name goes, got '$hogliteOwnerUrlPattern'"
+        }
+        require(hogliteConnectTimeoutMs >= 1 && hogliteReadTimeoutMs >= 1 && hogliteCommitTimeoutMs >= 1) {
+            "hoglite timeouts must be positive: HOGLAKE_HOGLITE_CONNECT_TIMEOUT_MS=" +
+                "$hogliteConnectTimeoutMs HOGLAKE_HOGLITE_READ_TIMEOUT_MS=$hogliteReadTimeoutMs " +
+                "HOGLAKE_HOGLITE_COMMIT_TIMEOUT_MS=$hogliteCommitTimeoutMs"
+        }
+        require(hogliteCircuitFailureThreshold >= 0 && hogliteCircuitOpenMs >= 1) {
+            "HOGLAKE_HOGLITE_CIRCUIT_FAILURE_THRESHOLD=$hogliteCircuitFailureThreshold must be >= 0 " +
+                "(0 disables the breaker) and HOGLAKE_HOGLITE_CIRCUIT_OPEN_MS=$hogliteCircuitOpenMs >= 1"
         }
         // A page of 0 is a purge that deletes nothing forever, and a
         // page of a million is the 2026-10-01 statement back: at the
@@ -1651,6 +1763,23 @@ data class Config(
             name: String,
             default: String,
         ): String = System.getenv(name)?.takeIf { it.isNotBlank() } ?: default
+
+        /**
+         * A backend selector that refuses anything but the two spellings,
+         * naming itself and the value — the same argument as [boolEnv]:
+         * a values file that says `hoglitle` must not boot a Postgres
+         * deployment by typo.
+         */
+        private fun backendEnv(
+            name: String,
+            default: DatabaseBackend,
+        ): DatabaseBackend {
+            val raw = System.getenv(name)?.takeIf { it.isNotBlank() } ?: return default
+            return DatabaseBackend.fromWire(raw.lowercase())
+                ?: throw IllegalArgumentException(
+                    "$name must be 'postgres' or 'hoglite', got '$raw'",
+                )
+        }
 
         /**
          * A boolean knob that REFUSES anything but `true`/`false`,
