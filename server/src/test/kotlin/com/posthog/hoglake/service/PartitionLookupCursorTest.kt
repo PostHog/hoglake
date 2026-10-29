@@ -25,7 +25,9 @@ class PartitionLookupCursorTest {
             s: Long = 3,
             v: List<String?> = listOf("a", null),
             upper: Long = 100,
-        ) = PartitionLookupCursor.scope(c, t, u, s, v, upper)
+            snapshot: Long = 5,
+            limit: Int = 100,
+        ) = PartitionLookupCursor.scope(c, t, u, s, v, upper, snapshot, limit)
         val base = scope()
         listOf(
             scope(
@@ -50,6 +52,7 @@ class PartitionLookupCursorTest {
                 v = listOf(null, "a"),
             ),
             scope(v = listOf("a|null")), scope(v = listOf("a", null, null)), scope(upper = 101),
+            scope(snapshot = 6), scope(limit = 101),
         ).forEach {
             assertThat(it).isNotEqualTo(base)
         }

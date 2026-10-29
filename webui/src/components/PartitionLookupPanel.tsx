@@ -50,7 +50,17 @@ function LookupError({ error, onRetry, onHead }: {
       </div>
     );
   }
-  return <><ErrorBox error={error} /><button type="button" onClick={onRetry}>Retry inspection</button></>;
+  if (error instanceof ApiError && [400, 404, 422].includes(error.status)) {
+    return (
+      <div className="error-box" role="alert">
+        <strong>{error.status === 404 ? "This table is unavailable at the selected snapshot." : "The partition lookup needs different inputs."}</strong>
+        <span>{error.detail ?? "Check the spec ID, complete stored tuple, and snapshot, then inspect again."}</span>
+        <span>Edit the inputs above{error.status === 404 ? " or inspect at head" : " to try a different lookup"}.</span>
+        {error.status === 404 && <button type="button" onClick={onHead}>Inspect at head</button>}
+      </div>
+    );
+  }
+  return <><ErrorBox error={error} />{(!(error instanceof ApiError) || error.status >= 500) && <button type="button" onClick={onRetry}>Retry inspection</button>}</>;
 }
 
 export function PartitionLookupPanel({ catalog, namespace, table, defaultSpecId, renderFileStats }: {
@@ -69,17 +79,17 @@ export function PartitionLookupPanel({ catalog, namespace, table, defaultSpecId,
   const [spec, setSpec] = useState(params.get("lookup_spec") ?? defaultSpecId ?? "");
   const specEdited = useRef(false);
   const [tuple, setTuple] = useState(params.get("lookup_values") ?? "");
-  const [snapshot, setSnapshot] = useState(params.get("snapshot") ?? "");
+  const urlSnapshot = params.get("lookup_at") ?? params.get("snapshot");
+  const [snapshot, setSnapshot] = useState(urlSnapshot === "head" ? "" : urlSnapshot ?? "");
   const [inputError, setInputError] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<Int64 | null>(null);
-  const scope = JSON.stringify([catalog, namespace, table, request]);
+  const scope = JSON.stringify([catalog, namespace, table, request, request?.snapshot === undefined ? location.key : null]);
   const activeScope = useRef(scope);
   activeScope.current = scope;
   const urlSpec = params.get("lookup_spec");
   const urlTuple = params.get("lookup_values");
-  const urlSnapshot = params.get("snapshot");
   const queryKey = (value: PartitionLookupRequest | null) =>
-    ["partitionLookup", catalog, namespace, table, value?.specId, value?.values, value?.snapshot ?? "head", PAGE_SIZE] as const;
+    ["partitionLookup", catalog, namespace, table, value?.specId, value?.values, value?.snapshot ?? `head:${location.key}`, PAGE_SIZE] as const;
 
   const query = useInfiniteQuery({
     queryKey: queryKey(request),
@@ -95,8 +105,8 @@ export function PartitionLookupPanel({ catalog, namespace, table, defaultSpecId,
     getNextPageParam: (last): Page | undefined => last.next_cursor === null
       ? undefined
       : { snapshot: last.snapshot_id, cursor: last.next_cursor },
-    staleTime: request?.snapshot === undefined ? 0 : Infinity,
-    refetchOnMount: request?.snapshot === undefined ? "always" : false,
+    staleTime: Infinity,
+    refetchOnMount: false,
     refetchOnWindowFocus: false,
     refetchOnReconnect: false,
     retry: false,
@@ -112,7 +122,7 @@ export function PartitionLookupPanel({ catalog, namespace, table, defaultSpecId,
     setInputError(null);
   }, [catalog, namespace, table, urlTuple]);
   useEffect(() => {
-    setSnapshot(urlSnapshot ?? "");
+    setSnapshot(urlSnapshot === "head" ? "" : urlSnapshot ?? "");
     setInputError(null);
   }, [catalog, namespace, table, urlSnapshot]);
   useEffect(() => {
@@ -141,8 +151,12 @@ export function PartitionLookupPanel({ catalog, namespace, table, defaultSpecId,
   const apply = (next: PartitionLookupRequest) => {
     setExpanded(null);
     setInputError(null);
-    void client.resetQueries({ queryKey: queryKey(next), exact: true });
-    setParams((previous) => partitionLookupParams(previous, next));
+    if (next.snapshot !== undefined) void client.resetQueries({ queryKey: queryKey(next), exact: true });
+    setParams((previous) => {
+      const updated = partitionLookupParams(previous, next);
+      updated.set("lookup_at", next.snapshot ?? "head");
+      return updated;
+    });
   };
   const atHead = () => {
     if (request) apply({ ...request, snapshot: undefined });
@@ -166,7 +180,7 @@ export function PartitionLookupPanel({ catalog, namespace, table, defaultSpecId,
       }}>
         <div className="form-row">
           <label>Spec ID<input value={spec} onChange={(event) => { specEdited.current = true; setSpec(event.target.value); }} inputMode="numeric" /></label>
-          <label>Complete tuple (JSON)<input className="mono" value={tuple} onChange={(event) => setTuple(event.target.value)} placeholder={'["2026-10", null]'} /></label>
+          <label>Complete tuple (JSON)<textarea className="mono" rows={3} value={tuple} onChange={(event) => setTuple(event.target.value)} placeholder={'["2026-10", null]'} /></label>
           <label>Snapshot (blank for head)<input value={snapshot} onChange={(event) => setSnapshot(event.target.value)} inputMode="numeric" /></label>
           <button type="submit" disabled={query.isFetching}>Inspect partition</button>
         </div>
@@ -176,7 +190,8 @@ export function PartitionLookupPanel({ catalog, namespace, table, defaultSpecId,
         if (query.isFetchNextPageError) void query.fetchNextPage();
         else void query.refetch();
       }} />}
-      {request && (!first || request.snapshot === undefined) && !query.isError && <SkeletonBlock />}
+      <div role="region" aria-label="Partition inspection results" aria-live="polite" aria-busy={query.isFetching}>
+      {request && (!first || request.snapshot === undefined) && !query.isError && <><span className="subtle">Loading partition inspection…</span><SkeletonBlock /></>}
       {request && request.snapshot !== undefined && first && pinnedSnapshot && (
         <>
           <p>Snapshot <SnapshotId catalog={catalog} id={pinnedSnapshot} /> · spec <span className="mono">{first.spec_id}</span> · tuple <code>{JSON.stringify(first.values)}</code>{" "}
@@ -216,9 +231,10 @@ export function PartitionLookupPanel({ catalog, namespace, table, defaultSpecId,
               ))}
             </tbody>
           </table>
-          {query.hasNextPage && <button type="button" disabled={query.isFetchingNextPage} onClick={() => void query.fetchNextPage()}>{query.isFetchingNextPage ? "Loading…" : files.length === 0 ? "Continue inspection" : "Load more files"}</button>}
+          {query.hasNextPage && <button type="button" aria-busy={query.isFetchingNextPage} disabled={query.isFetchingNextPage} onClick={() => void query.fetchNextPage()}>{query.isFetchingNextPage ? "Loading…" : files.length === 0 ? "Continue inspection" : "Load more files"}</button>}
         </>
       )}
+      </div>
     </section>
   );
 }

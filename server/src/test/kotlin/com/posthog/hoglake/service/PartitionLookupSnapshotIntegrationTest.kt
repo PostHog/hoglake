@@ -162,7 +162,7 @@ class PartitionLookupSnapshotIntegrationTest {
         instrumented.setSqlLogger(
             object : SqlLogger {
                 override fun logBeforeExecution(context: StatementContext) {
-                    if (context.rawSql.contains("WITH candidates AS MATERIALIZED") &&
+                    if (context.rawSql.contains("WITH probes AS MATERIALIZED") &&
                         fired.compareAndSet(false, true)
                     ) {
                         // A separate thread gets a different JDBI handle and transaction.

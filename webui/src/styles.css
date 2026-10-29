@@ -905,7 +905,7 @@ button.ghost:hover:not(:disabled) {
   font-size: 12px;
   color: var(--text-dim);
 }
-.partition-filter-field input {
+.partition-filter-field input:not([type="checkbox"]) {
   min-width: 0;
   font-size: 12px;
   padding: 3px 6px;

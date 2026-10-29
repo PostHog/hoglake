@@ -51,7 +51,12 @@ Notable surfaces beyond the catalog browser:
   a spec ID and the complete stored tuple as a JSON array of strings or
   nulls. No maintenance sample is required. Leave snapshot blank to
   resolve head once; the shareable URL, file pages, and file inspector
-  then use that resolved snapshot. Totals show physical rows without
+  then use that resolved snapshot (`lookup_snapshot`) without changing the
+  page-wide snapshot used by Schema and Files. The separate `lookup_at`
+  parameter preserves the form's requested snapshot (`head` for blank), so
+  resolving head does not pin the next tuple's input. Cached pinned file
+  pages are reused on remount; Inspect at head explicitly starts a fresh
+  lookup. Totals show physical rows without
   subtracting deletion vectors. When the aggregate budget is exceeded,
   totals are unavailable and bounded file paging continues, including
   through empty candidate windows. Busy and timed-out requests require

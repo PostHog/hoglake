@@ -224,8 +224,8 @@ class RetirementCostIntegrationTest {
      * THE ANSWER IS THAT IT IS INDEX-DRIVEN, and the test asks rather
      * than asserts it from reading the schema: `V2__maintenance.sql`
      * added `hog_delete_file_data_lookup (catalog_id, data_file_id)`;
-     * V30's `hog_delete_file_snapshot_lookup` has the same non-partial
-     * prefix. Either serves the RI query's key. (The partial
+     * V30 replaces it with `hog_delete_file_snapshot_lookup`, retaining
+     * the same non-partial prefix for the RI query's key. (The partial
      * `hog_delete_file_one_live_per_data_file` could not have served
      * it — the trigger's query carries no `end_snapshot` predicate for
      * the planner to match — and `_live`, `_path` and the primary key
@@ -275,16 +275,14 @@ class RetirementCostIntegrationTest {
                 ).bind("c", catalogId).bind("d", 1L).mapTo(String::class.java).list().joinToString(" | ")
             }
         println("[#193] DV cascade RI plan: $riPlan")
-        // MUTATION: drop BOTH non-partial catalog/file lookup indexes
+        // MUTATION: drop the non-partial catalog/file lookup index
         // and this reds — the RI query falls to a sequential scan of
         // hog_delete_file, once per deleted data-file row, and the
         // timing assertion below goes with it.
-        val driverIndex =
-            listOf("hog_delete_file_data_lookup", "hog_delete_file_snapshot_lookup")
-                .firstOrNull { riPlan.contains("Index Scan using $it") }
-        assertThat(driverIndex)
+        val driverIndex = "hog_delete_file_snapshot_lookup"
+        assertThat(riPlan)
             .describedAs("the FK's referencing-side query must be index-driven:%n%s", riPlan)
-            .isNotNull()
+            .contains("Index Scan using $driverIndex")
         assertThat(riPlan.substringAfter("Index Cond:", "").substringBefore(" | "))
             .describedAs("the RI index must constrain both catalog and data file:%n%s", riPlan)
             .contains("catalog_id =", "data_file_id =")

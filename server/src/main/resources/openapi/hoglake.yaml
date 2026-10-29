@@ -931,8 +931,9 @@ paths:
         File rows are physical rows, without subtracting deletion vectors.
         Aggregates are exact only when the bounded candidate scan completes;
         otherwise totals are null and file paging remains available. The
-        candidate budget covers the catalog-wide first-field value index,
-        including other tables, specs, tuples and retained ended files, so
+        candidate budget uses the smallest bounded per-key value probe,
+        with at most 10,001 index entries read per tuple key. The index
+        includes other tables, specs, tuples and retained ended files, so
         even a small partition can have unavailable totals. An empty
         files page with a non-null next_cursor is scan progress, not an empty
         partition. Only next_cursor=null ends pagination. File timestamp
@@ -942,8 +943,12 @@ paths:
         historical inspection through a dropped/recreated namespace can
         therefore return 404 there even while lookup metadata is retained.
         at_timestamp is rejected; use an explicit snapshot for time travel.
-        Every query has a 3-second statement timeout; at most two lookups run
-        concurrently per server process. No catalog commit lock is acquired.
+        Lookup database work shares a 3-second transaction budget, reduced by
+        connection acquisition time (the pool separately bounds acquisition
+        at 5 seconds). At most two lookups run per process and one per catalog;
+        admission does not queue. No catalog commit lock is acquired.
+        Aggregates are computed only for the initial page; continuation
+        pages return unavailable totals with reason continuation.
       parameters:
         - { $ref: "#/components/parameters/catalog" }
         - { $ref: "#/components/parameters/namespace" }
@@ -977,7 +982,8 @@ paths:
             Opaque continuation from next_cursor. Bound to catalog, table
             incarnation, spec, full tuple, resolved snapshot, initial file-ID
             ceiling and effective limit. Repeat spec_id and values. If snapshot is supplied with
-            a cursor, it must match the cursor's snapshot.
+            a cursor, it must match the cursor's snapshot. The unsigned cursor
+            detects inconsistent parameters, not deliberate forgery.
           schema: { type: string, maxLength: 1024 }
       responses:
         "200":
@@ -6501,11 +6507,13 @@ components:
         reason:
           type: string
           nullable: true
-          enum: [candidate_scan_limit, overflow, null]
+          enum: [candidate_scan_limit, overflow, continuation, null]
           description: >
             Null for exact totals. candidate_scan_limit means more indexed
             candidates exist than the request budget, including unrelated
             files. overflow means an exact total cannot fit in int64.
+            continuation means totals were not recomputed for this file page;
+            retain the initial page's aggregates.
         totals:
           $ref: "#/components/schemas/PartitionLookupTotals"
 

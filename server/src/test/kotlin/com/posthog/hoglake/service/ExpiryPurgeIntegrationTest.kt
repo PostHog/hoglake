@@ -1897,11 +1897,11 @@ class ExpiryPurgeIntegrationTest {
         // with the catalog rather than with the page.
         assertThat(plan)
             .describedAs("the vector arm must probe hog_delete_file by (catalog, data file):%n%s", plan)
-            .contains("hog_delete_file_data_lookup")
+            .contains("hog_delete_file_snapshot_lookup")
         assertThat(plan)
             .describedAs("and must never scan the vector relation:%n%s", plan)
             .doesNotContain("Seq Scan on hog_delete_file")
-        val vectorBuffers = nodeBuffers(plan, "hog_delete_file_data_lookup")
+        val vectorBuffers = nodeBuffers(plan, "hog_delete_file_snapshot_lookup")
         println(
             "[expiry purge] the vector arm on a 44,000-row hog_delete_file: $vectorBuffers buffers " +
                 "for a page of ${ExpiryService.PURGE_PAGE}",

@@ -129,6 +129,12 @@ class V30DeleteFileSnapshotLookupMigrationIntegrationTest {
                 ).mapTo(String::class.java).list()
             }
         assertThat(keys).containsExactly("catalog_id", "data_file_id", "begin_snapshot", "delete_file_id")
+        assertThat(
+            db.jdbi.withHandleUnchecked { h ->
+                h.createQuery("SELECT to_regclass('hog_delete_file_data_lookup') IS NULL")
+                    .mapTo(Boolean::class.javaObjectType).one()
+            },
+        ).describedAs("the replacement covers maintenance and FK probes without a duplicate index").isTrue()
     }
 
     @Test
@@ -156,6 +162,7 @@ class V30DeleteFileSnapshotLookupMigrationIntegrationTest {
                 }.one()
             }
         db.jdbi.useHandleUnchecked { h ->
+            h.execute("CREATE INDEX hog_delete_file_data_lookup ON hog_delete_file (catalog_id, data_file_id)")
             h.execute("UPDATE pg_index SET indisvalid = false WHERE indexrelid = '$index'::regclass")
             h.execute("DELETE FROM flyway_schema_history WHERE version = '30'")
         }
@@ -165,6 +172,10 @@ class V30DeleteFileSnapshotLookupMigrationIntegrationTest {
                 h.createQuery(
                     "SELECT indisvalid FROM pg_index WHERE indexrelid = '$index'::regclass",
                 ).mapTo(Boolean::class.javaObjectType).one(),
+            ).isTrue()
+            assertThat(
+                h.createQuery("SELECT to_regclass('hog_delete_file_data_lookup') IS NULL")
+                    .mapTo(Boolean::class.javaObjectType).one(),
             ).isTrue()
             assertThat(
                 h.createQuery("SELECT current_setting('statement_timeout'), current_setting('lock_timeout')").map {

@@ -742,9 +742,9 @@ appends and never deletes; a delete commit supersedes at most once per
 flush), which is why the default page is sized on the stats cascade — but
 a table with deep vector history is the shape that makes a page expensive
 in a way the row count does not show, and the 5 s statement bound plus
-the halving ladder are what bound it. The vector delete probes
-`hog_delete_file_data_lookup` once per deleted file (measured: a nested
-loop, ~2.2 buffers a probe against a 44,000-row vector relation), so the
+the halving ladder are what bound it. The vector delete probes the
+`(catalog_id, data_file_id)` prefix of `hog_delete_file_snapshot_lookup`
+once per deleted file, so the
 *lookup* cost is O(page) whatever the depth; it is the rows it finds that
 are not.
 
@@ -2101,13 +2101,20 @@ The catalog reports on itself instead of waiting for ops SQL:
   last file write/rewrite is not ingestion freshness. A bounded
   candidate scan returns exact totals or an explicit unavailable
   reason, while file inspection remains paged. The budget includes
-  other tables/specs and retained files sharing the first-field value,
-  so totals can be unavailable even for a small partition. Hydration
+  other tables/specs and retained files, but probes every tuple key
+  (at most 10,001 index entries each) and chooses the smallest candidate
+  set. Totals can still be unavailable even for a small partition.
+  Only the first page computes aggregates; continuation pages report
+  `reason: continuation` and callers retain the initial totals. Hydration
   state counts reflect the current request, not historical state at
   the requested snapshot. Continue until
   `next_cursor` is null, even if a page contains no matching files.
   Expired snapshots return 410; busy admission and query timeouts
   return 503 with `Retry-After`, distinct from an empty partition.
+  A shared three-second transaction budget includes database work across
+  statements; pool acquisition reduces the remaining budget and has its
+  own five-second bound. Admission allows two lookups per process and
+  one per catalog, without queuing.
   The existing file stats endpoint resolves namespaces at head, so
   it may return 404 for files reached through a historical namespace
   that has since been dropped/recreated.

@@ -329,7 +329,31 @@ describe("TablePage partitions tab", () => {
     expect(lookupUrl.searchParams.get("spec_id")).toBe("1");
     expect(JSON.parse(lookupUrl.searchParams.get("values")!)).toEqual(["20697", "7"]);
     expect(urls.filter((u) => u.split("?")[0] === `${base}/files`)).toHaveLength(0);
-    await waitFor(() => expect(urls.some((u) => u.includes("snapshot=4211") && u.includes("totals=false"))).toBe(true));
+    await screen.findByRole("button", { name: "Inspect file 101" });
+    expect(urls).toContain(`${base}?totals=false`);
+    expect(urls.some((u) => u.includes("snapshot=4211"))).toBe(false);
+    await user.click(screen.getByRole("tab", { name: "files" }));
+    await waitFor(() => expect(urls.some((u) => u.split("?")[0] === `${base}/files`)).toBe(true));
+    const filesUrl = new URL(urls.find((u) => u.split("?")[0] === `${base}/files`)!, "http://localhost");
+    expect(filesUrl.searchParams.has("snapshot")).toBe(false);
+    await user.click(screen.getByRole("tab", { name: "schema" }));
+    expect(urls.filter((u) => u.split("?")[0] === base).every((u) => !new URL(u, "http://localhost").searchParams.has("snapshot"))).toBe(true);
+  });
+
+  it("preserves page time travel when returning from a separately pinned lookup to sampled partitions", async () => {
+    const urls = harness();
+    const user = userEvent.setup();
+    const params = new URLSearchParams({ tab: "partitions", lookup: "1", lookup_spec: "1", lookup_values: '["20697","7"]', snapshot: "7", lookup_snapshot: "4211", lookup_at: "head" });
+    renderApp(`${route}?${params}`);
+    await screen.findByRole("button", { name: "Inspect file 101" });
+    const back = screen.getByRole("link", { name: "Back to sampled partitions" });
+    expect(new URL(back.getAttribute("href")!, "http://localhost").searchParams.get("snapshot")).toBe("7");
+    await user.click(back);
+    await screen.findByText("2026-09-01");
+    await user.click(screen.getByRole("tab", { name: "files" }));
+    await waitFor(() => expect(urls.some((u) => u.split("?")[0] === `${base}/files`)).toBe(true));
+    const filesUrl = new URL(urls.find((u) => u.split("?")[0] === `${base}/files`)!, "http://localhost");
+    expect(filesUrl.searchParams.get("snapshot")).toBe("7");
   });
 
   it("opens a pinned lookup without table metadata and keeps historical inspector errors local", async () => {
@@ -370,6 +394,7 @@ describe("TablePage partitions tab", () => {
     const user = userEvent.setup();
     renderApp(`${route}?tab=partitions`);
     expect(await screen.findByRole("alert")).toHaveTextContent("Sample listing limit exceeded");
+    expect(screen.getByText(/Use exact inspection above with a spec ID/)).toBeInTheDocument();
     await user.click(screen.getByRole("link", { name: "Inspect exact partition" }));
     await user.clear(screen.getByLabelText("Spec ID"));
     await user.type(screen.getByLabelText("Spec ID"), "1");

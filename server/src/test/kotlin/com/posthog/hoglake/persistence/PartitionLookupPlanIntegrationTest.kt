@@ -161,7 +161,7 @@ class PartitionLookupPlanIntegrationTest {
     @Test
     fun `custom and generic plans bound index and manifest work before materialization`() {
         for (values in listOf(listOf("common", "wanted"), listOf(null, "wanted"), listOf("rare", "wanted"))) {
-            for (cap in listOf(100, 1000)) {
+            for (cap in listOf(100, 1000, 10_000)) {
                 for (page in listOf(false, true)) {
                     for (generic in listOf(false, true)) {
                         for (after in if (page) listOf(-1L, 100_000L) else listOf(-1L)) {
@@ -175,19 +175,30 @@ class PartitionLookupPlanIntegrationTest {
                                 }
                             val result = explain(sql, values, cap, generic, page, after)
                             val all = nodes(result["Plan"])
-                            val candidates = all.single { it.path("Subplan Name").asText() == "CTE candidates" }
-                            val pivot =
-                                nodes(candidates).single {
+                            val candidates =
+                                all.singleOrNull { it.path("Subplan Name").asText() == "CTE candidates" }
+                                    ?: error("missing candidates: ${result.toPrettyString()}")
+                            assertThat(candidates.path("Actual Rows").asDouble()).isLessThanOrEqualTo(cap + 1.0)
+                            val probes =
+                                all.singleOrNull { it.path("Subplan Name").asText() == "CTE probes" }
+                                    ?: error("missing probes: ${result.toPrettyString()}")
+                            val keyProbes =
+                                nodes(probes).filter {
                                     it.path("Relation Name").asText() == "hog_file_partition_value"
                                 }
-                            assertThat(pivot["Node Type"].asText()).isIn("Index Only Scan", "Index Scan")
-                            assertThat(pivot.path("Index Name").asText()).isEqualTo("hog_file_partition_value_lookup")
-                            assertThat(pivot.path("Index Cond").asText())
-                                .contains("key_index = 0", "data_file_id >", "data_file_id <")
-                            val pivotExamined =
-                                (pivot["Actual Rows"].asDouble() + pivot.path("Rows Removed by Filter").asDouble()) *
-                                    pivot["Actual Loops"].asDouble()
-                            assertThat(pivotExamined).isLessThanOrEqualTo(cap + 1.0)
+                            assertThat(keyProbes).hasSize(values.size)
+                            for (pivot in keyProbes) {
+                                assertThat(pivot["Node Type"].asText()).isIn("Index Only Scan", "Index Scan")
+                                assertThat(
+                                    pivot.path("Index Name").asText(),
+                                ).isEqualTo("hog_file_partition_value_lookup")
+                                assertThat(pivot.path("Index Cond").asText())
+                                    .contains("catalog_id =", "key_index =", "data_file_id >", "data_file_id <")
+                                val filtered = pivot.path("Rows Removed by Filter").asDouble()
+                                val pivotExamined =
+                                    (pivot["Actual Rows"].asDouble() + filtered) * pivot["Actual Loops"].asDouble()
+                                assertThat(pivotExamined).isLessThanOrEqualTo(cap + 1.0)
+                            }
                             for (node in all.filter {
                                 it["Relation Name"]?.asText() in
                                     listOf("hog_data_file", "hog_file_partition_value", "hog_delete_file")

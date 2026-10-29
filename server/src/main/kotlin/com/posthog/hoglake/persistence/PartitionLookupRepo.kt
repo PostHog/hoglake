@@ -10,10 +10,9 @@ import org.jdbi.v3.core.statement.Query
 import java.sql.ResultSet
 
 /**
- * Fixed windows of the existing inverse index; unrelated tables and ended files consume the budget too.
- * The 120k-file plan fixture examines at most cap + 1 candidates: at cap 1,000, the worst
- * custom/generic plan used 6,832 buffers in 3.469 ms (about 3.5 microseconds per candidate).
- * Production caps at 10,000 candidates per statement, with a separate three-second timeout.
+ * Probe each tuple key through the inverse index, then examine the smallest bounded candidate set.
+ * Each key reads at most cap + 1 entries; unrelated tables and retained ended files still count.
+ * The plan fixture checks custom and generic plans at the production candidate cap.
  */
 internal object PartitionLookupRepo {
     private const val FILE_COLUMNS =
@@ -162,19 +161,34 @@ internal object PartitionLookupRepo {
     }
 
     // IS NULL does not fix an equality pathkey; retaining value keeps the inverse index's ordering.
-    private fun windows(values: List<String?>): String =
-        """
-        WITH candidates AS MATERIALIZED (
-            SELECT data_file_id FROM hog_file_partition_value
-            WHERE catalog_id = :catalogId AND key_index = 0
-              AND ${if (values[0] == null) "value IS NULL" else "value = :value0"}
-              AND data_file_id > :after
-              AND data_file_id < :upper
-            ORDER BY value, data_file_id LIMIT :candidateProbeLimit
+    private fun windows(values: List<String?>): String {
+        val probes =
+            values.mapIndexed { i, value ->
+                """SELECT $i AS key_index, data_file_id FROM (
+                SELECT data_file_id FROM hog_file_partition_value
+                WHERE catalog_id = :catalogId AND key_index = $i
+                  AND ${if (value == null) "value IS NULL" else "value = :value$i"}
+                  AND data_file_id > :after AND data_file_id < :upper
+                ORDER BY value, data_file_id LIMIT :candidateProbeLimit
+            ) key_$i"""
+            }.joinToString(" UNION ALL ")
+        val keys = values.indices.joinToString(", ") { "($it)" }
+        return """
+        WITH probes AS MATERIALIZED ($probes),
+        pivot AS MATERIALIZED (
+            SELECT keys.key_index FROM (VALUES $keys) keys(key_index)
+            LEFT JOIN (
+                SELECT key_index, count(*) AS candidate_count FROM probes GROUP BY key_index
+            ) counts USING (key_index)
+            ORDER BY coalesce(candidate_count, 0), keys.key_index LIMIT 1
+        ),
+        candidates AS MATERIALIZED (
+            SELECT data_file_id FROM probes WHERE key_index = (SELECT key_index FROM pivot)
         ), scan_window AS MATERIALIZED (
             SELECT data_file_id FROM candidates ORDER BY data_file_id LIMIT :candidateLimit
         )
         """
+    }
 
     private fun matched(
         values: List<String?>,

@@ -663,7 +663,7 @@ export interface PartitionLookup {
   values: (string | null)[];
   aggregates:
     | { status: "exact"; reason: null; totals: PartitionLookupTotals }
-    | { status: "unavailable"; reason: "candidate_scan_limit" | "overflow"; totals: null };
+    | { status: "unavailable"; reason: "candidate_scan_limit" | "overflow" | "continuation"; totals: null };
   files: DataFile[];
   next_cursor: string | null;
 }

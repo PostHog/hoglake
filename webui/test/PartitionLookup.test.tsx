@@ -20,7 +20,7 @@ afterEach(() => vi.restoreAllMocks());
 
 function link(values = tuple, snapshot?: string, spec = "1"): string {
   const params = new URLSearchParams({ tab: "partitions", lookup: "1", lookup_spec: spec, lookup_values: JSON.stringify(values) });
-  if (snapshot !== undefined) params.set("snapshot", snapshot);
+  if (snapshot !== undefined) params.set("lookup_snapshot", snapshot);
   return `${route}?${params}`;
 }
 
@@ -49,14 +49,17 @@ function setup(initial = `${route}?tab=partitions&lookup=1`, client = new QueryC
     const location = useLocation();
     const navigate = useNavigate();
     const [defaultSpec, setDefaultSpec] = useState<string | undefined>(undefined);
+    const [visible, setVisible] = useState(true);
     return <>
       <output data-testid="location">{location.search}</output>
       <button onClick={() => setDefaultSpec("99")}>Metadata arrives</button>
+      <button onClick={() => navigate(-1)}>Back</button>
+      <button onClick={() => setVisible((shown) => !shown)}>Toggle inspection</button>
       <button onClick={() => navigate(link(["different"], "20", "2"))}>Different lookup</button>
       <button onClick={() => navigate(link())}>Unpinned lookup</button>
       {nextLookup && <button onClick={() => navigate(nextLookup)}>Next lookup</button>}
-      <PartitionLookupPanel catalog="analytics" namespace="events" table="pageviews" defaultSpecId={defaultSpec}
-        renderFileStats={(id, snapshot) => <p>Inspector {id} at {snapshot}</p>} />
+      {visible && <PartitionLookupPanel catalog="analytics" namespace="events" table="pageviews" defaultSpecId={defaultSpec}
+        renderFileStats={(id, snapshot) => <p>Inspector {id} at {snapshot}</p>} />}
     </>;
   }
   const view = render(<QueryClientProvider client={client}><MemoryRouter initialEntries={[initial]}><Harness /></MemoryRouter></QueryClientProvider>);
@@ -89,7 +92,7 @@ describe("exact partition lookup input", () => {
   });
 
   it("rejects malformed, duplicate or incomplete URL parameters without falling back to head", () => {
-    for (const extra of ["snapshot=", "snapshot=-1", "snapshot=9223372036854775808", "snapshot=1&snapshot=2", "lookup_spec=2", "lookup_values=[]"]) {
+    for (const extra of ["lookup_snapshot=", "lookup_snapshot=-1", "lookup_snapshot=1&lookup_snapshot=2", "lookup_at=-1", "lookup_at=1&lookup_at=2", "snapshot=", "snapshot=-1", "snapshot=9223372036854775808", "snapshot=1&snapshot=2", "lookup_spec=2", "lookup_values=[]"]) {
       const params = new URLSearchParams({ lookup_spec: "1", lookup_values: '["x"]' });
       for (const [key, value] of new URLSearchParams(extra)) params.append(key, value);
       expect(readPartitionLookupRequest(params)).toMatchObject({ request: null, error: expect.any(String) });
@@ -112,9 +115,11 @@ describe("PartitionLookupPanel", () => {
     const partitionLinks = copyButtons.mock.calls.filter(([props]) => props.label === "partition link");
     expect(partitionLinks.length).toBeGreaterThan(0);
     for (const [props] of partitionLinks) {
-      expect(new URL(props.text).searchParams.get("snapshot")).toBe(big);
+      expect(new URL(props.text).searchParams.get("lookup_snapshot")).toBe(big);
+      expect(new URL(props.text).searchParams.has("snapshot")).toBe(false);
     }
-    expect(screen.getByTestId("location")).toHaveTextContent(`snapshot=${big}`);
+    expect(screen.getByTestId("location")).toHaveTextContent(`lookup_snapshot=${big}`);
+    expect(screen.getByLabelText("Snapshot (blank for head)")).toHaveValue("");
     expect(urls).toHaveLength(1);
     const request = new URL(urls[0], "http://localhost").searchParams;
     expect(request.get("spec_id")).toBe(big);
@@ -136,6 +141,83 @@ describe("PartitionLookupPanel", () => {
     await screen.findByText("s3://bucket/original.parquet");
     expect(urls).toHaveLength(1);
     expect(screen.getByRole("button", { name: "Copy partition link" })).toBeInTheDocument();
+    expect(screen.getByLabelText("Snapshot (blank for head)")).toHaveValue("");
+  });
+
+  it("looks up the next tuple at head after automatically pinning the first", async () => {
+    const urls = fetches((params, call) => {
+      expect(params.has("snapshot")).toBe(false);
+      return jsonResponse(page({ snapshot_id: String(20 + call), values: JSON.parse(params.get("values")!) }));
+    });
+    const { user } = setup(link());
+    await screen.findByText("s3://bucket/original.parquet");
+    expect(screen.getByLabelText("Snapshot (blank for head)")).toHaveValue("");
+    await user.clear(screen.getByLabelText("Complete tuple (JSON)"));
+    await user.click(screen.getByLabelText("Complete tuple (JSON)"));
+    await user.paste('["next"]');
+    await user.click(screen.getByRole("button", { name: "Inspect partition" }));
+    await waitFor(() => expect(screen.getByTestId("location")).toHaveTextContent("lookup_snapshot=22"));
+    expect(urls).toHaveLength(2);
+  });
+
+  it("keeps page time travel independent and restores explicit lookup intent on back navigation", async () => {
+    const urls = fetches((params) => jsonResponse(page({ snapshot_id: params.get("snapshot") ?? "40" })));
+    const { user } = setup(`${link()}&snapshot=7`);
+    await screen.findByText("s3://bucket/original.parquet");
+    expect(new URL(urls[0], "http://localhost").searchParams.get("snapshot")).toBe("7");
+    await user.clear(screen.getByLabelText("Snapshot (blank for head)"));
+    await user.type(screen.getByLabelText("Snapshot (blank for head)"), "30");
+    await user.click(screen.getByRole("button", { name: "Inspect partition" }));
+    await waitFor(() => expect(screen.getByTestId("location")).toHaveTextContent("lookup_at=30"));
+    await user.click(screen.getByRole("button", { name: "Inspect at head" }));
+    await waitFor(() => expect(screen.getByTestId("location")).toHaveTextContent("lookup_snapshot=40"));
+    expect(screen.getByLabelText("Snapshot (blank for head)")).toHaveValue("");
+    const current = new URLSearchParams(screen.getByTestId("location").textContent!);
+    expect(current.get("snapshot")).toBe("7");
+    expect(new URL(urls.at(-1)!, "http://localhost").searchParams.has("snapshot")).toBe(false);
+    await user.click(screen.getByRole("button", { name: "Back" }));
+    await waitFor(() => expect(screen.getByLabelText("Snapshot (blank for head)")).toHaveValue("30"));
+    expect(new URLSearchParams(screen.getByTestId("location").textContent!).get("snapshot")).toBe("7");
+  });
+
+  it("reuses loaded pinned pages on remount without replaying them", async () => {
+    const urls = fetches((_params, call) => jsonResponse(page(call === 1 ? { next_cursor: "next" } : {
+      files: [{ ...filesFixture[0], data_file_id: "72", path: "s3://bucket/second.parquet" }],
+      aggregates: { status: "unavailable", reason: "continuation", totals: null },
+    })));
+    const { user } = setup(link());
+    await user.click(await screen.findByRole("button", { name: "Load more files" }));
+    await screen.findByText("s3://bucket/second.parquet");
+    await user.click(screen.getByRole("button", { name: "Toggle inspection" }));
+    await user.click(screen.getByRole("button", { name: "Toggle inspection" }));
+    await screen.findByText("s3://bucket/second.parquet");
+    expect(screen.getByText("s3://bucket/original.parquet")).toBeInTheDocument();
+    expect(screen.queryByText(/Totals unavailable:/)).not.toBeInTheDocument();
+    expect(urls).toHaveLength(2);
+  });
+
+  it.each([400, 404, 422])("offers input correction instead of retrying non-retryable %s", async (status) => {
+    const urls = fetches(() => jsonResponse({ error: "invalid_lookup", detail: "Check this spec and tuple." }, status));
+    setup(link(tuple, big));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Check this spec and tuple.");
+    expect(screen.queryByRole("button", { name: "Retry inspection" })).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Complete tuple (JSON)").tagName).toBe("TEXTAREA");
+    expect(urls).toHaveLength(1);
+  });
+
+  it("announces pending inspection and continuation state", async () => {
+    let complete!: (response: Response) => void;
+    const delayed = new Promise<Response>((resolve) => { complete = resolve; });
+    const urls = fetches((_params, call) => call === 1 ? jsonResponse(page({ next_cursor: "next" })) : delayed);
+    const { user } = setup(link());
+    await user.click(await screen.findByRole("button", { name: "Load more files" }));
+    const results = screen.getByRole("region", { name: "Partition inspection results" });
+    expect(results).toHaveAttribute("aria-live", "polite");
+    expect(results).toHaveAttribute("aria-busy", "true");
+    expect(screen.getByRole("button", { name: "Loading…" })).toHaveAttribute("aria-busy", "true");
+    await act(async () => { complete(jsonResponse(page({ files: [] }))); await delayed; });
+    await waitFor(() => expect(results).toHaveAttribute("aria-busy", "false"));
+    expect(urls).toHaveLength(2);
   });
 
   it("keeps dirty drafts when deferred metadata arrives", async () => {
@@ -225,7 +307,7 @@ describe("PartitionLookupPanel", () => {
     expect(urls).toHaveLength(1);
     await user.click(screen.getByRole("button", { name: "Inspect at head" }));
     await screen.findByText("s3://bucket/original.parquet");
-    await waitFor(() => expect(screen.getByTestId("location")).toHaveTextContent(`snapshot=${big}`));
+    await waitFor(() => expect(screen.getByTestId("location")).toHaveTextContent(`lookup_snapshot=${big}`));
     expect(urls).toHaveLength(2);
   });
 
@@ -238,7 +320,7 @@ describe("PartitionLookupPanel", () => {
     await user.click(screen.getByRole("button", { name: "Different lookup" }));
     await screen.findByText("s3://bucket/new.parquet");
     await act(async () => { resolve(jsonResponse(page())); await delayed; });
-    expect(screen.getByTestId("location")).toHaveTextContent("snapshot=20");
+    expect(screen.getByTestId("location")).toHaveTextContent("lookup_snapshot=20");
     expect(screen.getByTestId("location")).toHaveTextContent("lookup_spec=2");
     expect(screen.queryByText("s3://bucket/original.parquet")).not.toBeInTheDocument();
     expect(urls).toHaveLength(2);
@@ -250,13 +332,13 @@ describe("PartitionLookupPanel", () => {
     const urls = fetches((_params, call) => call === 1 ? jsonResponse(page()) : delayed);
     const { user } = setup(link());
     await screen.findByText("s3://bucket/original.parquet");
-    await waitFor(() => expect(screen.getByTestId("location")).toHaveTextContent(`snapshot=${big}`));
+    await waitFor(() => expect(screen.getByTestId("location")).toHaveTextContent(`lookup_snapshot=${big}`));
     await user.click(screen.getByRole("button", { name: "Unpinned lookup" }));
     await waitFor(() => expect(urls).toHaveLength(2));
-    expect(screen.getByTestId("location")).not.toHaveTextContent("snapshot=");
+    expect(screen.getByTestId("location")).not.toHaveTextContent("lookup_snapshot=");
     expect(screen.queryByText("s3://bucket/original.parquet")).not.toBeInTheDocument();
     await act(async () => { resolve(jsonResponse(page({ snapshot_id: "9007199254740995", files: [] }))); await delayed; });
-    await waitFor(() => expect(screen.getByTestId("location")).toHaveTextContent("snapshot=9007199254740995"));
+    await waitFor(() => expect(screen.getByTestId("location")).toHaveTextContent("lookup_snapshot=9007199254740995"));
     expect(urls).toHaveLength(2);
   });
 
@@ -270,14 +352,14 @@ describe("PartitionLookupPanel", () => {
     });
     const { user } = setup(link());
     await screen.findByText("s3://bucket/original.parquet");
-    await waitFor(() => expect(screen.getByTestId("location")).toHaveTextContent(`snapshot=${big}`));
+    await waitFor(() => expect(screen.getByTestId("location")).toHaveTextContent(`lookup_snapshot=${big}`));
     await user.click(screen.getByRole("button", { name: "Inspect at head" }));
     await waitFor(() => expect(urls).toHaveLength(2));
-    expect(screen.getByTestId("location")).not.toHaveTextContent("snapshot=");
+    expect(screen.getByTestId("location")).not.toHaveTextContent("lookup_snapshot=");
     expect(screen.queryByText("s3://bucket/original.parquet")).not.toBeInTheDocument();
     await act(async () => { resolve(jsonResponse(page({ snapshot_id: "9007199254740995", files: [] }))); await delayed; });
     await screen.findByText("No files in this partition at this snapshot.");
-    await waitFor(() => expect(screen.getByTestId("location")).toHaveTextContent("snapshot=9007199254740995"));
+    await waitFor(() => expect(screen.getByTestId("location")).toHaveTextContent("lookup_snapshot=9007199254740995"));
     expect(urls).toHaveLength(2);
   });
 
@@ -289,15 +371,15 @@ describe("PartitionLookupPanel", () => {
     });
     const { user } = setup(link());
     await screen.findByText("s3://bucket/original.parquet");
-    await waitFor(() => expect(screen.getByTestId("location")).toHaveTextContent(`snapshot=${big}`));
+    await waitFor(() => expect(screen.getByTestId("location")).toHaveTextContent(`lookup_snapshot=${big}`));
     await user.click(screen.getByRole("button", { name: "Unpinned lookup" }));
     await screen.findByText("Partition inspection timed out.");
-    expect(screen.getByTestId("location")).not.toHaveTextContent("snapshot=");
+    expect(screen.getByTestId("location")).not.toHaveTextContent("lookup_snapshot=");
     expect(screen.queryByText("s3://bucket/original.parquet")).not.toBeInTheDocument();
     expect(urls).toHaveLength(2);
     await user.click(screen.getByRole("button", { name: "Retry inspection" }));
     await screen.findByText("No files in this partition at this snapshot.");
-    await waitFor(() => expect(screen.getByTestId("location")).toHaveTextContent("snapshot=9007199254740995"));
+    await waitFor(() => expect(screen.getByTestId("location")).toHaveTextContent("lookup_snapshot=9007199254740995"));
     expect(urls).toHaveLength(3);
   });
 

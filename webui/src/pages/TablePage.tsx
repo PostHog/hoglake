@@ -2,6 +2,7 @@ import { Fragment, useEffect, useRef, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  ApiError,
   getFileStats,
   getTable,
   listFiles,
@@ -1461,6 +1462,9 @@ function PartitionsTab({
         </div>
       )}
       {query.isError && <ErrorBox error={query.error} />}
+      {query.isError && query.error instanceof ApiError && query.error.status === 422 && (
+        <p className="subtle">The sampled listing cannot serve this request. Use exact inspection above with a spec ID and the complete stored tuple.</p>
+      )}
       <table className="data-table">
         <thead>
           <tr>
@@ -1835,7 +1839,7 @@ export function TablePage() {
       )}
       {exactLookup && (
         <>
-          <p><Link to="?tab=partitions">Back to sampled partitions</Link></p>
+          <p><Link to={`?${new URLSearchParams({ tab: "partitions", ...(snapshot === undefined ? {} : { snapshot }) })}`}>Back to sampled partitions</Link></p>
           <PartitionLookupPanel
             key={JSON.stringify([catalog, namespace, table])}
             catalog={catalog}

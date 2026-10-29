@@ -7,6 +7,8 @@
 -- This index is paid only on DV registration, not ordinary data-file
 -- appends. It grows by one entry per retained DV version; the existing
 -- snapshot-expiry purge removes those entries with their owning rows.
+-- Its non-partial (catalog_id, data_file_id) prefix also serves maintenance
+-- and FK cascades, so retire the narrower V2 index after the build succeeds.
 -- V30DeleteFileSnapshotLookupMigrationIntegrationTest measures the build,
 -- index bytes and before/after production query on interleaved histories.
 -- PG18 fixture: 200,000 versions, two interleaved catalogs, 100,000 per
@@ -24,8 +26,13 @@
 --     ON hog_delete_file
 --       (catalog_id, data_file_id, begin_snapshot DESC, delete_file_id DESC);
 -- Check for old transactions first: a concurrent build can wait beyond the
--- pod's startup budget. A cancelled build leaves an invalid index; the
--- repair below removes it before retrying.
+-- pod's startup budget. A cancelled build leaves an invalid index. Before
+-- retrying on a busy installation, remove that invalid index out of band:
+--   DROP INDEX CONCURRENTLY IF EXISTS hog_delete_file_snapshot_lookup;
+-- Then pre-build the replacement with the CREATE above before promotion.
+-- The fallback repair below uses plain DROP INDEX, which needs ACCESS
+-- EXCLUSIVE on hog_delete_file; its five-second lock timeout bounds that
+-- wait, but concurrent cleanup avoids taking that table lock at all.
 SELECT set_config('hoglake.migration_lock_timeout', current_setting('lock_timeout'), false);
 SET lock_timeout = '5s';
 
@@ -48,5 +55,7 @@ SET statement_timeout = 0;
 
 CREATE INDEX CONCURRENTLY IF NOT EXISTS hog_delete_file_snapshot_lookup
     ON hog_delete_file (catalog_id, data_file_id, begin_snapshot DESC, delete_file_id DESC);
+
+DROP INDEX CONCURRENTLY IF EXISTS hog_delete_file_data_lookup;
 
 SELECT set_config('statement_timeout', current_setting('hoglake.migration_statement_timeout'), false);

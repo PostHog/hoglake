@@ -54,6 +54,8 @@ internal data class PartitionLookupCursor(
             specId: Long,
             values: List<String?>,
             upper: Long,
+            snapshot: Long,
+            limit: Int,
         ): String {
             val bytes = ByteArrayOutputStream()
             DataOutputStream(bytes).use { out ->
@@ -63,6 +65,8 @@ internal data class PartitionLookupCursor(
                 out.writeLong(tableUuid.leastSignificantBits)
                 out.writeLong(specId)
                 out.writeLong(upper)
+                out.writeLong(snapshot)
+                out.writeInt(limit)
                 out.writeInt(values.size)
                 values.forEach { value ->
                     if (value == null) {

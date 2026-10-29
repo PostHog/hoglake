@@ -58,11 +58,16 @@ export function readPartitionLookupRequest(params: URLSearchParams): {
   error: string | null;
 } {
   try {
-    for (const name of ["lookup_spec", "lookup_values", "snapshot"]) {
+    for (const name of ["lookup_spec", "lookup_values", "lookup_snapshot", "lookup_at", "snapshot"]) {
       if (params.getAll(name).length > 1) throw new Error(`The link repeats ${name}; enter one value.`);
     }
-    const snapshot = params.get("snapshot");
-    if (snapshot !== null) id(snapshot, "Snapshot", false);
+    for (const name of ["snapshot", "lookup_snapshot"]) {
+      const value = params.get(name);
+      if (value !== null) id(value, "Snapshot", false);
+    }
+    const intent = params.get("lookup_at") ?? params.get("snapshot");
+    if (intent !== null && intent !== "head") id(intent, "Snapshot", false);
+    const snapshot = params.get("lookup_snapshot") ?? (intent === "head" ? null : intent);
     if (!params.has("lookup_spec") && !params.has("lookup_values")) return { request: null, error: null };
     const spec = params.get("lookup_spec");
     const tuple = params.get("lookup_values");
@@ -80,7 +85,7 @@ export function partitionLookupParams(params: URLSearchParams, request: Partitio
   next.set("lookup", "1");
   next.set("lookup_spec", request.specId);
   next.set("lookup_values", JSON.stringify(request.values));
-  if (request.snapshot === undefined) next.delete("snapshot");
-  else next.set("snapshot", request.snapshot);
+  if (request.snapshot === undefined) next.delete("lookup_snapshot");
+  else next.set("lookup_snapshot", request.snapshot);
   return next;
 }

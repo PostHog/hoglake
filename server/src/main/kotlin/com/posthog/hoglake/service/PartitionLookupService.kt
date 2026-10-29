@@ -2,6 +2,7 @@ package com.posthog.hoglake.service
 
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.PartitionLookup
+import com.posthog.hoglake.model.PartitionLookupAggregates
 import com.posthog.hoglake.model.PartitionLookupInvalidRequest
 import com.posthog.hoglake.model.PartitionLookupUnavailable
 import com.posthog.hoglake.model.validatePartitionLookupValues
@@ -12,8 +13,10 @@ import com.posthog.hoglake.persistence.Pg
 import com.posthog.hoglake.persistence.TableRepo
 import org.jdbi.v3.core.Jdbi
 import org.jdbi.v3.core.kotlin.inTransactionUnchecked
-import org.jdbi.v3.core.statement.UnableToExecuteStatementException
+import java.sql.SQLException
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Semaphore
+import java.util.concurrent.TimeUnit
 
 /** Exact lookup is independent of sampler state and bounded before borrowing a database connection. */
 class PartitionLookupService(
@@ -29,6 +32,7 @@ class PartitionLookupService(
     }
 
     private val admission = Semaphore(maxConcurrentRequests)
+    private val activeCatalogs = ConcurrentHashMap.newKeySet<String>()
 
     fun lookup(
         catalog: String,
@@ -49,16 +53,19 @@ class PartitionLookupService(
         ) {
             throw PartitionLookupInvalidRequest("cursor does not match snapshot or limit")
         }
-        if (!admission.tryAcquire()) {
-            throw PartitionLookupUnavailable(
-                "busy",
-                "partition lookup capacity is busy; retry shortly",
-            )
+        val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(statementTimeoutMs.toLong())
+        if (!admission.tryAcquire()) busy()
+        if (!activeCatalogs.add(catalog)) {
+            admission.release()
+            busy()
         }
         try {
             return jdbi.inTransactionUnchecked { h ->
                 h.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-                h.execute("SET LOCAL statement_timeout = '$statementTimeoutMs'")
+                val remaining = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime())
+                if (remaining <= 0) timeout()
+                h.execute("SET LOCAL transaction_timeout = '$remaining'")
+                h.execute("SET LOCAL statement_timeout = '$remaining'")
                 val cat = CatalogRepo.require(h, catalog)
                 val at = snapshot ?: continuation?.snapshot ?: cat.headSnapshotId
                 if (at < 0 || at > cat.headSnapshotId) {
@@ -85,6 +92,8 @@ class PartitionLookupService(
                         specId,
                         values,
                         upper,
+                        at,
+                        limit,
                     )
                 if (continuation != null && continuation.scope != scope) {
                     throw PartitionLookupInvalidRequest(
@@ -103,16 +112,20 @@ class PartitionLookupService(
                     )
                 }
                 val aggregates =
-                    PartitionLookupRepo.aggregates(
-                        h,
-                        cat.catalogId,
-                        resolved.tableId,
-                        specId,
-                        values,
-                        at,
-                        upper,
-                        candidateLimit,
-                    )
+                    if (continuation == null) {
+                        PartitionLookupRepo.aggregates(
+                            h,
+                            cat.catalogId,
+                            resolved.tableId,
+                            specId,
+                            values,
+                            at,
+                            upper,
+                            candidateLimit,
+                        )
+                    } else {
+                        PartitionLookupAggregates("unavailable", "continuation", null)
+                    }
                 val page =
                     PartitionLookupRepo.page(
                         h,
@@ -143,16 +156,27 @@ class PartitionLookupService(
                     nextAfter?.let { PartitionLookupCursor(at, it, upper, limit, scope).encode() },
                 )
             }
-        } catch (e: UnableToExecuteStatementException) {
-            if (Pg.isQueryCanceled(
-                    e,
-                )
-            ) {
-                throw PartitionLookupUnavailable("timeout", "partition lookup exceeded its time budget")
-            }
+        } catch (e: RuntimeException) {
+            val state =
+                generateSequence<Throwable>(e) { it.cause }.filterIsInstance<SQLException>()
+                    .firstOrNull()?.sqlState
+            if (state == Pg.QUERY_CANCELED || state == "25P04") timeout()
             throw e
         } finally {
+            activeCatalogs.remove(catalog)
             admission.release()
         }
     }
+
+    private fun busy(): Nothing =
+        throw PartitionLookupUnavailable(
+            "busy",
+            "partition lookup capacity is busy; retry shortly",
+        )
+
+    private fun timeout(): Nothing =
+        throw PartitionLookupUnavailable(
+            "timeout",
+            "partition lookup exceeded its time budget",
+        )
 }

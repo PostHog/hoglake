@@ -26,6 +26,7 @@ import org.junit.jupiter.api.TestInstance
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 @Tag("integration")
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
@@ -228,10 +229,42 @@ class PartitionLookupServiceIntegrationTest {
     }
 
     @Test
+    fun `selective later key avoids common leading value budget exhaustion`() {
+        val f = PartitionLookupFixture(db)
+        f.append(
+            *List(7) { listOf("common", "other") }.toTypedArray(),
+            listOf("common", "wanted"),
+            listOf("common", "wanted"),
+        )
+        val bounded = PartitionLookupService(db.jdbi, candidateLimit = 3)
+        val first = bounded.lookup(f.name, "ns", "t", f.specId, listOf("common", "wanted"), limit = 1)
+        assertThat(first.aggregates.totals!!.fileCount).isEqualTo(2)
+        assertThat(first.files).hasSize(1)
+        val second =
+            bounded.lookup(
+                f.name,
+                "ns",
+                "t",
+                f.specId,
+                listOf("common", "wanted"),
+                limit = 1,
+                cursor = first.nextCursor,
+            )
+        assertThat(second.files).hasSize(1)
+        assertThat(second.files.single().dataFileId).isGreaterThan(first.files.single().dataFileId)
+        assertThat(second.aggregates.reason).isEqualTo("continuation")
+        assertThat(second.nextCursor).isNull()
+        val missing = bounded.lookup(f.name, "ns", "t", f.specId, listOf("common", "missing"))
+        assertThat(missing.aggregates.totals!!.fileCount).isZero()
+        assertThat(missing.files).isEmpty()
+    }
+
+    @Test
     fun `candidate cap yields sparse advancing pages and never exact suffix totals`() {
         val f = PartitionLookupFixture(db)
         f.append(
             *List(7) { listOf("pivot", "unrelated") }.toTypedArray(),
+            *List(7) { listOf("other", "wanted") }.toTypedArray(),
             listOf("pivot", "wanted"),
             listOf("pivot", "wanted"),
         )
@@ -243,7 +276,7 @@ class PartitionLookupServiceIntegrationTest {
         do {
             val got = bounded.lookup(f.name, "ns", "t", f.specId, listOf("pivot", "wanted"), limit = 1, cursor = cursor)
             assertThat(got.aggregates.status).isEqualTo("unavailable")
-            assertThat(got.aggregates.reason).isEqualTo("candidate_scan_limit")
+            assertThat(got.aggregates.reason).isEqualTo(if (cursor == null) "candidate_scan_limit" else "continuation")
             assertThat(got.aggregates.totals).isNull()
             if (got.files.isEmpty()) emptyPages++
             seen += got.files.map { it.dataFileId }
@@ -291,7 +324,9 @@ class PartitionLookupServiceIntegrationTest {
         val second = service.lookup(f.name, "ns", "t", f.specId, listOf("a", "b"), limit = 1, cursor = first.nextCursor)
         assertThat(second.snapshotId).isEqualTo(frozen)
         assertThat(second.files).hasSize(1)
-        assertThat(second.aggregates.totals!!.fileCount).isEqualTo(3)
+        assertThat(second.aggregates.status).isEqualTo("unavailable")
+        assertThat(second.aggregates.reason).isEqualTo("continuation")
+        assertThat(second.aggregates.totals).isNull()
         assertThatThrownBy {
             service.lookup(f.name, "ns", "t", f.specId, listOf("a", null), limit = 1, cursor = first.nextCursor)
         }.isInstanceOf(PartitionLookupInvalidRequest::class.java)
@@ -300,6 +335,29 @@ class PartitionLookupServiceIntegrationTest {
         }.isInstanceOf(PartitionLookupInvalidRequest::class.java)
         assertThatThrownBy {
             service.lookup(f.name, "ns", "t", f.specId, listOf("a", "b"), limit = 2, cursor = first.nextCursor)
+        }.isInstanceOf(PartitionLookupInvalidRequest::class.java)
+        val originalCursor = PartitionLookupCursor.parse(first.nextCursor!!)
+        assertThatThrownBy {
+            service.lookup(
+                f.name,
+                "ns",
+                "t",
+                f.specId,
+                listOf("a", "b"),
+                limit = 2,
+                cursor = originalCursor.copy(limit = 2).encode(),
+            )
+        }.isInstanceOf(PartitionLookupInvalidRequest::class.java)
+        assertThatThrownBy {
+            service.lookup(
+                f.name,
+                "ns",
+                "t",
+                f.specId,
+                listOf("a", "b"),
+                limit = 1,
+                cursor = originalCursor.copy(snapshot = frozen - 1).encode(),
+            )
         }.isInstanceOf(PartitionLookupInvalidRequest::class.java)
         assertThatThrownBy {
             service.lookup(
@@ -361,6 +419,7 @@ class PartitionLookupServiceIntegrationTest {
         val f = PartitionLookupFixture(db)
         f.append(
             *List(7) { listOf("pivot", "other") }.toTypedArray(),
+            *List(7) { listOf("other", "wanted") }.toTypedArray(),
             listOf("pivot", "wanted"),
             listOf("pivot", "wanted"),
         )
@@ -429,6 +488,65 @@ class PartitionLookupServiceIntegrationTest {
     }
 
     @Test
+    fun `one catalog cannot occupy both lookup permits`() {
+        val f = PartitionLookupFixture(db)
+        val other = PartitionLookupFixture(db)
+        f.append(listOf("a", "b"))
+        other.append(listOf("a", "b"))
+        val arrived = CountDownLatch(1)
+        val proceed = CountDownLatch(1)
+        val blocked = AtomicBoolean()
+        val instrumented = Database.jdbi(db.dataSource)
+        instrumented.setSqlLogger(
+            object : SqlLogger {
+                override fun logBeforeExecution(context: StatementContext) {
+                    if (context.rawSql.contains("WITH probes AS MATERIALIZED") && blocked.compareAndSet(false, true)) {
+                        arrived.countDown()
+                        check(proceed.await(5, TimeUnit.SECONDS))
+                    }
+                }
+            },
+        )
+        val bounded = PartitionLookupService(instrumented)
+        Executors.newSingleThreadExecutor().use { executor ->
+            val first = executor.submit { bounded.lookup(f.name, "ns", "t", f.specId, listOf("a", "b")) }
+            try {
+                assertThat(arrived.await(5, TimeUnit.SECONDS)).isTrue()
+                val before = db.dataSource.hikariPoolMXBean.activeConnections
+                assertThatThrownBy { bounded.lookup(f.name, "ns", "t", f.specId, listOf("a", "b")) }
+                    .isInstanceOf(PartitionLookupUnavailable::class.java).extracting("reason").isEqualTo("busy")
+                assertThat(db.dataSource.hikariPoolMXBean.activeConnections).isEqualTo(before)
+                assertThat(bounded.lookup(other.name, "ns", "t", other.specId, listOf("a", "b")).files).hasSize(1)
+            } finally {
+                proceed.countDown()
+            }
+            first.get(5, TimeUnit.SECONDS)
+        }
+        assertThat(bounded.lookup(f.name, "ns", "t", f.specId, listOf("a", "b")).files).hasSize(1)
+    }
+
+    @Test
+    fun `lookup statements share one transaction time budget and release admission after termination`() {
+        val f = PartitionLookupFixture(db)
+        f.append(listOf("a", "b"))
+        val instrumented = Database.jdbi(db.dataSource)
+        instrumented.setSqlLogger(
+            object : SqlLogger {
+                override fun logBeforeExecution(context: StatementContext) {
+                    if (context.rawSql.trimStart().startsWith("SELECT")) Thread.sleep(180)
+                }
+            },
+        )
+        val bounded = PartitionLookupService(instrumented, statementTimeoutMs = 300)
+        val started = System.nanoTime()
+        assertThatThrownBy { bounded.lookup(f.name, "ns", "t", f.specId, listOf("a", "b")) }
+            .isInstanceOf(PartitionLookupUnavailable::class.java).extracting("reason").isEqualTo("timeout")
+        assertThat(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started)).isLessThan(1000)
+        instrumented.setSqlLogger(SqlLogger.NOP_SQL_LOGGER)
+        assertThat(bounded.lookup(f.name, "ns", "t", f.specId, listOf("a", "b")).files).hasSize(1)
+    }
+
+    @Test
     fun `admission rejects before borrowing and timed-out lookup releases connection and permit`() {
         val f = PartitionLookupFixture(db)
         f.append(listOf("a", "b"))
@@ -438,7 +556,7 @@ class PartitionLookupServiceIntegrationTest {
         instrumented.setSqlLogger(
             object : SqlLogger {
                 override fun logBeforeExecution(context: StatementContext) {
-                    if (context.rawSql.contains("WITH candidates AS MATERIALIZED")) {
+                    if (context.rawSql.contains("WITH probes AS MATERIALIZED")) {
                         arrived.countDown()
                         check(proceed.await(5, TimeUnit.SECONDS))
                     }

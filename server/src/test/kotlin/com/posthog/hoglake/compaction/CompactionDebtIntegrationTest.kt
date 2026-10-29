@@ -173,8 +173,7 @@ class CompactionDebtIntegrationTest {
             val all = nodes(plan)
             val indexes =
                 all.filter {
-                    it.path("Index Name").asText() in
-                        setOf("hog_delete_file_data_lookup", "hog_delete_file_snapshot_lookup")
+                    it.path("Index Name").asText() == "hog_delete_file_snapshot_lookup"
                 }
             assertThat(indexes).describedAs("catalog/file lookup: %s", plan).isNotEmpty()
             for (index in indexes) {
