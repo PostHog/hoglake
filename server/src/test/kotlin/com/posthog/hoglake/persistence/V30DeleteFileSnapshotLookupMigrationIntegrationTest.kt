@@ -18,8 +18,8 @@ import java.util.concurrent.TimeUnit
 
 @Tag("integration")
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
-class V29DeleteFileSnapshotLookupMigrationIntegrationTest {
-    private val db = PgTestSupport.freshDatabaseAt("28", productionSession = true)
+class V30DeleteFileSnapshotLookupMigrationIntegrationTest {
+    private val db = PgTestSupport.freshDatabaseAt("29", productionSession = true)
     private val f = PartitionLookupFixture(db)
     private val neighbour = PartitionLookupFixture(db)
     private val tuple = listOf("a", "b")
@@ -58,10 +58,10 @@ class V29DeleteFileSnapshotLookupMigrationIntegrationTest {
                     h ->
                 h.createQuery("SELECT pg_relation_size('$index')").mapTo(Long::class.javaObjectType).one()
             }
-        println("V29 build_ms=$elapsed index_bytes=$bytes bytes_per_version=${bytes / 200000.0}")
+        println("V30 build_ms=$elapsed index_bytes=$bytes bytes_per_version=${bytes / 200000.0}")
         for ((label, plan) in listOf("before" to before, "after" to after)) {
             println(
-                "V29 $label buffers=${buffers(plan)} elapsed_ms=${plan["Execution Time"]} dv_nodes=${dvNodes(plan)}",
+                "V30 $label buffers=${buffers(plan)} elapsed_ms=${plan["Execution Time"]} dv_nodes=${dvNodes(plan)}",
             )
         }
     }
@@ -157,7 +157,7 @@ class V29DeleteFileSnapshotLookupMigrationIntegrationTest {
             }
         db.jdbi.useHandleUnchecked { h ->
             h.execute("UPDATE pg_index SET indisvalid = false WHERE indexrelid = '$index'::regclass")
-            h.execute("DELETE FROM flyway_schema_history WHERE version = '29'")
+            h.execute("DELETE FROM flyway_schema_history WHERE version = '30'")
         }
         Database.migrate(db.dataSource)
         db.jdbi.useHandleUnchecked { h ->
@@ -176,7 +176,7 @@ class V29DeleteFileSnapshotLookupMigrationIntegrationTest {
             ).isEqualTo(bounds)
         }
         assertThat(
-            File("src/main/resources/db/migration/V29__delete_file_snapshot_lookup.sql.conf").readText(),
+            File("src/main/resources/db/migration/V30__delete_file_snapshot_lookup.sql.conf").readText(),
         ).contains("executeInTransaction=false")
     }
 }

@@ -176,8 +176,8 @@ export function PartitionLookupPanel({ catalog, namespace, table, defaultSpecId,
         if (query.isFetchNextPageError) void query.fetchNextPage();
         else void query.refetch();
       }} />}
-      {request && !first && !query.isError && <SkeletonBlock />}
-      {request && first && pinnedSnapshot && (
+      {request && (!first || request.snapshot === undefined) && !query.isError && <SkeletonBlock />}
+      {request && request.snapshot !== undefined && first && pinnedSnapshot && (
         <>
           <p>Snapshot <SnapshotId catalog={catalog} id={pinnedSnapshot} /> · spec <span className="mono">{first.spec_id}</span> · tuple <code>{JSON.stringify(first.values)}</code>{" "}
             <CopyButton text={`${window.location.origin}${location.pathname}${location.search}`} label="partition link" />{" "}

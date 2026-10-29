@@ -3,8 +3,9 @@ import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider, focusManager, onlineManager } from "@tanstack/react-query";
 import { MemoryRouter, useLocation, useNavigate } from "react-router-dom";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { PartitionLookupPanel } from "../src/components/PartitionLookupPanel";
+import * as CopyButtonModule from "../src/components/CopyButton";
 import type { PartitionLookup } from "../src/api/types";
 import { parsePartitionLookupInput, readPartitionLookupRequest } from "../src/lib/partitionLookup";
 import { filesFixture } from "./fixtures";
@@ -14,6 +15,8 @@ const base = "/v1/catalogs/analytics/namespaces/events/tables/pageviews/partitio
 const route = "/catalogs/analytics/namespaces/events/tables/pageviews";
 const tuple = [null, "", "null"];
 const big = "9007199254740993";
+
+afterEach(() => vi.restoreAllMocks());
 
 function link(values = tuple, snapshot?: string, spec = "1"): string {
   const params = new URLSearchParams({ tab: "partitions", lookup: "1", lookup_spec: spec, lookup_values: JSON.stringify(values) });
@@ -97,6 +100,7 @@ describe("exact partition lookup input", () => {
 
 describe("PartitionLookupPanel", () => {
   it("submits only on request, pins head once, preserves raw values and inspector snapshot", async () => {
+    const copyButtons = vi.spyOn(CopyButtonModule, "CopyButton");
     const urls = fetches(() => jsonResponse(page({ spec_id: big })));
     const { user } = setup();
     await user.type(screen.getByLabelText("Spec ID"), big);
@@ -105,7 +109,12 @@ describe("PartitionLookupPanel", () => {
     expect(urls).toHaveLength(0);
     await user.click(screen.getByRole("button", { name: "Inspect partition" }));
     await screen.findByText("s3://bucket/original.parquet");
-    await waitFor(() => expect(screen.getByTestId("location")).toHaveTextContent(`snapshot=${big}`));
+    const partitionLinks = copyButtons.mock.calls.filter(([props]) => props.label === "partition link");
+    expect(partitionLinks.length).toBeGreaterThan(0);
+    for (const [props] of partitionLinks) {
+      expect(new URL(props.text).searchParams.get("snapshot")).toBe(big);
+    }
+    expect(screen.getByTestId("location")).toHaveTextContent(`snapshot=${big}`);
     expect(urls).toHaveLength(1);
     const request = new URL(urls[0], "http://localhost").searchParams;
     expect(request.get("spec_id")).toBe(big);
@@ -268,7 +277,7 @@ describe("PartitionLookupPanel", () => {
     expect(screen.queryByText("s3://bucket/original.parquet")).not.toBeInTheDocument();
     await act(async () => { resolve(jsonResponse(page({ snapshot_id: "9007199254740995", files: [] }))); await delayed; });
     await screen.findByText("No files in this partition at this snapshot.");
-    expect(screen.getByTestId("location")).toHaveTextContent("snapshot=9007199254740995");
+    await waitFor(() => expect(screen.getByTestId("location")).toHaveTextContent("snapshot=9007199254740995"));
     expect(urls).toHaveLength(2);
   });
 
@@ -288,13 +297,13 @@ describe("PartitionLookupPanel", () => {
     expect(urls).toHaveLength(2);
     await user.click(screen.getByRole("button", { name: "Retry inspection" }));
     await screen.findByText("No files in this partition at this snapshot.");
-    expect(screen.getByTestId("location")).toHaveTextContent("snapshot=9007199254740995");
+    await waitFor(() => expect(screen.getByTestId("location")).toHaveTextContent("snapshot=9007199254740995"));
     expect(urls).toHaveLength(3);
   });
 
   it("resets the inspector and cursor when changing the lookup identity", async () => {
     const urls = fetches((params) => jsonResponse(page({ snapshot_id: params.get("snapshot") ?? big, spec_id: params.get("spec_id")!, values: JSON.parse(params.get("values")!) })));
-    const { user } = setup(link());
+    const { user } = setup(link(tuple, big));
     await user.click(await screen.findByRole("button", { name: "Inspect file 71" }));
     expect(screen.getByText(`Inspector 71 at ${big}`)).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Different lookup" }));

@@ -7,7 +7,7 @@
 -- This index is paid only on DV registration, not ordinary data-file
 -- appends. It grows by one entry per retained DV version; the existing
 -- snapshot-expiry purge removes those entries with their owning rows.
--- V29DeleteFileSnapshotLookupMigrationIntegrationTest measures the build,
+-- V30DeleteFileSnapshotLookupMigrationIntegrationTest measures the build,
 -- index bytes and before/after production query on interleaved histories.
 -- PG18 fixture: 200,000 versions, two interleaved catalogs, 100,000 per
 -- file. At the middle snapshot the old changefeed/bitmap path examined
