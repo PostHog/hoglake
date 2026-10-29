@@ -627,7 +627,11 @@ The rules. Every one of them was violated by the code above.
   transaction, has a row bound and a `SET LOCAL statement_timeout`
   smaller than the lock's fair share. Loops of bounded steps, each its
   own transaction, with a run budget and a pause (the retirement
-  shape), never one statement that is "done when it is done".
+  shape), never one statement that is "done when it is done". A read
+  that takes several statements to answer one request (partition
+  lookup) takes one deadline before it borrows a connection and sets
+  each statement's timeout to the time remaining, so the bound is per
+  request, not per statement.
 - **Never hold a transaction across non-database work.** Parquet I/O,
   object-store calls, in-memory sorting and packing, HTTP calls: all
   of it happens between transactions, never inside one. Read what you
@@ -1837,8 +1841,10 @@ suite — `./gradlew :test -PpgImage=postgres:19` (or
 it breaks statistics views that moved columns, which only an integration
 run can see. The suite, the dev compose stack and the CI image-smoke
 service all run **Postgres 18** as of 2026-09-18 (moved from 16); the
-override runs backwards too (`-PpgImage=postgres:16`), which is how a
-failure gets attributed to the version rather than to the environment.
+override runs backwards too, down to **Postgres 17**
+(`-PpgImage=postgres:17`), which is how a failure gets attributed to the
+version rather than to the environment. 17 is the floor: partition
+lookup sets `transaction_timeout`, which 16 does not have.
 Two things the test suite cannot see, and a future move must check by
 hand: the docker-library image's PGDATA path (18 moved it to
 `/var/lib/postgresql/18/docker` and the VOLUME to the parent, so a
