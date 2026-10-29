@@ -34,7 +34,7 @@ Notable surfaces beyond the catalog browser:
   and average size, deletion vectors, rows, and the snapshot that last
   wrote to it — with a filter box per partition key (matching the
   DECODED value by prefix, so `2026-09` finds every day of that month)
-  and a link from each row into the files tab filtered to it. Each key
+  and a link from each partitioned row into exact inspection under its spec. Each key
   also carries an explicit "is null" toggle, because the null partition
   value has no text to prefix-match and an empty box means unfiltered.
   THE NUMBERS ARE A SAMPLE, not a live read: they come from the
@@ -47,6 +47,20 @@ Notable surfaces beyond the catalog browser:
   the sampler has not published for yet says so instead of showing
   zeroes. Rows and last-written are blank rather than 0 on a sample
   taken before the server measured them.
+- **Exact partition inspection** (`partitions` tab, `lookup=1`): enter
+  a spec ID and the complete stored tuple as a JSON array of strings or
+  nulls. No maintenance sample is required. Leave snapshot blank to
+  resolve head once; the shareable URL, file pages, and file inspector
+  then use that resolved snapshot (`lookup_snapshot`) without changing the
+  page-wide snapshot used by Schema and Files. The separate `lookup_at`
+  parameter preserves the form's requested snapshot (`head` for blank), so
+  resolving head does not pin the next tuple's input. Cached pinned file
+  pages are reused on remount; Inspect at head explicitly starts a fresh
+  lookup. Totals show physical rows without
+  subtracting deletion vectors. When the aggregate budget is exceeded,
+  totals are unavailable and bounded file paging continues, including
+  through empty candidate windows. Busy and timed-out requests require
+  an explicit retry; an expired snapshot offers inspection at head.
 - **Compaction debt** (`/catalogs/:catalog/partitions`): leaf
   partitions ranked by `debt_score` (files the planner would bin-pack
   into a group; excludes groups under their minimum), with small-file

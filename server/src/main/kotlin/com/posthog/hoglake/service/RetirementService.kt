@@ -1194,7 +1194,7 @@ class RetirementService(
          * for the same reason.
          *
          * `data_file_id = ANY(:victims)` is served by
-         * `hog_delete_file_data_lookup` (V2, non-partial on
+         * `hog_delete_file_snapshot_lookup` (non-partial with prefix
          * `(catalog_id, data_file_id)`) — the partial
          * `one_live_per_data_file` index could not serve a statement
          * that carries no `end_snapshot` predicate.
@@ -1222,7 +1222,7 @@ class RetirementService(
          * batch of the table. The RETURNING form leaves the WHERE as it
          * was, so the plan is the one `V20RetirementMigrationIntegrationTest`
          * pins against a populated hog_delete_file: the driver is
-         * `hog_delete_file_data_lookup`, and nothing is filtered.
+         * `hog_delete_file_snapshot_lookup`, and nothing is filtered.
          *
          * A vector whose `table_id` DISAGREES with its data file's (a
          * row `CommitService` refuses to write, and the schema does not
@@ -1259,8 +1259,8 @@ class RetirementService(
          * size of the relations rather than in the size of the batch
          * times them: `hog_file_column_stats` and
          * `hog_file_partition_value` on their primary keys, and
-         * `hog_delete_file` on `hog_delete_file_data_lookup`
-         * (V2__maintenance.sql, non-partial on `(catalog_id,
+         * `hog_delete_file` on `hog_delete_file_snapshot_lookup`
+         * (non-partial with prefix `(catalog_id,
          * data_file_id)`). That last one is the non-obvious of the
          * three — the partial `one_live_per_data_file` index could not
          * serve an RI query that carries no `end_snapshot` predicate —

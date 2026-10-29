@@ -782,8 +782,9 @@ CREATE INDEX hog_data_file_maintenance_scan
 -- because that is the order compaction bin-packs in.
 CREATE INDEX hog_data_file_maintenance_size_scan
     ON hog_data_file (catalog_id, table_id, file_size_bytes, data_file_id);
-CREATE INDEX hog_delete_file_data_lookup
-    ON hog_delete_file (catalog_id, data_file_id);
+-- Ordered retained-history seek; end_snapshot is checked after LIMIT 1.
+CREATE INDEX hog_delete_file_snapshot_lookup
+    ON hog_delete_file (catalog_id, data_file_id, begin_snapshot DESC, delete_file_id DESC);
 
 -- Changefeed windows range on begin_snapshot over ALL files (dead ones
 -- included — replay semantics); hog_data_file_live is partial on

@@ -482,7 +482,7 @@ class CompactionBucketProbePlanIntegrationTest {
      * pages. The join is a nested loop at any result size (the outer
      * estimate is the Param-array default, ~3 rows; see
      * `CompactionService.candidateSql` regime (c)), and each probe is a
-     * descent of `hog_delete_file_data_lookup` plus the heap page of a
+     * descent of `hog_delete_file_snapshot_lookup` plus the heap page of a
      * match — [perProbe], like every other probe here. Measured with
      * ~133k live DVs seeded: 3.4 buffers per returned row (169 for 50,
      * 27,700 for 8,193).

@@ -427,7 +427,7 @@ class ExpiryService(
          *     FK's `ON DELETE CASCADE` (`V1__init.sql`) whatever its own
          *     state, and a cascaded delete queues nothing — a
          *     permanently leaked puffin object with no row left to find
-         *     it. Driven by `hog_delete_file_data_lookup
+         *     it. Driven by `hog_delete_file_snapshot_lookup
          *     (catalog_id, data_file_id)`, so it is an index probe per
          *     deleted row rather than a scan.
          *

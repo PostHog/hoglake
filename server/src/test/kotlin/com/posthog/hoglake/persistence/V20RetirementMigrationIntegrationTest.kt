@@ -427,8 +427,9 @@ class V20RetirementMigrationIntegrationTest {
         // superseded vector must go too, or the data-file cascade takes
         // it away un-queued — so the PARTIAL
         // `hog_delete_file_one_live_per_data_file` cannot serve it. It
-        // does not have to: `hog_delete_file_data_lookup` (V2) is
-        // non-partial on exactly `(catalog_id, data_file_id)`, which is
+        // does not have to: V32 replaces V2's narrower index with
+        // `hog_delete_file_snapshot_lookup`, non-partial with prefix
+        // `(catalog_id, data_file_id)`, which is
         // both this statement's key and the FK cascade's. The table
         // guard (#264) is in the RETURNING for this reason: as a
         // `table_id` predicate it handed the planner
@@ -442,7 +443,7 @@ class V20RetirementMigrationIntegrationTest {
             .doesNotContain("end_snapshot")
         assertThat(driverIndex(dvDeletePlan, "hog_delete_file"))
             .describedAs("the DV delete must probe by data_file_id, not walk the table's vectors:%n%s", dvDeletePlan)
-            .isEqualTo("hog_delete_file_data_lookup")
+            .isEqualTo("hog_delete_file_snapshot_lookup")
         assertThat(dvDeletePlan)
             .describedAs("a per-batch sequential scan is the shape this excludes:%n%s", dvDeletePlan)
             .doesNotContain("Seq Scan on hog_delete_file")

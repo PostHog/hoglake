@@ -2,6 +2,8 @@ package com.posthog.hoglake.api
 
 import com.posthog.hoglake.auth.bearerChallenge
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.PartitionLookupInvalidRequest
+import com.posthog.hoglake.model.PartitionLookupUnavailable
 import com.posthog.hoglake.service.CorruptDefinitionException
 import io.github.oshai.kotlinlogging.KotlinLogging
 import io.ktor.http.HttpHeaders
@@ -74,6 +76,10 @@ private val log = KotlinLogging.logger("com.posthog.hoglake.api.ErrorMapping")
 
 internal fun errorBody(cause: HoglakeException): Pair<HttpStatusCode, ApiErrorDto> =
     when (cause) {
+        is PartitionLookupInvalidRequest -> HttpStatusCode.BadRequest to apiError("bad_request", cause)
+        is PartitionLookupUnavailable ->
+            HttpStatusCode.ServiceUnavailable to
+                apiError("partition_lookup_unavailable", cause).copy(reason = cause.reason)
         is HoglakeException.NotFound -> HttpStatusCode.NotFound to apiError("not_found", cause)
         is HoglakeException.AlreadyExists -> HttpStatusCode.Conflict to apiError("already_exists", cause)
         is HoglakeException.ReconciliationRequired ->
@@ -140,7 +146,7 @@ internal fun errorBody(cause: HoglakeException): Pair<HttpStatusCode, ApiErrorDt
 fun StatusPagesConfig.installErrorMapping() {
     exception<HoglakeException> { call, cause ->
         val (status, body) = errorBody(cause)
-        if (cause is HoglakeException.CommitQueueTimeout) {
+        if (cause is HoglakeException.CommitQueueTimeout || cause is PartitionLookupUnavailable) {
             call.response.headers.append(HttpHeaders.RetryAfter, RETRY_AFTER_SECONDS)
         }
         if (cause is HoglakeException.Unauthenticated) {
