@@ -1830,6 +1830,16 @@ data class HydratorSweepResult(
      */
     @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
     val statsSkippedBelowFloor: Long = 0,
+    /**
+     * Of [hydrated], the files of a table with the object-prefix layout
+     * whose footer did not prove that every row holds the value their
+     * prefix names ([ObjectPrefix.checkFieldStats]): flipped to
+     * `provided` with `prefix_quarantined` set, below the floor or not.
+     * Always <= [hydrated]. Defaulted and NON_DEFAULT for
+     * [statsSkippedBelowFloor]'s reason.
+     */
+    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    val quarantined: Long = 0,
 )
 
 /** One cleanup drain's outcome. */

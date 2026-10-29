@@ -322,6 +322,12 @@ CREATE TABLE hog_data_file (
     -- [0, file_size_bytes), at most 100,000 entries) is enforced in
     -- code by model/SplitOffsets.kt, not by a CHECK.
     split_offsets   bigint[],
+    -- V30: set by the hydrator when a deferred-stats file of a table with
+    -- the object-prefix layout (hog_table_layout) flips to 'provided' but
+    -- its footer does not prove every row holds its prefix value. A
+    -- reader of such a table includes only `stats_state = 'provided' AND
+    -- NOT prefix_quarantined` (model/ObjectPrefix.kt).
+    prefix_quarantined boolean NOT NULL DEFAULT false,
     PRIMARY KEY (catalog_id, data_file_id),
     FOREIGN KEY (catalog_id, table_id) REFERENCES hog_table ON DELETE CASCADE,
     CHECK (end_snapshot IS NULL OR end_snapshot > begin_snapshot)
@@ -360,6 +366,10 @@ CREATE INDEX hog_data_file_failed
 CREATE INDEX hog_data_file_missing_field_ids
     ON hog_data_file (catalog_id, table_id)
     WHERE missing_field_ids AND end_snapshot IS NULL;
+-- V31: the fourth attention index, for hoglake_object_prefix_quarantined_files.
+CREATE INDEX hog_data_file_prefix_quarantined
+    ON hog_data_file (catalog_id, table_id)
+    WHERE prefix_quarantined AND end_snapshot IS NULL;
 
 -- Per-file, per-column zone maps. Bounds are stored in Iceberg
 -- single-value binary serialization (opaque to Postgres) so manifest

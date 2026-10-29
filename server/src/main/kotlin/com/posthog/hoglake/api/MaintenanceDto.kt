@@ -363,9 +363,10 @@ private fun normalizeLedgerResult(
 
 /**
  * Hydrator sweep counters added after the ledger started recording
- * (`stats_skipped_below_floor`, #432). Append-only, like the others.
+ * (`stats_skipped_below_floor`, #432; `quarantined`, the object-prefix
+ * check). Append-only, like the others.
  */
-private val HYDRATOR_COUNTERS_ADDED_LATER = listOf("stats_skipped_below_floor")
+private val HYDRATOR_COUNTERS_ADDED_LATER = listOf("stats_skipped_below_floor", "quarantined")
 
 /**
  * Compaction result counters added after the ledger started recording.

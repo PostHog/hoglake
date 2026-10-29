@@ -234,7 +234,9 @@ data class Config(
      * still read, and it flips to `provided` with `missing_field_ids`
      * (the field-id audit flag) and `split_offsets` set, but with NO
      * `hog_file_column_stats` rows, which readers already treat as no
-     * bounds. That read buys only the flag and the offsets: since #445
+     * bounds. That read buys the flag, the offsets and, on an
+     * object-prefix table, the prefix proof (the hydrator's quarantine
+     * check runs before the floor): since #445
      * the DDL guard refuses over FLAGGED files alone, so a file left
      * `pending` holds nothing up. 0 writes rows for every file (the
      * behaviour before the floor); negative is refused. Default 1 MiB.

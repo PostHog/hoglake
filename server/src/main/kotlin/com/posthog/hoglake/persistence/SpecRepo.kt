@@ -42,26 +42,37 @@ object SpecRepo {
                 .mapTo(Long::class.javaObjectType)
                 .findOne()
                 .orElse(null) ?: return null
-        val fields =
-            h.createQuery(
-                """
+        return PartitionSpec(specId, fields(h, catalogId, tableId, specId))
+    }
+
+    /**
+     * The fields of the table's spec [specId], by key_index, whether the
+     * spec is live or retired (retired specs are never cleared): what a
+     * file written under it names by `spec_id`.
+     */
+    fun fields(
+        h: Handle,
+        catalogId: Long,
+        tableId: Long,
+        specId: Long,
+    ): List<PartitionFieldDef> =
+        h.createQuery(
+            """
             SELECT source_field_id, transform, transform_param
             FROM hog_partition_field
             WHERE catalog_id = :catalogId AND table_id = :tableId AND spec_id = :specId
             ORDER BY key_index
             """,
-            )
-                .bind("catalogId", catalogId)
-                .bind("tableId", tableId)
-                .bind("specId", specId)
-                .map { rs, _ ->
-                    PartitionFieldDef(
-                        sourceFieldId = rs.getLong("source_field_id"),
-                        transform = Transform.fromWire(rs.getString("transform")),
-                        transformParam = rs.getObject("transform_param")?.let { (it as Number).toInt() },
-                    )
-                }
-                .list()
-        return PartitionSpec(specId, fields)
-    }
+        )
+            .bind("catalogId", catalogId)
+            .bind("tableId", tableId)
+            .bind("specId", specId)
+            .map { rs, _ ->
+                PartitionFieldDef(
+                    sourceFieldId = rs.getLong("source_field_id"),
+                    transform = Transform.fromWire(rs.getString("transform")),
+                    transformParam = rs.getObject("transform_param")?.let { (it as Number).toInt() },
+                )
+            }
+            .list()
 }

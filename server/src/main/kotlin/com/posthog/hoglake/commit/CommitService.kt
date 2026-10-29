@@ -1459,13 +1459,14 @@ class CommitService(
      *    `"042"`, `"+4"` and an out-of-range value are all refused;
      *  - sit under that value's prefix ([ObjectPrefix.isUnder]), which is
      *    what keeps `team_id=4/` from admitting `team_id=42/`;
-     *  - ship its stats inline. Deferred stats register the file as
-     *    `pending`, and until the hydrator checks a pending file's footer
-     *    against the layout nothing would: refused as a stop-gap;
-     *  - prove with those stats that every row holds the value
+     *  - prove with its inline stats that every row holds the value
      *    ([ObjectPrefix.checkFieldStats]: both bounds equal to it, no
      *    nulls). A zero-row file therefore cannot register, since its
-     *    bounds are dropped.
+     *    bounds are dropped. A file with DEFERRED stats has none to prove
+     *    it with: it registers `pending`, and the hydrator makes the same
+     *    proof from its footer, quarantining a file that fails it
+     *    (`hog_data_file.prefix_quarantined`). A pending file is outside
+     *    a per-value read until then, by its state.
      *
      * Violations are collected rather than thrown at the first, so the
      * one 422 names up to five paths, each with the prefix it should have
@@ -1498,12 +1499,8 @@ class CommitService(
                 violations += "${file.path} (expected under $prefix)"
                 continue
             }
-            val stats = file.columnStats
-            if (stats == null) {
-                violations += "${file.path} (registered without column_stats: deferred stats are not accepted " +
-                    "on a table with the object-prefix layout, ship the footer's stats inline)"
-                continue
-            }
+            // Deferred stats: the hydrator checks the footer (KDoc above).
+            val stats = file.columnStats ?: continue
             val verdict =
                 ObjectPrefix.checkFieldStats(layout, value, stats.firstOrNull { it.fieldId == layout.fieldId })
             if (verdict != ObjectPrefix.Verdict.OK) {
