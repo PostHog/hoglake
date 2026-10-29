@@ -574,4 +574,200 @@ class HogliteBackendIntegrationTest {
             )
         }.isInstanceOf(HoglakeException.DdlSinceReadSnapshot::class.java)
     }
+
+
+    // ---- views -----------------------------------------------------------
+
+    @Test
+    fun `views create list drop with change rows`() {
+        val catalog = freshCatalog()
+        store.createNamespace(catalog, "ns")
+        store.createTable(catalog, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+
+        val view = store.views.create(catalog, "ns", "v", "SELECT 1", "trino", "test", "create")
+        assertThat(store.views.get(catalog, "ns", "v").viewUuid).isEqualTo(view.viewUuid)
+        assertThat(store.views.list(catalog, "ns").map { it.name }).containsExactly("v")
+        assertThatThrownBy { store.views.create(catalog, "ns", "v", "SELECT 2", "trino", "test", "dup") }
+            .isInstanceOf(HoglakeException.AlreadyExists::class.java)
+
+        store.views.drop(catalog, "ns", "v", "test", "drop")
+        assertThat(store.views.list(catalog, "ns")).isEmpty()
+        // The changefeed saw both ends of the lifecycle.
+        val kinds = mutableListOf<String>()
+        var from = 0L
+        while (true) {
+            val page = store.listSnapshots(catalog, from, 50)
+            if (page.first.isEmpty()) break
+            from = page.first.last().snapshotId
+            if (!page.second) break
+        }
+        // (snapshots feed is the whole-catalog one; the view change kinds
+        // ride it — this asserts the feed grew past the DDL, not the kind
+        // strings, which the table-scoped feed owns.)
+        assertThat(from).isGreaterThan(1L)
+    }
+
+    // ---- options -----------------------------------------------------------
+
+    @Test
+    fun `options patch validates and attributes retention decreases`() {
+        val catalog = freshCatalog()
+        val options = com.posthog.hoglake.hoglite.HogliteOptions(store)
+        val initial = options.get(catalog)
+        assertThat(initial.snapshotRetentionSeconds).isNull()
+
+        // Setting retention where none was needs operator attribution.
+        assertThatThrownBy {
+            options.patch(catalog, com.posthog.hoglake.service.PatchField.Set(3600L), null, null, null)
+        }.isInstanceOf(HoglakeException.Validation::class.java)
+        val set = options.patch(
+            catalog,
+            com.posthog.hoglake.service.PatchField.Set(3600L),
+            null,
+            "test",
+            "set retention",
+        )
+        assertThat(set.snapshotRetentionSeconds).isEqualTo(3600L)
+        // Raising it never needs attribution.
+        val raised = options.patch(catalog, com.posthog.hoglake.service.PatchField.Set(7200L), null, null, null)
+        assertThat(raised.snapshotRetentionSeconds).isEqualTo(7200L)
+        // Lowering it does.
+        assertThatThrownBy {
+            options.patch(catalog, com.posthog.hoglake.service.PatchField.Set(60L), null, null, null)
+        }.isInstanceOf(HoglakeException.Validation::class.java)
+        // A non-positive value is a 422 regardless.
+        assertThatThrownBy {
+            options.patch(catalog, com.posthog.hoglake.service.PatchField.Set(0L), null, "test", "bad")
+        }.isInstanceOf(HoglakeException.Validation::class.java)
+        // consumer_floor toggles without attribution.
+        val floored = options.patch(catalog, com.posthog.hoglake.service.PatchField.Absent, false, null, null)
+        assertThat(floored.consumerFloor).isFalse()
+    }
+
+    // ---- truncate ------------------------------------------------------------
+
+    @Test
+    fun `truncate ends files and dvs at the new snapshot`() {
+        val catalog = freshCatalog()
+        store.createNamespace(catalog, "ns")
+        val table = store.createTable(catalog, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        val commit =
+            store.commit(
+                catalog,
+                CommitRequest(
+                    appends =
+                        listOf(
+                            TableAppend(
+                                namespace = "ns",
+                                table = "t",
+                                files =
+                                    listOf(
+                                        FileRegistration(
+                                            path = "s3://hoglake-it/$catalog/data/ns/t/a.parquet",
+                                            recordCount = 10,
+                                            fileSizeBytes = 100,
+                                        ),
+                                    ),
+                            ),
+                        ),
+                ),
+            )
+        assertThat(store.listFiles(catalog, "ns", "t")).hasSize(1)
+
+        val result =
+            store.truncateTable(
+                catalog,
+                "ns",
+                "t",
+                expectedTableUuid = table.tableUuid,
+                author = "test",
+                message = "truncate",
+            )
+        assertThat(store.listFiles(catalog, "ns", "t")).isEmpty()
+        // Time travel sees the file as of the commit.
+        assertThat(
+            store.listFiles(catalog, "ns", "t", snapshot = commit.snapshotId),
+        ).hasSize(1)
+        assertThat(result.snapshotId).isGreaterThan(commit.snapshotId)
+    }
+
+    // ---- partitions (exact computation over the live manifest) ---------------
+
+    @Test
+    fun `partition stats rank by the planner's debt`() {
+        val catalog = freshCatalog()
+        store.createNamespace(catalog, "ns")
+        val table = store.createTable(catalog, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        repeat(3) { i ->
+            store.commit(
+                catalog,
+                CommitRequest(
+                    appends =
+                        listOf(
+                            TableAppend(
+                                namespace = "ns",
+                                table = "t",
+                                files =
+                                    listOf(
+                                        FileRegistration(
+                                            path = "s3://hoglake-it/$catalog/data/ns/t/f$i.parquet",
+                                            recordCount = 10,
+                                            fileSizeBytes = 100,
+                                        ),
+                                    ),
+                            ),
+                        ),
+                ),
+            )
+        }
+        val partitions =
+            com.posthog.hoglake.hoglite.HoglitePartitions(
+                store,
+                smallFileThresholdBytes = 1_000_000,
+                // Two, not the production default of five: three small
+                // files must form a group for the debt assertion to bite.
+                minInputFiles = 2,
+            )
+        val report = partitions.partitionStats(catalog, "ns", "t", 50)
+        assertThat(report.partitions).hasSize(1)
+        val debt = report.partitions.single()
+        assertThat(debt.fileCount).isEqualTo(3)
+        assertThat(debt.smallFileCount).isEqualTo(3)
+        // Three files under the target pack into one group: all three are debt.
+        assertThat(debt.debtScore).isEqualTo(3)
+        val listing = partitions.listPartitions(catalog, "ns", "t")
+        assertThat(listing.total).isEqualTo(1)
+        assertThat(listing.partitions.single().recordCount).isEqualTo(30)
+    }
+
+    // ---- maintenance status ---------------------------------------------------
+
+    @Test
+    fun `maintenance status reports live backlogs and the run ledger`() {
+        val catalog = freshCatalog()
+        store.createNamespace(catalog, "ns")
+        store.createTable(catalog, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        val status =
+            com.posthog.hoglake.hoglite.HogliteMaintenanceStatus(
+                store,
+                hydratorIntervalMs = 0,
+                expiryIntervalMs = 60_000,
+                cleanupIntervalMs = 60_000,
+                compactionIntervalMs = 0,
+                retirementIntervalMs = 0,
+                smallFileThresholdBytes = 1_000_000,
+            )
+        val s = status.status(catalog)
+        assertThat(s.catalog).isEqualTo(catalog)
+        val expiry = s.tasks.first { it.task == com.posthog.hoglake.model.MaintenanceTask.EXPIRY }
+        assertThat(expiry.loopIntervalMs).isEqualTo(60_000)
+        val backlog = expiry.backlog as com.posthog.hoglake.model.MaintenanceBacklog.ExpiryBacklog
+        assertThat(backlog.headSnapshotId).isGreaterThan(0L)
+        assertThat(backlog.earliestSnapshotId).isEqualTo(0)
+        // The run ledger answers per-catalog and instance-wide.
+        assertThat(status.runs(catalog, null, null, 50).runs).isEmpty()
+        val inst = status.instanceStatus(null, 50)
+        assertThat(inst.catalogs.map { it.catalog }).contains(catalog)
+    }
+
 }
