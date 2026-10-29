@@ -41,13 +41,11 @@ data class Config(
     val dbUser: String = env("HOGLAKE_DB_USER", "hoglake"),
     val dbPassword: String = env("HOGLAKE_DB_PASSWORD", "hoglake"),
     val dbPoolSize: Int = env("HOGLAKE_DB_POOL_SIZE", "10").toInt(),
-
-    // ---- hoglite backend (HOGLAKE_DATABASE=hoglite) -------------------
-
-    /**
-     * Base URL of the hoglite STANDARD pool's service (any replica;
-     * hoglite's owner-proxy forwards to the owning pod). Required when
-     * [database] is [DatabaseBackend.HOGLITE].
+    /*
+     * hoglite backend (HOGLAKE_DATABASE=hoglite). Base URL of the hoglite
+     * STANDARD pool's service (any replica; hoglite's owner-proxy forwards
+     * to the owning pod). Required when [database] is
+     * [DatabaseBackend.HOGLITE].
      */
     val hogliteUrl: String = env("HOGLAKE_HOGLITE_URL", ""),
     /**
@@ -94,6 +92,13 @@ data class Config(
      * gets first is `commit_queue_timeout`'s, not this.
      */
     val hogliteRetryBudgetMs: Long = env("HOGLAKE_HOGLITE_RETRY_BUDGET_MS", "8000").toLong(),
+    /*
+     * Prefix every hoglite tenant id with this deployment's name, so two
+     * hoglake deployments sharing one hoglite cluster never address the
+     * same tenant. Change it only before first boot: existing tenants
+     * keep the id they were created under.
+     */
+    val hogliteTenantPrefix: String = env("HOGLAKE_HOGLITE_TENANT_PREFIX", "hoglake-"),
     /**
      * Circuit breaker, per hoglite POOL (standard/whale — the two pools
      * fail independently, so the breaker is per pool and not global):

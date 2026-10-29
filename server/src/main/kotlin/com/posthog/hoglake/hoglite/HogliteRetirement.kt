@@ -99,6 +99,7 @@ internal class HogliteRetirement(
 
     private fun sweep(catalog: String): RetirementResult {
         val started = System.nanoTime()
+
         fun overBudget() = (System.nanoTime() - started) / 1_000_000 >= runBudgetMs
 
         // The ceiling, BEFORE any candidate work: when cleanup is this far
@@ -253,17 +254,19 @@ internal class HogliteRetirement(
         val foreign = dvRows.count { it[2].asLong() != candidate.tableId }
         if (foreign > 0) {
             return BatchOutcome.Stuck(
-                "$foreign deletion-vector rows on the batch belong to another table; refusing"
+                "$foreign deletion-vector rows on the batch belong to another table; refusing",
             )
         }
         val tx = HogliteTx()
         // The victim predicate rides every DELETE: a row that left the
-        // set between the read and the write (impossible under hoglite's
-        // serial writer, but the belt is cheap) fails the batch whole.
-        for ((i, dv) in dvRows.withIndex()) {
+        // set between the read and the write fails the batch whole. That
+        // window is REAL here — the read and the tx are separate
+        // requests; hoglite's serial writer only serializes the tx
+        // itself — and these guards are what closes it.
+        for (dv in dvRows) {
             tx.add(
                 "INSERT INTO removals(path, file_kind, reason, queued_snapshot, queued_at) " +
-                    "VALUES (?, 'delete', '${REASON}', ?, ?)",
+                    "VALUES (?, 'delete', '$REASON', ?, ?)",
                 dv[1].asString(),
                 floor,
                 HogliteSchema.now(),
@@ -273,15 +276,14 @@ internal class HogliteRetirement(
                 dv[0].asLong(),
             ) {
                 com.posthog.hoglake.model.HoglakeException.CommitConflict(
-                    "retirement DV row ${dv[0].asLong()} vanished mid-batch"
+                    "retirement DV row ${dv[0].asLong()} vanished mid-batch",
                 )
             }
-            i // index unused; the loop shape mirrors the file arm
         }
         for (victim in victims) {
             tx.add(
                 "INSERT INTO removals(path, file_kind, reason, queued_snapshot, queued_at) " +
-                    "VALUES (?, 'data', '${REASON}', ?, ?)",
+                    "VALUES (?, 'data', '$REASON', ?, ?)",
                 victim[1].asString(),
                 floor,
                 HogliteSchema.now(),
@@ -292,7 +294,7 @@ internal class HogliteRetirement(
                 candidate.tableId,
             ) {
                 com.posthog.hoglake.model.HoglakeException.CommitConflict(
-                    "retirement victim ${victim[0].asLong()} vanished mid-batch"
+                    "retirement victim ${victim[0].asLong()} vanished mid-batch",
                 )
             }
         }

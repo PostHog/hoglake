@@ -11,7 +11,6 @@ import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.time.Duration
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicLong
 
 /** One statement of a hoglite transaction (`/v1/t/{tid}/tx`), or the single statement of a `/query`. */
 data class HogliteStatement(
@@ -44,8 +43,7 @@ fun Any?.asLong(): Long =
 /** Nullable variant of [asLong]. */
 fun Any?.asLongOrNull(): Long? = (this as? Number)?.toLong()
 
-fun Any?.asString(): String =
-    this?.toString() ?: throw IllegalStateException("expected a string, got null")
+fun Any?.asString(): String = this?.toString() ?: throw IllegalStateException("expected a string, got null")
 
 /**
  * A transaction guard failed: hoglite answered 409 `expect_failed`.
@@ -87,7 +85,7 @@ class HogliteRejected(
  * owner pin, because a promoted tenant's owner lives in the whale pool
  * and the old standard-pool name would misroute.
  *
- * ## Retry taxonomy (load-bearing; matches the reference adapter's)
+ * ## Retry taxonomy
  *
  * Only three outcomes retry: 421 (re-route), 503 (owner lost
  * mid-flight, lease not yet expired), and transport errors (dead pod
@@ -97,13 +95,17 @@ class HogliteRejected(
  * exactly-once is hoglite's, the client just has to not change the key.
  * Everything else — 409 guard, 422 SQL, 404, 400 — is deterministic and
  * surfaces on first sight; spending retry budget on an impossible
- * request was the P1-7 lesson.
+ * request just delays the caller's refusal.
  *
  * ## Circuit breaking
  *
  * One breaker per POOL (standard, whale) — the pools fail
- * independently. Consecutive transport/5xx attempts trip it; an open
- * breaker fails fast with [HoglakeException.BackendUnavailable] until
+ * independently. Only TRANSPORT failures count toward tripping: a 503
+ * is hoglite's per-tenant owner-loss signal, and folding it into a
+ * pool-wide breaker would let one tenant's failover fail every OTHER
+ * tenant fast for the open window. Any HTTP answer (2xx, 4xx, 421,
+ * 503) proves the pool is up and resets the count. An open breaker
+ * fails fast with [HoglakeException.BackendUnavailable] until
  * [circuitOpenMs] has passed, then lets one trial through (half-open:
  * success closes, failure re-opens). This is what converts a down pool
  * into instant typed 503s instead of timeout convoys — hoglake's
@@ -151,9 +153,6 @@ class HogliteClient(
             Pool.STANDARD to CircuitBreaker(circuitFailureThreshold, circuitOpenMs),
             Pool.WHALE to CircuitBreaker(circuitFailureThreshold, circuitOpenMs),
         )
-
-    /** Txids minted here when the caller brings none: monotonic per process, plus randomness. */
-    private val txSeq = AtomicLong()
 
     // ---- public API -------------------------------------------------------
 
@@ -240,6 +239,21 @@ class HogliteClient(
         }
     }
 
+    /**
+     * `/v1/t/{tenant}/status`, the routed read that PINS the owner for
+     * the calls that follow: hoglite's `release` and tenant `DELETE`
+     * are owner-local (not proxied), so a lifecycle caller must pin via
+     * this first and let the 421 dance land on the owning pod.
+     */
+    fun status(tenant: String) {
+        call(tenant, "/v1/t/$tenant/status", null, readTimeoutMs, method = "GET") { status, bytes ->
+            when (status) {
+                200 -> Unit
+                else -> throw HogliteRejected(status, String(bytes))
+            }
+        }
+    }
+
     /** Release [tenant]'s ownership (optionally reclassing it, e.g. `whale`); 409 means not owned here. */
     fun release(
         tenant: String,
@@ -268,12 +282,6 @@ class HogliteClient(
             log.warn(it) { "hoglite health probe failed: the standard pool did not answer" }
             false
         }
-
-    /** Mint a txid for a payload without an idempotency key: deterministic in the payload, unique per call. */
-    fun contentTxid(catalog: String, fingerprintHex: String): String = "ch:$catalog:$fingerprintHex"
-
-    /** The txid for a keyed request: the key IS the idempotency token. */
-    fun keyTxid(catalog: String, key: java.util.UUID): String = "ik:$catalog:$key"
 
     // ---- the call loop ------------------------------------------------------
 
@@ -304,59 +312,63 @@ class HogliteClient(
                         "${breaker.openMs}ms rather than queueing behind timeouts",
                 )
             }
+            // Never START an attempt that cannot fit the budget: cap
+            // the attempt's timeout at what is left so the worst case is
+            // the budget, not budget + one full timeout.
+            val remainingMs = (deadline - System.nanoTime()) / 1_000_000
+            if (remainingMs <= 0) {
+                throw HoglakeException.BackendUnavailable(
+                    "hoglite ${pool.name.lowercase()} pool did not answer within the " +
+                        "${retryBudgetMs}ms retry budget (last failure: ${lastFailure?.message})",
+                )
+            }
             val resp =
                 try {
-                    send(base, path, body, timeoutMs, method)
-                } catch (e: Throwable) {
+                    send(base, path, body, minOf(timeoutMs, remainingMs), method)
+                } catch (e: InterruptedException) {
+                    // Shutdown, not a backend failure: restore the flag and
+                    // stop retrying.
+                    Thread.currentThread().interrupt()
+                    throw HoglakeException.BackendUnavailable(
+                        "interrupted while calling hoglite (${pool.name.lowercase()} pool)",
+                    )
+                } catch (e: Exception) {
                     // Transport failure. A stale OWNER pin (dead pod, moved
                     // tenant) must not pin forever: clear it so the next
-                    // attempt re-resolves through the service proxy.
+                    // attempt re-resolves through the service proxy. Only
+                    // THIS outcome feeds the breaker — a 503 is per-tenant
+                    // owner loss, not a pool outage.
                     if (pin is Route.Owner) tenantRoutes.remove(tenant, pin)
                     breaker.onFailure()
                     lastFailure = e
-                    if (System.nanoTime() >= deadline) {
-                        throw HoglakeException.BackendUnavailable(
-                            "hoglite ${pool.name.lowercase()} pool unreachable within the " +
-                                "${retryBudgetMs}ms retry budget: ${e.message}",
-                        )
-                    }
                     sleeper(RETRY_BACKOFF_MS)
                     continue
                 }
+            // Any HTTP answer at all proves the pool is up: the breaker
+            // only tracks transport silence.
+            breaker.onSuccess()
             when (resp.statusCode()) {
                 200 -> {
-                    breaker.onSuccess()
                     return parse(200, resp.body())
                 }
                 503 -> {
                     // Owner lost mid-flight / transient infra: retryable.
-                    breaker.onFailure()
                     lastFailure = HogliteRejected(503, String(resp.body()))
-                    if (System.nanoTime() >= deadline) {
-                        throw HoglakeException.BackendUnavailable(
-                            "hoglite ${pool.name.lowercase()} pool answered 503 for the whole " +
-                                "${retryBudgetMs}ms retry budget (owner lost or saturated)",
-                        )
-                    }
                     sleeper(RETRY_BACKOFF_MS)
                 }
                 421 -> {
                     // Misdirected: re-pin from the hint and retry. Class wins
                     // over owner — a whale's owner lives in the whale pool.
-                    // Not a breaker event: the pool answered fine.
+                    // The hint can name a class or owner that is itself
+                    // about to move (lease wait-out), so this arm backs off
+                    // like the others instead of spinning hot.
                     repin(tenant, resp.body())
-                    if (System.nanoTime() >= deadline) {
-                        throw HoglakeException.BackendUnavailable(
-                            "hoglite kept redirecting tenant '$tenant' (421) for the whole " +
-                                "${retryBudgetMs}ms retry budget",
-                        )
-                    }
-                    // No backoff: a 421 is an answer, not a wait.
+                    lastFailure = HogliteRejected(421, String(resp.body()))
+                    sleeper(RETRY_BACKOFF_MS)
                 }
                 else -> {
                     // Deterministic: the pool answered and the answer is
-                    // final. Success for the breaker — it is up.
-                    breaker.onSuccess()
+                    // final.
                     return parse(resp.statusCode(), resp.body())
                 }
             }
@@ -408,8 +420,14 @@ class HogliteClient(
         when (method) {
             "GET" -> builder.GET()
             "DELETE" -> builder.DELETE()
-            "PUT" -> builder.PUT(body?.let(HttpRequest.BodyPublishers::ofByteArray) ?: HttpRequest.BodyPublishers.noBody())
-            else -> builder.POST(body?.let(HttpRequest.BodyPublishers::ofByteArray) ?: HttpRequest.BodyPublishers.noBody())
+            "PUT" ->
+                builder.PUT(
+                    body?.let(HttpRequest.BodyPublishers::ofByteArray) ?: HttpRequest.BodyPublishers.noBody(),
+                )
+            else ->
+                builder.POST(
+                    body?.let(HttpRequest.BodyPublishers::ofByteArray) ?: HttpRequest.BodyPublishers.noBody(),
+                )
         }
         return http.send(builder.build(), HttpResponse.BodyHandlers.ofByteArray())
     }
@@ -426,6 +444,7 @@ class HogliteClient(
 
     private fun parseTxResults(bytes: ByteArray): List<HogliteQueryResult> {
         val decoded = json.readValue<Map<String, Any?>>(bytes)
+
         @Suppress("UNCHECKED_CAST")
         val results = decoded["results"] as? List<Map<String, Any?>> ?: emptyList()
         return results.map { it.toQueryResult() }
@@ -502,7 +521,6 @@ class HogliteClient(
     }
 
     companion object {
-
         /** Build the client from the process config's HOGLAKE_HOGLITE_* knobs. */
         fun fromConfig(cfg: com.posthog.hoglake.Config): HogliteClient =
             HogliteClient(
@@ -516,6 +534,7 @@ class HogliteClient(
                 circuitFailureThreshold = cfg.hogliteCircuitFailureThreshold,
                 circuitOpenMs = cfg.hogliteCircuitOpenMs,
             )
+
         /** The `client` half of hoglite's (client, txid) dedup key. */
         const val CLIENT_NAME = "hoglake"
 

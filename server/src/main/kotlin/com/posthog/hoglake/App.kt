@@ -40,9 +40,9 @@ import com.posthog.hoglake.service.ReindexService
 import com.posthog.hoglake.service.RemovalStore
 import com.posthog.hoglake.service.RetirementService
 import com.posthog.hoglake.service.ScanService
-import com.posthog.hoglake.store.PostgresCatalogStore
 import com.posthog.hoglake.service.TableCreationService
 import com.posthog.hoglake.service.ViewService
+import com.posthog.hoglake.store.PostgresCatalogStore
 import com.zaxxer.hikari.HikariDataSource
 import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
@@ -78,11 +78,14 @@ class App private constructor(
      */
     val jdbi: Jdbi?,
     /**
-     * The catalog backend the /v1 routes serve: Postgres (the services
-     * below, via [com.posthog.hoglake.store.PostgresCatalogStore]) or
-     * hoglite ([com.posthog.hoglake.hoglite.HogliteCatalogStore]).
+     * The catalog backend the /v1 routes serve, when the caller brings
+     * one (the hoglite mode); null on the Postgres path, where [store]
+     * below builds it from THE SAME lazy service instances the rest of
+     * the App uses — one CommitService per process, so state like its
+     * warn-dedup set never diverges between the route path and the
+     * store path.
      */
-    val store: com.posthog.hoglake.store.CatalogStore,
+    private val storeParam: com.posthog.hoglake.store.CatalogStore?,
     /**
      * `/healthz`'s own one-connection probe (#218). Injected so a test
      * can point it at a database it is allowed to stop; defaulted from
@@ -97,6 +100,11 @@ class App private constructor(
      * that file for the mechanism and the rejected alternatives.
      */
     val requestDispatcher = RequestDispatcher(cfg.requestThreads)
+
+    /** The routes' catalog backend: the caller's (hoglite) or the Postgres delegate over THIS App's services. */
+    val store: com.posthog.hoglake.store.CatalogStore by lazy {
+        storeParam ?: PostgresCatalogStore(catalogService, commitService, scanService)
+    }
 
     private val catalogService by lazy { CatalogService(jdbi!!) }
     private val commitService by lazy {
@@ -145,10 +153,10 @@ class App private constructor(
      * same predicate the refusal prices on, and stating it at this call
      * site is how the two could quietly diverge.
      */
+    private fun newCleanupService(jdbi: Jdbi) = CleanupService(jdbi, removalStore, cfg)
     // CleanupConfigTest pins this construction text: the service must be
     // built from Config (the loop predicate derivation lives in its Config
     // constructor, where a test can build it), not knob by knob here.
-    private fun newCleanupService(jdbi: Jdbi) = CleanupService(jdbi, removalStore, cfg)
 
     private val cleanupService by lazy { newCleanupService(requireNotNull(jdbi)) }
 
@@ -391,23 +399,15 @@ class App private constructor(
             healthProbe: HealthProbe = HealthProbe.fromConfig(cfg),
         ): App =
             buildShared(
-                App(
-                    cfg,
-                    jdbi,
-                    PostgresCatalogStore(
-                        CatalogService(jdbi),
-                        CommitService(
-                            jdbi,
-                            commitLockTimeoutMs = cfg.commitLockTimeoutMs,
-                            refuseBlindPartitionedAppends = cfg.refuseBlindPartitionedAppends,
-                        ),
-                        ScanService(jdbi),
-                    ),
-                    healthProbe,
-                ),
+                App(cfg, jdbi, storeParam = null, healthProbe = healthProbe),
                 cfg,
                 dataSource,
-            )
+            ).also {
+                // CatalogMetrics registers its MultiGauges in its
+                // constructor; touching it here keeps them present from
+                // boot (a pre-first-tick /metrics scrape is not empty).
+                it.catalogMetrics
+            }
 
         /**
          * The hoglite backend: no Postgres, no Jdbi; the store is a
@@ -419,8 +419,7 @@ class App private constructor(
             cfg: Config,
             store: com.posthog.hoglake.hoglite.HogliteCatalogStore,
             healthProbe: HealthProbe,
-        ): App =
-            buildShared(App(cfg, null, store, healthProbe), cfg, dataSource = null)
+        ): App = buildShared(App(cfg, null, store, healthProbe), cfg, dataSource = null)
 
         private fun buildShared(
             app: App,

@@ -75,7 +75,11 @@ internal class HoglitePartitions(
          * Actionable debt: files the planner's pack would select. Runs the
          * same grouping arithmetic HogliteCompaction plans with.
          */
-        fun debt(threshold: Long, minFiles: Int, maxFiles: Int): Long {
+        fun debt(
+            threshold: Long,
+            minFiles: Int,
+            maxFiles: Int,
+        ): Long {
             val small = files.filter { it.sizeBytes < threshold }
             if (small.size < minFiles) return 0
             val packed =
@@ -97,10 +101,11 @@ internal class HoglitePartitions(
         val m = store.meta(catalog)
         val nsFilter = if (namespace != null) "AND v.namespace = ?" else ""
         val tFilter = if (table != null) "AND v.name = ?" else ""
-        val args = buildList {
-            if (namespace != null) add(namespace)
-            if (table != null) add(table)
-        }
+        val args =
+            buildList {
+                if (namespace != null) add(namespace)
+                if (table != null) add(table)
+            }
         val rows =
             store.queryCatalog(
                 catalog,
@@ -178,7 +183,11 @@ internal class HoglitePartitions(
     /** field_id -> dotted column path, from the forest. */
     private fun columnPaths(columns: List<Column>): Map<Long, String> {
         val out = mutableMapOf<Long, String>()
-        fun walk(col: Column, prefix: String) {
+
+        fun walk(
+            col: Column,
+            prefix: String,
+        ) {
             val path = if (prefix.isEmpty()) col.def.name else "$prefix.${col.def.name}"
             out[col.fieldId] = path
             col.children.forEach { walk(it, path) }
@@ -273,10 +282,11 @@ internal class HoglitePartitions(
         val cappedLimit = limit.coerceAtMost(MAX_LIMIT)
         val descending = desc ?: sort.descendingByDefault
 
-        val headSpec = run {
-            val t = store.liveTable(catalog, namespace, table)
-            headSpec(catalog, t.tableId)
-        }
+        val headSpec =
+            run {
+                val t = store.liveTable(catalog, namespace, table)
+                headSpec(catalog, t.tableId)
+            }
         val arity = headSpec?.fields?.size ?: 0
         filters.firstOrNull { it.keyIndex < 0 || it.keyIndex >= arity }?.let {
             throw HoglakeException.Validation(
@@ -465,7 +475,16 @@ internal class HoglitePartitions(
     private fun compareValue(
         a: String?,
         b: String?,
-    ): Int = if (a == null && b == null) 0 else if (a == null) -1 else if (b == null) 1 else a.compareTo(b)
+    ): Int =
+        if (a == null && b == null) {
+            0
+        } else if (a == null) {
+            -1
+        } else if (b == null) {
+            1
+        } else {
+            a.compareTo(b)
+        }
 
     companion object {
         private const val MAX_LIMIT = 1_000

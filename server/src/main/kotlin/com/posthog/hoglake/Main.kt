@@ -36,12 +36,19 @@ fun main() {
             // pattern), and /healthz's probe is the client's own
             // /v1/healthz behind the same deadline machinery.
             val client = com.posthog.hoglake.hoglite.HogliteClient.fromConfig(cfg)
-            val store = com.posthog.hoglake.hoglite.HogliteCatalogStore(client, cfg.removalLedgerRetentionSeconds)
-            app = App.buildHoglite(
-                cfg,
-                store,
-                HealthProbe.forProbe(cfg.healthProbeTimeoutMs) { client.reachable() },
-            )
+            val store =
+                com.posthog.hoglake.hoglite.HogliteCatalogStore(
+                    client,
+                    cfg.hogliteTenantPrefix,
+                    cfg.refuseBlindPartitionedAppends,
+                    cfg.removalLedgerRetentionSeconds,
+                )
+            app =
+                App.buildHoglite(
+                    cfg,
+                    store,
+                    HealthProbe.forProbe(cfg.healthProbeTimeoutMs) { client.reachable() },
+                )
         }
     }
     val background = app.startBackground()

@@ -154,7 +154,6 @@ class Hydrator(
         val beginSnapshot: Long,
     )
 
-
     /**
      * The sweep's claim, PER CATALOG with a fair share of [limit] (#269).
      *
@@ -875,7 +874,6 @@ class Hydrator(
          * arithmetic.
          */
         const val DEFAULT_MIN_FILE_BYTES: Long = 1L shl 20
-
 
         /** Default whole-object fallback cap: 256 MiB. */
         const val DEFAULT_MAX_WHOLE_OBJECT_BYTES: Long = 256L * 1024 * 1024

@@ -30,12 +30,18 @@ them unchanged; the hoglite ports live in `server/.../hoglite/`.
 
 ## The mapping
 
-- **Catalog == tenant.** Creating a catalog provisions the tenant lazily
-  (hoglite's `PUT /v1/tenants/{tid}` is idempotent) and bootstraps the schema
-  in one transaction whose txid is fixed (`hoglake-bootstrap`), so a replay is
-  a read. The registry of catalog names + data_path prefix disjointness lives
-  in a dedicated `__hoglake_registry` tenant, written under a guard in the
-  same transaction as the name claim.
+- **Catalog == tenant.** The tenant id is the deployment prefix
+  (`HOGLAKE_HOGLITE_TENANT_PREFIX`, default `hoglake-`) plus the catalog
+  name, so two hoglake deployments can share one hoglite cluster. Creating a
+  catalog provisions the tenant FIRST (hoglite's `PUT /v1/tenants/{tid}` is
+  idempotent) and bootstraps the schema in one fixed-txid transaction, so a
+  replay is a read; the registry row (catalog name + data_path prefix
+  disjointness, in a dedicated registry tenant) publishes LAST — a crash
+  mid-create leaves an adoptable orphan tenant, never a ghost registry row.
+  Dropping fences the catalog first (one transaction: the emptiness
+  preconditions as guards plus `meta.dropping = 1`, which every mutating
+  transaction guards on), then releases and deletes the tenant through its
+  owner, then deletes the registry row.
 - **Every write is one hoglite transaction** (`POST /v1/t/{tid}/tx`) carrying
   its OCC guards in the request: `expect_scalar_int`/`expect_affected` per
   statement, evaluated inside the tenant's serial transaction. hoglite answers
@@ -49,17 +55,25 @@ them unchanged; the hoglite ports live in `server/.../hoglite/`.
   strings must not contain words like `delete` even in string literals (the
   commit claims-probe uses numeric kind markers for this reason).
 - **Idempotency**: commit txids are `ik:<idempotency-key>` when the request
-  carries one, else `ch:<catalog>:<fingerprint16>` over the request content
-  (hoglake's own commit fingerprint), so a retried commit is hoglite's dedup
-  hit with the recorded result, and a same-key/different-body replay is the
-  typed 422. DDL operations are *not* idempotent in hoglake's contract, so
-  they use fresh txids and let their guards answer duplicates (409/422).
+  carries one; an UNKEYED commit gets a fresh random txid per store call —
+  publication idempotency is the explicit key's alone (hoglake's Postgres
+  contract), and a content-derived txid would silently replay an identical
+  later request (truncate + reload) without applying it. A keyed replay is
+  hoglite's dedup hit with the recorded result; a same-key/different-body
+  replay is the typed 422. DDL operations are *not* idempotent in hoglake's
+  contract, so they use fresh txids and let their guards answer duplicates
+  (409/422).
 - **Snapshots**: `meta.next_snapshot` is the allocator; commit allocations
   bump it alone, DDL allocations bump `schema_version` with it — the same
   distinction as `CatalogRepo.allocateSnapshot` vs the commit tail.
 - **Deletion vectors**: supersession is epoch-ordered per data file
   (`PRIMARY KEY(data_file_id, epoch)`), with the staleness-before-monotonicity
-  guard order from the commit path.
+  guard order from the commit path. Supersession ENDS the predecessor epoch
+  in the same transaction (Postgres's `ended_dvs`), so exactly one live DV
+  per data file is the invariant compaction, expiry, and storage accounting
+  rely on — and a DV may only target a LIVE data file (retired after the
+  read is the retryable 409; retired before it, the 422), which is what
+  keeps a delete racing compaction from being silently lost.
 
 ## What is computed differently, deliberately
 

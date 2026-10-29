@@ -2,14 +2,8 @@ package com.posthog.hoglake.api
 
 import com.fasterxml.jackson.databind.JsonNode
 import com.posthog.hoglake.auth.actorOrRefuse
-import com.posthog.hoglake.compaction.CompactionService
-import com.posthog.hoglake.hydrator.Hydrator
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.MaintenanceTask
-import com.posthog.hoglake.service.CleanupService
-import com.posthog.hoglake.service.DatabaseHealthService
-import com.posthog.hoglake.service.ExpiryService
-import com.posthog.hoglake.service.MaintenanceStatusService
 import com.posthog.hoglake.service.CleanupBackend
 import com.posthog.hoglake.service.CompactionBackend
 import com.posthog.hoglake.service.DatabaseHealthBackend
@@ -17,7 +11,6 @@ import com.posthog.hoglake.service.ExpiryBackend
 import com.posthog.hoglake.service.HydratorMaintenanceBackend
 import com.posthog.hoglake.service.MaintenanceStatusBackend
 import com.posthog.hoglake.service.OptionsBackend
-import com.posthog.hoglake.service.OptionsService
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall

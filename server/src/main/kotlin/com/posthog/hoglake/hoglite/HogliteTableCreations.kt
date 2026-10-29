@@ -2,8 +2,8 @@ package com.posthog.hoglake.hoglite
 
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
-import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.FileRegistration
+import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.initialColumns
 import com.posthog.hoglake.model.validateFooterSize
 import com.posthog.hoglake.service.AlterService
@@ -238,6 +238,9 @@ internal class HogliteTableCreations(
             try {
                 store.runTx(catalog, HogliteCatalogStore.freshTxid("publish-reject"), null, tx)
             } catch (race: PublishRace) {
+                // The winner's receipt answers only a replay of the SAME
+                // payload; a different payload raced is the typed reuse.
+                if (race.receipt.state != "aborted") requireSameFiles(catalog, operationId, encodedFiles)
                 return race.receipt
             }
             return store.loadCreationOrThrow(catalog, operationId)
@@ -260,7 +263,7 @@ internal class HogliteTableCreations(
         tx.expectOne(
             "SELECT COUNT(*) FROM namespaces WHERE id = ? AND dropped_snapshot IS NULL",
             originalNamespace,
-        ) { HoglakeException.NotFound("namespace '${definition.namespace}' in catalog '$catalog'") }
+        ) { nsChangedRace }
         if (replacement != null) {
             // The guarded target must still be the live incarnation, and
             // nothing but compaction may have touched it since the read.
@@ -271,13 +274,13 @@ internal class HogliteTableCreations(
                 originalNamespace,
                 definition.name,
                 replacement.expectedTableUuid?.toString() ?: "",
-            ) { HoglakeException.CommitConflict("replacement target changed during publication") }
+            ) { targetChangedRace }
             tx.expectZero(
                 "SELECT COUNT(*) FROM changes WHERE object_id = ? AND snapshot_id > ? " +
                     "AND kind LIKE 'table_%' AND kind <> 'table_compacted'",
                 target!![0].asLong(),
                 replacement.readSnapshot,
-            ) { HoglakeException.CommitConflict("replacement target changed during publication") }
+            ) { targetChangedRace }
         } else {
             tx.expectZero(
                 "SELECT COUNT(*) FROM tables t JOIN table_versions v ON v.table_id = t.id " +
@@ -285,11 +288,7 @@ internal class HogliteTableCreations(
                     "AND t.dropped_snapshot IS NULL",
                 originalNamespace,
                 definition.name,
-            ) {
-                HoglakeException.AlreadyExists(
-                    "table '${definition.name}' already exists in namespace '${definition.namespace}'",
-                )
-            }
+            ) { targetExistsRace }
         }
         // A definition the server NOW refuses (prepared under a laxer
         // binary) must land as a durable rejection, not a 422 that
@@ -327,12 +326,12 @@ internal class HogliteTableCreations(
             tx.affectOne(
                 "UPDATE tables SET dropped_snapshot = ${HogliteSchema.HEAD_SQL} WHERE id = ?",
                 oldId,
-            ) { HoglakeException.CommitConflict("replacement target changed during publication") }
+            ) { targetChangedRace }
             tx.affectOne(
                 "UPDATE table_versions SET end_snapshot = ${HogliteSchema.HEAD_SQL} " +
                     "WHERE table_id = ? AND end_snapshot IS NULL",
                 oldId,
-            ) { HoglakeException.CommitConflict("replacement target changed during publication") }
+            ) { targetChangedRace }
         }
         tx.affectOne(
             "UPDATE meta SET next_table_id = next_table_id + 1 WHERE id = 1",
@@ -396,9 +395,10 @@ internal class HogliteTableCreations(
         // allocator, the claims the operation owned settled, and the
         // removal-queue refusal.
         if (files.isNotEmpty()) {
-            val liveColumnTypes = cols.flatMap { it.selfAndDescendants() }
-                .filter { !it.def.type.isNested }
-                .associate { it.fieldId to it.def.type }
+            val liveColumnTypes =
+                cols.flatMap { it.selfAndDescendants() }
+                    .filter { !it.def.type.isNested }
+                    .associate { it.fieldId to it.def.type }
             val specFieldCount = definition.partitionFields.size.takeIf { definition.partitionFields.isNotEmpty() }
             val specId: Long? = if (specFieldCount != null) 1L else null
             tx.expectZero(
@@ -416,7 +416,13 @@ internal class HogliteTableCreations(
             ) { HoglakeException.NotFound("catalog '$catalog'") }
             var rowOffset = 0L
             files.forEachIndexed { i, f ->
-                val sanitized = HogliteCommit.validateFile(f, "${definition.namespace}.${definition.name}", specFieldCount, liveColumnTypes)
+                val sanitized =
+                    HogliteCommit.validateFile(
+                        f,
+                        "${definition.namespace}.${definition.name}",
+                        specFieldCount,
+                        liveColumnTypes,
+                    )
                 val idSql = "(SELECT next_file_id - ${files.size} + $i FROM meta WHERE id = 1)"
                 tx.add(
                     "INSERT INTO files(id, table_id, path, record_count, file_size_bytes, footer_size, " +
@@ -456,8 +462,10 @@ internal class HogliteTableCreations(
             val toSettle = HogliteCommit.decideClaims(store, catalog, claimPaths, operationId)
             for (uploadId in toSettle) {
                 tx.affectOne(
-                    "UPDATE uploads SET state = 'registered' WHERE upload_id = ? AND state = 'active'",
+                    "UPDATE uploads SET state = 'registered' " +
+                        "WHERE upload_id = ? AND state = 'active' AND owner = ?",
                     uploadId,
+                    operationId.toString(),
                 ) {
                     HoglakeException.CommitConflict(
                         "upload is fenced, already registered, or belongs to another operation",
@@ -473,6 +481,47 @@ internal class HogliteTableCreations(
         try {
             store.runTx(catalog, HogliteCatalogStore.freshTxid("publish"), null, tx)
         } catch (race: PublishRace) {
+            if (race.receipt.state != "aborted") requireSameFiles(catalog, operationId, encodedFiles)
+            return race.receipt
+        } catch (e: HoglakeException) {
+            when (e) {
+                // The three durable guards; anything else (removal queue,
+                // claim settle) stays the transient refusal the caller
+                // retries.
+                nsChangedRace -> return rejectDurably(catalog, operationId, encodedFiles, "namespace_changed")
+                targetChangedRace -> return rejectDurably(catalog, operationId, encodedFiles, "target_changed")
+                targetExistsRace -> return rejectDurably(catalog, operationId, encodedFiles, "target_exists")
+                else -> throw e
+            }
+        }
+        return store.loadCreationOrThrow(catalog, operationId)
+    }
+
+    /**
+     * Land the operation's terminal REJECTED receipt (with the attempted
+     * payload recorded, so a replay compares equal) and answer it.
+     */
+    private fun rejectDurably(
+        catalog: String,
+        operationId: UUID,
+        encodedFiles: String,
+        reason: String,
+    ): TableCreation {
+        val tx = HogliteTx()
+        tx.affectOne(
+            "UPDATE table_creations SET files_json = ? WHERE operation = ? AND state = 'prepared'",
+            encodedFiles,
+            operationId.toString(),
+        ) { throw PublishRace(store.loadCreationOrThrow(catalog, operationId)) }
+        tx.add(
+            "UPDATE table_creations SET state = 'rejected', reason = ? WHERE operation = ?",
+            reason,
+            operationId.toString(),
+        )
+        try {
+            store.runTx(catalog, HogliteCatalogStore.freshTxid("publish-reject"), null, tx)
+        } catch (race: PublishRace) {
+            if (race.receipt.state != "aborted") requireSameFiles(catalog, operationId, encodedFiles)
             return race.receipt
         }
         return store.loadCreationOrThrow(catalog, operationId)
@@ -555,4 +604,14 @@ internal class HogliteTableCreations(
 
     /** A publish whose receipt transitioned mid-flight: the new receipt is the answer. */
     private class PublishRace(val receipt: TableCreation) : RuntimeException("publish race")
+
+    /*
+     * Publish-time guard failures that must land as DURABLE rejections
+     * (the operation's terminal receipt), matched by IDENTITY so a
+     * lookalike transient conflict — the removal-queue guard, a claim
+     * settle — still propagates to the caller as retryable.
+     */
+    private val nsChangedRace = HoglakeException.NotFound("namespace changed during publication")
+    private val targetChangedRace = HoglakeException.CommitConflict("replacement target changed during publication")
+    private val targetExistsRace = HoglakeException.AlreadyExists("table appeared during publication")
 }

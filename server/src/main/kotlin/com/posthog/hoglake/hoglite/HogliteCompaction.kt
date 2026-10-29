@@ -8,10 +8,10 @@ import com.posthog.hoglake.compaction.CompactionGrouping
 import com.posthog.hoglake.compaction.InvalidDataException
 import com.posthog.hoglake.compaction.LiveDv
 import com.posthog.hoglake.compaction.ParquetRewriter
-import com.posthog.hoglake.compaction.UnconvertibleSchemaException
 import com.posthog.hoglake.compaction.PuffinDeletionVector
 import com.posthog.hoglake.compaction.S3InputFile
 import com.posthog.hoglake.compaction.S3OutputFile
+import com.posthog.hoglake.compaction.UnconvertibleSchemaException
 import com.posthog.hoglake.hydrator.FooterSplitOffsets
 import com.posthog.hoglake.hydrator.FooterStats
 import com.posthog.hoglake.hydrator.ObjectStore
@@ -316,7 +316,8 @@ internal class HogliteCompaction(
         val key = CompactionClaimRepo.groupKey(group)
         val tx = HogliteTx()
         tx.add(
-            "INSERT INTO compaction_claims(table_id, group_key, input_file_ids_json, claimant, claimed_at, expires_at) " +
+            "INSERT INTO compaction_claims(table_id, group_key, input_file_ids_json, claimant, " +
+                "claimed_at, expires_at) " +
                 "VALUES (?, ?, ?, ?, ?, ?) " +
                 "ON CONFLICT(table_id, group_key) DO UPDATE SET " +
                 "claimant = excluded.claimant, claimed_at = excluded.claimed_at, " +
@@ -535,9 +536,10 @@ internal class HogliteCompaction(
                     f.explicitRowIds,
                     // A compaction output written under the live spec is a
                     // trusted run of it (CompactionService.trustedSorted).
-                    trustedSorted = f.explicitRowIds &&
-                        ctx.sortBeginSnapshot != null &&
-                        f.beginSnapshot >= ctx.sortBeginSnapshot,
+                    trustedSorted =
+                        f.explicitRowIds &&
+                            ctx.sortBeginSnapshot != null &&
+                            f.beginSnapshot >= ctx.sortBeginSnapshot,
                     fileSizeBytes = f.fileSizeBytes,
                     survivingRecords = f.survivingRecords,
                     keySource =
@@ -596,7 +598,10 @@ internal class HogliteCompaction(
                     }
             }
         val rowIdStart = group.files.minOf { it.rowIdStart }
-        return commitGroup(catalog, ctx, group, outputPath, outputBytes, footerSize, stats, splitOffsets, rewritten.rowsWritten, rowIdStart, stagingId)
+        return commitGroup(
+            catalog, ctx, group, outputPath, outputBytes, footerSize, stats, splitOffsets,
+            rewritten.rowsWritten, rowIdStart, stagingId,
+        )
     }
 
     /** The staging ticket: an undrained 'compaction_staging' removal row. */
@@ -644,6 +649,7 @@ internal class HogliteCompaction(
         // side-channel: the lambda records it and returns the typed
         // conflict hoglite's 409 requires, and the catch below maps it.
         var guardOutcome: Outcome? = null
+
         fun guard(o: Outcome): HoglakeException {
             guardOutcome = o
             return HoglakeException.CommitConflict("compaction guard refused: $o")
@@ -670,17 +676,19 @@ internal class HogliteCompaction(
         // GUARD 3: the live sort spec is still the one planned against —
         // a spec that moved mid-rewrite would publish a mis-sorted file
         // as a trusted run of the new spec.
-        tx.expectOne(
-            "SELECT COUNT(*) FROM sort_specs WHERE table_id = ? AND end_snapshot IS NULL " +
-                "AND spec_id = ?",
-            ctx.tableId,
-            ctx.sortId ?: -1L,
-        ) { guard(Outcome.SkippedConflict) }
         if (ctx.sortId == null) {
             // No spec at planning: guard that none ARRIVED.
             tx.expectZero(
                 "SELECT COUNT(*) FROM sort_specs WHERE table_id = ? AND end_snapshot IS NULL",
                 ctx.tableId,
+            ) { guard(Outcome.SkippedConflict) }
+        } else {
+            // A spec at planning: guard the live spec is still that one.
+            tx.expectOne(
+                "SELECT COUNT(*) FROM sort_specs WHERE table_id = ? AND end_snapshot IS NULL " +
+                    "AND spec_id = ?",
+                ctx.tableId,
+                ctx.sortId,
             ) { guard(Outcome.SkippedConflict) }
         }
         // GUARD 4: every input still live.
@@ -756,7 +764,8 @@ internal class HogliteCompaction(
             "INSERT INTO files(id, table_id, path, file_format, record_count, file_size_bytes, " +
                 "footer_size, row_id_start, explicit_row_ids, spec_id, partition_values_json, " +
                 "stats_state, stats_json, split_offsets_json, begin_snapshot) " +
-                "VALUES ((SELECT next_file_id - 1 FROM meta WHERE id = 1), ?, ?, 'parquet', ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, " +
+                "VALUES ((SELECT next_file_id - 1 FROM meta WHERE id = 1), ?, ?, 'parquet', ?, ?, ?, ?, 1, " +
+                "?, ?, ?, ?, ?, " +
                 "${HogliteSchema.HEAD_SQL})",
             ctx.tableId,
             outputPath,
@@ -773,11 +782,12 @@ internal class HogliteCompaction(
         // table_totals: gross append counters, exactly like a commit's
         // (the ended inputs' counts stay — the DVs already masked them).
         tx.add(
-            "INSERT INTO table_totals(table_id, record_count, file_count, size_bytes) " +
+            "INSERT INTO table_totals(table_id, record_count, file_count, file_size_bytes) " +
                 "VALUES (?, ?, 1, ?) " +
                 "ON CONFLICT(table_id) DO UPDATE SET " +
                 "record_count = record_count + excluded.record_count, " +
-                "file_count = file_count + 1, size_bytes = size_bytes + excluded.size_bytes",
+                "file_count = file_count + 1, " +
+                "file_size_bytes = file_size_bytes + excluded.file_size_bytes",
             ctx.tableId,
             survivors,
             outputBytes,

@@ -48,7 +48,16 @@ internal fun HogliteTx.allocateCommitSnapshot() {
     ) { HoglakeException.NotFound("catalog (meta row missing)") }
 }
 
-/** The snapshot row for the snapshot this transaction just allocated. */
+/**
+ * The snapshot row for the snapshot this transaction just allocated.
+ *
+ * The timestamp is computed IN the transaction as the greater of the
+ * previous snapshot's ts and the pod's clock (Postgres's clock_timestamp
+ * under the commit lock): snapshot ids are issued serially, so AS OF
+ * time resolution only stays consistent with snapshot order when ts is
+ * monotone with id. The fixed-width codec makes lexical MAX the
+ * chronological MAX.
+ */
 internal fun HogliteTx.insertSnapshotRow(
     author: String?,
     message: String?,
@@ -56,7 +65,9 @@ internal fun HogliteTx.insertSnapshotRow(
 ) {
     add(
         "INSERT INTO snapshots(id, ts, author, message, schema_version) " +
-            "VALUES (${HogliteSchema.HEAD_SQL}, ?, ?, ?, (SELECT schema_version FROM meta WHERE id = 1))",
+            "VALUES (${HogliteSchema.HEAD_SQL}, " +
+            "MAX(COALESCE((SELECT MAX(ts) FROM snapshots), ''), ?), ?, ?, " +
+            "(SELECT schema_version FROM meta WHERE id = 1))",
         ts,
         author,
         message,

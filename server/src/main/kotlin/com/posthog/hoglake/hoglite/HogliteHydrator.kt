@@ -1,5 +1,13 @@
 package com.posthog.hoglake.hoglite
 
+import com.posthog.hoglake.hydrator.CatalogColumn
+import com.posthog.hoglake.hydrator.FooterReader
+import com.posthog.hoglake.hydrator.FooterSplitOffsets
+import com.posthog.hoglake.hydrator.FooterStats
+import com.posthog.hoglake.hydrator.Hydrator
+import com.posthog.hoglake.hydrator.ObjectStore
+import com.posthog.hoglake.hydrator.TransientFetchException
+import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnStats
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.HydratorSweepResult
@@ -8,19 +16,9 @@ import com.posthog.hoglake.model.MaintenanceTrigger
 import com.posthog.hoglake.model.RehydrateResult
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
-import com.posthog.hoglake.hydrator.FooterReader
-import com.posthog.hoglake.hydrator.CatalogColumn
-import com.posthog.hoglake.hydrator.FooterSplitOffsets
-import com.posthog.hoglake.hydrator.FooterStats
-import com.posthog.hoglake.hydrator.Hydrator
-import com.posthog.hoglake.hydrator.ObjectStore
-import com.posthog.hoglake.hydrator.TransientFetchException
-import com.posthog.hoglake.model.ColType
-import com.posthog.hoglake.service.requireOperationMetadata
 import io.github.oshai.kotlinlogging.KotlinLogging
-import java.time.Instant
-import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.ThreadLocalRandom
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * The hydrator on hoglite: [Hydrator]'s semantics over the tenant
@@ -99,7 +97,8 @@ internal class HogliteHydrator(
         for (row in pending) {
             val file =
                 Hydrator.PendingFile(
-                    catalogId = 0, // the tenant IS the catalog; nothing reads it
+                    // the tenant IS the catalog; nothing reads catalogId
+                    catalogId = 0,
                     dataFileId = row[0].asLong(),
                     tableId = row[1].asLong(),
                     path = row[2].asString(),
@@ -189,15 +188,16 @@ internal class HogliteHydrator(
         // resolved row is not overwritten (Hydrator's `flipped == 0`
         // case, here simply not counted as hydrated).
         val tx = HogliteTx()
-        val flip = tx.add(
-            "UPDATE files SET stats_state = 'provided', missing_field_ids = ?, " +
-                "stats_json = COALESCE(?, stats_json), split_offsets_json = ? " +
-                "WHERE id = ? AND stats_state = 'pending'",
-            if (missingFieldIds) 1L else 0L,
-            statsJson,
-            splitOffsets?.let { offs -> store.json.writeValueAsString(offs.toList()) },
-            file.dataFileId,
-        )
+        val flip =
+            tx.add(
+                "UPDATE files SET stats_state = 'provided', missing_field_ids = ?, " +
+                    "stats_json = COALESCE(?, stats_json), split_offsets_json = ? " +
+                    "WHERE id = ? AND stats_state = 'pending'",
+                if (missingFieldIds) 1L else 0L,
+                statsJson,
+                splitOffsets?.let { offs -> store.json.writeValueAsString(offs.toList()) },
+                file.dataFileId,
+            )
         val flipped = store.runTx(catalog, HogliteCatalogStore.freshTxid("hydrate"), null, tx)[flip].affected
         if (flipped == 0L) {
             log.warn { "file ${file.dataFileId} left 'pending' concurrently; stats upserted anyway" }
@@ -217,8 +217,13 @@ internal class HogliteHydrator(
             "UPDATE files SET stats_state = 'failed'" +
                 (if (missingFieldIds != null) ", missing_field_ids = ?" else "") +
                 " WHERE id = ? AND stats_state = 'pending'",
-            *(if (missingFieldIds != null) arrayOf(if (missingFieldIds) 1L else 0L, file.dataFileId)
-              else arrayOf(file.dataFileId)),
+            *(
+                if (missingFieldIds != null) {
+                    arrayOf(if (missingFieldIds) 1L else 0L, file.dataFileId)
+                } else {
+                    arrayOf(file.dataFileId)
+                }
+            ),
         )
         store.runTx(catalog, HogliteCatalogStore.freshTxid("hydrate-failed"), null, tx)
     }
@@ -248,6 +253,7 @@ internal class HogliteHydrator(
                     at,
                 ).rows
             }
+
         data class Row(val parentFieldId: Long?, val ordinal: Int, val col: CatalogColumn)
         val mapped =
             rows.map { r ->

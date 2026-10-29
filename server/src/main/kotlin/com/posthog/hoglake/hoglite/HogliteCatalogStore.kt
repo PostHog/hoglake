@@ -66,10 +66,23 @@ import java.util.UUID
  */
 class HogliteCatalogStore(
     internal val client: HogliteClient,
+    /*
+     * Deployment prefix for tenant ids (Config.hogliteTenantPrefix):
+     * catalog `wh` lives in tenant `hoglake-wh`. Two hoglake
+     * deployments sharing one hoglite cluster set distinct prefixes.
+     */
+    private val tenantPrefix: String = "hoglake-",
+    /** CommitService's blind-partitioned-append enforcement flag, for the commit port. */
+    internal val refuseBlindPartitionedAppends: Boolean = false,
     /** Removal-ledger retention, for the upload sweep's rested-tombstone rule. */
     private val ledgerRetentionSeconds: Long = com.posthog.hoglake.service.CleanupService.LEDGER_RETENTION_SECONDS,
 ) : CatalogStore {
     internal val json: ObjectMapper = jacksonObjectMapper()
+
+    /** The hoglite tenant id a catalog lives in. Applied at the client boundary ONLY. */
+    internal fun tenantOf(catalog: String): String = tenantPrefix + catalog
+
+    private val log = io.github.oshai.kotlinlogging.KotlinLogging.logger {}
 
     // ==================== catalogs =========================================
 
@@ -103,22 +116,14 @@ class HogliteCatalogStore(
                 )
             }
         }
-        val reg = HogliteTx()
-        reg.expectZero(
-            "SELECT COUNT(*) FROM catalogs WHERE name = ?",
-            name,
-        ) { HoglakeException.AlreadyExists("catalog '$name' already exists") }
-        reg.add("INSERT INTO catalogs(name, data_path) VALUES (?, ?)", name, dataPath)
-        // A fresh txid per CALL: hoglake's createCatalog is not an
-        // idempotent endpoint (a same-name create is a 409), so the guard
-        // — not hoglite's dedup — is what must answer a replay.
-        runTx(REGISTRY_TENANT, freshTxid("create-catalog"), null, reg)
-
-        // The tenant, then its schema and meta row. Both idempotent —
-        // createTenant answers an existing tenant as success, and the
-        // bootstrap's INSERT OR IGNORE + hoglite's dedup make a replay a
-        // read.
-        client.createTenant(name)
+        // The tenant FIRST, then the registry row: a crash between
+        // them leaves an orphan TENANT (harmless — nothing lists it and
+        // a retried create adopts it), never a ghost registry row that
+        // poisons every listCatalogs caller and can be neither created
+        // nor dropped. Both steps are idempotent: createTenant answers
+        // an existing tenant as success, and the bootstrap's
+        // INSERT OR IGNORE + hoglite's dedup make a replay a read.
+        client.createTenant(tenantOf(name))
         val boot = HogliteTx()
         HogliteSchema.DDL.forEach { boot.add(it) }
         boot.add(
@@ -135,13 +140,25 @@ class HogliteCatalogStore(
         // Readback, so a bootstrap racing a different data_path is caught
         // here rather than silently adopting the old one.
         val readback = boot.add("SELECT data_path FROM meta WHERE id = 1")
-        val results = runTx(name, "boot:$name", fp = "bootstrap:v1", boot)
+        val results = runTx(name, "boot:$name", fp = "bootstrap:v1", boot, fenced = false)
         val storedPath = results[readback].firstRow()?.get(0).asString()
         if (storedPath != dataPath) {
             throw HoglakeException.AlreadyExists(
                 "catalog '$name' already exists with a different data_path; drop it first",
             )
         }
+
+        // The registry row publishes the catalog. A fresh txid per CALL:
+        // hoglake's createCatalog is not an idempotent endpoint (a
+        // same-name create is a 409), so the guard — not hoglite's dedup
+        // — is what must answer a replay.
+        val reg = HogliteTx()
+        reg.expectZero(
+            "SELECT COUNT(*) FROM catalogs WHERE name = ?",
+            name,
+        ) { HoglakeException.AlreadyExists("catalog '$name' already exists") }
+        reg.add("INSERT INTO catalogs(name, data_path) VALUES (?, ?)", name, dataPath)
+        runTx(REGISTRY_TENANT, freshTxid("create-catalog"), null, reg, fenced = false)
         return getCatalog(name)
     }
 
@@ -153,7 +170,17 @@ class HogliteCatalogStore(
         return rows.rows
             .map { it[0].asString() }
             .filter { visible == null || it in visible }
-            .map { getCatalog(it) }
+            .mapNotNull {
+                try {
+                    getCatalog(it)
+                } catch (e: HoglakeException.NotFound) {
+                    // A registry row whose tenant is mid-create or
+                    // mid-drop. Skip it rather than failing every
+                    // caller's list; dropCatalog cleans the row up.
+                    log.warn { "catalog '$it' is registered but its tenant is not readable; skipping" }
+                    null
+                }
+            }
     }
 
     override fun dropCatalog(
@@ -161,82 +188,111 @@ class HogliteCatalogStore(
         author: String?,
         message: String?,
     ): DroppedCatalog {
-        val info = meta(catalog)
-        // The emptiness preconditions, in the resolution ORDER the
+        // A ghost registry row (a create that died before its tenant
+        // existed) is droppable too: skip the tenant and take the row.
+        val info =
+            try {
+                meta(catalog)
+            } catch (e: HoglakeException.NotFound) {
+                // No tenant: only a ghost REGISTRY row (a create that
+                // died mid-flight) may still be dropped. An unknown name
+                // is the plain 404.
+                val registered =
+                    queryRegistry("SELECT data_path FROM catalogs WHERE name = ?", catalog)
+                        .firstRow()
+                if (registered == null) {
+                    throw HoglakeException.NotFound("catalog '$catalog'")
+                }
+                runTx(
+                    REGISTRY_TENANT,
+                    freshTxid("drop-catalog"),
+                    null,
+                    HogliteTx().apply { add("DELETE FROM catalogs WHERE name = ?", catalog) },
+                    fenced = false,
+                )
+                return DroppedCatalog(catalog, registered[0].asString())
+            }
+
+        // The emptiness preconditions AND the write fence in ONE
+        // transaction: the guards run in the resolution ORDER the
         // Postgres side documents (CatalogNotEmptyReason's KDoc is the
-        // contract: the FIRST failing precondition in declaration order
-        // is the answer, so a client acting on `reason` walks the chain
-        // front to back). One query per reason, all cheap COUNTs.
-        fun count(sql: String, vararg args: Any?): Long = queryCatalog(catalog, sql, *args).firstRow()!!.get(0).asLong()
-        val liveNamespaces = count("SELECT COUNT(*) FROM namespaces WHERE dropped_snapshot IS NULL")
-        if (liveNamespaces != 0L) {
-            throw HoglakeException.CatalogNotEmpty(
-                "catalog '$catalog' is not empty: $liveNamespaces live namespace(s) remain",
-                CatalogNotEmptyReason.LIVE_NAMESPACES,
-            )
+        // contract), and the same tx sets meta.dropping, which every
+        // mutating tenant tx guards on (runTx statement 0) — so no
+        // namespace, commit, or loop sweep can land between these
+        // checks and the tenant deletion below. The fence tx itself
+        // opts out of the fence (a retried drop after a partial failure
+        // must be able to proceed).
+        fun countNow(sql: String): Long = queryCatalog(catalog, sql).firstRow()!!.get(0).asLong()
+
+        val fenceNow = HogliteSchema.now()
+        val fence = HogliteTx()
+
+        fun emptyGuard(
+            sql: String,
+            reason: CatalogNotEmptyReason,
+            describe: (Long) -> String,
+        ) {
+            fence.expectZero(sql) {
+                val n = countNow(sql)
+                HoglakeException.CatalogNotEmpty(
+                    "catalog '$catalog' is not empty: ${describe(n)}",
+                    reason,
+                )
+            }
         }
-        val liveFiles =
-            count(
-                "SELECT (SELECT COUNT(*) FROM files WHERE end_snapshot IS NULL) + " +
-                    "(SELECT COUNT(*) FROM dvs WHERE end_snapshot IS NULL)",
-            )
-        if (liveFiles != 0L) {
-            throw HoglakeException.CatalogNotEmpty(
-                "catalog '$catalog' is not empty: $liveFiles live file row(s) await retirement",
-                CatalogNotEmptyReason.TABLES_PENDING_RETIREMENT,
-            )
+        emptyGuard(
+            "SELECT COUNT(*) FROM namespaces WHERE dropped_snapshot IS NULL",
+            CatalogNotEmptyReason.LIVE_NAMESPACES,
+        ) { "$it live namespace(s) remain" }
+        emptyGuard(
+            "SELECT (SELECT COUNT(*) FROM files WHERE end_snapshot IS NULL) + " +
+                "(SELECT COUNT(*) FROM dvs WHERE end_snapshot IS NULL)",
+            CatalogNotEmptyReason.TABLES_PENDING_RETIREMENT,
+        ) { "$it live file row(s) await retirement" }
+        emptyGuard(
+            "SELECT (SELECT COUNT(*) FROM files) + (SELECT COUNT(*) FROM dvs)",
+            CatalogNotEmptyReason.FILES_PENDING_EXPIRY,
+        ) { "$it ended file row(s) await expiry" }
+        emptyGuard(
+            "SELECT COUNT(*) FROM removals WHERE drained_at IS NULL",
+            CatalogNotEmptyReason.REMOVALS_PENDING,
+        ) { "$it removal(s) are not drained" }
+        emptyGuard(
+            "SELECT COUNT(*) FROM compaction_claims WHERE expires_at > '$fenceNow'",
+            CatalogNotEmptyReason.ACTIVE_COMPACTION_CLAIMS,
+        ) { "$it live compaction claim(s); a compactor may be mid-rewrite" }
+        emptyGuard(
+            "SELECT COUNT(*) FROM offsets",
+            CatalogNotEmptyReason.CONSUMER_OFFSETS,
+        ) { "$it consumer offset(s) remain" }
+        emptyGuard(
+            "SELECT COUNT(*) FROM uploads WHERE state = 'active'",
+            CatalogNotEmptyReason.ACTIVE_UPLOADS,
+        ) { "$it active upload claim(s) remain" }
+        emptyGuard(
+            "SELECT COUNT(*) FROM uploads WHERE state = 'abandoned' " +
+                "AND (scheduled_at IS NULL OR expires_at > '$fenceNow')",
+            CatalogNotEmptyReason.ABANDONED_UPLOADS_UNSETTLED,
+        ) {
+            "$it abandoned upload(s) are not settled (schedule them with POST .../uploads/schedule-expired, " +
+                "or wait out their expiry window)"
         }
-        val endedFiles = count("SELECT COUNT(*) FROM files") + count("SELECT COUNT(*) FROM dvs")
-        if (endedFiles != 0L) {
-            throw HoglakeException.CatalogNotEmpty(
-                "catalog '$catalog' is not empty: $endedFiles ended file row(s) await expiry",
-                CatalogNotEmptyReason.FILES_PENDING_EXPIRY,
-            )
-        }
-        val pendingRemovals = count("SELECT COUNT(*) FROM removals")
-        if (pendingRemovals != 0L) {
-            throw HoglakeException.CatalogNotEmpty(
-                "catalog '$catalog' is not empty: $pendingRemovals removal(s) are not drained",
-                CatalogNotEmptyReason.REMOVALS_PENDING,
-            )
-        }
-        val offsets = count("SELECT COUNT(*) FROM offsets")
-        if (offsets != 0L) {
-            throw HoglakeException.CatalogNotEmpty(
-                "catalog '$catalog' is not empty: $offsets consumer offset(s) remain",
-                CatalogNotEmptyReason.CONSUMER_OFFSETS,
-            )
-        }
-        val activeUploads = count("SELECT COUNT(*) FROM uploads WHERE state = 'active'")
-        if (activeUploads != 0L) {
-            throw HoglakeException.CatalogNotEmpty(
-                "catalog '$catalog' is not empty: $activeUploads active upload claim(s) remain",
-                CatalogNotEmptyReason.ACTIVE_UPLOADS,
-            )
-        }
-        val unsettledUploads =
-            count(
-                "SELECT COUNT(*) FROM uploads WHERE state = 'abandoned' " +
-                    "AND (scheduled_at IS NULL OR expires_at > ?)",
-                HogliteSchema.now(),
-            )
-        if (unsettledUploads != 0L) {
-            throw HoglakeException.CatalogNotEmpty(
-                "catalog '$catalog' is not empty: $unsettledUploads abandoned upload(s) are not settled " +
-                    "(schedule them with POST .../uploads/schedule-expired, or wait out their expiry window)",
-                CatalogNotEmptyReason.ABANDONED_UPLOADS_UNSETTLED,
-            )
-        }
-        // Order matters (plan §3): fence the owner so nothing in flight
-        // can re-materialize the tenant, THEN delete its durable state,
-        // then the registry row. A 409 from DELETE means a live remote
-        // owner still holds it — fence again and retry; three strikes is
-        // a backend problem, not a client one.
+        fence.add("UPDATE meta SET dropping = 1 WHERE id = 1")
+        runTx(catalog, freshTxid("drop-fence"), null, fence, fenced = false)
+
+        // Order matters: fence the owner so nothing in flight can
+        // re-materialize the tenant, THEN delete its durable state, then
+        // the registry row. release and tenant DELETE are owner-LOCAL in
+        // hoglite (not proxied), so each attempt first pins the owner via
+        // a routed status call; a 409 from DELETE means a live remote
+        // owner still holds it — re-pin, fence again, retry with a pause.
         var fencingFailure: HogliteRejected? = null
         repeat(3) {
-            client.release(catalog)
+            if (it > 0) Thread.sleep(200)
+            client.status(tenantOf(catalog))
+            client.release(tenantOf(catalog))
             try {
-                client.deleteTenant(catalog)
+                client.deleteTenant(tenantOf(catalog))
                 fencingFailure = null
                 return@repeat
             } catch (e: HogliteRejected) {
@@ -254,7 +310,7 @@ class HogliteCatalogStore(
         // Fresh txid: the registry tenant's dedup table survives the
         // catalog's own tenant, so a fixed txid would make a
         // recreate-then-redrop silently skip the registry delete.
-        runTx(REGISTRY_TENANT, freshTxid("drop-catalog"), null, reg)
+        runTx(REGISTRY_TENANT, freshTxid("drop-catalog"), null, reg, fenced = false)
         return DroppedCatalog(catalog, info.dataPath)
     }
 
@@ -706,7 +762,8 @@ class HogliteCatalogStore(
             t.tableId,
         )
         tx.add(
-            "INSERT INTO changes(snapshot_id, kind, object_id) VALUES (${HogliteSchema.HEAD_SQL}, 'table_deleted_from', ?)",
+            "INSERT INTO changes(snapshot_id, kind, object_id) " +
+                "VALUES (${HogliteSchema.HEAD_SQL}, 'table_deleted_from', ?)",
             t.tableId,
         )
         tx.insertSnapshotRow(author, message)
@@ -1181,6 +1238,11 @@ class HogliteCatalogStore(
         tableUuid: UUID,
         snapshotId: Long,
     ): ConsumerOffset {
+        // Postgres enforces the consumer id's 1..128 length as a CHECK;
+        // here it is a typed refusal instead of a SQL error.
+        if (consumerId.isEmpty() || consumerId.length > 128) {
+            throw HoglakeException.Validation("consumer_id must be 1..128 characters, got ${consumerId.length}")
+        }
         val m = meta(catalog)
         if (snapshotId < 0 || snapshotId > m.head) {
             throw HoglakeException.Validation("snapshot $snapshotId out of range [0, ${m.head}]")
@@ -1206,10 +1268,12 @@ class HogliteCatalogStore(
         }
         val now = HogliteSchema.now()
         val tx = HogliteTx()
-        // Monotonic: strictly increasing only, per the Postgres upsert's
-        // `committed_snapshot < EXCLUDED` guard.
+        // Monotonic: never move BACKWARDS. An EQUAL re-commit is the
+        // Postgres upsert's `<= EXCLUDED` arm — accepted, a no-op — which
+        // is what makes a client retry of a timed-out-but-applied call
+        // safe (each call carries a fresh txid).
         tx.expectZero(
-            "SELECT COUNT(*) FROM offsets WHERE consumer_id = ? AND table_uuid = ? AND committed_snapshot >= ?",
+            "SELECT COUNT(*) FROM offsets WHERE consumer_id = ? AND table_uuid = ? AND committed_snapshot > ?",
             consumerId,
             tableUuid.toString(),
             snapshotId,
@@ -1220,8 +1284,8 @@ class HogliteCatalogStore(
         }
         tx.add(
             "INSERT INTO offsets(consumer_id, table_uuid, committed_snapshot, updated_at) VALUES (?, ?, ?, ?) " +
-                "ON CONFLICT(consumer_id, table_uuid) DO UPDATE SET committed_snapshot = excluded.committed_snapshot, " +
-                "updated_at = excluded.updated_at",
+                "ON CONFLICT(consumer_id, table_uuid) DO UPDATE SET " +
+                "committed_snapshot = excluded.committed_snapshot, updated_at = excluded.updated_at",
             consumerId,
             tableUuid.toString(),
             snapshotId,
@@ -1484,6 +1548,7 @@ class HogliteCatalogStore(
                     comment = r[7] as? String,
                 )
             }
+
         fun build(parent: Long?): List<Column> =
             rows.filter { it.parentFieldId == parent }.sortedBy { it.ordinal }.map { r ->
                 Column(
@@ -1580,7 +1645,11 @@ class HogliteCatalogStore(
     ): List<FileColumnStats> {
         val stored = file.statsJson?.let { json.readValue<List<ColumnStats>>(it) } ?: return emptyList()
         val byId = mutableMapOf<Long, Pair<Column, String>>()
-        fun walk(col: Column, path: String) {
+
+        fun walk(
+            col: Column,
+            path: String,
+        ) {
             val here = if (path.isEmpty()) col.def.name else "$path.${col.def.name}"
             byId[col.fieldId] = col to here
             col.children.forEach { walk(it, here) }
@@ -1699,15 +1768,46 @@ class HogliteCatalogStore(
 
     // ---- transports --------------------------------------------------------
 
+    /**
+     * Run [tx] against [catalog]'s tenant.
+     *
+     * Every mutating tenant transaction carries the DROP FENCE as
+     * statement 0: dropCatalog's fencing phase sets `meta.dropping`
+     * under the same guard set that proves the catalog empty, and this
+     * statement is what stops any later write (namespace create, commit,
+     * loop sweep) from landing between those checks and the tenant's
+     * deletion. Registry and bootstrap transactions opt out (the
+     * registry tenant has no meta row; bootstrap is what CREATES it).
+     */
     internal fun runTx(
         catalog: String,
         txid: String,
         fp: String?,
         tx: HogliteTx,
+        fenced: Boolean = true,
     ): List<HogliteQueryResult> =
         try {
-            client.tx(catalog, txid, fp, tx.statements())
+            val statements =
+                if (fenced) {
+                    listOf(
+                        HogliteStatement(
+                            "SELECT COUNT(*) FROM meta WHERE id = 1 AND dropping = 0",
+                            emptyList(),
+                            expectScalarInt = 1,
+                        ),
+                    ) + tx.statements()
+                } else {
+                    tx.statements()
+                }
+            val results = client.tx(tenantOf(catalog), txid, fp, statements)
+            if (fenced) results.subList(1, results.size) else results
         } catch (g: HogliteGuardFailure) {
+            if (fenced) {
+                if (g.statementIndex == 0) {
+                    throw HoglakeException.NotFound("catalog '$catalog' (it is being dropped)")
+                }
+                throw tx.classify(HogliteGuardFailure(g.statementIndex - 1, g.message ?: "guard failed"))
+            }
             throw tx.classify(g)
         } catch (r: HogliteRejected) {
             throw mapRejected(catalog, r)
@@ -1719,7 +1819,7 @@ class HogliteCatalogStore(
         vararg args: Any?,
     ): HogliteQueryResult =
         try {
-            client.query(catalog, sql, args.toList())
+            client.query(tenantOf(catalog), sql, args.toList())
         } catch (r: HogliteRejected) {
             throw mapRejected(catalog, r)
         }
@@ -1734,7 +1834,17 @@ class HogliteCatalogStore(
             // a malformed statement. Both are this store's bug or a bad
             // input the guards should have named; surface as Validation
             // with the engine's message rather than a bare 500.
-            422 -> HoglakeException.Validation("hoglite refused the statement: ${r.body}")
+            422 -> {
+                // The body is hoglite's {"error": "..."}; surface the
+                // engine's message, not raw JSON, into the API error.
+                val detail =
+                    try {
+                        json.readTree(r.body).get("error")?.asText()
+                    } catch (_: Exception) {
+                        null
+                    }
+                HoglakeException.Validation("hoglite refused the statement: ${detail ?: r.body}")
+            }
             else -> HoglakeException.BackendUnavailable("hoglite answered ${r.status}: ${r.body}")
         }
 
@@ -1756,13 +1866,23 @@ class HogliteCatalogStore(
         try {
             val result = body()
             recordRun(
-                catalog, task, trigger, startedAt, java.time.Instant.now(),
-                com.posthog.hoglake.model.MaintenanceRunStatus.OK, null, result,
+                catalog,
+                task,
+                trigger,
+                startedAt,
+                java.time.Instant.now(),
+                com.posthog.hoglake.model.MaintenanceRunStatus.OK,
+                null,
+                result,
             )
             return result
         } catch (e: Throwable) {
             recordRun(
-                catalog, task, trigger, startedAt, java.time.Instant.now(),
+                catalog,
+                task,
+                trigger,
+                startedAt,
+                java.time.Instant.now(),
                 com.posthog.hoglake.model.MaintenanceRunStatus.FAILED,
                 e.message,
                 (e as? com.posthog.hoglake.persistence.PartialResult)?.partial,
@@ -1786,7 +1906,8 @@ class HogliteCatalogStore(
         runCatching {
             val tx = HogliteTx()
             tx.add(
-                "INSERT INTO maintenance_runs(task, run_trigger, started_at, finished_at, status, error, result_json) " +
+                "INSERT INTO maintenance_runs(task, run_trigger, started_at, finished_at, status, error, " +
+                    "result_json) " +
                     "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 task.wire,
                 trigger.wire,
@@ -1810,13 +1931,13 @@ class HogliteCatalogStore(
     }
 
     internal fun ensureRegistry() {
-        client.createTenant(REGISTRY_TENANT)
+        client.createTenant(tenantOf(REGISTRY_TENANT))
         val tx = HogliteTx()
         tx.add(
             "CREATE TABLE IF NOT EXISTS catalogs(name TEXT PRIMARY KEY, data_path TEXT NOT NULL)",
         )
         // Fixed txid + fp: replaying the bootstrap is a no-op read.
-        runTx(REGISTRY_TENANT, "boot:$REGISTRY_TENANT", "registry:v1", tx)
+        runTx(REGISTRY_TENANT, "boot:$REGISTRY_TENANT", "registry:v1", tx, fenced = false)
     }
 
     internal fun queryRegistry(
@@ -1824,14 +1945,14 @@ class HogliteCatalogStore(
         vararg args: Any?,
     ): HogliteQueryResult =
         try {
-            client.query(REGISTRY_TENANT, sql, args.toList())
+            client.query(tenantOf(REGISTRY_TENANT), sql, args.toList())
         } catch (r: HogliteRejected) {
             if (r.status == 404 || (r.status == 422 && "no such table" in r.body)) {
                 // Registry tenant not bootstrapped yet (first-ever call,
                 // or a catalog list before any create): bootstrap and
                 // retry once.
                 ensureRegistry()
-                client.query(REGISTRY_TENANT, sql, args.toList())
+                client.query(tenantOf(REGISTRY_TENANT), sql, args.toList())
             } else {
                 throw mapRejected(REGISTRY_TENANT, r)
             }
@@ -1854,7 +1975,10 @@ class HogliteCatalogStore(
         tableIdSql: String,
         columns: List<Column>,
     ) {
-        fun walk(cols: List<Column>, parent: Long?) {
+        fun walk(
+            cols: List<Column>,
+            parent: Long?,
+        ) {
             for (c in cols) {
                 tx.add(
                     "INSERT INTO columns(table_id, field_id, parent_field_id, ordinal, name, type, " +

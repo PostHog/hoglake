@@ -8,7 +8,6 @@ import com.posthog.hoglake.model.FindingResolution
 import com.posthog.hoglake.model.FindingSeverity
 import com.posthog.hoglake.model.ResolutionKind
 import com.posthog.hoglake.service.DatabaseHealthBackend
-import java.time.Instant
 
 /**
  * `GET /v1/database/health` on hoglite — the ONE genuinely

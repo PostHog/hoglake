@@ -52,7 +52,8 @@ internal class HogliteViews(
         val viewUuid = UUID.randomUUID()
         tx.add(
             "INSERT INTO views(id, namespace_id, namespace, name, view_uuid, dialect, sql_text, created_snapshot) " +
-                "VALUES ((SELECT next_view_id - 1 FROM meta WHERE id = 1), ?, ?, ?, ?, ?, ?, ${HogliteSchema.HEAD_SQL})",
+                "VALUES ((SELECT next_view_id - 1 FROM meta WHERE id = 1), ?, ?, ?, ?, ?, ?, " +
+                "${HogliteSchema.HEAD_SQL})",
             ns.namespaceId,
             namespace,
             name,

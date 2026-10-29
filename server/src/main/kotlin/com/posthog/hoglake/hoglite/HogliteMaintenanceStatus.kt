@@ -110,7 +110,12 @@ internal class HogliteMaintenanceStatus(
                 ).rows.map { name to toRun(name, it) }
             }.onSuccess { all += it }
         }
-        val ordered = all.sortedWith(compareByDescending<Pair<String, MaintenanceRun>> { it.second.startedAt }.thenByDescending { it.second.runId })
+        val ordered =
+            all.sortedWith(
+                compareByDescending<Pair<String, MaintenanceRun>> {
+                    it.second.startedAt
+                }.thenByDescending { it.second.runId },
+            )
         // `before` is a ledger id; on the instance feed it is advisory —
         // applied as a started_at horizon would lose same-second runs, so
         // it filters nothing here and the page is simply the newest cap.
@@ -302,8 +307,7 @@ internal class HogliteMaintenanceStatus(
     private fun page(
         rows: List<MaintenanceRun>,
         cap: Int,
-    ): MaintenanceRunPage =
-        MaintenanceRunPage(runs = rows.take(cap), hasMore = rows.size > cap)
+    ): MaintenanceRunPage = MaintenanceRunPage(runs = rows.take(cap), hasMore = rows.size > cap)
 
     private fun validateLimit(limit: Int): Int {
         if (limit <= 0) throw HoglakeException.Validation("limit must be positive (got $limit)")

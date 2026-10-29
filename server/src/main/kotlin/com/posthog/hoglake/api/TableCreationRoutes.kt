@@ -4,8 +4,8 @@ import com.fasterxml.jackson.databind.annotation.JsonDeserialize
 import com.posthog.hoglake.auth.actorOrRefuse
 import com.posthog.hoglake.service.ReplacementTarget
 import com.posthog.hoglake.service.TableCreation
-import com.posthog.hoglake.service.TableCreationDefinition
 import com.posthog.hoglake.service.TableCreationBackend
+import com.posthog.hoglake.service.TableCreationDefinition
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
 import io.ktor.server.plugins.BadRequestException

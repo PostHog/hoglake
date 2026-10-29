@@ -1,13 +1,12 @@
 package com.posthog.hoglake.hoglite
 
-import com.posthog.hoglake.service.ExpiryBackend
 import com.posthog.hoglake.model.ExpiryResult
 import com.posthog.hoglake.model.HoglakeException
-import com.posthog.hoglake.model.MaintenanceRunStatus
 import com.posthog.hoglake.model.MaintenanceTask
 import com.posthog.hoglake.model.MaintenanceTrigger
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
+import com.posthog.hoglake.service.ExpiryBackend
 import java.time.Instant
 
 /**
@@ -170,8 +169,9 @@ internal class HogliteExpiry(
                 },
             )[0].affected.toLong()
 
-        val retention = pre.retentionSeconds
-            ?: return Advance(0, pre.earliestSnapshotId, null, released)
+        val retention =
+            pre.retentionSeconds
+                ?: return Advance(0, pre.earliestSnapshotId, null, released)
 
         val now = Instant.now()
         val cutoff = HogliteSchema.fmt(now.minusSeconds(retention))
@@ -211,16 +211,44 @@ internal class HogliteExpiry(
         }
 
         val tx = HogliteTx()
+        // The floor's invariants, re-asserted IN the transaction (the
+        // planning reads above are separate requests; hoglite serializes
+        // the tx, not them):
+        //  - OCC on the floor itself: a concurrent sweep that advanced it
+        //    invalidates this plan (and the floor must never regress).
+        //  - The consumer floor: a consumer that registered below the
+        //    planned floor since planning keeps its history.
+        // A miss is a typed conflict; the next sweep re-plans.
+        tx.expectScalar(
+            pre.earliestSnapshotId,
+            "SELECT earliest_snapshot_id FROM meta WHERE id = 1",
+        ) {
+            HoglakeException.CommitConflict(
+                "the expiry floor moved under this sweep; the next run re-plans",
+            )
+        }
+        if (pre.consumerFloor) {
+            tx.expectZero(
+                "SELECT COUNT(*) FROM offsets o JOIN tables t ON t.table_uuid = o.table_uuid " +
+                    "WHERE o.committed_snapshot < ?",
+                newEarliest,
+            ) {
+                HoglakeException.CommitConflict(
+                    "a consumer registered below this sweep's planned floor; the next run re-plans",
+                )
+            }
+        }
         tx.add(
             "DELETE FROM changes WHERE snapshot_id >= ? AND snapshot_id < ?",
             pre.earliestSnapshotId,
             newEarliest,
         )
-        val snapshots = tx.add(
-            "DELETE FROM snapshots WHERE id >= ? AND id < ?",
-            pre.earliestSnapshotId,
-            newEarliest,
-        )
+        val snapshots =
+            tx.add(
+                "DELETE FROM snapshots WHERE id >= ? AND id < ?",
+                pre.earliestSnapshotId,
+                newEarliest,
+            )
         // The new floor snapshot's time rides the same update: that row
         // survives this sweep, and 410 reconciliation needs the time
         // after the rows below it are gone.
@@ -352,15 +380,21 @@ internal class HogliteExpiry(
                 }
             if (page.isEmpty()) break
             val ids = page.map { it[0].asLong() }
-            val riding =
-                store.queryCatalog(
-                    catalog,
-                    "SELECT delete_file_id, path FROM dvs " +
-                        "WHERE data_file_id IN (${ids.joinToString(",") { "?" }})",
-                    *ids.toTypedArray(),
-                ).rows
             runCatching {
                 val tx = HogliteTx()
+                // The riding vectors' removals come from the same
+                // predicate INSIDE the transaction: a DV that lands
+                // between the page read and this tx is queued AND
+                // deleted atomically, never orphaned.
+                val dvQueue =
+                    tx.add(
+                        "INSERT INTO removals(path, file_kind, reason, queued_snapshot, queued_at) " +
+                            "SELECT path, 'delete', 'snapshot_expiry', ?, ? FROM dvs " +
+                            "WHERE data_file_id IN (${ids.joinToString(",") { "?" }})",
+                        floor,
+                        HogliteSchema.now(),
+                        *ids.toTypedArray(),
+                    )
                 tx.add(
                     "DELETE FROM dvs WHERE data_file_id IN (${ids.joinToString(",") { "?" }})",
                     *ids.toTypedArray(),
@@ -380,16 +414,8 @@ internal class HogliteExpiry(
                         HogliteSchema.now(),
                     )
                 }
-                for (row in riding) {
-                    tx.add(
-                        "INSERT INTO removals(path, file_kind, reason, queued_snapshot, queued_at) " +
-                            "VALUES (?, 'delete', 'snapshot_expiry', ?, ?)",
-                        row[1].asString(),
-                        floor,
-                        HogliteSchema.now(),
-                    )
-                }
                 store.runTx(catalog, HogliteCatalogStore.freshTxid("expiry-purge-data"), null, tx)
+                    .also { deleteRows += it[dvQueue].affected }
             }.onFailure {
                 failures++
                 truncated = true
@@ -397,7 +423,6 @@ internal class HogliteExpiry(
             if (failures > 0) break
             pages++
             dataRows += ids.size
-            deleteRows += riding.size
             if (ids.size < purgePage) break
         }
 

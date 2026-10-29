@@ -91,7 +91,8 @@ class HealthProbe private constructor(
     @Suppress("UNUSED_PARAMETER") marker: PrivateCtorMarker,
 ) : AutoCloseable {
     /** Distinguishes the target-factory primary constructor from the DataSource one. */
-    private enum class PrivateCtorMarker { MARK }
+    private enum class PrivateCtorMarker { MARK, }
+
     /**
      * What one probe run asks. The Postgres target borrows its own
      * one-connection pool and runs `SELECT 1`; the hoglite target calls

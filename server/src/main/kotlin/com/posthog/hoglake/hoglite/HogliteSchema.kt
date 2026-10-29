@@ -56,7 +56,12 @@ internal object HogliteSchema {
                 earliest_snapshot_id INTEGER NOT NULL DEFAULT 0,
                 earliest_snapshot_time TEXT,
                 snapshot_retention_seconds INTEGER,
-                consumer_floor INTEGER NOT NULL DEFAULT 1
+                consumer_floor INTEGER NOT NULL DEFAULT 1,
+                /* Set by dropCatalog's fencing transaction: every
+                 * mutating tenant tx guards on it, so no write can land
+                 * between the drop's emptiness checks and the tenant's
+                 * deletion. */
+                dropping INTEGER NOT NULL DEFAULT 0
             )""",
             """CREATE TABLE IF NOT EXISTS namespaces(
                 id INTEGER PRIMARY KEY,
@@ -82,7 +87,7 @@ internal object HogliteSchema {
             )""",
             """CREATE UNIQUE INDEX IF NOT EXISTS tables_live
                 ON tables(namespace, name) WHERE dropped_snapshot IS NULL""",
-            /**
+            /*
              * The table's (namespace, name, comment, properties) as an
              * interval — hog_table_version's shape. RENAME and metadata
              * sets end the live version and open a new one, so a
@@ -103,7 +108,7 @@ internal object HogliteSchema {
             )""",
             """CREATE UNIQUE INDEX IF NOT EXISTS table_versions_live
                 ON table_versions(namespace, name) WHERE end_snapshot IS NULL""",
-            /**
+            /*
              * Column VERSIONS, one row per column node (top-level or
              * nested) per interval of visibility — hog_column's shape.
              * A column dropped by an alter keeps its rows with
@@ -161,7 +166,7 @@ internal object HogliteSchema {
             )""",
             "CREATE INDEX IF NOT EXISTS changes_obj ON changes(object_id, snapshot_id)",
             "CREATE INDEX IF NOT EXISTS changes_snap ON changes(snapshot_id)",
-            /**
+            /*
              * Files keep an end_snapshot from day one even though the
              * maintenance loops that SET it (expiry, compaction,
              * truncate) are ported later: every visibility predicate is
@@ -216,7 +221,7 @@ internal object HogliteSchema {
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY(consumer_id, table_uuid)
             )""",
-            /**
+            /*
              * Upload claims: the fenced path reservation a writer without
              * S3 credentials of its own holds between claiming a path and
              * committing the file that landed there. States: 'active',
@@ -234,7 +239,7 @@ internal object HogliteSchema {
                 scheduled_at TEXT
             )""",
             "CREATE UNIQUE INDEX IF NOT EXISTS uploads_path ON uploads(path)",
-            /**
+            /*
              * Atomic table creations: the durable payload a writer stages
              * with PUT .../table-creations/{op} and publishes with
              * .../commit. The definition is the request verbatim, so a
@@ -254,16 +259,12 @@ internal object HogliteSchema {
                 reason TEXT,
                 created_at TEXT NOT NULL
             )""",
-            /**
-             * The removal queue cleanup drains: a physical object's path
-             * once no retained snapshot references it. claimed_* is the
-             * cleanup worker's lease on the row.
-             */
-            /**
+            /*
              * The removal queue (Postgres's hog_file_removal minus
              * catalog_id): expiry/compaction/retirement/upload-abandon
              * queue an object path here; the cleanup drain claims with a
              * lease, deletes the object, and settles with an outcome.
+             * claimed_* is the cleanup worker's lease on the row.
              */
             """CREATE TABLE IF NOT EXISTS removals(
                 id INTEGER PRIMARY KEY,
@@ -294,7 +295,7 @@ internal object HogliteSchema {
             )""",
             """CREATE UNIQUE INDEX IF NOT EXISTS views_live
                 ON views(namespace, name) WHERE dropped_snapshot IS NULL""",
-            /**
+            /*
              * Compaction claims (Postgres's hog_compaction_claim): one row
              * per claimed group, keyed by (table, sorted input ids), with a
              * lease. A claim is efficiency — the commit's liveness guards
@@ -310,7 +311,7 @@ internal object HogliteSchema {
                 expires_at TEXT NOT NULL,
                 PRIMARY KEY(table_id, group_key)
             )""",
-            /**
+            /*
              * The maintenance run ledger (the maintenance status/runs
              * routes read it): one row per task run, Postgres's
              * hog_maintenance_run minus catalog_id (the tenant IS the
@@ -332,7 +333,7 @@ internal object HogliteSchema {
     private val TS_FORMAT: DateTimeFormatter =
         DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'").withZone(ZoneOffset.UTC)
 
-    /** The one timestamp encoding: fixed-width UTC millis, lexically sortable. */
+    // The one timestamp encoding: fixed-width UTC millis, lexically sortable.
     fun fmt(instant: Instant): String = TS_FORMAT.format(instant)
 
     fun parse(ts: String): Instant = Instant.parse(ts)

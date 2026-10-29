@@ -2684,12 +2684,15 @@ sealed class HoglakeException(message: String) : RuntimeException(message) {
      * retry budget exhausted on transient errors) -> HTTP 503
      * `backend_unavailable` with `Retry-After`.
      *
-     * Retryable by construction: nothing about the request was refused,
-     * it was never evaluated. Distinct from [CommitQueueTimeout] — that
+     * Retryable: nothing about the request was refused. Caveat the
+     * caller must know: a commit whose TRANSACTION timed out may have
+     * applied — the client got no answer, not a rollback — so a retried
+     * write needs its own idempotency (an idempotency key, or the
+     * acceptance of a typed AlreadyExists/Conflict on the retry).
+     * Distinct from [CommitQueueTimeout] — that
      * one is a catalog convoying on its own commit lock while the
      * database is healthy; this one is the database itself not
      * answering, which an operator pages on differently.
      */
     class BackendUnavailable(detail: String) : HoglakeException(detail)
-
 }

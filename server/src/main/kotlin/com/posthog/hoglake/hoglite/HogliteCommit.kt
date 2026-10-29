@@ -1,5 +1,7 @@
 package com.posthog.hoglake.hoglite
 
+import com.posthog.hoglake.commit.CommitService.Companion.BLIND_PARTITIONED_REFUSAL
+import com.posthog.hoglake.commit.CommitService.Companion.blindPartitionedRefusal
 import com.posthog.hoglake.commit.commitFingerprint
 import com.posthog.hoglake.commit.commitFingerprintDigest
 import com.posthog.hoglake.commit.pathStaysUnder
@@ -13,7 +15,6 @@ import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.StatsSanity
 import com.posthog.hoglake.model.validateSplitOffsets
 import io.github.oshai.kotlinlogging.KotlinLogging
-import java.security.MessageDigest
 import java.util.UUID
 
 /**
@@ -49,6 +50,7 @@ import java.util.UUID
  *    the loser's whole transaction rolls back on the constraint
  *    violation.
  */
+
 internal object HogliteCommit {
     private val log = KotlinLogging.logger {}
 
@@ -59,6 +61,31 @@ internal object HogliteCommit {
     private const val DDL_KINDS = "('table_dropped','table_altered')"
 
     fun commit(
+        store: HogliteCatalogStore,
+        catalog: String,
+        request: CommitRequest,
+    ): CommitResult {
+        // The schema fence (SCHEMA_CHANGED, guarded in-tx below) means a
+        // DDL landed between this commit's planning and its transaction.
+        // Postgres re-validates under the commit lock; the hoglite shape
+        // re-plans instead: one retry with fresh state, then the conflict
+        // stands as a typed, retryable refusal.
+        return try {
+            doCommit(store, catalog, request)
+        } catch (e: HoglakeException.CommitConflict) {
+            if (e !== SCHEMA_CHANGED) throw e
+            try {
+                doCommit(store, catalog, request)
+            } catch (e2: HoglakeException.CommitConflict) {
+                if (e2 !== SCHEMA_CHANGED) throw e2
+                throw HoglakeException.CommitConflict(
+                    "concurrent DDL changed the schema twice while this commit was being planned; retry",
+                )
+            }
+        }
+    }
+
+    private fun doCommit(
         store: HogliteCatalogStore,
         catalog: String,
         request: CommitRequest,
@@ -74,6 +101,7 @@ internal object HogliteCommit {
         // as the Postgres path does, so one table gets one guard set
         // and one change row per kind.
         val order = LinkedHashMap<String, Touched>()
+
         fun touch(
             namespace: String,
             table: String,
@@ -139,6 +167,9 @@ internal object HogliteCommit {
 
         val readSnapshot = request.readSnapshot
         if (readSnapshot != null) {
+            if (readSnapshot < 0) {
+                throw HoglakeException.Validation("read_snapshot must be non-negative, got $readSnapshot")
+            }
             if (readSnapshot > meta.head) {
                 throw HoglakeException.Validation(
                     "read_snapshot $readSnapshot is ahead of head ${meta.head}",
@@ -196,7 +227,11 @@ internal object HogliteCommit {
         // ---- request-side validation (refusals that do not depend on tx state)
 
         val allPaths = LinkedHashMap<String, String>() // path -> file_kind
-        fun claimPath(path: String, kind: String) {
+
+        fun claimPath(
+            path: String,
+            kind: String,
+        ) {
             val prev = allPaths.putIfAbsent(path, kind)
             if (prev != null && prev != kind) {
                 throw HoglakeException.Validation("one upload path cannot hold both data and deletion vectors")
@@ -234,10 +269,41 @@ internal object HogliteCommit {
             }
         }
 
+        // Blind partitioned appends (CommitService's rule, verbatim):
+        // a commit with no read_snapshot whose files carry partition
+        // values. WARN + counter always; the 422 once the deployment's
+        // flag is on.
+        if (readSnapshot == null) {
+            val offending =
+                appends.filter { a -> a.files.any { it.partitionValues != null } }
+                    .map { "${it.namespace}.${it.table}" }.sorted()
+            for (qname in offending) {
+                com.posthog.hoglake.observability.Metrics.blindPartitionedAppend(
+                    catalog,
+                    qname.substringBefore('.'),
+                    qname.substringAfter('.'),
+                )
+                if (WARNED_BLIND_PARTITIONED.add("$catalog:$qname")) {
+                    log.warn {
+                        "blind partitioned append to $catalog.$qname accepted: $BLIND_PARTITIONED_REFUSAL"
+                    }
+                }
+            }
+            if (offending.isNotEmpty() && store.refuseBlindPartitionedAppends) {
+                throw HoglakeException.Validation(
+                    "${blindPartitionedRefusal(offending)}: $BLIND_PARTITIONED_REFUSAL",
+                )
+            }
+        }
+
         // DV targets: staged (this commit's appends, by path) or durable
         // (a data_file_id). Staged references must carry dataFileId 0.
-        val stagedIdByPath = mutableMapOf<String, Int>() // path -> index into plannedAppends
-        plannedAppends.forEachIndexed { i, p -> stagedIdByPath[p.file.path] = i }
+        // Staged references resolve by (TABLE, path) — Postgres's
+        // (tableId, path) resolution: a DV's target must be a file THIS
+        // delete's table is appending, so a cross-table staged reference
+        // can never bind another table's file to this table's DV row.
+        val stagedIdByPath = mutableMapOf<Pair<Long, String>, Int>()
+        plannedAppends.forEachIndexed { i, p -> stagedIdByPath[p.table.tableId to p.file.path] = i }
         val plannedDeletes = mutableListOf<PlannedDelete>()
         val seenTargets = mutableSetOf<Long>()
         val seenStaged = mutableSetOf<Int>()
@@ -253,11 +319,12 @@ internal object HogliteCommit {
                                 "(the file is allocated by this commit)",
                         )
                     }
-                    val target = stagedIdByPath[staged]
-                        ?: throw HoglakeException.Validation(
-                            "deletion vector for ${delete.namespace}.${delete.table} references " +
-                                "data_file_path $staged, which this commit does not append",
-                        )
+                    val target =
+                        stagedIdByPath[table.tableId to staged]
+                            ?: throw HoglakeException.Validation(
+                                "deletion vector for ${delete.namespace}.${delete.table} references " +
+                                    "data_file_path $staged, which this commit does not append to that table",
+                            )
                     if (!seenStaged.add(target)) {
                         throw HoglakeException.Validation(
                             "the staged file $staged has two deletion vectors in one commit",
@@ -347,10 +414,9 @@ internal object HogliteCommit {
 
         // 1. Table guards: live + incarnation, inside the transaction.
         for ((qname, t) in resolved) {
-            tx.expectOne(
-                "SELECT COUNT(*) FROM tables WHERE id = ? AND dropped_snapshot IS NULL",
-                t.tableId,
-            ) { HoglakeException.NotFound("table '$qname' in catalog '$catalog'") }
+            // Incarnation BEFORE liveness: a recreate changes the table
+            // id, and a caller holding the old incarnation must get the
+            // retryable 409s (re-read), never a bare 404.
             val touched = order.values.first { "${it.namespace}.${it.table}" == qname }
             touched.expectedUuid?.let { expected ->
                 tx.expectOne(
@@ -367,9 +433,57 @@ internal object HogliteCommit {
                     )
                 }
             }
+            tx.expectOne(
+                "SELECT COUNT(*) FROM tables WHERE id = ? AND dropped_snapshot IS NULL",
+                t.tableId,
+            ) {
+                // Classify AFTER the rollback: the failure lambda runs
+                // once the transaction is already dead, so this read sees
+                // the state that refused us.
+                val row =
+                    store.queryCatalog(
+                        catalog,
+                        "SELECT dropped_snapshot FROM tables WHERE id = ?",
+                        t.tableId,
+                    ).firstRow()
+                if (row != null && row[0] != null) {
+                    HoglakeException.TableDropped(
+                        "table '$qname' in catalog '$catalog' was dropped at snapshot " +
+                            "${row[0].asLong()}; stop, or recreate it",
+                    )
+                } else {
+                    HoglakeException.NotFound("table '$qname' in catalog '$catalog'")
+                }
+            }
         }
 
-        // 2. Conflict guards for the race between the pre-flight read
+        // 2a. The schema fence: planning (specs, column types, stats
+        // validation) ran against head's schema; a DDL that landed since
+        // invalidates that planning even when the request carries no
+        // read_snapshot (a blind append). Failure replans once via the
+        // commit() wrapper.
+        tx.expectScalar(
+            meta.schemaVersion,
+            "SELECT schema_version FROM meta WHERE id = 1",
+        ) { SCHEMA_CHANGED }
+
+        // 2b. The expiry floor, in-tx: a sweep that advanced the floor
+        // past this commit's read snapshot since planning must not let
+        // the commit's conflict window silently empty (the change rows
+        // are already purged). Same 410 the pre-flight check answers.
+        if (readSnapshot != null) {
+            tx.expectZero(
+                "SELECT COUNT(*) FROM meta WHERE id = 1 AND earliest_snapshot_id > ?",
+                readSnapshot,
+            ) {
+                HoglakeException.Expired(
+                    "read_snapshot $readSnapshot is below the expiry floor; reconcile from a full " +
+                        "scan at a retained snapshot",
+                )
+            }
+        }
+
+        // 2c. Conflict guards for the race between the pre-flight read
         // and this transaction. CONTENT FIRST: a mixed window must
         // answer the retryable code.
         if (readSnapshot != null) {
@@ -408,7 +522,8 @@ internal object HogliteCommit {
         // registered (hoglake's refuseQueuedPaths).
         if (allPaths.isNotEmpty()) {
             tx.expectZero(
-                "SELECT COUNT(*) FROM removals WHERE path IN (${allPaths.keys.joinToString(",") { "?" }})",
+                "SELECT COUNT(*) FROM removals WHERE drained_at IS NULL " +
+                    "AND path IN (${allPaths.keys.joinToString(",") { "?" }})",
                 *allPaths.keys.toTypedArray(),
             ) {
                 HoglakeException.CommitConflict(
@@ -426,8 +541,8 @@ internal object HogliteCommit {
                 "UPDATE meta SET next_file_id = next_file_id + $totalFiles WHERE id = 1",
             ) { HoglakeException.NotFound("catalog '$catalog'") }
         }
-        fun allocatedId(offset: Int): String =
-            "(SELECT next_file_id - $totalFiles + $offset FROM meta WHERE id = 1)"
+
+        fun allocatedId(offset: Int): String = "(SELECT next_file_id - $totalFiles + $offset FROM meta WHERE id = 1)"
 
         // 5. Appends: file rows with server-assigned row lineage.
         val appendedIdByIndex = mutableMapOf<Int, String>()
@@ -517,6 +632,32 @@ internal object HogliteCommit {
                         "delete for $qname targets unknown data_file_id $target",
                     )
                 }
+                // Target liveness, typed like Postgres's planDeletes:
+                // retired AFTER the writer's read is the retryable
+                // conflict (compaction landed mid-flight); retired AT OR
+                // BEFORE it is the stale-request refusal. Without these a
+                // DV can land on a dead compaction input and its deletes
+                // never apply to the replacement's rows.
+                tx.expectZero(
+                    "SELECT COUNT(*) FROM files WHERE id = ? AND end_snapshot IS NOT NULL " +
+                        "AND end_snapshot > ?",
+                    target,
+                    readSnapshot,
+                ) {
+                    HoglakeException.CommitConflict(
+                        "delete for $qname targets data_file_id $target, which was retired after " +
+                            "read snapshot $readSnapshot",
+                    )
+                }
+                tx.expectOne(
+                    "SELECT COUNT(*) FROM files WHERE id = ? AND end_snapshot IS NULL",
+                    target,
+                ) {
+                    HoglakeException.Validation(
+                        "delete for $qname targets data_file_id $target, which was retired at or " +
+                            "before read snapshot $readSnapshot",
+                    )
+                }
                 // The target appeared after the read: the vector was
                 // planned without it. Retryable.
                 tx.expectZero(
@@ -560,6 +701,17 @@ internal object HogliteCommit {
                             "live deletion vector — vectors only grow",
                     )
                 }
+                // Supersession ends the live predecessor atomically
+                // (Postgres's ended_dvs): exactly one DV per data file is
+                // live at any head, which compaction's candidate join and
+                // its GUARD 5, expiry's purge, and storage accounting all
+                // assume. The UPDATE runs BEFORE the insert so the new
+                // epoch stays live.
+                tx.add(
+                    "UPDATE dvs SET end_snapshot = ${HogliteSchema.HEAD_SQL} " +
+                        "WHERE data_file_id = ? AND end_snapshot IS NULL",
+                    target,
+                )
                 tx.add(
                     "INSERT INTO dvs(data_file_id, table_id, delete_file_id, path, delete_count, " +
                         "file_size_bytes, begin_snapshot, epoch) " +
@@ -571,14 +723,31 @@ internal object HogliteCommit {
                     dv.fileSizeBytes,
                     target,
                 )
+                // The invariant, asserted: after supersession exactly one
+                // live epoch remains for this file.
+                tx.expectScalar(
+                    1,
+                    "SELECT COUNT(*) FROM dvs WHERE data_file_id = ? AND end_snapshot IS NULL",
+                    target,
+                ) {
+                    HoglakeException.CommitConflict(
+                        "deletion vector supersession for data_file_id $target in $qname violated " +
+                            "the one-live-epoch invariant (a store bug; rolled back cleanly)",
+                    )
+                }
             }
         }
 
         // 7. Upload claim settlement (the decision was pre-flight).
+        // The settle re-asserts the FULL claim predicate — active AND
+        // ours — so an abandonment or a fence that landed between
+        // pre-flight and this transaction stops the publication rather
+        // than being overwritten back to registered.
         for (claimId in claimsToSettle) {
             tx.affectOne(
-                "UPDATE uploads SET state = 'registered' WHERE upload_id = ?",
+                "UPDATE uploads SET state = 'registered' WHERE upload_id = ? AND state = 'active' AND owner = ?",
                 claimId,
+                request.idempotencyKey?.toString(),
             ) {
                 HoglakeException.CommitConflict(
                     "upload is fenced, already registered, or belongs to another operation",
@@ -616,9 +785,17 @@ internal object HogliteCommit {
         }
         val readback = tx.add(HogliteSql.READBACK_COMMIT)
 
+        // Keyed commits reuse the key's txid so a replayed request
+        // answers from hoglite's dedup; UNKEYED commits get a fresh txid
+        // per store invocation — Postgres grants publication idempotency
+        // only to explicit keys, and a content-derived txid would make an
+        // identical LATER commit (truncate + reload of the same paths)
+        // silently replay the old result without applying. The txid is
+        // minted here, once, and HogliteClient's retry loop reuses it, so
+        // at-most-once holds across this request's own retries.
         val txid =
             request.idempotencyKey?.let { "ik:$catalog:$it" }
-                ?: "ch:$catalog:${sha256Hex16(canonical)}"
+                ?: "ch:$catalog:${UUID.randomUUID()}"
         val results =
             try {
                 store.runTx(catalog, txid, fingerprint, tx)
@@ -626,7 +803,10 @@ internal object HogliteCommit {
                 // The receipt PRIMARY KEY is the race closer: two
                 // different payloads under one key -> the loser's
                 // constraint violation lands here.
-                if (request.idempotencyKey != null && "receipts" in (e.message ?: "")) {
+                val msg = e.message ?: ""
+                if (request.idempotencyKey != null &&
+                    ("receipts" in msg || "idempotency key reused" in msg)
+                ) {
                     throw HoglakeException.Validation(
                         "idempotency_key ${request.idempotencyKey} was already used with a different payload",
                     )
@@ -859,8 +1039,14 @@ internal object HogliteCommit {
     }
 
     private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
-
-    /** The content-addressed txid's payload half: first 16 bytes of the canonical request's SHA-256. */
-    private fun sha256Hex16(canonical: String): String =
-        MessageDigest.getInstance("SHA-256").digest(canonical.toByteArray()).take(16).toByteArray().toHex()
 }
+
+// The schema-fence failure, matched by IDENTITY in commit()'s retry
+// wrapper: a guard lambda returns this one instance, classify passes it
+// through, and only a reference-equal catch means "replan", never a
+// lookalike CommitConflict from another guard.
+private val SCHEMA_CHANGED =
+    HoglakeException.CommitConflict("concurrent DDL changed the schema while this commit was being planned")
+
+// Blind-partitioned WARN dedupe, per (catalog, table), for the process's life.
+private val WARNED_BLIND_PARTITIONED = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()

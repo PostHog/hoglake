@@ -1,6 +1,5 @@
 package com.posthog.hoglake.hoglite
 
-import com.posthog.hoglake.service.CleanupBackend
 import com.posthog.hoglake.Config
 import com.posthog.hoglake.model.CleanupResult
 import com.posthog.hoglake.model.HoglakeException
@@ -8,6 +7,7 @@ import com.posthog.hoglake.model.MaintenanceTask
 import com.posthog.hoglake.model.MaintenanceTrigger
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
+import com.posthog.hoglake.service.CleanupBackend
 import com.posthog.hoglake.service.CleanupService
 import com.posthog.hoglake.service.RemovalStore
 import io.github.oshai.kotlinlogging.KotlinLogging
@@ -217,8 +217,19 @@ internal class HogliteCleanup(
             *ids.toTypedArray(),
             leaseCutoff,
         )
-        store.runTx(catalog, HogliteCatalogStore.freshTxid("cleanup-claim"), null, tx)
-        return candidates.map { Entry(it[0].asLong(), it[1].asString(), it[2] as? String) }
+        // Return the rows the claim UPDATE actually took, not the
+        // preselected candidates: a row another worker claimed or drained
+        // in the gap is THEIRS, and deleting its object under our lease
+        // would break the lease's authority over external deletion.
+        val acquired =
+            tx.add(
+                "SELECT id, path, reason FROM removals WHERE claimed_by = ? AND claimed_at = ? " +
+                    "AND drained_at IS NULL",
+                worker,
+                now,
+            )
+        val rows = store.runTx(catalog, HogliteCatalogStore.freshTxid("cleanup-claim"), null, tx)
+        return rows[acquired].rows.map { Entry(it[0].asLong(), it[1].asString(), it[2] as? String) }
     }
 
     private fun releaseClaims(
@@ -313,26 +324,35 @@ internal class HogliteCleanup(
             // Settle, fenced on drained_at IS NULL AND claimed_by = worker —
             // both halves load-bearing (CleanupService.SETTLE_SQL's KDoc).
             // The readback classifies a miss rather than counting it.
-            val idx = tx.add(
-                "UPDATE removals SET drained_at = ?, drained_outcome = ?, last_attempt_at = ?, " +
-                    "claimed_at = NULL, claimed_by = NULL " +
-                    "WHERE id IN (${ids.joinToString(",") { "?" }}) " +
-                    "AND drained_at IS NULL AND claimed_by = ?",
-                now,
-                outcome,
-                now,
-                *ids.toTypedArray(),
-                worker,
-            )
+            val idx =
+                tx.add(
+                    "UPDATE removals SET drained_at = ?, drained_outcome = ?, last_attempt_at = ?, " +
+                        "claimed_at = NULL, claimed_by = NULL " +
+                        "WHERE id IN (${ids.joinToString(",") { "?" }}) " +
+                        "AND drained_at IS NULL AND claimed_by = ?",
+                    now,
+                    outcome,
+                    now,
+                    *ids.toTypedArray(),
+                    worker,
+                )
             settleStmts[outcome] = ids to idx
         }
-        val results = store.runTx(catalog, HogliteCatalogStore.freshTxid("cleanup-settle"), null, tx)
+        // An all-referenced or all-failed sub-batch has no settle
+        // statements — hoglite refuses an empty transaction, and the
+        // attempts/release bookkeeping below must still run.
+        val results =
+            if (tx.size == 0) {
+                emptyList()
+            } else {
+                store.runTx(catalog, HogliteCatalogStore.freshTxid("cleanup-settle"), null, tx)
+            }
         for ((outcome, ids) in drainedByOutcome) {
             if (ids.isEmpty()) continue
             val settled = results[settleStmts.getValue(outcome).second].affected
             val missedCount = ids.size - settled
             settledElsewhere += missedCount
-            if (outcome == "deleted") removed = settled.toLong() else missing = settled.toLong()
+            if (outcome == "deleted") removed = settled else missing = settled
             if (missedCount > 0) {
                 // Classify: a settle lost to 'registered' over a path this
                 // sub-batch DELETED is the invariant violation; anything
@@ -358,12 +378,13 @@ internal class HogliteCleanup(
                                 "'registered' by a compaction group AFTER this sub-batch deleted " +
                                 "the object — invariant violation"
                         }
-                        events += PathEvent(
-                            "cleanup_violation",
-                            path,
-                            "invariant_violation",
-                            "removal_id=${row[0].asLong()} registered after this drain deleted the object",
-                        )
+                        events +=
+                            PathEvent(
+                                "cleanup_violation",
+                                path,
+                                "invariant_violation",
+                                "removal_id=${row[0].asLong()} registered after this drain deleted the object",
+                            )
                         registeredAfterDelete++
                     } else if (claimedBy != null && claimedBy != worker) {
                         log.warn {
@@ -392,12 +413,13 @@ internal class HogliteCleanup(
                 "cleanup: path '${entry.path}' (removal_id ${entry.removalId}) is still " +
                     "referenced by the catalog — invariant violation; skipping"
             }
-            events += PathEvent(
-                "cleanup_violation",
-                entry.path,
-                "invariant_violation",
-                "removal_id=${entry.removalId} still referenced; not deleted",
-            )
+            events +=
+                PathEvent(
+                    "cleanup_violation",
+                    entry.path,
+                    "invariant_violation",
+                    "removal_id=${entry.removalId} still referenced; not deleted",
+                )
         }
         val bumpedFailed = bumpAttempts(catalog, worker, failed.map { it.removalId })
         settledElsewhere += failed.size - bumpedFailed.size
@@ -494,15 +516,16 @@ internal class HogliteCleanup(
             val gone =
                 try {
                     val tx = HogliteTx()
-                    val idx = tx.add(
-                        "DELETE FROM receipts WHERE idempotency_key IN (" +
-                            "SELECT idempotency_key FROM receipts WHERE created_at < ? " +
-                            "ORDER BY created_at LIMIT ?)",
-                        cutoff,
-                        receiptPurgePage,
-                    )
+                    val idx =
+                        tx.add(
+                            "DELETE FROM receipts WHERE idempotency_key IN (" +
+                                "SELECT idempotency_key FROM receipts WHERE created_at < ? " +
+                                "ORDER BY created_at LIMIT ?)",
+                            cutoff,
+                            receiptPurgePage,
+                        )
                     store.runTx(catalog, HogliteCatalogStore.freshTxid("cleanup-receipts"), null, tx)[idx]
-                        .affected.toLong()
+                        .affected
                 } catch (e: Exception) {
                     failures++
                     log.warn(e) { "cleanup: a commit-receipt purge page failed for catalog '$catalog'" }
@@ -521,13 +544,14 @@ internal class HogliteCleanup(
             val deadline = System.nanoTime() + LEDGER_PURGE_BUDGET_MS * 1_000_000
             while (System.nanoTime() < deadline) {
                 val tx = HogliteTx()
-                val idx = tx.add(
-                    "DELETE FROM removals WHERE id IN (" +
-                        "SELECT id FROM removals WHERE drained_at IS NOT NULL AND drained_at < ? " +
-                        "ORDER BY id LIMIT ?)",
-                    cutoff,
-                    LEDGER_PURGE_PAGE,
-                )
+                val idx =
+                    tx.add(
+                        "DELETE FROM removals WHERE id IN (" +
+                            "SELECT id FROM removals WHERE drained_at IS NOT NULL AND drained_at < ? " +
+                            "ORDER BY id LIMIT ?)",
+                        cutoff,
+                        LEDGER_PURGE_PAGE,
+                    )
                 val gone =
                     store.runTx(catalog, HogliteCatalogStore.freshTxid("cleanup-drained"), null, tx)[idx]
                         .affected

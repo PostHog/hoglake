@@ -1,5 +1,6 @@
 package com.posthog.hoglake.hoglite
 
+import com.fasterxml.jackson.module.kotlin.readValue
 import com.posthog.hoglake.model.AlterOp
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.Column
@@ -9,16 +10,15 @@ import com.posthog.hoglake.model.PartitionSpec
 import com.posthog.hoglake.model.SortSpec
 import com.posthog.hoglake.model.TableInfo
 import com.posthog.hoglake.model.allNodes
-import com.posthog.hoglake.model.canPromoteTo
 import com.posthog.hoglake.model.assignFieldIds
 import com.posthog.hoglake.model.boundReencodeFor
+import com.posthog.hoglake.model.canPromoteTo
 import com.posthog.hoglake.service.AlterBackend
 import com.posthog.hoglake.service.AlterService
 import com.posthog.hoglake.service.ColumnTrees
 import com.posthog.hoglake.service.Identifiers
 import com.posthog.hoglake.service.TableMetadata
 import com.posthog.hoglake.stats.IcebergSingleValue
-import com.fasterxml.jackson.module.kotlin.readValue
 import java.util.UUID
 
 /**
@@ -68,7 +68,7 @@ internal class HogliteAlters(
             if (readSnapshot < meta.earliestSnapshotId) {
                 throw HoglakeException.Expired("read_snapshot is below the expiry floor")
             }
-            ddlChangedSince(catalog, t.tableId, readSnapshot)?.let {
+            if (ddlChangedSince(catalog, t.tableId, readSnapshot)) {
                 throw HoglakeException.DdlSinceReadSnapshot(
                     "concurrent DDL since snapshot $readSnapshot on table(s): " +
                         "$namespace.$table; re-read the table and re-issue the alter, " +
@@ -89,6 +89,13 @@ internal class HogliteAlters(
                 spec = store.specAt(catalog, t.tableId, meta.head),
                 sortSpec = store.sortSpecAt(catalog, t.tableId, meta.head),
             )
+
+        // The field-id allocator is planned LOCALLY across the ops of
+        // one alter: the first AddColumn pins it with a scalar guard, and
+        // later ones advance the pinned value (each reads the same
+        // pre-tx row, so without this the second AddColumn's guard would
+        // always trip on the first's bump).
+        val plannedNextFieldId = longArrayOf(-1L)
 
         val tx = HogliteTx()
         tx.expectOne(
@@ -118,6 +125,33 @@ internal class HogliteAlters(
                 )
             }
         }
+        // The schema fence: the ops were planned against head's
+        // columns/specs in Kotlin; an unguarded alter (readSnapshot =
+        // null) has no changes-window guard, so without this a
+        // concurrent alter between planning and the tx would be
+        // overwritten by stale in-memory state. Same OCC as the commit
+        // path's schema fence, but an alter IS DDL, so a miss is the
+        // typed retryable conflict, not a replan.
+        tx.expectScalar(
+            meta.schemaVersion,
+            "SELECT schema_version FROM meta WHERE id = 1",
+        ) {
+            HoglakeException.CommitConflict(
+                "catalog '$catalog' schema changed under the alter on $namespace.$table; re-read and retry",
+            )
+        }
+        if (readSnapshot != null) {
+            // The expiry floor, in-tx: a sweep that purged the window
+            // since planning must not let the changes guard pass empty.
+            tx.expectZero(
+                "SELECT COUNT(*) FROM meta WHERE id = 1 AND earliest_snapshot_id > ?",
+                readSnapshot,
+            ) {
+                HoglakeException.Expired(
+                    "read_snapshot $readSnapshot is below the expiry floor; re-read the table and re-issue",
+                )
+            }
+        }
         tx.allocateDdlSnapshot()
         tx.insertSnapshotRow(author, message)
         tx.add(
@@ -125,7 +159,7 @@ internal class HogliteAlters(
                 "VALUES (${HogliteSchema.HEAD_SQL}, 'table_altered', ?)",
             t.tableId,
         )
-        for (op in ops) applyOp(catalog, tx, t, ns.namespaceId, namespace, state, op)
+        for (op in ops) applyOp(catalog, tx, t, ns.namespaceId, namespace, state, op, plannedNextFieldId)
 
         val readback = tx.add(HogliteSql.READBACK_DDL)
         val results = store.runTx(catalog, HogliteCatalogStore.freshTxid("alter"), null, tx)
@@ -167,14 +201,14 @@ internal class HogliteAlters(
         catalog: String,
         tableId: Long,
         readSnapshot: Long,
-    ): Boolean? =
+    ): Boolean =
         store.queryCatalog(
             catalog,
             "SELECT COUNT(*) FROM changes WHERE object_id = ? AND snapshot_id > ? " +
                 "AND kind IN ('table_altered', 'table_dropped')",
             tableId,
             readSnapshot,
-        ).firstRow()!![0].asLong().takeIf { true }?.let { it > 0 }
+        ).firstRow()!![0].asLong() > 0
 
     // ---- op application (AlterService.applyOp, ported) -------------------
 
@@ -200,9 +234,10 @@ internal class HogliteAlters(
         namespaceName: String,
         state: TableState,
         op: AlterOp,
+        plannedNextFieldId: LongArray,
     ) {
         when (op) {
-            is AlterOp.AddColumn -> addColumn(catalog, tx, t, state, op)
+            is AlterOp.AddColumn -> addColumn(catalog, tx, t, state, op, plannedNextFieldId)
             is AlterOp.DropColumn -> dropColumn(tx, t, state, op)
             is AlterOp.RenameColumn -> renameColumn(catalog, tx, t, state, op)
             is AlterOp.PromoteColumn -> promoteColumn(catalog, tx, t, state, op)
@@ -237,6 +272,7 @@ internal class HogliteAlters(
         t: HogliteCatalogStore.TableRow,
         state: TableState,
         op: AlterOp.AddColumn,
+        plannedNextFieldId: LongArray,
     ) {
         val parent = op.parent?.let { requireStructParent(state, it) }
         val siblings = parent?.children ?: state.cols
@@ -255,18 +291,27 @@ internal class HogliteAlters(
         requireFieldIds(catalog, tx, t, "cannot add column '${op.def.name}'")
         val count = ColumnTrees.nodeCount(listOf(op.def))
         // Allocate the field-id range in the transaction; the VALUES are
-        // computed here, pinned by a scalar guard on the allocator.
+        // computed here, pinned by a scalar guard on the allocator. Only
+        // the FIRST AddColumn of this alter reads and guards the row;
+        // later ones advance the locally pinned value.
         val nextField =
-            store.queryCatalog(
-                catalog,
-                "SELECT next_field_id FROM tables WHERE id = ?",
-                t.tableId,
-            ).firstRow()!![0].asLong()
-        tx.expectScalar(
-            nextField,
-            "SELECT next_field_id FROM tables WHERE id = ?",
-            t.tableId,
-        ) { HoglakeException.CommitConflict("table ${t.namespace}.${t.name} changed under the alter") }
+            if (plannedNextFieldId[0] >= 0) {
+                plannedNextFieldId[0]
+            } else {
+                val current =
+                    store.queryCatalog(
+                        catalog,
+                        "SELECT next_field_id FROM tables WHERE id = ?",
+                        t.tableId,
+                    ).firstRow()!![0].asLong()
+                tx.expectScalar(
+                    current,
+                    "SELECT next_field_id FROM tables WHERE id = ?",
+                    t.tableId,
+                ) { HoglakeException.CommitConflict("table ${t.namespace}.${t.name} changed under the alter") }
+                current
+            }
+        plannedNextFieldId[0] = nextField + count
         tx.affectOne(
             "UPDATE tables SET next_field_id = next_field_id + $count WHERE id = ?",
             t.tableId,
@@ -432,7 +477,10 @@ internal class HogliteAlters(
                     IcebergSingleValue.encode(ColType.LONG, (IcebergSingleValue.decode(ColType.INT, b) as Int).toLong())
                 }
                 com.posthog.hoglake.model.BoundReencode.FLOAT_TO_DOUBLE -> { b ->
-                    IcebergSingleValue.encode(ColType.DOUBLE, (IcebergSingleValue.decode(ColType.FLOAT, b) as Float).toDouble())
+                    IcebergSingleValue.encode(
+                        ColType.DOUBLE,
+                        (IcebergSingleValue.decode(ColType.FLOAT, b) as Float).toDouble(),
+                    )
                 }
             }
         val rows =
@@ -627,7 +675,10 @@ internal class HogliteAlters(
         root: Column,
         rootParent: Long?,
     ) {
-        fun walk(col: Column, parent: Long?) {
+        fun walk(
+            col: Column,
+            parent: Long?,
+        ) {
             insertColumnVersion(tx, tableId, col, parent)
             col.children.forEach { walk(it, col.fieldId) }
         }
