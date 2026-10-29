@@ -1678,13 +1678,15 @@ ran on the local stack and what it showed.
   `missing_field_ids` and `split_offsets` set and no
   `hog_file_column_stats` rows, counted as the sweep result's
   `stats_skipped_below_floor` (a subset of `hydrated`). The under-floor
-  read buys the field-id audit flag and `split_offsets`, nothing else:
+  read buys the field-id audit flag, `split_offsets` and, on a table
+  with the object-prefix layout, the prefix proof (2.1c: the quarantine
+  check runs before the floor, so the GET cannot be skipped there):
   since #445 the DDL guard refuses over FLAGGED files only, so a file
   left `pending` holds nothing up, and the first-draft argument for
   keeping the GET (a pending tiny file blocking DDL forever on a bucket
   compaction never rewrites) died with the pending clause. Whether the
-  GET is worth keeping at millrace's file rate is the floor's own
-  question. The rows are the cost the floor removes: ~26 per tiny
+  GET is worth keeping at millrace's file rate on tables WITHOUT the
+  option is the floor's own question. The rows are the cost the floor removes: ~26 per tiny
   file, inserted only for the expiry purge to cascade-delete (~642M of
   them on millrace-prod-us's 24.7M pending files on 2026-10-22).
   server/README.md §File registration has the reasoning.

@@ -334,7 +334,11 @@ object Metrics {
         table,
     )
 
-    /** hoglake_stats_hydrated_total{result=provided|failed} */
+    /**
+     * hoglake_stats_hydrated_total{result=provided|quarantined|failed}:
+     * `quarantined` is a flip to provided whose footer failed the
+     * object-prefix check (Hydrator class KDoc).
+     */
     fun statsHydrated(result: String) = increment("hoglake_stats_hydrated_total", 1.0, "result", result)
 
     /**

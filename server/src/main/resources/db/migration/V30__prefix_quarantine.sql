@@ -1,0 +1,32 @@
+-- THE HYDRATOR'S OBJECT-PREFIX QUARANTINE FLAG (PR 2.1c).
+--
+-- On a table with the object-prefix layout (V29, model/ObjectPrefix.kt) a
+-- data file registered with deferred stats lands `pending`, and the
+-- hydrator makes the proof the commit makes for inline stats: from the
+-- file's own footer, that every row holds the value its prefix names.
+-- A file whose footer does not prove it still flips to `provided` with
+-- its truthful stats, and this flag says the proof failed. A reader of
+-- an option-on table includes only files with `stats_state =
+-- 'provided' AND NOT prefix_quarantined`; pending and failed files are
+-- excluded by state already.
+--
+-- A FLAG, NOT A FOURTH stats_state: the CHECK on stats_state, StatsState,
+-- the console, the OpenAPI and `rehydrate` would all ripple, and "has no
+-- stats" would be mixed up with "not tenant-safe". The
+-- `missing_field_ids` precedent (V1).
+--
+-- NOT NULL DEFAULT false: a constant default is metadata-only since PG 11
+-- (no rewrite), and every existing row reads false, which is true of
+-- them: no file was hydrated against a layout before this version. The
+-- hydrator writes the flag explicitly on every flip, false included.
+--
+-- Metadata-only, but ACCESS EXCLUSIVE on the manifest, so it sits inside
+-- the lock_timeout window (AGENT.md; MigrationLockWindowTest reads this
+-- file). V18's transactional shape: no `.conf`, `SET LOCAL` expires with
+-- the transaction, and a 5 s timeout rolls the file back with no history
+-- row for the next pod to retry. IF NOT EXISTS so a re-run over its own
+-- result is a no-op. The index that serves the gauge is V31, built
+-- concurrently outside any transaction.
+SET LOCAL lock_timeout = '5s';
+
+ALTER TABLE hog_data_file ADD COLUMN IF NOT EXISTS prefix_quarantined boolean NOT NULL DEFAULT false;

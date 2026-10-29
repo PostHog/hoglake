@@ -59,6 +59,18 @@ data class ObjectPrefixLayout(
  * together with [pathStaysUnder], is what keeps `team_id=4/` from
  * matching `team_id=42/`.
  *
+ * THE STATS PROOF ([checkFieldStats]) has two callers. The commit makes
+ * it on a file's inline stats and refuses the file when it fails. A file
+ * with deferred stats registers `pending`, and the hydrator makes it on
+ * the footer: a file that fails is still flipped to `provided` with its
+ * truthful stats, and `hog_data_file.prefix_quarantined` is set.
+ *
+ * THE MOUNT PREDICATE: a reader that serves one value's files of a table
+ * with the option (a per-value mount) includes only files with
+ * `stats_state = 'provided' AND NOT prefix_quarantined`. A pending file
+ * has not been proven yet, a failed one cannot be, and a quarantined one
+ * was disproven; all three stay out, so the read is fail-closed.
+ *
  * Shared vectors: `pyhoglake/tests/vectors/object_prefix_vectors.json`.
  */
 object ObjectPrefix {

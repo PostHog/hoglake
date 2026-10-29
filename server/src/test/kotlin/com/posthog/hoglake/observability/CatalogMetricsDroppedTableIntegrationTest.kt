@@ -161,8 +161,8 @@ class CatalogMetricsDroppedTableIntegrationTest {
 
         // #269: no pass over hog_data_file at all. The old shape read the
         // manifest once per sample (and before that, once per counter);
-        // this one reads it only through the three attention indexes
-        // (V26), and the live totals not at all. What a dropped table
+        // this one reads it only through the four attention indexes
+        // (V26, V31's prefix_quarantined), and the live totals not at all. What a dropped table
         // leaves behind is still WALKED where it sits in one of those
         // indexes — this fixture's 2,000 pending rows on the dropped
         // table are index entries the pending count reads and the join
@@ -179,7 +179,7 @@ class CatalogMetricsDroppedTableIntegrationTest {
         for (line in manifestIndexLines) {
             assertThat(line)
                 .describedAs("every manifest read must be through an attention index:%n%s", plan)
-                .containsPattern("hog_data_file_(pending|failed|missing_field_ids)\\b")
+                .containsPattern("hog_data_file_(pending|failed|missing_field_ids|prefix_quarantined)\\b")
         }
     }
 

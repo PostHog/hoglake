@@ -12,7 +12,8 @@ import kotlin.reflect.full.memberProperties
  * shape: no endpoint returns it, the ledger stores the MODEL's JSON and
  * hands it back, so the spec's schema is checked against the model by
  * REFLECTION here. Added with `stats_skipped_below_floor` (#432), the
- * first hydrator counter that postdates the ledger.
+ * first hydrator counter that postdates the ledger; `quarantined` (the
+ * object-prefix check) is the second.
  *
  * Unit, not integration: one artifact on disk and the class it describes.
  */
@@ -44,10 +45,10 @@ class HydratorSweepResultSpecParityTest {
     }
 
     @Test
-    fun `the counter added after the ledger is optional, the original four are required`() {
+    fun `the counters added after the ledger are optional, the original four are required`() {
         val required = requiredOf(schemaBlock("    HydratorSweepResult:"))
         assertThat(required).containsExactlyInAnyOrder("claimed", "hydrated", "failed", "transient")
-        assertThat(required).doesNotContain("stats_skipped_below_floor")
+        assertThat(required).doesNotContain("stats_skipped_below_floor", "quarantined")
     }
 
     @Test
@@ -65,5 +66,20 @@ class HydratorSweepResultSpecParityTest {
                 HydratorSweepResult(3, 3, 0, 0, 2),
             )
         assertThat(some["stats_skipped_below_floor"].asLong()).isEqualTo(2)
+    }
+
+    @Test
+    fun `a zero quarantined count is omitted from the stored row, a nonzero one is written`() {
+        // The object-prefix check's counter, on the same rule.
+        val zero =
+            wireObjectMapper().valueToTree<com.fasterxml.jackson.databind.JsonNode>(
+                HydratorSweepResult(3, 3, 0, 0, 1),
+            )
+        assertThat(zero.has("quarantined")).isFalse()
+        val some =
+            wireObjectMapper().valueToTree<com.fasterxml.jackson.databind.JsonNode>(
+                HydratorSweepResult(3, 3, 0, 0, 1, quarantined = 2),
+            )
+        assertThat(some["quarantined"].asLong()).isEqualTo(2)
     }
 }

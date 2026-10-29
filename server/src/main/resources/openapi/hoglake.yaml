@@ -2211,8 +2211,9 @@ paths:
             object-prefix layout (Table.object_prefix_field) and a data
             file is not under `<field>=<value>/` for its identity
             partition value, carries no canonical value for the field,
-            ships deferred stats, or has column stats that do not prove
-            every row holds the value — or a deletion vector is not under
+            or has inline column stats that do not prove every row holds
+            the value (deferred stats are accepted and proven by the
+            hydrator from the footer) — or a deletion vector is not under
             its target's prefix. The detail names the expected prefix and
             up to five offending paths; the body names `tables` and
             `retry: re-prepare`, because a payload written to the wrong
@@ -2433,8 +2434,9 @@ paths:
             object-prefix layout (Table.object_prefix_field) and a data
             file is not under `<field>=<value>/` for its identity
             partition value, carries no canonical value for the field,
-            ships deferred stats, or has column stats that do not prove
-            every row holds the value — or a deletion vector is not under
+            or has inline column stats that do not prove every row holds
+            the value (deferred stats are accepted and proven by the
+            hydrator from the footer) — or a deletion vector is not under
             its target's prefix. The detail names the expected prefix and
             up to five offending paths; the body names `tables` and
             `retry: re-prepare`, because a payload written to the wrong
@@ -2554,8 +2556,9 @@ paths:
             object-prefix layout (Table.object_prefix_field) and a data
             file is not under `<field>=<value>/` for its identity
             partition value, carries no canonical value for the field,
-            ships deferred stats, or has column stats that do not prove
-            every row holds the value — or a deletion vector is not under
+            or has inline column stats that do not prove every row holds
+            the value (deferred stats are accepted and proven by the
+            hydrator from the footer) — or a deletion vector is not under
             its target's prefix. The detail names the expected prefix and
             up to five offending paths; the body names `tables` and
             `retry: re-prepare`, because a payload written to the wrong
@@ -2652,8 +2655,9 @@ paths:
             object-prefix layout (Table.object_prefix_field) and a data
             file is not under `<field>=<value>/` for its identity
             partition value, carries no canonical value for the field,
-            ships deferred stats, or has column stats that do not prove
-            every row holds the value — or a deletion vector is not under
+            or has inline column stats that do not prove every row holds
+            the value (deferred stats are accepted and proven by the
+            hydrator from the footer) — or a deletion vector is not under
             its target's prefix. The detail names the expected prefix and
             up to five offending paths; the body names `tables` and
             `retry: re-prepare`, because a payload written to the wrong
@@ -2766,8 +2770,9 @@ paths:
             object-prefix layout (Table.object_prefix_field) and a data
             file is not under `<field>=<value>/` for its identity
             partition value, carries no canonical value for the field,
-            ships deferred stats, or has column stats that do not prove
-            every row holds the value — or a deletion vector is not under
+            or has inline column stats that do not prove every row holds
+            the value (deferred stats are accepted and proven by the
+            hydrator from the footer) — or a deletion vector is not under
             its target's prefix. The detail names the expected prefix and
             up to five offending paths; the body names `tables` and
             `retry: re-prepare`, because a payload written to the wrong
@@ -2864,8 +2869,9 @@ paths:
             object-prefix layout (Table.object_prefix_field) and a data
             file is not under `<field>=<value>/` for its identity
             partition value, carries no canonical value for the field,
-            ships deferred stats, or has column stats that do not prove
-            every row holds the value — or a deletion vector is not under
+            or has inline column stats that do not prove every row holds
+            the value (deferred stats are accepted and proven by the
+            hydrator from the footer) — or a deletion vector is not under
             its target's prefix. The detail names the expected prefix and
             up to five offending paths; the body names `tables` and
             `retry: re-prepare`, because a payload written to the wrong
@@ -3963,11 +3969,19 @@ components:
             `<data_path>/data/<namespace>/<table>/<field>=<value>/`,
             value the canonical decimal (no sign, no leading zero) of the
             data file's identity partition value for the field — a
-            deletion vector's: its target's — and a data file's column
-            stats must ship inline and prove every row holds it (both
-            bounds equal to the value, null_count 0). A commit that
-            breaks any of this is a 422 `object_prefix_violation`. The
-            name cannot change while the option is on.
+            deletion vector's: its target's — and a data file's inline
+            column stats must prove every row holds it (both bounds equal
+            to the value, null_count 0). A commit that breaks any of this
+            is a 422 `object_prefix_violation`. A file registered with
+            deferred stats (no column_stats) is accepted under its prefix
+            and stays pending until the hydrator has made the same proof
+            from its parquet footer; a file whose footer does not prove
+            it is flipped to provided and quarantined server-side. The
+            flag is on no response yet: GET /scan returns such a file as
+            `provided`, indistinguishable from a proven one, and no
+            endpoint applies the per-value predicate (`stats_state =
+            'provided' AND NOT prefix_quarantined`). The name cannot
+            change while the option is on.
         snapshot_id:
           type: integer
           format: int64
@@ -5100,6 +5114,19 @@ components:
             field-id checked, flipped to provided with no per-column
             stats rows. Optional: absent from rows written before the
             counter existed, and the read path fills 0.
+        quarantined:
+          type: integer
+          format: int64
+          description: >
+            Of `hydrated`, the files of a table with the object-prefix
+            layout (Table.object_prefix_field) whose footer does not prove
+            that every row holds the value their prefix names (both
+            bounds equal to it, no nulls): flipped to provided with their
+            stats, and quarantined server-side
+            (`hog_data_file.prefix_quarantined`). The flag is not on the
+            wire, and GET /scan still returns these files as `provided`.
+            Counted below the size floor too. Optional, like
+            stats_skipped_below_floor.
 
     RehydrateResult:
       type: object
@@ -5926,7 +5953,8 @@ components:
             historical `verify` rows still inside the ledger's retention
             window.
             Hydrator loop rows carry HydratorSweepResult, the sweep's
-            per-catalog counts; manual hydrator rows carry
+            per-catalog counts (`quarantined` among them: files that
+            failed the object-prefix check); manual hydrator rows carry
             RehydrateResult.
 
     MaintenanceRunPage:

@@ -246,7 +246,9 @@ claim runs under its own savepoint and timeout — a catalog whose claim
 is slow (a dropped table's pending backlog, walked and discarded until
 retirement deletes it) loses its share and is counted
 (`hoglake_hydrator_claim_timeouts_total{catalog}`); no other catalog
-waits on it.
+waits on it. On a table with the object-prefix layout the sweep also
+checks the footer against the file's prefix value and quarantines a file
+it does not prove (see Partitioning).
 
 The hydrator has a **size floor for stats rows** (#432):
 `HOGLAKE_HYDRATOR_MIN_FILE_BYTES`, default 1 MiB, 0 = rows for every
@@ -269,7 +271,9 @@ outputs), millpond's stray-day files are ~0.1 MB, and the stats table
 was 136 GB of the RDS volume; 24.7M × 26 is ~642M rows the floor spares.
 The footer GET and the one `UPDATE` per file stay, at today's rate. What
 the under-floor read buys is the field-id audit flag
-(`missing_field_ids`) and `split_offsets`; it no longer unblocks any DDL,
+(`missing_field_ids`) and `split_offsets`, and on a table with the
+object-prefix layout the prefix proof (see Partitioning), which is why
+that GET is not optional there; it no longer unblocks any DDL,
 because the guard below stopped refusing over `pending` files (#445).
 
 For a writer, **deferring has one cost and one upside**. A deferred file
@@ -500,11 +504,24 @@ holds the vectors it and any writer are held to). With the option on,
 the commit refuses (422 `object_prefix_violation`, naming the expected
 prefix, up to five paths, `tables` and `retry: re-prepare`) a data file
 whose value is missing or not canonical (`042`, `+4`, out of range),
-that is not under its value's prefix, that ships deferred stats, or
-whose stats do not prove every row holds the value (both bounds equal to
-it, `null_count` 0); and a deletion vector that is not under its
-target's prefix. Here the partition value is checked, not trusted: the
-stats are the proof, because the prefix is a tenant boundary. The DDL
+that is not under its value's prefix, or whose inline stats do not prove
+every row holds the value (both bounds equal to it, `null_count` 0); and
+a deletion vector that is not under its target's prefix. Here the
+partition value is checked, not trusted: the stats are the proof,
+because the prefix is a tenant boundary. A file with DEFERRED stats is
+held to the path and value rules at commit and registers `pending`; the
+hydrator makes the stats proof from its footer, before the size floor,
+and a file whose footer does not prove it (another value's rows in any
+row group, nulls, a bound the footer cannot state, the column absent)
+still flips to `provided` with its stats but with
+`hog_data_file.prefix_quarantined` set (V30; counted as the sweep's
+`quarantined`, `hoglake_stats_hydrated_total{result="quarantined"}`, and
+gauged live as `hoglake_object_prefix_quarantined_files{catalog}` off
+the V31 partial index). A reader that serves one value's files of such a
+table includes only `stats_state = 'provided' AND NOT
+prefix_quarantined`: pending, failed and quarantined files stay out.
+No endpoint is such a reader yet: nothing clears the flag, it is on no
+response, and GET /scan returns a quarantined file as `provided`. The DDL
 keeps the layout true: the option is set only on an EMPTY table whose
 spec has exactly one identity field on the column, once (the same field
 again changes nothing, though the request still commits its DDL
@@ -513,18 +530,43 @@ keep that identity field, the column cannot be dropped or renamed, the
 table cannot be renamed, and an atomic replacement of it is refused at
 prepare. GET reports `object_prefix_field` as of the snapshot read.
 Until compaction writes under the layout it skips such tables
-(`hoglake_compaction_skipped_total{reason="object_prefix_layout"}`), and
-deferred stats stay refused until the hydrator checks pending files
-against the layout. Set the option only once every server, compaction and
-hydrator replica runs a version that knows it: an older one ignores the
-row and would accept or compact files outside the prefixes. No in-tree
-writer produces conforming files yet, and each is refused with
-`object_prefix_violation`: millrace/millpond
-(`{data_path}/data/{ns}/{table}/{build}`, deferred stats), pyhoglake
-(`.../{table}/{idempotency_key}/`), duckdb-client (deletion vectors at
-the table root, `hoglake-dv-<uuid>.puffin`) and Trino writes (their
-upload claims are not under a value's prefix). Enable the option only
-on a table whose writer is layout-aware, in this order: create the table
+(`hoglake_compaction_skipped_total{reason="object_prefix_layout"}`). Set
+the option only once every server, compaction and hydrator replica runs
+a version that knows it: an older one ignores the row and would accept
+or compact files outside the prefixes. Deferred stats on such a table
+need more: a hydrator older than the quarantine check flips their files
+to `provided` UNCHECKED and unflagged, so send them only once every
+hydrator replica runs this version, and never roll one back below it
+afterwards. In a rollout, roll the maintenance (hydrator) Deployment to
+this version before the API replicas: an older API replica still
+refuses deferred stats on such a table, so no API replica accepts them
+while an older hydrator runs. If an older hydrator did flip such files,
+nothing marks them: re-pend them, in bounded batches on a large table,
+with `UPDATE hog_data_file f SET stats_state = 'pending' WHERE
+f.catalog_id = <id> AND f.stats_state = 'provided' AND NOT
+f.prefix_quarantined AND f.end_snapshot IS NULL AND f.begin_snapshot >=
+<first snapshot of the exposure> AND EXISTS (SELECT 1 FROM
+hog_table_layout l WHERE l.catalog_id = f.catalog_id AND l.table_id =
+f.table_id AND l.end_snapshot IS NULL) AND EXISTS (SELECT 1 FROM
+hog_table t WHERE t.catalog_id = f.catalog_id AND t.table_id =
+f.table_id AND t.dropped_snapshot IS NULL)`. The next sweeps re-check
+each footer. That re-checks every inline-stats file in the window too
+(their stats rows are rewritten from the footer, the upsert being `ON
+CONFLICT DO UPDATE`), and `POST .../maintenance/rehydrate` is no
+substitute: it re-pends only `failed` files. Of the in-tree writers only
+duckdb-client's INSERT conforms, and only on a spec of identity fields
+with the prefix field first: it writes hive `<field>=<value>/`
+directories under the table root, keeps the partition column in the
+file and always defers stats, so its files register `pending` and the
+hydrator proves them. Because it always defers, the hydrator-version
+rule above covers every DuckDB INSERT. Every other write is refused
+with `object_prefix_violation`: millrace/millpond
+(`{data_path}/data/{ns}/{table}/{build}`), pyhoglake
+(`.../{table}/{idempotency_key}/`), duckdb-client DELETE/UPDATE
+(deletion vectors at the table root, `hoglake-dv-<uuid>.puffin`) and
+Trino writes (their upload claims are not under a value's prefix).
+Enable the option only on a table whose writer is layout-aware, in this
+order: create the table
 with its spec, set the option, then start the writers. Never roll a
 server back below this version once a table has the option.
 
@@ -2171,8 +2213,18 @@ transaction (`observability/`):
   listing are served from it) — head snapshot and age,
   expiry floor, removal-queue depth (undrained entries only),
   pending-stats AND failed-stats counts
-  (`hoglake_stats_failed_files`), live id-less-file count
-  (`hoglake_missing_field_id_files`), live table
+  (`hoglake_stats_failed_files`), the head of the hydrator's queue
+  (`hoglake_stats_pending_head_file_id`: the `data_file_id` of the oldest
+  live pending file on a live table, the next one a sweep claims, read by
+  key off the pending index, never aggregated; 0 with nothing pending.
+  The head unchanged for three sweep intervals while
+  `hoglake_stats_pending_files` > 0 is a stalled hydrator, whose pending
+  files stay out of every per-value read; `hoglake_stats_pending_files`
+  rising for six hours is a hydrator that is behind. `rehydrate` re-pends
+  old failed files at their old ids, so the head moves back to them, which
+  is correct: they are now the oldest work), live id-less-file count
+  (`hoglake_missing_field_id_files`), live object-prefix-quarantined
+  count (`hoglake_object_prefix_quarantined_files`, see Partitioning), live table
   count, per-consumer lag (cardinality-capped), and
   `hoglake_live_files{catalog}` (live data files, dropped tables
   excluded). The three live totals are read from the maintenance
