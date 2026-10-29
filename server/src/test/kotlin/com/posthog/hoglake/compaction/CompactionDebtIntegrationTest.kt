@@ -1,5 +1,6 @@
 package com.posthog.hoglake.compaction
 
+import com.fasterxml.jackson.databind.JsonNode
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.service.CatalogService
@@ -7,6 +8,7 @@ import com.posthog.hoglake.service.MaintenanceStatusService
 import com.posthog.hoglake.service.MaintenanceSummarySampler
 import com.posthog.hoglake.service.PartitionStatsService
 import com.posthog.hoglake.testing.PgTestSupport
+import com.posthog.hoglake.wireObjectMapper
 import org.assertj.core.api.Assertions.assertThat
 import org.jdbi.v3.core.kotlin.withHandleUnchecked
 import org.junit.jupiter.api.AfterAll
@@ -155,15 +157,39 @@ class CompactionDebtIntegrationTest {
                 FROM generate_series(1, 10000) AS n
                 """,
             ).bind("cat", id).execute()
-            val plan =
+            val explained =
                 h.createQuery(
                     """
-                EXPLAIN (COSTS OFF) SELECT 1 FROM hog_delete_file
+                EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT 1 FROM hog_delete_file
                 WHERE catalog_id = :cat AND data_file_id = 5000 AND begin_snapshot <= 2
                   AND (end_snapshot IS NULL OR 2 < end_snapshot)
                 """,
-                ).bind("cat", id).mapTo(String::class.java).list().joinToString("\n")
-            assertThat(plan).contains("hog_delete_file_data_lookup")
+                ).bind("cat", id).mapTo(String::class.java).one()
+            val plan = wireObjectMapper().readTree(explained)[0]["Plan"]
+
+            fun nodes(node: JsonNode): List<JsonNode> =
+                listOf(node) + (node["Plans"]?.flatMap { nodes(it) } ?: emptyList())
+            assertThat(plan.path("Actual Rows").asDouble()).isEqualTo(1.0)
+            val all = nodes(plan)
+            val indexes =
+                all.filter {
+                    it.path("Index Name").asText() in
+                        setOf("hog_delete_file_data_lookup", "hog_delete_file_snapshot_lookup")
+                }
+            assertThat(indexes).describedAs("catalog/file lookup: %s", plan).isNotEmpty()
+            for (index in indexes) {
+                assertThat(index.path("Index Cond").asText()).contains("catalog_id =", "data_file_id =")
+            }
+            val scans = all.filter { it.path("Relation Name").asText() == "hog_delete_file" }
+            assertThat(scans).hasSize(1)
+            for (scan in scans + indexes) {
+                val examined =
+                    (
+                        scan.path("Actual Rows").asDouble() + scan.path("Rows Removed by Filter").asDouble() +
+                            scan.path("Rows Removed by Index Recheck").asDouble()
+                    ) * scan.path("Actual Loops").asDouble()
+                assertThat(examined).describedAs("single-file probe: %s", scan).isLessThanOrEqualTo(1.0)
+            }
         }
         val service =
             MaintenanceStatusService(

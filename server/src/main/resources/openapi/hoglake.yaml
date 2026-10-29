@@ -911,6 +911,95 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
 
+  /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/partitions/lookup:
+    get:
+      operationId: lookupPartition
+      summary: Exact partition metadata and bounded file pages at one snapshot
+      description: >
+        Requires a spec ID and its complete stored tuple, independently of
+        maintenance policies and sampled metadata. Head is resolved once;
+        subsequent pages use the snapshot, table incarnation and initial
+        file-ID ceiling in the cursor. Concurrent appends cannot extend the
+        scan beyond that ceiling.
+        File rows are physical rows, without subtracting deletion vectors.
+        Aggregates are exact only when the bounded candidate scan completes;
+        otherwise totals are null and file paging remains available. The
+        candidate budget covers the catalog-wide first-field value index,
+        including other tables, specs, tuples and retained ended files, so
+        even a small partition can have unavailable totals. An empty
+        files page with a non-null next_cursor is scan progress, not an empty
+        partition. Only next_cursor=null ends pagination. File timestamp
+        bounds are not loaded by this endpoint; use the existing file stats
+        endpoint with the returned snapshot_id to inspect available bounds.
+        The existing file stats endpoint resolves namespace names at head;
+        historical inspection through a dropped/recreated namespace can
+        therefore return 404 there even while lookup metadata is retained.
+        at_timestamp is rejected; use an explicit snapshot for time travel.
+        Every query has a 3-second statement timeout; at most two lookups run
+        concurrently per server process. No catalog commit lock is acquired.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+        - { $ref: "#/components/parameters/table" }
+        - name: spec_id
+          in: query
+          required: true
+          description: Explicit partition spec identity; never inferred from the current spec.
+          schema: { type: integer, format: int64, minimum: 1 }
+        - name: values
+          in: query
+          required: true
+          description: >
+            JSON array of stored strings or JSON nulls in spec order.
+            Null, the empty string, and the string "null" are distinct.
+            Transformed values use their stored representation, not decoded
+            dates. All fields must be supplied, including null fields.
+            At most 64 fields, each at most 8192 characters.
+          schema: { type: string, maxLength: 65536 }
+          example: '["8817","650",null]'
+        - { $ref: "#/components/parameters/snapshot" }
+        - name: limit
+          in: query
+          required: false
+          description: Maximum files per page, from 1 to 500; must remain unchanged across pages.
+          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+        - name: cursor
+          in: query
+          required: false
+          description: >
+            Opaque continuation from next_cursor. Bound to catalog, table
+            incarnation, spec, full tuple, resolved snapshot, initial file-ID
+            ceiling and effective limit. Repeat spec_id and values. If snapshot is supplied with
+            a cursor, it must match the cursor's snapshot.
+          schema: { type: string, maxLength: 1024 }
+      responses:
+        "200":
+          description: Exact metadata or unavailable totals, plus one bounded file page.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PartitionLookup" }
+        "400":
+          description: Malformed, repeated, or mismatched lookup parameters or cursor.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "410": { $ref: "#/components/responses/Gone" }
+        "422":
+          description: Invalid spec identity, incomplete tuple, or snapshot outside the catalog range.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "503":
+          description: Lookup admission is busy or a statement timed out; never an empty result.
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying.
+              schema: { type: integer, example: 1 }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PartitionLookupUnavailableError" }
+
   /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/partitions/values:
     get:
       operationId: getPartitionValues
@@ -6253,6 +6342,82 @@ components:
             catalog's sample_reanchored (MaintenanceStatus) is above 0
             the scan judged later files at a newer snapshot, so this can
             name a snapshot after it.
+
+    PartitionLookup:
+      type: object
+      required: [snapshot_id, table_uuid, spec_id, values, aggregates, files, next_cursor]
+      properties:
+        snapshot_id: { type: integer, format: int64 }
+        table_uuid: { type: string, format: uuid }
+        spec_id: { type: integer, format: int64 }
+        values:
+          type: array
+          items: { type: string, nullable: true }
+        aggregates:
+          $ref: "#/components/schemas/PartitionLookupAggregates"
+        files:
+          type: array
+          items: { $ref: "#/components/schemas/DataFile" }
+        next_cursor:
+          type: string
+          nullable: true
+          description: Null only when all matching files have been examined.
+
+    PartitionLookupAggregates:
+      type: object
+      required: [status, reason, totals]
+      properties:
+        status: { type: string, enum: [exact, unavailable] }
+        reason:
+          type: string
+          nullable: true
+          enum: [candidate_scan_limit, overflow, null]
+          description: >
+            Null for exact totals. candidate_scan_limit means more indexed
+            candidates exist than the request budget, including unrelated
+            files. overflow means an exact total cannot fit in int64.
+        totals:
+          $ref: "#/components/schemas/PartitionLookupTotals"
+
+    PartitionLookupTotals:
+      type: object
+      nullable: true
+      required: [file_count, physical_rows, total_bytes, dv_count, stats_state, last_file_write_snapshot]
+      properties:
+        file_count: { type: integer, format: int64 }
+        physical_rows:
+          type: integer
+          format: int64
+          description: Physical file rows; deletion vectors are not subtracted.
+        total_bytes: { type: integer, format: int64 }
+        dv_count:
+          type: integer
+          format: int64
+          description: Deletion vectors visible at snapshot_id on the matching files.
+        stats_state:
+          type: object
+          description: >
+            Current hydration state observed in this request's database
+            transaction for files visible at snapshot_id. Hydration state
+            is mutable and is not historical state at snapshot_id.
+          required: [provided, pending, failed]
+          properties:
+            provided: { type: integer, format: int64 }
+            pending: { type: integer, format: int64 }
+            failed: { type: integer, format: int64 }
+        last_file_write_snapshot:
+          type: integer
+          format: int64
+          nullable: true
+          description: Latest file write or rewrite; compaction can advance it. Not ingestion freshness.
+
+    PartitionLookupUnavailableError:
+      type: object
+      required: [error, detail, reason]
+      properties:
+        error: { type: string, enum: [partition_lookup_unavailable] }
+        detail: { type: string }
+        reason: { type: string, enum: [busy, timeout] }
 
     PartitionListing:
       type: object

@@ -2042,6 +2042,30 @@ The catalog reports on itself instead of waiting for ops SQL:
   more sampled groups than the listing will materialise is 422, because
   it decodes, sorts and pages in memory. The webui's partitions tab
   renders this.
+- **`GET .../tables/{t}/partitions/lookup`** — exact inspection with an
+  explicit `spec_id` and a complete JSON tuple in `values` (stored
+  strings or JSON nulls). It requires no maintenance policy or sample.
+  Resolves head once, pins file pages to that snapshot, and binds the
+  opaque cursor to the table incarnation, spec, tuple, and page size.
+  The initial file-ID ceiling bounds the scan even during concurrent
+  appends. Historical DV metadata uses an indexed latest-version seek,
+  so supersession history cannot turn each file probe into a full scan.
+  Totals count physical file rows, not DV-adjusted logical rows;
+  last file write/rewrite is not ingestion freshness. A bounded
+  candidate scan returns exact totals or an explicit unavailable
+  reason, while file inspection remains paged. The budget includes
+  other tables/specs and retained files sharing the first-field value,
+  so totals can be unavailable even for a small partition. Hydration
+  state counts reflect the current request, not historical state at
+  the requested snapshot. Continue until
+  `next_cursor` is null, even if a page contains no matching files.
+  Expired snapshots return 410; busy admission and query timeouts
+  return 503 with `Retry-After`, distinct from an empty partition.
+  The existing file stats endpoint resolves namespaces at head, so
+  it may return 404 for files reached through a historical namespace
+  that has since been dropped/recreated.
+  Existing Python, DuckDB, Trino, and hedgerow endpoints are unchanged;
+  this is an additional operator inspection endpoint.
 - **`GET .../tables/{t}/partitions/values`** — the partition fields at
   the read snapshot, each with the distinct STORED, transformed values
   it takes across the live files (most-frequent first, capped at 500;

@@ -2,6 +2,8 @@ package com.posthog.hoglake.api
 
 import com.posthog.hoglake.auth.bearerChallenge
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.PartitionLookupInvalidRequest
+import com.posthog.hoglake.model.PartitionLookupUnavailable
 import com.posthog.hoglake.service.CorruptDefinitionException
 import io.github.oshai.kotlinlogging.KotlinLogging
 import io.ktor.http.HttpHeaders
@@ -125,6 +127,16 @@ internal fun errorBody(cause: HoglakeException): Pair<HttpStatusCode, ApiErrorDt
 
 /** Installs [errorBody] plus the malformed-input and catch-all handlers. */
 fun StatusPagesConfig.installErrorMapping() {
+    exception<PartitionLookupInvalidRequest> { call, cause ->
+        call.respond(HttpStatusCode.BadRequest, ApiErrorDto("bad_request", cause.message))
+    }
+    exception<PartitionLookupUnavailable> { call, cause ->
+        call.response.headers.append(HttpHeaders.RetryAfter, RETRY_AFTER_SECONDS)
+        call.respond(
+            HttpStatusCode.ServiceUnavailable,
+            PartitionLookupUnavailableErrorDto("partition_lookup_unavailable", cause.message, cause.reason),
+        )
+    }
     exception<HoglakeException> { call, cause ->
         val (status, body) = errorBody(cause)
         if (cause is HoglakeException.CommitQueueTimeout) {
@@ -184,6 +196,12 @@ fun StatusPagesConfig.installErrorMapping() {
         )
     }
 }
+
+data class PartitionLookupUnavailableErrorDto(
+    val error: String,
+    val detail: String?,
+    val reason: String,
+)
 
 /** Retry-After for 503 commit_queue_timeout: back off a beat, then retry. */
 private const val RETRY_AFTER_SECONDS = "1"

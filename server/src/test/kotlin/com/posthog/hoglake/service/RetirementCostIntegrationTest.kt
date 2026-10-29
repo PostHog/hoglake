@@ -223,8 +223,9 @@ class RetirementCostIntegrationTest {
      *
      * THE ANSWER IS THAT IT IS INDEX-DRIVEN, and the test asks rather
      * than asserts it from reading the schema: `V2__maintenance.sql`
-     * added `hog_delete_file_data_lookup (catalog_id, data_file_id)`,
-     * NON-PARTIAL, which is exactly the RI query's key. (The partial
+     * added `hog_delete_file_data_lookup (catalog_id, data_file_id)`;
+     * V29's `hog_delete_file_snapshot_lookup` has the same non-partial
+     * prefix. Either serves the RI query's key. (The partial
      * `hog_delete_file_one_live_per_data_file` could not have served
      * it — the trigger's query carries no `end_snapshot` predicate for
      * the planner to match — and `_live`, `_path` and the primary key
@@ -274,22 +275,28 @@ class RetirementCostIntegrationTest {
                 ).bind("c", catalogId).bind("d", 1L).mapTo(String::class.java).list().joinToString(" | ")
             }
         println("[#193] DV cascade RI plan: $riPlan")
-        // MUTATION: `DROP INDEX hog_delete_file_data_lookup` and this
-        // reds — the RI query falls to a sequential scan of
+        // MUTATION: drop BOTH non-partial catalog/file lookup indexes
+        // and this reds — the RI query falls to a sequential scan of
         // hog_delete_file, once per deleted data-file row, and the
         // timing assertion below goes with it.
-        assertThat(riPlan)
+        val driverIndex =
+            listOf("hog_delete_file_data_lookup", "hog_delete_file_snapshot_lookup")
+                .firstOrNull { riPlan.contains("Index Scan using $it") }
+        assertThat(driverIndex)
             .describedAs("the FK's referencing-side query must be index-driven:%n%s", riPlan)
-            .contains("Index Scan using hog_delete_file_data_lookup")
+            .isNotNull()
+        assertThat(riPlan.substringAfter("Index Cond:", "").substringBefore(" | "))
+            .describedAs("the RI index must constrain both catalog and data file:%n%s", riPlan)
+            .contains("catalog_id =", "data_file_id =")
         assertThat(riPlan).doesNotContain("Seq Scan")
         println(
             "[#193] DV cascade: a 2,000-row batch costs ${empty.millis}ms against an EMPTY " +
                 "hog_delete_file and ${populated.millis}ms against $DELETE_FILES rows " +
                 "($pages heap pages); the FK's referencing side is served by " +
-                "hog_delete_file_data_lookup (V2), non-partial on (catalog_id, data_file_id)",
+                "$driverIndex, non-partial with prefix (catalog_id, data_file_id)",
         )
         // The claim being pinned is a SHAPE, not a constant: without
-        // that index the RI trigger scans the relation per deleted row,
+        // either lookup index the RI trigger scans the relation per deleted row,
         // so the cost would grow with hog_delete_file's SIZE rather
         // than with the batch, and this bound would be nowhere near
         // enough.

@@ -8,6 +8,7 @@ import com.posthog.hoglake.api.installDebugRoutes
 import com.posthog.hoglake.api.installErrorMapping
 import com.posthog.hoglake.api.installMaintenanceRoutes
 import com.posthog.hoglake.api.installPartitionListingRoutes
+import com.posthog.hoglake.api.installPartitionLookupRoutes
 import com.posthog.hoglake.api.installPartitionStatsRoutes
 import com.posthog.hoglake.api.installPublicationRoutes
 import com.posthog.hoglake.api.installScanRoutes
@@ -35,6 +36,7 @@ import com.posthog.hoglake.service.MaintenanceStatusService
 import com.posthog.hoglake.service.MaintenanceSummarySampler
 import com.posthog.hoglake.service.OptionsService
 import com.posthog.hoglake.service.PartitionListingService
+import com.posthog.hoglake.service.PartitionLookupService
 import com.posthog.hoglake.service.PartitionStatsService
 import com.posthog.hoglake.service.ReindexService
 import com.posthog.hoglake.service.RemovalStore
@@ -93,6 +95,7 @@ class App private constructor(
         )
     private val alterService = AlterService(jdbi)
     private val scanService = ScanService(jdbi)
+    private val partitionLookupService = PartitionLookupService(jdbi)
     private val viewService = ViewService(jdbi)
     private val optionsService = OptionsService(jdbi)
     private val expiryService = ExpiryService(jdbi, cfg)
@@ -409,6 +412,7 @@ class App private constructor(
         )
         app.installPartitionStatsRoutes(partitionStatsService)
         app.installPartitionListingRoutes(partitionListingService)
+        app.installPartitionLookupRoutes(partitionLookupService)
         app.installPublicationRoutes()
         app.installDebugRoutes()
     }
