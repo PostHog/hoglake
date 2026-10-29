@@ -73,7 +73,7 @@ class V32DeleteFileSnapshotLookupMigrationIntegrationTest {
                 PartitionLookupRepo.bind(
                     query =
                         h.createQuery(
-                            "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + PartitionLookupRepo.aggregateSql(tuple),
+                            "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + PartitionLookupRepo.lookupSql(tuple),
                         ),
                     catalogId = f.catalogId,
                     tableId = f.tableId,
@@ -83,7 +83,7 @@ class V32DeleteFileSnapshotLookupMigrationIntegrationTest {
                     upper = 2,
                     after = -1,
                     candidateLimit = 100,
-                )
+                ).bind("pageLimit", 101).bind("includeAggregates", true)
             wireObjectMapper().readTree(query.mapTo(String::class.java).one())[0]
         }
 
@@ -113,8 +113,8 @@ class V32DeleteFileSnapshotLookupMigrationIntegrationTest {
         assertThat(buffers(before)).isGreaterThan(buffers(after) * 10)
         val totals =
             db.jdbi.withHandleUnchecked { h ->
-                PartitionLookupRepo.aggregates(h, f.catalogId, f.tableId, f.specId, tuple, 50000, 2, 100)
-            }.totals!!
+                PartitionLookupRepo.lookup(h, f.catalogId, f.tableId, f.specId, tuple, 50000, 2, -1, 100, 100, true)
+            }.aggregates.totals!!
         assertThat(totals.dvCount).isEqualTo(1)
         assertThat(totals.physicalRows).isEqualTo(10)
         val keys =
@@ -144,9 +144,9 @@ class V32DeleteFileSnapshotLookupMigrationIntegrationTest {
         assertThat(buffers(plan)).isLessThan(100)
         val result =
             db.jdbi.withHandleUnchecked { h ->
-                PartitionLookupRepo.aggregates(h, f.catalogId, f.tableId, f.specId, tuple, 100001, 2, 100)
+                PartitionLookupRepo.lookup(h, f.catalogId, f.tableId, f.specId, tuple, 100001, 2, -1, 100, 100, true)
             }
-        assertThat(result.totals!!.dvCount).isZero()
+        assertThat(result.aggregates.totals!!.dvCount).isZero()
     }
 
     @Test

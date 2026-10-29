@@ -47,24 +47,6 @@ internal object PartitionLookupRepo {
         ).bind("catalogId", catalogId).bind("tableId", tableId).bind("specId", specId).bind("snapshot", snapshot)
             .mapTo(Int::class.javaObjectType).findOne().orElse(null)
 
-    fun aggregates(
-        h: Handle,
-        catalogId: Long,
-        tableId: Long,
-        specId: Long,
-        values: List<String?>,
-        snapshot: Long,
-        upper: Long,
-        candidateLimit: Int,
-    ): PartitionLookupAggregates =
-        bind(
-            h.createQuery(
-                aggregateSql(values),
-            ),
-            catalogId, tableId, specId, values, snapshot, upper, -1, candidateLimit,
-        )
-            .map { rs, _ -> aggregate(rs, candidateLimit) }.one()
-
     private fun aggregate(
         rs: ResultSet,
         candidateLimit: Int,
@@ -190,24 +172,18 @@ internal object PartitionLookupRepo {
         """
     }
 
-    private fun matched(
-        values: List<String?>,
-        aggregate: Boolean,
-    ): String {
+    private fun matched(values: List<String?>): String {
         val predicates =
             values.mapIndexed { i, value ->
                 """EXISTS (SELECT 1 FROM hog_file_partition_value pv
                     WHERE pv.catalog_id = f.catalog_id AND pv.data_file_id = f.data_file_id
                       AND pv.key_index = $i AND ${if (value == null) "pv.value IS NULL" else "pv.value = :value$i"})"""
             }.joinToString(" AND ")
-        val gate = if (aggregate) "WHERE (SELECT count(*) FROM candidates) <= :candidateLimit" else ""
         // OFFSET 0 keeps the manifest access a bounded primary-key probe per candidate.
-        val columns =
-            if (aggregate) "data_file_id, record_count, file_size_bytes, stats_state, begin_snapshot" else FILE_COLUMNS
-        val projected = columns.split(", ").joinToString(", ") { "f.$it" }
+        val projected = FILE_COLUMNS.split(", ").joinToString(", ") { "f.$it" }
         return """
         , matched AS MATERIALIZED (
-            SELECT $projected FROM (SELECT data_file_id FROM scan_window $gate) w
+            SELECT $projected FROM (SELECT data_file_id FROM scan_window) w
             JOIN LATERAL (
                 SELECT $projected FROM hog_data_file f
                 WHERE f.catalog_id = :catalogId AND f.data_file_id = w.data_file_id
@@ -224,7 +200,7 @@ internal object PartitionLookupRepo {
     }
 
     internal fun lookupSql(values: List<String?>): String =
-        windows(values) + matched(values, aggregate = false) +
+        windows(values) + matched(values) +
             """
             , totals AS MATERIALIZED (
                 ${totalsSql("WHERE :includeAggregates AND (SELECT count(*) FROM candidates) <= :candidateLimit")}
@@ -239,10 +215,6 @@ internal object PartitionLookupRepo {
             ) p ON true
             ORDER BY p.data_file_id
             """
-
-    internal fun aggregateSql(values: List<String?>): String =
-        windows(values) + matched(values, aggregate = true) +
-            "SELECT (SELECT count(*) FROM candidates) AS candidate_count, totals.* FROM (${totalsSql("")}) totals"
 
     private fun totalsSql(gate: String): String =
         """
