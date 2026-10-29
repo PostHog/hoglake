@@ -87,7 +87,7 @@ object ObjectPrefix {
     private val CANONICAL = Regex("^(0|[1-9][0-9]{0,18})$")
 
     /** Must equal `Identifiers.PATTERN` (service package), the name CHECK in schema.sql. */
-    private val NAME = Regex("^[A-Za-z_][A-Za-z0-9_-]{0,127}$")
+    internal val NAME = Regex("^[A-Za-z_][A-Za-z0-9_-]{0,127}$")
 
     /**
      * The value [raw] names as a long, or null when [raw] is not a

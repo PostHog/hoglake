@@ -1,6 +1,7 @@
 package com.posthog.hoglake.model
 
 import com.fasterxml.jackson.databind.ObjectMapper
+import com.posthog.hoglake.service.Identifiers
 import com.posthog.hoglake.stats.IcebergSingleValue
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
@@ -40,6 +41,11 @@ class ObjectPrefixTest {
         assertThat(ObjectPrefix.keyIndex(otherSource, 3)).isNull()
         assertThat(ObjectPrefix.keyIndex(bucketOnly, 3)).isNull()
         assertThat(ObjectPrefix.keyIndex(twice, 3)).isNull()
+    }
+
+    @Test
+    fun `the name grammar is the catalog identifier pattern`() {
+        assertThat(ObjectPrefix.NAME.pattern).isEqualTo(Identifiers.PATTERN)
     }
 
     @Test
