@@ -47,7 +47,9 @@ class ScanAndDeleteApiTest {
         testApplication {
             application {
                 app.module(this)
-                installScanRoutes(PostgresCatalogStore(CatalogService(db.jdbi), CommitService(db.jdbi), ScanService(db.jdbi)))
+                installScanRoutes(
+                    PostgresCatalogStore(CatalogService(db.jdbi), CommitService(db.jdbi), ScanService(db.jdbi)),
+                )
             }
             block(client)
         }
