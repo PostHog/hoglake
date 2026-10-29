@@ -290,8 +290,9 @@ object CatalogInvariants {
 
     /**
      * The versioned tables, mirroring
-     * `ExpiryService.VERSIONED_RETENTION_TABLES` plus the two the sweep
-     * clears by their own object-queueing path. `ExpiryServiceIntegration
+     * `ExpiryService.VERSIONED_RETENTION_TABLES`, plus the two the sweep
+     * clears by their own object-queueing path and
+     * `ExpiryService.VERSIONED_TABLES_NEVER_CLEARED`. `ExpiryServiceIntegration
      * Test.VERSIONED_RETENTION_TABLES is every versioned table the schema
      * has` is what keeps this list honest against a migration.
      */

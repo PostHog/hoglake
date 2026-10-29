@@ -360,9 +360,14 @@ there would break that gate on every build.
    silently skip; the floor advance captures
    `hog_catalog.earliest_snapshot_time` so 410s can say WHEN the floor
    was reached. A fifth sweep step deletes versioned DDL rows
-   (`hog_table_version`/`hog_column`/`hog_partition_spec`/`hog_sort_spec`/
-   `hog_view`) whose `end_snapshot <= earliest_snapshot_id` — invisible
-   at every retained snapshot, so DDL churn cannot grow them unbounded.
+   (`hog_table_version`/`hog_column`/`hog_sort_spec`/`hog_view`) whose
+   `end_snapshot <= earliest_snapshot_id` — invisible at every retained
+   snapshot, so DDL churn cannot grow them unbounded. `hog_partition_spec`
+   is deliberately kept (`ExpiryService.VERSIONED_TABLES_NEVER_CLEARED`):
+   file rows name their spec by `spec_id` at every snapshot and spec ids
+   are `MAX(spec_id) + 1`, so deleting a retired spec would break the
+   live files written under it, and relabel them when it held the
+   table's highest id.
    The FILE rows below the floor are the exception, and deliberately:
    a sweep advances the floor under the commit lock and then purges
    `hog_data_file`/`hog_delete_file` in bounded pages OUTSIDE it, so an

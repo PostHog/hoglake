@@ -509,9 +509,11 @@ class ExpiryServiceIntegrationTest {
      * new floor are unreachable (visible at S iff S < end; every valid
      * S >= floor) and deleted; live rows and rows ending above the floor
      * survive, so time travel at every retained snapshot is intact.
+     * A retired partition spec is the exception and survives with its
+     * fields: file rows name it by spec_id at every snapshot.
      */
     @Test
-    fun `versioned-row retention deletes below-floor corpses and cascades spec fields`() {
+    fun `versioned-row retention deletes below-floor corpses, cascades sort fields, keeps partition specs`() {
         val catalogId = seedCatalog("exp-vrows", head = 5, retentionSeconds = 60)
         seedTable(catalogId)
         jdbi.useHandleUnchecked { h ->
@@ -545,7 +547,7 @@ class ExpiryServiceIntegrationTest {
                     "VALUES (?, 1, 2, 4, 'id', 'long', 1)",
                 catalogId,
             )
-            // hog_partition_spec corpse WITH a field row that must CASCADE.
+            // A retired hog_partition_spec WITH a field row: both must survive.
             h.execute(
                 "INSERT INTO hog_partition_spec (catalog_id, table_id, spec_id, begin_snapshot, end_snapshot) " +
                     "VALUES (?, 1, 1, 1, 5)",
@@ -605,8 +607,8 @@ class ExpiryServiceIntegrationTest {
             fun count(table: String): Long =
                 h.createQuery("SELECT count(*) FROM $table WHERE catalog_id = ?")
                     .bind(0, catalogId).mapTo(Long::class.java).one()
-            assertThat(count("hog_partition_spec")).isZero()
-            assertThat(count("hog_partition_field")).describedAs("cascaded with its spec").isZero()
+            assertThat(count("hog_partition_spec")).describedAs("retired specs are never cleared").isEqualTo(1)
+            assertThat(count("hog_partition_field")).describedAs("kept with its spec").isEqualTo(1)
             assertThat(count("hog_sort_spec")).isEqualTo(1)
             assertThat(count("hog_sort_field")).describedAs("cascaded with its spec").isZero()
         }
@@ -623,12 +625,15 @@ class ExpiryServiceIntegrationTest {
      * passes because they all take their cases FROM the list. This asks
      * the catalog instead.
      *
-     * `hog_data_file` and `hog_delete_file` carry the same shape and are
-     * deliberately NOT in the list — steps 1 and 2 clear them by their
-     * own path (they queue objects for the cleanup drain first, which a
-     * bare DELETE would skip), so they are named here as the two known
-     * exclusions rather than left to a `containsAll`. Anything else
-     * appearing in the INTERSECT is a gap.
+     * Two kinds of versioned table are deliberately NOT in the list, and
+     * both are named here rather than left to a `containsAll`.
+     * `hog_data_file` and `hog_delete_file` ([FLOOR_CLEARED_BY_THEIR_OWN_STEP])
+     * are cleared by steps 1 and 2 on their own path: they queue objects
+     * for the cleanup drain first, which a bare DELETE would skip.
+     * [ExpiryService.VERSIONED_TABLES_NEVER_CLEARED] (`hog_partition_spec`)
+     * is never cleared, because file rows name their spec by `spec_id` at
+     * every snapshot and spec ids are `MAX(spec_id) + 1`. Any table in the
+     * INTERSECT that is in none of these lists is a gap.
      *
      * This guard used to live in `VerifyServiceIntegrationTest` (its last
      * assertion was `BELOW_FLOOR_TABLES containsAll
@@ -655,11 +660,15 @@ class ExpiryServiceIntegrationTest {
         assertThat(versioned).describedAs("the INTERSECT found no versioned table at all").isNotEmpty()
         assertThat(versioned).containsAll(ExpiryService.VERSIONED_RETENTION_TABLES)
 
-        assertThat(ExpiryService.VERSIONED_RETENTION_TABLES + FLOOR_CLEARED_BY_THEIR_OWN_STEP)
+        assertThat(
+            ExpiryService.VERSIONED_RETENTION_TABLES + FLOOR_CLEARED_BY_THEIR_OWN_STEP +
+                ExpiryService.VERSIONED_TABLES_NEVER_CLEARED,
+        )
             .describedAs(
                 "a versioned table expiry's step 5 never clears: add it to " +
-                    "ExpiryService.VERSIONED_RETENTION_TABLES, or to this test's exclusion list " +
-                    "with the step that does clear it",
+                    "ExpiryService.VERSIONED_RETENTION_TABLES, to this test's exclusion list " +
+                    "with the step that does clear it, or to " +
+                    "ExpiryService.VERSIONED_TABLES_NEVER_CLEARED with the reason it must be kept",
             ).containsExactlyInAnyOrderElementsOf(versioned)
     }
 
@@ -764,6 +773,76 @@ class ExpiryServiceIntegrationTest {
         // Below the floor: 410, not silent wrong answers.
         assertThatThrownBy { catalogs.getTable(cat, "ns", "t5", snapshot = 9) }
             .isInstanceOf(HoglakeException.Expired::class.java)
+    }
+
+    /**
+     * A retired partition spec outlives the floor. Files written under it
+     * name it by spec_id at every snapshot, and spec ids are
+     * MAX(spec_id) + 1, so deleting it would let the next spec take its
+     * id and relabel those files.
+     */
+    @Test
+    fun `a retired partition spec survives expiry and its id is never reused`() {
+        val catalogs = CatalogService(jdbi)
+        val alter = AlterService(jdbi)
+        val cat = "exp-spec-keep"
+        val catalogId = catalogs.createCatalog(cat, "s3://bucket/speckeep").catalogId // S0
+        catalogs.createNamespace(cat, "ns") // S1
+        catalogs.createTable(
+            cat,
+            "ns",
+            "t",
+            listOf(com.posthog.hoglake.model.ColumnDef("team_id", com.posthog.hoglake.model.ColType.LONG)),
+        ) // S2
+        val teamId = catalogs.getTable(cat, "ns", "t").columns.single().fieldId
+        val byTeam =
+            com.posthog.hoglake.model.AlterOp.SetPartitionSpec(
+                listOf(
+                    com.posthog.hoglake.model.PartitionFieldDef(
+                        teamId,
+                        com.posthog.hoglake.model.Transform.IDENTITY,
+                    ),
+                ),
+            )
+        alter.alterTable(cat, "ns", "t", listOf(byTeam)) // S3: spec 1
+        alter.alterTable(cat, "ns", "t", listOf(com.posthog.hoglake.model.AlterOp.SetPartitionSpec(emptyList()))) // S4
+        check(catalogs.getCatalog(cat).headSnapshotId == 4L)
+
+        jdbi.useHandleUnchecked { h ->
+            h.execute(
+                "UPDATE hog_snapshot SET snapshot_time = now() - interval '1 hour' " +
+                    "WHERE catalog_id = ? AND snapshot_id <= 4",
+                catalogId,
+            )
+            h.execute(
+                "UPDATE hog_catalog SET snapshot_retention_seconds = 60 WHERE catalog_id = ?",
+                catalogId,
+            )
+        }
+        val result = svc.runOnce(cat, batchSize = 100)
+        assertThat(result.newEarliestSnapshotId).isEqualTo(4)
+
+        jdbi.withHandleUnchecked { h ->
+            val specs =
+                h.createQuery(
+                    "SELECT spec_id || ':' || end_snapshot FROM hog_partition_spec WHERE catalog_id = ?",
+                ).bind(0, catalogId).mapTo(String::class.java).list()
+            assertThat(specs).describedAs("spec 1 ended at S4, at the floor, and is kept").containsExactly("1:4")
+            val fields =
+                h.createQuery(
+                    "SELECT count(*) FROM hog_partition_field WHERE catalog_id = ? AND spec_id = 1",
+                ).bind(0, catalogId).mapTo(Long::class.java).one()
+            assertThat(fields).isEqualTo(1)
+        }
+
+        alter.alterTable(cat, "ns", "t", listOf(byTeam)) // S5: a new spec
+        jdbi.withHandleUnchecked { h ->
+            val live =
+                h.createQuery(
+                    "SELECT spec_id FROM hog_partition_spec WHERE catalog_id = ? AND end_snapshot IS NULL",
+                ).bind(0, catalogId).mapTo(Long::class.java).list()
+            assertThat(live).describedAs("spec id 1 is never reused").containsExactly(2L)
+        }
     }
 
     @Test

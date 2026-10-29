@@ -631,7 +631,7 @@ scheduler. A sweep is **two phases**, and the split is the fix for the
 
 **Phase A — the floor advance, under the commit lock, one bounded
 transaction** carrying its own `statement_timeout` (derived:
-`min(session/4, admission/2) / 11` statements, 1,363 ms each at the
+`min(session/4, admission/2) / 10` statements, 1,500 ms each at the
 defaults, so the whole hold is at most half the 30 s admission window).
 Compute the new floor as the minimum of (age cutoff, head−1, current
 floor + batch, and — when `consumer_floor` — the **minimum consumer
@@ -646,11 +646,15 @@ was reached; requests reaching below it get **410 Gone** with
 reconcile instructions citing that time — a consumer is told its feed
 has a hole (and since when) rather than silently skipping one. A fifth
 step applies the same reachability rule to the accumulating versioned
-DDL tables (`hog_table_version`, `hog_column`, `hog_partition_spec`,
-`hog_sort_spec`, `hog_view`): rows with
-`end_snapshot <= earliest_snapshot_id` are invisible at every retained
-snapshot and are deleted (spec fields cascade), so DDL churn cannot
-grow the metadata without bound. Those five tables are bounded by DDL
+DDL tables (`hog_table_version`, `hog_column`, `hog_sort_spec`,
+`hog_view`): rows with `end_snapshot <= earliest_snapshot_id` are
+invisible at every retained snapshot and are deleted (sort fields
+cascade), so DDL churn cannot grow the metadata without bound.
+`hog_partition_spec` is kept: a file row names its spec by `spec_id` at
+every snapshot, and spec ids are allocated as `MAX(spec_id) + 1`, so
+deleting a retired spec would strip the labels from the live files
+written under it and, when it held the table's highest id, let the next
+spec reuse that id and relabel them. Those tables are bounded by DDL
 volume rather than by file volume — thousands of rows on prod-us, not
 millions — which is why they stay in the locked transaction while the
 file rows do not.
