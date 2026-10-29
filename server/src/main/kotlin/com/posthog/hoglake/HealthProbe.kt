@@ -85,10 +85,49 @@ import javax.sql.DataSource
  * construct an `App` and never call `/healthz`; none of them should open
  * a second connection, and several point `Config` at no database at all.
  */
-class HealthProbe(
+class HealthProbe private constructor(
     private val perOperationTimeoutMs: Long,
-    dataSource: () -> DataSource,
+    targetFactory: () -> ProbeTarget,
+    @Suppress("UNUSED_PARAMETER") marker: PrivateCtorMarker,
 ) : AutoCloseable {
+    /** Distinguishes the target-factory primary constructor from the DataSource one. */
+    private enum class PrivateCtorMarker { MARK }
+    /**
+     * What one probe run asks. The Postgres target borrows its own
+     * one-connection pool and runs `SELECT 1`; the hoglite target calls
+     * the client's `/v1/healthz` — both under the same thread/deadline
+     * machinery this class exists for.
+     */
+    fun interface ProbeTarget : AutoCloseable {
+        fun probe(): Boolean
+
+        override fun close() {}
+    }
+
+    /** The Postgres probe target: `SELECT 1` on the probe's own connection. */
+    constructor(
+        perOperationTimeoutMs: Long,
+        dataSource: () -> DataSource,
+    ) : this(
+        perOperationTimeoutMs,
+        {
+            val source = lazy(dataSource)
+            object : ProbeTarget {
+                override fun probe(): Boolean =
+                    source.value.connection.use { c ->
+                        c.createStatement().use { st ->
+                            st.executeQuery("SELECT 1").use { it.next() }
+                        }
+                    }
+
+                override fun close() {
+                    if (source.isInitialized()) (source.value as? AutoCloseable)?.close()
+                }
+            }
+        },
+        PrivateCtorMarker.MARK,
+    )
+
     private val log = KotlinLogging.logger {}
 
     /**
@@ -98,7 +137,7 @@ class HealthProbe(
      */
     val deadlineMs: Long = perOperationTimeoutMs * 2
 
-    private val source = lazy(dataSource)
+    private val target = lazy(targetFactory)
 
     /**
      * [MAX_CONCURRENT_PROBES] threads, and the code never launches more
@@ -239,11 +278,7 @@ class HealthProbe(
 
     private fun probe(): Boolean =
         runCatching {
-            source.value.connection.use { c ->
-                c.createStatement().use { st ->
-                    st.executeQuery("SELECT 1").use { it.next() }
-                }
-            }
+            target.value.probe()
         }.getOrElse {
             log.warn(it) { "health probe failed: the catalog database did not answer" }
             false
@@ -278,7 +313,7 @@ class HealthProbe(
         if (!executor.awaitTermination(SHUTDOWN_WAIT_SECONDS, TimeUnit.SECONDS)) {
             executor.shutdownNow()
         }
-        if (source.isInitialized()) (source.value as? AutoCloseable)?.close()
+        if (target.isInitialized()) target.value.close()
     }
 
     companion object {
@@ -302,6 +337,16 @@ class HealthProbe(
 
         /** Build the probe production uses: one Hikari connection of its own. */
         fun fromConfig(cfg: Config): HealthProbe = HealthProbe(cfg.healthProbeTimeoutMs) { pool(cfg) }
+
+        /**
+         * Build the probe the hoglite backend uses: the client's
+         * `/v1/healthz` call, behind the same deadline and
+         * single-flight machinery as the Postgres `SELECT 1`.
+         */
+        fun forProbe(
+            perOperationTimeoutMs: Long,
+            probe: () -> Boolean,
+        ): HealthProbe = HealthProbe(perOperationTimeoutMs, { ProbeTarget { probe() } }, PrivateCtorMarker.MARK)
 
         /**
          * The one-connection pool, separate from `Database.dataSource`'s.

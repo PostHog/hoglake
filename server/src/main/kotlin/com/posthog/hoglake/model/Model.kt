@@ -2677,4 +2677,33 @@ sealed class HoglakeException(message: String) : RuntimeException(message) {
         val tables: List<String>,
         val readSnapshot: Long,
     ) : CommitConflict(detail)
+
+    /**
+     * The configured database backend did not answer inside its budget
+     * (all hoglite pools unreachable, a tripped circuit breaker, or a
+     * retry budget exhausted on transient errors) -> HTTP 503
+     * `backend_unavailable` with `Retry-After`.
+     *
+     * Retryable by construction: nothing about the request was refused,
+     * it was never evaluated. Distinct from [CommitQueueTimeout] — that
+     * one is a catalog convoying on its own commit lock while the
+     * database is healthy; this one is the database itself not
+     * answering, which an operator pages on differently.
+     */
+    class BackendUnavailable(detail: String) : HoglakeException(detail)
+
+    /**
+     * The operation is not implemented by the backend this deployment
+     * runs (`HOGLAKE_DATABASE`) -> HTTP 501 `unsupported_backend`.
+     *
+     * The hoglite backend answers this for the surfaces its first
+     * milestone does not carry (storage-usage accounting, TRUNCATE,
+     * partition listings): the route table is one definition shared by
+     * both backends, so an unsupported operation gets a typed refusal
+     * that names the backend rather than a bare 404 that reads like a
+     * wrong URL. Deliberately NOT a [Validation]: replaying can never
+     * succeed, but the request was well-formed — the deployment is the
+     * mismatch.
+     */
+    class UnsupportedBackend(detail: String) : HoglakeException(detail)
 }

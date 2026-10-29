@@ -5,7 +5,7 @@ import com.posthog.hoglake.auth.actorOrRefuse
 import com.posthog.hoglake.service.ReplacementTarget
 import com.posthog.hoglake.service.TableCreation
 import com.posthog.hoglake.service.TableCreationDefinition
-import com.posthog.hoglake.service.TableCreationService
+import com.posthog.hoglake.service.TableCreationBackend
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
 import io.ktor.server.plugins.BadRequestException
@@ -59,7 +59,7 @@ private fun TableCreation.toDto() =
         writePath, state, expiresAt, snapshotId, schemaVersion, reason,
     )
 
-fun Application.installTableCreationRoutes(creations: TableCreationService) {
+fun Application.installTableCreationRoutes(creations: TableCreationBackend) {
     routing {
         route("/v1/catalogs/{catalog}/table-creations/{operation}") {
             put { call.prepareCreation(creations, partitioned = false) }
@@ -95,7 +95,7 @@ fun Application.installTableCreationRoutes(creations: TableCreationService) {
 }
 
 private suspend fun ApplicationCall.prepareCreation(
-    creations: TableCreationService,
+    creations: TableCreationBackend,
     partitioned: Boolean,
     sorted: Boolean = false,
     metadata: Boolean = false,

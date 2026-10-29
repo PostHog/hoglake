@@ -331,9 +331,7 @@ class NestedCampaignRegressionTest {
         for ((label, fieldId) in listOf("top-level" to 4L, "nested" to 3L)) {
             for (what in listOf("partition", "sort")) {
                 assertThatThrownBy {
-                    AlterService(
-                        org.jdbi.v3.core.Jdbi.create { error("unused") },
-                    ).requireSourceField(state, fieldId, what)
+                    AlterService.requireSourceField(state, fieldId, what)
                 }
                     .describedAs("%s variant as a %s source", label, what)
                     .isInstanceOf(HoglakeException.Validation::class.java)
@@ -352,11 +350,7 @@ class NestedCampaignRegressionTest {
                 ),
             )
         assertThat(
-            AlterService(
-                org.jdbi.v3.core.Jdbi.create {
-                    error("unused")
-                },
-            ).requireSourceField(ok, 2L, "partition").def.name,
+            AlterService.requireSourceField(ok, 2L, "partition").def.name,
         ).isEqualTo("n")
     }
 
