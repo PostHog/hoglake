@@ -98,6 +98,10 @@ jobs:
       fail-fast: false
       matrix:
         pyarrow: ["floor", "latest"]
+    # Pinned like the Test job: without it uv takes the runner's
+    # /usr/bin/python3, which ubuntu-latest moved from 3.12 to 3.14.
+    env:
+      UV_PYTHON: "3.12"
     defaults:
       run:
         working-directory: pyhoglake
