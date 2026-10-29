@@ -136,7 +136,7 @@ class ExpiryService(
      * one applied to a wait.
      */
     private val commitLockTimeoutMs: Long = CommitService.DEFAULT_COMMIT_LOCK_TIMEOUT_MS,
-) {
+) : ExpiryBackend {
     /**
      * The production wiring, and the only place the knobs come from
      * [Config] — `CleanupService`'s reason for the same shape: a
@@ -737,10 +737,10 @@ class ExpiryService(
      * Every run (zero-work included) is recorded in the maintenance run
      * ledger — the row is the per-catalog loop-liveness signal.
      */
-    fun runOnce(
+    override fun runOnce(
         catalog: String,
         batchSize: Int,
-        trigger: MaintenanceTrigger = MaintenanceTrigger.MANUAL,
+        trigger: MaintenanceTrigger,
     ): ExpiryResult =
         runStore.recorded(catalog, MaintenanceTask.EXPIRY, trigger) {
             runSweep(catalog, batchSize)

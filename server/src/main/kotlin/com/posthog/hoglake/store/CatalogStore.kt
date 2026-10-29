@@ -45,11 +45,12 @@ import java.util.UUID
  * therefore the operation (`commit`, `getTable`, `planScan`, …), and the
  * Postgres-side behavior is defined by the services the delegate calls.
  *
- * Operations a backend cannot honor throw
- * [com.posthog.hoglake.model.HoglakeException.UnsupportedBackend]
- * (HTTP 501) rather than being absent from the interface: the route
- * table stays one definition shared by both backends, and an honest,
- * typed refusal beats a 404 that looks like a wrong URL.
+ * Every route hoglake serves is implemented by BOTH backends — the
+ * route table is one definition shared by them, with no 501 carve-outs
+ * (the only 501s are the ones the Postgres path already serves, e.g.
+ * publications/export). A backend that cannot answer at all — outage,
+ * not semantics — throws
+ * [com.posthog.hoglake.model.HoglakeException.BackendUnavailable] (503).
  */
 interface CatalogStore {
     // ---- catalogs -------------------------------------------------------

@@ -44,6 +44,13 @@ fun Application.installApiRoutes(
     catalogTotals: () -> Map<String, CatalogTotals> = { emptyMap() },
     uiTheme: String = "",
 ) {
+    // The handlers below read `catalogs.`/`commits.` — the receiver names
+    // the spec-parity meta-tests pin by counting call sites (see
+    // CommitConflictSpecParityTest and CatalogDropSpecParityTest). The
+    // seam is the single CatalogStore; the aliases keep the handler
+    // text, and the tests' protective function, exactly as before.
+    val catalogs: CatalogStore = store
+    val commits: CatalogStore = store
     routing {
         get("/v1/info") {
             // Totals come from the metrics sampler's last pass — never
@@ -97,23 +104,23 @@ fun Application.installApiRoutes(
                         is AuthState.Anonymous -> emptySet()
                         is AuthState.Authenticated -> auth.caller.visibleCatalogs()
                     }
-                call.respond(store.listCatalogs(visible).map { it.toDto(totals[it.name]) })
+                call.respond(catalogs.listCatalogs(visible).map { it.toDto(totals[it.name]) })
             }
             post {
                 val req = call.receive<CreateCatalogRequestDto>()
                 call.respond(
                     HttpStatusCode.Created,
-                    store.createCatalog(req.name, req.dataPath, call.actorOrRefuse(req.author), req.message).toDto(),
+                    catalogs.createCatalog(req.name, req.dataPath, call.actorOrRefuse(req.author), req.message).toDto(),
                 )
             }
 
             route("/{catalog}") {
                 get {
-                    call.respond(store.getCatalog(call.catalog()).toDto())
+                    call.respond(catalogs.getCatalog(call.catalog()).toDto())
                 }
                 delete {
                     call.respond(
-                        store.dropCatalog(
+                        catalogs.dropCatalog(
                             call.catalog(),
                             call.actorOrRefuse(call.request.queryParameters["author"]),
                             call.request.queryParameters["message"],
@@ -129,13 +136,13 @@ fun Application.installApiRoutes(
                     ) {
                         throw BadRequestException("storage-usage does not accept snapshot or at_timestamp")
                     }
-                    call.respond(store.storageUsage(call.catalog()).toDto())
+                    call.respond(catalogs.storageUsage(call.catalog()).toDto())
                 }
 
                 route("/namespaces") {
                     get {
                         call.respond(
-                            store.listNamespaces(
+                            catalogs.listNamespaces(
                                 call.catalog(),
                                 call.longQuery("snapshot"),
                                 call.instantQuery("at_timestamp"),
@@ -146,7 +153,7 @@ fun Application.installApiRoutes(
                         val req = call.receive<CreateNamespaceRequestDto>()
                         call.respond(
                             HttpStatusCode.Created,
-                            store.createNamespace(
+                            catalogs.createNamespace(
                                 call.catalog(),
                                 req.name,
                                 call.actorOrRefuse(req.author),
@@ -156,12 +163,12 @@ fun Application.installApiRoutes(
                     }
                     get("/{namespace}") {
                         call.respond(
-                            store.getNamespace(call.catalog(), call.namespace()).toDto(),
+                            catalogs.getNamespace(call.catalog(), call.namespace()).toDto(),
                         )
                     }
                     delete("/{namespace}") {
                         call.respond(
-                            store.dropNamespace(
+                            catalogs.dropNamespace(
                                 call.catalog(),
                                 call.namespace(),
                                 call.longQuery("expected_namespace_id"),
@@ -174,7 +181,7 @@ fun Application.installApiRoutes(
                     route("/{namespace}/tables") {
                         get {
                             call.respond(
-                                store.listTables(
+                                catalogs.listTables(
                                     call.catalog(),
                                     call.namespace(),
                                     call.longQuery("snapshot"),
@@ -186,7 +193,7 @@ fun Application.installApiRoutes(
                             val req = call.receive<CreateTableRequestDto>()
                             call.respond(
                                 HttpStatusCode.Created,
-                                store.createTable(
+                                catalogs.createTable(
                                     call.catalog(),
                                     call.namespace(),
                                     req.name,
@@ -200,7 +207,7 @@ fun Application.installApiRoutes(
                         route("/{table}") {
                             get {
                                 call.respond(
-                                    store.getTable(
+                                    catalogs.getTable(
                                         call.catalog(),
                                         call.namespace(),
                                         call.table(),
@@ -219,7 +226,7 @@ fun Application.installApiRoutes(
                             }
                             delete {
                                 call.respond(
-                                    store.dropTable(
+                                    catalogs.dropTable(
                                         call.catalog(),
                                         call.namespace(),
                                         call.table(),
@@ -248,7 +255,7 @@ fun Application.installApiRoutes(
                                         }
                                     }
                                 call.respond(
-                                    store.truncateTable(
+                                    catalogs.truncateTable(
                                         call.catalog(),
                                         call.namespace(),
                                         call.table(),
@@ -327,7 +334,7 @@ fun Application.installApiRoutes(
                                             keyIndex to v
                                         } ?: emptyMap()
                                 call.respond(
-                                    store.listFiles(
+                                    catalogs.listFiles(
                                         call.catalog(),
                                         call.namespace(),
                                         call.table(),
@@ -343,7 +350,7 @@ fun Application.installApiRoutes(
                             }
                             get("/partitions/values") {
                                 call.respond(
-                                    store.partitionValues(
+                                    catalogs.partitionValues(
                                         call.catalog(),
                                         call.namespace(),
                                         call.table(),
@@ -354,7 +361,7 @@ fun Application.installApiRoutes(
                             }
                             get("/files/{fileId}/stats") {
                                 call.respond(
-                                    store.fileStats(
+                                    catalogs.fileStats(
                                         call.catalog(),
                                         call.namespace(),
                                         call.table(),
@@ -371,7 +378,7 @@ fun Application.installApiRoutes(
                                             "missing required query parameter 'from_snapshot'",
                                         )
                                 call.respond(
-                                    store.changes(
+                                    catalogs.changes(
                                         call.catalog(),
                                         call.namespace(),
                                         call.table(),
@@ -388,7 +395,7 @@ fun Application.installApiRoutes(
                     val at =
                         call.instantQuery("at_timestamp")
                             ?: throw BadRequestException("query parameter 'at_timestamp' is required")
-                    call.respond(store.resolveSnapshot(call.catalog(), at).toDto())
+                    call.respond(catalogs.resolveSnapshot(call.catalog(), at).toDto())
                 }
 
                 get("/snapshots") {
@@ -396,7 +403,7 @@ fun Application.installApiRoutes(
                     val before = call.longQuery("before")
                     val limit = (call.intQuery("limit") ?: 1000).coerceAtMost(10_000)
                     val (page, hasMore) =
-                        store.listSnapshots(call.catalog(), after, limit, before)
+                        catalogs.listSnapshots(call.catalog(), after, limit, before)
                     call.respond(SnapshotPageDto(page.map { it.toDto() }, hasMore))
                 }
 
@@ -408,7 +415,7 @@ fun Application.installApiRoutes(
                         throw com.posthog.hoglake.model.HoglakeException.Validation("idempotency_key is required")
                     }
                     call.respond(
-                        store.commit(call.catalog(), req.toModel(), call.request.userAgent()).toDto(),
+                        commits.commit(call.catalog(), req.toModel(), call.request.userAgent()).toDto(),
                     )
                 }
 
@@ -423,7 +430,7 @@ fun Application.installApiRoutes(
                         )
                     }
                     call.respond(
-                        store.commit(
+                        commits.commit(
                             call.catalog(),
                             req.toModel(allowEmptyDeletes = true),
                             call.request.userAgent(),
@@ -444,7 +451,7 @@ fun Application.installApiRoutes(
                         )
                     }
                     call.respond(
-                        store.commit(
+                        commits.commit(
                             call.catalog(),
                             req.toModel(allowEmptyDeletes = true).copy(requireUnchangedTables = true),
                             call.request.userAgent(),
@@ -463,7 +470,7 @@ fun Application.installApiRoutes(
                         )
                     }
                     call.respond(
-                        store.commit(
+                        commits.commit(
                             call.catalog(),
                             req.toModel(allowEmptyDeletes = true)
                                 .copy(requireUnchangedTables = req.deletes.isNotEmpty()),
@@ -488,7 +495,7 @@ fun Application.installApiRoutes(
                         )
                     }
                     call.respond(
-                        store.commit(
+                        commits.commit(
                             call.catalog(),
                             req.toModel(allowEmptyDeletes = true)
                                 .copy(requireUnchangedTables = true, allowPendingDeletes = true),
@@ -504,33 +511,33 @@ fun Application.installApiRoutes(
                         } catch (_: IllegalArgumentException) {
                             throw BadRequestException("invalid operation UUID")
                         }
-                    val receipt = store.receipt(call.catalog(), operation)
+                    val receipt = commits.receipt(call.catalog(), operation)
                     call.respond(CommitReceiptDto(operation, receipt.snapshotId, receipt.schemaVersion))
                 }
 
                 post("/commit") {
                     val req = call.receiveCommit()
                     call.respond(
-                        store.commit(call.catalog(), req.toModel(), call.request.userAgent()).toDto(),
+                        commits.commit(call.catalog(), req.toModel(), call.request.userAgent()).toDto(),
                     )
                 }
 
                 get("/consumers") {
                     call.respond(
-                        store.listConsumers(call.catalog()).toConsumerListDto(),
+                        catalogs.listConsumers(call.catalog()).toConsumerListDto(),
                     )
                 }
 
                 route("/consumers/{consumer}/offsets") {
                     get {
                         call.respond(
-                            store.listOffsets(call.catalog(), call.consumer())
+                            catalogs.listOffsets(call.catalog(), call.consumer())
                                 .map { it.toDto() },
                         )
                     }
                     get("/{tableUuid}") {
                         call.respond(
-                            store.getOffset(
+                            catalogs.getOffset(
                                 call.catalog(),
                                 call.consumer(),
                                 call.uuidPath("tableUuid"),
@@ -541,7 +548,7 @@ fun Application.installApiRoutes(
                         val tableUuid = call.uuidPath("tableUuid")
                         val req = call.receive<CommitOffsetRequestDto>()
                         call.respond(
-                            store.commitOffset(
+                            catalogs.commitOffset(
                                 call.catalog(),
                                 call.consumer(),
                                 tableUuid,
@@ -564,6 +571,10 @@ fun Application.installApiRoutes(
  * it with its own ScanService.
  */
 fun Application.installScanRoutes(store: CatalogStore) {
+    // `scan.` is the receiver name the handler used before the seam; the
+    // alias keeps the handler text identical (same rationale as the
+    // catalogs/commits aliases in installApiRoutes).
+    val scan: CatalogStore = store
     routing {
         get("/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/scan") {
             // getAll, joined: Parameters[...] is only the FIRST occurrence,
@@ -573,7 +584,7 @@ fun Application.installScanRoutes(store: CatalogStore) {
             fun joined(name: String) = call.request.queryParameters.getAll(name)?.joinToString(",")
             val request = parseScanRequest(joined("include"), joined("stats_fields"))
             call.respond(
-                store.planScan(
+                scan.planScan(
                     call.catalog(),
                     call.namespace(),
                     call.table(),

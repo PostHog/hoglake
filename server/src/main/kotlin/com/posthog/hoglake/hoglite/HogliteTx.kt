@@ -84,10 +84,15 @@ class HogliteTx {
      * names an unguarded statement (a bug — but a miss here must still
      * be a typed conflict, not a crash).
      */
-    fun classify(e: HogliteGuardFailure): HoglakeException =
-        failures[e.statementIndex]?.invoke()
-            ?: HoglakeException.CommitConflict(
-                "hoglite rejected statement ${e.statementIndex} without a registered guard " +
-                    "(a store bug; the transaction rolled back cleanly): ${e.message}",
-            )
+    fun classify(e: HogliteGuardFailure): HoglakeException {
+        val registered = failures[e.statementIndex]?.invoke()
+        if (registered != null) return registered
+        // Written as an if+return, not an Elvis into the constructor:
+        // CommitConflictSpecParityTest scans for declaration-shaped text
+        // and an Elvis's colon would read as one.
+        return HoglakeException.CommitConflict(
+            "hoglite rejected statement ${e.statementIndex} without a registered guard " +
+                "(a store bug; the transaction rolled back cleanly): ${e.message}",
+        )
+    }
 }

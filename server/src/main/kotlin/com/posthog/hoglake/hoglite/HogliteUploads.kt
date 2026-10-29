@@ -174,14 +174,15 @@ internal class HogliteUploads(
         // checks every path at drain time), but a path a file row
         // already claims must not even be OFFERED.
         tx.add(
-            """INSERT INTO removals(path, file_kind, reason, queued_snapshot)
+            """INSERT INTO removals(path, file_kind, reason, queued_snapshot, queued_at)
                SELECT u.path, u.file_kind, 'trino_upload',
-                      (SELECT next_snapshot - 1 FROM meta WHERE id = 1)
+                      (SELECT next_snapshot - 1 FROM meta WHERE id = 1), ?
                  FROM uploads u
                 WHERE u.upload_id = ?
                   AND NOT EXISTS (SELECT 1 FROM removals r WHERE r.path = u.path AND r.drained_at IS NULL)
                   AND NOT EXISTS (SELECT 1 FROM files f WHERE f.path = u.path)
                   AND NOT EXISTS (SELECT 1 FROM dvs d WHERE d.path = u.path)""",
+            HogliteSchema.now(),
             id,
         )
         val results = store.runTx(catalog, HogliteCatalogStore.freshTxid("upload-sweep"), null, tx)

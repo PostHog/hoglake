@@ -1177,7 +1177,7 @@ class CompactionService(
      * that must pass it, and does.
      */
     private val plannerIdentity: String? = null,
-) {
+) : com.posthog.hoglake.service.CompactionBackend {
     private val log = KotlinLogging.logger {}
 
     /** The run ledger; records after the sweep resolves, never inside it. */
@@ -3123,10 +3123,10 @@ class CompactionService(
     // ---- one run ---------------------------------------------------------
 
     /** Manual-trigger convenience: defaults with an optional groups-per-run override. */
-    fun runOnce(
+    override fun runOnce(
         catalog: String,
-        batchOverride: Int? = null,
-        trigger: MaintenanceTrigger = MaintenanceTrigger.MANUAL,
+        batchOverride: Int?,
+        trigger: MaintenanceTrigger,
     ): CompactionResult =
         runOnce(catalog, defaults.copy(maxGroupsPerRun = batchOverride ?: defaults.maxGroupsPerRun), trigger)
 

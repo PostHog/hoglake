@@ -127,10 +127,6 @@ internal fun errorBody(cause: HoglakeException): Pair<HttpStatusCode, ApiErrorDt
         // to "one catalog is hot".
         is HoglakeException.BackendUnavailable ->
             HttpStatusCode.ServiceUnavailable to apiError("backend_unavailable", cause)
-        // The route exists on both backends; this deployment's backend
-        // does not implement the operation.
-        is HoglakeException.UnsupportedBackend ->
-            HttpStatusCode.NotImplemented to apiError("unsupported_backend", cause)
     }
 
 /** Installs [errorBody] plus the malformed-input and catch-all handlers. */

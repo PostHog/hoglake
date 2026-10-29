@@ -607,10 +607,11 @@ internal object HogliteCommit {
         tx.insertSnapshotRow(request.author, request.message)
         if (request.idempotencyKey != null) {
             tx.add(
-                "INSERT INTO receipts(idempotency_key, fingerprint, snapshot_id, schema_version) " +
-                    "VALUES (?, ?, ${HogliteSchema.HEAD_SQL}, (SELECT schema_version FROM meta WHERE id = 1))",
+                "INSERT INTO receipts(idempotency_key, fingerprint, snapshot_id, schema_version, created_at) " +
+                    "VALUES (?, ?, ${HogliteSchema.HEAD_SQL}, (SELECT schema_version FROM meta WHERE id = 1), ?)",
                 request.idempotencyKey.toString(),
                 fingerprint,
+                HogliteSchema.now(),
             )
         }
         val readback = tx.add(HogliteSql.READBACK_COMMIT)

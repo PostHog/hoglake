@@ -132,7 +132,7 @@ class Hydrator(
      * fixtures keep their rows; `App` passes the configured floor.
      */
     private val minFileBytes: Long = 0,
-) {
+) : com.posthog.hoglake.service.HydratorMaintenanceBackend {
     init {
         require(minFileBytes >= 0) { "minFileBytes=$minFileBytes must not be negative" }
     }
@@ -154,8 +154,6 @@ class Hydrator(
         val beginSnapshot: Long,
     )
 
-    /** A retryable object-store failure: the file must STAY pending. */
-    private class TransientFetchException(message: String, cause: Throwable) : RuntimeException(message, cause)
 
     /**
      * The sweep's claim, PER CATALOG with a fair share of [limit] (#269).
@@ -425,10 +423,10 @@ class Hydrator(
      * registration corrected, cap raised). Recorded in the run ledger as
      * a manual hydrator run.
      */
-    fun rehydrateFailed(
+    override fun rehydrateFailed(
         catalog: String,
-        namespace: String? = null,
-        table: String? = null,
+        namespace: String?,
+        table: String?,
     ): RehydrateResult =
         runStore.recorded(catalog, MaintenanceTask.HYDRATOR, MaintenanceTrigger.MANUAL) {
             rehydrateFailedAudited(catalog, namespace, table)
@@ -753,7 +751,178 @@ class Hydrator(
 
     // ---- footer fetch ------------------------------------------------------
 
-    private fun readFooter(file: PendingFile): ParquetMetadata {
+    private val footerReader = FooterReader(store, maxWholeObjectBytes)
+
+    private fun readFooter(file: PendingFile): ParquetMetadata = footerReader.read(file)
+
+    companion object {
+        /**
+         * The sweep's claim, `internal` so the plan test EXPLAINs the
+         * SQL PRODUCTION runs rather than a lookalike (AGENT.md: V14's
+         * first index was proven against a predicate no code path
+         * issues).
+         *
+         * A DROPPED TABLE'S PENDING FILES ARE NOT WORK. Since #193 a
+         * drop touches no file row, so a dropped table's `pending` rows
+         * stay pending and this sweep would otherwise keep claiming
+         * them — fetching footers from S3 to write stats onto rows the
+         * retirement loop is about to delete, and holding row locks on
+         * a dropped table while it does. The claim is ordered by
+         * data_file_id within the catalog, so a big dropped table's
+         * pending backlog would sit at the HEAD of the catalog's queue
+         * and starve every live table behind it, forever, on a catalog
+         * whose floor has not reached the drop yet. The join discards
+         * them, but the index range still WALKS them — index-only
+         * since V26 put `table_id` in the index's payload, one memoized
+         * hog_table probe per table, and still O(backlog) per sweep
+         * until retirement deletes the rows. [claimPending]'s
+         * per-catalog timeout is what bounds that walk's cost to the
+         * one catalog.
+         *
+         * It is also what lets the retirement batch's victim select
+         * drop its `FOR UPDATE`: the hydrator was the only row-level
+         * writer that could otherwise touch a dropped table's file
+         * rows.
+         *
+         * `FOR UPDATE OF f`, not a bare `FOR UPDATE`: the join must not
+         * take row locks on `hog_table`, which every DDL path writes.
+         * The scan stays driven by `hog_data_file_pending` (the partial
+         * index on `stats_state = 'pending' AND end_snapshot IS NULL`,
+         * `(catalog_id, data_file_id)`), probed by `catalog_id` and
+         * continued past `:after`, with a primary-key probe into
+         * `hog_table` per claimed row — asserted in
+         * `HydratorClaimPlanIntegrationTest`, because a join added to a
+         * hot loop with no plan test is how an index stops being used
+         * without anything saying so.
+         *
+         * `f.end_snapshot IS NULL` (#269): an ENDED pending row — the
+         * file was compacted away, or its snapshot expired, before the
+         * hydrator reached it — is not work either. Its stats would be
+         * written onto a row no scan can return, after a footer read
+         * from the object store for nothing. The term is IN THE INDEX'S
+         * PREDICATE (V26), not merely in this WHERE: a row the claim
+         * skips must not stay in the index the claim walks, or every
+         * sweep would walk the catalog's whole ended-pending residue —
+         * unbounded on a retention-NULL catalog, where nothing deletes
+         * ended rows — before reaching its first live row. With it in
+         * the predicate, the UPDATE that ends a row drops it from the
+         * index at that moment. The same rule keeps `rehydrateFailed`
+         * from requeueing an ended failed row: the sweep would never
+         * take it, and the backlog gauge would count it forever.
+         */
+        internal const val CLAIM_PENDING_SQL: String =
+            """
+            SELECT f.catalog_id, f.data_file_id, f.table_id, f.path, f.record_count,
+                   f.file_size_bytes, f.footer_size, f.begin_snapshot
+            FROM hog_data_file f
+            JOIN hog_table t
+              ON t.catalog_id = f.catalog_id AND t.table_id = f.table_id
+            WHERE f.catalog_id = :catalogId
+              AND f.stats_state = 'pending'
+              AND f.data_file_id > :after
+              AND f.end_snapshot IS NULL
+              AND t.dropped_snapshot IS NULL
+            ORDER BY f.data_file_id
+            LIMIT :limit
+            FOR UPDATE OF f SKIP LOCKED
+            """
+
+        /**
+         * Files claimed per sweep.
+         *
+         * 100 was a placeholder that outlived its assumption. Hydration
+         * is a backfill for files registered WITHOUT stats, and the
+         * steady-state queue is empty because every writer in the fleet
+         * ships its own footer — so the batch size never mattered and a
+         * small one looked prudent.
+         *
+         * A writer that defers stats breaks that assumption, and then
+         * the arithmetic is unforgiving: the loop takes its batch and
+         * sleeps the whole interval whether one file waited or ten
+         * thousand did. At 100 per sweep on a 15-minute loop that is
+         * ~400 files/hour per deployment, against a deferred-stats
+         * writer producing them far faster. Measured on gigahog-dev: a
+         * 13,224-file backlog draining at ~800/hour while still growing.
+         *
+         * A pending file is unprunable on EVERY column until it is
+         * hydrated, so the backlog is not just a queue — it is files no
+         * reader can skip.
+         *
+         * 10,000 was sized off the per-file cost rather than a guess:
+         * ~150ms each (a ranged footer read plus a catalog write, from
+         * the same dev measurement), so a full batch is minutes of work
+         * and only ever runs when that much has genuinely accumulated.
+         * In practice that sized the wrong thing. The sweep is ONE
+         * transaction, claimed FOR UPDATE SKIP LOCKED, so 10,000 files
+         * is minutes of row locks and one commit's worth of WAL held
+         * open on the catalog database — and any failure rolls the
+         * whole sweep back, not one file.
+         *
+         * 1,000 keeps the drain rate that matters: at ~150ms each a
+         * full batch is ~2.5 minutes against a 15-minute interval, so
+         * a backlog still drains at ~4,000/hour — five times the rate
+         * that let the 13,224-file backlog grow under 100 — while the
+         * worst-case transaction is a tenth the length and a failure
+         * loses a tenth the work.
+         */
+        const val DEFAULT_SWEEP_LIMIT = 1_000
+
+        /**
+         * Config's default size floor, 1 MiB (#432): files under it hydrate
+         * without stats rows. The production files it covers are
+         * millrace-prod-us's ~13 KB files and millpond's ~0.1 MB stray-day
+         * files; the floor is about the rows, so see Config's KDoc for the
+         * arithmetic.
+         */
+        const val DEFAULT_MIN_FILE_BYTES: Long = 1L shl 20
+
+
+        /** Default whole-object fallback cap: 256 MiB. */
+        const val DEFAULT_MAX_WHOLE_OBJECT_BYTES: Long = 256L * 1024 * 1024
+
+        /** Per-file savepoint name inside the sweep transaction. */
+        private const val FILE_SAVEPOINT = "hoglake_hydrate_file"
+
+        private const val CLAIM_SAVEPOINT = "hoglake_hydrate_claim"
+
+        /**
+         * [Hydrator.claimTimeoutMs]'s default. A claim is one range of
+         * `hog_data_file_pending` bounded by its LIMIT; ten seconds is
+         * four orders of magnitude over a healthy one and well under the
+         * session's 60 s, so the sweep spends at most this per wedged
+         * catalog and never its whole statement budget on one.
+         */
+        const val DEFAULT_CLAIM_TIMEOUT_MS: Long = 10_000
+    }
+}
+
+private fun Update.bindNullableLong(
+    name: String,
+    value: Long?,
+): Update = if (value == null) bindNull(name, Types.BIGINT) else bind(name, value)
+
+private fun Update.bindNullableBytes(
+    name: String,
+    value: ByteArray?,
+): Update = if (value == null) bindNull(name, Types.BINARY) else bind(name, value)
+
+/**
+ * The object-store half of hydration: fetch a file's parquet footer
+ * (tail-range GET when the registration carried a usable footer_size,
+ * the capped whole-object fallback otherwise), with the transient-vs-
+ * structural fetch classification. Extracted from Hydrator so the
+ * hoglite backend's hydrator (HogliteHydrator) reads footers by the
+ * SAME code — only the catalog writes differ (Postgres's per-column
+ * stats rows vs the tenant row's stats_json).
+ */
+internal class FooterReader(
+    private val store: ObjectStore,
+    private val maxWholeObjectBytes: Long,
+) {
+    private val log = KotlinLogging.logger {}
+    // ---- footer fetch ------------------------------------------------------
+
+    fun read(file: Hydrator.PendingFile): ParquetMetadata {
         val footerSize = file.footerSize
         if (footerSize != null && footerSize > 0 && footerSize + FOOTER_SUFFIX < file.fileSizeBytes) {
             try {
@@ -935,154 +1104,10 @@ class Hydrator(
     }
 
     companion object {
-        /**
-         * The sweep's claim, `internal` so the plan test EXPLAINs the
-         * SQL PRODUCTION runs rather than a lookalike (AGENT.md: V14's
-         * first index was proven against a predicate no code path
-         * issues).
-         *
-         * A DROPPED TABLE'S PENDING FILES ARE NOT WORK. Since #193 a
-         * drop touches no file row, so a dropped table's `pending` rows
-         * stay pending and this sweep would otherwise keep claiming
-         * them — fetching footers from S3 to write stats onto rows the
-         * retirement loop is about to delete, and holding row locks on
-         * a dropped table while it does. The claim is ordered by
-         * data_file_id within the catalog, so a big dropped table's
-         * pending backlog would sit at the HEAD of the catalog's queue
-         * and starve every live table behind it, forever, on a catalog
-         * whose floor has not reached the drop yet. The join discards
-         * them, but the index range still WALKS them — index-only
-         * since V26 put `table_id` in the index's payload, one memoized
-         * hog_table probe per table, and still O(backlog) per sweep
-         * until retirement deletes the rows. [claimPending]'s
-         * per-catalog timeout is what bounds that walk's cost to the
-         * one catalog.
-         *
-         * It is also what lets the retirement batch's victim select
-         * drop its `FOR UPDATE`: the hydrator was the only row-level
-         * writer that could otherwise touch a dropped table's file
-         * rows.
-         *
-         * `FOR UPDATE OF f`, not a bare `FOR UPDATE`: the join must not
-         * take row locks on `hog_table`, which every DDL path writes.
-         * The scan stays driven by `hog_data_file_pending` (the partial
-         * index on `stats_state = 'pending' AND end_snapshot IS NULL`,
-         * `(catalog_id, data_file_id)`), probed by `catalog_id` and
-         * continued past `:after`, with a primary-key probe into
-         * `hog_table` per claimed row — asserted in
-         * `HydratorClaimPlanIntegrationTest`, because a join added to a
-         * hot loop with no plan test is how an index stops being used
-         * without anything saying so.
-         *
-         * `f.end_snapshot IS NULL` (#269): an ENDED pending row — the
-         * file was compacted away, or its snapshot expired, before the
-         * hydrator reached it — is not work either. Its stats would be
-         * written onto a row no scan can return, after a footer read
-         * from the object store for nothing. The term is IN THE INDEX'S
-         * PREDICATE (V26), not merely in this WHERE: a row the claim
-         * skips must not stay in the index the claim walks, or every
-         * sweep would walk the catalog's whole ended-pending residue —
-         * unbounded on a retention-NULL catalog, where nothing deletes
-         * ended rows — before reaching its first live row. With it in
-         * the predicate, the UPDATE that ends a row drops it from the
-         * index at that moment. The same rule keeps `rehydrateFailed`
-         * from requeueing an ended failed row: the sweep would never
-         * take it, and the backlog gauge would count it forever.
-         */
-        internal const val CLAIM_PENDING_SQL: String =
-            """
-            SELECT f.catalog_id, f.data_file_id, f.table_id, f.path, f.record_count,
-                   f.file_size_bytes, f.footer_size, f.begin_snapshot
-            FROM hog_data_file f
-            JOIN hog_table t
-              ON t.catalog_id = f.catalog_id AND t.table_id = f.table_id
-            WHERE f.catalog_id = :catalogId
-              AND f.stats_state = 'pending'
-              AND f.data_file_id > :after
-              AND f.end_snapshot IS NULL
-              AND t.dropped_snapshot IS NULL
-            ORDER BY f.data_file_id
-            LIMIT :limit
-            FOR UPDATE OF f SKIP LOCKED
-            """
-
-        /**
-         * Files claimed per sweep.
-         *
-         * 100 was a placeholder that outlived its assumption. Hydration
-         * is a backfill for files registered WITHOUT stats, and the
-         * steady-state queue is empty because every writer in the fleet
-         * ships its own footer — so the batch size never mattered and a
-         * small one looked prudent.
-         *
-         * A writer that defers stats breaks that assumption, and then
-         * the arithmetic is unforgiving: the loop takes its batch and
-         * sleeps the whole interval whether one file waited or ten
-         * thousand did. At 100 per sweep on a 15-minute loop that is
-         * ~400 files/hour per deployment, against a deferred-stats
-         * writer producing them far faster. Measured on gigahog-dev: a
-         * 13,224-file backlog draining at ~800/hour while still growing.
-         *
-         * A pending file is unprunable on EVERY column until it is
-         * hydrated, so the backlog is not just a queue — it is files no
-         * reader can skip.
-         *
-         * 10,000 was sized off the per-file cost rather than a guess:
-         * ~150ms each (a ranged footer read plus a catalog write, from
-         * the same dev measurement), so a full batch is minutes of work
-         * and only ever runs when that much has genuinely accumulated.
-         * In practice that sized the wrong thing. The sweep is ONE
-         * transaction, claimed FOR UPDATE SKIP LOCKED, so 10,000 files
-         * is minutes of row locks and one commit's worth of WAL held
-         * open on the catalog database — and any failure rolls the
-         * whole sweep back, not one file.
-         *
-         * 1,000 keeps the drain rate that matters: at ~150ms each a
-         * full batch is ~2.5 minutes against a 15-minute interval, so
-         * a backlog still drains at ~4,000/hour — five times the rate
-         * that let the 13,224-file backlog grow under 100 — while the
-         * worst-case transaction is a tenth the length and a failure
-         * loses a tenth the work.
-         */
-        const val DEFAULT_SWEEP_LIMIT = 1_000
-
-        /**
-         * Config's default size floor, 1 MiB (#432): files under it hydrate
-         * without stats rows. The production files it covers are
-         * millrace-prod-us's ~13 KB files and millpond's ~0.1 MB stray-day
-         * files; the floor is about the rows, so see Config's KDoc for the
-         * arithmetic.
-         */
-        const val DEFAULT_MIN_FILE_BYTES: Long = 1L shl 20
-
         /** 4-byte footer length + 4-byte "PAR1" magic at the end of the file. */
         private const val FOOTER_SUFFIX = 8L
-
-        /** Default whole-object fallback cap: 256 MiB. */
-        const val DEFAULT_MAX_WHOLE_OBJECT_BYTES: Long = 256L * 1024 * 1024
-
-        /** Per-file savepoint name inside the sweep transaction. */
-        private const val FILE_SAVEPOINT = "hoglake_hydrate_file"
-
-        private const val CLAIM_SAVEPOINT = "hoglake_hydrate_claim"
-
-        /**
-         * [Hydrator.claimTimeoutMs]'s default. A claim is one range of
-         * `hog_data_file_pending` bounded by its LIMIT; ten seconds is
-         * four orders of magnitude over a healthy one and well under the
-         * session's 60 s, so the sweep spends at most this per wedged
-         * catalog and never its whole statement budget on one.
-         */
-        const val DEFAULT_CLAIM_TIMEOUT_MS: Long = 10_000
     }
 }
 
-private fun Update.bindNullableLong(
-    name: String,
-    value: Long?,
-): Update = if (value == null) bindNull(name, Types.BIGINT) else bind(name, value)
-
-private fun Update.bindNullableBytes(
-    name: String,
-    value: ByteArray?,
-): Update = if (value == null) bindNull(name, Types.BINARY) else bind(name, value)
+/** A retryable object-store failure: the file must STAY pending. */
+internal class TransientFetchException(message: String, cause: Throwable) : RuntimeException(message, cause)

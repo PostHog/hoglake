@@ -71,8 +71,8 @@ class PartitionStatsService(
     private val smallFileThresholdBytes: Long,
     private val minInputFiles: Int = CompactionGrouping.DEFAULT_MIN_INPUT_FILES,
     private val maxInputFiles: Int = CompactionGrouping.DEFAULT_MAX_INPUT_FILES,
-) {
-    fun partitionStats(
+) : PartitionStatsBackend {
+    override fun partitionStats(
         catalog: String,
         namespace: String?,
         table: String?,

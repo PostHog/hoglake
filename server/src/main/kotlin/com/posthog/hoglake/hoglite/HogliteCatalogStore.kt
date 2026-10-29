@@ -1645,6 +1645,7 @@ class HogliteCatalogStore(
 
     /** ALTER TABLE on this store's tenant tables. */
     internal val alters: HogliteAlters by lazy { HogliteAlters(this) }
+    internal val views: HogliteViews by lazy { HogliteViews(this) }
 
     /**
      * One table-creation receipt, with lazy expiry applied: a `prepared`
@@ -1737,7 +1738,78 @@ class HogliteCatalogStore(
             else -> HoglakeException.BackendUnavailable("hoglite answered ${r.status}: ${r.body}")
         }
 
-    private fun ensureRegistry() {
+    /**
+     * The maintenance run ledger, one row per run in the CATALOG's
+     * tenant (the tenant IS the catalog, so Postgres's catalog_id
+     * column has no counterpart). Mirrors MaintenanceRunStore.recorded:
+     * the row lands after the run resolves, a failure records FAILED
+     * with the error text (and a PartialResult's earned counters), and
+     * a ledger-write failure is a WARN, never the run's result.
+     */
+    internal fun <T> recorded(
+        catalog: String,
+        task: com.posthog.hoglake.model.MaintenanceTask,
+        trigger: com.posthog.hoglake.model.MaintenanceTrigger,
+        body: () -> T,
+    ): T {
+        val startedAt = java.time.Instant.now()
+        try {
+            val result = body()
+            recordRun(
+                catalog, task, trigger, startedAt, java.time.Instant.now(),
+                com.posthog.hoglake.model.MaintenanceRunStatus.OK, null, result,
+            )
+            return result
+        } catch (e: Throwable) {
+            recordRun(
+                catalog, task, trigger, startedAt, java.time.Instant.now(),
+                com.posthog.hoglake.model.MaintenanceRunStatus.FAILED,
+                e.message,
+                (e as? com.posthog.hoglake.persistence.PartialResult)?.partial,
+            )
+            throw e
+        }
+    }
+
+    private val ledgerJson = com.posthog.hoglake.wireObjectMapper()
+
+    private fun recordRun(
+        catalog: String,
+        task: com.posthog.hoglake.model.MaintenanceTask,
+        trigger: com.posthog.hoglake.model.MaintenanceTrigger,
+        startedAt: java.time.Instant,
+        finishedAt: java.time.Instant,
+        status: com.posthog.hoglake.model.MaintenanceRunStatus,
+        error: String?,
+        result: Any?,
+    ) {
+        runCatching {
+            val tx = HogliteTx()
+            tx.add(
+                "INSERT INTO maintenance_runs(task, run_trigger, started_at, finished_at, status, error, result_json) " +
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                task.wire,
+                trigger.wire,
+                HogliteSchema.fmt(startedAt),
+                HogliteSchema.fmt(finishedAt),
+                status.wire,
+                error,
+                result?.let { ledgerJson.writeValueAsString(it) },
+            )
+            runTx(catalog, freshTxid("ledger"), null, tx)
+        }.onFailure { e ->
+            io.github.oshai.kotlinlogging.KotlinLogging.logger {}
+                .warn(e) { "maintenance ledger: failed to record ${'$'}task run for catalog '${'$'}catalog'" }
+        }
+    }
+
+    /** Every catalog name in the registry — the loops' instance-wide fan-out. */
+    internal fun listCatalogNames(): List<String> {
+        ensureRegistry()
+        return queryRegistry("SELECT name FROM catalogs ORDER BY name").rows.map { it[0].asString() }
+    }
+
+    internal fun ensureRegistry() {
         client.createTenant(REGISTRY_TENANT)
         val tx = HogliteTx()
         tx.add(
@@ -1747,7 +1819,7 @@ class HogliteCatalogStore(
         runTx(REGISTRY_TENANT, "boot:$REGISTRY_TENANT", "registry:v1", tx)
     }
 
-    private fun queryRegistry(
+    internal fun queryRegistry(
         sql: String,
         vararg args: Any?,
     ): HogliteQueryResult =

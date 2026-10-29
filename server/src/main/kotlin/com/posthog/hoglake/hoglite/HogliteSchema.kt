@@ -206,7 +206,8 @@ internal object HogliteSchema {
                 idempotency_key TEXT PRIMARY KEY,
                 fingerprint TEXT NOT NULL,
                 snapshot_id INTEGER NOT NULL,
-                schema_version INTEGER NOT NULL
+                schema_version INTEGER NOT NULL,
+                created_at TEXT NOT NULL
             )""",
             """CREATE TABLE IF NOT EXISTS offsets(
                 consumer_id TEXT NOT NULL,
@@ -258,15 +259,26 @@ internal object HogliteSchema {
              * once no retained snapshot references it. claimed_* is the
              * cleanup worker's lease on the row.
              */
+            /**
+             * The removal queue (Postgres's hog_file_removal minus
+             * catalog_id): expiry/compaction/retirement/upload-abandon
+             * queue an object path here; the cleanup drain claims with a
+             * lease, deletes the object, and settles with an outcome.
+             */
             """CREATE TABLE IF NOT EXISTS removals(
                 id INTEGER PRIMARY KEY,
                 path TEXT NOT NULL,
                 file_kind TEXT NOT NULL,
                 reason TEXT,
                 queued_snapshot INTEGER NOT NULL,
+                queued_at TEXT NOT NULL,
+                scheduled_at TEXT,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_attempt_at TEXT,
                 claimed_at TEXT,
                 claimed_by TEXT,
-                drained_at TEXT
+                drained_at TEXT,
+                drained_outcome TEXT
             )""",
             "CREATE INDEX IF NOT EXISTS removals_unclaimed ON removals(claimed_at)",
             """CREATE TABLE IF NOT EXISTS views(
@@ -275,13 +287,46 @@ internal object HogliteSchema {
                 namespace TEXT NOT NULL,
                 name TEXT NOT NULL,
                 view_uuid TEXT NOT NULL UNIQUE,
+                dialect TEXT NOT NULL,
                 sql_text TEXT NOT NULL,
-                columns_json TEXT NOT NULL,
                 created_snapshot INTEGER NOT NULL,
                 dropped_snapshot INTEGER
             )""",
             """CREATE UNIQUE INDEX IF NOT EXISTS views_live
                 ON views(namespace, name) WHERE dropped_snapshot IS NULL""",
+            /**
+             * Compaction claims (Postgres's hog_compaction_claim): one row
+             * per claimed group, keyed by (table, sorted input ids), with a
+             * lease. A claim is efficiency — the commit's liveness guards
+             * are correctness — so a lost claim race wastes one rewrite,
+             * never corrupts one.
+             */
+            """CREATE TABLE IF NOT EXISTS compaction_claims(
+                table_id INTEGER NOT NULL,
+                group_key TEXT NOT NULL,
+                input_file_ids_json TEXT NOT NULL,
+                claimant TEXT NOT NULL,
+                claimed_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                PRIMARY KEY(table_id, group_key)
+            )""",
+            /**
+             * The maintenance run ledger (the maintenance status/runs
+             * routes read it): one row per task run, Postgres's
+             * hog_maintenance_run minus catalog_id (the tenant IS the
+             * catalog).
+             */
+            """CREATE TABLE IF NOT EXISTS maintenance_runs(
+                id INTEGER PRIMARY KEY,
+                task TEXT NOT NULL,
+                run_trigger TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT NOT NULL,
+                status TEXT NOT NULL,
+                error TEXT,
+                result_json TEXT
+            )""",
+            "CREATE INDEX IF NOT EXISTS maintenance_runs_task ON maintenance_runs(task, id)",
         )
 
     private val TS_FORMAT: DateTimeFormatter =

@@ -45,16 +45,16 @@ internal fun CatalogInfo.options() =
  * must be positive (mirrors the schema CHECK) or the patch is rejected
  * with Validation before touching the row.
  */
-class OptionsService(private val jdbi: Jdbi) {
-    fun get(catalog: String): CatalogOptions =
+class OptionsService(private val jdbi: Jdbi) : OptionsBackend {
+    override fun get(catalog: String): CatalogOptions =
         jdbi.withHandleUnchecked { h -> CatalogRepo.require(h, catalog).options() }
 
-    fun patch(
+    override fun patch(
         catalog: String,
         snapshotRetentionSeconds: PatchField<Long>,
         consumerFloor: Boolean?,
-        author: String? = null,
-        message: String? = null,
+        author: String?,
+        message: String?,
     ): CatalogOptions =
         Audit.audited(
             "options_patch",

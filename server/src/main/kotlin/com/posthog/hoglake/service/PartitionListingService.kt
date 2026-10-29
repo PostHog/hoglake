@@ -74,7 +74,7 @@ class PartitionListingService(
     private val smallFileThresholdBytes: Long,
     private val minInputFiles: Int = CompactionGrouping.DEFAULT_MIN_INPUT_FILES,
     private val maxInputFiles: Int = CompactionGrouping.DEFAULT_MAX_INPUT_FILES,
-) {
+) : PartitionListingBackend {
     /**
      * Sortable columns. `PARTITION` sorts on the decoded value tuple
      * (nulls first, raw as the tiebreak) and defaults to ascending; every
@@ -107,15 +107,15 @@ class PartitionListingService(
      */
     data class Filter(val keyIndex: Int, val text: String)
 
-    fun listPartitions(
+    override fun listPartitions(
         catalog: String,
         namespace: String,
         table: String,
-        sort: SortColumn = SortColumn.PARTITION,
-        desc: Boolean? = null,
-        limit: Int = DEFAULT_LIMIT,
-        offset: Int = 0,
-        filters: List<Filter> = emptyList(),
+        sort: SortColumn,
+        desc: Boolean?,
+        limit: Int,
+        offset: Int,
+        filters: List<Filter>,
     ): PartitionListing {
         if (limit <= 0) throw HoglakeException.Validation("limit must be positive (got $limit)")
         if (offset < 0) throw HoglakeException.Validation("offset must be >= 0 (got $offset)")
