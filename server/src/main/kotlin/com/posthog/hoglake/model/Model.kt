@@ -638,6 +638,16 @@ sealed class AlterOp {
 
     /** Replace the sort order (empty list = unsorted). */
     data class SetSortOrder(val fields: List<SortFieldDef>) : AlterOp()
+
+    /**
+     * Turn on the object-prefix layout ([ObjectPrefix]) with the
+     * top-level integer column [name] as its field: from this snapshot
+     * on, every data file and deletion vector the table registers must
+     * live under `<table root><name>=<value>/`. Only on an EMPTY table
+     * whose spec has exactly one identity field on [name], and there is
+     * no unset: see AlterService.setObjectPrefixField.
+     */
+    data class SetObjectPrefixField(val name: String) : AlterOp()
 }
 
 data class CatalogInfo(
@@ -1001,6 +1011,15 @@ data class TableInfo(
     val partitionSpec: PartitionSpec? = null,
     /** Live sort order; null = unsorted. */
     val sortSpec: SortSpec? = null,
+    /**
+     * The object-prefix field's column NAME at the resolved snapshot
+     * (`hog_table_layout`), null when the option is off there. A writer
+     * reads it to learn that every file it registers must sit under
+     * `<table root><name>=<value>/` ([ObjectPrefix]); the name cannot
+     * change while the option is on, because renaming the column is
+     * refused.
+     */
+    val objectPrefixField: String? = null,
     val comment: String? = null,
     val properties: Map<String, String> = emptyMap(),
     /**
@@ -2677,4 +2696,27 @@ sealed class HoglakeException(message: String) : RuntimeException(message) {
         val tables: List<String>,
         val readSnapshot: Long,
     ) : CommitConflict(detail)
+
+    /**
+     * A commit to a table with the object-prefix layout registered a file
+     * the layout does not admit -> HTTP 422 `object_prefix_violation`,
+     * naming [table] and `retry: re-prepare`.
+     *
+     * Its own code rather than a [Validation], because the usual cause is
+     * not a malformed request but a writer that does not know the table
+     * has the option: one that strips `read_snapshot` (so no DDL arm can
+     * tell it the table changed) and writes under the table root. The
+     * detail names the expected prefix and up to five offending paths, and
+     * the code tells such a writer, without parsing prose, that replaying
+     * the payload cannot succeed: it has to re-read the table and write
+     * its files again under the prefix.
+     *
+     * Not a [CommitConflict] subclass: nothing raced the request, and no
+     * client should retry it as a conflict.
+     */
+    class ObjectPrefixViolation(
+        detail: String,
+        /** Qualified `namespace.table`. */
+        val table: String,
+    ) : HoglakeException(detail)
 }

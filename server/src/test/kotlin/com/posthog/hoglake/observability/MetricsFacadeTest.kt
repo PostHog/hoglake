@@ -78,6 +78,10 @@ class MetricsFacadeTest {
             .isEqualTo("conflict")
         assertThat(Metrics.commitFailureResult(HoglakeException.Validation("x")))
             .isEqualTo("validation")
+        // Its own value, not `validation` and not dropped by the `else`:
+        // MUTATION — delete the arm and the refusal is never counted.
+        assertThat(Metrics.commitFailureResult(HoglakeException.ObjectPrefixViolation("x", "ns.t")))
+            .isEqualTo("object_prefix_violation")
         // NotFound (unknown catalog) is not a commit result — no counter.
         assertThat(Metrics.commitFailureResult(HoglakeException.NotFound("x"))).isNull()
     }

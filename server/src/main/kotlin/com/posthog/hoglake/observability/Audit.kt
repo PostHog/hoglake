@@ -169,6 +169,10 @@ object Audit {
             is HoglakeException.OffsetRegression -> "regression"
             is HoglakeException.CommitQueueTimeout -> "timeout"
             is HoglakeException.Validation -> "validation"
+            // Its own outcome for the reason the metric below has one: a
+            // writer that does not know a table's layout is a fleet
+            // problem to find, not one validation failure among many.
+            is HoglakeException.ObjectPrefixViolation -> "object_prefix_violation"
             // The precondition refusals: a DDL the catalog's state does
             // not allow (a drop of something not empty, a rename while
             // id-less files would lose their history). Their own outcome

@@ -105,7 +105,7 @@ import java.time.Duration
  *
  * A fifth step applies the same reachability rule to the accumulating
  * versioned DDL tables (hog_table_version, hog_column, hog_sort_spec,
- * hog_view): rows with end_snapshot <= newEarliest are invisible at
+ * hog_view, hog_table_layout): rows with end_snapshot <= newEarliest are invisible at
  * every retained snapshot and are deleted — DDL churn no longer grows
  * them without bound. hog_partition_spec is NOT among them: a file row
  * names its spec by `spec_id`, whatever snapshot is read, so a retired
@@ -229,18 +229,18 @@ class ExpiryService(
      * `RetirementService.callBoundMs`'s arithmetic, for its reason: a
      * `statement_timeout` applies to each statement SEPARATELY, so a
      * bound of `admission / 2` across [BOUNDED_STATEMENTS_PER_ADVANCE]
-     * statements is a HOLD of ten times that. Dividing by the count
+     * statements is a HOLD of eleven times that. Dividing by the count
      * makes the number say what it claims:
      *
      *     per statement = min(session / 4, admission / 2) / statements
      *     whole hold   <= admission / 2
      *
-     * At the defaults (session 60 s, admission 30 s, 10 statements) that
-     * is 1,500 ms each and at most 15 s of hold — where 10 is the
+     * At the defaults (session 60 s, admission 30 s, 11 statements) that
+     * is 1,363 ms each and at most 15 s of hold — where 11 is the
      * MAXIMUM count rather than the exact one (a catalog with
-     * `consumer_floor` off skips the floor read and runs 9), so the
+     * `consumer_floor` off skips the floor read and runs 10), so the
      * derived bound is conservative in the direction that matters — against a phase A
-     * whose statements are the ten listed on
+     * whose statements are the eleven listed on
      * [BOUNDED_STATEMENTS_PER_ADVANCE]: point and bounded reads, a range
      * delete bounded by `batchSize`, one single-row UPDATE and deletes
      * over tables whose whole row counts are in the thousands. It is a bound on the pathological
@@ -655,6 +655,10 @@ class ExpiryService(
                 "hog_column",
                 "hog_sort_spec",
                 "hog_view",
+                // V29. With no unset op yet nothing ends a layout row, so
+                // this deletes nothing today; it is here so the first op
+                // that does cannot leave its corpses unbounded.
+                "hog_table_layout",
             )
 
         /**
@@ -726,13 +730,13 @@ class ExpiryService(
          * between taking the commit lock and committing: the re-read of
          * `hog_catalog`, the superseded-offset release, the
          * first-fresh-snapshot read, the consumer-floor read, the
-         * snapshot range delete, the floor advance, and the four
+         * snapshot range delete, the floor advance, and the five
          * [VERSIONED_RETENTION_TABLES] deletes. [advanceBoundMs] divides
          * by this so the whole HOLD, and not each statement, is what the
          * admission bound is compared against.
          *
          * THE MAXIMUM, not the exact count: a catalog with
-         * `consumer_floor` off runs nine of these, not ten. Dividing
+         * `consumer_floor` off runs ten of these, not eleven. Dividing
          * by the maximum makes the derived per-statement bound slightly
          * tighter than it has to be on such a catalog, which is the
          * direction a bound should err in.
@@ -743,7 +747,7 @@ class ExpiryService(
          * either — it runs before the lock is held, so it is not part of
          * any hold.
          */
-        const val BOUNDED_STATEMENTS_PER_ADVANCE = 10
+        const val BOUNDED_STATEMENTS_PER_ADVANCE = 11
     }
 
     /**
@@ -821,7 +825,7 @@ class ExpiryService(
                     // rather than an oversight: the ladder is bounded at
                     // log2(batch) rungs, a rolled-back rung held the
                     // commit lock only for its own statement bound
-                    // (1,500 ms at the defaults), and the corrected
+                    // (1,363 ms at the defaults), and the corrected
                     // cascade arithmetic below makes a rung firing at all
                     // near-theoretical on a prod-us-shaped catalog. If this
                     // counter ever runs hot the pause is the next thing

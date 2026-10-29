@@ -7,6 +7,7 @@ import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.Column
 import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.ObjectPrefix
 import com.posthog.hoglake.model.PartitionFieldDef
 import com.posthog.hoglake.model.PartitionSpec
 import com.posthog.hoglake.model.SortFieldDef
@@ -20,6 +21,7 @@ import com.posthog.hoglake.model.icebergType
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.persistence.CatalogRepo
 import com.posthog.hoglake.persistence.FileRepo
+import com.posthog.hoglake.persistence.LayoutRepo
 import com.posthog.hoglake.persistence.Locks
 import com.posthog.hoglake.persistence.NamespaceRepo
 import com.posthog.hoglake.persistence.SnapshotRepo
@@ -145,6 +147,7 @@ class AlterService(private val jdbi: Jdbi) {
                         properties = t.properties,
                         spec = SpecRepo.specAt(h, cat.catalogId, t.tableId, alloc.snapshotId - 1),
                         sortSpec = SortRepo.sortSpecAt(h, cat.catalogId, t.tableId, alloc.snapshotId - 1),
+                        objectPrefixFieldId = LayoutRepo.layoutAt(h, cat.catalogId, t.tableId, alloc.snapshotId - 1),
                     )
                 for (op in ops) {
                     applyOp(h, cat.catalogId, t.tableId, ns.namespaceId, namespace, alloc.snapshotId, state, op)
@@ -177,6 +180,10 @@ class AlterService(private val jdbi: Jdbi) {
                     fileSizeBytes = agg.fileSizeBytes,
                     partitionSpec = state.spec,
                     sortSpec = state.sortSpec,
+                    // Top-level by construction, and present: the field can
+                    // be neither dropped nor renamed while the option is on.
+                    objectPrefixField =
+                        state.objectPrefixFieldId?.let { id -> state.cols.single { it.fieldId == id }.def.name },
                     snapshotId = alloc.snapshotId,
                 )
             }
@@ -204,6 +211,8 @@ class AlterService(private val jdbi: Jdbi) {
         var properties: Map<String, String>,
         var spec: PartitionSpec?,
         var sortSpec: SortSpec?,
+        /** The object-prefix field's id (`hog_table_layout`); null = the option is off. */
+        var objectPrefixFieldId: Long?,
     )
 
     /** A column found by dotted path, with the chain that reached it. */
@@ -231,6 +240,7 @@ class AlterService(private val jdbi: Jdbi) {
             renameTable(h, catalogId, tableId, namespaceId, namespaceName, snapshot, state, op)
         is AlterOp.SetPartitionSpec -> setPartitionSpec(h, catalogId, tableId, snapshot, state, op)
         is AlterOp.SetSortOrder -> setSortOrder(h, catalogId, tableId, snapshot, state, op)
+        is AlterOp.SetObjectPrefixField -> setObjectPrefixField(h, catalogId, tableId, snapshot, state, op)
         is AlterOp.SetColumnComment -> {
             TableMetadata.validateComment(op.comment)
             val located = requireColumn(state, op.name)
@@ -427,6 +437,16 @@ class AlterService(private val jdbi: Jdbi) {
         // sort source hiding inside the dropped struct is exactly as
         // fatal as the struct itself being one.
         val doomed = col.selfAndDescendants().map { it.fieldId }.toSet()
+        // Ahead of the spec guard, which would also refuse it (the field
+        // is an identity source), for the message: the reason the column
+        // must stay is the layout, and dropping the spec field first does
+        // not help.
+        if (state.objectPrefixFieldId?.let { it in doomed } == true) {
+            throw HoglakeException.Validation(
+                "cannot drop column '${op.name}': it is the table's object-prefix field, which every file's " +
+                    "path depends on and which cannot be unset",
+            )
+        }
         val spec = state.spec
         spec?.fields?.firstOrNull { it.sourceFieldId in doomed }?.let { f ->
             throw HoglakeException.Validation(
@@ -474,6 +494,15 @@ class AlterService(private val jdbi: Jdbi) {
         Identifiers.validateColumn(op.to)
         val located = requireColumn(state, op.from)
         val col = located.column
+        // The field's NAME is in every file's path (`<name>=<value>/`), and
+        // the layout is checked against the live name, so a rename would
+        // strand every file already written.
+        if (col.fieldId == state.objectPrefixFieldId) {
+            throw HoglakeException.Validation(
+                "cannot rename column '${op.from}': it is the table's object-prefix field, and its name is " +
+                    "part of every file's path",
+            )
+        }
         val siblings = located.parent?.children ?: state.cols
         if (siblings.any { it.def.name == op.to }) {
             val where = located.parent?.let { " of struct '${it.def.name}'" } ?: ""
@@ -771,6 +800,15 @@ class AlterService(private val jdbi: Jdbi) {
         op: AlterOp.RenameTable,
     ) {
         Identifiers.validate("table", op.newName)
+        // The table's NAME is in every file's path
+        // (`<data_path>/data/<ns>/<table>/`), so a rename would strand them
+        // and hand the old prefix to whichever table takes the name next.
+        if (state.objectPrefixFieldId != null) {
+            throw HoglakeException.Validation(
+                "cannot rename table '${state.name}': it has the object-prefix layout, and its name is part of " +
+                    "every file's path",
+            )
+        }
         val existing = TableRepo.findLive(h, catalogId, namespaceId, op.newName)
         if (existing != null && existing.tableId != tableId) {
             throw HoglakeException.AlreadyExists(
@@ -799,7 +837,110 @@ class AlterService(private val jdbi: Jdbi) {
         state: TableState,
         op: AlterOp.SetPartitionSpec,
     ) {
+        // HERE, not in installPartitionSpec: createTable and atomic
+        // creation share that, and neither can have the option.
+        state.objectPrefixFieldId?.let { fieldId ->
+            if (ObjectPrefix.keyIndex(op.fields, fieldId) == null) {
+                val name = state.cols.single { it.fieldId == fieldId }.def.name
+                throw HoglakeException.Validation(
+                    "set_partition_spec must keep exactly one identity field on '$name' (field_id $fieldId): it " +
+                        "is the table's object-prefix field, and every file's path is named by its value",
+                )
+            }
+        }
         state.spec = installPartitionSpec(h, catalogId, tableId, snapshot, state.cols, op.fields)
+    }
+
+    /**
+     * Turn on the object-prefix layout ([ObjectPrefix], V29): from this
+     * snapshot on, CommitService refuses any data file or deletion vector
+     * of the table that is not under `<table root><name>=<value>/`.
+     *
+     * Every rule here exists so that the layout, once on, is true of EVERY
+     * live file and stays true:
+     *
+     *  - a TOP-LEVEL column of an [ObjectPrefix.ALLOWED_TYPES] type, whose
+     *    values are non-negative longs with one canonical spelling;
+     *  - exactly one IDENTITY field on it in the (evolving) spec, so a
+     *    file's partition value IS its rows' value, which the commit
+     *    proves with the file's stats. Checked here explicitly, because
+     *    validatePartitionFields has no duplicate check, and kept by
+     *    [setPartitionSpec];
+     *  - an EMPTY table: no live data file and no live deletion vector.
+     *    Then no file predates the layout, so nothing has to decide
+     *    whether an old file counts, no DV targets a file with no value,
+     *    and no compaction can be in flight between plan and commit (a
+     *    table with compactable inputs is not empty). Opting a non-empty
+     *    table in is a rewrite, and a separate route;
+     *  - set once. The same field again is a no-op; a different field is
+     *    refused, and there is no unset (drop the table instead). With the
+     *    refusals of renaming the table, renaming the column and dropping
+     *    it, the names in every path stay the names at set time.
+     *
+     * Ops apply in order, so `[set_partition_spec(identity(team_id)),
+     * set_object_prefix_field(team_id)]` works in one request.
+     */
+    private fun setObjectPrefixField(
+        h: Handle,
+        catalogId: Long,
+        tableId: Long,
+        snapshot: Long,
+        state: TableState,
+        op: AlterOp.SetObjectPrefixField,
+    ) {
+        val located = requireColumn(state, op.name)
+        val col = located.column
+        if (located.parent != null) {
+            throw HoglakeException.Validation(
+                "set_object_prefix_field: '${op.name}' is a nested field; the object-prefix field must be a " +
+                    "top-level column",
+            )
+        }
+        if (col.def.type !in ObjectPrefix.ALLOWED_TYPES) {
+            throw HoglakeException.Validation(
+                "set_object_prefix_field: '${op.name}' is '${col.def.type.wire}'; the object-prefix field must " +
+                    "be one of ${ObjectPrefix.ALLOWED_TYPES.map { it.wire }.sorted()}",
+            )
+        }
+        val current = state.objectPrefixFieldId
+        if (current == col.fieldId) return
+        if (current != null) {
+            val name = state.cols.single { it.fieldId == current }.def.name
+            throw HoglakeException.Validation(
+                "set_object_prefix_field: the table's object-prefix field is already '$name', and it cannot " +
+                    "be changed",
+            )
+        }
+        if (ObjectPrefix.keyIndex(state.spec?.fields.orEmpty(), col.fieldId) == null) {
+            throw HoglakeException.Validation(
+                "set_object_prefix_field: the partition spec must have exactly one identity field on " +
+                    "'${op.name}' (field_id ${col.fieldId}); set one first, in this request or an earlier one",
+            )
+        }
+        val nonEmpty =
+            h.createQuery(TABLE_HAS_LIVE_FILES_SQL)
+                .bind("catalogId", catalogId)
+                .bind("tableId", tableId)
+                .mapTo(Boolean::class.java)
+                .one()
+        if (nonEmpty) {
+            throw HoglakeException.Validation(
+                "set_object_prefix_field: the table has live data files or deletion vectors; the option can " +
+                    "only be set on an empty table, so that no file predates the layout",
+            )
+        }
+        h.createUpdate(
+            """
+            INSERT INTO hog_table_layout (catalog_id, table_id, begin_snapshot, object_prefix_field_id)
+            VALUES (:catalogId, :tableId, :snapshot, :fieldId)
+            """,
+        )
+            .bind("catalogId", catalogId)
+            .bind("tableId", tableId)
+            .bind("snapshot", snapshot)
+            .bind("fieldId", col.fieldId)
+            .execute()
+        state.objectPrefixFieldId = col.fieldId
     }
 
     internal fun validatePartitionFields(
@@ -1365,6 +1506,51 @@ class AlterService(private val jdbi: Jdbi) {
             FROM hog_data_file
             WHERE catalog_id = :catalogId AND table_id = :tableId
               AND missing_field_ids AND end_snapshot IS NULL
+            """
+
+        /**
+         * [setObjectPrefixField]'s emptiness probe, under the commit lock,
+         * exposed for `AlterGuardPlanIntegrationTest`.
+         *
+         * The data-file half is a LIMIT 1 in `hog_data_file_live`'s own
+         * order (catalog_id, table_id, begin_snapshot), not an EXISTS, on
+         * purpose. Postgres drops ORDER BY from an EXISTS, and a bare
+         * EXISTS let the planner pick a Seq Scan that "stops at the first
+         * match" whenever the statistics say the table's rows are common —
+         * which they still say after a truncate, the one state this probe
+         * is asked about with a big table behind it, and then the scan
+         * finds nothing and reads the whole manifest. In index order the
+         * index is cheaper under any estimate: a descent either way.
+         *
+         * The DV half is the same LIMIT 1 on `hog_delete_file_live`, whose
+         * key (catalog_id, table_id) has no column after table_id to order
+         * by. So table_id is spelled as a closed range, not an equality:
+         * an equality makes `ORDER BY table_id` redundant and Postgres
+         * drops it, which is the bare EXISTS again. As that EXISTS, after
+         * a truncate with the statistics not yet refreshed, it was a Seq
+         * Scan of ALL of `hog_delete_file`, across every catalog, not just
+         * this catalog's DVs (2,041 buffers for 50k ended DVs in
+         * `AlterGuardPlanIntegrationTest`). In range order a heap scan has
+         * to read and sort every matching row before the first, so the
+         * index wins whenever the relation is more than a few pages.
+         * (`hog_delete_file_changefeed` gives the same order with ended
+         * rows in it; the partial index is the smaller one, and the plan
+         * test pins it.)
+         *
+         * It is the backstop: a DV on a dead file is refused at commit,
+         * and compaction and truncate end a file's DVs with it, so a table
+         * with no live data file should have no live DV either. It runs
+         * only when the first half found nothing.
+         */
+        internal const val TABLE_HAS_LIVE_FILES_SQL: String =
+            """
+            SELECT (SELECT true FROM hog_data_file
+                     WHERE catalog_id = :catalogId AND table_id = :tableId AND end_snapshot IS NULL
+                     ORDER BY begin_snapshot LIMIT 1) IS NOT NULL
+                OR (SELECT true FROM hog_delete_file
+                     WHERE catalog_id = :catalogId AND table_id >= :tableId AND table_id <= :tableId
+                       AND end_snapshot IS NULL
+                     ORDER BY table_id LIMIT 1) IS NOT NULL
             """
 
         val TEMPORAL_TRANSFORMS =

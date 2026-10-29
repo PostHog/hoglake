@@ -619,7 +619,14 @@ paths:
             `nullable: false`: hoglake has no column defaults, so files
             written before the column read NULL for it. Refused on
             every table, files or not; the detail names the offending
-            path.
+            path. Also the object-prefix refusals: set_object_prefix_field
+            on a nested or non-integer column (uint64 included), on a
+            table whose spec lacks exactly one identity field on it, on a
+            table with live data files or deletion vectors, or naming a
+            different field than the one already set; and, while the
+            option is on, a set_partition_spec without exactly one
+            identity field on it, a drop_column or rename_column of it,
+            and a rename_table.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
@@ -1609,6 +1616,10 @@ paths:
                     Requires atomic-table-replacement-v1. Guard the target as observed at
                     read_snapshot; a null UUID requires absence. Publication rejects target
                     changes since that snapshot and replaces an existing incarnation atomically.
+                    A target with the object-prefix layout (Table.object_prefix_field) cannot
+                    be replaced, since the new incarnation would not carry the layout over:
+                    prepare refuses it with 422 `validation` and records nothing. Drop the
+                    table and create it instead.
                   required: [read_snapshot]
                   properties:
                     expected_table_uuid: { type: [string, "null"], format: uuid }
@@ -2098,7 +2109,22 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
         "422":
-          description: Invalid request, missing key, or key reused with another payload
+          description: >
+            Invalid request, missing key, or key reused with another
+            payload.
+            `object_prefix_violation` when a touched table has the
+            object-prefix layout (Table.object_prefix_field) and a data
+            file is not under `<field>=<value>/` for its identity
+            partition value, carries no canonical value for the field,
+            ships deferred stats, or has column stats that do not prove
+            every row holds the value — or a deletion vector is not under
+            its target's prefix. The detail names the expected prefix and
+            up to five offending paths; the body names `tables` and
+            `retry: re-prepare`, because a payload written to the wrong
+            place cannot succeed on replay.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
         "503":
           description: Commit admission timed out; retry the identical request
 
@@ -2305,7 +2331,22 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
         "422":
-          description: Invalid request, missing key, or key reused with another payload
+          description: >
+            Invalid request, missing key, or key reused with another
+            payload.
+            `object_prefix_violation` when a touched table has the
+            object-prefix layout (Table.object_prefix_field) and a data
+            file is not under `<field>=<value>/` for its identity
+            partition value, carries no canonical value for the field,
+            ships deferred stats, or has column stats that do not prove
+            every row holds the value — or a deletion vector is not under
+            its target's prefix. The detail names the expected prefix and
+            up to five offending paths; the body names `tables` and
+            `retry: re-prepare`, because a payload written to the wrong
+            place cannot succeed on replay.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
         "503":
           description: Commit admission timed out; retry the identical request
 
@@ -2411,7 +2452,22 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
         "422":
-          description: Invalid request, missing key, or key reused with another payload
+          description: >
+            Invalid request, missing key, or key reused with another
+            payload.
+            `object_prefix_violation` when a touched table has the
+            object-prefix layout (Table.object_prefix_field) and a data
+            file is not under `<field>=<value>/` for its identity
+            partition value, carries no canonical value for the field,
+            ships deferred stats, or has column stats that do not prove
+            every row holds the value — or a deletion vector is not under
+            its target's prefix. The detail names the expected prefix and
+            up to five offending paths; the body names `tables` and
+            `retry: re-prepare`, because a payload written to the wrong
+            place cannot succeed on replay.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
         "503":
           description: Commit admission timed out; retry the identical request
 
@@ -2494,7 +2550,22 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
         "422":
-          description: Invalid request, missing key, or key reused with another payload
+          description: >
+            Invalid request, missing key, or key reused with another
+            payload.
+            `object_prefix_violation` when a touched table has the
+            object-prefix layout (Table.object_prefix_field) and a data
+            file is not under `<field>=<value>/` for its identity
+            partition value, carries no canonical value for the field,
+            ships deferred stats, or has column stats that do not prove
+            every row holds the value — or a deletion vector is not under
+            its target's prefix. The detail names the expected prefix and
+            up to five offending paths; the body names `tables` and
+            `retry: re-prepare`, because a payload written to the wrong
+            place cannot succeed on replay.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
         "503":
           description: Commit admission timed out; retry the identical request
 
@@ -2593,7 +2664,22 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
         "422":
-          description: Invalid request, missing key, or key reused with another payload
+          description: >
+            Invalid request, missing key, or key reused with another
+            payload.
+            `object_prefix_violation` when a touched table has the
+            object-prefix layout (Table.object_prefix_field) and a data
+            file is not under `<field>=<value>/` for its identity
+            partition value, carries no canonical value for the field,
+            ships deferred stats, or has column stats that do not prove
+            every row holds the value — or a deletion vector is not under
+            its target's prefix. The detail names the expected prefix and
+            up to five offending paths; the body names `tables` and
+            `retry: re-prepare`, because a payload written to the wrong
+            place cannot succeed on replay.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
         "503":
           description: Commit admission timed out; retry the identical request
 
@@ -2673,11 +2759,22 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
         "422":
-          description: Validation failure (unknown table, bad stats shape,
+          description: >
+            Validation failure (unknown table, bad stats shape,
             unknown field ids, duplicate delete target — a commit carries
             at most one superseding deletion vector per data file; merge
             deleted positions client-side and register the union; an
-            append carrying partition_values with no read_snapshot)
+            append carrying partition_values with no read_snapshot).
+            `object_prefix_violation` when a touched table has the
+            object-prefix layout (Table.object_prefix_field) and a data
+            file is not under `<field>=<value>/` for its identity
+            partition value, carries no canonical value for the field,
+            ships deferred stats, or has column stats that do not prove
+            every row holds the value — or a deletion vector is not under
+            its target's prefix. The detail names the expected prefix and
+            up to five offending paths; the body names `tables` and
+            `retry: re-prepare`, because a payload written to the wrong
+            place cannot succeed on replay.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
@@ -3176,10 +3273,10 @@ components:
           type: array
           items: { type: string }
           description: >
-            Present on 409 ddl_since_read_snapshot and 409
-            table_recreated: the qualified `namespace.table` names the
-            refusal is about, so a caller knows which table info to
-            re-read without parsing `detail`.
+            Present on 409 ddl_since_read_snapshot, 409 table_recreated
+            and 422 object_prefix_violation: the qualified
+            `namespace.table` names the refusal is about, so a caller
+            knows which table info to re-read without parsing `detail`.
         read_snapshot:
           type: integer
           format: int64
@@ -3236,7 +3333,7 @@ components:
       properties:
         name: { type: string }
         data_path: { type: string }
-        capabilities: { type: array, items: { type: string }, description: "Includes atomic-table-creation-v1, idempotent-append-v1, idempotent-delete-v1, idempotent-mutation-v1, guarded-table-lifecycle-v1, atomic-table-replacement-v1 guarded-schema-evolution-v1 recursive-write-schema-v1 atomic-partitioned-table-creation-v1 atomic-sorted-table-creation-v1 and versioned-table-metadata-v1 and claimed-uploads-v1 and atomic-dml-transactions-v1 when supported" }
+        capabilities: { type: array, items: { type: string }, description: "Includes atomic-table-creation-v1, idempotent-append-v1, idempotent-delete-v1, idempotent-mutation-v1, guarded-table-lifecycle-v1, atomic-table-replacement-v1 guarded-schema-evolution-v1 recursive-write-schema-v1 atomic-partitioned-table-creation-v1 atomic-sorted-table-creation-v1 and versioned-table-metadata-v1 and claimed-uploads-v1 and atomic-dml-transactions-v1 and object-prefix-layout-v1 when supported" }
         head_snapshot_id: { type: integer, format: int64 }
         schema_version: { type: integer, format: int64 }
         earliest_snapshot_time:
@@ -3759,6 +3856,23 @@ components:
             them is their age.
         partition_spec: { $ref: "#/components/schemas/PartitionSpec" }
         sort_spec: { $ref: "#/components/schemas/SortSpec" }
+        object_prefix_field:
+          type: string
+          description: >
+            The table's object-prefix field — a top-level integer
+            column — as of the snapshot this response was resolved at;
+            absent when the option is off there (set by the alter op
+            set_object_prefix_field, capability object-prefix-layout-v1;
+            there is no unset). While present, every data file and
+            deletion vector the table registers must live under
+            `<data_path>/data/<namespace>/<table>/<field>=<value>/`,
+            value the canonical decimal (no sign, no leading zero) of the
+            data file's identity partition value for the field — a
+            deletion vector's: its target's — and a data file's column
+            stats must ship inline and prove every row holds it (both
+            bounds equal to the value, null_count 0). A commit that
+            breaks any of this is a 422 `object_prefix_violation`. The
+            name cannot change while the option is on.
         snapshot_id:
           type: integer
           format: int64
@@ -4095,6 +4209,21 @@ components:
         element, a key or a value, and the container's shape is part of
         its type. Nested containers are also not promotable — promote a
         struct's LEAF field, which follows the ordinary scalar matrix.
+
+        `set_object_prefix_field` (`name`, a top-level column of type
+        int8, int16, int, long, uint8, uint16 or uint32) turns on the
+        object-prefix layout described on Table.object_prefix_field. It
+        is accepted only on a table with no live data file or deletion
+        vector whose partition spec has exactly one identity field on
+        the column (ops apply in order, so a set_partition_spec earlier
+        in the same request counts). Setting the field already set
+        changes nothing (the request still commits its DDL snapshot, as
+        every alter does); another field is a 422, and there is no
+        unset. While it
+        is on, set_partition_spec must keep exactly one identity field
+        on it, and drop_column/rename_column of it and rename_table are
+        refused. A server without capability object-prefix-layout-v1
+        answers 400 unknown alter op.
       properties:
         comment: { type: [string, "null"], maxLength: 16384, description: "set_table_comment or set_column_comment; null or absent removes the comment." }
         properties: { $ref: "#/components/schemas/CustomProperties" }
@@ -4102,7 +4231,8 @@ components:
           type: string
           enum: [add_column, drop_column, rename_column, promote_column,
                  rename_table, set_partition_spec, set_sort_order, add_column_with_metadata,
-                 set_table_comment, set_column_comment, set_properties]
+                 set_table_comment, set_column_comment, set_properties,
+                 set_object_prefix_field]
         column:                       # add_column
           allOf: [{ $ref: "#/components/schemas/ColumnDef" }]
           description: >
@@ -4120,7 +4250,7 @@ components:
             Dotted path of an existing STRUCT to append the new field
             to (new field id, ordinal = max sibling + 1). Absent = a new
             top-level column. Naming a list or a map here is a 422.
-        name: { type: string }        # drop_column, promote_column
+        name: { type: string }        # drop_column, promote_column, set_column_comment, set_object_prefix_field
         from: { type: string }        # rename_column
         to:
           type: string

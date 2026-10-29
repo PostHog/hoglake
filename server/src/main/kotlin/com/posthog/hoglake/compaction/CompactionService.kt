@@ -18,6 +18,7 @@ import com.posthog.hoglake.model.allNodes
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.persistence.CatalogRepo
+import com.posthog.hoglake.persistence.LayoutRepo
 import com.posthog.hoglake.persistence.Locks
 import com.posthog.hoglake.persistence.MaintenanceRunStore
 import com.posthog.hoglake.persistence.NamespaceRepo
@@ -1250,6 +1251,12 @@ class CompactionService(
         val sortSpill: SortSpill? = null,
         /** Whether this catalog's variant tables compact (CompactionConfig.variantCompactionFor). */
         val variantCompaction: Boolean = false,
+        /**
+         * The table's object-prefix field id at the planning head
+         * (`hog_table_layout`), null = the option is off. A table with the
+         * option is not compacted yet: see [fetchCandidates].
+         */
+        val objectPrefixFieldId: Long? = null,
     )
 
     private data class PlanWithContext(
@@ -1557,6 +1564,7 @@ class CompactionService(
             commitLockTimeoutMs = cfg.commitLockTimeoutMs,
             sortSpill = if (sortFields.isEmpty()) null else cfg.sortSpill(columns),
             variantCompaction = cfg.variantCompactionFor(catalog),
+            objectPrefixFieldId = LayoutRepo.layoutAt(h, cat.catalogId, t.tableId, cat.headSnapshotId),
         )
     }
 
@@ -1754,6 +1762,14 @@ class CompactionService(
         ) {
             return empty()
         }
+        // A table with the OBJECT-PREFIX LAYOUT is not compacted yet: the
+        // rewrite writes its output at the table root, which the layout
+        // refuses, and nothing here checks an output's stats against the
+        // prefix value. Until compaction learns the layout it plans nothing
+        // for such a table, before the fetch, and [planAndClaim] counts the
+        // skip (`hoglake_compaction_skipped_total{reason=
+        // "object_prefix_layout"}`) so the debt it leaves is visible.
+        if (ctx.objectPrefixFieldId != null) return empty()
 
         // Does a published generation exist AT ALL? That is a different
         // question from "does it credit this table with a compactable
@@ -3523,6 +3539,9 @@ class CompactionService(
     ): PlannedWork =
         jdbi.withHandleUnchecked { h ->
             val (ctx, plan, markable) = planSnapshot(h, catalog, namespace, table, cfg)
+            // One per table per sweep, counted here and not in the planner,
+            // so a metadata-only planTable does not count.
+            if (ctx.objectPrefixFieldId != null) Metrics.compactionSkipped(catalog, "object_prefix_layout", 1)
             if (!cfg.claimsEnabled) {
                 return@withHandleUnchecked PlannedWork(plan, plan.groups.take(room).map { WorkItem(ctx, it) })
             }

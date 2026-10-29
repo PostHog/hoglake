@@ -53,11 +53,11 @@ import java.util.UUID
  *
  * WHY THE READ CAN BE ONE STATEMENT. Everything it reads is one of:
  * written only under the commit lock (head, receipts, table resolution,
- * specs, columns, the row-id allocator, change rows, delete targets and
- * their live DVs), so one snapshot taken right after the lock sees what
- * the separate statements saw — the purges that DELETE receipts and
- * ended file rows outside the lock raced those statements at an
- * instant no less arbitrary; or ROW-LOCKED by the read itself (the
+ * specs, columns, layouts, the row-id allocator, change rows, delete
+ * targets and their live DVs), so one snapshot taken right after the
+ * lock sees what the separate statements saw — the purges that DELETE
+ * receipts and ended file rows outside the lock raced those statements
+ * at an instant no less arbitrary; or ROW-LOCKED by the read itself (the
  * upload claims — `FOR UPDATE` re-fetches the newest version after a
  * wait, so a sweep that fenced a claim while the read waited is seen,
  * exactly as before); or the path-reuse guard
@@ -137,6 +137,19 @@ internal object CommitTail {
      * (an index probe, no lock): a replay answers from the receipt, as it
      * did, and locks no claim — the claims statement sits under a one-time
      * filter on the receipt, so its `FOR UPDATE` never runs for one.
+     *
+     * THE OBJECT-PREFIX LAYOUT (`layouts`, V29) is read for every resolved
+     * table, deletes included: one probe of `hog_table_layout_live` per
+     * table, which on a table without the option finds nothing, and then
+     * every `prefix_*` column below is null and costs nothing more (each
+     * probe that follows is gated on the layout row). The column's name
+     * and type come through a LEFT JOIN, so a layout whose column is gone
+     * reaches `CommitService` as a broken invariant (500), never as "off".
+     * With the option on, an appended table also gets the key_index of the
+     * identity field on the prefix field in its live spec, and a numeric
+     * DV target gets its own value of that field (one probe of
+     * `hog_partition_field` and one of `hog_file_partition_value`, both by
+     * primary key) — CommitService checks paths against both.
      */
     internal const val READ_SQL: String =
         """
@@ -176,13 +189,32 @@ internal object CommitTail {
                    LIMIT 2
               ) live
         ),
+        layouts AS MATERIALIZED (
+            SELECT l.table_id, l.object_prefix_field_id AS field_id, c.name AS field_name, c.col_type
+              FROM hog_table_layout l
+              LEFT JOIN hog_column c
+                ON c.catalog_id = l.catalog_id AND c.table_id = l.table_id
+               AND c.field_id = l.object_prefix_field_id AND c.end_snapshot IS NULL
+             WHERE l.catalog_id = :catalogId
+               AND l.table_id = ANY(ARRAY(SELECT table_id FROM resolved))
+               AND l.end_snapshot IS NULL
+        ),
         tables AS (
             SELECT r.ord, r.table_id, r.table_uuid, spec.spec_id, spec.field_count,
                    CASE WHEN r.appending THEN
                        (SELECT ts.next_row_id FROM hog_table_stats ts
                          WHERE ts.catalog_id = :catalogId AND ts.table_id = r.table_id)
-                   END AS next_row_id
+                   END AS next_row_id,
+                   lay.field_id AS prefix_field_id, lay.field_name AS prefix_field_name,
+                   lay.col_type AS prefix_col_type,
+                   CASE WHEN lay.field_id IS NOT NULL THEN
+                       (SELECT array_agg(pf.key_index ORDER BY pf.key_index) FROM hog_partition_field pf
+                         WHERE pf.catalog_id = :catalogId AND pf.table_id = r.table_id
+                           AND pf.spec_id = spec.spec_id AND pf.source_field_id = lay.field_id
+                           AND pf.transform = 'identity')
+                   END AS prefix_key_indexes
               FROM resolved r
+              LEFT JOIN layouts lay ON lay.table_id = r.table_id
               LEFT JOIN LATERAL (
                   SELECT ps.spec_id,
                          (SELECT count(*) FROM hog_partition_field pf
@@ -228,9 +260,20 @@ internal object CommitTail {
         ),
         queued AS (${CommitService.REMOVAL_QUEUE_COLLISION_SQL}),
         targets AS (
-            SELECT data_file_id, table_id, record_count, begin_snapshot, end_snapshot
-              FROM hog_data_file
-             WHERE catalog_id = :catalogId AND data_file_id = ANY(CAST(:targetIds AS bigint[]))
+            SELECT f.data_file_id, f.table_id, f.record_count, f.begin_snapshot, f.end_snapshot,
+                   CASE WHEN lay.field_id IS NOT NULL THEN
+                       (SELECT array_agg(v.value)
+                          FROM hog_partition_field pf
+                          JOIN hog_file_partition_value v
+                            ON v.catalog_id = pf.catalog_id AND v.data_file_id = f.data_file_id
+                           AND v.key_index = pf.key_index
+                         WHERE pf.catalog_id = :catalogId AND pf.table_id = f.table_id
+                           AND pf.spec_id = f.spec_id AND pf.source_field_id = lay.field_id
+                           AND pf.transform = 'identity')
+                   END AS prefix_values
+              FROM hog_data_file f
+              LEFT JOIN layouts lay ON lay.table_id = f.table_id
+             WHERE f.catalog_id = :catalogId AND f.data_file_id = ANY(CAST(:targetIds AS bigint[]))
                AND NOT EXISTS (SELECT 1 FROM receipt)
         ),
         live_dvs AS (
@@ -483,6 +526,17 @@ internal object CommitTail {
         val specId: Long?,
         val fieldCount: Int?,
         val nextRowId: Long?,
+        /** The live object-prefix field id (`hog_table_layout`); null = the option is off. */
+        val prefixFieldId: Long? = null,
+        /** That field's live column name and type; null beside a non-null id is a broken invariant. */
+        val prefixFieldName: String? = null,
+        val prefixColType: String? = null,
+        /**
+         * The key_index of every identity field on the prefix field in the
+         * live spec, ascending; read for appended tables only. Exactly one
+         * is the DDL's invariant.
+         */
+        val prefixKeyIndexes: List<Int>? = null,
     )
 
     data class LiveColumn(val tableId: Long, val fieldId: Long, val colType: String)
@@ -497,6 +551,11 @@ internal object CommitTail {
         val recordCount: Long,
         val beginSnapshot: Long,
         val endSnapshot: Long?,
+        /**
+         * The file's identity partition value(s) on its table's object-prefix
+         * field: null when the option is off, or when the file has none.
+         */
+        val prefixValues: List<String?>? = null,
     )
 
     data class LiveDv(val dataFileId: Long, val deleteFileId: Long, val deleteCount: Long, val beginSnapshot: Long)

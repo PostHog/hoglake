@@ -131,7 +131,11 @@ class CommitLockRoundTripsIntegrationTest {
     @AfterAll
     fun tearDown() = db.close()
 
-    /** A catalog with `ingest.events_raw` (25 longs, identity-partitioned on field 1) and `ingest.sessions`. */
+    /**
+     * A catalog with `ingest.events_raw` (25 longs, identity-partitioned on
+     * field 1), `ingest.sessions`, and `ingest.events_prefixed`: events_raw's
+     * shape with the object-prefix layout on c1.
+     */
     private fun fixture(): String {
         val cat = "rt-${counter.incrementAndGet()}"
         catalogs.createCatalog(cat, "s3://bucket/$cat")
@@ -144,6 +148,16 @@ class CommitLockRoundTripsIntegrationTest {
             listOf(AlterOp.SetPartitionSpec(listOf(PartitionFieldDef(1, Transform.IDENTITY)))),
         )
         catalogs.createTable(cat, "ingest", "sessions", listOf(ColumnDef("id", ColType.LONG)))
+        catalogs.createTable(cat, "ingest", "events_prefixed", (1..COLUMNS).map { ColumnDef("c$it", ColType.LONG) })
+        alter.alterTable(
+            cat,
+            "ingest",
+            "events_prefixed",
+            listOf(
+                AlterOp.SetPartitionSpec(listOf(PartitionFieldDef(1, Transform.IDENTITY))),
+                AlterOp.SetObjectPrefixField("c1"),
+            ),
+        )
         return cat
     }
 
@@ -181,6 +195,22 @@ class CommitLockRoundTripsIntegrationTest {
             partitionValues = listOf((n % 7).toString()),
             splitOffsets = listOf(4L),
         )
+
+    /** [eventsFile] under its object-prefix layout: team_id=<n % 7>/, c1's bounds the value. */
+    private fun prefixedFile(
+        cat: String,
+        n: Int,
+    ): FileRegistration {
+        val team = (n % 7).toLong()
+        val file = eventsFile(cat, n)
+        return file.copy(
+            path = "s3://bucket/$cat/data/ingest/events_prefixed/c1=$team/${UUID.randomUUID()}.parquet",
+            columnStats =
+                file.columnStats!!.map {
+                    if (it.fieldId == 1L) it.copy(nullCount = 0, lowerBound = le(team), upperBound = le(team)) else it
+                },
+        )
+    }
 
     private fun sessionsFile(cat: String): FileRegistration =
         FileRegistration("s3://bucket/$cat/data/sessions/${UUID.randomUUID()}.parquet", 10, 1_000, 20)
@@ -238,6 +268,24 @@ class CommitLockRoundTripsIntegrationTest {
                 deletes = listOf(TableDeletes("ingest", "events_raw", listOf(dv(targets[0], 1)))),
             )
         commits.commit(cat, firstDv)
+        // A file on the object-prefix table for that shape's DV to target.
+        val prefixedTarget = prefixedFile(cat, 4)
+        commits.commit(
+            cat,
+            CommitRequest(
+                readSnapshot = head(cat),
+                appends = listOf(TableAppend("ingest", "events_prefixed", listOf(prefixedTarget))),
+            ),
+        )
+        val prefixedTargetId =
+            db.jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    """
+                    SELECT f.data_file_id FROM hog_data_file f JOIN hog_catalog c USING (catalog_id)
+                    WHERE c.name = :cat AND f.path = :path
+                    """,
+                ).bind("cat", cat).bind("path", prefixedTarget.path).mapTo(Long::class.java).one()
+            }
 
         val oneFile = preparedAppend(cat, 1)
         val shapes =
@@ -279,6 +327,35 @@ class CommitLockRoundTripsIntegrationTest {
                                         "events_raw",
                                         listOf(dv(targets[0], 2), dv(targets[1], 1), dv(targets[2], 1)),
                                         uuid(cat, "events_raw"),
+                                    ),
+                                ),
+                        ),
+                    )
+                },
+                // The layout's checks are Kotlin between the two statements,
+                // and its rows (the layout, the identity key_index, the
+                // target's value) ride the one read.
+                "object-prefix table: append 1 file + a DV under its target's prefix" to {
+                    commits.commit(
+                        cat,
+                        CommitRequest(
+                            readSnapshot = head(cat),
+                            idempotencyKey = UUID.randomUUID(),
+                            appends = listOf(TableAppend("ingest", "events_prefixed", listOf(prefixedFile(cat, 2)))),
+                            deletes =
+                                listOf(
+                                    TableDeletes(
+                                        "ingest",
+                                        "events_prefixed",
+                                        listOf(
+                                            DeleteFileRegistration(
+                                                prefixedTargetId,
+                                                "s3://bucket/$cat/data/ingest/events_prefixed/c1=4/" +
+                                                    "dv-${UUID.randomUUID()}.puffin",
+                                                1,
+                                                64,
+                                            ),
+                                        ),
                                     ),
                                 ),
                         ),

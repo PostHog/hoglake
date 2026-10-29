@@ -305,5 +305,6 @@ object CatalogInvariants {
             "hog_partition_spec",
             "hog_sort_spec",
             "hog_view",
+            "hog_table_layout",
         )
 }

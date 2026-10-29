@@ -108,9 +108,12 @@ class CommitConflictSpecParityTest {
      * "read off the MAPPING, not off a restatement" — false, and left the
      * defect it was written to catch invisible from the other side.
      */
-    private fun bodyFor(cause: HoglakeException): Map<String, Any?> {
+    private fun bodyFor(
+        cause: HoglakeException,
+        expectedStatus: Int = 409,
+    ): Map<String, Any?> {
         val (status, dto) = errorBody(cause)
-        assertThat(status.value).describedAs("a typed refusal is a 409").isEqualTo(409)
+        assertThat(status.value).describedAs("%s's status", cause::class.simpleName).isEqualTo(expectedStatus)
         @Suppress("UNCHECKED_CAST")
         return mapper.convertValue(dto, Map::class.java) as Map<String, Any?>
     }
@@ -171,9 +174,17 @@ class CommitConflictSpecParityTest {
                 // The catalog drop's refusal (#412): `reason` is presence-
                 // scoped too, so its claim needs a body to be checked against.
                 bodyFor(HoglakeException.CatalogNotEmpty("d", CatalogNotEmptyReason.LIVE_NAMESPACES)),
+                // The one 422 with more than {error, detail}: it carries
+                // `tables` and `retry`, so `tables`' prose must name it.
+                bodyFor(HoglakeException.ObjectPrefixViolation("d", "ns.t"), expectedStatus = 422),
             ).associateBy { it["error"] as String }
         assertThat(bodies.keys)
-            .containsExactlyInAnyOrder("ddl_since_read_snapshot", "table_recreated", "catalog_not_empty")
+            .containsExactlyInAnyOrder(
+                "ddl_since_read_snapshot",
+                "table_recreated",
+                "catalog_not_empty",
+                "object_prefix_violation",
+            )
         // Only the PRESENCE-SCOPED fields — the ones whose description
         // opens "Present on …" — make a claim about which codes carry
         // them. `retry` is documented by meaning rather than by code, on
@@ -340,6 +351,31 @@ class CommitConflictSpecParityTest {
                 .describedAs("%s must reference ApiError from its 409 so the fields are documented", path)
                 .contains("#/components/schemas/ApiError")
         }
+    }
+
+    @Test
+    fun `every commit endpoint documents the object-prefix 422 and its body`() {
+        // Every one of them reaches CommitService.checkObjectPrefix or its
+        // DV twin, and the code is the only thing a writer that does not
+        // know a table's layout gets to branch on.
+        for (path in commitPaths()) {
+            val body = pathBlock(path)
+            val unprocessable = body.substringAfter("\"422\":").substringBefore("\"503\":")
+            assertThat(unprocessable).describedAs("%s's 422 must name object_prefix_violation", path)
+                .contains("object_prefix_violation")
+                .contains("retry: re-prepare")
+                .contains("#/components/schemas/ApiError")
+        }
+        val (status, dto) = errorBody(HoglakeException.ObjectPrefixViolation("why", "ns.t"))
+        assertThat(status.value).isEqualTo(422)
+        assertThat(dto).isEqualTo(
+            ApiErrorDto(
+                error = "object_prefix_violation",
+                detail = "why",
+                tables = listOf("ns.t"),
+                retry = "re-prepare",
+            ),
+        )
     }
 
     @Test
