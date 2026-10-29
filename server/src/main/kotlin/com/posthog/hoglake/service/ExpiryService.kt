@@ -240,10 +240,10 @@ class ExpiryService(
      * MAXIMUM count rather than the exact one (a catalog with
      * `consumer_floor` off skips the floor read and runs 9), so the
      * derived bound is conservative in the direction that matters — against a phase A
-     * whose statements are a PK read, two aggregate reads over
-     * `hog_snapshot`, a range delete bounded by `batchSize`, one
-     * single-row UPDATE and four deletes over tables whose whole row
-     * counts are in the thousands. It is a bound on the pathological
+     * whose statements are the ten listed on
+     * [BOUNDED_STATEMENTS_PER_ADVANCE]: point and bounded reads, a range
+     * delete bounded by `batchSize`, one single-row UPDATE and deletes
+     * over tables whose whole row counts are in the thousands. It is a bound on the pathological
      * case, not a budget anything normal spends.
      *
      * Floored at 1 ms, because `SET statement_timeout = 0` means
