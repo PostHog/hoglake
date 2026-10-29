@@ -12,6 +12,7 @@ import com.posthog.hoglake.model.CompactionResult
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.MaintenanceTask
 import com.posthog.hoglake.model.MaintenanceTrigger
+import com.posthog.hoglake.model.ObjectPrefix
 import com.posthog.hoglake.model.SortFieldDef
 import com.posthog.hoglake.model.allNodes
 import com.posthog.hoglake.observability.Audit
@@ -4587,8 +4588,7 @@ class CompactionService(
         // from a path — while giving every compaction output in a
         // table the same 10-character lead-in.
         val outputPath =
-            "${ctx.dataPath.trimEnd('/')}/data/${ctx.namespace}/${ctx.table}/" +
-                "${UUID.randomUUID()}.parquet"
+            ObjectPrefix.dataFilePath(ctx.dataPath, ctx.namespace, ctx.table, layout = null, value = null)
 
         // Claim ticket BEFORE the rewrite (its own committed
         // transaction): if this group never commits — skip, crash,

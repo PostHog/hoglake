@@ -97,6 +97,19 @@ whole, and requires a vector for every type of the grammar; the count,
 49, is pinned on both sides (`EXPECTED_VECTOR_COUNT` and
 `VariantLayoutVectorFile.EXPECTED_COUNT`).
 
+`pyhoglake/tests/vectors/object_prefix_vectors.json`: the object-prefix
+layout of `model/ObjectPrefix.kt`: the prefix grammar (canonical values
+per allowed type, and the refusals), containment (`team_id=4/` against
+`team_id=42/`, dot segments and encoded spellings), the stats proof's
+verdicts, and the reader role's IAM Resource pattern with the keys it
+must not grant. `regen_object_prefix_vectors.py` beside it writes the
+file, and `test_object_prefix_vectors.py` requires the file to be
+exactly what it writes. The server reads it in `ObjectPrefixVectorsTest`,
+and `ObjectPrefixTest` checks the IAM pattern with a glob matcher. No
+writer builds these paths yet; the one that does is held to the same
+file. The count, 69, is pinned on both sides (`EXPECTED_VECTOR_COUNT`
+and `ObjectPrefixVectorFile.EXPECTED_COUNT`).
+
 The VARIANT decoder has no second implementation here to diff against,
 so its external ground truth is apache/parquet-testing's `variant/` and
 `shredded_variant/` vectors, vendored in
