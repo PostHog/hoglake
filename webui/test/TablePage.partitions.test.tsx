@@ -15,6 +15,17 @@ import { jsonResponse, mockFetch, renderApp } from "./helpers";
 const base = "/v1/catalogs/analytics/namespaces/events/tables/pageviews";
 const route = "/catalogs/analytics/namespaces/events/tables/pageviews";
 
+function lookupResult(params: URLSearchParams) {
+  return {
+    snapshot_id: params.get("snapshot") ?? "4211", table_uuid: tableFixture.table_uuid,
+    spec_id: params.get("spec_id"), values: JSON.parse(params.get("values")!),
+    aggregates: { status: "exact", reason: null, totals: {
+      file_count: "2", physical_rows: "980000", total_bytes: "520093696", dv_count: "0",
+      stats_state: { provided: "1", pending: "1", failed: "0" }, last_file_write_snapshot: "4100",
+    } }, files: filesFixture, next_cursor: null,
+  };
+}
+
 /** Every request the page can make, plus the URLs it made, in order. */
 function harness(listing = partitionListingFixture) {
   const urls: string[] = [];
@@ -25,6 +36,10 @@ function harness(listing = partitionListingFixture) {
     if (path === `${base}/files`) return jsonResponse(filesFixture);
     if (path === `${base}/scan`) return jsonResponse(scanFixture);
     if (path === `${base}/partitions`) return jsonResponse(listing);
+    if (path === `${base}/partitions/lookup`) {
+      const params = new URL(url, "http://localhost").searchParams;
+      return jsonResponse(lookupResult(params));
+    }
     return undefined;
   });
   return urls;
@@ -256,17 +271,14 @@ describe("TablePage partitions tab", () => {
   it("the files tab preserves linked filters until explicitly cleared", async () => {
     const urls = harness();
     const user = userEvent.setup();
-    renderApp(route);
-    await user.click(await screen.findByRole("tab", { name: "partitions" }));
-    const row = (await screen.findByText("2026-09-01")).closest("td")!;
-    await user.click(within(row).getByRole("link"));
+    renderApp(`${route}?tab=files&partition=0%3A20697&partition=1%3A7`);
     await waitFor(() =>
       expect(urls.filter((u) => u.split("?")[0] === `${base}/files`).length).toBeGreaterThan(0),
     );
     const first = urls.filter((u) => u.split("?")[0] === `${base}/files`).at(-1)!;
     expect(decodeURIComponent(first)).toContain("partition=0:20697");
 
-    expect(screen.getByLabelText("filter by day(ts)")).toHaveValue("20697");
+    expect(await screen.findByLabelText("filter by day(ts)")).toHaveValue("20697");
     await user.click(screen.getByRole("tab", { name: "schema" }));
     await user.click(screen.getByRole("tab", { name: "files" }));
     expect(await screen.findByLabelText("filter by day(ts)")).toHaveValue("20697");
@@ -283,7 +295,7 @@ describe("TablePage partitions tab", () => {
     expect(decodeURIComponent(last)).not.toContain("partition=");
   });
 
-  it("links a partition to its own files, carrying the STORED values", async () => {
+  it("links a partition to exact inspection with its spec and complete stored tuple", async () => {
     harness();
     const user = userEvent.setup();
     renderApp(route);
@@ -291,24 +303,16 @@ describe("TablePage partitions tab", () => {
 
     const row = (await screen.findByText("2026-09-01")).closest("td")!;
     const link = within(row).getByRole("link");
-    // 20697 and 7, not "2026-09-01" and "bucket 7/16": the files
-    // listing matches the stored value exactly.
-    expect(link).toHaveAttribute(
-      "href",
-      expect.stringContaining("partition=0%3A20697"),
-    );
-    expect(link.getAttribute("href")).toContain("partition=1%3A7");
-    expect(link.getAttribute("href")).toContain("tab=files");
-
-    // A null value contributes NO param: `partition=1:` would mean the
-    // empty string to the files listing, which is a different filter.
+    const href = new URL(link.getAttribute("href")!, "http://localhost");
+    expect(href.searchParams.get("lookup")).toBe("1");
+    expect(href.searchParams.get("lookup_spec")).toBe("1");
+    expect(JSON.parse(href.searchParams.get("lookup_values")!)).toEqual(["20697", "7"]);
     const nullRow = (await screen.findByText("2026-09-02")).closest("td")!;
-    expect(within(nullRow).getByRole("link").getAttribute("href")).not.toContain(
-      "partition=1",
-    );
+    const nullHref = new URL(within(nullRow).getByRole("link").getAttribute("href")!, "http://localhost");
+    expect(JSON.parse(nullHref.searchParams.get("lookup_values")!)).toEqual(["20698", null]);
   });
 
-  it("the files tab picks the linked partition up from the URL", async () => {
+  it("opens exact inspection from a sampled row without a broad files listing", async () => {
     const urls = harness();
     const user = userEvent.setup();
     renderApp(route);
@@ -318,12 +322,65 @@ describe("TablePage partitions tab", () => {
 
     await waitFor(() =>
       expect(
-        urls.filter((u) => u.split("?")[0] === `${base}/files`).length,
+        urls.filter((u) => u.split("?")[0] === `${base}/partitions/lookup`).length,
       ).toBeGreaterThan(0),
     );
-    const filesUrl = urls.filter((u) => u.split("?")[0] === `${base}/files`).at(-1)!;
-    expect(decodeURIComponent(filesUrl)).toContain("partition=0:20697");
-    expect(decodeURIComponent(filesUrl)).toContain("partition=1:7");
+    const lookupUrl = new URL(urls.find((u) => u.split("?")[0] === `${base}/partitions/lookup`)!, "http://localhost");
+    expect(lookupUrl.searchParams.get("spec_id")).toBe("1");
+    expect(JSON.parse(lookupUrl.searchParams.get("values")!)).toEqual(["20697", "7"]);
+    expect(urls.filter((u) => u.split("?")[0] === `${base}/files`)).toHaveLength(0);
+    await waitFor(() => expect(urls.some((u) => u.includes("snapshot=4211") && u.includes("totals=false"))).toBe(true));
+  });
+
+  it("opens a pinned lookup without table metadata and keeps historical inspector errors local", async () => {
+    const snapshot = "9007199254740993";
+    const urls: string[] = [];
+    mockFetch((url) => {
+      urls.push(url);
+      const parsed = new URL(url, "http://localhost");
+      if (parsed.pathname === base) return jsonResponse({ error: "not_found", detail: "No table metadata" }, 404);
+      if (parsed.pathname === `${base}/partitions/lookup`) return jsonResponse(lookupResult(parsed.searchParams));
+      if (parsed.pathname === `${base}/files/101/stats`) return jsonResponse({ error: "not_found", detail: "Historical column stats unavailable" }, 404);
+      return undefined;
+    });
+    const params = new URLSearchParams({ tab: "partitions", lookup: "1", lookup_spec: "1", lookup_values: '[null,"","null"]', snapshot });
+    const user = userEvent.setup();
+    renderApp(`${route}?${params}`);
+
+    await user.click(await screen.findByRole("button", { name: "Inspect file 101" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Historical column stats unavailable");
+    expect(screen.getByText("Physical rows", { selector: "dt" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Inspect file 102" })).toBeInTheDocument();
+    expect(screen.queryByText("No table metadata")).not.toBeInTheDocument();
+    expect(urls).toContain(`${base}/files/101/stats?snapshot=${snapshot}`);
+    expect(urls.filter((url) => url.split("?")[0] === base)).toEqual([`${base}?snapshot=${snapshot}&totals=false`]);
+    expect(urls.some((url) => [`${base}/partitions`, `${base}/partitions/values`, `${base}/files`].includes(url.split("?")[0]))).toBe(false);
+  });
+
+  it("keeps exact inspection reachable after the sample listing exceeds its limit", async () => {
+    const urls: string[] = [];
+    mockFetch((url) => {
+      urls.push(url);
+      const parsed = new URL(url, "http://localhost");
+      if (parsed.pathname === base) return jsonResponse(tableFixture);
+      if (parsed.pathname === `${base}/partitions`) return jsonResponse({ error: "partition_limit", detail: "Sample listing limit exceeded" }, 422);
+      if (parsed.pathname === `${base}/partitions/lookup`) return jsonResponse(lookupResult(parsed.searchParams));
+      return undefined;
+    });
+    const user = userEvent.setup();
+    renderApp(`${route}?tab=partitions`);
+    expect(await screen.findByRole("alert")).toHaveTextContent("Sample listing limit exceeded");
+    await user.click(screen.getByRole("link", { name: "Inspect exact partition" }));
+    await user.clear(screen.getByLabelText("Spec ID"));
+    await user.type(screen.getByLabelText("Spec ID"), "1");
+    await user.click(screen.getByLabelText("Complete tuple (JSON)"));
+    await user.paste('["20697",null]');
+    await user.click(screen.getByRole("button", { name: "Inspect partition" }));
+    await screen.findByRole("button", { name: "Inspect file 101" });
+    const lookup = new URL(urls.find((url) => url.split("?")[0] === `${base}/partitions/lookup`)!, "http://localhost");
+    expect(JSON.parse(lookup.searchParams.get("values")!)).toEqual(["20697", null]);
+    expect(partitionsUrls(urls)).toHaveLength(1);
+    expect(urls.some((url) => [`${base}/partitions/values`, `${base}/files`].includes(url.split("?")[0]))).toBe(false);
   });
 });
 

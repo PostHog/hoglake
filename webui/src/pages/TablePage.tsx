@@ -46,6 +46,7 @@ import {
 import { applySort, int64Column, nextSort, textColumn } from "../lib/sort";
 import type { ColumnSort, SortState } from "../lib/sort";
 import { SortableTh } from "../components/SortableTh";
+import { PartitionLookupPanel } from "../components/PartitionLookupPanel";
 
 const TABS = ["schema", "files", "scan", "partitions"] as const;
 type Tab = (typeof TABS)[number];
@@ -1329,12 +1330,14 @@ function PartitionsTab({
   namespace,
   table,
   onOpenFiles,
+  lookupHref,
 }: {
   catalog: string;
   namespace: string;
   table: string;
-  /** Switch to the files tab with this partition's stored values applied. */
+  /** Open exact inspection for a partitioned spec, or the unpartitioned files view. */
   onOpenFiles: (group: PartitionGroup) => string;
+  lookupHref: string;
 }) {
   const [sort, setSort] = useState<SortState<PartitionSortKey>>({
     key: "partition",
@@ -1420,6 +1423,10 @@ function PartitionsTab({
   // unrecoverable. `filterFields` falls back to the last spec seen.
   return (
     <>
+      <p>
+        <Link to={lookupHref}>Inspect exact partition</Link>
+        <span className="subtle"> · Enter a full tuple without a maintenance sample.</span>
+      </p>
       {keyCount > 0 && (
         <div className="partition-filter">
           {filterFields.map((field, keyIndex) => (
@@ -1526,9 +1533,7 @@ function PartitionsTab({
             {rows.map((p, i) => (
               <tr key={i}>
                 <td className="partition-cell">
-                  {/* The link carries the STORED values, which is what
-                      the files listing matches on — the decoded form is
-                      for the reader, never for the wire. */}
+                  {/* Inspection uses the stored tuple under this row's spec. */}
                   <Link to={onOpenFiles(p)}>
                     {p.values.length === 0 ? (
                       <span className="subtle">unpartitioned</span>
@@ -1661,6 +1666,7 @@ export function TablePage() {
 
   const tabParam = searchParams.get("tab");
   const tab: Tab = TABS.includes(tabParam as Tab) ? (tabParam as Tab) : "schema";
+  const exactLookup = tab === "partitions" && searchParams.get("lookup") === "1";
   // A non-numeric ?snapshot (typo, mangled link) is ignored — treated as
   // head — rather than becoming NaN on screen and on the wire. Valid ids
   // stay exact decimal strings (int64: no Number round-trip).
@@ -1672,8 +1678,8 @@ export function TablePage() {
 
   const enabled = Boolean(catalog && namespace && table);
   const tableQuery = useQuery({
-    queryKey: ["table", catalog, namespace, table, snapshot ?? "head"],
-    queryFn: () => getTable(catalog!, namespace!, table!, snapshot),
+    queryKey: ["table", catalog, namespace, table, snapshot ?? "head", exactLookup ? "metadata" : "totals"],
+    queryFn: () => getTable(catalog!, namespace!, table!, snapshot, exactLookup ? { totals: false } : undefined),
     enabled,
   });
   if (!catalog || !namespace || !table) return null;
@@ -1707,6 +1713,21 @@ export function TablePage() {
     return `?${next.toString()}`;
   };
 
+  const lookupHref = (group?: PartitionGroup): string => {
+    const next = new URLSearchParams({ tab: "partitions", lookup: "1" });
+    if (snapshot !== undefined) next.set("snapshot", snapshot);
+    if (group?.spec_id !== undefined) {
+      next.set("lookup_spec", group.spec_id);
+      next.set("lookup_values", JSON.stringify(group.values.map((value) => value.raw)));
+    }
+    return `?${next.toString()}`;
+  };
+
+  const inspectPartitionHref = (group: PartitionGroup): string =>
+    group.spec_id !== undefined && /^\d+$/.test(group.spec_id) && BigInt(group.spec_id) > 0n && group.values.length > 0
+      ? lookupHref(group)
+      : filesHref(group);
+
   const setParam = (key: string, value: string | undefined) => {
     setSearchParams(
       (prev) => {
@@ -1729,7 +1750,7 @@ export function TablePage() {
           </span>
         )}
       </h2>
-      {tableQuery.isError ? (
+      {!exactLookup && (tableQuery.isError ? (
         <ErrorBox error={tableQuery.error} />
       ) : tableQuery.isPending ? (
         <SkeletonBlock />
@@ -1741,7 +1762,7 @@ export function TablePage() {
           // cannot be asked (see TotalsFreshness).
           timeTravel={snapshot !== undefined}
         />
-      )}
+      ))}
       <div className="tab-bar">
         <div role="tablist" className="tabs">
           {TABS.map((t) => (
@@ -1756,10 +1777,10 @@ export function TablePage() {
             </button>
           ))}
         </div>
-        <SnapshotSelector
+        {!exactLookup && <SnapshotSelector
           snapshot={snapshot}
           onChange={(s) => setParam("snapshot", s)}
-        />
+        />}
       </div>
       {tab === "schema" &&
         (tableQuery.isSuccess ? <SchemaTab table={tableQuery.data} /> : null)}
@@ -1803,13 +1824,35 @@ export function TablePage() {
           snapshot={snapshot}
         />
       )}
-      {tab === "partitions" && (
+      {tab === "partitions" && !exactLookup && (
         <PartitionsTab
           catalog={catalog}
           namespace={namespace}
           table={table}
-          onOpenFiles={filesHref}
+          onOpenFiles={inspectPartitionHref}
+          lookupHref={lookupHref()}
         />
+      )}
+      {exactLookup && (
+        <>
+          <p><Link to="?tab=partitions">Back to sampled partitions</Link></p>
+          <PartitionLookupPanel
+            key={JSON.stringify([catalog, namespace, table])}
+            catalog={catalog}
+            namespace={namespace}
+            table={table}
+            defaultSpecId={tableQuery.data?.partition_spec?.spec_id}
+            renderFileStats={(fileId, at) => (
+              <FileStatsPanel
+                catalog={catalog}
+                namespace={namespace}
+                table={table}
+                fileId={fileId}
+                snapshot={at}
+              />
+            )}
+          />
+        </>
       )}
     </section>
   );

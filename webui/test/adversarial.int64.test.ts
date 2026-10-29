@@ -16,6 +16,7 @@ import {
   listFiles,
   listSnapshots,
   listTablePartitions,
+  lookupPartition,
 } from "../src/api/client";
 import { addInt64, compareInt64, parseInt64Json } from "../src/api/int64";
 import { formatCount } from "../src/lib/format";
@@ -38,6 +39,29 @@ function stubFetchRaw(body: string) {
 }
 
 describe("int64 wire values above 2^53", () => {
+  it("preserves every exact lookup total and snapshot without rounding", async () => {
+    stubFetchRaw(`{
+      "snapshot_id":9007199254740993,"table_uuid":"u","spec_id":9007199254740995,
+      "values":[null,"","null"],"files":[],"next_cursor":null,
+      "aggregates":{"status":"exact","reason":null,"totals":{
+        "file_count":9007199254740997,"physical_rows":9007199254740999,
+        "total_bytes":4611686018427387905,"dv_count":9007199254741001,
+        "stats_state":{"provided":9007199254741003,"pending":9007199254741005,"failed":9007199254741007},
+        "last_file_write_snapshot":9007199254741009
+      }}}
+    `);
+    const result = await lookupPartition("c", "ns", "t", { specId: "1", values: [null] });
+    expect(result.snapshot_id).toBe("9007199254740993");
+    expect(result.spec_id).toBe("9007199254740995");
+    expect(result.values).toEqual([null, "", "null"]);
+    expect(result.aggregates.totals).toEqual({
+      file_count: "9007199254740997", physical_rows: "9007199254740999",
+      total_bytes: "4611686018427387905", dv_count: "9007199254741001",
+      stats_state: { provided: "9007199254741003", pending: "9007199254741005", failed: "9007199254741007" },
+      last_file_write_snapshot: "9007199254741009",
+    });
+  });
+
   it("record_count survives JSON parsing losslessly", async () => {
     stubFetchRaw(bigIntFilesWireBody);
     const files = await listFiles("c", "ns", "t");

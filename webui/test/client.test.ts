@@ -7,6 +7,7 @@ import {
   listConsumerOffsets,
   listFiles,
   listSnapshots,
+  lookupPartition,
   planScan,
 } from "../src/api/client";
 import {
@@ -33,6 +34,38 @@ describe("buildUrl", () => {
 });
 
 describe("api client", () => {
+  it("requests bounded table metadata without historical totals", async () => {
+    const fetchMock = mockFetch(() => jsonResponse(tableFixture));
+    await getTable("c", "ns", "t", "9007199254740993", { totals: false });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/v1/catalogs/c/namespaces/ns/tables/t?snapshot=9007199254740993&totals=false",
+      expect.anything(),
+    );
+  });
+
+  it("preserves the full nullable tuple, scope and cursor for exact lookup", async () => {
+    const fetchMock = mockFetch(() => jsonResponse({}));
+    const values = [null, "", "null", "a:/&+😀"];
+    await lookupPartition("c/1", "ns", "t", {
+      specId: "9007199254740993", values, snapshot: "9007199254740995", cursor: "opaque-_", limit: 100,
+    });
+    const url = new URL(fetchMock.mock.calls[0][0] as string, "http://localhost");
+    expect(url.pathname).toBe("/v1/catalogs/c%2F1/namespaces/ns/tables/t/partitions/lookup");
+    expect(JSON.parse(url.searchParams.get("values")!)).toEqual(values);
+    expect(url.searchParams.get("spec_id")).toBe("9007199254740993");
+    expect(url.searchParams.get("snapshot")).toBe("9007199254740995");
+    expect(url.searchParams.get("cursor")).toBe("opaque-_");
+    expect(url.searchParams.get("limit")).toBe("100");
+  });
+
+  it("retains typed lookup refusals and Retry-After", async () => {
+    mockFetch(() => new Response(JSON.stringify({
+      error: "partition_lookup_unavailable", detail: "Try again", reason: "busy",
+    }), { status: 503, headers: { "Retry-After": "1" } }));
+    await expect(lookupPartition("c", "ns", "t", { specId: "1", values: [null] }))
+      .rejects.toMatchObject({ status: 503, reason: "busy", retryAfter: "1" });
+  });
+
   it("hits GET /v1/catalogs and returns the parsed body as-is (snake_case)", async () => {
     const fetchMock = mockFetch((url) =>
       url === "/v1/catalogs" ? jsonResponse(catalogsFixture) : undefined,
