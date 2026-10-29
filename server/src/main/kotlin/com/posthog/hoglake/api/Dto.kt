@@ -58,17 +58,21 @@ import java.util.UUID
  * NON_NULL omission keeps it exactly that shape — a client that parses
  * only those two is unaffected by the fields below.
  *
- * `ddl_since_read_snapshot` carries more, because it is the one refusal
- * whose recovery is not "retry": a caller has to know WHICH tables
- * moved and that replaying is futile, and making it regex [detail] for
- * that would be a contract in prose. `catalog_not_empty` carries
- * [reason] for the same reason: seven preconditions, seven different
- * things to go and do, one code.
+ * The re-prepare family (`ddl_since_read_snapshot`, `table_recreated`
+ * and `object_prefix_violation`) carries more, because those are the
+ * refusals whose recovery is not "retry": a caller has to know WHICH
+ * tables to re-read and that replaying is futile, and making it regex
+ * [detail] for that would be a contract in prose. `catalog_not_empty`
+ * carries [reason] for the same reason: seven preconditions, seven
+ * different things to go and do, one code.
  */
 data class ApiErrorDto(
     val error: String,
     val detail: String? = null,
-    /** `ddl_since_read_snapshot` only: the qualified tables DDL landed on. */
+    /**
+     * `ddl_since_read_snapshot`, `table_recreated` and
+     * `object_prefix_violation`: the qualified tables the refusal is about.
+     */
     val tables: List<String>? = null,
     /** `ddl_since_read_snapshot` only: the request's own read_snapshot. */
     val readSnapshot: Long? = null,
@@ -102,6 +106,7 @@ data class CatalogDto(
             "versioned-table-metadata-v1",
             "claimed-uploads-v1",
             "atomic-dml-transactions-v1",
+            "object-prefix-layout-v1",
         ),
     /**
      * Live totals from the metrics sampler's last pass — display
@@ -367,6 +372,12 @@ data class TableDto(
     val partitionSpec: AlterPartitionSpecDto? = null,
     /** Sort order at the requested snapshot; NON_NULL omits when unsorted. */
     val sortSpec: AlterSortSpecDto? = null,
+    /**
+     * The object-prefix field's column name at the requested snapshot;
+     * NON_NULL omits it when the option is off, so a client that predates
+     * the option sees the same body it always did.
+     */
+    val objectPrefixField: String? = null,
     val comment: String? = null,
     val properties: Map<String, String> = emptyMap(),
     /**
@@ -395,6 +406,7 @@ fun TableInfo.toDto() =
         totalsAsOf = totalsAsOf,
         partitionSpec = partitionSpec?.toAlterDto(),
         sortSpec = sortSpec?.toAlterDto(),
+        objectPrefixField = objectPrefixField,
         comment = comment,
         properties = properties,
         snapshotId = snapshotId,

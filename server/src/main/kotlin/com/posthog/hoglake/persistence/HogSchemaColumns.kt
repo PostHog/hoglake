@@ -145,6 +145,10 @@ object HogSchemaColumns {
                     "catalog_id", "table_id", "sort_id", "key_index", "source_field_id",
                     "direction", "null_order",
                 ),
+            // V29: LayoutRepo, CommitTail's `layouts` CTE (read) and
+            // AlterService.setObjectPrefixField (write).
+            "hog_table_layout" to
+                setOf("catalog_id", "table_id", "begin_snapshot", "end_snapshot", "object_prefix_field_id"),
             // DeleteFileReadRepo, CommitTail (DV targets, supersession, inserts).
             "hog_delete_file" to
                 setOf(

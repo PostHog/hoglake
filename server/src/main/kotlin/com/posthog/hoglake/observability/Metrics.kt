@@ -497,6 +497,11 @@ object Metrics {
      * The self-healing skips — commit conflicts, DV supersession — stay
      * uncounted: they re-plan on the next run, so a line for them is
      * noise rather than signal.
+     *
+     * `object_prefix_layout` counts TABLES, one per sweep that planned
+     * one: a table with the object-prefix layout is not compacted until
+     * compaction writes under the layout, so its small files accumulate,
+     * and this is the line that says how many tables that is.
      */
     fun compactionSkipped(
         catalog: String,
@@ -867,6 +872,9 @@ object Metrics {
             is HoglakeException.TableRecreated -> "table_recreated"
             is HoglakeException.CommitConflict -> "conflict"
             is HoglakeException.Validation -> "validation"
+            // Distinct, so "which writers still miss the object-prefix
+            // layout" is a series rather than a slice of `validation`.
+            is HoglakeException.ObjectPrefixViolation -> "object_prefix_violation"
             is HoglakeException.CommitQueueTimeout -> "timeout"
             else -> null
         }

@@ -54,6 +54,9 @@ class AlterGuardPlanIntegrationTest {
 
         /** Flagged live files on ANOTHER table of the catalog: the key's second column at work. */
         const val FLAGGED_OTHER_TABLE = 40
+
+        /** A truncated table's ended DVs (and files): the emptiness probe's worst case. */
+        const val TRUNCATED_DVS = 50_000
     }
 
     private val db = PgTestSupport.freshDatabase()
@@ -164,5 +167,142 @@ class AlterGuardPlanIntegrationTest {
             .describedAs("no row removed by a filter above the index:%n%s", plan)
             .doesNotContainPattern(Regex("""Rows Removed by (Filter|Index Recheck): [1-9]""").toPattern())
         println("[#445] alter guard plan:\n$plan")
+    }
+
+    /**
+     * `set_object_prefix_field`'s emptiness probe
+     * ([AlterService.TABLE_HAS_LIVE_FILES_SQL]), also under the commit
+     * lock: one descent of `hog_data_file_live` whether the table holds
+     * 220k live files (table 1) or none (table 3) — measured 2-4 buffers
+     * on this fixture, against the ~4k pages of the manifest. As a bare
+     * EXISTS, table 1's probe was a Seq Scan that happened to stop at its
+     * first row (2 buffers here, the whole manifest when the table's rows
+     * sit at the end of the heap or were all ended by a truncate).
+     */
+    @Test
+    fun `the object-prefix emptiness probe stops at the first live row`() {
+        for (table in listOf(1L, 3L)) {
+            val (probe, answer) =
+                db.jdbi.inTransactionUnchecked { h ->
+                    h.execute("SET LOCAL max_parallel_workers_per_gather = 0")
+                    val explained =
+                        h.createQuery(
+                            "EXPLAIN (ANALYZE, BUFFERS, TIMING false, COSTS false, SUMMARY false) " +
+                                AlterService.TABLE_HAS_LIVE_FILES_SQL,
+                        ).bind("catalogId", catalogId).bind("tableId", table)
+                            .mapTo(String::class.java).list().joinToString("\n")
+                    val nonEmpty =
+                        h.createQuery(AlterService.TABLE_HAS_LIVE_FILES_SQL)
+                            .bind("catalogId", catalogId).bind("tableId", table)
+                            .mapTo(Boolean::class.java).one()
+                    explained to nonEmpty
+                }
+            assertThat(answer).describedAs("table %d", table).isEqualTo(table == 1L)
+            assertThat(probe).describedAs("table %d:%n%s", table, probe).doesNotContain("Seq Scan on hog_data_file")
+            assertThat(probe).contains("hog_data_file_live")
+            assertThat(com.posthog.hoglake.testing.ExplainPlan.nodes(probe).first().buffers)
+                .describedAs("table %d's probe buffers:%n%s", table, probe)
+                .isLessThan(20)
+        }
+    }
+
+    /**
+     * The probe's DV half, in the one state that runs it with a big table
+     * behind it: truncated (every DV and file ended, as
+     * `CatalogService.truncateTable` ends them) and not yet re-analyzed,
+     * so the statistics still say the table's DVs are live and common.
+     * The VACUUM (no ANALYZE) clears the old row versions' index entries,
+     * as any vacuum would, so what is measured is the plan the statistics
+     * pick and not a first scan over dead tuples. As a bare EXISTS the DV
+     * half was a Seq Scan of the whole of `hog_delete_file` here (2,041
+     * buffers); in range order it is one descent of `hog_delete_file_live`.
+     */
+    @Test
+    fun `the emptiness probe's DV half never scans hog_delete_file after a truncate`() {
+        val table = 4L
+        db.jdbi.useHandleUnchecked { h ->
+            // The stale statistics are the point: no autovacuum may refresh them mid-test.
+            h.execute("ALTER TABLE hog_data_file SET (autovacuum_enabled = false)")
+            h.execute("ALTER TABLE hog_delete_file SET (autovacuum_enabled = false)")
+            h.execute(
+                "INSERT INTO hog_table (catalog_id, table_id, created_snapshot) VALUES (?, ?, 1)",
+                catalogId,
+                table,
+            )
+            h.createUpdate(
+                """
+                INSERT INTO hog_data_file (catalog_id, data_file_id, table_id, begin_snapshot, path, record_count,
+                                           file_size_bytes, row_id_start, stats_state)
+                SELECT :c, 8000000 + g, :t, 1, 's3://guard-plan/t4/' || g || '.parquet', 100, 1024, g, 'provided'
+                FROM generate_series(1, :n) g
+                """,
+            ).bind("c", catalogId).bind("t", table).bind("n", TRUNCATED_DVS).execute()
+            h.createUpdate(
+                """
+                INSERT INTO hog_delete_file (catalog_id, delete_file_id, table_id, data_file_id, begin_snapshot,
+                                             path, delete_count, file_size_bytes)
+                SELECT :c, g, :t, 8000000 + g, 2, 's3://guard-plan/t4/dv/' || md5('dv' || g) || '.puffin', 1, 64
+                FROM generate_series(1, :n) g
+                """,
+            ).bind("c", catalogId).bind("t", table).bind("n", TRUNCATED_DVS).execute()
+            h.execute("ANALYZE hog_delete_file")
+            // The truncate: DVs first, then files, at one snapshot.
+            h.execute(
+                "UPDATE hog_delete_file SET end_snapshot = 5 " +
+                    "WHERE catalog_id = ? AND table_id = ? AND end_snapshot IS NULL",
+                catalogId,
+                table,
+            )
+            h.execute(
+                "UPDATE hog_data_file SET end_snapshot = 5 " +
+                    "WHERE catalog_id = ? AND table_id = ? AND end_snapshot IS NULL",
+                catalogId,
+                table,
+            )
+            h.execute("VACUUM hog_data_file, hog_delete_file")
+        }
+        val (probe, answer) =
+            db.jdbi.inTransactionUnchecked { h ->
+                h.execute("SET LOCAL max_parallel_workers_per_gather = 0")
+                val explained =
+                    h.createQuery(
+                        "EXPLAIN (ANALYZE, BUFFERS, TIMING false, COSTS false, SUMMARY false) " +
+                            AlterService.TABLE_HAS_LIVE_FILES_SQL,
+                    ).bind("catalogId", catalogId).bind("tableId", table)
+                        .mapTo(String::class.java).list().joinToString("\n")
+                val nonEmpty =
+                    h.createQuery(AlterService.TABLE_HAS_LIVE_FILES_SQL)
+                        .bind("catalogId", catalogId).bind("tableId", table)
+                        .mapTo(Boolean::class.java).one()
+                explained to nonEmpty
+            }
+        println("[2.1b] truncated-table emptiness probe:\n$probe")
+        assertThat(answer).describedAs("a truncated table is empty").isFalse()
+        assertThat(probe).describedAs("%s", probe).doesNotContain("Seq Scan on hog_delete_file")
+        assertThat(probe).describedAs("%s", probe).doesNotContain("Seq Scan on hog_data_file")
+        assertThat(probe).contains("hog_delete_file_live")
+        assertThat(com.posthog.hoglake.testing.ExplainPlan.nodes(probe).first().buffers)
+            .describedAs("the truncated table's probe buffers:%n%s", probe)
+            .isLessThan(20)
+        // The range spelling still answers: a live DV on an ended file
+        // (an invariant break, so only by hand) makes the table non-empty.
+        val withStrayDv =
+            db.jdbi.inTransactionUnchecked { h ->
+                h.execute(
+                    "INSERT INTO hog_delete_file (catalog_id, delete_file_id, table_id, data_file_id, " +
+                        "begin_snapshot, path, delete_count, file_size_bytes) " +
+                        "VALUES (?, ?, ?, 8000001, 6, 's3://guard-plan/t4/dv/stray.puffin', 1, 64)",
+                    catalogId,
+                    TRUNCATED_DVS + 1L,
+                    table,
+                )
+                val nonEmpty =
+                    h.createQuery(AlterService.TABLE_HAS_LIVE_FILES_SQL)
+                        .bind("catalogId", catalogId).bind("tableId", table)
+                        .mapTo(Boolean::class.java).one()
+                h.rollback()
+                nonEmpty
+            }
+        assertThat(withStrayDv).describedAs("a live DV alone makes the table non-empty").isTrue()
     }
 }

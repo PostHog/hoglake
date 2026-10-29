@@ -360,7 +360,8 @@ there would break that gate on every build.
    silently skip; the floor advance captures
    `hog_catalog.earliest_snapshot_time` so 410s can say WHEN the floor
    was reached. A fifth sweep step deletes versioned DDL rows
-   (`hog_table_version`/`hog_column`/`hog_sort_spec`/`hog_view`) whose
+   (`hog_table_version`/`hog_column`/`hog_sort_spec`/`hog_view`/
+   `hog_table_layout`) whose
    `end_snapshot <= earliest_snapshot_id` — invisible at every retained
    snapshot, so DDL churn cannot grow them unbounded. `hog_partition_spec`
    is deliberately kept (`ExpiryService.VERSIONED_TABLES_NEVER_CLEARED`):
