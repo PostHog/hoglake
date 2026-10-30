@@ -4,6 +4,7 @@ import com.posthog.hoglake.model.HoglakeException
 import com.sun.net.httpserver.HttpServer
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
+import org.assertj.core.api.Assertions.catchThrowable
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Test
 import java.net.InetSocketAddress
@@ -140,10 +141,203 @@ class HogliteClientTest {
     @Test
     fun `a deterministic refusal surfaces on first sight`() {
         val (server, calls) =
-            serve(Step(422, "{\"error\":\"syntax error\"}"))
+            serve(Step(422, "{\"error\":\"syntax error\",\"code\":\"refused\"}"))
         val c = client("http://127.0.0.1:${server.address.port}")
         assertThatThrownBy { txOne(c) }.isInstanceOf(HogliteRejected::class.java)
         assertThat(calls.get()).isEqualTo(1)
+    }
+
+    // ---- the outcome taxonomy: committed, not committed, unknown ----------
+
+    private val outcomeUnknown =
+        "{\"error\":\"commit outcome unknown (applied locally, durability unconfirmed): " +
+            "pod lease write deadline passed\",\"code\":\"outcome_unknown\"}"
+
+    private fun txFixed(
+        client: HogliteClient,
+        txid: String,
+    ) = client.tx("t", txid, null, listOf(HogliteStatement("INSERT INTO kv VALUES (1)", emptyList())))
+
+    @Test
+    fun `a 504 outcome_unknown retries with the same txid and returns the commit`() {
+        val (server, calls) = serve(Step(504, outcomeUnknown), Step(200, "{\"results\":[],\"dup\":true}"))
+        val c = client("http://127.0.0.1:${server.address.port}")
+        txFixed(c, "tx-fixed")
+        assertThat(calls.get()).isEqualTo(2)
+        assertThat(servedBodies.toList()).hasSize(2)
+        assertThat(servedBodies.first()).isEqualTo(servedBodies.last()).contains("\"txid\":\"tx-fixed\"")
+    }
+
+    @Test
+    fun `a 504 past the budget is outcome unknown, retryable and never a refusal`() {
+        val (server, _) = serve(Step(504, outcomeUnknown))
+        val c = client("http://127.0.0.1:${server.address.port}", budgetMs = 300)
+        val thrown = catchThrowable { txFixed(c, "tx-504") }
+        assertThat(thrown)
+            .isInstanceOf(HoglakeException.CommitOutcomeUnknown::class.java)
+            .isInstanceOf(HoglakeException.BackendUnavailable::class.java)
+            .isNotInstanceOf(HogliteRejected::class.java)
+        assertThat((thrown as HoglakeException.CommitOutcomeUnknown).txid).isEqualTo("tx-504")
+    }
+
+    @Test
+    fun `once an attempt may have applied the call cannot end as not committed`() {
+        // 504 first, then not_applied until the budget runs out: the later
+        // answers say nothing about the first attempt
+        val (server, _) =
+            serve(Step(504, outcomeUnknown), Step(503, "{\"error\":\"lease lost\",\"code\":\"not_applied\"}"))
+        val c = client("http://127.0.0.1:${server.address.port}", budgetMs = 300)
+        assertThatThrownBy { txFixed(c, "tx-sticky") }.isInstanceOf(HoglakeException.CommitOutcomeUnknown::class.java)
+    }
+
+    @Test
+    fun `a budget spent on not_applied 503s is unavailable but not unknown`() {
+        val (server, _) = serve(Step(503, "{\"error\":\"lease lost\",\"code\":\"not_applied\"}"))
+        val c = client("http://127.0.0.1:${server.address.port}", budgetMs = 300)
+        assertThat(catchThrowable { txFixed(c, "tx-na") })
+            .isInstanceOf(HoglakeException.BackendUnavailable::class.java)
+            .isNotInstanceOf(HoglakeException.CommitOutcomeUnknown::class.java)
+    }
+
+    @Test
+    fun `no retry is squeezed into the budget's last milliseconds`() {
+        // A slow not_applied 503 and a backoff that lands the loop ~25ms
+        // before the deadline: a retry started there could only time out,
+        // and a tx attempt that timed out after being sent is unknown.
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        server.createContext("/") { ex ->
+            ex.requestBody.readBytes()
+            Thread.sleep(100)
+            val body = "{\"error\":\"lease lost\",\"code\":\"not_applied\"}".toByteArray()
+            ex.sendResponseHeaders(503, body.size.toLong())
+            ex.responseBody.use { it.write(body) }
+        }
+        server.start()
+        servers += server
+        val budgetMs = 1_000L
+        var start = 0L
+        val c =
+            HogliteClient(
+                standardUrl = "http://127.0.0.1:${server.address.port}",
+                retryBudgetMs = budgetMs,
+                sleeper = { Thread.sleep(maxOf(0, start + budgetMs - 25 - System.currentTimeMillis())) },
+            )
+        start = System.currentTimeMillis()
+        // MUTATION: drop the MIN_RETRY_ATTEMPT_MS floor and the last
+        // attempt times out after being sent, so this is unknown.
+        assertThat(catchThrowable { txFixed(c, "tx-floor") })
+            .isInstanceOf(HoglakeException.BackendUnavailable::class.java)
+            .isNotInstanceOf(HoglakeException.CommitOutcomeUnknown::class.java)
+    }
+
+    @Test
+    fun `an unlabelled 503 on a tx may have applied`() {
+        // an engine that predates the labels answered 503 for segment and
+        // checkpoint failures after apply
+        val (server, _) = serve(Step(503, "{\"error\":\"segment put: SlowDown\"}"))
+        val c = client("http://127.0.0.1:${server.address.port}", budgetMs = 300)
+        assertThatThrownBy { txFixed(c, "tx-old503") }.isInstanceOf(HoglakeException.CommitOutcomeUnknown::class.java)
+    }
+
+    @Test
+    fun `an unlabelled 422 on a tx is unknown on first sight, not a refusal`() {
+        val (server, calls) = serve(Step(422, "{\"error\":\"pod lease write deadline passed\"}"))
+        val c = client("http://127.0.0.1:${server.address.port}")
+        assertThatThrownBy { txFixed(c, "tx-old422") }
+            .isInstanceOf(HoglakeException.CommitOutcomeUnknown::class.java)
+            .isNotInstanceOf(HogliteRejected::class.java)
+        assertThat(calls.get()).isEqualTo(1)
+    }
+
+    @Test
+    fun `a 500 or 502 on a tx is unknown, not a refusal`() {
+        for (status in listOf(500, 502)) {
+            val (server, _) = serve(Step(status, "bad gateway"))
+            val c = client("http://127.0.0.1:${server.address.port}")
+            assertThatThrownBy {
+                txFixed(
+                    c,
+                    "tx-$status",
+                )
+            }.isInstanceOf(HoglakeException.CommitOutcomeUnknown::class.java)
+        }
+    }
+
+    @Test
+    fun `a refused connection never sent the tx, so exhaustion is not unknown`() {
+        val (server, _) = serve(Step(200, "{\"results\":[]}"))
+        val port = server.address.port
+        server.stop(0)
+        val c = client("http://127.0.0.1:$port", budgetMs = 300)
+        assertThat(catchThrowable { txFixed(c, "tx-refused") })
+            .isInstanceOf(HoglakeException.BackendUnavailable::class.java)
+            .isNotInstanceOf(HoglakeException.CommitOutcomeUnknown::class.java)
+    }
+
+    @Test
+    fun `a read timeout after the tx was sent is unknown`() {
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        server.createContext("/") { ex ->
+            ex.requestBody.readBytes()
+            Thread.sleep(1_000)
+            ex.sendResponseHeaders(200, 2)
+            ex.responseBody.use { it.write(byteArrayOf(123, 125)) }
+        }
+        server.start()
+        servers += server
+        val c = client("http://127.0.0.1:${server.address.port}", budgetMs = 200)
+        assertThatThrownBy { txFixed(c, "tx-timeout") }.isInstanceOf(HoglakeException.CommitOutcomeUnknown::class.java)
+    }
+
+    @Test
+    fun `a labelled query guard refusal on a tx is final, whatever its status`() {
+        // hoglite's guard refusals rolled back and wrote no receipt; 504
+        // query_timeout shares its status with outcome_unknown, so only
+        // the label separates "retry this" from "this will never fit".
+        for ((status, code) in listOf(504 to "query_timeout", 413 to "result_too_large", 507 to "out_of_memory")) {
+            val (server, calls) = serve(Step(status, "{\"error\":\"guard\",\"code\":\"$code\"}"))
+            val c = client("http://127.0.0.1:${server.address.port}")
+            assertThat(catchThrowable { txFixed(c, "tx-$code") })
+                .describedAs(code)
+                .isInstanceOf(HogliteRejected::class.java)
+                .isNotInstanceOf(HoglakeException.CommitOutcomeUnknown::class.java)
+            assertThat(calls.get()).describedAs(code).isEqualTo(1)
+        }
+    }
+
+    @Test
+    fun `a query_timeout on a query is final, and a preempted read retries`() {
+        val (server, calls) = serve(Step(504, "{\"error\":\"query timeout\",\"code\":\"query_timeout\"}"))
+        val c = client("http://127.0.0.1:${server.address.port}")
+        assertThatThrownBy { c.query("t", "SELECT 1") }.isInstanceOf(HogliteRejected::class.java)
+        assertThat(calls.get()).isEqualTo(1)
+        // upstream's ErrReadPreempted: an unlabelled 503, retried
+        val (preempted, calls2) =
+            serve(
+                Step(503, "{\"error\":\"read canceled by checkpoint; retry\"}"),
+                Step(200, "{\"cols\":[\"x\"],\"rows\":[[1]]}"),
+            )
+        val c2 = client("http://127.0.0.1:${preempted.address.port}")
+        assertThat(c2.query("t", "SELECT 1").rows.single().single()).isEqualTo(1)
+        assertThat(calls2.get()).isEqualTo(2)
+    }
+
+    @Test
+    fun `a query is never unknown, and its 503 and 504 retry`() {
+        val (server, calls) =
+            serve(
+                Step(503, "{\"error\":\"context canceled\",\"code\":\"not_applied\"}"),
+                Step(504, "gateway timeout"),
+                Step(200, "{\"cols\":[\"x\"],\"rows\":[[1]]}"),
+            )
+        val c = client("http://127.0.0.1:${server.address.port}")
+        assertThat(c.query("t", "SELECT 1").rows.single().single()).isEqualTo(1)
+        assertThat(calls.get()).isEqualTo(3)
+        val (down, _) = serve(Step(504, "gateway timeout"))
+        val c2 = client("http://127.0.0.1:${down.address.port}", budgetMs = 300)
+        assertThat(catchThrowable { c2.query("t", "SELECT 1") })
+            .isInstanceOf(HoglakeException.BackendUnavailable::class.java)
+            .isNotInstanceOf(HoglakeException.CommitOutcomeUnknown::class.java)
     }
 
     @Test

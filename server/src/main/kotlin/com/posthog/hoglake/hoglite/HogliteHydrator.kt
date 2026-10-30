@@ -159,6 +159,18 @@ internal class HogliteHydrator(
                     "transient object-store failure hydrating file ${file.dataFileId} " +
                         "(${file.path}); leaving pending for the next sweep"
                 }
+            } catch (e: HoglakeException.BackendUnavailable) {
+                // hoglite did not answer, or a write's outcome is unknown
+                // (CommitOutcomeUnknown): nothing about the FILE failed,
+                // and the hydrate flip may even have landed. Both state
+                // flips are guarded on stats_state='pending', so leaving
+                // the file for the next sweep is safe either way; marking
+                // it failed would make a backend blip permanent.
+                tally[3]++
+                log.warn(e) {
+                    "hoglite unavailable hydrating file ${file.dataFileId} " +
+                        "(${file.path}); leaving pending for the next sweep"
+                }
             } catch (e: Exception) {
                 log.error(e) {
                     "hydration failed for file ${file.dataFileId} (${file.path}); marking failed"

@@ -136,9 +136,23 @@ them unchanged; the hoglite ports live in `server/.../hoglite/`.
 | `HOGLAKE_HOGLITE_CIRCUIT_FAILURE_THRESHOLD` | 10 | consecutive failures before the pool opens |
 | `HOGLAKE_HOGLITE_CIRCUIT_OPEN_MS` | 5000 | open duration before the half-open probe |
 
-Retry taxonomy: only 421 (owner moved — repin and retry), 503, and transport
-errors retry, inside the budget, with 200ms backoff. 409/422 surface
-immediately as hoglake's typed exceptions. When the budget is exhausted the
+Retry taxonomy: 421 (owner moved — repin and retry), 503, 504 and transport
+errors retry, inside the budget, with 200ms backoff, and a `/tx` retry
+reuses its txid, so it is exactly-once. A commit has three outcomes, and the
+engine's `code` (not its status) tells them apart:
+
+- **committed**: 200.
+- **not committed**, final: 409 guard failure, 422 `refused`, and the query
+  guard refusals (504 `query_timeout`, 413 `result_too_large`, 507
+  `out_of_memory`), which rolled back. They surface at once as hoglake's
+  typed exceptions.
+- **unknown**: 504 `outcome_unknown` (applied, then the owner failed before
+  the commit was durable), a 503 not labelled `not_applied`, any other
+  unlabelled error, or a transport failure after the request was sent.
+  These retry; if the budget runs out after one, the caller gets 503
+  `commit_outcome_unknown` with `Retry-After`: the commit may have landed.
+
+When the budget is exhausted on attempts that cannot have applied, the
 caller gets 503 `backend_unavailable` with `Retry-After` — the honest
 "transient, retry" answer, not a 500.
 

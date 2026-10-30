@@ -2743,7 +2743,32 @@ sealed class HoglakeException(message: String) : RuntimeException(message) {
      * database is healthy; this one is the database itself not
      * answering, which an operator pages on differently.
      */
-    class BackendUnavailable(detail: String) : HoglakeException(detail)
+    open class BackendUnavailable(detail: String) : HoglakeException(detail)
+
+    /**
+     * A commit the backend may or may not have applied -> HTTP 503
+     * `commit_outcome_unknown` with `Retry-After`. Raised by the hoglite
+     * backend when a transaction's attempts ended after at least one that
+     * may have applied (the engine's 504 `outcome_unknown`: applied, then
+     * the owner failed before durability was confirmed; a transport
+     * failure after the request was sent) and no later answer settled it.
+     *
+     * It IS a [BackendUnavailable] (retryable, never a refusal: the commit
+     * may have landed, so nothing may treat it as final), with its own
+     * code so a writer can tell "the database did not answer" from "your
+     * commit may be durable". Retrying the SAME backend transaction
+     * ([txid]) is exactly-once; a caller's retry with the same
+     * idempotency key is exactly-once too, and one without a key is
+     * at-least-once, the same as a lost COMMIT acknowledgement on
+     * Postgres.
+     */
+    class CommitOutcomeUnknown(
+        val txid: String,
+        detail: String,
+    ) : BackendUnavailable(
+            "transaction '$txid' outcome unknown (it may or may not have committed; " +
+                "retrying it with the same txid is exactly-once): $detail",
+        )
 
     /**
      * A commit to a table with the object-prefix layout registered a file

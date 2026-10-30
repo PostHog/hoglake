@@ -5,8 +5,10 @@ import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
 import com.posthog.hoglake.model.HoglakeException
 import io.github.oshai.kotlinlogging.KotlinLogging
+import java.net.ConnectException
 import java.net.URI
 import java.net.http.HttpClient
+import java.net.http.HttpConnectTimeoutException
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.time.Duration
@@ -58,15 +60,28 @@ class HogliteGuardFailure(
 
 /**
  * hoglite refused the call deterministically and it is NOT a guard:
- * a 422 (SQL error — constraint violation, malformed statement), a 404
- * (unknown tenant), or a 409 from `/query` (whose error channel has no
- * guard index). Never retried by the client; the store maps it to the
- * typed hoglake refusal it means.
+ * a 422 `refused` (SQL error — constraint violation, malformed
+ * statement — rolled back), a 404 (unknown tenant), or a 409 from
+ * `/query` (whose error channel has no guard index). Never retried by
+ * the client; the store maps it to the typed hoglake refusal it means.
+ * A `/tx` answer that is not KNOWN to be non-durable is never this:
+ * see [HoglakeException.CommitOutcomeUnknown].
  */
 class HogliteRejected(
     val status: Int,
     val body: String,
 ) : RuntimeException("hoglite $status: $body")
+
+/*
+ * A `/tx` whose outcome the client could not learn surfaces as
+ * [HoglakeException.CommitOutcomeUnknown]: raised when the retry budget
+ * (or an open breaker, or an interrupt) ends a transaction after at least
+ * one attempt that may have applied — a 504 `outcome_unknown`, a
+ * transport failure after the request may have been sent, a 503 not
+ * labelled `not_applied` — or at once for a 422 not labelled `refused`
+ * or any other unlabelled error status (an engine that predates the
+ * labels answered 422 for durable-but-unreported commits too).
+ */
 
 /**
  * The hoglite side of the hoglake backend: tenant lifecycle plus the
@@ -87,15 +102,27 @@ class HogliteRejected(
  *
  * ## Retry taxonomy
  *
- * Only three outcomes retry: 421 (re-route), 503 (owner lost
- * mid-flight, lease not yet expired), and transport errors (dead pod
- * under a stale pin). Each retry of a `tx` carries the SAME caller-fixed
+ * Only four outcomes retry: 421 (re-route), 503 (`not_applied`: owner
+ * lost mid-flight, lease not yet expired, a read cancelled by a
+ * checkpoint), 504 (`outcome_unknown`: a commit applied on an owner that
+ * then failed before durability was confirmed), and transport errors
+ * (dead pod under a stale pin). Each retry of a `tx` carries the SAME caller-fixed
  * `txid` and payload fingerprint, so a retry of a commit hoglite
  * already durably applied is answered from its dedup table —
  * exactly-once is hoglite's, the client just has to not change the key.
- * Everything else — 409 guard, 422 SQL, 404, 400 — is deterministic and
- * surfaces on first sight; spending retry budget on an impossible
- * request just delays the caller's refusal.
+ * Everything else — 409 guard, 422 `refused`, 404, 400 — is
+ * deterministic and surfaces on first sight; spending retry budget on an
+ * impossible request just delays the caller's refusal.
+ *
+ * A `tx` keeps three outcomes apart end to end: committed (200),
+ * definitely not committed (409 guard, 422 `refused`, 404, or a budget
+ * spent only on attempts that cannot have applied, which is
+ * [HoglakeException.BackendUnavailable]), and unknown
+ * ([HoglakeException.CommitOutcomeUnknown], also a BackendUnavailable
+ * but typed, with its own API code, so a caller can tell). An attempt may have applied when it got a 504, a 503
+ * not labelled `not_applied`, or a transport failure other than a refused
+ * or timed-out connect; once one has, the call can only end committed or
+ * unknown.
  *
  * ## Circuit breaking
  *
@@ -183,11 +210,27 @@ class HogliteClient(
                     put("statements", statements.map { it.toWire() })
                 },
             )
-        return call(tenant, "/v1/t/$tenant/tx", body, commitTimeoutMs) { status, bytes ->
-            when (status) {
-                200 -> parseTxResults(bytes)
-                409 -> throw guardFailure(bytes)
-                else -> throw HogliteRejected(status, String(bytes))
+        return call(tenant, "/v1/t/$tenant/tx", body, commitTimeoutMs, txid = txid) { status, bytes ->
+            when {
+                status == 200 -> parseTxResults(bytes)
+                status == 409 -> throw guardFailure(bytes)
+                // A query guard refusal (504 query_timeout, 413
+                // result_too_large, 507 out_of_memory): the statement
+                // rolled back and wrote no dedup receipt. Final.
+                errorCode(bytes) in GUARD_REFUSAL_CODES -> throw HogliteRejected(status, String(bytes))
+                // Never applied: the tenant does not exist, or the request
+                // was malformed before anything ran.
+                status == 400 || status == 404 -> throw HogliteRejected(status, String(bytes))
+                // 422 is a refusal only when the engine labels it one.
+                status == 422 ->
+                    if (errorCode(bytes) == CODE_REFUSED) {
+                        throw HogliteRejected(status, String(bytes))
+                    } else {
+                        throw HoglakeException.CommitOutcomeUnknown(txid, "unlabelled 422: ${String(bytes)}")
+                    }
+                // Anything else (a 500 or 502 from the engine or a proxy in
+                // front of it) may have followed an apply.
+                else -> throw HoglakeException.CommitOutcomeUnknown(txid, "hoglite answered $status: ${String(bytes)}")
             }
         }
     }
@@ -285,16 +328,28 @@ class HogliteClient(
         body: ByteArray?,
         timeoutMs: Long,
         method: String = "POST",
+        /** Set for a `tx`: its attempts can apply, so the call tracks whether one may have. */
+        txid: String? = null,
         parse: (Int, ByteArray) -> T,
     ): T {
         val deadline = System.nanoTime() + retryBudgetMs * 1_000_000
         var lastFailure: Throwable? = null
+        // True once an attempt of a tx may have applied. From then on the
+        // call ends committed or unknown, never "not committed".
+        var mayHaveApplied = false
+
+        fun unavailable(detail: String): HoglakeException.BackendUnavailable =
+            if (txid != null && mayHaveApplied) {
+                HoglakeException.CommitOutcomeUnknown(txid, detail)
+            } else {
+                HoglakeException.BackendUnavailable(detail)
+            }
         while (true) {
             val pin = tenantRoutes[tenant]
             val (pool, base) = routeFor(pin)
             val breaker = breakers.getValue(pool)
             if (!breaker.admit()) {
-                throw HoglakeException.BackendUnavailable(
+                throw unavailable(
                     "hoglite ${pool.name.lowercase()} pool circuit is open " +
                         "(${breaker.consecutiveFailures} consecutive failures); refusing fast for " +
                         "${breaker.openMs}ms rather than queueing behind timeouts",
@@ -303,9 +358,13 @@ class HogliteClient(
             // Never START an attempt that cannot fit the budget: cap
             // the attempt's timeout at what is left so the worst case is
             // the budget, not budget + one full timeout.
+            // A RETRY squeezed into the budget's last few milliseconds
+            // can only time out, and a tx attempt that timed out after
+            // being sent is outcome-unknown: it would turn a clean "not
+            // applied" exhaustion into a spurious unknown.
             val remainingMs = (deadline - System.nanoTime()) / 1_000_000
-            if (remainingMs <= 0) {
-                throw HoglakeException.BackendUnavailable(
+            if (remainingMs <= 0 || (lastFailure != null && remainingMs < MIN_RETRY_ATTEMPT_MS)) {
+                throw unavailable(
                     "hoglite ${pool.name.lowercase()} pool did not answer within the " +
                         "${retryBudgetMs}ms retry budget (last failure: ${lastFailure?.message})",
                 )
@@ -317,7 +376,9 @@ class HogliteClient(
                     // Shutdown, not a backend failure: restore the flag and
                     // stop retrying.
                     Thread.currentThread().interrupt()
-                    throw HoglakeException.BackendUnavailable(
+                    // the interrupted attempt may have been sent
+                    if (txid != null) mayHaveApplied = true
+                    throw unavailable(
                         "interrupted while calling hoglite (${pool.name.lowercase()} pool)",
                     )
                 } catch (e: Exception) {
@@ -328,6 +389,10 @@ class HogliteClient(
                     // owner loss, not a pool outage.
                     if (pin is Route.Owner) tenantRoutes.remove(tenant, pin)
                     breaker.onFailure()
+                    // Only a connect that never completed proves the
+                    // request was not sent; a timeout or reset after that
+                    // can follow a commit.
+                    if (txid != null && !neverSent(e)) mayHaveApplied = true
                     lastFailure = e
                     sleeper(RETRY_BACKOFF_MS)
                     continue
@@ -341,7 +406,24 @@ class HogliteClient(
                 }
                 503 -> {
                     // Owner lost mid-flight / transient infra: retryable.
+                    // hoglite labels a 503 it KNOWS did not apply; any
+                    // other 503 (an older engine, a proxy) might have.
+                    if (txid != null && errorCode(resp.body()) != CODE_NOT_APPLIED) mayHaveApplied = true
                     lastFailure = HogliteRejected(503, String(resp.body()))
+                    sleeper(RETRY_BACKOFF_MS)
+                }
+                504 -> {
+                    // A 504 the engine labels a query guard refusal
+                    // (query_timeout) is deterministic and rolled back:
+                    // final, not retried. Only the label tells it apart
+                    // from outcome_unknown or a gateway timeout.
+                    if (errorCode(resp.body()) in GUARD_REFUSAL_CODES) return parse(504, resp.body())
+                    // outcome_unknown: applied on an owner that then failed
+                    // before durability was confirmed (or a gateway timeout
+                    // in front of the engine). The same txid makes the
+                    // retry exactly-once: it finds the commit or applies it.
+                    if (txid != null) mayHaveApplied = true
+                    lastFailure = HogliteRejected(504, String(resp.body()))
                     sleeper(RETRY_BACKOFF_MS)
                 }
                 421 -> {
@@ -421,6 +503,16 @@ class HogliteClient(
     }
 
     // ---- wire codecs --------------------------------------------------------
+
+    /** The engine's outcome label (`code`) on an error answer, or null. */
+    private fun errorCode(bytes: ByteArray): String? =
+        runCatching { json.readValue<Map<String, Any?>>(bytes)["code"] as? String }.getOrNull()
+
+    /** True when [e] proves the request never left: the connection itself failed. */
+    private fun neverSent(e: Throwable): Boolean =
+        generateSequence(e) { it.cause }.take(8).any {
+            it is ConnectException || it is HttpConnectTimeoutException
+        }
 
     private fun HogliteStatement.toWire(): Map<String, Any?> =
         buildMap {
@@ -523,11 +615,26 @@ class HogliteClient(
                 circuitOpenMs = cfg.hogliteCircuitOpenMs,
             )
 
+        /** hoglite's label for a deterministic refusal (422). */
+        const val CODE_REFUSED = "refused"
+
+        /**
+         * hoglite's labels for a query guard refusal: deterministic for
+         * the same request and data, rolled back, no dedup receipt.
+         */
+        val GUARD_REFUSAL_CODES = setOf("query_timeout", "result_too_large", "out_of_memory")
+
+        /** hoglite's label for a failure it knows did not apply (503). */
+        const val CODE_NOT_APPLIED = "not_applied"
+
         /** The `client` half of hoglite's (client, txid) dedup key. */
         const val CLIENT_NAME = "hoglake"
 
         /** Pause between retryable attempts; 421 re-routes skip it. */
         const val RETRY_BACKOFF_MS = 200L
+
+        /** The least budget a retry (not a first attempt) is started with. */
+        const val MIN_RETRY_ATTEMPT_MS = 50L
 
         private val STMT_INDEX_REGEX = Regex("expectation failed at statement (\\d+)")
     }

@@ -144,6 +144,11 @@ internal fun errorBody(cause: HoglakeException): Pair<HttpStatusCode, ApiErrorDt
         // Retry-After shape, its own code, because the operations
         // response to "the database did not answer" is not the response
         // to "one catalog is hot".
+        // A commit that may have landed: retryable like the arm below,
+        // its own code because "your commit may be durable" is not "the
+        // database did not answer". Before BackendUnavailable: it is one.
+        is HoglakeException.CommitOutcomeUnknown ->
+            HttpStatusCode.ServiceUnavailable to apiError("commit_outcome_unknown", cause)
         is HoglakeException.BackendUnavailable ->
             HttpStatusCode.ServiceUnavailable to apiError("backend_unavailable", cause)
     }

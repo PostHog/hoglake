@@ -2248,8 +2248,11 @@ class HogliteCatalogStore(
     ): HoglakeException =
         when (r.status) {
             404 -> missingCatalog(catalog)
-            // A 422 from hoglite is a SQL error — constraint violation or
-            // a malformed statement. Both are this store's bug or a bad
+            // A 422 reaching here is hoglite's labelled `refused`: a SQL
+            // error (constraint violation, malformed statement) that
+            // rolled back. The client turns an unlabelled 422 into
+            // CommitOutcomeUnknown, so this arm never sees a commit that
+            // may be durable. Both causes are this store's bug or a bad
             // input the guards should have named; surface as Validation
             // with the engine's message rather than a bare 500.
             422 -> {
