@@ -214,7 +214,17 @@ class HogliteCatalogStore(
             name,
         ) { HoglakeException.AlreadyExists("catalog '$name' already exists") }
         reg.add("INSERT INTO catalogs(name, data_path, tenant) VALUES (?, ?, ?)", name, dataPath, tenantId)
-        runTx(REGISTRY_TENANT, freshTxid("create-catalog"), null, reg, fenced = false)
+        try {
+            runTx(REGISTRY_TENANT, freshTxid("create-catalog"), null, reg, fenced = false)
+        } catch (e: HoglakeException.AlreadyExists) {
+            // A concurrent create won publication. Only our unpublished,
+            // incarnation-unique tenant is safe to reclaim here.
+            runCatching {
+                client.release(tenantId)
+                client.deleteTenant(tenantId)
+            }.onFailure { log.warn(it) { "could not reclaim unpublished tenant '$tenantId'" } }
+            throw e
+        }
         tenantCache[name] = tenantId
         return getCatalog(name)
     }
@@ -264,7 +274,7 @@ class HogliteCatalogStore(
         // too: skip the fence and take the row.
         val info =
             try {
-                meta(catalog)
+                metaOnTenant(catalog, tenantId)
             } catch (e: HoglakeException.NotFound) {
                 runTx(
                     REGISTRY_TENANT,
@@ -288,7 +298,12 @@ class HogliteCatalogStore(
         // checks and the tenant deletion below. The fence tx itself
         // opts out of the fence (a retried drop after a partial failure
         // must be able to proceed).
-        fun countNow(sql: String): Long = queryCatalog(catalog, sql).firstRow()!!.get(0).asLong()
+        fun countNow(sql: String): Long =
+            try {
+                client.query(tenantId, sql, emptyList()).firstRow()!!.get(0).asLong()
+            } catch (r: HogliteRejected) {
+                throw mapRejected(catalog, r)
+            }
 
         val fenceNow = HogliteSchema.now()
         val fence = HogliteTx()
@@ -1449,15 +1464,37 @@ class HogliteCatalogStore(
             )
     }
 
+    private val metaSql =
+        "SELECT name, data_path, next_snapshot - 1, schema_version, earliest_snapshot_id, " +
+            "earliest_snapshot_time, snapshot_retention_seconds, consumer_floor FROM meta WHERE id = 1"
+
     internal fun meta(catalog: String): MetaRow {
         val row =
-            queryCatalog(
-                catalog,
-                "SELECT name, data_path, next_snapshot - 1, schema_version, earliest_snapshot_id, " +
-                    "earliest_snapshot_time, snapshot_retention_seconds, consumer_floor FROM meta WHERE id = 1",
-            ).firstRow()
+            queryCatalog(catalog, metaSql).firstRow()
                 ?: throw HoglakeException.NotFound("catalog '$catalog'")
-        return MetaRow(
+        return metaRow(row)
+    }
+
+    /**
+     * [meta] addressed at an exact tenant id, bypassing the name→tenant
+     * cache. The drop path must talk to the incarnation the registry row
+     * pins, never to whatever a stale cache entry resolves to.
+     */
+    private fun metaOnTenant(
+        catalog: String,
+        tenant: String,
+    ): MetaRow {
+        val row =
+            try {
+                client.query(tenant, metaSql, emptyList()).firstRow()
+            } catch (r: HogliteRejected) {
+                throw mapRejected(catalog, r)
+            } ?: throw HoglakeException.BackendUnavailable("catalog '$catalog' has no metadata row")
+        return metaRow(row)
+    }
+
+    private fun metaRow(row: List<Any?>): MetaRow =
+        MetaRow(
             name = row[0].asString(),
             dataPath = row[1].asString(),
             head = row[2].asLong(),
@@ -1467,7 +1504,6 @@ class HogliteCatalogStore(
             retentionSeconds = row[6].asLongOrNull(),
             consumerFloor = row[7].asLong() != 0L,
         )
-    }
 
     /** Resolve the read snapshot for a read path, with hoglake's guard order and typed refusals. */
     internal fun resolveRead(
@@ -1892,8 +1928,7 @@ class HogliteCatalogStore(
                 } else {
                     tx.statements()
                 }
-            val tenant = resolveTenant(catalog)
-            val results = client.tx(tenant, txid, fp, statements)
+            val results = withResolvedTenant(catalog) { tenant -> client.tx(tenant, txid, fp, statements) }
             if (fenced) results.subList(1, results.size) else results
         } catch (g: HogliteGuardFailure) {
             if (fenced) {
@@ -1904,12 +1939,6 @@ class HogliteCatalogStore(
             }
             throw tx.classify(g)
         } catch (r: HogliteRejected) {
-            // The engine's 404 can mean the tenant id is stale (a drop +
-            // recreate minted a new one): evict so the NEXT call
-            // re-resolves. This call still fails with the catalog-404,
-            // which is the truth a caller holding the old incarnation
-            // should see.
-            if (r.status == 404) tenantCache.entries.removeIf { it.key == catalog }
             throw mapRejected(catalog, r)
         }
 
@@ -1919,12 +1948,28 @@ class HogliteCatalogStore(
         vararg args: Any?,
     ): HogliteQueryResult =
         try {
-            val tenant = resolveTenant(catalog)
-            client.query(tenant, sql, args.toList())
+            withResolvedTenant(catalog) { tenant -> client.query(tenant, sql, args.toList()) }
         } catch (r: HogliteRejected) {
-            if (r.status == 404) tenantCache.entries.removeIf { it.key == catalog }
             throw mapRejected(catalog, r)
         }
+
+    /** A tenant 404 applies no statements; refresh a stale incarnation once. */
+    private fun <T> withResolvedTenant(
+        catalog: String,
+        call: (String) -> T,
+    ): T {
+        repeat(2) { attempt ->
+            val tenant = resolveTenant(catalog)
+            try {
+                return call(tenant)
+            } catch (r: HogliteRejected) {
+                if (r.status != 404) throw r
+                evictTenant(catalog, tenant)
+                if (attempt == 1 || catalog == REGISTRY_TENANT) throw r
+            }
+        }
+        error("unreachable")
+    }
 
     internal fun mapRejected(
         catalog: String,

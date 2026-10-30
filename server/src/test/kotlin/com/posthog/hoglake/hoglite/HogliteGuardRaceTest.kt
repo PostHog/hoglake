@@ -674,4 +674,207 @@ class HogliteGuardRaceTest {
         val ts = q(c, "SELECT ts FROM snapshots WHERE id = ?", r.snapshotId).firstRow()!![0].asString()
         assertThat(ts).isGreaterThanOrEqualTo("2031-01-01T00:00:00.000Z")
     }
+
+    @Test
+    fun `a drop through a replica with a stale tenant cache must not take a live recreated catalog`() {
+        val c = freshCatalog()
+        pstore.getCatalog(c) // Replica X caches name -> T1 through the observable proxy.
+        val oldTenant = pstore.resolveTenant(c)
+        // Replica Y drops, recreates and populates the name.
+        store.dropCatalog(c, "y", "drop")
+        store.createCatalog(c, "s3://hoglake-it/$c")
+        store.createNamespace(c, "ns")
+        store.createTable(c, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        store.commit(c, appendReq(c, "live.parquet"))
+        // Replica X must consult the pinned registry incarnation, never
+        // its stale cache (even a successful 404 retry would mask that).
+        seen.clear()
+        val r = runCatching { pstore.dropCatalog(c, "x", "drop") }
+        assertThat(r.exceptionOrNull()).isInstanceOf(HoglakeException.CatalogNotEmpty::class.java)
+        assertThat(seen).noneMatch { "/v1/t/$oldTenant/" in it }
+        assertThat(store.listCatalogs().map { it.name }).contains(c)
+        assertThat(store.listFiles(c, "ns", "t")).hasSize(1)
+    }
+
+    @Test
+    fun `a replica with a stale tenant cache serves a live catalog`() {
+        val d = freshCatalog()
+        store.getCatalog(d)
+        pstore.dropCatalog(d, "y", "drop")
+        pstore.createCatalog(d, "s3://hoglake-it/$d")
+        pstore.createNamespace(d, "ns")
+        pstore.createTable(d, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        val first = runCatching { store.commit(d, appendReq(d, "w1.parquet")) }
+        val second = runCatching { store.commit(d, appendReq(d, "w2.parquet")) }
+        assertThat(first.isSuccess).isTrue()
+        assertThat(second.isSuccess).isTrue()
+        assertThat(store.listFiles(d, "ns", "t")).hasSize(2)
+    }
+
+    @Test
+    fun `a consumer registered below a protected sweep's planned floor keeps its history`() {
+        val (c, t) = setup()
+        repeat(3) { store.commit(c, appendReq(c, "consumer$it.parquet")) }
+        HogliteOptions(store).patch(c, PatchField.Set(1L), consumerFloor = true, author = "test", message = "protect")
+        ageSnapshots(c)
+        val hook =
+            Hook({ m, p, b -> isTx(m, p) && "UPDATE meta SET earliest_snapshot_id" in b }, before = {
+                store.commitOffset(c, "late-consumer", t.tableUuid, 1)
+            })
+        hooks += hook
+        assertThatThrownBy {
+            HogliteExpiry(pstore, 100, 10_000).runOnce(c, 100, MaintenanceTrigger.MANUAL)
+        }.isInstanceOf(HoglakeException.CommitConflict::class.java)
+        assertThat(hook.remaining).isZero()
+        assertThat(store.getCatalog(c).earliestSnapshotId).isZero()
+        assertThat(n(c, "SELECT COUNT(*) FROM snapshots WHERE id = 1")).isEqualTo(1L)
+    }
+
+    @Test
+    fun `a commit re-checks its read snapshot against the in-transaction expiry floor`() {
+        val (c, _) = setup()
+        repeat(3) { store.commit(c, appendReq(c, "floor$it.parquet")) }
+        shortRetention(c)
+        ageSnapshots(c)
+        val hook =
+            Hook({ m, p, b -> isTx(m, p) && "expired-read.parquet" in b }, before = {
+                HogliteExpiry(store, 100, 10_000).runOnce(c, 100, MaintenanceTrigger.MANUAL)
+            })
+        hooks += hook
+        assertThatThrownBy { pstore.commit(c, appendReq(c, "expired-read.parquet", read = 1)) }
+            .isInstanceOf(HoglakeException.Expired::class.java)
+        assertThat(hook.remaining).isZero()
+        assertThat(store.getCatalog(c).earliestSnapshotId).isGreaterThan(1L)
+        assertThat(n(c, "SELECT COUNT(*) FROM files WHERE path LIKE '%expired-read.parquet'")).isZero()
+    }
+
+    @Test
+    fun `an upload renewed after sweep planning is not queued for removal`() {
+        val c = freshCatalog()
+        val owner = UUID.randomUUID()
+        val claim = store.uploads.claim(c, UUID.randomUUID(), owner, "s3://hoglake-it/$c/up", "data")
+        store.runTx(
+            c,
+            HogliteCatalogStore.freshTxid("age-upload"),
+            null,
+            HogliteTx().apply {
+                add("UPDATE uploads SET expires_at = '2001-01-01T00:00:00.000Z'")
+            },
+        )
+        val hook =
+            Hook({ m, p, b -> isTx(m, p) && "UPDATE uploads SET state = 'abandoned', scheduled_at" in b }, before = {
+                assertThat(store.uploads.renew(c, owner)).isEqualTo(1)
+            })
+        hooks += hook
+        assertThat(pstore.uploads.scheduleExpired(c, 100)).isZero()
+        assertThat(hook.remaining).isZero()
+        assertThat(n(c, "SELECT COUNT(*) FROM removals WHERE path = ?", claim.path)).isZero()
+        assertThat(q(c, "SELECT state FROM uploads WHERE path = ?", claim.path).firstRow()!![0]).isEqualTo("active")
+    }
+
+    @Test
+    fun `cleanup only deletes objects for removal rows it actually acquired`() {
+        val c = freshCatalog()
+        val key = "$c/unclaimed.parquet"
+        val path = "s3://hoglake-it/$key"
+        s3().use {
+            it.putObject(
+                { b -> b.bucket("hoglake-it").key(key) },
+                software.amazon.awssdk.core.sync.RequestBody.fromString("keep"),
+            )
+        }
+        store.runTx(
+            c,
+            HogliteCatalogStore.freshTxid("queue"),
+            null,
+            HogliteTx().apply {
+                add(
+                    "INSERT INTO removals(path, file_kind, reason, queued_snapshot, queued_at) " +
+                        "VALUES (?, 'data', 'snapshot_expiry', 0, ?)",
+                    path,
+                    HogliteSchema.now(),
+                )
+            },
+        )
+        val hook =
+            Hook({ m, p, b -> isTx(m, p) && "UPDATE removals SET claimed_at = ?, claimed_by = ?" in b }, before = {
+                store.runTx(
+                    c,
+                    HogliteCatalogStore.freshTxid("other-worker"),
+                    null,
+                    HogliteTx().apply {
+                        add(
+                            "UPDATE removals SET claimed_at = ?, claimed_by = 'other-worker' WHERE path = ?",
+                            HogliteSchema.now(),
+                            path,
+                        )
+                    },
+                )
+            })
+        hooks += hook
+        val cfg =
+            com.posthog.hoglake.Config(
+                database = com.posthog.hoglake.DatabaseBackend.HOGLITE,
+                hogliteUrl = "http://127.0.0.1:1",
+                s3Endpoint = s3Endpoint,
+                s3Region = "us-east-1",
+                s3AccessKey = minio.userName,
+                s3SecretKey = minio.password,
+                s3PathStyle = true,
+            )
+        HogliteCleanup(cfg, pstore).use { cleanup ->
+            val result = cleanup.runOnce(c, 100, MaintenanceTrigger.MANUAL)
+            assertThat(result.objectsRemoved).isZero()
+            assertThat(result.removed + result.missing).isZero()
+        }
+        assertThat(hook.remaining).isZero()
+        s3().use { assertThat(it.headObject { b -> b.bucket("hoglake-it").key(key) }.contentLength()).isEqualTo(4L) }
+        assertThat(
+            q(c, "SELECT claimed_by, drained_at FROM removals WHERE path = ?", path).firstRow(),
+        ).containsExactly("other-worker", null)
+    }
+
+    @Test
+    fun `a transaction refreshes a stale incarnation without a preceding read`() {
+        val c = freshCatalog()
+        pstore.dropCatalog(c, "test", "old")
+        pstore.createCatalog(c, "s3://hoglake-it/$c")
+        store.runTx(
+            c,
+            HogliteCatalogStore.freshTxid("refresh"),
+            null,
+            HogliteTx().apply {
+                add("UPDATE meta SET consumer_floor = 1 WHERE id = 1")
+            },
+        )
+        assertThat(pstore.getCatalog(c).consumerFloor).isTrue()
+    }
+
+    @Test
+    fun `a concurrent duplicate create reclaims only its own unpublished tenant`() {
+        val c = "race${catalogCounter++}"
+        var loserTenant = ""
+        hooks +=
+            Hook({ m, p, b ->
+                if (isTx(m, p) && "bootstrap:v1" in b && "/hoglake-$c-" in p) {
+                    loserTenant = p.substringAfter("/v1/t/").substringBefore("/tx")
+                    true
+                } else {
+                    false
+                }
+            })
+        val publish =
+            Hook({ m, p, b -> isTx(m, p) && "INSERT INTO catalogs" in b && c in b }, before = {
+                store.createCatalog(c, "s3://hoglake-it/$c")
+            })
+        hooks += publish
+        assertThatThrownBy { pstore.createCatalog(c, "s3://hoglake-it/$c") }
+            .isInstanceOf(HoglakeException.AlreadyExists::class.java)
+        assertThat(publish.remaining).isZero()
+        assertThat(loserTenant).isNotEmpty()
+        assertThat(store.resolveTenant(c)).isNotEqualTo(loserTenant)
+        assertThatThrownBy { client.query(loserTenant, "SELECT 1", emptyList()) }
+            .isInstanceOf(HogliteRejected::class.java).hasMessageContaining("404")
+        assertThat(store.getCatalog(c).name).isEqualTo(c)
+    }
 }

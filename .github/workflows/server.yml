@@ -1,3 +1,14 @@
+# Live hoglite CI artifact setup (manual until an immutable build is published):
+# 1. In PostHog/hoglite, build the reviewed engine commit:
+#      git checkout 6755620df2906495ff870de49be9a11cf7e6097b
+#      CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -trimpath -o hoglited ./cmd/hoglited
+#      sha256sum hoglited
+# 2. Upload those exact bytes to an immutable, CI-readable release URL.
+# 3. Replace BOTH inline literals in the Fetch hoglited step below in a reviewed
+#    commit (HOGLITED_URL and HOGLITED_SHA256), then confirm the two live suites
+#    execute with zero skips in the hosted run. Do not use Actions variables.
+# No artifact is published by this workflow; an empty pin annotates the coverage
+# gap as an error and in the job summary. It is NOT an active live-engine gate.
 name: Server
 
 on:
@@ -97,21 +108,21 @@ jobs:
       # rate-limit flake source). :test includes the schema-equivalence gate
       # (fold(migrations) == schema.sql).
       #
-      # The hoglite-backend suites (HogliteBackendIntegrationTest,
-      # HogliteGuardRaceTest) run a real hoglited. The binary comes from
-      # the digest-pinned artifact named by the HOGLITED_URL repo/org
-      # variable, verified against HOGLITED_SHA256; with the variables
-      # unset the suites skip (loudly) — a repo without the artifact
-      # configured loses the live-engine coverage, not the build.
+      # The URL and digest are reviewed together with each engine upgrade.
       - name: Fetch hoglited (hoglite backend suites)
         shell: bash
+        env:
+          HOGLITED_URL: ""
+          HOGLITED_SHA256: "d8477d0ecd33e9a7108e8888a3cf78ac5819c23e3b63dd8b35087ac7a722bb44"
         run: |
-          if [ -z "${{ vars.HOGLITED_URL }}" ]; then
-            echo "::warning::HOGLITED_URL not set — the live hoglite backend suites will skip"
+          if [ -z "$HOGLITED_URL" ] || [ -z "$HOGLITED_SHA256" ]; then
+            echo "::error title=Live hoglite coverage disabled::No inline hoglited artifact pin. HogliteBackendIntegrationTest and HogliteGuardRaceTest WILL SKIP. Follow the publishing steps in this workflow header."
+            echo "## Live hoglite coverage DISABLED" >> "$GITHUB_STEP_SUMMARY"
+            echo "No reviewed artifact URL/digest is configured. Both live-engine suites skip; this run is not a hoglite merge gate. See the workflow header for the exact activation steps." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          curl -fsSL "${{ vars.HOGLITED_URL }}" -o /tmp/hoglited
-          echo "${{ vars.HOGLITED_SHA256 }}  /tmp/hoglited" | sha256sum -c -
+          curl -fsSL "$HOGLITED_URL" -o /tmp/hoglited
+          echo "$HOGLITED_SHA256  /tmp/hoglited" | sha256sum -c -
           chmod +x /tmp/hoglited
           echo "HOGLITE_BINARY=/tmp/hoglited" >> "$GITHUB_ENV"
 
