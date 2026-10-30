@@ -178,3 +178,18 @@ suite uses, and covers the catalog/namespace/table lifecycle, commit OCC and
 idempotent replay, stale-read conflicts, drop+recreate incarnation guards,
 offset monotonicity, upload claims, atomic table-creation, alters, views,
 options, truncate, partition debt, and the maintenance status surface.
+
+CI builds that binary from a pinned PostHog/hoglite commit with
+`ci/build-hoglited.sh` (bit-reproducible; the script refuses any digest
+other than the pinned one) and fails `server-test` if any hoglite test
+class skips. The pins (`HOGLITE_COMMIT`, `HOGLITE_GO_VERSION`,
+`HOGLITED_SHA256`) and the reproduction recipe are on the `server-test`
+job in `.github/workflows/server.yml`. To run the live suites locally
+with the same bytes:
+
+```sh
+git clone git@github.com:PostHog/hoglite.git /tmp/hoglite
+git -C /tmp/hoglite checkout <HOGLITE_COMMIT>
+HOGLITE_GO_VERSION=1.27.1 ci/build-hoglited.sh /tmp/hoglite <HOGLITE_COMMIT> <HOGLITED_SHA256> /tmp/hoglited
+cd server && HOGLITE_BINARY=/tmp/hoglited ./gradlew :test --tests 'com.posthog.hoglake.hoglite.*'
+```

@@ -1,14 +1,3 @@
-# Live hoglite CI artifact setup (manual until an immutable build is published):
-# 1. In PostHog/hoglite, build the reviewed engine commit:
-#      git checkout 6755620df2906495ff870de49be9a11cf7e6097b
-#      CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -trimpath -o hoglited ./cmd/hoglited
-#      sha256sum hoglited
-# 2. Upload those exact bytes to an immutable, CI-readable release URL.
-# 3. Replace BOTH inline literals in the Fetch hoglited step below in a reviewed
-#    commit (HOGLITED_URL and HOGLITED_SHA256), then confirm the two live suites
-#    execute with zero skips in the hosted run. Do not use Actions variables.
-# No artifact is published by this workflow; an empty pin annotates the coverage
-# gap as an error and in the job summary. It is NOT an active live-engine gate.
 name: Server
 
 on:
@@ -89,6 +78,19 @@ jobs:
     if: needs.changes.outputs.server == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # The hoglite engine the live suites run against. Change all three
+    # together in one reviewed commit. Reproduce the binary on any
+    # linux/amd64 host with nothing but the commit and the Go version:
+    #   git clone https://github.com/PostHog/hoglite.git && cd hoglite   # internal
+    #   git checkout <HOGLITE_COMMIT>
+    #   CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOAMD64=v1 GOTOOLCHAIN=local \
+    #     go build -trimpath -buildvcs=false -o hoglited ./cmd/hoglited
+    #   sha256sum hoglited   # must print HOGLITED_SHA256
+    # ci/build-hoglited.sh runs exactly that and fails on any other digest.
+    env:
+      HOGLITE_COMMIT: 54dc61996753867d48940a602a7f57968a5b3cd0
+      HOGLITE_GO_VERSION: "1.27.1"
+      HOGLITED_SHA256: 1062fbdeef119cf51c96b79a3bc6d7d11056c98d9d159df521ada83c193950ad
     concurrency:
       group: server-test-${{ github.ref }}
       cancel-in-progress: true
@@ -107,28 +109,139 @@ jobs:
       # MinIO build — both unauthenticated Docker Hub pulls, the usual
       # rate-limit flake source). :test includes the schema-equivalence gate
       # (fold(migrations) == schema.sql).
+
+      # ---- Live hoglite engine -------------------------------------
+      # HogliteBackendIntegrationTest, HogliteGuardRaceTest and
+      # HogliteObjectPrefixIntegrationTest start a real hoglited from
+      # HOGLITE_BINARY and skip without one. This job builds it from
+      # the pinned PostHog/hoglite commit (job env above) and then
+      # requires every hoglite test class to have run with zero skips.
       #
-      # The URL and digest are reviewed together with each engine upgrade.
-      - name: Fetch hoglited (hoglite backend suites)
-        shell: bash
+      # PostHog/hoglite is an INTERNAL repository and this one is
+      # public, so the job token cannot read it. A GitHub App with only
+      # Contents: read, installed on PostHog/hoglite alone, mints a
+      # one-hour token scoped to that repository (secrets
+      # HOGLITE_READ_APP_ID, HOGLITE_READ_APP_PRIVATE_KEY). Revoke by
+      # uninstalling the app from hoglite; rotate by generating a new
+      # private key and replacing the secret.
+      # Deploy-key variant (if the org enables deploy keys): delete the
+      # token step, give the checkout `ssh-key: ${{ secrets.HOGLITE_DEPLOY_KEY }}`
+      # in place of `token:`, and test that secret in HAS_APP.
+      #
+      # Missing engine = failed job, with ONE exception: a pull request
+      # from a fork gets no secrets, so it cannot read hoglite. That run
+      # skips the live suites, says so in an annotation and the job
+      # summary, and prints the skip counts. Every other run (same-repo
+      # PRs, pushes to main) fails if the secrets are absent, the pinned
+      # commit is unreachable, the digest differs, or any hoglite test
+      # skips.
+      - name: Decide the hoglite engine source
+        id: hoglite
         env:
-          HOGLITED_URL: ""
-          HOGLITED_SHA256: "d8477d0ecd33e9a7108e8888a3cf78ac5819c23e3b63dd8b35087ac7a722bb44"
+          HAS_APP: ${{ secrets.HOGLITE_READ_APP_ID != '' && secrets.HOGLITE_READ_APP_PRIVATE_KEY != '' }}
+          FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
         run: |
-          if [ -z "$HOGLITED_URL" ] || [ -z "$HOGLITED_SHA256" ]; then
-            echo "::error title=Live hoglite coverage disabled::No inline hoglited artifact pin. HogliteBackendIntegrationTest and HogliteGuardRaceTest WILL SKIP. Follow the publishing steps in this workflow header."
-            echo "## Live hoglite coverage DISABLED" >> "$GITHUB_STEP_SUMMARY"
-            echo "No reviewed artifact URL/digest is configured. Both live-engine suites skip; this run is not a hoglite merge gate. See the workflow header for the exact activation steps." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
+          if [[ $HAS_APP == true ]]; then
+            echo "mode=live" >> "$GITHUB_OUTPUT"
+          elif [[ $FORK_PR == true ]]; then
+            echo "::warning title=Live hoglite suites skipped (fork PR)::A fork PR gets no secrets and cannot read the internal hoglite repo. The hoglite live suites skip in this run; the counts are in the job summary. A maintainer run is still required."
+            echo "mode=fork-skip" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error title=hoglite engine unavailable::The HOGLITE_READ_APP_ID / HOGLITE_READ_APP_PRIVATE_KEY secrets are not set, so hoglited ${HOGLITE_COMMIT} cannot be built and the live hoglite suites would skip. Only fork PRs may skip them."
+            exit 1
           fi
-          curl -fsSL "$HOGLITED_URL" -o /tmp/hoglited
-          echo "$HOGLITED_SHA256  /tmp/hoglited" | sha256sum -c -
-          chmod +x /tmp/hoglited
-          echo "HOGLITE_BINARY=/tmp/hoglited" >> "$GITHUB_ENV"
+
+      - name: Mint a hoglite read token
+        id: hoglite-token
+        if: steps.hoglite.outputs.mode == 'live'
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        # The JWT issuer accepts the app's numeric ID or its client ID.
+        with:
+          client-id: ${{ secrets.HOGLITE_READ_APP_ID }}
+          private-key: ${{ secrets.HOGLITE_READ_APP_PRIVATE_KEY }}
+          owner: PostHog
+          repositories: hoglite
+          permission-contents: read
+
+      - name: Check out PostHog/hoglite (pinned)
+        id: hoglite-checkout
+        if: steps.hoglite.outputs.mode == 'live'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: PostHog/hoglite
+          ref: ${{ env.HOGLITE_COMMIT }}
+          token: ${{ steps.hoglite-token.outputs.token }}
+          persist-credentials: false
+          path: .hoglite-src
+
+      - name: Explain a failed hoglite checkout
+        if: failure() && (steps.hoglite-token.outcome == 'failure' || steps.hoglite-checkout.outcome == 'failure')
+        run: |
+          echo "::error title=hoglite engine unavailable::Could not fetch PostHog/hoglite at ${HOGLITE_COMMIT} (expected hoglited sha256 ${HOGLITED_SHA256}). Either the read app lost access or the pinned commit is no longer reachable; re-pin HOGLITE_COMMIT and HOGLITED_SHA256 together in server.yml."
+          exit 1
+
+      - name: Set up Go (hoglited build)
+        if: steps.hoglite.outputs.mode == 'live'
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: ${{ env.HOGLITE_GO_VERSION }}
+          cache-dependency-path: .hoglite-src/go.sum
+
+      - name: Build hoglited and verify its digest
+        if: steps.hoglite.outputs.mode == 'live'
+        run: |
+          ci/build-hoglited.sh .hoglite-src "$HOGLITE_COMMIT" "$HOGLITED_SHA256" "$RUNNER_TEMP/hoglited"
+          echo "HOGLITE_BINARY=$RUNNER_TEMP/hoglited" >> "$GITHUB_ENV"
 
       - name: Server tests + ktlint
         working-directory: server
         run: ./gradlew --no-daemon :test :ktlintCheck :checkOpenapiVersion
+
+      # The hoglite tests skip (assumeTrue) without an engine, and a
+      # skip passes Gradle. This step reads the JUnit reports so a skip
+      # (or a missing report) fails the job, and puts the counts in the
+      # job summary. A fork PR only reports its counts (see above). It
+      # also runs after a test failure, so the summary always has them.
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        if: ${{ !cancelled() && steps.hoglite.outputs.mode != '' }}
+      - name: Require the hoglite suites to run with zero skips
+        if: ${{ !cancelled() && steps.hoglite.outputs.mode != '' }}
+        env:
+          MODE: ${{ steps.hoglite.outputs.mode }}
+        run: |
+          # Every report in the hoglite package or of a Hoglite* class
+          # anywhere, and the three live-engine classes by name, so a
+          # class that never ran fails too. A class that needs the engine
+          # but has another name must be added to `required`.
+          dir=server/build/test-results/test
+          required=(HogliteBackendIntegrationTest HogliteGuardRaceTest HogliteObjectPrefixIntegrationTest)
+          reports=()
+          for cls in "${required[@]}"; do
+            reports+=("$dir/TEST-com.posthog.hoglake.hoglite.${cls}.xml")
+          done
+          shopt -s nullglob
+          for f in "$dir"/TEST-com.posthog.hoglake.hoglite.*.xml "$dir"/TEST-*.Hoglite*.xml; do
+            [[ " ${reports[*]} " == *" $f "* ]] || reports+=("$f")
+          done
+          status=0
+          uv run --no-project --with defusedxml==0.7.1 python ci/check_live_results.py \
+            "${reports[@]}" > "$RUNNER_TEMP/hoglite-counts.txt" 2>&1 || status=$?
+          cat "$RUNNER_TEMP/hoglite-counts.txt"
+          tests=$(grep -o '[0-9]* tests;' "$RUNNER_TEMP/hoglite-counts.txt" | awk '{n+=$1} END {print n+0}')
+          skipped=$(grep -o "'skipped': [0-9]*" "$RUNNER_TEMP/hoglite-counts.txt" | awk '{n+=$2} END {print n+0}')
+          line="${tests} hoglite tests, ${skipped} skipped (engine ${HOGLITE_COMMIT:0:12}, sha256 ${HOGLITED_SHA256:0:12})"
+          if [[ $MODE == fork-skip ]]; then
+            title="Live hoglite suites SKIPPED (fork PR, no secrets): ${line}"
+            status=0
+          elif [[ $status == 0 ]]; then
+            title="Live hoglite suites: ${line}"
+          else
+            title="Live hoglite suites FAILED the zero-skip gate: ${line}"
+            echo "::error title=hoglite suites incomplete::${line}. Every hoglite test class must run with zero skips, failures and errors."
+          fi
+          echo "$title"
+          { echo "## ${title}"; echo '```'; cat "$RUNNER_TEMP/hoglite-counts.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
 
   trino-test:
     # The connector lives in PostHog/trino (repo PR #1); this runs the

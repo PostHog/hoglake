@@ -219,6 +219,18 @@ tasks.test {
         .dir(layout.projectDirectory.dir("../pyhoglake/tests/vectors"))
         .withPropertyName("sharedVectors")
         .withPathSensitivity(PathSensitivity.RELATIVE)
+    // The hoglite live suites skip without HOGLITE_BINARY (CI builds it
+    // from a pinned commit, see server.yml). The engine is an input, so
+    // setting, unsetting or swapping it re-runs :test instead of leaving
+    // UP-TO-DATE reports from another engine (or from none) behind.
+    val hogliteBinary = providers.environmentVariable("HOGLITE_BINARY").orNull.orEmpty()
+    inputs.property("hogliteBinarySet", hogliteBinary.isNotEmpty())
+    if (hogliteBinary.isNotEmpty()) {
+        inputs
+            .file(hogliteBinary)
+            .withPropertyName("hogliteBinary")
+            .withPathSensitivity(PathSensitivity.NONE)
+    }
     // jazzer-junit self-attaches its instrumentation agent (ByteBuddy)
     // for the corpus replay of the fuzz targets. The flag arrived to
     // silence the four-line JEP 451 warning a dynamic attach prints

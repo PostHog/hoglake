@@ -2845,7 +2845,7 @@ also pass against that upstream revision.
 Additional engine regression probes keep a billion-step SQLite read active
 on both read APIs: concurrent durable commits measured 11.9–21.1 ms against
 a 500 ms asserted ceiling on the upstream fixture. The three-mode
-`TestReadSnapshotReleasesAtOwnDurableBasis` separately gates successive
+`TestReadReleasesAtOwnDurableBasis` separately gates successive
 segment PUTs for `/query`, read-only `/tx`, and a failing scalar guard:
 even the guard's diagnostic must not reveal an undurable value. Upstream
 already supplies those guarantees; these are test-only regressions, not a
