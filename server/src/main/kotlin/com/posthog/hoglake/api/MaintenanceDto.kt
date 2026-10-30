@@ -242,6 +242,11 @@ data class CompactionResultDto(
      * bucket claim. See CompactionResult.bucketsSkippedClaimed.
      */
     val bucketsSkippedClaimed: Long,
+    /**
+     * Object-prefix groups refused in metadata with no nameable prefix.
+     * See CompactionResult.objectPrefixUnresolvable.
+     */
+    val objectPrefixUnresolvable: Long,
 )
 
 fun CompactionResult.toDto() =
@@ -278,6 +283,7 @@ fun CompactionResult.toDto() =
         groupsRetired = groupsRetired,
         filesUnranged = filesUnranged,
         bucketsSkippedClaimed = bucketsSkippedClaimed,
+        objectPrefixUnresolvable = objectPrefixUnresolvable,
     )
 
 data class RehydrateResultDto(
@@ -398,6 +404,7 @@ private val COMPACTION_COUNTERS_ADDED_LATER =
         "groups_retired",
         "files_unranged",
         "buckets_skipped_claimed",
+        "object_prefix_unresolvable",
     )
 
 /**

@@ -502,10 +502,10 @@ object Metrics {
      * uncounted: they re-plan on the next run, so a line for them is
      * noise rather than signal.
      *
-     * `object_prefix_layout` counts TABLES, one per sweep that planned
-     * one: a table with the object-prefix layout is not compacted until
-     * compaction writes under the layout, so its small files accumulate,
-     * and this is the line that says how many tables that is.
+     * `object_prefix_unresolvable` counts groups of a table with the
+     * object-prefix layout refused in metadata because their prefix
+     * cannot be named (CompactionResult.objectPrefixUnresolvable): a
+     * broken invariant that re-refuses every sweep, so it needs a line.
      */
     fun compactionSkipped(
         catalog: String,

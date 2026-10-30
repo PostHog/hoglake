@@ -95,6 +95,8 @@ const INT64_FIELDS = new Set([
   "failed",
   "transient",
   "stats_skipped_below_floor",
+  // Object-prefix files the hydrator quarantined (HydratorSweepResult).
+  "quarantined",
   "requeued",
   "snapshots_expired",
   "data_files_queued",
@@ -195,6 +197,8 @@ const INT64_FIELDS = new Set([
   "files_unranged",
   // Pre-probe bucket-claim skips (CompactionResult).
   "buckets_skipped_claimed",
+  // Object-prefix groups with no nameable prefix (CompactionResult).
+  "object_prefix_unresolvable",
   "violations",
 ]);
 

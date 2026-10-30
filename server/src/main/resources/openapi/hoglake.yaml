@@ -3990,8 +3990,11 @@ components:
             flag is on no response yet: GET /scan returns such a file as
             `provided`, indistinguishable from a proven one, and no
             endpoint applies the per-value predicate (`stats_state =
-            'provided' AND NOT prefix_quarantined`). The name cannot
-            change while the option is on.
+            'provided' AND NOT prefix_quarantined`). Compaction takes only
+            files that meet it as inputs and writes each output under its
+            group's prefix, with stats that prove the value, so a
+            deletion vector on an output follows the same rule. The name
+            cannot change while the option is on.
         snapshot_id:
           type: integer
           format: int64
@@ -5646,6 +5649,23 @@ components:
             OPTIONAL, for claimed_elsewhere's reason: the ledger holds
             rows written before it existed, and the read path fills 0
             for them.
+        object_prefix_unresolvable:
+          type: integer
+          format: int64
+          description: >
+            Groups of a table with the object-prefix layout
+            (Table.object_prefix_field) that the planner refused before
+            any IO because their prefix cannot be named: no partition
+            spec, no single identity field on the prefix column in their
+            spec, or a missing or non-canonical value there — or the
+            layout itself cannot be resolved (its column is not live, or
+            not of an allowed type), which refuses every group of the
+            table. The commit and DDL guards rule all four out, so a
+            nonzero count is a broken invariant or a row written around
+            the API, and the group is refused again on every sweep. Not charged to
+            HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN. Also
+            hoglake_compaction_skipped_total{reason="object_prefix_unresolvable"}.
+            Optional, for claimed_elsewhere's reason.
     RetirementResult:
       type: object
       required: [tables, rows_retired, dvs_retired, paths_queued, batches,
