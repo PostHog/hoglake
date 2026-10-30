@@ -84,7 +84,7 @@ zero, change `R`, scale up): a mixed-`R` fleet is unsupported.
 |---|---|
 | `rows/` + group + partition (u32 BE) + offset (i64 offset-binary) | raw Kafka payload |
 | `meta/fence` | the probing poll's last handled offset (i64; forensic) |
-| `meta/table_uuid` | the destination incarnation first committed to |
+| `meta/table_uuid` | the destination incarnation the rows commit to: set at the first commit, or by a planned move's re-pin (§5) |
 
 Any other key (an older build's `stats/`, `sched_age/`, `prepared/`,
 `flushed/`) is deleted during the startup drain, alongside the row
@@ -272,7 +272,18 @@ may quote payload keys): the decision fails with every row staged
 The first commit from a stage pins the destination incarnation in
 `meta/table_uuid`; the drain checks it before flushing anything, so a
 recreated table halts in every later process, not only the one that
-saw it.
+saw it. A planned move to another table sets
+`MILLRACE_STAGE_REPIN_FROM=<old table_uuid>` for one rollout: a stage
+pinned to exactly that uuid is re-pinned to the resolved table at the
+drain (one WARNING each, empty stages included) and flushes there, its
+rows decoded against the new table's columns. Each staged row lands in
+one table: a row committed to the old one left the stage when its
+commit landed, and a row whose commit landed but whose delete did not
+(a crash, a failed delete, an answer lost past the ladder) replays into
+the new one: the usual at-least-once duplicate, here across two
+tables. The image must read the knob before the rollout (an older one
+ignores it and halts), and moving back needs the knob naming the new
+table.
 
 **Commit ladder** (`HoglakeFlusher._publish`):
 
@@ -323,7 +334,8 @@ the runner, stop it, and re-raise from `run`, `run_once` and `drain`.
 1. Claim and open the stages (no reads; the index starts empty).
 2. `FlushRunner.drain`:
    - check every stage's pinned incarnation (`meta/table_uuid`): a
-     recreated destination halts before anything is flushed;
+     recreated destination halts before anything is flushed, and a
+     stage pinned to `MILLRACE_STAGE_REPIN_FROM` re-pins (§5);
    - **stream** each stage (the home and the foreign slots),
      stages concurrently (`_drain_stage`): ONE iterator over
      `rows/` with the bulk read-ahead options (`stage.RowStream`), cut
@@ -403,6 +415,7 @@ commit landed before the crash land again (duplicates).
 | `MILLRACE_CATALOG_DATA_PATH`, `MILLRACE_TABLE_COLUMNS`, `MILLRACE_PARTITION_BY`, `MILLRACE_SORT_BY` | unset (creation only) |
 | `MILLRACE_VARIANT_SOURCES` | unset: every nullable top-level variant column written as SQL NULL; `column=payload_key,…`, checked against the live columns at startup |
 | `MILLRACE_STAGE_URL` | required |
+| `MILLRACE_STAGE_REPIN_FROM` | unset; a table uuid, for one rollout that moves to a new table (§5) |
 | `MILLRACE_FLUSH_BYTES` | 256 MiB |
 | `MILLRACE_FLUSH_DEADLINE_S` | 900 |
 | `MILLRACE_SLOW_LANE_DEADLINE_S` | 21600 (≥ the flush deadline) |
@@ -479,7 +492,7 @@ and whenever liveness fails.
 | 9 | A fanout over the cap splits into several commits | `test_flush_contract.py` |
 | 10 | A refused payload retries with backoff, then reports the group stuck; other groups continue | `test_flush_contract.py` |
 | 11 | Ancient and far-future events are written | `test_flush_contract.py`, `tests/live/test_live_junk.py` |
-| 12 | A recreated destination halts | `test_flush_contract.py`, `tests/live/test_live_recreate.py` |
+| 12 | A recreated destination halts; a stage pinned to `MILLRACE_STAGE_REPIN_FROM` re-pins at the drain, empty ones too, and any other pin still halts | `test_flush_contract.py`, `tests/live/test_live_recreate.py`, `tests/live/test_live_repin.py` |
 | 13 | The startup drain flushes a previous process's rows before consuming, and again after a crash mid-drain | `test_flush_contract.py`, `test_consumer.py`, `test_drain.py`, `tests/live/test_live_kill.py` |
 | 17 | The startup drain is one read-ahead pass per stage, stages concurrent, batches bounded by `flush_concurrency`; a stuck group stays staged and indexed without blocking it; drained foreign slots close, the home stays | `test_stage.py`, `test_drain.py`, `tests/live/test_live_drain_latency.py` |
 | 18 | One replica stages every claimed partition in one home stage, one durable write per poll | `test_consumer.py` |

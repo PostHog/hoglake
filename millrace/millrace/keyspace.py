@@ -2,7 +2,7 @@
 
     rows/<group><partition><offset>   → raw Kafka payload bytes
     meta/fence             → offset (the consumer's fence probe; not a row)
-    meta/table_uuid        → the destination incarnation first committed to
+    meta/table_uuid        → the destination incarnation the rows commit to
 
 That is the whole keyspace. Group sizes and ages live in memory only
 (stage.py): staged state never outlives a process, because every
@@ -41,8 +41,9 @@ ROWS_PREFIX: Final = b"rows/"
 META_PREFIX: Final = b"meta/"
 #: The fence probe's one key.
 FENCE_PROBE_KEY: Final = META_PREFIX + b"fence"
-#: The destination incarnation this stage's rows were first committed
-#: to (UTF-8 table_uuid), so a recreated table halts across restarts.
+#: The destination incarnation this stage's rows commit to (UTF-8
+#: table_uuid; set at the first commit or by a planned move's re-pin),
+#: so a recreated table halts across restarts.
 TABLE_UUID_KEY: Final = META_PREFIX + b"table_uuid"
 
 _INT64_MIN: Final = -(1 << 63)

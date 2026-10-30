@@ -55,6 +55,7 @@ shape behavior:
 | `MILLRACE_SLOW_LANE_DEADLINE_S` | 21600 | any group this old flushes |
 | `MILLRACE_KAFKA_AUTO_OFFSET_RESET` | `latest` | where a partition with no committed offset starts |
 | `MILLRACE_VARIANT_SOURCES` | unset | `column=payload_key,…`: the variant columns filled from a payload key's JSON text (see "VARIANT columns") |
+| `MILLRACE_STAGE_REPIN_FROM` | unset | the old `table_uuid`, for one rollout that moves `MILLRACE_TABLE` to a new table: each stage pinned to it re-pins and drains into the new table instead of halting (exit 3). Remove it once every pod has rolled |
 
 ## Destination
 

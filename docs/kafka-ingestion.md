@@ -109,7 +109,7 @@ volumes anywhere.
 ```
 rows/<group><partition_u32><offset_ob>   → event payload bytes
 meta/fence                               → the consumer's fence probe (not a row)
-meta/table_uuid                          → the destination incarnation the stage's rows were first committed to
+meta/table_uuid                          → the destination incarnation the stage's rows commit to
 ```
 
 `<group>` is the partition tuple, prefix-free: `arity u8`, then per
@@ -212,7 +212,8 @@ no payload lowering ever runs under a stage's write lock.
   from and `expected_table_uuid`, the incarnation the startup resolve
   READ and pinned. A later read or commit naming another incarnation
   halts the process (exit 3): a human decides whether the staged rows
-  belong in the new table.
+  belong in the new table (if so, `MILLRACE_STAGE_REPIN_FROM` names the
+  old incarnation for one rollout).
 - Every build mints a fresh uuid4 `idempotency_key` per commit. An
   ambiguous answer (5xx, 408, 429, a transport error) or a plain 409
   `commit_conflict` resends the IDENTICAL bytes under the same key, and
