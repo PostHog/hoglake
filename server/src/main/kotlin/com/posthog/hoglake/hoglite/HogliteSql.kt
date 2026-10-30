@@ -55,8 +55,10 @@ internal fun HogliteTx.allocateCommitSnapshot() {
  * previous snapshot's ts and the pod's clock (Postgres's clock_timestamp
  * under the commit lock): snapshot ids are issued serially, so AS OF
  * time resolution only stays consistent with snapshot order when ts is
- * monotone with id. The fixed-width codec makes lexical MAX the
- * chronological MAX.
+ * monotone with id. The fixed-width codec makes lexical comparison the
+ * chronological one, and the LATEST row (id DESC LIMIT 1, the primary
+ * key's tail) is both the tightest lower bound and an O(1) read — a
+ * MAX(ts) aggregate would walk every retained snapshot per commit.
  */
 internal fun HogliteTx.insertSnapshotRow(
     author: String?,
@@ -66,7 +68,7 @@ internal fun HogliteTx.insertSnapshotRow(
     add(
         "INSERT INTO snapshots(id, ts, author, message, schema_version) " +
             "VALUES (${HogliteSchema.HEAD_SQL}, " +
-            "MAX(COALESCE((SELECT MAX(ts) FROM snapshots), ''), ?), ?, ?, " +
+            "MAX(COALESCE((SELECT ts FROM snapshots ORDER BY id DESC LIMIT 1), ''), ?), ?, ?, " +
             "(SELECT schema_version FROM meta WHERE id = 1))",
         ts,
         author,

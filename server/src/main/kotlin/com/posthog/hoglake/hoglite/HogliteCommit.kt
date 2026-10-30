@@ -424,13 +424,40 @@ internal object HogliteCommit {
                     t.tableId,
                     expected.toString(),
                 ) {
-                    HoglakeException.TableRecreated(
-                        "table '$qname' no longer has the expected UUID: it was recreated; " +
-                            "re-read it before retrying",
-                        table = qname,
-                        expectedTableUuid = expected,
-                        currentTableUuid = t.tableUuid,
-                    )
+                    // Classify AFTER the rollback: the read sees the state
+                    // that refused us. A live incarnation under the same
+                    // name with a DIFFERENT uuid is a recreate (re-read,
+                    // retryable); a dropped row with no successor is the
+                    // drop ("stop") — Postgres's table_dropped, not the
+                    // table_recreated a bare liveness miss would imply.
+                    val row =
+                        store.queryCatalog(
+                            catalog,
+                            "SELECT t.dropped_snapshot, " +
+                                "(SELECT COUNT(*) FROM tables s JOIN table_versions w " +
+                                "ON w.table_id = s.id AND w.end_snapshot IS NULL " +
+                                "WHERE s.dropped_snapshot IS NULL AND w.namespace = ? AND w.name = ? " +
+                                "AND s.table_uuid <> ?) " +
+                                "FROM tables t WHERE t.id = ?",
+                            t.namespace,
+                            t.name,
+                            expected.toString(),
+                            t.tableId,
+                        ).firstRow()
+                    if (row != null && row[0] != null && row[1].asLong() == 0L) {
+                        HoglakeException.TableDropped(
+                            "table '$qname' in catalog '$catalog' was dropped at snapshot " +
+                                "${row[0].asLong()}; stop, or recreate it",
+                        )
+                    } else {
+                        HoglakeException.TableRecreated(
+                            "table '$qname' no longer has the expected UUID: it was recreated; " +
+                                "re-read it before retrying",
+                            table = qname,
+                            expectedTableUuid = expected,
+                            currentTableUuid = t.tableUuid,
+                        )
+                    }
                 }
             }
             tx.expectOne(
@@ -457,15 +484,22 @@ internal object HogliteCommit {
             }
         }
 
-        // 2a. The schema fence: planning (specs, column types, stats
-        // validation) ran against head's schema; a DDL that landed since
-        // invalidates that planning even when the request carries no
-        // read_snapshot (a blind append). Failure replans once via the
+        // 2a. The schema fence, PER TOUCHED TABLE: planning (specs,
+        // column types, stats validation) ran against the table's schema
+        // as resolved; an ALTER that landed since invalidates that
+        // planning even when the request carries no read_snapshot (a
+        // blind append). Per-table — not the catalog-wide
+        // meta.schema_version — so a createTable or an ALTER of an
+        // UNRELATED table never replans (or worse, falsely 409s) a blind
+        // append in a busy catalog. Failure replans once via the
         // commit() wrapper.
-        tx.expectScalar(
-            meta.schemaVersion,
-            "SELECT schema_version FROM meta WHERE id = 1",
-        ) { SCHEMA_CHANGED }
+        for (t in resolved.values) {
+            tx.expectScalar(
+                t.schemaVersion,
+                "SELECT schema_version FROM tables WHERE id = ?",
+                t.tableId,
+            ) { SCHEMA_CHANGED }
+        }
 
         // 2b. The expiry floor, in-tx: a sweep that advanced the floor
         // past this commit's read snapshot since planning must not let

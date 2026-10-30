@@ -30,8 +30,8 @@ import java.util.UUID
  * Two implementations:
  *
  *  - [PostgresCatalogStore] — the historical path: it delegates to
- *    CatalogService / CommitService / ScanService unchanged, and the
- *    `gigahog` deployment runs exactly this.
+ *    CatalogService / CommitService / ScanService unchanged; the
+ *    existing shared deployment runs exactly this.
  *  - [com.posthog.hoglake.hoglite.HogliteCatalogStore] — every catalog
  *    is a hoglite tenant; operations become hoglite transactions and
  *    read-only queries. Semantics (OCC guards, snapshot allocation,

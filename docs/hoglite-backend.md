@@ -1,8 +1,8 @@
 # The hoglite backend (HOGLAKE_DATABASE=hoglite)
 
 hoglake has two storage backends behind one interface. `HOGLAKE_DATABASE=postgres`
-(the default) is the deployment gigahog runs: the catalog lives in one Postgres
-database, one row set per catalog, serialised by advisory locks.
+(the default) is what the existing shared deployment runs: the catalog lives in
+one Postgres database, one row set per catalog, serialised by advisory locks.
 `HOGLAKE_DATABASE=hoglite` is the warehouse deployment: each catalog is a
 **hoglite tenant** — a SQLite file the engine replicates — and every catalog
 operation is a guarded hoglite transaction or read-only query against it.
@@ -30,18 +30,28 @@ them unchanged; the hoglite ports live in `server/.../hoglite/`.
 
 ## The mapping
 
-- **Catalog == tenant.** The tenant id is the deployment prefix
-  (`HOGLAKE_HOGLITE_TENANT_PREFIX`, default `hoglake-`) plus the catalog
-  name, so two hoglake deployments can share one hoglite cluster. Creating a
-  catalog provisions the tenant FIRST (hoglite's `PUT /v1/tenants/{tid}` is
-  idempotent) and bootstraps the schema in one fixed-txid transaction, so a
-  replay is a read; the registry row (catalog name + data_path prefix
-  disjointness, in a dedicated registry tenant) publishes LAST — a crash
-  mid-create leaves an adoptable orphan tenant, never a ghost registry row.
-  Dropping fences the catalog first (one transaction: the emptiness
-  preconditions as guards plus `meta.dropping = 1`, which every mutating
-  transaction guards on), then releases and deletes the tenant through its
-  owner, then deletes the registry row.
+- **Catalog == tenant, incarnation-scoped.** The tenant id is the
+  deployment prefix (`HOGLAKE_HOGLITE_TENANT_PREFIX`, default `hoglake-`)
+  plus the catalog name plus a per-create random suffix — an INCARNATION id,
+  recorded in the registry row. Creating a catalog provisions the tenant
+  FIRST (hoglite's `PUT /v1/tenants/{tid}` is idempotent) and bootstraps the
+  schema in one fixed-txid transaction, so a replay is a read; the registry
+  row (catalog name + data_path prefix disjointness, in a dedicated registry
+  tenant) publishes LAST — a crash mid-create leaves an empty orphan tenant,
+  never a ghost registry row. Dropping resolves the row's tenant id, fences
+  the catalog (one transaction: the emptiness preconditions as guards plus
+  `meta.dropping = 1`, which every mutating transaction guards on), then
+  releases and deletes THAT tenant id — hoglite routes the release to the
+  owning pod, so a drop works through any replica — and deletes the registry
+  row conditionally on the incarnation. A drop paused mid-flight and resumed
+  after a drop+recreate therefore finishes the old incarnation's (already
+  complete) deletion and cannot touch the new catalog.
+- **Expiry re-reads its policy in the transaction.** The sweep's planning
+  reads (floor, retention, consumer-floor flag) are separate requests; the
+  advance transaction guards on all three, so a concurrent sweep, a
+  retention patch, or a consumer-floor toggle between plan and publish is a
+  typed conflict, and the next sweep re-plans. `commitOffset` guards the
+  floor in its transaction the same way.
 - **Every write is one hoglite transaction** (`POST /v1/t/{tid}/tx`) carrying
   its OCC guards in the request: `expect_scalar_int`/`expect_affected` per
   statement, evaluated inside the tenant's serial transaction. hoglite answers

@@ -225,30 +225,18 @@ class HogliteClient(
     }
 
     /**
-     * Delete [tenant]'s durable state. hoglite refuses (409) while a
-     * LIVE remote owner holds it — fence first ([release]); callers get
-     * [HogliteRejected] with status 409 in that case. A 404 is success:
-     * the tenant is gone either way.
+     * Delete [tenant]'s durable state. hoglite routes the delete to the
+     * live owner exactly like `/tx` (proxied, or 421 with the owner
+     * hint, which the call loop follows) and the deletion executes AT
+     * the owner — fence first ([release]) so nothing re-materializes it.
+     * A 404 is success: the tenant is gone either way. (An old engine
+     * still answers 409 for a live remote owner; callers tolerate and
+     * retry it as transitional during rolling upgrades.)
      */
     fun deleteTenant(tenant: String) {
         call(tenant, "/v1/tenants/$tenant", null, readTimeoutMs, method = "DELETE") { status, bytes ->
             when (status) {
                 200, 404 -> Unit
-                else -> throw HogliteRejected(status, String(bytes))
-            }
-        }
-    }
-
-    /**
-     * `/v1/t/{tenant}/status`, the routed read that PINS the owner for
-     * the calls that follow: hoglite's `release` and tenant `DELETE`
-     * are owner-local (not proxied), so a lifecycle caller must pin via
-     * this first and let the 421 dance land on the owning pod.
-     */
-    fun status(tenant: String) {
-        call(tenant, "/v1/t/$tenant/status", null, readTimeoutMs, method = "GET") { status, bytes ->
-            when (status) {
-                200 -> Unit
                 else -> throw HogliteRejected(status, String(bytes))
             }
         }

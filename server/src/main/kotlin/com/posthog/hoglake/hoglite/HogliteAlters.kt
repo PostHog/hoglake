@@ -130,14 +130,15 @@ internal class HogliteAlters(
         // null) has no changes-window guard, so without this a
         // concurrent alter between planning and the tx would be
         // overwritten by stale in-memory state. Same OCC as the commit
-        // path's schema fence, but an alter IS DDL, so a miss is the
-        // typed retryable conflict, not a replan.
+        // path's per-table schema fence, but an alter IS DDL, so a miss
+        // is the typed retryable conflict, not a replan.
         tx.expectScalar(
-            meta.schemaVersion,
-            "SELECT schema_version FROM meta WHERE id = 1",
+            t.schemaVersion,
+            "SELECT schema_version FROM tables WHERE id = ?",
+            t.tableId,
         ) {
             HoglakeException.CommitConflict(
-                "catalog '$catalog' schema changed under the alter on $namespace.$table; re-read and retry",
+                "table $namespace.$table changed under the alter; re-read and retry",
             )
         }
         if (readSnapshot != null) {
@@ -159,6 +160,10 @@ internal class HogliteAlters(
                 "VALUES (${HogliteSchema.HEAD_SQL}, 'table_altered', ?)",
             t.tableId,
         )
+        // Publish the schema change for the commit path's per-table
+        // fence: a blind append planned against the old schema fails
+        // its fence and replans once rather than landing stale.
+        tx.add("UPDATE tables SET schema_version = schema_version + 1 WHERE id = ?", t.tableId)
         for (op in ops) applyOp(catalog, tx, t, ns.namespaceId, namespace, state, op, plannedNextFieldId)
 
         val readback = tx.add(HogliteSql.READBACK_DDL)

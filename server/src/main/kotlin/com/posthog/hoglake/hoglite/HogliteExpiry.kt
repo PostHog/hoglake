@@ -227,6 +227,27 @@ internal class HogliteExpiry(
                 "the expiry floor moved under this sweep; the next run re-plans",
             )
         }
+        // The POLICY the sweep planned against, re-asserted in the same
+        // transaction: a retention patch (or its removal) and a
+        // consumer-floor toggle both land between planning and here
+        // otherwise, and a plan made under a policy no longer in force
+        // must not publish (null retention reads back as -1).
+        tx.expectScalar(
+            pre.retentionSeconds ?: -1,
+            "SELECT COALESCE(snapshot_retention_seconds, -1) FROM meta WHERE id = 1",
+        ) {
+            HoglakeException.CommitConflict(
+                "the retention policy changed under this sweep; the next run re-plans",
+            )
+        }
+        tx.expectScalar(
+            if (pre.consumerFloor) 1 else 0,
+            "SELECT consumer_floor FROM meta WHERE id = 1",
+        ) {
+            HoglakeException.CommitConflict(
+                "the consumer-floor policy changed under this sweep; the next run re-plans",
+            )
+        }
         if (pre.consumerFloor) {
             tx.expectZero(
                 "SELECT COUNT(*) FROM offsets o JOIN tables t ON t.table_uuid = o.table_uuid " +

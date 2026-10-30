@@ -152,11 +152,12 @@ class App private constructor(
      * refusal true (one worker when the loop is off) has to key on the
      * same predicate the refusal prices on, and stating it at this call
      * site is how the two could quietly diverge.
+     *
+     * CleanupConfigTest pins this construction text: the service must be
+     * built from Config (the loop predicate derivation lives in its Config
+     * constructor, where a test can build it), not knob by knob here.
      */
     private fun newCleanupService(jdbi: Jdbi) = CleanupService(jdbi, removalStore, cfg)
-    // CleanupConfigTest pins this construction text: the service must be
-    // built from Config (the loop predicate derivation lives in its Config
-    // constructor, where a test can build it), not knob by knob here.
 
     private val cleanupService by lazy { newCleanupService(requireNotNull(jdbi)) }
 

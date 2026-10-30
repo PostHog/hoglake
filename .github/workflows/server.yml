@@ -96,6 +96,25 @@ jobs:
       # MinIO build — both unauthenticated Docker Hub pulls, the usual
       # rate-limit flake source). :test includes the schema-equivalence gate
       # (fold(migrations) == schema.sql).
+      #
+      # The hoglite-backend suites (HogliteBackendIntegrationTest,
+      # HogliteGuardRaceTest) run a real hoglited. The binary comes from
+      # the digest-pinned artifact named by the HOGLITED_URL repo/org
+      # variable, verified against HOGLITED_SHA256; with the variables
+      # unset the suites skip (loudly) — a repo without the artifact
+      # configured loses the live-engine coverage, not the build.
+      - name: Fetch hoglited (hoglite backend suites)
+        shell: bash
+        run: |
+          if [ -z "${{ vars.HOGLITED_URL }}" ]; then
+            echo "::warning::HOGLITED_URL not set — the live hoglite backend suites will skip"
+            exit 0
+          fi
+          curl -fsSL "${{ vars.HOGLITED_URL }}" -o /tmp/hoglited
+          echo "${{ vars.HOGLITED_SHA256 }}  /tmp/hoglited" | sha256sum -c -
+          chmod +x /tmp/hoglited
+          echo "HOGLITE_BINARY=/tmp/hoglited" >> "$GITHUB_ENV"
+
       - name: Server tests + ktlint
         working-directory: server
         run: ./gradlew --no-daemon :test :ktlintCheck :checkOpenapiVersion

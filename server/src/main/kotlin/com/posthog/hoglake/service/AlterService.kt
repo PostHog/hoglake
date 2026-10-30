@@ -1210,6 +1210,7 @@ class AlterService(private val jdbi: Jdbi) : AlterBackend {
     companion object {
         // ---- pure validators (companion so the hoglite backend can call them without a Jdbi) ----
 
+        /** The root-to-node chain for [fieldId], or null when it is not in the forest. */
         internal fun findChain(
             siblings: List<Column>,
             fieldId: Long,
@@ -1280,8 +1281,6 @@ class AlterService(private val jdbi: Jdbi) : AlterBackend {
             }
             return col
         }
-
-        /** The root-to-node chain for [fieldId], or null when it is not in the forest. */
 
         internal fun validatePartitionFields(
             columns: List<Column>,

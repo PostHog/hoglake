@@ -81,6 +81,7 @@ internal object HogliteSchema {
                 properties_json TEXT NOT NULL DEFAULT '{}',
                 next_row_id INTEGER NOT NULL DEFAULT 0,
                 next_field_id INTEGER NOT NULL DEFAULT 1,
+                schema_version INTEGER NOT NULL DEFAULT 0,
                 replaced_table_id INTEGER,
                 created_snapshot INTEGER NOT NULL,
                 dropped_snapshot INTEGER

@@ -29,9 +29,9 @@ data class Config(
     val uiTheme: String = env("HOGLAKE_UI_THEME", ""),
     /**
      * Which database backend serves EVERY catalog this deployment
-     * knows: [DatabaseBackend.POSTGRES] (the default; the `gigahog`
-     * deployment's RDS) or [DatabaseBackend.HOGLITE] (each catalog is a
-     * hoglite tenant; the new per-warehouse deployment). A process
+     * knows: [DatabaseBackend.POSTGRES] (the default; the shared
+     * deployment's Postgres) or [DatabaseBackend.HOGLITE] (each catalog
+     * is a hoglite tenant; the per-warehouse deployment). A process
      * serves exactly one backend — there is no per-catalog branching,
      * so a mixed fleet is two Deployments, not one pod deciding per
      * request.

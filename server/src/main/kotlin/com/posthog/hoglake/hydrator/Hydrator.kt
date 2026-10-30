@@ -840,7 +840,7 @@ class Hydrator(
          * sleeps the whole interval whether one file waited or ten
          * thousand did. At 100 per sweep on a 15-minute loop that is
          * ~400 files/hour per deployment, against a deferred-stats
-         * writer producing them far faster. Measured on gigahog-dev: a
+         * writer producing them far faster. Measured on a shared dev deployment: a
          * 13,224-file backlog draining at ~800/hour while still growing.
          *
          * A pending file is unprunable on EVERY column until it is

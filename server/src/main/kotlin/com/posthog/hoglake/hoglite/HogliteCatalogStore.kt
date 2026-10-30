@@ -79,10 +79,48 @@ class HogliteCatalogStore(
 ) : CatalogStore {
     internal val json: ObjectMapper = jacksonObjectMapper()
 
-    /** The hoglite tenant id a catalog lives in. Applied at the client boundary ONLY. */
+    /**
+     * The LEGACY tenant-id shape (deployment prefix + catalog name).
+     * Retained for the registry tenant itself and for registry rows
+     * written before incarnation ids existed; user catalogs mint an
+     * incarnation id at create (see [createCatalog]).
+     */
     internal fun tenantOf(catalog: String): String = tenantPrefix + catalog
 
     private val log = io.github.oshai.kotlinlogging.KotlinLogging.logger {}
+
+    /*
+     * name -> tenant id. Tenant ids are INCARNATION-unique
+     * (`hoglake-<name>-<12 hex>`): a catalog drop releases and deletes
+     * the tenant id it fenced, so a paused stale drop can never delete
+     * a recreated catalog's tenant — the recreate minted a new id, the
+     * old id is already gone, and the stale drop's registry delete is
+     * conditional on the OLD id (a no-op against the new row). The
+     * cache is sound because a live catalog's tenant id never changes;
+     * a recreate invalidates via the engine's 404 (see runTx).
+     */
+    private val tenantCache = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    /** The tenant id [catalog] currently lives in; the 404s name the catalog. */
+    internal fun resolveTenant(catalog: String): String {
+        if (catalog == REGISTRY_TENANT) return tenantOf(REGISTRY_TENANT)
+        return tenantCache.computeIfAbsent(catalog) {
+            val row =
+                queryRegistry("SELECT tenant FROM catalogs WHERE name = ?", catalog).firstRow()
+                    ?: throw HoglakeException.NotFound("catalog '$catalog'")
+            (row[0] as? String) ?: tenantOf(catalog) // pre-incarnation registry row
+        }
+    }
+
+    private fun evictTenant(
+        catalog: String,
+        tenant: String,
+    ) {
+        tenantCache.remove(catalog, tenant)
+    }
+
+    /** The tenant id [catalog] resolves to right now, or null (tests). */
+    internal fun tenantCachePeek(catalog: String): String? = runCatching { resolveTenant(catalog) }.getOrNull()
 
     // ==================== catalogs =========================================
 
@@ -107,7 +145,13 @@ class HogliteCatalogStore(
         val newPrefix = dataPath.trimEnd('/') + "/"
         for (row in existing.rows) {
             val theirName = row[0].asString()
-            if (theirName == name) continue // the guarded insert below answers same-name
+            if (theirName == name) {
+                // Answer the duplicate BEFORE creating the tenant: the
+                // guarded insert below is the race-catcher, and a
+                // duplicate that created its tenant first would orphan
+                // it (nothing lists an unregistered tenant).
+                throw HoglakeException.AlreadyExists("catalog '$name' already exists")
+            }
             val theirPrefix = row[1].asString().trimEnd('/') + "/"
             if (newPrefix.startsWith(theirPrefix) || theirPrefix.startsWith(newPrefix)) {
                 throw HoglakeException.Validation(
@@ -117,13 +161,18 @@ class HogliteCatalogStore(
             }
         }
         // The tenant FIRST, then the registry row: a crash between
-        // them leaves an orphan TENANT (harmless — nothing lists it and
-        // a retried create adopts it), never a ghost registry row that
+        // them leaves an orphan TENANT (harmless — nothing lists it; a
+        // retried create mints a FRESH incarnation and the empty orphan
+        // leaks until ops reclaims it), never a ghost registry row that
         // poisons every listCatalogs caller and can be neither created
-        // nor dropped. Both steps are idempotent: createTenant answers
-        // an existing tenant as success, and the bootstrap's
-        // INSERT OR IGNORE + hoglite's dedup make a replay a read.
-        client.createTenant(tenantOf(name))
+        // nor dropped.
+        //
+        // The tenant id carries a per-create incarnation suffix: a drop
+        // releases and deletes the tenant id IT fenced, so a paused
+        // stale drop can never delete a recreated catalog's tenant, and
+        // its conditional registry delete no-ops against the new row.
+        val tenantId = tenantOf(name) + "-" + UUID.randomUUID().toString().replace("-", "").take(12)
+        client.createTenant(tenantId)
         val boot = HogliteTx()
         HogliteSchema.DDL.forEach { boot.add(it) }
         boot.add(
@@ -138,9 +187,16 @@ class HogliteCatalogStore(
             message,
         )
         // Readback, so a bootstrap racing a different data_path is caught
-        // here rather than silently adopting the old one.
+        // here rather than silently adopting the old one. The bootstrap
+        // addresses the RAW tenant id: the registry row this catalog
+        // resolves through does not exist yet.
         val readback = boot.add("SELECT data_path FROM meta WHERE id = 1")
-        val results = runTx(name, "boot:$name", fp = "bootstrap:v1", boot, fenced = false)
+        val results =
+            try {
+                client.tx(tenantId, "boot:$tenantId", "bootstrap:v1", boot.statements())
+            } catch (r: HogliteRejected) {
+                throw mapRejected(name, r)
+            }
         val storedPath = results[readback].firstRow()?.get(0).asString()
         if (storedPath != dataPath) {
             throw HoglakeException.AlreadyExists(
@@ -157,8 +213,9 @@ class HogliteCatalogStore(
             "SELECT COUNT(*) FROM catalogs WHERE name = ?",
             name,
         ) { HoglakeException.AlreadyExists("catalog '$name' already exists") }
-        reg.add("INSERT INTO catalogs(name, data_path) VALUES (?, ?)", name, dataPath)
+        reg.add("INSERT INTO catalogs(name, data_path, tenant) VALUES (?, ?, ?)", name, dataPath, tenantId)
         runTx(REGISTRY_TENANT, freshTxid("create-catalog"), null, reg, fenced = false)
+        tenantCache[name] = tenantId
         return getCatalog(name)
     }
 
@@ -188,28 +245,37 @@ class HogliteCatalogStore(
         author: String?,
         message: String?,
     ): DroppedCatalog {
+        // The registry row pins the incarnation this drop acts on: the
+        // fence, the release, the delete all address THIS tenant id, and
+        // the registry delete at the end is conditional on it. A paused
+        // drop resuming after a drop+recreate therefore finishes the OLD
+        // incarnation's deletion (an idempotent no-op — the recreate
+        // minted a new tenant id) and leaves the new catalog's row
+        // untouched.
+        val registered =
+            queryRegistry("SELECT data_path, tenant FROM catalogs WHERE name = ?", catalog)
+                .firstRow()
+                ?: throw HoglakeException.NotFound("catalog '$catalog'")
+        val rowTenant = registered[1] as? String
+        val tenantId = rowTenant ?: tenantOf(catalog) // pre-incarnation registry row
+
         // A ghost registry row (a create that died before its tenant
-        // existed) is droppable too: skip the tenant and take the row.
+        // existed, or a drop that died after deleting it) is droppable
+        // too: skip the fence and take the row.
         val info =
             try {
                 meta(catalog)
             } catch (e: HoglakeException.NotFound) {
-                // No tenant: only a ghost REGISTRY row (a create that
-                // died mid-flight) may still be dropped. An unknown name
-                // is the plain 404.
-                val registered =
-                    queryRegistry("SELECT data_path FROM catalogs WHERE name = ?", catalog)
-                        .firstRow()
-                if (registered == null) {
-                    throw HoglakeException.NotFound("catalog '$catalog'")
-                }
                 runTx(
                     REGISTRY_TENANT,
                     freshTxid("drop-catalog"),
                     null,
-                    HogliteTx().apply { add("DELETE FROM catalogs WHERE name = ?", catalog) },
+                    HogliteTx().apply {
+                        add("DELETE FROM catalogs WHERE name = ? AND tenant IS ?", catalog, rowTenant)
+                    },
                     fenced = false,
                 )
+                evictTenant(catalog, tenantId)
                 return DroppedCatalog(catalog, registered[0].asString())
             }
 
@@ -278,39 +344,52 @@ class HogliteCatalogStore(
                 "or wait out their expiry window)"
         }
         fence.add("UPDATE meta SET dropping = 1 WHERE id = 1")
-        runTx(catalog, freshTxid("drop-fence"), null, fence, fenced = false)
+        try {
+            client.tx(tenantId, freshTxid("drop-fence"), null, fence.statements())
+        } catch (g: HogliteGuardFailure) {
+            throw fence.classify(g)
+        } catch (r: HogliteRejected) {
+            throw mapRejected(catalog, r)
+        }
 
-        // Order matters: fence the owner so nothing in flight can
-        // re-materialize the tenant, THEN delete its durable state, then
-        // the registry row. release and tenant DELETE are owner-LOCAL in
-        // hoglite (not proxied), so each attempt first pins the owner via
-        // a routed status call; a 409 from DELETE means a live remote
-        // owner still holds it — re-pin, fence again, retry with a pause.
+        // Order matters: the fence stops new writes, then the owner is
+        // released so nothing in flight can re-materialize the tenant,
+        // THEN its durable state, then the registry row. hoglite routes
+        // release AND delete to the owning pod (a 421/503 rides the
+        // client's retry taxonomy) and answers release idempotently once
+        // no live owner remains. The 409 catch is transitional: an old
+        // engine (pre delete-routing) refuses a delete under a live
+        // remote owner — release again and retry with a pause.
         var fencingFailure: HogliteRejected? = null
-        repeat(3) {
-            if (it > 0) Thread.sleep(200)
-            client.status(tenantOf(catalog))
-            client.release(tenantOf(catalog))
+        var deleted = false
+        for (attempt in 0 until 3) {
+            if (attempt > 0) Thread.sleep(200)
+            client.release(tenantId)
             try {
-                client.deleteTenant(tenantOf(catalog))
-                fencingFailure = null
-                return@repeat
+                client.deleteTenant(tenantId)
+                deleted = true
+                break
             } catch (e: HogliteRejected) {
                 if (e.status == 409) fencingFailure = e else throw mapRejected(catalog, e)
             }
         }
-        fencingFailure?.let {
+        if (!deleted) {
             throw HoglakeException.BackendUnavailable(
                 "hoglite refused to delete tenant '$catalog' three times in a row (a live owner " +
-                    "kept re-claiming it): ${it.body}",
+                    "kept re-claiming it): ${fencingFailure?.body}",
             )
         }
+        // The registry delete is conditional on THIS incarnation: a
+        // recreate rewrote the row's tenant, and a stale drop must not
+        // take the new catalog's row. Zero rows affected is success —
+        // the catalog this drop fenced is gone either way.
         val reg = HogliteTx()
-        reg.add("DELETE FROM catalogs WHERE name = ?", catalog)
+        reg.add("DELETE FROM catalogs WHERE name = ? AND tenant IS ?", catalog, rowTenant)
         // Fresh txid: the registry tenant's dedup table survives the
         // catalog's own tenant, so a fixed txid would make a
         // recreate-then-redrop silently skip the registry delete.
         runTx(REGISTRY_TENANT, freshTxid("drop-catalog"), null, reg, fenced = false)
+        evictTenant(catalog, tenantId)
         return DroppedCatalog(catalog, info.dataPath)
     }
 
@@ -1272,6 +1351,18 @@ class HogliteCatalogStore(
         // Postgres upsert's `<= EXCLUDED` arm — accepted, a no-op — which
         // is what makes a client retry of a timed-out-but-applied call
         // safe (each call carries a fresh txid).
+        // The expiry floor, re-asserted IN the transaction: the preflight
+        // read is a separate request, and a sweep that advanced the floor
+        // in between must not let this offset land below it.
+        tx.expectZero(
+            "SELECT COUNT(*) FROM meta WHERE id = 1 AND earliest_snapshot_id > ?",
+            snapshotId,
+        ) {
+            HoglakeException.Expired(
+                "cannot commit offset at snapshot $snapshotId: the expiry floor advanced past it; " +
+                    "reconcile from a full scan at a retained snapshot",
+            )
+        }
         tx.expectZero(
             "SELECT COUNT(*) FROM offsets WHERE consumer_id = ? AND table_uuid = ? AND committed_snapshot > ?",
             consumerId,
@@ -1442,6 +1533,7 @@ class HogliteCatalogStore(
         val comment: String?,
         val properties: Map<String, String>,
         val nextRowId: Long,
+        val schemaVersion: Long,
     )
 
     /** Resolve (namespace, name) at [at]: the VERSION visible then, of an incarnation alive then. */
@@ -1456,7 +1548,7 @@ class HogliteCatalogStore(
             queryCatalog(
                 catalog,
                 "SELECT t.id, t.table_uuid, v.namespace_id, v.namespace, v.name, v.comment, " +
-                    "v.properties_json, t.next_row_id FROM table_versions v " +
+                    "v.properties_json, t.next_row_id, t.schema_version FROM table_versions v " +
                     "JOIN tables t ON t.id = v.table_id " +
                     "WHERE v.namespace_id = ? AND v.name = ? " +
                     "AND v.begin_snapshot <= ? AND (v.end_snapshot IS NULL OR v.end_snapshot > ?) " +
@@ -1484,7 +1576,7 @@ class HogliteCatalogStore(
             queryCatalog(
                 catalog,
                 "SELECT t.id, t.table_uuid, v.namespace_id, v.namespace, v.name, v.comment, " +
-                    "v.properties_json, t.next_row_id FROM table_versions v " +
+                    "v.properties_json, t.next_row_id, t.schema_version FROM table_versions v " +
                     "JOIN tables t ON t.id = v.table_id " +
                     "WHERE v.namespace_id = ? AND v.name = ? AND v.end_snapshot IS NULL " +
                     "AND t.dropped_snapshot IS NULL",
@@ -1506,6 +1598,7 @@ class HogliteCatalogStore(
             comment = row[5] as? String,
             properties = json.readValue<Map<String, String>>(row[6].asString()),
             nextRowId = row[7].asLong(),
+            schemaVersion = row[8].asLong(),
         )
 
     /** One column row as read back, before the tree is rebuilt. */
@@ -1799,7 +1892,8 @@ class HogliteCatalogStore(
                 } else {
                     tx.statements()
                 }
-            val results = client.tx(tenantOf(catalog), txid, fp, statements)
+            val tenant = resolveTenant(catalog)
+            val results = client.tx(tenant, txid, fp, statements)
             if (fenced) results.subList(1, results.size) else results
         } catch (g: HogliteGuardFailure) {
             if (fenced) {
@@ -1810,6 +1904,12 @@ class HogliteCatalogStore(
             }
             throw tx.classify(g)
         } catch (r: HogliteRejected) {
+            // The engine's 404 can mean the tenant id is stale (a drop +
+            // recreate minted a new one): evict so the NEXT call
+            // re-resolves. This call still fails with the catalog-404,
+            // which is the truth a caller holding the old incarnation
+            // should see.
+            if (r.status == 404) tenantCache.entries.removeIf { it.key == catalog }
             throw mapRejected(catalog, r)
         }
 
@@ -1819,8 +1919,10 @@ class HogliteCatalogStore(
         vararg args: Any?,
     ): HogliteQueryResult =
         try {
-            client.query(tenantOf(catalog), sql, args.toList())
+            val tenant = resolveTenant(catalog)
+            client.query(tenant, sql, args.toList())
         } catch (r: HogliteRejected) {
+            if (r.status == 404) tenantCache.entries.removeIf { it.key == catalog }
             throw mapRejected(catalog, r)
         }
 
@@ -1934,10 +2036,29 @@ class HogliteCatalogStore(
         client.createTenant(tenantOf(REGISTRY_TENANT))
         val tx = HogliteTx()
         tx.add(
-            "CREATE TABLE IF NOT EXISTS catalogs(name TEXT PRIMARY KEY, data_path TEXT NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS catalogs(name TEXT PRIMARY KEY, data_path TEXT NOT NULL, tenant TEXT)",
         )
         // Fixed txid + fp: replaying the bootstrap is a no-op read.
         runTx(REGISTRY_TENANT, "boot:$REGISTRY_TENANT", "registry:v1", tx, fenced = false)
+        // Registries written before incarnation ids: add the column.
+        // (SQLite has no IF NOT EXISTS for columns, and PRAGMA is off
+        // both API paths — the CREATE TABLE text in sqlite_master is
+        // the check.)
+        val ddl =
+            client.query(
+                tenantOf(REGISTRY_TENANT),
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'catalogs'",
+                emptyList(),
+            ).firstRow()?.get(0) as? String
+        if (ddl != null && "tenant" !in ddl) {
+            runTx(
+                REGISTRY_TENANT,
+                freshTxid("registry-migrate"),
+                null,
+                HogliteTx().apply { add("ALTER TABLE catalogs ADD COLUMN tenant TEXT") },
+                fenced = false,
+            )
+        }
     }
 
     internal fun queryRegistry(
