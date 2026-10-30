@@ -375,6 +375,54 @@ class App private constructor(
             )
         }
 
+    /**
+     * Every Postgres-backend service, constructed now. The services are
+     * `lazy` only so a hoglite App (jdbi = null) never builds them; on
+     * the Postgres path they are built at [build] time, as they were
+     * when they were plain vals, so a setting a constructor refuses
+     * (a retirement batch of 0, a compaction minInputFiles of 1, a
+     * cleanup sub-batch of 0, a summary refresh of 0) refuses BOOT —
+     * before Main starts a loop, binds the metrics port or the API —
+     * instead of failing every loop tick of a process with no API.
+     * CatalogMetrics registers its MultiGauges in its constructor, so
+     * this also keeps them present from boot.
+     */
+    internal fun constructPostgresServices() {
+        store
+        catalogService
+        commitService
+        alterService
+        scanService
+        partitionLookupService
+        viewService
+        optionsService
+        expiryService
+        partitionStatsService
+        partitionListingService
+        cleanupService
+        retirementService
+        reindexService
+        hydrator
+        compactionService
+        maintenanceStatusService
+        maintenanceSummarySampler
+        catalogMetrics
+    }
+
+    /** The hoglite backend's services, constructed now — the same fail-fast as [constructPostgresServices]. */
+    internal fun constructHogliteServices() {
+        hogliteStore()
+        hogliteOptions
+        hogliteExpiry
+        hogliteCleanup
+        hogliteHydrator
+        hogliteCompaction
+        hogliteRetirement
+        hogliteMaintenanceStatus
+        hoglitePartitions
+        hoglitePartitionLookup
+    }
+
     /** Catalog-health gauge sampler; tests drive [CatalogMetrics.sampleOnce] directly. */
     val catalogMetrics by lazy {
         CatalogMetrics(
@@ -403,16 +451,12 @@ class App private constructor(
             dataSource: HikariDataSource? = null,
             healthProbe: HealthProbe = HealthProbe.fromConfig(cfg),
         ): App =
-            buildShared(
-                App(cfg, jdbi, storeParam = null, healthProbe = healthProbe),
-                cfg,
-                dataSource,
-            ).also {
-                // CatalogMetrics registers its MultiGauges in its
-                // constructor; touching it here keeps them present from
-                // boot (a pre-first-tick /metrics scrape is not empty).
-                it.catalogMetrics
-            }
+            App(cfg, jdbi, storeParam = null, healthProbe = healthProbe)
+                // Construct first, bind second: a constructor's refusal
+                // (an invalid setting Config does not check) must throw
+                // here, before Metrics is bound or a loop is started.
+                .also { it.constructPostgresServices() }
+                .let { buildShared(it, cfg, dataSource) }
 
         /**
          * The hoglite backend: no Postgres, no Jdbi; the store is a
@@ -424,7 +468,10 @@ class App private constructor(
             cfg: Config,
             store: com.posthog.hoglake.hoglite.HogliteCatalogStore,
             healthProbe: HealthProbe,
-        ): App = buildShared(App(cfg, null, store, healthProbe), cfg, dataSource = null)
+        ): App =
+            App(cfg, null, store, healthProbe)
+                .also { it.constructHogliteServices() }
+                .let { buildShared(it, cfg, dataSource = null) }
 
         private fun buildShared(
             app: App,

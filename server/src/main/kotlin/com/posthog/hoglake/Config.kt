@@ -57,14 +57,14 @@ data class Config(
      * to the owning pod). Required when [database] is
      * [DatabaseBackend.HOGLITE].
      */
-    val hogliteUrl: String = env("HOGLAKE_HOGLITE_URL", ""),
+    val hogliteUrl: String = hogliteEnv(database, "HOGLAKE_HOGLITE_URL", ""),
     /**
      * Base URL of the hoglite WHALE pool's service. Empty = whale
      * tenants are reached through [hogliteUrl]'s proxy instead of
      * pinned direct (correct either way; pinning skips a hop after a
      * 421 class hint).
      */
-    val hogliteWhaleUrl: String = env("HOGLAKE_HOGLITE_WHALE_URL", ""),
+    val hogliteWhaleUrl: String = hogliteEnv(database, "HOGLAKE_HOGLITE_WHALE_URL", ""),
     /**
      * URL pattern for addressing one hoglite pod directly, with
      * `{owner}` where the pod's stable name goes — e.g.
@@ -74,15 +74,15 @@ data class Config(
      * is config rather than convention because the headless service
      * names belong to the hoglite chart, not to this repo.
      */
-    val hogliteOwnerUrlPattern: String = env("HOGLAKE_HOGLITE_OWNER_URL_PATTERN", ""),
+    val hogliteOwnerUrlPattern: String = hogliteEnv(database, "HOGLAKE_HOGLITE_OWNER_URL_PATTERN", ""),
     /** TCP connect bound per hoglite call. Failing fast is the point: a request must 503 quickly, never hang. */
-    val hogliteConnectTimeoutMs: Long = env("HOGLAKE_HOGLITE_CONNECT_TIMEOUT_MS", "2000").toLong(),
+    val hogliteConnectTimeoutMs: Long = hogliteEnv(database, "HOGLAKE_HOGLITE_CONNECT_TIMEOUT_MS", "2000").toLong(),
     /**
      * Per-attempt response bound for READS (`/query`, `/status`).
      * Interactive reads must fail fast; a slow hoglite owner is
      * surfaced as `backend_unavailable`, never as a hung handler.
      */
-    val hogliteReadTimeoutMs: Long = env("HOGLAKE_HOGLITE_READ_TIMEOUT_MS", "5000").toLong(),
+    val hogliteReadTimeoutMs: Long = hogliteEnv(database, "HOGLAKE_HOGLITE_READ_TIMEOUT_MS", "5000").toLong(),
     /**
      * Per-attempt response bound for COMMITS (`/tx`). Longer than the
      * read bound because a commit's latency includes hoglite's group
@@ -92,7 +92,7 @@ data class Config(
      * is safely retried with the same txid (exactly-once), so the cost
      * of a bound that is too small is a retry, not corruption.
      */
-    val hogliteCommitTimeoutMs: Long = env("HOGLAKE_HOGLITE_COMMIT_TIMEOUT_MS", "10000").toLong(),
+    val hogliteCommitTimeoutMs: Long = hogliteEnv(database, "HOGLAKE_HOGLITE_COMMIT_TIMEOUT_MS", "10000").toLong(),
     /**
      * Total wall-clock budget one request will spend RETRYING hoglite
      * (421 re-routes, 503 owner-loss, transport errors) before it gives
@@ -101,14 +101,14 @@ data class Config(
      * the commit admission bound so the typed backpressure a caller
      * gets first is `commit_queue_timeout`'s, not this.
      */
-    val hogliteRetryBudgetMs: Long = env("HOGLAKE_HOGLITE_RETRY_BUDGET_MS", "8000").toLong(),
+    val hogliteRetryBudgetMs: Long = hogliteEnv(database, "HOGLAKE_HOGLITE_RETRY_BUDGET_MS", "8000").toLong(),
     /*
      * Prefix every hoglite tenant id with this deployment's name, so two
      * hoglake deployments sharing one hoglite cluster never address the
      * same tenant. Change it only before first boot: existing tenants
      * keep the id they were created under.
      */
-    val hogliteTenantPrefix: String = env("HOGLAKE_HOGLITE_TENANT_PREFIX", "hoglake-"),
+    val hogliteTenantPrefix: String = hogliteEnv(database, "HOGLAKE_HOGLITE_TENANT_PREFIX", "hoglake-"),
     /**
      * Circuit breaker, per hoglite POOL (standard/whale — the two pools
      * fail independently, so the breaker is per pool and not global):
@@ -117,9 +117,14 @@ data class Config(
      * [hogliteCircuitOpenMs], turning a down pool into instant typed
      * 503s instead of timeout convoys. 0 disables.
      */
-    val hogliteCircuitFailureThreshold: Int = env("HOGLAKE_HOGLITE_CIRCUIT_FAILURE_THRESHOLD", "10").toInt(),
+    val hogliteCircuitFailureThreshold: Int =
+        hogliteEnv(
+            database,
+            "HOGLAKE_HOGLITE_CIRCUIT_FAILURE_THRESHOLD",
+            "10",
+        ).toInt(),
     /** How long an open breaker refuses calls before one trial is let through (half-open). */
-    val hogliteCircuitOpenMs: Long = env("HOGLAKE_HOGLITE_CIRCUIT_OPEN_MS", "5000").toLong(),
+    val hogliteCircuitOpenMs: Long = hogliteEnv(database, "HOGLAKE_HOGLITE_CIRCUIT_OPEN_MS", "5000").toLong(),
     /**
      * How many threads serve blocking route handlers (#218).
      *
@@ -1465,16 +1470,21 @@ data class Config(
                 "base URL, e.g. http://hoglite.hoglite.svc:8080); without it every catalog call " +
                 "would fail at request time instead of refusing the boot"
         }
-        require(hogliteOwnerUrlPattern.isEmpty() || hogliteOwnerUrlPattern.contains("{owner}")) {
+        // The remaining hoglite checks are HOGLITE-only, like the knobs'
+        // parsing (hogliteEnv): a Postgres deployment never builds a
+        // hoglite client, so a stray HOGLAKE_HOGLITE_* value must not
+        // refuse its boot.
+        val hoglite = database == DatabaseBackend.HOGLITE
+        require(!hoglite || hogliteOwnerUrlPattern.isEmpty() || hogliteOwnerUrlPattern.contains("{owner}")) {
             "HOGLAKE_HOGLITE_OWNER_URL_PATTERN must contain the literal {owner} where the owning " +
                 "pod's stable name goes, got '$hogliteOwnerUrlPattern'"
         }
-        require(hogliteConnectTimeoutMs >= 1 && hogliteReadTimeoutMs >= 1 && hogliteCommitTimeoutMs >= 1) {
+        require(!hoglite || hogliteConnectTimeoutMs >= 1 && hogliteReadTimeoutMs >= 1 && hogliteCommitTimeoutMs >= 1) {
             "hoglite timeouts must be positive: HOGLAKE_HOGLITE_CONNECT_TIMEOUT_MS=" +
                 "$hogliteConnectTimeoutMs HOGLAKE_HOGLITE_READ_TIMEOUT_MS=$hogliteReadTimeoutMs " +
                 "HOGLAKE_HOGLITE_COMMIT_TIMEOUT_MS=$hogliteCommitTimeoutMs"
         }
-        require(hogliteCircuitFailureThreshold >= 0 && hogliteCircuitOpenMs >= 1) {
+        require(!hoglite || hogliteCircuitFailureThreshold >= 0 && hogliteCircuitOpenMs >= 1) {
             "HOGLAKE_HOGLITE_CIRCUIT_FAILURE_THRESHOLD=$hogliteCircuitFailureThreshold must be >= 0 " +
                 "(0 disables the breaker) and HOGLAKE_HOGLITE_CIRCUIT_OPEN_MS=$hogliteCircuitOpenMs >= 1"
         }
@@ -1783,6 +1793,19 @@ data class Config(
             name: String,
             default: String,
         ): String = System.getenv(name)?.takeIf { it.isNotBlank() } ?: default
+
+        /**
+         * A `HOGLAKE_HOGLITE_*` knob: read only when [database] is
+         * HOGLITE, the default otherwise. A Postgres deployment never
+         * builds a hoglite client, so a malformed hoglite value in a
+         * shared values file must not refuse its boot (it would, as a
+         * NumberFormatException, if it were parsed).
+         */
+        private fun hogliteEnv(
+            database: DatabaseBackend,
+            name: String,
+            default: String,
+        ): String = if (database == DatabaseBackend.HOGLITE) env(name, default) else default
 
         /**
          * A backend selector that refuses anything but the two spellings,
