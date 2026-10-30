@@ -34,8 +34,10 @@ reads and writes data files — always outside the commit path).
 
 `GET /v1/catalogs/{catalog}/storage-usage` returns
 `{"tracked_bytes":"1234","pending_delete_files":"2"}`: **decimal int64 strings**,
-so a client must parse them losslessly. The existing v1 API has no application
-authentication; keep the service **network-private**, never expose this route
+so a client must parse them losslessly. Application authentication is optional
+(`HOGLAKE_AUTH_MODE`, default `off`); under `enforce` this route needs `read` on
+the catalog, and a catalog the caller is not entitled to is 404. Under `off`, keep
+the service **network-private**, never expose this route
 publicly, and resolve a caller's catalog through the consuming service's own
 tenant authorization. Database predicates are bound to the resolved catalog id.
 
@@ -80,9 +82,9 @@ has the reasoning for each precondition and for what is left to cascade.
 
 ## The data model
 
-Everything hangs off five ideas (`db/migration/V1__init.sql`, mirrored
-by the canonical `schema.sql`; an integration test asserts the two
-stay structurally identical):
+Everything hangs off five ideas (`db/migration/V1__init.sql` onward;
+the canonical `schema.sql` is the fold of the whole migration chain, and an
+integration test asserts the two stay structurally identical):
 
 **Snapshots are the clock.** Every mutation — DDL, append, delete —
 commits exactly one `hog_snapshot` row with a **dense, per-catalog
@@ -100,8 +102,11 @@ or blank field returns 422 naming it before mutation. DELETE routes take query
 parameters; truncate takes a JSON body and retains its mandatory UUID guard.
 Retention reductions also require both, including enabling finite retention from
 unlimited retention. Options patches are audited without creating a snapshot.
-Audit `actor` matches the author and `operation_message` carries the reason;
-these fields describe caller attribution, not an authenticated identity.
+Audit `actor` matches the author and `operation_message` carries the reason.
+Under `HOGLAKE_AUTH_MODE=off` these fields are caller attribution, not an
+authenticated identity; with a token (`warn`/`enforce`) `author` is filled from
+the token's actor or checked against it — a mismatch is 422, unless the token
+delegates, in which case it is recorded as `<author> via <token actor>`.
 Blank includes Unicode space characters and NEXT LINE (U+0085), matching Python.
 Atomic definitions carrying attribution use durable format v7; older servers
 cannot read those receipts. Complete the server rollout before preparing attributed
@@ -582,7 +587,8 @@ order, atomically, as one DDL commit** (one snapshot, one
 `table_altered` change row, one schema-version bump). Renames keep the
 `field_id` (end the old row, begin a new one with the same id), so
 files written before a rename still bind correctly. Type promotion is
-a strict widening lattice (`int→long`, `float→double`) chosen so
+a strict widening lattice (`int8→int16→int→long` and `uint8→uint16→uint32`, any rung to any
+higher one, plus `float→double`) chosen so
 existing files remain readable under the new schema — and a promote
 **re-encodes the table's existing stats bounds** (4-byte → 8-byte
 Iceberg encoding) in the same transaction, so nothing downstream ever
@@ -1016,8 +1022,9 @@ defaults do not clear a backlog; the values that do live in the chart, and
 they are a pair (a batch large enough to keep the workers busy, an
 interval near a run's own duration, which the reference check sets at ~20 s
 cold for 4 x 1,000 rows). A worker holds a pooled connection across that
-check, so `HOGLAKE_COMPACTION_PARALLEL_GROUPS + HOGLAKE_CLEANUP_WORKERS`
-is refused at boot above `HOGLAKE_DB_POOL_SIZE -
+check, so the draw of the loops that are on —
+`HOGLAKE_COMPACTION_PARALLEL_GROUPS` + `HOGLAKE_CLEANUP_WORKERS` + 1 for the
+reindex loop, each counted only when its interval is > 0 — is refused at boot above `HOGLAKE_DB_POOL_SIZE -
 FOREGROUND_CONNECTION_RESERVE`: at the default pool of 10 with reserve 4
 and 6 groups, no worker count is legal, which is why prod-us raised
 `dbPoolSize` to 16 — that is what makes 1 worker (and up to 6) legal. A claim is a
@@ -1275,14 +1282,17 @@ timeout served as a 500 — with nothing in the 500 naming the knob that
 caused it. So the server **refuses to boot** when
 
 ```
-HOGLAKE_COMPACTION_PARALLEL_GROUPS > HOGLAKE_DB_POOL_SIZE - 4
+compaction draw + cleanup draw + reindex draw > HOGLAKE_DB_POOL_SIZE - 4
 ```
 
-naming both variables in the failure. The four are a FLOOR, not a model
+where each draw counts only if its loop is on (interval > 0): compaction is
+`HOGLAKE_COMPACTION_PARALLEL_GROUPS`, cleanup is `HOGLAKE_CLEANUP_WORKERS`, and
+reindex is 1. The failure names every variable involved. The four are a FLOOR, not a model
 of demand: the hydrator, expiry, cleanup, retirement and the metrics
 sampler draw on the same pool, and a busy instance's foreground wants
 more than four of its own. Raise the pool with the knob — at the
-default pool of 10 the ceiling is 6.
+defaults (pool 10, cleanup on with 1 worker, reindex off) the
+`HOGLAKE_COMPACTION_PARALLEL_GROUPS` ceiling is 5.
 
 **`HOGLAKE_REQUEST_THREADS`** (default **`HOGLAKE_DB_POOL_SIZE`**) is
 the pool's other customer, and it is sized against the same arithmetic
@@ -1341,7 +1351,7 @@ Its footprint is worth stating because it is the knob that is ON by
 default. The worst case is `parallelGroups x inputOpenParallelism`
 readers each holding a parsed footer, and a footer read is capped at
 `S3InputFile.DEFAULT_MAX_PREFETCH_BYTES` (64 MiB) — so at the highest
-`parallelGroups` a default pool allows, 6 x 8 x 64 MiB is the
+`parallelGroups` a default pool allows, 5 x 8 x 64 MiB is the
 arithmetic bound, against kilobytes per footer for every real file. The
 window is per GROUP and is not divided by `parallelGroups`; an operator
 running both knobs high on a small pod should lower one of them.
@@ -1908,7 +1918,9 @@ supersession) stay uncounted: they re-plan on the next run. A fourth
 reason, `object_prefix_layout`, counts TABLES, not groups: one per sweep
 for each table with the object-prefix layout (see Partitioning), which
 compaction leaves alone until it writes under the layout. It is a steady
-rate while such tables exist, not an alert.
+rate while such tables exist, not an alert. A fifth, `claimed_elsewhere`,
+counts groups dropped because another run already claimed them — duplicated
+work that did not happen, not a failure.
 
 **`reason="failed"` is a FAILURE filed under a metric named
 `skipped`.** That is deliberate — one series for "groups that did not
@@ -2131,9 +2143,11 @@ The catalog reports on itself instead of waiting for ops SQL:
   more sampled groups than the listing will materialise is 422, because
   it decodes, sorts and pages in memory. The webui's partitions tab
   renders this.
-- **`GET .../tables/{t}/partitions/lookup`** — exact inspection with an
-  explicit `spec_id` and a complete JSON tuple in `values` (stored
-  strings or JSON nulls). It requires no maintenance policy or sample.
+- **`POST .../tables/{t}/partitions/lookup`** (`read` scope) — exact
+  inspection of one complete tuple, sent as the JSON array request body
+  (stored strings or JSON nulls), with `spec_id` (required), `snapshot`,
+  `limit` (1-500, default 100) and `cursor` as query parameters. It requires
+  no maintenance policy or sample.
   Resolves head once, pins file pages to that snapshot, and binds the
   opaque cursor to the table incarnation, spec, tuple, and page size.
   The initial file-ID ceiling bounds the scan even during concurrent
@@ -2156,7 +2170,9 @@ The catalog reports on itself instead of waiting for ops SQL:
   A shared three-second transaction budget includes database work across
   statements; pool acquisition reduces the remaining budget and has its
   own five-second bound. Admission allows two lookups per process and
-  one per catalog, without queuing.
+  one per catalog; a request that cannot start waits up to 200 ms in a
+  FIFO bounded at four waiters per process and two per catalog, then
+  returns 503.
   The existing file stats endpoint resolves namespaces at head, so
   it may return 404 for files reached through a historical namespace
   that has since been dropped/recreated.
@@ -2170,8 +2186,8 @@ The catalog reports on itself instead of waiting for ops SQL:
   returned verbatim for a client to offer as a filter and echo back as
   `partition=key_index:value` on `GET .../files`.
 - **`GET .../maintenance/status`** and **`GET .../maintenance/runs`**,
-  with instance-wide twins at **`GET /maintenance/status`** and
-  **`GET /maintenance/runs`** — the read side of `hog_maintenance_run`
+  with operator-only instance-wide twins at **`GET /v1/maintenance/status`** and
+  **`GET /v1/maintenance/runs`** — the read side of `hog_maintenance_run`
   (the ledger every background sweep and manual trigger writes) plus the
   persisted summaries. `status` is per-task: loop cadence, the task's own
   backlog keys (hydrator `pending_files`/`failed_files`, expiry's
@@ -2206,7 +2222,9 @@ The catalog reports on itself instead of waiting for ops SQL:
 Three surfaces, none of which ever writes to the catalog or rides a
 transaction (`observability/`):
 
-- **`/metrics`** (Prometheus): per-catalog health gauges sampled by a
+- **`/metrics`** (Prometheus; operator-only on the API port, and served
+  with no auth on the infra listener at `HOGLAKE_METRICS_PORT` when that is
+  > 0): per-catalog health gauges sampled by a
   background loop in GROUPS. The CORE group (one batched per-catalog
   query plus one consumer-offset query) runs on every pod that samples
   (`HOGLAKE_METRICS_INTERVAL_MS > 0`, since `/v1/info` and the catalogs
@@ -2231,7 +2249,8 @@ transaction (`observability/`):
   summary, which stamps them per catalog when it publishes a generation
   (V27), not from the manifest (#269): one row per catalog, minutes
   behind head on a large instance, and the sampler never scans
-  `hog_data_file` — the rare counts come from partial indexes (V26). A
+  `hog_data_file` — the rare counts come from partial indexes (V26, and
+  V31 for `prefix_quarantined`). A
   catalog with no published totals yet publishes NO live series
   (`hoglake_live_totals_sampled{catalog}` = 0) and `null` on the wire,
   and is never read from its own manifest for them.
@@ -2394,8 +2413,8 @@ transaction (`observability/`):
   every expiry delete and compaction supersession stays unreclaimable
   until it ends). The WARN set is `long_transaction`, `lock_wait`,
   `dead_tuples`, `never_analyzed`, `sequential_scans`, `unused_indexes`,
-  `cache_hit_ratio`, `connection_saturation` and
-  `checkpoints_requested`; `temp_files` is INFO.
+  `cache_hit_ratio`, `connection_saturation`, `index_bloat` and
+  `checkpoints_requested`; `temp_files` and `toast_dominant` are INFO.
 - **Health**: `/healthz` proves the catalog is reachable (`SELECT 1`
   on the probe's OWN one-connection pool, bounded four ways by
   `HOGLAKE_HEALTH_PROBE_TIMEOUT_MS` — Hikari `connectionTimeout`,
@@ -2410,16 +2429,17 @@ transaction (`observability/`):
 ### Background assembly
 
 `App.kt` wires services into Ktor and `startBackground()` runs the
-loops — hydrator, expiry, cleanup, compaction (default off:
+loops — maintenance summary, hydrator, expiry, cleanup, compaction (default off:
 `HOGLAKE_COMPACTION_INTERVAL_MS=0` — flipping it on is an ops
-decision), retirement (also default off), metrics sampler — as
+decision), retirement (also default off), reindex (also default off), metrics sampler — as
 **coroutines under one supervisor scope** (`BackgroundLoops`), each
 with its own interval knob
 (`Config.kt`, all env-sourced, `<= 0` disables), per-catalog failure
 isolation (a failed iteration is logged + counted and the loop keeps
 running), and structured, bounded shutdown (cancel + join, 5s cap).
 `Main.kt` = migrate (under an advisory lock, so replicas don't race
-DDL) → assemble → start loops → serve.
+DDL) → assemble → start loops → start the metrics listener (when
+`HOGLAKE_METRICS_PORT` > 0) → serve.
 
 **Every route handler's blocking work runs off the Netty event loop**
 (`api/BlockingDispatch.kt`, #218): one interceptor in its own phase,
@@ -2501,7 +2521,7 @@ Served at the root (not under `/v1`), documented in
 |---|---|---|
 | `GET /livez` | Process liveness only — never touches the database | **liveness** (a database outage must not restart pods) |
 | `GET /healthz` | Readiness: the catalog must answer (`SELECT 1` on the probe's own connection, bounded by `HOGLAKE_HEALTH_PROBE_TIMEOUT_MS`; the zombie-server incident is why it touches the database at all, #218 is why it no longer touches the request pool) | **readiness** (an unready pod leaves the Service) |
-| `GET /metrics` | Prometheus text exposition | scrape target, never a probe |
+| `GET /metrics` | Prometheus text exposition; operator-only on the API port, unauthenticated on the infra listener (`HOGLAKE_METRICS_PORT`, when > 0), which serves only this route | scrape target (via the infra listener), never a probe |
 
 One more read-only operational endpoint is served under `/v1`, not the
 root:
@@ -2563,18 +2583,19 @@ must set it by hand.
 ## Layout
 
 - `src/main/resources/db/migration/` — Flyway. `V1__init.sql` is frozen
-  as of v1.0.0 and the chain is append-only from there; V22 is the
+  as of v1.0.0 and the chain is append-only from there; V32 is the
   latest. `schema.sql` is the canonical twin, equivalence-tested.
 - `src/main/kotlin/com/posthog/hoglake/`
   - `model/` — domain types (mirror the OpenAPI schemas).
   - `persistence/` — JDBI repositories; all SQL parameterized.
   - `service/` — DDL, alter, scan, views, options, expiry, cleanup.
   - `commit/` — the commit path (OCC, lock tail, row-id assignment).
-  - `compaction/` — small-file merging (the only parquet-java user).
+  - `compaction/` — small-file merging.
   - `hydrator/` — deferred-stats hydration.
   - `stats/` — Iceberg single-value bounds codec.
   - `observability/` — metrics, audit, request ids.
   - `api/` — Ktor routes implementing the spec.
+  - `auth/` — token verification, the route authorization table, auth modes.
 
 ## Testing
 
@@ -2620,11 +2641,13 @@ eligible for operator cleanup, after their writers have stopped. Never remove
 files from committed operations based on operation age; normal catalog retention
 owns their lifecycle. There is no automatic fallback to staging-table rename.
 
-The API supports unpartitioned creation, at most 10000 columns and 10000 files per
-operation, and validates registration metadata using the existing append checks.
+The base API supports unpartitioned creation (partitioned and sorted creation
+use the `/partitioned` and `/sorted` preparation variants, advertised as
+`atomic-partitioned-table-creation-v1` and `atomic-sorted-table-creation-v1`),
+at most 10000 columns and 10000 files per operation, and validates registration metadata using the existing append checks.
 It does not open Parquet objects at publication time. Field IDs are table-local,
 start at one, and are installed with the prepared UUID at publication. Expanding
-receipt retention, automated orphan cleanup, or idempotent INSERT is separate work.
+receipt retention or automated orphan cleanup is separate work.
 
 Atomic preparation, publication, and abort emit `table_creation_*` audit events
 after their transactions finish. `hoglake_table_creation_total` labels attempts
@@ -2658,7 +2681,8 @@ DuckDB, hedgerow and the console) retain their existing behavior and need no wir
 changes. `/commit/prepared` remains supported. Manual SQL reruns, query/task
 retries and orphan collection are outside this guarantee.
 
-The standalone server has no application authentication. Protect this lookup
+Application authentication is optional (`HOGLAKE_AUTH_MODE`, default `off`);
+under `enforce` this lookup needs `read` on the catalog. Under `off`, protect it
 with the same authenticated deployment boundary and catalog authorization as
 `/commit`; catalog scoping alone is not authentication. This change does not
 introduce an authentication framework or authorize any deployment.

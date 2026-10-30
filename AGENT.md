@@ -158,19 +158,19 @@ path-scoped per component, posthog-monorepo style:
 | `server.yml` | every PR and push to main; a `changes` job selects `server/**`, codec vectors, the live-test harness, the file itself, and the heavy jobs skip otherwise (REQUIRED CHECK `server-checks`, the gate over `server-test` and `python-live`; see the ruleset note below) | server-test + ktlint (Docker/Testcontainers; schema-equivalence gate included), both live Python suites, and a `server-checks` gate that requires both suites before deployment, PR image boot-smoke, the gated `deploy` job, and `trino-test` — the integration harness against the fork's public image (`ghcr.io/posthog/trino`, newest ordered release tag; pin via the `HOGLAKE_TRINO_IMAGE` repo variable). trino-test runs on an ARM runner (the image is arm64-only), is NOT in deploy's `needs`, and must stay non-required: a broken fork build must never wedge hoglake CD |
 | `migration-chain.yml` | every PR and push to main, NO path filter | the append-only / no-duplicate-version / numbered-above-main gate on `server/src/main/resources/db/migration`, fetching main fresh at run time. Its own workflow because it is a REQUIRED CHECK, and it was the first to hit the rule below |
 | `webui.yml` | every PR and push to main; a `changes` job selects `webui/**`, the OpenAPI spec, the shared vectors, the file itself (REQUIRED CHECK `webui-test`) | `npm run build` (tsc gate) + vitest + PR image boot-smoke + gated `deploy` job |
-| `ci-python.yml` | every PR and push to main; a `changes` job selects `pyhoglake/**`, `hedgerow/**`, `millrace/**`, `bench/**`, the root `pyproject.toml` and `uv.lock`, the OpenAPI spec, `ci/**`, the workflow files, the server files and `.github/dependabot.yml` the client's tests read (the filter's comment names each), and the jobs skip otherwise (REQUIRED CHECK `python-checks`) | pyhoglake: `pyhoglake-checks.yml` (ruff, mypy, pytest on 3.12–3.13, the variant suites on the pyarrow floor `pyproject.toml` declares and — non-blocking — on the newest pyarrow at least 7 days old, build, wheel smoke test). hedgerow and bench: uv sync, ruff (pinned; bench exempt until its format backlog lands), pytest. Unit tests plus both live client suites through `python-live.yml`; a `python-checks` job fails if any dependency fails |
+| `ci-python.yml` | every PR and push to main; a `changes` job selects `pyhoglake/**`, `hedgerow/**`, `millrace/**`, `bench/**`, the root `pyproject.toml` and `uv.lock`, the OpenAPI spec, `ci/**`, the workflow files, the server files and `.github/dependabot.yml` the client's tests read (the filter's comment names each), and the jobs skip otherwise (REQUIRED CHECK `python-checks`) | pyhoglake: `pyhoglake-checks.yml` (ruff, mypy, pytest on 3.12–3.13, the variant suites on the pyarrow floor `pyproject.toml` declares and — non-blocking — on the newest pyarrow at least 7 days old, build, wheel smoke test). hedgerow and bench: uv sync, ruff (pinned; bench exempt until its format backlog lands), pytest. millrace: uv sync, ruff, mypy, pytest, and the mutmut survivors gate. Unit tests plus both live client suites through `python-live.yml`; a `python-checks` job fails if any dependency fails |
 | `bench-image.yml` | `bench/**` `pyhoglake/**` root `pyproject.toml` `uv.lock` | builds `bench/Dockerfile` (context = REPO ROOT: bench installs pyhoglake as a uv workspace member from the root `uv.lock`, so the root manifest, the lock, pyhoglake and every member's `pyproject.toml` must be in the context) and smokes it — CLI runs, non-root, no `.venv`, and the installed pyhoglake is this commit's and not PyPI's. A main push then publishes multi-arch `ghcr.io/posthog/hoglake-bench` (sha + `latest`), gated on the smoke and live client tests. NOT CD: no charts dispatch, no chart references it, it is pulled by hand into `bench/deploy/bench-pod.yaml`. Its build stage is deliberately NOT `$BUILDPLATFORM`-pinned — a virtualenv holds native wheels, so each arch installs its own |
 | `millrace-image.yml` | `millrace/**` `pyhoglake/**` root `pyproject.toml` `uv.lock` `ci/**` | builds `millrace/Dockerfile` (context = REPO ROOT, same reason as bench) and smokes it — both entrypoints (`millrace`, `python -m millrace.maintenance`) refuse an empty env at config with exit 2, non-root, no `.venv`, pyhoglake is this commit's. A main push publishes multi-arch `ghcr.io/posthog/hoglake-millrace` tagged `r<UTC minute>-<sha6>` (the Kargo release tag; `org.opencontainers.image.revision`/`.source` annotations on the index, verified after push), by sha, and `latest`, gated on the smoke and the live suites. No charts dispatch: a Kargo Warehouse in PostHog/charts subscribes to the repository |
 | `ecr-release.yml` | runs when `Server` or `Webui` completes on main (`workflow_run`); PRs that change the workflow or `.github/scripts/ecr-release.sh` run a dry run, and `workflow_dispatch` runs one on any branch | the Kargo path for the customer hoglake instance, ADDITIVE to the gigahog CD below. A `gate` job reads `server-checks` and `webui-test` for the commit. It publishes when no gate failed and at least one passed. It does not read the `deploy` jobs. One `publish` job builds BOTH images (same contexts and platforms as the `deploy` jobs) and pushes BOTH to the shared-services ECR with ONE tag, `r<UTC minute>-<sha6>`, plus the `org.opencontainers.image.revision`/`.source` annotations on the index and each manifest. ECR gets that tag only: the repositories have immutable tags. A rerun uses the commit's existing release again and pushes only a missing image. The job reads the role ARN from the `HOGLAKE_AWS_ECR_PUBLISH_IAM_ROLE` secret. The Warehouse makes Freight only when both repositories have the same newest tag, so never publish one image alone. The dry run, from a PR or from a manual dispatch, pushes to a local registry and runs the same checks without AWS. A dispatch on main with `dry_run` false publishes, and reads the same test gates as a push to main. A dispatch on a branch other than main must set `dry_run`, because the role trust accepts only `refs/heads/main`. Not a required check |
-| `python-live.yml` | reusable: server, Python checks, benchmark image | builds the checked-out server, starts PostgreSQL and MinIO, runs both live client suites (`live` job) and the millrace Kafka-ingestion live suite (`live-millrace` job, which adds apache/kafka to the stack via `ci/live-millrace.sh`), rejects skipped or empty reports, and saves logs and JUnit reports. A failed live run blocks server deployment, PyPI publishing, and benchmark image publishing |
+| `python-live.yml` | reusable: server, Python checks, benchmark image, millrace image | builds the checked-out server, starts PostgreSQL and MinIO, runs both live client suites (`live` job) and the millrace Kafka-ingestion live suite (`live-millrace` job, which adds apache/kafka to the stack via `ci/live-millrace.sh`), rejects skipped or empty reports, and saves logs and JUnit reports. A failed live run blocks server deployment, PyPI publishing, and benchmark and millrace image publishing |
 | `publish-pyhoglake.yml` | `pyhoglake-v*` tags; PRs touching the workflow | `pyhoglake-checks.yml`; tags also publish to PyPI (trusted publishing, `pypi` environment) and create a non-latest GitHub release |
-| `fuzz.yml` | nightly cron + dispatch | `./gradlew fuzz` over every Jazzer target (600s each by default), with the generated corpus accumulated across nights through the actions cache. Not a PR check: PR CI only REPLAYS the committed seed corpus, inside `:test` |
+| `fuzz.yml` | nightly cron + dispatch | `./gradlew fuzz` over every Jazzer target (900s per soak target, 60s per sweep target, by default), with the generated corpus accumulated across nights through the actions cache. Not a PR check: PR CI only REPLAYS the committed seed corpus, inside `:test` |
 | `semgrep.yml` | all | python / kotlin+java / general packs, pinned container |
 | `dependency-review.yml` | PRs | vulnerability gate (license allow-list deferred until the three-ecosystem atom set settles) |
 
 Live Python failures block deployment and publishing. The current merge
-rules require `migration-chain`, `server-test`, and `webui-test`; the live
-Python results are visible on the PR but are not required for merge.
+rules require `migration-chain`, `server-checks`, `python-checks`, and
+`webui-test`; the live Python suites are required through those gates.
 
 **Required checks run on every PR, by construction.** The main
 ruleset ("Require to be up to date", repository-level) requires
@@ -194,7 +194,7 @@ every PR is blocked on a name nothing produces.
 **Require the gate, not the leaf.** Where a workflow has a gate job
 that fans in several suites (`server-checks` over `server-test` and
 `python-live`; `python-checks` over the pyhoglake checks, the live
-client suites and the hedgerow/bench checks), the ruleset requires
+client suites and the hedgerow/bench/millrace checks), the ruleset requires
 the GATE. Requiring a leaf let #304 wire the live Python suites into
 three workflows as a deploy gate and merge while that gate was red —
 the suites had been failing for days outside CI, which is what #304
@@ -237,7 +237,8 @@ suffix — `X.Y.Z-dev` in gradle/npm/the OpenAPI spec, `X.Y.Z.dev0`
 released number. Cutting a release = one PR that strips the suffix
 (bumping minor/major if warranted) across all six version strings
 (server + trino build.gradle.kts, webui package.json, pyhoglake +
-hedgerow pyproject.toml, spec `info.version`), tag it (`vX.Y.Z`;
+hedgerow pyproject.toml, spec `info.version`) plus the matching entries
+in `webui/package-lock.json` and `uv.lock`, tag it (`vX.Y.Z`;
 `pyhoglake-vX.Y.Z` additionally publishes to PyPI), then a follow-up
 commit restores the next `-dev`. The `:checkOpenapiVersion` gradle task
 (in CI) keeps the spec's `info.version` locked to the server version;
@@ -1052,7 +1053,7 @@ ran on the local stack and what it showed.
   them reviews nothing. Eight PRs each carried the clean-review line;
   three of them held the livelock, the 500 and the expiry pin above.
 - **Errors**: services throw `HoglakeException.*`; the API maps them
-  (404/409/410/422; commit admission timeout 503 + Retry-After; parse
+  (401/403/404/409/410/422; commit admission timeout 503 + Retry-After; parse
   failures 400). New failure modes get a typed exception, not a status
   code sprinkled in a route.
 - **The request path never blocks the event loop, and the probe never
@@ -1094,8 +1095,9 @@ ran on the local stack and what it showed.
   but a pod that runs loops and serves traffic should set
   `HOGLAKE_REQUEST_THREADS` below the pool by the number of loops it
   runs. SHUTDOWN ORDER IS PART OF THE FIX: `Main.kt` stops the ENGINE
-  first and only then closes the loops and the pools, and both new pools
-  close with `shutdown()` + a bounded wait rather than `shutdownNow()` —
+  first, then the metrics listener, and only then closes the loops and the
+  pools, and both new pools close with `shutdown()` + a bounded wait,
+  falling back to `shutdownNow()` only when the wait expires —
   interrupting an in-flight commit to save a second of shutdown is the
   behaviour #218 complains about.
   The incident narrative, the Netty call-group floor, the probe's own
@@ -1109,7 +1111,8 @@ ran on the local stack and what it showed.
   (`api/RequestDispatchIntegrationTest`), and any future change to
   request dispatch belongs there too.
 - **Background loops are coroutines**: every periodic job (hydrator,
-  expiry, cleanup, compaction, retirement, reindex, metrics sampler)
+  expiry, cleanup, compaction, retirement, reindex, metrics sampler,
+  maintenance_summary)
   registers with
   `BackgroundLoops` (one supervisor scope owned by
   `App.startBackground()`) — never a raw daemon thread. Contracts:
@@ -1485,11 +1488,11 @@ ran on the local stack and what it showed.
     invisible in a green suite and visible in seconds of replay (#75).
   - **hedgerow** and the **webui** consume the same wire and restate the
     same vocabularies, and neither is exercised by the server suite
-    either — `webui/src/api/types.ts` still has no `variant`.
+    either.
   - Worked example, `TableSummary` growing five fields + `comment`
     (#189): pyhoglake and the webui implemented them; the **DuckDB
     extension**'s `HoglakeApiClient::ListTables`
-    (duckdb-client/src/rest/hoglake_api_client.cpp:552) reads only
+    (duckdb-client/src/rest/hoglake_api_client.cpp:689) reads only
     `name` and `table_uuid` off each array member and ignores the rest,
     so an additive change is safe there and it was left alone;
     **hedgerow** never calls the endpoint at all. Saying
@@ -1690,7 +1693,7 @@ ran on the local stack and what it showed.
   file, inserted only for the expiry purge to cascade-delete (~642M of
   them on millrace-prod-us's 24.7M pending files on 2026-10-22).
   server/README.md §File registration has the reasoning.
-- **Maintenance verify — REMOVED (#261, 2026-10-01)**: `POST
+- **Maintenance verify — REMOVED (#279, 2026-10-02; tracked by #261)**: `POST
   /v1/catalogs/{c}/maintenance/verify`, its background loop
   (`HOGLAKE_VERIFY_INTERVAL_MS`), its `hoglake_verify_violations` /
   `hoglake_verify_errors_total` metrics, its console panel and its
@@ -1748,7 +1751,7 @@ ran on the local stack and what it showed.
   retirement bullet above. The other nine have no at-rest enforcer in any
   environment. Four are now asserted in the TEST suite only, by
   `testing/CatalogInvariants.kt`: `visibility_bounds`, `removal_queue` at
-  the compaction boundary, `snapshot_density` (all 8 concurrent-commit
+  the compaction boundary, `snapshot_density` (all 10 concurrent-commit
   sites in `CompactionParallelIntegrationTest`), and `staging_tickets`
   arm (c) — rebuilt because they were the oracle's only falsifiable arms
   at those call sites and nothing else covers them. The versioned-table
@@ -1780,9 +1783,10 @@ ran on the local stack and what it showed.
   rather than submodules (the repo root was out of the branch's write
   scope; they become submodules on extraction to a standalone
   community-extension repo). Its DESIGN.md ends with numbered
-  **findings for the server**; the two still open are no
-  `explicit_row_ids` on `FileRegistration` (#30) and head-only listings
-  (#28), each capping a parity item.
+  **findings for the server**; four are still open: two
+  documented divergences (no transactional DDL, append-only `/changes`)
+  and no `explicit_row_ids` on `FileRegistration` (#30) and head-only
+  listings (#28), each capping a parity item.
 - **CDC publications to Kafka (the WAL tap)**: fully specified in the
   OpenAPI (501s) + README; not implemented.
 - **DR/export**: `GET /v1/catalogs/{c}/export` specified in the OpenAPI
@@ -1802,8 +1806,9 @@ ran on the local stack and what it showed.
   `DELETE /v1/catalogs/{catalog}` and the maintenance routes: it is a
   measurement mode, not a partial enforcement, and a `read`-only tenant
   writes freely while it is on. Deploy it where that is acceptable, which
-  is anywhere the current behaviour is already "no auth at all". `/metrics` is now operator-only, which the Prometheus scrape job
-  needs a token for before `enforce`. Issuance and per-tenant S3 credential
+  is anywhere the current behaviour is already "no auth at all". `/metrics` on the main port is operator-only; set
+  `HOGLAKE_METRICS_PORT` before `enforce` and scrape that infra listener,
+  which serves the same registry with no auth and needs no token. Issuance and per-tenant S3 credential
   vending live in `PostHog/hogtower`, not here: it already holds the
   tenant→catalog→IAM-role→bucket mapping, an `sts:AssumeRole` broker and the
   warehouse-scoped machine credentials. hoglake is a resource server — set
@@ -1816,9 +1821,9 @@ ran on the local stack and what it showed.
 - Catalog drop (#412) is server + pyhoglake only: no console action and no
   DuckDB-client vocabulary yet, and no offset-delete API, so a catalog any
   consumer ever read is undroppable without hand-deleting its offsets.
-- `bench/` is outside `just lint-all`: it passes `ruff check` but 12
-  files fail `ruff format --check`. Format it and wire it in (pin ruff
-  in its dev group, add the `lint` recipe) as its own change, so the
+- `bench/` is outside `just lint-all`: it passes `ruff check` but 13
+  files fail `ruff format --check` (ruff 0.17.1). Format it and wire it in
+  (add the `lint` recipe) as its own change, so the
   reformat lands as a reviewable diff rather than noise inside another.
 
 ## Doc index

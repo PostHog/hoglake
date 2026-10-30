@@ -86,10 +86,11 @@ no entry in either:
    one PG. Snapshot-pinned reads are replica-able (lag-tolerant by
    construction), but that's not built yet.
 3. **Compaction IO cost at 2PB.** The never-convoy design streams both
-   ends (`S3InputFile` / `S3OutputFile`) and touches no local disk;
-   only the sorted path materializes survivors in a heap. A sweep
-   rewrites `max_groups_per_run` × `parallel_groups` groups — 1 × 1 at
-   the compiled defaults, 64 × 6 on gigahog-prod-us. At 2PB with
+   ends (`S3InputFile` / `S3OutputFile`); only the sorted path touches
+   local disk, sorting heap-bounded chunks and spilling them for the
+   merge. A sweep rewrites `max_groups_per_run` × `parallel_groups`
+   groups — 1 × 1 at the compiled defaults, 64 × 2 per pod on
+   gigahog-prod-us, which runs two compaction Deployments. At 2PB with
    continuous small-file ingestion, whether those knobs keep up with
    the small-file accumulation rate is a real capacity-planning
    question — the knobs exist; the tradeoff is intentional.

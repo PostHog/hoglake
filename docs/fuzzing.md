@@ -37,12 +37,13 @@ four are generator-friendly.
   the stamped file equals the generic Thrift codec's re-encoding of
   pyarrow's footer with the same annotations added (`tests/footer_oracle.py`),
   passes the exact layout check, and reads back as the source rows.
-- **server** (planned, kotest-property or jqwik): the same codec
-  properties on `IcebergSingleValue`, expiry `newEarliest` math under
+- **server** (kotest-property): the same codec
+  properties on `IcebergSingleValue` (`QeIcebergSingleValuePropertyTest`),
+  expiry `newEarliest` math under
   generated snapshot/offset/time configurations (invariants: never >
   head, never > min consumer offset when floored, monotone across
-  sweeps), commit row-id range tiling under generated concurrent
-  request mixes.
+  sweeps; `QeExpiryPropertyTest`), commit row-id range tiling under
+  generated concurrent request mixes (`QeCommitRowIdTilingPropertyTest`).
 
 ### 2. Cross-language differential vectors
 
@@ -51,8 +52,8 @@ four are generator-friendly.
 both suites. The Iceberg single-value encoding exists in Kotlin
 (`stats/IcebergSingleValue.kt`) and Python (`pyhoglake/bounds.py`);
 any divergence corrupts pruning silently — the vector file makes it a
-test failure instead. JVM-side consumer test: planned alongside the
-server property tests. When a fuzzer finds a nasty value, it gets
+test failure instead. JVM-side consumer tests: `QeBoundsVectorsTest`,
+`QeBoundsDecodeVectorsTest` and `QeBoundsWireVectorsTest`. When a fuzzer finds a nasty value, it gets
 promoted into the vector file.
 
 `pyhoglake/tests/vectors/variant_shredding_vectors.json`: VARIANT
@@ -176,7 +177,7 @@ Targets (one class, one `@FuzzTest` each):
 | `ParquetFooterFuzzTest` | soak | the hydrator's footer parse (`FooterParse.parse`) + `FooterStats` | `IOException` refusals only — `FooterParse` translates every other escape from parquet-java into `FooterParseException`, so the contract needs no stack inspection; `FooterStats.*` total over parsed footers; 1 MiB input cap |
 | `NestedAgreementFuzzTest` | soak | `FooterStats.aggregate` (read) and `ParquetRewriter.rewrite` (write) over one generated nested file | typed refusals only on both surfaces; ground-truth binding; no stats for an unowned field id; per-leaf value conservation; a leaf the rewriter copied must have produced reader stats |
 | `WireDtoParseFuzzTest` | soak | every structured request body, each to the depth it has: `toModel()` on `CommitRequestDto`, the polymorphic `AlterOp` and the file registrations of `PublishTableCreationDto`; the codec round trip on `PrepareTableCreationDto`; `ColumnTrees.validate` on the columns of `PrepareTableCreationDto` and of each `add_column`; parse-and-reserialize on `CreateCatalogRequestDto`, `ClaimUploadDto`, `UploadOwnerDto` and `AbandonUploadsDto` (none of which has a `toModel`); `parseExpectedTableUuid` / `parseLongQuery` on the guarded-DML query parameters | where a `toModel()` runs, it throws only what ErrorMapping turns into 4xx; where a DTO is reserialized, the bytes re-parse — compared for equality except on the bodies carrying `ColumnStatsDto`, whose `ByteArray` bounds keep identity equals by design |
-| `TableCreationDefinitionCodecFuzzTest` | soak | `TableCreationDefinitionCodec.encode`/`decode`, stored-format versions 0-6 | `decode` refuses arbitrary bytes with `CorruptDefinitionException` and nothing else, naming the receipt; `decode(encode(d)) == d`; `encode` writes the LOWEST version that can carry the definition (a rolling deploy's older reader refuses a version it does not know) |
+| `TableCreationDefinitionCodecFuzzTest` | soak | `TableCreationDefinitionCodec.encode`/`decode`, stored-format versions 0-7 | `decode` refuses arbitrary bytes with `CorruptDefinitionException` and nothing else, naming the receipt; `decode(encode(d)) == d`; `encode` writes the LOWEST version that can carry the definition (a rolling deploy's older reader refuses a version it does not know) |
 | `CommitReceiptFuzzTest` | soak | the stored commit receipt: `CommitFingerprint.commitFingerprint` over a `CommitRequest` parsed by the production wire mapper | handler-phase throws are only what StatusPages installs a handler for — `HoglakeException`, `CorruptDefinitionException`, `BadRequestException`, `JsonConvertException`, `ContentTransformationException` — and deliberately NOT `JacksonException`, which reaches the `Throwable` arm as a 500; the fingerprint is deterministic, idempotent (`fingerprint(parse(fingerprint(r))) == fingerprint(r)`) and invariant under permutation of `appends`, of `files` within an append and of `column_stats` within a file |
 | `VariantShreddingFuzzTest` | soak | the `type_params.shredding` rules (`VariantShredding.validate`, through `ColumnTrees.validate` on a top-level variant): arbitrary declarations parsed by the production wire mapper, and declarations a generator builds by the documented grammar and then breaks at most one rule of, or takes to the field or depth limit | arbitrary input: `HoglakeException.Validation` refusals only, bounded messages, the same decision after a write-and-read round trip; generated input, against the generator's own ground truth: a sound declaration is accepted, a broken one refused; its `request_*` seeds are also vectors of `variant_shredding_vectors.json` (§2), which the Python client decides too |
 | `IcebergSingleValueDecodeFuzzTest` | sweep | `IcebergSingleValue.decode` (arbitrary bytes × every ColType) | only `IllegalArgumentException` refusals; `encode(decode(x)) == x` for canonical encodings |
@@ -246,7 +247,7 @@ from `pyhoglake/tests/vectors/bounds_vectors.json` (type byte +
 encoding) for the codec targets, real parquet-java-written footers
 (with/without field ids, truncated), spec-conformant + CRC-corrupted
 puffin DV blobs, boundary identifiers, representative wire bodies, one
-stored table-creation receipt per format version (1-6 written by the
+stored table-creation receipt per format version (1-7 written by the
 codec itself, 0 hand-written because no encoder emits it any more), and
 the guarded-DML commit shapes.
 

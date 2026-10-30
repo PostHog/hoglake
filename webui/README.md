@@ -11,8 +11,8 @@ namespaces, and tables, and deliberately no drop/delete actions.
 
 A namespace's table listing is NAME, RECORD_COUNT, FILE_COUNT,
 FILE_SIZE, SNAPSHOTS, EARLIEST_SNAPSHOT, COMMENT — one `TableSummary`
-row per table, every field resolved at the catalog head (the listing
-takes no snapshot parameter). SNAPSHOTS and EARLIEST_SNAPSHOT are
+row per table, every field resolved at the catalog head (the endpoint
+takes `snapshot`/`at_timestamp`; the console requests head). SNAPSHOTS and EARLIEST_SNAPSHOT are
 RETAINED-only and shrink as expiry advances the catalog floor.
 RECORD_COUNT is gross of deletion vectors — a row a live DV masks is
 still counted, as the table page's own count is — and its header
@@ -28,7 +28,8 @@ Notable surfaces beyond the catalog browser:
 
 - **Metrics** (`/metrics` route): one snapshot of the server's
   Prometheus endpoint rendered visually — stat tiles, per-label bars,
-  histogram bucket strips. Manual refresh only, no polling.
+  histogram bucket strips. Polled (5/15/30/60 s, default 15) with
+  per-family history charts; the Refresh button still works.
 - **Partitions** (the table page's `partitions` tab): one row per
   partition of one table — files, small files, actionable debt, total
   and average size, deletion vectors, rows, and the snapshot that last
@@ -149,7 +150,7 @@ npm install
 npm run dev            # http://localhost:5173
 ```
 
-The Vite dev server proxies `/v1`, `/healthz`, and `/openapi.yaml` to
+The Vite dev server proxies `/v1`, `/healthz`, `/metrics`, and `/openapi.yaml` to
 the hoglake server at `http://localhost:8080`, so start the server first
 and the app fetches same-origin (no CORS involved). Point the proxy at a
 different server with `HOGLAKE_API=http://host:port npm run dev`.
@@ -278,8 +279,8 @@ fetch client, which parses from raw response text through the int64
 reviver and unwraps the `ApiError {error, detail}` body into a typed
 exception every page renders inline. `src/pages/` has one component per
 route (catalogs → catalog → namespace → table, plus per-catalog
-consumers and partitions/compaction-debt, and the top-level metrics
-page), `src/components/` the shared chrome (topbar with `/healthz`
+consumers, partitions/compaction-debt and maintenance, and the top-level
+metrics, database-health and central maintenance pages), `src/components/` the shared chrome (topbar with `/healthz`
 polling + readiness tooltip and the instance-name badge, breadcrumbs,
 badges, skeleton loaders, error boxes), and `src/lib/format.ts` the
 humanizers (bytes, counts, partition transforms). Tests in `test/`

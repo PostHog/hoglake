@@ -227,9 +227,6 @@ reason** — never a generic unknown-type error, because "stop trying" and
 | `interval` | no Iceberg interval type |
 | `point`, `linestring`, `polygon`, `multipoint`, `multilinestring`, `multipolygon`, `linestring_z`, `geometrycollection` | DuckLake geometry; out of scope |
 
-Still open from the DuckLake type system: VARIANT (Iceberg V3 has
-`variant` — tracking V3 for `timestamp_ns` does not commit us to it).
-
 ### 2.8 Nested types: `list`, `struct`, `map`
 
 | col_type | Iceberg | parquet | bounds |
@@ -428,7 +425,7 @@ sorts above its partner IN THAT TYPE'S ORDER, is dropped rather than
 stored — readers prune on these, so a missing bound costs a scan and a
 wrong one costs a wrong answer.
 
-Still open: VARIANT, and `list`/`map` internals as partition sources
+Still open: `list`/`map` internals as partition sources
 (Iceberg does not define them either).
 
 ## 3. Iceberg-identical partition transforms only
