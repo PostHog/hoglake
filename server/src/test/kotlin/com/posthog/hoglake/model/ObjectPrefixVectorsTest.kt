@@ -12,9 +12,10 @@ import java.util.HexFormat
  * The shared object-prefix vectors
  * (`pyhoglake/tests/vectors/object_prefix_vectors.json`) against
  * [ObjectPrefix]. pyhoglake regenerates the file and pins its count
- * (`test_object_prefix_vectors.py`); the writer that builds these paths
- * must be held to the same file when it lands, so the path the server
- * checks and the path a writer builds cannot drift apart.
+ * (`test_object_prefix_vectors.py`), and holds pyhoglake's
+ * `object_prefix`, which writers build these paths with, to the same
+ * file, so the path the server checks and the path a writer builds
+ * cannot drift apart.
  */
 class ObjectPrefixVectorsTest {
     private val root: JsonNode = ObjectMapper().readTree(Files.readString(ObjectPrefixVectorFile.resolve()))

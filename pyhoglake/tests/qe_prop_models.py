@@ -253,6 +253,7 @@ MODEL_CASES = [
                 "read_snapshot_id": st.one_of(st.none(), I64),
                 "snapshot_id": st.one_of(st.none(), I64),
                 "totals_as_of": st.one_of(st.none(), st.just("2026-09-30T00:54:00Z")),
+                "object_prefix_field": st.one_of(st.none(), st.text(max_size=12)),
                 "columns": st.lists(
                     st.fixed_dictionaries(
                         {

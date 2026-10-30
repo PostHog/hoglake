@@ -786,6 +786,19 @@ consequences the "Deferred stats" row under "Configuration" lists. For a table w
 column, `write_part` writes `pq.write_table`'s bytes with the given
 options, byte for byte what `append` wrote before it was built on the
 core (`tests/data/writer_golden.json`).
+`registration(..., stats_field_ids=ids)` keeps only those fields' stats,
+and refuses an empty set or an id the file has none for: a `provided`
+file is never hydrated, so a stat left out stays out.
+
+**Object-prefix tables.** `TableInfo.object_prefix_field` is None while
+the option is off and from an older server. While it is set, the server
+takes a data file only under `object_prefix.prefix(data_path, namespace, table, field,
+col_type, value)`, `<data_path>/data/<ns>/<table>/<field>=<value>/`, value
+its identity partition value for the field (`object_prefix.key_index` in
+the spec), and its inline stats must pass `object_prefix.check_field_stats`;
+anything else is a 422 `object_prefix_violation`, a `Table.append`
+included. `stats_field_ids={field_id}` is enough, and keeps a small file
+out of the hydrator: a deferred one is not compacted until it is proven.
 
 ## The append incarnation guard — atomic at commit
 
