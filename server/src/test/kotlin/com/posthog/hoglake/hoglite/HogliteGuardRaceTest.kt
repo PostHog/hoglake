@@ -1305,6 +1305,185 @@ class HogliteGuardRaceTest {
         assertThat(n(c, "SELECT COUNT(*) FROM table_layouts")).isZero()
     }
 
+    // ---- planning reads see every definition their fence admits ----------
+
+    /** The liveTable read: the one that carries the table's schema fence. */
+    private fun isLiveTableRead(
+        m: String,
+        p: String,
+        b: String,
+    ) = m == "POST" && p.endsWith("/query") && "t.next_row_id, t.schema_version FROM table_versions v" in b
+
+    @Test
+    fun `a layout set between a commit's head read and its table read is enforced on the append`() {
+        val c = freshCatalog()
+        partitionedWithFile(c, null)
+        // The commit has read meta (head) but not yet the table row and its
+        // schema_version; the layout lands in between. The fence the commit
+        // reads INCLUDES the layout, so a plan made at the earlier head
+        // (no layout) would pass the in-tx guard with a stray path.
+        val hook =
+            Hook(::isLiveTableRead, before = {
+                HogliteAlters(store).alterTable(c, "ns", "t", listOf(AlterOp.SetObjectPrefixField("id")))
+            })
+        hooks += hook
+        val stray =
+            CommitRequest(
+                idempotencyKey = UUID.randomUUID(),
+                appends =
+                    listOf(
+                        TableAppend(
+                            "ns",
+                            "t",
+                            listOf(
+                                FileRegistration(
+                                    "s3://hoglake-it/$c/data/stray.parquet",
+                                    10,
+                                    100,
+                                    50,
+                                    null,
+                                    listOf("7"),
+                                ),
+                            ),
+                        ),
+                    ),
+            )
+        assertThatThrownBy { pstore.commit(c, stray) }
+            .isInstanceOf(HoglakeException.ObjectPrefixViolation::class.java)
+        assertThat(hook.remaining).isZero()
+        assertThat(store.getTable(c, "ns", "t").objectPrefixField).isEqualTo("id")
+        assertThat(n(c, "SELECT COUNT(*) FROM files")).isZero()
+    }
+
+    @Test
+    fun `a spec replaced between an alter's head read and its table read is the spec it validates`() {
+        val c = freshCatalog()
+        partitionedWithFile(c, null)
+        // set_object_prefix_field needs exactly one identity field on the
+        // column. Unpartitioning lands after the alter read the old head but
+        // before it read the fence: validating the old spec would set a
+        // layout no current spec can honour.
+        val hook =
+            Hook(::isLiveTableRead, before = {
+                HogliteAlters(store).alterTable(c, "ns", "t", listOf(AlterOp.SetPartitionSpec(emptyList())))
+            })
+        hooks += hook
+        assertThatThrownBy {
+            HogliteAlters(pstore).alterTable(c, "ns", "t", listOf(AlterOp.SetObjectPrefixField("id")))
+        }.isInstanceOf(HoglakeException.Validation::class.java)
+        assertThat(hook.remaining).isZero()
+        assertThat(store.getTable(c, "ns", "t").objectPrefixField).isNull()
+        assertThat(n(c, "SELECT COUNT(*) FROM table_layouts")).isZero()
+    }
+
+    // ---- replacement publication -----------------------------------------
+
+    private fun prepareCreation(
+        c: String,
+        name: String,
+        replacement: com.posthog.hoglake.service.ReplacementTarget?,
+    ): Pair<UUID, com.posthog.hoglake.service.TableCreation> {
+        val op = UUID.randomUUID()
+        val prepared =
+            store.tableCreations.prepare(
+                c,
+                op,
+                com.posthog.hoglake.service.TableCreationDefinition(
+                    "ns",
+                    name,
+                    listOf(ColumnDef("id", ColType.LONG)),
+                    replacement = replacement,
+                    author = "test",
+                    message = "replace",
+                ),
+            )
+        return op to prepared
+    }
+
+    @Test
+    fun `a replacement re-checks its read snapshot against the in-transaction expiry floor`() {
+        val (c, t) = setup()
+        store.createTable(c, "ns", "other", listOf(ColumnDef("id", ColType.LONG)))
+        store.commit(c, appendReq(c, "before.parquet"))
+        shortRetention(c)
+        val read = head(c)
+        val (op, _) = prepareCreation(c, "t", com.posthog.hoglake.service.ReplacementTarget(t.tableUuid, read))
+        // After the preflight saw no change to the target since `read`: an
+        // acknowledged append lands on it, another commit moves head past
+        // it, and expiry advances the floor beyond `read`, purging the
+        // append's change row. The changes guard is then vacuous.
+        val hook =
+            Hook({ m, p, b -> m == "POST" && p.endsWith("/query") && "kind <> 'table_compacted'" in b }, after = {
+                store.commit(c, appendReq(c, "acknowledged.parquet"))
+                store.commit(c, appendReq(c, "elsewhere.parquet", table = "other"))
+                ageSnapshots(c)
+                HogliteExpiry(store, 100, 10_000).runOnce(c, 100, MaintenanceTrigger.MANUAL)
+            })
+        hooks += hook
+        val published = pstore.tableCreations.publish(c, op, emptyList())
+        assertThat(hook.remaining).isZero()
+        assertThat(store.getCatalog(c).earliestSnapshotId).isGreaterThan(read)
+        assertThat(published.state).isEqualTo("rejected")
+        assertThat(published.reason).isEqualTo("target_changed")
+        // The target, with the acknowledged append, is still the live table.
+        assertThat(store.getTable(c, "ns", "t").tableUuid).isEqualTo(t.tableUuid)
+        assertThat(store.listFiles(c, "ns", "t").map { it.path })
+            .contains("s3://hoglake-it/$c/data/acknowledged.parquet")
+    }
+
+    @Test
+    fun `a replace-if-absent publication refuses a table created after its preflight`() {
+        val c = freshCatalog()
+        store.createNamespace(c, "ns")
+        val (op, _) = prepareCreation(c, "fresh", com.posthog.hoglake.service.ReplacementTarget(null, head(c)))
+        // The preflight found the name free (as at read_snapshot); a table
+        // takes it before the publication tx. Publishing would put a second
+        // live table under the name or silently retire the newcomer.
+        val hook =
+            Hook(
+                { m, p, b -> m == "POST" && p.endsWith("/query") && "SELECT t.id, t.table_uuid FROM tables t" in b },
+                after = { store.createTable(c, "ns", "fresh", listOf(ColumnDef("id", ColType.LONG))) },
+            )
+        hooks += hook
+        val newcomer = lazy { store.getTable(c, "ns", "fresh").tableUuid }
+        val published = pstore.tableCreations.publish(c, op, emptyList())
+        assertThat(hook.remaining).isZero()
+        assertThat(published.state).isEqualTo("rejected")
+        assertThat(published.reason).isEqualTo("target_changed")
+        assertThat(store.listTables(c, "ns").map { it.tableUuid }).containsExactly(newcomer.value)
+    }
+
+    // ---- views ------------------------------------------------------------
+
+    @Test
+    fun `a view create re-asserts its namespace inside the transaction`() {
+        val c = freshCatalog()
+        store.createNamespace(c, "vns")
+        // The create has resolved the namespace; the namespace is dropped
+        // (no views yet, so the drop's check passes) before the insert.
+        val hook =
+            Hook(
+                {
+                        m,
+                        p,
+                        b,
+                    ->
+                    m == "POST" && p.endsWith("/query") && "SELECT id, name FROM namespaces WHERE name = ?" in b
+                },
+                after = { store.dropNamespace(c, "vns", null, "test", "drop") },
+            )
+        hooks += hook
+        assertThatThrownBy { pstore.views.create(c, "vns", "v", "SELECT 1", "trino", "test", "create") }
+            .isInstanceOf(HoglakeException.NotFound::class.java)
+        assertThat(hook.remaining).isZero()
+        assertThat(n(c, "SELECT COUNT(*) FROM views")).isZero()
+        // A recreated namespace takes the view, and every read reaches it.
+        store.createNamespace(c, "vns")
+        val view = store.views.create(c, "vns", "v", "SELECT 1", "trino", "test", "create")
+        assertThat(store.views.list(c, "vns").map { it.viewUuid }).containsExactly(view.viewUuid)
+        assertThat(store.views.get(c, "vns", "v").viewUuid).isEqualTo(view.viewUuid)
+    }
+
     /** Raw fixture SQL still enters an explicit scope; never exempt production work. */
     private fun checkedStore(client: HogliteClient) =
         HogliteCatalogStore(client).apply { requireOperationBindingForTests = true }

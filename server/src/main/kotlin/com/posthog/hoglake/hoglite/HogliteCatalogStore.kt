@@ -838,14 +838,30 @@ class HogliteCatalogStore(
             val m = meta(catalog)
             val at = resolveRead(catalog, m, snapshot, atTimestamp)
             val ns = liveNamespace(catalog, namespace)
+            // Totals are the files visible at `at`, as Postgres's listing
+            // rolls them up at its snapshot: a head listing serves the
+            // transactionally maintained table_totals (exact at head, see
+            // getTable), and a PINNED listing aggregates the manifest at
+            // `at` per table, never the head counters.
+            val headRead = snapshot == null && atTimestamp == null
+            val visible =
+                "FROM files f WHERE f.table_id = t.id AND f.begin_snapshot <= ? " +
+                    "AND (f.end_snapshot IS NULL OR f.end_snapshot > ?)"
+            val totalsSql =
+                if (headRead) {
+                    "COALESCE(tt.record_count,0), COALESCE(tt.file_count,0), COALESCE(tt.file_size_bytes,0)"
+                } else {
+                    "(SELECT COALESCE(SUM(f.record_count),0) $visible), (SELECT COUNT(*) $visible), " +
+                        "(SELECT COALESCE(SUM(f.file_size_bytes),0) $visible)"
+                }
+            val totalsArgs: Array<Any?> = if (headRead) emptyArray() else arrayOf(at, at, at, at, at, at)
             // snapshotCount/earliestSnapshotId count RETAINED change rows, so
             // the window opens at the expiry floor — read from meta so the
             // day expiry lands the read is already right.
             val rows =
                 queryCatalog(
                     catalog,
-                    """SELECT t.id, t.table_uuid, v.name, v.comment,
-                          COALESCE(tt.record_count,0), COALESCE(tt.file_count,0), COALESCE(tt.file_size_bytes,0),
+                    """SELECT t.id, t.table_uuid, v.name, v.comment, $totalsSql,
                           (SELECT COUNT(DISTINCT c.snapshot_id) FROM changes c
                             WHERE c.object_id = t.id AND c.snapshot_id >= ? AND c.snapshot_id <= ?),
                           (SELECT MIN(c.snapshot_id) FROM changes c
@@ -857,6 +873,7 @@ class HogliteCatalogStore(
                     WHERE v.namespace_id = ?
                       AND t.created_snapshot <= ? AND (t.dropped_snapshot IS NULL OR t.dropped_snapshot > ?)
                     ORDER BY v.name""",
+                    *totalsArgs,
                     m.earliestSnapshotId,
                     at,
                     m.earliestSnapshotId,

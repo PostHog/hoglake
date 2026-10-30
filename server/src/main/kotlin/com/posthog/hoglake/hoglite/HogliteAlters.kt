@@ -51,9 +51,16 @@ internal class HogliteAlters(
     ): TableInfo =
         store.catalogOperation(catalog) {
             if (ops.isEmpty()) throw HoglakeException.Validation("ops must contain at least one operation")
-            val meta = store.meta(catalog)
             val ns = store.liveNamespace(catalog, namespace)
             val t = store.liveTable(catalog, namespace, table)
+            // Head AFTER the table's fence (t.schemaVersion): the shape
+            // below is read at meta.head, and a head read before the fence
+            // could miss DDL the fence already includes, so the schema
+            // guard would pass a plan made against older definitions (e.g.
+            // set_object_prefix_field approved against a spec a concurrent
+            // alter just replaced). Read after, DDL the fence admits is
+            // visible at head, and any later DDL trips the fence.
+            val meta = store.meta(catalog)
             if (expectedTableUuid != null && t.tableUuid != expectedTableUuid) {
                 throw HoglakeException.TableRecreated(
                     "table '$namespace.$table' no longer has the expected UUID: it was " +

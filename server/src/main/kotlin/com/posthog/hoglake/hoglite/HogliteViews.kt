@@ -34,6 +34,16 @@ internal class HogliteViews(
             val ns = store.liveNamespace(catalog, namespace)
 
             val tx = HogliteTx()
+            // The namespace read above is a preflight: a dropNamespace that
+            // passed its no-live-views check and committed since would
+            // leave this insert pointing at a dropped id, acknowledged but
+            // unreachable by get/list/drop (even after a recreate, which
+            // mints a new id). Re-assert liveness of THAT id in-tx, as
+            // createTable does.
+            tx.expectOne(
+                "SELECT COUNT(*) FROM namespaces WHERE id = ? AND dropped_snapshot IS NULL",
+                ns.namespaceId,
+            ) { HoglakeException.NotFound("namespace '$namespace' in catalog '$catalog'") }
             tx.expectZero(
                 "SELECT COUNT(*) FROM views WHERE namespace_id = ? AND name = ? AND dropped_snapshot IS NULL",
                 ns.namespaceId,

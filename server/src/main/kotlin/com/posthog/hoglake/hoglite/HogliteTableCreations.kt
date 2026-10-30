@@ -284,22 +284,50 @@ internal class HogliteTableCreations(
                 originalNamespace,
             ) { nsChangedRace }
             if (replacement != null) {
-                // The guarded target must still be the live incarnation, and
-                // nothing but compaction may have touched it since the read.
-                tx.expectOne(
-                    "SELECT COUNT(*) FROM tables t JOIN table_versions v ON v.table_id = t.id " +
-                        "WHERE v.namespace_id = ? AND v.name = ? AND v.end_snapshot IS NULL " +
-                        "AND t.dropped_snapshot IS NULL AND t.table_uuid = ?",
-                    originalNamespace,
-                    definition.name,
-                    replacement.expectedTableUuid?.toString() ?: "",
-                ) { targetChangedRace }
+                // The expiry floor, in-tx and FIRST: the changes guard below
+                // only proves "no change since read_snapshot" while that
+                // window is retained. A sweep that advanced past it after
+                // the preflight read may have purged the change row of an
+                // acknowledged append, and an empty window would then pass.
+                // Same guard, same reason, as commit and alter; the
+                // preflight's answer to an unretained snapshot is
+                // `target_changed`, so the race is too.
                 tx.expectZero(
-                    "SELECT COUNT(*) FROM changes WHERE object_id = ? AND snapshot_id > ? " +
-                        "AND kind LIKE 'table_%' AND kind <> 'table_compacted'",
-                    target!![0].asLong(),
+                    "SELECT COUNT(*) FROM meta WHERE id = 1 AND earliest_snapshot_id > ?",
                     replacement.readSnapshot,
                 ) { targetChangedRace }
+                val expectedUuid = replacement.expectedTableUuid
+                if (expectedUuid == null) {
+                    // Replace-if-absent: the name was free at read_snapshot
+                    // and (preflight) still is. Nothing is retired; a table
+                    // that appeared since is a changed target, as the
+                    // preflight would have answered.
+                    tx.expectZero(
+                        "SELECT COUNT(*) FROM tables t JOIN table_versions v ON v.table_id = t.id " +
+                            "WHERE v.namespace_id = ? AND v.name = ? AND v.end_snapshot IS NULL " +
+                            "AND t.dropped_snapshot IS NULL",
+                        originalNamespace,
+                        definition.name,
+                    ) { targetChangedRace }
+                } else {
+                    // The guarded target must still be the live incarnation,
+                    // and nothing but compaction may have touched it since
+                    // the read. The preflight proved target's uuid matches.
+                    tx.expectOne(
+                        "SELECT COUNT(*) FROM tables t JOIN table_versions v ON v.table_id = t.id " +
+                            "WHERE v.namespace_id = ? AND v.name = ? AND v.end_snapshot IS NULL " +
+                            "AND t.dropped_snapshot IS NULL AND t.table_uuid = ?",
+                        originalNamespace,
+                        definition.name,
+                        expectedUuid.toString(),
+                    ) { targetChangedRace }
+                    tx.expectZero(
+                        "SELECT COUNT(*) FROM changes WHERE object_id = ? AND snapshot_id > ? " +
+                            "AND kind LIKE 'table_%' AND kind <> 'table_compacted'",
+                        checkNotNull(target) { "a matched replacement target is live" }[0].asLong(),
+                        replacement.readSnapshot,
+                    ) { targetChangedRace }
+                }
             } else {
                 tx.expectZero(
                     "SELECT COUNT(*) FROM tables t JOIN table_versions v ON v.table_id = t.id " +
@@ -350,8 +378,13 @@ internal class HogliteTableCreations(
             }
 
             tx.allocateDdlSnapshot()
-            if (replacement != null) {
-                val oldId = target!![0].asLong()
+            // Only a replacement that found a live target retires one (and
+            // fences the new incarnation's feed): CatalogService.createTable
+            // keys both on replacementTableId, which is null for
+            // replace-if-absent.
+            val retired = target?.takeIf { replacement != null }?.get(0)?.asLong()
+            if (retired != null) {
+                val oldId = retired
                 tx.add(
                     "INSERT INTO changes(snapshot_id, kind, object_id) " +
                         "VALUES (${HogliteSchema.HEAD_SQL}, 'table_dropped', ?)",
@@ -378,14 +411,14 @@ internal class HogliteTableCreations(
                 definition.namespace,
                 definition.name,
                 operation.tableUuid.toString(),
-                target?.get(0)?.asLong(),
+                retired,
                 maxFieldId + 1,
             )
             tx.add(
                 "INSERT INTO changes(snapshot_id, kind, object_id) " +
                     "VALUES (${HogliteSchema.HEAD_SQL}, 'table_created', $newIdSql)",
             )
-            if (replacement != null) {
+            if (retired != null) {
                 // The new incarnation's feed fences consumers whose window
                 // starts before publication (same pair as truncate).
                 tx.add(

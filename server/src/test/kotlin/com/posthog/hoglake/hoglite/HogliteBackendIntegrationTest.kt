@@ -553,6 +553,48 @@ class HogliteBackendIntegrationTest {
         assertThat(store.tableCreations.publish(catalog, op3, emptyList()).state).isEqualTo("aborted")
     }
 
+    @Test
+    fun `create-or-replace of a table absent at read_snapshot publishes a plain create`() {
+        val catalog = freshCatalog()
+        store.createNamespace(catalog, "ns")
+        val read = store.getCatalog(catalog).headSnapshotId
+        val op = UUID.randomUUID()
+        val definition =
+            TableCreationDefinition(
+                "ns",
+                "fresh",
+                listOf(ColumnDef("id", ColType.LONG)),
+                replacement = com.posthog.hoglake.service.ReplacementTarget(null, read),
+                author = "test",
+                message = "create or replace",
+            )
+        val prepared = store.tableCreations.prepare(catalog, op, definition)
+        assertThat(prepared.state).isEqualTo("prepared")
+        val published =
+            store.tableCreations.publish(
+                catalog,
+                op,
+                listOf(FileRegistration("${prepared.writePath}part-0.parquet", 3, 100, 50)),
+            )
+        assertThat(published.state).isEqualTo("committed")
+        val table = store.getTable(catalog, "ns", "fresh")
+        assertThat(table.tableUuid).isEqualTo(prepared.tableUuid)
+        assertThat(table.recordCount).isEqualTo(3L)
+        // Nothing was retired: no drop change, no replaced id, and the new
+        // incarnation's feed carries no replacement fence pair.
+        val snap = published.snapshotId!!
+        assertThat(
+            q(catalog, "SELECT kind FROM changes WHERE snapshot_id = ? ORDER BY kind", snap).rows.map {
+                it[0].asString()
+            },
+        ).containsExactly("table_created", "table_inserted_into")
+        assertThat(
+            q(catalog, "SELECT replaced_table_id FROM tables WHERE table_uuid = ?", prepared.tableUuid.toString())
+                .firstRow()!![0],
+        ).isNull()
+        assertThat(published.reason).isNull()
+    }
+
     // ---- alter ----------------------------------------------------------------
 
     @Test
@@ -1218,6 +1260,199 @@ class HogliteBackendIntegrationTest {
         assertThat(
             q(catalog, "SELECT COUNT(*) FROM removals WHERE drained_at IS NULL").firstRow()!![0].asLong(),
         ).isEqualTo(0L)
+    }
+
+    @Test
+    fun `head totals stay the visible manifest across compactions, including a group that dies`() {
+        val catalog = freshCatalog()
+        store.createNamespace(catalog, "ns")
+        val columns = listOf(ColumnDef("id", ColType.LONG), ColumnDef("name", ColType.STRING))
+        store.createTable(catalog, "ns", "t", columns)
+        store.createTable(catalog, "ns", "dead", columns)
+        val cfg =
+            com.posthog.hoglake.Config(
+                database = com.posthog.hoglake.DatabaseBackend.HOGLITE,
+                hogliteUrl = "http://127.0.0.1:1",
+                s3Endpoint = "http://127.0.0.1:${minio.firstMappedPort}",
+                s3Region = "us-east-1",
+                s3AccessKey = minio.userName,
+                s3SecretKey = minio.password,
+                s3PathStyle = true,
+            )
+
+        fun put(
+            key: String,
+            bytes: ByteArray,
+        ): String {
+            s3Client().use { s3c ->
+                s3c.putObject(
+                    { it.bucket("hoglake-it").key("$catalog/data/$key") },
+                    software.amazon.awssdk.core.sync.RequestBody.fromBytes(bytes),
+                )
+            }
+            return "s3://hoglake-it/$catalog/data/$key"
+        }
+
+        fun appendReal(
+            table: String,
+            key: String,
+            ids: List<Long>,
+        ) {
+            val bytes = parquetBytes(ids)
+            val path = put(key, bytes)
+            store.commit(
+                catalog,
+                CommitRequest(
+                    idempotencyKey = UUID.randomUUID(),
+                    appends =
+                        listOf(
+                            TableAppend(
+                                "ns",
+                                table,
+                                listOf(FileRegistration(path, ids.size.toLong(), bytes.size.toLong())),
+                            ),
+                        ),
+                ),
+            )
+        }
+
+        fun hydrate() = HogliteHydrator(store, com.posthog.hoglake.hydrator.ObjectStore(cfg)).runOnce()
+
+        val compaction =
+            HogliteCompaction(
+                store,
+                com.posthog.hoglake.hydrator.ObjectStore(cfg),
+                com.posthog.hoglake.compaction.CompactionConfig(
+                    targetBytes = 1L shl 30,
+                    minInputFiles = 2,
+                    maxInputFiles = 2,
+                    maxFanIn = 2,
+                    maxGroupsPerRun = 10,
+                    maxCandidates = 100,
+                ),
+            )
+
+        fun compact() = compaction.runOnce(catalog, null, com.posthog.hoglake.model.MaintenanceTrigger.MANUAL)
+
+        /** (rows, files, bytes) of the manifest visible at [at]: the contract every totals read serves. */
+        fun manifest(
+            table: String,
+            at: Long,
+        ): Triple<Long, Long, Long> {
+            val r =
+                q(
+                    catalog,
+                    "SELECT COALESCE(SUM(f.record_count),0), COUNT(*), COALESCE(SUM(f.file_size_bytes),0) " +
+                        "FROM files f JOIN table_versions v ON v.table_id = f.table_id AND v.end_snapshot IS NULL " +
+                        "WHERE v.name = ? AND f.begin_snapshot <= ? AND (f.end_snapshot IS NULL OR f.end_snapshot > ?)",
+                    table,
+                    at,
+                    at,
+                ).firstRow()!!
+            return Triple(r[0].asLong(), r[1].asLong(), r[2].asLong())
+        }
+
+        fun headTotals(table: String): Triple<Long, Long, Long> {
+            val info = store.getTable(catalog, "ns", table)
+            return Triple(info.recordCount!!, info.fileCount!!, info.fileSizeBytes!!)
+        }
+
+        fun listed(
+            table: String,
+            at: Long?,
+        ): Triple<Long, Long, Long> {
+            val s = store.listTables(catalog, "ns", snapshot = at).single { it.name == table }
+            return Triple(s.recordCount, s.fileCount, s.fileSizeBytes)
+        }
+
+        /** Head getTable, head listTables, and a time-travel read at head all report the manifest at head. */
+        fun assertTotalsAgree(
+            table: String,
+            rows: Long,
+            files: Long,
+        ) {
+            val head = store.getCatalog(catalog).headSnapshotId
+            val truth = manifest(table, head)
+            assertThat(truth.first).describedAs("rows in the visible manifest").isEqualTo(rows)
+            assertThat(truth.second).describedAs("files in the visible manifest").isEqualTo(files)
+            assertThat(headTotals(table)).describedAs("head getTable of $table").isEqualTo(truth)
+            assertThat(listed(table, null)).describedAs("head listTables of $table").isEqualTo(truth)
+            val pinned = store.getTable(catalog, "ns", table, snapshot = head)
+            assertThat(Triple(pinned.recordCount, pinned.fileCount, pinned.fileSizeBytes))
+                .describedAs("time-travel getTable of $table at head")
+                .isEqualTo(truth)
+            assertThat(listed(table, head)).describedAs("pinned listTables of $table at head").isEqualTo(truth)
+        }
+
+        // Two 10-row files compact into one 20-row file: 20 rows and ONE file,
+        // not the 40 rows / 3 files gross counters would report.
+        appendReal("t", "a.parquet", (1L..10L).toList())
+        appendReal("t", "b.parquet", (11L..20L).toList())
+        hydrate()
+        assertTotalsAgree("t", rows = 20, files = 2)
+        val beforeCompaction = store.getCatalog(catalog).headSnapshotId
+        assertThat(compact().groupsCompacted).isEqualTo(1L)
+        assertTotalsAgree("t", rows = 20, files = 1)
+
+        // Repeated compactions do not inflate: two more files, then compact
+        // until one file is left, checking after every run.
+        appendReal("t", "c.parquet", (21L..30L).toList())
+        appendReal("t", "d.parquet", (31L..40L).toList())
+        hydrate()
+        assertTotalsAgree("t", rows = 40, files = 3)
+        var runs = 0
+        while (manifest("t", store.getCatalog(catalog).headSnapshotId).second > 1L) {
+            assertThat(compact().groupsCompacted).isGreaterThanOrEqualTo(1L)
+            hydrate()
+            assertTotalsAgree("t", rows = 40, files = manifest("t", store.getCatalog(catalog).headSnapshotId).second)
+            check(++runs < 5) { "compaction stopped converging" }
+        }
+        assertTotalsAgree("t", rows = 40, files = 1)
+
+        // A group whose every input is fully deleted: it retires with no
+        // output, and its inputs leave the totals with it.
+        appendReal("dead", "x.parquet", listOf(1L, 2L))
+        appendReal("dead", "y.parquet", listOf(3L, 4L))
+        hydrate()
+        for ((i, path) in listOf("x.parquet", "y.parquet").withIndex()) {
+            val fileId =
+                q(catalog, "SELECT id FROM files WHERE path = ?", "s3://hoglake-it/$catalog/data/$path")
+                    .firstRow()!![0].asLong()
+            val bytes = com.posthog.hoglake.compaction.PuffinTestFiles.deletionVector(listOf(0L, 1L))
+            val dvPath = put("dead-dv$i.puffin", bytes)
+            store.commit(
+                catalog,
+                CommitRequest(
+                    readSnapshot = store.getCatalog(catalog).headSnapshotId,
+                    idempotencyKey = UUID.randomUUID(),
+                    deletes =
+                        listOf(
+                            TableDeletes(
+                                "ns",
+                                "dead",
+                                listOf(DeleteFileRegistration(fileId, dvPath, 2, bytes.size.toLong())),
+                            ),
+                        ),
+                ),
+            )
+        }
+        assertTotalsAgree("dead", rows = 4, files = 2)
+        val retired = compact()
+        assertThat(retired.groupsRetired).isEqualTo(1L)
+        assertThat(retired.groupsCompacted).isZero()
+        assertTotalsAgree("dead", rows = 0, files = 0)
+        assertThat(headTotals("dead")).isEqualTo(Triple(0L, 0L, 0L))
+        // The other table is untouched by the dead group's retirement.
+        assertTotalsAgree("t", rows = 40, files = 1)
+
+        // History is the manifest AT the pin, never head counters: both the
+        // time-travel getTable and a pinned listing still see the two
+        // pre-compaction files.
+        val then = manifest("t", beforeCompaction)
+        assertThat(then.first to then.second).isEqualTo(20L to 2L)
+        val pinned = store.getTable(catalog, "ns", "t", snapshot = beforeCompaction)
+        assertThat(Triple(pinned.recordCount, pinned.fileCount, pinned.fileSizeBytes)).isEqualTo(then)
+        assertThat(listed("t", beforeCompaction)).isEqualTo(then)
     }
 
     // ---- the routes, over the wire -------------------------------------------

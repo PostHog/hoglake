@@ -991,8 +991,9 @@ internal class HogliteCompaction(
             stats?.let { store.json.writeValueAsString(it) },
             splitOffsets?.let { store.json.writeValueAsString(it) },
         )
-        // table_totals: gross append counters, exactly like a commit's
-        // (the ended inputs' counts stay — the DVs already masked them).
+        // table_totals: the output is added here, and endSnapshotInputs
+        // subtracts the inputs, so head totals stay the visible-file
+        // aggregate a time-travel read computes (see endSnapshotInputs).
         tx.add(
             "INSERT INTO table_totals(table_id, record_count, file_count, file_size_bytes) " +
                 "VALUES (?, ?, 1, ?) " +
@@ -1050,13 +1051,43 @@ internal class HogliteCompaction(
         }
     }
 
-    /** End the inputs and their applied DVs at the new snapshot, with the row-count checks. */
+    /**
+     * End the inputs and their applied DVs at the new snapshot, and take
+     * the inputs out of `table_totals`.
+     *
+     * `table_totals` is what a HEAD getTable/listTables serves, and its
+     * contract is the files visible at head: the same SUM/COUNT over live
+     * file rows a time-travel read aggregates. A commit adds what it
+     * appends; truncate zeroes it; so the files compaction ends must come
+     * out here, in the same transaction, on BOTH the live and the
+     * zero-survivor path (the output, if any, is added by the caller).
+     * Computed in-tx from the rows being ended, before they are ended,
+     * so the subtraction is exactly what the manifest loses. (Postgres
+     * serves head totals from the sampler's visible-file aggregate, so
+     * it has no counter to keep in step.)
+     */
     private fun endSnapshotInputs(
         tx: HogliteTx,
         ctx: TableContext,
         ids: List<Long>,
         group: CompactionGroup,
     ) {
+        val idList = ids.joinToString(",") { "?" }
+        val inputs = "FROM files WHERE table_id = ? AND id IN ($idList) AND end_snapshot IS NULL"
+        tx.add(
+            "UPDATE table_totals SET " +
+                "record_count = record_count - (SELECT COALESCE(SUM(record_count), 0) $inputs), " +
+                "file_count = file_count - (SELECT COUNT(*) $inputs), " +
+                "file_size_bytes = file_size_bytes - (SELECT COALESCE(SUM(file_size_bytes), 0) $inputs) " +
+                "WHERE table_id = ?",
+            ctx.tableId,
+            *ids.toTypedArray(),
+            ctx.tableId,
+            *ids.toTypedArray(),
+            ctx.tableId,
+            *ids.toTypedArray(),
+            ctx.tableId,
+        )
         tx.add(
             "UPDATE files SET end_snapshot = ${HogliteSchema.HEAD_SQL} " +
                 "WHERE table_id = ? AND id IN (${ids.joinToString(",") { "?" }})",

@@ -229,6 +229,18 @@ internal object HogliteCommit {
             resolved["${t.namespace}.${t.table}"] = row
         }
 
+        // The snapshot every definition below (spec, layout) is read at:
+        // a head read AFTER every table's fence (tables.schema_version,
+        // read with its row above). `meta.head` is too early: DDL landing
+        // between it and the table read would be invisible to planning
+        // while the fence, read after it, already includes it, and the
+        // tx would pass with the plan made against the older definitions
+        // (an append planned without a just-set object-prefix layout, or
+        // against a just-replaced spec). Read after the fence, every DDL
+        // the fence admits is visible at planHead, and any DDL after it
+        // bumps a schema_version the fence then refuses (a replan).
+        val planHead = if (resolved.isEmpty()) meta.head else store.meta(catalog).head
+
         // ---- request-side validation (refusals that do not depend on tx state)
 
         val allPaths = LinkedHashMap<String, String>() // path -> file_kind
@@ -254,7 +266,7 @@ internal object HogliteCommit {
         val plannedAppends = mutableListOf<PlannedAppend>()
         for (append in appends) {
             val table = resolved.getValue("${append.namespace}.${append.table}")
-            val spec = store.specAt(catalog, table.tableId, meta.head)
+            val spec = store.specAt(catalog, table.tableId, planHead)
             val liveColumnTypes = liveColumnTypes(store, catalog, table.tableId)
             var rows = table.nextRowId
             for (file in append.files) {
@@ -361,18 +373,19 @@ internal object HogliteCommit {
         // The object-prefix layout (CommitService step 4a): on the
         // SANITIZED stats, after the structural checks of appends and
         // DVs alike, before claims. A table without the option skips it.
-        // The layout was read at head with the table; setting it bumps
-        // tables.schema_version, so the in-tx schema fence below replans
-        // a commit that planned against the option being off.
+        // The layout is read at planHead (after the table's fence);
+        // setting it bumps tables.schema_version, so the in-tx schema
+        // fence below replans a commit that planned against the option
+        // being off.
         val layouts = HashMap<Long, ObjectPrefixLayout?>()
 
         fun layoutFor(table: HogliteCatalogStore.TableRow): ObjectPrefixLayout? =
-            layouts.getOrPut(table.tableId) { layoutOf(store, catalog, table, meta.head) }
+            layouts.getOrPut(table.tableId) { layoutOf(store, catalog, table, planHead) }
 
         for (append in appends) {
             val table = resolved.getValue("${append.namespace}.${append.table}")
             val layout = layoutFor(table) ?: continue
-            val spec = store.specAt(catalog, table.tableId, meta.head)
+            val spec = store.specAt(catalog, table.tableId, planHead)
             val keyIndex = spec?.let { ObjectPrefix.keyIndex(it.fields, layout.fieldId) }
             // The DDL keeps exactly one identity field on the prefix field
             // in every spec while the option is on.
@@ -410,7 +423,7 @@ internal object HogliteCommit {
                 if (p.stagedTarget != null) {
                     val target = plannedAppends[p.stagedTarget]
                     val keyIndex =
-                        store.specAt(catalog, p.table.tableId, meta.head)
+                        store.specAt(catalog, p.table.tableId, planHead)
                             ?.let { ObjectPrefix.keyIndex(it.fields, layout.fieldId) }
                     keyIndex?.let { target.file.partitionValues?.getOrNull(it) }
                 } else {
