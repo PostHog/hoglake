@@ -214,7 +214,7 @@ jobs:
           # class that never ran fails too. A class that needs the engine
           # but has another name must be added to `required`.
           dir=server/build/test-results/test
-          required=(HogliteBackendIntegrationTest HogliteGuardRaceTest HogliteObjectPrefixIntegrationTest)
+          required=(HogliteBackendIntegrationTest HogliteGuardRaceTest HogliteObjectPrefixIntegrationTest HogliteBackendConformanceIntegrationTest HogliteSchemaEquivalenceIntegrationTest HogliteDurabilityConformanceIntegrationTest)
           reports=()
           for cls in "${required[@]}"; do
             reports+=("$dir/TEST-com.posthog.hoglake.hoglite.${cls}.xml")

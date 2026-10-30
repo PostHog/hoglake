@@ -70,6 +70,22 @@ internal object HogliteCommit {
         catalog: String,
         request: CommitRequest,
     ): CommitResult {
+        // Match CommitService's transaction admission before any planning or writes.
+        if (request.allowPendingDeletes &&
+            (
+                request.idempotencyKey == null || request.readSnapshot == null ||
+                    !request.requireUnchangedTables ||
+                    request.appends.any { it.expectedTableUuid == null } ||
+                    request.deletes.any { it.expectedTableUuid == null }
+            )
+        ) {
+            throw HoglakeException.Validation("transaction requires guarded idempotent publication")
+        }
+        if (request.deletes.any { table -> table.files.any { it.dataFilePath != null } } &&
+            !request.allowPendingDeletes
+        ) {
+            throw HoglakeException.Validation("pending delete targets require /commit/transaction")
+        }
         // The schema fence (SCHEMA_CHANGED, guarded in-tx below) means a
         // DDL landed between this commit's planning and its transaction.
         // Postgres re-validates under the commit lock; the hoglite shape

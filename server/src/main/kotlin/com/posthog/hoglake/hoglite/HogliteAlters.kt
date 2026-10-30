@@ -112,6 +112,12 @@ internal class HogliteAlters(
                             "SELECT COALESCE(MAX(spec_id), 0) FROM partition_specs WHERE table_id = ?",
                             t.tableId,
                         ).firstRow()!![0].asLong(),
+                    maxSortId =
+                        store.queryCatalog(
+                            catalog,
+                            "SELECT COALESCE(MAX(spec_id), 0) FROM sort_specs WHERE table_id = ?",
+                            t.tableId,
+                        ).firstRow()!![0].asLong(),
                 )
 
             // The field-id allocator is planned LOCALLY across the ops of
@@ -221,7 +227,10 @@ internal class HogliteAlters(
                 fileCount = agg[1].asLong(),
                 fileSizeBytes = agg[2].asLong(),
                 partitionSpec = state.spec,
-                sortSpec = state.sortSpec,
+                sortSpec =
+                    state.sortSpec?.let {
+                        if (state.sortInsertedHere) it.copy(beginSnapshot = snapshotId) else it
+                    },
                 snapshotId = snapshotId,
                 objectPrefixField =
                     state.objectPrefixFieldId?.let { id -> state.cols.single { it.fieldId == id }.def.name },
@@ -254,6 +263,9 @@ internal class HogliteAlters(
         var objectPrefixFieldId: Long?,
         /** MAX(spec_id) over the table's spec rows as this alter has left them so far. */
         var maxSpecId: Long,
+        /** Sort ids use the same historical MAX + 1 allocator as partition ids. */
+        var maxSortId: Long,
+        var sortInsertedHere: Boolean = false,
         /** Whether an earlier op of THIS alter inserted the live spec (begun at its snapshot). */
         var specInsertedHere: Boolean = false,
     )
@@ -748,11 +760,21 @@ internal class HogliteAlters(
         op: AlterOp.SetSortOrder,
     ) {
         AlterService.validateSortFields(state.cols, op.fields)
+        // An intermediate spec in this alter was never visible; free its id.
+        tx.add(
+            "DELETE FROM sort_specs WHERE table_id = ? AND end_snapshot IS NULL " +
+                "AND begin_snapshot = ${HogliteSchema.HEAD_SQL}",
+            t.tableId,
+        )
         tx.add(
             "UPDATE sort_specs SET end_snapshot = ${HogliteSchema.HEAD_SQL} " +
                 "WHERE table_id = ? AND end_snapshot IS NULL",
             t.tableId,
         )
+        if (state.sortInsertedHere) {
+            state.maxSortId -= 1
+            state.sortInsertedHere = false
+        }
         if (op.fields.isEmpty()) {
             state.sortSpec = null
             return
@@ -765,10 +787,10 @@ internal class HogliteAlters(
             t.tableId,
             store.json.writeValueAsString(op.fields),
         )
-        // begin_snapshot: this alter's snapshot, resolved at readback;
-        // the receipt only needs fields + id, and reads resolve the
-        // interval from the row.
-        state.sortSpec = SortSpec((state.sortSpec?.sortId ?: 0L) + 1, op.fields, state.sortSpec?.beginSnapshot ?: 0)
+        state.maxSortId += 1
+        state.sortInsertedHere = true
+        // The actual begin snapshot is assigned from the transaction readback.
+        state.sortSpec = SortSpec(state.maxSortId, op.fields, 0)
     }
 
     // ---- row lifecycle helpers -------------------------------------------

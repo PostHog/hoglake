@@ -429,20 +429,24 @@ class HogliteObjectPrefixIntegrationTest {
 
         // Staged: a DV in the same commit as its target, by path.
         val staged = good(cat, value = 7)
+        val expected = store.getTable(cat, "ingest", "events").tableUuid
 
         fun stagedCommit(dvPath: String) =
             store.commit(
                 cat,
                 CommitRequest(
+                    allowPendingDeletes = true,
+                    requireUnchangedTables = true,
                     readSnapshot = store.getCatalog(cat).headSnapshotId,
                     idempotencyKey = UUID.randomUUID(),
-                    appends = listOf(TableAppend("ingest", "events", listOf(staged))),
+                    appends = listOf(TableAppend("ingest", "events", listOf(staged), expectedTableUuid = expected)),
                     deletes =
                         listOf(
                             TableDeletes(
                                 "ingest",
                                 "events",
                                 listOf(DeleteFileRegistration(0, dvPath, 1, 10, dataFilePath = staged.path)),
+                                expectedTableUuid = expected,
                             ),
                         ),
                 ),
