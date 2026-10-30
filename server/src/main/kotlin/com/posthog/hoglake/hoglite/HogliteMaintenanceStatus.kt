@@ -42,11 +42,12 @@ internal class HogliteMaintenanceStatus(
     private val retirementIntervalMs: Long,
     private val smallFileThresholdBytes: Long,
 ) : MaintenanceStatusBackend {
-    override fun status(catalog: String): MaintenanceStatus {
-        // Resolve the catalog (404 on a stranger) before the per-task reads.
-        store.meta(catalog)
-        return assemble(catalog)
-    }
+    override fun status(catalog: String): MaintenanceStatus =
+        store.catalogOperation(catalog) {
+            // Resolve the catalog (404 on a stranger) before the per-task reads.
+            store.meta(catalog)
+            return assemble(catalog)
+        }
 
     override fun instanceStatus(
         after: String?,
@@ -68,24 +69,25 @@ internal class HogliteMaintenanceStatus(
         task: MaintenanceTask?,
         before: Long?,
         limit: Int,
-    ): MaintenanceRunPage {
-        store.meta(catalog) // 404 on a stranger
-        val cap = validateLimit(limit)
-        val rows =
-            store.queryCatalog(
-                catalog,
-                "SELECT id, task, run_trigger, started_at, finished_at, status, error, result_json " +
-                    "FROM maintenance_runs " +
-                    "WHERE (? IS NULL OR task = ?) AND (? IS NULL OR id < ?) " +
-                    "ORDER BY id DESC LIMIT ?",
-                task?.wire,
-                task?.wire,
-                before,
-                before,
-                cap + 1L,
-            ).rows
-        return page(rows.map { toRun(catalog, it) }, cap)
-    }
+    ): MaintenanceRunPage =
+        store.catalogOperation(catalog) {
+            store.meta(catalog) // 404 on a stranger
+            val cap = validateLimit(limit)
+            val rows =
+                store.queryCatalog(
+                    catalog,
+                    "SELECT id, task, run_trigger, started_at, finished_at, status, error, result_json " +
+                        "FROM maintenance_runs " +
+                        "WHERE (? IS NULL OR task = ?) AND (? IS NULL OR id < ?) " +
+                        "ORDER BY id DESC LIMIT ?",
+                    task?.wire,
+                    task?.wire,
+                    before,
+                    before,
+                    cap + 1L,
+                ).rows
+            return page(rows.map { toRun(catalog, it) }, cap)
+        }
 
     override fun instanceRuns(
         task: MaintenanceTask?,
@@ -99,15 +101,17 @@ internal class HogliteMaintenanceStatus(
         val all = mutableListOf<Pair<String, MaintenanceRun>>()
         for (name in store.listCatalogNames()) {
             runCatching {
-                store.queryCatalog(
-                    name,
-                    "SELECT id, task, run_trigger, started_at, finished_at, status, error, result_json " +
-                        "FROM maintenance_runs " +
-                        "WHERE (? IS NULL OR task = ?) ORDER BY id DESC LIMIT ?",
-                    task?.wire,
-                    task?.wire,
-                    cap + 1L,
-                ).rows.map { name to toRun(name, it) }
+                store.catalogOperation(name) {
+                    store.queryCatalog(
+                        name,
+                        "SELECT id, task, run_trigger, started_at, finished_at, status, error, result_json " +
+                            "FROM maintenance_runs " +
+                            "WHERE (? IS NULL OR task = ?) ORDER BY id DESC LIMIT ?",
+                        task?.wire,
+                        task?.wire,
+                        cap + 1L,
+                    ).rows.map { name to toRun(name, it) }
+                }
             }.onSuccess { all += it }
         }
         val ordered =
@@ -127,24 +131,25 @@ internal class HogliteMaintenanceStatus(
 
     // ---- assembly -----------------------------------------------------------
 
-    private fun assemble(catalog: String): MaintenanceStatus {
-        val lastRuns = lastRunByTask(catalog)
-        val loopRuns = recentLoopRuns(catalog)
-        val now = Instant.now()
-        val tasks =
-            MaintenanceTask.entries
-                .filter { it != REMOVED_VERIFY }
-                .map { task ->
-                    MaintenanceTaskStatus(
-                        task = task,
-                        loopIntervalMs = loopIntervalOf(task),
-                        lastRun = lastRuns[task],
-                        backlog = backlog(catalog, task),
-                        loop = observe(task, loopRuns[task] ?: emptyList(), now),
-                    )
-                }
-        return MaintenanceStatus(catalog = catalog, tasks = tasks)
-    }
+    private fun assemble(catalog: String): MaintenanceStatus =
+        store.catalogOperation(catalog) {
+            val lastRuns = lastRunByTask(catalog)
+            val loopRuns = recentLoopRuns(catalog)
+            val now = Instant.now()
+            val tasks =
+                MaintenanceTask.entries
+                    .filter { it != REMOVED_VERIFY }
+                    .map { task ->
+                        MaintenanceTaskStatus(
+                            task = task,
+                            loopIntervalMs = loopIntervalOf(task),
+                            lastRun = lastRuns[task],
+                            backlog = backlog(catalog, task),
+                            loop = observe(task, loopRuns[task] ?: emptyList(), now),
+                        )
+                    }
+            return MaintenanceStatus(catalog = catalog, tasks = tasks)
+        }
 
     private fun loopIntervalOf(task: MaintenanceTask): Long? =
         when (task) {

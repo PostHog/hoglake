@@ -37,89 +37,92 @@ internal class HogliteUploads(
         owner: UUID,
         prefix: String,
         kind: String,
-    ): UploadClaim {
-        if (kind !in setOf("data", "delete")) throw HoglakeException.Validation("invalid upload file_kind")
-        val normalized = prefix.trimEnd('/')
-        // meta read: the catalog 404 and the data_path the prefix must stay under.
-        val dataPath = store.meta(catalog).dataPath
-        val path = "$normalized/trino-upload/${UUID.randomUUID()}.${if (kind == "data") "parquet" else "puffin"}"
-        val root = dataPath.trimEnd('/') + "/"
-        if (!path.startsWith(root) || path.any { it.isWhitespace() || it.isISOControl() } ||
-            path.removePrefix(root).split('/').any { it.isEmpty() || it == "." || it == ".." }
-        ) {
-            throw HoglakeException.Validation("upload prefix must stay under the catalog data_path")
+    ): UploadClaim =
+        store.catalogOperation(catalog) {
+            if (kind !in setOf("data", "delete")) throw HoglakeException.Validation("invalid upload file_kind")
+            val normalized = prefix.trimEnd('/')
+            // meta read: the catalog 404 and the data_path the prefix must stay under.
+            val dataPath = store.meta(catalog).dataPath
+            val path = "$normalized/trino-upload/${UUID.randomUUID()}.${if (kind == "data") "parquet" else "puffin"}"
+            val root = dataPath.trimEnd('/') + "/"
+            if (!path.startsWith(root) || path.any { it.isWhitespace() || it.isISOControl() } ||
+                path.removePrefix(root).split('/').any { it.isEmpty() || it == "." || it == ".." }
+            ) {
+                throw HoglakeException.Validation("upload prefix must stay under the catalog data_path")
+            }
+            val now = Instant.now()
+            val expires = now.plus(24, ChronoUnit.HOURS)
+            // The path is a fresh random UUID, so this races nothing;
+            // INSERT OR IGNORE makes a retry of the SAME upload_id
+            // idempotent, and the identity check below rejects a reuse
+            // that changed the definition.
+            store.runTx(
+                catalog,
+                HogliteCatalogStore.freshTxid("upload-claim"),
+                null,
+                HogliteTx().apply {
+                    add(
+                        "INSERT OR IGNORE INTO uploads(upload_id, owner, prefix, file_kind, path, state, " +
+                            "claimed_at, expires_at) VALUES (?, ?, ?, ?, ?, 'active', ?, ?)",
+                        id.toString(),
+                        owner.toString(),
+                        normalized,
+                        kind,
+                        path,
+                        HogliteSchema.fmt(now),
+                        HogliteSchema.fmt(expires),
+                    )
+                },
+            )
+            val claim = load(catalog, id)
+            if (claim.owner != owner || claim.prefix != normalized || claim.fileKind != kind) {
+                throw HoglakeException.CommitConflict("upload identity was reused with a different definition")
+            }
+            return claim
         }
-        val now = Instant.now()
-        val expires = now.plus(24, ChronoUnit.HOURS)
-        // The path is a fresh random UUID, so this races nothing;
-        // INSERT OR IGNORE makes a retry of the SAME upload_id
-        // idempotent, and the identity check below rejects a reuse
-        // that changed the definition.
-        store.runTx(
-            catalog,
-            HogliteCatalogStore.freshTxid("upload-claim"),
-            null,
-            HogliteTx().apply {
-                add(
-                    "INSERT OR IGNORE INTO uploads(upload_id, owner, prefix, file_kind, path, state, " +
-                        "claimed_at, expires_at) VALUES (?, ?, ?, ?, ?, 'active', ?, ?)",
-                    id.toString(),
-                    owner.toString(),
-                    normalized,
-                    kind,
-                    path,
-                    HogliteSchema.fmt(now),
-                    HogliteSchema.fmt(expires),
-                )
-            },
-        )
-        val claim = load(catalog, id)
-        if (claim.owner != owner || claim.prefix != normalized || claim.fileKind != kind) {
-            throw HoglakeException.CommitConflict("upload identity was reused with a different definition")
-        }
-        return claim
-    }
 
     /** Renewal may win against expiry, but can never revive a fenced claim. */
     override fun renew(
         catalog: String,
         owner: UUID,
-    ): Int {
-        store.meta(catalog)
-        val expires = HogliteSchema.fmt(Instant.now().plus(24, ChronoUnit.HOURS))
-        val tx = HogliteTx()
-        val idx =
-            tx.add(
-                "UPDATE uploads SET expires_at = ? WHERE owner = ? AND state = 'active'",
-                expires,
-                owner.toString(),
-            )
-        return store.runTx(catalog, HogliteCatalogStore.freshTxid("upload-renew"), null, tx)[idx]
-            .affected.toInt()
-    }
+    ): Int =
+        store.catalogOperation(catalog) {
+            store.meta(catalog)
+            val expires = HogliteSchema.fmt(Instant.now().plus(24, ChronoUnit.HOURS))
+            val tx = HogliteTx()
+            val idx =
+                tx.add(
+                    "UPDATE uploads SET expires_at = ? WHERE owner = ? AND state = 'active'",
+                    expires,
+                    owner.toString(),
+                )
+            return store.runTx(catalog, HogliteCatalogStore.freshTxid("upload-renew"), null, tx)[idx]
+                .affected.toInt()
+        }
 
     override fun abandon(
         catalog: String,
         owner: UUID,
         paths: List<String>,
-    ): Int {
-        store.meta(catalog)
-        if (paths.size > 10000) throw HoglakeException.Validation("too many upload paths")
-        if (paths.isEmpty()) return 0
-        // Registered claims are immutable: abort cannot retract a
-        // publication with an unknown response. The state predicate
-        // enforces that.
-        val tx = HogliteTx()
-        val idx =
-            tx.add(
-                "UPDATE uploads SET state = 'abandoned' " +
-                    "WHERE owner = ? AND state = 'active' AND path IN (${paths.joinToString(",") { "?" }})",
-                owner.toString(),
-                *paths.toTypedArray(),
-            )
-        return store.runTx(catalog, HogliteCatalogStore.freshTxid("upload-abandon"), null, tx)[idx]
-            .affected.toInt()
-    }
+    ): Int =
+        store.catalogOperation(catalog) {
+            store.meta(catalog)
+            if (paths.size > 10000) throw HoglakeException.Validation("too many upload paths")
+            if (paths.isEmpty()) return 0
+            // Registered claims are immutable: abort cannot retract a
+            // publication with an unknown response. The state predicate
+            // enforces that.
+            val tx = HogliteTx()
+            val idx =
+                tx.add(
+                    "UPDATE uploads SET state = 'abandoned' " +
+                        "WHERE owner = ? AND state = 'active' AND path IN (${paths.joinToString(",") { "?" }})",
+                    owner.toString(),
+                    *paths.toTypedArray(),
+                )
+            return store.runTx(catalog, HogliteCatalogStore.freshTxid("upload-abandon"), null, tx)[idx]
+                .affected.toInt()
+        }
 
     /**
      * Fence expired active claims and rested abandoned tombstones, one
@@ -132,24 +135,25 @@ internal class HogliteUploads(
     override fun scheduleExpired(
         catalog: String,
         limit: Int,
-    ): Int {
-        if (limit !in 1..10000) throw HoglakeException.Validation("limit must be between 1 and 10000")
-        store.meta(catalog)
-        val now = HogliteSchema.now()
-        val restBefore = HogliteSchema.fmt(Instant.now().minusSeconds(ledgerRetentionSeconds))
-        val candidates =
-            store.queryCatalog(
-                catalog,
-                "SELECT upload_id FROM uploads " +
-                    "WHERE (state = 'active' AND expires_at <= ?) " +
-                    "OR (state = 'abandoned' AND (scheduled_at IS NULL OR scheduled_at <= ?)) " +
-                    "ORDER BY upload_id LIMIT ?",
-                now,
-                restBefore,
-                limit.toLong(),
-            ).rows.map { it[0].asString() }
-        return candidates.sumOf { id -> fenceAndQueue(catalog, id, now, restBefore) }
-    }
+    ): Int =
+        store.catalogOperation(catalog) {
+            if (limit !in 1..10000) throw HoglakeException.Validation("limit must be between 1 and 10000")
+            store.meta(catalog)
+            val now = HogliteSchema.now()
+            val restBefore = HogliteSchema.fmt(Instant.now().minusSeconds(ledgerRetentionSeconds))
+            val candidates =
+                store.queryCatalog(
+                    catalog,
+                    "SELECT upload_id FROM uploads " +
+                        "WHERE (state = 'active' AND expires_at <= ?) " +
+                        "OR (state = 'abandoned' AND (scheduled_at IS NULL OR scheduled_at <= ?)) " +
+                        "ORDER BY upload_id LIMIT ?",
+                    now,
+                    restBefore,
+                    limit.toLong(),
+                ).rows.map { it[0].asString() }
+            return candidates.sumOf { id -> fenceAndQueue(catalog, id, now, restBefore) }
+        }
 
     /** Fence one claim and queue its path; 1 if fenced, 0 if it stopped qualifying. */
     private fun fenceAndQueue(

@@ -61,10 +61,19 @@ internal class HogliteHydrator(
         for (catalog in order) {
             val room = minOf(share, limit - served)
             if (room <= 0) break
+            served += runCatalog(catalog, room)[0].toInt()
+        }
+        return served
+    }
+
+    private fun runCatalog(
+        catalog: String,
+        room: Int,
+    ): LongArray =
+        store.catalogOperation(catalog) {
             val tally = sweepCatalog(catalog, room)
-            served += tally[0].toInt()
             if (tally[0] > 0) {
-                // The ledger row, after the work committed.
+                // The ledger shares the claim/hydration operation's tenant binding.
                 store.recorded(catalog, MaintenanceTask.HYDRATOR, MaintenanceTrigger.LOOP) {
                     HydratorSweepResult(
                         claimed = tally[0],
@@ -75,9 +84,8 @@ internal class HogliteHydrator(
                     )
                 }
             }
+            tally
         }
-        return served
-    }
 
     /** [claimed, hydrated, failed, transient, stats skipped below floor] */
     private fun sweepCatalog(

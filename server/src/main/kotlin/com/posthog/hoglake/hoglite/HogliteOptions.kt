@@ -20,14 +20,15 @@ import com.posthog.hoglake.service.requireOperationMetadata
 internal class HogliteOptions(
     private val store: HogliteCatalogStore,
 ) : OptionsBackend {
-    override fun get(catalog: String): CatalogOptions {
-        val m = store.meta(catalog)
-        return CatalogOptions(
-            snapshotRetentionSeconds = m.retentionSeconds,
-            consumerFloor = m.consumerFloor,
-            earliestSnapshotId = m.earliestSnapshotId,
-        )
-    }
+    override fun get(catalog: String): CatalogOptions =
+        store.catalogOperation(catalog) {
+            val m = store.meta(catalog)
+            return CatalogOptions(
+                snapshotRetentionSeconds = m.retentionSeconds,
+                consumerFloor = m.consumerFloor,
+                earliestSnapshotId = m.earliestSnapshotId,
+            )
+        }
 
     override fun patch(
         catalog: String,
@@ -36,49 +37,51 @@ internal class HogliteOptions(
         author: String?,
         message: String?,
     ): CatalogOptions =
-        Audit.audited(
-            "options_patch",
-            catalog,
-            null,
-            actor = { author },
-            message = { message },
-            detail = { opts ->
-                "snapshot_retention_seconds=${opts.snapshotRetentionSeconds} " +
-                    "consumer_floor=${opts.consumerFloor}"
-            },
-        ) {
-            if (snapshotRetentionSeconds is PatchField.Set) {
-                val v = snapshotRetentionSeconds.value
-                if (v != null && v <= 0) {
-                    throw HoglakeException.Validation(
-                        "snapshot_retention_seconds must be positive (got $v); " +
-                            "null disables expiry",
+        store.catalogOperation(catalog) {
+            Audit.audited(
+                "options_patch",
+                catalog,
+                null,
+                actor = { author },
+                message = { message },
+                detail = { opts ->
+                    "snapshot_retention_seconds=${opts.snapshotRetentionSeconds} " +
+                        "consumer_floor=${opts.consumerFloor}"
+                },
+            ) {
+                if (snapshotRetentionSeconds is PatchField.Set) {
+                    val v = snapshotRetentionSeconds.value
+                    if (v != null && v <= 0) {
+                        throw HoglakeException.Validation(
+                            "snapshot_retention_seconds must be positive (got $v); " +
+                                "null disables expiry",
+                        )
+                    }
+                }
+                val current = store.meta(catalog)
+                if (snapshotRetentionSeconds is PatchField.Set) {
+                    val next = snapshotRetentionSeconds.value
+                    if (next != null && (current.retentionSeconds == null || next < current.retentionSeconds)) {
+                        requireOperationMetadata(author, message)
+                    }
+                }
+                val tx = HogliteTx()
+                if (snapshotRetentionSeconds is PatchField.Set) {
+                    tx.add(
+                        "UPDATE meta SET snapshot_retention_seconds = ? WHERE id = 1",
+                        snapshotRetentionSeconds.value,
                     )
                 }
-            }
-            val current = store.meta(catalog)
-            if (snapshotRetentionSeconds is PatchField.Set) {
-                val next = snapshotRetentionSeconds.value
-                if (next != null && (current.retentionSeconds == null || next < current.retentionSeconds)) {
-                    requireOperationMetadata(author, message)
+                if (consumerFloor != null) {
+                    tx.add(
+                        "UPDATE meta SET consumer_floor = ? WHERE id = 1",
+                        if (consumerFloor) 1L else 0L,
+                    )
                 }
+                if (tx.size > 0) {
+                    store.runTx(catalog, HogliteCatalogStore.freshTxid("options-patch"), null, tx)
+                }
+                get(catalog)
             }
-            val tx = HogliteTx()
-            if (snapshotRetentionSeconds is PatchField.Set) {
-                tx.add(
-                    "UPDATE meta SET snapshot_retention_seconds = ? WHERE id = 1",
-                    snapshotRetentionSeconds.value,
-                )
-            }
-            if (consumerFloor != null) {
-                tx.add(
-                    "UPDATE meta SET consumer_floor = ? WHERE id = 1",
-                    if (consumerFloor) 1L else 0L,
-                )
-            }
-            if (tx.size > 0) {
-                store.runTx(catalog, HogliteCatalogStore.freshTxid("options-patch"), null, tx)
-            }
-            get(catalog)
         }
 }

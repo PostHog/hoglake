@@ -47,160 +47,161 @@ internal class HogliteAlters(
         readSnapshot: Long?,
         author: String?,
         message: String?,
-    ): TableInfo {
-        if (ops.isEmpty()) throw HoglakeException.Validation("ops must contain at least one operation")
-        val meta = store.meta(catalog)
-        val ns = store.liveNamespace(catalog, namespace)
-        val t = store.liveTable(catalog, namespace, table)
-        if (expectedTableUuid != null && t.tableUuid != expectedTableUuid) {
-            throw HoglakeException.TableRecreated(
-                "table '$namespace.$table' no longer has the expected UUID: it was " +
-                    "recreated; re-read it before retrying",
-                table = "$namespace.$table",
-                expectedTableUuid = expectedTableUuid,
-                currentTableUuid = t.tableUuid,
-            )
-        }
-        if (readSnapshot != null) {
-            if (readSnapshot < 0 || readSnapshot > meta.head) {
-                throw HoglakeException.Validation("read_snapshot must be between zero and catalog head")
-            }
-            if (readSnapshot < meta.earliestSnapshotId) {
-                throw HoglakeException.Expired("read_snapshot is below the expiry floor")
-            }
-            if (ddlChangedSince(catalog, t.tableId, readSnapshot)) {
-                throw HoglakeException.DdlSinceReadSnapshot(
-                    "concurrent DDL since snapshot $readSnapshot on table(s): " +
-                        "$namespace.$table; re-read the table and re-issue the alter, " +
-                        "replaying this request cannot succeed",
-                    tables = listOf("$namespace.$table"),
-                    readSnapshot = readSnapshot,
+    ): TableInfo =
+        store.catalogOperation(catalog) {
+            if (ops.isEmpty()) throw HoglakeException.Validation("ops must contain at least one operation")
+            val meta = store.meta(catalog)
+            val ns = store.liveNamespace(catalog, namespace)
+            val t = store.liveTable(catalog, namespace, table)
+            if (expectedTableUuid != null && t.tableUuid != expectedTableUuid) {
+                throw HoglakeException.TableRecreated(
+                    "table '$namespace.$table' no longer has the expected UUID: it was " +
+                        "recreated; re-read it before retrying",
+                    table = "$namespace.$table",
+                    expectedTableUuid = expectedTableUuid,
+                    currentTableUuid = t.tableUuid,
                 )
             }
-        }
+            if (readSnapshot != null) {
+                if (readSnapshot < 0 || readSnapshot > meta.head) {
+                    throw HoglakeException.Validation("read_snapshot must be between zero and catalog head")
+                }
+                if (readSnapshot < meta.earliestSnapshotId) {
+                    throw HoglakeException.Expired("read_snapshot is below the expiry floor")
+                }
+                if (ddlChangedSince(catalog, t.tableId, readSnapshot)) {
+                    throw HoglakeException.DdlSinceReadSnapshot(
+                        "concurrent DDL since snapshot $readSnapshot on table(s): " +
+                            "$namespace.$table; re-read the table and re-issue the alter, " +
+                            "replaying this request cannot succeed",
+                        tables = listOf("$namespace.$table"),
+                        readSnapshot = readSnapshot,
+                    )
+                }
+            }
 
-        // Live shape as of the pre-alter head.
-        val state =
-            TableState(
-                cols = store.columnsAt(catalog, t.tableId, meta.head),
-                name = t.name,
-                comment = t.comment,
-                properties = t.properties,
-                spec = store.specAt(catalog, t.tableId, meta.head),
-                sortSpec = store.sortSpecAt(catalog, t.tableId, meta.head),
-            )
+            // Live shape as of the pre-alter head.
+            val state =
+                TableState(
+                    cols = store.columnsAt(catalog, t.tableId, meta.head),
+                    name = t.name,
+                    comment = t.comment,
+                    properties = t.properties,
+                    spec = store.specAt(catalog, t.tableId, meta.head),
+                    sortSpec = store.sortSpecAt(catalog, t.tableId, meta.head),
+                )
 
-        // The field-id allocator is planned LOCALLY across the ops of
-        // one alter: the first AddColumn pins it with a scalar guard, and
-        // later ones advance the pinned value (each reads the same
-        // pre-tx row, so without this the second AddColumn's guard would
-        // always trip on the first's bump).
-        val plannedNextFieldId = longArrayOf(-1L)
+            // The field-id allocator is planned LOCALLY across the ops of
+            // one alter: the first AddColumn pins it with a scalar guard, and
+            // later ones advance the pinned value (each reads the same
+            // pre-tx row, so without this the second AddColumn's guard would
+            // always trip on the first's bump).
+            val plannedNextFieldId = longArrayOf(-1L)
 
-        val tx = HogliteTx()
-        tx.expectOne(
-            "SELECT COUNT(*) FROM tables WHERE id = ? AND dropped_snapshot IS NULL AND table_uuid = ?",
-            t.tableId,
-            t.tableUuid.toString(),
-        ) {
-            HoglakeException.TableRecreated(
-                "table '$namespace.$table' was recreated under the alter",
-                table = "$namespace.$table",
-                expectedTableUuid = t.tableUuid,
-                currentTableUuid = t.tableUuid,
-            )
-        }
-        if (readSnapshot != null) {
-            tx.expectZero(
-                "SELECT COUNT(*) FROM changes WHERE object_id = ? AND snapshot_id > ? " +
-                    "AND kind IN ('table_altered', 'table_dropped')",
+            val tx = HogliteTx()
+            tx.expectOne(
+                "SELECT COUNT(*) FROM tables WHERE id = ? AND dropped_snapshot IS NULL AND table_uuid = ?",
                 t.tableId,
-                readSnapshot,
+                t.tableUuid.toString(),
             ) {
-                HoglakeException.DdlSinceReadSnapshot(
-                    "concurrent DDL since snapshot $readSnapshot on table(s): $namespace.$table; " +
-                        "re-read the table and re-issue the alter",
-                    tables = listOf("$namespace.$table"),
-                    readSnapshot = readSnapshot,
+                HoglakeException.TableRecreated(
+                    "table '$namespace.$table' was recreated under the alter",
+                    table = "$namespace.$table",
+                    expectedTableUuid = t.tableUuid,
+                    currentTableUuid = t.tableUuid,
                 )
             }
-        }
-        // The schema fence: the ops were planned against head's
-        // columns/specs in Kotlin; an unguarded alter (readSnapshot =
-        // null) has no changes-window guard, so without this a
-        // concurrent alter between planning and the tx would be
-        // overwritten by stale in-memory state. Same OCC as the commit
-        // path's per-table schema fence, but an alter IS DDL, so a miss
-        // is the typed retryable conflict, not a replan.
-        tx.expectScalar(
-            t.schemaVersion,
-            "SELECT schema_version FROM tables WHERE id = ?",
-            t.tableId,
-        ) {
-            HoglakeException.CommitConflict(
-                "table $namespace.$table changed under the alter; re-read and retry",
+            if (readSnapshot != null) {
+                tx.expectZero(
+                    "SELECT COUNT(*) FROM changes WHERE object_id = ? AND snapshot_id > ? " +
+                        "AND kind IN ('table_altered', 'table_dropped')",
+                    t.tableId,
+                    readSnapshot,
+                ) {
+                    HoglakeException.DdlSinceReadSnapshot(
+                        "concurrent DDL since snapshot $readSnapshot on table(s): $namespace.$table; " +
+                            "re-read the table and re-issue the alter",
+                        tables = listOf("$namespace.$table"),
+                        readSnapshot = readSnapshot,
+                    )
+                }
+            }
+            // The schema fence: the ops were planned against head's
+            // columns/specs in Kotlin; an unguarded alter (readSnapshot =
+            // null) has no changes-window guard, so without this a
+            // concurrent alter between planning and the tx would be
+            // overwritten by stale in-memory state. Same OCC as the commit
+            // path's per-table schema fence, but an alter IS DDL, so a miss
+            // is the typed retryable conflict, not a replan.
+            tx.expectScalar(
+                t.schemaVersion,
+                "SELECT schema_version FROM tables WHERE id = ?",
+                t.tableId,
+            ) {
+                HoglakeException.CommitConflict(
+                    "table $namespace.$table changed under the alter; re-read and retry",
+                )
+            }
+            if (readSnapshot != null) {
+                // The expiry floor, in-tx: a sweep that purged the window
+                // since planning must not let the changes guard pass empty.
+                tx.expectZero(
+                    "SELECT COUNT(*) FROM meta WHERE id = 1 AND earliest_snapshot_id > ?",
+                    readSnapshot,
+                ) {
+                    HoglakeException.Expired(
+                        "read_snapshot $readSnapshot is below the expiry floor; re-read the table and re-issue",
+                    )
+                }
+            }
+            tx.allocateDdlSnapshot()
+            tx.insertSnapshotRow(author, message)
+            tx.add(
+                "INSERT INTO changes(snapshot_id, kind, object_id) " +
+                    "VALUES (${HogliteSchema.HEAD_SQL}, 'table_altered', ?)",
+                t.tableId,
+            )
+            // Publish the schema change for the commit path's per-table
+            // fence: a blind append planned against the old schema fails
+            // its fence and replans once rather than landing stale.
+            tx.add("UPDATE tables SET schema_version = schema_version + 1 WHERE id = ?", t.tableId)
+            for (op in ops) applyOp(catalog, tx, t, ns.namespaceId, namespace, state, op, plannedNextFieldId)
+
+            val readback = tx.add(HogliteSql.READBACK_DDL)
+            val results = store.runTx(catalog, HogliteCatalogStore.freshTxid("alter"), null, tx)
+            val snapshotId = results[readback].firstRow()!![0].asLong()
+
+            // STAYS EXACT, like the Postgres path (#232): the snapshot this
+            // receipt answers for was allocated in this transaction, so no
+            // sampler could have seen it; an alter is rare DDL beside which
+            // one aggregate is noise.
+            val agg =
+                store.queryCatalog(
+                    catalog,
+                    "SELECT COALESCE(SUM(record_count),0), COUNT(*), COALESCE(SUM(file_size_bytes),0) " +
+                        "FROM files WHERE table_id = ? AND begin_snapshot <= ? " +
+                        "AND (end_snapshot IS NULL OR end_snapshot > ?)",
+                    t.tableId,
+                    snapshotId,
+                    snapshotId,
+                ).firstRow()!!
+            return TableInfo(
+                tableId = t.tableId,
+                tableUuid = t.tableUuid,
+                namespace = namespace,
+                name = state.name,
+                comment = state.comment,
+                properties = state.properties,
+                columns = state.cols.sortedBy { it.ordinal },
+                readSnapshotId = snapshotId,
+                recordCount = agg[0].asLong(),
+                fileCount = agg[1].asLong(),
+                fileSizeBytes = agg[2].asLong(),
+                partitionSpec = state.spec,
+                sortSpec = state.sortSpec,
+                snapshotId = snapshotId,
             )
         }
-        if (readSnapshot != null) {
-            // The expiry floor, in-tx: a sweep that purged the window
-            // since planning must not let the changes guard pass empty.
-            tx.expectZero(
-                "SELECT COUNT(*) FROM meta WHERE id = 1 AND earliest_snapshot_id > ?",
-                readSnapshot,
-            ) {
-                HoglakeException.Expired(
-                    "read_snapshot $readSnapshot is below the expiry floor; re-read the table and re-issue",
-                )
-            }
-        }
-        tx.allocateDdlSnapshot()
-        tx.insertSnapshotRow(author, message)
-        tx.add(
-            "INSERT INTO changes(snapshot_id, kind, object_id) " +
-                "VALUES (${HogliteSchema.HEAD_SQL}, 'table_altered', ?)",
-            t.tableId,
-        )
-        // Publish the schema change for the commit path's per-table
-        // fence: a blind append planned against the old schema fails
-        // its fence and replans once rather than landing stale.
-        tx.add("UPDATE tables SET schema_version = schema_version + 1 WHERE id = ?", t.tableId)
-        for (op in ops) applyOp(catalog, tx, t, ns.namespaceId, namespace, state, op, plannedNextFieldId)
-
-        val readback = tx.add(HogliteSql.READBACK_DDL)
-        val results = store.runTx(catalog, HogliteCatalogStore.freshTxid("alter"), null, tx)
-        val snapshotId = results[readback].firstRow()!![0].asLong()
-
-        // STAYS EXACT, like the Postgres path (#232): the snapshot this
-        // receipt answers for was allocated in this transaction, so no
-        // sampler could have seen it; an alter is rare DDL beside which
-        // one aggregate is noise.
-        val agg =
-            store.queryCatalog(
-                catalog,
-                "SELECT COALESCE(SUM(record_count),0), COUNT(*), COALESCE(SUM(file_size_bytes),0) " +
-                    "FROM files WHERE table_id = ? AND begin_snapshot <= ? " +
-                    "AND (end_snapshot IS NULL OR end_snapshot > ?)",
-                t.tableId,
-                snapshotId,
-                snapshotId,
-            ).firstRow()!!
-        return TableInfo(
-            tableId = t.tableId,
-            tableUuid = t.tableUuid,
-            namespace = namespace,
-            name = state.name,
-            comment = state.comment,
-            properties = state.properties,
-            columns = state.cols.sortedBy { it.ordinal },
-            readSnapshotId = snapshotId,
-            recordCount = agg[0].asLong(),
-            fileCount = agg[1].asLong(),
-            fileSizeBytes = agg[2].asLong(),
-            partitionSpec = state.spec,
-            sortSpec = state.sortSpec,
-            snapshotId = snapshotId,
-        )
-    }
 
     private fun ddlChangedSince(
         catalog: String,

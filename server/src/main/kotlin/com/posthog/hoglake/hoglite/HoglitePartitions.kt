@@ -212,58 +212,59 @@ internal class HoglitePartitions(
         namespace: String?,
         table: String?,
         limit: Int,
-    ): PartitionStatsReport {
-        if (table != null && namespace == null) {
-            throw HoglakeException.Validation("'table' filter requires 'namespace'")
-        }
-        if (limit <= 0) {
-            throw HoglakeException.Validation("limit must be positive (got $limit)")
-        }
-        val cappedLimit = limit.coerceAtMost(MAX_LIMIT)
-        if (namespace != null) {
-            store.liveNamespace(catalog, namespace)
-            if (table != null) store.liveTable(catalog, namespace, table)
-        }
-        val groups = groups(catalog, namespace, table)
-        val names = fieldNames(catalog, groups.map { it.tableId }.distinct())
-        val headSpecs = groups.map { it.tableId }.distinct().associateWith { headSpec(catalog, it)?.specId }
-        val debts =
-            groups.map { g ->
-                val fieldNames = g.specId?.let { names[g.tableId to it] } ?: emptyList()
-                PartitionDebt(
-                    namespace = g.namespace,
-                    table = g.table,
-                    tableUuid = java.util.UUID.fromString(g.tableUuid),
-                    partitionValues =
-                        g.values.mapIndexed { i, value ->
-                            PartitionValue(fieldNames.getOrElse(i) { "key_$i" }, value)
-                        },
-                    specId = g.specId,
-                    fileCount = g.fileCount,
-                    smallFileCount = g.smallFileCount,
-                    totalBytes = g.totalBytes,
-                    smallFileBytes = g.smallFileBytes,
-                    avgFileBytes = if (g.fileCount > 0) g.totalBytes / g.fileCount else 0,
-                    dvCount = g.dvCount,
-                    debtScore = g.debt(smallFileThresholdBytes, minInputFiles, maxInputFiles),
-                )
+    ): PartitionStatsReport =
+        store.catalogOperation(catalog) {
+            if (table != null && namespace == null) {
+                throw HoglakeException.Validation("'table' filter requires 'namespace'")
             }
-        val ordered =
-            debts.sortedWith(
-                compareByDescending<PartitionDebt> { it.debtScore }
-                    .thenByDescending { it.smallFileBytes }
-                    .thenBy { it.namespace }
-                    .thenBy { it.table },
+            if (limit <= 0) {
+                throw HoglakeException.Validation("limit must be positive (got $limit)")
+            }
+            val cappedLimit = limit.coerceAtMost(MAX_LIMIT)
+            if (namespace != null) {
+                store.liveNamespace(catalog, namespace)
+                if (table != null) store.liveTable(catalog, namespace, table)
+            }
+            val groups = groups(catalog, namespace, table)
+            val names = fieldNames(catalog, groups.map { it.tableId }.distinct())
+            val headSpecs = groups.map { it.tableId }.distinct().associateWith { headSpec(catalog, it)?.specId }
+            val debts =
+                groups.map { g ->
+                    val fieldNames = g.specId?.let { names[g.tableId to it] } ?: emptyList()
+                    PartitionDebt(
+                        namespace = g.namespace,
+                        table = g.table,
+                        tableUuid = java.util.UUID.fromString(g.tableUuid),
+                        partitionValues =
+                            g.values.mapIndexed { i, value ->
+                                PartitionValue(fieldNames.getOrElse(i) { "key_$i" }, value)
+                            },
+                        specId = g.specId,
+                        fileCount = g.fileCount,
+                        smallFileCount = g.smallFileCount,
+                        totalBytes = g.totalBytes,
+                        smallFileBytes = g.smallFileBytes,
+                        avgFileBytes = if (g.fileCount > 0) g.totalBytes / g.fileCount else 0,
+                        dvCount = g.dvCount,
+                        debtScore = g.debt(smallFileThresholdBytes, minInputFiles, maxInputFiles),
+                    )
+                }
+            val ordered =
+                debts.sortedWith(
+                    compareByDescending<PartitionDebt> { it.debtScore }
+                        .thenByDescending { it.smallFileBytes }
+                        .thenBy { it.namespace }
+                        .thenBy { it.table },
+                )
+            return PartitionStatsReport(
+                partitions = ordered.take(cappedLimit),
+                truncated = ordered.size > cappedLimit,
+                staleSpecGroups =
+                    groups.count { it.specId != headSpecs[it.tableId] }.toLong(),
+                smallFileThresholdBytes = smallFileThresholdBytes,
+                sampledAt = null,
             )
-        return PartitionStatsReport(
-            partitions = ordered.take(cappedLimit),
-            truncated = ordered.size > cappedLimit,
-            staleSpecGroups =
-                groups.count { it.specId != headSpecs[it.tableId] }.toLong(),
-            smallFileThresholdBytes = smallFileThresholdBytes,
-            sampledAt = null,
-        )
-    }
+        }
 
     // ---- listing: one table's groups, decoded, filtered, paged --------------
 
@@ -276,114 +277,115 @@ internal class HoglitePartitions(
         limit: Int,
         offset: Int,
         filters: List<PartitionListingService.Filter>,
-    ): PartitionListing {
-        if (limit <= 0) throw HoglakeException.Validation("limit must be positive (got $limit)")
-        if (offset < 0) throw HoglakeException.Validation("offset must be >= 0 (got $offset)")
-        val cappedLimit = limit.coerceAtMost(MAX_LIMIT)
-        val descending = desc ?: sort.descendingByDefault
+    ): PartitionListing =
+        store.catalogOperation(catalog) {
+            if (limit <= 0) throw HoglakeException.Validation("limit must be positive (got $limit)")
+            if (offset < 0) throw HoglakeException.Validation("offset must be >= 0 (got $offset)")
+            val cappedLimit = limit.coerceAtMost(MAX_LIMIT)
+            val descending = desc ?: sort.descendingByDefault
 
-        val headSpec =
-            run {
-                val t = store.liveTable(catalog, namespace, table)
-                headSpec(catalog, t.tableId)
+            val headSpec =
+                run {
+                    val t = store.liveTable(catalog, namespace, table)
+                    headSpec(catalog, t.tableId)
+                }
+            val arity = headSpec?.fields?.size ?: 0
+            filters.firstOrNull { it.keyIndex < 0 || it.keyIndex >= arity }?.let {
+                throw HoglakeException.Validation(
+                    "partition key_index ${it.keyIndex} is out of range for table " +
+                        "'$namespace.$table' ($arity partition keys)",
+                )
             }
-        val arity = headSpec?.fields?.size ?: 0
-        filters.firstOrNull { it.keyIndex < 0 || it.keyIndex >= arity }?.let {
-            throw HoglakeException.Validation(
-                "partition key_index ${it.keyIndex} is out of range for table " +
-                    "'$namespace.$table' ($arity partition keys)",
-            )
-        }
-        val t = store.liveTable(catalog, namespace, table)
-        val groups = groups(catalog, namespace, table)
-        if (groups.size > MAX_GROUPS) {
-            throw HoglakeException.Validation(
-                "table '$namespace.$table' has more than $MAX_GROUPS partition groups; " +
-                    "this listing decodes, sorts and pages them in memory and refuses above that. " +
-                    "A 'filter' does not help (it is applied after the read). Use " +
-                    "GET /v1/catalogs/{catalog}/stats/partitions for the catalog-wide ranking.",
-            )
-        }
-        val names = fieldNames(catalog, listOf(t.tableId))
-        // Field labels WITH transforms for decoding (PartitionFieldLabels'
-        // Field carries transform + param; rebuild that here — the names
-        // map above flattens them away).
-        val fieldsBySpec = fieldDefs(catalog, t.tableId)
-        val spec =
-            headSpec?.let { s ->
-                val fields = fieldsBySpec[s.specId] ?: emptyList()
-                PartitionSpecSummary(
-                    specId = s.specId,
-                    fields =
-                        s.fields.mapIndexed { i, f ->
-                            PartitionSpecField(
-                                field = fields.getOrNull(i)?.first ?: "key_$i",
-                                transform = f.transform.wire,
-                                transformParam = f.transformParam,
-                                sourceFieldId = f.sourceFieldId,
+            val t = store.liveTable(catalog, namespace, table)
+            val groups = groups(catalog, namespace, table)
+            if (groups.size > MAX_GROUPS) {
+                throw HoglakeException.Validation(
+                    "table '$namespace.$table' has more than $MAX_GROUPS partition groups; " +
+                        "this listing decodes, sorts and pages them in memory and refuses above that. " +
+                        "A 'filter' does not help (it is applied after the read). Use " +
+                        "GET /v1/catalogs/{catalog}/stats/partitions for the catalog-wide ranking.",
+                )
+            }
+            val names = fieldNames(catalog, listOf(t.tableId))
+            // Field labels WITH transforms for decoding (PartitionFieldLabels'
+            // Field carries transform + param; rebuild that here — the names
+            // map above flattens them away).
+            val fieldsBySpec = fieldDefs(catalog, t.tableId)
+            val spec =
+                headSpec?.let { s ->
+                    val fields = fieldsBySpec[s.specId] ?: emptyList()
+                    PartitionSpecSummary(
+                        specId = s.specId,
+                        fields =
+                            s.fields.mapIndexed { i, f ->
+                                PartitionSpecField(
+                                    field = fields.getOrNull(i)?.first ?: "key_$i",
+                                    transform = f.transform.wire,
+                                    transformParam = f.transformParam,
+                                    sourceFieldId = f.sourceFieldId,
+                                )
+                            },
+                    )
+                }
+            val decoded =
+                groups.map { g ->
+                    val fields = g.specId?.let { fieldsBySpec[it] } ?: emptyList()
+                    val values =
+                        g.values.mapIndexed { i, raw ->
+                            val f = fields.getOrNull(i)
+                            PartitionListingValue(
+                                field = f?.first ?: "key_$i",
+                                raw = raw,
+                                decoded =
+                                    PartitionValueDecoding.decode(
+                                        f?.second ?: "identity",
+                                        raw,
+                                        f?.third,
+                                    ),
                             )
-                        },
-                )
-            }
-        val decoded =
-            groups.map { g ->
-                val fields = g.specId?.let { fieldsBySpec[it] } ?: emptyList()
-                val values =
-                    g.values.mapIndexed { i, raw ->
-                        val f = fields.getOrNull(i)
-                        PartitionListingValue(
-                            field = f?.first ?: "key_$i",
-                            raw = raw,
-                            decoded =
-                                PartitionValueDecoding.decode(
-                                    f?.second ?: "identity",
-                                    raw,
-                                    f?.third,
-                                ),
-                        )
-                    }
-                DecodedGroup(
-                    specId = g.specId,
-                    group =
-                        PartitionGroup(
-                            specId = g.specId,
-                            values = values,
-                            fileCount = g.fileCount,
-                            smallFileCount = g.smallFileCount,
-                            totalBytes = g.totalBytes,
-                            smallFileBytes = g.smallFileBytes,
-                            avgFileBytes = if (g.fileCount > 0) g.totalBytes / g.fileCount else 0,
-                            dvCount = g.dvCount,
-                            debtScore = g.debt(smallFileThresholdBytes, minInputFiles, maxInputFiles),
-                            // Always measured here — there is no sample to
-                            // be unpublished.
-                            recordCount = g.recordCount,
-                            lastWrittenSnapshot = g.newestBeginSnapshot,
-                        ),
-                )
-            }
-        val matching =
-            decoded.filter { d ->
-                filters.all { f ->
-                    val value = d.group.values.getOrNull(f.keyIndex) ?: return@all false
-                    if (f.text.isEmpty()) {
-                        value.decoded == null
-                    } else {
-                        value.decoded != null && value.decoded.startsWith(f.text, ignoreCase = true)
+                        }
+                    DecodedGroup(
+                        specId = g.specId,
+                        group =
+                            PartitionGroup(
+                                specId = g.specId,
+                                values = values,
+                                fileCount = g.fileCount,
+                                smallFileCount = g.smallFileCount,
+                                totalBytes = g.totalBytes,
+                                smallFileBytes = g.smallFileBytes,
+                                avgFileBytes = if (g.fileCount > 0) g.totalBytes / g.fileCount else 0,
+                                dvCount = g.dvCount,
+                                debtScore = g.debt(smallFileThresholdBytes, minInputFiles, maxInputFiles),
+                                // Always measured here — there is no sample to
+                                // be unpublished.
+                                recordCount = g.recordCount,
+                                lastWrittenSnapshot = g.newestBeginSnapshot,
+                            ),
+                    )
+                }
+            val matching =
+                decoded.filter { d ->
+                    filters.all { f ->
+                        val value = d.group.values.getOrNull(f.keyIndex) ?: return@all false
+                        if (f.text.isEmpty()) {
+                            value.decoded == null
+                        } else {
+                            value.decoded != null && value.decoded.startsWith(f.text, ignoreCase = true)
+                        }
                     }
                 }
-            }
-        val ordered = matching.sortedWith(comparator(sort, descending))
-        return PartitionListing(
-            sampledAt = null,
-            sampleStarted = null,
-            sampledSnapshotId = null,
-            spec = spec,
-            total = matching.size,
-            staleSpecGroups = matching.count { it.specId != headSpec?.specId },
-            partitions = ordered.drop(offset).take(cappedLimit).map { it.group },
-        )
-    }
+            val ordered = matching.sortedWith(comparator(sort, descending))
+            return PartitionListing(
+                sampledAt = null,
+                sampleStarted = null,
+                sampledSnapshotId = null,
+                spec = spec,
+                total = matching.size,
+                staleSpecGroups = matching.count { it.specId != headSpec?.specId },
+                partitions = ordered.drop(offset).take(cappedLimit).map { it.group },
+            )
+        }
 
     /** (spec_id -> [(displayName, transform, transformParam)]) for one table — PartitionFieldLabels over the tenant. */
     private fun fieldDefs(

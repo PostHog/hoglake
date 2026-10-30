@@ -73,6 +73,7 @@ class HogliteGuardRaceTest {
         var remaining: Int = 1,
         val shortCircuit: Int? = null,
         val before: () -> Unit = {},
+        val after: () -> Unit = {},
     )
 
     private val hooks = CopyOnWriteArrayList<Hook>()
@@ -182,6 +183,7 @@ class HogliteGuardRaceTest {
                             },
                         ).build()
                 val resp = fwd.send(req, HttpResponse.BodyHandlers.ofByteArray())
+                hook?.after?.invoke()
                 respond(resp.statusCode(), resp.body())
             } catch (e: Throwable) {
                 ex.sendResponseHeaders(599, -1)
@@ -973,6 +975,239 @@ class HogliteGuardRaceTest {
         assertThat(hook.remaining).isZero()
         assertThat(r.isSuccess).isTrue()
         assertThat(store.listCatalogs().map { it.name }).contains(c)
+        assertThat(store.getCatalog(c).name).isEqualTo(c)
+    }
+
+    private fun recreateWithVictim(
+        s: HogliteCatalogStore,
+        c: String,
+        t: com.posthog.hoglake.model.TableInfo,
+    ) {
+        s.dropTable(c, "ns", "t", t.tableUuid, "p", "p")
+        s.dropNamespace(c, "ns", null, "p", "p")
+        s.dropCatalog(c, "y", "drop")
+        s.createCatalog(c, "s3://hoglake-it/$c")
+        s.createNamespace(c, "zz")
+        s.createTable(c, "zz", "victim", listOf(ColumnDef("id", ColType.LONG)))
+    }
+
+    @Test
+    fun `a planning read cannot switch the incarnation of an existing commit plan`() {
+        val (c, t) = setup()
+        val oldTenant = store.resolveTenant(c)
+        pstore.getCatalog(c)
+        val hook =
+            Hook({ m, p, b -> m == "POST" && "/v1/t/$oldTenant/query" in p && "partition_specs" in b }, before = {
+                recreateWithVictim(store, c, t)
+            })
+        hooks += hook
+        seen.clear()
+        val r = runCatching { pstore.commit(c, appendReq(c, "p5a.parquet")) }
+        assertThat(r.exceptionOrNull()).isInstanceOf(HoglakeException.NotFound::class.java)
+        assertThat(hook.remaining).isZero()
+        assertThat(HogliteCatalogStore(client).listFiles(c, "zz", "victim")).isEmpty()
+    }
+
+    @Test
+    fun `a same-replica recreate cannot retarget an existing commit plan`() {
+        val (c, t) = setup()
+        val oldTenant = store.resolveTenant(c)
+        pstore.getCatalog(c)
+        val hook =
+            Hook({ m, p, b -> m == "POST" && "/v1/t/$oldTenant/query" in p && "partition_specs" in b }, after = {
+                recreateWithVictim(pstore, c, t)
+            })
+        hooks += hook
+        seen.clear()
+        val r = runCatching { pstore.commit(c, appendReq(c, "p5b.parquet")) }
+        assertThat(r.exceptionOrNull()).isInstanceOf(HoglakeException.NotFound::class.java)
+        assertThat(hook.remaining).isZero()
+        assertThat(HogliteCatalogStore(client).listFiles(c, "zz", "victim")).isEmpty()
+    }
+
+    @Test
+    fun `a concurrent cache refresh cannot retarget an existing commit plan`() {
+        val (c, t) = setup()
+        val oldTenant = store.resolveTenant(c)
+        pstore.getCatalog(c)
+        val hook =
+            Hook({ m, p, b -> m == "POST" && "/v1/t/$oldTenant/query" in p && "partition_specs" in b }, after = {
+                recreateWithVictim(store, c, t)
+                pstore.getCatalog(c)
+            })
+        hooks += hook
+        seen.clear()
+        val r = runCatching { pstore.commit(c, appendReq(c, "p5c.parquet")) }
+        assertThat(r.exceptionOrNull()).isInstanceOf(HoglakeException.NotFound::class.java)
+        assertThat(hook.remaining).isZero()
+        assertThat(HogliteCatalogStore(client).listFiles(c, "zz", "victim")).isEmpty()
+    }
+
+    @Test
+    fun `a partition-spec planning read cannot move a commit into a replacement tenant`() {
+        val (c, t) = setup()
+        val oldTenant = store.resolveTenant(c)
+        val hook =
+            Hook({ _, p, b ->
+                "/v1/t/$oldTenant/query" in p && "SELECT spec_id, fields_json FROM partition_specs" in b
+            }, before = {
+                store.dropTable(c, "ns", "t", t.tableUuid, "p", "p")
+                store.dropNamespace(c, "ns", null, "p", "p")
+                store.dropCatalog(c, "y", "drop")
+                store.createCatalog(c, "s3://hoglake-it/$c")
+                store.createNamespace(c, "zz")
+                store.createTable(c, "zz", "victim", listOf(ColumnDef("id", ColType.LONG)))
+            })
+        hooks += hook
+        val result = runCatching { pstore.commit(c, appendReq(c, "read-incarnation.parquet")) }
+        val files = store.listFiles(c, "zz", "victim")
+        assertThat(hook.remaining).isZero()
+        assertThat(files).describedAs("a read refresh must not redirect an existing table-id plan").isEmpty()
+        assertThat(result.exceptionOrNull()).isInstanceOf(HoglakeException.NotFound::class.java)
+    }
+
+    @Test
+    fun `a sibling refresh after the upload planning read cannot retarget a commit`() {
+        val (c, t) = setup()
+        val oldTenant = store.resolveTenant(c)
+        val hook =
+            Hook({ _, p, b ->
+                "/v1/t/$oldTenant/query" in p && "SELECT upload_id, path, file_kind, state, owner FROM uploads" in b
+            }, after = {
+                // This planning read has ALREADY returned from T1. A sibling
+                // request on this same store refreshes its shared name cache
+                // before the committing caller gets the old read response.
+                store.dropTable(c, "ns", "t", t.tableUuid, "p", "p")
+                store.dropNamespace(c, "ns", null, "p", "p")
+                store.dropCatalog(c, "y", "drop")
+                store.createCatalog(c, "s3://hoglake-it/$c")
+                store.createNamespace(c, "zz")
+                store.createTable(c, "zz", "victim", listOf(ColumnDef("id", ColType.LONG)))
+                pstore.getCatalog(c)
+            })
+        hooks += hook
+        val result = runCatching { pstore.commit(c, appendReq(c, "sibling-incarnation.parquet")) }
+        val files = store.listFiles(c, "zz", "victim")
+        assertThat(hook.remaining).isZero()
+        assertThat(files).describedAs("an unrelated request's cache refresh must not retarget this plan").isEmpty()
+        assertThat(result.exceptionOrNull()).isInstanceOf(HoglakeException.NotFound::class.java)
+    }
+
+    private fun recreateEmptyAndRefresh(c: String) {
+        store.dropCatalog(c, "test", "recreate")
+        store.createCatalog(c, "s3://hoglake-it/$c")
+        pstore.getCatalog(c)
+    }
+
+    @Test
+    fun `an options patch cannot cross incarnations after reading its policy`() {
+        val c = freshCatalog()
+        val old = store.resolveTenant(c)
+        val hook =
+            Hook({ _, p, b -> "/v1/t/$old/query" in p && "FROM meta" in b }, after = {
+                recreateEmptyAndRefresh(c)
+            })
+        hooks += hook
+        assertThatThrownBy {
+            HogliteOptions(pstore).patch(c, PatchField.Absent, false, "test", "policy")
+        }.isInstanceOf(HoglakeException.NotFound::class.java)
+        assertThat(hook.remaining).isZero()
+        assertThat(store.getCatalog(c).consumerFloor).isTrue()
+    }
+
+    @Test
+    fun `an upload claim cannot cross incarnations after checking its data path`() {
+        val c = freshCatalog()
+        val old = store.resolveTenant(c)
+        val hook =
+            Hook({ _, p, b -> "/v1/t/$old/query" in p && "FROM meta" in b }, after = {
+                recreateEmptyAndRefresh(c)
+            })
+        hooks += hook
+        assertThatThrownBy {
+            pstore.uploads.claim(c, UUID.randomUUID(), UUID.randomUUID(), "s3://hoglake-it/$c/up", "data")
+        }.isInstanceOf(HoglakeException.NotFound::class.java)
+        assertThat(hook.remaining).isZero()
+        assertThat(n(c, "SELECT COUNT(*) FROM uploads")).isZero()
+    }
+
+    @Test
+    fun `an expiry sweep and its run ledger stay on their entry incarnation`() {
+        val c = freshCatalog()
+        val old = store.resolveTenant(c)
+        val hook =
+            Hook({ _, p, b -> "/v1/t/$old/query" in p && "FROM meta" in b }, after = {
+                recreateEmptyAndRefresh(c)
+            })
+        hooks += hook
+        assertThatThrownBy {
+            HogliteExpiry(pstore, 100, 10_000).runOnce(c, 100, MaintenanceTrigger.MANUAL)
+        }.isInstanceOf(HoglakeException.NotFound::class.java)
+        assertThat(hook.remaining).isZero()
+        assertThat(n(c, "SELECT COUNT(*) FROM maintenance_runs")).isZero()
+        assertThat(store.getCatalog(c).earliestSnapshotId).isZero()
+    }
+
+    @Test
+    fun `a create-table plan cannot reuse a namespace id in a replacement tenant`() {
+        val c = freshCatalog()
+        store.createNamespace(c, "ns")
+        val old = store.resolveTenant(c)
+        val hook =
+            Hook({ _, p, b -> "/v1/t/$old/query" in p && "FROM namespaces WHERE name" in b }, after = {
+                store.dropNamespace(c, "ns", null, "test", "drop")
+                store.dropCatalog(c, "test", "drop")
+                store.createCatalog(c, "s3://hoglake-it/$c")
+                store.createNamespace(c, "zz")
+                pstore.getCatalog(c)
+            })
+        hooks += hook
+        assertThatThrownBy {
+            pstore.createTable(c, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        }.isInstanceOf(HoglakeException.NotFound::class.java)
+        assertThat(hook.remaining).isZero()
+        assertThat(n(c, "SELECT COUNT(*) FROM tables")).isZero()
+    }
+
+    @Test
+    fun `a swallowed bound 404 still fails the operation without writing a replacement run ledger`() {
+        val c = freshCatalog()
+        val old = store.resolveTenant(c)
+        assertThatThrownBy {
+            pstore.recorded(c, com.posthog.hoglake.model.MaintenanceTask.EXPIRY, MaintenanceTrigger.MANUAL) {
+                pstore.meta(c)
+                client.release(old)
+                client.deleteTenant(old)
+                assertThat(runCatching { pstore.queryCatalog(c, "SELECT 1") }.exceptionOrNull())
+                    .isInstanceOf(HoglakeException.NotFound::class.java)
+                // Even a broad catch must not permit the recorded boundary to
+                // acknowledge success or write its ledger to the new tenant.
+                val sibling = Executors.newSingleThreadExecutor()
+                try {
+                    sibling.submit { recreateEmptyAndRefresh(c) }.get(10, TimeUnit.SECONDS)
+                } finally {
+                    sibling.shutdownNow()
+                }
+                42
+            }
+        }.isInstanceOf(HoglakeException.NotFound::class.java)
+        assertThat(n(c, "SELECT COUNT(*) FROM maintenance_runs")).isZero()
+        // Finally unwinds the poisoned scope; a NEW operation may bind T2.
+        assertThat(pstore.getCatalog(c).name).isEqualTo(c)
+    }
+
+    @Test
+    fun `catalog bootstrap readback cannot acknowledge another incarnation`() {
+        val c = "race${catalogCounter++}"
+        val hook =
+            Hook({ m, _, b -> m == "POST" && "INSERT INTO catalogs" in b && c in b }, after = {
+                recreateEmptyAndRefresh(c)
+            })
+        hooks += hook
+        assertThatThrownBy {
+            pstore.createCatalog(c, "s3://hoglake-it/$c")
+        }.isInstanceOf(HoglakeException.NotFound::class.java)
+        assertThat(hook.remaining).isZero()
         assertThat(store.getCatalog(c).name).isEqualTo(c)
     }
 }
