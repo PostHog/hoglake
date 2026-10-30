@@ -534,8 +534,22 @@ snapshot like every alter, and there is no unset); while it is on, a spec change
 keep that identity field, the column cannot be dropped or renamed, the
 table cannot be renamed, and an atomic replacement of it is refused at
 prepare. GET reports `object_prefix_field` as of the snapshot read.
-Until compaction writes under the layout it skips such tables
-(`hoglake_compaction_skipped_total{reason="object_prefix_layout"}`). Set
+Compaction keeps the layout (2.1d): it takes as inputs only
+`stats_state = 'provided' AND NOT prefix_quarantined` files (the mount
+predicate, added to the candidate read for such tables only), writes each
+group's output under the group's value's prefix (groups never span a
+partition), proves the output's footer stats for the field before it
+commits (a mismatch is `invalid_data` naming the inputs; an output
+without a footer is not registered), and re-reads the live layout and
+names under the commit lock, skipping the group as a conflict if the
+output is no longer under the prefix they name. A group whose prefix
+cannot be named is refused in metadata, uncharged
+(`hoglake_compaction_skipped_total{reason="object_prefix_unresolvable"}`).
+In a rolling deploy a 2.1b/2.1c replica still skips such tables while a
+2.1d one compacts them, which is safe in both directions: outputs
+register `provided`, so an older hydrator never claims one, and an older
+commit path holds a DV on an output to the output's prefix like any
+other file. Set
 the option only once every server, compaction and hydrator replica runs
 a version that knows it: an older one ignores the row and would accept
 or compact files outside the prefixes. Deferred stats on such a table
@@ -1171,7 +1185,10 @@ stats from the footer the rewrite just wrote — the same
 `FooterStats.aggregate` the hydrator runs, so the counts and bounds are
 exactly the rows the writer emitted and no input stats row is read at
 all — and the changefeed excludes compacted outputs so
-consumers never see merged rows re-appear as fresh appends.
+consumers never see merged rows re-appear as fresh appends. On a table
+with the object-prefix layout the output goes under its group's prefix
+and its footer must prove the value before it registers (see
+Partitioning).
 
 **A group with no survivors registers no output.** When every input's
 live deletion vector deletes every row it holds, the rewrite still runs
@@ -1915,12 +1932,18 @@ outright failure that gets retried next run. The first two never show up as fail
 look perfectly healthy — which is why they get a line rather than only a
 log and a ledger row. The self-healing skips (commit conflicts, DV
 supersession) stay uncounted: they re-plan on the next run. A fourth
-reason, `object_prefix_layout`, counts TABLES, not groups: one per sweep
-for each table with the object-prefix layout (see Partitioning), which
-compaction leaves alone until it writes under the layout. It is a steady
-rate while such tables exist, not an alert. A fifth, `claimed_elsewhere`,
+reason, `object_prefix_unresolvable`, counts groups of a table with the
+object-prefix layout (see Partitioning) refused before any IO because
+their prefix cannot be named (no spec, no single identity key on the
+field, a missing or non-canonical value), or because the layout's column
+is not live or not of an allowed type, which refuses every group of the
+table; it is a broken invariant, refused again every sweep, so alert on
+any of it. A fifth, `claimed_elsewhere`,
 counts groups dropped because another run already claimed them — duplicated
-work that did not happen, not a failure.
+work that did not happen, not a failure. (`object_prefix_layout`, one per
+sweep per option-on table, was the 2.1b/2.1c servers' skip of such
+tables; a 2.1d-or-later server never emits it, so after a rollout that
+series names a replica that is still older.)
 
 **`reason="failed"` is a FAILURE filed under a metric named
 `skipped`.** That is deliberate — one series for "groups that did not

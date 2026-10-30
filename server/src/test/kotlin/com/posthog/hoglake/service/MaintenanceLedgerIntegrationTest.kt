@@ -214,6 +214,8 @@ class MaintenanceLedgerIntegrationTest {
                 // whose unknown range blocked an append.
                 "groups_retired",
                 "files_unranged",
+                // And the object-prefix planner refusal (2.1d).
+                "object_prefix_unresolvable",
             )
         for (counter in mergeSortCounters) {
             assertThat(result[counter]?.asLong())

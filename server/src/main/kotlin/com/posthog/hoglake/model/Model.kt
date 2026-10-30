@@ -1795,6 +1795,22 @@ data class CompactionResult(
      */
     @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
     val bucketsSkippedClaimed: Long = 0,
+    /**
+     * Groups of a table with the object-prefix layout that the planner
+     * refused in METADATA, before any IO, because their prefix cannot be
+     * named: no partition spec, no single identity field on the prefix
+     * column in their spec, or a missing or non-canonical value there —
+     * or the layout itself cannot be resolved (its column is not live, or
+     * not of an allowed type), which refuses EVERY group of the table.
+     * The commit and DDL guards rule all four out through the API, so a
+     * nonzero value is a broken invariant or a row written around it; the
+     * group re-refuses every sweep until it is fixed by hand. Not charged
+     * to HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN, like [spillBudgetExceeded];
+     * also `hoglake_compaction_skipped_total{reason="object_prefix_unresolvable"}`.
+     * `NON_DEFAULT`, for [claimedElsewhere]'s stored-payload reason.
+     */
+    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    val objectPrefixUnresolvable: Long = 0,
 )
 
 /**
