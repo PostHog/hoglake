@@ -96,7 +96,8 @@ import java.util.UUID
  * Plan shape: per-key probes are `LATERAL ... LIMIT 2` (a LIMIT keeps the
  * planner from flattening the subquery into a join it could hash over
  * `hog_table_version`; 2 rather than 1 so a broken unique invariant is
- * seen, as `findOne` saw it), and sets computed inside the statement
+ * seen, as `findOne` saw it; `layouts` alone takes 1, see [READ_SQL]),
+ * and sets computed inside the statement
  * drive index scans as `= ANY(ARRAY(SELECT ...))`, the shape the
  * separate statements had with a bound array. `CommitStatementPlanIntegrationTest`
  * EXPLAINs both statements, custom and generic.
@@ -143,8 +144,15 @@ internal object CommitTail {
      * table, which on a table without the option finds nothing, and then
      * every `prefix_*` column below is null and costs nothing more (each
      * probe that follows is gated on the layout row). The column's name
-     * and type come through a LEFT JOIN, so a layout whose column is gone
-     * reaches `CommitService` as a broken invariant (500), never as "off".
+     * and type are its NEWEST live version, `LEFT JOIN LATERAL ... ORDER
+     * BY begin_snapshot DESC LIMIT 1`: a backward probe of
+     * `hog_column_pkey` that stops at the live row however many ended
+     * versions renames from before the option, promotes and comments
+     * left behind it, where a plain join
+     * walked them all (#490). LIMIT 1, not 2: looking for a second live
+     * version would walk that history again. Still a LEFT join, so a
+     * layout whose column is gone reaches `CommitService` as a broken
+     * invariant (500), never as "off".
      * With the option on, an appended table also gets the key_index of the
      * identity field on the prefix field in its live spec, and a numeric
      * DV target gets its own value of that field (one probe of
@@ -192,9 +200,13 @@ internal object CommitTail {
         layouts AS MATERIALIZED (
             SELECT l.table_id, l.object_prefix_field_id AS field_id, c.name AS field_name, c.col_type
               FROM hog_table_layout l
-              LEFT JOIN hog_column c
-                ON c.catalog_id = l.catalog_id AND c.table_id = l.table_id
-               AND c.field_id = l.object_prefix_field_id AND c.end_snapshot IS NULL
+              LEFT JOIN LATERAL (
+                    SELECT c.name, c.col_type FROM hog_column c
+                     WHERE c.catalog_id = l.catalog_id AND c.table_id = l.table_id
+                       AND c.field_id = l.object_prefix_field_id AND c.end_snapshot IS NULL
+                     ORDER BY c.begin_snapshot DESC
+                     LIMIT 1
+                   ) c ON true
              WHERE l.catalog_id = :catalogId
                AND l.table_id = ANY(ARRAY(SELECT table_id FROM resolved))
                AND l.end_snapshot IS NULL
