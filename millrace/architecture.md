@@ -7,7 +7,7 @@ references are `module.py:symbol` under `millrace/millrace/`.
 ## 1. Contract
 
 One durable queue (Kafka) into another (hoglake) through durable
-staging (one SlateDB instance per claimed Kafka partition).
+staging (one SlateDB instance per replica: its home stage).
 **At-least-once**: no loss, duplicates accepted. Every mechanism below
 exists to prevent loss, to bound memory, or to keep files correctly
 laid out; nothing exists to prevent duplicates beyond the server's
@@ -15,7 +15,7 @@ receipt for identical-bytes retries within one process.
 
 | Guarantee | Mechanism |
 |---|---|
-| A committed Kafka offset's record is durable in staging, or was dropped as unrepresentable and counted | The offset commit follows `await_durable` of every touched partition's write; an all-dropped poll writes a durable fence probe instead (§4) |
+| A committed Kafka offset's record is durable in staging, or was dropped as unrepresentable and counted | The offset commit follows `await_durable` of the poll's one home-stage write; an all-dropped poll writes a durable fence probe instead (§4) |
 | A staged row is deleted only after every commit naming it landed, or it was a counted drop | The delete batch holds exactly the scanned keys and runs after the last commit returns (§5) |
 | Every staged row is eventually flushed | The startup drain (§6) plus an in-memory index that can never lose a group with rows (§3), plus a predicate under which every group becomes due (§5) |
 | No group wedges | A scan always returns ≥ 1 row; per-record drops never fail a batch; any failure retries with backoff (§5) |
@@ -325,7 +325,7 @@ the runner, stop it, and re-raise from `run`, `run_once` and `drain`.
    - check every stage's pinned incarnation (`meta/table_uuid`): a
      recreated destination halts before anything is flushed;
    - **stream** each stage (the home and the foreign slots),
-     stages concurrently (`_drain_partition`): ONE iterator over
+     stages concurrently (`_drain_stage`): ONE iterator over
      `rows/` with the bulk read-ahead options (`stage.RowStream`), cut
      into windows of one group each, at the group's last row or where
      the next row would exceed `flush_bytes` (always ≥ 1 row).
@@ -346,7 +346,7 @@ the runner, stop it, and re-raise from `run`, `run_once` and `drain`.
      holds no lock;
    - drain settles skip the per-window durability wait
      (`settle(durable=False)`; a lost delete re-flushes a duplicate,
-     which at-least-once allows) and each partition's stream ends with
+     which at-least-once allows) and each stage's stream ends with
      one `make_durable`. SlateDB fences lazily, so a fenced drain only
      learns it at a WAL flush or `make_durable`; meanwhile both owners
      may publish the same windows (duplicates only). Waiting per window serialized the drain on one
@@ -423,7 +423,7 @@ Destination creation (`destination.py`) is described in the README.
 ## 8. Maintenance service
 
 `maintenance.py`, one process per staging root, covers every
-partition's SlateDB across topics: discovers DBs by listing the root,
+stage's SlateDB (one per slot) across topics: discovers DBs by listing the root,
 sweeps a bounded page per interval, runs `Admin.run_gc_once` and
 exports the L0 SST count per DB. Writers never run GC (it is disabled
 in `stage.build_slatedb_settings`); the service keeps that LIST/DELETE
@@ -468,7 +468,7 @@ and whenever liveness fails.
 
 | # | Invariant | Tests |
 |---|---|---|
-| 1 | Offsets commit only after every touched partition's write is durable; an all-drop poll writes a fence probe | `test_consumer.py` |
+| 1 | Offsets commit only after the poll's one home-stage write is durable; an all-drop poll writes a fence probe | `test_consumer.py` |
 | 2 | A fenced write raises `FencedError`, closes the stage, commits nothing | `test_consumer.py`, `test_stage_integration.py` |
 | 3 | I2: rows on disk ⇒ group in the index (drain hold, index-before-write, gen-guarded removal) | `test_stage.py`, `test_drain.py` |
 | 4 | Settle deletes exactly the scanned keys | `test_stage.py` |

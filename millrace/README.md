@@ -227,7 +227,7 @@ over the staged rows, cut into one-group windows (at the group's end or
 at `MILLRACE_FLUSH_BYTES`), packed into batches of up to
 `MILLRACE_FLUSH_BYTES` and 512 windows (`max_files_per_commit`), each
 batch one commit (more if its groups fan out past 512 files), flushed
-and settled as the pass goes; stages drain concurrently with at most 4
+and settled as the pass goes; stages drain concurrently with at most 2
 batches (the flush concurrency) in memory. Progress is logged per stage (`startup drain of
 <topic>[<p>]: …` at start, every 1,000 windows or 30 s, and at the end)
 and counted in `millrace_drain_rows_total` / `millrace_drain_bytes_total`.
@@ -263,7 +263,7 @@ Any flush failure leaves the rows staged and retries the group with
 backoff (2 s doubling to 120 s). Due groups that are not at the size
 lane are flushed in batches, one commit per batch (more past 512
 files); a refused batch
-(400/422) splits: each of its groups retries alone, so one bad group
+(any 4xx but 408/429, including a 409 `table_dropped`) splits: each of its groups retries alone, so one bad group
 never holds the others back. Other batch failures retry the batch. After 3 consecutive failures the group is
 logged at ERROR (`flush STUCK: …`), `millrace_flush_groups_stuck_total`
 increments and `millrace_flush_groups_stuck` counts it until it
@@ -327,7 +327,7 @@ delete-dominated stages never merged their oldest runs.
 Pod memory, in terms:
 
 ```
-  K partitions × 256 MiB unflushed
+  256 MiB unflushed (the home stage: one per replica)
 + 256 MiB shared cache × ~1.05
 + 256 MiB librdkafka queue + 256 MiB fetch
 + 256 MiB consume batch
@@ -337,11 +337,11 @@ Pod memory, in terms:
 ```
 
 During the startup drain the 2 decisions are the drain's in-flight
-windows, and each partition also holds one row stream:
+windows, and each stage being drained also holds one row stream:
 
 ```
-  K partitions × ( (L0 SSTs + sorted runs) × 2 fetches × 1 MiB read-ahead
-                   + ≤ 16 MiB page )
+  stages × ( (L0 SSTs + sorted runs) × 2 fetches × 1 MiB read-ahead
+             + ≤ 16 MiB page )
 ```
 
 Measured: 4 partitions × 8 overlapping L0 SSTs streamed +157 MiB RSS at
@@ -349,10 +349,9 @@ Measured: 4 partitions × 8 overlapping L0 SSTs streamed +157 MiB RSS at
 took +316 MiB for 230 MiB/s, so the stream uses the smaller ones
 (`stage._drain_scan_options`).
 
-At 16 partitions per pod that is ~4 GiB unflushed + ~0.8 GiB queues and
-cache + ~4.4 GiB of decisions + baseline: a 1-replica, 16-partition
-pod does **not** fit 10 GiB; 4 partitions per pod (~7 GiB) does. The
-catch-up profile peaked at 6.6 GiB with 4 partitions.
+The unflushed budget is per stage (256 MiB,
+`SlateDbConfig.max_unflushed_bytes`) and does not grow with the
+partitions a replica claims.
 
 Row scans read ahead in 4 MiB ranged GETs with 4 concurrent fetches and
 do not cache their blocks (`stage._bulk_scan_options`; slatedb's

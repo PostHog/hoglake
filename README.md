@@ -97,6 +97,7 @@ schema evolution, time travel, the changefeed and maintenance calls.
 | [pyhoglake/](pyhoglake/README.md) | Python client; owns the parquet writer path |
 | [webui/](webui/README.md) | Management console: React, Vite, TypeScript. The table page's `partitions` tab reads the maintenance sampler's last published generation, so its numbers are a sample at the snapshot it names, never a live read |
 | [hedgerow/](hedgerow/README.md) | Replication daemon; append-only, single destination |
+| [millrace/](millrace/README.md) | Kafka → hoglake ingestion with durable SlateDB staging; at-least-once |
 | [duckdb-client/](duckdb-client/README.md) | DuckDB extension — reads, writes, DML, DDL and time travel over the REST contract |
 | [bench/](bench/README.md) | Benchmark harness behind the numbers below |
 
@@ -229,15 +230,10 @@ the resource server that verifies what hogtower mints — see
 [docs/auth-tenancy.md](docs/auth-tenancy.md) §17.
 
 Known gaps are tracked as [issues](https://github.com/PostHog/hoglake/issues).
-The larger ones: [#240](https://github.com/PostHog/hoglake/issues/240) (every
-commit body kept forever, ~40 GB/day),
-[#235](https://github.com/PostHog/hoglake/issues/235) (the namespace listing
-still aggregates the manifest per table),
-[#233](https://github.com/PostHog/hoglake/issues/233) /
-[#236](https://github.com/PostHog/hoglake/issues/236) (blind partitioned
-appends, unguarded until the server flag flips) and
-[#134](https://github.com/PostHog/hoglake/issues/134) (compaction's in-memory
-sort).
+The larger ones: [#235](https://github.com/PostHog/hoglake/issues/235) (the
+namespace listing still aggregates the manifest per table) and
+[#233](https://github.com/PostHog/hoglake/issues/233) (blind partitioned
+appends, unguarded until the server flag flips).
 
 ## Development
 
@@ -278,6 +274,8 @@ implementations together.
 | [docs/auth-tenancy.md](docs/auth-tenancy.md) | Auth, tenancy and S3 data-plane entitlement: the threat model, per-catalog scopes, STS credential vending, and the phased plan |
 | [docs/trino-integration.md](docs/trino-integration.md) | The native connector, and the commit shapes that keep Trino writes a translation away |
 | [docs/operational-notes.md](docs/operational-notes.md) | What hoglake changes operationally and what it does not; sizing, and the ceilings to watch |
+| [docs/kafka-ingestion.md](docs/kafka-ingestion.md) | Kafka ingestion via staged keying: the design obligations millrace implements |
+| [docs/kafka-ingestion-plan.md](docs/kafka-ingestion-plan.md) | The test-led build sequence for the Kafka ingestion design |
 | [docs/fuzzing.md](docs/fuzzing.md) | Property testing and fuzzing: hypothesis, kotest-property, cross-language codec vectors |
 | [docs/ducklake-defect-ledger.md](docs/ducklake-defect-ledger.md) | The predecessor's production defects, and where hoglake answers each |
 | [duckdb-client/DESIGN.md](duckdb-client/DESIGN.md) | The DuckDB extension as built, including its findings against the wire contract |

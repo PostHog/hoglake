@@ -5,7 +5,7 @@ upstream tickets against `duckdb/ducklake`; after the hard fork they are
 simply our bugs, and this ledger is part of the hoglake case file.
 Each entry ends with a **Hoglake correction** stating how the design
 eliminates the defect (or its whole class). File:line pointers are into
-the fork source (`src/` in this repo).
+the fork source (`src/` in [PostHog/ducklake](https://github.com/PostHog/ducklake)).
 
 ---
 
@@ -128,8 +128,9 @@ purge — stats join 3.71M → 56K rows (66×); writer flush durations
 form; never NOT IN — NULL-key semantics) because orphans regrow at
 ~29K rows/14h on the churn pattern.
 
-**→ Hoglake correction**: stats rows are deleted **in the DROP TABLE
-commit itself** (nothing can read them after the drop), and the schema
+**→ Hoglake correction**: stats rows cascade from their data file
+when expiry or retirement deletes it (a dropped table's files are retired
+once the drop sinks under the expiry floor), and the schema
 carries real FKs so the cascade is declarative, not hand-rolled. The
 recurring purge cron and its metric disappear; any orphan count &gt; 0 is
 exported as an invariant violation (orphan count over zero pages),

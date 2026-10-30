@@ -6,15 +6,15 @@ client. **DONE** = implemented and tested against the live dev stack;
 the hoglake REST contract (see DESIGN.md server findings); **N/A** =
 deliberately not carried over (the fleet-liability list); **TODO** =
 client work not yet done. Last checked against `openapi/hoglake.yaml`
-1.3.6-dev; re-sweep the WIRE GAP rows on each server release.
+1.4.8-dev; re-sweep the WIRE GAP rows on each server release.
 
 ## Attach / catalog
 
 | Capability | Status | Notes |
 |---|---|---|
-| `ATTACH` | DONE | `ATTACH 'hoglake:<catalog>' (ENDPOINT ...)`; `SET hoglake_default_endpoint` fallback; `CREATE_IF_NOT_EXISTS` + `DATA_PATH` |
+| `ATTACH` | DONE | `ATTACH 'hoglake:<catalog>' (ENDPOINT ...)`; `SET hoglake_default_endpoint` fallback; `CREATE_IF_NOT_EXISTS` + `DATA_PATH`; auth via `TOKEN` or `TOKEN_URL` + `CLIENT_ID` + `CLIENT_SECRET` (+ `AUDIENCE`) |
 | `SNAPSHOT_VERSION` / `SNAPSHOT_TIME` attach pins | DONE | forced read-only, as ducklake |
-| Secrets (`TYPE ducklake`) | TODO | endpoint+token secret type; low-cost once auth exists |
+| Secrets (`TYPE ducklake`) | TODO | endpoint+token secret type; no secret type is registered (auth is ATTACH options only) |
 | Multi-catalog attach | DONE | independent catalogs per ATTACH |
 | `DETACH` / re-attach | DONE | |
 | Identifier case semantics | DONE | DuckDB CI identifiers over the case-sensitive server: listing-based resolution for tables and columns, case-preserving creates, CI duplicate conflicts on CREATE and on ALTER targets (add/rename column, rename table; self case-change legal), ambiguity errors for case-colliding server-side tables, columns, and namespaces with listings surviving. Fixture-created colliding TABLE and NAMESPACE pairs (`hoglake_case.test`) AND a colliding-COLUMN table (`hoglake_wire_hardening.test`: targeted error, order-independent, listings survive) |
@@ -36,7 +36,7 @@ client work not yet done. Last checked against `openapi/hoglake.yaml`
 | `SET PARTITIONED BY` | DONE | identity/year/month/day/hour/bucket parsed to the wire spec |
 | `SET SORTED BY` | PARTIAL | DDL committed; sort-on-insert NOT applied by the writer yet |
 | `SET/DROP NOT NULL`, `SET DEFAULT` | WIRE GAP | not in AlterOp |
-| Nested-field ALTERs (`ADD/DROP/RENAME FIELD`) | N/A | flat wire schema |
+| Nested-field ALTERs (`ADD/DROP/RENAME FIELD`) | TODO | the wire has nested types and `add_column` with `parent`; the client's type set is flat |
 | `COMMENT ON` | TODO | AlterOps `set_table_comment` / `set_column_comment` / `set_properties` exist (`versioned-table-metadata-v1`) |
 | `CREATE VIEW` / views | TODO/WIRE-SHAPED | wire has views (dialect-tagged); binding duckdb-dialect views is client work not done |
 | `CREATE MACRO` / sequences / indexes / constraints beyond NOT NULL | N/A | as ducklake (unsupported there too) except macros |

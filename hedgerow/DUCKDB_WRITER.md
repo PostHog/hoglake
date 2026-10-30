@@ -2,7 +2,7 @@
 
 `hedgerow.duckdb_writer.write_duckdb_event_partition` implements the file-writing
 slice of buffered ingestion. It reads frozen source fragments directly with
-DuckDB 1.5.5, selects one team/calendar-month partition, derives UTC `event_date`,
+DuckDB 1.5.6, selects one team/calendar-month partition, derives UTC `event_date`,
 converts explicitly named JSON columns to native VARIANT, sorts by
 `(event_date, event, timestamp, uuid)` ascending/nulls-first, and writes Zstandard
 Parquet with explicit top-level field IDs. UUIDs are preserved, never generated.
@@ -11,7 +11,8 @@ This writer is called by `BufferedIngestion` for each frozen team/month batch.
 The coordinator uploads and publishes its output; the writer itself only writes
 local files. The CLI selects this coordinator with `mode: buffered`. The catalog accepts VARIANT and
 pyhoglake can publish these files through `prepare_append_files` without rewriting
-them. VARIANT tables are excluded from scalar compaction; query-engine
+them. VARIANT tables compact only when the server's `HOGLAKE_COMPACTION_VARIANT`
+is on (default off); query-engine
 interoperability remains separate work. Existing CLI configs default to direct replication.
 
 ```python
@@ -80,7 +81,7 @@ paths = write_duckdb_event_partition(
 ## Resources and failure handling
 
 Each call owns one DuckDB connection and one thread. The default memory setting
-is 512 MiB, scratch setting is 8 GiB, and output target is 256 MiB with 8,192-row
+is 512 MiB, scratch setting is 8 GiB, and output target is 256 MiB with 122,880-row
 row groups. File size is approximate, with row-group/footer overshoot. Scratch
 limits do not include completed output files. The caller must bound concurrent
 workers and provision enough space for both scratch and output.
