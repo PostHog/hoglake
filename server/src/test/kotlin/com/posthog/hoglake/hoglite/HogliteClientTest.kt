@@ -29,9 +29,11 @@ class HogliteClientTest {
     /** A scripted endpoint: each call consumes one [Step] (status + body), then repeats the last. */
     private class Step(val status: Int, val body: String = "")
 
+    private val servedBodies = ConcurrentLinkedQueue<String>()
+
     private fun serve(vararg steps: Step): Pair<HttpServer, AtomicInteger> {
         val calls = AtomicInteger()
-        val bodies = ConcurrentLinkedQueue<String>()
+        val bodies = servedBodies
         val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
         server.createContext("/") { ex ->
             val i = calls.getAndIncrement()
@@ -45,16 +47,20 @@ class HogliteClientTest {
         return server to calls
     }
 
+    private val sleeps = ConcurrentLinkedQueue<Long>()
+
     private fun client(
         url: String,
         threshold: Int = 10,
         budgetMs: Long = 2_000,
+        ownerUrlPattern: String = "",
     ) = HogliteClient(
         standardUrl = url,
+        ownerUrlPattern = ownerUrlPattern,
         retryBudgetMs = budgetMs,
         circuitFailureThreshold = threshold,
         circuitOpenMs = 250,
-        sleeper = {},
+        sleeper = { sleeps += it },
     )
 
     private fun txOne(client: HogliteClient): List<HogliteQueryResult> =
@@ -66,15 +72,32 @@ class HogliteClientTest {
         )
 
     @Test
-    fun `a 421 re-pins and retries with the txid reused verbatim`() {
-        val (server, calls) =
-            serve(
-                Step(421, "{}"),
-                Step(200, "{\"results\":[{\"cols\":[\"x\"],\"rows\":[[1]]}]}"),
+    fun `a 421 re-pins to the hinted owner and retries with the body byte-identical`() {
+        val (ownerServer, ownerCalls) = serve(Step(200, "{\"results\":[{\"cols\":[\"x\"],\"rows\":[[1]]}]}"))
+        val ownerPort = ownerServer.address.port
+        // The 421 hint names the owner; the chart's headless-name
+        // pattern turns it into a routable URL (here: the port IS the
+        // "pod name", so the pattern reconstructs the second server).
+        val (entryServer, entryCalls) =
+            serve(Step(421, "{\"error\":\"misdirected\",\"owner\":\"$ownerPort\"}"))
+        val c =
+            client(
+                "http://127.0.0.1:${entryServer.address.port}",
+                ownerUrlPattern = "http://127.0.0.1:{owner}",
             )
-        val c = client("http://127.0.0.1:${server.address.port}")
         assertThat(txOne(c).single().rows.single().single()).isEqualTo(1)
-        assertThat(calls.get()).isEqualTo(2)
+        assertThat(entryCalls.get()).isEqualTo(1)
+        assertThat(ownerCalls.get()).isEqualTo(1)
+        // The retry re-sends the SAME bytes (same txid: at-most-once
+        // depends on it) and backed off 200ms rather than spinning.
+        assertThat(servedBodies.toList()).hasSize(2)
+        assertThat(servedBodies.first()).isEqualTo(servedBodies.last())
+        assertThat(sleeps).containsExactly(200L)
+        // And the pin sticks: the next call goes straight to the owner.
+        servedBodies.clear()
+        txOne(c)
+        assertThat(entryCalls.get()).isEqualTo(1)
+        assertThat(ownerCalls.get()).isEqualTo(2)
     }
 
     @Test
@@ -134,14 +157,35 @@ class HogliteClientTest {
     }
 
     @Test
+    fun `the per-attempt timeout is capped to the remaining retry budget`() {
+        // A SLOW server (answers after 2s) and a 150ms retry budget: the
+        // attempt's own timeout is capped to the budget remainder, so the
+        // call fails in hundreds of milliseconds, not after the full
+        // (10s) attempt timeout the commit path configures.
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        server.createContext("/") { ex ->
+            Thread.sleep(2_000)
+            ex.sendResponseHeaders(200, 2)
+            ex.responseBody.use { it.write(byteArrayOf(123, 125)) }
+        }
+        server.start()
+        servers += server
+        val c = client("http://127.0.0.1:${server.address.port}", budgetMs = 150)
+        val started = System.nanoTime()
+        assertThatThrownBy { txOne(c) }.isInstanceOf(HoglakeException.BackendUnavailable::class.java)
+        val elapsedMs = (System.nanoTime() - started) / 1_000_000
+        assertThat(elapsedMs).isLessThan(2_000)
+    }
+
+    @Test
     fun `the retry loop never starts an attempt past the budget`() {
-        // A server that answers only after the budget: the client must
-        // not begin the attempt at all (remaining <= 0 check).
+        // Budget already spent before the first attempt: the client must
+        // not begin it at all (the remaining <= 0 check at the top of
+        // the loop).
         val (server, calls) = serve(Step(200, "{\"results\":[]}"))
         val c = client("http://127.0.0.1:${server.address.port}", budgetMs = 1)
-        Thread.sleep(5) // let the budget elapse before the first attempt
+        Thread.sleep(5) // let wall time pass; the deadline starts inside the call
         assertThatThrownBy { txOne(c) }.isInstanceOf(HoglakeException.BackendUnavailable::class.java)
-        // budget=1ms: at most a couple of attempts, never a long spin
         assertThat(calls.get()).isLessThan(50)
     }
 }

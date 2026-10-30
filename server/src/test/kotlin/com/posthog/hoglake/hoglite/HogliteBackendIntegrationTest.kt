@@ -986,8 +986,9 @@ class HogliteBackendIntegrationTest {
 
     @Test
     fun `a ghost registry row lists as absent, stays occupied, and drops`() {
-        val catalog = freshCatalog()
-        // Simulate the mid-create crash: registry row, no tenant.
+        // Simulate the mid-create crash precisely: a registry row with NO
+        // tenant ever provisioned (tenant column null — the row predates
+        // the tenant it names).
         store.ensureRegistry()
         val tx = HogliteTx()
         tx.add(
@@ -998,13 +999,35 @@ class HogliteBackendIntegrationTest {
         store.runTx("__hoglake_registry", HogliteCatalogStore.freshTxid("ghost"), null, tx, fenced = false)
         // listCatalogs does not throw and does not surface the ghost.
         assertThat(store.listCatalogs().map { it.name }).doesNotContain("ghostcat")
-        // The name stays occupied.
+        // The name stays occupied (the precheck, not a tenant, answers).
         assertThatThrownBy { store.createCatalog("ghostcat", "s3://hoglake-it/ghostcat2") }
             .isInstanceOf(HoglakeException.AlreadyExists::class.java)
-        // ...and the ghost is droppable.
+        // The drop takes the GHOST branch: no tenant was ever created, so
+        // there is nothing to fence or release — the row just goes.
         store.dropCatalog("ghostcat", "test", "drop the ghost")
         assertThat(store.listCatalogs().map { it.name }).doesNotContain("ghostcat")
-        assertThat(catalog).isNotBlank()
+        assertThatThrownBy { store.getCatalog("ghostcat") }
+            .isInstanceOf(HoglakeException.NotFound::class.java)
+        // And no tenant leaked: the legacy-id tenant the row implied does
+        // not exist (the engine's own 404, unmapped).
+        assertThatThrownBy { client.query("hoglake-ghostcat", "SELECT 1", emptyList()) }
+            .isInstanceOf(HogliteRejected::class.java)
+    }
+
+    @Test
+    fun `a drop and recreate gives the name a fresh incarnation, and stale readers see the new one`() {
+        val catalog = freshCatalog()
+        store.createNamespace(catalog, "ns")
+        val first = store.tenantCachePeek(catalog)
+        store.dropNamespace(catalog, "ns", author = "test", message = "empty it")
+        store.dropCatalog(catalog, "test", "drop")
+        store.createCatalog(catalog, "s3://hoglake-it/$catalog")
+        val second = store.tenantCachePeek(catalog)
+        assertThat(second).isNotEqualTo(first)
+        assertThat(second).startsWith("hoglake-$catalog-")
+        // Writes land on the NEW incarnation.
+        store.createNamespace(catalog, "ns")
+        assertThat(store.listNamespaces(catalog)).hasSize(1)
     }
 
     @Test
