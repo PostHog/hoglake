@@ -1352,11 +1352,32 @@ class HogliteCatalogStore(
             // The DV join picks the newest epoch VISIBLE AT the pin: history-
             // preserving supersession means a pinned scan sees the vector
             // that was live then.
-            val rows =
-                queryCatalog(
-                    catalog,
-                    """SELECT ${HogliteSql.FILE_COLUMNS},
-                          d.delete_file_id, d.path, d.delete_count, d.file_size_bytes, d.begin_snapshot
+            // Only requested payload travels over the wire. Keyset pages share
+            // one logical snapshot AND the operation's immutable tenant binding.
+            val statsBytes = if (columnStats != null) "length(CAST(f.stats_json AS BLOB))" else "0"
+            val offsetBytes = if (splitOffsets) "length(CAST(f.split_offsets_json AS BLOB))" else "0"
+
+            fun boundedJson(
+                column: String,
+                bytes: String,
+            ): String =
+                if (bytes == "0") "NULL" else "CASE WHEN $bytes <= $SCAN_MAX_ROW_JSON_BYTES THEN $column ELSE NULL END"
+            val projection =
+                HogliteSql.FILE_COLUMNS
+                    .replace("f.stats_json", boundedJson("f.stats_json", statsBytes))
+                    .replace("f.split_offsets_json", boundedJson("f.split_offsets_json", offsetBytes))
+            var afterRow = -1L
+            var afterId = -1L
+            val budget = HogliteScanBudget()
+            var files: List<Pair<ScanFile, FileRow>>
+            val collected = mutableListOf<Pair<ScanFile, FileRow>>()
+            while (true) {
+                val rows =
+                    queryCatalog(
+                        catalog,
+                        """SELECT $projection,
+                          d.delete_file_id, d.path, d.delete_count, d.file_size_bytes, d.begin_snapshot,
+                          $statsBytes, $offsetBytes
                      FROM files f
                      LEFT JOIN dvs d ON d.data_file_id = f.id
                        AND d.begin_snapshot <= ? AND (d.end_snapshot IS NULL OR d.end_snapshot > ?)
@@ -1365,34 +1386,63 @@ class HogliteCatalogStore(
                                          AND (d2.end_snapshot IS NULL OR d2.end_snapshot > ?))
                     WHERE f.table_id = ? AND f.begin_snapshot <= ?
                       AND (f.end_snapshot IS NULL OR f.end_snapshot > ?)
-                    ORDER BY f.row_id_start, f.id""",
-                    at,
-                    at,
-                    at,
-                    at,
-                    t.tableId,
-                    at,
-                    at,
-                )
-            var files =
-                rows.rows.map { r ->
-                    val fr = toFileRow(r)
-                    val dv =
-                        if (r[15] == null) {
-                            null
-                        } else {
-                            DeleteFile(
-                                deleteFileId = r[15].asLong(),
-                                dataFileId = fr.file.dataFileId,
-                                path = r[16].asString(),
-                                fileFormat = "puffin",
-                                deleteCount = r[17].asLong(),
-                                fileSizeBytes = r[18].asLong(),
-                                beginSnapshot = r[19].asLong(),
-                            )
-                        }
-                    ScanFile(fr.file, dv) to fr
+                      AND (f.row_id_start, f.id) > (?, ?)
+                    ORDER BY f.row_id_start, f.id LIMIT ?""",
+                        at,
+                        at,
+                        at,
+                        at,
+                        t.tableId,
+                        at,
+                        at,
+                        afterRow,
+                        afterId,
+                        SCAN_PAGE_SIZE,
+                    )
+                for (r in rows.rows) {
+                    if ((r[20].asLongOrNull() ?: 0L) > SCAN_MAX_ROW_JSON_BYTES ||
+                        (r[21].asLongOrNull() ?: 0L) > SCAN_MAX_ROW_JSON_BYTES
+                    ) {
+                        throw HoglakeException.Validation(
+                            "scan plan file metadata exceeds maximum $SCAN_MAX_ROW_JSON_BYTES bytes",
+                        )
+                    }
+                    // Conservative UTF-8 + JSON envelope budget, independent of
+                    // HTTP timeouts. Refuse, never return a truncated scan.
+                    budget.add(
+                        512L + json.writeValueAsBytes(r).size,
+                        (r[20].asLongOrNull() ?: 0L) + (r[21].asLongOrNull() ?: 0L),
+                    )
                 }
+                collected.addAll(
+                    rows.rows.map { r ->
+                        val fr = toFileRow(r)
+                        val dv =
+                            if (r[15] == null) {
+                                null
+                            } else {
+                                DeleteFile(
+                                    deleteFileId = r[15].asLong(),
+                                    dataFileId = fr.file.dataFileId,
+                                    path = r[16].asString(),
+                                    fileFormat = "puffin",
+                                    deleteCount = r[17].asLong(),
+                                    fileSizeBytes = r[18].asLong(),
+                                    beginSnapshot = r[19].asLong(),
+                                )
+                            }
+                        ScanFile(fr.file, dv) to fr
+                    },
+                )
+                if (rows.rows.size < SCAN_PAGE_SIZE) break
+                val last = rows.rows.last()
+                afterRow = last[7].asLong()
+                afterId = last[0].asLong()
+            }
+            files = collected
+            // Expiry may advance between pages. Never return an incomplete
+            // plan if the pin was purged while the pages were being read.
+            resolveRead(catalog, meta(catalog), at, null)
             if (columnStats != null) {
                 val columns = columnsAt(catalog, t.tableId, at)
                 // Variant columns and containers never carry stats rows; the
@@ -2425,6 +2475,12 @@ class HogliteCatalogStore(
     }
 
     companion object {
+        internal const val SCAN_PAGE_SIZE = 256
+        internal const val SCAN_MAX_FILES = 1_000_000
+        internal const val SCAN_MAX_BYTES = 512L * 1024 * 1024
+        internal const val SCAN_MAX_ROW_JSON_BYTES = 64 * 1024
+        internal const val SCAN_MAX_METADATA_BYTES = 64L * 1024 * 1024
+
         /**
          * The tenant holding the cross-catalog registry (one row per
          * catalog: name, data_path). Its name cannot collide with a

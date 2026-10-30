@@ -79,6 +79,21 @@ internal object HogliteSchema {
         val statements: List<String>,
     )
 
+    // V16/V17: path probes must scale with the probe, not the retained
+    // manifest or 30-day ledger. File paths are deliberately NOT partial:
+    // ended files still protect their objects from cleanup. V19: expiry
+    // pages visit ended rows, not the live manifest. Tenant == catalog_id.
+    val SCALE_INDEXES =
+        listOf(
+            "CREATE INDEX IF NOT EXISTS files_path ON files(path)",
+            "CREATE INDEX IF NOT EXISTS dvs_path ON dvs(path)",
+            "CREATE INDEX IF NOT EXISTS removals_undrained_path ON removals(path) WHERE drained_at IS NULL",
+            "CREATE INDEX IF NOT EXISTS files_ended ON files(end_snapshot) WHERE end_snapshot IS NOT NULL",
+            "CREATE INDEX IF NOT EXISTS dvs_ended ON dvs(end_snapshot) WHERE end_snapshot IS NOT NULL",
+            // Both ordering keys matter: compaction can reuse row_id_start.
+            "CREATE INDEX IF NOT EXISTS files_scan ON files(table_id, row_id_start, id)",
+        )
+
     val TENANT_MIGRATIONS: List<TenantMigration> =
         listOf(
             TenantMigration(
@@ -95,7 +110,15 @@ internal object HogliteSchema {
                     "AND sql LIKE '%prefix_quarantined%'",
                 listOf("ALTER TABLE files ADD COLUMN prefix_quarantined INTEGER NOT NULL DEFAULT 0"),
             ),
-        )
+        ) +
+            SCALE_INDEXES.map { ddl ->
+                val name = ddl.substringAfter("IF NOT EXISTS ").substringBefore(" ON")
+                TenantMigration(
+                    "scale.$name",
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = '$name'",
+                    listOf(ddl),
+                )
+            }
 
     val DDL: List<String> =
         listOf(
@@ -396,7 +419,7 @@ internal object HogliteSchema {
                 result_json TEXT
             )""",
             "CREATE INDEX IF NOT EXISTS maintenance_runs_task ON maintenance_runs(task, id)",
-        )
+        ) + SCALE_INDEXES
 
     private val TS_FORMAT: DateTimeFormatter =
         DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'").withZone(ZoneOffset.UTC)

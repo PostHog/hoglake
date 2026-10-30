@@ -1,5 +1,7 @@
 package com.posthog.hoglake.hoglite
 
+import com.fasterxml.jackson.databind.node.ObjectNode
+import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.posthog.hoglake.App
 import com.posthog.hoglake.HealthProbe
 import com.posthog.hoglake.model.ColType
@@ -12,6 +14,7 @@ import com.posthog.hoglake.model.TableAppend
 import com.posthog.hoglake.model.TableDeletes
 import com.posthog.hoglake.service.TableCreationDefinition
 import com.posthog.hoglake.testing.TestImages
+import com.sun.net.httpserver.HttpServer
 import io.ktor.client.request.get
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
@@ -32,6 +35,7 @@ import software.amazon.awssdk.auth.credentials.AwsBasicCredentials
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider
 import software.amazon.awssdk.regions.Region
 import software.amazon.awssdk.services.s3.S3Client
+import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.URI
 import java.net.http.HttpClient
@@ -40,6 +44,10 @@ import java.net.http.HttpResponse
 import java.nio.file.Files
 import java.time.Duration
 import java.util.UUID
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * The hoglite backend end to end: a real `hoglited` (the same binary
@@ -63,6 +71,7 @@ class HogliteBackendIntegrationTest {
     private lateinit var client: HogliteClient
     private lateinit var store: HogliteCatalogStore
     private var catalogCounter = 0
+    private lateinit var metricsUrl: String
 
     @BeforeAll
     fun startHoglite() {
@@ -94,6 +103,7 @@ class HogliteBackendIntegrationTest {
         s3.close()
 
         val port = ServerSocket(0).use { it.localPort }
+        metricsUrl = "http://127.0.0.1:$port/metrics"
         val dir = Files.createTempDirectory("hoglited-it").toFile()
         val builder =
             ProcessBuilder(
@@ -158,6 +168,274 @@ class HogliteBackendIntegrationTest {
     private fun findOnPath(binary: String): String? {
         val path = System.getenv("PATH") ?: return null
         return path.split(':').map { "$it/$binary" }.firstOrNull { java.io.File(it).canExecute() }
+    }
+
+    private fun scaleWrite(
+        catalog: String,
+        sql: String,
+        vararg args: Any?,
+    ) = store.catalogOperation(catalog) {
+        store.runTx(catalog, HogliteCatalogStore.freshTxid("scale"), null, HogliteTx().apply { add(sql, *args) })
+    }
+
+    private fun queryCount(): Long {
+        val body =
+            HttpClient.newHttpClient().send(
+                HttpRequest.newBuilder(URI.create(metricsUrl)).build(),
+                HttpResponse.BodyHandlers.ofString(),
+            ).body()
+        return body.lineSequence().first { it.startsWith("hoglite_queries_total ") }.substringAfter(' ').toLong()
+    }
+
+    @Test
+    fun `scan pages 565000 files by row lineage and id without fetching unrequested stats`() {
+        val cat = freshCatalog()
+        store.createNamespace(cat, "ns")
+        val table = store.createTable(cat, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        val count = 565_000
+        for (start in 1..count step 5_000) {
+            scaleWrite(
+                cat,
+                """WITH RECURSIVE n(i) AS (VALUES(?) UNION ALL SELECT i + 1 FROM n WHERE i < ?)
+                    INSERT INTO files(id, table_id, path, record_count, file_size_bytes, row_id_start, stats_state, begin_snapshot)
+                    SELECT i, ?, 's3://hoglake-it/scale/' || i || '.parquet', 1, 100, i / 2, 'pending', ? FROM n""",
+                start,
+                minOf(start + 4_999, count),
+                table.tableId,
+                table.readSnapshotId,
+            )
+        }
+        // Even a legacy oversized stats payload must cost no wire bytes when
+        // stats were not requested. Row-id ties cross page boundaries.
+        scaleWrite(
+            cat,
+            "UPDATE files SET stats_json = ? WHERE id = 1",
+            "x".repeat(HogliteCatalogStore.SCAN_MAX_ROW_JSON_BYTES + 1),
+        )
+        val before = queryCount()
+        val started = System.nanoTime()
+        val files = store.planScan(cat, "ns", "t", table.readSnapshotId, null, null, false)
+        val elapsedMs = (System.nanoTime() - started) / 1_000_000
+        val queries = queryCount() - before
+        assertThat(files).hasSize(count)
+        assertThat(
+            files.withIndex().all {
+                    (i, f) ->
+                f.dataFile.dataFileId == i + 1L && f.dataFile.rowIdStart == (i + 1L) / 2
+            },
+        ).isTrue()
+        assertThat(files.all { it.dataFile.columnStats == null && it.dataFile.splitOffsets == null }).isTrue()
+        val pages = (count + HogliteCatalogStore.SCAN_PAGE_SIZE - 1) / HogliteCatalogStore.SCAN_PAGE_SIZE
+        assertThat(queries).isBetween(pages.toLong(), pages + 30L)
+        println("hoglite scale: $count files, $pages pages, $queries queries, $elapsedMs ms")
+    }
+
+    @Test
+    fun `oversized requested scan metadata fails explicitly instead of timing out`() {
+        val cat = freshCatalog()
+        store.createNamespace(cat, "ns")
+        store.createTable(cat, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        append(cat, "a.parquet")
+        scaleWrite(
+            cat,
+            "UPDATE files SET stats_json = ?, split_offsets_json = ?",
+            "x".repeat(HogliteCatalogStore.SCAN_MAX_ROW_JSON_BYTES + 1),
+            "x".repeat(HogliteCatalogStore.SCAN_MAX_ROW_JSON_BYTES + 1),
+        )
+        assertThatThrownBy {
+            store.planScan(
+                cat,
+                "ns",
+                "t",
+                null,
+                null,
+                com.posthog.hoglake.service.ScanService.ColumnStatsRequest(),
+                false,
+            )
+        }.isInstanceOf(
+            HoglakeException.Validation::class.java,
+        ).hasMessageContaining("scan plan file metadata exceeds maximum")
+        assertThatThrownBy {
+            store.planScan(cat, "ns", "t", null, null, null, true)
+        }.isInstanceOf(
+            HoglakeException.Validation::class.java,
+        ).hasMessageContaining("scan plan file metadata exceeds maximum")
+        // Individually legal payloads must not accumulate without a bound.
+        val payload = " ".repeat(HogliteCatalogStore.SCAN_MAX_ROW_JSON_BYTES - 2) + "[]"
+        scaleWrite(cat, "UPDATE files SET stats_json = ?, split_offsets_json = NULL", payload)
+        scaleWrite(
+            cat,
+            """WITH RECURSIVE n(i) AS (VALUES(2) UNION ALL SELECT i + 1 FROM n WHERE i < 1025)
+                INSERT INTO files(id, table_id, path, record_count, file_size_bytes, row_id_start,
+                                  stats_state, stats_json, begin_snapshot)
+                SELECT i, table_id, path || i, record_count, file_size_bytes, i,
+                       stats_state, stats_json, begin_snapshot FROM n CROSS JOIN files WHERE files.id = 1""",
+        )
+        assertThatThrownBy {
+            store.planScan(
+                cat,
+                "ns",
+                "t",
+                null,
+                null,
+                com.posthog.hoglake.service.ScanService.ColumnStatsRequest(),
+                false,
+            )
+        }.isInstanceOf(
+            HoglakeException.Validation::class.java,
+        ).hasMessageContaining("scan plan requested metadata exceeds maximum")
+    }
+
+    @Test
+    fun `existing tenant migrates scale indexes and path and expiry probes use them`() {
+        val cat = freshCatalog()
+        store.createNamespace(cat, "ns")
+        val table = store.createTable(cat, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        append(cat, "a.parquet")
+        // Mostly ended history: path protection includes it; expiry should
+        // range over it without inspecting the live set.
+        scaleWrite(
+            cat,
+            """WITH RECURSIVE n(i) AS (VALUES(2) UNION ALL SELECT i + 1 FROM n WHERE i < 100001)
+                INSERT INTO files(id, table_id, path, record_count, file_size_bytes, row_id_start,
+                                  stats_state, begin_snapshot, end_snapshot)
+                SELECT i, ?, 's3://hoglake-it/history/' || i, 1, 100, i, 'pending', 2, 3 FROM n""",
+            table.tableId,
+        )
+        for (ddl in HogliteSchema.SCALE_INDEXES) {
+            scaleWrite(cat, "DROP INDEX " + ddl.substringAfter("IF NOT EXISTS ").substringBefore(" ON"))
+        }
+        val started = System.nanoTime()
+        val fresh = HogliteCatalogStore(client).apply { requireOperationBindingForTests = true }
+        assertThat(fresh.planScan(cat, "ns", "t", null, null, null, false)).hasSize(1)
+        println("hoglite scale migration: 100001 files, ${(System.nanoTime() - started) / 1_000_000} ms")
+        fresh.catalogOperation(cat) {
+            for ((sql, index) in listOf(
+                "SELECT path FROM files WHERE path IN ('absent')" to "files_path",
+                "SELECT path FROM dvs WHERE path IN ('absent')" to "dvs_path",
+                "SELECT path FROM removals WHERE path IN ('absent') AND drained_at IS NULL" to
+                    "removals_undrained_path",
+                "SELECT id FROM files WHERE end_snapshot IS NOT NULL AND end_snapshot <= 10 LIMIT 100" to "files_ended",
+                "SELECT delete_file_id FROM dvs WHERE end_snapshot IS NOT NULL AND end_snapshot <= 10 LIMIT 100" to
+                    "dvs_ended",
+                (
+                    "SELECT id FROM files WHERE table_id = 1 AND (row_id_start, id) > (10, 20) " +
+                        "ORDER BY row_id_start, id LIMIT 256"
+                ) to "files_scan",
+            )) {
+                val plan = fresh.queryCatalog(cat, "EXPLAIN QUERY PLAN $sql").rows.joinToString { it.last().asString() }
+                assertThat(plan).contains(index).contains("SEARCH").doesNotContain("TEMP B-TREE")
+            }
+            assertThat(
+                fresh.queryCatalog(cat, "SELECT path FROM files WHERE id = 1").rows.single().single(),
+            ).isEqualTo("s3://hoglake-it/$cat/data/a.parquet")
+        }
+    }
+
+    @Test
+    fun `scan retries a real checkpoint-cancelled page without losing its tenant binding`() {
+        val cat = freshCatalog()
+        store.createNamespace(cat, "ns")
+        store.createTable(cat, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        append(cat, "a.parquet")
+        val engine = metricsUrl.removeSuffix("/metrics")
+        val http = HttpClient.newHttpClient()
+        val json = jacksonObjectMapper()
+        val attempts = AtomicInteger()
+        val cancelledStatus = AtomicInteger()
+        val cancelledCode = AtomicReference<String>()
+        val cancelledError = AtomicReference<String>()
+        val scanTenant = AtomicReference<String>()
+        val failure = AtomicReference<Throwable>()
+        val executor = Executors.newCachedThreadPool()
+        val proxy = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        proxy.executor = executor
+        proxy.createContext("/") { ex ->
+            try {
+                val path = ex.requestURI.toString()
+                var body = ex.requestBody.readBytes()
+                val scanPage =
+                    path.endsWith("/query") &&
+                        body.decodeToString().contains("ORDER BY f.row_id_start, f.id LIMIT")
+                val first = scanPage && attempts.incrementAndGet() == 1
+                if (scanPage) {
+                    if (first) scanTenant.set(path) else check(path == scanTenant.get())
+                }
+                if (first) {
+                    val statement = json.readTree(body) as ObjectNode
+                    statement.put(
+                        "sql",
+                        statement["sql"].asText().replace(
+                            "FROM files f",
+                            "FROM files f CROSS JOIN (WITH RECURSIVE n(x) AS " +
+                                "(VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<1000000000) SELECT sum(x) FROM n) slow",
+                        ),
+                    )
+                    body = json.writeValueAsBytes(statement)
+                }
+                val pending =
+                    http.sendAsync(
+                        HttpRequest.newBuilder(URI.create(engine + path)).header("Content-Type", "application/json")
+                            .method(ex.requestMethod, HttpRequest.BodyPublishers.ofByteArray(body)).build(),
+                        HttpResponse.BodyHandlers.ofByteArray(),
+                    )
+                if (first) {
+                    val tenantPath = path.removeSuffix("/query")
+                    val deadline = System.nanoTime() + Duration.ofSeconds(2).toNanos()
+                    var active = false
+                    while (System.nanoTime() < deadline && !active) {
+                        val status =
+                            http.send(
+                                HttpRequest.newBuilder(URI.create("$engine$tenantPath/status")).build(),
+                                HttpResponse.BodyHandlers.ofString(),
+                            )
+                        active = json.readTree(status.body())["local"]?.get("active_reads")?.asInt() == 1
+                    }
+                    check(active) { "slow scan did not enter a read snapshot" }
+                    val release =
+                        http.send(
+                            HttpRequest.newBuilder(URI.create("$engine$tenantPath/release"))
+                                .POST(HttpRequest.BodyPublishers.noBody()).build(),
+                            HttpResponse.BodyHandlers.discarding(),
+                        )
+                    check(release.statusCode() == 200) { "checkpoint drain failed" }
+                }
+                val response = pending.get(5, TimeUnit.SECONDS)
+                if (first) {
+                    cancelledStatus.set(response.statusCode())
+                    cancelledCode.set(json.readTree(response.body())["code"]?.asText())
+                    cancelledError.set(json.readTree(response.body())["error"]?.asText())
+                }
+                ex.responseHeaders.add("Content-Type", "application/json")
+                ex.sendResponseHeaders(response.statusCode(), response.body().size.toLong())
+                ex.responseBody.use { it.write(response.body()) }
+            } catch (e: Throwable) {
+                failure.set(e)
+                ex.sendResponseHeaders(599, -1)
+                ex.close()
+            }
+        }
+        proxy.start()
+        try {
+            HogliteClient("http://127.0.0.1:${proxy.address.port}", sleeper = {}).use { retrying ->
+                val scoped = HogliteCatalogStore(retrying).apply { requireOperationBindingForTests = true }
+                val files = scoped.planScan(cat, "ns", "t", null, null, null, false)
+                assertThat(files.map { it.dataFile.path }).containsExactly("s3://hoglake-it/$cat/data/a.parquet")
+            }
+            assertThat(failure.get()).isNull()
+            assertThat(cancelledStatus.get()).isEqualTo(503)
+            // Upstream engines before the structured taxonomy omit code.
+            assertThat(cancelledCode.get()).isIn(null, "not_applied")
+            assertThat(cancelledError.get()).isEqualTo("read canceled by checkpoint; retry")
+            println(
+                "hoglite checkpoint retry: status=${cancelledStatus.get()} " +
+                    "code=${cancelledCode.get()} error=${cancelledError.get()} attempts=${attempts.get()}",
+            )
+            assertThat(attempts.get()).isEqualTo(2)
+        } finally {
+            proxy.stop(0)
+            executor.shutdownNow()
+        }
     }
 
     // ---- catalog + namespace + table lifecycle ----------------------------
