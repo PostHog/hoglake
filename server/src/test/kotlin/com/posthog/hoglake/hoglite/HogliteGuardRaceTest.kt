@@ -835,19 +835,29 @@ class HogliteGuardRaceTest {
     }
 
     @Test
-    fun `a transaction refreshes a stale incarnation without a preceding read`() {
+    fun `a transaction with a stale incarnation fails without replay and evicts it`() {
         val c = freshCatalog()
-        pstore.dropCatalog(c, "test", "old")
-        pstore.createCatalog(c, "s3://hoglake-it/$c")
-        store.runTx(
-            c,
-            HogliteCatalogStore.freshTxid("refresh"),
-            null,
-            HogliteTx().apply {
-                add("UPDATE meta SET consumer_floor = 1 WHERE id = 1")
-            },
-        )
-        assertThat(pstore.getCatalog(c).consumerFloor).isTrue()
+        pstore.getCatalog(c)
+        val oldTenant = pstore.resolveTenant(c)
+        store.dropCatalog(c, "test", "old")
+        store.createCatalog(c, "s3://hoglake-it/$c")
+        val consumerFloor = store.getCatalog(c).consumerFloor
+        seen.clear()
+        assertThatThrownBy {
+            pstore.runTx(
+                c,
+                HogliteCatalogStore.freshTxid("stale-write"),
+                null,
+                HogliteTx().apply {
+                    add("UPDATE meta SET consumer_floor = ? WHERE id = 1", if (consumerFloor) 0 else 1)
+                },
+            )
+        }.isInstanceOf(HoglakeException.NotFound::class.java)
+        val attempts = seen.filter { "/tx " in it }
+        assertThat(attempts).hasSize(1)
+        assertThat(attempts.single()).contains("/v1/t/$oldTenant/tx")
+        assertThat(pstore.resolveTenant(c)).isEqualTo(store.resolveTenant(c))
+        assertThat(store.getCatalog(c).consumerFloor).isEqualTo(consumerFloor)
     }
 
     @Test
@@ -875,6 +885,94 @@ class HogliteGuardRaceTest {
         assertThat(store.resolveTenant(c)).isNotEqualTo(loserTenant)
         assertThatThrownBy { client.query(loserTenant, "SELECT 1", emptyList()) }
             .isInstanceOf(HogliteRejected::class.java).hasMessageContaining("404")
+        assertThat(store.getCatalog(c).name).isEqualTo(c)
+    }
+
+    @Test
+    fun `stale-cache drop of an EMPTY recreated catalog drops the new incarnation, never touches the old id`() {
+        val c = freshCatalog()
+        pstore.getCatalog(c)
+        val oldTenant = pstore.resolveTenant(c)
+        store.dropCatalog(c, "y", "drop")
+        store.createCatalog(c, "s3://hoglake-it/$c")
+        val newTenant = store.resolveTenant(c)
+        seen.clear()
+        pstore.dropCatalog(c, "x", "drop")
+        assertThat(seen).noneMatch { "/v1/t/$oldTenant/" in it }
+        assertThat(store.listCatalogs().map { it.name }).doesNotContain(c)
+        assertThatThrownBy { client.query(newTenant, "SELECT 1", emptyList()) }
+            .isInstanceOf(HogliteRejected::class.java).hasMessageContaining("404")
+    }
+
+    @Test
+    fun `stale-cache read after a remote drop (no recreate) is NotFound, and a recreate is then served`() {
+        val c = freshCatalog()
+        pstore.getCatalog(c)
+        store.dropCatalog(c, "y", "drop")
+        val r = runCatching { pstore.getCatalog(c) }
+        assertThat(r.exceptionOrNull()).isInstanceOf(HoglakeException.NotFound::class.java)
+        store.createCatalog(c, "s3://hoglake-it/$c")
+        assertThat(pstore.getCatalog(c).name).isEqualTo(c)
+    }
+
+    @Test
+    fun `stale-cache drop where the pinned incarnation is a real ghost still clears the row`() {
+        val c = freshCatalog()
+        pstore.getCatalog(c) // X caches T1
+        val t1 = pstore.resolveTenant(c)
+        // Simulate a drop that died after deleting the tenant but before the registry delete.
+        client.release(t1)
+        client.deleteTenant(t1)
+        val r = runCatching { pstore.dropCatalog(c, "x", "drop") }
+        assertThat(r.isSuccess).isTrue()
+        assertThat(store.listCatalogs().map { it.name }).doesNotContain(c)
+    }
+
+    @Test
+    fun `a commit planned on the old incarnation must not be retried into a recreated catalog`() {
+        val (c, t) = setup() // T1: ns.t is table id 1, no files
+        val oldTenant = store.resolveTenant(c)
+        val hook =
+            Hook({ m, p, b -> isTx(m, p) && "xinc.parquet" in b && "/v1/t/$oldTenant/" in p }, before = {
+                // While the commit's tx is in flight (planned against T1):
+                // the table, namespace and catalog go away, and the name is
+                // recreated with an unrelated first table (id 1 again).
+                store.dropTable(c, "ns", "t", t.tableUuid, "p", "p")
+                store.dropNamespace(c, "ns", null, "p", "p")
+                store.dropCatalog(c, "y", "drop")
+                store.createCatalog(c, "s3://hoglake-it/$c")
+                store.createNamespace(c, "zz")
+                store.createTable(c, "zz", "victim", listOf(ColumnDef("id", ColType.LONG)))
+            })
+        hooks += hook
+        val r = runCatching { pstore.commit(c, appendReq(c, "xinc.parquet")) }
+        val victimFiles = store.listFiles(c, "zz", "victim")
+        assertThat(hook.remaining).isZero()
+        assertThat(r.exceptionOrNull()).isInstanceOf(HoglakeException.NotFound::class.java)
+        assertThat(victimFiles).isEmpty()
+        val attempts = seen.filter { "/tx " in it && "xinc.parquet" in it }
+        assertThat(attempts).hasSize(1)
+        assertThat(attempts.single()).contains("/v1/t/$oldTenant/tx")
+    }
+
+    @Test
+    fun `a ghost drop racing a recreate leaves the new row alone`() {
+        val c = freshCatalog()
+        val t1 = store.resolveTenant(c)
+        client.release(t1)
+        client.deleteTenant(t1) // ghost: registry row -> T1, T1 gone
+        val hook =
+            Hook({ m, p, b -> "/v1/t/$t1/query" in p && "FROM meta" in b }, before = {
+                // between X's registry read and its meta probe: another
+                // replica clears the ghost and recreates the name
+                store.dropCatalog(c, "y", "drop")
+                store.createCatalog(c, "s3://hoglake-it/$c")
+            })
+        hooks += hook
+        val r = runCatching { pstore.dropCatalog(c, "x", "drop") }
+        assertThat(hook.remaining).isZero()
+        assertThat(r.isSuccess).isTrue()
+        assertThat(store.listCatalogs().map { it.name }).contains(c)
         assertThat(store.getCatalog(c).name).isEqualTo(c)
     }
 }

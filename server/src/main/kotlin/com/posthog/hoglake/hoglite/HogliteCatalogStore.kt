@@ -1928,7 +1928,10 @@ class HogliteCatalogStore(
                 } else {
                     tx.statements()
                 }
-            val results = withResolvedTenant(catalog) { tenant -> client.tx(tenant, txid, fp, statements) }
+            val results =
+                withResolvedTenant(catalog, retryReadOnMissing = false) { tenant ->
+                    client.tx(tenant, txid, fp, statements)
+                }
             if (fenced) results.subList(1, results.size) else results
         } catch (g: HogliteGuardFailure) {
             if (fenced) {
@@ -1948,14 +1951,23 @@ class HogliteCatalogStore(
         vararg args: Any?,
     ): HogliteQueryResult =
         try {
-            withResolvedTenant(catalog) { tenant -> client.query(tenant, sql, args.toList()) }
+            withResolvedTenant(
+                catalog,
+                retryReadOnMissing = true,
+            ) { tenant -> client.query(tenant, sql, args.toList()) }
         } catch (r: HogliteRejected) {
             throw mapRejected(catalog, r)
         }
 
-    /** A tenant 404 applies no statements; refresh a stale incarnation once. */
+    /**
+     * Refresh stale resolution for reads only. A planned transaction can embed
+     * tenant-local ids from prior reads: replaying it in a replacement tenant
+     * could write to an unrelated table even though the old attempt applied nothing.
+     * Writes evict the stale entry but fail, so the caller must re-plan.
+     */
     private fun <T> withResolvedTenant(
         catalog: String,
+        retryReadOnMissing: Boolean,
         call: (String) -> T,
     ): T {
         repeat(2) { attempt ->
@@ -1965,7 +1977,7 @@ class HogliteCatalogStore(
             } catch (r: HogliteRejected) {
                 if (r.status != 404) throw r
                 evictTenant(catalog, tenant)
-                if (attempt == 1 || catalog == REGISTRY_TENANT) throw r
+                if (!retryReadOnMissing || attempt == 1 || catalog == REGISTRY_TENANT) throw r
             }
         }
         error("unreachable")
