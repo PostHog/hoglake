@@ -67,8 +67,8 @@ TLS: cpp-httplib supports `https://` when compiled with
 endpoint, and the OpenSSL vcpkg feature is a flip documented as a
 follow-up (community CI builds openssl for httpfs already). Auth is
 ATTACH options (#472): a static `TOKEN`, or `TOKEN_URL` + `CLIENT_ID` +
-`CLIENT_SECRET` (+ `AUDIENCE`) for RFC 6749 client credentials (an
-`http://` `TOKEN_URL` only, for the same TLS reason).
+`CLIENT_SECRET` (+ `AUDIENCE`) for RFC 6749 client credentials (a
+plaintext-HTTP `TOKEN_URL` only, for the same TLS reason).
 
 Error taxonomy (mirrors pyhoglake `errors.py`): 404 not-found, 409
 conflict (commit conflicts retryable; `"the table was recreated"` in
