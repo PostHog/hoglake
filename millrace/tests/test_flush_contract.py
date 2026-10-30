@@ -23,7 +23,11 @@ from typing import Any
 import httpx
 import pytest
 from flushkit import (
+    COLUMNS_WIRE,
+    DATA_PATH,
+    NAMESPACE,
     RECREATED_UUID,
+    TABLE,
     TABLE_UUID,
     CommitCapture,
     FakeMonotonic,
@@ -237,6 +241,116 @@ async def test_a_refused_read_basis_rebuilds_under_a_fresh_key(
     assert first["idempotency_key"] != second["idempotency_key"]
     assert (first["read_snapshot"], second["read_snapshot"]) == (88, 95)
     assert await staged_count(stages, 7) == 0
+    await stages.close()
+
+
+async def test_an_option_set_under_a_cached_shape_rebuilds_placed(
+    httpx_mock: Any,
+    flusher_factory: Any,
+    store: Any,
+    stages: Any,
+    fake_clock: Any,
+    mono: Any,
+    sleeper: Any,
+) -> None:
+    """The object-prefix option set after the shape was cached: the flat
+    commit is refused ``ddl_since_read_snapshot``, and the rebuild on the
+    fresh shape goes under the team's prefix with its stats inline."""
+    cfg = make_config()
+    flusher = flusher_factory(cfg=cfg, store=store)
+    script_options(httpx_mock)
+    script_table_refresh(
+        httpx_mock, table=table_wire(read_snapshot_id=95, object_prefix_field="team_id")
+    )
+    capture = CommitCapture(
+        httpx_mock,
+        [commit_refusal(409, "ddl_since_read_snapshot", "option set"), commit_ok(96)],
+    )
+    await stages.open_partition("events", 0)
+    await stage_rows(stages, fake_clock, 7, [(0, event_payload(7, NOW))])
+    report = await runner(stages, flusher, cfg, fake_clock, mono, sleeper).run_once(
+        drain=True
+    )
+    assert report.committed == 1
+    (flat,), (placed,) = (p["appends"][0]["files"] for p in capture.payloads)
+    assert "/team_id=" not in flat["path"] and "column_stats" not in flat
+    assert placed["path"].startswith(f"{DATA_PATH}/data/{NAMESPACE}/{TABLE}/team_id=7/")
+    assert [s["field_id"] for s in placed["column_stats"]] == [1]
+    assert committed_offsets(store, capture, landed=[1]) == ["pageview"]
+    assert await staged_count(stages, 7) == 0
+    await stages.close()
+
+
+async def test_rows_no_prefix_can_hold_are_dropped_and_counted(
+    httpx_mock: Any,
+    flusher_factory: Any,
+    store: Any,
+    stages: Any,
+    fake_clock: Any,
+    mono: Any,
+    sleeper: Any,
+) -> None:
+    cfg = make_config()
+    nullable = [{**COLUMNS_WIRE[0], "nullable": True}, *COLUMNS_WIRE[1:]]
+    flusher = flusher_factory(
+        cfg=cfg,
+        store=store,
+        table=table_wire(columns=nullable, object_prefix_field="team_id"),
+    )
+    script_options(httpx_mock)
+    capture = CommitCapture(httpx_mock, [commit_ok(91)])
+    await stages.open_partition("events", 0)
+    await stage_rows(
+        stages,
+        fake_clock,
+        7,
+        [
+            (0, event_payload(-1, NOW, "negative")),
+            (1, json.dumps({"team_id": None, "timestamp": NOW}).encode()),
+            (2, event_payload(7, NOW, "ok")),
+        ],
+    )
+    report = await runner(stages, flusher, cfg, fake_clock, mono, sleeper).run_once(
+        drain=True
+    )
+    assert report.committed == 1
+    assert committed_offsets(store, capture) == ["ok"]
+    assert flusher.stats().records_dropped == {"object_prefix_value": 2}
+    assert await staged_count(stages, 7) == 0
+    await stages.close()
+
+
+async def test_an_object_prefix_violation_is_a_refusal_not_a_rebuild(
+    httpx_mock: Any,
+    flusher_factory: Any,
+    store: Any,
+    stages: Any,
+    fake_clock: Any,
+    mono: Any,
+    sleeper: Any,
+) -> None:
+    """A 422 ``object_prefix_violation`` says re-prepare, but an option
+    set after the read is answered ``ddl_since_read_snapshot`` first
+    (``test_an_option_set_under_a_cached_shape_rebuilds_placed``): the
+    422 means millrace's pre-upload check and the server's disagree,
+    which a rebuild would repeat."""
+    cfg = make_config()
+    flusher = flusher_factory(
+        cfg=cfg, store=store, table=table_wire(object_prefix_field="team_id")
+    )
+    script_options(httpx_mock)
+    capture = CommitCapture(
+        httpx_mock, [commit_refusal(422, "object_prefix_violation", "not placed")]
+    )
+    await stages.open_partition("events", 0)
+    await stage_rows(stages, fake_clock, 7, [(0, event_payload(7, NOW))])
+    report = await runner(stages, flusher, cfg, fake_clock, mono, sleeper).run_once(
+        drain=True
+    )
+    assert report.failed == 1
+    assert len(capture.payloads) == 1
+    assert flusher.stats().commit_refusals == {"422": 1}
+    assert await staged_count(stages, 7) == 1
     await stages.close()
 
 
