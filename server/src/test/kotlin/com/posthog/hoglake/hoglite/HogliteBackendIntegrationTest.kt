@@ -138,7 +138,7 @@ class HogliteBackendIntegrationTest {
             throw IllegalStateException("hoglited did not come up; output: $out")
         }
         client = HogliteClient(standardUrl = "http://127.0.0.1:$port", sleeper = {})
-        store = HogliteCatalogStore(client)
+        store = HogliteCatalogStore(client).apply { requireOperationBindingForTests = true }
     }
 
     @AfterAll
@@ -796,7 +796,7 @@ class HogliteBackendIntegrationTest {
         catalog: String,
         sql: String,
         vararg args: Any?,
-    ) = store.queryCatalog(catalog, sql, *args)
+    ) = store.catalogOperation(catalog) { store.queryCatalog(catalog, sql, *args) }
 
     private fun append(
         catalog: String,

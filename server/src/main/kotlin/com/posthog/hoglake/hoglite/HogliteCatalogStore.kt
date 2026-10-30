@@ -117,6 +117,9 @@ class HogliteCatalogStore(
 
     private val operationBindings = ThreadLocal<MutableMap<String, CatalogOperation>>()
 
+    /** Test-only invariant; fixtures scope their diagnostic SQL just like API work. */
+    internal var requireOperationBindingForTests: Boolean = false
+
     /** Resolve authoritatively ONCE, before reading any tenant-local ids. */
     private fun freshTenant(catalog: String): String {
         val row =
@@ -2073,6 +2076,9 @@ class HogliteCatalogStore(
         call: (String) -> T,
     ): T {
         val binding = operationBindings.get()?.get(catalog)
+        check(!requireOperationBindingForTests || catalog == REGISTRY_TENANT || binding != null) {
+            "catalog '$catalog' reached tenant transport without an operation binding"
+        }
         binding?.missing?.let { throw it }
         val tenant = binding?.tenant ?: resolveTenant(catalog)
         try {

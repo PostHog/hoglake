@@ -139,7 +139,7 @@ class HogliteGuardRaceTest {
         hogPort = ServerSocket(0).use { it.localPort }
         startPod("race-1", hogPort, "race")
         client = HogliteClient(standardUrl = "http://127.0.0.1:$hogPort", sleeper = {})
-        store = HogliteCatalogStore(client)
+        store = checkedStore(client)
 
         val fwd = HttpClient.newHttpClient()
         proxy = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
@@ -192,7 +192,7 @@ class HogliteGuardRaceTest {
         }
         proxy.start()
         pstore =
-            HogliteCatalogStore(
+            checkedStore(
                 HogliteClient(standardUrl = "http://127.0.0.1:${proxy.address.port}", sleeper = {}),
             )
     }
@@ -235,7 +235,7 @@ class HogliteGuardRaceTest {
         c: String,
         sql: String,
         vararg a: Any?,
-    ) = store.queryCatalog(c, sql, *a)
+    ) = store.catalogOperation(c) { store.queryCatalog(c, sql, *a) }
 
     private fun n(
         c: String,
@@ -292,7 +292,7 @@ class HogliteGuardRaceTest {
 
     /** Age every snapshot far past any retention cutoff, deterministically (no sleeps). */
     private fun ageSnapshots(c: String) {
-        store.runTx(
+        boundTx(
             c,
             HogliteCatalogStore.freshTxid("age"),
             null,
@@ -577,8 +577,8 @@ class HogliteGuardRaceTest {
         val peers = "pod-c=http://127.0.0.1:$pc,pod-d=http://127.0.0.1:$pd"
         startPod("pod-c", pc, "mp", peers)
         startPod("pod-d", pd, "mp", peers)
-        val sc = HogliteCatalogStore(HogliteClient(standardUrl = "http://127.0.0.1:$pc", sleeper = {}))
-        val sd = HogliteCatalogStore(HogliteClient(standardUrl = "http://127.0.0.1:$pd", sleeper = {}))
+        val sc = checkedStore(HogliteClient(standardUrl = "http://127.0.0.1:$pc", sleeper = {}))
+        val sd = checkedStore(HogliteClient(standardUrl = "http://127.0.0.1:$pd", sleeper = {}))
         sc.createCatalog("mpcat", "s3://hoglake-it/mpcat")
         // The non-owner serves reads (proxied) AND the drop: hoglite routes
         // the release to the owner, and the delete proceeds once no live
@@ -666,7 +666,7 @@ class HogliteGuardRaceTest {
         store.commit(c, appendReq(c, "ts0.parquet"))
         // A future-stamped predecessor (pod-clock skew): the next snapshot's
         // ts honours it — time never moves backwards relative to id order.
-        store.runTx(
+        boundTx(
             c,
             HogliteCatalogStore.freshTxid("ts"),
             null,
@@ -755,7 +755,7 @@ class HogliteGuardRaceTest {
         val c = freshCatalog()
         val owner = UUID.randomUUID()
         val claim = store.uploads.claim(c, UUID.randomUUID(), owner, "s3://hoglake-it/$c/up", "data")
-        store.runTx(
+        boundTx(
             c,
             HogliteCatalogStore.freshTxid("age-upload"),
             null,
@@ -785,7 +785,7 @@ class HogliteGuardRaceTest {
                 software.amazon.awssdk.core.sync.RequestBody.fromString("keep"),
             )
         }
-        store.runTx(
+        boundTx(
             c,
             HogliteCatalogStore.freshTxid("queue"),
             null,
@@ -800,7 +800,7 @@ class HogliteGuardRaceTest {
         )
         val hook =
             Hook({ m, p, b -> isTx(m, p) && "UPDATE removals SET claimed_at = ?, claimed_by = ?" in b }, before = {
-                store.runTx(
+                boundTx(
                     c,
                     HogliteCatalogStore.freshTxid("other-worker"),
                     null,
@@ -841,19 +841,21 @@ class HogliteGuardRaceTest {
         val c = freshCatalog()
         pstore.getCatalog(c)
         val oldTenant = pstore.resolveTenant(c)
-        store.dropCatalog(c, "test", "old")
-        store.createCatalog(c, "s3://hoglake-it/$c")
         val consumerFloor = store.getCatalog(c).consumerFloor
-        seen.clear()
         assertThatThrownBy {
-            pstore.runTx(
-                c,
-                HogliteCatalogStore.freshTxid("stale-write"),
-                null,
-                HogliteTx().apply {
-                    add("UPDATE meta SET consumer_floor = ? WHERE id = 1", if (consumerFloor) 0 else 1)
-                },
-            )
+            pstore.catalogOperation(c) {
+                store.dropCatalog(c, "test", "old")
+                store.createCatalog(c, "s3://hoglake-it/$c")
+                seen.clear()
+                pstore.runTx(
+                    c,
+                    HogliteCatalogStore.freshTxid("stale-write"),
+                    null,
+                    HogliteTx().apply {
+                        add("UPDATE meta SET consumer_floor = ? WHERE id = 1", if (consumerFloor) 0 else 1)
+                    },
+                )
+            }
         }.isInstanceOf(HoglakeException.NotFound::class.java)
         val attempts = seen.filter { "/tx " in it }
         assertThat(attempts).hasSize(1)
@@ -1005,7 +1007,7 @@ class HogliteGuardRaceTest {
         val r = runCatching { pstore.commit(c, appendReq(c, "p5a.parquet")) }
         assertThat(r.exceptionOrNull()).isInstanceOf(HoglakeException.NotFound::class.java)
         assertThat(hook.remaining).isZero()
-        assertThat(HogliteCatalogStore(client).listFiles(c, "zz", "victim")).isEmpty()
+        assertThat(checkedStore(client).listFiles(c, "zz", "victim")).isEmpty()
     }
 
     @Test
@@ -1022,7 +1024,7 @@ class HogliteGuardRaceTest {
         val r = runCatching { pstore.commit(c, appendReq(c, "p5b.parquet")) }
         assertThat(r.exceptionOrNull()).isInstanceOf(HoglakeException.NotFound::class.java)
         assertThat(hook.remaining).isZero()
-        assertThat(HogliteCatalogStore(client).listFiles(c, "zz", "victim")).isEmpty()
+        assertThat(checkedStore(client).listFiles(c, "zz", "victim")).isEmpty()
     }
 
     @Test
@@ -1040,7 +1042,7 @@ class HogliteGuardRaceTest {
         val r = runCatching { pstore.commit(c, appendReq(c, "p5c.parquet")) }
         assertThat(r.exceptionOrNull()).isInstanceOf(HoglakeException.NotFound::class.java)
         assertThat(hook.remaining).isZero()
-        assertThat(HogliteCatalogStore(client).listFiles(c, "zz", "victim")).isEmpty()
+        assertThat(checkedStore(client).listFiles(c, "zz", "victim")).isEmpty()
     }
 
     @Test
@@ -1209,5 +1211,155 @@ class HogliteGuardRaceTest {
         }.isInstanceOf(HoglakeException.NotFound::class.java)
         assertThat(hook.remaining).isZero()
         assertThat(store.getCatalog(c).name).isEqualTo(c)
+    }
+
+    /** Raw fixture SQL still enters an explicit scope; never exempt production work. */
+    private fun checkedStore(client: HogliteClient) =
+        HogliteCatalogStore(client).apply { requireOperationBindingForTests = true }
+
+    private fun boundTx(
+        c: String,
+        txid: String,
+        fp: String?,
+        tx: HogliteTx,
+    ) = store.catalogOperation(c) { store.runTx(c, txid, fp, tx) }
+
+    @Suppress("UNCHECKED_CAST")
+    private fun bindings(s: HogliteCatalogStore): Map<String, Any>? {
+        val field = HogliteCatalogStore::class.java.getDeclaredField("operationBindings")
+        field.isAccessible = true
+        return (field.get(s) as ThreadLocal<MutableMap<String, Any>>).get()
+    }
+
+    private fun victimAppend(
+        c: String,
+        path: String,
+    ) = CommitRequest(
+        idempotencyKey = UUID.randomUUID(),
+        appends =
+            listOf(
+                TableAppend("zz", "victim", listOf(FileRegistration("s3://hoglake-it/$c/data/$path", 10, 100, 50))),
+            ),
+    )
+
+    @Test
+    fun `every catch-and-retry after a bound 404 rethrows the same NotFound and sends nothing`() {
+        val (c, t) = setup()
+        var first: Throwable? = null
+        val attempts = linkedMapOf<String, Throwable?>()
+        var sentAfterPoison = -1
+        val r =
+            runCatching {
+                pstore.catalogOperation(c) {
+                    pstore.meta(c) // bound to T1
+                    recreateWithVictim(store, c, t) // T2 holds zz.victim (table id 1).
+                    first = runCatching { pstore.queryCatalog(c, "SELECT 1") }.exceptionOrNull()
+                    val before = seen.size
+
+                    fun attempt(
+                        name: String,
+                        body: () -> Unit,
+                    ) {
+                        attempts[name] = runCatching(body).exceptionOrNull()
+                    }
+                    attempt("commit ns.t") { pstore.commit(c, appendReq(c, "poison.parquet")) }
+                    attempt("commit zz.victim") { pstore.commit(c, victimAppend(c, "poison-victim.parquet")) }
+                    attempt("createNamespace") { pstore.createNamespace(c, "poison") }
+                    attempt(
+                        "createTable",
+                    ) { pstore.createTable(c, "zz", "poison", listOf(ColumnDef("id", ColType.LONG))) }
+                    attempt("runTx") {
+                        val tx = HogliteTx().apply { add("UPDATE meta SET consumer_floor = 0 WHERE id = 1") }
+                        pstore.runTx(c, "poison", null, tx)
+                    }
+                    attempt("queryCatalog") { pstore.queryCatalog(c, "SELECT COUNT(*) FROM tables") }
+                    attempt("getCatalog") { pstore.getCatalog(c) }
+                    attempt(
+                        "options.patch",
+                    ) { HogliteOptions(pstore).patch(c, PatchField.Absent, false, "poison", "poison") }
+                    attempt("uploads.claim") {
+                        pstore.uploads.claim(c, UUID.randomUUID(), UUID.randomUUID(), "s3://hoglake-it/$c/up", "data")
+                    }
+                    attempt("recorded{ok}") {
+                        pstore.recorded(
+                            c,
+                            com.posthog.hoglake.model.MaintenanceTask.EXPIRY,
+                            MaintenanceTrigger.MANUAL,
+                        ) { 1 }
+                    }
+                    attempt(
+                        "expiry.runOnce",
+                    ) { HogliteExpiry(pstore, 100, 10_000).runOnce(c, 100, MaintenanceTrigger.MANUAL) }
+                    sentAfterPoison = seen.size - before
+                    42 // the broad catch "succeeds"
+                }
+            }
+        assertThat(first).isInstanceOf(HoglakeException.NotFound::class.java)
+        assertThat(attempts).hasSize(11)
+        attempts.forEach { (k, v) -> assertThat(v).describedAs(k).isSameAs(first) }
+        assertThat(sentAfterPoison).isZero()
+        assertThat(r.exceptionOrNull()).isSameAs(first)
+        assertThat(bindings(pstore)).isNull()
+        val t2 = checkedStore(client)
+        assertThat(t2.listFiles(c, "zz", "victim")).isEmpty()
+        assertThat(t2.listTables(c, "zz", null, null).map { it.name }).containsExactly("victim")
+        assertThat(t2.listNamespaces(c, null, null).map { it.name }).containsExactly("zz")
+        assertThat(
+            t2.catalogOperation(c) {
+                t2.queryCatalog(c, "SELECT COUNT(*) FROM maintenance_runs")
+            }.firstRow()!![0].asLong(),
+        ).isZero()
+        assertThat(
+            t2.catalogOperation(c) {
+                t2.queryCatalog(c, "SELECT COUNT(*) FROM uploads")
+            }.firstRow()!![0].asLong(),
+        ).isZero()
+        assertThat(t2.getCatalog(c).consumerFloor).isTrue() // default 1; poisoned retries tried to clear it
+        // A NEW operation on the same thread rebinds authoritatively and is served by T2.
+        pstore.commit(c, victimAppend(c, "after-unwind.parquet"))
+        assertThat(
+            t2.listFiles(c, "zz", "victim").map {
+                it.path
+            },
+        ).containsExactly("s3://hoglake-it/$c/data/after-unwind.parquet")
+    }
+
+    @Test
+    fun `a fence-poisoned scope stays poisoned even if the old tenant would accept the retry`() {
+        val c = freshCatalog()
+        val old = store.resolveTenant(c)
+        var first: Throwable? = null
+        var retry: Throwable? = null
+        var sent = -1
+        val r =
+            runCatching {
+                pstore.catalogOperation(c) {
+                    pstore.meta(c)
+                    client.tx(
+                        old,
+                        "poison-fence",
+                        null,
+                        listOf(HogliteStatement("UPDATE meta SET dropping = 1 WHERE id = 1", emptyList())),
+                    )
+                    first = runCatching { pstore.createNamespace(c, "a") }.exceptionOrNull()
+                    client.tx(
+                        old,
+                        "poison-unfence",
+                        null,
+                        listOf(HogliteStatement("UPDATE meta SET dropping = 0 WHERE id = 1", emptyList())),
+                    )
+                    val before = seen.size
+                    retry = runCatching { pstore.createNamespace(c, "a") }.exceptionOrNull()
+                    sent = seen.size - before
+                    "acknowledged"
+                }
+            }
+        assertThat(first).isInstanceOf(HoglakeException.NotFound::class.java)
+        assertThat(retry).isSameAs(first)
+        assertThat(sent).isZero()
+        assertThat(r.exceptionOrNull()).isSameAs(first)
+        assertThat(store.listNamespaces(c, null, null)).isEmpty()
+        // and a new operation (old tenant still registered, now unfenced) proceeds
+        assertThat(pstore.createNamespace(c, "a").name).isEqualTo("a")
     }
 }
