@@ -98,11 +98,12 @@ endpoint rather than silently ignoring an unfamiliar request field.
   files. Pending input remains intact; an upload reservation/reclamation path is
   still needed. Prepared requests must never be regenerated after an ambiguous
   commit. A persistent DDL conflict requires operator reconciliation.
-- Receipts currently retain the complete request indefinitely. A receipt GC
-  protocol needs an explicit replay horizon before any deletion is safe.
+- Server receipts store a digest of the request, not the request, and are
+  purged after `HOGLAKE_RECEIPT_RETENTION_SECONDS` (default 7 days). A
+  prepared request replayed after that re-publishes its files as a new snapshot.
 - Native VARIANT is not JSON. The DuckDB writer keeps payloads inside DuckDB,
   at the version [DUCKDB_WRITER.md](DUCKDB_WRITER.md) pins. Catalog types and prepared-file physical validation are implemented; VARIANT
-  statistics are omitted. VARIANT compaction, reader interoperability still need implementation. No Arrow payload rewrite may be inserted: ordinary
+  statistics are omitted. VARIANT compaction is behind the server's `HOGLAKE_COMPACTION_VARIANT` (default off; a group with an input not in the declared layout is refused); reader interoperability still needs implementation. No Arrow payload rewrite may be inserted: ordinary
   PyArrow read/write drops the native VARIANT annotation. Source-to-destination
   JSON column mappings are explicit at the library boundary; the CLI defaults
   only `properties` as described in the README.

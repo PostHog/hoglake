@@ -212,6 +212,11 @@ object AuthPolicy {
                 Requirement.READ,
             ),
             Entry(
+                HttpMethod.Post,
+                "/v1/catalogs/$CATALOG/namespaces/{namespace}/tables/{table}/partitions/lookup",
+                Requirement.READ,
+            ),
+            Entry(
                 HttpMethod.Get,
                 "/v1/catalogs/$CATALOG/namespaces/{namespace}/tables/{table}/changes",
                 Requirement.READ,

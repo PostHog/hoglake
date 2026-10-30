@@ -1,11 +1,18 @@
 # Auth, tenancy and S3 data-plane entitlement
 
-**Status:** §6.1–6.5, §7 and §11 are implemented by the first PR of the stack
-(the enforcement layer: JWT verification, the route-to-scope table, per-catalog
-`Caller`, the `off|warn|enforce` mode flag, filtered listings, and the death of
-the client-supplied `author`).
+**Status:** the hoglake side has shipped.
+[#460](https://github.com/PostHog/hoglake/pull/460) is the enforcement layer:
+`HOGLAKE_AUTH_MODE=off|warn|enforce`, ES256 JWT verification against a JWKS file
+or URL (`auth/JwtVerifier.kt`), the four scopes (`auth/Scope.kt`), the
+route-to-requirement table (`auth/AuthPolicy.kt`), per-catalog `Caller`,
+filtered listings (§7) and the adjudicated `author` (§6.6).
+[#475](https://github.com/PostHog/hoglake/pull/475) is the `/metrics` infra
+listener (§6.7). [#472](https://github.com/PostHog/hoglake/pull/472) is bearer
+auth in `pyhoglake`, `hedgerow` and the DuckDB extension (§8). Not built: S3
+credential vending in any client, millrace and bench auth, RFC 7523. Issuance,
+JWKS hosting and S3 vending belong to hogtower (§17).
 
-**§17 supersedes §4, §5, §6.6, §10, §14 and §15.** Reading `PostHog/hogtower`
+**§17 supersedes §4, §5, §6.1, §10, §14 and §15.** Reading `PostHog/hogtower`
 showed that hoglake is not the right home for issuance or S3 vending: the
 tenant→catalog→IAM-role→bucket mapping, an `sts:AssumeRole` broker, the
 warehouse-scoped machine credentials and an ES256 verifier all already exist
@@ -41,6 +48,9 @@ not an AWS principal. The rest of this document is mostly about C.
 ---
 
 ## 1. What exists today (verified in this tree)
+
+*This is the pre-#460 baseline. §1.1 and §1.7 no longer hold: the `auth/`
+package gates every route (`auth/AuthPolicy.kt`).*
 
 This section is the baseline. Everything below is either a fact I read out of
 the source or an inference I label as one.
@@ -319,7 +329,7 @@ and deny onboarding to everyone after it.
 
 ### 4.3 Backfill
 
-`V29` cannot know each catalog's org UUID, bucket layout or role ARN. It must
+The tenancy migration cannot know each catalog's org UUID, bucket layout or role ARN. It must
 therefore be paired with an operator-provided mapping (a one-shot admin endpoint
 or a `--backfill-tenant` CLI taking a CSV/JSONL of `catalog,
 org_id,bucket,prefix,region,role`). Two states:
@@ -484,7 +494,7 @@ the per-org Trino deployment gets its own ServiceAccount (which
 
   // Per-catalog authorization. Present catalogs, nothing more.
   "cat": {
-    "1b2c3d4e-5f60-4a7b-8c9d-0e1f2a3b4c5d":       ["read", "write", "consumer"],
+    "1b2c3d4e-5f60-4a7b-8c9d-0e1f2a3b4c5d":       ["read", "write"],
     "1b2c3d4e-5f60-4a7b-8c9d-0e1f2a3b4c5d-dev":   ["read"]
   },
 
@@ -511,11 +521,12 @@ Deliberate omissions:
 |---|---|
 | `read` | catalog get, namespaces, tables, views, files, scan, changes, partitions, stats, storage-usage, snapshots, options read, consumers read |
 | `write` | commit (all three forms), uploads, table-creations, alter, truncate, drop namespace/table, options write, consumers write |
-| `maintenance` | `POST …/maintenance/{expire,compact,rehydrate,cleanup}`, publications, reindex |
+| `maintenance` | `POST …/maintenance/{expire,compact,rehydrate,cleanup}`, publications create/delete |
 | `admin` | `DELETE /v1/catalogs/{catalog}` (tenant-scoped self-service drop), client management for this tenant |
 
-`read` implies no `write`; `write` implies `read` (checked at mint time, refused
-otherwise, so an operator cannot create a token that commits but cannot plan).
+The scopes are ordered `read < write < maintenance < admin`, and a held scope
+satisfies every requirement at or below it (`Scope.satisfies`, by ordinal), so a
+token that commits can always plan.
 
 ### 6.4 Route → scope map
 
@@ -524,24 +535,28 @@ Every route family gets an entry, and the test suite (§12) asserts the map is
 defaulting. This is the single most valuable test in the plan; the current tree
 `501`s some routes and that must not become a bypass.
 
+As shipped; `auth/AuthPolicy.kt` is the authoritative table.
+
 | Route | Tenant scope | Operator |
 |---|---|---|
 | `GET /v1/catalogs` | filtered to `cat` keys | all |
-| `POST /v1/catalogs` | `admin` on the org (provisioning only; normally an operator action) | ✓ |
+| `POST /v1/catalogs` | operator only | ✓ |
 | `GET/DELETE /v1/catalogs/{c}` | `read` / `admin` | ✓ |
 | `…/namespaces*`, `…/tables*`, `…/views*` | `read` (GET) / `write` (mutating) | ✓ |
 | `…/scan`, `…/files`, `…/changes`, `…/partitions*` | `read` | ✓ |
 | `…/commit*`, `…/uploads*`, `…/table-creations*`, `…/alter`, `…/truncate` | `write` | ✓ |
-| `…/maintenance/*` | `maintenance` | ✓ |
+| `POST …/maintenance/*` | `maintenance` | ✓ |
+| `GET …/maintenance/status`, `…/runs` | `read` | ✓ |
 | `…/consumers*` | `read` / `write` | ✓ |
-| `…/storage-credentials` | `read` (+ `write` in the policy iff the token has `write`) | ✓ |
+| `…/storage-credentials` | not built; S3 vending is hogtower's (§17) | n/a |
 | `…/export` | `read` | ✓ |
-| `…/publications` | `maintenance` | ✓ |
-| `/v1/maintenance/status`, `/runs` | filtered to `cat` | ✓ |
+| `…/publications*` | `read` (GET) / `maintenance` (POST, DELETE) | ✓ |
+| `/v1/maintenance/status`, `/runs` | operator only (§7.1) | ✓ |
 | `/v1/database/health` | operator only | ✓ |
-| `/v1/debug/*` | operator only, and only when an explicit env flag is set | ✓ |
-| `/v1/info` | instance identity public; **totals per-tenant or omitted** | all |
-| `/metrics`, `/livez`, `/healthz` | infra listener (see §6.7) | n/a |
+| `/v1/debug/*` | operator only | ✓ |
+| `/v1/info` | public; **totals projected onto the caller's catalogs, omitted when anonymous** | all |
+| `/livez`, `/healthz`, `/openapi.yaml` | public | n/a |
+| `/metrics` | operator only on the API port; unauthenticated on the infra listener (§6.7) | ✓ |
 
 ### 6.5 Enforcement point
 
@@ -554,8 +569,9 @@ One Ktor application plugin installed in `App.module()` before any
    carries the claim through and acts on none of it; revocation for the metadata
    plane is the token TTL and nothing else;
 2. resolves the route's required scope **and** the `{catalog}` path parameter;
-3. puts a `Caller` in the call attributes, and the actor into the MDC so
-   `Audit.event` stops defaulting to `anonymous`;
+3. puts a `Caller` in the call attributes; handlers pass the resolved actor
+   (`actorOrRefuse`) to `Audit.event` explicitly, so it stops defaulting to
+   `anonymous`. The actor does not go into the MDC;
 4. `401` with `WWW-Authenticate: Bearer error="invalid_token"` or `403
    {"error":"forbidden", …}` in the existing `ApiError` shape.
 
@@ -569,7 +585,8 @@ Two facts make this tractable here:
   tree, and the file even explains why a Ktor plugin was hand-rolled rather than
   added.
 
-**Defence in depth, beyond the interceptor.** An interceptor can be bypassed by a
+**Defence in depth, beyond the interceptor** (not built: there is no
+`TenantContext`; the backstop is the route-table totality test). An interceptor can be bypassed by a
 route registered outside it, which is exactly the class of bug this repo's
 invariants exist to prevent. So: every request also carries a `TenantContext`,
 and the repository layer asserts `catalog_id == TenantContext.catalogId` for the
@@ -584,7 +601,7 @@ drop, commit payload). Once a caller has an identity:
 
 - the server **overrides** `author` with the token's `sub`, and
 - a non-operator supplying a *different* `author` gets `422
-  author_not_permitted` (not a silent override — silent override makes a client
+  validation` (not a silent override — silent override makes a client
   believe its attribution landed),
 - **except a delegating client.** A token carrying `"dlg": true` belongs to a
   client that runs statements for end users (the Trino pool), and it may name
@@ -594,13 +611,26 @@ drop, commit payload). Once a caller has an identity:
   issuer sets `dlg` only on service credentials it provisions itself, never on
   a customer's own, so a customer SDK token still cannot name anybody else.
 
-The `CommitRequest.author` / `SnapshotAuthor` fields stay in the wire contract for
-operator/bulk paths and become operator-only. This also finally makes
+The `CommitRequest.author` / `SnapshotAuthor` fields stay in the wire contract.
+An operator may set any value; a tenant may send only its own subject, or a
+delegated user as above (`resolveActor` in `auth/AuthPlugin.kt`). This also finally makes
 `hog_snapshot.author` an audit-grade column.
 
 ### 6.7 Listeners
 
-Split the process's ports:
+*Landed for `/metrics`:* `HOGLAKE_METRICS_PORT` (default `0`, off) starts an
+infra listener serving `GET /metrics` alone, with no auth plugin
+(`observability/MetricsListener.kt`). The API port's `/metrics` stays
+`OPERATOR`. The scraper uses the infra port, which the chart exposes on the pod
+and not on the Service, so it needs no token. That matters for rollout as well
+as for safety: under `warn` an untokened scrape on the API port counts as a
+refusal, so the zero-refusals gate (§11) could never pass. `/healthz` and
+`/livez` stay on the API port, where the kubelet probes them and the route
+table already exempts them.
+
+*Not built, superseded by the above:* `/v1/database/health` and `/v1/debug/*`
+stay on the API port as `OPERATOR`, and the infra port has no fixed default.
+The original plan was to split the process's ports:
 
 - **public listener (8080)**: `/v1/*` with the auth plugin, plus `/livez` and
   `/openapi.yaml`.
@@ -668,37 +698,38 @@ tenant mismatch, 403 for scope shortfall.**
 
 ### 8.1 `pyhoglake`
 
-- `HoglakeClient(..., auth=ClientCredentials(client_id=…, client_secret=…))` or
-  `auth=Bearer("<jwt>")`, or `auth=JwtBearer(token_file=…)`.
-- One seam: the `httpx.Client` at `client.py:689`. Add an auth hook that refreshes
-  on `401` and at `exp - 60s`, guarded by a lock so 64 concurrent uploads do not
+- *Shipped (#472):* `HoglakeClient(..., auth=ClientCredentials(token_url, client_id,
+  client_secret, audience="hoglake"))` or `auth=BearerToken("<jwt>")`
+  (`pyhoglake/src/pyhoglake/auth.py`). No token-file variant.
+- One seam: the `httpx.Client`. `ClientCredentials` is an `httpx.Auth` that
+  replaces the token once on a `401` and refreshes ahead of `exp` (60 s, capped
+  at a fifth of the lifetime), guarded by a lock so 64 concurrent uploads do not
   each exchange.
-- **New:** the client is where vended S3 credentials land. `table.scan()` / the
+- **New, not built:** the client is where vended S3 credentials land. `table.scan()` / the
   writer's upload path must call `POST …/storage-credentials` and feed the
   result into the `S3Config`/`pyarrow.fs.S3FileSystem` construction at
   `client.py:495-610`. Today `S3Config` takes static `access_key`/`secret_key`;
   it needs a `RefreshableCredentials` variant (pyarrow accepts a credentials
   provider object, so the refresh can be lazy and cached).
-- Cross-tenant error taxonomy: new `UnauthorizedError`/`ForbiddenError` in
+- Cross-tenant error taxonomy (not built): new `UnauthorizedError`/`ForbiddenError` in
   `errors.py`, mapped from `401`/`403`, so a misconfigured service fails loudly
   instead of at the first S3 403.
 
 ### 8.2 DuckDB extension
 
-- `SET hoglake_token = '…'` (session-scoped, never persisted) or
-  `hoglake_token_file`, matching the existing `hoglake_default_endpoint` option
-  style at `duckdb-client/src/hoglake_extension.cpp:20`.
-- `hoglake_client_id`/`hoglake_client_secret` only if the extension can hold a
-  secret safely; otherwise token/CDN-file only. A `SECRET`-based spelling is the
-  right DuckDB idiom and worth checking against the pinned extension version.
-- The extension has its own S3 access (it reads parquet directly), so it needs
+- *Shipped (#472):* `ATTACH` options, not `SET` settings: `TOKEN`, or
+  `TOKEN_URL` + `CLIENT_ID` + `CLIENT_SECRET` (+ `AUDIENCE`)
+  (`duckdb-client/src/storage/hoglake_storage.cpp`). No token-file option.
+- A `SECRET`-based spelling is the right DuckDB idiom; not built.
+- Not built: the extension has its own S3 access (it reads parquet directly), so it needs
   the vended-credential path too — `SET s3_access_key_id`/`s3_session_token`
   from the vended response, refreshed on expiry.
 
 ### 8.3 `millrace`, `hedgerow`, `bench`
 
-All sit on `pyhoglake`. Service tokens via RFC 7523 (in-cluster) or
-`client_credentials` (dev/local). `millrace` creates its destination catalog at
+All sit on `pyhoglake`. *Shipped (#472):* `hedgerow` takes `client_credentials`
+per side (`source.auth` / `destination.auth`, `hedgerow/src/hedgerow/config.py`).
+Not built: RFC 7523 service tokens, and auth in `millrace` and `bench`. `millrace` creates its destination catalog at
 startup from `MILLRACE_CATALOG_DATA_PATH` — with auth, that knob becomes
 operator-only and the *customer* deployment path passes a tenant token instead.
 `bench/` needs an `--token` flag or it stops working against an enforcing stack;
@@ -800,7 +831,7 @@ argued, and it is worth doing.
 
 ## 10. Schema
 
-### 10.1 New tables (V29+)
+### 10.1 New tables (a future migration)
 
 Follow the repo's migration conventions exactly: one `V<n>__*.sql` per change,
 `schema.sql` updated so `fold(migrations) == schema.sql`
@@ -811,11 +842,11 @@ migrations use), `CREATE INDEX CONCURRENTLY` with the accompanying `.conf`
 header comment that states *why* rather than *what*.
 
 ```sql
--- V29__tenancy.sql
+-- tenancy (a future migration)
 CREATE TABLE hog_tenant ( … §4.1 … );
 CREATE INDEX hog_tenant_org ON hog_tenant (org_id);
 
--- V30__auth_clients.sql
+-- auth clients (a future migration)
 CREATE TABLE hog_client (
     client_id     text PRIMARY KEY CHECK (client_id ~ '^hk_[a-z]+_[A-Za-z0-9]{20,40}$'),
     -- High-entropy secret: SHA-256 is sufficient and constant-time; argon2
@@ -846,7 +877,7 @@ CREATE TABLE hog_client_scope (
 );
 CREATE INDEX hog_client_scope_catalog ON hog_client_scope (catalog_id);
 
--- V31__auth_signing_keys.sql — optional if keys live in KMS.
+-- signing keys (a future migration) — optional if keys live in KMS.
 CREATE TABLE hog_signing_key (
     kid         text PRIMARY KEY,
     algorithm   text NOT NULL CHECK (algorithm IN ('ES256')),
@@ -901,7 +932,7 @@ must be revoked, not inherited — assert that in a test.
 | Mode | Behaviour |
 |---|---|
 | `off` | today's behaviour; the plugin is installed but anonymous |
-| `warn` | the plugin resolves a caller when a token is present, authorizes, and on failure **logs + counts + allows**. Every request without a token emits `auth_missing_token_total{catalog}` |
+| `warn` | the plugin resolves a caller when a token is present, authorizes, and on failure **logs + counts + allows**. Every request without a token counts as `hoglake_auth_requests_total{outcome="missing"}`, by `client` class |
 | `enforce` | the plugin is authoritative |
 
 Sequence:
@@ -910,8 +941,8 @@ Sequence:
    `off`; ship client support in `pyhoglake` / DuckDB / Trino.
 2. Flip **dev** to `warn`, then `enforce`. The `warn` metric list is the
    onboarding checklist — a single scrape answers "who is still anonymous?".
-3. Run `warn` on `prod-us` and `prod-eu` for a week. `auth_missing_token_total`
-   must reach zero per catalog before the flip.
+3. Run `warn` on `prod-us` and `prod-eu` for a week. `hoglake_auth_requests_total`
+   refusals must reach zero per client class before the flip.
 4. Flip prod to `enforce`, both regions, off-peak, one region at a time.
 5. Only then hand customers credentials (the fleet is already authenticated
    machine-to-machine before a single customer sees a `client_id`).
@@ -936,9 +967,9 @@ The additions specific to auth:
 | **Path-confinement property test** | A hypothesis-driven generator of hostile paths (`../`, absolute, percent-encoded, doubled slashes, unicode lookalikes, prefix-siblings like `org/abc` vs `org/abcd`) through `validatePathsUnderDataPath` *and* through the session-policy generator — the two must agree on every input. The existing `verify` on prefix comparison is a substring test; the `abc`/`abcd` sibling is the classic bug and belongs in a vector file, in the style of `pyhoglake/tests/vectors/bounds_vectors.json` |
 | **Session-policy golden test** | The generated policy JSON for a matrix of (bucket, prefix, org, scope) is byte-exact, and every case is < 2048 chars |
 | **`sts:AssumeRole` fault injection** | `ObjectStore` is already `open` with overridable methods *for exactly this reason* (fault injection on the rewrite path); add an `StsClient` seam in the same style — throttling, `AccessDenied`, expired cached creds, and a clock-skewed `expiration` |
-| **Token verification vectors** | Cross-language vectors for the JWS: valid, bad `kid`, bad signature, `exp` skew edge, `nbf` future, wrong `aud`, `ep` stale, `cat` absent. Ship as `vectors/jwt_vectors.json` beside `bounds_vectors.json`, because the Trino connector (Java) and `pyhoglake` (Python) must agree |
+| **Token verification vectors** | Cross-language vectors for the JWS: valid, bad `kid`, bad signature, `exp` skew edge, `nbf` future, wrong `aud`, `cat` absent. Shipped as `server/src/test/resources/oauth/contract-vectors.json` (`ep` is not checked, §17.3), because the Trino connector (Java) and `pyhoglake` (Python) must agree |
 | **Fuzz the token parser** | The repo already runs nightly property/fuzz suites (`docs/fuzzing.md`); a JWS parser is a parser and gets the same treatment |
-| **Migration test** | `V29`/`V30` applied to a populated database, in the shape of the existing `V*MigrationIntegrationTest`s |
+| **Migration test** | The tenancy and client migrations applied to a populated database, in the shape of the existing `V*MigrationIntegrationTest`s |
 | **Audit attribution** | Every audited action carries a non-`anonymous` actor when a token is present, and a caller-supplied `author` is refused for tenants unless the token delegates (`dlg`), in which case it is recorded as `<user> via <actor>` |
 
 ---
@@ -951,16 +982,18 @@ New metrics (Prometheus, existing `observability/Metrics.kt` idiom):
 |---|---|
 | `hoglake_auth_requests_total{mode,outcome,client}` | the `warn`-mode onboarding checklist; `client` is a closed class from `User-Agent`, and the enforce gate is zero refusals per class |
 | `hoglake_auth_signing_keys` | keys the verifier holds; alert on 0 (boot refuses an empty source, this catches a rotation that never lands) |
-| `hoglake_auth_missing_token_total{catalog}` | who is still anonymous |
-| `hoglake_auth_denials_total{catalog,required_scope,reason}` | distinguishes "client misconfigured" from "attack" by `reason` |
-| `hoglake_token_issued_total{grant_type}`, `_failures_total` | token endpoint health |
-| `hoglake_sts_assume_total{catalog,outcome}`, `_duration_seconds` | the vending path is now on the critical path of a read; it needs a latency histogram |
-| `hoglake_sts_cache_hit_ratio` | if this drops, every scan pays an STS round trip |
-| `hoglake_auth_epoch_refresh_age_seconds` | the 30 s epoch cache; stale means revocation is not working |
+| `hoglake_auth_denials_total{catalog,scope,reason}` | distinguishes "client misconfigured" from "attack" by `reason` |
+| `hoglake_token_issued_total{grant_type}`, `_failures_total` | token endpoint health; not built (issuance is hogtower's) |
+| `hoglake_sts_assume_total{catalog,outcome}`, `_duration_seconds` | the vending path is now on the critical path of a read; it needs a latency histogram; not built (vending is hogtower's) |
+| `hoglake_sts_cache_hit_ratio` | if this drops, every scan pays an STS round trip; not built |
+| `hoglake_auth_epoch_refresh_age_seconds` | the 30 s epoch cache; stale means revocation is not working; not built (no epoch, §17.3) |
 
-Audit additions: a `tenant` field on every event, and three new actions —
-`token_issue`, `token_denied`, `storage_credentials_vend` (the last one is the
-one you want when a customer asks "who read my data", alongside CloudTrail).
+"Who is still anonymous" is `hoglake_auth_requests_total{outcome="missing"}`.
+
+Audit additions: one new action, `auth_refused`. Not built: a `tenant` field on
+every event, and `token_issue`, `token_denied`, `storage_credentials_vend` (the
+last one is the one you want when a customer asks "who read my data", alongside
+CloudTrail).
 
 ---
 
@@ -973,7 +1006,7 @@ are weather, not commitments.
 
 | Item | Notes |
 |---|---|
-| `V29` `hog_tenant`, `V30` clients/scopes | §10.1 |
+| Future migrations: `hog_tenant`, clients/scopes | §10.1 |
 | `Caller` + auth plugin (verify-only, symmetric-free: JWKS + ES256), installed ahead of routes | hand-rolled in the `RequestId` idiom; no new Gradle dep |
 | Route→scope map + totality test | §12 |
 | `404`-not-`403` tenant mismatch; `listCatalogs` SQL filter | §7 |
@@ -1224,7 +1257,7 @@ The residual risk is a rogue *operator* caller, which is a different threat with
 a different mitigation (audit, and eventually a `data_path` root allow-list from
 config). Dropping §4 also drops the only migrations this document planned.
 
-**Superseded — §5 (S3 vending) and §6.6 (issuance, JWKS).** Both move to
+**Superseded — §5 (S3 vending) and §6.1 (issuance, JWKS).** Both move to
 hogtower. The session-policy construction in §5.3, the `2048`-character limit,
 the `RoleSessionName` argument and the rotation/revocation design transfer
 unchanged; the endpoint hosting them does not.
@@ -1275,15 +1308,16 @@ It must pin, at minimum:
   | `nbf` | no | not-before; absence means "valid now" |
   | `ep` | no | credential epoch, carried for the vendor's own use; **hoglake does not read it** |
 - the scope vocabulary and its ordering (`read < write < maintenance < admin`),
-  which hogtower mints and hoglake enforces — the same five words on both sides
+  which hogtower mints and hoglake enforces — the same four words on both sides
   or neither side;
 - the `alg` (`ES256`), the key id (`kid`) scheme, and the JWKS URL;
 - the error contract: `401` with `WWW-Authenticate: Bearer error=…` for a bad
   token, `403` for a scope shortfall, `404` for a catalog the caller cannot see.
   The reason strings are part of the contract because a client branches on them.
 
-hoglake's side of this is already built: `JwksSigningKeys.fromUrl` fetches, caches
-per `kid`, refreshes once on a miss and keeps the old keys when a refresh fails;
+hoglake's side of this is already built: `JwksSigningKeys.fromUrl` fetches and caches
+per `kid`; a `kid` miss refuses that request and triggers a background re-read,
+rate-limited to one per 30 s, which keeps the old keys when it fails;
 `Scope.parseAll` drops unknown names rather than refusing the token, so a newer
 minting side degrades to a 403 that names the scope instead of a rolling-upgrade
 outage.
@@ -1294,7 +1328,7 @@ Six PRs across two repos, in dependency order. Only the first touches hoglake.
 
 | # | repo | what | size |
 | --- | --- | --- | --- |
-| 1 | hoglake | **enforcement core** — verifier, route→scope table, `Caller`, `off\|warn\|enforce`, filtered listings, adjudicated `author`. *Open: [#460](https://github.com/PostHog/hoglake/pull/460).* | done |
+| 1 | hoglake | **enforcement core** — verifier, route→scope table, `Caller`, `off\|warn\|enforce`, filtered listings, adjudicated `author`. *Merged: [#460](https://github.com/PostHog/hoglake/pull/460); the `/metrics` infra listener followed in [#475](https://github.com/PostHog/hoglake/pull/475).* | done |
 | 2 | hogtower | **signing key + JWKS** — ES256 keypair sealed at rest with the existing AES-256 user-secret key machinery, a `kid`, `GET /.well-known/jwks.json`, rotation. No tokens yet, so it is inert. | 1 week |
 | 3 | hogtower | **`POST /oauth/token`** — `client_credentials` against `service_credentials` (bcrypt verify, `expires_at`, `revoked_at`), scopes from service grants/OPA/tenant, mint the JWT. **No `epoch` claim** — see the review note in §17.3: the only
 consumer that could act on it is the one that can read `revoked_at` directly, so
@@ -1302,7 +1336,7 @@ it would be a claim that implies a revocation check nobody performs. Smaller
 than it reads: `ValidateTrinoServiceCredential` already verifies exactly this credential and returns the org, tier and groups. | 1 week |
 | 4 | hogtower | **`POST /oauth/credentials`** — validate the JWT, resolve bucket/prefix/region from `warehouse_ducklings`, `AssumeRole` with a session policy and a per-tenant `RoleSessionName`, return the credentials. **The broker needs one real change:** `awsAssumeRole` (`sts_broker.go:247`) passes neither `Policy` nor a per-caller session name, and the cache is keyed on `roleARN` alone (`:192`) — keyed that way it would serve a prefix-scoped credential to the next caller for the same role, which is the bug that makes this whole design fail open. Cache key becomes `roleARN + hash(session policy)`. | 1.5–2 weeks |
 | 5 | hoglake | **flip it on** — `HOGLAKE_AUTH_ISSUER`, `HOGLAKE_AUTH_JWKS_URL`, then `HOGLAKE_AUTH_MODE=enforce`. Config plus the contract-vector test. Optional hardening in the same PR: refuse a `POST /v1/catalogs` whose `data_path` is outside a configured root. | 2 days |
-| 6 | hoglake, pyhoglake | **clients** — `pyhoglake` gains `client_credentials`, token refresh and a `/oauth/credentials` fetch; the DuckDB extension exposes it as an extension option. §8.1 and §8.2 otherwise stand. | 1 week |
+| 6 | hoglake, pyhoglake | **clients** — `pyhoglake` gains `client_credentials`, token refresh and a `/oauth/credentials` fetch; the DuckDB extension exposes it as an extension option. *Shipped in [#472](https://github.com/PostHog/hoglake/pull/472) (plus hedgerow) except the `/oauth/credentials` fetch; see §8.* | done, less vending |
 
 Weeks 2–4 are hogtower's and are independent of hoglake's; week 1 and week 5 are
 the only points where the two repos have to agree, and the contract vector file
@@ -1313,7 +1347,7 @@ means they agree in a test rather than in a meeting.
 The expensive part of the original §5 was STS session policies and the
 credential lifecycle, and that design survives verbatim — it moves one repo
 over. The expensive part of §4 was a tenant table and a backfill, and it
-disappears. The part that is genuinely thrown away is §6.6's in-server issuance
+disappears. The part that is genuinely thrown away is §6.1's in-server issuance
 and §10's schema: about two weeks of the five-phase plan, spent on a
 `POST /v1/oauth/token` that would have had to reach into hogtower for every
 answer anyway.

@@ -109,6 +109,7 @@ volumes anywhere.
 ```
 rows/<group><partition_u32><offset_ob>   → event payload bytes
 meta/fence                               → the consumer's fence probe (not a row)
+meta/table_uuid                          → the destination incarnation the stage's rows were first committed to
 ```
 
 `<group>` is the partition tuple, prefix-free: `arity u8`, then per
@@ -133,7 +134,10 @@ There is no quarantine: a record that can never become a row (not a
 JSON object, a malformed partition source, a value no column can hold)
 is dropped, logged and metered (`millrace_records_dropped_total{reason}`),
 at consume time (nothing is staged for it) or at flush time (it is left
-out of the payload and deleted with its window). Event times are never
+out of the payload and deleted with its window). The exception is a
+mapped VARIANT column (`MILLRACE_VARIANT_SOURCES`): an invalid value is
+written as SQL NULL and the row is kept
+(`millrace_variant_invalid_total{column,reason}`). Event times are never
 judged: ancient and far-future events are written, and an instant
 outside years 1–9999 is clamped to the nearest representable one
 (counted in `millrace_values_clamped_total{column}`).
@@ -150,10 +154,10 @@ layout optimization, never the truth: the flush fans every window out
 by the LIVE spec, so a group keyed under an older spec flushes
 correctly, as several files.
 
-Any partition's instance can hold any group, so a group spread over K
-partitions is up to K files per flush window, and a medium group split
-thin can fall under the age lane's minimum per instance and move to the
-slow lane.
+Any replica's home stage can hold any group, so a group whose partitions
+land on R replicas is up to R files per flush window, and a medium group
+split thin can fall under the age lane's minimum per stage and move to
+the slow lane.
 
 Staging order is Kafka offset order; the catalog's sort spec is event
 time, which late and skewed events invert. The flush sorts each batch
@@ -180,8 +184,8 @@ A flush's unit of work is bounded: one scan reads an offset prefix of
 at most `MILLRACE_FLUSH_BYTES` of staged payload, and always at least
 one row, so a record larger than the budget never wedges its group.
 Files come out around a fifth of the budget at typical compression;
-**compaction owns final file sizing**. The pod runs at most 4
-decisions at once, so the flush's memory envelope is about 4 × (budget
+**compaction owns final file sizing**. The pod runs at most 2
+decisions at once, so the flush's memory envelope is about 2 × (budget
 + decoded batch + output).
 
 Due groups below the size lane are flushed in **batches**: every due

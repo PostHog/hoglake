@@ -242,6 +242,11 @@ data class CompactionResultDto(
      * bucket claim. See CompactionResult.bucketsSkippedClaimed.
      */
     val bucketsSkippedClaimed: Long,
+    /**
+     * Object-prefix groups refused in metadata with no nameable prefix.
+     * See CompactionResult.objectPrefixUnresolvable.
+     */
+    val objectPrefixUnresolvable: Long,
 )
 
 fun CompactionResult.toDto() =
@@ -278,6 +283,7 @@ fun CompactionResult.toDto() =
         groupsRetired = groupsRetired,
         filesUnranged = filesUnranged,
         bucketsSkippedClaimed = bucketsSkippedClaimed,
+        objectPrefixUnresolvable = objectPrefixUnresolvable,
     )
 
 data class RehydrateResultDto(
@@ -363,9 +369,10 @@ private fun normalizeLedgerResult(
 
 /**
  * Hydrator sweep counters added after the ledger started recording
- * (`stats_skipped_below_floor`, #432). Append-only, like the others.
+ * (`stats_skipped_below_floor`, #432; `quarantined`, the object-prefix
+ * check). Append-only, like the others.
  */
-private val HYDRATOR_COUNTERS_ADDED_LATER = listOf("stats_skipped_below_floor")
+private val HYDRATOR_COUNTERS_ADDED_LATER = listOf("stats_skipped_below_floor", "quarantined")
 
 /**
  * Compaction result counters added after the ledger started recording.
@@ -397,6 +404,7 @@ private val COMPACTION_COUNTERS_ADDED_LATER =
         "groups_retired",
         "files_unranged",
         "buckets_skipped_claimed",
+        "object_prefix_unresolvable",
     )
 
 /**

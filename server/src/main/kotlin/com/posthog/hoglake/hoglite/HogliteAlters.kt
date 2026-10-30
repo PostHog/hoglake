@@ -6,6 +6,7 @@ import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.Column
 import com.posthog.hoglake.model.ColumnStats
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.ObjectPrefix
 import com.posthog.hoglake.model.PartitionSpec
 import com.posthog.hoglake.model.SortSpec
 import com.posthog.hoglake.model.TableInfo
@@ -89,6 +90,21 @@ internal class HogliteAlters(
                     properties = t.properties,
                     spec = store.specAt(catalog, t.tableId, meta.head),
                     sortSpec = store.sortSpecAt(catalog, t.tableId, meta.head),
+                    // Pinned like the rest of the shape: setting it bumps
+                    // tables.schema_version, so the fence below refuses a
+                    // plan made against a stale value.
+                    objectPrefixFieldId = store.layoutAt(catalog, t.tableId, meta.head),
+                    // The spec-id allocator is MAX(spec_id) + 1 over EVERY
+                    // spec row, retired ones included (expiry never clears
+                    // them), so the receipt's id is planned from the same
+                    // max — pinned by the schema fence, which every spec
+                    // change bumps — not from the live spec's id.
+                    maxSpecId =
+                        store.queryCatalog(
+                            catalog,
+                            "SELECT COALESCE(MAX(spec_id), 0) FROM partition_specs WHERE table_id = ?",
+                            t.tableId,
+                        ).firstRow()!![0].asLong(),
                 )
 
             // The field-id allocator is planned LOCALLY across the ops of
@@ -200,6 +216,8 @@ internal class HogliteAlters(
                 partitionSpec = state.spec,
                 sortSpec = state.sortSpec,
                 snapshotId = snapshotId,
+                objectPrefixField =
+                    state.objectPrefixFieldId?.let { id -> state.cols.single { it.fieldId == id }.def.name },
             )
         }
 
@@ -225,6 +243,12 @@ internal class HogliteAlters(
         var properties: Map<String, String>,
         var spec: PartitionSpec?,
         var sortSpec: SortSpec?,
+        /** The object-prefix field's id (`table_layouts`); null = the option is off. */
+        var objectPrefixFieldId: Long?,
+        /** MAX(spec_id) over the table's spec rows as this alter has left them so far. */
+        var maxSpecId: Long,
+        /** Whether an earlier op of THIS alter inserted the live spec (begun at its snapshot). */
+        var specInsertedHere: Boolean = false,
     )
 
     private class Located(
@@ -250,6 +274,7 @@ internal class HogliteAlters(
             is AlterOp.RenameTable -> renameTable(tx, t, namespaceId, namespaceName, state, op)
             is AlterOp.SetPartitionSpec -> setPartitionSpec(tx, t, state, op)
             is AlterOp.SetSortOrder -> setSortOrder(tx, t, state, op)
+            is AlterOp.SetObjectPrefixField -> setObjectPrefixField(catalog, tx, t, state, op)
             is AlterOp.SetColumnComment -> {
                 TableMetadata.validateComment(op.comment)
                 val located = requireColumn(state, op.name)
@@ -375,6 +400,14 @@ internal class HogliteAlters(
             )
         }
         val doomed = col.selfAndDescendants().map { it.fieldId }.toSet()
+        // Ahead of the spec guard, which would also refuse it, for the
+        // message (AlterService.dropColumn).
+        if (state.objectPrefixFieldId?.let { it in doomed } == true) {
+            throw HoglakeException.Validation(
+                "cannot drop column '${op.name}': it is the table's object-prefix field, which every file's " +
+                    "path depends on and which cannot be unset",
+            )
+        }
         state.spec?.fields?.firstOrNull { it.sourceFieldId in doomed }?.let { f ->
             throw HoglakeException.Validation(
                 if (f.sourceFieldId == col.fieldId) {
@@ -416,6 +449,13 @@ internal class HogliteAlters(
         Identifiers.validateColumn(op.to)
         val located = requireColumn(state, op.from)
         val col = located.column
+        // The field's NAME is in every file's path (`<name>=<value>/`).
+        if (col.fieldId == state.objectPrefixFieldId) {
+            throw HoglakeException.Validation(
+                "cannot rename column '${op.from}': it is the table's object-prefix field, and its name is " +
+                    "part of every file's path",
+            )
+        }
         val siblings = located.parent?.children ?: state.cols
         if (siblings.any { it.def.name == op.to }) {
             val where = located.parent?.let { " of struct '${it.def.name}'" } ?: ""
@@ -545,6 +585,15 @@ internal class HogliteAlters(
         op: AlterOp.RenameTable,
     ) {
         Identifiers.validate("table", op.newName)
+        // The table's NAME is in every file's path
+        // (`<data_path>/data/<ns>/<table>/`), so a rename would strand them
+        // and hand the old prefix to whichever table takes the name next.
+        if (state.objectPrefixFieldId != null) {
+            throw HoglakeException.Validation(
+                "cannot rename table '${state.name}': it has the object-prefix layout, and its name is part of " +
+                    "every file's path",
+            )
+        }
         tx.expectZero(
             "SELECT COUNT(*) FROM table_versions WHERE namespace_id = ? AND name = ? " +
                 "AND end_snapshot IS NULL AND table_id <> ?",
@@ -573,12 +622,35 @@ internal class HogliteAlters(
         state: TableState,
         op: AlterOp.SetPartitionSpec,
     ) {
+        state.objectPrefixFieldId?.let { fieldId ->
+            if (ObjectPrefix.keyIndex(op.fields, fieldId) == null) {
+                val name = state.cols.single { it.fieldId == fieldId }.def.name
+                throw HoglakeException.Validation(
+                    "set_partition_spec must keep exactly one identity field on '$name' (field_id $fieldId): it " +
+                        "is the table's object-prefix field, and every file's path is named by its value",
+                )
+            }
+        }
         AlterService.validatePartitionFields(state.cols, op.fields)
+        // AlterService.endOrDeleteSpec: a spec begun by an earlier op of
+        // this same alter was never visible, so it is deleted (and its id
+        // freed for the next MAX + 1, as on Postgres); otherwise the live
+        // spec is ended. Ending a same-snapshot row instead would leave an
+        // empty interval and burn an id the Postgres path reuses.
+        tx.add(
+            "DELETE FROM partition_specs WHERE table_id = ? AND end_snapshot IS NULL " +
+                "AND begin_snapshot = ${HogliteSchema.HEAD_SQL}",
+            t.tableId,
+        )
         tx.add(
             "UPDATE partition_specs SET end_snapshot = ${HogliteSchema.HEAD_SQL} " +
                 "WHERE table_id = ? AND end_snapshot IS NULL",
             t.tableId,
         )
+        if (state.specInsertedHere) {
+            state.maxSpecId -= 1
+            state.specInsertedHere = false
+        }
         if (op.fields.isEmpty()) {
             state.spec = null
             return
@@ -591,8 +663,75 @@ internal class HogliteAlters(
             t.tableId,
             store.json.writeValueAsString(op.fields),
         )
-        // The new id is max+1 computed in-transaction; the receipt wants the value.
-        state.spec = PartitionSpec((state.spec?.specId ?: 0L) + 1, op.fields)
+        // The new id is max+1 computed in-transaction; the receipt wants the
+        // value, planned from the same max (see maxSpecId).
+        state.maxSpecId += 1
+        state.specInsertedHere = true
+        state.spec = PartitionSpec(state.maxSpecId, op.fields)
+    }
+
+    /**
+     * AlterService.setObjectPrefixField, ported: same rules, same order,
+     * same messages. The emptiness rule is read here for the refusal
+     * order AND re-asserted as an in-transaction guard: a commit landing
+     * between this read and the transaction would otherwise leave a file
+     * that predates the layout. (The converse race — a commit planned
+     * before the option and landing after — fails its per-table schema
+     * fence, which this alter bumps, and replans against the layout.)
+     */
+    private fun setObjectPrefixField(
+        catalog: String,
+        tx: HogliteTx,
+        t: HogliteCatalogStore.TableRow,
+        state: TableState,
+        op: AlterOp.SetObjectPrefixField,
+    ) {
+        val located = requireColumn(state, op.name)
+        val col = located.column
+        if (located.parent != null) {
+            throw HoglakeException.Validation(
+                "set_object_prefix_field: '${op.name}' is a nested field; the object-prefix field must be a " +
+                    "top-level column",
+            )
+        }
+        if (col.def.type !in ObjectPrefix.ALLOWED_TYPES) {
+            throw HoglakeException.Validation(
+                "set_object_prefix_field: '${op.name}' is '${col.def.type.wire}'; the object-prefix field must " +
+                    "be one of ${ObjectPrefix.ALLOWED_TYPES.map { it.wire }.sorted()}",
+            )
+        }
+        val current = state.objectPrefixFieldId
+        if (current == col.fieldId) return
+        if (current != null) {
+            val name = state.cols.single { it.fieldId == current }.def.name
+            throw HoglakeException.Validation(
+                "set_object_prefix_field: the table's object-prefix field is already '$name', and it cannot " +
+                    "be changed",
+            )
+        }
+        if (ObjectPrefix.keyIndex(state.spec?.fields.orEmpty(), col.fieldId) == null) {
+            throw HoglakeException.Validation(
+                "set_object_prefix_field: the partition spec must have exactly one identity field on " +
+                    "'${op.name}' (field_id ${col.fieldId}); set one first, in this request or an earlier one",
+            )
+        }
+        val notEmpty = {
+            HoglakeException.Validation(
+                "set_object_prefix_field: the table has live data files or deletion vectors; the option can " +
+                    "only be set on an empty table, so that no file predates the layout",
+            )
+        }
+        val live =
+            store.queryCatalog(catalog, TABLE_LIVE_OBJECTS_SQL, t.tableId, t.tableId).firstRow()!![0].asLong()
+        if (live > 0) throw notEmpty()
+        tx.expectZero(TABLE_LIVE_OBJECTS_SQL, t.tableId, t.tableId) { notEmpty() }
+        tx.add(
+            "INSERT INTO table_layouts(table_id, begin_snapshot, object_prefix_field_id) " +
+                "VALUES (?, ${HogliteSchema.HEAD_SQL}, ?)",
+            t.tableId,
+            col.fieldId,
+        )
+        state.objectPrefixFieldId = col.fieldId
     }
 
     private fun setSortOrder(
@@ -851,4 +990,11 @@ internal class HogliteAlters(
                 else -> c.copy(children = replaceNode(c.children, fieldId, transform))
             }
         }
+
+    private companion object {
+        /** setObjectPrefixField's emptiness probe: live data files plus live deletion vectors. */
+        const val TABLE_LIVE_OBJECTS_SQL =
+            "SELECT (SELECT COUNT(*) FROM files WHERE table_id = ? AND end_snapshot IS NULL) + " +
+                "(SELECT COUNT(*) FROM dvs WHERE table_id = ? AND end_snapshot IS NULL)"
+    }
 }

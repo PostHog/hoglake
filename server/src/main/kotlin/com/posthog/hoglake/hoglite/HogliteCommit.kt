@@ -1,10 +1,11 @@
 package com.posthog.hoglake.hoglite
 
+import com.fasterxml.jackson.module.kotlin.readValue
 import com.posthog.hoglake.commit.CommitService.Companion.BLIND_PARTITIONED_REFUSAL
 import com.posthog.hoglake.commit.CommitService.Companion.blindPartitionedRefusal
+import com.posthog.hoglake.commit.ObjectPrefixRules
 import com.posthog.hoglake.commit.commitFingerprint
 import com.posthog.hoglake.commit.commitFingerprintDigest
-import com.posthog.hoglake.commit.pathStaysUnder
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnStats
 import com.posthog.hoglake.model.CommitRequest
@@ -12,7 +13,11 @@ import com.posthog.hoglake.model.CommitResult
 import com.posthog.hoglake.model.DeleteFileRegistration
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.ObjectPrefix
+import com.posthog.hoglake.model.ObjectPrefixLayout
+import com.posthog.hoglake.model.PartitionFieldDef
 import com.posthog.hoglake.model.StatsSanity
+import com.posthog.hoglake.model.pathStaysUnder
 import com.posthog.hoglake.model.validateSplitOffsets
 import io.github.oshai.kotlinlogging.KotlinLogging
 import java.util.UUID
@@ -351,6 +356,79 @@ internal object HogliteCommit {
                     plannedDeletes += PlannedDelete(table, dv, stagedTarget = null)
                 }
             }
+        }
+
+        // The object-prefix layout (CommitService step 4a): on the
+        // SANITIZED stats, after the structural checks of appends and
+        // DVs alike, before claims. A table without the option skips it.
+        // The layout was read at head with the table; setting it bumps
+        // tables.schema_version, so the in-tx schema fence below replans
+        // a commit that planned against the option being off.
+        val layouts = HashMap<Long, ObjectPrefixLayout?>()
+
+        fun layoutFor(table: HogliteCatalogStore.TableRow): ObjectPrefixLayout? =
+            layouts.getOrPut(table.tableId) { layoutOf(store, catalog, table, meta.head) }
+
+        for (append in appends) {
+            val table = resolved.getValue("${append.namespace}.${append.table}")
+            val layout = layoutFor(table) ?: continue
+            val spec = store.specAt(catalog, table.tableId, meta.head)
+            val keyIndex = spec?.let { ObjectPrefix.keyIndex(it.fields, layout.fieldId) }
+            // The DDL keeps exactly one identity field on the prefix field
+            // in every spec while the option is on.
+            check(keyIndex != null) {
+                "${append.namespace}.${append.table} has the object-prefix layout on '${layout.fieldName}' but " +
+                    "its live spec has no single identity field on it"
+            }
+            val sanitized =
+                plannedAppends.filter { it.table.tableId == table.tableId }
+                    .map { it.file.copy(columnStats = it.sanitizedStats) }
+            val violations =
+                ObjectPrefixRules.appendViolations(
+                    sanitized,
+                    layout,
+                    keyIndex,
+                    append.namespace,
+                    append.table,
+                    meta.dataPath,
+                )
+            if (violations.isNotEmpty()) {
+                throw ObjectPrefixRules.violation(append.namespace, append.table, meta.dataPath, layout, violations)
+            }
+        }
+        // Deletion vectors on an option-on table live under their TARGET's
+        // prefix. Computed here from immutable facts (a staged target's
+        // planned values; a durable target's own spec and values), and
+        // raised by a guard AFTER every per-target guard in the
+        // transaction: CommitService checks DVs after their conflict and
+        // liveness checks, so a stale or unknown target still answers
+        // with those refusals first.
+        val dvViolations = LinkedHashMap<Long, MutableList<String>>()
+        for (p in plannedDeletes) {
+            val layout = layoutFor(p.table) ?: continue
+            val raw =
+                if (p.stagedTarget != null) {
+                    val target = plannedAppends[p.stagedTarget]
+                    val keyIndex =
+                        store.specAt(catalog, p.table.tableId, meta.head)
+                            ?.let { ObjectPrefix.keyIndex(it.fields, layout.fieldId) }
+                    keyIndex?.let { target.file.partitionValues?.getOrNull(it) }
+                } else {
+                    // A target that is missing or another table's is refused
+                    // by the in-tx guards, ahead of this check.
+                    val target =
+                        durableTarget(store, catalog, p.table.tableId, p.registration.dataFileId) ?: continue
+                    target.specFields?.let { ObjectPrefix.keyIndex(it, layout.fieldId) }
+                        ?.let { target.partitionValues?.getOrNull(it) }
+                }
+            ObjectPrefixRules.dvViolation(
+                p.registration,
+                raw,
+                layout,
+                p.table.namespace,
+                p.table.name,
+                meta.dataPath,
+            )?.let { dvViolations.getOrPut(p.table.tableId) { mutableListOf() } += it }
         }
 
         // Upload claims: only paths WITH a claim row are gated; an
@@ -772,6 +850,17 @@ internal object HogliteCommit {
             }
         }
 
+        // 6a. The DV object-prefix refusal, after every per-target guard
+        // above (CommitService throws it after its planDeletes loop, for
+        // the first table with violations).
+        dvViolations.entries.firstOrNull()?.let { (tableId, violations) ->
+            val table = resolved.values.first { it.tableId == tableId }
+            val layout = layouts.getValue(tableId)!!
+            tx.expectZero("SELECT ?", violations.size.toLong()) {
+                ObjectPrefixRules.violation(table.namespace, table.name, meta.dataPath, layout, violations)
+            }
+        }
+
         // 7. Upload claim settlement (the decision was pre-flight).
         // The settle re-asserts the FULL claim predicate — active AND
         // ours — so an abandonment or a fence that landed between
@@ -896,6 +985,62 @@ internal object HogliteCommit {
         /** Index into the commit's planned appends for a data_file_path reference; null for a durable target. */
         val stagedTarget: Int?,
     )
+
+    /**
+     * The table's object-prefix layout at [head], or null when the option
+     * is off: CommitService.layoutOf over `table_layouts` and the live
+     * columns. A layout row whose column is not a live top-level column of
+     * an allowed type is a broken invariant (the DDL refuses dropping,
+     * renaming, or promoting the field out of the allowed set): a 500,
+     * never a commit that silently skips the check.
+     */
+    private fun layoutOf(
+        store: HogliteCatalogStore,
+        catalog: String,
+        table: HogliteCatalogStore.TableRow,
+        head: Long,
+    ): ObjectPrefixLayout? {
+        val fieldId = store.layoutAt(catalog, table.tableId, head) ?: return null
+        val col = store.columnsAt(catalog, table.tableId, head).firstOrNull { it.fieldId == fieldId }
+        check(col != null && col.def.type in ObjectPrefix.ALLOWED_TYPES) {
+            "object-prefix field_id $fieldId of table_id=${table.tableId} is not a live column of an allowed " +
+                "type (name=${col?.def?.name}, type=${col?.def?.type?.wire})"
+        }
+        return ObjectPrefixLayout(fieldId, col.def.name, col.def.type)
+    }
+
+    /** A durable DV target's own spec fields and partition values, as the prefix check reads them. */
+    private class DurableTarget(
+        val specFields: List<PartitionFieldDef>?,
+        val partitionValues: List<String?>?,
+    )
+
+    /**
+     * [dataFileId]'s spec (its OWN, retired or not — expiry keeps every
+     * spec a file can name) and partition values, or null when it is not
+     * a file of [tableId] (the transaction's guards refuse that first).
+     * Both are immutable for a file id, so a pre-flight read is exact.
+     */
+    private fun durableTarget(
+        store: HogliteCatalogStore,
+        catalog: String,
+        tableId: Long,
+        dataFileId: Long,
+    ): DurableTarget? {
+        val row =
+            store.queryCatalog(
+                catalog,
+                "SELECT f.partition_values_json, s.fields_json FROM files f " +
+                    "LEFT JOIN partition_specs s ON s.table_id = f.table_id AND s.spec_id = f.spec_id " +
+                    "WHERE f.id = ? AND f.table_id = ?",
+                dataFileId,
+                tableId,
+            ).firstRow() ?: return null
+        return DurableTarget(
+            specFields = (row[1] as? String)?.let { store.json.readValue<List<PartitionFieldDef>>(it) },
+            partitionValues = (row[0] as? String)?.let { store.json.readValue<List<String?>>(it) },
+        )
+    }
 
     /** The tables a guarded request's CONTENT window covers: delete targets when requireUnchangedTables. */
     private fun unchangedIds(

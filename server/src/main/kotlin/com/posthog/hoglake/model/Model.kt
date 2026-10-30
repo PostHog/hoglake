@@ -638,6 +638,16 @@ sealed class AlterOp {
 
     /** Replace the sort order (empty list = unsorted). */
     data class SetSortOrder(val fields: List<SortFieldDef>) : AlterOp()
+
+    /**
+     * Turn on the object-prefix layout ([ObjectPrefix]) with the
+     * top-level integer column [name] as its field: from this snapshot
+     * on, every data file and deletion vector the table registers must
+     * live under `<table root><name>=<value>/`. Only on an EMPTY table
+     * whose spec has exactly one identity field on [name], and there is
+     * no unset: see AlterService.setObjectPrefixField.
+     */
+    data class SetObjectPrefixField(val name: String) : AlterOp()
 }
 
 data class CatalogInfo(
@@ -1001,6 +1011,15 @@ data class TableInfo(
     val partitionSpec: PartitionSpec? = null,
     /** Live sort order; null = unsorted. */
     val sortSpec: SortSpec? = null,
+    /**
+     * The object-prefix field's column NAME at the resolved snapshot
+     * (`hog_table_layout`), null when the option is off there. A writer
+     * reads it to learn that every file it registers must sit under
+     * `<table root><name>=<value>/` ([ObjectPrefix]); the name cannot
+     * change while the option is on, because renaming the column is
+     * refused.
+     */
+    val objectPrefixField: String? = null,
     val comment: String? = null,
     val properties: Map<String, String> = emptyMap(),
     /**
@@ -1776,6 +1795,22 @@ data class CompactionResult(
      */
     @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
     val bucketsSkippedClaimed: Long = 0,
+    /**
+     * Groups of a table with the object-prefix layout that the planner
+     * refused in METADATA, before any IO, because their prefix cannot be
+     * named: no partition spec, no single identity field on the prefix
+     * column in their spec, or a missing or non-canonical value there —
+     * or the layout itself cannot be resolved (its column is not live, or
+     * not of an allowed type), which refuses EVERY group of the table.
+     * The commit and DDL guards rule all four out through the API, so a
+     * nonzero value is a broken invariant or a row written around it; the
+     * group re-refuses every sweep until it is fixed by hand. Not charged
+     * to HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN, like [spillBudgetExceeded];
+     * also `hoglake_compaction_skipped_total{reason="object_prefix_unresolvable"}`.
+     * `NON_DEFAULT`, for [claimedElsewhere]'s stored-payload reason.
+     */
+    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    val objectPrefixUnresolvable: Long = 0,
 )
 
 /**
@@ -1811,6 +1846,16 @@ data class HydratorSweepResult(
      */
     @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
     val statsSkippedBelowFloor: Long = 0,
+    /**
+     * Of [hydrated], the files of a table with the object-prefix layout
+     * whose footer did not prove that every row holds the value their
+     * prefix names ([ObjectPrefix.checkFieldStats]): flipped to
+     * `provided` with `prefix_quarantined` set, below the floor or not.
+     * Always <= [hydrated]. Defaulted and NON_DEFAULT for
+     * [statsSkippedBelowFloor]'s reason.
+     */
+    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    val quarantined: Long = 0,
 )
 
 /** One cleanup drain's outcome. */
@@ -2479,6 +2524,10 @@ data class ChangesPlan(
 
 /** Service-level failures the API layer maps to status codes. */
 sealed class HoglakeException(message: String) : RuntimeException(message) {
+    class PartitionLookupInvalidRequest(detail: String) : HoglakeException(detail)
+
+    class PartitionLookupUnavailable(val reason: String, detail: String) : HoglakeException(detail)
+
     class NotFound(what: String) : HoglakeException(what)
 
     class AlreadyExists(what: String) : HoglakeException(what)
@@ -2695,4 +2744,27 @@ sealed class HoglakeException(message: String) : RuntimeException(message) {
      * answering, which an operator pages on differently.
      */
     class BackendUnavailable(detail: String) : HoglakeException(detail)
+
+    /**
+     * A commit to a table with the object-prefix layout registered a file
+     * the layout does not admit -> HTTP 422 `object_prefix_violation`,
+     * naming [table] and `retry: re-prepare`.
+     *
+     * Its own code rather than a [Validation], because the usual cause is
+     * not a malformed request but a writer that does not know the table
+     * has the option: one that strips `read_snapshot` (so no DDL arm can
+     * tell it the table changed) and writes under the table root. The
+     * detail names the expected prefix and up to five offending paths, and
+     * the code tells such a writer, without parsing prose, that replaying
+     * the payload cannot succeed: it has to re-read the table and write
+     * its files again under the prefix.
+     *
+     * Not a [CommitConflict] subclass: nothing raced the request, and no
+     * client should retry it as a conflict.
+     */
+    class ObjectPrefixViolation(
+        detail: String,
+        /** Qualified `namespace.table`. */
+        val table: String,
+    ) : HoglakeException(detail)
 }

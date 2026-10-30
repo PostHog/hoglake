@@ -143,11 +143,51 @@ class HogliteCatalogStore(
             } else {
                 freshTenant(catalog)
             }
+        // A tenant bootstrapped by an older binary gets the columns and
+        // tables added since, before anything reads them. Once per tenant
+        // per process; creating tenants run the current DDL instead.
+        if (!creating) ensureTenantSchema(tenant)
         val bindings =
             operationBindings.get()
                 ?: mutableMapOf<String, CatalogOperation>().also { operationBindings.set(it) }
         bindings[catalog] = CatalogOperation(tenant)
         return true
+    }
+
+    private val migratedTenants: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
+
+    /**
+     * Apply [HogliteSchema.TENANT_MIGRATIONS] to [tenant]: the tenant-side
+     * half of the migration path (the registry's is [ensureRegistry]).
+     * Each migration's applied-probe is its transaction's guard, so a
+     * migration already in (this pod earlier, another pod, or a tenant
+     * created with the current [HogliteSchema.DDL]) fails the guard and
+     * is skipped, and two pods racing it serialize on the tenant. The
+     * read-only probe first keeps the steady state at one query per
+     * migration per process. A tenant that is gone (404) is left to the
+     * operation itself, which reports the catalog missing; the tenant is
+     * not remembered, so a later incarnation of the name is still checked.
+     */
+    internal fun ensureTenantSchema(tenant: String) {
+        if (tenant in migratedTenants) return
+        try {
+            for (m in HogliteSchema.TENANT_MIGRATIONS) {
+                if (client.query(tenant, m.appliedProbe, emptyList()).firstRow()!![0].asLong() > 0) continue
+                val statements =
+                    listOf(HogliteStatement(m.appliedProbe, emptyList(), expectScalarInt = 0)) +
+                        m.statements.map { HogliteStatement(it) }
+                try {
+                    client.tx(tenant, freshTxid("tenant-migrate"), null, statements)
+                    log.info { "hoglite tenant $tenant: applied schema migration ${m.id}" }
+                } catch (_: HogliteGuardFailure) {
+                    // Applied concurrently since the probe.
+                }
+            }
+        } catch (r: HogliteRejected) {
+            if (r.status == 404) return
+            throw r
+        }
+        migratedTenants.add(tenant)
     }
 
     @PublishedApi
@@ -763,12 +803,13 @@ class HogliteCatalogStore(
                     fileSizeBytes = row[2].asLong()
                 }
             }
+            val columns = columnsAt(catalog, t.tableId, at)
             return TableInfo(
                 tableId = t.tableId,
                 tableUuid = t.tableUuid,
                 namespace = namespace,
                 name = table,
-                columns = columnsAt(catalog, t.tableId, at),
+                columns = columns,
                 readSnapshotId = at,
                 recordCount = recordCount,
                 fileCount = fileCount,
@@ -777,6 +818,13 @@ class HogliteCatalogStore(
                 sortSpec = sortSpecAt(catalog, t.tableId, at),
                 comment = t.comment,
                 properties = t.properties,
+                // The option as it was at `at`, named by the column at `at`
+                // (CatalogService.getTable): the field is top-level and can
+                // be neither dropped nor renamed while the option is on.
+                objectPrefixField =
+                    layoutAt(catalog, t.tableId, at)?.let { id ->
+                        columns.single { it.fieldId == id }.def.name
+                    },
             )
         }
 
@@ -1845,6 +1893,41 @@ class HogliteCatalogStore(
         ).firstRow()?.let { r ->
             SortSpec(r[0].asLong(), json.readValue<List<SortFieldDef>>(r[1].asString()), r[2].asLong())
         }
+
+    /**
+     * The table's object-prefix field id visible at [at] (`table_layouts`,
+     * Postgres's LayoutRepo.layoutAt), or null when the option is off there.
+     */
+    internal fun layoutAt(
+        catalog: String,
+        tableId: Long,
+        at: Long,
+    ): Long? =
+        queryCatalog(
+            catalog,
+            "SELECT object_prefix_field_id FROM table_layouts WHERE table_id = ? " +
+                "AND begin_snapshot <= ? AND (end_snapshot IS NULL OR end_snapshot > ?)",
+            tableId,
+            at,
+            at,
+        ).firstRow()?.get(0)?.asLong()
+
+    /** table_id -> live object-prefix field id, for every table whose option is on at head (LayoutRepo.live). */
+    internal fun liveLayouts(catalog: String): Map<Long, Long> =
+        queryCatalog(
+            catalog,
+            "SELECT table_id, object_prefix_field_id FROM table_layouts WHERE end_snapshot IS NULL",
+        ).rows.associate { it[0].asLong() to it[1].asLong() }
+
+    /**
+     * The tenant the CURRENT operation on [catalog] is bound to. Only
+     * valid inside [catalogOperation]; a value derived from it (a cursor
+     * scope) is therefore scoped to that one incarnation of the name.
+     */
+    internal fun boundTenant(catalog: String): String =
+        checkNotNull(operationBindings.get()?.get(catalog)) {
+            "catalog '$catalog' has no operation binding"
+        }.tenant
 
     /** A file row plus its stored payloads, before per-endpoint projection. */
     internal class FileRow(

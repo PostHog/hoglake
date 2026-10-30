@@ -1,9 +1,11 @@
 package com.posthog.hoglake
 
+import com.posthog.hoglake.observability.metricsListener
 import io.github.oshai.kotlinlogging.KotlinLogging
 import io.ktor.server.engine.connector
 import io.ktor.server.engine.embeddedServer
 import io.ktor.server.netty.Netty
+import io.ktor.server.netty.NettyApplicationEngine
 
 private val log = KotlinLogging.logger {}
 
@@ -15,6 +17,11 @@ private val log = KotlinLogging.logger {}
  */
 private const val SHUTDOWN_GRACE_MS = 3_000L
 private const val SHUTDOWN_TIMEOUT_MS = 10_000L
+
+internal fun NettyApplicationEngine.Configuration.configureApiListener(cfg: Config) {
+    connector { port = cfg.port }
+    callGroupSize = cfg.nettyCallGroupSize
+}
 
 fun main() {
     val cfg = Config.fromEnv()
@@ -66,10 +73,15 @@ fun main() {
             // group keeps Ktor's own default on purpose; see
             // Config.nettyCallGroupSize.
             configure = {
-                connector { port = cfg.port }
-                callGroupSize = cfg.nettyCallGroupSize
+                configureApiListener(cfg)
             },
         ) { app.module(this) }
+    val metricsServer =
+        cfg.metricsPort.takeIf { it > 0 }?.let { metricsPort ->
+            embeddedServer(Netty, configure = { connector { port = metricsPort } }) {
+                metricsListener(app.meterRegistry)
+            }
+        }
 
     // ORDER IS THE POINT, and what it buys is narrower than "nothing is
     // interrupted". Stopping the ENGINE first stops new calls arriving
@@ -88,10 +100,16 @@ fun main() {
         Thread({
             runCatching { server.stop(SHUTDOWN_GRACE_MS, SHUTDOWN_TIMEOUT_MS) }
                 .onFailure { log.warn(it) { "engine shutdown failed; closing the rest anyway" } }
+            runCatching { metricsServer?.stop(0, SHUTDOWN_TIMEOUT_MS) }
+                .onFailure { log.warn(it) { "metrics listener shutdown failed" } }
             background.close()
             app.close()
         }, "hoglake-shutdown"),
     )
+    metricsServer?.let {
+        it.start(wait = false)
+        log.info { "hoglake metrics listener on :${cfg.metricsPort}" }
+    }
     log.info { "hoglake listening on :${cfg.port}" }
     server.start(wait = true)
 }

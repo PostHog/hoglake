@@ -7,8 +7,11 @@ import com.posthog.hoglake.model.CommitResult
 import com.posthog.hoglake.model.DeleteFileRegistration
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.ObjectPrefix
+import com.posthog.hoglake.model.ObjectPrefixLayout
 import com.posthog.hoglake.model.StatsSanity
 import com.posthog.hoglake.model.TableAppend
+import com.posthog.hoglake.model.pathStaysUnder
 import com.posthog.hoglake.model.validateFooterSize
 import com.posthog.hoglake.model.validateSplitOffsets
 import com.posthog.hoglake.observability.Audit
@@ -321,9 +324,15 @@ class CommitService(
     ) {
         val request = CommitRequest(appends = listOf(TableAppend(namespace, table, files)))
         validatePathsUnderDataPath(dataPath, request)
+        // No object-prefix layout, and none to read: the table was created
+        // in THIS transaction, a creation definition cannot carry the
+        // option, and replacing a table that has it is refused at prepare
+        // (TableCreationService.prepare, with CatalogService.createTable as
+        // the backstop). So the layout check is skipped here by
+        // construction, not by omission.
         val append =
             validateFiles(
-                ResolvedAppend(namespace, table, tableId, files, liveSpec(h, catalogId, tableId)),
+                ResolvedAppend(namespace, table, tableId, files, liveSpec(h, catalogId, tableId), layout = null),
                 liveColumnTypes(h, catalogId, tableId),
             )
         com.posthog.hoglake.service.UploadService.register(h, catalogId, uploadOwner, files.map { it.path to "data" })
@@ -419,7 +428,18 @@ class CommitService(
         val files: List<FileRegistration>,
         /** Live spec with >= 1 field, or null for an unpartitioned table. */
         val spec: LiveSpec?,
+        /** The table's object-prefix layout, or null when the option is off. */
+        val layout: ResolvedLayout?,
     )
+
+    /**
+     * An appended table's object-prefix layout as the commit read returned
+     * it, with the key_index of the identity field on the prefix field in
+     * the live spec: null when the spec has none or several, which the DDL
+     * makes impossible and [checkObjectPrefix] reports as a broken
+     * invariant.
+     */
+    private data class ResolvedLayout(val layout: ObjectPrefixLayout, val keyIndex: Int?)
 
     /** The targeted data file's row, as [planDeletes]'s per-target checks need it. */
     private data class DeleteTarget(
@@ -435,6 +455,8 @@ class CommitService(
         val table: String,
         val tableId: Long,
         val files: List<DeleteFileRegistration>,
+        /** The table's object-prefix layout, or null when the option is off. */
+        val layout: ObjectPrefixLayout?,
     )
 
     /**
@@ -621,15 +643,20 @@ class CommitService(
                 val rows = resolveGuarded(key)
                 val live = rows.first()
                 nextRowIds[live.tableId] = live.nextRowId
-                ResolvedAppend(namespace, table, live.tableId, files, liveSpec(rows))
+                val layout = layoutOf(live)?.let { ResolvedLayout(it, live.prefixKeyIndexes?.singleOrNull()) }
+                ResolvedAppend(namespace, table, live.tableId, files, liveSpec(rows), layout)
             }
-        val appendTableIdByName =
-            resolvedAppends.associate { (it.namespace to it.table) to it.tableId }
+        val appendByName = resolvedAppends.associateBy { it.namespace to it.table }
         val resolvedDeletes =
             mergedDeletes.map { (key, files) ->
                 val (namespace, table) = key
-                val tableId = appendTableIdByName[key] ?: resolveGuarded(key).first().tableId
-                ResolvedDeletes(namespace, table, tableId, files)
+                val appended = appendByName[key]
+                if (appended != null) {
+                    ResolvedDeletes(namespace, table, appended.tableId, files, appended.layout?.layout)
+                } else {
+                    val live = resolveGuarded(key).first()
+                    ResolvedDeletes(namespace, table, live.tableId, files, layoutOf(live))
+                }
             }
 
         // The second thing read_snapshot is REQUIRED for, and the reason
@@ -763,6 +790,11 @@ class CommitService(
         // sanitizes each file's stats (StatsSanity).
         val validatedAppends = resolvedAppends.map { validateFiles(it, read.columns[it.tableId].orEmpty()) }
         validateDeleteRegistrations(resolvedDeletes)
+        // 4a. The object-prefix layout, on the SANITIZED stats, and after
+        // the structural checks: a malformed file is malformed whatever
+        // the table's layout. A table without the option skips it whole.
+        // Its DVs are checked in planDeletes, after their conflicts.
+        validatedAppends.forEach { checkObjectPrefix(it, dataPath) }
 
         // 4b. Upload claims, then the removal-queue collision check, and
         // THE LATTER IS THE SERIALIZER NOW RATHER THAN THE COMMIT LOCK:
@@ -814,7 +846,16 @@ class CommitService(
         // statement that writes them.
         val (appendRows, firstDeleteFileId) = planAppends(validatedAppends, firstFileId) { nextRowIds[it] }
         val deleteRows =
-            planDeletes(resolvedDeletes, readSnapshot, snapshotId, firstDeleteFileId, appendRows.files, read)
+            planDeletes(
+                resolvedDeletes,
+                readSnapshot,
+                snapshotId,
+                firstDeleteFileId,
+                appendRows.files,
+                stagedPrefixValues(validatedAppends, appendRows),
+                read,
+                dataPath,
+            )
 
         // snapshot_time = clock_timestamp(), NOT the column default now():
         // now() is the TRANSACTION start time, which predates the advisory
@@ -1124,6 +1165,14 @@ class CommitService(
      * rejected by its begin_snapshot, or — a transaction's reference by
      * path — resolved to it. hog_table_stats is deliberately untouched
      * (see class KDoc).
+     *
+     * On a table with the object-prefix layout every DV must also sit
+     * under its TARGET's prefix: the value is the target's identity
+     * partition value on the prefix field, from [stagedPrefixValues] for a
+     * same-commit target and from the read for a numeric one. Checked
+     * after every other per-target check, so a stale vector or a retired
+     * target still answers its retryable 409 first, and refused for the
+     * whole commit once the loop is done, naming up to five DVs.
      */
     private fun planDeletes(
         resolved: List<ResolvedDeletes>,
@@ -1131,7 +1180,10 @@ class CommitService(
         snapshotId: Long,
         firstFileId: Long,
         appended: List<CommitTail.DataFileRow>,
+        /** data_file_id -> planned prefix value of this commit's appends to tables with the option. */
+        stagedPrefixValues: Map<Long, String?>,
         read: CommitTail.ReadSet,
+        dataPath: String,
     ): CommitTail.DeleteRows {
         if (resolved.isEmpty()) return CommitTail.DeleteRows(emptyList(), emptyList())
         checkNotNull(readSnapshot) { "deletes require a readSnapshot (validated earlier)" }
@@ -1140,6 +1192,8 @@ class CommitService(
         var nextFileId = firstFileId
         val ended = ArrayList<Long>()
         val files = ArrayList<CommitTail.DeleteFileRow>()
+        // By table_id, in request order: the first table's are refused.
+        val prefixViolations = LinkedHashMap<Long, MutableList<String>>()
         for (deletes in resolved) {
             val qualified = "${deletes.namespace}.${deletes.table}"
             for (registration in deletes.files) {
@@ -1242,6 +1296,17 @@ class CommitService(
                     }
                     ended += current.deleteFileId
                 }
+                deletes.layout?.let { layout ->
+                    val raw =
+                        if (reg.dataFileId in appendedById) {
+                            stagedPrefixValues[reg.dataFileId]
+                        } else {
+                            read.targets[reg.dataFileId]?.prefixValues?.singleOrNull()
+                        }
+                    dvPrefixViolation(reg, raw, layout, deletes, dataPath)?.let {
+                        prefixViolations.getOrPut(deletes.tableId) { mutableListOf() } += it
+                    }
+                }
                 files +=
                     CommitTail.DeleteFileRow(
                         deleteFileId = nextFileId++,
@@ -1253,8 +1318,31 @@ class CommitService(
                     )
             }
         }
+        prefixViolations.entries.firstOrNull()?.let { (tableId, violations) ->
+            val deletes = resolved.first { it.tableId == tableId }
+            throw objectPrefixViolation(deletes.namespace, deletes.table, dataPath, deletes.layout!!, violations)
+        }
         return CommitTail.DeleteRows(ended, files)
     }
+
+    /**
+     * Why one DV registration breaks its table's object-prefix layout, or
+     * null when it does not: its target has no canonical value for the
+     * field (fail closed — every live file of a table with the option was
+     * registered with one, and expiry keeps the partition spec it names
+     * (`ExpiryService.VERSIONED_TABLES_NEVER_CLEARED`), so this is a broken
+     * invariant or a foreign row), or the DV is not under the target's
+     * prefix. The latter is the
+     * DuckDB extension's shape today, a DV at the table root
+     * (`hoglake-dv-<uuid>.puffin`).
+     */
+    private fun dvPrefixViolation(
+        reg: DeleteFileRegistration,
+        raw: String?,
+        layout: ObjectPrefixLayout,
+        deletes: ResolvedDeletes,
+        dataPath: String,
+    ): String? = ObjectPrefixRules.dvViolation(reg, raw, layout, deletes.namespace, deletes.table, dataPath)
 
     /**
      * The refusal for a commit whose table did not resolve live: a
@@ -1311,6 +1399,100 @@ class CommitService(
                 "no longer part of the catalog and are being retired",
         )
     }
+
+    /**
+     * The read's object-prefix layout for one resolved table, or null when
+     * the option is off. A layout row whose column is not live, or whose
+     * type is not an allowed one, is a broken invariant (the DDL refuses
+     * dropping, renaming or promoting the field out of the allowed set),
+     * so it is a 500 rather than a commit that silently skips the check.
+     */
+    private fun layoutOf(row: CommitTail.ResolvedTable): ObjectPrefixLayout? {
+        val fieldId = row.prefixFieldId ?: return null
+        val name = row.prefixFieldName
+        val type = row.prefixColType?.let { ColType.fromWire(it) }
+        check(name != null && type != null && type in ObjectPrefix.ALLOWED_TYPES) {
+            "object-prefix field_id $fieldId of table_id=${row.tableId} is not a live column of an allowed " +
+                "type (name=$name, type=${row.prefixColType})"
+        }
+        return ObjectPrefixLayout(fieldId, name, type)
+    }
+
+    /**
+     * The planned value of the prefix field for every file this commit
+     * appends to a table with the object-prefix option, by data_file_id:
+     * what a transaction's DV on its own staged file is checked against.
+     */
+    private fun stagedPrefixValues(
+        appends: List<ResolvedAppend>,
+        rows: CommitTail.AppendRows,
+    ): Map<Long, String?> {
+        val keyByTable = appends.mapNotNull { a -> a.layout?.keyIndex?.let { a.tableId to it } }.toMap()
+        if (keyByTable.isEmpty()) return emptyMap()
+        val tableOf = rows.files.associate { it.dataFileId to it.tableId }
+        return rows.partitionValues
+            .filter { keyByTable[tableOf[it.dataFileId]] == it.keyIndex }
+            .associate { it.dataFileId to it.value }
+    }
+
+    /**
+     * The object-prefix layout's commit rule for one append
+     * ([ObjectPrefix]), on the files [validateFiles] returned — SANITIZED,
+     * because StatsSanity drops a bound it cannot decode and a dropped
+     * bound proves nothing. On a table with the option every file must:
+     *
+     *  - carry a canonical value for the prefix field at its identity
+     *    key_index ([ObjectPrefix.parseValue]: no sign, no leading zero,
+     *    ASCII digits, in the column type's range), so a null value,
+     *    `"042"`, `"+4"` and an out-of-range value are all refused;
+     *  - sit under that value's prefix ([ObjectPrefix.isUnder]), which is
+     *    what keeps `team_id=4/` from admitting `team_id=42/`;
+     *  - prove with its inline stats that every row holds the value
+     *    ([ObjectPrefix.checkFieldStats]: both bounds equal to it, no
+     *    nulls). A zero-row file therefore cannot register, since its
+     *    bounds are dropped. A file with DEFERRED stats has none to prove
+     *    it with: it registers `pending`, and the hydrator makes the same
+     *    proof from its footer, quarantining a file that fails it
+     *    (`hog_data_file.prefix_quarantined`). A pending file is outside
+     *    a per-value read until then, by its state.
+     *
+     * Violations are collected rather than thrown at the first, so the
+     * one 422 names up to five paths, each with the prefix it should have
+     * been under.
+     */
+    private fun checkObjectPrefix(
+        append: ResolvedAppend,
+        dataPath: String,
+    ) {
+        val (layout, keyIndex) = append.layout ?: return
+        // The DDL keeps exactly one identity field on the prefix field in
+        // every spec while the option is on (AlterService.setPartitionSpec),
+        // so anything else is a broken invariant, not a client error.
+        check(append.spec != null && keyIndex != null) {
+            "${append.namespace}.${append.table} has the object-prefix layout on '${layout.fieldName}' but its " +
+                "live spec has no single identity field on it"
+        }
+        val violations =
+            ObjectPrefixRules.appendViolations(append.files, layout, keyIndex, append.namespace, append.table, dataPath)
+        if (violations.isNotEmpty()) {
+            throw objectPrefixViolation(append.namespace, append.table, dataPath, layout, violations)
+        }
+    }
+
+    /**
+     * The 422 for [violations] (one entry per offending path, with its
+     * reason) on [namespace].[table]: the first five, the count of the
+     * rest, and the layout a writer has to follow, so one that did not
+     * know the table has the option learns where its files belong.
+     */
+    private fun objectPrefixViolation(
+        namespace: String,
+        table: String,
+        dataPath: String,
+        layout: ObjectPrefixLayout,
+        violations: List<String>,
+    ): HoglakeException.ObjectPrefixViolation =
+        ObjectPrefixRules.violation(namespace, table, dataPath, layout, violations)
 
     /**
      * The table's live partition spec, or null when unpartitioned. A spec
@@ -1674,28 +1856,3 @@ class CommitService(
         }
     }
 }
-
-/**
- * A literal startsWith is not enough: `s3://b/demo/../victim/x` starts
- * with `s3://b/demo/` but some reader stacks normalize dot segments,
- * re-addressing the object OUTSIDE the prefix. Whitespace/control
- * characters are refused outright (they survive into removal-queue
- * rows and reader URIs), as are empty and dot segments. So are their
- * ENCODED spellings — `%2E`, `%2F` — and backslashes: S3 stores them
- * literally, but this check is the only tenant boundary the maintenance
- * plane has (it runs under one IAM identity for every tenant), and it must
- * not depend on no reader stack ever decoding a key.
- */
-internal fun pathStaysUnder(
-    path: String,
-    prefix: String,
-): Boolean {
-    if (!path.startsWith(prefix)) return false
-    if (path.any { it.isWhitespace() || it.isISOControl() || it == '\\' }) return false
-    if (ENCODED_DOT_OR_SLASH.containsMatchIn(path)) return false
-    val relative = path.removePrefix(prefix)
-    if (relative.isEmpty()) return false
-    return relative.split('/').none { it.isEmpty() || it == "." || it == ".." }
-}
-
-private val ENCODED_DOT_OR_SLASH = Regex("%2[eEfF]")

@@ -88,6 +88,18 @@ internal class HogliteTableCreations(
                 if (target?.tableUuid != it.expectedTableUuid) {
                     throw HoglakeException.CommitConflict("replacement target does not match read snapshot")
                 }
+                // TableCreationService.prepare: no receipt is ever prepared
+                // for a replacement no definition could publish. Live at head
+                // is sound because the option has no unset; a set after the
+                // read snapshot is `target_changed` at publish, and publish's
+                // definition check below is the backstop.
+                if (target != null && store.liveLayouts(catalog).containsKey(target.tableId)) {
+                    throw HoglakeException.Validation(
+                        "cannot replace table '${definition.namespace}.${definition.name}': it has the " +
+                            "object-prefix layout (object_prefix_field), which a replacement would not carry " +
+                            "over; drop the table and create it instead",
+                    )
+                }
             }
             // The receipt's write path carries a server-generated identity:
             // even a future catalog recreation and reused operation id
@@ -307,6 +319,21 @@ internal class HogliteTableCreations(
                 com.posthog.hoglake.service.ColumnTrees.validate(definition.columns)
                 AlterService.validatePartitionFields(cols, definition.partitionFields)
                 AlterService.validateSortFields(cols, definition.sortFields)
+                // CatalogService.createTable's backstop: replacing a table
+                // with the object-prefix layout would mint an incarnation
+                // without it under the same path scope. Reaching here means
+                // the receipt was prepared without prepare's check (an older
+                // binary); rejected, never left prepared. The layout cannot
+                // be set between this read and the transaction without a
+                // `table_altered` change, which the guard above refuses.
+                val replacingLayoutTable =
+                    replacement != null && target != null && store.liveLayouts(catalog).containsKey(target[0].asLong())
+                if (replacingLayoutTable) {
+                    throw HoglakeException.Validation(
+                        "cannot replace table '${definition.namespace}.${definition.name}': it has the " +
+                            "object-prefix layout, which a replacement would not carry over",
+                    )
+                }
             } catch (e: HoglakeException.Validation) {
                 val tx = HogliteTx()
                 tx.add(

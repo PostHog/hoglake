@@ -344,7 +344,8 @@ object FuzzSeedGenerator {
                        {"op":"set_partition_spec","fields":[
                           {"source_field_id":1,"transform":"day"}]},
                        {"op":"set_sort_order","sort_fields":[
-                          {"source_field_id":1,"direction":"asc","null_order":"nulls_last"}]}]}""",
+                          {"source_field_id":1,"direction":"asc","null_order":"nulls_last"}]},
+                       {"op":"set_object_prefix_field","name":"team_id"}]}""",
                 "alter_unknown_op" to """{"ops":[{"op":"explode"}]}""",
                 // A variant's shredded layout, which a definition carries in
                 // type_params and which the target checks as the DDL paths

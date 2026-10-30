@@ -41,6 +41,62 @@ internal object HogliteSchema {
     /** head = next_snapshot - 1, as an SQL expression over the meta row. */
     const val HEAD_SQL = "(SELECT next_snapshot - 1 FROM meta WHERE id = 1)"
 
+    /*
+     * The object-prefix layout (`set_object_prefix_field`), Postgres V29's
+     * hog_table_layout: versioned like the spec rows, at most one live row
+     * per table (the unique partial index). No unset op exists, so nothing
+     * ends a row today; expiry clears ended rows like the other versioned
+     * definitions, and the dropped-table purge deletes a purged table's rows.
+     */
+    const val TABLE_LAYOUTS_DDL =
+        """CREATE TABLE IF NOT EXISTS table_layouts(
+                table_id INTEGER NOT NULL,
+                begin_snapshot INTEGER NOT NULL,
+                end_snapshot INTEGER,
+                object_prefix_field_id INTEGER NOT NULL,
+                PRIMARY KEY(table_id, begin_snapshot)
+            )"""
+
+    const val TABLE_LAYOUTS_LIVE_DDL =
+        "CREATE UNIQUE INDEX IF NOT EXISTS table_layouts_live ON table_layouts(table_id) WHERE end_snapshot IS NULL"
+
+    /**
+     * One upgrade of a tenant bootstrapped by an older binary. [DDL] is
+     * what a NEW tenant gets; a tenant created before a schema change
+     * never re-runs it, so every column or table added after the first
+     * release is ALSO listed here and applied by
+     * [HogliteCatalogStore.ensureTenantSchema] on the first catalog
+     * operation of each process. [appliedProbe] is a `SELECT COUNT(*)`
+     * over sqlite_master that reads 1 once the change is in; it runs as
+     * the transaction's own guard (statement 0, expect zero), so two pods
+     * racing the same upgrade serialize on the tenant and the loser's
+     * guard fails instead of its ALTER (SQLite has no `ADD COLUMN IF NOT
+     * EXISTS`, and PRAGMA is off both API paths).
+     */
+    class TenantMigration(
+        val id: String,
+        val appliedProbe: String,
+        val statements: List<String>,
+    )
+
+    val TENANT_MIGRATIONS: List<TenantMigration> =
+        listOf(
+            TenantMigration(
+                "table_layouts",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'table_layouts_live'",
+                listOf(TABLE_LAYOUTS_DDL, TABLE_LAYOUTS_LIVE_DDL),
+            ),
+            // Postgres V30's hog_data_file.prefix_quarantined: the hydrator's
+            // object-prefix quarantine flag. 0 for every existing row, which
+            // is true of them: none was hydrated against a layout before.
+            TenantMigration(
+                "files.prefix_quarantined",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'files' " +
+                    "AND sql LIKE '%prefix_quarantined%'",
+                listOf("ALTER TABLE files ADD COLUMN prefix_quarantined INTEGER NOT NULL DEFAULT 0"),
+            ),
+        )
+
     val DDL: List<String> =
         listOf(
             """CREATE TABLE IF NOT EXISTS meta(
@@ -147,6 +203,16 @@ internal object HogliteSchema {
                 end_snapshot INTEGER,
                 PRIMARY KEY(table_id, spec_id)
             )""",
+            /*
+             * The object-prefix layout (`set_object_prefix_field`), Postgres
+             * V29's hog_table_layout: versioned like the spec rows, at most
+             * one live row per table (the unique partial index). No unset op
+             * exists, so nothing ends a row today; expiry clears ended rows
+             * like the other versioned definitions, and the dropped-table
+             * purge deletes a purged table's rows.
+             */
+            TABLE_LAYOUTS_DDL,
+            TABLE_LAYOUTS_LIVE_DDL,
             """CREATE TABLE IF NOT EXISTS table_totals(
                 table_id INTEGER PRIMARY KEY,
                 record_count INTEGER NOT NULL DEFAULT 0,
@@ -192,7 +258,8 @@ internal object HogliteSchema {
                 split_offsets_json TEXT,
                 missing_field_ids INTEGER NOT NULL DEFAULT 0,
                 begin_snapshot INTEGER NOT NULL,
-                end_snapshot INTEGER
+                end_snapshot INTEGER,
+                prefix_quarantined INTEGER NOT NULL DEFAULT 0
             )""",
             "CREATE INDEX IF NOT EXISTS files_table ON files(table_id, begin_snapshot)",
             """CREATE TABLE IF NOT EXISTS dvs(

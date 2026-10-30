@@ -34,8 +34,10 @@ reads and writes data files — always outside the commit path).
 
 `GET /v1/catalogs/{catalog}/storage-usage` returns
 `{"tracked_bytes":"1234","pending_delete_files":"2"}`: **decimal int64 strings**,
-so a client must parse them losslessly. The existing v1 API has no application
-authentication; keep the service **network-private**, never expose this route
+so a client must parse them losslessly. Application authentication is optional
+(`HOGLAKE_AUTH_MODE`, default `off`); under `enforce` this route needs `read` on
+the catalog, and a catalog the caller is not entitled to is 404. Under `off`, keep
+the service **network-private**, never expose this route
 publicly, and resolve a caller's catalog through the consuming service's own
 tenant authorization. Database predicates are bound to the resolved catalog id.
 
@@ -80,9 +82,9 @@ has the reasoning for each precondition and for what is left to cascade.
 
 ## The data model
 
-Everything hangs off five ideas (`db/migration/V1__init.sql`, mirrored
-by the canonical `schema.sql`; an integration test asserts the two
-stay structurally identical):
+Everything hangs off five ideas (`db/migration/V1__init.sql` onward;
+the canonical `schema.sql` is the fold of the whole migration chain, and an
+integration test asserts the two stay structurally identical):
 
 **Snapshots are the clock.** Every mutation — DDL, append, delete —
 commits exactly one `hog_snapshot` row with a **dense, per-catalog
@@ -100,8 +102,11 @@ or blank field returns 422 naming it before mutation. DELETE routes take query
 parameters; truncate takes a JSON body and retains its mandatory UUID guard.
 Retention reductions also require both, including enabling finite retention from
 unlimited retention. Options patches are audited without creating a snapshot.
-Audit `actor` matches the author and `operation_message` carries the reason;
-these fields describe caller attribution, not an authenticated identity.
+Audit `actor` matches the author and `operation_message` carries the reason.
+Under `HOGLAKE_AUTH_MODE=off` these fields are caller attribution, not an
+authenticated identity; with a token (`warn`/`enforce`) `author` is filled from
+the token's actor or checked against it — a mismatch is 422, unless the token
+delegates, in which case it is recorded as `<author> via <token actor>`.
 Blank includes Unicode space characters and NEXT LINE (U+0085), matching Python.
 Atomic definitions carrying attribution use durable format v7; older servers
 cannot read those receipts. Complete the server rollout before preparing attributed
@@ -246,7 +251,9 @@ claim runs under its own savepoint and timeout — a catalog whose claim
 is slow (a dropped table's pending backlog, walked and discarded until
 retirement deletes it) loses its share and is counted
 (`hoglake_hydrator_claim_timeouts_total{catalog}`); no other catalog
-waits on it.
+waits on it. On a table with the object-prefix layout the sweep also
+checks the footer against the file's prefix value and quarantines a file
+it does not prove (see Partitioning).
 
 The hydrator has a **size floor for stats rows** (#432):
 `HOGLAKE_HYDRATOR_MIN_FILE_BYTES`, default 1 MiB, 0 = rows for every
@@ -269,7 +276,9 @@ outputs), millpond's stray-day files are ~0.1 MB, and the stats table
 was 136 GB of the RDS volume; 24.7M × 26 is ~642M rows the floor spares.
 The footer GET and the one `UPDATE` per file stay, at today's rate. What
 the under-floor read buys is the field-id audit flag
-(`missing_field_ids`) and `split_offsets`; it no longer unblocks any DDL,
+(`missing_field_ids`) and `split_offsets`, and on a table with the
+object-prefix layout the prefix proof (see Partitioning), which is why
+that GET is not optional there; it no longer unblocks any DDL,
 because the guard below stopped refusing over `pending` files (#445).
 
 For a writer, **deferring has one cost and one upside**. A deferred file
@@ -489,19 +498,111 @@ This is the one deliberate waiver of the server-validates-structure
 rule; registration *paths*, by contrast, are validated against the
 catalog's `data_path` prefix at commit.
 
+**Object-prefix layout** (`set_object_prefix_field`, V29
+`hog_table_layout`, capability `object-prefix-layout-v1`): a table may
+name a top-level integer column (int8 to long, uint8 to uint32; not
+uint64) whose identity partition value names every file's prefix,
+`<data_path>/data/<ns>/<table>/<field>=<value>/`, so one IAM statement on
+that prefix grants exactly one value's objects (`model/ObjectPrefix.kt`
+holds the path function; `pyhoglake/tests/vectors/object_prefix_vectors.json`
+holds the vectors it and any writer are held to). With the option on,
+the commit refuses (422 `object_prefix_violation`, naming the expected
+prefix, up to five paths, `tables` and `retry: re-prepare`) a data file
+whose value is missing or not canonical (`042`, `+4`, out of range),
+that is not under its value's prefix, or whose inline stats do not prove
+every row holds the value (both bounds equal to it, `null_count` 0); and
+a deletion vector that is not under its target's prefix. Here the
+partition value is checked, not trusted: the stats are the proof,
+because the prefix is a tenant boundary. A file with DEFERRED stats is
+held to the path and value rules at commit and registers `pending`; the
+hydrator makes the stats proof from its footer, before the size floor,
+and a file whose footer does not prove it (another value's rows in any
+row group, nulls, a bound the footer cannot state, the column absent)
+still flips to `provided` with its stats but with
+`hog_data_file.prefix_quarantined` set (V30; counted as the sweep's
+`quarantined`, `hoglake_stats_hydrated_total{result="quarantined"}`, and
+gauged live as `hoglake_object_prefix_quarantined_files{catalog}` off
+the V31 partial index). A reader that serves one value's files of such a
+table includes only `stats_state = 'provided' AND NOT
+prefix_quarantined`: pending, failed and quarantined files stay out.
+No endpoint is such a reader yet: nothing clears the flag, it is on no
+response, and GET /scan returns a quarantined file as `provided`. The DDL
+keeps the layout true: the option is set only on an EMPTY table whose
+spec has exactly one identity field on the column, once (the same field
+again changes nothing, though the request still commits its DDL
+snapshot like every alter, and there is no unset); while it is on, a spec change must
+keep that identity field, the column cannot be dropped or renamed, the
+table cannot be renamed, and an atomic replacement of it is refused at
+prepare. GET reports `object_prefix_field` as of the snapshot read.
+Compaction keeps the layout (2.1d): it takes as inputs only
+`stats_state = 'provided' AND NOT prefix_quarantined` files (the mount
+predicate, added to the candidate read for such tables only), writes each
+group's output under the group's value's prefix (groups never span a
+partition), proves the output's footer stats for the field before it
+commits (a mismatch is `invalid_data` naming the inputs; an output
+without a footer is not registered), and re-reads the live layout and
+names under the commit lock, skipping the group as a conflict if the
+output is no longer under the prefix they name. A group whose prefix
+cannot be named is refused in metadata, uncharged
+(`hoglake_compaction_skipped_total{reason="object_prefix_unresolvable"}`).
+In a rolling deploy a 2.1b/2.1c replica still skips such tables while a
+2.1d one compacts them, which is safe in both directions: outputs
+register `provided`, so an older hydrator never claims one, and an older
+commit path holds a DV on an output to the output's prefix like any
+other file. Set
+the option only once every server, compaction and hydrator replica runs
+a version that knows it: an older one ignores the row and would accept
+or compact files outside the prefixes. Deferred stats on such a table
+need more: a hydrator older than the quarantine check flips their files
+to `provided` UNCHECKED and unflagged, so send them only once every
+hydrator replica runs this version, and never roll one back below it
+afterwards. In a rollout, roll the maintenance (hydrator) Deployment to
+this version before the API replicas: an older API replica still
+refuses deferred stats on such a table, so no API replica accepts them
+while an older hydrator runs. If an older hydrator did flip such files,
+nothing marks them: re-pend them, in bounded batches on a large table,
+with `UPDATE hog_data_file f SET stats_state = 'pending' WHERE
+f.catalog_id = <id> AND f.stats_state = 'provided' AND NOT
+f.prefix_quarantined AND f.end_snapshot IS NULL AND f.begin_snapshot >=
+<first snapshot of the exposure> AND EXISTS (SELECT 1 FROM
+hog_table_layout l WHERE l.catalog_id = f.catalog_id AND l.table_id =
+f.table_id AND l.end_snapshot IS NULL) AND EXISTS (SELECT 1 FROM
+hog_table t WHERE t.catalog_id = f.catalog_id AND t.table_id =
+f.table_id AND t.dropped_snapshot IS NULL)`. The next sweeps re-check
+each footer. That re-checks every inline-stats file in the window too
+(their stats rows are rewritten from the footer, the upsert being `ON
+CONFLICT DO UPDATE`), and `POST .../maintenance/rehydrate` is no
+substitute: it re-pends only `failed` files. Of the in-tree writers only
+duckdb-client's INSERT conforms, and only on a spec of identity fields
+with the prefix field first: it writes hive `<field>=<value>/`
+directories under the table root, keeps the partition column in the
+file and always defers stats, so its files register `pending` and the
+hydrator proves them. Because it always defers, the hydrator-version
+rule above covers every DuckDB INSERT. Every other write is refused
+with `object_prefix_violation`: millrace/millpond
+(`{data_path}/data/{ns}/{table}/{build}`), pyhoglake
+(`.../{table}/{idempotency_key}/`), duckdb-client DELETE/UPDATE
+(deletion vectors at the table root, `hoglake-dv-<uuid>.puffin`) and
+Trino writes (their upload claims are not under a value's prefix).
+Enable the option only on a table whose writer is layout-aware, in this
+order: create the table
+with its spec, set the option, then start the writers. Never roll a
+server back below this version once a table has the option.
+
 ### Schema evolution
 
 `service/AlterService.kt`, `POST /alter`: a list of typed operations —
 `add_column`, `drop_column`, `rename_column`, `promote_column`,
-`rename_table`, `set_partition_spec`, `set_sort_order`, and the V11
+`rename_table`, `set_partition_spec`, `set_sort_order`, the V11
 metadata ops `add_column_with_metadata`, `set_table_comment`,
-`set_column_comment`, `set_properties` (`versioned-table-metadata-v1`)
-— applied **in
+`set_column_comment`, `set_properties` (`versioned-table-metadata-v1`),
+and `set_object_prefix_field` (see Partitioning) — applied **in
 order, atomically, as one DDL commit** (one snapshot, one
 `table_altered` change row, one schema-version bump). Renames keep the
 `field_id` (end the old row, begin a new one with the same id), so
 files written before a rename still bind correctly. Type promotion is
-a strict widening lattice (`int→long`, `float→double`) chosen so
+a strict widening lattice (`int8→int16→int→long` and `uint8→uint16→uint32`, any rung to any
+higher one, plus `float→double`) chosen so
 existing files remain readable under the new schema — and a promote
 **re-encodes the table's existing stats bounds** (4-byte → 8-byte
 Iceberg encoding) in the same transaction, so nothing downstream ever
@@ -646,11 +747,15 @@ was reached; requests reaching below it get **410 Gone** with
 reconcile instructions citing that time — a consumer is told its feed
 has a hole (and since when) rather than silently skipping one. A fifth
 step applies the same reachability rule to the accumulating versioned
-DDL tables (`hog_table_version`, `hog_column`, `hog_partition_spec`,
-`hog_sort_spec`, `hog_view`): rows with
-`end_snapshot <= earliest_snapshot_id` are invisible at every retained
-snapshot and are deleted (spec fields cascade), so DDL churn cannot
-grow the metadata without bound. Those five tables are bounded by DDL
+DDL tables (`hog_table_version`, `hog_column`, `hog_sort_spec`,
+`hog_view`, `hog_table_layout`): rows with `end_snapshot <= earliest_snapshot_id` are
+invisible at every retained snapshot and are deleted (sort fields
+cascade), so DDL churn cannot grow the metadata without bound.
+`hog_partition_spec` is kept: a file row names its spec by `spec_id` at
+every snapshot, and spec ids are allocated as `MAX(spec_id) + 1`, so
+deleting a retired spec would strip the labels from the live files
+written under it and, when it held the table's highest id, let the next
+spec reuse that id and relabel them. Those tables are bounded by DDL
 volume rather than by file volume — thousands of rows on prod-us, not
 millions — which is why they stay in the locked transaction while the
 file rows do not.
@@ -699,9 +804,9 @@ appends and never deletes; a delete commit supersedes at most once per
 flush), which is why the default page is sized on the stats cascade — but
 a table with deep vector history is the shape that makes a page expensive
 in a way the row count does not show, and the 5 s statement bound plus
-the halving ladder are what bound it. The vector delete probes
-`hog_delete_file_data_lookup` once per deleted file (measured: a nested
-loop, ~2.2 buffers a probe against a 44,000-row vector relation), so the
+the halving ladder are what bound it. The vector delete probes the
+`(catalog_id, data_file_id)` prefix of `hog_delete_file_snapshot_lookup`
+once per deleted file, so the
 *lookup* cost is O(page) whatever the depth; it is the rows it finds that
 are not.
 
@@ -931,8 +1036,9 @@ defaults do not clear a backlog; the values that do live in the chart, and
 they are a pair (a batch large enough to keep the workers busy, an
 interval near a run's own duration, which the reference check sets at ~20 s
 cold for 4 x 1,000 rows). A worker holds a pooled connection across that
-check, so `HOGLAKE_COMPACTION_PARALLEL_GROUPS + HOGLAKE_CLEANUP_WORKERS`
-is refused at boot above `HOGLAKE_DB_POOL_SIZE -
+check, so the draw of the loops that are on —
+`HOGLAKE_COMPACTION_PARALLEL_GROUPS` + `HOGLAKE_CLEANUP_WORKERS` + 1 for the
+reindex loop, each counted only when its interval is > 0 — is refused at boot above `HOGLAKE_DB_POOL_SIZE -
 FOREGROUND_CONNECTION_RESERVE`: at the default pool of 10 with reserve 4
 and 6 groups, no worker count is legal, which is why prod-us raised
 `dbPoolSize` to 16 — that is what makes 1 worker (and up to 6) legal. A claim is a
@@ -1079,7 +1185,10 @@ stats from the footer the rewrite just wrote — the same
 `FooterStats.aggregate` the hydrator runs, so the counts and bounds are
 exactly the rows the writer emitted and no input stats row is read at
 all — and the changefeed excludes compacted outputs so
-consumers never see merged rows re-appear as fresh appends.
+consumers never see merged rows re-appear as fresh appends. On a table
+with the object-prefix layout the output goes under its group's prefix
+and its footer must prove the value before it registers (see
+Partitioning).
 
 **A group with no survivors registers no output.** When every input's
 live deletion vector deletes every row it holds, the rewrite still runs
@@ -1190,14 +1299,17 @@ timeout served as a 500 — with nothing in the 500 naming the knob that
 caused it. So the server **refuses to boot** when
 
 ```
-HOGLAKE_COMPACTION_PARALLEL_GROUPS > HOGLAKE_DB_POOL_SIZE - 4
+compaction draw + cleanup draw + reindex draw > HOGLAKE_DB_POOL_SIZE - 4
 ```
 
-naming both variables in the failure. The four are a FLOOR, not a model
+where each draw counts only if its loop is on (interval > 0): compaction is
+`HOGLAKE_COMPACTION_PARALLEL_GROUPS`, cleanup is `HOGLAKE_CLEANUP_WORKERS`, and
+reindex is 1. The failure names every variable involved. The four are a FLOOR, not a model
 of demand: the hydrator, expiry, cleanup, retirement and the metrics
 sampler draw on the same pool, and a busy instance's foreground wants
 more than four of its own. Raise the pool with the knob — at the
-default pool of 10 the ceiling is 6.
+defaults (pool 10, cleanup on with 1 worker, reindex off) the
+`HOGLAKE_COMPACTION_PARALLEL_GROUPS` ceiling is 5.
 
 **`HOGLAKE_REQUEST_THREADS`** (default **`HOGLAKE_DB_POOL_SIZE`**) is
 the pool's other customer, and it is sized against the same arithmetic
@@ -1256,7 +1368,7 @@ Its footprint is worth stating because it is the knob that is ON by
 default. The worst case is `parallelGroups x inputOpenParallelism`
 readers each holding a parsed footer, and a footer read is capped at
 `S3InputFile.DEFAULT_MAX_PREFETCH_BYTES` (64 MiB) — so at the highest
-`parallelGroups` a default pool allows, 6 x 8 x 64 MiB is the
+`parallelGroups` a default pool allows, 5 x 8 x 64 MiB is the
 arithmetic bound, against kilobytes per footer for every real file. The
 window is per GROUP and is not divided by `parallelGroups`; an operator
 running both knobs high on a small pod should lower one of them.
@@ -1819,7 +1931,19 @@ contradicts its `explicit_row_ids` registration — and `failed` is the
 outright failure that gets retried next run. The first two never show up as failures — a sweep with either can
 look perfectly healthy — which is why they get a line rather than only a
 log and a ledger row. The self-healing skips (commit conflicts, DV
-supersession) stay uncounted: they re-plan on the next run.
+supersession) stay uncounted: they re-plan on the next run. A fourth
+reason, `object_prefix_unresolvable`, counts groups of a table with the
+object-prefix layout (see Partitioning) refused before any IO because
+their prefix cannot be named (no spec, no single identity key on the
+field, a missing or non-canonical value), or because the layout's column
+is not live or not of an allowed type, which refuses every group of the
+table; it is a broken invariant, refused again every sweep, so alert on
+any of it. A fifth, `claimed_elsewhere`,
+counts groups dropped because another run already claimed them — duplicated
+work that did not happen, not a failure. (`object_prefix_layout`, one per
+sweep per option-on table, was the 2.1b/2.1c servers' skip of such
+tables; a 2.1d-or-later server never emits it, so after a rollout that
+series names a replica that is still older.)
 
 **`reason="failed"` is a FAILURE filed under a metric named
 `skipped`.** That is deliberate — one series for "groups that did not
@@ -2042,6 +2166,41 @@ The catalog reports on itself instead of waiting for ops SQL:
   more sampled groups than the listing will materialise is 422, because
   it decodes, sorts and pages in memory. The webui's partitions tab
   renders this.
+- **`POST .../tables/{t}/partitions/lookup`** (`read` scope) — exact
+  inspection of one complete tuple, sent as the JSON array request body
+  (stored strings or JSON nulls), with `spec_id` (required), `snapshot`,
+  `limit` (1-500, default 100) and `cursor` as query parameters. It requires
+  no maintenance policy or sample.
+  Resolves head once, pins file pages to that snapshot, and binds the
+  opaque cursor to the table incarnation, spec, tuple, and page size.
+  The initial file-ID ceiling bounds the scan even during concurrent
+  appends. Historical DV metadata uses an indexed latest-version seek,
+  so supersession history cannot turn each file probe into a full scan.
+  Totals count physical file rows, not DV-adjusted logical rows;
+  last file write/rewrite is not ingestion freshness. A bounded
+  candidate scan returns exact totals or an explicit unavailable
+  reason, while file inspection remains paged. The budget includes
+  other tables/specs and retained files, but probes every tuple key
+  (at most 10,001 index entries each) and chooses the smallest candidate
+  set. Totals can still be unavailable even for a small partition.
+  Only the first page computes aggregates; continuation pages report
+  `reason: continuation` and callers retain the initial totals. Hydration
+  state counts reflect the current request, not historical state at
+  the requested snapshot. Continue until
+  `next_cursor` is null, even if a page contains no matching files.
+  Expired snapshots return 410; busy admission and query timeouts
+  return 503 with `Retry-After`, distinct from an empty partition.
+  A shared three-second transaction budget includes database work across
+  statements; pool acquisition reduces the remaining budget and has its
+  own five-second bound. Admission allows two lookups per process and
+  one per catalog; a request that cannot start waits up to 200 ms in a
+  FIFO bounded at four waiters per process and two per catalog, then
+  returns 503.
+  The existing file stats endpoint resolves namespaces at head, so
+  it may return 404 for files reached through a historical namespace
+  that has since been dropped/recreated.
+  Existing Python, DuckDB, Trino, and hedgerow endpoints are unchanged;
+  this is an additional operator inspection endpoint.
 - **`GET .../tables/{t}/partitions/values`** — the partition fields at
   the read snapshot, each with the distinct STORED, transformed values
   it takes across the live files (most-frequent first, capped at 500;
@@ -2050,8 +2209,8 @@ The catalog reports on itself instead of waiting for ops SQL:
   returned verbatim for a client to offer as a filter and echo back as
   `partition=key_index:value` on `GET .../files`.
 - **`GET .../maintenance/status`** and **`GET .../maintenance/runs`**,
-  with instance-wide twins at **`GET /maintenance/status`** and
-  **`GET /maintenance/runs`** — the read side of `hog_maintenance_run`
+  with operator-only instance-wide twins at **`GET /v1/maintenance/status`** and
+  **`GET /v1/maintenance/runs`** — the read side of `hog_maintenance_run`
   (the ledger every background sweep and manual trigger writes) plus the
   persisted summaries. `status` is per-task: loop cadence, the task's own
   backlog keys (hydrator `pending_files`/`failed_files`, expiry's
@@ -2086,22 +2245,35 @@ The catalog reports on itself instead of waiting for ops SQL:
 Three surfaces, none of which ever writes to the catalog or rides a
 transaction (`observability/`):
 
-- **`/metrics`** (Prometheus): per-catalog health gauges sampled by a
+- **`/metrics`** (Prometheus; operator-only on the API port, and served
+  with no auth on the infra listener at `HOGLAKE_METRICS_PORT` when that is
+  > 0): per-catalog health gauges sampled by a
   background loop in GROUPS. The CORE group (one batched per-catalog
   query plus one consumer-offset query) runs on every pod that samples
   (`HOGLAKE_METRICS_INTERVAL_MS > 0`, since `/v1/info` and the catalogs
   listing are served from it) — head snapshot and age,
   expiry floor, removal-queue depth (undrained entries only),
   pending-stats AND failed-stats counts
-  (`hoglake_stats_failed_files`), live id-less-file count
-  (`hoglake_missing_field_id_files`), live table
+  (`hoglake_stats_failed_files`), the head of the hydrator's queue
+  (`hoglake_stats_pending_head_file_id`: the `data_file_id` of the oldest
+  live pending file on a live table, the next one a sweep claims, read by
+  key off the pending index, never aggregated; 0 with nothing pending.
+  The head unchanged for three sweep intervals while
+  `hoglake_stats_pending_files` > 0 is a stalled hydrator, whose pending
+  files stay out of every per-value read; `hoglake_stats_pending_files`
+  rising for six hours is a hydrator that is behind. `rehydrate` re-pends
+  old failed files at their old ids, so the head moves back to them, which
+  is correct: they are now the oldest work), live id-less-file count
+  (`hoglake_missing_field_id_files`), live object-prefix-quarantined
+  count (`hoglake_object_prefix_quarantined_files`, see Partitioning), live table
   count, per-consumer lag (cardinality-capped), and
   `hoglake_live_files{catalog}` (live data files, dropped tables
   excluded). The three live totals are read from the maintenance
   summary, which stamps them per catalog when it publishes a generation
   (V27), not from the manifest (#269): one row per catalog, minutes
   behind head on a large instance, and the sampler never scans
-  `hog_data_file` — the rare counts come from partial indexes (V26). A
+  `hog_data_file` — the rare counts come from partial indexes (V26, and
+  V31 for `prefix_quarantined`). A
   catalog with no published totals yet publishes NO live series
   (`hoglake_live_totals_sampled{catalog}` = 0) and `null` on the wire,
   and is never read from its own manifest for them.
@@ -2264,8 +2436,8 @@ transaction (`observability/`):
   every expiry delete and compaction supersession stays unreclaimable
   until it ends). The WARN set is `long_transaction`, `lock_wait`,
   `dead_tuples`, `never_analyzed`, `sequential_scans`, `unused_indexes`,
-  `cache_hit_ratio`, `connection_saturation` and
-  `checkpoints_requested`; `temp_files` is INFO.
+  `cache_hit_ratio`, `connection_saturation`, `index_bloat` and
+  `checkpoints_requested`; `temp_files` and `toast_dominant` are INFO.
 - **Health**: `/healthz` proves the catalog is reachable (`SELECT 1`
   on the probe's OWN one-connection pool, bounded four ways by
   `HOGLAKE_HEALTH_PROBE_TIMEOUT_MS` — Hikari `connectionTimeout`,
@@ -2280,16 +2452,17 @@ transaction (`observability/`):
 ### Background assembly
 
 `App.kt` wires services into Ktor and `startBackground()` runs the
-loops — hydrator, expiry, cleanup, compaction (default off:
+loops — maintenance summary, hydrator, expiry, cleanup, compaction (default off:
 `HOGLAKE_COMPACTION_INTERVAL_MS=0` — flipping it on is an ops
-decision), retirement (also default off), metrics sampler — as
+decision), retirement (also default off), reindex (also default off), metrics sampler — as
 **coroutines under one supervisor scope** (`BackgroundLoops`), each
 with its own interval knob
 (`Config.kt`, all env-sourced, `<= 0` disables), per-catalog failure
 isolation (a failed iteration is logged + counted and the loop keeps
 running), and structured, bounded shutdown (cancel + join, 5s cap).
 `Main.kt` = migrate (under an advisory lock, so replicas don't race
-DDL) → assemble → start loops → serve.
+DDL) → assemble → start loops → start the metrics listener (when
+`HOGLAKE_METRICS_PORT` > 0) → serve.
 
 **Every route handler's blocking work runs off the Netty event loop**
 (`api/BlockingDispatch.kt`, #218): one interceptor in its own phase,
@@ -2371,7 +2544,7 @@ Served at the root (not under `/v1`), documented in
 |---|---|---|
 | `GET /livez` | Process liveness only — never touches the database | **liveness** (a database outage must not restart pods) |
 | `GET /healthz` | Readiness: the catalog must answer (`SELECT 1` on the probe's own connection, bounded by `HOGLAKE_HEALTH_PROBE_TIMEOUT_MS`; the zombie-server incident is why it touches the database at all, #218 is why it no longer touches the request pool) | **readiness** (an unready pod leaves the Service) |
-| `GET /metrics` | Prometheus text exposition | scrape target, never a probe |
+| `GET /metrics` | Prometheus text exposition; operator-only on the API port, unauthenticated on the infra listener (`HOGLAKE_METRICS_PORT`, when > 0), which serves only this route | scrape target (via the infra listener), never a probe |
 
 One more read-only operational endpoint is served under `/v1`, not the
 root:
@@ -2433,18 +2606,19 @@ must set it by hand.
 ## Layout
 
 - `src/main/resources/db/migration/` — Flyway. `V1__init.sql` is frozen
-  as of v1.0.0 and the chain is append-only from there; V22 is the
+  as of v1.0.0 and the chain is append-only from there; V32 is the
   latest. `schema.sql` is the canonical twin, equivalence-tested.
 - `src/main/kotlin/com/posthog/hoglake/`
   - `model/` — domain types (mirror the OpenAPI schemas).
   - `persistence/` — JDBI repositories; all SQL parameterized.
   - `service/` — DDL, alter, scan, views, options, expiry, cleanup.
   - `commit/` — the commit path (OCC, lock tail, row-id assignment).
-  - `compaction/` — small-file merging (the only parquet-java user).
+  - `compaction/` — small-file merging.
   - `hydrator/` — deferred-stats hydration.
   - `stats/` — Iceberg single-value bounds codec.
   - `observability/` — metrics, audit, request ids.
   - `api/` — Ktor routes implementing the spec.
+  - `auth/` — token verification, the route authorization table, auth modes.
 
 ## Testing
 
@@ -2490,11 +2664,13 @@ eligible for operator cleanup, after their writers have stopped. Never remove
 files from committed operations based on operation age; normal catalog retention
 owns their lifecycle. There is no automatic fallback to staging-table rename.
 
-The API supports unpartitioned creation, at most 10000 columns and 10000 files per
-operation, and validates registration metadata using the existing append checks.
+The base API supports unpartitioned creation (partitioned and sorted creation
+use the `/partitioned` and `/sorted` preparation variants, advertised as
+`atomic-partitioned-table-creation-v1` and `atomic-sorted-table-creation-v1`),
+at most 10000 columns and 10000 files per operation, and validates registration metadata using the existing append checks.
 It does not open Parquet objects at publication time. Field IDs are table-local,
 start at one, and are installed with the prepared UUID at publication. Expanding
-receipt retention, automated orphan cleanup, or idempotent INSERT is separate work.
+receipt retention or automated orphan cleanup is separate work.
 
 Atomic preparation, publication, and abort emit `table_creation_*` audit events
 after their transactions finish. `hoglake_table_creation_total` labels attempts
@@ -2528,7 +2704,8 @@ DuckDB, hedgerow and the console) retain their existing behavior and need no wir
 changes. `/commit/prepared` remains supported. Manual SQL reruns, query/task
 retries and orphan collection are outside this guarantee.
 
-The standalone server has no application authentication. Protect this lookup
+Application authentication is optional (`HOGLAKE_AUTH_MODE`, default `off`);
+under `enforce` this lookup needs `read` on the catalog. Under `off`, protect it
 with the same authenticated deployment boundary and catalog authorization as
 `/commit`; catalog scoping alone is not authentication. This change does not
 introduce an authentication framework or authorize any deployment.

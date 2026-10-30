@@ -67,6 +67,10 @@ const INT64_FIELDS = new Set([
   // rest of its int64 fields reuse names already above (file_count,
   // record_count, total_bytes, ...); this one is its own.
   "last_written_snapshot",
+  "physical_rows",
+  "last_file_write_snapshot",
+  "provided",
+  "pending",
   // table GET (#232): the snapshot a head read's sampled totals are
   // exact at, and the snapshot the whole response was resolved at. Both
   // are snapshot ids under their own names, so neither is covered by
@@ -91,6 +95,8 @@ const INT64_FIELDS = new Set([
   "failed",
   "transient",
   "stats_skipped_below_floor",
+  // Object-prefix files the hydrator quarantined (HydratorSweepResult).
+  "quarantined",
   "requeued",
   "snapshots_expired",
   "data_files_queued",
@@ -191,6 +197,8 @@ const INT64_FIELDS = new Set([
   "files_unranged",
   // Pre-probe bucket-claim skips (CompactionResult).
   "buckets_skipped_claimed",
+  // Object-prefix groups with no nameable prefix (CompactionResult).
+  "object_prefix_unresolvable",
   "violations",
 ]);
 

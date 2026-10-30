@@ -5,6 +5,7 @@ import com.posthog.hoglake.compaction.CompactionClaimRepo
 import com.posthog.hoglake.compaction.CompactionConfig
 import com.posthog.hoglake.compaction.CompactionGroup
 import com.posthog.hoglake.compaction.CompactionGrouping
+import com.posthog.hoglake.compaction.CompactionService
 import com.posthog.hoglake.compaction.InvalidDataException
 import com.posthog.hoglake.compaction.LiveDv
 import com.posthog.hoglake.compaction.ParquetRewriter
@@ -22,6 +23,9 @@ import com.posthog.hoglake.model.CompactionResult
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.MaintenanceTask
 import com.posthog.hoglake.model.MaintenanceTrigger
+import com.posthog.hoglake.model.ObjectPrefix
+import com.posthog.hoglake.model.ObjectPrefixLayout
+import com.posthog.hoglake.model.PartitionFieldDef
 import com.posthog.hoglake.model.SortFieldDef
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
@@ -57,6 +61,17 @@ import java.util.UUID
  * serialization; the bucket-claim layer (a guard against re-probing
  * cost the simple planner does not have) does not.
  *
+ * THE OBJECT-PREFIX LAYOUT (CompactionService's rules, ported): on a
+ * table with the option, only verified inputs (`stats_state =
+ * 'provided'` and not `prefix_quarantined`) are candidates; a group
+ * whose prefix value cannot be named from its own spec's identity key
+ * is refused in metadata, uncharged, and counted
+ * (`object_prefix_unresolvable`); the output is written under
+ * `<table root><field>=<value>/`; its footer stats must prove the value
+ * or the group is `invalid_data` with nothing registered; and the
+ * commit re-checks, inside its transaction, that the live layout still
+ * names the prefix the output was written under (else SkippedConflict).
+ *
  * Groups execute SEQUENTIALLY (the Postgres path's parallelGroups pool
  * exists to overlap S3 latency across catalogs' row locks; one tenant
  * has one writer, and the rewrite's own inputOpenParallelism already
@@ -68,8 +83,16 @@ internal class HogliteCompaction(
     private val store: HogliteCatalogStore,
     private val objectStore: ObjectStore,
     private val defaults: CompactionConfig,
+    /**
+     * Test seam: runs after a group's output is written and proven, before
+     * its metadata commit — the window the commit's guards exist for.
+     */
+    private val beforeCommit: (catalog: String, group: CompactionGroup) -> Unit = { _, _ -> },
 ) : com.posthog.hoglake.service.CompactionBackend {
     private val log = KotlinLogging.logger {}
+
+    /** (catalog, table_id) -> the last logged object-prefix refusal picture (CompactionService.lastPrefixRefusal). */
+    private val lastPrefixRefusal = java.util.concurrent.ConcurrentHashMap<Pair<String, Long>, String>()
 
     override fun runOnce(
         catalog: String,
@@ -120,7 +143,8 @@ internal class HogliteCompaction(
                     "bytes_in=${r.bytesIn} bytes_out=${r.bytesOut} skipped_conflicts=${r.skippedConflicts} " +
                     "dv_superseded=${r.dvSuperseded} unconvertible_schema=${r.unconvertibleSchema} " +
                     "invalid_data=${r.invalidData} failed_groups=${r.failedGroups} " +
-                    "claimed_elsewhere=${r.claimedElsewhere} candidates_fetched=${r.candidatesFetched}"
+                    "claimed_elsewhere=${r.claimedElsewhere} candidates_fetched=${r.candidatesFetched} " +
+                    "object_prefix_unresolvable=${r.objectPrefixUnresolvable}"
             },
         ) {
             if (cfg.maxGroupsPerRun <= 0) {
@@ -136,6 +160,7 @@ internal class HogliteCompaction(
             Metrics.compactionSkipped(catalog, "invalid_data", result.invalidData)
             Metrics.compactionSkipped(catalog, "failed", result.failedGroups)
             Metrics.compactionSkipped(catalog, "claimed_elsewhere", result.claimedElsewhere)
+            Metrics.compactionSkipped(catalog, "object_prefix_unresolvable", result.objectPrefixUnresolvable)
             result
         }
 
@@ -156,7 +181,30 @@ internal class HogliteCompaction(
         val inputOpenParallelism: Int,
         val sortSpill: com.posthog.hoglake.compaction.SortSpill?,
         val variantCompaction: Boolean,
+        /**
+         * The object-prefix field id at the planning head (`table_layouts`),
+         * null = the option is off. THIS, not [objectPrefix], says the
+         * option is on (CompactionService.TableContext's rule): a layout
+         * whose column is not live resolves no [objectPrefix], and every
+         * group is then refused as unresolvable.
+         */
+        val objectPrefixFieldId: Long? = null,
+        /** The layout with the column's live name and type; see [objectPrefixFieldId]. */
+        val objectPrefix: ObjectPrefixLayout? = null,
+        /** spec_id -> the identity key_index on the field, for every spec (retired ones too); empty when off. */
+        val prefixKeyIndex: Map<Long, Int?> = emptyMap(),
     )
+
+    /** CompactionService.prefixValue: the canonical value naming [group]'s prefix, or null. */
+    private fun prefixValue(
+        ctx: TableContext,
+        group: CompactionGroup,
+    ): String? {
+        val layout = ctx.objectPrefix ?: return null
+        val keyIndex = group.specId?.let { ctx.prefixKeyIndex[it] } ?: return null
+        val raw = group.partitionValues?.getOrNull(keyIndex) ?: return null
+        return raw.takeIf { ObjectPrefix.parseValue(it, layout.colType) != null }
+    }
 
     private fun tableContext(
         catalog: String,
@@ -191,6 +239,23 @@ internal class HogliteCompaction(
             } else {
                 null
             }
+        // The OBJECT-PREFIX LAYOUT on the same head: the field, its live
+        // top-level column, and its identity key_index in every spec of the
+        // table — retired specs included, since expiry keeps them while a
+        // file names them (HogliteExpiry.VERSIONED_TABLES_NEVER_CLEARED).
+        val prefixFieldId = store.layoutAt(catalog, tableId, head)
+        val prefixColumn = prefixFieldId?.let { id -> columns.firstOrNull { it.fieldId == id } }
+        val prefixKeyIndex =
+            prefixFieldId?.let { id ->
+                store.queryCatalog(
+                    catalog,
+                    "SELECT spec_id, fields_json FROM partition_specs WHERE table_id = ?",
+                    tableId,
+                ).rows.associate { r ->
+                    val fields = store.json.readValue(r[1].asString(), Array<PartitionFieldDef>::class.java).toList()
+                    r[0].asLong() to ObjectPrefix.keyIndex(fields, id)
+                }
+            }
         return TableContext(
             dataPath = m.dataPath,
             namespace = namespace,
@@ -205,6 +270,12 @@ internal class HogliteCompaction(
             inputOpenParallelism = cfg.inputOpenParallelism,
             sortSpill = sortSpill,
             variantCompaction = cfg.variantCompaction,
+            objectPrefixFieldId = prefixFieldId,
+            objectPrefix =
+                prefixColumn
+                    ?.takeIf { it.def.type in ObjectPrefix.ALLOWED_TYPES }
+                    ?.let { ObjectPrefixLayout(it.fieldId, it.def.name, it.def.type) },
+            prefixKeyIndex = prefixKeyIndex.orEmpty(),
         )
     }
 
@@ -220,6 +291,13 @@ internal class HogliteCompaction(
             verifyMinBytes = cfg.verifyMinBytes,
         )
 
+    /** One table's plan: the groups to attempt, and the object-prefix groups refused in metadata. */
+    private class TablePlan(
+        val ctx: TableContext,
+        val groups: List<CompactionGroup>,
+        val prefixUnresolvable: Long = 0,
+    )
+
     /** The plan for one table: candidates under the target, packed, claims dropped out. */
     private fun planTable(
         catalog: String,
@@ -228,8 +306,17 @@ internal class HogliteCompaction(
         table: String,
         tableId: Long,
         cfg: CompactionConfig,
-    ): Pair<TableContext, List<CompactionGroup>>? {
+    ): TablePlan? {
         val ctx = tableContext(catalog, m, namespace, table, tableId, cfg) ?: return null
+        // VERIFIED ONLY with the option on (CompactionService.VERIFIED_ONLY_SQL):
+        // a pending or quarantined input never reaches an output the
+        // per-value mount would serve. Off, the statement is unchanged.
+        val verifiedOnly =
+            if (ctx.objectPrefixFieldId != null) {
+                "AND f.stats_state = 'provided' AND f.prefix_quarantined = 0 "
+            } else {
+                ""
+            }
         val rows =
             store.queryCatalog(
                 catalog,
@@ -238,6 +325,7 @@ internal class HogliteCompaction(
                     "f.partition_values_json, d.delete_file_id, d.path, d.delete_count " +
                     "FROM files f LEFT JOIN dvs d ON d.data_file_id = f.id AND d.end_snapshot IS NULL " +
                     "WHERE f.table_id = ? AND f.end_snapshot IS NULL AND f.file_size_bytes < ? " +
+                    verifiedOnly +
                     "ORDER BY f.row_id_start",
                 tableId,
                 cfg.targetBytes,
@@ -279,12 +367,48 @@ internal class HogliteCompaction(
                 groups += CompactionGroup(take.sortedBy { it.rowIdStart }, bucket.first, bucket.second)
             }
         }
-        if (groups.isEmpty()) return ctx to emptyList()
+        // OBJECT-PREFIX LAYOUT: a group whose prefix cannot be named has no
+        // path its output may be written to — refused here, in metadata and
+        // uncharged (CompactionService.pack), and counted.
+        val (resolvable, unresolvable) =
+            if (ctx.objectPrefixFieldId == null) {
+                groups to emptyList()
+            } else {
+                groups.partition { prefixValue(ctx, it) != null }
+            }
+        logPrefixRefusals(catalog, ctx, unresolvable)
+        if (resolvable.isEmpty()) return TablePlan(ctx, emptyList(), unresolvable.size.toLong())
         // Drop groups overlapping a live claim (the efficiency half; the
         // commit guards remain the correctness half).
         val claimed = liveClaimedFileIds(catalog, tableId)
-        val free = groups.filter { g -> g.files.none { it.dataFileId in claimed } }
-        return ctx to free.sortedWith(compareBy({ -it.files.size }, { it.files.first().rowIdStart }))
+        val free = resolvable.filter { g -> g.files.none { it.dataFileId in claimed } }
+        return TablePlan(
+            ctx,
+            free.sortedWith(compareBy({ -it.files.size }, { it.files.first().rowIdStart })),
+            unresolvable.size.toLong(),
+        )
+    }
+
+    /** CompactionService.logPrefixRefusals: WARN when a table's unresolvable picture changes. */
+    private fun logPrefixRefusals(
+        catalog: String,
+        ctx: TableContext,
+        unresolvable: List<CompactionGroup>,
+    ) {
+        val key = catalog to ctx.tableId
+        if (unresolvable.isEmpty()) {
+            lastPrefixRefusal.remove(key)
+            return
+        }
+        val sample = unresolvable.take(5).joinToString { "${it.specId}, ${it.partitionValues}" }
+        val signature = "${unresolvable.size} ${ctx.objectPrefix} $sample"
+        if (lastPrefixRefusal.put(key, signature) == signature) return
+        log.warn {
+            "compaction refused ${unresolvable.size} group(s) of ${ctx.namespace}.${ctx.table} whose object " +
+                "prefix cannot be resolved (field_id=${ctx.objectPrefixFieldId} layout=${ctx.objectPrefix}; " +
+                "a null layout is a column that is not live or not of an allowed type, which refuses every " +
+                "group). First (spec_id, partition values): $sample"
+        }
     }
 
     // ---- claims ------------------------------------------------------------
@@ -392,6 +516,7 @@ internal class HogliteCompaction(
         var invalidData = 0L
         var failedGroups = 0L
         var claimedElsewhere = 0L
+        var objectPrefixUnresolvable = 0L
         var candidatesFetched = 0L
         var attempts = 0
         val maxGroups = cfg.maxGroupsPerRun
@@ -408,7 +533,9 @@ internal class HogliteCompaction(
             if (Thread.currentThread().isInterrupted) throw InterruptedException()
             val (namespace, table, tableId) = Triple(t[0].asString(), t[1].asString(), t[2].asLong())
             val planned = planTable(catalog, m, namespace, table, tableId, cfg) ?: continue
-            val (ctx, groups) = planned
+            val ctx = planned.ctx
+            val groups = planned.groups
+            objectPrefixUnresolvable += planned.prefixUnresolvable
             candidatesFetched += groups.sumOf { it.files.size }
             for (group in groups) {
                 if (attempts >= maxGroups) break
@@ -483,6 +610,7 @@ internal class HogliteCompaction(
             claimedElsewhere = claimedElsewhere,
             candidatesFetched = candidatesFetched,
             groupsRetired = groupsRetired,
+            objectPrefixUnresolvable = objectPrefixUnresolvable,
         )
     }
 
@@ -504,6 +632,14 @@ internal class HogliteCompaction(
         ctx: TableContext,
         group: CompactionGroup,
     ): Outcome {
+        val named = CompactionService.MAX_NAMED_INPUT_PATHS
+        // The OBJECT-PREFIX value, before any IO; the planner refused
+        // groups without one, so a miss here fails closed.
+        val prefixValue = prefixValue(ctx, group)
+        check(ctx.objectPrefixFieldId == null || prefixValue != null) {
+            "group of ${ctx.namespace}.${ctx.table} (spec_id ${group.specId}, values ${group.partitionValues}) " +
+                "has no resolvable object-prefix value; refusing to write its output"
+        }
         val inputs =
             group.files.map { f ->
                 val source = S3InputFile(objectStore, f.path, f.fileSizeBytes, f.footerSize)
@@ -552,9 +688,10 @@ internal class HogliteCompaction(
                         ),
                 )
             }
+        // Option off: `<data_path>/data/<ns>/<table>/<uuid>.parquet`, the
+        // path this port always wrote; on: under the group's value's prefix.
         val outputPath =
-            "${ctx.dataPath.trimEnd('/')}/data/${ctx.namespace}/${ctx.table}/" +
-                "${UUID.randomUUID()}.parquet"
+            ObjectPrefix.dataFilePath(ctx.dataPath, ctx.namespace, ctx.table, ctx.objectPrefix, prefixValue)
 
         // The staging ticket BEFORE any bytes: the object is always named
         // by an undrained removal row, so a crash mid-rewrite leaves the
@@ -597,10 +734,43 @@ internal class HogliteCompaction(
                         )
                     }
             }
+        // THE OUTPUT'S PREFIX PROOF (CompactionService's rule, same
+        // message): an output whose footer does not prove every row holds
+        // the value is never registered — the staged object stays queued
+        // for the cleanup drain under its ticket.
+        val layout = ctx.objectPrefix
+        if (layout != null && rewritten.rowsWritten > 0) {
+            val aggregate =
+                checkNotNull(stats) {
+                    "the rewrite of ${group.files.size} files of ${ctx.namespace}.${ctx.table} returned no " +
+                        "footer; an object-prefix output is never registered unproven"
+                }
+            val verdict =
+                ObjectPrefix.checkFieldStats(
+                    layout,
+                    ObjectPrefix.parseValue(prefixValue, layout.colType)!!,
+                    aggregate.firstOrNull { it.fieldId == layout.fieldId },
+                )
+            if (verdict != ObjectPrefix.Verdict.OK) {
+                throw InvalidDataException(
+                    "output of ${group.files.size} inputs does not prove ${layout.fieldName} = $prefixValue " +
+                        "for $outputPath ($verdict): an input holds rows of another value or nulls although " +
+                        "its registration proved the value. Inputs (data_file_id path), first " +
+                        "${minOf(group.files.size, named)}: " +
+                        group.files.take(named).joinToString { "${it.dataFileId} ${it.path}" } +
+                        if (group.files.size > named) {
+                            "; all data_file_ids: " + group.files.joinToString { "${it.dataFileId}" }
+                        } else {
+                            ""
+                        },
+                )
+            }
+        }
         val rowIdStart = group.files.minOf { it.rowIdStart }
+        beforeCommit(catalog, group)
         return commitGroup(
             catalog, ctx, group, outputPath, outputBytes, footerSize, stats, splitOffsets,
-            rewritten.rowsWritten, rowIdStart, stagingId,
+            rewritten.rowsWritten, rowIdStart, stagingId, prefixValue,
         )
     }
 
@@ -638,6 +808,7 @@ internal class HogliteCompaction(
         survivors: Long,
         rowIdStart: Long,
         stagingId: Long,
+        prefixValue: String?,
     ): Outcome {
         val ids = group.files.map { it.dataFileId }
         val tx = HogliteTx()
@@ -745,6 +916,47 @@ internal class HogliteCompaction(
             return Outcome.Retired(results[readback].firstRow()!![0].asLong())
         }
 
+        // GUARD 6, live commits only and after the input guards — where
+        // CompactionService.commitGroup runs its LAYOUT_RECHECK_SQL, so a
+        // retirement never consults the layout and a superseded DV wins
+        // the outcome (in this transaction): the live layout still names the prefix the
+        // output was written under. Postgres re-derives the prefix from the
+        // live field, its column's live name and type, and the table's live
+        // names, and requires the output under it; the prefix is a pure
+        // function of those strings and the group's value, so the same
+        // check is: the live layout row is the planned field, its column is
+        // live under the planned name with a type for which the value is
+        // canonical, and the table's live names are the planned ones. With
+        // the option off at planning, no live layout row may have arrived.
+        // A mismatch is a lost race, the staged output left for the drain.
+        val plannedLayout = ctx.objectPrefix
+        if (ctx.objectPrefixFieldId == null) {
+            tx.expectZero(
+                "SELECT COUNT(*) FROM table_layouts WHERE table_id = ? AND end_snapshot IS NULL",
+                ctx.tableId,
+            ) { layoutMoved(ctx, outputPath).let { guard(Outcome.SkippedConflict) } }
+        } else if (plannedLayout != null && prefixValue != null) {
+            val parsingTypes =
+                ObjectPrefix.ALLOWED_TYPES.filter { ObjectPrefix.parseValue(prefixValue, it) != null }.map { it.wire }
+            tx.expectOne(
+                "SELECT COUNT(*) FROM table_layouts l " +
+                    "JOIN table_versions v ON v.table_id = l.table_id AND v.end_snapshot IS NULL " +
+                    "JOIN columns c ON c.table_id = l.table_id AND c.field_id = l.object_prefix_field_id " +
+                    "AND c.end_snapshot IS NULL " +
+                    "WHERE l.table_id = ? AND l.end_snapshot IS NULL AND l.object_prefix_field_id = ? " +
+                    "AND v.namespace = ? AND v.name = ? AND c.name = ? " +
+                    "AND c.type IN (${parsingTypes.joinToString(",") { "?" }})",
+                ctx.tableId,
+                ctx.objectPrefixFieldId,
+                ctx.namespace,
+                ctx.table,
+                plannedLayout.fieldName,
+                *parsingTypes.toTypedArray(),
+            ) { layoutMoved(ctx, outputPath).let { guard(Outcome.SkippedConflict) } }
+        } else {
+            // compactGroup refuses an unresolvable group before any IO.
+            error("object-prefix group of ${ctx.namespace}.${ctx.table} reached the commit without a prefix")
+        }
         // The live commit: allocate snapshot + file id (commit allocation,
         // schema_version untouched — compaction is not DDL).
         tx.allocateCommitSnapshot()
@@ -812,6 +1024,18 @@ internal class HogliteCompaction(
                 throw e
             }
         return Outcome.Committed(results[readback].firstRow()!![0].asLong(), outputBytes)
+    }
+
+    /** The WARN CompactionService.commitGroup logs when the layout recheck refuses. */
+    private fun layoutMoved(
+        ctx: TableContext,
+        outputPath: String,
+    ) {
+        log.warn {
+            "compaction group for ${ctx.namespace}.${ctx.table} was written to $outputPath under " +
+                "object-prefix field ${ctx.objectPrefixFieldId ?: "none"}, but the live layout no longer names " +
+                "that prefix; skipping the commit. The staged output stays queued for the cleanup drain"
+        }
     }
 
     /** Re-stage an output whose ticket was touched — commitGroup's comment explains the leak it closes. */

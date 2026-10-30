@@ -2,6 +2,8 @@ package com.posthog.hoglake.api
 
 import com.posthog.hoglake.auth.bearerChallenge
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.PartitionLookupInvalidRequest
+import com.posthog.hoglake.model.PartitionLookupUnavailable
 import com.posthog.hoglake.service.CorruptDefinitionException
 import io.github.oshai.kotlinlogging.KotlinLogging
 import io.ktor.http.HttpHeaders
@@ -35,13 +37,16 @@ private val log = KotlinLogging.logger("com.posthog.hoglake.api.ErrorMapping")
  * - TableRecreated      -> 409 `table_recreated` (the expected
  *                          table_uuid is not the live one), same
  *                          `retry: re-prepare` family
- * - DdlSinceReadSnapshot -> 409 `ddl_since_read_snapshot`, the one
- *                          error body that is more than {error, detail}:
- *                          it also names `tables`, `read_snapshot` and
- *                          `retry: re-prepare`, because its recovery is
- *                          not a retry and a caller must not have to
- *                          parse prose to learn that
+ * - DdlSinceReadSnapshot -> 409 `ddl_since_read_snapshot`, the fullest
+ *                          re-prepare body: it also names `tables`,
+ *                          `read_snapshot` and `retry: re-prepare`,
+ *                          because its recovery is not a retry and a
+ *                          caller must not have to parse prose to learn
+ *                          that
  * - Validation          -> 422
+ * - ObjectPrefixViolation -> 422 `object_prefix_violation`, carrying
+ *                          `tables` and `retry: re-prepare`: a file the
+ *                          table's object-prefix layout does not admit
  * - Expired             -> 410
  * - CommitQueueTimeout  -> 503 + Retry-After (retryable backpressure,
  *                          never a generic 500)
@@ -71,6 +76,10 @@ private val log = KotlinLogging.logger("com.posthog.hoglake.api.ErrorMapping")
 
 internal fun errorBody(cause: HoglakeException): Pair<HttpStatusCode, ApiErrorDto> =
     when (cause) {
+        is PartitionLookupInvalidRequest -> HttpStatusCode.BadRequest to apiError("bad_request", cause)
+        is PartitionLookupUnavailable ->
+            HttpStatusCode.ServiceUnavailable to
+                apiError("partition_lookup_unavailable", cause).copy(reason = cause.reason)
         is HoglakeException.NotFound -> HttpStatusCode.NotFound to apiError("not_found", cause)
         is HoglakeException.AlreadyExists -> HttpStatusCode.Conflict to apiError("already_exists", cause)
         is HoglakeException.ReconciliationRequired ->
@@ -83,10 +92,11 @@ internal fun errorBody(cause: HoglakeException): Pair<HttpStatusCode, ApiErrorDt
         is HoglakeException.CatalogNotEmpty ->
             HttpStatusCode.Conflict to apiError("catalog_not_empty", cause).copy(reason = cause.reason.wire)
         is HoglakeException.TableDropped -> HttpStatusCode.Conflict to apiError("table_dropped", cause)
-        // The one body that carries more than {error, detail}: which
-        // tables moved, the read_snapshot they moved after, and the fact
-        // that replaying is futile. A client decides to re-prepare off
-        // those rather than off the prose.
+        // The fullest body of the re-prepare family (with table_recreated
+        // and object_prefix_violation below): which tables moved, the
+        // read_snapshot they moved after, and the fact that replaying is
+        // futile. A client decides to re-prepare off those rather than off
+        // the prose.
         is HoglakeException.DdlSinceReadSnapshot ->
             HttpStatusCode.Conflict to
                 apiError("ddl_since_read_snapshot", cause).copy(
@@ -107,6 +117,15 @@ internal fun errorBody(cause: HoglakeException): Pair<HttpStatusCode, ApiErrorDt
         // and a `when` would otherwise answer the base code for it.
         is HoglakeException.CommitConflict -> HttpStatusCode.Conflict to apiError("commit_conflict", cause)
         is HoglakeException.Validation -> HttpStatusCode.UnprocessableEntity to apiError("validation", cause)
+        // A 422 that is not a plain validation failure: the writer most
+        // likely does not know the table has the option, so the body says
+        // which table to re-read and that replaying is futile.
+        is HoglakeException.ObjectPrefixViolation ->
+            HttpStatusCode.UnprocessableEntity to
+                apiError("object_prefix_violation", cause).copy(
+                    tables = listOf(cause.table),
+                    retry = RETRY_RE_PREPARE,
+                )
         // 401, and the ONLY arm whose status is added by a header the
         // caller must also honour (WWW-Authenticate, below). `error`
         // carries the verifier's closed reason vocabulary rather than a
@@ -133,7 +152,10 @@ internal fun errorBody(cause: HoglakeException): Pair<HttpStatusCode, ApiErrorDt
 fun StatusPagesConfig.installErrorMapping() {
     exception<HoglakeException> { call, cause ->
         val (status, body) = errorBody(cause)
-        if (cause is HoglakeException.CommitQueueTimeout || cause is HoglakeException.BackendUnavailable) {
+        if (cause is HoglakeException.CommitQueueTimeout ||
+            cause is HoglakeException.BackendUnavailable ||
+            cause is PartitionLookupUnavailable
+        ) {
             call.response.headers.append(HttpHeaders.RetryAfter, RETRY_AFTER_SECONDS)
         }
         if (cause is HoglakeException.Unauthenticated) {

@@ -27,11 +27,9 @@ duckdb-client/
 ├── scripts/fetch-deps.sh       # pins duckdb + extension-ci-tools (see "Deps")
 ├── src/
 │   ├── hoglake_extension.cpp   # entry: storage extension + functions + settings
-│   ├── include/…               # headers mirror src/ layout
+│   ├── include/…               # headers mirror src/ layout; common/hoglake_wire.hpp = wire DTOs
 │   ├── common/
-│   │   ├── hoglake_types.cpp   # hoglake column types <-> LogicalType
-│   │   ├── hoglake_bounds.cpp  # Iceberg single-value binary codec (stats bounds)
-│   │   └── hoglake_wire.cpp    # DTOs for the OpenAPI schemas + yyjson codec
+│   │   └── hoglake_types.cpp   # hoglake column types <-> LogicalType
 │   ├── rest/
 │   │   └── hoglake_api_client.cpp  # HTTP transport + error taxonomy
 │   └── storage/
@@ -47,9 +45,7 @@ duckdb-client/
 │       ├── hoglake_delete.cpp        # M4: DV build + registration
 │       └── hoglake_puffin.cpp        # puffin deletion-vector-v1 read/write (roaring)
 │   └── functions/
-│       ├── hoglake_snapshots.cpp, hoglake_table_info.cpp,
-│       ├── hoglake_table_changes.cpp, hoglake_current_snapshot.cpp,
-│       └── hoglake_maintenance.cpp   # compact/expire/cleanup passthroughs
+│       └── hoglake_metadata_functions.cpp  # snapshots/table_info/current_snapshot + compact/expire/cleanup passthroughs
 └── test/sql/…                  # sqllogictests (live dev server + MinIO)
 ```
 
@@ -69,9 +65,10 @@ consumers use. Rejected alternatives:
 TLS: cpp-httplib supports `https://` when compiled with
 `CPPHTTPLIB_OPENSSL_SUPPORT`; v1 targets the plaintext dev/in-cluster
 endpoint, and the OpenSSL vcpkg feature is a flip documented as a
-follow-up (community CI builds openssl for httpfs already). Auth is out
-of scope for the server's v1; the client carries an optional bearer
-token setting so the slot exists.
+follow-up (community CI builds openssl for httpfs already). Auth is
+ATTACH options (#472): a static `TOKEN`, or `TOKEN_URL` + `CLIENT_ID` +
+`CLIENT_SECRET` (+ `AUDIENCE`) for RFC 6749 client credentials (a
+plaintext-HTTP `TOKEN_URL` only, for the same TLS reason).
 
 Error taxonomy (mirrors pyhoglake `errors.py`): 404 not-found, 409
 conflict (commit conflicts retryable; `"the table was recreated"` in
@@ -109,10 +106,11 @@ pyhoglake). Options:
 | `ENDPOINT` | server base URL (alternative to embedding it in the path) |
 | `SNAPSHOT_VERSION` / `SNAPSHOT_TIME` | pin the whole attach; forces READ_ONLY; mutually exclusive (DuckLake semantics) |
 | `CREATE_IF_NOT_EXISTS` + `DATA_PATH` | create the catalog on attach (maps to POST /catalogs; DATA_PATH must be s3://) |
+| `TOKEN` | static bearer token; exclusive with the client-credentials set |
+| `TOKEN_URL` + `CLIENT_ID` + `CLIENT_SECRET` (+ `AUDIENCE`) | RFC 6749 client-credentials grant against `TOKEN_URL` |
 
-A `SECRET` of `TYPE hoglake` (endpoint, token) resolves when the
-payload omits the endpoint — planned in M5, matching DuckLake's secret
-flow. Object-store credentials are DuckDB's ordinary S3 secrets
+A `SECRET` of `TYPE hoglake` (endpoint, token) is a TODO: no secret
+type is registered; credentials are ATTACH options only. Object-store credentials are DuckDB's ordinary S3 secrets
 (httpfs); two credential domains by design.
 
 ## Transactions and snapshot pinning
@@ -272,11 +270,10 @@ conflict checks, and the fixture-created ambiguous pairs.
    (DuckLake's exact pattern), with field-id-based column mapping so
    renames/adds/drops bind correctly against old files.
 3. **Prune**: partition pruning client-side from `spec_id` +
-   `partition_values` on each file — identity transforms prune with
-   full fidelity; `bucket/year/month/day/hour` prune via
-   transform-aware comparison (Iceberg semantics, mirroring
-   pyhoglake `transforms.py`). Files with `stats_state != provided`
-   are never pruned (correctness by construction).
+   `partition_values` on each file — identity transforms only;
+   `bucket/year/month/day/hour` fields do not prune. Files whose
+   `spec_id` is not the live spec are never pruned (correctness by
+   construction).
    **Gap (client side; server finding 1 addressed)**: the extension
    plans without per-file column bounds, so DuckLake-style zone-map file
    skipping on arbitrary predicates is not implemented; parquet
@@ -318,11 +315,9 @@ written with DuckDB's parquet writer with **field ids stamped** and
 target file size rotation. Per file the operator collects footer stats
 into `FileRegistration`: `record_count`, `file_size_bytes`,
 `footer_size` (**exactly the 4-byte LE thrift length, excluding the
-8-byte trailer** — the bugs.md #7 convention), `column_stats` with
-Iceberg single-value binary bounds (base64; codec ported from
-pyhoglake `bounds.py`, validated against `tests/vectors/
-bounds_vectors.json`), and `partition_values` (wire strings by
-key_index). Paths: `<data_path>data/<namespace>/<table>/<uuid>.parquet`
+8-byte trailer**), and `partition_values` (wire strings by
+key_index). No `column_stats`: registrations ship deferred
+(`stats_mode=deferred`; the server hydrator reads footers). Paths: `<data_path>data/<namespace>/<table>/<uuid>.parquet`
 (pyhoglake's layout); the server enforces the data_path prefix and
 segment hygiene. `expected_table_uuid` rides every append (the
 incarnation guard) with the uuid the table entry was bound at.
@@ -348,7 +343,8 @@ mandatory `read_snapshot`. UPDATE = DELETE of old positions + INSERT of
 new rows in the same commit (DuckLake's rewrite semantics). MERGE
 lowers to the same two primitives.
 
-Column types: hoglake's closed flat set (`boolean,int,long,float,
+Column types: the client maps a flat subset of the wire's 27 types
+(`boolean,int,long,float,
 double,decimal,date,time,timestamp,timestamptz,string,uuid,binary`);
 mapping identical to pyhoglake `types.py` (`uuid` <-> DuckDB UUID via
 16-byte big-endian; `timestamp[tz]` micros). Nested/other DuckDB types
@@ -368,22 +364,25 @@ are rejected at CREATE/ALTER with a clear error. Column names beginning
 | `ALTER TABLE ALTER COLUMN TYPE` | `promote_column` (server's promotion lattice: int→long, float→double; others 422) |
 | `ALTER TABLE RENAME TO` | `rename_table` |
 | `SET PARTITIONED BY / SORTED BY` | `set_partition_spec` / `set_sort_order` |
-| `CREATE/DROP VIEW` | POST/DELETE `/views` with `dialect: duckdb`; only duckdb-dialect views bind on read, others listed but error on use |
+| `CREATE/DROP VIEW` | planned: POST/DELETE `/views` with `dialect: duckdb`; `CREATE VIEW` currently throws NotImplemented |
 | `COMMENT ON` | `/alter` ops `set_table_comment` / `set_column_comment` / `set_properties` (`versioned-table-metadata-v1`) — client work not done |
-| `SET/DROP NOT NULL`, `SET DEFAULT`, nested-field ops | **gap**: not in `AlterOp` (flat schema, no defaults on the wire) |
+| `SET/DROP NOT NULL`, `SET DEFAULT` | **gap**: not in `AlterOp` (no defaults on the wire) |
+| nested-field ops | client work not done: the wire has nested types and `add_column` with `parent`; the client's type set is flat |
 
 Multiple ALTER clauses batch into one `/alter` call (atomic, ordered —
 better than DuckLake's per-statement alters).
 
 ## Metadata / maintenance functions (parity table)
 
-DuckLake function → hoglake equivalent:
+DuckLake function → hoglake equivalent. Registered today: `hoglake_snapshots`,
+`hoglake_table_info`, `hoglake_current_snapshot`, `hoglake_compact`,
+`hoglake_expire`, `hoglake_cleanup`; rows marked (planned) are not.
 
 | DuckLake | hoglake extension | Notes |
 |---|---|---|
 | `ducklake_snapshots` | `hoglake_snapshots(cat)` | GET `/snapshots`, **paginated** (fixes the 15.3M-snapshot OOM); typed change rows surfaced as MAP |
 | `ducklake_table_info` | `hoglake_table_info(cat)` | per-table GET; delete-file counts derived from `/scan` |
-| `ducklake_table_insertions` | `hoglake_table_changes(cat, ns, t, from, to)` | GET `/changes`; append-only v1 — insertions + DV diffs; no update pre/post images (**wire gap**) |
+| `ducklake_table_insertions` | `hoglake_table_changes(cat, ns, t, from, to)` (planned) | GET `/changes`; append-only v1 — insertions + DV diffs; no update pre/post images (**wire gap**) |
 | `ducklake_table_deletions` | `delete_files` half of `/changes` | positions only; row materialization = read data file + DV diff |
 | `ducklake_merge_adjacent_files` | `hoglake_compact(cat)` | POST `/maintenance/compact` (server-side — the whole point) |
 | `ducklake_rewrite_data_files` | server compaction policy | no client knob; N/A |
@@ -391,18 +390,18 @@ DuckLake function → hoglake equivalent:
 | `ducklake_cleanup_old_files` | `hoglake_cleanup(cat)` | POST `/maintenance/cleanup` (liveness-checked server-side) |
 | `ducklake_delete_orphaned_files` | — | server concern; not exposed |
 | `ducklake_flush_inlined_data` | — | N/A (no inlining in hoglake, by design) |
-| `ducklake_set_option` / `options` | `hoglake_options(cat)` / `hoglake_set_retention(...)` | GET/PATCH `/options` (retention + consumer_floor only — hoglake options are server config) |
-| `ducklake_settings` | `hoglake_settings(cat)` | endpoint, extension version, data_path |
-| `ducklake_set_commit_message` | `hoglake_set_commit_message(cat, author, msg)` | rides CommitRequest `author`/`message` |
+| `ducklake_set_option` / `options` | `hoglake_options(cat)` / `hoglake_set_retention(...)` (planned) | GET/PATCH `/options` (retention + consumer_floor only — hoglake options are server config) |
+| `ducklake_settings` | `hoglake_settings(cat)` (planned) | endpoint, extension version, data_path |
+| `ducklake_set_commit_message` | `hoglake_set_commit_message(cat, author, msg)` (planned) | rides CommitRequest `author`/`message` |
 | `ducklake_current_snapshot` | `hoglake_current_snapshot(cat)` | the pinned snapshot |
-| `ducklake_last_committed_snapshot` | `hoglake_last_committed_snapshot(cat)` | in-process cache, as DuckLake |
-| `ducklake_list_files` | `hoglake_list_files(cat, t)` | GET `/files` (+ snapshot/time params); no encryption keys (N/A) |
+| `ducklake_last_committed_snapshot` | `hoglake_last_committed_snapshot(cat)` (planned) | in-process cache, as DuckLake |
+| `ducklake_list_files` | `hoglake_list_files(cat, t)` (planned) | GET `/files` (+ snapshot/time params); no encryption keys (N/A) |
 | `ducklake_add_data_files` | deferred | wire supports it in principle (client parses footers, commits); DuckLake's NULL `row_id_start` defect does not apply — hoglake assigns row ids at commit |
 | `ducklake_commit` | — | N/A: every hoglake commit is server-side by construction |
 | `CHECKPOINT` composite | maybe `expire→compact→cleanup` passthrough | low value; server loops exist |
-| `murmur3_32` | ported | needed for bucket-transform pruning anyway |
+| `murmur3_32` | planned | needed for bucket-transform pruning anyway |
 | time travel `AT (VERSION/TIMESTAMP =>)` | ✔ | `?snapshot=` / `?at_timestamp=` (410 below floor → clear error) |
-| consumer offsets | `hoglake_offsets(...)`, `hoglake_commit_offset(...)` | new surface (no DuckLake analogue); monotonic 409 surfaced |
+| consumer offsets | `hoglake_offsets(...)`, `hoglake_commit_offset(...)` (planned) | new surface (no DuckLake analogue); monotonic 409 surfaced |
 
 Not carried over (fleet-liability list, deliberate): data inlining,
 encryption, `metadata_*` options, multi-backend managers,
@@ -452,7 +451,7 @@ loops.
    asserts extension-written and pyhoglake-written files with the same
    logical partition value land in byte-identical partition string
    groups (int/date/timestamp-with-fractional-seconds/boolean). The
-   bounds codec (`tests/vectors/bounds_vectors.json`) has NO C++
+   bounds codec (`pyhoglake/tests/vectors/bounds_vectors.json`) has NO C++
    counterpart yet: stats ship deferred, so no bounds are encoded
    client-side; the vector harness lands with the bounds codec.
 3. **Semantics cross-check**: pyhoglake's integration tests are the
@@ -497,9 +496,10 @@ See [PARITY.md](PARITY.md) for the per-capability checklist
    `add_column_with_metadata` are AlterOps, and `Column` and `TableInfo`
    carry versioned `comment` fields. Binding `COMMENT ON` to them is
    client work.
-6. `/namespaces` and `.../tables` listings are head-only (no
-   `snapshot=` param) → catalog listings inside a pinned transaction
-   can drift from the pinned snapshot (per-table fetches are pinned).
+6. ~~`/namespaces` and `.../tables` listings are head-only.~~ The
+   server now takes `snapshot`/`at_timestamp` on both; the client still
+   lists at head, so catalog listings inside a pinned transaction can
+   drift from the pinned snapshot (per-table fetches are pinned).
 7. `FileRegistration` has no `explicit_row_ids` → clients cannot
    register explicit-row-id files, so client-side UPDATE cannot
    preserve row identity (ducklake preserves; hoglake UPDATE assigns

@@ -1,9 +1,9 @@
 import { Fragment, useEffect, useRef, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
-import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
+import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  ApiError,
   getFileStats,
-  getPartitionValues,
   getTable,
   listFiles,
   listTablePartitions,
@@ -21,7 +21,6 @@ import type {
   PartitionListing,
   PartitionSpec,
   PartitionSpecSummary,
-  PartitionValues,
   ScanFile,
   SortField,
   SortSpec,
@@ -48,6 +47,7 @@ import {
 import { applySort, int64Column, nextSort, textColumn } from "../lib/sort";
 import type { ColumnSort, SortState } from "../lib/sort";
 import { SortableTh } from "../components/SortableTh";
+import { PartitionLookupPanel } from "../components/PartitionLookupPanel";
 
 const TABS = ["schema", "files", "scan", "partitions"] as const;
 type Tab = (typeof TABS)[number];
@@ -883,31 +883,35 @@ const FILE_SORT_WIRE: Record<FileSortKey, string> = {
 const FILE_PAGE_SIZE = 100;
 
 /**
- * One dropdown per partition field, fed by GET .../partitions/values. The
- * server returns the stored, transformed values (a day ordinal, an
- * identity value); each is decoded for display exactly as the files
- * table's partition column is, and echoed back verbatim as the filter.
- * `key_index` is the field's position in the spec, which is what the
- * `partition=key_index:value` query param addresses.
+ * Stored-value filters work without enumerating a table's distinct
+ * partition values. Drafts are applied together so typing does not issue
+ * a manifest query per keystroke.
  */
 function PartitionFilterBar({
   spec,
-  values,
   columns,
   filter,
   onChange,
 }: {
   spec: PartitionSpec;
-  values: PartitionValues;
   columns?: Column[];
   filter: Record<number, string>;
-  onChange: (keyIndex: number, value: string) => void;
+  onChange: (filter: Record<number, string>) => void;
 }) {
-  const byFieldId = new Map(values.fields.map((f) => [String(f.source_field_id), f]));
+  const [draft, setDraft] = useState(filter);
   return (
-    <div className="partition-filter">
+    <form
+      className="partition-filter"
+      aria-label="partition filters"
+      onSubmit={(e) => {
+        e.preventDefault();
+        onChange(
+          Object.fromEntries(Object.entries(draft).filter(([, v]) => v !== "")),
+        );
+      }}
+    >
+      <span className="subtle">Stored values; blank matches all.</span>
       {spec.fields.map((field, keyIndex) => {
-        const fieldValues = byFieldId.get(String(field.source_field_id));
         // The partition-spec block's label (formatPartitionField) for a real
         // transform — hour(ts) / month(ts) / bucket(16, url) — but identity
         // is just the column name, not identity(team_id).
@@ -915,60 +919,46 @@ function PartitionFilterBar({
           field.transform === "identity"
             ? (columnPath(columns, field.source_field_id) ?? `field_${field.source_field_id}`)
             : formatPartitionField(field, columns);
-        const current = filter[keyIndex] ?? "";
-        if (fieldValues?.truncated) {
-          // Over the distinct-value cap: a partial dropdown would mislead.
-          return (
-            <label key={keyIndex} className="partition-filter-field">
-              {label}
-              <span className="subtle">too many to list</span>
-            </label>
-          );
-        }
-        // Sort the options by their DECODED display value, so a temporal
-        // field reads chronologically (2026-04, 2026-05…) and a long list
-        // is browsable. The server returns most-frequent-first, which is
-        // right for capping at the cap but the wrong order to browse. The
-        // stored value stays the option's value; only the order changes.
-        // An identity column of integers sorts NUMERICALLY (17, 42, 1042),
-        // not lexically (1042, 17, 42) — the raw string is the value there.
-        const raw = fieldValues?.values ?? [];
-        const numeric =
-          field.transform === "identity" &&
-          raw.length > 0 &&
-          raw.every((v) => v !== null && /^-?\d+$/.test(v));
-        const options = raw
-          .map((v) => ({
-            stored: v,
-            display: decodeValue(field.transform, v, field.transform_param),
-          }))
-          .sort((a, b) => {
-            if (numeric) {
-              const an = a.stored === null ? 0 : parseInt(a.stored, 10);
-              const bn = b.stored === null ? 0 : parseInt(b.stored, 10);
-              return an - bn;
-            }
-            return a.display < b.display ? -1 : a.display > b.display ? 1 : 0;
-          });
+        const current = draft[keyIndex] ?? "";
+        const decoded = decodeValue(field.transform, current, field.transform_param);
+        const hint = {
+          identity: undefined,
+          year: "years since 1970",
+          month: "months since 1970-01",
+          day: "days since 1970-01-01",
+          hour: "hours since 1970-01-01T00:00Z",
+          bucket: "bucket index",
+        }[field.transform];
         return (
           <label key={keyIndex} className="partition-filter-field">
             {label}
-            <select
+            <input
               value={current}
-              onChange={(e) => onChange(keyIndex, e.target.value)}
+              onChange={(e) =>
+                setDraft((prev) => ({ ...prev, [keyIndex]: e.target.value }))
+              }
               aria-label={`filter by ${label}`}
-            >
-              <option value="">all</option>
-              {options.map((o, i) => (
-                <option key={i} value={o.stored ?? ""}>
-                  {o.display}
-                </option>
-              ))}
-            </select>
+              placeholder={hint ?? "all"}
+              title={hint ? `Stored value: ${hint}` : "Exact stored value"}
+            />
+            {current !== "" && decoded !== current && (
+              <span className="subtle">{decoded}</span>
+            )}
           </label>
         );
       })}
-    </div>
+      <button type="submit">Apply partition filters</button>
+      <button
+        type="button"
+        className="ghost"
+        onClick={() => {
+          setDraft({});
+          onChange({});
+        }}
+      >
+        Clear partition filters
+      </button>
+    </form>
   );
 }
 
@@ -980,8 +970,8 @@ function FilesTab({
   spec,
   sortSpec,
   columns,
-  initialFilter,
-  onInitialFilterConsumed,
+  partitionFilter,
+  onPartitionFilterChange,
 }: {
   catalog: string;
   namespace: string;
@@ -990,59 +980,24 @@ function FilesTab({
   spec?: PartitionSpec;
   sortSpec?: SortSpec;
   columns?: Column[];
-  /**
-   * `partition=key_index:value` params the URL arrived with — how the
-   * partitions tab hands a row over. Seeds this tab's own state once,
-   * after which the dropdowns own the filter. The PAGE decides whether
-   * to hand them over (it passes undefined once they have been spent),
-   * so a remount cannot re-seed from params the user has since
-   * filtered away from; the params themselves stay on the URL, which
-   * is what keeps the filtered view shareable.
-   */
-  initialFilter?: Record<number, string>;
-  /**
-   * Called once, on mount, when [initialFilter] was non-empty: the URL
-   * params have been taken into this tab's own state, and the page
-   * must not hand them over again on a later remount — otherwise any
-   * tab switch resurrects the partition the user has since changed
-   * away from. The params stay on the URL so the view is shareable;
-   * the PAGE remembers that they have been spent.
-   */
-  onInitialFilterConsumed?: () => void;
+  partitionFilter: Record<number, string>;
+  onPartitionFilterChange: (filter: Record<number, string>) => void;
 }) {
   const [expanded, setExpanded] = useState<Int64 | null>(null);
+  const queryClient = useQueryClient();
   // null = the server's default order (manifest: begin_snapshot,
   // row_id_start, id). A set sort is in the query key, so it drives the
   // request and ordering happens server-side over the WHOLE table — a
   // client sort would only order the loaded page.
   const [sort, setSort] = useState<SortState<FileSortKey> | null>(null);
   const onSort = (key: FileSortKey) => setSort((prev) => nextSort(prev, key));
-  // The active partition filter: key_index → the stored value to match.
-  // One value per key; a key set to "" is unfiltered. Changing it refetches
-  // from offset 0 via the query key.
-  const [partitionFilter, setPartitionFilter] = useState<Record<number, string>>(
-    initialFilter ?? {},
-  );
-  // READ ONCE. The empty dependency list is the whole point: the URL
-  // seeds the dropdowns on arrival and the page then marks the params
-  // SPENT (they stay on the URL, so the view is still addressable), so
-  // this tab's own state is the only filter that moves afterwards.
-  useEffect(() => {
-    if (Object.keys(initialFilter ?? {}).length > 0) onInitialFilterConsumed?.();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-  // The dropdown options, from the server. Only fetched for a partitioned
-  // table; the values are stored strings, echoed back verbatim on apply.
-  const valuesQuery = useQuery({
-    queryKey: ["partition-values", catalog, namespace, table, snapshot ?? "head"],
-    queryFn: () => getPartitionValues(catalog, namespace, table, snapshot),
-    enabled: (spec?.fields.length ?? 0) > 0,
-  });
   const activeFilter = Object.fromEntries(
     Object.entries(partitionFilter).filter(([, v]) => v !== ""),
   );
+  const filesQueryKey = (filter: Record<number, string>) =>
+    ["files", catalog, namespace, table, snapshot ?? "head", sort, filter] as const;
   const query = useInfiniteQuery({
-    queryKey: ["files", catalog, namespace, table, snapshot ?? "head", sort, activeFilter],
+    queryKey: filesQueryKey(activeFilter),
     queryFn: ({ pageParam }) =>
       listFiles(catalog, namespace, table, snapshot, {
         sort: sort ? FILE_SORT_WIRE[sort.key] : undefined,
@@ -1063,7 +1018,6 @@ function FilesTab({
         ? allPages.length * FILE_PAGE_SIZE
         : undefined,
   });
-  if (query.isError) return <ErrorBox error={query.error} />;
   // The column appears only for a partitioned table: on an unpartitioned
   // one it would be a column of dashes.
   const partitioned = (spec?.fields.length ?? 0) > 0;
@@ -1080,19 +1034,28 @@ function FilesTab({
   const rows = (query.data?.pages ?? [])
     .flat()
     .map((file) => ({ file, partition: decodePartition(file, spec, columns) }));
+  const filters = partitioned ? (
+    <PartitionFilterBar
+      key={JSON.stringify([catalog, namespace, table, snapshot, spec, activeFilter])}
+      spec={spec!}
+      columns={columns}
+      filter={activeFilter}
+      onChange={(filter) => {
+        // Returning to a previous filter starts at its first page,
+        // rather than resurrecting every page cached for that query.
+        queryClient.removeQueries({
+          queryKey: filesQueryKey(filter),
+          exact: true,
+          type: "inactive",
+        });
+        onPartitionFilterChange(filter);
+      }}
+    />
+  ) : null;
+  if (query.isError) return <>{filters}<ErrorBox error={query.error} /></>;
   return (
     <>
-      {partitioned && valuesQuery.data && (
-        <PartitionFilterBar
-          spec={spec!}
-          values={valuesQuery.data}
-          columns={columns}
-          filter={partitionFilter}
-          onChange={(keyIndex, value) =>
-            setPartitionFilter((prev) => ({ ...prev, [keyIndex]: value }))
-          }
-        />
-      )}
+      {filters}
       <table className="data-table">
         <thead>
           <tr>
@@ -1368,12 +1331,14 @@ function PartitionsTab({
   namespace,
   table,
   onOpenFiles,
+  lookupHref,
 }: {
   catalog: string;
   namespace: string;
   table: string;
-  /** Switch to the files tab with this partition's stored values applied. */
+  /** Open exact inspection for a partitioned spec, or the unpartitioned files view. */
   onOpenFiles: (group: PartitionGroup) => string;
+  lookupHref: string;
 }) {
   const [sort, setSort] = useState<SortState<PartitionSortKey>>({
     key: "partition",
@@ -1459,6 +1424,10 @@ function PartitionsTab({
   // unrecoverable. `filterFields` falls back to the last spec seen.
   return (
     <>
+      <p>
+        <Link to={lookupHref}>Inspect exact partition</Link>
+        <span className="subtle"> · Enter a full tuple without a maintenance sample.</span>
+      </p>
       {keyCount > 0 && (
         <div className="partition-filter">
           {filterFields.map((field, keyIndex) => (
@@ -1493,6 +1462,9 @@ function PartitionsTab({
         </div>
       )}
       {query.isError && <ErrorBox error={query.error} />}
+      {query.isError && query.error instanceof ApiError && query.error.status === 422 && (
+        <p className="subtle">The sampled listing cannot serve this request. Use exact inspection above with a spec ID and the complete stored tuple.</p>
+      )}
       <table className="data-table">
         <thead>
           <tr>
@@ -1565,9 +1537,7 @@ function PartitionsTab({
             {rows.map((p, i) => (
               <tr key={i}>
                 <td className="partition-cell">
-                  {/* The link carries the STORED values, which is what
-                      the files listing matches on — the decoded form is
-                      for the reader, never for the wire. */}
+                  {/* Inspection uses the stored tuple under this row's spec. */}
                   <Link to={onOpenFiles(p)}>
                     {p.values.length === 0 ? (
                       <span className="subtle">unpartitioned</span>
@@ -1700,6 +1670,7 @@ export function TablePage() {
 
   const tabParam = searchParams.get("tab");
   const tab: Tab = TABS.includes(tabParam as Tab) ? (tabParam as Tab) : "schema";
+  const exactLookup = tab === "partitions" && searchParams.get("lookup") === "1";
   // A non-numeric ?snapshot (typo, mangled link) is ignored — treated as
   // head — rather than becoming NaN on screen and on the wire. Valid ids
   // stay exact decimal strings (int64: no Number round-trip).
@@ -1711,8 +1682,8 @@ export function TablePage() {
 
   const enabled = Boolean(catalog && namespace && table);
   const tableQuery = useQuery({
-    queryKey: ["table", catalog, namespace, table, snapshot ?? "head"],
-    queryFn: () => getTable(catalog!, namespace!, table!, snapshot),
+    queryKey: ["table", catalog, namespace, table, snapshot ?? "head", exactLookup ? "metadata" : "totals"],
+    queryFn: () => getTable(catalog!, namespace!, table!, snapshot, exactLookup ? { totals: false } : undefined),
     enabled,
   });
   if (!catalog || !namespace || !table) return null;
@@ -1721,7 +1692,7 @@ export function TablePage() {
    * `?partition=key_index:value` on the URL, as a filter map. This is
    * how the partitions tab hands a row to the files tab: the link
    * carries the STORED values, which is what the files listing matches
-   * on, and the files tab seeds its dropdowns from them.
+   * on. Applied edits replace these params, keeping the view shareable.
    */
   const urlPartitionFilter: Record<number, string> = Object.fromEntries(
     searchParams
@@ -1746,19 +1717,20 @@ export function TablePage() {
     return `?${next.toString()}`;
   };
 
-  /**
-   * Whether the URL's `partition=` params have already seeded the files
-   * tab in this page's lifetime.
-   *
-   * A REF, and it lives HERE rather than in FilesTab, because FilesTab
-   * unmounts on every tab switch while this component does not — so a
-   * flag inside it would reset and re-seed from a URL the user has
-   * since filtered away from (the round-2 finding). The params
-   * THEMSELVES stay on the URL: erasing them made the filtered files
-   * view unaddressable, and `tab`/`snapshot` set the convention that
-   * the URL is the state.
-   */
-  const partitionFilterSeeded = useRef(false);
+  const lookupHref = (group?: PartitionGroup): string => {
+    const next = new URLSearchParams({ tab: "partitions", lookup: "1" });
+    if (snapshot !== undefined) next.set("snapshot", snapshot);
+    if (group?.spec_id !== undefined) {
+      next.set("lookup_spec", group.spec_id);
+      next.set("lookup_values", JSON.stringify(group.values.map((value) => value.raw)));
+    }
+    return `?${next.toString()}`;
+  };
+
+  const inspectPartitionHref = (group: PartitionGroup): string =>
+    group.spec_id !== undefined && /^\d+$/.test(group.spec_id) && BigInt(group.spec_id) > 0n && group.values.length > 0
+      ? lookupHref(group)
+      : filesHref(group);
 
   const setParam = (key: string, value: string | undefined) => {
     setSearchParams(
@@ -1782,7 +1754,7 @@ export function TablePage() {
           </span>
         )}
       </h2>
-      {tableQuery.isError ? (
+      {!exactLookup && (tableQuery.isError ? (
         <ErrorBox error={tableQuery.error} />
       ) : tableQuery.isPending ? (
         <SkeletonBlock />
@@ -1794,7 +1766,7 @@ export function TablePage() {
           // cannot be asked (see TotalsFreshness).
           timeTravel={snapshot !== undefined}
         />
-      )}
+      ))}
       <div className="tab-bar">
         <div role="tablist" className="tabs">
           {TABS.map((t) => (
@@ -1809,10 +1781,10 @@ export function TablePage() {
             </button>
           ))}
         </div>
-        <SnapshotSelector
+        {!exactLookup && <SnapshotSelector
           snapshot={snapshot}
           onChange={(s) => setParam("snapshot", s)}
-        />
+        />}
       </div>
       {tab === "schema" &&
         (tableQuery.isSuccess ? <SchemaTab table={tableQuery.data} /> : null)}
@@ -1822,11 +1794,19 @@ export function TablePage() {
           namespace={namespace}
           table={table}
           snapshot={snapshot}
-          initialFilter={
-            partitionFilterSeeded.current ? undefined : urlPartitionFilter
-          }
-          onInitialFilterConsumed={() => {
-            partitionFilterSeeded.current = true;
+          partitionFilter={urlPartitionFilter}
+          onPartitionFilterChange={(filter) => {
+            setSearchParams(
+              (prev) => {
+                const next = new URLSearchParams(prev);
+                next.delete("partition");
+                for (const [keyIndex, value] of Object.entries(filter)) {
+                  next.append("partition", `${keyIndex}:${value}`);
+                }
+                return next;
+              },
+              { replace: true },
+            );
           }}
           /* The spec the tuples decode against. Already fetched for the
              schema tab, so this is a prop rather than a second request;
@@ -1848,13 +1828,35 @@ export function TablePage() {
           snapshot={snapshot}
         />
       )}
-      {tab === "partitions" && (
+      {tab === "partitions" && !exactLookup && (
         <PartitionsTab
           catalog={catalog}
           namespace={namespace}
           table={table}
-          onOpenFiles={filesHref}
+          onOpenFiles={inspectPartitionHref}
+          lookupHref={lookupHref()}
         />
+      )}
+      {exactLookup && (
+        <>
+          <p><Link to={`?${new URLSearchParams({ tab: "partitions", ...(snapshot === undefined ? {} : { snapshot }) })}`}>Back to sampled partitions</Link></p>
+          <PartitionLookupPanel
+            key={JSON.stringify([catalog, namespace, table])}
+            catalog={catalog}
+            namespace={namespace}
+            table={table}
+            defaultSpecId={tableQuery.data?.partition_spec?.spec_id}
+            renderFileStats={(fileId, at) => (
+              <FileStatsPanel
+                catalog={catalog}
+                namespace={namespace}
+                table={table}
+                fileId={fileId}
+                snapshot={at}
+              />
+            )}
+          />
+        </>
       )}
     </section>
   );

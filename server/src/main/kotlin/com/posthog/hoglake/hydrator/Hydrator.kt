@@ -2,17 +2,22 @@ package com.posthog.hoglake.hydrator
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.posthog.hoglake.model.ColType
+import com.posthog.hoglake.model.ColumnStats
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.HydratorSweepResult
 import com.posthog.hoglake.model.MaintenanceTask
 import com.posthog.hoglake.model.MaintenanceTrigger
+import com.posthog.hoglake.model.ObjectPrefix
+import com.posthog.hoglake.model.ObjectPrefixLayout
 import com.posthog.hoglake.model.RehydrateResult
 import com.posthog.hoglake.model.SplitOffsets
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.persistence.CatalogRepo
+import com.posthog.hoglake.persistence.LayoutRepo
 import com.posthog.hoglake.persistence.MaintenanceRunStore
 import com.posthog.hoglake.persistence.NamespaceRepo
+import com.posthog.hoglake.persistence.SpecRepo
 import com.posthog.hoglake.persistence.TableRepo
 import com.posthog.hoglake.persistence.bindBigintArrayOrNull
 import io.github.oshai.kotlinlogging.KotlinLogging
@@ -99,10 +104,26 @@ import java.time.Instant
  * anything, and its rows would be inserted only for the expiry purge to
  * cascade-delete them once compaction ends the file. What the
  * under-floor footer read still buys is the field-id audit flag and
- * `split_offsets`; it no longer unblocks anything, since the DDL guard
- * stopped refusing over `pending` files (#445). Whether that read is
- * worth its GET at millrace's file rate is the floor's own question,
- * not this guard's.
+ * `split_offsets` (and, on an object-prefix table, the prefix proof: see
+ * below); it no longer unblocks anything, since the DDL guard stopped
+ * refusing over `pending` files (#445). Whether that read is worth its
+ * GET at millrace's file rate on tables WITHOUT the option is the
+ * floor's own question, not this guard's.
+ *
+ * THE OBJECT-PREFIX CHECK (PR 2.1c). On a table with the object-prefix
+ * layout ([ObjectPrefix], `hog_table_layout`) the commit checks a
+ * deferred-stats file's path and canonical value but cannot check its
+ * stats, which it does not have; the footer is where the proof is made.
+ * After the aggregate and BEFORE the floor (so a file under it is
+ * checked too), the prefix field's footer aggregate must prove that every
+ * row holds the value the file was registered with
+ * ([ObjectPrefix.checkFieldStats], the commit's rule for inline stats).
+ * A file it cannot prove still flips to `provided` with its truthful
+ * stats, and the flip sets `prefix_quarantined` ([prefixMismatch] lists
+ * what counts as unproven). The cost on a table without the option is
+ * one `LayoutRepo.live` query per claimed catalog per sweep and one more
+ * projected column; with it, one key_index read per (table, spec) per
+ * sweep and one primary-key probe of `hog_file_partition_value` per file.
  */
 class Hydrator(
     private val jdbi: Jdbi,
@@ -152,7 +173,16 @@ class Hydrator(
         val fileSizeBytes: Long,
         val footerSize: Long?,
         val beginSnapshot: Long,
+        /** The spec its partition values were computed under; null when unpartitioned. */
+        val specId: Long?,
     )
+
+    /**
+     * What the object-prefix check needs of one file of a table with the
+     * layout: the prefix field and the raw value the file was registered
+     * with at its spec's identity key_index, null when none resolves.
+     */
+    internal data class PrefixClaim(val fieldId: Long, val rawValue: String?)
 
     /**
      * The sweep's claim, PER CATALOG with a fair share of [limit] (#269).
@@ -321,6 +351,7 @@ class Hydrator(
                     fileSizeBytes = rs.getLong("file_size_bytes"),
                     footerSize = rs.getObject("footer_size", java.lang.Long::class.java)?.toLong(),
                     beginSnapshot = rs.getLong("begin_snapshot"),
+                    specId = rs.getObject("spec_id", java.lang.Long::class.java)?.toLong(),
                 )
             }
             .list()
@@ -350,20 +381,26 @@ class Hydrator(
                 jdbi.inTransaction<Int, Exception> { h ->
                     val pending = claimPending(h, limit)
                     for ((catalogId, files) in pending.groupBy { it.catalogId }) {
-                        tallies[catalogId] = mutableListOf(files.size.toLong(), 0, 0, 0, 0)
+                        tallies[catalogId] = mutableListOf(files.size.toLong(), 0, 0, 0, 0, 0)
                     }
+                    val prefixFields = prefixFields(h, pending)
+                    val keyIndexes = HashMap<Triple<Long, Long, Long>, Int?>()
                     for (file in pending) {
-                        // [claimed, hydrated, failed, transient, stats skipped below floor]
+                        // [claimed, hydrated, failed, transient, stats skipped below floor, quarantined]
                         val tally = tallies.getValue(file.catalogId)
                         h.savepoint(FILE_SAVEPOINT)
                         try {
-                            when (hydrate(h, file)) {
-                                Outcome.HYDRATED -> tally[1]++
-                                Outcome.HYDRATED_WITHOUT_STATS -> {
-                                    tally[1]++
-                                    tally[4]++
+                            val prefix =
+                                prefixFields[file.catalogId to file.tableId]?.let { fieldId ->
+                                    PrefixClaim(fieldId, prefixValue(h, file, fieldId, keyIndexes))
                                 }
-                                Outcome.FAILED -> tally[2]++
+                            val outcome = hydrate(h, file, prefix)
+                            if (outcome == Outcome.FAILED) {
+                                tally[2]++
+                            } else {
+                                tally[1]++
+                                if (outcome.withoutStats) tally[4]++
+                                if (outcome.quarantined) tally[5]++
                             }
                         } catch (e: TransientFetchException) {
                             h.rollbackToSavepoint(FILE_SAVEPOINT)
@@ -408,10 +445,69 @@ class Hydrator(
                     failed = tally[2],
                     transient = tally[3],
                     statsSkippedBelowFloor = tally[4],
+                    quarantined = tally[5],
                 ),
             )
         }
         return processed
+    }
+
+    /**
+     * (catalog, table) -> object-prefix field id, for the tables [pending]
+     * belongs to: one [LayoutRepo.live] query per catalog, field ids only.
+     * The column behind a field is resolved per file, against the columns
+     * its stats bind to ([prefixMismatch]), and NOT here: this read runs
+     * outside every file's savepoint, so a layout it could not vouch for
+     * would fail the whole sweep. A table dropped after the claim keeps its
+     * live layout row (`TableRepo.markDropped` does not end it) but not its
+     * columns, and that can only quarantine that table's own file.
+     */
+    private fun prefixFields(
+        h: Handle,
+        pending: List<PendingFile>,
+    ): Map<Pair<Long, Long>, Long> =
+        pending.groupBy { it.catalogId }.flatMap { (catalogId, files) ->
+            LayoutRepo.live(h, catalogId, files.map { it.tableId }).map { (tableId, fieldId) ->
+                (catalogId to tableId) to fieldId
+            }
+        }.toMap()
+
+    /**
+     * The raw value [file] was registered with for the prefix field
+     * [fieldId]: its own spec's identity key_index ([ObjectPrefix.keyIndex],
+     * cached per sweep by (catalog, table, spec) in [keyIndexes]), then one
+     * primary-key probe of `hog_file_partition_value`. Null when the file
+     * has no spec, its spec has no single identity field on [fieldId], or
+     * the value is absent or NULL — states the commit refuses, which the
+     * check quarantines rather than throws on.
+     */
+    private fun prefixValue(
+        h: Handle,
+        file: PendingFile,
+        fieldId: Long,
+        keyIndexes: MutableMap<Triple<Long, Long, Long>, Int?>,
+    ): String? {
+        val specId = file.specId ?: return null
+        val key = Triple(file.catalogId, file.tableId, specId)
+        val keyIndex =
+            if (key in keyIndexes) {
+                keyIndexes[key]
+            } else {
+                ObjectPrefix.keyIndex(SpecRepo.fields(h, file.catalogId, file.tableId, specId), fieldId)
+                    .also { keyIndexes[key] = it }
+            } ?: return null
+        return h.createQuery(
+            """
+            SELECT value FROM hog_file_partition_value
+            WHERE catalog_id = :catalogId AND data_file_id = :dataFileId AND key_index = :keyIndex
+            """,
+        )
+            .bind("catalogId", file.catalogId)
+            .bind("dataFileId", file.dataFileId)
+            .bind("keyIndex", keyIndex)
+            .mapTo(String::class.java)
+            .findOne()
+            .orElse(null)
     }
 
     /**
@@ -498,8 +594,14 @@ class Hydrator(
             }
         }
 
-    /** How one claimed file resolved; see [hydrate]. */
-    private enum class Outcome { HYDRATED, HYDRATED_WITHOUT_STATS, FAILED }
+    /** How one claimed file resolved; see [hydrate]. Every outcome but [FAILED] is `provided`. */
+    private enum class Outcome(val withoutStats: Boolean = false, val quarantined: Boolean = false) {
+        HYDRATED,
+        HYDRATED_WITHOUT_STATS(withoutStats = true),
+        QUARANTINED(quarantined = true),
+        QUARANTINED_WITHOUT_STATS(withoutStats = true, quarantined = true),
+        FAILED,
+    }
 
     /**
      * Read [file]'s footer and resolve it: `provided` with its stats rows,
@@ -507,11 +609,13 @@ class Hydrator(
      * or `failed`. Everything but the row inserts is the same for both
      * `provided` outcomes — the field-id verdict, the split offsets, and
      * the aggregate itself, whose structural refusals still fail a file
-     * of any size.
+     * of any size. [prefix] is non-null on a table with the object-prefix
+     * layout, and a file its footer does not prove is quarantined.
      */
     private fun hydrate(
         h: Handle,
         file: PendingFile,
+        prefix: PrefixClaim?,
     ): Outcome {
         val footer = readFooter(file)
         // The field-id contract check rides the footer we already hold.
@@ -545,6 +649,10 @@ class Hydrator(
         // here (same rule the commit path runs on client-supplied
         // column_stats).
         val aggs = FooterStats.aggregate(footer, columns, file.path)
+        // THE OBJECT-PREFIX PROOF, ahead of the floor: a file under it
+        // skips its stats rows, never the check of its tenant boundary.
+        val mismatch = prefix?.let { prefixMismatch(it, columns, aggs) }
+        val quarantined = mismatch != null
         // THE SIZE FLOOR (#432): below it the aggregate is computed and
         // discarded. Strictly below: a file of exactly [minFileBytes]
         // gets its rows.
@@ -573,13 +681,14 @@ class Hydrator(
                 """
                 UPDATE hog_data_file
                    SET stats_state = 'provided', missing_field_ids = :missingFieldIds,
-                       split_offsets = :splitOffsets
+                       split_offsets = :splitOffsets, prefix_quarantined = :quarantined
                 WHERE catalog_id = :catalogId AND data_file_id = :dataFileId
                   AND stats_state = 'pending'
                 """,
             )
                 .bind("missingFieldIds", missingFieldIds)
                 .bindBigintArrayOrNull("splitOffsets", splitOffsets)
+                .bind("quarantined", quarantined)
                 .bind("catalogId", file.catalogId)
                 .bind("dataFileId", file.dataFileId)
                 .execute()
@@ -588,7 +697,13 @@ class Hydrator(
                 "file ${file.dataFileId} left 'pending' concurrently; stats upserted anyway"
             }
         }
-        Metrics.statsHydrated("provided")
+        Metrics.statsHydrated(if (quarantined) "quarantined" else "provided")
+        if (mismatch != null) {
+            log.warn {
+                "file ${file.dataFileId} (${file.path}) quarantined: its footer does not prove every row " +
+                    "holds its object-prefix value ($mismatch)"
+            }
+        }
         if (missingFieldIds) {
             log.warn {
                 "file ${file.dataFileId} (${file.path}) has leaves without parquet field ids; " +
@@ -603,7 +718,12 @@ class Hydrator(
                 "hydrated file ${file.dataFileId} (${file.path}): ${aggs.size} column stats"
             }
         }
-        return if (belowFloor) Outcome.HYDRATED_WITHOUT_STATS else Outcome.HYDRATED
+        return when {
+            quarantined && belowFloor -> Outcome.QUARANTINED_WITHOUT_STATS
+            quarantined -> Outcome.QUARANTINED
+            belowFloor -> Outcome.HYDRATED_WITHOUT_STATS
+            else -> Outcome.HYDRATED
+        }
     }
 
     private fun upsertStats(
@@ -756,6 +876,59 @@ class Hydrator(
 
     companion object {
         /**
+         * Why [aggs], a file's footer aggregates, do not prove that every row
+         * holds the value [prefix] names, or null when they do: the commit's
+         * rule for inline stats ([ObjectPrefix.checkFieldStats]: both bounds
+         * present and equal to the value's encoding, null_count 0), applied to
+         * the footer. FAIL-CLOSED — everything it cannot establish is a
+         * mismatch, never an error that fails the file or the sweep:
+         *
+         *  - no value (no spec, no single identity key, a missing or NULL
+         *    row), or one not canonical for the column's type;
+         *  - the field not among [columns]: a table dropped after the claim
+         *    has no live columns, though its layout row is still live;
+         *  - no aggregate for the field: the file lacks the column, a chunk
+         *    omitted a nullable column's null_count, or [FooterStats] refused
+         *    the whole file over a duplicate field id or sibling name;
+         *  - bounds the aggregate could not state (one chunk with unusable
+         *    statistics makes the file's unknown), nulls present (an all-null
+         *    chunk adds to null_count), or lower != upper: one row group of
+         *    another value's rows is enough.
+         */
+        internal fun prefixMismatch(
+            prefix: PrefixClaim,
+            columns: List<CatalogColumn>,
+            aggs: List<FooterStats.ColumnAgg>,
+        ): String? {
+            val column =
+                columns.firstOrNull { it.fieldId == prefix.fieldId }
+                    ?: return "field ${prefix.fieldId} is not a live column of the table"
+            val value =
+                ObjectPrefix.parseValue(prefix.rawValue, column.type)
+                    ?: return "registered value ${prefix.rawValue?.let { "'${it.take(64)}'" } ?: "none"} " +
+                        "is not a canonical ${column.type.wire}"
+            val stats =
+                aggs.firstOrNull { it.fieldId == prefix.fieldId }?.let {
+                    ColumnStats(
+                        it.fieldId,
+                        it.valueCount,
+                        it.nullCount,
+                        it.nanCount,
+                        it.sizeBytes,
+                        it.lowerBound,
+                        it.upperBound,
+                    )
+                }
+            val verdict =
+                ObjectPrefix.checkFieldStats(
+                    ObjectPrefixLayout(column.fieldId, column.name, column.type),
+                    value,
+                    stats,
+                )
+            return if (verdict == ObjectPrefix.Verdict.OK) null else "$verdict for '${column.name}' = $value"
+        }
+
+        /**
          * The sweep's claim, `internal` so the plan test EXPLAINs the
          * SQL PRODUCTION runs rather than a lookalike (AGENT.md: V14's
          * first index was proven against a predicate no code path
@@ -808,11 +981,15 @@ class Hydrator(
          * index at that moment. The same rule keeps `rehydrateFailed`
          * from requeueing an ended failed row: the sweep would never
          * take it, and the backlog gauge would count it forever.
+         *
+         * `f.spec_id` is projected for the object-prefix check and joins
+         * nothing: the row is heap-fetched for the lock and the path
+         * anyway, so the plan above is unchanged.
          */
         internal const val CLAIM_PENDING_SQL: String =
             """
             SELECT f.catalog_id, f.data_file_id, f.table_id, f.path, f.record_count,
-                   f.file_size_bytes, f.footer_size, f.begin_snapshot
+                   f.file_size_bytes, f.footer_size, f.begin_snapshot, f.spec_id
             FROM hog_data_file f
             JOIN hog_table t
               ON t.catalog_id = f.catalog_id AND t.table_id = f.table_id

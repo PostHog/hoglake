@@ -220,12 +220,16 @@ class CompactionCandidateFetchPlanIntegrationTest {
             // THE SUBJECT TABLE, in one generate_series so the three
             // populations are INTERLEAVED in the heap rather than
             // clustered — AGENT.md records what a clustered fixture does
-            // to a measurement of this kind.
+            // to a measurement of this kind. Some of its files are not
+            // VERIFIED in the object-prefix sense (pending where
+            // id % 11 = 0, quarantined where id % 13 = 0), scattered the
+            // same way, so the verified-only probe has rows to filter; the
+            // option-off probe ignores both columns.
             h.createUpdate(
                 """
                 INSERT INTO hog_data_file (catalog_id, data_file_id, table_id, begin_snapshot,
                                            path, record_count, file_size_bytes, row_id_start,
-                                           spec_id)
+                                           spec_id, stats_state, prefix_quarantined)
                 SELECT :c,
                        g,
                        :t,
@@ -234,7 +238,9 @@ class CompactionCandidateFetchPlanIntegrationTest {
                        CASE WHEN g % 7 < 3 THEN :freshRows ELSE :tinyRows END,
                        CASE WHEN g % 7 < 3 THEN :freshBytes ELSE :tinyBytes END,
                        g::bigint * 1000000,
-                       1
+                       1,
+                       CASE WHEN g % 11 = 0 THEN 'pending' ELSE 'provided' END,
+                       g % 13 = 0
                 FROM generate_series(1, :n) g
                 """,
             )
@@ -414,8 +420,8 @@ class CompactionCandidateFetchPlanIntegrationTest {
             }
         }
 
-    /** EXPLAIN the no-published-generation fallback. */
-    private fun explainFallback(): String {
+    /** EXPLAIN the no-published-generation fallback ([verifiedOnly]: an object-prefix table's). */
+    private fun explainFallback(verifiedOnly: Boolean = false): String {
         val svc = CompactionService(db.jdbi, store, cfg)
         val sql =
             svc.candidateSql(
@@ -423,6 +429,7 @@ class CompactionCandidateFetchPlanIntegrationTest {
                 nullArms = emptySet(),
                 scopeToSpec = false,
                 withPartitionValues = true,
+                verifiedOnly = verifiedOnly,
             )
         return db.jdbi.withHandleUnchecked { h ->
             h.begin()
@@ -504,16 +511,16 @@ class CompactionCandidateFetchPlanIntegrationTest {
     private fun rowsRemoved(plan: String): Long =
         Regex("""Rows Removed by Filter: (\d+)""").findAll(plan).sumOf { it.groupValues[1].toLong() }
 
-    /** Total shared buffers the PLAN's own root reports (its whole cost). */
-    private fun buffers(plan: String): Long {
-        // The root node's Buffers line, which is the statement's total.
-        // Taken from the root rather than summed across nodes, because
-        // a child's buffers are included in its parent's.
-        val line =
-            plan.split("\n").firstOrNull { it.contains("Buffers:") }
-                ?: error("no Buffers line in:\n$plan")
-        return Regex("""shared (?:hit|read)=(\d+)""").findAll(line).sumOf { it.groupValues[1].toLong() }
-    }
+    /**
+     * Total shared buffers, hit AND read, the PLAN's own root reports (its
+     * whole cost): taken from the root rather than summed across nodes,
+     * because a child's buffers are included in its parent's.
+     * [ExplainPlan.nodes] parses both counters; the pattern this replaced,
+     * `shared (?:hit|read)=`, read only the first of `shared hit=N read=M`
+     * and measured a cold scan as its cache hits (ExplainPlan's KDoc).
+     */
+    private fun buffers(plan: String): Long =
+        ExplainPlan.nodes(plan).firstOrNull()?.buffers ?: error("no plan node in:\n$plan")
 
     private fun actualRows(plan: String): Long =
         Regex("""actual rows=([\d.]+)""").find(plan)!!.groupValues[1].toDouble().toLong()
@@ -797,6 +804,120 @@ class CompactionCandidateFetchPlanIntegrationTest {
         assertThat(plan)
             .describedAs("and it reaches the values by their primary key:\n%s", plan)
             .contains("hog_file_partition_value_pkey")
+    }
+
+    // ---- the object-prefix layout's verified-only probe (2.1d) ----------------
+
+    /** The plan's nodes without their measurements: which scans, on which indexes, in which order. */
+    private fun shape(plan: String): List<String> = ExplainPlan.nodes(plan).map { it.line.substringBefore(" (actual") }
+
+    /** The subject table's live small files in [value]'s bucket that a per-value mount would (not) serve. */
+    private fun bucketCount(
+        value: String,
+        verified: Boolean,
+    ): Long =
+        db.jdbi.withHandleUnchecked { h ->
+            h.createQuery(
+                """
+                SELECT count(*) FROM hog_data_file f
+                JOIN hog_file_partition_value pv
+                  ON pv.catalog_id = f.catalog_id AND pv.data_file_id = f.data_file_id
+                WHERE f.catalog_id = :c AND f.table_id = :t AND pv.key_index = 0 AND pv.value = :v
+                  AND (f.stats_state = 'provided' AND NOT f.prefix_quarantined) = :verified
+                """,
+            ).bind("c", catalogId).bind("t", tableId).bind("v", value).bind("verified", verified)
+                .mapTo(Long::class.java).one()
+        }
+
+    /** The manifest scan's (rows returned, rows removed by its filter). */
+    private fun manifestScan(plan: String): Pair<Long, Long> {
+        val lines = plan.lines()
+        val at = lines.indexOfFirst { it.contains(" on hog_data_file f0") }
+        check(at >= 0) { "no manifest scan in:\n$plan" }
+        val rows = Regex("""actual rows=([\d.]+)""").find(lines[at])!!.groupValues[1].toDouble().toLong()
+        val removed =
+            lines.drop(at + 1).takeWhile { !it.contains("->") }
+                .firstNotNullOfOrNull { Regex("""Rows Removed by Filter: (\d+)""").find(it) }
+                ?.groupValues?.get(1)?.toLong() ?: 0L
+        return rows to removed
+    }
+
+    @Test
+    fun `an object-prefix table's verified-only probe is the same plan, with the mount predicate as a filter`() {
+        // A table with the object-prefix layout sends every probe with
+        // `verifiedOnly`, which adds `stats_state = 'provided' AND NOT
+        // prefix_quarantined` to the inner scan and nothing else
+        // (CandidateSqlGoldenTest). Neither column is indexed, so the
+        // predicate has to ride the SAME scan as a filter: node for node
+        // the plan of the option-off probe, on the same indexes. The
+        // fixture's subject table has ~16% unverified files (seed()), so
+        // the filter has rows to remove, and what it costs is the extra
+        // rows the scan visits to fill the cap with verified ones.
+        val verified =
+            CompactionService(db.jdbi, store, cfg).candidateSql(
+                arms = listOf(0),
+                nullArms = emptySet(),
+                scopeToSpec = true,
+                withPartitionValues = false,
+                verifiedOnly = true,
+            )
+        for (value in listOf("day-00007", BIG_BUCKET, "fresh-1")) {
+            val unverified = bucketCount(value, verified = false)
+            assertThat(unverified).describedAs("%s holds unverified files, or this proves nothing", value).isPositive()
+            // Each statement twice, the comparisons on the WARM run, so
+            // the buffer counts measure the plan rather than the cache.
+            explainBucket(value)
+            explainBucket(value, sql = verified)
+            val off = explainBucket(value)
+            val on = explainBucket(value, sql = verified)
+            assertBucketDriven(on)
+            assertThat(shape(on))
+                .describedAs("the same nodes and indexes:\n%s\n----\n%s", off, on)
+                .isEqualTo(shape(off))
+            assertThat(actualRows(on))
+                .describedAs("%s: the verified files, capped", value)
+                .isEqualTo(minOf(bucketCount(value, verified = true), cfg.candidateBudget.toLong()))
+            val lines = on.lines()
+            val scan = lines.indexOfFirst { it.contains(" on hog_data_file f0") }
+            assertThat(lines.drop(scan + 1).takeWhile { !it.contains("->") }.filter { it.trim().startsWith("Filter:") })
+                .describedAs("the predicate filters the manifest scan itself:\n%s", on)
+                .singleElement()
+                .satisfies({ assertThat(it).contains("stats_state").contains("prefix_quarantined") })
+            val (offRows, offRemoved) = manifestScan(off)
+            val (onRows, onRemoved) = manifestScan(on)
+            if (bucketSize(value) <= cfg.candidateBudget) {
+                // Under the cap the scan visits the whole bucket either way,
+                // so the filter's extra removals are EXACTLY the bucket's
+                // unverified files (the rest are the neighbours' rows the
+                // table_id filter drops in both).
+                assertThat(onRemoved - offRemoved)
+                    .describedAs("%s: removed by the mount predicate:\n%s", value, on)
+                    .isEqualTo(unverified)
+            } else {
+                // Over it the scan stops at the cap's worth of VERIFIED rows,
+                // so it filters the unverified files it passes on the way and
+                // never more than the bucket holds.
+                assertThat(onRemoved - offRemoved)
+                    .describedAs("%s: removed by the mount predicate:\n%s", value, on)
+                    .isPositive()
+                    .isLessThanOrEqualTo(unverified)
+            }
+            // The cost is the extra rows visited, a bounded per-row probe,
+            // never a walk: at most 3 buffers per extra manifest row.
+            val extraVisited = (onRows + onRemoved) - (offRows + offRemoved)
+            assertThat(buffers(on))
+                .describedAs("%s: %d extra rows visited:\n%s\n----\n%s", value, extraVisited, off, on)
+                .isLessThanOrEqualTo(buffers(off) + 3 * extraVisited + 16)
+            println(
+                "RECORDED verified-only probe $value: buffers ${buffers(on)} (option off ${buffers(off)}), " +
+                    "$extraVisited extra rows visited, ${onRemoved - offRemoved} unverified filtered",
+            )
+        }
+        // The no-sample fallback keeps V10's ordered size scan and its cap.
+        val fallback = explainFallback(verifiedOnly = true)
+        assertThat(shape(fallback)).isEqualTo(shape(explainFallback()))
+        assertThat(fallback).contains("hog_data_file_maintenance_size_scan").contains("prefix_quarantined")
+        assertThat(actualRows(fallback)).isEqualTo(cfg.maxCandidates.toLong())
     }
 
     // ---- and the planner as a whole -------------------------------------------

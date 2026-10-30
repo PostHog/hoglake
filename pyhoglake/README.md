@@ -135,7 +135,7 @@ for s in catalog.snapshots(before=head + 1):
 
 | What | How |
 |---|---|
-| Server | `HoglakeClient(base_url, timeout=30.0)` — `/v1` is appended |
+| Server | `HoglakeClient(base_url, timeout=30.0, auth=None)` — `/v1` is appended; `auth=` takes `pyhoglake.auth.BearerToken` or `pyhoglake.auth.ClientCredentials` |
 | Object store | `S3Config(access_key, secret_key, endpoint_override, region, allow_bucket_creation, single_request_uploads)`; the write path uses `pyarrow.fs.S3FileSystem` (path-style with an endpoint override), and `boto3` built from the same settings for single-request uploads (`single_request_uploads=False` sends everything through the streaming writer) |
 | Parquet codec | `compression=` / `compression_level=` on `Table.append` and `Table.prepare_append_tables`. **Default: none passed, so pyarrow's default — SNAPPY**, ~4x larger than `compression="zstd", compression_level=3` on JSON-heavy event data. Allowed: `zstd` (levels 1–9), `snappy`, `none` — the codecs hoglake compaction can decode and a writer can afford to encode. `pyhoglake.parquet_write_options(compression, compression_level)` applies the same validation, so a caller can refuse a bad setting at startup; the append calls refuse it before any request. Its docstring has the measurements and when the choice is permanent (files at or over the compaction target). `prepare_append_files` uploads the caller's own files and does not re-encode them |
 | Deferred stats | `deferred_stats=True` on `Table.append`, `Table.prepare_append_tables` and `Table.prepare_append_files` (keyword-only; **default `False`, unchanged**: stats ship with the commit). Leaves `column_stats` out of every file registration, so the server registers the file `stats_state='pending'` and its hydrator reads the footer later, outside the per-catalog commit lock. Until then readers see no column bounds for that file, and a file under the server's `HOGLAKE_HYDRATOR_MIN_FILE_BYTES` (1 MiB by default) never gets stats rows — no bounds until compaction rewrites it. `add_column` / `rename_column` on the table are not held up by a pending file: the server trusts its field ids until the hydrator's footer read proves otherwise, as it does for every inline-stats file. In exchange each deferred file gets the hydrator's `missing_field_ids` audit, which inline-stats files never get |
@@ -882,7 +882,7 @@ totals. Only the writer path asks for identity alone, and
 contract is to compare the caller's layout against a fresh *server*
 read.
 
-## Not in 0.1
+## Not yet supported
 
 Deletion-vector writes and Iceberg-facade reads.
 

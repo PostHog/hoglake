@@ -8,6 +8,7 @@ import com.posthog.hoglake.api.installDebugRoutes
 import com.posthog.hoglake.api.installErrorMapping
 import com.posthog.hoglake.api.installMaintenanceRoutes
 import com.posthog.hoglake.api.installPartitionListingRoutes
+import com.posthog.hoglake.api.installPartitionLookupRoutes
 import com.posthog.hoglake.api.installPartitionStatsRoutes
 import com.posthog.hoglake.api.installPublicationRoutes
 import com.posthog.hoglake.api.installScanRoutes
@@ -35,6 +36,7 @@ import com.posthog.hoglake.service.MaintenanceStatusService
 import com.posthog.hoglake.service.MaintenanceSummarySampler
 import com.posthog.hoglake.service.OptionsService
 import com.posthog.hoglake.service.PartitionListingService
+import com.posthog.hoglake.service.PartitionLookupService
 import com.posthog.hoglake.service.PartitionStatsService
 import com.posthog.hoglake.service.ReindexService
 import com.posthog.hoglake.service.RemovalStore
@@ -116,6 +118,7 @@ class App private constructor(
     }
     private val alterService by lazy { AlterService(jdbi!!) }
     private val scanService by lazy { ScanService(jdbi!!) }
+    private val partitionLookupService by lazy { PartitionLookupService(jdbi!!) }
     private val viewService by lazy { ViewService(jdbi!!) }
     private val optionsService by lazy { OptionsService(jdbi!!) }
     private val expiryService by lazy { ExpiryService(jdbi!!, cfg) }
@@ -275,6 +278,7 @@ class App private constructor(
             maxInputFiles = cfg.compactionMaxInputFiles,
         )
     }
+    private val hoglitePartitionLookup by lazy { com.posthog.hoglake.hoglite.HoglitePartitionLookup(hogliteStore()) }
 
     /** One hydrator: the background sweep loop AND the rehydrate route. */
     private val hydrator by lazy {
@@ -494,10 +498,10 @@ class App private constructor(
             // metrics + audit log. GATED by auth/AuthPolicy.kt as
             // operator-only: the exposition carries per-catalog labels,
             // i.e. the tenant roster, so it is not a public surface.
-            // docs/auth-tenancy.md §6.7 moves it to a second
-            // cluster-internal listener, which is the right home; until
-            // that lands, flipping HOGLAKE_AUTH_MODE=enforce in a cluster
-            // requires the scrape job to hold an operator token.
+            // The scraper uses the infra listener instead
+            // (HOGLAKE_METRICS_PORT, observability/MetricsListener.kt,
+            // docs/auth-tenancy.md §6.7), which serves the same registry
+            // with no auth plugin on a port the Service does not expose.
             get("/metrics") {
                 call.respondText(
                     this@App.meterRegistry.scrape(),
@@ -563,6 +567,7 @@ class App private constructor(
             )
             app.installPartitionStatsRoutes(partitionStatsService)
             app.installPartitionListingRoutes(partitionListingService)
+            app.installPartitionLookupRoutes(partitionLookupService)
         } else {
             // HOGLAKE_DATABASE=hoglite. These route groups run against
             // the hoglite-backed implementations in the hoglite package
@@ -583,6 +588,7 @@ class App private constructor(
             )
             app.installPartitionStatsRoutes(hoglitePartitions)
             app.installPartitionListingRoutes(hoglitePartitions)
+            app.installPartitionLookupRoutes(hoglitePartitionLookup)
         }
     }
 

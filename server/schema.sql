@@ -322,6 +322,12 @@ CREATE TABLE hog_data_file (
     -- [0, file_size_bytes), at most 100,000 entries) is enforced in
     -- code by model/SplitOffsets.kt, not by a CHECK.
     split_offsets   bigint[],
+    -- V30: set by the hydrator when a deferred-stats file of a table with
+    -- the object-prefix layout (hog_table_layout) flips to 'provided' but
+    -- its footer does not prove every row holds its prefix value. A
+    -- reader of such a table includes only `stats_state = 'provided' AND
+    -- NOT prefix_quarantined` (model/ObjectPrefix.kt).
+    prefix_quarantined boolean NOT NULL DEFAULT false,
     PRIMARY KEY (catalog_id, data_file_id),
     FOREIGN KEY (catalog_id, table_id) REFERENCES hog_table ON DELETE CASCADE,
     CHECK (end_snapshot IS NULL OR end_snapshot > begin_snapshot)
@@ -360,6 +366,10 @@ CREATE INDEX hog_data_file_failed
 CREATE INDEX hog_data_file_missing_field_ids
     ON hog_data_file (catalog_id, table_id)
     WHERE missing_field_ids AND end_snapshot IS NULL;
+-- V31: the fourth attention index, for hoglake_object_prefix_quarantined_files.
+CREATE INDEX hog_data_file_prefix_quarantined
+    ON hog_data_file (catalog_id, table_id)
+    WHERE prefix_quarantined AND end_snapshot IS NULL;
 
 -- Per-file, per-column zone maps. Bounds are stored in Iceberg
 -- single-value binary serialization (opaque to Postgres) so manifest
@@ -491,6 +501,27 @@ CREATE TABLE hog_sort_field (
     FOREIGN KEY (catalog_id, table_id, sort_id)
         REFERENCES hog_sort_spec ON DELETE CASCADE
 );
+
+-- ---- Object layout (V29) ----
+-- Versioned per-table layout option, the sort-spec shape: a live row
+-- means every data file and deletion vector of the table lives under
+-- <data_path>/data/<ns>/<table>/<field>=<value>/ (model/ObjectPrefix.kt),
+-- enforced at commit. object_prefix_field_id has no foreign key
+-- (hog_column's key includes begin_snapshot); the DDL refuses dropping or
+-- renaming the field while the option is on. At most one live row per
+-- table (the unique partial index).
+CREATE TABLE hog_table_layout (
+    catalog_id             bigint NOT NULL,
+    table_id               bigint NOT NULL,
+    begin_snapshot         bigint NOT NULL,
+    end_snapshot           bigint,
+    object_prefix_field_id bigint NOT NULL,
+    PRIMARY KEY (catalog_id, table_id, begin_snapshot),
+    FOREIGN KEY (catalog_id, table_id) REFERENCES hog_table ON DELETE CASCADE,
+    CHECK (end_snapshot IS NULL OR end_snapshot > begin_snapshot)
+);
+CREATE UNIQUE INDEX hog_table_layout_live
+    ON hog_table_layout (catalog_id, table_id) WHERE end_snapshot IS NULL;
 
 -- ---- Row-level deletes: deletion vectors ----
 -- One DV file per data file per range; a new DV supersedes the old
@@ -751,8 +782,9 @@ CREATE INDEX hog_data_file_maintenance_scan
 -- because that is the order compaction bin-packs in.
 CREATE INDEX hog_data_file_maintenance_size_scan
     ON hog_data_file (catalog_id, table_id, file_size_bytes, data_file_id);
-CREATE INDEX hog_delete_file_data_lookup
-    ON hog_delete_file (catalog_id, data_file_id);
+-- Ordered retained-history seek; end_snapshot is checked after LIMIT 1.
+CREATE INDEX hog_delete_file_snapshot_lookup
+    ON hog_delete_file (catalog_id, data_file_id, begin_snapshot DESC, delete_file_id DESC);
 
 -- Changefeed windows range on begin_snapshot over ALL files (dead ones
 -- included — replay semantics); hog_data_file_live is partial on

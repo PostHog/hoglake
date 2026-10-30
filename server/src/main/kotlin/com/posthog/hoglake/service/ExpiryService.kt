@@ -104,10 +104,17 @@ import java.time.Duration
  * what keeps that ordering true across a paged walk.
  *
  * A fifth step applies the same reachability rule to the accumulating
- * versioned DDL tables (hog_table_version, hog_column,
- * hog_partition_spec, hog_sort_spec, hog_view): rows with
- * end_snapshot <= newEarliest are invisible at every retained snapshot
- * and are deleted — DDL churn no longer grows them without bound. The
+ * versioned DDL tables (hog_table_version, hog_column, hog_sort_spec,
+ * hog_view, hog_table_layout): rows with end_snapshot <= newEarliest are invisible at
+ * every retained snapshot and are deleted — DDL churn no longer grows
+ * them without bound. hog_partition_spec is NOT among them: a file row
+ * names its spec by `spec_id`, whatever snapshot is read, so a retired
+ * spec stays needed while any file written under it lives; and a new
+ * spec's id is `MAX(spec_id) + 1`, so a deleted retired spec that held
+ * the table's highest id (e.g. the table was later set unpartitioned)
+ * would have its id handed to the next spec, relabelling those files.
+ * Spec rows are bounded by partition-spec changes and partitioned-table
+ * creations, which are rare. The
  * floor advance also captures the new floor snapshot's snapshot_time
  * into hog_catalog.earliest_snapshot_time (the reconciliation anchor
  * that 410s cite once the snapshot rows below the floor are gone).
@@ -233,10 +240,10 @@ class ExpiryService(
      * MAXIMUM count rather than the exact one (a catalog with
      * `consumer_floor` off skips the floor read and runs 10), so the
      * derived bound is conservative in the direction that matters — against a phase A
-     * whose statements are a PK read, two aggregate reads over
-     * `hog_snapshot`, a range delete bounded by `batchSize`, one
-     * single-row UPDATE and five deletes over tables whose whole row
-     * counts are in the thousands. It is a bound on the pathological
+     * whose statements are the eleven listed on
+     * [BOUNDED_STATEMENTS_PER_ADVANCE]: point and bounded reads, a range
+     * delete bounded by `batchSize`, one single-row UPDATE and deletes
+     * over tables whose whole row counts are in the thousands. It is a bound on the pathological
      * case, not a budget anything normal spends.
      *
      * Floored at 1 ms, because `SET statement_timeout = 0` means
@@ -420,7 +427,7 @@ class ExpiryService(
          *     FK's `ON DELETE CASCADE` (`V1__init.sql`) whatever its own
          *     state, and a cascaded delete queues nothing — a
          *     permanently leaked puffin object with no row left to find
-         *     it. Driven by `hog_delete_file_data_lookup
+         *     it. Driven by `hog_delete_file_snapshot_lookup
          *     (catalog_id, data_file_id)`, so it is an index probe per
          *     deleted row rather than a scan.
          *
@@ -646,10 +653,26 @@ class ExpiryService(
             listOf(
                 "hog_table_version",
                 "hog_column",
-                "hog_partition_spec",
                 "hog_sort_spec",
                 "hog_view",
+                // V29. With no unset op yet nothing ends a layout row, so
+                // this deletes nothing today; it is here so the first op
+                // that does cannot leave its corpses unbounded.
+                "hog_table_layout",
             )
+
+        /**
+         * Versioned tables step 5 deliberately never clears. A
+         * `hog_data_file` row names its partition spec by `spec_id`
+         * (no snapshot qualifier). The partition listing and stats label
+         * a retired spec's files from its field rows, while scan pruning
+         * and compaction bucketing rely on its id staying unique.
+         * `AlterService.installPartitionSpec` allocates
+         * `MAX(spec_id) + 1`, so a deleted retired spec that held the
+         * table's highest id would have that id handed to the next spec,
+         * relabelling those files.
+         */
+        val VERSIONED_TABLES_NEVER_CLEARED = listOf("hog_partition_spec")
 
         /** See `Config.expiryPurgePage`. */
         const val PURGE_PAGE = 1_000
@@ -1170,8 +1193,10 @@ class ExpiryService(
      * that encoded the old timing, and #262 taught its `hog_data_file` /
      * `hog_delete_file` arm to assert only against a sweep whose ledger
      * row reported the purge DRAINED at a floor covering the current
-     * one, while the five DDL tables kept the no-lag property because
-     * step 5 is still phase A's. #261 then removed the whole check, so
+     * one, while the step-5 tables ([VERSIONED_RETENTION_TABLES])
+     * kept the no-lag property because step 5 is still phase A's
+     * (hog_partition_spec, [VERSIONED_TABLES_NEVER_CLEARED], is never
+     * cleared, so it has no floor property at all). #261 then removed the whole check, so
      * NOTHING asserts the invariant half today — a drained purge that
      * leaves rows below the floor is unwatched until the paged scrubber
      * (#261). The backlog half is unaffected and never went through
@@ -1375,10 +1400,12 @@ class ExpiryService(
         // it is unreachable by any valid read (head reads see only
         // end IS NULL rows) and can be deleted outright. Live rows
         // (end IS NULL) and rows ending above the floor are untouched, so
-        // time travel at every S >= newEarliest is unchanged. Child tables
-        // (hog_partition_field, hog_sort_field) follow their spec headers
-        // via FK ON DELETE CASCADE. Incremental like the steps above: the
-        // range is bounded by newEarliest, which batchSize caps per sweep.
+        // time travel at every S >= newEarliest is unchanged. Child rows
+        // (hog_sort_field) follow their spec headers via FK ON DELETE
+        // CASCADE. Partition specs are not in the list: file rows name
+        // them by spec_id at every snapshot (VERSIONED_TABLES_NEVER_CLEARED).
+        // Incremental like the steps above: the range is bounded by
+        // newEarliest, which batchSize caps per sweep.
         for (table in VERSIONED_RETENTION_TABLES) {
             h.createUpdate(
                 """

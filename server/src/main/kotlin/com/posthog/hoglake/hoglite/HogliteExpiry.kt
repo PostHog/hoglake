@@ -22,8 +22,16 @@ import java.time.Instant
  *    the snapshot + change rows below it, advance
  *    `meta.earliest_snapshot_id` capturing the new floor's timestamp,
  *    and purge the below-floor corpses of the versioned DDL tables
- *    (table_versions, columns, partition_specs, sort_specs, views —
- *    VERSIONED_RETENTION_TABLES's list).
+ *    (table_versions, columns, sort_specs, table_layouts, views —
+ *    VERSIONED_RETENTION_TABLES's list). partition_specs is NOT among
+ *    them (VERSIONED_TABLES_NEVER_CLEARED): a file row names its spec by
+ *    `spec_id` whatever snapshot is read, so a retired spec stays needed
+ *    while any file written under it lives — the partition listing and
+ *    stats label those files from it, the lookup resolves its arity, the
+ *    commit and hydrator read a DV target's / pending file's prefix key
+ *    from it — and a new spec's id is `MAX(spec_id) + 1`
+ *    (HogliteAlters.setPartitionSpec), so deleting the highest retired
+ *    spec would hand its id to the next one and relabel those files.
  *  - PHASE B (paged, outside any guard): delete the ended file rows
  *    below the floor and queue every removed path into `removals`,
  *    the superseded-vector arm first, then the data-file arm whose
@@ -281,7 +289,11 @@ internal class HogliteExpiry(
         ) { HoglakeException.NotFound("catalog (meta row missing)") }
         // Versioned-row retention: end/dropped <= floor means no retained
         // snapshot can see the row (visibility is begin <= S < end).
-        for (table in listOf("table_versions", "columns", "partition_specs", "sort_specs")) {
+        // partition_specs is deliberately absent (class KDoc), and
+        // table_layouts is here although nothing ends a layout row yet
+        // (no unset op), so the first op that does cannot leave its
+        // corpses unbounded — ExpiryService's two lists, ported.
+        for (table in VERSIONED_RETENTION_TABLES) {
             tx.add(
                 "DELETE FROM $table WHERE end_snapshot IS NOT NULL AND end_snapshot <= ?",
                 newEarliest,
@@ -469,8 +481,14 @@ internal class HogliteExpiry(
         return Purge(dataRows, deleteRows, pages, failures, truncated, remaining)
     }
 
-    private companion object {
+    internal companion object {
         /** Saturating backlog cap — ExpiryService.PURGE_REMAINING_CAP. */
         const val PURGE_REMAINING_CAP = 100_000
+
+        /** ExpiryService.VERSIONED_RETENTION_TABLES over the tenant schema (views purge by dropped_snapshot). */
+        val VERSIONED_RETENTION_TABLES = listOf("table_versions", "columns", "sort_specs", "table_layouts")
+
+        /** ExpiryService.VERSIONED_TABLES_NEVER_CLEARED over the tenant schema; see the class KDoc. */
+        val VERSIONED_TABLES_NEVER_CLEARED = listOf("partition_specs")
     }
 }

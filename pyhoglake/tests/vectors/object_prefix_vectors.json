@@ -1,0 +1,538 @@
+{
+  "format": "hoglake-object-prefix-vectors",
+  "version": 1,
+  "description": "Shared vectors for the object-prefix layout: a table with an object-prefix field keeps every data file and deletion vector under <data_path>/data/<ns>/<table>/<field>=<value>/, where value is the canonical decimal of the file's identity partition value. prefix_cases: build the prefix, or refuse the value. containment_cases: whether a path is an object under a prefix. stats_cases: whether a file's column stats for the field prove every row holds the value (Iceberg single-value bounds, lowercase hex). iam: resource_pattern with the tag replaced by each of values must equal 'arn:aws:s3:::' + that value's prefix without 's3://' + '*'; read as an IAM glob ('*' spans '/'), the pattern for value 4 must not match 'arn:aws:s3:::' + each of foreign_keys (bucket/key strings). The count of every case, iam values and foreign keys included, is pinned by the server's ObjectPrefixVectorsTest and by pyhoglake's test_object_prefix_vectors.py.",
+  "prefix_cases": [
+    {
+      "data_path": "s3://hoglake-prod-us/lake",
+      "namespace": "ingest",
+      "table": "events",
+      "field": "team_id",
+      "col_type": "long",
+      "value": "4",
+      "expected": "s3://hoglake-prod-us/lake/data/ingest/events/team_id=4/"
+    },
+    {
+      "data_path": "s3://hoglake-prod-us/lake/",
+      "namespace": "ingest",
+      "table": "events",
+      "field": "team_id",
+      "col_type": "long",
+      "value": "4",
+      "expected": "s3://hoglake-prod-us/lake/data/ingest/events/team_id=4/"
+    },
+    {
+      "data_path": "s3://hoglake-prod-us/lake",
+      "namespace": "ingest",
+      "table": "events",
+      "field": "team_id",
+      "col_type": "long",
+      "value": "0",
+      "expected": "s3://hoglake-prod-us/lake/data/ingest/events/team_id=0/"
+    },
+    {
+      "data_path": "s3://hoglake-prod-us/lake",
+      "namespace": "ingest",
+      "table": "events",
+      "field": "team_id",
+      "col_type": "long",
+      "value": "42",
+      "expected": "s3://hoglake-prod-us/lake/data/ingest/events/team_id=42/"
+    },
+    {
+      "data_path": "s3://hoglake-prod-us/lake",
+      "namespace": "ingest",
+      "table": "events",
+      "field": "team_id",
+      "col_type": "long",
+      "value": "9223372036854775807",
+      "expected": "s3://hoglake-prod-us/lake/data/ingest/events/team_id=9223372036854775807/"
+    },
+    {
+      "data_path": "s3://hoglake-prod-us/lake",
+      "namespace": "ingest",
+      "table": "events",
+      "field": "team_id",
+      "col_type": "long",
+      "value": "9223372036854775808",
+      "error": "invalid_value"
+    },
+    {
+      "data_path": "s3://hoglake-prod-us/lake",
+      "namespace": "ingest",
+      "table": "events",
+      "field": "team_id",
+      "col_type": "long",
+      "value": "042",
+      "error": "invalid_value"
+    },
+    {
+      "data_path": "s3://hoglake-prod-us/lake",
+      "namespace": "ingest",
+      "table": "events",
+      "field": "team_id",
+      "col_type": "long",
+      "value": "+4",
+      "error": "invalid_value"
+    },
+    {
+      "data_path": "s3://hoglake-prod-us/lake",
+      "namespace": "ingest",
+      "table": "events",
+      "field": "team_id",
+      "col_type": "long",
+      "value": "-4",
+      "error": "invalid_value"
+    },
+    {
+      "data_path": "s3://hoglake-prod-us/lake",
+      "namespace": "ingest",
+      "table": "events",
+      "field": "team_id",
+      "col_type": "long",
+      "value": "",
+      "error": "invalid_value"
+    },
+    {
+      "data_path": "s3://hoglake-prod-us/lake",
+      "namespace": "ingest",
+      "table": "events",
+      "field": "team_id",
+      "col_type": "long",
+      "value": "4 ",
+      "error": "invalid_value"
+    },
+    {
+      "data_path": "s3://hoglake-prod-us/lake",
+      "namespace": "ingest",
+      "table": "events",
+      "field": "team_id",
+      "col_type": "long",
+      "value": "4.0",
+      "error": "invalid_value"
+    },
+    {
+      "data_path": "s3://hoglake-prod-us/lake",
+      "namespace": "ingest",
+      "table": "events",
+      "field": "team_id",
+      "col_type": "long",
+      "value": "1e3",
+      "error": "invalid_value"
+    },
+    {
+      "data_path": "s3://hoglake-prod-us/lake",
+      "namespace": "ingest",
+      "table": "events",
+      "field": "team_id",
+      "col_type": "long",
+      "value": "\u0664\u0662",
+      "error": "invalid_value"
+    },
+    {
+      "data_path": "s3://hoglake-prod-us/lake",
+      "namespace": "ingest",
+      "table": "events",
+      "field": "team_id",
+      "col_type": "long",
+      "value": null,
+      "error": "invalid_value"
+    },
+    {
+      "data_path": "s3://hoglake-prod-us/lake",
+      "namespace": "ingest",
+      "table": "events",
+      "field": "team_id",
+      "col_type": "int8",
+      "value": "127",
+      "expected": "s3://hoglake-prod-us/lake/data/ingest/events/team_id=127/"
+    },
+    {
+      "data_path": "s3://hoglake-prod-us/lake",
+      "namespace": "ingest",
+      "table": "events",
+      "field": "team_id",
+      "col_type": "int8",
+      "value": "128",
+      "error": "invalid_value"
+    },
+    {
+      "data_path": "s3://hoglake-prod-us/lake",
+      "namespace": "ingest",
+      "table": "events",
+      "field": "team_id",
+      "col_type": "int16",
+      "value": "32767",
+      "expected": "s3://hoglake-prod-us/lake/data/ingest/events/team_id=32767/"
+    },
+    {
+      "data_path": "s3://hoglake-prod-us/lake",
+      "namespace": "ingest",
+      "table": "events",
+      "field": "team_id",
+      "col_type": "int16",
+      "value": "32768",
+      "error": "invalid_value"
+    },
+    {
+      "data_path": "s3://hoglake-prod-us/lake",
+      "namespace": "ingest",
+      "table": "events",
+      "field": "team_id",
+      "col_type": "int",
+      "value": "2147483647",
+      "expected": "s3://hoglake-prod-us/lake/data/ingest/events/team_id=2147483647/"
+    },
+    {
+      "data_path": "s3://hoglake-prod-us/lake",
+      "namespace": "ingest",
+      "table": "events",
+      "field": "team_id",
+      "col_type": "int",
+      "value": "2147483648",
+      "error": "invalid_value"
+    },
+    {
+      "data_path": "s3://hoglake-prod-us/lake",
+      "namespace": "ingest",
+      "table": "events",
+      "field": "team_id",
+      "col_type": "uint8",
+      "value": "255",
+      "expected": "s3://hoglake-prod-us/lake/data/ingest/events/team_id=255/"
+    },
+    {
+      "data_path": "s3://hoglake-prod-us/lake",
+      "namespace": "ingest",
+      "table": "events",
+      "field": "team_id",
+      "col_type": "uint8",
+      "value": "256",
+      "error": "invalid_value"
+    },
+    {
+      "data_path": "s3://hoglake-prod-us/lake",
+      "namespace": "ingest",
+      "table": "events",
+      "field": "team_id",
+      "col_type": "uint16",
+      "value": "65535",
+      "expected": "s3://hoglake-prod-us/lake/data/ingest/events/team_id=65535/"
+    },
+    {
+      "data_path": "s3://hoglake-prod-us/lake",
+      "namespace": "ingest",
+      "table": "events",
+      "field": "team_id",
+      "col_type": "uint16",
+      "value": "65536",
+      "error": "invalid_value"
+    },
+    {
+      "data_path": "s3://hoglake-prod-us/lake",
+      "namespace": "ingest",
+      "table": "events",
+      "field": "team_id",
+      "col_type": "uint32",
+      "value": "4294967295",
+      "expected": "s3://hoglake-prod-us/lake/data/ingest/events/team_id=4294967295/"
+    },
+    {
+      "data_path": "s3://hoglake-prod-us/lake",
+      "namespace": "ingest",
+      "table": "events",
+      "field": "team_id",
+      "col_type": "uint32",
+      "value": "4294967296",
+      "error": "invalid_value"
+    },
+    {
+      "data_path": "s3://hoglake-prod-us/lake",
+      "namespace": "ingest",
+      "table": "events",
+      "field": "team_id",
+      "col_type": "uint64",
+      "value": "4",
+      "error": "invalid_value"
+    },
+    {
+      "data_path": "s3://hoglake-prod-us/lake",
+      "namespace": "ingest",
+      "table": "events",
+      "field": "team_id",
+      "col_type": "string",
+      "value": "4",
+      "error": "invalid_value"
+    }
+  ],
+  "containment_cases": [
+    {
+      "prefix": "s3://hoglake-prod-us/lake/data/ingest/events/team_id=4/",
+      "path": "s3://hoglake-prod-us/lake/data/ingest/events/team_id=4/a.parquet",
+      "under": true
+    },
+    {
+      "prefix": "s3://hoglake-prod-us/lake/data/ingest/events/team_id=4/",
+      "path": "s3://hoglake-prod-us/lake/data/ingest/events/team_id=4/sub/x.puffin",
+      "under": true
+    },
+    {
+      "prefix": "s3://hoglake-prod-us/lake/data/ingest/events/team_id=4/",
+      "path": "s3://hoglake-prod-us/lake/data/ingest/events/team_id=42/a.parquet",
+      "under": false
+    },
+    {
+      "prefix": "s3://hoglake-prod-us/lake/data/ingest/events/team_id=4/",
+      "path": "s3://hoglake-prod-us/lake/data/ingest/events/team_id=4x/a.parquet",
+      "under": false
+    },
+    {
+      "prefix": "s3://hoglake-prod-us/lake/data/ingest/events/team_id=4/",
+      "path": "s3://hoglake-prod-us/lake/data/ingest/events/team_id=4/../team_id=42/a.parquet",
+      "under": false
+    },
+    {
+      "prefix": "s3://hoglake-prod-us/lake/data/ingest/events/team_id=4/",
+      "path": "s3://hoglake-prod-us/lake/data/ingest/events/team_id=4//a.parquet",
+      "under": false
+    },
+    {
+      "prefix": "s3://hoglake-prod-us/lake/data/ingest/events/team_id=4/",
+      "path": "s3://hoglake-prod-us/lake/data/ingest/events/team_id=4/%2E%2E/a.parquet",
+      "under": false
+    },
+    {
+      "prefix": "s3://hoglake-prod-us/lake/data/ingest/events/team_id=4/",
+      "path": "s3://hoglake-prod-us/lake/data/ingest/events/team_id=4/%2f/a.parquet",
+      "under": false
+    },
+    {
+      "prefix": "s3://hoglake-prod-us/lake/data/ingest/events/team_id=4/",
+      "path": "s3://hoglake-prod-us/lake/data/ingest/events/hoglake-dv-1.puffin",
+      "under": false
+    },
+    {
+      "prefix": "s3://hoglake-prod-us/lake/data/ingest/events/team_id=4/",
+      "path": "s3://hoglake-prod-us/lake/data/ingest/events/team_id=4/",
+      "under": false
+    },
+    {
+      "prefix": "s3://hoglake-prod-us/lake/data/ingest/events/team_id=4/",
+      "path": "s3://hoglake-prod-us/lake/data/ingest/events/team_id=4/a b.parquet",
+      "under": false
+    },
+    {
+      "prefix": "s3://hoglake-prod-us/lake/data/ingest/events/team_id=4/",
+      "path": "s3://hoglake-prod-us/lake/data/ingest/events/team_id=4/a\\b.parquet",
+      "under": false
+    },
+    {
+      "prefix": "s3://hoglake-prod-us/lake/data/ingest/events/team_id=4/",
+      "path": "s3://hoglake-prod-us/lake/data/ingest/events/team_id=4/./a.parquet",
+      "under": false
+    },
+    {
+      "prefix": "s3://hoglake-prod-us/lake/data/ingest/events/team_id=4/",
+      "path": "s3://hoglake-prod-us/lake/data/ingest/events/team_id=4/a\u0000.parquet",
+      "under": false
+    }
+  ],
+  "stats_cases": [
+    {
+      "col_type": "long",
+      "value": 4,
+      "verdict": "OK",
+      "stats": {
+        "lower_hex": "0400000000000000",
+        "upper_hex": "0400000000000000",
+        "null_count": 0
+      }
+    },
+    {
+      "col_type": "long",
+      "value": 4,
+      "verdict": "BOUND_MISMATCH",
+      "stats": {
+        "lower_hex": "04000000",
+        "upper_hex": "04000000",
+        "null_count": 0
+      }
+    },
+    {
+      "col_type": "long",
+      "value": 4,
+      "verdict": "BOUND_MISMATCH",
+      "stats": {
+        "lower_hex": "0400000000000000",
+        "upper_hex": "2a00000000000000",
+        "null_count": 0
+      }
+    },
+    {
+      "col_type": "long",
+      "value": 4,
+      "verdict": "BOUND_MISMATCH",
+      "stats": {
+        "lower_hex": "0200000000000000",
+        "upper_hex": "0400000000000000",
+        "null_count": 0
+      }
+    },
+    {
+      "col_type": "long",
+      "value": 4,
+      "verdict": "BOUND_MISMATCH",
+      "stats": {
+        "lower_hex": "2a00000000000000",
+        "upper_hex": "2a00000000000000",
+        "null_count": 0
+      }
+    },
+    {
+      "col_type": "long",
+      "value": 4,
+      "verdict": "NULLS_PRESENT",
+      "stats": {
+        "lower_hex": "0400000000000000",
+        "upper_hex": "0400000000000000",
+        "null_count": 1
+      }
+    },
+    {
+      "col_type": "long",
+      "value": 4,
+      "verdict": "NULL_BOUNDS",
+      "stats": {
+        "lower_hex": null,
+        "upper_hex": "0400000000000000",
+        "null_count": 0
+      }
+    },
+    {
+      "col_type": "long",
+      "value": 4,
+      "verdict": "NULL_BOUNDS",
+      "stats": {
+        "lower_hex": "0400000000000000",
+        "upper_hex": null,
+        "null_count": 0
+      }
+    },
+    {
+      "col_type": "long",
+      "value": 4,
+      "verdict": "MISSING_STATS",
+      "stats": null
+    },
+    {
+      "col_type": "int",
+      "value": 4,
+      "verdict": "OK",
+      "stats": {
+        "lower_hex": "04000000",
+        "upper_hex": "04000000",
+        "null_count": 0
+      }
+    },
+    {
+      "col_type": "int",
+      "value": 4,
+      "verdict": "BOUND_MISMATCH",
+      "stats": {
+        "lower_hex": "02000000",
+        "upper_hex": "04000000",
+        "null_count": 0
+      }
+    },
+    {
+      "col_type": "int",
+      "value": 4,
+      "verdict": "BOUND_MISMATCH",
+      "stats": {
+        "lower_hex": "0400000000000000",
+        "upper_hex": "0400000000000000",
+        "null_count": 0
+      }
+    },
+    {
+      "col_type": "int8",
+      "value": 127,
+      "verdict": "OK",
+      "stats": {
+        "lower_hex": "7f000000",
+        "upper_hex": "7f000000",
+        "null_count": 0
+      }
+    },
+    {
+      "col_type": "int16",
+      "value": 4,
+      "verdict": "OK",
+      "stats": {
+        "lower_hex": "04000000",
+        "upper_hex": "04000000",
+        "null_count": 0
+      }
+    },
+    {
+      "col_type": "uint8",
+      "value": 255,
+      "verdict": "OK",
+      "stats": {
+        "lower_hex": "ff000000",
+        "upper_hex": "ff000000",
+        "null_count": 0
+      }
+    },
+    {
+      "col_type": "uint16",
+      "value": 4,
+      "verdict": "OK",
+      "stats": {
+        "lower_hex": "04000000",
+        "upper_hex": "04000000",
+        "null_count": 0
+      }
+    },
+    {
+      "col_type": "uint32",
+      "value": 4294967295,
+      "verdict": "OK",
+      "stats": {
+        "lower_hex": "ffffffff00000000",
+        "upper_hex": "ffffffff00000000",
+        "null_count": 0
+      }
+    },
+    {
+      "col_type": "uint32",
+      "value": 4,
+      "verdict": "BOUND_MISMATCH",
+      "stats": {
+        "lower_hex": "04000000",
+        "upper_hex": "04000000",
+        "null_count": 0
+      }
+    }
+  ],
+  "iam": {
+    "data_path": "s3://hoglake-prod-us/lake",
+    "namespace": "ingest",
+    "table": "events",
+    "field": "team_id",
+    "col_type": "long",
+    "resource_pattern": "arn:aws:s3:::hoglake-prod-us/lake/data/ingest/events/team_id=${aws:PrincipalTag/hoglake-team-id}/*",
+    "values": [
+      "0",
+      "4",
+      "42",
+      "4294967295"
+    ],
+    "foreign_keys": [
+      "hoglake-prod-us/lake/data/ingest/events/team_id=42/a.parquet",
+      "hoglake-prod-us/lake/data/ingest/events/team_id=4x/a.parquet",
+      "hoglake-prod-us/lake/data/ingest/events/hoglake-dv-1.puffin",
+      "hoglake-prod-us/lake/data/ingest/events/team_id=40/a.parquet"
+    ]
+  }
+}

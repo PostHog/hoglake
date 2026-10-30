@@ -20,6 +20,16 @@ enum class DatabaseBackend {
 data class Config(
     val port: Int = env("HOGLAKE_PORT", "8080").toInt(),
     /**
+     * The infra listener's port (docs/auth-tenancy.md §6.7): `GET /metrics`
+     * and nothing else, with no auth plugin. 0 = no infra listener; the
+     * scrape then has to use [port], where `/metrics` is operator-only.
+     *
+     * The exposition carries per-catalog labels, i.e. the tenant roster,
+     * so this port is for the cluster's scraper only: the chart exposes it
+     * on the pod and not on the Service.
+     */
+    val metricsPort: Int = env("HOGLAKE_METRICS_PORT", "0").toInt(),
+    /**
      * Human-facing name for THIS hoglake instance (e.g. "GigaHog"),
      * shown by the webui so operators can tell deployments apart.
      * Empty = unnamed.
@@ -319,7 +329,9 @@ data class Config(
      * still read, and it flips to `provided` with `missing_field_ids`
      * (the field-id audit flag) and `split_offsets` set, but with NO
      * `hog_file_column_stats` rows, which readers already treat as no
-     * bounds. That read buys only the flag and the offsets: since #445
+     * bounds. That read buys the flag, the offsets and, on an
+     * object-prefix table, the prefix proof (the hydrator's quarantine
+     * check runs before the floor): since #445
      * the DDL guard refuses over FLAGGED files alone, so a file left
      * `pending` holds nothing up. 0 writes rows for every file (the
      * behaviour before the floor); negative is refused. Default 1 MiB.
@@ -1417,6 +1429,9 @@ data class Config(
             "HOGLAKE_HEALTH_PROBE_TIMEOUT_MS=$healthProbeTimeoutMs is below Hikari's " +
                 "$MIN_HEALTH_PROBE_TIMEOUT_MS ms connectionTimeout floor, which Hikari would " +
                 "silently replace with its own default — set at least $MIN_HEALTH_PROBE_TIMEOUT_MS"
+        }
+        require(metricsPort == 0 || (metricsPort in 1..65535 && metricsPort != port)) {
+            "HOGLAKE_METRICS_PORT=$metricsPort must be 0 (off) or a port other than HOGLAKE_PORT=$port"
         }
         // Netty refuses a group of zero with an IllegalArgumentException
         // from deep inside its own constructor, naming neither the knob

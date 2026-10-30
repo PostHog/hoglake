@@ -63,7 +63,8 @@ The native connector lives in `PostHog/trino` (`plugin/trino-hoglake`);
 
 ## 1. Reads: everything rides the Iceberg connector
 
-No custom Trino plugin. Trino's stock Iceberg connector pointed at the
+Today the native connector (§0) is the read path. Once the facade
+exists, no custom Trino plugin: Trino's stock Iceberg connector pointed at the
 hoglake REST facade gets: snapshot isolation, time travel
 (`FOR VERSION AS OF` / `FOR TIMESTAMP AS OF` map to our snapshots),
 partition + min/max pruning (as good as our manifests — hence the

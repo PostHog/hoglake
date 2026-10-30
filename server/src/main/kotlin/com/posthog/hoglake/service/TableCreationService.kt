@@ -14,6 +14,7 @@ import com.posthog.hoglake.model.validateFooterSize
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.persistence.CatalogRepo
+import com.posthog.hoglake.persistence.LayoutRepo
 import com.posthog.hoglake.persistence.Locks
 import com.posthog.hoglake.persistence.NamespaceRepo
 import com.posthog.hoglake.persistence.Pg
@@ -109,6 +110,18 @@ class TableCreationService(
                     val target = TableRepo.findAt(h, cat.catalogId, ns.namespaceId, definition.name, it.readSnapshot)
                     if (target?.tableUuid != it.expectedTableUuid) {
                         throw HoglakeException.CommitConflict("replacement target does not match read snapshot")
+                    }
+                    // Here, so no receipt is ever prepared for a replacement
+                    // that no definition could publish. Live at head is sound
+                    // because the option has no unset; a set after the read
+                    // snapshot is `target_changed` at publish, and
+                    // CatalogService.createTable is the backstop.
+                    if (target != null && LayoutRepo.live(h, cat.catalogId, listOf(target.tableId)).isNotEmpty()) {
+                        throw HoglakeException.Validation(
+                            "cannot replace table '${definition.namespace}.${definition.name}': it has the " +
+                                "object-prefix layout (object_prefix_field), which a replacement would not carry " +
+                                "over; drop the table and create it instead",
+                        )
                     }
                 }
                 // Prefix includes a server-generated identity: even a future catalog recreation

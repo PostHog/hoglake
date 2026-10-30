@@ -8,8 +8,10 @@ import com.posthog.hoglake.model.DeleteFileRegistration
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.MaintenanceTrigger
+import com.posthog.hoglake.model.PartitionFieldDef
 import com.posthog.hoglake.model.TableAppend
 import com.posthog.hoglake.model.TableDeletes
+import com.posthog.hoglake.model.Transform
 import com.posthog.hoglake.service.PatchField
 import com.posthog.hoglake.testing.TestImages
 import com.sun.net.httpserver.HttpServer
@@ -1211,6 +1213,96 @@ class HogliteGuardRaceTest {
         }.isInstanceOf(HoglakeException.NotFound::class.java)
         assertThat(hook.remaining).isZero()
         assertThat(store.getCatalog(c).name).isEqualTo(c)
+    }
+
+    /** `ns.t(id)` partitioned by identity(id), optionally holding one file for id=7. */
+    private fun partitionedWithFile(
+        c: String,
+        path: String?,
+    ): com.posthog.hoglake.model.TableInfo {
+        store.createNamespace(c, "ns")
+        val t = store.createTable(c, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        HogliteAlters(store).alterTable(
+            c,
+            "ns",
+            "t",
+            listOf(AlterOp.SetPartitionSpec(listOf(PartitionFieldDef(1, Transform.IDENTITY)))),
+        )
+        if (path != null) {
+            store.commit(
+                c,
+                CommitRequest(
+                    idempotencyKey = UUID.randomUUID(),
+                    appends =
+                        listOf(
+                            TableAppend(
+                                "ns",
+                                "t",
+                                listOf(
+                                    FileRegistration("s3://hoglake-it/$c/data/$path", 10, 100, 50, null, listOf("7")),
+                                ),
+                            ),
+                        ),
+                ),
+            )
+        }
+        return store.getTable(c, "ns", "t")
+    }
+
+    private fun recreatePartitioned(
+        c: String,
+        t: com.posthog.hoglake.model.TableInfo,
+        path: String?,
+    ) {
+        store.dropTable(c, "ns", "t", t.tableUuid, "p", "p")
+        store.dropNamespace(c, "ns", null, "p", "p")
+        store.dropCatalog(c, "y", "drop")
+        store.createCatalog(c, "s3://hoglake-it/$c")
+        partitionedWithFile(c, path)
+        pstore.getCatalog(c)
+    }
+
+    @Test
+    fun `a partition lookup cannot answer from a replacement tenant after resolving its table`() {
+        val c = freshCatalog()
+        val t = partitionedWithFile(c, null)
+        val old = store.resolveTenant(c)
+        pstore.getCatalog(c)
+        // After the lookup has resolved the table (and its id) on the old
+        // incarnation, where the partition is empty, the name is recreated
+        // with the SAME shape and ids plus a file for the value, and this
+        // replica's cache is refreshed to it. Answering would report the
+        // replacement's file as the old table's partition.
+        val hook =
+            Hook({ m, p, b -> m == "POST" && "/v1/t/$old/query" in p && "next_file_id" in b }, after = {
+                recreatePartitioned(c, t, "victim7.parquet")
+            })
+        hooks += hook
+        val r = runCatching { HoglitePartitionLookup(pstore).lookup(c, "ns", "t", 1, listOf("7")) }
+        assertThat(r.exceptionOrNull()).isInstanceOf(HoglakeException.NotFound::class.java)
+        assertThat(hook.remaining).isZero()
+        // The fresh incarnation is served on a fresh entry.
+        val fresh = HoglitePartitionLookup(pstore).lookup(c, "ns", "t", 1, listOf("7"))
+        assertThat(fresh.files.map { it.path }).containsExactly("s3://hoglake-it/$c/data/victim7.parquet")
+    }
+
+    @Test
+    fun `set_object_prefix_field cannot cross incarnations after its emptiness probe`() {
+        val c = freshCatalog()
+        val t = partitionedWithFile(c, null)
+        val old = store.resolveTenant(c)
+        pstore.getCatalog(c)
+        val hook =
+            Hook({ m, p, b -> m == "POST" && "/v1/t/$old/query" in p && "FROM dvs" in b }, after = {
+                recreatePartitioned(c, t, null)
+            })
+        hooks += hook
+        assertThatThrownBy {
+            HogliteAlters(pstore).alterTable(c, "ns", "t", listOf(AlterOp.SetObjectPrefixField("id")))
+        }.isInstanceOf(HoglakeException.NotFound::class.java)
+        assertThat(hook.remaining).isZero()
+        assertThat(store.getTable(c, "ns", "t").objectPrefixField).isNull()
+        assertThat(n(c, "SELECT COUNT(*) FROM table_layouts")).isZero()
     }
 
     /** Raw fixture SQL still enters an explicit scope; never exempt production work. */

@@ -1,12 +1,14 @@
-import { screen, waitFor, within } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { MemoryRouter, useLocation, useNavigate } from "react-router-dom";
+import { App } from "../src/App";
 import {
   commentedTableFixture,
   filesFixture,
   longCommentTableFixture,
   notFoundError,
-  partitionValuesFixture,
   scanFixture,
   sortedFilesFixture,
   sortedTableFixture,
@@ -23,8 +25,17 @@ function happyHandler(url: string): Response | undefined {
   if (path === base) return jsonResponse(tableFixture);
   if (path === `${base}/files`) return jsonResponse(filesFixture);
   if (path === `${base}/scan`) return jsonResponse(scanFixture);
-  if (path === `${base}/partitions/values`) return jsonResponse(partitionValuesFixture);
   return undefined;
+}
+
+function LocationProbe() {
+  const { search } = useLocation();
+  const navigate = useNavigate();
+  return <>
+    <output aria-label="current URL">{search}</output>
+    <button onClick={() => navigate(-1)}>Back</button>
+    <button onClick={() => navigate(1)}>Forward</button>
+  </>;
 }
 
 describe("TablePage", () => {
@@ -415,152 +426,146 @@ describe("TablePage", () => {
     expect(screen.getByText("none")).toBeInTheDocument();
   });
 
-  it("renders a partition filter dropdown per field, decoded for display", async () => {
-    mockFetch(happyHandler);
-    renderApp(route);
-    const user = userEvent.setup();
-
-    await user.click(await screen.findByRole("tab", { name: "files" }));
-    await screen.findByText("101");
-
-    // One dropdown per partition field, labelled like the partition-spec
-    // block: day(ts) and bucket(16, url).
-    const daySelect = await screen.findByRole("combobox", { name: "filter by day(ts)" });
-    expect(daySelect).toBeInTheDocument();
-    expect(
-      screen.getByRole("combobox", { name: "filter by bucket(16, url)" }),
-    ).toBeInTheDocument();
-
-    // Options are decoded for display: the stored day ordinal is a date,
-    // the bucket index reads as a bucket. "all" is the empty (unfiltered) value.
-    expect(screen.getByRole("option", { name: "2026-09-01" })).toBeInTheDocument();
-    expect(screen.getByRole("option", { name: "2026-09-02" })).toBeInTheDocument();
-    expect(screen.getByRole("option", { name: "bucket 7/16" })).toBeInTheDocument();
-    expect(screen.getByRole("option", { name: "bucket 12/16" })).toBeInTheDocument();
-  });
-
-  it("sorts the dropdown options by their decoded display value, not frequency", async () => {
-    // The server returns most-frequent-first; the dropdown re-sorts by the
-    // decoded value. Give it an UNSORTED set (most-frequent first) and
-    // assert the rendered options are in date order.
-    mockFetch((url) => {
-      const [path] = url.split("?");
-      if (path === base) return jsonResponse(tableFixture);
-      if (path === `${base}/files`) return jsonResponse(filesFixture);
-      if (path === `${base}/scan`) return jsonResponse(scanFixture);
-      if (path === `${base}/partitions/values`)
-        return jsonResponse({
-          spec_id: "1",
-          fields: [
-            {
-              source_field_id: "1",
-              transform: "day",
-              // Frequency order (server): 20698 most common, then 20697.
-              values: ["20698", "20697"],
-              truncated: false,
-            },
-            {
-              source_field_id: "3",
-              transform: "bucket",
-              transform_param: 16,
-              values: ["12", "7"],
-              truncated: false,
-            },
-          ],
-        });
-      return undefined;
-    });
-    renderApp(route);
-    const user = userEvent.setup();
-
-    await user.click(await screen.findByRole("tab", { name: "files" }));
-    const daySelect = await screen.findByRole("combobox", { name: "filter by day(ts)" });
-
-    // The rendered option order is the decoded (chronological) order:
-    // 2026-09-01 (20697) before 2026-09-02 (20698), despite the server
-    // returning 20698 first.
-    const optionTexts = [...daySelect.querySelectorAll("option")].map(
-      (o) => o.textContent,
-    );
-    expect(optionTexts).toEqual(["all", "2026-09-01", "2026-09-02"]);
-
-    // But the option VALUES stay the stored strings, so the filter echoes
-    // the stored value, not the decoded one.
-    const optionValues = [...daySelect.querySelectorAll("option")].map((o) =>
-      o.getAttribute("value"),
-    );
-    expect(optionValues).toEqual(["", "20697", "20698"]);
-  });
-
-  it("sorts an identity column of integers numerically, not lexically", async () => {
-    // team_id ids are numeric but stored as strings: lexical order puts
-    // "1042" before "42", which is not how a user scans for team 42. The
-    // table fixture's spec is day(ts)+bucket; swap it for an identity spec.
-    mockFetch((url) => {
-      const [path] = url.split("?");
-      if (path === base)
-        return jsonResponse({
-          ...tableFixture,
-          partition_spec: {
-            spec_id: "1",
-            fields: [{ source_field_id: "2", transform: "identity" }],
-          },
-        });
-      if (path === `${base}/files`) return jsonResponse(filesFixture);
-      if (path === `${base}/scan`) return jsonResponse(scanFixture);
-      if (path === `${base}/partitions/values`)
-        return jsonResponse({
-          spec_id: "1",
-          fields: [
-            {
-              source_field_id: "2",
-              transform: "identity",
-              // Frequency order (server), coincidentally lexical here.
-              values: ["1042", "137", "17", "42"],
-              truncated: false,
-            },
-          ],
-        });
-      return undefined;
-    });
-    renderApp(route);
-    const user = userEvent.setup();
-
-    await user.click(await screen.findByRole("tab", { name: "files" }));
-    // identity stays a bare column label.
-    const idSelect = await screen.findByRole("combobox", { name: "filter by user_id" });
-    const optionValues = [...idSelect.querySelectorAll("option")].map((o) =>
-      o.getAttribute("value"),
-    );
-    // Numeric order, not lexical: 17, 42, 137, 1042.
-    expect(optionValues).toEqual(["", "17", "42", "137", "1042"]);
-  });
-
-  it("filtering by a partition echoes the stored value and refetches", async () => {
+  it("renders stored-value filters without discovering distinct values", async () => {
     const fetchMock = mockFetch(happyHandler);
-    renderApp(route);
+    renderApp(`${route}?tab=files`);
     const user = userEvent.setup();
 
-    await user.click(await screen.findByRole("tab", { name: "files" }));
-    const daySelect = await screen.findByRole("combobox", { name: "filter by day(ts)" });
+    expect(await screen.findByRole("textbox", { name: "filter by day(ts)" })).toHaveValue("");
+    expect(screen.getByRole("textbox", { name: "filter by bucket(16, url)" })).toHaveValue("");
+    expect(screen.getByText("Stored values; blank matches all.")).toBeInTheDocument();
+    expect(screen.getByPlaceholderText("days since 1970-01-01")).toBeInTheDocument();
+    await screen.findByText("254,567");
+    await user.click(screen.getByRole("tab", { name: "schema" }));
+    await user.click(screen.getByRole("tab", { name: "files" }));
+    await user.type(screen.getByLabelText("snapshot id"), "4100");
+    await user.click(screen.getByRole("button", { name: "Go" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining(`${base}/files?snapshot=4100`), expect.anything(),
+    ));
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes("/partitions/values"))).toBe(false);
+  });
 
-    // Pick day 20697: the request carries partition=0:20697 verbatim
-    // (the stored string, not a decoded date).
-    await user.selectOptions(daySelect, "20697");
-    await waitFor(() =>
-      expect(fetchMock).toHaveBeenCalledWith(
-        expect.stringContaining("partition=0%3A20697"),
-        expect.anything(),
-      ),
-    );
+  it("applies stored values together without requesting files per keystroke", async () => {
+    const fetchMock = mockFetch(happyHandler);
+    renderApp(`${route}?tab=files`);
+    const user = userEvent.setup();
+    await screen.findByText("254,567");
+    const fileRequests = () => fetchMock.mock.calls.filter(([url]) => String(url).split("?")[0] === `${base}/files`);
+    const before = fileRequests().length;
 
-    // And it refetches from offset 0 (the filter changed).
-    await waitFor(() =>
-      expect(fetchMock).toHaveBeenCalledWith(
-        expect.stringContaining("offset=0"),
-        expect.anything(),
-      ),
+    await user.type(screen.getByLabelText("filter by day(ts)"), "20697");
+    await user.type(screen.getByLabelText("filter by bucket(16, url)"), "7");
+    expect(fileRequests()).toHaveLength(before);
+    const form = screen.getByRole("form", { name: "partition filters" });
+    expect(within(form).getByText("2026-09-01")).toBeInTheDocument();
+    expect(within(form).getByText("bucket 7/16")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Apply partition filters" }));
+    await waitFor(() => {
+      const params = new URL(String(fileRequests().at(-1)![0]), "http://test").searchParams;
+      expect(params.getAll("partition")).toEqual(["0:20697", "1:7"]);
+      expect(params.get("offset")).toBe("0");
+    });
+  });
+
+  it("preserves identity text, whitespace, colons, Unicode and large integers", async () => {
+    const fetchMock = mockFetch((url) => {
+      if (url.split("?")[0] === base) return jsonResponse({
+        ...tableFixture,
+        partition_spec: {
+          spec_id: "1",
+          fields: [{ source_field_id: "2", transform: "identity" }],
+        },
+      });
+      return happyHandler(url);
+    });
+    renderApp(`${route}?tab=files`);
+    const user = userEvent.setup();
+    const input = await screen.findByLabelText("filter by user_id");
+    const value = " 9007199254740993:🦔 ";
+    await user.type(input, value);
+    await user.click(screen.getByRole("button", { name: "Apply partition filters" }));
+    await waitFor(() => {
+      const request = fetchMock.mock.calls.map(([url]) => String(url)).filter((url) => url.includes("/files?")).at(-1)!;
+      expect(new URL(request, "http://test").searchParams.getAll("partition")).toEqual([`0:${value}`]);
+    });
+    expect(input).not.toBeInTheDocument();
+    expect(screen.getByLabelText("filter by user_id")).toHaveValue(value);
+    await user.click(screen.getByRole("tab", { name: "schema" }));
+    await user.click(screen.getByRole("tab", { name: "files" }));
+    expect(await screen.findByLabelText("filter by user_id")).toHaveValue(value);
+  });
+
+  it("keeps filters editable after a failed files request", async () => {
+    const fetchMock = mockFetch((url) => {
+      if (url.includes("partition=0%3Abad")) {
+        return jsonResponse({ error: "validation", detail: "bad partition filter" }, 422);
+      }
+      return happyHandler(url);
+    });
+    renderApp(`${route}?tab=files&partition=0:bad`);
+    const user = userEvent.setup();
+    expect(await screen.findByRole("alert")).toHaveTextContent("bad partition filter");
+    expect(screen.getByLabelText("filter by day(ts)")).toHaveValue("bad");
+    await user.click(screen.getByRole("button", { name: "Clear partition filters" }));
+    await screen.findByText("254,567");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("filter by day(ts)")).toHaveValue("");
+    const request = fetchMock.mock.calls.map(([url]) => String(url)).filter((url) => url.includes("/files?")).at(-1)!;
+    expect(new URL(request, "http://test").searchParams.has("partition")).toBe(false);
+  });
+
+  it("keeps applied filters in the URL and synchronizes back/forward navigation", async () => {
+    mockFetch(happyHandler);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter initialEntries={[
+          `${route}?tab=files&partition=0:1`,
+          `${route}?tab=files&snapshot=4100&keep=flag&partition=0:20697&partition=1:7`,
+        ]}>
+          <App />
+          <LocationProbe />
+        </MemoryRouter>
+      </QueryClientProvider>,
     );
+    const user = userEvent.setup();
+    const day = await screen.findByLabelText("filter by day(ts)");
+    expect(day).toHaveValue("20697");
+    await user.clear(day);
+    await user.type(day, "20700");
+    await user.click(screen.getByRole("button", { name: "Apply partition filters" }));
+    const params = () => new URLSearchParams(screen.getByLabelText("current URL").textContent!);
+    expect(params().getAll("partition")).toEqual(["0:20700", "1:7"]);
+    expect(params().get("snapshot")).toBe("4100");
+    expect(params().get("keep")).toBe("flag");
+
+    await user.click(screen.getByRole("button", { name: "Back" }));
+    expect(await screen.findByLabelText("filter by day(ts)")).toHaveValue("1");
+    await user.click(screen.getByRole("button", { name: "Forward" }));
+    expect(await screen.findByLabelText("filter by day(ts)")).toHaveValue("20700");
+    await user.click(screen.getByRole("button", { name: "Clear partition filters" }));
+    expect(params().has("partition")).toBe(false);
+    expect(params().get("snapshot")).toBe("4100");
+    expect(params().get("keep")).toBe("flag");
+  });
+
+  it("resets unapplied drafts when the snapshot's spec changes", async () => {
+    mockFetch((url) => {
+      if (url === `${base}?snapshot=4100`) return jsonResponse({
+        ...tableFixture,
+        partition_spec: { spec_id: "2", fields: [{ source_field_id: "2", transform: "identity" }] },
+      });
+      return happyHandler(url);
+    });
+    renderApp(`${route}?tab=files`);
+    const user = userEvent.setup();
+    await user.type(await screen.findByLabelText("filter by day(ts)"), "20697");
+    await user.type(screen.getByLabelText("snapshot id"), "4100");
+    await user.click(screen.getByRole("button", { name: "Go" }));
+    expect(await screen.findByLabelText("filter by user_id")).toHaveValue("");
+    expect(screen.queryByLabelText("filter by day(ts)")).not.toBeInTheDocument();
   });
 
   it("drives ?snapshot through the selector (time travel)", async () => {
@@ -797,6 +802,48 @@ describe("TablePage", () => {
     expect(
       screen.queryByRole("button", { name: /load more/i }),
     ).not.toBeInTheDocument();
+  });
+
+  it("resets loaded pages on Apply and Clear while retaining the server sort", async () => {
+    const oneFile = (id: number) => ({ ...filesFixture[0], data_file_id: String(id) });
+    const fetchMock = mockFetch((url) => {
+      const [path, qs] = url.split("?");
+      if (path === `${base}/files`) {
+        const params = new URLSearchParams(qs);
+        if (params.has("partition")) return jsonResponse([oneFile(3000)]);
+        return jsonResponse(params.get("offset") === "100"
+          ? [oneFile(2000)]
+          : Array.from({ length: 100 }, (_, i) => oneFile(1000 + i)));
+      }
+      return happyHandler(url);
+    });
+    renderApp(`${route}?tab=files`);
+    const user = userEvent.setup();
+    await screen.findByText("1000");
+    await user.click(screen.getByRole("button", { name: /^size/ }));
+    await waitFor(() => expect(lastFilesUrl(fetchMock)).toContain("sort=size"));
+    await user.click(await screen.findByRole("button", { name: "Load more" }));
+    await screen.findByText("2000");
+
+    await user.type(screen.getByLabelText("filter by day(ts)"), "20697");
+    await user.click(screen.getByRole("button", { name: "Apply partition filters" }));
+    await screen.findByText("3000");
+    expect(screen.queryByText("2000")).not.toBeInTheDocument();
+    expect(screen.queryByText("1000")).not.toBeInTheDocument();
+    let params = new URL(lastFilesUrl(fetchMock), "http://test").searchParams;
+    expect(params.get("offset")).toBe("0");
+    expect(params.get("sort")).toBe("size");
+    expect(params.get("order")).toBe("desc");
+
+    await user.click(screen.getByRole("button", { name: "Clear partition filters" }));
+    await screen.findByText("1000");
+    params = new URL(lastFilesUrl(fetchMock), "http://test").searchParams;
+    expect(params.get("offset")).toBe("0");
+    expect(params.get("sort")).toBe("size");
+    expect(params.get("order")).toBe("desc");
+    expect(params.has("partition")).toBe(false);
+    expect(screen.queryByText("2000")).not.toBeInTheDocument();
+    expect(screen.queryByText("3000")).not.toBeInTheDocument();
   });
 
   it("sorts the scan table, keeping files without a deletion vector last", async () => {
