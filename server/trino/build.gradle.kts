@@ -15,7 +15,7 @@ val testcontainersVersion = "1.21.4"
 val ktorVersion = "3.5.2"
 
 dependencies {
-    testImplementation("com.fasterxml.jackson.core:jackson-databind:2.22.3")
+    testImplementation("com.fasterxml.jackson.core:jackson-databind:2.22.4")
     testImplementation("org.junit.jupiter:junit-jupiter:6.1.3")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
     testImplementation("org.assertj:assertj-core:3.27.7")
@@ -41,12 +41,12 @@ dependencies {
     // root hydrator tests use).
     testImplementation("dev.hardwood:hardwood-core:1.1.0.Beta3")
     // Bucket creation + parquet/deletion-vector upload to MinIO.
-    testImplementation("software.amazon.awssdk:s3:2.55.16")
+    testImplementation("software.amazon.awssdk:s3:2.57.3")
     // Real puffin deletion vectors for the DV read tests: the portable
     // 64-bit roaring serialization IS the Java library's format, so the
     // harness writes the same bytes the server and DuckDB client do.
     // Keep in step with the root project's pin.
-    testImplementation("org.roaringbitmap:RoaringBitmap:1.6.24")
+    testImplementation("org.roaringbitmap:RoaringBitmap:1.6.25")
 }
 
 kotlin {
