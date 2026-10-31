@@ -88,7 +88,7 @@ jobs:
     #   sha256sum hoglited   # must print HOGLITED_SHA256
     # ci/build-hoglited.sh runs exactly that and fails on any other digest.
     env:
-      HOGLITE_COMMIT: 54dc61996753867d48940a602a7f57968a5b3cd0
+      HOGLITE_COMMIT: bfdf4b3c39b1cf3a4f7b38ebc847c7d50b1ca25c
       HOGLITE_GO_VERSION: "1.27.1"
       HOGLITED_SHA256: 1062fbdeef119cf51c96b79a3bc6d7d11056c98d9d159df521ada83c193950ad
     concurrency:

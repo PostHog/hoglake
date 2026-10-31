@@ -61,8 +61,8 @@ name. These are not silently successful tests.
 
 The stronger invariant (a read cannot expose a locally applied commit that later
 vanishes) is fault-injected at the engine boundary by
-`TestReadSnapshotReleasesAtOwnDurableBasis` in the hoglite repository
-(`internal/hoglite/reads_test.go`). It gates two
+`TestReadReleasesAtOwnDurableBasis` in the hoglite repository
+(`internal/hoglite/reads_basis_test.go`). It gates two
 segment PUTs, releases only the first snapshot's segment, and asserts the read
 returns that snapshot's data, never the later row. This is an engine-level proof,
 not a claim that the acknowledged-recovery smoke test parks durability. The
