@@ -287,10 +287,32 @@ class HogliteGuardRaceTest {
             ),
     )
 
+    /** A write transaction: a commit's planning reads go out as a read-only `/tx` too, and are not one. */
     private fun isTx(
         m: String,
         p: String,
-    ) = m == "POST" && p.endsWith("/tx")
+        b: String,
+    ) = m == "POST" && p.endsWith("/tx") && !isReadBatch(b)
+
+    /** A read-only `/tx` (body or `seen` line): the client marks its txid. */
+    private fun isReadBatch(body: String) = "\"txid\":\"${HogliteClient.READ_TXID_PREFIX}" in body
+
+    /** The `seen` line of a write transaction carrying [marker]. */
+    private fun isWriteTxLine(
+        line: String,
+        marker: String,
+    ) = line.startsWith("POST") && "/tx " in line && !isReadBatch(line) && marker in line
+
+    /**
+     * A commit attempt's planning read on [tenant] whose statements include
+     * [marker]: one read-only `/tx` carrying every pre-flight read.
+     */
+    private fun isPlanRead(
+        p: String,
+        b: String,
+        tenant: String,
+        marker: String,
+    ) = "/v1/t/$tenant/tx" in p && isReadBatch(b) && marker in b
 
     /** Age every snapshot far past any retention cutoff, deterministically (no sleeps). */
     private fun ageSnapshots(c: String) {
@@ -319,7 +341,7 @@ class HogliteGuardRaceTest {
         val pre = store.getCatalog(c).earliestSnapshotId
         // Between the slow sweep's plan and its advance tx, a fast sweep runs to completion.
         hooks +=
-            Hook({ m, p, b -> isTx(m, p) && "UPDATE meta SET earliest_snapshot_id" in b }, before = {
+            Hook({ m, p, b -> isTx(m, p, b) && "UPDATE meta SET earliest_snapshot_id" in b }, before = {
                 HogliteExpiry(store, purgePage = 100, purgeBudgetMs = 10_000).runOnce(c, 100, MaintenanceTrigger.MANUAL)
             })
         val r =
@@ -343,7 +365,7 @@ class HogliteGuardRaceTest {
         val snapshotsBefore = n(c, "SELECT COUNT(*) FROM snapshots")
         // Disable retention between the sweep's plan and its advance tx.
         hooks +=
-            Hook({ m, p, b -> isTx(m, p) && "UPDATE meta SET earliest_snapshot_id" in b }, before = {
+            Hook({ m, p, b -> isTx(m, p, b) && "UPDATE meta SET earliest_snapshot_id" in b }, before = {
                 HogliteOptions(store)
                     .patch(
                         c,
@@ -379,7 +401,7 @@ class HogliteGuardRaceTest {
         ageSnapshots(c)
         // Protection turns on between the plan and the advance tx.
         hooks +=
-            Hook({ m, p, b -> isTx(m, p) && "UPDATE meta SET earliest_snapshot_id" in b }, before = {
+            Hook({ m, p, b -> isTx(m, p, b) && "UPDATE meta SET earliest_snapshot_id" in b }, before = {
                 HogliteOptions(store)
                     .patch(c, PatchField.Set(1L), consumerFloor = true, author = "test", message = "protection on")
             })
@@ -407,7 +429,7 @@ class HogliteGuardRaceTest {
         // Between the offset's preflight and its tx, a sweep advances the
         // floor past the offset's snapshot.
         hooks +=
-            Hook({ m, p, b -> isTx(m, p) && "INSERT INTO offsets" in b }, before = {
+            Hook({ m, p, b -> isTx(m, p, b) && "INSERT INTO offsets" in b }, before = {
                 HogliteExpiry(store, purgePage = 100, purgeBudgetMs = 10_000).runOnce(c, 100, MaintenanceTrigger.MANUAL)
             })
         assertThatThrownBy { pstore.commitOffset(c, "consumer-1", t.tableUuid, 1) }
@@ -438,14 +460,14 @@ class HogliteGuardRaceTest {
             )
         }
         seen.clear()
-        hooks += Hook({ m, p, b -> isTx(m, p) && "once.parquet" in b }, before = { alter() })
+        hooks += Hook({ m, p, b -> isTx(m, p, b) && "once.parquet" in b }, before = { alter() })
         val once = runCatching { pstore.commit(c, appendReq(c, "once.parquet", key = null)) }
-        val onceAttempts = seen.count { it.startsWith("POST") && it.contains("/tx ") && "once.parquet" in it }
+        val onceAttempts = seen.count { isWriteTxLine(it, "once.parquet") }
         assertThat(once.isSuccess).isTrue()
         assertThat(onceAttempts).isEqualTo(2) // fence tripped, replanned, applied
 
         seen.clear()
-        hooks += Hook({ m, p, b -> isTx(m, p) && "twice.parquet" in b }, remaining = 2, before = { alter() })
+        hooks += Hook({ m, p, b -> isTx(m, p, b) && "twice.parquet" in b }, remaining = 2, before = { alter() })
         val twice = runCatching { pstore.commit(c, appendReq(c, "twice.parquet", key = UUID.randomUUID())) }
         assertThat(twice.exceptionOrNull()).isInstanceOf(HoglakeException.CommitConflict::class.java)
         assertThat(
@@ -459,7 +481,7 @@ class HogliteGuardRaceTest {
         store.createTable(c, "ns", "u", listOf(ColumnDef("id", ColType.LONG)))
         // A schema change to table U lands between the append's plan and tx.
         hooks +=
-            Hook({ m, p, b -> isTx(m, p) && "calm.parquet" in b }, before = {
+            Hook({ m, p, b -> isTx(m, p, b) && "calm.parquet" in b }, before = {
                 store.alters.alterTable(
                     c,
                     "ns",
@@ -475,14 +497,14 @@ class HogliteGuardRaceTest {
         val r = runCatching { pstore.commit(c, appendReq(c, "calm.parquet", key = null)) }
         assertThat(r.isSuccess).isTrue()
         // No replan: exactly ONE tx carried the append.
-        assertThat(seen.count { it.startsWith("POST") && it.contains("/tx ") && "calm.parquet" in it }).isEqualTo(1)
+        assertThat(seen.count { isWriteTxLine(it, "calm.parquet") }).isEqualTo(1)
     }
 
     @Test
     fun `recreate mid-commit is TableRecreated, drop mid-commit is TableDropped, guarded or not`() {
         val (c, t1) = setup()
         hooks +=
-            Hook({ m, p, b -> isTx(m, p) && "rec.parquet" in b }, before = {
+            Hook({ m, p, b -> isTx(m, p, b) && "rec.parquet" in b }, before = {
                 store.dropTable(c, "ns", "t", t1.tableUuid, "p", "p")
                 store.createTable(c, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
             })
@@ -491,7 +513,7 @@ class HogliteGuardRaceTest {
 
         val t2 = store.getTable(c, "ns", "t")
         hooks +=
-            Hook({ m, p, b -> isTx(m, p) && "drp.parquet" in b }, before = {
+            Hook({ m, p, b -> isTx(m, p, b) && "drp.parquet" in b }, before = {
                 store.dropTable(c, "ns", "t", t2.tableUuid, "p", "p")
             })
         // Guarded (expected uuid): the DROP must type as TableDropped, not TableRecreated.
@@ -501,7 +523,7 @@ class HogliteGuardRaceTest {
         store.createTable(c, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
         val t3 = store.getTable(c, "ns", "t")
         hooks +=
-            Hook({ m, p, b -> isTx(m, p) && "ung.parquet" in b }, before = {
+            Hook({ m, p, b -> isTx(m, p, b) && "ung.parquet" in b }, before = {
                 store.dropTable(c, "ns", "t", t3.tableUuid, "p", "p")
             })
         val ung = runCatching { pstore.commit(c, appendReq(c, "ung.parquet")) }
@@ -513,7 +535,8 @@ class HogliteGuardRaceTest {
     @Test
     fun `a namespace created between the drop's pre-check and fence keeps the catalog`() {
         val c = freshCatalog()
-        hooks += Hook({ m, p, b -> isTx(m, p) && "dropping = 1" in b }, before = { store.createNamespace(c, "late") })
+        hooks +=
+            Hook({ m, p, b -> isTx(m, p, b) && "dropping = 1" in b }, before = { store.createNamespace(c, "late") })
         val r = runCatching { pstore.dropCatalog(c, "p", "p") }
         assertThat(r.exceptionOrNull()).isInstanceOf(HoglakeException.CatalogNotEmpty::class.java)
         // The fence did not land: writes still work.
@@ -620,7 +643,7 @@ class HogliteGuardRaceTest {
         val owner = UUID.randomUUID()
         val claim = store.uploads.claim(c, UUID.randomUUID(), owner, "s3://hoglake-it/$c/up", "data")
         hooks +=
-            Hook({ m, p, b -> isTx(m, p) && claim.path in b && "INSERT INTO files" in b }, before = {
+            Hook({ m, p, b -> isTx(m, p, b) && claim.path in b && "INSERT INTO files" in b }, before = {
                 store.uploads.abandon(c, owner, listOf(claim.path))
             })
         val r =
@@ -642,7 +665,7 @@ class HogliteGuardRaceTest {
         val (c, _) = setup()
         // The APPLIED tx's response is replaced by a 503; the client retries
         // with the SAME txid and hoglite's dedup answers the replay.
-        hooks += Hook({ m, p, b -> isTx(m, p) && "lost.parquet" in b }, shortCircuit = 503)
+        hooks += Hook({ m, p, b -> isTx(m, p, b) && "lost.parquet" in b }, shortCircuit = 503)
         val before = n(c, "SELECT COUNT(*) FROM files")
         val r = runCatching { pstore.commit(c, appendReq(c, "lost.parquet", key = null)) }
         assertThat(r.isSuccess).isTrue()
@@ -654,7 +677,7 @@ class HogliteGuardRaceTest {
         val (c, _) = setup()
         val key = UUID.randomUUID()
         hooks +=
-            Hook({ m, p, b -> isTx(m, p) && "payloadA" in b }, before = {
+            Hook({ m, p, b -> isTx(m, p, b) && "payloadA" in b }, before = {
                 store.commit(c, appendReq(c, "payloadB.parquet", key = key))
             })
         val race = runCatching { pstore.commit(c, appendReq(c, "payloadA.parquet", key = key)) }
@@ -722,7 +745,7 @@ class HogliteGuardRaceTest {
         HogliteOptions(store).patch(c, PatchField.Set(1L), consumerFloor = true, author = "test", message = "protect")
         ageSnapshots(c)
         val hook =
-            Hook({ m, p, b -> isTx(m, p) && "UPDATE meta SET earliest_snapshot_id" in b }, before = {
+            Hook({ m, p, b -> isTx(m, p, b) && "UPDATE meta SET earliest_snapshot_id" in b }, before = {
                 store.commitOffset(c, "late-consumer", t.tableUuid, 1)
             })
         hooks += hook
@@ -741,7 +764,7 @@ class HogliteGuardRaceTest {
         shortRetention(c)
         ageSnapshots(c)
         val hook =
-            Hook({ m, p, b -> isTx(m, p) && "expired-read.parquet" in b }, before = {
+            Hook({ m, p, b -> isTx(m, p, b) && "expired-read.parquet" in b }, before = {
                 HogliteExpiry(store, 100, 10_000).runOnce(c, 100, MaintenanceTrigger.MANUAL)
             })
         hooks += hook
@@ -766,7 +789,7 @@ class HogliteGuardRaceTest {
             },
         )
         val hook =
-            Hook({ m, p, b -> isTx(m, p) && "UPDATE uploads SET state = 'abandoned', scheduled_at" in b }, before = {
+            Hook({ m, p, b -> isTx(m, p, b) && "UPDATE uploads SET state = 'abandoned', scheduled_at" in b }, before = {
                 assertThat(store.uploads.renew(c, owner)).isEqualTo(1)
             })
         hooks += hook
@@ -801,7 +824,7 @@ class HogliteGuardRaceTest {
             },
         )
         val hook =
-            Hook({ m, p, b -> isTx(m, p) && "UPDATE removals SET claimed_at = ?, claimed_by = ?" in b }, before = {
+            Hook({ m, p, b -> isTx(m, p, b) && "UPDATE removals SET claimed_at = ?, claimed_by = ?" in b }, before = {
                 boundTx(
                     c,
                     HogliteCatalogStore.freshTxid("other-worker"),
@@ -872,7 +895,7 @@ class HogliteGuardRaceTest {
         var loserTenant = ""
         hooks +=
             Hook({ m, p, b ->
-                if (isTx(m, p) && "bootstrap:v1" in b && "/hoglake-$c-" in p) {
+                if (isTx(m, p, b) && "bootstrap:v1" in b && "/hoglake-$c-" in p) {
                     loserTenant = p.substringAfter("/v1/t/").substringBefore("/tx")
                     true
                 } else {
@@ -880,7 +903,7 @@ class HogliteGuardRaceTest {
                 }
             })
         val publish =
-            Hook({ m, p, b -> isTx(m, p) && "INSERT INTO catalogs" in b && c in b }, before = {
+            Hook({ m, p, b -> isTx(m, p, b) && "INSERT INTO catalogs" in b && c in b }, before = {
                 store.createCatalog(c, "s3://hoglake-it/$c")
             })
         hooks += publish
@@ -939,7 +962,7 @@ class HogliteGuardRaceTest {
         val (c, t) = setup() // T1: ns.t is table id 1, no files
         val oldTenant = store.resolveTenant(c)
         val hook =
-            Hook({ m, p, b -> isTx(m, p) && "xinc.parquet" in b && "/v1/t/$oldTenant/" in p }, before = {
+            Hook({ m, p, b -> isTx(m, p, b) && "xinc.parquet" in b && "/v1/t/$oldTenant/" in p }, before = {
                 // While the commit's tx is in flight (planned against T1):
                 // the table, namespace and catalog go away, and the name is
                 // recreated with an unrelated first table (id 1 again).
@@ -956,7 +979,7 @@ class HogliteGuardRaceTest {
         assertThat(hook.remaining).isZero()
         assertThat(r.exceptionOrNull()).isInstanceOf(HoglakeException.NotFound::class.java)
         assertThat(victimFiles).isEmpty()
-        val attempts = seen.filter { "/tx " in it && "xinc.parquet" in it }
+        val attempts = seen.filter { isWriteTxLine(it, "xinc.parquet") }
         assertThat(attempts).hasSize(1)
         assertThat(attempts.single()).contains("/v1/t/$oldTenant/tx")
     }
@@ -1001,7 +1024,7 @@ class HogliteGuardRaceTest {
         val oldTenant = store.resolveTenant(c)
         pstore.getCatalog(c)
         val hook =
-            Hook({ m, p, b -> m == "POST" && "/v1/t/$oldTenant/query" in p && "partition_specs" in b }, before = {
+            Hook({ _, p, b -> isPlanRead(p, b, oldTenant, "partition_specs") }, before = {
                 recreateWithVictim(store, c, t)
             })
         hooks += hook
@@ -1018,7 +1041,7 @@ class HogliteGuardRaceTest {
         val oldTenant = store.resolveTenant(c)
         pstore.getCatalog(c)
         val hook =
-            Hook({ m, p, b -> m == "POST" && "/v1/t/$oldTenant/query" in p && "partition_specs" in b }, after = {
+            Hook({ _, p, b -> isPlanRead(p, b, oldTenant, "partition_specs") }, after = {
                 recreateWithVictim(pstore, c, t)
             })
         hooks += hook
@@ -1035,7 +1058,7 @@ class HogliteGuardRaceTest {
         val oldTenant = store.resolveTenant(c)
         pstore.getCatalog(c)
         val hook =
-            Hook({ m, p, b -> m == "POST" && "/v1/t/$oldTenant/query" in p && "partition_specs" in b }, after = {
+            Hook({ _, p, b -> isPlanRead(p, b, oldTenant, "partition_specs") }, after = {
                 recreateWithVictim(store, c, t)
                 pstore.getCatalog(c)
             })
@@ -1053,7 +1076,7 @@ class HogliteGuardRaceTest {
         val oldTenant = store.resolveTenant(c)
         val hook =
             Hook({ _, p, b ->
-                "/v1/t/$oldTenant/query" in p && "SELECT spec_id, fields_json FROM partition_specs" in b
+                isPlanRead(p, b, oldTenant, "SELECT spec_id, fields_json FROM partition_specs")
             }, before = {
                 store.dropTable(c, "ns", "t", t.tableUuid, "p", "p")
                 store.dropNamespace(c, "ns", null, "p", "p")
@@ -1076,7 +1099,7 @@ class HogliteGuardRaceTest {
         val oldTenant = store.resolveTenant(c)
         val hook =
             Hook({ _, p, b ->
-                "/v1/t/$oldTenant/query" in p && "SELECT upload_id, path, file_kind, state, owner FROM uploads" in b
+                isPlanRead(p, b, oldTenant, "SELECT upload_id, path, file_kind, state, owner FROM uploads")
             }, after = {
                 // This planning read has ALREADY returned from T1. A sibling
                 // request on this same store refreshes its shared name cache
@@ -1305,23 +1328,395 @@ class HogliteGuardRaceTest {
         assertThat(n(c, "SELECT COUNT(*) FROM table_layouts")).isZero()
     }
 
+    // ---- a commit's planning reads are ONE read-only transaction ---------
+
+    /** The reads and writes one operation sent to [tenant], from `seen`. */
+    private class TenantTraffic(
+        val queries: Int,
+        val readBatches: Int,
+        val writes: Int,
+        val metaReads: Int,
+    )
+
+    private fun traffic(tenant: String): TenantTraffic {
+        val lines = seen.filter { it.startsWith("POST /v1/t/$tenant/") }
+        return TenantTraffic(
+            queries = lines.count { it.startsWith("POST /v1/t/$tenant/query ") },
+            readBatches = lines.count { it.startsWith("POST /v1/t/$tenant/tx ") && isReadBatch(it) },
+            writes = lines.count { it.startsWith("POST /v1/t/$tenant/tx ") && !isReadBatch(it) },
+            // Occurrences, not lines: a batch carrying the meta read twice is a duplicate read.
+            metaReads = lines.sumOf { it.windowed(store.metaSql.length).count { w -> w == store.metaSql } },
+        )
+    }
+
+    /**
+     * The commit shapes the counting tests run, each on its own catalog:
+     * the benchmark's unkeyed blind append, a keyed append with a
+     * read_snapshot, and a guarded two-table commit with a durable DV on a
+     * layout table (the most reads one attempt plans: receipt, specs,
+     * column types, layouts, a durable DV target and the conflict window).
+     */
+    private fun commitShapes(): List<Pair<String, (String) -> CommitRequest>> =
+        listOf(
+            "unkeyed blind append" to { c -> appendReq(c, "blind.parquet", key = null, table = "u") },
+            "keyed append with read_snapshot" to { c -> appendReq(c, "keyed.parquet", read = head(c), table = "u") },
+            "guarded append + durable DV on a layout table" to { c ->
+                val fileId = n(c, "SELECT id FROM files WHERE path LIKE '%/seed.parquet'")
+                CommitRequest(
+                    readSnapshot = head(c),
+                    idempotencyKey = UUID.randomUUID(),
+                    requireUnchangedTables = true,
+                    appends =
+                        listOf(
+                            TableAppend(
+                                "ns",
+                                "u",
+                                listOf(FileRegistration("s3://hoglake-it/$c/data/u.parquet", 10, 100, 50)),
+                            ),
+                        ),
+                    deletes =
+                        listOf(
+                            TableDeletes(
+                                "ns",
+                                "t",
+                                listOf(
+                                    DeleteFileRegistration(
+                                        fileId,
+                                        "s3://hoglake-it/$c/data/ns/t/id=7/dv.puffin",
+                                        1,
+                                        10,
+                                    ),
+                                ),
+                            ),
+                        ),
+                )
+            },
+        )
+
+    /** State for [commitShapes]: [layoutOn]'s ns.t, and ns.u plain. */
+    private fun shapeCatalog(): String {
+        val c = freshCatalog()
+        layoutOn(c)
+        store.createTable(c, "ns", "u", listOf(ColumnDef("id", ColType.LONG)))
+        return c
+    }
+
+    /**
+     * ns.t on [c], partitioned by identity(id) with the object-prefix layout
+     * on it (set while empty, as the option requires) and one file for
+     * id=7 under its prefix, stats deferred.
+     */
+    private fun layoutOn(c: String) {
+        partitionedWithFile(c, null)
+        HogliteAlters(store).alterTable(c, "ns", "t", listOf(AlterOp.SetObjectPrefixField("id")))
+        store.commit(
+            c,
+            CommitRequest(
+                readSnapshot = head(c),
+                idempotencyKey = UUID.randomUUID(),
+                appends =
+                    listOf(
+                        TableAppend(
+                            "ns",
+                            "t",
+                            listOf(
+                                FileRegistration(
+                                    "s3://hoglake-it/$c/data/ns/t/id=7/seed.parquet",
+                                    10,
+                                    100,
+                                    50,
+                                    null,
+                                    listOf("7"),
+                                ),
+                            ),
+                        ),
+                    ),
+            ),
+        )
+    }
+
+    @Test
+    fun `a commit plans with one read-only transaction, not one query per read`() {
+        for ((shape, request) in commitShapes()) {
+            val c = shapeCatalog()
+            val tenant = store.resolveTenant(c)
+            // Warm this process's per-tenant schema probe, so only the commit is counted.
+            pstore.getCatalog(c)
+            val req = request(c)
+            seen.clear()
+            pstore.commit(c, req)
+            val t = traffic(tenant)
+            assertThat(t.readBatches).describedAs("$shape: read-only transactions").isEqualTo(1)
+            assertThat(t.queries).describedAs("$shape: single-read queries on the catalog").isZero()
+            assertThat(t.writes).describedAs("$shape: write transactions").isEqualTo(1)
+            // Everything else read is the operation's one registry resolution.
+            val reads = seen.count { it.startsWith("POST") && (it.contains("/query ") || isReadBatch(it)) }
+            assertThat(reads).describedAs("$shape: reads per commit").isEqualTo(2)
+        }
+    }
+
+    @Test
+    fun `a commit reads the catalog meta row once per attempt`() {
+        for ((shape, request) in commitShapes()) {
+            val c = shapeCatalog()
+            val tenant = store.resolveTenant(c)
+            pstore.getCatalog(c)
+            val req = request(c)
+            seen.clear()
+            pstore.commit(c, req)
+            // The plan head is the batch's own meta.head: one snapshot is the
+            // fence the old separate re-read approximated, so a second meta
+            // read is a duplicate, never a fence.
+            assertThat(traffic(tenant).metaReads).describedAs(shape).isEqualTo(1)
+        }
+        // A replan is a new attempt at a new snapshot: one meta read EACH.
+        val (c, _) = setup()
+        val tenant = store.resolveTenant(c)
+        pstore.getCatalog(c)
+        hooks +=
+            Hook({ m, p, b -> isTx(m, p, b) && "replan-meta.parquet" in b }, before = {
+                store.alters.alterTable(
+                    c,
+                    "ns",
+                    "t",
+                    listOf(AlterOp.AddColumn(ColumnDef("m", ColType.LONG))),
+                    null,
+                    null,
+                    "p",
+                    "p",
+                )
+            })
+        seen.clear()
+        pstore.commit(c, appendReq(c, "replan-meta.parquet", key = null))
+        val t = traffic(tenant)
+        assertThat(t.writes).isEqualTo(2)
+        assertThat(t.readBatches).isEqualTo(2)
+        assertThat(t.metaReads).isEqualTo(2)
+    }
+
+    /**
+     * One commit outcome, comparable across two identically-built
+     * catalogs: the result and the table's files, or the exception's class
+     * and message, with the catalog name and random ids normalized.
+     */
+    private fun outcome(
+        s: HogliteCatalogStore,
+        c: String,
+        req: CommitRequest,
+    ): String {
+        val uuid = Regex("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+        fun norm(x: String) = x.replace(c, "<c>").replace(uuid, "<uuid>")
+        val files = { norm(q(c, "SELECT path, table_id, end_snapshot FROM files ORDER BY id").rows.toString()) }
+        return runCatching { s.commit(c, req) }.fold(
+            { "ok $it files=${files()}" },
+            { "${it.javaClass.simpleName}: ${norm(it.message.orEmpty())} files=${files()}" },
+        )
+    }
+
+    @Test
+    fun `batched planning reads decide every validation exactly as the separate reads did`() {
+        val proxied = { HogliteClient(standardUrl = "http://127.0.0.1:${proxy.address.port}", sleeper = {}) }
+        val batched = checkedStore(proxied())
+        val unbatched = checkedStore(proxied()).apply { unbatchedReadsForTests = true }
+
+        // Each scenario builds its state on a fresh catalog and returns the
+        // request; it runs once per store, on two identically-built catalogs.
+        val scenarios: List<Pair<String, (String) -> CommitRequest>> =
+            listOf(
+                "append accepted" to { c ->
+                    setupOn(c)
+                    appendReq(c, "ok.parquet", read = head(c))
+                },
+                "missing table" to { c ->
+                    setupOn(c)
+                    appendReq(c, "x.parquet", table = "nope")
+                },
+                "missing namespace" to { c ->
+                    setupOn(c)
+                    appendReq(c, "x.parquet").let {
+                        it.copy(
+                            appends =
+                                it.appends.map {
+                                        a ->
+                                    a.copy(namespace = "nons")
+                                },
+                        )
+                    }
+                },
+                "recreated table (expected uuid)" to { c ->
+                    val t = setupOn(c)
+                    store.dropTable(c, "ns", "t", t.tableUuid, "p", "p")
+                    store.createTable(c, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+                    appendReq(c, "x.parquet", expected = t.tableUuid)
+                },
+                "receipt replays" to { c ->
+                    setupOn(c)
+                    val req = appendReq(c, "replay.parquet", key = UUID.randomUUID())
+                    store.commit(c, req)
+                    req
+                },
+                "receipt key reused for different content" to { c ->
+                    setupOn(c)
+                    val key = UUID.randomUUID()
+                    store.commit(c, appendReq(c, "first.parquet", key = key))
+                    appendReq(c, "second.parquet", key = key)
+                },
+                "DDL since read_snapshot" to { c ->
+                    setupOn(c)
+                    val read = head(c)
+                    store.alters.alterTable(
+                        c, "ns", "t", listOf(AlterOp.AddColumn(ColumnDef("y", ColType.LONG))), null, null, "p", "p",
+                    )
+                    appendReq(c, "x.parquet", read = read)
+                },
+                "unchanged-tables guard: content changed since read_snapshot" to { c ->
+                    setupOn(c)
+                    store.commit(c, appendReq(c, "target.parquet"))
+                    val read = head(c)
+                    store.commit(c, appendReq(c, "later.parquet"))
+                    val id = n(c, "SELECT id FROM files WHERE path LIKE '%/target.parquet'")
+                    dvReq(c, id, read, "dv.puffin", 1).copy(requireUnchangedTables = true)
+                },
+                "in-tx guard: DV on a file the table does not hold" to { c ->
+                    setupOn(c)
+                    dvReq(c, 999_999, head(c), "dv.puffin", 1)
+                },
+                "in-tx guard: DV deleting more rows than the file has" to { c ->
+                    setupOn(c)
+                    store.commit(c, appendReq(c, "target.parquet"))
+                    val id = n(c, "SELECT id FROM files WHERE path LIKE '%/target.parquet'")
+                    dvReq(c, id, head(c), "dv.puffin", 11)
+                },
+                "stats name a field the table does not have" to { c ->
+                    setupOn(c)
+                    val f =
+                        FileRegistration(
+                            "s3://hoglake-it/$c/data/stats.parquet", 10, 100, 50,
+                            listOf(com.posthog.hoglake.model.ColumnStats(42, 10, 0, null, null, null, null)),
+                        )
+                    CommitRequest(appends = listOf(TableAppend("ns", "t", listOf(f))))
+                },
+                "partition values that do not fit the spec" to { c ->
+                    partitionedWithFile(c, null)
+                    CommitRequest(
+                        readSnapshot = head(c),
+                        appends =
+                            listOf(
+                                TableAppend(
+                                    "ns", "t",
+                                    listOf(
+                                        FileRegistration(
+                                            "s3://hoglake-it/$c/data/pv.parquet",
+                                            10,
+                                            100,
+                                            50,
+                                            null,
+                                            listOf("7", "8"),
+                                        ),
+                                    ),
+                                ),
+                            ),
+                    )
+                },
+                "append outside the layout prefix" to { c ->
+                    layoutOn(c)
+                    CommitRequest(
+                        readSnapshot = head(c),
+                        appends =
+                            listOf(
+                                TableAppend(
+                                    "ns", "t",
+                                    listOf(
+                                        FileRegistration(
+                                            "s3://hoglake-it/$c/data/stray.parquet",
+                                            10,
+                                            100,
+                                            50,
+                                            null,
+                                            listOf("7"),
+                                        ),
+                                    ),
+                                ),
+                            ),
+                    )
+                },
+                "durable DV outside its target's prefix" to { c ->
+                    layoutOn(c)
+                    val id = n(c, "SELECT id FROM files WHERE path LIKE '%/seed.parquet'")
+                    dvReq(c, id, head(c), "ns/t/id=8/dv.puffin", 1)
+                },
+                "upload claimed by another operation" to { c ->
+                    setupOn(c)
+                    val other = UUID.randomUUID()
+                    val claim = store.uploads.claim(c, UUID.randomUUID(), other, "s3://hoglake-it/$c/data/up", "data")
+                    CommitRequest(
+                        idempotencyKey = UUID.randomUUID(),
+                        appends = listOf(TableAppend("ns", "t", listOf(FileRegistration(claim.path, 10, 100, 50)))),
+                    )
+                },
+                "upload settled by its owner" to { c ->
+                    setupOn(c)
+                    val owner = UUID.randomUUID()
+                    val claim = store.uploads.claim(c, UUID.randomUUID(), owner, "s3://hoglake-it/$c/data/up", "data")
+                    CommitRequest(
+                        idempotencyKey = owner,
+                        appends = listOf(TableAppend("ns", "t", listOf(FileRegistration(claim.path, 10, 100, 50)))),
+                    )
+                },
+                "two tables, one missing" to { c ->
+                    setupOn(c)
+                    val a = appendReq(c, "x.parquet").appends.single()
+                    CommitRequest(appends = listOf(a, a.copy(table = "gone")))
+                },
+            )
+
+        for ((name, arrange) in scenarios) {
+            val c1 = freshCatalog()
+            val c2 = freshCatalog()
+            val r1 = arrange(c1)
+            val r2 = arrange(c2)
+            seen.clear()
+            val one = outcome(batched, c1, r1)
+            val batches = seen.count { isReadBatch(it) }
+            val many = outcome(unbatched, c2, r2)
+            assertThat(one).describedAs(name).isEqualTo(many)
+            // The two paths really differ in how they read: one batch per attempt, none at all.
+            assertThat(batches).describedAs("$name: batched read transactions").isPositive()
+            assertThat(seen.count { isReadBatch(it) }).describedAs("$name: unbatched sent a batch").isEqualTo(batches)
+        }
+    }
+
+    /** [setup]'s ns.t on an existing catalog [c]. */
+    private fun setupOn(c: String): com.posthog.hoglake.model.TableInfo {
+        store.createNamespace(c, "ns")
+        return store.createTable(c, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+    }
+
     // ---- planning reads see every definition their fence admits ----------
 
-    /** The liveTable read: the one that carries the table's schema fence. */
+    /**
+     * The liveTable read: the one that carries the table's schema fence. An
+     * alter sends it as a `/query`; a commit sends it inside its one
+     * read-only `/tx`, with the meta read the plan head comes from.
+     */
     private fun isLiveTableRead(
         m: String,
         p: String,
         b: String,
-    ) = m == "POST" && p.endsWith("/query") && "t.next_row_id, t.schema_version FROM table_versions v" in b
+    ) = m == "POST" &&
+        (p.endsWith("/query") || (p.endsWith("/tx") && isReadBatch(b))) &&
+        "t.next_row_id, t.schema_version FROM table_versions v" in b
 
     @Test
     fun `a layout set between a commit's head read and its table read is enforced on the append`() {
         val c = freshCatalog()
         partitionedWithFile(c, null)
-        // The commit has read meta (head) but not yet the table row and its
-        // schema_version; the layout lands in between. The fence the commit
-        // reads INCLUDES the layout, so a plan made at the earlier head
-        // (no layout) would pass the in-tx guard with a stray path.
+        // The layout lands just before the commit's planning read. When the
+        // head and the table row were separate reads, it could land between
+        // them: the fence the commit reads INCLUDES the layout, so a plan made
+        // at the earlier head (no layout) would pass the in-tx guard with a
+        // stray path. One read-only transaction reads both at one snapshot.
         val hook =
             Hook(::isLiveTableRead, before = {
                 HogliteAlters(store).alterTable(c, "ns", "t", listOf(AlterOp.SetObjectPrefixField("id")))

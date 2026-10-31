@@ -12,6 +12,7 @@ import java.net.http.HttpConnectTimeoutException
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.time.Duration
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
 /** One statement of a hoglite transaction (`/v1/t/{tid}/tx`), or the single statement of a `/query`. */
@@ -247,6 +248,68 @@ class HogliteClient(
                 200 -> parseQueryResult(bytes)
                 // /query's error channel is a bare 409 with no guard index:
                 // a SQL error, not a conflict a caller can re-prepare for.
+                else -> throw HogliteRejected(status, String(bytes))
+            }
+        }
+    }
+
+    /**
+     * Several reads of [tenant] as ONE read-only hoglite transaction: one
+     * reader slot, one pinned snapshot and one durability park for all of
+     * them, where the same reads as [query] calls take one of each apiece.
+     * hoglite sends a `/tx` whose statements all start with SELECT down
+     * its reader path, with no dedup receipt, so this is a read in every
+     * respect but the endpoint:
+     *
+     *  - every statement must be a plain, unguarded SELECT. Anything else
+     *    would fail the engine's read-only classifier and go down the
+     *    serial write path with a dedup receipt, so it is refused here;
+     *  - no attempt can apply anything, so the call never tracks "may have
+     *    applied" and never ends [HoglakeException.CommitOutcomeUnknown]:
+     *    retry exhaustion is a plain [HoglakeException.BackendUnavailable],
+     *    as for [query];
+     *  - a statement error is final, as on `/query`, which reports it as a
+     *    409 `refused`; a read-only `/tx` reports it as a 422 `refused`.
+     *    This reports the `/query` status, so a caller mapping
+     *    [HogliteRejected] treats a failed batch exactly like the failed
+     *    single read it replaces. Every other final answer (404, 400, a
+     *    query guard refusal) passes through with its status, as [query]
+     *    passes it.
+     *
+     * The txid is a fresh `read:` id (the endpoint requires one; the
+     * engine records nothing for a read-only transaction) and stays fixed
+     * across the call's retries.
+     */
+    fun readTx(
+        tenant: String,
+        statements: List<HogliteStatement>,
+    ): List<HogliteQueryResult> {
+        require(statements.isNotEmpty()) { "a hoglite read transaction needs at least one statement" }
+        for (st in statements) {
+            require(st.expectAffected == null && st.expectScalarInt == null) {
+                "a hoglite read transaction carries no guards: ${st.sql}"
+            }
+            require(st.sql.trimStart().startsWith("SELECT ", ignoreCase = true)) {
+                "a hoglite read transaction holds plain SELECTs only: ${st.sql}"
+            }
+        }
+        val body =
+            json.writeValueAsBytes(
+                buildMap {
+                    put("client", CLIENT_NAME)
+                    put("txid", READ_TXID_PREFIX + UUID.randomUUID())
+                    put("statements", statements.map { it.toWire() })
+                },
+            )
+        return call(tenant, "/v1/t/$tenant/tx", body, readTimeoutMs) { status, bytes ->
+            when {
+                status == 200 ->
+                    parseTxResults(bytes).also {
+                        check(it.size == statements.size) {
+                            "hoglite answered ${it.size} results for a ${statements.size}-statement read"
+                        }
+                    }
+                status == 422 && errorCode(bytes) == CODE_REFUSED -> throw HogliteRejected(409, String(bytes))
                 else -> throw HogliteRejected(status, String(bytes))
             }
         }
@@ -629,6 +692,9 @@ class HogliteClient(
 
         /** The `client` half of hoglite's (client, txid) dedup key. */
         const val CLIENT_NAME = "hoglake"
+
+        /** The txid prefix of a [readTx]: the engine keeps no receipt for it. */
+        const val READ_TXID_PREFIX = "read:"
 
         /** Pause between retryable attempts; 421 re-routes skip it. */
         const val RETRY_BACKOFF_MS = 200L

@@ -382,4 +382,79 @@ class HogliteClientTest {
         assertThatThrownBy { txOne(c) }.isInstanceOf(HoglakeException.BackendUnavailable::class.java)
         assertThat(calls.get()).isLessThan(50)
     }
+
+    // ---- read-only transactions (a commit's batched planning reads) ------
+
+    /**
+     * Each case is one engine failure, as `/query` and as a read-only `/tx`
+     * answer it. The batch must reject exactly as the single read it
+     * replaces, so a caller's mapping of [HogliteRejected] (and retry
+     * exhaustion) is unchanged: same class, same status.
+     */
+    @Test
+    fun `a failed read transaction rejects exactly as the failed query it replaces`() {
+        fun err(code: String) = "{\"error\":\"x\",\"code\":\"$code\"}"
+        val cases =
+            listOf(
+                // A statement error: /query answers 409, a read-only /tx 422, both `refused`.
+                Step(409, err("refused")) to Step(422, err("refused")),
+                // Query guard refusals: final, same status on both endpoints.
+                Step(504, err("query_timeout")) to Step(504, err("query_timeout")),
+                Step(413, err("result_too_large")) to Step(413, err("result_too_large")),
+                Step(507, err("out_of_memory")) to Step(507, err("out_of_memory")),
+                // The tenant is gone; a malformed request; an unlabelled 422.
+                Step(404, "{}") to Step(404, "{}"),
+                Step(400, "{}") to Step(400, "{}"),
+                Step(422, "{}") to Step(422, "{}"),
+                // Transient until the budget runs out: unavailable, never "outcome unknown".
+                Step(503, "{}") to Step(503, "{}"),
+                Step(504, "{}") to Step(504, "{}"),
+            )
+
+        fun shape(t: Throwable?) = t?.javaClass to (t as? HogliteRejected)?.status
+        for ((asQuery, asTx) in cases) {
+            val (qs, _) = serve(asQuery)
+            val (ts, _) = serve(asTx)
+            val single =
+                catchThrowable { client("http://127.0.0.1:${qs.address.port}", budgetMs = 50).query("t", "SELECT 1") }
+            val batch =
+                catchThrowable {
+                    client("http://127.0.0.1:${ts.address.port}", budgetMs = 50)
+                        .readTx("t", listOf(HogliteStatement("SELECT 1", emptyList())))
+                }
+            assertThat(single).describedAs("query ${asQuery.status} ${asQuery.body}").isNotNull()
+            assertThat(shape(batch)).describedAs("read tx ${asTx.status} ${asTx.body}").isEqualTo(shape(single))
+            assertThat(batch).isNotInstanceOf(HoglakeException.CommitOutcomeUnknown::class.java)
+        }
+    }
+
+    @Test
+    fun `a read transaction carries plain SELECTs under a read txid and returns one result per statement`() {
+        val (server, calls) =
+            serve(Step(200, "{\"results\":[{\"cols\":[\"x\"],\"rows\":[[1]]},{\"cols\":[\"y\"],\"rows\":[]}]}"))
+        val c = client("http://127.0.0.1:${server.address.port}")
+        val r =
+            c.readTx(
+                "t",
+                listOf(HogliteStatement("SELECT 1", emptyList()), HogliteStatement("SELECT 2 WHERE 0", emptyList())),
+            )
+        assertThat(r.map { it.rows }).containsExactly(listOf(listOf(1)), emptyList())
+        assertThat(calls.get()).isEqualTo(1)
+        assertThat(servedBodies.single()).contains("\"txid\":\"${HogliteClient.READ_TXID_PREFIX}")
+        // A write or a guard would leave the engine's reader path: refused before sending.
+        assertThatThrownBy { c.readTx("t", listOf(HogliteStatement("UPDATE meta SET head = 1", emptyList()))) }
+            .isInstanceOf(IllegalArgumentException::class.java)
+        assertThatThrownBy {
+            c.readTx("t", listOf(HogliteStatement("SELECT 1", emptyList(), expectScalarInt = 1L)))
+        }.isInstanceOf(IllegalArgumentException::class.java)
+        // A short answer is a broken engine, not a silently missing read.
+        val (short, _) = serve(Step(200, "{\"results\":[{\"cols\":[\"x\"],\"rows\":[[1]]}]}"))
+        assertThatThrownBy {
+            client("http://127.0.0.1:${short.address.port}").readTx(
+                "t",
+                listOf(HogliteStatement("SELECT 1", emptyList()), HogliteStatement("SELECT 2", emptyList())),
+            )
+        }.isInstanceOf(IllegalStateException::class.java)
+        assertThat(calls.get()).isEqualTo(1)
+    }
 }

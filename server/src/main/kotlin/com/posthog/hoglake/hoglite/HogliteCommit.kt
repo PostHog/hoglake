@@ -16,7 +16,10 @@ import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.ObjectPrefix
 import com.posthog.hoglake.model.ObjectPrefixLayout
 import com.posthog.hoglake.model.PartitionFieldDef
+import com.posthog.hoglake.model.PartitionSpec
 import com.posthog.hoglake.model.StatsSanity
+import com.posthog.hoglake.model.TableAppend
+import com.posthog.hoglake.model.TableDeletes
 import com.posthog.hoglake.model.pathStaysUnder
 import com.posthog.hoglake.model.validateSplitOffsets
 import io.github.oshai.kotlinlogging.KotlinLogging
@@ -162,7 +165,12 @@ internal object HogliteCommit {
                 )
             }
 
-        val meta = store.meta(catalog)
+        // Every read this attempt plans against, as ONE read-only
+        // transaction (see PlanReads). The results are consumed below in
+        // the order the reads used to run, so the first refusal a request
+        // gets is unchanged.
+        val plan = PlanReads.read(store, catalog, request, order.values, appends, deletes)
+        val meta = plan.meta()
         val dataPathPrefix = meta.dataPath.trimEnd('/') + "/"
 
         // Idempotency: the receipt pre-read (the tx's PK insert closes
@@ -170,12 +178,7 @@ internal object HogliteCommit {
         val canonical = commitFingerprint(request)
         val fingerprint = commitFingerprintDigest(canonical).toHex()
         if (request.idempotencyKey != null) {
-            val existing =
-                store.queryCatalog(
-                    catalog,
-                    "SELECT fingerprint, snapshot_id, schema_version FROM receipts WHERE idempotency_key = ?",
-                    request.idempotencyKey.toString(),
-                ).firstRow()
+            val existing = plan.receipt()
             if (existing != null) {
                 if (existing[0].asString() == fingerprint) {
                     return CommitResult(existing[1].asLong(), existing[2].asLong())
@@ -212,8 +215,10 @@ internal object HogliteCommit {
         for (t in order.values) {
             val row =
                 try {
-                    store.liveTable(catalog, t.namespace, t.table)
+                    plan.table(t)
                 } catch (e: HoglakeException.NotFound) {
+                    // A failure path (the commit is refused either way):
+                    // this probe stays a separate read after the batch.
                     val dropped =
                         store.queryCatalog(
                             catalog,
@@ -245,17 +250,20 @@ internal object HogliteCommit {
             resolved["${t.namespace}.${t.table}"] = row
         }
 
-        // The snapshot every definition below (spec, layout) is read at:
-        // a head read AFTER every table's fence (tables.schema_version,
-        // read with its row above). `meta.head` is too early: DDL landing
-        // between it and the table read would be invisible to planning
-        // while the fence, read after it, already includes it, and the
-        // tx would pass with the plan made against the older definitions
-        // (an append planned without a just-set object-prefix layout, or
-        // against a just-replaced spec). Read after the fence, every DDL
-        // the fence admits is visible at planHead, and any DDL after it
-        // bumps a schema_version the fence then refuses (a replan).
-        val planHead = if (resolved.isEmpty()) meta.head else store.meta(catalog).head
+        // The snapshot every definition below (spec, layout) is read at
+        // is meta.head, read in the SAME snapshot as every table's fence
+        // (tables.schema_version, read with its row above): the plan reads
+        // are one transaction. The head must not be older than the fence —
+        // DDL landing between a head read and a later fence read would be
+        // invisible to planning while the fence already includes it, and
+        // the tx would pass with the plan made against the older
+        // definitions (an append planned without a just-set object-prefix
+        // layout, or against a just-replaced spec). Read in one snapshot,
+        // every DDL the fence admits is visible at the plan head, and any
+        // DDL after it bumps a schema_version the fence then refuses (a
+        // replan). When the reads were separate `/query` calls this took a
+        // second meta read after the table reads; in one snapshot that
+        // read returns this same row, so it is not repeated.
 
         // ---- request-side validation (refusals that do not depend on tx state)
 
@@ -282,8 +290,8 @@ internal object HogliteCommit {
         val plannedAppends = mutableListOf<PlannedAppend>()
         for (append in appends) {
             val table = resolved.getValue("${append.namespace}.${append.table}")
-            val spec = store.specAt(catalog, table.tableId, planHead)
-            val liveColumnTypes = liveColumnTypes(store, catalog, table.tableId)
+            val spec = plan.spec(table)
+            val liveColumnTypes = plan.columnTypes(table)
             var rows = table.nextRowId
             for (file in append.files) {
                 val sanitizedStats =
@@ -389,19 +397,19 @@ internal object HogliteCommit {
         // The object-prefix layout (CommitService step 4a): on the
         // SANITIZED stats, after the structural checks of appends and
         // DVs alike, before claims. A table without the option skips it.
-        // The layout is read at planHead (after the table's fence);
+        // The layout is read at the plan head (with the table's fence);
         // setting it bumps tables.schema_version, so the in-tx schema
         // fence below replans a commit that planned against the option
         // being off.
         val layouts = HashMap<Long, ObjectPrefixLayout?>()
 
         fun layoutFor(table: HogliteCatalogStore.TableRow): ObjectPrefixLayout? =
-            layouts.getOrPut(table.tableId) { layoutOf(store, catalog, table, planHead) }
+            layouts.getOrPut(table.tableId) { plan.layout(table) }
 
         for (append in appends) {
             val table = resolved.getValue("${append.namespace}.${append.table}")
             val layout = layoutFor(table) ?: continue
-            val spec = store.specAt(catalog, table.tableId, planHead)
+            val spec = plan.spec(table)
             val keyIndex = spec?.let { ObjectPrefix.keyIndex(it.fields, layout.fieldId) }
             // The DDL keeps exactly one identity field on the prefix field
             // in every spec while the option is on.
@@ -439,14 +447,12 @@ internal object HogliteCommit {
                 if (p.stagedTarget != null) {
                     val target = plannedAppends[p.stagedTarget]
                     val keyIndex =
-                        store.specAt(catalog, p.table.tableId, planHead)
-                            ?.let { ObjectPrefix.keyIndex(it.fields, layout.fieldId) }
+                        plan.spec(p.table)?.let { ObjectPrefix.keyIndex(it.fields, layout.fieldId) }
                     keyIndex?.let { target.file.partitionValues?.getOrNull(it) }
                 } else {
                     // A target that is missing or another table's is refused
                     // by the in-tx guards, ahead of this check.
-                    val target =
-                        durableTarget(store, catalog, p.table.tableId, p.registration.dataFileId) ?: continue
+                    val target = plan.durableTarget(p.table, p.registration.dataFileId) ?: continue
                     target.specFields?.let { ObjectPrefix.keyIndex(it, layout.fieldId) }
                         ?.let { target.partitionValues?.getOrNull(it) }
                 }
@@ -466,35 +472,14 @@ internal object HogliteCommit {
         // a writer claims with owner=<key> and commits with
         // idempotency_key=<key>). The decision is pre-flight; the settle
         // lands in the transaction.
-        val claimsToSettle = decideClaims(store, catalog, allPaths, request.idempotencyKey)
+        val claimsToSettle = settleDecision(plan.claims(), plan.retainedPaths(), allPaths, request.idempotencyKey)
 
         // ---- the conflict window (the mixed rule needs the UNION, so
         // pre-flight collects it; the in-tx guards below close the race
         // with content conflicts FIRST so a mixed window answers
         // commit_conflict, never the non-retryable one).
         if (readSnapshot != null) {
-            val ids = resolved.values.map { it.tableId }
-            val unchanged = unchangedIds(order, resolved, request)
-            // Empty IN-lists are not SQL, so the content arm exists only
-            // when the request has unchanged delete targets.
-            val contentArm =
-                if (unchanged.isEmpty()) {
-                    ""
-                } else {
-                    " OR (kind IN $CONTENT_KINDS AND object_id IN (${unchanged.joinToString(",") { "?" }}))"
-                }
-            val conflicts =
-                store.queryCatalog(
-                    catalog,
-                    "SELECT DISTINCT object_id, CASE WHEN kind IN $DDL_KINDS THEN 1 ELSE 0 END FROM changes " +
-                        "WHERE snapshot_id > ? AND object_id IN (${ids.joinToString(",") { "?" }}) " +
-                        "AND (kind IN $DDL_KINDS$contentArm)",
-                    *buildList {
-                        add(readSnapshot)
-                        addAll(ids)
-                        addAll(unchanged)
-                    }.toTypedArray(),
-                )
+            val conflicts = plan.conflicts()
             if (conflicts.rows.isNotEmpty()) {
                 val nameById = resolved.entries.associate { it.value.tableId to it.key }
                 val names = conflicts.rows.mapNotNull { nameById[it[0].asLong()] }.distinct().sorted()
@@ -1015,29 +1000,6 @@ internal object HogliteCommit {
         val stagedTarget: Int?,
     )
 
-    /**
-     * The table's object-prefix layout at [head], or null when the option
-     * is off: CommitService.layoutOf over `table_layouts` and the live
-     * columns. A layout row whose column is not a live top-level column of
-     * an allowed type is a broken invariant (the DDL refuses dropping,
-     * renaming, or promoting the field out of the allowed set): a 500,
-     * never a commit that silently skips the check.
-     */
-    private fun layoutOf(
-        store: HogliteCatalogStore,
-        catalog: String,
-        table: HogliteCatalogStore.TableRow,
-        head: Long,
-    ): ObjectPrefixLayout? {
-        val fieldId = store.layoutAt(catalog, table.tableId, head) ?: return null
-        val col = store.columnsAt(catalog, table.tableId, head).firstOrNull { it.fieldId == fieldId }
-        check(col != null && col.def.type in ObjectPrefix.ALLOWED_TYPES) {
-            "object-prefix field_id $fieldId of table_id=${table.tableId} is not a live column of an allowed " +
-                "type (name=${col?.def?.name}, type=${col?.def?.type?.wire})"
-        }
-        return ObjectPrefixLayout(fieldId, col.def.name, col.def.type)
-    }
-
     /** A durable DV target's own spec fields and partition values, as the prefix check reads them. */
     private class DurableTarget(
         val specFields: List<PartitionFieldDef>?,
@@ -1045,31 +1007,294 @@ internal object HogliteCommit {
     )
 
     /**
-     * [dataFileId]'s spec (its OWN, retired or not — expiry keeps every
-     * spec a file can name) and partition values, or null when it is not
-     * a file of [tableId] (the transaction's guards refuse that first).
-     * Both are immutable for a file id, so a pre-flight read is exact.
+     * Every read one commit attempt plans against, sent as ONE read-only
+     * hoglite transaction ([HogliteCatalogStore.readCatalog]) on the
+     * operation's bound incarnation.
+     *
+     * They used to be separate `/query` calls: 8 for an unkeyed append to
+     * one table, 10 with an idempotency key and a read_snapshot. hoglite
+     * parks each read until its snapshot is durable, and a parked read
+     * holds one of the tenant's reader slots while it waits, so under
+     * concurrent writers a commit's own reads queued behind each other's
+     * parks. One transaction takes one slot and parks once.
+     *
+     * One snapshot is also the basis the separate reads approximated. The
+     * meta row, the receipt, every table row (with its schema_version
+     * fence), the definitions at the plan head, the claims and the
+     * conflict window are one moment. The plan head is that snapshot's
+     * meta.head, so every DDL the fence admits is visible to planning.
+     *
+     * Table ids are unknown while the statements are built, so a per-table
+     * read names its table by [LIVE_TABLE_ID_SQL] (the live resolution
+     * [table] decodes, as a subquery) and the plan head by
+     * [HogliteSchema.HEAD_SQL]. Both evaluate inside the same snapshot as
+     * the table and meta rows, so they are the id and head read back.
+     *
+     * Not batched, because they only run once the commit is refused: the
+     * dropped-incarnation probe after a table miss and the post-rollback
+     * classifiers of the guards.
      */
-    private fun durableTarget(
-        store: HogliteCatalogStore,
-        catalog: String,
-        tableId: Long,
-        dataFileId: Long,
-    ): DurableTarget? {
-        val row =
-            store.queryCatalog(
-                catalog,
-                "SELECT f.partition_values_json, s.fields_json FROM files f " +
-                    "LEFT JOIN partition_specs s ON s.table_id = f.table_id AND s.spec_id = f.spec_id " +
-                    "WHERE f.id = ? AND f.table_id = ?",
-                dataFileId,
-                tableId,
-            ).firstRow() ?: return null
-        return DurableTarget(
-            specFields = (row[1] as? String)?.let { store.json.readValue<List<PartitionFieldDef>>(it) },
-            partitionValues = (row[0] as? String)?.let { store.json.readValue<List<String?>>(it) },
-        )
+    private class PlanReads private constructor(
+        private val store: HogliteCatalogStore,
+        private val catalog: String,
+    ) {
+        private val statements = mutableListOf<HogliteStatement>()
+        private lateinit var results: List<HogliteQueryResult>
+
+        private var metaAt = -1
+        private var receiptAt: Int? = null
+        private val namespaceAt = HashMap<String, Int>()
+        private val tableAt = HashMap<String, Int>()
+        private val specAt = HashMap<String, Int>()
+        private val columnTypesAt = HashMap<String, Int>()
+        private val layoutAt = HashMap<String, Int>()
+        private var claimsAt: Int? = null
+        private var retainedAt: Int? = null
+        private var conflictsAt: Int? = null
+        private var durableAt: Int? = null
+
+        private fun add(
+            sql: String,
+            args: List<Any?>,
+        ): Int {
+            statements += HogliteStatement(sql, args)
+            return statements.size - 1
+        }
+
+        /** The catalog's meta row; a missing one is the missing catalog, as [HogliteCatalogStore.meta]. */
+        fun meta(): HogliteCatalogStore.MetaRow =
+            store.metaRow(
+                results[metaAt].firstRow() ?: throw HoglakeException.NotFound("catalog '$catalog'"),
+            )
+
+        /** (fingerprint, snapshot_id, schema_version) of the request's key, or null. */
+        fun receipt(): List<Any?>? = results[checkNotNull(receiptAt)].firstRow()
+
+        /** [HogliteCatalogStore.liveTable]'s answer and refusals for [t]. */
+        fun table(t: Touched): HogliteCatalogStore.TableRow {
+            val key = key(t.namespace, t.table)
+            if (results[namespaceAt.getValue(key)].firstRow() == null) {
+                throw HoglakeException.NotFound("namespace '${t.namespace}' in catalog '$catalog'")
+            }
+            val row =
+                results[tableAt.getValue(key)].firstRow()
+                    ?: throw HoglakeException.NotFound("table '${t.namespace}.${t.table}' in catalog '$catalog'")
+            return store.tableRowOf(row)
+        }
+
+        /** The live partition spec at the plan head of an appended table ([HogliteCatalogStore.specAt]). */
+        fun spec(table: HogliteCatalogStore.TableRow): PartitionSpec? =
+            results[specAt.getValue(key(table.namespace, table.name))].firstRow()?.let { r ->
+                PartitionSpec(r[0].asLong(), store.json.readValue<List<PartitionFieldDef>>(r[1].asString()))
+            }
+
+        /** The live field_id -> type map stats validation checks against (every node, containers included). */
+        fun columnTypes(table: HogliteCatalogStore.TableRow): Map<Long, ColType> =
+            results[columnTypesAt.getValue(key(table.namespace, table.name))].rows
+                .associate { it[0].asLong() to ColType.fromWire(it[1].asString()) }
+
+        /**
+         * The table's object-prefix layout at the plan head, or null when
+         * the option is off: CommitService.layoutOf over `table_layouts`
+         * and the live top-level columns. A layout row whose column is not
+         * a live top-level column of an allowed type is a broken invariant
+         * (the DDL refuses dropping, renaming, or promoting the field out
+         * of the allowed set): a 500, never a commit that silently skips
+         * the check.
+         */
+        fun layout(table: HogliteCatalogStore.TableRow): ObjectPrefixLayout? {
+            val row = results[layoutAt.getValue(key(table.namespace, table.name))].firstRow() ?: return null
+            val fieldId = row[0].asLong()
+            val name = row[1] as? String
+            val type = (row[2] as? String)?.let { ColType.fromWire(it) }
+            check(name != null && type != null && type in ObjectPrefix.ALLOWED_TYPES) {
+                "object-prefix field_id $fieldId of table_id=${table.tableId} is not a live column of an allowed " +
+                    "type (name=$name, type=${type?.wire})"
+            }
+            return ObjectPrefixLayout(fieldId, name, type)
+        }
+
+        /** The upload rows of the commit's paths. */
+        fun claims(): List<List<Any?>> = claimsAt?.let { results[it].rows } ?: emptyList()
+
+        /** (path, kind) still held by a file or DV row, for every claimed path. */
+        fun retainedPaths(): Set<Pair<String, String>> = retainedAt?.let { retainedPathSet(results[it]) } ?: emptySet()
+
+        /** (object_id, is_ddl) of the changes in the conflict window since read_snapshot. */
+        fun conflicts(): HogliteQueryResult = results[checkNotNull(conflictsAt)]
+
+        /**
+         * [dataFileId]'s spec (its OWN, retired or not — expiry keeps every
+         * spec a file can name) and partition values, or null when it is
+         * not a file of [table] (the transaction's guards refuse that
+         * first). Both are immutable for a file id, so a pre-flight read is
+         * exact.
+         */
+        fun durableTarget(
+            table: HogliteCatalogStore.TableRow,
+            dataFileId: Long,
+        ): DurableTarget? {
+            val row =
+                results[checkNotNull(durableAt)].rows.firstOrNull {
+                    it[0].asLong() == dataFileId && it[1].asLong() == table.tableId
+                } ?: return null
+            return DurableTarget(
+                specFields = (row[3] as? String)?.let { store.json.readValue<List<PartitionFieldDef>>(it) },
+                partitionValues = (row[2] as? String)?.let { store.json.readValue<List<String?>>(it) },
+            )
+        }
+
+        companion object {
+            private fun key(
+                namespace: String,
+                table: String,
+            ) = "$namespace.$table"
+
+            fun read(
+                store: HogliteCatalogStore,
+                catalog: String,
+                request: CommitRequest,
+                touched: Collection<Touched>,
+                appends: List<TableAppend>,
+                deletes: List<TableDeletes>,
+            ): PlanReads {
+                val p = PlanReads(store, catalog)
+                p.metaAt = p.add(store.metaSql, emptyList())
+                request.idempotencyKey?.let {
+                    p.receiptAt =
+                        p.add(
+                            "SELECT fingerprint, snapshot_id, schema_version FROM receipts WHERE idempotency_key = ?",
+                            listOf(it.toString()),
+                        )
+                }
+                val head = HogliteSchema.HEAD_SQL
+                for (t in touched) {
+                    val key = key(t.namespace, t.table)
+                    val id = listOf(t.namespace, t.table)
+                    p.namespaceAt[key] =
+                        p.add(
+                            "SELECT id, name FROM namespaces WHERE name = ? AND dropped_snapshot IS NULL",
+                            listOf(t.namespace),
+                        )
+                    p.tableAt[key] =
+                        p.add(
+                            "SELECT t.id, t.table_uuid, v.namespace_id, v.namespace, v.name, v.comment, " +
+                                "v.properties_json, t.next_row_id, t.schema_version FROM table_versions v " +
+                                "JOIN tables t ON t.id = v.table_id " +
+                                "WHERE v.namespace_id = ($LIVE_NAMESPACE_ID_SQL) AND v.name = ? " +
+                                "AND v.end_snapshot IS NULL AND t.dropped_snapshot IS NULL",
+                            id,
+                        )
+                    if (t.appends) {
+                        p.specAt[key] =
+                            p.add(
+                                "SELECT spec_id, fields_json FROM partition_specs " +
+                                    "WHERE table_id = $LIVE_TABLE_ID_SQL " +
+                                    "AND begin_snapshot <= $head AND (end_snapshot IS NULL OR end_snapshot > $head) " +
+                                    "ORDER BY spec_id DESC LIMIT 1",
+                                id,
+                            )
+                        p.columnTypesAt[key] =
+                            p.add(
+                                "SELECT field_id, type FROM columns WHERE table_id = $LIVE_TABLE_ID_SQL " +
+                                    "AND end_snapshot IS NULL",
+                                id,
+                            )
+                    }
+                    // The layout field and its live top-level column, at the plan head.
+                    p.layoutAt[key] =
+                        p.add(
+                            "SELECT l.object_prefix_field_id, c.name, c.type FROM table_layouts l " +
+                                "LEFT JOIN columns c ON c.table_id = l.table_id " +
+                                "AND c.field_id = l.object_prefix_field_id AND c.parent_field_id IS NULL " +
+                                "AND c.begin_snapshot <= $head " +
+                                "AND (c.end_snapshot IS NULL OR c.end_snapshot > $head) " +
+                                "WHERE l.table_id = $LIVE_TABLE_ID_SQL " +
+                                "AND l.begin_snapshot <= $head " +
+                                "AND (l.end_snapshot IS NULL OR l.end_snapshot > $head) " +
+                                "ORDER BY c.ordinal",
+                            id,
+                        )
+                }
+
+                val paths = LinkedHashSet<String>()
+                appends.forEach { a -> a.files.forEach { paths += it.path } }
+                deletes.forEach { d -> d.files.forEach { paths += it.path } }
+                if (paths.isNotEmpty()) {
+                    val inList = paths.joinToString(",") { "?" }
+                    p.claimsAt = p.add(CLAIMS_SQL + "WHERE path IN ($inList)", paths.toList())
+                    // Only claimed paths are ever looked up in this set, so
+                    // the read is limited to them: a commit without claims
+                    // probes no file or DV row.
+                    val claimed = "SELECT path FROM uploads WHERE path IN ($inList)"
+                    p.retainedAt =
+                        p.add(
+                            "SELECT path, 0 FROM files WHERE path IN ($claimed) " +
+                                "UNION SELECT path, 1 FROM dvs WHERE path IN ($claimed)",
+                            paths.toList() + paths.toList(),
+                        )
+                }
+
+                val readSnapshot = request.readSnapshot
+                if (readSnapshot != null) {
+                    // The window covers every touched table for DDL; the
+                    // content arm (an empty IN-list is not SQL) only the
+                    // unchanged delete targets.
+                    val all = touched.toList()
+                    val unchanged = if (request.requireUnchangedTables) all.filter { it.deletes } else emptyList()
+                    val contentArm =
+                        if (unchanged.isEmpty()) {
+                            ""
+                        } else {
+                            " OR (kind IN $CONTENT_KINDS AND object_id IN " +
+                                "(${unchanged.joinToString(",") { LIVE_TABLE_ID_SQL }}))"
+                        }
+                    p.conflictsAt =
+                        p.add(
+                            "SELECT DISTINCT object_id, CASE WHEN kind IN $DDL_KINDS THEN 1 ELSE 0 END FROM changes " +
+                                "WHERE snapshot_id > ? " +
+                                "AND object_id IN (${all.joinToString(",") { LIVE_TABLE_ID_SQL }}) " +
+                                "AND (kind IN $DDL_KINDS$contentArm)",
+                            buildList {
+                                add(readSnapshot)
+                                all.forEach { addAll(listOf(it.namespace, it.table)) }
+                                unchanged.forEach { addAll(listOf(it.namespace, it.table)) }
+                            },
+                        )
+                }
+
+                // Durable DV targets, for the object-prefix check on layout
+                // tables; by primary key, filtered to the DV's table in Kotlin.
+                val targets =
+                    deletes.flatMap { d -> d.files.filter { it.dataFilePath == null && it.dataFileId > 0 } }
+                        .map { it.dataFileId }.distinct()
+                if (targets.isNotEmpty()) {
+                    p.durableAt =
+                        p.add(
+                            "SELECT f.id, f.table_id, f.partition_values_json, s.fields_json FROM files f " +
+                                "LEFT JOIN partition_specs s ON s.table_id = f.table_id AND s.spec_id = f.spec_id " +
+                                "WHERE f.id IN (${targets.joinToString(",") { "?" }})",
+                            targets,
+                        )
+                }
+
+                p.results = store.readCatalog(catalog, p.statements)
+                return p
+            }
+        }
     }
+
+    /** The live namespace id of a name, as [HogliteCatalogStore.liveNamespace] resolves it. One `?`: the name. */
+    private const val LIVE_NAMESPACE_ID_SQL = "SELECT id FROM namespaces WHERE name = ? AND dropped_snapshot IS NULL"
+
+    /**
+     * The live table id of (namespace, name), as [HogliteCatalogStore.liveTable]
+     * resolves it, for a read that cannot bind the id yet. Two `?`: namespace, name.
+     */
+    private const val LIVE_TABLE_ID_SQL =
+        "(SELECT t.id FROM table_versions v JOIN tables t ON t.id = v.table_id " +
+            "WHERE v.namespace_id = ($LIVE_NAMESPACE_ID_SQL) AND v.name = ? " +
+            "AND v.end_snapshot IS NULL AND t.dropped_snapshot IS NULL)"
 
     /** The tables a guarded request's CONTENT window covers: delete targets when requireUnchangedTables. */
     private fun unchangedIds(
@@ -1082,18 +1307,6 @@ internal object HogliteCommit {
             .filter { it.deletes }
             .map { resolved.getValue("${it.namespace}.${it.table}").tableId }
     }
-
-    /** The live field_id -> type map stats validation checks against (every node, containers included). */
-    private fun liveColumnTypes(
-        store: HogliteCatalogStore,
-        catalog: String,
-        tableId: Long,
-    ): Map<Long, ColType> =
-        store.queryCatalog(
-            catalog,
-            "SELECT field_id, type FROM columns WHERE table_id = ? AND end_snapshot IS NULL",
-            tableId,
-        ).rows.associate { it[0].asLong() to ColType.fromWire(it[1].asString()) }
 
     /**
      * CommitService.validateFiles + sanitizeStats, ported check for
@@ -1208,25 +1421,48 @@ internal object HogliteCommit {
         val claims =
             store.queryCatalog(
                 catalog,
-                "SELECT upload_id, path, file_kind, state, owner FROM uploads " +
-                    "WHERE path IN (${paths.keys.joinToString(",") { "?" }})",
+                CLAIMS_SQL + "WHERE path IN (${paths.keys.joinToString(",") { "?" }})",
                 *paths.keys.toTypedArray(),
             ).rows
         if (claims.isEmpty()) return emptyList()
-        // Immutable objects still referenced at a retained snapshot may
-        // be referenced again; ownership never permits rewriting them.
-        // Numeric kind markers, not the 'data'/'delete' strings: hoglite's
-        // /query gate scans the TEXT for DML words, and a 'delete' literal
-        // is one. The mapping back happens here.
         val retainedPaths =
-            store.queryCatalog(
-                catalog,
-                "SELECT path, 0 FROM files WHERE path IN (${paths.keys.joinToString(",") { "?" }}) " +
-                    "UNION SELECT path, 1 FROM dvs WHERE path IN (${paths.keys.joinToString(",") { "?" }})",
-                // toList() first: Set + Set is the Set overload and DEDUPLICATES the
-                // doubled keys, shorting the second IN-list its arguments.
-                *(paths.keys.toList() + paths.keys).toTypedArray(),
-            ).rows.map { it[0].asString() to (if (it[1].asLong() == 0L) "data" else "delete") }.toSet()
+            retainedPathSet(
+                store.queryCatalog(
+                    catalog,
+                    "SELECT path, 0 FROM files WHERE path IN (${paths.keys.joinToString(",") { "?" }}) " +
+                        "UNION SELECT path, 1 FROM dvs WHERE path IN (${paths.keys.joinToString(",") { "?" }})",
+                    // toList() first: Set + Set is the Set overload and DEDUPLICATES the
+                    // doubled keys, shorting the second IN-list its arguments.
+                    *(paths.keys.toList() + paths.keys).toTypedArray(),
+                ),
+            )
+        return settleDecision(claims, retainedPaths, paths, owner)
+    }
+
+    /** The upload rows a claim decision reads; the caller appends the path filter. */
+    private const val CLAIMS_SQL = "SELECT upload_id, path, file_kind, state, owner FROM uploads "
+
+    /**
+     * Immutable objects still referenced at a retained snapshot may be
+     * referenced again; ownership never permits rewriting them. Numeric
+     * kind markers, not the 'data'/'delete' strings: hoglite's /query gate
+     * scans the TEXT for DML words, and a 'delete' literal is one. The
+     * mapping back happens here.
+     */
+    private fun retainedPathSet(result: HogliteQueryResult): Set<Pair<String, String>> =
+        result.rows.map { it[0].asString() to (if (it[1].asLong() == 0L) "data" else "delete") }.toSet()
+
+    /**
+     * [decideClaims]'s decision over rows already read: [claims] are the
+     * upload rows of [paths], [retainedPaths] the (path, kind) pairs a
+     * file or DV row still holds, for at least every claimed path.
+     */
+    private fun settleDecision(
+        claims: List<List<Any?>>,
+        retainedPaths: Set<Pair<String, String>>,
+        paths: Map<String, String>,
+        owner: UUID?,
+    ): List<String> {
         val settle = mutableListOf<String>()
         for (claim in claims) {
             val path = claim[1].asString()

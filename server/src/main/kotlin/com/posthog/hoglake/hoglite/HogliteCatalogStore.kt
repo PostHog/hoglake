@@ -1693,7 +1693,7 @@ class HogliteCatalogStore(
             )
     }
 
-    private val metaSql =
+    internal val metaSql =
         "SELECT name, data_path, next_snapshot - 1, schema_version, earliest_snapshot_id, " +
             "earliest_snapshot_time, snapshot_retention_seconds, consumer_floor FROM meta WHERE id = 1"
 
@@ -1722,7 +1722,7 @@ class HogliteCatalogStore(
         return metaRow(row)
     }
 
-    private fun metaRow(row: List<Any?>): MetaRow =
+    internal fun metaRow(row: List<Any?>): MetaRow =
         MetaRow(
             name = row[0].asString(),
             dataPath = row[1].asString(),
@@ -1853,7 +1853,7 @@ class HogliteCatalogStore(
     }
 
     @Suppress("UNCHECKED_CAST")
-    private fun tableRowOf(row: List<Any?>): TableRow =
+    internal fun tableRowOf(row: List<Any?>): TableRow =
         TableRow(
             tableId = row[0].asLong(),
             tableUuid = UUID.fromString(row[1].asString()),
@@ -2219,6 +2219,34 @@ class HogliteCatalogStore(
         } catch (r: HogliteRejected) {
             throw mapRejected(catalog, r)
         }
+
+    /**
+     * Several reads of [catalog] as ONE read-only transaction on the bound
+     * incarnation ([HogliteClient.readTx]): one snapshot, one reader slot,
+     * one durability park. Same binding and error mapping as
+     * [queryCatalog], so a failed batch raises what the failed single read
+     * would have.
+     */
+    internal fun readCatalog(
+        catalog: String,
+        statements: List<HogliteStatement>,
+    ): List<HogliteQueryResult> {
+        if (unbatchedReadsForTests) {
+            return statements.map { queryCatalog(catalog, it.sql, *it.args.toTypedArray()) }
+        }
+        return try {
+            withBoundTenant(catalog) { tenant -> client.readTx(tenant, statements) }
+        } catch (r: HogliteRejected) {
+            throw mapRejected(catalog, r)
+        }
+    }
+
+    /**
+     * Test-only: [readCatalog] sends each statement as its own `/query`,
+     * the transport the commit pre-flight used before it was batched, so a
+     * test can hold the two side by side on the same state.
+     */
+    internal var unbatchedReadsForTests: Boolean = false
 
     /** No per-call refresh: a bound 404 aborts the entire plan. */
     private fun <T> withBoundTenant(
