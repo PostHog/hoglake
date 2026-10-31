@@ -219,10 +219,11 @@ tasks.test {
         .dir(layout.projectDirectory.dir("../pyhoglake/tests/vectors"))
         .withPropertyName("sharedVectors")
         .withPathSensitivity(PathSensitivity.RELATIVE)
-    // The hoglite live suites skip without HOGLITE_BINARY (CI builds it
-    // from a pinned commit, see server.yml). The engine is an input, so
-    // setting, unsetting or swapping it re-runs :test instead of leaving
-    // UP-TO-DATE reports from another engine (or from none) behind.
+    // The hoglite live suites skip without HOGLITE_BINARY (CI takes it
+    // from a hoglite image pinned by digest, see server.yml). The engine
+    // is an input, so setting, unsetting or swapping it re-runs :test
+    // instead of leaving UP-TO-DATE reports from another engine (or from
+    // none) behind.
     val hogliteBinary = providers.environmentVariable("HOGLITE_BINARY").orNull.orEmpty()
     inputs.property("hogliteBinarySet", hogliteBinary.isNotEmpty())
     if (hogliteBinary.isNotEmpty()) {

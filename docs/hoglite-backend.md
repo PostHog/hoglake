@@ -179,17 +179,32 @@ idempotent replay, stale-read conflicts, drop+recreate incarnation guards,
 offset monotonicity, upload claims, atomic table-creation, alters, views,
 options, truncate, partition debt, and the maintenance status surface.
 
-CI builds that binary from a pinned PostHog/hoglite commit with
-`ci/build-hoglited.sh` (bit-reproducible; the script refuses any digest
-other than the pinned one) and fails `server-test` if any hoglite test
-class skips. The pins (`HOGLITE_COMMIT`, `HOGLITE_GO_VERSION`,
-`HOGLITED_SHA256`) and the reproduction recipe are on the `server-test`
-job in `.github/workflows/server.yml`. To run the live suites locally
-with the same bytes:
+CI takes that binary from hoglite's release image in ECR, pinned by image
+digest (`HOGLITED_IMAGE_DIGEST`), never by tag. The digest is
+content-addressed, so it fixes every byte of the engine, the binary included.
+`ci/fetch-hoglited.sh` pulls the image by that digest, checks that its
+`org.opencontainers.image.revision` label is `HOGLITE_COMMIT`, copies out
+`/usr/local/bin/hoglited`, and puts the release's Go toolchain
+(`go version -m`) in the job summary. The pins and the recipe are on the
+`server-test` job in `.github/workflows/server.yml`.
+
+The pull role trusts only hoglake's `main` branch. So pushes to `main` run the
+live suites and fail `server-test` if the engine cannot be pulled or its label
+does not match, or if any hoglite test class skips. Pull requests cannot pull
+the engine and skip the live-engine suites by design: they get a notice and
+one job-summary line with the counts, and the job stays green.
+
+To run the live suites locally against the same engine (needs pull access to
+the hoglite ECR repository):
 
 ```sh
-git clone git@github.com:PostHog/hoglite.git /tmp/hoglite
-git -C /tmp/hoglite checkout <HOGLITE_COMMIT>
-HOGLITE_GO_VERSION=1.27.1 ci/build-hoglited.sh /tmp/hoglite <HOGLITE_COMMIT> <HOGLITED_SHA256> /tmp/hoglited
+ci/fetch-hoglited.sh <registry> <HOGLITED_IMAGE_DIGEST> <HOGLITE_COMMIT> /tmp/hoglited
 cd server && HOGLITE_BINARY=/tmp/hoglited ./gradlew :test --tests 'com.posthog.hoglake.hoglite.*'
 ```
+
+Without ECR access, rebuild from source at `HOGLITE_COMMIT` with the toolchain
+the summary records:
+`CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false ./cmd/hoglited`.
+The hoglite Containerfile builds on the floating `golang:1.27-bookworm` tag, so
+only the same Go patch release gives the same bytes; pinning that base image by
+digest is a hoglite follow-up.
