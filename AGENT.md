@@ -281,7 +281,12 @@ struct, list or map) is accepted by `prepare_append_tables` and
 `prepare_append_files`, which refused it. `registration` takes
 `stats_field_ids=` (only those fields' stats), `TableInfo` carries
 `object_prefix_field`, and `pyhoglake.object_prefix` builds and checks
-an object-prefix table's paths and stats, as the server does.
+an object-prefix table's paths and stats from its `TableInfo`, as the
+server does. A commit refused with 422 `object_prefix_violation` raises
+`ObjectPrefixViolationError` (`re_prepare=True`), a `ValidationError`,
+where it raised a plain `ValidationError`; `Table.append` and
+`prepare_append_*` do not place files, so on such a table they are
+always refused.
 
 Because that version is constant between releases, it cannot tell two
 deploys apart. The image build therefore also carries a BUILD STAMP: the

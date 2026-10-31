@@ -38,6 +38,7 @@ from pyhoglake import (
     DdlSinceReadSnapshotError,
     HoglakeClient,
     IncarnationChangedError,
+    ObjectPrefixViolationError,
     ReadSnapshotExpiredError,
     TableInfo,
 )
@@ -129,6 +130,14 @@ RECREATED_409 = {
 EXPIRED_410 = {
     "error": "expired",
     "detail": "read_snapshot 88 is below the expiry floor 120",
+}
+
+# A writer that read the table before it had the object-prefix option.
+PREFIX_422 = {
+    "error": "object_prefix_violation",
+    "detail": "expected under s3://bkt/lake/data/ns1/events/team_id=4/",
+    "tables": ["ns1.events"],
+    "retry": "re-prepare",
 }
 
 
@@ -231,8 +240,9 @@ def test_the_payload_pairs_the_cached_shape_with_its_own_snapshot(
         (DDL_409, 409, DdlSinceReadSnapshotError),
         (RECREATED_409, 409, IncarnationChangedError),
         (EXPIRED_410, 410, ReadSnapshotExpiredError),
+        (PREFIX_422, 422, ObjectPrefixViolationError),
     ],
-    ids=["ddl", "recreated", "below-floor"],
+    ids=["ddl", "recreated", "below-floor", "object-prefix"],
 )
 def test_each_re_prepare_refusal_invalidates_the_cache_and_the_next_prepare_re_reads(
     table, httpx_mock, fake_s3, tmp_path, body, status, error

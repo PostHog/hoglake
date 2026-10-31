@@ -436,8 +436,11 @@ class TableInfo:
     #: as of the snapshot this response was resolved at; None when the
     #: option is off there, and from a server older than the option. While
     #: it is set, every data file goes under
-    #: :func:`pyhoglake.object_prefix.prefix`, and its inline stats must
-    #: prove its value (:func:`pyhoglake.object_prefix.check_field_stats`).
+    #: :func:`pyhoglake.object_prefix.prefix`, and its inline stats, if
+    #: any, must prove its value
+    #: (:func:`pyhoglake.object_prefix.check_field_stats`), or the commit
+    #: is refused (:class:`~pyhoglake.ObjectPrefixViolationError`):
+    #: ``Table.append`` and ``prepare_append_*`` always are.
     object_prefix_field: str | None = None
 
     @classmethod

@@ -212,6 +212,43 @@ class IncarnationChangedError(HoglakeError):
         self.table = table
 
 
+class ObjectPrefixViolationError(ValidationError):
+    """422 ``object_prefix_violation`` — a commit to a table with an
+    object-prefix field (:attr:`~pyhoglake.TableInfo.object_prefix_field`)
+    registered a file the layout does not admit: one whose partition value
+    names no prefix, one not under its value's
+    :func:`pyhoglake.object_prefix.prefix`, or one whose inline stats do
+    not prove the value (a deletion vector outside its target's prefix
+    too). The whole commit is refused, with zero writes.
+
+    :attr:`re_prepare`, as the server's ``retry: re-prepare`` says:
+    replaying the payload cannot succeed, but a writer that read the
+    table before it had the option can re-read it and write its files
+    again under the prefix. Only a writer that builds its keys with
+    :mod:`pyhoglake.object_prefix` can: ``Table.append``,
+    ``prepare_append_tables`` and ``prepare_append_files`` write under the
+    table root, so on such a table they are refused every time, and a
+    caller must not retry them on this flag. None of them retries on its
+    own.
+
+    A :class:`ValidationError`, so an existing ``except ValidationError``
+    still catches it. :attr:`table` names the qualified table, off the
+    server's structured body."""
+
+    re_prepare = True
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        detail: str | None = None,
+        table: str | None = None,
+    ) -> None:
+        super().__init__(message, status_code=status_code, detail=detail)
+        self.table = table
+
+
 class MalformedResponseError(HoglakeError):
     """A response body did not match the wire contract: a required field
     was missing, or a field/nested object had the wrong shape.

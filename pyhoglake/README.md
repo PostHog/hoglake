@@ -141,7 +141,7 @@ for s in catalog.snapshots(before=head + 1):
 | Deferred stats | `deferred_stats=True` on `Table.append`, `Table.prepare_append_tables` and `Table.prepare_append_files` (keyword-only; **default `False`, unchanged**: stats ship with the commit). Leaves `column_stats` out of every file registration, so the server registers the file `stats_state='pending'` and its hydrator reads the footer later, outside the per-catalog commit lock. Until then readers see no column bounds for that file, and a file under the server's `HOGLAKE_HYDRATOR_MIN_FILE_BYTES` (1 MiB by default) never gets stats rows — no bounds until compaction rewrites it. `add_column` / `rename_column` on the table are not held up by a pending file: the server trusts its field ids until the hydrator's footer read proves otherwise, as it does for every inline-stats file. In exchange each deferred file gets the hydrator's `missing_field_ids` audit, which inline-stats files never get |
 | Upload fan-out | `concurrency=` on the prepared-append calls, else `PYHOGLAKE_UPLOAD_CONCURRENCY`, else 64 — capped at the number of objects. Arrow's process-global IO thread pool is raised to match only when the flush actually routes an object through Arrow |
 | `User-Agent` | `pyhoglake/<version>` on every request, from the installed package metadata (`pyhoglake/unknown` from a source checkout). The server names the client in its transition warnings by this header — notably the blind-partitioned-append WARN — so it identifies which writer has to change |
-| Errors | Typed, all under `HoglakeError`, and every one of them answers two questions — `retryable` (replay the SAME request) and `re_prepare` (replay cannot work; re-read the table and build a NEW one). `CommitConflictError` (`retryable=True` — refresh the read snapshot and retry) · `DdlSinceReadSnapshotError` (`re_prepare=True` — DDL landed on a touched table after the request's `read_snapshot`, so replaying is a livelock) · `IncarnationChangedError` (`re_prepare=True` — the table was dropped and recreated; the append incarnation guard, enforced server-side at commit, see below) · `ReadSnapshotExpiredError` (`re_prepare=True`, a subclass of `ExpiredError` — a commit whose `read_snapshot` sank below the expiry floor) · `NotFoundError` · `AlreadyExistsError` · `ValidationError` · `OffsetRegressionError` · `IdlessFilesPresentError` (409 `idless_files_present` on an `add_column`/`rename_column` while the table has a live file the hydrator has proven id-less — `missing_field_ids`; neither flag set, NOT a `CommitConflictError`, and never cleared by retrying: the file must be rewritten by compaction or retired, so fail loudly rather than back off or drop the column; pending/failed hydration does not raise it) · `ExpiredError` (410 on a changefeed window — reconcile from a full scan) · `CatalogNotEmptyError` (409 on `Catalog.drop`, one subclass per `reason`, e.g. `CatalogHasLiveNamespacesError`; neither flag set) · `MalformedResponseError` (every wire-parse failure — a structurally defective response body, an unexpected redirect (3xx is never success), a field of the wrong shape — one exception type naming the model and field) |
+| Errors | Typed, all under `HoglakeError`, and every one of them answers two questions — `retryable` (replay the SAME request) and `re_prepare` (replay cannot work; re-read the table and build a NEW one). `CommitConflictError` (`retryable=True` — refresh the read snapshot and retry) · `DdlSinceReadSnapshotError` (`re_prepare=True` — DDL landed on a touched table after the request's `read_snapshot`, so replaying is a livelock) · `IncarnationChangedError` (`re_prepare=True` — the table was dropped and recreated; the append incarnation guard, enforced server-side at commit, see below) · `ReadSnapshotExpiredError` (`re_prepare=True`, a subclass of `ExpiredError` — a commit whose `read_snapshot` sank below the expiry floor) · `ObjectPrefixViolationError` (`re_prepare=True`, a subclass of `ValidationError` — 422 `object_prefix_violation`, a file not placed under an object-prefix table's layout; re-preparing helps only a writer that places its files, never `Table.append` or `prepare_append_*`, see "Object-prefix tables") · `NotFoundError` · `AlreadyExistsError` · `ValidationError` · `OffsetRegressionError` · `IdlessFilesPresentError` (409 `idless_files_present` on an `add_column`/`rename_column` while the table has a live file the hydrator has proven id-less — `missing_field_ids`; neither flag set, NOT a `CommitConflictError`, and never cleared by retrying: the file must be rewritten by compaction or retired, so fail loudly rather than back off or drop the column; pending/failed hydration does not raise it) · `ExpiredError` (410 on a changefeed window — reconcile from a full scan) · `CatalogNotEmptyError` (409 on `Catalog.drop`, one subclass per `reason`, e.g. `CatalogHasLiveNamespacesError`; neither flag set) · `MalformedResponseError` (every wire-parse failure — a structurally defective response body, an unexpected redirect (3xx is never success), a field of the wrong shape — one exception type naming the model and field) |
 
 ## Type mapping
 
@@ -786,19 +786,42 @@ consequences the "Deferred stats" row under "Configuration" lists. For a table w
 column, `write_part` writes `pq.write_table`'s bytes with the given
 options, byte for byte what `append` wrote before it was built on the
 core (`tests/data/writer_golden.json`).
-`registration(..., stats_field_ids=ids)` keeps only those fields' stats,
-and refuses an empty set or an id the file has none for: a `provided`
-file is never hydrated, so a stat left out stays out.
+`registration(..., stats=True, stats_field_ids=ids)` registers only
+those fields' stats. The file is `provided` and is never hydrated, so it
+has no stats for any other column, and nothing prunes it on them, until
+compaction rewrites it. `ids` without `stats=True`, an empty set, a
+`bool` or another non-integer, or an id the file has no stats for is a
+`ValidationError`.
 
 **Object-prefix tables.** `TableInfo.object_prefix_field` is None while
 the option is off and from an older server. While it is set, the server
-takes a data file only under `object_prefix.prefix(data_path, namespace, table, field,
-col_type, value)`, `<data_path>/data/<ns>/<table>/<field>=<value>/`, value
-its identity partition value for the field (`object_prefix.key_index` in
-the spec), and its inline stats must pass `object_prefix.check_field_stats`;
-anything else is a 422 `object_prefix_violation`, a `Table.append`
-included. `stats_field_ids={field_id}` is enough, and keeps a small file
-out of the hydrator: a deferred one is not compacted until it is proven.
+takes a data file only under `object_prefix.prefix(data_path, info,
+value)`, `<data_path>/data/<ns>/<table>/<field>=<value>/`, value its
+identity partition value for the field (at `object_prefix.key_index` in
+the spec, read with `object_prefix.parse_value`), and its inline stats,
+when it has any, must pass `object_prefix.check_field_stats(info, value,
+stats)`; a file with deferred stats registers `pending`, and the
+hydrator makes that check on its footer. Anything else is refused with
+422 `ObjectPrefixViolationError`.
+`prefix`, `expected_bound` and `check_field_stats` take the `TableInfo`
+the payload's `read_snapshot` comes from and read the field's type from
+its column, never from the caller, and take the value as an integer
+(numpy's and Arrow's included, not a `bool`), writing its canonical
+decimal themselves.
+
+pyhoglake's own writers do not place files. `Table.append`,
+`prepare_append_tables` and `prepare_append_files` write under the table
+root, so on such a table every commit of theirs is refused with that
+422, and re-preparing them does not help. A writer of such a table
+(millrace; a one-off copy job) builds its keys with `object_prefix` and
+registers them through `PreparedPart.registration`.
+
+On such a table, millrace registers a file below its
+`footer_stats_min_bytes` with `stats_field_ids={field_id}`: the prefix
+field's stats alone, which the server checks at commit. The file is
+then `provided`, mountable and compactable at commit with no hydrator
+pass, and has no stats for its other columns until compaction rewrites
+it. A file at or above the threshold registers every stat.
 
 ## The append incarnation guard — atomic at commit
 

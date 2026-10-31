@@ -7,6 +7,7 @@ built on this, and an ingester that owns its own calls it directly.
 
 from __future__ import annotations
 
+import operator
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -65,12 +66,23 @@ class PreparedPart:
         """The FileRegistration wire dict for this file uploaded at ``uri``,
         with ``column_stats`` from its own footer when ``stats``: every
         leaf's, or only those of the field ids in ``stats_field_ids``.
+        Without ``stats`` the key is left out, and the server registers the
+        file ``pending`` for its hydrator.
 
-        With ``stats``, an empty ``stats_field_ids``, or one naming an id
-        this file has no stats for (a container's, or one the table does
-        not have), is a ``ValidationError``: either would register the
-        file ``provided`` without a stat for good. Without ``stats`` the
-        key is left out and ``stats_field_ids`` is ignored."""
+        A file registered with ``stats_field_ids`` is ``provided`` and is
+        never hydrated: it has no stats for any other column, so nothing
+        prunes it on them, until compaction rewrites it. That is the trade
+        an object-prefix writer makes for a small file (millrace, below its
+        ``footer_stats_min_bytes``): the prefix field's stats alone, which
+        the server checks at commit, make it mountable and compactable at
+        once, without the hydrator. A file at or above that size carries
+        every stat.
+
+        ``stats_field_ids`` is a ``ValidationError`` without ``stats`` (the
+        file would register ``pending``), when empty, when it holds a
+        ``bool`` or a non-integer (``True`` and ``1.0`` would name field 1),
+        or when it names an id this file has no stats for (a container's,
+        or one the table does not have)."""
         return _registration(
             self, uri, columns, stats, partition_values, stats_field_ids
         )
@@ -96,15 +108,23 @@ def _registration(
     # Omitted, not empty: an absent key is what the server registers
     # 'pending' for the hydrator; `[]` would be 'provided' with no stats,
     # forever.
+    if stats_field_ids is not None and not stats:
+        # Ids asked for and then dropped: the file would register pending
+        # instead of provided, and nothing would say so.
+        raise ValidationError(
+            "stats_field_ids needs stats=True; stats=False defers every stat",
+            status_code=None,
+        )
     if stats:
         found = extract_column_stats(part.metadata, tuple(columns))
         if stats_field_ids is not None:
             # Refused, not skipped: a provided file is never hydrated, so a
             # stat asked for and left out would be missing for good.
-            wanted = set(stats_field_ids)
+            wanted = _field_ids(stats_field_ids)
             if not wanted:
                 raise ValidationError(
-                    "stats_field_ids is empty; stats=False defers the stats",
+                    "stats_field_ids is empty; to defer the stats, pass "
+                    "stats=False and no ids",
                     status_code=None,
                 )
             unknown = wanted - {stat.field_id for stat in found}
@@ -118,6 +138,23 @@ def _registration(
     if partition_values is not None:
         reg["partition_values"] = list(partition_values)
     return reg
+
+
+def _field_ids(ids: Collection[int]) -> set[int]:
+    # Each item, before a set can fold True or 1.0 into 1 and hide it:
+    # either would name field 1. Any other integer (numpy's, Arrow's) is
+    # its int, as an object-prefix value is.
+    wanted: set[int] = set()
+    for item in ids:
+        try:
+            if isinstance(item, bool):
+                raise TypeError
+            wanted.add(operator.index(item))
+        except TypeError:
+            raise ValidationError(
+                f"stats_field_ids holds {item!r}, not a field id", status_code=None
+            ) from None
+    return wanted
 
 
 def write_part(
