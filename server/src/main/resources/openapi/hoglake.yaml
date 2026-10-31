@@ -5950,7 +5950,14 @@ components:
         catalog:
           type: string
           description: The catalog the run acted on (the ledger is per-catalog).
-        task: { $ref: "#/components/schemas/MaintenanceTask" }
+        task:
+          type: string
+          description: >
+            The task name as recorded. Normally one of the
+            `MaintenanceTask` values, but a ledger written by a newer
+            build during a rolling deploy can hold a name this build does
+            not know; it is passed through as-is rather than failing the
+            feed.
         trigger:
           type: string
           enum: [loop, manual]
