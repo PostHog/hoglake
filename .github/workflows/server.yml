@@ -78,6 +78,33 @@ jobs:
     if: needs.changes.outputs.server == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # The hoglite engine the live suites run against: hoglited taken
+    # from hoglite's release image in ECR (repository "hoglite"),
+    # pinned by IMAGE DIGEST, never by tag. Change both in one reviewed
+    # commit:
+    #   HOGLITE_COMMIT         hoglite commit the image was built from;
+    #                          checked against the image's
+    #                          org.opencontainers.image.revision label
+    #   HOGLITED_IMAGE_DIGEST  digest of that image (release tag
+    #                          r202610310801-bfdf4b)
+    # The digest is content-addressed, so it fixes every byte of the
+    # engine; there is deliberately no separate binary hash (see
+    # ci/fetch-hoglited.sh). Reproduce with pull access to the hoglite
+    # ECR repository:
+    #   docker pull --platform linux/amd64 <registry>/hoglite@<HOGLITED_IMAGE_DIGEST>
+    #   id=$(docker create --platform linux/amd64 <registry>/hoglite@<HOGLITED_IMAGE_DIGEST>)
+    #   docker cp "$id:/usr/local/bin/hoglited" hoglited && docker rm "$id"
+    # ci/fetch-hoglited.sh runs exactly that, checks the revision label,
+    # and puts the release's Go toolchain (go version -m) in the job
+    # summary, which is what a rebuild from source at HOGLITE_COMMIT needs.
+    env:
+      HOGLITE_COMMIT: bfdf4b3c39b1cf3a4f7b38ebc847c7d50b1ca25c
+      HOGLITED_IMAGE_DIGEST: sha256:924dafe1413c0a20d1005ae281b7dd094eb59d27d948b373ef5cea86e6fce4ab
+    # id-token: the OIDC token for the ECR pull role (main pushes only;
+    # the role's trust admits refs/heads/main and nothing else).
+    permissions:
+      contents: read
+      id-token: write
     concurrency:
       group: server-test-${{ github.ref }}
       cancel-in-progress: true
@@ -96,9 +123,127 @@ jobs:
       # MinIO build — both unauthenticated Docker Hub pulls, the usual
       # rate-limit flake source). :test includes the schema-equivalence gate
       # (fold(migrations) == schema.sql).
+
+      # ---- Live hoglite engine -------------------------------------
+      # The Hoglite*IntegrationTest classes start a real hoglited from
+      # HOGLITE_BINARY and skip without one.
+      #
+      # PUSH TO MAIN = ENFORCE. The job assumes hoglake's existing ECR
+      # role over GitHub OIDC (role ARN in the
+      # HOGLAKE_AWS_ECR_PUBLISH_IAM_ROLE secret, the one ecr-release.yml
+      # uses), pulls the pinned image by digest, checks its revision
+      # label, and then requires every hoglite test class to run with
+      # zero skips. A missing secret, a failed role assumption or pull,
+      # a wrong revision label, or any hoglite skip fails the job.
+      #
+      # PULL REQUEST = SKIP, BY DESIGN. The role trusts
+      # refs/heads/main only, so a PR run cannot pull the engine. It
+      # runs everything else, skips the live-engine suites, and says so
+      # in a notice and one job-summary line with the counts. The job
+      # stays green; main enforces.
+      - name: Decide whether the live hoglite suites run
+        id: hoglite
+        env:
+          ENFORCE: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          HAS_ROLE: ${{ secrets.HOGLAKE_AWS_ECR_PUBLISH_IAM_ROLE != '' }}
+        run: |
+          if [[ $ENFORCE != true ]]; then
+            echo "mode=skip" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Live hoglite suites run on main::This run skips the live-engine hoglite suites; they run, with a zero-skip gate, on every push to main."
+          elif [[ $HAS_ROLE == true ]]; then
+            echo "mode=live" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error title=hoglite engine unavailable::The HOGLAKE_AWS_ECR_PUBLISH_IAM_ROLE secret is not set, so hoglite image ${HOGLITED_IMAGE_DIGEST} cannot be pulled and the live hoglite suites would skip."
+            exit 1
+          fi
+
+      - name: Assume the ECR pull role
+        id: aws
+        if: steps.hoglite.outputs.mode == 'live'
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+        with:
+          role-to-assume: ${{ secrets.HOGLAKE_AWS_ECR_PUBLISH_IAM_ROLE }}
+          aws-region: us-east-1
+          mask-aws-account-id: true
+
+      - name: Log in to ECR
+        id: ecr
+        if: steps.hoglite.outputs.mode == 'live'
+        uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076 # v2.0.1
+
+      - name: Explain a failed ECR login
+        if: failure() && (steps.aws.outcome == 'failure' || steps.ecr.outcome == 'failure')
+        run: |
+          echo "::error title=hoglite engine unavailable::Could not assume the ECR pull role or log in, so hoglite image ${HOGLITED_IMAGE_DIGEST} (expected hoglite ${HOGLITE_COMMIT}) cannot be pulled. The role must be trusted for this repository's main branch and allowed to pull the hoglite repository."
+          exit 1
+
+      # The registry host contains the AWS account. configure-aws-credentials
+      # registers that ID as a mask with mask-aws-account-id, so the host is
+      # masked without printing a workflow command built from a step output,
+      # which Semgrep blocks (unsafe-add-mask-workflow-command).
+      - name: Pull hoglited from the pinned image and verify it
+        if: steps.hoglite.outputs.mode == 'live'
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          ci/fetch-hoglited.sh "$REGISTRY" "$HOGLITED_IMAGE_DIGEST" "$HOGLITE_COMMIT" "$RUNNER_TEMP/hoglited" \
+            > "$RUNNER_TEMP/hoglite-engine.txt"
+          cat "$RUNNER_TEMP/hoglite-engine.txt"
+          { echo "### hoglite engine"; echo '```'; cat "$RUNNER_TEMP/hoglite-engine.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          echo "HOGLITE_BINARY=$RUNNER_TEMP/hoglited" >> "$GITHUB_ENV"
+
       - name: Server tests + ktlint
         working-directory: server
         run: ./gradlew --no-daemon :test :ktlintCheck :checkOpenapiVersion
+
+      # The hoglite tests skip (assumeTrue) without an engine, and a
+      # skip passes Gradle. On main this step reads the JUnit reports so
+      # a skip (or a missing report) fails the job, and puts the counts
+      # in the job summary. On a PR it only writes the one-line note. It
+      # also runs after a test failure, so the summary always has them.
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        if: ${{ !cancelled() && steps.hoglite.outputs.mode != '' }}
+      - name: Require the hoglite suites to run with zero skips
+        if: ${{ !cancelled() && steps.hoglite.outputs.mode != '' }}
+        env:
+          MODE: ${{ steps.hoglite.outputs.mode }}
+        run: |
+          # Every report in the hoglite package or of a Hoglite* class
+          # anywhere, and the live-engine classes by name, so a class
+          # that never ran fails too. A class that needs the engine but
+          # has another name must be added to `required`.
+          dir=server/build/test-results/test
+          required=(HogliteBackendIntegrationTest HogliteGuardRaceTest HogliteObjectPrefixIntegrationTest HogliteBackendConformanceIntegrationTest HogliteSchemaEquivalenceIntegrationTest HogliteDurabilityConformanceIntegrationTest)
+          reports=()
+          for cls in "${required[@]}"; do
+            reports+=("$dir/TEST-com.posthog.hoglake.hoglite.${cls}.xml")
+          done
+          shopt -s nullglob
+          for f in "$dir"/TEST-com.posthog.hoglake.hoglite.*.xml "$dir"/TEST-*.Hoglite*.xml; do
+            [[ " ${reports[*]} " == *" $f "* ]] || reports+=("$f")
+          done
+          status=0
+          uv run --no-project --with defusedxml==0.7.1 python ci/check_live_results.py \
+            "${reports[@]}" > "$RUNNER_TEMP/hoglite-counts.txt" 2>&1 || status=$?
+          cat "$RUNNER_TEMP/hoglite-counts.txt"
+          tests=$(grep -o '[0-9]* tests;' "$RUNNER_TEMP/hoglite-counts.txt" | awk '{n+=$1} END {print n+0}')
+          skipped=$(grep -o "'skipped': [0-9]*" "$RUNNER_TEMP/hoglite-counts.txt" | awk '{n+=$2} END {print n+0}')
+          if [[ $MODE == skip ]]; then
+            note="Live hoglite suites run on pushes to main; this run skipped them by design (${tests} hoglite tests, ${skipped} skipped)."
+            echo "$note"
+            echo "$note" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          line="${tests} hoglite tests, ${skipped} skipped (engine ${HOGLITE_COMMIT:0:12}, image ${HOGLITED_IMAGE_DIGEST:7:12})"
+          if [[ $status == 0 ]]; then
+            title="Live hoglite suites: ${line}"
+          else
+            title="Live hoglite suites FAILED the zero-skip gate: ${line}"
+            echo "::error title=hoglite suites incomplete::${line}. Every hoglite test class must run with zero skips, failures and errors."
+          fi
+          echo "$title"
+          { echo "## ${title}"; echo '```'; cat "$RUNNER_TEMP/hoglite-counts.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
 
   trino-test:
     # The connector lives in PostHog/trino (repo PR #1); this runs the

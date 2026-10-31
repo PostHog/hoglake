@@ -27,7 +27,7 @@ class PartitionLookupService(
     private val candidateLimit: Int = 10_000,
     private val statementTimeoutMs: Int = 3_000,
     maxConcurrentRequests: Int = 2,
-) {
+) : PartitionLookupBackend {
     init {
         require(candidateLimit in 1 until Int.MAX_VALUE)
         require(statementTimeoutMs > 0)
@@ -36,15 +36,15 @@ class PartitionLookupService(
 
     private val admission = PartitionLookupAdmission(maxConcurrentRequests)
 
-    fun lookup(
+    override fun lookup(
         catalog: String,
         namespace: String,
         table: String,
         specId: Long,
         values: List<String?>,
-        snapshot: Long? = null,
-        limit: Int? = null,
-        cursor: String? = null,
+        snapshot: Long?,
+        limit: Int?,
+        cursor: String?,
     ): PartitionLookup {
         val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(statementTimeoutMs.toLong())
         if (specId <= 0) throw PartitionLookupInvalidRequest("spec_id must be positive")

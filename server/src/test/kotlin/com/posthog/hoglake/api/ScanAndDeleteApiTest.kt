@@ -4,7 +4,10 @@ import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.posthog.hoglake.App
 import com.posthog.hoglake.Config
+import com.posthog.hoglake.commit.CommitService
+import com.posthog.hoglake.service.CatalogService
 import com.posthog.hoglake.service.ScanService
+import com.posthog.hoglake.store.PostgresCatalogStore
 import com.posthog.hoglake.testing.PgTestSupport
 import io.ktor.client.HttpClient
 import io.ktor.client.request.get
@@ -44,7 +47,9 @@ class ScanAndDeleteApiTest {
         testApplication {
             application {
                 app.module(this)
-                installScanRoutes(ScanService(db.jdbi))
+                installScanRoutes(
+                    PostgresCatalogStore(CatalogService(db.jdbi), CommitService(db.jdbi), ScanService(db.jdbi)),
+                )
             }
             block(client)
         }

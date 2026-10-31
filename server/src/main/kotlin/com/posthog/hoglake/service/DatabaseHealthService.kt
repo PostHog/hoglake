@@ -37,8 +37,8 @@ class DatabaseHealthService(
     private val jdbi: Jdbi,
     /** The bloat estimate's owner; its gauge is refreshed by every report. */
     private val reindex: ReindexService = ReindexService(jdbi),
-) {
-    fun report(): DatabaseHealth =
+) : DatabaseHealthBackend {
+    override fun report(): DatabaseHealth =
         jdbi.inTransactionUnchecked { handle ->
             // One transaction, so every number is from one MVCC snapshot:
             // a table list that disagrees with its own index list is

@@ -1,0 +1,1822 @@
+package com.posthog.hoglake.hoglite
+
+import com.fasterxml.jackson.databind.node.ObjectNode
+import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import com.posthog.hoglake.App
+import com.posthog.hoglake.HealthProbe
+import com.posthog.hoglake.model.ColType
+import com.posthog.hoglake.model.ColumnDef
+import com.posthog.hoglake.model.CommitRequest
+import com.posthog.hoglake.model.DeleteFileRegistration
+import com.posthog.hoglake.model.FileRegistration
+import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.TableAppend
+import com.posthog.hoglake.model.TableDeletes
+import com.posthog.hoglake.service.TableCreationDefinition
+import com.posthog.hoglake.testing.TestImages
+import com.sun.net.httpserver.HttpServer
+import io.ktor.client.request.get
+import io.ktor.client.request.post
+import io.ktor.client.request.setBody
+import io.ktor.http.ContentType
+import io.ktor.http.HttpStatusCode
+import io.ktor.http.contentType
+import io.ktor.server.testing.testApplication
+import org.assertj.core.api.Assertions.assertThat
+import org.assertj.core.api.Assertions.assertThatThrownBy
+import org.junit.jupiter.api.AfterAll
+import org.junit.jupiter.api.Assumptions.assumeTrue
+import org.junit.jupiter.api.BeforeAll
+import org.junit.jupiter.api.Tag
+import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.TestInstance
+import org.testcontainers.containers.MinIOContainer
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider
+import software.amazon.awssdk.regions.Region
+import software.amazon.awssdk.services.s3.S3Client
+import java.net.InetSocketAddress
+import java.net.ServerSocket
+import java.net.URI
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse
+import java.nio.file.Files
+import java.time.Duration
+import java.util.UUID
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
+
+/**
+ * The hoglite backend end to end: a real `hoglited` (the same binary
+ * production runs) in front of a Silo container, driven through
+ * [HogliteCatalogStore] exactly as the /v1 routes drive it.
+ *
+ * The store is where hoglake's catalog semantics live on this backend —
+ * the OCC guards, the idempotency receipts, the typed conflicts — so
+ * this suite exercises the semantics, not the wire (the wire is
+ * [com.posthog.hoglake.api]'s, and backend-agnostic).
+ *
+ * The binary is located via `HOGLITE_BINARY` or on the PATH; without
+ * one the class skips (the CI packaging story — an image or a
+ * prebuilt binary — is the follow-up this suite's skip reports).
+ */
+@Tag("integration")
+@TestInstance(TestInstance.Lifecycle.PER_CLASS)
+class HogliteBackendIntegrationTest {
+    private lateinit var minio: MinIOContainer
+    private var process: Process? = null
+    private lateinit var client: HogliteClient
+    private lateinit var store: HogliteCatalogStore
+    private var catalogCounter = 0
+    private lateinit var metricsUrl: String
+
+    @BeforeAll
+    fun startHoglite() {
+        val binary = System.getenv("HOGLITE_BINARY") ?: findOnPath("hoglited")
+        assumeTrue(binary != null) { "no hoglited binary (set HOGLITE_BINARY); skipping hoglite backend tests" }
+
+        minio = TestImages.minio()
+        minio.start()
+        // The AWS SDK only falls back to PATH-style addressing for an
+        // IP-literal endpoint; MinIOContainer's s3URL is a `localhost`
+        // URL, which resolves as a virtual-hosted bucket name.
+        val s3Endpoint = "http://127.0.0.1:${minio.firstMappedPort}"
+        val bucket = "hoglite-it"
+        val s3 =
+            S3Client.builder()
+                .endpointOverride(URI.create(s3Endpoint))
+                .credentialsProvider(
+                    StaticCredentialsProvider.create(
+                        AwsBasicCredentials.create(minio.userName, minio.password),
+                    ),
+                )
+                .region(Region.US_EAST_1)
+                .forcePathStyle(true)
+                .build()
+        s3.createBucket { it.bucket(bucket) }
+        // The catalog data_path bucket (freshCatalog's s3://hoglake-it/...):
+        // cleanup's drain DELETEs there.
+        s3.createBucket { it.bucket("hoglake-it") }
+        s3.close()
+
+        val port = ServerSocket(0).use { it.localPort }
+        metricsUrl = "http://127.0.0.1:$port/metrics"
+        val dir = Files.createTempDirectory("hoglited-it").toFile()
+        val builder =
+            ProcessBuilder(
+                binary,
+                "-addr", "127.0.0.1:$port",
+                "-dir", dir.absolutePath,
+                "-bucket", bucket,
+                "-id", "it-1",
+                "-class", "standard",
+            ).redirectErrorStream(true)
+        builder.environment().putAll(
+            mapOf(
+                "AWS_ENDPOINT_URL" to s3Endpoint,
+                "AWS_ACCESS_KEY_ID" to minio.userName,
+                "AWS_SECRET_ACCESS_KEY" to minio.password,
+                "AWS_REGION" to "us-east-1",
+            ),
+        )
+        process = builder.start()
+        val http = HttpClient.newHttpClient()
+        val deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos()
+        var up = false
+        while (System.nanoTime() < deadline) {
+            if (process?.isAlive == false) break
+            try {
+                val resp =
+                    http.send(
+                        HttpRequest.newBuilder(URI.create("http://127.0.0.1:$port/v1/healthz")).build(),
+                        HttpResponse.BodyHandlers.discarding(),
+                    )
+                if (resp.statusCode() == 200) {
+                    up = true
+                    break
+                }
+            } catch (_: Exception) {
+                // not up yet
+            }
+            Thread.sleep(100)
+        }
+        if (!up) {
+            val out = process?.inputStream?.readBytes()?.decodeToString()?.take(2000)
+            throw IllegalStateException("hoglited did not come up; output: $out")
+        }
+        client = HogliteClient(standardUrl = "http://127.0.0.1:$port", sleeper = {})
+        store = HogliteCatalogStore(client).apply { requireOperationBindingForTests = true }
+    }
+
+    @AfterAll
+    fun stopHoglite() {
+        if (::client.isInitialized) client.close()
+        process?.destroy()
+        process?.waitFor()
+        if (::minio.isInitialized) minio.stop()
+    }
+
+    private fun freshCatalog(): String {
+        val name = "it${catalogCounter++}"
+        store.createCatalog(name, "s3://hoglake-it/$name")
+        return name
+    }
+
+    private fun findOnPath(binary: String): String? {
+        val path = System.getenv("PATH") ?: return null
+        return path.split(':').map { "$it/$binary" }.firstOrNull { java.io.File(it).canExecute() }
+    }
+
+    private fun scaleWrite(
+        catalog: String,
+        sql: String,
+        vararg args: Any?,
+    ) = store.catalogOperation(catalog) {
+        store.runTx(catalog, HogliteCatalogStore.freshTxid("scale"), null, HogliteTx().apply { add(sql, *args) })
+    }
+
+    private fun queryCount(): Long {
+        val body =
+            HttpClient.newHttpClient().send(
+                HttpRequest.newBuilder(URI.create(metricsUrl)).build(),
+                HttpResponse.BodyHandlers.ofString(),
+            ).body()
+        return body.lineSequence().first { it.startsWith("hoglite_queries_total ") }.substringAfter(' ').toLong()
+    }
+
+    @Test
+    fun `scan pages 565000 files by row lineage and id without fetching unrequested stats`() {
+        val cat = freshCatalog()
+        store.createNamespace(cat, "ns")
+        val table = store.createTable(cat, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        val count = 565_000
+        for (start in 1..count step 5_000) {
+            scaleWrite(
+                cat,
+                """WITH RECURSIVE n(i) AS (VALUES(?) UNION ALL SELECT i + 1 FROM n WHERE i < ?)
+                    INSERT INTO files(id, table_id, path, record_count, file_size_bytes, row_id_start, stats_state, begin_snapshot)
+                    SELECT i, ?, 's3://hoglake-it/scale/' || i || '.parquet', 1, 100, i / 2, 'pending', ? FROM n""",
+                start,
+                minOf(start + 4_999, count),
+                table.tableId,
+                table.readSnapshotId,
+            )
+        }
+        // Even a legacy oversized stats payload must cost no wire bytes when
+        // stats were not requested. Row-id ties cross page boundaries.
+        scaleWrite(
+            cat,
+            "UPDATE files SET stats_json = ? WHERE id = 1",
+            "x".repeat(HogliteCatalogStore.SCAN_MAX_ROW_JSON_BYTES + 1),
+        )
+        val before = queryCount()
+        val started = System.nanoTime()
+        val files = store.planScan(cat, "ns", "t", table.readSnapshotId, null, null, false)
+        val elapsedMs = (System.nanoTime() - started) / 1_000_000
+        val queries = queryCount() - before
+        assertThat(files).hasSize(count)
+        assertThat(
+            files.withIndex().all {
+                    (i, f) ->
+                f.dataFile.dataFileId == i + 1L && f.dataFile.rowIdStart == (i + 1L) / 2
+            },
+        ).isTrue()
+        assertThat(files.all { it.dataFile.columnStats == null && it.dataFile.splitOffsets == null }).isTrue()
+        val pages = (count + HogliteCatalogStore.SCAN_PAGE_SIZE - 1) / HogliteCatalogStore.SCAN_PAGE_SIZE
+        assertThat(queries).isBetween(pages.toLong(), pages + 30L)
+        println("hoglite scale: $count files, $pages pages, $queries queries, $elapsedMs ms")
+    }
+
+    @Test
+    fun `oversized requested scan metadata fails explicitly instead of timing out`() {
+        val cat = freshCatalog()
+        store.createNamespace(cat, "ns")
+        store.createTable(cat, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        append(cat, "a.parquet")
+        scaleWrite(
+            cat,
+            "UPDATE files SET stats_json = ?, split_offsets_json = ?",
+            "x".repeat(HogliteCatalogStore.SCAN_MAX_ROW_JSON_BYTES + 1),
+            "x".repeat(HogliteCatalogStore.SCAN_MAX_ROW_JSON_BYTES + 1),
+        )
+        assertThatThrownBy {
+            store.planScan(
+                cat,
+                "ns",
+                "t",
+                null,
+                null,
+                com.posthog.hoglake.service.ScanService.ColumnStatsRequest(),
+                false,
+            )
+        }.isInstanceOf(
+            HoglakeException.Validation::class.java,
+        ).hasMessageContaining("scan plan file metadata exceeds maximum")
+        assertThatThrownBy {
+            store.planScan(cat, "ns", "t", null, null, null, true)
+        }.isInstanceOf(
+            HoglakeException.Validation::class.java,
+        ).hasMessageContaining("scan plan file metadata exceeds maximum")
+        // Individually legal payloads must not accumulate without a bound.
+        val payload = " ".repeat(HogliteCatalogStore.SCAN_MAX_ROW_JSON_BYTES - 2) + "[]"
+        scaleWrite(cat, "UPDATE files SET stats_json = ?, split_offsets_json = NULL", payload)
+        scaleWrite(
+            cat,
+            """WITH RECURSIVE n(i) AS (VALUES(2) UNION ALL SELECT i + 1 FROM n WHERE i < 1025)
+                INSERT INTO files(id, table_id, path, record_count, file_size_bytes, row_id_start,
+                                  stats_state, stats_json, begin_snapshot)
+                SELECT i, table_id, path || i, record_count, file_size_bytes, i,
+                       stats_state, stats_json, begin_snapshot FROM n CROSS JOIN files WHERE files.id = 1""",
+        )
+        assertThatThrownBy {
+            store.planScan(
+                cat,
+                "ns",
+                "t",
+                null,
+                null,
+                com.posthog.hoglake.service.ScanService.ColumnStatsRequest(),
+                false,
+            )
+        }.isInstanceOf(
+            HoglakeException.Validation::class.java,
+        ).hasMessageContaining("scan plan requested metadata exceeds maximum")
+    }
+
+    @Test
+    fun `existing tenant migrates scale indexes and path and expiry probes use them`() {
+        val cat = freshCatalog()
+        store.createNamespace(cat, "ns")
+        val table = store.createTable(cat, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        append(cat, "a.parquet")
+        // Mostly ended history: path protection includes it; expiry should
+        // range over it without inspecting the live set.
+        scaleWrite(
+            cat,
+            """WITH RECURSIVE n(i) AS (VALUES(2) UNION ALL SELECT i + 1 FROM n WHERE i < 100001)
+                INSERT INTO files(id, table_id, path, record_count, file_size_bytes, row_id_start,
+                                  stats_state, begin_snapshot, end_snapshot)
+                SELECT i, ?, 's3://hoglake-it/history/' || i, 1, 100, i, 'pending', 2, 3 FROM n""",
+            table.tableId,
+        )
+        for (ddl in HogliteSchema.SCALE_INDEXES) {
+            scaleWrite(cat, "DROP INDEX " + ddl.substringAfter("IF NOT EXISTS ").substringBefore(" ON"))
+        }
+        val started = System.nanoTime()
+        val fresh = HogliteCatalogStore(client).apply { requireOperationBindingForTests = true }
+        assertThat(fresh.planScan(cat, "ns", "t", null, null, null, false)).hasSize(1)
+        println("hoglite scale migration: 100001 files, ${(System.nanoTime() - started) / 1_000_000} ms")
+        fresh.catalogOperation(cat) {
+            for ((sql, index) in listOf(
+                "SELECT path FROM files WHERE path IN ('absent')" to "files_path",
+                "SELECT path FROM dvs WHERE path IN ('absent')" to "dvs_path",
+                "SELECT path FROM removals WHERE path IN ('absent') AND drained_at IS NULL" to
+                    "removals_undrained_path",
+                "SELECT id FROM files WHERE end_snapshot IS NOT NULL AND end_snapshot <= 10 LIMIT 100" to "files_ended",
+                "SELECT delete_file_id FROM dvs WHERE end_snapshot IS NOT NULL AND end_snapshot <= 10 LIMIT 100" to
+                    "dvs_ended",
+                (
+                    "SELECT id FROM files WHERE table_id = 1 AND (row_id_start, id) > (10, 20) " +
+                        "ORDER BY row_id_start, id LIMIT 256"
+                ) to "files_scan",
+            )) {
+                val plan = fresh.queryCatalog(cat, "EXPLAIN QUERY PLAN $sql").rows.joinToString { it.last().asString() }
+                assertThat(plan).contains(index).contains("SEARCH").doesNotContain("TEMP B-TREE")
+            }
+            assertThat(
+                fresh.queryCatalog(cat, "SELECT path FROM files WHERE id = 1").rows.single().single(),
+            ).isEqualTo("s3://hoglake-it/$cat/data/a.parquet")
+        }
+    }
+
+    @Test
+    fun `scan retries a real checkpoint-cancelled page without losing its tenant binding`() {
+        val cat = freshCatalog()
+        store.createNamespace(cat, "ns")
+        store.createTable(cat, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        append(cat, "a.parquet")
+        val engine = metricsUrl.removeSuffix("/metrics")
+        val http = HttpClient.newHttpClient()
+        val json = jacksonObjectMapper()
+        val attempts = AtomicInteger()
+        val cancelledStatus = AtomicInteger()
+        val cancelledCode = AtomicReference<String>()
+        val cancelledError = AtomicReference<String>()
+        val scanTenant = AtomicReference<String>()
+        val failure = AtomicReference<Throwable>()
+        val executor = Executors.newCachedThreadPool()
+        val proxy = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        proxy.executor = executor
+        proxy.createContext("/") { ex ->
+            try {
+                val path = ex.requestURI.toString()
+                var body = ex.requestBody.readBytes()
+                val scanPage =
+                    path.endsWith("/query") &&
+                        body.decodeToString().contains("ORDER BY f.row_id_start, f.id LIMIT")
+                val first = scanPage && attempts.incrementAndGet() == 1
+                if (scanPage) {
+                    if (first) scanTenant.set(path) else check(path == scanTenant.get())
+                }
+                if (first) {
+                    val statement = json.readTree(body) as ObjectNode
+                    statement.put(
+                        "sql",
+                        statement["sql"].asText().replace(
+                            "FROM files f",
+                            "FROM files f CROSS JOIN (WITH RECURSIVE n(x) AS " +
+                                "(VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<1000000000) SELECT sum(x) FROM n) slow",
+                        ),
+                    )
+                    body = json.writeValueAsBytes(statement)
+                }
+                val pending =
+                    http.sendAsync(
+                        HttpRequest.newBuilder(URI.create(engine + path)).header("Content-Type", "application/json")
+                            .method(ex.requestMethod, HttpRequest.BodyPublishers.ofByteArray(body)).build(),
+                        HttpResponse.BodyHandlers.ofByteArray(),
+                    )
+                if (first) {
+                    val tenantPath = path.removeSuffix("/query")
+                    val deadline = System.nanoTime() + Duration.ofSeconds(2).toNanos()
+                    var active = false
+                    while (System.nanoTime() < deadline && !active) {
+                        val status =
+                            http.send(
+                                HttpRequest.newBuilder(URI.create("$engine$tenantPath/status")).build(),
+                                HttpResponse.BodyHandlers.ofString(),
+                            )
+                        active = json.readTree(status.body())["local"]?.get("active_reads")?.asInt() == 1
+                    }
+                    check(active) { "slow scan did not enter a read snapshot" }
+                    val release =
+                        http.send(
+                            HttpRequest.newBuilder(URI.create("$engine$tenantPath/release"))
+                                .POST(HttpRequest.BodyPublishers.noBody()).build(),
+                            HttpResponse.BodyHandlers.discarding(),
+                        )
+                    check(release.statusCode() == 200) { "checkpoint drain failed" }
+                }
+                val response = pending.get(5, TimeUnit.SECONDS)
+                if (first) {
+                    cancelledStatus.set(response.statusCode())
+                    cancelledCode.set(json.readTree(response.body())["code"]?.asText())
+                    cancelledError.set(json.readTree(response.body())["error"]?.asText())
+                }
+                ex.responseHeaders.add("Content-Type", "application/json")
+                ex.sendResponseHeaders(response.statusCode(), response.body().size.toLong())
+                ex.responseBody.use { it.write(response.body()) }
+            } catch (e: Throwable) {
+                failure.set(e)
+                ex.sendResponseHeaders(599, -1)
+                ex.close()
+            }
+        }
+        proxy.start()
+        try {
+            HogliteClient("http://127.0.0.1:${proxy.address.port}", sleeper = {}).use { retrying ->
+                val scoped = HogliteCatalogStore(retrying).apply { requireOperationBindingForTests = true }
+                val files = scoped.planScan(cat, "ns", "t", null, null, null, false)
+                assertThat(files.map { it.dataFile.path }).containsExactly("s3://hoglake-it/$cat/data/a.parquet")
+            }
+            assertThat(failure.get()).isNull()
+            assertThat(cancelledStatus.get()).isEqualTo(503)
+            // Upstream engines before the structured taxonomy omit code.
+            assertThat(cancelledCode.get()).isIn(null, "not_applied")
+            assertThat(cancelledError.get()).isEqualTo("read canceled by checkpoint; retry")
+            println(
+                "hoglite checkpoint retry: status=${cancelledStatus.get()} " +
+                    "code=${cancelledCode.get()} error=${cancelledError.get()} attempts=${attempts.get()}",
+            )
+            assertThat(attempts.get()).isEqualTo(2)
+        } finally {
+            proxy.stop(0)
+            executor.shutdownNow()
+        }
+    }
+
+    // ---- catalog + namespace + table lifecycle ----------------------------
+
+    @Test
+    fun `catalog namespace table lifecycle`() {
+        val catalog = freshCatalog()
+        // a same-name create is the 409, whatever the data_path.
+        assertThatThrownBy { store.createCatalog(catalog, "s3://hoglake-it/$catalog") }
+            .isInstanceOf(HoglakeException.AlreadyExists::class.java)
+        assertThatThrownBy { store.createCatalog(catalog, "s3://hoglake-it/other-$catalog") }
+            .isInstanceOf(HoglakeException.AlreadyExists::class.java)
+        // prefix overlap with an existing catalog's data_path is refused.
+        assertThatThrownBy { store.createCatalog("${catalog}sub", "s3://hoglake-it/$catalog/sub") }
+            .isInstanceOf(HoglakeException.Validation::class.java)
+
+        assertThat(store.getCatalog(catalog).headSnapshotId).isEqualTo(0)
+        assertThat(store.listCatalogs().map { it.name }).contains(catalog)
+
+        val ns = store.createNamespace(catalog, "ns")
+        assertThat(store.getNamespace(catalog, "ns").namespaceId).isEqualTo(ns.namespaceId)
+        assertThatThrownBy { store.createNamespace(catalog, "ns") }
+            .isInstanceOf(HoglakeException.AlreadyExists::class.java)
+
+        val table = store.createTable(catalog, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        assertThat(table.snapshotId).isNotNull()
+        assertThat(store.getTable(catalog, "ns", "t").tableUuid).isEqualTo(table.tableUuid)
+        assertThat(store.listTables(catalog, "ns").map { it.name }).containsExactly("t")
+
+        store.dropTable(catalog, "ns", "t", expectedTableUuid = table.tableUuid, author = "test", message = "drop")
+        assertThatThrownBy { store.getTable(catalog, "ns", "t") }
+            .isInstanceOf(HoglakeException.NotFound::class.java)
+        // time travel: the table is still visible at its live snapshot.
+        assertThat(
+            store.getTable(catalog, "ns", "t", snapshot = table.snapshotId).tableUuid,
+        ).isEqualTo(table.tableUuid)
+
+        store.dropNamespace(catalog, "ns", author = "test", message = "drop")
+        assertThat(store.listNamespaces(catalog)).isEmpty()
+
+        store.dropCatalog(catalog, "test", "drop")
+        assertThatThrownBy { store.getCatalog(catalog) }
+            .isInstanceOf(HoglakeException.NotFound::class.java)
+    }
+
+    // ---- commits: OCC guards, idempotency, typed conflicts -----------------
+
+    @Test
+    fun `commit appends land with row lineage and replay idempotently`() {
+        val catalog = freshCatalog()
+        store.createNamespace(catalog, "ns")
+        val table = store.createTable(catalog, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        val head = table.readSnapshotId
+
+        val key = UUID.randomUUID()
+        val request =
+            CommitRequest(
+                readSnapshot = head,
+                idempotencyKey = key,
+                appends =
+                    listOf(
+                        TableAppend(
+                            "ns",
+                            "t",
+                            listOf(
+                                FileRegistration("s3://hoglake-it/$catalog/data/a.parquet", 100, 1000, 500),
+                                FileRegistration("s3://hoglake-it/$catalog/data/b.parquet", 50, 800, 400),
+                            ),
+                            expectedTableUuid = table.tableUuid,
+                        ),
+                    ),
+            )
+        val committed = store.commit(catalog, request)
+        assertThat(committed.snapshotId).isEqualTo(head + 1)
+        // The same key + payload replays the receipt; it does not re-land.
+        val replayed = store.commit(catalog, request)
+        assertThat(replayed.snapshotId).isEqualTo(committed.snapshotId)
+        assertThat(store.getCatalog(catalog).headSnapshotId).isEqualTo(head + 1)
+        assertThat(store.receipt(catalog, key).snapshotId).isEqualTo(committed.snapshotId)
+        // The same key with a DIFFERENT payload is the 422.
+        assertThatThrownBy {
+            store.commit(
+                catalog,
+                request.copy(
+                    appends =
+                        listOf(
+                            TableAppend(
+                                "ns",
+                                "t",
+                                listOf(FileRegistration("s3://hoglake-it/$catalog/data/c.parquet", 1, 1, 1)),
+                                expectedTableUuid = table.tableUuid,
+                            ),
+                        ),
+                ),
+            )
+        }.isInstanceOf(HoglakeException.Validation::class.java)
+
+        // Row lineage is server-assigned and contiguous.
+        val files = store.listFiles(catalog, "ns", "t")
+        assertThat(files.map { it.recordCount }).containsExactly(100, 50)
+        assertThat(files.map { it.rowIdStart }).containsExactly(0L, 100L)
+        val scan = store.planScan(catalog, "ns", "t")
+        assertThat(scan.map { it.dataFile.path }).containsExactly(
+            "s3://hoglake-it/$catalog/data/a.parquet",
+            "s3://hoglake-it/$catalog/data/b.parquet",
+        )
+        // The changefeed carries the insert's files in the window.
+        val changes = store.changes(catalog, "ns", "t", fromSnapshot = head)
+        assertThat(changes.files.map { it.path }).containsExactly(
+            "s3://hoglake-it/$catalog/data/a.parquet",
+            "s3://hoglake-it/$catalog/data/b.parquet",
+        )
+    }
+
+    @Test
+    fun `a prepared delete against a stale read snapshot is the typed conflict`() {
+        val catalog = freshCatalog()
+        store.createNamespace(catalog, "ns")
+        val table = store.createTable(catalog, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        val head = table.readSnapshotId
+        val first =
+            store.commit(
+                catalog,
+                CommitRequest(
+                    readSnapshot = head,
+                    idempotencyKey = UUID.randomUUID(),
+                    appends =
+                        listOf(
+                            TableAppend(
+                                "ns",
+                                "t",
+                                listOf(FileRegistration("s3://hoglake-it/$catalog/data/a.parquet", 10, 100, 50)),
+                                expectedTableUuid = table.tableUuid,
+                            ),
+                        ),
+                ),
+            )
+        val fileId = store.listFiles(catalog, "ns", "t").single().dataFileId
+
+        // A writer that read at `first.snapshotId` commits a data change;
+        // a second writer's GUARDED delete against the same read snapshot
+        // must conflict.
+        store.commit(
+            catalog,
+            CommitRequest(
+                readSnapshot = first.snapshotId,
+                idempotencyKey = UUID.randomUUID(),
+                appends =
+                    listOf(
+                        TableAppend(
+                            "ns",
+                            "t",
+                            listOf(FileRegistration("s3://hoglake-it/$catalog/data/b.parquet", 5, 50, 25)),
+                            expectedTableUuid = table.tableUuid,
+                        ),
+                    ),
+            ),
+        )
+        assertThatThrownBy {
+            store.commit(
+                catalog,
+                CommitRequest(
+                    readSnapshot = first.snapshotId,
+                    idempotencyKey = UUID.randomUUID(),
+                    requireUnchangedTables = true,
+                    deletes =
+                        listOf(
+                            TableDeletes(
+                                "ns",
+                                "t",
+                                listOf(
+                                    DeleteFileRegistration(
+                                        fileId,
+                                        "s3://hoglake-it/$catalog/data/a.puffin",
+                                        1,
+                                        10,
+                                    ),
+                                ),
+                                expectedTableUuid = table.tableUuid,
+                            ),
+                        ),
+                ),
+            )
+        }.isInstanceOf(HoglakeException.CommitConflict::class.java)
+
+        // A delete that re-reads lands, and the scan pairs the DV.
+        val head2 = store.getCatalog(catalog).headSnapshotId
+        val deleted =
+            store.commit(
+                catalog,
+                CommitRequest(
+                    readSnapshot = head2,
+                    idempotencyKey = UUID.randomUUID(),
+                    requireUnchangedTables = true,
+                    deletes =
+                        listOf(
+                            TableDeletes(
+                                "ns",
+                                "t",
+                                listOf(
+                                    DeleteFileRegistration(
+                                        fileId,
+                                        "s3://hoglake-it/$catalog/data/a.puffin",
+                                        1,
+                                        10,
+                                    ),
+                                ),
+                                expectedTableUuid = table.tableUuid,
+                            ),
+                        ),
+                ),
+            )
+        val scan = store.planScan(catalog, "ns", "t")
+        val withDv = scan.filter { it.deleteFile != null }
+        assertThat(withDv).hasSize(1)
+        assertThat(withDv.single().deleteFile!!.deleteCount).isEqualTo(1)
+        assertThat(deleted.snapshotId).isEqualTo(head2 + 1)
+    }
+
+    @Test
+    fun `a guarded commit after drop plus recreate is the TableRecreated 409`() {
+        val catalog = freshCatalog()
+        store.createNamespace(catalog, "ns")
+        val table = store.createTable(catalog, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        store.dropTable(catalog, "ns", "t", expectedTableUuid = table.tableUuid, author = "test", message = "drop")
+        val recreated = store.createTable(catalog, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        assertThatThrownBy {
+            store.commit(
+                catalog,
+                CommitRequest(
+                    readSnapshot = recreated.readSnapshotId,
+                    idempotencyKey = UUID.randomUUID(),
+                    appends =
+                        listOf(
+                            TableAppend(
+                                "ns",
+                                "t",
+                                listOf(FileRegistration("s3://hoglake-it/$catalog/data/a.parquet", 1, 1, 1)),
+                                expectedTableUuid = table.tableUuid,
+                            ),
+                        ),
+                ),
+            )
+        }.isInstanceOf(HoglakeException.TableRecreated::class.java)
+    }
+
+    // ---- consumer offsets ---------------------------------------------------
+
+    @Test
+    fun `offsets are monotonic and reject regression`() {
+        val catalog = freshCatalog()
+        store.createNamespace(catalog, "ns")
+        val table = store.createTable(catalog, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        val offset =
+            store.commitOffset(catalog, "consumer-1", table.tableUuid, table.readSnapshotId)
+        assertThat(offset.committedSnapshot).isEqualTo(table.readSnapshotId)
+        // An EQUAL re-commit is Postgres's upsert no-op arm: accepted, so a
+        // client retry of a timed-out-but-applied call is safe.
+        assertThat(store.commitOffset(catalog, "consumer-1", table.tableUuid, table.readSnapshotId).committedSnapshot)
+            .isEqualTo(table.readSnapshotId)
+        // Backwards is the 409.
+        append(catalog, "offset.parquet")
+        val head = store.getCatalog(catalog).headSnapshotId
+        store.commitOffset(catalog, "consumer-1", table.tableUuid, head)
+        assertThatThrownBy {
+            store.commitOffset(catalog, "consumer-1", table.tableUuid, head - 1)
+        }.isInstanceOf(HoglakeException.OffsetRegression::class.java)
+        assertThat(store.getOffset(catalog, "consumer-1", table.tableUuid).committedSnapshot)
+            .isEqualTo(head)
+        assertThatThrownBy {
+            store.commitOffset(catalog, "consumer-1", UUID.randomUUID(), 0)
+        }.isInstanceOf(HoglakeException.Validation::class.java)
+    }
+
+    // ---- upload claims ------------------------------------------------------
+
+    @Test
+    fun `an upload claim settles when its owner commits the path`() {
+        val catalog = freshCatalog()
+        store.createNamespace(catalog, "ns")
+        val table = store.createTable(catalog, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        val owner = UUID.randomUUID()
+        val claim = store.uploads.claim(catalog, UUID.randomUUID(), owner, "s3://hoglake-it/$catalog", "data")
+        assertThat(claim.path).startsWith("s3://hoglake-it/$catalog/trino-upload/")
+        // idempotent: the same upload id re-claims the same path.
+        assertThat(store.uploads.claim(catalog, claim.uploadId, owner, "s3://hoglake-it/$catalog", "data").path)
+            .isEqualTo(claim.path)
+        // a different owner committing the claimed path is fenced.
+        assertThatThrownBy {
+            store.commit(
+                catalog,
+                CommitRequest(
+                    readSnapshot = table.readSnapshotId,
+                    idempotencyKey = UUID.randomUUID(),
+                    appends =
+                        listOf(
+                            TableAppend(
+                                "ns",
+                                "t",
+                                listOf(FileRegistration(claim.path, 1, 1, 1)),
+                                expectedTableUuid = table.tableUuid,
+                            ),
+                        ),
+                ),
+            )
+        }.isInstanceOf(HoglakeException.CommitConflict::class.java)
+        // the owner settles it.
+        store.commit(
+            catalog,
+            CommitRequest(
+                readSnapshot = table.readSnapshotId,
+                idempotencyKey = owner,
+                appends =
+                    listOf(
+                        TableAppend(
+                            "ns",
+                            "t",
+                            listOf(FileRegistration(claim.path, 1, 1, 1)),
+                            expectedTableUuid = table.tableUuid,
+                        ),
+                    ),
+            ),
+        )
+        // and a settled claim cannot be abandoned after the fact.
+        assertThat(store.uploads.abandon(catalog, owner, listOf(claim.path))).isEqualTo(0)
+    }
+
+    // ---- atomic table creation ----------------------------------------------
+
+    @Test
+    fun `prepare publish and the durable rejections`() {
+        val catalog = freshCatalog()
+        store.createNamespace(catalog, "ns")
+        val op = UUID.randomUUID()
+        val definition =
+            TableCreationDefinition(
+                "ns",
+                "created",
+                listOf(ColumnDef("id", ColType.LONG)),
+            )
+        val prepared = store.tableCreations.prepare(catalog, op, definition)
+        assertThat(prepared.state).isEqualTo("prepared")
+        // idempotent replay
+        assertThat(store.tableCreations.prepare(catalog, op, definition).tableUuid)
+            .isEqualTo(prepared.tableUuid)
+        // a different definition under the same id is the 409
+        assertThatThrownBy {
+            store.tableCreations.prepare(catalog, op, definition.copy(name = "other"))
+        }.isInstanceOf(HoglakeException.CommitConflict::class.java)
+
+        val files =
+            listOf(
+                FileRegistration(
+                    "${prepared.writePath}part-0.parquet",
+                    10,
+                    100,
+                    50,
+                ),
+            )
+        val published = store.tableCreations.publish(catalog, op, files)
+        assertThat(published.state).isEqualTo("committed")
+        assertThat(published.snapshotId).isNotNull()
+        assertThat(store.getTable(catalog, "ns", "created").tableUuid).isEqualTo(prepared.tableUuid)
+        assertThat(store.listFiles(catalog, "ns", "created").single().recordCount).isEqualTo(10)
+        // publish replay: same files return the receipt; different files 409.
+        assertThat(store.tableCreations.publish(catalog, op, files).state).isEqualTo("committed")
+        assertThatThrownBy {
+            store.tableCreations.publish(
+                catalog,
+                op,
+                listOf(FileRegistration("${prepared.writePath}part-1.parquet", 1, 1, 1)),
+            )
+        }.isInstanceOf(HoglakeException.CommitConflict::class.java)
+
+        // target_exists: a prepared creation whose name was taken in the
+        // meantime rejects DURABLY, and the receipt says why.
+        val op2 = UUID.randomUUID()
+        store.tableCreations.prepare(catalog, op2, definition.copy(name = "taken"))
+        store.createTable(catalog, "ns", "taken", listOf(ColumnDef("id", ColType.LONG)))
+        val rejected =
+            store.tableCreations.publish(
+                catalog,
+                op2,
+                emptyList(),
+            )
+        assertThat(rejected.state).isEqualTo("rejected")
+        assertThat(rejected.reason).isEqualTo("target_exists")
+
+        // abort fences a prepared receipt.
+        val op3 = UUID.randomUUID()
+        store.tableCreations.prepare(catalog, op3, definition.copy(name = "aborted"))
+        assertThat(store.tableCreations.abort(catalog, op3).state).isEqualTo("aborted")
+        assertThat(store.tableCreations.publish(catalog, op3, emptyList()).state).isEqualTo("aborted")
+    }
+
+    @Test
+    fun `create-or-replace of a table absent at read_snapshot publishes a plain create`() {
+        val catalog = freshCatalog()
+        store.createNamespace(catalog, "ns")
+        val read = store.getCatalog(catalog).headSnapshotId
+        val op = UUID.randomUUID()
+        val definition =
+            TableCreationDefinition(
+                "ns",
+                "fresh",
+                listOf(ColumnDef("id", ColType.LONG)),
+                replacement = com.posthog.hoglake.service.ReplacementTarget(null, read),
+                author = "test",
+                message = "create or replace",
+            )
+        val prepared = store.tableCreations.prepare(catalog, op, definition)
+        assertThat(prepared.state).isEqualTo("prepared")
+        val published =
+            store.tableCreations.publish(
+                catalog,
+                op,
+                listOf(FileRegistration("${prepared.writePath}part-0.parquet", 3, 100, 50)),
+            )
+        assertThat(published.state).isEqualTo("committed")
+        val table = store.getTable(catalog, "ns", "fresh")
+        assertThat(table.tableUuid).isEqualTo(prepared.tableUuid)
+        assertThat(table.recordCount).isEqualTo(3L)
+        // Nothing was retired: no drop change, no replaced id, and the new
+        // incarnation's feed carries no replacement fence pair.
+        val snap = published.snapshotId!!
+        assertThat(
+            q(catalog, "SELECT kind FROM changes WHERE snapshot_id = ? ORDER BY kind", snap).rows.map {
+                it[0].asString()
+            },
+        ).containsExactly("table_created", "table_inserted_into")
+        assertThat(
+            q(catalog, "SELECT replaced_table_id FROM tables WHERE table_uuid = ?", prepared.tableUuid.toString())
+                .firstRow()!![0],
+        ).isNull()
+        assertThat(published.reason).isNull()
+    }
+
+    // ---- alter ----------------------------------------------------------------
+
+    @Test
+    fun `rename and add column, guarded and unguarded`() {
+        val catalog = freshCatalog()
+        store.createNamespace(catalog, "ns")
+        val table = store.createTable(catalog, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        val renamed =
+            store.alters.alterTable(
+                catalog,
+                "ns",
+                "t",
+                listOf(com.posthog.hoglake.model.AlterOp.RenameTable("t2")),
+                expectedTableUuid = table.tableUuid,
+            )
+        assertThat(renamed.name).isEqualTo("t2")
+        assertThat(store.getTable(catalog, "ns", "t2").tableUuid).isEqualTo(table.tableUuid)
+        assertThatThrownBy { store.getTable(catalog, "ns", "t") }
+            .isInstanceOf(HoglakeException.NotFound::class.java)
+
+        val added =
+            store.alters.alterTable(
+                catalog,
+                "ns",
+                "t2",
+                listOf(
+                    com.posthog.hoglake.model.AlterOp.AddColumn(ColumnDef("extra", ColType.STRING)),
+                ),
+            )
+        assertThat(added.columns.map { it.def.name }).containsExactly("id", "extra")
+        // a guarded alter against a stale read snapshot is the typed 409
+        assertThatThrownBy {
+            store.alters.alterTable(
+                catalog,
+                "ns",
+                "t2",
+                listOf(com.posthog.hoglake.model.AlterOp.RenameTable("t3")),
+                readSnapshot = table.readSnapshotId,
+            )
+        }.isInstanceOf(HoglakeException.DdlSinceReadSnapshot::class.java)
+    }
+
+    // ---- views -----------------------------------------------------------
+
+    @Test
+    fun `views create list drop with change rows`() {
+        val catalog = freshCatalog()
+        store.createNamespace(catalog, "ns")
+        store.createTable(catalog, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+
+        val view = store.views.create(catalog, "ns", "v", "SELECT 1", "trino", "test", "create")
+        assertThat(store.views.get(catalog, "ns", "v").viewUuid).isEqualTo(view.viewUuid)
+        assertThat(store.views.list(catalog, "ns").map { it.name }).containsExactly("v")
+        assertThatThrownBy { store.views.create(catalog, "ns", "v", "SELECT 2", "trino", "test", "dup") }
+            .isInstanceOf(HoglakeException.AlreadyExists::class.java)
+
+        store.views.drop(catalog, "ns", "v", "test", "drop")
+        assertThat(store.views.list(catalog, "ns")).isEmpty()
+        // The changefeed saw both ends of the lifecycle.
+        val kinds = mutableListOf<String>()
+        var from = 0L
+        while (true) {
+            val page = store.listSnapshots(catalog, from, 50)
+            if (page.first.isEmpty()) break
+            from = page.first.last().snapshotId
+            if (!page.second) break
+        }
+        // (snapshots feed is the whole-catalog one; the view change kinds
+        // ride it — this asserts the feed grew past the DDL, not the kind
+        // strings, which the table-scoped feed owns.)
+        assertThat(from).isGreaterThan(1L)
+    }
+
+    // ---- options -----------------------------------------------------------
+
+    @Test
+    fun `options patch validates and attributes retention decreases`() {
+        val catalog = freshCatalog()
+        val options = com.posthog.hoglake.hoglite.HogliteOptions(store)
+        val initial = options.get(catalog)
+        assertThat(initial.snapshotRetentionSeconds).isNull()
+
+        // Setting retention where none was needs operator attribution.
+        assertThatThrownBy {
+            options.patch(catalog, com.posthog.hoglake.service.PatchField.Set(3600L), null, null, null)
+        }.isInstanceOf(HoglakeException.Validation::class.java)
+        val set =
+            options.patch(
+                catalog,
+                com.posthog.hoglake.service.PatchField.Set(3600L),
+                null,
+                "test",
+                "set retention",
+            )
+        assertThat(set.snapshotRetentionSeconds).isEqualTo(3600L)
+        // Raising it never needs attribution.
+        val raised = options.patch(catalog, com.posthog.hoglake.service.PatchField.Set(7200L), null, null, null)
+        assertThat(raised.snapshotRetentionSeconds).isEqualTo(7200L)
+        // Lowering it does.
+        assertThatThrownBy {
+            options.patch(catalog, com.posthog.hoglake.service.PatchField.Set(60L), null, null, null)
+        }.isInstanceOf(HoglakeException.Validation::class.java)
+        // A non-positive value is a 422 regardless.
+        assertThatThrownBy {
+            options.patch(catalog, com.posthog.hoglake.service.PatchField.Set(0L), null, "test", "bad")
+        }.isInstanceOf(HoglakeException.Validation::class.java)
+        // consumer_floor toggles without attribution.
+        val floored = options.patch(catalog, com.posthog.hoglake.service.PatchField.Absent, false, null, null)
+        assertThat(floored.consumerFloor).isFalse()
+    }
+
+    // ---- truncate ------------------------------------------------------------
+
+    @Test
+    fun `truncate ends files and dvs at the new snapshot`() {
+        val catalog = freshCatalog()
+        store.createNamespace(catalog, "ns")
+        val table = store.createTable(catalog, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        val commit =
+            store.commit(
+                catalog,
+                CommitRequest(
+                    appends =
+                        listOf(
+                            TableAppend(
+                                namespace = "ns",
+                                table = "t",
+                                files =
+                                    listOf(
+                                        FileRegistration(
+                                            path = "s3://hoglake-it/$catalog/data/ns/t/a.parquet",
+                                            recordCount = 10,
+                                            fileSizeBytes = 100,
+                                        ),
+                                    ),
+                            ),
+                        ),
+                ),
+            )
+        assertThat(store.listFiles(catalog, "ns", "t")).hasSize(1)
+
+        val result =
+            store.truncateTable(
+                catalog,
+                "ns",
+                "t",
+                expectedTableUuid = table.tableUuid,
+                author = "test",
+                message = "truncate",
+            )
+        assertThat(store.listFiles(catalog, "ns", "t")).isEmpty()
+        // Time travel sees the file as of the commit.
+        assertThat(
+            store.listFiles(catalog, "ns", "t", snapshot = commit.snapshotId),
+        ).hasSize(1)
+        assertThat(result.snapshotId).isGreaterThan(commit.snapshotId)
+    }
+
+    // ---- partitions (exact computation over the live manifest) ---------------
+
+    @Test
+    fun `partition stats rank by the planner's debt`() {
+        val catalog = freshCatalog()
+        store.createNamespace(catalog, "ns")
+        val table = store.createTable(catalog, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        repeat(3) { i ->
+            store.commit(
+                catalog,
+                CommitRequest(
+                    appends =
+                        listOf(
+                            TableAppend(
+                                namespace = "ns",
+                                table = "t",
+                                files =
+                                    listOf(
+                                        FileRegistration(
+                                            path = "s3://hoglake-it/$catalog/data/ns/t/f$i.parquet",
+                                            recordCount = 10,
+                                            fileSizeBytes = 100,
+                                        ),
+                                    ),
+                            ),
+                        ),
+                ),
+            )
+        }
+        val partitions =
+            com.posthog.hoglake.hoglite.HoglitePartitions(
+                store,
+                smallFileThresholdBytes = 1_000_000,
+                // Two, not the production default of five: three small
+                // files must form a group for the debt assertion to bite.
+                minInputFiles = 2,
+            )
+        val report = partitions.partitionStats(catalog, "ns", "t", 50)
+        assertThat(report.partitions).hasSize(1)
+        val debt = report.partitions.single()
+        assertThat(debt.fileCount).isEqualTo(3)
+        assertThat(debt.smallFileCount).isEqualTo(3)
+        // Three files under the target pack into one group: all three are debt.
+        assertThat(debt.debtScore).isEqualTo(3)
+        val listing = partitions.listPartitions(catalog, "ns", "t")
+        assertThat(listing.total).isEqualTo(1)
+        assertThat(listing.partitions.single().recordCount).isEqualTo(30)
+    }
+
+    // ---- maintenance status ---------------------------------------------------
+
+    @Test
+    fun `maintenance status reports live backlogs and the run ledger`() {
+        val catalog = freshCatalog()
+        store.createNamespace(catalog, "ns")
+        store.createTable(catalog, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        val status =
+            com.posthog.hoglake.hoglite.HogliteMaintenanceStatus(
+                store,
+                hydratorIntervalMs = 0,
+                expiryIntervalMs = 60_000,
+                cleanupIntervalMs = 60_000,
+                compactionIntervalMs = 0,
+                retirementIntervalMs = 0,
+                smallFileThresholdBytes = 1_000_000,
+            )
+        val s = status.status(catalog)
+        assertThat(s.catalog).isEqualTo(catalog)
+        val expiry = s.tasks.first { it.task == com.posthog.hoglake.model.MaintenanceTask.EXPIRY }
+        assertThat(expiry.loopIntervalMs).isEqualTo(60_000)
+        val backlog = expiry.backlog as com.posthog.hoglake.model.MaintenanceBacklog.ExpiryBacklog
+        assertThat(backlog.headSnapshotId).isGreaterThan(0L)
+        assertThat(backlog.earliestSnapshotId).isEqualTo(0)
+        // The run ledger answers per-catalog and instance-wide.
+        assertThat(status.runs(catalog, null, null, 50).runs).isEmpty()
+        val inst = status.instanceStatus(null, 50)
+        assertThat(inst.catalogs.map { it.catalog }).contains(catalog)
+    }
+
+    // ---- review regression tests ------------------------------------------
+
+    private fun q(
+        catalog: String,
+        sql: String,
+        vararg args: Any?,
+    ) = store.catalogOperation(catalog) { store.queryCatalog(catalog, sql, *args) }
+
+    private fun append(
+        catalog: String,
+        path: String,
+        rows: Long = 10,
+        key: UUID? = UUID.randomUUID(),
+        read: Long? = null,
+        table: String = "t",
+    ) = store.commit(
+        catalog,
+        CommitRequest(
+            readSnapshot = read,
+            idempotencyKey = key,
+            appends =
+                listOf(
+                    TableAppend(
+                        "ns",
+                        table,
+                        listOf(FileRegistration("s3://hoglake-it/$catalog/data/$path", rows, 100, 50)),
+                    ),
+                ),
+        ),
+    )
+
+    private fun dv(
+        catalog: String,
+        fileId: Long,
+        read: Long,
+        path: String,
+        count: Long,
+        table: String = "t",
+    ) = store.commit(
+        catalog,
+        CommitRequest(
+            readSnapshot = read,
+            idempotencyKey = UUID.randomUUID(),
+            deletes =
+                listOf(
+                    TableDeletes(
+                        "ns",
+                        table,
+                        listOf(
+                            DeleteFileRegistration(fileId, "s3://hoglake-it/$catalog/data/$path", count, 10),
+                        ),
+                    ),
+                ),
+        ),
+    )
+
+    @Test
+    fun `a superseded DV epoch is ended atomically, leaving exactly one live vector`() {
+        val catalog = freshCatalog()
+        store.createNamespace(catalog, "ns")
+        store.createTable(catalog, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        append(catalog, "a.parquet")
+        val f = store.listFiles(catalog, "ns", "t").single().dataFileId
+        dv(catalog, f, store.getCatalog(catalog).headSnapshotId, "dv1.puffin", 1)
+        dv(catalog, f, store.getCatalog(catalog).headSnapshotId, "dv2.puffin", 3)
+        // The predecessor epoch was ended by the superseding commit: exactly
+        // one live vector, and it is the newer one.
+        val live =
+            q(catalog, "SELECT path, delete_count FROM dvs WHERE data_file_id = ? AND end_snapshot IS NULL", f)
+        assertThat(live.rows.size).isEqualTo(1)
+        assertThat(live.rows.single()[0].asString()).endsWith("dv2.puffin")
+        assertThat(live.rows.single()[1].asLong()).isEqualTo(3L)
+        assertThat(
+            q(catalog, "SELECT COUNT(*) FROM dvs WHERE data_file_id = ? AND end_snapshot IS NOT NULL", f)
+                .firstRow()!![0].asLong(),
+        ).isEqualTo(1L)
+    }
+
+    @Test
+    fun `a DV against a retired file is the typed conflict, both directions`() {
+        val catalog = freshCatalog()
+        store.createNamespace(catalog, "ns")
+        val t = store.createTable(catalog, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        append(catalog, "a.parquet")
+        val f = store.listFiles(catalog, "ns", "t").single().dataFileId
+        val afterAppend = store.getCatalog(catalog).headSnapshotId
+        store.truncateTable(catalog, "ns", "t", t.tableUuid, "test", "retire the file")
+        // Retired AFTER the read snapshot: the retryable 409.
+        assertThatThrownBy { dv(catalog, f, afterAppend, "dv.puffin", 1) }
+            .isInstanceOf(HoglakeException.CommitConflict::class.java)
+        // Retired BEFORE the read snapshot: the caller can see it, 422.
+        val now = store.getCatalog(catalog).headSnapshotId
+        assertThatThrownBy { dv(catalog, f, now, "dv.puffin", 1) }
+            .isInstanceOf(HoglakeException.Validation::class.java)
+    }
+
+    @Test
+    fun `an unkeyed commit is never deduplicated, even byte-identical after truncate`() {
+        val catalog = freshCatalog()
+        store.createNamespace(catalog, "ns")
+        val t = store.createTable(catalog, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        val first = append(catalog, "a.parquet", key = null)
+        store.truncateTable(catalog, "ns", "t", t.tableUuid, "test", "clear the table")
+        assertThat(store.listFiles(catalog, "ns", "t")).isEmpty()
+        // The identical unkeyed commit must APPLY, not replay the old receipt.
+        val second = append(catalog, "a.parquet", key = null)
+        assertThat(second.snapshotId).isGreaterThan(first.snapshotId)
+        assertThat(store.listFiles(catalog, "ns", "t")).hasSize(1)
+    }
+
+    @Test
+    fun `a staged DV cannot reference another table's append by path`() {
+        val catalog = freshCatalog()
+        store.createNamespace(catalog, "ns")
+        store.createTable(catalog, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        store.createTable(catalog, "ns", "u", listOf(ColumnDef("id", ColType.LONG)))
+        val path = "s3://hoglake-it/$catalog/data/shared.parquet"
+        // One commit: append the path to t, reference it from u's delete.
+        assertThatThrownBy {
+            store.commit(
+                catalog,
+                CommitRequest(
+                    idempotencyKey = UUID.randomUUID(),
+                    appends = listOf(TableAppend("ns", "t", listOf(FileRegistration(path, 10, 100, 50)))),
+                    deletes =
+                        listOf(
+                            TableDeletes(
+                                "ns",
+                                "u",
+                                listOf(
+                                    DeleteFileRegistration(
+                                        0,
+                                        "s3://hoglake-it/$catalog/data/dv.puffin",
+                                        1,
+                                        10,
+                                        dataFilePath = path,
+                                    ),
+                                ),
+                            ),
+                        ),
+                ),
+            )
+        }.isInstanceOf(HoglakeException.Validation::class.java)
+        // Nothing landed.
+        assertThat(store.listFiles(catalog, "ns", "t")).isEmpty()
+        assertThat(store.listFiles(catalog, "ns", "u")).isEmpty()
+    }
+
+    @Test
+    fun `a guarded alter on a fresh read snapshot applies, and one alter adds two columns`() {
+        val catalog = freshCatalog()
+        store.createNamespace(catalog, "ns")
+        val t = store.createTable(catalog, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        val read = store.getTable(catalog, "ns", "t").readSnapshotId
+        store.alters.alterTable(
+            catalog,
+            "ns",
+            "t",
+            ops = listOf(com.posthog.hoglake.model.AlterOp.AddColumn(ColumnDef("a", ColType.LONG))),
+            expectedTableUuid = null,
+            readSnapshot = read,
+            author = "test",
+            message = "fresh guarded alter",
+        )
+        // Two AddColumn ops in ONE alter: the second allocates from the first.
+        store.alters.alterTable(
+            catalog,
+            "ns",
+            "t",
+            ops =
+                listOf(
+                    com.posthog.hoglake.model.AlterOp.AddColumn(ColumnDef("b", ColType.LONG)),
+                    com.posthog.hoglake.model.AlterOp.AddColumn(ColumnDef("c", ColType.STRING)),
+                ),
+            expectedTableUuid = null,
+            readSnapshot = null,
+            author = "test",
+            message = "two adds in one alter",
+        )
+        val cols = store.getTable(catalog, "ns", "t").columns.map { it.def.name }
+        assertThat(cols).containsExactly("id", "a", "b", "c")
+    }
+
+    @Test
+    fun `consumer id length is validated`() {
+        val catalog = freshCatalog()
+        store.createNamespace(catalog, "ns")
+        val t = store.createTable(catalog, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        assertThatThrownBy { store.commitOffset(catalog, "", t.tableUuid, t.readSnapshotId) }
+            .isInstanceOf(HoglakeException.Validation::class.java)
+        assertThatThrownBy { store.commitOffset(catalog, "x".repeat(129), t.tableUuid, t.readSnapshotId) }
+            .isInstanceOf(HoglakeException.Validation::class.java)
+    }
+
+    @Test
+    fun `a ghost registry row lists as absent, stays occupied, and drops`() {
+        // Simulate the mid-create crash precisely: a registry row with NO
+        // tenant ever provisioned (tenant column null — the row predates
+        // the tenant it names).
+        store.ensureRegistry()
+        val tx = HogliteTx()
+        tx.add(
+            "INSERT INTO catalogs(name, data_path) VALUES (?, ?)",
+            "ghostcat",
+            "s3://hoglake-it/ghostcat",
+        )
+        store.runTx("__hoglake_registry", HogliteCatalogStore.freshTxid("ghost"), null, tx, fenced = false)
+        // listCatalogs does not throw and does not surface the ghost.
+        assertThat(store.listCatalogs().map { it.name }).doesNotContain("ghostcat")
+        // The name stays occupied (the precheck, not a tenant, answers).
+        assertThatThrownBy { store.createCatalog("ghostcat", "s3://hoglake-it/ghostcat2") }
+            .isInstanceOf(HoglakeException.AlreadyExists::class.java)
+        // The drop takes the GHOST branch: no tenant was ever created, so
+        // there is nothing to fence or release — the row just goes.
+        store.dropCatalog("ghostcat", "test", "drop the ghost")
+        assertThat(store.listCatalogs().map { it.name }).doesNotContain("ghostcat")
+        assertThatThrownBy { store.getCatalog("ghostcat") }
+            .isInstanceOf(HoglakeException.NotFound::class.java)
+        // And no tenant leaked: the legacy-id tenant the row implied does
+        // not exist (the engine's own 404, unmapped).
+        assertThatThrownBy { client.query("hoglake-ghostcat", "SELECT 1", emptyList()) }
+            .isInstanceOf(HogliteRejected::class.java)
+    }
+
+    @Test
+    fun `a drop and recreate gives the name a fresh incarnation, and stale readers see the new one`() {
+        val catalog = freshCatalog()
+        store.createNamespace(catalog, "ns")
+        val first = store.tenantCachePeek(catalog)
+        store.dropNamespace(catalog, "ns", author = "test", message = "empty it")
+        store.dropCatalog(catalog, "test", "drop")
+        store.createCatalog(catalog, "s3://hoglake-it/$catalog")
+        val second = store.tenantCachePeek(catalog)
+        assertThat(second).isNotEqualTo(first)
+        assertThat(second).startsWith("hoglake-$catalog-")
+        // Writes land on the NEW incarnation.
+        store.createNamespace(catalog, "ns")
+        assertThat(store.listNamespaces(catalog)).hasSize(1)
+    }
+
+    @Test
+    fun `the drop fence empties then deletes the tenant`() {
+        val catalog = freshCatalog()
+        store.createNamespace(catalog, "ns")
+        // A non-empty catalog refuses, inside the fence transaction.
+        assertThatThrownBy { store.dropCatalog(catalog, "test", "too early") }
+            .isInstanceOf(HoglakeException.CatalogNotEmpty::class.java)
+        store.dropNamespace(catalog, "ns", author = "test", message = "empty it")
+        store.dropCatalog(catalog, "test", "drop the empty catalog")
+        // The tenant is gone; a direct read is the engine's 404.
+        assertThatThrownBy { store.getCatalog(catalog) }
+            .isInstanceOf(HoglakeException.NotFound::class.java)
+        // And the name is free again.
+        store.createCatalog(catalog, "s3://hoglake-it/$catalog")
+    }
+
+    // ---- maintenance loops, end to end -------------------------------------
+
+    @Test
+    fun `maintenance loops run end to end against the live tenant`() {
+        val catalog = freshCatalog()
+        store.createNamespace(catalog, "ns")
+        val t = store.createTable(catalog, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        append(catalog, "a.parquet", key = UUID.randomUUID())
+        // Retire the file (truncate) so expiry has something to purge.
+        store.truncateTable(catalog, "ns", "t", t.tableUuid, "test", "truncate")
+        // Retention one second: every snapshot older than the sweep's cutoff
+        // is eligible; the floor advances and the ended file is purged INTO
+        // the removal queue.
+        HogliteOptions(store).patch(
+            catalog,
+            com.posthog.hoglake.service.PatchField.Set(1L),
+            consumerFloor = null,
+            author = "test",
+            message = "shorten retention for the sweep",
+        )
+        // The sweep's cutoff is now-minus-retention; the fixtures above must
+        // be OLDER than it.
+        Thread.sleep(1_100)
+        val expiry = HogliteExpiry(store, purgePage = 100, purgeBudgetMs = 10_000)
+        val result = expiry.runOnce(catalog, 100, com.posthog.hoglake.model.MaintenanceTrigger.MANUAL)
+        assertThat(result.snapshotsExpired).isGreaterThan(0L)
+        assertThat(store.getCatalog(catalog).earliestSnapshotId).isGreaterThan(0L)
+        val queued =
+            q(catalog, "SELECT COUNT(*) FROM removals WHERE drained_at IS NULL").firstRow()!![0].asLong()
+        assertThat(queued).isGreaterThan(0L)
+        // Cleanup drains: the objects never existed in the bucket, so each
+        // settles as MISSING (the drain's liveness rule, live).
+        val cleanupCfg =
+            com.posthog.hoglake.Config(
+                database = com.posthog.hoglake.DatabaseBackend.HOGLITE,
+                hogliteUrl = "http://127.0.0.1:1",
+                s3Endpoint = "http://127.0.0.1:${minio.firstMappedPort}",
+                s3Region = "us-east-1",
+                s3AccessKey = minio.userName,
+                s3SecretKey = minio.password,
+                s3PathStyle = true,
+            )
+        val cleanup = HogliteCleanup(cleanupCfg, store)
+        val drained = cleanup.runOnce(catalog, 100, com.posthog.hoglake.model.MaintenanceTrigger.MANUAL)
+        assertThat(drained.missing + drained.removed).isEqualTo(queued)
+        assertThat(
+            q(catalog, "SELECT COUNT(*) FROM removals WHERE drained_at IS NULL").firstRow()!![0].asLong(),
+        ).isEqualTo(0L)
+        // Both runs are in the ledger.
+        val runs =
+            HogliteMaintenanceStatus(store, 0, 0, 0, 0, 0, 1_000_000)
+                .runs(catalog, null, null, 50).runs
+        assertThat(runs.map { it.task }).contains(
+            com.posthog.hoglake.model.MaintenanceTask.EXPIRY,
+            com.posthog.hoglake.model.MaintenanceTask.CLEANUP,
+        )
+    }
+
+    @Test
+    fun `compaction and hydration run end to end against the live tenant`() {
+        val catalog = freshCatalog()
+        store.createNamespace(catalog, "ns")
+        store.createTable(
+            catalog,
+            "ns",
+            "t",
+            listOf(ColumnDef("id", ColType.LONG), ColumnDef("name", ColType.STRING)),
+        )
+        val cfg =
+            com.posthog.hoglake.Config(
+                database = com.posthog.hoglake.DatabaseBackend.HOGLITE,
+                hogliteUrl = "http://127.0.0.1:1",
+                s3Endpoint = "http://127.0.0.1:${minio.firstMappedPort}",
+                s3Region = "us-east-1",
+                s3AccessKey = minio.userName,
+                s3SecretKey = minio.password,
+                s3PathStyle = true,
+            )
+        // Two real tiny parquet files land in the catalog's data path.
+        for ((i, ids) in listOf(listOf(1L, 2L), listOf(3L, 4L)).withIndex()) {
+            val bytes = parquetBytes(ids)
+            s3Client().use { s3c ->
+                s3c.putObject(
+                    { it.bucket("hoglake-it").key("$catalog/data/f$i.parquet") },
+                    software.amazon.awssdk.core.sync.RequestBody.fromBytes(bytes),
+                )
+            }
+            store.commit(
+                catalog,
+                CommitRequest(
+                    idempotencyKey = UUID.randomUUID(),
+                    appends =
+                        listOf(
+                            TableAppend(
+                                "ns",
+                                "t",
+                                listOf(
+                                    FileRegistration(
+                                        "s3://hoglake-it/$catalog/data/f$i.parquet",
+                                        ids.size.toLong(),
+                                        bytes.size.toLong(),
+                                    ),
+                                ),
+                            ),
+                        ),
+                ),
+            )
+        }
+        // Stats are pending until the hydrator reads the footers.
+        assertThat(
+            q(catalog, "SELECT COUNT(*) FROM files WHERE stats_state = 'pending'").firstRow()!![0].asLong(),
+        ).isEqualTo(2L)
+        HogliteHydrator(store, com.posthog.hoglake.hydrator.ObjectStore(cfg)).runOnce()
+        assertThat(
+            q(catalog, "SELECT COUNT(*) FROM files WHERE stats_state = 'pending'").firstRow()!![0].asLong(),
+        ).isEqualTo(0L)
+        // One group of two files, packed by the fan-in floor (the byte target
+        // is unreachable for a fixture, like the Postgres tests).
+        val compaction =
+            HogliteCompaction(
+                store,
+                com.posthog.hoglake.hydrator.ObjectStore(cfg),
+                com.posthog.hoglake.compaction.CompactionConfig(
+                    targetBytes = 1L shl 30,
+                    minInputFiles = 2,
+                    maxInputFiles = 2,
+                    maxFanIn = 2,
+                    maxGroupsPerRun = 1,
+                    maxCandidates = 100,
+                ),
+            )
+        val result =
+            compaction.runOnce(catalog, null, com.posthog.hoglake.model.MaintenanceTrigger.MANUAL)
+        assertThat(result.groupsCompacted).isEqualTo(1L)
+        assertThat(result.filesIn).isEqualTo(2L)
+        assertThat(result.filesOut).isEqualTo(1L)
+        // The inputs are ended; exactly one live file carries all four rows.
+        assertThat(
+            q(catalog, "SELECT COUNT(*) FROM files WHERE end_snapshot IS NULL").firstRow()!![0].asLong(),
+        ).isEqualTo(1L)
+        assertThat(
+            q(catalog, "SELECT record_count FROM files WHERE end_snapshot IS NULL").firstRow()!![0].asLong(),
+        ).isEqualTo(4L)
+        // The staging ticket settled 'registered' — the output object is a
+        // live manifest entry now, never cleanup's to delete.
+        assertThat(
+            q(
+                catalog,
+                "SELECT drained_outcome FROM removals WHERE reason = 'compaction_staging'",
+            ).firstRow()!![0].asString(),
+        ).isEqualTo("registered")
+        // The ended inputs are reclaimed once expiry's floor passes them.
+        HogliteOptions(store).patch(
+            catalog,
+            com.posthog.hoglake.service.PatchField.Set(1L),
+            consumerFloor = null,
+            author = "test",
+            message = "shorten retention for the sweep",
+        )
+        Thread.sleep(1_100)
+        HogliteExpiry(store, purgePage = 100, purgeBudgetMs = 10_000)
+            .runOnce(catalog, 100, com.posthog.hoglake.model.MaintenanceTrigger.MANUAL)
+        val queued =
+            q(catalog, "SELECT COUNT(*) FROM removals WHERE drained_at IS NULL").firstRow()!![0].asLong()
+        assertThat(queued).isGreaterThanOrEqualTo(2L)
+        val drained =
+            HogliteCleanup(cfg, store).runOnce(catalog, 100, com.posthog.hoglake.model.MaintenanceTrigger.MANUAL)
+        // The two inputs really were in the bucket, so the drain REMOVES them.
+        assertThat(drained.removed).isGreaterThanOrEqualTo(2L)
+        assertThat(
+            q(catalog, "SELECT COUNT(*) FROM removals WHERE drained_at IS NULL").firstRow()!![0].asLong(),
+        ).isEqualTo(0L)
+    }
+
+    @Test
+    fun `head totals stay the visible manifest across compactions, including a group that dies`() {
+        val catalog = freshCatalog()
+        store.createNamespace(catalog, "ns")
+        val columns = listOf(ColumnDef("id", ColType.LONG), ColumnDef("name", ColType.STRING))
+        store.createTable(catalog, "ns", "t", columns)
+        store.createTable(catalog, "ns", "dead", columns)
+        val cfg =
+            com.posthog.hoglake.Config(
+                database = com.posthog.hoglake.DatabaseBackend.HOGLITE,
+                hogliteUrl = "http://127.0.0.1:1",
+                s3Endpoint = "http://127.0.0.1:${minio.firstMappedPort}",
+                s3Region = "us-east-1",
+                s3AccessKey = minio.userName,
+                s3SecretKey = minio.password,
+                s3PathStyle = true,
+            )
+
+        fun put(
+            key: String,
+            bytes: ByteArray,
+        ): String {
+            s3Client().use { s3c ->
+                s3c.putObject(
+                    { it.bucket("hoglake-it").key("$catalog/data/$key") },
+                    software.amazon.awssdk.core.sync.RequestBody.fromBytes(bytes),
+                )
+            }
+            return "s3://hoglake-it/$catalog/data/$key"
+        }
+
+        fun appendReal(
+            table: String,
+            key: String,
+            ids: List<Long>,
+        ) {
+            val bytes = parquetBytes(ids)
+            val path = put(key, bytes)
+            store.commit(
+                catalog,
+                CommitRequest(
+                    idempotencyKey = UUID.randomUUID(),
+                    appends =
+                        listOf(
+                            TableAppend(
+                                "ns",
+                                table,
+                                listOf(FileRegistration(path, ids.size.toLong(), bytes.size.toLong())),
+                            ),
+                        ),
+                ),
+            )
+        }
+
+        fun hydrate() = HogliteHydrator(store, com.posthog.hoglake.hydrator.ObjectStore(cfg)).runOnce()
+
+        val compaction =
+            HogliteCompaction(
+                store,
+                com.posthog.hoglake.hydrator.ObjectStore(cfg),
+                com.posthog.hoglake.compaction.CompactionConfig(
+                    targetBytes = 1L shl 30,
+                    minInputFiles = 2,
+                    maxInputFiles = 2,
+                    maxFanIn = 2,
+                    maxGroupsPerRun = 10,
+                    maxCandidates = 100,
+                ),
+            )
+
+        fun compact() = compaction.runOnce(catalog, null, com.posthog.hoglake.model.MaintenanceTrigger.MANUAL)
+
+        /** (rows, files, bytes) of the manifest visible at [at]: the contract every totals read serves. */
+        fun manifest(
+            table: String,
+            at: Long,
+        ): Triple<Long, Long, Long> {
+            val r =
+                q(
+                    catalog,
+                    "SELECT COALESCE(SUM(f.record_count),0), COUNT(*), COALESCE(SUM(f.file_size_bytes),0) " +
+                        "FROM files f JOIN table_versions v ON v.table_id = f.table_id AND v.end_snapshot IS NULL " +
+                        "WHERE v.name = ? AND f.begin_snapshot <= ? AND (f.end_snapshot IS NULL OR f.end_snapshot > ?)",
+                    table,
+                    at,
+                    at,
+                ).firstRow()!!
+            return Triple(r[0].asLong(), r[1].asLong(), r[2].asLong())
+        }
+
+        fun headTotals(table: String): Triple<Long, Long, Long> {
+            val info = store.getTable(catalog, "ns", table)
+            return Triple(info.recordCount!!, info.fileCount!!, info.fileSizeBytes!!)
+        }
+
+        fun listed(
+            table: String,
+            at: Long?,
+        ): Triple<Long, Long, Long> {
+            val s = store.listTables(catalog, "ns", snapshot = at).single { it.name == table }
+            return Triple(s.recordCount, s.fileCount, s.fileSizeBytes)
+        }
+
+        /** Head getTable, head listTables, and a time-travel read at head all report the manifest at head. */
+        fun assertTotalsAgree(
+            table: String,
+            rows: Long,
+            files: Long,
+        ) {
+            val head = store.getCatalog(catalog).headSnapshotId
+            val truth = manifest(table, head)
+            assertThat(truth.first).describedAs("rows in the visible manifest").isEqualTo(rows)
+            assertThat(truth.second).describedAs("files in the visible manifest").isEqualTo(files)
+            assertThat(headTotals(table)).describedAs("head getTable of $table").isEqualTo(truth)
+            assertThat(listed(table, null)).describedAs("head listTables of $table").isEqualTo(truth)
+            val pinned = store.getTable(catalog, "ns", table, snapshot = head)
+            assertThat(Triple(pinned.recordCount, pinned.fileCount, pinned.fileSizeBytes))
+                .describedAs("time-travel getTable of $table at head")
+                .isEqualTo(truth)
+            assertThat(listed(table, head)).describedAs("pinned listTables of $table at head").isEqualTo(truth)
+        }
+
+        // Two 10-row files compact into one 20-row file: 20 rows and ONE file,
+        // not the 40 rows / 3 files gross counters would report.
+        appendReal("t", "a.parquet", (1L..10L).toList())
+        appendReal("t", "b.parquet", (11L..20L).toList())
+        hydrate()
+        assertTotalsAgree("t", rows = 20, files = 2)
+        val beforeCompaction = store.getCatalog(catalog).headSnapshotId
+        assertThat(compact().groupsCompacted).isEqualTo(1L)
+        assertTotalsAgree("t", rows = 20, files = 1)
+
+        // Repeated compactions do not inflate: two more files, then compact
+        // until one file is left, checking after every run.
+        appendReal("t", "c.parquet", (21L..30L).toList())
+        appendReal("t", "d.parquet", (31L..40L).toList())
+        hydrate()
+        assertTotalsAgree("t", rows = 40, files = 3)
+        var runs = 0
+        while (manifest("t", store.getCatalog(catalog).headSnapshotId).second > 1L) {
+            assertThat(compact().groupsCompacted).isGreaterThanOrEqualTo(1L)
+            hydrate()
+            assertTotalsAgree("t", rows = 40, files = manifest("t", store.getCatalog(catalog).headSnapshotId).second)
+            check(++runs < 5) { "compaction stopped converging" }
+        }
+        assertTotalsAgree("t", rows = 40, files = 1)
+
+        // A group whose every input is fully deleted: it retires with no
+        // output, and its inputs leave the totals with it.
+        appendReal("dead", "x.parquet", listOf(1L, 2L))
+        appendReal("dead", "y.parquet", listOf(3L, 4L))
+        hydrate()
+        for ((i, path) in listOf("x.parquet", "y.parquet").withIndex()) {
+            val fileId =
+                q(catalog, "SELECT id FROM files WHERE path = ?", "s3://hoglake-it/$catalog/data/$path")
+                    .firstRow()!![0].asLong()
+            val bytes = com.posthog.hoglake.compaction.PuffinTestFiles.deletionVector(listOf(0L, 1L))
+            val dvPath = put("dead-dv$i.puffin", bytes)
+            store.commit(
+                catalog,
+                CommitRequest(
+                    readSnapshot = store.getCatalog(catalog).headSnapshotId,
+                    idempotencyKey = UUID.randomUUID(),
+                    deletes =
+                        listOf(
+                            TableDeletes(
+                                "ns",
+                                "dead",
+                                listOf(DeleteFileRegistration(fileId, dvPath, 2, bytes.size.toLong())),
+                            ),
+                        ),
+                ),
+            )
+        }
+        assertTotalsAgree("dead", rows = 4, files = 2)
+        val retired = compact()
+        assertThat(retired.groupsRetired).isEqualTo(1L)
+        assertThat(retired.groupsCompacted).isZero()
+        assertTotalsAgree("dead", rows = 0, files = 0)
+        assertThat(headTotals("dead")).isEqualTo(Triple(0L, 0L, 0L))
+        // The other table is untouched by the dead group's retirement.
+        assertTotalsAgree("t", rows = 40, files = 1)
+
+        // History is the manifest AT the pin, never head counters: both the
+        // time-travel getTable and a pinned listing still see the two
+        // pre-compaction files.
+        val then = manifest("t", beforeCompaction)
+        assertThat(then.first to then.second).isEqualTo(20L to 2L)
+        val pinned = store.getTable(catalog, "ns", "t", snapshot = beforeCompaction)
+        assertThat(Triple(pinned.recordCount, pinned.fileCount, pinned.fileSizeBytes)).isEqualTo(then)
+        assertThat(listed("t", beforeCompaction)).isEqualTo(then)
+    }
+
+    // ---- the routes, over the wire -------------------------------------------
+
+    @Test
+    fun `the v1 routes serve the hoglite backend`() {
+        val cfg =
+            com.posthog.hoglake.Config(
+                database = com.posthog.hoglake.DatabaseBackend.HOGLITE,
+                hogliteUrl = "http://127.0.0.1:1",
+                s3Endpoint = "http://127.0.0.1:${minio.firstMappedPort}",
+                s3Region = "us-east-1",
+                s3AccessKey = minio.userName,
+                s3SecretKey = minio.password,
+                s3PathStyle = true,
+                hydratorIntervalMs = 0,
+                expiryIntervalMs = 0,
+                cleanupIntervalMs = 0,
+                compactionIntervalMs = 0,
+                retirementIntervalMs = 0,
+            )
+        val probe = HealthProbe.forProbe(1_000) { client.reachable() }
+        val app = App.buildHoglite(cfg, store, probe)
+        val name = "route${catalogCounter++}"
+        testApplication {
+            application { app.module(this) }
+            val created =
+                client.post("/v1/catalogs") {
+                    contentType(ContentType.Application.Json)
+                    setBody("""{"name":"$name","data_path":"s3://hoglake-it/$name"}""")
+                }
+            assertThat(created.status).isEqualTo(HttpStatusCode.Created)
+            assertThat(client.get("/v1/catalogs/$name").status).isEqualTo(HttpStatusCode.OK)
+            assertThat(client.get("/healthz").status).isEqualTo(HttpStatusCode.OK)
+        }
+    }
+
+    private fun s3Client(): S3Client =
+        S3Client.builder()
+            .endpointOverride(URI.create("http://127.0.0.1:${minio.firstMappedPort}"))
+            .credentialsProvider(
+                StaticCredentialsProvider.create(
+                    AwsBasicCredentials.create(minio.userName, minio.password),
+                ),
+            ).region(Region.US_EAST_1)
+            .forcePathStyle(true)
+            .build()
+
+    /** `id long (1, required)`, `name string (2, optional)` — the smallest honest parquet file. */
+    private val parquetSchema =
+        org.apache.parquet.schema.Types
+            .buildMessage()
+            .addField(
+                org.apache.parquet.schema.Types
+                    .required(org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.INT64)
+                    .id(1)
+                    .named("id"),
+            ).addField(
+                org.apache.parquet.schema.Types
+                    .optional(org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.BINARY)
+                    .`as`(org.apache.parquet.schema.LogicalTypeAnnotation.stringType())
+                    .id(2)
+                    .named("name"),
+            ).named("t")
+
+    private fun parquetBytes(ids: List<Long>): ByteArray {
+        val tmp = Files.createTempFile("hoglite-compact", ".parquet")
+        try {
+            Files.delete(tmp)
+            val factory = org.apache.parquet.example.data.simple.SimpleGroupFactory(parquetSchema)
+            org.apache.parquet.hadoop.example.ExampleParquetWriter
+                .builder(org.apache.parquet.io.LocalOutputFile(tmp))
+                .withType(parquetSchema)
+                .withCompressionCodec(org.apache.parquet.hadoop.metadata.CompressionCodecName.UNCOMPRESSED)
+                .build()
+                .use { w ->
+                    for (id in ids) {
+                        val g = factory.newGroup()
+                        g.add("id", id)
+                        g.add("name", "row-$id")
+                        w.write(g)
+                    }
+                }
+            return Files.readAllBytes(tmp)
+        } finally {
+            Files.deleteIfExists(tmp)
+        }
+    }
+}

@@ -17,7 +17,6 @@ import com.posthog.hoglake.model.validateSplitOffsets
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.persistence.Locks
-import com.posthog.hoglake.service.Identifiers
 import com.posthog.hoglake.storedPayloadObjectMapper
 import io.github.oshai.kotlinlogging.KotlinLogging
 import org.jdbi.v3.core.Handle
@@ -1343,18 +1342,7 @@ class CommitService(
         layout: ObjectPrefixLayout,
         deletes: ResolvedDeletes,
         dataPath: String,
-    ): String? {
-        if (ObjectPrefix.parseValue(raw, layout.colType) == null) {
-            return "${reg.path} (its target data_file_id ${reg.dataFileId} has no canonical " +
-                "'${layout.fieldName}' value, got ${raw?.let { "'${Identifiers.cap(it)}'" } ?: "none"})"
-        }
-        val prefix = ObjectPrefix.prefix(dataPath, deletes.namespace, deletes.table, layout, raw!!)
-        return if (ObjectPrefix.isUnder(reg.path, prefix)) {
-            null
-        } else {
-            "${reg.path} (expected under $prefix, its target data_file_id ${reg.dataFileId}'s prefix)"
-        }
-    }
+    ): String? = ObjectPrefixRules.dvViolation(reg, raw, layout, deletes.namespace, deletes.table, dataPath)
 
     /**
      * The refusal for a commit whose table did not resolve live: a
@@ -1484,44 +1472,12 @@ class CommitService(
             "${append.namespace}.${append.table} has the object-prefix layout on '${layout.fieldName}' but its " +
                 "live spec has no single identity field on it"
         }
-        val violations = ArrayList<String>()
-        for (file in append.files) {
-            // validateFiles already refused a missing list and a wrong arity.
-            val raw = file.partitionValues!![keyIndex]
-            val value = ObjectPrefix.parseValue(raw, layout.colType)
-            if (value == null) {
-                violations += "${file.path} (partition value ${raw?.let { "'${Identifiers.cap(it)}'" } ?: "null"} " +
-                    "is not a canonical ${layout.colType.wire} value: digits only, no sign or leading zero)"
-                continue
-            }
-            val prefix = ObjectPrefix.prefix(dataPath, append.namespace, append.table, layout, raw!!)
-            if (!ObjectPrefix.isUnder(file.path, prefix)) {
-                violations += "${file.path} (expected under $prefix)"
-                continue
-            }
-            // Deferred stats: the hydrator checks the footer (KDoc above).
-            val stats = file.columnStats ?: continue
-            val verdict =
-                ObjectPrefix.checkFieldStats(layout, value, stats.firstOrNull { it.fieldId == layout.fieldId })
-            if (verdict != ObjectPrefix.Verdict.OK) {
-                violations += "${file.path} (its column stats for '${layout.fieldName}' do not prove every row " +
-                    "is $raw: ${describe(verdict)})"
-            }
-        }
+        val violations =
+            ObjectPrefixRules.appendViolations(append.files, layout, keyIndex, append.namespace, append.table, dataPath)
         if (violations.isNotEmpty()) {
             throw objectPrefixViolation(append.namespace, append.table, dataPath, layout, violations)
         }
     }
-
-    private fun describe(verdict: ObjectPrefix.Verdict): String =
-        when (verdict) {
-            ObjectPrefix.Verdict.OK -> "ok"
-            ObjectPrefix.Verdict.MISSING_STATS -> "no stats row for the field"
-            ObjectPrefix.Verdict.NULL_BOUNDS ->
-                "a bound is missing (absent, or dropped as undecodable for the column's type)"
-            ObjectPrefix.Verdict.NULLS_PRESENT -> "null_count is not 0"
-            ObjectPrefix.Verdict.BOUND_MISMATCH -> "the lower and upper bounds are not both the value"
-        }
 
     /**
      * The 422 for [violations] (one entry per offending path, with its
@@ -1535,20 +1491,8 @@ class CommitService(
         dataPath: String,
         layout: ObjectPrefixLayout,
         violations: List<String>,
-    ): HoglakeException.ObjectPrefixViolation {
-        val qualified = "$namespace.$table"
-        val expected = ObjectPrefix.tableRoot(dataPath, namespace, table) + "${layout.fieldName}=<value>/"
-        return HoglakeException.ObjectPrefixViolation(
-            "${violations.size} file(s) registered to $qualified break its object-prefix layout: " +
-                violations.take(5).joinToString("; ") +
-                (if (violations.size > 5) " (+${violations.size - 5} more)" else "") +
-                ". Every data file and deletion vector of $qualified lives under $expected, <value> being the " +
-                "data file's identity partition value for '${layout.fieldName}' (a DV's: its target's), with " +
-                "column stats proving every row holds it; re-read the table and re-prepare, replaying this " +
-                "request cannot succeed",
-            table = qualified,
-        )
-    }
+    ): HoglakeException.ObjectPrefixViolation =
+        ObjectPrefixRules.violation(namespace, table, dataPath, layout, violations)
 
     /**
      * The table's live partition spec, or null when unpartitioned. A spec

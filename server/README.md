@@ -2789,3 +2789,65 @@ hedgerow and the web UI retain their ordinary commit behavior. They read the usu
 positive file IDs, row lineage and Puffin vectors after publication; private IDs
 and paths add no new committed storage or scan representation. No migration is
 needed beyond the claimed-upload ledger required by this capability.
+
+### Hoglite large-catalog read bounds
+
+Upstream hoglite (verified at `a6e3040`) already supplies the concurrent
+read implementation; no hoglake-specific engine rewrite is required. It
+keeps one writer actor/connection per tenant and defaults to four separate
+`query_only` read connections. The actor establishes a SQLite
+WAL snapshot and captures its WAL end together, then a worker executes the
+query (including read-only `/tx`) outside the actor. A result is released
+only after that captured end is durably stored; later writes cannot change
+the pinned snapshot or hold the read behind their own durability. Write
+order and segment-before-ack are unchanged.
+
+The default read execution deadline is five seconds; checkpoint drains
+allow a two-second grace before preempting readers with `ErrReadPreempted`.
+Before folding a base, the checkpoint drains active snapshots and checks the
+`wal_checkpoint(TRUNCATE)` **busy result**, not just its SQL error. A busy
+checkpoint must not publish an incomplete base. Interrupted reads return a
+retryable engine response; the client retries against the same tenant
+incarnation. Checkpoints themselves remain serialized with writes.
+
+`planScan` retains the existing complete-list response contract, internally
+fetching 256 files at a time with a `(row_id_start, id)` keyset. The second
+key handles compaction's shared row-id starts. Every page uses the same
+logical snapshot and immutable catalog-operation binding; a final retention
+check refuses a pin that expiry overtook. Stats and split-offset JSON are
+not fetched unless requested. Plans over one million files or a 512 MiB
+encoded-row-plus-envelope budget are refused with validation, never
+silently truncated. Requested per-file stats/offset JSON over 64 KiB is
+refused before its content crosses the engine wire. Requested metadata also
+has a cumulative 64 MiB ceiling, so individually legal payloads cannot
+consume the process heap before the plan limit is reached. These are safety
+ceilings, not a promise of a sub-five-second **whole** scan: the five-second
+client read timeout applies to each bounded page.
+
+Tenant migrations install path indexes on both file tables (including
+ended references), an undrained-removal path index, ended-row indexes, and
+the scan keyset index. These port the V16/V17/V19 access paths, without the
+Postgres `catalog_id` prefix because the tenant is already the catalog.
+The normal guarded migration path also upgrades existing tenants; bootstrap
+DDL alone is insufficient. SQLite index builds serialize with the writer,
+so large existing tenants still need an upgrade window for the one-time
+build. No concurrent-index-build guarantee is claimed.
+
+Scale probes: `HogliteBackendIntegrationTest` scans 565,000 files with tied
+row-id starts and an oversized **unrequested** stats payload. Against plain
+upstream engine `a6e3040` and the local S3 fixture it used 2,208 pages /
+2,213 queries in 11,286 ms (about 20 microseconds per file, including HTTP
+and mapping). The real checkpoint-drain probe observed HTTP 503 with
+`read canceled by checkpoint; retry`, then the complete plan on attempt
+two against the same bound tenant. Both multi-pod routed-drop/delete probes
+also pass against that upstream revision.
+
+Additional engine regression probes keep a billion-step SQLite read active
+on both read APIs: concurrent durable commits measured 11.9–21.1 ms against
+a 500 ms asserted ceiling on the upstream fixture. The three-mode
+`TestReadReleasesAtOwnDurableBasis` separately gates successive
+segment PUTs for `/query`, read-only `/tx`, and a failing scalar guard:
+even the guard's diagnostic must not reveal an undurable value. Upstream
+already supplies those guarantees; these are test-only regressions, not a
+replacement engine. These are fixture measurements, not production latency
+guarantees.

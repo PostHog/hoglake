@@ -140,13 +140,27 @@ internal fun errorBody(cause: HoglakeException): Pair<HttpStatusCode, ApiErrorDt
         // added by the caller.
         is HoglakeException.CommitQueueTimeout ->
             HttpStatusCode.ServiceUnavailable to apiError("commit_queue_timeout", cause)
+        // Backend down (as against backend convoyed, above): same 503 +
+        // Retry-After shape, its own code, because the operations
+        // response to "the database did not answer" is not the response
+        // to "one catalog is hot".
+        // A commit that may have landed: retryable like the arm below,
+        // its own code because "your commit may be durable" is not "the
+        // database did not answer". Before BackendUnavailable: it is one.
+        is HoglakeException.CommitOutcomeUnknown ->
+            HttpStatusCode.ServiceUnavailable to apiError("commit_outcome_unknown", cause)
+        is HoglakeException.BackendUnavailable ->
+            HttpStatusCode.ServiceUnavailable to apiError("backend_unavailable", cause)
     }
 
 /** Installs [errorBody] plus the malformed-input and catch-all handlers. */
 fun StatusPagesConfig.installErrorMapping() {
     exception<HoglakeException> { call, cause ->
         val (status, body) = errorBody(cause)
-        if (cause is HoglakeException.CommitQueueTimeout || cause is PartitionLookupUnavailable) {
+        if (cause is HoglakeException.CommitQueueTimeout ||
+            cause is HoglakeException.BackendUnavailable ||
+            cause is PartitionLookupUnavailable
+        ) {
             call.response.headers.append(HttpHeaders.RetryAfter, RETRY_AFTER_SECONDS)
         }
         if (cause is HoglakeException.Unauthenticated) {

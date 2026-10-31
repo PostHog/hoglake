@@ -5,16 +5,15 @@ import com.posthog.hoglake.auth.AuthState
 import com.posthog.hoglake.auth.actorOrRefuse
 import com.posthog.hoglake.auth.hoglakeAuth
 import com.posthog.hoglake.auth.resolveActor
-import com.posthog.hoglake.commit.CommitService
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.observability.CatalogTotals
 import com.posthog.hoglake.observability.InstanceTotals
 import com.posthog.hoglake.observability.instanceTotalsFor
 import com.posthog.hoglake.persistence.FileRepo
-import com.posthog.hoglake.service.CatalogService
 import com.posthog.hoglake.service.ColumnTrees
 import com.posthog.hoglake.service.Identifiers
 import com.posthog.hoglake.service.ScanService
+import com.posthog.hoglake.store.CatalogStore
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
@@ -39,13 +38,19 @@ import java.util.UUID
  * whose HoglakeExceptions are mapped by ErrorMapping.
  */
 fun Application.installApiRoutes(
-    catalogs: CatalogService,
-    commits: CommitService,
+    store: CatalogStore,
     instanceName: String = "",
     instanceTotals: () -> InstanceTotals? = { null },
     catalogTotals: () -> Map<String, CatalogTotals> = { emptyMap() },
     uiTheme: String = "",
 ) {
+    // The handlers below read `catalogs.`/`commits.` — the receiver names
+    // the spec-parity meta-tests pin by counting call sites (see
+    // CommitConflictSpecParityTest and CatalogDropSpecParityTest). The
+    // seam is the single CatalogStore; the aliases keep the handler
+    // text, and the tests' protective function, exactly as before.
+    val catalogs: CatalogStore = store
+    val commits: CatalogStore = store
     routing {
         get("/v1/info") {
             // Totals come from the metrics sampler's last pass — never
@@ -565,7 +570,11 @@ fun Application.installApiRoutes(
  * stored row-group start offsets. Installed separately so App.kt wires
  * it with its own ScanService.
  */
-fun Application.installScanRoutes(scan: ScanService) {
+fun Application.installScanRoutes(store: CatalogStore) {
+    // `scan.` is the receiver name the handler used before the seam; the
+    // alias keeps the handler text identical (same rationale as the
+    // catalogs/commits aliases in installApiRoutes).
+    val scan: CatalogStore = store
     routing {
         get("/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/scan") {
             // getAll, joined: Parameters[...] is only the FIRST occurrence,

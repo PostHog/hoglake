@@ -1,7 +1,7 @@
 package com.posthog.hoglake.api
 
 import com.posthog.hoglake.auth.actorOrRefuse
-import com.posthog.hoglake.service.AlterService
+import com.posthog.hoglake.service.AlterBackend
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
 import io.ktor.server.plugins.BadRequestException
@@ -17,7 +17,7 @@ import io.ktor.server.routing.routing
  * request's structural contract (minItems 1, op discriminator shape ->
  * 400); semantics live in AlterService, mapped by ErrorMapping.
  */
-fun Application.installAlterRoutes(alter: AlterService) {
+fun Application.installAlterRoutes(alter: AlterBackend) {
     routing {
         post("/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/alter") {
             val req = call.receive<AlterTableRequestDto>()

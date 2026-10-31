@@ -7,7 +7,7 @@ import com.posthog.hoglake.model.PartitionLookup
 import com.posthog.hoglake.model.PartitionLookupInvalidRequest
 import com.posthog.hoglake.model.PartitionLookupStatsState
 import com.posthog.hoglake.model.validatePartitionLookupValues
-import com.posthog.hoglake.service.PartitionLookupService
+import com.posthog.hoglake.service.PartitionLookupBackend
 import com.posthog.hoglake.wireObjectMapper
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
@@ -37,7 +37,7 @@ private val PartitionLookupBodyLimit =
         }
     }
 
-fun Application.installPartitionLookupRoutes(lookups: PartitionLookupService) {
+fun Application.installPartitionLookupRoutes(lookups: PartitionLookupBackend) {
     routing {
         route("/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/partitions/lookup") {
             install(PartitionLookupBodyLimit)

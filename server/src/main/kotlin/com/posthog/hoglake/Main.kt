@@ -25,14 +25,39 @@ internal fun NettyApplicationEngine.Configuration.configureApiListener(cfg: Conf
 
 fun main() {
     val cfg = Config.fromEnv()
-    val ds = Database.dataSource(cfg)
-    Database.migrate(ds)
-    val jdbi = Database.jdbi(ds)
+    val app: App
+    when (cfg.database) {
+        DatabaseBackend.POSTGRES -> {
+            val ds = Database.dataSource(cfg)
+            Database.migrate(ds)
+            val jdbi = Database.jdbi(ds)
 
-    // `ds` is handed over only so the hoglake_db_pool_* saturation
-    // gauges have an MXBean to read (#218); everything else goes
-    // through Jdbi as before.
-    val app = App.build(cfg, jdbi, dataSource = ds)
+            // `ds` is handed over only so the hoglake_db_pool_* saturation
+            // gauges have an MXBean to read (#218); everything else goes
+            // through Jdbi as before.
+            app = App.build(cfg, jdbi, dataSource = ds)
+        }
+        DatabaseBackend.HOGLITE -> {
+            // No Postgres anywhere in this mode: the catalog store is a
+            // hoglite deployment (single URL, or whale + owner URL
+            // pattern), and /healthz's probe is the client's own
+            // /v1/healthz behind the same deadline machinery.
+            val client = com.posthog.hoglake.hoglite.HogliteClient.fromConfig(cfg)
+            val store =
+                com.posthog.hoglake.hoglite.HogliteCatalogStore(
+                    client,
+                    cfg.hogliteTenantPrefix,
+                    cfg.refuseBlindPartitionedAppends,
+                    cfg.removalLedgerRetentionSeconds,
+                )
+            app =
+                App.buildHoglite(
+                    cfg,
+                    store,
+                    HealthProbe.forProbe(cfg.healthProbeTimeoutMs) { client.reachable() },
+                )
+        }
+    }
     val background = app.startBackground()
     val server =
         embeddedServer(
