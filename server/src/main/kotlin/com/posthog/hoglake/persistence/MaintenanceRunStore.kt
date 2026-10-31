@@ -247,7 +247,10 @@ class MaintenanceRunStore(private val jdbi: Jdbi) {
     fun lastByTask(
         h: Handle,
         catalogId: Long,
-    ): Map<MaintenanceTask, MaintenanceRun> = lastByTaskAll(h, listOf(catalogId)).values.associateBy { it.task }
+    ): Map<MaintenanceTask, MaintenanceRun> =
+        lastByTaskAll(h, listOf(catalogId)).values
+            .mapNotNull { run -> run.task?.let { it to run } }
+            .toMap()
 
     /** The most recent run per (catalog, task) across the instance — the central page's rollup. */
     fun lastByTaskAll(
@@ -281,7 +284,9 @@ class MaintenanceRunStore(private val jdbi: Jdbi) {
             .bindArray("tasks", String::class.java, MaintenanceTask.entries.map { it.wire })
             .map { rs, _ -> runMapper(rs) }
             .list()
-            .associateBy { it.catalog to it.task }
+            // The query asks for known tasks only, so `task` is never null here.
+            .mapNotNull { run -> run.task?.let { (run.catalog to it) to run } }
+            .toMap()
     }
 
     /** Recent loop-run start times per task for [catalogId], on the caller's handle. */
@@ -421,9 +426,7 @@ class MaintenanceRunStore(private val jdbi: Jdbi) {
         return MaintenanceRun(
             runId = rs.getLong("run_id"),
             catalog = rs.getString("catalog_name"),
-            task =
-                MaintenanceTask.fromWire(rs.getString("task"))
-                    ?: error("unknown maintenance task in ledger: ${rs.getString("task")}"),
+            taskName = rs.getString("task"),
             trigger = MaintenanceTrigger.fromWire(rs.getString("run_trigger")),
             startedAt = rs.getObject("started_at", java.time.OffsetDateTime::class.java).toInstant(),
             finishedAt = rs.getObject("finished_at", java.time.OffsetDateTime::class.java).toInstant(),
