@@ -39,7 +39,7 @@ dependencies {
     testImplementation("io.trino:trino-jdbc:484")
     // Real parquet files for the end-to-end read test (same writer the
     // root hydrator tests use).
-    testImplementation("dev.hardwood:hardwood-core:1.1.0.Beta2")
+    testImplementation("dev.hardwood:hardwood-core:1.1.0.Beta3")
     // Bucket creation + parquet/deletion-vector upload to MinIO.
     testImplementation("software.amazon.awssdk:s3:2.57.3")
     // Real puffin deletion vectors for the DV read tests: the portable
