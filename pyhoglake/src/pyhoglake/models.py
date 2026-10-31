@@ -432,6 +432,13 @@ class TableInfo:
     #: :attr:`snapshot_id`: that one is set only by create/alter and this
     #: client treats its presence as a DDL pin.
     read_snapshot_id: int | None = None
+    #: The table's object-prefix field, a top-level integer column's name,
+    #: as of the snapshot this response was resolved at; None when the
+    #: option is off there, and from a server older than the option. While
+    #: it is set, every data file goes under
+    #: :func:`pyhoglake.object_prefix.prefix`, and its inline stats must
+    #: prove its value (:func:`pyhoglake.object_prefix.check_field_stats`).
+    object_prefix_field: str | None = None
 
     @classmethod
     def from_wire(cls, d: dict[str, Any]) -> TableInfo:
@@ -459,6 +466,7 @@ class TableInfo:
                 totals_snapshot_id=d.get("totals_snapshot_id"),
                 totals_as_of=d.get("totals_as_of"),
                 read_snapshot_id=d.get("read_snapshot_id"),
+                object_prefix_field=d.get("object_prefix_field"),
             )
 
         return _wire("TableInfo", d, build)

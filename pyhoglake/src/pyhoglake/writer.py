@@ -7,7 +7,7 @@ built on this, and an ingester that owns its own calls it directly.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -60,10 +60,20 @@ class PreparedPart:
         *,
         stats: bool,
         partition_values: Sequence[str | None] | None = None,
+        stats_field_ids: Collection[int] | None = None,
     ) -> dict[str, Any]:
         """The FileRegistration wire dict for this file uploaded at ``uri``,
-        with ``column_stats`` from its own footer when ``stats``."""
-        return _registration(self, uri, columns, stats, partition_values)
+        with ``column_stats`` from its own footer when ``stats``: every
+        leaf's, or only those of the field ids in ``stats_field_ids``.
+
+        With ``stats``, an empty ``stats_field_ids``, or one naming an id
+        this file has no stats for (a container's, or one the table does
+        not have), is a ``ValidationError``: either would register the
+        file ``provided`` without a stat for good. Without ``stats`` the
+        key is left out and ``stats_field_ids`` is ignored."""
+        return _registration(
+            self, uri, columns, stats, partition_values, stats_field_ids
+        )
 
 
 def _registration(
@@ -72,6 +82,7 @@ def _registration(
     columns: Sequence[Column],
     stats: bool,
     partition_values: Sequence[str | None] | None,
+    stats_field_ids: Collection[int] | None = None,
 ) -> dict[str, Any]:
     # One builder for every path, a file the caller wrote included (``part``
     # is then the client's measurement of it): a registration that differs
@@ -86,10 +97,24 @@ def _registration(
     # 'pending' for the hydrator; `[]` would be 'provided' with no stats,
     # forever.
     if stats:
-        reg["column_stats"] = [
-            stat.to_wire()
-            for stat in extract_column_stats(part.metadata, tuple(columns))
-        ]
+        found = extract_column_stats(part.metadata, tuple(columns))
+        if stats_field_ids is not None:
+            # Refused, not skipped: a provided file is never hydrated, so a
+            # stat asked for and left out would be missing for good.
+            wanted = set(stats_field_ids)
+            if not wanted:
+                raise ValidationError(
+                    "stats_field_ids is empty; stats=False defers the stats",
+                    status_code=None,
+                )
+            unknown = wanted - {stat.field_id for stat in found}
+            if unknown:
+                raise ValidationError(
+                    f"stats_field_ids {sorted(unknown)} name no stats of this file",
+                    status_code=None,
+                )
+            found = [stat for stat in found if stat.field_id in wanted]
+        reg["column_stats"] = [stat.to_wire() for stat in found]
     if partition_values is not None:
         reg["partition_values"] = list(partition_values)
     return reg

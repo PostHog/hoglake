@@ -106,9 +106,10 @@ verdicts, and the reader role's IAM Resource pattern with the keys it
 must not grant. `regen_object_prefix_vectors.py` beside it writes the
 file, and `test_object_prefix_vectors.py` requires the file to be
 exactly what it writes. The server reads it in `ObjectPrefixVectorsTest`,
-and `ObjectPrefixTest` checks the IAM pattern with a glob matcher. No
-writer builds these paths yet; the one that does is held to the same
-file. The count, 69, is pinned on both sides (`EXPECTED_VECTOR_COUNT`
+and `ObjectPrefixTest` checks the IAM pattern with a glob matcher.
+Writers build these paths with pyhoglake's `object_prefix`, which
+`test_object_prefix_vectors.py` holds to the prefix, stats and IAM
+cases. The count, 69, is pinned on both sides (`EXPECTED_VECTOR_COUNT`
 and `ObjectPrefixVectorFile.EXPECTED_COUNT`).
 
 The VARIANT decoder has no second implementation here to diff against,
