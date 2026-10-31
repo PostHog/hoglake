@@ -177,14 +177,15 @@ jobs:
           echo "::error title=hoglite engine unavailable::Could not assume the ECR pull role or log in, so hoglite image ${HOGLITED_IMAGE_DIGEST} (expected hoglite ${HOGLITE_COMMIT}) cannot be pulled. The role must be trusted for this repository's main branch and allowed to pull the hoglite repository."
           exit 1
 
-      # The registry host names the AWS account; mask it in this public
-      # repository's logs.
+      # The registry host contains the AWS account. configure-aws-credentials
+      # registers that ID as a mask with mask-aws-account-id, so the host is
+      # masked without printing a workflow command built from a step output,
+      # which Semgrep blocks (unsafe-add-mask-workflow-command).
       - name: Pull hoglited from the pinned image and verify it
         if: steps.hoglite.outputs.mode == 'live'
         env:
           REGISTRY: ${{ steps.ecr.outputs.registry }}
         run: |
-          echo "::add-mask::${REGISTRY}"
           ci/fetch-hoglited.sh "$REGISTRY" "$HOGLITED_IMAGE_DIGEST" "$HOGLITE_COMMIT" "$RUNNER_TEMP/hoglited" \
             > "$RUNNER_TEMP/hoglite-engine.txt"
           cat "$RUNNER_TEMP/hoglite-engine.txt"
