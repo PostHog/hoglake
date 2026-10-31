@@ -36,6 +36,11 @@ commit-throughput *args:
 commit-contention *args:
     {{_uv}} run hoglake-bench commit-contention {{args}}
 
+# Pipelined commits: serial prepare, bounded in-flight durability waits
+[group('metadata-only')]
+commit-pipelined *args:
+    {{_uv}} run hoglake-bench commit-pipelined {{args}}
+
 # Concurrent deletes using fabricated data-file and deletion-vector paths
 [group('metadata-only')]
 delete-contention *args:
