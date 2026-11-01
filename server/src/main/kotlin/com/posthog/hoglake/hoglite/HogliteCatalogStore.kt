@@ -257,6 +257,8 @@ class HogliteCatalogStore(
             // check, same accepted race (two concurrent creates of DIFFERENT
             // names with overlapping paths; CatalogService.createCatalog's
             // comment carries the argument for accepting it).
+            //
+            // Cached: after startup this sends nothing (see ensureRegistry).
             ensureRegistry()
             val existing = queryRegistry("SELECT name, data_path FROM catalogs")
             val newPrefix = dataPath.trimEnd('/') + "/"
@@ -332,7 +334,7 @@ class HogliteCatalogStore(
             ) { HoglakeException.AlreadyExists("catalog '$name' already exists") }
             reg.add("INSERT INTO catalogs(name, data_path, tenant) VALUES (?, ?, ?)", name, dataPath, tenantId)
             try {
-                runTx(REGISTRY_TENANT, freshTxid("create-catalog"), null, reg, fenced = false)
+                runRegistryTx(freshTxid("create-catalog"), null, reg)
             } catch (e: HoglakeException.AlreadyExists) {
                 // A concurrent create won publication. Only our unpublished,
                 // incarnation-unique tenant is safe to reclaim here.
@@ -352,7 +354,7 @@ class HogliteCatalogStore(
         }
 
     override fun listCatalogs(visible: Set<String>?): List<CatalogInfo> {
-        ensureRegistry()
+        // A read: a missing registry lists as empty, and nothing is created.
         val rows = queryRegistry("SELECT name FROM catalogs ORDER BY name")
         return rows.rows
             .map { it[0].asString() }
@@ -2374,58 +2376,242 @@ class HogliteCatalogStore(
         }
     }
 
-    /** Every catalog name in the registry — the loops' instance-wide fan-out. */
-    internal fun listCatalogNames(): List<String> {
-        ensureRegistry()
-        return queryRegistry("SELECT name FROM catalogs ORDER BY name").rows.map { it[0].asString() }
+    /**
+     * Every catalog name in the registry — the loops' instance-wide
+     * fan-out. A pure read: it never creates the registry. A missing
+     * registry means no catalog was ever created, so the answer is empty
+     * ([queryRegistry]); the hydrator, cleanup, expiry, compaction,
+     * retirement and status loops all call this on a timer and must not
+     * turn each tick into a tenant create.
+     */
+    internal fun listCatalogNames(): List<String> =
+        queryRegistry("SELECT name FROM catalogs ORDER BY name").rows.map { it[0].asString() }
+
+    // ---- the registry tenant's bootstrap ------------------------------------
+    //
+    // The registry tenant is created once per DEPLOYMENT, and checked once
+    // per PROCESS: [ensureRegistry] runs at startup ([bootstrapRegistryAtStartup],
+    // from Main) and caches the result in [registryReady]. After that,
+    // creates find the flag set and send nothing for the registry beyond
+    // their own read and write. The flag is cleared only when a registry
+    // call reports the registry MISSING ([registryMissing]: a 404 for the
+    // tenant, or "no such table: catalogs"), and the next call that needs
+    // the registry to exist — a create's registry write — bootstraps
+    // again. Reads never bootstrap: a missing registry reads as empty.
+    //
+    // Why this matters: `PUT /v1/tenants/{t}` on a hoglite replica that
+    // does not own the tenant can block for the owner's whole lease (15 s
+    // with production settings, until the engine answers it from the
+    // owner) — past the client's 5 s attempt timeout and 8 s budget. Sent on
+    // every create and every background list through a 3-replica Service,
+    // 2 of 3 of those PUTs reached a non-owner, and creates and the
+    // hydrator failed with backend_unavailable.
+    // The bootstrap itself reads first ([bootstrapRegistry]) and PUTs only
+    // when hoglite says the tenant does not exist, i.e. when no replica
+    // owns it and there is no lease to wait out.
+
+    /** True once this process has seen the registry tenant and table exist, current schema. */
+    @Volatile
+    private var registryReady = false
+
+    private val registryBootstrapLock = Any()
+
+    private val registryTenant: String get() = tenantOf(REGISTRY_TENANT)
+
+    /**
+     * Make sure the registry tenant and its table exist, at most once per
+     * process unless a registry call has since reported it missing. Throws
+     * [HoglakeException.BackendUnavailable] naming the registry and the
+     * step that failed when hoglite cannot be reached.
+     */
+    internal fun ensureRegistry() {
+        if (registryReady) return
+        synchronized(registryBootstrapLock) {
+            if (registryReady) return
+            bootstrapRegistry()
+            registryReady = true
+        }
     }
 
-    internal fun ensureRegistry() {
-        client.createTenant(tenantOf(REGISTRY_TENANT))
-        val tx = HogliteTx()
-        tx.add(
-            "CREATE TABLE IF NOT EXISTS catalogs(name TEXT PRIMARY KEY, data_path TEXT NOT NULL, tenant TEXT)",
-        )
-        // Fixed txid + fp: replaying the bootstrap is a no-op read.
-        runTx(REGISTRY_TENANT, "boot:$REGISTRY_TENANT", "registry:v1", tx, fenced = false)
+    /**
+     * The startup half of [ensureRegistry]. Best effort: a hoglite that is
+     * down at boot must not keep hoglake from starting (readiness reports
+     * it), so a failure is logged with its cause and the first create
+     * bootstraps instead. Returns whether the registry is ready.
+     */
+    fun bootstrapRegistryAtStartup(): Boolean =
+        try {
+            ensureRegistry()
+            log.info { "hoglite catalog registry '$registryTenant' is ready" }
+            true
+        } catch (e: HoglakeException.BackendUnavailable) {
+            log.warn(e) {
+                "hoglite catalog registry '$registryTenant' could not be checked at startup; " +
+                    "the first catalog create will retry: ${e.message}"
+            }
+            false
+        }
+
+    /** Test hook: whether the registry is cached as ready. */
+    internal val registryReadyForTests: Boolean get() = registryReady
+
+    /**
+     * Read first, create only what is missing:
+     *  1. read the table's DDL. Any replica answers this at once (it
+     *     proxies a read to the owner); a 404 means the tenant does not
+     *     exist anywhere;
+     *  2. only on that 404, `PUT` the tenant — nobody owns it, so no
+     *     replica has a lease to wait out;
+     *  3. only if the table is missing, the fixed-txid bootstrap
+     *     transaction (a replay is answered from the dedup table);
+     *  4. only for a registry written before incarnation ids, the
+     *     `tenant` column.
+     * On a deployment whose registry exists, that is one read.
+     */
+    private fun bootstrapRegistry() {
+        val readSchema = "reading the registry schema"
+        var ddl =
+            try {
+                client.query(
+                    registryTenant,
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'catalogs'",
+                    emptyList(),
+                ).firstRow()?.get(0) as? String
+            } catch (r: HogliteRejected) {
+                if (!tenantAbsent(r)) throw registryUnavailable(readSchema, r)
+                registryStep("creating the registry tenant") { client.createTenant(registryTenant) }
+                null
+            } catch (e: HoglakeException.BackendUnavailable) {
+                throw registryUnavailable(readSchema, e)
+            }
+        if (ddl == null) {
+            val tx = HogliteTx()
+            tx.add(
+                "CREATE TABLE IF NOT EXISTS catalogs(name TEXT PRIMARY KEY, data_path TEXT NOT NULL, tenant TEXT)",
+            )
+            // Fixed txid + fp: replaying the bootstrap is a no-op read.
+            registryStep("creating the registry table") {
+                client.tx(registryTenant, "boot:$REGISTRY_TENANT", "registry:v1", tx.statements())
+            }
+            ddl = "tenant"
+        }
         // Registries written before incarnation ids: add the column.
         // (SQLite has no IF NOT EXISTS for columns, and PRAGMA is off
         // both API paths — the CREATE TABLE text in sqlite_master is
         // the check.)
-        val ddl =
-            client.query(
-                tenantOf(REGISTRY_TENANT),
-                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'catalogs'",
-                emptyList(),
-            ).firstRow()?.get(0) as? String
-        if (ddl != null && "tenant" !in ddl) {
-            runTx(
-                REGISTRY_TENANT,
-                freshTxid("registry-migrate"),
-                null,
-                HogliteTx().apply { add("ALTER TABLE catalogs ADD COLUMN tenant TEXT") },
-                fenced = false,
-            )
+        if ("tenant" !in ddl) {
+            registryStep("adding the registry's tenant column") {
+                client.tx(
+                    registryTenant,
+                    freshTxid("registry-migrate"),
+                    null,
+                    HogliteTx().apply { add("ALTER TABLE catalogs ADD COLUMN tenant TEXT") }.statements(),
+                )
+            }
         }
     }
 
+    /**
+     * One bootstrap step, with any failure re-raised as a
+     * [HoglakeException.BackendUnavailable] that names the registry, the
+     * step and the underlying cause.
+     */
+    private inline fun <T> registryStep(
+        step: String,
+        body: () -> T,
+    ): T =
+        try {
+            body()
+        } catch (r: HogliteRejected) {
+            throw registryUnavailable(step, r)
+        } catch (e: HogliteGuardFailure) {
+            throw registryUnavailable(step, e)
+        } catch (e: HoglakeException.BackendUnavailable) {
+            throw registryUnavailable(step, e)
+        }
+
+    private fun registryUnavailable(
+        step: String,
+        cause: Throwable,
+    ): HoglakeException.BackendUnavailable =
+        HoglakeException.BackendUnavailable(
+            "hoglake catalog registry (hoglite tenant '$registryTenant') is unavailable: $step failed: " +
+                "${cause.message}",
+        ).apply { initCause(cause) }
+
+    /**
+     * hoglite's 404 for a tenant with no manifest. Matched on the engine's
+     * message too: a 404 from anything else (a wrong URL, a proxy) must not
+     * read as "no catalogs".
+     */
+    private fun tenantAbsent(r: HogliteRejected): Boolean = r.status == 404 && "tenant does not exist" in r.body
+
+    /** Whether [r] says the registry tenant or its table does not exist; clears [registryReady] if so. */
+    private fun registryMissing(r: HogliteRejected): Boolean {
+        // /query reports a statement error as 409 `refused`, /tx as 422.
+        val missing = tenantAbsent(r) || (r.status in setOf(409, 422) && "no such table: catalogs" in r.body)
+        if (missing) {
+            if (registryReady) log.warn { "hoglite catalog registry '$registryTenant' is missing: ${r.message}" }
+            registryReady = false
+        }
+        return missing
+    }
+
+    /**
+     * A read of the registry. A registry that does not exist reads as
+     * EMPTY (no catalog was ever created, or the tenant was removed): no
+     * read creates it, and the cached [registryReady] is cleared so the
+     * next create bootstraps. hoglite being unreachable surfaces as a
+     * [HoglakeException.BackendUnavailable] naming the registry.
+     */
     internal fun queryRegistry(
         sql: String,
         vararg args: Any?,
     ): HogliteQueryResult =
         try {
-            client.query(tenantOf(REGISTRY_TENANT), sql, args.toList())
+            client.query(registryTenant, sql, args.toList())
         } catch (r: HogliteRejected) {
-            if (r.status == 404 || (r.status == 422 && "no such table" in r.body)) {
-                // Registry tenant not bootstrapped yet (first-ever call,
-                // or a catalog list before any create): bootstrap and
-                // retry once.
-                ensureRegistry()
-                client.query(tenantOf(REGISTRY_TENANT), sql, args.toList())
+            if (registryMissing(r)) {
+                HogliteQueryResult(emptyList(), emptyList(), 0)
+            } else if (r.status == 404) {
+                throw registryUnavailable("reading the registry", r)
             } else {
                 throw mapRejected(REGISTRY_TENANT, r)
             }
+        } catch (e: HoglakeException.BackendUnavailable) {
+            throw registryUnavailable("reading the registry", e)
         }
+
+    /**
+     * A write to the registry (a create's publishing row). If hoglite
+     * reports the registry missing, bootstrap it and send the SAME
+     * transaction once more: a 404 or a statement error rolled back, so
+     * the retry cannot apply twice. Every other outcome is [runTx]'s.
+     */
+    internal fun runRegistryTx(
+        txid: String,
+        fp: String?,
+        tx: HogliteTx,
+    ): List<HogliteQueryResult> {
+        fun once(): List<HogliteQueryResult> =
+            try {
+                client.tx(registryTenant, txid, fp, tx.statements())
+            } catch (g: HogliteGuardFailure) {
+                throw tx.classify(g)
+            }
+        return try {
+            once()
+        } catch (r: HogliteRejected) {
+            if (!registryMissing(r)) throw mapRejected(REGISTRY_TENANT, r)
+            ensureRegistry()
+            try {
+                once()
+            } catch (r2: HogliteRejected) {
+                registryMissing(r2)
+                throw mapRejected(REGISTRY_TENANT, r2)
+            }
+        }
+    }
 
     // ---- small shared pieces ------------------------------------------------
 
