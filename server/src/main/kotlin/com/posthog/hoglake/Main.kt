@@ -56,6 +56,11 @@ fun main() {
                     store,
                     HealthProbe.forProbe(cfg.healthProbeTimeoutMs) { client.reachable() },
                 )
+            // The registry tenant once per process, before the background
+            // loops start; catalog creates and lists then never re-create it.
+            // Best effort: a hoglite that is down at boot is logged and the
+            // first create retries.
+            store.bootstrapRegistryAtStartup()
         }
     }
     val background = app.startBackground()

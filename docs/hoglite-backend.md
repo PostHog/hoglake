@@ -46,6 +46,16 @@ them unchanged; the hoglite ports live in `server/.../hoglite/`.
   row conditionally on the incarnation. A drop paused mid-flight and resumed
   after a drop+recreate therefore finishes the old incarnation's (already
   complete) deletion and cannot touch the new catalog.
+- **The registry tenant is created once per deployment and checked once per
+  process.** hoglake checks it at startup: it reads the registry's schema
+  first and sends `PUT /v1/tenants/{prefix}__hoglake_registry` only when
+  hoglite answers 404, so no replica owns it and there is no lease to wait
+  out. The result is cached. Catalog creates, lists and the background loops'
+  catalog fan-out never re-create it. A read that finds the registry missing
+  answers "no catalogs" and clears the cache. A create whose registry write
+  finds it missing bootstraps it again and resends the same transaction once.
+  A startup check that cannot reach hoglite is logged, and the first create
+  retries it.
 - **Expiry re-reads its policy in the transaction.** The sweep's planning
   reads (floor, retention, consumer-floor flag) are separate requests; the
   advance transaction guards on all three, so a concurrent sweep, a
@@ -154,7 +164,13 @@ engine's `code` (not its status) tells them apart:
 
 When the budget is exhausted on attempts that cannot have applied, the
 caller gets 503 `backend_unavailable` with `Retry-After` — the honest
-"transient, retry" answer, not a 500.
+"transient, retry" answer, not a 500. The detail names the request and
+what spent the budget, for example `did not answer PUT /v1/tenants/...
+within the 8000ms retry budget after 2 attempts: 2 timed out (attempt
+timeout up to 5000ms)`, or `... 1 misdirected (421); last 421 named owner
+'hl-1', but owner-direct routing is not configured`. Timeouts point at a stalled engine or a lease
+wait, 421s at routing, and 503s at owner churn. A failure on the registry
+tenant also names the registry and the step that failed.
 
 ## Failure modes
 

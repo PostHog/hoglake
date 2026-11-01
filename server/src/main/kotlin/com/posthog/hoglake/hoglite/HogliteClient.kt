@@ -401,6 +401,11 @@ class HogliteClient(
         // call ends committed or unknown, never "not committed".
         var mayHaveApplied = false
 
+        // What the attempts met, so an exhausted budget says WHICH failure
+        // spent it: timeouts (a slow or stalled engine) read differently
+        // from 421s (a routing problem) or 503s (owner churn).
+        val outcomes = AttemptOutcomes()
+
         fun unavailable(detail: String): HoglakeException.BackendUnavailable =
             if (txid != null && mayHaveApplied) {
                 HoglakeException.CommitOutcomeUnknown(txid, detail)
@@ -415,7 +420,13 @@ class HogliteClient(
                 throw unavailable(
                     "hoglite ${pool.name.lowercase()} pool circuit is open " +
                         "(${breaker.consecutiveFailures} consecutive failures); refusing fast for " +
-                        "${breaker.openMs}ms rather than queueing behind timeouts",
+                        "${breaker.openMs}ms rather than queueing behind timeouts" +
+                        (
+                            lastFailure?.let {
+                                "; this call, ${outcomes.summary(ownerUrlPattern.isNotBlank())} " +
+                                    "(last failure: ${it.message})"
+                            } ?: ""
+                        ),
                 )
             }
             // Never START an attempt that cannot fit the budget: cap
@@ -428,8 +439,9 @@ class HogliteClient(
             val remainingMs = (deadline - System.nanoTime()) / 1_000_000
             if (remainingMs <= 0 || (lastFailure != null && remainingMs < MIN_RETRY_ATTEMPT_MS)) {
                 throw unavailable(
-                    "hoglite ${pool.name.lowercase()} pool did not answer within the " +
-                        "${retryBudgetMs}ms retry budget (last failure: ${lastFailure?.message})",
+                    "hoglite ${pool.name.lowercase()} pool did not answer $method $path within the " +
+                        "${retryBudgetMs}ms retry budget ${outcomes.summary(ownerUrlPattern.isNotBlank())} " +
+                        "(last failure: ${lastFailure?.message})",
                 )
             }
             val resp =
@@ -456,6 +468,7 @@ class HogliteClient(
                     // request was not sent; a timeout or reset after that
                     // can follow a commit.
                     if (txid != null && !neverSent(e)) mayHaveApplied = true
+                    outcomes.transport(e, minOf(timeoutMs, remainingMs))
                     lastFailure = e
                     sleeper(RETRY_BACKOFF_MS)
                     continue
@@ -472,6 +485,7 @@ class HogliteClient(
                     // hoglite labels a 503 it KNOWS did not apply; any
                     // other 503 (an older engine, a proxy) might have.
                     if (txid != null && errorCode(resp.body()) != CODE_NOT_APPLIED) mayHaveApplied = true
+                    outcomes.status(503, errorCode(resp.body()))
                     lastFailure = HogliteRejected(503, String(resp.body()))
                     sleeper(RETRY_BACKOFF_MS)
                 }
@@ -486,6 +500,7 @@ class HogliteClient(
                     // in front of the engine). The same txid makes the
                     // retry exactly-once: it finds the commit or applies it.
                     if (txid != null) mayHaveApplied = true
+                    outcomes.status(504, errorCode(resp.body()))
                     lastFailure = HogliteRejected(504, String(resp.body()))
                     sleeper(RETRY_BACKOFF_MS)
                 }
@@ -495,7 +510,7 @@ class HogliteClient(
                     // The hint can name a class or owner that is itself
                     // about to move (lease wait-out), so this arm backs off
                     // like the others instead of spinning hot.
-                    repin(tenant, resp.body())
+                    outcomes.misdirected(repin(tenant, resp.body()))
                     lastFailure = HogliteRejected(421, String(resp.body()))
                     sleeper(RETRY_BACKOFF_MS)
                 }
@@ -516,11 +531,11 @@ class HogliteClient(
             is Route.Owner -> Pool.STANDARD to pin.url
         }
 
-    /** Apply a 421 hint to the tenant's pin. */
+    /** Apply a 421 hint to the tenant's pin; returns the owner the hint named, if any. */
     private fun repin(
         tenant: String,
         body: ByteArray,
-    ) {
+    ): String? {
         val hint =
             runCatching { json.readValue<Map<String, Any?>>(body) }.getOrNull()
         val hintClass = hint?.get("class") as? String
@@ -536,6 +551,74 @@ class HogliteClient(
                 tenantRoutes[tenant] = Route.Owner(ownerUrlPattern.replace("{owner}", stable))
             }
             else -> tenantRoutes.remove(tenant)
+        }
+        return owner?.takeIf { it.isNotBlank() }?.substringBefore('.')
+    }
+
+    /**
+     * The tally of one call's failed attempts, for the exhaustion message:
+     * `after 3 attempts: 2 timed out (attempt timeout up to 5000ms), 1
+     * misdirected (421); last 421 named owner 'hl-1'`. The counts are what tell a routing problem (421s,
+     * or timeouts at a pod that is not the owner) from a slow engine
+     * (timeouts everywhere) from owner churn (503s).
+     */
+    private class AttemptOutcomes {
+        private companion object {
+            const val TIMED_OUT = "timed out"
+        }
+
+        private val counts = LinkedHashMap<String, Int>()
+        private var attempts = 0
+        private var owner: String? = null
+        private var timeoutMs = 0L
+
+        private fun count(label: String) {
+            attempts++
+            counts.merge(label, 1, Int::plus)
+        }
+
+        fun transport(
+            e: Throwable,
+            attemptTimeoutMs: Long,
+        ) = count(
+            when {
+                generateSequence(e) { it.cause }.take(8).any { it is HttpConnectTimeoutException } ->
+                    "connect timed out"
+                generateSequence(e) { it.cause }.take(8).any { it is ConnectException } -> "connect refused"
+                generateSequence(e) { it.cause }.take(8).any { it is java.net.http.HttpTimeoutException } -> {
+                    timeoutMs = maxOf(timeoutMs, attemptTimeoutMs)
+                    TIMED_OUT
+                }
+                else -> "transport error (${e.javaClass.simpleName})"
+            },
+        )
+
+        fun status(
+            status: Int,
+            code: String?,
+        ) = count(if (code != null) "$status $code" else "$status unlabelled")
+
+        fun misdirected(hintedOwner: String?) {
+            if (hintedOwner != null) owner = hintedOwner
+            count("misdirected (421)")
+        }
+
+        fun summary(ownerRouting: Boolean): String {
+            if (attempts == 0) return "before any attempt"
+            val parts =
+                counts.entries.joinToString(", ") { (label, n) ->
+                    if (label == TIMED_OUT) "$n $label (attempt timeout up to ${timeoutMs}ms)" else "$n $label"
+                }
+            val hint =
+                owner?.let {
+                    if (ownerRouting) {
+                        "; last 421 named owner '$it'"
+                    } else {
+                        "; last 421 named owner '$it', but owner-direct routing is not configured " +
+                            "(HOGLAKE_HOGLITE_OWNER_URL_PATTERN), so its retries went back to the service"
+                    }
+                } ?: ""
+            return "after $attempts attempt${if (attempts == 1) "" else "s"}: $parts$hint"
         }
     }
 

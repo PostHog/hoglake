@@ -1819,4 +1819,109 @@ class HogliteBackendIntegrationTest {
             Files.deleteIfExists(tmp)
         }
     }
+
+    /**
+     * A counting pass-through in front of hoglited: what a store sends,
+     * by `METHOD path`, plus the registry's bootstrap transactions.
+     */
+    private class CountingProxy(
+        target: String,
+    ) : AutoCloseable {
+        val counts = java.util.concurrent.ConcurrentHashMap<String, AtomicInteger>()
+        val registryBootTxs = AtomicInteger()
+        private val http = HttpClient.newHttpClient()
+        private val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+
+        init {
+            server.executor = Executors.newFixedThreadPool(8)
+            server.createContext("/") { ex ->
+                val body = ex.requestBody.readBytes()
+                val key = "${ex.requestMethod} ${ex.requestURI.path}"
+                counts.computeIfAbsent(key) { AtomicInteger() }.incrementAndGet()
+                val registryBoot = "CREATE TABLE IF NOT EXISTS catalogs" in body.decodeToString()
+                if (key.endsWith("__hoglake_registry/tx") && registryBoot) {
+                    registryBootTxs.incrementAndGet()
+                }
+                val resp =
+                    http.send(
+                        HttpRequest.newBuilder(URI.create(target + ex.requestURI))
+                            .method(ex.requestMethod, HttpRequest.BodyPublishers.ofByteArray(body))
+                            .header("Content-Type", "application/json")
+                            .build(),
+                        HttpResponse.BodyHandlers.ofByteArray(),
+                    )
+                ex.sendResponseHeaders(resp.statusCode(), resp.body().size.toLong().takeIf { it > 0 } ?: -1)
+                ex.responseBody.use { it.write(resp.body()) }
+            }
+            server.start()
+        }
+
+        val url: String get() = "http://127.0.0.1:${server.address.port}"
+
+        fun count(key: String): Int = counts[key]?.get() ?: 0
+
+        override fun close() = server.stop(0)
+    }
+
+    @Test
+    fun `the registry is bootstrapped once per process, read first, and re-created only when reported missing`() {
+        // A deployment prefix of its own, so this registry starts absent
+        // whatever ran before in this class.
+        val prefix = "reg${UUID.randomUUID().toString().take(8)}-"
+        val registry = "${prefix}__hoglake_registry"
+        val put = "PUT /v1/tenants/$registry"
+        val engine = metricsUrl.removeSuffix("/metrics")
+        CountingProxy(engine).use { proxy ->
+            fun storeThroughProxy() =
+                HogliteCatalogStore(HogliteClient(standardUrl = proxy.url, sleeper = {}), prefix)
+                    .apply { requireOperationBindingForTests = true }
+
+            // Replica A, fresh deployment: startup creates the registry...
+            val a = storeThroughProxy()
+            assertThat(a.bootstrapRegistryAtStartup()).isTrue()
+            assertThat(proxy.count(put)).isEqualTo(1)
+            assertThat(proxy.registryBootTxs.get()).isEqualTo(1)
+            // ...and N creates and N background lists add nothing to it.
+            val n = 4
+            repeat(n) { i ->
+                a.createCatalog("c$i", "s3://hoglake-it/$prefix/c$i")
+                assertThat(a.listCatalogNames()).contains("c$i")
+                assertThat(a.listCatalogs().map { it.name }).contains("c$i")
+            }
+            assertThat(proxy.count(put)).describedAs("registry PUTs after $n creates").isEqualTo(1)
+            assertThat(proxy.registryBootTxs.get()).isEqualTo(1)
+            // Each create still PUTs its OWN (fresh, unowned) catalog tenant.
+            assertThat(proxy.counts.keys.count { it.startsWith("PUT /v1/tenants/${prefix}c") }).isEqualTo(n)
+
+            // Replica B (or A restarted): the registry exists, so the
+            // bootstrap is one read and never a PUT.
+            val queriesBefore = proxy.count("POST /v1/t/$registry/query")
+            val b = storeThroughProxy()
+            assertThat(b.bootstrapRegistryAtStartup()).isTrue()
+            b.createCatalog("b0", "s3://hoglake-it/$prefix/b0")
+            assertThat(b.listCatalogNames()).containsExactly("b0", "c0", "c1", "c2", "c3")
+            assertThat(proxy.count(put)).describedAs("registry PUTs from a second replica").isEqualTo(1)
+            assertThat(proxy.registryBootTxs.get()).isEqualTo(1)
+            // The startup schema read, the create's overlap read, the list.
+            // (The create's own getCatalog resolves through its operation
+            // binding, not the registry.) No per-create registry check.
+            assertThat(proxy.count("POST /v1/t/$registry/query") - queriesBefore).isEqualTo(3)
+
+            // The registry tenant removed under both: a list reads it as
+            // empty and creates nothing; the next create re-creates it.
+            client.release(registry)
+            client.deleteTenant(registry)
+            assertThat(a.listCatalogNames()).isEmpty()
+            assertThat(b.listCatalogs()).isEmpty()
+            assertThat(proxy.count(put)).isEqualTo(1)
+            a.createCatalog("again", "s3://hoglake-it/$prefix/again")
+            assertThat(proxy.count(put)).isEqualTo(2)
+            assertThat(proxy.registryBootTxs.get()).isEqualTo(2)
+            // B's cache still says "ready": its create finds the registry
+            // there and sends no PUT.
+            b.createCatalog("again-b", "s3://hoglake-it/$prefix/again-b")
+            assertThat(proxy.count(put)).isEqualTo(2)
+            assertThat(b.listCatalogNames()).containsExactly("again", "again-b")
+        }
+    }
 }
