@@ -100,13 +100,25 @@ internal class HogliteCleanup(
             doRunOnce(catalog, batchSize)
         }
 
-    fun runOnceAllCatalogs(batchSize: Int): List<Pair<String, CleanupResult>> {
+    /**
+     * One registry read for the sweep; each catalog bound to the tenant it
+     * named. [continueSweep] (the loop lease) is asked before each catalog.
+     */
+    fun runOnceAllCatalogs(
+        batchSize: Int,
+        continueSweep: () -> Boolean = { true },
+    ): List<Pair<String, CleanupResult>> {
         // Shuffled per sweep (#455): no catalog is always first.
-        val names = store.listCatalogNames().shuffled()
+        val catalogs = store.catalogTenants().shuffled()
         val results = mutableListOf<Pair<String, CleanupResult>>()
-        for (name in names) {
+        for ((name, tenant) in catalogs) {
+            if (!continueSweep()) break
             try {
-                results += name to runOnce(name, batchSize, MaintenanceTrigger.LOOP)
+                results +=
+                    name to
+                    store.catalogOperation(name, tenant = tenant) {
+                        runOnce(name, batchSize, MaintenanceTrigger.LOOP)
+                    }
             } catch (e: Exception) {
                 log.error(e) { "cleanup drain failed for catalog '$name'; continuing" }
             }

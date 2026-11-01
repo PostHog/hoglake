@@ -56,6 +56,40 @@ them unchanged; the hoglite ports live in `server/.../hoglite/`.
   finds it missing bootstraps it again and resends the same transaction once.
   A startup check that cannot reach hoglite is logged, and the first create
   retries it.
+- **A catalog list is a constant number of round trips.** `listCatalogs`
+  reads every `(name, tenant)` pair from the registry in one query per
+  10,000 catalogs (paged by name, under hoglite's 100,000-row read cap), then
+  every catalog's meta row through hoglite's `POST /v1/query-batch` (one
+  request per 250 catalogs, the requests in parallel). The engine answers
+  each item exactly as that tenant's `/query` would: locally, through one
+  sub-batch per owning peer, or by acquiring a released tenant. It used to
+  cost two sequential reads per catalog, and eight more migration probes
+  per catalog the first time a process saw the tenant. An engine without
+  the endpoint answers its route 404, and the client then reads the
+  tenants one by one, 16 at a time, still without a per-catalog registry
+  lookup. Each meta row is read from the exact incarnation the registry
+  read named, so a catalog dropped during the list is either listed as it
+  was or left out, and one recreated during it is either the old
+  incarnation or the new one, never a mix. A row is left out when its
+  tenant is gone or its meta names another catalog. A catalog whose drop
+  is fenced but not finished still lists, as before, so the drop can be
+  retried from the list.
+- **One process sweeps each background loop.** The hydrator, expiry,
+  cleanup, compaction and retirement loops each sweep every catalog.
+  They used to run in every hoglake process, so P processes made P full
+  sweeps per interval. Each loop now takes a lease at every tick: one row
+  per loop in the registry tenant's `loop_leases` table, taken in one
+  guarded transaction (`expect_affected = 1`, so racing processes
+  serialize and one wins). Only the holder sweeps. It renews between
+  catalogs once a third of the TTL has passed, and stops the sweep if it
+  has lost the lease. It releases the lease on shutdown. The TTL is two
+  intervals, and never under 60 s. A sweep reads the registry once and
+  binds each catalog to the tenant id that read named, instead of
+  resolving each name again. The lease saves work and is not a
+  correctness fence: every operation a sweep makes carries its own
+  guards, so two sweepers, after clock skew or a stalled holder, are the
+  old behaviour, not a hazard. `HOGLAKE_HOGLITE_LOOP_LEASES=false` turns
+  the lease off.
 - **Expiry re-reads its policy in the transaction.** The sweep's planning
   reads (floor, retention, consumer-floor flag) are separate requests; the
   advance transaction guards on all three, so a concurrent sweep, a
@@ -145,6 +179,7 @@ them unchanged; the hoglite ports live in `server/.../hoglite/`.
 | `HOGLAKE_HOGLITE_RETRY_BUDGET_MS` | 8000 | total per-call retry envelope |
 | `HOGLAKE_HOGLITE_CIRCUIT_FAILURE_THRESHOLD` | 10 | consecutive failures before the pool opens |
 | `HOGLAKE_HOGLITE_CIRCUIT_OPEN_MS` | 5000 | open duration before the half-open probe |
+| `HOGLAKE_HOGLITE_LOOP_LEASES` | `true` | one process per background loop sweeps (a lease in the registry tenant); `false`: every process sweeps |
 
 Retry taxonomy: 421 (owner moved — repin and retry), 503, 504 and transport
 errors retry, inside the budget, with 200ms backoff, and a `/tx` retry

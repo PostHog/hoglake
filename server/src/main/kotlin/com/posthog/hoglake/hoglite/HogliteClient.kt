@@ -315,6 +315,86 @@ class HogliteClient(
         }
     }
 
+    /** One item of [queryBatch]: a read-only statement against its own tenant. */
+    data class BatchRead(
+        val tenant: String,
+        val sql: String,
+        val args: List<Any?> = emptyList(),
+    )
+
+    /**
+     * One item's answer from [queryBatch]: [result] when the engine
+     * answered 200, otherwise the [status] and [body] that `/query`
+     * would have answered for that tenant alone.
+     */
+    class BatchAnswer(
+        val status: Int,
+        val body: String,
+        val result: HogliteQueryResult?,
+    )
+
+    /**
+     * Many single-statement reads, each against its own tenant, in ONE
+     * request: hoglite's `POST /v1/query-batch`. The engine routes each
+     * item as `/query` would (local, one sub-batch per owning peer, or a
+     * local acquire), and answers every item in request order with the
+     * status and body `/query` would have sent. One item's failure (a
+     * 404 for a dropped tenant, a 503 for an owner mid-move) is that
+     * item's answer, never the call's.
+     *
+     * Returns null when the engine does not serve the endpoint (a build
+     * that predates it answers the route 404 or 405); the caller then
+     * sends the reads one by one. That answer is remembered for
+     * [BATCH_UNSUPPORTED_RECHECK_MS], so a cluster mid-upgrade is probed
+     * again rather than written off.
+     *
+     * The request is a read, so it retries like [query] (421, 503, 504,
+     * transport) and never ends [HoglakeException.CommitOutcomeUnknown].
+     */
+    fun queryBatch(reads: List<BatchRead>): List<BatchAnswer>? {
+        require(reads.size <= MAX_BATCH_READS) { "at most $MAX_BATCH_READS reads per batch, got ${reads.size}" }
+        if (reads.isEmpty()) return emptyList()
+        if (System.nanoTime() < batchUnsupportedUntilNanos) return null
+        val body =
+            json.writeValueAsBytes(
+                mapOf("queries" to reads.map { mapOf("tenant" to it.tenant, "sql" to it.sql, "args" to it.args) }),
+            )
+        return call(BATCH_ROUTE_KEY, "/v1/query-batch", body, readTimeoutMs) { status, bytes ->
+            when {
+                status == 200 -> {
+                    val decoded = json.readValue<Map<String, Any?>>(bytes)
+
+                    @Suppress("UNCHECKED_CAST")
+                    val results = decoded["results"] as? List<Map<String, Any?>>
+                    check(results != null && results.size == reads.size) {
+                        "hoglite answered ${results?.size} results for a ${reads.size}-read batch"
+                    }
+                    results.map { r ->
+                        val itemStatus = (r["status"] as Number).toInt()
+                        val itemBody = r["body"]
+
+                        @Suppress("UNCHECKED_CAST")
+                        val parsed = if (itemStatus == 200) (itemBody as Map<String, Any?>).toQueryResult() else null
+                        BatchAnswer(itemStatus, json.writeValueAsString(itemBody), parsed)
+                    }
+                }
+                // The route itself is unknown: an engine without the endpoint.
+                // hoglite's own 4xx bodies are JSON with an `error`; Go's
+                // mux answers an unknown route with plain text.
+                (status == 404 || status == 405) && errorCode(bytes) == null &&
+                    runCatching { json.readValue<Map<String, Any?>>(bytes)["error"] }.getOrNull() == null -> {
+                    batchUnsupportedUntilNanos = System.nanoTime() + BATCH_UNSUPPORTED_RECHECK_MS * 1_000_000
+                    log.info { "hoglite does not serve /v1/query-batch; reading tenants one by one" }
+                    null
+                }
+                else -> throw HogliteRejected(status, String(bytes))
+            }
+        }
+    }
+
+    @Volatile
+    private var batchUnsupportedUntilNanos = Long.MIN_VALUE
+
     /**
      * Create [tenant], idempotently: 200 is "created" and a 409/422
      * from a racing or replayed create on an existing tenant is success
@@ -784,6 +864,19 @@ class HogliteClient(
 
         /** The least budget a retry (not a first attempt) is started with. */
         const val MIN_RETRY_ATTEMPT_MS = 50L
+
+        /** The engine's bound on one `/v1/query-batch` request. */
+        const val MAX_BATCH_READS = 1000
+
+        /** How long an engine that lacks `/v1/query-batch` is believed before it is asked again. */
+        const val BATCH_UNSUPPORTED_RECHECK_MS = 60_000L
+
+        /**
+         * The routing key of a batch: no tenant pin applies to a request
+         * that names many tenants, so it always goes to the standard pool.
+         * Not a valid tenant id, so it can never collide with one.
+         */
+        private const val BATCH_ROUTE_KEY = "\u0000batch"
 
         private val STMT_INDEX_REGEX = Regex("expectation failed at statement (\\d+)")
     }

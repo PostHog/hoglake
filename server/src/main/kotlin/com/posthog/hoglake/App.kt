@@ -669,13 +669,50 @@ class App private constructor(
             //  - the metrics tick's catalogTotals sampler (the metrics
             //    loop's gauges ride Jdbi reads).
             // Everything else is the same work on the same cadence.
-            loops.register("hydrator", cfg.hydratorIntervalMs) { hogliteHydrator.runOnce() }
-            loops.register("expiry", cfg.expiryIntervalMs) {
-                hogliteExpiry.runOnceAllCatalogs(cfg.expiryBatchSize)
+            //
+            // One process per loop sweeps, not every process: each loop
+            // takes its lease in the registry tenant at every tick and
+            // sweeps only if it holds it (HogliteLoopLease). Without it,
+            // P processes each swept every catalog on every tick.
+            // HOGLAKE_HOGLITE_LOOP_LEASES=false restores that behaviour.
+            val leases = mutableListOf<com.posthog.hoglake.hoglite.HogliteLoopLease>()
+
+            fun leased(
+                name: String,
+                intervalMs: Long,
+                sweep: (continueSweep: () -> Boolean) -> Unit,
+            ): () -> Unit {
+                if (!cfg.hogliteLoopLeases) return { sweep { true } }
+                val lease =
+                    com.posthog.hoglake.hoglite.HogliteLoopLease(
+                        hogliteStore(),
+                        name,
+                        com.posthog.hoglake.hoglite.HogliteLoopLease.ttlFor(intervalMs),
+                    )
+                if (intervalMs > 0) leases += lease
+                return { if (lease.acquire()) sweep(lease::renewIfDue) }
             }
-            loops.register("cleanup", cfg.cleanupIntervalMs) {
-                hogliteCleanup.runOnceAllCatalogs(cfg.cleanupBatchSize)
-            }
+            loops.register(
+                "hydrator",
+                cfg.hydratorIntervalMs,
+                body = leased("hydrator", cfg.hydratorIntervalMs) { go -> hogliteHydrator.runOnce(continueSweep = go) },
+            )
+            loops.register(
+                "expiry",
+                cfg.expiryIntervalMs,
+                body =
+                    leased("expiry", cfg.expiryIntervalMs) { go ->
+                        hogliteExpiry.runOnceAllCatalogs(cfg.expiryBatchSize, go)
+                    },
+            )
+            loops.register(
+                "cleanup",
+                cfg.cleanupIntervalMs,
+                body =
+                    leased("cleanup", cfg.cleanupIntervalMs) { go ->
+                        hogliteCleanup.runOnceAllCatalogs(cfg.cleanupBatchSize, go)
+                    },
+            )
             loops.register(
                 "compaction",
                 cfg.compactionIntervalMs,
@@ -683,14 +720,22 @@ class App private constructor(
                     BackgroundLoops.COMPACTION_JITTER_FRACTION,
                     com.posthog.hoglake.compaction.CompactionService.identitySeed(plannerIdentity),
                 ),
-            ) {
-                hogliteCompaction.runOnceAllCatalogs()
-            }
-            loops.register("retirement", cfg.retirementIntervalMs) {
-                hogliteRetirement.runOnceAllCatalogs()
-            }
+                leased("compaction", cfg.compactionIntervalMs) { go ->
+                    hogliteCompaction.runOnceAllCatalogs(continueSweep = go)
+                },
+            )
+            loops.register(
+                "retirement",
+                cfg.retirementIntervalMs,
+                body =
+                    leased("retirement", cfg.retirementIntervalMs) { go ->
+                        hogliteRetirement.runOnceAllCatalogs(go)
+                    },
+            )
             return AutoCloseable {
                 loops.close()
+                // After the loops stop, so no sweep renews a lease it just gave up.
+                leases.forEach { it.release() }
                 hogliteCleanup.close()
                 removalStore.close()
                 objectStore.close()

@@ -110,6 +110,15 @@ data class Config(
      */
     val hogliteTenantPrefix: String = hogliteEnv(database, "HOGLAKE_HOGLITE_TENANT_PREFIX", "hoglake-"),
     /**
+     * Whether each background loop's all-catalog sweep runs in ONE hoglake
+     * process at a time, elected through a lease row in the registry
+     * tenant (hoglite/HogliteLoopLease.kt). On by default: without it
+     * every process sweeps every catalog on every tick. `false` restores
+     * that, for a deployment that wants it back while it investigates.
+     */
+    val hogliteLoopLeases: Boolean =
+        database != DatabaseBackend.HOGLITE || boolEnv("HOGLAKE_HOGLITE_LOOP_LEASES", true),
+    /**
      * Circuit breaker, per hoglite POOL (standard/whale — the two pools
      * fail independently, so the breaker is per pool and not global):
      * after this many CONSECUTIVE transport/5xx failures the pool's

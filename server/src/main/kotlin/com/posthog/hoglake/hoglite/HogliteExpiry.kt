@@ -69,15 +69,28 @@ internal class HogliteExpiry(
             runSweep(catalog, batchSize)
         }
 
-    fun runOnceAllCatalogs(batchSize: Int): List<Pair<String, ExpiryResult>> =
-        store.listCatalogNames().mapNotNull { name ->
+    /**
+     * One registry read for the sweep; each catalog bound to the tenant it
+     * named. [continueSweep] (the loop lease) is asked before each catalog.
+     */
+    fun runOnceAllCatalogs(
+        batchSize: Int,
+        continueSweep: () -> Boolean = { true },
+    ): List<Pair<String, ExpiryResult>> {
+        val results = mutableListOf<Pair<String, ExpiryResult>>()
+        for ((name, tenant) in store.catalogTenants()) {
+            if (!continueSweep()) break
             runCatching {
                 name to
-                    runOnce(name, batchSize, MaintenanceTrigger.LOOP)
+                    store.catalogOperation(name, tenant = tenant) {
+                        runOnce(name, batchSize, MaintenanceTrigger.LOOP)
+                    }
             }.onFailure { e ->
                 Audit.event("expiry", name, null, Audit.failureOutcome(e), e.message)
-            }.getOrNull()
+            }.onSuccess { results += it }
         }
+        return results
+    }
 
     private fun runSweep(
         catalog: String,
