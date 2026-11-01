@@ -86,7 +86,7 @@ jobs:
     #                          checked against the image's
     #                          org.opencontainers.image.revision label
     #   HOGLITED_IMAGE_DIGEST  digest of that image (release tag
-    #                          r202610312034-a3ea73)
+    #                          r202611011832-0a26b4)
     # The digest is content-addressed, so it fixes every byte of the
     # engine; there is deliberately no separate binary hash (see
     # ci/fetch-hoglited.sh). Reproduce with pull access to the hoglite
@@ -98,8 +98,8 @@ jobs:
     # and puts the release's Go toolchain (go version -m) in the job
     # summary, which is what a rebuild from source at HOGLITE_COMMIT needs.
     env:
-      HOGLITE_COMMIT: a3ea7319ef980ba2117350771b9e20dc95f75c07
-      HOGLITED_IMAGE_DIGEST: sha256:2865cbb0de8f0c47a03f59a2eee9474e4a325737432eed41b96fe939509daa98
+      HOGLITE_COMMIT: 0a26b49646c887eadb0bc2a1142429a68bb88d72
+      HOGLITED_IMAGE_DIGEST: sha256:8da2526e8e08f3706546003ce7ade4ae3aaeefdb3d99b94c4ee7f300ad1d83f2
     # id-token: the OIDC token for the ECR pull role (main pushes only;
     # the role's trust admits refs/heads/main and nothing else).
     permissions:
