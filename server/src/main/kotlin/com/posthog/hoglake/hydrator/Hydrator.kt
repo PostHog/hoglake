@@ -232,10 +232,16 @@ class Hydrator(
     internal fun claimPending(
         h: Handle,
         limit: Int,
+        catalogIds: Set<Long>? = null,
     ): List<PendingFile> {
         if (limit <= 0) return emptyList()
         val names =
-            h.createQuery("SELECT catalog_id, name FROM hog_catalog ORDER BY catalog_id")
+            h.createQuery(
+                "SELECT catalog_id, name FROM hog_catalog " +
+                    "WHERE (:allCatalogs OR catalog_id = ANY(:catalogIds)) ORDER BY catalog_id",
+            )
+                .bind("allCatalogs", catalogIds == null)
+                .bindArray("catalogIds", Long::class.javaObjectType, catalogIds ?: emptySet<Long>())
                 .map { rs, _ -> rs.getLong("catalog_id") to rs.getString("name") }
                 .list().toMap(java.util.LinkedHashMap())
         val catalogs = names.keys.toList()
@@ -371,7 +377,10 @@ class Hydrator(
      * [limit] defaults to [DEFAULT_SWEEP_LIMIT] — see that constant for
      * why it is not 100.
      */
-    fun runOnce(limit: Int = DEFAULT_SWEEP_LIMIT): Int {
+    fun runOnce(
+        limit: Int = DEFAULT_SWEEP_LIMIT,
+        catalogIds: Set<Long>? = null,
+    ): Int {
         val startedAt = Instant.now()
         // Per-catalog outcome tallies, accumulated inside the sweep
         // transaction and recorded after it commits.
@@ -379,7 +388,7 @@ class Hydrator(
         val processed =
             try {
                 jdbi.inTransaction<Int, Exception> { h ->
-                    val pending = claimPending(h, limit)
+                    val pending = claimPending(h, limit, catalogIds)
                     for ((catalogId, files) in pending.groupBy { it.catalogId }) {
                         tallies[catalogId] = mutableListOf(files.size.toLong(), 0, 0, 0, 0, 0)
                     }

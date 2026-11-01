@@ -24,8 +24,8 @@ import java.util.UUID
 
 /**
  * The catalog persistence seam: every catalog-scoped operation the /v1
- * routes need, behind one interface, so the backend is a STARTUP choice
- * (`HOGLAKE_DATABASE`) rather than a property of the call sites.
+ * routes need, behind one interface. Legacy modes select the backend at startup.
+ * Explicit mixed mode binds one directory entry for each synchronous operation.
  *
  * Two implementations:
  *
@@ -60,6 +60,8 @@ interface CatalogStore {
         dataPath: String,
         author: String? = null,
         message: String? = null,
+        backend: String? = null,
+        connectionRef: String? = null,
     ): CatalogInfo
 
     fun getCatalog(name: String): CatalogInfo
@@ -248,4 +250,14 @@ interface CatalogStore {
         tableUuid: UUID,
         snapshotId: Long,
     ): ConsumerOffset
+}
+
+/** Legacy deployments keep their configured backend and reject create-time selection. */
+internal fun requireLegacySelection(
+    backend: String?,
+    connectionRef: String?,
+) {
+    if (backend != null || connectionRef != null) {
+        throw com.posthog.hoglake.model.HoglakeException.Validation("backend selection requires HOGLAKE_DATABASE=mixed")
+    }
 }

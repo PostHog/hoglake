@@ -1,5 +1,8 @@
 # The hoglite backend (HOGLAKE_DATABASE=hoglite)
 
+For explicit mixed routing, see [Catalog backend selection](catalog-backends.md).
+Both legacy deployment modes keep their existing defaults.
+
 hoglake has two storage backends behind one interface. `HOGLAKE_DATABASE=postgres`
 (the default) is what the existing shared deployment runs: the catalog lives in
 one Postgres database, one row set per catalog, serialised by advisory locks.
@@ -170,7 +173,7 @@ them unchanged; the hoglite ports live in `server/.../hoglite/`.
 
 | Env var | Default | Meaning |
 | --- | --- | --- |
-| `HOGLAKE_DATABASE` | `postgres` | `postgres` or `hoglite` |
+| `HOGLAKE_DATABASE` | `postgres` | `postgres`, `hoglite`, or explicit `mixed` routing |
 | `HOGLAKE_HOGLITE_URL` | — | single endpoint… |
 | `HOGLAKE_HOGLITE_WHALE_URL` / `HOGLAKE_HOGLITE_OWNER_URL_PATTERN` | — | …or whale + owner-pattern routing |
 | `HOGLAKE_HOGLITE_CONNECT_TIMEOUT_MS` | 2000 | TCP connect |

@@ -7,6 +7,7 @@ package com.posthog.hoglake
 enum class DatabaseBackend {
     POSTGRES,
     HOGLITE,
+    MIXED,
     ;
 
     val wire: String get() = name.lowercase()
@@ -37,15 +38,7 @@ data class Config(
     val instanceName: String = env("HOGLAKE_INSTANCE_NAME", ""),
     /** Color theme for the webui. Empty keeps the default palette. */
     val uiTheme: String = env("HOGLAKE_UI_THEME", ""),
-    /**
-     * Which database backend serves EVERY catalog this deployment
-     * knows: [DatabaseBackend.POSTGRES] (the default; the shared
-     * deployment's Postgres) or [DatabaseBackend.HOGLITE] (each catalog
-     * is a hoglite tenant; the per-warehouse deployment). A process
-     * serves exactly one backend — there is no per-catalog branching,
-     * so a mixed fleet is two Deployments, not one pod deciding per
-     * request.
-     */
+    /** Legacy deployment backend, or explicit mixed routing through the hoglite directory. */
     val database: DatabaseBackend = backendEnv("HOGLAKE_DATABASE", DatabaseBackend.POSTGRES),
     val jdbcUrl: String = env("HOGLAKE_JDBC_URL", "jdbc:postgresql://localhost:5432/hoglake"),
     val dbUser: String = env("HOGLAKE_DB_USER", "hoglake"),
@@ -117,7 +110,7 @@ data class Config(
      * that, for a deployment that wants it back while it investigates.
      */
     val hogliteLoopLeases: Boolean =
-        database != DatabaseBackend.HOGLITE || boolEnv("HOGLAKE_HOGLITE_LOOP_LEASES", true),
+        database == DatabaseBackend.POSTGRES || boolEnv("HOGLAKE_HOGLITE_LOOP_LEASES", true),
     /**
      * Circuit breaker, per hoglite POOL (standard/whale — the two pools
      * fail independently, so the breaker is per pool and not global):
@@ -1468,22 +1461,33 @@ data class Config(
         // Hikari pool for the arithmetic to protect, and dbPoolSize is
         // inert — the dispatcher is then bounded by hoglite's client
         // timeouts instead.
-        require(database != DatabaseBackend.POSTGRES || requestThreads <= dbPoolSize) {
+        require(database == DatabaseBackend.HOGLITE || requestThreads <= dbPoolSize) {
             "HOGLAKE_REQUEST_THREADS=$requestThreads exceeds HOGLAKE_DB_POOL_SIZE=$dbPoolSize: " +
                 "handler threads past the pool queue inside HikariPool.getConnection and 500 " +
                 "after its 5s connectionTimeout instead of queueing in the dispatcher, where a " +
                 "wait is measured and shed with a typed 503. Raise HOGLAKE_DB_POOL_SIZE with it."
         }
-        require(database != DatabaseBackend.HOGLITE || hogliteUrl.isNotBlank()) {
-            "HOGLAKE_DATABASE=hoglite requires HOGLAKE_HOGLITE_URL (the standard pool's service " +
-                "base URL, e.g. http://hoglite.hoglite.svc:8080); without it every catalog call " +
+        require(database == DatabaseBackend.POSTGRES || hogliteUrl.isNotBlank()) {
+            "HOGLAKE_DATABASE=${database.wire} requires HOGLAKE_HOGLITE_URL (the standard pool's service " +
+                "base URL); without it every catalog call " +
                 "would fail at request time instead of refusing the boot"
+        }
+        if (database == DatabaseBackend.MIXED) {
+            require(jdbcUrl.startsWith("jdbc:postgresql:")) { "mixed mode requires a PostgreSQL HOGLAKE_JDBC_URL" }
+            for (url in listOf(hogliteUrl, hogliteWhaleUrl).filter { it.isNotEmpty() }) {
+                val uri = runCatching { java.net.URI(url) }.getOrNull()
+                require(
+                    uri != null && uri.scheme in setOf("http", "https") && uri.host != null && uri.userInfo == null,
+                ) {
+                    "mixed mode requires HTTP(S) hoglite URLs without credentials"
+                }
+            }
         }
         // The remaining hoglite checks are HOGLITE-only, like the knobs'
         // parsing (hogliteEnv): a Postgres deployment never builds a
         // hoglite client, so a stray HOGLAKE_HOGLITE_* value must not
         // refuse its boot.
-        val hoglite = database == DatabaseBackend.HOGLITE
+        val hoglite = database != DatabaseBackend.POSTGRES
         require(!hoglite || hogliteOwnerUrlPattern.isEmpty() || hogliteOwnerUrlPattern.contains("{owner}")) {
             "HOGLAKE_HOGLITE_OWNER_URL_PATTERN must contain the literal {owner} where the owning " +
                 "pod's stable name goes, got '$hogliteOwnerUrlPattern'"
@@ -1814,7 +1818,7 @@ data class Config(
             database: DatabaseBackend,
             name: String,
             default: String,
-        ): String = if (database == DatabaseBackend.HOGLITE) env(name, default) else default
+        ): String = if (database != DatabaseBackend.POSTGRES) env(name, default) else default
 
         /**
          * A backend selector that refuses anything but the two spellings,
@@ -1829,7 +1833,7 @@ data class Config(
             val raw = System.getenv(name)?.takeIf { it.isNotBlank() } ?: return default
             return DatabaseBackend.fromWire(raw.lowercase())
                 ?: throw IllegalArgumentException(
-                    "$name must be 'postgres' or 'hoglite', got '$raw'",
+                    "$name must be 'postgres', 'hoglite', or 'mixed', got '$raw'",
                 )
         }
 

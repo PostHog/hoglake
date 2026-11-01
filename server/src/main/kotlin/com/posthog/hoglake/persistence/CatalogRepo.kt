@@ -61,13 +61,14 @@ object CatalogRepo {
         try {
             handle.createQuery(
                 """
-                INSERT INTO hog_catalog (name, data_path)
-                VALUES (:name, :dataPath)
+                INSERT INTO hog_catalog (catalog_id, name, data_path) OVERRIDING SYSTEM VALUE
+                VALUES (COALESCE(:boundId, nextval('hog_catalog_catalog_id_seq')), :name, :dataPath)
                 RETURNING $CATALOG_COLUMNS
                 """,
             )
                 .bind("name", name)
                 .bind("dataPath", dataPath)
+                .bind("boundId", CatalogBinding.id(name))
                 .map(catalogMapper)
                 .one()
         } catch (e: UnableToExecuteStatementException) {
@@ -90,7 +91,7 @@ object CatalogRepo {
             .bind("name", name)
             .map(catalogMapper)
             .findOne()
-            .orElse(null)
+            .orElse(null)?.also { CatalogBinding.check(name, it.catalogId) }
 
     /** Serialize option validation and updates on the single catalog row. */
     fun requireForUpdate(
@@ -102,6 +103,7 @@ object CatalogRepo {
             .map(catalogMapper)
             .findOne()
             .orElseThrow { HoglakeException.NotFound("catalog '$name'") }
+            .also { CatalogBinding.check(name, it.catalogId) }
 
     /** [findByName] or [HoglakeException.NotFound]. */
     fun require(
@@ -111,6 +113,16 @@ object CatalogRepo {
 
     fun listAll(handle: Handle): List<CatalogInfo> =
         handle.createQuery("SELECT $CATALOG_COLUMNS FROM hog_catalog ORDER BY name")
+            .map(catalogMapper)
+            .list()
+
+    /** A mixed roster binds immutable IDs before this bounded metadata query. */
+    internal fun listByIds(
+        handle: Handle,
+        ids: List<Long>,
+    ): List<CatalogInfo> =
+        handle.createQuery("SELECT $CATALOG_COLUMNS FROM hog_catalog WHERE catalog_id = ANY(:ids) ORDER BY name")
+            .bindArray("ids", Long::class.javaObjectType, ids)
             .map(catalogMapper)
             .list()
 

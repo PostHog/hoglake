@@ -41,7 +41,12 @@ class PostgresCatalogStore(
         dataPath: String,
         author: String?,
         message: String?,
-    ): CatalogInfo = catalogs.createCatalog(name, dataPath, author, message)
+        backend: String?,
+        connectionRef: String?,
+    ): CatalogInfo {
+        requireLegacySelection(backend, connectionRef)
+        return catalogs.createCatalog(name, dataPath, author, message)
+    }
 
     override fun getCatalog(name: String): CatalogInfo = catalogs.getCatalog(name)
 

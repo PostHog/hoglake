@@ -93,6 +93,9 @@ class HogliteCatalogStore(
     // mutable map after entry. Their immutable binding lives in operationBindings.
     private val tenantCache = java.util.concurrent.ConcurrentHashMap<String, String>()
 
+    /** Mixed mode extends this registry before serving requests. Legacy modes do not use these columns. */
+    internal var directoryEnabled = false
+
     /** The tenant id [catalog] currently lives in; the 404s name the catalog. */
     internal fun resolveTenant(catalog: String): String {
         if (catalog == REGISTRY_TENANT) return tenantOf(REGISTRY_TENANT)
@@ -273,8 +276,11 @@ class HogliteCatalogStore(
         dataPath: String,
         author: String?,
         message: String?,
+        backend: String?,
+        connectionRef: String?,
     ): CatalogInfo =
         catalogOperation(name, creating = true) {
+            com.posthog.hoglake.store.requireLegacySelection(backend, connectionRef)
             validateCatalogName(name)
             validateDataPathShape(dataPath)
             // The cross-catalog invariants (unique name, disjoint data_path
@@ -360,6 +366,17 @@ class HogliteCatalogStore(
                 "SELECT COUNT(*) FROM catalogs WHERE name = ?",
                 name,
             ) { HoglakeException.AlreadyExists("catalog '$name' already exists") }
+            if (directoryEnabled) {
+                val prefix = dataPath.trimEnd('/') + "/"
+                reg.expectZero(
+                    "SELECT COUNT(*) FROM catalogs WHERE " +
+                        "substr(rtrim(data_path, '/') || '/', 1, length(?)) = ? " +
+                        "OR substr(?, 1, length(rtrim(data_path, '/') || '/')) = rtrim(data_path, '/') || '/'",
+                    prefix,
+                    prefix,
+                    prefix,
+                ) { HoglakeException.Validation("data_path overlaps another catalog") }
+            }
             reg.add("INSERT INTO catalogs(name, data_path, tenant) VALUES (?, ?, ?)", name, dataPath, tenantId)
             try {
                 runRegistryTx(freshTxid("create-catalog"), null, reg)
@@ -412,6 +429,11 @@ class HogliteCatalogStore(
     override fun listCatalogs(visible: Set<String>?): List<CatalogInfo> {
         // A read: a missing registry lists as empty, and nothing is created.
         val bound = catalogTenants().filter { (name, _) -> visible == null || name in visible }
+        return listBoundCatalogs(bound)
+    }
+
+    /** Mixed routing supplies its authoritative roster directly, without rereading the legacy registry. */
+    internal fun listBoundCatalogs(bound: List<Pair<String, String>>): List<CatalogInfo> {
         val metas = readMetas(bound)
         return bound.indices.mapNotNull { i ->
             val name = bound[i].first
@@ -542,6 +564,8 @@ class HogliteCatalogStore(
                 ?: throw HoglakeException.NotFound("catalog '$catalog'")
         val rowTenant = registered[1] as? String
         val tenantId = rowTenant ?: tenantOf(catalog) // pre-incarnation registry row
+        val bound = operationBindings.get()?.get(catalog)?.tenant
+        if (bound != null && bound != tenantId) throw missingCatalog(catalog)
 
         // A ghost registry row (a create that died before its tenant
         // existed, or a drop that died after deleting it) is droppable
@@ -2537,7 +2561,10 @@ class HogliteCatalogStore(
      * turn each tick into a tenant create.
      */
     internal fun listCatalogNames(): List<String> =
-        queryRegistry("SELECT name FROM catalogs ORDER BY name").rows.map { it[0].asString() }
+        queryRegistry("SELECT name FROM catalogs${directoryFilter()} ORDER BY name").rows.map { it[0].asString() }
+
+    private fun directoryFilter(): String =
+        if (directoryEnabled) " WHERE backend = 'hoglite' AND state = 'ready'" else ""
 
     /**
      * Every catalog with the tenant id its registry row names, by name, in
@@ -2560,10 +2587,15 @@ class HogliteCatalogStore(
         while (true) {
             val rows =
                 if (out.isEmpty()) {
-                    queryRegistry("SELECT name, tenant FROM catalogs ORDER BY name LIMIT ?", page).rows
+                    queryRegistry(
+                        "SELECT name, tenant FROM catalogs${directoryFilter()} ORDER BY name LIMIT ?",
+                        page,
+                    ).rows
                 } else {
                     queryRegistry(
-                        "SELECT name, tenant FROM catalogs WHERE name > ? ORDER BY name LIMIT ?",
+                        "SELECT name, tenant FROM catalogs" +
+                            (if (directoryEnabled) directoryFilter() + " AND name > ?" else " WHERE name > ?") +
+                            " ORDER BY name LIMIT ?",
                         out.last().first,
                         page,
                     ).rows
@@ -2849,7 +2881,7 @@ class HogliteCatalogStore(
         walk(columns, null)
     }
 
-    private fun validateCatalogName(name: String) {
+    internal fun validateCatalogName(name: String) {
         if (!CATALOG_NAME_REGEX.matches(name)) {
             throw HoglakeException.Validation(
                 "invalid catalog name '${Identifiers.cap(name)}' (must match $CATALOG_NAME_PATTERN)",
@@ -2861,7 +2893,7 @@ class HogliteCatalogStore(
     }
 
     /** [com.posthog.hoglake.service.CatalogService.validateDataPath], ported verbatim. */
-    private fun validateDataPathShape(dataPath: String) {
+    internal fun validateDataPathShape(dataPath: String) {
         if (dataPath.isBlank()) throw HoglakeException.Validation("data_path must not be blank")
         if (dataPath.length > 512) {
             throw HoglakeException.Validation(

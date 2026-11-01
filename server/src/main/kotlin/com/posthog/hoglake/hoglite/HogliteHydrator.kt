@@ -89,7 +89,7 @@ internal class HogliteHydrator(
         return served
     }
 
-    private fun runCatalog(
+    internal fun runCatalog(
         catalog: String,
         tenant: String,
         room: Int,

@@ -110,7 +110,14 @@ fun Application.installApiRoutes(
                 val req = call.receive<CreateCatalogRequestDto>()
                 call.respond(
                     HttpStatusCode.Created,
-                    catalogs.createCatalog(req.name, req.dataPath, call.actorOrRefuse(req.author), req.message).toDto(),
+                    catalogs.createCatalog(
+                        req.name,
+                        req.dataPath,
+                        call.actorOrRefuse(req.author),
+                        req.message,
+                        req.backend,
+                        req.connectionRef,
+                    ).toDto(),
                 )
             }
 

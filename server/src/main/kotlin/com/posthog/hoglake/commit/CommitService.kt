@@ -16,6 +16,7 @@ import com.posthog.hoglake.model.validateFooterSize
 import com.posthog.hoglake.model.validateSplitOffsets
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
+import com.posthog.hoglake.persistence.CatalogBinding
 import com.posthog.hoglake.persistence.Locks
 import com.posthog.hoglake.storedPayloadObjectMapper
 import io.github.oshai.kotlinlogging.KotlinLogging
@@ -304,8 +305,10 @@ class CommitService(
                 SELECT r.snapshot_id, r.schema_version FROM hog_commit_receipt r
                 JOIN hog_catalog c USING (catalog_id)
                 WHERE c.name = :catalog AND r.idempotency_key = :operation
+                  AND (:boundId::bigint IS NULL OR c.catalog_id = :boundId)
                 """,
             ).bind("catalog", catalog).bind("operation", operation)
+                .bind("boundId", CatalogBinding.id(catalog))
                 .map { rs, _ -> CommitResult(rs.getLong("snapshot_id"), rs.getLong("schema_version")) }
                 .findOne().orElseThrow { HoglakeException.NotFound("commit receipt '$operation'") }
         }
@@ -483,6 +486,7 @@ class CommitService(
                 .map { rs, _ -> rs.getLong(1) to rs.getString(2) }
                 .findOne()
                 .orElseThrow { HoglakeException.NotFound("catalog '$catalogName'") }
+        com.posthog.hoglake.persistence.CatalogBinding.check(catalogName, catalogId)
         if (req.idempotencyKey == null) validatePathsUnderDataPath(dataPath, req)
 
         // 2. Merge duplicate (namespace, table) appends/deletes, preserving

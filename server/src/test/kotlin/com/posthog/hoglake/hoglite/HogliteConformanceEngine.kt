@@ -138,6 +138,8 @@ internal class HogliteConformanceEngine : AutoCloseable {
             s3PathStyle = true,
         )
 
+    fun url(): String = "http://127.0.0.1:$port"
+
     fun s3Client(): S3Client =
         S3Client.builder()
             .endpointOverride(URI.create(config().s3Endpoint))

@@ -1633,6 +1633,7 @@ class CleanupService(
      * shrinking.
      */
     private fun purgeDrainedLedger(runLabel: String) {
+        val boundId = com.posthog.hoglake.persistence.CatalogBinding.currentId()
         val deadline = System.nanoTime() + Duration.ofMillis(ledgerPurgeBudgetMs).toNanos()
         var after = 0L
         var purged = 0L
@@ -1652,7 +1653,17 @@ class CleanupService(
             }
             val page =
                 jdbi.withHandleUnchecked { h ->
-                    h.createQuery(PURGE_PAGE_SQL)
+                    h.createQuery(
+                        if (boundId == null) {
+                            PURGE_PAGE_SQL
+                        } else {
+                            PURGE_PAGE_SQL.replace(
+                                "AND drained_at <",
+                                "AND catalog_id = :boundCatalogId AND drained_at <",
+                            )
+                        },
+                    )
+                        .also { if (boundId != null) it.bind("boundCatalogId", boundId) }
                         .bind("after", after)
                         .bind("page", ledgerPurgePage)
                         .bind("retention", ledgerRetentionSeconds)

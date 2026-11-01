@@ -28,7 +28,7 @@ metadata database.
 ## What
 
 - **Catalog as a service.** All catalog SQL lives server-side behind a REST API. One implementation, one version, one deployment — not a library that every client embeds.
-- **Postgres as the only backend.** Foreign keys with `ON DELETE CASCADE`, advisory locks, partial indexes and range deletes are load-bearing design material, not portability casualties.
+- **Two catalog backends.** PostgreSQL remains the deployment default. Explicit mixed mode selects a backend per catalog. See [Catalog backend selection](docs/catalog-backends.md).
 - **Commits scoped to the write set.** One commit is one snapshot, and its cost does not grow with the size of the catalog.
 - **Footer-shipping registration.** Writers upload parquet and send the footer statistics; the server never opens a data file on the commit path. A deferred-stats mode hydrates them asynchronously instead.
 - **Server-assigned row lineage.** Contiguous row-id ranges, never reused, under a `table_uuid` incarnation contract. Compaction preserves row ids across a sorted rewrite.

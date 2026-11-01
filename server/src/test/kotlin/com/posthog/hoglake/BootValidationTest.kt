@@ -105,9 +105,35 @@ class BootValidationTest {
     fun `a Postgres build constructs every Postgres service and no hoglite one`() {
         val all = lazies(postgres(Config()))
         assertThat(all).hasSizeGreaterThan(20)
-        val (hogliteOnes, postgresOnes) = all.entries.partition { it.key.startsWith("hoglite") }
+        val (hogliteOnes, postgresOnes) =
+            all.entries.partition { it.key.startsWith("hoglite") || it.key == "mixedRouter" }
         assertThat(postgresOnes.filterNot { it.value.isInitialized() }.map { it.key }).isEmpty()
         assertThat(hogliteOnes.filter { it.value.isInitialized() }.map { it.key }).isEmpty()
+    }
+
+    @Test
+    fun `mixed mode omits unsampled fleet metrics without changing legacy registration`() {
+        val mixed =
+            App.buildMixed(
+                hogliteBase.copy(database = DatabaseBackend.MIXED),
+                noDb,
+                HogliteCatalogStore(HogliteClient(standardUrl = "http://127.0.0.1:1")),
+                HealthProbe.forProbe(1_000) { false },
+            )
+        mixed.use {
+            assertThat(lazies(it).getValue("catalogMetrics").isInitialized()).isFalse()
+            for (name in listOf(
+                "hoglake_metrics_last_sample_epoch",
+                "hoglake_maintenance_last_run_epoch",
+                "hoglake_live_rows",
+                "hoglake_live_bytes",
+            )) {
+                assertThat(it.meterRegistry.find(name).meters()).isEmpty()
+            }
+        }
+        postgres(Config()).use {
+            assertThat(it.meterRegistry.find("hoglake_metrics_last_sample_epoch").gauge()).isNotNull()
+        }
     }
 
     @Test
@@ -118,6 +144,28 @@ class BootValidationTest {
         assertThat(hogliteOnes.filterNot { it.value.isInitialized() }.map { it.key }).isEmpty()
         // the Postgres services need a Jdbi a hoglite App does not have
         assertThat(others.filter { it.value.isInitialized() }.map { it.key }).isEmpty()
+    }
+
+    @Test
+    fun `a mixed build validates both service sets without contacting either database`() {
+        val cfg = hogliteBase.copy(database = DatabaseBackend.MIXED)
+
+        fun mixed(config: Config) =
+            App.buildMixed(
+                config,
+                noDb,
+                HogliteCatalogStore(HogliteClient(standardUrl = config.hogliteUrl)),
+                HealthProbe.forProbe(1_000) { false },
+            )
+        mixed(cfg).use { app ->
+            assertThat(lazies(app).filterValues { !it.isInitialized() }.keys).containsExactly("catalogMetrics")
+        }
+        assertThatThrownBy { mixed(cfg.copy(maintenanceSummaryRefreshSeconds = 0)) }
+            .isInstanceOf(IllegalArgumentException::class.java)
+        assertThatThrownBy { cfg.copy(hogliteConnectTimeoutMs = 0) }
+            .isInstanceOf(IllegalArgumentException::class.java)
+        assertThatThrownBy { cfg.copy(jdbcUrl = "not-a-jdbc-url") }
+            .isInstanceOf(IllegalArgumentException::class.java)
     }
 
     // ---- HOGLAKE_HOGLITE_* belongs to the hoglite backend alone ----------

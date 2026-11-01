@@ -62,6 +62,33 @@ fun main() {
             // first create retries.
             store.bootstrapRegistryAtStartup()
         }
+        DatabaseBackend.MIXED -> {
+            val ds = Database.dataSource(cfg)
+            val postgres = MixedPostgres(ds)
+            val client = com.posthog.hoglake.hoglite.HogliteClient.fromConfig(cfg)
+            val store =
+                com.posthog.hoglake.hoglite.HogliteCatalogStore(
+                    client,
+                    cfg.hogliteTenantPrefix,
+                    cfg.refuseBlindPartitionedAppends,
+                    cfg.removalLedgerRetentionSeconds,
+                )
+            val directory = com.posthog.hoglake.hoglite.CatalogDirectory(store)
+            app =
+                App.buildMixed(
+                    cfg,
+                    Database.jdbi(ds),
+                    store,
+                    HealthProbe.forProbe(cfg.healthProbeTimeoutMs) {
+                        runCatching {
+                            directory.entries(limit = 1)
+                            true
+                        }.getOrDefault(false)
+                    },
+                    postgres::ensureReady,
+                    ds,
+                )
+        }
     }
     val background = app.startBackground()
     val server =
