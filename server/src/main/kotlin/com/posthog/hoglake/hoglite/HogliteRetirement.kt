@@ -48,13 +48,20 @@ internal class HogliteRetirement(
             runSweep(catalog)
         }
 
-    fun runOnceAllCatalogs(): List<Pair<String, RetirementResult>> {
+    /**
+     * One registry read for the sweep; each catalog bound to the tenant it
+     * named. [continueSweep] (the loop lease) is asked before each catalog.
+     */
+    fun runOnceAllCatalogs(continueSweep: () -> Boolean = { true }): List<Pair<String, RetirementResult>> {
         // Shuffled per sweep (#455): no catalog is always first.
-        val names = store.listCatalogNames().shuffled()
+        val catalogs = store.catalogTenants().shuffled()
         val results = mutableListOf<Pair<String, RetirementResult>>()
-        for (name in names) {
+        for ((name, tenant) in catalogs) {
+            if (!continueSweep()) break
             try {
-                results += name to runOnce(name, MaintenanceTrigger.LOOP)
+                results +=
+                    name to
+                    store.catalogOperation(name, tenant = tenant) { runOnce(name, MaintenanceTrigger.LOOP) }
             } catch (e: Exception) {
                 log.error(e) { "retirement sweep failed for catalog '$name'; continuing" }
             }

@@ -128,20 +128,34 @@ class HogliteCatalogStore(
         return ((row[0] as? String) ?: tenantOf(catalog)).also { tenantCache[catalog] = it }
     }
 
+    /**
+     * [tenant] is a binding the caller already resolved from the registry
+     * in the same sweep ([catalogTenants]): the background loops read the
+     * registry once per sweep and bind each catalog to the tenant id that
+     * read named, instead of one registry read per catalog. It is still ONE
+     * incarnation for the whole operation: if the name was dropped (and
+     * perhaps recreated) since that read, the bound tenant answers 404 and
+     * the operation fails NotFound; it never reaches the new incarnation.
+     */
     @PublishedApi
     internal fun enterCatalogOperation(
         catalog: String,
         creating: Boolean = false,
+        tenant: String? = null,
     ): Boolean {
         if (operationBindings.get()?.containsKey(catalog) == true) {
             check(!creating) { "cannot bootstrap inside an existing catalog operation" }
+            check(tenant == null || operationBindings.get()!![catalog]!!.tenant == tenant) {
+                "catalog '$catalog' is already bound to another incarnation"
+            }
             return false
         }
+        check(!(creating && tenant != null)) { "a create mints its own incarnation" }
         val tenant =
             if (creating) {
                 tenantOf(catalog) + "-" + UUID.randomUUID().toString().replace("-", "").take(12)
             } else {
-                freshTenant(catalog)
+                tenant ?: freshTenant(catalog)
             }
         // A tenant bootstrapped by an older binary gets the columns and
         // tables added since, before anything reads them. Once per tenant
@@ -154,6 +168,15 @@ class HogliteCatalogStore(
         return true
     }
 
+    /**
+     * Every migration's applied-probe as one SELECT of scalar subqueries:
+     * one row, one column per migration, in [HogliteSchema.TENANT_MIGRATIONS]
+     * order. A plain `/query`, not a read-only `/tx`, so it is read like
+     * any other single read.
+     */
+    private val migrationProbesSql: String =
+        "SELECT " + HogliteSchema.TENANT_MIGRATIONS.joinToString(", ") { "(${it.appliedProbe})" }
+
     private val migratedTenants: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
 
     /**
@@ -163,16 +186,20 @@ class HogliteCatalogStore(
      * migration already in (this pod earlier, another pod, or a tenant
      * created with the current [HogliteSchema.DDL]) fails the guard and
      * is skipped, and two pods racing it serialize on the tenant. The
-     * read-only probe first keeps the steady state at one query per
-     * migration per process. A tenant that is gone (404) is left to the
+     * read-only probes go first, all of them in ONE query
+     * ([migrationProbesSql]), so a tenant whose migrations are all in
+     * costs one round trip per process (it was one per migration: eight
+     * sequential reads on the first operation each catalog saw, which a
+     * catalog list or a loop sweep paid N times over). A tenant that is gone (404) is left to the
      * operation itself, which reports the catalog missing; the tenant is
      * not remembered, so a later incarnation of the name is still checked.
      */
     internal fun ensureTenantSchema(tenant: String) {
         if (tenant in migratedTenants) return
         try {
-            for (m in HogliteSchema.TENANT_MIGRATIONS) {
-                if (client.query(tenant, m.appliedProbe, emptyList()).firstRow()!![0].asLong() > 0) continue
+            val applied = client.query(tenant, migrationProbesSql, emptyList()).firstRow()!!
+            for ((m, probe) in HogliteSchema.TENANT_MIGRATIONS.zip(applied)) {
+                if (probe.asLong() > 0) continue
                 val statements =
                     listOf(HogliteStatement(m.appliedProbe, emptyList(), expectScalarInt = 0)) +
                         m.statements.map { HogliteStatement(it) }
@@ -209,9 +236,10 @@ class HogliteCatalogStore(
     internal inline fun <T> catalogOperation(
         catalog: String,
         creating: Boolean = false,
+        tenant: String? = null,
         body: () -> T,
     ): T {
-        val entered = enterCatalogOperation(catalog, creating)
+        val entered = enterCatalogOperation(catalog, creating, tenant)
         try {
             return body()
         } finally {
@@ -353,23 +381,147 @@ class HogliteCatalogStore(
             meta(name).toCatalogInfo()
         }
 
+    /**
+     * Every catalog, in a constant number of hoglite round trips rather
+     * than two per catalog:
+     *
+     *  1. ONE registry read for every (name, tenant) pair;
+     *  2. the catalogs' meta rows, each read from the exact tenant id that
+     *     read named, through hoglite's `/v1/query-batch`
+     *     ([HogliteClient.queryBatch]): one request per
+     *     [listBatchSize] catalogs. An engine without the endpoint gets the
+     *     same reads one by one, [LIST_FALLBACK_PARALLELISM] at a time.
+     *
+     * No per-catalog registry lookup, and no per-catalog migration check:
+     * the meta columns this reads are in every tenant's DDL since the
+     * first, so a list needs no migration.
+     *
+     * Correctness under a concurrent drop or recreate rests on the binding
+     * in step 1: each meta row comes from the incarnation the registry row
+     * named. A row is listed only if its tenant answers and its meta row
+     * carries the same name. A catalog dropped during the list is
+     * therefore either listed as it was or omitted, and one whose drop
+     * completed before the list began is never listed (its tenant is
+     * deleted before its registry row). A catalog recreated during the
+     * list is either its old incarnation (the registry read came first and
+     * the old one was still live) or its new one, never a mix. A catalog
+     * a drop has fenced but not finished still lists, as it always has:
+     * it exists until the drop completes, and an operator retries the
+     * drop from the list.
+     */
     override fun listCatalogs(visible: Set<String>?): List<CatalogInfo> {
         // A read: a missing registry lists as empty, and nothing is created.
-        val rows = queryRegistry("SELECT name FROM catalogs ORDER BY name")
-        return rows.rows
-            .map { it[0].asString() }
-            .filter { visible == null || it in visible }
-            .mapNotNull {
+        val bound = catalogTenants().filter { (name, _) -> visible == null || name in visible }
+        val metas = readMetas(bound)
+        return bound.indices.mapNotNull { i ->
+            val name = bound[i].first
+            val row = metas[i]
+            when {
+                row == null -> {
+                    // A registry row whose tenant is mid-create or gone
+                    // (dropped since the registry read). Skip it rather
+                    // than failing every caller's list; dropCatalog
+                    // cleans the row up.
+                    log.warn { "catalog '$name' is registered but its tenant is not readable; skipping" }
+                    null
+                }
+                row[0] != name -> {
+                    log.warn { "catalog '$name' resolved to a tenant whose meta names '${row[0]}'; skipping" }
+                    null
+                }
+                else -> metaRow(row).toCatalogInfo()
+            }
+        }
+    }
+
+    /** Catalogs per `/v1/query-batch` request; a test hook, so a test can force several. */
+    internal var listBatchSize: Int = LIST_BATCH_SIZE
+
+    /**
+     * The meta row of each (name, tenant) in [bound], in order: the row,
+     * or null when that tenant does not exist (404) or has no meta row.
+     * Any other answer for an item is retried on its own through
+     * [HogliteClient.query] (which owns re-routing and the retry budget),
+     * and an item that still fails fails the call, as a single
+     * [getCatalog] would. That covers a whale-class tenant: the batch goes
+     * to the standard pool, which answers that item 421 with the class,
+     * and the retry follows the hint to the whale pool.
+     */
+    private fun readMetas(bound: List<Pair<String, String>>): List<List<Any?>?> {
+        val out = arrayOfNulls<List<Any?>>(bound.size)
+        val retry = mutableListOf<Int>()
+        val sql = metaSql
+        val chunks = bound.indices.chunked(listBatchSize.coerceIn(1, HogliteClient.MAX_BATCH_READS))
+        // The chunks are independent requests: sent together, a list costs
+        // the slowest chunk's latency, not their sum.
+        val chunkAnswers =
+            parallelReads(chunks.indices.toList()) { c ->
+                client.queryBatch(chunks[c].map { HogliteClient.BatchRead(bound[it].second, sql) })
+            }
+        for ((chunk, answers) in chunks.zip(chunkAnswers)) {
+            if (answers == null) {
+                retry += chunk
+                continue
+            }
+            for ((k, i) in chunk.withIndex()) {
+                val a = answers[k]
+                when {
+                    a.status == 200 -> out[i] = a.result!!.firstRow()
+                    a.status == 404 -> out[i] = null
+                    else -> retry += i
+                }
+            }
+        }
+        if (retry.isNotEmpty()) {
+            val rows = parallelReads(retry) { i -> readMetaOne(bound[i].first, bound[i].second, sql) }
+            for ((k, i) in retry.withIndex()) out[i] = rows[k]
+        }
+        return out.toList()
+    }
+
+    private fun readMetaOne(
+        catalog: String,
+        tenant: String,
+        sql: String,
+    ): List<Any?>? =
+        try {
+            client.query(tenant, sql, emptyList()).firstRow()
+        } catch (r: HogliteRejected) {
+            if (r.status == 404) null else throw mapRejected(catalog, r)
+        }
+
+    /**
+     * [read] for each of [items], [LIST_FALLBACK_PARALLELISM] at a time, on
+     * [fanoutPool]. The reads address explicit tenant ids, so they need no
+     * operation binding on the pool's threads. The first failure is
+     * rethrown once every read has finished.
+     */
+    private fun <T> parallelReads(
+        items: List<Int>,
+        read: (Int) -> T,
+    ): List<T> {
+        if (items.size == 1) return listOf(read(items[0]))
+        val futures = items.map { i -> fanoutPool.submit<T> { read(i) } }
+        var failure: Throwable? = null
+        val results =
+            futures.map { f ->
                 try {
-                    getCatalog(it)
-                } catch (e: HoglakeException.NotFound) {
-                    // A registry row whose tenant is mid-create or
-                    // mid-drop. Skip it rather than failing every
-                    // caller's list; dropCatalog cleans the row up.
-                    log.warn { "catalog '$it' is registered but its tenant is not readable; skipping" }
+                    f.get()
+                } catch (e: java.util.concurrent.ExecutionException) {
+                    failure = failure ?: e.cause
                     null
                 }
             }
+        failure?.let { throw it }
+        @Suppress("UNCHECKED_CAST")
+        return results as List<T>
+    }
+
+    private val fanoutPool: java.util.concurrent.ExecutorService by lazy {
+        val n = java.util.concurrent.atomic.AtomicInteger()
+        java.util.concurrent.Executors.newFixedThreadPool(LIST_FALLBACK_PARALLELISM) { r ->
+            Thread(r, "hoglite-list-${n.incrementAndGet()}").apply { isDaemon = true }
+        }
     }
 
     override fun dropCatalog(
@@ -2387,6 +2539,46 @@ class HogliteCatalogStore(
     internal fun listCatalogNames(): List<String> =
         queryRegistry("SELECT name FROM catalogs ORDER BY name").rows.map { it[0].asString() }
 
+    /**
+     * Every catalog with the tenant id its registry row names, by name, in
+     * ONE registry read. A sweep binds each catalog to that tenant
+     * ([catalogOperation]'s `tenant`) instead of resolving each name again;
+     * the list reads each catalog's meta from exactly that tenant. A row
+     * written before incarnation ids has no tenant and lives at
+     * [tenantOf]. Missing registry: empty, as [listCatalogNames].
+     *
+     * Paged by name, [registryPageSize] rows a read, because hoglite caps
+     * the rows of one read (`-max-result-rows`, 100,000 by default): one
+     * read up to [REGISTRY_PAGE_SIZE] catalogs, one more per that many
+     * after. The pages are not one snapshot: a catalog created or dropped
+     * between two pages may be in the result or not, as for any list
+     * racing that create or drop.
+     */
+    internal fun catalogTenants(): List<Pair<String, String>> {
+        val out = mutableListOf<Pair<String, String>>()
+        val page = registryPageSize
+        while (true) {
+            val rows =
+                if (out.isEmpty()) {
+                    queryRegistry("SELECT name, tenant FROM catalogs ORDER BY name LIMIT ?", page).rows
+                } else {
+                    queryRegistry(
+                        "SELECT name, tenant FROM catalogs WHERE name > ? ORDER BY name LIMIT ?",
+                        out.last().first,
+                        page,
+                    ).rows
+                }
+            for (row in rows) {
+                val name = row[0].asString()
+                out += name to ((row[1] as? String) ?: tenantOf(name))
+            }
+            if (rows.size < page) return out
+        }
+    }
+
+    /** Registry rows per [catalogTenants] read; a test hook. */
+    internal var registryPageSize: Int = REGISTRY_PAGE_SIZE
+
     // ---- the registry tenant's bootstrap ------------------------------------
     //
     // The registry tenant is created once per DEPLOYMENT, and checked once
@@ -2417,6 +2609,9 @@ class HogliteCatalogStore(
     private val registryBootstrapLock = Any()
 
     private val registryTenant: String get() = tenantOf(REGISTRY_TENANT)
+
+    /** The registry tenant's id, for the loop leases that live in it ([HogliteLoopLease]). */
+    internal val registryTenantId: String get() = registryTenant
 
     /**
      * Make sure the registry tenant and its table exist, at most once per
@@ -2708,6 +2903,15 @@ class HogliteCatalogStore(
 
         private const val CATALOG_NAME_PATTERN = "^[a-z][a-z0-9_-]{0,62}\$"
         private val CATALOG_NAME_REGEX = Regex(CATALOG_NAME_PATTERN)
+
+        /** Registry rows per read of [catalogTenants]: well under hoglite's default 100,000-row cap. */
+        const val REGISTRY_PAGE_SIZE = 10_000
+
+        /** Catalogs per `/v1/query-batch` request in [listCatalogs]. */
+        const val LIST_BATCH_SIZE = 250
+
+        /** Concurrent single reads when the engine has no `/v1/query-batch`. */
+        const val LIST_FALLBACK_PARALLELISM = 16
 
         internal fun freshTxid(prefix: String): String = "$prefix:${UUID.randomUUID()}"
     }

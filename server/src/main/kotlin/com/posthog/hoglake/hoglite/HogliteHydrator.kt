@@ -62,28 +62,39 @@ internal class HogliteHydrator(
     /** Where the next sweep's catalog order starts; seeded at random so replicas differ. */
     private val rotation = AtomicInteger(ThreadLocalRandom.current().nextInt())
 
-    fun runOnce(limit: Int = Hydrator.DEFAULT_SWEEP_LIMIT): Int {
+    /**
+     * One sweep. The catalogs and their tenants come from ONE registry
+     * read, and each catalog's work is bound to the tenant that read named
+     * (no per-catalog registry lookup). [continueSweep] is asked before
+     * each catalog: the loop's lease ([HogliteLoopLease.renewIfDue]), so a
+     * process that has lost it stops.
+     */
+    fun runOnce(
+        limit: Int = Hydrator.DEFAULT_SWEEP_LIMIT,
+        continueSweep: () -> Boolean = { true },
+    ): Int {
         if (limit <= 0) return 0
-        val names = store.listCatalogNames()
-        if (names.isEmpty()) return 0
-        val start = Math.floorMod(rotation.get(), names.size)
-        val order = names.drop(start) + names.take(start)
+        val catalogs = store.catalogTenants()
+        if (catalogs.isEmpty()) return 0
+        val start = Math.floorMod(rotation.get(), catalogs.size)
+        val order = catalogs.drop(start) + catalogs.take(start)
         rotation.incrementAndGet()
         var served = 0
         val share = maxOf(1, limit / order.size)
-        for (catalog in order) {
+        for ((catalog, tenant) in order) {
             val room = minOf(share, limit - served)
-            if (room <= 0) break
-            served += runCatalog(catalog, room)[0].toInt()
+            if (room <= 0 || !continueSweep()) break
+            served += runCatalog(catalog, tenant, room)[0].toInt()
         }
         return served
     }
 
     private fun runCatalog(
         catalog: String,
+        tenant: String,
         room: Int,
     ): LongArray =
-        store.catalogOperation(catalog) {
+        store.catalogOperation(catalog, tenant = tenant) {
             val tally = sweepCatalog(catalog, room)
             if (tally[0] > 0) {
                 // The ledger shares the claim/hydration operation's tenant binding.

@@ -1924,4 +1924,172 @@ class HogliteBackendIntegrationTest {
             assertThat(b.listCatalogNames()).containsExactly("again", "again-b")
         }
     }
+
+    // ---- a list and a sweep in O(1) registry round trips ----------------------
+
+    /** A store on a deployment prefix of its own, so its registry holds only this test's catalogs. */
+    private fun prefixedStore(
+        prefix: String,
+        url: String = metricsUrl.removeSuffix("/metrics"),
+    ) = HogliteCatalogStore(HogliteClient(standardUrl = url, sleeper = {}), prefix)
+        .apply { requireOperationBindingForTests = true }
+
+    /** Whether the engine under test serves `/v1/query-batch` (hoglite with the batch endpoint). */
+    private fun engineBatches(): Boolean =
+        HogliteClient(standardUrl = metricsUrl.removeSuffix("/metrics"), sleeper = {}).use {
+            it.queryBatch(listOf(HogliteClient.BatchRead("probe-${UUID.randomUUID()}", "SELECT 1"))) != null
+        }
+
+    @Test
+    fun `a list of N catalogs is a constant number of round trips, counted at the wire`() {
+        val prefix = "lst${UUID.randomUUID().toString().take(8)}-"
+        val registry = "${prefix}__hoglake_registry"
+        val n = 30
+        val names = (0 until n).map { "c%02d".format(it) }
+        prefixedStore(prefix).apply { names.forEach { createCatalog(it, "s3://hoglake-it/$prefix$it") } }
+        val batches = engineBatches()
+        CountingProxy(metricsUrl.removeSuffix("/metrics")).use { proxy ->
+            // A fresh process: nothing cached, no tenant migrated yet.
+            val store = prefixedStore(prefix, proxy.url)
+            val listed = store.listCatalogs(null)
+            assertThat(listed.map { it.name }).containsExactlyElementsOf(names)
+            assertThat(listed.map { it.dataPath }).containsExactlyElementsOf(names.map { "s3://hoglake-it/$prefix$it" })
+            val total = proxy.counts.values.sumOf { it.get() }
+            // The registry once, whatever N is (it was 1 + N, then 8
+            // migration probes per tenant on top in a fresh process).
+            assertThat(proxy.count("POST /v1/t/$registry/query")).isEqualTo(1)
+            assertThat(proxy.counts.keys.filter { it.endsWith("/tx") }).isEmpty()
+            if (batches) {
+                // ... and every catalog's meta row in ONE batch: 2 round trips.
+                assertThat(proxy.count("POST /v1/query-batch")).isEqualTo(1)
+                assertThat(total).isEqualTo(2)
+            } else {
+                // An engine without /v1/query-batch: its 404, then one meta
+                // read per catalog, in parallel.
+                assertThat(total).isEqualTo(n + 2)
+            }
+        }
+    }
+
+    @Test
+    fun `a background sweep reads the registry once and binds each catalog to the tenant it named`() {
+        val prefix = "swp${UUID.randomUUID().toString().take(8)}-"
+        val registry = "${prefix}__hoglake_registry"
+        val n = 12
+        prefixedStore(prefix).apply { (0 until n).forEach { createCatalog("c$it", "s3://hoglake-it/$prefix$it") } }
+        CountingProxy(metricsUrl.removeSuffix("/metrics")).use { proxy ->
+            val store = prefixedStore(prefix, proxy.url)
+            val results = HogliteExpiry(store, purgePage = 100, purgeBudgetMs = 10_000).runOnceAllCatalogs(100)
+            assertThat(results).hasSize(n)
+            // One registry read for the sweep, not one per catalog.
+            assertThat(proxy.count("POST /v1/t/$registry/query")).isEqualTo(1)
+            assertThat(proxy.counts.keys.filter { registry in it }).containsExactly("POST /v1/t/$registry/query")
+
+            // A sweep the lease withdraws stops before the next catalog.
+            var asked = 0
+            val partial =
+                HogliteExpiry(store, purgePage = 100, purgeBudgetMs = 10_000).runOnceAllCatalogs(100) { ++asked <= 3 }
+            assertThat(partial).hasSize(3)
+        }
+    }
+
+    @Test
+    fun `one process holds a loop's lease, renews it, releases it, and loses it only once expired`() {
+        val prefix = "lease${UUID.randomUUID().toString().take(8)}-"
+        val store = prefixedStore(prefix)
+        // No registry yet: no catalog, so nobody needs to sweep.
+        assertThat(HogliteLoopLease(store, "cleanup", 60_000, holder = "p0").acquire()).isFalse()
+        store.ensureRegistry()
+
+        // P processes racing for the lease: exactly one wins.
+        val p = 8
+        val pool = Executors.newFixedThreadPool(p)
+        val go = java.util.concurrent.CountDownLatch(1)
+        val leases = (1..p).map { HogliteLoopLease(prefixedStore(prefix), "cleanup", 60_000, holder = "p$it") }
+        val won = leases.map { l -> pool.submit<Boolean> { go.await().let { l.acquire() } } }
+        go.countDown()
+        assertThat(won.map { it.get(30, TimeUnit.SECONDS) }.count { it }).isEqualTo(1)
+        pool.shutdown()
+        val holder = leases.single { it.held }
+        val other = leases.first { !it.held }
+        // The holder renews; the others keep losing; another loop's lease is separate.
+        assertThat(holder.acquire()).isTrue()
+        assertThat(other.acquire()).isFalse()
+        assertThat(HogliteLoopLease(store, "expiry", 60_000, holder = "p0").acquire()).isTrue()
+        // Released on shutdown: the next process takes it at once.
+        holder.release()
+        assertThat(other.acquire()).isTrue()
+
+        // Expiry: a holder that stops renewing is replaced after the TTL,
+        // and finds out at its next renewal.
+        val now = AtomicReference(System.currentTimeMillis() + 120_000)
+        val a = HogliteLoopLease(store, "hydrator", 60_000, holder = "a", clock = { now.get() })
+        val b = HogliteLoopLease(store, "hydrator", 60_000, holder = "b", clock = { now.get() })
+        assertThat(a.acquire()).isTrue()
+        now.set(now.get() + 30_000)
+        assertThat(b.acquire()).isFalse()
+        assertThat(a.renewIfDue()).isTrue()
+        now.set(now.get() + 60_001)
+        assertThat(b.acquire()).isTrue()
+        assertThat(a.renewIfDue()).isFalse()
+        assertThat(a.held).isFalse()
+    }
+
+    @Test
+    fun `a list while a catalog is dropped and recreated never shows a dropped incarnation`() {
+        val prefix = "churn${UUID.randomUUID().toString().take(8)}-"
+        val store = prefixedStore(prefix)
+        val stable = (0 until 5).map { "s$it" }
+        stable.forEach { store.createCatalog(it, "s3://hoglake-it/$prefix$it") }
+
+        fun path(gen: Int) = "s3://hoglake-it/${prefix}x/gen-$gen"
+        store.createCatalog("x", path(0))
+        // Generations: `created` once create returns, `begun` before the
+        // drop of the previous one starts.
+        val created = AtomicInteger(0)
+        val begun = AtomicInteger(0)
+        val stop = java.util.concurrent.atomic.AtomicBoolean(false)
+        val listsDone = AtomicInteger(0)
+        val churn =
+            Executors.newSingleThreadExecutor().submit {
+                for (gen in 1..12) {
+                    begun.set(gen)
+                    store.dropCatalog("x", null, null)
+                    store.createCatalog("x", path(gen))
+                    created.set(gen)
+                    // Live until the lister has run twice, so lists see
+                    // every incarnation of x as well as the gaps between
+                    // them, however slow a list racing a delete is.
+                    val seen = listsDone.get()
+                    val until = System.nanoTime() + 20_000_000_000L
+                    while (listsDone.get() < seen + 2 && System.nanoTime() < until) Thread.sleep(5)
+                }
+                stop.set(true)
+            }
+        val lister = prefixedStore(prefix)
+        var lists = 0
+        var sawX = 0
+        while (!stop.get()) {
+            val lo = created.get()
+            val listed = lister.listCatalogs(null)
+            val hi = begun.get()
+            lists = listsDone.incrementAndGet()
+            assertThat(listed.map { it.name }).containsAll(stable)
+            val x = listed.filter { it.name == "x" }
+            assertThat(x.size).isLessThanOrEqualTo(1)
+            x.singleOrNull()?.let {
+                sawX++
+                val gen = it.dataPath.substringAfterLast("gen-").toInt()
+                // Not an incarnation dropped before the list began, and
+                // not one created after it ended.
+                assertThat(gen).describedAs("listed generation of x").isBetween(lo, hi)
+            }
+        }
+        churn.get(120, TimeUnit.SECONDS)
+        assertThat(lists).isGreaterThanOrEqualTo(24)
+        assertThat(sawX).describedAs("lists that saw a live x").isGreaterThanOrEqualTo(12)
+        store.dropCatalog("x", null, null)
+        assertThat(lister.listCatalogs(null).map { it.name }).containsExactlyElementsOf(stable)
+        println("churn: $lists lists, x listed in $sawX")
+    }
 }

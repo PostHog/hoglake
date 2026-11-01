@@ -110,12 +110,22 @@ internal class HogliteCompaction(
             runSweep(catalog, cfg)
         }
 
-    fun runOnceAllCatalogs(cfg: CompactionConfig = defaults): List<Pair<String, CompactionResult>> {
-        val names = store.listCatalogNames().shuffled()
+    /**
+     * One registry read for the sweep; each catalog bound to the tenant it
+     * named. [continueSweep] (the loop lease) is asked before each catalog.
+     */
+    fun runOnceAllCatalogs(
+        cfg: CompactionConfig = defaults,
+        continueSweep: () -> Boolean = { true },
+    ): List<Pair<String, CompactionResult>> {
+        val catalogs = store.catalogTenants().shuffled()
         val results = mutableListOf<Pair<String, CompactionResult>>()
-        for (name in names) {
+        for ((name, tenant) in catalogs) {
+            if (!continueSweep()) break
             try {
-                results += name to runOnce(name, cfg, MaintenanceTrigger.LOOP)
+                results +=
+                    name to
+                    store.catalogOperation(name, tenant = tenant) { runOnce(name, cfg, MaintenanceTrigger.LOOP) }
             } catch (e: InterruptedException) {
                 Thread.currentThread().interrupt()
                 throw e
