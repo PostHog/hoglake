@@ -42,6 +42,7 @@ from .errors import (
     IdlessFilesPresentError,
     IncarnationChangedError,
     NotFoundError,
+    ObjectPrefixViolationError,
     OffsetRegressionError,
     ReadSnapshotExpiredError,
     ReconciliationRequiredError,
@@ -142,12 +143,15 @@ logger = logging.getLogger("pyhoglake")
 # carries no expected_table_uuid field (name-only resolution).
 UNGUARDED = object()
 
-# The 409/410 codes whose recovery is "re-read the table and prepare a
-# new request", never "replay this payload". The server says the same
-# thing in the body as `retry: re-prepare`.
-_RE_PREPARE_ERRORS: dict[str, type[HoglakeError]] = {
-    "ddl_since_read_snapshot": DdlSinceReadSnapshotError,
-    "table_recreated": IncarnationChangedError,
+# The codes whose recovery is "re-read the table and prepare a new
+# request", never "replay this payload", with the status each comes
+# with. The server says the same thing in the body as `retry: re-prepare`.
+# (A commit's 410 is the fourth; `_commit` types it, since a changefeed's
+# 410 carries the same `expired` code.)
+_RE_PREPARE_ERRORS: dict[str, tuple[int, type[HoglakeError]]] = {
+    "ddl_since_read_snapshot": (409, DdlSinceReadSnapshotError),
+    "table_recreated": (409, IncarnationChangedError),
+    "object_prefix_violation": (422, ObjectPrefixViolationError),
 }
 
 # 409 `catalog_not_empty`'s `reason` -> its typed refusal. Keyed off each
@@ -340,16 +344,24 @@ def _re_prepare_error(code: str, body: Any, detail: str | None) -> HoglakeError:
     """
     fields = body if isinstance(body, dict) else {}
     tables = tuple(fields.get("tables") or ())
+    status, _ = _RE_PREPARE_ERRORS[code]
     if code == "table_recreated":
         return IncarnationChangedError(
             code,
-            status_code=409,
+            status_code=status,
+            detail=detail,
+            table=tables[0] if tables else None,
+        )
+    if code == "object_prefix_violation":
+        return ObjectPrefixViolationError(
+            code,
+            status_code=status,
             detail=detail,
             table=tables[0] if tables else None,
         )
     return DdlSinceReadSnapshotError(
         code,
-        status_code=409,
+        status_code=status,
         detail=detail,
         tables=tables,
         read_snapshot=fields.get("read_snapshot"),
@@ -779,7 +791,12 @@ class HoglakeClient:
         # acts on those rather than on the detail prose. The CODE is the
         # contract — this used to be a search for the phrase "the table
         # was recreated" inside `detail`.
-        if resp.status_code == 409 and message in _RE_PREPARE_ERRORS:
+        # A str first: a body's `error` can be anything, and a dict would
+        # not hash, on any status.
+        re_prepare = (
+            _RE_PREPARE_ERRORS.get(message) if isinstance(message, str) else None
+        )
+        if re_prepare is not None and resp.status_code == re_prepare[0]:
             raise _re_prepare_error(message, body, detail)
         # Same reasoning: the drop's `reason` is the contract, so the TYPE
         # is chosen off it rather than off the detail prose.
