@@ -17,6 +17,9 @@ features = ["python"]
 module-name = "pyhoglake_variant_codec"
 
 [tool.uv]
+# Supply-chain cooldown (semgrep uv-missing-dependency-cooldown): resolve
+# only package versions published at least 7 days ago.
+exclude-newer = "7 days"
 # Rebuild the editable install when the Rust changes.
 cache-keys = [
     { file = "pyproject.toml" },
