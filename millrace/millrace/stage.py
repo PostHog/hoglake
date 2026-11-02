@@ -756,13 +756,13 @@ class PartitionStage:
         return deleted
 
     async def pinned_table_uuid(self) -> str | None:
-        """The incarnation this stage's rows were first committed to."""
+        """The incarnation this stage's rows commit to (see keyspace)."""
         self._ensure_open()
         raw = await self._db.get(keyspace.TABLE_UUID_KEY)
         return None if raw is None else bytes(raw).decode("utf-8")
 
     async def pin_table_uuid(self, table_uuid: str) -> None:
-        """Durably record the incarnation (first commit only)."""
+        """Durably record the incarnation (first commit, or a re-pin)."""
         self._ensure_open()
         batch = WriteBatch()
         batch.put(keyspace.TABLE_UUID_KEY, table_uuid.encode("utf-8"))

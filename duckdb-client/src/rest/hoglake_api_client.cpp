@@ -58,13 +58,19 @@ struct JsonMutDoc {
 	yyjson_mut_doc *doc;
 };
 
-void AddDDLMetadata(JsonMutDoc &body, yyjson_mut_val *root, const string &message) {
-	yyjson_mut_obj_add_strcpy(body.doc, root, "author", "duckdb-client");
+//! With a credential, the server takes the author from the token and refuses
+//! a tenant request claiming a different one, so `author` is only sent when
+//! unauthenticated — where it is still the only attribution there is.
+void AddDDLMetadata(JsonMutDoc &body, yyjson_mut_val *root, const string &message, bool claim_author) {
+	if (claim_author) {
+		yyjson_mut_obj_add_strcpy(body.doc, root, "author", "duckdb-client");
+	}
 	yyjson_mut_obj_add_strcpy(body.doc, root, "message", message.c_str());
 }
 
-string DDLMetadataQuery(const string &message) {
-	return "?author=duckdb-client&message=" + HoglakeApiClient::EncodeSegment(message);
+string DDLMetadataQuery(const string &message, bool claim_author) {
+	return string(claim_author ? "?author=duckdb-client&" : "?") +
+	       "message=" + HoglakeApiClient::EncodeSegment(message);
 }
 
 string GetString(yyjson_val *obj, const char *key, const string &default_value = string()) {
@@ -354,8 +360,19 @@ yyjson_val *ParseArrayResponse(JsonDoc &doc, const string &what) {
 // Transport
 //===--------------------------------------------------------------------===//
 
-HoglakeApiClient::HoglakeApiClient(string endpoint_url, string catalog_name_p)
-    : endpoint(std::move(endpoint_url)), catalog_name(std::move(catalog_name_p)) {
+HoglakeApiClient::HoglakeApiClient(string endpoint_url, string catalog_name_p, HoglakeAuthOptions auth_p)
+    : endpoint(std::move(endpoint_url)), catalog_name(std::move(catalog_name_p)), auth(std::move(auth_p)) {
+	if (!auth.token.empty() && auth.UsesClientCredentials()) {
+		throw InvalidInputException("hoglake: set either TOKEN or TOKEN_URL/CLIENT_ID/CLIENT_SECRET, not both");
+	}
+	if (auth.UsesClientCredentials() && (auth.client_id.empty() || auth.client_secret.empty())) {
+		throw InvalidInputException("hoglake: TOKEN_URL requires CLIENT_ID and CLIENT_SECRET");
+	}
+	if (auth.UsesClientCredentials() && !StringUtil::StartsWith(auth.token_url, "http://")) {
+		throw InvalidInputException("hoglake: TOKEN_URL must be an http:// URL (the vendored HTTP client is built "
+		                            "without TLS), got \"%s\"",
+		                            auth.token_url);
+	}
 	while (!endpoint.empty() && endpoint.back() == '/') {
 		endpoint.pop_back();
 	}
@@ -400,24 +417,101 @@ string HoglakeApiClient::TravelQuery(const HoglakeTravel &travel) {
 	return string();
 }
 
+//! A 401 is retried ONCE with a freshly minted token, which is safe for
+//! writes too: hoglake decides authentication before any handler runs, so a
+//! 401 means the request did nothing. A fixed TOKEN cannot be refreshed, so
+//! its 401 is final.
 HoglakeApiClient::Response HoglakeApiClient::Request(const string &method, const string &path,
                                                      const string &json_body) {
+	auto token = CurrentToken();
+	auto response = SendOnce(method, path, json_body, token);
+	if (response.status != 401 || !auth.UsesClientCredentials()) {
+		return response;
+	}
+	InvalidateToken(token);
+	return SendOnce(method, path, json_body, CurrentToken());
+}
+
+string HoglakeApiClient::CurrentToken() {
+	if (!auth.UsesClientCredentials()) {
+		return auth.token;
+	}
+	// one lock: threads that all find the token stale mint once
+	std::lock_guard<std::mutex> guard(token_lock);
+	if (cached_token.empty() || std::chrono::steady_clock::now() >= refresh_at) {
+		MintToken();
+	}
+	return cached_token;
+}
+
+void HoglakeApiClient::InvalidateToken(const string &token) {
+	std::lock_guard<std::mutex> guard(token_lock);
+	if (cached_token == token) {
+		cached_token.clear();
+	}
+}
+
+void HoglakeApiClient::MintToken() {
+	// split http://host[:port]/path into the client base and the request path
+	auto scheme_end = auth.token_url.find("://");
+	auto path_start = auth.token_url.find('/', scheme_end + 3);
+	auto base = path_start == string::npos ? auth.token_url : auth.token_url.substr(0, path_start);
+	auto token_path = path_start == string::npos ? string("/") : auth.token_url.substr(path_start);
+
+	duckdb_httplib::Client client(base);
+	client.set_connection_timeout(10, 0);
+	client.set_read_timeout(10, 0);
+	client.set_basic_auth(auth.client_id, auth.client_secret);
+	duckdb_httplib::Headers headers {{"User-Agent", USER_AGENT}, {"Accept", "application/json"}};
+	auto body = "grant_type=client_credentials&audience=" + EncodeSegment(auth.audience);
+	auto result = client.Post(token_path, headers, body, "application/x-www-form-urlencoded");
+	if (!result) {
+		throw IOException("hoglake: could not reach the token endpoint %s: %s", auth.token_url,
+		                  duckdb_httplib::to_string(result.error()));
+	}
+	if (result->status != 200) {
+		// an RFC 6749 §5.2 error object; carries no secrets
+		throw IOException("hoglake: token endpoint %s answered HTTP %d: %s", auth.token_url, result->status,
+		                  result->body);
+	}
+	JsonDoc doc(result->body);
+	auto root = doc.Root();
+	if (!root || !yyjson_is_obj(root)) {
+		throw IOException("hoglake: token endpoint %s returned a non-JSON body", auth.token_url);
+	}
+	auto access_token = GetString(root, "access_token");
+	auto expires_in = GetBoundedInt(root, "expires_in", 0, 86400 * 365);
+	if (access_token.empty() || expires_in <= 0) {
+		throw IOException("hoglake: token endpoint %s returned no usable token", auth.token_url);
+	}
+	// refresh a minute early, or a fifth of the lifetime if that is shorter
+	auto margin = MinValue<int64_t>(60, expires_in / 5);
+	cached_token = access_token;
+	refresh_at = std::chrono::steady_clock::now() + std::chrono::seconds(expires_in - margin);
+}
+
+HoglakeApiClient::Response HoglakeApiClient::SendOnce(const string &method, const string &path, const string &json_body,
+                                                      const string &token) {
 	duckdb_httplib::Client client(endpoint);
 	client.set_connection_timeout(10, 0);
 	client.set_read_timeout(30, 0);
 	client.set_write_timeout(30, 0);
+	duckdb_httplib::Headers headers {{"User-Agent", USER_AGENT}};
+	if (!token.empty()) {
+		headers.emplace("Authorization", "Bearer " + token);
+	}
 
 	duckdb_httplib::Result result;
 	if (method == "GET") {
-		result = client.Get(path);
+		result = client.Get(path, headers);
 	} else if (method == "POST") {
-		result = client.Post(path, json_body, "application/json");
+		result = client.Post(path, headers, json_body, "application/json");
 	} else if (method == "PUT") {
-		result = client.Put(path, json_body, "application/json");
+		result = client.Put(path, headers, json_body, "application/json");
 	} else if (method == "PATCH") {
-		result = client.Patch(path, json_body, "application/json");
+		result = client.Patch(path, headers, json_body, "application/json");
 	} else if (method == "DELETE") {
-		result = client.Delete(path);
+		result = client.Delete(path, headers);
 	} else {
 		throw InternalException("hoglake: unknown HTTP method %s", method);
 	}
@@ -478,6 +572,24 @@ void HoglakeApiClient::ThrowFor(const Response &response, const string &what, bo
 	case 400:
 	case 422:
 		throw InvalidInputException("%s", message);
+	case 401:
+		// the server's code (invalid_request, invalid_signature, expired, ...)
+		// does not say which ATTACH option is at fault; this does
+		if (!auth.Configured()) {
+			throw PermissionException("%s (HTTP 401: the server requires a credential; ATTACH with TOKEN '...' or "
+			                          "TOKEN_URL, CLIENT_ID and CLIENT_SECRET)",
+			                          message);
+		}
+		if (!auth.UsesClientCredentials()) {
+			throw PermissionException("%s (HTTP 401: the server refused TOKEN; a fixed token is never refreshed)",
+			                          message);
+		}
+		throw PermissionException("%s (HTTP 401: the server refused the token minted from %s, also after minting "
+		                          "a fresh one)",
+		                          message, auth.token_url);
+	case 403:
+		throw PermissionException("%s (HTTP 403: the credential lacks the scope this needs on catalog \"%s\")",
+		                          message, catalog_name);
 	case 404:
 		throw CatalogException("%s", message);
 	case 409:
@@ -529,7 +641,7 @@ HoglakeCatalogInfo HoglakeApiClient::CreateCatalog(const string &data_path) {
 	yyjson_mut_doc_set_root(body.doc, root);
 	yyjson_mut_obj_add_strcpy(body.doc, root, "name", catalog_name.c_str());
 	yyjson_mut_obj_add_strcpy(body.doc, root, "data_path", data_path.c_str());
-	AddDDLMetadata(body, root, "CREATE CATALOG " + catalog_name);
+	AddDDLMetadata(body, root, "CREATE CATALOG " + catalog_name, !Authenticated());
 	auto response = Request("POST", "/v1/catalogs", body.Write());
 	if (response.status != 201) {
 		ThrowFor(response, "create catalog");
@@ -563,7 +675,7 @@ void HoglakeApiClient::CreateNamespace(const string &name) {
 	auto root = yyjson_mut_obj(body.doc);
 	yyjson_mut_doc_set_root(body.doc, root);
 	yyjson_mut_obj_add_strcpy(body.doc, root, "name", name.c_str());
-	AddDDLMetadata(body, root, "CREATE SCHEMA " + name);
+	AddDDLMetadata(body, root, "CREATE SCHEMA " + name, !Authenticated());
 	auto response = Request("POST", CatalogPath("/namespaces"), body.Write());
 	if (response.status != 201) {
 		ThrowFor(response, "create namespace \"" + name + "\"");
@@ -614,7 +726,7 @@ HoglakeTableInfo HoglakeApiClient::CreateTable(const string &ns, const string &n
 	auto root = yyjson_mut_obj(body.doc);
 	yyjson_mut_doc_set_root(body.doc, root);
 	yyjson_mut_obj_add_strcpy(body.doc, root, "name", name.c_str());
-	AddDDLMetadata(body, root, "CREATE TABLE " + ns + "." + name);
+	AddDDLMetadata(body, root, "CREATE TABLE " + ns + "." + name, !Authenticated());
 	auto cols = yyjson_mut_obj_add_arr(body.doc, root, "columns");
 	for (auto &col : columns) {
 		auto col_obj = yyjson_mut_arr_add_obj(body.doc, cols);
@@ -636,10 +748,10 @@ HoglakeTableInfo HoglakeApiClient::CreateTable(const string &ns, const string &n
 }
 
 HoglakeCommitResult HoglakeApiClient::DropTable(const string &ns, const string &table) {
-	auto response =
-	    Request("DELETE", CatalogPath("/namespaces/" + EncodeSegment(ns) + "/tables/" + EncodeSegment(table)) +
-	                DDLMetadataQuery("DROP TABLE " + ns + "." + table),
-	            string());
+	auto response = Request("DELETE",
+	                        CatalogPath("/namespaces/" + EncodeSegment(ns) + "/tables/" + EncodeSegment(table)) +
+	                            DDLMetadataQuery("DROP TABLE " + ns + "." + table, !Authenticated()),
+	                        string());
 	if (response.status != 200) {
 		ThrowFor(response, "drop table \"" + ns + "." + table + "\"");
 	}
@@ -675,7 +787,7 @@ HoglakeViewInfo HoglakeApiClient::CreateView(const string &ns, const string &nam
 	yyjson_mut_obj_add_strcpy(body.doc, root, "name", name.c_str());
 	yyjson_mut_obj_add_strcpy(body.doc, root, "sql", sql.c_str());
 	yyjson_mut_obj_add_strcpy(body.doc, root, "dialect", dialect.c_str());
-	AddDDLMetadata(body, root, "CREATE VIEW " + ns + "." + name);
+	AddDDLMetadata(body, root, "CREATE VIEW " + ns + "." + name, !Authenticated());
 	auto response = Request("POST", CatalogPath("/namespaces/" + EncodeSegment(ns) + "/views"), body.Write());
 	if (response.status != 201) {
 		ThrowFor(response, "create view \"" + ns + "." + name + "\"");
@@ -685,9 +797,10 @@ HoglakeViewInfo HoglakeApiClient::CreateView(const string &ns, const string &nam
 }
 
 HoglakeCommitResult HoglakeApiClient::DropView(const string &ns, const string &view) {
-	auto response = Request(
-	    "DELETE", CatalogPath("/namespaces/" + EncodeSegment(ns) + "/views/" + EncodeSegment(view)) +
-	                  DDLMetadataQuery("DROP VIEW " + ns + "." + view), string());
+	auto response = Request("DELETE",
+	                        CatalogPath("/namespaces/" + EncodeSegment(ns) + "/views/" + EncodeSegment(view)) +
+	                            DDLMetadataQuery("DROP VIEW " + ns + "." + view, !Authenticated()),
+	                        string());
 	if (response.status != 200) {
 		ThrowFor(response, "drop view \"" + ns + "." + view + "\"");
 	}
@@ -828,7 +941,7 @@ HoglakeTableInfo HoglakeApiClient::AlterTable(const string &ns, const string &ta
 	JsonMutDoc body;
 	auto root = yyjson_mut_obj(body.doc);
 	yyjson_mut_doc_set_root(body.doc, root);
-	AddDDLMetadata(body, root, "ALTER TABLE " + ns + "." + table);
+	AddDDLMetadata(body, root, "ALTER TABLE " + ns + "." + table, !Authenticated());
 	auto ops_arr = yyjson_mut_obj_add_arr(body.doc, root, "ops");
 	for (auto &op : ops) {
 		auto op_obj = yyjson_mut_arr_add_obj(body.doc, ops_arr);

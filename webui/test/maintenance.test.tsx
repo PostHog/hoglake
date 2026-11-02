@@ -369,6 +369,30 @@ describe("maintenance outcome and history", () => {
     ).toHaveAttribute("title", expect.stringContaining("their files were not read"));
   });
 
+  it("shows object-prefix quarantines and unresolvable groups, and only when there are some", () => {
+    const sweep = maintenanceRunsFixture.find((r) => r.task === "hydrator" && r.trigger === "loop")!;
+    const quarantining = {
+      ...sweep,
+      result: { claimed: "5", hydrated: "5", failed: "0", transient: "0", quarantined: "2" },
+    } as MaintenanceRun;
+    const hydrator = render(<RunSummary run={quarantining} />);
+    expect(screen.getByText(/2 quarantined/)).toHaveAttribute("title", expect.stringContaining("does not prove"));
+    hydrator.unmount();
+    const refusing = render(
+      <RunSummary run={{ ...compaction, result: { ...compaction.result!, object_prefix_unresolvable: "4" } }} />,
+    );
+    expect(screen.getByText(/4 group\(s\) with no object prefix/)).toHaveAttribute(
+      "title",
+      expect.stringContaining("broken invariant"),
+    );
+    refusing.unmount();
+    // Pre-2.1c/2.1d rows (no counter) and zeros read the same: nothing shown.
+    render(<RunSummary run={sweep} />);
+    render(<RunSummary run={compaction} />);
+    expect(screen.queryByText(/quarantined/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/with no object prefix/)).not.toBeInTheDocument();
+  });
+
   it("hides the held-elsewhere counts when both are zero or absent", () => {
     render(<RunSummary run={compaction} />);
     expect(screen.queryByText(/held by other runs:/)).not.toBeInTheDocument();
@@ -592,6 +616,7 @@ describe("isQuietRun", () => {
     ["hydrator", "failed"],
     ["hydrator", "transient"],
     ["hydrator", "stats_skipped_below_floor"],
+    ["hydrator", "quarantined"],
     ["expiry", "snapshots_expired"],
     ["expiry", "data_files_queued"],
     ["expiry", "delete_files_queued"],
@@ -612,6 +637,8 @@ describe("isQuietRun", () => {
     ["compaction", "unconvertible_schema"],
     ["compaction", "invalid_data"],
     ["compaction", "failed_groups"],
+    // A broken invariant on an object-prefix table, not a configured bound.
+    ["compaction", "object_prefix_unresolvable"],
   ] as const)("keeps a %s run whose %s is nonzero", (task, field) => {
     expect(isQuietRun(withField(quiet[task], field, "1"))).toBe(false);
   });

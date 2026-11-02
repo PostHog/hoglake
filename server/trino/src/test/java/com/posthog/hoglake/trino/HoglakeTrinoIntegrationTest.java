@@ -557,8 +557,8 @@ class HoglakeTrinoIntegrationTest
      *
      * <p>The guard itself SHIPPED: {@code AlterService} refuses
      * {@code rename_column} with 409 {@code idless_files_present} while any
-     * live file is flagged {@code missing_field_ids} or is still
-     * {@code pending}. This test is not evidence against it — it is the
+     * live file is flagged {@code missing_field_ids}. This test is not
+     * evidence against it — it is the
      * documented hole in it (README "The field-id contract's blind spot"):
      * {@code missing_field_ids} is written only by the hydrator's footer
      * read, and the hydrator only sweeps {@code pending} files. A commit

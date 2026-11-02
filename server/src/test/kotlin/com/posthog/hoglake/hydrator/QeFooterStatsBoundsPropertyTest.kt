@@ -419,6 +419,9 @@ class QeFooterStatsBoundsPropertyTest {
             // pyarrow/DuckDB write INT32 + INT(32, unsigned).
             add(ColType.UINT32 to "int32/uint32")
             add(ColType.UINT32 to "int64")
+            // A uint8/uint16 column's files after a promote to uint32.
+            add(ColType.UINT32 to "int32/uint8")
+            add(ColType.UINT32 to "int32/uint16")
             // long: the plain signed case, plus the zero-extension cases
             // a foreign writer produces — arrow and DuckDB emit unsigned
             // data as INT32 + INT(w, unsigned), and long's domain holds

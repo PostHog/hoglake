@@ -8,10 +8,12 @@ import pytest
 
 from millrace.config import (
     AutoOffsetReset,
+    ColumnSpec,
     Config,
     ConfigError,
     PartitionFieldSpec,
     SortFieldSpec,
+    _check_fields_against_columns,
     load_config,
 )
 
@@ -612,7 +614,7 @@ class TestTableColumns:
             ("props:struct", "nested type 'struct'"),
             ("tags:list", "nested type 'list'"),
             ("m:map", "nested type 'map'"),
-            ("v:variant", "variant"),
+            ("v:variant", "map it in MILLRACE_VARIANT_SOURCES"),
             ("team_id:long,team_id:string", "duplicated"),
             ("bad.col:long", "not a valid hoglake identifier"),
             ("_hog_row_id:long", "reserved prefix"),
@@ -855,6 +857,132 @@ class TestSortBy:
         )
         assert "MILLRACE_SORT_BY column 'timestamp'" in p
         assert "MILLRACE_TABLE_COLUMNS" in p
+
+
+def test_a_variant_column_is_no_partition_or_sort_source():
+    """Refused by type in the cross-check itself, not only because the
+    column grammar refuses a variant today: the server refuses a variant
+    partition or sort source, pyhoglake's check_transform takes
+    identity(v), and lifting the grammar refusal must not let the create
+    422. One problem per field: bucket(v) is not also handed to
+    check_transform, whose own refusal would be a second, other reason.
+    Driven directly, since the grammar stops a variant before it."""
+    columns = (ColumnSpec("team_id", "long"), ColumnSpec("v", "variant"))
+    found: list[str] = []
+    _check_fields_against_columns(
+        columns,
+        (
+            PartitionFieldSpec("v", "identity"),
+            PartitionFieldSpec("v", "bucket", 16),
+            PartitionFieldSpec("team_id", "identity"),
+        ),
+        (SortFieldSpec("v"), SortFieldSpec("team_id")),
+        found,
+    )
+    assert found == [
+        (
+            "MILLRACE_PARTITION_BY identity(v): 'v' is a variant column, which is "
+            "no partition source"
+        ),
+        (
+            "MILLRACE_PARTITION_BY bucket(v, 16): 'v' is a variant column, which "
+            "is no partition source"
+        ),
+        "MILLRACE_SORT_BY column 'v' is a variant column, which is no sort source",
+    ]
+
+
+class TestVariantSources:
+    """MILLRACE_VARIANT_SOURCES: ``column=payload_key,…``. Whether each
+    column is a top-level variant is the flusher's startup check
+    (test_flush_variant.py), against the live catalog."""
+
+    @pytest.mark.parametrize("raw", [None, "", "   "])
+    def test_unset_or_empty_maps_nothing(self, raw):
+        env = (
+            MINIMAL_ENV
+            if raw is None
+            else MINIMAL_ENV | {"MILLRACE_VARIANT_SOURCES": raw}
+        )
+        assert load(env).variant_sources == ()
+
+    def test_entries_parse_in_order_trimmed(self):
+        cfg = load(
+            MINIMAL_ENV
+            | {"MILLRACE_VARIANT_SOURCES": " properties_sv = properties ,b=$set=x,"}
+        )
+        assert cfg.variant_sources == (
+            ("properties_sv", "properties"),
+            ("b", "$set=x"),
+        )
+
+    @pytest.mark.parametrize(
+        ("value", "needle"),
+        [
+            ("properties_sv", "is not column=payload_key"),
+            ("=properties", "is not column=payload_key"),
+            ("properties_sv=", "is not column=payload_key"),
+            (
+                "bad.col=properties",
+                "column 'bad.col' is not a valid hoglake identifier",
+            ),
+            ("a=x,a=y", "column 'a' is duplicated"),
+            (",", "is set but contains no entries"),
+        ],
+    )
+    def test_refusals_name_the_knob(self, value, needle):
+        found = problems(MINIMAL_ENV | {"MILLRACE_VARIANT_SOURCES": value})
+        assert [p for p in found if "MILLRACE_VARIANT_SOURCES" in p and needle in p], (
+            found
+        )
+
+    def test_every_bad_entry_is_reported_at_once(self):
+        found = problems(
+            MINIMAL_ENV | {"MILLRACE_VARIANT_SOURCES": "a,b=,c.d=x,e=x,e=y,f=ok"}
+        )
+        assert len(found) == 4, found
+
+
+class TestStageRepinFrom:
+    """MILLRACE_STAGE_REPIN_FROM: the uuid of the table a planned move
+    leaves (test_flush_contract.py pins the re-pin itself)."""
+
+    @pytest.mark.parametrize("raw", [None, "", "   "])
+    def test_unset_or_empty_repins_nothing(self, raw):
+        env = (
+            MINIMAL_ENV
+            if raw is None
+            else MINIMAL_ENV | {"MILLRACE_STAGE_REPIN_FROM": raw}
+        )
+        assert load(env).stage_repin_from is None
+
+    def test_a_uuid_is_kept_lowercase_as_the_server_writes_it(self):
+        cfg = load(
+            MINIMAL_ENV
+            | {"MILLRACE_STAGE_REPIN_FROM": " 0B8EE9BA-79A1-4F3E-B7E5-6A0B6AB6F012 "}
+        )
+        assert cfg.stage_repin_from == "0b8ee9ba-79a1-4f3e-b7e5-6a0b6ab6f012"
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "events",
+            "0b8ee9ba-79a1",
+            "0b8ee9ba-79a1-4f3e-b7e5-6a0b6ab6f012x",
+            # Forms uuid.UUID would take (a typo then matches no pin).
+            "0b8ee9ba79a14f3eb7e56a0b6ab6f012",
+            "{0b8ee9ba-79a1-4f3e-b7e5-6a0b6ab6f012}",
+            "urn:uuid:0b8ee9ba-79a1-4f3e-b7e5-6a0b6ab6f012",
+        ],
+    )
+    def test_anything_else_is_refused(self, value):
+        expected = (
+            f"MILLRACE_STAGE_REPIN_FROM {value!r} is not a table uuid "
+            "(8-4-4-4-12 hex digits)"
+        )
+        assert problems(MINIMAL_ENV | {"MILLRACE_STAGE_REPIN_FROM": value}) == (
+            expected,
+        )
 
 
 # -- review additions: grammar edges ------------------------------------------------

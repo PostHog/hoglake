@@ -61,8 +61,9 @@ The harness never hammers a dead server: 10 consecutive
 transport/5xx failures abort the run (exit 3) with a clear message.
 
 Catalogs are `bench-*` prefixed and unique per run (run id in catalog
-name and data path), so runs never collide and need no cleanup — there
-is no catalog-delete API; bench catalogs are cheap metadata rows.
+name and data path), so runs never collide and need no cleanup — the
+catalog-delete API (`Catalog.drop`) drops only an empty catalog; bench
+catalogs are cheap metadata rows.
 Real objects are only written by `expiry-throughput` (real-parquet
 cleanup probes), `end-to-end-writer` and `analytics-lifecycle` (actual
 parquet), under `s3://hoglake-bench/<run-id>/`.
@@ -136,13 +137,12 @@ full 1.1.0 type system, respecting the server's nesting-depth cap (8)
 and per-table node cap (10,000), with bounds-stressing values baked in
 (planted integer domain extremes, NaN floats for the nan_count path,
 multi-KB strings and long-shared-prefix pairs). **`variant` is excluded,
-not faked**: pyarrow cannot write native Parquet VARIANT(1) and bench's
-write path is pyhoglake/pyarrow, so variant data cannot be honestly
-produced (`datagen.VARIANT_EXCLUSION_REASON`); `analytics-lifecycle`
+not faked** (`datagen.VARIANT_EXCLUSION_REASON`), though pyhoglake now
+writes VARIANT from JSON text (#464/#465); `analytics-lifecycle`
 still exercises variant *DDL* on a table that then drops.
 
 - **Many files, not a few giants**: facts/events aim for `--file-mb`
-  (default 32, clamped to 20-80), so compaction planning has real
+  (default 20, clamped to 20-80), so compaction planning has real
   candidates to rank. Small budgets over the 6-team x 6-month grid
   produce smaller partition files by construction.
 - **Realism without the cost**: [Faker](https://faker.readthedocs.io)

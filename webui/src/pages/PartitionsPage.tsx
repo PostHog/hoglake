@@ -85,8 +85,9 @@ export function PartitionsPage() {
         limit: LIMIT,
       }),
     enabled: Boolean(catalog),
-    refetchInterval: 5_000,
+    refetchInterval: 60_000,
     refetchIntervalInBackground: false,
+    refetchOnWindowFocus: true,
   });
   if (!catalog) return null;
 

@@ -214,6 +214,8 @@ class MaintenanceLedgerIntegrationTest {
                 // whose unknown range blocked an append.
                 "groups_retired",
                 "files_unranged",
+                // And the object-prefix planner refusal (2.1d).
+                "object_prefix_unresolvable",
             )
         for (counter in mergeSortCounters) {
             assertThat(result[counter]?.asLong())
@@ -322,6 +324,8 @@ class MaintenanceLedgerIntegrationTest {
             }.map { wireObjectMapper().valueToTree<JsonNode>(it.toDto())["result"] }
         val sweep = runs.single { it.has("claimed") }
         assertThat(sweep["stats_skipped_below_floor"].asLong()).isZero()
+        // The object-prefix check's `quarantined`, likewise.
+        assertThat(sweep["quarantined"].asLong()).isZero()
         assertThat(sweep["hydrated"].asLong()).isEqualTo(2)
         val manual = runs.single { it.has("requeued") }
         assertThat(manual.fieldNames().asSequence().toList()).containsExactly("requeued")

@@ -92,6 +92,7 @@ fun rewriteToLocal(
     maxNodesPerRow: Int = ParquetRewriter.DEFAULT_MAX_NODES_PER_ROW,
     codec: ParquetRewriter.OutputCodec = ParquetRewriter.OutputCodec(),
     spill: SortSpill? = if (sortFields.isEmpty()) null else roomySpill(),
+    variantCompaction: Boolean = false,
 ): ParquetRewriter.RewriteResult =
     ParquetRewriter.rewrite(
         inputs,
@@ -101,4 +102,5 @@ fun rewriteToLocal(
         maxNodesPerRow,
         codec,
         spill = spill,
+        variantCompaction = variantCompaction,
     )

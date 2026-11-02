@@ -54,6 +54,8 @@ shape behavior:
 | `MILLRACE_FLUSH_DEADLINE_S` | 900 | a group at least this old with ≥ 1 MiB staged flushes |
 | `MILLRACE_SLOW_LANE_DEADLINE_S` | 21600 | any group this old flushes |
 | `MILLRACE_KAFKA_AUTO_OFFSET_RESET` | `latest` | where a partition with no committed offset starts |
+| `MILLRACE_VARIANT_SOURCES` | unset | `column=payload_key,…`: the variant columns filled from a payload key's JSON text (see "VARIANT columns") |
+| `MILLRACE_STAGE_REPIN_FROM` | unset | the old `table_uuid`, for one rollout that moves `MILLRACE_TABLE` to a new table: each stage pinned to it re-pins and drains into the new table instead of halting (exit 3). Remove it once every pod has rolled |
 
 ## Destination
 
@@ -84,6 +86,124 @@ MILLRACE_PARTITION_BY=identity(team_id),day(timestamp)
 MILLRACE_SORT_BY=timestamp
 ```
 
+## VARIANT columns
+
+millrace never creates a variant column (`MILLRACE_TABLE_COLUMNS`
+refuses `variant`): an operator adds a nullable one to the live table
+with pyhoglake, `ops.add_column("properties_sv", "variant",
+shredding=...)`, and maps it to the payload key it is filled from:
+
+```
+MILLRACE_VARIANT_SOURCES=properties_sv=properties
+```
+
+The shredded layout comes from the live column's
+`type_params.shredding` only (no alter changes it), never from millrace
+configuration. A live variant column is not reported as a difference
+from `MILLRACE_TABLE_COLUMNS`, which cannot name one, so the operator
+adds it without touching that knob.
+
+**Text mode.** The producer sends the field as a JSON string holding
+JSON text (`JSON.stringify`). millrace takes that string, unparsed (the
+same value a `properties` string column stores), and each file's rows
+are encoded by pyhoglake's encoder, which reads the producer's own text
+strictly, in the build on the `millrace-hoglake` pool thread, never on
+the event loop.
+
+| The payload key holds | The column gets | Counted as |
+|---|---|---|
+| JSON text | the Variant value | `encoded` |
+| the text `null` | a Variant null | `encoded` |
+| nothing (absent), JSON `null`, `""` | SQL NULL | `sql_null` |
+| invalid text: not JSON, a duplicate key, a lone surrogate escape, `NaN`/`Infinity` or a number beyond the double range, an integer of more than 38 digits, nesting deeper than 128 | SQL NULL | `invalid` (by the encoder's reason) |
+| a value that is not a string (an object, a number) | SQL NULL | `invalid` (`not_text`) |
+| a string with a lone surrogate in the outer payload | SQL NULL | `invalid` (`invalid_unicode`) |
+
+The last two rows are reached only from a payload key no string column
+reads. When the mapped key is also a string column's, as `properties`
+is, that column's rules apply first: a value that is not a string, or
+an outer string holding a lone surrogate (which Arrow cannot store),
+drops the record (`uncastable_column`) before the variant is read. A
+key a `json` or numeric column also reads keeps that column's value,
+and the variant counts it `not_text`.
+
+**The variant never drops a row**: an invalid value is SQL NULL in the
+variant column and the row is kept. A variant column that is not mapped
+is written as all SQL NULL. Only the mapped key is read: a payload key
+of the variant column's own name is an unknown key, dropped from the
+row and counted like any other.
+
+**Refused at startup**: a NOT NULL variant column, mapped or not (its
+invalid and unmapped values have nowhere to go); a variant nested in a
+container, mapped or not (no writer shreds one); a mapping that names
+no top-level variant column of the table (missing, or another type); a
+declaration this pyhoglake cannot write; and a malformed entry (exit 2,
+at config).
+
+**Rollout**, in this order:
+
+1. deploy an image that reads `MILLRACE_VARIANT_SOURCES` on every
+   replica;
+2. enable server compaction of variant tables for the catalog
+   (`HOGLAKE_COMPACTION_VARIANT=true`, narrowed by
+   `HOGLAKE_COMPACTION_VARIANT_CATALOGS`): without it the server skips
+   the whole table and its small files are never rolled up;
+3. add the column (nullable, with its declaration);
+4. set `MILLRACE_VARIANT_SOURCES` and roll the fleet. Set it only on the
+   deployments whose table has the column: a mapping that names no
+   column of the table refuses startup.
+
+**Kill switch**: remove the column's entry and roll the fleet. The
+column is then written as SQL NULL, with no schema change. Rows written
+while the column is unmapped (before step 4, during its roll, or after
+the kill switch) keep it SQL NULL; nothing backfills them.
+
+**Dropping or renaming the column**: remove its entry and roll the
+fleet first. The next commit after the drop is refused
+(`ddl_since_read_snapshot`), and every rebuild on the re-read shape
+fails while the mapping names a column the table no longer has: the
+rows stay staged, but the groups go stuck until the entry is removed.
+
+**Rollback floor**: the first image that reads
+`MILLRACE_VARIANT_SOURCES` (the commit that added it to this README) is
+the oldest that starts on a table with a variant column. An image
+without that knob refuses to start once the column exists (and a
+running one fails every build), so never roll back past it after
+step 3.
+
+**CPU**: the encode costs about 33 µs per row and holds the GIL (about
+4.6 s per 256 MiB flush, so a build takes roughly 2.5× the CPU it did),
+so the startup drain and the steady-state build both get longer. Watch
+`millrace_flush_build_seconds_total{stage="variant_encode"}` against the
+other stages, and size the startup probe for the longer drain.
+
+**Memory**: the build carries a mapped column's source text twice (the
+string column and the variant's JSON text) through the sort and the
+fanout, plus each file's encoded storage, so a properties-heavy flush
+needs about twice the build's peak Arrow memory. Size the pod's memory
+limit before step 4.
+
+**Metrics** (labels come from the catalog and closed vocabularies only,
+never from payload keys):
+
+- `millrace_variant_rows_total{column, outcome}`, outcome `encoded`,
+  `sql_null` or `invalid`;
+- `millrace_variant_invalid_total{column, reason}`;
+- `millrace_variant_values_total{column, path, outcome}`, per declared
+  path, outcome `typed`, `fallback` (kept in `value`: the type did not
+  match) or `variant_null`. A high fallback share means the immutable
+  declaration does not fit the data.
+
+They count per build, so a rebuild counts its rows again.
+
+**Readers.** The files are in the Trino connector's layout
+(`VARIANT(1)`, the declared shredding); a variant registers no
+`column_stats`. Read-back through the Trino connector is not yet
+verified by a harness. Server compaction copies the layout only with
+`HOGLAKE_COMPACTION_VARIANT`. The hoglake DuckDB extension refuses a
+table with a variant column at bind (#87), so after step 3 the whole
+table is unreadable through it.
+
 ## Startup drain and probes
 
 On start each replica opens its home stage (the slot of its smallest
@@ -108,12 +228,14 @@ over the staged rows, cut into one-group windows (at the group's end or
 at `MILLRACE_FLUSH_BYTES`), packed into batches of up to
 `MILLRACE_FLUSH_BYTES` and 512 windows (`max_files_per_commit`), each
 batch one commit (more if its groups fan out past 512 files), flushed
-and settled as the pass goes; stages drain concurrently with at most 4
+and settled as the pass goes; stages drain concurrently with at most 2
 batches (the flush concurrency) in memory. Progress is logged per stage (`startup drain of
 <topic>[<p>]: …` at start, every 1,000 windows or 30 s, and at the end)
 and counted in `millrace_drain_rows_total` / `millrace_drain_bytes_total`.
 Small groups share commits, so drain time is mostly the stage reads
-and the parquet builds. The stream
+and the parquet builds (`millrace_flush_build_seconds_total{stage}`,
+and their wait for a pool thread in
+`millrace_flush_build_queue_seconds_total`). The stream
 reopens its iterator past the last key every 60 s and after a read
 error, so an SST the maintenance GC deletes under it costs a reopen,
 not a restart.
@@ -142,7 +264,7 @@ Any flush failure leaves the rows staged and retries the group with
 backoff (2 s doubling to 120 s). Due groups that are not at the size
 lane are flushed in batches, one commit per batch (more past 512
 files); a refused batch
-(400/422) splits: each of its groups retries alone, so one bad group
+(any 4xx but 408/429, including a 409 `table_dropped`) splits: each of its groups retries alone, so one bad group
 never holds the others back. Other batch failures retry the batch. After 3 consecutive failures the group is
 logged at ERROR (`flush STUCK: …`), `millrace_flush_groups_stuck_total`
 increments and `millrace_flush_groups_stuck` counts it until it
@@ -187,6 +309,7 @@ are never judged: ancient and far-future events are written.
 | Consume | `malformed_value` | not a strict JSON object |
 | Consume | `malformed_partition_source` | a partition source value of the wrong type or uncoercible (the log names the path) |
 | Flush | `undecodable_payload` / `uncastable_column` | a value no column can hold (the log names the first refusing column path, never the value) |
+| Flush | `object_prefix_value` | on a table whose `object_prefix_field` is set, a null or negative value of that field: no prefix can hold the row (the server would refuse the whole commit) |
 
 ## SlateDB and pod memory
 
@@ -206,7 +329,7 @@ delete-dominated stages never merged their oldest runs.
 Pod memory, in terms:
 
 ```
-  K partitions × 256 MiB unflushed
+  256 MiB unflushed (the home stage: one per replica)
 + 256 MiB shared cache × ~1.05
 + 256 MiB librdkafka queue + 256 MiB fetch
 + 256 MiB consume batch
@@ -216,11 +339,11 @@ Pod memory, in terms:
 ```
 
 During the startup drain the 2 decisions are the drain's in-flight
-windows, and each partition also holds one row stream:
+windows, and each stage being drained also holds one row stream:
 
 ```
-  K partitions × ( (L0 SSTs + sorted runs) × 2 fetches × 1 MiB read-ahead
-                   + ≤ 16 MiB page )
+  stages × ( (L0 SSTs + sorted runs) × 2 fetches × 1 MiB read-ahead
+             + ≤ 16 MiB page )
 ```
 
 Measured: 4 partitions × 8 overlapping L0 SSTs streamed +157 MiB RSS at
@@ -228,10 +351,9 @@ Measured: 4 partitions × 8 overlapping L0 SSTs streamed +157 MiB RSS at
 took +316 MiB for 230 MiB/s, so the stream uses the smaller ones
 (`stage._drain_scan_options`).
 
-At 16 partitions per pod that is ~4 GiB unflushed + ~0.8 GiB queues and
-cache + ~4.4 GiB of decisions + baseline: a 1-replica, 16-partition
-pod does **not** fit 10 GiB; 4 partitions per pod (~7 GiB) does. The
-catch-up profile peaked at 6.6 GiB with 4 partitions.
+The unflushed budget is per stage (256 MiB,
+`SlateDbConfig.max_unflushed_bytes`) and does not grow with the
+partitions a replica claims.
 
 Row scans read ahead in 4 MiB ranged GETs with 4 concurrent fetches and
 do not cache their blocks (`stage._bulk_scan_options`; slatedb's

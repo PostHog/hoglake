@@ -1077,14 +1077,18 @@ object FooterStats {
             // uint32 maps to Iceberg long. hoglake's own writers emit INT64
             // (see docs/iceberg-federation.md §2), but pyarrow/DuckDB emit
             // INT32 + INT(32, unsigned) natively, so both are read. The
-            // INT32 form REQUIRES the unsigned annotation: without it
+            // INT32 form REQUIRES an unsigned annotation: without it
             // parquet computed the chunk's min/max in SIGNED order, and
             // reinterpreting those bounds as unsigned would invert them.
+            // Any unsigned width up to 32 zero-extends (the guard above
+            // refuses wider): INT(8|16, unsigned) is what a uint8/uint16
+            // column's files hold after a promote to uint32, and below
+            // 2^16 signed and unsigned order agree.
             ColType.UINT32 ->
                 when (physical) {
                     PrimitiveType.PrimitiveTypeName.INT64 -> readLongLE(raw)
                     PrimitiveType.PrimitiveTypeName.INT32 ->
-                        if (isUnsignedInt(leaf, 32)) readIntLE(raw)?.let { it.toLong() and 0xFFFFFFFFL } else null
+                        if (isUnsignedInt(leaf)) readIntLE(raw)?.let { it.toLong() and 0xFFFFFFFFL } else null
                     else -> null
                 }
             // uint64 maps to decimal(20,0); the bound is a BigInteger in

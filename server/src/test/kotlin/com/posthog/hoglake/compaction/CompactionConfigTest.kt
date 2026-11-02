@@ -1115,4 +1115,43 @@ class CompactionConfigTest {
         }.isInstanceOf(IllegalArgumentException::class.java)
             .hasMessageContaining("HOGLAKE_COMPACTION_PLAN_STATEMENT_TIMEOUT_MS")
     }
+
+    // ---- variant compaction ---------------------------------------------
+
+    @Test
+    fun `variant compaction is off by default, and the allowlist narrows it by catalog name`() {
+        assertThat(defaulted().variantCompactionFor("c")).isFalse()
+        assertThat(Config().compactionVariant).isFalse()
+        assertThat(Config().compactionVariantCatalogs).isEmpty()
+        assertThat(Config.nameList("a, b ,,")).describedAs("each name trimmed").containsExactlyInAnyOrder("a", "b")
+        assertThat(Config.nameList("")).isEmpty()
+        val on = defaulted().copy(variantCompaction = true)
+        assertThat(on.variantCompactionFor("c")).describedAs("an empty allowlist is every catalog").isTrue()
+        val listed = on.copy(variantCompactionCatalogs = setOf("a", "b"))
+        assertThat(listOf("a", "b", "c").map { listed.variantCompactionFor(it) }).containsExactly(true, true, false)
+        assertThat(defaulted().copy(variantCompactionCatalogs = setOf("a")).variantCompactionFor("a"))
+            .describedAs("the allowlist alone turns nothing on")
+            .isFalse()
+        val app = Files.readString(Path.of("src/main/kotlin/com/posthog/hoglake/App.kt"))
+        assertThat(app)
+            .containsPattern("""variantCompaction\s*=\s*cfg\.compactionVariant\b""")
+            .containsPattern("""variantCompactionCatalogs\s*=\s*cfg\.compactionVariantCatalogs""")
+    }
+
+    @Test
+    fun `a variant's chunk is sized by its layout's nodes, and a list in it derates as nested`() {
+        val cfg = defaulted()
+
+        fun variant(declaration: Any?) =
+            listOf(Column(1, 0, ColumnDef("v", ColType.VARIANT, declaration?.let { mapOf("shredding" to it) })))
+        // Unshredded: the group, metadata and value.
+        assertThat(cfg.spillChunkRows(variant(null))).isEqualTo(chunkOf(cfg.sortedHeapBytesPerGroup, 3))
+        val strings = mapOf("type" to "object", "fields" to (1..10).map { mapOf("name" to "f$it", "type" to "string") })
+        // + value, typed_value, and per field its group, value and typed_value.
+        assertThat(cfg.spillChunkRows(variant(strings))).isEqualTo(chunkOf(cfg.sortedHeapBytesPerGroup, 3 + 1 + 30))
+        val list = mapOf("type" to "array", "element" to mapOf("type" to "string"))
+        // The group, metadata, value, typed_value, list, element, and its value and typed_value.
+        assertThat(cfg.spillChunkRows(variant(list)))
+            .isEqualTo(chunkOf(cfg.sortedHeapBytesPerGroup, 8) / cfg.nestedSortExpansion)
+    }
 }

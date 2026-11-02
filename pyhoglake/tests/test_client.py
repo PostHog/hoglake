@@ -14,10 +14,13 @@ from pyhoglake import (
     CommitConflictError,
     ExpiredError,
     HoglakeClient,
+    HoglakeError,
+    IdlessFilesPresentError,
     MalformedResponseError,
     NotFoundError,
     OffsetRegressionError,
     ReconciliationRequiredError,
+    UnsupportedTypeError,
     ValidationError,
     ops,
 )
@@ -1037,6 +1040,34 @@ def test_alter_wire_shape_and_errors(client, httpx_mock):
         t.alter([ops.drop_column("ghost")])
 
 
+@pytest.mark.parametrize("type_", ["int", pa.int32(), "variant"])
+def test_add_column_refuses_a_required_column_before_the_round_trip(
+    client, httpx_mock, type_
+):
+    """hoglake has no column defaults, so a column added after files exist
+    reads NULL from every one of them; the server refuses nullable=false
+    anywhere in an added column (#446) and the builder refuses the one
+    node it can express, in the server's words and without a request."""
+    with pytest.raises(ValidationError, match="hoglake has no column defaults") as ei:
+        ops.add_column("team_id", type_, nullable=False)
+    assert ei.value.status_code is None
+    assert "cannot add column 'team_id'" in str(ei.value)
+    assert httpx_mock.get_requests() == []
+    # Positional, as test_variant_ddl once spelt it.
+    with pytest.raises(ValidationError):
+        ops.add_column("team_id", type_, False)
+    # The type mapping answers first: an unsupported type is still its
+    # own error, required or not.
+    with pytest.raises(UnsupportedTypeError):
+        ops.add_column("team_id", pa.float16(), nullable=False)
+    # Both legal spellings still build the op.
+    assert ops.add_column("team_id", type_).to_wire()["column"]["nullable"] is True
+    assert (
+        ops.add_column("team_id", type_, nullable=True).to_wire()["column"]["nullable"]
+        is True
+    )
+
+
 def test_drop_table(client, httpx_mock):
     t = _table(client, httpx_mock)
     # Give the table a DDL pin (via alter), so drop() has something to clear.
@@ -1591,6 +1622,102 @@ def test_commit_410_below_the_floor_is_re_prepare_not_a_reconcile(client, httpx_
     assert ei.value.re_prepare is True
 
 
+@pytest.mark.parametrize(
+    "body,table",
+    [
+        (
+            {
+                "error": "object_prefix_violation",
+                "detail": "expected under s3://b/lake/data/ns1/events/team_id=4/",
+                "tables": ["ns1.events"],
+                "retry": "re-prepare",
+            },
+            "ns1.events",
+        ),
+        ({"error": "object_prefix_violation"}, None),
+    ],
+    ids=["full-body", "code-only"],
+)
+def test_commit_422_object_prefix_violation_is_re_prepare(
+    client, httpx_mock, body, table
+):
+    """The server's `retry: re-prepare`: a file outside the layout cannot
+    land on replay. Still a ValidationError, so `except ValidationError`
+    keeps catching it, and a plain 422 stays a plain ValidationError."""
+    from pyhoglake import ObjectPrefixViolationError, ValidationError
+
+    cat = _catalog(client, httpx_mock)
+    httpx_mock.add_response(
+        method="POST",
+        url=f"{BASE}/v1/catalogs/cat/commit",
+        json=body,
+        status_code=422,
+    )
+    with pytest.raises(ObjectPrefixViolationError) as ei:
+        cat._commit({"appends": []})
+    assert isinstance(ei.value, ValidationError)
+    assert ei.value.status_code == 422
+    assert (ei.value.retryable, ei.value.re_prepare) == (False, True)
+    assert ei.value.table == table
+    assert ei.value.detail == body.get("detail")
+
+    httpx_mock.add_response(
+        method="POST",
+        url=f"{BASE}/v1/catalogs/cat/commit",
+        json={"error": "validation", "detail": "bad stats"},
+        status_code=422,
+    )
+    with pytest.raises(ValidationError) as plain:
+        cat._commit({"appends": []})
+    assert type(plain.value) is ValidationError
+    assert not plain.value.re_prepare
+
+
+def test_a_re_prepare_code_is_typed_only_at_its_own_status(client, httpx_mock):
+    """A code is the contract only with its status: `object_prefix_violation`
+    on a 409 is the caller's conflict class, not the 422 refusal."""
+    from pyhoglake import ObjectPrefixViolationError
+
+    cat = _catalog(client, httpx_mock)
+    httpx_mock.add_response(
+        method="POST",
+        url=f"{BASE}/v1/catalogs/cat/commit",
+        json={"error": "object_prefix_violation"},
+        status_code=409,
+    )
+    with pytest.raises(CommitConflictError) as ei:
+        cat._commit({"appends": []})
+    assert not isinstance(ei.value, ObjectPrefixViolationError)
+
+
+@pytest.mark.parametrize("status", [409, 422, 503])
+def test_an_error_code_that_is_not_a_string_stays_in_the_taxonomy(
+    client, httpx_mock, status
+):
+    """A gateway's body can carry anything under `error`; a dict does
+    not hash, and looking it up must not leak a TypeError past
+    `except HoglakeError` on any status."""
+    cat = _catalog(client, httpx_mock)
+    httpx_mock.add_response(
+        method="POST",
+        url=f"{BASE}/v1/catalogs/cat/commit",
+        json={"error": {"code": "upstream"}},
+        status_code=status,
+    )
+    with pytest.raises(HoglakeError) as ei:
+        cat._commit({"appends": []})
+    assert ei.value.status_code == status
+    assert not ei.value.re_prepare
+
+
+def test_object_prefix_violation_is_exported():
+    import pyhoglake
+    from pyhoglake.errors import ObjectPrefixViolationError
+
+    assert pyhoglake.ObjectPrefixViolationError is ObjectPrefixViolationError
+    assert "ObjectPrefixViolationError" in pyhoglake.__all__
+
+
 def test_every_request_identifies_the_client(client, httpx_mock):
     """`User-Agent: pyhoglake/<version>` on every request.
 
@@ -1659,6 +1786,60 @@ def test_changes_truncate_requires_reconciliation(client, httpx_mock):
     with pytest.raises(ReconciliationRequiredError, match="Reconcile") as failure:
         table.changes(3)
     assert failure.value.retryable is False
+
+
+_IDLESS_DETAIL = (
+    "cannot add column 'extra': 1 id-less live data file(s) bind columns by name; "
+    "rewrite (compact) or retire them first"
+)
+
+
+def _alter_answers(httpx_mock, status, body):
+    httpx_mock.add_response(
+        method="POST",
+        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events/alter",
+        status_code=status,
+        json=body,
+    )
+
+
+def test_alter_idless_files_present_is_its_own_error_not_a_conflict(client, httpx_mock):
+    """A file the hydrator proved id-less blocks add/rename until it is
+    rewritten or retired; no retry clears it. Classified as
+    CommitConflictError (retryable) it read as concurrent DDL, and a
+    writer that drops the column on a conflict dropped it here."""
+    table = _table(client, httpx_mock)
+    _alter_answers(
+        httpx_mock, 409, {"error": "idless_files_present", "detail": _IDLESS_DETAIL}
+    )
+    with pytest.raises(IdlessFilesPresentError) as failure:
+        table.alter([ops.add_column("extra", pa.int64())])
+    error = failure.value
+    assert type(error) is IdlessFilesPresentError
+    assert isinstance(error, HoglakeError)
+    assert not isinstance(error, CommitConflictError)
+    assert (error.retryable, error.re_prepare) == (False, False)
+    assert error.status_code == 409
+    assert error.message == "idless_files_present"
+    assert error.detail == _IDLESS_DETAIL
+
+
+def test_alter_other_409s_still_raise_commit_conflict(client, httpx_mock):
+    table = _table(client, httpx_mock)
+    _alter_answers(
+        httpx_mock, 409, {"error": "commit_conflict", "detail": "concurrent DDL"}
+    )
+    with pytest.raises(CommitConflictError) as failure:
+        table.alter([ops.rename_column("name", "label")])
+    assert type(failure.value) is CommitConflictError
+    assert failure.value.retryable is True
+
+
+def test_idless_files_present_is_exported():
+    import pyhoglake
+
+    assert pyhoglake.IdlessFilesPresentError is IdlessFilesPresentError
+    assert "IdlessFilesPresentError" in pyhoglake.__all__
 
 
 # -- table/column comments and properties (#169) ----------------------------

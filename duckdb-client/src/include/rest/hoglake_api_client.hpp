@@ -11,6 +11,9 @@
 #include "duckdb/common/optional_idx.hpp"
 #include "common/hoglake_wire.hpp"
 
+#include <chrono>
+#include <mutex>
+
 namespace duckdb {
 
 //! Time-travel selector: at most one of snapshot / at_timestamp.
@@ -41,22 +44,50 @@ struct HoglakeTravel {
 	}
 };
 
+//! How the client authenticates to hoglake. Empty = no credential, which a
+//! server in HOGLAKE_AUTH_MODE=enforce refuses.
+struct HoglakeAuthOptions {
+	//! a fixed bearer token (ATTACH ... (TOKEN '...')); never refreshed
+	string token;
+	//! RFC 6749 client credentials (TOKEN_URL, CLIENT_ID, CLIENT_SECRET)
+	string token_url;
+	string client_id;
+	string client_secret;
+	string audience = "hoglake";
+
+	bool UsesClientCredentials() const {
+		return !token_url.empty();
+	}
+	bool Configured() const {
+		return !token.empty() || UsesClientCredentials();
+	}
+};
+
 //! One client per attached catalog. Every method throws a duckdb
 //! exception mapped from the hoglake error taxonomy on failure:
 //!   400/422 -> InvalidInputException     (never retryable)
+//!   401/403 -> PermissionException       (credential missing, refused or under-scoped)
 //!   404     -> CatalogException          (or nullptr on Try* methods)
 //!   409     -> TransactionException      (commit conflicts; retryable upstream)
 //!   410     -> InvalidInputException     (below the expiry floor)
 //!   503     -> IOException               (commit_queue_timeout backpressure)
 class HoglakeApiClient {
 public:
-	HoglakeApiClient(string endpoint_url, string catalog_name);
+	HoglakeApiClient(string endpoint_url, string catalog_name, HoglakeAuthOptions auth = HoglakeAuthOptions());
+
+	//! Sent on every request; hoglake counts auth outcomes per client class
+	//! read from this header, so the prefix must stay recognisable.
+	static constexpr const char *USER_AGENT = "duckdb-hoglake/1";
 
 	const string &GetEndpoint() const {
 		return endpoint;
 	}
 	const string &GetCatalogName() const {
 		return catalog_name;
+	}
+	//! A credential is configured, so the server attributes writes to it.
+	bool Authenticated() const {
+		return auth.Configured();
 	}
 
 public:
@@ -130,9 +161,20 @@ private:
 	static string TravelQuery(const HoglakeTravel &travel);
 
 private:
+	Response SendOnce(const string &method, const string &path, const string &json_body, const string &token);
+	//! The bearer token to send, minting one if none is cached or it is
+	//! near expiry. Empty when no credential is configured.
+	string CurrentToken();
+	void InvalidateToken(const string &token);
+	void MintToken();
+
 	//! scheme://host[:port] (no trailing slash); /v1 is appended per call
 	string endpoint;
 	string catalog_name;
+	HoglakeAuthOptions auth;
+	std::mutex token_lock;
+	string cached_token;
+	std::chrono::steady_clock::time_point refresh_at;
 };
 
 } // namespace duckdb

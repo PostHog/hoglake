@@ -269,7 +269,7 @@ def test_records_dropped_total_merges_consume_and_flush_reasons():
 
 def test_flush_counters_are_exposed_by_exact_name_labels_and_value():
     """Seeded with distinct values, so a swapped pair reads back wrong."""
-    from millrace.flush import STUCK_AFTER, _Failures
+    from millrace.flush import BUILD_STAGES, STUCK_AFTER, _Failures
 
     consumer, stages, flusher, runner = _components()
     try:
@@ -291,7 +291,16 @@ def test_flush_counters_are_exposed_by_exact_name_labels_and_value():
         raw = _raw(_collector(consumer, stages, flusher, runner))
         assert raw[("millrace_flushes_committed_total", ())] == 3
         assert raw[("millrace_flush_failures_total", ())] == 5
-        assert raw[("millrace_flush_commits_total", ())] == 7
+        assert (
+            raw[
+                (
+                    "millrace_flush_commits_total",
+                    (("catalog", "cat"), ("table", "ns1.events")),
+                )
+            ]
+            == 7
+        )
+        assert ("millrace_flush_commits_total", ()) not in raw
         assert raw[("millrace_flush_rows_published_total", ())] == 11
         assert raw[("millrace_flush_files_written_total", ())] == 13
         assert raw[("millrace_flush_bytes_written_total", ())] == 17
@@ -305,6 +314,67 @@ def test_flush_counters_are_exposed_by_exact_name_labels_and_value():
         assert raw[("millrace_flush_ambiguous_uploads_total", ())] == 37
         assert raw[("millrace_values_clamped_total", (("column", "timestamp"),))] == 41
         assert raw[("millrace_values_clamped_total", (("column", "props.ts"),))] == 43
+        # Every stage is a series from the start, a zero until a build.
+        built = {
+            labels: value
+            for (name, labels), value in raw.items()
+            if name == "millrace_flush_build_seconds_total"
+        }
+        assert built == {(("stage", s),): 0.0 for s in BUILD_STAGES}
+        assert raw[("millrace_flush_build_queue_seconds_total", ())] == 0.0
+        for i, stage in enumerate(BUILD_STAGES):
+            flusher._build_seconds[stage] = 59.0 + i
+        flusher._build_queue_seconds = 67.5
+        raw = _raw(_collector(consumer, stages, flusher, runner))
+        for i, stage in enumerate(BUILD_STAGES):
+            assert raw[("millrace_flush_build_seconds_total", (("stage", stage),))] == (
+                59.0 + i
+            )
+        assert raw[("millrace_flush_build_queue_seconds_total", ())] == 67.5
+        # Variant families: present with no series until a mapped column
+        # is built, then one series per label tuple.
+        variant = ("millrace_variant_rows_total", "millrace_variant_invalid_total")
+        assert not any(name in variant for name, _ in raw)
+        flusher._variant_rows.update({("sv", "encoded"): 71, ("sv", "invalid"): 73})
+        flusher._variant_invalid[("sv", "duplicate_key")] = 79
+        flusher._variant_values[("sv", "$.$os", "fallback")] = 83
+        raw = _raw(_collector(consumer, stages, flusher, runner))
+        assert (
+            raw[
+                (
+                    "millrace_variant_rows_total",
+                    (("column", "sv"), ("outcome", "encoded")),
+                )
+            ]
+            == 71
+        )
+        assert (
+            raw[
+                (
+                    "millrace_variant_rows_total",
+                    (("column", "sv"), ("outcome", "invalid")),
+                )
+            ]
+            == 73
+        )
+        assert (
+            raw[
+                (
+                    "millrace_variant_invalid_total",
+                    (("column", "sv"), ("reason", "duplicate_key")),
+                )
+            ]
+            == 79
+        )
+        assert (
+            raw[
+                (
+                    "millrace_variant_values_total",
+                    (("column", "sv"), ("outcome", "fallback"), ("path", "$.$os")),
+                )
+            ]
+            == 83
+        )
         # The removed exactly-once machinery exports nothing.
         assert not any(
             word in name

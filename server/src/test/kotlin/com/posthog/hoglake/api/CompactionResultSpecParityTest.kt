@@ -114,6 +114,7 @@ class CompactionResultSpecParityTest {
                 groupsRetired = 30,
                 filesUnranged = 31,
                 bucketsSkippedClaimed = 32,
+                objectPrefixUnresolvable = 33,
             )
         val dto = result.toDto()
         assertThat(dto.groupsCompacted).isEqualTo(1)
@@ -162,6 +163,9 @@ class CompactionResultSpecParityTest {
         // bucketsConsidered, so a `toDto` that copied one into the other
         // is exactly what the distinct value catches.
         assertThat(dto.bucketsSkippedClaimed).isEqualTo(32)
+        // The object-prefix planner refusal (2.1d), a group counter beside
+        // the budget refusals.
+        assertThat(dto.objectPrefixUnresolvable).isEqualTo(33)
     }
 
     @Test
@@ -209,6 +213,8 @@ class CompactionResultSpecParityTest {
                 // The pre-probe bucket-claim skips, added after the
                 // ledger like every counter in this list.
                 "buckets_skipped_claimed",
+                // The object-prefix planner refusal (2.1d).
+                "object_prefix_unresolvable",
             )
         assertThat(properties(block)).containsAll(added)
         assertThat(requiredOf(block)).doesNotContainAnyElementsOf(added)

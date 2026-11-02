@@ -23,14 +23,17 @@ import com.posthog.hoglake.api.UploadOwnerDto
 import com.posthog.hoglake.api.parseExpectedTableUuid
 import com.posthog.hoglake.api.parseLongQuery
 import com.posthog.hoglake.api.parsePartitionFilter
+import com.posthog.hoglake.api.parsePartitionLookupValues
 import com.posthog.hoglake.api.parseScanRequest
 import com.posthog.hoglake.api.parseScanStatsRequest
 import com.posthog.hoglake.commit.commitFingerprint
 import com.posthog.hoglake.model.AlterOp
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.PartitionLookupInvalidRequest
 import com.posthog.hoglake.model.SplitOffsets
 import com.posthog.hoglake.model.validateSplitOffsets
 import com.posthog.hoglake.service.ColumnTrees
+import com.posthog.hoglake.service.PartitionLookupCursor
 import com.posthog.hoglake.service.TableCreationDefinition
 import com.posthog.hoglake.service.TableCreationDefinitionCodec
 import com.posthog.hoglake.wireObjectMapper
@@ -74,6 +77,54 @@ class WireDtoParseFuzzTest {
     @FuzzTest(maxDuration = "120s")
     fun wireParseFailsOnlyWithMappedExceptions(data: ByteArray) {
         if (data.size > MAX_INPUT_BYTES) return
+
+        val generatedValue = data.take(256).toByteArray().toString(Charsets.UTF_8).replace("\u0000", "")
+        val generatedValues = listOf(null, "", "null", "東京\uD83D\uDE80$generatedValue")
+        check(parsePartitionLookupValues(mapper.writeValueAsString(generatedValues)) == generatedValues)
+        val generatedLong =
+            data.take(8).fold(0L) { acc, byte -> (acc shl 8) xor (byte.toLong() and 255) } and Long.MAX_VALUE
+        val generatedLimit = (data.firstOrNull()?.toInt()?.and(255) ?: 0) + 1
+        val generatedAfter = generatedLong.coerceAtMost(Long.MAX_VALUE - 1)
+        val generatedUpper = generatedAfter + 1
+        val validCursor =
+            PartitionLookupCursor(
+                generatedLong,
+                generatedAfter,
+                generatedUpper,
+                generatedLimit,
+                "a".repeat(64),
+            ).encode()
+        val decodedCursor = java.util.Base64.getUrlDecoder().decode(validCursor).toString(Charsets.US_ASCII).split('|')
+        check(
+            decodedCursor ==
+                listOf(
+                    "2", generatedLong.toString(), generatedAfter.toString(), generatedUpper.toString(),
+                    generatedLimit.toString(), "a".repeat(64),
+                ),
+        )
+        val parsedCursor = PartitionLookupCursor.parse(validCursor)
+        check(
+            parsedCursor.snapshot == generatedLong && parsedCursor.after == generatedAfter &&
+                parsedCursor.upper == generatedUpper && parsedCursor.limit == generatedLimit,
+        )
+
+        try {
+            val raw = data.toString(Charsets.UTF_8)
+            val values = parsePartitionLookupValues(raw)
+            val node = mapper.readTree(raw)
+            check(node.isArray && node.size() in 1..64)
+            check(node.map { if (it.isNull) null else it.textValue() } == values)
+            check(node.all { it.isNull || it.isTextual })
+        } catch (e: Exception) {
+            check(e is PartitionLookupInvalidRequest) { "partition lookup values escaped: $e" }
+        }
+        try {
+            val cursor = PartitionLookupCursor.parse(data.toString(Charsets.UTF_8))
+            check(cursor.snapshot >= 0 && cursor.after >= 0 && cursor.upper > cursor.after && cursor.limit in 1..500)
+            check(cursor.encode() == data.toString(Charsets.UTF_8))
+        } catch (e: Exception) {
+            check(e is PartitionLookupInvalidRequest) { "partition lookup cursor escaped: $e" }
+        }
 
         try {
             val uuid = parseExpectedTableUuid(data.toString(Charsets.UTF_8))

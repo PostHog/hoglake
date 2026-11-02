@@ -48,7 +48,8 @@ ci_python=(uv run --no-project --with defusedxml==0.7.1 python)
 ) 2>&1 | tee "$report_dir/build.log"
 "${compose[@]}" up -d --wait --wait-timeout 90 postgres minio
 
-# The deferred-stats integration test requires the hydrator loop.
+# The deferred-stats integration test requires the hydrator loop, and the
+# variant compaction test requires variant compaction on.
 env HOGLAKE_JDBC_URL="jdbc:postgresql://localhost:$HOGLAKE_PG_PORT/hoglake" \
     HOGLAKE_DB_USER=hoglake HOGLAKE_DB_PASSWORD=hoglake \
     HOGLAKE_INSTANCE_NAME="$project" \
@@ -56,6 +57,7 @@ env HOGLAKE_JDBC_URL="jdbc:postgresql://localhost:$HOGLAKE_PG_PORT/hoglake" \
     HOGLAKE_CLEANUP_INTERVAL_MS=0 HOGLAKE_COMPACTION_INTERVAL_MS=0 \
     HOGLAKE_RETIREMENT_INTERVAL_MS=0 HOGLAKE_REINDEX_INTERVAL_MS=0 \
     HOGLAKE_METRICS_INTERVAL_MS=0 HOGLAKE_MAINTENANCE_SUMMARY_INTERVAL_MS=0 \
+    HOGLAKE_COMPACTION_VARIANT=true \
     "$repo_dir/server/build/install/hoglake-server/bin/hoglake-server" \
     > "$report_dir/server.log" 2>&1 &
 server_pid=$!

@@ -57,12 +57,16 @@ jobs:
               # shredding fuzz corpus (its JDK check also reads
               # build.gradle.kts and the Dockerfile, which change with
               # every dependency bump and are left out: only a JDK
-              # downgrade could red that check).
+              # downgrade could red that check). dependabot.yml is in the
+              # filter too:
+              # test_pyarrow_floor.test_the_latest_pyarrow_canary_keeps_the_dependency_cooldown
+              # holds the pyarrow canary's cooldown to its uv cooldown.
               - "server/src/main/kotlin/com/posthog/hoglake/model/Model.kt"
               - "server/src/main/kotlin/com/posthog/hoglake/service/VariantShredding.kt"
               - "server/src/main/kotlin/com/posthog/hoglake/service/ColumnTrees.kt"
               - "server/src/main/kotlin/com/posthog/hoglake/service/Identifiers.kt"
               - "server/src/test/resources/com/posthog/hoglake/fuzz/VariantShreddingFuzzTestInputs/**"
+              - ".github/dependabot.yml"
               - ".github/workflows/ci-python.yml"
               - ".github/workflows/pyhoglake-checks.yml"
               - ".github/workflows/python-live.yml"
@@ -123,7 +127,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
 
       - run: uv sync --locked
 
@@ -150,7 +154,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
 
       - run: uv sync --locked
 

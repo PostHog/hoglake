@@ -292,3 +292,57 @@ def test_s3_settings_to_pyhoglake():
     assert s3.endpoint_override == "http://minio:19000"
     assert s3.access_key == "k"
     assert s3.secret_key == "s"
+
+
+def test_auth_is_optional_and_absent_by_default():
+    cfg = HedgerowConfig.parse(_valid())
+    assert cfg.source.auth is None
+    assert cfg.destination.auth is None
+
+
+def test_auth_parses_with_secret_from_env():
+    raw = _valid()
+    raw["source"]["auth"] = {
+        "token_url": "https://hogtower/oauth/token",
+        "client_id": "hlc_src",
+    }
+    raw = apply_env_overrides(raw, {"HEDGEROW__SOURCE__AUTH__CLIENT_SECRET": "s3cret"})
+    cfg = HedgerowConfig.parse(raw)
+    assert cfg.source.auth is not None
+    assert cfg.source.auth.client_id == "hlc_src"
+    assert cfg.source.auth.client_secret == "s3cret"
+    assert cfg.source.auth.audience == "hoglake"
+    assert cfg.destination.auth is None
+
+
+def test_auth_requires_every_credential_and_never_echoes_the_secret():
+    raw = _valid()
+    raw["destination"]["auth"] = {
+        "token_url": "https://hogtower/oauth/token",
+        "client_id": "hlc_dst",
+        "client_secret": 12345,
+    }
+    with pytest.raises(ConfigError) as refused:
+        HedgerowConfig.parse(raw)
+    assert "12345" not in str(refused.value)
+    raw["destination"]["auth"] = {"token_url": "https://hogtower/oauth/token"}
+    with pytest.raises(ConfigError, match="client_id"):
+        HedgerowConfig.parse(raw)
+
+
+def test_auth_builds_a_client_credentials_source():
+    from pyhoglake import ClientCredentials
+
+    from hedgerow.config import hoglake_client
+
+    raw = _valid()
+    raw["source"]["auth"] = {
+        "token_url": "https://hogtower/oauth/token",
+        "client_id": "hlc_src",
+        "client_secret": "s3cret",
+    }
+    cfg = HedgerowConfig.parse(raw)
+    with hoglake_client(cfg.source.url, cfg.source.s3, cfg.source.auth) as client:
+        assert isinstance(client._http.auth, ClientCredentials)
+    with hoglake_client(cfg.destination.url, cfg.destination.s3, None) as client:
+        assert not isinstance(client._http.auth, ClientCredentials)

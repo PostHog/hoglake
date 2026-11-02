@@ -212,6 +212,43 @@ class IncarnationChangedError(HoglakeError):
         self.table = table
 
 
+class ObjectPrefixViolationError(ValidationError):
+    """422 ``object_prefix_violation`` — a commit to a table with an
+    object-prefix field (:attr:`~pyhoglake.TableInfo.object_prefix_field`)
+    registered a file the layout does not admit: one whose partition value
+    names no prefix, one not under its value's
+    :func:`pyhoglake.object_prefix.prefix`, or one whose inline stats do
+    not prove the value (a deletion vector outside its target's prefix
+    too). The whole commit is refused, with zero writes.
+
+    :attr:`re_prepare`, as the server's ``retry: re-prepare`` says:
+    replaying the payload cannot succeed, but a writer that read the
+    table before it had the option can re-read it and write its files
+    again under the prefix. Only a writer that builds its keys with
+    :mod:`pyhoglake.object_prefix` can: ``Table.append``,
+    ``prepare_append_tables`` and ``prepare_append_files`` write under the
+    table root, so on such a table they are refused every time, and a
+    caller must not retry them on this flag. None of them retries on its
+    own.
+
+    A :class:`ValidationError`, so an existing ``except ValidationError``
+    still catches it. :attr:`table` names the qualified table, off the
+    server's structured body."""
+
+    re_prepare = True
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        detail: str | None = None,
+        table: str | None = None,
+    ) -> None:
+        super().__init__(message, status_code=status_code, detail=detail)
+        self.table = table
+
+
 class MalformedResponseError(HoglakeError):
     """A response body did not match the wire contract: a required field
     was missing, or a field/nested object had the wrong shape.
@@ -323,6 +360,29 @@ class CatalogHasAbandonedUploadsError(CatalogNotEmptyError):
     expiry."""
 
     wire_reason = "abandoned_uploads_unsettled"
+
+
+class IdlessFilesPresentError(HoglakeError):
+    """409 ``idless_files_present`` — an ``add_column`` or ``rename_column``
+    refused because the table has a live data file the server's hydrator
+    has PROVEN id-less (``missing_field_ids``): its parquet schema carries
+    no field ids, so its columns bind by NAME and the new or renamed name
+    could adopt another column's values.
+
+    Deliberately NOT a :class:`CommitConflictError`: no concurrent DDL
+    happened, and refreshing the read snapshot changes nothing. Neither
+    :attr:`retryable` nor :attr:`re_prepare`, and retrying never helps:
+    the flag never clears on its own. The SAME alter succeeds only once
+    the id-less files — :attr:`detail` (the server's prose) counts them —
+    have been rewritten by compaction or retired. A pending or failed
+    hydration does NOT raise this (the server trusts a file until its
+    footer proves otherwise), so there is no sweep to wait for.
+
+    The right response is to fail loudly: surface the alter's failure to
+    whoever can compact or retire the file. Do not retry on a backoff,
+    and do not fall back to dropping or skipping the column — the data
+    the alter was for has nowhere else to go.
+    """
 
 
 class ReconciliationRequiredError(HoglakeError):

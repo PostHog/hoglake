@@ -3,7 +3,8 @@
 import importlib.metadata
 import logging
 
-from . import ops, transforms, upload, variant
+from . import object_prefix, ops, transforms, upload, variant, writer
+from .auth import BearerToken, ClientCredentials
 from .bounds import decode_bound, encode_bound
 from .client import (
     UNGUARDED,
@@ -30,9 +31,11 @@ from .errors import (
     DdlSinceReadSnapshotError,
     ExpiredError,
     HoglakeError,
+    IdlessFilesPresentError,
     IncarnationChangedError,
     MalformedResponseError,
     NotFoundError,
+    ObjectPrefixViolationError,
     OffsetRegressionError,
     ReadSnapshotExpiredError,
     ReconciliationRequiredError,
@@ -71,6 +74,7 @@ from .models import (
 from .ops import AlterOp
 from .types import arrow_type_to_coltype, coltype_to_arrow
 from .variant import VARIANT_NULL, VariantReport, variant_field
+from .writer import PreparedPart, write_part
 
 # Read from the installed metadata so it cannot drift from pyproject.toml.
 __version__ = importlib.metadata.version("pyhoglake")
@@ -91,6 +95,7 @@ __all__ = [
     "AlterOp",
     "AppendResult",
     "AppendedFile",
+    "BearerToken",
     "Catalog",
     "CatalogFilesPendingExpiryError",
     "CatalogHasAbandonedUploadsError",
@@ -105,6 +110,7 @@ __all__ = [
     "CatalogTablesPendingRetirementError",
     "ChangesPlan",
     "CleanupResult",
+    "ClientCredentials",
     "Column",
     "ColumnStats",
     "CommitConflictError",
@@ -118,13 +124,16 @@ __all__ = [
     "ExpiryResult",
     "HoglakeClient",
     "HoglakeError",
+    "IdlessFilesPresentError",
     "IncarnationChangedError",
     "MalformedResponseError",
     "Namespace",
     "NotFoundError",
+    "ObjectPrefixViolationError",
     "OffsetRegressionError",
     "PartitionField",
     "PartitionSpec",
+    "PreparedPart",
     "ReadSnapshotExpiredError",
     "ReconciliationRequiredError",
     "S3Config",
@@ -149,10 +158,13 @@ __all__ = [
     "coltype_to_arrow",
     "decode_bound",
     "encode_bound",
+    "object_prefix",
     "ops",
     "parquet_write_options",
     "transforms",
     "upload",
     "variant",
     "variant_field",
+    "write_part",
+    "writer",
 ]

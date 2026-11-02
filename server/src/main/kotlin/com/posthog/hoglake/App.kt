@@ -8,12 +8,14 @@ import com.posthog.hoglake.api.installDebugRoutes
 import com.posthog.hoglake.api.installErrorMapping
 import com.posthog.hoglake.api.installMaintenanceRoutes
 import com.posthog.hoglake.api.installPartitionListingRoutes
+import com.posthog.hoglake.api.installPartitionLookupRoutes
 import com.posthog.hoglake.api.installPartitionStatsRoutes
 import com.posthog.hoglake.api.installPublicationRoutes
 import com.posthog.hoglake.api.installScanRoutes
 import com.posthog.hoglake.api.installTableCreationRoutes
 import com.posthog.hoglake.api.installUploadRoutes
 import com.posthog.hoglake.api.installViewRoutes
+import com.posthog.hoglake.auth.installAuth
 import com.posthog.hoglake.commit.CommitService
 import com.posthog.hoglake.compaction.CompactionConfig
 import com.posthog.hoglake.compaction.CompactionService
@@ -34,6 +36,7 @@ import com.posthog.hoglake.service.MaintenanceStatusService
 import com.posthog.hoglake.service.MaintenanceSummarySampler
 import com.posthog.hoglake.service.OptionsService
 import com.posthog.hoglake.service.PartitionListingService
+import com.posthog.hoglake.service.PartitionLookupService
 import com.posthog.hoglake.service.PartitionStatsService
 import com.posthog.hoglake.service.ReindexService
 import com.posthog.hoglake.service.RemovalStore
@@ -92,6 +95,7 @@ class App private constructor(
         )
     private val alterService = AlterService(jdbi)
     private val scanService = ScanService(jdbi)
+    private val partitionLookupService = PartitionLookupService(jdbi)
     private val viewService = ViewService(jdbi)
     private val optionsService = OptionsService(jdbi)
     private val expiryService = ExpiryService(jdbi, cfg)
@@ -201,6 +205,8 @@ class App private constructor(
                 verifyMinBytes = cfg.compactionVerifyMinBytes,
                 maxNodesPerRow = cfg.compactionMaxNodesPerRow,
                 codec = ParquetRewriter.OutputCodec.parse(cfg.compactionCodec, cfg.compactionZstdLevel),
+                variantCompaction = cfg.compactionVariant,
+                variantCompactionCatalogs = cfg.compactionVariantCatalogs,
             ),
             // The pod's identity spreads N pods' bucket cursors (and seeds
             // the compaction loop's jitter below). Passed HERE because the
@@ -290,7 +296,35 @@ class App private constructor(
     }
 
     fun module(app: Application) {
-        // FIRST, and once: every handler installed below this line runs
+        // RequestId comes before auth, and the order is load-bearing. Auth
+        // refuses by responding from inside its own interceptor, so anything
+        // installed after it runs on a call whose response is already built: a
+        // 401 would lose its X-Request-Id (and, with CallLogging below it, its
+        // access-log line) exactly when somebody is trying to correlate a
+        // refusal with a server record. Both are cheap and neither touches the
+        // database, so both belong on the outside.
+        app.install(RequestId)
+        app.install(CallLogging) {
+            // Coroutine-safe MDC propagation of the request id, so audit
+            // lines emitted inside request handling carry request_id.
+            mdc(Audit.REQUEST_ID_MDC) { call -> call.requestId }
+        }
+
+        // THEN, and before anything that does real work: authenticate and
+        // authorize, so a refused request never reaches the blocking
+        // dispatcher, never borrows a connection, and never runs a handler that
+        // could have been written without a check. The routes below are
+        // installed by a dozen `install*Routes` functions; the plugin's rule
+        // table (auth/AuthPolicy.kt) is what makes "every route has a policy" a
+        // property of the build rather than a property of the reviewer.
+        //
+        // Inert unless HOGLAKE_AUTH_MODE says otherwise: `off` is the default and
+        // resolves no callers, which is precisely today's behaviour. A mis-set
+        // `enforce` (no issuer, no key source) fails here, at boot, naming the
+        // variable — not with a fleet-wide 401.
+        app.installAuth(com.posthog.hoglake.auth.AuthService.fromConfig(cfg))
+
+        // Then, and once: every handler installed below this line runs
         // its blocking database/object-store work on requestDispatcher
         // rather than on the Netty event loop. The probe paths are
         // bypassed, the queue wait is stamped and measured, and a
@@ -303,12 +337,6 @@ class App private constructor(
             // behaviour (api/WireJson.kt).
             jackson { configureHoglakeWire() }
         }
-        app.install(RequestId)
-        app.install(CallLogging) {
-            // Coroutine-safe MDC propagation of the request id, so audit
-            // lines emitted inside request handling carry request_id.
-            mdc(Audit.REQUEST_ID_MDC) { call -> call.requestId }
-        }
         app.install(MicrometerMetrics) {
             registry = meterRegistry
             // Unmatched request paths must NOT each mint a `route` tag —
@@ -317,8 +345,14 @@ class App private constructor(
         }
         app.install(StatusPages) { installErrorMapping() }
         app.routing {
-            // Prometheus scrape endpoint — unauthenticated like /healthz,
-            // and excluded from the http request metrics + audit log.
+            // Prometheus scrape endpoint, excluded from the http request
+            // metrics + audit log. GATED by auth/AuthPolicy.kt as
+            // operator-only: the exposition carries per-catalog labels,
+            // i.e. the tenant roster, so it is not a public surface.
+            // The scraper uses the infra listener instead
+            // (HOGLAKE_METRICS_PORT, observability/MetricsListener.kt,
+            // docs/auth-tenancy.md §6.7), which serves the same registry
+            // with no auth plugin on a port the Service does not expose.
             get("/metrics") {
                 call.respondText(
                     this@App.meterRegistry.scrape(),
@@ -378,6 +412,7 @@ class App private constructor(
         )
         app.installPartitionStatsRoutes(partitionStatsService)
         app.installPartitionListingRoutes(partitionListingService)
+        app.installPartitionLookupRoutes(partitionLookupService)
         app.installPublicationRoutes()
         app.installDebugRoutes()
     }

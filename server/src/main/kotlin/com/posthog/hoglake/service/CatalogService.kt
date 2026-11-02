@@ -30,6 +30,7 @@ import com.posthog.hoglake.persistence.CatalogRepo
 import com.posthog.hoglake.persistence.CommitLockPath
 import com.posthog.hoglake.persistence.DeleteFileReadRepo
 import com.posthog.hoglake.persistence.FileRepo
+import com.posthog.hoglake.persistence.LayoutRepo
 import com.posthog.hoglake.persistence.Locks
 import com.posthog.hoglake.persistence.NamespaceRepo
 import com.posthog.hoglake.persistence.OffsetRepo
@@ -171,7 +172,27 @@ class CatalogService(private val jdbi: Jdbi) {
 
     fun getCatalog(name: String): CatalogInfo = jdbi.withHandleUnchecked { h -> requireCatalog(h, name) }
 
-    fun listCatalogs(): List<CatalogInfo> = jdbi.withHandleUnchecked { h -> CatalogRepo.listAll(h) }
+    /**
+     * Every catalog this caller may see.
+     *
+     * [visible] is the caller's allowlist, or null for an operator. The filter is
+     * applied HERE, in Kotlin, rather than as a `WHERE catalog_id IN (…)` — the
+     * listing reads every catalog row anyway (it is one indexed scan of a table
+     * with one row per tenant, thousands at most), and a parameterized IN-list
+     * of arbitrary length would put a statement-plan cache miss in front of a
+     * request every tenant makes on load. If catalogs ever number enough for
+     * that to change, this is the line to revisit.
+     *
+     * The DEFAULT is "everything", which is the operator path and the
+     * `HOGLAKE_AUTH_MODE=off` path; every caller that has a tenant passes its own
+     * allowlist explicitly, so forgetting to pass one is a compile error rather
+     * than a leak.
+     */
+    fun listCatalogs(visible: Set<String>? = null): List<CatalogInfo> =
+        jdbi.withHandleUnchecked { h ->
+            val all = CatalogRepo.listAll(h)
+            if (visible == null) all else all.filter { it.name in visible }
+        }
 
     /**
      * Drop an EMPTY catalog: `DELETE /v1/catalogs/{catalog}` (#412).
@@ -553,6 +574,22 @@ class CatalogService(private val jdbi: Jdbi) {
                 "table '$name' already exists in namespace '$namespace'",
             )
         }
+        // An atomic replacement of a table with the object-prefix layout
+        // would mint an incarnation WITHOUT it under the same name, i.e. the
+        // same path scope, and its writers could put unchecked files under
+        // the old incarnation's prefixes. Refused while the option cannot be
+        // unset. This is the BACKSTOP: TableCreationService.prepare refuses
+        // it before a receipt exists, and an option set after a receipt's
+        // read_snapshot is already `target_changed` at publish. What reaches
+        // here was prepared without that check (an older replica); a
+        // Validation, so publish records the receipt `rejected` rather than
+        // leaving it prepared forever.
+        if (replacementTableId != null && LayoutRepo.live(h, cat.catalogId, listOf(replacementTableId)).isNotEmpty()) {
+            throw HoglakeException.Validation(
+                "cannot replace table '$namespace.$name': it has the object-prefix layout, which a replacement " +
+                    "would not carry over",
+            )
+        }
         val alloc = CatalogRepo.allocateSnapshot(h, cat.catalogId)
         SnapshotRepo.insert(h, cat.catalogId, alloc.snapshotId, alloc.schemaVersion, author, message)
         if (replacementTableId != null) {
@@ -867,6 +904,7 @@ class CatalogService(private val jdbi: Jdbi) {
                 } else {
                     null
                 }
+            val columns = TableRepo.columnsAt(h, cat.catalogId, t.tableId, at)
             TableInfo(
                 tableId = t.tableId,
                 tableUuid = t.tableUuid,
@@ -874,7 +912,7 @@ class CatalogService(private val jdbi: Jdbi) {
                 properties = t.properties,
                 namespace = ns.name,
                 name = t.name,
-                columns = TableRepo.columnsAt(h, cat.catalogId, t.tableId, at),
+                columns = columns,
                 // The snapshot every field above was resolved at, which
                 // a writer sends back as a commit's read_snapshot.
                 readSnapshotId = at,
@@ -890,6 +928,13 @@ class CatalogService(private val jdbi: Jdbi) {
                 // unpartitioned/unsorted there); listTables skips both.
                 partitionSpec = SpecRepo.specAt(h, cat.catalogId, t.tableId, at),
                 sortSpec = SortRepo.sortSpecAt(h, cat.catalogId, t.tableId, at),
+                // The option as it was at `at`, named by the column at `at`:
+                // the field is top-level, and while the option is on it can
+                // be neither dropped nor renamed, so the lookup cannot miss.
+                objectPrefixField =
+                    LayoutRepo.layoutAt(h, cat.catalogId, t.tableId, at)?.let { id ->
+                        columns.single { it.fieldId == id }.def.name
+                    },
             )
         }
 

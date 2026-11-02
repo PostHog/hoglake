@@ -1,0 +1,179 @@
+[
+ {
+  "name": "id",
+  "type": "long",
+  "field_id": 1,
+  "ordinal": 0,
+  "nullable": false
+ },
+ {
+  "name": "props",
+  "type": "variant",
+  "field_id": 2,
+  "ordinal": 1,
+  "type_params": {
+   "shredding": {
+    "type": "object",
+    "fields": [
+     {
+      "name": "$session_id",
+      "type": "string"
+     },
+     {
+      "name": "$window_id",
+      "type": "string"
+     },
+     {
+      "name": "$group_0",
+      "type": "string"
+     },
+     {
+      "name": "$current_url",
+      "type": "string"
+     },
+     {
+      "name": "$browser",
+      "type": "string"
+     },
+     {
+      "name": "$os",
+      "type": "string"
+     },
+     {
+      "name": "$lib",
+      "type": "string"
+     }
+    ]
+   }
+  }
+ },
+ {
+  "name": "rich",
+  "type": "variant",
+  "field_id": 3,
+  "ordinal": 2,
+  "type_params": {
+   "shredding": {
+    "type": "object",
+    "fields": [
+     {
+      "name": "boolean",
+      "type": "boolean"
+     },
+     {
+      "name": "int8",
+      "type": "int8"
+     },
+     {
+      "name": "int16",
+      "type": "int16"
+     },
+     {
+      "name": "int32",
+      "type": "int32"
+     },
+     {
+      "name": "int64",
+      "type": "int64"
+     },
+     {
+      "name": "float",
+      "type": "float"
+     },
+     {
+      "name": "double",
+      "type": "double"
+     },
+     {
+      "name": "date",
+      "type": "date"
+     },
+     {
+      "name": "time",
+      "type": "time"
+     },
+     {
+      "name": "timestamp",
+      "type": "timestamp"
+     },
+     {
+      "name": "timestamp_ns",
+      "type": "timestamp_ns"
+     },
+     {
+      "name": "timestamptz",
+      "type": "timestamptz"
+     },
+     {
+      "name": "timestamptz_ns",
+      "type": "timestamptz_ns"
+     },
+     {
+      "name": "binary",
+      "type": "binary"
+     },
+     {
+      "name": "string",
+      "type": "string"
+     },
+     {
+      "name": "uuid",
+      "type": "uuid"
+     },
+     {
+      "name": "d4",
+      "type": "decimal4",
+      "precision": 9,
+      "scale": 3
+     },
+     {
+      "name": "d8",
+      "type": "decimal8",
+      "precision": 18,
+      "scale": 2
+     },
+     {
+      "name": "d16",
+      "type": "decimal16",
+      "precision": 38,
+      "scale": 4
+     },
+     {
+      "name": "objs",
+      "type": "array",
+      "element": {
+       "type": "object",
+       "fields": [
+        {
+         "name": "k",
+         "type": "string"
+        }
+       ]
+      }
+     },
+     {
+      "name": "nested",
+      "type": "object",
+      "fields": [
+       {
+        "name": "a",
+        "type": "int64"
+       },
+       {
+        "name": "any",
+        "type": "variant"
+       }
+      ]
+     }
+    ]
+   }
+  }
+ },
+ {
+  "name": "raw",
+  "type": "variant",
+  "field_id": 4,
+  "ordinal": 3,
+  "nullable": false
+ }
+]

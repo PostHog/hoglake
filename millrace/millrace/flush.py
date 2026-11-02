@@ -40,9 +40,9 @@ from __future__ import annotations
 import asyncio
 import importlib.metadata
 import logging
-import struct
 import time
 import uuid
+from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from concurrent.futures import Executor, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -54,7 +54,6 @@ from urllib.parse import quote
 import httpx
 import pyarrow as pa
 import pyarrow.compute as pc
-import pyarrow.parquet as pq
 from pyhoglake import (
     Catalog,
     Column,
@@ -65,14 +64,19 @@ from pyhoglake import (
     HoglakeError,
     IncarnationChangedError,
     Namespace,
+    PreparedPart,
     ReadSnapshotExpiredError,
     Table,
     TableInfo,
     UnsupportedTypeError,
     ValidationError,
+    VariantEncodingError,
+    VariantReport,
+    object_prefix,
+    parquet_write_options,
+    write_part,
 )
 from pyhoglake.models import PartitionSpec
-from pyhoglake.parquet_schema import prepared_schema_matches
 from pyhoglake.stats import extract_column_stats
 from pyhoglake.transforms import (
     partition_source_array,
@@ -87,6 +91,7 @@ from pyhoglake.upload import (
     run_uploads,
     widen_io_threads_for,
 )
+from pyhoglake.variant import encode_json
 
 from . import keyspace
 from .coerce import (
@@ -95,6 +100,7 @@ from .coerce import (
     UnsupportedColumnError,
     coercer_for,
     load_json_object,
+    variant_text,
 )
 from .config import Config
 from .grouping import column_chains, field_names
@@ -130,8 +136,12 @@ _ASSUMED_RETENTION_S: Final = 1800.0
 #: rebuild re-reads the shape and mints a fresh key.
 _REBUILD_ATTEMPTS: Final = 3
 #: A file at least this large registers with footer stats; smaller files
-#: register deferred and the server's hydrator backfills.
+#: register deferred and the server's hydrator backfills (on an
+#: object-prefix table, with the prefix field's stats alone instead).
 FOOTER_STATS_MIN_BYTES: Final = 32 * 1024 * 1024
+#: The flush-time drop reason (``millrace_records_dropped_total``) of a
+#: row whose object-prefix value is null or negative: no prefix holds it.
+REASON_OBJECT_PREFIX_VALUE: Final = "object_prefix_value"
 #: Consecutive failures after which a group is reported stuck (ERROR
 #: log, counter, gauge). Retries continue at the capped backoff.
 STUCK_AFTER: Final = 3
@@ -214,6 +224,20 @@ class FlushStats:
     ambiguous_uploads: int = 0
     dropped_payload_keys: int = 0
     values_clamped: Mapping[str, int] = dataclass_field(default_factory=dict)
+    #: Seconds the builds that returned a plan spent per stage (``BUILD_STAGES``).
+    build_seconds: Mapping[str, float] = dataclass_field(default_factory=dict)
+    #: Seconds builds (raised ones too) waited, after submission, for a pool thread.
+    build_queue_seconds: float = 0.0
+    #: Mapped variant columns' rows per build, by ``(column, outcome)``.
+    variant_rows: Mapping[tuple[str, str], int] = dataclass_field(default_factory=dict)
+    #: Their invalid rows (written as SQL NULL), by ``(column, reason)``.
+    variant_invalid: Mapping[tuple[str, str], int] = dataclass_field(
+        default_factory=dict
+    )
+    #: Their values per declared path, by ``(column, path, outcome)``.
+    variant_values: Mapping[tuple[str, str, str], int] = dataclass_field(
+        default_factory=dict
+    )
 
 
 # -- the payload decoder --------------------------------------------------------
@@ -223,8 +247,8 @@ class FlushStats:
 class DecodedRecord:
     """One staged payload decoded to column-aligned values. ``values``
     holds every destination column (null where the payload lacked a
-    nullable key); ``dropped_keys`` are payload keys the table does not
-    have (dropped, never silently: the flusher counts and logs them)."""
+    nullable key); ``dropped_keys`` are payload keys no column is filled
+    from (dropped, never silently: the flusher counts and logs them)."""
 
     values: dict[str, Any]
     dropped_keys: tuple[str, ...]
@@ -251,16 +275,37 @@ class JsonObjectDecoder:
     non-finite), per-column coercion with int64-per-unit bounds,
     missing nullable keys → null, missing/explicit-null non-nullable
     keys → failure, unknown keys dropped (counted and logged by the
-    flusher)."""
+    flusher). A top-level variant column takes the JSON text at its
+    ``variant_sources`` payload key (:func:`variant_text`), or SQL NULL
+    when unmapped; it never drops a record. With ``prefix_field`` (an
+    object-prefix table's field), a record whose value there is null or
+    negative fails (:data:`REASON_OBJECT_PREFIX_VALUE`): no prefix holds it."""
 
-    def __init__(self, columns: tuple[Column, ...] | Sequence[Column]) -> None:
+    def __init__(
+        self,
+        columns: tuple[Column, ...] | Sequence[Column],
+        variant_sources: Mapping[str, str] | None = None,
+        prefix_field: str | None = None,
+    ) -> None:
         self._columns = tuple(columns)
+        self._prefix_field = prefix_field
+        sources = dict(variant_sources or {})
         #: Timestamps clamped to years 1–9999, by dotted column path.
         self.clamped: dict[str, int] = {}
+        #: Mapped variant values written as SQL NULL, by (column, reason).
+        self.variant_invalid: Counter[tuple[str, str]] = Counter()
+        self._variants = _variant_plans(self._columns, sources)
         self._plans = tuple(
-            (c, coercer_for(c, on_clamp=self._note_clamp)) for c in self._columns
+            (c, coercer_for(c, on_clamp=self._note_clamp))
+            for c in self._columns
+            if c.type != "variant"
         )
-        self._names = frozenset(c.name for c in self._columns)
+        # A variant column's own name is no payload key millrace reads:
+        # only its mapped key is consumed, so a key of the column's name
+        # is an unknown key like any other.
+        self._names = frozenset(
+            c.name for c in self._columns if c.type != "variant"
+        ) | set(sources.values())
         # The Arrow schema is built once here too, so a column the batch
         # build could not describe (a malformed container) is a startup
         # refusal like any other.
@@ -296,8 +341,54 @@ class JsonObjectDecoder:
                 if e.path is None:
                     e.path = column.name
                 raise
+        if self._prefix_field is not None:
+            value = values[self._prefix_field]
+            if value is None or value < 0:
+                raise DecodeError(
+                    f"{self._prefix_field} {value!r} names no object prefix",
+                    reason=REASON_OBJECT_PREFIX_VALUE,
+                    path=self._prefix_field,
+                )
+        # After every column that can drop the record: only kept rows count.
+        for name, key in self._variants:
+            text, reason = (None, None) if key is None else variant_text(doc.get(key))
+            values[name] = text
+            if reason is not None:
+                self.variant_invalid[(name, reason)] += 1
         dropped = tuple(sorted(k for k in doc if k not in self._names))
         return DecodedRecord(values=values, dropped_keys=dropped)
+
+
+def _variant_plans(
+    columns: tuple[Column, ...], sources: Mapping[str, str]
+) -> tuple[tuple[str, str | None], ...]:
+    """Each top-level variant column with the payload key its JSON text
+    comes from, or None: unmapped, it is written as SQL NULL, so adding
+    one to a live table needs no millrace change and removing its
+    mapping is the kill switch. Raises :class:`UnsupportedColumnError`
+    for a mapping that names no top-level variant column, and for a NOT
+    NULL variant column: an invalid value is written as SQL NULL with
+    its row kept (``on_invalid="null"``), and an unmapped one has none."""
+    by_name = {c.name: c for c in columns}
+    for name in sources:
+        column = by_name.get(name)
+        if column is None or column.type != "variant":
+            what = "no top-level column" if column is None else f"a {column.type}"
+            raise UnsupportedColumnError(
+                f"MILLRACE_VARIANT_SOURCES maps column {name!r}, which is {what} "
+                "of the table: only a top-level variant column takes a payload key"
+            )
+    plans = []
+    for column in columns:
+        if column.type != "variant":
+            continue
+        if not column.nullable:
+            raise UnsupportedColumnError(
+                f"variant column {column.name!r} is NOT NULL: millrace writes an "
+                "invalid or unmapped variant value as SQL NULL, keeping the row"
+            )
+        plans.append((column.name, sources.get(column.name)))
+    return tuple(plans)
 
 
 # -- Arrow building -------------------------------------------------------------
@@ -306,12 +397,16 @@ class JsonObjectDecoder:
 def arrow_schema(columns: Sequence[Column]) -> pa.Schema:
     """The batch's Arrow schema: pyhoglake's
     (:func:`~pyhoglake.types.column_to_arrow_field` — field ids on every
-    level). Raises :class:`UnsupportedColumnError` naming a column it
-    cannot describe."""
+    level), a top-level variant as its JSON text (``pa.json_()``). Raises
+    :class:`UnsupportedColumnError` naming a column it cannot describe."""
     fields = []
     for column in sorted(columns, key=lambda c: c.ordinal):
         try:
-            fields.append(column_to_arrow_field(column))
+            if column.type == "variant":
+                # Compiles the declaration: one this pyhoglake cannot write
+                # is refused at startup, not at every build.
+                column_to_arrow_field(column, variant="storage")
+            fields.append(column_to_arrow_field(column, variant="json"))
         except (UnsupportedTypeError, ValidationError) as e:
             raise UnsupportedColumnError(
                 f"column {column.name!r} has no Arrow form this writer can build: {e}"
@@ -389,45 +484,14 @@ def _encode_field(f: pa.Field) -> pa.Field:
     return f.with_type(_encode_type(f.type))
 
 
-def _map_entries_type(t: pa.DataType) -> pa.DataType:
-    """``t`` with every map's entries struct under Arrow's default name.
-    A parquet round trip names a map's entries after the COLUMN (pyarrow
-    reads ``map<k, v ('m')>`` back for a column ``m`` it wrote as
-    ``entries``), and Arrow type equality compares that name; nothing
-    else about the type, field ids included, is touched."""
-    if pa.types.is_map(t):
-        return pa.map_(
-            t.key_field.with_type(_map_entries_type(t.key_type)),
-            t.item_field.with_type(_map_entries_type(t.item_type)),
-            keys_sorted=t.keys_sorted,
-        )
-    if pa.types.is_struct(t):
-        return pa.struct(
-            [
-                t.field(i).with_type(_map_entries_type(t.field(i).type))
-                for i in range(t.num_fields)
-            ]
-        )
-    if pa.types.is_list(t):
-        return pa.list_(t.value_field.with_type(_map_entries_type(t.value_type)))
-    return t
-
-
-def file_schema(schema: pa.Schema) -> pa.Schema:
-    """A written file's Arrow schema, comparable with the encoding schema
-    (:func:`_map_entries_type`)."""
-    return pa.schema(
-        [f.with_type(_map_entries_type(f.type)) for f in schema],
-        metadata=schema.metadata,
-    )
-
-
 def _encode_schema(schema: pa.Schema) -> pa.Schema:
     """The parquet-encoding schema: the catalog schema with field ids,
-    plus the one storage conversion pyhoglake's writer path makes —
-    Parquet has no seconds timestamp unit, so ``timestamp_s`` is stored
-    as milliseconds (mirrors ``Table._prepare_append``, which does it for
-    top-level columns; this does it at every depth)."""
+    every ``timestamp_s`` (at any depth) as the milliseconds Parquet
+    stores. ``write_part`` takes seconds as well, but writes the Arrow
+    schema it is given into the footer, so seconds would be other bytes
+    than this cast writes (the golden fixture pins them); and the cast
+    belongs to the batch build, where a value that fails it is isolated
+    to its record (:data:`_BUILD_FAILURES`)."""
     return pa.schema(
         [_encode_field(field) for field in schema], metadata=schema.metadata
     )
@@ -464,15 +528,17 @@ _SORT_NULL_ORDERS: Final = {"nulls_first": "at_start", "nulls_last": "at_end"}
 
 
 #: Column types that are no partition or sort source: containers have no
-#: single value per row, and a json value has no order or transform this
-#: writer (or the server) defines.
-_UNORDERED_TYPES: Final = frozenset({"struct", "list", "map", "json"})
+#: single value per row, and a json or variant value has no order or
+#: transform this writer (or the server) defines. variant is listed by
+#: type: the decoder takes a top-level variant column, so no decode
+#: refusal stands in for this one.
+_UNORDERED_TYPES: Final = frozenset({"struct", "list", "map", "json", "variant"})
 _REPEATED_TYPES: Final = frozenset({"list", "map"})
 
 
 def _source_fault(chain: tuple[Column, ...]) -> str | None:
     """Why a partition/sort source chain cannot be read as one scalar per
-    row, or None: a container or json leaf, or a leaf under a
+    row, or None: a container, json or variant leaf, or a leaf under a
     list or a map (many values per row). A struct leaf is fine — it is
     read by path."""
     leaf = chain[-1]
@@ -494,8 +560,8 @@ def _spec_sort_keys(info: TableInfo) -> list[tuple[tuple[str, ...], str, str]]:
     is its root-to-leaf name path); ``[]`` for an unsorted table.
 
     A field that does not resolve to a live column, resolves to one that
-    is not one scalar per row (a container, json, or a leaf
-    under a list or a map), or carries a direction/null_order outside the
+    is not one scalar per row (a container, a json or variant
+    column, or a leaf under a list or a map), or carries a direction/null_order outside the
     wire vocabulary, is a shape this writer cannot honor — refused
     LOUDLY (the same posture as the partition-spec guard below), never
     silently unsorted: an unsorted file under a sorted spec is exactly
@@ -700,6 +766,89 @@ def _partition_groups(
     return out
 
 
+# -- object-prefix placement -----------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _Placement:
+    """Where an object-prefix table's files go: under ``<field>=<value>/``,
+    ``value`` a file's partition value at ``key_index``, with inline stats
+    for ``field_id`` that prove it."""
+
+    field: str
+    field_id: int
+    type: str
+    key_index: int
+
+
+def _placement(info: TableInfo) -> _Placement | None:
+    """The live shape's placement, or None while its option is off. A
+    field that is not a top-level column of an allowed type, or that has
+    no single identity field in the live spec, breaks invariants the
+    server keeps (it refuses both): a shape this writer cannot honor,
+    refused like a spec it cannot honor."""
+    name = info.object_prefix_field
+    if name is None:
+        return None
+    where = f"{info.namespace}.{info.name}"
+    column = next((c for c in info.columns if c.name == name), None)
+    if column is None or column.type not in object_prefix.MAX_VALUE:
+        found = "no top-level column" if column is None else f"a {column.type!r}"
+        raise FlushError(
+            f"object prefix field {name!r} of {where} is {found}, not an "
+            "allowed integer column"
+        )
+    spec = info.partition_spec
+    index = (
+        None if spec is None else object_prefix.key_index(spec.fields, column.field_id)
+    )
+    if index is None:
+        raise FlushError(
+            f"object prefix field {name!r} of {where} has no single identity "
+            "field in the live partition spec"
+        )
+    return _Placement(name, column.field_id, column.type, index)
+
+
+def _placed_uri(
+    written: PreparedPart,
+    info: TableInfo,
+    placement: _Placement,
+    partition_values: Sequence[str | None],
+    *,
+    data_path: str,
+    build: str,
+    index: int,
+) -> str:
+    """An object-prefix file's key, once its own footer stats for the
+    prefix field prove its partition value: the check the server makes
+    at commit, made before upload. Rows that cannot be placed were
+    dropped at decode, so a failure is a millrace encoder bug."""
+    raw = partition_values[placement.key_index]
+    value = object_prefix.parse_value(raw, placement.type)
+    if value is None:
+        raise FlushError(
+            f"partition value {raw!r} of {placement.field!r} names no object "
+            "prefix (a millrace encoder bug); the rows stay staged"
+        )
+    stats = next(
+        (
+            s
+            for s in extract_column_stats(written.metadata, info.columns)
+            if s.field_id == placement.field_id
+        ),
+        None,
+    )
+    verdict = object_prefix.check_field_stats(info, value, stats)
+    if verdict != "OK":
+        raise FlushError(
+            f"the file for {placement.field}={raw} fails its own prefix check "
+            f"({verdict}): a millrace encoder bug; the rows stay staged"
+        )
+    prefix = object_prefix.prefix(data_path, info, value)
+    return f"{prefix}{build}/{index}.parquet"
+
+
 # -- commit message --------------------------------------------------------------
 
 
@@ -795,13 +944,18 @@ class FlushPlan:
     dropped_indices: tuple[int, ...] = ()
     #: Timestamps clamped to years 1–9999, by dotted column path.
     clamped: Mapping[str, int] = dataclass_field(default_factory=dict)
+    #: Seconds the build spent per stage (:data:`BUILD_STAGES`).
+    stage_seconds: Mapping[str, float] = dataclass_field(default_factory=dict)
+    #: Per mapped variant column, what encoding its rows found.
+    variant: Mapping[str, VariantReport] = dataclass_field(default_factory=dict)
 
 
-def _footer_size(raw: bytes) -> int:
-    """The 4-byte LE thrift footer length stored in the parquet trailer,
-    excluding the 8-byte suffix (pyhoglake's wire convention)."""
-    (meta_len,) = struct.unpack("<I", raw[-8:-4])
-    return int(meta_len)
+#: The build's timed stages, in order (``millrace_flush_build_seconds_total``).
+BUILD_STAGES: Final = ("decode", "build", "sort", "fanout", "variant_encode", "write")
+#: zstd at compaction's level (ParquetRewriter.DEFAULT_ZSTD_LEVEL): pyarrow's
+#: default snappy left files ~3x larger than compaction's rewrite of them, in
+#: upload bytes and in the spool. Validated at import, so at startup.
+_WRITE_OPTIONS: Final = parquet_write_options("zstd", 3)
 
 
 def build_flush_plan(
@@ -813,17 +967,46 @@ def build_flush_plan(
     max_files_per_commit: int,
     footer_stats_min_bytes: int,
     version: str,
+    variant_sources: Mapping[str, str] | None = None,
+    clock: Callable[[], float] = time.perf_counter,
 ) -> FlushPlan:
     """Decode → Arrow → sort by the live sort spec → fan out by the live
-    partition spec → parquet → commit requests of at most
-    ``max_files_per_commit`` files each. Pure: no I/O, no clock.
+    partition spec → parquet (pyhoglake's ``write_part``, one file per
+    tuple) → commit requests of at most ``max_files_per_commit`` files
+    each. Pure: no I/O; ``clock`` only times the stages.
+
+    Each mapped variant column (``variant_sources``) is encoded per file,
+    after the fanout, with ``on_invalid="null"``: an invalid value is SQL
+    NULL and its row is kept. It is encoded here rather than inside
+    ``write_part`` for a report per column (the core's sums them all).
 
     Sorting happens before the fanout (a group filter keeps row order),
     so every file is key-nondecreasing under the sort spec compaction
-    enforces; staging order is Kafka offset order, not event time."""
+    enforces; staging order is Kafka offset order, not event time.
+
+    While the table's ``object_prefix_field`` is set, each file goes
+    under its value's prefix with that field's stats inline (its full
+    footer stats at ``footer_stats_min_bytes`` or more), and a row whose
+    value is null or negative is dropped (:data:`REASON_OBJECT_PREFIX_VALUE`).
+    """
     if max_files_per_commit < 1:
         raise ValueError("max_files_per_commit must be >= 1")
-    decoder = JsonObjectDecoder(info.columns)
+    placement = _placement(info)
+    seconds = dict.fromkeys(BUILD_STAGES, 0.0)
+    mark = clock()
+
+    def lap(stage: str) -> None:
+        nonlocal mark
+        now = clock()
+        seconds[stage] += now - mark
+        mark = now
+
+    sources = dict(variant_sources or {})
+    decoder = JsonObjectDecoder(
+        info.columns, sources, None if placement is None else placement.field
+    )
+    mapped = [c for c in info.columns if c.name in sources]
+    reports = {c.name: VariantReport() for c in mapped}
     staged_bytes = sum(len(payload) for _, payload in records)
     good: list[tuple[keyspace.RowKey, bytes, DecodedRecord]] = []
     good_indices: list[int] = []
@@ -842,6 +1025,7 @@ def build_flush_plan(
         dropped_keys.update(record.dropped_keys)
         good.append((row_key, payload_bytes, record))
         good_indices.append(index)
+    lap("decode")
     if not good:
         return FlushPlan(
             (),
@@ -852,6 +1036,7 @@ def build_flush_plan(
             tuple(sorted(dropped_keys)),
             tuple(dropped_indices),
             dict(decoder.clamped),
+            seconds,
         )
 
     encoded = _build_batch_or_raise(good, decoder.columns)
@@ -859,16 +1044,17 @@ def build_flush_plan(
     # The decoded rows are the bulk of the build's memory; the parquet
     # writes below need only the encoded table.
     del good
-    encode_schema = encoded.schema
     # A row-index column rides through the sort and the fanout so each
     # file knows which staged rows it holds (a commit settles its own
     # rows as soon as it lands); it is dropped before the parquet write.
     encoded = encoded.append_column(
         _ROW_INDEX, pa.array(range(good_count), type=pa.int64())
     )
+    lap("build")
     sort_keys = _spec_sort_keys(info)
     if sort_keys:
         encoded = _sort_batch_by_spec(encoded, sort_keys)
+    lap("sort")
     spec = info.partition_spec
     parts: list[tuple[tuple[str | None, ...] | None, pa.Table]]
     if spec is not None and spec.fields:
@@ -876,6 +1062,7 @@ def build_flush_plan(
     else:
         parts = [(None, encoded)]
     del encoded
+    lap("fanout")
 
     label = keyspace.group_label(ctx.group_fields, ctx.group)
     base = f"{data_path.rstrip('/')}/data/{info.namespace}/{info.name}/{ctx.build}"
@@ -884,38 +1071,82 @@ def build_flush_plan(
         partition_values, part = parts[index]
         # Release each fanout slice once written.
         parts[index] = (partition_values, _EMPTY)
-        rows: list[int] = part.column(_ROW_INDEX).to_pylist()
-        part = part.drop_columns([_ROW_INDEX])
-        sink = pa.BufferOutputStream()
-        # zstd at compaction's level (ParquetRewriter.DEFAULT_ZSTD_LEVEL):
-        # pyarrow's default snappy left files ~3x larger than compaction's
-        # rewrite of them, in upload bytes and in the spool.
-        pq.write_table(part, sink, compression="zstd", compression_level=3)
+        try:
+            # Lapped only for a mapped column, and before the row-index
+            # bookkeeping, so the stage times the encode alone.
+            if mapped:
+                for column in mapped:
+                    i = part.schema.get_field_index(column.name)
+                    storage = encode_json(part.column(i), column, on_invalid="null")
+                    reports[column.name].merge(storage.report)
+                    field = part.schema.field(i).with_type(storage.array.type)
+                    part = part.set_column(i, field, storage.array)
+                    del storage
+                lap("variant_encode")
+            rows: list[int] = part.column(_ROW_INDEX).to_pylist()
+            part = part.drop_columns([_ROW_INDEX])
+            written = write_part(part, info.columns, write_options=_WRITE_OPTIONS)
+        except VariantEncodingError as e:
+            # Its column and reason only: the message and path may quote
+            # payload keys. With on_invalid="null" no value raises; this is
+            # a NOT NULL column or the encoder failing its own output.
+            raise FlushError(
+                f"variant column {e.column!r} could not be written ({e.reason}): "
+                "a millrace encoder bug; the rows stay staged"
+            ) from None
+        except ValidationError as e:
+            # The core reads the footer back and holds it to the
+            # destination's schema; the table was built at that schema.
+            raise FlushError(
+                f"the encoded parquet is not the destination's (a millrace "
+                f"encoder bug): {e}"
+            ) from e
         del part
-        raw = sink.getvalue()
-        with pq.ParquetFile(pa.BufferReader(raw)) as parquet:
-            if not prepared_schema_matches(
-                file_schema(parquet.schema_arrow), encode_schema
-            ):
-                raise FlushError(
-                    "encoded parquet schema/field ids differ from the "
-                    "destination schema (a millrace encoder bug)"
-                )
-            metadata = parquet.metadata
-        uri = f"{base}/{index}.parquet"
-        registration: dict[str, Any] = {
-            "path": uri,
-            "record_count": metadata.num_rows,
-            "file_size_bytes": raw.size,
-            "footer_size": _footer_size(bytes(raw[-8:])),
-        }
-        if raw.size >= footer_stats_min_bytes:
-            registration["column_stats"] = [
-                stat.to_wire() for stat in extract_column_stats(metadata, info.columns)
-            ]
-        if partition_values is not None:
-            registration["partition_values"] = list(partition_values)
-        files.append((registration, Upload(uri=uri, size=raw.size, body=raw), rows))
+        footer_stats = written.size >= footer_stats_min_bytes
+        if placement is None:
+            uri = f"{base}/{index}.parquet"
+            stats, stats_field_ids = footer_stats, None
+        else:
+            assert partition_values is not None  # _placement found a spec field
+            uri = _placed_uri(
+                written,
+                info,
+                placement,
+                partition_values,
+                data_path=data_path,
+                build=ctx.build,
+                index=index,
+            )
+            # Inline, never deferred: the file is provided (mountable and
+            # compactable) at commit, and no hydrator older than 2.1c can
+            # flip it unchecked.
+            stats = True
+            stats_field_ids = None if footer_stats else {placement.field_id}
+        try:
+            registration = written.registration(
+                uri,
+                info.columns,
+                stats=stats,
+                partition_values=partition_values,
+                stats_field_ids=stats_field_ids,
+            )
+        except ValidationError as e:
+            raise FlushError(
+                f"the file's registration was refused (a millrace encoder bug): {e}"
+            ) from e
+        files.append(
+            (registration, Upload(uri=uri, size=written.size, body=written.body), rows)
+        )
+        lap("write")
+    # A value the decoder nulled reached the encoder as SQL NULL; it is an
+    # invalid row all the same.
+    for (name, reason), count in decoder.variant_invalid.items():
+        report = reports[name]
+        report.sql_null_rows -= count
+        report.invalid_rows += count
+        report.invalid_by_reason[reason] = (
+            report.invalid_by_reason.get(reason, 0) + count
+        )
 
     chunks = [
         files[i : i + max_files_per_commit]
@@ -968,10 +1199,20 @@ def build_flush_plan(
         dropped_keys=tuple(sorted(dropped_keys)),
         dropped_indices=tuple(dropped_indices),
         clamped=dict(decoder.clamped),
+        stage_seconds=seconds,
+        variant=reports,
     )
 
 
 _EMPTY: Final = pa.table({})
+
+
+def _started[R](fn: Callable[[], R], clock: Callable[[], float], at: list[float]) -> R:
+    """``fn``'s result, after appending to ``at`` when it began on
+    ``clock``: the submitter subtracts its submit time for the wait for a
+    pool thread, and reads it whether ``fn`` returns or raises."""
+    at.append(clock())
+    return fn()
 
 
 FlushOutcome = Literal["committed", "dropped", "empty"]
@@ -1258,7 +1499,7 @@ class HoglakeFlusher:
         flusher._shape_read_at = flusher._monotonic()
         flusher._resolved_info = info
         try:
-            JsonObjectDecoder(info.columns)
+            JsonObjectDecoder(info.columns, flusher._variant_sources)
         except UnsupportedColumnError as e:
             raise FlushStartupError(str(e)) from e
         spec = info.partition_spec
@@ -1296,6 +1537,7 @@ class HoglakeFlusher:
                     ) from e
         try:
             _spec_sort_keys(info)
+            _placement(info)
         except FlushError as e:
             raise FlushStartupError(str(e)) from e
         # Build the shared upload client now, on one thread: pyhoglake
@@ -1316,7 +1558,7 @@ class HoglakeFlusher:
             log.debug("could not install the Retry-After hook")
         log.info(
             "millrace destination resolved: %s/%s/%s table_uuid=%s "
-            "read_snapshot=%d (%d columns, spec %s)",
+            "read_snapshot=%d (%d columns, spec %s, object prefix %s)",
             cfg.catalog,
             cfg.namespace,
             cfg.table,
@@ -1326,6 +1568,7 @@ class HoglakeFlusher:
             "none"
             if spec is None
             else f"id={spec.spec_id} ({len(spec.fields)} fields)",
+            info.object_prefix_field or "off",
         )
         return flusher
 
@@ -1345,6 +1588,7 @@ class HoglakeFlusher:
             raise ValueError(f"io_workers must be >= 1, got {io_workers}")
         self._client = client
         self._cfg = cfg
+        self._variant_sources = dict(cfg.variant_sources)
         # The shared upload client's pool: one decision's fan-out times
         # the decisions in flight, one size for the process (_upload).
         self._upload_pool = (
@@ -1388,6 +1632,11 @@ class HoglakeFlusher:
         self._pinned_stages: set[str] = set()
         self._values_clamped: dict[str, int] = {}
         self._clamp_logged: dict[str, float] = {}
+        self._build_seconds = dict.fromkeys(BUILD_STAGES, 0.0)
+        self._build_queue_seconds = 0.0
+        self._variant_rows: Counter[tuple[str, str]] = Counter()
+        self._variant_invalid: Counter[tuple[str, str]] = Counter()
+        self._variant_values: Counter[tuple[str, str, str]] = Counter()
 
     def close(self) -> None:
         """Close the HTTP client and (if owned) the executor. Idempotent."""
@@ -1406,6 +1655,11 @@ class HoglakeFlusher:
     def resolved_info(self) -> TableInfo:
         """The shape read at startup (the consumer's first keyer)."""
         return self._resolved_info
+
+    @property
+    def destination(self) -> tuple[str, str]:
+        """The configured catalog and ``namespace.table``."""
+        return self._cfg.catalog, f"{self._cfg.namespace}.{self._cfg.table}"
 
     def shape_reader(self) -> ShapeReader:
         """The consumer's keyer-refresh source, pinned to this incarnation."""
@@ -1428,6 +1682,11 @@ class HoglakeFlusher:
             ambiguous_uploads=self._ambiguous_uploads,
             values_clamped=dict(self._values_clamped),
             dropped_payload_keys=self._dropped_payload_keys,
+            build_seconds=dict(self._build_seconds),
+            build_queue_seconds=self._build_queue_seconds,
+            variant_rows=dict(self._variant_rows),
+            variant_invalid=dict(self._variant_invalid),
+            variant_values=dict(self._variant_values),
         )
 
     async def check_stage_identity(
@@ -1436,7 +1695,11 @@ class HoglakeFlusher:
         """Halt when the stage's rows were first committed to another
         incarnation of the destination (``meta/table_uuid``): the halt
         survives restarts, not only the process that saw the recreate.
-        With ``pin``, an unpinned stage records this incarnation."""
+        With ``pin``, an unpinned stage records this incarnation. A stage
+        pinned to ``stage_repin_from`` (a planned move to this table) is
+        re-pinned instead: a row committed there left the stage when its
+        commit landed, so every staged row belongs here (but the
+        at-least-once replay of a commit whose delete was lost)."""
         if stage.path in self._pinned_stages:
             return
         pinned = await stage.pinned_table_uuid()
@@ -1445,12 +1708,27 @@ class HoglakeFlusher:
                 return
             await stage.pin_table_uuid(self._table_uuid)
         elif pinned != self._table_uuid:
-            raise FlushHalted(
-                "table_recreated",
-                f"{stage.topic}[{stage.partition}]'s staged rows were committed "
-                f"to incarnation {pinned} of {self._cfg.namespace}."
-                f"{self._cfg.table}, which now resolves to {self._table_uuid}. "
-                "A human decides what happened; staged rows stay durable.",
+            if pinned != self._cfg.stage_repin_from:
+                knob = self._cfg.stage_repin_from or "unset"
+                raise FlushHalted(
+                    "table_recreated",
+                    f"{stage.topic}[{stage.partition}]'s staged rows were committed "
+                    f"to incarnation {pinned}; {self._cfg.namespace}."
+                    f"{self._cfg.table} now resolves to {self._table_uuid}. "
+                    "A human decides what happened (a planned move here sets "
+                    f"MILLRACE_STAGE_REPIN_FROM={pinned}; it is {knob}); staged "
+                    "rows stay durable.",
+                )
+            await stage.pin_table_uuid(self._table_uuid)
+            log.warning(
+                "%s[%d] re-pinned from %s to %s (%s.%s, MILLRACE_STAGE_REPIN_FROM): "
+                "it now flushes there",
+                stage.topic,
+                stage.partition,
+                pinned,
+                self._table_uuid,
+                self._cfg.namespace,
+                self._cfg.table,
             )
         self._pinned_stages.add(stage.path)
 
@@ -1671,8 +1949,8 @@ class HoglakeFlusher:
             if key not in self._warned_dropped:
                 self._warned_dropped.add(key)
                 log.warning(
-                    "payload key %r is not a column of %s.%s; dropping it from "
-                    "every flush (no schema evolution)",
+                    "payload key %r fills no column of %s.%s (a variant takes only its "
+                    "mapped key); dropping it from every flush (no schema evolution)",
                     key,
                     info.namespace,
                     info.name,
@@ -1848,18 +2126,37 @@ class HoglakeFlusher:
                 table_uuid=self._table_uuid,
                 build=self._new_token(),
             )
-            plan = await self._io(
-                partial(
-                    build_flush_plan,
-                    [scan.rows[k] for k in inputs[i]],
-                    info,
-                    ctx=ctx,
-                    data_path=self._catalog.data_path,
-                    max_files_per_commit=self._cfg.max_files_per_commit,
-                    footer_stats_min_bytes=FOOTER_STATS_MIN_BYTES,
-                    version=_millrace_version(),
+            started: list[float] = []
+            submitted = self._monotonic()
+            try:
+                plan = await self._io(
+                    partial(
+                        _started,
+                        partial(
+                            build_flush_plan,
+                            [scan.rows[k] for k in inputs[i]],
+                            info,
+                            ctx=ctx,
+                            data_path=self._catalog.data_path,
+                            max_files_per_commit=self._cfg.max_files_per_commit,
+                            footer_stats_min_bytes=FOOTER_STATS_MIN_BYTES,
+                            version=_millrace_version(),
+                            variant_sources=self._variant_sources,
+                        ),
+                        self._monotonic,
+                        started,
+                    )
                 )
-            )
+            finally:
+                # Summed here, on the loop, never on the pool's threads; a
+                # build that raised waited all the same. Its stage seconds
+                # ride on the plan, so only a returned plan's are counted.
+                if started:
+                    self._build_queue_seconds += started[0] - submitted
+            for name, seconds in plan.stage_seconds.items():
+                self._build_seconds[name] += seconds
+            for column, report in plan.variant.items():
+                self._note_variant(column, report)
             return plan, keyspace.group_label(fields, scan.group)
 
         outcomes = await asyncio.gather(
@@ -1875,6 +2172,27 @@ class HoglakeFlusher:
                 raise outcome
             out.append(outcome)
         return out
+
+    def _note_variant(self, column: str, report: VariantReport) -> None:
+        """Count one build's encode of a mapped variant column. Every
+        label is the catalog's (the column, a declared path) or a closed
+        vocabulary; ``first_invalid`` holds payload keys and is never read."""
+        rows = (
+            ("encoded", report.rows - report.sql_null_rows - report.invalid_rows),
+            ("sql_null", report.sql_null_rows),
+            ("invalid", report.invalid_rows),
+        )
+        for outcome, count in rows:
+            self._variant_rows[(column, outcome)] += count
+        for reason, count in report.invalid_by_reason.items():
+            self._variant_invalid[(column, reason)] += count
+        for outcome, counts in (
+            ("typed", report.typed),
+            ("fallback", report.fallback),
+            ("variant_null", report.variant_null),
+        ):
+            for (_, path), count in counts.items():
+                self._variant_values[(column, path, outcome)] += count
 
     def _chunk(
         self, built: Sequence[tuple[int, FlushPlan, str]]
@@ -2229,7 +2547,8 @@ class FlushRunner:
         """Flush everything staged, before the consumer starts (nothing
         new arrives meanwhile). First every stage's pinned incarnation is
         checked: a recreated destination halts before anything is
-        flushed. Then each stage (the home and every foreign slot)
+        flushed, and a planned move re-pins (``stage_repin_from``),
+        empty stages included. Then each stage (the home and every foreign slot)
         streams its rows in one sequential pass (:meth:`_drain_stage`),
         stages concurrently, at most ``concurrency`` batches in memory at
         once. A group whose window
@@ -2243,6 +2562,12 @@ class FlushRunner:
             except FlushHalted as halt:
                 self._fatal = halt
                 raise
+            except Exception as e:
+                # A re-pin writes (MILLRACE_STAGE_REPIN_FROM).
+                if not is_fenced(e):
+                    raise
+                self._fatal = FencedError([(topic, partition)])
+                raise self._fatal from e
         slots = asyncio.Semaphore(self._concurrency)
         streams = [
             asyncio.create_task(

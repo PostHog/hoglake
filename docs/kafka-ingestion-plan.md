@@ -86,6 +86,13 @@ pinned.
 
 ## Phase 1 — keyspace and planner (the pure core)
 
+> **Superseded by #382** (at-least-once simplification): the keyspace is `rows/` plus
+> `meta/fence` and `meta/table_uuid`, with no `stats`/`sched_age`/
+> `prepared/`/`flushed/` prefixes, and there is one SlateDB per replica
+> (its home stage), not per partition. See
+> [kafka-ingestion.md](kafka-ingestion.md) for the current design; the
+> text below is the original plan.
+
 **Scope.** `keyspace.py`: `(team_id, timestamp, offset)` row-key codec,
 `stats`/`sched_age` prefixes, side prefixes for Kafka offset ranges,
 persisted prepared requests (`prepared/`, v3 envelopes carrying the
@@ -142,6 +149,13 @@ deletes, staged-bytes accounting for the gauges.
 
 ## Phase 3 — consume
 
+> **Superseded by #382** (at-least-once simplification): assignment is static (`p % replica_count`), the
+> default `auto.offset.reset` is `latest`, there is no pause/resume, and
+> a record that can never become a row is dropped and counted, not
+> quarantined. See
+> [kafka-ingestion.md](kafka-ingestion.md) for the current design; the
+> text below is the original plan.
+
 **Scope.** `consumer.py`: confluent-kafka, partition claiming that
 follows the consumer assignment (a replica claims a partition *and* its
 SlateDB instance together; assignments may change between deploys),
@@ -158,6 +172,13 @@ quarantine.
 **Exit:** fake-driven suite covers every loop branch.
 
 ## Phase 4 — flush and the wire contract
+
+> **Superseded by #382** (at-least-once simplification): requests are not persisted (a
+> fresh idempotency key per build; delivery is at-least-once), an
+> expired or DDL-refused read basis rebuilds, and a non-retryable 4xx
+> fails the decision and retries with backoff instead of quarantining. See
+> [kafka-ingestion.md](kafka-ingestion.md) for the current design; the
+> text below is the original plan.
 
 **Scope.** `flush.py`: scan staged range → Arrow → junk
 quarantine/clamp → partition fanout `(team_id, month(timestamp))` →
@@ -222,7 +243,7 @@ live gate; the harness fails on skips.
 ## Phase 5.5 — external maintenance services
 
 Per docs/kafka-ingestion.md §Maintenance services: a separate
-deployment looping all per-partition SlateDB instances (across topics
+deployment looping all per-replica SlateDB instances (across topics
 and replicas) for GC now and compaction when the binding route lands.
 
 - **GC + debt-monitoring service** (the decided scope, 2026-10-09 —
@@ -246,11 +267,17 @@ and replicas) for GC now and compaction when the binding route lands.
 
 ## Phase 5.6 — review follow-ups (adversarial review 2026-10-09)
 
+> **Superseded by #382** (at-least-once simplification): the C2 `flushed/` marker and C3
+> `prepared/` envelope items no longer apply. See
+> [kafka-ingestion.md](kafka-ingestion.md) for the current design; the
+> text below is the original plan.
+
 > 2026-10-10, PR #331 review: pyarrow floor is >= 25.0 (the
-> sort-keys triple form), float columns check float32 range, unpaired
+> sort-keys triple form; now >= 26.0.0), float columns check float32 range, unpaired
 > surrogates are per-record poison.
 
-Full findings: `millrace/ADVERSARIAL-REVIEW-2026-10-09.md`. Verdict was
+Full findings: `millrace/ADVERSARIAL-REVIEW-2026-10-09.md` (never
+committed; not in the repo). Verdict was
 fix-before-review; work proceeds in batches because the files overlap.
 
 - **Correctness batch** (in flight): C1 decoder overflow boundary,
@@ -262,7 +289,7 @@ fix-before-review; work proceeds in batches because the files overlap.
   flush windows (scan capped by the size-lane-derived budget, window
   narrowed to the covered offset prefix, per-team outstanding-entry
   gate); M5 flush-runner throughput measured (1024 ready keys × 4
-  partitions: 72 keys/s serial, 286 at the default concurrency 4 on the
+  partitions: 72 keys/s serial, 286 at concurrency 4 (then the default; now 2) on the
   in-memory rig — serial within 2× of the ~110/s the design wants, so
   bound-parallel flush shipped: per-partition in-flight cap, the
   flusher's I/O pool sized to match) and evidence noted in
@@ -285,7 +312,8 @@ fix-before-review; work proceeds in batches because the files overlap.
 - **Queued majors** (after these — same files): M7 earliest-replay
   boundary documented, consider `flushed/`-marker suppression; M8
   mutmut into the millrace CI job with a survivors check against the
-  ledger.
+  ledger (landed: `ci-python.yml` runs `mutmut run` +
+  `tests/check_mutants.py`).
 
 ## Phase 6 — benches (the design's validation items, closed out)
 

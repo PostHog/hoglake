@@ -11,6 +11,7 @@ flush against 18 ms of server commit.
 
 import builtins
 import contextlib
+import json
 import logging
 import re
 import struct
@@ -35,6 +36,7 @@ from pyhoglake import (
 from pyhoglake import client as client_module
 from pyhoglake import upload as upload_module
 from pyhoglake.client import Namespace
+from pyhoglake.stats import extract_column_stats
 from pyhoglake.types import columns_to_arrow_schema
 from pyhoglake.upload import (
     CONCURRENCY_ENV,
@@ -255,6 +257,82 @@ def test_prepare_tables_registrations_match_prepare_files(
     )
 
 
+def _wire_map(name, field_id, ordinal, value):
+    key = {"name": "key", "type": "string", "field_id": field_id + 1, "ordinal": 0}
+    return {
+        "name": name,
+        "type": "map",
+        "field_id": field_id,
+        "ordinal": ordinal,
+        "children": [{**key, "nullable": False}, {**value, "ordinal": 1}],
+    }
+
+
+# A flat map, and a list of maps whose values are maps (hoglake#359).
+MAP_TABLE_WIRE = {
+    **TABLE_WIRE,
+    "columns": [
+        TABLE_WIRE["columns"][0],
+        _wire_map("attrs", 2, 1, {"name": "value", "type": "string", "field_id": 4}),
+        {
+            "name": "nested",
+            "type": "list",
+            "field_id": 5,
+            "ordinal": 2,
+            "children": [
+                _wire_map(
+                    "element",
+                    6,
+                    0,
+                    _wire_map(
+                        "value", 8, 1, {"name": "value", "type": "long", "field_id": 10}
+                    ),
+                )
+            ],
+        },
+    ],
+}
+
+
+def test_map_columns_prepare_through_both_paths(httpx_mock, recording_s3, tmp_path):
+    """pyarrow reads a map's entries struct back named after its field,
+    and the prepared-file check compared that name, so every map-bearing
+    table was refused by BOTH entry points, including the bytes
+    prepare_append_tables had just encoded itself (hoglake#359)."""
+    table = resolved_table(httpx_mock, recording_s3, MAP_TABLE_WIRE)
+    schema = columns_to_arrow_schema(table.columns)
+    data = pa.Table.from_pylist(
+        [
+            {"id": 1, "attrs": [("a", "x")], "nested": [[("k", [("v", 2)])]]},
+            {"id": 2, "attrs": None, "nested": [[]]},
+        ],
+        schema=schema,
+    )
+    path = tmp_path / "maps.parquet"
+    pq.write_table(data, path)
+
+    from_files = table.prepare_append_files(
+        [(str(path), None)], idempotency_key=str(uuid.uuid4())
+    )
+    from_tables = table.prepare_append_tables(
+        [(data, None)], idempotency_key=str(uuid.uuid4())
+    )
+    file_reg = from_files["appends"][0]["files"][0]
+    table_reg = from_tables["appends"][0]["files"][0]
+    assert {k: v for k, v in table_reg.items() if k != "path"} == {
+        k: v for k, v in file_reg.items() if k != "path"
+    }
+    assert table_reg["record_count"] == 2
+    # The innermost map value (field 10) is registered, through all three
+    # repetition layers.
+    assert 10 in {s["field_id"] for s in table_reg["column_stats"]}
+    for reg in (file_reg, table_reg):
+        assert recording_s3.files[reg["path"].removeprefix("s3://")] == (
+            path.read_bytes()
+        )
+    table._namespace._catalog._client.close()
+
+
 def test_prepare_tables_carries_partition_values_and_input_order(httpx_mock):
     """Registrations follow the INPUT order, not the order the uploads
     finished — the server assigns row ids in registration order, so the
@@ -283,9 +361,13 @@ def test_prepare_tables_carries_partition_values_and_input_order(httpx_mock):
     ]
 
 
-def test_prepare_tables_refuses_a_variant_destination(httpx_mock, recording_s3):
-    """An Arrow rewrite drops the native VARIANT annotation, so there is
-    no honest way to serve a variant destination from an Arrow table."""
+def test_prepare_tables_refuses_a_group_without_its_variant_column(
+    httpx_mock, recording_s3
+):
+    """A variant destination is written from Arrow tables now
+    (test_variant_write.py), but each group still holds every column: a
+    missing variant column is refused by the schema comparison, before any
+    upload."""
     with_variant = {
         **TABLE_WIRE,
         "columns": [
@@ -301,7 +383,7 @@ def test_prepare_tables_refuses_a_variant_destination(httpx_mock, recording_s3):
     }
     table = resolved_table(httpx_mock, recording_s3, with_variant)
     schema = columns_to_arrow_schema(table.columns[:2])
-    with pytest.raises(ValidationError, match="native Parquet VARIANT") as excinfo:
+    with pytest.raises(ValidationError, match="schema/field IDs") as excinfo:
         table.prepare_append_tables(
             [(_rows(1, schema), None)], idempotency_key=str(uuid.uuid4())
         )
@@ -1053,6 +1135,106 @@ def test_an_unavailable_codec_is_refused(monkeypatch):
         parquet_write_options("zstd", 3)
     # `none` needs no codec library at all.
     assert parquet_write_options("none") == {"compression": "none"}
+
+
+# --- deferred stats -------------------------------------------------------
+
+# The registration keys, in wire order, of an unpartitioned file.
+_DEFERRED_KEYS = ["path", "record_count", "file_size_bytes", "footer_size"]
+_SHIPPED_KEYS = [*_DEFERRED_KEYS, "column_stats"]
+
+
+def _prepare(table, tmp_path, entry: str, counts, **kwargs):
+    """``counts`` groups through ``entry`` (``files`` or ``tables``),
+    unpartitioned; returns the registrations."""
+    groups = _groups(table, counts)
+    if entry == "files":
+        paths = []
+        for index, (data, _) in enumerate(groups):
+            path = tmp_path / f"group-{index}.parquet"
+            pq.write_table(data, path)
+            paths.append((str(path), None))
+        request = table.prepare_append_files(
+            paths, idempotency_key=str(uuid.uuid4()), **kwargs
+        )
+    else:
+        request = table.prepare_append_tables(
+            groups, idempotency_key=str(uuid.uuid4()), **kwargs
+        )
+    return request["appends"][0]["files"]
+
+
+@pytest.mark.parametrize("entry", ["files", "tables"])
+def test_deferred_stats_omits_column_stats_from_every_registration(
+    prepared, recording_s3, tmp_path, entry
+):
+    """The key is ABSENT, not empty: absent is what the server registers
+    'pending' for the hydrator; ``[]`` would register 'provided' with no
+    stats and never be hydrated."""
+    regs = _prepare(prepared, tmp_path, entry, [3, 4], deferred_stats=True)
+    assert [list(reg) for reg in regs] == [_DEFERRED_KEYS, _DEFERRED_KEYS]
+    assert [reg["record_count"] for reg in regs] == [3, 4]
+    # The files still uploaded, and the registration still describes them.
+    for reg in regs:
+        assert reg["file_size_bytes"] == len(_object(recording_s3, reg))
+
+
+@pytest.mark.parametrize("entry", ["files", "tables"])
+@pytest.mark.parametrize("kwargs", [{}, {"deferred_stats": False}])
+def test_default_registration_still_ships_column_stats(
+    prepared, recording_s3, tmp_path, entry, kwargs
+):
+    """Default unchanged on the wire: same keys in the same order, and
+    ``column_stats`` is the footer of the uploaded object itself, read
+    back out of the store rather than taken from the writer."""
+    regs = _prepare(prepared, tmp_path, entry, [3], **kwargs)
+    (reg,) = regs
+    assert list(reg) == _SHIPPED_KEYS
+    footer = pq.read_metadata(pa.BufferReader(_object(recording_s3, reg)))
+    expected = [s.to_wire() for s in extract_column_stats(footer, prepared.columns)]
+    assert expected  # a vacuous [] == [] would pass with the stats dropped
+    assert reg["column_stats"] == expected
+
+
+@pytest.mark.parametrize("entry", ["files", "tables"])
+def test_explicit_false_is_byte_identical_to_the_default(
+    prepared, recording_s3, tmp_path, entry
+):
+    def wire(**kwargs) -> list[str]:
+        regs = _prepare(prepared, tmp_path, entry, [3, 4], **kwargs)
+        return [
+            json.dumps({k: v for k, v in reg.items() if k != "path"}) for reg in regs
+        ]
+
+    assert wire() == wire(deferred_stats=False)
+
+
+@pytest.mark.parametrize("deferred", [True, False])
+def test_append_and_prepare_tables_register_the_same_shape(
+    httpx_mock, prepared, recording_s3, deferred
+):
+    """``Table.append(deferred_stats=...)`` and
+    ``prepare_append_tables(deferred_stats=...)`` hand the server the same
+    registration for the same rows: same keys in the same order, and the
+    same values for everything but the uuid-bearing path."""
+    httpx_mock.add_response(
+        method="POST",
+        url=f"{BASE}/v1/catalogs/cat/commit",
+        json={"snapshot_id": 6, "schema_version": 2},
+    )
+    (data, _) = _groups(prepared, [5])[0]
+    prepared.append(data, deferred_stats=deferred)
+    (commit,) = [r for r in httpx_mock.get_requests() if r.method == "POST"]
+    (appended,) = json.loads(commit.content)["appends"][0]["files"]
+    (staged,) = prepared.prepare_append_tables(
+        [(data, None)], idempotency_key=str(uuid.uuid4()), deferred_stats=deferred
+    )["appends"][0]["files"]
+
+    assert list(staged) == list(appended)
+    assert ("column_stats" in staged) is not deferred
+    assert {k: v for k, v in staged.items() if k != "path"} == {
+        k: v for k, v in appended.items() if k != "path"
+    }
 
 
 @pytest.fixture(autouse=True)

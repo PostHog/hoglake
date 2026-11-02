@@ -19,9 +19,9 @@ import org.jdbi.v3.core.Handle
  * table's current spec, and the whole point of the stale-spec badge is
  * that those groups are labelled correctly rather than against head's
  * spec. `hog_partition_field` rows are keyed by spec id and survive the
- * spec's retirement (expiry's step 5 removes them only once the whole
- * version is below the floor), so one fetch per table covers every
- * vintage its samples can name.
+ * spec's retirement (expiry never removes them, because live files keep
+ * naming their spec by id), so one fetch per table covers every vintage
+ * its samples can name.
  *
  * One statement for the fields plus one for the columns, both keyed on
  * `(catalog_id, table_id)` — bounded by the tables asked for, never by
@@ -50,8 +50,10 @@ internal object PartitionFieldLabels {
      *
      * The column name resolves to the LIVE version when one exists, else
      * the latest version (a dropped column's partitions still need a
-     * label); a column with no versions at all (never legal) falls back
-     * to "field_<id>".
+     * label). A source column dropped after its spec retired loses all
+     * of its versions once expiry passes the drop, while the retired
+     * spec (never cleared) still names it; such a field falls back to
+     * "field_<id>".
      */
     fun fields(
         h: Handle,
@@ -110,7 +112,7 @@ internal object PartitionFieldLabels {
      *
      * DISTINCT ON picks one version per field id — the live one, else the
      * most recent — so a dropped source still labels from its last
-     * version.
+     * version while any version survives expiry.
      */
     private fun columnPaths(
         h: Handle,

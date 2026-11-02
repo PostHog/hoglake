@@ -227,9 +227,6 @@ reason** — never a generic unknown-type error, because "stop trying" and
 | `interval` | no Iceberg interval type |
 | `point`, `linestring`, `polygon`, `multipoint`, `multilinestring`, `multipolygon`, `linestring_z`, `geometrycollection` | DuckLake geometry; out of scope |
 
-Still open from the DuckLake type system: VARIANT (Iceberg V3 has
-`variant` — tracking V3 for `timestamp_ns` does not commit us to it).
-
 ### 2.8 Nested types: `list`, `struct`, `map`
 
 | col_type | Iceberg | parquet | bounds |
@@ -428,7 +425,7 @@ sorts above its partner IN THAT TYPE'S ORDER, is dropped rather than
 stored — readers prune on these, so a missing bound costs a scan and a
 wrong one costs a wrong answer.
 
-Still open: VARIANT, and `list`/`map` internals as partition sources
+Still open: `list`/`map` internals as partition sources
 (Iceberg does not define them either).
 
 ## 3. Iceberg-identical partition transforms only
@@ -547,9 +544,10 @@ partition transform, sort-key contract, or promotion to/from scalar types.
 Prepared-file validation requires the native Parquet VARIANT(1) group annotation
 and its metadata/value storage shape; an ordinary struct is not equivalent.
 Shredded child statistics are not whole-column statistics and are omitted.
-Compaction planning skips tables with live VARIANT columns, and the scalar
-rewriter rejects them explicitly. A top-level variant may declare the shredded
-layout writers give it (`type_params.shredding`); it is catalog metadata for
-writers, has no Iceberg counterpart, and no read depends on it. Reader support
-must be verified per engine;
-this does not enable an Iceberg REST facade or the buffered-ingestion CLI.
+Compaction planning skips tables with live VARIANT columns, and the rewriter
+rejects them explicitly, unless `HOGLAKE_COMPACTION_VARIANT` is on; then each
+VARIANT is copied in its declared layout (server/README.md). A top-level variant
+may declare the shredded layout writers give it (`type_params.shredding`); it is
+catalog metadata for writers, has no Iceberg counterpart, and no read depends on
+it. Reader support must be verified per engine; this does not enable an Iceberg
+REST facade or the buffered-ingestion CLI.

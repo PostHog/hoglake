@@ -4,6 +4,7 @@ import com.posthog.hoglake.compaction.InvalidDataException
 import com.posthog.hoglake.compaction.MixedIdBindingRepro
 import com.posthog.hoglake.compaction.ParquetRewriter
 import com.posthog.hoglake.compaction.UnconvertibleSchemaException
+import com.posthog.hoglake.compaction.VariantLayoutMismatchException
 import com.posthog.hoglake.compaction.localInput
 import com.posthog.hoglake.compaction.rewriteToLocal
 import com.posthog.hoglake.hydrator.CatalogColumn
@@ -200,7 +201,7 @@ class NestedCampaignRegressionTest {
     // ---- variant inside a container (the #77 x phase-2 seam) -------------
 
     @Test
-    fun `a variant nested in a struct is expressible, statless, and never compacted`(
+    fun `a variant nested in a struct is expressible, statless, and compacted only in its layout`(
         @TempDir tmp: Path,
     ) {
         // VARIANT is a catalog SCALAR with no children, so ColumnTrees
@@ -221,7 +222,7 @@ class NestedCampaignRegressionTest {
         // READER: the variant produces no stats at ANY depth, and its
         // sibling still does — a variant must not take the subtree with
         // it.
-        val schema =
+        fun schema(value: Type.Repetition) =
             MessageType(
                 "m",
                 listOf<Type>(
@@ -230,7 +231,7 @@ class NestedCampaignRegressionTest {
                             Types.optionalGroup()
                                 .`as`(LogicalTypeAnnotation.variantType(1.toByte()))
                                 .required(PrimitiveType.PrimitiveTypeName.BINARY).named("metadata")
-                                .optional(PrimitiveType.PrimitiveTypeName.BINARY).named("value")
+                                .primitive(PrimitiveType.PrimitiveTypeName.BINARY, value).named("value")
                                 .id(Math.toIntExact(variantCol.fieldId))
                                 .named("v"),
                         )
@@ -243,19 +244,24 @@ class NestedCampaignRegressionTest {
                         .named("s"),
                 ),
             )
-        val src = tmp.resolve("nested-variant.parquet")
-        write(schema, src) { f ->
-            listOf(
-                f.newGroup().also {
-                    val g = it.addGroup(0)
-                    g.addGroup(0).also { v ->
-                        v.add(0, Binary.fromConstantByteArray(byteArrayOf(1)))
-                        v.add(1, Binary.fromConstantByteArray(byteArrayOf(2)))
-                    }
-                    g.add(1, 7L)
-                },
-            )
+
+        fun written(value: Type.Repetition): Path {
+            val src = tmp.resolve("nested-variant-$value.parquet")
+            write(schema(value), src) { f ->
+                listOf(
+                    f.newGroup().also {
+                        val g = it.addGroup(0)
+                        g.addGroup(0).also { v ->
+                            v.add(0, Binary.fromConstantByteArray(byteArrayOf(1)))
+                            v.add(1, Binary.fromConstantByteArray(byteArrayOf(2)))
+                        }
+                        g.add(1, 7L)
+                    },
+                )
+            }
+            return src
         }
+        val src = written(Type.Repetition.OPTIONAL)
         val catalog = NestedFuzz.toCatalogColumns(live)
         val aggs = FooterStats.aggregate(FooterParse.parse(LocalInputFile(src)), catalog, src.toString())
         assertThat(aggs.map { it.fieldId })
@@ -274,7 +280,32 @@ class NestedCampaignRegressionTest {
             )
         }
             .isInstanceOf(UnconvertibleSchemaException::class.java)
-            .hasMessageContaining("variant compaction is not supported")
+            .hasMessageContaining("variant compaction is off")
+
+        // HOGLAKE_COMPACTION_VARIANT on: a nested variant takes no
+        // declaration, so its layout is the unshredded REQUIRED `metadata`
+        // and REQUIRED `value`. This file's OPTIONAL `value` is not that,
+        // so the copy is refused, typed; with a REQUIRED one it is made.
+        assertThatThrownBy {
+            rewriteToLocal(
+                listOf(localInput(src, 0L, null)),
+                live,
+                emptyList(),
+                tmp.resolve("nested-variant-on.parquet"),
+                variantCompaction = true,
+            )
+        }
+            .isInstanceOf(VariantLayoutMismatchException::class.java)
+            .hasMessageContaining("variant column 'v'")
+        val copied =
+            rewriteToLocal(
+                listOf(localInput(written(Type.Repetition.REQUIRED), 0L, null)),
+                live,
+                emptyList(),
+                tmp.resolve("nested-variant-copied.parquet"),
+                variantCompaction = true,
+            )
+        assertThat(copied.rowsWritten).isEqualTo(1)
     }
 
     @Test

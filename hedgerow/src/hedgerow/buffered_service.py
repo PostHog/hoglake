@@ -11,7 +11,6 @@ from pyhoglake import (
     AlreadyExistsError,
     CommitConflictError,
     ExpiredError,
-    HoglakeClient,
     HoglakeError,
     NotFoundError,
     OffsetRegressionError,
@@ -20,7 +19,7 @@ from pyhoglake import (
 )
 from pyhoglake import IncarnationChangedError as ClientIncarnationChangedError
 
-from .config import ConfigError
+from .config import ConfigError, hoglake_client
 from .halts import (
     FeedExpiredError,
     HaltError,
@@ -125,7 +124,7 @@ class BufferedService:
         Path(buffered.state_path).parent.mkdir(parents=True, exist_ok=True)
         Path(buffered.spill_directory).mkdir(parents=True, exist_ok=True)
         for side in (cfg.source, cfg.destination):
-            self.clients.append(HoglakeClient(side.url, s3=side.s3.to_pyhoglake()))
+            self.clients.append(hoglake_client(side.url, side.s3, side.auth))
         source_catalog = self.clients[0].catalog(cfg.source.catalog)
         destination_catalog = self.clients[1].catalog(cfg.destination.catalog)
         source = source_catalog.namespace(cfg.source.namespace).table(cfg.source.table)
@@ -268,7 +267,10 @@ class BufferedService:
         # Preserve useful diagnostics without exposing configured credentials,
         # including DuckDB's SQL-escaped representation of a quoted secret.
         for side in (self.config.source, self.config.destination):
-            for value in (side.s3.access_key, side.s3.secret_key):
+            secrets = (side.s3.access_key, side.s3.secret_key)
+            if side.auth is not None:
+                secrets += (side.auth.client_secret,)
+            for value in secrets:
                 if value:
                     for representation in (value.replace("'", "''"), value):
                         detail = detail.replace(representation, "[redacted]")

@@ -13,6 +13,7 @@ export type Int64 = string;
 export interface ApiErrorBody {
   error: string;
   detail?: string;
+  reason?: string;
 }
 
 export interface Catalog {
@@ -646,6 +647,27 @@ export interface PartitionListing {
   partitions: PartitionGroup[];
 }
 
+export interface PartitionLookupTotals {
+  file_count: Int64;
+  physical_rows: Int64;
+  total_bytes: Int64;
+  dv_count: Int64;
+  stats_state: { provided: Int64; pending: Int64; failed: Int64 };
+  last_file_write_snapshot: Int64 | null;
+}
+
+export interface PartitionLookup {
+  snapshot_id: Int64;
+  table_uuid: string;
+  spec_id: Int64;
+  values: (string | null)[];
+  aggregates:
+    | { status: "exact"; reason: null; totals: PartitionLookupTotals }
+    | { status: "unavailable"; reason: "candidate_scan_limit" | "overflow" | "continuation"; totals: null };
+  files: DataFile[];
+  next_cursor: string | null;
+}
+
 export interface CommitResult {
   snapshot_id: Int64;
   schema_version?: Int64;
@@ -689,6 +711,13 @@ export interface HydratorSweepResult {
    * before the counter; the server fills 0 on read.
    */
   stats_skipped_below_floor?: Int64;
+  /**
+   * Of `hydrated`, files of a table with the object-prefix layout whose footer
+   * did not prove the value their prefix names: provided, but quarantined
+   * server-side. Absent on rows written before the counter; the server fills
+   * 0 on read.
+   */
+  quarantined?: Int64;
 }
 
 /** Manual hydrator rows are rehydrate calls. */
@@ -958,6 +987,14 @@ export interface CompactionResult {
    * OPTIONAL for the same reason claimed_elsewhere is.
    */
   buckets_skipped_claimed?: Int64;
+  /**
+   * Groups of an object-prefix table the planner refused before any IO
+   * because their prefix cannot be named (no spec, no identity key on the
+   * field, a missing or non-canonical value, or a layout column that is not
+   * live). A broken invariant, refused again every sweep. OPTIONAL for the
+   * same reason claimed_elsewhere is.
+   */
+  object_prefix_unresolvable?: Int64;
 }
 
 /** HISTORICAL, with VerifyReport: only a `verify` ledger row carries it. */

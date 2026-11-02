@@ -70,10 +70,12 @@ from .keyspace import PartitionTuple
 #: row); a source BELOW a list or a map has many values per row.
 _CONTAINER_TYPES: Final = frozenset({"list", "struct", "map"})
 _REPEATED_TYPES: Final = frozenset({"list", "map"})
-#: Column types the JSON coercers fill but no partition source may be:
-#: a json value has no transform domain (flush.py refuses the same
-#: sources at startup).
-_UNKEYABLE_TYPES: Final = frozenset({"json"})
+#: Column types no partition source may be: a json or variant value has
+#: no transform domain (flush.py refuses the same sources at startup).
+#: variant is listed by type, beside json: coercer_for still refuses
+#: one, but because the decoder fills it from a payload key, which
+#: says nothing about keying.
+_UNKEYABLE_TYPES: Final = frozenset({"json", "variant"})
 _TEMPORAL_TRANSFORMS: Final = frozenset({"year", "month", "day", "hour"})
 _EPOCH_NAIVE: Final = datetime.fromisoformat("1970-01-01T00:00:00")
 _EPOCH_UTC: Final = datetime(1970, 1, 1, tzinfo=UTC)
@@ -84,8 +86,8 @@ class GroupKeyError(ValueError):
     """The table's partition spec cannot be keyed by this writer, decided
     when the keyer is BUILT (never per record). Refused: a source field
     id that resolves to no column; a container source (list/struct/map);
-    a source under a list or a map; a json source; a source column the
-    JSON coercers do not support (variant); an unknown transform; a
+    a source under a list or a map; a json or variant source; a source
+    column the JSON coercers do not support; an unknown transform; a
     ``bucket``/``truncate`` without its positive parameter; a temporal
     transform (year/month/day/hour) on a type pyhoglake's temporal gate
     refuses; ``bucket`` on a type outside pyhoglake's bucketable set

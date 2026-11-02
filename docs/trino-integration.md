@@ -63,7 +63,8 @@ The native connector lives in `PostHog/trino` (`plugin/trino-hoglake`);
 
 ## 1. Reads: everything rides the Iceberg connector
 
-No custom Trino plugin. Trino's stock Iceberg connector pointed at the
+Today the native connector (§0) is the read path. Once the facade
+exists, no custom Trino plugin: Trino's stock Iceberg connector pointed at the
 hoglake REST facade gets: snapshot isolation, time travel
 (`FOR VERSION AS OF` / `FOR TIMESTAMP AS OF` map to our snapshots),
 partition + min/max pruning (as good as our manifests — hence the
@@ -255,11 +256,12 @@ Prepared replacement already checks target changes and namespace identity: an
 alteration committed first rejects replacement, and replacement committed first
 rejects an alteration using the old UUID.
 
-ADD COLUMN now shares RENAME COLUMN's refusal of live id-less files and files
-with pending or failed hydration.
+ADD COLUMN now shares RENAME COLUMN's refusal of live id-less files: those the
+hydrator's footer read has flagged `missing_field_ids`. A file with pending or
+failed hydration is trusted (#445) and does not block either.
 Without IDs, an old file can contain a name being added (including DROP + ADD),
 and name-based readers could expose those old values under the new field ID.
-Hydrate, rewrite, or retire blocking files first. All clients using `/alter`
+Rewrite (compact) or retire blocking files first. All clients using `/alter`
 (including Python, DuckDB and the console) receive `idless_files_present` for
 this unsafe case. Existing requests otherwise retain their semantics; the new
 guards are optional for legacy callers. Namespace identity is additive response
@@ -394,13 +396,24 @@ pyhoglake declares a layout too, with `variant.variant_field` in a `create_table
 schema or `ops.add_column(..., "variant", shredding=...)`, and checks it locally
 against the same rules (a shared vector file keeps its copy of them in step with
 the server's), leaving to the server the few case collisions it cannot decide as
-the JDK does (around `Σ`, or past its Unicode data). It writes no VARIANT values
-from Arrow, so it honours no declaration yet, and it reads a stored declaration
-as an ordinary `type_params` map; the console does not show `type_params`. DuckDB
-clients refuse VARIANT at bind (#87) and read only decimal parameters. Hedgerow
-compares `type_params` exactly, so it refuses a destination variant that has a
-declaration as a schema mismatch; it writes through DuckDB, which honours no
-declaration. Compaction still skips every table with a VARIANT column (#70).
+the JDK does (around `Σ`, or past its Unicode data). It writes VARIANT values
+from Arrow (`Table.append`, `Table.prepare_append_tables`) and honours the
+declaration, writing the connector's layout for it: JSON text encoded with exact
+numbers and the connector's same-class shredding rule, the group annotated
+VARIANT(1) and each file's layout checked against the declaration before upload.
+A read-back of those files through the connector is not yet in the harness. It
+reads a stored declaration as an ordinary `type_params` map; the console does not
+show `type_params`. DuckDB clients refuse VARIANT at bind (#87) and read only
+decimal parameters. Hedgerow compares `type_params` exactly, so it refuses a
+destination variant that has a declaration as a schema mismatch; it writes
+through DuckDB, which honours no declaration. Compaction skips every table with a
+VARIANT column (#70) unless the server sets `HOGLAKE_COMPACTION_VARIANT`. With it,
+compaction copies each VARIANT's storage as it is, in the layout the declaration
+gives it (the connector's, and pyhoglake's), and skips a group holding a file in
+any other layout, or one DuckDB wrote: the connector reads a DuckDB file's top-level
+Variant null as SQL NULL by its `created_by`, which a compacted file does not keep.
+A read-back of compacted variant files (parquet-mr's `created_by`, `TIME_MICROS`
+beside time leaves) through the connector is not yet in the harness either.
 
 ### Reclaiming abandoned Trino uploads
 

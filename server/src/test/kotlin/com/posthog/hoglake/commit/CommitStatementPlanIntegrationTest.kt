@@ -37,6 +37,15 @@ import java.util.UUID
  * long-lived upload ledger, a removal queue mostly drained, a week of
  * receipts. What each statement may cost is stated beside its
  * assertion, from the probes it makes.
+ *
+ * The object-prefix layout (V29): every even table has a live layout row,
+ * so `hog_table_layout_live` holds [TABLES] / 2 rows and the hot table
+ * (odd) is probed and found WITHOUT the option, the shape almost every
+ * commit has. [PREFIX] is the option-on table, with [PREFIX_FILES] files
+ * of its own and the partition values every partitioned file carries, so
+ * the DV-target probe of `hog_file_partition_value` runs against
+ * production's shape too. [HISTORY] has the option with its prefix
+ * column [VERSIONS] versions deep, among [WIDE] more live columns.
  */
 @Tag("integration")
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
@@ -60,11 +69,32 @@ class CommitStatementPlanIntegrationTest {
 
         const val HOT = 1L
 
+        /** The table with the object-prefix layout, its spec identity on field 1. */
+        const val PREFIX = 2L
+
+        /** [PREFIX]'s own files, after the [FILES] and [DVS] ids; one per (team, i). */
+        const val PREFIX_FILES = 1_000
+
+        /** Distinct prefix values among them. */
+        const val TEAMS = 50
+
+        /**
+         * An option-on table (even, so it has a layout on field 1) whose
+         * prefix column has [VERSIONS] ended versions behind its live one,
+         * what renames from before the option, promotes and comments leave
+         * until expiry, and [WIDE] more
+         * live columns than the rest.
+         */
+        const val HISTORY = 4L
+        const val VERSIONS = 500
+        const val WIDE = 200
+
         /** Every big table a commit statement touches; none may be scanned whole. */
         val BIG_TABLES =
             listOf(
                 "hog_snapshot_change", "hog_data_file", "hog_delete_file", "hog_upload", "hog_file_removal",
                 "hog_column", "hog_table_version", "hog_table_stats", "hog_table", "hog_commit_receipt",
+                "hog_file_partition_value", "hog_table_layout",
             )
 
         /**
@@ -90,6 +120,7 @@ class CommitStatementPlanIntegrationTest {
     private lateinit var activePaths: List<String>
     private lateinit var activeIds: List<UUID>
     private lateinit var dvTargets: List<Long>
+    private lateinit var prefixTargets: List<Long>
 
     @AfterAll
     fun tearDown() = db.close()
@@ -181,12 +212,54 @@ class CommitStatementPlanIntegrationTest {
                 FROM generate_series(1, :d) g
                 """,
             ).bind("c", catalogId).bind("f", FILES).bind("d", DVS).execute()
+            // The object-prefix table: its spec, a live layout on every even
+            // table, its own files under their team prefixes, and the
+            // partition value of every partitioned file in the fixture.
+            h.execute(
+                "INSERT INTO hog_partition_spec (catalog_id, table_id, spec_id, begin_snapshot) VALUES (?, ?, 1, 0)",
+                catalogId,
+                PREFIX,
+            )
+            h.execute(
+                """
+                INSERT INTO hog_partition_field (catalog_id, table_id, spec_id, key_index, source_field_id, transform)
+                VALUES (?, ?, 1, 0, 1, 'identity')
+                """,
+                catalogId,
+                PREFIX,
+            )
+            h.createUpdate(
+                """
+                INSERT INTO hog_table_layout (catalog_id, table_id, begin_snapshot, object_prefix_field_id)
+                SELECT :c, g, 1, 1 FROM generate_series(2, :n, 2) g
+                """,
+            ).bind("c", catalogId).bind("n", TABLES).execute()
+            h.createUpdate(
+                """
+                INSERT INTO hog_data_file (catalog_id, data_file_id, table_id, begin_snapshot,
+                                           path, record_count, file_size_bytes, row_id_start, spec_id)
+                SELECT :c, :first + g, :t, 1 + g % (:s - 1),
+                       's3://bucket/plan/data/ingest/t' || :t || '/team_id=' || g % :teams || '/' || md5(g::text)
+                           || '.parquet',
+                       10, 1000, g * 10, 1
+                FROM generate_series(1, :n) g
+                """,
+            ).bind("c", catalogId).bind("first", FILES + DVS).bind("t", PREFIX).bind("s", SNAPSHOTS)
+                .bind("teams", TEAMS).bind("n", PREFIX_FILES).execute()
+            h.createUpdate(
+                """
+                INSERT INTO hog_file_partition_value (catalog_id, data_file_id, key_index, value)
+                SELECT f.catalog_id, f.data_file_id, 0, (f.data_file_id % :teams)::text
+                FROM hog_data_file f WHERE f.catalog_id = :c AND f.spec_id IS NOT NULL
+                """,
+            ).bind("c", catalogId).bind("teams", TEAMS).execute()
+            prefixTargets = listOf(7L, 77L, 777L).map { FILES + DVS + it }
             h.execute(
                 "UPDATE hog_catalog SET last_snapshot_id = ?, next_file_id = ?, next_table_id = ?, " +
                     "next_namespace_id = 2 " +
                     "WHERE catalog_id = ?",
                 SNAPSHOTS.toLong(),
-                (FILES + DVS + 1).toLong(),
+                (FILES + DVS + PREFIX_FILES + 1).toLong(),
                 (TABLES + 1).toLong(),
                 catalogId,
             )
@@ -227,6 +300,30 @@ class CommitStatementPlanIntegrationTest {
                 """,
             ).bind("c", catalogId).bind("s", SNAPSHOTS).bind("r", RECEIPTS).execute()
             dvTargets = listOf(41L, 81L, 121L)
+            // HISTORY: every ended version of field 1 OLDER than the live
+            // one, as the DDL writes them, and the live one moved past them.
+            h.execute(
+                "UPDATE hog_column SET begin_snapshot = ? WHERE catalog_id = ? AND table_id = ? AND field_id = 1",
+                VERSIONS + 1,
+                catalogId,
+                HISTORY,
+            )
+            h.createUpdate(
+                """
+                INSERT INTO hog_column (catalog_id, table_id, field_id, begin_snapshot, end_snapshot, name, col_type,
+                                        ordinal)
+                SELECT :c, :t, 1, s, s + 1, 'team_' || s, 'long', 0 FROM generate_series(1, :v) s
+                UNION ALL
+                SELECT :c, :t, f, 0, NULL, 'c' || f, 'long', f - 1 FROM generate_series(:cols + 1, :cols + :w) f
+                """,
+            ).bind("c", catalogId).bind("t", HISTORY).bind("v", VERSIONS).bind("cols", COLUMNS).bind("w", WIDE)
+                .execute()
+            h.execute(
+                "UPDATE hog_table SET next_field_id = ? WHERE catalog_id = ? AND table_id = ?",
+                COLUMNS + WIDE + 1,
+                catalogId,
+                HISTORY,
+            )
             val small = listOf("hog_namespace", "hog_partition_spec", "hog_partition_field", "hog_catalog")
             for (relation in BIG_TABLES + small) {
                 h.execute("VACUUM (ANALYZE) $relation")
@@ -244,6 +341,33 @@ class CommitStatementPlanIntegrationTest {
             tables = listOf(CommitTail.TableKey("ingest", "t$HOT", appending = true, unchanged = false)),
             readSnapshot = head() - READ_BEHIND,
             paths = (1..PATHS).map { "s3://bucket/plan/data/${UUID.randomUUID()}.parquet" },
+            targetIds = emptyList(),
+        )
+
+    /**
+     * A guarded transaction on the object-prefix table: appending under
+     * its prefixes and registering DVs on three of its files, so the read
+     * takes the layout, the identity key_index and each target's value.
+     */
+    private fun prefixTransaction() =
+        CommitTail.ReadInputs(
+            catalogId = catalogId,
+            idempotencyKey = UUID.randomUUID(),
+            tables = listOf(CommitTail.TableKey("ingest", "t$PREFIX", appending = true, unchanged = true)),
+            readSnapshot = head() - READ_BEHIND,
+            paths =
+                (1..PATHS).map { "s3://bucket/plan/data/ingest/t$PREFIX/team_id=${it % TEAMS}/${UUID.randomUUID()}" },
+            targetIds = prefixTargets,
+        )
+
+    /** A prepared append to [HISTORY], under its prefixes. */
+    private fun historyAppend() =
+        CommitTail.ReadInputs(
+            catalogId = catalogId,
+            idempotencyKey = UUID.randomUUID(),
+            tables = listOf(CommitTail.TableKey("ingest", "t$HISTORY", appending = true, unchanged = false)),
+            readSnapshot = head() - READ_BEHIND,
+            paths = (1..PATHS).map { "s3://bucket/plan/data/ingest/t$HISTORY/c1=${it % TEAMS}/${UUID.randomUUID()}" },
             targetIds = emptyList(),
         )
 
@@ -422,6 +546,19 @@ class CommitStatementPlanIntegrationTest {
     /** The statement's own total: the root node's cumulative Buffers line. */
     private fun totalBuffers(plan: String): Long = ExplainPlan.nodes(plan).first().buffers
 
+    /** The lines of [plan] under `CTE [name]`: that CTE's subtree alone, its root node first. */
+    private fun cte(
+        plan: String,
+        name: String,
+    ): String {
+        val lines = plan.lines()
+        val start = lines.indexOfFirst { it.trim() == "CTE $name" }
+        assertThat(start).describedAs("CTE %s in:%n%s", name, plan).isNotNegative()
+
+        fun depth(l: String) = l.length - l.trimStart().length
+        return lines.drop(start + 1).takeWhile { depth(it) > depth(lines[start]) }.joinToString("\n")
+    }
+
     /** pg_class.relpages of [table], read rather than written down. */
     private fun pages(table: String): Long =
         db.jdbi.withHandleUnchecked { h ->
@@ -443,12 +580,24 @@ class CommitStatementPlanIntegrationTest {
             "hog_commit_receipt_pkey", "hog_table_version_live_name", "hog_table_stats_pkey", "hog_column_live",
             "hog_snapshot_change_conflict", "hog_upload_catalog_id_path_key", "hog_file_removal_undrained_path",
             "hog_data_file_path", "hog_data_file_pkey",
+            // A DV target's value on a table with the object-prefix
+            // option, by key. (Its identity field is read from
+            // hog_partition_field, two rows here and scanned, as the
+            // spec's field count already is.)
+            "hog_file_partition_value_pkey",
         )) {
             assertThat(generic).describedAs("the generic read uses %s:%n%s", index, generic).contains("using $index on")
         }
+        // The layout probe, one per resolved table: the generic plan
+        // takes it as a bitmap scan of the live index, which reads the
+        // same index pages.
+        assertThat(generic)
+            .describedAs("the generic read probes hog_table_layout_live:%n%s", generic)
+            .containsPattern("(Bitmap Index Scan on|Index Scan using|Index Only Scan using) hog_table_layout_live")
         for ((name, inputs) in listOf(
             "prepared append" to preparedAppend(),
             "claimed transaction" to claimedTransaction(),
+            "object-prefix transaction" to prefixTransaction(),
         )) {
             assertNoScanOf(
                 BIG_TABLES,
@@ -460,17 +609,78 @@ class CommitStatementPlanIntegrationTest {
 
     @Test
     fun `the read of a prepared append costs its probes, not the catalog`() {
-        // Measured on this fixture: 56 buffers — the receipt, head and
+        // Measured on this fixture: 58 buffers — the receipt, head and
         // resolution descents, 25 live column rows, the 50 change rows
-        // since the read snapshot, and one descent each of the claim key
+        // since the read snapshot, one descent each of the claim key
         // and the queue key for 270 paths no claim or queue row shares a
-        // prefix with. The bound is the smallest relation any of those
-        // probes would have to read whole instead (hog_column, 516 pages
-        // here), quartered: a plan that scans ANY big table cannot fit.
+        // prefix with, and (V29) the two of the layout probe that finds
+        // the hot table has no object-prefix layout; 56 before it. The
+        // bound is the smallest relation any of those probes would have
+        // to read whole instead (hog_column, 516 pages here), quartered:
+        // a plan that scans ANY big table cannot fit.
         val plan = explainAnalyze(CommitTail.READ_SQL) { q -> CommitTail.bindRead(q, preparedAppend()) }
         val budget = PROBED.minOf { pages(it) } / 4
         println("prepared-append read: ${totalBuffers(plan)} buffers (budget $budget)")
         assertThat(totalBuffers(plan)).describedAs("prepared-append read buffers:%n%s", plan).isLessThan(budget)
+    }
+
+    @Test
+    fun `the read of an object-prefix transaction pays its layout probes by key, not the catalog`() {
+        // On top of the prepared append's probes: one descent of the live
+        // layout index, one of hog_partition_field for the identity
+        // key_index, and for each of the three DV targets its file row,
+        // its live DV and its value (hog_partition_field and
+        // hog_file_partition_value, both by primary key). Measured 90
+        // buffers here; the bound is the prepared append's, the smallest
+        // probed relation quartered, which no scan fits.
+        val plan = explainAnalyze(CommitTail.READ_SQL) { q -> CommitTail.bindRead(q, prefixTransaction()) }
+        val budget = PROBED.minOf { pages(it) } / 4
+        println("object-prefix transaction read: ${totalBuffers(plan)} buffers (budget $budget)")
+        assertThat(plan).describedAs("the layout probe:%n%s", plan).contains("hog_table_layout_live")
+        assertThat(totalBuffers(plan)).describedAs("object-prefix read buffers:%n%s", plan).isLessThan(budget)
+        // And the values it read are the targets' own.
+        val values =
+            db.jdbi.withHandleUnchecked { h ->
+                h.begin()
+                try {
+                    CommitTail.read(h, prefixTransaction()).targets.mapValues { it.value.prefixValues }
+                } finally {
+                    h.rollback()
+                }
+            }
+        assertThat(values).isEqualTo(prefixTargets.associateWith { listOf("${it % TEAMS}") })
+    }
+
+    @Test
+    fun `the layout read takes the prefix column's newest live version, not its history`() {
+        // `layouts` on HISTORY: one descent of hog_table_layout_live and
+        // its heap page (3 buffers), then one backward descent of
+        // hog_column_pkey that stops at the live row (4). Measured 7; the
+        // bound leaves a descent's slack. MUTATION (#490): the plain LEFT
+        // JOIN filters the field's 500 ended versions on the forward
+        // pkey scan, Rows Removed by Filter: 500, 21 buffers.
+        val plan = explainAnalyze(CommitTail.READ_SQL) { q -> CommitTail.bindRead(q, historyAppend()) }
+        val layouts = cte(plan, "layouts")
+        val buffers = ExplainPlan.nodes(layouts).first().buffers
+        println("history layout read: $buffers buffers, the read ${totalBuffers(plan)}")
+        val generic = cte(explainGeneric(CommitTail.READ_SQL), "layouts")
+        for ((shape, text) in listOf("custom" to layouts, "generic" to generic)) {
+            assertThat(text).describedAs("the %s layout read:%n%s", shape, text)
+                .contains("Index Scan Backward using hog_column_pkey on hog_column")
+        }
+        assertThat(layouts).describedAs("the layout read walks:%n%s", layouts).doesNotContain("Rows Removed by Filter")
+        assertThat(buffers).describedAs("layout read buffers:%n%s", layouts).isLessThanOrEqualTo(10)
+        // And it answers the live version, not one of the 500 behind it.
+        val row =
+            db.jdbi.withHandleUnchecked { h ->
+                h.begin()
+                try {
+                    CommitTail.read(h, historyAppend()).tables.values.single().single()
+                } finally {
+                    h.rollback()
+                }
+            }
+        assertThat(row.prefixFieldName to row.prefixColType).isEqualTo("c1" to "long")
     }
 
     @Test

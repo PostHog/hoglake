@@ -4,6 +4,16 @@ package com.posthog.hoglake
 data class Config(
     val port: Int = env("HOGLAKE_PORT", "8080").toInt(),
     /**
+     * The infra listener's port (docs/auth-tenancy.md §6.7): `GET /metrics`
+     * and nothing else, with no auth plugin. 0 = no infra listener; the
+     * scrape then has to use [port], where `/metrics` is operator-only.
+     *
+     * The exposition carries per-catalog labels, i.e. the tenant roster,
+     * so this port is for the cluster's scraper only: the chart exposes it
+     * on the pod and not on the Service.
+     */
+    val metricsPort: Int = env("HOGLAKE_METRICS_PORT", "0").toInt(),
+    /**
      * Human-facing name for THIS hoglake instance (e.g. "GigaHog"),
      * shown by the webui so operators can tell deployments apart.
      * Empty = unnamed.
@@ -135,15 +145,68 @@ data class Config(
     val s3SecretKey: String = env("HOGLAKE_S3_SECRET_KEY", ""),
     val s3PathStyle: Boolean = env("HOGLAKE_S3_PATH_STYLE", "true").toBoolean(),
     /**
+     * Authentication at the HTTP boundary (docs/auth-tenancy.md):
+     * `off` | `warn` | `enforce` (§11).
+     *
+     * Parsed by `AuthMode.parse`, which refuses anything else BY NAME at boot.
+     * The default is `off`, i.e. exactly today's behaviour, so this whole change
+     * is inert until an operator asks for it — and `off` stays in the binary
+     * indefinitely as the rollback for a bad `enforce` flip.
+     */
+    val authMode: String = env("HOGLAKE_AUTH_MODE", "off"),
+    /**
+     * This instance's issuer identity, e.g. `https://hoglake-prod-us.internal`.
+     *
+     * Required whenever [authMode] is not `off`, and it must match the `iss` a
+     * token carries exactly: two regional instances with different issuers is
+     * what stops a prod-us token being replayed at prod-eu, and that property
+     * only exists if the value is configured rather than derived from a host
+     * header an attacker controls.
+     */
+    val authIssuer: String = env("HOGLAKE_AUTH_ISSUER", ""),
+    /**
+     * The `aud` a token must carry. One value for the whole estate.
+     *
+     * Not per-region: `iss` already separates regions, and making the audience
+     * regional too would mean a token could not be used by an in-cluster caller
+     * that legitimately talks to whichever instance its catalog lives on.
+     */
+    val authAudience: String = env("HOGLAKE_AUTH_AUDIENCE", "hoglake"),
+    /**
+     * A JWKS document on local disk — the in-cluster source.
+     *
+     * A FILE rather than an inline public key because the kubelet rotates a
+     * projected volume without a restart, and the verifier re-reads it on a key
+     * miss. Exactly one of this and [authJwksUrl] must be set when auth is on;
+     * setting both is refused rather than silently preferred.
+     */
+    val authJwksFile: String = env("HOGLAKE_AUTH_JWKS_FILE", ""),
+    /** A JWKS document at a URL — the external-issuer source. */
+    val authJwksUrl: String = env("HOGLAKE_AUTH_JWKS_URL", ""),
+    /**
+     * Tolerated clock skew, in seconds, for `exp` / `nbf` / `iat`.
+     *
+     * 60s covers an un-synced pod clock comfortably. It is CAPPED at 600 by
+     * `JwtVerifier`'s own `require`, because a large skew is not a tolerance —
+     * it is an extension of every token's lifetime, which is the one thing the
+     * TTL exists to bound.
+     */
+    val authClockSkewSeconds: Long = env("HOGLAKE_AUTH_CLOCK_SKEW_SECONDS", "60").toLong(),
+    /**
      * Hydrator poll interval; 0 disables the background loop (tests drive
      * it directly).
      *
      * Fifteen minutes, not seconds: hydration is a backfill for files
-     * registered WITHOUT stats, and every writer in the fleet ships its
-     * own footer, so the queue is empty in the steady state and a fast
-     * poll only records that it was empty. The cost of the interval is
-     * the delay before a stats-less file becomes prunable, which is a
-     * backfill's latency rather than a reader's.
+     * registered WITHOUT stats. A writer that ships its own footer
+     * (every millpond file) never enters the queue; one that defers
+     * stats (`deferred_stats`, what millrace does and millpond may) adds
+     * a pending file per flush, so on such a fleet the queue is never
+     * empty between sweeps and each sweep drains up to
+     * `Hydrator.DEFAULT_SWEEP_LIMIT` of it. The cost of the interval is
+     * the delay before a deferred file becomes prunable and before its
+     * field-id audit lands (`missing_field_ids`), a backfill's latency
+     * rather than a reader's; since #445 nothing a client does waits on
+     * it.
      */
     val hydratorIntervalMs: Long = env("HOGLAKE_HYDRATOR_INTERVAL_MS", "900000").toLong(),
     /**
@@ -168,12 +231,15 @@ data class Config(
     /**
      * The hydrator's SIZE FLOOR (#432), and it gates the STATS ROWS only:
      * a pending file under this many bytes is still claimed, its footer
-     * still read and field-id checked (so `add_column`/`rename_column`
-     * are not held up by it), and it flips to `provided` with
-     * `missing_field_ids` and `split_offsets` set, but with NO
+     * still read, and it flips to `provided` with `missing_field_ids`
+     * (the field-id audit flag) and `split_offsets` set, but with NO
      * `hog_file_column_stats` rows, which readers already treat as no
-     * bounds. 0 writes rows for every file (the behaviour before the
-     * floor); negative is refused. Default 1 MiB.
+     * bounds. That read buys the flag, the offsets and, on an
+     * object-prefix table, the prefix proof (the hydrator's quarantine
+     * check runs before the floor): since #445
+     * the DDL guard refuses over FLAGGED files alone, so a file left
+     * `pending` holds nothing up. 0 writes rows for every file (the
+     * behaviour before the floor); negative is refused. Default 1 MiB.
      *
      * Why: the stats of a file this small never prune anything (one row
      * group, cheaper to read than to skip), and compaction registers its
@@ -1147,6 +1213,22 @@ data class Config(
             "HOGLAKE_COMPACTION_ZSTD_LEVEL",
             "${com.posthog.hoglake.compaction.ParquetRewriter.DEFAULT_ZSTD_LEVEL}",
         ).toInt(),
+    /**
+     * Whether compaction rewrites tables with a VARIANT column, copying
+     * each variant as its declared layout and refusing a group with an
+     * input in any other (`hoglake_compaction_variant_layout_mismatch_total`).
+     * Off by default: off, those tables are never planned, as before.
+     * A refused group spends a run slot on every sweep, so allowlist only
+     * catalogs that pyhoglake or Trino write. See CompactionConfig.variantCompaction.
+     */
+    val compactionVariant: Boolean = boolEnv("HOGLAKE_COMPACTION_VARIANT", false),
+    /**
+     * The catalogs, by name and comma-separated, whose variant tables
+     * compact when [compactionVariant] is on; empty means every catalog.
+     * For a rollout one catalog at a time.
+     */
+    val compactionVariantCatalogs: Set<String> =
+        nameList(env("HOGLAKE_COMPACTION_VARIANT_CATALOGS", "")),
     /** Dashboard sampling: one bounded metadata page per tick, persisted between ticks/restarts. */
     val maintenanceSummaryIntervalMs: Long = env("HOGLAKE_MAINTENANCE_SUMMARY_INTERVAL_MS", "1000").toLong(),
     val maintenanceSummaryBatch: Int = env("HOGLAKE_MAINTENANCE_SUMMARY_BATCH", "10000").toInt(),
@@ -1252,6 +1334,9 @@ data class Config(
             "HOGLAKE_HEALTH_PROBE_TIMEOUT_MS=$healthProbeTimeoutMs is below Hikari's " +
                 "$MIN_HEALTH_PROBE_TIMEOUT_MS ms connectionTimeout floor, which Hikari would " +
                 "silently replace with its own default — set at least $MIN_HEALTH_PROBE_TIMEOUT_MS"
+        }
+        require(metricsPort == 0 || (metricsPort in 1..65535 && metricsPort != port)) {
+            "HOGLAKE_METRICS_PORT=$metricsPort must be 0 (off) or a port other than HOGLAKE_PORT=$port"
         }
         // Netty refuses a group of zero with an IllegalArgumentException
         // from deep inside its own constructor, naming neither the knob
@@ -1572,6 +1657,10 @@ data class Config(
                 }
             }
         }
+
+        /** A comma-separated list of names, each trimmed: `"a, b"` names `b`, not `" b"`. */
+        internal fun nameList(raw: String): Set<String> =
+            raw.split(',').map { it.trim() }.filter { it.isNotEmpty() }.toSet()
 
         private fun env(
             name: String,

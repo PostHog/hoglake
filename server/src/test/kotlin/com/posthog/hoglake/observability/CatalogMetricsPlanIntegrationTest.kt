@@ -3,6 +3,7 @@ package com.posthog.hoglake.observability
 import com.posthog.hoglake.model.MaintenanceTask
 import com.posthog.hoglake.testing.ExplainPlan
 import com.posthog.hoglake.testing.PgTestSupport
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry
 import org.assertj.core.api.Assertions.assertThat
 import org.jdbi.v3.core.kotlin.inTransactionUnchecked
 import org.jdbi.v3.core.kotlin.useHandleUnchecked
@@ -36,10 +37,10 @@ import org.junit.jupiter.api.TestInstance
  *  - `unsampled`: tables and files, no published generation;
  *  - `empty`: nothing.
  *
- * `prod`'s manifest also carries the three rare states SAMPLE_SQL
+ * `prod`'s manifest also carries the four rare states SAMPLE_SQL
  * counts — [PENDING_FILES] pending, [FAILED_FILES] failed,
- * [MISSING_ID_FILES] without field ids, a few of each on a dropped
- * table — and its published generation has stamped live totals (V27)
+ * [MISSING_ID_FILES] without field ids, [QUARANTINED_FILES] quarantined by
+ * the object-prefix check, a few of each on a dropped table — and its published generation has stamped live totals (V27)
  * at snapshot 5 with [LATE_DROPS] tables dropped AFTER it that still
  * hold buckets, the shape the sampler's dropped-table subtraction reads.
  *
@@ -70,13 +71,44 @@ class CatalogMetricsPlanIntegrationTest {
         const val PENDING_FILES = 500
         const val FAILED_FILES = 200
         const val MISSING_ID_FILES = 200
+        const val QUARANTINED_FILES = 100
         const val LATE_DROPS = 10
+
+        /** The pending-head fixture ([headDb]): live pending files on `backlog`, all behind the head. */
+        const val BACKLOG = 200_000
+
+        /** Pending files of a DROPPED table at the head of `backlog`'s pending index. */
+        const val DROPPED_AHEAD = 2_000
+
+        /** Provided files of `backlog`, between the head and the backlog in id order. */
+        const val HEAD_PROVIDED = 100_000
+
+        /** The data_file_id of `backlog`'s first live pending file: past the ended row, the drop, the provided. */
+        const val BACKLOG_HEAD = DROPPED_AHEAD + 2 + HEAD_PROVIDED
+
+        /** `backlog`'s extra tables: dropped-dominated, as hog_table converges to. */
+        const val HEAD_LIVE_TABLES = 38
+        const val HEAD_DROPPED_TABLES = 5_000
     }
 
     private val db = PgTestSupport.freshDatabase()
 
+    /**
+     * hoglake_stats_pending_head_file_id on its OWN database, so its
+     * [BACKLOG] does not move the counts and buffer bounds [db] pins:
+     * `backlog`'s pending index holds, in id order, one ended pending row
+     * (id 1), [DROPPED_AHEAD] pending rows of a dropped table, then (past
+     * [HEAD_PROVIDED] provided rows) the live backlog from [BACKLOG_HEAD];
+     * `drained` has nothing pending.
+     */
+    private val headDb by lazy { PgTestSupport.freshDatabase().also { seedPendingHead(it) } }
+    private var headDbOpen = false
+
     @AfterAll
-    fun tearDown() = db.close()
+    fun tearDown() {
+        db.close()
+        if (headDbOpen) headDb.close()
+    }
 
     @BeforeAll
     fun seed() {
@@ -170,6 +202,12 @@ class CatalogMetricsPlanIntegrationTest {
             h.execute(
                 "UPDATE hog_data_file SET missing_field_ids = true WHERE catalog_id = 1 " +
                     "AND data_file_id % ${DATA_FILES / MISSING_ID_FILES} = 2",
+            )
+            // Quarantined files on live tables, and on the pending drops
+            // (which the count must exclude).
+            h.execute(
+                "UPDATE hog_data_file SET prefix_quarantined = true WHERE catalog_id = 1 " +
+                    "AND (data_file_id % ${DATA_FILES / QUARANTINED_FILES} = 3 OR data_file_id > $DATA_FILES)",
             )
             // Summary: `prod` and `small` published generation 1 with
             // generation 2 in flight; `unsampled` has a row that never
@@ -467,7 +505,7 @@ class CatalogMetricsPlanIntegrationTest {
     /**
      * #269: the sample used to be one full pass over hog_data_file per
      * tick. Now every read of the manifest is an index descent — the
-     * three partial indexes for the rare states, `hog_data_file_live`
+     * four partial indexes for the rare states, `hog_data_file_live`
      * scoped by catalog for a catalog with no published generation — and
      * `prod`'s $DATA_FILES-row manifest is never walked: its live totals
      * come from the published tier generation.
@@ -480,8 +518,8 @@ class CatalogMetricsPlanIntegrationTest {
         assertThat(exec).describedAs(plan).doesNotContain("Seq Scan on hog_data_file")
         assertThat(exec).describedAs(plan).doesNotContain("Seq Scan on hog_maintenance_summary_tier")
         assertThat(exec).describedAs(plan).doesNotContain("Seq Scan on hog_table")
-        // EVERY manifest read is through one of the three attention
-        // indexes (V26) — not `_live`, not the primary key, nothing a
+        // EVERY manifest read is through one of the four attention
+        // indexes (V26, V31) — not `_live`, not the primary key, nothing a
         // catalog's whole manifest sits under. A plain Index Scan names
         // its index on the scan line, a Bitmap Heap Scan on the Bitmap
         // Index Scan beneath it; both are checked.
@@ -490,12 +528,18 @@ class CatalogMetricsPlanIntegrationTest {
                 Regex("""Index (Only )?Scan using hog_data_file|Bitmap Index Scan on hog_data_file""")
                     .containsMatchIn(it)
             }
-        assertThat(manifestIndexLines).describedAs(plan).hasSizeGreaterThanOrEqualTo(3)
+        assertThat(manifestIndexLines).describedAs(plan).hasSizeGreaterThanOrEqualTo(4)
         for (line in manifestIndexLines) {
             assertThat(line)
                 .describedAs("a manifest read outside the attention indexes:%n%s", plan)
-                .containsPattern("hog_data_file_(pending|failed|missing_field_ids)\\b")
+                .containsPattern("hog_data_file_(pending|failed|missing_field_ids|prefix_quarantined)\\b")
         }
+        // The quarantine count (V31) is one of them. MUTATION: drop
+        // `f.prefix_quarantined` from its subselect and it reads the
+        // catalog's live files through hog_data_file_live instead.
+        assertThat(exec).describedAs(plan).containsPattern(
+            "(Index (Only )?Scan using|Bitmap Index Scan on) hog_data_file_prefix_quarantined\\b",
+        )
         // And the manifest's buffers are the rare populations' — index
         // pages plus a heap fetch for whatever the visibility map does
         // not cover — against a $DATA_FILES-row relation. MUTATION: put
@@ -506,7 +550,7 @@ class CatalogMetricsPlanIntegrationTest {
             ExplainPlan.nodes(exec).filter { it.line.contains("on hog_data_file") }.sumOf { it.buffers }
         assertThat(manifestBuffers)
             .describedAs("manifest buffers must be the rare populations', not the manifest's:%n%s", plan)
-            .isLessThan((PENDING_FILES + FAILED_FILES + MISSING_ID_FILES).toLong())
+            .isLessThan((PENDING_FILES + FAILED_FILES + MISSING_ID_FILES + QUARANTINED_FILES).toLong())
         // The live totals are the summary row: the tier is read ONLY for
         // the tables dropped since the generation's snapshot, through
         // the (catalog_id, generation, table_id) index, one range per
@@ -554,6 +598,7 @@ class CatalogMetricsPlanIntegrationTest {
         assertThat(prod["stats_pending"]).isEqualTo(PENDING_FILES.toLong())
         assertThat(prod["stats_failed"]).isEqualTo(FAILED_FILES.toLong())
         assertThat(prod["missing_field_ids"]).isEqualTo(MISSING_ID_FILES.toLong())
+        assertThat(prod["prefix_quarantined"]).isEqualTo(QUARANTINED_FILES.toLong())
         // No generation: absent, with the flag saying so — and the
         // catalog's files, which exist, are not summed in its place.
         val unsampled = rows.getValue("unsampled")
@@ -572,6 +617,174 @@ class CatalogMetricsPlanIntegrationTest {
         val snapshotNodes = ExplainPlan.nodes(execution(plan)).filter { it.line.contains("on hog_snapshot") }
         for (node in snapshotNodes) {
             assertThat(node.buffers).describedAs(plan).isLessThanOrEqualTo(4 * node.loops)
+        }
+    }
+
+    private fun seedPendingHead(head: PgTestSupport.TestDb) {
+        headDbOpen = true
+        head.jdbi.useHandleUnchecked { h ->
+            h.execute(
+                "INSERT INTO hog_catalog (name, data_path, last_snapshot_id, earliest_snapshot_id) " +
+                    "VALUES ('backlog', 's3://b', 2, 1), ('drained', 's3://d', 1, 1)",
+            )
+            // catalog ids 1..2 in that order.
+            h.execute(
+                "INSERT INTO hog_snapshot (catalog_id, snapshot_id, schema_version) " +
+                    "VALUES (1, 1, 0), (1, 2, 0), (2, 1, 0)",
+            )
+            h.execute(
+                "INSERT INTO hog_table (catalog_id, table_id, created_snapshot, dropped_snapshot) " +
+                    "VALUES (1, 1, 1, NULL), (1, 2, 1, 2), (2, 1, 1, NULL)",
+            )
+            // hog_table in the shape it converges to (rows are never
+            // deleted): thousands dropped, tens live. With three rows the
+            // planner materialises it; dominated by dropped tables, a plain
+            // join to it was planned as a merge join over the sorted backlog.
+            h.execute(
+                "INSERT INTO hog_table (catalog_id, table_id, created_snapshot, dropped_snapshot) " +
+                    "SELECT 1, 1000 + g, 1, CASE WHEN g <= $HEAD_LIVE_TABLES THEN NULL ELSE 2 END " +
+                    "FROM generate_series(1, ${HEAD_LIVE_TABLES + HEAD_DROPPED_TABLES}) g",
+            )
+            h.execute(
+                """
+                INSERT INTO hog_data_file (catalog_id, data_file_id, table_id, begin_snapshot, end_snapshot,
+                                           path, record_count, file_size_bytes, row_id_start, stats_state)
+                SELECT 1, g,
+                       CASE WHEN g BETWEEN 2 AND ${DROPPED_AHEAD + 1} THEN 2 ELSE 1 END,
+                       1, CASE WHEN g = 1 THEN 2 END,
+                       's3://b/f' || g, 10, 100, g,
+                       CASE WHEN g < ${DROPPED_AHEAD + 2} OR g >= $BACKLOG_HEAD THEN 'pending' ELSE 'provided' END
+                  FROM generate_series(1, ${BACKLOG_HEAD + BACKLOG - 1}) g
+                """,
+            )
+            h.execute(
+                "INSERT INTO hog_data_file (catalog_id, data_file_id, table_id, begin_snapshot, path, " +
+                    "record_count, file_size_bytes, row_id_start, stats_state) " +
+                    "VALUES (2, 1, 1, 1, 's3://d/1', 1, 1, 0, 'provided')",
+            )
+            h.execute("VACUUM (ANALYZE) hog_data_file")
+            h.execute("ANALYZE hog_table")
+        }
+    }
+
+    /** EXPLAIN of the head read alone, over every catalog of [on]; [setup] runs first in the transaction. */
+    private fun explainHead(
+        on: PgTestSupport.TestDb,
+        setup: String? = null,
+    ): String =
+        on.jdbi.inTransactionUnchecked { h ->
+            h.execute("SET LOCAL max_parallel_workers_per_gather = 0")
+            if (setup != null) h.execute(setup)
+            h.createQuery(
+                "EXPLAIN (ANALYZE, BUFFERS, TIMING false, COSTS false, SUMMARY false) " +
+                    "SELECT c.name, ${CatalogMetrics.PENDING_HEAD_FILE_ID_SQL} AS head FROM hog_catalog c",
+            ).mapTo(String::class.java).list().joinToString("\n")
+        }
+
+    /** Pending-index entries the head read walked, summed over loops. */
+    private fun walked(exec: String): Double =
+        exec.lines().filter { it.contains("Index Only Scan using hog_data_file_pending") }.sumOf { line ->
+            val m = Regex("""actual rows=([\d.]+) loops=(\d+)""").find(line)!!
+            m.groupValues[1].toDouble() * m.groupValues[2].toLong()
+        }
+
+    /**
+     * PENDING_HEAD_FILE_ID_SQL on [db], the production-shaped fixture
+     * where a plain join to `hog_table` (40 live tables, 11,000 dropped)
+     * was planned as a Merge Join over `prod`'s whole pending range,
+     * sorted twice, inside SAMPLE_SQL. The order is now structural: no
+     * Sort and no Merge Join anywhere in the sample, and the head read
+     * walks the head of each catalog's pending index — one entry for
+     * `prod`, none for the others — not its [PENDING_FILES]. MUTATION:
+     * put a plain `JOIN hog_table` back and this reds.
+     *
+     * STRUCTURAL, NOT CHOSEN: the same read with `enable_nestloop` off
+     * keeps its shape. A LATERAL probe with its own LIMIT has no join form
+     * to switch to, where a plain join does — whether the planner takes
+     * it otherwise depends on what ANALYZE sampled.
+     */
+    @Test
+    fun `the pending head read walks only the head, on the dropped-dominated catalog too`() {
+        val sample = execution(explain(CatalogMetrics.SAMPLE_SQL))
+        assertThat(sample).describedAs(sample).doesNotContain("Merge Join").doesNotContain("Sort")
+        val plan = explainHead(db)
+        val exec = execution(plan)
+        println("[metrics-plan] pending head on db:\n$plan")
+        assertThat(exec).describedAs(plan).doesNotContain("Merge Join").doesNotContain("Sort")
+        // Non-vacuity by the node's presence, not its row count: before PG
+        // 18 EXPLAIN rounds per-loop actual rows to an integer, and prod's
+        // one head row over four loops prints rows=0.
+        assertThat(exec).describedAs(plan).contains("Index Only Scan using hog_data_file_pending")
+        assertThat(walked(exec)).describedAs(plan).isLessThanOrEqualTo(4.0)
+        val forced = explainHead(db, setup = "SET LOCAL enable_nestloop = off")
+        assertThat(execution(forced)).describedAs(forced)
+            .doesNotContain("Merge Join").doesNotContain("Merge Right Join").doesNotContain("Merge Left Join")
+            .doesNotContain("Hash Join").doesNotContain("Hash Right Join").doesNotContain("Hash Left Join")
+            .doesNotContain("Sort")
+    }
+
+    /**
+     * The head is read BY KEY: the [BACKLOG] behind it is never walked,
+     * and the walk to it is index-only — what it does read is the dropped
+     * table's [DROPPED_AHEAD] entries in front, which the claim walks too.
+     * MUTATION: order the head by anything but the index's own order and
+     * this reads all [BACKLOG] rows.
+     */
+    @Test
+    fun `the pending head is read by key, never by sorting the backlog`() {
+        val plan = explainHead(headDb)
+        val exec = execution(plan)
+        println("[metrics-plan] pending head: $BACKLOG pending behind $DROPPED_AHEAD dropped\n$plan")
+        assertThat(exec).describedAs(plan)
+            .doesNotContain("Seq Scan on hog_data_file")
+            .doesNotContain("Seq Scan on hog_table")
+            .doesNotContain("Sort")
+        assertThat(exec).describedAs(plan).contains("Index Only Scan using hog_data_file_pending")
+        val manifestNodes = ExplainPlan.nodes(exec).filter { it.line.contains("on hog_data_file") }
+        assertThat(manifestNodes).describedAs(plan).isNotEmpty().allSatisfy {
+            assertThat(it.line).contains("using hog_data_file_pending")
+        }
+        // The head of each catalog, plus the dropped table's entries in
+        // front of `backlog`'s.
+        assertThat(walked(exec)).describedAs(plan).isLessThanOrEqualTo((DROPPED_AHEAD + 2).toDouble())
+        // A leaf page holds hundreds of entries: the dropped run is a
+        // handful of pages, the backlog would be hundreds.
+        assertThat(manifestNodes.sumOf { it.buffers }).describedAs(plan).isLessThanOrEqualTo(64)
+    }
+
+    /**
+     * The value, through the gauge: `backlog`'s head is [BACKLOG_HEAD], not
+     * the ended row (id 1) or the dropped table's (2 onwards) in front of
+     * it, and it advances once the head leaves `pending` — the sweep's
+     * flip; HydratorObjectPrefixIntegrationTest drives a real sweep.
+     * `drained` reads 0, present. MUTATIONS: drop the dropped-table or the
+     * liveness term and `backlog` reads 2 or 1.
+     */
+    @Test
+    fun `the gauge is the queue's head, skips dropped and ended rows, advances, and is 0 when drained`() {
+        fun heads(): Map<String, Double?> {
+            val registry = SimpleMeterRegistry()
+            CatalogMetrics(headDb.jdbi, registry).sampleOnce()
+            return listOf("backlog", "drained").associateWith {
+                registry.find("hoglake_stats_pending_head_file_id").tag("catalog", it).gauge()?.value()
+            }
+        }
+        assertThat(heads()).isEqualTo(mapOf("backlog" to BACKLOG_HEAD.toDouble(), "drained" to 0.0))
+        headDb.jdbi.useHandleUnchecked { h ->
+            h.execute(
+                "UPDATE hog_data_file SET stats_state = 'provided' WHERE catalog_id = 1 AND data_file_id = ?",
+                BACKLOG_HEAD,
+            )
+        }
+        try {
+            assertThat(heads()["backlog"]).isEqualTo((BACKLOG_HEAD + 1).toDouble())
+        } finally {
+            headDb.jdbi.useHandleUnchecked { h ->
+                h.execute(
+                    "UPDATE hog_data_file SET stats_state = 'pending' WHERE catalog_id = 1 AND data_file_id = ?",
+                    BACKLOG_HEAD,
+                )
+            }
         }
     }
 }

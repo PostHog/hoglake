@@ -3,18 +3,30 @@
 Arrow 25 exposes VARIANT as its storage struct and drops its logical annotation.
 Read only the schema list from the compact-Thrift footer to distinguish native
 VARIANT from an ordinary struct. No payload pages are loaded or rewritten.
+
+The same footer reading serves pyhoglake's own VARIANT files, which Arrow
+cannot annotate either: :func:`write_variant_parquet` writes the storage
+with pyarrow, splices the annotations into the footer
+(:func:`stamp_variant_footer`), and holds the result to the declaration's
+layout (:func:`variant_layout_fault`).
 """
 
 from __future__ import annotations
 
+import io
+import os
 import struct
-from typing import Any
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any, Literal, NamedTuple, TypeAlias
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 from thrift.protocol.TCompactProtocol import TCompactProtocol
 from thrift.Thrift import TType
 from thrift.transport.TTransport import TMemoryBuffer
 
+from ._variant_codec import ParquetElement, Plan, member, structure_fault
 from .errors import UnsupportedTypeError, ValidationError
 from .models import Column
 from .types import (
@@ -22,24 +34,56 @@ from .types import (
     PARQUET_FIELD_ID_KEY,
     coltype_to_arrow,
     column_to_arrow_field,
+    map_names_form,
     uuid_storage_form,
     uuid_storage_form_schema,
 )
+from .variant import SHREDDING_KEY, _column_plan
+
+#: A Parquet file: its path, or the whole file in memory.
+Source: TypeAlias = str | os.PathLike[str] | bytes | bytearray | memoryview | pa.Buffer
+
+#: The largest footer read: its length is the file's to state, and the
+#: bytes are read whole before any of them is checked.
+_MAX_FOOTER = 64 * 1024 * 1024
+
+# parquet.thrift's SchemaElement field ids, and the Type values the stamps
+# check, by name where the code below reads them.
+_TYPE, _NAME, _CHILDREN = 1, 4, 5
+_CONVERTED, _SCALE, _PRECISION, _FIELD_ID, _LOGICAL = 6, 7, 8, 9, 10
+_INT32, _INT64 = 1, 2
 
 
 def _struct(protocol: Any, depth: int = 0) -> dict[int, Any]:
+    return _fields(protocol, depth)[0]
+
+
+def _fields(protocol: Any, depth: int = 0) -> tuple[dict[int, Any], int]:
+    """A struct's fields by Thrift id, and the id of its last field.
+
+    BOOLs are kept: TIMESTAMP's and TIME's ``isAdjustedToUTC`` and
+    INTEGER's ``isSigned`` are BOOLs, and without them TIMESTAMP(true)
+    read as TIMESTAMP(false), and INT(8, true) as UINT_8. A list or any
+    other type is skipped. The last id counts a skipped field too: the
+    compact protocol writes each field id as a delta from the one before,
+    so a splice that adds a field after it has to know it.
+    """
     if depth > 8:
         raise ValueError("Parquet logical annotation nesting is too deep")
-    result = {}
+    result: dict[int, Any] = {}
+    last = 0
     protocol.readStructBegin()
     while True:
         _, kind, field = protocol.readFieldBegin()
         if kind == TType.STOP:
             break
+        last = field
         if kind == TType.I32:
             result[field] = protocol.readI32()
         elif kind == TType.BYTE:
             result[field] = protocol.readByte()
+        elif kind == TType.BOOL:
+            result[field] = protocol.readBool()
         elif kind == TType.STRING:
             result[field] = protocol.readString()
         elif kind == TType.STRUCT:
@@ -48,20 +92,50 @@ def _struct(protocol: Any, depth: int = 0) -> dict[int, Any]:
             protocol.skip(kind)
         protocol.readFieldEnd()
     protocol.readStructEnd()
-    return result
+    return result, last
 
 
-def _schema_elements(path: str) -> list[dict[int, Any]]:
-    with open(path, "rb") as source:
-        source.seek(0, 2)
-        size = source.tell()
-        source.seek(-8, 2)
-        trailer = source.read(8)
-        length = struct.unpack("<I", trailer[:4])[0]
-        if trailer[4:] != b"PAR1" or length > min(size - 12, 64 * 1024 * 1024):
-            raise ValueError("invalid or oversized Parquet footer")
-        source.seek(-8 - length, 2)
-        protocol = TCompactProtocol(TMemoryBuffer(source.read(length)))
+def _footer_bytes(source: Source) -> tuple[int, bytes]:
+    """The offset of a Parquet file's footer, and the footer: the Thrift
+    FileMetaData, without the length and the magic after it.
+
+    ``source`` is a path, whose tail alone is read, or the whole file in
+    memory. Only a plaintext footer is read: an encrypted one ends in
+    ``PARE``, and its schema is ciphertext.
+    """
+    if isinstance(source, (str, os.PathLike)):
+        with open(source, "rb") as file:
+            file.seek(0, 2)
+            size = file.tell()
+            if size < 8:
+                raise ValueError("invalid or oversized Parquet footer")
+            file.seek(-8, 2)
+            length = _footer_length(file.read(8), size)
+            file.seek(-8 - length, 2)
+            return size - 8 - length, file.read(length)
+    view = memoryview(source).cast("B")
+    size = len(view)
+    if size < 8:
+        raise ValueError("invalid or oversized Parquet footer")
+    length = _footer_length(bytes(view[-8:]), size)
+    start = size - 8 - length
+    return start, bytes(view[start : size - 8])
+
+
+def _footer_length(trailer: bytes, size: int) -> int:
+    length: int = struct.unpack("<I", trailer[:4])[0]
+    if trailer[4:] == b"PARE":
+        raise ValueError("Parquet footer is encrypted (PARE)")
+    if trailer[4:] != b"PAR1" or length > min(size - 12, _MAX_FOOTER):
+        raise ValueError("invalid or oversized Parquet footer")
+    return length
+
+
+def _read_schema(footer: bytes) -> list[tuple[dict[int, Any], int, int]]:
+    """Each element of a footer's schema list: its fields, the offset in
+    the footer of its STOP byte, and the id of its last field."""
+    transport = TMemoryBuffer(footer)
+    protocol = TCompactProtocol(transport)
     protocol.readStructBegin()
     while True:
         _, kind, field = protocol.readFieldBegin()
@@ -71,13 +145,75 @@ def _schema_elements(path: str) -> list[dict[int, Any]]:
             item_type, count = protocol.readListBegin()
             if item_type != TType.STRUCT or not 0 < count <= 100000:
                 raise ValueError("invalid Parquet schema list")
-            return [_struct(protocol) for _ in range(count)]
+            cursor = transport.cstringio_buf
+            read = []
+            for _ in range(count):
+                fields, last = _fields(protocol)
+                # The compact protocol's readStructEnd reads nothing, so the
+                # byte just read is the element's STOP.
+                read.append((fields, cursor.tell() - 1, last))
+            return read
         protocol.skip(kind)
         protocol.readFieldEnd()
 
 
-def _top_level(elements: list[dict[int, Any]]) -> list[tuple[dict[int, Any], range]]:
-    """Each top-level schema element with the leaf-column range it owns.
+def _schema_elements_from_footer(footer: bytes) -> list[dict[int, Any]]:
+    return [fields for fields, _, _ in _read_schema(footer)]
+
+
+def _schema_elements(source: Source) -> list[dict[int, Any]]:
+    return _schema_elements_from_footer(_footer_bytes(source)[1])
+
+
+class SchemaElement(NamedTuple):
+    """One schema element of a footer, with where it sits.
+
+    ``stop`` is the offset in the footer of the element's STOP byte, before
+    which a field can be added; ``last`` is the id of its last field.
+    ``path`` is its names from the root's child down; a tuple, never a
+    dotted string, because a declared name may hold a dot (Trino's ``a.b``).
+    """
+
+    fields: dict[int, Any]
+    stop: int
+    last: int
+    path: tuple[str, ...]
+
+
+def _positioned_elements(footer: bytes) -> list[SchemaElement]:
+    """The schema list of a footer, each element a :class:`SchemaElement`.
+    A tree that claims more elements than it holds, holds more than it
+    claims, or counts children below zero is refused, with ValueError: the
+    splice places its bytes by these paths."""
+    out = []
+    # [children still to come, path] of each group being read.
+    open_groups: list[list[Any]] = []
+    for index, (fields, stop, last) in enumerate(_read_schema(footer)):
+        path: tuple[str, ...] = ()
+        if index:
+            while open_groups and not open_groups[-1][0]:
+                open_groups.pop()
+            name = fields.get(_NAME)
+            if not open_groups or not isinstance(name, str):
+                raise ValueError("invalid Parquet schema tree")
+            open_groups[-1][0] -= 1
+            path = (*open_groups[-1][1], name)
+        children = fields.get(_CHILDREN, 0)
+        if not isinstance(children, int) or children < 0:
+            raise ValueError("negative schema child count")
+        if children:
+            open_groups.append([children, path])
+        out.append(SchemaElement(fields, stop, last, path))
+    if any(left for left, _ in open_groups):
+        raise ValueError("truncated Parquet schema")
+    return out
+
+
+def _top_level(
+    elements: list[dict[int, Any]],
+) -> list[tuple[dict[int, Any], range, int]]:
+    """Each top-level schema element with the leaf-column range it owns,
+    and its index in ``elements``.
 
     A row group's column chunks are its leaves, in schema order, so the
     range indexes ``row_group.column(...)`` directly. That is how a
@@ -102,7 +238,7 @@ def _top_level(elements: list[dict[int, Any]]) -> list[tuple[dict[int, Any], ran
                 leaves += 1
             pending += children - 1
             cursor += 1
-        result.append((elements[start], range(first_leaf, leaves)))
+        result.append((elements[start], range(first_leaf, leaves), start))
     if cursor != len(elements):
         raise ValueError("invalid Parquet schema tree")
     return result
@@ -164,21 +300,33 @@ def prepared_schema_matches(found: pa.Schema, want: pa.Schema) -> bool:
 
     Field for field, names, nullability and the ``PARQUET:field_id``
     metadata compared exactly — the identity check that binds a file to
-    the catalog. The ONE licence is the uuid column's two legal
-    spellings: hoglake's uuid wire form is
+    the catalog. There are TWO licences. The first is the uuid column's
+    two legal spellings: hoglake's uuid wire form is
     ``FIXED_LEN_BYTE_ARRAY(16) + UUID``, which pyarrow produces only for
     ``pa.uuid()``, while every file registered before that contract (and
     any writer below the pyarrow floor) carries the bare fixed(16). The
     bytes are identical, so both are accepted, at any nesting depth
     (:func:`~pyhoglake.types.uuid_storage_form`).
 
+    The second is a map's synthetic names. Every writer and reader names
+    the entries struct, key and value differently, and pyarrow names the
+    entries after the map's own field on read, so both sides are normalized
+    (:func:`~pyhoglake.types.map_names_form`).
+
     Nothing else is loosened: the field ids still have to match, so a
-    file that annotates its uuid column but misnumbers it is refused
-    exactly as before.
+    file that annotates its uuid column but misnumbers it, or that
+    numbers a map's key or value differently, is refused exactly as
+    before.
     """
-    return uuid_storage_form_schema(found).equals(
-        uuid_storage_form_schema(want), check_metadata=True
-    )
+
+    def comparable(schema: pa.Schema) -> pa.Schema:
+        schema = uuid_storage_form_schema(schema)
+        return pa.schema(
+            [f.with_type(map_names_form(f.type)) for f in schema],
+            metadata=schema.metadata,
+        )
+
+    return comparable(found).equals(comparable(want), check_metadata=True)
 
 
 def validate_variant_file(path: str, parquet: Any, columns: tuple[Column, ...]) -> None:
@@ -195,7 +343,9 @@ def validate_variant_file(path: str, parquet: Any, columns: tuple[Column, ...]) 
     arrow = parquet.schema_arrow
     if arrow.names != [c.name for c in columns] or len(physical) != len(columns):
         fail("prepared Parquet columns differ from destination")
-    for column, field, (element, leaves) in zip(columns, arrow, physical, strict=True):
+    for column, field, (element, leaves, _) in zip(
+        columns, arrow, physical, strict=True
+    ):
         if (
             element.get(9) != column.field_id
             or field.metadata is None
@@ -283,3 +433,520 @@ def validate_variant_file(path: str, parquet: Any, columns: tuple[Column, ...]) 
                     fail(
                         f"prepared file cannot prove non-null values for {column.name}"
                     )
+
+
+# -- stamping pyhoglake's own VARIANT files ------------------------------------
+
+
+@dataclass(frozen=True)
+class FooterStamp:
+    """One annotation :func:`stamp_variant_footer` adds to a footer.
+
+    ``variant`` is VARIANT(1) on a top-level group, which must carry
+    ``field_id``; ``decimal4`` and ``decimal8`` are DECIMAL(precision,
+    scale) on an INT32 or INT64 leaf. ``path`` is the element's names from
+    the top-level column down.
+    """
+
+    path: tuple[str, ...]
+    kind: Literal["variant", "decimal4", "decimal8"]
+    field_id: int | None = None
+    precision: int = 0
+    scale: int = 0
+
+    def __post_init__(self) -> None:
+        # The root is never a stamp's target (the splice looks below it);
+        # first, since every message below names the path.
+        if not self.path:
+            raise ValueError("a stamp needs a path below the root")
+        # Any other would be stamped as a decimal8 (_annotation), typo or not.
+        if self.kind not in ("variant", "decimal4", "decimal8"):
+            raise ValueError(f"{_where(self.path)}: no stamp of kind {self.kind!r}")
+        # A group's stamp is checked against the group's field id, so None
+        # would match a group that has none; a leaf's would be ignored.
+        has_id = isinstance(self.field_id, int) and not isinstance(self.field_id, bool)
+        if has_id != (self.kind == "variant"):
+            raise ValueError(
+                f"{_where(self.path)}: a {self.kind} stamp with field id "
+                f"{self.field_id!r}"
+            )
+
+
+#: :meth:`Plan.expected_elements` of one column.
+Expected: TypeAlias = list[tuple[tuple[str, ...], ParquetElement]]
+
+
+def variant_stamps(
+    column: Column, plan: Plan, *, expected: Expected | None = None
+) -> list[FooterStamp]:
+    """The stamps a file of ``column`` written from ``plan``'s storage
+    needs: VARIANT(1) on its group and DECIMAL on each leaf of
+    :attr:`Plan.stamps`, which the file holds as INT32 (decimal4) or INT64
+    (decimal8) as :meth:`Plan.expected_elements` says (``expected``, when
+    the caller has it already)."""
+    by_path = dict(plan.expected_elements(column) if expected is None else expected)
+    stamps = [FooterStamp((column.name,), "variant", field_id=column.field_id)]
+    for path, precision, scale in plan.stamps:
+        where = (column.name, *path)
+        physical = by_path[where][_TYPE]
+        stamps.append(
+            FooterStamp(
+                where,
+                "decimal4" if physical == _INT32 else "decimal8",
+                precision=precision,
+                scale=scale,
+            )
+        )
+    return stamps
+
+
+def stamp_variant_footer(
+    raw: bytes | bytearray | memoryview | pa.Buffer, stamps: Sequence[FooterStamp]
+) -> tuple[int, bytes, list[dict[int, Any]]]:
+    """The file ``raw`` with ``stamps`` added to its footer, as the offset
+    at which its footer starts and what replaces everything from there
+    (the patched footer, its length and ``PAR1``), and the patched
+    footer's schema elements. The file is ``raw[:start] + tail``: the
+    body is the caller's to keep, unchanged and uncopied.
+
+    pyarrow writes a VARIANT group as the struct it is stored as, with no
+    annotation (it reads one, but drops it on write), and a decimal4 or
+    decimal8 leaf, given its unscaled integers, as a plain INT32 or INT64.
+    Each annotation is spliced in as the bytes the compact protocol encodes
+    it as, before the element's STOP byte: 7 bytes for VARIANT(1) on a
+    group (``logicalType``), 14 for DECIMAL(p, s) on a leaf
+    (``converted_type``, ``scale``, ``precision`` and ``logicalType``). A
+    field inside the schema list changes neither the list's header (an
+    element count) nor how any later field is encoded, and the body is
+    untouched, so every offset into it (column chunks, page indexes, bloom
+    filters) stays valid; only the footer's length in the trailer changes.
+
+    The patched footer is not read again: the elements returned are the
+    ones read before the splice with the stamps' fields added. The bytes
+    depend on nothing but the stamp and the element's last field id, which
+    the preconditions hold to the field id (a group) or to name or
+    num_children (a leaf), so the tests' generic re-encoding pins every
+    spelling there is; the exact size of the patch is asserted here.
+
+    Each precondition refuses loudly, with ValueError (as a FooterStamp
+    with another kind, a misplaced field id or no path does when it is
+    made): a footer that is not plaintext ``PAR1``; a path that is not in
+    the footer exactly once, or stamped twice; a group with a type, an
+    annotation, a field id other than the stamp's, or a field after the
+    field id; a leaf of another physical type, or with an annotation, a
+    scale, a precision, a field id or any field after ``num_children``. A
+    pyarrow that started writing any of these would stop pyhoglake's writes
+    rather than have it publish a layout nobody checked.
+    """
+    start, footer = _footer_bytes(raw)
+    elements = _positioned_elements(footer)
+    found: dict[tuple[str, ...], list[SchemaElement]] = {}
+    for element in elements[1:]:
+        found.setdefault(element.path, []).append(element)
+    inserts: dict[int, bytes] = {}
+    stamped: dict[tuple[str, ...], FooterStamp] = {}
+    for stamp in stamps:
+        where = _where(stamp.path)
+        if stamp.path in stamped:
+            raise ValueError(f"{where} is stamped twice")
+        stamped[stamp.path] = stamp
+        hits = found.get(stamp.path, [])
+        if len(hits) != 1:
+            raise ValueError(f"{where} is in the footer {len(hits)} times, not once")
+        inserts[hits[0].stop] = _annotation(stamp, hits[0])
+    # In footer order, whatever order the stamps came in: spliced in the
+    # order given, a later offset first, the pieces between them would
+    # repeat a stretch of the footer.
+    pieces = []
+    previous = 0
+    for offset in sorted(inserts):
+        pieces += [footer[previous:offset], inserts[offset]]
+        previous = offset
+    pieces.append(footer[previous:])
+    patched = b"".join(pieces)
+    groups = sum(stamp.kind == "variant" for stamp in stamps)
+    if len(patched) != len(footer) + 7 * groups + 14 * (len(stamps) - groups):
+        raise ValueError("stamped footer has the wrong length")
+    tail = b"".join((patched, struct.pack("<I", len(patched)), b"PAR1"))
+    return start, tail, [_stamped(e.fields, stamped.get(e.path)) for e in elements]
+
+
+def _annotation(stamp: FooterStamp, element: SchemaElement) -> bytes:
+    """The compact-protocol bytes of ``stamp``'s fields, inserted before
+    ``element``'s STOP, whose last field is ``element.last``."""
+    fields, last, where = element.fields, element.last, _where(stamp.path)
+    if stamp.kind == "variant":
+        if _TYPE in fields or not fields.get(_CHILDREN):
+            raise ValueError(f"{where} is not a group")
+        if _CONVERTED in fields or _LOGICAL in fields:
+            raise ValueError(f"{where} is already annotated")
+        if fields.get(_FIELD_ID) != stamp.field_id:
+            raise ValueError(
+                f"{where} has field id {fields.get(_FIELD_ID)}, not {stamp.field_id}"
+            )
+        if last != _FIELD_ID:
+            raise ValueError(f"{where} has field {last} after its field id")
+        # Field 10 (a struct, a delta of 1 from the field id), the LogicalType
+        # union's field 16 (VARIANT: a long-form header, the id as a zigzag
+        # i16), its VariantType's field 1 (an i8, version 1), two STOPs.
+        return bytes((0x1C, 0x0C, 0x20, 0x13, 0x01, 0x00, 0x00))
+    physical, widest = (_INT32, 9) if stamp.kind == "decimal4" else (_INT64, 18)
+    if fields.get(_TYPE) != physical:
+        raise ValueError(
+            f"{where} is physical type {fields.get(_TYPE)}, not {physical}"
+        )
+    if _FIELD_ID in fields:
+        raise ValueError(f"{where} has a field id")
+    held = sorted(set(fields) & {_CONVERTED, _SCALE, _PRECISION, _LOGICAL})
+    if held:
+        raise ValueError(f"{where} already has fields {held}")
+    if last > _CHILDREN:
+        raise ValueError(f"{where} has field {last} after num_children")
+    if not 0 <= stamp.scale <= stamp.precision <= widest or not stamp.precision:
+        raise ValueError(
+            f"{where}: DECIMAL({stamp.precision}, {stamp.scale}) is not a {stamp.kind}"
+        )
+    # Precision and scale are at most 18, so each zigzag varint is one byte.
+    scale, precision = stamp.scale << 1, stamp.precision << 1
+    return bytes(
+        (
+            (_CONVERTED - last) << 4 | 0x05,  # converted_type, an i32:
+            0x0A,  # DECIMAL (5)
+            0x15,  # scale
+            scale,
+            0x15,  # precision
+            precision,
+            0x2C,  # logicalType, a struct (a delta of 2)
+            0x5C,  # the LogicalType union's DECIMAL (field 5)
+            0x15,  # DecimalType's scale
+            scale,
+            0x15,  # and precision
+            precision,
+            0x00,  # STOP DecimalType
+            0x00,  # STOP LogicalType
+        )
+    )
+
+
+def _stamped(fields: dict[int, Any], stamp: FooterStamp | None) -> dict[int, Any]:
+    """An element's fields as they read once ``stamp`` is added."""
+    if stamp is None:
+        return fields
+    if stamp.kind == "variant":
+        return {**fields, _LOGICAL: {16: {1: 1}}}
+    scale, precision = stamp.scale, stamp.precision
+    return {
+        **fields,
+        _CONVERTED: 5,
+        _SCALE: scale,
+        _PRECISION: precision,
+        _LOGICAL: {5: {1: scale, 2: precision}},
+    }
+
+
+def _where(path: Sequence[str]) -> str:
+    """A path of Parquet names in a message: the column's name, then each
+    name below it as :func:`member` spells a key, so ``a.b`` is one name."""
+    return path[0] + "".join(member(name) for name in path[1:])
+
+
+# -- holding pyhoglake's own VARIANT files to their declarations ---------------
+
+
+def variant_layout_fault(
+    elements: list[dict[int, Any]],
+    start: int,
+    column: Column,
+    plan: Plan,
+    *,
+    expected: Expected | None = None,
+) -> str | None:
+    """What is wrong with the VARIANT layout pyhoglake wrote for
+    ``column``, whose group is ``elements[start]``, or None.
+
+    The subtree must be ``plan``'s :meth:`~Plan.expected_elements`
+    (``expected``, when the caller has it already), element for element:
+    names, order, repetition, child counts, physical type and length,
+    logical type with its BOOLs, scale and precision, the field id on the
+    group and on nothing below it, and VARIANT(1) on the group. The one
+    licence is a converted type, the legacy spelling of the logical type
+    beside it (with a DECIMAL's scale and precision), which a writer may
+    leave out whole, but not spell otherwise. Every element's
+    child count is compared, so a subtree whose elements all match has the
+    expected extent too.
+
+    This is for pyhoglake's own files only, which the declaration says
+    everything about; a file another writer produced may lay a declaration
+    out otherwise, as the spec allows.
+    """
+    cursor, pending = start, 1
+    while pending:
+        if cursor >= len(elements):
+            return "truncated Parquet schema"
+        children = elements[cursor].get(_CHILDREN, 0)
+        if not isinstance(children, int) or children < 0:
+            return "negative schema child count"
+        pending += children - 1
+        cursor += 1
+    if expected is None:
+        expected = plan.expected_elements(column)
+    for offset, (path, want) in enumerate(expected):
+        index = start + offset
+        found = elements[index] if index < cursor else None
+        if found is None or not _same_element(found, want):
+            return f"{_where(path)} is {found!r}, not the declaration's {want!r}"
+    return None
+
+
+def _same_element(found: dict[int, Any], want: dict[int, Any]) -> bool:
+    if found == want:
+        return True
+    # A converted type, with the scale and precision a DECIMAL one carries,
+    # is the legacy spelling of the logical type beside it: a writer may
+    # leave it out, but not write another.
+    legacy = {_CONVERTED, _SCALE, _PRECISION}
+    return _CONVERTED in want and found == {
+        field: value for field, value in want.items() if field not in legacy
+    }
+
+
+@dataclass(frozen=True)
+class VariantParquet:
+    """A Parquet file :func:`write_variant_parquet` wrote, stamped and
+    checked: the bytes to upload, and what the registration reads off
+    them, the sizes measured AFTER the footer was patched."""
+
+    #: The whole file, in the buffer pyarrow wrote it into: the stamps
+    #: replace the footer in place, with no whole-file join (at worst,
+    #: one realloc as the slightly longer tail is written).
+    body: pa.Buffer
+    #: The footer's length from the patched trailer: the wire's
+    #: ``footer_size`` (the Thrift FileMetaData, without the 8-byte suffix).
+    footer_size: int
+    #: pyarrow's FileMetaData of the file as written, before the stamps:
+    #: the row count, the row groups, and every column chunk's offsets,
+    #: sizes, null counts and raw statistics bytes, which the stamps do not
+    #: touch. The stamped annotations are not the body's: no VARIANT on the
+    #: groups, and no DECIMAL on their decimal4/decimal8 leaves, whose
+    #: statistics therefore read as unscaled integers. Nor is
+    #: ``serialized_size``, which is 0 here. ``extract_column_stats`` skips
+    #: a variant's storage whole.
+    metadata: Any
+
+    @property
+    def size(self) -> int:
+        return len(self.body)
+
+
+class _RefusedTable(ValueError):
+    """:func:`write_variant_parquet`'s refusal of the caller's table, made
+    before anything is written. A ValueError, as documented; its own type
+    lets the append paths name VARIANT for these alone and leave an error
+    of pyarrow's write (an option, a null in a non-nullable column) as the
+    other write paths raise it."""
+
+
+def write_variant_parquet(
+    table: pa.Table,
+    columns: Sequence[Column],
+    *,
+    row_group_size: int | None = None,
+    write_options: Mapping[str, Any] | None = None,
+) -> VariantParquet:
+    """Write ``table``, whose variant columns hold their storage in the
+    write form of their declarations, as the Parquet file of those
+    declarations.
+
+    ``columns`` are the catalog's, and ``table`` carries their field ids:
+    each variant field its column's nullability and ``PARQUET:field_id``,
+    as :func:`~pyhoglake.types.columns_to_arrow_schema` builds them, and a
+    variant column's plan is its own declaration's. ``write_options``
+    comes from :func:`pyhoglake.parquet_write_options` (empty means
+    pyarrow's default codec, SNAPPY), as for the other write paths. Each
+    step is what the file must be for the Trino connector:
+
+    1. Each decimal4/decimal8 leaf is viewed (zero-copy) as the int32/int64
+       its decimal32/decimal64 already holds: pyarrow writes a decimal32 or
+       decimal64 as a fixed-length array, and the file-wide
+       ``store_decimal_as_integer`` would also change a decimal16 leaf and
+       any top-level decimal column (D15).
+    2. ``store_schema=False``: a stored Arrow schema would describe the
+       group as the plain struct, with integer leaves, and pyarrow reads
+       that back instead of the footer.
+    3. The footer is stamped (:func:`stamp_variant_footer`), in the buffer
+       pyarrow wrote: the body before it stays where it is.
+    4. Each variant column's subtree is held to its declaration, element
+       for element (:func:`variant_layout_fault`), on the elements the
+       splice read: the file is not opened again.
+
+    The caller's mistakes are refused with ValueError before anything is
+    written: a table with no variant column, a variant field whose
+    nullability or field id is not its column's, or whose type is not its
+    declaration's write form, SQL NULL rows in a NOT NULL column, and a
+    null in a non-nullable field below the top (under a present row
+    pyarrow would write it as other values, and under a SQL NULL row it
+    cannot view it; the encoder's output holds neither). An error of
+    pyarrow's own write (an option, SQL NULL in another NOT NULL column)
+    is raised as pyarrow raises it. A variant nested in a container is
+    refused with UnsupportedTypeError, as
+    :func:`~pyhoglake.types.column_to_arrow_field` refuses it.
+
+    A failure at 3 or 4 is pyhoglake's, or a pyarrow it does not know, and
+    raises ValidationError before anything is uploaded. How pyarrow reads
+    the file back (a plain struct, never an extension type) is pinned by
+    the tests' canaries, on every pyarrow CI runs.
+    """
+    by_name = {column.name: column for column in columns}
+    fields, data, stamps = [], [], []
+    # column, plan and expected elements of each variant column, in order:
+    # the elements are derived once and serve both the stamps and the check.
+    planned: list[tuple[Column, Plan, Expected]] = []
+    for field in table.schema:
+        column = by_name.get(field.name)
+        if column is not None and column.type in NESTED_TYPES:
+            # Built for its refusal: a container holding a variant is
+            # refused, as the other write paths refuse it, rather than
+            # written as the plain struct it would be.
+            column_to_arrow_field(column)
+        if column is None or column.type != "variant":
+            fields.append(field)
+            data.append(table.column(field.name))
+            continue
+        # The caller's table, not pyhoglake's layout: either would
+        # otherwise surface as a footer or layout fault blaming the writer.
+        field_id = (field.metadata or {}).get(PARQUET_FIELD_ID_KEY)
+        if field_id != str(column.field_id).encode():
+            held = (
+                "no field id"
+                if field_id is None
+                else f"field id {field_id.decode(errors='replace')}"
+            )
+            raise _RefusedTable(
+                f"{field.name} carries {held}, not its column's {column.field_id}"
+            )
+        if field.nullable != column.nullable:
+            nullable = {True: "nullable", False: "NOT NULL"}
+            raise _RefusedTable(
+                f"{field.name} is {nullable[field.nullable]}, and its column "
+                f"{nullable[column.nullable]}"
+            )
+        plan = _column_plan(column, (column.type_params or {}).get(SHREDDING_KEY))
+        if plan.form_of(field.type) != "write":
+            raise _RefusedTable(f"{field.name} is not in its plan's write form")
+        # pyarrow writes a null struct in a REQUIRED group as its children's
+        # bytes, here an empty metadata: an invalid variant that both the
+        # splice and the layout check pass, since the layout is right.
+        if not column.nullable and table.column(field.name).null_count:
+            raise _RefusedTable(f"{field.name} is NOT NULL but has SQL NULL rows")
+        # From the plan, not the caller's type: form_of ignores field
+        # metadata, so a caller's PARQUET:field_id on a child would
+        # otherwise be written below the group (D14) and blamed on the
+        # writer by the layout check.
+        kind = _integer_view(plan.write_type)
+        fields.append(field.with_type(kind))
+        chunks = table.column(field.name).chunks
+        # A null in a REQUIRED field under a present parent (metadata, an
+        # object's field, a list's element) pyarrow writes as the masked
+        # children's values or empty bytes; structure_fault names its path.
+        for chunk in chunks:
+            fault = structure_fault(chunk)
+            if fault is not None:
+                raise _RefusedTable(f"{field.name}: {fault}")
+        # Arrow's view refuses a null anywhere in a non-nullable child's
+        # buffer, so what is left for it is a null under a SQL NULL row (as
+        # take on a null index and pa.nulls build) or outside a slice's rows:
+        # keep it when kind is the type unchanged.
+        try:
+            views = [chunk.view(kind) for chunk in chunks]
+        except pa.ArrowInvalid as error:
+            raise _RefusedTable(
+                f"{field.name} has a null in a non-nullable field under a SQL "
+                "NULL row or outside its rows, which the writer cannot view: "
+                "build the storage with the encoder"
+            ) from error
+        data.append(pa.chunked_array(views, kind))
+        expected = plan.expected_elements(column)
+        stamps += variant_stamps(column, plan, expected=expected)
+        planned.append((column, plan, expected))
+    if not planned:
+        raise _RefusedTable("no variant columns to write; use pq.write_table")
+    schema = pa.schema(fields, metadata=table.schema.metadata)
+    # A Python buffer, not a BufferOutputStream: its bytes can be cut at
+    # the footer and appended to where they lie, so the stamps cost the
+    # footer, not a copy of a file of hundreds of MiB.
+    sink = io.BytesIO()
+    # store_schema last, so no option can put the Arrow schema back.
+    options = {**(write_options or {}), "store_schema": False}
+    # A writer of our own, not write_table's metadata_collector: after a
+    # failed write, write_table's close would ask the failed writer for its
+    # metadata, and that RuntimeError would hide the write's own error.
+    writer = pq.ParquetWriter(sink, schema, **options)
+    try:
+        writer.write_table(pa.table(data, schema=schema), row_group_size=row_group_size)
+    finally:
+        writer.close()
+    # The writer's own FileMetaData, once it closed cleanly: the stats need
+    # no second parse of the footer.
+    metadata = writer.writer.metadata
+    try:
+        with sink.getbuffer() as written:
+            start, tail, elements = stamp_variant_footer(written, stamps)
+    except ValueError as error:
+        raise ValidationError(
+            f"cannot annotate VARIANT footer: {error}", status_code=None
+        ) from error
+    # The tail is a few bytes longer than the footer it replaces, and
+    # BytesIO keeps room to spare from the writes before, so it almost
+    # always lands after the body without moving it (at worst, one
+    # realloc: the copy the old join made every time).
+    sink.seek(start)
+    sink.truncate()
+    sink.write(tail)
+    starts = {element.get(_NAME): index for element, _, index in _top_level(elements)}
+    for column, plan, expected in planned:
+        fault = variant_layout_fault(
+            elements, starts[column.name], column, plan, expected=expected
+        )
+        if fault is not None:
+            raise ValidationError(
+                f"pyhoglake wrote VARIANT column {column.name} in a layout that is "
+                f"not its declaration's: {fault}",
+                status_code=None,
+            )
+    # getvalue, with no buffer exported, trims BytesIO's own bytes object to
+    # the file and hands it over: no copy, and no growth slack held until
+    # the upload.
+    body = pa.py_buffer(sink.getvalue())
+    # The tail ends with the file's trailer.
+    return VariantParquet(body, _footer_size(tail), metadata)
+
+
+def _footer_size(raw: bytes) -> int:
+    """Thrift footer-metadata length for the commit's ``footer_size``.
+
+    Wire convention (bugs.md #7): ``footer_size`` is EXACTLY the 4-byte
+    LE length stored in the parquet trailer — the serialized thrift
+    FileMetaData size, EXCLUDING the trailing 8-byte suffix (4-byte
+    length + ``PAR1`` magic). The server's hydrator tail-reads
+    ``[file_size - footer_size - 8, file_size)`` and compaction stores
+    the same value for its own outputs; shipping ``meta_len + 8`` here
+    (the old behavior) made every client-written file 8 bytes off.
+    """
+    (meta_len,) = struct.unpack("<I", raw[-8:-4])
+    return meta_len
+
+
+def _integer_view(kind: pa.DataType) -> pa.DataType:
+    """``kind`` with each decimal32/decimal64 leaf the int32/int64 its
+    storage already is."""
+    if pa.types.is_decimal32(kind):
+        return pa.int32()
+    if pa.types.is_decimal64(kind):
+        return pa.int64()
+    if pa.types.is_struct(kind):
+        return pa.struct([field.with_type(_integer_view(field.type)) for field in kind])
+    if pa.types.is_list(kind):
+        return pa.list_(
+            kind.value_field.with_type(_integer_view(kind.value_field.type))
+        )
+    return kind

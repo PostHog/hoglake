@@ -113,6 +113,9 @@ object HogSchemaColumns {
                     // CompactionService.commitGroup; read by
                     // ScanService.planScan (include=split_offsets) only.
                     "split_offsets",
+                    // V30: written by Hydrator.hydrate's flip only; read by
+                    // CatalogMetrics.SAMPLE_SQL's count. Not on any wire shape.
+                    "prefix_quarantined",
                 ),
             // FileRepo.columnStatsMapper / scanColumnStatsMapper (the
             // shared read shapes) and AlterService's promote re-encode on
@@ -145,6 +148,10 @@ object HogSchemaColumns {
                     "catalog_id", "table_id", "sort_id", "key_index", "source_field_id",
                     "direction", "null_order",
                 ),
+            // V29: LayoutRepo, CommitTail's `layouts` CTE (read) and
+            // AlterService.setObjectPrefixField (write).
+            "hog_table_layout" to
+                setOf("catalog_id", "table_id", "begin_snapshot", "end_snapshot", "object_prefix_field_id"),
             // DeleteFileReadRepo, CommitTail (DV targets, supersession, inserts).
             "hog_delete_file" to
                 setOf(

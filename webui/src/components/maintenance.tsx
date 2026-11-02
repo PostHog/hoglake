@@ -153,7 +153,9 @@ export function isQuietRun(run: MaintenanceRun): boolean {
       // Manual rows are rehydrate calls; loop rows are sweeps.
       if ("requeued" in r) return !positive(r.requeued);
       if ("claimed" in r) {
-        return ![r.claimed, r.hydrated, r.failed, r.transient, r.stats_skipped_below_floor].some(positive);
+        return ![r.claimed, r.hydrated, r.failed, r.transient, r.stats_skipped_below_floor, r.quarantined].some(
+          positive,
+        );
       }
       return false;
     }
@@ -226,6 +228,10 @@ export function isQuietRun(run: MaintenanceRun): boolean {
         // every bucket because sibling pods hold them is the fleet
         // dividing the catalog, not an idle loop.
         r.buckets_skipped_claimed,
+        // Unlike the budget refusals this is no configured bound being
+        // obeyed: it is a broken invariant on an object-prefix table, and a
+        // sweep whose only count it is must not be folded away as idle.
+        r.object_prefix_unresolvable,
         r.spill_cleanup_failures,
         // A retirement commits a snapshot and ends files without a single
         // groups_compacted or files_in: hiding it would hide the commit.
@@ -333,6 +339,11 @@ export function RunSummary({ run }: { run: MaintenanceRun }) {
                 , {formatCount(r.stats_skipped_below_floor)} below floor
               </span>
             )}
+            {positive(r.quarantined) && (
+              <span className="badge stats-failed" title={QUARANTINED_TITLE}>
+                {formatCount(r.quarantined ?? "0")} quarantined
+              </span>
+            )}
           </>
         );
       }
@@ -416,6 +427,11 @@ export function RunSummary({ run }: { run: MaintenanceRun }) {
           {positive(r.spill_cleanup_failures) && (
             <span className="badge stats-failed" title={SPILL_CLEANUP_TITLE}>
               {formatCount(r.spill_cleanup_failures ?? "0")} spill dir(s) left on disk
+            </span>
+          )}
+          {positive(r.object_prefix_unresolvable) && (
+            <span className="badge stats-failed" title={PREFIX_UNRESOLVABLE_TITLE}>
+              {formatCount(r.object_prefix_unresolvable ?? "0")} group(s) with no object prefix
             </span>
           )}
           {(positive(r.skipped_conflicts) ||
@@ -674,6 +690,20 @@ const APPENDED_TITLE =
   "sorted table only when an input's sort-key range does not overlap " +
   "any other input's, so its rows stay one sorted block. Several times " +
   "cheaper than rewriting the same bytes.";
+
+const QUARANTINED_TITLE =
+  "Files of a table with the object-prefix layout whose parquet footer does " +
+  "not prove that every row holds the value their prefix names. They are " +
+  "provided, with truthful stats, and flagged so that a per-value reader and " +
+  "compaction leave them out. Counted within hydrated.";
+
+const PREFIX_UNRESOLVABLE_TITLE =
+  "Groups of a table with the object-prefix layout that compaction refused " +
+  "before reading anything, because no prefix can be named for them: no " +
+  "partition spec, no identity field on the prefix column, a missing or " +
+  "non-canonical value, or a layout column that is not live. The commit " +
+  "path never registers such files, so this is a broken invariant; the " +
+  "groups are refused again on every sweep.";
 
 const CLAIMED_TITLE =
   "Work another compaction run (usually another maintenance pod) had " +

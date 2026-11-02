@@ -1,6 +1,7 @@
 package com.posthog.hoglake.api
 
 import com.fasterxml.jackson.databind.annotation.JsonDeserialize
+import com.posthog.hoglake.auth.actorOrRefuse
 import com.posthog.hoglake.service.ReplacementTarget
 import com.posthog.hoglake.service.TableCreation
 import com.posthog.hoglake.service.TableCreationDefinition
@@ -132,7 +133,7 @@ private suspend fun ApplicationCall.prepareCreation(
                 request.sortFields.map { it.toModel() },
                 request.comment,
                 request.properties,
-                request.author,
+                actorOrRefuse(request.author),
                 request.message,
             ),
         ).toDto(),

@@ -12,12 +12,15 @@ import com.posthog.hoglake.model.CompactionResult
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.MaintenanceTask
 import com.posthog.hoglake.model.MaintenanceTrigger
+import com.posthog.hoglake.model.ObjectPrefix
+import com.posthog.hoglake.model.ObjectPrefixLayout
 import com.posthog.hoglake.model.SortFieldDef
 import com.posthog.hoglake.model.allNodes
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.persistence.CatalogRepo
 import com.posthog.hoglake.persistence.CommitLockPath
+import com.posthog.hoglake.persistence.LayoutRepo
 import com.posthog.hoglake.persistence.Locks
 import com.posthog.hoglake.persistence.MaintenanceRunStore
 import com.posthog.hoglake.persistence.NamespaceRepo
@@ -25,6 +28,7 @@ import com.posthog.hoglake.persistence.PartialResult
 import com.posthog.hoglake.persistence.Pg
 import com.posthog.hoglake.persistence.SnapshotRepo
 import com.posthog.hoglake.persistence.SortRepo
+import com.posthog.hoglake.persistence.SpecRepo
 import com.posthog.hoglake.persistence.TableRepo
 import com.posthog.hoglake.persistence.TierTotalsRepo
 import com.posthog.hoglake.persistence.bindBigintArrayOrNull
@@ -532,7 +536,21 @@ data class CompactionConfig(
      * then on, not a per-file detail.
      */
     val codec: ParquetRewriter.OutputCodec = ParquetRewriter.OutputCodec(),
+    /**
+     * Whether tables with a VARIANT column compact
+     * (`HOGLAKE_COMPACTION_VARIANT`, default off), each variant copied as
+     * its declared layout (see the ParquetRewriter class doc); off, they
+     * are never planned. [variantCompactionCatalogs]
+     * (`HOGLAKE_COMPACTION_VARIANT_CATALOGS`) narrows it to those catalogs
+     * by name, empty meaning every catalog.
+     */
+    val variantCompaction: Boolean = false,
+    val variantCompactionCatalogs: Set<String> = emptySet(),
 ) {
+    /** Whether [catalog]'s variant tables compact: see [variantCompaction]. */
+    fun variantCompactionFor(catalog: String): Boolean =
+        variantCompaction && (variantCompactionCatalogs.isEmpty() || catalog in variantCompactionCatalogs)
+
     init {
         CompactionGrouping.of(targetBytes)
         // Validated HERE, at construction, which is boot — not in
@@ -745,13 +763,19 @@ data class CompactionConfig(
      * plus one for the `_hog_row_id` carrier every output writes), which
      * is exact for flat tables and a floor for nested ones — hence the
      * [nestedSortExpansion] division, which is the only thing standing in
-     * for list lengths the catalog cannot know.
+     * for list lengths the catalog cannot know. A VARIANT is one catalog
+     * node but a Parquet group of up to thousands ([VariantLayout.shape]),
+     * so it counts as its layout's nodes, and as nested when that layout
+     * holds a list.
      */
     fun spillChunkRows(columns: List<Column>): Long {
-        val nodes = columns.allNodes().size + 1L // + the _hog_row_id carrier
+        val variants = columns.allNodes().filter { it.def.type == ColType.VARIANT }
+        val layouts = variants.map { VariantLayout.shape(it) ?: (1 to false) }
+        // + the _hog_row_id carrier, and each variant's nodes beyond the one counted
+        val nodes = columns.allNodes().size + 1L + layouts.sumOf { (n, _) -> n - 1L }
         val perRow = SORTED_HEAP_BYTES_PER_NODE * nodes
         val ceiling = sortedHeapBytesPerGroup / perRow
-        val nested = columns.allNodes().any { it.def.type.isNested }
+        val nested = columns.allNodes().any { it.def.type.isNested } || layouts.any { (_, list) -> list }
         return maxOf(1L, if (nested) ceiling / nestedSortExpansion else ceiling)
     }
 
@@ -962,6 +986,13 @@ data class CompactionPlan(
      * configuration — a heap budget small against the byte target.
      */
     val mergeRefusedGroups: Long = 0,
+    /**
+     * Groups of a table with the object-prefix layout refused in
+     * METADATA because their prefix cannot be named (no spec, no single
+     * identity key on the field, a missing or non-canonical value).
+     * Uncharged, like [spillRefusedGroups]; see `CompactionResult`.
+     */
+    val objectPrefixUnresolvableGroups: Long = 0,
     /**
      * Groups this plan formed and then dropped because another
      * maintainer holds a LIVE claim over one or more of their input
@@ -1182,6 +1213,9 @@ class CompactionService(
      */
     private val lastBudgetRefusal = java.util.concurrent.ConcurrentHashMap<Pair<Long, Long>, String>()
 
+    /** [lastBudgetRefusal]'s twin for the object-prefix refusals in [pack], keyed the same way. */
+    private val lastPrefixRefusal = java.util.concurrent.ConcurrentHashMap<Pair<Long, Long>, String>()
+
     /** Everything execution needs beyond the group list. */
     private data class TableContext(
         val catalogId: Long,
@@ -1230,6 +1264,28 @@ class CompactionService(
          * empty, because the rewriter refuses a sort without them.
          */
         val sortSpill: SortSpill? = null,
+        /** Whether this catalog's variant tables compact (CompactionConfig.variantCompactionFor). */
+        val variantCompaction: Boolean = false,
+        /**
+         * The table's object-prefix field id at the planning head
+         * (`hog_table_layout`), null = the option is off. THIS, not
+         * [objectPrefix], is what says the option is on: a layout whose
+         * column is not live resolves no [objectPrefix], and every group
+         * of the table is then refused as unresolvable rather than
+         * compacted as if the option were off.
+         */
+        val objectPrefixFieldId: Long? = null,
+        /** The layout at the planning head, with the column's live name and type; see [objectPrefixFieldId]. */
+        val objectPrefix: ObjectPrefixLayout? = null,
+        /**
+         * spec_id -> the key_index of the one identity field on
+         * [objectPrefixFieldId] in that spec ([ObjectPrefix.keyIndex]),
+         * null when it has none, for every spec of the table, retired
+         * ones included (`SpecRepo.fields`): a file names its spec by id,
+         * and the specs are kept for as long as such a file lives. Empty
+         * when the option is off.
+         */
+        val prefixKeyIndex: Map<Long, Int?> = emptyMap(),
     )
 
     private data class PlanWithContext(
@@ -1423,9 +1479,10 @@ class CompactionService(
      * per-catalog commit lock, that the staging ticket is untouched,
      * that the TABLE is not dropped (`hog_table.dropped_snapshot`),
      * that the live SORT SPEC is the one planned against
-     * (`hog_sort_spec.sort_id`), that every input is still live (`end_snapshot IS NULL`) and that
-     * every input still carries EXACTLY its planned deletion vector by
-     * `delete_file_id`. A stale plan therefore costs one group —
+     * (`hog_sort_spec.sort_id`), that every input is still live (`end_snapshot IS NULL`),
+     * that every input still carries EXACTLY its planned deletion vector by
+     * `delete_file_id`, and that the output is under the prefix the live
+     * object-prefix layout names (`hog_table_layout`). A stale plan therefore costs one group —
      * `skipped_conflicts` or `dv_superseded` — and never a wrong commit.
      * That was already true of a plan the old shape held across minutes
      * of rewriting other groups; widening the window by the packing time
@@ -1481,6 +1538,7 @@ class CompactionService(
                 groups = free.groups,
                 spillRefusedGroups = packed.spillRefused,
                 mergeRefusedGroups = packed.mergeRefused,
+                objectPrefixUnresolvableGroups = packed.prefixUnresolvable,
                 claimedGroups = free.claimed,
                 candidatesFetched = fetched.candidatesFetched,
                 bucketsConsidered = fetched.bucketsConsidered,
@@ -1521,6 +1579,24 @@ class CompactionService(
         val columns = TableRepo.columnsAt(h, cat.catalogId, t.tableId, cat.headSnapshotId)
         val sortSpec = SortRepo.sortSpecAt(h, cat.catalogId, t.tableId, cat.headSnapshotId)
         val sortFields = sortSpec?.fields ?: emptyList()
+        // The OBJECT-PREFIX LAYOUT, on this same snapshot: the field, its
+        // top-level column, and its identity key_index in every spec of
+        // the table (one PK-range read of the spec ids, then
+        // `SpecRepo.fields` per spec; a table has as many specs as it has
+        // had spec changes). Option-off tables read only the layout probe.
+        val prefixFieldId = LayoutRepo.layoutAt(h, cat.catalogId, t.tableId, cat.headSnapshotId)
+        val prefixColumn = prefixFieldId?.let { id -> columns.firstOrNull { it.fieldId == id } }
+        val prefixKeyIndex =
+            prefixFieldId?.let { id ->
+                h.createQuery("SELECT spec_id FROM hog_partition_spec WHERE catalog_id = :c AND table_id = :t")
+                    .bind("c", cat.catalogId)
+                    .bind("t", t.tableId)
+                    .mapTo(Long::class.java)
+                    .list()
+                    .associateWith { specId ->
+                        ObjectPrefix.keyIndex(SpecRepo.fields(h, cat.catalogId, t.tableId, specId), id)
+                    }
+            }
         return TableContext(
             catalogId = cat.catalogId,
             catalog = cat.name,
@@ -1537,7 +1613,32 @@ class CompactionService(
             inputOpenParallelism = cfg.inputOpenParallelism,
             commitLockTimeoutMs = cfg.commitLockTimeoutMs,
             sortSpill = if (sortFields.isEmpty()) null else cfg.sortSpill(columns),
+            variantCompaction = cfg.variantCompactionFor(catalog),
+            objectPrefixFieldId = prefixFieldId,
+            objectPrefix =
+                prefixColumn
+                    ?.takeIf { it.def.type in ObjectPrefix.ALLOWED_TYPES }
+                    ?.let { ObjectPrefixLayout(it.fieldId, it.def.name, it.def.type) },
+            prefixKeyIndex = prefixKeyIndex.orEmpty(),
         )
+    }
+
+    /**
+     * The canonical value of [ctx]'s object-prefix field that names
+     * [group]'s prefix, or null when the option is on and the group has
+     * none: no spec, no single identity key on the field in its spec, or
+     * a missing or non-canonical value at that key. Groups never span a
+     * bucket, so the value is one for the whole group. Always null with
+     * the option off.
+     */
+    private fun prefixValue(
+        ctx: TableContext,
+        group: CompactionGroup,
+    ): String? {
+        val layout = ctx.objectPrefix ?: return null
+        val keyIndex = group.specId?.let { ctx.prefixKeyIndex[it] } ?: return null
+        val raw = group.partitionValues?.getOrNull(keyIndex) ?: return null
+        return raw.takeIf { ObjectPrefix.parseValue(it, layout.colType) != null }
     }
 
     /**
@@ -1716,16 +1817,24 @@ class CompactionService(
             available: Long = 0,
             truncated: Boolean = false,
         ) = CandidateFetch(ctx, budget, emptyMap(), 0, 0, available, truncated)
-        // The scalar rewriter cannot preserve VARIANT groups yet. Do not enqueue
-        // work that could drop payloads or repeatedly fail the maintenance loop.
-        // allNodes, not the top level: a variant nested inside a struct
-        // is still a variant the rewriter cannot write, and `struct{v:
+        // A VARIANT table compacts only with HOGLAKE_COMPACTION_VARIANT on
+        // for its catalog, which copies each variant as its declared layout
+        // (ParquetRewriter's class doc). Off, do not enqueue work the
+        // rewriter refuses on every sweep. allNodes, not the top level: a
+        // variant nested inside a struct is still a variant, and `struct{v:
         // variant}` has no top-level one. #77's check predates
-        // containers, where the two were the same question.
+        // containers, where the two were the same question. On, a
+        // declaration no layout can be derived from (one predating a
+        // grammar rule) is still never planned.
         //
         // Checked BEFORE the fetch, not after: a variant table's
         // candidate rows were read and thrown away on every sweep.
-        if (ctx.columns.allNodes().any { it.def.type == ColType.VARIANT }) return empty()
+        val variants = ctx.columns.allNodes().filter { it.def.type == ColType.VARIANT }
+        if (variants.isNotEmpty() &&
+            (!ctx.variantCompaction || variants.any { VariantLayout.shape(it) == null })
+        ) {
+            return empty()
+        }
 
         // Does a published generation exist AT ALL? That is a different
         // question from "does it credit this table with a compactable
@@ -2525,7 +2634,7 @@ class CompactionService(
      *    estimate, which comes from the same Param-array default; a hash
      *    join's alternative is a read of every live DV of the CATALOG,
      *    which on production is not cheaper than 8,192 probes of
-     *    `hog_delete_file_data_lookup`; and gigahog's buckets are a
+     *    `hog_delete_file_snapshot_lookup`; and gigahog's buckets are a
      *    median of 66 files, where the nested loop is ~130-225 buffers.
      *  - (d) MEMORY. `ARRAY(subquery)` accumulates in the per-query
      *    memory context — ~32 bytes per id, doubling growth plus a copy,
@@ -2569,12 +2678,30 @@ class CompactionService(
      * a big team) and `CompactionCandidateFetchPlanIntegrationTest`
      * (production's skewed bucket sizes), PG 18, warm, serial; the
      * assertions are in those tests.
+     *
+     * # VERIFIED ONLY, for a table with the object-prefix layout
+     *
+     * [verifiedOnly] adds [VERIFIED_ONLY_SQL] — the per-value mount
+     * predicate (`ObjectPrefix`) — to the inner scan, inside the scan
+     * cap, and nothing else: an input whose stats are still pending, or
+     * that the hydrator quarantined, never reaches an output the mount
+     * would then serve. It is a filter on the same scan, so the plan is
+     * the option-off plan with one more Filter
+     * (`CompactionCandidateFetchPlanIntegrationTest` asserts both). On
+     * an arm'd probe the rows it removes are the bucket's unverified
+     * files, bounded by the bucket like the rest; on the no-sample
+     * fallback's ordered size scan they are the table's unverified small
+     * files below the cap's last row — the hydrator's backlog on that
+     * table, read only before the catalog's first generation publishes.
+     * Off, the text is byte-identical to the statement before the layout
+     * existed (`CandidateSqlGoldenTest`).
      */
     internal fun candidateSql(
         arms: List<Int>,
         nullArms: Set<Int>,
         scopeToSpec: Boolean,
         withPartitionValues: Boolean,
+        verifiedOnly: Boolean = false,
     ): String {
         fun valuePredicate(keyIndex: Int) =
             if (keyIndex in nullArms) "pv$keyIndex.value IS NULL" else "pv$keyIndex.value = :v$keyIndex"
@@ -2649,7 +2776,7 @@ class CompactionService(
                       FROM hog_data_file f0
                      WHERE f0.catalog_id = :catalogId AND f0.table_id = :tableId
                        AND f0.end_snapshot IS NULL
-                       AND f0.file_size_bytes < :targetBytes$armSql$specInner$innerOrder
+                       AND f0.file_size_bytes < :targetBytes${if (verifiedOnly) VERIFIED_ONLY_SQL else ""}$armSql$specInner$innerOrder
                      LIMIT :scanLimit
                    ) f
               LEFT JOIN hog_delete_file dv
@@ -2714,6 +2841,7 @@ class CompactionService(
                     nullArms = nullArms,
                     scopeToSpec = true,
                     withPartitionValues = false,
+                    verifiedOnly = ctx.objectPrefixFieldId != null,
                 ),
             )
                 .bind("catalogId", ctx.catalogId)
@@ -2758,6 +2886,7 @@ class CompactionService(
                     nullArms = emptySet(),
                     scopeToSpec = false,
                     withPartitionValues = true,
+                    verifiedOnly = ctx.objectPrefixFieldId != null,
                 ),
             )
                 .bind("catalogId", ctx.catalogId)
@@ -2830,6 +2959,7 @@ class CompactionService(
         val groups: List<CompactionGroup>,
         val spillRefused: Long,
         val mergeRefused: Long,
+        val prefixUnresolvable: Long = 0,
     )
 
     /** A candidate as sorted-rewrite admission sees it: catalog facts only. */
@@ -2936,6 +3066,19 @@ class CompactionService(
                 ) { it.fileSizeBytes }
             for (take in packed) out += CompactionGroup(rowIdOrder(take), bucket.specId, bucket.values)
         }
+        // OBJECT-PREFIX LAYOUT: a group whose prefix cannot be named — no
+        // spec, no single identity key on the field, a missing or
+        // non-canonical value, or a layout whose column is not live or not
+        // of an allowed type, which refuses every group ([prefixValue]) —
+        // has no path its output may be written to. Refused HERE, in
+        // metadata and uncharged like the budget refusals below, because it
+        // re-refuses every sweep: the commit and DDL guards make it
+        // unreachable through the API, so a nonzero count is a broken
+        // invariant or a foreign row, and charging it would let one such
+        // bucket starve the sweep.
+        val (resolvable, unresolvable) =
+            if (ctx.objectPrefixFieldId == null) out to emptyList() else out.partition { prefixValue(ctx, it) != null }
+        logPrefixRefusals(ctx, unresolvable)
         // A SORTED group the rewrite's own budgets would refuse is refused
         // HERE, in metadata, uncharged — see [budgetRefusal]. Only
         // configuration produces either (a spill budget small against the
@@ -2950,9 +3093,9 @@ class CompactionService(
         val mergeRefused = mutableListOf<CompactionGroup>()
         val fits =
             if (spill == null || leaves == null) {
-                out
+                resolvable
             } else {
-                out.filter { group ->
+                resolvable.filter { group ->
                     when (budgetRefusal(ctx, spill, leaves, group)) {
                         BudgetRefusal.SPILL -> false.also { spillRefused += group }
                         BudgetRefusal.MERGE -> false.also { mergeRefused += group }
@@ -2969,6 +3112,7 @@ class CompactionService(
             fits.sortedWith(compareBy({ -it.files.size }, { it.files.first().rowIdStart })),
             spillRefused.size.toLong(),
             mergeRefused.size.toLong(),
+            unresolvable.size.toLong(),
         )
     }
 
@@ -3023,6 +3167,31 @@ class CompactionService(
                     "HOGLAKE_COMPACTION_SORTED_HEAP_BYTES (with the pod's memory), lower " +
                     "HOGLAKE_COMPACTION_PARALLEL_GROUPS, or lower HOGLAKE_COMPACTION_TARGET_BYTES"
             }
+        }
+    }
+
+    /**
+     * WARN about a table's unresolvable object-prefix groups when the
+     * picture CHANGES, for [logBudgetRefusals]' reason: the same groups
+     * re-refuse every sweep, and the counter is the per-sweep signal.
+     */
+    private fun logPrefixRefusals(
+        ctx: TableContext,
+        unresolvable: List<CompactionGroup>,
+    ) {
+        val key = ctx.catalogId to ctx.tableId
+        if (unresolvable.isEmpty()) {
+            lastPrefixRefusal.remove(key)
+            return
+        }
+        val sample = unresolvable.take(5).joinToString { "${it.specId}, ${it.partitionValues}" }
+        val signature = "${unresolvable.size} ${ctx.objectPrefix} $sample"
+        if (lastPrefixRefusal.put(key, signature) == signature) return
+        log.warn {
+            "compaction refused ${unresolvable.size} group(s) of ${ctx.namespace}.${ctx.table} whose object " +
+                "prefix cannot be resolved (field_id=${ctx.objectPrefixFieldId} layout=${ctx.objectPrefix}; " +
+                "a null layout is a column that is not live or not of an allowed type, which refuses every " +
+                "group). First (spec_id, partition values): $sample"
         }
     }
 
@@ -3146,7 +3315,8 @@ class CompactionService(
                     "candidates_fetched=${r.candidatesFetched} " +
                     "buckets_considered=${r.bucketsConsidered}/${r.bucketsAvailable} " +
                     "buckets_skipped_claimed=${r.bucketsSkippedClaimed} " +
-                    "candidates_truncated=${r.candidatesTruncated} plan_ms=${r.planMs}"
+                    "candidates_truncated=${r.candidatesTruncated} plan_ms=${r.planMs} " +
+                    "object_prefix_unresolvable=${r.objectPrefixUnresolvable}"
             },
         ) {
             if (cfg.maxGroupsPerRun <= 0) {
@@ -3178,6 +3348,7 @@ class CompactionService(
             // Its own reason label, because it is the one "skip" that is
             // GOOD news: it is duplicated work that did not happen.
             Metrics.compactionSkipped(catalog, "claimed_elsewhere", result.claimedElsewhere)
+            Metrics.compactionSkipped(catalog, "object_prefix_unresolvable", result.objectPrefixUnresolvable)
             // Buckets, not groups, so not a `skipped` reason: a bucket
             // can hold any number of groups, and summing the two in one
             // series would make neither readable.
@@ -3220,6 +3391,8 @@ class CompactionService(
         val mergeBudgetExceeded: Long = 0,
         val failedGroups: Long = 0,
         val claimedElsewhere: Long = 0,
+        /** Refused in metadata by the planner, so not in [attempts]; see [CompactionPlan.objectPrefixUnresolvableGroups]. */
+        val objectPrefixUnresolvable: Long = 0,
         /**
          * What sorted rewrites DID, summed over every rewrite that
          * returned — committed or not, since the work was spent either
@@ -3328,6 +3501,7 @@ class CompactionService(
                 mergeBudgetExceeded + other.mergeBudgetExceeded,
                 failedGroups + other.failedGroups,
                 claimedElsewhere + other.claimedElsewhere,
+                objectPrefixUnresolvable + other.objectPrefixUnresolvable,
                 runsTrusted + other.runsTrusted,
                 runsSpilled + other.runsSpilled,
                 runsDemoted + other.runsDemoted,
@@ -3747,6 +3921,7 @@ class CompactionService(
                     GroupTally(
                         spillBudgetExceeded = plan.spillRefusedGroups,
                         mergeBudgetExceeded = plan.mergeRefusedGroups,
+                        objectPrefixUnresolvable = plan.objectPrefixUnresolvableGroups,
                         claimedElsewhere = plan.claimedGroups,
                         // The plan measures, summed over every table the
                         // sweep plans — so the ledger row says how much
@@ -3857,6 +4032,7 @@ class CompactionService(
             candidatesTruncated = candidatesTruncated,
             planMs = planMs,
             bucketsSkippedClaimed = bucketsSkippedClaimed,
+            objectPrefixUnresolvable = objectPrefixUnresolvable,
         )
 
     /**
@@ -4194,6 +4370,7 @@ class CompactionService(
         } catch (e: UnconvertibleSchemaException) {
             // Skip-with-reason, not a failure: the group stays
             // uncompacted until the schema or the file set moves.
+            if (e is VariantLayoutMismatchException) Metrics.compactionVariantLayoutMismatch(catalog, e.reason)
             log.warn {
                 "compaction group of ${group.files.size} files for " +
                     "$catalog/${ctx.namespace}.${ctx.table} is not convertible to the live " +
@@ -4487,6 +4664,15 @@ class CompactionService(
         group: CompactionGroup,
         onRewritten: (ParquetRewriter.RewriteResult) -> Unit = {},
     ): GroupOutcome {
+        // The OBJECT-PREFIX value, before any IO. The planner refuses a
+        // group without one ([pack]); this surface is also reached from
+        // [compactPlannedGroup], which is handed a group, so it fails
+        // closed rather than writing outside every prefix.
+        val prefixValue = prefixValue(ctx, group)
+        check(ctx.objectPrefixFieldId == null || prefixValue != null) {
+            "group of ${ctx.namespace}.${ctx.table} (spec_id ${group.specId}, values ${group.partitionValues}) " +
+                "has no resolvable object-prefix value; refusing to write its output"
+        }
         val inputs =
             group.files.map { f ->
                 // Read the object IN PLACE. This used to fetch the
@@ -4558,9 +4744,11 @@ class CompactionService(
         // how a file's row ids are read, and no reader may infer that
         // from a path — while giving every compaction output in a
         // table the same 10-character lead-in.
+        // With the object-prefix layout, under the group's value's prefix,
+        // which is what the commit's recheck and every later DV on the
+        // output are held to; without it, exactly the old path.
         val outputPath =
-            "${ctx.dataPath.trimEnd('/')}/data/${ctx.namespace}/${ctx.table}/" +
-                "${UUID.randomUUID()}.parquet"
+            ObjectPrefix.dataFilePath(ctx.dataPath, ctx.namespace, ctx.table, ctx.objectPrefix, prefixValue)
 
         // Claim ticket BEFORE the rewrite (its own committed
         // transaction): if this group never commits — skip, crash,
@@ -4615,6 +4803,7 @@ class CompactionService(
                 ctx.inputOpenParallelism,
                 ctx.sortSpill,
                 appendFloorBytes,
+                ctx.variantCompaction,
             )
         onRewritten(rewritten)
         check(rewritten.rowsWritten == group.survivingRecords) {
@@ -4688,6 +4877,48 @@ class CompactionService(
                         )
                     }
             }
+        // THE OUTPUT'S PREFIX PROOF, the commit's rule for inline stats
+        // made on the footer the writer just built: an output that does
+        // not prove every row holds the value is never registered, and
+        // a missing footer is no exception — a `pending` output would be
+        // left to the hydrator, which would quarantine it after the
+        // inputs were already retired. Not needed for a group with no
+        // survivors, which registers nothing.
+        val layout = ctx.objectPrefix
+        if (layout != null && rewritten.rowsWritten > 0) {
+            val aggregate =
+                checkNotNull(stats) {
+                    "the rewrite of ${group.files.size} files of ${ctx.namespace}.${ctx.table} returned no " +
+                        "footer; an object-prefix output is never registered unproven"
+                }
+            val verdict =
+                ObjectPrefix.checkFieldStats(
+                    layout,
+                    ObjectPrefix.parseValue(prefixValue, layout.colType)!!,
+                    aggregate.firstOrNull { it.fieldId == layout.fieldId },
+                )
+            if (verdict != ObjectPrefix.Verdict.OK) {
+                // EVERY input's id, for the lossy-rewrite check's reason above:
+                // this refusal is durable, so the group re-plans and
+                // re-refuses every sweep, and the operator needs the files
+                // to hunt the writer. Which input lies is not known here —
+                // the rewrite keeps no input's footer — so none is singled out.
+                // Paths only for the first 20: at a 2,048-file fan-in they
+                // would make a ~300 KB line, past what a log pipeline keeps.
+                throw InvalidDataException(
+                    "output of ${group.files.size} inputs does not prove ${layout.fieldName} = $prefixValue " +
+                        "for $outputPath ($verdict): an input holds rows of another value or nulls although " +
+                        "its registration proved the value. Inputs (data_file_id path), first " +
+                        "${minOf(group.files.size, MAX_NAMED_INPUT_PATHS)}: " +
+                        group.files.take(MAX_NAMED_INPUT_PATHS).joinToString { "${it.dataFileId} ${it.path}" } +
+                        if (group.files.size > MAX_NAMED_INPUT_PATHS) {
+                            "; all data_file_ids: " + group.files.joinToString { "${it.dataFileId}" }
+                        } else {
+                            ""
+                        },
+                )
+            }
+        }
         val outcome =
             commitGroup(
                 ctx, group, outputPath, outputBytes, footerSize, stats,
@@ -5036,6 +5267,60 @@ class CompactionService(
                 return@inTransactionUnchecked retireDeadGroup(h, ctx, group, ids)
             }
 
+            // THE OBJECT-PREFIX LAYOUT IS STILL THE ONE THE OUTPUT WAS
+            // WRITTEN UNDER. Re-read under the lock (one probe of
+            // `hog_table_layout_live`, which an option-off table answers
+            // with no row): the field, its live name and type, and the
+            // table's live names, and the output must be under the prefix
+            // they name for the group's value. The DDL keeps all of them
+            // fixed while the option is on and refuses setting it on a
+            // table with live files, so a mismatch is a route that changes
+            // them (a relayout, setting the option on a non-empty table)
+            // or a broken invariant — and registering the output then would
+            // put a file outside its prefix that no later check revisits.
+            // A lost race like any other: skipped, the staged output left
+            // for the cleanup drain.
+            val liveLayout =
+                h.createQuery(LAYOUT_RECHECK_SQL)
+                    .bind("catalogId", ctx.catalogId)
+                    .bind("tableId", ctx.tableId)
+                    .map { rs, _ ->
+                        rs.getLong("field_id") to
+                            runCatching {
+                                val layout =
+                                    ObjectPrefixLayout(
+                                        rs.getLong("field_id"),
+                                        rs.getString("field_name")!!,
+                                        ColType.fromWire(rs.getString("col_type")!!),
+                                    )
+                                ObjectPrefix.prefix(
+                                    ctx.dataPath,
+                                    rs.getString("namespace_name"),
+                                    rs.getString("table_name"),
+                                    layout,
+                                    prefixValue(ctx, group)!!,
+                                )
+                            }.getOrNull()
+                    }
+                    .findOne()
+                    .orElse(null)
+            val layoutHolds =
+                if (liveLayout == null) {
+                    ctx.objectPrefixFieldId == null
+                } else {
+                    liveLayout.first == ctx.objectPrefixFieldId &&
+                        liveLayout.second?.let { ObjectPrefix.isUnder(outputPath, it) } == true
+                }
+            if (!layoutHolds) {
+                log.warn {
+                    "compaction group for ${ctx.namespace}.${ctx.table} was written to $outputPath under " +
+                        "object-prefix field ${ctx.objectPrefixFieldId ?: "none"}, but the live layout is " +
+                        "${liveLayout?.first ?: "none"} with prefix ${liveLayout?.second ?: "none"}; skipping " +
+                        "the commit. The staged output stays queued for the cleanup drain"
+                }
+                return@inTransactionUnchecked GroupOutcome.SkippedConflict
+            }
+
             // Allocate snapshot + file id under the lock (CommitService
             // step 5); compaction is not DDL: schema_version untouched.
             val (snapshotId, dataFileId, schemaVersion) =
@@ -5323,7 +5608,15 @@ class CompactionService(
      * (Expiry pattern).
      */
     fun runOnceAllCatalogs(cfg: CompactionConfig = defaults): List<Pair<String, CompactionResult>> {
-        val names = jdbi.withHandleUnchecked { h -> CatalogRepo.listAll(h) }.map { it.name }
+        // Shuffled per sweep (#455). In list order every replica started
+        // every cycle on the same catalog, so the others always waited
+        // behind its run (prod-us: millpond ~32 min a run, millrace
+        // ~3.6 min) and all replicas moved in lockstep. The shuffle
+        // spreads which catalog waits and desynchronises replicas; it
+        // does NOT change a catalog's share of a pod's cycle, which is
+        // the sum of one capped run per catalog whatever the order.
+        // Every catalog still runs exactly once per sweep.
+        val names = jdbi.withHandleUnchecked { h -> CatalogRepo.listAll(h) }.map { it.name }.shuffled()
         val results = mutableListOf<Pair<String, CompactionResult>>()
         for (name in names) {
             try {
@@ -5383,6 +5676,9 @@ class CompactionService(
     }
 
     internal companion object {
+        /** Inputs named with their path in an output-proof refusal; the rest by id only. */
+        const val MAX_NAMED_INPUT_PATHS = 20
+
         /**
          * The claim transaction's `statement_timeout`, fixed and EQUAL to
          * the plan lock's 15 s wait (`Locks.acquireCatalogCompactionPlanLock`):
@@ -5410,6 +5706,56 @@ class CompactionService(
          * toward its 200,000 ceiling.
          */
         const val MAX_NEW_BUCKETS = 50_000
+
+        /**
+         * [candidateSql]'s `verifiedOnly` fragment: the per-value mount
+         * predicate (`ObjectPrefix`), appended to the inner scan's WHERE
+         * for a table with the object-prefix layout and for no other.
+         */
+        internal const val VERIFIED_ONLY_SQL: String =
+            "\n                       AND f0.stats_state = 'provided' AND NOT f0.prefix_quarantined"
+
+        /**
+         * `commitGroup`'s object-prefix recheck under the commit lock: the
+         * table's live layout row (`hog_table_layout_live`, unique and
+         * partial, so an option-off table costs one empty probe) with its
+         * column's live name and type and the table's live names, each a
+         * live-index or primary-key probe. A layout whose column is not
+         * live comes back with a null name, which fails the recheck.
+         *
+         * THE COLUMN IS READ NEWEST FIRST, `LIMIT 1`. `hog_column`'s only
+         * key that names the field is the primary key `(catalog_id,
+         * table_id, field_id, begin_snapshot)`, and every rename, promote
+         * and `set_column_comment` adds a version under it (the DDL
+         * refuses only the rename while the option is on), so filtering
+         * the field's rows for the live one walked its history — 500
+         * versions, 15 buffers, in `CompactionLayoutRecheckPlanIntegrationTest`.
+         * The live version is the newest by construction (a version
+         * begins where its predecessor ends), so a backward scan stops at
+         * it. The namespace is a correlated primary-key lookup for the
+         * same reason in another table: joined, the planner hashed every
+         * namespace of a 1,001-namespace catalog (9 buffers). Measured
+         * there, warm: 2 buffers for an option-off table, 12 for an
+         * option-on one with 1,000 table versions and 500 field versions.
+         */
+        internal const val LAYOUT_RECHECK_SQL: String =
+            """
+            SELECT l.object_prefix_field_id AS field_id, c.name AS field_name, c.col_type,
+                   tv.name AS table_name,
+                   (SELECT ns.name FROM hog_namespace ns
+                     WHERE ns.catalog_id = tv.catalog_id AND ns.namespace_id = tv.namespace_id) AS namespace_name
+              FROM hog_table_layout l
+              JOIN hog_table_version tv
+                ON tv.catalog_id = l.catalog_id AND tv.table_id = l.table_id AND tv.end_snapshot IS NULL
+              LEFT JOIN LATERAL (
+                    SELECT c.name, c.col_type FROM hog_column c
+                     WHERE c.catalog_id = l.catalog_id AND c.table_id = l.table_id
+                       AND c.field_id = l.object_prefix_field_id AND c.end_snapshot IS NULL
+                     ORDER BY c.begin_snapshot DESC
+                     LIMIT 1
+                   ) c ON true
+             WHERE l.catalog_id = :catalogId AND l.table_id = :tableId AND l.end_snapshot IS NULL
+            """
 
         /**
          * [newBuckets]' statement — `internal` so

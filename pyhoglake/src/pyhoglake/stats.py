@@ -6,7 +6,7 @@ row groups; min/max only when every row group carries min/max statistics
 for the column; bounds encoded to Iceberg single-value binary by the
 catalog column type.
 
-The footer is not always one this process wrote. ``_write_one_file``
+The footer is not always one this process wrote. ``pyhoglake.writer``
 hands over a footer built from ``columns_to_arrow_schema``, but
 ``prepare_append_files`` (#73) hands over a footer the CALLER wrote, so
 nothing here may assume that footer order, synthetic group names, or
@@ -308,8 +308,9 @@ def _walk_leaves(
 
     That distinction matters because the premise this module was written
     under is gone. It used to be reached from one call site,
-    :func:`pyhoglake.client._write_one_file`, on the footer of a parquet
-    this process had just written from
+    ``pyhoglake.client._write_one_file`` (now
+    :meth:`pyhoglake.writer.PreparedPart.registration`), on the footer of
+    a parquet this process had just written from
     ``columns_to_arrow_schema(info.columns)`` -- so footer order was
     catalog order by construction. #73 added
     :meth:`pyhoglake.client.Table.prepare_append_files`, which reads a

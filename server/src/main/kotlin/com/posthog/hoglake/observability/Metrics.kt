@@ -389,7 +389,11 @@ object Metrics {
         table,
     )
 
-    /** hoglake_stats_hydrated_total{result=provided|failed} */
+    /**
+     * hoglake_stats_hydrated_total{result=provided|quarantined|failed}:
+     * `quarantined` is a flip to provided whose footer failed the
+     * object-prefix check (Hydrator class KDoc).
+     */
     fun statsHydrated(result: String) = increment("hoglake_stats_hydrated_total", 1.0, "result", result)
 
     /**
@@ -552,6 +556,11 @@ object Metrics {
      * The self-healing skips — commit conflicts, DV supersession — stay
      * uncounted: they re-plan on the next run, so a line for them is
      * noise rather than signal.
+     *
+     * `object_prefix_unresolvable` counts groups of a table with the
+     * object-prefix layout refused in metadata because their prefix
+     * cannot be named (CompactionResult.objectPrefixUnresolvable): a
+     * broken invariant that re-refuses every sweep, so it needs a line.
      */
     fun compactionSkipped(
         catalog: String,
@@ -568,6 +577,31 @@ object Metrics {
                 reason,
             )
         }
+    }
+
+    /**
+     * hoglake_compaction_variant_layout_mismatch_total{catalog, reason} —
+     * groups refused because a VARIANT column's storage in an input is
+     * not the layout compaction copies it as (`reason="layout"`), or the
+     * input was written by DuckDB (`reason="duckdb"`, whatever its
+     * layout); see VariantLayoutMismatchException.
+     *
+     * Its own series rather than a reason of
+     * `hoglake_compaction_skipped_total`, because those groups are already
+     * in that one's `unconvertible_schema`, and a second reason for them
+     * would count each twice in its sum. The compaction warning logged
+     * with each one names the table, column and input file. A `layout`
+     * refusal of a file pyhoglake's Table.append or prepare_append_tables
+     * or the Trino connector wrote means the server's layout port has
+     * drifted from theirs: turn HOGLAKE_COMPACTION_VARIANT off. One of a
+     * file registered from another writer (prepare_append_files) is just
+     * another layout.
+     */
+    fun compactionVariantLayoutMismatch(
+        catalog: String,
+        reason: String,
+    ) {
+        increment("hoglake_compaction_variant_layout_mismatch_total", 1.0, "catalog", catalog, "reason", reason)
     }
 
     /**
@@ -746,6 +780,56 @@ object Metrics {
     fun multipartAbortFailed() = increment("hoglake_multipart_abort_failures_total", 1.0)
 
     /**
+     * hoglake_auth_requests_total{mode,outcome,client} — every request the auth
+     * plugin looked at.
+     *
+     * The `warn` mode's whole purpose is this series: an operator flip to
+     * `enforce` is gated on `outcome="missing"` reaching zero, per client,
+     * so the burn-in period answers "who is still anonymous" from one
+     * scrape instead of from a log search. `mode` is a tag rather than
+     * being implied by the deployment name because a rolling upgrade runs
+     * both for a while, and a dashboards that could not separate them would
+     * show a healthy fleet mid-flip.
+     *
+     * Outcomes: `ok` (authorized), `missing` (no token presented),
+     * `invalid` (a token that did not verify), `forbidden` (verified, but
+     * short of a scope or not entitled), `unmapped` (no rule for the path).
+     *
+     * `client` is a closed class read from `User-Agent` (see
+     * `auth.clientClass`): the enforce flip is gated on zero refusals per
+     * class, and an unauthenticated request has no other identity to count by.
+     */
+    fun authRequest(
+        mode: String,
+        outcome: String,
+        client: String,
+    ) = increment("hoglake_auth_requests_total", 1.0, "mode", mode, "outcome", outcome, "client", client)
+
+    /**
+     * hoglake_auth_denials_total{catalog,scope,reason} — refusals that
+     * reached a decision, tagged so "the client is misconfigured" can be
+     * told from "someone is probing": a burst of `forbidden` on one
+     * catalog for one scope is a broken client; the same shape spread over
+     * many catalogs a client does not own is the other thing.
+     */
+    fun authDenial(
+        catalog: String,
+        scope: String,
+        reason: String,
+    ) = increment("hoglake_auth_denials_total", 1.0, "catalog", catalog, "scope", scope, "reason", reason)
+
+    /**
+     * hoglake_auth_signing_keys — keys the token verifier holds right now.
+     * Boot refuses an empty source, so this is for what boot cannot see: a
+     * rotation that never lands. Zero under `warn`/`enforce` means every token
+     * is refused; alert on it.
+     */
+    fun authSigningKeys(count: () -> Int) {
+        val r = registry ?: return
+        Gauge.builder("hoglake_auth_signing_keys") { count().toDouble() }.register(r)
+    }
+
+    /**
      * hoglake_reindex_gauge_refresh_failures_total — metrics ticks whose
      * `hoglake_index_bloat_bytes` refresh threw. Its own counter, not the
      * metrics loop's: the refresh rides that loop's tick on the reindex pod
@@ -891,6 +975,9 @@ object Metrics {
             is HoglakeException.TableRecreated -> "table_recreated"
             is HoglakeException.CommitConflict -> "conflict"
             is HoglakeException.Validation -> "validation"
+            // Distinct, so "which writers still miss the object-prefix
+            // layout" is a series rather than a slice of `validation`.
+            is HoglakeException.ObjectPrefixViolation -> "object_prefix_violation"
             is HoglakeException.CommitQueueTimeout -> "timeout"
             else -> null
         }

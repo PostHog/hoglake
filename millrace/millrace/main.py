@@ -162,7 +162,6 @@ class _PipelineCollector:
                 "Flush decisions that failed (rows stay staged and retry)",
                 f.decisions_failed,
             ),
-            ("millrace_flush_commits_total", "Hoglake commits that landed", f.commits),
             ("millrace_flush_rows_published_total", "Rows published", f.rows_published),
             (
                 "millrace_flush_files_written_total",
@@ -187,6 +186,18 @@ class _PipelineCollector:
         ]
         for name, doc, value in counters:
             yield CounterMetricFamily(name, doc, value=value)
+        # Labelled with the destination: other writers commit on the same
+        # catalog, so alerts on millrace's progress read this, not the
+        # server's per-catalog commit counter. `table` is `namespace.table`:
+        # the scrape honors exported labels, so a `namespace` label would
+        # replace the pod's Kubernetes namespace.
+        commits = CounterMetricFamily(
+            "millrace_flush_commits_total",
+            "Hoglake commits that landed, by destination catalog and table",
+            labels=["catalog", "table"],
+        )
+        commits.add_metric(list(self._flusher.destination), f.commits)
+        yield commits
         dropped = CounterMetricFamily(
             "millrace_records_dropped_total",
             "Records that cannot be represented (consume or flush time), by reason",
@@ -220,6 +231,44 @@ class _PipelineCollector:
             "Objects of a commit whose retries ran out on ambiguous answers "
             "(the commit may have landed; never counted as orphans)",
             value=f.ambiguous_uploads,
+        )
+        built = CounterMetricFamily(
+            "millrace_flush_build_seconds_total",
+            "Seconds the flush's group builds that returned a plan spent, by stage",
+            labels=["stage"],
+        )
+        for stage, seconds in f.build_seconds.items():
+            built.add_metric([stage], seconds)
+        yield built
+        variant_families = (
+            (
+                "millrace_variant_rows_total",
+                "Mapped variant column rows per build: encoded, sql_null, invalid",
+                ["column", "outcome"],
+                f.variant_rows,
+            ),
+            (
+                "millrace_variant_invalid_total",
+                "Mapped variant values written as SQL NULL as invalid, by reason",
+                ["column", "reason"],
+                f.variant_invalid,
+            ),
+            (
+                "millrace_variant_values_total",
+                "Mapped variant values per declared path: typed, fallback, variant_null",
+                ["column", "path", "outcome"],
+                f.variant_values,
+            ),
+        )
+        for name, doc, labels, counts in variant_families:
+            family = CounterMetricFamily(name, doc, labels=labels)
+            for key, count in sorted(counts.items()):
+                family.add_metric(list(key), count)
+            yield family
+        yield CounterMetricFamily(
+            "millrace_flush_build_queue_seconds_total",
+            "Seconds group builds waited for a millrace-hoglake pool thread",
+            value=f.build_queue_seconds,
         )
         yield GaugeMetricFamily(
             "millrace_flush_groups_stuck",

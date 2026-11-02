@@ -30,11 +30,15 @@ Pinned here:
 from __future__ import annotations
 
 import asyncio
+import base64
+import dataclasses
 import inspect
 import json
 import logging
 import re
+import threading
 import uuid
+from decimal import Decimal
 from typing import Any
 
 import httpx
@@ -71,7 +75,13 @@ from flushkit import (
     team_group,
     team_label,
 )
-from pyhoglake import TableInfo
+from pyhoglake import (
+    PreparedPart,
+    TableInfo,
+    ValidationError,
+    object_prefix,
+    parquet_write_options,
+)
 from pyhoglake.models import Column
 from pyhoglake.parquet_schema import prepared_schema_matches
 from slatedb.uniffi import CloseReason
@@ -442,8 +452,9 @@ class TestJsonDecoder:
             decoder.decode_record(b'{"d": 12345678901}')  # precision 10 exceeded
 
     def test_unfillable_columns_are_a_startup_refusal(self) -> None:
-        """What is still refused by shape: an unknown type, a variant (top
-        level or below a container), a container whose children do not
+        """What is still refused by shape: an unknown type, a variant below
+        a container (a top-level one is test_flush_variant.py's), a
+        container whose children do not
         match its type, and a map whose key is a container or json (a
         JSON object key is a string, which no such key coerces — without
         the refusal every non-empty map would drop at flush time)."""
@@ -461,7 +472,6 @@ class TestJsonDecoder:
             "ordinal": 0,
             "children": [{"name": "item", "type": "long", "field_id": 2, "ordinal": 0}],
         }
-        variant = {"name": "c", "type": "variant", "field_id": 1, "ordinal": 0}
 
         def map_keyed_by(key: dict[str, Any]) -> dict[str, Any]:
             return {
@@ -497,7 +507,6 @@ class TestJsonDecoder:
         for wire in (
             variant_in_struct,
             bad_list,
-            variant,
             unknown,
             struct_key,
             list_key,
@@ -838,6 +847,151 @@ class TestPlanBuilder:
         assert codecs == {"ZSTD"}
 
 
+def prefixed_info(**wire: Any) -> TableInfo:
+    """The default shape with its object-prefix option on ``team_id``."""
+    return info_for(table_wire(object_prefix_field="team_id", **wire))
+
+
+def b64_bound(team: int) -> str:
+    return base64.b64encode(
+        object_prefix.expected_bound(prefixed_info(), team)
+    ).decode()
+
+
+class TestObjectPrefix:
+    """With ``object_prefix_field`` set, every file goes under its team's
+    prefix with its ``team_id`` stats inline, and its own footer proves
+    them before upload (design-2.2 §1)."""
+
+    def test_files_go_under_their_team_prefix_with_only_the_team_stats(
+        self,
+    ) -> None:
+        records = [
+            (keyspace.RowKey(team_group(7), 0), event_payload(7, JAN_US)),
+            (keyspace.RowKey(team_group(7), 1), event_payload(7, DEC_US)),
+            (keyspace.RowKey(team_group(7), 2), event_payload(42, JAN_US)),
+        ]
+        plan = plan_for(
+            records,
+            prefixed_info(),
+            ctx=ctx_for(build="tok"),
+            footer_stats_min_bytes=1 << 30,
+        )
+        (commit,) = plan.commits
+        root = f"{DATA_PATH}/data/{NAMESPACE}/{TABLE}"
+        assert commit.uris == (
+            f"{root}/team_id=7/tok/0.parquet",
+            f"{root}/team_id=7/tok/1.parquet",
+            f"{root}/team_id=42/tok/2.parquet",
+        )
+        files = commit.payload["appends"][0]["files"]
+        stats = [f["column_stats"] for f in files]
+        assert all(s["size_bytes"] > 0 for (s,) in stats)
+        assert [[{**s, "size_bytes": 0}] for (s,) in stats] == [
+            [
+                {
+                    "field_id": 1,
+                    "value_count": 1,
+                    "null_count": 0,
+                    "size_bytes": 0,
+                    "lower_bound": b64_bound(team),
+                    "upper_bound": b64_bound(team),
+                }
+            ]
+            for team in (7, 7, 42)
+        ]
+
+    def test_a_file_at_the_threshold_keeps_its_full_footer_stats(self) -> None:
+        records = [(keyspace.RowKey(team_group(7), 0), event_payload(7, JAN_US))]
+        plan = plan_for(records, prefixed_info(), footer_stats_min_bytes=1)
+        (f,) = plan.commits[0].payload["appends"][0]["files"]
+        assert {s["field_id"] for s in f["column_stats"]} == {1, 2, 3}
+        assert f["path"].startswith(f"{DATA_PATH}/data/{NAMESPACE}/{TABLE}/team_id=7/")
+
+    def test_null_and_negative_teams_are_dropped_and_counted(self) -> None:
+        nullable = [{**COLUMNS_WIRE[0], "nullable": True}, *COLUMNS_WIRE[1:]]
+        records = [
+            (keyspace.RowKey(team_group(7), 0), event_payload(7, JAN_US)),
+            (
+                keyspace.RowKey(team_group(7), 1),
+                b'{"team_id": null, "timestamp": 1800000000000000}',
+            ),
+            (keyspace.RowKey(team_group(7), 2), event_payload(-3, JAN_US)),
+            (keyspace.RowKey(team_group(7), 3), event_payload(0, JAN_US)),
+        ]
+        plan = plan_for(records, prefixed_info(columns=nullable))
+        reason = flush_mod.REASON_OBJECT_PREFIX_VALUE
+        assert plan.dropped_records == (
+            flush_mod.DroppedRecord(1, reason, "team_id", 0),
+            flush_mod.DroppedRecord(2, reason, "team_id", 0),
+        )
+        assert plan.dropped_indices == (1, 2)
+        assert (plan.records, plan.files) == (2, 2)
+        assert [c.row_indices for c in plan.commits] == [(0, 3)]
+        assert {u.uri.split("/")[-3] for u in plan.commits[0].uploads} == {
+            "team_id=7",
+            "team_id=0",
+        }
+        # With the option off, the same rows are written as before.
+        off = plan_for(records, info_for(table_wire(columns=nullable)))
+        assert off.dropped_records == () and off.records == 4
+
+    def test_a_file_whose_stats_do_not_prove_its_prefix_fails_the_plan(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        real = flush_mod.extract_column_stats
+
+        def forged(metadata: Any, cols: Any) -> Any:
+            return [
+                dataclasses.replace(
+                    s, upper_bound=object_prefix.expected_bound(prefixed_info(), 8)
+                )
+                if s.field_id == 1
+                else s
+                for s in real(metadata, cols)
+            ]
+
+        monkeypatch.setattr(flush_mod, "extract_column_stats", forged)
+        records = [(keyspace.RowKey(team_group(7), 0), event_payload(7, JAN_US))]
+        with pytest.raises(flush_mod.FlushError, match=r"team_id=7 .*BOUND_MISMATCH"):
+            plan_for(records, prefixed_info())
+
+    def test_a_refused_registration_fails_the_plan_as_an_encoder_bug(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def refused(self: Any, *args: Any, **kwargs: Any) -> Any:
+            raise ValidationError("stats_field_ids [1] name no stats", status_code=None)
+
+        monkeypatch.setattr(PreparedPart, "registration", refused)
+        records = [(keyspace.RowKey(team_group(7), 0), event_payload(7, JAN_US))]
+        with pytest.raises(flush_mod.FlushError, match="registration was refused"):
+            plan_for(records, prefixed_info())
+
+    @pytest.mark.parametrize(
+        ("wire", "match"),
+        [
+            ({"object_prefix_field": "region"}, "no top-level column"),
+            ({"object_prefix_field": "event"}, "a 'string'"),
+            (
+                {
+                    "object_prefix_field": "team_id",
+                    "spec": {
+                        "spec_id": 4,
+                        "fields": [{"source_field_id": 2, "transform": "month"}],
+                    },
+                },
+                "no single identity field",
+            ),
+        ],
+    )
+    def test_a_layout_the_writer_cannot_honor_is_refused(
+        self, wire: dict[str, Any], match: str
+    ) -> None:
+        records = [(keyspace.RowKey(team_group(7), 0), event_payload(7, JAN_US))]
+        with pytest.raises(flush_mod.FlushError, match=match):
+            plan_for(records, info_for(table_wire(**wire)))
+
+
 class TestBatchBuild:
     """The Arrow batch build raises on encoder drift (coercion is total)."""
 
@@ -882,6 +1036,190 @@ class TestBatchBuild:
         monkeypatch.setattr(flush_mod, "_build_batch", flaky)
         with pytest.raises(flush_mod.FlushError, match="no single record"):
             flush_mod._build_batch_or_raise(rows, cols)
+
+
+class TestWriterCore:
+    """Each part is written by pyhoglake's ``write_part`` (the bytes are
+    pinned by test_flush_golden.py); its refusals are the build's."""
+
+    def test_a_part_the_core_refuses_fails_the_plan_as_an_encoder_bug(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The core reads every footer back and holds it to the
+        destination's columns, not to the batch's own schema as millrace's
+        old check did (that one passed this batch, its drift on both
+        sides): a batch built at another field id fails the build, with
+        the rows staged and nothing uploaded."""
+        real = flush_mod.arrow_schema
+
+        def drifted(cols: Any) -> pa.Schema:
+            schema = real(cols)
+            index = schema.get_field_index("event")
+            return schema.set(
+                index,
+                schema.field(index).with_metadata({b"PARQUET:field_id": b"99"}),
+            )
+
+        monkeypatch.setattr(flush_mod, "arrow_schema", drifted)
+        records = [(keyspace.RowKey(team_group(7), 0), event_payload(7, JAN_US))]
+        with pytest.raises(flush_mod.FlushError, match="a millrace encoder bug") as e:
+            plan_for(records, info_for())
+        assert isinstance(e.value.__cause__, ValidationError)
+
+    def test_each_part_is_written_with_the_codec_and_the_core_defaults(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """zstd level 3 and nothing else: row_group_size (pyarrow's
+        default) and the variant options are left to the core, so a
+        keyword added here would change production files' layout where
+        the golden's small files cannot show it."""
+        real = flush_mod.write_part
+        calls: list[dict[str, Any]] = []
+
+        def spy(*args: Any, **kwargs: Any) -> Any:
+            calls.append(kwargs)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(flush_mod, "write_part", spy)
+        records = [
+            (keyspace.RowKey(team_group(7), 0), event_payload(7, JAN_US)),
+            (keyspace.RowKey(team_group(7), 1), event_payload(7, DEC_US)),
+        ]
+        plan = plan_for(records, info_for(table_wire(sort=SORT_WIRE)))
+        assert plan.files == 2
+        assert calls == [{"write_options": parquet_write_options("zstd", 3)}] * 2
+
+
+class TestBuildStages:
+    """The build times each stage on the clock it is given
+    (``millrace_flush_build_seconds_total{stage}``)."""
+
+    @staticmethod
+    def _advancing(
+        monkeypatch: pytest.MonkeyPatch,
+        now: list[float],
+        owner: Any,
+        name: str,
+        by: float,
+    ) -> None:
+        real = getattr(owner, name)
+
+        def run(*args: Any, **kwargs: Any) -> Any:
+            now[0] += by
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(owner, name, run)
+
+    def test_each_stage_is_timed_across_its_own_work(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A clock that moves only inside each stage's work, by a distinct
+        amount per stage: a lap in the wrong place, or a stage's time
+        added to another's, reads back wrong."""
+        now = [0.0]
+        for owner, name, by in [
+            (flush_mod.JsonObjectDecoder, "decode_record", 1.0),
+            (flush_mod, "_build_batch_or_raise", 10.0),
+            (flush_mod, "_sort_batch_by_spec", 100.0),
+            (flush_mod, "_partition_groups", 1000.0),
+            (flush_mod, "write_part", 10000.0),
+        ]:
+            self._advancing(monkeypatch, now, owner, name, by)
+        records = [
+            (keyspace.RowKey(team_group(7), 0), event_payload(7, JAN_US)),
+            (keyspace.RowKey(team_group(7), 1), event_payload(7, DEC_US)),
+            (keyspace.RowKey(team_group(7), 2), event_payload(7, JAN_US)),
+        ]
+        plan = build_flush_plan(
+            records,
+            info_for(table_wire(sort=SORT_WIRE)),
+            ctx=ctx_for(),
+            data_path=DATA_PATH,
+            max_files_per_commit=512,
+            footer_stats_min_bytes=1,
+            version="test",
+            clock=lambda: now[0],
+        )
+        assert plan.files == 2
+        assert plan.stage_seconds == {
+            "decode": 3.0,
+            "build": 10.0,
+            "sort": 100.0,
+            "fanout": 1000.0,
+            "variant_encode": 0.0,
+            "write": 20000.0,
+        }
+
+    def test_a_window_whose_every_row_drops_times_only_its_decode(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        now = [0.0]
+        self._advancing(
+            monkeypatch, now, flush_mod.JsonObjectDecoder, "decode_record", 2.0
+        )
+        plan = build_flush_plan(
+            [(keyspace.RowKey(team_group(7), 0), b"not json")],
+            info_for(),
+            ctx=ctx_for(),
+            data_path=DATA_PATH,
+            max_files_per_commit=512,
+            footer_stats_min_bytes=1,
+            version="test",
+            clock=lambda: now[0],
+        )
+        assert plan.commits == ()
+        assert plan.stage_seconds == {
+            "decode": 2.0,
+            "build": 0.0,
+            "sort": 0.0,
+            "fanout": 0.0,
+            "variant_encode": 0.0,
+            "write": 0.0,
+        }
+
+
+class TestVariantIsNoKey:
+    """A variant is refused as a sort or partition source by its type:
+    the decoder takes a top-level variant column now."""
+
+    def test_a_variant_sort_source_is_refused(self) -> None:
+        wire = table_wire(
+            columns=[
+                *COLUMNS_WIRE,
+                {"name": "v", "type": "variant", "field_id": 4, "ordinal": 3},
+            ],
+            sort={
+                "sort_id": 6,
+                "fields": [
+                    {
+                        "source_field_id": 4,
+                        "direction": "asc",
+                        "null_order": "nulls_last",
+                    }
+                ],
+            },
+        )
+        with pytest.raises(
+            flush_mod.FlushError, match="cannot be a sort source: 'v' is a 'variant'"
+        ):
+            flush_mod._spec_sort_keys(info_for(wire))
+
+    def test_a_variant_partition_source_is_refused(self) -> None:
+        """The predicate startup validation applies to each partition
+        field."""
+        props = Column.from_wire(
+            {
+                "name": "p",
+                "type": "struct",
+                "field_id": 1,
+                "ordinal": 0,
+                "children": [
+                    {"name": "v", "type": "variant", "field_id": 2, "ordinal": 0}
+                ],
+            }
+        )
+        chain = (props, *props.children)
+        assert flush_mod._source_fault(chain) == "'p.v' is a 'variant' column"
 
 
 # =====================================================================================
@@ -1021,6 +1359,93 @@ class TestHappyPath:
             script_options(httpx_mock)
             CommitCapture(httpx_mock, [commit_ok(50)])
             assert (await r.run_once()).committed == 1
+
+
+@component
+class TestBuildTimings:
+    async def test_the_flusher_sums_stage_seconds_and_the_wait_for_a_thread(
+        self,
+        httpx_mock: Any,
+        stage_factory: Any,
+        fake_clock: Any,
+        flusher_factory: Any,
+        store: FakeObjectStore,
+        mono: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Two groups' builds in one batch, on the flusher's injected clock:
+        ``build_queue_seconds`` sums each build's wait for the pool's only
+        thread, from submit to START — a 0.25 s job ahead of both, then
+        the first 0.5 s build ahead of the second, is 0.25 + 0.75 s (2.0 s
+        if a build's own time counted). The second build raises: its wait
+        still counts, and its stage seconds (on the plan it never
+        returned) do not, so each stage reads the first build's alone."""
+        stage = await stage_factory()
+        await staged(stage, fake_clock, 1, [(0, JAN_US)])
+        await staged(stage, fake_clock, 2, [(1, JAN_US)])
+        scans = [
+            await stage.scan(team_group(t), max_bytes=1 << 30, now_us=fake_clock())
+            for t in (1, 2)
+        ]
+        script_options(httpx_mock)
+        CommitCapture(httpx_mock, [commit_ok(50)])
+        flusher = flusher_factory(store=store, cfg=make_config())
+        assert flusher.stats().build_seconds == dict.fromkeys(
+            flush_mod.BUILD_STAGES, 0.0
+        )
+        assert flusher.stats().build_queue_seconds == 0.0
+        real_build = flush_mod.build_flush_plan
+        builds = 0
+
+        def fixed_seconds(*args: Any, **kwargs: Any) -> Any:
+            nonlocal builds
+            builds += 1
+            plan = real_build(*args, **kwargs)
+            mono.advance(0.5)
+            if builds == 2:
+                raise flush_mod.FlushError("the second build fails")
+            assert set(plan.stage_seconds) == set(flush_mod.BUILD_STAGES)
+            seconds = {s: i + 1.0 for i, s in enumerate(flush_mod.BUILD_STAGES)}
+            return dataclasses.replace(plan, stage_seconds=seconds)
+
+        monkeypatch.setattr(flush_mod, "build_flush_plan", fixed_seconds)
+        # The busy job holds the pool's one thread until both builds are
+        # submitted, so each submit reads the clock before it moves.
+        release = threading.Event()
+        real_shape = flusher._shape_sync
+
+        def busy() -> None:
+            assert release.wait(5)
+            mono.advance(0.25)
+
+        def shape_then_busy() -> Any:
+            info = real_shape()
+            flusher._executor.submit(busy)
+            return info
+
+        flusher._shape_sync = shape_then_busy
+        submitted = 0
+
+        async def io(fn: Any) -> Any:
+            nonlocal submitted
+            future = asyncio.get_running_loop().run_in_executor(flusher._executor, fn)
+            if getattr(fn, "func", None) is flush_mod._started:
+                submitted += 1
+                if submitted == 2:
+                    release.set()
+            return await future
+
+        flusher._io = io
+
+        report = await flusher.flush_batch(stage, scans, "slow")
+
+        assert [r.outcome for r in report.reports] == ["committed"]
+        assert [str(e) for _, e in report.failed] == ["the second build fails"]
+        stats = flusher.stats()
+        assert stats.build_seconds == {
+            s: i + 1.0 for i, s in enumerate(flush_mod.BUILD_STAGES)
+        }
+        assert stats.build_queue_seconds == 1.0
 
 
 # =====================================================================================
@@ -1576,7 +2001,7 @@ class TestOrphansAndDrops:
                 await flush_group(flusher, stage, team_group(TEAM), "size")
         assert flusher.stats().dropped_payload_keys == 2
         warned = [
-            r for r in caplog.records if "'surprise' is not a column" in r.getMessage()
+            r for r in caplog.records if "'surprise' fills no column" in r.getMessage()
         ]
         assert len(warned) == 1
         assert "surprise" not in str(capture.payloads[1])
@@ -1862,6 +2287,62 @@ class TestRunner:
             )
             assert await staged_rows(stage, 11) == []
             assert r.stuck_groups == 0
+
+    async def test_a_decimal_past_its_precision_is_dropped_never_wedges(
+        self,
+        httpx_mock: Any,
+        fake_clock: Any,
+        flusher_factory: Any,
+        store: FakeObjectStore,
+        sleeper: Sleeper,
+    ) -> None:
+        """123456789 has nine significant digits but needs eleven at
+        decimal(10, 2). It is dropped as uncastable, so the batch builds
+        and the group drains, rather than failing every sweep with its
+        rows staged."""
+        wire = COLUMNS_WIRE + [
+            {
+                "name": "amt",
+                "type": "decimal",
+                "field_id": 4,
+                "ordinal": 3,
+                "nullable": True,
+                "type_params": {"precision": 10, "scale": 2},
+            }
+        ]
+        cfg = make_config()
+        async with StageManager(
+            "memory:///", "millrace", settings=fast_flush_settings()
+        ) as manager:
+            stage = await manager.open_partition("events", 0)
+            payloads = [
+                event_payload(TEAM, JAN_US, amt="99999999.99"),
+                event_payload(TEAM, JAN_US, amt=123456789),
+                event_payload(TEAM, JAN_US, amt=99999999),
+            ]
+            await staged(
+                stage,
+                fake_clock,
+                TEAM,
+                [(i, JAN_US) for i in range(len(payloads))],
+                payloads=payloads,
+            )
+            script_options(httpx_mock)
+            capture = CommitCapture(httpx_mock, [commit_ok(50)])
+            flusher = flusher_factory(
+                store=store, cfg=cfg, table=table_wire(columns=wire)
+            )
+            r = runner(manager, flusher, cfg, fake_clock, sleeper)
+
+            sweep = await r.run_once(drain=True)
+
+            assert (sweep.decisions, sweep.committed, sweep.failed) == (1, 1, 0)
+            assert r.stuck_groups == 0
+            assert flusher.stats().records_dropped == {REASON_UNCASTABLE_COLUMN: 1}
+            assert await staged_rows(stage, TEAM) == []
+            (f,) = capture.payloads[0]["appends"][0]["files"]
+            amts = parquet_rows(store, f["path"]).column("amt").to_pylist()
+            assert sorted(amts) == [Decimal(99999999), Decimal("99999999.99")]
 
     async def test_halt_is_sticky(
         self,
@@ -2540,6 +3021,22 @@ class TestStartupValidation:
         with pytest.raises(FlushStartupError, match="field_id 99"):
             flusher_factory(store=store, table=wire)
 
+    async def test_an_object_prefix_without_its_identity_refuses_at_resolve(
+        self,
+        httpx_mock: Any,
+        flusher_factory: Any,
+        store: FakeObjectStore,
+    ) -> None:
+        wire = table_wire(
+            object_prefix_field="team_id",
+            spec={
+                "spec_id": 5,
+                "fields": [{"source_field_id": 2, "transform": "month"}],
+            },
+        )
+        with pytest.raises(FlushStartupError, match="no single identity field"):
+            flusher_factory(store=store, table=wire)
+
     async def test_unknown_transform_refuses_at_resolve(
         self,
         httpx_mock: Any,
@@ -2790,7 +3287,7 @@ class TestNestedJsonColumns:
             path.write_bytes(store.files[key])
             with pq.ParquetFile(path) as parquet:
                 assert prepared_schema_matches(
-                    flush_mod.file_schema(parquet.schema_arrow),
+                    parquet.schema_arrow,
                     flush_mod._encode_schema(flush_mod.arrow_schema(info.columns)),
                 )
                 table = parquet.read()

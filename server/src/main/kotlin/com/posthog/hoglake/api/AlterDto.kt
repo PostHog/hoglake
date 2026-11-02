@@ -138,6 +138,10 @@ data class AlterOpDto(
                 AlterOp.SetPartitionSpec(required(fields, "fields").map { it.toModel() })
             "set_sort_order" ->
                 AlterOp.SetSortOrder(required(sortFields, "sort_fields").map { it.toModel() })
+            // No null-to-clear: the option has no unset. A replica older
+            // than the op answers 400 "unknown alter op", which is the
+            // fail-closed answer for a layout it would not enforce.
+            "set_object_prefix_field" -> AlterOp.SetObjectPrefixField(required(name, "name"))
             else -> throw BadRequestException("unknown alter op '$op'")
         }
     }

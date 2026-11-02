@@ -1,5 +1,6 @@
 package com.posthog.hoglake.api
 
+import com.posthog.hoglake.auth.actorOrRefuse
 import com.posthog.hoglake.service.AlterService
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
@@ -32,7 +33,7 @@ fun Application.installAlterRoutes(alter: AlterService) {
                     ops,
                     call.expectedTableUuid(),
                     call.longQuery("read_snapshot"),
-                    req.author,
+                    call.actorOrRefuse(req.author),
                     req.message,
                 ).toDto(),
             )

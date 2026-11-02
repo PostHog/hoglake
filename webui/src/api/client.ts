@@ -18,6 +18,7 @@ import type {
   MaintenanceTask,
   Namespace,
   PartitionListing,
+  PartitionLookup,
   PartitionStatsResponse,
   PartitionValues,
   ScanFile,
@@ -31,13 +32,17 @@ export class ApiError extends Error {
   readonly status: number;
   readonly error: string;
   readonly detail?: string;
+  readonly reason?: string;
+  readonly retryAfter?: string;
 
-  constructor(status: number, body: ApiErrorBody) {
+  constructor(status: number, body: ApiErrorBody, retryAfter?: string) {
     super(body.detail ? `${body.error}: ${body.detail}` : body.error);
     this.name = "ApiError";
     this.status = status;
     this.error = body.error;
     this.detail = body.detail;
+    this.reason = body.reason;
+    this.retryAfter = retryAfter;
   }
 }
 
@@ -71,7 +76,7 @@ async function parseError(res: Response): Promise<ApiError> {
   } catch {
     // Non-JSON error body; keep the status-based message.
   }
-  return new ApiError(res.status, body);
+  return new ApiError(res.status, body, res.headers.get("Retry-After") ?? undefined);
 }
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
@@ -153,11 +158,12 @@ export function getTable(
   namespace: string,
   table: string,
   snapshot?: Int64,
+  opts?: { totals?: boolean },
 ): Promise<Table> {
   return request(
     buildUrl(
       `/catalogs/${seg(catalog)}/namespaces/${seg(namespace)}/tables/${seg(table)}`,
-      { snapshot },
+      { snapshot, totals: opts?.totals === undefined ? undefined : String(opts.totals) },
     ),
   );
 }
@@ -214,6 +220,32 @@ export function getPartitionValues(
       `/catalogs/${seg(catalog)}/namespaces/${seg(namespace)}/tables/${seg(table)}/partitions/values`,
       { snapshot },
     ),
+  );
+}
+
+export function lookupPartition(
+  catalog: string,
+  namespace: string,
+  table: string,
+  opts: {
+    specId: Int64;
+    values: (string | null)[];
+    snapshot?: Int64;
+    cursor?: string;
+    limit?: number;
+  },
+): Promise<PartitionLookup> {
+  return request(
+    buildUrl(
+      `/catalogs/${seg(catalog)}/namespaces/${seg(namespace)}/tables/${seg(table)}/partitions/lookup`,
+      {
+        spec_id: opts.specId,
+        snapshot: opts.snapshot,
+        cursor: opts.cursor,
+        limit: opts.limit,
+      },
+    ),
+    { method: "POST", body: JSON.stringify(opts.values) },
   );
 }
 

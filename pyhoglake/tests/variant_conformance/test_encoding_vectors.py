@@ -415,6 +415,22 @@ def test_e9_variant_decimals_are_little_endian_and_typed_decimal16_exact():
 
 DEEPEST = "[" * (codec.MAX_VARIANT_DEPTH + 1) + "]" * (codec.MAX_VARIANT_DEPTH + 1)
 TOO_DEEP = "[" * (codec.MAX_VARIANT_DEPTH + 2) + "]" * (codec.MAX_VARIANT_DEPTH + 2)
+EXTREME_NESTING = "[" * 10_000 + "]" * 10_000
+
+
+@pytest.fixture
+def json_parser_recursion_error(text, monkeypatch):
+    if text != EXTREME_NESTING:
+        return
+    decode = codec._JSON.decode
+
+    def refuse_extreme_nesting(text):
+        if text == EXTREME_NESTING:
+            raise RecursionError
+        return decode(text)
+
+    monkeypatch.setattr(codec._JSON, "decode", refuse_extreme_nesting)
+
 
 INVALID_JSON = [
     ('{"a":1,"a":2}', "duplicate_key", None),
@@ -447,7 +463,7 @@ INVALID_JSON = [
         "nesting_too_deep",
         "$" + ".k" * codec.MAX_VARIANT_DEPTH,
     ),
-    ("[" * 10_000 + "]" * 10_000, "nesting_too_deep", None),
+    (EXTREME_NESTING, "nesting_too_deep", None),
     ('{"a":', "invalid_json", None),
     ("", "invalid_json", None),
     ("{'a':1}", "invalid_json", None),
@@ -467,6 +483,7 @@ DECLARATIONS = [
 
 @pytest.mark.parametrize("decl", DECLARATIONS, ids=lambda d: str(d and d["type"]))
 @pytest.mark.parametrize(("text", "reason", "path"), INVALID_JSON, ids=ident)
+@pytest.mark.usefixtures("json_parser_recursion_error")
 def test_e10_invalid_json_rows(text, reason, path, decl):
     with pytest.raises(VariantEncodingError) as raised:
         variant.encode_json(["1", text], shredding=decl)
@@ -477,6 +494,28 @@ def test_e10_invalid_json_rows(text, reason, path, decl):
     report = encoded.report
     assert (report.invalid_rows, report.invalid_by_reason) == (1, {reason: 1})
     assert report.first_invalid == (None, 1, reason, path)
+    assert report.sql_null_rows == 0
+    variant.verify(encoded.array, shredding=decl)
+
+
+@pytest.mark.parametrize("decl", DECLARATIONS, ids=lambda d: str(d and d["type"]))
+def test_e10_extreme_json_nesting_is_invalid(decl):
+    with pytest.raises(VariantEncodingError) as raised:
+        variant.encode_json(["1", EXTREME_NESTING], shredding=decl)
+    error = raised.value
+    assert (error.reason, error.row) == ("nesting_too_deep", 1)
+    # CPython may refuse in the parser, or decode far enough for the codec's bound.
+    assert error.path in (None, "$" + "[0]" * codec.MAX_VARIANT_DEPTH)
+    encoded = variant.encode_json(
+        ["1", EXTREME_NESTING, "2"], shredding=decl, on_invalid="null"
+    )
+    assert variant.to_python(encoded.array) == [1, None, 2]
+    report = encoded.report
+    assert (report.invalid_rows, report.invalid_by_reason) == (
+        1,
+        {"nesting_too_deep": 1},
+    )
+    assert report.first_invalid == (None, 1, "nesting_too_deep", error.path)
     assert report.sql_null_rows == 0
     variant.verify(encoded.array, shredding=decl)
 

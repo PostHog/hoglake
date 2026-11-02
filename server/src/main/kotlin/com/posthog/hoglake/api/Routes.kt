@@ -1,10 +1,15 @@
 package com.posthog.hoglake.api
 
 import com.posthog.hoglake.BuildInfo
+import com.posthog.hoglake.auth.AuthState
+import com.posthog.hoglake.auth.actorOrRefuse
+import com.posthog.hoglake.auth.hoglakeAuth
+import com.posthog.hoglake.auth.resolveActor
 import com.posthog.hoglake.commit.CommitService
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.observability.CatalogTotals
 import com.posthog.hoglake.observability.InstanceTotals
+import com.posthog.hoglake.observability.instanceTotalsFor
 import com.posthog.hoglake.persistence.FileRepo
 import com.posthog.hoglake.service.CatalogService
 import com.posthog.hoglake.service.ColumnTrees
@@ -47,7 +52,24 @@ fun Application.installApiRoutes(
             // computed here (a live-manifest sum per request would tax
             // the commit tail's RDS at fleet scale). Null (fields
             // omitted) only in the boot window before the first sample.
-            val totals = instanceTotals()
+            //
+            // The instance-wide sums are every tenant's storage, so they are
+            // PROJECTED onto what this caller may see. Three cases, and the
+            // table in auth/AuthPolicy.kt says why /v1/info is PUBLIC while
+            // still caring:
+            //   operator   -> the instance totals, unchanged
+            //   tenant     -> the same accounting over its own catalogs
+            //   anonymous  -> no totals at all (the fields are omitted)
+            val totals =
+                when (val auth = call.hoglakeAuth) {
+                    // Auth off: unauthenticated by configuration, so the
+                    // instance totals are what this route has always returned.
+                    // The distinction matters — see auth/AuthState.
+                    is AuthState.Off -> instanceTotals()
+                    is AuthState.Anonymous -> null
+                    is AuthState.Authenticated ->
+                        instanceTotalsFor(instanceTotals(), catalogTotals(), auth.caller.visibleCatalogs())
+                }
             call.respond(
                 InstanceInfoDto(
                     name = instanceName.ifBlank { null },
@@ -64,14 +86,26 @@ fun Application.installApiRoutes(
             get {
                 // Totals ride the sampler's last pass (catalogTotals), so
                 // listing catalogs never sums the manifest per request.
+                //
+                // The LIST is filtered, not merely gated: without this a tenant
+                // token reads the whole fleet's catalog roster off the first
+                // request it makes. Under HOGLAKE_AUTH_MODE=off the caller is
+                // null and the filter is "everything", i.e. today's behaviour.
                 val totals = catalogTotals()
-                call.respond(catalogs.listCatalogs().map { it.toDto(totals[it.name]) })
+                val visible =
+                    when (val auth = call.hoglakeAuth) {
+                        is AuthState.Off -> null
+                        // Only reachable in `warn`, which lets a refusal through.
+                        is AuthState.Anonymous -> emptySet()
+                        is AuthState.Authenticated -> auth.caller.visibleCatalogs()
+                    }
+                call.respond(catalogs.listCatalogs(visible).map { it.toDto(totals[it.name]) })
             }
             post {
                 val req = call.receive<CreateCatalogRequestDto>()
                 call.respond(
                     HttpStatusCode.Created,
-                    catalogs.createCatalog(req.name, req.dataPath, req.author, req.message).toDto(),
+                    catalogs.createCatalog(req.name, req.dataPath, call.actorOrRefuse(req.author), req.message).toDto(),
                 )
             }
 
@@ -83,7 +117,7 @@ fun Application.installApiRoutes(
                     call.respond(
                         catalogs.dropCatalog(
                             call.catalog(),
-                            call.request.queryParameters["author"],
+                            call.actorOrRefuse(call.request.queryParameters["author"]),
                             call.request.queryParameters["message"],
                         ).toDto(),
                     )
@@ -114,7 +148,12 @@ fun Application.installApiRoutes(
                         val req = call.receive<CreateNamespaceRequestDto>()
                         call.respond(
                             HttpStatusCode.Created,
-                            catalogs.createNamespace(call.catalog(), req.name, req.author, req.message).toDto(),
+                            catalogs.createNamespace(
+                                call.catalog(),
+                                req.name,
+                                call.actorOrRefuse(req.author),
+                                req.message,
+                            ).toDto(),
                         )
                     }
                     get("/{namespace}") {
@@ -128,7 +167,7 @@ fun Application.installApiRoutes(
                                 call.catalog(),
                                 call.namespace(),
                                 call.longQuery("expected_namespace_id"),
-                                call.request.queryParameters["author"],
+                                call.actorOrRefuse(call.request.queryParameters["author"]),
                                 call.request.queryParameters["message"],
                             ).toDto(),
                         )
@@ -154,7 +193,7 @@ fun Application.installApiRoutes(
                                     call.namespace(),
                                     req.name,
                                     req.columns.map { it.toModel() },
-                                    req.author,
+                                    call.actorOrRefuse(req.author),
                                     req.message,
                                 ).toDto(),
                             )
@@ -187,7 +226,7 @@ fun Application.installApiRoutes(
                                         call.namespace(),
                                         call.table(),
                                         call.expectedTableUuid(),
-                                        call.request.queryParameters["author"],
+                                        call.actorOrRefuse(call.request.queryParameters["author"]),
                                         call.request.queryParameters["message"],
                                     ).toDto(),
                                 )
@@ -216,7 +255,7 @@ fun Application.installApiRoutes(
                                         call.namespace(),
                                         call.table(),
                                         expected,
-                                        req.author,
+                                        call.actorOrRefuse(req.author),
                                         req.message,
                                     ).toDto(),
                                 )
@@ -366,7 +405,7 @@ fun Application.installApiRoutes(
                 // Dedicated endpoint prevents old servers silently ignoring the
                 // new request key and degrading retries to at-least-once.
                 post("/commit/prepared") {
-                    val req = call.receive<CommitRequestDto>()
+                    val req = call.receiveCommit()
                     if (req.idempotencyKey == null) {
                         throw com.posthog.hoglake.model.HoglakeException.Validation("idempotency_key is required")
                     }
@@ -377,7 +416,7 @@ fun Application.installApiRoutes(
 
                 // Distinct endpoint fences replicas that predate the DELETE contract.
                 post("/commit/deletes/prepared") {
-                    val req = call.receive<CommitRequestDto>()
+                    val req = call.receiveCommit()
                     if (req.idempotencyKey == null || req.readSnapshot == null || req.appends.isNotEmpty() ||
                         req.deletes.isEmpty() || req.deletes.any { it.expectedTableUuid == null }
                     ) {
@@ -397,7 +436,7 @@ fun Application.installApiRoutes(
                 // A separate endpoint fences old replicas and includes the stronger
                 // conflict contract in the durable full-payload receipt.
                 post("/commit/mutations/prepared") {
-                    val req = call.receive<CommitRequestDto>()
+                    val req = call.receiveCommit()
                     if (req.idempotencyKey == null || req.readSnapshot == null || req.deletes.isEmpty() ||
                         req.deletes.any { it.expectedTableUuid == null } ||
                         req.appends.any { it.expectedTableUuid == null }
@@ -416,7 +455,7 @@ fun Application.installApiRoutes(
                 }
 
                 post("/commit/uploads") {
-                    val req = call.receive<CommitRequestDto>()
+                    val req = call.receiveCommit()
                     if (req.idempotencyKey == null || req.readSnapshot == null ||
                         req.appends.any { it.expectedTableUuid == null } ||
                         req.deletes.any { it.expectedTableUuid == null }
@@ -441,7 +480,7 @@ fun Application.installApiRoutes(
                 // append-only transaction keeps the ordinary DDL-only
                 // conflict rule and does not 409 on a concurrent INSERT.
                 post("/commit/transaction") {
-                    val req = call.receive<CommitRequestDto>()
+                    val req = call.receiveCommit()
                     if (req.idempotencyKey == null || req.readSnapshot == null ||
                         req.appends.any { it.expectedTableUuid == null } ||
                         req.deletes.any { it.expectedTableUuid == null }
@@ -472,7 +511,7 @@ fun Application.installApiRoutes(
                 }
 
                 post("/commit") {
-                    val req = call.receive<CommitRequestDto>()
+                    val req = call.receiveCommit()
                     call.respond(
                         commits.commit(call.catalog(), req.toModel(), call.request.userAgent()).toDto(),
                     )
@@ -821,3 +860,16 @@ internal fun parseExpectedTableUuid(raw: String): UUID =
     } catch (_: IllegalArgumentException) {
         throw BadRequestException("expected_table_uuid must be a UUID")
     }
+
+/**
+ * Every commit route reads its body through here, so the snapshot's `author`
+ * is decided by the same rule as every other write ([resolveActor]). Under
+ * auth, a tenant's commit is recorded as its own subject, or `<user> via
+ * <subject>` for a delegating client, and naming anyone else is refused. A
+ * commit route that read the body directly would take its `author` as given:
+ * `CommitAttributionTest` fails if one does.
+ */
+internal suspend fun ApplicationCall.receiveCommit(): CommitRequestDto =
+    receive<CommitRequestDto>().attributed(hoglakeAuth)
+
+internal fun CommitRequestDto.attributed(auth: AuthState): CommitRequestDto = copy(author = resolveActor(auth, author))

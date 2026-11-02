@@ -51,6 +51,7 @@ object Audit {
         requestId: String? = null,
         actor: String? = null,
         message: String? = null,
+        tenant: String? = null,
     ) {
         try {
             val args =
@@ -60,6 +61,14 @@ object Audit {
                     kv("outcome", outcome),
                 )
             catalog?.let { args += kv("catalog", it) }
+            // The ORG, alongside the catalog. A catalog names one tenant
+            // today, but the org is the unit a customer and a support
+            // engineer both think in, and joining a trail by catalog
+            // alone means a rename or a second catalog for the same org
+            // splits the history. Null for operator actions and for
+            // anonymous ones, which is exactly the distinction a reader
+            // needs when asking "did a tenant do this or did we".
+            tenant?.let { args += kv("tenant", it) }
             obj?.let { args += kv("object", it) }
             detail?.let { args += kv("detail", it) }
             message?.let { args += kv("operation_message", it) }
@@ -160,6 +169,10 @@ object Audit {
             is HoglakeException.OffsetRegression -> "regression"
             is HoglakeException.CommitQueueTimeout -> "timeout"
             is HoglakeException.Validation -> "validation"
+            // Its own outcome for the reason the metric below has one: a
+            // writer that does not know a table's layout is a fleet
+            // problem to find, not one validation failure among many.
+            is HoglakeException.ObjectPrefixViolation -> "object_prefix_violation"
             // The precondition refusals: a DDL the catalog's state does
             // not allow (a drop of something not empty, a rename while
             // id-less files would lose their history). Their own outcome
@@ -174,6 +187,13 @@ object Audit {
             is HoglakeException.IdlessFilesPresent,
             -> "refused"
             is HoglakeException.NotFound -> "not_found"
+            // Authentication and authorization refusals are their own
+            // outcomes, not "error". A 401 next to a 500 in the trail is
+            // indistinguishable from a server fault, and the question
+            // whoever reads it after a stuck writer has is exactly "was
+            // this caller turned away, or did we break".
+            is HoglakeException.Unauthenticated -> "unauthenticated"
+            is HoglakeException.Forbidden -> "forbidden"
             else -> "error"
         }
 }

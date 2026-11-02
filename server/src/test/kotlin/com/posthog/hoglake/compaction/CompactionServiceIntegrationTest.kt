@@ -52,6 +52,7 @@ import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName
 import org.apache.parquet.schema.Types
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
+import org.assertj.core.api.Assertions.entry
 import org.jdbi.v3.core.kotlin.useHandleUnchecked
 import org.jdbi.v3.core.kotlin.withHandleUnchecked
 import org.junit.jupiter.api.AfterAll
@@ -1367,7 +1368,7 @@ class CompactionServiceIntegrationTest {
     }
 
     @Test
-    fun `a table holding a variant at ANY depth produces no candidates`() {
+    fun `a table holding a variant at ANY depth produces no candidates unless the flag is on`() {
         // THE GATE, which had no test: the rewriter's refusal is only
         // the backstop, and reverting the planner to #77's top-level
         // check left the whole suite green. A nested variant would then
@@ -1451,6 +1452,89 @@ class CompactionServiceIntegrationTest {
             assertThat(svc.runOnce(cat, cfg).groupsCompacted)
                 .describedAs("%s variant: and nothing is compacted", label)
                 .isZero()
+
+            // HOGLAKE_COMPACTION_VARIANT on: the same files compact, the
+            // variant null-filled in its declared layout.
+            val on = cfg.copy(variantCompaction = true)
+            assertThat(svc.planTable(cat, "ns", "t", on).groups)
+                .describedAs("%s variant, flag on: the files are planned", label)
+                .isNotEmpty()
+            assertThat(svc.runOnce(cat, on).groupsCompacted)
+                .describedAs("%s variant, flag on: and compacted", label)
+                .isPositive()
+        }
+    }
+
+    @Test
+    fun `a variant table compacts pyhoglake's files, and a group with another layout is skipped and counted`() {
+        // The service end to end, over pyhoglake-written files (see
+        // VariantPassthroughTest for the bytes): the declarations come from
+        // the catalog, the inputs are hydrated, the output is registered.
+        val defs =
+            com.posthog.hoglake.wireObjectMapper()
+                .readTree(javaClass.getResource("/variant/passthrough/columns.json"))
+                .map {
+                    ColumnDef(
+                        it["name"].asText(),
+                        ColType.fromWire(it["type"].asText()),
+                        it["type_params"]?.let {
+                                p ->
+                            com.posthog.hoglake.wireObjectMapper().convertValue(p, Map::class.java)
+                        }
+                            ?.let { p -> p.entries.associate { (k, v) -> k as String to v } },
+                        nullable = it["nullable"]?.asBoolean() ?: true,
+                    )
+                }
+        val on = cfg.copy(targetBytes = 1L shl 20, variantCompaction = true)
+        val registry = io.micrometer.core.instrument.simple.SimpleMeterRegistry()
+        com.posthog.hoglake.observability.Metrics.bind(registry)
+        try {
+            for ((second, compacts) in listOf("b" to true, "mismatch" to false)) {
+                val cat = "compact-variant-files-$second-${counter.incrementAndGet()}"
+                catalogs.createCatalog(cat, "s3://$BUCKET/$cat")
+                catalogs.createNamespace(cat, "ns")
+                catalogs.createTable(cat, "ns", "t", defs)
+                // b twice, not a and b: a is over twice b's size, and the
+                // planner would not pack the two.
+                for ((i, name) in listOf("b", second).withIndex()) {
+                    val bytes = javaClass.getResourceAsStream("/variant/passthrough/$name.parquet")!!.readAllBytes()
+                    val path = "s3://$BUCKET/$cat/data/ns/t/$i-$name.parquet"
+                    store.put(path, bytes)
+                    val rows =
+                        ParquetFileReader.open(
+                            LocalInputFile(
+                                java.nio.file.Path.of(
+                                    javaClass.getResource("/variant/passthrough/$name.parquet")!!.toURI(),
+                                ),
+                            ),
+                        ).use {
+                            it.recordCount
+                        }
+                    commits.commit(
+                        cat,
+                        CommitRequest(
+                            appends =
+                                listOf(
+                                    TableAppend("ns", "t", listOf(FileRegistration(path, rows, bytes.size.toLong()))),
+                                ),
+                        ),
+                    )
+                }
+                Hydrator(db.jdbi, store).runOnce()
+                val result = svc.runOnce(cat, on)
+                assertThat(result.groupsCompacted).describedAs(second).isEqualTo(if (compacts) 1L else 0L)
+                assertThat(result.unconvertibleSchema).describedAs(second).isEqualTo(if (compacts) 0L else 1L)
+                assertThat(
+                    registry.find(
+                        "hoglake_compaction_variant_layout_mismatch_total",
+                    ).tag("catalog", cat).tag("reason", "layout").counter()?.count(),
+                )
+                    .describedAs(second)
+                    .isEqualTo(if (compacts) null else 1.0)
+            }
+        } finally {
+            com.posthog.hoglake.observability.Metrics.clear()
+            registry.close()
         }
     }
 
@@ -3039,6 +3123,93 @@ class CompactionServiceIntegrationTest {
             HetRow(20, null, 1),
             HetRow(30, 1.5, 2),
         )
+    }
+
+    @Test
+    fun `compacting an id-less group lifts the rename guard - the output carries ids and the inputs are ended`() {
+        // The whole arc of the field-id contract, end to end: an id-less
+        // file is committed with deferred stats, the sweep FLAGS it,
+        // rename_column is refused 409, compaction rewrites the group
+        // under the live schema (ids stamped on every node, the inputs
+        // end-snapshotted), and the same rename goes through. This is
+        // the remedy the 409's message prescribes, exercised rather than
+        // described.
+        val cat = "compact-idless-${counter.incrementAndGet()}"
+        catalogs.createCatalog(cat, "s3://$BUCKET/$cat")
+        catalogs.createNamespace(cat, "ns")
+        catalogs.createTable(
+            cat,
+            "ns",
+            "t",
+            listOf(ColumnDef("id", ColType.LONG, nullable = false), ColumnDef("name", ColType.STRING)),
+        )
+        val idlessSchema =
+            Types.buildMessage()
+                .addField(Types.required(PrimitiveTypeName.INT64).named("id"))
+                .addField(
+                    Types.optional(PrimitiveTypeName.BINARY).`as`(LogicalTypeAnnotation.stringType()).named("name"),
+                )
+                .named("t")
+        val paths =
+            (1..2).map { i ->
+                val bytes =
+                    customParquetBytes(
+                        idlessSchema,
+                        listOf({ g ->
+                            g.add("id", i.toLong())
+                            g.add("name", "row-$i")
+                        }),
+                    )
+                val path = "s3://$BUCKET/$cat/data/ns/t/idless-$i.parquet"
+                store.put(path, bytes)
+                commits.commit(
+                    cat,
+                    CommitRequest(
+                        appends =
+                            listOf(
+                                TableAppend("ns", "t", listOf(FileRegistration(path, 1, bytes.size.toLong()))),
+                            ),
+                    ),
+                )
+                path
+            }
+
+        fun flagged(): Map<String, Boolean> =
+            db.jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    """
+                    SELECT f.path, f.missing_field_ids FROM hog_data_file f
+                    JOIN hog_catalog c ON c.catalog_id = f.catalog_id
+                    WHERE c.name = :cat AND f.end_snapshot IS NULL
+                    """,
+                ).bind("cat", cat).map { rs, _ -> rs.getString("path") to rs.getBoolean("missing_field_ids") }
+                    .list().toMap()
+            }
+        val rename = listOf(AlterOp.RenameColumn("name", "label"))
+
+        // The class shares one database, so the sweep may also drain
+        // another test's pending files; what matters is these two.
+        assertThat(Hydrator(db.jdbi, store).runOnce()).isGreaterThanOrEqualTo(2)
+        assertThat(flagged()).containsExactlyInAnyOrderEntriesOf(paths.associateWith { true })
+        assertThatThrownBy { alter.alterTable(cat, "ns", "t", rename) }
+            .isInstanceOf(HoglakeException.IdlessFilesPresent::class.java)
+            .hasMessageContaining("2 id-less")
+
+        val result = svc.runOnce(cat, cfg)
+        assertThat(result.groupsCompacted).isEqualTo(1)
+        val output = catalogs.listFiles(cat, "ns", "t").single()
+        assertThat(output.path).isNotIn(paths)
+        // The output registers unflagged (compaction stamps an id on
+        // every node it writes) and the inputs are no longer live, so
+        // the guard's population is empty.
+        assertThat(flagged()).containsExactly(entry(output.path, false))
+        var outSchema: MessageType? = null
+        readGroups(store.get(output.path)) { s, _ -> outSchema = s }
+        assertThat(outSchema!!.getType("id").id.intValue()).isEqualTo(1)
+        assertThat(outSchema!!.getType("name").id.intValue()).isEqualTo(2)
+
+        val renamed = alter.alterTable(cat, "ns", "t", rename).columns.map { it.def.name }
+        assertThat(renamed).contains("label").doesNotContain("name")
     }
 
     @Test

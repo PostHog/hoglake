@@ -1,20 +1,59 @@
 openapi: 3.0.3
 info:
   title: hoglake
-  version: 1.4.5-dev
+  version: 1.4.8-dev
   description: |
     The hoglake control plane: a Postgres-native lakehouse catalog.
     Clients never touch the backing Postgres; parquet lives in object
     storage and is written by clients, registered here via
     footer-shipping commits. Row-level deletes are deletion vectors
     (client-written puffin DVs, registered like files). Retention is a
-    catalog property with a consumer-offset floor. Auth is out of scope
-    for v1.
+    catalog property with a consumer-offset floor.
+
+    ## Authentication
+
+    Every operation except the four marked `security: []` below
+    (`/livez`, `/healthz`, `/metrics`, `/info`) requires
+    `Authorization: Bearer <jwt>`; `/metrics` requires an OPERATOR
+    credential rather than none. The token is an ES256 compact JWS
+    issued by this instance, carrying the
+    caller's kind (`ten`), org (`org`), and — for a tenant — a `cat`
+    map from catalog name to the scopes held on it. Scopes are
+    PER-CATALOG, not global: `read`, `write`, `maintenance`, `admin`,
+    nested so that `admin` implies all of them and `maintenance`
+    implies `write`.
+
+    Two refusals are worth distinguishing, because they mean different
+    things to a client:
+
+    - **401** (`error`: `invalid_request`, `invalid_token`,
+      `token_expired`, `invalid_signature`, …) with a
+      `WWW-Authenticate: Bearer error="…"` challenge: no credential, or
+      one that does not verify. Renew and retry.
+    - **403** `forbidden`: the credential verifies and the catalog is
+      the caller's own, but it is short of the scope this route needs.
+    - **404** — NOT 403 — for a catalog the caller is not entitled to.
+      This is deliberate: a 403 would confirm the catalog exists and
+      turn an org id the caller was never given into an enumeration
+      oracle, so an unentitled catalog is indistinguishable from one
+      that does not exist.
+
+    Instance-wide operational surfaces (`/metrics`, `/v1/database/health`,
+    `/v1/debug/*`, `/v1/maintenance/{status,runs}`, `POST /v1/catalogs`)
+    are OPERATOR-only: they report across tenants and cannot be
+    meaningfully scoped. The per-catalog twins of the maintenance feeds
+    are the tenant-facing ones.
+
+    `author` (query or body) is ADJUDICATED, not trusted: for a tenant
+    token it must be absent or equal to the token's own subject, and is
+    otherwise filled in from it. A claim to any other name is 422.
 
     Malformed bodies/params and unknown request fields are 400
     bad_request; semantic failures are 422.
 servers:
   - url: /v1
+security:
+  - bearerAuth: []
 paths:
   # ---- operational endpoints (served at the ROOT, not under /v1) ----
   # Probe guidance: liveness -> /livez (process-only; a database outage
@@ -24,6 +63,7 @@ paths:
   # /openapi.yaml through to the server.
   /livez:
     servers: [{ url: / }]
+    security: []
     get:
       operationId: livez
       summary: >
@@ -38,6 +78,7 @@ paths:
               schema: { type: string, example: ok }
   /healthz:
     servers: [{ url: / }]
+    security: []
     get:
       operationId: healthz
       summary: >
@@ -53,6 +94,7 @@ paths:
           description: The catalog database did not answer inside the probe's deadline.
   /metrics:
     servers: [{ url: / }]
+    security: []
     get:
       operationId: metrics
       summary: Prometheus text exposition (scrape endpoint).
@@ -552,11 +594,13 @@ paths:
             Conflict. add_column and rename_column additionally fail with error
             `idless_files_present` while any LIVE data file of the table
             is flagged missing_field_ids (its parquet schema carries no
-            field ids): such files bind columns by name, so evolution
-            could misbind their history in readers. Files with pending or failed hydration also block both
-            operations until successfully hydrated. Rewrite
-            (compact) or retire the id-less files first. rename_table is
-            unaffected.
+            field ids, as the hydrator's footer read found): such files
+            bind columns by name, so evolution could misbind their
+            history in readers. Only a flagged file blocks; a file whose
+            footer has not been read (pending or failed hydration, or
+            registered with client-shipped stats) is trusted. The error
+            never clears on its own: rewrite (compact) or retire the
+            id-less files first. rename_table is unaffected.
 
 
             `table_recreated` when expected_table_uuid names an
@@ -568,8 +612,21 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
         "422":
-          description: Invalid op (unknown column, illegal promotion,
-            duplicate name, bad spec)
+          description: >
+            Invalid op (unknown column, illegal promotion, duplicate
+            name, bad spec), or an add_column whose column — or any
+            node nested inside it, a map's key excepted — has
+            `nullable: false`: hoglake has no column defaults, so files
+            written before the column read NULL for it. Refused on
+            every table, files or not; the detail names the offending
+            path. Also the object-prefix refusals: set_object_prefix_field
+            on a nested or non-integer column (uint64 included), on a
+            table whose spec lacks exactly one identity field on it, on a
+            table with live data files or deletion vectors, or naming a
+            different field than the one already set; and, while the
+            option is on, a set_partition_spec without exactly one
+            identity field on it, a drop_column or rename_column of it,
+            and a rename_table.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
@@ -860,6 +917,111 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+
+  /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/partitions/lookup:
+    post:
+      operationId: lookupPartition
+      summary: Exact partition metadata and bounded file pages at one snapshot
+      description: >
+        This metadata read requires catalog read scope despite using POST.
+        Requires a spec ID and its complete stored tuple, independently of
+        maintenance policies and sampled metadata. Head is resolved once;
+        subsequent pages use the snapshot, table incarnation and initial
+        file-ID ceiling in the cursor. Concurrent appends cannot extend the
+        scan beyond that ceiling.
+        File rows are physical rows, without subtracting deletion vectors.
+        Aggregates are exact only when the bounded candidate scan completes;
+        otherwise totals are null and file paging remains available. The
+        candidate budget uses the smallest bounded per-key value probe.
+        Probes run once per request, shared by aggregates and file paging,
+        reading at most tuple arity times 10,001 index entries in total. The index
+        includes other tables, specs, tuples and retained ended files, so
+        even a small partition can have unavailable totals. An empty
+        files page with a non-null next_cursor is scan progress, not an empty
+        partition. Only next_cursor=null ends pagination. File timestamp
+        bounds are not loaded by this endpoint; use the existing file stats
+        endpoint with the returned snapshot_id to inspect available bounds.
+        The existing file stats endpoint resolves namespace names at head;
+        historical inspection through a dropped/recreated namespace can
+        therefore return 404 there even while lookup metadata is retained.
+        at_timestamp is rejected; use an explicit snapshot for time travel.
+        Lookup statements share a 3-second request deadline, reduced by
+        admission and connection acquisition time (the pool separately bounds
+        acquisition at 5 seconds). Each statement uses the remaining deadline;
+        transaction_timeout is a separate higher backstop. At most two lookups
+        run per process and one per catalog. Admission waits at most 200 ms
+        with at most four waiting requests globally and two per catalog;
+        catalogs with an active lookup do not consume an execution slot while
+        waiting. No catalog commit lock is acquired.
+        Aggregates are computed only for the initial page; continuation
+        pages return unavailable totals with reason continuation.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+        - { $ref: "#/components/parameters/table" }
+        - name: spec_id
+          in: query
+          required: true
+          description: Explicit partition spec identity; never inferred from the current spec.
+          schema: { type: integer, format: int64, minimum: 1 }
+        - { $ref: "#/components/parameters/snapshot" }
+        - name: limit
+          in: query
+          required: false
+          description: Maximum files per page, from 1 to 500. Defaults to 100 on the first page; omitted on continuation, inherits the cursor limit. An explicit limit must match the cursor.
+          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+        - name: cursor
+          in: query
+          required: false
+          description: >
+            Opaque continuation from next_cursor. Bound to catalog, table
+            incarnation, spec, full tuple, resolved snapshot, initial file-ID
+            ceiling and effective limit. Repeat spec_id and the tuple body. If snapshot is supplied with
+            a cursor, it must match the cursor's snapshot. The unsigned cursor
+            detects inconsistent parameters, not deliberate forgery.
+          schema: { type: string, maxLength: 1024 }
+      requestBody:
+        required: true
+        description: >
+          Complete stored tuple as a JSON array in spec order, with all fields
+          supplied. Null, the empty string, and the string "null" are distinct.
+          Transformed values use their stored representation, not decoded dates.
+          The JSON text is limited to 65536 characters and the body to 262144 bytes.
+        content:
+          application/json:
+            schema:
+              type: array
+              minItems: 1
+              maxItems: 64
+              items: { type: string, nullable: true, maxLength: 8192 }
+            example: ["8817", "650", null]
+      responses:
+        "200":
+          description: Exact metadata or unavailable totals, plus one bounded file page.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PartitionLookup" }
+        "400":
+          description: Malformed, repeated, or mismatched lookup parameters or cursor.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "410": { $ref: "#/components/responses/Gone" }
+        "422":
+          description: Invalid spec identity, incomplete tuple, or snapshot outside the catalog range.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "503":
+          description: Lookup admission is busy or a statement timed out; never an empty result.
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying.
+              schema: { type: integer, example: 1 }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PartitionLookupUnavailableError" }
 
   /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/partitions/values:
     get:
@@ -1559,6 +1721,10 @@ paths:
                     Requires atomic-table-replacement-v1. Guard the target as observed at
                     read_snapshot; a null UUID requires absence. Publication rejects target
                     changes since that snapshot and replaces an existing incarnation atomically.
+                    A target with the object-prefix layout (Table.object_prefix_field) cannot
+                    be replaced, since the new incarnation would not carry the layout over:
+                    prepare refuses it with 422 `validation` and records nothing. Drop the
+                    table and create it instead.
                   required: [read_snapshot]
                   properties:
                     expected_table_uuid: { type: [string, "null"], format: uuid }
@@ -2048,7 +2214,23 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
         "422":
-          description: Invalid request, missing key, or key reused with another payload
+          description: >
+            Invalid request, missing key, or key reused with another
+            payload.
+            `object_prefix_violation` when a touched table has the
+            object-prefix layout (Table.object_prefix_field) and a data
+            file is not under `<field>=<value>/` for its identity
+            partition value, carries no canonical value for the field,
+            or has inline column stats that do not prove every row holds
+            the value (deferred stats are accepted and proven by the
+            hydrator from the footer) — or a deletion vector is not under
+            its target's prefix. The detail names the expected prefix and
+            up to five offending paths; the body names `tables` and
+            `retry: re-prepare`, because a payload written to the wrong
+            place cannot succeed on replay.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
         "503":
           description: Commit admission timed out; retry the identical request
 
@@ -2255,7 +2437,23 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
         "422":
-          description: Invalid request, missing key, or key reused with another payload
+          description: >
+            Invalid request, missing key, or key reused with another
+            payload.
+            `object_prefix_violation` when a touched table has the
+            object-prefix layout (Table.object_prefix_field) and a data
+            file is not under `<field>=<value>/` for its identity
+            partition value, carries no canonical value for the field,
+            or has inline column stats that do not prove every row holds
+            the value (deferred stats are accepted and proven by the
+            hydrator from the footer) — or a deletion vector is not under
+            its target's prefix. The detail names the expected prefix and
+            up to five offending paths; the body names `tables` and
+            `retry: re-prepare`, because a payload written to the wrong
+            place cannot succeed on replay.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
         "503":
           description: Commit admission timed out; retry the identical request
 
@@ -2361,7 +2559,23 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
         "422":
-          description: Invalid request, missing key, or key reused with another payload
+          description: >
+            Invalid request, missing key, or key reused with another
+            payload.
+            `object_prefix_violation` when a touched table has the
+            object-prefix layout (Table.object_prefix_field) and a data
+            file is not under `<field>=<value>/` for its identity
+            partition value, carries no canonical value for the field,
+            or has inline column stats that do not prove every row holds
+            the value (deferred stats are accepted and proven by the
+            hydrator from the footer) — or a deletion vector is not under
+            its target's prefix. The detail names the expected prefix and
+            up to five offending paths; the body names `tables` and
+            `retry: re-prepare`, because a payload written to the wrong
+            place cannot succeed on replay.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
         "503":
           description: Commit admission timed out; retry the identical request
 
@@ -2444,7 +2658,23 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
         "422":
-          description: Invalid request, missing key, or key reused with another payload
+          description: >
+            Invalid request, missing key, or key reused with another
+            payload.
+            `object_prefix_violation` when a touched table has the
+            object-prefix layout (Table.object_prefix_field) and a data
+            file is not under `<field>=<value>/` for its identity
+            partition value, carries no canonical value for the field,
+            or has inline column stats that do not prove every row holds
+            the value (deferred stats are accepted and proven by the
+            hydrator from the footer) — or a deletion vector is not under
+            its target's prefix. The detail names the expected prefix and
+            up to five offending paths; the body names `tables` and
+            `retry: re-prepare`, because a payload written to the wrong
+            place cannot succeed on replay.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
         "503":
           description: Commit admission timed out; retry the identical request
 
@@ -2543,7 +2773,23 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
         "422":
-          description: Invalid request, missing key, or key reused with another payload
+          description: >
+            Invalid request, missing key, or key reused with another
+            payload.
+            `object_prefix_violation` when a touched table has the
+            object-prefix layout (Table.object_prefix_field) and a data
+            file is not under `<field>=<value>/` for its identity
+            partition value, carries no canonical value for the field,
+            or has inline column stats that do not prove every row holds
+            the value (deferred stats are accepted and proven by the
+            hydrator from the footer) — or a deletion vector is not under
+            its target's prefix. The detail names the expected prefix and
+            up to five offending paths; the body names `tables` and
+            `retry: re-prepare`, because a payload written to the wrong
+            place cannot succeed on replay.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
         "503":
           description: Commit admission timed out; retry the identical request
 
@@ -2623,11 +2869,23 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
         "422":
-          description: Validation failure (unknown table, bad stats shape,
+          description: >
+            Validation failure (unknown table, bad stats shape,
             unknown field ids, duplicate delete target — a commit carries
             at most one superseding deletion vector per data file; merge
             deleted positions client-side and register the union; an
-            append carrying partition_values with no read_snapshot)
+            append carrying partition_values with no read_snapshot).
+            `object_prefix_violation` when a touched table has the
+            object-prefix layout (Table.object_prefix_field) and a data
+            file is not under `<field>=<value>/` for its identity
+            partition value, carries no canonical value for the field,
+            or has inline column stats that do not prove every row holds
+            the value (deferred stats are accepted and proven by the
+            hydrator from the footer) — or a deletion vector is not under
+            its target's prefix. The detail names the expected prefix and
+            up to five offending paths; the body names `tables` and
+            `retry: re-prepare`, because a payload written to the wrong
+            place cannot succeed on replay.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
@@ -2786,6 +3044,7 @@ paths:
               schema: { $ref: "#/components/schemas/ApiError" }
 
   /info:
+    security: []
     get:
       operationId: getInstanceInfo
       summary: >
@@ -2970,12 +3229,32 @@ paths:
         "409": { $ref: "#/components/responses/Conflict" }
 
 components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        An ES256 compact JWS issued by this instance. Minimum claim
+        set: `iss` (this instance), `aud`, `sub` (client id or
+        service-account subject), `jti`, `exp`, `iat`, `ten`
+        (`tenant` | `operator`), and for a tenant `org` plus a `cat`
+        map from catalog name to the scopes held on it. A token NEVER
+        carries an object-store credential: S3 access is vended
+        separately as short-lived, prefix-confined STS credentials, so
+        a leaked control-plane token cannot be replayed against the
+        bucket.
   parameters:
     operationAuthor:
       in: query
       name: author
       required: true
-      description: Caller-supplied attribution, not an authenticated identity. Missing or blank returns 422.
+      description: >
+        Attribution for the operation. ADJUDICATED, not trusted: for a
+        tenant token it must be absent or equal the token's own subject
+        (an omitted value is filled in from it), and a claim to any
+        other name returns 422. An OPERATOR may attribute work to
+        another name.
       schema: { type: string, minLength: 1 }
     operationMessage:
       in: query
@@ -3032,6 +3311,28 @@ components:
       schema: { type: integer }
 
   responses:
+    Unauthenticated:
+      description: >
+        No credential, or one that does not verify. `error` is a closed
+        vocabulary (`invalid_request`, `invalid_token`, `token_expired`,
+        `not_yet_valid`, `invalid_signature`, `unknown_signing_key`,
+        `invalid_audience`, `invalid_issuer`, `unsupported_algorithm`),
+        and the same value appears in the `WWW-Authenticate` challenge.
+      headers:
+        WWW-Authenticate:
+          schema: { type: string }
+          description: '`Bearer error="<reason>"`, per RFC 6750 §3, also sent on 401 responses.'
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
+    Forbidden:
+      description: >
+        The credential verifies and the catalog is the caller's own, but it
+        does not hold the scope this route requires. A catalog the caller is
+        NOT entitled to is 404, never 403 — a 403 would confirm it exists.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
     NotImplemented:
       description: Specified but not yet implemented.
       content:
@@ -3083,10 +3384,10 @@ components:
           type: array
           items: { type: string }
           description: >
-            Present on 409 ddl_since_read_snapshot and 409
-            table_recreated: the qualified `namespace.table` names the
-            refusal is about, so a caller knows which table info to
-            re-read without parsing `detail`.
+            Present on 409 ddl_since_read_snapshot, 409 table_recreated
+            and 422 object_prefix_violation: the qualified
+            `namespace.table` names the refusal is about, so a caller
+            knows which table info to re-read without parsing `detail`.
         read_snapshot:
           type: integer
           format: int64
@@ -3143,7 +3444,7 @@ components:
       properties:
         name: { type: string }
         data_path: { type: string }
-        capabilities: { type: array, items: { type: string }, description: "Includes atomic-table-creation-v1, idempotent-append-v1, idempotent-delete-v1, idempotent-mutation-v1, guarded-table-lifecycle-v1, atomic-table-replacement-v1 guarded-schema-evolution-v1 recursive-write-schema-v1 atomic-partitioned-table-creation-v1 atomic-sorted-table-creation-v1 and versioned-table-metadata-v1 and claimed-uploads-v1 and atomic-dml-transactions-v1 when supported" }
+        capabilities: { type: array, items: { type: string }, description: "Includes atomic-table-creation-v1, idempotent-append-v1, idempotent-delete-v1, idempotent-mutation-v1, guarded-table-lifecycle-v1, atomic-table-replacement-v1 guarded-schema-evolution-v1 recursive-write-schema-v1 atomic-partitioned-table-creation-v1 atomic-sorted-table-creation-v1 and versioned-table-metadata-v1 and claimed-uploads-v1 and atomic-dml-transactions-v1 and object-prefix-layout-v1 when supported" }
         head_snapshot_id: { type: integer, format: int64 }
         schema_version: { type: integer, format: int64 }
         earliest_snapshot_time:
@@ -3307,7 +3608,12 @@ components:
             which is the membership rule. VARIANT maps to Iceberg v3 variant and
             requires native Parquet VARIANT(1), with its field ID on the group.
             VARIANT has no whole-column statistics and cannot be a partition or
-            sort source. Scalar compaction skips tables containing VARIANT.
+            sort source. Compaction skips tables containing VARIANT unless
+            the server enables it (HOGLAKE_COMPACTION_VARIANT); then it copies
+            each VARIANT in the layout its declaration gives it, and skips
+            any compaction group holding a file in another VARIANT layout or
+            written by DuckDB, so that group's other files stay uncompacted
+            with it.
             A top-level VARIANT may declare the shredded layout of the files
             written to it in `type_params.shredding`.
 
@@ -3357,9 +3663,9 @@ components:
 
             A TOP-LEVEL `variant` takes `shredding`, the shredded layout
             that a writer which shreds VARIANT values (the Trino
-            connector) gives the column in its Parquet files: which
-            object fields and array elements get Parquet columns of
-            their own, and the Variant type of each. Readers use the
+            connector, pyhoglake) gives the column in its Parquet files:
+            which object fields and array elements get Parquet columns
+            of their own, and the Variant type of each. Readers use the
             layout each file's footer records, so a declaration never
             changes a read, and files written before it or without it
             stay as they are. A declaration is a tree of JSON objects,
@@ -3398,7 +3704,20 @@ components:
             variant. A two-phase creation prepared before these checks
             existed is re-checked when it is published, and becomes
             `rejected` with reason `definition_invalid`.
-        nullable: { type: boolean, default: true }
+        nullable:
+          type: boolean
+          default: true
+          description: >
+            Whether the column admits NULL. `false` is accepted at
+            create_table (no file predates the column) and required on
+            a map's `key`. Under an add_column it is a 422 at every
+            node of the added subtree except a map's key: hoglake has
+            no column defaults (nothing like Iceberg v3's
+            initial-default), so every file written before the alter
+            reads NULL for the new column, and a schema calling it
+            required would misreport those files to readers that trust
+            the flag. Refused unconditionally, even on a table with no
+            files.
         children:
           type: array
           items: { $ref: "#/components/schemas/ColumnDef" }
@@ -3648,6 +3967,34 @@ components:
             them is their age.
         partition_spec: { $ref: "#/components/schemas/PartitionSpec" }
         sort_spec: { $ref: "#/components/schemas/SortSpec" }
+        object_prefix_field:
+          type: string
+          description: >
+            The table's object-prefix field — a top-level integer
+            column — as of the snapshot this response was resolved at;
+            absent when the option is off there (set by the alter op
+            set_object_prefix_field, capability object-prefix-layout-v1;
+            there is no unset). While present, every data file and
+            deletion vector the table registers must live under
+            `<data_path>/data/<namespace>/<table>/<field>=<value>/`,
+            value the canonical decimal (no sign, no leading zero) of the
+            data file's identity partition value for the field — a
+            deletion vector's: its target's — and a data file's inline
+            column stats must prove every row holds it (both bounds equal
+            to the value, null_count 0). A commit that breaks any of this
+            is a 422 `object_prefix_violation`. A file registered with
+            deferred stats (no column_stats) is accepted under its prefix
+            and stays pending until the hydrator has made the same proof
+            from its parquet footer; a file whose footer does not prove
+            it is flipped to provided and quarantined server-side. The
+            flag is on no response yet: GET /scan returns such a file as
+            `provided`, indistinguishable from a proven one, and no
+            endpoint applies the per-value predicate (`stats_state =
+            'provided' AND NOT prefix_quarantined`). Compaction takes only
+            files that meet it as inputs and writes each output under its
+            group's prefix, with stats that prove the value, so a
+            deletion vector on an output follows the same rule. The name
+            cannot change while the option is on.
         snapshot_id:
           type: integer
           format: int64
@@ -3984,6 +4331,21 @@ components:
         element, a key or a value, and the container's shape is part of
         its type. Nested containers are also not promotable — promote a
         struct's LEAF field, which follows the ordinary scalar matrix.
+
+        `set_object_prefix_field` (`name`, a top-level column of type
+        int8, int16, int, long, uint8, uint16 or uint32) turns on the
+        object-prefix layout described on Table.object_prefix_field. It
+        is accepted only on a table with no live data file or deletion
+        vector whose partition spec has exactly one identity field on
+        the column (ops apply in order, so a set_partition_spec earlier
+        in the same request counts). Setting the field already set
+        changes nothing (the request still commits its DDL snapshot, as
+        every alter does); another field is a 422, and there is no
+        unset. While it
+        is on, set_partition_spec must keep exactly one identity field
+        on it, and drop_column/rename_column of it and rename_table are
+        refused. A server without capability object-prefix-layout-v1
+        answers 400 unknown alter op.
       properties:
         comment: { type: [string, "null"], maxLength: 16384, description: "set_table_comment or set_column_comment; null or absent removes the comment." }
         properties: { $ref: "#/components/schemas/CustomProperties" }
@@ -3991,15 +4353,26 @@ components:
           type: string
           enum: [add_column, drop_column, rename_column, promote_column,
                  rename_table, set_partition_spec, set_sort_order, add_column_with_metadata,
-                 set_table_comment, set_column_comment, set_properties]
-        column: { $ref: "#/components/schemas/ColumnDef" }   # add_column
+                 set_table_comment, set_column_comment, set_properties,
+                 set_object_prefix_field]
+        column:                       # add_column
+          allOf: [{ $ref: "#/components/schemas/ColumnDef" }]
+          description: >
+            The column to add, possibly nested (add_column and
+            add_column_with_metadata alike). Every node of it must
+            be nullable (a map's `key`, which the type model requires
+            non-null, excepted): hoglake has no column defaults, so
+            files written before the alter read NULL for the new
+            column, and a `nullable: false` anywhere in the subtree is
+            a 422 naming the path — on every table, files or not. See
+            ColumnDef.nullable.
         parent:                       # add_column, optional
           type: string
           description: >
             Dotted path of an existing STRUCT to append the new field
             to (new field id, ordinal = max sibling + 1). Absent = a new
             top-level column. Naming a list or a map here is a 422.
-        name: { type: string }        # drop_column, promote_column
+        name: { type: string }        # drop_column, promote_column, set_column_comment, set_object_prefix_field
         from: { type: string }        # rename_column
         to:
           type: string
@@ -4754,6 +5127,19 @@ components:
             field-id checked, flipped to provided with no per-column
             stats rows. Optional: absent from rows written before the
             counter existed, and the read path fills 0.
+        quarantined:
+          type: integer
+          format: int64
+          description: >
+            Of `hydrated`, the files of a table with the object-prefix
+            layout (Table.object_prefix_field) whose footer does not prove
+            that every row holds the value their prefix names (both
+            bounds equal to it, no nulls): flipped to provided with their
+            stats, and quarantined server-side
+            (`hog_data_file.prefix_quarantined`). The flag is not on the
+            wire, and GET /scan still returns these files as `provided`.
+            Counted below the size floor too. Optional, like
+            stats_skipped_below_floor.
 
     RehydrateResult:
       type: object
@@ -4914,7 +5300,10 @@ components:
           description: >
             Groups skipped because a live column's type cannot be
             produced from an input file's parquet type (outside identity
-            and the int->long / float->double promotions).
+            and the int->long / float->double promotions). With
+            HOGLAKE_COMPACTION_VARIANT on, also groups holding a VARIANT
+            input not in its declared layout or written by DuckDB, which
+            hoglake_compaction_variant_layout_mismatch_total counts apart.
         invalid_data:
           type: integer
           format: int64
@@ -5260,6 +5649,23 @@ components:
             OPTIONAL, for claimed_elsewhere's reason: the ledger holds
             rows written before it existed, and the read path fills 0
             for them.
+        object_prefix_unresolvable:
+          type: integer
+          format: int64
+          description: >
+            Groups of a table with the object-prefix layout
+            (Table.object_prefix_field) that the planner refused before
+            any IO because their prefix cannot be named: no partition
+            spec, no single identity field on the prefix column in their
+            spec, or a missing or non-canonical value there — or the
+            layout itself cannot be resolved (its column is not live, or
+            not of an allowed type), which refuses every group of the
+            table. The commit and DDL guards rule all four out, so a
+            nonzero count is a broken invariant or a row written around
+            the API, and the group is refused again on every sweep. Not charged to
+            HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN. Also
+            hoglake_compaction_skipped_total{reason="object_prefix_unresolvable"}.
+            Optional, for claimed_elsewhere's reason.
     RetirementResult:
       type: object
       required: [tables, rows_retired, dvs_retired, paths_queued, batches,
@@ -5577,7 +5983,8 @@ components:
             historical `verify` rows still inside the ledger's retention
             window.
             Hydrator loop rows carry HydratorSweepResult, the sweep's
-            per-catalog counts; manual hydrator rows carry
+            per-catalog counts (`quarantined` among them: files that
+            failed the object-prefix check); manual hydrator rows carry
             RehydrateResult.
 
     MaintenanceRunPage:
@@ -6129,6 +6536,84 @@ components:
             catalog's sample_reanchored (MaintenanceStatus) is above 0
             the scan judged later files at a newer snapshot, so this can
             name a snapshot after it.
+
+    PartitionLookup:
+      type: object
+      required: [snapshot_id, table_uuid, spec_id, values, aggregates, files, next_cursor]
+      properties:
+        snapshot_id: { type: integer, format: int64 }
+        table_uuid: { type: string, format: uuid }
+        spec_id: { type: integer, format: int64 }
+        values:
+          type: array
+          items: { type: string, nullable: true }
+        aggregates:
+          $ref: "#/components/schemas/PartitionLookupAggregates"
+        files:
+          type: array
+          items: { $ref: "#/components/schemas/DataFile" }
+        next_cursor:
+          type: string
+          nullable: true
+          description: Null only when all matching files have been examined.
+
+    PartitionLookupAggregates:
+      type: object
+      required: [status, reason, totals]
+      properties:
+        status: { type: string, enum: [exact, unavailable] }
+        reason:
+          type: string
+          nullable: true
+          enum: [candidate_scan_limit, overflow, continuation, null]
+          description: >
+            Null for exact totals. candidate_scan_limit means more indexed
+            candidates exist than the request budget, including unrelated
+            files. overflow means an exact total cannot fit in int64.
+            continuation means totals were not recomputed for this file page;
+            retain the initial page's aggregates.
+        totals:
+          $ref: "#/components/schemas/PartitionLookupTotals"
+
+    PartitionLookupTotals:
+      type: object
+      nullable: true
+      required: [file_count, physical_rows, total_bytes, dv_count, stats_state, last_file_write_snapshot]
+      properties:
+        file_count: { type: integer, format: int64 }
+        physical_rows:
+          type: integer
+          format: int64
+          description: Physical file rows; deletion vectors are not subtracted.
+        total_bytes: { type: integer, format: int64 }
+        dv_count:
+          type: integer
+          format: int64
+          description: Deletion vectors visible at snapshot_id on the matching files.
+        stats_state:
+          type: object
+          description: >
+            Current hydration state observed in this request's database
+            transaction for files visible at snapshot_id. Hydration state
+            is mutable and is not historical state at snapshot_id.
+          required: [provided, pending, failed]
+          properties:
+            provided: { type: integer, format: int64 }
+            pending: { type: integer, format: int64 }
+            failed: { type: integer, format: int64 }
+        last_file_write_snapshot:
+          type: integer
+          format: int64
+          nullable: true
+          description: Latest file write or rewrite; compaction can advance it. Not ingestion freshness.
+
+    PartitionLookupUnavailableError:
+      type: object
+      required: [error, detail, reason]
+      properties:
+        error: { type: string, enum: [partition_lookup_unavailable] }
+        detail: { type: string }
+        reason: { type: string, enum: [busy, timeout] }
 
     PartitionListing:
       type: object

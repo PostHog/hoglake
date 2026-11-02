@@ -40,6 +40,16 @@ static void HandleHoglakeOption(ClientContext &context, HoglakeOptions &options,
 		// UTC instead of being dropped; naive timestamps follow the
 		// session TimeZone — UTC by default)
 		options.snapshot_time = HoglakeTypes::CanonicalInstant(context, value);
+	} else if (lcase == "token") {
+		options.auth.token = value.ToString();
+	} else if (lcase == "token_url") {
+		options.auth.token_url = value.ToString();
+	} else if (lcase == "client_id") {
+		options.auth.client_id = value.ToString();
+	} else if (lcase == "client_secret") {
+		options.auth.client_secret = value.ToString();
+	} else if (lcase == "audience") {
+		options.auth.audience = value.ToString();
 	} else {
 		throw NotImplementedException("Unsupported option %s for hoglake", option);
 	}
@@ -67,6 +77,14 @@ static unique_ptr<Catalog> HoglakeAttach(optional_ptr<StorageExtensionInfo> stor
 	ParseAttachPath(options, info.path);
 	for (auto &entry : attach_options.options) {
 		HandleHoglakeOption(context, options, entry.first, entry.second);
+	}
+	// AttachedDatabase keeps these options after attach returns and
+	// duckdb_databases() prints them, so the secrets must not survive in them.
+	for (auto &entry : attach_options.options) {
+		auto lcase = StringUtil::Lower(entry.first);
+		if (lcase == "token" || lcase == "client_secret") {
+			entry.second = Value("<redacted>");
+		}
 	}
 	if (options.endpoint.empty()) {
 		Value endpoint_setting;
