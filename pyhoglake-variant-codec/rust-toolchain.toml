@@ -1,0 +1,4 @@
+# The stable Rust the codec is built and checked with (rustup reads this).
+[toolchain]
+channel = "1.91.1"
+components = ["clippy", "rustfmt"]

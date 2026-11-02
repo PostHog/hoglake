@@ -29,6 +29,7 @@ from pyhoglake import (
     ValidationError,
     VariantEncodingError,
     VariantReport,
+    _variant_backend,
     variant,
 )
 from pyhoglake import _variant_codec as codec
@@ -759,9 +760,17 @@ def test_unshredded_columns_report_no_paths():
 # -- chunks and rows that fail part-way ---------------------------------------
 
 
-def _encode(values, decl, **chunking):
+@pytest.fixture(params=["python", "auto"])
+def backend(request):
+    """The codec the budget tests encode with, through the hook: ``auto`` is
+    the Rust one wherever it encodes the plan when it is installed (JSON
+    text into an unshredded plan, for now), and Python elsewhere."""
+    return request.param
+
+
+def _encode(values, decl, backend, **chunking):
     report = VariantReport()
-    chunks = codec.encode(
+    chunks = _variant_backend.encode(
         values,
         codec.compile_plan(decl),
         report,
@@ -769,29 +778,30 @@ def _encode(values, decl, **chunking):
         column=None,
         nullable=True,
         on_invalid="null",
+        backend=backend,
         **chunking,
     )
     return chunks, report
 
 
-def test_chunks_are_capped_by_rows():
+def test_chunks_are_capped_by_rows(backend):
     rows = [f'{{"s":"{i}","tags":["{i}"]}}' for i in range(10)] + [None, "[]"]
-    chunks, _ = _encode(rows, DECL, chunk_rows=4)
+    chunks, _ = _encode(rows, DECL, backend, chunk_rows=4)
     assert [len(chunk) for chunk in chunks] == [4, 4, 4]
-    whole, _ = _encode(rows, DECL)
+    whole, _ = _encode(rows, DECL, backend)
     assert len(whole) == 1
     assert pa.chunked_array(chunks).combine_chunks().equals(whole[0])
 
 
-def test_chunks_are_capped_by_encoded_bytes():
+def test_chunks_are_capped_by_encoded_bytes(backend):
     # Each row is about 70 bytes of metadata, residual and typed strings;
     # a 150-byte cap closes a chunk every third row. Without the cap one
     # chunk would hold every row and a binary child could pass int32
     # offsets.
     rows = ['{"s":"' + "x" * 30 + '","other":"' + "y" * 20 + '"}'] * 7
-    chunks, _ = _encode(rows, DECL, chunk_bytes=150)
+    chunks, _ = _encode(rows, DECL, backend, chunk_bytes=150)
     assert [len(chunk) for chunk in chunks] == [3, 3, 1]
-    whole, _ = _encode(rows, DECL)
+    whole, _ = _encode(rows, DECL, backend)
     assert pa.chunked_array(chunks).combine_chunks().equals(whole[0])
 
 
@@ -800,17 +810,17 @@ def test_chunks_are_capped_by_encoded_bytes():
     [None, {"type": "variant"}, INT64, EVENT, LIST],
     ids=["undeclared", "root-variant", "unmatched-primitive", "object", "array"],
 )
-def test_bytes_kept_in_value_count_against_the_byte_cap(decl):
+def test_bytes_kept_in_value_count_against_the_byte_cap(decl, backend):
     # Every row is a 105-byte long string the declaration does not take,
     # so its bytes all land in a value column, beside 3 bytes of metadata:
     # a 250-byte cap closes a chunk every third row. The unshredded column
     # is the common case, and without the count only its metadata would
     # bound a chunk.
     rows = ['"' + "x" * 100 + '"'] * 7
-    chunks, _ = _encode(rows, decl, chunk_bytes=250)
+    chunks, _ = _encode(rows, decl, backend, chunk_bytes=250)
     assert [len(chunk) for chunk in chunks] == [3, 3, 1]
     # A chunk closes on reaching the cap, not only on passing it.
-    chunks, _ = _encode(rows, decl, chunk_bytes=216)
+    chunks, _ = _encode(rows, decl, backend, chunk_bytes=216)
     assert [len(chunk) for chunk in chunks] == [2, 2, 2, 1]
 
 
@@ -819,11 +829,11 @@ def test_bytes_kept_in_value_count_against_the_byte_cap(decl):
     [({"type": "string"}, "x" * 105), ({"type": "binary"}, b"x" * 105)],
     ids=["string", "binary"],
 )
-def test_typed_text_and_bytes_count_against_the_byte_cap(decl, value):
+def test_typed_text_and_bytes_count_against_the_byte_cap(decl, value, backend):
     # 105 bytes in the typed leaf, which is a binary child too, beside 3
     # of metadata: a 250-byte cap closes a chunk every third row.
     report = VariantReport()
-    chunks = codec.encode(
+    chunks = _variant_backend.encode(
         [value] * 7,
         codec.compile_plan(decl),
         report,
@@ -832,27 +842,28 @@ def test_typed_text_and_bytes_count_against_the_byte_cap(decl, value):
         nullable=True,
         on_invalid="raise",
         chunk_bytes=250,
+        backend=backend,
     )
     assert [len(chunk) for chunk in chunks] == [3, 3, 1]
     assert all(chunk.field("value").null_count == len(chunk) for chunk in chunks)
 
 
-def test_metadata_counts_against_the_byte_cap():
+def test_metadata_counts_against_the_byte_cap(backend):
     # Every value lands in a typed int64, so the row's dictionary is all the
     # binary bytes it adds: about 126 a row, a chunk every second row.
     names = ["k" * 40 + str(i) for i in range(3)]
     decl = {"type": "object", "fields": [{"name": n, "type": "int64"} for n in names]}
     rows = ["{" + ",".join(f'"{n}":1' for n in names) + "}"] * 5
-    chunks, _ = _encode(rows, decl, chunk_bytes=200)
+    chunks, _ = _encode(rows, decl, backend, chunk_bytes=200)
     assert [len(chunk) for chunk in chunks] == [2, 2, 1]
     assert all(chunk.field("value").null_count == len(chunk) for chunk in chunks)
 
 
-def test_list_elements_count_against_the_byte_cap():
+def test_list_elements_count_against_the_byte_cap(backend):
     # Typed numbers add no binary bytes, but list offsets are int32 too.
     decl = {"type": "array", "element": {"type": "int64"}}
     rows = ["[" + ",".join(["1"] * 100) + "]"] * 3
-    chunks, _ = _encode(rows, decl, chunk_bytes=150)
+    chunks, _ = _encode(rows, decl, backend, chunk_bytes=150)
     assert [len(chunk) for chunk in chunks] == [2, 1]
 
 
@@ -876,7 +887,7 @@ def test_large_input_comes_back_chunked():
         '{"s":"ok","z":"\\ud800"}',
     ],
 )
-def test_a_row_that_fails_part_way_leaves_nothing_behind(bad):
+def test_a_row_that_fails_part_way_leaves_nothing_behind(bad, backend):
     rows = ['{"s":"a","tags":["p"]}', bad, '{"s":"b","tags":["q","r"]}']
     encoded = variant.encode_json(rows, shredding=DECL, on_invalid="null")
     assert variant.to_python(encoded.array, shredding=DECL) == [
@@ -885,7 +896,7 @@ def test_a_row_that_fails_part_way_leaves_nothing_behind(bad):
         {"s": "b", "tags": ["q", "r"]},
     ]
     variant.verify(encoded.array, shredding=DECL)
-    chunks, _ = _encode([bad, *rows], DECL, chunk_rows=2)
+    chunks, _ = _encode([bad, *rows], DECL, backend, chunk_rows=2)
     assert sum(len(chunk) for chunk in chunks) == 4
 
 

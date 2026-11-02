@@ -139,6 +139,62 @@ jobs:
       - name: Variant suites
         run: uv run --no-sync pytest -m "not integration" -q -k variant
 
+  # The Rust VARIANT codec, pyhoglake-variant-codec (design-native-
+  # encoder §6): its Rust checks, then the member built into the workspace
+  # env and the variant suites run through it. `auto` takes the Rust codec
+  # for what it encodes, and conftest fails any fallback to Python; the
+  # randomized differential runs at 100k rows. UV_NO_SYNC after the sync:
+  # a plain `uv run` would sync the group away.
+  variant-codec:
+    name: Variant codec (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    env:
+      UV_PYTHON: "3.13"
+    defaults:
+      run:
+        working-directory: pyhoglake-variant-codec
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+
+      # rust-toolchain.toml's version (rustup installed first where the
+      # runner image lacks it), with no cache and no RUSTFLAGS of its own.
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          rust-src-dir: pyhoglake-variant-codec
+          cache: false
+          rustflags: ""
+
+      - name: Rust checks
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo test --locked
+
+      - name: Build the codec into the workspace env
+        working-directory: pyhoglake
+        run: |
+          uv sync --locked --group variant-codec
+          echo "UV_NO_SYNC=1" >> "$GITHUB_ENV"
+
+      - name: Variant suites through the codec
+        working-directory: pyhoglake
+        env:
+          HOGLAKE_URL: http://127.0.0.1:9
+          HOGLAKE_S3_ENDPOINT: http://127.0.0.1:9
+          PYHOGLAKE_VARIANT_DIFFERENTIAL_ROWS: "100000"
+        run: |
+          uv run python -c "from pyhoglake import _variant_backend as b; m, why = b.native(); assert m, why"
+          uv run pytest -m "not integration" -q -k variant
+
   build:
     name: Build sdist and wheel
     runs-on: ubuntu-latest

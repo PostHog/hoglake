@@ -1,0 +1,26 @@
+# pyhoglake's VARIANT codec in Rust, built by maturin as an abi3 wheel; a
+# uv workspace member whose static metadata locks without a build.
+[project]
+name = "pyhoglake-variant-codec"
+version = "1.4.8.dev0"
+description = "pyhoglake's VARIANT value codec (private to pyhoglake)"
+license = "MIT"
+authors = [{ name = "PostHog" }]
+requires-python = ">=3.12"
+
+[build-system]
+requires = ["maturin>=1.16,<2"]
+build-backend = "maturin"
+
+[tool.maturin]
+features = ["python"]
+module-name = "pyhoglake_variant_codec"
+
+[tool.uv]
+# Rebuild the editable install when the Rust changes.
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "Cargo.toml" },
+    { file = "Cargo.lock" },
+    { file = "src/**/*.rs" },
+]

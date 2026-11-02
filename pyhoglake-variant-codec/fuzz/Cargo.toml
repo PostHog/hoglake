@@ -1,0 +1,25 @@
+# cargo-fuzz targets for the codec (fuzz.yml runs them nightly).
+[package]
+name = "pyhoglake-variant-codec-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arrow-array = "59.3"
+libfuzzer-sys = "0.4.13"
+parquet-variant = "59.3"
+pyhoglake-variant-codec = { path = ".." }
+serde_json = { version = "1", features = ["arbitrary_precision", "float_roundtrip", "unbounded_depth"] }
+
+[[bin]]
+name = "encode_json"
+path = "fuzz_targets/encode_json.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

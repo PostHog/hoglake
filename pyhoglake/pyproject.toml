@@ -80,6 +80,15 @@ dev = [
     "boto3>=1.43.118",
 ]
 
+# The Rust VARIANT codec, a workspace member that _variant_backend uses
+# when it is installed: `uv sync --group variant-codec` builds it (Rust
+# needed). A group, not an extra, so that no release names the package
+# before it is published and its name claimed (N3).
+variant-codec = ["pyhoglake-variant-codec"]
+
+[tool.uv.sources]
+pyhoglake-variant-codec = { workspace = true }
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
@@ -120,7 +129,7 @@ python_version = "3.12"
 
 [[tool.mypy.overrides]]
 # pyarrow ships no type information.
-module = ["pyarrow", "pyarrow.*", "thrift", "thrift.*", "boto3", "botocore", "botocore.*"]
+module = ["pyarrow", "pyarrow.*", "thrift", "thrift.*", "boto3", "botocore", "botocore.*", "pyhoglake_variant_codec"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
