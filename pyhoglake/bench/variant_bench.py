@@ -9,12 +9,12 @@ golden_storage.arrow, not this). Run it on the interpreter you deploy:
 
 The rows imitate posthog-js ``properties``: about 1 KB of compact JSON and
 26 top-level keys, with a nested ``$set`` object, a feature-flag array,
-URLs, a user agent and a few numbers. The declaration shreds the 12 keys a
-writer would most likely declare, an array of strings among them. The
-generator is seeded, so two runs encode the same text. ``--payload dev``
-pads each row to about 4.3 KB, mw-dev's average, with the keys a dev
-event adds. PYHOGLAKE_VARIANT_CODEC picks the codec; the Rust one
-encodes the unshredded column only, so far.
+URLs, a user agent and a few numbers. One declaration shreds the 12 keys a
+writer would most likely declare, an array of strings among them; the
+other is millrace's properties_sv, 16 string fields. The generator is
+seeded, so two runs encode the same text. ``--payload dev`` pads each row
+to about 4.3 KB, mw-dev's average, with the keys a dev event adds.
+PYHOGLAKE_VARIANT_CODEC picks the codec.
 """
 
 from __future__ import annotations
@@ -53,6 +53,17 @@ SHREDDING_12 = {
         },
     ],
 }
+
+#: millrace's properties_sv declaration on ingest.events.
+MILLRACE_16 = {
+    "type": "object",
+    "fields": [
+        {"name": name, "type": "string"}
+        for name in ("$session_id", "$window_id", *(f"$group_{i}" for i in range(5)),
+                     "$current_url", "$pathname", "$host", "$browser", "$os",
+                     "$device_type", "$lib", "$referring_domain", "$device_id")
+    ],
+}  # fmt: skip
 
 _PATHS = ["/dashboard", "/insights/new", "/events", "/persons", "/feature_flags",
           "/sessions", "/settings", "/web-analytics", "/experiments", "/surveys"]  # fmt: skip
@@ -147,17 +158,17 @@ def main() -> None:
     unshredded = run(None)
     print(
         f"python {platform.python_implementation()} {sys.version.split()[0]}, "
-        f"pyarrow {pa.__version__}, {platform.machine()}, codec {_variant_backend.mode()}"
+        f"pyarrow {pa.__version__}, {platform.machine()}, codec {_variant_backend.MODE}"
     )
     print(f"{len(rows)} rows, {size:.0f} B and {keys:.1f} top-level keys a row")
     print(
         f"encode_json, unshredded:           {unshredded:.2f} us/row "
         f"({unshredded * 1000 / size:.2f} us/KB), CPU time, best of {args.repeat}"
     )
-    if _variant_backend.mode() != "native":
-        shredded = run(SHREDDING_12)
+    for name, shredding in (("12-field", SHREDDING_12), ("millrace", MILLRACE_16)):
+        shredded = run(shredding)
         print(
-            f"encode_json, 12-field declaration: {shredded:.2f} us/row "
+            f"encode_json, {name + ' declaration:':21} {shredded:.2f} us/row "
             f"({shredded * 1000 / size:.2f} us/KB)"
         )
 

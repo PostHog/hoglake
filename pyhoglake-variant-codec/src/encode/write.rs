@@ -30,7 +30,7 @@ fn put(out: &mut Vec<u8>, width: usize, n: usize) {
 }
 
 /// The index after the value at `at`.
-fn next(s: &Scratch, at: u32) -> u32 {
+pub fn next(s: &Scratch, at: u32) -> u32 {
     match s.toks[at as usize] {
         Tok::Array(_, end) | Tok::Object(_, end, _) => end,
         _ => at + 1,
@@ -153,18 +153,23 @@ pub fn value(s: &Scratch, text: &[u8], b: &mut Bufs, at: u32, out: &mut Vec<u8>)
             }
             header(s, b, out, start, offsets, None);
         }
-        Tok::Object(len, _, slot) => {
-            // Values in field-id order, which is key order (VE:454-465).
-            let (start, offsets, keys) = (out.len(), b.offsets.len(), &s.slots[(slot - len) as usize..slot as usize]);
-            for &key in keys {
-                b.offsets.push(out.len() - start);
-                let child = s.keys[key as usize].tok + 1;
-                value(s, text, b, child, out).map_err(|fault| fault.step(Step::Key(s.key(text, key).to_vec())))?;
-            }
-            header(s, b, out, start, offsets, Some(keys));
-        }
+        Tok::Object(len, _, slot) => fields(s, text, b, &s.slots[(slot - len) as usize..slot as usize], out)?,
         Tok::Key(_) => unreachable!("a key is read with its object"),
     }
+    Ok(())
+}
+
+/// Appends an object of `keys`, in field-id order: a whole object, or the
+/// residual of a shredded one (`_encode_fields`).
+pub fn fields(s: &Scratch, text: &[u8], b: &mut Bufs, keys: &[u32], out: &mut Vec<u8>) -> Result<(), Fault> {
+    // Values in field-id order, which is key order (VE:454-465).
+    let (start, offsets) = (out.len(), b.offsets.len());
+    for &key in keys {
+        b.offsets.push(out.len() - start);
+        let child = s.keys[key as usize].tok + 1;
+        value(s, text, b, child, out).map_err(|fault| fault.step(Step::Key(s.key(text, key).to_vec())))?;
+    }
+    header(s, b, out, start, offsets, Some(keys));
     Ok(())
 }
 

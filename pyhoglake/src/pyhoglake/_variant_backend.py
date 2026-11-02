@@ -2,27 +2,34 @@
 pyhoglake-variant-codec, or the Python one, its reference while both exist.
 Private, and goes with the Python codec.
 
-``PYHOGLAKE_VARIANT_CODEC``: ``auto`` (the default) uses Rust when it
-imports with this PROTOCOL and pyhoglake's version, for what it takes (JSON
-text into an unshredded plan, so far); ``native`` requires it, and raises
-where it is missing or does not take the input or plan; ``python`` never
-uses it. A Rust result is checked first: an invalid row whose reason or
-path Python does not give (``mismatch``), storage not of the plan's type
+``PYHOGLAKE_VARIANT_CODEC``, read at import: ``auto`` (the default) uses
+Rust when it imports with this PROTOCOL and pyhoglake's version, for what it
+takes (JSON text, shredded or not, so far); ``native`` requires it, and
+raises where it is missing or does not take the input or plan; ``python``
+never uses it. A Rust result is checked first: an invalid row whose reason
+or path Python does not give (``mismatch``), storage not of the plan's type
 (``type``) or a panic (``panic``) re-encodes the call in Python rather than
 raise, which would strand a millrace group in staging; each is counted in
 ``VariantReport.codec_fallbacks`` and logged. Where either parser stopped
 at its recursion bound (CPython's moves with its stack), Python's verdict
 on the row stands, counted as ``recursion_bound``.
+
+``PYHOGLAKE_VARIANT_SHADOW``, a fraction from 0 (the default) to 1 read
+at import, encodes that share of the calls Rust took in Python too, in
+``VariantReport.shadow_seconds``. Where the two differ, in counts or in any
+slot of the storage (``shadow_mismatch``), Python's result is used.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import random
 import sys
 import time
 from contextlib import suppress
-from functools import cache, partial
+from dataclasses import replace
+from functools import cache, lru_cache, partial
 from importlib import metadata
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Literal
@@ -35,8 +42,9 @@ from .errors import VariantEncodingError
 if TYPE_CHECKING:
     from .variant import VariantReport
 
-PROTOCOL = 1
+PROTOCOL = 2
 ENV = "PYHOGLAKE_VARIANT_CODEC"
+SHADOW_ENV = "PYHOGLAKE_VARIANT_SHADOW"
 Backend = Literal["auto", "native", "python"]
 _log = logging.getLogger(__name__)
 
@@ -46,6 +54,20 @@ def mode() -> Backend:
     if chosen not in ("auto", "native", "python"):
         raise ValueError(f"{ENV} is auto, native or python, not {chosen!r}")
     return chosen  # type: ignore[return-value]
+
+
+def shadow() -> float:
+    """The share of Rust's calls that Python encodes again to compare."""
+    text = os.environ.get(SHADOW_ENV) or "0"
+    with suppress(ValueError):
+        if 0 <= (fraction := float(text)) <= 1:
+            return fraction
+    raise ValueError(f"{SHADOW_ENV} is a fraction from 0 to 1, not {text!r}")
+
+
+#: Read once: a malformed value fails the import, not every encode, which
+#: would strand a millrace group in staging.
+MODE, SHADOW = mode(), shadow()
 
 
 @cache
@@ -63,6 +85,23 @@ def native() -> tuple[ModuleType | None, str]:
     return module, ""
 
 
+@lru_cache(maxsize=256)
+def _plan(module: ModuleType, plan: codec.Plan) -> tuple[Any, tuple[str, ...], str]:
+    """Rust's plan, from the write form, and the path of each node it counts
+    (every node with a type, in the order Python's ``count`` visits them);
+    or None and why it is not taken."""
+    paths, nodes = [], [plan.root]
+    while nodes:
+        node = nodes.pop()
+        if node is not None and node.kind != "variant":
+            paths.append(node.path)
+            nodes += [node.element, *reversed([child for _, child in node.fields])]
+    try:
+        return module.Plan(plan.write_type), tuple(paths), ""
+    except ValueError as exc:
+        return None, (), f"it does not take this plan ({exc})"
+
+
 def encode(
     values: Any,
     plan: codec.Plan,
@@ -78,17 +117,18 @@ def encode(
 ) -> list[pa.StructArray]:
     """``codec.encode`` through ``backend``, or the switch's. JSON text
     comes as :func:`pyhoglake.variant.encode_json` takes it."""
-    from .variant import _add_counts, _binary_chunks, _json_rows
+    from .variant import VariantReport, _binary_chunks, _json_rows
 
-    chosen = backend or mode()
+    chosen = backend or MODE
     module, why = native() if chosen != "python" else (None, "")
     chunks = None
     if module is not None:
-        if not json_text or plan.root is not None:
-            why = "it encodes JSON text into an unshredded plan only, so far"
-        elif isinstance(values, (pa.Array, pa.ChunkedArray)):
+        native_plan, paths, why = _plan(module, plan)
+        if not json_text:
+            why = "it encodes JSON text only, so far"
+        elif not why and isinstance(values, (pa.Array, pa.ChunkedArray)):
             chunks = _binary_chunks(values)
-        else:
+        elif not why:
             values = list(values)
             why = "a row is not UTF-8 text"
             if all(type(v) in (str, bytes) or v is None for v in values):
@@ -97,7 +137,6 @@ def encode(
     python = partial(
         codec.encode,
         plan=plan,
-        report=report,
         json_text=json_text,
         column=column,
         nullable=nullable,
@@ -108,12 +147,13 @@ def encode(
     if module is None or chunks is None:
         if chosen == "native":
             raise RuntimeError(f"{ENV}=native, but {why}")
-        return python(_json_rows(values) if json_text else values)
+        return python(_json_rows(values) if json_text else values, report=report)
 
     started = time.perf_counter()
     try:
-        out, rows, sql_null_rows, invalid = module.encode_json(
+        out, rows, sql_null_rows, invalid, counts = module.encode_json(
             chunks,
+            native_plan,
             nullable=nullable,
             raise_on_invalid=on_invalid == "raise",
             chunk_rows=chunk_rows,
@@ -127,20 +167,69 @@ def encode(
     report.encode_seconds += time.perf_counter() - started
     if fault is not None:
         _fall_back(*fault, column, report)
-        return python(_json_rows(values))
-    _add_counts(report.codec_fallbacks, {"recursion_bound": bounded} if bounded else {})
+        return python(_json_rows(values), report=report)
+    mine = VariantReport(
+        codec_fallbacks={"recursion_bound": bounded} if bounded else {}
+    )
     for row, reason, path, detail in invalid:
         if on_invalid == "raise" or reason == "sql_null_in_not_null":
             message = codec._message(column, row, path, detail)
             raise VariantEncodingError(
                 message, column=column, row=row, path=path, reason=reason
             )
-        report.invalid_rows += 1
-        report.invalid_by_reason[reason] = report.invalid_by_reason.get(reason, 0) + 1
-        report.first_invalid = report.first_invalid or (column, row, reason, path)
-    report.rows += rows
-    report.sql_null_rows += sql_null_rows
+        mine.invalid_rows += 1
+        mine.invalid_by_reason[reason] = mine.invalid_by_reason.get(reason, 0) + 1
+        mine.first_invalid = mine.first_invalid or (column, row, reason, path)
+    mine.rows, mine.sql_null_rows = rows, sql_null_rows
+    for path, (typed, fallback, variant_null) in zip(paths, counts, strict=True):
+        mine.typed[column, path] = typed
+        mine.fallback[column, path] = fallback
+        mine.variant_null[column, path] = variant_null
+    if random.random() < SHADOW:
+        return _shadow(out, mine, partial(python, _json_rows(values)), column, report)
+    report.merge(mine)
     return out
+
+
+def _shadow(
+    out: list[pa.StructArray],
+    mine: VariantReport,
+    python: Any,
+    column: str | None,
+    report: VariantReport,
+) -> list[pa.StructArray]:
+    """Rust's result, or Python's where the two differ in counts, a raise
+    or any slot of the storage (``Array.equals`` would take -0.0 for 0.0
+    and skip the placeholders under null parents)."""
+    from .variant import VariantReport, _storage_slots
+
+    def counted(r: VariantReport) -> VariantReport:
+        return replace(r, encode_seconds=0.0, codec_fallbacks={})
+
+    theirs = VariantReport()
+    started = time.perf_counter()
+    try:
+        expected, error = python(report=theirs), None
+    except VariantEncodingError as exc:
+        expected, error = [], exc
+    same = (
+        error is None
+        and counted(mine) == counted(theirs)
+        and len(out) == len(expected)
+        and all(
+            _storage_slots(a) == _storage_slots(b)
+            for a, b in zip(out, expected, strict=True)
+        )
+    )
+    report.shadow_seconds += time.perf_counter() - started
+    if same:
+        report.merge(mine)
+        return out
+    _fall_back("shadow_mismatch", None, column, report)
+    if error is not None:
+        raise error
+    report.merge(replace(theirs, encode_seconds=0.0))
+    return expected
 
 
 def _fall_back(
