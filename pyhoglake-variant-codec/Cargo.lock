@@ -703,6 +703,7 @@ version = "0.0.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
+ "arrow-data",
  "arrow-schema",
  "parquet-variant",
  "pyo3",

@@ -1,10 +1,12 @@
-//! JSON text to unshredded VARIANT storage (no declaration, or a root
-//! `variant`): `_variant_codec.encode` with `json_text=True`, row for row,
-//! chunk for chunk, fault for fault. A row's faults come in its order: bad
-//! UTF-8; the parse's, in text order; depth; a key with an unpaired
-//! surrogate; the values', in field-id order. A failed row adds no bytes.
+//! JSON text to VARIANT storage, shredded as a plan lays it out:
+//! `_variant_codec.encode` with `json_text=True`, row for row, chunk for
+//! chunk, fault for fault. A row's faults come in its order: bad UTF-8; the
+//! parse's, in text order; depth; a key with an unpaired surrogate; the
+//! values', in the order the shredder places them. A failed row keeps what
+//! its placed values added to the chunk's budget, as the Python codec's.
 
 mod parse;
+mod shred;
 mod write;
 
 use std::sync::Arc;
@@ -16,6 +18,7 @@ use arrow_schema::{DataType, Field, Fields};
 
 use crate::consts::{MAX_DEPTH, PATH_CAP};
 pub use parse::PARSE_DEPTH;
+pub use shred::Plan;
 
 /// How one call encodes. `stop_at_invalid` is `on_invalid="raise"`;
 /// `max_int_digits` is `sys.get_int_max_str_digits()`, 0 for none; the last
@@ -199,13 +202,19 @@ impl Chunk {
         self.present.push(present);
     }
 
-    fn build(self) -> StructArray {
+    /// The chunk's storage: its metadata, then the unshredded value or the
+    /// root group's columns.
+    fn build(self, fields: &Fields, root: Option<&mut shred::Group>) -> StructArray {
         let binary = |ends: Vec<i32>, bytes: Vec<u8>| -> ArrayRef {
             Arc::new(BinaryArray::new(OffsetBuffer::new(ScalarBuffer::from(ends)), Buffer::from_vec(bytes), None))
         };
         let nulls = (self.nulls > 0).then(|| NullBuffer::from(self.present));
-        let children = vec![binary(self.metadata_ends, self.metadata), binary(self.value_ends, self.value)];
-        StructArray::new(storage_fields(), children, nulls)
+        let mut children = vec![binary(self.metadata_ends, self.metadata)];
+        match root {
+            None => children.push(binary(self.value_ends, self.value)),
+            Some(root) => children.extend(root.build()),
+        }
+        StructArray::new(fields.clone(), children, nulls)
     }
 }
 
@@ -218,10 +227,15 @@ pub struct Encoded {
     /// Each row not written, and why. With `stop_at_invalid` the call ends
     /// at the first, a SQL NULL into a NOT NULL target among them.
     pub invalid: Vec<(usize, Fault)>,
+    /// Typed, fallback and Variant-null counts of each declared node with a
+    /// type, in declaration order (`VariantReport.typed` and its kin).
+    pub counts: Vec<[usize; 3]>,
 }
 
 struct Encoder<'o> {
     o: &'o Options,
+    fields: &'o Fields,
+    root: Option<shred::Group>,
     tape: parse::Scratch,
     bufs: write::Bufs,
     chunk: Chunk,
@@ -240,12 +254,12 @@ impl Encoder<'_> {
                 return false;
             }
             None => {
-                self.chunk.end_row(false);
+                self.end_row(false);
                 self.out.sql_null_rows += 1;
             }
             Some(text) => {
                 let result = self.encode_row(text);
-                self.chunk.end_row(result.is_ok());
+                self.end_row(result.is_ok());
                 if let Err(fault) = result {
                     self.out.invalid.push((row, fault));
                     if self.o.stop_at_invalid {
@@ -255,10 +269,23 @@ impl Encoder<'_> {
             }
         }
         if self.chunk.present.len() >= self.o.chunk_rows || self.chunk.used >= self.o.chunk_bytes {
-            let full = std::mem::replace(&mut self.chunk, Chunk::new());
-            self.out.chunks.push(full.build());
+            self.close();
         }
         true
+    }
+
+    /// Ends the row; one not written is a null row over placeholders.
+    fn end_row(&mut self, present: bool) {
+        if let Some(root) = self.root.as_mut().filter(|_| !present) {
+            root.truncate(self.chunk.present.len());
+            root.absent();
+        }
+        self.chunk.end_row(present);
+    }
+
+    fn close(&mut self) {
+        let full = std::mem::replace(&mut self.chunk, Chunk::new());
+        self.out.chunks.push(full.build(self.fields, self.root.as_mut()));
     }
 
     fn encode_row(&mut self, text: &[u8]) -> Result<(), Fault> {
@@ -277,7 +304,11 @@ impl Encoder<'_> {
             return Err(Fault::along(write::path_to(&self.tape, text, container), "nesting_too_deep", detail));
         }
         write::metadata(&self.tape, text, &mut self.bufs, &mut self.chunk.metadata)?;
-        write::value(&self.tape, text, &mut self.bufs, 0, &mut self.chunk.value)
+        let (s, b, used) = (&self.tape, &mut self.bufs, &mut self.chunk.used);
+        match &mut self.root {
+            None => write::value(s, text, b, 0, &mut self.chunk.value),
+            Some(root) => root.add(&mut shred::Row { s, text, b, used }, 0),
+        }
     }
 
     fn rows<'a>(&mut self, array: impl ArrayAccessor<Item = &'a [u8]>) -> bool {
@@ -286,25 +317,29 @@ impl Encoder<'_> {
 }
 
 /// Encodes the rows of `inputs`, Arrow binary (`binary`, `large_binary`,
-/// `binary_view`) or null arrays, into chunks of unshredded storage.
-pub fn encode_json(inputs: &[ArrayRef], o: &Options) -> Result<Encoded, String> {
+/// `binary_view`) or null arrays, into chunks of `plan`'s storage.
+pub fn encode_json(inputs: &[ArrayRef], plan: &Plan, o: &Options) -> Result<Encoded, String> {
     let (tape, bufs, chunk, out) =
         (parse::Scratch::default(), write::Bufs::default(), Chunk::new(), Encoded::default());
-    let mut e = Encoder { o, tape, bufs, chunk, out };
+    let mut e = Encoder { o, fields: &plan.fields, root: plan.root.clone(), tape, bufs, chunk, out };
+    let mut stopped = false;
     for array in inputs {
-        let go = match array.data_type() {
+        stopped = !match array.data_type() {
             DataType::Binary => e.rows(array.as_binary::<i32>()),
             DataType::LargeBinary => e.rows(array.as_binary::<i64>()),
             DataType::BinaryView => e.rows(array.as_binary_view()),
             DataType::Null => (0..array.len()).all(|_| e.row(None)),
             other => return Err(format!("JSON text comes as Arrow binary, not {other}")),
         };
-        if !go {
-            return Ok(e.out);
+        if stopped {
+            break;
         }
     }
-    if !e.chunk.present.is_empty() || e.out.chunks.is_empty() {
-        e.out.chunks.push(e.chunk.build());
+    if !stopped && (!e.chunk.present.is_empty() || e.out.chunks.is_empty()) {
+        e.close();
+    }
+    if let Some(root) = &e.root {
+        root.counts(&mut e.out.counts);
     }
     Ok(e.out)
 }

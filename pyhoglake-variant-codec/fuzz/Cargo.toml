@@ -10,6 +10,7 @@ cargo-fuzz = true
 
 [dependencies]
 arrow-array = "59.3"
+arrow-schema = "59.3"
 libfuzzer-sys = "0.4.13"
 parquet-variant = "59.3"
 pyhoglake-variant-codec = { path = ".." }

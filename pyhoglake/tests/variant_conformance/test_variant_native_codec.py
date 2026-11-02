@@ -1,7 +1,9 @@
 """The Rust VARIANT codec (pyhoglake-variant-codec) against the Python one,
-its reference while both exist: the same chunks, storage byte for byte,
-reports, reasons, paths and messages, for JSON text into an unshredded
-plan, which is what it encodes so far.
+its reference while both exist: the same chunks, storage byte for byte
+(every slot of every child, the placeholders under null parents too),
+reports, reasons, paths and messages, for JSON text under any declaration:
+unshredded, millrace's, every accepted one of the shredding vectors, and
+ones the randomized rows' keys fill.
 
 Skipped where the package is not installed: `uv sync --group
 variant-codec` builds it, and CI's variant-codec job checks it imports
@@ -11,19 +13,25 @@ of the randomized differential (a PR runs at least 1M rows once).
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import math
 import os
 import random
+import subprocess
 import sys
 from pathlib import Path
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
-from test_parquet_testing import BYTE_EQUAL
+from test_parquet_testing import BYTE_EQUAL, CASES, SHREDDED, _variant_bin
+from variant_corpus import DECLARATIONS as CORPUS
+from variant_corpus import JSON_ROWS
+from variant_helpers import storage_digest, storage_slots
 
-from pyhoglake import VariantEncodingError, _variant_backend, variant
+from pyhoglake import ValidationError, VariantEncodingError, _variant_backend, variant
 from pyhoglake import _variant_codec as codec
 from pyhoglake.variant import VARIANT_NULL, VariantReport
 
@@ -36,6 +44,52 @@ ROWS = int(os.environ.get("PYHOGLAKE_VARIANT_DIFFERENTIAL_ROWS", "20000"))
 UNSHREDDED = [None, {"type": "variant"}]
 PARQUET_TESTING = Path(__file__).parents[1] / "data" / "parquet-testing"
 JSON_TEST_SUITE = Path(__file__).parents[1] / "data" / "JSONTestSuite" / "test_parsing"
+VECTORS = Path(__file__).parents[1] / "vectors" / "variant_shredding_vectors.json"
+#: Every declaration the shredding vectors accept.
+ACCEPTED = [
+    vector["declaration"]
+    for vector in json.loads(VECTORS.read_text())["vectors"]
+    if vector["expect"] == "accept"
+]
+#: millrace's properties_sv on ingest.events: 16 string fields.
+MILLRACE_NAMES = ["$session_id", "$window_id", *(f"$group_{i}" for i in range(5)),
+                  "$current_url", "$pathname", "$host", "$browser", "$os",
+                  "$device_type", "$lib", "$referring_domain", "$device_id"]  # fmt: skip
+MILLRACE = {"type": "object", "fields": [{"name": n, "type": "string"} for n in MILLRACE_NAMES]}  # fmt: skip
+#: The randomized rows' keys (_KEYS, then "", "1" or "2"), at every type
+#: JSON can fill and some it cannot, nested.
+RANDOM = {
+    "type": "object",
+    "fields": [
+        {"name": "a", "type": "int64"},
+        {"name": "A2", "type": "string"},
+        {"name": "a1", "type": "boolean"},
+        {"name": "1", "type": "double"},
+        {"name": "b.c", "type": "array", "element": {"type": "string"}},
+        {"name": "x[0]", "type": "int8"},
+        {"name": "\u00e9", "type": "decimal16", "precision": 20, "scale": 0},
+        {"name": "\u65e5\u672c", "type": "int32"},
+        {"name": "\x01", "type": "int16"},
+        {"name": "$browser", "type": "variant"},
+        {"name": 'q"', "type": "uuid"},
+        {"name": "aa", "type": "array", "element": {"type": "array", "element": {"type": "double"}}},
+        {
+            "name": "$set",
+            "type": "object",
+            "fields": [
+                {"name": "a", "type": "decimal16", "precision": 38, "scale": 0},
+                {"name": "A2", "type": "variant"},
+                {"name": "\u2028", "type": "decimal8", "precision": 18, "scale": 0},
+                {"name": "$set", "type": "array", "element": {"type": "object", "fields": [
+                    {"name": "aa", "type": "int16"}, {"name": "a", "type": "string"}]}},
+            ],
+        },
+    ],
+}  # fmt: skip
+#: The randomized differential's declarations, a batch each in turn.
+RANDOMIZED = [None, MILLRACE, RANDOM, {"type": "array", "element": RANDOM},
+              {"type": "string"}, {"type": "int64"},
+              {"type": "decimal16", "precision": 38, "scale": 0}]  # fmt: skip
 
 
 def _encode(rows, backend, decl=None, on_invalid="null", **chunking):
@@ -64,19 +118,20 @@ def assert_same(rows, decl=None, **chunking):
     assert native_report == python_report
     assert [len(c) for c in native] == [len(c) for c in python]
     for mine, theirs in zip(native, python, strict=True):
-        assert mine.type == theirs.type
-        assert mine.is_valid().equals(theirs.is_valid())
-        # Children whole, the placeholders under null rows too.
-        assert mine.field(0).equals(theirs.field(0))
-        assert mine.field(1).equals(theirs.field(1))
+        assert mine.type == theirs.type == codec.compile_plan(decl).write_type
+        # Every slot of every child, the placeholders under null parents too.
+        if storage_digest(mine) != storage_digest(theirs):
+            assert storage_slots(mine) == storage_slots(theirs)
     return python_report
 
 
-def assert_same_faults(rows: list[bytes]) -> int:
+def assert_same_faults(rows: list[bytes], decl=None) -> int:
     """Each row Rust refuses, Python refuses with the same reason, path and
     message (the message from Rust's detail); returns how many."""
-    _, _, _, invalid = NATIVE.encode_json(
+    plan = codec.compile_plan(decl)
+    _, _, _, invalid, _ = NATIVE.encode_json(
         [pa.array(rows, pa.binary())],
+        NATIVE.Plan(plan.write_type),
         nullable=True,
         raise_on_invalid=False,
         chunk_rows=codec.CHUNK_ROWS,
@@ -87,7 +142,7 @@ def assert_same_faults(rows: list[bytes]) -> int:
         try:
             codec.encode(
                 [rows[row]],
-                codec.UNSHREDDED_PLAN,
+                plan,
                 VariantReport(),
                 json_text=True,
                 column=None,
@@ -115,37 +170,45 @@ def assert_same_faults(rows: list[bytes]) -> int:
 # -- the switch, the hook and the fallbacks -----------------------------------
 
 
-def test_the_switch(monkeypatch):
+def test_the_switch_is_read_once_and_a_bad_one_fails_the_import(monkeypatch):
     monkeypatch.delenv(_variant_backend.ENV, raising=False)
     assert _variant_backend.mode() == "auto"
     monkeypatch.setenv(_variant_backend.ENV, "rust")
     with pytest.raises(ValueError, match="auto, native or python"):
-        variant.encode_json(["1"])
+        _variant_backend.mode()
+    # Set after import, it changes nothing; malformed at import, it fails
+    # there, not on every encode.
+    assert variant.encode_json(["1"]).report.rows == 1
+    imported = subprocess.run(
+        [sys.executable, "-c", "import pyhoglake"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**os.environ, _variant_backend.ENV: "rust"},
+    )
+    assert imported.returncode == 1
+    assert "PYHOGLAKE_VARIANT_CODEC is auto, native or python" in imported.stderr
 
 
-def test_auto_takes_rust_for_json_into_an_unshredded_plan(monkeypatch):
+def test_auto_takes_rust_for_json_text(monkeypatch):
     def refuse(*args, **kwargs):
         raise AssertionError("the Python codec was used")
 
     monkeypatch.setattr(codec, "encode", refuse)
-    for decl in UNSHREDDED:
+    for decl in [*UNSHREDDED, *ACCEPTED, MILLRACE, RANDOM]:
         assert variant.encode_json(['{"a":1}'], shredding=decl).report.rows == 1
     with pytest.raises(AssertionError, match="Python codec"):
-        variant.encode_json(['{"a":1}'], shredding={"type": "string"})
+        variant.encode_python([{"a": 1}], shredding={"type": "string"})
 
 
 @pytest.mark.parametrize(
-    ("values", "decl", "why"),
-    [
-        (['"x"'], {"type": "string"}, "unshredded plan only"),
-        (['"\ud800"'], None, "not UTF-8"),
-        ([b"1", 1], None, "not UTF-8"),
-    ],
+    ("values", "why"),
+    [(['"\ud800"'], "not UTF-8"), ([b"1", 1], "not UTF-8")],
 )
-def test_native_refuses_what_it_does_not_take(monkeypatch, values, decl, why):
-    monkeypatch.setenv(_variant_backend.ENV, "native")
+def test_native_refuses_what_it_does_not_take(monkeypatch, values, why):
+    monkeypatch.setattr(_variant_backend, "MODE", "native")
     with pytest.raises(RuntimeError, match=why):
-        variant.encode_json(values, shredding=decl)
+        variant.encode_json(values)
     with pytest.raises(RuntimeError, match="encodes JSON text"):
         _variant_backend.encode(
             [1],
@@ -157,6 +220,59 @@ def test_native_refuses_what_it_does_not_take(monkeypatch, values, decl, why):
             on_invalid="raise",
             backend="native",
         )
+
+
+def test_a_plan_rust_does_not_lay_out_is_refused():
+    # Plans come from compile_plan, which Rust reads off the write form;
+    # a type it does not know is refused rather than guessed at.
+    plan = codec.compile_plan({"type": "string"})
+    metadata, value, _ = plan.write_type
+    odd = dataclasses.replace(
+        plan,
+        write_type=pa.struct(
+            [metadata, value, pa.field("typed_value", pa.large_string())]
+        ),
+    )
+    with pytest.raises(
+        RuntimeError, match="does not take this plan .*typed_value of LargeUtf8"
+    ):
+        _variant_backend.encode(
+            ['"x"'],
+            odd,
+            VariantReport(),
+            json_text=True,
+            column=None,
+            nullable=True,
+            on_invalid="raise",
+            backend="native",
+        )
+    for kind in (
+        pa.int64(),
+        pa.struct([pa.field("value", pa.binary())]),
+        pa.struct(
+            [
+                metadata,
+                value,
+                pa.field("typed_value", pa.struct([pa.field("a", pa.int8())])),
+            ]
+        ),
+        pa.struct(
+            [
+                metadata,
+                value,
+                pa.field("typed_value", pa.list_(pa.field("element", value.type))),
+            ]
+        ),
+        pa.struct(
+            [
+                metadata,
+                pa.field("value", pa.binary(), nullable=False),
+                pa.field("typed_value", pa.int8()),
+            ]
+        ),
+    ):
+        with pytest.raises(ValueError):
+            NATIVE.Plan(kind)
 
 
 def test_a_package_of_another_version_is_not_used(monkeypatch):
@@ -180,13 +296,13 @@ def test_a_result_that_fails_its_check_is_encoded_again_in_python(
     monkeypatch.setattr(_variant_backend, "_fall_back", REAL_FALL_BACK)
     real = NATIVE.encode_json
 
-    def broken(chunks, **kwargs):
+    def broken(chunks, *args, **kwargs):
         if reason == "panic":
             raise NATIVE.PanicException("boom")
-        out, rows, nulls, invalid = real(chunks, **kwargs)
+        out, rows, nulls, invalid, counts = real(chunks, *args, **kwargs)
         if reason == "type":
-            return [pa.array([1])], rows, nulls, invalid
-        return out, rows, nulls, [(1, "duplicate_key", None, "key 'a' ...")]
+            return [pa.array([1])], rows, nulls, invalid, counts
+        return out, rows, nulls, [(1, "duplicate_key", None, "key 'a' ...")], counts
 
     monkeypatch.setattr(NATIVE, "encode_json", broken)
     rows = ["1", '{"a":[2]}', None]
@@ -203,6 +319,146 @@ def test_a_result_that_fails_its_check_is_encoded_again_in_python(
     assert again.report.codec_fallbacks == {}
 
 
+# -- the shadow ----------------------------------------------------------------
+
+
+def test_the_shadow_share_is_read_once_and_a_bad_one_fails_the_import(monkeypatch):
+    for text, share in (("", 0.0), ("0", 0.0), ("0.05", 0.05), ("1", 1.0)):
+        monkeypatch.setenv(_variant_backend.SHADOW_ENV, text)
+        assert _variant_backend.shadow() == share
+    for text in ("-0.1", "1.5", "nan", "half"):
+        monkeypatch.setenv(_variant_backend.SHADOW_ENV, text)
+        with pytest.raises(ValueError, match="a fraction from 0 to 1"):
+            _variant_backend.shadow()
+    # Set after import, it changes nothing; malformed at import, it fails
+    # there, not on every encode.
+    assert variant.encode_json(["1"]).report.shadow_seconds == 0
+    imported = subprocess.run(
+        [sys.executable, "-c", "import pyhoglake"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**os.environ, _variant_backend.SHADOW_ENV: "half"},
+    )
+    assert imported.returncode == 1
+    assert "PYHOGLAKE_VARIANT_SHADOW is a fraction from 0 to 1" in imported.stderr
+
+
+#: Rows with typed doubles of both signs, integers under doubles, null lists
+#: and absent fields under present and null parents: what the shadow must
+#: compare slot for slot.
+SHADOWED = [
+    '{"b.c":"no","1":-0.0,"aa":[[1.5,-0.0],"x"],"$set":{"$set":[{"aa":1},2]}}',
+    None,
+    "[1,",
+    '{"A2":null,"1":0.0}',
+    '{"1":7,"aa":[[2]]}',
+    '"x"',
+]
+
+
+def test_the_shadow_keeps_rusts_result_when_python_agrees(monkeypatch):
+    monkeypatch.setattr(_variant_backend, "SHADOW", 1.0)
+    real, out = NATIVE.encode_json, []
+
+    def spy(*args, **kwargs):
+        out.append(real(*args, **kwargs))
+        return out[-1]
+
+    monkeypatch.setattr(NATIVE, "encode_json", spy)
+    encoded = variant.encode_json(SHADOWED, shredding=RANDOM, on_invalid="null")
+    assert encoded.array is out[0][0][0]
+    assert encoded.report.codec_fallbacks == {}
+    assert encoded.report.shadow_seconds > 0
+    monkeypatch.setattr(_variant_backend, "SHADOW", 0.0)
+    plain = variant.encode_json(SHADOWED, shredding=RANDOM, on_invalid="null").report
+    timing = {"encode_seconds": 0.0, "shadow_seconds": 0.0}
+    assert dataclasses.replace(encoded.report, **timing) == dataclasses.replace(
+        plain, **timing
+    )
+
+
+def _covered(chunk: pa.StructArray) -> pa.StructArray:
+    """``chunk`` with its null list over one absent element: a placeholder
+    no reader sees, Arrow's equality included."""
+    typed = chunk.field("typed_value")
+    element = pa.array([{"value": None, "typed_value": None}], typed.type.value_type)
+    hidden = pa.ListArray.from_arrays(
+        pa.array([0, 1], pa.int32()), element, typed.type, mask=pa.array([True])
+    )
+    return pa.StructArray.from_arrays(
+        [chunk.field(0), chunk.field(1), hidden], fields=list(chunk.type)
+    )
+
+
+@pytest.mark.parametrize("how", ["storage", "counts", "raise", "sign", "placeholder"])
+def test_a_shadow_mismatch_takes_pythons_result(monkeypatch, caplog, how):
+    monkeypatch.setattr(_variant_backend, "_fall_back", REAL_FALL_BACK)
+    monkeypatch.setattr(_variant_backend, "SHADOW", 1.0)
+    real = NATIVE.encode_json
+    decl, rows = MILLRACE, ['{"$browser":"x"}', '{"$os":1}', None]
+    if how == "raise":
+        rows[2] = "[1,"
+    elif how == "sign":
+        decl, rows = {"type": "double"}, ["-0.0"]
+    elif how == "placeholder":
+        decl, rows = {"type": "array", "element": {"type": "string"}}, ['"x"']
+
+    def broken(chunks, *args, **kwargs):
+        if how == "sign":  # 0.0 for -0.0: Arrow's equality takes them as one
+            chunks = [pa.array([b"0.0"], pa.binary())]
+        out, rows, nulls, invalid, counts = real(chunks, *args, **kwargs)
+        if how == "storage":
+            out = [chunk.take(list(reversed(range(len(chunk))))) for chunk in out]
+        elif how == "counts":
+            counts = [(typed + 1, fallback, null) for typed, fallback, null in counts]
+        elif how == "raise":
+            invalid = []  # the invalid row written as a null
+        elif how == "placeholder":
+            out = [_covered(chunk) for chunk in out]
+        return out, rows, nulls, invalid, counts
+
+    monkeypatch.setattr(NATIVE, "encode_json", broken)
+    with caplog.at_level(logging.WARNING, logger=_variant_backend.__name__):
+        if how == "raise":
+            with pytest.raises(VariantEncodingError, match="row 2"):
+                variant.encode_json(rows, shredding=decl)
+        else:
+            encoded = variant.encode_json(rows, shredding=decl)
+    assert caplog.messages == [
+        "VARIANT codec fallback to Python: column=None row=None reason=shadow_mismatch"
+    ]
+    if how == "raise":
+        return
+    assert encoded.report.codec_fallbacks == {"shadow_mismatch": 1}
+    monkeypatch.setattr(_variant_backend, "SHADOW", 0.0)
+    wrong = variant.encode_json(rows, shredding=decl)
+    monkeypatch.setattr(NATIVE, "encode_json", real)
+    right = variant.encode_json(rows, shredding=decl)
+    assert storage_slots(encoded.array) == storage_slots(right.array)
+    assert encoded.report.typed == right.report.typed
+    if how in ("sign", "placeholder"):
+        assert wrong.array.equals(right.array)
+        assert storage_slots(wrong.array) != storage_slots(right.array)
+
+
+def test_the_digest_sees_placeholders_under_null_parents_and_types():
+    # What Arrow's equality and Parquet skip, the differential compares.
+    offsets = pa.array([0, 1, 1], pa.int32())
+    a = pa.ListArray.from_arrays(offsets, pa.array([7]), mask=pa.array([True, False]))
+    b = pa.ListArray.from_arrays(pa.array([0, 0, 0], pa.int32()), pa.array([], pa.int64()), mask=pa.array([True, False]))  # fmt: skip
+    mask = pa.array([False, True])
+    c = pa.StructArray.from_arrays([pa.array([1, 2])], names=["x"], mask=mask)
+    d = pa.StructArray.from_arrays([pa.array([1, 3])], names=["x"], mask=mask)
+    for x, y in ((a, b), (c, d)):
+        assert x.equals(y)
+        assert storage_digest(x) != storage_digest(y)
+    raw = pa.array([b"\x00" * 16], pa.binary(16))
+    assert storage_digest(raw) != storage_digest(
+        pa.ExtensionArray.from_storage(pa.uuid(), raw)
+    )
+
+
 # -- the chunk budget through the hook ----------------------------------------
 
 
@@ -217,6 +473,39 @@ def test_chunks_close_at_the_same_rows(decl):
     assert assert_same([], decl).rows == 0
 
 
+#: A field of each kind that counts bytes against the budget as it is
+#: placed: a residual, a typed string, a list's elements.
+PLACED = {
+    "type": "object",
+    "fields": [
+        {"name": "s", "type": "string"},
+        {"name": "l", "type": "array", "element": {"type": "string"}},
+        {"name": "z", "type": "int8"},
+    ],
+}
+
+
+@pytest.mark.parametrize("decl", [PLACED, {"type": "array", "element": PLACED}])
+def test_a_failed_row_keeps_the_bytes_it_placed(decl):
+    # As Python's builders count them: a row that fails after placing values
+    # leaves their bytes in the chunk's budget, so chunks close alike.
+    rows = [
+        '{"r":"' + "y" * 200 + '","z":' + "9" * 39 + "}",
+        '{"s":"' + "x" * 150 + '","l":["a","\\ud800"]}',
+        '{"s":"x","l":"no","z":300}',
+        None,
+        '"' + "w" * 120 + '"',
+    ] * 4
+    if decl["type"] == "array":
+        rows = [row and f"[{row},{row}]" for row in rows]
+    for chunk_bytes in (100, 200, 300, 450, 1000):
+        assert_same(rows, decl, chunk_bytes=chunk_bytes)
+    # The residual's 207 bytes close a chunk though its row is not written.
+    chunks, report = _encode(rows[:1] * 3, "native", decl, chunk_bytes=200)
+    assert report.invalid_rows == 3
+    assert [len(chunk) for chunk in chunks] == [1, 1, 1]
+
+
 def test_arrow_text_of_every_kind_and_chunking():
     rows = ['{"a":1}', None, "[1,", '"\\ud800"', "2"]
     for kind in (pa.string(), pa.large_string(), pa.string_view(), pa.binary(),
@@ -228,6 +517,7 @@ def test_arrow_text_of_every_kind_and_chunking():
     assert_same(pa.array([b"\xff", b'"\xc3"', b"1"], pa.binary()))
 
 
+@pytest.mark.parametrize("decl", [None, RANDOM], ids=["unshredded", "random"])
 @pytest.mark.parametrize("on_invalid", ["raise", "null"])
 @pytest.mark.parametrize(
     ("text", "reason", "path"),
@@ -245,19 +535,19 @@ def test_arrow_text_of_every_kind_and_chunking():
     ],
     ids=lambda value: value[:24] if isinstance(value, str) else None,
 )
-def test_invalid_rows_are_refused_alike(text, reason, path, on_invalid):
+def test_invalid_rows_are_refused_alike(text, reason, path, on_invalid, decl):
     rows = ["1", text, "2"]
     if reason is None:
-        assert assert_same(rows).invalid_rows == 0
+        assert assert_same(rows, decl).invalid_rows == 0
         return
     if on_invalid == "null":
-        report = assert_same(rows)
+        report = assert_same(rows, decl)
         assert report.first_invalid == ("c", 1, reason, path)
         return
     errors = []
     for backend in ("python", "native"):
         with pytest.raises(VariantEncodingError) as raised:
-            _encode(rows, backend, on_invalid="raise")
+            _encode(rows, backend, decl, on_invalid="raise")
         error = raised.value
         errors.append((str(error), error.reason, error.row, error.path))
     assert errors[0] == errors[1] == (errors[0][0], reason, 1, path)
@@ -283,13 +573,14 @@ def test_rows_past_a_recursion_bound_take_pythons_verdict():
         assert errors[0] == errors[1]
 
 
+@pytest.mark.parametrize("decl", [None, MILLRACE], ids=["unshredded", "millrace"])
 @pytest.mark.parametrize("on_invalid", ["raise", "null"])
-def test_sql_null_into_not_null_raises_alike(on_invalid):
+def test_sql_null_into_not_null_raises_alike(on_invalid, decl):
     for backend in ("python", "native"):
         with pytest.raises(VariantEncodingError, match="row 1: SQL NULL") as raised:
             _variant_backend.encode(
                 ["1", None],
-                codec.UNSHREDDED_PLAN,
+                codec.compile_plan(decl),
                 VariantReport(),
                 json_text=True,
                 column="c",
@@ -351,6 +642,81 @@ def test_every_json_value_of_the_vectors():
     assert len(BYTE_EQUAL.intersection(taken)) == 14
 
 
+def _json_texts() -> list[str]:
+    """The JSON-representable values of the vectors, as text."""
+    texts = []
+    for _, metadata, value in _json_values():
+        storage = pa.StructArray.from_arrays(
+            [pa.array([metadata], pa.binary()), pa.array([value], pa.binary())],
+            fields=list(variant.storage_type()),
+        )
+        (decoded,) = variant.to_python(storage)
+        decoded = None if decoded is VARIANT_NULL else decoded
+        if _json_like(decoded):
+            texts += [json.dumps(decoded), json.dumps(decoded, ensure_ascii=False)]
+    return texts
+
+
+_LEAVES = {pa.int8(): "int8", pa.int16(): "int16", pa.int32(): "int32",
+           pa.int64(): "int64", pa.float32(): "float", pa.float64(): "double",
+           pa.bool_(): "boolean", pa.string(): "string", pa.binary(): "binary",
+           pa.date32(): "date", pa.time64("us"): "time", pa.uuid(): "uuid",
+           pa.timestamp("us"): "timestamp", pa.timestamp("ns"): "timestamp_ns",
+           pa.timestamp("us", "UTC"): "timestamptz",
+           pa.timestamp("ns", "UTC"): "timestamptz_ns"}  # fmt: skip
+
+
+def _declaration(group: pa.DataType) -> dict:
+    """The declaration of a shredded case's group; KeyError where the
+    grammar has no type for a leaf."""
+    if group.get_field_index("typed_value") < 0:
+        return {"type": "variant"}
+    kind = group.field("typed_value").type
+    if pa.types.is_struct(kind):
+        fields = [{"name": f.name, **_declaration(f.type)} for f in kind]
+        return {"type": "object", "fields": fields}
+    if pa.types.is_list(kind):
+        return {"type": "array", "element": _declaration(kind.value_type)}
+    if pa.types.is_decimal(kind):
+        width = 4 if kind.precision <= 9 else 8 if kind.precision <= 18 else 16
+        return {"type": f"decimal{width}", "precision": kind.precision, "scale": kind.scale}  # fmt: skip
+    return {"type": _LEAVES[kind]}
+
+
+def test_the_layouts_of_the_shredded_cases():
+    # Each case's layout that the grammar can declare, over every
+    # JSON-representable value of the vectors and the corpus's edge rows.
+    layouts = {}
+    for case in CASES:
+        group = pq.read_schema(SHREDDED / case["parquet_file"]).field("var").type
+        try:
+            decl = _declaration(group)
+            codec.compile_plan(decl)
+        except (KeyError, ValidationError):
+            continue
+        layouts[json.dumps(decl, sort_keys=True)] = decl
+    rows = [*_json_texts(), *JSON_ROWS]
+    for case in CASES:
+        for name in case.get("variant_files") or [case.get("variant_file")]:
+            value = _variant_bin(name)
+            if name and _json_like(None if value is VARIANT_NULL else value):
+                rows.append(json.dumps(None if value is VARIANT_NULL else value))
+    for decl in layouts.values():
+        assert_same(rows, decl)
+    assert len(layouts) == 27  # all but uint32 and fixed_size_binary[4]
+
+
+@pytest.mark.parametrize(
+    "decl",
+    [*ACCEPTED, *CORPUS.values(), MILLRACE, RANDOM],
+    ids=[f"vector-{i}" for i in range(len(ACCEPTED))] + [*CORPUS, "millrace", "random"],
+)
+def test_every_declaration_over_the_corpus(decl):
+    rng = random.Random(len(json.dumps(decl)))
+    fitted = [_fit(rng, decl) for _ in range(300)] if decl else []
+    assert_same([*JSON_ROWS, *_json_texts(), *fitted], decl)
+
+
 #: Strings cut short after escapes, controls and nothing, as text and keys:
 #: the position and wording are the running CPython's.
 UNTERMINATED = [
@@ -367,12 +733,14 @@ def test_strings_cut_short():
     assert assert_same_faults(UNTERMINATED) == report.invalid_rows == len(UNTERMINATED)
 
 
-def test_json_test_suite():
+@pytest.mark.parametrize("decl", [None, MILLRACE, RANDOM, {"type": "string"},
+                                  {"type": "array", "element": RANDOM}])  # fmt: skip
+def test_json_test_suite(decl):
     # Every test_parsing file as one row, verdicts by Python's parser, not
     # the RFC's (Python takes NaN to its hook, refuses \f as whitespace).
     rows = [path.read_bytes() for path in sorted(JSON_TEST_SUITE.glob("*.json"))]
-    report = assert_same(pa.array(rows, pa.binary()))
-    assert assert_same_faults(rows) == report.invalid_rows
+    report = assert_same(pa.array(rows, pa.binary()), decl)
+    assert assert_same_faults(rows, decl) == report.invalid_rows
     assert (len(rows), report.invalid_rows) == (318, 221)
 
 
@@ -466,10 +834,41 @@ def _edges() -> list[str]:
     return rows
 
 
-def _rows(rng: random.Random, n: int) -> list[bytes]:
+def _fit(rng: random.Random, decl: dict, depth: int = 0) -> str:
+    """JSON text shaped like ``decl``: declared fields mostly there among
+    other keys, values of the declared type mostly, of another now and then."""
+    kind = decl["type"]
+    if kind == "variant" or depth > 5 or rng.random() < 0.15:
+        return _value(rng, depth)
+    if kind == "object":
+        members = {f["name"]: _fit(rng, f, depth + 1) for f in decl["fields"] if rng.random() < 0.8}  # fmt: skip
+        for _ in range(rng.randrange(4)):
+            members.setdefault(rng.choice(_KEYS) + rng.choice(["", "1"]), _value(rng, depth + 1))  # fmt: skip
+        items = list(members.items())
+        rng.shuffle(items)
+        return "{" + ",".join(_string(rng, k) + ":" + v for k, v in items) + "}"
+    if kind == "array":
+        return "[" + ",".join(_fit(rng, decl["element"], depth + 1) for _ in range(rng.randrange(5))) + "]"  # fmt: skip
+    if kind == "boolean":
+        return rng.choice(["true", "false"])
+    if kind == "string":
+        return _string(
+            rng, "".join(rng.choices("ab\u00e9 /\U0001f600", k=rng.randrange(70)))
+        )
+    if rng.random() < 0.5:
+        return _number(rng)
+    return (
+        repr(rng.uniform(-1e6, 1e6))
+        if kind == "double"
+        else str(rng.randrange(-300, 300))
+    )
+
+
+def _rows(rng: random.Random, n: int, decl: dict | None = None) -> list[bytes]:
     rows = []
     for _ in range(n):
-        text = _value(rng, 0).encode("utf-8", "surrogatepass")
+        text = _fit(rng, decl) if decl and rng.random() < 0.6 else _value(rng, 0)
+        text = text.encode("utf-8", "surrogatepass")
         escapes = [i for i in range(len(text) - 1) if text[i : i + 2] == b"\\u"]
         if escapes and rng.random() < 0.03:
             # Cut inside or just after a \u escape: CPython's rule there
@@ -485,17 +884,23 @@ def _rows(rng: random.Random, n: int) -> list[bytes]:
 
 
 def test_randomized_differential():
+    # Batches of rows under each declaration in turn: shredded ones get rows
+    # shaped like them as well.
     rng = random.Random(20261102)
-    invalid = assert_same_faults([text.encode() for text in _edges()])
-    seen = 0
+    for decl in RANDOMIZED:
+        assert_same(_edges(), decl)
+        assert_same_faults([text.encode() for text in _edges()], decl)
+    invalid = seen = batch = 0
     while seen < ROWS:
-        rows = _rows(rng, min(5000, ROWS - seen))
-        report = assert_same(pa.array(rows, pa.binary()))
-        assert report.invalid_rows == assert_same_faults(rows)
+        decl = RANDOMIZED[batch % len(RANDOMIZED)]
+        rows = _rows(rng, min(5000, ROWS - seen), decl)
+        report = assert_same(pa.array(rows, pa.binary()), decl)
+        assert report.invalid_rows == assert_same_faults(rows, decl)
         invalid += report.invalid_rows
-        seen += len(rows)
-    assert_same(_rows(rng, 2000), chunk_rows=7, chunk_bytes=900)
-    assert seen and 0.2 * seen < invalid < 0.5 * seen
+        seen, batch = seen + len(rows), batch + 1
+    for decl in RANDOMIZED:
+        assert_same(_rows(rng, 1000, decl), decl, chunk_rows=7, chunk_bytes=900)
+    assert seen and 0.2 * seen < invalid < 0.6 * seen
 
 
 @pytest.mark.parametrize("limit", [0, 640, 5000])

@@ -10,6 +10,7 @@ key order is ignored.
 
 from __future__ import annotations
 
+import hashlib
 import struct
 import uuid
 from datetime import UTC, date, datetime, time
@@ -111,3 +112,12 @@ def ident(value: object) -> str:
     except ValueError:
         return f"<{type(value).__name__}>"
     return text if len(text) <= 40 else text[:37] + "..."
+
+
+#: Every slot of a storage array, placeholders included (the shadow's too).
+storage_slots = variant._storage_slots
+
+
+def storage_digest(array: pa.Array) -> str:
+    """The sha256 of :func:`storage_slots`."""
+    return hashlib.sha256(repr(storage_slots(array)).encode()).hexdigest()

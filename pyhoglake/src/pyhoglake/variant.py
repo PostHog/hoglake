@@ -321,10 +321,14 @@ class VariantReport:
     #: Wall time spent encoding.
     encode_seconds: float = 0.0
     #: Calls the Rust codec's result was not used for and Python encoded
-    #: again, by why: ``mismatch``, ``type`` or ``panic``; and rows nested
-    #: past a parser's recursion bound, whose verdict is Python's
-    #: (``recursion_bound``, not re-encoded). Transitional.
+    #: again, by why: ``mismatch``, ``type``, ``panic`` or
+    #: ``shadow_mismatch``; and rows nested past a parser's recursion bound,
+    #: whose verdict is Python's (``recursion_bound``, not re-encoded).
+    #: Transitional.
     codec_fallbacks: dict[str, int] = _field(default_factory=dict)
+    #: Wall time the shadow spent encoding in Python again
+    #: (``PYHOGLAKE_VARIANT_SHADOW``), not in encode_seconds. Transitional.
+    shadow_seconds: float = 0.0
 
     def merge(self, other: VariantReport) -> None:
         """Adds ``other``'s counts to this report. The first invalid row
@@ -340,6 +344,7 @@ class VariantReport:
             self.first_invalid = other.first_invalid
         self.encode_seconds += other.encode_seconds
         _add_counts(self.codec_fallbacks, other.codec_fallbacks)
+        self.shadow_seconds += other.shadow_seconds
 
 
 def _add_counts(mine: dict[_K, int], theirs: Mapping[_K, int]) -> None:
@@ -795,6 +800,26 @@ def _one_array(
     if len(chunks) == 1:
         return chunks[0]
     return pa.chunked_array(chunks, type=plan.write_type)
+
+
+def _storage_slots(array: pa.Array) -> list[Any]:
+    """Every slot of ``array`` and of its children, in a fixed order: the
+    type, the validity and the value of each, floats as bits (so -0.0 is
+    not 0.0), lists as their offsets. Children are walked whole, so the
+    placeholders under a null parent count, which Arrow's equality skips.
+    Two codecs' storage is the same when these are equal."""
+    kind = array.type
+    out: list[Any] = [str(kind), len(array), array.is_valid().to_pylist()]
+    if pa.types.is_struct(kind):
+        out += [_storage_slots(array.field(i)) for i in range(kind.num_fields)]
+    elif pa.types.is_list(kind):
+        out += [array.offsets.to_pylist(), _storage_slots(array.values)]
+    elif kind in (pa.float32(), pa.float64()):
+        bits = pa.int32() if kind == pa.float32() else pa.int64()
+        out.append(array.view(bits).to_pylist())
+    else:
+        out.append(array.to_pylist())
+    return out
 
 
 # -- internals ----------------------------------------------------------------

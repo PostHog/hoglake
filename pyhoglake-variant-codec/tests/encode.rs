@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, BinaryArray, NullArray, StructArray};
-use pyhoglake_variant_codec::encode::{encode_json, Detail, Encoded, Options, PARSE_DEPTH};
+use pyhoglake_variant_codec::encode::{encode_json, Detail, Encoded, Options, Plan, PARSE_DEPTH};
 
 mod oracle;
 
@@ -23,7 +23,7 @@ fn defaults() -> Options {
 
 fn run(rows: &[Option<&[u8]>], o: &Options) -> Encoded {
     let array: ArrayRef = Arc::new(BinaryArray::from(rows.to_vec()));
-    encode_json(&[array], o).expect("binary input")
+    encode_json(&[array], &Plan::default(), o).expect("binary input")
 }
 
 fn bytes(chunk: &StructArray, row: usize) -> (Vec<u8>, Vec<u8>) {
@@ -282,7 +282,7 @@ fn chunks_close_on_rows_or_bytes() {
     let (metadata, value) = bytes(&out.chunks[0], 1);
     assert!(metadata.is_empty() && value.is_empty());
     let empty: ArrayRef = Arc::new(NullArray::new(0));
-    assert_eq!(encode_json(&[empty], &defaults()).unwrap().chunks.len(), 1);
+    assert_eq!(encode_json(&[empty], &Plan::default(), &defaults()).unwrap().chunks.len(), 1);
 }
 
 #[test]
