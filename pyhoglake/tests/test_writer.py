@@ -43,13 +43,15 @@ from pyhoglake import (
     PreparedPart,
     ValidationError,
     VariantReport,
+    object_prefix,
     parquet_write_options,
     variant,
     write_part,
 )
 from pyhoglake import client as client_module
 from pyhoglake import writer as writer_module
-from pyhoglake.models import Column
+from pyhoglake.models import Column, TableInfo
+from pyhoglake.stats import extract_column_stats
 from pyhoglake.types import columns_to_arrow_schema
 
 GOLDEN = Path(__file__).parent / "data" / "writer_golden.json"
@@ -247,6 +249,66 @@ def test_registration_omits_column_stats_without_stats():
     assert list(with_stats) == [*common, "column_stats", "partition_values"]
     assert len(with_stats["column_stats"]) == 13
     assert with_stats["partition_values"] == ["7", None]
+
+
+def test_registration_keeps_the_stats_of_the_field_ids_asked_for():
+    """An object-prefix writer's small file, one row of id 4: its id stat
+    alone, which proves the value from the footer. Any iterable of ids is
+    read once, and `stats=False` with no ids leaves the key out."""
+    columns = _golden_columns()
+    part = write_part(_golden_rows().slice(4, 1), columns, write_options={})
+
+    def stats(ids, on=True):
+        reg = part.registration("s3://b/f", columns, stats=on, stats_field_ids=ids)
+        return reg.get("column_stats")
+
+    full = stats(None)
+    assert len(full) == 13
+    (id_stat,) = [
+        s for s in extract_column_stats(part.metadata, columns) if s.field_id == 1
+    ]
+    assert stats({1}) == [id_stat.to_wire()]
+    info = TableInfo.from_wire({**GOLDEN_WIRE, "object_prefix_field": "id"})
+    assert object_prefix.check_field_stats(info, 4, id_stat) == "OK"
+    assert stats([16, 1]) == [s for s in full if s["field_id"] in (1, 16)]
+    assert stats(iter([1])) == [id_stat.to_wire()]
+    assert stats({pa.scalar(1, pa.int32())}) == [id_stat.to_wire()]
+    assert stats(None, on=False) is None
+
+
+@pytest.mark.parametrize(
+    "ids,on,match",
+    [
+        ({1, 9, 99}, True, r"\[9, 99\] name no stats"),
+        (frozenset(), True, "is empty"),
+        ({True}, True, "holds True, not a field id"),
+        ([1, True], True, "holds True, not a field id"),
+        ([1, 1.0], True, "holds 1.0, not a field id"),
+        (["1"], True, "holds '1', not a field id"),
+        ({1}, False, "needs stats=True"),
+        (frozenset(), False, "needs stats=True"),
+    ],
+    ids=[
+        "unknown",
+        "empty",
+        "bool",
+        "bool-after-its-int",
+        "float-after-its-int",
+        "str",
+        "without-stats",
+        "empty-without-stats",
+    ],
+)
+def test_registration_refuses_ids_it_would_not_register_as_asked(ids, on, match):
+    """A container's id, one the table does not have, or none at all: the
+    file would register provided without the stat, and never get it.
+    True and 1.0 would name field 1. Without stats the file would register
+    pending, the ids dropped in silence."""
+    part = write_part(_golden_rows(), _golden_columns(), write_options={})
+    with pytest.raises(ValidationError, match=match):
+        part.registration(
+            "s3://b/f.parquet", _golden_columns(), stats=on, stats_field_ids=ids
+        )
 
 
 # -- timestamp_s at every depth ---------------------------------------------------

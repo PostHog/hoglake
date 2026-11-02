@@ -64,6 +64,7 @@ from pyhoglake import (
     HoglakeError,
     IncarnationChangedError,
     Namespace,
+    PreparedPart,
     ReadSnapshotExpiredError,
     Table,
     TableInfo,
@@ -71,10 +72,12 @@ from pyhoglake import (
     ValidationError,
     VariantEncodingError,
     VariantReport,
+    object_prefix,
     parquet_write_options,
     write_part,
 )
 from pyhoglake.models import PartitionSpec
+from pyhoglake.stats import extract_column_stats
 from pyhoglake.transforms import (
     partition_source_array,
     transform_strings,
@@ -133,8 +136,12 @@ _ASSUMED_RETENTION_S: Final = 1800.0
 #: rebuild re-reads the shape and mints a fresh key.
 _REBUILD_ATTEMPTS: Final = 3
 #: A file at least this large registers with footer stats; smaller files
-#: register deferred and the server's hydrator backfills.
+#: register deferred and the server's hydrator backfills (on an
+#: object-prefix table, with the prefix field's stats alone instead).
 FOOTER_STATS_MIN_BYTES: Final = 32 * 1024 * 1024
+#: The flush-time drop reason (``millrace_records_dropped_total``) of a
+#: row whose object-prefix value is null or negative: no prefix holds it.
+REASON_OBJECT_PREFIX_VALUE: Final = "object_prefix_value"
 #: Consecutive failures after which a group is reported stuck (ERROR
 #: log, counter, gauge). Retries continue at the capped backoff.
 STUCK_AFTER: Final = 3
@@ -270,14 +277,18 @@ class JsonObjectDecoder:
     keys → failure, unknown keys dropped (counted and logged by the
     flusher). A top-level variant column takes the JSON text at its
     ``variant_sources`` payload key (:func:`variant_text`), or SQL NULL
-    when unmapped; it never drops a record."""
+    when unmapped; it never drops a record. With ``prefix_field`` (an
+    object-prefix table's field), a record whose value there is null or
+    negative fails (:data:`REASON_OBJECT_PREFIX_VALUE`): no prefix holds it."""
 
     def __init__(
         self,
         columns: tuple[Column, ...] | Sequence[Column],
         variant_sources: Mapping[str, str] | None = None,
+        prefix_field: str | None = None,
     ) -> None:
         self._columns = tuple(columns)
+        self._prefix_field = prefix_field
         sources = dict(variant_sources or {})
         #: Timestamps clamped to years 1–9999, by dotted column path.
         self.clamped: dict[str, int] = {}
@@ -330,6 +341,14 @@ class JsonObjectDecoder:
                 if e.path is None:
                     e.path = column.name
                 raise
+        if self._prefix_field is not None:
+            value = values[self._prefix_field]
+            if value is None or value < 0:
+                raise DecodeError(
+                    f"{self._prefix_field} {value!r} names no object prefix",
+                    reason=REASON_OBJECT_PREFIX_VALUE,
+                    path=self._prefix_field,
+                )
         # After every column that can drop the record: only kept rows count.
         for name, key in self._variants:
             text, reason = (None, None) if key is None else variant_text(doc.get(key))
@@ -747,6 +766,89 @@ def _partition_groups(
     return out
 
 
+# -- object-prefix placement -----------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _Placement:
+    """Where an object-prefix table's files go: under ``<field>=<value>/``,
+    ``value`` a file's partition value at ``key_index``, with inline stats
+    for ``field_id`` that prove it."""
+
+    field: str
+    field_id: int
+    type: str
+    key_index: int
+
+
+def _placement(info: TableInfo) -> _Placement | None:
+    """The live shape's placement, or None while its option is off. A
+    field that is not a top-level column of an allowed type, or that has
+    no single identity field in the live spec, breaks invariants the
+    server keeps (it refuses both): a shape this writer cannot honor,
+    refused like a spec it cannot honor."""
+    name = info.object_prefix_field
+    if name is None:
+        return None
+    where = f"{info.namespace}.{info.name}"
+    column = next((c for c in info.columns if c.name == name), None)
+    if column is None or column.type not in object_prefix.MAX_VALUE:
+        found = "no top-level column" if column is None else f"a {column.type!r}"
+        raise FlushError(
+            f"object prefix field {name!r} of {where} is {found}, not an "
+            "allowed integer column"
+        )
+    spec = info.partition_spec
+    index = (
+        None if spec is None else object_prefix.key_index(spec.fields, column.field_id)
+    )
+    if index is None:
+        raise FlushError(
+            f"object prefix field {name!r} of {where} has no single identity "
+            "field in the live partition spec"
+        )
+    return _Placement(name, column.field_id, column.type, index)
+
+
+def _placed_uri(
+    written: PreparedPart,
+    info: TableInfo,
+    placement: _Placement,
+    partition_values: Sequence[str | None],
+    *,
+    data_path: str,
+    build: str,
+    index: int,
+) -> str:
+    """An object-prefix file's key, once its own footer stats for the
+    prefix field prove its partition value: the check the server makes
+    at commit, made before upload. Rows that cannot be placed were
+    dropped at decode, so a failure is a millrace encoder bug."""
+    raw = partition_values[placement.key_index]
+    value = object_prefix.parse_value(raw, placement.type)
+    if value is None:
+        raise FlushError(
+            f"partition value {raw!r} of {placement.field!r} names no object "
+            "prefix (a millrace encoder bug); the rows stay staged"
+        )
+    stats = next(
+        (
+            s
+            for s in extract_column_stats(written.metadata, info.columns)
+            if s.field_id == placement.field_id
+        ),
+        None,
+    )
+    verdict = object_prefix.check_field_stats(info, value, stats)
+    if verdict != "OK":
+        raise FlushError(
+            f"the file for {placement.field}={raw} fails its own prefix check "
+            f"({verdict}): a millrace encoder bug; the rows stay staged"
+        )
+    prefix = object_prefix.prefix(data_path, info, value)
+    return f"{prefix}{build}/{index}.parquet"
+
+
 # -- commit message --------------------------------------------------------------
 
 
@@ -880,9 +982,16 @@ def build_flush_plan(
 
     Sorting happens before the fanout (a group filter keeps row order),
     so every file is key-nondecreasing under the sort spec compaction
-    enforces; staging order is Kafka offset order, not event time."""
+    enforces; staging order is Kafka offset order, not event time.
+
+    While the table's ``object_prefix_field`` is set, each file goes
+    under its value's prefix with that field's stats inline (its full
+    footer stats at ``footer_stats_min_bytes`` or more), and a row whose
+    value is null or negative is dropped (:data:`REASON_OBJECT_PREFIX_VALUE`).
+    """
     if max_files_per_commit < 1:
         raise ValueError("max_files_per_commit must be >= 1")
+    placement = _placement(info)
     seconds = dict.fromkeys(BUILD_STAGES, 0.0)
     mark = clock()
 
@@ -893,7 +1002,9 @@ def build_flush_plan(
         mark = now
 
     sources = dict(variant_sources or {})
-    decoder = JsonObjectDecoder(info.columns, sources)
+    decoder = JsonObjectDecoder(
+        info.columns, sources, None if placement is None else placement.field
+    )
     mapped = [c for c in info.columns if c.name in sources]
     reports = {c.name: VariantReport() for c in mapped}
     staged_bytes = sum(len(payload) for _, payload in records)
@@ -991,13 +1102,38 @@ def build_flush_plan(
                 f"encoder bug): {e}"
             ) from e
         del part
-        uri = f"{base}/{index}.parquet"
-        registration = written.registration(
-            uri,
-            info.columns,
-            stats=written.size >= footer_stats_min_bytes,
-            partition_values=partition_values,
-        )
+        footer_stats = written.size >= footer_stats_min_bytes
+        if placement is None:
+            uri = f"{base}/{index}.parquet"
+            stats, stats_field_ids = footer_stats, None
+        else:
+            assert partition_values is not None  # _placement found a spec field
+            uri = _placed_uri(
+                written,
+                info,
+                placement,
+                partition_values,
+                data_path=data_path,
+                build=ctx.build,
+                index=index,
+            )
+            # Inline, never deferred: the file is provided (mountable and
+            # compactable) at commit, and no hydrator older than 2.1c can
+            # flip it unchecked.
+            stats = True
+            stats_field_ids = None if footer_stats else {placement.field_id}
+        try:
+            registration = written.registration(
+                uri,
+                info.columns,
+                stats=stats,
+                partition_values=partition_values,
+                stats_field_ids=stats_field_ids,
+            )
+        except ValidationError as e:
+            raise FlushError(
+                f"the file's registration was refused (a millrace encoder bug): {e}"
+            ) from e
         files.append(
             (registration, Upload(uri=uri, size=written.size, body=written.body), rows)
         )
@@ -1401,6 +1537,7 @@ class HoglakeFlusher:
                     ) from e
         try:
             _spec_sort_keys(info)
+            _placement(info)
         except FlushError as e:
             raise FlushStartupError(str(e)) from e
         # Build the shared upload client now, on one thread: pyhoglake
@@ -1421,7 +1558,7 @@ class HoglakeFlusher:
             log.debug("could not install the Retry-After hook")
         log.info(
             "millrace destination resolved: %s/%s/%s table_uuid=%s "
-            "read_snapshot=%d (%d columns, spec %s)",
+            "read_snapshot=%d (%d columns, spec %s, object prefix %s)",
             cfg.catalog,
             cfg.namespace,
             cfg.table,
@@ -1431,6 +1568,7 @@ class HoglakeFlusher:
             "none"
             if spec is None
             else f"id={spec.spec_id} ({len(spec.fields)} fields)",
+            info.object_prefix_field or "off",
         )
         return flusher
 
@@ -1557,7 +1695,11 @@ class HoglakeFlusher:
         """Halt when the stage's rows were first committed to another
         incarnation of the destination (``meta/table_uuid``): the halt
         survives restarts, not only the process that saw the recreate.
-        With ``pin``, an unpinned stage records this incarnation."""
+        With ``pin``, an unpinned stage records this incarnation. A stage
+        pinned to ``stage_repin_from`` (a planned move to this table) is
+        re-pinned instead: a row committed there left the stage when its
+        commit landed, so every staged row belongs here (but the
+        at-least-once replay of a commit whose delete was lost)."""
         if stage.path in self._pinned_stages:
             return
         pinned = await stage.pinned_table_uuid()
@@ -1566,12 +1708,27 @@ class HoglakeFlusher:
                 return
             await stage.pin_table_uuid(self._table_uuid)
         elif pinned != self._table_uuid:
-            raise FlushHalted(
-                "table_recreated",
-                f"{stage.topic}[{stage.partition}]'s staged rows were committed "
-                f"to incarnation {pinned} of {self._cfg.namespace}."
-                f"{self._cfg.table}, which now resolves to {self._table_uuid}. "
-                "A human decides what happened; staged rows stay durable.",
+            if pinned != self._cfg.stage_repin_from:
+                knob = self._cfg.stage_repin_from or "unset"
+                raise FlushHalted(
+                    "table_recreated",
+                    f"{stage.topic}[{stage.partition}]'s staged rows were committed "
+                    f"to incarnation {pinned}; {self._cfg.namespace}."
+                    f"{self._cfg.table} now resolves to {self._table_uuid}. "
+                    "A human decides what happened (a planned move here sets "
+                    f"MILLRACE_STAGE_REPIN_FROM={pinned}; it is {knob}); staged "
+                    "rows stay durable.",
+                )
+            await stage.pin_table_uuid(self._table_uuid)
+            log.warning(
+                "%s[%d] re-pinned from %s to %s (%s.%s, MILLRACE_STAGE_REPIN_FROM): "
+                "it now flushes there",
+                stage.topic,
+                stage.partition,
+                pinned,
+                self._table_uuid,
+                self._cfg.namespace,
+                self._cfg.table,
             )
         self._pinned_stages.add(stage.path)
 
@@ -2390,7 +2547,8 @@ class FlushRunner:
         """Flush everything staged, before the consumer starts (nothing
         new arrives meanwhile). First every stage's pinned incarnation is
         checked: a recreated destination halts before anything is
-        flushed. Then each stage (the home and every foreign slot)
+        flushed, and a planned move re-pins (``stage_repin_from``),
+        empty stages included. Then each stage (the home and every foreign slot)
         streams its rows in one sequential pass (:meth:`_drain_stage`),
         stages concurrently, at most ``concurrency`` batches in memory at
         once. A group whose window
@@ -2404,6 +2562,12 @@ class FlushRunner:
             except FlushHalted as halt:
                 self._fatal = halt
                 raise
+            except Exception as e:
+                # A re-pin writes (MILLRACE_STAGE_REPIN_FROM).
+                if not is_fenced(e):
+                    raise
+                self._fatal = FencedError([(topic, partition)])
+                raise self._fatal from e
         slots = asyncio.Semaphore(self._concurrency)
         streams = [
             asyncio.create_task(

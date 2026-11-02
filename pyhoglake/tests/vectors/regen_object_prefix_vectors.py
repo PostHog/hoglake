@@ -163,7 +163,10 @@ def build() -> dict[str, Any]:
             "prefix without 's3://' + '*'; read as an IAM glob ('*' spans '/'), the pattern for value 4 must not "
             "match 'arn:aws:s3:::' + each of foreign_keys (bucket/key strings). The count of every case, iam values "
             "and foreign keys included, "
-            "is pinned by the server's ObjectPrefixVectorsTest and by pyhoglake's test_object_prefix_vectors.py."
+            "is pinned by the server's ObjectPrefixVectorsTest and by pyhoglake's test_object_prefix_vectors.py. "
+            "The server runs every case. pyhoglake's object_prefix, a writer's twin of the server's path and stats "
+            "rules, runs prefix_cases, stats_cases and iam values, and skips containment_cases and iam foreign_keys: "
+            "a writer builds a prefix and never tests whether a path is under one, nor reads an IAM glob."
         ),
         "prefix_cases": prefix_cases,
         "containment_cases": [

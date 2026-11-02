@@ -943,6 +943,48 @@ class TestVariantSources:
         assert len(found) == 4, found
 
 
+class TestStageRepinFrom:
+    """MILLRACE_STAGE_REPIN_FROM: the uuid of the table a planned move
+    leaves (test_flush_contract.py pins the re-pin itself)."""
+
+    @pytest.mark.parametrize("raw", [None, "", "   "])
+    def test_unset_or_empty_repins_nothing(self, raw):
+        env = (
+            MINIMAL_ENV
+            if raw is None
+            else MINIMAL_ENV | {"MILLRACE_STAGE_REPIN_FROM": raw}
+        )
+        assert load(env).stage_repin_from is None
+
+    def test_a_uuid_is_kept_lowercase_as_the_server_writes_it(self):
+        cfg = load(
+            MINIMAL_ENV
+            | {"MILLRACE_STAGE_REPIN_FROM": " 0B8EE9BA-79A1-4F3E-B7E5-6A0B6AB6F012 "}
+        )
+        assert cfg.stage_repin_from == "0b8ee9ba-79a1-4f3e-b7e5-6a0b6ab6f012"
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "events",
+            "0b8ee9ba-79a1",
+            "0b8ee9ba-79a1-4f3e-b7e5-6a0b6ab6f012x",
+            # Forms uuid.UUID would take (a typo then matches no pin).
+            "0b8ee9ba79a14f3eb7e56a0b6ab6f012",
+            "{0b8ee9ba-79a1-4f3e-b7e5-6a0b6ab6f012}",
+            "urn:uuid:0b8ee9ba-79a1-4f3e-b7e5-6a0b6ab6f012",
+        ],
+    )
+    def test_anything_else_is_refused(self, value):
+        expected = (
+            f"MILLRACE_STAGE_REPIN_FROM {value!r} is not a table uuid "
+            "(8-4-4-4-12 hex digits)"
+        )
+        assert problems(MINIMAL_ENV | {"MILLRACE_STAGE_REPIN_FROM": value}) == (
+            expected,
+        )
+
+
 # -- review additions: grammar edges ------------------------------------------------
 
 _ID_128 = "c" * 128
