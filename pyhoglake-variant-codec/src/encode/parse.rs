@@ -358,9 +358,14 @@ impl Parser<'_> {
                 (float, i) = (true, self.skip(sign, DIGITS));
             }
         }
-        let text = std::str::from_utf8(&t[start..i]).expect("a number is ASCII");
+        // Unreachable: the scan above admits only ASCII digits, signs, `.` and `e`.
+        let text = std::str::from_utf8(&t[start..i])
+            .map_err(|_| Fault::unlocated("invalid_json", "a number token is not ASCII"))?;
         let tok = if float {
-            let value: f64 = text.parse().expect("a JSON number parses");
+            // Unreachable: the scan above admits only JSON number grammar.
+            let value: f64 = text
+                .parse()
+                .map_err(|_| Fault::unlocated("invalid_json", format!("{text} does not parse as a number")))?;
             if value.is_infinite() {
                 let detail = format!("{} is beyond the range of a double", &text[..text.len().min(40)]);
                 return Err(Fault::unlocated("non_finite_number", detail));
