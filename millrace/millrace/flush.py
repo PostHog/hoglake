@@ -1656,6 +1656,11 @@ class HoglakeFlusher:
         """The shape read at startup (the consumer's first keyer)."""
         return self._resolved_info
 
+    @property
+    def destination(self) -> tuple[str, str]:
+        """The configured catalog and ``namespace.table``."""
+        return self._cfg.catalog, f"{self._cfg.namespace}.{self._cfg.table}"
+
     def shape_reader(self) -> ShapeReader:
         """The consumer's keyer-refresh source, pinned to this incarnation."""
         return ShapeReader(self._catalog, self._cfg.namespace, self._resolved_info)

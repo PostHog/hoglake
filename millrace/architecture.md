@@ -476,7 +476,7 @@ Everything is read from memory on the scrape thread
 | `millrace_messages_consumed_total`, `millrace_records_staged_total`, `millrace_kafka_commits_total` | consume side |
 | `millrace_records_dropped_total{reason}` | unrepresentable records (consume and flush) |
 | `millrace_flushes_committed_total`, `millrace_flush_failures_total` | decisions |
-| `millrace_flush_commits_total`, `…_rows_published_total`, `…_files_written_total`, `…_bytes_written_total` | output |
+| `millrace_flush_commits_total{catalog,table}`, `…_rows_published_total`, `…_files_written_total`, `…_bytes_written_total` | output; the commit counter names the destination (`table` is `namespace.table`), because other writers commit on the same catalog and the server's `hoglake_commits_total{catalog}` counts them all |
 | `millrace_flush_commit_refusals_total{status}` | 4xx answers |
 | `millrace_flush_groups_stuck` / `…_stuck_total` | groups at ≥ 3 consecutive failures (alert) |
 | `millrace_flush_orphaned_uploads_total` | uploaded objects no commit names |
