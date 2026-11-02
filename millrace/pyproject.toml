@@ -31,7 +31,6 @@ dependencies = [
 
 [project.scripts]
 millrace = "millrace.main:main"
-millrace-copy = "millrace.copy:main"
 
 [dependency-groups]
 dev = [
