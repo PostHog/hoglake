@@ -30,6 +30,7 @@ Pinned here:
 from __future__ import annotations
 
 import asyncio
+import base64
 import dataclasses
 import inspect
 import json
@@ -74,7 +75,13 @@ from flushkit import (
     team_group,
     team_label,
 )
-from pyhoglake import TableInfo, ValidationError, parquet_write_options
+from pyhoglake import (
+    PreparedPart,
+    TableInfo,
+    ValidationError,
+    object_prefix,
+    parquet_write_options,
+)
 from pyhoglake.models import Column
 from pyhoglake.parquet_schema import prepared_schema_matches
 from slatedb.uniffi import CloseReason
@@ -838,6 +845,151 @@ class TestPlanBuilder:
             for c in range(meta.num_columns)
         }
         assert codecs == {"ZSTD"}
+
+
+def prefixed_info(**wire: Any) -> TableInfo:
+    """The default shape with its object-prefix option on ``team_id``."""
+    return info_for(table_wire(object_prefix_field="team_id", **wire))
+
+
+def b64_bound(team: int) -> str:
+    return base64.b64encode(
+        object_prefix.expected_bound(prefixed_info(), team)
+    ).decode()
+
+
+class TestObjectPrefix:
+    """With ``object_prefix_field`` set, every file goes under its team's
+    prefix with its ``team_id`` stats inline, and its own footer proves
+    them before upload (design-2.2 §1)."""
+
+    def test_files_go_under_their_team_prefix_with_only_the_team_stats(
+        self,
+    ) -> None:
+        records = [
+            (keyspace.RowKey(team_group(7), 0), event_payload(7, JAN_US)),
+            (keyspace.RowKey(team_group(7), 1), event_payload(7, DEC_US)),
+            (keyspace.RowKey(team_group(7), 2), event_payload(42, JAN_US)),
+        ]
+        plan = plan_for(
+            records,
+            prefixed_info(),
+            ctx=ctx_for(build="tok"),
+            footer_stats_min_bytes=1 << 30,
+        )
+        (commit,) = plan.commits
+        root = f"{DATA_PATH}/data/{NAMESPACE}/{TABLE}"
+        assert commit.uris == (
+            f"{root}/team_id=7/tok/0.parquet",
+            f"{root}/team_id=7/tok/1.parquet",
+            f"{root}/team_id=42/tok/2.parquet",
+        )
+        files = commit.payload["appends"][0]["files"]
+        stats = [f["column_stats"] for f in files]
+        assert all(s["size_bytes"] > 0 for (s,) in stats)
+        assert [[{**s, "size_bytes": 0}] for (s,) in stats] == [
+            [
+                {
+                    "field_id": 1,
+                    "value_count": 1,
+                    "null_count": 0,
+                    "size_bytes": 0,
+                    "lower_bound": b64_bound(team),
+                    "upper_bound": b64_bound(team),
+                }
+            ]
+            for team in (7, 7, 42)
+        ]
+
+    def test_a_file_at_the_threshold_keeps_its_full_footer_stats(self) -> None:
+        records = [(keyspace.RowKey(team_group(7), 0), event_payload(7, JAN_US))]
+        plan = plan_for(records, prefixed_info(), footer_stats_min_bytes=1)
+        (f,) = plan.commits[0].payload["appends"][0]["files"]
+        assert {s["field_id"] for s in f["column_stats"]} == {1, 2, 3}
+        assert f["path"].startswith(f"{DATA_PATH}/data/{NAMESPACE}/{TABLE}/team_id=7/")
+
+    def test_null_and_negative_teams_are_dropped_and_counted(self) -> None:
+        nullable = [{**COLUMNS_WIRE[0], "nullable": True}, *COLUMNS_WIRE[1:]]
+        records = [
+            (keyspace.RowKey(team_group(7), 0), event_payload(7, JAN_US)),
+            (
+                keyspace.RowKey(team_group(7), 1),
+                b'{"team_id": null, "timestamp": 1800000000000000}',
+            ),
+            (keyspace.RowKey(team_group(7), 2), event_payload(-3, JAN_US)),
+            (keyspace.RowKey(team_group(7), 3), event_payload(0, JAN_US)),
+        ]
+        plan = plan_for(records, prefixed_info(columns=nullable))
+        reason = flush_mod.REASON_OBJECT_PREFIX_VALUE
+        assert plan.dropped_records == (
+            flush_mod.DroppedRecord(1, reason, "team_id", 0),
+            flush_mod.DroppedRecord(2, reason, "team_id", 0),
+        )
+        assert plan.dropped_indices == (1, 2)
+        assert (plan.records, plan.files) == (2, 2)
+        assert [c.row_indices for c in plan.commits] == [(0, 3)]
+        assert {u.uri.split("/")[-3] for u in plan.commits[0].uploads} == {
+            "team_id=7",
+            "team_id=0",
+        }
+        # With the option off, the same rows are written as before.
+        off = plan_for(records, info_for(table_wire(columns=nullable)))
+        assert off.dropped_records == () and off.records == 4
+
+    def test_a_file_whose_stats_do_not_prove_its_prefix_fails_the_plan(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        real = flush_mod.extract_column_stats
+
+        def forged(metadata: Any, cols: Any) -> Any:
+            return [
+                dataclasses.replace(
+                    s, upper_bound=object_prefix.expected_bound(prefixed_info(), 8)
+                )
+                if s.field_id == 1
+                else s
+                for s in real(metadata, cols)
+            ]
+
+        monkeypatch.setattr(flush_mod, "extract_column_stats", forged)
+        records = [(keyspace.RowKey(team_group(7), 0), event_payload(7, JAN_US))]
+        with pytest.raises(flush_mod.FlushError, match=r"team_id=7 .*BOUND_MISMATCH"):
+            plan_for(records, prefixed_info())
+
+    def test_a_refused_registration_fails_the_plan_as_an_encoder_bug(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def refused(self: Any, *args: Any, **kwargs: Any) -> Any:
+            raise ValidationError("stats_field_ids [1] name no stats", status_code=None)
+
+        monkeypatch.setattr(PreparedPart, "registration", refused)
+        records = [(keyspace.RowKey(team_group(7), 0), event_payload(7, JAN_US))]
+        with pytest.raises(flush_mod.FlushError, match="registration was refused"):
+            plan_for(records, prefixed_info())
+
+    @pytest.mark.parametrize(
+        ("wire", "match"),
+        [
+            ({"object_prefix_field": "region"}, "no top-level column"),
+            ({"object_prefix_field": "event"}, "a 'string'"),
+            (
+                {
+                    "object_prefix_field": "team_id",
+                    "spec": {
+                        "spec_id": 4,
+                        "fields": [{"source_field_id": 2, "transform": "month"}],
+                    },
+                },
+                "no single identity field",
+            ),
+        ],
+    )
+    def test_a_layout_the_writer_cannot_honor_is_refused(
+        self, wire: dict[str, Any], match: str
+    ) -> None:
+        records = [(keyspace.RowKey(team_group(7), 0), event_payload(7, JAN_US))]
+        with pytest.raises(flush_mod.FlushError, match=match):
+            plan_for(records, info_for(table_wire(**wire)))
 
 
 class TestBatchBuild:
@@ -2867,6 +3019,22 @@ class TestStartupValidation:
             }
         )
         with pytest.raises(FlushStartupError, match="field_id 99"):
+            flusher_factory(store=store, table=wire)
+
+    async def test_an_object_prefix_without_its_identity_refuses_at_resolve(
+        self,
+        httpx_mock: Any,
+        flusher_factory: Any,
+        store: FakeObjectStore,
+    ) -> None:
+        wire = table_wire(
+            object_prefix_field="team_id",
+            spec={
+                "spec_id": 5,
+                "fields": [{"source_field_id": 2, "transform": "month"}],
+            },
+        )
+        with pytest.raises(FlushStartupError, match="no single identity field"):
             flusher_factory(store=store, table=wire)
 
     async def test_unknown_transform_refuses_at_resolve(
