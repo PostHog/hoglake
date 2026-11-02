@@ -221,7 +221,12 @@ class UploadServiceIntegrationTest {
         val holder = db.jdbi.open()
         try {
             holder.begin()
-            com.posthog.hoglake.persistence.Locks.acquireCatalogCommitLock(holder, catalogId)
+            com.posthog.hoglake.persistence.Locks.acquireCatalogCommitLock(
+                holder,
+                catalogId,
+                catalog,
+                com.posthog.hoglake.persistence.CommitLockPath.COMMIT,
+            )
             // Each of these used to queue behind the held lock forever. The
             // timeout is the assertion: it fails the test rather than hanging.
             val pool = java.util.concurrent.Executors.newSingleThreadExecutor()

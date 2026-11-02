@@ -3,6 +3,7 @@ package com.posthog.hoglake.service
 import com.posthog.hoglake.Database
 import com.posthog.hoglake.observability.ExpiryGauges
 import com.posthog.hoglake.observability.Metrics
+import com.posthog.hoglake.persistence.CommitLockPath
 import com.posthog.hoglake.persistence.Locks
 import com.posthog.hoglake.testing.PgTestSupport
 import io.micrometer.prometheusmetrics.PrometheusConfig
@@ -1684,7 +1685,7 @@ class ExpiryPurgeIntegrationTest {
                     started.await()
                     repeat(20) { i ->
                         jdbi.inTransactionUnchecked { h ->
-                            Locks.acquireCatalogCommitLock(h, catalogId)
+                            Locks.acquireCatalogCommitLock(h, catalogId, "test-holder", CommitLockPath.COMMIT)
                             // FAR above any floor this sweep can reach.
                             // `batchSize` caps the advance at
                             // earliest + 100, so a row ended at 5,000 is

@@ -1,5 +1,6 @@
 package com.posthog.hoglake.service
 
+import com.posthog.hoglake.persistence.CommitLockPath
 import com.posthog.hoglake.persistence.Locks
 import com.posthog.hoglake.testing.PgTestSupport
 import org.assertj.core.api.Assertions.assertThat
@@ -133,7 +134,7 @@ class DatabaseHealthIntegrationTest {
             Thread {
                 db.jdbi.useHandleUnchecked { handle ->
                     handle.begin()
-                    Locks.acquireCatalogCommitLock(handle, catalogId)
+                    Locks.acquireCatalogCommitLock(handle, catalogId, "test-holder", CommitLockPath.COMMIT)
                     locked.countDown()
                     release.await()
                     handle.rollback()
