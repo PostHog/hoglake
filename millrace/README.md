@@ -367,6 +367,48 @@ replaces that copy with one `ctypes.memmove` at import of `stage.py`,
 after checking the binding's shape and a self-test round trip; if
 either fails it leaves the binding alone and logs a WARNING.
 
+## One-time copy (`millrace-copy`)
+
+`millrace-copy` (`millrace/copy.py`, same image) copies millrace's
+history from `ingest.events` into `ingest.events_v2` once (federation
+plan 2.6). It runs as three kinds of k8s Job; the manifests and steps
+are in the 2.6 copy runbook. Exit codes: 0 done, 1 verify failed, 2
+config or shapes, 3 refused or a unit halted.
+
+- `plan [--no-commit] [--settle-window S] [--accept-debt VALUES]`: the
+  settle gate (two censuses `S` apart name the same files, and the
+  table's compaction debt is 0 outside the listed partitions), the census
+  at head, the run lock `RUN` (a conditional S3 create), and the units,
+  one per source partition tuple, bin-packed across `COPY_SHARDS`.
+- `copy [--shard I] [--no-commit] [--limit N] [--teams T,…]`: each unit
+  is read by Iceberg field id, mapped to the destination's columns
+  (`properties_sv` from `properties`, `variant_on_invalid="null"`),
+  written under each team's prefix with full footer stats, read back
+  from the store and tallied, then committed as ONE commit under a key
+  fixed for the unit's version. Its record (`sent`, then `done`) holds
+  the payload, so a restart resends it. Inside `COPY_RECEIPT_TRUST_S`, a
+  refused resend proves the attempt never landed; past it the unit halts
+  `unresolved` until `copy --resolve UNIT` asks its receipt, and
+  `copy --rearm UNIT` restarts a `halted` unit once nothing it sent can
+  land. A transient error repeats a unit's step up to 5 times. `--shard`
+  defaults to `JOB_COMPLETION_INDEX`; `--no-commit` builds and measures
+  without uploading.
+- `verify [--fallback-run-at T]`: every unit `done`; registered rows and
+  the stored objects' (team, day) tally equal the census less drops a
+  null team explains; no foreign or unrecorded `/c26-` file; each
+  destination partition holds at least what was copied into it and less
+  than twice that (only flagged near `COPY_S_TIME`); the source
+  unchanged. It writes `verify.json` and `tally.csv`.
+
+Environment: `HOGLAKE_URL`, `HOGLAKE_S3_*`, `COPY_CATALOG`,
+`COPY_SOURCE` and `COPY_DEST` (`<namespace>.<table>`) with their
+`*_UUID`, `COPY_RUN`, `COPY_SCRATCH_URL`, `COPY_VARIANT_SOURCES`
+(`properties_sv=properties`), `COPY_CHUNK_BYTES` (256 MiB),
+`COPY_SHARDS`, `COPY_S_TIME`, `COPY_RECEIPT_TRUST_S` (6 days), and
+`COPY_RECEIPT_RETENTION_S`: the server's
+`HOGLAKE_RECEIPT_RETENTION_SECONDS` (7 days), which the trust window
+must stay below.
+
 ## Test layers
 
 Unmarked = unit (pure), `component` = SlateDB on `memory:///`,
