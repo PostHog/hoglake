@@ -20,8 +20,9 @@ Without `HOGLITE_BINARY` or a `hoglited` executable on PATH, 30 PostgreSQL-only
 invocations still run. The 33 hoglite arms, three PostgreSQL Parquet/compaction
 arms sharing the live fixture, schema equivalence and recovery explicitly abort
 with a missing-engine reason (38 invocations). JUnit represents assumption aborts
-as skipped in XML; CI rejects them and requires all six live suite reports by
-name. These are not silently successful tests.
+as skipped in XML. On pushes to main, CI rejects these skips.
+It requires all six live suite reports by name. Pull requests skip the live
+hoglite suites by design. These are not silently successful tests.
 
 ## Covered guarantees
 
@@ -121,13 +122,15 @@ hoglite twin. A change in either backend then has to satisfy the same assertion.
   Its staged scenario now supplies honest transaction metadata; the shared
   admission contract rejects all six missing-guard shapes before any mutation.
 
-## Reproduced drift checks
+## Mutation discipline
 
-The targeted shared options, sort-lifecycle and staged-admission run produced six
-invocations: all three PostgreSQL cases passed and all three hoglite cases failed
-with the options attribution guard removed and the two ports absent. Restoring
-only the hoglite counterparts makes those same assertions pass. The options
-source was restored byte-for-byte (empty diff against HEAD).
+Mutation checks must make the shared assertions fail. Remove a production guard
+or port, then run the narrow shared scenarios against both backends. Confirm the
+expected failures before restoring the production code. Confirm that the same
+scenarios pass after restoration.
+
+Keep the historical schema baseline independent. A negative schema check must
+make the upgrade/fresh-DDL comparison fail. Restore the baseline after the check.
 
 ## Deliberately not covered in this pass
 
@@ -141,8 +144,3 @@ are not inferred from these small semantic fixtures. Exact partition lookup's
 candidate-budget exhaustion is covered by the service-specific tests rather than
 this shared suite. New guards still require new shared scenarios: interfaces and
 this finite suite cannot automatically infer an arbitrary future invariant.
-
-The schema negative check removed `files.missing_field_ids` only from the frozen
-baseline: the real upgrade/fresh-DDL comparison failed, then passed after restoring
-the column. Separately reverting the two production ports after a green run
-reproduced exactly two hoglite failures while both PostgreSQL cases stayed green.

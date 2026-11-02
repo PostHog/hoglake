@@ -115,9 +115,6 @@ internal class CatalogRouter(
         }
     }
 
-    private fun target(e: CatalogDirectory.Entry): CatalogStore =
-        if (e.backend == DatabaseBackend.POSTGRES) postgres else hoglite
-
     private fun list(visible: Set<String>?): List<CatalogInfo> {
         val entries = directory.all(readyOnly = true).filter { visible == null || it.name in visible }
         val infos = mutableMapOf<String, CatalogInfo>()

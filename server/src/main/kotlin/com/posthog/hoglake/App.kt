@@ -226,37 +226,41 @@ class App private constructor(
             minFileBytes = cfg.hydratorMinFileBytes,
         )
     }
+
+    private fun newCompactionConfig() =
+        CompactionConfig(
+            targetBytes = cfg.compactionTargetBytes,
+            minInputFiles = cfg.compactionMinInputFiles,
+            maxInputFiles = cfg.compactionMaxInputFiles,
+            maxGroupsPerRun = cfg.compactionMaxGroupsPerRun,
+            candidateHeadroom = cfg.compactionCandidateHeadroom,
+            maxCandidates = cfg.compactionMaxCandidates,
+            newBucketWindow = cfg.compactionNewBucketWindow,
+            maxFanIn = cfg.compactionMaxFanIn,
+            parallelGroups = cfg.compactionParallelGroups,
+            inputOpenParallelism = cfg.compactionParallelInputOpens,
+            claimsEnabled = cfg.compactionClaimsEnabled,
+            claimTtlSeconds = cfg.compactionClaimTtlSeconds,
+            committedClaimTtlSeconds = cfg.compactionCommittedClaimTtlSeconds,
+            bucketClaimTtlSeconds = cfg.compactionBucketClaimTtlSeconds,
+            planStatementTimeoutMs = cfg.compactionPlanStatementTimeoutMs,
+            commitLockTimeoutMs = cfg.commitLockTimeoutMs,
+            nestedSortExpansion = cfg.compactionNestedSortExpansion,
+            sortedHeapBytes = cfg.compactionSortedHeapBytes,
+            spillBytes = cfg.compactionSpillBytes,
+            spillDir = java.nio.file.Path.of(cfg.compactionSpillDir),
+            verifyMinBytes = cfg.compactionVerifyMinBytes,
+            maxNodesPerRow = cfg.compactionMaxNodesPerRow,
+            codec = ParquetRewriter.OutputCodec.parse(cfg.compactionCodec, cfg.compactionZstdLevel),
+            variantCompaction = cfg.compactionVariant,
+            variantCompactionCatalogs = cfg.compactionVariantCatalogs,
+        )
+
     private val hogliteCompaction by lazy {
         com.posthog.hoglake.hoglite.HogliteCompaction(
             hogliteStore(),
             objectStore,
-            CompactionConfig(
-                targetBytes = cfg.compactionTargetBytes,
-                minInputFiles = cfg.compactionMinInputFiles,
-                maxInputFiles = cfg.compactionMaxInputFiles,
-                maxGroupsPerRun = cfg.compactionMaxGroupsPerRun,
-                candidateHeadroom = cfg.compactionCandidateHeadroom,
-                maxCandidates = cfg.compactionMaxCandidates,
-                newBucketWindow = cfg.compactionNewBucketWindow,
-                maxFanIn = cfg.compactionMaxFanIn,
-                parallelGroups = cfg.compactionParallelGroups,
-                inputOpenParallelism = cfg.compactionParallelInputOpens,
-                claimsEnabled = cfg.compactionClaimsEnabled,
-                claimTtlSeconds = cfg.compactionClaimTtlSeconds,
-                committedClaimTtlSeconds = cfg.compactionCommittedClaimTtlSeconds,
-                bucketClaimTtlSeconds = cfg.compactionBucketClaimTtlSeconds,
-                planStatementTimeoutMs = cfg.compactionPlanStatementTimeoutMs,
-                commitLockTimeoutMs = cfg.commitLockTimeoutMs,
-                nestedSortExpansion = cfg.compactionNestedSortExpansion,
-                sortedHeapBytes = cfg.compactionSortedHeapBytes,
-                spillBytes = cfg.compactionSpillBytes,
-                spillDir = java.nio.file.Path.of(cfg.compactionSpillDir),
-                verifyMinBytes = cfg.compactionVerifyMinBytes,
-                maxNodesPerRow = cfg.compactionMaxNodesPerRow,
-                codec = ParquetRewriter.OutputCodec.parse(cfg.compactionCodec, cfg.compactionZstdLevel),
-                variantCompaction = cfg.compactionVariant,
-                variantCompactionCatalogs = cfg.compactionVariantCatalogs,
-            ),
+            newCompactionConfig(),
         )
     }
     private val hogliteRetirement by lazy {
@@ -306,33 +310,7 @@ class App private constructor(
         CompactionService(
             jdbi!!,
             objectStore,
-            CompactionConfig(
-                targetBytes = cfg.compactionTargetBytes,
-                minInputFiles = cfg.compactionMinInputFiles,
-                maxInputFiles = cfg.compactionMaxInputFiles,
-                maxGroupsPerRun = cfg.compactionMaxGroupsPerRun,
-                candidateHeadroom = cfg.compactionCandidateHeadroom,
-                maxCandidates = cfg.compactionMaxCandidates,
-                newBucketWindow = cfg.compactionNewBucketWindow,
-                maxFanIn = cfg.compactionMaxFanIn,
-                parallelGroups = cfg.compactionParallelGroups,
-                inputOpenParallelism = cfg.compactionParallelInputOpens,
-                claimsEnabled = cfg.compactionClaimsEnabled,
-                claimTtlSeconds = cfg.compactionClaimTtlSeconds,
-                committedClaimTtlSeconds = cfg.compactionCommittedClaimTtlSeconds,
-                bucketClaimTtlSeconds = cfg.compactionBucketClaimTtlSeconds,
-                planStatementTimeoutMs = cfg.compactionPlanStatementTimeoutMs,
-                commitLockTimeoutMs = cfg.commitLockTimeoutMs,
-                nestedSortExpansion = cfg.compactionNestedSortExpansion,
-                sortedHeapBytes = cfg.compactionSortedHeapBytes,
-                spillBytes = cfg.compactionSpillBytes,
-                spillDir = java.nio.file.Path.of(cfg.compactionSpillDir),
-                verifyMinBytes = cfg.compactionVerifyMinBytes,
-                maxNodesPerRow = cfg.compactionMaxNodesPerRow,
-                codec = ParquetRewriter.OutputCodec.parse(cfg.compactionCodec, cfg.compactionZstdLevel),
-                variantCompaction = cfg.compactionVariant,
-                variantCompactionCatalogs = cfg.compactionVariantCatalogs,
-            ),
+            newCompactionConfig(),
             // The pod's identity spreads N pods' bucket cursors (and seeds
             // the compaction loop's jitter below). Passed HERE because the
             // constructor's default is no seeding, for the tests' sake.

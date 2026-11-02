@@ -440,6 +440,122 @@ class HogliteGuardRaceTest {
             .isInstanceOf(HoglakeException.NotFound::class.java)
     }
 
+    // ---- changefeed: expiry between the preflight and payload reads ----
+
+    private fun expireAfterChangesMeta(c: String): Hook =
+        Hook({ m, p, b -> m == "POST" && p.endsWith("/query") && store.metaSql in b }, after = {
+            HogliteExpiry(store, purgePage = 100, purgeBudgetMs = 10_000).runOnce(c, 100, MaintenanceTrigger.MANUAL)
+        }).also { hooks += it }
+
+    @Test
+    fun `a changefeed refuses expiry that purges its truncate barrier after preflight`() {
+        val (c, t) = setup()
+        store.commit(c, appendReq(c, "before.parquet"))
+        val from = head(c)
+        val truncated = store.truncateTable(c, "ns", "t", t.tableUuid, "test", "truncate").snapshotId
+        store.commit(c, appendReq(c, "after.parquet"))
+        shortRetention(c)
+        ageSnapshots(c)
+        val to = head(c)
+        assertThatThrownBy { store.changes(c, "ns", "t", from, to) }
+            .isInstanceOf(HoglakeException.ReconciliationRequired::class.java)
+
+        val hook = expireAfterChangesMeta(c)
+        assertThatThrownBy { pstore.changes(c, "ns", "t", from, to) }
+            .isInstanceOf(HoglakeException.Expired::class.java)
+        assertThat(hook.remaining).isZero()
+        assertThat(store.getCatalog(c).earliestSnapshotId).isEqualTo(to)
+        assertThat(n(c, "SELECT COUNT(*) FROM changes WHERE snapshot_id = ?", truncated)).isZero()
+        // The incomplete feed would otherwise let the consumer advance beyond the lost barrier.
+        store.commitOffset(c, "consumer-1", t.tableUuid, to)
+        assertThat(store.getOffset(c, "consumer-1", t.tableUuid).committedSnapshot).isEqualTo(to)
+    }
+
+    @Test
+    fun `a changefeed refuses expiry that purges ended files and vectors after preflight`() {
+        val (c, t) = setup()
+        val from = head(c)
+        val appended = store.commit(c, appendReq(c, "ended.parquet")).snapshotId
+        val file = store.listFiles(c, "ns", "t").single()
+        val first = store.commit(c, dvReq(c, file.dataFileId, appended, "first.puffin", 1)).snapshotId
+        val to = store.commit(c, dvReq(c, file.dataFileId, first, "second.puffin", 2)).snapshotId
+        // The truncate is outside the requested window. Only file/DV history represents this window.
+        store.truncateTable(c, "ns", "t", t.tableUuid, "test", "end history")
+        shortRetention(c)
+        ageSnapshots(c)
+        val retained = store.changes(c, "ns", "t", from, to)
+        assertThat(retained.files.map { it.dataFileId }).containsExactly(file.dataFileId)
+        assertThat(retained.deleteFiles.map { it.path }).containsExactly(
+            "s3://hoglake-it/$c/data/first.puffin",
+            "s3://hoglake-it/$c/data/second.puffin",
+        )
+
+        val hook = expireAfterChangesMeta(c)
+        assertThatThrownBy { pstore.changes(c, "ns", "t", from, to) }
+            .isInstanceOf(HoglakeException.Expired::class.java)
+        assertThat(hook.remaining).isZero()
+        assertThat(store.getCatalog(c).earliestSnapshotId).isGreaterThan(to)
+        assertThat(n(c, "SELECT COUNT(*) FROM files")).isZero()
+        assertThat(n(c, "SELECT COUNT(*) FROM dvs")).isZero()
+    }
+
+    @Test
+    fun `a changefeed allows floor minus one after concurrent expiry and rejects an earlier bound`() {
+        val (c, _) = setup()
+        shortRetention(c)
+        val appended = store.commit(c, appendReq(c, "older.parquet")).snapshotId
+        val file = store.listFiles(c, "ns", "t").single()
+        val first = store.commit(c, dvReq(c, file.dataFileId, appended, "older.puffin", 1)).snapshotId
+        val to =
+            store.commit(
+                c,
+                dvReq(c, file.dataFileId, first, "retained.puffin", 2)
+                    .copy(appends = appendReq(c, "retained.parquet").appends),
+            ).snapshotId
+        // The superseded vector ends exactly at the future floor. Its insertion is at floor minus one.
+        assertThat(n(c, "SELECT end_snapshot FROM dvs WHERE path LIKE '%older.puffin'")).isEqualTo(to)
+        assertThat(n(c, "SELECT begin_snapshot FROM dvs WHERE path LIKE '%older.puffin'")).isEqualTo(to - 1)
+        ageSnapshots(c)
+        val hook = expireAfterChangesMeta(c)
+        val plan = pstore.changes(c, "ns", "t", to - 1)
+        assertThat(hook.remaining).isZero()
+        assertThat(store.getCatalog(c).earliestSnapshotId).isEqualTo(to)
+        assertThat(plan.toSnapshot).isEqualTo(to)
+        assertThat(plan.files.map { it.path }).containsExactly("s3://hoglake-it/$c/data/retained.parquet")
+        assertThat(plan.deleteFiles.map { it.path }).containsExactly("s3://hoglake-it/$c/data/retained.puffin")
+        assertThat(n(c, "SELECT COUNT(*) FROM dvs WHERE path LIKE '%older.puffin'")).isZero()
+        assertThatThrownBy { pstore.changes(c, "ns", "t", to - 2) }
+            .isInstanceOf(HoglakeException.Expired::class.java)
+        val boundary = pstore.changes(c, "ns", "t", to - 1, to - 1)
+        assertThat(boundary.files).isEmpty()
+        assertThat(boundary.deleteFiles).isEmpty()
+        val empty = pstore.changes(c, "ns", "t", to, to)
+        assertThat(empty.files).isEmpty()
+        assertThat(empty.deleteFiles).isEmpty()
+    }
+
+    @Test
+    fun `a changefeed without expiry keeps the original head through concurrent appends`() {
+        val (c, t) = setup()
+        val from = head(c)
+        val appended = store.commit(c, appendReq(c, "original.parquet")).snapshotId
+        val file = store.listFiles(c, "ns", "t").single()
+        val to = store.commit(c, dvReq(c, file.dataFileId, appended, "original.puffin", 1)).snapshotId
+        val hook =
+            Hook({ m, p, b -> m == "POST" && p.endsWith("/query") && store.metaSql in b }, after = {
+                store.commit(c, appendReq(c, "later.parquet"))
+            })
+        hooks += hook
+        val plan = pstore.changes(c, "ns", "t", from)
+        assertThat(hook.remaining).isZero()
+        assertThat(plan.tableUuid).isEqualTo(t.tableUuid)
+        assertThat(plan.fromSnapshot).isEqualTo(from)
+        assertThat(plan.toSnapshot).isEqualTo(to)
+        assertThat(plan.files.map { it.dataFileId }).containsExactly(file.dataFileId)
+        assertThat(plan.deleteFiles.map { it.path }).containsExactly("s3://hoglake-it/$c/data/original.puffin")
+        assertThat(head(c)).isGreaterThan(to)
+    }
+
     // ---- commit: the per-table schema fence ----------------------------
 
     @Test

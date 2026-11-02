@@ -1369,13 +1369,17 @@ class HogliteCatalogStore(
             if (fromSnapshot > to) {
                 throw HoglakeException.Validation("from_snapshot $fromSnapshot is beyond to_snapshot $to")
             }
-            if (fromSnapshot < m.earliestSnapshotId - 1) {
-                throw HoglakeException.Expired(
-                    "from_snapshot $fromSnapshot reaches below the expiry floor " +
-                        "(earliest retained snapshot is ${m.earliestSnapshotId}); part of the range is " +
-                        "gone; reconcile by re-reading from a full scan at a retained snapshot",
-                )
+
+            fun requireRetained(floor: Long) {
+                if (fromSnapshot < floor - 1) {
+                    throw HoglakeException.Expired(
+                        "from_snapshot $fromSnapshot reaches below the expiry floor " +
+                            "(earliest retained snapshot is $floor); part of the range is " +
+                            "gone; reconcile by re-reading from a full scan at a retained snapshot",
+                    )
+                }
             }
+            requireRetained(m.earliestSnapshotId)
             val ns = liveNamespace(catalog, namespace)
             val t = tableAt(catalog, ns.namespaceId, namespace, table, to)
             // TRUNCATE / replacement barrier: a window that crosses a
@@ -1430,6 +1434,9 @@ class HogliteCatalogStore(
                         beginSnapshot = r[5].asLong(),
                     )
                 }
+            // Expiry can purge barriers or ended files/DVs between these reads.
+            // Their snapshots precede the floor. Recheck the exclusive lower bound before returning.
+            requireRetained(meta(catalog).earliestSnapshotId)
             return ChangesPlan(t.tableUuid, fromSnapshot, to, files, dvs)
         }
 
