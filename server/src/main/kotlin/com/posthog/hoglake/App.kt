@@ -44,6 +44,7 @@ import com.posthog.hoglake.service.RetirementService
 import com.posthog.hoglake.service.ScanService
 import com.posthog.hoglake.service.TableCreationService
 import com.posthog.hoglake.service.ViewService
+import com.posthog.hoglake.store.PostgresCatalogStore
 import com.zaxxer.hikari.HikariDataSource
 import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
@@ -70,7 +71,19 @@ import org.jdbi.v3.core.Jdbi
  */
 class App private constructor(
     val cfg: Config,
-    val jdbi: Jdbi,
+    /**
+     * The Postgres handle — NULL under `HOGLAKE_DATABASE=hoglite`, where
+     * no Postgres exists. Every service below that takes it is `lazy`,
+     * so a hoglite-mode App never constructs one; the route installers
+     * that need them are guarded on `jdbi != null` in [module], and the
+     * background loops likewise in [startBackground].
+     */
+    val jdbi: Jdbi?,
+    /**
+     * The configured hoglite store in hoglite or mixed mode. PostgreSQL-only mode passes null.
+     * [store] wraps both configured implementations in mixed mode.
+     */
+    private val storeParam: com.posthog.hoglake.store.CatalogStore?,
     /**
      * `/healthz`'s own one-connection probe (#218). Injected so a test
      * can point it at a database it is allowed to stop; defaulted from
@@ -78,6 +91,7 @@ class App private constructor(
      * second connection until something asks.
      */
     val healthProbe: HealthProbe,
+    private val ensurePostgres: () -> Unit = {},
 ) : AutoCloseable {
     /**
      * The bounded pool every route handler's blocking work runs on.
@@ -86,41 +100,60 @@ class App private constructor(
      */
     val requestDispatcher = RequestDispatcher(cfg.requestThreads)
 
-    private val catalogService = CatalogService(jdbi)
-    private val commitService =
+    /** The routes' catalog backend: the caller's (hoglite) or the Postgres delegate over THIS App's services. */
+    val store: com.posthog.hoglake.store.CatalogStore by lazy {
+        if (cfg.database == DatabaseBackend.MIXED) mixedRouter.store else storeParam ?: postgresStore
+    }
+
+    private val postgresStore by lazy { PostgresCatalogStore(catalogService, commitService, scanService) }
+    internal val mixedRouter by lazy {
+        com.posthog.hoglake.hoglite.CatalogRouter(
+            com.posthog.hoglake.hoglite.CatalogDirectory(hogliteStore()),
+            postgresStore,
+            hogliteStore(),
+            requireNotNull(jdbi),
+            ensurePostgres,
+        )
+    }
+
+    private val catalogService by lazy { CatalogService(jdbi!!) }
+    private val commitService by lazy {
         CommitService(
-            jdbi,
+            jdbi!!,
             commitLockTimeoutMs = cfg.commitLockTimeoutMs,
             refuseBlindPartitionedAppends = cfg.refuseBlindPartitionedAppends,
         )
-    private val alterService = AlterService(jdbi)
-    private val scanService = ScanService(jdbi)
-    private val partitionLookupService = PartitionLookupService(jdbi)
-    private val viewService = ViewService(jdbi)
-    private val optionsService = OptionsService(jdbi)
-    private val expiryService = ExpiryService(jdbi, cfg)
+    }
+    private val alterService by lazy { AlterService(jdbi!!) }
+    private val scanService by lazy { ScanService(jdbi!!) }
+    private val partitionLookupService by lazy { PartitionLookupService(jdbi!!) }
+    private val viewService by lazy { ViewService(jdbi!!) }
+    private val optionsService by lazy { OptionsService(jdbi!!) }
+    private val expiryService by lazy { ExpiryService(jdbi!!, cfg) }
 
     /** Same threshold CompactionService plans with: debt == sweepable files. */
-    private val partitionStatsService =
+    private val partitionStatsService by lazy {
         PartitionStatsService(
-            jdbi,
+            jdbi!!,
             smallFileThresholdBytes = cfg.compactionTargetBytes,
             minInputFiles = cfg.compactionMinInputFiles,
             maxInputFiles = cfg.compactionMaxInputFiles,
         )
+    }
 
     /**
      * The per-table partitions tab, over the same published sample and
      * the same policy the debt ranking uses — a sample computed under a
      * different compaction policy is unusable for both.
      */
-    private val partitionListingService =
+    private val partitionListingService by lazy {
         PartitionListingService(
-            jdbi,
+            jdbi!!,
             smallFileThresholdBytes = cfg.compactionTargetBytes,
             minInputFiles = cfg.compactionMinInputFiles,
             maxInputFiles = cfg.compactionMaxInputFiles,
         )
+    }
     private val removalStore = RemovalStore(cfg)
 
     /**
@@ -130,8 +163,14 @@ class App private constructor(
      * refusal true (one worker when the loop is off) has to key on the
      * same predicate the refusal prices on, and stating it at this call
      * site is how the two could quietly diverge.
+     *
+     * CleanupConfigTest pins this construction text: the service must be
+     * built from Config (the loop predicate derivation lives in its Config
+     * constructor, where a test can build it), not knob by knob here.
      */
-    private val cleanupService = CleanupService(jdbi, removalStore, cfg)
+    private fun newCleanupService(jdbi: Jdbi) = CleanupService(jdbi, removalStore, cfg)
+
+    private val cleanupService by lazy { newCleanupService(requireNotNull(jdbi)) }
 
     /**
      * Paced retirement of dropped tables' file rows — the other half of
@@ -139,85 +178,150 @@ class App private constructor(
      * maintenance workload alone, because a batch takes the per-catalog
      * commit lock.
      */
-    private val retirementService =
+    private val retirementService by lazy {
         RetirementService(
-            jdbi,
+            jdbi!!,
             batchSize = cfg.retirementBatch,
             pauseMs = cfg.retirementPauseMs,
             runBudgetMs = cfg.retirementRunBudgetMs,
             queueCeiling = cfg.retirementQueueCeiling,
             commitLockTimeoutMs = cfg.commitLockTimeoutMs,
         )
+    }
 
     /**
      * The hourly index-bloat check + REINDEX (#268). Built on every pod:
      * the health page uses its estimate. The loop, and the
      * `hoglake_index_bloat_bytes` gauge, belong to the pod that runs it.
      */
-    private val reindexService =
+    private val reindexService by lazy {
         ReindexService(
-            jdbi,
+            jdbi!!,
             publishGauge = cfg.reindexIntervalMs > 0,
             purgeWaitWindows = cfg.reindexPurgeWaitWindows,
         )
+    }
 
     /** Shared read/put store: hydrator footer reads + compaction rewrites. */
     private val objectStore = ObjectStore(cfg)
 
+    // ---- the hoglite backend's service ports (constructed only when the
+    // backend is hoglite; `store` is the HogliteCatalogStore then) --------
+
+    private fun hogliteStore() = storeParam as com.posthog.hoglake.hoglite.HogliteCatalogStore
+
+    private val hogliteOptions by lazy { com.posthog.hoglake.hoglite.HogliteOptions(hogliteStore()) }
+    private val hogliteExpiry by lazy {
+        com.posthog.hoglake.hoglite.HogliteExpiry(
+            hogliteStore(),
+            purgePage = cfg.expiryPurgePage,
+            purgeBudgetMs = cfg.expiryPurgeBudgetMs,
+        )
+    }
+    private val hogliteCleanup by lazy { com.posthog.hoglake.hoglite.HogliteCleanup(cfg, hogliteStore()) }
+    private val hogliteHydrator by lazy {
+        com.posthog.hoglake.hoglite.HogliteHydrator(
+            hogliteStore(),
+            objectStore,
+            minFileBytes = cfg.hydratorMinFileBytes,
+        )
+    }
+
+    private fun newCompactionConfig() =
+        CompactionConfig(
+            targetBytes = cfg.compactionTargetBytes,
+            minInputFiles = cfg.compactionMinInputFiles,
+            maxInputFiles = cfg.compactionMaxInputFiles,
+            maxGroupsPerRun = cfg.compactionMaxGroupsPerRun,
+            candidateHeadroom = cfg.compactionCandidateHeadroom,
+            maxCandidates = cfg.compactionMaxCandidates,
+            newBucketWindow = cfg.compactionNewBucketWindow,
+            maxFanIn = cfg.compactionMaxFanIn,
+            parallelGroups = cfg.compactionParallelGroups,
+            inputOpenParallelism = cfg.compactionParallelInputOpens,
+            claimsEnabled = cfg.compactionClaimsEnabled,
+            claimTtlSeconds = cfg.compactionClaimTtlSeconds,
+            committedClaimTtlSeconds = cfg.compactionCommittedClaimTtlSeconds,
+            bucketClaimTtlSeconds = cfg.compactionBucketClaimTtlSeconds,
+            planStatementTimeoutMs = cfg.compactionPlanStatementTimeoutMs,
+            commitLockTimeoutMs = cfg.commitLockTimeoutMs,
+            nestedSortExpansion = cfg.compactionNestedSortExpansion,
+            sortedHeapBytes = cfg.compactionSortedHeapBytes,
+            spillBytes = cfg.compactionSpillBytes,
+            spillDir = java.nio.file.Path.of(cfg.compactionSpillDir),
+            verifyMinBytes = cfg.compactionVerifyMinBytes,
+            maxNodesPerRow = cfg.compactionMaxNodesPerRow,
+            codec = ParquetRewriter.OutputCodec.parse(cfg.compactionCodec, cfg.compactionZstdLevel),
+            variantCompaction = cfg.compactionVariant,
+            variantCompactionCatalogs = cfg.compactionVariantCatalogs,
+        )
+
+    private val hogliteCompaction by lazy {
+        com.posthog.hoglake.hoglite.HogliteCompaction(
+            hogliteStore(),
+            objectStore,
+            newCompactionConfig(),
+        )
+    }
+    private val hogliteRetirement by lazy {
+        com.posthog.hoglake.hoglite.HogliteRetirement(
+            hogliteStore(),
+            batchSize = cfg.retirementBatch,
+            queueCeiling = cfg.retirementQueueCeiling,
+            runBudgetMs = cfg.retirementRunBudgetMs,
+        )
+    }
+    private val hogliteMaintenanceStatus by lazy {
+        com.posthog.hoglake.hoglite.HogliteMaintenanceStatus(
+            hogliteStore(),
+            hydratorIntervalMs = cfg.hydratorIntervalMs,
+            expiryIntervalMs = cfg.expiryIntervalMs,
+            cleanupIntervalMs = cfg.cleanupIntervalMs,
+            compactionIntervalMs = cfg.compactionIntervalMs,
+            retirementIntervalMs = cfg.retirementIntervalMs,
+            smallFileThresholdBytes = cfg.compactionTargetBytes,
+        )
+    }
+    private val hoglitePartitions by lazy {
+        com.posthog.hoglake.hoglite.HoglitePartitions(
+            hogliteStore(),
+            smallFileThresholdBytes = cfg.compactionTargetBytes,
+            minInputFiles = cfg.compactionMinInputFiles,
+            maxInputFiles = cfg.compactionMaxInputFiles,
+        )
+    }
+    private val hoglitePartitionLookup by lazy { com.posthog.hoglake.hoglite.HoglitePartitionLookup(hogliteStore()) }
+
     /** One hydrator: the background sweep loop AND the rehydrate route. */
-    private val hydrator =
+    private val hydrator by lazy {
         Hydrator(
-            jdbi,
+            jdbi!!,
             objectStore,
             maxWholeObjectBytes = cfg.hydratorMaxWholeObjectBytes,
             claimTimeoutMs = cfg.hydratorClaimTimeoutMs,
             minFileBytes = cfg.hydratorMinFileBytes,
         )
+    }
 
     /** This pod's name, for the compaction planner's cursor spread and loop jitter. */
     private val plannerIdentity = CompactionService.defaultPlannerIdentity()
 
-    private val compactionService =
+    private val compactionService by lazy {
         CompactionService(
-            jdbi,
+            jdbi!!,
             objectStore,
-            CompactionConfig(
-                targetBytes = cfg.compactionTargetBytes,
-                minInputFiles = cfg.compactionMinInputFiles,
-                maxInputFiles = cfg.compactionMaxInputFiles,
-                maxGroupsPerRun = cfg.compactionMaxGroupsPerRun,
-                candidateHeadroom = cfg.compactionCandidateHeadroom,
-                maxCandidates = cfg.compactionMaxCandidates,
-                newBucketWindow = cfg.compactionNewBucketWindow,
-                maxFanIn = cfg.compactionMaxFanIn,
-                parallelGroups = cfg.compactionParallelGroups,
-                inputOpenParallelism = cfg.compactionParallelInputOpens,
-                claimsEnabled = cfg.compactionClaimsEnabled,
-                claimTtlSeconds = cfg.compactionClaimTtlSeconds,
-                committedClaimTtlSeconds = cfg.compactionCommittedClaimTtlSeconds,
-                bucketClaimTtlSeconds = cfg.compactionBucketClaimTtlSeconds,
-                planStatementTimeoutMs = cfg.compactionPlanStatementTimeoutMs,
-                commitLockTimeoutMs = cfg.commitLockTimeoutMs,
-                nestedSortExpansion = cfg.compactionNestedSortExpansion,
-                sortedHeapBytes = cfg.compactionSortedHeapBytes,
-                spillBytes = cfg.compactionSpillBytes,
-                spillDir = java.nio.file.Path.of(cfg.compactionSpillDir),
-                verifyMinBytes = cfg.compactionVerifyMinBytes,
-                maxNodesPerRow = cfg.compactionMaxNodesPerRow,
-                codec = ParquetRewriter.OutputCodec.parse(cfg.compactionCodec, cfg.compactionZstdLevel),
-                variantCompaction = cfg.compactionVariant,
-                variantCompactionCatalogs = cfg.compactionVariantCatalogs,
-            ),
+            newCompactionConfig(),
             // The pod's identity spreads N pods' bucket cursors (and seeds
             // the compaction loop's jitter below). Passed HERE because the
             // constructor's default is no seeding, for the tests' sake.
             plannerIdentity = plannerIdentity,
         )
+    }
 
     /** The run ledger's read side: status + history routes (webui maintenance page). */
-    private val maintenanceStatusService =
+    private val maintenanceStatusService by lazy {
         MaintenanceStatusService(
-            jdbi,
+            jdbi!!,
             hydratorIntervalMs = cfg.hydratorIntervalMs,
             expiryIntervalMs = cfg.expiryIntervalMs,
             cleanupIntervalMs = cfg.cleanupIntervalMs,
@@ -228,15 +332,17 @@ class App private constructor(
             minInputFiles = cfg.compactionMinInputFiles,
             maxInputFiles = cfg.compactionMaxInputFiles,
         )
+    }
 
-    private val maintenanceSummarySampler =
+    private val maintenanceSummarySampler by lazy {
         MaintenanceSummarySampler(
-            jdbi,
+            jdbi!!,
             cfg.compactionTargetBytes,
             cfg.compactionMinInputFiles,
             cfg.compactionMaxInputFiles,
             cfg.maintenanceSummaryRefreshSeconds,
         )
+    }
 
     /**
      * The process meter registry: Ktor http server metrics land here via
@@ -255,8 +361,58 @@ class App private constructor(
             )
         }
 
+    /**
+     * Every Postgres-backend service, constructed now. The services are
+     * `lazy` only so a hoglite App (jdbi = null) never builds them; on
+     * the Postgres path they are built at [build] time, as they were
+     * when they were plain vals, so a setting a constructor refuses
+     * (a retirement batch of 0, a compaction minInputFiles of 1, a
+     * cleanup sub-batch of 0, a summary refresh of 0) refuses BOOT —
+     * before Main starts a loop, binds the metrics port or the API —
+     * instead of failing every loop tick of a process with no API.
+     * Legacy PostgreSQL mode also registers CatalogMetrics from boot.
+     * Mixed mode registers the routed sampler without opening PostgreSQL connections.
+     */
+    internal fun constructPostgresServices() {
+        store
+        catalogService
+        commitService
+        alterService
+        scanService
+        partitionLookupService
+        viewService
+        optionsService
+        expiryService
+        partitionStatsService
+        partitionListingService
+        cleanupService
+        retirementService
+        reindexService
+        hydrator
+        compactionService
+        maintenanceStatusService
+        maintenanceSummarySampler
+        catalogMetrics
+    }
+
+    /** The hoglite backend's services, constructed now — the same fail-fast as [constructPostgresServices]. */
+    internal fun constructHogliteServices() {
+        store
+        hogliteStore()
+        hogliteOptions
+        hogliteExpiry
+        hogliteCleanup
+        hogliteHydrator
+        hogliteCompaction
+        hogliteRetirement
+        hogliteMaintenanceStatus
+        hoglitePartitions
+        hoglitePartitionLookup
+        catalogMetrics
+    }
+
     /** Catalog-health gauge sampler; tests drive [CatalogMetrics.sampleOnce] directly. */
-    val catalogMetrics =
+    val catalogMetrics by lazy {
         CatalogMetrics(
             jdbi,
             meterRegistry,
@@ -264,7 +420,20 @@ class App private constructor(
             // is produced (the maintenance Deployment), so API replicas do
             // not each republish the same instance-wide series.
             extendedGroups = cfg.maintenanceSummaryIntervalMs > 0,
+            source =
+                if (cfg.database == DatabaseBackend.POSTGRES) {
+                    com.posthog.hoglake.observability.PostgresCatalogMetricSource(requireNotNull(jdbi))
+                } else {
+                    com.posthog.hoglake.hoglite.RoutedCatalogMetricSource(
+                        hogliteStore(),
+                        cfg.compactionTargetBytes,
+                        if (cfg.database == DatabaseBackend.MIXED) mixedRouter else null,
+                        jdbi,
+                        ensurePostgres,
+                    )
+                },
         )
+    }
 
     companion object {
         /**
@@ -282,7 +451,50 @@ class App private constructor(
             dataSource: HikariDataSource? = null,
             healthProbe: HealthProbe = HealthProbe.fromConfig(cfg),
         ): App =
-            App(cfg, jdbi, healthProbe).also {
+            App(cfg, jdbi, storeParam = null, healthProbe = healthProbe)
+                // Construct first, bind second: a constructor's refusal
+                // (an invalid setting Config does not check) must throw
+                // here, before Metrics is bound or a loop is started.
+                .also { it.constructPostgresServices() }
+                .let { buildShared(it, cfg, dataSource) }
+
+        /**
+         * The hoglite backend: no Postgres, no Jdbi; the store is a
+         * [HogliteCatalogStore] over the client Main built from the
+         * `HOGLAKE_HOGLITE_*` knobs, and the probe asks hoglite's own
+         * `/v1/healthz`.
+         */
+        fun buildHoglite(
+            cfg: Config,
+            store: com.posthog.hoglake.hoglite.HogliteCatalogStore,
+            healthProbe: HealthProbe,
+        ): App =
+            App(cfg, null, store, healthProbe)
+                .also { it.constructHogliteServices() }
+                .let { buildShared(it, cfg, dataSource = null) }
+
+        /** Both service implementations remain available. Only selected PostgreSQL work needs PostgreSQL readiness. */
+        fun buildMixed(
+            cfg: Config,
+            jdbi: Jdbi,
+            store: com.posthog.hoglake.hoglite.HogliteCatalogStore,
+            healthProbe: HealthProbe,
+            ensurePostgres: () -> Unit = {},
+            dataSource: HikariDataSource? = null,
+        ): App =
+            App(cfg, jdbi, store, healthProbe, ensurePostgres)
+                .also {
+                    it.constructPostgresServices()
+                    it.constructHogliteServices()
+                }
+                .let { buildShared(it, cfg, dataSource) }
+
+        private fun buildShared(
+            app: App,
+            cfg: Config,
+            dataSource: HikariDataSource?,
+        ): App =
+            app.also {
                 Metrics.bind(it.meterRegistry)
                 Metrics.registerRequestPoolGauges(it.meterRegistry, it.requestDispatcher)
                 Metrics.registerHealthProbeGauge(it.meterRegistry) { it.healthProbe.outstandingAttempts }
@@ -385,36 +597,133 @@ class App private constructor(
             }
         }
         app.installApiRoutes(
-            catalogService,
-            commitService,
+            store,
             cfg.instanceName,
             instanceTotals = { catalogMetrics.latestTotals },
             catalogTotals = { catalogMetrics.latestByCatalog },
             uiTheme = cfg.uiTheme,
         )
-        app.installTableCreationRoutes(
-            TableCreationService(jdbi, catalogService, commitService, cfg.commitLockTimeoutMs),
-        )
-        app.installUploadRoutes(
-            com.posthog.hoglake.service.UploadService(jdbi, cfg.removalLedgerRetentionSeconds),
-        )
-        app.installAlterRoutes(alterService)
-        app.installScanRoutes(scanService)
-        app.installViewRoutes(viewService)
-        app.installMaintenanceRoutes(
-            optionsService,
-            expiryService,
-            cleanupService,
-            compactionService,
-            hydrator,
-            maintenanceStatusService,
-            DatabaseHealthService(jdbi, reindexService),
-        )
-        app.installPartitionStatsRoutes(partitionStatsService)
-        app.installPartitionListingRoutes(partitionListingService)
-        app.installPartitionLookupRoutes(partitionLookupService)
+        app.installScanRoutes(store)
         app.installPublicationRoutes()
         app.installDebugRoutes()
+        if (cfg.database == DatabaseBackend.MIXED) {
+            installMixedRoutes(app)
+        } else if (jdbi != null) {
+            app.installTableCreationRoutes(
+                TableCreationService(jdbi, catalogService, commitService, cfg.commitLockTimeoutMs),
+            )
+            app.installUploadRoutes(
+                com.posthog.hoglake.service.UploadService(jdbi, cfg.removalLedgerRetentionSeconds),
+            )
+            app.installAlterRoutes(alterService)
+            app.installViewRoutes(viewService)
+            app.installMaintenanceRoutes(
+                optionsService,
+                expiryService,
+                cleanupService,
+                compactionService,
+                hydrator,
+                maintenanceStatusService,
+                DatabaseHealthService(jdbi, reindexService),
+            )
+            app.installPartitionStatsRoutes(partitionStatsService)
+            app.installPartitionListingRoutes(partitionListingService)
+            app.installPartitionLookupRoutes(partitionLookupService)
+        } else {
+            // HOGLAKE_DATABASE=hoglite. These route groups run against
+            // the hoglite-backed implementations in the hoglite package
+            // instead of the Jdbi services.
+            val hogliteStore = hogliteStore()
+            app.installUploadRoutes(hogliteStore.uploads)
+            app.installTableCreationRoutes(hogliteStore.tableCreations)
+            app.installAlterRoutes(hogliteStore.alters)
+            app.installViewRoutes(hogliteStore.views)
+            app.installMaintenanceRoutes(
+                hogliteOptions,
+                hogliteExpiry,
+                hogliteCleanup,
+                hogliteCompaction,
+                hogliteHydrator,
+                hogliteMaintenanceStatus,
+                com.posthog.hoglake.hoglite.HogliteDatabaseHealth(hogliteStore.client),
+            )
+            app.installPartitionStatsRoutes(hoglitePartitions)
+            app.installPartitionListingRoutes(hoglitePartitions)
+            app.installPartitionLookupRoutes(hoglitePartitionLookup)
+        }
+    }
+
+    private fun installMixedRoutes(app: Application) {
+        val router = mixedRouter
+
+        fun <T : Any> port(
+            type: Class<T>,
+            pg: T,
+            hg: T,
+        ): T = router.port(type, pg, hg)
+        val hg = hogliteStore()
+        app.installTableCreationRoutes(
+            port(
+                com.posthog.hoglake.service.TableCreationBackend::class.java,
+                TableCreationService(requireNotNull(jdbi), catalogService, commitService, cfg.commitLockTimeoutMs),
+                hg.tableCreations,
+            ),
+        )
+        app.installUploadRoutes(
+            port(
+                com.posthog.hoglake.service.UploadBackend::class.java,
+                com.posthog.hoglake.service.UploadService(requireNotNull(jdbi), cfg.removalLedgerRetentionSeconds),
+                hg.uploads,
+            ),
+        )
+        app.installAlterRoutes(port(com.posthog.hoglake.service.AlterBackend::class.java, alterService, hg.alters))
+        app.installViewRoutes(port(com.posthog.hoglake.service.ViewBackend::class.java, viewService, hg.views))
+        app.installMaintenanceRoutes(
+            port(com.posthog.hoglake.service.OptionsBackend::class.java, optionsService, hogliteOptions),
+            port(com.posthog.hoglake.service.ExpiryBackend::class.java, expiryService, hogliteExpiry),
+            port(com.posthog.hoglake.service.CleanupBackend::class.java, cleanupService, hogliteCleanup),
+            port(com.posthog.hoglake.service.CompactionBackend::class.java, compactionService, hogliteCompaction),
+            port(com.posthog.hoglake.service.HydratorMaintenanceBackend::class.java, hydrator, hogliteHydrator),
+            com.posthog.hoglake.hoglite.MixedMaintenanceStatus(
+                router,
+                maintenanceStatusService,
+                hogliteMaintenanceStatus,
+            ),
+            object : com.posthog.hoglake.service.DatabaseHealthBackend {
+                override fun report(): com.posthog.hoglake.model.DatabaseHealth {
+                    ensurePostgres()
+                    val pg = DatabaseHealthService(requireNotNull(jdbi), reindexService).report()
+                    val hg = com.posthog.hoglake.hoglite.HogliteDatabaseHealth(hg.client).report()
+                    return pg.copy(
+                        findings = pg.findings + hg.findings,
+                        blindSpots =
+                            pg.blindSpots +
+                                "PostgreSQL statistics cover only the configured postgres connection." + hg.blindSpots,
+                    )
+                }
+            },
+        )
+        app.installPartitionStatsRoutes(
+            port(
+                com.posthog.hoglake.service.PartitionStatsBackend::class.java,
+                partitionStatsService,
+                hoglitePartitions,
+            ),
+        )
+        app.installPartitionListingRoutes(
+            port(
+                com.posthog.hoglake.service.PartitionListingBackend::class.java,
+                partitionListingService,
+                hoglitePartitions,
+            ),
+        )
+        app.installPartitionLookupRoutes(
+            port(
+                com.posthog.hoglake.service.PartitionLookupBackend::class.java,
+                partitionLookupService,
+                hoglitePartitionLookup,
+            ),
+        )
     }
 
     /**
@@ -435,6 +744,91 @@ class App private constructor(
             com.posthog.hoglake.compaction.SpillDirectory.sweepLeftovers(java.nio.file.Path.of(cfg.compactionSpillDir))
         }
         val loops = BackgroundLoops()
+        if (cfg.database == DatabaseBackend.MIXED) return startMixedBackground(loops)
+        if (jdbi == null) {
+            // HOGLAKE_DATABASE=hoglite. The same loop names, cadences and
+            // off-by-default semantics as the Postgres branch below, over
+            // the tenant-local ports. What is missing, deliberately:
+            //  - maintenance_summary (the sampler exists to spare a
+            //    10M-row manifest a per-request scan on a shared
+            //    database; a hoglite tenant IS one catalog, so the
+            //    status/partition/table-GET reads compute exactly),
+            //  - reindex (B-tree bloat is Postgres's problem),
+            // The metrics sampler reads each tenant through its pinned identity.
+            // Everything else is the same work on the same cadence.
+            //
+            // One process per loop sweeps, not every process: each loop
+            // takes its lease in the registry tenant at every tick and
+            // sweeps only if it holds it (HogliteLoopLease). Without it,
+            // P processes each swept every catalog on every tick.
+            // HOGLAKE_HOGLITE_LOOP_LEASES=false restores that behaviour.
+            val leases = mutableListOf<com.posthog.hoglake.hoglite.HogliteLoopLease>()
+
+            fun leased(
+                name: String,
+                intervalMs: Long,
+                sweep: (continueSweep: () -> Boolean) -> Unit,
+            ): () -> Unit {
+                if (!cfg.hogliteLoopLeases) return { sweep { true } }
+                val lease =
+                    com.posthog.hoglake.hoglite.HogliteLoopLease(
+                        hogliteStore(),
+                        name,
+                        com.posthog.hoglake.hoglite.HogliteLoopLease.ttlFor(intervalMs),
+                    )
+                if (intervalMs > 0) leases += lease
+                return { if (lease.acquire()) sweep(lease::renewIfDue) }
+            }
+            loops.register(
+                "hydrator",
+                cfg.hydratorIntervalMs,
+                body = leased("hydrator", cfg.hydratorIntervalMs) { go -> hogliteHydrator.runOnce(continueSweep = go) },
+            )
+            loops.register(
+                "expiry",
+                cfg.expiryIntervalMs,
+                body =
+                    leased("expiry", cfg.expiryIntervalMs) { go ->
+                        hogliteExpiry.runOnceAllCatalogs(cfg.expiryBatchSize, go)
+                    },
+            )
+            loops.register(
+                "cleanup",
+                cfg.cleanupIntervalMs,
+                body =
+                    leased("cleanup", cfg.cleanupIntervalMs) { go ->
+                        hogliteCleanup.runOnceAllCatalogs(cfg.cleanupBatchSize, go)
+                    },
+            )
+            loops.register(
+                "compaction",
+                cfg.compactionIntervalMs,
+                BackgroundLoops.Jitter(
+                    BackgroundLoops.COMPACTION_JITTER_FRACTION,
+                    com.posthog.hoglake.compaction.CompactionService.identitySeed(plannerIdentity),
+                ),
+                leased("compaction", cfg.compactionIntervalMs) { go ->
+                    hogliteCompaction.runOnceAllCatalogs(continueSweep = go)
+                },
+            )
+            loops.register(
+                "retirement",
+                cfg.retirementIntervalMs,
+                body =
+                    leased("retirement", cfg.retirementIntervalMs) { go ->
+                        hogliteRetirement.runOnceAllCatalogs(go)
+                    },
+            )
+            loops.register("metrics", cfg.metricsIntervalMs) { catalogMetrics.sampleOnce() }
+            return AutoCloseable {
+                loops.close()
+                // After the loops stop, so no sweep renews a lease it just gave up.
+                leases.forEach { it.release() }
+                hogliteCleanup.close()
+                removalStore.close()
+                objectStore.close()
+            }
+        }
         loops.register("maintenance_summary", cfg.maintenanceSummaryIntervalMs) {
             maintenanceSummarySampler.tick(cfg.maintenanceSummaryBatch)
         }
@@ -479,6 +873,137 @@ class App private constructor(
         }
     }
 
+    internal fun startMixedBackground(loops: BackgroundLoops): AutoCloseable {
+        val router = mixedRouter
+        val leases = mutableListOf<com.posthog.hoglake.hoglite.HogliteLoopLease>()
+
+        fun register(
+            name: String,
+            interval: Long,
+            task: com.posthog.hoglake.model.MaintenanceTask,
+        ) {
+            val lease =
+                com.posthog.hoglake.hoglite.HogliteLoopLease(
+                    hogliteStore(),
+                    name,
+                    com.posthog.hoglake.hoglite.HogliteLoopLease.ttlFor(interval),
+                )
+            if (interval > 0 && cfg.hogliteLoopLeases) leases += lease
+            val jitter =
+                if (task == com.posthog.hoglake.model.MaintenanceTask.COMPACTION) {
+                    BackgroundLoops.Jitter(
+                        BackgroundLoops.COMPACTION_JITTER_FRACTION,
+                        CompactionService.identitySeed(plannerIdentity),
+                    )
+                } else {
+                    null
+                }
+            loops.register(name, interval, jitter) {
+                router.directory.initialize()
+                if (!cfg.hogliteLoopLeases || lease.acquire()) {
+                    val entries = router.directory.all().filter { it.state == "ready" }.shuffled()
+                    val hydration = task == com.posthog.hoglake.model.MaintenanceTask.HYDRATOR
+                    val page = if (hydration) entries.take(Hydrator.DEFAULT_SWEEP_LIMIT) else entries
+                    val share = maxOf(1, Hydrator.DEFAULT_SWEEP_LIMIT / maxOf(1, page.size))
+                    for (entry in page) {
+                        if (cfg.hogliteLoopLeases && !lease.renewIfDue()) break
+                        // One backend cannot suppress the other's work. Failures remain visible.
+                        runCatching { mixedCatalogTask(entry, task, share) }.onFailure {
+                            io.github.oshai.kotlinlogging.KotlinLogging.logger {}.warn(it) {
+                                "mixed $name failed for catalog '${entry.name}'"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        register("expiry", cfg.expiryIntervalMs, com.posthog.hoglake.model.MaintenanceTask.EXPIRY)
+        register("cleanup", cfg.cleanupIntervalMs, com.posthog.hoglake.model.MaintenanceTask.CLEANUP)
+        register("compaction", cfg.compactionIntervalMs, com.posthog.hoglake.model.MaintenanceTask.COMPACTION)
+        register("retirement", cfg.retirementIntervalMs, com.posthog.hoglake.model.MaintenanceTask.RETIREMENT)
+        register("hydrator", cfg.hydratorIntervalMs, com.posthog.hoglake.model.MaintenanceTask.HYDRATOR)
+        // These tasks operate on the configured PostgreSQL database, not on hoglite tenants.
+        loops.register("maintenance_summary", cfg.maintenanceSummaryIntervalMs) {
+            mixedMaintenanceSummary()
+        }
+        loops.register("reindex", cfg.reindexIntervalMs) {
+            ensurePostgres()
+            reindexService.pollOnce()
+        }
+        loops.register("metrics", cfg.metricsIntervalMs) { metricsTick() }
+        return AutoCloseable {
+            loops.close()
+            leases.forEach { it.release() }
+            hogliteCleanup.close()
+            removalStore.close()
+            objectStore.close()
+        }
+    }
+
+    /** A sweep carries the directory entry unchanged through every backend phase. */
+    internal fun mixedCatalogTask(
+        entry: com.posthog.hoglake.hoglite.CatalogDirectory.Entry,
+        task: com.posthog.hoglake.model.MaintenanceTask,
+        hydrationLimit: Int = Hydrator.DEFAULT_SWEEP_LIMIT,
+    ) {
+        val trigger = com.posthog.hoglake.model.MaintenanceTrigger.LOOP
+        mixedRouter.bound(entry) {
+            val pg = entry.backend == DatabaseBackend.POSTGRES
+            val name = entry.name
+            when (task) {
+                com.posthog.hoglake.model.MaintenanceTask.EXPIRY ->
+                    if (pg) {
+                        expiryService.runOnce(
+                            name,
+                            cfg.expiryBatchSize,
+                            trigger,
+                        )
+                    } else {
+                        hogliteExpiry.runOnce(name, cfg.expiryBatchSize, trigger)
+                    }
+                com.posthog.hoglake.model.MaintenanceTask.CLEANUP ->
+                    if (pg) {
+                        cleanupService.runOnce(
+                            name,
+                            cfg.cleanupBatchSize,
+                            trigger,
+                        )
+                    } else {
+                        hogliteCleanup.runOnce(name, cfg.cleanupBatchSize, trigger)
+                    }
+                com.posthog.hoglake.model.MaintenanceTask.COMPACTION ->
+                    if (pg) {
+                        compactionService.runOnce(
+                            name,
+                            trigger = trigger,
+                        )
+                    } else {
+                        hogliteCompaction.runOnce(name, trigger = trigger)
+                    }
+                com.posthog.hoglake.model.MaintenanceTask.RETIREMENT ->
+                    if (pg) retirementService.runOnce(name, trigger) else hogliteRetirement.runOnce(name, trigger)
+                com.posthog.hoglake.model.MaintenanceTask.HYDRATOR ->
+                    if (pg) {
+                        hydrator.runOnce(
+                            hydrationLimit,
+                            setOf(entry.identity.toLong()),
+                        )
+                    } else {
+                        hogliteHydrator.runCatalog(name, entry.identity, hydrationLimit)
+                    }
+                else -> error("$task is not a catalog sweep")
+            }
+        }
+    }
+
+    internal fun mixedMaintenanceSummary() {
+        val ids =
+            mixedRouter.directory.all().filter { it.backend == DatabaseBackend.POSTGRES && it.state == "ready" }
+                .map { it.identity.toLong() }
+        ensurePostgres()
+        maintenanceSummarySampler.tick(cfg.maintenanceSummaryBatch, ids)
+    }
+
     /**
      * One metrics-loop iteration. The bloat gauge rides it on the reindex
      * pod only (a no-op elsewhere): ~4 ms of catalog reads, so the series
@@ -491,7 +1016,15 @@ class App private constructor(
         try {
             catalogMetrics.sampleOnce()
         } finally {
-            reindexService.refreshGauge()
+            // A PostgreSQL outage cannot prevent hoglite collection.
+            if (jdbi != null) {
+                runCatching {
+                    ensurePostgres()
+                    reindexService.refreshGauge()
+                }.onFailure {
+                    io.github.oshai.kotlinlogging.KotlinLogging.logger {}.warn(it) { "PostgreSQL gauge refresh failed" }
+                }
+            }
         }
     }
 

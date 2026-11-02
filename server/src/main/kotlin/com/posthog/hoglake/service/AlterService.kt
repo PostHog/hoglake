@@ -53,16 +53,16 @@ import java.util.UUID
  * row is deleted instead of ended — it was never visible at any
  * snapshot, and end == begin would violate the schema CHECK.
  */
-class AlterService(private val jdbi: Jdbi) {
-    fun alterTable(
+class AlterService(private val jdbi: Jdbi) : AlterBackend {
+    override fun alterTable(
         catalog: String,
         namespace: String,
         table: String,
         ops: List<AlterOp>,
-        expectedTableUuid: UUID? = null,
-        readSnapshot: Long? = null,
-        author: String? = null,
-        message: String? = null,
+        expectedTableUuid: UUID?,
+        readSnapshot: Long?,
+        author: String?,
+        message: String?,
     ): TableInfo =
         Audit.audited(
             "table_alter",
@@ -943,63 +943,6 @@ class AlterService(private val jdbi: Jdbi) {
         state.objectPrefixFieldId = col.fieldId
     }
 
-    internal fun validatePartitionFields(
-        columns: List<Column>,
-        fields: List<PartitionFieldDef>,
-    ) {
-        for (f in fields) {
-            val col = requireSourceField(columns, f.sourceFieldId, "partition")
-            when (f.transform) {
-                Transform.BUCKET -> {
-                    if (f.transformParam == null || f.transformParam < 1) {
-                        throw HoglakeException.Validation(
-                            "bucket transform requires transform_param >= 1",
-                        )
-                    }
-                    if (col.def.type !in BUCKETABLE_TYPES) {
-                        // Name the actual reason: "not bucketable" sends a
-                        // caller looking for a syntax error, when the answer
-                        // is that nobody has specified how to hash this type.
-                        val why =
-                            when (col.def.type) {
-                                in HASH_DOMAIN_MISMATCHED ->
-                                    "Iceberg hashes the MAPPED type's representation " +
-                                        "('${col.def.type.wire}' maps to " +
-                                        "'${col.def.type.icebergType.wire}'), and hoglake has no " +
-                                        "cross-language contract for that hash yet"
-                                // NOT "the spec excludes it" — Iceberg buckets
-                                // strings, and json maps to string. The problem
-                                // is that JSON has no canonical byte form.
-                                ColType.JSON ->
-                                    "the bucket hash runs over bytes, and documents that are equal " +
-                                        "as JSON can have different bytes (key order, whitespace, " +
-                                        "number spelling), so bucket assignment would depend on " +
-                                        "which writer serialized the value rather than on the value"
-                                else -> "the Iceberg spec excludes it from the bucket hash domain"
-                            }
-                        throw HoglakeException.Validation(
-                            "bucket transform cannot be applied to column '${col.def.name}' of type " +
-                                "'${col.def.type.wire}': $why; bucketable types are " +
-                                "${BUCKETABLE_TYPES.map { it.wire }.sorted()}",
-                        )
-                    }
-                }
-                else ->
-                    if (f.transformParam != null) {
-                        throw HoglakeException.Validation(
-                            "transform '${f.transform.wire}' does not take transform_param",
-                        )
-                    }
-            }
-            if (f.transform in TEMPORAL_TRANSFORMS && col.def.type !in TEMPORAL_TYPES) {
-                throw HoglakeException.Validation(
-                    "transform '${f.transform.wire}' requires a date or timestamp column; " +
-                        "'${col.def.name}' is '${col.def.type.wire}'",
-                )
-            }
-        }
-    }
-
     internal fun installPartitionSpec(
         h: Handle,
         catalogId: Long,
@@ -1073,21 +1016,6 @@ class AlterService(private val jdbi: Jdbi) {
         op: AlterOp.SetSortOrder,
     ) {
         state.sortSpec = installSortSpec(h, catalogId, tableId, snapshot, state.cols, op.fields)
-    }
-
-    internal fun validateSortFields(
-        columns: List<Column>,
-        fields: List<SortFieldDef>,
-    ) {
-        val seen = HashSet<Long>()
-        for (f in fields) {
-            requireSourceField(columns, f.sourceFieldId, "sort")
-            if (!seen.add(f.sourceFieldId)) {
-                throw HoglakeException.Validation(
-                    "duplicate sort source field_id ${f.sourceFieldId}",
-                )
-            }
-        }
     }
 
     internal fun installSortSpec(
@@ -1251,78 +1179,6 @@ class AlterService(private val jdbi: Jdbi) {
             "cannot address '${Identifiers.cap(fullPath)}': " +
                 "'$containerPath' is '${container.def.type.wire}', not a struct",
         )
-    }
-
-    /**
-     * The one place a partition or sort source is resolved and refused.
-     *
-     * The source must be a LEAF that no list or map sits above.
-     * Iceberg's `source-id` may point at a struct leaf, so `addr.zip` is
-     * a legal partition source — but nothing under a repeated element
-     * is, because a row has many of those values and a partition/sort
-     * key is one value per row.
-     *
-     * Takes the live COLUMNS rather than the whole TableState, which is
-     * all it ever used — and which lets its refusals (nested container,
-     * list/map interior, variant) be asserted directly instead of
-     * through a live catalog.
-     */
-    internal fun requireSourceField(
-        cols: List<Column>,
-        fieldId: Long,
-        what: String,
-    ): Column {
-        val chain =
-            findChain(cols, fieldId, emptyList())
-                ?: throw HoglakeException.Validation(
-                    "$what source field_id $fieldId is not a live column",
-                )
-        val col = chain.last()
-        val path = chain.joinToString(".") { it.def.name }
-        // VARIANT is a catalog SCALAR, so `isNested` is false for it and
-        // the container refusal below never fires — but a variant has no
-        // single value a transform could read either. #77 refused it at
-        // the two call sites; refusing it HERE covers a variant reached
-        // through a struct, which the call-site checks (top-level only)
-        // did not see.
-        if (col.def.type == ColType.VARIANT) {
-            throw HoglakeException.Validation(
-                "$what source field_id $fieldId ('$path') is a 'variant': a variant has no single " +
-                    "scalar value, so it cannot be a $what source",
-            )
-        }
-        if (col.def.type.isNested) {
-            throw HoglakeException.Validation(
-                "$what source field_id $fieldId ('$path') is a " +
-                    "'${col.def.type.wire}': a nested " +
-                    "container has no single value per row and cannot be a $what source; use one " +
-                    "of its leaf fields",
-            )
-        }
-        val repeated = chain.dropLast(1).firstOrNull { it.def.type == ColType.LIST || it.def.type == ColType.MAP }
-        if (repeated != null) {
-            throw HoglakeException.Validation(
-                "$what source field_id $fieldId ('$path') sits under " +
-                    "'${repeated.def.name}', a " +
-                    "'${repeated.def.type.wire}': a row has many such values, so it cannot be a " +
-                    "$what source; struct leaves are the only nested fields that can",
-            )
-        }
-        return col
-    }
-
-    /** The root-to-node chain for [fieldId], or null when it is not in the forest. */
-    private fun findChain(
-        siblings: List<Column>,
-        fieldId: Long,
-        prefix: List<Column>,
-    ): List<Column>? {
-        for (c in siblings) {
-            val here = prefix + c
-            if (c.fieldId == fieldId) return here
-            findChain(c.children, fieldId, here)?.let { return it }
-        }
-        return null
     }
 
     /** Depth of [node] in [state]'s forest, top-level counting as 1. */
@@ -1493,6 +1349,152 @@ class AlterService(private val jdbi: Jdbi) {
      * pyhoglake's parity test compares against its own allowlist.
      */
     companion object {
+        // ---- pure validators (companion so the hoglite backend can call them without a Jdbi) ----
+
+        /** The root-to-node chain for [fieldId], or null when it is not in the forest. */
+        internal fun findChain(
+            siblings: List<Column>,
+            fieldId: Long,
+            prefix: List<Column>,
+        ): List<Column>? {
+            for (c in siblings) {
+                val here = prefix + c
+                if (c.fieldId == fieldId) return here
+                findChain(c.children, fieldId, here)?.let { return it }
+            }
+            return null
+        }
+
+        /**
+         * The one place a partition or sort source is resolved and refused.
+         *
+         * The source must be a LEAF that no list or map sits above.
+         * Iceberg's `source-id` may point at a struct leaf, so `addr.zip` is
+         * a legal partition source — but nothing under a repeated element
+         * is, because a row has many of those values and a partition/sort
+         * key is one value per row.
+         *
+         * Takes the live COLUMNS rather than the whole TableState, which is
+         * all it ever used — and which lets its refusals (nested container,
+         * list/map interior, variant) be asserted directly instead of
+         * through a live catalog.
+         */
+        internal fun requireSourceField(
+            cols: List<Column>,
+            fieldId: Long,
+            what: String,
+        ): Column {
+            val chain =
+                findChain(cols, fieldId, emptyList())
+                    ?: throw HoglakeException.Validation(
+                        "$what source field_id $fieldId is not a live column",
+                    )
+            val col = chain.last()
+            val path = chain.joinToString(".") { it.def.name }
+            // VARIANT is a catalog SCALAR, so `isNested` is false for it and
+            // the container refusal below never fires — but a variant has no
+            // single value a transform could read either. #77 refused it at
+            // the two call sites; refusing it HERE covers a variant reached
+            // through a struct, which the call-site checks (top-level only)
+            // did not see.
+            if (col.def.type == ColType.VARIANT) {
+                throw HoglakeException.Validation(
+                    "$what source field_id $fieldId ('$path') is a 'variant': a variant has no single " +
+                        "scalar value, so it cannot be a $what source",
+                )
+            }
+            if (col.def.type.isNested) {
+                throw HoglakeException.Validation(
+                    "$what source field_id $fieldId ('$path') is a " +
+                        "'${col.def.type.wire}': a nested " +
+                        "container has no single value per row and cannot be a $what source; use one " +
+                        "of its leaf fields",
+                )
+            }
+            val repeated = chain.dropLast(1).firstOrNull { it.def.type == ColType.LIST || it.def.type == ColType.MAP }
+            if (repeated != null) {
+                throw HoglakeException.Validation(
+                    "$what source field_id $fieldId ('$path') sits under " +
+                        "'${repeated.def.name}', a " +
+                        "'${repeated.def.type.wire}': a row has many such values, so it cannot be a " +
+                        "$what source; struct leaves are the only nested fields that can",
+                )
+            }
+            return col
+        }
+
+        internal fun validatePartitionFields(
+            columns: List<Column>,
+            fields: List<PartitionFieldDef>,
+        ) {
+            for (f in fields) {
+                val col = requireSourceField(columns, f.sourceFieldId, "partition")
+                when (f.transform) {
+                    Transform.BUCKET -> {
+                        if (f.transformParam == null || f.transformParam < 1) {
+                            throw HoglakeException.Validation(
+                                "bucket transform requires transform_param >= 1",
+                            )
+                        }
+                        if (col.def.type !in BUCKETABLE_TYPES) {
+                            // Name the actual reason: "not bucketable" sends a
+                            // caller looking for a syntax error, when the answer
+                            // is that nobody has specified how to hash this type.
+                            val why =
+                                when (col.def.type) {
+                                    in HASH_DOMAIN_MISMATCHED ->
+                                        "Iceberg hashes the MAPPED type's representation " +
+                                            "('${col.def.type.wire}' maps to " +
+                                            "'${col.def.type.icebergType.wire}'), and hoglake has no " +
+                                            "cross-language contract for that hash yet"
+                                    // NOT "the spec excludes it" — Iceberg buckets
+                                    // strings, and json maps to string. The problem
+                                    // is that JSON has no canonical byte form.
+                                    ColType.JSON ->
+                                        "the bucket hash runs over bytes, and documents that are equal " +
+                                            "as JSON can have different bytes (key order, whitespace, " +
+                                            "number spelling), so bucket assignment would depend on " +
+                                            "which writer serialized the value rather than on the value"
+                                    else -> "the Iceberg spec excludes it from the bucket hash domain"
+                                }
+                            throw HoglakeException.Validation(
+                                "bucket transform cannot be applied to column '${col.def.name}' of type " +
+                                    "'${col.def.type.wire}': $why; bucketable types are " +
+                                    "${BUCKETABLE_TYPES.map { it.wire }.sorted()}",
+                            )
+                        }
+                    }
+                    else ->
+                        if (f.transformParam != null) {
+                            throw HoglakeException.Validation(
+                                "transform '${f.transform.wire}' does not take transform_param",
+                            )
+                        }
+                }
+                if (f.transform in TEMPORAL_TRANSFORMS && col.def.type !in TEMPORAL_TYPES) {
+                    throw HoglakeException.Validation(
+                        "transform '${f.transform.wire}' requires a date or timestamp column; " +
+                            "'${col.def.name}' is '${col.def.type.wire}'",
+                    )
+                }
+            }
+        }
+
+        internal fun validateSortFields(
+            columns: List<Column>,
+            fields: List<SortFieldDef>,
+        ) {
+            val seen = HashSet<Long>()
+            for (f in fields) {
+                requireSourceField(columns, f.sourceFieldId, "sort")
+                if (!seen.add(f.sourceFieldId)) {
+                    throw HoglakeException.Validation(
+                        "duplicate sort source field_id ${f.sourceFieldId}",
+                    )
+                }
+            }
+        }
+
         /**
          * The field-id guard's count ([requireFieldIds]); the statement
          * production issues, exposed for `AlterGuardPlanIntegrationTest`

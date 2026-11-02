@@ -585,7 +585,7 @@ class CleanupService(
      * page, which makes the budget's stop observable without sleeping.
      */
     private val receiptPurgeBudgetMs: Long = RECEIPT_PURGE_BUDGET_MS,
-) {
+) : CleanupBackend {
     /**
      * The production wiring, and the ONLY place the service's knobs are
      * derived from [Config].
@@ -688,10 +688,10 @@ class CleanupService(
      * audit event — app-log debug only, so idle background loops stay out
      * of the audit stream.
      */
-    fun runOnce(
+    override fun runOnce(
         catalog: String,
         batchSize: Int,
-        trigger: MaintenanceTrigger = MaintenanceTrigger.MANUAL,
+        trigger: MaintenanceTrigger,
     ): CleanupResult =
         drainCatalog(catalog, batchSize, trigger, receiptPurgeDeadline()).also {
             // ONCE PER RUN, after the drain: the retention purge is
@@ -1633,6 +1633,7 @@ class CleanupService(
      * shrinking.
      */
     private fun purgeDrainedLedger(runLabel: String) {
+        val boundId = com.posthog.hoglake.persistence.CatalogBinding.currentId()
         val deadline = System.nanoTime() + Duration.ofMillis(ledgerPurgeBudgetMs).toNanos()
         var after = 0L
         var purged = 0L
@@ -1652,7 +1653,17 @@ class CleanupService(
             }
             val page =
                 jdbi.withHandleUnchecked { h ->
-                    h.createQuery(PURGE_PAGE_SQL)
+                    h.createQuery(
+                        if (boundId == null) {
+                            PURGE_PAGE_SQL
+                        } else {
+                            PURGE_PAGE_SQL.replace(
+                                "AND drained_at <",
+                                "AND catalog_id = :boundCatalogId AND drained_at <",
+                            )
+                        },
+                    )
+                        .also { if (boundId != null) it.bind("boundCatalogId", boundId) }
                         .bind("after", after)
                         .bind("page", ledgerPurgePage)
                         .bind("retention", ledgerRetentionSeconds)

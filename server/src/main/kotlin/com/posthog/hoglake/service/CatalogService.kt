@@ -563,8 +563,8 @@ class CatalogService(private val jdbi: Jdbi) {
         val cols = initialColumns(columns)
         // Publication catches definition validation and records a rejected receipt.
         // All such refusals must precede snapshot allocation or table mutation.
-        AlterService(jdbi).validatePartitionFields(cols, partitionFields)
-        AlterService(jdbi).validateSortFields(cols, sortFields)
+        AlterService.validatePartitionFields(cols, partitionFields)
+        AlterService.validateSortFields(cols, sortFields)
         val cat = requireCatalog(h, catalog)
         Locks.acquireCatalogCommitLock(h, cat.catalogId)
         val ns = requireNamespace(h, cat, namespace)

@@ -35,6 +35,7 @@ class CommitConflictSpecParityTest {
     private val spec: String = File("src/main/resources/openapi/hoglake.yaml").readText()
     private val routes: String = File("src/main/kotlin/com/posthog/hoglake/api/Routes.kt").readText()
     private val mapper = wireObjectMapper()
+    private val exceptionDeclarationPattern = Regex("(?<!\\?):\\s*(?:HoglakeException\\.)?(\\w+)\\(")
 
     /**
      * Every commit endpoint, read off the routing tree rather than
@@ -272,12 +273,11 @@ class CommitConflictSpecParityTest {
         // is the case reflection cannot see; here it is a declaration with
         // no matching type, and the counts diverge.
         val known = exceptionTypes().mapNotNull { it.simpleName }.toSet()
-        val pattern = Regex(":\\s*(?:HoglakeException\\.)?(\\w+)\\(")
         val declared =
             File("src/main/kotlin")
                 .walkTopDown()
                 .filter { it.isFile && it.extension == "kt" }
-                .flatMap { file -> pattern.findAll(file.readText()).map { it.groupValues[1] } }
+                .flatMap { file -> exceptionDeclarationPattern.findAll(file.readText()).map { it.groupValues[1] } }
                 .filter { it == "HoglakeException" || it in known }
                 .count()
         assertThat(declared)
@@ -287,6 +287,18 @@ class CommitConflictSpecParityTest {
                 known.size,
             )
             .isEqualTo(known.size)
+    }
+
+    @Test
+    fun `exception declaration scan ignores Elvis but still catches real subtypes`() {
+        val source =
+            """
+            val absent = row ?: HoglakeException.NotFound("missing")
+            class Extra(message: String) : HoglakeException.CommitConflict(message)
+            class Direct(message: String) : HoglakeException(message)
+            """.trimIndent()
+        assertThat(exceptionDeclarationPattern.findAll(source).map { it.groupValues[1] }.toList())
+            .containsExactly("CommitConflict", "HoglakeException")
     }
 
     /**

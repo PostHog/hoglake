@@ -125,9 +125,11 @@ class MaintenanceRunStore(private val jdbi: Jdbi) {
                     SELECT catalog_id, :task, :trigger, :startedAt, :finishedAt, :status, :error,
                            CAST(:result AS jsonb)
                       FROM hog_catalog WHERE name = :catalog
+                       AND (:boundId::bigint IS NULL OR catalog_id = :boundId)
                     """,
                 )
                     .bind("catalog", catalog)
+                    .bind("boundId", CatalogBinding.id(catalog))
                     .bindLedgerFields(task, trigger, startedAt, finishedAt, status, error, resultJson)
                     .execute()
             }

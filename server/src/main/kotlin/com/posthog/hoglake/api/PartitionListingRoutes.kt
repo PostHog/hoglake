@@ -6,6 +6,7 @@ import com.posthog.hoglake.model.PartitionListing
 import com.posthog.hoglake.model.PartitionListingValue
 import com.posthog.hoglake.model.PartitionSpecField
 import com.posthog.hoglake.model.PartitionSpecSummary
+import com.posthog.hoglake.service.PartitionListingBackend
 import com.posthog.hoglake.service.PartitionListingService
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
@@ -38,7 +39,7 @@ import java.time.Instant
  * exactly, and a default `limit` because a sample listing has no
  * historical unbounded caller to keep working.
  */
-fun Application.installPartitionListingRoutes(listings: PartitionListingService) {
+fun Application.installPartitionListingRoutes(listings: PartitionListingBackend) {
     routing {
         get("/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/partitions") {
             call.respond(

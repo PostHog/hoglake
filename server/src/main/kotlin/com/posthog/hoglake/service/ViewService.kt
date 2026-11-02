@@ -27,15 +27,15 @@ import org.jdbi.v3.core.kotlin.withHandleUnchecked
  * or rewrites it — it is an opaque string in the declared dialect,
  * interpreted only by the query engine that reads it back.
  */
-class ViewService(private val jdbi: Jdbi) {
-    fun create(
+class ViewService(private val jdbi: Jdbi) : ViewBackend {
+    override fun create(
         catalog: String,
         namespace: String,
         name: String,
         sql: String,
-        dialect: String = "trino",
-        author: String? = null,
-        message: String? = null,
+        dialect: String,
+        author: String?,
+        message: String?,
     ): ViewInfo =
         Audit.audited(
             "view_create",
@@ -89,7 +89,7 @@ class ViewService(private val jdbi: Jdbi) {
             }
         }
 
-    fun get(
+    override fun get(
         catalog: String,
         namespace: String,
         name: String,
@@ -104,7 +104,7 @@ class ViewService(private val jdbi: Jdbi) {
         }
 
     /** Live views in the namespace, ordered by name. */
-    fun list(
+    override fun list(
         catalog: String,
         namespace: String,
     ): List<ViewInfo> =
@@ -114,12 +114,12 @@ class ViewService(private val jdbi: Jdbi) {
             ViewRepo.listLive(h, cat.catalogId, ns.namespaceId, ns.name)
         }
 
-    fun drop(
+    override fun drop(
         catalog: String,
         namespace: String,
         name: String,
-        author: String? = null,
-        message: String? = null,
+        author: String?,
+        message: String?,
     ): CommitResult =
         Audit.audited(
             "view_drop",

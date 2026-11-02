@@ -1,6 +1,6 @@
 package com.posthog.hoglake.api
 
-import com.posthog.hoglake.service.UploadService
+import com.posthog.hoglake.service.UploadBackend
 import io.ktor.server.application.Application
 import io.ktor.server.plugins.BadRequestException
 import io.ktor.server.request.receive
@@ -17,7 +17,7 @@ data class UploadOwnerDto(val owner: UUID)
 
 data class AbandonUploadsDto(val owner: UUID, val paths: List<String>)
 
-fun Application.installUploadRoutes(uploads: UploadService) {
+fun Application.installUploadRoutes(uploads: UploadBackend) {
     routing {
         route("/v1/catalogs/{catalog}/uploads") {
             put("/{upload}") {

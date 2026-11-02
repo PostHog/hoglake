@@ -315,16 +315,22 @@ class MaintenanceSummarySampler(
     )
 
     /** Share a tick's row budget across at most ten catalogs/checkpoints. */
-    fun tick(rowBudget: Int = 10_000) {
+    fun tick(
+        rowBudget: Int = 10_000,
+        catalogIds: List<Long>? = null,
+    ) {
         require(rowBudget > 0)
         val jobs = minOf(10, rowBudget)
         repeat(jobs) {
-            if (!runOnce(rowBudget / jobs)) return
+            if (!runOnce(rowBudget / jobs, catalogIds)) return
         }
     }
 
     /** True if a checkpoint was advanced; false when nothing is due. */
-    fun runOnce(batchSize: Int = 10_000): Boolean {
+    fun runOnce(
+        batchSize: Int = 10_000,
+        catalogIds: List<Long>? = null,
+    ): Boolean {
         require(batchSize > 0)
         return jdbi.inTransactionUnchecked { h ->
             h.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
@@ -335,29 +341,37 @@ class MaintenanceSummarySampler(
                 INSERT INTO hog_maintenance_summary (catalog_id)
                 SELECT c.catalog_id FROM hog_catalog c
                 WHERE NOT EXISTS (SELECT 1 FROM hog_maintenance_summary s WHERE s.catalog_id = c.catalog_id)
+                AND (:allCatalogs OR c.catalog_id = ANY(:catalogIds))
                 ORDER BY c.catalog_id LIMIT 100 ON CONFLICT DO NOTHING
                 """,
-            ).execute()
+            )
+                .bind("allCatalogs", catalogIds == null)
+                .bindArray("catalogIds", Long::class.javaObjectType, catalogIds ?: emptyList<Long>())
+                .execute()
             val job =
                 h.createQuery(
                     """
                 SELECT catalog_id, generation, published_generation, scan_state::text AS scan
                 FROM hog_maintenance_summary WHERE next_batch_at <= now()
+                AND (:allCatalogs OR catalog_id = ANY(:catalogIds))
                 ORDER BY next_batch_at, catalog_id LIMIT 1 FOR UPDATE SKIP LOCKED
                 """,
-                ).map { rs, _ ->
-                    Job(
-                        rs.getLong("catalog_id"), rs.getLong("generation"), rs.getLong("published_generation"),
-                        // A scan_state this build cannot parse is a scan
-                        // from a build whose cursor had a different shape
-                        // (the keyset moved from row-id to size order).
-                        // The state is a disposable sample, so drop it and
-                        // start a fresh scan rather than killing the sweep.
-                        rs.getString("scan")?.let {
-                            runCatching { json.readValue(it, Scan::class.java) }.getOrNull()
-                        },
-                    )
-                }.findOne().orElse(null) ?: return@inTransactionUnchecked false
+                )
+                    .bind("allCatalogs", catalogIds == null)
+                    .bindArray("catalogIds", Long::class.javaObjectType, catalogIds ?: emptyList<Long>())
+                    .map { rs, _ ->
+                        Job(
+                            rs.getLong("catalog_id"), rs.getLong("generation"), rs.getLong("published_generation"),
+                            // A scan_state this build cannot parse is a scan
+                            // from a build whose cursor had a different shape
+                            // (the keyset moved from row-id to size order).
+                            // The state is a disposable sample, so drop it and
+                            // start a fresh scan rather than killing the sweep.
+                            rs.getString("scan")?.let {
+                                runCatching { json.readValue(it, Scan::class.java) }.getOrNull()
+                            },
+                        )
+                    }.findOne().orElse(null) ?: return@inTransactionUnchecked false
 
             var generation = job.generation
             var scan = job.scan

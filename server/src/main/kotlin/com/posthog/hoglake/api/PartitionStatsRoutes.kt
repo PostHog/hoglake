@@ -4,6 +4,7 @@ import com.fasterxml.jackson.annotation.JsonInclude
 import com.posthog.hoglake.model.PartitionDebt
 import com.posthog.hoglake.model.PartitionStatsReport
 import com.posthog.hoglake.model.PartitionValue
+import com.posthog.hoglake.service.PartitionStatsBackend
 import com.posthog.hoglake.service.PartitionStatsService
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
@@ -21,7 +22,7 @@ import java.util.UUID
  * HoglakeExceptions are mapped by ErrorMapping (404 unknown names, 422
  * for table-without-namespace / non-positive limit).
  */
-fun Application.installPartitionStatsRoutes(stats: PartitionStatsService) {
+fun Application.installPartitionStatsRoutes(stats: PartitionStatsBackend) {
     routing {
         get("/v1/catalogs/{catalog}/stats/partitions") {
             call.respond(

@@ -65,6 +65,8 @@ object Database {
                 validationTimeout = 2_500
                 // No idle-in-transaction squatters, ever.
                 connectionInitSql = SESSION_INIT_SQL
+                // Mixed mode starts its healthy hoglite paths during a PostgreSQL outage.
+                if (cfg.database == DatabaseBackend.MIXED) initializationFailTimeout = -1
             }
         return HikariDataSource(hc)
     }

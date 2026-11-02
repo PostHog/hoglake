@@ -2728,6 +2728,49 @@ sealed class HoglakeException(message: String) : RuntimeException(message) {
     ) : CommitConflict(detail)
 
     /**
+     * The configured database backend did not answer inside its budget
+     * (all hoglite pools unreachable, a tripped circuit breaker, or a
+     * retry budget exhausted on transient errors) -> HTTP 503
+     * `backend_unavailable` with `Retry-After`.
+     *
+     * Retryable: nothing about the request was refused. Caveat the
+     * caller must know: a commit whose TRANSACTION timed out may have
+     * applied — the client got no answer, not a rollback — so a retried
+     * write needs its own idempotency (an idempotency key, or the
+     * acceptance of a typed AlreadyExists/Conflict on the retry).
+     * Distinct from [CommitQueueTimeout] — that
+     * one is a catalog convoying on its own commit lock while the
+     * database is healthy; this one is the database itself not
+     * answering, which an operator pages on differently.
+     */
+    open class BackendUnavailable(detail: String) : HoglakeException(detail)
+
+    /**
+     * A commit the backend may or may not have applied -> HTTP 503
+     * `commit_outcome_unknown` with `Retry-After`. Raised by the hoglite
+     * backend when a transaction's attempts ended after at least one that
+     * may have applied (the engine's 504 `outcome_unknown`: applied, then
+     * the owner failed before durability was confirmed; a transport
+     * failure after the request was sent) and no later answer settled it.
+     *
+     * It IS a [BackendUnavailable] (retryable, never a refusal: the commit
+     * may have landed, so nothing may treat it as final), with its own
+     * code so a writer can tell "the database did not answer" from "your
+     * commit may be durable". Retrying the SAME backend transaction
+     * ([txid]) is exactly-once; a caller's retry with the same
+     * idempotency key is exactly-once too, and one without a key is
+     * at-least-once, the same as a lost COMMIT acknowledgement on
+     * Postgres.
+     */
+    class CommitOutcomeUnknown(
+        val txid: String,
+        detail: String,
+    ) : BackendUnavailable(
+            "transaction '$txid' outcome unknown (it may or may not have committed; " +
+                "retrying it with the same txid is exactly-once): $detail",
+        )
+
+    /**
      * A commit to a table with the object-prefix layout registered a file
      * the layout does not admit -> HTTP 422 `object_prefix_violation`,
      * naming [table] and `retry: re-prepare`.

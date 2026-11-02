@@ -173,6 +173,8 @@ data class CreateCatalogRequestDto(
     val author: String? = null,
     @JsonDeserialize(using = OperationTextDeserializer::class)
     val message: String? = null,
+    val backend: String? = null,
+    val connectionRef: String? = null,
 )
 
 data class OperationMetadataDto(

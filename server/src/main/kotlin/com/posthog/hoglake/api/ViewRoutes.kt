@@ -1,7 +1,7 @@
 package com.posthog.hoglake.api
 
 import com.posthog.hoglake.auth.actorOrRefuse
-import com.posthog.hoglake.service.ViewService
+import com.posthog.hoglake.service.ViewBackend
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
@@ -18,7 +18,7 @@ import io.ktor.server.routing.routing
  * travels and is stored verbatim — the server never parses it.
  * Installed separately so App.kt wires it with its own ViewService.
  */
-fun Application.installViewRoutes(views: ViewService) {
+fun Application.installViewRoutes(views: ViewBackend) {
     routing {
         route("/v1/catalogs/{catalog}/namespaces/{namespace}/views") {
             get {
