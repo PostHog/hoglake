@@ -53,7 +53,7 @@ dependencies = [
 # endpoints before, so an install must not silently get the other
 # framing. boto3 1.36.0 (PyPI, 2025-01-15) is the matching release: it
 # requires botocore >=1.36.0,<1.37.0.
-fast-upload = ["boto3>=1.43.114"]
+fast-upload = ["boto3>=1.43.118"]
 
 [project.urls]
 Repository = "https://github.com/PostHog/hoglake"
@@ -77,7 +77,7 @@ dev = [
     # Not optional for the suite: the single-request upload path is only
     # covered if boto3 is importable here. Same floor as the extra, so
     # the suite cannot pass against framing the extra would not install.
-    "boto3>=1.43.114",
+    "boto3>=1.43.118",
 ]
 
 [build-system]

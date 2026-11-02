@@ -1252,7 +1252,7 @@ def test_extract_column_stats_production_callers_are_known():
     # ONE call since the writer core: writer._registration builds every
     # registration, a footer this process wrote and a prepared file's alike.
     assert callers == [
-        "writer.py: for stat in extract_column_stats(part.metadata, tuple(columns))",
+        "writer.py: found = extract_column_stats(part.metadata, tuple(columns))",
     ], f"unexpected caller(s) of extract_column_stats: {callers}"
 
 

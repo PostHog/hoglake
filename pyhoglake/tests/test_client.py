@@ -1622,6 +1622,102 @@ def test_commit_410_below_the_floor_is_re_prepare_not_a_reconcile(client, httpx_
     assert ei.value.re_prepare is True
 
 
+@pytest.mark.parametrize(
+    "body,table",
+    [
+        (
+            {
+                "error": "object_prefix_violation",
+                "detail": "expected under s3://b/lake/data/ns1/events/team_id=4/",
+                "tables": ["ns1.events"],
+                "retry": "re-prepare",
+            },
+            "ns1.events",
+        ),
+        ({"error": "object_prefix_violation"}, None),
+    ],
+    ids=["full-body", "code-only"],
+)
+def test_commit_422_object_prefix_violation_is_re_prepare(
+    client, httpx_mock, body, table
+):
+    """The server's `retry: re-prepare`: a file outside the layout cannot
+    land on replay. Still a ValidationError, so `except ValidationError`
+    keeps catching it, and a plain 422 stays a plain ValidationError."""
+    from pyhoglake import ObjectPrefixViolationError, ValidationError
+
+    cat = _catalog(client, httpx_mock)
+    httpx_mock.add_response(
+        method="POST",
+        url=f"{BASE}/v1/catalogs/cat/commit",
+        json=body,
+        status_code=422,
+    )
+    with pytest.raises(ObjectPrefixViolationError) as ei:
+        cat._commit({"appends": []})
+    assert isinstance(ei.value, ValidationError)
+    assert ei.value.status_code == 422
+    assert (ei.value.retryable, ei.value.re_prepare) == (False, True)
+    assert ei.value.table == table
+    assert ei.value.detail == body.get("detail")
+
+    httpx_mock.add_response(
+        method="POST",
+        url=f"{BASE}/v1/catalogs/cat/commit",
+        json={"error": "validation", "detail": "bad stats"},
+        status_code=422,
+    )
+    with pytest.raises(ValidationError) as plain:
+        cat._commit({"appends": []})
+    assert type(plain.value) is ValidationError
+    assert not plain.value.re_prepare
+
+
+def test_a_re_prepare_code_is_typed_only_at_its_own_status(client, httpx_mock):
+    """A code is the contract only with its status: `object_prefix_violation`
+    on a 409 is the caller's conflict class, not the 422 refusal."""
+    from pyhoglake import ObjectPrefixViolationError
+
+    cat = _catalog(client, httpx_mock)
+    httpx_mock.add_response(
+        method="POST",
+        url=f"{BASE}/v1/catalogs/cat/commit",
+        json={"error": "object_prefix_violation"},
+        status_code=409,
+    )
+    with pytest.raises(CommitConflictError) as ei:
+        cat._commit({"appends": []})
+    assert not isinstance(ei.value, ObjectPrefixViolationError)
+
+
+@pytest.mark.parametrize("status", [409, 422, 503])
+def test_an_error_code_that_is_not_a_string_stays_in_the_taxonomy(
+    client, httpx_mock, status
+):
+    """A gateway's body can carry anything under `error`; a dict does
+    not hash, and looking it up must not leak a TypeError past
+    `except HoglakeError` on any status."""
+    cat = _catalog(client, httpx_mock)
+    httpx_mock.add_response(
+        method="POST",
+        url=f"{BASE}/v1/catalogs/cat/commit",
+        json={"error": {"code": "upstream"}},
+        status_code=status,
+    )
+    with pytest.raises(HoglakeError) as ei:
+        cat._commit({"appends": []})
+    assert ei.value.status_code == status
+    assert not ei.value.re_prepare
+
+
+def test_object_prefix_violation_is_exported():
+    import pyhoglake
+    from pyhoglake.errors import ObjectPrefixViolationError
+
+    assert pyhoglake.ObjectPrefixViolationError is ObjectPrefixViolationError
+    assert "ObjectPrefixViolationError" in pyhoglake.__all__
+
+
 def test_every_request_identifies_the_client(client, httpx_mock):
     """`User-Agent: pyhoglake/<version>` on every request.
 

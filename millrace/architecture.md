@@ -245,11 +245,21 @@ drain's retry pass (§6) treats every indexed group as due.
    `file_size_bytes` measured on the body; `column_stats` only for a
    file of at least 32 MiB, the rest left to the server's hydrator);
    chunk the files into commits of at most `max_files_per_commit` (512).
+   On a table whose `object_prefix_field` is set (hoglake's object-prefix
+   layout), a row whose value of that field is null or negative is
+   dropped at decode (`object_prefix_value`), every file's stats for the
+   field are held to its partition value before upload
+   (`pyhoglake.object_prefix.check_field_stats`; a mismatch fails the
+   build, rows staged), and a file under 32 MiB registers those stats
+   alone instead of deferring, so it is `provided` (mountable,
+   compactable) at commit and no hydrator older than hoglake 2.1c can
+   flip it unchecked.
    Each build times its stages (decode, Arrow build, sort, fanout,
    variant encode, write) and its wait for a pool thread (§9).
 3. Per commit: upload every file (objects at
-   `{data_path}/data/{ns}/{table}/{build}/{index}.parquet`, `build` a
-   fresh token per build), then publish with a fresh uuid4
+   `{data_path}/data/{ns}/{table}/{build}/{index}.parquet`, or
+   `…/{table}/{field}={value}/{build}/{index}.parquet` under the
+   object-prefix layout, `build` a fresh token per build), then publish with a fresh uuid4
    `idempotency_key`, `read_snapshot` from the shape read and the
    pinned `expected_table_uuid`.
 4. As each commit lands, `PartitionStage.settle` deletes exactly the
@@ -295,6 +305,12 @@ table.
 | 409 `table_recreated` | `FlushHalted` (exit 3) |
 | other 4xx (400/422 payload refusal, 401, 403, 404, 413, 409 `table_dropped`) | `CommitRefused`, counted by status; the decision stops and its unpublished groups split out |
 | ladder exhausted | `CommitExhausted`; the decision fails; its objects may be live, so they are counted as ambiguous (`millrace_flush_ambiguous_uploads_total`), never as orphans |
+
+A 422 `object_prefix_violation` is a `CommitRefused` too, though its
+body says re-prepare: an option set after millrace's read is answered
+`ddl_since_read_snapshot` first (every alter is DDL), so the 422 means
+millrace's pre-upload check and the server's disagree, which a rebuild
+would repeat.
 
 **Batched decision** (`HoglakeFlusher.flush_batch`, the only flush
 implementation): every group of the decision is built on ONE shape

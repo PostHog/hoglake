@@ -411,6 +411,37 @@ def test_append_rebind_after_preflight_is_409d_by_the_server(
     assert len(fake_s3.files) == 1  # parquet orphaned in the bucket
 
 
+def test_append_to_an_object_prefix_table_is_refused_once_not_retried(
+    table, httpx_mock, fake_s3
+):
+    """Table.append writes under the table root, so on a table with the
+    object-prefix option the server refuses it. The refusal says
+    re-prepare, which only a writer that places its files can act on;
+    append raises it after its one commit and does not try again."""
+    from pyhoglake import ObjectPrefixViolationError
+
+    prefixed = {**TABLE_WIRE, "object_prefix_field": "id"}
+    httpx_mock.add_response(method="GET", url=_WRITER_TABLES_URL, json=prefixed)
+    httpx_mock.add_response(
+        method="POST",
+        url=_COMMIT_URL,
+        json={
+            "error": "object_prefix_violation",
+            "detail": "expected under s3://bkt/lake/data/ns1/events/id=1/",
+            "tables": ["ns1.events"],
+            "retry": "re-prepare",
+        },
+        status_code=422,
+    )
+    with pytest.raises(ObjectPrefixViolationError) as ei:
+        table.append(pa.table({"id": [1], "name": ["a"]}))
+    assert (ei.value.status_code, ei.value.table) == (422, "ns1.events")
+    assert ei.value.re_prepare and not ei.value.retryable
+    ((key, _),) = fake_s3.files.items()
+    assert "/id=" not in key  # the table root, not the prefix
+    assert len([r for r in httpx_mock.get_requests() if r.method == "POST"]) == 1
+
+
 def test_append_ordinary_commit_conflict_stays_retryable(table, httpx_mock, fake_s3):
     # a 409 that does NOT indicate recreation keeps the existing
     # taxonomy: CommitConflictError, retryable
