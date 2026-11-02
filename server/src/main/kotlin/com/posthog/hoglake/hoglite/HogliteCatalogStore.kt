@@ -76,8 +76,20 @@ class HogliteCatalogStore(
     internal val refuseBlindPartitionedAppends: Boolean = false,
     /** Removal-ledger retention, for the upload sweep's rested-tombstone rule. */
     private val ledgerRetentionSeconds: Long = com.posthog.hoglake.service.CleanupService.LEDGER_RETENTION_SECONDS,
+    /**
+     * Config.hogliteInteriorPlanReads: the commit pre-flight batch reads
+     * as an interior read ([readCatalogInterior]). Off is the rollback:
+     * every read parks for durability, as before.
+     */
+    internal val interiorPlanReads: Boolean = false,
 ) : CatalogStore {
     internal val json: ObjectMapper = jacksonObjectMapper()
+
+    /** Commits whose interior plan was thrown away and decided again on a parked plan (HogliteCommit). */
+    internal val interiorRedecided = java.util.concurrent.atomic.AtomicLong()
+
+    /** Last warning for an interior plan read the engine answered without a token. */
+    private val interiorUnservedLoggedMs = java.util.concurrent.atomic.AtomicLong(Long.MIN_VALUE / 2)
 
     /**
      * The LEGACY tenant-id shape (deployment prefix + catalog name).
@@ -2363,6 +2375,8 @@ class HogliteCatalogStore(
         fp: String?,
         tx: HogliteTx,
         fenced: Boolean = true,
+        /** The token of the interior read [tx] was decided on ([readCatalogInterior]); null = no fence. */
+        incarnation: String? = null,
     ): List<HogliteQueryResult> =
         try {
             val statements =
@@ -2379,7 +2393,7 @@ class HogliteCatalogStore(
                 }
             val results =
                 withBoundTenant(catalog) { tenant ->
-                    client.tx(tenant, txid, fp, statements)
+                    client.tx(tenant, txid, fp, statements, incarnation)
                 }
             if (fenced) results.subList(1, results.size) else results
         } catch (g: HogliteGuardFailure) {
@@ -2423,6 +2437,56 @@ class HogliteCatalogStore(
             withBoundTenant(catalog) { tenant -> client.readTx(tenant, statements) }
         } catch (r: HogliteRejected) {
             throw mapRejected(catalog, r)
+        }
+    }
+
+    /**
+     * [readCatalog] as an INTERIOR read ([HogliteClient.interiorReadTx]):
+     * applied state, not waited on for durability, plus the incarnation
+     * token the write decided on it must carry. ONLY for the commit
+     * pre-flight ([HogliteCommit]), whose results decide that commit's own
+     * write and nothing else; [HogliteCommit] decides again on [readCatalog]
+     * whenever an interior plan would answer without that write. Every
+     * other read — anything returned to a caller, the registry, background
+     * jobs — uses [readCatalog] or [queryCatalog] and parks.
+     */
+    internal fun readCatalogInterior(
+        catalog: String,
+        statements: List<HogliteStatement>,
+    ): HogliteInteriorRead {
+        if (unbatchedReadsForTests) {
+            return HogliteInteriorRead(readCatalog(catalog, statements), null)
+        }
+        val read =
+            try {
+                withBoundTenant(catalog) { tenant -> client.interiorReadTx(tenant, statements) }
+            } catch (r: HogliteRejected) {
+                throw mapRejected(catalog, r)
+            }
+        if (read.incarnation == null) interiorUnservedByEngine()
+        return read
+    }
+
+    /**
+     * The setting is on, but the engine did not serve the read as interior:
+     * it predates interior reads (and ignored the field) or runs without
+     * `-interior-reads`. Both park the read and return no token, so the
+     * commit is planned on a durable read and stays correct — but the
+     * operator believes the setting is in force. That must not be silent:
+     * count it, and log a warning at most once a minute.
+     */
+    private fun interiorUnservedByEngine() {
+        com.posthog.hoglake.observability.Metrics.hogliteInteriorPlanReadUnserved()
+        val now = System.currentTimeMillis()
+        val last = interiorUnservedLoggedMs.get()
+        if (now - last >= 60_000 && interiorUnservedLoggedMs.compareAndSet(last, now)) {
+            log.warn {
+                "HOGLAKE_HOGLITE_INTERIOR_PLAN_READS is on, but hoglite answered a commit pre-flight read " +
+                    "without an incarnation token: the engine predates interior reads or runs without " +
+                    "-interior-reads (HL_INTERIOR_READS). Commits stay correct on the parked read, but the " +
+                    "setting has no effect. Pair it with an engine that has interior reads (hoglite #8), " +
+                    "or unset it. Counted in hoglake_hoglite_interior_plan_reads_unserved_total."
+            }
         }
     }
 
