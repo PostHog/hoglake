@@ -21,6 +21,7 @@ import logging
 import os
 import sys
 import time
+from contextlib import suppress
 from functools import cache, partial
 from importlib import metadata
 from types import ModuleType
@@ -91,10 +92,8 @@ def encode(
             values = list(values)
             why = "a row is not UTF-8 text"
             if all(type(v) in (str, bytes) or v is None for v in values):
-                try:
+                with suppress(UnicodeEncodeError):  # a str with a lone surrogate
                     chunks = [pa.array(values, pa.binary())]
-                except UnicodeEncodeError:  # a str with an unpaired surrogate
-                    pass
     python = partial(
         codec.encode,
         plan=plan,

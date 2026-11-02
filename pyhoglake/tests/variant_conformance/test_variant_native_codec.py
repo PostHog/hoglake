@@ -351,6 +351,22 @@ def test_every_json_value_of_the_vectors():
     assert len(BYTE_EQUAL.intersection(taken)) == 14
 
 
+#: Strings cut short after escapes, controls and nothing, as text and keys:
+#: the position and wording are the running CPython's.
+UNTERMINATED = [
+    b'"\\u0001\\\\\\u0001\\u000A',  # CI on 3.13.16, 2026-11-02
+    *(b'"' + tail for tail in (b"", b"\\", b"\\u", b"\\u0", b"\\u004", b"\\u0041", b"ab\\u0041", b"\\n\\u0041",
+                               b"\\\\\\u0041", b"\\u0041x", b"\\ud800\\udc00", b"\\ud800\\udc0", b"\\ud800\\u0041",
+                               b"\\x", b"\x01", b"a\x01\\u0041", b"\\u0041\\u0042", b"\\/")),
+    b'{"\\u0041', b'["\\u0041', b'{"a":"\\u0041', b'["x","\\ud83d\\ude00',
+]  # fmt: skip
+
+
+def test_strings_cut_short():
+    report = assert_same(UNTERMINATED)
+    assert assert_same_faults(UNTERMINATED) == report.invalid_rows == len(UNTERMINATED)
+
+
 def test_json_test_suite():
     # Every test_parsing file as one row, verdicts by Python's parser, not
     # the RFC's (Python takes NaN to its hook, refuses \f as whitespace).
@@ -454,7 +470,12 @@ def _rows(rng: random.Random, n: int) -> list[bytes]:
     rows = []
     for _ in range(n):
         text = _value(rng, 0).encode("utf-8", "surrogatepass")
-        if rng.random() < 0.3:
+        escapes = [i for i in range(len(text) - 1) if text[i : i + 2] == b"\\u"]
+        if escapes and rng.random() < 0.03:
+            # Cut inside or just after a \u escape: CPython's rule there
+            # changed in 3.14 and 3.13.14 or so.
+            text = text[: rng.choice(escapes) + rng.randrange(2, 8)]
+        elif rng.random() < 0.3:
             at, kind = rng.randrange(len(text) + 1), rng.random()
             bad = rng.choice(_BAD)
             text = (text[:at] if kind < 0.25 else text[:at] + bad + text[at:] if kind < 0.6

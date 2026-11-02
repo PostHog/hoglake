@@ -67,12 +67,8 @@ pub struct Scratch {
 
 impl Scratch {
     pub fn bytes<'a>(&'a self, text: &'a [u8], span: Span) -> &'a [u8] {
-        let range = span.start as usize..(span.start + span.len) as usize;
-        if span.arena {
-            &self.arena[range]
-        } else {
-            &text[range]
-        }
+        let source = if span.arena { &self.arena[..] } else { text };
+        &source[span.start as usize..(span.start + span.len) as usize]
     }
 
     pub fn key<'a>(&'a self, text: &'a [u8], key: u32) -> &'a [u8] {
@@ -317,7 +313,7 @@ impl Parser<'_> {
             }
             next += 1;
             end = next + 4;
-            // Before 3.14, CPython wants a character after the four digits.
+            // Older CPython wants a character after the four digits.
             if end > len || (self.o.escape_needs_tail && end == len) {
                 return Err(json(t, "Invalid \\uXXXX escape", next - 1));
             }
@@ -358,14 +354,12 @@ impl Parser<'_> {
                 (float, i) = (true, self.skip(sign, DIGITS));
             }
         }
-        // Unreachable: the scan above admits only ASCII digits, signs, `.` and `e`.
-        let text = std::str::from_utf8(&t[start..i])
-            .map_err(|_| Fault::unlocated("invalid_json", "a number token is not ASCII"))?;
+        // The scan above admits only ASCII digits, signs, `.` and `e`.
+        let text = std::str::from_utf8(&t[start..i]).unwrap_or_default();
         let tok = if float {
             // Unreachable: the scan above admits only JSON number grammar.
-            let value: f64 = text
-                .parse()
-                .map_err(|_| Fault::unlocated("invalid_json", format!("{text} does not parse as a number")))?;
+            let value: f64 =
+                text.parse().map_err(|_| Fault::unlocated("invalid_json", format!("{text} is no number")))?;
             if value.is_infinite() {
                 let detail = format!("{} is beyond the range of a double", &text[..text.len().min(40)]);
                 return Err(Fault::unlocated("non_finite_number", detail));

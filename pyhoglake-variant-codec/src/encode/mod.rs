@@ -19,7 +19,7 @@ pub use parse::PARSE_DEPTH;
 
 /// How one call encodes. `stop_at_invalid` is `on_invalid="raise"`;
 /// `max_int_digits` is `sys.get_int_max_str_digits()`, 0 for none; the last
-/// two are CPython's: 3.13 and later, and before 3.14.
+/// two are the running CPython's json rules (the binding probes them).
 #[derive(Clone, Debug)]
 pub struct Options {
     pub nullable: bool,
