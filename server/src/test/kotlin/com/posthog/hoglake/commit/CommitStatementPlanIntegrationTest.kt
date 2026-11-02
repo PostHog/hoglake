@@ -44,7 +44,8 @@ import java.util.UUID
  * commit has. [PREFIX] is the option-on table, with [PREFIX_FILES] files
  * of its own and the partition values every partitioned file carries, so
  * the DV-target probe of `hog_file_partition_value` runs against
- * production's shape too.
+ * production's shape too. [HISTORY] has the option with its prefix
+ * column [VERSIONS] versions deep, among [WIDE] more live columns.
  */
 @Tag("integration")
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
@@ -76,6 +77,17 @@ class CommitStatementPlanIntegrationTest {
 
         /** Distinct prefix values among them. */
         const val TEAMS = 50
+
+        /**
+         * An option-on table (even, so it has a layout on field 1) whose
+         * prefix column has [VERSIONS] ended versions behind its live one,
+         * what renames from before the option, promotes and comments leave
+         * until expiry, and [WIDE] more
+         * live columns than the rest.
+         */
+        const val HISTORY = 4L
+        const val VERSIONS = 500
+        const val WIDE = 200
 
         /** Every big table a commit statement touches; none may be scanned whole. */
         val BIG_TABLES =
@@ -288,6 +300,30 @@ class CommitStatementPlanIntegrationTest {
                 """,
             ).bind("c", catalogId).bind("s", SNAPSHOTS).bind("r", RECEIPTS).execute()
             dvTargets = listOf(41L, 81L, 121L)
+            // HISTORY: every ended version of field 1 OLDER than the live
+            // one, as the DDL writes them, and the live one moved past them.
+            h.execute(
+                "UPDATE hog_column SET begin_snapshot = ? WHERE catalog_id = ? AND table_id = ? AND field_id = 1",
+                VERSIONS + 1,
+                catalogId,
+                HISTORY,
+            )
+            h.createUpdate(
+                """
+                INSERT INTO hog_column (catalog_id, table_id, field_id, begin_snapshot, end_snapshot, name, col_type,
+                                        ordinal)
+                SELECT :c, :t, 1, s, s + 1, 'team_' || s, 'long', 0 FROM generate_series(1, :v) s
+                UNION ALL
+                SELECT :c, :t, f, 0, NULL, 'c' || f, 'long', f - 1 FROM generate_series(:cols + 1, :cols + :w) f
+                """,
+            ).bind("c", catalogId).bind("t", HISTORY).bind("v", VERSIONS).bind("cols", COLUMNS).bind("w", WIDE)
+                .execute()
+            h.execute(
+                "UPDATE hog_table SET next_field_id = ? WHERE catalog_id = ? AND table_id = ?",
+                COLUMNS + WIDE + 1,
+                catalogId,
+                HISTORY,
+            )
             val small = listOf("hog_namespace", "hog_partition_spec", "hog_partition_field", "hog_catalog")
             for (relation in BIG_TABLES + small) {
                 h.execute("VACUUM (ANALYZE) $relation")
@@ -322,6 +358,17 @@ class CommitStatementPlanIntegrationTest {
             paths =
                 (1..PATHS).map { "s3://bucket/plan/data/ingest/t$PREFIX/team_id=${it % TEAMS}/${UUID.randomUUID()}" },
             targetIds = prefixTargets,
+        )
+
+    /** A prepared append to [HISTORY], under its prefixes. */
+    private fun historyAppend() =
+        CommitTail.ReadInputs(
+            catalogId = catalogId,
+            idempotencyKey = UUID.randomUUID(),
+            tables = listOf(CommitTail.TableKey("ingest", "t$HISTORY", appending = true, unchanged = false)),
+            readSnapshot = head() - READ_BEHIND,
+            paths = (1..PATHS).map { "s3://bucket/plan/data/ingest/t$HISTORY/c1=${it % TEAMS}/${UUID.randomUUID()}" },
+            targetIds = emptyList(),
         )
 
     /** The Trino shape: a guarded transaction over claimed uploads, appending and superseding live DVs. */
@@ -499,6 +546,19 @@ class CommitStatementPlanIntegrationTest {
     /** The statement's own total: the root node's cumulative Buffers line. */
     private fun totalBuffers(plan: String): Long = ExplainPlan.nodes(plan).first().buffers
 
+    /** The lines of [plan] under `CTE [name]`: that CTE's subtree alone, its root node first. */
+    private fun cte(
+        plan: String,
+        name: String,
+    ): String {
+        val lines = plan.lines()
+        val start = lines.indexOfFirst { it.trim() == "CTE $name" }
+        assertThat(start).describedAs("CTE %s in:%n%s", name, plan).isNotNegative()
+
+        fun depth(l: String) = l.length - l.trimStart().length
+        return lines.drop(start + 1).takeWhile { depth(it) > depth(lines[start]) }.joinToString("\n")
+    }
+
     /** pg_class.relpages of [table], read rather than written down. */
     private fun pages(table: String): Long =
         db.jdbi.withHandleUnchecked { h ->
@@ -589,6 +649,38 @@ class CommitStatementPlanIntegrationTest {
                 }
             }
         assertThat(values).isEqualTo(prefixTargets.associateWith { listOf("${it % TEAMS}") })
+    }
+
+    @Test
+    fun `the layout read takes the prefix column's newest live version, not its history`() {
+        // `layouts` on HISTORY: one descent of hog_table_layout_live and
+        // its heap page (3 buffers), then one backward descent of
+        // hog_column_pkey that stops at the live row (4). Measured 7; the
+        // bound leaves a descent's slack. MUTATION (#490): the plain LEFT
+        // JOIN filters the field's 500 ended versions on the forward
+        // pkey scan, Rows Removed by Filter: 500, 21 buffers.
+        val plan = explainAnalyze(CommitTail.READ_SQL) { q -> CommitTail.bindRead(q, historyAppend()) }
+        val layouts = cte(plan, "layouts")
+        val buffers = ExplainPlan.nodes(layouts).first().buffers
+        println("history layout read: $buffers buffers, the read ${totalBuffers(plan)}")
+        val generic = cte(explainGeneric(CommitTail.READ_SQL), "layouts")
+        for ((shape, text) in listOf("custom" to layouts, "generic" to generic)) {
+            assertThat(text).describedAs("the %s layout read:%n%s", shape, text)
+                .contains("Index Scan Backward using hog_column_pkey on hog_column")
+        }
+        assertThat(layouts).describedAs("the layout read walks:%n%s", layouts).doesNotContain("Rows Removed by Filter")
+        assertThat(buffers).describedAs("layout read buffers:%n%s", layouts).isLessThanOrEqualTo(10)
+        // And it answers the live version, not one of the 500 behind it.
+        val row =
+            db.jdbi.withHandleUnchecked { h ->
+                h.begin()
+                try {
+                    CommitTail.read(h, historyAppend()).tables.values.single().single()
+                } finally {
+                    h.rollback()
+                }
+            }
+        assertThat(row.prefixFieldName to row.prefixColType).isEqualTo("c1" to "long")
     }
 
     @Test
