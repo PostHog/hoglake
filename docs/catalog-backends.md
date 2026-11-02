@@ -163,11 +163,10 @@ The PostgreSQL summary sampler receives only registered, ready PostgreSQL identi
 Reindex remains a PostgreSQL database task.
 Mixed compaction retains the existing seeded jitter, including when leases are disabled.
 
-Mixed mode omits aggregate catalog totals.
-Its metrics loop refreshes the PostgreSQL reindex gauge only.
-It does not claim complete cross-backend catalog metrics.
-The omitted sampler registers no permanent zero values.
-The `/v1/info` aggregate totals remain absent.
+All modes collect catalog metrics through the configured metrics loop.
+Mixed mode samples only registered, ready directory entries.
+The sampler pins each entry's backend and immutable identity for that sample.
+The `/v1/info` totals use successful sampler observations.
 The database health endpoint reports PostgreSQL statistics plus hoglite findings.
 That endpoint fails if PostgreSQL cannot answer.
 Per-catalog maintenance endpoints remain the catalog-specific diagnostic surface.
@@ -176,63 +175,73 @@ Its `before` parameter is advisory because ledger IDs are local to their catalog
 The page uses descending start time and run ID, then ascending catalog name.
 Per-catalog run pagination retains its existing cursor behavior.
 
-### Unavailable metrics
+### Metrics scope and failure behavior
 
-Mixed mode does not collect the following sampler series:
+All 36 backend-neutral sampler series work in PostgreSQL-only, hoglite-only, and mixed modes.
+Existing catalog, namespace, table, consumer, task, status, and group labels retain their meanings.
+The PostgreSQL-only physical series are:
 
-```text
-hoglake_head_snapshot_id
-hoglake_earliest_snapshot_id
-hoglake_snapshot_count
-hoglake_head_age_seconds
-hoglake_removal_queue_depth
-hoglake_stats_pending_files
-hoglake_stats_pending_head_file_id
-hoglake_stats_failed_files
-hoglake_missing_field_id_files
-hoglake_object_prefix_quarantined_files
-hoglake_live_totals_sampled
-hoglake_live_totals_age_seconds
-hoglake_live_rows
-hoglake_live_bytes
-hoglake_live_files
-hoglake_table_count
-hoglake_consumer_lag_snapshots
-hoglake_consumer_lag_max
-hoglake_table_files
-hoglake_table_small_files
-hoglake_table_bytes
-hoglake_table_small_bytes
-hoglake_table_rows
-hoglake_table_delete_files
-hoglake_table_partitions
-hoglake_table_largest_partition_files
-hoglake_table_series_truncated
-hoglake_live_delete_files
-hoglake_live_delete_bytes
-hoglake_earliest_snapshot_age_seconds
-hoglake_dropped_tables_pending_retirement
-hoglake_relation_bytes
-hoglake_relation_live_tuples
-hoglake_relation_dead_tuples
-hoglake_maintenance_last_run_epoch
-hoglake_maintenance_last_run_duration_seconds
-hoglake_metrics_last_sample_epoch
-hoglake_metrics_sample_errors_total
-hoglake_metrics_group_failures_total
-```
+- `hoglake_relation_bytes{relation,kind}`
+- `hoglake_relation_live_tuples{relation}`
+- `hoglake_relation_dead_tuples{relation}`
 
-The two legacy modes retain their current metrics behavior.
-Other existing request counters, maintenance counters, and run-owned gauges are unchanged.
-Existing alerts using these absent series need an explicit operational decision before enabling mixed mode.
-In particular, the two historical liveness series above are unavailable.
-They are not replaced with timer ticks or process-local observations.
+These series describe only the configured PostgreSQL relations.
+They never describe hoglite storage or total fleet storage.
+Hoglite-only mode publishes none of these relation series.
+Mixed mode retains the PostgreSQL reindex gauge refresh.
 
-The current PostgreSQL sampler reads persisted ledger rows across replicas.
-An in-memory completion observer would not recover that history after restart.
-It would also miss other replicas' completed runs.
-This implementation does not disguise those narrower semantics under the existing names.
-It does not scan every hoglite tenant solely for telemetry.
+PostgreSQL totals retain their maintained-summary semantics.
+A missing summary produces `live_totals_sampled=0` with absent totals and age.
+Hoglite uses exact durable SQL aggregates over live tables and files.
+For hoglite, `live_totals_sampled=1` means an exact aggregate exists for that catalog incarnation.
+Its age measures time since that successful aggregate read begins.
+The age continues to increase after failed refreshes.
+A scrape never resets that age.
+Before the first successful read, hoglite totals and age remain absent.
+Every numeric zero represents an observed empty count.
+Hoglite table metrics use exact aggregates rather than a persisted summary generation.
+
+Core reads share one durable snapshot within each catalog.
+There is no atomic snapshot across catalogs or backends.
+Each catalog/group keeps its last successful observation after a read failure.
+Healthy catalogs continue to refresh.
+The sampler increments the error counter once per failed sample.
+It increments each affected group counter once per sample.
+A failed directory read preserves the previous observations without selecting another backend.
+An authoritative roster removes observations for dropped or replaced identities.
+A replacement never inherits another incarnation's maintenance epochs.
+A drop after roster selection can leave the selected incarnation's stale observation until the next roster.
+Incomplete reservations never enter the sample.
+
+`hoglake_metrics_last_sample_epoch` advances only when every selected core read succeeds.
+Extended-group failures do not prevent that core epoch from advancing.
+A core failure preserves the previous complete `/v1/info` totals for an unchanged roster.
+A roster change invalidates those fleet totals until the next complete core success.
+Per-catalog values can remain stale when their own read fails.
+The group counters expose that condition.
+No partial successful fleet sum replaces a complete fleet sum.
+
+Maintenance epochs come from persisted ledger rows across replicas.
+Hoglite and mixed PostgreSQL use bounded indexed probes for each task and status.
+They recover older successful runs after a sampler restart, including after long failure streaks.
+Ledger retention still limits recoverable history.
+Legacy PostgreSQL-only mode retains its existing window-plus-memory behavior.
+
+Collection walks the roster serially in bounded pages.
+It retains the existing 100-consumer cap and 500-table cap per catalog.
+The maximum consumer lag remains available above the consumer cap.
+The retirement gauge probes only the newest 10,000 dropped tables per catalog.
+That retirement value remains a lower bound.
+Queries retain the configured hoglite deadlines and the PostgreSQL statement timeout.
+Returned aggregate rows remain bounded, but exact hoglite queries can scan a tenant's live manifest.
+Collection time and retained observations grow with catalog count.
+This implementation does not optimize deployments with very many tenants.
+The extended groups retain the existing maintenance-summary interval gate.
+Sampling failures never become request failures.
+
+The live contract tests use the workflow-pinned hoglited executable plus PostgreSQL.
+They cover exported values, persisted history, missing summaries, partial failures, and incarnation changes.
+The schema tests compare historical tenant upgrades with new tenant creation.
 
 ## Scope
 

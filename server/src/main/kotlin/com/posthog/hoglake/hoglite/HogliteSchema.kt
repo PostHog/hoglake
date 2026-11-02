@@ -86,6 +86,7 @@ internal object HogliteSchema {
     val SCALE_INDEXES =
         listOf(
             "CREATE INDEX IF NOT EXISTS files_path ON files(path)",
+            "CREATE INDEX IF NOT EXISTS maintenance_runs_status ON maintenance_runs(task, status, id)",
             "CREATE INDEX IF NOT EXISTS dvs_path ON dvs(path)",
             "CREATE INDEX IF NOT EXISTS removals_undrained_path ON removals(path) WHERE drained_at IS NULL",
             "CREATE INDEX IF NOT EXISTS files_ended ON files(end_snapshot) WHERE end_snapshot IS NOT NULL",

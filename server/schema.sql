@@ -918,3 +918,7 @@ CREATE INDEX hog_compaction_claim_expiry
 -- 1,157 MiB at 5M rows, 243 bytes/row.
 CREATE INDEX hog_data_file_path ON hog_data_file (catalog_id, path);
 CREATE INDEX hog_delete_file_path ON hog_delete_file (catalog_id, path);
+
+-- Durable per-status maintenance history, including runs outside the sampler window.
+CREATE INDEX hog_maintenance_run_status
+    ON hog_maintenance_run (catalog_id, task, status, run_id DESC);

@@ -2242,6 +2242,14 @@ The catalog reports on itself instead of waiting for ops SQL:
 
 ### Observability
 
+The sampler supports PostgreSQL-only, hoglite-only, and mixed deployments.
+The PostgreSQL details below retain their legacy behavior.
+Hoglite uses exact durable aggregates instead of PostgreSQL summary generations.
+Mixed mode pins the ready directory roster for each sample.
+See [Catalog backend selection](../docs/catalog-backends.md#metrics-scope-and-failure-behavior) for freshness, partial failures, and scaling limits.
+The physical relation gauges describe PostgreSQL only.
+
+
 Three surfaces, none of which ever writes to the catalog or rides a
 transaction (`observability/`):
 

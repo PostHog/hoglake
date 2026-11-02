@@ -393,7 +393,7 @@ class App private constructor(
      * before Main starts a loop, binds the metrics port or the API —
      * instead of failing every loop tick of a process with no API.
      * Legacy PostgreSQL mode also registers CatalogMetrics from boot.
-     * Mixed mode omits that PostgreSQL-only sampler instead of publishing misleading fleet totals.
+     * Mixed mode registers the routed sampler without opening PostgreSQL connections.
      */
     internal fun constructPostgresServices() {
         store
@@ -414,7 +414,7 @@ class App private constructor(
         compactionService
         maintenanceStatusService
         maintenanceSummarySampler
-        if (cfg.database != DatabaseBackend.MIXED) catalogMetrics
+        catalogMetrics
     }
 
     /** The hoglite backend's services, constructed now — the same fail-fast as [constructPostgresServices]. */
@@ -430,17 +430,30 @@ class App private constructor(
         hogliteMaintenanceStatus
         hoglitePartitions
         hoglitePartitionLookup
+        catalogMetrics
     }
 
     /** Catalog-health gauge sampler; tests drive [CatalogMetrics.sampleOnce] directly. */
     val catalogMetrics by lazy {
         CatalogMetrics(
-            jdbi!!,
+            jdbi,
             meterRegistry,
             // The five extended groups run where the maintenance summary
             // is produced (the maintenance Deployment), so API replicas do
             // not each republish the same instance-wide series.
             extendedGroups = cfg.maintenanceSummaryIntervalMs > 0,
+            source =
+                if (cfg.database == DatabaseBackend.POSTGRES) {
+                    com.posthog.hoglake.observability.PostgresCatalogMetricSource(requireNotNull(jdbi))
+                } else {
+                    com.posthog.hoglake.hoglite.RoutedCatalogMetricSource(
+                        hogliteStore(),
+                        cfg.compactionTargetBytes,
+                        if (cfg.database == DatabaseBackend.MIXED) mixedRouter else null,
+                        jdbi,
+                        ensurePostgres,
+                    )
+                },
         )
     }
 
@@ -608,20 +621,8 @@ class App private constructor(
         app.installApiRoutes(
             store,
             cfg.instanceName,
-            // The sampler's last pass — Postgres only. Under hoglite the
-            // totals are absent until the metrics sampler is ported
-            // (nulls are the documented boot-window shape, so this is
-            // honest, not a stub).
-            instanceTotals = {
-                if (jdbi != null && cfg.database != DatabaseBackend.MIXED) catalogMetrics.latestTotals else null
-            },
-            catalogTotals = {
-                if (jdbi != null && cfg.database != DatabaseBackend.MIXED) {
-                    catalogMetrics.latestByCatalog
-                } else {
-                    emptyMap()
-                }
-            },
+            instanceTotals = { catalogMetrics.latestTotals },
+            catalogTotals = { catalogMetrics.latestByCatalog },
             uiTheme = cfg.uiTheme,
         )
         app.installScanRoutes(store)
@@ -775,8 +776,7 @@ class App private constructor(
             //    database; a hoglite tenant IS one catalog, so the
             //    status/partition/table-GET reads compute exactly),
             //  - reindex (B-tree bloat is Postgres's problem),
-            //  - the metrics tick's catalogTotals sampler (the metrics
-            //    loop's gauges ride Jdbi reads).
+            // The metrics sampler reads each tenant through its pinned identity.
             // Everything else is the same work on the same cadence.
             //
             // One process per loop sweeps, not every process: each loop
@@ -841,6 +841,7 @@ class App private constructor(
                         hogliteRetirement.runOnceAllCatalogs(go)
                     },
             )
+            loops.register("metrics", cfg.metricsIntervalMs) { catalogMetrics.sampleOnce() }
             return AutoCloseable {
                 loops.close()
                 // After the loops stop, so no sweep renews a lease it just gave up.
@@ -951,10 +952,7 @@ class App private constructor(
             ensurePostgres()
             reindexService.pollOnce()
         }
-        loops.register("metrics", cfg.metricsIntervalMs) {
-            ensurePostgres()
-            reindexService.refreshGauge()
-        }
+        loops.register("metrics", cfg.metricsIntervalMs) { metricsTick() }
         return AutoCloseable {
             loops.close()
             leases.forEach { it.release() }
@@ -1040,7 +1038,15 @@ class App private constructor(
         try {
             catalogMetrics.sampleOnce()
         } finally {
-            reindexService.refreshGauge()
+            // A PostgreSQL outage cannot prevent hoglite collection.
+            if (jdbi != null) {
+                runCatching {
+                    ensurePostgres()
+                    reindexService.refreshGauge()
+                }.onFailure {
+                    io.github.oshai.kotlinlogging.KotlinLogging.logger {}.warn(it) { "PostgreSQL gauge refresh failed" }
+                }
+            }
         }
     }
 

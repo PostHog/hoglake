@@ -164,7 +164,7 @@ class V32DeleteFileSnapshotLookupMigrationIntegrationTest {
         db.jdbi.useHandleUnchecked { h ->
             h.execute("CREATE INDEX hog_delete_file_data_lookup ON hog_delete_file (catalog_id, data_file_id)")
             h.execute("UPDATE pg_index SET indisvalid = false WHERE indexrelid = '$index'::regclass")
-            h.execute("DELETE FROM flyway_schema_history WHERE version = '32'")
+            h.execute("DELETE FROM flyway_schema_history WHERE version::numeric >= 32")
         }
         Database.migrate(db.dataSource)
         db.jdbi.useHandleUnchecked { h ->

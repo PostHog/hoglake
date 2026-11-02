@@ -112,7 +112,7 @@ class BootValidationTest {
     }
 
     @Test
-    fun `mixed mode omits unsampled fleet metrics without changing legacy registration`() {
+    fun `mixed mode registers its sampler without fabricating catalog observations`() {
         val mixed =
             App.buildMixed(
                 hogliteBase.copy(database = DatabaseBackend.MIXED),
@@ -121,9 +121,9 @@ class BootValidationTest {
                 HealthProbe.forProbe(1_000) { false },
             )
         mixed.use {
-            assertThat(lazies(it).getValue("catalogMetrics").isInitialized()).isFalse()
+            assertThat(lazies(it).getValue("catalogMetrics").isInitialized()).isTrue()
+            assertThat(it.meterRegistry.find("hoglake_metrics_last_sample_epoch").gauge()!!.value()).isZero()
             for (name in listOf(
-                "hoglake_metrics_last_sample_epoch",
                 "hoglake_maintenance_last_run_epoch",
                 "hoglake_live_rows",
                 "hoglake_live_bytes",
@@ -139,7 +139,10 @@ class BootValidationTest {
     @Test
     fun `a hoglite build constructs every hoglite service and no Postgres one`() {
         val all = lazies(hoglite(hogliteBase))
-        val (hogliteOnes, others) = all.entries.partition { it.key.startsWith("hoglite") || it.key == "store" }
+        val (hogliteOnes, others) =
+            all.entries.partition {
+                it.key.startsWith("hoglite") || it.key in setOf("store", "catalogMetrics")
+            }
         assertThat(hogliteOnes).hasSizeGreaterThan(8)
         assertThat(hogliteOnes.filterNot { it.value.isInitialized() }.map { it.key }).isEmpty()
         // the Postgres services need a Jdbi a hoglite App does not have
@@ -158,7 +161,7 @@ class BootValidationTest {
                 HealthProbe.forProbe(1_000) { false },
             )
         mixed(cfg).use { app ->
-            assertThat(lazies(app).filterValues { !it.isInitialized() }.keys).containsExactly("catalogMetrics")
+            assertThat(lazies(app).filterValues { !it.isInitialized() }.keys).isEmpty()
         }
         assertThatThrownBy { mixed(cfg.copy(maintenanceSummaryRefreshSeconds = 0)) }
             .isInstanceOf(IllegalArgumentException::class.java)

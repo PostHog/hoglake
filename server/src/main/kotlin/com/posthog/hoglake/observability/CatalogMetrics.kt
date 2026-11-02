@@ -1,7 +1,5 @@
 package com.posthog.hoglake.observability
 
-import com.posthog.hoglake.model.MaintenanceTask
-import com.posthog.hoglake.persistence.DatabaseHealthRepo
 import com.posthog.hoglake.persistence.TierTotalsRepo
 import io.github.oshai.kotlinlogging.KotlinLogging
 import io.micrometer.core.instrument.Counter
@@ -10,8 +8,6 @@ import io.micrometer.core.instrument.MeterRegistry
 import io.micrometer.core.instrument.MultiGauge
 import io.micrometer.core.instrument.Tags
 import org.jdbi.v3.core.Jdbi
-import org.jdbi.v3.core.kotlin.inTransactionUnchecked
-import org.jdbi.v3.core.kotlin.withHandleUnchecked
 import java.time.Instant
 import java.util.concurrent.atomic.AtomicLong
 
@@ -552,91 +548,25 @@ data class CatalogTotals(
 )
 
 /**
- * Catalog-health gauges (README.md §8 — the catalog reports on itself,
- * retiring the metrics-cron layer). A lightweight periodic sampler
- * refreshes per-catalog MultiGauges in GROUPS: the core group is ONE
- * batched query over all catalogs (scalar subselects, no per-gauge round
- * trips) plus one grouped query for consumer offsets; the five extended
- * groups below are each their own statement.
+ * Shared catalog gauges with independent collection groups.
  *
- * Notes on semantics:
- *  - hoglake_snapshot_count is the head - earliest + 1 approximation
- *    (retained ids are dense between floor and head by construction;
- *    cheap, no count(*) over hog_snapshot).
- *  - hoglake_head_age_seconds is now() - head snapshot_time, both read
- *    on the Postgres side so app/db clock skew cannot bend it.
- *  - hoglake_removal_queue_depth counts UNDRAINED entries only: drained
- *    rows are the soft-deleted cleanup ledger, not pending work.
- *  - hoglake_missing_field_id_files counts LIVE flagged files — the
- *    same population the rename guard refuses on.
- *  - hoglake_stats_pending_head_file_id is the data_file_id at the head
- *    of the hydrator's queue, read by key ([PENDING_HEAD_FILE_ID_SQL]);
- *    0 when the catalog has no live pending file.
- *  - hoglake_object_prefix_quarantined_files counts LIVE files the
- *    hydrator flipped to provided with `prefix_quarantined` set: a
- *    deferred-stats file of an object-prefix table whose footer does not
- *    prove its prefix value. Nothing clears the flag in this version.
- *  - EVERY hog_data_file gauge joins hog_table and excludes dropped
- *    tables. Since #193 a drop touches no file row, so `end_snapshot IS
- *    NULL` is no longer the whole of "live" — the rows of a dropped
- *    table stay open until the retirement sweep deletes them, which on
- *    a catalog with no retention is never. The six of them are
- *    computed in ONE grouped pass (CatalogMetrics.SAMPLE_SQL), not six
- *    correlated subqueries per catalog.
- *  - hoglake_consumer_lag_snapshots{consumer} is head - min committed
- *    snapshot across the consumer's tables (its worst table). To cap
- *    cardinality, per-consumer series are only emitted while a catalog
- *    has <= MAX_CONSUMER_SERIES consumers; hoglake_consumer_lag_max is
- *    ALWAYS emitted per catalog with offsets, so the alerting family
- *    never flaps when a catalog crosses the cap. Offsets are joined to
- *    hog_table (ExpiryService's floor query, mirrored) so garbage or
- *    expired uuids can never distort the lag series, head + offsets are
- *    read in one transaction, and lag is clamped at >= 0.
- *  - hoglake_table_*{catalog,namespace,table} come from the maintenance
- *    sampler's PUBLISHED generation ([TABLE_SQL]), never from the
- *    manifest, and are capped per catalog at [maxTableSeries] tables,
- *    largest by files first, with hoglake_table_series_truncated{catalog}
- *    saying how many were left out — the consumer-lag cap's idiom, with
- *    the omission made visible rather than silent. `namespace` and
- *    `table` are separate labels, as on
- *    hoglake_blind_partitioned_appends_total.
- *  - hoglake_metrics_last_sample_epoch (global) is the wall-clock time
- *    of the last sample whose CORE group ("catalogs", SAMPLE_SQL plus
- *    the offsets read) succeeded, whatever the other groups did: the
- *    gigahog dashboard and its alert read it as "the sampler is alive",
- *    and a failing ledger or relation query must not make it look dead.
- *    hoglake_metrics_sample_errors_total counts samples in which at
- *    least one group failed; hoglake_metrics_group_failures_total{group}
- *    says which, and is pre-registered at zero for the closed set of
- *    [GROUPS] so a first failure is a 0 -> 1 step `increase()` can see.
+ * PostgreSQL-only mode retains its batched reads and summary semantics.
+ * Hoglite reads exact tenant aggregates. Mixed mode pins the ready directory roster once per sample.
+ * Each routed catalog/group retains its last successful observation after failure.
+ * An authoritative roster removes dropped or replaced identities from every group cache.
+ * A failed roster read leaves catalog observations unchanged. PostgreSQL relations remain independently readable.
  *
- * GROUPS FAIL INDEPENDENTLY. The core per-catalog read, the per-table
- * summary read, the deletion-vector totals, the snapshot/retirement
- * lifecycle read, the relation sizes and the maintenance ledger are each
- * their own statement in their own try. One that throws leaves ITS
- * gauges at their last published values and does not stop the others;
- * the sample then counts ONE `hoglake_metrics_sample_errors_total` (that
- * counter's unit is a sample, as its description has always said) and
- * one `hoglake_metrics_group_failures_total{group}` per failed group,
- * logs each failed group's NAME, and rethrows the first failure (the
- * others attached as suppressed) so `BackgroundLoops` counts the
- * iteration and logs the stack traces once. The staleness epoch is NOT
- * held back by a failed extended group: it advances as soon as the core
- * group has published, because its readers treat it as liveness, and
- * the per-group counter is the signal for the rest.
+ * The global epoch advances only after the complete core group succeeds.
+ * Extended-group failures do not prevent that advance. Each failed sample increments one error counter.
+ * Each failed group increments its own counter once. The sampler rethrows the first failure after publication.
+ * Fleet totals remain stale after a partial core failure. A changed roster invalidates those totals first.
  *
- * WHERE THE EXTENDED GROUPS RUN. The core group runs on every pod that
- * samples (`HOGLAKE_METRICS_INTERVAL_MS > 0`), because `/v1/info` and the
- * catalogs listing are served from it. The five extended groups run only
- * when [extendedGroups] is true, which `App` sets from
- * `HOGLAKE_MAINTENANCE_SUMMARY_INTERVAL_MS > 0` — the maintenance
- * Deployment, which also produces the summary the tables group reads.
- * Otherwise every API replica would publish the same instance-wide
- * series, and a `sum by (table)` over them would multiply by the replica
- * count.
+ * The extended groups retain the maintenance-summary interval gate.
+ * The consumer cap suppresses individual consumers, never the maximum lag.
+ * The table cap keeps the largest tables. The retirement probe remains a bounded lower count.
  */
-class CatalogMetrics(
-    private val jdbi: Jdbi,
+class CatalogMetrics internal constructor(
+    jdbi: Jdbi?,
     private val registry: MeterRegistry,
     /**
      * Per-catalog cap on the hoglake_table_* series. A constructor
@@ -654,6 +584,7 @@ class CatalogMetrics(
     private val maintenanceRunLookback: Int = MAINTENANCE_RUN_LOOKBACK,
     /** Whether the five extended groups run on this pod; see the class KDoc. */
     private val extendedGroups: Boolean = true,
+    private val source: CatalogMetricSource = PostgresCatalogMetricSource(requireNotNull(jdbi)),
 ) {
     init {
         require(maxTableSeries > 0) { "maxTableSeries must be positive, was $maxTableSeries" }
@@ -721,36 +652,32 @@ class CatalogMetrics(
     private val liveTotalsSampled =
         multiGauge(
             "hoglake_live_totals_sampled",
-            "1 when the catalog's maintenance summary has published a generation with live totals, " +
-                "which hoglake_live_rows/_bytes/_files and the API totals are read from; 0 while it " +
-                "has not, in which case those series are absent rather than zero",
+            "1 when catalog totals exist: a published PostgreSQL summary or a successful exact hoglite aggregate; " +
+                "0 for a PostgreSQL catalog without a summary. Missing totals are absent, never fabricated zeros",
         )
     private val liveTotalsAge =
         multiGauge(
             "hoglake_live_totals_age_seconds",
-            "Seconds since the maintenance summary scan that hoglake_live_rows/_bytes/_files are as of " +
-                "BEGAN (the data's age, not the publish's: a scan runs for hours on a large catalog); " +
-                "absent while the catalog has none. Grows without bound if the maintenance sampler " +
-                "stops, which is how a frozen total announces itself",
+            "Seconds since the PostgreSQL summary scan began or the successful exact hoglite aggregate began; " +
+                "absent before totals exist. Hoglite age continues to increase after a failed refresh",
         )
     private val liveRows =
         multiGauge(
             "hoglake_live_rows",
-            "Live registered rows per catalog (gross of DV masking; dropped tables excluded), as of " +
-                "the maintenance summary's published generation; absent while the catalog has none " +
-                "(hoglake_live_totals_sampled = 0) or the generation did not measure rows",
+            "Live registered rows, gross of DV masking, excluding dropped tables. " +
+                "Uses a PostgreSQL summary or an exact hoglite aggregate; absent when no row measure exists",
         )
     private val liveBytes =
         multiGauge(
             "hoglake_live_bytes",
-            "Live data-file bytes per catalog (dropped tables excluded), as of the maintenance summary's " +
-                "published generation; absent while the catalog has none (hoglake_live_totals_sampled = 0)",
+            "Live data-file bytes, excluding dropped tables, from a PostgreSQL summary or an exact hoglite read; " +
+                "absent before totals exist",
         )
     private val liveFiles =
         multiGauge(
             "hoglake_live_files",
-            "Live data files per catalog (dropped tables excluded), as of the maintenance summary's " +
-                "published generation; absent while the catalog has none (hoglake_live_totals_sampled = 0)",
+            "Live data files, excluding dropped tables, from a PostgreSQL summary or an exact hoglite aggregate; " +
+                "absent before totals exist",
         )
     private val tableCount =
         multiGauge("hoglake_table_count", "Live (non-dropped) tables")
@@ -763,44 +690,48 @@ class CatalogMetrics(
                 "$MAX_CONSUMER_SERIES consumers, this never does)",
         )
 
-    // --- per-table, from the maintenance sampler's published generation ---
+    // Per-table values use a PostgreSQL summary or an exact hoglite aggregate.
     private val tableFiles =
         multiGauge(
             "hoglake_table_files",
-            "Live data files per table, as of the maintenance sampler's published generation",
+            "Live data files per table, from a PostgreSQL summary or an exact hoglite read",
         )
     private val tableSmallFiles =
         multiGauge(
             "hoglake_table_small_files",
-            "Live data files under the compaction target size per table (published generation)",
+            "Live data files under the compaction target size per table (PostgreSQL summary or exact hoglite read)",
         )
     private val tableBytes =
-        multiGauge("hoglake_table_bytes", "Live data-file bytes per table (published generation)")
+        multiGauge(
+            "hoglake_table_bytes",
+            "Live data-file bytes per table (PostgreSQL summary or exact hoglite aggregate)",
+        )
     private val tableSmallBytes =
         multiGauge(
             "hoglake_table_small_bytes",
-            "Bytes in live data files under the compaction target size per table (published generation)",
+            "Bytes in live data files under the compaction target size per table " +
+                "(PostgreSQL summary or exact hoglite read)",
         )
     private val tableRows =
         multiGauge(
             "hoglake_table_rows",
-            "Live registered rows per table, gross of DV masking (published generation; absent " +
+            "Live registered rows per table, gross of DV masking (PostgreSQL summary or exact hoglite read; absent " +
                 "while the generation's row measure is incomplete)",
         )
     private val tableDeleteFiles =
         multiGauge(
             "hoglake_table_delete_files",
-            "Live data files carrying a deletion vector per table (published generation)",
+            "Live data files carrying a deletion vector per table (PostgreSQL summary or exact hoglite aggregate)",
         )
     private val tablePartitions =
         multiGauge(
             "hoglake_table_partitions",
-            "Partitions holding at least one live data file per table (published generation)",
+            "Partitions holding at least one live data file per table (PostgreSQL summary or exact hoglite aggregate)",
         )
     private val tableLargestPartitionFiles =
         multiGauge(
             "hoglake_table_largest_partition_files",
-            "Live data files in the table's fullest partition (published generation)",
+            "Live data files in the table's fullest partition (PostgreSQL summary or exact hoglite aggregate)",
         )
     private val tableSeriesTruncated =
         multiGauge(
@@ -837,20 +768,26 @@ class CatalogMetrics(
     private val relationBytes =
         multiGauge(
             "hoglake_relation_bytes",
-            "On-disk bytes of each hog_* relation by kind (heap, index, toast), as GET /v1/database/health reports",
+            "PostgreSQL-only bytes of each configured hog_* relation by kind (heap, index, toast); excludes hoglite",
         )
     private val relationLiveTuples =
-        multiGauge("hoglake_relation_live_tuples", "Estimated live tuples per hog_* relation (pg_stat_user_tables)")
+        multiGauge(
+            "hoglake_relation_live_tuples",
+            "PostgreSQL-only estimated live tuples per hog_* relation (pg_stat_user_tables)",
+        )
     private val relationDeadTuples =
-        multiGauge("hoglake_relation_dead_tuples", "Estimated dead tuples per hog_* relation (pg_stat_user_tables)")
+        multiGauge(
+            "hoglake_relation_dead_tuples",
+            "PostgreSQL-only estimated dead tuples per hog_* relation (pg_stat_user_tables)",
+        )
 
     // --- maintenance ledger ---
     private val maintenanceLastRunEpoch =
         multiGauge(
             "hoglake_maintenance_last_run_epoch",
-            "Epoch seconds the latest maintenance run with this status finished. Read from the task's " +
-                "last $maintenanceRunLookback ledger rows; when that window holds none, the last value " +
-                "this process saw is republished (a restart forgets it, so absent = none seen since boot)",
+            "Epoch seconds the latest maintenance run with this status finished, from persisted history. " +
+                "Legacy PostgreSQL uses the last $maintenanceRunLookback ledger rows plus process memory; " +
+                "hoglite and mixed mode recover each status through indexed durable reads",
         )
     private val maintenanceLastRunDuration =
         multiGauge(
@@ -858,22 +795,11 @@ class CatalogMetrics(
             "Wall-clock duration of the latest recorded maintenance run per task",
         )
 
-    /**
-     * (catalog, task, status) -> the newest finish epoch this process has
-     * seen. What keeps `status="ok"` alive through a failure streak longer
-     * than the lookback window: a staleness alert keyed on
-     * `time() - hoglake_maintenance_last_run_epoch{status="ok"}` must keep
-     * RISING while a task fails, not go silent when the last success
-     * scrolls out of the window. One writer (the sampler loop), so a plain
-     * map replaced wholesale is enough.
-     *
-     * KEYED BY CATALOG NAME, as every series is. A catalog that no longer
-     * exists is forgotten on the next sample; one deleted and re-created
-     * under the same name within one sample interval inherits the old
-     * epochs until its own runs replace them. Accepted: there is no
-     * catalog delete API today, and the window shows the new catalog's
-     * runs as soon as it has any.
-     */
+    /** The last authoritative routed roster, used to invalidate fleet totals after identity changes. */
+    @Volatile
+    private var previousIdentities: Map<String, String> = emptyMap()
+
+    /** Legacy PostgreSQL retains statuses outside its window. Routed sources recover them from the ledger. */
     @Volatile
     private var lastRunMemory: Map<Triple<String, String, String>, Double> = emptyMap()
 
@@ -905,48 +831,6 @@ class CatalogMetrics(
                 .register(registry)
         }
 
-    private data class CatalogRow(
-        val name: String,
-        val head: Long,
-        val earliest: Long,
-        val headAgeSeconds: Double?,
-        val removalDepth: Long,
-        val statsPending: Long,
-        val statsPendingHeadFileId: Long,
-        val statsFailed: Long,
-        val missingFieldIds: Long,
-        val prefixQuarantined: Long,
-        val tables: Long,
-        /** Whether the maintenance summary has stamped this catalog's live totals (V27). */
-        val liveSampled: Boolean,
-        /** Seconds since the generation the totals are as of was published; null when unsampled. */
-        val liveTotalsAgeSeconds: Double?,
-        /** Null when unsampled, or when the published generation did not measure rows. */
-        val liveRows: Long?,
-        val liveBytes: Long?,
-        val liveFiles: Long?,
-        val oldestSnapshotTime: Instant?,
-    )
-
-    private data class TableRow(
-        val catalog: String,
-        val namespace: String,
-        val table: String,
-        val measured: Boolean,
-        val files: Long,
-        val smallFiles: Long,
-        val bytes: Long,
-        val smallBytes: Long,
-        val rows: Long,
-        val deleteFiles: Long,
-        val partitions: Long,
-        val largestPartitionFiles: Long,
-        /** Live tables the published generation covers in this catalog, before the cap. */
-        val covered: Long,
-    ) {
-        val tags: Tags get() = Tags.of("catalog", catalog, "namespace", namespace, "table", table)
-    }
-
     /**
      * One sample: refresh every gauge from the catalog. Safe to call
      * concurrently with traffic. Each group is attempted whatever the
@@ -954,14 +838,30 @@ class CatalogMetrics(
      */
     fun sampleOnce() {
         val failures = mutableListOf<Pair<String, Throwable>>()
+        val rosterFailure = runCatching { source.startSample() }.exceptionOrNull()
+        if (rosterFailure == null) {
+            val identities = source.identities
+            if (identities != null) {
+                lastRunMemory =
+                    lastRunMemory.filterKeys {
+                            key ->
+                        previousIdentities[key.first] == identities[key.first]
+                    }
+                if (previousIdentities != identities) latestTotals = null
+                previousIdentities = identities
+            }
+        }
 
         fun group(
             name: String,
             block: () -> Unit,
         ) {
             try {
+                if (name != GROUP_RELATIONS) rosterFailure?.let { throw it }
                 block()
+                source.failure(name)?.let { throw it }
             } catch (t: Throwable) {
+                if (t is InterruptedException || t is java.util.concurrent.CancellationException) throw t
                 groupFailures.getValue(name).increment()
                 // An Error (OOM and friends) is not a failed query; count
                 // the sample and stop rather than carry on regardless.
@@ -978,7 +878,7 @@ class CatalogMetrics(
             // Liveness, not completeness: set as soon as the core group
             // has published, so a failing extended group below cannot
             // make the sampler look dead (see the class KDoc).
-            lastSampleEpoch.set(System.currentTimeMillis() / 1000)
+            if (source.failure(GROUP_CATALOGS) == null) lastSampleEpoch.set(System.currentTimeMillis() / 1000)
         }
         if (extendedGroups) {
             group(GROUP_TABLES) { sampleTables() }
@@ -994,13 +894,13 @@ class CatalogMetrics(
             // suppressed, and BackgroundLoops logs it with its trace.
             log.warn { "catalog metrics: failed groups ${failures.map { it.first }}" }
             val first = failures.first().second
-            failures.drop(1).forEach { first.addSuppressed(it.second) }
+            failures.drop(1).forEach { if (it.second !== first) first.addSuppressed(it.second) }
             throw first
         }
     }
 
     private fun sampleCatalogs() {
-        val (rows, offsets) = readSample()
+        val (rows, offsets) = source.catalogs()
 
         fun rowsOf(value: (CatalogRow) -> Number) =
             rows.map {
@@ -1057,12 +957,14 @@ class CatalogMetrics(
         // window before the first stamps land.
         val covered = rows.filter { it.liveRows != null && it.liveBytes != null }
         val known = covered.isNotEmpty() || rows.isEmpty()
-        latestTotals =
-            InstanceTotals(
-                totalRows = if (known) covered.sumOf { it.liveRows!! } else null,
-                totalSizeBytes = if (known) covered.sumOf { it.liveBytes!! } else null,
-                unsampledCatalogs = rows.size - covered.size,
-            )
+        if (source.failure(GROUP_CATALOGS) == null) {
+            latestTotals =
+                InstanceTotals(
+                    totalRows = if (known) covered.sumOf { it.liveRows!! } else null,
+                    totalSizeBytes = if (known) covered.sumOf { it.liveBytes!! } else null,
+                    unsampledCatalogs = rows.size - covered.size,
+                )
+        }
         // The same rows, kept per catalog for the catalogs listing. The
         // map is replaced wholesale so a reader never sees a half-updated
         // mixture of two samples.
@@ -1106,34 +1008,7 @@ class CatalogMetrics(
      * both statements see the same summary rows.
      */
     private fun sampleTables() {
-        val (published, rows) =
-            jdbi.inTransactionUnchecked { h ->
-                // First statement of the transaction, or it does not apply.
-                h.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-                val names = h.createQuery(PUBLISHED_CATALOGS_SQL).mapTo(String::class.java).list()
-                val tables =
-                    h.createQuery(TABLE_SQL)
-                        .bind("cap", maxTableSeries)
-                        .map { rs, _ ->
-                            TableRow(
-                                catalog = rs.getString("catalog"),
-                                namespace = rs.getString("namespace_name"),
-                                table = rs.getString("table_name"),
-                                measured = rs.getBoolean("measured"),
-                                files = rs.getLong("files"),
-                                smallFiles = rs.getLong("small_files"),
-                                bytes = rs.getLong("bytes"),
-                                smallBytes = rs.getLong("small_bytes"),
-                                rows = rs.getLong("record_count"),
-                                deleteFiles = rs.getLong("delete_files"),
-                                partitions = rs.getLong("partitions"),
-                                largestPartitionFiles = rs.getLong("largest_partition_files"),
-                                covered = rs.getLong("covered"),
-                            )
-                        }
-                        .list()
-                names to tables
-            }
+        val (published, rows) = source.tables(maxTableSeries)
 
         fun rowsOf(value: (TableRow) -> Number) = rows.map { MultiGauge.Row.of(it.tags, value(it)) }
 
@@ -1166,31 +1041,13 @@ class CatalogMetrics(
     }
 
     private fun sampleDeleteFiles() {
-        val rows =
-            jdbi.inTransactionUnchecked { h ->
-                h.createQuery(DELETE_FILES_SQL)
-                    .map { rs, _ -> Triple(rs.getString("name"), rs.getLong("files"), rs.getLong("bytes")) }
-                    .list()
-            }
+        val rows = source.deleteFiles()
         liveDeleteFiles.register(rows.map { MultiGauge.Row.of(Tags.of("catalog", it.first), it.second) }, true)
         liveDeleteBytes.register(rows.map { MultiGauge.Row.of(Tags.of("catalog", it.first), it.third) }, true)
     }
 
     private fun sampleLifecycle() {
-        data class Lifecycle(val name: String, val earliestAge: Double?, val droppedPending: Long)
-        val rows =
-            jdbi.inTransactionUnchecked { h ->
-                h.createQuery(LIFECYCLE_SQL)
-                    .bind("probeCap", droppedTableProbeCap)
-                    .map { rs, _ ->
-                        Lifecycle(
-                            rs.getString("name"),
-                            rs.getObject("earliest_age_seconds")?.let { rs.getDouble("earliest_age_seconds") },
-                            rs.getLong("dropped_pending"),
-                        )
-                    }
-                    .list()
-            }
+        val rows = source.lifecycle(droppedTableProbeCap)
         earliestSnapshotAgeSeconds.register(
             rows.mapNotNull { r -> r.earliestAge?.let { MultiGauge.Row.of(Tags.of("catalog", r.name), it) } },
             true,
@@ -1209,7 +1066,7 @@ class CatalogMetrics(
      * catalog only; no `hog_*` row is read.
      */
     private fun sampleRelations() {
-        val tables = jdbi.withHandleUnchecked { h -> DatabaseHealthRepo.tables(h) }
+        val tables = source.relations()
         relationBytes.register(
             tables.flatMap { t ->
                 listOf(
@@ -1231,32 +1088,7 @@ class CatalogMetrics(
     }
 
     private fun sampleMaintenanceRuns() {
-        data class LastRuns(
-            val catalog: String,
-            val task: String,
-            val okAt: Double?,
-            val failedAt: Double?,
-            val duration: Double,
-        )
-        val (catalogs, rows) =
-            jdbi.inTransactionUnchecked { h ->
-                val names = h.createQuery("SELECT name FROM hog_catalog").mapTo(String::class.java).set()
-                val runs =
-                    h.createQuery(MAINTENANCE_RUNS_SQL)
-                        .bindArray("tasks", String::class.java, MaintenanceTask.entries.map { it.wire })
-                        .bind("lookback", maintenanceRunLookback)
-                        .map { rs, _ ->
-                            LastRuns(
-                                rs.getString("catalog"),
-                                rs.getString("task"),
-                                rs.getObject("ok_at")?.let { rs.getDouble("ok_at") },
-                                rs.getObject("failed_at")?.let { rs.getDouble("failed_at") },
-                                rs.getDouble("last_duration"),
-                            )
-                        }
-                        .list()
-                names to runs
-            }
+        val (catalogs, rows) = source.maintenanceRuns(maintenanceRunLookback)
         // Merge this window into the memory: a newer epoch wins, a status
         // the window does not hold keeps what was seen before. A catalog
         // that no longer exists is forgotten (ExpiryGauges.retain's
@@ -1268,7 +1100,16 @@ class CatalogMetrics(
                     r.failedAt?.let { Triple(r.catalog, r.task, "failed") to it },
                 )
             }
-        val merged = lastRunMemory.filterKeys { it.first in catalogs }.toMutableMap()
+        val merged =
+            (
+                if (source.identities == null) {
+                    lastRunMemory.filterKeys {
+                        it.first in catalogs
+                    }
+                } else {
+                    emptyMap()
+                }
+            ).toMutableMap()
         for ((key, epoch) in seen) merged.merge(key, epoch) { old, new -> maxOf(old, new) }
         lastRunMemory = merged
         maintenanceLastRunEpoch.register(
@@ -1282,67 +1123,6 @@ class CatalogMetrics(
             true,
         )
     }
-
-    /** The two sample queries, in ONE transaction: head and offsets are a consistent pair. */
-    private fun readSample(): Pair<List<CatalogRow>, List<Triple<String, String, Long>>> =
-        jdbi.inTransactionUnchecked { h ->
-            val rows =
-                h.createQuery(SAMPLE_SQL)
-                    .map { rs, _ ->
-                        CatalogRow(
-                            name = rs.getString("name"),
-                            head = rs.getLong("last_snapshot_id"),
-                            earliest = rs.getLong("earliest_snapshot_id"),
-                            headAgeSeconds =
-                                rs.getObject("head_age_seconds")?.let {
-                                    rs.getDouble("head_age_seconds")
-                                },
-                            removalDepth = rs.getLong("removal_depth"),
-                            statsPending = rs.getLong("stats_pending"),
-                            statsPendingHeadFileId = rs.getLong("stats_pending_head_file_id"),
-                            statsFailed = rs.getLong("stats_failed"),
-                            missingFieldIds = rs.getLong("missing_field_ids"),
-                            prefixQuarantined = rs.getLong("prefix_quarantined"),
-                            tables = rs.getLong("table_count"),
-                            liveSampled = rs.getBoolean("live_sampled"),
-                            liveTotalsAgeSeconds =
-                                rs.getObject("live_totals_age_seconds")?.let {
-                                    rs.getDouble("live_totals_age_seconds")
-                                },
-                            liveRows = rs.getObject("live_rows", java.lang.Long::class.java)?.toLong(),
-                            liveBytes = rs.getObject("live_bytes", java.lang.Long::class.java)?.toLong(),
-                            liveFiles = rs.getObject("live_files", java.lang.Long::class.java)?.toLong(),
-                            oldestSnapshotTime =
-                                rs.getObject(
-                                    "oldest_snapshot_time",
-                                    java.time.OffsetDateTime::class.java,
-                                )?.toInstant(),
-                        )
-                    }
-                    .list()
-            // consumer -> worst (lowest) committed snapshot across its
-            // tables. The hog_table join mirrors ExpiryService's floor
-            // query: only offsets whose table identity exists (any
-            // incarnation) count — a garbage/expired uuid cannot distort
-            // the lag series any more than it can pin retention.
-            val offsets =
-                h.createQuery(
-                    """
-                SELECT c.name AS catalog, o.consumer_id,
-                       min(o.committed_snapshot) AS committed
-                  FROM hog_consumer_offset o
-                  JOIN hog_catalog c ON c.catalog_id = o.catalog_id
-                  JOIN hog_table t
-                    ON t.catalog_id = o.catalog_id AND t.table_uuid = o.table_uuid
-                 GROUP BY c.name, o.consumer_id
-                """,
-                )
-                    .map { rs, _ ->
-                        Triple(rs.getString("catalog"), rs.getString("consumer_id"), rs.getLong("committed"))
-                    }
-                    .list()
-            rows to offsets
-        }
 
     companion object {
         private val log = KotlinLogging.logger {}
