@@ -35,3 +35,16 @@ def live_server_url() -> str:
     if not _server_reachable():
         pytest.skip(f"no live hoglake server at {HOGLAKE_URL} (set HOGLAKE_URL)")
     return HOGLAKE_URL
+
+
+@pytest.fixture(autouse=True)
+def _codec_fallbacks_fail(monkeypatch):
+    """With the Rust VARIANT codec installed, the suites' encodes run through
+    it, and a fallback to Python would hide a difference: it fails the test.
+    A test of the fallback itself puts the real one back."""
+    from pyhoglake import _variant_backend
+
+    def fail(reason, row, column, report):
+        raise AssertionError(f"VARIANT codec fallback: {reason} at row {row}")
+
+    monkeypatch.setattr(_variant_backend, "_fall_back", fail)

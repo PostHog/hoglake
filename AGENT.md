@@ -54,8 +54,13 @@ The four Python trees (`pyhoglake/`, `hedgerow/`, `bench/`, `millrace/`)
 are **one uv workspace**: the root `pyproject.toml` lists the members and
 holds nothing else, and ONE root `uv.lock` pins all of them (Python
 >=3.12, the intersection of the members' floors). Dependents take
-pyhoglake as `{ workspace = true }`. `uv sync`/`uv run` inside a member
-directory select that member against the root lock; never add a
+pyhoglake as `{ workspace = true }`. A fifth member,
+`pyhoglake-variant-codec/`, is pyhoglake's VARIANT codec in Rust
+(maturin): only `uv sync --group variant-codec` in `pyhoglake/` builds
+it, which needs Rust, and `_variant_backend` uses it when it is
+installed (`PYHOGLAKE_VARIANT_CODEC=auto|native|python`).
+`uv sync`/`uv run` inside a member directory select that member against
+the root lock; never add a
 per-directory `uv.lock` back — separately locked trees went stale on
 every pyhoglake pin bump (#332). The members share one `.venv` at the
 root.
@@ -235,10 +240,11 @@ Between releases, main carries the NEXT patch version with a dev
 suffix — `X.Y.Z-dev` in gradle/npm/the OpenAPI spec, `X.Y.Z.dev0`
 (PEP 440) in the Python trees — so an unreleased build never claims a
 released number. Cutting a release = one PR that strips the suffix
-(bumping minor/major if warranted) across all six version strings
+(bumping minor/major if warranted) across all seven version strings
 (server + trino build.gradle.kts, webui package.json, pyhoglake +
-hedgerow pyproject.toml, spec `info.version`) plus the matching entries
-in `webui/package-lock.json` and `uv.lock`, tag it (`vX.Y.Z`;
+pyhoglake-variant-codec + hedgerow pyproject.toml, spec
+`info.version`) plus the matching entries in `webui/package-lock.json`
+and `uv.lock`, tag it (`vX.Y.Z`;
 `pyhoglake-vX.Y.Z` additionally publishes to PyPI), then a follow-up
 commit restores the next `-dev`. The `:checkOpenapiVersion` gradle task
 (in CI) keeps the spec's `info.version` locked to the server version;

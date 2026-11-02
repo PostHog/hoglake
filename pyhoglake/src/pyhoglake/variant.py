@@ -62,6 +62,7 @@ from unicodedata import unidata_version
 
 import pyarrow as pa
 
+from . import _variant_backend as _backend
 from . import _variant_codec as _codec
 from .errors import UnsupportedShreddingError, ValidationError
 from .models import Column
@@ -319,6 +320,11 @@ class VariantReport:
     variant_null: dict[tuple[str | None, str], int] = _field(default_factory=dict)
     #: Wall time spent encoding.
     encode_seconds: float = 0.0
+    #: Calls the Rust codec's result was not used for and Python encoded
+    #: again, by why: ``mismatch``, ``type`` or ``panic``; and rows nested
+    #: past a parser's recursion bound, whose verdict is Python's
+    #: (``recursion_bound``, not re-encoded). Transitional.
+    codec_fallbacks: dict[str, int] = _field(default_factory=dict)
 
     def merge(self, other: VariantReport) -> None:
         """Adds ``other``'s counts to this report. The first invalid row
@@ -333,6 +339,7 @@ class VariantReport:
         if self.first_invalid is None:
             self.first_invalid = other.first_invalid
         self.encode_seconds += other.encode_seconds
+        _add_counts(self.codec_fallbacks, other.codec_fallbacks)
 
 
 def _add_counts(mine: dict[_K, int], theirs: Mapping[_K, int]) -> None:
@@ -431,8 +438,8 @@ def encode_json(
     _refuse_one_row(values, "encode_json")
     name, plan, target_nullable = _target(column, shredding, nullable, on_invalid)
     report = VariantReport()
-    chunks = _codec.encode(
-        _json_rows(values),
+    chunks = _backend.encode(
+        values,
         plan,
         report,
         json_text=True,
@@ -734,6 +741,21 @@ def _json_rows(
     if not isinstance(values, (pa.Array, pa.ChunkedArray)):
         yield from values
         return
+    step = _codec.CHUNK_ROWS
+    for chunk in _binary_chunks(values):
+        for start in range(0, len(chunk), step):
+            yield from chunk.slice(start, step).to_pylist()
+
+
+def _binary_chunks(values: pa.Array | pa.ChunkedArray) -> list[pa.Array]:
+    """Arrow JSON text as the chunks of binary it is, refusing other types.
+
+    As bytes: Arrow does not check that text is UTF-8 (a view, a Parquet
+    file, IPC), and to_pylist would fail the whole batch on one bad row.
+    The encoder decodes each row and refuses that one as invalid_unicode
+    (D6). Binary needs no view: it is those bytes already, and the usual
+    Arrow form of a message payload.
+    """
     kind = values.type
     if _is_json_type(kind):
         kind = kind.storage_type
@@ -753,23 +775,18 @@ def _json_rows(
             f"holding UTF-8), not {values.type}"
         )
     chunks = values.chunks if isinstance(values, pa.ChunkedArray) else [values]
-    step = _codec.CHUNK_ROWS
+    out = []
     for chunk in chunks:
         if isinstance(chunk, pa.ExtensionArray):
             chunk = chunk.storage
-        # As bytes: Arrow does not check that text is UTF-8 (a view, a
-        # Parquet file, IPC), and to_pylist would fail the whole batch on
-        # one bad row. The encoder decodes each row and refuses that one
-        # as invalid_unicode (D6). Binary needs no view: it is those bytes
-        # already, and the usual Arrow form of a message payload.
         if pa.types.is_string(chunk.type):
             chunk = chunk.view(pa.binary())
         elif pa.types.is_large_string(chunk.type):
             chunk = chunk.view(pa.large_binary())
         elif pa.types.is_string_view(chunk.type):
             chunk = chunk.view(pa.binary_view())
-        for start in range(0, len(chunk), step):
-            yield from chunk.slice(start, step).to_pylist()
+        out.append(chunk)
+    return out
 
 
 def _one_array(

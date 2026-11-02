@@ -14,6 +14,7 @@ members = [
     "hoglake-bench",
     "millrace",
     "pyhoglake",
+    "pyhoglake-variant-codec",
 ]
 
 [[package]]
@@ -1139,6 +1140,9 @@ dev = [
     { name = "pytest-httpx" },
     { name = "ruff" },
 ]
+variant-codec = [
+    { name = "pyhoglake-variant-codec" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -1158,6 +1162,12 @@ dev = [
     { name = "pytest-httpx", specifier = ">=0.30" },
     { name = "ruff", specifier = ">=0.16.10" },
 ]
+variant-codec = [{ name = "pyhoglake-variant-codec", editable = "pyhoglake-variant-codec" }]
+
+[[package]]
+name = "pyhoglake-variant-codec"
+version = "1.4.8.dev0"
+source = { editable = "pyhoglake-variant-codec" }
 
 [[package]]
 name = "pytest"

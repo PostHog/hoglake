@@ -41,7 +41,7 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 from variant_helpers import same, unshredded
 
-from pyhoglake import VariantEncodingError, VariantReport, variant
+from pyhoglake import VariantEncodingError, VariantReport, _variant_backend, variant
 from pyhoglake import _variant_codec as codec
 from pyhoglake.variant import VARIANT_NULL
 
@@ -229,14 +229,20 @@ def test_python_round_trips_exactly(values, decl):
     _check(array, decl, rows)
 
 
-@given(st.lists(JSON_VALUES, min_size=1, max_size=6), DECLARATIONS, st.integers(1, 3))
-def test_encoding_is_deterministic(values, decl, chunk_rows):
+@given(
+    st.lists(JSON_VALUES, min_size=1, max_size=6),
+    DECLARATIONS,
+    st.integers(1, 3),
+    st.sampled_from(["python", "auto"]),
+)
+def test_encoding_is_deterministic(values, decl, chunk_rows, backend):
     texts = [None if i % 4 == 3 else json.dumps(v) for i, v in enumerate(values)]
     first = variant.encode_json(texts, shredding=decl).array
     again = variant.encode_json(pa.array(texts, pa.json_()), shredding=decl).array
     assert first.equals(again)
-    # Chunks change where rows are cut, never what a row holds.
-    chunks = codec.encode(
+    # Chunks change where rows are cut, never what a row holds, in either
+    # codec (auto: the Rust one where it encodes the plan, if installed).
+    chunks = _variant_backend.encode(
         texts,
         codec.compile_plan(decl),
         VariantReport(),
@@ -245,6 +251,7 @@ def test_encoding_is_deterministic(values, decl, chunk_rows):
         nullable=True,
         on_invalid="raise",
         chunk_rows=chunk_rows,
+        backend=backend,
     )
     assert pa.chunked_array(chunks, type=first.type).combine_chunks().equals(first)
     # JSON text lands exactly as the objects it parses to.

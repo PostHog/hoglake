@@ -33,6 +33,10 @@ docs/
 # pyproject.toml and nothing else.
 hedgerow/*
 !hedgerow/pyproject.toml
+# Likewise the Rust codec (its cargo target/ is gigabytes): N3 builds
+# its wheel in a stage of its own.
+pyhoglake-variant-codec/*
+!pyhoglake-variant-codec/pyproject.toml
 
 # Local run artifacts.
 **/bench-results.jsonl

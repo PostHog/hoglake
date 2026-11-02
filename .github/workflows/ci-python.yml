@@ -37,6 +37,7 @@ jobs:
           filters: |
             python:
               - "pyhoglake/**"
+              - "pyhoglake-variant-codec/**"
               - "hedgerow/**"
               - "millrace/**"
               - "bench/**"

@@ -1,0 +1,9 @@
+The files under test_parsing/ are copied unmodified from Nicolas Seriot's
+JSONTestSuite:
+
+  https://github.com/nst/JSONTestSuite
+  commit 1ef36fa01286573e846ac449e8683f8833c5b26a (2024-11-22)
+
+They are licensed under the MIT License; see LICENSE beside this file.
+These files are test inputs only: the wheel does not contain them, and the
+sdist carries them with the rest of tests/.

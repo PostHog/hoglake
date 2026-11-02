@@ -63,6 +63,7 @@ COPY pyhoglake/ pyhoglake/
 # --locked check reads.
 COPY hedgerow/pyproject.toml hedgerow/
 COPY millrace/pyproject.toml millrace/
+COPY pyhoglake-variant-codec/pyproject.toml pyhoglake-variant-codec/
 # Manifests only, so the dependency layer survives a bench source-only
 # change. (pyproject's `readme` is resolved at build time, hence
 # README.md.)
