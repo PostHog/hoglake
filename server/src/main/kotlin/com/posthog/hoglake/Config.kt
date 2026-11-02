@@ -95,6 +95,21 @@ data class Config(
      * gets first is `commit_queue_timeout`'s, not this.
      */
     val hogliteRetryBudgetMs: Long = hogliteEnv(database, "HOGLAKE_HOGLITE_RETRY_BUDGET_MS", "8000").toLong(),
+    /**
+     * Send the commit pre-flight reads as ONE interior read: hoglite
+     * answers them from applied state without parking for durability
+     * (needs hoglited `-interior-reads`; an engine without it parks them as
+     * before). Safe only because the commit's own write is fenced to the
+     * incarnation that served the read and acknowledged in WAL order after
+     * everything the read saw, and any other outcome of the plan is decided
+     * again on a parked read (see HogliteCommit). Every other read keeps
+     * the durability wait. Default off; turning it off is the rollback.
+     * Parsed whatever the backend ([parseBoolSetting]): a value nobody can
+     * read refuses boot even where the knob would not apply, rather than
+     * surfacing on the day the backend changes.
+     */
+    val hogliteInteriorPlanReads: Boolean =
+        boolEnv("HOGLAKE_HOGLITE_INTERIOR_PLAN_READS", false) && database != DatabaseBackend.POSTGRES,
     /*
      * Prefix every hoglite tenant id with this deployment's name, so two
      * hoglake deployments sharing one hoglite cluster never address the
@@ -1838,27 +1853,46 @@ data class Config(
         }
 
         /**
-         * A boolean knob that REFUSES anything but `true`/`false`,
-         * naming itself when it does.
-         *
-         * `String.toBoolean()` maps every other spelling — `1`, `yes`,
-         * `on`, a typo — to FALSE, silently, which for a knob whose
-         * default is true means a values file can turn a feature off by
-         * being wrong about how to turn it on. `toBooleanStrict()` alone
-         * throws a message that names neither the variable nor the
-         * value, which in a boot crash is the only thing an operator
-         * needs.
+         * A boolean knob: unset or blank is [default]; otherwise
+         * [parseBoolSetting], which refuses anything it does not know,
+         * naming the variable.
          */
         private fun boolEnv(
             name: String,
             default: Boolean,
         ): Boolean {
             val raw = System.getenv(name)?.takeIf { it.isNotBlank() } ?: return default
-            return raw.lowercase().toBooleanStrictOrNull()
-                ?: throw IllegalArgumentException(
-                    "$name must be 'true' or 'false', got '$raw'",
-                )
+            return parseBoolSetting(name, raw)
         }
+
+        /**
+         * The ONE spelling rule for boolean settings, shared with the
+         * hoglite engine's `boolSetting` (cmd/hoglited): `true`, `1`,
+         * `yes`, `on` and `false`, `0`, `no`, `off`, case-insensitive,
+         * surrounding whitespace ignored. Anything else throws, naming the
+         * variable, the accepted values and what it got.
+         *
+         * Never a silent fallback: `String.toBoolean()` maps every other
+         * spelling — a typo included — to false, so a values file could
+         * leave a feature off while its operator believes it on (or turn a
+         * default-on feature off by being wrong about how to turn it on).
+         * And never strict `true`/`false` only: Kubernetes manifests and
+         * Helm values routinely say `1`, and an operator should not have
+         * to guess which convention this one knob follows.
+         */
+        internal fun parseBoolSetting(
+            name: String,
+            raw: String,
+        ): Boolean =
+            when (raw.trim().lowercase()) {
+                "true", "1", "yes", "on" -> true
+                "false", "0", "no", "off" -> false
+                else -> throw IllegalArgumentException(
+                    "$name must be one of $BOOL_SETTING_SPELLINGS (case-insensitive), got '$raw'",
+                )
+            }
+
+        internal const val BOOL_SETTING_SPELLINGS = "true/1/yes/on or false/0/no/off"
 
         fun fromEnv(): Config = Config()
     }

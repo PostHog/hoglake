@@ -23,6 +23,19 @@ internal fun NettyApplicationEngine.Configuration.configureApiListener(cfg: Conf
     callGroupSize = cfg.nettyCallGroupSize
 }
 
+/** The store constructor shared by both boot paths that can serve hoglite catalogs. */
+internal fun hogliteCatalogStore(
+    cfg: Config,
+    client: com.posthog.hoglake.hoglite.HogliteClient,
+): com.posthog.hoglake.hoglite.HogliteCatalogStore =
+    com.posthog.hoglake.hoglite.HogliteCatalogStore(
+        client,
+        cfg.hogliteTenantPrefix,
+        cfg.refuseBlindPartitionedAppends,
+        cfg.removalLedgerRetentionSeconds,
+        cfg.hogliteInteriorPlanReads,
+    )
+
 fun main() {
     val cfg = Config.fromEnv()
     val app: App
@@ -43,13 +56,7 @@ fun main() {
             // pattern), and /healthz's probe is the client's own
             // /v1/healthz behind the same deadline machinery.
             val client = com.posthog.hoglake.hoglite.HogliteClient.fromConfig(cfg)
-            val store =
-                com.posthog.hoglake.hoglite.HogliteCatalogStore(
-                    client,
-                    cfg.hogliteTenantPrefix,
-                    cfg.refuseBlindPartitionedAppends,
-                    cfg.removalLedgerRetentionSeconds,
-                )
+            val store = hogliteCatalogStore(cfg, client)
             app =
                 App.buildHoglite(
                     cfg,
@@ -66,13 +73,7 @@ fun main() {
             val ds = Database.dataSource(cfg)
             val postgres = MixedPostgres(ds)
             val client = com.posthog.hoglake.hoglite.HogliteClient.fromConfig(cfg)
-            val store =
-                com.posthog.hoglake.hoglite.HogliteCatalogStore(
-                    client,
-                    cfg.hogliteTenantPrefix,
-                    cfg.refuseBlindPartitionedAppends,
-                    cfg.removalLedgerRetentionSeconds,
-                )
+            val store = hogliteCatalogStore(cfg, client)
             val directory = com.posthog.hoglake.hoglite.CatalogDirectory(store)
             app =
                 App.buildMixed(

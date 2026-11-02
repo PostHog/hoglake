@@ -258,6 +258,17 @@ object Metrics {
     }
 
     /**
+     * hoglake_hoglite_interior_plan_reads_unserved_total — commit
+     * pre-flight reads sent as interior (HOGLAKE_HOGLITE_INTERIOR_PLAN_READS
+     * on) that hoglite answered WITHOUT an incarnation token: the engine
+     * predates interior reads or runs without `-interior-reads`. The
+     * commit is safe (it is planned on the parked read it got), but the
+     * setting does nothing. Any nonzero rate means the engine/client
+     * pairing is wrong; see docs/hoglite-backend.md.
+     */
+    fun hogliteInteriorPlanReadUnserved() = increment("hoglake_hoglite_interior_plan_reads_unserved_total", 1.0)
+
+    /**
      * hoglake_commit_receipt_purge_failures_total{catalog} — pages of
      * the commit-receipt retention purge that threw (#240, V24).
      *

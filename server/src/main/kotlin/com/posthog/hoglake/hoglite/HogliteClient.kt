@@ -60,6 +60,25 @@ class HogliteGuardFailure(
 ) : RuntimeException(detail)
 
 /**
+ * A fenced write ([HogliteClient.tx] with an incarnation token) reached a
+ * different tenant incarnation than the one that served the interior read
+ * it was decided on, and that incarnation holds no receipt for its txid:
+ * hoglite answered 412 `incarnation_changed`. Definitely not applied — the
+ * statements never ran — but NOT a refusal of the request: the read it was
+ * built from may have seen a commit the new owner never had. The caller
+ * decides the write again on a durable read, with the same txid.
+ */
+class HogliteIncarnationChanged(
+    detail: String,
+) : RuntimeException(detail)
+
+/** An interior read's results and the incarnation token that fences the write it decides (null: it parked). */
+class HogliteInteriorRead(
+    val results: List<HogliteQueryResult>,
+    val incarnation: String?,
+)
+
+/**
  * hoglite refused the call deterministically and it is NOT a guard:
  * a 422 `refused` (SQL error — constraint violation, malformed
  * statement — rolled back), a 404 (unknown tenant), or a 409 from
@@ -200,6 +219,12 @@ class HogliteClient(
         txid: String,
         fingerprint: String?,
         statements: List<HogliteStatement>,
+        /**
+         * The token an [interiorReadTx] returned, when [statements] were
+         * decided on that read: hoglite then applies them only in the
+         * incarnation that served it ([HogliteIncarnationChanged]).
+         */
+        incarnation: String? = null,
     ): List<HogliteQueryResult> {
         require(statements.isNotEmpty()) { "a hoglite transaction needs at least one statement" }
         val body =
@@ -208,6 +233,7 @@ class HogliteClient(
                     put("client", CLIENT_NAME)
                     put("txid", txid)
                     if (fingerprint != null) put("fp", fingerprint)
+                    if (incarnation != null) put("incarnation", incarnation)
                     put("statements", statements.map { it.toWire() })
                 },
             )
@@ -215,6 +241,10 @@ class HogliteClient(
             when {
                 status == 200 -> parseTxResults(bytes)
                 status == 409 -> throw guardFailure(bytes)
+                // A fenced write met another incarnation and found no
+                // receipt for its txid there: not applied, decide again.
+                status == 412 && errorCode(bytes) == CODE_INCARNATION_CHANGED ->
+                    throw HogliteIncarnationChanged(String(bytes))
                 // A query guard refusal (504 query_timeout, 413
                 // result_too_large, 507 out_of_memory): the statement
                 // rolled back and wrote no dedup receipt. Final.
@@ -283,7 +313,33 @@ class HogliteClient(
     fun readTx(
         tenant: String,
         statements: List<HogliteStatement>,
-    ): List<HogliteQueryResult> {
+    ): List<HogliteQueryResult> = sendReadTx(tenant, statements, interior = false).results
+
+    /**
+     * [readTx] as an INTERIOR read: hoglite answers from applied state
+     * without waiting for it to be durable, when its `-interior-reads`
+     * option is on. The result may show a commit that is lost if the owner
+     * dies, so it may only decide a write sent with
+     * [tx]`(incarnation = `[HogliteInteriorRead.incarnation]`)` — that
+     * write is acknowledged only after everything the read saw is durable,
+     * and is refused ([HogliteIncarnationChanged]) on any other owner
+     * incarnation. Nothing derived from the result may reach a caller in
+     * any other way. The one user is the commit pre-flight
+     * ([HogliteCommit]); every other read keeps [readTx] / [query].
+     *
+     * An engine with the option off parks the read as usual and returns
+     * no token ([HogliteInteriorRead.incarnation] null).
+     */
+    internal fun interiorReadTx(
+        tenant: String,
+        statements: List<HogliteStatement>,
+    ): HogliteInteriorRead = sendReadTx(tenant, statements, interior = true)
+
+    private fun sendReadTx(
+        tenant: String,
+        statements: List<HogliteStatement>,
+        interior: Boolean,
+    ): HogliteInteriorRead {
         require(statements.isNotEmpty()) { "a hoglite read transaction needs at least one statement" }
         for (st in statements) {
             require(st.expectAffected == null && st.expectScalarInt == null) {
@@ -298,17 +354,23 @@ class HogliteClient(
                 buildMap {
                     put("client", CLIENT_NAME)
                     put("txid", READ_TXID_PREFIX + UUID.randomUUID())
+                    if (interior) put("interior", true)
                     put("statements", statements.map { it.toWire() })
                 },
             )
         return call(tenant, "/v1/t/$tenant/tx", body, readTimeoutMs) { status, bytes ->
             when {
-                status == 200 ->
-                    parseTxResults(bytes).also {
-                        check(it.size == statements.size) {
-                            "hoglite answered ${it.size} results for a ${statements.size}-statement read"
-                        }
+                status == 200 -> {
+                    val decoded = json.readValue<Map<String, Any?>>(bytes)
+                    val results = parseTxResults(decoded)
+                    check(results.size == statements.size) {
+                        "hoglite answered ${results.size} results for a ${statements.size}-statement read"
                     }
+                    // Only an interior request can carry a token; a token on
+                    // an ordinary read would be an engine bug, and ignoring
+                    // it keeps every ordinary write unfenced as before.
+                    HogliteInteriorRead(results, if (interior) decoded["incarnation"] as? String else null)
+                }
                 status == 422 && errorCode(bytes) == CODE_REFUSED -> throw HogliteRejected(409, String(bytes))
                 else -> throw HogliteRejected(status, String(bytes))
             }
@@ -748,9 +810,10 @@ class HogliteClient(
             if (expectScalarInt != null) put("expect_scalar_int", expectScalarInt)
         }
 
-    private fun parseTxResults(bytes: ByteArray): List<HogliteQueryResult> {
-        val decoded = json.readValue<Map<String, Any?>>(bytes)
+    private fun parseTxResults(bytes: ByteArray): List<HogliteQueryResult> =
+        parseTxResults(json.readValue<Map<String, Any?>>(bytes))
 
+    private fun parseTxResults(decoded: Map<String, Any?>): List<HogliteQueryResult> {
         @Suppress("UNCHECKED_CAST")
         val results = decoded["results"] as? List<Map<String, Any?>> ?: emptyList()
         return results.map { it.toQueryResult() }
@@ -849,6 +912,9 @@ class HogliteClient(
          * the same request and data, rolled back, no dedup receipt.
          */
         val GUARD_REFUSAL_CODES = setOf("query_timeout", "result_too_large", "out_of_memory")
+
+        /** hoglite's label for a fenced write refused in another incarnation (412). */
+        const val CODE_INCARNATION_CHANGED = "incarnation_changed"
 
         /** hoglite's label for a failure it knows did not apply (503). */
         const val CODE_NOT_APPLIED = "not_applied"

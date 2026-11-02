@@ -16,7 +16,8 @@ package com.posthog.hoglake
  * `RemovedEnvConfigTest` launches this class and reads the exit code.
  *
  * Exit codes are the contract:
- *  - `0` — `Config()` constructed, so nothing refused it.
+ *  - `0` — `Config()` constructed, so nothing refused it. Each
+ *    argument is a property name, printed as `name=value`.
  *  - `2` — construction threw `IllegalArgumentException`, i.e. a
  *    `require` in `init` fired. The message goes to stdout for the test
  *    to assert on.
@@ -29,8 +30,15 @@ object ConfigBootProbe {
     @JvmStatic
     fun main(args: Array<String>) {
         try {
-            Config()
+            val config = Config()
             println("CONSTRUCTED")
+            // Each argument names a Config property to report as
+            // `name=value`, so a test can see what the real environment
+            // parsed to, not only whether it parsed.
+            for (name in args) {
+                val getter = Config::class.java.getMethod("get" + name.replaceFirstChar { it.uppercase() })
+                println("$name=${getter.invoke(config)}")
+            }
         } catch (e: IllegalArgumentException) {
             println("REFUSED: ${e.message}")
             // Not `exitProcess(2)`: the point is an exit code the parent

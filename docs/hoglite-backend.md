@@ -183,6 +183,11 @@ them unchanged; the hoglite ports live in `server/.../hoglite/`.
 | `HOGLAKE_HOGLITE_CIRCUIT_FAILURE_THRESHOLD` | 10 | consecutive failures before the pool opens |
 | `HOGLAKE_HOGLITE_CIRCUIT_OPEN_MS` | 5000 | open duration before the half-open probe |
 | `HOGLAKE_HOGLITE_LOOP_LEASES` | `true` | one process per background loop sweeps (a lease in the registry tenant); `false`: every process sweeps |
+| `HOGLAKE_HOGLITE_INTERIOR_PLAN_READS` | `false` | commit pre-flight reads skip the durability wait (needs `hoglited -interior-reads`); see below |
+
+Boolean settings, here and in hoglited, take `true`/`1`/`yes`/`on` or
+`false`/`0`/`no`/`off`, case-insensitive. Any other value refuses boot with a
+message naming the variable; it never falls back to the default.
 
 Retry taxonomy: 421 (owner moved — repin and retry), 503, 504 and transport
 errors retry, inside the budget, with 200ms backoff, and a `/tx` retry
@@ -209,6 +214,38 @@ timeout up to 5000ms)`, or `... 1 misdirected (421); last 421 named owner
 'hl-1', but owner-direct routing is not configured`. Timeouts point at a stalled engine or a lease
 wait, 421s at routing, and 503s at owner churn. A failure on the registry
 tenant also names the registry and the step that failed.
+
+### Interior plan reads
+
+hoglite parks every read until its snapshot is durable, so no caller sees a
+commit a dying owner could lose. With `HOGLAKE_HOGLITE_INTERIOR_PLAN_READS`
+on (and the engine started with `-interior-reads`), ONE read skips the wait:
+the batched pre-flight read of a commit (`HogliteCommit.PlanReads`). It is
+safe because the write is incarnation-fenced and acknowledged in WAL order;
+receipts, refusals and a changed incarnation are decided again durably with
+the same txid. The canonical safety argument lives beside
+[`HogliteCommit`](../server/src/main/kotlin/com/posthog/hoglake/hoglite/HogliteCommit.kt).
+The option applies to hoglite catalogs in both `hoglite` and `mixed` mode;
+PostgreSQL catalogs are unaffected.
+
+Nothing else reads interior: registry reads (another tenant's WAL orders
+nothing here), the post-rollback classifiers, the dropped-table probe, every
+read whose result is returned, and all maintenance (expiry, compaction, the
+hydrator). Turning the variable off is the rollback.
+
+**Pairing.** The setting needs an engine that has interior reads (hoglite
+#8 or later) started with `-interior-reads` / `HL_INTERIOR_READS=1`. Enable
+both together, per namespace, in the hoglite-backend Helm values. The code
+default stays off on both sides, so nothing turns on by upgrading. If the
+engine is older or runs without the flag, it parks the read and returns no
+token. Commits then stay correct, planned on the durable read, but the
+setting does nothing. That case is **loud, not silent**: every such read
+counts in `hoglake_hoglite_interior_plan_reads_unserved_total`, and the
+server logs a warning (at most once a minute) naming both settings. It does
+not fail the commit, because that would turn the engine-side rollback (drop
+`-interior-reads`) into an outage. A nonzero rate of that counter means the
+pairing is wrong. The opposite pairing (engine on, server off) is inert: the
+engine serves interior reads only to requests that ask for them.
 
 ## Failure modes
 

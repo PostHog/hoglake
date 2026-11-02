@@ -57,6 +57,33 @@ import java.util.UUID
  *    pre-read and the tx is closed by the receipt insert's PRIMARY KEY:
  *    the loser's whole transaction rolls back on the constraint
  *    violation.
+ *
+ * ## Interior plan reads ([HogliteCatalogStore.interiorPlanReads], default off)
+ *
+ * hoglite parks a read until its snapshot is durable, so no caller sees a
+ * commit that a dying owner could lose. The pre-flight reads ([PlanReads])
+ * can skip that wait as an INTERIOR read, under three rules that together
+ * keep every caller-visible outcome off non-durable state:
+ *
+ *  1. The plan may only lead to this commit's own write, sent with the
+ *     read's incarnation token. hoglite acknowledges that write only once
+ *     every byte before it in the owner's WAL is durable — everything the
+ *     plan saw included — and refuses it, unapplied, on any other owner
+ *     incarnation (412 `incarnation_changed`), where a lost commit's
+ *     counters (snapshot ids, schema versions, table ids) may have been
+ *     reused and a guard built from the plan could pass on different
+ *     state.
+ *  2. Any other outcome of an interior plan — the receipt replay (an ack
+ *     with no write: it could replay a not-yet-durable first attempt of
+ *     the same key), and every refusal raised before the write is sent —
+ *     is thrown away and the commit is decided again on parked reads
+ *     ([planAndCommit]). So is a 412.
+ *  3. The decision again keeps the txid, so a write the first attempt
+ *     may have applied answers from hoglite's dedup, exactly once.
+ *
+ * Nothing else may read interior: not the registry (another tenant's WAL
+ * orders nothing here), not the post-rollback classifiers or the dropped
+ * probe, not any read whose result is returned, not maintenance.
  */
 
 internal object HogliteCommit {
@@ -95,11 +122,11 @@ internal object HogliteCommit {
         // re-plans instead: one retry with fresh state, then the conflict
         // stands as a typed, retryable refusal.
         return try {
-            doCommit(store, catalog, request)
+            planAndCommit(store, catalog, request)
         } catch (e: HoglakeException.CommitConflict) {
             if (e !== SCHEMA_CHANGED) throw e
             try {
-                doCommit(store, catalog, request)
+                planAndCommit(store, catalog, request)
             } catch (e2: HoglakeException.CommitConflict) {
                 if (e2 !== SCHEMA_CHANGED) throw e2
                 throw HoglakeException.CommitConflict(
@@ -109,10 +136,61 @@ internal object HogliteCommit {
         }
     }
 
+    /**
+     * One planned commit attempt. With interior plan reads on, the plan is
+     * read interior first; whenever that plan would end the commit in
+     * anything but its own fenced write (see the class KDoc, rule 2), or
+     * the write meets another incarnation, the attempt is decided again on
+     * a parked plan with the same txid.
+     */
+    private fun planAndCommit(
+        store: HogliteCatalogStore,
+        catalog: String,
+        request: CommitRequest,
+    ): CommitResult {
+        if (!store.interiorPlanReads) return doCommit(store, catalog, request, Attempt(interior = false))
+        val first = Attempt(interior = true)
+        try {
+            return doCommit(store, catalog, request, first)
+        } catch (e: HogliteIncarnationChanged) {
+            // the fenced write met another incarnation: not applied
+        } catch (e: InteriorUndecided) {
+            // the interior plan answered without the write
+        } catch (e: Exception) {
+            // A failure of the plan read itself or of the write is the same
+            // answer a parked plan would get; only a refusal the interior
+            // plan raised before the write is redecided. BackendUnavailable
+            // says nothing about the state and would only double the wait.
+            if (!first.interiorPlan || first.sent || e is HoglakeException.BackendUnavailable) throw e
+        }
+        store.interiorRedecided.incrementAndGet()
+        return doCommit(store, catalog, request, Attempt(interior = false, txid = first.txid))
+    }
+
+    /** The plan transport of one [doCommit], and how far it got. */
+    private class Attempt(
+        /** Ask for the plan as an interior read. */
+        val interior: Boolean,
+        /** The txid to reuse: a redecided attempt keeps its predecessor's. */
+        var txid: String? = null,
+    ) {
+        /** The plan WAS read interior (hoglite returned a token; an engine with the option off parks). */
+        var interiorPlan = false
+
+        /** The write was handed to hoglite: from here every outcome is the write's. */
+        var sent = false
+    }
+
+    /** An interior plan reached an outcome without this commit's write (the receipt replay). */
+    private object InteriorUndecided : RuntimeException("interior plan answered without its write") {
+        override fun fillInStackTrace(): Throwable = this
+    }
+
     private fun doCommit(
         store: HogliteCatalogStore,
         catalog: String,
         request: CommitRequest,
+        attempt: Attempt,
     ): CommitResult {
         if (request.appends.isEmpty() && request.deletes.isEmpty()) {
             throw HoglakeException.Validation("at least one of appends/deletes must be non-empty")
@@ -169,7 +247,8 @@ internal object HogliteCommit {
         // transaction (see PlanReads). The results are consumed below in
         // the order the reads used to run, so the first refusal a request
         // gets is unchanged.
-        val plan = PlanReads.read(store, catalog, request, order.values, appends, deletes)
+        val plan = PlanReads.read(store, catalog, request, order.values, appends, deletes, attempt.interior)
+        attempt.interiorPlan = plan.incarnation != null
         val meta = plan.meta()
         val dataPathPrefix = meta.dataPath.trimEnd('/') + "/"
 
@@ -181,6 +260,10 @@ internal object HogliteCommit {
             val existing = plan.receipt()
             if (existing != null) {
                 if (existing[0].asString() == fingerprint) {
+                    // An ack without a write: from an interior plan the
+                    // receipt may be a first attempt that is not durable
+                    // yet, so it is read again, parked.
+                    if (attempt.interiorPlan) throw InteriorUndecided
                     return CommitResult(existing[1].asLong(), existing[2].asLong())
                 }
                 throw HoglakeException.Validation(
@@ -931,11 +1014,14 @@ internal object HogliteCommit {
         // minted here, once, and HogliteClient's retry loop reuses it, so
         // at-most-once holds across this request's own retries.
         val txid =
-            request.idempotencyKey?.let { "ik:$catalog:$it" }
+            attempt.txid
+                ?: request.idempotencyKey?.let { "ik:$catalog:$it" }
                 ?: "ch:$catalog:${UUID.randomUUID()}"
+        attempt.txid = txid
+        attempt.sent = true
         val results =
             try {
-                store.runTx(catalog, txid, fingerprint, tx)
+                store.runTx(catalog, txid, fingerprint, tx, incarnation = plan.incarnation)
             } catch (e: HoglakeException.Validation) {
                 // The receipt PRIMARY KEY is the race closer: two
                 // different payloads under one key -> the loser's
@@ -1040,6 +1126,10 @@ internal object HogliteCommit {
     ) {
         private val statements = mutableListOf<HogliteStatement>()
         private lateinit var results: List<HogliteQueryResult>
+
+        /** The incarnation token of an interior plan read; null when the plan parked (durable). */
+        var incarnation: String? = null
+            private set
 
         private var metaAt = -1
         private var receiptAt: Int? = null
@@ -1157,6 +1247,7 @@ internal object HogliteCommit {
                 touched: Collection<Touched>,
                 appends: List<TableAppend>,
                 deletes: List<TableDeletes>,
+                interior: Boolean,
             ): PlanReads {
                 val p = PlanReads(store, catalog)
                 p.metaAt = p.add(store.metaSql, emptyList())
@@ -1278,7 +1369,13 @@ internal object HogliteCommit {
                         )
                 }
 
-                p.results = store.readCatalog(catalog, p.statements)
+                if (interior) {
+                    val read = store.readCatalogInterior(catalog, p.statements)
+                    p.results = read.results
+                    p.incarnation = read.incarnation
+                } else {
+                    p.results = store.readCatalog(catalog, p.statements)
+                }
                 return p
             }
         }
