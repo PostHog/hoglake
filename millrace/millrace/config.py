@@ -19,6 +19,7 @@ topic → one table.
 | ``MILLRACE_PARTITION_BY`` | none | partition spec for creating the table: ``col``, ``identity(col)``, ``year/month/day/hour(col)``, ``bucket(col, N)`` |
 | ``MILLRACE_SORT_BY`` | none | sort order for creating the table: ``col [asc|desc] [nulls_first|nulls_last]``, … |
 | ``MILLRACE_VARIANT_SOURCES`` | none | ``column=payload_key,…``: each top-level variant column of the live table filled from the JSON text at that payload key; an unlisted (nullable) variant column is written as SQL NULL |
+| ``MILLRACE_STAGE_REPIN_FROM`` | none | a table uuid, for one rollout that moves to a new table: a stage pinned to it is re-pinned to the resolved table and its staged rows drain there; a pin to any other uuid still halts ``table_recreated`` |
 | ``MILLRACE_STAGE_URL`` | required | staging root (``s3://bucket/prefix``, ``file:///path``, ``memory:///``); one SlateDB per replica (its home stage) at ``<root>/<topic>/<slot>``, the slot of its smallest claimed partition |
 | ``MILLRACE_FLUSH_BYTES`` | 268435456 (256 MiB) | staged bytes per flush decision: the size lane fires at it and a scan reads at most it (always at least one row) |
 | ``MILLRACE_FLUSH_DEADLINE_S`` | 900 | age lane: a group at least this old with at least 1 MiB staged flushes |
@@ -194,6 +195,8 @@ _TOPIC_NAME: Final = re.compile(r"^[a-zA-Z0-9._-]{1,249}$")
 _CATALOG_NAME: Final = re.compile(r"^[a-z][a-z0-9_-]{0,62}$")
 _IDENTIFIER: Final = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,127}$")
 _S3_BUCKET: Final = re.compile(r"^[a-z0-9][a-z0-9.\-]{1,61}[a-z0-9]$")
+# The server's table_uuid text (Postgres uuid, lowercase, hyphenated).
+_TABLE_UUID: Final = re.compile(r"^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$")
 # A StatefulSet pod name's trailing ordinal.
 _POD_ORDINAL: Final = re.compile(r"-(\d+)$")
 # ``transform(args)`` in MILLRACE_PARTITION_BY.
@@ -246,6 +249,9 @@ class Config:
     #: ``(column, payload key)`` per mapped variant column, checked against
     #: the live catalog by the flusher at startup.
     variant_sources: tuple[tuple[str, str], ...] = ()
+    #: The incarnation a planned move leaves (lowercase uuid text): a
+    #: stage pinned to it re-pins to the resolved table instead of halting.
+    stage_repin_from: str | None = None
     # -- constants --
     #: The age lane's minimum staged bytes.
     min_flush_bytes: int = MIN_FLUSH_BYTES_DEFAULT
@@ -923,6 +929,15 @@ def load_config(env: Mapping[str, str]) -> Config:
     stage: tuple[str, str] | None = None
     if stage_raw is not None:
         stage = _parse_stage_url(stage_raw, problems)
+    stage_repin_from: str | None = None
+    if raw := env.get("MILLRACE_STAGE_REPIN_FROM", "").strip():
+        if _TABLE_UUID.match(raw.lower()):
+            stage_repin_from = raw.lower()
+        else:
+            problems.append(
+                f"MILLRACE_STAGE_REPIN_FROM {raw!r} is not a table uuid "
+                "(8-4-4-4-12 hex digits)"
+            )
 
     catalog_data_path: str | None = None
     if raw := env.get("MILLRACE_CATALOG_DATA_PATH", "").strip():
@@ -1026,4 +1041,5 @@ def load_config(env: Mapping[str, str]) -> Config:
         partition_by=partition_by,
         sort_by=sort_by,
         variant_sources=variant_sources,
+        stage_repin_from=stage_repin_from,
     )

@@ -44,6 +44,8 @@ from flushkit import (
     table_wire,
     team_group,
 )
+from slatedb.uniffi import CloseReason
+from slatedb.uniffi import Error as SlateError
 from stagekit import NOW, fast_flush_settings, staged_groups
 
 from millrace.flush import (
@@ -976,6 +978,153 @@ async def test_the_first_commit_pins_the_incarnation_and_a_recreate_halts_the_dr
     assert _exit_code_for([halted.value]) == EXIT_HALTED
     assert len(capture.bodies) == 1  # nothing was committed after the restart
     assert await staged_count(restarted, 7) == 1
+    await restarted.close()
+
+
+async def _pinned_with_one_row_staged(
+    tmp_path: Path,
+    flusher_factory: Any,
+    store: Any,
+    clock: Any,
+    mono: Any,
+    sleeper: Any,
+) -> None:
+    """Slot 0 pinned to TABLE_UUID by its first commit, one row left
+    staged; slot 2 pinned to it and empty (an idle or drained stage)."""
+    cfg = make_config()
+    first = manager(tmp_path)
+    await first.open_partition("events", 0)
+    await first.open_partition("events", 2)
+    flusher = flusher_factory(cfg=cfg, store=store)
+    await stage_rows(first, clock, 7, [(0, event_payload(7, NOW))])
+    await runner(first, flusher, cfg, clock, mono, sleeper).run_once(drain=True)
+    assert await first.stage("events", 0).pinned_table_uuid() == TABLE_UUID
+    await first.stage("events", 2).pin_table_uuid(TABLE_UUID)
+    await stage_rows(first, clock, 7, [(1, event_payload(7, NOW))])
+    await first.close()
+
+
+async def test_a_planned_move_repins_the_stage_and_drains_it_into_the_new_table(
+    tmp_path: Path,
+    httpx_mock: Any,
+    flusher_factory: Any,
+    store: Any,
+    fake_clock: Any,
+    mono: Any,
+    sleeper: Any,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """MILLRACE_STAGE_REPIN_FROM names the old incarnation: the drain
+    re-pins every stage, the empty one too, and commits the staged row to
+    the new one; a later start without the knob drains as usual."""
+    script_options(httpx_mock)
+    capture = CommitCapture(httpx_mock, [commit_ok(91), commit_ok(92)])
+    await _pinned_with_one_row_staged(
+        tmp_path, flusher_factory, store, fake_clock, mono, sleeper
+    )
+
+    cfg = make_config(stage_repin_from=TABLE_UUID)
+    moved = flusher_factory(cfg=cfg, store=store, table=table_wire(uuid=RECREATED_UUID))
+    script_options(httpx_mock)
+    restarted = manager(tmp_path)
+    await restarted.open_partition("events", 0)
+    await restarted.open_partition("events", 2)
+    with caplog.at_level(logging.WARNING, logger="millrace.flush"):
+        await runner(restarted, moved, cfg, fake_clock, mono, sleeper).drain()
+    for slot in (0, 2):
+        pinned = await restarted.stage("events", slot).pinned_table_uuid()
+        assert pinned == RECREATED_UUID, slot
+    assert [p["appends"][0]["expected_table_uuid"] for p in capture.payloads] == [
+        TABLE_UUID,
+        RECREATED_UUID,
+    ]
+    assert len(committed_offsets(store, capture, landed=[1])) == 1
+    assert await staged_count(restarted, 7) == 0
+    repins = [
+        r.getMessage()
+        for r in caplog.records
+        if TABLE_UUID in r.getMessage() and RECREATED_UUID in r.getMessage()
+    ]
+    assert len(repins) == 2, caplog.text
+    await restarted.close()
+
+    plain = make_config()
+    again = manager(tmp_path)
+    await again.open_partition("events", 0)
+    await again.open_partition("events", 2)
+    later = flusher_factory(
+        cfg=plain, store=store, table=table_wire(uuid=RECREATED_UUID)
+    )
+    await runner(again, later, plain, fake_clock, mono, sleeper).drain()
+    assert len(capture.bodies) == 2
+    await again.close()
+
+
+async def test_a_pin_to_any_other_incarnation_still_halts_under_the_knob(
+    tmp_path: Path,
+    httpx_mock: Any,
+    flusher_factory: Any,
+    store: Any,
+    fake_clock: Any,
+    mono: Any,
+    sleeper: Any,
+) -> None:
+    """The knob re-pins only the uuid it names; the halt names the knob."""
+    script_options(httpx_mock)
+    capture = CommitCapture(httpx_mock, [commit_ok(91)])
+    await _pinned_with_one_row_staged(
+        tmp_path, flusher_factory, store, fake_clock, mono, sleeper
+    )
+
+    other = str(uuid.uuid4())
+    cfg = make_config(stage_repin_from=other)
+    moved = flusher_factory(cfg=cfg, store=store, table=table_wire(uuid=RECREATED_UUID))
+    restarted = manager(tmp_path)
+    await restarted.open_partition("events", 0)
+    with pytest.raises(FlushHalted) as halted:
+        await runner(restarted, moved, cfg, fake_clock, mono, sleeper).drain()
+    assert halted.value.reason == "table_recreated"
+    assert f"MILLRACE_STAGE_REPIN_FROM={TABLE_UUID}; it is {other}" in str(halted.value)
+    assert await restarted.stage("events", 0).pinned_table_uuid() == TABLE_UUID
+    assert len(capture.bodies) == 1
+    assert await staged_count(restarted, 7) == 1
+    await restarted.close()
+
+
+async def test_a_fenced_repin_stops_the_drain_as_fenced(
+    tmp_path: Path,
+    httpx_mock: Any,
+    flusher_factory: Any,
+    store: Any,
+    fake_clock: Any,
+    mono: Any,
+    sleeper: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The re-pin is the drain check's one write: a newer writer's fence
+    there latches and exits 4, not a crash."""
+    from millrace.main import EXIT_FENCED, _exit_code_for
+    from millrace.stage import FencedError, PartitionStage
+
+    script_options(httpx_mock)
+    CommitCapture(httpx_mock, [commit_ok(91)])
+    await _pinned_with_one_row_staged(
+        tmp_path, flusher_factory, store, fake_clock, mono, sleeper
+    )
+
+    async def fenced(self: Any, table_uuid: str) -> None:
+        raise SlateError.Closed(CloseReason.FENCED, "newer writer")
+
+    monkeypatch.setattr(PartitionStage, "pin_table_uuid", fenced)
+    cfg = make_config(stage_repin_from=TABLE_UUID)
+    moved = flusher_factory(cfg=cfg, store=store, table=table_wire(uuid=RECREATED_UUID))
+    restarted = manager(tmp_path)
+    await restarted.open_partition("events", 0)
+    r = runner(restarted, moved, cfg, fake_clock, mono, sleeper)
+    with pytest.raises(FencedError) as stopped:
+        await r.drain()
+    assert r.halted is stopped.value
+    assert _exit_code_for([stopped.value]) == EXIT_FENCED
     await restarted.close()
 
 

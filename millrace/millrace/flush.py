@@ -1690,7 +1690,11 @@ class HoglakeFlusher:
         """Halt when the stage's rows were first committed to another
         incarnation of the destination (``meta/table_uuid``): the halt
         survives restarts, not only the process that saw the recreate.
-        With ``pin``, an unpinned stage records this incarnation."""
+        With ``pin``, an unpinned stage records this incarnation. A stage
+        pinned to ``stage_repin_from`` (a planned move to this table) is
+        re-pinned instead: a row committed there left the stage when its
+        commit landed, so every staged row belongs here (but the
+        at-least-once replay of a commit whose delete was lost)."""
         if stage.path in self._pinned_stages:
             return
         pinned = await stage.pinned_table_uuid()
@@ -1699,12 +1703,27 @@ class HoglakeFlusher:
                 return
             await stage.pin_table_uuid(self._table_uuid)
         elif pinned != self._table_uuid:
-            raise FlushHalted(
-                "table_recreated",
-                f"{stage.topic}[{stage.partition}]'s staged rows were committed "
-                f"to incarnation {pinned} of {self._cfg.namespace}."
-                f"{self._cfg.table}, which now resolves to {self._table_uuid}. "
-                "A human decides what happened; staged rows stay durable.",
+            if pinned != self._cfg.stage_repin_from:
+                knob = self._cfg.stage_repin_from or "unset"
+                raise FlushHalted(
+                    "table_recreated",
+                    f"{stage.topic}[{stage.partition}]'s staged rows were committed "
+                    f"to incarnation {pinned}; {self._cfg.namespace}."
+                    f"{self._cfg.table} now resolves to {self._table_uuid}. "
+                    "A human decides what happened (a planned move here sets "
+                    f"MILLRACE_STAGE_REPIN_FROM={pinned}; it is {knob}); staged "
+                    "rows stay durable.",
+                )
+            await stage.pin_table_uuid(self._table_uuid)
+            log.warning(
+                "%s[%d] re-pinned from %s to %s (%s.%s, MILLRACE_STAGE_REPIN_FROM): "
+                "it now flushes there",
+                stage.topic,
+                stage.partition,
+                pinned,
+                self._table_uuid,
+                self._cfg.namespace,
+                self._cfg.table,
             )
         self._pinned_stages.add(stage.path)
 
@@ -2523,7 +2542,8 @@ class FlushRunner:
         """Flush everything staged, before the consumer starts (nothing
         new arrives meanwhile). First every stage's pinned incarnation is
         checked: a recreated destination halts before anything is
-        flushed. Then each stage (the home and every foreign slot)
+        flushed, and a planned move re-pins (``stage_repin_from``),
+        empty stages included. Then each stage (the home and every foreign slot)
         streams its rows in one sequential pass (:meth:`_drain_stage`),
         stages concurrently, at most ``concurrency`` batches in memory at
         once. A group whose window
@@ -2537,6 +2557,12 @@ class FlushRunner:
             except FlushHalted as halt:
                 self._fatal = halt
                 raise
+            except Exception as e:
+                # A re-pin writes (MILLRACE_STAGE_REPIN_FROM).
+                if not is_fenced(e):
+                    raise
+                self._fatal = FencedError([(topic, partition)])
+                raise self._fatal from e
         slots = asyncio.Semaphore(self._concurrency)
         streams = [
             asyncio.create_task(
