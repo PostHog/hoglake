@@ -55,6 +55,20 @@ dependencies = [
 # requires botocore >=1.36.0,<1.37.0.
 fast-upload = ["boto3>=1.43.118"]
 
+# The Rust VARIANT codec, which _variant_backend uses when it speaks its
+# PROTOCOL. It is released on its own, only when it changes; this pin is
+# the release publish-pyhoglake.yml tests from PyPI before an upload. In
+# the workspace uv builds the member instead, whatever its version. The
+# markers are variant-codec-wheels.yml's wheels: elsewhere the extra
+# installs nothing rather than build the sdist (Rust needed), and the
+# Python codec runs. Free-threaded CPython and glibc below 2.28, which no
+# marker tells apart, still get the sdist.
+variant-codec = ["""pyhoglake-variant-codec==0.1.0; \
+    platform_python_implementation == 'CPython' and (\
+    (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) \
+    or (sys_platform == 'darwin' and (platform_machine == 'x86_64' or platform_machine == 'arm64')) \
+    or (sys_platform == 'win32' and platform_machine == 'AMD64'))"""]
+
 [project.urls]
 Repository = "https://github.com/PostHog/hoglake"
 Documentation = "https://github.com/PostHog/hoglake/tree/main/pyhoglake"
@@ -80,14 +94,8 @@ dev = [
     "boto3>=1.43.118",
 ]
 
-# The Rust VARIANT codec, a workspace member that _variant_backend uses
-# when it is installed: `uv sync --group variant-codec` builds it (Rust
-# needed). A group, not an extra, so that no release names the package
-# before it is published and its name claimed.
-# FOLLOW-UP once pyhoglake-variant-codec is on PyPI (publish-pyhoglake-
-# variant-codec.yml): add the `variant-codec` extra, pinned to this
-# version, with markers matching variant-codec-wheels.yml's wheels
-# (design-native-encoder §6).
+# The codec built from the workspace member on any platform: `uv sync
+# --group variant-codec` (Rust needed).
 variant-codec = ["pyhoglake-variant-codec"]
 
 [tool.uv.sources]

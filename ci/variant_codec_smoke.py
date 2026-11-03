@@ -1,5 +1,5 @@
 """Checks an installed pyhoglake-variant-codec against pyhoglake's Python
-codec: pyhoglake takes it (its protocol and version), and it encodes JSON
+codec: pyhoglake takes it (its protocol), and it encodes JSON
 text exactly as Python does, valid rows and invalid, unshredded and
 shredded, in both on_invalid modes. CI runs it on each wheel and the sdist
 (ci/variant-codec-wheel.sh) and in the millrace image, on its platform.

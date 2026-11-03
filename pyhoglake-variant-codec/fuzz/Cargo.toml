@@ -11,6 +11,7 @@ cargo-fuzz = true
 [dependencies]
 arrow-array = "59.3"
 arrow-schema = "59.3"
+chrono = "0.4.45"
 libfuzzer-sys = "0.4.13"
 parquet-variant = "59.3"
 pyhoglake-variant-codec = { path = ".." }
@@ -19,6 +20,13 @@ serde_json = { version = "1", features = ["arbitrary_precision", "float_roundtri
 [[bin]]
 name = "encode_json"
 path = "fuzz_targets/encode_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
 test = false
 doc = false
 bench = false

@@ -1,12 +1,13 @@
 #!/bin/sh
 # Tests one built pyhoglake-variant-codec wheel, or the sdist (built into a
-# wheel here, as pip would), as it ships: pyhoglake's locked env from the
-# repo root with exactly that file installed, on the file's own platform.
+# wheel here, as pip would), or a release on PyPI by its requirement
+# (publish-pyhoglake.yml), as it ships: pyhoglake's locked env from the
+# repo root with exactly that file or release installed, on its platform.
 # pyhoglake must take it and encode as the Python codec does
 # (ci/variant_codec_smoke.py); then, unless --smoke-only, pyhoglake's
 # variant suites run through it, and conftest fails any fallback to Python.
 #
-#   sh ci/variant-codec-wheel.sh <wheel or sdist> [--smoke-only]
+#   sh ci/variant-codec-wheel.sh <wheel, sdist or requirement> [--smoke-only]
 set -eu
 uv sync --locked --package pyhoglake --no-install-package pyhoglake-variant-codec
 uv pip install --no-deps "$1"

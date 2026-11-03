@@ -3,8 +3,8 @@ pyhoglake-variant-codec, or the Python one, its reference while both exist.
 Private, and goes with the Python codec.
 
 ``PYHOGLAKE_VARIANT_CODEC``, read at import: ``auto`` (the default) uses
-Rust when it imports with this PROTOCOL and pyhoglake's version, for what it
-takes (JSON text, shredded or not, so far); ``native`` requires it, and
+Rust when it imports with this PROTOCOL, whatever its own version, for what
+it takes (JSON text, shredded or not, so far); ``native`` requires it, and
 raises where it is missing or does not take the input or plan; ``python``
 never uses it. A Rust result is checked first: an invalid row whose reason
 or path Python does not give (``mismatch``), storage not of the plan's type
@@ -18,6 +18,18 @@ on the row stands, counted apart in ``VariantReport.recursion_bound_rows``.
 at import, encodes that share of the calls Rust took in Python too, in
 ``VariantReport.shadow_seconds``. Where the two differ, in counts or in any
 slot of the storage (``shadow_mismatch``), Python's result is used.
+
+``verify`` and ``structure_fault`` read storage through the same switch,
+and until N6b removes the Python codec, Python reads it as well: where the
+two verdicts differ either way (``mismatch``), or Rust panics (``panic``),
+Python's stands, logged and counted in ``DECODE_FALLBACKS``, since a
+read has no report. ``to_python`` stays Python until Rust builds its
+objects (N5b).
+
+Each process counts as well, for millrace: encode fallbacks, a call that
+raises after one included (``ENCODE_FALLBACKS``); the calls and rows the
+shadow compared (``SHADOWED``); and calls ``auto`` sent to Python, by op
+and why (``ROUTED``).
 """
 
 from __future__ import annotations
@@ -26,11 +38,12 @@ import logging
 import os
 import random
 import sys
+import threading
 import time
+from collections import Counter
 from contextlib import suppress
 from dataclasses import replace
 from functools import cache, lru_cache, partial
-from importlib import metadata
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -42,7 +55,7 @@ from .errors import VariantEncodingError
 if TYPE_CHECKING:
     from .variant import VariantReport
 
-PROTOCOL = 2
+PROTOCOL = 3
 ENV = "PYHOGLAKE_VARIANT_CODEC"
 SHADOW_ENV = "PYHOGLAKE_VARIANT_SHADOW"
 Backend = Literal["auto", "native", "python"]
@@ -79,9 +92,6 @@ def native() -> tuple[ModuleType | None, str]:
         return None, f"pyhoglake-variant-codec does not import ({exc})"
     if getattr(module, "PROTOCOL", None) != PROTOCOL:
         return None, f"pyhoglake-variant-codec does not speak protocol {PROTOCOL}"
-    mine, theirs = map(metadata.version, ("pyhoglake", "pyhoglake-variant-codec"))
-    if mine != theirs:
-        return None, f"pyhoglake-variant-codec is {theirs}, not pyhoglake's {mine}"
     return module, ""
 
 
@@ -121,16 +131,17 @@ def encode(
 
     chosen = backend or MODE
     module, why = native() if chosen != "python" else (None, "")
-    chunks = None
+    chunks, skipped = None, "unavailable"
     if module is not None:
         native_plan, paths, why = _plan(module, plan)
+        skipped = "plan"
         if not json_text:
-            why = "it encodes JSON text only, so far"
+            why, skipped = "it encodes JSON text only, so far", "not_json"
         elif not why and isinstance(values, (pa.Array, pa.ChunkedArray)):
             chunks = _binary_chunks(values)
         elif not why:
             values = list(values)
-            why = "a row is not UTF-8 text"
+            why, skipped = "a row is not UTF-8 text", "not_utf8"
             if all(type(v) in (str, bytes) or v is None for v in values):
                 with suppress(UnicodeEncodeError):  # a str with a lone surrogate
                     chunks = [pa.array(values, pa.binary())]
@@ -147,6 +158,8 @@ def encode(
     if module is None or chunks is None:
         if chosen == "native":
             raise RuntimeError(f"{ENV}=native, but {why}")
+        if chosen == "auto":
+            _count(ROUTED, ("encode", skipped))
         return python(_json_rows(values) if json_text else values, report=report)
 
     started = time.perf_counter()
@@ -222,6 +235,9 @@ def _shadow(
         )
     )
     report.shadow_seconds += time.perf_counter() - started
+    with _COUNTING:
+        SHADOWED["calls"] += 1
+        SHADOWED["rows"] += mine.rows
     if same:
         report.merge(mine)
         return out
@@ -238,6 +254,7 @@ def _fall_back(
     message = "VARIANT codec fallback to Python: column=%s row=%s reason=%s"
     _log.warning(message, column, row, reason)
     report.codec_fallbacks[reason] = report.codec_fallbacks.get(reason, 0) + 1
+    _count(ENCODE_FALLBACKS, reason)
 
 
 def _check(
@@ -251,7 +268,7 @@ def _check(
     from .variant import VariantReport
 
     for chunk in out:
-        if chunk.type != plan.write_type or codec.structure_fault(chunk) is not None:
+        if chunk.type != plan.write_type or structure_fault(chunk) is not None:
             return ("type", None), 0
     bounded = 0
     for i, (row, reason, path, _) in enumerate(invalid):
@@ -284,3 +301,156 @@ def _check(
                 continue
         return ("mismatch", row), 0
     return None, bounded
+
+
+def verify(
+    array: pa.Array | pa.ChunkedArray,
+    plan: codec.Plan | None,
+    *,
+    canonical: bool,
+    column: str | None,
+    nullable: bool,
+    backend: Backend | None = None,
+) -> None:
+    """``codec.reassemble(strict=True)``'s verdict, through ``backend`` or
+    the switch's; the GIL is released while Rust reads."""
+    chosen = backend or MODE
+    module, why = native() if chosen != "python" else (None, "")
+    flags = {"strict": True, "canonical": canonical, "nullable": nullable}
+
+    def python(storage: pa.Array | pa.ChunkedArray, plan: codec.Plan | None) -> None:
+        codec.reassemble(storage, plan, column=column, **flags)
+
+    if module is not None:
+        chunks = list(map(importable, codec.storage_chunks(array, plan, column)))
+        try:
+            _, found = module.decode(chunks, tagged=False, **flags)
+        except TypeError as exc:  # a type pyo3-arrow does not import
+            why = f"it does not take this storage ({exc})"
+        except module.PanicException:
+            _decode_fall_back("panic", None, column)
+            python(array, plan)
+            return
+        else:
+            fault = found and error(column, *decoded_fault(found, chunks[0].type))
+            # Until N6b, Python's verdict too, and it stands where they differ.
+            try:
+                python(array, plan)
+            except VariantEncodingError as exc:
+                theirs: VariantEncodingError | None = exc
+            else:
+                theirs = None
+            spelt = [e and (e.row, e.reason, e.path, str(e)) for e in (fault, theirs)]
+            if spelt[0] != spelt[1]:
+                at = theirs.row if theirs is not None else fault.row
+                _decode_fall_back("mismatch", at, column)
+            if theirs is not None:
+                raise theirs
+            return
+    if chosen == "native":
+        raise RuntimeError(f"{ENV}=native, but {why}")
+    if chosen == "auto":
+        _count(ROUTED, ("decode", "unavailable" if module is None else "storage"))
+    python(array, plan)
+
+
+def structure_fault(array: pa.StructArray) -> str | None:
+    """``codec.structure_fault``, from Rust where the switch uses it, and
+    until N6b from Python too, whose verdict stands where they differ: a
+    false fault would refuse every write of the storage (a millrace group
+    sticks), and a missed one write a null pyarrow turns into other bytes."""
+    module, why = native() if MODE != "python" else (None, "")
+    if module is None and MODE == "native":
+        raise RuntimeError(f"{ENV}=native, but {why}")
+    if module is None:
+        if MODE == "auto":
+            _count(ROUTED, ("decode", "unavailable"))
+        return codec.structure_fault(array)
+    try:
+        parts = module.structure_fault(importable(array))
+    except module.PanicException:
+        _decode_fall_back("panic", None, None)
+        return codec.structure_fault(array)
+    python = codec.structure_fault(array)
+    if python != (parts and _detail(parts, array.type)):
+        _decode_fall_back("mismatch", None, None)
+    return python
+
+
+#: Since import, under ``_COUNTING``, for millrace to export: encode and
+#: decode fallbacks to Python by reason (``mismatch``, ``panic``; encode's
+#: also ``type`` and ``shadow_mismatch``); calls ``auto`` sent to Python by
+#: ``(op, why)``: ``encode`` for ``unavailable`` (no matching package),
+#: ``plan``, ``not_utf8`` or, through the hook only, ``not_json``; ``decode``
+#: for ``unavailable`` or ``storage``; and the shadow's ``calls`` and
+#: ``rows`` compared.
+ENCODE_FALLBACKS: Counter[str] = Counter()
+DECODE_FALLBACKS: Counter[str] = Counter()
+ROUTED: Counter[tuple[str, str]] = Counter()
+SHADOWED: Counter[str] = Counter()
+_COUNTING = threading.Lock()
+
+
+def _count[K](counter: Counter[K], key: K) -> None:
+    with _COUNTING:
+        counter[key] += 1
+
+
+def _decode_fall_back(reason: str, row: int | None, column: str | None) -> None:
+    message = "VARIANT decode fallback to Python: column=%s row=%s reason=%s"
+    _log.warning(message, column, row, reason)
+    _count(DECODE_FALLBACKS, reason)
+
+
+def importable(array: pa.Array) -> pa.Array:
+    """``array``, or a copy without offsets where arrow-rs would not import
+    it: it slices the struct children of a struct twice where an offset
+    applies (arrow-rs 59 ``ArrayData::slice``), and panics there."""
+    arrays = [array]
+    while arrays:  # storage nests as deep as it likes: no recursion
+        at = arrays.pop()
+        if isinstance(at, pa.StructArray):
+            arrays += [at.field(i) for i in range(at.type.num_fields)]
+        elif isinstance(at, (pa.ListArray, pa.LargeListArray, pa.FixedSizeListArray)):
+            arrays.append(at.values)
+        if at.offset and isinstance(at, (pa.StructArray, pa.FixedSizeListArray)):
+            return pa.concat_arrays([array])
+    return array
+
+
+def decoded_fault(
+    found: tuple[Any, ...], kind: pa.DataType
+) -> tuple[int | None, str, str | None, str]:
+    """Rust's fault as ``(row, reason, path, detail)``, spelt by the
+    Python codec's helpers: paths, quoted names and Arrow types."""
+    row, reason, trail, parts = found
+    located = codec._Invalid(reason, "")
+    located.trail = trail or []
+    return row, reason, None if trail is None else located.path(), _detail(parts, kind)
+
+
+def _detail(parts: list[Any], kind: pa.DataType) -> str:
+    out = []
+    for part in parts:
+        what, argument = ("text", part) if isinstance(part, str) else part
+        if what in ("type", "raw_type"):  # the type at a child path of the storage
+            at = kind
+            for index in argument:
+                at = at.field(index).type if pa.types.is_struct(at) else at.value_type
+            argument = codec._type_text(at) if what == "type" else str(at)
+        elif what == "quoted":
+            argument = codec._quoted(argument)
+        elif what == "column":
+            argument = codec._column_path("".join(map(codec.member, argument)))
+        out.append(argument)
+    return "".join(out)
+
+
+def error(
+    column: str | None, row: int | None, reason: str, path: str | None, detail: str
+) -> VariantEncodingError:
+    """A fault as the Python codec raises it."""
+    message = codec._message(column, row, path, detail)
+    return VariantEncodingError(
+        message, column=column, row=row, path=path, reason=reason
+    )

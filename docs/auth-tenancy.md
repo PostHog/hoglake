@@ -628,6 +628,19 @@ refusal, so the zero-refusals gate (§11) could never pass. `/healthz` and
 `/livez` stay on the API port, where the kubelet probes them and the route
 table already exempts them.
 
+*Landed for customers:* `HOGLAKE_PUBLIC_PORT` (default `0`, off) starts a
+second API listener with the same routes, process and verifier, meant for an
+internet-facing load balancer. It always enforces, whatever
+`HOGLAKE_AUTH_MODE` says, so the API port can stay at `warn` through rollout
+while the public one never serves an untokened call. It also refuses a
+verified `OPERATOR` token with `401 invalid_token`: operator credentials are
+for the cluster, and refusing them here means a leaked one is useless from the
+internet. It needs a verifier, so it cannot be set when
+`HOGLAKE_AUTH_MODE=off`, and it must differ from the API and metrics ports
+(`Config.kt`, `AuthService.forPublicListener` in `auth/AuthPlugin.kt`). Its
+requests count under `listener="public"` in `hoglake_auth_requests_total`, so
+internet scanners never touch the API port's enforce gate.
+
 *Not built, superseded by the above:* `/v1/database/health` and `/v1/debug/*`
 stay on the API port as `OPERATOR`, and the infra port has no fixed default.
 The original plan was to split the process's ports:
@@ -980,7 +993,7 @@ New metrics (Prometheus, existing `observability/Metrics.kt` idiom):
 
 | Metric | Why |
 |---|---|
-| `hoglake_auth_requests_total{mode,outcome,client}` | the `warn`-mode onboarding checklist; `client` is a closed class from `User-Agent`, and the enforce gate is zero refusals per class |
+| `hoglake_auth_requests_total{mode,listener,outcome,client}` | the `warn`-mode onboarding checklist; `client` is a closed class from `User-Agent`, and the enforce gate is zero refusals per class on `listener="api"` (`listener="public"` is the internet-facing port, §6.7, where refusals are expected) |
 | `hoglake_auth_signing_keys` | keys the verifier holds; alert on 0 (boot refuses an empty source, this catches a rotation that never lands) |
 | `hoglake_auth_denials_total{catalog,scope,reason}` | distinguishes "client misconfigured" from "attack" by `reason` |
 | `hoglake_token_issued_total{grant_type}`, `_failures_total` | token endpoint health; not built (issuance is hogtower's) |

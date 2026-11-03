@@ -45,7 +45,7 @@ import uuid
 from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from concurrent.futures import Executor, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
 from functools import partial
 from typing import Any, Final, Literal, Protocol, TypeVar
@@ -102,7 +102,7 @@ from .coerce import (
     load_json_object,
     variant_text,
 )
-from .config import Config
+from .config import Config, variant_codec
 from .grouping import column_chains, field_names
 from .planner import PlannerKnobs, decide, due_floor_ts
 from .stage import (
@@ -238,16 +238,17 @@ class FlushStats:
     variant_values: Mapping[tuple[str, str, str], int] = dataclass_field(
         default_factory=dict
     )
-    #: Their encodes the Rust codec's result was not used for, by
-    #: ``(reason,)`` (``VariantReport.codec_fallbacks``). Transitional, as
-    #: the two below are.
-    variant_codec_fallbacks: Mapping[tuple[str], int] = dataclass_field(
-        default_factory=dict
-    )
-    #: Their invalid rows past a JSON parser's recursion bound.
+    #: Their invalid rows past a JSON parser's recursion bound. Transitional,
+    #: as the one below is; the Rust codec's fallbacks are pyhoglake's, per
+    #: process (a build that raises after one counts too).
     variant_recursion_bound_rows: int = 0
     #: Seconds the shadow (``PYHOGLAKE_VARIANT_SHADOW``) encoded them again.
     variant_shadow_seconds: float = 0.0
+    #: Wall seconds of their encode calls, the shadow's excluded, by
+    #: ``(column, backend)``: the process's codec (``variant_codec``).
+    variant_encode_seconds: Mapping[tuple[str, str], float] = dataclass_field(
+        default_factory=dict
+    )
 
 
 # -- the payload decoder --------------------------------------------------------
@@ -956,7 +957,8 @@ class FlushPlan:
     clamped: Mapping[str, int] = dataclass_field(default_factory=dict)
     #: Seconds the build spent per stage (:data:`BUILD_STAGES`).
     stage_seconds: Mapping[str, float] = dataclass_field(default_factory=dict)
-    #: Per mapped variant column, what encoding its rows found.
+    #: Per mapped variant column, what encoding its rows found; its
+    #: ``encode_seconds`` is the encode calls' wall time less the shadow's.
     variant: Mapping[str, VariantReport] = dataclass_field(default_factory=dict)
 
 
@@ -983,7 +985,8 @@ def build_flush_plan(
     """Decode → Arrow → sort by the live sort spec → fan out by the live
     partition spec → parquet (pyhoglake's ``write_part``, one file per
     tuple) → commit requests of at most ``max_files_per_commit`` files
-    each. Pure: no I/O; ``clock`` only times the stages.
+    each. Pure: no I/O; ``clock`` only times the stages and each encode
+    call (perf_counter's, as pyhoglake's shadow seconds are).
 
     Each mapped variant column (``variant_sources``) is encoded per file,
     after the fanout, with ``on_invalid="null"``: an invalid value is SQL
@@ -1087,8 +1090,12 @@ def build_flush_plan(
             if mapped:
                 for column in mapped:
                     i = part.schema.get_field_index(column.name)
+                    started = clock()
                     storage = encode_json(part.column(i), column, on_invalid="null")
-                    reports[column.name].merge(storage.report)
+                    took = clock() - started - storage.report.shadow_seconds
+                    reports[column.name].merge(
+                        replace(storage.report, encode_seconds=took)
+                    )
                     field = part.schema.field(i).with_type(storage.array.type)
                     part = part.set_column(i, field, storage.array)
                     del storage
@@ -1647,9 +1654,15 @@ class HoglakeFlusher:
         self._variant_rows: Counter[tuple[str, str]] = Counter()
         self._variant_invalid: Counter[tuple[str, str]] = Counter()
         self._variant_values: Counter[tuple[str, str, str]] = Counter()
-        self._variant_codec_fallbacks: Counter[tuple[str]] = Counter()
         self._variant_recursion_bound_rows = 0
         self._variant_shadow_seconds = 0.0
+        # Every mapped column under either codec, from 0.
+        self._variant_codec = variant_codec()
+        self._variant_encode_seconds = {
+            (column, backend): 0.0
+            for column, _ in cfg.variant_sources
+            for backend in ("native", "python")
+        }
 
     def close(self) -> None:
         """Close the HTTP client and (if owned) the executor. Idempotent."""
@@ -1700,9 +1713,9 @@ class HoglakeFlusher:
             variant_rows=dict(self._variant_rows),
             variant_invalid=dict(self._variant_invalid),
             variant_values=dict(self._variant_values),
-            variant_codec_fallbacks=dict(self._variant_codec_fallbacks),
             variant_recursion_bound_rows=self._variant_recursion_bound_rows,
             variant_shadow_seconds=self._variant_shadow_seconds,
+            variant_encode_seconds=dict(self._variant_encode_seconds),
         )
 
     async def check_stage_identity(
@@ -2209,10 +2222,11 @@ class HoglakeFlusher:
         ):
             for (_, path), count in counts.items():
                 self._variant_values[(column, path, outcome)] += count
-        for reason, count in report.codec_fallbacks.items():
-            self._variant_codec_fallbacks[(reason,)] += count
         self._variant_recursion_bound_rows += report.recursion_bound_rows
         self._variant_shadow_seconds += report.shadow_seconds
+        key = (column, self._variant_codec)
+        seconds = self._variant_encode_seconds.get(key, 0.0) + report.encode_seconds
+        self._variant_encode_seconds[key] = seconds
 
     def _chunk(
         self, built: Sequence[tuple[int, FlushPlan, str]]
