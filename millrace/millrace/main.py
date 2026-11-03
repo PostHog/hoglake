@@ -33,6 +33,7 @@ from functools import partial
 from typing import Any
 
 from prometheus_client.core import REGISTRY, CounterMetricFamily, GaugeMetricFamily
+from pyhoglake import _variant_backend
 
 from .config import Config, ConfigError, load_config, variant_codec
 from .consumer import AssignmentError, MillraceConsumer, create_kafka_consumer
@@ -51,6 +52,21 @@ EXIT_HALTED = 3
 EXIT_FENCED = 4
 
 _MICROS_PER_SECOND = 1_000_000
+
+#: The reasons pyhoglake counts the Rust codec's fallbacks under, exported
+#: at 0 from the first scrape so that increase() counts a pod's first
+#: fallback (transitional, as the fallbacks are).
+_ENCODE_REASONS = ("mismatch", "type", "panic", "shadow_mismatch")
+_DECODE_REASONS = ("mismatch", "panic")
+
+
+def _decode_fallbacks() -> dict[tuple[str], int]:
+    """pyhoglake's decode fallbacks since import, by reason: a read
+    (``verify``, ``structure_fault``) has no report, so they are counted
+    per process, under pyhoglake's lock."""
+    with _variant_backend._COUNTING:
+        counted = dict(_variant_backend.DECODE_FALLBACKS)
+    return {(reason,): count for reason, count in counted.items()}
 
 
 def _now_us() -> int:
@@ -263,7 +279,18 @@ class _PipelineCollector:
                 "millrace_variant_codec_fallback_total",
                 "Variant encodes Python redid for the Rust codec, by reason (transitional)",
                 ["reason"],
-                f.variant_codec_fallbacks,
+                dict.fromkeys([(r,) for r in _ENCODE_REASONS], 0)
+                | dict(f.variant_codec_fallbacks),
+            ),
+            (
+                "millrace_variant_codec_decode_fallback_total",
+                (
+                    "Variant storage reads (verify, structure_fault) the Python codec "
+                    "decided where the Rust codec disagreed or panicked, by reason, "
+                    "per process (transitional)"
+                ),
+                ["reason"],
+                dict.fromkeys([(r,) for r in _DECODE_REASONS], 0) | _decode_fallbacks(),
             ),
         )
         for name, doc, labels, counts in variant_families:
