@@ -797,6 +797,48 @@ class MaintenanceLedgerIntegrationTest {
             .containsExactlyInAnyOrder("catalog", "status", "checks")
     }
 
+    @Test
+    fun `a ledger row naming a task this build does not know is passed through, not a 500`() {
+        // A rolling deploy: a newer pod's migration widened
+        // hog_maintenance_run's task CHECK and it wrote a row for a task
+        // this (older) build has no enum value for. Both feeds used to
+        // throw in the row mapper for as long as that row existed.
+        val catalogId = seedCatalog("led-unknown-task")
+        val check = "hog_maintenance_run_task_check"
+        val known = MaintenanceTask.entries.joinToString(", ") { "'${it.wire}'" }
+        try {
+            jdbi.useHandleUnchecked { h ->
+                // Stand in for the newer build's migration.
+                h.execute("ALTER TABLE hog_maintenance_run DROP CONSTRAINT IF EXISTS $check")
+                h.createUpdate(
+                    """
+                    INSERT INTO hog_maintenance_run
+                        (catalog_id, task, run_trigger, started_at, finished_at, status)
+                    VALUES (:c, 'table_totals', 'loop', now(), now(), 'ok')
+                    """,
+                ).bind("c", catalogId).execute()
+            }
+            // A row of a known task, so the page must decode both.
+            ExpiryService(jdbi).runOnce("led-unknown-task", 10)
+
+            val statusSvc = statusSvc()
+            val perCatalog = statusSvc.runs("led-unknown-task", task = null, before = null, limit = 10)
+            assertThat(perCatalog.runs.map { it.taskName })
+                .containsExactlyInAnyOrder("table_totals", "expiry")
+            val unknown = perCatalog.runs.single { it.taskName == "table_totals" }
+            assertThat(unknown.task).isNull()
+            assertThat(unknown.toDto().task).isEqualTo("table_totals")
+
+            val instance = statusSvc.instanceRuns(task = null, before = null, limit = 500)
+            assertThat(instance.runs.map { it.taskName }).contains("table_totals", "expiry")
+        } finally {
+            jdbi.useHandleUnchecked { h ->
+                h.createUpdate("DELETE FROM hog_maintenance_run WHERE catalog_id = :c").bind("c", catalogId).execute()
+                h.execute("ALTER TABLE hog_maintenance_run ADD CONSTRAINT $check CHECK (task IN ($known))")
+            }
+        }
+    }
+
     private fun statusSvc() =
         MaintenanceStatusService(
             jdbi,
