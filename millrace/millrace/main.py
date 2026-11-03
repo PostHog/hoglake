@@ -280,6 +280,17 @@ class _PipelineCollector:
                 f.variant_rows,
             ),
             (
+                "millrace_variant_encode_seconds_total",
+                (
+                    "Wall seconds of mapped variant columns' encode calls, less "
+                    "PYHOGLAKE_VARIANT_SHADOW's, by column and the process's codec "
+                    "(backend: native or python; calls auto gives Python and "
+                    "fallbacks count under it), per build that returned a plan"
+                ),
+                ["column", "backend"],
+                f.variant_encode_seconds,
+            ),
+            (
                 "millrace_variant_invalid_total",
                 "Mapped variant values written as SQL NULL as invalid, by reason",
                 ["column", "reason"],
@@ -323,8 +334,8 @@ class _PipelineCollector:
         )
         for name, doc, labels, counts in variant_families:
             family = CounterMetricFamily(name, doc, labels=labels)
-            for key, count in sorted(counts.items()):
-                family.add_metric(list(key), count)
+            for key, total in sorted(counts.items()):
+                family.add_metric(list(key), total)
             yield family
         yield CounterMetricFamily(
             "millrace_variant_codec_recursion_bound_rows_total",
