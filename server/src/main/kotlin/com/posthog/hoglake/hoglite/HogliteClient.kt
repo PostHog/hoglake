@@ -1,5 +1,6 @@
 package com.posthog.hoglake.hoglite
 
+import com.fasterxml.jackson.databind.DeserializationFeature
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
@@ -202,18 +203,28 @@ class HogliteClient(
         statements: List<HogliteStatement>,
     ): List<HogliteQueryResult> {
         require(statements.isNotEmpty()) { "a hoglite transaction needs at least one statement" }
+        val materialized = statements.map { it.toWire() }
+        val statementCount = materialized.size
         val body =
             json.writeValueAsBytes(
                 buildMap {
                     put("client", CLIENT_NAME)
                     put("txid", txid)
                     if (fingerprint != null) put("fp", fingerprint)
-                    put("statements", statements.map { it.toWire() })
+                    put("statements", materialized)
                 },
             )
         return call(tenant, "/v1/t/$tenant/tx", body, commitTimeoutMs, txid = txid) { status, bytes ->
             when {
-                status == 200 -> parseTxResults(bytes)
+                status == 200 ->
+                    try {
+                        parseWriteTxResults(bytes, statementCount)
+                    } catch (e: Exception) {
+                        throw HoglakeException.CommitOutcomeUnknown(
+                            txid,
+                            "invalid hoglite write response: ${e.message}",
+                        )
+                    }
                 status == 409 -> throw guardFailure(bytes)
                 // A query guard refusal (504 query_timeout, 413
                 // result_too_large, 507 out_of_memory): the statement
@@ -492,6 +503,18 @@ class HogliteClient(
             } else {
                 HoglakeException.BackendUnavailable(detail)
             }
+
+        fun finalAnswer(
+            status: Int,
+            bytes: ByteArray,
+        ): T {
+            // A later refusal cannot disprove an earlier ambiguous apply.
+            // Only a complete successful answer can settle this exact request.
+            if (txid != null && mayHaveApplied && status != 200) {
+                throw HoglakeException.CommitOutcomeUnknown(txid, "hoglite answered $status after an ambiguous attempt")
+            }
+            return parse(status, bytes)
+        }
         while (true) {
             val pin = tenantRoutes[tenant]
             val (pool, base) = routeFor(pin)
@@ -558,7 +581,7 @@ class HogliteClient(
             breaker.onSuccess()
             when (resp.statusCode()) {
                 200 -> {
-                    return parse(200, resp.body())
+                    return finalAnswer(200, resp.body())
                 }
                 503 -> {
                     // Owner lost mid-flight / transient infra: retryable.
@@ -574,7 +597,7 @@ class HogliteClient(
                     // (query_timeout) is deterministic and rolled back:
                     // final, not retried. Only the label tells it apart
                     // from outcome_unknown or a gateway timeout.
-                    if (errorCode(resp.body()) in GUARD_REFUSAL_CODES) return parse(504, resp.body())
+                    if (errorCode(resp.body()) in GUARD_REFUSAL_CODES) return finalAnswer(504, resp.body())
                     // outcome_unknown: applied on an owner that then failed
                     // before durability was confirmed (or a gateway timeout
                     // in front of the engine). The same txid makes the
@@ -597,7 +620,7 @@ class HogliteClient(
                 else -> {
                     // Deterministic: the pool answered and the answer is
                     // final.
-                    return parse(resp.statusCode(), resp.body())
+                    return finalAnswer(resp.statusCode(), resp.body())
                 }
             }
         }
@@ -747,6 +770,40 @@ class HogliteClient(
             if (expectAffected != null) put("expect_affected", expectAffected)
             if (expectScalarInt != null) put("expect_scalar_int", expectScalarInt)
         }
+
+    /** Validate every write result before the store removes its outer fence result. */
+    private fun parseWriteTxResults(
+        bytes: ByteArray,
+        statementCount: Int,
+    ): List<HogliteQueryResult> {
+        val decoded = json.reader().with(DeserializationFeature.FAIL_ON_TRAILING_TOKENS).readTree(bytes)
+        val results = decoded?.get("results")
+        check(results != null && results.isArray && results.size() == statementCount) {
+            "expected $statementCount statement results"
+        }
+        return results.map { result ->
+            check(result.isObject && result.has("cols") && result.has("rows")) { "invalid statement result" }
+            val cols = result.get("cols")
+            val rows = result.get("rows")
+            val affected = result.get("affected")
+            check(cols.isNull || (cols.isArray && cols.all { it.isTextual })) { "invalid result columns" }
+            check(rows.isNull || rows.isArray) { "invalid result rows" }
+            check(affected != null && affected.isIntegralNumber && affected.canConvertToLong()) {
+                "invalid affected count"
+            }
+            val names = if (cols.isNull) emptyList() else cols.map { it.textValue() }
+            val values =
+                if (rows.isNull) {
+                    emptyList()
+                } else {
+                    rows.map { row ->
+                        check(row.isArray && row.size() == names.size) { "invalid result row width" }
+                        row.map { json.treeToValue(it, Any::class.java) }
+                    }
+                }
+            HogliteQueryResult(names, values, affected.longValue())
+        }
+    }
 
     private fun parseTxResults(bytes: ByteArray): List<HogliteQueryResult> {
         val decoded = json.readValue<Map<String, Any?>>(bytes)

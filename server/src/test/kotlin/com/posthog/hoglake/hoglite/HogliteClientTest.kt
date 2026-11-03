@@ -74,7 +74,10 @@ class HogliteClientTest {
 
     @Test
     fun `a 421 re-pins to the hinted owner and retries with the body byte-identical`() {
-        val (ownerServer, ownerCalls) = serve(Step(200, "{\"results\":[{\"cols\":[\"x\"],\"rows\":[[1]]}]}"))
+        val (ownerServer, ownerCalls) =
+            serve(
+                Step(200, "{\"results\":[{\"cols\":[\"x\"],\"rows\":[[1]],\"affected\":1}]}"),
+            )
         val ownerPort = ownerServer.address.port
         // The 421 hint names the owner; the chart's headless-name
         // pattern turns it into a routable URL (here: the port IS the
@@ -106,7 +109,7 @@ class HogliteClientTest {
         val (server, calls) =
             serve(
                 Step(503, "owner lost"),
-                Step(200, "{\"results\":[]}"),
+                Step(200, "{\"results\":[{\"cols\":null,\"rows\":null,\"affected\":1}]}"),
             )
         val c = client("http://127.0.0.1:${server.address.port}", threshold = 1)
         txOne(c)
@@ -127,7 +130,7 @@ class HogliteClientTest {
 
     @Test
     fun `transport failures trip the breaker and an open breaker fails fast`() {
-        val (server, calls) = serve(Step(200, "{\"results\":[]}"))
+        val (server, calls) = serve(Step(200, "{\"results\":[{\"cols\":null,\"rows\":null,\"affected\":1}]}"))
         val port = server.address.port
         server.stop(0)
         val c = client("http://127.0.0.1:$port", threshold = 2, budgetMs = 400)
@@ -147,6 +150,50 @@ class HogliteClientTest {
         assertThat(calls.get()).isEqualTo(1)
     }
 
+    @Test
+    fun `malformed successful write arrays are unknown with the original txid`() {
+        for (body in listOf(
+            "{}", "{\"results\":null}", "{\"results\":[]}", "not-json",
+            "{\"results\":[{\"cols\":null,\"rows\":null,\"affected\":1}]} {}",
+            "{\"results\":[{}]}", "{\"results\":[null]}", "{\"results\":[1]}",
+            "{\"results\":[{\"cols\":[1],\"rows\":[],\"affected\":0}]}",
+            "{\"results\":[{\"cols\":[\"a\"],\"rows\":[[1,2]],\"affected\":0}]}",
+            "{\"results\":[{\"cols\":[],\"rows\":[1],\"affected\":0}]}",
+            "{\"results\":[{\"cols\":[],\"rows\":[],\"affected\":0.5}]}",
+            "{\"results\":[{\"cols\":[],\"rows\":[],\"affected\":9223372036854775808}]}",
+            "{\"results\":[{\"cols\":[],\"rows\":[],\"affected\":0},{\"cols\":[],\"rows\":[],\"affected\":0}]}",
+        )) {
+            val (server, calls) = serve(Step(200, body))
+            val thrown = catchThrowable { txFixed(client("http://127.0.0.1:${server.address.port}"), "codec-tx") }
+            assertThat(thrown).describedAs(body).isExactlyInstanceOf(HoglakeException.CommitOutcomeUnknown::class.java)
+            assertThat((thrown as HoglakeException.CommitOutcomeUnknown).txid).isEqualTo("codec-tx")
+            assertThat(calls.get()).isEqualTo(1)
+        }
+    }
+
+    @Test
+    fun `a duplicate successful write decodes the complete original result array`() {
+        val (server, calls) =
+            serve(
+                Step(
+                    200,
+                    "{\"dup\":true,\"results\":[{\"cols\":null,\"rows\":null,\"affected\":1}," +
+                        "{\"cols\":[\"snapshot\",\"schema\"],\"rows\":[[7,3]],\"affected\":0}]}",
+                ),
+            )
+        val result =
+            client("http://127.0.0.1:${server.address.port}").tx(
+                "t",
+                "full-dup",
+                "full-fp",
+                listOf(HogliteStatement("UPDATE kv SET v=1"), HogliteStatement("SELECT 7,3")),
+            )
+        assertThat(result).hasSize(2)
+        assertThat(result[0].affected).isEqualTo(1)
+        assertThat(result[1].rows).containsExactly(listOf(7, 3))
+        assertThat(calls.get()).isEqualTo(1)
+    }
+
     // ---- the outcome taxonomy: committed, not committed, unknown ----------
 
     private val outcomeUnknown =
@@ -160,7 +207,11 @@ class HogliteClientTest {
 
     @Test
     fun `a 504 outcome_unknown retries with the same txid and returns the commit`() {
-        val (server, calls) = serve(Step(504, outcomeUnknown), Step(200, "{\"results\":[],\"dup\":true}"))
+        val (server, calls) =
+            serve(
+                Step(504, outcomeUnknown),
+                Step(200, "{\"results\":[{\"cols\":null,\"rows\":null,\"affected\":1}],\"dup\":true}"),
+            )
         val c = client("http://127.0.0.1:${server.address.port}")
         txFixed(c, "tx-fixed")
         assertThat(calls.get()).isEqualTo(2)
@@ -188,6 +239,105 @@ class HogliteClientTest {
             serve(Step(504, outcomeUnknown), Step(503, "{\"error\":\"lease lost\",\"code\":\"not_applied\"}"))
         val c = client("http://127.0.0.1:${server.address.port}", budgetMs = 300)
         assertThatThrownBy { txFixed(c, "tx-sticky") }.isInstanceOf(HoglakeException.CommitOutcomeUnknown::class.java)
+    }
+
+    @Test
+    fun `sticky ambiguity prevents later final refusals from erasing an earlier attempt`() {
+        val refusals =
+            listOf(
+                Step(409, "{\"error\":\"expect_failed\",\"guard_index\":2}"),
+                Step(422, "{\"code\":\"refused\"}"),
+                Step(400, "{}"),
+                Step(404, "{}"),
+                Step(413, "{\"code\":\"result_too_large\"}"),
+                Step(504, "{\"code\":\"query_timeout\"}"),
+                Step(507, "{\"code\":\"out_of_memory\"}"),
+            )
+        for (first in listOf(Step(504, outcomeUnknown), Step(503, "ambiguous gateway"))) {
+            for (refusal in refusals) {
+                servedBodies.clear()
+                val (server, calls) = serve(first, Step(503, "{\"code\":\"not_applied\"}"), refusal)
+                val c = client("http://127.0.0.1:${server.address.port}")
+                val error = catchThrowable { txFixed(c, "sticky-final") }
+                assertThat(error).isExactlyInstanceOf(HoglakeException.CommitOutcomeUnknown::class.java)
+                assertThat((error as HoglakeException.CommitOutcomeUnknown).txid).isEqualTo("sticky-final")
+                assertThat(calls.get()).isEqualTo(3)
+                assertThat(servedBodies.distinct()).hasSize(1)
+            }
+        }
+    }
+
+    @Test
+    fun `sticky ambiguity survives owner repinning while known rollback and full success remain distinct`() {
+        for (ambiguous in listOf(false, true)) {
+            for (success in listOf(false, true)) {
+                servedBodies.clear()
+                val final =
+                    if (success) {
+                        Step(
+                            200,
+                            "{\"dup\":true,\"results\":[{\"cols\":null,\"rows\":null,\"affected\":1}," +
+                                "{\"cols\":[\"snapshot\",\"schema\"],\"rows\":[[7,3]],\"affected\":0}]}",
+                        )
+                    } else {
+                        Step(409, "{\"error\":\"expect_failed\",\"guard_index\":2}")
+                    }
+                val (owner, ownerCalls) = serve(Step(503, "{\"code\":\"not_applied\"}"), final)
+                val first = if (ambiguous) Step(504, outcomeUnknown) else Step(503, "{\"code\":\"not_applied\"}")
+                val (entry, entryCalls) =
+                    serve(
+                        first,
+                        Step(421, "{\"error\":\"misdirected\",\"owner\":\"${owner.address.port}\"}"),
+                    )
+                val c = client("http://127.0.0.1:${entry.address.port}", ownerUrlPattern = "http://127.0.0.1:{owner}")
+                val result =
+                    runCatching {
+                        c.tx(
+                            "t",
+                            "sticky-owner",
+                            "sticky-fingerprint",
+                            listOf(HogliteStatement("UPDATE kv SET v=1"), HogliteStatement("SELECT 7,3")),
+                        )
+                    }
+                if (success) {
+                    assertThat(result.exceptionOrNull()).isNull()
+                    assertThat(result.getOrThrow()).hasSize(2)
+                    assertThat(result.getOrThrow()[0].affected).isEqualTo(1)
+                    assertThat(result.getOrThrow()[1].rows).containsExactly(listOf(7, 3))
+                } else if (ambiguous) {
+                    assertThat(
+                        result.exceptionOrNull(),
+                    ).isExactlyInstanceOf(HoglakeException.CommitOutcomeUnknown::class.java)
+                    assertThat(
+                        (result.exceptionOrNull() as HoglakeException.CommitOutcomeUnknown).txid,
+                    ).isEqualTo("sticky-owner")
+                } else {
+                    assertThat(result.exceptionOrNull()).isInstanceOf(HogliteGuardFailure::class.java)
+                }
+                assertThat(entryCalls.get()).isEqualTo(2)
+                assertThat(ownerCalls.get()).isEqualTo(2)
+                assertThat(servedBodies).hasSize(4)
+                assertThat(servedBodies.distinct()).hasSize(1)
+                assertThat(servedBodies.first()).contains("\"txid\":\"sticky-owner\"", "\"fp\":\"sticky-fingerprint\"")
+            }
+        }
+    }
+
+    @Test
+    fun `sticky write classification does not change query or read transaction refusals`() {
+        val (query, _) = serve(Step(504, outcomeUnknown), Step(409, "{\"code\":\"refused\"}"))
+        val q = catchThrowable { client("http://127.0.0.1:${query.address.port}").query("t", "SELECT 1") }
+        assertThat(q).isInstanceOf(HogliteRejected::class.java)
+        assertThat((q as HogliteRejected).status).isEqualTo(409)
+        val (batch, _) = serve(Step(504, outcomeUnknown), Step(422, "{\"code\":\"refused\"}"))
+        val r =
+            catchThrowable {
+                client(
+                    "http://127.0.0.1:${batch.address.port}",
+                ).readTx("t", listOf(HogliteStatement("SELECT 1")))
+            }
+        assertThat(r).isInstanceOf(HogliteRejected::class.java)
+        assertThat((r as HogliteRejected).status).isEqualTo(409)
     }
 
     @Test
@@ -265,7 +415,7 @@ class HogliteClientTest {
 
     @Test
     fun `a refused connection never sent the tx, so exhaustion is not unknown`() {
-        val (server, _) = serve(Step(200, "{\"results\":[]}"))
+        val (server, _) = serve(Step(200, "{\"results\":[{\"cols\":null,\"rows\":null,\"affected\":1}]}"))
         val port = server.address.port
         server.stop(0)
         val c = client("http://127.0.0.1:$port", budgetMs = 300)
@@ -315,7 +465,7 @@ class HogliteClientTest {
         val (preempted, calls2) =
             serve(
                 Step(503, "{\"error\":\"read canceled by checkpoint; retry\"}"),
-                Step(200, "{\"cols\":[\"x\"],\"rows\":[[1]]}"),
+                Step(200, "{\"cols\":[\"x\"],\"rows\":[[1]],\"affected\":1}"),
             )
         val c2 = client("http://127.0.0.1:${preempted.address.port}")
         assertThat(c2.query("t", "SELECT 1").rows.single().single()).isEqualTo(1)
@@ -328,7 +478,7 @@ class HogliteClientTest {
             serve(
                 Step(503, "{\"error\":\"context canceled\",\"code\":\"not_applied\"}"),
                 Step(504, "gateway timeout"),
-                Step(200, "{\"cols\":[\"x\"],\"rows\":[[1]]}"),
+                Step(200, "{\"cols\":[\"x\"],\"rows\":[[1]],\"affected\":1}"),
             )
         val c = client("http://127.0.0.1:${server.address.port}")
         assertThat(c.query("t", "SELECT 1").rows.single().single()).isEqualTo(1)
@@ -376,7 +526,7 @@ class HogliteClientTest {
         // Budget already spent before the first attempt: the client must
         // not begin it at all (the remaining <= 0 check at the top of
         // the loop).
-        val (server, calls) = serve(Step(200, "{\"results\":[]}"))
+        val (server, calls) = serve(Step(200, "{\"results\":[{\"cols\":null,\"rows\":null,\"affected\":1}]}"))
         val c = client("http://127.0.0.1:${server.address.port}", budgetMs = 1)
         Thread.sleep(5) // let wall time pass; the deadline starts inside the call
         assertThatThrownBy { txOne(c) }.isInstanceOf(HoglakeException.BackendUnavailable::class.java)
@@ -431,7 +581,13 @@ class HogliteClientTest {
     @Test
     fun `a read transaction carries plain SELECTs under a read txid and returns one result per statement`() {
         val (server, calls) =
-            serve(Step(200, "{\"results\":[{\"cols\":[\"x\"],\"rows\":[[1]]},{\"cols\":[\"y\"],\"rows\":[]}]}"))
+            serve(
+                Step(
+                    200,
+                    "{\"results\":[{\"cols\":[\"x\"],\"rows\":[[1]],\"affected\":1}," +
+                        "{\"cols\":[\"y\"],\"rows\":[],\"affected\":0}]}",
+                ),
+            )
         val c = client("http://127.0.0.1:${server.address.port}")
         val r =
             c.readTx(
@@ -448,7 +604,7 @@ class HogliteClientTest {
             c.readTx("t", listOf(HogliteStatement("SELECT 1", emptyList(), expectScalarInt = 1L)))
         }.isInstanceOf(IllegalArgumentException::class.java)
         // A short answer is a broken engine, not a silently missing read.
-        val (short, _) = serve(Step(200, "{\"results\":[{\"cols\":[\"x\"],\"rows\":[[1]]}]}"))
+        val (short, _) = serve(Step(200, "{\"results\":[{\"cols\":[\"x\"],\"rows\":[[1]],\"affected\":1}]}"))
         assertThatThrownBy {
             client("http://127.0.0.1:${short.address.port}").readTx(
                 "t",

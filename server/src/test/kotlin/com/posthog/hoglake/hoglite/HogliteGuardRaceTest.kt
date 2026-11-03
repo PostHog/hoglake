@@ -1,10 +1,13 @@
 package com.posthog.hoglake.hoglite
 
+import com.posthog.hoglake.commit.commitFingerprint
+import com.posthog.hoglake.commit.commitFingerprintDigest
 import com.posthog.hoglake.model.AlterOp
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.ColumnStats
 import com.posthog.hoglake.model.CommitRequest
+import com.posthog.hoglake.model.CommitResult
 import com.posthog.hoglake.model.DeleteFileRegistration
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.HoglakeException
@@ -13,9 +16,12 @@ import com.posthog.hoglake.model.PartitionFieldDef
 import com.posthog.hoglake.model.TableAppend
 import com.posthog.hoglake.model.TableDeletes
 import com.posthog.hoglake.model.Transform
+import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.service.PatchField
 import com.posthog.hoglake.testing.TestImages
+import com.posthog.hoglake.wireObjectMapper
 import com.sun.net.httpserver.HttpServer
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.AfterAll
@@ -77,6 +83,9 @@ class HogliteGuardRaceTest {
         val shortCircuit: Int? = null,
         val before: () -> Unit = {},
         val after: () -> Unit = {},
+        val response: ((Int, ByteArray) -> Pair<Int, ByteArray>)? = null,
+        val shortCircuitBody: String = "{\"error\":\"probe short-circuit\"}",
+        val dropResponse: () -> Boolean = { false },
     )
 
     private val hooks = CopyOnWriteArrayList<Hook>()
@@ -169,7 +178,7 @@ class HogliteGuardRaceTest {
                     if (bytes.isNotEmpty()) ex.responseBody.use { it.write(bytes) } else ex.close()
                 }
                 if (hook?.shortCircuit != null) {
-                    respond(hook.shortCircuit, """{"error":"probe short-circuit"}""".toByteArray())
+                    respond(hook.shortCircuit, hook.shortCircuitBody.toByteArray())
                     return@createContext
                 }
                 val req =
@@ -187,7 +196,14 @@ class HogliteGuardRaceTest {
                         ).build()
                 val resp = fwd.send(req, HttpResponse.BodyHandlers.ofByteArray())
                 hook?.after?.invoke()
-                respond(resp.statusCode(), resp.body())
+                val answer =
+                    hook?.response?.invoke(resp.statusCode(), resp.body()) ?: (resp.statusCode() to resp.body())
+                if (hook?.dropResponse?.invoke() == true) {
+                    // The engine applies the write before the proxy closes the connection.
+                    ex.close()
+                    return@createContext
+                }
+                respond(answer.first, answer.second)
             } catch (e: Throwable) {
                 ex.sendResponseHeaders(599, -1)
                 ex.close()
@@ -1059,15 +1075,744 @@ class HogliteGuardRaceTest {
     }
 
     @Test
-    fun `a lost response inside one unkeyed commit still applies exactly once`() {
+    fun `an applied response loss retries the exact materialization for keyed and unkeyed requests`() {
+        for (key in listOf(null, UUID.randomUUID())) {
+            val (c, _) = setup()
+            val req = appendReq(c, "applied-loss.parquet", key)
+            val captured = mutableListOf<com.fasterxml.jackson.databind.JsonNode>()
+            val before = head(c)
+            seen.clear()
+            hooks +=
+                Hook(
+                    { m, p, b -> isTx(m, p, b) && "applied-loss.parquet" in b }, remaining = 2,
+                    response = { status, bytes ->
+                        assertThat(status).isEqualTo(200)
+                        captured.add(wireObjectMapper().readTree(bytes))
+                        if (captured.size == 1) {
+                            503 to "{\"code\":\"outcome_unknown\"}".toByteArray()
+                        } else {
+                            status to bytes
+                        }
+                    },
+                )
+            val result = pstore.commit(c, req)
+            val bodies =
+                seen.filter {
+                    isWriteTxLine(it, "applied-loss.parquet")
+                }.map { it.substringAfter(" ", "").substringAfter(" ") }
+            assertThat(bodies).hasSize(2)
+            assertThat(bodies[0]).isEqualTo(bodies[1])
+            val materialized = wireObjectMapper().readTree(bodies[0])
+            assertThat(materialized["txid"].asText()).startsWith("ch:$c:")
+            assertThat(materialized["fp"]).isNotNull()
+            assertThat(materialized["fp"].asText()).isEqualTo(digest(req))
+            assertThat(captured).hasSize(2)
+            assertThat(captured[1]["dup"].asBoolean()).isTrue()
+            assertThat(captured[1]["results"]).isEqualTo(captured[0]["results"])
+            assertThat(captured[0]["results"].size()).isEqualTo(materialized["statements"].size())
+            assertThat(result.snapshotId).isEqualTo(before + 1)
+            assertThat(head(c)).isEqualTo(result.snapshotId)
+            assertThat(n(c, "SELECT COUNT(*) FROM files")).isEqualTo(1)
+        }
+    }
+
+    private fun digest(request: CommitRequest) =
+        commitFingerprintDigest(commitFingerprint(request)).joinToString("") { "%02x".format(it) }
+
+    private fun edit(
+        c: String,
+        sql: String,
+        vararg args: Any?,
+    ) = boundTx(c, HogliteCatalogStore.freshTxid("replay-fixture"), null, HogliteTx().apply { add(sql, *args) })
+
+    private fun receiptRead(
+        m: String,
+        p: String,
+        b: String,
+        key: UUID,
+    ) = m == "POST" && p.endsWith("/query") &&
+        "SELECT fingerprint, snapshot_id, schema_version FROM receipts" in b && key.toString() in b
+
+    @Test
+    fun `replay repair recovers identical receipts before settled claim and DV symptoms`() {
+        for (mode in listOf("append", "claim", "delete")) {
+            val (c, _) = setup()
+            val key = UUID.randomUUID()
+            val req =
+                when (mode) {
+                    "claim" -> {
+                        val claim = store.uploads.claim(c, UUID.randomUUID(), key, "s3://hoglake-it/$c/up", "data")
+                        appendReq(
+                            c,
+                            "unused",
+                            key,
+                        ).copy(
+                            appends = listOf(TableAppend("ns", "t", listOf(FileRegistration(claim.path, 10, 100, 50)))),
+                        )
+                    }
+                    "delete" -> {
+                        store.commit(c, appendReq(c, "seed.parquet"))
+                        val id = n(c, "SELECT id FROM files")
+                        dvReq(c, id, head(c), "replay-delete.puffin", 2).copy(idempotencyKey = key)
+                    }
+                    else -> appendReq(c, "replay-append.parquet", key)
+                }
+            var winner: CommitResult? = null
+            var guardIndex = 0
+            seen.clear()
+            hooks +=
+                Hook({ m, p, b -> isTx(m, p, b) && key.toString() in b }, before = {
+                    winner = store.commit(c, req)
+                }, response = { status, bytes ->
+                    guardIndex = wireObjectMapper().readTree(bytes)["guard_index"]?.asInt() ?: 0
+                    status to bytes
+                })
+            val replay = runCatching { pstore.commit(c, req) }
+            assertThat(replay.exceptionOrNull()).isNull()
+            assertThat(replay.getOrThrow()).isEqualTo(winner)
+            assertThat(guardIndex).isEqualTo(2)
+            assertThat(
+                seen.count {
+                    it.contains("/query ") && "SELECT fingerprint, snapshot_id, schema_version FROM receipts" in it
+                },
+            ).isEqualTo(1)
+            assertThat(head(c)).isEqualTo(winner!!.snapshotId)
+            assertThat(n(c, "SELECT COUNT(*) FROM receipts WHERE idempotency_key = ?", key.toString())).isEqualTo(1)
+        }
+    }
+
+    @Test
+    fun `replay repair uses a receipt across different upload settlement statement layouts`() {
+        for (winnerHasClaim in listOf(true, false)) {
+            val (c, _) = setup()
+            val key = UUID.randomUUID()
+            val claim = store.uploads.claim(c, UUID.randomUUID(), key, "s3://hoglake-it/$c/up", "data")
+            val req =
+                appendReq(
+                    c,
+                    "unused",
+                    key,
+                ).copy(appends = listOf(TableAppend("ns", "t", listOf(FileRegistration(claim.path, 10, 100, 50)))))
+            // Keep the real claim definition. Only its visibility at each plan differs.
+            if (winnerHasClaim) edit(c, "UPDATE uploads SET path = path || '.hidden'")
+            var winner: CommitResult? = null
+            seen.clear()
+            hooks +=
+                Hook({ m, p, b -> isTx(m, p, b) && claim.path in b }, before = {
+                    if (winnerHasClaim) {
+                        edit(c, "UPDATE uploads SET path = ?", claim.path)
+                    } else {
+                        edit(c, "DELETE FROM uploads")
+                    }
+                    winner = store.commit(c, req)
+                })
+            val replay = runCatching { pstore.commit(c, req) }
+            assertThat(replay.exceptionOrNull()).isNull()
+            assertThat(replay.getOrThrow()).isEqualTo(winner)
+            val loser = seen.single { isWriteTxLine(it, claim.path) }
+            assertThat("UPDATE uploads SET state = 'registered'" in loser).isEqualTo(!winnerHasClaim)
+            assertThat(n(c, "SELECT COUNT(*) FROM files")).isEqualTo(1)
+            assertThat(head(c)).isEqualTo(winner!!.snapshotId)
+        }
+    }
+
+    @Test
+    fun `replay repair shares the single replan budget with schema changes and receipt cleanup`() {
+        for (schedule in listOf("purge", "purge-purge", "schema-purge", "purge-schema", "purge-retained")) {
+            val (c, _) = setup()
+            val key = UUID.randomUUID()
+            val req = appendReq(c, "budget.parquet", key)
+            var attempts = 0
+            var lookups = 0
+            var winner: CommitResult? = null
+            seen.clear()
+            hooks +=
+                Hook({ m, p, b -> isTx(m, p, b) && "budget.parquet" in b }, remaining = 3, before = {
+                    attempts++
+                    val cause =
+                        when {
+                            schedule == "schema-purge" && attempts == 1 -> "schema"
+                            schedule == "purge-schema" && attempts == 2 -> "schema"
+                            schedule == "purge" && attempts == 2 -> "none"
+                            else -> "receipt"
+                        }
+                    if (cause == "schema") {
+                        HogliteAlters(store).alterTable(
+                            c, "ns", "t",
+                            listOf(AlterOp.AddColumn(ColumnDef("extra$attempts", ColType.LONG))),
+                        )
+                    }
+                    if (cause == "receipt") winner = store.commit(c, req)
+                })
+            hooks +=
+                Hook({ m, p, b -> receiptRead(m, p, b, key) }, remaining = 3, before = {
+                    lookups++
+                    if (!(schedule == "purge-retained" && attempts == 2)) {
+                        edit(c, "DELETE FROM receipts WHERE idempotency_key = ?", key.toString())
+                    }
+                })
+            val result = runCatching { pstore.commit(c, req) }
+            assertThat(attempts).isEqualTo(2)
+            if (schedule in listOf("purge", "purge-retained")) {
+                assertThat(result.exceptionOrNull()).isNull()
+                if (schedule == "purge-retained") assertThat(result.getOrThrow()).isEqualTo(winner)
+                assertThat(n(c, "SELECT COUNT(*) FROM files")).isEqualTo(2)
+            } else {
+                assertThat(result.exceptionOrNull()).isExactlyInstanceOf(HoglakeException.CommitConflict::class.java)
+                assertThat(result.exceptionOrNull()!!.message).contains("retry")
+            }
+            assertThat(lookups).isEqualTo(if (schedule.startsWith("purge-p") || schedule == "purge-retained") 2 else 1)
+            hooks.removeIf { it.remaining > 0 }
+        }
+    }
+
+    @Test
+    fun `replay repair compares all valid digest versions on collision and rejects malformed storage`() {
+        SimpleMeterRegistry().let { registry ->
+            Metrics.bind(registry)
+            try {
+                for (stored in listOf(
+                    "00" + "ab".repeat(32),
+                    "02" + "cd".repeat(32),
+                    "ff" + "ef".repeat(32),
+                    "01" + "00".repeat(32),
+                    "02",
+                    "zz".repeat(33),
+                    "",
+                )) {
+                    for (different in listOf(false, true)) {
+                        val (c, _) = setup()
+                        val key = UUID.randomUUID()
+                        val req = appendReq(c, "version-loser.parquet", key)
+                        val winnerReq = if (different) appendReq(c, "version-winner.parquet", key) else req
+                        var winner: CommitResult? = null
+                        seen.clear()
+                        hooks +=
+                            Hook({ m, p, b -> isTx(m, p, b) && "version-loser.parquet" in b }, before = {
+                                winner = store.commit(c, winnerReq)
+                                edit(
+                                    c, "UPDATE receipts SET fingerprint = ? WHERE idempotency_key = ?",
+                                    stored, key.toString(),
+                                )
+                            })
+                        val result = runCatching { pstore.commit(c, req) }
+                        val unknown = stored.length == 66 && stored.take(2) in listOf("00", "02", "ff")
+                        if (unknown) {
+                            assertThat(result.exceptionOrNull()).isNull()
+                            assertThat(result.getOrThrow()).isEqualTo(winner)
+                        } else {
+                            assertThat(
+                                result.exceptionOrNull(),
+                            ).isExactlyInstanceOf(HoglakeException.Validation::class.java)
+                        }
+                        val metric =
+                            registry.find("hoglake_commit_receipt_unknown_digest_version_total")
+                                .tag("catalog", c).counter()?.count() ?: 0.0
+                        assertThat(metric).isEqualTo(if (unknown) 1.0 else 0.0)
+                        assertThat(head(c)).isEqualTo(winner!!.snapshotId)
+                        assertThat(n(c, "SELECT COUNT(*) FROM files")).isEqualTo(1)
+                    }
+                }
+            } finally {
+                Metrics.clear()
+                registry.close()
+            }
+        }
+    }
+
+    @Test
+    fun `replay repair never rebinds a recovery read after catalog recreation`() {
         val (c, _) = setup()
-        // The APPLIED tx's response is replaced by a 503; the client retries
-        // with the SAME txid and hoglite's dedup answers the replay.
-        hooks += Hook({ m, p, b -> isTx(m, p, b) && "lost.parquet" in b }, shortCircuit = 503)
-        val before = n(c, "SELECT COUNT(*) FROM files")
-        val r = runCatching { pstore.commit(c, appendReq(c, "lost.parquet", key = null)) }
-        assertThat(r.isSuccess).isTrue()
-        assertThat(n(c, "SELECT COUNT(*) FROM files") - before).isEqualTo(1L)
+        val tenant = store.resolveTenant(c)
+        val key = UUID.randomUUID()
+        val req = appendReq(c, "recovery-incarnation.parquet", key)
+        hooks +=
+            Hook(
+                { m, p, b -> isTx(m, p, b) && "recovery-incarnation.parquet" in b },
+                before = { store.commit(c, req) },
+            )
+        val recovery =
+            Hook({ m, p, b -> receiptRead(m, p, b, key) }, before = {
+                client.release(tenant)
+                client.deleteTenant(tenant)
+                // The registry still names the removed tenant. Replace its row through the normal create path.
+                store.dropCatalog(c, "test", "lost-tenant")
+                store.createCatalog(c, "s3://hoglake-it/$c")
+                store.createNamespace(c, "zz")
+                store.createTable(c, "zz", "victim", listOf(ColumnDef("id", ColType.LONG)))
+                pstore.getCatalog(c)
+            })
+        hooks += recovery
+        val result = runCatching { pstore.commit(c, req) }
+        assertThat(recovery.remaining).isZero()
+        assertThat(result.exceptionOrNull()).isInstanceOf(HoglakeException.NotFound::class.java)
+        assertThat(store.listFiles(c, "zz", "victim")).isEmpty()
+    }
+
+    @Test
+    fun `replay repair malformed successful readback remains unknown without rematerialization`() {
+        val mapper = wireObjectMapper()
+        for (bad in listOf(
+            "[]",
+            "[[1]]",
+            "[[1,2,3]]",
+            "[[1,2],[3,4]]",
+            "[[null,2]]",
+            "[[\"1\",2]]",
+            "[[1.5,2]]",
+            "[[9223372036854775808,2]]",
+        )) {
+            val (c, _) = setup()
+            val req = appendReq(c, "bad-readback.parquet")
+            seen.clear()
+            hooks +=
+                Hook({ m, p, b -> isTx(m, p, b) && "bad-readback.parquet" in b }, response = { status, bytes ->
+                    assertThat(status).isEqualTo(200)
+                    val decoded = mapper.readTree(bytes)
+                    val readback = decoded["results"].last() as com.fasterxml.jackson.databind.node.ObjectNode
+                    readback.set<com.fasterxml.jackson.databind.JsonNode>("rows", mapper.readTree(bad))
+                    status to mapper.writeValueAsBytes(decoded)
+                })
+            val result = runCatching { pstore.commit(c, req) }
+            assertThat(result.exceptionOrNull()).isExactlyInstanceOf(HoglakeException.CommitOutcomeUnknown::class.java)
+            val body = mapper.readTree(seen.single { isWriteTxLine(it, "bad-readback.parquet") }.substringAfter("/tx "))
+            assertThat(
+                (result.exceptionOrNull() as HoglakeException.CommitOutcomeUnknown).txid,
+            ).isEqualTo(body["txid"].asText())
+            assertThat(n(c, "SELECT COUNT(*) FROM files")).isEqualTo(1)
+            assertThat(store.commit(c, req).snapshotId).isEqualTo(head(c))
+        }
+    }
+
+    @Test
+    fun `sticky ambiguity blocks both private markers after applied response loss`() {
+        for (loss in listOf("504", "transport")) {
+            for (marker in listOf("receipt", "schema")) {
+                val (c, _) = setup()
+                val key = UUID.randomUUID()
+                val req = appendReq(c, "sticky-private.parquet", key)
+                var responses = 0
+                var guardIndex = 0
+                var durable: com.fasterxml.jackson.databind.JsonNode? = null
+                seen.clear()
+                val hook =
+                    Hook(
+                        { m, p, b -> isTx(m, p, b) && "sticky-private.parquet" in b },
+                        remaining = 2,
+                        response = { status, bytes ->
+                            responses++
+                            assertThat(status).isEqualTo(200)
+                            if (responses == 1) {
+                                durable = wireObjectMapper().readTree(bytes)
+                                val wire =
+                                    wireObjectMapper().readTree(
+                                        seen.last {
+                                            isWriteTxLine(
+                                                it,
+                                                "sticky-private.parquet",
+                                            )
+                                        }.substringAfter("/tx "),
+                                    )
+                                val sql =
+                                    if (marker == "receipt") {
+                                        "SELECT COUNT(*) FROM receipts WHERE idempotency_key = ?"
+                                    } else {
+                                        "SELECT schema_version FROM tables WHERE id = ?"
+                                    }
+                                val statements = wire["statements"]
+                                guardIndex = statements.indexOfFirst { statement ->
+                                    statement["sql"].asText() == sql
+                                } + 1
+                                // A missing receipt makes an incorrect replan publish again.
+                                edit(c, "DELETE FROM receipts WHERE idempotency_key = ?", key.toString())
+                                if (loss == "504") {
+                                    504 to "{\"code\":\"outcome_unknown\"}".toByteArray()
+                                } else {
+                                    status to bytes
+                                }
+                            } else {
+                                409 to "{\"error\":\"expect_failed\",\"guard_index\":$guardIndex}".toByteArray()
+                            }
+                        },
+                        dropResponse = { loss == "transport" && responses == 1 },
+                    )
+                hooks += hook
+                val outcome = runCatching { pstore.commit(c, req) }
+                assertThat(
+                    outcome.exceptionOrNull(),
+                ).isExactlyInstanceOf(HoglakeException.CommitOutcomeUnknown::class.java)
+                assertThat(hook.remaining).describedAs("$loss/$marker: ${outcome.exceptionOrNull()?.message}").isZero()
+                assertThat(guardIndex).isGreaterThan(0)
+                val bodies =
+                    seen.filter { isWriteTxLine(it, "sticky-private.parquet") }
+                        .map { it.substringAfter("/tx ") }
+                assertThat(bodies).hasSize(2)
+                assertThat(bodies.distinct()).hasSize(1)
+                val wire = wireObjectMapper().readTree(bodies.first())
+                assertThat((outcome.exceptionOrNull() as HoglakeException.CommitOutcomeUnknown).txid)
+                    .isEqualTo(wire["txid"].asText())
+                assertThat(wire["fp"].asText()).isEqualTo(digest(req))
+                assertThat(seen.count { isReadBatch(it) && key.toString() in it && "FROM receipts" in it }).isEqualTo(1)
+                assertThat(seen.none { it.contains("/query ") && "SELECT fingerprint, snapshot_id" in it }).isTrue()
+                assertThat(n(c, "SELECT COUNT(*) FROM files")).isEqualTo(1)
+                val readback = durable!!["results"].last()["rows"].first()[0].asLong()
+                assertThat(head(c)).isEqualTo(readback)
+                assertThat(n(c, "SELECT COUNT(*) FROM receipts")).isZero()
+            }
+        }
+    }
+
+    @Test
+    fun `not applied retries retain receipt recovery and the bounded schema replan`() {
+        for (marker in listOf("receipt", "schema")) {
+            val (c, _) = setup()
+            val key = UUID.randomUUID()
+            val req = appendReq(c, "known-private.parquet", key)
+            var winner: CommitResult? = null
+            seen.clear()
+            hooks +=
+                Hook(
+                    { m, p, b -> isTx(m, p, b) && "known-private.parquet" in b },
+                    shortCircuit = 503, shortCircuitBody = "{\"code\":\"not_applied\"}",
+                )
+            hooks +=
+                Hook({ m, p, b -> isTx(m, p, b) && "known-private.parquet" in b }, before = {
+                    if (marker == "receipt") {
+                        winner = store.commit(c, req)
+                    } else {
+                        HogliteAlters(store).alterTable(
+                            c, "ns", "t",
+                            listOf(AlterOp.AddColumn(ColumnDef("new", ColType.LONG))),
+                        )
+                    }
+                })
+            val outcome = runCatching { pstore.commit(c, req) }
+            assertThat(outcome.exceptionOrNull()).isNull()
+            val bodies = seen.filter { isWriteTxLine(it, "known-private.parquet") }.map { it.substringAfter("/tx ") }
+            assertThat(bodies.take(2).distinct()).hasSize(1)
+            assertThat(bodies.map { wireObjectMapper().readTree(it)["fp"].asText() }.distinct())
+                .containsExactly(digest(req))
+            if (marker == "receipt") {
+                assertThat(outcome.getOrThrow()).isEqualTo(winner)
+                assertThat(bodies).hasSize(2)
+                assertThat(
+                    seen.count { it.contains("/query ") && "SELECT fingerprint, snapshot_id" in it },
+                ).isEqualTo(1)
+            } else {
+                assertThat(bodies).hasSize(3)
+                assertThat(bodies.distinct()).hasSize(2)
+            }
+            assertThat(n(c, "SELECT COUNT(*) FROM files")).isEqualTo(1)
+        }
+    }
+
+    @Test
+    fun `replay repair refuses unrelated failures without receipt recovery or a new materialization`() {
+        val cases =
+            listOf(
+                Triple(
+                    422,
+                    "{\"code\":\"refused\",\"error\":\"receipts unrelated SQL failure\"}",
+                    HoglakeException.Validation::class.java,
+                ),
+                Triple(
+                    422,
+                    "{\"error\":\"receipts ambiguous failure\"}",
+                    HoglakeException.CommitOutcomeUnknown::class.java,
+                ),
+                Triple(503, "{\"code\":\"not_applied\"}", HoglakeException.BackendUnavailable::class.java),
+                Triple(503, "{\"code\":\"outcome_unknown\"}", HoglakeException.CommitOutcomeUnknown::class.java),
+                Triple(504, "{\"code\":\"outcome_unknown\"}", HoglakeException.CommitOutcomeUnknown::class.java),
+                Triple(
+                    409,
+                    "{\"error\":\"expect_failed\",\"guard_index\":999}",
+                    HoglakeException.CommitConflict::class.java,
+                ),
+            )
+        for ((status, body, type) in cases) {
+            val (c, _) = setup()
+            val key = UUID.randomUUID()
+            val req = appendReq(c, "unrelated-failure.parquet", key)
+            val local =
+                checkedStore(
+                    HogliteClient(
+                        standardUrl = "http://127.0.0.1:${proxy.address.port}",
+                        retryBudgetMs = 300,
+                        sleeper = {},
+                    ),
+                )
+            seen.clear()
+            val hook =
+                Hook(
+                    { m, p, b -> isTx(m, p, b) && "unrelated-failure.parquet" in b },
+                    remaining = Int.MAX_VALUE,
+                    shortCircuit = status,
+                    shortCircuitBody = body,
+                )
+            hooks += hook
+            try {
+                val result = runCatching { local.commit(c, req) }
+                assertThat(result.exceptionOrNull()).isExactlyInstanceOf(type)
+                assertThat(
+                    seen.none {
+                        it.contains("/query ") && "SELECT fingerprint, snapshot_id, schema_version FROM receipts" in it
+                    },
+                ).isTrue()
+                val attempts = seen.filter { isWriteTxLine(it, "unrelated-failure.parquet") }
+                assertThat(attempts).isNotEmpty()
+                assertThat(attempts.distinct()).hasSize(1)
+                if (status == 422 || status == 409) assertThat(attempts).hasSize(1)
+                if (result.exceptionOrNull() is HoglakeException.CommitOutcomeUnknown) {
+                    val txid = wireObjectMapper().readTree(attempts.first().substringAfter("/tx "))["txid"].asText()
+                    assertThat((result.exceptionOrNull() as HoglakeException.CommitOutcomeUnknown).txid).isEqualTo(txid)
+                }
+                assertThat(n(c, "SELECT COUNT(*) FROM files")).isZero()
+            } finally {
+                hooks.remove(hook)
+            }
+        }
+    }
+
+    @Test
+    fun `replay repair recovery read failures preserve known rollback typing`() {
+        for (status in listOf(503, 404)) {
+            val (c, _) = setup()
+            val key = UUID.randomUUID()
+            val req = appendReq(c, "failed-recovery.parquet", key)
+            val local =
+                checkedStore(
+                    HogliteClient(
+                        standardUrl = "http://127.0.0.1:${proxy.address.port}",
+                        retryBudgetMs = 300,
+                        sleeper = {},
+                    ),
+                )
+            hooks +=
+                Hook(
+                    { m, p, b -> isTx(m, p, b) && "failed-recovery.parquet" in b },
+                    before = { store.commit(c, req) },
+                )
+            val recovery =
+                Hook(
+                    { m, p, b -> receiptRead(m, p, b, key) },
+                    remaining = Int.MAX_VALUE,
+                    shortCircuit = status,
+                    shortCircuitBody = "{\"code\":\"not_applied\"}",
+                )
+            hooks += recovery
+            seen.clear()
+            try {
+                val result = runCatching { local.commit(c, req) }
+                assertThat(
+                    result.exceptionOrNull(),
+                ).isExactlyInstanceOf(
+                    if (status == 404) {
+                        HoglakeException.NotFound::class.java
+                    } else {
+                        HoglakeException.BackendUnavailable::class.java
+                    },
+                )
+                assertThat(recovery.remaining).isLessThan(Int.MAX_VALUE)
+                assertThat(seen.count { isWriteTxLine(it, "failed-recovery.parquet") }).isEqualTo(1)
+                assertThat(n(c, "SELECT COUNT(*) FROM files")).isEqualTo(1)
+            } finally {
+                hooks.remove(recovery)
+            }
+        }
+    }
+
+    @Test
+    fun `replay repair replans upload ownership after receipt cleanup`() {
+        val (c, _) = setup()
+        val key = UUID.randomUUID()
+        val other = UUID.randomUUID()
+        val claim = store.uploads.claim(c, UUID.randomUUID(), other, "s3://hoglake-it/$c/up", "data")
+        edit(c, "UPDATE uploads SET path = path || '.hidden'")
+        val req =
+            appendReq(
+                c,
+                "unused",
+                key,
+            ).copy(appends = listOf(TableAppend("ns", "t", listOf(FileRegistration(claim.path, 10, 100, 50)))))
+        hooks += Hook({ m, p, b -> isTx(m, p, b) && claim.path in b }, before = { store.commit(c, req) })
+        val recovery =
+            Hook({ m, p, b -> receiptRead(m, p, b, key) }, before = {
+                edit(c, "DELETE FROM receipts WHERE idempotency_key = ?", key.toString())
+                edit(c, "UPDATE uploads SET path = ?", claim.path)
+            })
+        hooks += recovery
+        seen.clear()
+        val result = runCatching { pstore.commit(c, req) }
+        assertThat(recovery.remaining).isZero()
+        assertThat(result.exceptionOrNull()).isExactlyInstanceOf(HoglakeException.CommitConflict::class.java)
+        assertThat(result.exceptionOrNull()!!.message).contains("upload")
+        assertThat(seen.count { isReadBatch(it) && key.toString() in it && "FROM receipts" in it }).isEqualTo(2)
+        assertThat(seen.count { isWriteTxLine(it, claim.path) }).isEqualTo(1)
+        assertThat(n(c, "SELECT COUNT(*) FROM files")).isEqualTo(1)
+        assertThat(q(c, "SELECT state FROM uploads").firstRow()!![0]).isEqualTo("active")
+    }
+
+    @Test
+    fun `replay repair malformed or unequal preflight receipts refuse without a write`() {
+        for (stored in listOf("", "02", "gg".repeat(33), "01" + "00".repeat(32))) {
+            val (c, _) = setup()
+            val req = appendReq(c, "bad-receipt.parquet")
+            val first = store.commit(c, req)
+            edit(c, "UPDATE receipts SET fingerprint = ?", stored)
+            seen.clear()
+            val result = runCatching { pstore.commit(c, req) }
+            assertThat(result.exceptionOrNull()).isExactlyInstanceOf(HoglakeException.Validation::class.java)
+            assertThat(seen.none { isWriteTxLine(it, "bad-receipt.parquet") }).isTrue()
+            assertThat(head(c)).isEqualTo(first.snapshotId)
+        }
+        val (c, _) = setup()
+        val req = appendReq(c, "uppercase.parquet")
+        val first = store.commit(c, req)
+        edit(c, "UPDATE receipts SET fingerprint = upper(fingerprint)")
+        val replay = runCatching { pstore.commit(c, req) }
+        assertThat(replay.exceptionOrNull()).isNull()
+        assertThat(replay.getOrThrow()).isEqualTo(first)
+    }
+
+    @Test
+    fun `replay repair ignores legacy permanent engine identities when the application receipt is absent`() {
+        val (c, _) = setup()
+        val key = UUID.randomUUID()
+        val req = appendReq(c, "legacy-identity.parquet", key)
+        boundTx(
+            c,
+            "ik:$c:$key",
+            digest(req),
+            HogliteTx().apply {
+                add("UPDATE meta SET next_snapshot = next_snapshot WHERE id = 1")
+            },
+        )
+        seen.clear()
+        val result = runCatching { pstore.commit(c, req) }
+        assertThat(result.exceptionOrNull()).isNull()
+        assertThat(n(c, "SELECT COUNT(*) FROM files")).isEqualTo(1)
+        assertThat(store.receipt(c, key)).isEqualTo(result.getOrThrow())
+    }
+
+    @Test
+    fun `an applied response loss exhausts as unknown with one publication and resolves through its receipt`() {
+        val (c, _) = setup()
+        val req = appendReq(c, "all-responses-lost.parquet")
+        val local =
+            checkedStore(
+                HogliteClient(
+                    standardUrl = "http://127.0.0.1:${proxy.address.port}",
+                    retryBudgetMs = 600,
+                    sleeper = {},
+                ),
+            )
+        val captured = mutableListOf<com.fasterxml.jackson.databind.JsonNode>()
+        val hook =
+            Hook(
+                { m, p, b -> isTx(m, p, b) && "all-responses-lost.parquet" in b },
+                remaining = Int.MAX_VALUE,
+                response = { status, bytes ->
+                    assertThat(status).isEqualTo(200)
+                    captured.add(wireObjectMapper().readTree(bytes))
+                    503 to "{\"code\":\"outcome_unknown\"}".toByteArray()
+                },
+            )
+        hooks += hook
+        seen.clear()
+        try {
+            val result = runCatching { local.commit(c, req) }
+            assertThat(result.exceptionOrNull()).isExactlyInstanceOf(HoglakeException.CommitOutcomeUnknown::class.java)
+            val attempts = seen.filter { isWriteTxLine(it, "all-responses-lost.parquet") }
+            assertThat(attempts.size).isGreaterThan(1)
+            assertThat(attempts.distinct()).hasSize(1)
+            val txid = wireObjectMapper().readTree(attempts.first().substringAfter("/tx "))["txid"].asText()
+            assertThat((result.exceptionOrNull() as HoglakeException.CommitOutcomeUnknown).txid).isEqualTo(txid)
+            assertThat(
+                captured.drop(1).all { it["dup"].asBoolean() && it["results"] == captured[0]["results"] },
+            ).isTrue()
+            assertThat(n(c, "SELECT COUNT(*) FROM files")).isEqualTo(1)
+            assertThat(store.commit(c, req).snapshotId).isEqualTo(head(c))
+        } finally {
+            hooks.remove(hook)
+        }
+    }
+
+    @Test
+    fun `an applied response loss recovers the full dedup array from S3 on a new owner`() {
+        // A separate prefix keeps owner recovery independent of this class's other tenants.
+        val port = ServerSocket(0).use { it.localPort }
+        val prefix = "response-recovery-${UUID.randomUUID()}"
+        startPod("response-owner", port, prefix)
+        val original = procs.last()
+        val direct = HogliteClient(standardUrl = "http://127.0.0.1:$port", sleeper = {})
+        val ownerStore = checkedStore(direct)
+        val c = "response-recovery"
+        ownerStore.createCatalog(c, "s3://hoglake-it/$c")
+        ownerStore.createNamespace(c, "ns")
+        ownerStore.createTable(c, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        val tenant = ownerStore.resolveTenant(c)
+        val req = appendReq(c, "owner-recovered-loss.parquet", key = null)
+        val captured = mutableListOf<com.fasterxml.jackson.databind.JsonNode>()
+        val bodies = mutableListOf<String>()
+        val forwarding = HttpClient.newHttpClient()
+        val transport = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        val executor = Executors.newCachedThreadPool()
+        transport.executor = executor
+        transport.createContext("/") { ex ->
+            try {
+                val path = ex.requestURI.toString()
+                val body = ex.requestBody.readBytes()
+                val answer =
+                    forwarding.send(
+                        HttpRequest.newBuilder(URI.create("http://127.0.0.1:$port$path"))
+                            .header("Content-Type", "application/json")
+                            .method(ex.requestMethod, HttpRequest.BodyPublishers.ofByteArray(body)).build(),
+                        HttpResponse.BodyHandlers.ofByteArray(),
+                    )
+                var status = answer.statusCode()
+                var bytes = answer.body()
+                if (path.endsWith("/tx") && "INSERT INTO files" in body.decodeToString()) {
+                    bodies.add(body.decodeToString())
+                    captured.add(wireObjectMapper().readTree(bytes))
+                    if (captured.size == 1) {
+                        direct.release(tenant)
+                        direct.release(ownerStore.registryTenantId)
+                        original.destroyForcibly().waitFor()
+                        startPod("response-recovered-owner", port, prefix)
+                        status = 503
+                        bytes = "{\"code\":\"outcome_unknown\"}".toByteArray()
+                    }
+                }
+                ex.sendResponseHeaders(status, bytes.size.toLong())
+                ex.responseBody.use { it.write(bytes) }
+            } catch (_: Throwable) {
+                ex.sendResponseHeaders(599, -1)
+                ex.close()
+            }
+        }
+        transport.start()
+        try {
+            val replayStore =
+                checkedStore(
+                    HogliteClient(standardUrl = "http://127.0.0.1:${transport.address.port}", sleeper = {}),
+                )
+            val outcome = runCatching { replayStore.commit(c, req) }
+            assertThat(outcome.exceptionOrNull()).isNull()
+            assertThat(bodies).hasSize(2)
+            assertThat(bodies[0]).isEqualTo(bodies[1])
+            val materialized = wireObjectMapper().readTree(bodies[0])
+            assertThat(materialized["fp"]).isNotNull()
+            assertThat(materialized["fp"].asText()).isEqualTo(digest(req))
+            assertThat(captured).hasSize(2)
+            assertThat(captured[1]["dup"].asBoolean()).isTrue()
+            assertThat(captured[1]["results"]).isEqualTo(captured[0]["results"])
+            assertThat(captured[0]["results"].size()).isEqualTo(materialized["statements"].size())
+            assertThat(ownerStore.listFiles(c, "ns", "t")).hasSize(1)
+            assertThat(outcome.getOrThrow().snapshotId).isEqualTo(ownerStore.getCatalog(c).headSnapshotId)
+        } finally {
+            transport.stop(0)
+            executor.shutdownNow()
+        }
     }
 
     @Test

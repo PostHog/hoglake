@@ -13,6 +13,7 @@ import com.posthog.hoglake.model.PartitionFieldDef
 import com.posthog.hoglake.model.TableAppend
 import com.posthog.hoglake.model.TableDeletes
 import com.posthog.hoglake.model.Transform
+import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.service.AlterBackend
 import com.posthog.hoglake.service.AlterService
 import com.posthog.hoglake.service.CatalogService
@@ -22,6 +23,7 @@ import com.posthog.hoglake.service.UploadService
 import com.posthog.hoglake.store.CatalogStore
 import com.posthog.hoglake.store.PostgresCatalogStore
 import com.posthog.hoglake.testing.PgTestSupport
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.AfterAll
@@ -169,6 +171,136 @@ class HogliteCommitParityIntegrationTest {
                 "SELECT COUNT(*) FROM hog_upload WHERE catalog_id = :catalog AND state = 'registered'",
             ),
         )
+
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(Backend::class)
+    fun `receipt lifetime controls replay for retained and purged equal or different payloads`(backend: Backend) {
+        select(backend)
+        for (claimed in listOf(false, true)) {
+            for (different in listOf(false, true)) {
+                val cat = fixture()
+                val key = UUID.randomUUID()
+                val path =
+                    if (claimed) {
+                        uploads.claim(
+                            cat,
+                            UUID.randomUUID(),
+                            key,
+                            "s3://hoglake-it/$cat/up",
+                            "data",
+                        ).path
+                    } else {
+                        file(cat).path
+                    }
+                val req = request(cat, file(cat).copy(path = path), read = null).copy(idempotencyKey = key)
+                val first = publish(cat, req)
+                val before = state(cat)
+                assertThat(store.commit(cat, req)).isEqualTo(first)
+                assertThatThrownBy {
+                    store.commit(cat, req.copy(message = "different"))
+                }.isInstanceOf(HoglakeException.Validation::class.java)
+                assertThat(state(cat)).isEqualTo(before)
+                write(cat, "DELETE FROM receipts", "DELETE FROM hog_commit_receipt WHERE catalog_id = :catalog")
+                val retry = if (different) req.copy(message = "different") else req
+                val second = publish(cat, retry)
+                assertThat(second.snapshotId).isGreaterThan(first.snapshotId)
+                assertThat(
+                    number(
+                        cat,
+                        "SELECT COUNT(*) FROM files",
+                        "SELECT COUNT(*) FROM hog_data_file WHERE catalog_id = :catalog",
+                    ),
+                ).isEqualTo(2)
+                assertThat(
+                    number(
+                        cat,
+                        "SELECT COUNT(DISTINCT row_id_start) FROM files",
+                        "SELECT COUNT(DISTINCT row_id_start) FROM hog_data_file WHERE catalog_id = :catalog",
+                    ),
+                ).isEqualTo(2)
+                assertThat(store.receipt(cat, key)).isEqualTo(second)
+                if (claimed) assertThat(state(cat).last()).isEqualTo(1)
+            }
+        }
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(Backend::class)
+    fun `retained canonical permutations replay without another allocation`(backend: Backend) {
+        select(backend)
+        val cat = fixture()
+        val stats =
+            listOf(
+                ColumnStats(1, 10, 0, null, null, null, null),
+                ColumnStats(2, 10, 0, null, null, null, null),
+            )
+        val a = file(cat, "canonical-a").copy(columnStats = stats)
+        val b = file(cat, "canonical-b").copy(columnStats = stats.reversed())
+        val key = UUID.randomUUID()
+        val req =
+            CommitRequest(
+                idempotencyKey = key,
+                appends =
+                    listOf(
+                        TableAppend("ns", "t", listOf(a)),
+                        TableAppend("ns", "t", listOf(b)),
+                    ),
+            )
+        val first = publish(cat, req)
+        val before = state(cat)
+        val permuted =
+            req.copy(
+                appends =
+                    req.appends.reversed().map { append ->
+                        append.copy(
+                            files =
+                                append.files.reversed().map {
+                                        f ->
+                                    f.copy(columnStats = f.columnStats!!.reversed())
+                                },
+                        )
+                    },
+            )
+        assertThat(publish(cat, permuted)).isEqualTo(first)
+        assertThat(state(cat)).isEqualTo(before)
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(Backend::class)
+    fun `valid older and newer digest versions replay old results for equal and different requests`(backend: Backend) {
+        select(backend)
+        SimpleMeterRegistry().let { registry ->
+            Metrics.bind(registry)
+            try {
+                for (version in listOf("00", "02", "ff")) {
+                    for (different in listOf(false, true)) {
+                        val cat = fixture()
+                        val req = request(cat, read = null)
+                        val first = publish(cat, req)
+                        val stored = version + "a5".repeat(32)
+                        write(
+                            cat,
+                            "UPDATE receipts SET fingerprint = '$stored'",
+                            "UPDATE hog_commit_receipt SET fingerprint = decode('$stored','hex') " +
+                                "WHERE catalog_id = :catalog",
+                        )
+                        val before = state(cat)
+                        assertThat(
+                            publish(cat, if (different) req.copy(message = "different") else req),
+                        ).isEqualTo(first)
+                        assertThat(state(cat)).isEqualTo(before)
+                        assertThat(
+                            registry.find("hoglake_commit_receipt_unknown_digest_version_total")
+                                .tag("catalog", cat).counter()?.count() ?: 0.0,
+                        ).isEqualTo(1.0)
+                    }
+                }
+            } finally {
+                Metrics.clear()
+                registry.close()
+            }
+        }
+    }
 
     private fun ddl(
         cat: String,

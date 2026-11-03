@@ -1,6 +1,8 @@
 package com.posthog.hoglake.hoglite
 
 import com.fasterxml.jackson.module.kotlin.readValue
+import com.posthog.hoglake.commit.COMMIT_FINGERPRINT_LENGTH
+import com.posthog.hoglake.commit.COMMIT_FINGERPRINT_VERSION
 import com.posthog.hoglake.commit.CommitService.Companion.BLIND_PARTITIONED_REFUSAL
 import com.posthog.hoglake.commit.CommitService.Companion.blindPartitionedRefusal
 import com.posthog.hoglake.commit.ObjectPrefixRules
@@ -23,6 +25,7 @@ import com.posthog.hoglake.model.TableDeletes
 import com.posthog.hoglake.model.pathStaysUnder
 import com.posthog.hoglake.model.validateFooterSize
 import com.posthog.hoglake.model.validateSplitOffsets
+import com.posthog.hoglake.observability.Metrics
 import io.github.oshai.kotlinlogging.KotlinLogging
 import java.util.UUID
 
@@ -47,17 +50,13 @@ import java.util.UUID
  *     rows, typed change rows, the snapshot row, the receipt.
  *  5. The readback answers the CommitResult.
  *
- * Exactly-once is two layers and both are load-bearing:
+ * Each materialized transaction has a fresh engine txid. Transport retries
+ * keep its complete body fixed. An ambiguous outcome never permits replanning.
  *
- *  - the txid is `ik:<key>` for a keyed request, `ch:<catalog>:<fp16>`
- *    otherwise, so a client retry of the SAME logical commit is answered
- *    from hoglite's dedup table without re-executing;
- *  - the receipts table is the durable `GET /commit/receipts/{op}`
- *    lookup AND the pre-flight that turns a reused key with a different
- *    payload into a 422 before any statement runs. A race between the
- *    pre-read and the tx is closed by the receipt insert's PRIMARY KEY:
- *    the loser's whole transaction rolls back on the constraint
- *    violation.
+ * Application receipts control client-key replay for their retention lifetime.
+ * A receipt guard precedes state guards inside the transaction. Its private
+ * rollback marker permits a bound receipt lookup. A missing receipt shares
+ * the schema fence's single replan slot.
  */
 
 internal object HogliteCommit {
@@ -90,21 +89,22 @@ internal object HogliteCommit {
         ) {
             throw HoglakeException.Validation("pending delete targets require /commit/transaction")
         }
-        // The schema fence (SCHEMA_CHANGED, guarded in-tx below) means a
-        // DDL landed between this commit's planning and its transaction.
-        // Postgres re-validates under the commit lock; the hoglite shape
-        // re-plans instead: one retry with fresh state, then the conflict
-        // stands as a typed, retryable refusal.
+        // Schema changes and receipts removed during recovery share one replan.
+        // Both private markers prove that the materialized write rolls back.
         return try {
             doCommit(store, catalog, request)
         } catch (e: HoglakeException.CommitConflict) {
-            if (e !== SCHEMA_CHANGED) throw e
+            if (e !== SCHEMA_CHANGED && e !== RECEIPT_CHANGED) throw e
             try {
                 doCommit(store, catalog, request)
             } catch (e2: HoglakeException.CommitConflict) {
-                if (e2 !== SCHEMA_CHANGED) throw e2
+                if (e2 !== SCHEMA_CHANGED && e2 !== RECEIPT_CHANGED) throw e2
                 throw HoglakeException.CommitConflict(
-                    "concurrent DDL changed the schema twice while this commit was being planned; retry",
+                    if (e2 === SCHEMA_CHANGED) {
+                        "concurrent DDL changed the schema twice while this commit was being planned; retry"
+                    } else {
+                        "receipt changed during publication; retry"
+                    },
                 )
             }
         }
@@ -166,19 +166,13 @@ internal object HogliteCommit {
         val meta = plan.meta()
         val dataPathPrefix = meta.dataPath.trimEnd('/') + "/"
 
-        // Idempotency: the receipt pre-read (the tx's PK insert closes
-        // the race; see the class KDoc).
-        val canonical = commitFingerprint(request)
-        val fingerprint = commitFingerprintDigest(canonical).toHex()
+        // Compare the original logical request, not its merged statement layout.
+        val fingerprintBytes = commitFingerprintDigest(commitFingerprint(request))
+        val fingerprint = fingerprintBytes.toHex()
         if (request.idempotencyKey != null) {
             val existing = plan.receipt()
             if (existing != null) {
-                if (existing[0].asString() == fingerprint) {
-                    return CommitResult(existing[1].asLong(), existing[2].asLong())
-                }
-                throw HoglakeException.Validation(
-                    "idempotency_key ${request.idempotencyKey} was already used with a different payload",
-                )
+                return replayedReceipt(catalog, request.idempotencyKey, fingerprintBytes, existing)
             }
         }
 
@@ -513,6 +507,14 @@ internal object HogliteCommit {
         // ---- build the transaction
 
         val tx = HogliteTx()
+        // The store retains its outer catalog fence before this receipt guard.
+        // A retained publication takes precedence over stale claim or DV state.
+        request.idempotencyKey?.let { key ->
+            tx.expectZero(
+                "SELECT COUNT(*) FROM receipts WHERE idempotency_key = ?",
+                key.toString(),
+            ) { RECEIPT_CHANGED }
+        }
 
         // 1. Table guards: live + incarnation, inside the transaction.
         for ((qname, t) in resolved) {
@@ -946,36 +948,59 @@ internal object HogliteCommit {
         }
         val readback = tx.add(HogliteSql.READBACK_COMMIT)
 
-        // Keyed commits reuse the key's txid so a replayed request
-        // answers from hoglite's dedup; UNKEYED commits get a fresh txid
-        // per store invocation — Postgres grants publication idempotency
-        // only to explicit keys, and a content-derived txid would make an
-        // identical LATER commit (truncate + reload of the same paths)
-        // silently replay the old result without applying. The txid is
-        // minted here, once, and HogliteClient's retry loop reuses it, so
-        // at-most-once holds across this request's own retries.
-        val txid =
-            request.idempotencyKey?.let { "ik:$catalog:$it" }
-                ?: "ch:$catalog:${UUID.randomUUID()}"
+        // Only a new materialization mints an identity. Exact transport retries
+        // reuse this txid, fingerprint, statement layout, arguments and timestamps.
+        val txid = "ch:$catalog:${UUID.randomUUID()}"
         val results =
             try {
                 store.runTx(catalog, txid, fingerprint, tx)
-            } catch (e: HoglakeException.Validation) {
-                // The receipt PRIMARY KEY is the race closer: two
-                // different payloads under one key -> the loser's
-                // constraint violation lands here.
-                val msg = e.message ?: ""
-                if (request.idempotencyKey != null &&
-                    ("receipts" in msg || "idempotency key reused" in msg)
-                ) {
-                    throw HoglakeException.Validation(
-                        "idempotency_key ${request.idempotencyKey} was already used with a different payload",
-                    )
-                }
+            } catch (e: HoglakeException.CommitConflict) {
+                if (e !== RECEIPT_CHANGED) throw e
+                val key = checkNotNull(request.idempotencyKey)
+                // This lookup stays inside the original catalogOperation binding.
+                val existing =
+                    store.queryCatalog(
+                        catalog,
+                        "SELECT fingerprint, snapshot_id, schema_version FROM receipts WHERE idempotency_key = ?",
+                        key.toString(),
+                    ).firstRow()
+                if (existing != null) return replayedReceipt(catalog, key, fingerprintBytes, existing)
+                // Cleanup removed the receipt. Only the shared budget permits a replan.
                 throw e
             }
-        val row = results[readback].firstRow()!!
-        return CommitResult(snapshotId = row[0].asLong(), schemaVersion = row[1].asLong())
+        try {
+            val result = results[readback]
+            check(result.cols.size == 2 && result.rows.size == 1) { "invalid commit readback shape" }
+            val row = result.rows.single()
+            check(row.size == 2 && row.all { it is Int || it is Long }) { "invalid commit readback integers" }
+            return CommitResult(snapshotId = row[0].asLong(), schemaVersion = row[1].asLong())
+        } catch (e: Exception) {
+            throw HoglakeException.CommitOutcomeUnknown(txid, "invalid commit readback: ${e.message}")
+        }
+    }
+
+    private fun replayedReceipt(
+        catalog: String,
+        key: UUID,
+        fingerprint: ByteArray,
+        row: List<Any?>,
+    ): CommitResult {
+        val stored = row.getOrNull(0) as? String
+        val valid =
+            stored != null && stored.length == COMMIT_FINGERPRINT_LENGTH * 2 &&
+                stored.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }
+        if (!valid || row.size != 3 || row.drop(1).any { it !is Int && it !is Long }) {
+            throw HoglakeException.Validation("idempotency_key $key has an invalid stored receipt")
+        }
+        val digest = checkNotNull(stored).chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+        if (digest[0] == COMMIT_FINGERPRINT_VERSION) {
+            if (!digest.contentEquals(fingerprint)) {
+                throw HoglakeException.Validation("idempotency_key $key was already used with a different payload")
+            }
+        } else {
+            Metrics.commitReceiptUnknownDigestVersion(catalog)
+        }
+        return CommitResult(row[1].asLong(), row[2].asLong())
     }
 
     /** The durable publication receipt, as GET /commit/receipts/{operation} serves it. */
@@ -1518,6 +1543,9 @@ internal object HogliteCommit {
 // lookalike CommitConflict from another guard.
 private val SCHEMA_CHANGED =
     HoglakeException.CommitConflict("concurrent DDL changed the schema while this commit was being planned")
+
+// Only this registered guard marker permits receipt recovery after a rollback.
+private val RECEIPT_CHANGED = HoglakeException.CommitConflict("receipt changed during publication")
 
 // Blind-partitioned WARN dedupe, per (catalog, table), for the process's life.
 private val WARNED_BLIND_PARTITIONED = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
