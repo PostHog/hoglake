@@ -133,14 +133,7 @@ internal object HogliteCommit {
             expectedUuid: UUID?,
         ): Touched {
             val t = order.getOrPut("$namespace.$table") { Touched(namespace, table) }
-            if (expectedUuid != null) {
-                if (t.expectedUuid != null && t.expectedUuid != expectedUuid) {
-                    throw HoglakeException.Validation(
-                        "conflicting expected_table_uuid for $namespace.$table",
-                    )
-                }
-                t.expectedUuid = expectedUuid
-            }
+            if (expectedUuid != null) t.expectedUuids += expectedUuid
             return t
         }
         val appends =
@@ -167,9 +160,8 @@ internal object HogliteCommit {
             }
 
         // Every read this attempt plans against, as ONE read-only
-        // transaction (see PlanReads). The results are consumed below in
-        // the order the reads used to run, so the first refusal a request
-        // gets is unchanged.
+        // transaction (see PlanReads). Resolve identities before consuming
+        // conflicts. Conflicts precede live-file validation and claims.
         val plan = PlanReads.read(store, catalog, request, order.values, appends, deletes)
         val meta = plan.meta()
         val dataPathPrefix = meta.dataPath.trimEnd('/') + "/"
@@ -238,8 +230,8 @@ internal object HogliteCommit {
                     }
                     throw e
                 }
-            val expected = t.expectedUuid
-            if (expected != null && row.tableUuid != expected) {
+            val expected = t.expectedUuids.firstOrNull { it != row.tableUuid }
+            if (expected != null) {
                 throw HoglakeException.TableRecreated(
                     "table '${t.namespace}.${t.table}' no longer has the expected UUID: it was " +
                         "recreated; re-read it before retrying",
@@ -249,6 +241,32 @@ internal object HogliteCommit {
                 )
             }
             resolved["${t.namespace}.${t.table}"] = row
+        }
+
+        // ---- the conflict window (the mixed rule needs the UNION, so
+        // pre-flight collects it; the in-tx guards below close the race
+        // with content conflicts FIRST so a mixed window answers
+        // commit_conflict, never the non-retryable one).
+        if (readSnapshot != null) {
+            val conflicts = plan.conflicts()
+            if (conflicts.rows.isNotEmpty()) {
+                val nameById = resolved.entries.associate { it.value.tableId to it.key }
+                val names = conflicts.rows.mapNotNull { nameById[it[0].asLong()] }.distinct().sorted()
+                val allDdl = conflicts.rows.all { it[1].asLong() == 1L }
+                if (allDdl) {
+                    throw HoglakeException.DdlSinceReadSnapshot(
+                        "concurrent DDL since snapshot $readSnapshot on table(s): " +
+                            names.joinToString(", ") +
+                            "; re-prepare against current table info, replaying this request cannot succeed",
+                        tables = names,
+                        readSnapshot = readSnapshot,
+                    )
+                }
+                throw HoglakeException.CommitConflict(
+                    "concurrent table change since snapshot $readSnapshot on table(s): " +
+                        names.joinToString(", "),
+                )
+            }
         }
 
         // The snapshot every definition below (spec, layout) is read at
@@ -277,9 +295,6 @@ internal object HogliteCommit {
             val prev = allPaths.putIfAbsent(path, kind)
             if (prev != null && prev != kind) {
                 throw HoglakeException.Validation("one upload path cannot hold both data and deletion vectors")
-            }
-            if (prev != null) {
-                throw HoglakeException.Validation("duplicate file path in commit: $path")
             }
             if (!pathStaysUnder(path, dataPathPrefix)) {
                 throw HoglakeException.Validation(
@@ -344,11 +359,11 @@ internal object HogliteCommit {
         // (tableId, path) resolution: a DV's target must be a file THIS
         // delete's table is appending, so a cross-table staged reference
         // can never bind another table's file to this table's DV row.
-        val stagedIdByPath = mutableMapOf<Pair<Long, String>, Int>()
-        plannedAppends.forEachIndexed { i, p -> stagedIdByPath[p.table.tableId to p.file.path] = i }
+        val stagedIdsByPath =
+            plannedAppends.withIndex().groupBy({ it.value.table.tableId to it.value.file.path }) { it.index }
         val plannedDeletes = mutableListOf<PlannedDelete>()
         val seenTargets = mutableSetOf<Long>()
-        val seenStaged = mutableSetOf<Int>()
+        val seenStaged = mutableSetOf<Pair<Long, String>>()
         for (delete in deletes) {
             val table = resolved.getValue("${delete.namespace}.${delete.table}")
             for (dv in delete.files) {
@@ -361,29 +376,36 @@ internal object HogliteCommit {
                 }
                 val staged = dv.dataFilePath
                 if (staged != null) {
-                    if (dv.dataFileId != 0L) {
-                        throw HoglakeException.Validation(
-                            "a deletion vector that names data_file_path must carry data_file_id 0 " +
-                                "(the file is allocated by this commit)",
-                        )
-                    }
-                    val target =
-                        stagedIdByPath[table.tableId to staged]
-                            ?: throw HoglakeException.Validation(
-                                "deletion vector for ${delete.namespace}.${delete.table} references " +
-                                    "data_file_path $staged, which this commit does not append to that table",
-                            )
-                    if (!seenStaged.add(target)) {
-                        throw HoglakeException.Validation(
-                            "the staged file $staged has two deletion vectors in one commit",
-                        )
-                    }
                     if (dv.fileSizeBytes < 0) {
                         throw HoglakeException.Validation(
                             "negative file_size_bytes for delete of data_file_id ${dv.dataFileId} " +
                                 "in ${delete.namespace}.${delete.table}",
                         )
                     }
+                    if (dv.dataFileId != 0L) {
+                        throw HoglakeException.Validation(
+                            "a deletion vector that names data_file_path must carry data_file_id 0 " +
+                                "(the file is allocated by this commit)",
+                        )
+                    }
+                    if (!seenStaged.add(table.tableId to staged)) {
+                        throw HoglakeException.Validation(
+                            "the staged file $staged has two deletion vectors in one commit",
+                        )
+                    }
+                    val targets = stagedIdsByPath[table.tableId to staged].orEmpty()
+                    if (targets.size != 1) {
+                        val refusal =
+                            HoglakeException.Validation(
+                                "pending delete must target exactly one same-table append in this commit",
+                            )
+                        if (targets.isEmpty()) throw refusal
+                        // PostgreSQL checks path protection before ambiguous targets.
+                        // Keep every path, but do not select a target.
+                        plannedDeletes += PlannedDelete(table, dv, stagedTarget = null, refusal = refusal)
+                        continue
+                    }
+                    val target = targets.single()
                     plannedDeletes += PlannedDelete(table, dv, stagedTarget = target)
                 } else {
                     if (dv.dataFileId <= 0) {
@@ -455,6 +477,7 @@ internal object HogliteCommit {
         // with those refusals first.
         val dvViolations = LinkedHashMap<Long, MutableList<String>>()
         for (p in plannedDeletes) {
+            if (p.refusal != null) continue
             val layout = layoutFor(p.table) ?: continue
             val raw =
                 if (p.stagedTarget != null) {
@@ -487,32 +510,6 @@ internal object HogliteCommit {
         // lands in the transaction.
         val claimsToSettle = settleDecision(plan.claims(), plan.retainedPaths(), allPaths, request.idempotencyKey)
 
-        // ---- the conflict window (the mixed rule needs the UNION, so
-        // pre-flight collects it; the in-tx guards below close the race
-        // with content conflicts FIRST so a mixed window answers
-        // commit_conflict, never the non-retryable one).
-        if (readSnapshot != null) {
-            val conflicts = plan.conflicts()
-            if (conflicts.rows.isNotEmpty()) {
-                val nameById = resolved.entries.associate { it.value.tableId to it.key }
-                val names = conflicts.rows.mapNotNull { nameById[it[0].asLong()] }.distinct().sorted()
-                val allDdl = conflicts.rows.all { it[1].asLong() == 1L }
-                if (allDdl) {
-                    throw HoglakeException.DdlSinceReadSnapshot(
-                        "concurrent DDL since snapshot $readSnapshot on table(s): " +
-                            names.joinToString(", ") +
-                            "; re-prepare against current table info, replaying this request cannot succeed",
-                        tables = names,
-                        readSnapshot = readSnapshot,
-                    )
-                }
-                throw HoglakeException.CommitConflict(
-                    "concurrent table change since snapshot $readSnapshot on table(s): " +
-                        names.joinToString(", "),
-                )
-            }
-        }
-
         // ---- build the transaction
 
         val tx = HogliteTx()
@@ -523,7 +520,7 @@ internal object HogliteCommit {
             // id, and a caller holding the old incarnation must get the
             // retryable 409s (re-read), never a bare 404.
             val touched = order.values.first { "${it.namespace}.${it.table}" == qname }
-            touched.expectedUuid?.let { expected ->
+            touched.expectedUuids.firstOrNull()?.let { expected ->
                 tx.expectOne(
                     "SELECT COUNT(*) FROM tables WHERE id = ? AND dropped_snapshot IS NULL AND table_uuid = ?",
                     t.tableId,
@@ -671,95 +668,24 @@ internal object HogliteCommit {
             }
         }
 
-        // 4. Allocate: the snapshot, then the file ids this commit needs
-        // (data files first, then DVs — the shared allocator's order).
-        tx.allocateCommitSnapshot()
-        val totalFiles = plannedAppends.size + plannedDeletes.size
-        if (totalFiles > 0) {
-            tx.affectOne(
-                "UPDATE meta SET next_file_id = next_file_id + $totalFiles WHERE id = 1",
-            ) { HoglakeException.NotFound("catalog '$catalog'") }
-        }
-
-        fun allocatedId(offset: Int): String = "(SELECT next_file_id - $totalFiles + $offset FROM meta WHERE id = 1)"
-
-        // 5. Appends: file rows with server-assigned row lineage.
-        val appendedIdByIndex = mutableMapOf<Int, String>()
-        plannedAppends.forEachIndexed { i, p ->
-            val idSql = allocatedId(i)
-            appendedIdByIndex[i] = idSql
-            val statsJson = p.sanitizedStats?.let { store.json.writeValueAsString(it) }
-            tx.add(
-                "INSERT INTO files(id, table_id, path, record_count, file_size_bytes, footer_size, " +
-                    "row_id_start, spec_id, partition_values_json, stats_state, stats_json, " +
-                    "split_offsets_json, begin_snapshot) " +
-                    "VALUES ($idSql, ?, ?, ?, ?, ?, " +
-                    "(SELECT next_row_id FROM tables WHERE id = ?) + ${p.rowOffset}, ?, ?, ?, ?, ?, " +
-                    "${HogliteSchema.HEAD_SQL})",
-                p.table.tableId,
-                p.file.path,
-                p.file.recordCount,
-                p.file.fileSizeBytes,
-                p.file.footerSize,
-                p.table.tableId,
-                p.specId,
-                p.file.partitionValues?.let { store.json.writeValueAsString(it) },
-                if (p.sanitizedStats == null) "pending" else "provided",
-                statsJson,
-                p.file.splitOffsets?.let { offs -> store.json.writeValueAsString(offs) },
-            )
-        }
-        // Row lineage advances once per appended table.
-        for (append in appends) {
-            val table = resolved.getValue("${append.namespace}.${append.table}")
-            val rows = append.files.sumOf { it.recordCount }
-            if (rows > 0) {
-                tx.add(
-                    "UPDATE tables SET next_row_id = next_row_id + $rows WHERE id = ?",
-                    table.tableId,
-                )
-            }
-            val bytes = append.files.sumOf { it.fileSizeBytes }
-            tx.add(
-                "INSERT INTO table_totals(table_id, record_count, file_count, file_size_bytes) VALUES (?, ?, ?, ?) " +
-                    "ON CONFLICT(table_id) DO UPDATE SET " +
-                    "record_count = table_totals.record_count + excluded.record_count, " +
-                    "file_count = table_totals.file_count + excluded.file_count, " +
-                    "file_size_bytes = table_totals.file_size_bytes + excluded.file_size_bytes",
-                table.tableId,
-                rows,
-                append.files.size.toLong(),
-                bytes,
-            )
-        }
-
-        // 6. Deletes: per-target guards (staleness BEFORE monotonicity),
-        // then the history-preserving epoch insert.
-        plannedDeletes.forEachIndexed { i, p ->
-            val idSql = allocatedId(plannedAppends.size + i)
+        // Target resolution follows merged registration order, AFTER
+        // executed path protection and BEFORE allocation or mutation.
+        // An ambiguous slot keeps its position without choosing an append.
+        for (p in plannedDeletes) {
             val dv = p.registration
             val qname = "${p.table.namespace}.${p.table.name}"
-            if (p.stagedTarget != null) {
-                // Same-commit target: the file is minted above, so its
-                // guards are the append's own. delete_count is checked
-                // against the registration in Kotlin already.
+            if (p.refusal != null) {
+                tx.expectZero("SELECT 1") { p.refusal }
+            } else if (p.stagedTarget != null) {
                 val target = plannedAppends[p.stagedTarget]
                 if (dv.deleteCount > target.file.recordCount) {
-                    throw HoglakeException.Validation(
-                        "delete_count ${dv.deleteCount} exceeds record_count of the staged file " +
-                            "${target.file.path} in $qname",
-                    )
+                    tx.expectZero("SELECT 1") {
+                        HoglakeException.Validation(
+                            "delete_count ${dv.deleteCount} exceeds record_count of the staged file " +
+                                "${target.file.path} in $qname",
+                        )
+                    }
                 }
-                tx.add(
-                    "INSERT INTO dvs(data_file_id, table_id, delete_file_id, path, delete_count, " +
-                        "file_size_bytes, begin_snapshot, epoch) " +
-                        "VALUES (${appendedIdByIndex.getValue(p.stagedTarget)}, ?, $idSql, ?, ?, ?, " +
-                        "${HogliteSchema.HEAD_SQL}, 1)",
-                    p.table.tableId,
-                    dv.path,
-                    dv.deleteCount,
-                    dv.fileSizeBytes,
-                )
             } else {
                 val target = dv.dataFileId
                 tx.expectOne(
@@ -840,6 +766,102 @@ internal object HogliteCommit {
                             "live deletion vector — vectors only grow",
                     )
                 }
+            }
+        }
+
+        // The DV object-prefix refusal, after every per-target guard
+        // above (CommitService throws it after its planDeletes loop, for
+        // the first table with violations).
+        dvViolations.entries.firstOrNull()?.let { (tableId, violations) ->
+            val table = resolved.values.first { it.tableId == tableId }
+            val layout = layouts.getValue(tableId)!!
+            tx.expectZero("SELECT ?", violations.size.toLong()) {
+                ObjectPrefixRules.violation(table.namespace, table.name, meta.dataPath, layout, violations)
+            }
+        }
+
+        // 4. Allocate: the snapshot, then the file ids this commit needs
+        // (data files first, then DVs — the shared allocator's order).
+        tx.allocateCommitSnapshot()
+        val totalFiles = plannedAppends.size + plannedDeletes.size
+        if (totalFiles > 0) {
+            tx.affectOne(
+                "UPDATE meta SET next_file_id = next_file_id + $totalFiles WHERE id = 1",
+            ) { HoglakeException.NotFound("catalog '$catalog'") }
+        }
+
+        fun allocatedId(offset: Int): String = "(SELECT next_file_id - $totalFiles + $offset FROM meta WHERE id = 1)"
+
+        // 5. Appends: file rows with server-assigned row lineage.
+        val appendedIdByIndex = mutableMapOf<Int, String>()
+        plannedAppends.forEachIndexed { i, p ->
+            val idSql = allocatedId(i)
+            appendedIdByIndex[i] = idSql
+            val statsJson = p.sanitizedStats?.let { store.json.writeValueAsString(it) }
+            tx.add(
+                "INSERT INTO files(id, table_id, path, record_count, file_size_bytes, footer_size, " +
+                    "row_id_start, spec_id, partition_values_json, stats_state, stats_json, " +
+                    "split_offsets_json, begin_snapshot) " +
+                    "VALUES ($idSql, ?, ?, ?, ?, ?, " +
+                    "(SELECT next_row_id FROM tables WHERE id = ?) + ${p.rowOffset}, ?, ?, ?, ?, ?, " +
+                    "${HogliteSchema.HEAD_SQL})",
+                p.table.tableId,
+                p.file.path,
+                p.file.recordCount,
+                p.file.fileSizeBytes,
+                p.file.footerSize,
+                p.table.tableId,
+                p.specId,
+                p.file.partitionValues?.let { store.json.writeValueAsString(it) },
+                if (p.sanitizedStats == null) "pending" else "provided",
+                statsJson,
+                p.file.splitOffsets?.let { offs -> store.json.writeValueAsString(offs) },
+            )
+        }
+        // Row lineage advances once per appended table.
+        for (append in appends) {
+            val table = resolved.getValue("${append.namespace}.${append.table}")
+            val rows = append.files.sumOf { it.recordCount }
+            if (rows > 0) {
+                tx.add(
+                    "UPDATE tables SET next_row_id = next_row_id + $rows WHERE id = ?",
+                    table.tableId,
+                )
+            }
+            val bytes = append.files.sumOf { it.fileSizeBytes }
+            tx.add(
+                "INSERT INTO table_totals(table_id, record_count, file_count, file_size_bytes) VALUES (?, ?, ?, ?) " +
+                    "ON CONFLICT(table_id) DO UPDATE SET " +
+                    "record_count = table_totals.record_count + excluded.record_count, " +
+                    "file_count = table_totals.file_count + excluded.file_count, " +
+                    "file_size_bytes = table_totals.file_size_bytes + excluded.file_size_bytes",
+                table.tableId,
+                rows,
+                append.files.size.toLong(),
+                bytes,
+            )
+        }
+
+        // 6. Deletes: history-preserving epoch writes. The live-epoch
+        // invariant is a POSTCONDITION of each durable supersession.
+        plannedDeletes.forEachIndexed { i, p ->
+            if (p.refusal != null) return@forEachIndexed
+            val idSql = allocatedId(plannedAppends.size + i)
+            val dv = p.registration
+            val qname = "${p.table.namespace}.${p.table.name}"
+            if (p.stagedTarget != null) {
+                tx.add(
+                    "INSERT INTO dvs(data_file_id, table_id, delete_file_id, path, delete_count, " +
+                        "file_size_bytes, begin_snapshot, epoch) " +
+                        "VALUES (${appendedIdByIndex.getValue(p.stagedTarget)}, ?, $idSql, ?, ?, ?, " +
+                        "${HogliteSchema.HEAD_SQL}, 1)",
+                    p.table.tableId,
+                    dv.path,
+                    dv.deleteCount,
+                    dv.fileSizeBytes,
+                )
+            } else {
+                val target = dv.dataFileId
                 // Supersession ends the live predecessor atomically
                 // (Postgres's ended_dvs): exactly one DV per data file is
                 // live at any head, which compaction's candidate join and
@@ -874,17 +896,6 @@ internal object HogliteCommit {
                             "the one-live-epoch invariant (a store bug; rolled back cleanly)",
                     )
                 }
-            }
-        }
-
-        // 6a. The DV object-prefix refusal, after every per-target guard
-        // above (CommitService throws it after its planDeletes loop, for
-        // the first table with violations).
-        dvViolations.entries.firstOrNull()?.let { (tableId, violations) ->
-            val table = resolved.values.first { it.tableId == tableId }
-            val layout = layouts.getValue(tableId)!!
-            tx.expectZero("SELECT ?", violations.size.toLong()) {
-                ObjectPrefixRules.violation(table.namespace, table.name, meta.dataPath, layout, violations)
             }
         }
 
@@ -992,7 +1003,7 @@ internal object HogliteCommit {
         val namespace: String,
         val table: String,
     ) {
-        var expectedUuid: UUID? = null
+        val expectedUuids = linkedSetOf<UUID>()
         var appends: Boolean = false
         var deletes: Boolean = false
     }
@@ -1009,8 +1020,10 @@ internal object HogliteCommit {
     private class PlannedDelete(
         val table: HogliteCatalogStore.TableRow,
         val registration: DeleteFileRegistration,
-        /** Index into the commit's planned appends for a data_file_path reference; null for a durable target. */
+        /** Exact-one append index, or null for a durable or unresolved target. */
         val stagedTarget: Int?,
+        /** An ambiguous staged target refuses at this slot, never by selecting an append. */
+        val refusal: HoglakeException.Validation? = null,
     )
 
     /** A durable DV target's own spec fields and partition values, as the prefix check reads them. */

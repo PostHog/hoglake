@@ -3,6 +3,7 @@ package com.posthog.hoglake.hoglite
 import com.posthog.hoglake.model.AlterOp
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnDef
+import com.posthog.hoglake.model.ColumnStats
 import com.posthog.hoglake.model.CommitRequest
 import com.posthog.hoglake.model.DeleteFileRegistration
 import com.posthog.hoglake.model.FileRegistration
@@ -554,6 +555,286 @@ class HogliteGuardRaceTest {
         assertThat(plan.files.map { it.dataFileId }).containsExactly(file.dataFileId)
         assertThat(plan.deleteFiles.map { it.path }).containsExactly("s3://hoglake-it/$c/data/original.puffin")
         assertThat(head(c)).isGreaterThan(to)
+    }
+
+    @Test
+    fun `a schema fence replan reports DDL before dropped stats or stale partition values`() {
+        for (partition in listOf(false, true)) {
+            val (c, _) = setup()
+            if (!partition) {
+                store.alters.alterTable(c, "ns", "t", listOf(AlterOp.AddColumn(ColumnDef("extra", ColType.LONG))))
+            }
+            val read = head(c)
+            val file =
+                FileRegistration(
+                    "s3://hoglake-it/$c/fenced.parquet",
+                    10,
+                    100,
+                    50,
+                    columnStats = if (partition) null else listOf(ColumnStats(2, 10, 0, null, null, null, null)),
+                )
+            val key = UUID.randomUUID()
+            val beforeFileId = n(c, "SELECT next_file_id FROM meta")
+            val hook =
+                Hook({ m, p, b -> isTx(m, p, b) && "INSERT INTO files" in b && file.path in b }, before = {
+                    val op =
+                        if (partition) {
+                            AlterOp.SetPartitionSpec(listOf(PartitionFieldDef(1, Transform.IDENTITY)))
+                        } else {
+                            AlterOp.DropColumn("extra")
+                        }
+                    store.alters.alterTable(c, "ns", "t", listOf(op))
+                })
+            hooks += hook
+            seen.clear()
+            val error =
+                runCatching {
+                    pstore.commit(
+                        c,
+                        CommitRequest(
+                            readSnapshot = read,
+                            idempotencyKey = key,
+                            appends = listOf(TableAppend("ns", "t", listOf(file))),
+                        ),
+                    )
+                }.exceptionOrNull()
+            assertThat(hook.remaining).isZero()
+            assertThat(error).isExactlyInstanceOf(HoglakeException.DdlSinceReadSnapshot::class.java)
+            assertThat((error as HoglakeException.DdlSinceReadSnapshot).tables).containsExactly("ns.t")
+            assertThat(error.readSnapshot).isEqualTo(read)
+            assertThat(seen.count { isWriteTxLine(it, "fenced.parquet") }).isEqualTo(1)
+            assertThat(seen.count { isReadBatch(it) && key.toString() in it && "FROM receipts" in it }).isEqualTo(2)
+            assertThat(head(c)).isEqualTo(read + 1)
+            assertThat(n(c, "SELECT next_file_id FROM meta")).isEqualTo(beforeFileId)
+            assertThat(n(c, "SELECT next_row_id FROM tables WHERE dropped_snapshot IS NULL")).isZero()
+            assertThat(n(c, "SELECT COUNT(*) FROM receipts WHERE idempotency_key = ?", key.toString())).isZero()
+            assertThat(store.listFiles(c, "ns", "t")).isEmpty()
+        }
+    }
+
+    @Test
+    fun `duplicate paths roll back when a claim changes or a claimed removal appears after planning`() {
+        for (mode in listOf("abandon", "owner", "removal")) {
+            val (c, _) = setup()
+            val owner = UUID.randomUUID()
+            val claim = store.uploads.claim(c, UUID.randomUUID(), owner, "s3://hoglake-it/$c/up", "data")
+            val file = FileRegistration(claim.path, 10, 100, 50)
+            val beforeHead = head(c)
+            val beforeFileId = n(c, "SELECT next_file_id FROM meta")
+            val hook =
+                Hook({ m, p, b -> isTx(m, p, b) && "INSERT INTO files" in b && claim.path in b }, before = {
+                    if (mode == "removal") {
+                        store.catalogOperation(c) {
+                            store.runTx(
+                                c,
+                                HogliteCatalogStore.freshTxid("removal"),
+                                null,
+                                HogliteTx().apply {
+                                    add(
+                                        "INSERT INTO removals(path,file_kind,reason,queued_snapshot,queued_at," +
+                                            "claimed_at,claimed_by) " +
+                                            "VALUES (?,'data','snapshot_expiry',0,'2026-11-03','2026-11-03','worker')",
+                                        claim.path,
+                                    )
+                                },
+                            )
+                        }
+                    } else if (mode == "owner") {
+                        store.catalogOperation(c) {
+                            store.runTx(
+                                c,
+                                HogliteCatalogStore.freshTxid("owner"),
+                                null,
+                                HogliteTx().apply {
+                                    add(
+                                        "UPDATE uploads SET owner = ? WHERE path = ?",
+                                        UUID.randomUUID().toString(),
+                                        claim.path,
+                                    )
+                                },
+                            )
+                        }
+                    } else {
+                        store.uploads.abandon(c, owner, listOf(claim.path))
+                    }
+                })
+            hooks += hook
+            val error =
+                runCatching {
+                    pstore.commit(
+                        c,
+                        CommitRequest(
+                            idempotencyKey = owner,
+                            appends = listOf(TableAppend("ns", "t", listOf(file, file))),
+                        ),
+                    )
+                }.exceptionOrNull()
+            assertThat(hook.remaining).isZero()
+            assertThat(error).isExactlyInstanceOf(HoglakeException.CommitConflict::class.java)
+            assertThat(head(c)).isEqualTo(beforeHead)
+            assertThat(n(c, "SELECT next_file_id FROM meta")).isEqualTo(beforeFileId)
+            assertThat(n(c, "SELECT next_row_id FROM tables WHERE dropped_snapshot IS NULL")).isZero()
+            assertThat(n(c, "SELECT COUNT(*) FROM files")).isZero()
+            assertThat(n(c, "SELECT COUNT(*) FROM receipts")).isZero()
+            assertThat(
+                q(c, "SELECT state FROM uploads WHERE path = ?", claim.path).firstRow()!![0],
+            ).isEqualTo(if (mode == "abandon") "abandoned" else "active")
+        }
+    }
+
+    @Test
+    fun `ambiguous targets execute removal protection before refusing without allocations`() {
+        for (kind in listOf("none", "data", "delete")) {
+            val (c, table) = setup()
+            val owner = UUID.randomUUID()
+            val claim = store.uploads.claim(c, UUID.randomUUID(), owner, "s3://hoglake-it/$c/up", "data")
+            val file = FileRegistration(claim.path, 10, 100, 50)
+            val dvPath = "s3://hoglake-it/$c/ambiguous.dv"
+            val beforeHead = head(c)
+            val beforeFileId = n(c, "SELECT next_file_id FROM meta")
+            val hook =
+                Hook({ m, p, b -> isTx(m, p, b) && "INSERT INTO files" in b && claim.path in b }, before = {
+                    if (kind != "none") {
+                        val path = if (kind == "data") claim.path else dvPath
+                        store.catalogOperation(c) {
+                            store.runTx(
+                                c,
+                                HogliteCatalogStore.freshTxid("queued"),
+                                null,
+                                HogliteTx().apply {
+                                    add(
+                                        "INSERT INTO removals(path,file_kind,reason,queued_snapshot,queued_at," +
+                                            "claimed_at,claimed_by) VALUES (?,?,'snapshot_expiry',0," +
+                                            "'2026-11-03','2026-11-03','worker')",
+                                        path,
+                                        kind,
+                                    )
+                                },
+                            )
+                        }
+                    }
+                })
+            hooks += hook
+            seen.clear()
+            val error =
+                runCatching {
+                    pstore.commit(
+                        c,
+                        CommitRequest(
+                            idempotencyKey = owner,
+                            readSnapshot = beforeHead,
+                            allowPendingDeletes = true,
+                            requireUnchangedTables = true,
+                            appends = listOf(TableAppend("ns", "t", listOf(file, file), table.tableUuid)),
+                            deletes =
+                                listOf(
+                                    TableDeletes(
+                                        "ns",
+                                        "t",
+                                        listOf(
+                                            DeleteFileRegistration(
+                                                0,
+                                                dvPath,
+                                                1,
+                                                10,
+                                                dataFilePath = claim.path,
+                                            ),
+                                        ),
+                                        table.tableUuid,
+                                    ),
+                                ),
+                        ),
+                    )
+                }.exceptionOrNull()
+            assertThat(hook.remaining).isZero()
+            assertThat(seen.count { isWriteTxLine(it, claim.path) }).isEqualTo(1)
+            val attempt = seen.single { isWriteTxLine(it, claim.path) }
+            val removalGuard = attempt.indexOf("FROM removals")
+            val targetGuard = attempt.indexOf("SELECT 1")
+            val allocation = attempt.indexOf("UPDATE meta SET next_snapshot")
+            assertThat(removalGuard).isGreaterThanOrEqualTo(0)
+            assertThat(targetGuard).isGreaterThan(removalGuard)
+            assertThat(allocation).isGreaterThan(targetGuard)
+            if (kind == "none") {
+                assertThat(error).isExactlyInstanceOf(HoglakeException.Validation::class.java)
+                    .hasMessage("pending delete must target exactly one same-table append in this commit")
+            } else {
+                assertThat(error).isExactlyInstanceOf(HoglakeException.CommitConflict::class.java)
+                    .hasMessage("a file path in this commit is queued for removal; claim a fresh path and retry")
+            }
+            assertThat(head(c)).isEqualTo(beforeHead)
+            assertThat(n(c, "SELECT next_file_id FROM meta")).isEqualTo(beforeFileId)
+            assertThat(n(c, "SELECT next_row_id FROM tables WHERE dropped_snapshot IS NULL")).isZero()
+            assertThat(n(c, "SELECT COUNT(*) FROM files")).isZero()
+            assertThat(n(c, "SELECT COUNT(*) FROM dvs")).isZero()
+            assertThat(n(c, "SELECT COUNT(*) FROM receipts")).isZero()
+            assertThat(q(c, "SELECT state FROM uploads WHERE path = ?", claim.path).firstRow()!![0]).isEqualTo("active")
+        }
+    }
+
+    @Test
+    fun `duplicate staged targets refuse before a publication transaction`() {
+        val (c, table) = setup()
+        val path = "s3://hoglake-it/$c/duplicate-target"
+        val file = FileRegistration(path, 10, 100, 50)
+        val dv = DeleteFileRegistration(0, "$path.dv", 1, 10, dataFilePath = path)
+        val before = head(c)
+        seen.clear()
+        assertThatThrownBy {
+            pstore.commit(
+                c,
+                CommitRequest(
+                    idempotencyKey = UUID.randomUUID(),
+                    readSnapshot = before,
+                    allowPendingDeletes = true,
+                    requireUnchangedTables = true,
+                    appends = listOf(TableAppend("ns", "t", listOf(file), table.tableUuid)),
+                    deletes =
+                        listOf(
+                            TableDeletes("ns", "t", listOf(dv, dv.copy(path = "$path.second.dv")), table.tableUuid),
+                        ),
+                ),
+            )
+        }.isExactlyInstanceOf(HoglakeException.Validation::class.java)
+            .hasMessage("the staged file $path has two deletion vectors in one commit")
+        assertThat(seen.count { isWriteTxLine(it, path) }).isZero()
+        assertThat(head(c)).isEqualTo(before)
+        assertThat(n(c, "SELECT next_file_id FROM meta")).isEqualTo(1)
+        assertThat(n(c, "SELECT COUNT(*) FROM files")).isZero()
+        assertThat(n(c, "SELECT COUNT(*) FROM receipts")).isZero()
+    }
+
+    @Test
+    fun `merged equal UUID expectations keep the transactional incarnation guard`() {
+        val (c, table) = setup()
+        val req = appendReq(c, "merged-uuid.parquet", expected = table.tableUuid)
+        val hook =
+            Hook({ m, p, b -> isTx(m, p, b) && "merged-uuid.parquet" in b }, before = {
+                store.dropTable(c, "ns", "t", table.tableUuid, "test", "drop")
+                store.createTable(c, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+            })
+        hooks += hook
+        val error =
+            runCatching {
+                pstore.commit(
+                    c,
+                    req.copy(
+                        appends =
+                            req.appends +
+                                req.appends.map {
+                                    val file = it.files.single()
+                                    it.copy(files = listOf(file.copy(path = file.path + ".second")))
+                                },
+                    ),
+                )
+            }.exceptionOrNull()
+        assertThat(hook.remaining).isZero()
+        assertThat(error).isExactlyInstanceOf(HoglakeException.TableRecreated::class.java)
+        assertThat((error as HoglakeException.TableRecreated).expectedTableUuid).isEqualTo(table.tableUuid)
+        assertThat(error.table).isEqualTo("ns.t")
+        assertThat(store.listFiles(c, "ns", "t")).isEmpty()
+        assertThat(n(c, "SELECT COUNT(*) FROM receipts")).isZero()
+        assertThat(n(c, "SELECT next_file_id FROM meta")).isEqualTo(1)
     }
 
     // ---- commit: the per-table schema fence ----------------------------

@@ -1800,6 +1800,150 @@ class HogliteBackendIntegrationTest {
     }
 
     @Test
+    fun `commit routes report stale schemas and conflicting UUIDs with exact reprepare details`() {
+        val cfg =
+            com.posthog.hoglake.Config(
+                database = com.posthog.hoglake.DatabaseBackend.HOGLITE,
+                hogliteUrl = "http://127.0.0.1:1",
+                s3Endpoint = "http://127.0.0.1:${minio.firstMappedPort}",
+                s3Region = "us-east-1", s3AccessKey = minio.userName, s3SecretKey = minio.password, s3PathStyle = true,
+                hydratorIntervalMs = 0,
+                expiryIntervalMs = 0,
+                cleanupIntervalMs = 0,
+                compactionIntervalMs = 0,
+                retirementIntervalMs = 0,
+            )
+        val app = App.buildHoglite(cfg, store, HealthProbe.forProbe(1_000) { client.reachable() })
+        val cat = freshCatalog()
+        store.createNamespace(cat, "ns")
+        val table =
+            store.createTable(
+                cat,
+                "ns",
+                "t",
+                listOf(ColumnDef("id", ColType.LONG), ColumnDef("extra", ColType.LONG)),
+            )
+        val read = table.readSnapshotId
+        store.alters.alterTable(cat, "ns", "t", listOf(com.posthog.hoglake.model.AlterOp.DropColumn("extra")))
+        val before = store.getCatalog(cat).headSnapshotId
+        val mapper = jacksonObjectMapper()
+        testApplication {
+            application { app.module(this) }
+            val stale =
+                client.post("/v1/catalogs/$cat/commit") {
+                    contentType(ContentType.Application.Json)
+                    setBody(
+                        """
+                        {"read_snapshot":"$read","idempotency_key":"${UUID.randomUUID()}",
+                        "appends":[{"namespace":"ns","table":"t",
+                        "files":[{"path":"s3://hoglake-it/$cat/stale",
+                        "record_count":"10","file_size_bytes":"100","footer_size":"50",
+                        "column_stats":[{"field_id":"2","value_count":"10","null_count":"0"}]}]}]}
+                        """.trimIndent(),
+                    )
+                }
+            assertThat(stale.status).isEqualTo(HttpStatusCode.Conflict)
+            val ddl = mapper.readTree(stale.bodyAsText())
+            assertThat(ddl["error"].asText()).isEqualTo("ddl_since_read_snapshot")
+            assertThat(ddl["retry"].asText()).isEqualTo("re-prepare")
+            assertThat(ddl["tables"].map { it.asText() }).containsExactly("ns.t")
+            assertThat(ddl["read_snapshot"].asLong()).isEqualTo(read)
+            for (reverse in listOf(false, true)) {
+                val old = UUID.randomUUID()
+                val expectations = if (reverse) listOf(old, table.tableUuid) else listOf(table.tableUuid, old)
+                val groups =
+                    expectations.mapIndexed { i, uuid ->
+                        mapOf(
+                            "namespace" to "ns",
+                            "table" to "t",
+                            "expected_table_uuid" to uuid.toString(),
+                            "files" to
+                                listOf(
+                                    mapOf(
+                                        "path" to "s3://hoglake-it/$cat/u$i",
+                                        "record_count" to "10",
+                                        "file_size_bytes" to "100",
+                                        "footer_size" to "50",
+                                    ),
+                                ),
+                        )
+                    }
+                val response =
+                    client.post("/v1/catalogs/$cat/commit") {
+                        contentType(ContentType.Application.Json)
+                        setBody(
+                            mapper.writeValueAsString(
+                                mapOf("idempotency_key" to UUID.randomUUID().toString(), "appends" to groups),
+                            ),
+                        )
+                    }
+                assertThat(response.status).isEqualTo(HttpStatusCode.Conflict)
+                val error = mapper.readTree(response.bodyAsText())
+                assertThat(error["error"].asText()).isEqualTo("table_recreated")
+                assertThat(error["retry"].asText()).isEqualTo("re-prepare")
+                assertThat(error["tables"].map { it.asText() }).containsExactly("ns.t")
+                assertThat(
+                    error["detail"].asText(),
+                ).isEqualTo(
+                    "table 'ns.t' no longer has the expected UUID: it was recreated; re-read it before retrying",
+                )
+            }
+        }
+        assertThat(store.getCatalog(cat).headSnapshotId).isEqualTo(before)
+        assertThat(store.listFiles(cat, "ns", "t")).isEmpty()
+        assertThat(
+            store.catalogOperation(cat) {
+                store.queryCatalog(cat, "SELECT COUNT(*) FROM receipts").firstRow()!![0].asLong()
+            },
+        ).isZero()
+    }
+
+    @Test
+    fun `transaction route refuses ambiguous staged references without publishing duplicates`() {
+        val cfg =
+            com.posthog.hoglake.Config(
+                database = com.posthog.hoglake.DatabaseBackend.HOGLITE, hogliteUrl = "http://127.0.0.1:1",
+                s3Endpoint = "http://127.0.0.1:${minio.firstMappedPort}", s3Region = "us-east-1",
+                s3AccessKey = minio.userName, s3SecretKey = minio.password, s3PathStyle = true,
+                hydratorIntervalMs = 0,
+                expiryIntervalMs = 0,
+                cleanupIntervalMs = 0,
+                compactionIntervalMs = 0,
+                retirementIntervalMs = 0,
+            )
+        val app = App.buildHoglite(cfg, store, HealthProbe.forProbe(1_000) { client.reachable() })
+        val cat = freshCatalog()
+        store.createNamespace(cat, "ns")
+        val table = store.createTable(cat, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        val path = "s3://hoglake-it/$cat/staged"
+        val f = """{"path":"$path","record_count":"10","file_size_bytes":"100","footer_size":"50"}"""
+        testApplication {
+            application { app.module(this) }
+            val response =
+                client.post("/v1/catalogs/$cat/commit/transaction") {
+                    contentType(ContentType.Application.Json)
+                    setBody(
+                        """
+                        {"read_snapshot":"${table.readSnapshotId}","idempotency_key":"${UUID.randomUUID()}",
+                        "appends":[{"namespace":"ns","table":"t","expected_table_uuid":"${table.tableUuid}",
+                        "files":[$f,$f]}],
+                        "deletes":[{"namespace":"ns","table":"t","expected_table_uuid":"${table.tableUuid}",
+                        "files":[{"data_file_id":"0","data_file_path":"$path","path":"$path.dv","delete_count":"1","file_size_bytes":"10"}]}]}
+                        """.trimIndent(),
+                    )
+                }
+            assertThat(response.status).isEqualTo(HttpStatusCode.UnprocessableEntity)
+            val error = jacksonObjectMapper().readTree(response.bodyAsText())
+            assertThat(error["error"].asText()).isEqualTo("validation")
+            assertThat(
+                error["detail"].asText(),
+            ).isEqualTo("pending delete must target exactly one same-table append in this commit")
+        }
+        assertThat(store.getCatalog(cat).headSnapshotId).isEqualTo(table.readSnapshotId)
+        assertThat(store.listFiles(cat, "ns", "t")).isEmpty()
+    }
+
+    @Test
     fun `the v1 routes serve the hoglite backend`() {
         val cfg =
             com.posthog.hoglake.Config(

@@ -39,7 +39,9 @@ import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.TestInstance
 import org.junit.jupiter.params.ParameterizedTest
+import org.junit.jupiter.params.provider.Arguments
 import org.junit.jupiter.params.provider.EnumSource
+import org.junit.jupiter.params.provider.MethodSource
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.file.Files
@@ -1203,6 +1205,102 @@ class HogliteBackendConformanceIntegrationTest {
         assertThat(store.getTable(cat, "ns", "t", snapshot = head).recordCount).isEqualTo(4)
         assertThat(store.getTable(cat, "ns", "t", snapshot = before).fileCount).isEqualTo(2)
         assertThat(compact(cat).groupsCompacted).isZero()
+    }
+
+    private fun orderedDeleteCases() =
+        Backend.entries.flatMap { backend ->
+            listOf("retired", "output", "overcount").flatMap { kind ->
+                listOf(Arguments.of(backend, kind, true), Arguments.of(backend, kind, false))
+            }
+        }.stream()
+
+    private fun publicationState(cat: String): List<Long> =
+        when (selected) {
+            Backend.POSTGRES ->
+                pg!!.jdbi.withHandle<List<Long>, Exception> { h ->
+                    h.createQuery(
+                        "SELECT last_snapshot_id,next_file_id," +
+                            "(SELECT COALESCE(SUM(next_row_id),0) FROM hog_table_stats WHERE catalog_id = :id)," +
+                            "(SELECT COUNT(*) FROM hog_data_file WHERE catalog_id = :id)," +
+                            "(SELECT COUNT(*) FROM hog_delete_file WHERE catalog_id = :id)," +
+                            "(SELECT COUNT(*) FROM hog_commit_receipt WHERE catalog_id = :id) " +
+                            "FROM hog_catalog WHERE catalog_id = :id",
+                    ).bind("id", store.getCatalog(cat).catalogId).map { rs, _ -> (1..6).map { rs.getLong(it) } }.one()
+                }
+            Backend.HOGLITE ->
+                engine().store.catalogOperation(cat) {
+                    engine().store.queryCatalog(
+                        cat,
+                        "SELECT next_snapshot - 1,next_file_id,(SELECT COALESCE(SUM(next_row_id),0) FROM tables)," +
+                            "(SELECT COUNT(*) FROM files),(SELECT COUNT(*) FROM dvs)," +
+                            "(SELECT COUNT(*) FROM receipts) FROM meta",
+                    ).firstRow()!!.map { it.asLong() }
+                }
+        }
+
+    @ParameterizedTest(name = "{0} {1} durable-first={2}")
+    @MethodSource("orderedDeleteCases")
+    fun `ordered deletion validation distinguishes compacted inputs from ambiguous staged targets`(
+        backend: Backend,
+        kind: String,
+        durableFirst: Boolean,
+    ) {
+        select(backend)
+        val cat = freshCatalog()
+        store.createNamespace(cat, "ns")
+        val table = store.createTable(cat, "ns", "t", columns)
+        for (i in 1..2) {
+            val (path, size) = putParquet(cat, "s3://hoglake-it/$cat/data/$i.parquet", i.toLong())
+            store.commit(
+                cat,
+                CommitRequest(appends = listOf(TableAppend("ns", "t", listOf(FileRegistration(path, 2, size))))),
+            )
+        }
+        val read = store.getCatalog(cat).headSnapshotId
+        val inputs = store.listFiles(cat, "ns", "t")
+        hydrate()
+        val compacted = compact(cat)
+        assertThat(compacted.groupsCompacted).isEqualTo(1)
+        assertThat(compacted.filesIn).isEqualTo(2)
+        assertThat(compacted.filesOut).isEqualTo(1)
+        assertThat(store.listFiles(cat, "ns", "t").single().dataFileId).isNotIn(inputs.map { it.dataFileId })
+        assertThat(store.listFiles(cat, "ns", "t", snapshot = read).map { it.dataFileId })
+            .containsExactlyInAnyOrderElementsOf(inputs.map { it.dataFileId })
+        val path = "s3://hoglake-it/$cat/data/ambiguous.parquet"
+        val file = FileRegistration(path, 2, 100, 50)
+        val target = if (kind == "retired") inputs.first() else store.listFiles(cat, "ns", "t").single()
+        val count = if (kind == "overcount") target.recordCount + 1 else 1L
+        val requestRead = if (kind == "overcount") store.getCatalog(cat).headSnapshotId else read
+        val durable = DeleteFileRegistration(target.dataFileId, "$path.durable.dv", count, 10)
+        val pending = DeleteFileRegistration(0, "$path.pending.dv", 1, 10, dataFilePath = path)
+        val registrations = if (durableFirst) listOf(durable, pending) else listOf(pending, durable)
+        val req =
+            CommitRequest(
+                idempotencyKey = UUID.randomUUID(),
+                readSnapshot = requestRead,
+                requireUnchangedTables = true,
+                allowPendingDeletes = true,
+                appends = listOf(TableAppend("ns", "t", listOf(file, file), table.tableUuid)),
+                deletes = registrations.map { TableDeletes("ns", "t", listOf(it), table.tableUuid) },
+            )
+        val before = publicationState(cat)
+        val filesBefore = store.listFiles(cat, "ns", "t")
+        val error = runCatching { store.commit(cat, req) }.exceptionOrNull()
+        if (durableFirst) {
+            if (kind == "overcount") {
+                assertThat(error).isExactlyInstanceOf(HoglakeException.Validation::class.java)
+                    .hasMessageContaining("delete_count $count exceeds record_count")
+                    .hasMessageContaining("data_file_id ${target.dataFileId}")
+            } else {
+                assertThat(error).isExactlyInstanceOf(HoglakeException.CommitConflict::class.java)
+                    .hasMessageContaining("data_file_id ${target.dataFileId}")
+            }
+        } else {
+            assertThat(error).isExactlyInstanceOf(HoglakeException.Validation::class.java)
+                .hasMessage("pending delete must target exactly one same-table append in this commit")
+        }
+        assertThat(publicationState(cat)).isEqualTo(before)
+        assertThat(store.listFiles(cat, "ns", "t")).isEqualTo(filesBefore)
     }
 
     @ParameterizedTest(name = "{0}")
