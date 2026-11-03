@@ -154,7 +154,7 @@ data class Config(
     val s3Region: String = env("HOGLAKE_S3_REGION", "us-east-1"),
     val s3AccessKey: String = env("HOGLAKE_S3_ACCESS_KEY", ""),
     val s3SecretKey: String = env("HOGLAKE_S3_SECRET_KEY", ""),
-    val s3PathStyle: Boolean = env("HOGLAKE_S3_PATH_STYLE", "true").toBoolean(),
+    val s3PathStyle: Boolean = boolEnv("HOGLAKE_S3_PATH_STYLE", true),
     /**
      * Authentication at the HTTP boundary (docs/auth-tenancy.md):
      * `off` | `warn` | `enforce` (§11).
