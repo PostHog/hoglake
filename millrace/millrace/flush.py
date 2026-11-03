@@ -238,13 +238,9 @@ class FlushStats:
     variant_values: Mapping[tuple[str, str, str], int] = dataclass_field(
         default_factory=dict
     )
-    #: Their encodes the Rust codec's result was not used for, by
-    #: ``(reason,)`` (``VariantReport.codec_fallbacks``). Transitional, as
-    #: the two below are.
-    variant_codec_fallbacks: Mapping[tuple[str], int] = dataclass_field(
-        default_factory=dict
-    )
-    #: Their invalid rows past a JSON parser's recursion bound.
+    #: Their invalid rows past a JSON parser's recursion bound. Transitional,
+    #: as the one below is; the Rust codec's fallbacks are pyhoglake's, per
+    #: process (a build that raises after one counts too).
     variant_recursion_bound_rows: int = 0
     #: Seconds the shadow (``PYHOGLAKE_VARIANT_SHADOW``) encoded them again.
     variant_shadow_seconds: float = 0.0
@@ -1647,7 +1643,6 @@ class HoglakeFlusher:
         self._variant_rows: Counter[tuple[str, str]] = Counter()
         self._variant_invalid: Counter[tuple[str, str]] = Counter()
         self._variant_values: Counter[tuple[str, str, str]] = Counter()
-        self._variant_codec_fallbacks: Counter[tuple[str]] = Counter()
         self._variant_recursion_bound_rows = 0
         self._variant_shadow_seconds = 0.0
 
@@ -1700,7 +1695,6 @@ class HoglakeFlusher:
             variant_rows=dict(self._variant_rows),
             variant_invalid=dict(self._variant_invalid),
             variant_values=dict(self._variant_values),
-            variant_codec_fallbacks=dict(self._variant_codec_fallbacks),
             variant_recursion_bound_rows=self._variant_recursion_bound_rows,
             variant_shadow_seconds=self._variant_shadow_seconds,
         )
@@ -2209,8 +2203,6 @@ class HoglakeFlusher:
         ):
             for (_, path), count in counts.items():
                 self._variant_values[(column, path, outcome)] += count
-        for reason, count in report.codec_fallbacks.items():
-            self._variant_codec_fallbacks[(reason,)] += count
         self._variant_recursion_bound_rows += report.recursion_bound_rows
         self._variant_shadow_seconds += report.shadow_seconds
 

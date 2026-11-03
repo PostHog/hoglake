@@ -45,7 +45,9 @@ fn the_vectors_read_as_arrow_rs_reads_them() {
             (std::fs::read(path.with_extension("metadata")).unwrap(), std::fs::read(&path).unwrap());
         let ours = unshredded(&metadata, &value, &mode(true, false)).unwrap();
         let theirs = Variant::try_new(&metadata, &value).unwrap();
-        assert!(oracle::same_value(&ours, &theirs), "{}: {ours:?} vs {theirs:?}", path.display());
+        // The vector's name only: CodeQL reads a decoded value in the
+        // message (a UUID) as one logged in the clear (alert 132).
+        assert!(oracle::same_value(&ours, &theirs), "{} reads otherwise in arrow-rs", path.display());
         read += 1;
     }
     assert_eq!(read, 29);

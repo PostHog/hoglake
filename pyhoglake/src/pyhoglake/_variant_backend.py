@@ -22,9 +22,14 @@ slot of the storage (``shadow_mismatch``), Python's result is used.
 ``verify`` and ``structure_fault`` read storage through the same switch,
 and until N6b removes the Python codec, Python reads it as well: where the
 two verdicts differ either way (``mismatch``), or Rust panics (``panic``),
-Python's stands, logged and counted in ``DECODE_FALLBACKS``, apart from
-encode's, since a read has no report. ``to_python`` stays Python until Rust
-builds its objects (N5b).
+Python's stands, logged and counted in ``DECODE_FALLBACKS``, since a
+read has no report. ``to_python`` stays Python until Rust builds its
+objects (N5b).
+
+Each process counts as well, for millrace: encode fallbacks, a call that
+raises after one included (``ENCODE_FALLBACKS``); the calls and rows the
+shadow compared (``SHADOWED``); and calls ``auto`` sent to Python, by op
+and why (``ROUTED``).
 """
 
 from __future__ import annotations
@@ -130,16 +135,17 @@ def encode(
 
     chosen = backend or MODE
     module, why = native() if chosen != "python" else (None, "")
-    chunks = None
+    chunks, skipped = None, "unavailable"
     if module is not None:
         native_plan, paths, why = _plan(module, plan)
+        skipped = "plan"
         if not json_text:
-            why = "it encodes JSON text only, so far"
+            why, skipped = "it encodes JSON text only, so far", "not_json"
         elif not why and isinstance(values, (pa.Array, pa.ChunkedArray)):
             chunks = _binary_chunks(values)
         elif not why:
             values = list(values)
-            why = "a row is not UTF-8 text"
+            why, skipped = "a row is not UTF-8 text", "not_utf8"
             if all(type(v) in (str, bytes) or v is None for v in values):
                 with suppress(UnicodeEncodeError):  # a str with a lone surrogate
                     chunks = [pa.array(values, pa.binary())]
@@ -156,6 +162,8 @@ def encode(
     if module is None or chunks is None:
         if chosen == "native":
             raise RuntimeError(f"{ENV}=native, but {why}")
+        if chosen == "auto":
+            _count(ROUTED, ("encode", skipped))
         return python(_json_rows(values) if json_text else values, report=report)
 
     started = time.perf_counter()
@@ -231,6 +239,9 @@ def _shadow(
         )
     )
     report.shadow_seconds += time.perf_counter() - started
+    with _COUNTING:
+        SHADOWED["calls"] += 1
+        SHADOWED["rows"] += mine.rows
     if same:
         report.merge(mine)
         return out
@@ -247,6 +258,7 @@ def _fall_back(
     message = "VARIANT codec fallback to Python: column=%s row=%s reason=%s"
     _log.warning(message, column, row, reason)
     report.codec_fallbacks[reason] = report.codec_fallbacks.get(reason, 0) + 1
+    _count(ENCODE_FALLBACKS, reason)
 
 
 def _check(
@@ -341,6 +353,8 @@ def verify(
             return
     if chosen == "native":
         raise RuntimeError(f"{ENV}=native, but {why}")
+    if chosen == "auto":
+        _count(ROUTED, ("decode", "unavailable" if module is None else "storage"))
     python(array, plan)
 
 
@@ -353,6 +367,8 @@ def structure_fault(array: pa.StructArray) -> str | None:
     if module is None and MODE == "native":
         raise RuntimeError(f"{ENV}=native, but {why}")
     if module is None:
+        if MODE == "auto":
+            _count(ROUTED, ("decode", "unavailable"))
         return codec.structure_fault(array)
     try:
         parts = module.structure_fault(importable(array))
@@ -365,17 +381,29 @@ def structure_fault(array: pa.StructArray) -> str | None:
     return python
 
 
-#: Decode fallbacks to Python since import, by reason (``mismatch``,
-#: ``panic``), for millrace to export apart from encode's.
+#: Since import, under ``_COUNTING``, for millrace to export: encode and
+#: decode fallbacks to Python by reason (``mismatch``, ``panic``; encode's
+#: also ``type`` and ``shadow_mismatch``); calls ``auto`` sent to Python by
+#: ``(op, why)``: ``encode`` for ``unavailable`` (no matching package),
+#: ``plan``, ``not_utf8`` or, through the hook only, ``not_json``; ``decode``
+#: for ``unavailable`` or ``storage``; and the shadow's ``calls`` and
+#: ``rows`` compared.
+ENCODE_FALLBACKS: Counter[str] = Counter()
 DECODE_FALLBACKS: Counter[str] = Counter()
+ROUTED: Counter[tuple[str, str]] = Counter()
+SHADOWED: Counter[str] = Counter()
 _COUNTING = threading.Lock()
+
+
+def _count[K](counter: Counter[K], key: K) -> None:
+    with _COUNTING:
+        counter[key] += 1
 
 
 def _decode_fall_back(reason: str, row: int | None, column: str | None) -> None:
     message = "VARIANT decode fallback to Python: column=%s row=%s reason=%s"
     _log.warning(message, column, row, reason)
-    with _COUNTING:
-        DECODE_FALLBACKS[reason] += 1
+    _count(DECODE_FALLBACKS, reason)
 
 
 def importable(array: pa.Array) -> pa.Array:
