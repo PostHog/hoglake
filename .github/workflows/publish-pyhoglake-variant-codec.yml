@@ -5,8 +5,9 @@ name: Publish pyhoglake-variant-codec
 # and sdist variant-codec-wheels.yml built and tested in this same run,
 # those exact files. Trigger: push a tag named
 # pyhoglake-variant-codec-v<version> that matches the version in
-# pyhoglake-variant-codec/pyproject.toml, which must also be pyhoglake's
-# (pyhoglake takes the codec only at its own version).
+# pyhoglake-variant-codec/pyproject.toml. The codec has its own version,
+# released only when it changes; pyhoglake's `variant-codec` extra pins
+# one, and publish-pyhoglake.yml refuses a pin that is not on PyPI.
 #
 # PyPI side: the project's trusted publisher pins this repo, this
 # workflow file, and the `pypi` environment. GitHub side: the `pypi`

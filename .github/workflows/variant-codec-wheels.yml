@@ -3,7 +3,7 @@ name: Variant codec wheels
 # pyhoglake-variant-codec's wheels and sdist (design-native-encoder section 6),
 # each tested on its own platform before anything uploads it:
 # ci/variant-codec-wheel.sh installs exactly that file into pyhoglake's
-# locked env, where pyhoglake must take it (protocol and version) and
+# locked env, where pyhoglake must take it (its protocol) and
 # encode as the Python codec does, and then runs the variant suites
 # through it (not on Windows, where they have never run: their file reads
 # take the locale's encoding there). ci-python.yml calls this for the
@@ -73,15 +73,13 @@ jobs:
           cache: false
           rustflags: ""
 
-      # pyhoglake takes the codec only at its own version, so a release
-      # tags both packages at one version.
-      - name: Tag must match the package versions
+      # The codec has its own version, which pyhoglake's extra pins.
+      - name: Tag must match the package version
         if: github.ref_type == 'tag'
         run: |
           version=$(uv version --short --directory pyhoglake-variant-codec)
-          pyhoglake=$(uv version --short --directory pyhoglake)
-          if [ "$GITHUB_REF_NAME" != "pyhoglake-variant-codec-v$version" ] || [ "$version" != "$pyhoglake" ]; then
-            echo "::error::Tag $GITHUB_REF_NAME, codec $version, pyhoglake $pyhoglake: all must agree"
+          if [ "$GITHUB_REF_NAME" != "pyhoglake-variant-codec-v$version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match the codec's version $version"
             exit 1
           fi
 

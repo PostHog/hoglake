@@ -51,6 +51,21 @@ fun main() {
                 configureApiListener(cfg)
             },
         ) { app.module(this) }
+    // The public API listener (HOGLAKE_PUBLIC_PORT): every route, always
+    // under `enforce`, tenant tokens only (AuthService.forPublicListener), so
+    // an internet-facing load balancer can front it while the in-cluster
+    // callers on HOGLAKE_PORT still migrate under `warn`. Same App, same
+    // dispatcher and pools: it is a second door, not a second server.
+    val publicServer =
+        cfg.publicPort.takeIf { it > 0 }?.let { publicPort ->
+            embeddedServer(
+                Netty,
+                configure = {
+                    connector { port = publicPort }
+                    callGroupSize = cfg.nettyCallGroupSize
+                },
+            ) { app.module(this, app.auth.forPublicListener()) }
+        }
     val metricsServer =
         cfg.metricsPort.takeIf { it > 0 }?.let { metricsPort ->
             embeddedServer(Netty, configure = { connector { port = metricsPort } }) {
@@ -73,8 +88,19 @@ fun main() {
     // cancelled probe scope while the Service still routed to it.
     Runtime.getRuntime().addShutdownHook(
         Thread({
+            // The two API engines drain in parallel, so the public listener
+            // does not double the time before the pools close (the pod's
+            // grace period is 30 s).
+            val publicStop =
+                publicServer?.let { ps ->
+                    Thread({
+                        runCatching { ps.stop(SHUTDOWN_GRACE_MS, SHUTDOWN_TIMEOUT_MS) }
+                            .onFailure { log.warn(it) { "public listener shutdown failed; closing the rest anyway" } }
+                    }, "hoglake-shutdown-public").apply { start() }
+                }
             runCatching { server.stop(SHUTDOWN_GRACE_MS, SHUTDOWN_TIMEOUT_MS) }
                 .onFailure { log.warn(it) { "engine shutdown failed; closing the rest anyway" } }
+            publicStop?.join()
             runCatching { metricsServer?.stop(0, SHUTDOWN_TIMEOUT_MS) }
                 .onFailure { log.warn(it) { "metrics listener shutdown failed" } }
             background.close()
@@ -84,6 +110,10 @@ fun main() {
     metricsServer?.let {
         it.start(wait = false)
         log.info { "hoglake metrics listener on :${cfg.metricsPort}" }
+    }
+    publicServer?.let {
+        it.start(wait = false)
+        log.info { "hoglake public listener on :${cfg.publicPort} (enforce, tenant tokens only)" }
     }
     log.info { "hoglake listening on :${cfg.port}" }
     server.start(wait = true)

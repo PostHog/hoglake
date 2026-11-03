@@ -982,6 +982,32 @@ class TestObjectPrefix:
                 },
                 "no single identity field",
             ),
+            (
+                # Two identity fields on the prefix field: key_index names
+                # neither (the server's DDL refuses this spec too).
+                {
+                    "object_prefix_field": "team_id",
+                    "spec": {
+                        "spec_id": 4,
+                        "fields": [
+                            {"source_field_id": 1, "transform": "identity"},
+                            {"source_field_id": 1, "transform": "identity"},
+                        ],
+                    },
+                },
+                "no single identity field",
+            ),
+            (
+                # uint64 is Iceberg decimal(20,0), not an allowed type.
+                {
+                    "object_prefix_field": "team_id",
+                    "columns": [
+                        {**COLUMNS_WIRE[0], "type": "uint64"},
+                        *COLUMNS_WIRE[1:],
+                    ],
+                },
+                "a 'uint64'",
+            ),
         ],
     )
     def test_a_layout_the_writer_cannot_honor_is_refused(

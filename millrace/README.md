@@ -192,7 +192,13 @@ never from payload keys):
 - `millrace_variant_values_total{column, path, outcome}`, per declared
   path, outcome `typed`, `fallback` (kept in `value`: the type did not
   match) or `variant_null`. A high fallback share means the immutable
-  declaration does not fit the data.
+  declaration does not fit the data;
+- `millrace_variant_encode_seconds_total{column, backend}`, the wall
+  seconds of the column's encode calls, less `PYHOGLAKE_VARIANT_SHADOW`'s,
+  under the process's codec (`native` or `python`; calls `auto` gives
+  Python and fallbacks count under it too); every column under both
+  from 0. Seconds per encoded row: `sum by (column) (rate(…encode_seconds_total))`
+  over `sum by (column) (rate(…rows_total{outcome="encoded"}))`.
 
 They count per build, so a rebuild counts its rows again.
 

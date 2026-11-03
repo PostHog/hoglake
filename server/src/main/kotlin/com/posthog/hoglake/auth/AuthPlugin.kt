@@ -30,11 +30,39 @@ import io.ktor.util.AttributeKey
 class AuthService(
     val mode: AuthMode,
     val verifier: JwtVerifier?,
+    /**
+     * Refuse an operator token even when it verifies, as though it had not
+     * been sent. Set on the public listener only: an operator token is minted
+     * in-cluster and never handed to a party outside it, so one arriving from
+     * the internet is a leak, and the operator routes it would open
+     * (maintenance, debug, /metrics) are not a public surface.
+     */
+    val tenantOnly: Boolean = false,
 ) {
+    /**
+     * The `listener` label on hoglake_auth_requests_total: internet scanners
+     * refused on the public listener must not land in the series the enforce
+     * flip of the API port is judged by.
+     */
+    val listener: String get() = if (tenantOnly) "public" else "api"
+
     init {
         require(mode == AuthMode.OFF || verifier != null) {
             "auth mode '${mode.wire}' needs a verifier; HOGLAKE_AUTH_ISSUER plus a JWKS source are required"
         }
+    }
+
+    /**
+     * The public listener's service (HOGLAKE_PUBLIC_PORT): this verifier, under
+     * `enforce`, tenants only, whatever this instance's own mode is. Off has no
+     * verifier, and the public listener cannot run without one.
+     */
+    fun forPublicListener(): AuthService {
+        val v =
+            requireNotNull(verifier) {
+                "HOGLAKE_PUBLIC_PORT requires HOGLAKE_AUTH_MODE warn or enforce: the public listener always enforces"
+            }
+        return AuthService(AuthMode.ENFORCE, v, tenantOnly = true)
     }
 
     companion object {
@@ -250,6 +278,14 @@ val HoglakeAuth =
                     failure = HoglakeException.Unauthenticated(v.reason, "token refused")
                 }
             }
+            // The public listener: an operator token is dropped, so the request
+            // is anonymous from here on. A PUBLIC route still answers; every
+            // other one refuses it as it would any bad token.
+            if (service.tenantOnly && caller?.kind?.isOperator() == true) {
+                AuthLog.warn { "operator token presented on the public listener for ${call.request.path()}; refused" }
+                caller = null
+                failure = HoglakeException.Unauthenticated(JwtViolation.MALFORMED, "token refused")
+            }
 
             // Recorded for BOTH outcomes: an anonymous request under `warn` or
             // `enforce` must be distinguishable from a request in `off`.
@@ -268,7 +304,7 @@ val HoglakeAuth =
             if (decision is AuthDecision.Allow) {
                 // The token was still parsed, so a valid one still yields its
                 // caller and its per-tenant totals.
-                Metrics.authRequest(service.mode.wire, "ok", clientClass(call))
+                Metrics.authRequest(service.mode.wire, service.listener, "ok", clientClass(call))
                 return@onCall
             }
             // A listed path asked with an unlisted method is a 405, whatever the
@@ -282,7 +318,7 @@ val HoglakeAuth =
                     if (service.mode.isEnforcing) {
                         call.respondMethodNotAllowed(allowed)
                     } else {
-                        Metrics.authRequest(service.mode.wire, "unmapped", clientClass(call))
+                        Metrics.authRequest(service.mode.wire, service.listener, "unmapped", clientClass(call))
                     }
                     return@onCall
                 }
@@ -297,7 +333,7 @@ val HoglakeAuth =
             // Counted in BOTH modes: the warn numbers are the forecast and the
             // enforce numbers are the outcome, and a flip is judged by comparing
             // the two per client class.
-            countRefusal(service.mode, clientClass(call), caller, match, refusal)
+            countRefusal(service, clientClass(call), caller, match, refusal)
             if (service.mode.isEnforcing) {
                 call.respondRefusal(refusal)
                 return@onCall
@@ -361,7 +397,7 @@ private val CLIENT_CLASSES =
     )
 
 private fun countRefusal(
-    mode: AuthMode,
+    service: AuthService,
     client: String,
     caller: Caller?,
     match: RouteMatch?,
@@ -375,7 +411,7 @@ private fun countRefusal(
             is HoglakeException.NotFound -> "not_entitled"
             else -> "other"
         }
-    Metrics.authRequest(mode.wire, outcome, client)
+    Metrics.authRequest(service.mode.wire, service.listener, outcome, client)
     val catalog = match?.catalog ?: ""
     if (failure is HoglakeException.Forbidden) {
         Metrics.authDenial(catalog, match?.requirement?.wire() ?: "", outcome)
@@ -384,8 +420,10 @@ private fun countRefusal(
         action = "auth_refused",
         catalog = match?.catalog,
         obj = null,
-        outcome = if (mode.isEnforcing) "refused" else "warn_allowed",
-        detail = "${failure::class.simpleName}: ${failure.message} pattern=${match?.pattern}",
+        outcome = if (service.mode.isEnforcing) "refused" else "warn_allowed",
+        detail =
+            "${failure::class.simpleName}: ${failure.message} pattern=${match?.pattern} " +
+                "listener=${service.listener}",
         actor = caller?.actor,
         tenant = caller?.orgId,
     )

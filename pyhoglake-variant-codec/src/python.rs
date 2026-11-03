@@ -1,5 +1,6 @@
 //! The module `_variant_backend` imports: Arrow in and out through the C
-//! Data Interface (pyo3-arrow), the GIL released for the whole encode.
+//! Data Interface (pyo3-arrow), the GIL released for the whole encode or
+//! decode.
 
 use std::sync::Arc;
 
@@ -12,11 +13,13 @@ use pyo3::sync::PyOnceLock;
 use pyo3::types::PyBytes;
 use pyo3_arrow::{PyArray, PyDataType};
 
+use crate::decode::{Part, Step};
 use crate::encode::{self, Detail, Options};
 
-/// The calls' arguments and results `_variant_backend` expects; the version
-/// pins the semantics.
-const PROTOCOL: u32 = 2;
+/// The calls' arguments and results `_variant_backend` expects, and what
+/// they mean. pyhoglake checks this, not the package version, so bump it on
+/// any change a released pyhoglake would notice.
+const PROTOCOL: u32 = 3;
 
 /// A declaration's plan, from the write form of its storage (`Plan.write_type`):
 /// a type it does not lay out as `compile_plan` does is a ValueError.
@@ -109,11 +112,82 @@ fn detail(py: Python<'_>, detail: Detail) -> PyResult<String> {
     }
 }
 
+/// A fault's detail as `_variant_backend` spells it: text, or
+/// `(kind, argument)` for the interpreter to spell.
+fn parts(py: Python<'_>, parts: Vec<Part>) -> PyResult<Vec<Bound<'_, PyAny>>> {
+    fn tagged<'py>(kind: &str, argument: Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+        let py = argument.py();
+        Ok((kind, argument).into_pyobject(py)?.into_any())
+    }
+    parts
+        .into_iter()
+        .map(|part| match part {
+            Part::Text(text) => Ok(text.into_pyobject(py)?.into_any()),
+            Part::Quoted(name) => tagged("quoted", name.into_pyobject(py)?.into_any()),
+            Part::Column(names) => tagged("column", names.into_pyobject(py)?.into_any()),
+            Part::Type(steps) => tagged("type", steps.into_pyobject(py)?.into_any()),
+            Part::RawType(steps) => tagged("raw_type", steps.into_pyobject(py)?.into_any()),
+        })
+        .collect()
+}
+
+/// Whether the running CPython's `struct` keeps a float's signaling NaN
+/// signaling as a double (3.14), probed once: the decoder reads as it does.
+static SIGNALING_NAN: PyOnceLock<bool> = PyOnceLock::new();
+
+fn signaling_nan(py: Python<'_>) -> PyResult<bool> {
+    let nan = PyBytes::new(py, &[0x01, 0x00, 0x80, 0x7F]);
+    let read: f64 = py.import("struct")?.call_method1("unpack", ("<f", nan))?.get_item(0)?.extract()?;
+    Ok(read.to_bits() & 1 << 51 == 0)
+}
+
+/// `(row, reason, trail, detail)`: the trail innermost first, as
+/// `_Invalid.trail`, or None where the fault has no path.
+type DecodeFault<'py> = (Option<usize>, &'static str, Option<Vec<Bound<'py, PyAny>>>, Vec<Bound<'py, PyAny>>);
+
+/// Reads storage chunks (`reassemble`) up to the first fault: each row as
+/// tagged JSON when `tagged`, and the fault.
+#[pyfunction]
+#[pyo3(signature = (chunks, *, strict, canonical, nullable, tagged))]
+fn decode<'py>(
+    py: Python<'py>,
+    chunks: Vec<PyArray>,
+    strict: bool,
+    canonical: bool,
+    nullable: bool,
+    tagged: bool,
+) -> PyResult<(Vec<String>, Option<DecodeFault<'py>>)> {
+    let inputs: Vec<_> = chunks.into_iter().map(PyArray::into_inner).collect();
+    let signaling_nan = *SIGNALING_NAN.get_or_try_init(py, || signaling_nan(py))?;
+    let options = crate::decode::Options { strict, canonical, nullable, tagged, signaling_nan };
+    // Imported holding the GIL, and dropped holding it when this returns.
+    let decoded = py.detach(|| crate::decode::decode(&inputs, &options));
+    let Some((row, fault)) = decoded.fault else {
+        return Ok((decoded.rows, None));
+    };
+    let step = |step| match step {
+        Step::Key(key) => Ok(key.into_pyobject(py)?.into_any()),
+        Step::Index(index) => Ok(index.into_pyobject(py)?.into_any()),
+    };
+    let trail = fault.trail.map(|trail| trail.into_iter().map(step).collect::<PyResult<_>>()).transpose()?;
+    Ok((decoded.rows, Some((row, fault.reason, trail, parts(py, fault.detail)?))))
+}
+
+/// `structure_fault`: the detail of the first null a REQUIRED child holds
+/// under a present parent, or None.
+#[pyfunction]
+fn structure_fault(py: Python<'_>, array: PyArray) -> PyResult<Option<Vec<Bound<'_, PyAny>>>> {
+    let (array, _) = array.into_inner();
+    py.detach(|| crate::decode::structure_fault(&array)).map(|found| parts(py, found)).transpose()
+}
+
 #[pymodule]
 fn pyhoglake_variant_codec(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("PROTOCOL", PROTOCOL)?;
     m.add("PanicException", m.py().get_type::<PanicException>())?;
     m.add_class::<Plan>()?;
     m.add_function(wrap_pyfunction!(encode_json, m)?)?;
+    m.add_function(wrap_pyfunction!(decode, m)?)?;
+    m.add_function(wrap_pyfunction!(structure_fault, m)?)?;
     Ok(())
 }

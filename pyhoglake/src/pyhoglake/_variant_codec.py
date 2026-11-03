@@ -2718,21 +2718,11 @@ def _plain(kind: pa.DataType, depth: int = 0) -> pa.DataType:
     return _PLAIN.get(kind, kind)
 
 
-def reassemble(
-    array: pa.Array | pa.ChunkedArray,
-    plan: Plan | None,
-    *,
-    strict: bool,
-    canonical: bool = False,
-    column: str | None = None,
-    nullable: bool = True,
-) -> list[object]:
-    """Every row of a storage array as Python (to_python, verify).
-
-    The storage says how to read itself, so no declaration is needed;
-    ``plan`` checks that it is a form of that declaration, and
-    ``nullable=False`` that no row is SQL NULL, as the encoders refuse it.
-    """
+def storage_chunks(
+    array: pa.Array | pa.ChunkedArray, plan: Plan | None, column: str | None
+) -> list[pa.Array]:
+    """The chunks of a storage array, checked to be a form of ``plan``'s
+    declaration where there is one (reassemble's first step)."""
     chunks = array.chunks if isinstance(array, pa.ChunkedArray) else [array]
     # A column of no chunks (Table.from_batches([], schema) gives one) is
     # still checked: its type is all the storage there is. pa.nulls, since
@@ -2771,9 +2761,27 @@ def reassemble(
             column=column,
             reason="invalid_shredding",
         )
+    return chunks
+
+
+def reassemble(
+    array: pa.Array | pa.ChunkedArray,
+    plan: Plan | None,
+    *,
+    strict: bool,
+    canonical: bool = False,
+    column: str | None = None,
+    nullable: bool = True,
+) -> list[object]:
+    """Every row of a storage array as Python (to_python, verify).
+
+    The storage says how to read itself, so no declaration is needed;
+    ``plan`` checks that it is a form of that declaration, and
+    ``nullable=False`` that no row is SQL NULL, as the encoders refuse it.
+    """
     out: list[object] = []
     row = 0
-    for chunk in chunks:
+    for chunk in storage_chunks(array, plan, column):
         try:
             reader = _Reassembly(chunk, strict=strict, canonical=canonical)
         except _Invalid as exc:

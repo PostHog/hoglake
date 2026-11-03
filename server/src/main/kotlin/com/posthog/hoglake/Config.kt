@@ -14,6 +14,17 @@ data class Config(
      */
     val metricsPort: Int = env("HOGLAKE_METRICS_PORT", "0").toInt(),
     /**
+     * The public API listener's port (docs/auth-tenancy.md): the same routes
+     * as [port], for clients outside the cluster, ALWAYS under `enforce` and
+     * for TENANT tokens only, whatever [authMode] says. That is what lets an
+     * internet-facing load balancer front this port while the in-cluster
+     * callers on [port] are still migrating under `warn`. An operator token is
+     * refused here even when it verifies: none is ever issued to a party
+     * outside the cluster. 0 = no public listener. Requires a verifier, so
+     * [authMode] must not be `off`.
+     */
+    val publicPort: Int = env("HOGLAKE_PUBLIC_PORT", "0").toInt(),
+    /**
      * Human-facing name for THIS hoglake instance (e.g. "GigaHog"),
      * shown by the webui so operators can tell deployments apart.
      * Empty = unnamed.
@@ -1337,6 +1348,14 @@ data class Config(
         }
         require(metricsPort == 0 || (metricsPort in 1..65535 && metricsPort != port)) {
             "HOGLAKE_METRICS_PORT=$metricsPort must be 0 (off) or a port other than HOGLAKE_PORT=$port"
+        }
+        require(publicPort == 0 || (publicPort in 1..65535 && publicPort != port && publicPort != metricsPort)) {
+            "HOGLAKE_PUBLIC_PORT=$publicPort must be 0 (off) or a port other than HOGLAKE_PORT=$port " +
+                "and HOGLAKE_METRICS_PORT=$metricsPort"
+        }
+        require(publicPort == 0 || authMode.trim().lowercase() != "off") {
+            "HOGLAKE_PUBLIC_PORT=$publicPort requires HOGLAKE_AUTH_MODE warn or enforce: the public listener " +
+                "always enforces, so it needs HOGLAKE_AUTH_ISSUER and a JWKS source"
         }
         // Netty refuses a group of zero with an IllegalArgumentException
         // from deep inside its own constructor, naming neither the knob

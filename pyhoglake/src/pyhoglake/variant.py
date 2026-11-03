@@ -610,10 +610,9 @@ def verify(
     """
     _storage_argument(array)
     name, plan = _reader_target(column, shredding)
-    _codec.reassemble(
+    _backend.verify(
         array,
         plan,
-        strict=True,
         canonical=canonical,
         column=name,
         nullable=column is None or column.nullable,

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import Counter
 from typing import Any
 
 import pytest
@@ -135,13 +136,15 @@ def test_s3_kwargs_maps_only_present_values():
     }
 
 
-def _components(**stage_kwargs: Any) -> tuple[Any, StageManager, Any, Any]:
+def _components(
+    variant_sources: tuple[tuple[str, str], ...] = (), **stage_kwargs: Any
+) -> tuple[Any, StageManager, Any, Any]:
     """Real-but-unstarted components for the collector."""
     from pyhoglake import HoglakeClient
 
     from millrace.flush import FlushRunner, HoglakeFlusher
 
-    cfg = make_config()
+    cfg = make_config(variant_sources=variant_sources)
     stages = StageManager("memory:///", "millrace", **stage_kwargs)
     consumer = MillraceConsumer(
         FakeConsumer(),
@@ -268,10 +271,13 @@ def test_records_dropped_total_merges_consume_and_flush_reasons():
         flusher.close()
 
 
-def test_flush_counters_are_exposed_by_exact_name_labels_and_value():
+def test_flush_counters_are_exposed_by_exact_name_labels_and_value(
+    monkeypatch: pytest.MonkeyPatch,
+):
     """Seeded with distinct values, so a swapped pair reads back wrong."""
     from millrace.flush import BUILD_STAGES, STUCK_AFTER, _Failures
 
+    monkeypatch.setattr(_variant_backend, "ENCODE_FALLBACKS", Counter())
     consumer, stages, flusher, runner = _components()
     try:
         flusher._decisions_committed = 3
@@ -376,11 +382,13 @@ def test_flush_counters_are_exposed_by_exact_name_labels_and_value():
             ]
             == 83
         )
-        # The Rust codec's transitional series: fallbacks by reason, apart
-        # from the rows a recursion bound took Python's verdict for.
+        # The Rust codec's transitional series per build: the rows a
+        # recursion bound took Python's verdict for and the shadow's
+        # seconds. A report's fallbacks are pyhoglake's per-process count
+        # already, so not counted again.
+        fallback = "millrace_variant_codec_fallback_total"
         assert raw[("millrace_variant_codec_recursion_bound_rows_total", ())] == 0
         assert raw[("millrace_variant_shadow_seconds_total", ())] == 0.0
-        assert not any(n == "millrace_variant_codec_fallback_total" for n, _ in raw)
         report = VariantReport(
             codec_fallbacks={"mismatch": 2, "shadow_mismatch": 1},
             recursion_bound_rows=3,
@@ -389,9 +397,7 @@ def test_flush_counters_are_exposed_by_exact_name_labels_and_value():
         flusher._note_variant("sv", report)
         flusher._note_variant("sv", report)
         raw = _raw(_collector(consumer, stages, flusher, runner))
-        fallback = "millrace_variant_codec_fallback_total"
-        assert raw[(fallback, (("reason", "mismatch"),))] == 4
-        assert raw[(fallback, (("reason", "shadow_mismatch"),))] == 2
+        assert set(_by_reason(raw, fallback).values()) == {0}
         assert raw[("millrace_variant_codec_recursion_bound_rows_total", ())] == 6
         assert raw[("millrace_variant_shadow_seconds_total", ())] == 0.5
         # The removed exactly-once machinery exports nothing.
@@ -400,6 +406,79 @@ def test_flush_counters_are_exposed_by_exact_name_labels_and_value():
             for name, _ in raw
             for word in ("prepared", "receipt", "deduped", "unresolved", "fenced")
         )
+    finally:
+        flusher.close()
+
+
+def _by_reason(raw: dict[Any, float], name: str) -> dict[str, float]:
+    return {dict(labels)["reason"]: v for (n, labels), v in raw.items() if n == name}
+
+
+def test_pipeline_collector_exports_the_codec_counts_per_process(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """pyhoglake counts the codec's fallbacks, the calls auto gives Python
+    and what the shadow compared per process (a read has no report, and an
+    encode whose build raises later returns none); each scrape reads those
+    counts, every reason from 0."""
+    for counter in ("ENCODE_FALLBACKS", "DECODE_FALLBACKS", "ROUTED", "SHADOWED"):
+        monkeypatch.setattr(_variant_backend, counter, Counter())
+    consumer, stages, flusher, runner = _components()
+    encode = "millrace_variant_codec_fallback_total"
+    decode = "millrace_variant_codec_decode_fallback_total"
+    shadow = (
+        "millrace_variant_shadow_rows_total",
+        "millrace_variant_shadow_calls_total",
+    )
+
+    def routed(raw: dict[Any, float]) -> dict[tuple[str, str], float]:
+        name = "millrace_variant_codec_routed_to_python_total"
+        return {
+            (dict(k)["op"], dict(k)["reason"]): v
+            for (n, k), v in raw.items()
+            if n == name
+        }
+
+    try:
+        collector = _collector(consumer, stages, flusher, runner)
+        raw = _raw(collector)
+        assert _by_reason(raw, encode) == dict.fromkeys(
+            ["mismatch", "type", "panic", "shadow_mismatch"], 0
+        )
+        assert _by_reason(raw, decode) == {"mismatch": 0, "panic": 0}
+        assert routed(raw) == {
+            ("encode", "unavailable"): 0,
+            ("encode", "plan"): 0,
+            ("encode", "not_utf8"): 0,
+            ("decode", "unavailable"): 0,
+            ("decode", "storage"): 0,
+        }
+        assert [raw[(name, ())] for name in shadow] == [0, 0]
+        report = VariantReport()
+        _variant_backend._fall_back("mismatch", 1, "sv", report)
+        _variant_backend._fall_back("shadow_mismatch", None, "sv", VariantReport())
+        _variant_backend._fall_back("mismatch", None, None, VariantReport())
+        _variant_backend._decode_fall_back("mismatch", 7, "sv")
+        _variant_backend._decode_fall_back("mismatch", None, None)
+        _variant_backend._decode_fall_back("panic", None, "sv")
+        _variant_backend._count(_variant_backend.ROUTED, ("encode", "not_utf8"))
+        _variant_backend._count(_variant_backend.ROUTED, ("decode", "storage"))
+        _variant_backend.SHADOWED.update(calls=3, rows=1000)
+        # Exported once, whether or not a build returns the report.
+        flusher._note_variant("sv", report)
+        raw = _raw(collector)
+        assert _by_reason(raw, encode) == {
+            "mismatch": 2,
+            "type": 0,
+            "panic": 0,
+            "shadow_mismatch": 1,
+        }
+        assert _by_reason(raw, decode) == {"mismatch": 2, "panic": 1}
+        assert {k: v for k, v in routed(raw).items() if v} == {
+            ("encode", "not_utf8"): 1,
+            ("decode", "storage"): 1,
+        }
+        assert [raw[(name, ())] for name in shadow] == [1000, 3]
     finally:
         flusher.close()
 
@@ -419,6 +498,35 @@ def test_pipeline_collector_names_the_variant_codec(
         raw = _raw(_collector(consumer, stages, flusher, runner))
         info = {k: v for k, v in raw.items() if k[0] == "millrace_variant_codec_info"}
         assert info == {("millrace_variant_codec_info", (("backend", backend),)): 1}
+    finally:
+        flusher.close()
+
+
+@pytest.mark.parametrize("backend", ["native", "python"])
+def test_pipeline_collector_exports_encode_seconds_per_column_and_codec(
+    monkeypatch: pytest.MonkeyPatch, backend: str
+):
+    """Every mapped column under both codecs from the first scrape; a
+    build's encode seconds go under the process's codec."""
+    monkeypatch.setattr(_variant_backend, "MODE", backend)
+    monkeypatch.setattr(_variant_backend, "native", lambda: (object(), ""))
+    consumer, stages, flusher, runner = _components((("sv", "properties"),))
+    name = "millrace_variant_encode_seconds_total"
+
+    def exported() -> dict[tuple[str, str], float]:
+        raw = _raw(_collector(consumer, stages, flusher, runner))
+        return {
+            (dict(labels)["column"], dict(labels)["backend"]): value
+            for (n, labels), value in raw.items()
+            if n == name
+        }
+
+    try:
+        expected = {("sv", "native"): 0.0, ("sv", "python"): 0.0}
+        assert exported() == expected
+        flusher._note_variant("sv", VariantReport(encode_seconds=0.25))
+        flusher._note_variant("sv", VariantReport(encode_seconds=0.5))
+        assert exported() == expected | {("sv", backend): 0.75}
     finally:
         flusher.close()
 
