@@ -862,6 +862,9 @@ class HogliteCatalogStore(
     ): TableInfo =
         catalogOperation(catalog) {
             Identifiers.validate("table", name)
+            if (columns.isEmpty()) {
+                throw HoglakeException.Validation("table '$name' must have at least one column")
+            }
             // The column-tree rules (nesting depth, synthetic child names,
             // decimal params, duplicates) are hoglake's own object — same
             // refusals, same messages, as the Postgres path.
@@ -1015,13 +1018,29 @@ class HogliteCatalogStore(
         catalogOperation(catalog) {
             val m = meta(catalog)
             val at = resolveRead(catalog, m, snapshot, atTimestamp)
-            val ns = liveNamespace(catalog, namespace)
+            val headRead = snapshot == null && atTimestamp == null
+            // A pinned listing resolves the namespace incarnation at its snapshot.
+            val ns =
+                if (headRead) {
+                    liveNamespace(catalog, namespace)
+                } else {
+                    queryCatalog(
+                        catalog,
+                        "SELECT id, name FROM namespaces WHERE name = ? AND created_snapshot <= ? " +
+                            "AND (dropped_snapshot IS NULL OR dropped_snapshot > ?)",
+                        namespace,
+                        at,
+                        at,
+                    ).firstRow()?.let { NamespaceInfo(it[0].asLong(), it[1].asString()) }
+                        ?: throw HoglakeException.NotFound(
+                            "namespace '$namespace' in catalog '$catalog' at snapshot $at",
+                        )
+                }
             // Totals are the files visible at `at`, as Postgres's listing
             // rolls them up at its snapshot: a head listing serves the
             // transactionally maintained table_totals (exact at head, see
             // getTable), and a PINNED listing aggregates the manifest at
             // `at` per table, never the head counters.
-            val headRead = snapshot == null && atTimestamp == null
             val visible =
                 "FROM files f WHERE f.table_id = t.id AND f.begin_snapshot <= ? " +
                     "AND (f.end_snapshot IS NULL OR f.end_snapshot > ?)"
@@ -1036,14 +1055,19 @@ class HogliteCatalogStore(
             // snapshotCount/earliestSnapshotId count RETAINED change rows, so
             // the window opens at the expiry floor — read from meta so the
             // day expiry lands the read is already right.
+            // Object ids overlap across tables, namespaces, and views.
+            val tableKinds = ChangeKind.TABLE_SCOPED.map { it.wire }.toTypedArray()
+            val kindParams = tableKinds.joinToString(",") { "?" }
             val rows =
                 queryCatalog(
                     catalog,
                     """SELECT t.id, t.table_uuid, v.name, v.comment, $totalsSql,
                           (SELECT COUNT(DISTINCT c.snapshot_id) FROM changes c
-                            WHERE c.object_id = t.id AND c.snapshot_id >= ? AND c.snapshot_id <= ?),
+                            WHERE c.object_id = t.id AND c.kind IN ($kindParams)
+                              AND c.snapshot_id >= ? AND c.snapshot_id <= ?),
                           (SELECT MIN(c.snapshot_id) FROM changes c
-                            WHERE c.object_id = t.id AND c.snapshot_id >= ? AND c.snapshot_id <= ?)
+                            WHERE c.object_id = t.id AND c.kind IN ($kindParams)
+                              AND c.snapshot_id >= ? AND c.snapshot_id <= ?)
                      FROM tables t
                      JOIN table_versions v ON v.table_id = t.id
                       AND v.begin_snapshot <= ? AND (v.end_snapshot IS NULL OR v.end_snapshot > ?)
@@ -1052,8 +1076,10 @@ class HogliteCatalogStore(
                       AND t.created_snapshot <= ? AND (t.dropped_snapshot IS NULL OR t.dropped_snapshot > ?)
                     ORDER BY v.name""",
                     *totalsArgs,
+                    *tableKinds,
                     m.earliestSnapshotId,
                     at,
+                    *tableKinds,
                     m.earliestSnapshotId,
                     at,
                     at,
@@ -1404,11 +1430,14 @@ class HogliteCatalogStore(
                         "Reconcile the destination from a full snapshot before advancing its checkpoint.",
                 )
             }
+            // Compaction outputs rewrite rows that consumers already receive through the original files.
             val files =
                 queryCatalog(
                     catalog,
                     "SELECT ${HogliteSql.FILE_COLUMNS} FROM files f " +
                         "WHERE f.table_id = ? AND f.begin_snapshot > ? AND f.begin_snapshot <= ? " +
+                        "AND NOT EXISTS (SELECT 1 FROM changes c WHERE c.snapshot_id = f.begin_snapshot " +
+                        "AND c.kind = 'table_compacted' AND c.object_id = f.table_id) " +
                         "ORDER BY f.begin_snapshot, f.id",
                     t.tableId,
                     fromSnapshot,

@@ -18,6 +18,7 @@ import com.sun.net.httpserver.HttpServer
 import io.ktor.client.request.get
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
+import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.contentType
@@ -1736,6 +1737,68 @@ class HogliteBackendIntegrationTest {
     // ---- the routes, over the wire -------------------------------------------
 
     @Test
+    fun `table history excludes colliding namespace and view ids`() {
+        val catalog = freshCatalog()
+        val namespace = store.createNamespace(catalog, "ns")
+        val table = store.createTable(catalog, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        assertThat(namespace.namespaceId).isEqualTo(table.tableId)
+
+        fun assertHistory(
+            count: Long,
+            earliest: Long?,
+            at: Long? = null,
+        ) {
+            val summary = store.listTables(catalog, "ns", snapshot = at).single()
+            assertThat(summary.snapshotCount).isEqualTo(count)
+            assertThat(summary.earliestSnapshotId).isEqualTo(earliest)
+        }
+        assertHistory(1, table.readSnapshotId)
+        val views = HogliteViews(store)
+        val view = views.create(catalog, "ns", "v", "SELECT 1")
+        assertThat(view.viewId).isEqualTo(table.tableId)
+        assertHistory(1, table.readSnapshotId)
+        views.drop(catalog, "ns", "v", author = "test", message = "drop the colliding view")
+        assertHistory(1, table.readSnapshotId)
+        val truncated =
+            store.truncateTable(
+                catalog,
+                "ns",
+                "t",
+                table.tableUuid,
+                author = "test",
+                message = "truncate the table",
+            ).snapshotId
+        // Truncate records two table kinds at one snapshot.
+        assertHistory(2, table.readSnapshotId)
+        store.commit(
+            catalog,
+            CommitRequest(
+                appends =
+                    listOf(
+                        TableAppend(
+                            "ns",
+                            "t",
+                            listOf(FileRegistration("s3://hoglake-it/$catalog/after.parquet", 2, 100)),
+                        ),
+                    ),
+            ),
+        )
+        assertHistory(3, table.readSnapshotId)
+        assertHistory(2, table.readSnapshotId, truncated)
+        // Leave change rows below the floor to check the read bound independently of purge.
+        scaleWrite(catalog, "UPDATE meta SET earliest_snapshot_id = ? WHERE id = 1", truncated)
+        assertThat(
+            q(catalog, "SELECT COUNT(*) FROM changes WHERE snapshot_id < ?", truncated).firstRow()!![0].asLong(),
+        ).isGreaterThan(0)
+        assertHistory(2, truncated)
+        assertHistory(1, truncated, truncated)
+        store.createNamespace(catalog, "unrelated")
+        val head = store.getCatalog(catalog).headSnapshotId
+        scaleWrite(catalog, "UPDATE meta SET earliest_snapshot_id = ? WHERE id = 1", head)
+        assertHistory(0, null)
+    }
+
+    @Test
     fun `the v1 routes serve the hoglite backend`() {
         val cfg =
             com.posthog.hoglake.Config(
@@ -1765,6 +1828,19 @@ class HogliteBackendIntegrationTest {
             assertThat(created.status).isEqualTo(HttpStatusCode.Created)
             assertThat(client.get("/v1/catalogs/$name").status).isEqualTo(HttpStatusCode.OK)
             assertThat(client.get("/healthz").status).isEqualTo(HttpStatusCode.OK)
+            store.createNamespace(name, "ns")
+            val before = store.getCatalog(name).headSnapshotId
+            val empty =
+                client.post("/v1/catalogs/$name/namespaces/ns/tables") {
+                    contentType(ContentType.Application.Json)
+                    setBody("""{"name":"empty","columns":[]}""")
+                }
+            assertThat(empty.status).isEqualTo(HttpStatusCode.UnprocessableEntity)
+            val error = jacksonObjectMapper().readTree(empty.bodyAsText())
+            assertThat(error["error"].asText()).isEqualTo("validation")
+            assertThat(error["detail"].asText()).isEqualTo("table 'empty' must have at least one column")
+            assertThat(store.getCatalog(name).headSnapshotId).isEqualTo(before)
+            assertThat(store.listTables(name, "ns")).isEmpty()
         }
     }
 

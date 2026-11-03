@@ -154,6 +154,50 @@ class HogliteBackendConformanceIntegrationTest {
 
     @ParameterizedTest(name = "{0}")
     @EnumSource(Backend::class)
+    fun `empty table columns return a typed validation without a snapshot`(backend: Backend) {
+        select(backend)
+        val cat = freshCatalog()
+        store.createNamespace(cat, "ns")
+        val before = store.getCatalog(cat).headSnapshotId
+        assertThatThrownBy { store.createTable(cat, "ns", "empty", emptyList()) }
+            .isExactlyInstanceOf(HoglakeException.Validation::class.java)
+            .hasMessage("table 'empty' must have at least one column")
+        assertThat(store.getCatalog(cat).headSnapshotId).isEqualTo(before)
+        assertThat(store.listTables(cat, "ns")).isEmpty()
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(Backend::class)
+    fun `pinned table listings resolve a dropped namespace at the pin`(backend: Backend) {
+        select(backend)
+        val cat = freshCatalog()
+        store.createNamespace(cat, "ns")
+        val table = store.createTable(cat, "ns", "old", listOf(ColumnDef("id", ColType.LONG)))
+        val pin = store.getCatalog(cat).headSnapshotId
+        val timestamp = store.listSnapshots(cat, after = pin - 1, limit = 1).first.single().snapshotTime
+        store.dropTable(cat, "ns", "old", author = "test", message = "drop the pinned table")
+        store.dropNamespace(cat, "ns", author = "test", message = "drop the pinned namespace")
+        val gap = store.getCatalog(cat).headSnapshotId
+
+        assertThat(store.listTables(cat, "ns", snapshot = pin).map { it.tableUuid }).containsExactly(table.tableUuid)
+        assertThat(store.listTables(cat, "ns", atTimestamp = timestamp).map { it.tableUuid })
+            .containsExactly(table.tableUuid)
+        assertThatThrownBy { store.listTables(cat, "ns") }
+            .isExactlyInstanceOf(HoglakeException.NotFound::class.java)
+        assertThatThrownBy { store.listTables(cat, "ns", snapshot = gap) }
+            .isExactlyInstanceOf(HoglakeException.NotFound::class.java)
+            .hasMessageContaining("at snapshot $gap")
+
+        store.createNamespace(cat, "ns")
+        val replacement = store.createTable(cat, "ns", "new", listOf(ColumnDef("id", ColType.LONG)))
+        assertThat(store.listTables(cat, "ns", snapshot = pin).map { it.tableUuid }).containsExactly(table.tableUuid)
+        assertThat(store.listTables(cat, "ns").map { it.tableUuid }).containsExactly(replacement.tableUuid)
+        assertThatThrownBy { store.listTables(cat, "ns", snapshot = gap) }
+            .isExactlyInstanceOf(HoglakeException.NotFound::class.java)
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(Backend::class)
     fun `commit appends land with row lineage and replay idempotently`(backend: Backend) {
         select(backend)
         val catalog = freshCatalog()
@@ -1160,6 +1204,91 @@ class HogliteBackendConformanceIntegrationTest {
         assertThat(store.getTable(cat, "ns", "t", snapshot = before).fileCount).isEqualTo(2)
         assertThat(compact(cat).groupsCompacted).isZero()
     }
+
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(Backend::class)
+    fun `consumer windows exclude real compaction outputs without losing ordinary appends`(backend: Backend) {
+        select(backend)
+        val cat = freshCatalog()
+        store.createNamespace(cat, "ns")
+        val table = store.createTable(cat, "ns", "t", columns)
+        val start = store.getCatalog(cat).headSnapshotId
+        store.commitOffset(cat, "replica", table.tableUuid, start)
+        val paths = mutableListOf<String>()
+
+        fun appendRows(team: Long) {
+            val (path, size) = putParquet(cat, "s3://hoglake-it/$cat/data/$team.parquet", team)
+            paths += path
+            store.commit(
+                cat,
+                CommitRequest(appends = listOf(TableAppend("ns", "t", listOf(FileRegistration(path, 2, size))))),
+            )
+        }
+        appendRows(1)
+        appendRows(2)
+        val first = store.changes(cat, "ns", "t", store.getOffset(cat, "replica", table.tableUuid).committedSnapshot)
+        assertThat(first.files.map { it.path }).containsExactlyElementsOf(paths)
+        assertThat(changeRows(first)).containsExactly(1L to 1L, 1L to 2L, 2L to 1L, 2L to 2L)
+        store.commitOffset(cat, "replica", table.tableUuid, first.toSnapshot)
+
+        hydrate()
+        val result = compact(cat)
+        assertThat(result.groupsCompacted).isEqualTo(1)
+        val compacted = store.getCatalog(cat).headSnapshotId
+        val output = store.listFiles(cat, "ns", "t").single()
+        assertThat(output.recordCount).isEqualTo(4)
+        assertThat(output.path).isNotIn(paths)
+        val rewrite = store.changes(cat, "ns", "t", first.toSnapshot, compacted)
+        assertThat(rewrite.files).describedAs("a rewrite does not append consumer rows").isEmpty()
+        assertThat(rewrite.toSnapshot).isEqualTo(compacted)
+        store.commitOffset(cat, "replica", table.tableUuid, rewrite.toSnapshot)
+
+        appendRows(3)
+        val next = store.changes(cat, "ns", "t", store.getOffset(cat, "replica", table.tableUuid).committedSnapshot)
+        assertThat(next.files.map { it.path }).containsExactly(paths.last())
+        assertThat(changeRows(next)).containsExactly(3L to 1L, 3L to 2L)
+        val all = store.changes(cat, "ns", "t", start, next.toSnapshot)
+        assertThat(all.tableUuid).isEqualTo(table.tableUuid)
+        assertThat(all.files.map { it.path }).containsExactlyElementsOf(paths)
+        assertThat(changeRows(all)).containsExactly(
+            1L to 1L,
+            1L to 2L,
+            2L to 1L,
+            2L to 2L,
+            3L to 1L,
+            3L to 2L,
+        )
+        // A delayed consumer still receives the original files after the rewrite ends them.
+        val pinned = store.changes(cat, "ns", "t", start, first.toSnapshot)
+        assertThat(pinned.toSnapshot).isEqualTo(first.toSnapshot)
+        assertThat(pinned.files.map { it.path }).containsExactlyElementsOf(paths.take(2))
+    }
+
+    private fun changeRows(plan: com.posthog.hoglake.model.ChangesPlan): List<Pair<Long, Long>> =
+        com.posthog.hoglake.hydrator.ObjectStore(engine().config()).use { objects ->
+            plan.files.flatMap { file ->
+                com.posthog.hoglake.ParquetReaders.open(
+                    com.posthog.hoglake.compaction.S3InputFile(objects, file.path, file.fileSizeBytes),
+                ).use { reader ->
+                    val schema = reader.footer.fileMetaData.schema
+                    val columnIO = org.apache.parquet.io.ColumnIOFactory().getColumnIO(schema)
+                    buildList {
+                        while (true) {
+                            val pages = reader.readNextRowGroup() ?: break
+                            val rows =
+                                columnIO.getRecordReader(
+                                    pages,
+                                    org.apache.parquet.example.data.simple.convert.GroupRecordConverter(schema),
+                                )
+                            repeat(pages.rowCount.toInt()) {
+                                val row = rows.read()
+                                add(row.getLong("team_id", 0) to row.getLong("v", 0))
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
     @ParameterizedTest(name = "{0}")
     @EnumSource(Backend::class)
