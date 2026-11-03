@@ -39,6 +39,13 @@ class AuthService(
      */
     val tenantOnly: Boolean = false,
 ) {
+    /**
+     * The `listener` label on hoglake_auth_requests_total: internet scanners
+     * refused on the public listener must not land in the series the enforce
+     * flip of the API port is judged by.
+     */
+    val listener: String get() = if (tenantOnly) "public" else "api"
+
     init {
         require(mode == AuthMode.OFF || verifier != null) {
             "auth mode '${mode.wire}' needs a verifier; HOGLAKE_AUTH_ISSUER plus a JWKS source are required"
@@ -297,7 +304,7 @@ val HoglakeAuth =
             if (decision is AuthDecision.Allow) {
                 // The token was still parsed, so a valid one still yields its
                 // caller and its per-tenant totals.
-                Metrics.authRequest(service.mode.wire, "ok", clientClass(call))
+                Metrics.authRequest(service.mode.wire, service.listener, "ok", clientClass(call))
                 return@onCall
             }
             // A listed path asked with an unlisted method is a 405, whatever the
@@ -311,7 +318,7 @@ val HoglakeAuth =
                     if (service.mode.isEnforcing) {
                         call.respondMethodNotAllowed(allowed)
                     } else {
-                        Metrics.authRequest(service.mode.wire, "unmapped", clientClass(call))
+                        Metrics.authRequest(service.mode.wire, service.listener, "unmapped", clientClass(call))
                     }
                     return@onCall
                 }
@@ -326,7 +333,7 @@ val HoglakeAuth =
             // Counted in BOTH modes: the warn numbers are the forecast and the
             // enforce numbers are the outcome, and a flip is judged by comparing
             // the two per client class.
-            countRefusal(service.mode, clientClass(call), caller, match, refusal)
+            countRefusal(service, clientClass(call), caller, match, refusal)
             if (service.mode.isEnforcing) {
                 call.respondRefusal(refusal)
                 return@onCall
@@ -390,7 +397,7 @@ private val CLIENT_CLASSES =
     )
 
 private fun countRefusal(
-    mode: AuthMode,
+    service: AuthService,
     client: String,
     caller: Caller?,
     match: RouteMatch?,
@@ -404,7 +411,7 @@ private fun countRefusal(
             is HoglakeException.NotFound -> "not_entitled"
             else -> "other"
         }
-    Metrics.authRequest(mode.wire, outcome, client)
+    Metrics.authRequest(service.mode.wire, service.listener, outcome, client)
     val catalog = match?.catalog ?: ""
     if (failure is HoglakeException.Forbidden) {
         Metrics.authDenial(catalog, match?.requirement?.wire() ?: "", outcome)
@@ -413,8 +420,10 @@ private fun countRefusal(
         action = "auth_refused",
         catalog = match?.catalog,
         obj = null,
-        outcome = if (mode.isEnforcing) "refused" else "warn_allowed",
-        detail = "${failure::class.simpleName}: ${failure.message} pattern=${match?.pattern}",
+        outcome = if (service.mode.isEnforcing) "refused" else "warn_allowed",
+        detail =
+            "${failure::class.simpleName}: ${failure.message} pattern=${match?.pattern} " +
+                "listener=${service.listener}",
         actor = caller?.actor,
         tenant = caller?.orgId,
     )

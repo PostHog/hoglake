@@ -358,6 +358,10 @@ class App private constructor(
         }
         app.install(MicrometerMetrics) {
             registry = meterRegistry
+            // The JVM binders belong to the process, not to a listener: bound
+            // again by the public listener's module, JvmGcMetrics would add a
+            // second GC listener and double every jvm_gc_* counter.
+            if (auth.tenantOnly) meterBinders = emptyList()
             // Unmatched request paths must NOT each mint a `route` tag —
             // hostile path scans would otherwise grow series without bound.
             distinctNotRegisteredRoutes = false

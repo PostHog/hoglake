@@ -88,10 +88,19 @@ fun main() {
     // cancelled probe scope while the Service still routed to it.
     Runtime.getRuntime().addShutdownHook(
         Thread({
-            runCatching { publicServer?.stop(SHUTDOWN_GRACE_MS, SHUTDOWN_TIMEOUT_MS) }
-                .onFailure { log.warn(it) { "public listener shutdown failed; closing the rest anyway" } }
+            // The two API engines drain in parallel, so the public listener
+            // does not double the time before the pools close (the pod's
+            // grace period is 30 s).
+            val publicStop =
+                publicServer?.let { ps ->
+                    Thread({
+                        runCatching { ps.stop(SHUTDOWN_GRACE_MS, SHUTDOWN_TIMEOUT_MS) }
+                            .onFailure { log.warn(it) { "public listener shutdown failed; closing the rest anyway" } }
+                    }, "hoglake-shutdown-public").apply { start() }
+                }
             runCatching { server.stop(SHUTDOWN_GRACE_MS, SHUTDOWN_TIMEOUT_MS) }
                 .onFailure { log.warn(it) { "engine shutdown failed; closing the rest anyway" } }
+            publicStop?.join()
             runCatching { metricsServer?.stop(0, SHUTDOWN_TIMEOUT_MS) }
                 .onFailure { log.warn(it) { "metrics listener shutdown failed" } }
             background.close()

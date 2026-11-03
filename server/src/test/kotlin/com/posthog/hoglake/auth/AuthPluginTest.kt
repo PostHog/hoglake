@@ -92,6 +92,8 @@ class AuthPluginTest {
     @Test
     fun `the public listener enforces even where the instance only warns`() =
         testApplication {
+            val registry = PrometheusMeterRegistry(PrometheusConfig.DEFAULT)
+            Metrics.bind(registry)
             // MUTATION: make forPublicListener keep the instance's own mode and
             // these anonymous calls are let through under warn.
             application { harness(service(AuthMode.WARN).forPublicListener()) }
@@ -103,6 +105,8 @@ class AuthPluginTest {
             assertThat(tenant.status).isEqualTo(HttpStatusCode.OK)
             assertThat(tenant.bodyAsText()).isEqualTo("client:hedgerow-prod")
             assertThat(client.get("/livez").status).isEqualTo(HttpStatusCode.OK)
+            // Its refusals are counted apart from the API port's enforce gate.
+            assertThat(registry.scrape()).contains("listener=\"public\"").doesNotContain("listener=\"api\"")
         }
 
     @Test
@@ -326,6 +330,7 @@ class AuthPluginTest {
             assertThat(counters).contains("hoglake_auth_requests_total")
             assertThat(counters).contains("outcome=\"missing\"")
             assertThat(counters).contains("outcome=\"invalid\"")
+            assertThat(counters).contains("listener=\"api\"")
         }
 
     @Test
