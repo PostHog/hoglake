@@ -9,6 +9,7 @@ import com.posthog.hoglake.model.CommitRequest
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.TableAppend
 import com.posthog.hoglake.observability.Metrics
+import com.posthog.hoglake.persistence.CommitLockPath
 import com.posthog.hoglake.persistence.Locks
 import com.posthog.hoglake.service.CatalogService
 import com.posthog.hoglake.testing.PgTestSupport
@@ -102,7 +103,7 @@ class CommitAdmissionIntegrationTest {
         val holder =
             thread(name = "adm-lock-holder") {
                 db.jdbi.useTransaction<Exception> { h ->
-                    Locks.acquireCatalogCommitLock(h, catalogId)
+                    Locks.acquireCatalogCommitLock(h, catalogId, "test-holder", CommitLockPath.COMMIT)
                     held.countDown()
                     release.await(30, TimeUnit.SECONDS)
                 }

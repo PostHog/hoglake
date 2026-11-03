@@ -16,5 +16,9 @@
 # The per-member ruff/mypy pins stay duplicated on purpose: a dev group
 # here is not installed by a member's `uv sync`, and the lock already
 # guarantees the duplicates resolve to one version.
+#
+# pyhoglake-variant-codec is the fifth, a Rust crate maturin builds: its
+# static metadata locks without a build, and only a sync that asks for it
+# (pyhoglake's `variant-codec` group) needs Rust.
 [tool.uv.workspace]
-members = ["pyhoglake", "hedgerow", "bench", "millrace"]
+members = ["pyhoglake", "hedgerow", "bench", "millrace", "pyhoglake-variant-codec"]

@@ -10,7 +10,10 @@ files carry ``VARIANT(1)`` in the declared layout, the server accepts
 millrace's footer stats with no row for the variant, and server
 compaction (``HOGLAKE_COMPACTION_VARIANT``, set by ci/live-millrace.sh)
 rolls the files up with every value unchanged. Unmapped, the column is
-written as SQL NULL and the pipeline is not stuck.
+written as SQL NULL and the pipeline is not stuck. On a table with the
+object-prefix option, as ``ingest.events_v2`` is created (runbook 2.5),
+compaction writes each team's output under that team's prefix in the
+declared layout.
 """
 
 from __future__ import annotations
@@ -18,20 +21,24 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+from collections import Counter
 from typing import Any
 
 import livekit
 import pyarrow.parquet as pq
 import pytest
 from livekit import now_us
-from pyhoglake import ops
-from pyhoglake.variant import VARIANT_NULL, to_python
+from pyhoglake import object_prefix, ops
+from pyhoglake.variant import VARIANT_NULL, storage_type, to_python
 
 import millrace.flush as flush_mod
 
 pytestmark = pytest.mark.live
 
 TEAM = 9
+#: Teams on the object-prefix table: 4 and 42 share a leading digit, so
+#: a prefix without its trailing ``/`` would hold the other's files.
+PREFIX_TEAMS = (4, 42, 7)
 WAVES = 5  # the server's default minimum compaction group
 FLUSH_DEADLINE_S = 2
 
@@ -70,10 +77,16 @@ CASES: list[tuple[str | None, Any]] = [
 ]
 
 
-def _variant_table(lake_home: Any, name: str) -> tuple[Any, Any]:
+def _variant_table(
+    lake_home: Any, name: str, *, prefixed: bool = False
+) -> tuple[Any, Any]:
     """The events table plus the operator's alter; returns it with the
-    live ``properties_sv`` column."""
+    live ``properties_sv`` column. ``prefixed`` first sets the
+    object-prefix option on the empty table, as runbook 2.5 creates
+    ``ingest.events_v2``."""
     table = lake_home.create_events_table(name)
+    if prefixed:
+        table.alter([ops.AlterOp("set_object_prefix_field", {"name": "team_id"})])
     info = table.alter(
         [
             ops.add_column("properties", "string"),
@@ -84,12 +97,12 @@ def _variant_table(lake_home: Any, name: str) -> tuple[Any, Any]:
     return table, column
 
 
-def _produce(producer: Any, seqs: range) -> None:
+def _produce(producer: Any, seqs: range, team: int = TEAM) -> None:
     base = now_us()
     for seq in seqs:
         text = CASES[seq % len(CASES)][0]
         producer.send(
-            TEAM,
+            team,
             base + seq,
             seq,
             extra=None if text is None else {"properties": text},
@@ -245,3 +258,123 @@ async def test_an_unmapped_variant_is_written_as_sql_null(
         zip(rows.column("seq").to_pylist(), rows.column("properties").to_pylist())
     )
     assert by_seq == {seq: CASES[seq][0] for seq in seqs}
+
+
+def _files_per_team(lake_home: Any, table: Any) -> Counter[int]:
+    files = livekit.lake_files(table, lake_home.head())
+    counts = Counter(int(f.partition_values[0]) for f in files)
+    return Counter({team: counts[team] for team in PREFIX_TEAMS})
+
+
+def _placed(lake_home: Any, info: Any, f: Any) -> int:
+    """``f``'s team, after checking that ``f`` is under that team's
+    prefix, ``provided``, and holds ``properties_sv`` as ``VARIANT(1)``
+    in the declared shredded layout."""
+    team = int(f.partition_values[0])
+    prefix = object_prefix.prefix(lake_home.catalog.data_path, info, team)
+    assert f.path.startswith(prefix), (f.path, prefix)
+    assert f.stats_state == "provided", f
+    parquet = _read(lake_home, f.path)
+    assert "properties_sv (Variant(1))" in str(parquet.schema), f.path
+    kind = parquet.schema_arrow.field("properties_sv").type
+    assert getattr(kind, "storage_type", kind) == storage_type(DECLARATION), kind
+    return team
+
+
+async def test_compaction_keeps_each_team_prefix_and_the_variant_layout(
+    lake_home, topic_factory, producer_factory
+):
+    table, column = _variant_table(lake_home, "events_v2", prefixed=True)
+    info = await asyncio.to_thread(table.info, totals=False)
+    assert info.object_prefix_field == "team_id"
+    topic = topic_factory(partitions=2)
+    producer = producer_factory(topic.name)
+    cfg = dataclasses.replace(
+        livekit.live_config(
+            topic=topic.name,
+            group=topic.group,
+            stage_base_path=f"stage/{livekit.RUN_ID}/{lake_home.slug}",
+            catalog=lake_home.catalog.name,
+            namespace="ns1",
+            table=table.name,
+            flush_deadline_s=FLUSH_DEADLINE_S,
+            flush_sweep_s=1,
+        ),
+        variant_sources=(("properties_sv", "properties"),),
+    )
+    seqs: dict[int, list[int]] = {team: [] for team in PREFIX_TEAMS}
+    async with livekit.Pipeline(cfg, sweep_s=0.5) as pipe:
+        assert pipe.runner is not None and pipe.flusher is not None
+        # One wave per flush: WAVES small files per team, each team its
+        # own (team, month) group, every case in every file.
+        for wave in range(WAVES):
+            for k, team in enumerate(PREFIX_TEAMS):
+                start = (wave * len(PREFIX_TEAMS) + k) * len(CASES)
+                block = range(start, start + len(CASES))
+                await asyncio.to_thread(_produce, producer, block, team)
+                seqs[team].extend(block)
+            await livekit.wait_until_async(
+                lambda w=wave: (
+                    pipe.runner.halted is not None
+                    or min(_files_per_team(lake_home, table).values()) >= w + 1
+                ),
+                60,
+                desc=lambda w=wave: f"wave {w} flushed (halt: {pipe.runner.halted})",
+            )
+        assert pipe.runner.halted is None
+        assert pipe.runner.stuck_groups == 0
+        await livekit.wait_until_async(
+            lambda: pipe.stages.gauges().staged_groups == 0,
+            30,
+            desc=lambda: f"staging residue: {pipe.stages.gauges()}",
+        )
+        stats = pipe.flusher.stats()
+        assert stats.records_dropped == {}
+        assert {r for _, r in stats.variant_invalid} == {
+            "duplicate_key",
+            "invalid_unicode",
+        }
+
+    inputs = livekit.lake_files(table, lake_home.head())
+    per_team = Counter(_placed(lake_home, info, f) for f in inputs)
+    assert set(per_team) == set(PREFIX_TEAMS), per_team
+    assert min(per_team.values()) >= WAVES, per_team
+
+    # One group per sweep (HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN defaults
+    # to 1): sweep until a sweep compacts nothing, as the loop would.
+    totals: Counter[str] = Counter()
+    for _ in range(len(PREFIX_TEAMS) + 1):
+        result = await asyncio.to_thread(
+            lake_home.client._request,
+            "POST",
+            f"/catalogs/{lake_home.catalog.name}/maintenance/compact",
+        )
+        assert result["failed_groups"] == 0, result
+        if not result["groups_compacted"]:
+            break
+        totals.update(
+            {k: result[k] for k in ("groups_compacted", "files_in", "files_out")}
+        )
+    assert totals == {
+        "groups_compacted": len(PREFIX_TEAMS),
+        "files_in": len(inputs),
+        "files_out": len(PREFIX_TEAMS),
+    }, totals
+
+    outputs = livekit.lake_files(table, lake_home.head())
+    assert sorted(_placed(lake_home, info, f) for f in outputs) == sorted(PREFIX_TEAMS)
+    assert not {f.path for f in outputs} & {f.path for f in inputs}
+    for f in outputs:
+        team = int(f.partition_values[0])
+        data = _read(lake_home, f.path).read(columns=["team_id", "seq"])
+        assert set(data.column("team_id").to_pylist()) == {team}, f.path
+        assert sorted(data.column("seq").to_pylist()) == seqs[team], f.path
+        file_stats = lake_home.client._request(
+            "GET",
+            f"/catalogs/{lake_home.catalog.name}/namespaces/ns1/tables/"
+            f"{table.name}/files/{f.data_file_id}/stats",
+        )
+        (bounds,) = [c for c in file_stats["columns"] if c["path"] == "team_id"]
+        assert bounds["lower_bound"] == bounds["upper_bound"] == team, bounds
+    produced = range(WAVES * len(PREFIX_TEAMS) * len(CASES))
+    _assert_values(await asyncio.to_thread(_values, lake_home, table, column), produced)

@@ -113,6 +113,7 @@ def table_wire(
     columns: list[dict[str, Any]] | None = None,
     spec: dict[str, Any] | None = None,
     sort: dict[str, Any] | None = None,
+    object_prefix_field: str | None = None,
 ) -> dict[str, Any]:
     wire: dict[str, Any] = {
         "name": TABLE,
@@ -125,6 +126,8 @@ def table_wire(
         wire["sort_spec"] = sort
     if read_snapshot_id is not None:
         wire["read_snapshot_id"] = read_snapshot_id
+    if object_prefix_field is not None:
+        wire["object_prefix_field"] = object_prefix_field
     return wire
 
 

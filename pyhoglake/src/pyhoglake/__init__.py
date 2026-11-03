@@ -3,7 +3,7 @@
 import importlib.metadata
 import logging
 
-from . import ops, transforms, upload, variant, writer
+from . import object_prefix, ops, transforms, upload, variant, writer
 from .auth import BearerToken, ClientCredentials
 from .bounds import decode_bound, encode_bound
 from .client import (
@@ -35,6 +35,7 @@ from .errors import (
     IncarnationChangedError,
     MalformedResponseError,
     NotFoundError,
+    ObjectPrefixViolationError,
     OffsetRegressionError,
     ReadSnapshotExpiredError,
     ReconciliationRequiredError,
@@ -128,6 +129,7 @@ __all__ = [
     "MalformedResponseError",
     "Namespace",
     "NotFoundError",
+    "ObjectPrefixViolationError",
     "OffsetRegressionError",
     "PartitionField",
     "PartitionSpec",
@@ -156,6 +158,7 @@ __all__ = [
     "coltype_to_arrow",
     "decode_bound",
     "encode_bound",
+    "object_prefix",
     "ops",
     "parquet_write_options",
     "transforms",

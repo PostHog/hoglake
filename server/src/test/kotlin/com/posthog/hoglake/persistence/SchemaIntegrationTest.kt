@@ -116,7 +116,7 @@ class SchemaIntegrationTest {
         val catalogId = 4242L
         db.jdbi.open().use { h ->
             h.begin()
-            Locks.acquireCatalogCommitLock(h, catalogId)
+            Locks.acquireCatalogCommitLock(h, catalogId, "test-holder", CommitLockPath.COMMIT)
 
             val held =
                 h.createQuery(

@@ -149,3 +149,13 @@ setting. `test_writer.py` holds both paths and the core to it, with the
 `created_by` of the pyarrow it ran on put back to the captured one. Recapture
 it with `PYHOGLAKE_RECAPTURE_WRITER_GOLDEN=1` only after a pyarrow upgrade
 that changes its bytes, never to make a writer change pass.
+
+# JSON parsing vectors: JSONTestSuite
+
+`JSONTestSuite/test_parsing/` (318 files) is copied unmodified from
+https://github.com/nst/JSONTestSuite at commit
+1ef36fa01286573e846ac449e8683f8833c5b26a, MIT-licensed (`JSONTestSuite/LICENSE`,
+provenance in `JSONTestSuite/NOTICE`). `test_variant_native_codec.py` encodes
+each file as one row with both VARIANT codecs and requires the same verdict,
+reason, path, message and bytes. Refresh by copying `test_parsing/` and
+`LICENSE` from a newer commit and updating both commit lines.

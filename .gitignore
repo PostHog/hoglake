@@ -59,3 +59,8 @@ dist/
 
 # Local and CI test reports
 .artifacts/
+
+# Cargo build output of the Rust VARIANT codec and its fuzz targets.
+/pyhoglake-variant-codec/**/target/
+/pyhoglake-variant-codec/fuzz/corpus/
+/pyhoglake-variant-codec/fuzz/artifacts/

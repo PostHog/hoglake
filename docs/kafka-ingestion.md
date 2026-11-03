@@ -109,7 +109,7 @@ volumes anywhere.
 ```
 rows/<group><partition_u32><offset_ob>   → event payload bytes
 meta/fence                               → the consumer's fence probe (not a row)
-meta/table_uuid                          → the destination incarnation the stage's rows were first committed to
+meta/table_uuid                          → the destination incarnation the stage's rows commit to
 ```
 
 `<group>` is the partition tuple, prefix-free: `arity u8`, then per
@@ -131,8 +131,9 @@ group with staged rows is always in the index, and every group becomes
 due within the slow-lane deadline.
 
 There is no quarantine: a record that can never become a row (not a
-JSON object, a malformed partition source, a value no column can hold)
-is dropped, logged and metered (`millrace_records_dropped_total{reason}`),
+JSON object, a malformed partition source, a value no column can hold,
+a null or negative value of an object-prefix table's field) is
+dropped, logged and metered (`millrace_records_dropped_total{reason}`),
 at consume time (nothing is staged for it) or at flush time (it is left
 out of the payload and deleted with its window). The exception is a
 mapped VARIANT column (`MILLRACE_VARIANT_SOURCES`): an invalid value is
@@ -212,7 +213,8 @@ no payload lowering ever runs under a stage's write lock.
   from and `expected_table_uuid`, the incarnation the startup resolve
   READ and pinned. A later read or commit naming another incarnation
   halts the process (exit 3): a human decides whether the staged rows
-  belong in the new table.
+  belong in the new table (if so, `MILLRACE_STAGE_REPIN_FROM` names the
+  old incarnation for one rollout).
 - Every build mints a fresh uuid4 `idempotency_key` per commit. An
   ambiguous answer (5xx, 408, 429, a transport error) or a plain 409
   `commit_conflict` resends the IDENTICAL bytes under the same key, and
@@ -223,10 +225,17 @@ no payload lowering ever runs under a stage's write lock.
   `table_dropped`) fails the decision: nothing is deleted, the group
   retries with backoff, and after three consecutive failures it is
   reported stuck (ERROR log, counter, gauge) while every other group
-  keeps flushing. Rows are never dropped for a refusal.
-- Object names are `…/{build}/{index}.parquet`, `build` a fresh token
-  per build, so a rebuild never touches objects a landed commit may
-  name. Every object exists before a commit names it.
+  keeps flushing. Rows are never dropped for a refusal. A 422
+  `object_prefix_violation` is such a refusal too, though its body says
+  re-prepare: an option set after millrace's read is answered
+  `ddl_since_read_snapshot` first (every alter is DDL), so the 422
+  means millrace's pre-upload check and the server's disagree, which a
+  rebuild would repeat.
+- Object names are `…/{build}/{index}.parquet`
+  (`…/{field}={value}/{build}/{index}.parquet` on a table whose
+  `object_prefix_field` is set), `build` a fresh token per build, so a
+  rebuild never touches objects a landed commit may name. Every object
+  exists before a commit names it.
 - Table identity reads use `totals=false`; the shape cache's TTL is a
   quarter of the catalog's snapshot retention, so the commit's
   conflict window always covers a spec change.
@@ -234,7 +243,10 @@ no payload lowering ever runs under a stage's write lock.
 Stats policy is keyed on the realized file size: a file of at least
 32 MiB ships full footer stats; smaller files ship
 `stats_mode=deferred` and the hydrator backfills bounds off the commit
-path.
+path. On an object-prefix table a smaller file ships that field's stats
+inline instead, so it is `provided` at commit, and it is never
+hydrated: it has no bounds on other columns until compaction rewrites
+it.
 
 ## Delivery semantics
 
@@ -284,7 +296,8 @@ Per-commit rows grow only by the bounded flush window (≤
 `MILLRACE_FLUSH_BYTES` of staged input, ≤ 512 files per commit);
 receipts expire server-side (`HOGLAKE_RECEIPT_RETENTION_SECONDS`, V24);
 stats rows of files under 32 MiB arrive deferred via the hydrator
-rather than in the commit body.
+rather than in the commit body (on an object-prefix table, that field's
+row inline).
 The open question is compaction throughput at that arrival rate, which
 is validation item 1, not an assumption.
 

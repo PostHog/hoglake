@@ -291,7 +291,16 @@ def test_flush_counters_are_exposed_by_exact_name_labels_and_value():
         raw = _raw(_collector(consumer, stages, flusher, runner))
         assert raw[("millrace_flushes_committed_total", ())] == 3
         assert raw[("millrace_flush_failures_total", ())] == 5
-        assert raw[("millrace_flush_commits_total", ())] == 7
+        assert (
+            raw[
+                (
+                    "millrace_flush_commits_total",
+                    (("catalog", "cat"), ("table", "ns1.events")),
+                )
+            ]
+            == 7
+        )
+        assert ("millrace_flush_commits_total", ()) not in raw
         assert raw[("millrace_flush_rows_published_total", ())] == 11
         assert raw[("millrace_flush_files_written_total", ())] == 13
         assert raw[("millrace_flush_bytes_written_total", ())] == 17

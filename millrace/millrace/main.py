@@ -162,7 +162,6 @@ class _PipelineCollector:
                 "Flush decisions that failed (rows stay staged and retry)",
                 f.decisions_failed,
             ),
-            ("millrace_flush_commits_total", "Hoglake commits that landed", f.commits),
             ("millrace_flush_rows_published_total", "Rows published", f.rows_published),
             (
                 "millrace_flush_files_written_total",
@@ -187,6 +186,18 @@ class _PipelineCollector:
         ]
         for name, doc, value in counters:
             yield CounterMetricFamily(name, doc, value=value)
+        # Labelled with the destination: other writers commit on the same
+        # catalog, so alerts on millrace's progress read this, not the
+        # server's per-catalog commit counter. `table` is `namespace.table`:
+        # the scrape honors exported labels, so a `namespace` label would
+        # replace the pod's Kubernetes namespace.
+        commits = CounterMetricFamily(
+            "millrace_flush_commits_total",
+            "Hoglake commits that landed, by destination catalog and table",
+            labels=["catalog", "table"],
+        )
+        commits.add_metric(list(self._flusher.destination), f.commits)
+        yield commits
         dropped = CounterMetricFamily(
             "millrace_records_dropped_total",
             "Records that cannot be represented (consume or flush time), by reason",

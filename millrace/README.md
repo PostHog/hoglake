@@ -55,6 +55,7 @@ shape behavior:
 | `MILLRACE_SLOW_LANE_DEADLINE_S` | 21600 | any group this old flushes |
 | `MILLRACE_KAFKA_AUTO_OFFSET_RESET` | `latest` | where a partition with no committed offset starts |
 | `MILLRACE_VARIANT_SOURCES` | unset | `column=payload_key,…`: the variant columns filled from a payload key's JSON text (see "VARIANT columns") |
+| `MILLRACE_STAGE_REPIN_FROM` | unset | the old `table_uuid`, for one rollout that moves `MILLRACE_TABLE` to a new table: each stage pinned to it re-pins and drains into the new table instead of halting (exit 3). Remove it once every pod has rolled |
 
 ## Destination
 
@@ -308,6 +309,7 @@ are never judged: ancient and far-future events are written.
 | Consume | `malformed_value` | not a strict JSON object |
 | Consume | `malformed_partition_source` | a partition source value of the wrong type or uncoercible (the log names the path) |
 | Flush | `undecodable_payload` / `uncastable_column` | a value no column can hold (the log names the first refusing column path, never the value) |
+| Flush | `object_prefix_value` | on a table whose `object_prefix_field` is set, a null or negative value of that field: no prefix can hold the row (the server would refuse the whole commit) |
 
 ## SlateDB and pod memory
 

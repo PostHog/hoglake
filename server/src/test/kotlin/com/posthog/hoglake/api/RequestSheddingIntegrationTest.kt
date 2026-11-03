@@ -6,6 +6,7 @@ import com.posthog.hoglake.Config
 import com.posthog.hoglake.Database
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnDef
+import com.posthog.hoglake.persistence.CommitLockPath
 import com.posthog.hoglake.persistence.Locks
 import com.posthog.hoglake.service.CatalogService
 import com.posthog.hoglake.testing.PgTestSupport
@@ -132,7 +133,13 @@ class RequestSheddingIntegrationTest {
                         val started = System.nanoTime()
                         runCatching {
                             db.jdbi.useTransaction<Exception> { h ->
-                                Locks.acquireCatalogCommitLock(h, lockVictimCatalogId.get(), cfg.commitLockTimeoutMs)
+                                Locks.acquireCatalogCommitLock(
+                                    h,
+                                    lockVictimCatalogId.get(),
+                                    "test-holder",
+                                    CommitLockPath.COMMIT,
+                                    cfg.commitLockTimeoutMs,
+                                )
                             }
                         }
                         call.respondText("${(System.nanoTime() - started) / 1_000_000}")
@@ -302,7 +309,7 @@ class RequestSheddingIntegrationTest {
         val holder =
             thread(name = "shed-slow-lock-holder") {
                 db.jdbi.useTransaction<Exception> { h ->
-                    Locks.acquireCatalogCommitLock(h, catalogId)
+                    Locks.acquireCatalogCommitLock(h, catalogId, "test-holder", CommitLockPath.COMMIT)
                     lockHeld.countDown()
                     releaseLock.await(60, TimeUnit.SECONDS)
                 }
@@ -347,7 +354,7 @@ class RequestSheddingIntegrationTest {
         val holder =
             thread(name = "shed-lock-holder") {
                 db.jdbi.useTransaction<Exception> { h ->
-                    Locks.acquireCatalogCommitLock(h, catalogId)
+                    Locks.acquireCatalogCommitLock(h, catalogId, "test-holder", CommitLockPath.COMMIT)
                     lockHeld.countDown()
                     releaseLock.await(60, TimeUnit.SECONDS)
                 }
