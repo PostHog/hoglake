@@ -780,7 +780,7 @@ object Metrics {
     fun multipartAbortFailed() = increment("hoglake_multipart_abort_failures_total", 1.0)
 
     /**
-     * hoglake_auth_requests_total{mode,outcome,client} — every request the auth
+     * hoglake_auth_requests_total{mode,listener,outcome,client} — every request the auth
      * plugin looked at.
      *
      * The `warn` mode's whole purpose is this series: an operator flip to
@@ -801,9 +801,21 @@ object Metrics {
      */
     fun authRequest(
         mode: String,
+        listener: String,
         outcome: String,
         client: String,
-    ) = increment("hoglake_auth_requests_total", 1.0, "mode", mode, "outcome", outcome, "client", client)
+    ) = increment(
+        "hoglake_auth_requests_total",
+        1.0,
+        "mode",
+        mode,
+        "listener",
+        listener,
+        "outcome",
+        outcome,
+        "client",
+        client,
+    )
 
     /**
      * hoglake_auth_denials_total{catalog,scope,reason} — refusals that
