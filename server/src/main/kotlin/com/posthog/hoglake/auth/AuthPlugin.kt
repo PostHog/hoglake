@@ -30,11 +30,32 @@ import io.ktor.util.AttributeKey
 class AuthService(
     val mode: AuthMode,
     val verifier: JwtVerifier?,
+    /**
+     * Refuse an operator token even when it verifies, as though it had not
+     * been sent. Set on the public listener only: an operator token is minted
+     * in-cluster and never handed to a party outside it, so one arriving from
+     * the internet is a leak, and the operator routes it would open
+     * (maintenance, debug, /metrics) are not a public surface.
+     */
+    val tenantOnly: Boolean = false,
 ) {
     init {
         require(mode == AuthMode.OFF || verifier != null) {
             "auth mode '${mode.wire}' needs a verifier; HOGLAKE_AUTH_ISSUER plus a JWKS source are required"
         }
+    }
+
+    /**
+     * The public listener's service (HOGLAKE_PUBLIC_PORT): this verifier, under
+     * `enforce`, tenants only, whatever this instance's own mode is. Off has no
+     * verifier, and the public listener cannot run without one.
+     */
+    fun forPublicListener(): AuthService {
+        val v =
+            requireNotNull(verifier) {
+                "HOGLAKE_PUBLIC_PORT requires HOGLAKE_AUTH_MODE warn or enforce: the public listener always enforces"
+            }
+        return AuthService(AuthMode.ENFORCE, v, tenantOnly = true)
     }
 
     companion object {
@@ -249,6 +270,14 @@ val HoglakeAuth =
                     AuthLog.debug(v) { "token refused for ${call.request.path()}" }
                     failure = HoglakeException.Unauthenticated(v.reason, "token refused")
                 }
+            }
+            // The public listener: an operator token is dropped, so the request
+            // is anonymous from here on. A PUBLIC route still answers; every
+            // other one refuses it as it would any bad token.
+            if (service.tenantOnly && caller?.kind?.isOperator() == true) {
+                AuthLog.warn { "operator token presented on the public listener for ${call.request.path()}; refused" }
+                caller = null
+                failure = HoglakeException.Unauthenticated(JwtViolation.MALFORMED, "token refused")
             }
 
             // Recorded for BOTH outcomes: an anonymous request under `warn` or

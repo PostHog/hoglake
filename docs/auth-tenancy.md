@@ -628,6 +628,17 @@ refusal, so the zero-refusals gate (§11) could never pass. `/healthz` and
 `/livez` stay on the API port, where the kubelet probes them and the route
 table already exempts them.
 
+*Landed for customers:* `HOGLAKE_PUBLIC_PORT` (default `0`, off) starts a
+second API listener with the same routes, process and verifier, meant for an
+internet-facing load balancer. It always enforces, whatever
+`HOGLAKE_AUTH_MODE` says, so the API port can stay at `warn` through rollout
+while the public one never serves an untokened call. It also refuses a
+verified `OPERATOR` token with `401 invalid_token`: operator credentials are
+for the cluster, and refusing them here means a leaked one is useless from the
+internet. It needs a verifier, so it cannot be set when
+`HOGLAKE_AUTH_MODE=off`, and it must differ from the API and metrics ports
+(`Config.kt`, `AuthService.forPublicListener` in `auth/AuthPlugin.kt`).
+
 *Not built, superseded by the above:* `/v1/database/health` and `/v1/debug/*`
 stay on the API port as `OPERATOR`, and the infra port has no fixed default.
 The original plan was to split the process's ports:

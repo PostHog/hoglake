@@ -86,6 +86,16 @@ class App private constructor(
      */
     val requestDispatcher = RequestDispatcher(cfg.requestThreads)
 
+    /**
+     * This instance's auth, built once so the API listener and the public
+     * listener share one verifier and one JWKS cache. LAZY, and that is
+     * load-bearing: [build] binds [Metrics] only after the constructor, and
+     * building this registers the signing-key gauge, so it must first happen
+     * in [module]. A mis-set mode (enforce with no issuer or key source) fails
+     * there, at boot, naming the variable — not with a fleet-wide 401.
+     */
+    val auth: com.posthog.hoglake.auth.AuthService by lazy { com.posthog.hoglake.auth.AuthService.fromConfig(cfg) }
+
     private val catalogService = CatalogService(jdbi)
     private val commitService =
         CommitService(
@@ -295,7 +305,16 @@ class App private constructor(
             }
     }
 
-    fun module(app: Application) {
+    /**
+     * Mounts every route on [app] behind [auth]: this instance's own on the
+     * API listener, [com.posthog.hoglake.auth.AuthService.forPublicListener]
+     * on the public one. The routes are the same; only who may call them
+     * differs.
+     */
+    fun module(
+        app: Application,
+        auth: com.posthog.hoglake.auth.AuthService = this.auth,
+    ) {
         // RequestId comes before auth, and the order is load-bearing. Auth
         // refuses by responding from inside its own interceptor, so anything
         // installed after it runs on a call whose response is already built: a
@@ -321,8 +340,8 @@ class App private constructor(
         // Inert unless HOGLAKE_AUTH_MODE says otherwise: `off` is the default and
         // resolves no callers, which is precisely today's behaviour. A mis-set
         // `enforce` (no issuer, no key source) fails here, at boot, naming the
-        // variable — not with a fleet-wide 401.
-        app.installAuth(com.posthog.hoglake.auth.AuthService.fromConfig(cfg))
+        // variable — not with a fleet-wide 401 (see [auth]).
+        app.installAuth(auth)
 
         // Then, and once: every handler installed below this line runs
         // its blocking database/object-store work on requestDispatcher
