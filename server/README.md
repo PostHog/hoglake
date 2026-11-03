@@ -574,16 +574,25 @@ f.table_id AND t.dropped_snapshot IS NULL)`. The next sweeps re-check
 each footer. That re-checks every inline-stats file in the window too
 (their stats rows are rewritten from the footer, the upsert being `ON
 CONFLICT DO UPDATE`), and `POST .../maintenance/rehydrate` is no
-substitute: it re-pends only `failed` files. Of the in-tree writers only
-duckdb-client's INSERT conforms, and only on a spec of identity fields
-with the prefix field first: it writes hive `<field>=<value>/`
-directories under the table root, keeps the partition column in the
-file and always defers stats, so its files register `pending` and the
-hydrator proves them. Because it always defers, the hydrator-version
-rule above covers every DuckDB INSERT. Every other write is refused
-with `object_prefix_violation`: millrace/millpond
-(`{data_path}/data/{ns}/{table}/{build}`), pyhoglake
-(`.../{table}/{idempotency_key}/`), duckdb-client DELETE/UPDATE
+substitute: it re-pends only `failed` files. Of the in-tree writers,
+millrace conforms: it writes each file as `<build>/<index>.parquet`
+under its value's prefix (built by `pyhoglake.object_prefix.prefix`),
+with its stats inline, never deferred (only the prefix field's below
+`FOOTER_STATS_MIN_BYTES`, 32 MiB; the full footer stats from there), so
+its files register `provided` and the hydrator-version rule above does
+not apply to them. Before upload it holds each file's own footer stats
+for the field to the file's value, and at decode it drops a row whose
+value is null or negative, which no prefix can hold (counted in
+`millrace_records_dropped_total`). duckdb-client's INSERT conforms too,
+but only on a spec of identity fields with the prefix field first: it
+writes hive `<field>=<value>/` directories under the table root, keeps
+the partition column in the file and always defers stats, so its files
+register `pending` and the hydrator proves them. Because it always
+defers, that rule covers every DuckDB INSERT. Every other write is
+refused with `object_prefix_violation`: pyhoglake's `Table.append`
+(`.../{table}/{uuid}.parquet`), its `prepare_append_*`
+(`.../{table}/{idempotency_key}/`, hedgerow's and millpond's path),
+duckdb-client DELETE/UPDATE
 (deletion vectors at the table root, `hoglake-dv-<uuid>.puffin`) and
 Trino writes (their upload claims are not under a value's prefix).
 Enable the option only on a table whose writer is layout-aware, in this
