@@ -18,8 +18,9 @@ Pinned here:
   rows through the sort and the fanout;
 - a variant refusal that still reaches the build is a FlushError naming
   the column and reason, never payload text;
-- the encode is its own build stage, and the flusher counts rows,
-  reasons and declared paths per column;
+- the encode is its own build stage, each encode call is timed per
+  column less the shadow's seconds, and the flusher counts rows, reasons,
+  declared paths and those seconds per column and codec;
 - a column added under a running flusher (rollout step 3) is written
   SQL NULL by the rebuild on the re-read shape.
 """
@@ -65,6 +66,7 @@ from millrace.coerce import (
     DecodeError,
     UnsupportedColumnError,
 )
+from millrace.config import variant_codec
 from millrace.flush import FlushStartupError, JsonObjectDecoder, build_flush_plan
 
 component = pytest.mark.component
@@ -498,6 +500,29 @@ class TestBuild:
         assert plan.stage_seconds["variant_encode"] == 14.0
         assert plan.stage_seconds["write"] == 0.0
 
+    def test_each_encode_call_is_timed_less_the_shadow(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The call's wall time per file, summed per column; the shadow's
+        seconds stay in the stage and in shadow_seconds only."""
+        now = [0.0]
+        real = flush_mod.encode_json
+
+        def shadowed(*args: Any, **kwargs: Any) -> Any:
+            now[0] += 7.0
+            encoded = real(*args, **kwargs)
+            encoded.report.shadow_seconds = 2.0
+            return encoded
+
+        monkeypatch.setattr(flush_mod, "encode_json", shadowed)
+        payloads = [event_payload(7, NOW, properties="{}")] * 2 + [
+            event_payload(7, NOW - 40 * DAY_US, properties="{}")
+        ]
+        plan = plan_for(payloads, info_for(), clock=lambda: now[0])
+        report = plan.variant["properties_sv"]
+        assert (report.encode_seconds, report.shadow_seconds) == (10.0, 4.0)
+        assert plan.stage_seconds["variant_encode"] == 14.0
+
     @pytest.mark.parametrize(
         "wire", [COLUMNS_WIRE, VARIANT_WIRE], ids=["none", "unmapped"]
     )
@@ -571,6 +596,10 @@ async def test_a_flush_lands_every_row_and_counts_per_column(
     assert values.get(("properties_sv", "$.$os", "fallback"), 0) == 0
     assert values[("properties_sv", "$", "variant_null")] == 1
     assert stats.build_seconds["variant_encode"] > 0.0
+    # Under the process's codec; the other is exported at 0.
+    other = {"native": "python", "python": "native"}[variant_codec()]
+    assert stats.variant_encode_seconds[("properties_sv", variant_codec())] > 0.0
+    assert stats.variant_encode_seconds[("properties_sv", other)] == 0.0
 
     # A second build adds to every counter (they are Prometheus counters).
     await stage.stage_batch(
@@ -587,6 +616,8 @@ async def test_a_flush_lands_every_row_and_counts_per_column(
     assert again.variant_rows == {k: 2 * v for k, v in stats.variant_rows.items()}
     assert again.variant_invalid == {k: 2 * v for k, v in stats.variant_invalid.items()}
     assert again.variant_values == {k: 2 * v for k, v in stats.variant_values.items()}
+    encoded = ("properties_sv", variant_codec())
+    assert again.variant_encode_seconds[encoded] > stats.variant_encode_seconds[encoded]
 
 
 @component
