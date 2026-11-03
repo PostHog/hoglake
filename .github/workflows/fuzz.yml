@@ -112,24 +112,25 @@ jobs:
             server/build/reports/tests/
           if-no-files-found: warn
 
-  # The Rust VARIANT codec's encoder (pyhoglake-variant-codec/fuzz):
-  # any bytes as a row, 600 s a night. A crash fails the run and uploads
-  # the input libFuzzer saved.
+  # The Rust VARIANT codec (pyhoglake-variant-codec/fuzz): any bytes as a
+  # row to encode, and as a value to decode, 600 s each a night. A crash
+  # fails the run and uploads the input libFuzzer saved.
   variant-codec:
     if: github.repository == 'PostHog/hoglake'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Fuzz encode_json
+      - name: Fuzz encode_json and decode
         working-directory: pyhoglake-variant-codec/fuzz
         run: |
           rustup toolchain install nightly --profile minimal
           cargo +nightly install cargo-fuzz --locked --version 0.13.2
           cargo +nightly fuzz run encode_json -- -max_total_time=600
+          cargo +nightly fuzz run decode -- -max_total_time=600
 
       - name: Upload findings
         if: failure()
