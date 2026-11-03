@@ -322,10 +322,12 @@ class VariantReport:
     encode_seconds: float = 0.0
     #: Calls the Rust codec's result was not used for and Python encoded
     #: again, by why: ``mismatch``, ``type``, ``panic`` or
-    #: ``shadow_mismatch``; and rows nested past a parser's recursion bound,
-    #: whose verdict is Python's (``recursion_bound``, not re-encoded).
-    #: Transitional.
+    #: ``shadow_mismatch``. Transitional.
     codec_fallbacks: dict[str, int] = _field(default_factory=dict)
+    #: Invalid rows nested past a parser's recursion bound, whose verdict
+    #: is the Python codec's; not a fallback, since nothing is encoded
+    #: again, and a hostile row can cause one. Transitional.
+    recursion_bound_rows: int = 0
     #: Wall time the shadow spent encoding in Python again
     #: (``PYHOGLAKE_VARIANT_SHADOW``), not in encode_seconds. Transitional.
     shadow_seconds: float = 0.0
@@ -344,6 +346,7 @@ class VariantReport:
             self.first_invalid = other.first_invalid
         self.encode_seconds += other.encode_seconds
         _add_counts(self.codec_fallbacks, other.codec_fallbacks)
+        self.recursion_bound_rows += other.recursion_bound_rows
         self.shadow_seconds += other.shadow_seconds
 
 

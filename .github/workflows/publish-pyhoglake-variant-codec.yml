@@ -1,0 +1,103 @@
+name: Publish pyhoglake-variant-codec
+
+# Publishes pyhoglake-variant-codec, pyhoglake's Rust VARIANT codec, to
+# PyPI through OIDC trusted publishing (no API-token secret): the wheels
+# and sdist variant-codec-wheels.yml built and tested in this same run,
+# those exact files. Trigger: push a tag named
+# pyhoglake-variant-codec-v<version> that matches the version in
+# pyhoglake-variant-codec/pyproject.toml, which must also be pyhoglake's
+# (pyhoglake takes the codec only at its own version).
+#
+# PyPI side: the project's trusted publisher pins this repo, this
+# workflow file, and the `pypi` environment. GitHub side: the `pypi`
+# environment's deployment tag rule must admit pyhoglake-variant-codec-v*.
+#
+# Pull requests that touch this workflow, and manual runs from a branch,
+# build and test every platform without publishing (CI's PRs build only
+# the manylinux wheels).
+
+on:
+  push:
+    tags:
+      - "pyhoglake-variant-codec-v*"
+  pull_request:
+    paths:
+      - ".github/workflows/publish-pyhoglake-variant-codec.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Never cancel a tag run: it may be halfway through the PyPI upload.
+concurrency:
+  group: publish-pyhoglake-variant-codec-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+jobs:
+  wheels:
+    uses: ./.github/workflows/variant-codec-wheels.yml
+    with:
+      all-platforms: true
+
+  publish:
+    name: Publish to PyPI
+    needs: [wheels]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/project/pyhoglake-variant-codec/
+    permissions:
+      id-token: write # PyPI trusted publishing and the GitHub attestation
+      attestations: write # stores the GitHub attestation
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: variant-codec-*
+          merge-multiple: true
+          path: dist/
+
+      # GitHub-side SLSA provenance, verifiable with `gh attestation verify`.
+      # The PyPI upload below adds its own PEP 740 attestations by default.
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/*
+
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          packages-dir: dist
+
+  github-release:
+    name: Create GitHub release
+    needs: [publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write # creates the GitHub release
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: variant-codec-*
+          merge-multiple: true
+          path: dist/
+
+      # --latest=false keeps the server's vX.Y.Z release as the repo's latest.
+      - name: Create release with the published files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#pyhoglake-variant-codec-v}"
+          # PEP 440 pre and dev releases carry letters (1.1.0rc1, 1.0.1.dev0).
+          prerelease=false
+          if [[ "$version" =~ [a-z] ]]; then
+            prerelease=true
+          fi
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "pyhoglake-variant-codec $version" \
+            --notes "Published to PyPI: https://pypi.org/project/pyhoglake-variant-codec/$version/" \
+            --verify-tag \
+            --latest=false \
+            --prerelease="$prerelease"

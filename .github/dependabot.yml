@@ -61,6 +61,26 @@ updates:
       python-minor-patch:
         update-types: [minor, patch]
 
+  # The Rust VARIANT codec and its fuzz crate. arrow-* and parquet-variant
+  # stay on the major pyo3-arrow takes (59 for pyo3-arrow 0.20), so their
+  # majors move with a pyo3-arrow bump, by hand.
+  - package-ecosystem: cargo
+    directories:
+      - /pyhoglake-variant-codec
+      - /pyhoglake-variant-codec/fuzz
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      cargo-minor-patch:
+        update-types: [minor, patch]
+    ignore:
+      - dependency-name: "arrow-*"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "parquet-variant"
+        update-types: ["version-update:semver-major"]
+
   - package-ecosystem: github-actions
     directory: /
     schedule:

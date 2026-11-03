@@ -16,7 +16,8 @@ name: Millrace image
 #
 # pyhoglake/** is a trigger path as much as millrace/** is: millrace
 # installs the client from the sibling tree, so a pyhoglake change IS a
-# millrace image change.
+# millrace image change; so is a change to its Rust VARIANT codec,
+# pyhoglake-variant-codec/**, which the image builds and installs.
 # The root pyproject.toml and uv.lock likewise: the image installs from
 # the workspace lock, so a lock-only change IS an image change.
 
@@ -26,6 +27,7 @@ on:
     paths:
       - "millrace/**"
       - "pyhoglake/**"
+      - "pyhoglake-variant-codec/**"
       - "pyproject.toml"
       - "uv.lock"
       - ".github/workflows/millrace-image.yml"
@@ -36,6 +38,7 @@ on:
     paths:
       - "millrace/**"
       - "pyhoglake/**"
+      - "pyhoglake-variant-codec/**"
       - "pyproject.toml"
       - "uv.lock"
       - ".github/workflows/millrace-image.yml"
@@ -52,17 +55,26 @@ jobs:
   # Build and exercise the image on every PR and every main push. The
   # unit layer is ci-python.yml; this job's job is the IMAGE — that it
   # assembles for both entrypoints, that it is not root, and that the
-  # client inside it is the repo's, not PyPI's.
+  # client inside it is the repo's, not PyPI's. Both arches, as publish
+  # builds them: arm64 under QEMU, its Rust codec cross-built on amd64.
   image:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux/amd64, linux/arm64]
     concurrency:
-      group: millrace-image-${{ github.ref }}
+      group: millrace-image-${{ github.ref }}-${{ matrix.platform }}
       cancel-in-progress: true
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Set up QEMU
+        if: matrix.platform == 'linux/arm64'
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
@@ -74,6 +86,7 @@ jobs:
         with:
           context: .
           file: millrace/Dockerfile
+          platforms: ${{ matrix.platform }}
           load: true
           tags: hoglake-millrace:ci
           cache-from: type=gha,scope=millrace
@@ -121,6 +134,16 @@ jobs:
           echo "pyproject=$want image=$got origin=$origin"
           [ "$want" = "$got" ]
           case "$origin" in *file:///src/pyhoglake*) : ;; *) echo "::error::pyhoglake was not installed from the sibling tree"; exit 1 ;; esac
+
+      # The Rust VARIANT codec is in the image and off (python) by
+      # default; with native, pyhoglake takes it (this commit's protocol
+      # and version) and it encodes as the Python codec does.
+      - name: Smoke - the Rust VARIANT codec
+        run: |
+          docker run --rm --entrypoint python hoglake-millrace:ci -c \
+            'from pyhoglake import _variant_backend as b; assert b.MODE == "python", b.MODE'
+          docker run --rm -e PYHOGLAKE_VARIANT_CODEC=native -v "$PWD/ci:/ci:ro" \
+            --entrypoint python hoglake-millrace:ci /ci/variant_codec_smoke.py
 
   publish:
     # Gated on the image smoke and the live suite: a red main push

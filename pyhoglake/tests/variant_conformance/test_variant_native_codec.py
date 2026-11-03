@@ -114,7 +114,7 @@ def assert_same(rows, decl=None, **chunking):
     count of rows that took Python's verdict at a recursion bound."""
     python, python_report = _encode(rows, "python", decl, **chunking)
     native, native_report = _encode(rows, "native", decl, **chunking)
-    native_report.codec_fallbacks.pop("recursion_bound", None)
+    native_report.recursion_bound_rows = 0
     assert native_report == python_report
     assert [len(c) for c in native] == [len(c) for c in python]
     for mine, theirs in zip(native, python, strict=True):
@@ -560,7 +560,9 @@ def test_rows_past_a_recursion_bound_take_pythons_verdict():
     rows.append("[" * 20_000)
     python, python_report = _encode(rows, "python")
     native, native_report = _encode(rows, "native")
-    assert native_report.codec_fallbacks.pop("recursion_bound") >= 1
+    assert native_report.recursion_bound_rows >= 1
+    assert native_report.codec_fallbacks == {}
+    native_report.recursion_bound_rows = 0
     assert native_report == python_report
     assert python_report.invalid_rows == len(rows)
     assert native[0].equals(python[0])

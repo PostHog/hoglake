@@ -4,6 +4,7 @@
 name = "pyhoglake-variant-codec"
 version = "1.4.8.dev0"
 description = "pyhoglake's VARIANT value codec (private to pyhoglake)"
+readme = "README.md"
 license = "MIT"
 authors = [{ name = "PostHog" }]
 requires-python = ">=3.12"

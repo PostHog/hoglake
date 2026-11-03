@@ -34,7 +34,7 @@ from typing import Any
 
 from prometheus_client.core import REGISTRY, CounterMetricFamily, GaugeMetricFamily
 
-from .config import Config, ConfigError, load_config
+from .config import Config, ConfigError, load_config, variant_codec
 from .consumer import AssignmentError, MillraceConsumer, create_kafka_consumer
 from .destination import DestinationError, ensure_destination
 from .flush import STUCK_AFTER, FlushHalted, FlushRunner, HoglakeFlusher
@@ -259,12 +259,38 @@ class _PipelineCollector:
                 ["column", "path", "outcome"],
                 f.variant_values,
             ),
+            (
+                "millrace_variant_codec_fallback_total",
+                "Variant encodes Python redid for the Rust codec, by reason (transitional)",
+                ["reason"],
+                f.variant_codec_fallbacks,
+            ),
         )
         for name, doc, labels, counts in variant_families:
             family = CounterMetricFamily(name, doc, labels=labels)
             for key, count in sorted(counts.items()):
                 family.add_metric(list(key), count)
             yield family
+        yield CounterMetricFamily(
+            "millrace_variant_codec_recursion_bound_rows_total",
+            "Invalid variant rows past a JSON parser's recursion bound, whose "
+            "verdict is the Python codec's (transitional)",
+            value=f.variant_recursion_bound_rows,
+        )
+        yield CounterMetricFamily(
+            "millrace_variant_shadow_seconds_total",
+            "Seconds PYHOGLAKE_VARIANT_SHADOW spent encoding variant columns "
+            "in Python again, within the variant_encode stage (transitional)",
+            value=f.variant_shadow_seconds,
+        )
+        codec = GaugeMetricFamily(
+            "millrace_variant_codec_info",
+            "The codec encoding variant columns: native (Rust) or python "
+            "(PYHOGLAKE_VARIANT_CODEC; transitional)",
+            labels=["backend"],
+        )
+        codec.add_metric([variant_codec()], 1)
+        yield codec
         yield CounterMetricFamily(
             "millrace_flush_build_queue_seconds_total",
             "Seconds group builds waited for a millrace-hoglake pool thread",

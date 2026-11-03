@@ -40,7 +40,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Final
 
-from pyhoglake import UnsupportedTypeError, ValidationError
+from pyhoglake import UnsupportedTypeError, ValidationError, _variant_backend
 from pyhoglake.transforms import check_transform
 from pyhoglake.types import NESTED_TYPES, arrow_type_to_coltype, coltype_to_arrow
 
@@ -877,6 +877,14 @@ def _check_fields_against_columns(
             )
 
 
+def variant_codec() -> str:
+    """The codec encoding variant columns (JSON text): ``native``, pyhoglake's
+    Rust one, or ``python``. Transitional, until the Python codec goes."""
+    if _variant_backend.MODE == "python" or _variant_backend.native()[0] is None:
+        return "python"
+    return "native"
+
+
 def load_config(env: Mapping[str, str]) -> Config:
     """Parse and validate the ``MILLRACE_*`` environment. Every problem
     is collected into one :class:`ConfigError`."""
@@ -991,6 +999,13 @@ def load_config(env: Mapping[str, str]) -> Config:
             f"MILLRACE_FLUSH_DEADLINE_S={flush_deadline_s}"
         )
         slow_lane_deadline_s = None
+
+    # Required here, not at the first encode, where the raise would strand
+    # the group in staging. pyhoglake read the same variable at import.
+    if env.get(_variant_backend.ENV) == "native":
+        module, why = _variant_backend.native()
+        if module is None:
+            problems.append(f"{_variant_backend.ENV}=native, but {why}")
 
     port_raw = env.get("MILLRACE_METRICS_PORT", "").strip() or "8000"
     metrics_port: int | None

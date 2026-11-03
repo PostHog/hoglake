@@ -33,10 +33,16 @@ docs/
 # pyproject.toml and nothing else.
 hedgerow/*
 !hedgerow/pyproject.toml
-# Likewise the Rust codec (its cargo target/ is gigabytes): N3 builds
-# its wheel in a stage of its own.
+# Likewise the Rust codec (its cargo target/ is gigabytes): what the
+# wheel builds from, which millrace/Dockerfile's codec stage does. Not
+# rust-toolchain.toml: the stage's image pins the same Rust.
 pyhoglake-variant-codec/*
 !pyhoglake-variant-codec/pyproject.toml
+!pyhoglake-variant-codec/Cargo.toml
+!pyhoglake-variant-codec/Cargo.lock
+!pyhoglake-variant-codec/README.md
+!pyhoglake-variant-codec/LICENSE
+!pyhoglake-variant-codec/src/
 
 # Local run artifacts.
 **/bench-results.jsonl

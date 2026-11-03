@@ -1086,3 +1086,22 @@ class TestGrammarEdges:
     def test_sort_by_refuses_a_129_char_identifier(self):
         (p,) = problems(MINIMAL_ENV | {"MILLRACE_SORT_BY": _ID_129})
         assert "MILLRACE_SORT_BY" in p and "not a valid hoglake identifier" in p
+
+
+@pytest.mark.parametrize("mode", ["native", "auto", "python", ""])
+def test_a_native_variant_codec_is_required_at_config(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+):
+    """PYHOGLAKE_VARIANT_CODEC=native refuses at startup (exit 2) when
+    pyhoglake does not take the Rust codec, not at the first encode, which
+    would strand the group; the other modes fall back to Python."""
+    from pyhoglake import _variant_backend
+
+    env = MINIMAL_ENV | {"PYHOGLAKE_VARIANT_CODEC": mode}
+    monkeypatch.setattr(_variant_backend, "native", lambda: (None, "it is missing"))
+    if mode == "native":
+        assert problems(env) == ("PYHOGLAKE_VARIANT_CODEC=native, but it is missing",)
+    else:
+        load(env)
+    monkeypatch.setattr(_variant_backend, "native", lambda: (object(), ""))
+    load(env)

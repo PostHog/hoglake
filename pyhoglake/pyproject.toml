@@ -83,7 +83,11 @@ dev = [
 # The Rust VARIANT codec, a workspace member that _variant_backend uses
 # when it is installed: `uv sync --group variant-codec` builds it (Rust
 # needed). A group, not an extra, so that no release names the package
-# before it is published and its name claimed (N3).
+# before it is published and its name claimed.
+# FOLLOW-UP once pyhoglake-variant-codec is on PyPI (publish-pyhoglake-
+# variant-codec.yml): add the `variant-codec` extra, pinned to this
+# version, with markers matching variant-codec-wheels.yml's wheels
+# (design-native-encoder §6).
 variant-codec = ["pyhoglake-variant-codec"]
 
 [tool.uv.sources]
