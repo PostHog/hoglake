@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import Counter
 from typing import Any
 
 import pytest
@@ -376,11 +377,15 @@ def test_flush_counters_are_exposed_by_exact_name_labels_and_value():
             ]
             == 83
         )
-        # The Rust codec's transitional series: fallbacks by reason, apart
-        # from the rows a recursion bound took Python's verdict for.
+        # The Rust codec's transitional series: fallbacks by reason, each
+        # from 0, apart from the rows a recursion bound took Python's
+        # verdict for.
+        fallback = "millrace_variant_codec_fallback_total"
         assert raw[("millrace_variant_codec_recursion_bound_rows_total", ())] == 0
         assert raw[("millrace_variant_shadow_seconds_total", ())] == 0.0
-        assert not any(n == "millrace_variant_codec_fallback_total" for n, _ in raw)
+        assert _by_reason(raw, fallback) == dict.fromkeys(
+            ["mismatch", "type", "panic", "shadow_mismatch"], 0
+        )
         report = VariantReport(
             codec_fallbacks={"mismatch": 2, "shadow_mismatch": 1},
             recursion_bound_rows=3,
@@ -389,9 +394,12 @@ def test_flush_counters_are_exposed_by_exact_name_labels_and_value():
         flusher._note_variant("sv", report)
         flusher._note_variant("sv", report)
         raw = _raw(_collector(consumer, stages, flusher, runner))
-        fallback = "millrace_variant_codec_fallback_total"
-        assert raw[(fallback, (("reason", "mismatch"),))] == 4
-        assert raw[(fallback, (("reason", "shadow_mismatch"),))] == 2
+        assert _by_reason(raw, fallback) == {
+            "mismatch": 4,
+            "type": 0,
+            "panic": 0,
+            "shadow_mismatch": 2,
+        }
         assert raw[("millrace_variant_codec_recursion_bound_rows_total", ())] == 6
         assert raw[("millrace_variant_shadow_seconds_total", ())] == 0.5
         # The removed exactly-once machinery exports nothing.
@@ -400,6 +408,29 @@ def test_flush_counters_are_exposed_by_exact_name_labels_and_value():
             for name, _ in raw
             for word in ("prepared", "receipt", "deduped", "unresolved", "fenced")
         )
+    finally:
+        flusher.close()
+
+
+def _by_reason(raw: dict[Any, float], name: str) -> dict[str, float]:
+    return {dict(labels)["reason"]: v for (n, labels), v in raw.items() if n == name}
+
+
+def test_pipeline_collector_exports_the_decode_fallbacks(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A read has no VariantReport, so pyhoglake counts its fallbacks per
+    process; each scrape reads that count, every reason from 0."""
+    monkeypatch.setattr(_variant_backend, "DECODE_FALLBACKS", Counter())
+    consumer, stages, flusher, runner = _components()
+    name = "millrace_variant_codec_decode_fallback_total"
+    try:
+        collector = _collector(consumer, stages, flusher, runner)
+        assert _by_reason(_raw(collector), name) == {"mismatch": 0, "panic": 0}
+        _variant_backend._decode_fall_back("mismatch", 7, "sv")
+        _variant_backend._decode_fall_back("mismatch", None, None)
+        _variant_backend._decode_fall_back("panic", None, "sv")
+        assert _by_reason(_raw(collector), name) == {"mismatch": 2, "panic": 1}
     finally:
         flusher.close()
 
