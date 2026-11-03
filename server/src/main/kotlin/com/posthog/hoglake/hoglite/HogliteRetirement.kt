@@ -128,9 +128,7 @@ internal class HogliteRetirement(
         val candidates =
             store.queryCatalog(
                 catalog,
-                "SELECT id, dropped_snapshot FROM tables " +
-                    "WHERE dropped_snapshot IS NOT NULL AND dropped_snapshot <= ? " +
-                    "ORDER BY id LIMIT $MAX_TABLES_PER_RUN",
+                CANDIDATES_SQL,
                 floor,
             ).rows.map { Candidate(it[0].asLong(), it[1].asLong()) }
 
@@ -139,11 +137,9 @@ internal class HogliteRetirement(
         var dvsRetired = 0L
         var batches = 0L
         var skippedTables = 0L
-        var tablesRemaining = 0L
         for (candidate in candidates) {
             if (overBudget()) break
             var tableWorked = false
-            var tableStuck = false
             while (true) {
                 if (overBudget()) break
                 when (val outcome = retireBatch(catalog, candidate, floor)) {
@@ -157,7 +153,6 @@ internal class HogliteRetirement(
                     BatchOutcome.Drained -> break
                     is BatchOutcome.Stuck -> {
                         skippedTables++
-                        tableStuck = true
                         log.error {
                             "retirement batch for catalog '$catalog' table ${candidate.tableId} " +
                                 "is stuck: ${outcome.reason}; skipping the table"
@@ -169,17 +164,9 @@ internal class HogliteRetirement(
                 if (Thread.currentThread().isInterrupted) break
             }
             if (tableWorked) tables++
-            // A table still holding live rows after this run counts as
-            // remaining, whether the budget stopped it or it is stuck.
-            if (tableStuck || liveRows(catalog, candidate.tableId) > 0) tablesRemaining++
         }
-        // Candidates past the page are remaining by construction.
-        val unexamined =
-            store.queryCatalog(
-                catalog,
-                "SELECT COUNT(*) FROM tables WHERE dropped_snapshot IS NOT NULL AND dropped_snapshot <= ?",
-                floor,
-            ).firstRow()!![0].asLong() - candidates.size
+        val remaining =
+            store.queryCatalog(catalog, REMAINING_SQL, floor).firstRow()!![0].asLong()
         return RetirementResult(
             tables = tables,
             rowsRetired = rowsRetired,
@@ -191,19 +178,9 @@ internal class HogliteRetirement(
             skippedQueueFull = 0,
             convoyed = 0,
             skippedLocked = 0,
-            tablesRemaining = tablesRemaining + unexamined.coerceAtLeast(0),
+            tablesRemaining = remaining,
         )
     }
-
-    private fun liveRows(
-        catalog: String,
-        tableId: Long,
-    ): Long =
-        store.queryCatalog(
-            catalog,
-            "SELECT COUNT(*) FROM files WHERE table_id = ? AND end_snapshot IS NULL",
-            tableId,
-        ).firstRow()!![0].asLong()
 
     private sealed interface BatchOutcome {
         data class Retired(val rows: Long, val dvs: Long) : BatchOutcome
@@ -318,5 +295,21 @@ internal class HogliteRetirement(
 
         /** Bound on the candidate read; a fuller page just defers to the next run. */
         const val MAX_TABLES_PER_RUN = 1_000
+
+        /**
+         * Match RetirementService's eligibility: identity rows outlive retirement,
+         * so drained drops must not occupy the bounded candidate page. Vectors
+         * riding each live file (including superseded versions) retire with it.
+         * This is a correctness filter, not a bound on historical tables examined.
+         */
+        internal const val ELIGIBLE_PREDICATE =
+            "t.dropped_snapshot IS NOT NULL AND t.dropped_snapshot <= ? " +
+                "AND EXISTS (SELECT 1 FROM files f WHERE f.table_id = t.id AND f.end_snapshot IS NULL)"
+
+        /** Exposed so tests explain the exact production statements. */
+        internal const val CANDIDATES_SQL =
+            "SELECT t.id, t.dropped_snapshot FROM tables t WHERE $ELIGIBLE_PREDICATE " +
+                "ORDER BY t.id LIMIT $MAX_TABLES_PER_RUN"
+        internal const val REMAINING_SQL = "SELECT COUNT(*) FROM tables t WHERE $ELIGIBLE_PREDICATE"
     }
 }

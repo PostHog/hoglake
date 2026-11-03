@@ -1143,6 +1143,11 @@ class HogliteCatalogStore(
                 t.tableId,
             ) { HoglakeException.NotFound("table '$namespace.$table' in catalog '$catalog'") }
             tx.add(
+                "UPDATE columns SET end_snapshot = ${HogliteSchema.HEAD_SQL} " +
+                    "WHERE table_id = ? AND end_snapshot IS NULL",
+                t.tableId,
+            )
+            tx.add(
                 "INSERT INTO changes(snapshot_id, kind, object_id) " +
                     "VALUES (${HogliteSchema.HEAD_SQL}, 'table_dropped', ?)",
                 t.tableId,

@@ -45,8 +45,9 @@ internal object HogliteSchema {
      * The object-prefix layout (`set_object_prefix_field`), Postgres V29's
      * hog_table_layout: versioned like the spec rows, at most one live row
      * per table (the unique partial index). No unset op exists, so nothing
-     * ends a row today; expiry clears ended rows like the other versioned
-     * definitions, and the dropped-table purge deletes a purged table's rows.
+     * ends a layout row today. Expiry clears ended versioned definitions;
+     * retirement drains dropped tables' files and vectors, not their identity
+     * or layout rows.
      */
     const val TABLE_LAYOUTS_DDL =
         """CREATE TABLE IF NOT EXISTS table_layouts(

@@ -724,6 +724,7 @@ class HogliteBackendIntegrationTest {
         // idempotent: the same upload id re-claims the same path.
         assertThat(store.uploads.claim(catalog, claim.uploadId, owner, "s3://hoglake-it/$catalog", "data").path)
             .isEqualTo(claim.path)
+        // Valid footer metadata keeps both attempts focused on claim ownership.
         // a different owner committing the claimed path is fenced.
         assertThatThrownBy {
             store.commit(
@@ -736,7 +737,7 @@ class HogliteBackendIntegrationTest {
                             TableAppend(
                                 "ns",
                                 "t",
-                                listOf(FileRegistration(claim.path, 1, 1, 1)),
+                                listOf(FileRegistration(claim.path, 1, 100, 1)),
                                 expectedTableUuid = table.tableUuid,
                             ),
                         ),
@@ -754,7 +755,7 @@ class HogliteBackendIntegrationTest {
                         TableAppend(
                             "ns",
                             "t",
-                            listOf(FileRegistration(claim.path, 1, 1, 1)),
+                            listOf(FileRegistration(claim.path, 1, 100, 1)),
                             expectedTableUuid = table.tableUuid,
                         ),
                     ),

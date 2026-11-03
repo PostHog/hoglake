@@ -363,18 +363,7 @@ internal class HogliteTableCreations(
                     )
                 }
             } catch (e: HoglakeException.Validation) {
-                val tx = HogliteTx()
-                tx.add(
-                    "UPDATE table_creations SET files_json = ? WHERE operation = ?",
-                    encodedFiles,
-                    operationId.toString(),
-                )
-                tx.add(
-                    "UPDATE table_creations SET state = 'rejected', reason = 'definition_invalid' WHERE operation = ?",
-                    operationId.toString(),
-                )
-                store.runTx(catalog, HogliteCatalogStore.freshTxid("publish-reject"), null, tx)
-                return store.loadCreationOrThrow(catalog, operationId)
+                return rejectDurably(catalog, operationId, encodedFiles, "definition_invalid")
             }
 
             tx.allocateDdlSnapshot()
@@ -399,6 +388,11 @@ internal class HogliteTableCreations(
                         "WHERE table_id = ? AND end_snapshot IS NULL",
                     oldId,
                 ) { targetChangedRace }
+                tx.add(
+                    "UPDATE columns SET end_snapshot = ${HogliteSchema.HEAD_SQL} " +
+                        "WHERE table_id = ? AND end_snapshot IS NULL",
+                    oldId,
+                )
             }
             tx.affectOne(
                 "UPDATE meta SET next_table_id = next_table_id + 1 WHERE id = 1",

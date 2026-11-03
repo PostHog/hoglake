@@ -762,13 +762,14 @@ class HogliteGuardRaceTest {
             Hook({ m, p, b -> isTx(m, p, b) && claim.path in b && "INSERT INTO files" in b }, before = {
                 store.uploads.abandon(c, owner, listOf(claim.path))
             })
+        // Valid footer metadata lets the claim race, not file validation, decide.
         val r =
             runCatching {
                 pstore.commit(
                     c,
                     CommitRequest(
                         idempotencyKey = owner,
-                        appends = listOf(TableAppend("ns", "t", listOf(FileRegistration(claim.path, 1, 10, 5)))),
+                        appends = listOf(TableAppend("ns", "t", listOf(FileRegistration(claim.path, 1, 100, 5)))),
                     ),
                 )
             }

@@ -6,7 +6,7 @@ Run with a real release engine and Docker:
 HOGLITE_BINARY=/path/to/hoglited ./gradlew :test --tests '*Hoglite*'
 ```
 
-The gate adds 68 test invocations: 33 shared scenarios × two backends, one schema
+The shared gate runs 78 test invocations: 38 shared scenarios × two backends, one schema
 equivalence test, and one acknowledged-recovery test.
 
 `HogliteBackendConformanceIntegrationTest` has one parameterized scenario per
@@ -16,10 +16,10 @@ assertions do not choose a backend. PostgreSQL uses `PgTestSupport.freshDatabase
 against a real object store. No mocked catalog or transaction transport is used.
 The engine stdout goes to a file, not an undrained pipe.
 
-Without `HOGLITE_BINARY` or a `hoglited` executable on PATH, 30 PostgreSQL-only
-invocations still run. The 33 hoglite arms, three PostgreSQL Parquet/compaction
+Without `HOGLITE_BINARY` or a `hoglited` executable on PATH, 35 PostgreSQL-only
+invocations still run. The 38 hoglite arms, three PostgreSQL Parquet/compaction
 arms sharing the live fixture, schema equivalence and recovery explicitly abort
-with a missing-engine reason (38 invocations). JUnit represents assumption aborts
+with a missing-engine reason (43 invocations). JUnit represents assumption aborts
 as skipped in XML. On pushes to main, CI rejects these skips.
 It requires all six live suite reports by name. Pull requests skip the live
 hoglite suites by design. These are not silently successful tests.
@@ -38,7 +38,10 @@ hoglite suites by design. These are not silently successful tests.
   In particular truncate/stale-delete is DdlSinceReadSnapshot, not merely any
   CommitConflict. Fresh-read retired-file deletion is Validation.
 - Deletion-vector supersession, historical epochs, stale-epoch conflicts, and
-  cross-table staged-target refusal/transaction atomicity.
+  cross-table staged-target refusal/transaction atomicity. Zero and negative
+  deletion counts are refused on durable and same-commit targets.
+- Ordinary commit footer validation, including missing optional metadata, zero,
+  the exact file-size-minus-eight boundary, negative values and overflow-sized input.
 - Retention opt-in, consumer pinning and explicit disabling of the consumer floor;
   expired snapshot reads/writes fail with Expired and live files survive expiry.
 - Object-prefix proof, canonical values, deferred stats, option-off behavior,
@@ -57,6 +60,25 @@ hoglite suites by design. These are not silently successful tests.
   acknowledged commits and recovers with an empty local directory. Snapshot
   answers and receipts must survive S3 recovery. This tests acknowledged
   durability, not a controlled unacknowledged-read durability barrier.
+
+### Retirement and creation regressions
+
+`HogliteRetirementAndCreationIntegrationTest` separately drives the release engine
+and MinIO. It retires a real API-created target behind 1002 drained drops seeded
+with SQL, checks both superseded and live vectors are queued, and reads the actual
+maintenance ledger. A zero-budget run retains pending work; a drained rerun does
+none. Drop and replacement churn end only the current column versions at the
+allocated drop snapshot, preserve history, and leave no ended columns after real
+expiry. A transport interleaving lets abort land immediately before an invalid
+definition rejection transaction; the durable aborted receipt must win. Ktor
+routes verify footer and deletion-count HTTP refusals without advancing the head.
+
+The exact production candidate and remaining-count SQL share eligibility and are
+explained on 100001 file metadata rows (96000 live). The plans still scan table
+identities and probe a table-keyed file index. This fixture has no stats payload;
+it proves neither a bound on examined historical tables nor production-scale
+latency, retirement batching cost, object-store throughput, or reader capacity.
+Those scale concerns remain separate work.
 
 ### Read results must wait for their own durable basis
 

@@ -21,6 +21,7 @@ import com.posthog.hoglake.model.StatsSanity
 import com.posthog.hoglake.model.TableAppend
 import com.posthog.hoglake.model.TableDeletes
 import com.posthog.hoglake.model.pathStaysUnder
+import com.posthog.hoglake.model.validateFooterSize
 import com.posthog.hoglake.model.validateSplitOffsets
 import io.github.oshai.kotlinlogging.KotlinLogging
 import java.util.UUID
@@ -352,6 +353,12 @@ internal object HogliteCommit {
             val table = resolved.getValue("${delete.namespace}.${delete.table}")
             for (dv in delete.files) {
                 claimPath(dv.path, "delete")
+                if (dv.deleteCount <= 0) {
+                    throw HoglakeException.Validation(
+                        "delete_count must be > 0 for data_file_id ${dv.dataFileId} " +
+                            "in ${delete.namespace}.${delete.table}, got ${dv.deleteCount}",
+                    )
+                }
                 val staged = dv.dataFilePath
                 if (staged != null) {
                     if (dv.dataFileId != 0L) {
@@ -371,8 +378,11 @@ internal object HogliteCommit {
                             "the staged file $staged has two deletion vectors in one commit",
                         )
                     }
-                    if (dv.deleteCount < 0 || dv.fileSizeBytes < 0) {
-                        throw HoglakeException.Validation("negative delete_count/file_size_bytes for ${dv.path}")
+                    if (dv.fileSizeBytes < 0) {
+                        throw HoglakeException.Validation(
+                            "negative file_size_bytes for delete of data_file_id ${dv.dataFileId} " +
+                                "in ${delete.namespace}.${delete.table}",
+                        )
                     }
                     plannedDeletes += PlannedDelete(table, dv, stagedTarget = target)
                 } else {
@@ -386,8 +396,11 @@ internal object HogliteCommit {
                             "data_file_id ${dv.dataFileId} has two deletion vectors in one commit",
                         )
                     }
-                    if (dv.deleteCount < 0 || dv.fileSizeBytes < 0) {
-                        throw HoglakeException.Validation("negative delete_count/file_size_bytes for ${dv.path}")
+                    if (dv.fileSizeBytes < 0) {
+                        throw HoglakeException.Validation(
+                            "negative file_size_bytes for delete of data_file_id ${dv.dataFileId} " +
+                                "in ${delete.namespace}.${delete.table}",
+                        )
                     }
                     plannedDeletes += PlannedDelete(table, dv, stagedTarget = null)
                 }
@@ -1335,6 +1348,7 @@ internal object HogliteCommit {
         if (file.fileSizeBytes < 0) {
             throw HoglakeException.Validation("negative file_size_bytes for ${file.path} in $qualified")
         }
+        file.validateFooterSize()
         file.validateSplitOffsets()
         val values = file.partitionValues
         if (specFieldCount != null) {

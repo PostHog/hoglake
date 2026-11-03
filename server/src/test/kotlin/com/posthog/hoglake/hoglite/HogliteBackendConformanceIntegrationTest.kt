@@ -1636,4 +1636,161 @@ class HogliteBackendConformanceIntegrationTest {
         assertThat(store.changes(cat, "ns", "t", fromSnapshot = 0, toSnapshot = before).files).hasSize(1)
         assertThat(store.changes(cat, "ns", "t", fromSnapshot = truncated, toSnapshot = after).files).hasSize(1)
     }
+
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(Backend::class)
+    fun `ordinary commit footer boundaries match the creation contract`(backend: Backend) {
+        select(backend)
+        val cat = freshCatalog()
+        store.createNamespace(cat, "ns")
+        store.createTable(cat, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        val before = store.getCatalog(cat).headSnapshotId
+        for ((size, footer) in listOf(100L to -1L, 100L to 93L, 7L to 0L, Long.MAX_VALUE to Long.MAX_VALUE)) {
+            assertThatThrownBy {
+                store.commit(
+                    cat,
+                    CommitRequest(
+                        appends =
+                            listOf(
+                                TableAppend(
+                                    "ns",
+                                    "t",
+                                    listOf(FileRegistration("s3://hoglake-it/$cat/bad-$size-$footer", 1, size, footer)),
+                                ),
+                            ),
+                    ),
+                )
+            }.isExactlyInstanceOf(HoglakeException.Validation::class.java).hasMessage("invalid footer_size")
+            assertThat(store.getCatalog(cat).headSnapshotId).isEqualTo(before)
+            assertThat(store.listFiles(cat, "ns", "t")).isEmpty()
+        }
+        for ((i, pair) in listOf(100L to null, 8L to 0L, 100L to 92L).withIndex()) {
+            val (size, footer) = pair
+            store.commit(
+                cat,
+                CommitRequest(
+                    appends =
+                        listOf(
+                            TableAppend(
+                                "ns",
+                                "t",
+                                listOf(FileRegistration("s3://hoglake-it/$cat/valid-$i", 1, size, footer)),
+                            ),
+                        ),
+                ),
+            )
+        }
+        assertThat(store.listFiles(cat, "ns", "t")).hasSize(3)
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(Backend::class)
+    fun `deletion counts must be positive for durable and same commit targets`(backend: Backend) {
+        select(backend)
+        val cat = freshCatalog()
+        store.createNamespace(cat, "ns")
+        val table = store.createTable(cat, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        val dataPath = "s3://hoglake-it/$cat/data"
+        store.commit(
+            cat,
+            CommitRequest(
+                appends =
+                    listOf(
+                        TableAppend(
+                            "ns",
+                            "t",
+                            listOf(FileRegistration(dataPath, 10, 100)),
+                        ),
+                    ),
+            ),
+        )
+        val id = store.listFiles(cat, "ns", "t").single().dataFileId
+        for (staged in listOf(false, true)) {
+            val before = store.getCatalog(cat).headSnapshotId
+            for (count in listOf(0L, -1L)) {
+                val targetId = if (staged) 0L else id
+                val stagedPath = "s3://hoglake-it/$cat/staged-$count"
+                assertThatThrownBy {
+                    store.commit(
+                        cat,
+                        CommitRequest(
+                            readSnapshot = store.getCatalog(cat).headSnapshotId,
+                            allowPendingDeletes = staged,
+                            requireUnchangedTables = staged,
+                            idempotencyKey = UUID.randomUUID(),
+                            appends =
+                                if (staged) {
+                                    listOf(
+                                        TableAppend(
+                                            "ns",
+                                            "t",
+                                            listOf(FileRegistration(stagedPath, 10, 100)),
+                                            table.tableUuid,
+                                        ),
+                                    )
+                                } else {
+                                    emptyList()
+                                },
+                            deletes =
+                                listOf(
+                                    TableDeletes(
+                                        "ns",
+                                        "t",
+                                        listOf(
+                                            DeleteFileRegistration(
+                                                targetId,
+                                                "s3://hoglake-it/$cat/dv-$staged-$count",
+                                                count,
+                                                20,
+                                                if (staged) stagedPath else null,
+                                            ),
+                                        ),
+                                        table.tableUuid,
+                                    ),
+                                ),
+                        ),
+                    )
+                }.isExactlyInstanceOf(HoglakeException.Validation::class.java)
+                    .hasMessage("delete_count must be > 0 for data_file_id $targetId in ns.t, got $count")
+                assertThat(store.getCatalog(cat).headSnapshotId).isEqualTo(before)
+                assertThat(store.listFiles(cat, "ns", "t")).hasSize(1)
+            }
+            val stagedPath = "s3://hoglake-it/$cat/positive-staged"
+            store.commit(
+                cat,
+                CommitRequest(
+                    readSnapshot = store.getCatalog(cat).headSnapshotId,
+                    allowPendingDeletes = staged,
+                    requireUnchangedTables = staged,
+                    idempotencyKey = UUID.randomUUID(),
+                    appends =
+                        if (staged) {
+                            listOf(
+                                TableAppend("ns", "t", listOf(FileRegistration(stagedPath, 10, 100)), table.tableUuid),
+                            )
+                        } else {
+                            emptyList()
+                        },
+                    deletes =
+                        listOf(
+                            TableDeletes(
+                                "ns",
+                                "t",
+                                listOf(
+                                    DeleteFileRegistration(
+                                        if (staged) 0 else id,
+                                        "s3://hoglake-it/$cat/positive-$staged",
+                                        1,
+                                        20,
+                                        if (staged) stagedPath else null,
+                                    ),
+                                ),
+                                table.tableUuid,
+                            ),
+                        ),
+                ),
+            )
+        }
+        assertThat(store.listFiles(cat, "ns", "t")).hasSize(2)
+    }
 }
