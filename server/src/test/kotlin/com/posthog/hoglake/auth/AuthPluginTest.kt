@@ -26,6 +26,7 @@ import io.ktor.server.testing.testApplication
 import io.micrometer.prometheusmetrics.PrometheusConfig
 import io.micrometer.prometheusmetrics.PrometheusMeterRegistry
 import org.assertj.core.api.Assertions.assertThat
+import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Test
 import java.security.KeyPair
@@ -65,8 +66,10 @@ class AuthPluginTest {
      * interesting shape of route. `whoami` echoes the resolved actor so a test
      * can see whether a caller was attached at all.
      */
-    private fun Application.harness(mode: AuthMode) {
-        installAuth(service(mode))
+    private fun Application.harness(mode: AuthMode) = harness(service(mode))
+
+    private fun Application.harness(service: AuthService) {
+        installAuth(service)
         install(ContentNegotiation) { jackson { configureHoglakeWire() } }
         routing {
             get("/livez") { call.respondText("ok") }
@@ -83,6 +86,68 @@ class AuthPluginTest {
     }
 
     private fun token(claims: String = TestTokens.tenantClaims()) = TestTokens.mint(pair, claims)
+
+    // ---- the public listener (HOGLAKE_PUBLIC_PORT) -------------------------
+
+    @Test
+    fun `the public listener enforces even where the instance only warns`() =
+        testApplication {
+            val registry = PrometheusMeterRegistry(PrometheusConfig.DEFAULT)
+            Metrics.bind(registry)
+            // MUTATION: make forPublicListener keep the instance's own mode and
+            // these anonymous calls are let through under warn.
+            application { harness(service(AuthMode.WARN).forPublicListener()) }
+            assertThat(client.get("/v1/catalogs").status).isEqualTo(HttpStatusCode.Unauthorized)
+            assertThat(client.post("/v1/catalogs/lake/commit").status).isEqualTo(HttpStatusCode.Unauthorized)
+            assertThat(client.post("/v1/catalogs").status).isEqualTo(HttpStatusCode.Unauthorized)
+            val tenant =
+                client.get("/v1/catalogs") { header(HttpHeaders.Authorization, "Bearer ${token()}") }
+            assertThat(tenant.status).isEqualTo(HttpStatusCode.OK)
+            assertThat(tenant.bodyAsText()).isEqualTo("client:hedgerow-prod")
+            assertThat(client.get("/livez").status).isEqualTo(HttpStatusCode.OK)
+            // Its refusals are counted apart from the API port's enforce gate.
+            assertThat(registry.scrape()).contains("listener=\"public\"").doesNotContain("listener=\"api\"")
+        }
+
+    @Test
+    fun `the public listener refuses an operator token that verifies`() =
+        testApplication {
+            application { harness(service(AuthMode.ENFORCE).forPublicListener()) }
+            val operator = "Bearer ${token(TestTokens.operatorClaims())}"
+            val compact =
+                client.post(
+                    "/v1/catalogs/lake/maintenance/compact",
+                ) { header(HttpHeaders.Authorization, operator) }
+            assertThat(compact.status).isEqualTo(HttpStatusCode.Unauthorized)
+            assertThat(compact.headers[HttpHeaders.WWWAuthenticate]).contains("invalid_token")
+            assertThat(client.get("/v1/database/health") { header(HttpHeaders.Authorization, operator) }.status)
+                .isEqualTo(HttpStatusCode.Unauthorized)
+            assertThat(client.get("/v1/catalogs") { header(HttpHeaders.Authorization, operator) }.status)
+                .isEqualTo(HttpStatusCode.Unauthorized)
+            // A PUBLIC route still answers, with no caller attached.
+            assertThat(client.get("/v1/info") { header(HttpHeaders.Authorization, operator) }.bodyAsText())
+                .isEqualTo("Anonymous")
+        }
+
+    @Test
+    fun `the API listener still honours the operator token the public one refuses`() =
+        testApplication {
+            application { harness(AuthMode.ENFORCE) }
+            val operator = "Bearer ${token(TestTokens.operatorClaims())}"
+            assertThat(
+                client.post(
+                    "/v1/catalogs/lake/maintenance/compact",
+                ) { header(HttpHeaders.Authorization, operator) }.status,
+            )
+                .isEqualTo(HttpStatusCode.OK)
+        }
+
+    @Test
+    fun `there is no public listener without a verifier`() {
+        assertThatThrownBy { service(AuthMode.OFF).forPublicListener() }
+            .isInstanceOf(IllegalArgumentException::class.java)
+            .hasMessageContaining("HOGLAKE_PUBLIC_PORT")
+    }
 
     // ---- off -------------------------------------------------------------
 
@@ -265,6 +330,7 @@ class AuthPluginTest {
             assertThat(counters).contains("hoglake_auth_requests_total")
             assertThat(counters).contains("outcome=\"missing\"")
             assertThat(counters).contains("outcome=\"invalid\"")
+            assertThat(counters).contains("listener=\"api\"")
         }
 
     @Test
