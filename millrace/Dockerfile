@@ -74,7 +74,7 @@ COPY millrace/millrace/ millrace/millrace/
 RUN uv sync --locked --package millrace --no-dev --no-editable \
     --no-install-package pyhoglake-variant-codec
 # The codec's wheel goes in after the last sync, which removes what the
-# lock does not install. pyhoglake checks its version against its own.
+# lock does not install. pyhoglake checks its PROTOCOL.
 COPY --from=codec /wheels/ /wheels/
 RUN uv pip install --python /opt/hoglake-millrace/venv --no-deps /wheels/*.whl
 

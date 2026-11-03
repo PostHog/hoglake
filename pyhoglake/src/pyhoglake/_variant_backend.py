@@ -3,8 +3,8 @@ pyhoglake-variant-codec, or the Python one, its reference while both exist.
 Private, and goes with the Python codec.
 
 ``PYHOGLAKE_VARIANT_CODEC``, read at import: ``auto`` (the default) uses
-Rust when it imports with this PROTOCOL and pyhoglake's version, for what it
-takes (JSON text, shredded or not, so far); ``native`` requires it, and
+Rust when it imports with this PROTOCOL, whatever its own version, for what
+it takes (JSON text, shredded or not, so far); ``native`` requires it, and
 raises where it is missing or does not take the input or plan; ``python``
 never uses it. A Rust result is checked first: an invalid row whose reason
 or path Python does not give (``mismatch``), storage not of the plan's type
@@ -44,7 +44,6 @@ from collections import Counter
 from contextlib import suppress
 from dataclasses import replace
 from functools import cache, lru_cache, partial
-from importlib import metadata
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -93,9 +92,6 @@ def native() -> tuple[ModuleType | None, str]:
         return None, f"pyhoglake-variant-codec does not import ({exc})"
     if getattr(module, "PROTOCOL", None) != PROTOCOL:
         return None, f"pyhoglake-variant-codec does not speak protocol {PROTOCOL}"
-    mine, theirs = map(metadata.version, ("pyhoglake", "pyhoglake-variant-codec"))
-    if mine != theirs:
-        return None, f"pyhoglake-variant-codec is {theirs}, not pyhoglake's {mine}"
     return module, ""
 
 

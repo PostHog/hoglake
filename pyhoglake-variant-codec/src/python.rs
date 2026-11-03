@@ -16,8 +16,9 @@ use pyo3_arrow::{PyArray, PyDataType};
 use crate::decode::{Part, Step};
 use crate::encode::{self, Detail, Options};
 
-/// The calls' arguments and results `_variant_backend` expects; the version
-/// pins the semantics.
+/// The calls' arguments and results `_variant_backend` expects, and what
+/// they mean. pyhoglake checks this, not the package version, so bump it on
+/// any change a released pyhoglake would notice.
 const PROTOCOL: u32 = 3;
 
 /// A declaration's plan, from the write form of its storage (`Plan.write_type`):

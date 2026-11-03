@@ -301,14 +301,15 @@ def test_a_plan_rust_does_not_lay_out_is_refused():
             NATIVE.Plan(kind)
 
 
-def test_a_package_of_another_version_is_not_used(monkeypatch):
-    versions = {"pyhoglake": "1.0.0", "pyhoglake-variant-codec": "1.0.1"}
-    monkeypatch.setattr(_variant_backend.metadata, "version", versions.get)
+def test_a_package_of_another_protocol_is_not_used(monkeypatch):
+    # The codec has its own version, so PROTOCOL is the one runtime check.
+    protocol = _variant_backend.PROTOCOL
+    monkeypatch.setattr(NATIVE, "PROTOCOL", protocol + 1)
     _variant_backend.native.cache_clear()
     try:
         module, why = _variant_backend.native()
         assert module is None
-        assert why == "pyhoglake-variant-codec is 1.0.1, not pyhoglake's 1.0.0"
+        assert why == f"pyhoglake-variant-codec does not speak protocol {protocol}"
     finally:
         monkeypatch.undo()
         _variant_backend.native.cache_clear()
