@@ -389,7 +389,15 @@ class MixedCatalogIntegrationTest {
 
     @Test
     fun `a registry outage never probes or redirects to PostgreSQL`() {
-        val dead = HogliteClient(standardUrl = "http://127.0.0.1:1", retryBudgetMs = 0, connectTimeoutMs = 100)
+        // A refused connection opens the breaker. The outage must not query PostgreSQL.
+        val dead =
+            HogliteClient(
+                standardUrl = "http://127.0.0.1:1",
+                retryBudgetMs = 2_000,
+                connectTimeoutMs = 100,
+                circuitFailureThreshold = 1,
+                sleeper = {},
+            )
         val pgCalls = AtomicInteger()
         val noDb =
             Jdbi.create {

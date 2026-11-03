@@ -9,7 +9,10 @@ import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.jdbi.v3.core.Jdbi
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.params.ParameterizedTest
+import org.junit.jupiter.params.provider.ValueSource
 import java.sql.SQLException
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.TimeUnit
 
 /**
@@ -192,11 +195,26 @@ class BootValidationTest {
         val builder =
             ProcessBuilder(java, "-cp", System.getProperty("java.class.path"), ConfigBootProbe::class.java.name)
                 .redirectErrorStream(true)
+        builder.environment().keys.removeIf { it.startsWith("HOGLAKE_HOGLITE_") }
+        builder.environment().putAll(
+            mapOf(
+                "HOGLAKE_DATABASE" to "postgres",
+                "HOGLAKE_JDBC_URL" to "jdbc:postgresql://localhost:5432/hoglake",
+                "HOGLAKE_DB_POOL_SIZE" to "10",
+                "HOGLAKE_REQUEST_THREADS" to "10",
+                "HOGLAKE_HOGLITE_URL" to "http://127.0.0.1:1",
+            ),
+        )
         builder.environment().putAll(env.toMap())
         val process = builder.start()
-        val output = process.inputStream.bufferedReader().readText()
-        assertThat(process.waitFor(120, TimeUnit.SECONDS)).describedAs(output).isTrue()
-        return process.exitValue() to output
+        val output = CompletableFuture.supplyAsync { process.inputStream.bufferedReader().use { it.readText() } }
+        try {
+            assertThat(process.waitFor(120, TimeUnit.SECONDS)).describedAs("Config boot probe exited").isTrue()
+            return process.exitValue() to output.get(10, TimeUnit.SECONDS)
+        } finally {
+            process.destroyForcibly()
+            process.waitFor(10, TimeUnit.SECONDS)
+        }
     }
 
     @Test
@@ -207,10 +225,88 @@ class BootValidationTest {
                 "HOGLAKE_HOGLITE_CIRCUIT_FAILURE_THRESHOLD" to "ten",
                 "HOGLAKE_HOGLITE_OWNER_URL_PATTERN" to "http://no-placeholder",
             )
-        val (pgCode, pgOut) = boot(*malformed)
+        val (pgCode, pgOut) = boot(*malformed, "HOGLAKE_DATABASE" to "postgres")
         assertThat(pgCode).describedAs(pgOut).isEqualTo(0)
         val (hlCode, hlOut) =
             boot(*malformed, "HOGLAKE_DATABASE" to "hoglite", "HOGLAKE_HOGLITE_URL" to "http://127.0.0.1:1")
         assertThat(hlCode).describedAs(hlOut).isEqualTo(2)
+    }
+
+    private fun withDuration(
+        config: Config,
+        knob: String,
+        value: Long,
+    ): Config =
+        when (knob) {
+            "CONNECT_TIMEOUT_MS" -> config.copy(hogliteConnectTimeoutMs = value)
+            "READ_TIMEOUT_MS" -> config.copy(hogliteReadTimeoutMs = value)
+            "COMMIT_TIMEOUT_MS" -> config.copy(hogliteCommitTimeoutMs = value)
+            "RETRY_BUDGET_MS" -> config.copy(hogliteRetryBudgetMs = value)
+            else -> error(knob)
+        }
+
+    @ParameterizedTest
+    @ValueSource(strings = ["CONNECT_TIMEOUT_MS", "READ_TIMEOUT_MS", "COMMIT_TIMEOUT_MS", "RETRY_BUDGET_MS"])
+    fun `each nonpositive transport duration refuses only an active hoglite configuration`(knob: String) {
+        val key = "HOGLAKE_HOGLITE_$knob"
+        for (backend in DatabaseBackend.entries) {
+            val base = hogliteBase.copy(database = backend)
+            for (value in listOf(0L, -1L)) {
+                if (backend == DatabaseBackend.POSTGRES) {
+                    assertThatCode { withDuration(base, knob, value) }.doesNotThrowAnyException()
+                } else {
+                    assertThatThrownBy { withDuration(base, knob, value) }
+                        .isInstanceOf(IllegalArgumentException::class.java)
+                        .hasMessageContaining(key).hasMessageContaining(value.toString())
+                }
+                val (code, output) = boot("HOGLAKE_DATABASE" to backend.name.lowercase(), key to value.toString())
+                assertThat(code).describedAs("$backend $key=$value: $output")
+                    .isEqualTo(if (backend == DatabaseBackend.POSTGRES) 0 else 2)
+                if (backend != DatabaseBackend.POSTGRES) assertThat(output).contains(key, value.toString())
+            }
+            assertThatCode { withDuration(base, knob, 1) }.doesNotThrowAnyException()
+            val (code, output) = boot("HOGLAKE_DATABASE" to backend.name.lowercase(), key to "1")
+            assertThat(code).describedAs(output).isZero()
+        }
+    }
+
+    @Test
+    fun `malformed retry budget text remains unused by postgres but refuses hoglite and mixed`() {
+        for (backend in DatabaseBackend.entries) {
+            val (code, output) =
+                boot(
+                    "HOGLAKE_DATABASE" to backend.name.lowercase(),
+                    "HOGLAKE_HOGLITE_RETRY_BUDGET_MS" to "8s",
+                )
+            assertThat(code).describedAs(output).isEqualTo(if (backend == DatabaseBackend.POSTGRES) 0 else 2)
+            if (backend == DatabaseBackend.POSTGRES) assertThat(output).contains("CONSTRUCTED")
+        }
+    }
+
+    @Test
+    fun `transport defaults and positive budgets on either side of commit timeout stay supported`() {
+        assertThat(
+            listOf(
+                hogliteBase.hogliteConnectTimeoutMs,
+                hogliteBase.hogliteReadTimeoutMs,
+                hogliteBase.hogliteCommitTimeoutMs,
+                hogliteBase.hogliteRetryBudgetMs,
+            ),
+        ).containsExactly(2_000L, 5_000L, 10_000L, 8_000L)
+        for (backend in DatabaseBackend.entries) {
+            val base = hogliteBase.copy(database = backend)
+            assertThatCode {
+                base.copy(
+                    hogliteRetryBudgetMs = 1,
+                    hogliteCommitTimeoutMs = 10_000,
+                )
+            }.doesNotThrowAnyException()
+            assertThatCode {
+                base.copy(
+                    hogliteRetryBudgetMs = 10_000,
+                    hogliteCommitTimeoutMs = 1,
+                )
+            }.doesNotThrowAnyException()
+        }
     }
 }

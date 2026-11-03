@@ -1497,6 +1497,9 @@ data class Config(
                 "$hogliteConnectTimeoutMs HOGLAKE_HOGLITE_READ_TIMEOUT_MS=$hogliteReadTimeoutMs " +
                 "HOGLAKE_HOGLITE_COMMIT_TIMEOUT_MS=$hogliteCommitTimeoutMs"
         }
+        require(!hoglite || hogliteRetryBudgetMs > 0) {
+            "HOGLAKE_HOGLITE_RETRY_BUDGET_MS=$hogliteRetryBudgetMs must be positive"
+        }
         require(!hoglite || hogliteCircuitFailureThreshold >= 0 && hogliteCircuitOpenMs >= 1) {
             "HOGLAKE_HOGLITE_CIRCUIT_FAILURE_THRESHOLD=$hogliteCircuitFailureThreshold must be >= 0 " +
                 "(0 disables the breaker) and HOGLAKE_HOGLITE_CIRCUIT_OPEN_MS=$hogliteCircuitOpenMs >= 1"

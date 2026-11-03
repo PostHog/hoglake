@@ -1,16 +1,25 @@
 package com.posthog.hoglake.hoglite
 
+import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.posthog.hoglake.model.HoglakeException
 import com.sun.net.httpserver.HttpServer
 import org.assertj.core.api.Assertions.assertThat
+import org.assertj.core.api.Assertions.assertThatCode
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.assertj.core.api.Assertions.catchThrowable
 import org.junit.jupiter.api.AfterEach
+import org.junit.jupiter.api.Assertions.assertAll
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.params.ParameterizedTest
+import org.junit.jupiter.params.provider.ValueSource
 import java.net.InetSocketAddress
 import java.util.UUID
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * HogliteClient's retry taxonomy and circuit breaker, against a scripted
@@ -612,5 +621,558 @@ class HogliteClientTest {
             )
         }.isInstanceOf(IllegalStateException::class.java)
         assertThat(calls.get()).isEqualTo(1)
+    }
+
+    /** Capture the worker flag before clearing it; never interrupt the JUnit thread. */
+    private fun interruptedCall(
+        unknown: Boolean = false,
+        txid: String? = null,
+        action: () -> Unit,
+    ): Throwable {
+        val failure = AtomicReference<Throwable>()
+        val interrupted = AtomicBoolean()
+        val worker =
+            Thread {
+                try {
+                    failure.set(catchThrowable { action() })
+                    interrupted.set(Thread.currentThread().isInterrupted)
+                } finally {
+                    Thread.interrupted()
+                }
+            }
+        worker.start()
+        try {
+            worker.join(10_000)
+            assertThat(worker.isAlive).isFalse()
+            assertAll(
+                { assertThat(interrupted.get()).describedAs("worker interrupt flag restored").isTrue() },
+                {
+                    assertThat(failure.get()).isExactlyInstanceOf(
+                        if (unknown) {
+                            HoglakeException.CommitOutcomeUnknown::class.java
+                        } else {
+                            HoglakeException.BackendUnavailable::class.java
+                        },
+                    )
+                },
+                {
+                    if (unknown) {
+                        assertThat(
+                            (failure.get() as? HoglakeException.CommitOutcomeUnknown)?.txid,
+                        ).isEqualTo(txid)
+                    }
+                },
+            )
+            return checkNotNull(failure.get()) { "interrupted call falsely succeeded" }
+        } finally {
+            worker.interrupt()
+            worker.join(10_000)
+        }
+    }
+
+    private fun assertInterruptedWrite(
+        unknown: Boolean,
+        interruptAt: Int = 1,
+        vararg steps: Step,
+    ) {
+        val (server, calls) = serve(*steps, Step(200, writeAnswer))
+        val backoffs = AtomicInteger()
+        val materializations = AtomicInteger()
+        val statements =
+            object : AbstractList<HogliteStatement>() {
+                override val size = 1
+
+                override fun get(index: Int): HogliteStatement {
+                    materializations.incrementAndGet()
+                    return HogliteStatement("UPDATE meta SET head = ?", listOf(7), expectAffected = 1)
+                }
+            }
+        val c =
+            HogliteClient(
+                standardUrl = url(server),
+                sleeper = { if (backoffs.incrementAndGet() == interruptAt) throw InterruptedException("backoff hook") },
+            )
+        val error =
+            interruptedCall(unknown, "interrupted-tx") { c.tx("t", "interrupted-tx", "interrupted-fp", statements) }
+        assertThat(error).hasMessageContaining("interrupted")
+        assertThat(calls.get()).isEqualTo(interruptAt)
+        assertThat(backoffs.get()).isEqualTo(interruptAt)
+        assertThat(materializations.get()).isEqualTo(1)
+        val bodies = servedBodies.toList().takeLast(interruptAt)
+        assertThat(bodies.distinct()).hasSize(1)
+        assertThat(bodies.first()).contains("\"txid\":\"interrupted-tx\"", "\"fp\":\"interrupted-fp\"")
+    }
+
+    @Test
+    fun `interrupted 503 backoff retains unknown or known not applied classification`() {
+        assertInterruptedWrite(true, steps = arrayOf(Step(503, "unlabelled")))
+        assertInterruptedWrite(false, steps = arrayOf(Step(503, "{\"code\":\"not_applied\"}")))
+    }
+
+    @Test
+    fun `interrupted 504 backoff retains original unknown txid`() {
+        assertInterruptedWrite(true, steps = arrayOf(Step(504, "{\"code\":\"outcome_unknown\"}")))
+    }
+
+    @Test
+    fun `interrupted 421 backoff is known not applied without another send`() {
+        assertInterruptedWrite(false, steps = arrayOf(Step(421, "{\"owner\":\"unused.nonce\"}")))
+    }
+
+    @Test
+    fun `interruption after a later not applied or 421 cannot erase write ambiguity`() {
+        for (first in listOf(Step(504, "{\"code\":\"outcome_unknown\"}"), Step(503, "unlabelled"))) {
+            for (last in listOf(Step(503, "{\"code\":\"not_applied\"}"), Step(421, "{}"))) {
+                assertInterruptedWrite(true, 2, first, last)
+            }
+        }
+    }
+
+    @Test
+    fun `interrupted refused connect backoff stays unavailable and leaves genuine breaker failure intact`() {
+        val (server, calls) = serve(Step(200, writeAnswer))
+        server.stop(0)
+        val backoffs = AtomicInteger()
+        val c =
+            HogliteClient(
+                standardUrl = url(server),
+                circuitFailureThreshold = 1,
+                circuitOpenMs = 60_000,
+                sleeper = {
+                    backoffs.incrementAndGet()
+                    throw InterruptedException("connect backoff")
+                },
+            )
+        assertThat(interruptedCall { txFixed(c, "never-sent") })
+            .isExactlyInstanceOf(HoglakeException.BackendUnavailable::class.java)
+        assertThat(backoffs.get()).isEqualTo(1)
+        assertThat(calls.get()).isZero()
+        assertThatThrownBy { txFixed(c, "another") }.hasMessageContaining("circuit is open")
+        assertThat(backoffs.get()).isEqualTo(1)
+    }
+
+    @Test
+    fun `interrupted transport backoff after owner repin preserves earlier ambiguity`() {
+        val (owner, ownerCalls) = serve(Step(200, writeAnswer))
+        owner.stop(0)
+        val (entry, entryCalls) =
+            serve(
+                Step(504, "{\"code\":\"outcome_unknown\"}"),
+                Step(421, "{\"owner\":\"${owner.address.port}.nonce\"}"),
+                Step(200, writeAnswer),
+            )
+        val backoffs = AtomicInteger()
+        val c =
+            HogliteClient(
+                standardUrl = url(entry),
+                ownerUrlPattern = "http://127.0.0.1:{owner}",
+                sleeper = { if (backoffs.incrementAndGet() == 3) throw InterruptedException("owner connect") },
+            )
+        val error = interruptedCall(true, "owner-interrupted") { txFixed(c, "owner-interrupted") }
+        assertThat(error).isExactlyInstanceOf(HoglakeException.CommitOutcomeUnknown::class.java)
+        assertThat((error as HoglakeException.CommitOutcomeUnknown).txid).isEqualTo("owner-interrupted")
+        assertThat(entryCalls.get()).isEqualTo(2)
+        assertThat(ownerCalls.get()).isZero()
+        assertThat(servedBodies.toList().distinct()).hasSize(1)
+        // Transport failure evicted the dead owner pin; interruption neither resets nor invents routing.
+        txFixed(c, "next")
+        assertThat(entryCalls.get()).isEqualTo(3)
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = ["query", "readTx", "batch", "create", "delete", "release"])
+    fun `interrupted backoffs never invent a read or lifecycle commit`(operation: String) {
+        for (step in listOf(Step(503, "unlabelled"), Step(504, "{\"code\":\"outcome_unknown\"}"), Step(421, "{}"))) {
+            val (server, calls) = serve(step, Step(200, writeAnswer))
+            val c = HogliteClient(standardUrl = url(server), sleeper = { throw InterruptedException("read backoff") })
+            assertThat(interruptedCall { invoke(c, operation, "t") })
+                .isExactlyInstanceOf(HoglakeException.BackendUnavailable::class.java)
+            assertThat(calls.get()).isEqualTo(1)
+        }
+    }
+
+    @Test
+    fun `latch interruption stops an owner backoff before any owner request`() {
+        val (owner, ownerCalls) = serve(Step(200, writeAnswer))
+        val (entry, entryCalls) = serve(Step(421, "{\"owner\":\"${owner.address.port}.nonce\"}"))
+        val entered = CountDownLatch(1)
+        val wait = CountDownLatch(1)
+        val flag = AtomicBoolean()
+        val failure = AtomicReference<Throwable>()
+        val c =
+            HogliteClient(
+                standardUrl = url(entry),
+                ownerUrlPattern = "http://127.0.0.1:{owner}",
+                sleeper = {
+                    entered.countDown()
+                    wait.await()
+                },
+            )
+        val worker =
+            Thread {
+                try {
+                    failure.set(catchThrowable { txFixed(c, "latch-tx") })
+                    flag.set(Thread.currentThread().isInterrupted)
+                } finally {
+                    Thread.interrupted()
+                }
+            }
+        worker.start()
+        try {
+            assertThat(entered.await(10, TimeUnit.SECONDS)).isTrue()
+            worker.interrupt()
+            worker.join(10_000)
+            assertThat(worker.isAlive).isFalse()
+            assertThat(flag.get()).isTrue()
+            assertThat(failure.get()).isExactlyInstanceOf(HoglakeException.BackendUnavailable::class.java)
+            assertThat(entryCalls.get()).isEqualTo(1)
+            assertThat(ownerCalls.get()).isZero()
+        } finally {
+            wait.countDown()
+            worker.interrupt()
+            worker.join(10_000)
+        }
+    }
+
+    @Test
+    fun `backoff interruption is not a pool failure and non interruption hooks are not reclassified`() {
+        val (server, calls) = serve(Step(503, "{\"code\":\"not_applied\"}"), Step(200, writeAnswer))
+        val c =
+            HogliteClient(
+                standardUrl = url(server),
+                circuitFailureThreshold = 1,
+                circuitOpenMs = 60_000,
+                sleeper = { throw InterruptedException("backoff") },
+            )
+        assertThat(interruptedCall { txFixed(c, "not-applied") })
+            .isExactlyInstanceOf(HoglakeException.BackendUnavailable::class.java)
+        assertThatCode { txFixed(c, "after") }.doesNotThrowAnyException()
+        assertThat(calls.get()).isEqualTo(2)
+        val sentinel = IllegalStateException("sentinel")
+        val (other, otherCalls) = serve(Step(503, "{}"), Step(200, writeAnswer))
+        val nonInterrupting = HogliteClient(standardUrl = url(other), sleeper = { throw sentinel })
+        assertThat(catchThrowable { txFixed(nonInterrupting, "sentinel") }).isSameAs(sentinel)
+        assertThat(otherCalls.get()).isEqualTo(1)
+    }
+
+    private val writeAnswer = "{\"results\":[{\"cols\":[\"x\"],\"rows\":[[1]],\"affected\":1}]}"
+    private val queryAnswer = "{\"cols\":[\"x\"],\"rows\":[[1]],\"affected\":0}"
+
+    private fun url(server: HttpServer) = "http://127.0.0.1:${server.address.port}"
+
+    private data class RawRequest(val method: String, val path: String, val query: String?, val body: String)
+
+    /** A strict endpoint: wrong components are rejected, never hidden by a redirect. */
+    private fun strictServer(
+        expectedPath: String,
+        expectedQuery: String? = null,
+        answer: String = writeAnswer,
+        status: Int = 200,
+        steps: List<Step> = emptyList(),
+        nextPaths: List<String> = emptyList(),
+    ): Pair<HttpServer, ConcurrentLinkedQueue<RawRequest>> {
+        val requests = ConcurrentLinkedQueue<RawRequest>()
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        server.createContext("/") { ex ->
+            val request =
+                RawRequest(
+                    ex.requestMethod,
+                    ex.requestURI.rawPath,
+                    ex.requestURI.rawQuery,
+                    ex.requestBody.readBytes().decodeToString(),
+                )
+            requests += request
+            val index = requests.size - 1
+            val path = if (nextPaths.isEmpty()) expectedPath else nextPaths[minOf(index, nextPaths.lastIndex)]
+            val step = if (steps.isEmpty()) Step(status, answer) else steps[minOf(index, steps.lastIndex)]
+            val correct = request.path == path && request.query == expectedQuery
+            val body = (if (correct) step.body else "{\"code\":\"bad_path\"}").toByteArray()
+            ex.sendResponseHeaders(if (correct) step.status else 400, body.size.toLong())
+            ex.responseBody.use { it.write(body) }
+        }
+        server.start()
+        servers += server
+        return server to requests
+    }
+
+    private fun invoke(
+        c: HogliteClient,
+        operation: String,
+        tenant: String,
+    ) {
+        when (operation) {
+            "tx" -> c.tx(tenant, "url-tx", "url-fp", listOf(HogliteStatement("SELECT ?", listOf("a/b?#%"))))
+            "query" -> c.query(tenant, "SELECT ?", listOf("a/b?#%"))
+            "readTx" -> c.readTx(tenant, listOf(HogliteStatement("SELECT ?", listOf("a/b?#%"))))
+            "create" -> c.createTenant(tenant)
+            "delete" -> c.deleteTenant(tenant)
+            "release" -> c.release(tenant, "whale")
+            "batch" -> c.queryBatch(listOf(HogliteClient.BatchRead(tenant, "SELECT 1")))
+            else -> error(operation)
+        }
+    }
+
+    private fun endpoint(
+        operation: String,
+        segment: String,
+    ): String =
+        when (operation) {
+            "tx", "readTx" -> "/v1/t/$segment/tx"
+            "query" -> "/v1/t/$segment/query"
+            "create", "delete" -> "/v1/tenants/$segment"
+            "release" -> "/v1/t/$segment/release"
+            else -> error(operation)
+        }
+
+    @ParameterizedTest
+    @ValueSource(strings = ["tx", "query", "readTx", "create", "delete", "release"])
+    fun `every tenant endpoint joins root and prefixed bases without changing components`(operation: String) {
+        for (prefix in listOf("", "/proxy/hoglite", "/proxy//hog%20lite")) {
+            for (suffix in listOf("", "/", "///")) {
+                val path = prefix + endpoint(operation, "valid_A-9.z")
+                val (server, requests) =
+                    strictServer(
+                        path,
+                        if (operation == "release") "class=whale" else null,
+                        if (operation == "query") queryAnswer else writeAnswer,
+                    )
+                val c = HogliteClient(standardUrl = url(server) + prefix + suffix)
+                val failure = catchThrowable { invoke(c, operation, "valid_A-9.z") }
+                assertThat(requests.map { it.path }).containsExactly(path)
+                assertThat(failure).isNull()
+                val expectedMethod =
+                    when (operation) {
+                        "create" -> "PUT"
+                        "delete" -> "DELETE"
+                        else -> "POST"
+                    }
+                assertThat(requests.single().method).isEqualTo(expectedMethod)
+            }
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = ["tx", "query", "readTx", "create", "delete", "release"])
+    fun `tenant segments encode transport literals once but leave valid engine IDs unchanged`(operation: String) {
+        // Reserved/Unicode literals test the client boundary, NOT an expansion of engine grammar.
+        val tenants =
+            mapOf(
+                "valid_A-9.z" to "valid_A-9.z",
+                "a b+c%/d?e#é" to "a%20b%2Bc%25%2Fd%3Fe%23%C3%A9",
+                "a/b" to "a%2Fb",
+                "a%2Fb" to "a%252Fb",
+                "a~b" to "a~b",
+            )
+        for ((tenant, segment) in tenants) {
+            val path = endpoint(operation, segment)
+            val (server, requests) =
+                strictServer(
+                    path,
+                    if (operation == "release") "class=whale" else null,
+                    if (operation == "query") queryAnswer else writeAnswer,
+                )
+            val failure = catchThrowable { invoke(HogliteClient(standardUrl = url(server)), operation, tenant) }
+            assertThat(requests.map { it.path }).containsExactly(path)
+            assertThat(failure).isNull()
+            val request = requests.single()
+            val method =
+                when (operation) {
+                    "create" -> "PUT"
+                    "delete" -> "DELETE"
+                    else -> "POST"
+                }
+            assertThat(request.method).isEqualTo(method)
+            assertThat(request.query).isEqualTo(if (operation == "release") "class=whale" else null)
+            if (operation in listOf("tx", "query", "readTx")) {
+                val json = jacksonObjectMapper().readTree(request.body)
+                val expected =
+                    when (operation) {
+                        "query" -> "{\"sql\":\"SELECT ?\",\"args\":[\"a/b?#%\"]}"
+                        "tx" ->
+                            "{\"client\":\"hoglake\",\"txid\":\"url-tx\",\"fp\":\"url-fp\"," +
+                                "\"statements\":[{\"sql\":\"SELECT ?\",\"args\":[\"a/b?#%\"]}]}"
+                        else ->
+                            "{\"client\":\"hoglake\",\"txid\":\"${json["txid"].asText()}\"," +
+                                "\"statements\":[{\"sql\":\"SELECT ?\",\"args\":[\"a/b?#%\"]}]}"
+                    }
+                assertThat(request.body).isEqualTo(expected)
+                if (operation != "query") {
+                    assertThat(json["client"].asText()).isEqualTo("hoglake")
+                    assertThat(json["txid"].asText()).startsWith(if (operation == "readTx") "read:" else "url-tx")
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `batch and health use the same slash join and batch retains original tenant literals`() {
+        val tenant = "a/b%?#é"
+        val (batch, requests) =
+            strictServer(
+                "/proxy/v1/query-batch",
+                answer = "{\"results\":[{\"status\":200,\"body\":$queryAnswer}]}",
+            )
+        val c = HogliteClient(standardUrl = url(batch) + "/proxy///")
+        val failure =
+            catchThrowable {
+                val answers = c.queryBatch(listOf(HogliteClient.BatchRead(tenant, "SELECT 1")))
+                assertThat(answers).hasSize(1)
+                assertThat(answers!!.single().status).isEqualTo(200)
+                assertThat(answers.single().result!!.rows).containsExactly(listOf(1))
+            }
+        assertThat(requests.map { it.path }).containsExactly("/proxy/v1/query-batch")
+        assertThat(failure).isNull()
+        assertThat(
+            jacksonObjectMapper().readTree(requests.single().body)["queries"][0]["tenant"].asText(),
+        ).isEqualTo(tenant)
+        val (health, healthRequests) = strictServer("/proxy/v1/healthz", answer = "{}")
+        assertThat(HogliteClient(standardUrl = url(health) + "/proxy///").reachable()).isTrue()
+        assertThat(healthRequests.single().method).isEqualTo("GET")
+    }
+
+    @Test
+    fun `configured owner URL prefix and stable name remain pinned under segment encoding`() {
+        val (owner, ownerRequests) = strictServer("/owner/v1/t/a%2Fb/tx")
+        val (entry, entryCalls) =
+            serve(
+                Step(421, "{\"owner\":\"${owner.address.port}.nonce\"}"),
+                Step(200, writeAnswer),
+            )
+        val c =
+            HogliteClient(
+                standardUrl = url(entry) + "/",
+                ownerUrlPattern = "http://127.0.0.1:{owner}/owner///",
+                sleeper = {},
+            )
+        val failure = catchThrowable { invoke(c, "tx", "a/b") }
+        assertThat(ownerRequests.map { it.path }).containsExactly("/owner/v1/t/a%2Fb/tx")
+        assertThat(failure).isNull()
+        invoke(c, "tx", "a/b")
+        invoke(c, "tx", "a%2Fb") // an independent literal route key, not the encoded key of a/b
+        assertThat(entryCalls.get()).isEqualTo(2)
+        assertThat(ownerRequests).hasSize(2)
+        assertThat(ownerRequests.map { it.body }.distinct()).containsExactly(servedBodies.first())
+    }
+
+    @Test
+    fun `whale hint still wins over owner and blank whale still falls back to standard`() {
+        val (whale, whaleRequests) = strictServer("/whale/v1/t/t/tx")
+        val (entry, entryCalls) =
+            serve(
+                Step(421, "{\"class\":\"whale\",\"owner\":\"wrong.nonce\"}"),
+                Step(200, writeAnswer),
+            )
+        val c =
+            HogliteClient(
+                standardUrl = url(entry) + "/",
+                whaleUrl = url(whale) + "/whale/",
+                ownerUrlPattern = "http://127.0.0.1:1/{owner}",
+                sleeper = {},
+            )
+        val failure = catchThrowable { txFixed(c, "whale") }
+        assertThat(whaleRequests.map { it.path }).containsExactly("/whale/v1/t/t/tx")
+        assertThat(failure).isNull()
+        txFixed(c, "pinned")
+        assertThat(entryCalls.get()).isEqualTo(1)
+        assertThat(whaleRequests).hasSize(2)
+        val (fallback, fallbackRequests) =
+            strictServer(
+                "/v1/t/t/tx",
+                steps = listOf(Step(421, "{\"class\":\"whale\"}"), Step(200, writeAnswer)),
+            )
+        val fallbackFailure =
+            catchThrowable {
+                txFixed(HogliteClient(standardUrl = url(fallback) + "/", whaleUrl = "", sleeper = {}), "fallback")
+            }
+        assertThat(fallbackRequests.map { it.path }).containsExactly("/v1/t/t/tx", "/v1/t/t/tx")
+        assertThat(fallbackFailure).isNull()
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = ["connectTimeoutMs", "readTimeoutMs", "commitTimeoutMs", "retryBudgetMs"])
+    fun `direct transport construction rejects each nonpositive duration without imposing timeout relationships`(
+        parameter: String,
+    ) {
+        fun construct(value: Long) =
+            HogliteClient(
+                standardUrl = "http://127.0.0.1:1",
+                connectTimeoutMs = if (parameter == "connectTimeoutMs") value else 2_000,
+                readTimeoutMs = if (parameter == "readTimeoutMs") value else 5_000,
+                commitTimeoutMs = if (parameter == "commitTimeoutMs") value else 10_000,
+                retryBudgetMs = if (parameter == "retryBudgetMs") value else 8_000,
+            )
+        for (value in listOf(0L, -1L)) {
+            assertThatThrownBy { construct(value) }.isInstanceOf(IllegalArgumentException::class.java)
+                .hasMessageContaining(parameter).hasMessageContaining(value.toString())
+        }
+        assertThatCode { construct(1).close() }.doesNotThrowAnyException()
+        assertThatCode {
+            HogliteClient(standardUrl = "http://127.0.0.1:1", commitTimeoutMs = 1, retryBudgetMs = 10_000).close()
+        }.doesNotThrowAnyException()
+    }
+
+    @Test
+    fun `read transaction retry retains its body and generated id with an encoded path`() {
+        val (server, requests) =
+            strictServer(
+                "/v1/t/a%2Fb/tx",
+                steps = listOf(Step(503, "{\"code\":\"not_applied\"}"), Step(200, writeAnswer)),
+            )
+        val c = HogliteClient(standardUrl = url(server), sleeper = {})
+        val failure = catchThrowable { invoke(c, "readTx", "a/b") }
+        assertThat(requests.map { it.path }).containsExactly("/v1/t/a%2Fb/tx", "/v1/t/a%2Fb/tx")
+        assertThat(failure).isNull()
+        assertThat(requests.map { it.body }.distinct()).hasSize(1)
+        assertThat(jacksonObjectMapper().readTree(requests.first().body)["txid"].asText()).startsWith("read:")
+    }
+
+    @Test
+    fun `unsupported batch preserves literal JSON tenant before caller single query fallback`() {
+        val (server, requests) =
+            strictServer(
+                "/v1/query-batch",
+                steps = listOf(Step(404, "404 page not found"), Step(200, queryAnswer)),
+                nextPaths = listOf("/v1/query-batch", "/v1/t/a%252Fb/query"),
+            )
+        val c = HogliteClient(standardUrl = url(server) + "/")
+        assertThat(c.queryBatch(listOf(HogliteClient.BatchRead("a%2Fb", "SELECT 1")))).isNull()
+        val failure = catchThrowable { c.query("a%2Fb", "SELECT 1") }
+        assertThat(requests.map { it.path }).containsExactly("/v1/query-batch", "/v1/t/a%252Fb/query")
+        assertThat(failure).isNull()
+        assertThat(
+            jacksonObjectMapper().readTree(requests.first().body)["queries"][0]["tenant"].asText(),
+        ).isEqualTo("a%2Fb")
+    }
+
+    @Test
+    fun `failed configured owner pin returns to service within the same exact write`() {
+        val (owner, ownerRequests) =
+            strictServer(
+                "/owner/v1/t/a%2Fb/tx",
+                status = 503,
+                answer = "{\"code\":\"not_applied\"}",
+            )
+        val (entry, entryRequests) =
+            strictServer(
+                "/service/v1/t/a%2Fb/tx",
+                steps =
+                    listOf(
+                        Step(421, "{\"owner\":\"${owner.address.port}.nonce\"}"),
+                        Step(200, writeAnswer),
+                    ),
+            )
+        val backoffs = AtomicInteger()
+        val c =
+            HogliteClient(
+                standardUrl = url(entry) + "/service/",
+                ownerUrlPattern = "http://127.0.0.1:{owner}/owner/",
+                sleeper = { if (backoffs.incrementAndGet() == 2) owner.stop(0) },
+            )
+        val failure = catchThrowable { invoke(c, "tx", "a/b") }
+        assertThat(entryRequests.map { it.path }).containsExactly("/service/v1/t/a%2Fb/tx", "/service/v1/t/a%2Fb/tx")
+        assertThat(ownerRequests.map { it.path }).containsExactly("/owner/v1/t/a%2Fb/tx")
+        assertThat(failure).isNull()
+        assertThat((entryRequests + ownerRequests).map { it.body }.distinct()).hasSize(1)
+        assertThat(backoffs.get()).isEqualTo(3)
     }
 }

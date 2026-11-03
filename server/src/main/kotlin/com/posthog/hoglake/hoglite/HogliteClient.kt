@@ -154,6 +154,13 @@ class HogliteClient(
     /** Test hook: the retry sleep. Production sleeps the thread. */
     private val sleeper: (Long) -> Unit = { Thread.sleep(it) },
 ) : AutoCloseable {
+    init {
+        require(connectTimeoutMs > 0) { "connectTimeoutMs=$connectTimeoutMs must be positive" }
+        require(readTimeoutMs > 0) { "readTimeoutMs=$readTimeoutMs must be positive" }
+        require(commitTimeoutMs > 0) { "commitTimeoutMs=$commitTimeoutMs must be positive" }
+        require(retryBudgetMs > 0) { "retryBudgetMs=$retryBudgetMs must be positive" }
+    }
+
     private val log = KotlinLogging.logger {}
 
     private val http: HttpClient =
@@ -214,7 +221,7 @@ class HogliteClient(
                     put("statements", materialized)
                 },
             )
-        return call(tenant, "/v1/t/$tenant/tx", body, commitTimeoutMs, txid = txid) { status, bytes ->
+        return call(tenant, "/v1/t/${tenantSegment(tenant)}/tx", body, commitTimeoutMs, txid = txid) { status, bytes ->
             when {
                 status == 200 ->
                     try {
@@ -254,7 +261,7 @@ class HogliteClient(
         args: List<Any?> = emptyList(),
     ): HogliteQueryResult {
         val body = json.writeValueAsBytes(mapOf("sql" to sql, "args" to args))
-        return call(tenant, "/v1/t/$tenant/query", body, readTimeoutMs) { status, bytes ->
+        return call(tenant, "/v1/t/${tenantSegment(tenant)}/query", body, readTimeoutMs) { status, bytes ->
             when (status) {
                 200 -> parseQueryResult(bytes)
                 // /query's error channel is a bare 409 with no guard index:
@@ -312,7 +319,7 @@ class HogliteClient(
                     put("statements", statements.map { it.toWire() })
                 },
             )
-        return call(tenant, "/v1/t/$tenant/tx", body, readTimeoutMs) { status, bytes ->
+        return call(tenant, "/v1/t/${tenantSegment(tenant)}/tx", body, readTimeoutMs) { status, bytes ->
             when {
                 status == 200 ->
                     parseTxResults(bytes).also {
@@ -413,7 +420,7 @@ class HogliteClient(
      * needs. Anything else is transient and retries within the budget.
      */
     fun createTenant(tenant: String) {
-        call(tenant, "/v1/tenants/$tenant", null, readTimeoutMs, method = "PUT") { status, bytes ->
+        call(tenant, "/v1/tenants/${tenantSegment(tenant)}", null, readTimeoutMs, method = "PUT") { status, bytes ->
             when (status) {
                 200, 409, 422 -> Unit
                 else -> throw HogliteRejected(status, String(bytes))
@@ -431,7 +438,7 @@ class HogliteClient(
      * retry it as transitional during rolling upgrades.)
      */
     fun deleteTenant(tenant: String) {
-        call(tenant, "/v1/tenants/$tenant", null, readTimeoutMs, method = "DELETE") { status, bytes ->
+        call(tenant, "/v1/tenants/${tenantSegment(tenant)}", null, readTimeoutMs, method = "DELETE") { status, bytes ->
             when (status) {
                 200, 404 -> Unit
                 else -> throw HogliteRejected(status, String(bytes))
@@ -445,7 +452,7 @@ class HogliteClient(
         newClass: String? = null,
     ) {
         val query = if (newClass != null) "?class=$newClass" else ""
-        call(tenant, "/v1/t/$tenant/release$query", null, readTimeoutMs) { status, bytes ->
+        call(tenant, "/v1/t/${tenantSegment(tenant)}/release$query", null, readTimeoutMs) { status, bytes ->
             when (status) {
                 200, 409 -> Unit
                 else -> throw HogliteRejected(status, String(bytes))
@@ -503,6 +510,17 @@ class HogliteClient(
             } else {
                 HoglakeException.BackendUnavailable(detail)
             }
+
+        fun backoff() {
+            try {
+                sleeper(RETRY_BACKOFF_MS)
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                // No new attempt was sent: retain the outcome of the
+                // attempts already made, including any earlier ambiguity.
+                throw unavailable("interrupted during hoglite retry backoff")
+            }
+        }
 
         fun finalAnswer(
             status: Int,
@@ -573,7 +591,7 @@ class HogliteClient(
                     if (txid != null && !neverSent(e)) mayHaveApplied = true
                     outcomes.transport(e, minOf(timeoutMs, remainingMs))
                     lastFailure = e
-                    sleeper(RETRY_BACKOFF_MS)
+                    backoff()
                     continue
                 }
             // Any HTTP answer at all proves the pool is up: the breaker
@@ -590,7 +608,7 @@ class HogliteClient(
                     if (txid != null && errorCode(resp.body()) != CODE_NOT_APPLIED) mayHaveApplied = true
                     outcomes.status(503, errorCode(resp.body()))
                     lastFailure = HogliteRejected(503, String(resp.body()))
-                    sleeper(RETRY_BACKOFF_MS)
+                    backoff()
                 }
                 504 -> {
                     // A 504 the engine labels a query guard refusal
@@ -605,7 +623,7 @@ class HogliteClient(
                     if (txid != null) mayHaveApplied = true
                     outcomes.status(504, errorCode(resp.body()))
                     lastFailure = HogliteRejected(504, String(resp.body()))
-                    sleeper(RETRY_BACKOFF_MS)
+                    backoff()
                 }
                 421 -> {
                     // Misdirected: re-pin from the hint and retry. Class wins
@@ -615,7 +633,7 @@ class HogliteClient(
                     // like the others instead of spinning hot.
                     outcomes.misdirected(repin(tenant, resp.body()))
                     lastFailure = HogliteRejected(421, String(resp.body()))
-                    sleeper(RETRY_BACKOFF_MS)
+                    backoff()
                 }
                 else -> {
                     // Deterministic: the pool answered and the answer is
@@ -733,7 +751,7 @@ class HogliteClient(
         method: String,
     ): HttpResponse<ByteArray> {
         val builder =
-            HttpRequest.newBuilder(URI.create(base + path))
+            HttpRequest.newBuilder(URI.create(base.trimEnd('/') + path))
                 .timeout(Duration.ofMillis(timeoutMs))
                 .header("Content-Type", "application/json")
         when (method) {
@@ -752,6 +770,22 @@ class HogliteClient(
     }
 
     // ---- wire codecs --------------------------------------------------------
+
+    /** A single UTF-8 path component, not a change to the engine's tenant grammar. */
+    private fun tenantSegment(tenant: String): String =
+        buildString {
+            val hex = "0123456789ABCDEF"
+            for (byte in tenant.toByteArray(Charsets.UTF_8)) {
+                val value = byte.toInt() and 0xff
+                if (value in 65..90 || value in 97..122 || value in 48..57 || value.toChar() in "-._~") {
+                    append(value.toChar())
+                } else {
+                    append('%')
+                    append(hex[value ushr 4])
+                    append(hex[value and 15])
+                }
+            }
+        }
 
     /** The engine's outcome label (`code`) on an error answer, or null. */
     private fun errorCode(bytes: ByteArray): String? =
@@ -916,7 +950,7 @@ class HogliteClient(
         /** The txid prefix of a [readTx]: the engine keeps no receipt for it. */
         const val READ_TXID_PREFIX = "read:"
 
-        /** Pause between retryable attempts; 421 re-routes skip it. */
+        /** Pause between retryable attempts, including 421 re-routing. */
         const val RETRY_BACKOFF_MS = 200L
 
         /** The least budget a retry (not a first attempt) is started with. */
