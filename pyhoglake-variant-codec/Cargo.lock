@@ -705,6 +705,7 @@ dependencies = [
  "arrow-buffer",
  "arrow-data",
  "arrow-schema",
+ "chrono",
  "parquet-variant",
  "pyo3",
  "pyo3-arrow",

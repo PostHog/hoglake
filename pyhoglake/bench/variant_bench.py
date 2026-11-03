@@ -1,4 +1,5 @@
-"""Microseconds per row of variant.encode_json on PostHog-like properties.
+"""Microseconds per row of variant.encode_json, and of variant.verify on
+its output, on PostHog-like properties.
 
 Not part of CI or the suite: a number to quote, and to compare against when
 the encoder changes (the determinism pin is tests/data/variant/
@@ -14,7 +15,7 @@ writer would most likely declare, an array of strings among them; the
 other is millrace's properties_sv, 16 string fields. The generator is
 seeded, so two runs encode the same text. ``--payload dev`` pads each row
 to about 4.3 KB, mw-dev's average, with the keys a dev event adds.
-PYHOGLAKE_VARIANT_CODEC picks the codec.
+PYHOGLAKE_VARIANT_CODEC picks the codec, for verify too.
 """
 
 from __future__ import annotations
@@ -146,11 +147,15 @@ def main() -> None:
     size = sum(map(len, rows)) / len(rows)
     keys = statistics.mean(len(json.loads(r)) for r in rows[:2000])
 
-    def run(shredding: object) -> float:
+    def run(shredding: object, verify: bool = False) -> float:
+        storage = variant.encode_json(text, shredding=shredding).array
         best = float("inf")
         for _ in range(args.repeat):
             started = time.process_time()
-            variant.encode_json(text, shredding=shredding)
+            if verify:
+                variant.verify(storage, shredding=shredding)
+            else:
+                variant.encode_json(text, shredding=shredding)
             best = min(best, time.process_time() - started)
         return best / len(rows) * 1e6
 
@@ -170,6 +175,12 @@ def main() -> None:
         print(
             f"encode_json, {name + ' declaration:':21} {shredded:.2f} us/row "
             f"({shredded * 1000 / size:.2f} us/KB)"
+        )
+    for name, shredding in (("unshredded", None), ("millrace", MILLRACE_16)):
+        verified = run(shredding, verify=True)
+        print(
+            f"verify, {name + ':':26} {verified:.2f} us/row "
+            f"({verified * 1000 / size:.2f} us/KB)"
         )
 
 

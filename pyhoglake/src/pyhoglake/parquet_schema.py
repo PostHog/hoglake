@@ -26,7 +26,8 @@ from thrift.protocol.TCompactProtocol import TCompactProtocol
 from thrift.Thrift import TType
 from thrift.transport.TTransport import TMemoryBuffer
 
-from ._variant_codec import ParquetElement, Plan, member, structure_fault
+from ._variant_backend import structure_fault
+from ._variant_codec import ParquetElement, Plan, member
 from .errors import UnsupportedTypeError, ValidationError
 from .models import Column
 from .types import (

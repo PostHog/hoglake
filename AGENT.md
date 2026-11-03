@@ -58,7 +58,8 @@ pyhoglake as `{ workspace = true }`. A fifth member,
 `pyhoglake-variant-codec/`, is pyhoglake's VARIANT codec in Rust
 (maturin): only `uv sync --group variant-codec` in `pyhoglake/` builds
 it, which needs Rust, and `_variant_backend` uses it when it is
-installed (`PYHOGLAKE_VARIANT_CODEC=auto|native|python`). Its release
+installed (`PYHOGLAKE_VARIANT_CODEC=auto|native|python`) for
+`encode_json`, `verify` and `structure_fault`. Its release
 wheels come from `variant-codec-wheels.yml`; the millrace image builds
 its own in a stage whose `rust:` image tag, maturin and zig must stay
 those of `rust-toolchain.toml` and the workflow (millrace's

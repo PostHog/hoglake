@@ -1,9 +1,13 @@
 //! arrow-rs `parquet-variant` as an independent decoder (design §4.6): a
 //! written row reads back as serde_json reads its text. serde_json cannot
 //! judge duplicate keys or lone surrogates, and a written row has neither.
-//! Shared by `tests/encode.rs` and the fuzz target.
+//! And the codec's own decoder held to arrow-rs, value for value. Shared by
+//! the tests and the fuzz targets, each of which uses part of it.
+#![allow(dead_code)]
 
+use chrono::{NaiveTime, Timelike};
 use parquet_variant::{Variant, VariantMetadata};
+use pyhoglake_variant_codec::decode;
 use serde_json::Value;
 
 /// Panics unless `metadata` and `value` are a valid Variant of the JSON
@@ -54,5 +58,48 @@ fn same(got: &Variant, want: &Value, text: &str) {
             }
         }
         _ => panic!("{got:?} is not {want} in {text}"),
+    }
+}
+
+/// Whether the codec's decoder read the value arrow-rs reads: types by
+/// family (an int of any width, a float as its double), objects by name.
+pub fn same_value(ours: &decode::Value, theirs: &Variant) -> bool {
+    use decode::Value as V;
+    let micros = |time: &NaiveTime| {
+        i64::from(time.num_seconds_from_midnight()) * 1_000_000 + i64::from(time.nanosecond() / 1000)
+    };
+    match (ours, theirs) {
+        (V::Null, Variant::Null) => true,
+        (&V::Bool(b), Variant::BooleanTrue) => b,
+        (&V::Bool(b), Variant::BooleanFalse) => !b,
+        (&V::Int(n), Variant::Int8(x)) => n == i64::from(*x),
+        (&V::Int(n), Variant::Int16(x)) => n == i64::from(*x),
+        (&V::Int(n), Variant::Int32(x)) => n == i64::from(*x),
+        (&V::Int(n), Variant::Int64(x)) => n == *x,
+        (&V::Float(x), Variant::Double(y)) => x.to_bits() == y.to_bits(),
+        (&V::Float(x), Variant::Float(y)) => x.to_bits() == f64::from(*y).to_bits(),
+        (&V::Decimal(n, s), Variant::Decimal4(d)) => n == i128::from(d.integer()) && s == d.scale(),
+        (&V::Decimal(n, s), Variant::Decimal8(d)) => n == i128::from(d.integer()) && s == d.scale(),
+        (&V::Decimal(n, s), Variant::Decimal16(d)) => n == d.integer() && s == d.scale(),
+        (&V::Date(days), Variant::Date(d)) => {
+            Some(i64::from(days) * 86_400) == d.and_hms_opt(0, 0, 0).map(|t| t.and_utc().timestamp())
+        }
+        (&V::Timestamp(m, true), Variant::TimestampMicros(t)) => m == t.timestamp_micros(),
+        (&V::Timestamp(m, false), Variant::TimestampNtzMicros(t)) => m == t.and_utc().timestamp_micros(),
+        (&V::TimestampNanos(n, true), Variant::TimestampNanos(t)) => Some(n) == t.timestamp_nanos_opt(),
+        (&V::TimestampNanos(n, false), Variant::TimestampNtzNanos(t)) => Some(n) == t.and_utc().timestamp_nanos_opt(),
+        (&V::Time(m), Variant::Time(t)) => m == micros(t),
+        (V::Str(s), Variant::String(t)) => s == t,
+        (V::Str(s), Variant::ShortString(t)) => *s == t.as_str(),
+        (V::Bytes(b), Variant::Binary(c)) => b == c,
+        (V::Uuid(b), Variant::Uuid(u)) => *b == u.as_bytes(),
+        (V::Object(fields), Variant::Object(object)) => {
+            fields.len() == object.len()
+                && fields.iter().all(|(name, value)| object.get(name).is_some_and(|theirs| same_value(value, &theirs)))
+        }
+        (V::Array(items), Variant::List(list)) => {
+            items.len() == list.len() && items.iter().zip(list.iter()).all(|(value, theirs)| same_value(value, &theirs))
+        }
+        _ => false,
     }
 }

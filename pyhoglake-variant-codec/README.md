@@ -2,10 +2,11 @@
 
 pyhoglake's VARIANT value codec, in Rust. It encodes JSON text as the
 Parquet VARIANT storage that [pyhoglake](https://pypi.org/project/pyhoglake/)
-writes, byte for byte as pyhoglake's Python codec does, and releases the
-GIL while it works. It is private to pyhoglake and has no API of its own:
-install it beside pyhoglake of the same version, and
-`pyhoglake.variant.encode_json` uses it.
+writes, byte for byte as pyhoglake's Python codec does, and reads any
+conformant storage back as that codec reads it, releasing the GIL while it
+works. It is private to pyhoglake and has no API of its own: install it
+beside pyhoglake of the same version, and `pyhoglake.variant.encode_json`
+and `pyhoglake.variant.verify` use it.
 
 `PYHOGLAKE_VARIANT_CODEC`, read when pyhoglake is imported, picks the codec:
 

@@ -39,12 +39,35 @@ def live_server_url() -> str:
 
 @pytest.fixture(autouse=True)
 def _codec_fallbacks_fail(monkeypatch):
-    """With the Rust VARIANT codec installed, the suites' encodes run through
-    it, and a fallback to Python would hide a difference: it fails the test.
-    A test of the fallback itself puts the real one back."""
+    """With the Rust VARIANT codec installed, the suites' encodes and verify
+    run through it, and a fallback to Python would hide a difference: it
+    fails the test. A test of the fallback itself puts the real one back."""
     from pyhoglake import _variant_backend
 
     def fail(reason, row, column, report):
         raise AssertionError(f"VARIANT codec fallback: {reason} at row {row}")
 
     monkeypatch.setattr(_variant_backend, "_fall_back", fail)
+    monkeypatch.setattr(
+        _variant_backend,
+        "_decode_fall_back",
+        lambda reason, row, column: fail(reason, row, column, None),
+    )
+
+
+@pytest.fixture(autouse=True)
+def _decoders_agree(monkeypatch):
+    """With the Rust VARIANT codec installed, every storage the suites read
+    back through the Python codec (to_python, and verify where Python
+    reads it) is read by Rust too, and every structure_fault checked: the
+    same values, as tags, or the same fault (variant_decoding)."""
+    from variant_decoding import agreeing, agreeing_structure
+
+    from pyhoglake import _variant_backend
+    from pyhoglake import _variant_codec as codec
+
+    module, _ = _variant_backend.native()
+    if module is not None:
+        monkeypatch.setattr(codec, "reassemble", agreeing(module, codec.reassemble))
+        structure = agreeing_structure(module, codec.structure_fault)
+        monkeypatch.setattr(codec, "structure_fault", structure)
