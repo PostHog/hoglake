@@ -96,8 +96,22 @@ internal object HogliteSchema {
             "CREATE INDEX IF NOT EXISTS files_scan ON files(table_id, row_id_start, id)",
         )
 
+    /**
+     * This table-wide build serializes the tenant writer. It is not row-bounded.
+     * Pinned-engine local fixtures retain one million rows. Builds take at most 627 ms.
+     * Competing writes take at most 744 ms. These figures do not bound larger tenants.
+     * Large existing tenants still need an upgrade window within the unchanged write budget.
+     */
+    const val DVS_ONE_LIVE_DDL =
+        "CREATE UNIQUE INDEX IF NOT EXISTS dvs_one_live_per_data_file ON dvs(data_file_id) WHERE end_snapshot IS NULL"
+
     val TENANT_MIGRATIONS: List<TenantMigration> =
         listOf(
+            TenantMigration(
+                "dvs.one_live_per_data_file",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'dvs_one_live_per_data_file'",
+                listOf(DVS_ONE_LIVE_DDL),
+            ),
             TenantMigration(
                 "table_layouts",
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'table_layouts_live'",
@@ -299,6 +313,7 @@ internal object HogliteSchema {
                 epoch INTEGER NOT NULL,
                 PRIMARY KEY(data_file_id, epoch)
             )""",
+            DVS_ONE_LIVE_DDL,
             "CREATE INDEX IF NOT EXISTS dvs_table ON dvs(table_id, begin_snapshot)",
             """CREATE TABLE IF NOT EXISTS receipts(
                 idempotency_key TEXT PRIMARY KEY,

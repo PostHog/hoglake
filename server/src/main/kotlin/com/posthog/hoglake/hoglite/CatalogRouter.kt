@@ -196,7 +196,7 @@ internal class CatalogRouter(
         val entry = directory.find(name) ?: throw HoglakeException.NotFound("catalog '$name'")
         selected(entry)
         if (entry.backend == DatabaseBackend.HOGLITE) {
-            return bound(entry) { hoglite.dropCatalog(name, args[1] as String?, args[2] as String?) }
+            return bound(entry) { hoglite.dropCatalog(entry) }
         }
         return nameLock(name) {
             // A delayed drop never acts on a replacement reservation.

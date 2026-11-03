@@ -214,7 +214,7 @@ class HogliteCatalogStore(
                 }
             }
         } catch (r: HogliteRejected) {
-            if (r.status == 404) return
+            if (tenantAbsent(r)) return
             throw r
         }
         migratedTenants.add(tenant)
@@ -551,40 +551,68 @@ class HogliteCatalogStore(
         author: String?,
         message: String?,
     ): DroppedCatalog {
-        // The registry row pins the incarnation this drop acts on: the
-        // fence, the release, the delete all address THIS tenant id, and
-        // the registry delete at the end is conditional on it. A paused
-        // drop resuming after a drop+recreate therefore finishes the OLD
-        // incarnation's deletion (an idempotent no-op — the recreate
-        // minted a new tenant id) and leaves the new catalog's row
-        // untouched.
-        val registered =
-            queryRegistry("SELECT data_path, tenant FROM catalogs WHERE name = ?", catalog)
-                .firstRow()
-                ?: throw HoglakeException.NotFound("catalog '$catalog'")
-        val rowTenant = registered[1] as? String
-        val tenantId = rowTenant ?: tenantOf(catalog) // pre-incarnation registry row
-        val bound = operationBindings.get()?.get(catalog)?.tenant
-        if (bound != null && bound != tenantId) throw missingCatalog(catalog)
+        return dropCatalog(catalog, null)
+    }
 
-        // A ghost registry row (a create that died before its tenant
-        // existed, or a drop that died after deleting it) is droppable
-        // too: skip the fence and take the row.
-        val info =
-            try {
-                metaOnTenant(catalog, tenantId)
-            } catch (e: HoglakeException.NotFound) {
-                runTx(
-                    REGISTRY_TENANT,
-                    freshTxid("drop-catalog"),
-                    null,
-                    HogliteTx().apply {
-                        add("DELETE FROM catalogs WHERE name = ? AND tenant IS ?", catalog, rowTenant)
-                    },
-                    fenced = false,
+    /** Mixed mode passes its captured directory identity instead of resolving a replacement. */
+    internal fun dropCatalog(entry: CatalogDirectory.Entry): DroppedCatalog = dropCatalog(entry.name, entry)
+
+    private fun dropCatalog(
+        catalog: String,
+        captured: CatalogDirectory.Entry?,
+    ): DroppedCatalog {
+        val binding = operationBindings.get()?.get(catalog)
+        binding?.missing?.let { throw it }
+        if (captured != null && binding != null && binding.tenant != captured.identity) throw missingCatalog(catalog)
+        val columns =
+            if (captured == null) {
+                "data_path, tenant"
+            } else {
+                "data_path, tenant, backend, connection_ref, state, operation"
+            }
+        val registered =
+            queryRegistry("SELECT $columns FROM catalogs WHERE name = ?", catalog)
+                .firstRow() ?: throw HoglakeException.NotFound("catalog '$catalog'")
+        val rowTenant = registered[1] as? String
+        val tenantId = rowTenant ?: tenantOf(catalog)
+        if (binding != null && binding.tenant != tenantId) throw missingCatalog(catalog)
+        if (captured != null && (
+                tenantId != captured.identity || registered[0] != captured.dataPath ||
+                    registered[2] != captured.backend.wire || registered[3] != captured.connection ||
+                    registered[4] != captured.state || registered[5] != captured.operation
+            )
+        ) {
+            throw missingCatalog(catalog)
+        }
+
+        fun removeCaptured() {
+            val tx = HogliteTx()
+            if (captured == null) {
+                tx.add("DELETE FROM catalogs WHERE name = ? AND tenant IS ?", catalog, rowTenant)
+            } else {
+                tx.add(
+                    "DELETE FROM catalogs WHERE name = ? AND tenant IS ? AND data_path = ? " +
+                        "AND backend = ? AND connection_ref = ? AND state = ? AND operation = ?",
+                    catalog,
+                    rowTenant,
+                    captured.dataPath,
+                    captured.backend.wire,
+                    captured.connection,
+                    captured.state,
+                    captured.operation,
                 )
-                evictTenant(catalog, tenantId)
-                return DroppedCatalog(catalog, registered[0].asString())
+            }
+            runTx(REGISTRY_TENANT, freshTxid("drop-catalog"), null, tx, fenced = false)
+            evictTenant(catalog, tenantId)
+        }
+
+        val info =
+            when (val probe = dropMetadata(catalog, tenantId)) {
+                DropMetadata.Absent -> {
+                    removeCaptured()
+                    return DroppedCatalog(catalog, registered[0].asString())
+                }
+                is DropMetadata.Present -> probe.meta
             }
 
         // The emptiness preconditions AND the write fence in ONE
@@ -692,17 +720,8 @@ class HogliteCatalogStore(
                     "kept re-claiming it): ${fencingFailure?.body}",
             )
         }
-        // The registry delete is conditional on THIS incarnation: a
-        // recreate rewrote the row's tenant, and a stale drop must not
-        // take the new catalog's row. Zero rows affected is success —
-        // the catalog this drop fenced is gone either way.
-        val reg = HogliteTx()
-        reg.add("DELETE FROM catalogs WHERE name = ? AND tenant IS ?", catalog, rowTenant)
-        // Fresh txid: the registry tenant's dedup table survives the
-        // catalog's own tenant, so a fixed txid would make a
-        // recreate-then-redrop silently skip the registry delete.
-        runTx(REGISTRY_TENANT, freshTxid("drop-catalog"), null, reg, fenced = false)
-        evictTenant(catalog, tenantId)
+        // The DELETE itself fences the captured incarnation. Zero affected rows is safe.
+        removeCaptured()
         return DroppedCatalog(catalog, info.dataPath)
     }
 
@@ -1923,22 +1942,25 @@ class HogliteCatalogStore(
         return metaRow(row)
     }
 
-    /**
-     * [meta] addressed at an exact tenant id, bypassing the name→tenant
-     * cache. The drop path must talk to the incarnation the registry row
-     * pins, never to whatever a stale cache entry resolves to.
-     */
-    private fun metaOnTenant(
+    private sealed interface DropMetadata {
+        data class Present(val meta: MetaRow) : DropMetadata
+
+        data object Absent : DropMetadata
+    }
+
+    /** Only this drop-private probe permits proven absence without poisoning an operation. */
+    private fun dropMetadata(
         catalog: String,
         tenant: String,
-    ): MetaRow {
+    ): DropMetadata {
         val row =
             try {
                 client.query(tenant, metaSql, emptyList()).firstRow()
             } catch (r: HogliteRejected) {
+                if (tenantAbsent(r)) return DropMetadata.Absent
                 throw mapRejected(catalog, r)
             } ?: throw HoglakeException.BackendUnavailable("catalog '$catalog' has no metadata row")
-        return metaRow(row)
+        return DropMetadata.Present(metaRow(row))
     }
 
     internal fun metaRow(row: List<Any?>): MetaRow =

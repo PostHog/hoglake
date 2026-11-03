@@ -1052,6 +1052,369 @@ class MixedCatalogIntegrationTest {
     }
 
     @Test
+    fun `options HTTP refusal preserves the floor and uses the existing validation response`() {
+        app().use { app ->
+            testApplication {
+                application { app.module(this) }
+                for (backend in listOf("hoglite", "postgres")) {
+                    val n = name()
+                    create(app, n, backend)
+                    val root = "/v1/catalogs/$n/options"
+                    val initial =
+                        client.patch(root) {
+                            contentType(ContentType.Application.Json)
+                            setBody("""{"snapshot_retention_seconds":100,"author":"test","message":"initial"}""")
+                        }
+                    assertThat(initial.status).isEqualTo(HttpStatusCode.OK)
+                    val refused =
+                        client.patch(root) {
+                            contentType(ContentType.Application.Json)
+                            setBody(
+                                json.writeValueAsString(
+                                    mapOf(
+                                        "snapshot_retention_seconds" to 20,
+                                        "consumer_floor" to false,
+                                        "author" to "\u0085",
+                                        "message" to "refuse",
+                                    ),
+                                ),
+                            )
+                        }
+                    assertThat(refused.status).isEqualTo(HttpStatusCode.UnprocessableEntity)
+                    assertThat(json.readTree(refused.bodyAsText())["error"].asText()).isEqualTo("validation")
+                    assertThat(json.readTree(refused.bodyAsText())["detail"].asText())
+                        .isEqualTo("author is required and must not be blank")
+                    val after = json.readTree(client.get(root).bodyAsText())
+                    assertThat(after["snapshot_retention_seconds"].asLong()).isEqualTo(100)
+                    assertThat(after["consumer_floor"].asBoolean()).isTrue()
+                }
+            }
+        }
+    }
+
+    /** Test-local transport barriers preserve the real engine's SQL and response bodies. */
+    private class DropProbe(private val upstream: String) : AutoCloseable {
+        val seen = java.util.concurrent.CopyOnWriteArrayList<String>()
+        var before: (String, String, String) -> Pair<Int, String>? = { _, _, _ -> null }
+        var after: (String, String, String, Int, String) -> Unit = { _, _, _, _, _ -> }
+        private val http = java.net.http.HttpClient.newHttpClient()
+        private val pool = Executors.newCachedThreadPool()
+        private val server = com.sun.net.httpserver.HttpServer.create(java.net.InetSocketAddress("127.0.0.1", 0), 0)
+
+        init {
+            server.executor = pool
+            server.createContext("/") { ex ->
+                try {
+                    val method = ex.requestMethod
+                    val path = ex.requestURI.toString()
+                    val body = ex.requestBody.readBytes().decodeToString()
+                    seen += "$method $path $body"
+                    val injected = before(method, path, body)
+                    val response =
+                        if (injected != null) {
+                            injected
+                        } else {
+                            val request =
+                                java.net.http.HttpRequest.newBuilder(java.net.URI.create(upstream + path))
+                                    .header("Content-Type", "application/json")
+                                    .method(
+                                        method,
+                                        if (body.isEmpty()) {
+                                            java.net.http.HttpRequest.BodyPublishers.noBody()
+                                        } else {
+                                            java.net.http.HttpRequest.BodyPublishers.ofString(body)
+                                        },
+                                    ).build()
+                            val r = http.send(request, java.net.http.HttpResponse.BodyHandlers.ofString())
+                            after(method, path, body, r.statusCode(), r.body())
+                            r.statusCode() to r.body()
+                        }
+                    val bytes = response.second.toByteArray()
+                    ex.responseHeaders.add("Content-Type", "application/json")
+                    ex.sendResponseHeaders(response.first, if (bytes.isEmpty()) -1 else bytes.size.toLong())
+                    if (bytes.isNotEmpty()) ex.responseBody.use { it.write(bytes) } else ex.close()
+                } catch (_: Throwable) {
+                    ex.sendResponseHeaders(599, -1)
+                    ex.close()
+                }
+            }
+            server.start()
+        }
+
+        fun client() = HogliteClient(standardUrl = "http://127.0.0.1:${server.address.port}")
+
+        override fun close() {
+            server.stop(0)
+            pool.shutdownNow()
+            http.close()
+        }
+    }
+
+    private fun proxyApp(store: HogliteCatalogStore): App =
+        App.buildMixed(
+            engine.config().copy(database = DatabaseBackend.MIXED, hogliteUrl = engine.url()),
+            db.jdbi,
+            store,
+            HealthProbe.forProbe(1_000) { true },
+        )
+
+    @Test
+    fun `captured drop cleanup preserves hoglite and PostgreSQL replacements`() {
+        app().use { current ->
+            for ((backend, legacy, ghost) in listOf(
+                Triple("hoglite", false, true),
+                Triple("postgres", false, true),
+                Triple("hoglite", true, true),
+                Triple("hoglite", false, false),
+                Triple("postgres", false, false),
+            )) {
+                DropProbe(engine.url()).use { probe ->
+                    probe.client().use { client ->
+                        val pinnedStore = HogliteCatalogStore(client)
+                        proxyApp(pinnedStore).use { stale ->
+                            val n = name()
+                            create(current, n)
+                            val created = current.mixedRouter.directory.find(n)!!
+                            if (ghost) {
+                                engine.client.release(created.identity)
+                                engine.client.deleteTenant(created.identity)
+                            }
+                            if (legacy) {
+                                engine.store.runTx(
+                                    HogliteCatalogStore.REGISTRY_TENANT,
+                                    UUID.randomUUID().toString(),
+                                    null,
+                                    HogliteTx().apply { add("UPDATE catalogs SET tenant = NULL WHERE name = ?", n) },
+                                    fenced = false,
+                                )
+                            }
+                            val old = current.mixedRouter.directory.find(n)!!
+                            val fired = AtomicBoolean()
+                            var replacement: CatalogDirectory.Entry? = null
+                            probe.before = { method, path, body ->
+                                if (method == "POST" && path.endsWith("/tx") && "DELETE FROM catalogs" in body &&
+                                    n in body && fired.compareAndSet(false, true)
+                                ) {
+                                    current.store.dropCatalog(n, "test", "remove ghost")
+                                    current.store.createCatalog(
+                                        n, old.dataPath + "-replacement", backend = backend, connectionRef = backend,
+                                    )
+                                    replacement = current.mixedRouter.directory.find(n)
+                                    current.store.createNamespace(n, "victim")
+                                    current.store.createTable(n, "victim", "t", listOf(ColumnDef("id", ColType.LONG)))
+                                    if (backend == "hoglite") {
+                                        HogliteOptions(engine.store).patch(
+                                            n, com.posthog.hoglake.service.PatchField.Absent, false,
+                                        )
+                                        pinnedStore.getCatalog(n)
+                                    }
+                                }
+                                null
+                            }
+                            val result = stale.store.dropCatalog(n, "test", "captured cleanup")
+                            assertThat(fired.get()).isTrue()
+                            assertThat(result.dataPath).isEqualTo(old.dataPath)
+                            assertThat(current.mixedRouter.directory.find(n)).isEqualTo(replacement)
+                            val cleanupSql =
+                                "DELETE FROM catalogs WHERE name = ? AND tenant IS ? AND data_path = ? " +
+                                    "AND backend = ? AND connection_ref = ? AND state = ? AND operation = ?"
+                            assertThat(probe.seen.any { cleanupSql in it }).isTrue()
+                            if (backend == "hoglite") {
+                                val beforeCachedLookup = probe.seen.size
+                                assertThat(pinnedStore.resolveTenant(n)).isEqualTo(replacement!!.identity)
+                                assertThat(probe.seen.size).isEqualTo(beforeCachedLookup)
+                            }
+                            assertThat(current.store.listNamespaces(n).map { it.name }).containsExactly("victim")
+                            if (backend == "hoglite") {
+                                assertThat(
+                                    HogliteOptions(engine.store).get(n).consumerFloor,
+                                ).isFalse()
+                            }
+                            assertThat(current.store.listTables(n, "victim").map { it.name }).containsExactly("t")
+                            assertThat(
+                                probe.seen.filter {
+                                    ("/v1/t/${replacement!!.identity}/" in it && ("/release" in it || "/tx" in it)) ||
+                                        it.startsWith("DELETE /v1/tenants/${replacement!!.identity} ")
+                                },
+                            ).isEmpty()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `a selected hoglite drop refuses a replacement before its metadata probe`() {
+        app().use { current ->
+            DropProbe(engine.url()).use { probe ->
+                probe.client().use { transport ->
+                    proxyApp(HogliteCatalogStore(transport)).use { stale ->
+                        val n = name()
+                        create(current, n)
+                        val fired = AtomicBoolean()
+                        var replacement: CatalogDirectory.Entry? = null
+                        stale.mixedRouter.selected = { e ->
+                            if (e.name == n && fired.compareAndSet(false, true)) {
+                                current.store.dropCatalog(n, "test", "replace")
+                                create(current, n)
+                                replacement = current.mixedRouter.directory.find(n)
+                                current.store.createNamespace(n, "victim")
+                            }
+                        }
+                        assertThatThrownBy { stale.store.dropCatalog(n, "test", "stale") }
+                            .isExactlyInstanceOf(HoglakeException.NotFound::class.java)
+                        assertThat(current.mixedRouter.directory.find(n)).isEqualTo(replacement)
+                        assertThat(current.store.listNamespaces(n).map { it.name }).containsExactly("victim")
+                        assertThat(probe.seen.filter { "/v1/t/${replacement!!.identity}/" in it }).isEmpty()
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `drop probe refuses unproven absence and a cold migration proxy404`() {
+        app().use { current ->
+            val n = name()
+            create(current, n)
+            val entry = current.mixedRouter.directory.find(n)!!
+            DropProbe(engine.url()).use { probe ->
+                probe.client().use { client ->
+                    val store = HogliteCatalogStore(client)
+                    proxyApp(store).use { candidate ->
+                        // Warm this exact process before faults on the drop-private metadata probe.
+                        store.getCatalog(n)
+                        for ((status, body) in listOf(
+                            404 to "{\"error\":\"proxy route missing\"}",
+                            409 to "{\"error\":\"SQL refused\"}",
+                            200 to "{\"cols\":[],\"rows\":[]}",
+                            200 to "not-json",
+                            503 to "{\"error\":\"unavailable\"}",
+                        )) {
+                            val count = AtomicInteger()
+                            probe.before = { _, path, payload ->
+                                if (path.endsWith("/${entry.identity}/query") && "FROM meta" in payload) {
+                                    count.incrementAndGet()
+                                    status to body
+                                } else {
+                                    null
+                                }
+                            }
+                            val result = runCatching { candidate.store.dropCatalog(n, "test", "refuse") }
+                            val expected =
+                                when {
+                                    status == 404 -> HoglakeException.NotFound::class.java
+                                    body == "not-json" -> java.lang.reflect.UndeclaredThrowableException::class.java
+                                    else -> HoglakeException.BackendUnavailable::class.java
+                                }
+                            assertThat(result.exceptionOrNull()).describedAs("status=$status body=$body")
+                                .isExactlyInstanceOf(expected)
+                            if (body == "not-json") {
+                                assertThat(result.exceptionOrNull()!!.cause)
+                                    .isExactlyInstanceOf(com.fasterxml.jackson.core.JsonParseException::class.java)
+                            }
+                            assertThat(count.get()).isGreaterThan(0)
+                            assertThat(current.mixedRouter.directory.find(n)).isEqualTo(entry)
+                        }
+                    }
+                    // A different store has no migration cache entry.
+                    proxyApp(HogliteCatalogStore(client)).use { cold ->
+                        val count = AtomicInteger()
+                        probe.before = { _, path, body ->
+                            if (path.endsWith("/${entry.identity}/query") && "sqlite_master" in body) {
+                                count.incrementAndGet()
+                                404 to "{\"error\":\"proxy route missing\"}"
+                            } else {
+                                null
+                            }
+                        }
+                        assertThatThrownBy { cold.store.dropCatalog(n, "test", "cold") }
+                            .isExactlyInstanceOf(HogliteRejected::class.java)
+                        assertThat(count.get()).isEqualTo(1)
+                        assertThat(current.mixedRouter.directory.find(n)).isEqualTo(entry)
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `a failed registry cleanup leaves a recoverable captured ghost`() {
+        app().use { current ->
+            val n = name()
+            create(current, n)
+            val entry = current.mixedRouter.directory.find(n)!!
+            DropProbe(engine.url()).use { probe ->
+                probe.client().use { client ->
+                    proxyApp(HogliteCatalogStore(client)).use { interrupted ->
+                        probe.before = { _, path, body ->
+                            if (path.endsWith("/tx") && "DELETE FROM catalogs" in body && n in body) {
+                                422 to "{\"code\":\"not_applied\",\"error\":\"registry refusal\"}"
+                            } else {
+                                null
+                            }
+                        }
+                        assertThatThrownBy { interrupted.store.dropCatalog(n, "test", "partial") }
+                            .isExactlyInstanceOf(HoglakeException.CommitOutcomeUnknown::class.java)
+                        assertThat(current.mixedRouter.directory.find(n)).isEqualTo(entry)
+                        val missing = runCatching { engine.client.query(entry.identity, "SELECT 1") }.exceptionOrNull()
+                        assertThat(missing).isExactlyInstanceOf(HogliteRejected::class.java)
+                        assertThat((missing as HogliteRejected).status).isEqualTo(404)
+                        assertThat(missing.body).contains("tenant does not exist")
+                        probe.before = { _, _, _ -> null }
+                        val result = interrupted.store.dropCatalog(n, "test", "retry")
+                        assertThat(result.dataPath).isEqualTo(entry.dataPath)
+                        assertThat(current.mixedRouter.directory.find(n)).isNull()
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `mixed ghost drop recovers with a warm schema cache`() = recoverGhost(false)
+
+    @Test
+    fun `mixed ghost drop recovers with a cold schema cache`() = recoverGhost(true)
+
+    private fun recoverGhost(cold: Boolean) {
+        app().use { creator ->
+            DropProbe(engine.url()).use { probe ->
+                probe.client().use { transport ->
+                    val store = HogliteCatalogStore(transport)
+                    proxyApp(store).use { recovered ->
+                        val n = name()
+                        create(creator, n)
+                        val entry = creator.mixedRouter.directory.find(n)!!
+                        if (!cold) store.getCatalog(n)
+                        engine.client.release(entry.identity)
+                        engine.client.deleteTenant(entry.identity)
+                        probe.seen.clear()
+                        var response: Pair<HttpStatusCode, String>? = null
+                        var repeated: HttpStatusCode? = null
+                        testApplication {
+                            application { recovered.module(this) }
+                            val first = client.delete("/v1/catalogs/$n?author=test&message=retry")
+                            response = first.status to first.bodyAsText()
+                            repeated = client.delete("/v1/catalogs/$n?author=test&message=again").status
+                        }
+                        val (status, text) = checkNotNull(response)
+                        assertThat(status).describedAs("cold=$cold $text").isEqualTo(HttpStatusCode.OK)
+                        val body = json.readTree(text)
+                        assertThat(body["name"].asText()).isEqualTo(n)
+                        assertThat(body["data_path"].asText()).isEqualTo(entry.dataPath)
+                        assertThat(recovered.mixedRouter.directory.find(n)).isNull()
+                        assertThat(probe.seen.count { "/${entry.identity}/query" in it && "sqlite_master" in it })
+                            .isEqualTo(if (cold) 1 else 0)
+                        assertThat(repeated).isEqualTo(HttpStatusCode.NotFound)
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
     fun `a stale PostgreSQL drop cannot delete a replacement directory entry`() {
         app().use { app ->
             val name = name()

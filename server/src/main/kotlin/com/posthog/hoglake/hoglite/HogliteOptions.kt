@@ -59,13 +59,24 @@ internal class HogliteOptions(
                     }
                 }
                 val current = store.meta(catalog)
-                if (snapshotRetentionSeconds is PatchField.Set) {
-                    val next = snapshotRetentionSeconds.value
-                    if (next != null && (current.retentionSeconds == null || next < current.retentionSeconds)) {
-                        requireOperationMetadata(author, message)
+                val tx = HogliteTx()
+                if (snapshotRetentionSeconds is PatchField.Set && snapshotRetentionSeconds.value != null) {
+                    val invalidMetadata =
+                        try {
+                            requireOperationMetadata(author, message)
+                            null
+                        } catch (e: HoglakeException.Validation) {
+                            e
+                        }
+                    if (invalidMetadata != null) {
+                        // The serial transaction decides whether this write needs attribution.
+                        tx.expectZero(
+                            "SELECT COUNT(*) FROM meta WHERE id = 1 AND " +
+                                "(snapshot_retention_seconds IS NULL OR snapshot_retention_seconds > ?)",
+                            snapshotRetentionSeconds.value,
+                        ) { invalidMetadata }
                     }
                 }
-                val tx = HogliteTx()
                 if (snapshotRetentionSeconds is PatchField.Set) {
                     tx.add(
                         "UPDATE meta SET snapshot_retention_seconds = ? WHERE id = 1",
@@ -78,10 +89,19 @@ internal class HogliteOptions(
                         if (consumerFloor) 1L else 0L,
                     )
                 }
-                if (tx.size > 0) {
-                    store.runTx(catalog, HogliteCatalogStore.freshTxid("options-patch"), null, tx)
+                if (tx.size == 0) {
+                    CatalogOptions(current.retentionSeconds, current.consumerFloor, current.earliestSnapshotId)
+                } else {
+                    val readback =
+                        tx.add(
+                            "SELECT snapshot_retention_seconds, consumer_floor, earliest_snapshot_id " +
+                                "FROM meta WHERE id = 1",
+                        )
+                    val row =
+                        store.runTx(catalog, HogliteCatalogStore.freshTxid("options-patch"), null, tx)[readback]
+                            .firstRow()!!
+                    CatalogOptions(row[0].asLongOrNull(), row[1].asLong() != 0L, row[2].asLong())
                 }
-                get(catalog)
             }
         }
 }

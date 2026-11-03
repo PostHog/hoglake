@@ -609,6 +609,49 @@ class HogliteBackendConformanceIntegrationTest {
 
     @ParameterizedTest(name = "{0}")
     @EnumSource(Backend::class)
+    fun `options metadata matrix preserves the existing attribution policy`(backend: Backend) {
+        select(backend)
+        val c = freshCatalog()
+        val set = com.posthog.hoglake.service.PatchField.Set(20L)
+        val absent = com.posthog.hoglake.service.PatchField.Absent
+        for (initial in listOf(null, 100L)) {
+            for (blank in listOf(null, "", " ", "\u2003", "\u0085")) {
+                options.patch(c, com.posthog.hoglake.service.PatchField.Set(initial), true, "test", "reset")
+                for ((author, message, required) in listOf(
+                    Triple(blank, "valid", "author"),
+                    Triple("valid", blank, "message"),
+                    Triple(blank, blank, "author"),
+                )) {
+                    assertThatThrownBy { options.patch(c, set, false, author, message) }
+                        .isExactlyInstanceOf(HoglakeException.Validation::class.java)
+                        .hasMessage("$required is required and must not be blank")
+                    assertThat(options.get(c).snapshotRetentionSeconds).isEqualTo(initial)
+                    assertThat(options.get(c).consumerFloor).isTrue()
+                }
+            }
+        }
+        options.patch(c, set, true, "test", "valid reduction")
+        for (v in listOf(20L, 30L)) {
+            assertThat(
+                options.patch(c, com.posthog.hoglake.service.PatchField.Set(v), null, "\u0085", " ")
+                    .snapshotRetentionSeconds,
+            ).isEqualTo(v)
+        }
+        for (v in listOf(0L, -1L)) {
+            assertThatThrownBy {
+                options.patch(c, com.posthog.hoglake.service.PatchField.Set(v), false, "test", "invalid")
+            }.isExactlyInstanceOf(HoglakeException.Validation::class.java)
+                .hasMessage("snapshot_retention_seconds must be positive (got $v); null disables expiry")
+            assertThat(options.get(c).consumerFloor).isTrue()
+        }
+        assertThat(options.patch(c, absent, false, null, null).consumerFloor).isFalse()
+        val disabled = options.patch(c, com.posthog.hoglake.service.PatchField.Set(null), null, null, null)
+        assertThat(disabled.snapshotRetentionSeconds).isNull()
+        assertThat(options.patch(c, absent, null, null, null)).isEqualTo(disabled)
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(Backend::class)
     fun `a DV against a retired file is the typed conflict, both directions`(backend: Backend) {
         select(backend)
         val catalog = freshCatalog()
