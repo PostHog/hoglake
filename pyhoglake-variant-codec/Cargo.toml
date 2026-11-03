@@ -27,6 +27,7 @@ pyo3-arrow = { version = "0.20.0", optional = true }
 
 [dev-dependencies]
 # An independent decoder to read the output, and the JSON to compare it to.
+chrono = "0.4.45"
 parquet-variant = "59.3"
 serde_json = { version = "1", features = ["arbitrary_precision", "float_roundtrip", "unbounded_depth"] }
 

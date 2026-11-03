@@ -1,6 +1,7 @@
 //! Any bytes as one row: no panic, one row out, and a row written reads
 //! back through arrow-rs as serde_json reads the text (tests/oracle);
-//! shredded, no panic and the same verdict.
+//! shredded, no panic and the same verdict. Both read back through the
+//! codec's decoder as canonical storage of the same value.
 #![no_main]
 
 use std::sync::{Arc, LazyLock};
@@ -8,6 +9,7 @@ use std::sync::{Arc, LazyLock};
 use arrow_array::{Array, ArrayRef, BinaryArray};
 use arrow_schema::{DataType, Field, Fields};
 use libfuzzer_sys::fuzz_target;
+use pyhoglake_variant_codec::decode;
 use pyhoglake_variant_codec::encode::{encode_json, Options, Plan};
 
 /// `{a: int64, b: string, c: array<double>, d: {e: boolean}, f: variant}`.
@@ -52,6 +54,14 @@ fuzz_target!(|data: &[u8]| {
     assert_eq!(out.chunks.iter().map(Array::len).sum::<usize>(), 1);
     let shredded = encode_json(&[rows], &SHREDDED, &options).expect("binary input");
     assert_eq!(shredded.invalid.is_empty(), out.invalid.is_empty());
+    let o = decode::Options { strict: true, canonical: true, nullable: true, tagged: true, signaling_nan: false };
+    let read = |chunk: &arrow_array::StructArray| {
+        let field = Arc::new(Field::new("", chunk.data_type().clone(), true));
+        decode::decode(&[(Arc::new(chunk.clone()) as ArrayRef, field)], &o)
+    };
+    let (plain, shredded) = (read(&out.chunks[0]), read(&shredded.chunks[0]));
+    assert!(plain.fault.is_none() && shredded.fault.is_none(), "{:?} {:?}", plain.fault, shredded.fault);
+    assert_eq!(plain.rows, shredded.rows);
     if out.invalid.is_empty() {
         let child = |i: usize| out.chunks[0].column(i).as_any().downcast_ref::<BinaryArray>().unwrap().value(0);
         oracle::check(child(0), child(1), data);
