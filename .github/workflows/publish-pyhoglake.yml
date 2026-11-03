@@ -9,7 +9,9 @@ name: Publish pyhoglake
 # GitHub side: the `pypi` environment only deploys from pyhoglake-v* tags.
 #
 # Pull requests that touch this workflow, and manual runs from a branch, run
-# the checks without publishing.
+# the checks without publishing. Each run also tests the codec release the
+# `variant-codec` extra pins, from PyPI, so a pin not yet published there
+# fails it: release pyhoglake-variant-codec first.
 
 on:
   push:
@@ -34,9 +36,39 @@ jobs:
   pyhoglake:
     uses: ./.github/workflows/pyhoglake-checks.yml
 
+  # The just-built wheel with its `variant-codec` extra in a clean env:
+  # pyhoglake takes the pinned codec from PyPI (its PROTOCOL), a wheel and
+  # not a source build, and it encodes as the Python codec does. Then the
+  # variant suites run through that codec (ci/variant-codec-wheel.sh).
+  codec:
+    name: Pinned codec from PyPI
+    needs: [pyhoglake]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      UV_PYTHON: "3.13"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: pyhoglake-dist
+          path: dist/
+
+      - name: The wheel takes its pinned codec from PyPI
+        run: |
+          wheel=$(echo dist/pyhoglake-*.whl)
+          uv run --isolated --no-project --no-build-package pyhoglake-variant-codec \
+            --with "pyhoglake[variant-codec] @ ./$wheel" python ci/variant_codec_smoke.py
+          sh ci/variant-codec-wheel.sh "$(grep -o 'pyhoglake-variant-codec==[^;]*' pyhoglake/pyproject.toml)"
+
   publish:
     name: Publish to PyPI
-    needs: [pyhoglake]
+    needs: [pyhoglake, codec]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     timeout-minutes: 10

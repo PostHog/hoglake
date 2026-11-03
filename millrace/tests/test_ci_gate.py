@@ -59,6 +59,21 @@ def test_python_checks_gate_needs_the_codec_wheels_when_the_codec_changes():
     assert release["with"] == {"all-platforms": True}
 
 
+def test_python_checks_gate_needs_the_codec_version_check():
+    """A codec change ships under a new or .dev version (pyhoglake's extra
+    pins exact releases); the gate must see that check fail."""
+    jobs = _jobs()
+    steps = jobs["changes"]["steps"]
+    filter_step = next(step for step in steps if step.get("id") == "filter")
+    filters = yaml.safe_load(filter_step["with"]["filters"])
+    assert "pyhoglake-variant-codec/src/**" in filters["codec-source"]
+    assert "needs.changes.outputs.codec-source == 'true'" in jobs["codec-version"]["if"]
+    assert "codec-version" in jobs["python-checks"]["needs"]
+    gate = jobs["python-checks"]["steps"][0]
+    assert "${{ needs.codec-version.result }}" in gate["env"].values()
+    assert "$VERSION_RESULT" in gate["run"]
+
+
 def test_the_image_builds_the_codec_with_the_release_wheels_tools():
     """millrace/Dockerfile's codec stage pins Rust by its image tag, and
     maturin and zig by version, by hand: they must be rust-toolchain.toml's

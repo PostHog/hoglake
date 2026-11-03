@@ -2,7 +2,9 @@
 # uv workspace member whose static metadata locks without a build.
 [project]
 name = "pyhoglake-variant-codec"
-version = "1.4.8.dev0"
+# Its own version, released only when the codec changes (ci-python.yml
+# holds a change to a new or a .dev version); pyhoglake's extra pins one.
+version = "0.1.0"
 description = "pyhoglake's VARIANT value codec (private to pyhoglake)"
 readme = "README.md"
 license = "MIT"

@@ -136,8 +136,8 @@ jobs:
           case "$origin" in *file:///src/pyhoglake*) : ;; *) echo "::error::pyhoglake was not installed from the sibling tree"; exit 1 ;; esac
 
       # The Rust VARIANT codec is in the image and off (python) by
-      # default; with native, pyhoglake takes it (this commit's protocol
-      # and version) and it encodes as the Python codec does.
+      # default; with native, pyhoglake takes it (this commit's protocol)
+      # and it encodes as the Python codec does.
       - name: Smoke - the Rust VARIANT codec
         run: |
           docker run --rm --entrypoint python hoglake-millrace:ci -c \

@@ -28,6 +28,7 @@ jobs:
     outputs:
       python: ${{ steps.filter.outputs.python }}
       codec: ${{ steps.filter.outputs.codec }}
+      codec-source: ${{ steps.filter.outputs.codec-source }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -82,6 +83,12 @@ jobs:
               - ".github/workflows/variant-codec-wheels.yml"
               - "ci/variant-codec-wheel.sh"
               - "ci/variant_codec_smoke.py"
+            # What a codec release is built from.
+            codec-source:
+              - "pyhoglake-variant-codec/src/**"
+              - "pyhoglake-variant-codec/Cargo.*"
+              - "pyhoglake-variant-codec/pyproject.toml"
+              - "pyhoglake-variant-codec/rust-toolchain.toml"
 
   # THE GATE, and the check the ruleset requires. It is this job and not
   # `pyhoglake`, `check` or `millrace` so that the live client suites (run inside
@@ -92,10 +99,11 @@ jobs:
   # Runs (and fails) when `changes` itself failed: a skipped gate
   # passes the ruleset, so a broken filter must not read as "nothing
   # to check".
-  # The codec's wheels are gated only when the codec changed.
+  # The codec's wheels are gated only when the codec changed, and its
+  # version check only on a PR that changes its source.
   python-checks:
     if: always() && (needs.changes.result != 'success' || needs.changes.outputs.python == 'true')
-    needs: [changes, pyhoglake, check, millrace, variant-codec-wheels]
+    needs: [changes, pyhoglake, check, millrace, variant-codec-wheels, codec-version]
     runs-on: ubuntu-latest
     steps:
       - name: Require Python checks and live suites
@@ -106,11 +114,13 @@ jobs:
           MILLRACE_RESULT: ${{ needs.millrace.result }}
           WHEELS_RESULT: ${{ needs.variant-codec-wheels.result }}
           CODEC_CHANGED: ${{ needs.changes.outputs.codec }}
+          VERSION_RESULT: ${{ needs.codec-version.result }}
         run: |
           test "$CHANGES_RESULT" = success &&
             test "$CLIENT_RESULT" = success &&
             test "$OTHER_RESULT" = success &&
             test "$MILLRACE_RESULT" = success &&
+            { test "$VERSION_RESULT" = success || test "$VERSION_RESULT" = skipped; } &&
             { test "$WHEELS_RESULT" = success ||
               { test "$CODEC_CHANGED" != true && test "$WHEELS_RESULT" = skipped; }; }
 
@@ -129,6 +139,29 @@ jobs:
     uses: ./.github/workflows/variant-codec-wheels.yml
     with:
       all-platforms: false
+
+  # A codec change ships under a version not yet released: a new one, or
+  # a .dev one (pyhoglake's extra pins exact codec releases).
+  codec-version:
+    needs: changes
+    if: github.event_name == 'pull_request' && needs.changes.outputs.codec-source == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 2 # the PR's merge commit and the base, its first parent
+      - name: A codec change has a new or .dev version
+        run: |
+          version() { git show "$1:pyhoglake-variant-codec/pyproject.toml" | grep -m1 '^version = ' | cut -d'"' -f2; }
+          new=$(version HEAD) old=$(version HEAD^1)
+          [ -n "$new" ] && [ -n "$old" ] || { echo "::error::cannot read the codec's version"; exit 1; }
+          case "$new" in *.dev*) exit 0 ;; esac
+          if [ "$new" = "$old" ]; then
+            echo "::error::pyhoglake-variant-codec changed but is still $new: bump its version, or make it .dev"
+            exit 1
+          fi
 
   check:
     needs: changes
