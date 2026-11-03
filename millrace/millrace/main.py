@@ -28,6 +28,7 @@ import os
 import signal
 import sys
 import time
+from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from functools import partial
 from typing import Any
@@ -53,20 +54,34 @@ EXIT_FENCED = 4
 
 _MICROS_PER_SECOND = 1_000_000
 
-#: The reasons pyhoglake counts the Rust codec's fallbacks under, exported
-#: at 0 from the first scrape so that increase() counts a pod's first
-#: fallback (transitional, as the fallbacks are).
+#: The labels pyhoglake counts the Rust codec's fallbacks and ``auto``'s
+#: routes to Python under, exported at 0 from the first scrape so that
+#: increase() counts a pod's first (transitional, as the codecs are).
 _ENCODE_REASONS = ("mismatch", "type", "panic", "shadow_mismatch")
 _DECODE_REASONS = ("mismatch", "panic")
+_ROUTED = (
+    *(("encode", why) for why in ("unavailable", "plan", "not_utf8")),
+    *(("decode", why) for why in ("unavailable", "storage")),
+)
 
 
-def _decode_fallbacks() -> dict[tuple[str], int]:
-    """pyhoglake's decode fallbacks since import, by reason: a read
-    (``verify``, ``structure_fault``) has no report, so they are counted
-    per process, under pyhoglake's lock."""
-    with _variant_backend._COUNTING:
-        counted = dict(_variant_backend.DECODE_FALLBACKS)
-    return {(reason,): count for reason, count in counted.items()}
+def _codec_counts() -> tuple[
+    dict[tuple[str], int],
+    dict[tuple[str], int],
+    dict[tuple[str, str], int],
+    Counter[str],
+]:
+    """pyhoglake's VARIANT codec counts since import, per process, under
+    its lock, so that an encode whose build raises later counts too: encode
+    and decode fallbacks by reason, calls ``auto`` sent to Python by op and
+    why, and what the shadow compared (``calls``, ``rows``)."""
+    backend = _variant_backend
+    with backend._COUNTING:
+        encode = {(reason,): n for reason, n in backend.ENCODE_FALLBACKS.items()}
+        decode = {(reason,): n for reason, n in backend.DECODE_FALLBACKS.items()}
+        routed = dict(backend.ROUTED)
+        shadowed = Counter(backend.SHADOWED)
+    return encode, decode, routed, shadowed
 
 
 def _now_us() -> int:
@@ -256,6 +271,7 @@ class _PipelineCollector:
         for stage, seconds in f.build_seconds.items():
             built.add_metric([stage], seconds)
         yield built
+        encode, decode, routed, shadowed = _codec_counts()
         variant_families = (
             (
                 "millrace_variant_rows_total",
@@ -277,10 +293,12 @@ class _PipelineCollector:
             ),
             (
                 "millrace_variant_codec_fallback_total",
-                "Variant encodes Python redid for the Rust codec, by reason (transitional)",
+                (
+                    "Variant encodes Python redid for the Rust codec, by reason, "
+                    "per process (transitional)"
+                ),
                 ["reason"],
-                dict.fromkeys([(r,) for r in _ENCODE_REASONS], 0)
-                | dict(f.variant_codec_fallbacks),
+                dict.fromkeys([(r,) for r in _ENCODE_REASONS], 0) | encode,
             ),
             (
                 "millrace_variant_codec_decode_fallback_total",
@@ -290,7 +308,17 @@ class _PipelineCollector:
                     "per process (transitional)"
                 ),
                 ["reason"],
-                dict.fromkeys([(r,) for r in _DECODE_REASONS], 0) | _decode_fallbacks(),
+                dict.fromkeys([(r,) for r in _DECODE_REASONS], 0) | decode,
+            ),
+            (
+                "millrace_variant_codec_routed_to_python_total",
+                (
+                    "Variant encodes and storage reads (verify, structure_fault) "
+                    "PYHOGLAKE_VARIANT_CODEC=auto gave the Python codec, by op and "
+                    "reason, per process (transitional)"
+                ),
+                ["op", "reason"],
+                dict.fromkeys(_ROUTED, 0) | routed,
             ),
         )
         for name, doc, labels, counts in variant_families:
@@ -301,14 +329,29 @@ class _PipelineCollector:
         yield CounterMetricFamily(
             "millrace_variant_codec_recursion_bound_rows_total",
             "Invalid variant rows past a JSON parser's recursion bound, whose "
-            "verdict is the Python codec's (transitional)",
+            "verdict is the Python codec's, per build that returned a plan "
+            "(transitional)",
             value=f.variant_recursion_bound_rows,
         )
         yield CounterMetricFamily(
             "millrace_variant_shadow_seconds_total",
             "Seconds PYHOGLAKE_VARIANT_SHADOW spent encoding variant columns "
-            "in Python again, within the variant_encode stage (transitional)",
+            "in Python again, within the variant_encode stage, per build that "
+            "returned a plan (transitional)",
             value=f.variant_shadow_seconds,
+        )
+        yield CounterMetricFamily(
+            "millrace_variant_shadow_rows_total",
+            "Variant rows PYHOGLAKE_VARIANT_SHADOW encoded in Python again and "
+            "compared, per process (transitional)",
+            value=shadowed["rows"],
+        )
+        yield CounterMetricFamily(
+            "millrace_variant_shadow_calls_total",
+            "Variant encodes PYHOGLAKE_VARIANT_SHADOW compared, per process; "
+            "fallback reason shadow_mismatch counts the ones that differed "
+            "(transitional)",
+            value=shadowed["calls"],
         )
         codec = GaugeMetricFamily(
             "millrace_variant_codec_info",

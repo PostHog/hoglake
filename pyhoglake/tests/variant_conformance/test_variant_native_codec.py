@@ -21,6 +21,7 @@ import os
 import random
 import subprocess
 import sys
+from collections import Counter
 from pathlib import Path
 
 import pyarrow as pa
@@ -222,6 +223,31 @@ def test_native_refuses_what_it_does_not_take(monkeypatch, values, why):
         )
 
 
+def test_auto_counts_the_encodes_it_gives_python(monkeypatch):
+    # Per process, by why, for millrace to export: auto's quiet route.
+    monkeypatch.setattr(_variant_backend, "MODE", "auto")
+    monkeypatch.setattr(_variant_backend, "ROUTED", Counter())
+
+    def routed(why, values, json_text=True, backend=None):
+        before = Counter(_variant_backend.ROUTED)
+        plan, report = codec.UNSHREDDED_PLAN, VariantReport()
+        flags = {"column": None, "nullable": True, "on_invalid": "null"}
+        _variant_backend.encode(
+            values, plan, report, json_text=json_text, backend=backend, **flags
+        )
+        counted = _variant_backend.ROUTED - before
+        assert counted == Counter({("encode", why): 1} if why else {})
+
+    routed("not_utf8", ['"\ud800"', None])
+    routed("not_json", [1], json_text=False)
+    routed(None, [1], json_text=False, backend="python")
+    routed(None, ["1"])  # Rust's
+    monkeypatch.setattr(_variant_backend, "_plan", lambda *_: (None, (), "no"))
+    routed("plan", ["1"])
+    monkeypatch.setattr(_variant_backend, "native", lambda: (None, "it is gone"))
+    routed("unavailable", pa.array(["1"]))
+
+
 def test_a_plan_rust_does_not_lay_out_is_refused():
     # Plans come from compile_plan, which Rust reads off the write form;
     # a type it does not know is refused rather than guessed at.
@@ -305,10 +331,12 @@ def test_a_result_that_fails_its_check_is_encoded_again_in_python(
         return out, rows, nulls, [(1, "duplicate_key", None, "key 'a' ...")], counts
 
     monkeypatch.setattr(NATIVE, "encode_json", broken)
+    monkeypatch.setattr(_variant_backend, "ENCODE_FALLBACKS", Counter())
     rows = ["1", '{"a":[2]}', None]
     with caplog.at_level(logging.WARNING, logger=_variant_backend.__name__):
         encoded = variant.encode_json(rows, shredding={"type": "variant"})
     assert encoded.report.codec_fallbacks == {reason: 1}
+    assert _variant_backend.ENCODE_FALLBACKS == Counter({reason: 1})
     row = 1 if reason == "mismatch" else None
     assert caplog.messages == [
         f"VARIANT codec fallback to Python: column=None row={row} reason={reason}"
@@ -347,7 +375,7 @@ def test_the_shadow_share_is_read_once_and_a_bad_one_fails_the_import(monkeypatc
 #: Rows with typed doubles of both signs, integers under doubles, null lists
 #: and absent fields under present and null parents: what the shadow must
 #: compare slot for slot.
-SHADOWED = [
+SHADOW_ROWS = [
     '{"b.c":"no","1":-0.0,"aa":[[1.5,-0.0],"x"],"$set":{"$set":[{"aa":1},2]}}',
     None,
     "[1,",
@@ -366,12 +394,15 @@ def test_the_shadow_keeps_rusts_result_when_python_agrees(monkeypatch):
         return out[-1]
 
     monkeypatch.setattr(NATIVE, "encode_json", spy)
-    encoded = variant.encode_json(SHADOWED, shredding=RANDOM, on_invalid="null")
+    monkeypatch.setattr(_variant_backend, "SHADOWED", Counter())
+    encoded = variant.encode_json(SHADOW_ROWS, shredding=RANDOM, on_invalid="null")
     assert encoded.array is out[0][0][0]
     assert encoded.report.codec_fallbacks == {}
     assert encoded.report.shadow_seconds > 0
     monkeypatch.setattr(_variant_backend, "SHADOW", 0.0)
-    plain = variant.encode_json(SHADOWED, shredding=RANDOM, on_invalid="null").report
+    plain = variant.encode_json(SHADOW_ROWS, shredding=RANDOM, on_invalid="null").report
+    # The rate's denominators, per process: one call of six rows compared.
+    assert _variant_backend.SHADOWED == Counter(calls=1, rows=len(SHADOW_ROWS))
     timing = {"encode_seconds": 0.0, "shadow_seconds": 0.0}
     assert dataclasses.replace(encoded.report, **timing) == dataclasses.replace(
         plain, **timing
@@ -419,6 +450,8 @@ def test_a_shadow_mismatch_takes_pythons_result(monkeypatch, caplog, how):
         return out, rows, nulls, invalid, counts
 
     monkeypatch.setattr(NATIVE, "encode_json", broken)
+    monkeypatch.setattr(_variant_backend, "ENCODE_FALLBACKS", Counter())
+    monkeypatch.setattr(_variant_backend, "SHADOWED", Counter())
     with caplog.at_level(logging.WARNING, logger=_variant_backend.__name__):
         if how == "raise":
             with pytest.raises(VariantEncodingError, match="row 2"):
@@ -428,6 +461,9 @@ def test_a_shadow_mismatch_takes_pythons_result(monkeypatch, caplog, how):
     assert caplog.messages == [
         "VARIANT codec fallback to Python: column=None row=None reason=shadow_mismatch"
     ]
+    # Counted per process, a call that raised included (it has no report).
+    assert _variant_backend.ENCODE_FALLBACKS == Counter(shadow_mismatch=1)
+    assert _variant_backend.SHADOWED == Counter(calls=1, rows=len(rows))
     if how == "raise":
         return
     assert encoded.report.codec_fallbacks == {"shadow_mismatch": 1}

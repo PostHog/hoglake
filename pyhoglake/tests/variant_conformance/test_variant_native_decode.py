@@ -188,6 +188,7 @@ def test_the_switch_picks_the_decoder(monkeypatch):
         raise AssertionError("Rust was used")
 
     storage = variant.encode_json(['{"a":1}']).array
+    monkeypatch.setattr(_variant_backend, "ROUTED", Counter())
     fake = _fake(decode=refuse, structure_fault=refuse)
     monkeypatch.setattr(_variant_backend, "native", lambda: (fake, ""))
     _variant_backend.verify(
@@ -206,6 +207,8 @@ def test_the_switch_picks_the_decoder(monkeypatch):
         else:
             variant.verify(storage)
             assert _variant_backend.structure_fault(storage) is None
+    # Only auto's route is counted, per process, for millrace to export.
+    assert _variant_backend.ROUTED == Counter({("decode", "unavailable"): 2})
 
 
 def test_storage_rust_does_not_import_is_read_by_python(monkeypatch):
@@ -214,7 +217,10 @@ def test_storage_rust_does_not_import_is_read_by_python(monkeypatch):
 
     storage = variant.encode_json(["1"]).array
     monkeypatch.setattr(_variant_backend, "native", lambda: (_fake(decode=decode), ""))
+    monkeypatch.setattr(_variant_backend, "MODE", "auto")
+    monkeypatch.setattr(_variant_backend, "ROUTED", Counter())
     variant.verify(storage)
+    assert _variant_backend.ROUTED == Counter({("decode", "storage"): 1})
     monkeypatch.setattr(_variant_backend, "MODE", "native")
     with pytest.raises(RuntimeError, match="does not take this storage"):
         variant.verify(storage)
