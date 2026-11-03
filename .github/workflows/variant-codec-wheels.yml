@@ -1,0 +1,146 @@
+name: Variant codec wheels
+
+# pyhoglake-variant-codec's wheels and sdist (design-native-encoder section 6),
+# each tested on its own platform before anything uploads it:
+# ci/variant-codec-wheel.sh installs exactly that file into pyhoglake's
+# locked env, where pyhoglake must take it (protocol and version) and
+# encode as the Python codec does, and then runs the variant suites
+# through it (not on Windows, where they have never run: their file reads
+# take the locale's encoding there). ci-python.yml calls this for the
+# Linux glibc wheels and the sdist when the codec or the lock changes;
+# publish-pyhoglake-variant-codec.yml calls it for every platform (on a
+# release tag, or a manual run, which publishes nothing) and uploads
+# these artifacts (design section 6: macOS and Windows on tags).
+#
+# abi3 for CPython 3.12+, on pyarrow's platforms. Linux wheels are built
+# on the runner by zig against glibc 2.28 or musl 1.2, as millrace's
+# image builds its own, so no build container fetches a Rust of its own:
+# Rust is rust-toolchain.toml's, and maturin and zig are pinned here and
+# in millrace/Dockerfile. musllinux wheels are tested in Alpine.
+#
+# The two jobs share their steps through YAML aliases. Keep this file
+# ASCII: actionlint 1.7.12 misplaces aliases after a multi-byte character.
+
+on:
+  workflow_call:
+    inputs:
+      all-platforms:
+        description: musllinux, macOS and Windows too, not only manylinux
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  MATURIN: maturin==1.16.0
+  ZIG: ziglang==0.15.2
+  UV_PYTHON: "3.13"
+
+jobs:
+  manylinux:
+    name: Wheel (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Each job names every key the shared steps read.
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            compatibility: manylinux_2_28
+            sdist: true
+            container: ""
+            smoke-only: false
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            compatibility: manylinux_2_28
+    defaults: &defaults
+      run:
+        shell: bash
+    steps: &steps
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          rust-src-dir: pyhoglake-variant-codec
+          target: ${{ matrix.target }}
+          cache: false
+          rustflags: ""
+
+      # pyhoglake takes the codec only at its own version, so a release
+      # tags both packages at one version.
+      - name: Tag must match the package versions
+        if: github.ref_type == 'tag'
+        run: |
+          version=$(uv version --short --directory pyhoglake-variant-codec)
+          pyhoglake=$(uv version --short --directory pyhoglake)
+          if [ "$GITHUB_REF_NAME" != "pyhoglake-variant-codec-v$version" ] || [ "$version" != "$pyhoglake" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME, codec $version, pyhoglake $pyhoglake: all must agree"
+            exit 1
+          fi
+
+      - name: Build the wheel
+        working-directory: pyhoglake-variant-codec
+        env:
+          TARGET: ${{ matrix.target }}
+          COMPATIBILITY: ${{ matrix.compatibility }}
+        run: |
+          zig=(); [ -z "$COMPATIBILITY" ] || zig=(--zig --compatibility "$COMPATIBILITY")
+          uv tool run --from "$MATURIN" --with "$ZIG" maturin build --release --locked --target "$TARGET" --out dist "${zig[@]}"
+
+      - name: Test the wheel on its platform
+        env:
+          CONTAINER: ${{ matrix.container }}
+          SMOKE_ONLY: ${{ matrix.smoke-only }}
+        run: |
+          run=(); [ -z "$CONTAINER" ] || run=(docker run --rm -v "$PWD:/w" -w /w "$CONTAINER")
+          "${run[@]}" sh ci/variant-codec-wheel.sh pyhoglake-variant-codec/dist/*.whl "${SMOKE_ONLY:+--smoke-only}"
+
+      # The documented build: uv builds the sdist alone through maturin,
+      # as pip would on a platform without a wheel.
+      - name: Build and test the sdist
+        if: matrix.sdist
+        run: |
+          (cd pyhoglake-variant-codec && uv tool run --from "$MATURIN" maturin sdist --out dist)
+          sh ci/variant-codec-wheel.sh pyhoglake-variant-codec/dist/*.tar.gz --smoke-only
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: variant-codec-${{ matrix.target }}
+          path: pyhoglake-variant-codec/dist/*
+          if-no-files-found: error
+
+  # The same steps for the other platforms, on a release (YAML aliases).
+  others:
+    if: inputs.all-platforms
+    name: Wheel (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            compatibility: musllinux_1_2
+            container: ghcr.io/astral-sh/uv:0.13.4-python3.13-alpine
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            compatibility: musllinux_1_2
+            container: ghcr.io/astral-sh/uv:0.13.4-python3.13-alpine
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            smoke-only: true
+            sdist: false
+    defaults: *defaults
+    steps: *steps

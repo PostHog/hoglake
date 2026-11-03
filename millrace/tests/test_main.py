@@ -16,7 +16,8 @@ from typing import Any
 import pytest
 from flushkit import make_config, table_wire
 from kafkakit import FakeConsumer
-from pyhoglake import TableInfo
+from pyhoglake import TableInfo, _variant_backend
+from pyhoglake.variant import VariantReport
 
 from millrace import main
 from millrace.consumer import AssignmentError, MillraceConsumer
@@ -375,12 +376,49 @@ def test_flush_counters_are_exposed_by_exact_name_labels_and_value():
             ]
             == 83
         )
+        # The Rust codec's transitional series: fallbacks by reason, apart
+        # from the rows a recursion bound took Python's verdict for.
+        assert raw[("millrace_variant_codec_recursion_bound_rows_total", ())] == 0
+        assert raw[("millrace_variant_shadow_seconds_total", ())] == 0.0
+        assert not any(n == "millrace_variant_codec_fallback_total" for n, _ in raw)
+        report = VariantReport(
+            codec_fallbacks={"mismatch": 2, "shadow_mismatch": 1},
+            recursion_bound_rows=3,
+            shadow_seconds=0.25,
+        )
+        flusher._note_variant("sv", report)
+        flusher._note_variant("sv", report)
+        raw = _raw(_collector(consumer, stages, flusher, runner))
+        fallback = "millrace_variant_codec_fallback_total"
+        assert raw[(fallback, (("reason", "mismatch"),))] == 4
+        assert raw[(fallback, (("reason", "shadow_mismatch"),))] == 2
+        assert raw[("millrace_variant_codec_recursion_bound_rows_total", ())] == 6
+        assert raw[("millrace_variant_shadow_seconds_total", ())] == 0.5
         # The removed exactly-once machinery exports nothing.
         assert not any(
             word in name
             for name, _ in raw
             for word in ("prepared", "receipt", "deduped", "unresolved", "fenced")
         )
+    finally:
+        flusher.close()
+
+
+@pytest.mark.parametrize(
+    ("mode", "module", "backend"),
+    [("python", object(), "python"), ("auto", None, "python"),
+     ("auto", object(), "native"), ("native", object(), "native")],
+)  # fmt: skip
+def test_pipeline_collector_names_the_variant_codec(
+    monkeypatch: pytest.MonkeyPatch, mode: str, module: object, backend: str
+):
+    monkeypatch.setattr(_variant_backend, "MODE", mode)
+    monkeypatch.setattr(_variant_backend, "native", lambda: (module, "why"))
+    consumer, stages, flusher, runner = _components()
+    try:
+        raw = _raw(_collector(consumer, stages, flusher, runner))
+        info = {k: v for k, v in raw.items() if k[0] == "millrace_variant_codec_info"}
+        assert info == {("millrace_variant_codec_info", (("backend", backend),)): 1}
     finally:
         flusher.close()
 

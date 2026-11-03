@@ -12,7 +12,7 @@ or path Python does not give (``mismatch``), storage not of the plan's type
 raise, which would strand a millrace group in staging; each is counted in
 ``VariantReport.codec_fallbacks`` and logged. Where either parser stopped
 at its recursion bound (CPython's moves with its stack), Python's verdict
-on the row stands, counted as ``recursion_bound``.
+on the row stands, counted apart in ``VariantReport.recursion_bound_rows``.
 
 ``PYHOGLAKE_VARIANT_SHADOW``, a fraction from 0 (the default) to 1 read
 at import, encodes that share of the calls Rust took in Python too, in
@@ -168,9 +168,7 @@ def encode(
     if fault is not None:
         _fall_back(*fault, column, report)
         return python(_json_rows(values), report=report)
-    mine = VariantReport(
-        codec_fallbacks={"recursion_bound": bounded} if bounded else {}
-    )
+    mine = VariantReport(recursion_bound_rows=bounded)
     for row, reason, path, detail in invalid:
         if on_invalid == "raise" or reason == "sql_null_in_not_null":
             message = codec._message(column, row, path, detail)
@@ -204,7 +202,9 @@ def _shadow(
     from .variant import VariantReport, _storage_slots
 
     def counted(r: VariantReport) -> VariantReport:
-        return replace(r, encode_seconds=0.0, codec_fallbacks={})
+        return replace(
+            r, encode_seconds=0.0, codec_fallbacks={}, recursion_bound_rows=0
+        )
 
     theirs = VariantReport()
     started = time.perf_counter()

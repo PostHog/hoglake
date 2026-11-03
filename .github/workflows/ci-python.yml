@@ -27,6 +27,7 @@ jobs:
       pull-requests: read
     outputs:
       python: ${{ steps.filter.outputs.python }}
+      codec: ${{ steps.filter.outputs.codec }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -71,7 +72,16 @@ jobs:
               - ".github/workflows/ci-python.yml"
               - ".github/workflows/pyhoglake-checks.yml"
               - ".github/workflows/python-live.yml"
+              - ".github/workflows/variant-codec-wheels.yml"
               - "ci/**"
+            # What the codec's wheels are built and tested from, the
+            # lock (pyarrow, the test env) included.
+            codec:
+              - "pyhoglake-variant-codec/**"
+              - "uv.lock"
+              - ".github/workflows/variant-codec-wheels.yml"
+              - "ci/variant-codec-wheel.sh"
+              - "ci/variant_codec_smoke.py"
 
   # THE GATE, and the check the ruleset requires. It is this job and not
   # `pyhoglake`, `check` or `millrace` so that the live client suites (run inside
@@ -82,9 +92,10 @@ jobs:
   # Runs (and fails) when `changes` itself failed: a skipped gate
   # passes the ruleset, so a broken filter must not read as "nothing
   # to check".
+  # The codec's wheels are gated only when the codec changed.
   python-checks:
     if: always() && (needs.changes.result != 'success' || needs.changes.outputs.python == 'true')
-    needs: [changes, pyhoglake, check, millrace]
+    needs: [changes, pyhoglake, check, millrace, variant-codec-wheels]
     runs-on: ubuntu-latest
     steps:
       - name: Require Python checks and live suites
@@ -93,16 +104,31 @@ jobs:
           CLIENT_RESULT: ${{ needs.pyhoglake.result }}
           OTHER_RESULT: ${{ needs.check.result }}
           MILLRACE_RESULT: ${{ needs.millrace.result }}
+          WHEELS_RESULT: ${{ needs.variant-codec-wheels.result }}
+          CODEC_CHANGED: ${{ needs.changes.outputs.codec }}
         run: |
           test "$CHANGES_RESULT" = success &&
             test "$CLIENT_RESULT" = success &&
             test "$OTHER_RESULT" = success &&
-            test "$MILLRACE_RESULT" = success
+            test "$MILLRACE_RESULT" = success &&
+            { test "$WHEELS_RESULT" = success ||
+              { test "$CODEC_CHANGED" != true && test "$WHEELS_RESULT" = skipped; }; }
 
   pyhoglake:
     needs: changes
     if: needs.changes.outputs.python == 'true'
     uses: ./.github/workflows/pyhoglake-checks.yml
+
+  # The codec's manylinux wheels and sdist, each tested on its platform;
+  # the artifacts stay on the run for later PRs to use. The other
+  # platforms build on a release tag, or a manual run of
+  # publish-pyhoglake-variant-codec.yml (design-native-encoder section 6).
+  variant-codec-wheels:
+    needs: changes
+    if: needs.changes.outputs.codec == 'true'
+    uses: ./.github/workflows/variant-codec-wheels.yml
+    with:
+      all-platforms: false
 
   check:
     needs: changes

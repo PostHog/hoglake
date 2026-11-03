@@ -20,6 +20,24 @@
 # staging bucket and the lake come from the pod's projected
 # web-identity token via the ambient AWS chain.
 
+# pyhoglake's Rust VARIANT codec, pyhoglake-variant-codec: built on the
+# build host for the target arch, zig linking it against glibc 2.28
+# (manylinux_2_28), so no Rust compiles under qemu. The image's Rust is
+# pyhoglake-variant-codec/rust-toolchain.toml's, and maturin and zig are
+# pinned as in .github/workflows/variant-codec-wheels.yml: bump them
+# together (millrace's tests/test_ci_gate.py fails otherwise).
+FROM --platform=$BUILDPLATFORM ghcr.io/astral-sh/uv:0.13.4 AS uv
+FROM --platform=$BUILDPLATFORM rust:1.91.1-slim-trixie AS codec
+ARG TARGETARCH
+COPY --from=uv /uv /usr/local/bin/uv
+WORKDIR /src/pyhoglake-variant-codec
+COPY pyhoglake-variant-codec/ ./
+RUN case "$TARGETARCH" in amd64) arch=x86_64 ;; arm64) arch=aarch64 ;; *) exit 1 ;; esac \
+ && rustup target add "$arch-unknown-linux-gnu" \
+ && uv tool run --from maturin==1.16.0 --with ziglang==0.15.2 maturin build \
+      --release --locked --target "$arch-unknown-linux-gnu" --zig \
+      --compatibility manylinux_2_28 --out /wheels
+
 # No --platform=$BUILDPLATFORM: the installed tree is a virtualenv of
 # native manylinux wheels (pyarrow, slatedb, confluent-kafka), per
 # target arch by construction. Every wheel millrace installs from the
@@ -49,10 +67,16 @@ COPY pyhoglake-variant-codec/pyproject.toml pyhoglake-variant-codec/
 # Manifests only, so the dependency layer survives a millrace
 # source-only change. (pyproject's `readme` resolves at build time.)
 COPY millrace/pyproject.toml millrace/README.md millrace/
-RUN uv sync --locked --package millrace --no-dev --no-editable --no-install-project
+RUN uv sync --locked --package millrace --no-dev --no-editable --no-install-project \
+    --no-install-package pyhoglake-variant-codec
 
 COPY millrace/millrace/ millrace/millrace/
-RUN uv sync --locked --package millrace --no-dev --no-editable
+RUN uv sync --locked --package millrace --no-dev --no-editable \
+    --no-install-package pyhoglake-variant-codec
+# The codec's wheel goes in after the last sync, which removes what the
+# lock does not install. pyhoglake checks its version against its own.
+COPY --from=codec /wheels/ /wheels/
+RUN uv pip install --python /opt/hoglake-millrace/venv --no-deps /wheels/*.whl
 
 # --no-editable makes the venv self-contained (workspace members are
 # editable for development; here they are installed as wheels), so the
@@ -64,7 +88,11 @@ FROM python:3.13-slim-trixie
 RUN groupadd --system --gid 10001 hoglake \
  && useradd --system --uid 10001 --gid 10001 hoglake
 COPY --from=build /opt/hoglake-millrace/venv/ /opt/hoglake-millrace/venv/
-ENV PATH="/opt/hoglake-millrace/venv/bin:$PATH"
+# The Rust codec is installed but off: the chart's
+# PYHOGLAKE_VARIANT_CODEC=native turns it on, and millrace then refuses
+# to start without it (exit 2). Transitional, as the codec switch is.
+ENV PATH="/opt/hoglake-millrace/venv/bin:$PATH" \
+    PYHOGLAKE_VARIANT_CODEC=python
 # Nothing is written outside /tmp: staging lives on the object store
 # (SlateDB), parquet is built in memory and uploaded. /work is a
 # writable cwd. Read-only-rootfs friendly otherwise.

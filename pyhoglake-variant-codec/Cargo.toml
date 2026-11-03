@@ -3,6 +3,8 @@ name = "pyhoglake-variant-codec"
 # Not a version to bump: the wheel's is pyproject.toml's.
 version = "0.0.0"
 edition = "2021"
+# rust-toolchain.toml's; the sdist's documented minimum.
+rust-version = "1.91"
 license = "MIT"
 publish = false
 
