@@ -319,7 +319,7 @@ fun MaintenanceRun.toDto(): MaintenanceRunDto =
     MaintenanceRunDto(
         runId = runId,
         catalog = catalog,
-        task = task.wire,
+        task = taskName,
         trigger = trigger.wire,
         startedAt = startedAt,
         finishedAt = finishedAt,
@@ -346,7 +346,7 @@ fun MaintenanceRun.toDto(): MaintenanceRunDto =
  * happened.
  */
 private fun normalizeLedgerResult(
-    task: MaintenanceTask,
+    task: MaintenanceTask?,
     node: JsonNode,
 ): JsonNode {
     if (!node.isObject) return node

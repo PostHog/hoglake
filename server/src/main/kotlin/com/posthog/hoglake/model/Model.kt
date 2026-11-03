@@ -2370,14 +2370,22 @@ data class MaintenanceRun(
     val runId: Long,
     /** The catalog the run acted on (the ledger is per-catalog). */
     val catalog: String,
-    val task: MaintenanceTask,
+    /**
+     * The task name exactly as stored. A pod can meet a name it does not
+     * know (a rolling deploy where a newer pod added a task), so the row
+     * keeps the raw string; [task] is the enum when the name is known.
+     */
+    val taskName: String,
     val trigger: MaintenanceTrigger,
     val startedAt: Instant,
     val finishedAt: Instant,
     val status: MaintenanceRunStatus,
     val error: String?,
     val resultJson: String?,
-)
+) {
+    /** The parsed task, or null for a name this build does not know. */
+    val task: MaintenanceTask? get() = MaintenanceTask.fromWire(taskName)
+}
 
 data class MaintenanceRunPage(
     val runs: List<MaintenanceRun>,
