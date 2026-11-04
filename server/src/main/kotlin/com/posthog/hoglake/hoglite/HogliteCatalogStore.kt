@@ -1681,28 +1681,33 @@ class HogliteCatalogStore(
             // Expiry may advance between pages. Never return an incomplete
             // plan if the pin was purged while the pages were being read.
             resolveRead(catalog, meta(catalog), at, null)
-            if (columnStats != null) {
-                val columns = columnsAt(catalog, t.tableId, at)
-                // Variant columns and containers never carry stats rows; the
-                // cap counts REQUESTED VISIBLE LEAVES per file.
-                val leaves =
-                    columns.flatMap { it.selfAndDescendants() }
-                        .filter { it.def.type != ColType.VARIANT && !it.def.type.isNested }
-                val requested =
-                    columnStats.fieldIds?.let { ids -> leaves.filter { it.fieldId in ids } } ?: leaves
-                val entries = files.size.toLong() * requested.size
-                if (entries > ScanService.SCAN_COLUMN_STATS_MAX_ENTRIES) {
-                    throw HoglakeException.Validation(
-                        "column_stats for ${files.size} files x ${requested.size} requested column(s) is " +
-                            "$entries entries, over the maximum ${ScanService.SCAN_COLUMN_STATS_MAX_ENTRIES}",
-                    )
+            val providedFiles =
+                if (columnStats == null) {
+                    0L
+                } else {
+                    files.count { it.first.dataFile.statsState == StatsState.PROVIDED }.toLong()
                 }
-                val wanted = requested.map { it.fieldId }.toSet()
+            if (columnStats != null && providedFiles > 0) {
+                val columns = columnsAt(catalog, t.tableId, at)
+                // Match PostgreSQL's column-tree contract, including childless
+                // VARIANTs in the conservative cap. This does not generate rows
+                // for columns with no stored statistics.
+                val leaves = columns.flatMap { it.selfAndDescendants() }.filter { it.children.isEmpty() }
+                val leafIds = leaves.map { it.fieldId }.toSet()
+                com.posthog.hoglake.service.enforceScanColumnStatsEntryCap(providedFiles, leafIds, columnStats)
+                val wanted = columnStats.fieldIds?.intersect(leafIds) ?: leafIds
                 files =
                     files.map { (sf, fr) ->
-                        sf.copy(
-                            dataFile = sf.dataFile.copy(columnStats = resolveStoredStats(fr, columns, wanted)),
-                        ) to fr
+                        // Eligibility is the state captured with the selected file,
+                        // never a later hydration result. Payloads across queries
+                        // are not a new frozen statistics snapshot.
+                        if (sf.dataFile.statsState != StatsState.PROVIDED) {
+                            sf to fr
+                        } else {
+                            sf.copy(
+                                dataFile = sf.dataFile.copy(columnStats = resolveStoredStats(fr, columns, wanted)),
+                            ) to fr
+                        }
                     }
             }
             if (splitOffsets) {

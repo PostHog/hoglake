@@ -629,11 +629,9 @@ internal object HogliteCommit {
             if (unchanged.isNotEmpty()) {
                 tx.expectZero(
                     "SELECT COUNT(*) FROM changes WHERE snapshot_id > ? AND kind IN $CONTENT_KINDS " +
-                        "AND object_id IN (${unchanged.joinToString(",") { "?" }})",
-                    *buildList {
-                        add(readSnapshot)
-                        addAll(unchanged)
-                    }.toTypedArray(),
+                        "AND object_id IN (SELECT value FROM json_each(?))",
+                    readSnapshot,
+                    store.json.writeValueAsString(unchanged),
                 ) {
                     HoglakeException.CommitConflict(
                         "concurrent table change since snapshot $readSnapshot on a delete target",
@@ -661,8 +659,8 @@ internal object HogliteCommit {
         if (allPaths.isNotEmpty()) {
             tx.expectZero(
                 "SELECT COUNT(*) FROM removals WHERE drained_at IS NULL " +
-                    "AND path IN (${allPaths.keys.joinToString(",") { "?" }})",
-                *allPaths.keys.toTypedArray(),
+                    "AND path IN (SELECT value FROM json_each(?))",
+                store.json.writeValueAsString(allPaths.keys),
             ) {
                 HoglakeException.CommitConflict(
                     "a file path in this commit is queued for removal; claim a fresh path and retry",
@@ -1272,8 +1270,9 @@ internal object HogliteCommit {
                 appends.forEach { a -> a.files.forEach { paths += it.path } }
                 deletes.forEach { d -> d.files.forEach { paths += it.path } }
                 if (paths.isNotEmpty()) {
-                    val inList = paths.joinToString(",") { "?" }
-                    p.claimsAt = p.add(CLAIMS_SQL + "WHERE path IN ($inList)", paths.toList())
+                    val inList = "SELECT value FROM json_each(?)"
+                    val pathJson = store.json.writeValueAsString(paths)
+                    p.claimsAt = p.add(CLAIMS_SQL + "WHERE path IN ($inList)", listOf(pathJson))
                     // Only claimed paths are ever looked up in this set, so
                     // the read is limited to them: a commit without claims
                     // probes no file or DV row.
@@ -1282,7 +1281,7 @@ internal object HogliteCommit {
                         p.add(
                             "SELECT path, 0 FROM files WHERE path IN ($claimed) " +
                                 "UNION SELECT path, 1 FROM dvs WHERE path IN ($claimed)",
-                            paths.toList() + paths.toList(),
+                            listOf(pathJson, pathJson),
                         )
                 }
 
@@ -1297,19 +1296,20 @@ internal object HogliteCommit {
                         if (unchanged.isEmpty()) {
                             ""
                         } else {
-                            " OR (kind IN $CONTENT_KINDS AND object_id IN " +
-                                "(${unchanged.joinToString(",") { LIVE_TABLE_ID_SQL }}))"
+                            " OR (kind IN $CONTENT_KINDS AND object_id IN ($LIVE_TABLE_IDS_SQL))"
                         }
                     p.conflictsAt =
                         p.add(
                             "SELECT DISTINCT object_id, CASE WHEN kind IN $DDL_KINDS THEN 1 ELSE 0 END FROM changes " +
                                 "WHERE snapshot_id > ? " +
-                                "AND object_id IN (${all.joinToString(",") { LIVE_TABLE_ID_SQL }}) " +
+                                "AND object_id IN ($LIVE_TABLE_IDS_SQL) " +
                                 "AND (kind IN $DDL_KINDS$contentArm)",
                             buildList {
                                 add(readSnapshot)
-                                all.forEach { addAll(listOf(it.namespace, it.table)) }
-                                unchanged.forEach { addAll(listOf(it.namespace, it.table)) }
+                                add(store.json.writeValueAsString(all.map { listOf(it.namespace, it.table) }))
+                                if (unchanged.isNotEmpty()) {
+                                    add(store.json.writeValueAsString(unchanged.map { listOf(it.namespace, it.table) }))
+                                }
                             },
                         )
                 }
@@ -1324,8 +1324,8 @@ internal object HogliteCommit {
                         p.add(
                             "SELECT f.id, f.table_id, f.partition_values_json, s.fields_json FROM files f " +
                                 "LEFT JOIN partition_specs s ON s.table_id = f.table_id AND s.spec_id = f.spec_id " +
-                                "WHERE f.id IN (${targets.joinToString(",") { "?" }})",
-                            targets,
+                                "WHERE f.id IN (SELECT value FROM json_each(?))",
+                            listOf(store.json.writeValueAsString(targets)),
                         )
                 }
 
@@ -1346,6 +1346,20 @@ internal object HogliteCommit {
         "(SELECT t.id FROM table_versions v JOIN tables t ON t.id = v.table_id " +
             "WHERE v.namespace_id = ($LIVE_NAMESPACE_ID_SQL) AND v.name = ? " +
             "AND v.end_snapshot IS NULL AND t.dropped_snapshot IS NULL)"
+
+    /**
+     * The same scalar resolution for each bound [namespace, name] pair.
+     * Keep pairs intact (not independent name sets), and preserve the live
+     * namespace, version and table predicates of [LIVE_TABLE_ID_SQL].
+     * One JSON bind avoids 2N variables without adding read transactions or
+     * changing result indexes. It does not bound rows, bytes or execution time.
+     */
+    private const val LIVE_TABLE_IDS_SQL =
+        "SELECT (SELECT t.id FROM table_versions v JOIN tables t ON t.id = v.table_id " +
+            "WHERE v.namespace_id = (SELECT id FROM namespaces " +
+            "WHERE name = json_extract(requested.value, '$[0]') AND dropped_snapshot IS NULL) " +
+            "AND v.name = json_extract(requested.value, '$[1]') " +
+            "AND v.end_snapshot IS NULL AND t.dropped_snapshot IS NULL) FROM json_each(?) requested"
 
     /** The tables a guarded request's CONTENT window covers: delete targets when requireUnchangedTables. */
     private fun unchangedIds(
@@ -1470,22 +1484,22 @@ internal object HogliteCommit {
         owner: UUID?,
     ): List<String> {
         if (paths.isEmpty()) return emptyList()
+        val pathJson = store.json.writeValueAsString(paths.keys)
         val claims =
             store.queryCatalog(
                 catalog,
-                CLAIMS_SQL + "WHERE path IN (${paths.keys.joinToString(",") { "?" }})",
-                *paths.keys.toTypedArray(),
+                CLAIMS_SQL + "WHERE path IN (SELECT value FROM json_each(?))",
+                pathJson,
             ).rows
         if (claims.isEmpty()) return emptyList()
         val retainedPaths =
             retainedPathSet(
                 store.queryCatalog(
                     catalog,
-                    "SELECT path, 0 FROM files WHERE path IN (${paths.keys.joinToString(",") { "?" }}) " +
-                        "UNION SELECT path, 1 FROM dvs WHERE path IN (${paths.keys.joinToString(",") { "?" }})",
-                    // toList() first: Set + Set is the Set overload and DEDUPLICATES the
-                    // doubled keys, shorting the second IN-list its arguments.
-                    *(paths.keys.toList() + paths.keys).toTypedArray(),
+                    "SELECT path, 0 FROM files WHERE path IN (SELECT value FROM json_each(?)) " +
+                        "UNION SELECT path, 1 FROM dvs WHERE path IN (SELECT value FROM json_each(?))",
+                    pathJson,
+                    pathJson,
                 ),
             )
         return settleDecision(claims, retainedPaths, paths, owner)
