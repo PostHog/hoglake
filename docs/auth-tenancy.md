@@ -487,7 +487,7 @@ the per-org Trino deployment gets its own ServiceAccount (which
   "exp": 1764547800,                    // +600s
   "jti": "0193c1e2-9f0a-7…",
 
-  "ten": "tenant",                      // kind: "tenant" | "operator"
+  "ten": "tenant",                      // kind: "tenant" | "scoped" | "operator" (§6.2a)
   "org": "1b2c3d4e-5f60-4a7b-8c9d-0e1f2a3b4c5d",
   "cli": "hedgerow-prod",
   "ep": 7,                              // carried, NOT read — see below
@@ -514,6 +514,38 @@ Deliberate omissions:
   expensive to size (a table allowlist can be thousands of entries). Design the
   verifier so the absence of `tab` means "all tables in `cat`" — which is what
   every v1 token means — and the field can be added without a version bump.
+
+### 6.2a Scoped tokens (`ten: scoped`)
+
+A scoped token is a tenant token narrowed by a predicate: it may touch only
+what is attributed to one of its values, in a catalog named in `cat`. The
+issuer's design is hogtower's `docs/team-scoped-hoglake-credentials.md`; the
+contract vector is `scoped_team` in `oauth/contract-vectors.json`.
+
+```jsonc
+{
+  "ten": "scoped",
+  "cat": { "<catalog>": ["write"] },                    // read | write only
+  "prd": { "team_id": { "42": "write", "7": "read" } }, // or {"team_id": {"*": "read"}}
+  "usr": "<opaque end-user name>",                      // audit only, grants nothing
+  "iat": 1764547200, "exp": 1764548100                  // exp - iat <= 900
+}
+```
+
+- **The auth source declares the fields** (`HOGLAKE_AUTH_PREDICATE_FIELDS`,
+  e.g. `team_id`). `prd` must name exactly those. With none declared, every
+  scoped token is refused.
+- **Parsed strictly**, unlike `cat`'s unknown scope words: an undeclared or
+  missing field, an empty map, more than 200 values, a key that is not a
+  canonical decimal id, a permission other than `read`/`write`, or `*` mixed
+  with values refuses the token (`invalid_predicate`). Dropping an unknown
+  scope loses authority; dropping an unknown predicate would gain it.
+- **A value's permission** is the lower of its own and `cat`'s for the catalog.
+- **Fails closed.** A scoped caller may use `AUTHENTICATED` routes (listings,
+  filtered to `cat`, with catalog totals withheld) and nothing catalog-scoped:
+  every catalog route answers `403` until it narrows by predicate. That holds
+  under `warn` too. Routes learn the predicate one at a time, after namespace
+  containment exists to attribute tables to values.
 
 ### 6.3 Scope vocabulary
 

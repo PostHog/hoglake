@@ -158,6 +158,54 @@
         "sub": "hogtower:provisioner",
         "ten": "operator"
       }
+    },
+    {
+      "name": "scoped_team",
+      "description": "A team credential's token: ten scoped, cat the org catalog at the credential's scope, prd.team_id each team at its effective permission, usr the owner, never dlg.",
+      "client": {
+        "credential_id": "hlc_00112233445566778899aabb",
+        "name": "laptop",
+        "org": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+        "scope": "write",
+        "delegates": false,
+        "owner_user_uuid": "0190a1b2-c3d4-7e5f-8a9b-000000000042",
+        "teams": {
+          "42": "write",
+          "7": "read"
+        }
+      },
+      "audience": "hoglake",
+      "jti": "00000000-0000-4000-8000-000000000005",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6IjAzNGYxMDIzNmE4YWNkMDgifQ.eyJpc3MiOiJodHRwczovL2hvZ3Rvd2VyLmNvbnRyYWN0LnRlc3QiLCJhdWQiOiJob2dsYWtlIiwic3ViIjoiaGxjXzAwMTEyMjMzNDQ1NTY2Nzc4ODk5YWFiYiIsImp0aSI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwNSIsInRlbiI6InNjb3BlZCIsIm9yZyI6IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiIsImNhdCI6eyIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wYzFkMmUzZjRhNWIiOlsid3JpdGUiXX0sInByZCI6eyJ0ZWFtX2lkIjp7IjQyIjoid3JpdGUiLCI3IjoicmVhZCJ9fSwiY2xpIjoibGFwdG9wIiwidXNyIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMDAwMDAwMDAwMDQyIiwiZXhwIjoxNzY3MjI2NTAwLCJpYXQiOjE3NjcyMjU2MDAsIm5iZiI6MTc2NzIyNTYwMH0.KyX-GYqrHG5HiU5kfLQ9JMNBMNemE0AfY_fypISiD1B0DgECotyKrUxNnbXSRHDIGbL3wlEnhw6p8SaHK0sGIg",
+      "header": {
+        "alg": "ES256",
+        "kid": "034f10236a8acd08",
+        "typ": "JWT"
+      },
+      "claims": {
+        "aud": "hoglake",
+        "cat": {
+          "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b": [
+            "write"
+          ]
+        },
+        "cli": "laptop",
+        "exp": 1767226500,
+        "iat": 1767225600,
+        "iss": "https://hogtower.contract.test",
+        "jti": "00000000-0000-4000-8000-000000000005",
+        "nbf": 1767225600,
+        "org": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+        "prd": {
+          "team_id": {
+            "42": "write",
+            "7": "read"
+          }
+        },
+        "sub": "hlc_00112233445566778899aabb",
+        "ten": "scoped",
+        "usr": "0190a1b2-c3d4-7e5f-8a9b-000000000042"
+      }
     }
   ]
 }

@@ -256,6 +256,41 @@ class AuthPolicyTest {
             .isEqualTo(AuthDecision.UnknownCatalog("lake"))
     }
 
+    @Test
+    fun `a scoped caller is refused on every catalog route, and only listings let it in`() {
+        // No catalog route narrows by predicate yet. A route added to the table
+        // is refused to scoped callers until it is taught to.
+        val scoped =
+            Caller(
+                subject = "hlc_team",
+                orgId = "org-1",
+                kind = Caller.Kind.SCOPED,
+                catalogScopes = mapOf("lake" to setOf(Scope.WRITE)),
+                tokenId = "jti",
+                clientName = "laptop",
+                predicates = mapOf("team_id" to PredicateGrant.All(Scope.WRITE)),
+            )
+        for (rule in AuthPolicy.rules) {
+            val path = rule.pattern.replace("{catalog}", "lake").replace(Regex("\\{[a-zA-Z]+}"), "x")
+            val match = AuthPolicy.match(rule.method, path)!!
+            val decision = AuthPolicy.authorize(scoped, match)
+            when (rule.requirement) {
+                Requirement.PUBLIC, Requirement.AUTHENTICATED ->
+                    assertThat(decision).describedAs(rule.pattern).isEqualTo(AuthDecision.Allow)
+                Requirement.OPERATOR ->
+                    assertThat(
+                        decision,
+                    ).describedAs(rule.pattern).isInstanceOf(AuthDecision.InsufficientScope::class.java)
+                else ->
+                    assertThat(decision).describedAs(rule.pattern)
+                        .isEqualTo(AuthDecision.NotPredicated("lake", match.pattern))
+            }
+        }
+        // Another catalog is still unknown, not forbidden.
+        val other = AuthPolicy.match(io.ktor.http.HttpMethod.Get, "/v1/catalogs/other")!!
+        assertThat(AuthPolicy.authorize(scoped, other)).isEqualTo(AuthDecision.UnknownCatalog("other"))
+    }
+
     // ---- fixtures -------------------------------------------------------
 
     private fun tenant(

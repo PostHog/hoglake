@@ -48,6 +48,13 @@ class JwtViolation(
         const val WRONG_ISSUER = "invalid_issuer"
         const val MISSING_CLAIM = "missing_claim"
         const val STALE_EPOCH = "stale_credential_epoch"
+
+        /**
+         * A scoped token's `prd` is missing, malformed, or names a field this
+         * instance's auth source does not declare; or this instance accepts no
+         * scoped tokens at all.
+         */
+        const val INVALID_PREDICATE = "invalid_predicate"
     }
 }
 

@@ -73,6 +73,23 @@ object TestTokens {
             """"org":"$org","cli":"hedgerow-prod","ep":7,"iat":$iat,"exp":$exp$nbfClaim,"cat":{$cat}}"""
     }
 
+    /**
+     * A scoped claim set: [prd] is spliced in verbatim (null leaves the claim
+     * out), so a test can send any shape, well-formed or not.
+     */
+    fun scopedClaims(
+        prd: String? = """{"team_id":{"42":"write","7":"read"}}""",
+        catalogs: String = """{"lake":["write"]}""",
+        iat: Long = 1_700_000_000L,
+        exp: Long = iat + 900,
+        extra: String = "",
+    ): String {
+        val prdClaim = prd?.let { ""","prd":$it""" } ?: ""
+        return """{"iss":"$ISSUER","aud":"$AUDIENCE","sub":"hlc_team","jti":"jti-s","ten":"scoped",""" +
+            """"org":"11111111-1111-1111-1111-111111111111","cli":"laptop","usr":"user-1",""" +
+            """"iat":$iat,"exp":$exp,"cat":$catalogs$prdClaim$extra}"""
+    }
+
     fun operatorClaims(
         exp: Long = 4_000_000_000L,
         sub: String = "sa:bulk-loader",

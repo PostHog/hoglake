@@ -34,10 +34,25 @@ data class Caller(
      * customer's own; without it a tenant may name nobody but itself.
      */
     val delegates: Boolean = false,
+    /**
+     * `prd`, on a [Kind.SCOPED] caller only: predicate field -> the values it
+     * may see, each with its own permission. Empty for every other kind.
+     */
+    val predicates: Map<String, PredicateGrant> = emptyMap(),
+    /** `usr`: an opaque end-user name for the audit log. Grants nothing. */
+    val user: String? = null,
 ) {
     enum class Kind {
         /** A tenant. Every catalog it may touch is enumerated in [catalogScopes]. */
         TENANT,
+
+        /**
+         * A tenant narrowed by [predicates]: it may touch only what is
+         * attributed to a value it holds, in a catalog in [catalogScopes].
+         * Naming a catalog is not enough on its own, so [holds] is false for
+         * it: every route a scoped caller may use decides per object.
+         */
+        SCOPED,
 
         /** PostHog-operated. Acts across catalogs; every use is audited separately. */
         OPERATOR,
@@ -70,12 +85,32 @@ data class Caller(
         scope: Scope,
     ): Boolean {
         if (kind.isOperator()) return true
+        // Fail closed: a scoped caller's authority is per object, never per
+        // catalog. A route that asked this would otherwise hand it the catalog.
+        if (kind == Kind.SCOPED) return false
         val held = catalogScopes[catalog] ?: return false
         return held.any { it.satisfies(scope) }
     }
 
     /** Every catalog name this caller may read — the filter for fleet-wide listings. */
     fun visibleCatalogs(): Set<String>? = if (kind.isOperator()) null else catalogScopes.keys
+}
+
+/**
+ * What a scoped token grants on one predicate field.
+ *
+ * Either every value ([All], `{"*": perm}`) or an enumerated set ([Values]).
+ * Permissions are [Scope.READ] or [Scope.WRITE] only; the effective permission
+ * on a value is the lower of this and the token's `cat` scope for the catalog.
+ */
+sealed interface PredicateGrant {
+    data class All(
+        val scope: Scope,
+    ) : PredicateGrant
+
+    data class Values(
+        val values: Map<Long, Scope>,
+    ) : PredicateGrant
 }
 
 /**
@@ -106,5 +141,15 @@ sealed interface AuthDecision {
     data class InsufficientScope(
         val catalog: String,
         val required: Scope,
+    ) : AuthDecision
+
+    /**
+     * A scoped caller on a route that cannot yet narrow by predicate -> 403.
+     * Refused in every mode, `warn` included: a verified scoped token is never
+     * let through to an unfiltered route.
+     */
+    data class NotPredicated(
+        val catalog: String,
+        val pattern: String,
     ) : AuthDecision
 }
