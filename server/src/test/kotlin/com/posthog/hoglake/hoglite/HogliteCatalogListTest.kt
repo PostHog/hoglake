@@ -63,7 +63,7 @@ class HogliteCatalogListTest {
         /** Whale-class tenants: the batch (standard pool) answers them 421 `class: whale`. */
         val whales: MutableSet<String> = ConcurrentHashMap.newKeySet()
 
-        /** Runs after the registry read is answered: a test's concurrent drop/recreate lands here. */
+        /** Runs after registry rows are captured but before the response: a concurrent drop/recreate lands here. */
         @Volatile var afterRegistryRead: () -> Unit = {}
 
         val requests = AtomicInteger()
@@ -109,8 +109,9 @@ class HogliteCatalogListTest {
                                 listOfNotNull(catalogs[args[0]]?.let { listOf(it) })
                             else -> error("unexpected registry read: $sql")
                         }
-                    reply(ex, 200, mapOf("cols" to List(rows.firstOrNull()?.size ?: 1) { "c$it" }, "rows" to rows))
+                    val response = mapOf("cols" to List(rows.firstOrNull()?.size ?: 1) { "c$it" }, "rows" to rows)
                     afterRegistryRead()
+                    reply(ex, 200, response)
                 }
                 path == "/v1/query-batch" -> {
                     if (!batchSupported) return reply(ex, 404, "404 page not found\n")

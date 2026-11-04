@@ -1725,7 +1725,7 @@ class HogliteCatalogStore(
                 """SELECT o.consumer_id, o.table_uuid, o.committed_snapshot, o.updated_at,
                       t.namespace, t.name, CASE WHEN t.dropped_snapshot IS NULL THEN 0 ELSE 1 END
                  FROM offsets o LEFT JOIN tables t ON t.table_uuid = o.table_uuid
-                ORDER BY o.consumer_id, o.table_uuid""",
+                ORDER BY o.consumer_id, t.namespace NULLS LAST, t.name NULLS LAST, o.table_uuid""",
             ).rows.map { r ->
                 ConsumerTableOffset(
                     consumerId = r[0].asString(),
@@ -2316,6 +2316,7 @@ class HogliteCatalogStore(
         if (sort == null || sort.fields.isEmpty()) {
             return page.map { fr ->
                 val f = fr.file
+                if (f.recordCount <= 0) return@map f.copy(orderingBounds = null)
                 f.copy(
                     orderingBounds =
                         FileOrderingBounds.RowIds(

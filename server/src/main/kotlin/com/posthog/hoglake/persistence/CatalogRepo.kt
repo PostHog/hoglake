@@ -59,16 +59,27 @@ object CatalogRepo {
         dataPath: String,
     ): CatalogInfo =
         try {
-            handle.createQuery(
-                """
-                INSERT INTO hog_catalog (catalog_id, name, data_path) OVERRIDING SYSTEM VALUE
-                VALUES (COALESCE(:boundId, nextval('hog_catalog_catalog_id_seq')), :name, :dataPath)
-                RETURNING $CATALOG_COLUMNS
-                """,
-            )
-                .bind("name", name)
+            val boundId = CatalogBinding.id(name)
+            val query =
+                if (boundId == null) {
+                    handle.createQuery(
+                        """
+                        INSERT INTO hog_catalog (name, data_path)
+                        VALUES (:name, :dataPath)
+                        RETURNING $CATALOG_COLUMNS
+                        """,
+                    )
+                } else {
+                    handle.createQuery(
+                        """
+                        INSERT INTO hog_catalog (catalog_id, name, data_path) OVERRIDING SYSTEM VALUE
+                        VALUES (:boundId, :name, :dataPath)
+                        RETURNING $CATALOG_COLUMNS
+                        """,
+                    ).bind("boundId", boundId)
+                }
+            query.bind("name", name)
                 .bind("dataPath", dataPath)
-                .bind("boundId", CatalogBinding.id(name))
                 .map(catalogMapper)
                 .one()
         } catch (e: UnableToExecuteStatementException) {

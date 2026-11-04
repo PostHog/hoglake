@@ -336,29 +336,47 @@ class MaintenanceSummarySampler(
             h.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
             // Discover new catalogs in bounded batches; catalog identity
             // is small, indexed state, not file metadata.
-            h.createUpdate(
-                """
-                INSERT INTO hog_maintenance_summary (catalog_id)
-                SELECT c.catalog_id FROM hog_catalog c
-                WHERE NOT EXISTS (SELECT 1 FROM hog_maintenance_summary s WHERE s.catalog_id = c.catalog_id)
-                AND (:allCatalogs OR c.catalog_id = ANY(:catalogIds))
-                ORDER BY c.catalog_id LIMIT 100 ON CONFLICT DO NOTHING
-                """,
-            )
-                .bind("allCatalogs", catalogIds == null)
-                .bindArray("catalogIds", Long::class.javaObjectType, catalogIds ?: emptyList<Long>())
-                .execute()
-            val job =
-                h.createQuery(
-                    """
-                SELECT catalog_id, generation, published_generation, scan_state::text AS scan
-                FROM hog_maintenance_summary WHERE next_batch_at <= now()
-                AND (:allCatalogs OR catalog_id = ANY(:catalogIds))
-                ORDER BY next_batch_at, catalog_id LIMIT 1 FOR UPDATE SKIP LOCKED
-                """,
+            val seed =
+                h.createUpdate(
+                    if (catalogIds == null) {
+                        """
+                        INSERT INTO hog_maintenance_summary (catalog_id)
+                        SELECT c.catalog_id FROM hog_catalog c
+                        WHERE NOT EXISTS (SELECT 1 FROM hog_maintenance_summary s WHERE s.catalog_id = c.catalog_id)
+                        ORDER BY c.catalog_id LIMIT 100 ON CONFLICT DO NOTHING
+                        """
+                    } else {
+                        """
+                        INSERT INTO hog_maintenance_summary (catalog_id)
+                        SELECT c.catalog_id FROM hog_catalog c
+                        WHERE NOT EXISTS (SELECT 1 FROM hog_maintenance_summary s WHERE s.catalog_id = c.catalog_id)
+                        AND c.catalog_id = ANY(:catalogIds)
+                        ORDER BY c.catalog_id LIMIT 100 ON CONFLICT DO NOTHING
+                        """
+                    },
                 )
-                    .bind("allCatalogs", catalogIds == null)
-                    .bindArray("catalogIds", Long::class.javaObjectType, catalogIds ?: emptyList<Long>())
+            if (catalogIds != null) seed.bindArray("catalogIds", Long::class.javaObjectType, catalogIds)
+            seed.execute()
+            val due =
+                h.createQuery(
+                    if (catalogIds == null) {
+                        """
+                        SELECT catalog_id, generation, published_generation, scan_state::text AS scan
+                        FROM hog_maintenance_summary WHERE next_batch_at <= now()
+                        ORDER BY next_batch_at, catalog_id LIMIT 1 FOR UPDATE SKIP LOCKED
+                        """
+                    } else {
+                        """
+                        SELECT catalog_id, generation, published_generation, scan_state::text AS scan
+                        FROM hog_maintenance_summary WHERE next_batch_at <= now()
+                        AND catalog_id = ANY(:catalogIds)
+                        ORDER BY next_batch_at, catalog_id LIMIT 1 FOR UPDATE SKIP LOCKED
+                        """
+                    },
+                )
+            if (catalogIds != null) due.bindArray("catalogIds", Long::class.javaObjectType, catalogIds)
+            val job =
+                due
                     .map { rs, _ ->
                         Job(
                             rs.getLong("catalog_id"), rs.getLong("generation"), rs.getLong("published_generation"),
