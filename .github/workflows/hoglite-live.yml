@@ -1,0 +1,73 @@
+# External image availability must not delay Server's completion/CD/ECR.
+name: Hoglite live
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'server/**'
+      - 'pyhoglake/tests/vectors/**'
+      - 'ci/**'
+      - '.github/workflows/**'
+
+permissions:
+  contents: read
+
+jobs:
+  hoglite-live:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'PostHog/hoglake'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: hoglite-live-${{ github.ref }}
+      cancel-in-progress: true
+    # Moved from server-test; update both pins together in one review.
+    # Content digest fixes the binary; revision label independently checks provenance.
+    env:
+      HOGLITE_COMMIT: 0a26b49646c887eadb0bc2a1142429a68bb88d72
+      HOGLITED_IMAGE_DIGEST: sha256:8da2526e8e08f3706546003ce7ade4ae3aaeefdb3d99b94c4ee7f300ad1d83f2
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: gradle
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - name: Require the pull role
+        env:
+          HAS_ROLE: ${{ secrets.HOGLAKE_AWS_ECR_PUBLISH_IAM_ROLE != '' }}
+        run: ci/hoglite-live.sh role
+      - name: Assume the ECR pull role
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+        with:
+          role-to-assume: ${{ secrets.HOGLAKE_AWS_ECR_PUBLISH_IAM_ROLE }}
+          aws-region: us-east-1
+          mask-aws-account-id: true
+      - name: Log in to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076 # v2.0.1
+      - name: Pull hoglited from the pinned image and verify it
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: ci/hoglite-live.sh pull
+      - name: Full server suite with the verified engine
+        run: ci/hoglite-live.sh test
+      - name: Require every engine consumer report
+        if: ${{ !cancelled() }}
+        run: uv run --no-project --with defusedxml==0.7.1 python ci/check_hoglite_results.py
+      - name: Save engine provenance and test reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: hoglite-live-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            server/build/test-results/test/
+            server/build/reports/tests/test/
+            ${{ runner.temp }}/hoglite-engine.txt
+          if-no-files-found: error

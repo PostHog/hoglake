@@ -240,21 +240,33 @@ content-addressed, so it fixes every byte of the engine, the binary included.
 `org.opencontainers.image.revision` label is `HOGLITE_COMMIT`, copies out
 `/usr/local/bin/hoglited`, and puts the release's Go toolchain
 (`go version -m`) in the job summary. The pins and the recipe are on the
-`server-test` job in `.github/workflows/server.yml`.
+`hoglite-live` job in `.github/workflows/hoglite-live.yml`.
 
-The pull role trusts only hoglake's `main` branch. So pushes to `main` run the
-live suites and fail `server-test` if the engine cannot be pulled or its label
-does not match, or if any hoglite test class skips. Pull requests cannot pull
-the engine and skip the live-engine suites by design: they get a notice and
-one job-summary line with the counts, and the job stays green.
+The pull role trusts only hoglake's `main` branch. Relevant main pushes run
+`Hoglite live / hoglite-live`, a visible **non-required separate workflow**.
+Missing credentials, pull/revision failure, test failure or incomplete/skipped
+engine reports fail that job red, without delaying Server completion or ECR/CD.
+Required `server-test` runs full `:test` with no HOGLITE_BINARY and refuses a
+hoglited PATH fallback. Its PostgreSQL/shared PG arms and pure-unit tests remain.
+The external job also runs full `:test`, including those PG arms. Its complete
+engine-consumer roster is `ci/hoglite-live-classes.txt`, checked against known
+launcher/shared-fixture patterns across all test packages by
+`ci/check_hoglite_results.py`; each required XML must be nonempty with zero skips,
+failures or errors. This bounded inventory is not a future-proof Kotlin parser.
+PRs cannot pull the engine under this main-only policy; hosted premerge live-engine
+coverage remains unresolved. Local exact-tree pre-push acceptance is unchanged.
 
 To run the live suites locally against the same engine (needs pull access to
 the hoglite ECR repository):
 
 ```sh
 ci/fetch-hoglited.sh <registry> <HOGLITED_IMAGE_DIGEST> <HOGLITE_COMMIT> /tmp/hoglited
-cd server && HOGLITE_BINARY=/tmp/hoglited ./gradlew :test --tests 'com.posthog.hoglake.hoglite.*'
+cd server && HOGLITE_BINARY=/tmp/hoglited ./gradlew :test
 ```
+
+Then run `uv run --no-project --with defusedxml==0.7.1 python
+ci/check_hoglite_results.py` from the repository root to enforce the complete
+roster, including non-Hoglite class names and classes outside the hoglite package.
 
 Without ECR access, rebuild from source at `HOGLITE_COMMIT` with the toolchain
 the summary records:

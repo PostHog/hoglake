@@ -155,7 +155,8 @@ path-scoped per component, posthog-monorepo style:
 
 | Workflow | Paths | Runs |
 |---|---|---|
-| `server.yml` | every PR and push to main; a `changes` job selects `server/**`, codec vectors, the live-test harness, the file itself, and the heavy jobs skip otherwise (REQUIRED CHECK `server-checks`, the gate over `server-test` and `python-live`; see the ruleset note below) | server-test + ktlint (Docker/Testcontainers; schema-equivalence gate included), both live Python suites, and a `server-checks` gate that requires both suites before deployment, PR image boot-smoke, the gated `deploy` job, and `trino-test` — the integration harness against the fork's public image (`ghcr.io/posthog/trino`, newest ordered release tag; pin via the `HOGLAKE_TRINO_IMAGE` repo variable). trino-test runs on an ARM runner (the image is arm64-only), is NOT in deploy's `needs`, and must stay non-required: a broken fork build must never wedge hoglake CD |
+| `server.yml` | every PR and push to main; a `changes` job selects `server/**`, codec vectors, the live-test harness, the file itself, and the heavy jobs skip otherwise (REQUIRED CHECK `server-checks`, the gate over `server-test` and `python-live`; see the ruleset note below) | full no-engine server-test + ktlint (Docker/Testcontainers; PostgreSQL/shared PG arms and schema-equivalence gate included), both live Python suites, and a `server-checks` gate that requires both suites before deployment, PR image boot-smoke, the gated `deploy` job, and `trino-test` — the integration harness against the fork's public image (`ghcr.io/posthog/trino`, newest ordered release tag; pin via the `HOGLAKE_TRINO_IMAGE` repo variable). trino-test runs on an ARM runner (the image is arm64-only), is NOT in deploy's `needs`, and must stay non-required: a broken fork build must never wedge hoglake CD |
+| `hoglite-live.yml` | relevant main pushes only (`server/**`, vectors, `ci/**`, workflow changes); NON-REQUIRED and separate from Server/ECR completion | full root `:test` with the digest/revision-verified external engine; explicit `ci/hoglite-live-classes.txt` inventory plus fail-closed nonempty/zero-skip report gate. Pull/login/test/report failures are red here, never hidden as allowed failures. PR live-engine coverage remains unavailable; neither deploy nor ECR depends on this workflow. |
 | `migration-chain.yml` | every PR and push to main, NO path filter | the append-only / no-duplicate-version / numbered-above-main gate on `server/src/main/resources/db/migration`, fetching main fresh at run time. Its own workflow because it is a REQUIRED CHECK, and it was the first to hit the rule below |
 | `webui.yml` | every PR and push to main; a `changes` job selects `webui/**`, the OpenAPI spec, the shared vectors, the file itself (REQUIRED CHECK `webui-test`) | `npm run build` (tsc gate) + vitest + PR image boot-smoke + gated `deploy` job |
 | `ci-python.yml` | every PR and push to main; a `changes` job selects `pyhoglake/**`, `hedgerow/**`, `millrace/**`, `bench/**`, the root `pyproject.toml` and `uv.lock`, the OpenAPI spec, `ci/**`, the workflow files, the server files and `.github/dependabot.yml` the client's tests read (the filter's comment names each), and the jobs skip otherwise (REQUIRED CHECK `python-checks`) | pyhoglake: `pyhoglake-checks.yml` (ruff, mypy, pytest on 3.12–3.13, the variant suites on the pyarrow floor `pyproject.toml` declares and — non-blocking — on the newest pyarrow at least 7 days old, build, wheel smoke test). hedgerow and bench: uv sync, ruff (pinned; bench exempt until its format backlog lands), pytest. millrace: uv sync, ruff, mypy, pytest, and the mutmut survivors gate. Unit tests plus both live client suites through `python-live.yml`; a `python-checks` job fails if any dependency fails |
@@ -167,6 +168,15 @@ path-scoped per component, posthog-monorepo style:
 | `fuzz.yml` | nightly cron + dispatch | `./gradlew fuzz` over every Jazzer target (900s per soak target, 60s per sweep target, by default), with the generated corpus accumulated across nights through the actions cache. Not a PR check: PR CI only REPLAYS the committed seed corpus, inside `:test` |
 | `semgrep.yml` | all | python / kotlin+java / general packs, pinned container |
 | `dependency-review.yml` | PRs | vulnerability gate (license allow-list deferred until the three-ecosystem atom set settles) |
+
+The external image-backed check is isolated from required `server-checks` and
+PostgreSQL CD/ECR. Required `server-test` unsets `HOGLITE_BINARY` and refuses a
+`hoglited` PATH fallback; an empty string is not absence for all launchers.
+Both jobs run full root `:test`, without package/name exclusions. This CI split
+does **not** weaken the exact-tree local pre-push acceptance rule above, including
+real engine coverage when changing the hoglite backend. Main-only credentials do
+not provide hosted premerge engine coverage (that policy remains unresolved).
+
 
 Live Python failures block deployment and publishing. The current merge
 rules require `migration-chain`, `server-checks`, `python-checks`, and

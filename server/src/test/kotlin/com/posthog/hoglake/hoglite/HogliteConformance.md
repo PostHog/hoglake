@@ -3,11 +3,11 @@
 Run with a real release engine and Docker:
 
 ```sh
-HOGLITE_BINARY=/path/to/hoglited ./gradlew :test --tests '*Hoglite*'
+HOGLITE_BINARY=/path/to/hoglited ./gradlew :test
 ```
 
-The shared gate runs 78 test invocations: 38 shared scenarios × two backends, one schema
-equivalence test, and one acknowledged-recovery test.
+The shared caller-contract suites and all backend-specific suites run together;
+the live report roster, not a fixed historical invocation count, defines coverage.
 
 `HogliteBackendConformanceIntegrationTest` has one parameterized scenario per
 contract, each invoked for POSTGRES and HOGLITE. Only fixture construction varies;
@@ -16,12 +16,19 @@ assertions do not choose a backend. PostgreSQL uses `PgTestSupport.freshDatabase
 against a real object store. No mocked catalog or transaction transport is used.
 The engine stdout goes to a file, not an undrained pipe.
 
-Without `HOGLITE_BINARY` or a `hoglited` executable on PATH, 35 PostgreSQL-only
-invocations still run. The 38 hoglite arms, three PostgreSQL Parquet/compaction
-arms sharing the live fixture, schema equivalence and recovery explicitly abort
-with a missing-engine reason (43 invocations). JUnit represents assumption aborts
-as skipped in XML. On pushes to main, CI rejects these skips.
-It requires all six live suite reports by name. Pull requests skip the live
+Without `HOGLITE_BINARY` or a `hoglited` executable on PATH, independent
+PostgreSQL arms still run. Engine arms and PG Parquet/compaction arms that share
+the live fixture explicitly abort with a missing-engine reason (JUnit XML skips).
+ In the separate, non-required main-only
+`Hoglite live / hoglite-live` workflow, CI rejects these skips. It runs full root
+`:test` and requires the complete `ci/hoglite-live-classes.txt` report roster,
+including CatalogMetrics, MixedCatalog, read parity and PostgreSQL creation/sampler
+parity consumers. Known launcher/shared-fixture source patterns across all test
+packages must match that roster; reports must be nonempty and have zero skips,
+failures and errors. This bounded gate does not infer arbitrary future fixtures.
+The required PG job also runs full `:test` without an engine, retaining PG arms.
+Local pre-push acceptance is unchanged. Hosted premerge engine coverage remains
+unresolved under the approved main-only credential policy. Pull requests skip the live
 hoglite suites by design. These are not silently successful tests.
 
 ## Covered guarantees

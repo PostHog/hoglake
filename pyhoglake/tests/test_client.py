@@ -1839,3 +1839,25 @@ def test_set_properties_client_side_validation():
     # A valid set passes, and an empty dict (clear) is valid.
     ops.set_properties({"owner": "web-analytics", "quality.tier": "gold"})
     ops.set_properties({})
+
+
+@pytest.mark.parametrize("code", ["backend_unavailable", "commit_outcome_unknown"])
+def test_availability_codes_make_one_request_not_a_retry_policy(
+    client, httpx_mock, code
+):
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat",
+        status_code=503,
+        headers={"Retry-After": "1"},
+        json={"error": code, "detail": "uncertain"},
+    )
+    with pytest.raises(HoglakeError) as caught:
+        client.catalog("cat")
+    error = caught.value
+    assert type(error) is HoglakeError
+    assert error.status_code == 503
+    assert error.message == code
+    assert error.detail == "uncertain"
+    assert error.retryable is False
+    assert len(httpx_mock.get_requests()) == 1

@@ -18,13 +18,13 @@ import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.Test
 
 /**
- * A commit that may have landed reaches the API as a retryable 503 with
+ * A commit that may have landed reaches the API as an uncertain 503 with
  * its own code — never a 4xx a writer would treat as final, and not
  * `backend_unavailable`, which says nothing about the commit.
  */
 class CommitOutcomeUnknownMappingTest {
     @Test
-    fun `an unknown commit outcome is a retryable 503 with its own code`() =
+    fun `an unknown commit outcome is an uncertain 503 with its own code`() =
         testApplication {
             application {
                 install(ContentNegotiation) { jackson { configureHoglakeWire() } }
@@ -32,6 +32,7 @@ class CommitOutcomeUnknownMappingTest {
                 routing {
                     get("/unknown") { throw HoglakeException.CommitOutcomeUnknown("tx-1", "owner lost") }
                     get("/down") { throw HoglakeException.BackendUnavailable("pool down") }
+                    get("/queue") { throw HoglakeException.CommitQueueTimeout("busy") }
                 }
             }
             val mapper = wireObjectMapper()
@@ -39,10 +40,39 @@ class CommitOutcomeUnknownMappingTest {
             assertThat(unknown.status).isEqualTo(HttpStatusCode.ServiceUnavailable)
             assertThat(unknown.headers[HttpHeaders.RetryAfter]).isEqualTo("1")
             val body = mapper.readTree(unknown.bodyAsText())
+            assertThat(body.fieldNames().asSequence().toList()).containsExactlyInAnyOrder("error", "detail")
             assertThat(body["error"].asText()).isEqualTo("commit_outcome_unknown")
             assertThat(body["detail"].asText()).contains("tx-1", "may or may not have committed")
             val down = client.get("/down")
             assertThat(down.status).isEqualTo(HttpStatusCode.ServiceUnavailable)
-            assertThat(mapper.readTree(down.bodyAsText())["error"].asText()).isEqualTo("backend_unavailable")
+            assertThat(down.headers[HttpHeaders.RetryAfter]).isEqualTo("1")
+            val downBody = mapper.readTree(down.bodyAsText())
+            assertThat(downBody["error"].asText()).isEqualTo("backend_unavailable")
+            assertThat(downBody.fieldNames().asSequence().toList()).containsExactlyInAnyOrder("error", "detail")
+            val queue = client.get("/queue")
+            assertThat(queue.status).isEqualTo(HttpStatusCode.ServiceUnavailable)
+            assertThat(queue.headers[HttpHeaders.RetryAfter]).isEqualTo("1")
+            val queueBody = mapper.readTree(queue.bodyAsText())
+            assertThat(queueBody["error"].asText()).isEqualTo("commit_queue_timeout")
+            assertThat(queueBody.fieldNames().asSequence().toList()).containsExactlyInAnyOrder("error", "detail")
         }
+
+    @Test
+    fun `documented availability examples are the real serialized mapping not new replay fields`() {
+        val spec = java.io.File("src/main/resources/openapi/hoglake.yaml").readText()
+        val responses = spec.substringAfter("  responses:\n").substringBefore("  schemas:\n")
+        val examples =
+            Regex("value: (\\{[^\\n]+})").findAll(responses)
+                .map { wireObjectMapper().readTree(it.groupValues[1]) }.toList()
+        for (cause in listOf(
+            HoglakeException.BackendUnavailable("pool down"),
+            HoglakeException.CommitOutcomeUnknown("tx-1", "owner lost"),
+        )) {
+            val (status, dto) = errorBody(cause)
+            assertThat(status).isEqualTo(HttpStatusCode.ServiceUnavailable)
+            val actual = wireObjectMapper().valueToTree<com.fasterxml.jackson.databind.JsonNode>(dto)
+            assertThat(actual.fieldNames().asSequence().toList()).containsExactlyInAnyOrder("error", "detail")
+            assertThat(examples).contains(actual)
+        }
+    }
 }

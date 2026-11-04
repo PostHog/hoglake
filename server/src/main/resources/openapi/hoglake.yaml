@@ -10,6 +10,32 @@ info:
     (client-written puffin DVs, registered like files). Retention is a
     catalog property with a consumer-offset floor.
 
+    ## Backend availability and uncertain writes
+
+    `backend_unavailable` means the configured backend could not complete the
+    operation normally. It does not prove whole-operation rollback or that a
+    failure is transient. `commit_outcome_unknown` means a backend transaction
+    may or may not have committed; it is not a definitive rejection. Both use
+    HTTP 503 and `Retry-After: 1`. This header schedules backoff, not replay
+    safety or finality. Reads can be retried after backoff. Write recovery
+    depends on the operation's existing idempotency contract.
+
+    For receipt-backed commits, retain the original idempotency key and identical
+    logical payload (including read basis, target incarnation and file references).
+    Replay is conditional on the original catalog incarnation and retained receipt
+    lifetime under configured retention. An existing receipt reports the original
+    committed result; a missing receipt does not prove an in-flight operation
+    stopped or rolled back. Retain uncertain uploads/referenced objects until
+    reconciled. Receipts are not a permanent deduplication guarantee.
+
+    Unkeyed writes and ordinary DDL have no general client replay guarantee.
+    Blind repetition or a new key may apply another operation. Use the operation's
+    documented receipt/state/reconciliation mechanism; idempotent table creation
+    uses its operation UUID/state machine, not a commit receipt for ALTER.
+    A txid in free-form detail is internal, not a REST replay token. Branch on
+    `error`, not parsed detail. These codes are not limited to the paths explicitly
+    listing them below. Queue/partition-specific refusals remain distinct.
+
     ## Authentication
 
     Every operation except the four marked `security: []` below
@@ -116,6 +142,8 @@ paths:
               schema:
                 type: array
                 items: { $ref: "#/components/schemas/Catalog" }
+        "503": { $ref: "#/components/responses/ReadUnavailable" }
+
     post:
       operationId: createCatalog
       summary: Create a catalog
@@ -136,6 +164,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "503": { $ref: "#/components/responses/WriteUnavailable" }
 
   /catalogs/{catalog}:
     get:
@@ -149,6 +178,8 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Catalog" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/ReadUnavailable" }
+
     delete:
       operationId: dropCatalog
       summary: Drop an empty catalog (metadata only; the data path is not touched)
@@ -205,6 +236,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
         "422": { $ref: "#/components/responses/Validation" }
+        "503": { $ref: "#/components/responses/WriteUnavailable" }
 
   /catalogs/{catalog}/storage-usage:
     get:
@@ -246,12 +278,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
-        "503":
-          description: Request admission unavailable; retry later
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/ApiError" }
-
+        "503": { $ref: "#/components/responses/ReadUnavailable" }
   /catalogs/{catalog}/namespaces:
     get:
       operationId: listNamespaces
@@ -275,6 +302,8 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
         "410": { $ref: "#/components/responses/Gone" }
         "422": { $ref: "#/components/responses/Validation" }
+        "503": { $ref: "#/components/responses/ReadUnavailable" }
+
     post:
       operationId: createNamespace
       parameters: [ { $ref: "#/components/parameters/catalog" } ]
@@ -303,6 +332,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "503": { $ref: "#/components/responses/WriteUnavailable" }
 
   /catalogs/{catalog}/namespaces/{namespace}:
     get:
@@ -317,6 +347,8 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Namespace" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/ReadUnavailable" }
+
     delete:
       operationId: dropNamespace
       summary: Drop a namespace (DDL commit; produces a snapshot)
@@ -341,6 +373,7 @@ paths:
               schema: { $ref: "#/components/schemas/CommitResult" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/Conflict" }
+        "503": { $ref: "#/components/responses/WriteUnavailable" }
 
   /catalogs/{catalog}/namespaces/{namespace}/tables:
     get:
@@ -382,6 +415,8 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
         "410": { $ref: "#/components/responses/Gone" }
         "422": { $ref: "#/components/responses/Validation" }
+        "503": { $ref: "#/components/responses/ReadUnavailable" }
+
     post:
       operationId: createTable
       summary: Create a table (DDL commit; produces a snapshot)
@@ -406,6 +441,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "503": { $ref: "#/components/responses/WriteUnavailable" }
 
   /catalogs/{catalog}/namespaces/{namespace}/tables/{table}:
     get:
@@ -453,6 +489,8 @@ paths:
               schema: { $ref: "#/components/schemas/ApiError" }
         "404": { $ref: "#/components/responses/NotFound" }
         "410": { $ref: "#/components/responses/Gone" }
+        "503": { $ref: "#/components/responses/ReadUnavailable" }
+
     delete:
       operationId: dropTable
       summary: Drop a table (DDL commit; produces a snapshot)
@@ -488,6 +526,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "503": { $ref: "#/components/responses/WriteUnavailable" }
 
   /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/truncate:
     post:
@@ -540,6 +579,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "503": { $ref: "#/components/responses/WriteUnavailable" }
 
   /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/alter:
     post:
@@ -630,6 +670,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "503": { $ref: "#/components/responses/WriteUnavailable" }
 
   /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/scan:
     get:
@@ -755,6 +796,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "503": { $ref: "#/components/responses/ReadUnavailable" }
 
   /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/files:
     get:
@@ -829,6 +871,7 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
         "410": { $ref: "#/components/responses/Gone" }
         "422": { $ref: "#/components/responses/Validation" }
+        "503": { $ref: "#/components/responses/ReadUnavailable" }
 
   /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/partitions:
     get:
@@ -917,6 +960,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "503": { $ref: "#/components/responses/ReadUnavailable" }
 
   /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/partitions/lookup:
     post:
@@ -1014,14 +1058,17 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
         "503":
-          description: Lookup admission is busy or a statement timed out; never an empty result.
+          description: Lookup admission is busy or a statement timed out (`partition_lookup_unavailable`); never an empty result. Backend availability failures can instead return `backend_unavailable` with ApiError. Retry-After is backoff, not a write replay guarantee.
           headers:
             Retry-After:
               description: Seconds to wait before retrying.
               schema: { type: integer, example: 1 }
           content:
             application/json:
-              schema: { $ref: "#/components/schemas/PartitionLookupUnavailableError" }
+              schema:
+                anyOf:
+                  - { $ref: "#/components/schemas/PartitionLookupUnavailableError" }
+                  - { $ref: "#/components/schemas/ApiError" }
 
   /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/partitions/values:
     get:
@@ -1050,6 +1097,7 @@ paths:
               schema: { $ref: "#/components/schemas/PartitionValues" }
         "404": { $ref: "#/components/responses/NotFound" }
         "410": { $ref: "#/components/responses/Gone" }
+        "503": { $ref: "#/components/responses/ReadUnavailable" }
 
   /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/files/{fileId}/stats:
     get:
@@ -1091,6 +1139,7 @@ paths:
               schema: { $ref: "#/components/schemas/FileStats" }
         "404": { $ref: "#/components/responses/NotFound" }
         "410": { $ref: "#/components/responses/Gone" }
+        "503": { $ref: "#/components/responses/ReadUnavailable" }
 
   /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/changes:
     get:
@@ -1137,6 +1186,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "503": { $ref: "#/components/responses/ReadUnavailable" }
 
   /catalogs/{catalog}/options:
     get:
@@ -1149,6 +1199,8 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/CatalogOptions" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/ReadUnavailable" }
+
     patch:
       operationId: patchCatalogOptions
       summary: >
@@ -1186,6 +1238,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "503": { $ref: "#/components/responses/WriteUnavailable" }
 
   /catalogs/{catalog}/maintenance/expire:
     post:
@@ -1204,6 +1257,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ExpiryResult" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/WriteUnavailable" }
 
   /catalogs/{catalog}/maintenance/compact:
     post:
@@ -1241,6 +1295,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/CompactionResult" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/WriteUnavailable" }
 
   /catalogs/{catalog}/maintenance/rehydrate:
     post:
@@ -1278,6 +1333,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "503": { $ref: "#/components/responses/WriteUnavailable" }
 
   /catalogs/{catalog}/maintenance/cleanup:
     post:
@@ -1309,6 +1365,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/CleanupResult" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/WriteUnavailable" }
 
   /database/health:
     get:
@@ -1333,6 +1390,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/DatabaseHealth" }
+        "503": { $ref: "#/components/responses/ReadUnavailable" }
 
   /maintenance/status:
     get:
@@ -1363,6 +1421,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "503": { $ref: "#/components/responses/ReadUnavailable" }
 
   /maintenance/runs:
     get:
@@ -1401,6 +1460,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "503": { $ref: "#/components/responses/ReadUnavailable" }
 
   /catalogs/{catalog}/maintenance/status:
     get:
@@ -1439,6 +1499,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/MaintenanceStatus" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/ReadUnavailable" }
 
   /catalogs/{catalog}/maintenance/runs:
     get:
@@ -1483,6 +1544,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "503": { $ref: "#/components/responses/ReadUnavailable" }
 
   /catalogs/{catalog}/stats/partitions:
     get:
@@ -1543,6 +1605,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "503": { $ref: "#/components/responses/ReadUnavailable" }
 
   /catalogs/{catalog}/namespaces/{namespace}/views:
     get:
@@ -1558,6 +1621,8 @@ paths:
               schema:
                 type: array
                 items: { $ref: "#/components/schemas/View" }
+        "503": { $ref: "#/components/responses/ReadUnavailable" }
+
     post:
       operationId: createView
       summary: Create a view (DDL commit; view SQL is stored verbatim with its dialect)
@@ -1586,6 +1651,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/View" }
         "409": { $ref: "#/components/responses/Conflict" }
+        "503": { $ref: "#/components/responses/WriteUnavailable" }
 
   /catalogs/{catalog}/namespaces/{namespace}/views/{view}:
     get:
@@ -1604,6 +1670,8 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/View" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/ReadUnavailable" }
+
     delete:
       operationId: dropView
       parameters:
@@ -1623,6 +1691,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/CommitResult" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/WriteUnavailable" }
 
   /catalogs/{catalog}/snapshots/resolve:
     get:
@@ -1655,6 +1724,7 @@ paths:
               schema: { $ref: "#/components/schemas/ApiError" }
         "404": { $ref: "#/components/responses/NotFound" }
         "410": { $ref: "#/components/responses/Gone" }
+        "503": { $ref: "#/components/responses/ReadUnavailable" }
 
   /catalogs/{catalog}/snapshots:
     get:
@@ -1689,6 +1759,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "503": { $ref: "#/components/responses/ReadUnavailable" }
 
   /catalogs/{catalog}/table-creations/{operation}:
     put:
@@ -1741,13 +1812,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "503":
-          description: Operation or catalog lock wait exceeded the configured timeout; retry with the same operation ID
-          headers:
-            Retry-After: { schema: { type: integer }, description: Seconds before retrying }
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/ApiError" }
+        "503": { $ref: "#/components/responses/CreationUnavailable" }
         "409": { $ref: "#/components/responses/Conflict" }
         "422":
           description: Invalid definition or file registrations; no publication occurred
@@ -1772,13 +1837,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "503":
-          description: Operation or catalog lock wait exceeded the configured timeout; retry with the same operation ID
-          headers:
-            Retry-After: { schema: { type: integer }, description: Seconds before retrying }
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/ApiError" }
+        "503": { $ref: "#/components/responses/CreationReadUnavailable" }
         "409": { $ref: "#/components/responses/Conflict" }
         "422":
           description: Invalid definition or file registrations; no publication occurred
@@ -1840,8 +1899,7 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { description: Conflicting operation definition }
         "422": { description: Invalid partition fields or table definition }
-        "503": { description: Operation or catalog lock wait exceeded; retry with the same operation ID }
-
+        "503": { $ref: "#/components/responses/CreationUnavailable" }
   /catalogs/{catalog}/table-creations/{operation}/sorted:
     put:
       operationId: prepareSortedTableCreation
@@ -1901,8 +1959,7 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { description: Conflicting operation definition }
         "422": { description: Invalid sort or partition fields or table definition }
-        "503": { description: Operation or catalog lock wait exceeded; retry with the same operation ID }
-
+        "503": { $ref: "#/components/responses/CreationUnavailable" }
   /catalogs/{catalog}/table-creations/{operation}/metadata:
     put:
       operationId: prepareMetadataTableCreation
@@ -1962,8 +2019,7 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { description: Conflicting operation definition }
         "422": { description: Invalid sort or partition fields or table definition }
-        "503": { description: Operation or catalog lock wait exceeded; retry with the same operation ID }
-
+        "503": { $ref: "#/components/responses/CreationUnavailable" }
   /catalogs/{catalog}/table-creations/{operation}/commit:
     post:
       operationId: publishTableCreation
@@ -2006,13 +2062,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "503":
-          description: Operation or catalog lock wait exceeded the configured timeout; retry with the same operation ID
-          headers:
-            Retry-After: { schema: { type: integer }, description: Seconds before retrying }
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/ApiError" }
+        "503": { $ref: "#/components/responses/CreationUnavailable" }
         "409": { $ref: "#/components/responses/Conflict" }
         "422":
           description: Invalid definition or file registrations; no publication occurred
@@ -2063,13 +2113,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "503":
-          description: Operation or catalog lock wait exceeded the configured timeout; retry with the same operation ID
-          headers:
-            Retry-After: { schema: { type: integer }, description: Seconds before retrying }
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/ApiError" }
+        "503": { $ref: "#/components/responses/CreationUnavailable" }
         "409": { $ref: "#/components/responses/Conflict" }
         "422":
           description: Invalid definition or file registrations; no publication occurred
@@ -2095,13 +2139,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "503":
-          description: Operation or catalog lock wait exceeded the configured timeout; retry with the same operation ID
-          headers:
-            Retry-After: { schema: { type: integer }, description: Seconds before retrying }
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/ApiError" }
+        "503": { $ref: "#/components/responses/CreationUnavailable" }
         "409": { $ref: "#/components/responses/Conflict" }
         "422":
           description: Invalid definition or file registrations; no publication occurred
@@ -2116,8 +2154,10 @@ paths:
       description: >
         Available with idempotent-append-v1. Uses the same deployment access
         boundary as the catalog commit API. A 404 is not proof that an in-flight
-        request has stopped. Receipts survive rename, drop and snapshot expiry
-        and have no expiration. No file paths or request payload are returned.
+        request has stopped. Receipts survive table rename, table drop and snapshot
+        expiry while retained under configured receipt retention; they are scoped to
+        the original catalog incarnation, not permanent. No file paths or request
+        payload are returned.
       parameters:
         - { $ref: "#/components/parameters/catalog" }
         - name: operation
@@ -2139,6 +2179,7 @@ paths:
         "400":
           description: Invalid operation UUID
         "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/ReadUnavailable" }
 
   /catalogs/{catalog}/commit/prepared:
     post:
@@ -2231,9 +2272,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
-        "503":
-          description: Commit admission timed out; retry the identical request
-
+        "503": { $ref: "#/components/responses/CommitUnavailable" }
   /catalogs/{catalog}/uploads/{upload}:
     put:
       operationId: claimUpload
@@ -2277,6 +2316,7 @@ paths:
                   expires_at: { type: string, format: date-time }
         "409": { description: Upload identity reused with different intent }
         "422": { description: Invalid prefix or file kind }
+        "503": { $ref: "#/components/responses/WriteUnavailable" }
 
   /catalogs/{catalog}/uploads/renew:
     post:
@@ -2302,6 +2342,7 @@ paths:
           content:
             application/json:
               schema: { type: object, properties: { renewed: { type: integer } } }
+        "503": { $ref: "#/components/responses/WriteUnavailable" }
 
   /catalogs/{catalog}/uploads/abandon:
     post:
@@ -2325,6 +2366,7 @@ paths:
           content:
             application/json:
               schema: { type: object, properties: { abandoned: { type: integer } } }
+        "503": { $ref: "#/components/responses/WriteUnavailable" }
 
   /catalogs/{catalog}/uploads/schedule-expired:
     post:
@@ -2358,6 +2400,7 @@ paths:
             application/json:
               schema: { type: object, properties: { scheduled: { type: integer } } }
         "422": { description: Limit outside allowed range }
+        "503": { $ref: "#/components/responses/WriteUnavailable" }
 
   /catalogs/{catalog}/commit/uploads:
     post:
@@ -2454,9 +2497,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
-        "503":
-          description: Commit admission timed out; retry the identical request
-
+        "503": { $ref: "#/components/responses/CommitUnavailable" }
   /catalogs/{catalog}/commit/transaction:
     post:
       operationId: commitTransaction
@@ -2576,9 +2617,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
-        "503":
-          description: Commit admission timed out; retry the identical request
-
+        "503": { $ref: "#/components/responses/CommitUnavailable" }
   /catalogs/{catalog}/commit/deletes/prepared:
     post:
       operationId: commitPreparedDelete
@@ -2675,9 +2714,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
-        "503":
-          description: Commit admission timed out; retry the identical request
-
+        "503": { $ref: "#/components/responses/CommitUnavailable" }
   /catalogs/{catalog}/commit/mutations/prepared:
     post:
       operationId: commitPreparedMutation
@@ -2790,9 +2827,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
-        "503":
-          description: Commit admission timed out; retry the identical request
-
+        "503": { $ref: "#/components/responses/CommitUnavailable" }
   /catalogs/{catalog}/commit:
     post:
       operationId: commit
@@ -2889,22 +2924,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
-        "503":
-          description: >
-            Commit admission timed out: the commit transaction's
-            lock_timeout (HOGLAKE_COMMIT_LOCK_TIMEOUT_MS, default 30s,
-            0 disables) expired while queuing on the per-catalog commit
-            lock. Error code `commit_queue_timeout`. Explicit, retryable
-            backpressure — never a generic 500; back off per the
-            Retry-After header and retry the identical commit.
-          headers:
-            Retry-After:
-              description: Seconds to back off before retrying.
-              schema: { type: integer }
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/ApiError" }
-
+        "503": { $ref: "#/components/responses/CommitUnavailable" }
   # ---- CDC publications (SPECIFIED, NOT YET IMPLEMENTED: all return 501) ----
   # The WAL tap: a catalog-managed publication tails a table's changefeed
   # and produces its rows directly to Kafka. The publisher's progress is a
@@ -3152,6 +3172,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ConsumerList" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/ReadUnavailable" }
 
   /catalogs/{catalog}/consumers/{consumer}/offsets:
     get:
@@ -3168,6 +3189,7 @@ paths:
                 type: array
                 items: { $ref: "#/components/schemas/ConsumerOffset" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/ReadUnavailable" }
 
   /catalogs/{catalog}/consumers/{consumer}/offsets/{tableUuid}:
     get:
@@ -3187,6 +3209,8 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ConsumerOffset" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/ReadUnavailable" }
+
     put:
       operationId: commitConsumerOffset
       summary: >
@@ -3227,6 +3251,7 @@ paths:
               schema: { $ref: "#/components/schemas/ConsumerOffset" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/Conflict" }
+        "503": { $ref: "#/components/responses/WriteUnavailable" }
 
 components:
   securitySchemes:
@@ -3311,6 +3336,97 @@ components:
       schema: { type: integer }
 
   responses:
+    ReadUnavailable:
+      description: >
+        Backend availability failure (`backend_unavailable`). Retry reads after
+        backoff; Retry-After does not prove rollback of any earlier operation.
+        Request admission can also be unavailable (`commit_queue_timeout`);
+        back off and retry the read.
+      headers:
+        Retry-After:
+          description: Seconds to back off; not proof of rollback or replay safety.
+          schema: { type: integer, example: 1 }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
+          examples:
+            backendUnavailable:
+              value: {"error":"backend_unavailable","detail":"pool down"}
+    WriteUnavailable:
+      description: >
+        Backend availability failure (`backend_unavailable`) or uncertain backend
+        transaction (`commit_outcome_unknown`), which may have committed. Neither
+        the status nor Retry-After makes an unkeyed write or DDL replay-safe.
+        See Backend availability and uncertain writes.
+      headers:
+        Retry-After:
+          description: Seconds to back off; not proof of rollback or replay safety.
+          schema: { type: integer, example: 1 }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
+          examples:
+            backendUnavailable:
+              value: {"error":"backend_unavailable","detail":"pool down"}
+            commitOutcomeUnknown:
+              value: {"error":"commit_outcome_unknown","detail":"transaction 'tx-1' outcome unknown (it may or may not have committed; retrying it with the same txid is exactly-once): owner lost"}
+    CommitUnavailable:
+      description: >
+        Commit admission backpressure (`commit_queue_timeout`): the transaction's
+        lock_timeout (HOGLAKE_COMMIT_LOCK_TIMEOUT_MS, default 30s, 0 disables)
+        expired waiting on the per-catalog commit lock. Back off and retry the
+        identical commit. Also backend_unavailable or commit_outcome_unknown:
+        unknown may have committed, and backend_unavailable does not prove
+        whole-operation rollback. Receipt-backed replay requires the original
+        key and identical payload within the original incarnation/retained receipt
+        lifetime; unkeyed blind retry is unsafe. See Backend availability and
+        uncertain writes.
+      headers:
+        Retry-After:
+          description: Seconds to back off; not proof of rollback or replay safety.
+          schema: { type: integer, example: 1 }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
+          examples:
+            backendUnavailable:
+              value: {"error":"backend_unavailable","detail":"pool down"}
+            commitOutcomeUnknown:
+              value: {"error":"commit_outcome_unknown","detail":"transaction 'tx-1' outcome unknown (it may or may not have committed; retrying it with the same txid is exactly-once): owner lost"}
+    CreationUnavailable:
+      description: >
+        Operation or catalog lock wait exceeded the configured timeout
+        (`commit_queue_timeout`); back off and retry with the same operation ID.
+        Also backend_unavailable or commit_outcome_unknown, which may have
+        committed. Reconcile using the existing creation operation UUID/state
+        machine, not a new UUID or a universal replay token.
+      headers:
+        Retry-After:
+          description: Seconds to back off; not proof of rollback or replay safety.
+          schema: { type: integer, example: 1 }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
+          examples:
+            backendUnavailable:
+              value: {"error":"backend_unavailable","detail":"pool down"}
+            commitOutcomeUnknown:
+              value: {"error":"commit_outcome_unknown","detail":"transaction 'tx-1' outcome unknown (it may or may not have committed; retrying it with the same txid is exactly-once): owner lost"}
+    CreationReadUnavailable:
+      description: >
+        Operation or catalog lock wait exceeded the configured timeout
+        (`commit_queue_timeout`); back off and retry with the same operation ID.
+        Also backend availability failure (`backend_unavailable`).
+      headers:
+        Retry-After:
+          description: Seconds to back off; not proof of rollback or replay safety.
+          schema: { type: integer, example: 1 }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
+          examples:
+            backendUnavailable:
+              value: {"error":"backend_unavailable","detail":"pool down"}
     Unauthenticated:
       description: >
         No credential, or one that does not verify. `error` is a closed
@@ -3378,7 +3494,13 @@ components:
       type: object
       required: [error]
       properties:
-        error: { type: string }
+        error:
+          type: string
+          description: >
+            Open error code string. HTTP 503 includes backend_unavailable (no
+            whole-operation rollback promise) and commit_outcome_unknown (may
+            have committed). Retry-After does not establish write replay safety.
+            See Backend availability and uncertain writes above.
         detail: { type: string }
         tables:
           type: array
@@ -4132,7 +4254,8 @@ components:
             registration fields, is compared. Equivalent request replays
             return the original result without writing, including after snapshot
             expiry. Reusing a key with a different request returns 422. Receipts
-            are retained indefinitely. Persist the complete request before sending.
+            are retained under configured receipt retention in the original catalog
+            incarnation, not indefinitely. Persist the complete request before sending.
         read_snapshot:
           type: integer
           format: int64

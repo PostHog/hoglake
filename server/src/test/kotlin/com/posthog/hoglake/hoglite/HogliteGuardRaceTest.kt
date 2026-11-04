@@ -3075,6 +3075,366 @@ class HogliteGuardRaceTest {
         assertThat(n(c, "SELECT COUNT(*) FROM table_layouts")).isZero()
     }
 
+    // ---- ALTER: only a proven private schema rollback may replan ----------
+
+    private fun isAlterTx(
+        m: String,
+        p: String,
+        b: String,
+    ) = isTx(m, p, b) && "table_altered" in b
+
+    @Test
+    fun `alter allows at most two materializations and neither rollback consumes ids`() {
+        val (c, original) = setup()
+        val before = head(c)
+        var interference = 0
+        val bodies = mutableListOf<String>()
+        val responses = mutableListOf<String>()
+        val hook =
+            Hook(::isAlterTx, remaining = 3, before = {
+                store.alters.alterTable(
+                    c,
+                    "ns",
+                    "t",
+                    listOf(AlterOp.AddColumn(ColumnDef("a${interference++}", ColType.LONG))),
+                )
+            }, response = { status, bytes ->
+                assertThat(status).isEqualTo(409)
+                responses += bytes.decodeToString()
+                status to bytes
+            })
+        hooks += hook
+        val start = seen.size
+        assertThatThrownBy {
+            pstore.alters.alterTable(c, "ns", "t", listOf(AlterOp.AddColumn(ColumnDef("b", ColType.LONG))))
+        }.isExactlyInstanceOf(HoglakeException.CommitConflict::class.java)
+        hooks.remove(hook)
+        bodies += seen.drop(start).filter { "table_altered" in it && "POST " in it && "/tx " in it }
+        assertThat(bodies).hasSize(2)
+        assertThat(
+            bodies.map { wireObjectMapper().readTree(it.substringAfter("/tx "))["txid"].asText() }.distinct(),
+        ).hasSize(2)
+        assertThat(responses).hasSize(2)
+        assertThat(hook.remaining).isEqualTo(1)
+        assertThat(head(c)).isEqualTo(before + 2)
+        val current = store.getTable(c, "ns", "t")
+        assertThat(current.columns.map { it.def.name }).containsExactly("id", "a0", "a1")
+        assertThat(current.columns.map { it.fieldId }).containsExactly(1, 2, 3)
+        assertThat(n(c, "SELECT COUNT(*) FROM changes WHERE kind = 'table_altered'")).isEqualTo(2)
+        assertThat(store.getTable(c, "ns", "t", snapshot = original.readSnapshotId).columns).hasSize(1)
+    }
+
+    @Test
+    fun `alter replan refuses replacement table namespace and catalog instead of adopting them`() {
+        for (replacement in listOf("table", "namespace", "catalog", "rename")) {
+            val (c, original) = setup()
+            var replacementUuid: UUID? = null
+            var hookError: Throwable? = null
+            val hook =
+                Hook(::isAlterTx, before = {
+                    store.alters.alterTable(c, "ns", "t", listOf(AlterOp.SetTableComment("winner")))
+                }, after = {
+                    try {
+                        if (replacement == "rename") {
+                            store.alters.alterTable(c, "ns", "t", listOf(AlterOp.RenameTable("old")))
+                        } else {
+                            store.dropTable(c, "ns", "t", author = "test", message = "replace")
+                            if (replacement != "table") {
+                                store.dropNamespace(
+                                    c,
+                                    "ns",
+                                    author = "test",
+                                    message = "replace",
+                                )
+                            }
+                            if (replacement == "catalog") {
+                                store.dropCatalog(c, "test", "replace")
+                                store.createCatalog(c, "s3://hoglake-it/$c")
+                            }
+                            if (replacement != "table") store.createNamespace(c, "ns")
+                        }
+                        replacementUuid =
+                            store.createTable(c, "ns", "t", listOf(ColumnDef("id", ColType.LONG))).tableUuid
+                    } catch (e: Throwable) {
+                        hookError = e
+                        throw e
+                    }
+                })
+            hooks += hook
+            val start = seen.size
+            val error =
+                runCatching {
+                    pstore.alters.alterTable(c, "ns", "t", listOf(AlterOp.AddColumn(ColumnDef("b", ColType.LONG))))
+                }.exceptionOrNull()
+            assertThat(error).describedAs("replacement must refuse, not retarget").isNotNull()
+            assertThat(hookError).describedAs("replacement fixture $replacement").isNull()
+            run {
+                if (replacement == "catalog") {
+                    assertThat(error).isInstanceOf(HoglakeException.NotFound::class.java)
+                } else {
+                    assertThat(error).isExactlyInstanceOf(HoglakeException.TableRecreated::class.java)
+                    assertThat(
+                        (error as HoglakeException.TableRecreated).expectedTableUuid,
+                    ).isEqualTo(original.tableUuid)
+                }
+            }
+            assertThat(hook.remaining).isZero()
+            assertThat(seen.drop(start).count { "/tx " in it && "table_altered" in it }).isEqualTo(1)
+            assertThat(store.getTable(c, "ns", "t").tableUuid).isEqualTo(replacementUuid)
+            assertThat(store.getTable(c, "ns", "t").columns.map { it.def.name }).containsExactly("id")
+        }
+    }
+
+    @Test
+    fun `alter does not replan other guard indices or arbitrary statuses`() {
+        // Index 0 is the prepended catalog fence; 1 is table identity; 2
+        // is the only private schema guard. Allocator and unknown indices
+        // never share that marker, regardless of misleading error prose.
+        val answers =
+            listOf(
+                409 to """{"code":"expect_failed","guard_index":-1,"error":"schema changed"}""",
+                409 to """{"code":"expect_failed","guard_index":0,"error":"schema changed"}""",
+                409 to
+                    """{"code":"expect_failed","guard_index":1,"error":"table schema changed while planning alter"}""",
+                409 to
+                    """{"code":"expect_failed","guard_index":2,"error":"table schema changed while planning alter"}""",
+                409 to
+                    """{"code":"expect_failed","guard_index":9,"error":"table schema changed while planning alter"}""",
+                409 to
+                    """{"code":"expect_failed","guard_index":999,"error":"schema changed"}""",
+                409 to """{"error":"table schema changed while planning alter"}""",
+                422 to """{"error":"table schema changed while planning alter"}""",
+                503 to """{"error":"table schema changed while planning alter"}""",
+            )
+        for ((status, body) in answers) {
+            val (c, _) = setup()
+            val before = head(c)
+            val hook = Hook(::isAlterTx, remaining = Int.MAX_VALUE, shortCircuit = status, shortCircuitBody = body)
+            hooks += hook
+            val start = seen.size
+            try {
+                assertThatThrownBy {
+                    pstore.alters.alterTable(c, "ns", "t", listOf(AlterOp.AddColumn(ColumnDef("b", ColType.LONG))))
+                }.isInstanceOf(HoglakeException::class.java)
+                val sent = seen.drop(start).filter { "/tx " in it && "table_altered" in it }
+                assertThat(sent).isNotEmpty()
+                assertThat(
+                    sent.distinct(),
+                ).describedAs("status $status: transport retries byte-identical, no new plan").hasSize(1)
+                assertThat(head(c)).isEqualTo(before)
+                assertThat(store.getTable(c, "ns", "t").columns).hasSize(1)
+            } finally {
+                hooks.remove(hook)
+            }
+        }
+    }
+
+    @Test
+    fun `alter lost acknowledgement and later schema refusal stay unknown with one materialization`() {
+        val (c, _) = setup()
+        val before = head(c)
+        val lose = Hook(::isAlterTx, dropResponse = { true })
+        // First really commits. The next transport attempt sees a schema-
+        // looking refusal; it cannot settle the earlier ambiguous apply.
+        val refusal =
+            Hook(
+                ::isAlterTx,
+                remaining = Int.MAX_VALUE,
+                shortCircuit = 409,
+                shortCircuitBody = """{"code":"expect_failed","guard_index":3,"error":"schema changed"}""",
+            )
+        hooks += lose
+        hooks += refusal
+        val start = seen.size
+        try {
+            assertThatThrownBy {
+                pstore.alters.alterTable(c, "ns", "t", listOf(AlterOp.AddColumn(ColumnDef("b", ColType.LONG))))
+            }.isExactlyInstanceOf(HoglakeException.CommitOutcomeUnknown::class.java)
+            val sent = seen.drop(start).filter { "/tx " in it && "table_altered" in it }
+            assertThat(sent.size).isGreaterThan(1)
+            assertThat(sent.distinct()).hasSize(1)
+            assertThat(head(c)).isEqualTo(before + 1)
+            assertThat(store.getTable(c, "ns", "t").columns.map { it.def.name }).containsExactly("id", "b")
+        } finally {
+            hooks.remove(refusal)
+        }
+    }
+
+    @Test
+    fun `alter aggregate failure never replans and a later writer cannot change its returned snapshot`() {
+        for (fail in listOf(false, true)) {
+            val (c, _) = setup()
+            val before = head(c)
+            val aggregate =
+                Hook(
+                    { m, p, b -> m == "POST" && p.endsWith("/query") && "SUM(record_count)" in b },
+                    remaining = if (fail) Int.MAX_VALUE else 1,
+                    shortCircuit = if (fail) 503 else null,
+                    before = {
+                        if (!fail) {
+                            store.alters.alterTable(
+                                c,
+                                "ns",
+                                "t",
+                                listOf(AlterOp.AddColumn(ColumnDef("later", ColType.LONG))),
+                            )
+                            store.commit(c, appendReq(c, "later.parquet"))
+                        }
+                    },
+                )
+            val stale =
+                Hook(::isAlterTx, before = {
+                    store.alters.alterTable(c, "ns", "t", listOf(AlterOp.AddColumn(ColumnDef("winner", ColType.LONG))))
+                })
+            hooks += stale
+            hooks += aggregate
+            val start = seen.size
+            try {
+                if (fail) {
+                    assertThatThrownBy {
+                        pstore.alters.alterTable(c, "ns", "t", listOf(AlterOp.AddColumn(ColumnDef("b", ColType.LONG))))
+                    }.isInstanceOf(HoglakeException.BackendUnavailable::class.java)
+                } else {
+                    val result =
+                        pstore.alters.alterTable(
+                            c,
+                            "ns",
+                            "t",
+                            listOf(AlterOp.AddColumn(ColumnDef("b", ColType.LONG))),
+                        )
+                    assertThat(result.readSnapshotId).isEqualTo(before + 2)
+                    assertThat(result.columns.map { it.def.name }).containsExactly("id", "winner", "b")
+                    assertThat(result.recordCount).isZero()
+                    assertThat(result.fileCount).isZero()
+                    assertThat(result.fileSizeBytes).isZero()
+                    assertThat(store.getTable(c, "ns", "t").recordCount).isEqualTo(10)
+                }
+                assertThat(seen.drop(start).count { "/tx " in it && "table_altered" in it }).isEqualTo(2)
+                assertThat(head(c)).isEqualTo(before + if (fail) 2 else 4)
+            } finally {
+                hooks.remove(stale)
+                hooks.remove(aggregate)
+            }
+        }
+    }
+
+    @Test
+    fun `alter stats conflict never consumes a schema retry`() {
+        val c = freshCatalog()
+        store.createNamespace(c, "ns")
+        store.createTable(c, "ns", "t", listOf(ColumnDef("id", ColType.INT)))
+        val bound = com.posthog.hoglake.stats.IcebergSingleValue.encode(ColType.INT, 7)
+        store.commit(
+            c,
+            CommitRequest(
+                appends =
+                    listOf(
+                        TableAppend(
+                            "ns",
+                            "t",
+                            listOf(
+                                FileRegistration(
+                                    "s3://hoglake-it/$c/data/stats.parquet",
+                                    10,
+                                    100,
+                                    50,
+                                    listOf(ColumnStats(1, 10, 0, null, null, bound, bound)),
+                                ),
+                            ),
+                        ),
+                    ),
+            ),
+        )
+        val before = head(c)
+        val changed = listOf(ColumnStats(1, 10, 1, null, null, bound, bound))
+        val hook =
+            Hook(::isAlterTx, before = {
+                store.catalogOperation(c) {
+                    val tx = HogliteTx()
+                    tx.add("UPDATE files SET stats_json = ?", store.json.writeValueAsString(changed))
+                    store.runTx(c, HogliteCatalogStore.freshTxid("stats"), null, tx)
+                }
+            })
+        hooks += hook
+        val start = seen.size
+        assertThatThrownBy {
+            pstore.alters.alterTable(c, "ns", "t", listOf(AlterOp.PromoteColumn("id", ColType.LONG)))
+        }.isExactlyInstanceOf(HoglakeException.CommitConflict::class.java)
+            .hasMessage("file stats changed under the alter")
+        assertThat(hook.remaining).isZero()
+        assertThat(seen.drop(start).count { "/tx " in it && "table_altered" in it }).isEqualTo(1)
+        assertThat(head(c)).isEqualTo(before)
+        assertThat(store.getTable(c, "ns", "t").columns.single().def.type).isEqualTo(ColType.INT)
+        assertThat(q(c, "SELECT stats_json FROM files").firstRow()!![0].asString())
+            .isEqualTo(store.json.writeValueAsString(changed))
+    }
+
+    @Test
+    fun `unrelated table DDL does not cause an alter replan`() {
+        val (c, _) = setup()
+        store.createTable(c, "ns", "other", listOf(ColumnDef("id", ColType.LONG)))
+        val hook =
+            Hook(::isAlterTx, before = {
+                store.alters.alterTable(c, "ns", "other", listOf(AlterOp.AddColumn(ColumnDef("a", ColType.LONG))))
+            })
+        hooks += hook
+        val start = seen.size
+        val result = pstore.alters.alterTable(c, "ns", "t", listOf(AlterOp.AddColumn(ColumnDef("b", ColType.LONG))))
+        assertThat(result.columns.map { it.def.name }).containsExactly("id", "b")
+        assertThat(hook.remaining).isZero()
+        assertThat(seen.drop(start).count { "/tx " in it && "table_altered" in it }).isEqualTo(1)
+    }
+
+    @Test
+    fun `guarded alter never replans even a schema marker without a changes row`() {
+        val (c, original) = setup()
+        // Isolate the schema fence (synthetic protocol-negative control):
+        // normal production DDL also adds a changes row and hits the earlier
+        // DdlSinceReadSnapshot guard, covered by the shared real race.
+        val hook =
+            Hook(::isAlterTx, before = {
+                store.catalogOperation(c) {
+                    val tx = HogliteTx()
+                    tx.add("UPDATE tables SET schema_version = schema_version + 1")
+                    store.runTx(c, HogliteCatalogStore.freshTxid("fence-control"), null, tx)
+                }
+            })
+        hooks += hook
+        val start = seen.size
+        assertThatThrownBy {
+            pstore.alters.alterTable(
+                c,
+                "ns",
+                "t",
+                listOf(AlterOp.AddColumn(ColumnDef("b", ColType.LONG))),
+                readSnapshot = original.readSnapshotId,
+            )
+        }.isExactlyInstanceOf(HoglakeException.CommitConflict::class.java)
+        assertThat(hook.remaining).isZero()
+        assertThat(seen.drop(start).count { "/tx " in it && "table_altered" in it }).isEqualTo(1)
+        assertThat(head(c)).isEqualTo(original.readSnapshotId)
+    }
+
+    @Test
+    fun `invalid alter success after a real commit is unknown without another plan`() {
+        val (c, _) = setup()
+        val before = head(c)
+        val hook =
+            Hook(::isAlterTx, response = { status, _ ->
+                assertThat(status).isEqualTo(200)
+                200 to """{"results":[]}""".toByteArray()
+            })
+        hooks += hook
+        val start = seen.size
+        assertThatThrownBy {
+            pstore.alters.alterTable(c, "ns", "t", listOf(AlterOp.AddColumn(ColumnDef("b", ColType.LONG))))
+        }.isExactlyInstanceOf(HoglakeException.CommitOutcomeUnknown::class.java)
+        assertThat(hook.remaining).isZero()
+        assertThat(seen.drop(start).count { "/tx " in it && "table_altered" in it }).isEqualTo(1)
+        assertThat(head(c)).isEqualTo(before + 1)
+        assertThat(store.getTable(c, "ns", "t").columns.map { it.def.name }).containsExactly("id", "b")
+    }
+
     // ---- replacement publication -----------------------------------------
 
     private fun prepareCreation(

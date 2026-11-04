@@ -104,4 +104,56 @@ class PartitionLookupSpecParityTest {
         assertThat(schema("PartitionLookupUnavailableError")).contains("enum: [busy, timeout]")
         assertThat(schema("ApiError").substringAfter("        reason:\n")).doesNotContain("busy", "timeout")
     }
+
+    @Test
+    fun `lookup 503 nonexclusive response schemas accept actual mapped wire bodies`() {
+        val path = "/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/partitions/lookup"
+        val response =
+            spec.substringAfter("  $path:\n").substringBefore("\n  /")
+                .substringAfter("\"503\":").substringBefore("\n        \"")
+        assertThat(response).contains("anyOf:").doesNotContain("oneOf:")
+        val branches =
+            Regex("#/components/schemas/(\\w+)").findAll(response)
+                .map { it.groupValues[1] }.toList()
+        assertThat(branches).containsExactlyInAnyOrder("PartitionLookupUnavailableError", "ApiError")
+        assertThat(schema("PartitionLookupUnavailableError"))
+            .contains("enum: [partition_lookup_unavailable]", "enum: [busy, timeout]")
+
+        // Bounded validation of these existing object schemas: required keys,
+        // property primitive types and enums, read from the resolved definitions.
+        // Preserve the existing reason enums: ApiError's catalog-drop enum
+        // currently excludes partition reasons. anyOf documents the available
+        // bodies without introducing a new exclusivity policy if they overlap.
+        fun accepts(
+            name: String,
+            body: JsonNode,
+        ): Boolean {
+            val block = schema(name)
+            val required =
+                Regex("required: \\[([^]]*)]").find(block)!!.groupValues[1]
+                    .split(',').map { it.trim() }
+            if (required.any { !body.has(it) }) return false
+            return body.properties().all { (key, value) ->
+                val property =
+                    block.substringAfter("        $key:", "")
+                        .split(Regex("\n        [a-z_]+:"), limit = 2)[0]
+                val enumeration =
+                    Regex("enum: \\[([^]]*)]").find(property)?.groupValues?.get(1)
+                        ?.split(',')?.map { it.trim() }
+                ("type: string" !in property || value.isTextual) &&
+                    (enumeration == null || value.asText() in enumeration)
+            }
+        }
+        for (cause in listOf(
+            PartitionLookupUnavailable("busy", "lookup busy"),
+            PartitionLookupUnavailable("timeout", "lookup timed out"),
+            com.posthog.hoglake.model.HoglakeException.BackendUnavailable("pool down"),
+        )) {
+            val (status, dto) = errorBody(cause)
+            assertThat(status.value).isEqualTo(503)
+            val body = mapper.readTree(mapper.writeValueAsBytes(dto))
+            val matches = branches.count { accepts(it, body) }
+            assertThat(matches).isEqualTo(1)
+        }
+    }
 }
