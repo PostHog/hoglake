@@ -571,14 +571,24 @@ class HogliteClientTest {
             )
 
         fun shape(t: Throwable?) = t?.javaClass to (t as? HogliteRejected)?.status
+
+        // The budget also caps each attempt's timeout. At 50 ms, a final
+        // answer that a loaded runner delivers late times out, and the call
+        // ends as BackendUnavailable instead of the rejection under test.
+        val budgetMs = 500L
         for ((asQuery, asTx) in cases) {
             val (qs, _) = serve(asQuery)
             val (ts, _) = serve(asTx)
             val single =
-                catchThrowable { client("http://127.0.0.1:${qs.address.port}", budgetMs = 50).query("t", "SELECT 1") }
+                catchThrowable {
+                    client(
+                        "http://127.0.0.1:${qs.address.port}",
+                        budgetMs = budgetMs,
+                    ).query("t", "SELECT 1")
+                }
             val batch =
                 catchThrowable {
-                    client("http://127.0.0.1:${ts.address.port}", budgetMs = 50)
+                    client("http://127.0.0.1:${ts.address.port}", budgetMs = budgetMs)
                         .readTx("t", listOf(HogliteStatement("SELECT 1", emptyList())))
                 }
             assertThat(single).describedAs("query ${asQuery.status} ${asQuery.body}").isNotNull()
