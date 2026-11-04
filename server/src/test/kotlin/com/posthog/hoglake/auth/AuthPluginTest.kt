@@ -87,6 +87,59 @@ class AuthPluginTest {
 
     private fun token(claims: String = TestTokens.tenantClaims()) = TestTokens.mint(pair, claims)
 
+    // ---- scoped tokens ------------------------------------------------------
+
+    private fun scopedService(mode: AuthMode) =
+        AuthService(
+            mode,
+            JwtVerifier(
+                TestTokens.ISSUER,
+                TestTokens.AUDIENCE,
+                StaticSigningKeys(TestTokens.KID, pair.public as ECPublicKey),
+                predicateFields = setOf("team_id"),
+            ) { 1_700_000_100L },
+        )
+
+    @Test
+    fun `a scoped token may list its catalogs but not open one, even under warn`() =
+        testApplication {
+            application { harness(scopedService(AuthMode.WARN)) }
+            val scoped = "Bearer ${token(TestTokens.scopedClaims())}"
+            val list = client.get("/v1/catalogs") { header(HttpHeaders.Authorization, scoped) }
+            assertThat(list.status).isEqualTo(HttpStatusCode.OK)
+            assertThat(list.bodyAsText()).isEqualTo("hlc_team")
+            for (path in listOf("/v1/catalogs/lake")) {
+                val r = client.get(path) { header(HttpHeaders.Authorization, scoped) }
+                assertThat(r.status).describedAs(path).isEqualTo(HttpStatusCode.Forbidden)
+                assertThat(r.bodyAsText()).contains("scoped credential")
+            }
+            val commit = client.post("/v1/catalogs/lake/commit") { header(HttpHeaders.Authorization, scoped) }
+            assertThat(commit.status).isEqualTo(HttpStatusCode.Forbidden)
+            // Another catalog is still a 404, as for a tenant.
+            assertThat(client.get("/v1/catalogs/other") { header(HttpHeaders.Authorization, scoped) }.status)
+                .isEqualTo(HttpStatusCode.NotFound)
+            // An invalid scoped token is no caller at all: warn lets an
+            // anonymous request through as it always has, enforce refuses it.
+            val bad = "Bearer ${token(TestTokens.scopedClaims(prd = null))}"
+            assertThat(client.get("/v1/catalogs/lake") { header(HttpHeaders.Authorization, bad) }.status)
+                .isEqualTo(HttpStatusCode.OK)
+        }
+
+    @Test
+    fun `under enforce a scoped token is refused the same way, and a bad one is a 401`() =
+        testApplication {
+            application { harness(scopedService(AuthMode.ENFORCE)) }
+            val scoped = "Bearer ${token(TestTokens.scopedClaims())}"
+            assertThat(client.get("/v1/catalogs/lake") { header(HttpHeaders.Authorization, scoped) }.status)
+                .isEqualTo(HttpStatusCode.Forbidden)
+            val bad =
+                client.get("/v1/catalogs/lake") {
+                    header(HttpHeaders.Authorization, "Bearer ${token(TestTokens.scopedClaims(prd = null))}")
+                }
+            assertThat(bad.status).isEqualTo(HttpStatusCode.Unauthorized)
+            assertThat(bad.headers[HttpHeaders.WWWAuthenticate]).contains(JwtViolation.INVALID_PREDICATE)
+        }
+
     // ---- the public listener (HOGLAKE_PUBLIC_PORT) -------------------------
 
     @Test

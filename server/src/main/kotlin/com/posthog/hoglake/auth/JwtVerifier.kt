@@ -288,9 +288,18 @@ class JwtVerifier(
     private val audience: String,
     private val keys: SigningKeys,
     private val skewSeconds: Long = 60,
+    /**
+     * The predicate fields this instance's auth source declares
+     * (`HOGLAKE_AUTH_PREDICATE_FIELDS`). A scoped token must carry exactly
+     * these in `prd`. Empty means scoped tokens are refused outright.
+     */
+    private val predicateFields: Set<String> = emptySet(),
     private val clock: () -> Long = { System.currentTimeMillis() / 1000 },
 ) {
     init {
+        require(predicateFields.all { FIELD_NAME.matches(it) }) {
+            "auth predicate fields must be identifiers, got $predicateFields"
+        }
         require(issuer.isNotBlank()) { "auth issuer must be configured when auth is not off" }
         require(audience.isNotBlank()) { "auth audience must be configured when auth is not off" }
         require(skewSeconds in 0..600) { "auth clock skew must be 0..600s, got $skewSeconds" }
@@ -398,6 +407,8 @@ class JwtVerifier(
                     clientName = clientName,
                 )
 
+            "scoped" -> scopedCaller(claims, subject, tokenId, clientName)
+
             "tenant" -> {
                 val orgId = Jwt.text(claims, "org")
                 val cat =
@@ -422,18 +433,7 @@ class JwtVerifier(
                 if (scopes.isEmpty()) {
                     throw JwtViolation(JwtViolation.MISSING_CLAIM, "a tenant token must grant at least one catalog")
                 }
-                // Optional and strictly boolean: `"dlg": "false"` is a malformed
-                // token, not a truthy string that grants delegation.
-                val delegates =
-                    when (val dlg = claims.get("dlg")) {
-                        null -> false
-                        else ->
-                            if (dlg.isBoolean) {
-                                dlg.asBoolean()
-                            } else {
-                                throw JwtViolation(JwtViolation.MALFORMED, "claim 'dlg' is not a boolean")
-                            }
-                    }
+                val delegates = delegates(claims)
                 Caller(
                     subject = subject,
                     orgId = orgId,
@@ -447,8 +447,147 @@ class JwtVerifier(
 
             else -> throw JwtViolation(
                 JwtViolation.MALFORMED,
-                "claim 'ten' must be 'tenant' or 'operator', got '$kindText'",
+                "claim 'ten' must be 'tenant', 'scoped' or 'operator', got '$kindText'",
             )
         }
+    }
+
+    /** Optional and strictly boolean: `"dlg": "false"` is a malformed token, not a truthy string. */
+    private fun delegates(claims: JsonNode): Boolean =
+        when (val dlg = claims.get("dlg")) {
+            null -> false
+            else ->
+                if (dlg.isBoolean) {
+                    dlg.asBoolean()
+                } else {
+                    throw JwtViolation(JwtViolation.MALFORMED, "claim 'dlg' is not a boolean")
+                }
+        }
+
+    /**
+     * A scoped token, parsed STRICTLY: anything this verifier does not
+     * understand refuses the token rather than being ignored, so a narrowing
+     * added to the contract later can never be silently dropped by an older
+     * hoglake. That is the opposite of `cat`'s rule for unknown scope words,
+     * and deliberately so: dropping an unknown scope loses authority, while
+     * dropping an unknown predicate would GAIN it.
+     */
+    private fun scopedCaller(
+        claims: JsonNode,
+        subject: String,
+        tokenId: String,
+        clientName: String?,
+    ): Caller {
+        if (predicateFields.isEmpty()) {
+            throw JwtViolation(JwtViolation.INVALID_PREDICATE, "this instance accepts no scoped tokens")
+        }
+        // A scoped token is short-lived by contract: its predicate is a
+        // snapshot of the holder's access, and exp - iat bounds how stale it gets.
+        val iat =
+            claims.get("iat")?.takeIf { it.isIntegralNumber }?.asLong()
+                ?: throw JwtViolation(JwtViolation.MISSING_CLAIM, "a scoped token must carry an integer 'iat'")
+        if (Jwt.seconds(claims, "exp") - iat > MAX_SCOPED_LIFETIME_SECONDS) {
+            throw JwtViolation(
+                JwtViolation.MALFORMED,
+                "a scoped token may live at most ${MAX_SCOPED_LIFETIME_SECONDS}s",
+            )
+        }
+        val orgId = Jwt.text(claims, "org")
+        val cat =
+            claims.get("cat")?.takeIf { it.isObject }
+                ?: throw JwtViolation(JwtViolation.MISSING_CLAIM, "a scoped token must carry an object 'cat'")
+        val scopes = LinkedHashMap<String, Set<Scope>>()
+        cat.properties().forEach { (catalog, value) ->
+            if (!value.isArray || value.isEmpty) {
+                throw JwtViolation(JwtViolation.MALFORMED, "cat['$catalog'] is not a non-empty array")
+            }
+            scopes[catalog] =
+                value.map { word ->
+                    word.takeIf { it.isTextual }?.asText()?.let(::predicateScope)
+                        ?: throw JwtViolation(
+                            JwtViolation.MALFORMED,
+                            "a scoped token's cat['$catalog'] may hold only 'read' and 'write'",
+                        )
+                }.toSet()
+        }
+        if (scopes.isEmpty()) {
+            throw JwtViolation(JwtViolation.MISSING_CLAIM, "a scoped token must grant at least one catalog")
+        }
+        val user =
+            when (val usr = claims.get("usr")) {
+                null -> null
+                else ->
+                    usr.takeIf { it.isTextual && it.asText().isNotBlank() && it.asText().length <= MAX_USER_LENGTH }
+                        ?.asText()
+                        ?: throw JwtViolation(
+                            JwtViolation.MALFORMED,
+                            "claim 'usr' is not a non-blank string of at most $MAX_USER_LENGTH characters",
+                        )
+            }
+        return Caller(
+            subject = subject,
+            orgId = orgId,
+            kind = Caller.Kind.SCOPED,
+            catalogScopes = scopes,
+            tokenId = tokenId,
+            clientName = clientName,
+            delegates = delegates(claims),
+            predicates = predicates(claims.get("prd")),
+            user = user,
+        )
+    }
+
+    private fun predicates(prd: JsonNode?): Map<String, PredicateGrant> {
+        fun refuse(detail: String): Nothing = throw JwtViolation(JwtViolation.INVALID_PREDICATE, detail)
+        if (prd == null || !prd.isObject) refuse("a scoped token must carry an object 'prd'")
+        val fields = prd.properties().map { it.key }.toSet()
+        if (fields != predicateFields) {
+            refuse("prd must name exactly ${predicateFields.sorted()}, got ${fields.sorted()}")
+        }
+        return predicateFields.associateWith { field ->
+            val values = prd.get(field)
+            if (!values.isObject || values.isEmpty) refuse("prd.$field is not a non-empty object")
+            if (values.size() > MAX_PREDICATE_VALUES) {
+                refuse("prd.$field holds ${values.size()} values; at most $MAX_PREDICATE_VALUES")
+            }
+            val parsed = LinkedHashMap<String, Scope>()
+            values.properties().forEach { (value, perm) ->
+                parsed[value] = perm.takeIf { it.isTextual }?.asText()?.let(::predicateScope)
+                    ?: refuse("prd.$field['$value'] must be 'read' or 'write'")
+            }
+            if (ALL in parsed) {
+                if (parsed.size != 1) refuse("prd.$field mixes '$ALL' with values")
+                PredicateGrant.All(parsed.getValue(ALL))
+            } else {
+                PredicateGrant.Values(
+                    parsed.entries.associate { (value, scope) ->
+                        val id =
+                            value.takeIf { CANONICAL_ID.matches(it) }?.toLongOrNull()
+                                ?: refuse("prd.$field key '$value' is not a canonical decimal id")
+                        id to scope
+                    },
+                )
+            }
+        }
+    }
+
+    companion object {
+        /** The most values one predicate field may enumerate. */
+        const val MAX_PREDICATE_VALUES = 200
+
+        /** `exp - iat` ceiling for a scoped token: hogtower mints 15 minutes. */
+        const val MAX_SCOPED_LIFETIME_SECONDS = 900L
+
+        private const val MAX_USER_LENGTH = 200
+        private const val ALL = "*"
+
+        // No leading zero, no sign, at most 19 digits; toLongOrNull rejects
+        // the 19-digit values past Long.MAX_VALUE.
+        private val CANONICAL_ID = Regex("^[1-9][0-9]{0,18}$")
+        private val FIELD_NAME = Regex("^[a-z][a-z0-9_]{0,62}$")
+
+        /** A predicate permission: `read` or `write`, nothing stronger. */
+        private fun predicateScope(word: String): Scope? =
+            Scope.fromWire(word)?.takeIf { it == Scope.READ || it == Scope.WRITE }
     }
 }

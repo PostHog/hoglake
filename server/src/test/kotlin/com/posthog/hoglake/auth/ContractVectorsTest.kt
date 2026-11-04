@@ -30,9 +30,10 @@ class ContractVectorsTest {
     private fun verifier(
         audience: String = "hoglake",
         now: Long = verifyAt,
+        predicateFields: Set<String> = setOf("team_id"),
     ): JwtVerifier {
         val (kid, key) = keys.entries.single()
-        return JwtVerifier(root["issuer"].asText(), audience, StaticSigningKeys(kid, key), 60) { now }
+        return JwtVerifier(root["issuer"].asText(), audience, StaticSigningKeys(kid, key), 60, predicateFields) { now }
     }
 
     private fun vectors(): List<JsonNode> = root["vectors"].toList()
@@ -87,6 +88,31 @@ class ContractVectorsTest {
         assertThat(caller.delegates).isFalse()
         assertThat(caller.clientName).isEqualTo(claims["cli"].asText())
         assertThat(caller.tokenId).isEqualTo(claims["jti"].asText())
+    }
+
+    @Test
+    fun `a team credential's scoped vector verifies to a scoped caller holding its teams`() {
+        val vector = vectors().single { it["name"].asText() == "scoped_team" }
+        val claims = vector["claims"]
+        val caller = verifier().verify(vector["token"].asText())
+
+        assertThat(caller.kind).isEqualTo(Caller.Kind.SCOPED)
+        assertThat(caller.subject).isEqualTo(claims["sub"].asText())
+        assertThat(caller.orgId).isEqualTo(claims["org"].asText())
+        assertThat(caller.user).isEqualTo(claims["usr"].asText())
+        assertThat(caller.delegates).isFalse()
+        assertThat(caller.catalogScopes).isEqualTo(mapOf(claims["org"].asText() to setOf(Scope.WRITE)))
+        val teams =
+            claims["prd"]["team_id"].properties().associate { (id, perm) ->
+                id.toLong() to Scope.entries.single { it.wire == perm.asText() }
+            }
+        assertThat(caller.predicates).isEqualTo(mapOf("team_id" to PredicateGrant.Values(teams)))
+
+        // An instance whose auth source declares no predicate field refuses it.
+        assertThatThrownBy { verifier(predicateFields = emptySet()).verify(vector["token"].asText()) }
+            .isInstanceOfSatisfying(JwtViolation::class.java) {
+                assertThat(it.reason).isEqualTo(JwtViolation.INVALID_PREDICATE)
+            }
     }
 
     @Test

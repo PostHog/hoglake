@@ -95,6 +95,8 @@ class AuthService(
                         audience = audience,
                         keys = keys,
                         skewSeconds = cfg.authClockSkewSeconds,
+                        predicateFields =
+                            cfg.authPredicateFields.split(',').map { it.trim() }.filter { it.isNotEmpty() }.toSet(),
                     ),
             )
         }
@@ -334,7 +336,11 @@ val HoglakeAuth =
             // enforce numbers are the outcome, and a flip is judged by comparing
             // the two per client class.
             countRefusal(service, clientClass(call), caller, match, refusal)
-            if (service.mode.isEnforcing) {
+            // A verified scoped token is refused in `warn` too. Warn exists to
+            // forecast refusals of callers that predate auth; a scoped token is
+            // new, and letting it through would hand a team-scoped credential
+            // the whole catalog.
+            if (service.mode.isEnforcing || caller?.kind == Caller.Kind.SCOPED) {
                 call.respondRefusal(refusal)
                 return@onCall
             }
@@ -444,6 +450,10 @@ private fun failureFor(
             HoglakeException.Forbidden(
                 "this credential does not hold '${decision.required.wire}' on '${decision.catalog}' " +
                     "(route ${match?.pattern ?: "?"})",
+            )
+        is AuthDecision.NotPredicated ->
+            HoglakeException.Forbidden(
+                "a scoped credential cannot use route ${decision.pattern} on '${decision.catalog}'",
             )
     }
 
