@@ -5,16 +5,20 @@ import com.posthog.hoglake.model.HoglakeException
 /** Shared SQL fragments for the hoglite backend. */
 internal object HogliteSql {
     /**
-     * The file columns every file listing selects, in the order
-     * [HogliteCatalogStore.toFileRow] reads them: 15 columns,
-     * indices 0..14. A query that joins DVs puts the five DV columns
+     * Common file fields at indices 0..11. The projections below complete
+     * the 15 columns [HogliteCatalogStore.toFileRow] reads, indices 0..14.
+     * A query that joins DVs puts the five DV columns
      * (delete_file_id, path, delete_count, file_size_bytes,
      * begin_snapshot) at indices 15..19.
      */
-    const val FILE_COLUMNS =
+    private const val FILE_PREFIX =
         "f.id, f.table_id, f.path, f.file_format, f.record_count, f.file_size_bytes, f.footer_size, " +
-            "f.row_id_start, f.explicit_row_ids, f.spec_id, f.partition_values_json, f.stats_state, " +
-            "f.stats_json, f.split_offsets_json, f.begin_snapshot"
+            "f.row_id_start, f.explicit_row_ids, f.spec_id, f.partition_values_json, f.stats_state, "
+
+    const val FILE_COLUMNS = FILE_PREFIX + "f.stats_json, f.split_offsets_json, f.begin_snapshot"
+
+    /** Changefeed discards payloads; keep the mapper's fifteen positions, including snapshot at14. */
+    const val CHANGEFEED_FILE_COLUMNS = FILE_PREFIX + "NULL AS stats_json, NULL AS split_offsets_json, f.begin_snapshot"
 
     /**
      * The readback every DDL transaction ends with: the snapshot just

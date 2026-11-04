@@ -1469,7 +1469,7 @@ class HogliteCatalogStore(
             val files =
                 queryCatalog(
                     catalog,
-                    "SELECT ${HogliteSql.FILE_COLUMNS} FROM files f " +
+                    "SELECT ${HogliteSql.CHANGEFEED_FILE_COLUMNS} FROM files f " +
                         "WHERE f.table_id = ? AND f.begin_snapshot > ? AND f.begin_snapshot <= ? " +
                         "AND NOT EXISTS (SELECT 1 FROM changes c WHERE c.snapshot_id = f.begin_snapshot " +
                         "AND c.kind = 'table_compacted' AND c.object_id = f.table_id) " +

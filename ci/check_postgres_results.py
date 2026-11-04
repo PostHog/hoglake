@@ -160,6 +160,35 @@ PG_INVENTORY = {
             }
         ),
     ),
+    "HogliteChangesProjectionIntegrationTest": (
+        Counter(
+            {
+                "projection public fields POSTGRES": 1,
+                "projection retained history POSTGRES": 1,
+            }
+        ),
+        Counter(
+            {
+                "projection public fields HOGLITE": 1,
+                "projection retained history HOGLITE": 1,
+                "hoglite raw changefeed preserves fifteen positions and omits payloads()": 1,
+                "hoglite listing and scan retain their complete stored metadata()": 1,
+            }
+        ),
+    ),
+    "MixedPostgresInitializationIntegrationTest": (
+        Counter(
+            {
+                "blocked cold leader admits no follower migration or business IO()": 1,
+                "failed leader retries to success and ready calls never borrow again()": 1,
+                "successful cold leader is the only concurrent initializer()": 1,
+                "interrupted initializer releases admission and preserves approved terminal semantics()": 1,
+                "cancelled initializer releases admission and preserves approved terminal semantics()": 1,
+                "fatal initializer error escapes unchanged and permits retry()": 1,
+            }
+        ),
+        Counter(),
+    ),
 }
 
 

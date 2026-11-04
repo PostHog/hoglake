@@ -49,11 +49,15 @@ class PostgresResultsTest(unittest.TestCase):
             "HoglitePartitionParityIntegrationTest",
             "HogliteCatalogCreateParityIntegrationTest",
         }
+        runtime = {
+            "HogliteChangesProjectionIntegrationTest",
+            "MixedPostgresInitializationIntegrationTest",
+        }
         self.assertEqual(
             sum(
                 sum(pg.values())
                 for name, (pg, _) in PG_INVENTORY.items()
-                if name not in added
+                if name not in added | runtime
             ),
             78,
         )
@@ -61,7 +65,7 @@ class PostgresResultsTest(unittest.TestCase):
             sum(
                 sum(other.values())
                 for name, (_, other) in PG_INVENTORY.items()
-                if name not in added
+                if name not in added | runtime
             ),
             75,
         )
@@ -98,6 +102,8 @@ class PostgresResultsTest(unittest.TestCase):
         for name in (
             "HoglitePartitionParityIntegrationTest",
             "HogliteCatalogCreateParityIntegrationTest",
+            "HogliteChangesProjectionIntegrationTest",
+            "MixedPostgresInitializationIntegrationTest",
         ):
             path = self.report(name)
             original = path.read_text()
@@ -118,6 +124,44 @@ class PostgresResultsTest(unittest.TestCase):
                         path.write_text(original.replace(case, changed, 1))
                         self.assertNotEqual(self.run_checker().returncode, 0)
                         path.write_text(original)
+
+    def test_runtime_inventory_preserves_every_previous_record_and_legacy_subsets(self):
+        runtime = {
+            "HogliteChangesProjectionIntegrationTest",
+            "MixedPostgresInitializationIntegrationTest",
+        }
+        self.assertEqual(
+            sum(
+                sum(pg.values())
+                for name, (pg, _) in PG_INVENTORY.items()
+                if name not in runtime
+            ),
+            88,
+        )
+        self.assertEqual(
+            sum(
+                sum(other.values())
+                for name, (_, other) in PG_INVENTORY.items()
+                if name not in runtime
+            ),
+            87,
+        )
+        self.assertEqual(sum(sum(pg.values()) for pg, _ in PG_INVENTORY.values()), 96)
+        self.assertEqual(
+            sum(sum(other.values()) for _, other in PG_INVENTORY.values()), 91
+        )
+        self.assertEqual(
+            sum(PG_INVENTORY["MixedPostgresInitializationIntegrationTest"][0].values()),
+            6,
+        )
+        self.assertFalse(PG_INVENTORY["MixedPostgresInitializationIntegrationTest"][1])
+        self.assertEqual(
+            sum(PG_INVENTORY["HogliteChangesProjectionIntegrationTest"][0].values()), 2
+        )
+        self.assertEqual(
+            sum(PG_INVENTORY["HogliteChangesProjectionIntegrationTest"][1].values()), 4
+        )
+        self.assertNotIn("MixedPostgresColdStartIntegrationTest", PG_INVENTORY)
 
     def test_complete_inventory_accepts_unrelated_engine_skips(self):
         # Unselected HG arms and real mixed-directory engine cases are distinct.
