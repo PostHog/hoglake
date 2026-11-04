@@ -177,7 +177,7 @@ class HogliteAlterRaceIntegrationTest {
                 }
                 proxy.start()
                 proxyClient = HogliteClient(standardUrl = "http://127.0.0.1:${proxy.address.port}", sleeper = {})
-                val store = HogliteCatalogStore(proxyClient).apply { requireOperationBindingForTests = true }
+                val store = HogliteCatalogStore(proxyClient)
                 b = pool.submit<TableInfo> { publish(HogliteAlters(store), opsB, "B") }
                 assertThat(entered.await(20, TimeUnit.SECONDS)).describedAs("B fully materialized before A").isTrue()
                 a = pool.submit<TableInfo> { publish(f.alter, opsA, "A") }

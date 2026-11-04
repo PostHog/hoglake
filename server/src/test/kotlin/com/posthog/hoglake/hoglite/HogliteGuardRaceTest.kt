@@ -3544,8 +3544,7 @@ class HogliteGuardRaceTest {
     }
 
     /** Raw fixture SQL still enters an explicit scope; never exempt production work. */
-    private fun checkedStore(client: HogliteClient) =
-        HogliteCatalogStore(client).apply { requireOperationBindingForTests = true }
+    private fun checkedStore(client: HogliteClient) = HogliteCatalogStore(client)
 
     private fun boundTx(
         c: String,

@@ -89,8 +89,8 @@ class HogliteCatalogStore(
 
     private val log = io.github.oshai.kotlinlogging.KotlinLogging.logger {}
 
-    // A hint for single-call internal helpers; planned operations never use this
-    // mutable map after entry. Their immutable binding lives in operationBindings.
+    // A diagnostic/lifecycle hint only. Tenant-local transport requires an
+    // immutable operation binding and never falls back to this mutable map.
     private val tenantCache = java.util.concurrent.ConcurrentHashMap<String, String>()
 
     /** Mixed mode extends this registry before serving requests. Legacy modes do not use these columns. */
@@ -119,9 +119,6 @@ class HogliteCatalogStore(
     }
 
     private val operationBindings = ThreadLocal<MutableMap<String, CatalogOperation>>()
-
-    /** Test-only invariant; fixtures scope their diagnostic SQL just like API work. */
-    internal var requireOperationBindingForTests: Boolean = false
 
     /** Resolve authoritatively ONCE, before reading any tenant-local ids. */
     private fun freshTenant(catalog: String): String {
@@ -243,10 +240,24 @@ class HogliteCatalogStore(
         body: () -> T,
     ): T {
         val entered = enterCatalogOperation(catalog, creating, tenant)
+        var failure: Throwable? = null
         try {
             return body()
+        } catch (e: Throwable) {
+            failure = e
+            throw e
         } finally {
-            finishCatalogOperation(catalog, entered)
+            try {
+                finishCatalogOperation(catalog, entered)
+            } catch (secondary: Throwable) {
+                val original = failure
+                if (original == null) throw secondary
+                // Nested scopes may observe the same poison. Preserve the body's
+                // outcome (especially an ambiguous txid), without self/duplicate suppression.
+                if (original !== secondary && original.suppressed.none { it === secondary }) {
+                    original.addSuppressed(secondary)
+                }
+            }
         }
     }
 
@@ -2237,10 +2248,14 @@ class HogliteCatalogStore(
      * valid inside [catalogOperation]; a value derived from it (a cursor
      * scope) is therefore scoped to that one incarnation of the name.
      */
-    internal fun boundTenant(catalog: String): String =
-        checkNotNull(operationBindings.get()?.get(catalog)) {
-            "catalog '$catalog' has no operation binding"
-        }.tenant
+    internal fun boundTenant(catalog: String): String {
+        val binding =
+            checkNotNull(operationBindings.get()?.get(catalog)) {
+                "catalog '$catalog' has no operation binding"
+            }
+        binding.missing?.let { throw it }
+        return binding.tenant
+    }
 
     /** A file row plus its stored payloads, before per-endpoint projection. */
     internal class FileRow(
@@ -2500,12 +2515,9 @@ class HogliteCatalogStore(
         catalog: String,
         call: (String) -> T,
     ): T {
-        val binding = operationBindings.get()?.get(catalog)
-        check(!requireOperationBindingForTests || catalog == REGISTRY_TENANT || binding != null) {
-            "catalog '$catalog' reached tenant transport without an operation binding"
-        }
-        binding?.missing?.let { throw it }
-        val tenant = binding?.tenant ?: resolveTenant(catalog)
+        // Registry transport is explicitly instance-wide; every user-tenant
+        // query/read/tx must belong to one already-entered operation.
+        val tenant = if (catalog == REGISTRY_TENANT) registryTenant else boundTenant(catalog)
         try {
             return call(tenant)
         } catch (r: HogliteRejected) {

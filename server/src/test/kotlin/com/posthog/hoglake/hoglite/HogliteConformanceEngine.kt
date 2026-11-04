@@ -78,7 +78,7 @@ internal class HogliteConformanceEngine : AutoCloseable {
         process = builder.start()
         awaitStarted(log)
         client = HogliteClient(standardUrl = "http://127.0.0.1:$port", sleeper = {})
-        store = HogliteCatalogStore(client).apply { requireOperationBindingForTests = true }
+        store = HogliteCatalogStore(client)
     }
 
     /** Abrupt owner loss and a fresh local directory: recovery must read durable S3 state. */
@@ -92,7 +92,7 @@ internal class HogliteConformanceEngine : AutoCloseable {
         builder.command(args).redirectOutput(log)
         process = builder.start()
         awaitStarted(log)
-        store = HogliteCatalogStore(client).apply { requireOperationBindingForTests = true }
+        store = HogliteCatalogStore(client)
     }
 
     private fun awaitStarted(log: java.io.File) {

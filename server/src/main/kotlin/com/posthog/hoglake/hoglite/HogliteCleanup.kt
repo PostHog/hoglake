@@ -120,6 +120,7 @@ internal class HogliteCleanup(
                         runOnce(name, batchSize, MaintenanceTrigger.LOOP)
                     }
             } catch (e: Exception) {
+                if (terminalPurgeFailure(e)) throw e
                 log.error(e) { "cleanup drain failed for catalog '$name'; continuing" }
             }
         }
@@ -163,18 +164,46 @@ internal class HogliteCleanup(
             if (!progressed) break
         }
 
-        purgeMaintenanceLedger(catalog)
+        // These are independent hygiene phases, in the existing order. A ledger
+        // refusal must not starve the other purges, but must still fail this run.
+        val ledgerFailure =
+            try {
+                purgeMaintenanceLedger(catalog)
+                null
+            } catch (e: Exception) {
+                requireOrdinaryPurgeFailure(catalog, e)
+                e
+            }
         val receipts =
-            runCatching { purgeCommitReceipts(catalog, m.retentionSeconds) }
-                .getOrElse { e ->
-                    log.warn(e) {
-                        "cleanup: the commit-receipt retention purge failed for catalog '$catalog'; " +
-                            "the drain itself is unaffected and the next run retries"
+            try {
+                val receipts =
+                    try {
+                        purgeCommitReceipts(catalog, m.retentionSeconds)
+                    } catch (e: Exception) {
+                        requireOrdinaryPurgeFailure(catalog, e)
+                        log.warn(e) {
+                            "cleanup: the commit-receipt retention purge failed for catalog '$catalog'; " +
+                                "the drain itself is unaffected and the next run retries"
+                        }
+                        ReceiptPurge(failures = 1)
                     }
-                    ReceiptPurge(failures = 1)
+                Metrics.commitReceiptPurgeFailures(catalog, receipts.failures)
+                val drainedFailure = purgeDrainedLedger(catalog)
+                if (ledgerFailure != null && drainedFailure != null) {
+                    suppressOnce(ledgerFailure, drainedFailure)
                 }
-        Metrics.commitReceiptPurgeFailures(catalog, receipts.failures)
-        purgeDrainedLedger(catalog)
+                receipts
+            } catch (e: Throwable) {
+                if (ledgerFailure == null) throw e
+                // Shutdown/fatal signals escape immediately, never another phase.
+                if (e !is Exception || terminalPurgeFailure(e)) {
+                    suppressOnce(e, ledgerFailure)
+                    throw e
+                }
+                suppressOnce(ledgerFailure, e)
+                throw ledgerFailure
+            }
+        if (ledgerFailure != null) throw ledgerFailure
         return CleanupResult(
             total.removed,
             total.missing,
@@ -498,6 +527,26 @@ internal class HogliteCleanup(
 
     // ---- the after-run purges ------------------------------------------------
 
+    private fun terminalPurgeFailure(e: Exception): Boolean =
+        e is InterruptedException || e is java.util.concurrent.CancellationException ||
+            Thread.currentThread().isInterrupted
+
+    /** Ordinary failures can be isolated; shutdown and poisoned bindings cannot. */
+    private fun requireOrdinaryPurgeFailure(
+        catalog: String,
+        e: Exception,
+    ) {
+        if (terminalPurgeFailure(e)) throw e
+        store.boundTenant(catalog) // Throws the memoized poison before any sibling I/O.
+    }
+
+    private fun suppressOnce(
+        original: Throwable,
+        secondary: Throwable,
+    ) {
+        if (original !== secondary && original.suppressed.none { it === secondary }) original.addSuppressed(secondary)
+    }
+
     private fun purgeMaintenanceLedger(catalog: String) {
         val cutoff = HogliteSchema.fmt(Instant.now().minusSeconds(maintenanceLedgerRetentionSeconds))
         val tx = HogliteTx()
@@ -539,6 +588,7 @@ internal class HogliteCleanup(
                     store.runTx(catalog, HogliteCatalogStore.freshTxid("cleanup-receipts"), null, tx)[idx]
                         .affected
                 } catch (e: Exception) {
+                    requireOrdinaryPurgeFailure(catalog, e)
                     failures++
                     log.warn(e) { "cleanup: a commit-receipt purge page failed for catalog '$catalog'" }
                     break
@@ -550,8 +600,8 @@ internal class HogliteCleanup(
     }
 
     /** The drained-ledger retention: paged from the bottom of the key, budgeted. */
-    private fun purgeDrainedLedger(catalog: String) {
-        runCatching {
+    private fun purgeDrainedLedger(catalog: String): Exception? =
+        try {
             val cutoff = HogliteSchema.fmt(Instant.now().minusSeconds(removalLedgerRetentionSeconds))
             val deadline = System.nanoTime() + LEDGER_PURGE_BUDGET_MS * 1_000_000
             while (System.nanoTime() < deadline) {
@@ -569,13 +619,17 @@ internal class HogliteCleanup(
                         .affected
                 if (gone < LEDGER_PURGE_PAGE.toLong()) break
             }
-        }.onFailure { e ->
+            null
+        } catch (e: Exception) {
+            requireOrdinaryPurgeFailure(catalog, e)
             log.warn(e) {
                 "cleanup: the drained-ledger retention purge failed for catalog '$catalog'; " +
                     "the drain itself is unaffected and the next run retries from the bottom of the key"
             }
+            // Retain the existing standalone best-effort contract, but attach
+            // this context if the earlier maintenance-ledger purge failed.
+            e
         }
-    }
 
     override fun close() = removalStore.close()
 

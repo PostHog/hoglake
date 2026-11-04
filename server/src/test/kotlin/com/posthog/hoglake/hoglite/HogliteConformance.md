@@ -87,6 +87,26 @@ it proves neither a bound on examined historical tables nor production-scale
 latency, retirement batching cost, object-store throughput, or reader capacity.
 Those scale concerns remain separate work.
 
+### Cleanup and operation lifecycle regressions
+
+`HogliteCleanupLifecycleIntegrationTest` executes the production purge statements
+against the release engine. A real foreign-key refusal of maintenance-ledger
+DELETE must not starve receipt and drained-ledger hygiene, and the original failure
+still marks the run failed. Receipt-only ordinary failures remain counted
+best-effort results. Response-loss plus real drop/recreate preserves the original
+unknown txid and refuses work on a replacement. Scheduled cancellation, interruption
+and fatal errors stop siblings. Isolated two-catalog sweep controls require terminal
+failures to stop before second-catalog I/O while ordinary errors and binding poison
+continue to the unrelated catalog. Only transport during the sweep is counted.
+`HogliteOperationLifecycleTest` checks unconditional
+unbound-transport refusal, primary/secondary failure preservation, swallowed-404
+refusal and nested/early-return/throw cleanup without an engine. Existing mixed
+warm/cold ghost-drop tests retain the private captured-absence exception.
+
+These are HG-specific lifecycle regressions, not a full PG parity claim. PostgreSQL
+CleanupService still calls maintenance-ledger purge uncaught before receipt purge;
+its drained-ledger purge is instance-wide. PG production behavior is unchanged.
+
 ### Read results must wait for their own durable basis
 
 The stronger invariant (a read cannot expose a locally applied commit that later

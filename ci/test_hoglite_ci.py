@@ -143,6 +143,10 @@ class CommandTest(unittest.TestCase):
             "server/gradlew",
             '#!/bin/bash\n[ "${HOGLITE_BINARY+x}" != x ] || [ "${LIVE:-}" = yes ] || exit 97\nprintf "%s\\n" "$@" > "$(dirname "$0")/args"\nexit "${GRADLE_STATUS:-0}"\n',
         )
+        self.write(
+            "bin/uv",
+            '#!/bin/bash\nprintf "%s\\n" "$@" > "$RUNNER_TEMP/report-args"\nexit "${PG_REPORT_STATUS:-0}"\n',
+        )
 
     def write(self, name, text):
         path = self.root / name
@@ -176,6 +180,29 @@ class CommandTest(unittest.TestCase):
         result = self.run_script("test-postgres.sh")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("PATH fallback", result.stderr)
+
+    def test_pg_report_gate_is_called_and_both_failures_propagate(self):
+        result = self.run_script("test-postgres.sh")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report_args = self.root / "report-args"
+        self.assertTrue(report_args.is_file(), "PG report checker was not invoked")
+        self.assertEqual(
+            report_args.read_text().splitlines(),
+            [
+                "run",
+                "--no-project",
+                "--with",
+                "defusedxml==0.7.1",
+                "python",
+                "ci/check_postgres_results.py",
+            ],
+        )
+        result = self.run_script("test-postgres.sh", PG_REPORT_STATUS="37")
+        self.assertEqual(result.returncode, 37, result.stderr)
+        report_args.unlink()
+        result = self.run_script("test-postgres.sh", GRADLE_STATUS="23")
+        self.assertEqual(result.returncode, 23, result.stderr)
+        self.assertFalse(report_args.exists(), "report gate ran after failed Gradle")
 
     def test_live_test_failure_not_masked_and_full_suite(self):
         self.write("engine", "#!/bin/sh\nexit 0\n")

@@ -384,7 +384,7 @@ class HogliteRetirementAndCreationIntegrationTest {
         proxy.start()
         try {
             HogliteClient("http://127.0.0.1:${proxy.address.port}", sleeper = {}).use { client ->
-                val racing = HogliteCatalogStore(client).apply { requireOperationBindingForTests = true }
+                val racing = HogliteCatalogStore(client)
                 val result = racing.tableCreations.publish(cat, op, emptyList())
                 assertThat(intercepted.get()).isEqualTo(1)
                 assertThat(result.state).isEqualTo("aborted")

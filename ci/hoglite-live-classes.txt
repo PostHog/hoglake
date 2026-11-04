@@ -3,6 +3,7 @@ com.posthog.hoglake.hoglite.CatalogMetricsLoopIntegrationTest
 com.posthog.hoglake.hoglite.HogliteAlterRaceIntegrationTest
 com.posthog.hoglake.hoglite.HogliteBackendConformanceIntegrationTest
 com.posthog.hoglake.hoglite.HogliteBackendIntegrationTest
+com.posthog.hoglake.hoglite.HogliteCleanupLifecycleIntegrationTest
 com.posthog.hoglake.hoglite.HogliteCommitCollectionsIntegrationTest
 com.posthog.hoglake.hoglite.HogliteCommitParityIntegrationTest
 com.posthog.hoglake.hoglite.HogliteDurabilityConformanceIntegrationTest

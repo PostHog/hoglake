@@ -136,7 +136,7 @@ class MixedCatalogListIntegrationTest {
                         val coldStore =
                             HogliteCatalogStore(
                                 routedClient,
-                            ).apply { requireOperationBindingForTests = true }
+                            )
                         App.buildMixed(cfg, db.jdbi, coldStore, HealthProbe.forProbe(1_000) { true }).use { app ->
                             testApplication {
                                 application { app.module(this) }

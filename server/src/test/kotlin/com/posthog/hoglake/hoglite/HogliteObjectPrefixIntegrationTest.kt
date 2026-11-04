@@ -134,7 +134,7 @@ class HogliteObjectPrefixIntegrationTest {
             up,
         ) { "hoglited did not come up; output: ${process?.inputStream?.readBytes()?.decodeToString()?.take(2000)}" }
         client = HogliteClient(standardUrl = "http://127.0.0.1:$port", sleeper = {})
-        store = HogliteCatalogStore(client).apply { requireOperationBindingForTests = true }
+        store = HogliteCatalogStore(client)
         alters = HogliteAlters(store)
     }
 
@@ -788,7 +788,7 @@ class HogliteObjectPrefixIntegrationTest {
             "ALTER TABLE files DROP COLUMN prefix_quarantined",
         )
         // A fresh process (store) migrates on the first operation it binds.
-        val fresh = HogliteCatalogStore(client).apply { requireOperationBindingForTests = true }
+        val fresh = HogliteCatalogStore(client)
         assertThat(fresh.getTable(cat, "ingest", "events").objectPrefixField).isNull()
         val probe =
             fresh.catalogOperation(cat) {

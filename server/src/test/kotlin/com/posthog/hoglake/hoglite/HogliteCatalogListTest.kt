@@ -194,7 +194,6 @@ class HogliteCatalogListTest {
 
     private fun store(fake: FakeEngine) =
         HogliteCatalogStore(HogliteClient(standardUrl = serve(fake), retryBudgetMs = 2_000, sleeper = {}))
-            .apply { requireOperationBindingForTests = true }
 
     // ---- round trips -------------------------------------------------------
 
@@ -301,7 +300,7 @@ class HogliteCatalogListTest {
         val store =
             HogliteCatalogStore(
                 HogliteClient(standardUrl = serve(fake), whaleUrl = serve(whale), retryBudgetMs = 2_000, sleeper = {}),
-            ).apply { requireOperationBindingForTests = true }
+            )
 
         val listed = store.listCatalogs(null)
 

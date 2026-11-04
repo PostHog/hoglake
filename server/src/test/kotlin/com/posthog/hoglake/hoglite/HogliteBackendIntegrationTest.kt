@@ -149,7 +149,7 @@ class HogliteBackendIntegrationTest {
             throw IllegalStateException("hoglited did not come up; output: $out")
         }
         client = HogliteClient(standardUrl = "http://127.0.0.1:$port", sleeper = {})
-        store = HogliteCatalogStore(client).apply { requireOperationBindingForTests = true }
+        store = HogliteCatalogStore(client)
     }
 
     @AfterAll
@@ -307,7 +307,7 @@ class HogliteBackendIntegrationTest {
             scaleWrite(cat, "DROP INDEX " + ddl.substringAfter("IF NOT EXISTS ").substringBefore(" ON"))
         }
         val started = System.nanoTime()
-        val fresh = HogliteCatalogStore(client).apply { requireOperationBindingForTests = true }
+        val fresh = HogliteCatalogStore(client)
         assertThat(fresh.planScan(cat, "ns", "t", null, null, null, false)).hasSize(1)
         println("hoglite scale migration: 100001 files, ${(System.nanoTime() - started) / 1_000_000} ms")
         fresh.catalogOperation(cat) {
@@ -419,7 +419,7 @@ class HogliteBackendIntegrationTest {
         proxy.start()
         try {
             HogliteClient("http://127.0.0.1:${proxy.address.port}", sleeper = {}).use { retrying ->
-                val scoped = HogliteCatalogStore(retrying).apply { requireOperationBindingForTests = true }
+                val scoped = HogliteCatalogStore(retrying)
                 val files = scoped.planScan(cat, "ns", "t", null, null, null, false)
                 assertThat(files.map { it.dataFile.path }).containsExactly("s3://hoglake-it/$cat/data/a.parquet")
             }
@@ -2093,9 +2093,7 @@ class HogliteBackendIntegrationTest {
         val put = "PUT /v1/tenants/$registry"
         val engine = metricsUrl.removeSuffix("/metrics")
         CountingProxy(engine).use { proxy ->
-            fun storeThroughProxy() =
-                HogliteCatalogStore(HogliteClient(standardUrl = proxy.url, sleeper = {}), prefix)
-                    .apply { requireOperationBindingForTests = true }
+            fun storeThroughProxy() = HogliteCatalogStore(HogliteClient(standardUrl = proxy.url, sleeper = {}), prefix)
 
             // Replica A, fresh deployment: startup creates the registry...
             val a = storeThroughProxy()
@@ -2153,7 +2151,6 @@ class HogliteBackendIntegrationTest {
         prefix: String,
         url: String = metricsUrl.removeSuffix("/metrics"),
     ) = HogliteCatalogStore(HogliteClient(standardUrl = url, sleeper = {}), prefix)
-        .apply { requireOperationBindingForTests = true }
 
     /** Whether the engine under test serves `/v1/query-batch` (hoglite with the batch endpoint). */
     private fun engineBatches(): Boolean =

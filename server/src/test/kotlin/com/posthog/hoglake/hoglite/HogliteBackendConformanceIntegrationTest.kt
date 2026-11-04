@@ -1,5 +1,6 @@
 package com.posthog.hoglake.hoglite
 
+import com.posthog.hoglake.Config
 import com.posthog.hoglake.commit.CommitService
 import com.posthog.hoglake.model.AlterOp
 import com.posthog.hoglake.model.ColType
@@ -33,6 +34,7 @@ import com.posthog.hoglake.service.ViewService
 import com.posthog.hoglake.store.CatalogStore
 import com.posthog.hoglake.store.PostgresCatalogStore
 import com.posthog.hoglake.testing.PgTestSupport
+import com.posthog.hoglake.testing.TestImages
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.AfterAll
@@ -42,6 +44,12 @@ import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.Arguments
 import org.junit.jupiter.params.provider.EnumSource
 import org.junit.jupiter.params.provider.MethodSource
+import org.testcontainers.containers.MinIOContainer
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider
+import software.amazon.awssdk.regions.Region
+import software.amazon.awssdk.services.s3.S3Client
+import java.net.URI
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.file.Files
@@ -60,6 +68,8 @@ class HogliteBackendConformanceIntegrationTest {
 
     private var pg: PgTestSupport.TestDb? = null
     private var live: HogliteConformanceEngine? = null
+    private var pgMinio: MinIOContainer? = null
+    private var pgObjectConfig: Config? = null
     private lateinit var store: CatalogStore
     private lateinit var alters: AlterBackend
     private lateinit var creations: TableCreationBackend
@@ -101,9 +111,47 @@ class HogliteBackendConformanceIntegrationTest {
 
     @AfterAll
     fun close() {
-        pg?.close()
-        live?.close()
+        try {
+            pg?.close()
+            live?.close()
+        } finally {
+            pgMinio?.stop()
+        }
     }
+
+    /** Independent PG object fixture: obtaining it must never open/assume the engine. */
+    private fun objectConfig(backend: Backend): Config {
+        if (backend == Backend.HOGLITE) return engine().config()
+        return pgObjectConfig ?: run {
+            val minio =
+                pgMinio ?: TestImages.minio().also {
+                    pgMinio = it
+                    it.start()
+                }
+            val config =
+                Config(
+                    s3Endpoint = "http://127.0.0.1:${minio.firstMappedPort}",
+                    s3Region = "us-east-1", s3AccessKey = minio.userName,
+                    s3SecretKey = minio.password, s3PathStyle = true,
+                )
+            postgresS3Client(config).use { it.createBucket { b -> b.bucket("hoglake-it") } }
+            pgObjectConfig = config
+            config
+        }
+    }
+
+    private fun postgresS3Client(config: Config): S3Client =
+        S3Client.builder()
+            .endpointOverride(URI.create(config.s3Endpoint))
+            .credentialsProvider(
+                StaticCredentialsProvider.create(AwsBasicCredentials.create(config.s3AccessKey, config.s3SecretKey)),
+            )
+            .region(Region.US_EAST_1)
+            .forcePathStyle(true)
+            .build()
+
+    private fun objectS3Client(backend: Backend): S3Client =
+        if (backend == Backend.HOGLITE) engine().s3Client() else postgresS3Client(objectConfig(backend))
 
     private fun freshCatalog(): String {
         val name = "contract" + UUID.randomUUID().toString().replace("-", "")
@@ -1216,7 +1264,7 @@ class HogliteBackendConformanceIntegrationTest {
         store.createNamespace(cat, "ns")
         store.createTable(cat, "ns", "t", columns)
         for (i in 1..2) {
-            val (path, size) = putParquet(cat, "s3://hoglake-it/$cat/data/$i.parquet", i.toLong())
+            val (path, size) = putParquet(backend, cat, "s3://hoglake-it/$cat/data/$i.parquet", i.toLong())
             store.commit(
                 cat,
                 CommitRequest(appends = listOf(TableAppend("ns", "t", listOf(FileRegistration(path, 2, size))))),
@@ -1224,12 +1272,12 @@ class HogliteBackendConformanceIntegrationTest {
         }
         val before = store.getCatalog(cat).headSnapshotId
         assertThat(store.listFiles(cat, "ns", "t").map { it.statsState }).containsOnly(StatsState.PENDING)
-        hydrate()
+        hydrate(backend)
         assertThat(store.listFiles(cat, "ns", "t").map { it.statsState }).containsOnly(StatsState.PROVIDED)
         for (f in store.listFiles(cat, "ns", "t")) {
             assertThat(store.fileStats(cat, "ns", "t", f.dataFileId).columns.map { it.fieldId }).containsExactly(1L, 2L)
         }
-        val result = compact(cat)
+        val result = compact(backend, cat)
         assertThat(result.groupsCompacted).isEqualTo(1)
         assertThat(result.filesIn).isEqualTo(2)
         assertThat(result.filesOut).isEqualTo(1)
@@ -1247,7 +1295,7 @@ class HogliteBackendConformanceIntegrationTest {
         }
         assertThat(store.getTable(cat, "ns", "t", snapshot = head).recordCount).isEqualTo(4)
         assertThat(store.getTable(cat, "ns", "t", snapshot = before).fileCount).isEqualTo(2)
-        assertThat(compact(cat).groupsCompacted).isZero()
+        assertThat(compact(backend, cat).groupsCompacted).isZero()
     }
 
     private fun orderedDeleteCases() =
@@ -1293,7 +1341,7 @@ class HogliteBackendConformanceIntegrationTest {
         store.createNamespace(cat, "ns")
         val table = store.createTable(cat, "ns", "t", columns)
         for (i in 1..2) {
-            val (path, size) = putParquet(cat, "s3://hoglake-it/$cat/data/$i.parquet", i.toLong())
+            val (path, size) = putParquet(backend, cat, "s3://hoglake-it/$cat/data/$i.parquet", i.toLong())
             store.commit(
                 cat,
                 CommitRequest(appends = listOf(TableAppend("ns", "t", listOf(FileRegistration(path, 2, size))))),
@@ -1301,8 +1349,8 @@ class HogliteBackendConformanceIntegrationTest {
         }
         val read = store.getCatalog(cat).headSnapshotId
         val inputs = store.listFiles(cat, "ns", "t")
-        hydrate()
-        val compacted = compact(cat)
+        hydrate(backend)
+        val compacted = compact(backend, cat)
         assertThat(compacted.groupsCompacted).isEqualTo(1)
         assertThat(compacted.filesIn).isEqualTo(2)
         assertThat(compacted.filesOut).isEqualTo(1)
@@ -1358,7 +1406,7 @@ class HogliteBackendConformanceIntegrationTest {
         val paths = mutableListOf<String>()
 
         fun appendRows(team: Long) {
-            val (path, size) = putParquet(cat, "s3://hoglake-it/$cat/data/$team.parquet", team)
+            val (path, size) = putParquet(backend, cat, "s3://hoglake-it/$cat/data/$team.parquet", team)
             paths += path
             store.commit(
                 cat,
@@ -1369,11 +1417,11 @@ class HogliteBackendConformanceIntegrationTest {
         appendRows(2)
         val first = store.changes(cat, "ns", "t", store.getOffset(cat, "replica", table.tableUuid).committedSnapshot)
         assertThat(first.files.map { it.path }).containsExactlyElementsOf(paths)
-        assertThat(changeRows(first)).containsExactly(1L to 1L, 1L to 2L, 2L to 1L, 2L to 2L)
+        assertThat(changeRows(backend, first)).containsExactly(1L to 1L, 1L to 2L, 2L to 1L, 2L to 2L)
         store.commitOffset(cat, "replica", table.tableUuid, first.toSnapshot)
 
-        hydrate()
-        val result = compact(cat)
+        hydrate(backend)
+        val result = compact(backend, cat)
         assertThat(result.groupsCompacted).isEqualTo(1)
         val compacted = store.getCatalog(cat).headSnapshotId
         val output = store.listFiles(cat, "ns", "t").single()
@@ -1387,11 +1435,11 @@ class HogliteBackendConformanceIntegrationTest {
         appendRows(3)
         val next = store.changes(cat, "ns", "t", store.getOffset(cat, "replica", table.tableUuid).committedSnapshot)
         assertThat(next.files.map { it.path }).containsExactly(paths.last())
-        assertThat(changeRows(next)).containsExactly(3L to 1L, 3L to 2L)
+        assertThat(changeRows(backend, next)).containsExactly(3L to 1L, 3L to 2L)
         val all = store.changes(cat, "ns", "t", start, next.toSnapshot)
         assertThat(all.tableUuid).isEqualTo(table.tableUuid)
         assertThat(all.files.map { it.path }).containsExactlyElementsOf(paths)
-        assertThat(changeRows(all)).containsExactly(
+        assertThat(changeRows(backend, all)).containsExactly(
             1L to 1L,
             1L to 2L,
             2L to 1L,
@@ -1405,8 +1453,11 @@ class HogliteBackendConformanceIntegrationTest {
         assertThat(pinned.files.map { it.path }).containsExactlyElementsOf(paths.take(2))
     }
 
-    private fun changeRows(plan: com.posthog.hoglake.model.ChangesPlan): List<Pair<Long, Long>> =
-        com.posthog.hoglake.hydrator.ObjectStore(engine().config()).use { objects ->
+    private fun changeRows(
+        backend: Backend,
+        plan: com.posthog.hoglake.model.ChangesPlan,
+    ): List<Pair<Long, Long>> =
+        com.posthog.hoglake.hydrator.ObjectStore(objectConfig(backend)).use { objects ->
             plan.files.flatMap { file ->
                 com.posthog.hoglake.ParquetReaders.open(
                     com.posthog.hoglake.compaction.S3InputFile(objects, file.path, file.fileSizeBytes),
@@ -1438,15 +1489,15 @@ class HogliteBackendConformanceIntegrationTest {
         val cat = fixture()
         for ((value, actual) in listOf(4L to 4L, 8L to 9L)) {
             for (i in 1..2) {
-                val (path, size) = putParquet(cat, under(cat, "events", "$value") + "$i.parquet", actual)
+                val (path, size) = putParquet(backend, cat, under(cat, "events", "$value") + "$i.parquet", actual)
                 append(cat, "events", file(path, "$value", null, rows = 2, size = size, footer = null))
             }
         }
         // Pending files cannot be compacted before verification.
-        assertThat(compact(cat).groupsCompacted).isZero()
-        hydrate()
+        assertThat(compact(backend, cat).groupsCompacted).isZero()
+        hydrate(backend)
         assertThat(store.listFiles(cat, "ingest", "events").map { it.statsState }).containsOnly(StatsState.PROVIDED)
-        val result = compact(cat)
+        val result = compact(backend, cat)
         assertThat(result.groupsCompacted).isEqualTo(1)
         assertThat(result.invalidData).isZero()
         val files = store.listFiles(cat, "ingest", "events")
@@ -1465,11 +1516,11 @@ class HogliteBackendConformanceIntegrationTest {
         select(backend)
         val cat = fixture()
         for (i in 1..2) {
-            val (path, size) = putParquet(cat, under(cat, "events", "4") + "$i.parquet", 5)
+            val (path, size) = putParquet(backend, cat, under(cat, "events", "4") + "$i.parquet", 5)
             append(cat, "events", file(path, "4", stats(le8(4), le8(4)), rows = 2, size = size, footer = null))
         }
         val before = store.getCatalog(cat).headSnapshotId
-        val result = compact(cat)
+        val result = compact(backend, cat)
         assertThat(result.invalidData).isEqualTo(1)
         assertThat(result.groupsCompacted).isZero()
         assertThat(store.getCatalog(cat).headSnapshotId).isEqualTo(before)
@@ -1477,16 +1528,19 @@ class HogliteBackendConformanceIntegrationTest {
     }
 
     // Backend choices belong only in fixture adapters, never in contract assertions.
-    private fun hydrate() {
-        com.posthog.hoglake.hydrator.ObjectStore(engine().config()).use { objects ->
-            when (selected) {
+    private fun hydrate(backend: Backend) {
+        com.posthog.hoglake.hydrator.ObjectStore(objectConfig(backend)).use { objects ->
+            when (backend) {
                 Backend.POSTGRES -> com.posthog.hoglake.hydrator.Hydrator(pg!!.jdbi, objects).runOnce()
                 Backend.HOGLITE -> HogliteHydrator(engine().store, objects).runOnce()
             }
         }
     }
 
-    private fun compact(cat: String): com.posthog.hoglake.model.CompactionResult {
+    private fun compact(
+        backend: Backend,
+        cat: String,
+    ): com.posthog.hoglake.model.CompactionResult {
         val config =
             com.posthog.hoglake.compaction.CompactionConfig(
                 targetBytes = 1L shl 30,
@@ -1496,9 +1550,9 @@ class HogliteBackendConformanceIntegrationTest {
                 maxGroupsPerRun = 10,
                 maxCandidates = 100,
             )
-        return com.posthog.hoglake.hydrator.ObjectStore(engine().config()).use { objects ->
+        return com.posthog.hoglake.hydrator.ObjectStore(objectConfig(backend)).use { objects ->
             val compactor: com.posthog.hoglake.service.CompactionBackend =
-                when (selected) {
+                when (backend) {
                     Backend.POSTGRES -> com.posthog.hoglake.compaction.CompactionService(pg!!.jdbi, objects, config)
                     Backend.HOGLITE -> HogliteCompaction(engine().store, objects, config)
                 }
@@ -1523,6 +1577,7 @@ class HogliteBackendConformanceIntegrationTest {
 
     /** Two rows of team_id [team] at [path] (an s3://hoglake-it/ URI); returns (path, size). */
     private fun putParquet(
+        backend: Backend,
         cat: String,
         path: String,
         team: Long,
@@ -1550,7 +1605,7 @@ class HogliteBackendConformanceIntegrationTest {
             } finally {
                 Files.deleteIfExists(tmp)
             }
-        engine().s3Client().use { s3 ->
+        objectS3Client(backend).use { s3 ->
             s3.putObject(
                 { it.bucket("hoglake-it").key(path.removePrefix("s3://hoglake-it/")) },
                 software.amazon.awssdk.core.sync.RequestBody.fromBytes(bytes),

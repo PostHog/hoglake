@@ -8,3 +8,4 @@ if command -v hoglited >/dev/null 2>&1; then
     exit 1
 fi
 ./server/gradlew -p server --no-daemon :test :ktlintCheck :checkOpenapiVersion
+uv run --no-project --with defusedxml==0.7.1 python ci/check_postgres_results.py

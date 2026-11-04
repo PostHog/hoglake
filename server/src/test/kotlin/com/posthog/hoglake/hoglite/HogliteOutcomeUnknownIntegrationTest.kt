@@ -175,7 +175,7 @@ class HogliteOutcomeUnknownIntegrationTest {
                 retryBudgetMs = budgetMs,
                 sleeper = {},
             ),
-        ).apply { requireOperationBindingForTests = true }
+        )
 
     private fun freshCatalog(store: HogliteCatalogStore): String {
         val name = "ou${catalogCounter++}"

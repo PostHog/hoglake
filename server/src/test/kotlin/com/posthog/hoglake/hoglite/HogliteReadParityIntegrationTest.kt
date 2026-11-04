@@ -90,7 +90,7 @@ class HogliteReadParityIntegrationTest {
                     start()
                 }
             proxyClient = HogliteClient(standardUrl = "http://127.0.0.1:${proxy.address.port}", sleeper = {})
-            val capturedStore = HogliteCatalogStore(proxyClient).apply { requireOperationBindingForTests = true }
+            val capturedStore = HogliteCatalogStore(proxyClient)
             store = capturedStore
             alters = HogliteAlters(capturedStore)
             app =

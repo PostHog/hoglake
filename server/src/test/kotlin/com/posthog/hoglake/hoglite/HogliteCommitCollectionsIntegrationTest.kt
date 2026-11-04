@@ -76,7 +76,7 @@ class HogliteCommitCollectionsIntegrationTest {
                 start()
             }
         val client = HogliteClient(standardUrl = "http://127.0.0.1:${proxy.address.port}", sleeper = {})
-        val store = HogliteCatalogStore(client).apply { requireOperationBindingForTests = true }
+        val store = HogliteCatalogStore(client)
         try {
             val cat = "bind" + UUID.randomUUID().toString().replace("-", "")
             store.createCatalog(cat, "s3://hoglake-it/$cat")

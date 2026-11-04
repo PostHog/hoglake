@@ -103,7 +103,7 @@ class HogliteScanStatsParityIntegrationTest {
                     start()
                 }
             client = HogliteClient(standardUrl = "http://127.0.0.1:${proxy.address.port}", sleeper = {})
-            val hg = HogliteCatalogStore(client).apply { requireOperationBindingForTests = true }
+            val hg = HogliteCatalogStore(client)
             store = hg
             app =
                 App.buildHoglite(
