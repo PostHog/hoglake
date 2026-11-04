@@ -154,6 +154,16 @@ internal object HogliteSchema {
             """CREATE UNIQUE INDEX IF NOT EXISTS table_versions_live
                 ON table_versions(namespace, name) WHERE end_snapshot IS NULL""",
             /*
+             * Name lookup: tableAt and the live lookups filter on
+             * (namespace_id, name). The live index above is keyed on the
+             * namespace TEXT, and the primary key starts with table_id, so
+             * without this index SQLite scans every table and its retained
+             * versions. end_snapshot last: head reads and commit planning
+             * seek the live version, and a historical read stays bounded to
+             * the one table's versions.
+             */
+            "CREATE INDEX IF NOT EXISTS table_versions_name ON table_versions(namespace_id, name, end_snapshot)",
+            /*
              * Column VERSIONS, one row per column node (top-level or
              * nested) per interval of visibility — hog_column's shape.
              * A column dropped by an alter keeps its rows with
