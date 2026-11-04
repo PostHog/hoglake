@@ -42,6 +42,83 @@ class PostgresResultsTest(unittest.TestCase):
             text=True,
         )
 
+    def test_partition_and_configured_create_inventory_is_explicit_and_preserves_legacy_counts(
+        self,
+    ):
+        added = {
+            "HoglitePartitionParityIntegrationTest",
+            "HogliteCatalogCreateParityIntegrationTest",
+        }
+        self.assertEqual(
+            sum(
+                sum(pg.values())
+                for name, (pg, _) in PG_INVENTORY.items()
+                if name not in added
+            ),
+            78,
+        )
+        self.assertEqual(
+            sum(
+                sum(other.values())
+                for name, (_, other) in PG_INVENTORY.items()
+                if name not in added
+            ),
+            75,
+        )
+        self.assertEqual(
+            sum(PG_INVENTORY["HoglitePartitionParityIntegrationTest"][0].values()), 7
+        )
+        self.assertEqual(
+            sum(PG_INVENTORY["HogliteCatalogCreateParityIntegrationTest"][0].values()),
+            3,
+        )
+        self.assertEqual(
+            sum(PG_INVENTORY["HoglitePartitionParityIntegrationTest"][1].values()), 6
+        )
+        self.assertEqual(
+            sum(PG_INVENTORY["HogliteCatalogCreateParityIntegrationTest"][1].values()),
+            6,
+        )
+        for name in added:
+            pg, other = PG_INVENTORY[name]
+            self.assertTrue(all(count == 1 for count in (pg + other).values()))
+            self.assertTrue(
+                all(
+                    "POSTGRES" in label or label.startswith("PostgreSQL fixture")
+                    for label in pg
+                )
+            )
+            self.assertTrue(
+                all("HOGLITE" in label or "MIXED" in label for label in other)
+            )
+
+    def test_new_parity_cases_cannot_hide_missing_skipped_duplicated_or_misclassified(
+        self,
+    ):
+        for name in (
+            "HoglitePartitionParityIntegrationTest",
+            "HogliteCatalogCreateParityIntegrationTest",
+        ):
+            path = self.report(name)
+            original = path.read_text()
+            for label in PG_INVENTORY[name][0]:
+                case = f"<testcase classname={quoteattr(PACKAGE + name)} name={quoteattr(label)}/>"
+                for changed in (
+                    "",
+                    case + case,
+                    case.replace("/>", "><skipped/></testcase>"),
+                    case.replace("/>", "><error/></testcase>"),
+                    case.replace("/>", "><failure/></testcase>"),
+                    case.replace(
+                        quoteattr(PACKAGE + name),
+                        quoteattr(PACKAGE + "MixedCatalogIntegrationTest"),
+                    ),
+                ):
+                    with self.subTest(name=name, label=label, changed=changed):
+                        path.write_text(original.replace(case, changed, 1))
+                        self.assertNotEqual(self.run_checker().returncode, 0)
+                        path.write_text(original)
+
     def test_complete_inventory_accepts_unrelated_engine_skips(self):
         # Unselected HG arms and real mixed-directory engine cases are distinct.
         for name, (_, other) in PG_INVENTORY.items():

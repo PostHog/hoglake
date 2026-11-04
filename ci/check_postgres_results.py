@@ -118,6 +118,48 @@ PG_INVENTORY = {
             }
         ),
     ),
+    "HoglitePartitionParityIntegrationTest": (
+        Counter(
+            {
+                "API writes use actual PG sampler while hoglite stays exact and legacy escapes coalesce(Backend) [1] POSTGRES": 1,
+                "PostgreSQL fixture records actual database and text array collation without a new setting()": 1,
+                "compact listing group boundary accepts50000 refuses50001 before filters(Backend) [1] POSTGRES": 1,
+                "listing decoded raw null prefix filters and every measure direction stay unchanged(Backend) [1] POSTGRES": 1,
+                "partition route caps distinguish stats500 from listing1000(Backend) [1] POSTGRES": 1,
+                "stats rank precedence keeps debt smallbytes namespace and table ahead of tuple(Backend) [1] POSTGRES": 1,
+                "stats typed tuples retain absent empty null elements prefixes and numeric specs(Backend) [1] POSTGRES": 1,
+            }
+        ),
+        Counter(
+            {
+                "API writes use actual PG sampler while hoglite stays exact and legacy escapes coalesce(Backend) [2] HOGLITE": 1,
+                "compact listing group boundary accepts50000 refuses50001 before filters(Backend) [2] HOGLITE": 1,
+                "listing decoded raw null prefix filters and every measure direction stay unchanged(Backend) [2] HOGLITE": 1,
+                "partition route caps distinguish stats500 from listing1000(Backend) [2] HOGLITE": 1,
+                "stats rank precedence keeps debt smallbytes namespace and table ahead of tuple(Backend) [2] HOGLITE": 1,
+                "stats typed tuples retain absent empty null elements prefixes and numeric specs(Backend) [2] HOGLITE": 1,
+            }
+        ),
+    ),
+    "HogliteCatalogCreateParityIntegrationTest": (
+        Counter(
+            {
+                "configured create authenticates before decoding and keeps operator attribution(Mode) [1] POSTGRES": 1,
+                "configured create malformed unknown strict attribution and content type do no backend IO(Mode) [1] POSTGRES": 1,
+                "configured create selection presence null scalar and conflict matrix(Mode) [1] POSTGRES": 1,
+            }
+        ),
+        Counter(
+            {
+                "configured create authenticates before decoding and keeps operator attribution(Mode) [2] HOGLITE": 1,
+                "configured create authenticates before decoding and keeps operator attribution(Mode) [3] MIXED": 1,
+                "configured create malformed unknown strict attribution and content type do no backend IO(Mode) [2] HOGLITE": 1,
+                "configured create malformed unknown strict attribution and content type do no backend IO(Mode) [3] MIXED": 1,
+                "configured create selection presence null scalar and conflict matrix(Mode) [2] HOGLITE": 1,
+                "configured create selection presence null scalar and conflict matrix(Mode) [3] MIXED": 1,
+            }
+        ),
+    ),
 }
 
 

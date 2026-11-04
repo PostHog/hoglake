@@ -14,7 +14,10 @@ Only catalog creation accepts new optional fields.
 | `mixed` | hoglite | Extended hoglite registry | Lazy initialization before PostgreSQL work |
 
 Both legacy modes keep their existing defaults.
-They reject explicit backend selection on create.
+In configured PostgreSQL mode, the presence of `backend` or `connection_ref` on
+create is an unknown-field `400 bad_request`, including an explicit JSON `null`.
+Legacy hoglite keeps its existing behavior: null selection values act as absent;
+any non-null explicit selection is refused with `422 validation`.
 Mixed mode requires the existing PostgreSQL configuration.
 It also requires the existing `HOGLAKE_HOGLITE_*` configuration.
 Boot validates both service configurations without requiring PostgreSQL availability.
@@ -49,7 +52,8 @@ The allowlist contains exactly two connection references:
 | `hoglite` | hoglite | The cluster configured by `HOGLAKE_HOGLITE_URL` and its existing routing options |
 
 The connection reference can select its backend when `backend` is absent.
-Supplying both fields requires a matching pair.
+In mixed mode, null selection values act as absent; supplying both non-null
+fields requires a matching pair.
 Unknown references fail before a name reservation.
 References never contain client-provided URLs or credentials.
 The directory stores the selected reference.

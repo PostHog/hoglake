@@ -3633,13 +3633,18 @@ components:
           description: >
             Optional create-time selection in HOGLAKE_DATABASE=mixed.
             The default is hoglite in mixed mode.
-            Legacy modes reject explicit selection.
+            Configured postgres rejects selection-property presence with 400,
+            including explicit null. Legacy hoglite refuses non-null selection
+            with 422; null retains its existing absent-value behavior.
         connection_ref:
           type: string
           enum: [postgres, hoglite]
           description: >
             An allowlisted reference to the configured PostgreSQL pool or hoglite cluster.
-            It must match backend when both fields are present.
+            In mixed mode, null acts as absent; non-null values must match backend
+            when both selections are non-null. Configured postgres rejects this
+            property's presence with 400, including null; legacy hoglite refuses
+            non-null selection with 422 and treats null as absent.
             URLs, credentials, and additional pools are not supported here.
 
     Namespace:

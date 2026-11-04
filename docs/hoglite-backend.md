@@ -143,6 +143,22 @@ them unchanged; the hoglite ports live in `server/.../hoglite/`.
 - **Debt is the planner's arithmetic.** `GET .../stats/partitions` computes
   actionable debt by running the same `CompactionGrouping` pack the compaction
   sweep will run, instead of reading the sampler's simulated pool tallies.
+- **Partition API bounds and ordering.** STATS caps its returned ranking at 500;
+  LIST caps a page at 1000 and refuses more than 50,000 groups before filtering.
+  STATS ties use namespace, table, numeric spec (null first), then the typed
+  nullable string tuple (whole tuple null last, null elements last, shorter
+  equal prefixes first). Absent and empty tuples stay distinct internally but
+  both project to the existing empty-values wire shape. LIST retains its
+  separate decoded/raw comparison, nulls first, with no spec-id tiebreak.
+  Hoglite retains deterministic text comparison; PostgreSQL uses its configured
+  collation. Comparison evidence covers the lowercase-ASCII fixture domain,
+  **not** universal case, punctuation or Unicode equivalence. The observed PG18
+  fixture uses libc `en_US.utf8` and differs from hoglite on mixed-case and
+  non-ASCII examples. This qualification does not restrict accepted text.
+  These are API bounds, **not** a large-manifest scan/capacity repair: hoglite
+  still reads the full live manifest within the published engine's existing
+  row/byte/time/read-slot limits. Tiny one-file-per-group cap fixtures are not
+  fleet/whale performance evidence.
 - **Compaction plans simply.** One candidate read per table (live files under
   the target size), grouped by (spec, partition), packed greedily; groups run
   sequentially (one tenant has one writer). The claims stay — cross-replica

@@ -1,0 +1,1 @@
+{"name":"fuzz","data_path":"s3://bucket/fuzz","backend":"postgres"}

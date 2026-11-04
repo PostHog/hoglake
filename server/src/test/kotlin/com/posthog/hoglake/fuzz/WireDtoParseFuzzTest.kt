@@ -13,6 +13,7 @@ import com.posthog.hoglake.api.CreateNamespaceRequestDto
 import com.posthog.hoglake.api.CreateTableRequestDto
 import com.posthog.hoglake.api.CreateViewRequestDto
 import com.posthog.hoglake.api.InstanceInfoDto
+import com.posthog.hoglake.api.LegacyPostgresCreateCatalogRequestDto
 import com.posthog.hoglake.api.OperationMetadataDto
 import com.posthog.hoglake.api.OptionsPatchRequest
 import com.posthog.hoglake.api.PrepareTableCreationDto
@@ -184,6 +185,27 @@ class WireDtoParseFuzzTest {
         } catch (e: Exception) {
             checkAllowed("scan include/stats_fields", e)
         }
+
+        // The configured PostgreSQL DTO is a separate parse surface, not the mixed/public DTO.
+        parseOrNull { mapper.readValue<LegacyPostgresCreateCatalogRequestDto>(data) }?.let { dto ->
+            val node = mapper.readTree(data)
+            check(!node.has("backend") && !node.has("connection_ref"))
+            for (field in listOf("author", "message")) {
+                check(!node.has(field) || node[field].isNull || node[field].isTextual)
+            }
+            check(dto.toPublicRequest() == CreateCatalogRequestDto(dto.name, dto.dataPath, dto.author, dto.message))
+        }
+        // Ground-truth presence oracle: well-formed legacy fields, arbitrary selection VALUE.
+        // No nullable-default DTO can silently turn a present null into an absent property.
+        val legacy = mapper.createObjectNode().put("name", "fuzz").put("data_path", "s3://bucket/fuzz")
+        val selector = listOf(null, "backend", "connection_ref")[(data.firstOrNull()?.toInt()?.and(255) ?: 0) % 3]
+        if (selector != null) {
+            val value = parseOrNull { mapper.readTree(data) } ?: mapper.nullNode()
+            legacy.set<com.fasterxml.jackson.databind.JsonNode>(selector, value)
+        }
+        val legacyDecoded =
+            parseOrNull { mapper.readValue<LegacyPostgresCreateCatalogRequestDto>(mapper.writeValueAsBytes(legacy)) }
+        check((legacyDecoded != null) == (selector == null))
 
         parseOrNull { mapper.readValue<CreateCatalogRequestDto>(data) }?.let { dto ->
             check(mapper.readValue<CreateCatalogRequestDto>(mapper.writeValueAsBytes(dto)) == dto)

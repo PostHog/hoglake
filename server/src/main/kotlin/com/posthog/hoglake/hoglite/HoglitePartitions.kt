@@ -15,6 +15,7 @@ import com.posthog.hoglake.model.PartitionValueDecoding
 import com.posthog.hoglake.service.PartitionListingBackend
 import com.posthog.hoglake.service.PartitionListingService
 import com.posthog.hoglake.service.PartitionStatsBackend
+import com.posthog.hoglake.service.PartitionStatsService
 
 /**
  * The partition surfaces on hoglite (PartitionStatsService and
@@ -25,9 +26,10 @@ import com.posthog.hoglake.service.PartitionStatsBackend
  * generation because the debt arithmetic over a 10M-row manifest is
  * what a request path cannot pay on a shared database — the sample is
  * the affordance, the staleness its price. A hoglite tenant is one
- * catalog's own file: the whole live manifest is the kind of read the
- * engine serves all day, so the sample's raison d'être is gone and the
- * answer is exact. The wire shape keeps the sampler's fields
+ * catalog's own file: this implementation reads its whole live manifest
+ * and computes exact results, still subject to the engine's read limits.
+ * The API caps below do not make that scan bounded or repair capacity.
+ * The wire shape keeps the sampler's fields
  * (`sampledAt` null — "no sample" — with every group present).
  *
  * The DEBT definition ports the planner's, not the sampler's pool
@@ -58,7 +60,7 @@ internal class HoglitePartitions(
         val table: String,
         val tableUuid: String,
         val specId: Long?,
-        val values: List<String?>,
+        val values: List<String?>?,
         val thresholdBytes: Long,
         val files: MutableList<FileEntry> = mutableListOf(),
         var dvCount: Long = 0,
@@ -133,7 +135,7 @@ internal class HoglitePartitions(
                         table = r[2].asString(),
                         tableUuid = r[3].asString(),
                         specId = r[4].asLongOrNull(),
-                        values = values ?: emptyList<String?>(),
+                        values = values,
                         thresholdBytes = smallFileThresholdBytes,
                     )
                 }
@@ -220,7 +222,7 @@ internal class HoglitePartitions(
             if (limit <= 0) {
                 throw HoglakeException.Validation("limit must be positive (got $limit)")
             }
-            val cappedLimit = limit.coerceAtMost(MAX_LIMIT)
+            val cappedLimit = limit.coerceAtMost(PartitionStatsService.MAX_LIMIT)
             if (namespace != null) {
                 store.liveNamespace(catalog, namespace)
                 if (table != null) store.liveTable(catalog, namespace, table)
@@ -236,7 +238,7 @@ internal class HoglitePartitions(
                         table = g.table,
                         tableUuid = java.util.UUID.fromString(g.tableUuid),
                         partitionValues =
-                            g.values.mapIndexed { i, value ->
+                            g.values.orEmpty().mapIndexed { i, value ->
                                 PartitionValue(fieldNames.getOrElse(i) { "key_$i" }, value)
                             },
                         specId = g.specId,
@@ -247,17 +249,19 @@ internal class HoglitePartitions(
                         avgFileBytes = if (g.fileCount > 0) g.totalBytes / g.fileCount else 0,
                         dvCount = g.dvCount,
                         debtScore = g.debt(smallFileThresholdBytes, minInputFiles, maxInputFiles),
-                    )
+                    ) to g.values
                 }
             val ordered =
                 debts.sortedWith(
-                    compareByDescending<PartitionDebt> { it.debtScore }
-                        .thenByDescending { it.smallFileBytes }
-                        .thenBy { it.namespace }
-                        .thenBy { it.table },
+                    compareByDescending<Pair<PartitionDebt, List<String?>?>> { it.first.debtScore }
+                        .thenByDescending { it.first.smallFileBytes }
+                        .thenBy { it.first.namespace }
+                        .thenBy { it.first.table }
+                        .thenBy { it.first.specId }
+                        .thenComparator { a, b -> compareStatsValues(a.second, b.second) },
                 )
             return PartitionStatsReport(
-                partitions = ordered.take(cappedLimit),
+                partitions = ordered.take(cappedLimit).map { it.first },
                 truncated = ordered.size > cappedLimit,
                 staleSpecGroups =
                     groups.count { it.specId != headSpecs[it.tableId] }.toLong(),
@@ -281,7 +285,7 @@ internal class HoglitePartitions(
         store.catalogOperation(catalog) {
             if (limit <= 0) throw HoglakeException.Validation("limit must be positive (got $limit)")
             if (offset < 0) throw HoglakeException.Validation("offset must be >= 0 (got $offset)")
-            val cappedLimit = limit.coerceAtMost(MAX_LIMIT)
+            val cappedLimit = limit.coerceAtMost(PartitionListingService.MAX_LIMIT)
             val descending = desc ?: sort.descendingByDefault
 
             val headSpec =
@@ -298,9 +302,9 @@ internal class HoglitePartitions(
             }
             val t = store.liveTable(catalog, namespace, table)
             val groups = groups(catalog, namespace, table)
-            if (groups.size > MAX_GROUPS) {
+            if (groups.size > PartitionListingService.MAX_GROUPS) {
                 throw HoglakeException.Validation(
-                    "table '$namespace.$table' has more than $MAX_GROUPS partition groups; " +
+                    "table '$namespace.$table' has more than ${PartitionListingService.MAX_GROUPS} partition groups; " +
                         "this listing decodes, sorts and pages them in memory and refuses above that. " +
                         "A 'filter' does not help (it is applied after the read). Use " +
                         "GET /v1/catalogs/{catalog}/stats/partitions for the catalog-wide ranking.",
@@ -331,7 +335,7 @@ internal class HoglitePartitions(
                 groups.map { g ->
                     val fields = g.specId?.let { fieldsBySpec[it] } ?: emptyList()
                     val values =
-                        g.values.mapIndexed { i, raw ->
+                        g.values.orEmpty().mapIndexed { i, raw ->
                             val f = fields.getOrNull(i)
                             PartitionListingValue(
                                 field = f?.first ?: "key_$i",
@@ -488,8 +492,31 @@ internal class HoglitePartitions(
             a.compareTo(b)
         }
 
-    companion object {
-        private const val MAX_LIMIT = 1_000
-        private const val MAX_GROUPS = 10_000
+    /**
+     * PG's one-dimensional text[] order: whole NULL and null elements LAST,
+     * shorter equal prefixes FIRST. Keep HG's deterministic text comparison;
+     * PG's configured collation may differ outside the characterized fixtures.
+     * This is separate from LIST's decoded/raw, nulls-FIRST comparator above.
+     */
+    private fun compareStatsValues(
+        a: List<String?>?,
+        b: List<String?>?,
+    ): Int {
+        if (a === b) return 0
+        if (a == null) return 1
+        if (b == null) return -1
+        for (i in 0 until minOf(a.size, b.size)) {
+            val x = a[i]
+            val y = b[i]
+            val c =
+                when {
+                    x == null && y == null -> 0
+                    x == null -> 1
+                    y == null -> -1
+                    else -> x.compareTo(y)
+                }
+            if (c != 0) return c
+        }
+        return a.size.compareTo(b.size)
     }
 }

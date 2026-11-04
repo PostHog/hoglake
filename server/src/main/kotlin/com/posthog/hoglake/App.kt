@@ -602,6 +602,7 @@ class App private constructor(
             instanceTotals = { catalogMetrics.latestTotals },
             catalogTotals = { catalogMetrics.latestByCatalog },
             uiTheme = cfg.uiTheme,
+            database = cfg.database,
         )
         app.installScanRoutes(store)
         app.installPublicationRoutes()

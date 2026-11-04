@@ -1,6 +1,7 @@
 package com.posthog.hoglake.api
 
 import com.posthog.hoglake.BuildInfo
+import com.posthog.hoglake.DatabaseBackend
 import com.posthog.hoglake.auth.AuthState
 import com.posthog.hoglake.auth.actorOrRefuse
 import com.posthog.hoglake.auth.hoglakeAuth
@@ -43,6 +44,7 @@ fun Application.installApiRoutes(
     instanceTotals: () -> InstanceTotals? = { null },
     catalogTotals: () -> Map<String, CatalogTotals> = { emptyMap() },
     uiTheme: String = "",
+    database: DatabaseBackend? = null,
 ) {
     // The handlers below read `catalogs.`/`commits.` — the receiver names
     // the spec-parity meta-tests pin by counting call sites (see
@@ -107,7 +109,7 @@ fun Application.installApiRoutes(
                 call.respond(catalogs.listCatalogs(visible).map { it.toDto(totals[it.name]) })
             }
             post {
-                val req = call.receive<CreateCatalogRequestDto>()
+                val req = call.receiveCatalogCreate(database)
                 call.respond(
                     HttpStatusCode.Created,
                     catalogs.createCatalog(
