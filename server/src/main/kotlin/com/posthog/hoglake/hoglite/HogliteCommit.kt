@@ -5,6 +5,7 @@ import com.posthog.hoglake.commit.COMMIT_FINGERPRINT_LENGTH
 import com.posthog.hoglake.commit.COMMIT_FINGERPRINT_VERSION
 import com.posthog.hoglake.commit.CommitService.Companion.BLIND_PARTITIONED_REFUSAL
 import com.posthog.hoglake.commit.CommitService.Companion.MAX_FILE_RECORD_COUNT
+import com.posthog.hoglake.commit.CommitService.Companion.MAX_WARNED_BLIND_PARTITIONED
 import com.posthog.hoglake.commit.CommitService.Companion.blindPartitionedRefusal
 import com.posthog.hoglake.commit.ObjectPrefixRules
 import com.posthog.hoglake.commit.commitFingerprint
@@ -73,7 +74,7 @@ internal object HogliteCommit {
     //    messages differ.
     //  - settleDecision vs UploadService.claimsToSettle. The rule is the
     //    same. UploadClaim needs columns this query does not read.
-    // Shared now: ObjectPrefixRules, MAX_FILE_RECORD_COUNT,
+    // Shared now: ObjectPrefixRules, MAX_FILE_RECORD_COUNT, MAX_WARNED_BLIND_PARTITIONED,
     // BLIND_PARTITIONED_REFUSAL, StatsSanity and the scan column-stats cap.
 
     private const val CONTENT_KINDS = "('table_created','table_inserted_into','table_deleted_from')"
@@ -345,7 +346,15 @@ internal object HogliteCommit {
                     qname.substringBefore('.'),
                     qname.substringAfter('.'),
                 )
-                if (WARNED_BLIND_PARTITIONED.add("$catalog:$qname")) {
+                if (WARNED_BLIND_PARTITIONED.size >= MAX_WARNED_BLIND_PARTITIONED) {
+                    // CommitService's cap: said once, then never again.
+                    if (WARNED_BLIND_PARTITIONED_CAPPED.compareAndSet(false, true)) {
+                        log.warn {
+                            "blind-partitioned append warnings suppressed past " +
+                                "$MAX_WARNED_BLIND_PARTITIONED distinct tables"
+                        }
+                    }
+                } else if (WARNED_BLIND_PARTITIONED.add("$catalog:$qname")) {
                     log.warn {
                         "blind partitioned append to $catalog.$qname accepted: $BLIND_PARTITIONED_REFUSAL"
                     }
@@ -839,18 +848,7 @@ internal object HogliteCommit {
                     table.tableId,
                 )
             }
-            val bytes = append.files.sumOf { it.fileSizeBytes }
-            tx.add(
-                "INSERT INTO table_totals(table_id, record_count, file_count, file_size_bytes) VALUES (?, ?, ?, ?) " +
-                    "ON CONFLICT(table_id) DO UPDATE SET " +
-                    "record_count = table_totals.record_count + excluded.record_count, " +
-                    "file_count = table_totals.file_count + excluded.file_count, " +
-                    "file_size_bytes = table_totals.file_size_bytes + excluded.file_size_bytes",
-                table.tableId,
-                rows,
-                append.files.size.toLong(),
-                bytes,
-            )
+            addAppendTotals(tx, table.tableId, "${append.namespace}.${append.table}", rows, append.files)
         }
 
         // 6. Deletes: history-preserving epoch writes. The live-epoch
@@ -1481,6 +1479,45 @@ internal object HogliteCommit {
     }
 
     /**
+     * Add one appended table's totals to [tx]: a guard, then the upsert.
+     * The byte sum is checked like CommitService's byteSum, because a
+     * wrapped sum is a negative total and this schema has no CHECK.
+     * The guard keeps the running total an exact INTEGER: SQLite turns
+     * an overflowing `+` into a REAL. The row sum needs no check here;
+     * the planning loop checked it against the row-id allocator.
+     */
+    internal fun addAppendTotals(
+        tx: HogliteTx,
+        tableId: Long,
+        qualified: String,
+        rows: Long,
+        files: List<FileRegistration>,
+    ) {
+        val bytes =
+            try {
+                files.fold(0L) { acc, f -> Math.addExact(acc, f.fileSizeBytes) }
+            } catch (_: ArithmeticException) {
+                throw HoglakeException.Validation("file_size_bytes sum overflows for $qualified")
+            }
+        tx.expectZero(
+            "SELECT COUNT(*) FROM table_totals WHERE table_id = ? AND file_size_bytes > ?",
+            tableId,
+            Long.MAX_VALUE - bytes,
+        ) { HoglakeException.Validation("file_size_bytes total overflows for $qualified") }
+        tx.add(
+            "INSERT INTO table_totals(table_id, record_count, file_count, file_size_bytes) VALUES (?, ?, ?, ?) " +
+                "ON CONFLICT(table_id) DO UPDATE SET " +
+                "record_count = table_totals.record_count + excluded.record_count, " +
+                "file_count = table_totals.file_count + excluded.file_count, " +
+                "file_size_bytes = table_totals.file_size_bytes + excluded.file_size_bytes",
+            tableId,
+            rows,
+            files.size.toLong(),
+            bytes,
+        )
+    }
+
+    /**
      * The upload-claim decision (UploadService.claimsToSettle's logic,
      * against the tenant's uploads table): only paths WITH a claim row
      * are gated; each must be active, owned by this commit's owner, and
@@ -1573,4 +1610,8 @@ private val SCHEMA_CHANGED =
 private val RECEIPT_CHANGED = HoglakeException.CommitConflict("receipt changed during publication")
 
 // Blind-partitioned WARN dedupe, per (catalog, table), for the process's life.
+// Capped at CommitService's MAX_WARNED_BLIND_PARTITIONED: the keys are names.
 private val WARNED_BLIND_PARTITIONED = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+// Whether the cap's own line has been logged.
+private val WARNED_BLIND_PARTITIONED_CAPPED = java.util.concurrent.atomic.AtomicBoolean(false)

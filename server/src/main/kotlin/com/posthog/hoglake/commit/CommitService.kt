@@ -125,7 +125,7 @@ class CommitService(
          * table count; it is defence in depth, not the primary bound,
          * which is that the key holds nothing a client chooses.
          */
-        private const val MAX_WARNED_BLIND_PARTITIONED: Int = 512
+        internal const val MAX_WARNED_BLIND_PARTITIONED: Int = 512
 
         /** Which table(s) the blind-partitioned refusal is about. */
         internal fun blindPartitionedRefusal(qualified: List<String>): String =

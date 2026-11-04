@@ -487,19 +487,20 @@ class HogliteCatalogStore(
         return DroppedCatalog(catalog, info.dataPath)
     }
 
+    /**
+     * The catalog's footprint, with the StorageUsageRepo contract.
+     * Tracked bytes count EVERY file and DV row, ended rows included,
+     * because those objects stay in storage until expiry or retirement.
+     * Pending deletes count only removals that are not drained.
+     * Overflow is an error, not a wrapped total.
+     */
     fun storageUsage(catalog: String): StorageUsage =
         catalogOperation(catalog) {
             meta(catalog)
-            val row =
-                queryCatalog(
-                    catalog,
-                    "SELECT (SELECT COALESCE(SUM(file_size_bytes),0) FROM files WHERE end_snapshot IS NULL) + " +
-                        "(SELECT COALESCE(SUM(file_size_bytes),0) FROM dvs WHERE end_snapshot IS NULL), " +
-                        "(SELECT COUNT(*) FROM removals)",
-                ).firstRow()!!
+            val row = queryCatalog(catalog, STORAGE_USAGE_SQL).firstRow()!!
             return StorageUsage(
-                trackedBytes = row[0].asLong(),
-                pendingDeleteFiles = row[1].asLong(),
+                trackedBytes = Math.addExact(row[0].asLong(), row[1].asLong()),
+                pendingDeleteFiles = row[2].asLong(),
             )
         }
 
@@ -2294,6 +2295,12 @@ class HogliteCatalogStore(
         internal const val SCAN_MAX_METADATA_BYTES = 64L * 1024 * 1024
 
         private val CATALOG_NAME_REGEX = Regex(Identifiers.CATALOG_NAME_PATTERN)
+
+        /** [storageUsage]'s read: no live-row predicate on files or DVs. */
+        internal const val STORAGE_USAGE_SQL =
+            "SELECT (SELECT COALESCE(SUM(file_size_bytes),0) FROM files), " +
+                "(SELECT COALESCE(SUM(file_size_bytes),0) FROM dvs), " +
+                "(SELECT COUNT(*) FROM removals WHERE drained_at IS NULL)"
 
         /** Catalogs per `/v1/query-batch` request in [listCatalogs]. */
         const val LIST_BATCH_SIZE = 250

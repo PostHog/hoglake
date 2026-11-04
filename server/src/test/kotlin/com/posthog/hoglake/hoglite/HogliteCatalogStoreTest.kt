@@ -39,6 +39,9 @@ class HogliteCatalogStoreTest {
     /** A fence guard whose SQL contains this text counts this many rows (the catalog is not empty). */
     private var nonEmpty: Pair<String, Long>? = null
 
+    /** The storage-usage read's row: file bytes, DV bytes, undrained removals. */
+    private var usage: List<Long> = listOf(0, 0, 0)
+
     private val server: HttpServer =
         HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0).apply {
             createContext("/") { ex -> handle(ex) }
@@ -100,6 +103,7 @@ class HogliteCatalogStoreTest {
     ): Map<String, Any?> =
         when {
             sql.startsWith("SELECT name, data_path,") -> if (t.name == null) result() else result(metaRow(t))
+            sql == HogliteCatalogStore.STORAGE_USAGE_SQL -> result(usage)
             // The count a CatalogNotEmpty message reports.
             else -> result(listOf(nonEmpty?.second ?: 0))
         }
@@ -198,6 +202,29 @@ class HogliteCatalogStoreTest {
         val name = "0e9b1c52-7f3a-4d6e-9a41-2b8c5d7e1f60"
 
         assertThat(store.createCatalog(name, "s3://bucket/u", null, null).name).isEqualTo(name)
+    }
+
+    @Test
+    fun `storage usage counts every file and DV row and only undrained removals`() {
+        seed("t-wh-1", "wh")
+        usage = listOf(100, 20, 3)
+
+        val footprint = store.storageUsage("wh")
+
+        assertThat(footprint.trackedBytes).isEqualTo(120)
+        assertThat(footprint.pendingDeleteFiles).isEqualTo(3)
+        // StorageUsageRepo's contract: ended rows still occupy storage.
+        assertThat(HogliteCatalogStore.STORAGE_USAGE_SQL)
+            .doesNotContain("end_snapshot")
+            .contains("FROM removals WHERE drained_at IS NULL")
+    }
+
+    @Test
+    fun `storage usage refuses a byte total that overflows`() {
+        seed("t-wh-1", "wh")
+        usage = listOf(Long.MAX_VALUE, 1, 0)
+
+        assertThat(catchThrowable { store.storageUsage("wh") }).isInstanceOf(ArithmeticException::class.java)
     }
 
     @Test
