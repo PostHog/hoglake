@@ -248,6 +248,28 @@ class HogliteCatalogStoreTest {
     }
 
     @Test
+    fun `list skips a name the resolver does not know and keeps the other names`() {
+        seed("t-a-1", "a")
+        // A drop can remove "gone" from the mapping while a list is running.
+        val partial =
+            HogliteCatalogStore(client, { catalog ->
+                if (catalog == "gone") throw HoglakeException.NotFound("catalog '$catalog'")
+                "t-$catalog-1"
+            })
+
+        assertThat(partial.listCatalogs(listOf("gone", "a")).map { it.name }).containsExactly("a")
+    }
+
+    @Test
+    fun `list fails when the resolver fails for a reason other than NotFound`() {
+        val broken = HogliteCatalogStore(client, { throw IllegalStateException("routing is down") })
+
+        assertThat(catchThrowable { broken.listCatalogs(listOf("a")) })
+            .isInstanceOf(IllegalStateException::class.java)
+            .hasMessage("routing is down")
+    }
+
+    @Test
     fun `drop fences the catalog, then releases and deletes its tenant`() {
         seed("t-wh-1", "wh")
 

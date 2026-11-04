@@ -247,11 +247,21 @@ class HogliteCatalogStore(
      * same reads one by one, [LIST_FALLBACK_PARALLELISM] at a time.
      *
      * This class keeps no list of catalogs, so the caller names them.
-     * A name with no readable tenant, or whose tenant holds another
-     * catalog, is skipped.
+     * A name that [tenants] does not know (NotFound), with no readable
+     * tenant, or whose tenant holds another catalog, is skipped. A drop
+     * that runs during the list must not fail the list. Any other
+     * resolver failure fails the call.
      */
     fun listCatalogs(names: Collection<String>): List<CatalogInfo> {
-        val bound = names.distinct().map { it to tenants.tenantFor(it) }
+        val bound =
+            names.distinct().mapNotNull { name ->
+                try {
+                    name to tenants.tenantFor(name)
+                } catch (_: HoglakeException.NotFound) {
+                    log.warn { "catalog '$name' has no tenant; skipping" }
+                    null
+                }
+            }
         val metas = readMetas(bound)
         return bound.indices.mapNotNull { i ->
             val name = bound[i].first
@@ -1791,7 +1801,15 @@ class HogliteCatalogStore(
         return m.head
     }
 
-    /** Largest retained snapshot with snapshot_time <= [atTimestamp]; before the floor -> Expired. */
+    /**
+     * Largest retained snapshot with snapshot_time <= [atTimestamp]; before the floor -> Expired.
+     *
+     * ts never decreases as the id grows ([insertSnapshotRow]), so the newest
+     * id with ts <= T is the answer. ORDER BY id walks the primary key
+     * backwards and stops at the first match, as PostgreSQL's
+     * RESOLVE_SNAPSHOT_SQL does. ts has no index: ORDER BY ts sorts every
+     * retained snapshot.
+     */
     internal fun resolveTimestamp(
         catalog: String,
         m: MetaRow,
@@ -1799,7 +1817,7 @@ class HogliteCatalogStore(
     ): Long =
         queryCatalog(
             catalog,
-            "SELECT id FROM snapshots WHERE ts <= ? ORDER BY ts DESC, id DESC LIMIT 1",
+            "SELECT id FROM snapshots WHERE ts <= ? ORDER BY id DESC LIMIT 1",
             HogliteSchema.fmt(atTimestamp),
         ).firstRow()?.get(0)?.asLong()
             ?: throw HoglakeException.Expired(
@@ -1937,8 +1955,12 @@ class HogliteCatalogStore(
                 )
             }
 
+        // Group once, as TableRepo.assemble does. A filter per node is
+        // quadratic: 10,000 flat columns cost 100 million comparisons.
+        val byParent = rows.groupBy { it.parentFieldId }
+
         fun build(parent: Long?): List<Column> =
-            rows.filter { it.parentFieldId == parent }.sortedBy { it.ordinal }.map { r ->
+            byParent[parent].orEmpty().sortedBy { it.ordinal }.map { r ->
                 Column(
                     fieldId = r.fieldId,
                     ordinal = r.ordinal,
