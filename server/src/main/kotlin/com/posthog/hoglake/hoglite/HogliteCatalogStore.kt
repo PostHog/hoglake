@@ -43,6 +43,7 @@ import com.posthog.hoglake.service.CatalogService
 import com.posthog.hoglake.service.ColumnTrees
 import com.posthog.hoglake.service.Identifiers
 import com.posthog.hoglake.service.ScanService
+import com.posthog.hoglake.service.columnsByFieldId
 import com.posthog.hoglake.service.requireOperationMetadata
 import java.time.Instant
 import java.util.UUID
@@ -736,20 +737,30 @@ class HogliteCatalogStore(
             var fileCount: Long? = null
             var fileSizeBytes: Long? = null
             if (totals) {
-                if (headRead) {
-                    // Exact, maintained transactionally by every commit — the
-                    // hoglite backend has no sampler lag, so head totals are
-                    // not a sample and carry no freshness fields (null, per
-                    // the TableInfo KDoc: freshness fields are for samples).
-                    val row =
+                // Exact, maintained transactionally by every commit — the
+                // hoglite backend has no sampler lag, so head totals are
+                // not a sample and carry no freshness fields (null, per
+                // the TableInfo KDoc: freshness fields are for samples).
+                // So they must describe `at`. The head comes back in the
+                // SAME statement; if a write moved it since meta(), the
+                // totals are from a later snapshot and the read below
+                // aggregates the files visible at `at` instead.
+                val head =
+                    if (headRead) {
                         queryCatalog(
                             catalog,
-                            "SELECT record_count, file_count, file_size_bytes FROM table_totals WHERE table_id = ?",
+                            "SELECT tt.record_count, tt.file_count, tt.file_size_bytes, h.head " +
+                                "FROM (SELECT ${HogliteSchema.HEAD_SQL} AS head) h " +
+                                "LEFT JOIN table_totals tt ON tt.table_id = ?",
                             t.tableId,
-                        ).firstRow()
-                    recordCount = row?.get(0).asLongOrNull() ?: 0
-                    fileCount = row?.get(1).asLongOrNull() ?: 0
-                    fileSizeBytes = row?.get(2).asLongOrNull() ?: 0
+                        ).firstRow()!!.takeIf { it[3].asLong() == at }
+                    } else {
+                        null
+                    }
+                if (head != null) {
+                    recordCount = head[0].asLongOrNull() ?: 0
+                    fileCount = head[1].asLongOrNull() ?: 0
+                    fileSizeBytes = head[2].asLongOrNull() ?: 0
                 } else {
                     val row =
                         queryCatalog(
@@ -826,37 +837,42 @@ class HogliteCatalogStore(
             val visible =
                 "FROM files f WHERE f.table_id = t.id AND f.begin_snapshot <= ? " +
                     "AND (f.end_snapshot IS NULL OR f.end_snapshot > ?)"
-            val totalsSql =
-                if (headRead) {
-                    "COALESCE(tt.record_count,0), COALESCE(tt.file_count,0), COALESCE(tt.file_size_bytes,0)"
-                } else {
-                    "(SELECT COALESCE(SUM(f.record_count),0) $visible), (SELECT COUNT(*) $visible), " +
-                        "(SELECT COALESCE(SUM(f.file_size_bytes),0) $visible)"
-                }
-            val totalsArgs: Array<Any?> = if (headRead) emptyArray() else arrayOf(at, at, at, at, at, at)
-            // snapshotCount/earliestSnapshotId count RETAINED change rows, so
-            // the window opens at the expiry floor — read from meta so the
-            // day expiry lands the read is already right.
-            // Object ids overlap across tables, namespaces, and views.
-            val tableKinds = ChangeKind.TABLE_SCOPED.map { it.wire }.toTypedArray()
-            val kindParams = tableKinds.joinToString(",") { "?" }
-            val rows =
-                queryCatalog(
+
+            // A head listing returns the head in the SAME statement. If a
+            // write moved it since meta(), table_totals is from a later
+            // snapshot, and the listing runs again with totals at `at`.
+            fun listing(headTotals: Boolean): HogliteQueryResult {
+                val totalsSql =
+                    if (headTotals) {
+                        "COALESCE(tt.record_count,0), COALESCE(tt.file_count,0), COALESCE(tt.file_size_bytes,0)"
+                    } else {
+                        "(SELECT COALESCE(SUM(f.record_count),0) $visible), (SELECT COUNT(*) $visible), " +
+                            "(SELECT COALESCE(SUM(f.file_size_bytes),0) $visible)"
+                    }
+                val totalsArgs: Array<Any?> = if (headTotals) emptyArray() else arrayOf(at, at, at, at, at, at)
+                // snapshotCount/earliestSnapshotId count RETAINED change rows, so
+                // the window opens at the expiry floor — read from meta so the
+                // day expiry lands the read is already right.
+                // Object ids overlap across tables, namespaces, and views.
+                val tableKinds = ChangeKind.TABLE_SCOPED.map { it.wire }.toTypedArray()
+                val kindParams = tableKinds.joinToString(",") { "?" }
+                return queryCatalog(
                     catalog,
                     """SELECT t.id, t.table_uuid, v.name, v.comment, $totalsSql,
-                          (SELECT COUNT(DISTINCT c.snapshot_id) FROM changes c
-                            WHERE c.object_id = t.id AND c.kind IN ($kindParams)
-                              AND c.snapshot_id >= ? AND c.snapshot_id <= ?),
-                          (SELECT MIN(c.snapshot_id) FROM changes c
-                            WHERE c.object_id = t.id AND c.kind IN ($kindParams)
-                              AND c.snapshot_id >= ? AND c.snapshot_id <= ?)
-                     FROM tables t
-                     JOIN table_versions v ON v.table_id = t.id
-                      AND v.begin_snapshot <= ? AND (v.end_snapshot IS NULL OR v.end_snapshot > ?)
-                     LEFT JOIN table_totals tt ON tt.table_id = t.id
-                    WHERE v.namespace_id = ?
-                      AND t.created_snapshot <= ? AND (t.dropped_snapshot IS NULL OR t.dropped_snapshot > ?)
-                    ORDER BY v.name""",
+                              (SELECT COUNT(DISTINCT c.snapshot_id) FROM changes c
+                                WHERE c.object_id = t.id AND c.kind IN ($kindParams)
+                                  AND c.snapshot_id >= ? AND c.snapshot_id <= ?),
+                              (SELECT MIN(c.snapshot_id) FROM changes c
+                                WHERE c.object_id = t.id AND c.kind IN ($kindParams)
+                                  AND c.snapshot_id >= ? AND c.snapshot_id <= ?),
+                              ${HogliteSchema.HEAD_SQL}
+                         FROM tables t
+                         JOIN table_versions v ON v.table_id = t.id
+                          AND v.begin_snapshot <= ? AND (v.end_snapshot IS NULL OR v.end_snapshot > ?)
+                         LEFT JOIN table_totals tt ON tt.table_id = t.id
+                        WHERE v.namespace_id = ?
+                          AND t.created_snapshot <= ? AND (t.dropped_snapshot IS NULL OR t.dropped_snapshot > ?)
+                        ORDER BY v.name""",
                     *totalsArgs,
                     *tableKinds,
                     m.earliestSnapshotId,
@@ -870,6 +886,11 @@ class HogliteCatalogStore(
                     at,
                     at,
                 )
+            }
+            val headListing = listing(headTotals = headRead)
+            // Column 9 is the head the statement saw.
+            val headMoved = headRead && headListing.rows.any { it[9].asLong() != at }
+            val rows = if (headMoved) listing(headTotals = false) else headListing
             return rows.rows.map { r ->
                 TableSummaryInfo(
                     tableId = r[0].asLong(),
@@ -1156,7 +1177,7 @@ class HogliteCatalogStore(
             return FileStats(
                 dataFileId = file.file.dataFileId,
                 statsState = file.file.statsState,
-                columns = resolveStoredStats(file, columns, null),
+                columns = resolveStoredStats(file.statsJson, columnsByFieldId(columns), null),
             )
         }
 
@@ -1459,6 +1480,7 @@ class HogliteCatalogStore(
                 val leafIds = leaves.map { it.fieldId }.toSet()
                 com.posthog.hoglake.service.enforceScanColumnStatsEntryCap(providedFiles, leafIds, columnStats)
                 val wanted = columnStats.fieldIds?.intersect(leafIds) ?: leafIds
+                val byId = columnsByFieldId(columns)
                 files =
                     files.map { (sf, fr) ->
                         // Eligibility is the state captured with the selected file,
@@ -1467,9 +1489,8 @@ class HogliteCatalogStore(
                         if (sf.dataFile.statsState != StatsState.PROVIDED) {
                             sf to fr
                         } else {
-                            sf.copy(
-                                dataFile = sf.dataFile.copy(columnStats = resolveStoredStats(fr, columns, wanted)),
-                            ) to fr
+                            val stats = resolveStoredStats(fr.statsJson, byId, wanted)
+                            sf.copy(dataFile = sf.dataFile.copy(columnStats = stats)) to fr
                         }
                     }
             }
@@ -2039,31 +2060,23 @@ class HogliteCatalogStore(
     internal fun toDataFile(r: List<Any?>): DataFile = toFileRow(r).file
 
     /**
-     * A file's stored stats rows resolved against the columns visible at
-     * the read snapshot — one [FileColumnStats] per stored row whose
-     * field id is a visible LEAF (and in [wanted], when given); a row
+     * A file's stored stats rows ([statsJson]) resolved against the columns
+     * visible at the read snapshot — one [FileColumnStats] per stored row
+     * whose field id is a visible LEAF (and in [wanted], when given); a row
      * whose field id is not visible (a dropped column) is omitted.
+     *
+     * [byId] is [columnsByFieldId] of those columns. The caller builds it
+     * ONCE per read, as ScanService does, not once per file.
      */
     internal fun resolveStoredStats(
-        file: FileRow,
-        columns: List<Column>,
+        statsJson: String?,
+        byId: Map<Long, Pair<String, Column>>,
         wanted: Set<Long>?,
     ): List<FileColumnStats> {
-        val stored = file.statsJson?.let { json.readValue<List<ColumnStats>>(it) } ?: return emptyList()
-        val byId = mutableMapOf<Long, Pair<Column, String>>()
-
-        fun walk(
-            col: Column,
-            path: String,
-        ) {
-            val here = if (path.isEmpty()) col.def.name else "$path.${col.def.name}"
-            byId[col.fieldId] = col to here
-            col.children.forEach { walk(it, here) }
-        }
-        columns.forEach { walk(it, "") }
+        val stored = statsJson?.let { json.readValue<List<ColumnStats>>(it) } ?: return emptyList()
         return stored.mapNotNull { stat ->
             if (wanted != null && stat.fieldId !in wanted) return@mapNotNull null
-            val (col, path) = byId[stat.fieldId] ?: return@mapNotNull null
+            val (path, col) = byId[stat.fieldId] ?: return@mapNotNull null
             if (col.def.type == ColType.VARIANT || col.def.type.isNested) return@mapNotNull null
             FileColumnStats(
                 fieldId = stat.fieldId,
@@ -2102,11 +2115,12 @@ class HogliteCatalogStore(
             }
         }
         val leadingFieldId = sort.fields.first().sourceFieldId
-        val columns = columnsAt(catalog, tableId, at)
+        val byId = columnsByFieldId(columnsAt(catalog, tableId, at))
+        val wanted = setOf(leadingFieldId)
         return page.map { fr ->
             // A file with no stored stats for the sort key carries no
             // bound — null is "unknown", not a computed lie.
-            val bound = resolveStoredStats(fr, columns, setOf(leadingFieldId)).firstOrNull()
+            val bound = resolveStoredStats(fr.statsJson, byId, wanted).firstOrNull()
             fr.file.copy(orderingBounds = bound?.let { FileOrderingBounds.SortKey(it) })
         }
     }

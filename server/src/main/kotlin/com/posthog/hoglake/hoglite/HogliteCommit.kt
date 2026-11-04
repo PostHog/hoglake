@@ -842,12 +842,6 @@ internal object HogliteCommit {
         for (append in appends) {
             val table = resolved.getValue("${append.namespace}.${append.table}")
             val rows = append.files.sumOf { it.recordCount }
-            if (rows > 0) {
-                tx.add(
-                    "UPDATE tables SET next_row_id = next_row_id + $rows WHERE id = ?",
-                    table.tableId,
-                )
-            }
             addAppendTotals(tx, table.tableId, "${append.namespace}.${append.table}", rows, append.files)
         }
 
@@ -1479,12 +1473,18 @@ internal object HogliteCommit {
     }
 
     /**
-     * Add one appended table's totals to [tx]: a guard, then the upsert.
+     * Add one appended table's row-id advance and totals to [tx].
+     *
+     * The planning loop checks [rows] against the allocator it READ, but a
+     * concurrent blind append can move next_row_id before this transaction
+     * runs. So a guard checks the allocator value inside the transaction,
+     * before the advance. The guard refuses the whole transaction, so the
+     * file rows whose row_id_start reads the allocator roll back too.
+     *
      * The byte sum is checked like CommitService's byteSum, because a
      * wrapped sum is a negative total and this schema has no CHECK.
-     * The guard keeps the running total an exact INTEGER: SQLite turns
-     * an overflowing `+` into a REAL. The row sum needs no check here;
-     * the planning loop checked it against the row-id allocator.
+     * Both guards keep a running value an exact INTEGER: SQLite turns an
+     * overflowing `+` into a REAL.
      */
     internal fun addAppendTotals(
         tx: HogliteTx,
@@ -1499,6 +1499,14 @@ internal object HogliteCommit {
             } catch (_: ArithmeticException) {
                 throw HoglakeException.Validation("file_size_bytes sum overflows for $qualified")
             }
+        if (rows > 0) {
+            tx.expectZero(
+                "SELECT COUNT(*) FROM tables WHERE id = ? AND next_row_id > ?",
+                tableId,
+                Long.MAX_VALUE - rows,
+            ) { HoglakeException.Validation("row id overflow appending to $qualified") }
+            tx.add("UPDATE tables SET next_row_id = next_row_id + $rows WHERE id = ?", tableId)
+        }
         tx.expectZero(
             "SELECT COUNT(*) FROM table_totals WHERE table_id = ? AND file_size_bytes > ?",
             tableId,
