@@ -8,6 +8,7 @@ import com.posthog.hoglake.auth.hoglakeAuth
 import com.posthog.hoglake.auth.resolveActor
 import com.posthog.hoglake.commit.CommitService
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.NamespaceContainment
 import com.posthog.hoglake.observability.CatalogTotals
 import com.posthog.hoglake.observability.InstanceTotals
 import com.posthog.hoglake.observability.instanceTotalsFor
@@ -178,6 +179,31 @@ fun Application.installApiRoutes(
                                 call.longQuery("expected_namespace_id"),
                                 call.actorOrRefuse(call.request.queryParameters["author"]),
                                 call.request.queryParameters["message"],
+                                // Auth off, or an operator: a contained
+                                // namespace may be dropped. A tenant may not.
+                                mayDropContained = call.hoglakeAuth.callerOrNull?.kind?.isOperator() ?: true,
+                            ).toDto(),
+                        )
+                    }
+                    // Containment (V33): operator-only in AuthPolicy.
+                    put("/{namespace}/containment") {
+                        val req = call.receive<NamespaceContainmentDto>()
+                        call.respond(
+                            catalogs.setNamespaceContainment(
+                                call.catalog(),
+                                call.namespace(),
+                                NamespaceContainment(req.field, req.value),
+                                call.actorOrRefuse(null),
+                            ).toDto(),
+                        )
+                    }
+                    delete("/{namespace}/containment") {
+                        call.respond(
+                            catalogs.setNamespaceContainment(
+                                call.catalog(),
+                                call.namespace(),
+                                null,
+                                call.actorOrRefuse(null),
                             ).toDto(),
                         )
                     }

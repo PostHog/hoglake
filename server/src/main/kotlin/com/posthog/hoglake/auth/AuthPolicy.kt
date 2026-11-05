@@ -163,6 +163,11 @@ object AuthPolicy {
             Entry(HttpMethod.Post, "/v1/catalogs/$CATALOG/namespaces", Requirement.WRITE),
             Entry(HttpMethod.Get, "/v1/catalogs/$CATALOG/namespaces/{namespace}", Requirement.READ),
             Entry(HttpMethod.Delete, "/v1/catalogs/$CATALOG/namespaces/{namespace}", Requirement.WRITE),
+            // OPERATOR: containment is what a scoped token's team namespaces
+            // rest on, so a tenant may not mark, move or clear it. The drop
+            // of a contained namespace is refused to a tenant in the service.
+            Entry(HttpMethod.Put, "/v1/catalogs/$CATALOG/namespaces/{namespace}/containment", Requirement.OPERATOR),
+            Entry(HttpMethod.Delete, "/v1/catalogs/$CATALOG/namespaces/{namespace}/containment", Requirement.OPERATOR),
             // ---- tables ---------------------------------------------------
             Entry(HttpMethod.Get, "/v1/catalogs/$CATALOG/namespaces/{namespace}/tables", Requirement.READ),
             Entry(HttpMethod.Post, "/v1/catalogs/$CATALOG/namespaces/{namespace}/tables", Requirement.WRITE),

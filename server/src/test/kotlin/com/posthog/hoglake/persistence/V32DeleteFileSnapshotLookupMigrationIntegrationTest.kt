@@ -19,7 +19,13 @@ import java.util.concurrent.TimeUnit
 @Tag("integration")
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class V32DeleteFileSnapshotLookupMigrationIntegrationTest {
-    private val db = PgTestSupport.freshDatabaseAt("31", productionSession = true)
+    // The fixtures below read namespaces, which needs V33's containment
+    // columns, so its file is applied out of order (idempotent; the
+    // migrate in seedThenMigrate re-applies it).
+    private val db =
+        PgTestSupport.freshDatabaseAt("31", productionSession = true).also {
+            PgTestSupport.applyMigrationFile(it, "V33__namespace_containment.sql")
+        }
     private val f = PartitionLookupFixture(db)
     private val neighbour = PartitionLookupFixture(db)
     private val tuple = listOf("a", "b")
@@ -164,7 +170,14 @@ class V32DeleteFileSnapshotLookupMigrationIntegrationTest {
         db.jdbi.useHandleUnchecked { h ->
             h.execute("CREATE INDEX hog_delete_file_data_lookup ON hog_delete_file (catalog_id, data_file_id)")
             h.execute("UPDATE pg_index SET indisvalid = false WHERE indexrelid = '$index'::regclass")
-            h.execute("DELETE FROM flyway_schema_history WHERE version = '32'")
+            // A failed V32 records nothing, and nothing after it ran either:
+            // drop its row and every later one (each later file is idempotent).
+            h.execute(
+                """
+                DELETE FROM flyway_schema_history WHERE installed_rank >=
+                    (SELECT installed_rank FROM flyway_schema_history WHERE version = '32')
+                """,
+            )
         }
         Database.migrate(db.dataSource)
         db.jdbi.useHandleUnchecked { h ->

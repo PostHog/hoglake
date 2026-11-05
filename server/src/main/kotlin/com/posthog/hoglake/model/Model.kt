@@ -764,6 +764,19 @@ enum class CatalogNotEmptyReason(val wire: String) {
 data class NamespaceInfo(
     val namespaceId: Long,
     val name: String,
+    /** Set when the namespace is contained (V33); null otherwise. */
+    val containment: NamespaceContainment? = null,
+)
+
+/**
+ * A namespace marked contained for `field = value`: its tables register
+ * files only under `<data_path>/data/<namespace>/`, and no other table
+ * registers files there. What a `ten: scoped` caller holding `value` for
+ * `field` is given; operator-managed.
+ */
+data class NamespaceContainment(
+    val field: String,
+    val value: Long,
 )
 
 /**
@@ -2757,4 +2770,22 @@ sealed class HoglakeException(message: String) : RuntimeException(message) {
         /** Qualified `namespace.table`. */
         val table: String,
     ) : HoglakeException(detail)
+
+    /**
+     * A registered path that namespace containment (V33) does not admit:
+     * a contained namespace's table writing outside its prefix, or any
+     * other table writing inside one. 422 `containment_violation`.
+     */
+    class ContainmentViolation(
+        detail: String,
+        /** Qualified `namespace.table`. */
+        val table: String,
+    ) : HoglakeException(detail)
+
+    /**
+     * Marking a namespace contained could not prove, within its time
+     * bound, that no other table's file lives under the prefix. 503
+     * `containment_unverified`: the namespace is left unmarked.
+     */
+    class ContainmentUnverified(detail: String) : HoglakeException(detail)
 }

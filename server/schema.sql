@@ -111,10 +111,23 @@ CREATE TABLE hog_namespace (
     -- empirically). The commit-time check sees the settled state.
     dropped      boolean NOT NULL DEFAULT false,
     created_at   timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (catalog_id, namespace_id)
+    -- V33: containment. Marked contained for `field = value`: its tables
+    -- register files only under `<data_path>/data/<name>/`, and no other
+    -- table registers files there. Both or neither; operator-only.
+    contained_field text,
+    contained_value bigint,
+    PRIMARY KEY (catalog_id, namespace_id),
+    CONSTRAINT hog_namespace_containment_shape CHECK (
+        (contained_field IS NULL AND contained_value IS NULL)
+        OR (contained_field ~ '^[a-z][a-z0-9_]{0,62}$' AND contained_value > 0)
+    )
 );
 CREATE UNIQUE INDEX hog_namespace_live_name
     ON hog_namespace (catalog_id, name) WHERE NOT dropped;
+-- V33: one live contained namespace per (catalog, field, value).
+CREATE UNIQUE INDEX hog_namespace_live_containment
+    ON hog_namespace (catalog_id, contained_field, contained_value)
+    WHERE NOT dropped AND contained_field IS NOT NULL;
 
 -- Immutable table identity. table_uuid is the contract consumers key
 -- cursors to: it survives rename, changes on drop+recreate.

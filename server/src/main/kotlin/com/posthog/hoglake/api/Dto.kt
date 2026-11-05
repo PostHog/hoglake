@@ -184,9 +184,17 @@ data class OperationMetadataDto(
 
 // ---- namespaces ----------------------------------------------------------
 
-data class NamespaceDto(val name: String, val namespaceId: Long)
+data class NamespaceDto(
+    val name: String,
+    val namespaceId: Long,
+    /** Present when the namespace is contained (V33). */
+    val containment: NamespaceContainmentDto? = null,
+)
 
-fun NamespaceInfo.toDto() = NamespaceDto(name, namespaceId)
+data class NamespaceContainmentDto(val field: String, val value: Long)
+
+fun NamespaceInfo.toDto() =
+    NamespaceDto(name, namespaceId, containment?.let { NamespaceContainmentDto(it.field, it.value) })
 
 data class CreateNamespaceRequestDto(
     val name: String,

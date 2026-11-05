@@ -294,6 +294,19 @@ internal object CommitTail {
              WHERE catalog_id = :catalogId AND data_file_id = ANY(CAST(:targetIds AS bigint[]))
                AND end_snapshot IS NULL
                AND NOT EXISTS (SELECT 1 FROM receipt)
+        ),
+        -- V33: which of the named namespaces are contained. One probe of
+        -- hog_namespace_live_name per distinct name (a commit names its
+        -- target namespaces and the `data/<segment>/` of its paths, so
+        -- usually one or two), read under the commit lock that marking
+        -- also takes.
+        contained AS (
+            SELECT n.name
+              FROM hog_namespace n
+             WHERE n.catalog_id = :catalogId AND NOT n.dropped
+               AND n.name = ANY(CAST(:containmentNames AS text[]))
+               AND n.contained_field IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM receipt)
         )
         SELECT h.last_snapshot_id, h.schema_version, h.earliest_snapshot_id, h.earliest_snapshot_time,
                h.next_file_id,
@@ -306,7 +319,8 @@ internal object CommitTail {
                (SELECT json_agg(rt) FROM retained rt) AS retained,
                (SELECT json_agg(q.path) FROM queued q) AS queued,
                (SELECT json_agg(t) FROM targets t) AS targets,
-               (SELECT json_agg(d) FROM live_dvs d) AS live_dvs
+               (SELECT json_agg(d) FROM live_dvs d) AS live_dvs,
+               (SELECT json_agg(c.name) FROM contained c) AS contained
           FROM head h
           LEFT JOIN receipt rc ON true
         """
@@ -510,6 +524,12 @@ internal object CommitTail {
         val paths: List<String>,
         /** The DV registrations' numeric targets (a transaction's staged targets are not read). */
         val targetIds: List<Long>,
+        /**
+         * Namespace names whose containment the commit must know: every
+         * target table's namespace and every `data/<segment>/` a registered
+         * path names (see [com.posthog.hoglake.model.Containment.segments]).
+         */
+        val containmentNames: List<String> = emptyList(),
     )
 
     /** hog_catalog's head-of-line state. */
@@ -588,6 +608,8 @@ internal object CommitTail {
         val queued: List<String>,
         val targets: Map<Long, Target>,
         val liveDvs: Map<Long, LiveDv>,
+        /** Which of [ReadInputs.containmentNames] are live contained namespaces. */
+        val contained: Set<String> = emptySet(),
     )
 
     /**
@@ -609,6 +631,7 @@ internal object CommitTail {
             .bind("readSnapshot", inputs.readSnapshot)
             .bindArray("paths", String::class.java, inputs.paths)
             .bindArray("targetIds", LONG, inputs.targetIds)
+            .bindArray("containmentNames", String::class.java, inputs.containmentNames.distinct())
 
     fun read(
         h: Handle,
@@ -659,6 +682,7 @@ internal object CommitTail {
                                 }
                             }
                         },
+                    contained = section<String>(rs.getString("contained")).toSet(),
                 )
             }
             .findOne()

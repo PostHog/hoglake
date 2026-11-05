@@ -250,3 +250,61 @@ object ObjectPrefix {
         return if (matches) Verdict.OK else Verdict.BOUND_MISMATCH
     }
 }
+
+/**
+ * Namespace containment (V33): which `data/<segment>/` a path names, and
+ * whether a table may register it.
+ *
+ * A contained namespace `n` owns `<data_path>/data/n/`: its tables register
+ * files only there, and no other table registers files there. The segment
+ * is compared RAW for the table's own namespace and DECODED as well for
+ * everyone else's, because a reader that percent-decodes a URI would
+ * resolve `data/team%5F42/x` to `data/team_42/x`. A contained table's
+ * files must name its namespace literally.
+ */
+object Containment {
+    /** The raw `data/<segment>` of [path] under [dataPath], or null when the path is not under `data/`. */
+    fun rawSegment(
+        dataPath: String,
+        path: String,
+    ): String? {
+        val root = dataPath.trimEnd('/') + "/data/"
+        if (!path.startsWith(root)) return null
+        val rest = path.substring(root.length)
+        val end = rest.indexOf('/')
+        return if (end <= 0) null else rest.substring(0, end)
+    }
+
+    /** Every name [path]'s segment can reach: the raw segment, and its percent-decoding when that differs. */
+    fun segments(
+        dataPath: String,
+        path: String,
+    ): Set<String> {
+        val raw = rawSegment(dataPath, path) ?: return emptySet()
+        if ('%' !in raw) return setOf(raw)
+        val decoded = runCatching { java.net.URLDecoder.decode(raw.replace("+", "%2B"), Charsets.UTF_8) }.getOrNull()
+        return setOfNotNull(raw, decoded)
+    }
+
+    /**
+     * Why [path] may not be registered for a table in [namespace], or null
+     * when it may. [contained] holds the live contained namespaces among
+     * every name the commit asked about.
+     */
+    fun violation(
+        dataPath: String,
+        namespace: String,
+        path: String,
+        contained: Set<String>,
+    ): String? {
+        if (namespace in contained && rawSegment(dataPath, path) != namespace) {
+            return "namespace '$namespace' is contained: its files must live under " +
+                "${dataPath.trimEnd('/')}/data/$namespace/"
+        }
+        val foreign = segments(dataPath, path).firstOrNull { it in contained && it != namespace }
+        if (foreign != null) {
+            return "${dataPath.trimEnd('/')}/data/$foreign/ belongs to contained namespace '$foreign'"
+        }
+        return null
+    }
+}

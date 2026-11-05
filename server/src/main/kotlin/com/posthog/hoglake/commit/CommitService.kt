@@ -4,6 +4,7 @@ import com.fasterxml.jackson.module.kotlin.readValue
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.CommitRequest
 import com.posthog.hoglake.model.CommitResult
+import com.posthog.hoglake.model.Containment
 import com.posthog.hoglake.model.DeleteFileRegistration
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.HoglakeException
@@ -326,6 +327,10 @@ class CommitService(
     ) {
         val request = CommitRequest(appends = listOf(TableAppend(namespace, table, files)))
         validatePathsUnderDataPath(dataPath, request)
+        // Containment (V33). Its own statement: table creation does not run
+        // the commit's READ_SQL. The caller holds the catalog lock.
+        val names = containmentNames(dataPath, listOf(namespace), files.map { it.path })
+        checkContainment(dataPath, namespace, table, files.map { it.path }, containedAmong(h, catalogId, names))
         // No object-prefix layout, and none to read: the table was created
         // in THIS transaction, a creation definition cannot carry the
         // option, and replacing a table that has it is refused at prepare
@@ -557,6 +562,13 @@ class CommitService(
                         mergedDeletes.values.flatMap { files ->
                             files.filter { it.dataFilePath == null }.map { it.dataFileId }
                         }.distinct(),
+                    containmentNames =
+                        containmentNames(
+                            dataPath,
+                            tableKeys.map { it.namespace },
+                            mergedAppends.values.flatMap { files -> files.map { it.path } } +
+                                mergedDeletes.values.flatMap { files -> files.map { it.path } },
+                        ),
                 ),
             )
 
@@ -797,6 +809,17 @@ class CommitService(
         // the table's layout. A table without the option skips it whole.
         // Its DVs are checked in planDeletes, after their conflicts.
         validatedAppends.forEach { checkObjectPrefix(it, dataPath) }
+        // 4a'. Namespace containment (V33), on every registered path, data
+        // and DV: the containment of each name was read in the one
+        // statement above, under the lock marking also takes.
+        resolvedAppends.forEach {
+                a ->
+            checkContainment(dataPath, a.namespace, a.table, a.files.map { it.path }, read.contained)
+        }
+        resolvedDeletes.forEach {
+                d ->
+            checkContainment(dataPath, d.namespace, d.table, d.files.map { it.path }, read.contained)
+        }
 
         // 4b. Upload claims, then the removal-queue collision check, and
         // THE LATTER IS THE SERIALIZER NOW RATHER THAN THE COMMIT LOCK:
@@ -980,6 +1003,56 @@ class CommitService(
             throw HoglakeException.Validation("idempotency_key reused with a different request")
         }
         return CommitResult(receipt.snapshotId, receipt.schemaVersion)
+    }
+
+    /** The namespace names a commit must know the containment of: its targets' and its paths' segments. */
+    private fun containmentNames(
+        dataPath: String,
+        namespaces: List<String>,
+        paths: List<String>,
+    ): List<String> = (namespaces + paths.flatMap { Containment.segments(dataPath, it) }).distinct()
+
+    /** Which of [names] are live contained namespaces; READ_SQL's `contained` CTE, alone. */
+    private fun containedAmong(
+        h: Handle,
+        catalogId: Long,
+        names: List<String>,
+    ): Set<String> =
+        h.createQuery(
+            """
+            SELECT name FROM hog_namespace
+             WHERE catalog_id = :catalogId AND NOT dropped AND contained_field IS NOT NULL
+               AND name = ANY(CAST(:names AS text[]))
+            """,
+        ).bind("catalogId", catalogId).bindArray("names", String::class.java, names)
+            .mapTo(String::class.java).set()
+
+    /**
+     * Refuse any of [paths] that containment (V33) does not admit for a
+     * table in [namespace]: see [Containment.violation]. No contained
+     * namespace among the names read, which is every catalog until an
+     * operator marks one, refuses nothing.
+     */
+    private fun checkContainment(
+        dataPath: String,
+        namespace: String,
+        table: String,
+        paths: List<String>,
+        contained: Set<String>,
+    ) {
+        if (contained.isEmpty()) return
+        val refused =
+            paths.mapNotNull {
+                    p ->
+                Containment.violation(dataPath, namespace, p, contained)?.let { p to it }
+            }
+        if (refused.isEmpty()) return
+        val (first, why) = refused.first()
+        throw HoglakeException.ContainmentViolation(
+            "$why; refused $namespace.$table path '$first'" +
+                (if (refused.size > 1) " (+${refused.size - 1} more)" else ""),
+            "$namespace.$table",
+        )
     }
 
     /**

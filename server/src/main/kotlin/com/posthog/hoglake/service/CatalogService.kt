@@ -12,6 +12,7 @@ import com.posthog.hoglake.model.FileColumnStats
 import com.posthog.hoglake.model.FileOrderingBounds
 import com.posthog.hoglake.model.FileStats
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.NamespaceContainment
 import com.posthog.hoglake.model.NamespaceInfo
 import com.posthog.hoglake.model.PartitionFieldDef
 import com.posthog.hoglake.model.PartitionFieldValues
@@ -63,6 +64,10 @@ import java.util.UUID
  */
 class CatalogService(private val jdbi: Jdbi) {
     companion object {
+        /** The prefix scan's bound when marking a namespace contained; see setNamespaceContainment. */
+        const val CONTAINMENT_SCAN_TIMEOUT_MS = 10_000L
+        private val CONTAINMENT_FIELD = Regex("^[a-z][a-z0-9_]{0,62}$")
+
         /**
          * Ceiling on a catalog's `data_path`.
          *
@@ -399,6 +404,176 @@ class CatalogService(private val jdbi: Jdbi) {
 
     // ---- namespaces ------------------------------------------------------
 
+    /**
+     * Mark [namespace] contained for `field = value` (V33), or clear it
+     * with a null [containment]. Operator-only (the route says so).
+     *
+     * Marking requires:
+     * - the namespace never to have held a table or a view, so every file
+     *   any of its tables registers from now on is checked;
+     * - no other table's file, DV or live upload claim to sit under
+     *   `<data_path>/data/<namespace>/` (or a percent-escaped spelling of
+     *   it), so the prefix is the namespace's alone;
+     * - no other live namespace to hold the same `field = value`.
+     *
+     * Marking the same containment again is a no-op; changing it means
+     * clearing first. Clearing requires no live table or view.
+     *
+     * SCALE. The prefix check reads the catalog's file rows, so it runs
+     * BEFORE the commit lock, bounded by [CONTAINMENT_SCAN_TIMEOUT_MS]; a
+     * timeout refuses the mark (503 `containment_unverified`) rather than
+     * marking unverified. It is an index-only walk of
+     * `hog_data_file_path`/`hog_delete_file_path` over the catalog's
+     * entries (`starts_with` cannot range-scan a non-C collation), so it
+     * is O(files of the catalog), meant for the org catalogs team
+     * namespaces live in. Under the lock it re-reads only rows allocated
+     * since the scan began: a `data_file_id`/`delete_file_id` range from
+     * the `next_file_id` read before it, by primary key.
+     */
+    fun setNamespaceContainment(
+        catalog: String,
+        namespace: String,
+        containment: NamespaceContainment?,
+        author: String? = null,
+    ): NamespaceInfo =
+        Audit.audited(
+            if (containment == null) "namespace_containment_clear" else "namespace_containment_set",
+            catalog,
+            namespace,
+            detail = { "containment=${containment?.let { "${it.field}=${it.value}" }}" },
+            actor = { author },
+        ) {
+            containment?.let {
+                if (!CONTAINMENT_FIELD.matches(it.field)) {
+                    throw HoglakeException.Validation("containment field must match ${CONTAINMENT_FIELD.pattern}")
+                }
+                if (it.value <= 0) throw HoglakeException.Validation("containment value must be a positive id")
+            }
+            val (cat, scannedFrom) =
+                jdbi.inTransactionUnchecked { h ->
+                    val cat = requireCatalog(h, catalog)
+                    val ns = requireNamespace(h, cat, namespace)
+                    val from =
+                        h.createQuery("SELECT next_file_id FROM hog_catalog WHERE catalog_id = :c")
+                            .bind("c", cat.catalogId).mapTo(Long::class.java).one()
+                    // The cheap refusals first, so a namespace that holds
+                    // tables is told so rather than that its own files sit
+                    // under its prefix. Repeated under the lock below.
+                    if (containment != null && ns.containment == null) {
+                        requireNeverHeld(h, cat.catalogId, ns)
+                        foreignFileUnderPrefix(h, cat.catalogId, cat.dataPath, namespace, null)?.let {
+                            throw prefixTaken(namespace, it)
+                        }
+                    }
+                    cat to from
+                }
+            jdbi.inTransactionUnchecked { h ->
+                Locks.acquireCatalogCommitLock(h, cat.catalogId, cat.name, CommitLockPath.DDL)
+                val ns = requireNamespace(h, cat, namespace)
+                if (ns.containment == containment) return@inTransactionUnchecked ns
+                if (containment != null) {
+                    if (ns.containment != null) {
+                        throw HoglakeException.CommitConflict(
+                            "namespace '$namespace' is already contained for " +
+                                "${ns.containment.field} = ${ns.containment.value}; clear it first",
+                        )
+                    }
+                    requireNeverHeld(h, cat.catalogId, ns)
+                    foreignFileUnderPrefix(h, cat.catalogId, cat.dataPath, namespace, scannedFrom)?.let {
+                        throw prefixTaken(namespace, it)
+                    }
+                } else {
+                    if (TableRepo.listLive(h, cat.catalogId, ns.namespaceId).isNotEmpty() ||
+                        ViewRepo.listLive(h, cat.catalogId, ns.namespaceId, ns.name).isNotEmpty()
+                    ) {
+                        throw HoglakeException.NamespaceNotEmpty(
+                            "namespace '$namespace' still holds tables or views; containment can only be " +
+                                "cleared from an empty namespace",
+                        )
+                    }
+                }
+                NamespaceRepo.setContainment(h, cat.catalogId, ns.namespaceId, containment)
+                ns.copy(containment = containment)
+            }
+        }
+
+    /**
+     * A file, DV or live upload claim under [namespace]'s prefix (or a
+     * percent-escaped segment, which a decoding reader could resolve to
+     * it), or null. [fromFileId] null scans every row of the catalog under
+     * [CONTAINMENT_SCAN_TIMEOUT_MS]; otherwise only file ids from it on,
+     * by primary key, plus the claims.
+     */
+    private fun foreignFileUnderPrefix(
+        h: org.jdbi.v3.core.Handle,
+        catalogId: Long,
+        dataPath: String,
+        namespace: String,
+        fromFileId: Long?,
+    ): String? {
+        val root = dataPath.trimEnd('/') + "/data/"
+        val ids = if (fromFileId == null) "" else "AND %s >= :from"
+        val match =
+            "(starts_with(path, :prefix) OR (starts_with(path, :root) AND " +
+                "position('%' IN split_part(substr(path, length(:root) + 1), '/', 1)) > 0))"
+        h.execute("SET LOCAL statement_timeout = '${if (fromFileId == null) CONTAINMENT_SCAN_TIMEOUT_MS else 1_000}ms'")
+        return try {
+            h.createQuery(
+                """
+                SELECT path FROM (
+                    (SELECT path FROM hog_data_file WHERE catalog_id = :c ${ids.format(
+                    "data_file_id",
+                )} AND $match LIMIT 1)
+                    UNION ALL
+                    (SELECT path FROM hog_delete_file WHERE catalog_id = :c ${ids.format(
+                    "delete_file_id",
+                )} AND $match LIMIT 1)
+                    UNION ALL
+                    (SELECT path FROM hog_upload WHERE catalog_id = :c AND state = 'active' AND $match LIMIT 1)
+                ) hit LIMIT 1
+                """,
+            ).bind("c", catalogId).bind("prefix", root + namespace + "/").bind("root", root)
+                .also { q -> fromFileId?.let { q.bind("from", it) } }
+                .mapTo(String::class.java).findOne().orElse(null)
+        } catch (e: org.jdbi.v3.core.statement.UnableToExecuteStatementException) {
+            if (Pg.isQueryCanceled(e)) {
+                throw HoglakeException.ContainmentUnverified(
+                    "could not check $root$namespace/ for other tables' files within its time bound; " +
+                        "the namespace was not marked",
+                )
+            }
+            throw e
+        }
+    }
+
+    /** Refuse a namespace that has ever held a table or view (by hog_table_version_namespace, and hog_view's key). */
+    private fun requireNeverHeld(
+        h: org.jdbi.v3.core.Handle,
+        catalogId: Long,
+        ns: NamespaceInfo,
+    ) {
+        val held =
+            h.createQuery(
+                """
+                SELECT EXISTS (SELECT 1 FROM hog_table_version WHERE catalog_id = :c AND namespace_id = :n)
+                    OR EXISTS (SELECT 1 FROM hog_view WHERE catalog_id = :c AND namespace_id = :n)
+                """,
+            ).bind("c", catalogId).bind("n", ns.namespaceId).mapTo(Boolean::class.java).one()
+        if (held) {
+            throw HoglakeException.NamespaceNotEmpty(
+                "namespace '${ns.name}' has held a table or view; only a namespace that never has can be " +
+                    "marked contained",
+            )
+        }
+    }
+
+    private fun prefixTaken(
+        namespace: String,
+        path: String,
+    ) = HoglakeException.CommitConflict(
+        "cannot mark namespace '$namespace' contained: '$path' is already registered or claimed under its prefix",
+    )
+
     fun createNamespace(
         catalog: String,
         name: String,
@@ -471,6 +646,8 @@ class CatalogService(private val jdbi: Jdbi) {
         expectedNamespaceId: Long? = null,
         author: String? = null,
         message: String? = null,
+        /** False for a non-operator caller: a contained namespace is then refused (V33). */
+        mayDropContained: Boolean = true,
     ): CommitResult =
         Audit.audited(
             "namespace_drop",
@@ -487,6 +664,13 @@ class CatalogService(private val jdbi: Jdbi) {
                 val ns = requireNamespace(h, cat, namespace)
                 if (expectedNamespaceId != null && ns.namespaceId != expectedNamespaceId) {
                     throw HoglakeException.CommitConflict("namespace '$namespace' no longer has the expected identity")
+                }
+                // Under the lock marking takes, so a namespace marked while
+                // this drop queued is refused rather than dropped.
+                if (ns.containment != null && !mayDropContained) {
+                    throw HoglakeException.Forbidden(
+                        "namespace '$namespace' is contained; only an operator may drop it",
+                    )
                 }
                 // Emptiness under the commit lock: a concurrent createTable
                 // or createView into this namespace serializes behind the

@@ -47,6 +47,10 @@ private val log = KotlinLogging.logger("com.posthog.hoglake.api.ErrorMapping")
  * - ObjectPrefixViolation -> 422 `object_prefix_violation`, carrying
  *                          `tables` and `retry: re-prepare`: a file the
  *                          table's object-prefix layout does not admit
+ * - ContainmentViolation -> 422 `containment_violation`, same shape: a
+ *                          file namespace containment (V33) does not admit
+ * - ContainmentUnverified -> 503 `containment_unverified`: marking could
+ *                          not prove the prefix clean in time
  * - Expired             -> 410
  * - CommitQueueTimeout  -> 503 + Retry-After (retryable backpressure,
  *                          never a generic 500)
@@ -126,6 +130,16 @@ internal fun errorBody(cause: HoglakeException): Pair<HttpStatusCode, ApiErrorDt
                     tables = listOf(cause.table),
                     retry = RETRY_RE_PREPARE,
                 )
+        // Same shape: the namespace was marked contained after the writer
+        // chose its paths, or the writer chose them under someone else's.
+        is HoglakeException.ContainmentViolation ->
+            HttpStatusCode.UnprocessableEntity to
+                apiError("containment_violation", cause).copy(
+                    tables = listOf(cause.table),
+                    retry = RETRY_RE_PREPARE,
+                )
+        is HoglakeException.ContainmentUnverified ->
+            HttpStatusCode.ServiceUnavailable to apiError("containment_unverified", cause)
         // 401, and the ONLY arm whose status is added by a header the
         // caller must also honour (WWW-Authenticate, below). `error`
         // carries the verifier's closed reason vocabulary rather than a

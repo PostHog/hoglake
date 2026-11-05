@@ -547,6 +547,35 @@ contract vector is `scoped_team` in `oauth/contract-vectors.json`.
   under `warn` too. Routes learn the predicate one at a time, after namespace
   containment exists to attribute tables to values.
 
+### 6.2b Namespace containment
+
+Containment is what attributes tables to predicate values. An operator marks a
+namespace contained for `field = value` (`PUT
+/v1/catalogs/{c}/namespaces/{ns}/containment`, body `{"field": "team_id",
+"value": 42}`; `DELETE` clears). hoglake knows nothing about teams: the field
+is any lowercase identifier, the value a positive id, and the convention that
+`team_<id>` is contained for `team_id = <id>` lives in the provisioner.
+
+- **The prefix is the namespace's.** A table in a contained namespace `n`
+  registers files only under `<data_path>/data/n/`, and no table outside `n`
+  registers files there (`containment_violation`, 422). Checked on every
+  commit route and on table-creation publish; a contained namespace's
+  table-creation `write_path` is `data/<n>/<uuid>/`. A path whose `data/`
+  segment is percent-encoded is compared decoded as well, so `team%5F42`
+  cannot reach `team_42`'s prefix.
+- **Marked only when that is already true.** Marking refuses a namespace that
+  has ever held a table or view (`namespace_not_empty`) and a prefix that
+  already holds another table's data file, DV or live upload claim
+  (`commit_conflict`). The full scan runs outside the commit lock under a 10 s
+  bound (`containment_unverified`, 503, past it); under the lock only files
+  registered since are re-checked.
+- **One live namespace per `(catalog, field, value)`** (`already_exists`).
+- **Operators only.** Marking and clearing are operator routes; a tenant
+  token cannot drop a contained namespace (403). Clearing requires the
+  namespace to be empty.
+- **Nothing changes until something is marked.** A catalog with no contained
+  namespace refuses nothing it refused before.
+
 ### 6.3 Scope vocabulary
 
 | Scope | Grants |
