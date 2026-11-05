@@ -238,26 +238,32 @@ internal object HogliteSchema {
              * written end-snapshot-aware now, so those ports add writers
              * of the column, not a schema migration plus a rewrite of
              * every read.
+             *
+             * Column order matters. A row with a large stats_json spills to
+             * overflow pages, and a column after it can only be read by a
+             * walk of that overflow chain. So the fixed-width columns, which
+             * the visibility and eligibility predicates read on every row,
+             * come first, and the variable-length text comes last.
              */
             """CREATE TABLE IF NOT EXISTS files(
                 id INTEGER PRIMARY KEY,
                 table_id INTEGER NOT NULL,
-                path TEXT NOT NULL,
-                file_format TEXT NOT NULL DEFAULT 'parquet',
+                begin_snapshot INTEGER NOT NULL,
+                end_snapshot INTEGER,
                 record_count INTEGER NOT NULL,
                 file_size_bytes INTEGER NOT NULL,
                 footer_size INTEGER,
                 row_id_start INTEGER NOT NULL,
                 explicit_row_ids INTEGER NOT NULL DEFAULT 0,
                 spec_id INTEGER,
-                partition_values_json TEXT,
-                stats_state TEXT NOT NULL,
-                stats_json TEXT,
-                split_offsets_json TEXT,
                 missing_field_ids INTEGER NOT NULL DEFAULT 0,
-                begin_snapshot INTEGER NOT NULL,
-                end_snapshot INTEGER,
-                prefix_quarantined INTEGER NOT NULL DEFAULT 0
+                prefix_quarantined INTEGER NOT NULL DEFAULT 0,
+                stats_state TEXT NOT NULL,
+                file_format TEXT NOT NULL DEFAULT 'parquet',
+                path TEXT NOT NULL,
+                partition_values_json TEXT,
+                stats_json TEXT,
+                split_offsets_json TEXT
             )""",
             "CREATE INDEX IF NOT EXISTS files_table ON files(table_id, begin_snapshot)",
             """CREATE TABLE IF NOT EXISTS dvs(
