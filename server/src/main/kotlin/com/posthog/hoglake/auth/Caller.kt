@@ -92,6 +92,36 @@ data class Caller(
         return held.any { it.satisfies(scope) }
     }
 
+    /**
+     * May this SCOPED caller use, with [scope], a namespace in [catalog]
+     * contained for `field = value`? Its permission on the value is the lower
+     * of the predicate's and the catalog's (`cat`), so both must satisfy
+     * [scope]. False for every other kind: a tenant's authority is [holds],
+     * and nothing here may widen it.
+     */
+    fun mayUseContained(
+        catalog: String,
+        field: String,
+        value: Long,
+        scope: Scope,
+    ): Boolean {
+        if (kind != Kind.SCOPED) return false
+        val held = catalogScopes[catalog] ?: return false
+        if (held.none { it.satisfies(scope) }) return false
+        val perm =
+            when (val grant = predicates[field] ?: return false) {
+                is PredicateGrant.All -> grant.scope
+                is PredicateGrant.Values -> grant.values[value] ?: return false
+            }
+        return perm.satisfies(scope)
+    }
+
+    /** Does this caller hold [scope] on [catalog] by its `cat` claim alone? Not an authorization. */
+    internal fun catalogClaimAllows(
+        catalog: String,
+        scope: Scope,
+    ): Boolean = catalogScopes[catalog]?.any { it.satisfies(scope) } == true
+
     /** Every catalog name this caller may read — the filter for fleet-wide listings. */
     fun visibleCatalogs(): Set<String>? = if (kind.isOperator()) null else catalogScopes.keys
 }
@@ -151,5 +181,19 @@ sealed interface AuthDecision {
     data class NotPredicated(
         val catalog: String,
         val pattern: String,
+    ) : AuthDecision
+
+    /**
+     * A scoped caller on a route that narrows by namespace: allowed only if
+     * [namespace] is live, contained, and its value is one the caller holds
+     * with [required]. That needs the database, so the plugin defers it to
+     * the namespace gate (NamespaceGate.kt), which runs on the request
+     * dispatcher before routing and answers 404, exactly as for a missing
+     * namespace, when it does not hold.
+     */
+    data class ByNamespace(
+        val catalog: String,
+        val namespace: String,
+        val required: Scope,
     ) : AuthDecision
 }

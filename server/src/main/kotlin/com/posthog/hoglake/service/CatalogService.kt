@@ -712,6 +712,20 @@ class CatalogService(private val jdbi: Jdbi) {
             }
         }
 
+    /**
+     * [namespace]'s containment, or null when the catalog or namespace is
+     * missing, the namespace is dropped, or it is not contained. The namespace
+     * gate's read (auth/NamespaceGate.kt): one probe of each name's index.
+     */
+    fun liveContainment(
+        catalog: String,
+        namespace: String,
+    ): NamespaceContainment? =
+        jdbi.withHandleUnchecked { h ->
+            val cat = CatalogRepo.findByName(h, catalog) ?: return@withHandleUnchecked null
+            NamespaceRepo.findLiveByName(h, cat.catalogId, namespace)?.containment
+        }
+
     fun getNamespace(
         catalog: String,
         namespace: String,

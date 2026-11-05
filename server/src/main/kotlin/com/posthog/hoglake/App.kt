@@ -16,6 +16,7 @@ import com.posthog.hoglake.api.installTableCreationRoutes
 import com.posthog.hoglake.api.installUploadRoutes
 import com.posthog.hoglake.api.installViewRoutes
 import com.posthog.hoglake.auth.installAuth
+import com.posthog.hoglake.auth.installNamespaceGate
 import com.posthog.hoglake.commit.CommitService
 import com.posthog.hoglake.compaction.CompactionConfig
 import com.posthog.hoglake.compaction.CompactionService
@@ -351,6 +352,10 @@ class App private constructor(
         // with the typed 503 before it borrows a connection
         // (api/BlockingDispatch.kt).
         app.installBlockingDispatch(requestDispatcher, cfg.commitLockTimeoutMs)
+        // A scoped caller's namespace check, on the dispatcher and before
+        // routing: the half of authorization that needs the database
+        // (auth/NamespaceGate.kt).
+        app.installNamespaceGate(catalogService::liveContainment)
         app.install(ContentNegotiation) {
             // One definition, shared with the tests that pin this
             // behaviour (api/WireJson.kt).

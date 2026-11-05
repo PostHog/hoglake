@@ -56,6 +56,10 @@ data class RouteMatch(
     val catalog: String?,
     /** The rule's own pattern, for logs and for the totality test's failures. */
     val pattern: String,
+    /** The `{namespace}` segment's value, when the route has one; see [catalog]. */
+    val namespace: String? = null,
+    /** The rule's method (HEAD matches as GET). Null only in hand-built matches. */
+    val method: HttpMethod? = null,
 )
 
 /**
@@ -341,6 +345,7 @@ object AuthPolicy {
             val pattern = segmentsByPattern.getValue(entry)
             if (pattern.size != actual.size) continue
             var catalog: String? = null
+            var namespace: String? = null
             var ok = true
             for (i in pattern.indices) {
                 when (val seg = pattern[i]) {
@@ -349,10 +354,14 @@ object AuthPolicy {
                             ok = false
                             break
                         }
-                    is Seg.Param -> if (seg.name == "catalog") catalog = actual[i]
+                    is Seg.Param ->
+                        when (seg.name) {
+                            "catalog" -> catalog = actual[i]
+                            "namespace" -> namespace = actual[i]
+                        }
                 }
             }
-            if (ok) return RouteMatch(entry.requirement, catalog, entry.pattern)
+            if (ok) return RouteMatch(entry.requirement, catalog, entry.pattern, namespace, entry.method)
         }
         return null
     }
@@ -454,12 +463,7 @@ object AuthPolicy {
                 if (!caller.knowsCatalog(catalog)) {
                     return AuthDecision.UnknownCatalog(catalog)
                 }
-                // No catalog route narrows by predicate yet, so a scoped
-                // caller may use none of them. Each one that learns to is
-                // listed here as it does.
-                if (caller.kind == Caller.Kind.SCOPED) {
-                    return AuthDecision.NotPredicated(catalog, match.pattern)
-                }
+                if (caller.kind == Caller.Kind.SCOPED) return authorizeScoped(caller, catalog, match)
                 val required = match.requirement.scopeOrNull() ?: return AuthDecision.Allow
                 if (caller.holds(catalog, required)) {
                     AuthDecision.Allow
@@ -468,5 +472,53 @@ object AuthPolicy {
                 }
             }
         }
+    }
+
+    /**
+     * The routes a scoped caller may use, each narrowed by predicate. Every
+     * other catalog route refuses it ([AuthDecision.NotPredicated]), so a
+     * route added to the table stays closed to scoped callers until it is
+     * listed here, and listing one is a claim that it reads nothing outside
+     * the namespace its path names.
+     *
+     * - The `{namespace}` routes are decided per namespace by the gate:
+     *   a table's metadata, files, scan plan, partitions, changes and stats,
+     *   and the namespace's views, are all its own.
+     * - The namespace listing is the one route without a `{namespace}`: its
+     *   handler filters to the namespaces the caller may use (Routes.kt).
+     *
+     * Reads only, for now. Writes follow once a scoped writer's commit is
+     * held to its namespaces.
+     */
+    internal val SCOPED_ROUTES: Set<Pair<HttpMethod, String>> =
+        setOf(
+            HttpMethod.Get to "/v1/catalogs/$CATALOG/namespaces",
+            HttpMethod.Get to "/v1/catalogs/$CATALOG/namespaces/{namespace}",
+            HttpMethod.Get to "/v1/catalogs/$CATALOG/namespaces/{namespace}/tables",
+            HttpMethod.Get to "/v1/catalogs/$CATALOG/namespaces/{namespace}/tables/{table}",
+            HttpMethod.Get to "/v1/catalogs/$CATALOG/namespaces/{namespace}/tables/{table}/scan",
+            HttpMethod.Get to "/v1/catalogs/$CATALOG/namespaces/{namespace}/tables/{table}/files",
+            HttpMethod.Get to "/v1/catalogs/$CATALOG/namespaces/{namespace}/tables/{table}/files/{fileId}/stats",
+            HttpMethod.Get to "/v1/catalogs/$CATALOG/namespaces/{namespace}/tables/{table}/partitions",
+            HttpMethod.Get to "/v1/catalogs/$CATALOG/namespaces/{namespace}/tables/{table}/partitions/values",
+            HttpMethod.Post to "/v1/catalogs/$CATALOG/namespaces/{namespace}/tables/{table}/partitions/lookup",
+            HttpMethod.Get to "/v1/catalogs/$CATALOG/namespaces/{namespace}/tables/{table}/changes",
+            HttpMethod.Get to "/v1/catalogs/$CATALOG/namespaces/{namespace}/views",
+            HttpMethod.Get to "/v1/catalogs/$CATALOG/namespaces/{namespace}/views/{view}",
+        )
+
+    private fun authorizeScoped(
+        caller: Caller,
+        catalog: String,
+        match: RouteMatch,
+    ): AuthDecision {
+        val required = match.requirement.scopeOrNull()
+        val method = match.method
+        if (required == null || method == null || (method to match.pattern) !in SCOPED_ROUTES) {
+            return AuthDecision.NotPredicated(catalog, match.pattern)
+        }
+        if (!caller.catalogClaimAllows(catalog, required)) return AuthDecision.InsufficientScope(catalog, required)
+        val namespace = match.namespace ?: return AuthDecision.Allow
+        return AuthDecision.ByNamespace(catalog, namespace, required)
     }
 }
