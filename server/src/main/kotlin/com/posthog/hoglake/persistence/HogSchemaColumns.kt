@@ -60,7 +60,13 @@ object HogSchemaColumns {
             // CommitService.checkConflicts.
             "hog_snapshot_change" to setOf("catalog_id", "snapshot_id", "kind", "object_id"),
             // NamespaceRepo.
-            "hog_namespace" to setOf("catalog_id", "namespace_id", "name", "dropped", "created_at"),
+            // V33: contained_field/contained_value, read by NamespaceRepo and
+            // CommitTail.READ_SQL's `contained` CTE.
+            "hog_namespace" to
+                setOf(
+                    "catalog_id", "namespace_id", "name", "dropped", "created_at",
+                    "contained_field", "contained_value",
+                ),
             // TableRepo (identity + drop marking).
             "hog_table" to
                 setOf(

@@ -139,13 +139,31 @@ class TableCreationService(
                 """,
                     ).bind("catalog", cat.catalogId).bind("operation", operationId)
                         .bind("namespace", ns.namespaceId).bind("definition", encoded).bind("uuid", uuid)
-                        .bind("path", cat.dataPath.trimEnd('/') + "/data/$uuid/").execute()
+                        .bind("path", writePath(cat.dataPath, ns, uuid)).execute()
                 replay = inserted == 0
                 requireSame(h, cat.catalogId, operationId, "definition", encoded)
                 load(h, cat.catalogId, operationId)
             }
         }
     }
+
+    /**
+     * Where a creation's files go: `<data_path>/data/<uuid>/`, or, in a
+     * contained namespace (V33), `<data_path>/data/<namespace>/<uuid>/`,
+     * the only place its files may be registered. A namespace marked
+     * after prepare fails the publish with `containment_violation`, and
+     * the writer re-prepares.
+     */
+    private fun writePath(
+        dataPath: String,
+        ns: com.posthog.hoglake.model.NamespaceInfo,
+        uuid: UUID,
+    ): String =
+        if (ns.containment != null) {
+            dataPath.trimEnd('/') + "/data/${ns.name}/$uuid/"
+        } else {
+            dataPath.trimEnd('/') + "/data/$uuid/"
+        }
 
     fun status(
         catalog: String,

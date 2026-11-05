@@ -250,3 +250,78 @@ object ObjectPrefix {
         return if (matches) Verdict.OK else Verdict.BOUND_MISMATCH
     }
 }
+
+/**
+ * Namespace containment (V33): which `data/<segment>/` a path names, and
+ * whether a table may register it.
+ *
+ * A contained namespace `n` owns `<data_path>/data/n/`: its tables register
+ * files only there, and no other table registers files there. A contained
+ * table's files must spell `data/n/` literally. Everyone else's are also
+ * compared DECODED, both the `data` directory and the segment after it,
+ * because a reader that percent-decodes a URI resolves `d%61ta/team%5F42/x`
+ * to `data/team_42/x`. (The catalog's own `data_path` prefix is matched
+ * literally by commit validation, so only what follows it can vary.)
+ */
+object Containment {
+    /** The two segments after `<dataPath>/`, raw, or null when the path has fewer. */
+    private fun head(
+        dataPath: String,
+        path: String,
+    ): Pair<String, String>? {
+        val root = dataPath.trimEnd('/') + "/"
+        if (!path.startsWith(root)) return null
+        val parts = path.substring(root.length).split('/', limit = 3)
+        if (parts.size < 3 || parts[0].isEmpty() || parts[1].isEmpty()) return null
+        return parts[0] to parts[1]
+    }
+
+    private fun decode(segment: String): String? =
+        if ('%' !in segment) {
+            segment
+        } else {
+            runCatching { java.net.URLDecoder.decode(segment.replace("+", "%2B"), Charsets.UTF_8) }.getOrNull()
+        }
+
+    /** The raw segment of [path] after a LITERAL `<dataPath>/data/`, or null. */
+    fun rawSegment(
+        dataPath: String,
+        path: String,
+    ): String? = head(dataPath, path)?.takeIf { it.first == "data" }?.second
+
+    /**
+     * Every namespace name [path] can reach: the segment after a `data`
+     * directory spelled raw or escaped, raw and decoded. Empty when the
+     * first segment is not (a spelling of) `data`.
+     */
+    fun segments(
+        dataPath: String,
+        path: String,
+    ): Set<String> {
+        val (dir, raw) = head(dataPath, path) ?: return emptySet()
+        if (dir != "data" && decode(dir) != "data") return emptySet()
+        return setOfNotNull(raw, decode(raw))
+    }
+
+    /**
+     * Why [path] may not be registered for a table in [namespace], or null
+     * when it may. [contained] holds the live contained namespaces among
+     * every name the commit asked about.
+     */
+    fun violation(
+        dataPath: String,
+        namespace: String,
+        path: String,
+        contained: Set<String>,
+    ): String? {
+        if (namespace in contained && rawSegment(dataPath, path) != namespace) {
+            return "namespace '$namespace' is contained: its files must live under " +
+                "${dataPath.trimEnd('/')}/data/$namespace/"
+        }
+        val foreign = segments(dataPath, path).firstOrNull { it in contained && it != namespace }
+        if (foreign != null) {
+            return "${dataPath.trimEnd('/')}/data/$foreign/ belongs to contained namespace '$foreign'"
+        }
+        return null
+    }
+}

@@ -608,6 +608,54 @@ class CommitStatementPlanIntegrationTest {
     }
 
     @Test
+    fun `the containment probe reads hog_namespace by its live-name key, custom and generic`() {
+        // V33's `contained` CTE reads hog_namespace by an index: a probe
+        // of hog_namespace_live_name per name the commit asks about, or
+        // (the generic plan here) the catalog's range of
+        // hog_namespace_live_containment, i.e. its contained namespaces
+        // alone, 300 of the 3,000 below. Seeded with 3,000 namespaces in the
+        // fixture catalog, every tenth contained (an org catalog with a
+        // namespace per team is the shape), so a scan of hog_namespace
+        // would show. hog_namespace is not in BIG_TABLES: it is small by
+        // construction, one row per namespace ever created.
+        db.jdbi.useHandleUnchecked { h ->
+            h.execute(
+                """
+                INSERT INTO hog_namespace (catalog_id, namespace_id, name, contained_field, contained_value)
+                SELECT ?, 1000000 + g, 'team_' || g,
+                       CASE WHEN g % 10 = 0 THEN 'team_id' END, CASE WHEN g % 10 = 0 THEN g END
+                  FROM generate_series(1, 3000) g
+                ON CONFLICT DO NOTHING
+                """,
+                catalogId,
+            )
+            h.execute("ANALYZE hog_namespace")
+        }
+        val names = listOf("ingest", "team_10", "team_11")
+        val inputs =
+            CommitTail.ReadInputs(
+                catalogId = catalogId,
+                idempotencyKey = UUID.randomUUID(),
+                tables = listOf(CommitTail.TableKey("ingest", "t$HOT", appending = true, unchanged = false)),
+                readSnapshot = head() - READ_BEHIND,
+                paths = (1..PATHS).map { "s3://bucket/plan/data/team_10/${UUID.randomUUID()}.parquet" },
+                targetIds = emptyList(),
+                containmentNames = names,
+            )
+        val plan = explainAnalyze(CommitTail.READ_SQL) { q -> CommitTail.bindRead(q, inputs) }
+        val generic = explainGeneric(CommitTail.READ_SQL)
+        for ((what, p) in listOf("custom" to plan, "generic" to generic)) {
+            assertThat(
+                p,
+            ).describedAs("the %s read scans hog_namespace:%n%s", what, p).doesNotContain("Seq Scan on hog_namespace ")
+            assertThat(p).describedAs("the %s read reads hog_namespace by index:%n%s", what, p)
+                .containsPattern("Index (Only )?Scan (using|on) hog_namespace_live_(name|containment)")
+        }
+        val read = db.jdbi.withHandleUnchecked { h -> CommitTail.read(h, inputs) }
+        assertThat(read.contained).containsExactly("team_10")
+    }
+
+    @Test
     fun `the read of a prepared append costs its probes, not the catalog`() {
         // Measured on this fixture: 58 buffers — the receipt, head and
         // resolution descents, 25 live column rows, the 50 change rows
