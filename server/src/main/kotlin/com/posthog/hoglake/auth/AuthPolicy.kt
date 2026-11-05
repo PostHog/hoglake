@@ -487,8 +487,14 @@ object AuthPolicy {
      * - The namespace listing is the one route without a `{namespace}`: its
      *   handler filters to the namespaces the caller may use (Routes.kt).
      *
-     * Reads only, for now. Writes follow once a scoped writer's commit is
-     * held to its namespaces.
+     * - Writes on a `{namespace}` route (create, drop, truncate or alter a
+     *   table; create or drop a view) are the gate's too, at `write`.
+     * - The upload claim's renew and abandon are keyed by the claim owner, a
+     *   random UUID the writer chose; they name no namespace and register
+     *   nothing. A claim is held to a namespace when it is made
+     *   ([BODY_SCOPED_ROUTES]).
+     *
+     * Routes that name their namespaces in the body are [BODY_SCOPED_ROUTES].
      */
     internal val SCOPED_ROUTES: Set<Pair<HttpMethod, String>> =
         setOf(
@@ -505,6 +511,40 @@ object AuthPolicy {
             HttpMethod.Get to "/v1/catalogs/$CATALOG/namespaces/{namespace}/tables/{table}/changes",
             HttpMethod.Get to "/v1/catalogs/$CATALOG/namespaces/{namespace}/views",
             HttpMethod.Get to "/v1/catalogs/$CATALOG/namespaces/{namespace}/views/{view}",
+            HttpMethod.Post to "/v1/catalogs/$CATALOG/namespaces/{namespace}/tables",
+            HttpMethod.Delete to "/v1/catalogs/$CATALOG/namespaces/{namespace}/tables/{table}",
+            HttpMethod.Post to "/v1/catalogs/$CATALOG/namespaces/{namespace}/tables/{table}/truncate",
+            HttpMethod.Post to "/v1/catalogs/$CATALOG/namespaces/{namespace}/tables/{table}/alter",
+            HttpMethod.Post to "/v1/catalogs/$CATALOG/namespaces/{namespace}/views",
+            HttpMethod.Delete to "/v1/catalogs/$CATALOG/namespaces/{namespace}/views/{view}",
+            HttpMethod.Post to "/v1/catalogs/$CATALOG/uploads/renew",
+            HttpMethod.Post to "/v1/catalogs/$CATALOG/uploads/abandon",
+        )
+
+    /**
+     * The routes a scoped caller may use whose namespaces are in the request
+     * body, or behind an id the handler resolves (a table creation's
+     * operation). Each handler checks every namespace before it acts
+     * ([requireScopedNamespaces]); listing a route here is a claim that its
+     * handler does. ScopedWritesIntegrationTest drives every entry.
+     */
+    internal val BODY_SCOPED_ROUTES: Set<Pair<HttpMethod, String>> =
+        setOf(
+            HttpMethod.Post to "/v1/catalogs/$CATALOG/commit",
+            HttpMethod.Post to "/v1/catalogs/$CATALOG/commit/prepared",
+            HttpMethod.Post to "/v1/catalogs/$CATALOG/commit/deletes/prepared",
+            HttpMethod.Post to "/v1/catalogs/$CATALOG/commit/mutations/prepared",
+            HttpMethod.Post to "/v1/catalogs/$CATALOG/commit/transaction",
+            HttpMethod.Post to "/v1/catalogs/$CATALOG/commit/uploads",
+            HttpMethod.Put to "/v1/catalogs/$CATALOG/table-creations/{operation}",
+            HttpMethod.Put to "/v1/catalogs/$CATALOG/table-creations/{operation}/partitioned",
+            HttpMethod.Put to "/v1/catalogs/$CATALOG/table-creations/{operation}/sorted",
+            HttpMethod.Put to "/v1/catalogs/$CATALOG/table-creations/{operation}/metadata",
+            HttpMethod.Get to "/v1/catalogs/$CATALOG/table-creations/{operation}",
+            HttpMethod.Post to "/v1/catalogs/$CATALOG/table-creations/{operation}/commit",
+            HttpMethod.Post to "/v1/catalogs/$CATALOG/table-creations/{operation}/commit/uploads",
+            HttpMethod.Post to "/v1/catalogs/$CATALOG/table-creations/{operation}/abort",
+            HttpMethod.Put to "/v1/catalogs/$CATALOG/uploads/{upload}",
         )
 
     private fun authorizeScoped(
@@ -514,10 +554,12 @@ object AuthPolicy {
     ): AuthDecision {
         val required = match.requirement.scopeOrNull()
         val method = match.method
-        if (required == null || method == null || (method to match.pattern) !in SCOPED_ROUTES) {
+        val route = method?.let { it to match.pattern }
+        if (required == null || route == null || (route !in SCOPED_ROUTES && route !in BODY_SCOPED_ROUTES)) {
             return AuthDecision.NotPredicated(catalog, match.pattern)
         }
         if (!caller.catalogClaimAllows(catalog, required)) return AuthDecision.InsufficientScope(catalog, required)
+        if (route in BODY_SCOPED_ROUTES) return AuthDecision.ByBody(catalog, required)
         val namespace = match.namespace ?: return AuthDecision.Allow
         return AuthDecision.ByNamespace(catalog, namespace, required)
     }

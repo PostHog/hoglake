@@ -42,7 +42,11 @@ internal val PendingNamespaceKey = AttributeKey<AuthDecision.ByNamespace>("Hogla
  * namespace is missing, dropped or uncontained. One indexed read
  * (`hog_namespace_live_name`) per scoped request on these routes.
  */
-fun Application.installNamespaceGate(containment: (catalog: String, namespace: String) -> NamespaceContainment?) {
+fun Application.installNamespaceGate(
+    /** The catalog's data_path, null when it is missing: a scoped upload claim's check (ScopedWrites.kt). */
+    dataPath: (catalog: String) -> String? = { null },
+    containment: (catalog: String, namespace: String) -> NamespaceContainment?,
+) {
     // After the blocking dispatcher, so the read runs admitted on it. An
     // application without one (a test harness) gets the gate right after
     // Plugins, which is still before routing.
@@ -51,6 +55,7 @@ fun Application.installNamespaceGate(containment: (catalog: String, namespace: S
         NamespaceGatePhase,
     )
     attributes.put(NamespaceGateKey, Unit)
+    attributes.put(ScopedLookupsKey, ScopedLookups(containment, dataPath))
     intercept(NamespaceGatePhase) {
         val pending = call.attributes.getOrNull(PendingNamespaceKey) ?: return@intercept
         val caller = call.hoglakeAuth.callerOrNull

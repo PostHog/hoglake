@@ -316,6 +316,13 @@ val HoglakeAuth =
                 call.attributes.put(PendingNamespaceKey, decision)
                 return@onCall
             }
+            // A scoped caller on a route whose namespaces are in its body:
+            // decided by the handler (ScopedWrites.kt), which needs the gate's
+            // lookups. Without them it is refused below.
+            if (decision is AuthDecision.ByBody && call.application.attributes.contains(ScopedLookupsKey)) {
+                call.attributes.put(PendingBodyKey, decision)
+                return@onCall
+            }
             // A listed path asked with an unlisted method is a 405, whatever the
             // token: nothing would serve it, and answering 401 sent probes and
             // clients looking for a credential problem that did not exist. The
@@ -467,6 +474,10 @@ private fun failureFor(
             )
         // Only reached with no namespace gate installed: a wiring bug, refused.
         is AuthDecision.ByNamespace ->
+            HoglakeException.Forbidden(
+                "a scoped credential cannot use route ${match?.pattern ?: "?"} on '${decision.catalog}'",
+            )
+        is AuthDecision.ByBody ->
             HoglakeException.Forbidden(
                 "a scoped credential cannot use route ${match?.pattern ?: "?"} on '${decision.catalog}'",
             )

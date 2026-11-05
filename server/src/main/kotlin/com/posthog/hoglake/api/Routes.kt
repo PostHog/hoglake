@@ -6,6 +6,7 @@ import com.posthog.hoglake.auth.Caller
 import com.posthog.hoglake.auth.Scope
 import com.posthog.hoglake.auth.actorOrRefuse
 import com.posthog.hoglake.auth.hoglakeAuth
+import com.posthog.hoglake.auth.requireScopedNamespaces
 import com.posthog.hoglake.auth.resolveActor
 import com.posthog.hoglake.commit.CommitService
 import com.posthog.hoglake.model.HoglakeException
@@ -914,8 +915,13 @@ internal fun parseExpectedTableUuid(raw: String): UUID =
  * <subject>` for a delegating client, and naming anyone else is refused. A
  * commit route that read the body directly would take its `author` as given:
  * `CommitAttributionTest` fails if one does.
+ *
+ * A scoped caller is held here to the namespaces the body names, before the
+ * commit runs and before a receipt can replay (ScopedWrites.kt).
  */
 internal suspend fun ApplicationCall.receiveCommit(): CommitRequestDto =
-    receive<CommitRequestDto>().attributed(hoglakeAuth)
+    receive<CommitRequestDto>().attributed(hoglakeAuth).also { req ->
+        requireScopedNamespaces(catalog(), req.appends.map { it.namespace } + req.deletes.map { it.namespace })
+    }
 
 internal fun CommitRequestDto.attributed(auth: AuthState): CommitRequestDto = copy(author = resolveActor(auth, author))

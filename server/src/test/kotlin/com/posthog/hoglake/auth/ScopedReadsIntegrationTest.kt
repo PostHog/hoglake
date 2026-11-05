@@ -154,13 +154,14 @@ class ScopedReadsIntegrationTest {
                     assertThat(json.readTree(r.body()).path("error").asText()).isEqualTo(missingCode)
                     assertThat(r.body()).doesNotContain("team_id").doesNotContain("scoped credential")
                 }
-                // Catalog-wide reads and every write stay refused.
+                // Catalog-wide reads and namespace DDL stay refused. Writes
+                // are ScopedWritesIntegrationTest's.
                 assertThat(call(port, token, "").statusCode()).isEqualTo(403)
                 assertThat(call(port, token, "/snapshots").statusCode()).isEqualTo(403)
                 assertThat(call(port, token, "/namespaces/team_42", "DELETE").statusCode()).isEqualTo(403)
-                assertThat(call(port, token, "/namespaces/team_42/tables/t", "DELETE").statusCode())
-                    .isEqualTo(403)
-                assertThat(call(port, token, "/commit", "POST").statusCode()).isEqualTo(403)
+                // A read-only value's table is not writable.
+                assertThat(call(port, token, "/namespaces/team_7/tables/x", "DELETE").statusCode())
+                    .isEqualTo(404)
             }
         }
     }
