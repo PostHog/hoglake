@@ -51,7 +51,7 @@ jobs:
     if: needs.changes.outputs.server == 'true'
     uses: ./.github/workflows/python-live.yml
 
-  # Deployment requires both suites. Run this gate only for server
+  # Deployment requires every suite. Run this gate only for server
   # changes. THIS is the check the ruleset requires, not `server-test`:
   # requiring the leaf let #304 merge with python-live red (two hours
   # of red main until #306). A required gate is what makes a gate.
@@ -60,18 +60,20 @@ jobs:
   # to check".
   server-checks:
     if: always() && (needs.changes.result != 'success' || needs.changes.outputs.server == 'true')
-    needs: [changes, server-test, python-live]
+    needs: [changes, server-test, python-live, hoglite-live]
     runs-on: ubuntu-latest
     steps:
-      - name: Require both suites
+      - name: Require every suite
         env:
           CHANGES_RESULT: ${{ needs.changes.result }}
           SERVER_RESULT: ${{ needs.server-test.result }}
           LIVE_RESULT: ${{ needs.python-live.result }}
+          HOGLITE_RESULT: ${{ needs.hoglite-live.result }}
         run: |
           test "$CHANGES_RESULT" = success &&
             test "$SERVER_RESULT" = success &&
-            test "$LIVE_RESULT" = success
+            test "$LIVE_RESULT" = success &&
+            test "$HOGLITE_RESULT" = success
 
   server-test:
     needs: changes
@@ -99,6 +101,63 @@ jobs:
       - name: Server tests + ktlint
         working-directory: server
         run: ./gradlew --no-daemon :test :ktlintCheck :checkOpenapiVersion
+
+  # The hoglite adapter's live tests, against the newest tested hoglited
+  # build (ci/fetch-hoglited.sh): no pin, so an engine change that breaks
+  # the adapter turns this job red on the next run. HOGLITE_REQUIRED=1
+  # makes a missing engine a failure, never a skip. server-test runs the
+  # same classes without an engine, so there they skip.
+  hoglite-live:
+    needs: changes
+    if: needs.changes.outputs.server == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: hoglite-live-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: "25"
+          cache: gradle
+
+      - name: Fetch the newest hoglited build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ci/fetch-hoglited.sh "$RUNNER_TEMP/hoglite"
+
+      # Docker required (Testcontainers: pgsty/silo, the MinIO build).
+      - name: hoglite live tests
+        working-directory: server
+        env:
+          HOGLITE_REQUIRED: "1"
+        run: ./gradlew --no-daemon :test --tests 'com.posthog.hoglake.hoglite.*IntegrationTest'
+
+      # The fail-closed proof: the live classes ran, and none skipped.
+      - name: Require executed live tests
+        working-directory: server/build/test-results/test
+        run: |
+          shopt -s nullglob
+          reports=(TEST-com.posthog.hoglake.hoglite.*IntegrationTest.xml)
+          test ${#reports[@]} -gt 0
+          sum() { cat "${reports[@]}" | grep -o "<testsuite [^>]*" | grep -o " $1=\"[0-9]*\"" | tr -dc '0-9\n' | awk '{ n += $1 } END { print n + 0 }'; }
+          tests=$(sum tests)
+          skipped=$(sum skipped)
+          echo "hoglite live: $tests tests in ${#reports[@]} classes, $skipped skipped against $HOGLITE_BUILD"
+          test "$tests" -gt 0 && test "$skipped" -eq 0
+
+      - name: Upload test reports
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: hoglite-live-reports
+          path: server/build/reports/tests/test
+          retention-days: 7
 
   trino-test:
     # The connector lives in PostHog/trino (repo PR #1); this runs the
