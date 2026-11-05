@@ -168,7 +168,8 @@ round-trips every byte value and lengths 0 to 1 MiB.
    record counts at its staged, decompressed size).
 3. Classify on a worker thread (`classify_message`): a value starting
    with the LZ4 frame magic is decompressed first (WarpStream pipelines
-   write LZ4 frames; a corrupt frame drops as `undecodable_lz4`); strict
+   write LZ4 frames; a corrupt frame drops as `undecodable_lz4`, one that
+   decompresses past 32 MiB as `oversized_lz4`); strict
    JSON object → stage the JSON under the keyer's tuple; anything else →
    `DroppedRecord` (counted, rate-limited log).
 4. ONE home-stage write for the whole poll: `stage_batch` (one

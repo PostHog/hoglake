@@ -84,6 +84,7 @@ from millrace.consumer import (
     REASON_MALFORMED_PARTITION_SOURCE,
     REASON_MALFORMED_VALUE,
     REASON_MISSING_VALUE,
+    REASON_OVERSIZED_LZ4,
     REASON_UNDECODABLE_LZ4,
     AssignmentError,
     ConsumerStats,
@@ -573,6 +574,20 @@ def test_lz4_magic_edges(value, reason):
     assert _classify(keyer, value) == DroppedRecord(41, reason)
 
 
+def test_decoding_stops_past_the_limit():
+    decoded = b'{"team_id":2,"pad":"' + b"0123456789" * 500_000 + b'"}'
+    assert decode_value(_BENTO_TWO_BLOCKS, limit=len(decoded)) == decoded
+    with pytest.raises(consumer_mod.OversizedValueError):
+        decode_value(_BENTO_TWO_BLOCKS, limit=len(decoded) - 1)
+
+
+def test_a_frame_decompressing_past_the_limit_is_dropped(monkeypatch):
+    monkeypatch.setattr(consumer_mod, "MAX_DECODED_VALUE_BYTES", 1024 * 1024)
+    keyer = GroupKeyer(table_info([IDENTITY_TEAM]))
+    assert _classify(keyer, _BENTO_TWO_BLOCKS) == DroppedRecord(41, "oversized_lz4")
+    assert isinstance(_classify(keyer, _BENTO_LZ4_FRAME), StagedRecord)
+
+
 def test_plain_json_with_leading_whitespace_is_staged_unchanged():
     keyer = GroupKeyer(table_info([IDENTITY_TEAM]))
     value = b' \n\t{"team_id": 7}'
@@ -605,6 +620,7 @@ def test_classify_names_the_FIRST_failing_check():
         (REASON_INVALID_OFFSET, REASON_INVALID_OFFSET),
         (REASON_MALFORMED_VALUE, REASON_MALFORMED_VALUE),
         (REASON_UNDECODABLE_LZ4, "undecodable_lz4"),
+        (REASON_OVERSIZED_LZ4, "oversized_lz4"),
         ("malformed_partition_source:a.b.c", REASON_MALFORMED_PARTITION_SOURCE),
         (REASON_MALFORMED_PARTITION_SOURCE, REASON_MALFORMED_PARTITION_SOURCE),
     ],

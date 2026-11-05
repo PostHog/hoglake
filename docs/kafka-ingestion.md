@@ -135,8 +135,9 @@ WarpStream pipelines write it) is decompressed before parsing, and the
 decompressed JSON is what gets staged.
 
 There is no quarantine: a record that can never become a row (not a
-JSON object, a corrupt LZ4 frame, a malformed partition source, a value no column can hold,
-a null or negative value of an object-prefix table's field) is
+JSON object, a corrupt LZ4 frame or one decompressing past 32 MiB, a
+malformed partition source, a value no column can hold, a null or
+negative value of an object-prefix table's field) is
 dropped, logged and metered (`millrace_records_dropped_total{reason}`),
 at consume time (nothing is staged for it) or at flush time (it is left
 out of the payload and deleted with its window). The exception is a

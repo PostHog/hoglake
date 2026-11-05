@@ -73,6 +73,13 @@ REASON_INVALID_OFFSET: Final = "invalid_offset"
 REASON_MISSING_VALUE: Final = "missing_value"
 REASON_MALFORMED_VALUE: Final = "malformed_value"
 REASON_UNDECODABLE_LZ4: Final = "undecodable_lz4"
+REASON_OVERSIZED_LZ4: Final = "oversized_lz4"
+
+#: The largest decompressed LZ4-framed value. Capture caps a produced event at
+#: 10 MiB, so no real event comes near it; it bounds what one record can expand
+#: to (the poll byte cap is predictive and does not).
+MAX_DECODED_VALUE_BYTES: Final = 32 * 1024 * 1024
+_DECODE_CHUNK_BYTES: Final = 1024 * 1024
 
 # The LZ4 frame magic number (0x184D2204, little-endian). WarpStream pipelines
 # that repartition clickhouse_events_json (team_split_ws,
@@ -83,18 +90,33 @@ REASON_UNDECODABLE_LZ4: Final = "undecodable_lz4"
 _LZ4_FRAME_MAGIC: Final = b"\x04\x22\x4d\x18"
 
 
-def decode_value(value: bytes) -> bytes:
+class OversizedValueError(Exception):
+    """An LZ4-framed value decompresses past the limit."""
+
+
+def decode_value(value: bytes, limit: int | None = None) -> bytes:
     """The JSON bytes of a record value: an LZ4-framed value is
     decompressed, any other value is returned unchanged.
 
     pyarrow's streaming reader handles frames without a content-size field,
     which is what Bento's lz4 codec writes; the one-shot ``pa.decompress``
-    needs the decompressed size up front. Raises OSError on a corrupt frame.
+    needs the decompressed size up front. Reads in chunks and stops past
+    ``limit`` (default :data:`MAX_DECODED_VALUE_BYTES`) with
+    OversizedValueError. Raises OSError on a corrupt frame.
     """
     if value[:4] != _LZ4_FRAME_MAGIC:
         return value
-    decoded: bytes = pa.CompressedInputStream(pa.BufferReader(value), "lz4").read()
-    return decoded
+    if limit is None:
+        limit = MAX_DECODED_VALUE_BYTES
+    stream = pa.CompressedInputStream(pa.BufferReader(value), "lz4")
+    chunks: list[bytes] = []
+    total = 0
+    while chunk := stream.read(min(_DECODE_CHUNK_BYTES, limit + 1 - total)):
+        total += len(chunk)
+        if total > limit:
+            raise OversizedValueError(f"decompresses past {limit} bytes")
+        chunks.append(chunk)
+    return chunks[0] if len(chunks) == 1 else b"".join(chunks)
 
 
 # Logged as ``malformed_partition_source:<dotted path>``; the label drops
@@ -191,6 +213,8 @@ def classify_message(
         value = decode_value(value)
     except OSError:
         return DroppedRecord(offset, REASON_UNDECODABLE_LZ4)
+    except OversizedValueError:
+        return DroppedRecord(offset, REASON_OVERSIZED_LZ4)
     try:
         doc = load_json_object(value)
     except DecodeError:
