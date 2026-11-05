@@ -581,6 +581,13 @@ is any lowercase identifier, the value a positive id, and the convention that
   files spell `data/<n>/` literally; everyone else's are compared decoded as
   well, the `data` directory and the segment after it, so neither
   `team%5F42/` nor `d%61ta/team_42/` reaches `team_42`'s prefix.
+- **The name is the namespace's alone.** Marking refuses a name another
+  namespace in the catalog has ever had (`commit_conflict`). Reads at a past
+  snapshot resolve a namespace by name, so with the name only ever this
+  namespace's, every resolution of it is this namespace or nothing, and
+  authorizing the live one authorizes its whole history. Together with the
+  next rule, every table a contained namespace has ever had was created
+  while it was contained.
 - **Marked only when that is already true.** Marking refuses a namespace that
   has ever held a table or view (`namespace_not_empty`) and a prefix that
   still holds another table's object as far as the catalog knows, in any

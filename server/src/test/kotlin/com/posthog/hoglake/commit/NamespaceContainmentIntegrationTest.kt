@@ -177,6 +177,13 @@ class NamespaceContainmentIntegrationTest {
         catalogs.dropTable(cat, "team_5", "gone", author = "test", message = "test")
         assertThatThrownBy { catalogs.setNamespaceContainment(cat, "team_5", NamespaceContainment("team_id", 5)) }
             .isInstanceOf(HoglakeException.NamespaceNotEmpty::class.java)
+        // A name another namespace once had: a read at an old snapshot
+        // resolves the name to that one, so it can never be contained.
+        catalogs.createNamespace(cat, "team_6")
+        catalogs.dropNamespace(cat, "team_6", author = "test", message = "test")
+        catalogs.createNamespace(cat, "team_6")
+        assertThatThrownBy { catalogs.setNamespaceContainment(cat, "team_6", NamespaceContainment("team_id", 6)) }
+            .isInstanceOf(HoglakeException.CommitConflict::class.java).hasMessageContaining("dropped namespace")
         // Another table's file already under the prefix, plainly or escaped.
         for ((ns, path) in listOf("team_8" to "team_8/x.parquet", "team_9" to "team%5F9/x.parquet")) {
             append(cat, "main", data(cat, path))
