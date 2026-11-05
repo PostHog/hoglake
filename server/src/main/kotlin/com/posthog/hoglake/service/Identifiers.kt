@@ -17,6 +17,13 @@ object Identifiers {
     const val PATTERN = "^[A-Za-z_][A-Za-z0-9_-]{0,127}$"
 
     /**
+     * The catalog-name rule: the `hog_catalog_name_check` CHECK since V13
+     * (numeric-leading names, for UUIDs). Postgres enforces it in the
+     * database; a store without that CHECK enforces it with this pattern.
+     */
+    const val CATALOG_NAME_PATTERN = "^[a-z0-9][a-z0-9_-]{0,62}$"
+
+    /**
      * The prefix hoglake reserves for its own columns.
      *
      * Compaction outputs carry `_hog_row_id`, a physical column that is

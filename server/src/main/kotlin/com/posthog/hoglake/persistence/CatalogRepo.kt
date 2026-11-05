@@ -3,6 +3,7 @@ package com.posthog.hoglake.persistence
 import com.posthog.hoglake.model.CatalogInfo
 import com.posthog.hoglake.model.CatalogNotEmptyReason
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.service.Identifiers
 import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.mapper.RowMapper
 import org.jdbi.v3.core.statement.UnableToExecuteStatementException
@@ -76,7 +77,7 @@ object CatalogRepo {
                     throw HoglakeException.AlreadyExists("catalog '$name' already exists")
                 Pg.isCheckViolation(e) ->
                     throw HoglakeException.Validation(
-                        "invalid catalog name '$name' (must match ^[a-z0-9][a-z0-9_-]{0,62}$)",
+                        "invalid catalog name '$name' (must match ${Identifiers.CATALOG_NAME_PATTERN})",
                     )
                 else -> throw e
             }
