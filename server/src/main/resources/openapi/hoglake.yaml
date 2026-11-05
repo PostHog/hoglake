@@ -322,7 +322,8 @@ paths:
       summary: Drop a namespace (DDL commit; produces a snapshot)
       description: Emptiness precondition, no CASCADE — a namespace with live
         tables or views is refused with 409, matching dropTable's no-CASCADE
-        position.
+        position. A contained namespace can be dropped only by an
+        operator (403).
       parameters:
         - { $ref: "#/components/parameters/operationAuthor" }
         - { $ref: "#/components/parameters/operationMessage" }
@@ -339,6 +340,63 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/CommitResult" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /catalogs/{catalog}/namespaces/{namespace}/containment:
+    put:
+      operationId: setNamespaceContainment
+      summary: Mark a namespace contained for field = value (operator only)
+      description: >
+        A contained namespace's tables register files only under
+        `<data_path>/data/<namespace>/`, and no other table registers files
+        there; a commit that breaks either rule is refused with 422
+        `containment_violation`. Only a namespace that has never held a
+        table or view can be marked, and only while no other table's file
+        or deletion vector (live or retained), live upload claim or
+        undrained removal sits under its prefix, in any percent-escaped
+        spelling that decodes to it (409 otherwise). At most one live namespace per (field, value) (409).
+        Marking the same containment again is a no-op; to change it, clear
+        it first. A contained namespace can be dropped only by an operator.
+        The prefix check reads the catalog's file rows under a time bound;
+        503 `containment_unverified` when it cannot finish, and the
+        namespace is left unmarked.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NamespaceContainment" }
+      responses:
+        "200":
+          description: The namespace, contained
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Namespace" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/Validation" }
+        "503":
+          description: The prefix could not be verified within its time bound; nothing was marked.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+    delete:
+      operationId: clearNamespaceContainment
+      summary: Clear a namespace's containment (operator only)
+      description: Requires the namespace to hold no live table or view (409 otherwise). Clearing an uncontained namespace is a no-op.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+      responses:
+        "200":
+          description: The namespace, no longer contained
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Namespace" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/Conflict" }
 
@@ -3358,6 +3416,24 @@ components:
       content:
         application/json:
           schema: { $ref: "#/components/schemas/ApiError" }
+    BackendUnavailable:
+      description: >
+        The catalog backend did not answer. Only a catalog backend that is
+        reached over the network returns these codes; the PostgreSQL
+        backend does not. Both are retryable: back off per the
+        Retry-After header and retry. `backend_unavailable`: the backend
+        did not answer, and nothing was applied that the server knows of.
+        `commit_outcome_unknown`: a commit that the backend may or may not
+        have applied. A retry with the same `idempotency_key` is
+        exactly-once. A retry without a key can apply the commit a second
+        time, as after a lost COMMIT acknowledgement on PostgreSQL.
+      headers:
+        Retry-After:
+          description: Seconds to back off before retrying.
+          schema: { type: integer }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
 
   schemas:
     OperationAuthor:
@@ -3512,6 +3588,18 @@ components:
       properties:
         name: { type: string }
         namespace_id: { type: integer, format: int64, description: Stable identity; not reused after namespace deletion. }
+        containment:
+          description: Present when the namespace is contained (PUT …/containment).
+          allOf:
+            - { $ref: "#/components/schemas/NamespaceContainment" }
+
+    NamespaceContainment:
+      type: object
+      required: [field, value]
+      additionalProperties: false
+      properties:
+        field: { type: string, pattern: "^[a-z][a-z0-9_]{0,62}$", description: "The predicate field, e.g. team_id." }
+        value: { type: integer, format: int64, minimum: 1, description: The value this namespace holds. }
 
     TableCreation:
       type: object

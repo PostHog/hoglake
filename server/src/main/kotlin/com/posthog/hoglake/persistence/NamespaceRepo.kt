@@ -1,6 +1,7 @@
 package com.posthog.hoglake.persistence
 
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.NamespaceContainment
 import com.posthog.hoglake.model.NamespaceInfo
 import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.statement.UnableToExecuteStatementException
@@ -60,7 +61,7 @@ object NamespaceRepo {
         handle.createQuery(LIST_AT_SQL)
             .bind("catalogId", catalogId)
             .bind("snapshot", snapshot)
-            .map { rs, _ -> NamespaceInfo(rs.getLong("namespace_id"), rs.getString("name")) }
+            .map(::namespaceRow)
             .list()
 
     /** [listAt]'s rule for one name. */
@@ -72,7 +73,7 @@ object NamespaceRepo {
     ): NamespaceInfo? =
         handle.createQuery(
             """
-            SELECT n.namespace_id, n.name
+            SELECT n.namespace_id, n.name, n.contained_field, n.contained_value
             $VISIBLE_FROM
             WHERE n.catalog_id = :catalogId AND n.name = :name AND $VISIBLE_WHERE
             """,
@@ -80,7 +81,7 @@ object NamespaceRepo {
             .bind("catalogId", catalogId)
             .bind("name", name)
             .bind("snapshot", snapshot)
-            .map { rs, _ -> NamespaceInfo(rs.getLong("namespace_id"), rs.getString("name")) }
+            .map(::namespaceRow)
             .findOne()
             .orElse(null)
 
@@ -106,7 +107,7 @@ object NamespaceRepo {
      */
     internal val LIST_AT_SQL =
         """
-            SELECT n.namespace_id, n.name
+            SELECT n.namespace_id, n.name, n.contained_field, n.contained_value
             $VISIBLE_FROM
             WHERE n.catalog_id = :catalogId AND $VISIBLE_WHERE
             ORDER BY n.name
@@ -133,13 +134,13 @@ object NamespaceRepo {
     ): NamespaceInfo? =
         handle.createQuery(
             """
-            SELECT namespace_id, name FROM hog_namespace
+            SELECT namespace_id, name, contained_field, contained_value FROM hog_namespace
             WHERE catalog_id = :catalogId AND name = :name AND NOT dropped
             """,
         )
             .bind("catalogId", catalogId)
             .bind("name", name)
-            .map { rs, _ -> NamespaceInfo(rs.getLong("namespace_id"), rs.getString("name")) }
+            .map(::namespaceRow)
             .findOne()
             .orElse(null)
 
@@ -149,14 +150,60 @@ object NamespaceRepo {
     ): List<NamespaceInfo> =
         handle.createQuery(
             """
-            SELECT namespace_id, name FROM hog_namespace
+            SELECT namespace_id, name, contained_field, contained_value FROM hog_namespace
             WHERE catalog_id = :catalogId AND NOT dropped
             ORDER BY name
             """,
         )
             .bind("catalogId", catalogId)
-            .map { rs, _ -> NamespaceInfo(rs.getLong("namespace_id"), rs.getString("name")) }
+            .map(::namespaceRow)
             .list()
+
+    private fun namespaceRow(
+        rs: java.sql.ResultSet,
+        @Suppress("UNUSED_PARAMETER") ctx: org.jdbi.v3.core.statement.StatementContext,
+    ): NamespaceInfo {
+        val field = rs.getString("contained_field")
+        return NamespaceInfo(
+            rs.getLong("namespace_id"),
+            rs.getString("name"),
+            field?.let { NamespaceContainment(it, rs.getLong("contained_value")) },
+        )
+    }
+
+    /**
+     * Set (or, with null, clear) a live namespace's containment. The
+     * caller holds the catalog commit lock and has checked the
+     * preconditions; the live-containment unique index backstops "one
+     * namespace per value" -> [HoglakeException.AlreadyExists].
+     */
+    fun setContainment(
+        handle: Handle,
+        catalogId: Long,
+        namespaceId: Long,
+        containment: NamespaceContainment?,
+    ) {
+        try {
+            handle.createUpdate(
+                """
+                UPDATE hog_namespace SET contained_field = :field, contained_value = :value
+                WHERE catalog_id = :catalogId AND namespace_id = :namespaceId AND NOT dropped
+                """,
+            )
+                .bind("catalogId", catalogId)
+                .bind("namespaceId", namespaceId)
+                .bind("field", containment?.field)
+                .bind("value", containment?.value)
+                .execute()
+        } catch (e: UnableToExecuteStatementException) {
+            if (Pg.isUniqueViolation(e)) {
+                throw HoglakeException.AlreadyExists(
+                    "another namespace is already contained for ${containment?.field} = ${containment?.value}",
+                )
+            }
+            throw e
+        }
+    }
 
     /**
      * Drop tail: set the liveness flag. The row itself stays — namespace

@@ -148,6 +148,7 @@ class CommitLockCallSitesTest {
                 "CatalogService.createNamespace" to "DDL",
                 "CatalogService.createTable" to "DDL",
                 "CatalogService.truncateTable" to "DDL",
+                "CatalogService.setNamespaceContainment" to "DDL",
                 "CatalogService.dropCatalog" to "DROP",
                 "CatalogService.dropNamespace" to "DROP",
                 "CatalogService.dropTable" to "DROP",

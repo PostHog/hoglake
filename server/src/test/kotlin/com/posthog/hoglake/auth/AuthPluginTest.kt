@@ -1,6 +1,10 @@
 package com.posthog.hoglake.auth
 
+import ch.qos.logback.classic.Logger
+import ch.qos.logback.classic.spi.ILoggingEvent
+import ch.qos.logback.core.read.ListAppender
 import com.posthog.hoglake.configureHoglakeWire
+import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.observability.REQUEST_ID_HEADER
 import com.posthog.hoglake.observability.RequestId
@@ -29,6 +33,7 @@ import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Test
+import org.slf4j.LoggerFactory
 import java.security.KeyPair
 import java.security.interfaces.ECPublicKey
 
@@ -113,6 +118,8 @@ class AuthPluginTest {
                 assertThat(r.status).describedAs(path).isEqualTo(HttpStatusCode.Forbidden)
                 assertThat(r.bodyAsText()).contains("scoped credential")
             }
+            // A body-scoped route with no namespace gate (so no lookups for its
+            // handler) is refused by the plugin.
             val commit = client.post("/v1/catalogs/lake/commit") { header(HttpHeaders.Authorization, scoped) }
             assertThat(commit.status).isEqualTo(HttpStatusCode.Forbidden)
             // Another catalog is still a 404, as for a tenant.
@@ -123,6 +130,85 @@ class AuthPluginTest {
             val bad = "Bearer ${token(TestTokens.scopedClaims(prd = null))}"
             assertThat(client.get("/v1/catalogs/lake") { header(HttpHeaders.Authorization, bad) }.status)
                 .isEqualTo(HttpStatusCode.OK)
+        }
+
+    @Test
+    fun `a scoped refusal under warn is audited as refused, because it was`() {
+        val capture = ListAppender<ILoggingEvent>().apply { start() }
+        val audit =
+            org.slf4j.LoggerFactory.getLogger(
+                com.posthog.hoglake.observability.Audit.LOGGER_NAME,
+            ) as ch.qos.logback.classic.Logger
+        audit.addAppender(capture)
+        try {
+            testApplication {
+                application {
+                    installAuth(scopedService(AuthMode.WARN))
+                    installNamespaceGate { _, _ -> null }
+                    install(ContentNegotiation) { jackson { configureHoglakeWire() } }
+                    routing {
+                        get("/v1/catalogs/{catalog}") { call.respondText("catalog") }
+                        get("/v1/catalogs/{catalog}/namespaces/{namespace}") { call.respondText("served") }
+                    }
+                }
+                val scoped = "Bearer ${token(TestTokens.scopedClaims())}"
+                // Refused by the plugin (no predicate) and by the gate (404).
+                for (path in listOf("/v1/catalogs/lake", "/v1/catalogs/lake/namespaces/team_9")) {
+                    capture.list.clear()
+                    client.get(path) { header(HttpHeaders.Authorization, scoped) }
+                    val line = capture.list.single { it.formattedMessage.startsWith("auth_refused ") }
+                    assertThat(line.formattedMessage).describedAs(path).isEqualTo("auth_refused refused")
+                }
+                // A tenant's refusal under warn is still let through, and says so.
+                capture.list.clear()
+                client.get("/v1/catalogs/other") { header(HttpHeaders.Authorization, "Bearer ${token()}") }
+                assertThat(capture.list.single { it.formattedMessage.startsWith("auth_refused ") }.formattedMessage)
+                    .isEqualTo("auth_refused warn_allowed")
+            }
+        } finally {
+            audit.detachAppender(capture)
+        }
+    }
+
+    @Test
+    fun `with no namespace gate installed, a namespaced read is refused, not let through`() =
+        testApplication {
+            application {
+                installAuth(scopedService(AuthMode.WARN))
+                install(ContentNegotiation) { jackson { configureHoglakeWire() } }
+                routing { get("/v1/catalogs/{catalog}/namespaces/{namespace}") { call.respondText("served") } }
+            }
+            val r =
+                client.get("/v1/catalogs/lake/namespaces/team_42") {
+                    header(HttpHeaders.Authorization, "Bearer ${token(TestTokens.scopedClaims())}")
+                }
+            assertThat(r.status).isEqualTo(HttpStatusCode.Forbidden)
+            assertThat(r.bodyAsText()).doesNotContain("served")
+        }
+
+    @Test
+    fun `the gate lets through only a namespace whose value the caller holds`() =
+        testApplication {
+            application {
+                installAuth(scopedService(AuthMode.WARN))
+                installNamespaceGate { _, ns ->
+                    when (ns) {
+                        "team_42" -> com.posthog.hoglake.model.NamespaceContainment("team_id", 42)
+                        "team_9" -> com.posthog.hoglake.model.NamespaceContainment("team_id", 9)
+                        else -> null
+                    }
+                }
+                install(ContentNegotiation) { jackson { configureHoglakeWire() } }
+                routing { get("/v1/catalogs/{catalog}/namespaces/{namespace}") { call.respondText("served") } }
+            }
+            val scoped = "Bearer ${token(TestTokens.scopedClaims())}"
+            val own = client.get("/v1/catalogs/lake/namespaces/team_42") { header(HttpHeaders.Authorization, scoped) }
+            assertThat(own.bodyAsText()).isEqualTo("served")
+            for (ns in listOf("team_9", "main")) {
+                val r = client.get("/v1/catalogs/lake/namespaces/$ns") { header(HttpHeaders.Authorization, scoped) }
+                assertThat(r.status).describedAs(ns).isEqualTo(HttpStatusCode.NotFound)
+                assertThat(r.bodyAsText()).describedAs(ns).doesNotContain("served")
+            }
         }
 
     @Test

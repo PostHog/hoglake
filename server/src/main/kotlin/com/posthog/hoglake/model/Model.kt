@@ -764,6 +764,19 @@ enum class CatalogNotEmptyReason(val wire: String) {
 data class NamespaceInfo(
     val namespaceId: Long,
     val name: String,
+    /** Set when the namespace is contained (V33); null otherwise. */
+    val containment: NamespaceContainment? = null,
+)
+
+/**
+ * A namespace marked contained for `field = value`: its tables register
+ * files only under `<data_path>/data/<namespace>/`, and no other table
+ * registers files there. What a `ten: scoped` caller holding `value` for
+ * `field` is given; operator-managed.
+ */
+data class NamespaceContainment(
+    val field: String,
+    val value: Long,
 )
 
 /**
@@ -2736,6 +2749,52 @@ sealed class HoglakeException(message: String) : RuntimeException(message) {
     ) : CommitConflict(detail)
 
     /**
+     * The configured database backend did not answer inside its budget
+     * (all hoglite pools unreachable, a tripped circuit breaker, or a
+     * retry budget exhausted on transient errors) -> HTTP 503
+     * `backend_unavailable` with `Retry-After`.
+     *
+     * Retryable: nothing about the request was refused. Caveat the
+     * caller must know: a commit whose TRANSACTION timed out may have
+     * applied — the client got no answer, not a rollback — so a retried
+     * write needs its own idempotency (an idempotency key, or the
+     * acceptance of a typed AlreadyExists/Conflict on the retry).
+     * Distinct from [CommitQueueTimeout] — that
+     * one is a catalog convoying on its own commit lock while the
+     * database is healthy; this one is the database itself not
+     * answering, which an operator pages on differently.
+     */
+    open class BackendUnavailable(detail: String) : HoglakeException(detail)
+
+    /**
+     * A commit the backend may or may not have applied -> HTTP 503
+     * `commit_outcome_unknown` with `Retry-After`. Raised by the hoglite
+     * backend when a transaction's attempts ended after at least one that
+     * may have applied (the engine's 504 `outcome_unknown`: applied, then
+     * the owner failed before durability was confirmed; a transport
+     * failure after the request was sent) and no later answer settled it.
+     *
+     * It IS a [BackendUnavailable] (retryable, never a refusal: the commit
+     * may have landed, so nothing may treat it as final), with its own
+     * code so a writer can tell "the database did not answer" from "your
+     * commit may be durable". Inside the server, a retry of the SAME
+     * backend transaction ([txid]) is exactly-once. The txid is
+     * server-generated, so the message tells an API caller only what it
+     * can do: a retry with the same idempotency_key is exactly-once, and
+     * one without a key is at-least-once, the same as a lost COMMIT
+     * acknowledgement on Postgres. [txid] stays in the message for
+     * operators.
+     */
+    class CommitOutcomeUnknown(
+        val txid: String,
+        detail: String,
+    ) : BackendUnavailable(
+            "commit outcome unknown: it may or may not have been applied. A retry with the same " +
+                "idempotency_key is exactly-once; without a key, read the table before a retry " +
+                "(backend transaction '$txid'): $detail",
+        )
+
+    /**
      * A commit to a table with the object-prefix layout registered a file
      * the layout does not admit -> HTTP 422 `object_prefix_violation`,
      * naming [table] and `retry: re-prepare`.
@@ -2757,4 +2816,22 @@ sealed class HoglakeException(message: String) : RuntimeException(message) {
         /** Qualified `namespace.table`. */
         val table: String,
     ) : HoglakeException(detail)
+
+    /**
+     * A registered path that namespace containment (V33) does not admit:
+     * a contained namespace's table writing outside its prefix, or any
+     * other table writing inside one. 422 `containment_violation`.
+     */
+    class ContainmentViolation(
+        detail: String,
+        /** Qualified `namespace.table`. */
+        val table: String,
+    ) : HoglakeException(detail)
+
+    /**
+     * Marking a namespace contained could not prove, within its time
+     * bound, that no other table's file lives under the prefix. 503
+     * `containment_unverified`: the namespace is left unmarked.
+     */
+    class ContainmentUnverified(detail: String) : HoglakeException(detail)
 }

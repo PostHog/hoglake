@@ -4,6 +4,7 @@ import com.fasterxml.jackson.module.kotlin.readValue
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.CommitRequest
 import com.posthog.hoglake.model.CommitResult
+import com.posthog.hoglake.model.Containment
 import com.posthog.hoglake.model.DeleteFileRegistration
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.HoglakeException
@@ -18,7 +19,6 @@ import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.persistence.CommitLockPath
 import com.posthog.hoglake.persistence.Locks
-import com.posthog.hoglake.service.Identifiers
 import com.posthog.hoglake.storedPayloadObjectMapper
 import io.github.oshai.kotlinlogging.KotlinLogging
 import org.jdbi.v3.core.Handle
@@ -117,7 +117,7 @@ class CommitService(
          * parquet file gets anywhere close; the cap keeps a hostile
          * registration from racing the row-id allocator toward overflow.
          */
-        private const val MAX_FILE_RECORD_COUNT: Long = 1L shl 48
+        internal const val MAX_FILE_RECORD_COUNT: Long = 1L shl 48
 
         /**
          * Cap on the blind-partitioned WARN's dedupe set — see
@@ -125,7 +125,7 @@ class CommitService(
          * table count; it is defence in depth, not the primary bound,
          * which is that the key holds nothing a client chooses.
          */
-        private const val MAX_WARNED_BLIND_PARTITIONED: Int = 512
+        internal const val MAX_WARNED_BLIND_PARTITIONED: Int = 512
 
         /** Which table(s) the blind-partitioned refusal is about. */
         internal fun blindPartitionedRefusal(qualified: List<String>): String =
@@ -326,6 +326,10 @@ class CommitService(
     ) {
         val request = CommitRequest(appends = listOf(TableAppend(namespace, table, files)))
         validatePathsUnderDataPath(dataPath, request)
+        // Containment (V33). Its own statement: table creation does not run
+        // the commit's READ_SQL. The caller holds the catalog lock.
+        val names = containmentNames(dataPath, listOf(namespace), files.map { it.path })
+        checkContainment(dataPath, namespace, table, files.map { it.path }, containedAmong(h, catalogId, names))
         // No object-prefix layout, and none to read: the table was created
         // in THIS transaction, a creation definition cannot carry the
         // option, and replacing a table that has it is refused at prepare
@@ -557,6 +561,13 @@ class CommitService(
                         mergedDeletes.values.flatMap { files ->
                             files.filter { it.dataFilePath == null }.map { it.dataFileId }
                         }.distinct(),
+                    containmentNames =
+                        containmentNames(
+                            dataPath,
+                            tableKeys.map { it.namespace },
+                            mergedAppends.values.flatMap { files -> files.map { it.path } } +
+                                mergedDeletes.values.flatMap { files -> files.map { it.path } },
+                        ),
                 ),
             )
 
@@ -797,6 +808,17 @@ class CommitService(
         // the table's layout. A table without the option skips it whole.
         // Its DVs are checked in planDeletes, after their conflicts.
         validatedAppends.forEach { checkObjectPrefix(it, dataPath) }
+        // 4a'. Namespace containment (V33), on every registered path, data
+        // and DV: the containment of each name was read in the one
+        // statement above, under the lock marking also takes.
+        resolvedAppends.forEach {
+                a ->
+            checkContainment(dataPath, a.namespace, a.table, a.files.map { it.path }, read.contained)
+        }
+        resolvedDeletes.forEach {
+                d ->
+            checkContainment(dataPath, d.namespace, d.table, d.files.map { it.path }, read.contained)
+        }
 
         // 4b. Upload claims, then the removal-queue collision check, and
         // THE LATTER IS THE SERIALIZER NOW RATHER THAN THE COMMIT LOCK:
@@ -980,6 +1002,56 @@ class CommitService(
             throw HoglakeException.Validation("idempotency_key reused with a different request")
         }
         return CommitResult(receipt.snapshotId, receipt.schemaVersion)
+    }
+
+    /** The namespace names a commit must know the containment of: its targets' and its paths' segments. */
+    private fun containmentNames(
+        dataPath: String,
+        namespaces: List<String>,
+        paths: List<String>,
+    ): List<String> = (namespaces + paths.flatMap { Containment.segments(dataPath, it) }).distinct()
+
+    /** Which of [names] are live contained namespaces; READ_SQL's `contained` CTE, alone. */
+    private fun containedAmong(
+        h: Handle,
+        catalogId: Long,
+        names: List<String>,
+    ): Set<String> =
+        h.createQuery(
+            """
+            SELECT name FROM hog_namespace
+             WHERE catalog_id = :catalogId AND NOT dropped AND contained_field IS NOT NULL
+               AND name = ANY(CAST(:names AS text[]))
+            """,
+        ).bind("catalogId", catalogId).bindArray("names", String::class.java, names)
+            .mapTo(String::class.java).set()
+
+    /**
+     * Refuse any of [paths] that containment (V33) does not admit for a
+     * table in [namespace]: see [Containment.violation]. No contained
+     * namespace among the names read, which is every catalog until an
+     * operator marks one, refuses nothing.
+     */
+    private fun checkContainment(
+        dataPath: String,
+        namespace: String,
+        table: String,
+        paths: List<String>,
+        contained: Set<String>,
+    ) {
+        if (contained.isEmpty()) return
+        val refused =
+            paths.mapNotNull {
+                    p ->
+                Containment.violation(dataPath, namespace, p, contained)?.let { p to it }
+            }
+        if (refused.isEmpty()) return
+        val (first, why) = refused.first()
+        throw HoglakeException.ContainmentViolation(
+            "$why; refused $namespace.$table path '$first'" +
+                (if (refused.size > 1) " (+${refused.size - 1} more)" else ""),
+            "$namespace.$table",
+        )
     }
 
     /**
@@ -1344,18 +1416,7 @@ class CommitService(
         layout: ObjectPrefixLayout,
         deletes: ResolvedDeletes,
         dataPath: String,
-    ): String? {
-        if (ObjectPrefix.parseValue(raw, layout.colType) == null) {
-            return "${reg.path} (its target data_file_id ${reg.dataFileId} has no canonical " +
-                "'${layout.fieldName}' value, got ${raw?.let { "'${Identifiers.cap(it)}'" } ?: "none"})"
-        }
-        val prefix = ObjectPrefix.prefix(dataPath, deletes.namespace, deletes.table, layout, raw!!)
-        return if (ObjectPrefix.isUnder(reg.path, prefix)) {
-            null
-        } else {
-            "${reg.path} (expected under $prefix, its target data_file_id ${reg.dataFileId}'s prefix)"
-        }
-    }
+    ): String? = ObjectPrefixRules.dvViolation(reg, raw, layout, deletes.namespace, deletes.table, dataPath)
 
     /**
      * The refusal for a commit whose table did not resolve live: a
@@ -1485,44 +1546,12 @@ class CommitService(
             "${append.namespace}.${append.table} has the object-prefix layout on '${layout.fieldName}' but its " +
                 "live spec has no single identity field on it"
         }
-        val violations = ArrayList<String>()
-        for (file in append.files) {
-            // validateFiles already refused a missing list and a wrong arity.
-            val raw = file.partitionValues!![keyIndex]
-            val value = ObjectPrefix.parseValue(raw, layout.colType)
-            if (value == null) {
-                violations += "${file.path} (partition value ${raw?.let { "'${Identifiers.cap(it)}'" } ?: "null"} " +
-                    "is not a canonical ${layout.colType.wire} value: digits only, no sign or leading zero)"
-                continue
-            }
-            val prefix = ObjectPrefix.prefix(dataPath, append.namespace, append.table, layout, raw!!)
-            if (!ObjectPrefix.isUnder(file.path, prefix)) {
-                violations += "${file.path} (expected under $prefix)"
-                continue
-            }
-            // Deferred stats: the hydrator checks the footer (KDoc above).
-            val stats = file.columnStats ?: continue
-            val verdict =
-                ObjectPrefix.checkFieldStats(layout, value, stats.firstOrNull { it.fieldId == layout.fieldId })
-            if (verdict != ObjectPrefix.Verdict.OK) {
-                violations += "${file.path} (its column stats for '${layout.fieldName}' do not prove every row " +
-                    "is $raw: ${describe(verdict)})"
-            }
-        }
+        val violations =
+            ObjectPrefixRules.appendViolations(append.files, layout, keyIndex, append.namespace, append.table, dataPath)
         if (violations.isNotEmpty()) {
             throw objectPrefixViolation(append.namespace, append.table, dataPath, layout, violations)
         }
     }
-
-    private fun describe(verdict: ObjectPrefix.Verdict): String =
-        when (verdict) {
-            ObjectPrefix.Verdict.OK -> "ok"
-            ObjectPrefix.Verdict.MISSING_STATS -> "no stats row for the field"
-            ObjectPrefix.Verdict.NULL_BOUNDS ->
-                "a bound is missing (absent, or dropped as undecodable for the column's type)"
-            ObjectPrefix.Verdict.NULLS_PRESENT -> "null_count is not 0"
-            ObjectPrefix.Verdict.BOUND_MISMATCH -> "the lower and upper bounds are not both the value"
-        }
 
     /**
      * The 422 for [violations] (one entry per offending path, with its
@@ -1536,20 +1565,8 @@ class CommitService(
         dataPath: String,
         layout: ObjectPrefixLayout,
         violations: List<String>,
-    ): HoglakeException.ObjectPrefixViolation {
-        val qualified = "$namespace.$table"
-        val expected = ObjectPrefix.tableRoot(dataPath, namespace, table) + "${layout.fieldName}=<value>/"
-        return HoglakeException.ObjectPrefixViolation(
-            "${violations.size} file(s) registered to $qualified break its object-prefix layout: " +
-                violations.take(5).joinToString("; ") +
-                (if (violations.size > 5) " (+${violations.size - 5} more)" else "") +
-                ". Every data file and deletion vector of $qualified lives under $expected, <value> being the " +
-                "data file's identity partition value for '${layout.fieldName}' (a DV's: its target's), with " +
-                "column stats proving every row holds it; re-read the table and re-prepare, replaying this " +
-                "request cannot succeed",
-            table = qualified,
-        )
-    }
+    ): HoglakeException.ObjectPrefixViolation =
+        ObjectPrefixRules.violation(namespace, table, dataPath, layout, violations)
 
     /**
      * The table's live partition spec, or null when unpartitioned. A spec

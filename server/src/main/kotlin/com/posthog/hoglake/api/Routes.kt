@@ -3,11 +3,14 @@ package com.posthog.hoglake.api
 import com.posthog.hoglake.BuildInfo
 import com.posthog.hoglake.auth.AuthState
 import com.posthog.hoglake.auth.Caller
+import com.posthog.hoglake.auth.Scope
 import com.posthog.hoglake.auth.actorOrRefuse
 import com.posthog.hoglake.auth.hoglakeAuth
+import com.posthog.hoglake.auth.requireScopedNamespaces
 import com.posthog.hoglake.auth.resolveActor
 import com.posthog.hoglake.commit.CommitService
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.NamespaceContainment
 import com.posthog.hoglake.observability.CatalogTotals
 import com.posthog.hoglake.observability.InstanceTotals
 import com.posthog.hoglake.observability.instanceTotalsFor
@@ -145,12 +148,22 @@ fun Application.installApiRoutes(
 
                 route("/namespaces") {
                     get {
+                        val catalog = call.catalog()
+                        // A scoped caller sees only the contained namespaces
+                        // it may use (AuthPolicy.SCOPED_ROUTES); everyone
+                        // else, everything.
+                        val scoped = call.hoglakeAuth.callerOrNull?.takeIf { it.kind == Caller.Kind.SCOPED }
                         call.respond(
                             catalogs.listNamespaces(
-                                call.catalog(),
+                                catalog,
                                 call.longQuery("snapshot"),
                                 call.instantQuery("at_timestamp"),
-                            ).map { it.toDto() },
+                            ).filter { ns ->
+                                scoped == null ||
+                                    ns.containment?.let {
+                                        scoped.mayUseContained(catalog, it.field, it.value, Scope.READ)
+                                    } == true
+                            }.map { it.toDto() },
                         )
                     }
                     post {
@@ -178,6 +191,31 @@ fun Application.installApiRoutes(
                                 call.longQuery("expected_namespace_id"),
                                 call.actorOrRefuse(call.request.queryParameters["author"]),
                                 call.request.queryParameters["message"],
+                                // Auth off, or an operator: a contained
+                                // namespace may be dropped. A tenant may not.
+                                mayDropContained = call.hoglakeAuth.callerOrNull?.kind?.isOperator() ?: true,
+                            ).toDto(),
+                        )
+                    }
+                    // Containment (V33): operator-only in AuthPolicy.
+                    put("/{namespace}/containment") {
+                        val req = call.receive<NamespaceContainmentDto>()
+                        call.respond(
+                            catalogs.setNamespaceContainment(
+                                call.catalog(),
+                                call.namespace(),
+                                NamespaceContainment(req.field, req.value),
+                                call.actorOrRefuse(null),
+                            ).toDto(),
+                        )
+                    }
+                    delete("/{namespace}/containment") {
+                        call.respond(
+                            catalogs.setNamespaceContainment(
+                                call.catalog(),
+                                call.namespace(),
+                                null,
+                                call.actorOrRefuse(null),
                             ).toDto(),
                         )
                     }
@@ -877,8 +915,13 @@ internal fun parseExpectedTableUuid(raw: String): UUID =
  * <subject>` for a delegating client, and naming anyone else is refused. A
  * commit route that read the body directly would take its `author` as given:
  * `CommitAttributionTest` fails if one does.
+ *
+ * A scoped caller is held here to the namespaces the body names, before the
+ * commit runs and before a receipt can replay (ScopedWrites.kt).
  */
 internal suspend fun ApplicationCall.receiveCommit(): CommitRequestDto =
-    receive<CommitRequestDto>().attributed(hoglakeAuth)
+    receive<CommitRequestDto>().attributed(hoglakeAuth).also { req ->
+        requireScopedNamespaces(catalog(), req.appends.map { it.namespace } + req.deletes.map { it.namespace })
+    }
 
 internal fun CommitRequestDto.attributed(auth: AuthState): CommitRequestDto = copy(author = resolveActor(auth, author))

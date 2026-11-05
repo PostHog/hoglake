@@ -542,10 +542,102 @@ contract vector is `scoped_team` in `oauth/contract-vectors.json`.
   scope loses authority; dropping an unknown predicate would gain it.
 - **A value's permission** is the lower of its own and `cat`'s for the catalog.
 - **Fails closed.** A scoped caller may use `AUTHENTICATED` routes (listings,
-  filtered to `cat`, with catalog totals withheld) and nothing catalog-scoped:
-  every catalog route answers `403` until it narrows by predicate. That holds
-  under `warn` too. Routes learn the predicate one at a time, after namespace
-  containment exists to attribute tables to values.
+  filtered to `cat`, with catalog totals withheld) and, in a catalog it names,
+  only the routes listed in `AuthPolicy.SCOPED_ROUTES`. Every other catalog
+  route answers `403`, under `warn` too, and a route added to the table stays
+  closed to scoped callers until it is listed.
+- **Reads, by namespace.** The listed routes are the namespace-scoped reads (a
+  namespace, its tables and views, and a table's metadata, files, scan plan,
+  partitions, changes and file stats) and the namespace listing. A
+  `{namespace}` route is allowed only when that namespace is live, contained
+  (§6.2b), and its value is one the token holds with `read` (`*` holds every
+  value of the field); anything else is the `404` a missing namespace gets, so
+  a scoped caller learns nothing of namespaces outside its own. The listing
+  returns only those namespaces. Uncontained namespaces are never visible to a
+  scoped caller. Clearing a namespace's containment closes it at once.
+- **Where it is decided.** The auth plugin decides everything but the
+  namespace and leaves that to the namespace gate (`auth/NamespaceGate.kt`), a
+  pipeline phase after the blocking dispatcher and before routing: the check
+  needs one indexed read of `hog_namespace`, and the plugin runs before the
+  dispatcher so a refused request never borrows a connection. Without the gate
+  installed the plugin refuses instead of deferring.
+- **Writes, by namespace.** A scoped caller writes only to namespaces it
+  could read with `write` in place of `read`: live, contained, and contained
+  for a value the token holds with `write` (and `cat` holds `write`).
+  Anything else is the same `404`.
+  - **In the path:** create, drop, truncate or alter a table, and create or
+    drop a view. The namespace gate decides, as for reads.
+  - **In the body** (`AuthPolicy.BODY_SCOPED_ROUTES`): every commit route,
+    table-creation prepare, and upload claim. The plugin cannot read a body,
+    so it lets the call through and the handler checks every namespace the
+    request names before it acts (`auth/ScopedWrites.kt`). A commit is
+    checked before its receipt can replay, so a scoped caller never gets
+    another namespace's stored result. One namespace a caller may not use
+    refuses the whole request.
+  - **Behind an id:** a table creation's status, publish and abort check the
+    namespace recorded at prepare. Publish already re-checks that record
+    against the live namespace's id.
+  - **Upload claims** must spell `<data_path>/data/<namespace>/` literally,
+    as a contained table's files must (`403` otherwise). Renew and abandon
+    are keyed by the claim owner and name no namespace, so they are allowed.
+    `schedule-expired` stays an operator's.
+  - **Still refused:** namespace create and drop, containment, consumer
+    offsets, maintenance, options and every catalog-wide route.
+  - **Without the lock.** These checks run before the commit lock. They read
+    nothing a scoped writer can change. Containment clears only from an
+    empty namespace, a contained namespace drops only for an operator, and a
+    contained name is never another namespace's. So a namespace that passes
+    stays the caller's until an operator acts.
+  - **Files.** Containment (§6.2b) still holds a file's path to its table's
+    namespace, so a scoped writer can neither register files outside its
+    prefix nor into another's.
+
+### 6.2b Namespace containment
+
+Containment is what attributes tables to predicate values. An operator marks a
+namespace contained for `field = value` (`PUT
+/v1/catalogs/{c}/namespaces/{ns}/containment`, body `{"field": "team_id",
+"value": 42}`; `DELETE` clears). hoglake knows nothing about teams: the field
+is any lowercase identifier, the value a positive id, and the convention that
+`team_<id>` is contained for `team_id = <id>` lives in the provisioner.
+
+- **The prefix is the namespace's.** A table in a contained namespace `n`
+  registers files only under `<data_path>/data/n/`, and no table outside `n`
+  registers files there (`containment_violation`, 422). Checked on every
+  commit route and on table-creation publish; a contained namespace's
+  table-creation `write_path` is `data/<n>/<uuid>/`. A contained table's
+  files spell `data/<n>/` literally; everyone else's are compared decoded as
+  well, the `data` directory and the segment after it, so neither
+  `team%5F42/` nor `d%61ta/team_42/` reaches `team_42`'s prefix.
+- **The name is the namespace's alone.** Marking refuses a name another
+  namespace in the catalog has ever had (`commit_conflict`). Reads at a past
+  snapshot resolve a namespace by name, so with the name only ever this
+  namespace's, every resolution of it is this namespace or nothing, and
+  authorizing the live one authorizes its whole history. Together with the
+  next rule, every table a contained namespace has ever had was created
+  while it was contained.
+- **Marked only when that is already true.** Marking refuses a namespace that
+  has ever held a table or view (`namespace_not_empty`) and a prefix that
+  still holds another table's object as far as the catalog knows, in any
+  spelling that decodes to it (`commit_conflict`): a data file or DV row,
+  live or retained for time travel (it is still readable), a live upload
+  claim, or a removal not yet drained. The full scan runs outside the commit
+  lock under a 10 s bound (`containment_unverified`, 503, past it); under
+  the lock only what was allocated since it began is re-read: file and DV
+  ids, and undrained removals (expiry and retirement move a file row into
+  the removal queue in one transaction, so a file registered after the scan
+  and gone before the lock is still found).
+- **A tenant's upload claims are not bound to a namespace.** A claim names a
+  prefix, not a table, so after marking a tenant can still claim under a
+  contained prefix and write bytes there. It can't register them (the
+  commit check refuses), and a tenant token already has the whole catalog.
+  A scoped caller's claim is held to its contained namespaces (§6.2a).
+- **One live namespace per `(catalog, field, value)`** (`already_exists`).
+- **Operators only.** Marking and clearing are operator routes; a tenant
+  token cannot drop a contained namespace (403). Clearing requires the
+  namespace to be empty.
+- **Nothing changes until something is marked.** A catalog with no contained
+  namespace refuses nothing it refused before.
 
 ### 6.3 Scope vocabulary
 
