@@ -164,10 +164,13 @@ round-trips every byte value and lengths 0 to 1 MiB.
    another `table_uuid` raises `FlushHalted("table_recreated")` before
    the poll: exit 3).
 2. Poll up to `consume_batch_size` records, clamped to
-   `consume_batch_max_bytes ÷` the observed mean record size.
-3. Classify on a worker thread (`classify_message`): strict JSON object
-   → stage under the keyer's tuple; anything else → `DroppedRecord`
-   (counted, rate-limited log).
+   `consume_batch_max_bytes ÷` the observed mean record size (a staged
+   record counts at its staged, decompressed size).
+3. Classify on a worker thread (`classify_message`): a value starting
+   with the LZ4 frame magic is decompressed first (WarpStream pipelines
+   write LZ4 frames; a corrupt frame drops as `undecodable_lz4`); strict
+   JSON object → stage the JSON under the keyer's tuple; anything else →
+   `DroppedRecord` (counted, rate-limited log).
 4. ONE home-stage write for the whole poll: `stage_batch` (one
    durable WriteBatch holding every partition's records), or
    `probe_fence` when every record of the poll was dropped (an empty

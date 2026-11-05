@@ -130,8 +130,12 @@ complete scan of it was flushed and no write touched it since; so a
 group with staged rows is always in the index, and every group becomes
 due within the slow-lane deadline.
 
+A value that starts with the LZ4 frame magic (`04 22 4d 18`, as
+WarpStream pipelines write it) is decompressed before parsing, and the
+decompressed JSON is what gets staged.
+
 There is no quarantine: a record that can never become a row (not a
-JSON object, a malformed partition source, a value no column can hold,
+JSON object, a corrupt LZ4 frame, a malformed partition source, a value no column can hold,
 a null or negative value of an object-prefix table's field) is
 dropped, logged and metered (`millrace_records_dropped_total{reason}`),
 at consume time (nothing is staged for it) or at flush time (it is left
