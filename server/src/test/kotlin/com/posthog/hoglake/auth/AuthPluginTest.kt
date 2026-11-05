@@ -118,6 +118,8 @@ class AuthPluginTest {
                 assertThat(r.status).describedAs(path).isEqualTo(HttpStatusCode.Forbidden)
                 assertThat(r.bodyAsText()).contains("scoped credential")
             }
+            // A body-scoped route with no namespace gate (so no lookups for its
+            // handler) is refused by the plugin.
             val commit = client.post("/v1/catalogs/lake/commit") { header(HttpHeaders.Authorization, scoped) }
             assertThat(commit.status).isEqualTo(HttpStatusCode.Forbidden)
             // Another catalog is still a 404, as for a tenant.

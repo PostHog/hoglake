@@ -1,7 +1,10 @@
 package com.posthog.hoglake.api
 
 import com.fasterxml.jackson.databind.annotation.JsonDeserialize
+import com.posthog.hoglake.auth.Caller
 import com.posthog.hoglake.auth.actorOrRefuse
+import com.posthog.hoglake.auth.hoglakeAuth
+import com.posthog.hoglake.auth.requireScopedNamespaces
 import com.posthog.hoglake.service.ReplacementTarget
 import com.posthog.hoglake.service.TableCreation
 import com.posthog.hoglake.service.TableCreationDefinition
@@ -66,8 +69,12 @@ fun Application.installTableCreationRoutes(creations: TableCreationService) {
             put("/partitioned") { call.prepareCreation(creations, partitioned = true) }
             put("/sorted") { call.prepareCreation(creations, partitioned = false, sorted = true) }
             put("/metadata") { call.prepareCreation(creations, partitioned = false, metadata = true) }
-            get { call.respond(creations.status(call.creationCatalog(), call.creationOperation()).toDto()) }
+            get {
+                call.requireScopedCreation(creations)
+                call.respond(creations.status(call.creationCatalog(), call.creationOperation()).toDto())
+            }
             post("/commit") {
+                call.requireScopedCreation(creations)
                 val request = call.receive<PublishTableCreationDto>()
                 call.respond(
                     creations.publish(
@@ -80,6 +87,7 @@ fun Application.installTableCreationRoutes(creations: TableCreationService) {
                 )
             }
             post("/commit/uploads") {
+                call.requireScopedCreation(creations)
                 val request = call.receive<PublishTableCreationDto>()
                 call.respond(
                     creations.publish(
@@ -89,7 +97,10 @@ fun Application.installTableCreationRoutes(creations: TableCreationService) {
                     ).toDto(),
                 )
             }
-            post("/abort") { call.respond(creations.abort(call.creationCatalog(), call.creationOperation()).toDto()) }
+            post("/abort") {
+                call.requireScopedCreation(creations)
+                call.respond(creations.abort(call.creationCatalog(), call.creationOperation()).toDto())
+            }
         }
     }
 }
@@ -101,6 +112,7 @@ private suspend fun ApplicationCall.prepareCreation(
     metadata: Boolean = false,
 ) {
     val request = receive<PrepareTableCreationDto>()
+    requireScopedNamespaces(creationCatalog(), listOf(request.namespace))
 
     fun hasComment(columns: List<ColumnDefDto>): Boolean =
         columns.any {
@@ -149,3 +161,16 @@ private fun ApplicationCall.creationOperation(): UUID =
     } catch (_: IllegalArgumentException) {
         throw BadRequestException("invalid operation UUID")
     }
+
+/**
+ * A scoped caller may read, publish or abort only a creation prepared for a
+ * namespace it may use. The namespace is the one recorded at prepare, which
+ * publish re-checks against the live namespace's id, so a creation cannot be
+ * pointed elsewhere after the check. A creation that does not exist answers
+ * 404 as it would for anyone.
+ */
+private fun ApplicationCall.requireScopedCreation(creations: TableCreationService) {
+    if (hoglakeAuth.callerOrNull?.kind != Caller.Kind.SCOPED) return
+    val creation = creations.status(creationCatalog(), creationOperation())
+    requireScopedNamespaces(creationCatalog(), listOf(creation.definition.namespace))
+}

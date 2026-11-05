@@ -196,4 +196,19 @@ sealed interface AuthDecision {
         val namespace: String,
         val required: Scope,
     ) : AuthDecision
+
+    /**
+     * A scoped caller on a route whose namespaces are in its BODY (a commit,
+     * a table creation, an upload claim). The plugin cannot read the body,
+     * so it lets the call through to the handler, which checks every
+     * namespace the request names before it acts
+     * ([requireScopedNamespaces], ScopedWrites.kt) and answers 404 as the
+     * gate does. The handler's check keys on the caller's kind, not on this
+     * decision being recorded, so a scoped caller reaching such a handler
+     * any other way is refused there too.
+     */
+    data class ByBody(
+        val catalog: String,
+        val required: Scope,
+    ) : AuthDecision
 }

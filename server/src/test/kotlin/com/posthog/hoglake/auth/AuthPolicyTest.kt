@@ -257,9 +257,9 @@ class AuthPolicyTest {
     }
 
     @Test
-    fun `a scoped caller is refused on every catalog route but the listed reads, decided per namespace`() {
+    fun `a scoped caller is refused on every catalog route but the listed ones, decided per namespace`() {
         // A route added to the table is refused to scoped callers until it is
-        // listed in SCOPED_ROUTES.
+        // listed in SCOPED_ROUTES or BODY_SCOPED_ROUTES.
         val scoped =
             Caller(
                 subject = "hlc_team",
@@ -281,16 +281,21 @@ class AuthPolicyTest {
                     assertThat(
                         decision,
                     ).describedAs(rule.pattern).isInstanceOf(AuthDecision.InsufficientScope::class.java)
-                else ->
-                    if ((rule.method to rule.pattern) !in AuthPolicy.SCOPED_ROUTES) {
+                else -> {
+                    val route = rule.method to rule.pattern
+                    val scope = rule.requirement.scopeOrNull()!!
+                    if (route in AuthPolicy.BODY_SCOPED_ROUTES) {
+                        assertThat(decision).describedAs(rule.pattern).isEqualTo(AuthDecision.ByBody("lake", scope))
+                    } else if (route !in AuthPolicy.SCOPED_ROUTES) {
                         assertThat(decision).describedAs(rule.pattern)
                             .isEqualTo(AuthDecision.NotPredicated("lake", match.pattern))
                     } else if ("{namespace}" in rule.pattern) {
                         assertThat(decision).describedAs(rule.pattern)
-                            .isEqualTo(AuthDecision.ByNamespace("lake", "x", Scope.READ))
+                            .isEqualTo(AuthDecision.ByNamespace("lake", "x", scope))
                     } else {
                         assertThat(decision).describedAs(rule.pattern).isEqualTo(AuthDecision.Allow)
                     }
+                }
             }
         }
         // HEAD is GET for this too.
@@ -313,11 +318,18 @@ class AuthPolicyTest {
     }
 
     @Test
-    fun `every scoped route is a read the table lists`() {
-        for ((method, pattern) in AuthPolicy.SCOPED_ROUTES) {
+    fun `every scoped route is a read or a write the table lists, in one list`() {
+        assertThat(AuthPolicy.SCOPED_ROUTES intersect AuthPolicy.BODY_SCOPED_ROUTES).isEmpty()
+        for ((method, pattern) in AuthPolicy.SCOPED_ROUTES + AuthPolicy.BODY_SCOPED_ROUTES) {
             val rule = AuthPolicy.rules.singleOrNull { it.method == method && it.pattern == pattern }
             assertThat(rule).describedAs("%s %s is in the table", method.value, pattern).isNotNull()
-            assertThat(rule!!.requirement).describedAs("%s %s", method.value, pattern).isEqualTo(Requirement.READ)
+            assertThat(rule!!.requirement).describedAs("%s %s", method.value, pattern)
+                .isIn(Requirement.READ, Requirement.WRITE)
+        }
+        // A body-scoped route either names no namespace in its path, or is
+        // listed there because its path cannot name all it touches.
+        for ((_, pattern) in AuthPolicy.BODY_SCOPED_ROUTES) {
+            assertThat(pattern).describedAs(pattern).doesNotContain("{namespace}")
         }
     }
 

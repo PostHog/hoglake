@@ -1,5 +1,6 @@
 package com.posthog.hoglake.api
 
+import com.posthog.hoglake.auth.requireScopedUploadPrefix
 import com.posthog.hoglake.service.UploadService
 import io.ktor.server.application.Application
 import io.ktor.server.plugins.BadRequestException
@@ -28,6 +29,7 @@ fun Application.installUploadRoutes(uploads: UploadService) {
                     } catch (_: IllegalArgumentException) {
                         throw BadRequestException("invalid upload UUID")
                     }
+                call.requireScopedUploadPrefix(call.parameters["catalog"]!!, req.prefix)
                 call.respond(uploads.claim(call.parameters["catalog"]!!, id, req.owner, req.prefix, req.fileKind))
             }
             post("/renew") {

@@ -355,7 +355,16 @@ class App private constructor(
         // A scoped caller's namespace check, on the dispatcher and before
         // routing: the half of authorization that needs the database
         // (auth/NamespaceGate.kt).
-        app.installNamespaceGate(catalogService::liveContainment)
+        app.installNamespaceGate(
+            dataPath = { catalog ->
+                try {
+                    catalogService.getCatalog(catalog).dataPath
+                } catch (_: com.posthog.hoglake.model.HoglakeException.NotFound) {
+                    null
+                }
+            },
+            containment = catalogService::liveContainment,
+        )
         app.install(ContentNegotiation) {
             // One definition, shared with the tests that pin this
             // behaviour (api/WireJson.kt).
