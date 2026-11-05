@@ -9,6 +9,8 @@ import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.NamespaceContainment
 import com.posthog.hoglake.model.TableAppend
 import com.posthog.hoglake.model.TableDeletes
+import com.posthog.hoglake.persistence.CommitLockPath
+import com.posthog.hoglake.persistence.Locks
 import com.posthog.hoglake.service.CatalogService
 import com.posthog.hoglake.service.TableCreationDefinition
 import com.posthog.hoglake.service.TableCreationService
@@ -16,6 +18,7 @@ import com.posthog.hoglake.service.UploadService
 import com.posthog.hoglake.testing.PgTestSupport
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
+import org.jdbi.v3.core.kotlin.inTransactionUnchecked
 import org.jdbi.v3.core.kotlin.useHandleUnchecked
 import org.jdbi.v3.core.kotlin.withHandleUnchecked
 import org.junit.jupiter.api.AfterAll
@@ -23,6 +26,9 @@ import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
 import java.util.UUID
+import java.util.concurrent.Executors
+import java.util.concurrent.Future
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -226,6 +232,60 @@ class NamespaceContainmentIntegrationTest {
         catalogs.createNamespace(cat, "team_14")
         assertThatThrownBy { catalogs.setNamespaceContainment(cat, "team_14", NamespaceContainment("team_id", 14)) }
             .isInstanceOf(HoglakeException.CommitConflict::class.java)
+    }
+
+    @Test
+    fun `a file queued for removal between the scan and the lock still blocks the mark`() {
+        // The unlocked scan finds nothing; then, while marking waits on the
+        // commit lock, a path under the prefix lands in the removal queue (as
+        // expiry or retirement would move a file registered after the scan).
+        // The locked pass must find it.
+        val cat = fixture()
+        catalogs.createNamespace(cat, "team_20")
+        val late = data(cat, "team_20/late.parquet")
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            lateinit var marking: Future<*>
+            db.jdbi.inTransactionUnchecked { h ->
+                val catalogId =
+                    h.createQuery("SELECT catalog_id FROM hog_catalog WHERE name = :n").bind("n", cat)
+                        .mapTo(Long::class.java).one()
+                Locks.acquireCatalogCommitLock(h, catalogId, cat, CommitLockPath.DDL)
+                marking =
+                    executor.submit {
+                        catalogs.setNamespaceContainment(cat, "team_20", NamespaceContainment("team_id", 20))
+                    }
+                val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+                while (true) {
+                    h.execute("SELECT pg_stat_clear_snapshot()")
+                    val waiting =
+                        h.createQuery(
+                            """
+                            SELECT count(*) FROM pg_stat_activity
+                            WHERE datname = current_database() AND wait_event_type = 'Lock'
+                              AND wait_event = 'advisory' AND pid <> pg_backend_pid()
+                            """,
+                        ).mapTo(Int::class.java).one()
+                    if (waiting > 0) break
+                    check(System.nanoTime() < deadline) { "marking did not reach the commit lock" }
+                    Thread.sleep(10)
+                }
+                db.jdbi.useHandleUnchecked { other ->
+                    other.execute(
+                        "INSERT INTO hog_file_removal (catalog_id, path, file_kind, reason) " +
+                            "VALUES (?, ?, 'data', 'snapshot_expiry')",
+                        catalogId,
+                        late,
+                    )
+                }
+            }
+            assertThatThrownBy { marking.get(10, TimeUnit.SECONDS) }
+                .hasCauseInstanceOf(HoglakeException.CommitConflict::class.java)
+                .hasMessageContaining(late)
+            assertThat(catalogs.getNamespace(cat, "team_20").containment).isNull()
+        } finally {
+            executor.shutdownNow()
+        }
     }
 
     @Test
