@@ -405,6 +405,18 @@ class CatalogService(private val jdbi: Jdbi) {
     // ---- namespaces ------------------------------------------------------
 
     /**
+     * What the locked marking pass re-reads from: the catalog's next file id
+     * and the removal queue's highest id, both read before the unlocked scan.
+     * Ids are allocated in order, so anything allocated after the read is
+     * above them. Anything below them is either in the scan or belongs to a
+     * transaction still open at the scan, whose file rows the scan saw.
+     */
+    private data class ScanWatermark(
+        val fileId: Long,
+        val removalId: Long,
+    )
+
+    /**
      * Mark [namespace] contained for `field = value` (V33), or clear it
      * with a null [containment]. Operator-only (the route says so).
      *
@@ -453,9 +465,17 @@ class CatalogService(private val jdbi: Jdbi) {
                 jdbi.inTransactionUnchecked { h ->
                     val cat = requireCatalog(h, catalog)
                     val ns = requireNamespace(h, cat, namespace)
+                    // Both read BEFORE the scan, so everything allocated
+                    // after it sits above them; see [ScanWatermark].
                     val from =
-                        h.createQuery("SELECT next_file_id FROM hog_catalog WHERE catalog_id = :c")
-                            .bind("c", cat.catalogId).mapTo(Long::class.java).one()
+                        ScanWatermark(
+                            fileId =
+                                h.createQuery("SELECT next_file_id FROM hog_catalog WHERE catalog_id = :c")
+                                    .bind("c", cat.catalogId).mapTo(Long::class.java).one(),
+                            removalId =
+                                h.createQuery("SELECT coalesce(max(removal_id), 0) FROM hog_file_removal")
+                                    .mapTo(Long::class.java).one(),
+                        )
                     // The cheap refusals first, so a namespace that holds
                     // tables is told so rather than that its own files sit
                     // under its prefix. Repeated under the lock below.
@@ -503,22 +523,24 @@ class CatalogService(private val jdbi: Jdbi) {
      * resolves to it (what [com.posthog.hoglake.model.Containment.segments]
      * compares at commit), or null.
      *
-     * [fromFileId] null is the unlocked pass: every row of the catalog,
-     * under [CONTAINMENT_SCAN_TIMEOUT_MS]. Otherwise it is the pass under
-     * the commit lock, and reads only file and DV ids from [fromFileId] on,
-     * by primary key: those are the only rows the lock serializes. Claims
-     * and the removal queue take no commit lock, so re-reading them there
-     * would cost lock time and close no race; a claim can't register a
-     * file into the prefix (the commit check refuses it), and every row the
-     * queue gains came from a file row already scanned or from a claim.
+     * [from] null is the unlocked pass: every row of the catalog, under
+     * [CONTAINMENT_SCAN_TIMEOUT_MS]. Otherwise it is the pass under the
+     * commit lock, and reads only what was allocated since the watermark:
+     * file and DV ids by primary key, and undrained removals by the drain
+     * index (expiry and retirement move a file row into the queue in one
+     * transaction, so a file registered after the scan and gone before the
+     * lock is still found). Claims take no commit lock, so re-reading them
+     * there would cost lock time and close no race; a claim can't register
+     * a file into the prefix (the commit check refuses it).
      */
     private fun foreignFileUnderPrefix(
         h: org.jdbi.v3.core.Handle,
         catalogId: Long,
         dataPath: String,
         namespace: String,
-        fromFileId: Long?,
+        from: ScanWatermark?,
     ): String? {
+        val fromFileId = from?.fileId
         val root = dataPath.trimEnd('/') + "/"
         val ids = if (fromFileId == null) "" else "AND %s >= :from"
         // The literal prefix, or a path with a `%` whose `<dir>/<segment>/`
@@ -537,6 +559,17 @@ class CatalogService(private val jdbi: Jdbi) {
                     (SELECT path FROM hog_file_removal
                       WHERE catalog_id = :c AND drained_at IS NULL AND $match LIMIT 1)
             """
+        // Under the lock: a file row registered after the scan can leave
+        // hog_data_file before the lock only through expiry or retirement,
+        // which queue its path in the same transaction, so an undrained
+        // removal above the watermark is re-read too (the drain index's
+        // `(catalog_id, removal_id)` range).
+        val lockedRemovals =
+            """
+                    UNION ALL
+                    (SELECT path FROM hog_file_removal
+                      WHERE catalog_id = :c AND drained_at IS NULL AND removal_id > :fromRemoval AND $match LIMIT 1)
+            """
         h.execute("SET LOCAL statement_timeout = '${if (fromFileId == null) CONTAINMENT_SCAN_TIMEOUT_MS else 1_000}ms'")
         return try {
             h.createQuery(
@@ -547,12 +580,12 @@ class CatalogService(private val jdbi: Jdbi) {
                     UNION ALL
                     (SELECT path FROM hog_delete_file WHERE catalog_id = :c ${ids.format("delete_file_id")}
                        AND $match LIMIT 1)
-                    ${if (fromFileId == null) unlockedOnly else ""}
+                    ${if (fromFileId == null) unlockedOnly else lockedRemovals}
                 ) hit LIMIT 1
                 """,
             ).bind("c", catalogId).bind("prefix", root + "data/" + namespace + "/").bind("root", root)
                 .bind("spelled", "^" + spelledAs("data") + "/" + spelledAs(namespace) + "/")
-                .also { q -> fromFileId?.let { q.bind("from", it) } }
+                .also { q -> from?.let { q.bind("from", it.fileId).bind("fromRemoval", it.removalId) } }
                 .mapTo(String::class.java).findOne().orElse(null)
         } catch (e: org.jdbi.v3.core.statement.UnableToExecuteStatementException) {
             if (Pg.isQueryCanceled(e)) {

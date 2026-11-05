@@ -571,8 +571,10 @@ is any lowercase identifier, the value a positive id, and the convention that
   live or retained for time travel (it is still readable), a live upload
   claim, or a removal not yet drained. The full scan runs outside the commit
   lock under a 10 s bound (`containment_unverified`, 503, past it); under
-  the lock only file and DV ids allocated since are re-read, the only rows
-  that lock serializes.
+  the lock only what was allocated since it began is re-read: file and DV
+  ids, and undrained removals (expiry and retirement move a file row into
+  the removal queue in one transaction, so a file registered after the scan
+  and gone before the lock is still found).
 - **Upload claims are not yet bound to a namespace.** A claim names a
   prefix, not a table, so after marking a tenant can still claim under a
   contained prefix and write bytes there. It can't register them (the
