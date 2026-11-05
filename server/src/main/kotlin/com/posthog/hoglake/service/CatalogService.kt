@@ -79,6 +79,50 @@ class CatalogService(private val jdbi: Jdbi) {
          * by every overlap refusal afterwards.
          */
         const val MAX_DATA_PATH_LENGTH = 512
+
+        /**
+         * data_path shape: `s3://<bucket>[/<key-prefix>]` with a non-empty
+         * bucket, no whitespace/control chars, no dot segments. The
+         * commit-time path guard is a prefix comparison against this
+         * value, so a degenerate data_path is a guard bypass: `s3://`
+         * normalizes to a prefix every s3 URI starts with. A bucket-ROOT
+         * data_path is legal — it is the fleet convention (a catalog owns
+         * its bucket); the overlap check in [createCatalog] keeps other
+         * catalogs off it. Non-s3 schemes are refused because the
+         * hydrator/cleanup object store only speaks s3 — a catalog with an
+         * unparseable data_path poisons the removal queue (rows retry
+         * forever). Both catalog stores call it.
+         */
+        internal fun validateDataPath(dataPath: String) {
+            if (dataPath.isBlank()) throw HoglakeException.Validation("data_path must not be blank")
+            // A LENGTH BOUND, which nothing provided: the column is `text`
+            // with no CHECK, validateDataPath tested shape but never size,
+            // and the OpenAPI schema is a bare string. A 100 KB data_path
+            // registered fine and then rode into every overlap 422 any later
+            // catalog triggered — capping the echo only shortens the
+            // message, it does not stop the value being stored.
+            if (dataPath.length > MAX_DATA_PATH_LENGTH) {
+                throw HoglakeException.Validation(
+                    "data_path is ${dataPath.length} characters, over the maximum $MAX_DATA_PATH_LENGTH",
+                )
+            }
+            if (dataPath.any { it.isWhitespace() || it.isISOControl() }) {
+                throw HoglakeException.Validation("data_path must not contain whitespace or control characters")
+            }
+            val rest =
+                dataPath.removePrefix("s3://").takeIf { it != dataPath }
+                    ?: throw HoglakeException.Validation("data_path must be an s3://<bucket>[/<prefix>] URI")
+            val bucket = rest.substringBefore('/')
+            if (bucket.isEmpty()) {
+                throw HoglakeException.Validation(
+                    "data_path must be s3://<bucket>[/<prefix>] with a non-empty bucket, " +
+                        "got '${Identifiers.cap(dataPath)}'",
+                )
+            }
+            if (rest.split('/').any { it == "." || it == ".." }) {
+                throw HoglakeException.Validation("data_path must not contain '.' or '..' segments")
+            }
+        }
     }
 
     // ---- catalogs --------------------------------------------------------
@@ -131,49 +175,6 @@ class CatalogService(private val jdbi: Jdbi) {
                 info
             }
         }
-
-    /**
-     * data_path shape: `s3://<bucket>[/<key-prefix>]` with a non-empty
-     * bucket, no whitespace/control chars, no dot segments. The
-     * commit-time path guard is a prefix comparison against this
-     * value, so a degenerate data_path is a guard bypass: `s3://`
-     * normalizes to a prefix every s3 URI starts with. A bucket-ROOT
-     * data_path is legal — it is the fleet convention (a catalog owns
-     * its bucket); the overlap check above keeps other catalogs off
-     * it. Non-s3 schemes are refused because the hydrator/cleanup
-     * object store only speaks s3 — a catalog with an unparseable
-     * data_path poisons the removal queue (rows retry forever).
-     */
-    private fun validateDataPath(dataPath: String) {
-        if (dataPath.isBlank()) throw HoglakeException.Validation("data_path must not be blank")
-        // A LENGTH BOUND, which nothing provided: the column is `text`
-        // with no CHECK, validateDataPath tested shape but never size,
-        // and the OpenAPI schema is a bare string. A 100 KB data_path
-        // registered fine and then rode into every overlap 422 any later
-        // catalog triggered — capping the echo only shortens the
-        // message, it does not stop the value being stored.
-        if (dataPath.length > MAX_DATA_PATH_LENGTH) {
-            throw HoglakeException.Validation(
-                "data_path is ${dataPath.length} characters, over the maximum $MAX_DATA_PATH_LENGTH",
-            )
-        }
-        if (dataPath.any { it.isWhitespace() || it.isISOControl() }) {
-            throw HoglakeException.Validation("data_path must not contain whitespace or control characters")
-        }
-        val rest =
-            dataPath.removePrefix("s3://").takeIf { it != dataPath }
-                ?: throw HoglakeException.Validation("data_path must be an s3://<bucket>[/<prefix>] URI")
-        val bucket = rest.substringBefore('/')
-        if (bucket.isEmpty()) {
-            throw HoglakeException.Validation(
-                "data_path must be s3://<bucket>[/<prefix>] with a non-empty bucket, " +
-                    "got '${Identifiers.cap(dataPath)}'",
-            )
-        }
-        if (rest.split('/').any { it == "." || it == ".." }) {
-            throw HoglakeException.Validation("data_path must not contain '.' or '..' segments")
-        }
-    }
 
     fun getCatalog(name: String): CatalogInfo = jdbi.withHandleUnchecked { h -> requireCatalog(h, name) }
 

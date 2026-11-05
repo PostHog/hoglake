@@ -1,0 +1,51 @@
+package com.posthog.hoglake.hoglite
+
+import org.assertj.core.api.Assertions.assertThat
+import org.junit.jupiter.api.Test
+
+/**
+ * Schema shape that the read paths depend on. The query plans were
+ * checked with SQLite's EXPLAIN QUERY PLAN; these tests keep the shape.
+ */
+class HogliteSchemaTest {
+    private fun normalized(sql: String) = sql.replace(Regex("\\s+"), " ").trim()
+
+    /**
+     * tableAt and the live table lookups filter table_versions on
+     * (namespace_id, name). Without an index that starts with those
+     * columns, SQLite scans every table and its retained versions.
+     */
+    @Test
+    fun `table_versions has a non-partial index that starts with namespace_id and name`() {
+        val index =
+            HogliteSchema.DDL.map(::normalized).filter {
+                it.startsWith("CREATE INDEX") && it.contains(" ON table_versions(namespace_id, name")
+            }
+
+        assertThat(index).hasSize(1)
+        assertThat(index.single()).doesNotContain("WHERE")
+    }
+
+    /**
+     * A column after a large value (stats_json is kilobytes on a wide
+     * table) sits on that row's overflow pages, and SQLite walks the
+     * overflow chain to read it. The visibility predicates read
+     * begin_snapshot and end_snapshot on every row a scan touches, so
+     * they and the other fixed-width columns come before the JSON values.
+     * The order is free to choose before a tenant exists; after, it is a
+     * table rewrite.
+     */
+    @Test
+    fun `every fixed-width files column comes before the JSON columns`() {
+        val ddl = HogliteSchema.DDL.single { it.contains("CREATE TABLE IF NOT EXISTS files(") }
+        val columns =
+            ddl.substringAfter("files(").substringBeforeLast(")").split(",").map { it.trim().split(" ") }
+        val names = columns.map { it[0] }
+        val integers = columns.filter { it[1] == "INTEGER" }.map { names.indexOf(it[0]) }
+        val jsons = names.withIndex().filter { it.value.endsWith("_json") }.map { it.index }
+
+        assertThat(names).contains("begin_snapshot", "end_snapshot", "stats_json")
+        assertThat(jsons).isNotEmpty()
+        assertThat(integers.max()).describedAs("files columns: %s", names).isLessThan(jsons.min())
+    }
+}
