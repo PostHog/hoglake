@@ -3416,6 +3416,24 @@ components:
       content:
         application/json:
           schema: { $ref: "#/components/schemas/ApiError" }
+    BackendUnavailable:
+      description: >
+        The catalog backend did not answer. Only a catalog backend that is
+        reached over the network returns these codes; the PostgreSQL
+        backend does not. Both are retryable: back off per the
+        Retry-After header and retry. `backend_unavailable`: the backend
+        did not answer, and nothing was applied that the server knows of.
+        `commit_outcome_unknown`: a commit that the backend may or may not
+        have applied. A retry with the same `idempotency_key` is
+        exactly-once. A retry without a key can apply the commit a second
+        time, as after a lost COMMIT acknowledgement on PostgreSQL.
+      headers:
+        Retry-After:
+          description: Seconds to back off before retrying.
+          schema: { type: integer }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
 
   schemas:
     OperationAuthor:
