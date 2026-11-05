@@ -2777,18 +2777,21 @@ sealed class HoglakeException(message: String) : RuntimeException(message) {
      * It IS a [BackendUnavailable] (retryable, never a refusal: the commit
      * may have landed, so nothing may treat it as final), with its own
      * code so a writer can tell "the database did not answer" from "your
-     * commit may be durable". Retrying the SAME backend transaction
-     * ([txid]) is exactly-once; a caller's retry with the same
-     * idempotency key is exactly-once too, and one without a key is
-     * at-least-once, the same as a lost COMMIT acknowledgement on
-     * Postgres.
+     * commit may be durable". Inside the server, a retry of the SAME
+     * backend transaction ([txid]) is exactly-once. The txid is
+     * server-generated, so the message tells an API caller only what it
+     * can do: a retry with the same idempotency_key is exactly-once, and
+     * one without a key is at-least-once, the same as a lost COMMIT
+     * acknowledgement on Postgres. [txid] stays in the message for
+     * operators.
      */
     class CommitOutcomeUnknown(
         val txid: String,
         detail: String,
     ) : BackendUnavailable(
-            "transaction '$txid' outcome unknown (it may or may not have committed; " +
-                "retrying it with the same txid is exactly-once): $detail",
+            "commit outcome unknown: it may or may not have been applied. A retry with the same " +
+                "idempotency_key is exactly-once; without a key, read the table before a retry " +
+                "(backend transaction '$txid'): $detail",
         )
 
     /**

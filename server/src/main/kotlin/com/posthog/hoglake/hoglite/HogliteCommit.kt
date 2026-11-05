@@ -1525,42 +1525,6 @@ internal object HogliteCommit {
         )
     }
 
-    /**
-     * The upload-claim decision (UploadService.claimsToSettle's logic,
-     * against the tenant's uploads table): only paths WITH a claim row
-     * are gated; each must be active, owned by this commit's owner, and
-     * of the right file kind — anything else is the fenced/registered/
-     * foreign-owner CommitConflict. Returns the claim ids to settle in
-     * the transaction.
-     */
-    internal fun decideClaims(
-        store: HogliteCatalogStore,
-        catalog: String,
-        paths: Map<String, String>,
-        owner: UUID?,
-    ): List<String> {
-        if (paths.isEmpty()) return emptyList()
-        val pathJson = store.json.writeValueAsString(paths.keys)
-        val claims =
-            store.queryCatalog(
-                catalog,
-                CLAIMS_SQL + "WHERE path IN (SELECT value FROM json_each(?))",
-                pathJson,
-            ).rows
-        if (claims.isEmpty()) return emptyList()
-        val retainedPaths =
-            retainedPathSet(
-                store.queryCatalog(
-                    catalog,
-                    "SELECT path, 0 FROM files WHERE path IN (SELECT value FROM json_each(?)) " +
-                        "UNION SELECT path, 1 FROM dvs WHERE path IN (SELECT value FROM json_each(?))",
-                    pathJson,
-                    pathJson,
-                ),
-            )
-        return settleDecision(claims, retainedPaths, paths, owner)
-    }
-
     /** The upload rows a claim decision reads; the caller appends the path filter. */
     private const val CLAIMS_SQL = "SELECT upload_id, path, file_kind, state, owner FROM uploads "
 
@@ -1575,9 +1539,15 @@ internal object HogliteCommit {
         result.rows.map { it[0].asString() to (if (it[1].asLong() == 0L) "data" else "delete") }.toSet()
 
     /**
-     * [decideClaims]'s decision over rows already read: [claims] are the
-     * upload rows of [paths], [retainedPaths] the (path, kind) pairs a
-     * file or DV row still holds, for at least every claimed path.
+     * The upload-claim decision (UploadService.claimsToSettle's logic,
+     * against the tenant's uploads table), over rows the planning batch
+     * already read: [claims] are the upload rows of [paths],
+     * [retainedPaths] the (path, kind) pairs a file or DV row still holds,
+     * for at least every claimed path. Only paths WITH a claim row are
+     * gated; each must be active, owned by this commit's owner, and of the
+     * right file kind — anything else is the fenced/registered/
+     * foreign-owner CommitConflict. Returns the claim ids to settle in the
+     * transaction.
      */
     private fun settleDecision(
         claims: List<List<Any?>>,

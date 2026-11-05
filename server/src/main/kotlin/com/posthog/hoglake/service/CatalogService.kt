@@ -80,7 +80,19 @@ class CatalogService(private val jdbi: Jdbi) {
          */
         const val MAX_DATA_PATH_LENGTH = 512
 
-        /** The data_path shape rule. Both catalog stores call it. */
+        /**
+         * data_path shape: `s3://<bucket>[/<key-prefix>]` with a non-empty
+         * bucket, no whitespace/control chars, no dot segments. The
+         * commit-time path guard is a prefix comparison against this
+         * value, so a degenerate data_path is a guard bypass: `s3://`
+         * normalizes to a prefix every s3 URI starts with. A bucket-ROOT
+         * data_path is legal — it is the fleet convention (a catalog owns
+         * its bucket); the overlap check in [createCatalog] keeps other
+         * catalogs off it. Non-s3 schemes are refused because the
+         * hydrator/cleanup object store only speaks s3 — a catalog with an
+         * unparseable data_path poisons the removal queue (rows retry
+         * forever). Both catalog stores call it.
+         */
         internal fun validateDataPath(dataPath: String) {
             if (dataPath.isBlank()) throw HoglakeException.Validation("data_path must not be blank")
             // A LENGTH BOUND, which nothing provided: the column is `text`
@@ -164,18 +176,6 @@ class CatalogService(private val jdbi: Jdbi) {
             }
         }
 
-    /**
-     * data_path shape: `s3://<bucket>[/<key-prefix>]` with a non-empty
-     * bucket, no whitespace/control chars, no dot segments. The
-     * commit-time path guard is a prefix comparison against this
-     * value, so a degenerate data_path is a guard bypass: `s3://`
-     * normalizes to a prefix every s3 URI starts with. A bucket-ROOT
-     * data_path is legal — it is the fleet convention (a catalog owns
-     * its bucket); the overlap check above keeps other catalogs off
-     * it. Non-s3 schemes are refused because the hydrator/cleanup
-     * object store only speaks s3 — a catalog with an unparseable
-     * data_path poisons the removal queue (rows retry forever).
-     */
     fun getCatalog(name: String): CatalogInfo = jdbi.withHandleUnchecked { h -> requireCatalog(h, name) }
 
     /**

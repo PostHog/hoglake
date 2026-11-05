@@ -63,6 +63,19 @@ class BackendUnavailableErrorMappingTest {
             }
         }
 
+    /**
+     * The detail reaches API clients. The backend txid is server-generated
+     * and random per attempt, so no caller can retry "with the same txid".
+     * The detail names what a caller can do.
+     */
+    @Test
+    fun `the commit outcome detail names what a caller can do, not the internal txid retry`() {
+        val (_, body) = errorBody(HoglakeException.CommitOutcomeUnknown("tx-1", "the owner failed"))
+
+        assertThat(body.detail).contains("idempotency_key", "the owner failed", "tx-1")
+        assertThat(body.detail).doesNotContain("same txid")
+    }
+
     @Test
     fun `the spec documents both backend codes as a 503 with a Retry-After header`() {
         val block = responseBlock("BackendUnavailable")

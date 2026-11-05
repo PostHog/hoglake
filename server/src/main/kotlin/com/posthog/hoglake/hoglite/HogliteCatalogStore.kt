@@ -2031,13 +2031,6 @@ class HogliteCatalogStore(
             at,
         ).firstRow()?.get(0)?.asLong()
 
-    /** table_id -> live object-prefix field id, for every table whose option is on at head (LayoutRepo.live). */
-    internal fun liveLayouts(catalog: String): Map<Long, Long> =
-        queryCatalog(
-            catalog,
-            "SELECT table_id, object_prefix_field_id FROM table_layouts WHERE end_snapshot IS NULL",
-        ).rows.associate { it[0].asLong() to it[1].asLong() }
-
     /**
      * The tenant the CURRENT operation on [catalog] is bound to. Only
      * valid inside [catalogOperation]; a value derived from it (a cursor
