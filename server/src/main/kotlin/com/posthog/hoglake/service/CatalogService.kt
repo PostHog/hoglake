@@ -613,7 +613,7 @@ class CatalogService(private val jdbi: Jdbi) {
             "(?:$c|%${hex[0]}$second)"
         }
 
-    /** Refuse a namespace that has ever held a table or view (by hog_table_version_namespace, and hog_view's key). */
+    /** Refuse a namespace that has ever held a table or view, or whose name another namespace has had. */
     private fun requireNeverHeld(
         h: org.jdbi.v3.core.Handle,
         catalogId: Long,
@@ -630,6 +630,28 @@ class CatalogService(private val jdbi: Jdbi) {
             throw HoglakeException.NamespaceNotEmpty(
                 "namespace '${ns.name}' has held a table or view; only a namespace that never has can be " +
                     "marked contained",
+            )
+        }
+        // And no other namespace may ever have had its name. Reads at a past
+        // snapshot resolve a namespace BY NAME (NamespaceRepo.findAt), so a
+        // dropped namespace that once had this name would be served to
+        // whoever may read this one. With the name only ever this
+        // namespace's, every resolution of it at any snapshot is this
+        // namespace or nothing, and authorizing the live one authorizes them
+        // all. A later namespace reusing the name (after this one is dropped)
+        // is refused here in turn.
+        val reused =
+            h.createQuery(
+                """
+                SELECT EXISTS (SELECT 1 FROM hog_namespace
+                                WHERE catalog_id = :c AND name = :name AND namespace_id <> :n)
+                """,
+            ).bind("c", catalogId).bind("name", ns.name).bind("n", ns.namespaceId)
+                .mapTo(Boolean::class.java).one()
+        if (reused) {
+            throw HoglakeException.CommitConflict(
+                "namespace name '${ns.name}' has belonged to another, dropped namespace in this catalog; " +
+                    "only a name no other namespace has had can be marked contained",
             )
         }
     }
