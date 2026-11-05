@@ -411,9 +411,9 @@ class CatalogService(private val jdbi: Jdbi) {
      * Marking requires:
      * - the namespace never to have held a table or a view, so every file
      *   any of its tables registers from now on is checked;
-     * - no other table's file, DV or live upload claim to sit under
-     *   `<data_path>/data/<namespace>/` (or a percent-escaped spelling of
-     *   it), so the prefix is the namespace's alone;
+     * - no other table's file, DV, live upload claim or undrained removal
+     *   to sit under `<data_path>/data/<namespace>/` (or a percent-escaped
+     *   spelling of it), so the prefix is the namespace's alone;
      * - no other live namespace to hold the same `field = value`.
      *
      * Marking the same containment again is a no-op; changing it means
@@ -498,11 +498,19 @@ class CatalogService(private val jdbi: Jdbi) {
         }
 
     /**
-     * A file, DV or live upload claim under [namespace]'s prefix (or a
-     * percent-escaped segment, which a decoding reader could resolve to
-     * it), or null. [fromFileId] null scans every row of the catalog under
-     * [CONTAINMENT_SCAN_TIMEOUT_MS]; otherwise only file ids from it on,
-     * by primary key, plus the claims.
+     * Another table's file, DV, live upload claim or undrained removal
+     * under [namespace]'s prefix, in any spelling a percent-decoding reader
+     * resolves to it (what [com.posthog.hoglake.model.Containment.segments]
+     * compares at commit), or null.
+     *
+     * [fromFileId] null is the unlocked pass: every row of the catalog,
+     * under [CONTAINMENT_SCAN_TIMEOUT_MS]. Otherwise it is the pass under
+     * the commit lock, and reads only file and DV ids from [fromFileId] on,
+     * by primary key: those are the only rows the lock serializes. Claims
+     * and the removal queue take no commit lock, so re-reading them there
+     * would cost lock time and close no race; a claim can't register a
+     * file into the prefix (the commit check refuses it), and every row the
+     * queue gains came from a file row already scanned or from a claim.
      */
     private fun foreignFileUnderPrefix(
         h: org.jdbi.v3.core.Handle,
@@ -511,40 +519,66 @@ class CatalogService(private val jdbi: Jdbi) {
         namespace: String,
         fromFileId: Long?,
     ): String? {
-        val root = dataPath.trimEnd('/') + "/data/"
+        val root = dataPath.trimEnd('/') + "/"
         val ids = if (fromFileId == null) "" else "AND %s >= :from"
+        // The literal prefix, or a path with a `%` whose `<dir>/<segment>/`
+        // spells `data/<namespace>/`. Nothing broader: an unrelated escaped
+        // segment elsewhere in the catalog does not block the mark.
         val match =
             "(starts_with(path, :prefix) OR (starts_with(path, :root) AND " +
-                "position('%' IN split_part(substr(path, length(:root) + 1), '/', 1)) > 0))"
+                "position('%' IN path) > 0 AND substr(path, length(:root) + 1) ~ :spelled))"
+        val unlockedOnly =
+            """
+                    UNION ALL
+                    (SELECT path FROM hog_upload WHERE catalog_id = :c AND state = 'active' AND $match LIMIT 1)
+                    UNION ALL
+                    -- Queued for removal but not yet gone from the store:
+                    -- still readable under the prefix until cleanup drains it.
+                    (SELECT path FROM hog_file_removal
+                      WHERE catalog_id = :c AND drained_at IS NULL AND $match LIMIT 1)
+            """
         h.execute("SET LOCAL statement_timeout = '${if (fromFileId == null) CONTAINMENT_SCAN_TIMEOUT_MS else 1_000}ms'")
         return try {
             h.createQuery(
                 """
                 SELECT path FROM (
-                    (SELECT path FROM hog_data_file WHERE catalog_id = :c ${ids.format(
-                    "data_file_id",
-                )} AND $match LIMIT 1)
+                    (SELECT path FROM hog_data_file WHERE catalog_id = :c ${ids.format("data_file_id")}
+                       AND $match LIMIT 1)
                     UNION ALL
-                    (SELECT path FROM hog_delete_file WHERE catalog_id = :c ${ids.format(
-                    "delete_file_id",
-                )} AND $match LIMIT 1)
-                    UNION ALL
-                    (SELECT path FROM hog_upload WHERE catalog_id = :c AND state = 'active' AND $match LIMIT 1)
+                    (SELECT path FROM hog_delete_file WHERE catalog_id = :c ${ids.format("delete_file_id")}
+                       AND $match LIMIT 1)
+                    ${if (fromFileId == null) unlockedOnly else ""}
                 ) hit LIMIT 1
                 """,
-            ).bind("c", catalogId).bind("prefix", root + namespace + "/").bind("root", root)
+            ).bind("c", catalogId).bind("prefix", root + "data/" + namespace + "/").bind("root", root)
+                .bind("spelled", "^" + spelledAs("data") + "/" + spelledAs(namespace) + "/")
                 .also { q -> fromFileId?.let { q.bind("from", it) } }
                 .mapTo(String::class.java).findOne().orElse(null)
         } catch (e: org.jdbi.v3.core.statement.UnableToExecuteStatementException) {
             if (Pg.isQueryCanceled(e)) {
                 throw HoglakeException.ContainmentUnverified(
-                    "could not check $root$namespace/ for other tables' files within its time bound; " +
+                    "could not check ${root}data/$namespace/ for other tables' files within its time bound; " +
                         "the namespace was not marked",
                 )
             }
             throw e
         }
     }
+
+    /**
+     * A Postgres regex fragment matching every spelling of [word] that a
+     * percent-decoder resolves to it: each character literal or `%XX` in
+     * either hex case. Used for namespace names (`Identifiers.PATTERN`)
+     * and `data`: ASCII with no regex metacharacter, each character one
+     * byte.
+     */
+    internal fun spelledAs(word: String): String =
+        word.toList().joinToString("") { c ->
+            val hex = "%02X".format(c.code)
+            val low = hex[1].lowercaseChar()
+            val second = if (low == hex[1]) "${hex[1]}" else "[${hex[1]}$low]"
+            "(?:$c|%${hex[0]}$second)"
+        }
 
     /** Refuse a namespace that has ever held a table or view (by hog_table_version_namespace, and hog_view's key). */
     private fun requireNeverHeld(

@@ -119,7 +119,8 @@ CREATE TABLE hog_namespace (
     PRIMARY KEY (catalog_id, namespace_id),
     CONSTRAINT hog_namespace_containment_shape CHECK (
         (contained_field IS NULL AND contained_value IS NULL)
-        OR (contained_field ~ '^[a-z][a-z0-9_]{0,62}$' AND contained_value > 0)
+        OR (contained_field IS NOT NULL AND contained_value IS NOT NULL
+            AND contained_field ~ '^[a-z][a-z0-9_]{0,62}$' AND contained_value > 0)
     )
 );
 CREATE UNIQUE INDEX hog_namespace_live_name

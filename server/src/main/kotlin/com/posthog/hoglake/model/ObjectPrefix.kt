@@ -256,34 +256,51 @@ object ObjectPrefix {
  * whether a table may register it.
  *
  * A contained namespace `n` owns `<data_path>/data/n/`: its tables register
- * files only there, and no other table registers files there. The segment
- * is compared RAW for the table's own namespace and DECODED as well for
- * everyone else's, because a reader that percent-decodes a URI would
- * resolve `data/team%5F42/x` to `data/team_42/x`. A contained table's
- * files must name its namespace literally.
+ * files only there, and no other table registers files there. A contained
+ * table's files must spell `data/n/` literally. Everyone else's are also
+ * compared DECODED, both the `data` directory and the segment after it,
+ * because a reader that percent-decodes a URI resolves `d%61ta/team%5F42/x`
+ * to `data/team_42/x`. (The catalog's own `data_path` prefix is matched
+ * literally by commit validation, so only what follows it can vary.)
  */
 object Containment {
-    /** The raw `data/<segment>` of [path] under [dataPath], or null when the path is not under `data/`. */
+    /** The two segments after `<dataPath>/`, raw, or null when the path has fewer. */
+    private fun head(
+        dataPath: String,
+        path: String,
+    ): Pair<String, String>? {
+        val root = dataPath.trimEnd('/') + "/"
+        if (!path.startsWith(root)) return null
+        val parts = path.substring(root.length).split('/', limit = 3)
+        if (parts.size < 3 || parts[0].isEmpty() || parts[1].isEmpty()) return null
+        return parts[0] to parts[1]
+    }
+
+    private fun decode(segment: String): String? =
+        if ('%' !in segment) {
+            segment
+        } else {
+            runCatching { java.net.URLDecoder.decode(segment.replace("+", "%2B"), Charsets.UTF_8) }.getOrNull()
+        }
+
+    /** The raw segment of [path] after a LITERAL `<dataPath>/data/`, or null. */
     fun rawSegment(
         dataPath: String,
         path: String,
-    ): String? {
-        val root = dataPath.trimEnd('/') + "/data/"
-        if (!path.startsWith(root)) return null
-        val rest = path.substring(root.length)
-        val end = rest.indexOf('/')
-        return if (end <= 0) null else rest.substring(0, end)
-    }
+    ): String? = head(dataPath, path)?.takeIf { it.first == "data" }?.second
 
-    /** Every name [path]'s segment can reach: the raw segment, and its percent-decoding when that differs. */
+    /**
+     * Every namespace name [path] can reach: the segment after a `data`
+     * directory spelled raw or escaped, raw and decoded. Empty when the
+     * first segment is not (a spelling of) `data`.
+     */
     fun segments(
         dataPath: String,
         path: String,
     ): Set<String> {
-        val raw = rawSegment(dataPath, path) ?: return emptySet()
-        if ('%' !in raw) return setOf(raw)
-        val decoded = runCatching { java.net.URLDecoder.decode(raw.replace("+", "%2B"), Charsets.UTF_8) }.getOrNull()
-        return setOfNotNull(raw, decoded)
+        val (dir, raw) = head(dataPath, path) ?: return emptySet()
+        if (dir != "data" && decode(dir) != "data") return emptySet()
+        return setOfNotNull(raw, decode(raw))
     }
 
     /**

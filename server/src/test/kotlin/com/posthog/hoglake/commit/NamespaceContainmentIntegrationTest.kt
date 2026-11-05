@@ -16,6 +16,7 @@ import com.posthog.hoglake.service.UploadService
 import com.posthog.hoglake.testing.PgTestSupport
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
+import org.jdbi.v3.core.kotlin.useHandleUnchecked
 import org.jdbi.v3.core.kotlin.withHandleUnchecked
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.Tag
@@ -96,6 +97,13 @@ class NamespaceContainmentIntegrationTest {
         refused { append(cat, "main", data(cat, "team_42/t/c.parquet")) }
         refused { append(cat, "main", data(cat, "team%5F42/t/d.parquet")) }
         refused { append(cat, "main", data(cat, "team%5f42/t/e.parquet")) }
+        // The `data` directory escaped, alone or with the segment.
+        refused { append(cat, "main", "s3://bucket/$cat/d%61ta/team_42/t/f.parquet") }
+        refused { append(cat, "main", "s3://bucket/$cat/%64%61ta/team%5F42/t/g.parquet") }
+        // ...which is not `data/` for the contained table itself either.
+        refused { append(cat, "team_42", "s3://bucket/$cat/d%61ta/team_42/t/h.parquet") }
+        // An escaped directory that is not `data` reaches nothing.
+        append(cat, "main", "s3://bucket/$cat/d%62ta/team_42/t/i.parquet")
     }
 
     @Test
@@ -180,6 +188,44 @@ class NamespaceContainmentIntegrationTest {
         uploads.claim(cat, UUID.randomUUID(), UUID.randomUUID(), data(cat, "team_10"), "data")
         assertThatThrownBy { catalogs.setNamespaceContainment(cat, "team_10", NamespaceContainment("team_id", 10)) }
             .isInstanceOf(HoglakeException.CommitConflict::class.java)
+        // A path queued for removal and not yet drained: the object is still
+        // in the store. Once drained, it no longer blocks.
+        catalogs.createNamespace(cat, "team_12")
+        val queued = data(cat, "team_12/old.parquet")
+        db.jdbi.useHandleUnchecked { h ->
+            h.createUpdate(
+                """
+                INSERT INTO hog_file_removal (catalog_id, path, file_kind, reason)
+                SELECT catalog_id, :p, 'data', 'snapshot_expiry' FROM hog_catalog WHERE name = :cat
+                """,
+            ).bind("p", queued).bind("cat", cat).execute()
+        }
+        assertThatThrownBy { catalogs.setNamespaceContainment(cat, "team_12", NamespaceContainment("team_id", 12)) }
+            .isInstanceOf(HoglakeException.CommitConflict::class.java).hasMessageContaining(queued)
+        db.jdbi.useHandleUnchecked { h ->
+            h.execute(
+                "UPDATE hog_file_removal SET drained_at = now(), drained_outcome = 'deleted' WHERE path = ?",
+                queued,
+            )
+        }
+        assertThat(catalogs.setNamespaceContainment(cat, "team_12", NamespaceContainment("team_id", 12)).containment)
+            .isNotNull()
+        // Escaped segments that decode to something else don't block it
+        // (this catalog already holds `team%5F9/` from above, too).
+        append(cat, "main", data(cat, "team%5F13x/y.parquet"), data(cat, "other%20name/y.parquet"))
+        catalogs.createNamespace(cat, "team_13")
+        assertThat(catalogs.setNamespaceContainment(cat, "team_13", NamespaceContainment("team_id", 13)).containment)
+            .isNotNull()
+        // So is an escaped `data` directory.
+        append(cat, "main", "s3://bucket/$cat/d%61ta/team_15/y.parquet")
+        catalogs.createNamespace(cat, "team_15")
+        assertThatThrownBy { catalogs.setNamespaceContainment(cat, "team_15", NamespaceContainment("team_id", 15)) }
+            .isInstanceOf(HoglakeException.CommitConflict::class.java).hasMessageContaining("d%61ta/team_15")
+        // Lower-case hex is a spelling too.
+        append(cat, "main", data(cat, "team%5f14/y.parquet"))
+        catalogs.createNamespace(cat, "team_14")
+        assertThatThrownBy { catalogs.setNamespaceContainment(cat, "team_14", NamespaceContainment("team_id", 14)) }
+            .isInstanceOf(HoglakeException.CommitConflict::class.java)
     }
 
     @Test
@@ -191,12 +237,28 @@ class NamespaceContainmentIntegrationTest {
             .isInstanceOf(HoglakeException.AlreadyExists::class.java)
         assertThatThrownBy { catalogs.setNamespaceContainment(cat, "team_42", NamespaceContainment("team_id", 43)) }
             .isInstanceOf(HoglakeException.CommitConflict::class.java)
-        for (bad in listOf(NamespaceContainment("Team", 1), NamespaceContainment("team_id", 0))) {
+        for (bad in listOf(
+            NamespaceContainment("Team", 1),
+            NamespaceContainment("team_id", 0),
+            NamespaceContainment("team_id\n", 1),
+        )) {
             assertThatThrownBy { catalogs.setNamespaceContainment(cat, "other", bad) }
                 .isInstanceOf(HoglakeException.Validation::class.java)
         }
         assertThat(catalogs.getNamespace(cat, "team_42").containment).isEqualTo(team42)
         assertThat(catalogs.listNamespaces(cat).single { it.name == "main" }.containment).isNull()
+        // The database holds both-or-neither itself: neither half alone.
+        for (set in listOf("contained_field = 'team_id', contained_value = NULL", "contained_value = 7")) {
+            assertThatThrownBy {
+                db.jdbi.useHandleUnchecked { h ->
+                    h.execute(
+                        "UPDATE hog_namespace SET $set WHERE name = 'other' " +
+                            "AND catalog_id = (SELECT catalog_id FROM hog_catalog WHERE name = ?)",
+                        cat,
+                    )
+                }
+            }.hasMessageContaining("hog_namespace_containment_shape")
+        }
     }
 
     @Test

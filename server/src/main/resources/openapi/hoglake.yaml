@@ -353,9 +353,10 @@ paths:
         `<data_path>/data/<namespace>/`, and no other table registers files
         there; a commit that breaks either rule is refused with 422
         `containment_violation`. Only a namespace that has never held a
-        table or view can be marked, and only while no other table's file,
-        deletion vector or live upload claim sits under its prefix (409
-        otherwise). At most one live namespace per (field, value) (409).
+        table or view can be marked, and only while no other table's file
+        or deletion vector (live or retained), live upload claim or
+        undrained removal sits under its prefix, in any percent-escaped
+        spelling that decodes to it (409 otherwise). At most one live namespace per (field, value) (409).
         Marking the same containment again is a no-op; to change it, clear
         it first. A contained namespace can be dropped only by an operator.
         The prefix check reads the catalog's file rows under a time bound;
@@ -3570,8 +3571,9 @@ components:
         name: { type: string }
         namespace_id: { type: integer, format: int64, description: Stable identity; not reused after namespace deletion. }
         containment:
-          $ref: "#/components/schemas/NamespaceContainment"
           description: Present when the namespace is contained (PUT …/containment).
+          allOf:
+            - { $ref: "#/components/schemas/NamespaceContainment" }
 
     NamespaceContainment:
       type: object

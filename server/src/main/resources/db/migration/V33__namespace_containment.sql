@@ -20,6 +20,8 @@ ALTER TABLE hog_namespace
     ADD COLUMN IF NOT EXISTS contained_field text,
     ADD COLUMN IF NOT EXISTS contained_value bigint;
 
+-- The populated arm says IS NOT NULL outright: a CHECK passes on NULL, so
+-- without it `(field, NULL)` would satisfy `field ~ ... AND NULL > 0`.
 -- `ADD CONSTRAINT` has no `IF NOT EXISTS`, so `DO $$` keeps a re-run free
 -- (V20's shape). Every existing row has both columns NULL, so validating
 -- inline is a scan of a small table.
@@ -34,7 +36,8 @@ BEGIN
             ALTER TABLE hog_namespace
                 ADD CONSTRAINT hog_namespace_containment_shape CHECK (
                     (contained_field IS NULL AND contained_value IS NULL)
-                    OR (contained_field ~ '^[a-z][a-z0-9_]{0,62}$' AND contained_value > 0)
+                    OR (contained_field IS NOT NULL AND contained_value IS NOT NULL
+                        AND contained_field ~ '^[a-z][a-z0-9_]{0,62}$' AND contained_value > 0)
                 )
         $ddl$;
     END IF;

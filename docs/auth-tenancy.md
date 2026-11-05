@@ -560,15 +560,25 @@ is any lowercase identifier, the value a positive id, and the convention that
   registers files only under `<data_path>/data/n/`, and no table outside `n`
   registers files there (`containment_violation`, 422). Checked on every
   commit route and on table-creation publish; a contained namespace's
-  table-creation `write_path` is `data/<n>/<uuid>/`. A path whose `data/`
-  segment is percent-encoded is compared decoded as well, so `team%5F42`
-  cannot reach `team_42`'s prefix.
+  table-creation `write_path` is `data/<n>/<uuid>/`. A contained table's
+  files spell `data/<n>/` literally; everyone else's are compared decoded as
+  well, the `data` directory and the segment after it, so neither
+  `team%5F42/` nor `d%61ta/team_42/` reaches `team_42`'s prefix.
 - **Marked only when that is already true.** Marking refuses a namespace that
   has ever held a table or view (`namespace_not_empty`) and a prefix that
-  already holds another table's data file, DV or live upload claim
-  (`commit_conflict`). The full scan runs outside the commit lock under a 10 s
-  bound (`containment_unverified`, 503, past it); under the lock only files
-  registered since are re-checked.
+  still holds another table's object as far as the catalog knows, in any
+  spelling that decodes to it (`commit_conflict`): a data file or DV row,
+  live or retained for time travel (it is still readable), a live upload
+  claim, or a removal not yet drained. The full scan runs outside the commit
+  lock under a 10 s bound (`containment_unverified`, 503, past it); under
+  the lock only file and DV ids allocated since are re-read, the only rows
+  that lock serializes.
+- **Upload claims are not yet bound to a namespace.** A claim names a
+  prefix, not a table, so after marking a tenant can still claim under a
+  contained prefix and write bytes there. It can't register them (the
+  commit check refuses), and a tenant token already has the whole catalog.
+  Scoped callers are refused on the claim routes; when they are let in,
+  the claim is held to the caller's contained namespaces.
 - **One live namespace per `(catalog, field, value)`** (`already_exists`).
 - **Operators only.** Marking and clearing are operator routes; a tenant
   token cannot drop a contained namespace (403). Clearing requires the
