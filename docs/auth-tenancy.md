@@ -612,54 +612,6 @@ is any lowercase identifier, the value a positive id, and the convention that
 - **Nothing changes until something is marked.** A catalog with no contained
   namespace refuses nothing it refused before.
 
-### 6.2b Namespace containment
-
-Containment is what attributes tables to predicate values. An operator marks a
-namespace contained for `field = value` (`PUT
-/v1/catalogs/{c}/namespaces/{ns}/containment`, body `{"field": "team_id",
-"value": 42}`; `DELETE` clears). hoglake knows nothing about teams: the field
-is any lowercase identifier, the value a positive id, and the convention that
-`team_<id>` is contained for `team_id = <id>` lives in the provisioner.
-
-- **The prefix is the namespace's.** A table in a contained namespace `n`
-  registers files only under `<data_path>/data/n/`, and no table outside `n`
-  registers files there (`containment_violation`, 422). Checked on every
-  commit route and on table-creation publish; a contained namespace's
-  table-creation `write_path` is `data/<n>/<uuid>/`. A contained table's
-  files spell `data/<n>/` literally; everyone else's are compared decoded as
-  well, the `data` directory and the segment after it, so neither
-  `team%5F42/` nor `d%61ta/team_42/` reaches `team_42`'s prefix.
-- **The name is the namespace's alone.** Marking refuses a name another
-  namespace in the catalog has ever had (`commit_conflict`). Reads at a past
-  snapshot resolve a namespace by name, so with the name only ever this
-  namespace's, every resolution of it is this namespace or nothing, and
-  authorizing the live one authorizes its whole history. Together with the
-  next rule, every table a contained namespace has ever had was created
-  while it was contained.
-- **Marked only when that is already true.** Marking refuses a namespace that
-  has ever held a table or view (`namespace_not_empty`) and a prefix that
-  still holds another table's object as far as the catalog knows, in any
-  spelling that decodes to it (`commit_conflict`): a data file or DV row,
-  live or retained for time travel (it is still readable), a live upload
-  claim, or a removal not yet drained. The full scan runs outside the commit
-  lock under a 10 s bound (`containment_unverified`, 503, past it); under
-  the lock only what was allocated since it began is re-read: file and DV
-  ids, and undrained removals (expiry and retirement move a file row into
-  the removal queue in one transaction, so a file registered after the scan
-  and gone before the lock is still found).
-- **Upload claims are not yet bound to a namespace.** A claim names a
-  prefix, not a table, so after marking a tenant can still claim under a
-  contained prefix and write bytes there. It can't register them (the
-  commit check refuses), and a tenant token already has the whole catalog.
-  Scoped callers are refused on the claim routes; when they are let in,
-  the claim is held to the caller's contained namespaces.
-- **One live namespace per `(catalog, field, value)`** (`already_exists`).
-- **Operators only.** Marking and clearing are operator routes; a tenant
-  token cannot drop a contained namespace (403). Clearing requires the
-  namespace to be empty.
-- **Nothing changes until something is marked.** A catalog with no contained
-  namespace refuses nothing it refused before.
-
 ### 6.3 Scope vocabulary
 
 | Scope | Grants |
