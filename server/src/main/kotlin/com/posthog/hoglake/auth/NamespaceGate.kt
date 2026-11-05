@@ -65,7 +65,7 @@ fun Application.installNamespaceGate(containment: (catalog: String, namespace: S
         val refusal =
             HoglakeException.NotFound("namespace '${pending.namespace}' in catalog '${pending.catalog}'")
         val match = AuthPolicy.match(call.request.httpMethod, call.request.path())
-        countRefusal(service, clientClass(call), caller, match, refusal)
+        countRefusal(service, clientClass(call), caller, match, refusal, enforced = true)
         call.respondRefusal(refusal)
         finish()
     }

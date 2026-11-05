@@ -342,12 +342,13 @@ val HoglakeAuth =
             // Counted in BOTH modes: the warn numbers are the forecast and the
             // enforce numbers are the outcome, and a flip is judged by comparing
             // the two per client class.
-            countRefusal(service, clientClass(call), caller, match, refusal)
             // A verified scoped token is refused in `warn` too. Warn exists to
             // forecast refusals of callers that predate auth; a scoped token is
             // new, and letting it through would hand a team-scoped credential
             // the whole catalog.
-            if (service.mode.isEnforcing || caller?.kind == Caller.Kind.SCOPED) {
+            val enforced = service.mode.isEnforcing || caller?.kind == Caller.Kind.SCOPED
+            countRefusal(service, clientClass(call), caller, match, refusal, enforced)
+            if (enforced) {
                 call.respondRefusal(refusal)
                 return@onCall
             }
@@ -415,6 +416,8 @@ internal fun countRefusal(
     caller: Caller?,
     match: RouteMatch?,
     failure: HoglakeException,
+    /** Whether the refusal was answered, which `warn` does for scoped callers too: the audit says what happened. */
+    enforced: Boolean,
 ) {
     val outcome =
         when (failure) {
@@ -433,7 +436,7 @@ internal fun countRefusal(
         action = "auth_refused",
         catalog = match?.catalog,
         obj = null,
-        outcome = if (service.mode.isEnforcing) "refused" else "warn_allowed",
+        outcome = if (enforced) "refused" else "warn_allowed",
         detail =
             "${failure::class.simpleName}: ${failure.message} pattern=${match?.pattern} " +
                 "listener=${service.listener}",
