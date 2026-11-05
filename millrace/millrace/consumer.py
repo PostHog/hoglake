@@ -44,6 +44,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import Any, Final, Literal, Protocol, TypeVar
 
+import pyarrow as pa
 from confluent_kafka import (
     OFFSET_STORED,
     KafkaError,
@@ -71,6 +72,53 @@ _INT64_MAX: Final = (1 << 63) - 1
 REASON_INVALID_OFFSET: Final = "invalid_offset"
 REASON_MISSING_VALUE: Final = "missing_value"
 REASON_MALFORMED_VALUE: Final = "malformed_value"
+REASON_UNDECODABLE_LZ4: Final = "undecodable_lz4"
+REASON_OVERSIZED_LZ4: Final = "oversized_lz4"
+
+#: The largest decompressed LZ4-framed value. Capture caps a produced event at
+#: 10 MiB, so no real event comes near it; it bounds what one record can expand
+#: to (the poll byte cap is predictive and does not).
+MAX_DECODED_VALUE_BYTES: Final = 32 * 1024 * 1024
+_DECODE_CHUNK_BYTES: Final = 1024 * 1024
+
+# The LZ4 frame magic number (0x184D2204, little-endian). WarpStream pipelines
+# that repartition clickhouse_events_json (team_split_ws,
+# team_event_partitioned_ws in posthog-cloud-infra) write LZ4-framed values,
+# because WarpStream bills writes and storage on uncompressed bytes and the
+# framed value is what it sees. No JSON document starts with byte 0x04, so the
+# check cannot misread a plain value.
+_LZ4_FRAME_MAGIC: Final = b"\x04\x22\x4d\x18"
+
+
+class OversizedValueError(Exception):
+    """An LZ4-framed value decompresses past the limit."""
+
+
+def decode_value(value: bytes, limit: int | None = None) -> bytes:
+    """The JSON bytes of a record value: an LZ4-framed value is
+    decompressed, any other value is returned unchanged.
+
+    pyarrow's streaming reader handles frames without a content-size field,
+    which is what Bento's lz4 codec writes; the one-shot ``pa.decompress``
+    needs the decompressed size up front. Reads in chunks and stops past
+    ``limit`` (default :data:`MAX_DECODED_VALUE_BYTES`) with
+    OversizedValueError. Raises OSError on a corrupt frame.
+    """
+    if value[:4] != _LZ4_FRAME_MAGIC:
+        return value
+    if limit is None:
+        limit = MAX_DECODED_VALUE_BYTES
+    stream = pa.CompressedInputStream(pa.BufferReader(value), "lz4")
+    chunks: list[bytes] = []
+    total = 0
+    while chunk := stream.read(min(_DECODE_CHUNK_BYTES, limit + 1 - total)):
+        total += len(chunk)
+        if total > limit:
+            raise OversizedValueError(f"decompresses past {limit} bytes")
+        chunks.append(chunk)
+    return chunks[0] if len(chunks) == 1 else b"".join(chunks)
+
+
 # Logged as ``malformed_partition_source:<dotted path>``; the label drops
 # the path.
 REASON_MALFORMED_PARTITION_SOURCE: Final = "malformed_partition_source"
@@ -154,11 +202,19 @@ def classify_message(
 ) -> StagedRecord | DroppedRecord:
     """One record → the row to stage under its partition tuple, or the
     drop with its reason. Total over record content. The Kafka key and
-    timestamp are never read."""
+    timestamp are never read. An LZ4-framed value is decompressed here, and
+    the decompressed JSON is what gets staged, so the stage and the flush
+    only ever see JSON."""
     if offset < 0 or offset > _INT64_MAX:
         return DroppedRecord(offset, REASON_INVALID_OFFSET)
     if value is None:
         return DroppedRecord(offset, REASON_MISSING_VALUE)
+    try:
+        value = decode_value(value)
+    except OSError:
+        return DroppedRecord(offset, REASON_UNDECODABLE_LZ4)
+    except OversizedValueError:
+        return DroppedRecord(offset, REASON_OVERSIZED_LZ4)
     try:
         doc = load_json_object(value)
     except DecodeError:
@@ -230,9 +286,16 @@ def _classify_poll(keyer: GroupKeyer, msgs: Sequence[MessageView]) -> _Classifie
             keyer, offset=offset, value=raw_value, partition=partition
         )
         out.records += 1
-        out.nbytes += (len(raw_key) if raw_key else 0) + (
-            len(raw_value) if raw_value else 0
+        # A staged record is counted at its staged (decompressed) size,
+        # since that is what the byte cap bounds.
+        value_bytes = (
+            len(outcome.payload)
+            if isinstance(outcome, StagedRecord)
+            else len(raw_value)
+            if raw_value
+            else 0
         )
+        out.nbytes += (len(raw_key) if raw_key else 0) + value_bytes
         out.last_handled[key] = max(
             outcome.offset, out.last_handled.get(key, outcome.offset)
         )
