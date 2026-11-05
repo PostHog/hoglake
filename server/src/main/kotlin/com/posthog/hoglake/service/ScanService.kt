@@ -349,7 +349,11 @@ class ScanService(private val jdbi: Jdbi) {
         // that cannot contribute an entry. A deeply nested table is
         // mostly containers, which is where the difference is large.
         val leafFieldIds = byFieldId.filterValues { (_, column) -> column.children.isEmpty() }.keys
-        enforceEntryCap(files, leafFieldIds, request)
+        enforceScanColumnStatsEntryCap(
+            files.count { it.dataFile.statsState == StatsState.PROVIDED }.toLong(),
+            leafFieldIds,
+            request,
+        )
         val rowsByFile =
             FileRepo.providedColumnStatsAt(h, catalogId, tableId, at, request.fieldIds)
         return files.map { file ->
@@ -358,57 +362,56 @@ class ScanService(private val jdbi: Jdbi) {
             file.copy(dataFile = file.dataFile.copy(columnStats = resolveColumnStats(rows, byFieldId)))
         }
     }
+}
 
-    /**
-     * Refuse a plan whose `column_stats` array would exceed
-     * [SCAN_COLUMN_STATS_MAX_ENTRIES] entries, stating the arithmetic
-     * and the one parameter that changes it.
-     *
-     * THE ARITHMETIC IS `provided files x requested visible leaf
-     * columns`, and the message says so, because only one of the two
-     * factors is under the caller's control. `stats_fields` divides the
-     * second. Nothing divides the first: `/scan` plans a table at one
-     * snapshot and has no range, page or limit parameter, so a table
-     * whose FILE count alone exceeds the cap cannot reach these
-     * statistics at any narrowing — one column still costs one entry
-     * per file. That is a real, reachable state (see the spec's 422
-     * text and server/README.md), and the honest answer for such a
-     * table is that the engine plans without bounds; suggesting a
-     * range this endpoint does not have would send the caller looking
-     * for a parameter that is not there.
-     *
-     * 422 and not 400: the request is well-formed and would have been
-     * legal against a smaller table, which is the same line
-     * `snapshot`-out-of-range and `stats_fields`-without-`include` sit
-     * on. Multiplied in Long, because the product overflows Int well
-     * inside what this catalog can hold — roughly 215,000 files at the
-     * 10,000-column maximum — and an overflowed product is a cap that
-     * passes the requests it exists to refuse.
-     */
-    private fun enforceEntryCap(
-        files: List<ScanFile>,
-        visibleLeafFieldIds: Set<Long>,
-        request: ColumnStatsRequest,
-    ) {
-        val providedFiles = files.count { it.dataFile.statsState == StatsState.PROVIDED }.toLong()
-        val requested = request.fieldIds
-        val columns =
-            if (requested == null) {
-                visibleLeafFieldIds.size.toLong()
-            } else {
-                requested.count { it in visibleLeafFieldIds }.toLong()
-            }
-        val entries = providedFiles * columns
-        if (entries > SCAN_COLUMN_STATS_MAX_ENTRIES) {
-            val narrowed = if (requested == null) "" else " already narrowed by stats_fields;"
-            throw HoglakeException.Validation(
-                "column_stats would carry up to $entries entries ($providedFiles files with statistics " +
-                    "x $columns requested column(s)), over the maximum $SCAN_COLUMN_STATS_MAX_ENTRIES " +
-                    "per scan;$narrowed narrow it with stats_fields, naming only the field ids a " +
-                    "predicate prunes on — one column costs one entry per file, so a table with more " +
-                    "than $SCAN_COLUMN_STATS_MAX_ENTRIES files cannot carry column_stats at all and " +
-                    "must be planned without bounds",
-            )
+/**
+ * Refuse a plan whose `column_stats` array would exceed
+ * [ScanService.SCAN_COLUMN_STATS_MAX_ENTRIES] entries, stating the arithmetic
+ * and the one parameter that changes it.
+ *
+ * THE ARITHMETIC IS `provided files x requested visible leaf
+ * columns`, and the message says so, because only one of the two
+ * factors is under the caller's control. `stats_fields` divides the
+ * second. Nothing divides the first: `/scan` plans a table at one
+ * snapshot and has no range, page or limit parameter, so a table
+ * whose FILE count alone exceeds the cap cannot reach these
+ * statistics at any narrowing — one column still costs one entry
+ * per file. That is a real, reachable state (see the spec's 422
+ * text and server/README.md), and the honest answer for such a
+ * table is that the engine plans without bounds; suggesting a
+ * range this endpoint does not have would send the caller looking
+ * for a parameter that is not there.
+ *
+ * 422 and not 400: the request is well-formed and would have been
+ * legal against a smaller table, which is the same line
+ * `snapshot`-out-of-range and `stats_fields`-without-`include` sit
+ * on. Multiplied in Long, because the product overflows Int well
+ * inside what this catalog can hold — roughly 215,000 files at the
+ * 10,000-column maximum — and an overflowed product is a cap that
+ * passes the requests it exists to refuse.
+ */
+internal fun enforceScanColumnStatsEntryCap(
+    providedFiles: Long,
+    visibleLeafFieldIds: Set<Long>,
+    request: ScanService.ColumnStatsRequest,
+) {
+    val requested = request.fieldIds
+    val columns =
+        if (requested == null) {
+            visibleLeafFieldIds.size.toLong()
+        } else {
+            requested.count { it in visibleLeafFieldIds }.toLong()
         }
+    val entries = providedFiles * columns
+    if (entries > ScanService.SCAN_COLUMN_STATS_MAX_ENTRIES) {
+        val narrowed = if (requested == null) "" else " already narrowed by stats_fields;"
+        throw HoglakeException.Validation(
+            "column_stats would carry up to $entries entries ($providedFiles files with statistics " +
+                "x $columns requested column(s)), over the maximum ${ScanService.SCAN_COLUMN_STATS_MAX_ENTRIES} " +
+                "per scan;$narrowed narrow it with stats_fields, naming only the field ids a " +
+                "predicate prunes on — one column costs one entry per file, so a table with more " +
+                "than ${ScanService.SCAN_COLUMN_STATS_MAX_ENTRIES} files cannot carry column_stats at all and " +
+                "must be planned without bounds",
+        )
     }
 }
