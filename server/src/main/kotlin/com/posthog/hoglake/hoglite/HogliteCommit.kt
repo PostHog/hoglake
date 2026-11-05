@@ -59,6 +59,10 @@ import java.util.UUID
  * A receipt guard precedes state guards inside the transaction. Its private
  * rollback marker permits a bound receipt lookup. A missing receipt shares
  * the schema fence's single replan slot.
+ *
+ * Not verified against a live engine. No production path uses this code.
+ * Conformance tests against a real hoglited must pass before the server
+ * uses it.
  */
 
 internal object HogliteCommit {

@@ -81,6 +81,10 @@ fun interface HogliteTenantResolver {
  *
  * Not wired into the server yet: nothing constructs this class outside
  * tests.
+ *
+ * Not verified against a live engine. No production path uses this class.
+ * Conformance tests against a real hoglited must pass before the server
+ * uses it.
  */
 class HogliteCatalogStore(
     internal val client: HogliteClient,
