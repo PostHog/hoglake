@@ -313,6 +313,8 @@ are never judged: ancient and far-future events are written.
 | Consume | `invalid_offset` | offset < 0 or > int64 max |
 | Consume | `missing_value` | tombstone |
 | Consume | `malformed_value` | not a strict JSON object |
+| Consume | `undecodable_lz4` | starts with the LZ4 frame magic but is not a valid LZ4 frame |
+| Consume | `oversized_lz4` | an LZ4 frame that decompresses past 32 MiB (capture caps an event at 10 MiB) |
 | Consume | `malformed_partition_source` | a partition source value of the wrong type or uncoercible (the log names the path) |
 | Flush | `undecodable_payload` / `uncastable_column` | a value no column can hold (the log names the first refusing column path, never the value) |
 | Flush | `object_prefix_value` | on a table whose `object_prefix_field` is set, a null or negative value of that field: no prefix can hold the row (the server would refuse the whole commit) |

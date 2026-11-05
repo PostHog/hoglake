@@ -60,11 +60,14 @@ Pinned here:
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 from collections.abc import Collection
+from pathlib import Path
 from typing import Any
 
+import pyarrow as pa
 import pytest
 from confluent_kafka import OFFSET_STORED, KafkaError, KafkaException
 from kafkakit import FakeConsumer, error_event, msg, team_msg, team_payload
@@ -81,12 +84,15 @@ from millrace.consumer import (
     REASON_MALFORMED_PARTITION_SOURCE,
     REASON_MALFORMED_VALUE,
     REASON_MISSING_VALUE,
+    REASON_OVERSIZED_LZ4,
+    REASON_UNDECODABLE_LZ4,
     AssignmentError,
     ConsumerStats,
     MillraceConsumer,
     classify_message,
     compute_assignment,
     create_kafka_consumer,
+    decode_value,
     drop_reason_label,
     kafka_consumer_config,
 )
@@ -487,6 +493,107 @@ def test_the_record_timestamp_is_never_read():
     assert out == StagedRecord(("7",), 41, b'{"team_id": 7}')
 
 
+# An LZ4 frame written by Bento's lz4 codec (WarpStream pipelines): no
+# content-size field. Decompresses to {"team_id":2,"event":"signup"}.
+_BENTO_LZ4_FRAME = base64.b64decode(
+    "BCJNGGRwuR4AAIB7InRlYW1faWQiOjIsImV2ZW50Ijoic2lnbnVwIn0AAAAA1wZZsQ=="
+)
+
+
+# The same codec on {"team_id":2,"pad":"0123456789"*500000} (5,000,022
+# bytes): two blocks under Bento's 4 MiB block size, 19,712 bytes.
+_BENTO_TWO_BLOCKS = (
+    Path(__file__).parent / "data" / "bento_lz4_two_blocks.lz4"
+).read_bytes()
+
+
+def _lz4_frame(value: bytes) -> bytes:
+    sink = pa.BufferOutputStream()
+    with pa.CompressedOutputStream(sink, "lz4") as out:
+        out.write(value)
+    return bytes(sink.getvalue().to_pybytes())
+
+
+def test_an_lz4_framed_value_is_decompressed_and_staged_as_json():
+    keyer = GroupKeyer(table_info([IDENTITY_TEAM]))
+    out = _classify(keyer, _BENTO_LZ4_FRAME)
+    assert out == StagedRecord(("2",), 41, b'{"team_id":2,"event":"signup"}')
+
+
+def test_a_framed_value_stages_the_same_row_as_its_plain_json():
+    keyer = GroupKeyer(table_info([IDENTITY_TEAM]))
+    value = b'{"team_id": 7, "properties": {"a": 1}}'
+    assert _classify(keyer, _lz4_frame(value)) == _classify(keyer, value)
+
+
+def test_a_corrupt_lz4_frame_is_dropped_with_its_own_reason():
+    keyer = GroupKeyer(table_info([IDENTITY_TEAM]))
+    corrupt = b"\x04\x22\x4d\x18not an lz4 frame"
+    assert _classify(keyer, corrupt) == DroppedRecord(41, REASON_UNDECODABLE_LZ4)
+    assert _classify(keyer, _BENTO_LZ4_FRAME[:12]) == DroppedRecord(
+        41, REASON_UNDECODABLE_LZ4
+    )
+
+
+def test_a_framed_value_holding_bad_json_is_malformed():
+    keyer = GroupKeyer(table_info([IDENTITY_TEAM]))
+    assert _classify(keyer, _lz4_frame(b"not json")) == DroppedRecord(
+        41, REASON_MALFORMED_VALUE
+    )
+
+
+def test_a_plain_value_is_not_touched():
+    value = b'{"team_id": 7}'
+    assert decode_value(value) is value
+
+
+def test_a_multi_block_bento_frame_is_decompressed_whole():
+    keyer = GroupKeyer(table_info([IDENTITY_TEAM]))
+    out = _classify(keyer, _BENTO_TWO_BLOCKS)
+    assert isinstance(out, StagedRecord), out
+    assert out.group == ("2",)
+    assert out.payload == b'{"team_id":2,"pad":"' + b"0123456789" * 500_000 + b'"}'
+
+
+def test_a_bento_frame_with_a_bad_content_checksum_is_undecodable():
+    keyer = GroupKeyer(table_info([IDENTITY_TEAM]))
+    bad = _BENTO_LZ4_FRAME[:-1] + bytes([_BENTO_LZ4_FRAME[-1] ^ 1])
+    assert _classify(keyer, bad) == DroppedRecord(41, REASON_UNDECODABLE_LZ4)
+
+
+@pytest.mark.parametrize(
+    ("value", "reason"),
+    [
+        (b"\x04\x22\x4d\x18", "undecodable_lz4"),  # the magic alone
+        (b"\x04\x22\x4d{}", "malformed_value"),  # a magic prefix is not the magic
+        (b"", "malformed_value"),
+    ],
+)
+def test_lz4_magic_edges(value, reason):
+    keyer = GroupKeyer(table_info([IDENTITY_TEAM]))
+    assert _classify(keyer, value) == DroppedRecord(41, reason)
+
+
+def test_decoding_stops_past_the_limit():
+    decoded = b'{"team_id":2,"pad":"' + b"0123456789" * 500_000 + b'"}'
+    assert decode_value(_BENTO_TWO_BLOCKS, limit=len(decoded)) == decoded
+    with pytest.raises(consumer_mod.OversizedValueError):
+        decode_value(_BENTO_TWO_BLOCKS, limit=len(decoded) - 1)
+
+
+def test_a_frame_decompressing_past_the_limit_is_dropped(monkeypatch):
+    monkeypatch.setattr(consumer_mod, "MAX_DECODED_VALUE_BYTES", 1024 * 1024)
+    keyer = GroupKeyer(table_info([IDENTITY_TEAM]))
+    assert _classify(keyer, _BENTO_TWO_BLOCKS) == DroppedRecord(41, "oversized_lz4")
+    assert isinstance(_classify(keyer, _BENTO_LZ4_FRAME), StagedRecord)
+
+
+def test_plain_json_with_leading_whitespace_is_staged_unchanged():
+    keyer = GroupKeyer(table_info([IDENTITY_TEAM]))
+    value = b' \n\t{"team_id": 7}'
+    assert _classify(keyer, value) == StagedRecord(("7",), 41, value)
+
+
 def test_classify_out_of_range_offset():
     keyer = GroupKeyer(table_info([IDENTITY_TEAM]))
     out = _classify(keyer, b'{"team_id": 7}', offset=-1)
@@ -512,6 +619,8 @@ def test_classify_names_the_FIRST_failing_check():
     [
         (REASON_INVALID_OFFSET, REASON_INVALID_OFFSET),
         (REASON_MALFORMED_VALUE, REASON_MALFORMED_VALUE),
+        (REASON_UNDECODABLE_LZ4, "undecodable_lz4"),
+        (REASON_OVERSIZED_LZ4, "oversized_lz4"),
         ("malformed_partition_source:a.b.c", REASON_MALFORMED_PARTITION_SOURCE),
         (REASON_MALFORMED_PARTITION_SOURCE, REASON_MALFORMED_PARTITION_SOURCE),
     ],
@@ -1695,7 +1804,7 @@ async def test_one_poll_is_one_durable_write_for_every_partition(fake_clock):
 async def test_the_byte_cap_clamps_the_next_polls_batch_size(fake_clock):
     """The per-poll byte cap shapes what the NEXT consume asks for:
     ``batch_max_bytes ÷ observed average record size`` (key + value
-    bytes). The first poll has no observation and is bounded by the
+    bytes, a framed value at its decompressed size). The first poll has no observation and is bounded by the
     record cap alone."""
     journal: list[tuple] = []
     manager = make_manager(journal)
@@ -1741,6 +1850,57 @@ async def test_the_byte_cap_never_stalls_an_oversized_record(fake_clock):
     assert fake.requested_batch_sizes[:2] == [5, 1]
     assert fake.committed_store == {("events", 0): 8}
     assert_commits_follow_acks(journal)
+    await manager.close()
+
+
+@component
+async def test_the_byte_cap_counts_a_framed_value_at_its_staged_size(fake_clock):
+    """The byte cap bounds what a poll stages, so an LZ4-framed value
+    counts at its decompressed size, not its wire size."""
+    journal: list[tuple] = []
+    manager = make_manager(journal)
+    fake = FakeConsumer(journal=journal)
+    cfg = make_config(consume_batch_size=1000, consume_batch_max_bytes=10_000)
+    consumer = make_consumer(fake, manager, cfg, fake_clock)
+    await consumer.start()
+
+    value = b'{"team_id": 1, "pad": "' + b"v" * 975 + b'"}'
+    assert len(value) == 1000 and len(_lz4_frame(value)) < 100
+    fake.feed(*[msg(0, o, key=None, value=_lz4_frame(value)) for o in range(20)])
+    await run_steps(consumer, fake)
+    assert fake.requested_batch_sizes[0] == 1000
+    assert fake.requested_batch_sizes[1:] and set(fake.requested_batch_sizes[1:]) == {
+        10
+    }
+    assert fake.committed_store == {("events", 0): 20}
+    await manager.close()
+
+
+@component
+async def test_a_framed_record_through_the_loop_stages_its_json(fake_clock):
+    journal: list[tuple] = []
+    manager = make_manager(journal)
+    fake = FakeConsumer(journal=journal)
+    consumer = make_consumer(fake, manager, make_config(), fake_clock)
+    await consumer.start()
+
+    plain = b'{"team_id": 2, "event": "plain"}'
+    fake.feed(
+        msg(0, 0, key=None, value=_BENTO_LZ4_FRAME),
+        msg(0, 1, key=None, value=plain),
+        msg(0, 2, key=None, value=b"\x04\x22\x4d\x18corrupt"),
+    )
+    await run_steps(consumer, fake)
+
+    assert_commits_follow_acks(journal, dropped={("events", 0, 2)})
+    assert fake.committed_store == {("events", 0): 3}
+    stats = consumer.stats()
+    assert stats.records_staged == 2
+    assert stats.records_dropped == {"undecodable_lz4": 1}
+    rows = [
+        (rk.offset, v) for rk, v in await group_rows(manager.stage("events", 0), ("2",))
+    ]
+    assert rows == [(0, b'{"team_id":2,"event":"signup"}'), (1, plain)]
     await manager.close()
 
 

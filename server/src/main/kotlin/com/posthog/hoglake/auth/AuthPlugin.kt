@@ -309,6 +309,20 @@ val HoglakeAuth =
                 Metrics.authRequest(service.mode.wire, service.listener, "ok", clientClass(call))
                 return@onCall
             }
+            // A scoped caller on a namespaced route: decided by the gate, on
+            // the request dispatcher, before routing (NamespaceGate.kt). With no
+            // gate installed, nothing would decide it, so it is refused below.
+            if (decision is AuthDecision.ByNamespace && call.application.attributes.contains(NamespaceGateKey)) {
+                call.attributes.put(PendingNamespaceKey, decision)
+                return@onCall
+            }
+            // A scoped caller on a route whose namespaces are in its body:
+            // decided by the handler (ScopedWrites.kt), which needs the gate's
+            // lookups. Without them it is refused below.
+            if (decision is AuthDecision.ByBody && call.application.attributes.contains(ScopedLookupsKey)) {
+                call.attributes.put(PendingBodyKey, decision)
+                return@onCall
+            }
             // A listed path asked with an unlisted method is a 405, whatever the
             // token: nothing would serve it, and answering 401 sent probes and
             // clients looking for a credential problem that did not exist. The
@@ -335,12 +349,13 @@ val HoglakeAuth =
             // Counted in BOTH modes: the warn numbers are the forecast and the
             // enforce numbers are the outcome, and a flip is judged by comparing
             // the two per client class.
-            countRefusal(service, clientClass(call), caller, match, refusal)
             // A verified scoped token is refused in `warn` too. Warn exists to
             // forecast refusals of callers that predate auth; a scoped token is
             // new, and letting it through would hand a team-scoped credential
             // the whole catalog.
-            if (service.mode.isEnforcing || caller?.kind == Caller.Kind.SCOPED) {
+            val enforced = service.mode.isEnforcing || caller?.kind == Caller.Kind.SCOPED
+            countRefusal(service, clientClass(call), caller, match, refusal, enforced)
+            if (enforced) {
                 call.respondRefusal(refusal)
                 return@onCall
             }
@@ -350,7 +365,7 @@ val HoglakeAuth =
         }
     }
 
-private suspend fun ApplicationCall.respondRefusal(failure: HoglakeException) {
+internal suspend fun ApplicationCall.respondRefusal(failure: HoglakeException) {
     val (status, body) = errorBody(failure)
     if (failure is HoglakeException.Unauthenticated) {
         response.header(HttpHeaders.WWWAuthenticate, bearerChallenge(failure))
@@ -402,12 +417,14 @@ private val CLIENT_CLASSES =
         "curl" to "curl",
     )
 
-private fun countRefusal(
+internal fun countRefusal(
     service: AuthService,
     client: String,
     caller: Caller?,
     match: RouteMatch?,
     failure: HoglakeException,
+    /** Whether the refusal was answered, which `warn` does for scoped callers too: the audit says what happened. */
+    enforced: Boolean,
 ) {
     val outcome =
         when (failure) {
@@ -426,7 +443,7 @@ private fun countRefusal(
         action = "auth_refused",
         catalog = match?.catalog,
         obj = null,
-        outcome = if (service.mode.isEnforcing) "refused" else "warn_allowed",
+        outcome = if (enforced) "refused" else "warn_allowed",
         detail =
             "${failure::class.simpleName}: ${failure.message} pattern=${match?.pattern} " +
                 "listener=${service.listener}",
@@ -454,6 +471,15 @@ private fun failureFor(
         is AuthDecision.NotPredicated ->
             HoglakeException.Forbidden(
                 "a scoped credential cannot use route ${decision.pattern} on '${decision.catalog}'",
+            )
+        // Only reached with no namespace gate installed: a wiring bug, refused.
+        is AuthDecision.ByNamespace ->
+            HoglakeException.Forbidden(
+                "a scoped credential cannot use route ${match?.pattern ?: "?"} on '${decision.catalog}'",
+            )
+        is AuthDecision.ByBody ->
+            HoglakeException.Forbidden(
+                "a scoped credential cannot use route ${match?.pattern ?: "?"} on '${decision.catalog}'",
             )
     }
 
@@ -484,7 +510,7 @@ private fun bearerToken(call: ApplicationCall): String? {
  */
 fun bearerChallenge(failure: HoglakeException.Unauthenticated): String = "Bearer error=\"${failure.reason}\""
 
-private val AuthServiceKey = AttributeKey<AuthService>("HoglakeAuthService")
+internal val AuthServiceKey = AttributeKey<AuthService>("HoglakeAuthService")
 
 /**
  * Install the plugin with [service] bound to the application.
