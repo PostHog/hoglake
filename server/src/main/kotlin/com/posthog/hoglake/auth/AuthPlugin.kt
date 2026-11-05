@@ -309,6 +309,13 @@ val HoglakeAuth =
                 Metrics.authRequest(service.mode.wire, service.listener, "ok", clientClass(call))
                 return@onCall
             }
+            // A scoped caller on a namespaced route: decided by the gate, on
+            // the request dispatcher, before routing (NamespaceGate.kt). With no
+            // gate installed, nothing would decide it, so it is refused below.
+            if (decision is AuthDecision.ByNamespace && call.application.attributes.contains(NamespaceGateKey)) {
+                call.attributes.put(PendingNamespaceKey, decision)
+                return@onCall
+            }
             // A listed path asked with an unlisted method is a 405, whatever the
             // token: nothing would serve it, and answering 401 sent probes and
             // clients looking for a credential problem that did not exist. The
@@ -350,7 +357,7 @@ val HoglakeAuth =
         }
     }
 
-private suspend fun ApplicationCall.respondRefusal(failure: HoglakeException) {
+internal suspend fun ApplicationCall.respondRefusal(failure: HoglakeException) {
     val (status, body) = errorBody(failure)
     if (failure is HoglakeException.Unauthenticated) {
         response.header(HttpHeaders.WWWAuthenticate, bearerChallenge(failure))
@@ -402,7 +409,7 @@ private val CLIENT_CLASSES =
         "curl" to "curl",
     )
 
-private fun countRefusal(
+internal fun countRefusal(
     service: AuthService,
     client: String,
     caller: Caller?,
@@ -455,6 +462,11 @@ private fun failureFor(
             HoglakeException.Forbidden(
                 "a scoped credential cannot use route ${decision.pattern} on '${decision.catalog}'",
             )
+        // Only reached with no namespace gate installed: a wiring bug, refused.
+        is AuthDecision.ByNamespace ->
+            HoglakeException.Forbidden(
+                "a scoped credential cannot use route ${match?.pattern ?: "?"} on '${decision.catalog}'",
+            )
     }
 
 private fun Requirement.wire(): String = scopeOrNull()?.wire ?: name.lowercase()
@@ -484,7 +496,7 @@ private fun bearerToken(call: ApplicationCall): String? {
  */
 fun bearerChallenge(failure: HoglakeException.Unauthenticated): String = "Bearer error=\"${failure.reason}\""
 
-private val AuthServiceKey = AttributeKey<AuthService>("HoglakeAuthService")
+internal val AuthServiceKey = AttributeKey<AuthService>("HoglakeAuthService")
 
 /**
  * Install the plugin with [service] bound to the application.

@@ -257,9 +257,9 @@ class AuthPolicyTest {
     }
 
     @Test
-    fun `a scoped caller is refused on every catalog route, and only listings let it in`() {
-        // No catalog route narrows by predicate yet. A route added to the table
-        // is refused to scoped callers until it is taught to.
+    fun `a scoped caller is refused on every catalog route but the listed reads, decided per namespace`() {
+        // A route added to the table is refused to scoped callers until it is
+        // listed in SCOPED_ROUTES.
         val scoped =
             Caller(
                 subject = "hlc_team",
@@ -282,13 +282,75 @@ class AuthPolicyTest {
                         decision,
                     ).describedAs(rule.pattern).isInstanceOf(AuthDecision.InsufficientScope::class.java)
                 else ->
-                    assertThat(decision).describedAs(rule.pattern)
-                        .isEqualTo(AuthDecision.NotPredicated("lake", match.pattern))
+                    if ((rule.method to rule.pattern) !in AuthPolicy.SCOPED_ROUTES) {
+                        assertThat(decision).describedAs(rule.pattern)
+                            .isEqualTo(AuthDecision.NotPredicated("lake", match.pattern))
+                    } else if ("{namespace}" in rule.pattern) {
+                        assertThat(decision).describedAs(rule.pattern)
+                            .isEqualTo(AuthDecision.ByNamespace("lake", "x", Scope.READ))
+                    } else {
+                        assertThat(decision).describedAs(rule.pattern).isEqualTo(AuthDecision.Allow)
+                    }
             }
         }
+        // HEAD is GET for this too.
+        assertThat(
+            AuthPolicy.authorize(
+                scoped,
+                AuthPolicy.match(io.ktor.http.HttpMethod.Head, "/v1/catalogs/lake/namespaces/team_42")!!,
+            ),
+        ).isEqualTo(AuthDecision.ByNamespace("lake", "team_42", Scope.READ))
+        // The namespace is the one the router will serve: percent-decoded.
+        assertThat(
+            AuthPolicy.authorize(
+                scoped,
+                AuthPolicy.match(io.ktor.http.HttpMethod.Get, "/v1/catalogs/lake/namespaces/team%5F42/tables")!!,
+            ),
+        ).isEqualTo(AuthDecision.ByNamespace("lake", "team_42", Scope.READ))
         // Another catalog is still unknown, not forbidden.
         val other = AuthPolicy.match(io.ktor.http.HttpMethod.Get, "/v1/catalogs/other")!!
         assertThat(AuthPolicy.authorize(scoped, other)).isEqualTo(AuthDecision.UnknownCatalog("other"))
+    }
+
+    @Test
+    fun `every scoped route is a read the table lists`() {
+        for ((method, pattern) in AuthPolicy.SCOPED_ROUTES) {
+            val rule = AuthPolicy.rules.singleOrNull { it.method == method && it.pattern == pattern }
+            assertThat(rule).describedAs("%s %s is in the table", method.value, pattern).isNotNull()
+            assertThat(rule!!.requirement).describedAs("%s %s", method.value, pattern).isEqualTo(Requirement.READ)
+        }
+    }
+
+    @Test
+    fun `a scoped caller's permission on a value is the lower of its predicate and its catalog`() {
+        fun caller(
+            cat: Set<Scope>,
+            grant: PredicateGrant,
+        ) = Caller(
+            subject = "hlc_team",
+            orgId = "org-1",
+            kind = Caller.Kind.SCOPED,
+            catalogScopes = mapOf("lake" to cat),
+            tokenId = "jti",
+            clientName = null,
+            predicates = mapOf("team_id" to grant),
+        )
+        val values = PredicateGrant.Values(mapOf(42L to Scope.WRITE, 7L to Scope.READ))
+        val rw = caller(setOf(Scope.WRITE), values)
+        assertThat(rw.mayUseContained("lake", "team_id", 42, Scope.WRITE)).isTrue()
+        assertThat(rw.mayUseContained("lake", "team_id", 7, Scope.READ)).isTrue()
+        assertThat(rw.mayUseContained("lake", "team_id", 7, Scope.WRITE)).isFalse()
+        assertThat(rw.mayUseContained("lake", "team_id", 9, Scope.READ)).isFalse()
+        assertThat(rw.mayUseContained("lake", "org_id", 42, Scope.READ)).isFalse()
+        assertThat(rw.mayUseContained("other", "team_id", 42, Scope.READ)).isFalse()
+        val readOnlyCatalog = caller(setOf(Scope.READ), values)
+        assertThat(readOnlyCatalog.mayUseContained("lake", "team_id", 42, Scope.WRITE)).isFalse()
+        assertThat(readOnlyCatalog.mayUseContained("lake", "team_id", 42, Scope.READ)).isTrue()
+        val all = caller(setOf(Scope.WRITE), PredicateGrant.All(Scope.READ))
+        assertThat(all.mayUseContained("lake", "team_id", 123, Scope.READ)).isTrue()
+        assertThat(all.mayUseContained("lake", "team_id", 123, Scope.WRITE)).isFalse()
+        // Never for another kind: a tenant's authority is `holds`.
+        assertThat(rw.copy(kind = Caller.Kind.TENANT).mayUseContained("lake", "team_id", 42, Scope.READ)).isFalse()
     }
 
     // ---- fixtures -------------------------------------------------------

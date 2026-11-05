@@ -126,6 +126,47 @@ class AuthPluginTest {
         }
 
     @Test
+    fun `with no namespace gate installed, a namespaced read is refused, not let through`() =
+        testApplication {
+            application {
+                installAuth(scopedService(AuthMode.WARN))
+                install(ContentNegotiation) { jackson { configureHoglakeWire() } }
+                routing { get("/v1/catalogs/{catalog}/namespaces/{namespace}") { call.respondText("served") } }
+            }
+            val r =
+                client.get("/v1/catalogs/lake/namespaces/team_42") {
+                    header(HttpHeaders.Authorization, "Bearer ${token(TestTokens.scopedClaims())}")
+                }
+            assertThat(r.status).isEqualTo(HttpStatusCode.Forbidden)
+            assertThat(r.bodyAsText()).doesNotContain("served")
+        }
+
+    @Test
+    fun `the gate lets through only a namespace whose value the caller holds`() =
+        testApplication {
+            application {
+                installAuth(scopedService(AuthMode.WARN))
+                installNamespaceGate { _, ns ->
+                    when (ns) {
+                        "team_42" -> com.posthog.hoglake.model.NamespaceContainment("team_id", 42)
+                        "team_9" -> com.posthog.hoglake.model.NamespaceContainment("team_id", 9)
+                        else -> null
+                    }
+                }
+                install(ContentNegotiation) { jackson { configureHoglakeWire() } }
+                routing { get("/v1/catalogs/{catalog}/namespaces/{namespace}") { call.respondText("served") } }
+            }
+            val scoped = "Bearer ${token(TestTokens.scopedClaims())}"
+            val own = client.get("/v1/catalogs/lake/namespaces/team_42") { header(HttpHeaders.Authorization, scoped) }
+            assertThat(own.bodyAsText()).isEqualTo("served")
+            for (ns in listOf("team_9", "main")) {
+                val r = client.get("/v1/catalogs/lake/namespaces/$ns") { header(HttpHeaders.Authorization, scoped) }
+                assertThat(r.status).describedAs(ns).isEqualTo(HttpStatusCode.NotFound)
+                assertThat(r.bodyAsText()).describedAs(ns).doesNotContain("served")
+            }
+        }
+
+    @Test
     fun `under enforce a scoped token is refused the same way, and a bad one is a 401`() =
         testApplication {
             application { harness(scopedService(AuthMode.ENFORCE)) }

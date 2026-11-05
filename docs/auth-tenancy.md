@@ -542,10 +542,27 @@ contract vector is `scoped_team` in `oauth/contract-vectors.json`.
   scope loses authority; dropping an unknown predicate would gain it.
 - **A value's permission** is the lower of its own and `cat`'s for the catalog.
 - **Fails closed.** A scoped caller may use `AUTHENTICATED` routes (listings,
-  filtered to `cat`, with catalog totals withheld) and nothing catalog-scoped:
-  every catalog route answers `403` until it narrows by predicate. That holds
-  under `warn` too. Routes learn the predicate one at a time, after namespace
-  containment exists to attribute tables to values.
+  filtered to `cat`, with catalog totals withheld) and, in a catalog it names,
+  only the routes listed in `AuthPolicy.SCOPED_ROUTES`. Every other catalog
+  route answers `403`, under `warn` too, and a route added to the table stays
+  closed to scoped callers until it is listed.
+- **Reads, by namespace.** The listed routes are the namespace-scoped reads (a
+  namespace, its tables and views, and a table's metadata, files, scan plan,
+  partitions, changes and file stats) and the namespace listing. A
+  `{namespace}` route is allowed only when that namespace is live, contained
+  (§6.2b), and its value is one the token holds with `read` (`*` holds every
+  value of the field); anything else is the `404` a missing namespace gets, so
+  a scoped caller learns nothing of namespaces outside its own. The listing
+  returns only those namespaces. Uncontained namespaces are never visible to a
+  scoped caller. Clearing a namespace's containment closes it at once.
+- **Where it is decided.** The auth plugin decides everything but the
+  namespace and leaves that to the namespace gate (`auth/NamespaceGate.kt`), a
+  pipeline phase after the blocking dispatcher and before routing: the check
+  needs one indexed read of `hog_namespace`, and the plugin runs before the
+  dispatcher so a refused request never borrows a connection. Without the gate
+  installed the plugin refuses instead of deferring.
+- **Writes are not yet open** to scoped callers; they follow once a scoped
+  writer's commits and upload claims are held to its namespaces.
 
 ### 6.2b Namespace containment
 
