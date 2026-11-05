@@ -542,4 +542,105 @@ class JwtVerifierTest {
         assertThat(keys.byKeyId(TestTokens.KID)).isNotNull()
         assertThat(keys.keyCount).isEqualTo(1)
     }
+
+    // ---- scoped tokens ----------------------------------------------------
+
+    private fun scopedVerifier(fields: Set<String> = setOf("team_id")) =
+        JwtVerifier(
+            TestTokens.ISSUER,
+            TestTokens.AUDIENCE,
+            StaticSigningKeys(TestTokens.KID, pair.public as java.security.interfaces.ECPublicKey),
+            predicateFields = fields,
+        ) { 1_700_000_100L }
+
+    private fun scopedReason(
+        claims: String,
+        fields: Set<String> = setOf("team_id"),
+    ): String =
+        try {
+            scopedVerifier(fields).verify(TestTokens.mint(pair, claims))
+            "accepted"
+        } catch (v: JwtViolation) {
+            v.reason
+        }
+
+    @Test
+    fun `a scoped token becomes a scoped caller holding its predicate`() {
+        val caller = scopedVerifier().verify(TestTokens.mint(pair, TestTokens.scopedClaims()))
+        assertThat(caller.kind).isEqualTo(Caller.Kind.SCOPED)
+        assertThat(caller.catalogScopes).isEqualTo(mapOf("lake" to setOf(Scope.WRITE)))
+        assertThat(caller.predicates).isEqualTo(
+            mapOf("team_id" to PredicateGrant.Values(mapOf(42L to Scope.WRITE, 7L to Scope.READ))),
+        )
+        assertThat(caller.user).isEqualTo("user-1")
+        assertThat(caller.delegates).isFalse()
+        // Naming the catalog is not authority on its own.
+        assertThat(caller.knowsCatalog("lake")).isTrue()
+        assertThat(caller.holds("lake", Scope.READ)).isFalse()
+    }
+
+    @Test
+    fun `a wildcard grants every value at one permission`() {
+        val caller =
+            scopedVerifier().verify(
+                TestTokens.mint(pair, TestTokens.scopedClaims(prd = """{"team_id":{"*":"read"}}""")),
+            )
+        assertThat(caller.predicates).isEqualTo(mapOf("team_id" to PredicateGrant.All(Scope.READ)))
+    }
+
+    @Test
+    fun `an instance that declares no predicate fields refuses every scoped token`() {
+        assertThat(
+            scopedReason(TestTokens.scopedClaims(), fields = emptySet()),
+        ).isEqualTo(JwtViolation.INVALID_PREDICATE)
+    }
+
+    @Test
+    fun `prd is parsed strictly`() {
+        val tooMany = (1..201).joinToString(",") { "\"$it\":\"read\"" }
+        val refused =
+            mapOf(
+                "no prd" to null,
+                "prd not an object" to "[]",
+                "an undeclared field" to """{"team_id":{"42":"read"},"table":{"1":"read"}}""",
+                "a declared field missing" to """{}""",
+                "an empty value map" to """{"team_id":{}}""",
+                "201 values" to """{"team_id":{$tooMany}}""",
+                "admin" to """{"team_id":{"42":"admin"}}""",
+                "maintenance" to """{"team_id":{"42":"maintenance"}}""",
+                "a non-string permission" to """{"team_id":{"42":true}}""",
+                "extra structure" to """{"team_id":{"42":{"perm":"read"}}}""",
+                "a wildcard mixed with values" to """{"team_id":{"*":"read","42":"write"}}""",
+                "a leading zero" to """{"team_id":{"042":"read"}}""",
+                "zero" to """{"team_id":{"0":"read"}}""",
+                "a negative id" to """{"team_id":{"-1":"read"}}""",
+                "past Long" to """{"team_id":{"9999999999999999999":"read"}}""",
+                "not a number" to """{"team_id":{"abc":"read"}}""",
+            )
+        refused.forEach { (case, prd) ->
+            assertThat(scopedReason(TestTokens.scopedClaims(prd = prd))).describedAs(case)
+                .isEqualTo(JwtViolation.INVALID_PREDICATE)
+        }
+        val exactly200 = (1..200).joinToString(",") { "\"$it\":\"read\"" }
+        assertThat(scopedReason(TestTokens.scopedClaims(prd = """{"team_id":{$exactly200}}"""))).isEqualTo("accepted")
+    }
+
+    @Test
+    fun `a scoped token's other claims are strict too`() {
+        val malformed =
+            mapOf(
+                "cat admin" to TestTokens.scopedClaims(catalogs = """{"lake":["admin"]}"""),
+                "cat unknown scope" to TestTokens.scopedClaims(catalogs = """{"lake":["read","owner"]}"""),
+                "cat empty array" to TestTokens.scopedClaims(catalogs = """{"lake":[]}"""),
+                "lives 901s" to TestTokens.scopedClaims(exp = 1_700_000_901L),
+                "usr a number" to TestTokens.scopedClaims().replace(""""usr":"user-1"""", """"usr":7"""),
+                "dlg a string" to TestTokens.scopedClaims(extra = ""","dlg":"true""""),
+            )
+        malformed.forEach { (case, claims) ->
+            assertThat(scopedReason(claims)).describedAs(case).isIn(JwtViolation.MALFORMED, JwtViolation.MISSING_CLAIM)
+        }
+        assertThat(scopedReason(TestTokens.scopedClaims(catalogs = "{}"))).isEqualTo(JwtViolation.MISSING_CLAIM)
+        assertThat(scopedReason(TestTokens.scopedClaims().replace(""""iat":1700000000,""", "")))
+            .isEqualTo(JwtViolation.MISSING_CLAIM)
+    }
 }

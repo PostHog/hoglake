@@ -449,6 +449,12 @@ object AuthPolicy {
                 if (!caller.knowsCatalog(catalog)) {
                     return AuthDecision.UnknownCatalog(catalog)
                 }
+                // No catalog route narrows by predicate yet, so a scoped
+                // caller may use none of them. Each one that learns to is
+                // listed here as it does.
+                if (caller.kind == Caller.Kind.SCOPED) {
+                    return AuthDecision.NotPredicated(catalog, match.pattern)
+                }
                 val required = match.requirement.scopeOrNull() ?: return AuthDecision.Allow
                 if (caller.holds(catalog, required)) {
                     AuthDecision.Allow

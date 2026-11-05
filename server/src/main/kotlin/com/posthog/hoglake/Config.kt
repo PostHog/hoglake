@@ -204,6 +204,12 @@ data class Config(
      */
     val authClockSkewSeconds: Long = env("HOGLAKE_AUTH_CLOCK_SKEW_SECONDS", "60").toLong(),
     /**
+     * The predicate fields the auth source declares, comma-separated, e.g.
+     * `team_id` for PostHog's. A `ten: scoped` token must carry exactly these
+     * in its `prd` claim. Empty (the default) refuses every scoped token.
+     */
+    val authPredicateFields: String = env("HOGLAKE_AUTH_PREDICATE_FIELDS", ""),
+    /**
      * Hydrator poll interval; 0 disables the background loop (tests drive
      * it directly).
      *

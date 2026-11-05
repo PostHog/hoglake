@@ -2,6 +2,7 @@ package com.posthog.hoglake.api
 
 import com.posthog.hoglake.BuildInfo
 import com.posthog.hoglake.auth.AuthState
+import com.posthog.hoglake.auth.Caller
 import com.posthog.hoglake.auth.actorOrRefuse
 import com.posthog.hoglake.auth.hoglakeAuth
 import com.posthog.hoglake.auth.resolveActor
@@ -67,8 +68,14 @@ fun Application.installApiRoutes(
                     // The distinction matters — see auth/AuthState.
                     is AuthState.Off -> instanceTotals()
                     is AuthState.Anonymous -> null
+                    // A scoped caller sees part of a catalog, so a catalog's
+                    // totals would describe data it may not see.
                     is AuthState.Authenticated ->
-                        instanceTotalsFor(instanceTotals(), catalogTotals(), auth.caller.visibleCatalogs())
+                        if (auth.caller.kind == Caller.Kind.SCOPED) {
+                            null
+                        } else {
+                            instanceTotalsFor(instanceTotals(), catalogTotals(), auth.caller.visibleCatalogs())
+                        }
                 }
             call.respond(
                 InstanceInfoDto(
@@ -99,7 +106,9 @@ fun Application.installApiRoutes(
                         is AuthState.Anonymous -> emptySet()
                         is AuthState.Authenticated -> auth.caller.visibleCatalogs()
                     }
-                call.respond(catalogs.listCatalogs(visible).map { it.toDto(totals[it.name]) })
+                // Totals are catalog-wide, so a scoped caller gets none.
+                val scoped = (call.hoglakeAuth as? AuthState.Authenticated)?.caller?.kind == Caller.Kind.SCOPED
+                call.respond(catalogs.listCatalogs(visible).map { it.toDto(if (scoped) null else totals[it.name]) })
             }
             post {
                 val req = call.receive<CreateCatalogRequestDto>()

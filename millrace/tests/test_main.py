@@ -136,13 +136,15 @@ def test_s3_kwargs_maps_only_present_values():
     }
 
 
-def _components(**stage_kwargs: Any) -> tuple[Any, StageManager, Any, Any]:
+def _components(
+    variant_sources: tuple[tuple[str, str], ...] = (), **stage_kwargs: Any
+) -> tuple[Any, StageManager, Any, Any]:
     """Real-but-unstarted components for the collector."""
     from pyhoglake import HoglakeClient
 
     from millrace.flush import FlushRunner, HoglakeFlusher
 
-    cfg = make_config()
+    cfg = make_config(variant_sources=variant_sources)
     stages = StageManager("memory:///", "millrace", **stage_kwargs)
     consumer = MillraceConsumer(
         FakeConsumer(),
@@ -496,6 +498,35 @@ def test_pipeline_collector_names_the_variant_codec(
         raw = _raw(_collector(consumer, stages, flusher, runner))
         info = {k: v for k, v in raw.items() if k[0] == "millrace_variant_codec_info"}
         assert info == {("millrace_variant_codec_info", (("backend", backend),)): 1}
+    finally:
+        flusher.close()
+
+
+@pytest.mark.parametrize("backend", ["native", "python"])
+def test_pipeline_collector_exports_encode_seconds_per_column_and_codec(
+    monkeypatch: pytest.MonkeyPatch, backend: str
+):
+    """Every mapped column under both codecs from the first scrape; a
+    build's encode seconds go under the process's codec."""
+    monkeypatch.setattr(_variant_backend, "MODE", backend)
+    monkeypatch.setattr(_variant_backend, "native", lambda: (object(), ""))
+    consumer, stages, flusher, runner = _components((("sv", "properties"),))
+    name = "millrace_variant_encode_seconds_total"
+
+    def exported() -> dict[tuple[str, str], float]:
+        raw = _raw(_collector(consumer, stages, flusher, runner))
+        return {
+            (dict(labels)["column"], dict(labels)["backend"]): value
+            for (n, labels), value in raw.items()
+            if n == name
+        }
+
+    try:
+        expected = {("sv", "native"): 0.0, ("sv", "python"): 0.0}
+        assert exported() == expected
+        flusher._note_variant("sv", VariantReport(encode_seconds=0.25))
+        flusher._note_variant("sv", VariantReport(encode_seconds=0.5))
+        assert exported() == expected | {("sv", backend): 0.75}
     finally:
         flusher.close()
 
