@@ -45,6 +45,8 @@ import com.posthog.hoglake.service.RetirementService
 import com.posthog.hoglake.service.ScanService
 import com.posthog.hoglake.service.TableCreationService
 import com.posthog.hoglake.service.ViewService
+import com.posthog.hoglake.store.CatalogStore
+import com.posthog.hoglake.store.PostgresCatalogStore
 import com.zaxxer.hikari.HikariDataSource
 import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
@@ -106,6 +108,9 @@ class App private constructor(
         )
     private val alterService = AlterService(jdbi)
     private val scanService = ScanService(jdbi)
+
+    /** The catalog seam the core routes call. Only the PostgreSQL store exists in the server. */
+    private val catalogStore: CatalogStore = PostgresCatalogStore(catalogService, commitService, scanService)
     private val partitionLookupService = PartitionLookupService(jdbi)
     private val viewService = ViewService(jdbi)
     private val optionsService = OptionsService(jdbi)
@@ -363,7 +368,7 @@ class App private constructor(
                     null
                 }
             },
-            containment = catalogService::liveContainment,
+            containment = catalogStore::liveContainment,
         )
         app.install(ContentNegotiation) {
             // One definition, shared with the tests that pin this
@@ -422,8 +427,7 @@ class App private constructor(
             }
         }
         app.installApiRoutes(
-            catalogService,
-            commitService,
+            catalogStore,
             cfg.instanceName,
             instanceTotals = { catalogMetrics.latestTotals },
             catalogTotals = { catalogMetrics.latestByCatalog },
@@ -436,7 +440,7 @@ class App private constructor(
             com.posthog.hoglake.service.UploadService(jdbi, cfg.removalLedgerRetentionSeconds),
         )
         app.installAlterRoutes(alterService)
-        app.installScanRoutes(scanService)
+        app.installScanRoutes(catalogStore)
         app.installViewRoutes(viewService)
         app.installMaintenanceRoutes(
             optionsService,

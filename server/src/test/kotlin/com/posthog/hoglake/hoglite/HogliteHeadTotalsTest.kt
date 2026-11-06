@@ -32,7 +32,8 @@ class HogliteHeadTotalsTest {
                         sql.startsWith(
                             "SELECT name, data_path,",
                         ) -> listOf("wh", "s3://b/wh", metaHead, 0, 0, null, null, 0)
-                        sql.startsWith("SELECT id, name FROM namespaces") -> listOf(1, "ns")
+                        sql.startsWith("SELECT id, name, contained_field, contained_value FROM namespaces") ->
+                            listOf(1, "ns", null, null)
                         sql.startsWith("SELECT t.id, t.table_uuid, v.namespace_id") ->
                             listOf(7, uuid, 1, "ns", "t", null, "{}", 10, 0)
                         // The pinned listing: totals aggregated at the snapshot.

@@ -107,14 +107,32 @@ internal object HogliteSchema {
                  * deletion. */
                 dropping INTEGER NOT NULL DEFAULT 0
             )""",
+            /*
+             * contained_field/contained_value: namespace containment, as
+             * Postgres V33 adds it to hog_namespace. Not versioned: a read
+             * at a past snapshot gets the current containment, as on
+             * Postgres. The CHECK has the V33 shape without the field-name
+             * regex, because SQLite has no `~`. The store validates the
+             * field in Kotlin before every write.
+             */
             """CREATE TABLE IF NOT EXISTS namespaces(
                 id INTEGER PRIMARY KEY,
                 name TEXT NOT NULL,
                 created_snapshot INTEGER NOT NULL,
-                dropped_snapshot INTEGER
+                dropped_snapshot INTEGER,
+                contained_field TEXT,
+                contained_value INTEGER,
+                CHECK ((contained_field IS NULL AND contained_value IS NULL)
+                    OR (contained_field IS NOT NULL AND contained_value IS NOT NULL AND contained_value > 0))
             )""",
             """CREATE UNIQUE INDEX IF NOT EXISTS namespaces_live
                 ON namespaces(name) WHERE dropped_snapshot IS NULL""",
+            // At most one live namespace per containment (V33's
+            // hog_namespace_live_containment). A query uses it only when
+            // its WHERE repeats both terms of the index's WHERE.
+            """CREATE UNIQUE INDEX IF NOT EXISTS namespaces_live_containment
+                ON namespaces(contained_field, contained_value)
+                WHERE dropped_snapshot IS NULL AND contained_field IS NOT NULL""",
             """CREATE TABLE IF NOT EXISTS tables(
                 id INTEGER PRIMARY KEY,
                 namespace_id INTEGER NOT NULL,
