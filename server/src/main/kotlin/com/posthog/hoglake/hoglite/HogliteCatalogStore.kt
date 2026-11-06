@@ -2843,11 +2843,11 @@ class HogliteCatalogStore(
                 HoglakeException.BackendQueryTimeout(
                     "hoglite query exceeded the engine deadline; narrow the request: $detail",
                 )
-            r.status in setOf(421, 503, 504) ->
-                HoglakeException.BackendUnavailable("hoglite answered ${r.status}: $detail")
-            // SQL refusals, malformed requests, and other deterministic limits are final.
-            // readTx normalizes labelled 422 refusals to 409; support both forms.
-            else -> HoglakeException.Validation("hoglite refused the statement: $detail")
+            // /query's bare 409 is SQL refusal; readTx also normalizes refused 422 to 409.
+            code in setOf("refused", "out_of_memory") || r.status in setOf(400, 409, 422) ->
+                HoglakeException.Validation("hoglite refused the statement: $detail")
+            // An unclassified engine/proxy server failure is not a deterministic request refusal.
+            else -> HoglakeException.BackendUnavailable("hoglite answered ${r.status}: $detail")
         }
     }
 

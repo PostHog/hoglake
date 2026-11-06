@@ -636,8 +636,9 @@ class HogliteClient(
                     backoff()
                 }
                 else -> {
-                    // Deterministic: the pool answered and the answer is
-                    // final.
+                    // Surface other statuses without another transport attempt.
+                    // Operation-specific classification distinguishes request
+                    // refusals, unknown read failures, and ambiguous writes.
                     return finalAnswer(resp.statusCode(), resp.body())
                 }
             }
