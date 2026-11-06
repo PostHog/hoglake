@@ -86,6 +86,16 @@ jobs:
       - name: Smoke - the CLI runs
         run: docker run --rm hoglake-bench:ci --help
 
+      - name: Smoke - CostBench CLI and writable query cache
+        run: |
+          docker run --rm --network none hoglake-bench:ci costbench --help
+          docker run --rm --network none --entrypoint python hoglake-bench:ci -c '
+          from hoglake_bench.costbench.__main__ import build_parser
+          args = build_parser().parse_args(["run", "--trino-url", "http://localhost:8080", "--hourly-usd", "0", "--output", "/work/run.jsonl"])
+          args.query_cache.parent.mkdir(parents=True, exist_ok=True)
+          args.query_cache.write_text("cache write probe")
+          '
+
       # The image must not be root, and it must not carry a .venv built
       # on somebody's host — the failure mode this image exists to
       # retire (macOS-built binaries landing in a linux container).

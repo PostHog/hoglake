@@ -597,3 +597,19 @@ Caveat on correlations: a 2-stage `--stages` list (the quick profile)
 makes `catalog_latency_corr` a two-point Pearson, which is ±1 by
 construction — read `fixed_window_ratio` instead there; the
 correlation is only informative at 3+ stages.
+
+## CostBench query workload
+
+`hoglake-bench costbench` runs the pinned 2025 read-only warehouse workload:
+1B rows, 43 queries and three consecutive attempts per query. It is independent
+of the catalog regression scenarios and is excluded from `all`.
+
+See [the CostBench guide](costbench.md) for the self-contained public S3 loader,
+query runner, nine-worker NVMe deployment, cache verification, reporting and
+cleanup. No private perftest repository is required. The guide also covers
+running against an existing Trino + Hoglake deployment and explains the separate
+43-query headline, all 129 executions, compute charges and storage costs.
+
+The commands save reports locally; publishing results is a separate step.
+Upstream SQL is downloaded and checksummed as a separate licensed input; it is
+not vendored into this repository.

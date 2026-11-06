@@ -145,6 +145,7 @@ def build_parser() -> argparse.ArgumentParser:
         p = sub.add_parser(name, help=(mod.__doc__ or "").strip().splitlines()[0])
         _add_common(p)
         mod.add_args(p)
+    sub.add_parser("costbench", help="run the public 2025 CostBench SQL workload")
     # `seed` is a task, not a scenario: it is deliberately NOT in
     # SCENARIOS (so `all` never runs it) and journals no metrics.
     p_seed = sub.add_parser(
@@ -329,6 +330,11 @@ def _namespace_for(
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "costbench":
+        from .costbench.__main__ import main as costbench_main
+
+        return costbench_main(argv[1:])
     args = build_parser().parse_args(argv)
     cfg = BenchConfig(
         url=args.url,
