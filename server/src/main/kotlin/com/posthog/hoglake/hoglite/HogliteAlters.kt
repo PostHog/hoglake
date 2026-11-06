@@ -621,15 +621,47 @@ internal class HogliteAlters(
                 store.queryCatalog(catalog, "SELECT next_file_id FROM meta WHERE id = 1")
                     .firstRow()!![0].asLong()
             tx.expectScalar(nextFile, "SELECT next_file_id FROM meta WHERE id = 1") { ALTER_FILE_SET_CHANGED }
-            val rows =
-                store.queryCatalog(
-                    catalog,
-                    "SELECT id, stats_json FROM files WHERE table_id = ? AND stats_json IS NOT NULL",
-                    tableId,
-                ).rows
-            for (row in rows) {
-                val original = row[1].asString()
-                state.statsRewrites[row[0].asLong()] = StatsRewrite(original, store.json.readValue(original))
+            // Reuse files_listing's complete ordering, including ended rows. The
+            // pinned allocator ceiling excludes later appends; its tx guard will
+            // force a fresh plan if anything was appended while paging.
+            var cursor: Triple<Long, Long, Long>? = null
+            var pageSize = 256
+            while (true) {
+                val after = if (cursor == null) "" else " AND (begin_snapshot, row_id_start, id) > (?, ?, ?)"
+                val args =
+                    buildList<Any> {
+                        add(tableId)
+                        add(nextFile)
+                        cursor?.let {
+                            add(it.first)
+                            add(it.second)
+                            add(it.third)
+                        }
+                        add(pageSize)
+                    }
+                val rows =
+                    try {
+                        store.queryCatalog(
+                            catalog,
+                            "SELECT id, stats_json, begin_snapshot, row_id_start FROM files " +
+                                "WHERE table_id = ? AND id < ? AND stats_json IS NOT NULL" + after +
+                                " ORDER BY begin_snapshot, row_id_start, id LIMIT ?",
+                            *args.toTypedArray(),
+                        ).rows
+                    } catch (tooLarge: HoglakeException.BackendResultTooLarge) {
+                        // A row-bounded batch can still exceed the byte cap. Narrow
+                        // the next statement, never retry the same refused request.
+                        if (pageSize == 1) throw tooLarge
+                        pageSize = maxOf(1, pageSize / 2)
+                        continue
+                    }
+                for (row in rows) {
+                    val original = row[1].asString()
+                    state.statsRewrites[row[0].asLong()] = StatsRewrite(original, store.json.readValue(original))
+                }
+                if (rows.size < pageSize) break
+                val last = rows.last()
+                cursor = Triple(last[2].asLong(), last[3].asLong(), last[0].asLong())
             }
             state.statsLoaded = true
         }

@@ -152,7 +152,7 @@ class HoglitePromotionReviewIntegrationTest {
                     append(cat, "racing", listOf(1))
                 }
             }, { path, body ->
-                if (atReply && path.endsWith("/query") && "SELECT id, stats_json FROM files" in body &&
+                if (atReply && path.endsWith("/query") && "SELECT id, stats_json" in body &&
                     statsReplies.incrementAndGet() == 1
                 ) {
                     // The rows are already read. A fence captured after this response is too late.
