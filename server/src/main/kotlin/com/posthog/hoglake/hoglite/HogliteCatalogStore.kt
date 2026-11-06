@@ -2740,29 +2740,27 @@ class HogliteCatalogStore(
     internal fun mapRejected(
         catalog: String,
         r: HogliteRejected,
-    ): HoglakeException =
-        when (r.status) {
-            404 -> missingCatalog(catalog)
-            // A 422 reaching here is hoglite's labelled `refused`: a SQL
-            // error (constraint violation, malformed statement) that
-            // rolled back. The client turns an unlabelled 422 into
-            // CommitOutcomeUnknown, so this arm never sees a commit that
-            // may be durable. Both causes are this store's bug or a bad
-            // input the guards should have named; surface as Validation
-            // with the engine's message rather than a bare 500.
-            422 -> {
-                // The body is hoglite's {"error": "..."}; surface the
-                // engine's message, not raw JSON, into the API error.
-                val detail =
-                    try {
-                        json.readTree(r.body).get("error")?.asText()
-                    } catch (_: Exception) {
-                        null
-                    }
-                HoglakeException.Validation("hoglite refused the statement: ${detail ?: r.body}")
-            }
-            else -> HoglakeException.BackendUnavailable("hoglite answered ${r.status}: ${r.body}")
+    ): HoglakeException {
+        val body = runCatching { json.readTree(r.body) }.getOrNull()
+        val code = body?.get("code")?.asText()
+        val detail = body?.get("error")?.asText() ?: r.body
+        return when {
+            r.status == 404 -> missingCatalog(catalog)
+            code == "result_too_large" ->
+                HoglakeException.BackendResultTooLarge(
+                    "hoglite result exceeds the engine limit; narrow the request: $detail",
+                )
+            code == "query_timeout" ->
+                HoglakeException.BackendQueryTimeout(
+                    "hoglite query exceeded the engine deadline; narrow the request: $detail",
+                )
+            r.status in setOf(421, 503, 504) ->
+                HoglakeException.BackendUnavailable("hoglite answered ${r.status}: $detail")
+            // SQL refusals, malformed requests, and other deterministic limits are final.
+            // readTx normalizes labelled 422 refusals to 409; support both forms.
+            else -> HoglakeException.Validation("hoglite refused the statement: $detail")
         }
+    }
 
     /**
      * hoglite's 404 for a tenant with no manifest. Matched on the engine's
