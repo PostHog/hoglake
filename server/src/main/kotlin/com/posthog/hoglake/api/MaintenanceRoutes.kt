@@ -11,6 +11,7 @@ import com.posthog.hoglake.service.DatabaseHealthService
 import com.posthog.hoglake.service.ExpiryService
 import com.posthog.hoglake.service.MaintenanceStatusService
 import com.posthog.hoglake.service.OptionsService
+import com.posthog.hoglake.store.CatalogStoreSelector
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
@@ -42,14 +43,17 @@ fun Application.installMaintenanceRoutes(
     hydrator: Hydrator,
     status: MaintenanceStatusService,
     databaseHealth: DatabaseHealthService,
+    selector: CatalogStoreSelector? = null,
 ) {
     routing {
         route("/v1/catalogs/{catalog}") {
             route("/options") {
                 get {
+                    selector?.requirePostgres(call, call.maintenanceCatalog())
                     call.respond(options.get(call.maintenanceCatalog()).toDto())
                 }
                 patch {
+                    selector?.requirePostgres(call, call.maintenanceCatalog())
                     val req = OptionsPatchRequest.from(call.receive<JsonNode>())
                     call.respond(
                         options.patch(
@@ -63,6 +67,7 @@ fun Application.installMaintenanceRoutes(
                 }
             }
             post("/maintenance/expire") {
+                selector?.requirePostgres(call, call.maintenanceCatalog())
                 call.respond(
                     expiry.runOnce(
                         call.maintenanceCatalog(),
@@ -71,6 +76,7 @@ fun Application.installMaintenanceRoutes(
                 )
             }
             post("/maintenance/cleanup") {
+                selector?.requirePostgres(call, call.maintenanceCatalog())
                 call.respond(
                     cleanup.runOnce(
                         call.maintenanceCatalog(),
@@ -81,6 +87,7 @@ fun Application.installMaintenanceRoutes(
             // `batch` = groups rewritten this run (default: the config knob,
             // 1 — compaction takes tiny bites by construction).
             post("/maintenance/compact") {
+                selector?.requirePostgres(call, call.maintenanceCatalog())
                 call.respond(
                     compaction.runOnce(
                         call.maintenanceCatalog(),
@@ -93,6 +100,7 @@ fun Application.installMaintenanceRoutes(
             // table via ?namespace=..&table=.. — both together or
             // neither).
             post("/maintenance/rehydrate") {
+                selector?.requirePostgres(call, call.maintenanceCatalog())
                 call.respond(
                     hydrator.rehydrateFailed(
                         call.maintenanceCatalog(),
@@ -104,9 +112,11 @@ fun Application.installMaintenanceRoutes(
             // The read side of the run ledger: per-task status (loop
             // cadence + live backlog + last run) and the paged history.
             get("/maintenance/status") {
+                selector?.requirePostgres(call, call.maintenanceCatalog())
                 call.respond(status.status(call.maintenanceCatalog()).toDto())
             }
             get("/maintenance/runs") {
+                selector?.requirePostgres(call, call.maintenanceCatalog())
                 call.respond(
                     status.runs(
                         call.maintenanceCatalog(),
@@ -121,6 +131,7 @@ fun Application.installMaintenanceRoutes(
             // pattern, so clients get the documented contract instead of
             // a bare 404 fall-through.
             get("/export") {
+                selector?.requirePostgres(call, call.maintenanceCatalog())
                 call.respond(
                     HttpStatusCode.NotImplemented,
                     ApiErrorDto(

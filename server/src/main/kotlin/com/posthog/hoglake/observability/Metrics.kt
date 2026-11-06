@@ -966,6 +966,11 @@ object Metrics {
     /** The commit counter's result tag for a failed commit. */
     fun commitFailureResult(e: HoglakeException): String? =
         when (e) {
+            is HoglakeException.CommitOutcomeUnknown -> "commit_outcome_unknown"
+            is HoglakeException.BackendUnavailable -> "backend_unavailable"
+            is HoglakeException.BackendResultTooLarge -> "backend_result_too_large"
+            is HoglakeException.BackendQueryTimeout -> "backend_query_timeout"
+            is HoglakeException.NotSupported -> "not_supported_on_backend"
             // Counted, and counted as a conflict: it is a 409, and
             // before it was typed it was counted as "validation".
             // Left in the `else` it would stop being counted at all.

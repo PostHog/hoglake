@@ -2545,6 +2545,9 @@ data class ChangesPlan(
 
 /** Service-level failures the API layer maps to status codes. */
 sealed class HoglakeException(message: String) : RuntimeException(message) {
+    /** The selected backend does not implement this operation. */
+    class NotSupported(detail: String) : HoglakeException(detail)
+
     /** Narrow the result before retrying. This refusal is not backend unavailability. */
     class BackendResultTooLarge(detail: String) : HoglakeException(detail)
 

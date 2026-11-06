@@ -46,6 +46,7 @@ import com.posthog.hoglake.service.ScanService
 import com.posthog.hoglake.service.TableCreationService
 import com.posthog.hoglake.service.ViewService
 import com.posthog.hoglake.store.CatalogStore
+import com.posthog.hoglake.store.CatalogStoreSelector
 import com.posthog.hoglake.store.PostgresCatalogStore
 import com.zaxxer.hikari.HikariDataSource
 import io.ktor.http.ContentType
@@ -109,8 +110,9 @@ class App private constructor(
     private val alterService = AlterService(jdbi)
     private val scanService = ScanService(jdbi)
 
-    /** The catalog seam the core routes call. Only the PostgreSQL store exists in the server. */
+    /** The default store stays PostgreSQL. Verified placement selects additional backends per request. */
     private val catalogStore: CatalogStore = PostgresCatalogStore(catalogService, commitService, scanService)
+    private val catalogSelector = CatalogStoreSelector(catalogStore, cfg)
     private val partitionLookupService = PartitionLookupService(jdbi)
     private val viewService = ViewService(jdbi)
     private val optionsService = OptionsService(jdbi)
@@ -360,16 +362,7 @@ class App private constructor(
         // A scoped caller's namespace check, on the dispatcher and before
         // routing: the half of authorization that needs the database
         // (auth/NamespaceGate.kt).
-        app.installNamespaceGate(
-            dataPath = { catalog ->
-                try {
-                    catalogService.getCatalog(catalog).dataPath
-                } catch (_: com.posthog.hoglake.model.HoglakeException.NotFound) {
-                    null
-                }
-            },
-            containment = catalogStore::liveContainment,
-        )
+        app.installNamespaceGate(catalogSelector)
         app.install(ContentNegotiation) {
             // One definition, shared with the tests that pin this
             // behaviour (api/WireJson.kt).
@@ -414,7 +407,11 @@ class App private constructor(
             // HOGLAKE_HEALTH_PROBE_TIMEOUT_MS, so neither a full Hikari
             // pool nor a full request dispatcher can delay it.
             get("/healthz") {
-                val ok = healthProbe.reachable()
+                val ok =
+                    healthProbe.reachable() &&
+                        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                            catalogSelector.reachable()
+                        }
                 if (ok) {
                     call.respondText("ok")
                 } else {
@@ -427,7 +424,7 @@ class App private constructor(
             }
         }
         app.installApiRoutes(
-            catalogStore,
+            catalogSelector,
             cfg.instanceName,
             instanceTotals = { catalogMetrics.latestTotals },
             catalogTotals = { catalogMetrics.latestByCatalog },
@@ -440,7 +437,7 @@ class App private constructor(
             com.posthog.hoglake.service.UploadService(jdbi, cfg.removalLedgerRetentionSeconds),
         )
         app.installAlterRoutes(alterService)
-        app.installScanRoutes(catalogStore)
+        app.installScanRoutes(catalogSelector)
         app.installViewRoutes(viewService)
         app.installMaintenanceRoutes(
             optionsService,
@@ -450,11 +447,12 @@ class App private constructor(
             hydrator,
             maintenanceStatusService,
             DatabaseHealthService(jdbi, reindexService),
+            selector = catalogSelector,
         )
         app.installPartitionStatsRoutes(partitionStatsService)
         app.installPartitionListingRoutes(partitionListingService)
         app.installPartitionLookupRoutes(partitionLookupService)
-        app.installPublicationRoutes()
+        app.installPublicationRoutes(catalogSelector)
         app.installDebugRoutes()
     }
 

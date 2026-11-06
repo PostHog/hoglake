@@ -148,6 +148,11 @@ object Audit {
     /** Failure outcome vocabulary for audit lines (ErrorMapping's cousin). */
     fun failureOutcome(e: Throwable): String =
         when (e) {
+            is HoglakeException.CommitOutcomeUnknown -> "commit_outcome_unknown"
+            is HoglakeException.BackendUnavailable -> "backend_unavailable"
+            is HoglakeException.BackendResultTooLarge -> "backend_result_too_large"
+            is HoglakeException.BackendQueryTimeout -> "backend_query_timeout"
+            is HoglakeException.NotSupported -> "not_supported_on_backend"
             is HoglakeException.AlreadyExists -> "conflict"
             // A commit into a dropped table is a 409 like the other
             // two, and it used to arrive here as Validation. Without

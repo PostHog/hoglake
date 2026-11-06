@@ -1,7 +1,27 @@
 package com.posthog.hoglake
 
-/** Process configuration, environment-sourced. No config files in v1. */
+import com.fasterxml.jackson.core.JsonParser
+import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import com.posthog.hoglake.hoglite.HogliteBackend
+import com.posthog.hoglake.store.BackendKind
+import java.net.URI
+import java.nio.file.Files
+import java.nio.file.Path
+import java.util.UUID
+
+/** Process configuration, with an optional backend allowlist file. */
 data class Config(
+    /**
+     * Optional JSON file: {"backends": [{"id": UUID, "kind": "hoglite", "url": HTTP_URL}]}.
+     * Optional keys: whale_url, owner_url_pattern, connect_timeout_ms, read_timeout_ms,
+     * commit_timeout_ms, retry_budget_ms, circuit_failure_threshold, circuit_open_ms.
+     * Entries contain endpoints, never credentials. Each id must be unique and canonical.
+     */
+    val backendsFile: String = env("HOGLAKE_BACKENDS_FILE", ""),
+    /** PostgreSQL is the only default backend. `none` disables fallback, not PostgreSQL startup. */
+    val defaultBackend: String = env("HOGLAKE_DEFAULT_BACKEND", "postgres"),
+    /** Optional allowlist id for this process's PostgreSQL backend. */
+    val postgresBackendId: String = env("HOGLAKE_POSTGRES_BACKEND_ID", ""),
     val port: Int = env("HOGLAKE_PORT", "8080").toInt(),
     /**
      * The infra listener's port (docs/auth-tenancy.md §6.7): `GET /metrics`
@@ -1251,7 +1271,26 @@ data class Config(
     val maintenanceSummaryBatch: Int = env("HOGLAKE_MAINTENANCE_SUMMARY_BATCH", "10000").toInt(),
     val maintenanceSummaryRefreshSeconds: Long = env("HOGLAKE_MAINTENANCE_SUMMARY_REFRESH_SECONDS", "60").toLong(),
 ) {
+    val hogliteBackends: Map<UUID, HogliteBackend> = readBackends(backendsFile)
+
+    val backendKinds: Map<UUID, BackendKind> =
+        hogliteBackends.keys.associateWith { BackendKind.HOGLITE } +
+            if (postgresBackendId.isEmpty()) {
+                emptyMap()
+            } else {
+                mapOf(canonicalBackendId(postgresBackendId) to BackendKind.POSTGRES)
+            }
+
     init {
+        require(defaultBackend == "postgres" || defaultBackend == "none") {
+            "HOGLAKE_DEFAULT_BACKEND must be postgres or none; hoglite cannot be a default backend"
+        }
+        require(backendsFile.isBlank() || authMode.trim().lowercase() in setOf("warn", "enforce")) {
+            "HOGLAKE_BACKENDS_FILE requires HOGLAKE_AUTH_MODE warn or enforce: hoglite needs auth"
+        }
+        require(postgresBackendId.isEmpty() || canonicalBackendId(postgresBackendId) !in hogliteBackends) {
+            "HOGLAKE_POSTGRES_BACKEND_ID duplicates a hoglite backend id"
+        }
         checkRemovedEnv(System::getenv)
         // THE SPILL DIRECTORY IS CHECKED AT BOOT, and only where the
         // compaction loop runs — priced per workload like the pool check
@@ -1717,4 +1756,92 @@ data class Config(
 
         fun fromEnv(): Config = Config()
     }
+}
+
+/** Parse backend ids without UUID.fromString's abbreviated forms. */
+private fun canonicalBackendId(value: String): UUID {
+    val id = UUID.fromString(value)
+    require(id.toString() == value) { "backend id must be a canonical lowercase UUID" }
+    return id
+}
+
+private fun readBackends(file: String): Map<UUID, HogliteBackend> {
+    if (file.isBlank()) return emptyMap()
+    val json = jacksonObjectMapper().enable(JsonParser.Feature.STRICT_DUPLICATE_DETECTION)
+    val root = Files.newBufferedReader(Path.of(file)).use { json.readTree(it) }
+    require(root.isObject && root.properties().map { it.key }.toSet() == setOf("backends")) {
+        "HOGLAKE_BACKENDS_FILE must contain only a backends array"
+    }
+    val entries = root.get("backends")
+    require(entries.isArray) { "backends must be an array" }
+    val result = linkedMapOf<UUID, HogliteBackend>()
+    for (entry in entries) {
+        require(entry.isObject) { "backend entry must be an object" }
+        val keys =
+            setOf(
+                "id", "kind", "url", "whale_url", "owner_url_pattern", "connect_timeout_ms", "read_timeout_ms",
+                "commit_timeout_ms", "retry_budget_ms", "circuit_failure_threshold", "circuit_open_ms",
+            )
+        require(entry.properties().all { it.key in keys }) { "backend entry has unknown fields" }
+
+        fun text(
+            key: String,
+            default: String? = null,
+        ): String {
+            val node = entry.get(key) ?: return requireNotNull(default) { "backend requires $key" }
+            require(node.isTextual) { "backend $key must be a string" }
+            return node.asText()
+        }
+
+        fun positive(
+            key: String,
+            default: Long,
+        ): Long {
+            val node = entry.get(key) ?: return default
+            require(
+                node.isIntegralNumber && node.canConvertToLong() && node.asLong() > 0,
+            ) { "backend $key must be positive" }
+            return node.asLong()
+        }
+
+        fun url(
+            key: String,
+            default: String? = null,
+        ): String {
+            val value = text(key, default)
+            if (value.isEmpty() && default != null) return value
+            val uri = URI(value)
+            require(uri.scheme in setOf("http", "https") && !uri.host.isNullOrEmpty() && uri.userInfo == null) {
+                "backend $key must be an http(s) URL without credentials"
+            }
+            return value
+        }
+        val id = canonicalBackendId(text("id"))
+        require(id !in result) { "duplicate backend id" }
+        require(text("kind") == "hoglite") { "backend entries support only kind hoglite" }
+        val owner = text("owner_url_pattern", "")
+        require(owner.isEmpty() || "{owner}" in owner) { "owner_url_pattern must contain {owner}" }
+        if (owner.isNotEmpty()) {
+            val uri = URI(owner.replace("{owner}", "owner"))
+            require(uri.scheme in setOf("http", "https") && !uri.host.isNullOrEmpty() && uri.userInfo == null) {
+                "owner_url_pattern must be an http(s) URL without credentials"
+            }
+        }
+        val threshold = positive("circuit_failure_threshold", 10)
+        require(threshold <= Int.MAX_VALUE) { "circuit_failure_threshold is too large" }
+        result[id] =
+            HogliteBackend(
+                id = id,
+                url = url("url"),
+                whaleUrl = url("whale_url", ""),
+                ownerUrlPattern = owner,
+                connectTimeoutMs = positive("connect_timeout_ms", 2000),
+                readTimeoutMs = positive("read_timeout_ms", 5000),
+                commitTimeoutMs = positive("commit_timeout_ms", 10000),
+                retryBudgetMs = positive("retry_budget_ms", 8000),
+                circuitFailureThreshold = threshold.toInt(),
+                circuitOpenMs = positive("circuit_open_ms", 5000),
+            )
+    }
+    return result
 }
