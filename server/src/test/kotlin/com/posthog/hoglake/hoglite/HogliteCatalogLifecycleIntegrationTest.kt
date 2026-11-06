@@ -64,6 +64,8 @@ class HogliteCatalogLifecycleIntegrationTest {
         val names = (1..3).map { HogliteConformanceEngine.uniqueName("list") }
         names.forEach { store.createCatalog(it, "s3://hoglake-it/$it", null, null) }
         val missing = HogliteConformanceEngine.uniqueName("absent")
-        assertThat(store.listCatalogs(names + missing).map { it.name }).containsExactlyInAnyOrderElementsOf(names)
+        assertThat(
+            store.listCatalogs((names + missing).toSet()).map { it.name },
+        ).containsExactlyInAnyOrderElementsOf(names)
     }
 }

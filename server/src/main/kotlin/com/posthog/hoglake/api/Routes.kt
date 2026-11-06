@@ -8,17 +8,15 @@ import com.posthog.hoglake.auth.actorOrRefuse
 import com.posthog.hoglake.auth.hoglakeAuth
 import com.posthog.hoglake.auth.requireScopedNamespaces
 import com.posthog.hoglake.auth.resolveActor
-import com.posthog.hoglake.commit.CommitService
 import com.posthog.hoglake.model.HoglakeException
-import com.posthog.hoglake.model.NamespaceContainment
 import com.posthog.hoglake.observability.CatalogTotals
 import com.posthog.hoglake.observability.InstanceTotals
 import com.posthog.hoglake.observability.instanceTotalsFor
 import com.posthog.hoglake.persistence.FileRepo
-import com.posthog.hoglake.service.CatalogService
 import com.posthog.hoglake.service.ColumnTrees
 import com.posthog.hoglake.service.Identifiers
 import com.posthog.hoglake.service.ScanService
+import com.posthog.hoglake.store.CatalogStore
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
@@ -43,13 +41,17 @@ import java.util.UUID
  * whose HoglakeExceptions are mapped by ErrorMapping.
  */
 fun Application.installApiRoutes(
-    catalogs: CatalogService,
-    commits: CommitService,
+    store: CatalogStore,
     instanceName: String = "",
     instanceTotals: () -> InstanceTotals? = { null },
     catalogTotals: () -> Map<String, CatalogTotals> = { emptyMap() },
     uiTheme: String = "",
 ) {
+    // The handlers keep the receiver names `catalogs.` and `commits.`.
+    // CommitConflictSpecParityTest and CatalogDropSpecParityTest count call
+    // sites by these names. Both names refer to the one CatalogStore.
+    val catalogs: CatalogStore = store
+    val commits: CatalogStore = store
     routing {
         get("/v1/info") {
             // Totals come from the metrics sampler's last pass — never
@@ -197,29 +199,6 @@ fun Application.installApiRoutes(
                             ).toDto(),
                         )
                     }
-                    // Containment (V33): operator-only in AuthPolicy.
-                    put("/{namespace}/containment") {
-                        val req = call.receive<NamespaceContainmentDto>()
-                        call.respond(
-                            catalogs.setNamespaceContainment(
-                                call.catalog(),
-                                call.namespace(),
-                                NamespaceContainment(req.field, req.value),
-                                call.actorOrRefuse(null),
-                            ).toDto(),
-                        )
-                    }
-                    delete("/{namespace}/containment") {
-                        call.respond(
-                            catalogs.setNamespaceContainment(
-                                call.catalog(),
-                                call.namespace(),
-                                null,
-                                call.actorOrRefuse(null),
-                            ).toDto(),
-                        )
-                    }
-
                     route("/{namespace}/tables") {
                         get {
                             call.respond(
@@ -610,9 +589,9 @@ fun Application.installApiRoutes(
  * with `include=column_stats` each provided file's column statistics
  * (narrowed by `stats_fields`), with `include=split_offsets` each file's
  * stored row-group start offsets. Installed separately so App.kt wires
- * it with its own ScanService.
+ * it with its own CatalogStore.
  */
-fun Application.installScanRoutes(scan: ScanService) {
+fun Application.installScanRoutes(scan: CatalogStore) {
     routing {
         get("/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/scan") {
             // getAll, joined: Parameters[...] is only the FIRST occurrence,

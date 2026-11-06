@@ -7,6 +7,7 @@ import com.posthog.hoglake.api.installBlockingDispatch
 import com.posthog.hoglake.api.installDebugRoutes
 import com.posthog.hoglake.api.installErrorMapping
 import com.posthog.hoglake.api.installMaintenanceRoutes
+import com.posthog.hoglake.api.installNamespaceContainmentRoutes
 import com.posthog.hoglake.api.installPartitionListingRoutes
 import com.posthog.hoglake.api.installPartitionLookupRoutes
 import com.posthog.hoglake.api.installPartitionStatsRoutes
@@ -45,6 +46,8 @@ import com.posthog.hoglake.service.RetirementService
 import com.posthog.hoglake.service.ScanService
 import com.posthog.hoglake.service.TableCreationService
 import com.posthog.hoglake.service.ViewService
+import com.posthog.hoglake.store.CatalogStore
+import com.posthog.hoglake.store.PostgresCatalogStore
 import com.zaxxer.hikari.HikariDataSource
 import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
@@ -106,6 +109,9 @@ class App private constructor(
         )
     private val alterService = AlterService(jdbi)
     private val scanService = ScanService(jdbi)
+
+    /** The catalog seam the core routes call. Only the PostgreSQL store exists in the server. */
+    private val catalogStore: CatalogStore = PostgresCatalogStore(catalogService, commitService, scanService)
     private val partitionLookupService = PartitionLookupService(jdbi)
     private val viewService = ViewService(jdbi)
     private val optionsService = OptionsService(jdbi)
@@ -422,13 +428,13 @@ class App private constructor(
             }
         }
         app.installApiRoutes(
-            catalogService,
-            commitService,
+            catalogStore,
             cfg.instanceName,
             instanceTotals = { catalogMetrics.latestTotals },
             catalogTotals = { catalogMetrics.latestByCatalog },
             uiTheme = cfg.uiTheme,
         )
+        app.installNamespaceContainmentRoutes(catalogService)
         app.installTableCreationRoutes(
             TableCreationService(jdbi, catalogService, commitService, cfg.commitLockTimeoutMs),
         )
@@ -436,7 +442,7 @@ class App private constructor(
             com.posthog.hoglake.service.UploadService(jdbi, cfg.removalLedgerRetentionSeconds),
         )
         app.installAlterRoutes(alterService)
-        app.installScanRoutes(scanService)
+        app.installScanRoutes(catalogStore)
         app.installViewRoutes(viewService)
         app.installMaintenanceRoutes(
             optionsService,

@@ -6,6 +6,8 @@ import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.service.AlterService
 import com.posthog.hoglake.service.CatalogService
+import com.posthog.hoglake.service.ScanService
+import com.posthog.hoglake.store.PostgresCatalogStore
 import com.posthog.hoglake.testing.PgTestSupport
 import io.ktor.client.request.delete
 import io.ktor.client.request.get
@@ -40,7 +42,7 @@ class TableLifecycleRoutesIntegrationTest {
                 application {
                     install(ContentNegotiation) { jackson { configureHoglakeWire() } }
                     install(StatusPages) { installErrorMapping() }
-                    installApiRoutes(catalogs, CommitService(db.jdbi))
+                    installApiRoutes(PostgresCatalogStore(catalogs, CommitService(db.jdbi), ScanService(db.jdbi)))
                     installAlterRoutes(alter)
                 }
                 val base = "/v1/catalogs/schema-guards"
@@ -123,7 +125,7 @@ class TableLifecycleRoutesIntegrationTest {
                 application {
                     install(ContentNegotiation) { jackson { configureHoglakeWire() } }
                     install(StatusPages) { installErrorMapping() }
-                    installApiRoutes(catalogs, CommitService(db.jdbi))
+                    installApiRoutes(PostgresCatalogStore(catalogs, CommitService(db.jdbi), ScanService(db.jdbi)))
                     installAlterRoutes(AlterService(db.jdbi))
                 }
                 val base = "/v1/catalogs/wire-lifecycle"

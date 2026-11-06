@@ -240,7 +240,7 @@ class HogliteCatalogStoreTest {
         seed("t-b-1", "b")
         seed("t-d-1", "a") // a tenant whose meta names another catalog
 
-        val listed = store.listCatalogs(listOf("b", "a", "c", "d", "a"))
+        val listed = store.listCatalogs(setOf("b", "a", "c", "d", "a"))
 
         assertThat(listed.map { it.name }).containsExactly("b", "a")
         assertThat(listed.map { it.dataPath }).containsExactly("s3://bucket/b", "s3://bucket/a")
@@ -257,14 +257,22 @@ class HogliteCatalogStoreTest {
                 "t-$catalog-1"
             })
 
-        assertThat(partial.listCatalogs(listOf("gone", "a")).map { it.name }).containsExactly("a")
+        assertThat(partial.listCatalogs(setOf("gone", "a")).map { it.name }).containsExactly("a")
+    }
+
+    @Test
+    fun `list refuses a request for all catalogs because there is no list to enumerate`() {
+        assertThat(catchThrowable { store.listCatalogs(null) })
+            .isInstanceOf(HoglakeException.Validation::class.java)
+            .hasMessageContaining("name the catalogs to list")
+        assertThat(requests).isEmpty()
     }
 
     @Test
     fun `list fails when the resolver fails for a reason other than NotFound`() {
         val broken = HogliteCatalogStore(client, { throw IllegalStateException("routing is down") })
 
-        assertThat(catchThrowable { broken.listCatalogs(listOf("a")) })
+        assertThat(catchThrowable { broken.listCatalogs(setOf("a")) })
             .isInstanceOf(IllegalStateException::class.java)
             .hasMessage("routing is down")
     }

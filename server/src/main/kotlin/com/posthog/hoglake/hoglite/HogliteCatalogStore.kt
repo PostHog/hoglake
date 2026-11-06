@@ -45,6 +45,7 @@ import com.posthog.hoglake.service.Identifiers
 import com.posthog.hoglake.service.ScanService
 import com.posthog.hoglake.service.columnsByFieldId
 import com.posthog.hoglake.service.requireOperationMetadata
+import com.posthog.hoglake.store.CatalogStore
 import java.time.Instant
 import java.util.UUID
 
@@ -79,8 +80,8 @@ fun interface HogliteTenantResolver {
  * tenant holds a catalog. Cross-catalog rules (unique names, disjoint
  * data paths) belong to the component that owns the catalogs.
  *
- * Not wired into the server yet: nothing constructs this class outside
- * tests.
+ * It implements [CatalogStore], the seam the core routes call. It is not
+ * wired into the server yet: nothing constructs this class outside tests.
  *
  * Not verified against a live engine. No production path uses this class.
  * Conformance tests against a real hoglited must pass before the server
@@ -92,7 +93,7 @@ class HogliteCatalogStore(
     private val tenants: HogliteTenantResolver,
     /** CommitService's blind-partitioned-append enforcement flag, for the commit port. */
     internal val refuseBlindPartitionedAppends: Boolean = false,
-) {
+) : CatalogStore {
     internal val json: ObjectMapper = jacksonObjectMapper()
 
     private val log = io.github.oshai.kotlinlogging.KotlinLogging.logger {}
@@ -198,7 +199,7 @@ class HogliteCatalogStore(
      * not hoglite's dedup, answers a second create. The client's own
      * retries reuse the txid, so one call applies at most once.
      */
-    fun createCatalog(
+    override fun createCatalog(
         name: String,
         dataPath: String,
         author: String?,
@@ -237,7 +238,7 @@ class HogliteCatalogStore(
             return getCatalog(name)
         }
 
-    fun getCatalog(name: String): CatalogInfo =
+    override fun getCatalog(name: String): CatalogInfo =
         catalogOperation(name) {
             meta(name).toCatalogInfo()
         }
@@ -250,15 +251,22 @@ class HogliteCatalogStore(
      * [listBatchSize] catalogs. An engine without the endpoint gets the
      * same reads one by one, [LIST_FALLBACK_PARALLELISM] at a time.
      *
-     * This class keeps no list of catalogs, so the caller names them.
+     * This class keeps no list of catalogs, so the caller names them in
+     * [visible]. A null [visible] ("all catalogs") is refused with
+     * Validation, because there is no list to enumerate.
+     *
      * A name that [tenants] does not know (NotFound), with no readable
      * tenant, or whose tenant holds another catalog, is skipped. A drop
      * that runs during the list must not fail the list. Any other
      * resolver failure fails the call.
      */
-    fun listCatalogs(names: Collection<String>): List<CatalogInfo> {
+    override fun listCatalogs(visible: Set<String>?): List<CatalogInfo> {
+        val names =
+            visible ?: throw HoglakeException.Validation(
+                "the hoglite backend keeps no list of catalogs; name the catalogs to list",
+            )
         val bound =
-            names.distinct().mapNotNull { name ->
+            names.mapNotNull { name ->
                 try {
                     name to tenants.tenantFor(name)
                 } catch (_: HoglakeException.NotFound) {
@@ -380,7 +388,7 @@ class HogliteCatalogStore(
      * partial failure proceeds: the fence transaction itself is not
      * fenced.
      */
-    fun dropCatalog(
+    override fun dropCatalog(
         catalog: String,
         author: String?,
         message: String?,
@@ -509,7 +517,7 @@ class HogliteCatalogStore(
      * Pending deletes count only removals that are not drained.
      * Overflow is an error, not a wrapped total.
      */
-    fun storageUsage(catalog: String): StorageUsage =
+    override fun storageUsage(catalog: String): StorageUsage =
         catalogOperation(catalog) {
             meta(catalog)
             val row = queryCatalog(catalog, STORAGE_USAGE_SQL).firstRow()!!
@@ -521,7 +529,7 @@ class HogliteCatalogStore(
 
     // ==================== namespaces =======================================
 
-    fun createNamespace(
+    override fun createNamespace(
         catalog: String,
         name: String,
         author: String?,
@@ -556,7 +564,7 @@ class HogliteCatalogStore(
             return NamespaceInfo(namespaceId = row[3].asLong(), name = name)
         }
 
-    fun listNamespaces(
+    override fun listNamespaces(
         catalog: String,
         snapshot: Long?,
         atTimestamp: Instant?,
@@ -582,7 +590,7 @@ class HogliteCatalogStore(
             return rows.rows.map { NamespaceInfo(it[0].asLong(), it[1].asString()) }
         }
 
-    fun getNamespace(
+    override fun getNamespace(
         catalog: String,
         namespace: String,
     ): NamespaceInfo =
@@ -591,12 +599,17 @@ class HogliteCatalogStore(
             return liveNamespace(catalog, namespace)
         }
 
-    fun dropNamespace(
+    /**
+     * [mayDropContained] has no effect here. This backend does not store
+     * namespace containment, so no namespace is contained.
+     */
+    override fun dropNamespace(
         catalog: String,
         namespace: String,
         expectedNamespaceId: Long?,
         author: String?,
         message: String?,
+        mayDropContained: Boolean,
     ): CommitResult =
         catalogOperation(catalog) {
             requireOperationMetadata(author, message)
@@ -649,7 +662,7 @@ class HogliteCatalogStore(
 
     // ==================== tables ===========================================
 
-    fun createTable(
+    override fun createTable(
         catalog: String,
         namespace: String,
         name: String,
@@ -733,7 +746,7 @@ class HogliteCatalogStore(
             )
         }
 
-    fun getTable(
+    override fun getTable(
         catalog: String,
         namespace: String,
         table: String,
@@ -816,7 +829,7 @@ class HogliteCatalogStore(
             )
         }
 
-    fun listTables(
+    override fun listTables(
         catalog: String,
         namespace: String,
         snapshot: Long?,
@@ -920,7 +933,7 @@ class HogliteCatalogStore(
             }
         }
 
-    fun dropTable(
+    override fun dropTable(
         catalog: String,
         namespace: String,
         table: String,
@@ -976,7 +989,7 @@ class HogliteCatalogStore(
             return CommitResult(snapshotId = row[0].asLong(), schemaVersion = row[1].asLong())
         }
 
-    fun truncateTable(
+    override fun truncateTable(
         catalog: String,
         namespace: String,
         table: String,
@@ -1052,7 +1065,7 @@ class HogliteCatalogStore(
 
     // ==================== files + changefeed ===============================
 
-    fun listFiles(
+    override fun listFiles(
         catalog: String,
         namespace: String,
         table: String,
@@ -1117,7 +1130,7 @@ class HogliteCatalogStore(
             return withOrderingBounds(catalog, t.tableId, at, page)
         }
 
-    fun partitionValues(
+    override fun partitionValues(
         catalog: String,
         namespace: String,
         table: String,
@@ -1159,7 +1172,7 @@ class HogliteCatalogStore(
             return PartitionValues(spec.specId, fields)
         }
 
-    fun fileStats(
+    override fun fileStats(
         catalog: String,
         namespace: String,
         table: String,
@@ -1195,7 +1208,7 @@ class HogliteCatalogStore(
             )
         }
 
-    fun changes(
+    override fun changes(
         catalog: String,
         namespace: String,
         table: String,
@@ -1293,7 +1306,7 @@ class HogliteCatalogStore(
 
     // ==================== snapshots ========================================
 
-    fun resolveSnapshot(
+    override fun resolveSnapshot(
         catalog: String,
         atTimestamp: Instant,
     ): SnapshotResolution =
@@ -1306,7 +1319,7 @@ class HogliteCatalogStore(
             return SnapshotResolution(at, HogliteSchema.parse(ts))
         }
 
-    fun listSnapshots(
+    override fun listSnapshots(
         catalog: String,
         after: Long,
         limit: Int,
@@ -1371,7 +1384,7 @@ class HogliteCatalogStore(
 
     // ==================== read planning ====================================
 
-    fun planScan(
+    override fun planScan(
         catalog: String,
         namespace: String,
         table: String,
@@ -1520,7 +1533,7 @@ class HogliteCatalogStore(
 
     // ==================== consumer offsets =================================
 
-    fun listConsumers(catalog: String): List<ConsumerTableOffset> =
+    override fun listConsumers(catalog: String): List<ConsumerTableOffset> =
         catalogOperation(catalog) {
             meta(catalog)
             return queryCatalog(
@@ -1542,7 +1555,7 @@ class HogliteCatalogStore(
             }
         }
 
-    fun listOffsets(
+    override fun listOffsets(
         catalog: String,
         consumerId: String,
     ): List<ConsumerOffset> =
@@ -1563,7 +1576,7 @@ class HogliteCatalogStore(
             }
         }
 
-    fun getOffset(
+    override fun getOffset(
         catalog: String,
         consumerId: String,
         tableUuid: UUID,
@@ -1589,7 +1602,7 @@ class HogliteCatalogStore(
             )
         }
 
-    fun commitOffset(
+    override fun commitOffset(
         catalog: String,
         consumerId: String,
         tableUuid: UUID,
@@ -1687,7 +1700,7 @@ class HogliteCatalogStore(
 
     // ==================== commits ==========================================
 
-    fun commit(
+    override fun commit(
         catalog: String,
         request: CommitRequest,
         userAgent: String?,
@@ -1696,7 +1709,7 @@ class HogliteCatalogStore(
             HogliteCommit.commit(this, catalog, request)
         }
 
-    fun receipt(
+    override fun receipt(
         catalog: String,
         operation: UUID,
     ): CommitResult =
