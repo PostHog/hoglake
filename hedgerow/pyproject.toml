@@ -22,7 +22,7 @@ hedgerow = "hedgerow.cli:main"
 
 [dependency-groups]
 dev = [
-    "pytest>=8.0",
+    "pytest>=9.2.0",
     "pytest-httpx>=0.30",
     "prometheus-client>=0.20",
     # A floor: the version is the root uv.lock's, shared with the sibling
