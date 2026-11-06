@@ -57,12 +57,14 @@ class HogliteReadParityIntegrationTest {
         lite: Boolean,
         body: (CatalogStore, AlterBackend, String) -> Unit,
     ) {
+        // Resolve the optional engine on the JUnit thread before creating proxy resources.
+        val engineUrl = if (lite) engine.url() else null
         val store: CatalogStore
         val alters: AlterBackend
         var proxy: HttpServer? = null
         var proxyClient: HogliteClient? = null
         val executor = Executors.newFixedThreadPool(4)
-        if (lite) {
+        if (engineUrl != null) {
             val http = HttpClient.newHttpClient()
             proxy =
                 HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0).apply {
@@ -71,7 +73,7 @@ class HogliteReadParityIntegrationTest {
                         val raw = ex.requestBody.readBytes()
                         if (ex.requestURI.path.endsWith("/query")) issued.add(json.readTree(raw))
                         val builder =
-                            HttpRequest.newBuilder(URI.create(engine.url() + ex.requestURI))
+                            HttpRequest.newBuilder(URI.create(engineUrl + ex.requestURI))
                                 .method(ex.requestMethod, HttpRequest.BodyPublishers.ofByteArray(raw))
                         ex.requestHeaders.getFirst("Content-Type")?.let { builder.header("Content-Type", it) }
                         val answer = http.send(builder.build(), HttpResponse.BodyHandlers.ofByteArray())
