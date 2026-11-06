@@ -439,7 +439,7 @@ ship). Cache hit rate should approach 100% per (tenant, scope) warm pair.
   private key bytes never enter a pod; a mounted PEM is the dev fallback. Signing
   rate is low (token exchange and refresh only), so KMS latency is not on any
   hot path.
-- **Token TTL**: 10 minutes. Refresh with the same credential. `nbf`/`iat` skew
+- **Token TTL**: 15 minutes. Refresh with the same credential. `nbf`/`iat` skew
   tolerance 60 s.
 - **Revocation without a per-request DB read**: `hog_tenant.credential_epoch`
   is baked into the token as `ep`. Verification compares against an in-process
@@ -447,7 +447,7 @@ ship). Cache hit rate should approach 100% per (tenant, scope) warm pair.
   whole fleet). Bumping the epoch revokes every outstanding token for a tenant
   within 30 s. Deleting a client revokes its ability to *renew* immediately.
 - **STS revocation**: cannot be revoked, only outlived. That is why
-  `DurationSeconds` is capped at 1 h and why token TTL is 10 min — the worst-case
+  `DurationSeconds` is capped at 1 h and why token TTL is 15 min — the worst-case
   blast radius of a stolen secret is one hour of one prefix, on one role, under a
   session name that identifies the token.
 - **Break-glass**: `platform:admin` tokens (operator, from a projected SA token
@@ -484,7 +484,7 @@ the per-org Trino deployment gets its own ServiceAccount (which
   "aud": "hoglake",
   "sub": "client:0193c1e2-…",           // or "sa:duckgres:trino-<org>"
   "iat": 1764547200,
-  "exp": 1764547800,                    // +600s
+  "exp": 1764548100,                    // +900s
   "jti": "0193c1e2-9f0a-7…",
 
   "ten": "tenant",                      // kind: "tenant" | "scoped" | "operator" (§6.2a)
@@ -514,6 +514,50 @@ Deliberate omissions:
   expensive to size (a table allowlist can be thousands of entries). Design the
   verifier so the absence of `tab` means "all tables in `cat`" — which is what
   every v1 token means — and the field can be added without a version bump.
+
+### Routing amendment to §6.2
+
+The stateless deployment model adds an optional `rtg` placement claim.
+The earlier omission remains valid for storage credentials, but does not prohibit this routing claim.
+No server-side catalog-to-tenant derivation exists in this model.
+The issuer is the single placement authority. The backend-id allowlist limits its routing authority.
+The token carries no endpoints, secrets, or AWS credentials.
+
+A hoglite placement has exactly three string fields:
+
+```json
+{"b":"hoglite","be":"5b0c6d0e-1f2a-4b3c-9d4e-5f6a7b8c9d0e","t":"t_3fa8c1d9e2_1"}
+```
+
+`be` is a canonical lowercase UUID. It must identify a configured backend of kind `b`.
+Unknown ids and kind mismatches return 401 `unknown_backend`.
+`t` is opaque. It contains 1–128 ASCII letters, digits, dots, underscores, or hyphens.
+It cannot start with a dot or contain two consecutive dots.
+Hoglake does not split the incarnation suffix or derive the tenant from the catalog name.
+A PostgreSQL placement has exactly `b` and `be`. It forbids `t`.
+It needs `HOGLAKE_POSTGRES_BACKEND_ID` to identify this process's PostgreSQL backend.
+Unknown fields, invalid shapes, or multiple `cat` entries return 401 `invalid_token`.
+
+Every routed token names exactly one `cat` entry, including catalog operator tokens.
+Catalog operators retain `ten: operator` and operator authority; `cat` identifies only their placement.
+Legacy tokens without `rtg` keep their previous behavior.
+
+`HOGLAKE_BACKENDS_FILE` points to a JSON object with a `backends` array.
+Each entry has `id`, `kind: hoglite`, and `url`.
+Optional endpoint and timeout keys are documented in `Config`.
+This file contains server-controlled endpoints, not secrets.
+It requires auth mode `warn` or `enforce`.
+`HOGLAKE_DEFAULT_BACKEND` accepts `postgres` or `none`. Hoglite cannot be the default.
+PostgreSQL still opens at startup, even with no request fallback.
+
+| Request | Store |
+| --- | --- |
+| Matching catalog and verified `rtg` | The configured backend and opaque tenant from the token |
+| No `rtg`, or a different catalog | PostgreSQL default, or 404 when the default is `none` |
+| Hoglite catalog listing | Only the token's routed catalog |
+| Maintenance or publications on hoglite | 501 `not_supported_on_backend` |
+
+Authorization still runs before store selection. Fleet metrics and `/v1/info` remain PostgreSQL-only.
 
 ### 6.2a Scoped tokens (`ten: scoped`)
 
@@ -1439,6 +1483,7 @@ It must pin, at minimum:
   | `ten` | yes | `tenant` \| `operator` |
   | `org` | tenant | the org's catalog namespace |
   | `cat` | tenant | object: catalog name → array of scope names; non-empty, and an entry naming no known scope is dropped rather than carried |
+  | `rtg` | no | verified single-catalog placement; `b` and `be`, plus `t` only for hoglite; see the §6.2 routing amendment |
   | `cli` | no | human-facing client name |
   | `exp` | yes | expiry |
   | `iat` | no | issued-at; a value in the future is refused |
