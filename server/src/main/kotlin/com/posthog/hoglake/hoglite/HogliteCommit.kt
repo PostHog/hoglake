@@ -60,10 +60,7 @@ import java.util.UUID
  * A receipt guard precedes state guards inside the transaction. Its private
  * rollback marker permits a bound receipt lookup. A missing receipt shares
  * the schema fence's single replan slot.
- *
- * Not verified against a live engine. No production path uses this code.
- * Conformance tests against a real hoglited must pass before the server
- * uses it.
+
  */
 
 internal object HogliteCommit {
@@ -1640,6 +1637,34 @@ internal object HogliteCommit {
             files.size.toLong(),
             bytes,
         )
+    }
+
+    internal fun decideClaims(
+        store: HogliteCatalogStore,
+        catalog: String,
+        paths: Map<String, String>,
+        owner: UUID?,
+    ): List<String> {
+        if (paths.isEmpty()) return emptyList()
+        val pathJson = store.json.writeValueAsString(paths.keys)
+        val claims =
+            store.queryCatalog(
+                catalog,
+                CLAIMS_SQL + "WHERE path IN (SELECT value FROM json_each(?))",
+                pathJson,
+            ).rows
+        if (claims.isEmpty()) return emptyList()
+        val retainedPaths =
+            retainedPathSet(
+                store.queryCatalog(
+                    catalog,
+                    "SELECT path, 0 FROM files WHERE path IN (SELECT value FROM json_each(?)) " +
+                        "UNION SELECT path, 1 FROM dvs WHERE path IN (SELECT value FROM json_each(?))",
+                    pathJson,
+                    pathJson,
+                ),
+            )
+        return settleDecision(claims, retainedPaths, paths, owner)
     }
 
     /** The upload rows a claim decision reads; the caller appends the path filter. */

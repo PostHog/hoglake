@@ -82,12 +82,7 @@ fun interface HogliteTenantResolver {
  * tenant holds a catalog. Cross-catalog rules (unique names, disjoint
  * data paths) belong to the component that owns the catalogs.
  *
- * It implements [CatalogStore], the seam the core routes call. It is not
- * wired into the server yet: nothing constructs this class outside tests.
- *
- * Not verified against a live engine. No production path uses this class.
- * Conformance tests against a real hoglited must pass before the server
- * uses it.
+ * It implements [CatalogStore], the seam used by the request-scoped backend selector.
  */
 class HogliteCatalogStore(
     internal val client: HogliteClient,
@@ -157,6 +152,7 @@ class HogliteCatalogStore(
         binding.missing?.let { throw it }
     }
 
+    /** Run blocking work only. Never suspend or change threads inside [body]. */
     internal inline fun <T> catalogOperation(
         catalog: String,
         creating: Boolean = false,
@@ -268,7 +264,7 @@ class HogliteCatalogStore(
      */
     override fun listCatalogs(visible: Set<String>?): List<CatalogInfo> {
         // TODO(wiring): a null visible set ("all catalogs") comes with auth off and from operator callers.
-        // This adapter keeps no catalog list, so it refuses that request. The wiring PR must design
+        // This adapter keeps no catalog list, so it refuses that request. A later change must design
         // the answer, for example a catalog list from the routing source.
         val names =
             visible ?: throw HoglakeException.Validation(
@@ -2465,6 +2461,13 @@ class HogliteCatalogStore(
             at,
         ).firstRow()?.get(0)?.asLong()
 
+    /** table_id -> live object-prefix field id, for every table whose option is on at head (LayoutRepo.live). */
+    internal fun liveLayouts(catalog: String): Map<Long, Long> =
+        queryCatalog(
+            catalog,
+            "SELECT table_id, object_prefix_field_id FROM table_layouts WHERE end_snapshot IS NULL",
+        ).rows.associate { it[0].asLong() to it[1].asLong() }
+
     /**
      * The tenant the CURRENT operation on [catalog] is bound to. Only
      * valid inside [catalogOperation]; a value derived from it (a cursor
@@ -2573,6 +2576,73 @@ class HogliteCatalogStore(
             fr.file.copy(orderingBounds = bound?.let { FileOrderingBounds.SortKey(it) })
         }
     }
+
+    // ---- backends over the same tenant -------------------------------------
+
+    /** Upload claims (claim/renew/abandon/expiry sweep) on this store's tenant tables. */
+    internal val uploads: HogliteUploads by lazy { HogliteUploads(this, ledgerRetentionSeconds) }
+
+    /** Atomic table creations (prepare/publish/abort receipts) on this store's tenant tables. */
+    internal val tableCreations: HogliteTableCreations by lazy { HogliteTableCreations(this) }
+
+    /** ALTER TABLE on this store's tenant tables. */
+    internal val alters: HogliteAlters by lazy { HogliteAlters(this) }
+    internal val views: HogliteViews by lazy { HogliteViews(this) }
+
+    /**
+     * One table-creation receipt, with lazy expiry applied: a `prepared`
+     * receipt past its expires_at is aborted with reason `expired` on
+     * the touch (the Postgres path's `load`, verbatim).
+     */
+    internal fun loadCreationOrThrow(
+        catalog: String,
+        operationId: UUID,
+    ): com.posthog.hoglake.service.TableCreation {
+        val now = HogliteSchema.now()
+        runTx(
+            catalog,
+            freshTxid("creation-expire"),
+            null,
+            HogliteTx().apply {
+                add(
+                    "UPDATE table_creations SET state = 'aborted', reason = 'expired' " +
+                        "WHERE operation = ? AND state = 'prepared' AND expires_at <= ?",
+                    operationId.toString(),
+                    now,
+                )
+            },
+        )
+        val row =
+            queryCatalog(
+                catalog,
+                "SELECT table_uuid, definition_json, write_path, state, expires_at, snapshot_id, " +
+                    "schema_version, reason FROM table_creations WHERE operation = ?",
+                operationId.toString(),
+            ).firstRow()
+                ?: throw HoglakeException.NotFound("table creation operation '$operationId'")
+        val definition =
+            com.posthog.hoglake.service.TableCreationDefinitionCodec.decode(
+                row[1].asString(),
+                "table creation operation $operationId",
+            )
+        return com.posthog.hoglake.service.TableCreation(
+            operationId,
+            UUID.fromString(row[0].asString()),
+            definition,
+            com.posthog.hoglake.model.initialColumns(definition.columns),
+            row[2].asString(),
+            row[3].asString(),
+            HogliteSchema.parse(row[4].asString()),
+            row[5].asLongOrNull(),
+            row[6].asLongOrNull(),
+            row[7] as? String,
+        )
+    }
+
+    internal val partitions: HoglitePartitions by lazy {
+        HoglitePartitions(this, smallFileThresholdBytes, minInputFiles, maxInputFiles)
+    }
+    internal val partitionLookup: HoglitePartitionLookup by lazy { HoglitePartitionLookup(this) }
 
     // ---- transports --------------------------------------------------------
 
