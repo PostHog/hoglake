@@ -1514,24 +1514,60 @@ class HogliteCatalogStore(
                     " AND EXISTS (SELECT 1 FROM json_each(f.partition_values_json) pv " +
                         "WHERE pv.key = $keyIndex AND pv.value = ?)"
                 }
-            val sql =
+            val prefix =
                 "SELECT ${HogliteSql.FILE_COLUMNS} FROM files f WHERE f.table_id = ? " +
-                    "AND f.begin_snapshot <= ? AND (f.end_snapshot IS NULL OR f.end_snapshot > ?)" +
-                    partitionWhere + " ORDER BY $orderBy" +
-                    if (limit != null) " LIMIT ? OFFSET ?" else ""
-            val args =
+                    "AND f.begin_snapshot <= ? AND (f.end_snapshot IS NULL OR f.end_snapshot > ?)" + partitionWhere
+            val baseArgs =
                 buildList<Any?> {
                     add(t.tableId)
                     add(at)
                     add(at)
                     partitionFilter.entries.sortedBy { it.key }.forEach { add(it.value) }
-                    if (limit != null) {
-                        add(limit)
-                        add(offset)
-                    }
                 }
-            val page =
-                queryCatalog(catalog, sql, *args.toTypedArray()).rows.map { toFileRow(it) }
+            val page = mutableListOf<FileRow>()
+            var last: List<Any?>? = null
+            var remaining = limit ?: Int.MAX_VALUE
+            while (remaining > 0) {
+                val cursor = last
+                val cursorArgs = mutableListOf<Any?>()
+                val after =
+                    if (cursor == null) {
+                        ""
+                    } else if (sort == null) {
+                        cursorArgs.addAll(listOf(cursor[14], cursor[7], cursor[0]))
+                        " AND (f.begin_snapshot, f.row_id_start, f.id) > (?, ?, ?)"
+                    } else {
+                        val key =
+                            cursor[
+                                when (sort) {
+                                    FileRepo.FileSortColumn.ID -> 0
+                                    FileRepo.FileSortColumn.PATH -> 2
+                                    FileRepo.FileSortColumn.RECORD_COUNT -> 4
+                                    FileRepo.FileSortColumn.SIZE -> 5
+                                    FileRepo.FileSortColumn.STATS -> 11
+                                    FileRepo.FileSortColumn.BEGIN_SNAPSHOT -> 14
+                                },
+                            ]
+                        cursorArgs.addAll(listOf(key, key, cursor[0]))
+                        val comparison = if (desc) "<" else ">"
+                        " AND (${sortColumnSql(sort)} $comparison ? OR (${sortColumnSql(sort)} = ? AND f.id > ?))"
+                    }
+                val count = minOf(remaining, SCAN_PAGE_SIZE)
+                val initialOffset = if (last == null && limit != null) offset else 0
+                val rows =
+                    queryCatalog(
+                        catalog,
+                        prefix + after + " ORDER BY $orderBy LIMIT ? OFFSET ?",
+                        *(baseArgs + cursorArgs + listOf(count, initialOffset)).toTypedArray(),
+                    ).rows
+                page.addAll(rows.map { toFileRow(it) })
+                remaining -= rows.size
+                if (rows.size < count) break
+                last = rows.last()
+            }
+            if (meta(catalog).earliestSnapshotId > at) {
+                throw HoglakeException.Expired("snapshot $at expired while listing files")
+            }
             return withOrderingBounds(catalog, t.tableId, at, page)
         }
 
@@ -1671,38 +1707,88 @@ class HogliteCatalogStore(
                 )
             }
             // Compaction outputs rewrite rows that consumers already receive through the original files.
-            val files =
-                queryCatalog(
-                    catalog,
-                    "SELECT ${HogliteSql.CHANGEFEED_FILE_COLUMNS} FROM files f " +
-                        "WHERE f.table_id = ? AND f.begin_snapshot > ? AND f.begin_snapshot <= ? " +
-                        "AND NOT EXISTS (SELECT 1 FROM changes c WHERE c.snapshot_id = f.begin_snapshot " +
-                        "AND c.kind = 'table_compacted' AND c.object_id = f.table_id) " +
-                        "ORDER BY f.begin_snapshot, f.id",
-                    t.tableId,
-                    fromSnapshot,
-                    to,
-                ).rows.map { toDataFile(it) }
-            val dvs =
-                queryCatalog(
-                    catalog,
-                    "SELECT delete_file_id, data_file_id, path, delete_count, file_size_bytes, begin_snapshot " +
-                        "FROM dvs WHERE table_id = ? AND begin_snapshot > ? AND begin_snapshot <= ? " +
-                        "ORDER BY begin_snapshot, delete_file_id",
-                    t.tableId,
-                    fromSnapshot,
-                    to,
-                ).rows.map { r ->
-                    DeleteFile(
-                        deleteFileId = r[0].asLong(),
-                        dataFileId = r[1].asLong(),
-                        path = r[2].asString(),
-                        fileFormat = "puffin",
-                        deleteCount = r[3].asLong(),
-                        fileSizeBytes = r[4].asLong(),
-                        beginSnapshot = r[5].asLong(),
-                    )
-                }
+            val files = mutableListOf<DataFile>()
+            var fileCursor: Pair<Long, Long>? = null
+            while (true) {
+                val cursor = fileCursor
+                val lower =
+                    if (cursor == null) {
+                        "f.begin_snapshot > ?"
+                    } else {
+                        "(f.begin_snapshot, f.id) > (?, ?)"
+                    }
+                val args =
+                    buildList<Any?> {
+                        add(t.tableId)
+                        if (cursor == null) {
+                            add(fromSnapshot)
+                        } else {
+                            add(cursor.first)
+                            add(cursor.second)
+                        }
+                        add(to)
+                        add(SCAN_PAGE_SIZE)
+                    }
+                val rows =
+                    queryCatalog(
+                        catalog,
+                        "SELECT ${HogliteSql.CHANGEFEED_FILE_COLUMNS} FROM files f " +
+                            "WHERE f.table_id = ? AND $lower AND f.begin_snapshot <= ? " +
+                            "AND NOT EXISTS (SELECT 1 FROM changes c WHERE c.snapshot_id = f.begin_snapshot " +
+                            "AND c.kind = 'table_compacted' AND c.object_id = f.table_id)" +
+                            " ORDER BY f.begin_snapshot, f.id LIMIT ?",
+                        *args.toTypedArray(),
+                    ).rows
+                files.addAll(rows.map { toDataFile(it) })
+                if (rows.size < SCAN_PAGE_SIZE) break
+                fileCursor = rows.last().let { it[14].asLong() to it[0].asLong() }
+            }
+            val dvs = mutableListOf<DeleteFile>()
+            var dvCursor: Pair<Long, Long>? = null
+            while (true) {
+                val cursor = dvCursor
+                val lower =
+                    if (cursor == null) {
+                        "begin_snapshot > ?"
+                    } else {
+                        "(begin_snapshot, delete_file_id) > (?, ?)"
+                    }
+                val args =
+                    buildList<Any?> {
+                        add(t.tableId)
+                        if (cursor == null) {
+                            add(fromSnapshot)
+                        } else {
+                            add(cursor.first)
+                            add(cursor.second)
+                        }
+                        add(to)
+                        add(SCAN_PAGE_SIZE)
+                    }
+                val rows =
+                    queryCatalog(
+                        catalog,
+                        "SELECT delete_file_id, data_file_id, path, delete_count, file_size_bytes, begin_snapshot " +
+                            "FROM dvs WHERE table_id = ? AND $lower AND begin_snapshot <= ?" +
+                            " ORDER BY begin_snapshot, delete_file_id LIMIT ?",
+                        *args.toTypedArray(),
+                    ).rows
+                dvs.addAll(
+                    rows.map { r ->
+                        DeleteFile(
+                            deleteFileId = r[0].asLong(),
+                            dataFileId = r[1].asLong(),
+                            path = r[2].asString(),
+                            fileFormat = "puffin",
+                            deleteCount = r[3].asLong(),
+                            fileSizeBytes = r[4].asLong(),
+                            beginSnapshot = r[5].asLong(),
+                        )
+                    },
+                )
+                if (rows.size < SCAN_PAGE_SIZE) break
+                dvCursor = rows.last().let { it[5].asLong() to it[0].asLong() }
+            }
             // Expiry can purge barriers or ended files/DVs between these reads.
             // Their snapshots precede the floor. Recheck the exclusive lower bound before returning.
             requireRetained(meta(catalog).earliestSnapshotId)

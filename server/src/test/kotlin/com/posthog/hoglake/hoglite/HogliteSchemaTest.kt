@@ -69,4 +69,13 @@ class HogliteSchemaTest {
         assertThat(jsons).isNotEmpty()
         assertThat(integers.max()).describedAs("files columns: %s", names).isLessThan(jsons.min())
     }
+
+    @Test
+    fun `listing and changefeed keyset indexes include table and every continuation key`() {
+        val indexes = HogliteSchema.DDL.map(::normalized)
+        assertThat(indexes).contains(
+            "CREATE INDEX IF NOT EXISTS files_listing ON files(table_id, begin_snapshot, row_id_start, id)",
+            "CREATE INDEX IF NOT EXISTS dvs_changes ON dvs(table_id, begin_snapshot, delete_file_id)",
+        )
+    }
 }
