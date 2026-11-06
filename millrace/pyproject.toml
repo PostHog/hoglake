@@ -34,7 +34,7 @@ millrace = "millrace.main:main"
 
 [dependency-groups]
 dev = [
-    "pytest>=8.0",
+    "pytest>=9.2.0",
     "pytest-httpx>=0.30",
     "hypothesis>=6.170.12",
     # A floor, like pyhoglake's: the root uv.lock holds the one version the

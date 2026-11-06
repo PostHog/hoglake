@@ -22,7 +22,7 @@ hoglake-bench = "hoglake_bench.cli:main"
 
 [dependency-groups]
 dev = [
-    "pytest>=8.0",
+    "pytest>=9.2.0",
     # A floor: the version is the root uv.lock's, shared with the sibling
     # trees; see pyhoglake's note on why not `==`.
     "ruff>=0.17.3",
