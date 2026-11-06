@@ -2729,7 +2729,9 @@ class HogliteCatalogStore(
     internal val partitions: HoglitePartitions by lazy {
         HoglitePartitions(this, smallFileThresholdBytes, minInputFiles, maxInputFiles)
     }
-    internal val partitionLookup: HoglitePartitionLookup by lazy { HoglitePartitionLookup(this) }
+    internal val partitionLookup: HoglitePartitionLookup by lazy {
+        HoglitePartitionLookup(this, admission = partitionLookupAdmission)
+    }
 
     // ---- transports --------------------------------------------------------
 

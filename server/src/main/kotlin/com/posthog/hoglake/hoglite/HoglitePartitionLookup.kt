@@ -10,7 +10,6 @@ import com.posthog.hoglake.model.PartitionLookupTotals
 import com.posthog.hoglake.model.PartitionLookupUnavailable
 import com.posthog.hoglake.model.StatsState
 import com.posthog.hoglake.model.validatePartitionLookupValues
-import com.posthog.hoglake.service.PartitionLookupAdmission
 import com.posthog.hoglake.service.PartitionLookupBackend
 import com.posthog.hoglake.service.PartitionLookupCursor
 import java.nio.ByteBuffer
@@ -53,14 +52,13 @@ internal class HoglitePartitionLookup(
     private val candidateLimit: Int = 10_000,
     private val timeoutMs: Int = 3_000,
     maxConcurrentRequests: Int = 2,
+    private val admission: HoglitePartitionLookupAdmission = HoglitePartitionLookupAdmission(maxConcurrentRequests),
 ) : PartitionLookupBackend {
     init {
         require(candidateLimit in 1 until Int.MAX_VALUE)
         require(timeoutMs > 0)
         require(maxConcurrentRequests > 0)
     }
-
-    private val admission = PartitionLookupAdmission(maxConcurrentRequests)
 
     override fun lookup(
         catalog: String,
@@ -83,21 +81,23 @@ internal class HoglitePartitionLookup(
         ) {
             throw PartitionLookupInvalidRequest("cursor does not match snapshot or limit")
         }
-        try {
-            if (!admission.acquire(catalog, deadline)) {
-                remainingMillis(deadline)
+        return store.catalogOperation(catalog) {
+            // One backend controller, keyed by immutable tenant incarnation rather than display name.
+            val tenant = store.boundTenant(catalog)
+            try {
+                if (!admission.acquire(tenant, deadline)) {
+                    remainingMillis(deadline)
+                    busy()
+                }
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
                 busy()
             }
-        } catch (_: InterruptedException) {
-            Thread.currentThread().interrupt()
-            busy()
-        }
-        try {
-            return store.catalogOperation(catalog) {
+            try {
                 lookupBound(catalog, namespace, table, specId, values, snapshot, continuation, effectiveLimit, deadline)
+            } finally {
+                admission.release(tenant)
             }
-        } finally {
-            admission.release(catalog)
         }
     }
 
