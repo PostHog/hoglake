@@ -37,6 +37,7 @@ class CatalogStoreSelectorTest {
     @TempDir
     lateinit var dir: Path
     private val id = UUID.fromString("5b0c6d0e-1f2a-4b3c-9d4e-5f6a7b8c9d0e")
+    private val otherId = UUID.fromString("6b0c6d0e-1f2a-4b3c-9d4e-5f6a7b8c9d0e")
     private val pair = TestTokens.keyPair()
     private val postgres =
         Proxy.newProxyInstance(
@@ -46,9 +47,13 @@ class CatalogStoreSelectorTest {
             error("selection must not call PostgreSQL: ${method.name}")
         } as CatalogStore
 
-    private fun config(default: String): Config {
+    private fun config(
+        default: String,
+        backendIds: List<UUID> = listOf(id),
+    ): Config {
         val file = dir.resolve("backends.json")
-        Files.writeString(file, """{"backends":[{"id":"$id","kind":"hoglite","url":"http://localhost:1"}]}""")
+        val entries = backendIds.joinToString(",") { """{"id":"$it","kind":"hoglite","url":"http://localhost:1"}""" }
+        Files.writeString(file, """{"backends":[$entries]}""")
         return Config(backendsFile = file.toString(), defaultBackend = default, authMode = "enforce")
     }
 
@@ -62,10 +67,10 @@ class CatalogStoreSelectorTest {
     }
 
     @Test
-    fun `verified placements select request scoped stores and never enumerate the engine`() =
+    fun `verified placements share backend admission without sharing request scoped stores`() =
         testApplication {
             val cfg =
-                config("none").copy(
+                config("none", listOf(id, otherId)).copy(
                     removalLedgerRetentionSeconds = 12_345,
                     compactionTargetBytes = 64L * 1024 * 1024,
                     compactionMinInputFiles = 3,
@@ -127,7 +132,18 @@ class CatalogStoreSelectorTest {
                 assertThat(listing.bodyAsText()).isEqualTo("lake")
             }
             assertThat(stores[0]).isNotSameAs(stores[1])
-            assertThat((stores[0] as HogliteCatalogStore).client).isSameAs((stores[1] as HogliteCatalogStore).client)
+            val first = stores[0] as HogliteCatalogStore
+            val second = stores[1] as HogliteCatalogStore
+            assertThat(first.client).isSameAs(second.client)
+            assertThat(first.partitionLookupAdmission).isSameAs(second.partitionLookupAdmission)
+            val otherListing =
+                client.get("/v1/catalogs") {
+                    header(HttpHeaders.Authorization, "Bearer ${token(backendId = otherId)}")
+                }
+            assertThat(otherListing.status).isEqualTo(HttpStatusCode.OK)
+            val other = stores[2] as HogliteCatalogStore
+            assertThat(other).isNotSameAs(first)
+            assertThat(other.partitionLookupAdmission).isNotSameAs(first.partitionLookupAdmission)
             val publication =
                 client.get("/v1/catalogs/lake/publications") {
                     header(HttpHeaders.Authorization, "Bearer ${token()}")

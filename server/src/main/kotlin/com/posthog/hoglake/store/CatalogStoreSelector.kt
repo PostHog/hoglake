@@ -5,6 +5,7 @@ import com.posthog.hoglake.auth.Routing
 import com.posthog.hoglake.auth.hoglakeAuth
 import com.posthog.hoglake.hoglite.HogliteCatalogStore
 import com.posthog.hoglake.hoglite.HogliteClient
+import com.posthog.hoglake.hoglite.HoglitePartitionLookupAdmission
 import com.posthog.hoglake.hoglite.HogliteTenantResolver
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.service.AlterBackend
@@ -25,6 +26,7 @@ class CatalogStoreSelector(
     private val cfg: Config? = null,
 ) {
     private val clients = ConcurrentHashMap<UUID, HogliteClient>()
+    private val lookupAdmissions = ConcurrentHashMap<UUID, HoglitePartitionLookupAdmission>()
     private val requestStore = AttributeKey<HogliteCatalogStore>("HoglakeCatalogStore")
 
     /** Return one request-scoped hoglite store, or the process's PostgreSQL singleton. */
@@ -129,6 +131,10 @@ class CatalogStoreSelector(
                         smallFileThresholdBytes = cfg.compactionTargetBytes,
                         minInputFiles = cfg.compactionMinInputFiles,
                         maxInputFiles = cfg.compactionMaxInputFiles,
+                        partitionLookupAdmission =
+                            lookupAdmissions.computeIfAbsent(routing.backendId) {
+                                HoglitePartitionLookupAdmission()
+                            },
                     )
                 }
         }
