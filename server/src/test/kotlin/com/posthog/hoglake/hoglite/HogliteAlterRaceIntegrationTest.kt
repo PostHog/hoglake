@@ -314,4 +314,58 @@ class HogliteAlterRaceIntegrationTest {
         assertThat(error.readSnapshot).isEqualTo(original.readSnapshotId)
         assertThat(f.store.listSnapshots(c, original.readSnapshotId, 100).first).hasSize(1)
     }
+
+    @ParameterizedTest(name = "{displayName} [{index}] {0}")
+    @EnumSource(Backend::class)
+    fun `one alter widens both columns of the same stats row`(backend: Backend) {
+        val f = fixture(backend)
+        val cat = "promote" + UUID.randomUUID().toString().replace("-", "")
+        f.store.createCatalog(cat, "s3://hoglake-it/$cat")
+        f.store.createNamespace(cat, "ns")
+        f.store.createTable(cat, "ns", "t", listOf(ColumnDef("a", ColType.INT), ColumnDef("b", ColType.INT)))
+        val stats =
+            (1L..2L).map { id ->
+                com.posthog.hoglake.model.ColumnStats(
+                    id,
+                    1,
+                    0,
+                    null,
+                    null,
+                    com.posthog.hoglake.stats.IcebergSingleValue.encode(ColType.INT, 3),
+                    com.posthog.hoglake.stats.IcebergSingleValue.encode(ColType.INT, 9),
+                )
+            }
+        f.store.commit(
+            cat,
+            com.posthog.hoglake.model.CommitRequest(
+                appends =
+                    listOf(
+                        com.posthog.hoglake.model.TableAppend(
+                            "ns",
+                            "t",
+                            listOf(
+                                com.posthog.hoglake.model.FileRegistration("s3://hoglake-it/$cat/a", 1, 100, 20, stats),
+                            ),
+                        ),
+                    ),
+            ),
+        )
+        f.alter.alterTable(
+            cat,
+            "ns",
+            "t",
+            listOf(
+                AlterOp.PromoteColumn("a", ColType.LONG),
+                AlterOp.PromoteColumn("b", ColType.LONG),
+            ),
+        )
+        val id = f.store.listFiles(cat, "ns", "t").single().dataFileId
+        val columns = f.store.fileStats(cat, "ns", "t", id).columns
+        assertThat(columns).hasSize(2)
+        for (col in columns) {
+            assertThat(col.stats.lowerBound).hasSize(8)
+            assertThat(com.posthog.hoglake.stats.IcebergSingleValue.decode(ColType.LONG, col.stats.lowerBound!!))
+                .isEqualTo(3L)
+        }
+    }
 }

@@ -24,6 +24,7 @@ import java.util.UUID
 
 // Only runTx may return this exact rollback marker; never classify prose/status as it.
 private val ALTER_SCHEMA_CHANGED = HoglakeException.CommitConflict("table schema changed while planning alter")
+private val ALTER_STATS_CHANGED = HoglakeException.CommitConflict("file stats changed while planning alter")
 
 /**
  * [AlterBackend] on hoglite: [com.posthog.hoglake.service.AlterService]'s
@@ -177,8 +178,8 @@ internal class HogliteAlters(
                 // null) has no changes-window guard, so without this a
                 // concurrent alter between planning and the tx would be
                 // overwritten by stale in-memory state. Same OCC as the commit
-                // path's per-table schema fence. Only this precise, proven
-                // rollback permits one unguarded replan in this catalog binding.
+                // path's per-table schema fence. This precise rollback permits
+                // one unguarded schema replan in this catalog binding.
                 tx.expectScalar(
                     t.schemaVersion,
                     "SELECT schema_version FROM tables WHERE id = ?",
@@ -210,14 +211,24 @@ internal class HogliteAlters(
                 // its fence and replans once rather than landing stale.
                 tx.add("UPDATE tables SET schema_version = schema_version + 1 WHERE id = ?", t.tableId)
                 for (op in ops) applyOp(catalog, tx, t, ns.namespaceId, namespace, state, op, plannedNextFieldId)
+                // One guarded write per file, after every promotion has patched the shared plan.
+                for ((fileId, rewrite) in state.statsRewrites) {
+                    if (!rewrite.touched) continue
+                    tx.affectOne(
+                        "UPDATE files SET stats_json = ? WHERE id = ? AND stats_json = ?",
+                        store.json.writeValueAsString(rewrite.stats),
+                        fileId,
+                        rewrite.originalJson,
+                    ) { ALTER_STATS_CHANGED }
+                }
 
                 val readback = tx.add(HogliteSql.READBACK_DDL)
                 val results =
                     try {
                         store.runTx(catalog, HogliteCatalogStore.freshTxid("alter"), null, tx)
                     } catch (e: HoglakeException.CommitConflict) {
-                        if (e !== ALTER_SCHEMA_CHANGED) throw e
-                        if (readSnapshot != null || attempt == 1) {
+                        if (e !== ALTER_SCHEMA_CHANGED && e !== ALTER_STATS_CHANGED) throw e
+                        if (attempt == 1 || (e === ALTER_SCHEMA_CHANGED && readSnapshot != null)) {
                             throw HoglakeException.CommitConflict(
                                 "table $namespace.$table changed under the alter; re-read and retry",
                             )
@@ -300,7 +311,11 @@ internal class HogliteAlters(
         var sortInsertedHere: Boolean = false,
         /** Whether an earlier op of THIS alter inserted the live spec (begun at its snapshot). */
         var specInsertedHere: Boolean = false,
+        var statsLoaded: Boolean = false,
+        val statsRewrites: MutableMap<Long, StatsRewrite> = linkedMapOf(),
     )
+
+    private class StatsRewrite(val originalJson: String, var stats: List<ColumnStats>, var touched: Boolean = false)
 
     private class Located(
         val column: Column,
@@ -548,7 +563,7 @@ internal class HogliteAlters(
         val promoted = col.copy(def = col.def.copy(type = op.to))
         insertColumnVersion(tx, t.tableId, promoted, located.parent?.fieldId)
         state.cols = replaceNode(state.cols, col.fieldId) { promoted }
-        reencodeStatsOnPromote(catalog, tx, t.tableId, col.fieldId, col.def.type, op.to)
+        reencodeStatsOnPromote(catalog, tx, t.tableId, state, col.fieldId, col.def.type, op.to)
     }
 
     /**
@@ -557,12 +572,14 @@ internal class HogliteAlters(
      * column were written in the OLD type's 4-byte encoding; readers
      * decode bounds under the LIVE type. The stored stats are the file
      * row's JSON column-stats list, so the re-encode is read-patch-write
-     * per file, guarded on the old content.
+     * per file, guarded on the old content. All promotions share one plan and
+     * one rewrite per file; an allocator fence detects files added after the read.
      */
     private fun reencodeStatsOnPromote(
         catalog: String,
         tx: HogliteTx,
         tableId: Long,
+        state: TableState,
         fieldId: Long,
         from: ColType,
         to: ColType,
@@ -580,40 +597,42 @@ internal class HogliteAlters(
                     )
                 }
             }
-        val rows =
-            store.queryCatalog(
-                catalog,
-                "SELECT id, stats_json FROM files WHERE table_id = ? AND stats_json IS NOT NULL",
-                tableId,
-            ).rows
-        for (r in rows) {
-            val fileId = r[0].asLong()
-            val statsJson = r[1].asString()
-            val stats = store.json.readValue<List<ColumnStats>>(statsJson)
-            var touched = false
-            val patched =
-                stats.map { stat ->
+        if (!state.statsLoaded) {
+            // O(1) allocator fence, BEFORE the stats read, including an empty set.
+            // Every append increments it. A catalog-wide fence is conservative for
+            // unrelated tables but avoids an O(manifest) set comparison under the tx.
+            val nextFile =
+                store.queryCatalog(catalog, "SELECT next_file_id FROM meta WHERE id = 1")
+                    .firstRow()!![0].asLong()
+            tx.expectScalar(nextFile, "SELECT next_file_id FROM meta WHERE id = 1") { ALTER_STATS_CHANGED }
+            val rows =
+                store.queryCatalog(
+                    catalog,
+                    "SELECT id, stats_json FROM files WHERE table_id = ? AND stats_json IS NOT NULL",
+                    tableId,
+                ).rows
+            for (row in rows) {
+                val original = row[1].asString()
+                state.statsRewrites[row[0].asLong()] = StatsRewrite(original, store.json.readValue(original))
+            }
+            state.statsLoaded = true
+        }
+        for (rewrite in state.statsRewrites.values) {
+            rewrite.stats =
+                rewrite.stats.map { stat ->
                     if (stat.fieldId != fieldId) {
                         stat
                     } else {
                         val lower = stat.lowerBound?.let { if (it.size == 4) widen(it) else it }
                         val upper = stat.upperBound?.let { if (it.size == 4) widen(it) else it }
                         if (lower !== stat.lowerBound || upper !== stat.upperBound) {
-                            touched = true
+                            rewrite.touched = true
                             stat.copy(lowerBound = lower, upperBound = upper)
                         } else {
                             stat
                         }
                     }
                 }
-            if (touched) {
-                tx.affectOne(
-                    "UPDATE files SET stats_json = ? WHERE id = ? AND stats_json = ?",
-                    store.json.writeValueAsString(patched),
-                    fileId,
-                    statsJson,
-                ) { HoglakeException.CommitConflict("file stats changed under the alter") }
-            }
         }
     }
 
