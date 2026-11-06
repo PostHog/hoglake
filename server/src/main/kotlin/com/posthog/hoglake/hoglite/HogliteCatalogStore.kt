@@ -919,11 +919,11 @@ class HogliteCatalogStore(
      * hoglite has no per-statement timeout. The bound is a deadline of
      * [CatalogService.CONTAINMENT_SCAN_TIMEOUT_MS], checked before each
      * read, so one read can run past it by the client's retry budget. An
-     * expired deadline refuses the mark with ContainmentUnverified (503
-     * `containment_unverified`). So does a BackendUnavailable from a scan
-     * read: the engine's query guard (504 `query_timeout`, 413
-     * `result_too_large`, 507 `out_of_memory`) and a client timeout
-     * both surface as one. The namespace is never marked unverified.
+     * expired local deadline refuses the mark with ContainmentUnverified
+     * (503 `containment_unverified`). Transport uncertainty has the same result.
+     * Deterministic engine limits (`query_timeout`, `result_too_large`,
+     * `out_of_memory`) remain final 422 refusals, including during this scan.
+     * No failed scan marks the namespace.
      */
     private fun foreignPathUnderPrefix(
         catalog: String,
