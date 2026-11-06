@@ -95,6 +95,10 @@ class HogliteCatalogStore(
     private val tenants: HogliteTenantResolver,
     /** CommitService's blind-partitioned-append enforcement flag, for the commit port. */
     internal val refuseBlindPartitionedAppends: Boolean = false,
+    internal val ledgerRetentionSeconds: Long = com.posthog.hoglake.service.CleanupService.LEDGER_RETENTION_SECONDS,
+    internal val smallFileThresholdBytes: Long = 512L * 1024 * 1024,
+    internal val minInputFiles: Int = com.posthog.hoglake.compaction.CompactionGrouping.DEFAULT_MIN_INPUT_FILES,
+    internal val maxInputFiles: Int = com.posthog.hoglake.compaction.CompactionGrouping.DEFAULT_MAX_INPUT_FILES,
 ) : CatalogStore {
     internal val json: ObjectMapper = jacksonObjectMapper()
 

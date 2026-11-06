@@ -918,6 +918,19 @@ class HogliteClient(
     }
 
     companion object {
+        fun fromConfig(backend: HogliteBackend): HogliteClient =
+            HogliteClient(
+                standardUrl = backend.url,
+                whaleUrl = backend.whaleUrl,
+                ownerUrlPattern = backend.ownerUrlPattern,
+                connectTimeoutMs = backend.connectTimeoutMs,
+                readTimeoutMs = backend.readTimeoutMs,
+                commitTimeoutMs = backend.commitTimeoutMs,
+                retryBudgetMs = backend.retryBudgetMs,
+                circuitFailureThreshold = backend.circuitFailureThreshold,
+                circuitOpenMs = backend.circuitOpenMs,
+            )
+
         /** hoglite's label for a deterministic refusal (422). */
         const val CODE_REFUSED = "refused"
 
