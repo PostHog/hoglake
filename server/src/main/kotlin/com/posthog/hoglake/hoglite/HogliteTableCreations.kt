@@ -2,9 +2,11 @@ package com.posthog.hoglake.hoglite
 
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
+import com.posthog.hoglake.model.Containment
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.initialColumns
+import com.posthog.hoglake.model.pathStaysUnder
 import com.posthog.hoglake.model.validateFooterSize
 import com.posthog.hoglake.service.AlterService
 import com.posthog.hoglake.service.Identifiers
@@ -105,7 +107,8 @@ internal class HogliteTableCreations(
             // even a future catalog recreation and reused operation id
             // cannot reuse old object paths.
             val tableUuid = UUID.randomUUID()
-            val writePath = meta.dataPath.trimEnd('/') + "/data/$tableUuid/"
+            val namespacePath = if (ns.containment == null) "" else "${ns.name}/"
+            val writePath = meta.dataPath.trimEnd('/') + "/data/$namespacePath$tableUuid/"
             val now = Instant.now()
             val tx = HogliteTx()
             // A racing prepare of the same operation id makes this guard
@@ -185,7 +188,7 @@ internal class HogliteTableCreations(
                 throw HoglakeException.Validation("duplicate file paths")
             }
             files.forEach {
-                if (!it.path.startsWith(operation.writePath)) {
+                if (!it.path.startsWith(operation.writePath) || !pathStaysUnder(it.path, operation.writePath)) {
                     throw HoglakeException.Validation("file outside operation write_path")
                 }
                 it.validateFooterSize(required = true)
@@ -271,6 +274,7 @@ internal class HogliteTableCreations(
             val maxFieldId = cols.flatMap { it.selfAndDescendants() }.maxOf { it.fieldId }
             val newIdSql = "(SELECT next_table_id - 1 FROM meta WHERE id = 1)"
             val tx = HogliteTx()
+            guardContainment(catalog, tx, meta.dataPath, definition.namespace, definition.name, files)
             tx.affectOne(
                 "UPDATE table_creations SET files_json = ? WHERE operation = ? AND state = 'prepared'",
                 encodedFiles,
@@ -586,6 +590,55 @@ internal class HogliteTableCreations(
             return race.receipt
         }
         return store.loadCreationOrThrow(catalog, operationId)
+    }
+
+    /** registerInitialFiles checks this under PG's lock; the guard closes our preflight-to-tx gap. */
+    private fun guardContainment(
+        catalog: String,
+        tx: HogliteTx,
+        dataPath: String,
+        namespace: String,
+        table: String,
+        files: List<FileRegistration>,
+    ) {
+        if (files.isEmpty()) return
+        val names = setOf(namespace) + files.flatMap { Containment.segments(dataPath, it.path) }
+
+        fun contained(): Set<String> =
+            store.queryCatalog(
+                catalog,
+                "SELECT name FROM namespaces WHERE dropped_snapshot IS NULL AND contained_field IS NOT NULL " +
+                    "AND name IN (SELECT value FROM json_each(?))",
+                mapper.writeValueAsString(names),
+            ).rows.map { it[0].asString() }.toSet()
+
+        fun refusal(current: Set<String>): HoglakeException.ContainmentViolation? {
+            for (file in files) {
+                val why = Containment.violation(dataPath, namespace, file.path, current) ?: continue
+                return HoglakeException.ContainmentViolation(
+                    "$why; refused $namespace.$table path '${file.path}'",
+                    "$namespace.$table",
+                )
+            }
+            return null
+        }
+        val current = contained()
+        refusal(current)?.let { throw it }
+        val uncontained = names - current
+        if (uncontained.isNotEmpty()) {
+            tx.expectZero(
+                "SELECT COUNT(*) FROM namespaces WHERE dropped_snapshot IS NULL AND contained_field IS NOT NULL " +
+                    "AND name IN (SELECT value FROM json_each(?))",
+                mapper.writeValueAsString(uncontained),
+            ) {
+                val changed = refusal(contained())
+                if (changed != null) {
+                    changed
+                } else {
+                    HoglakeException.CommitConflict("namespace containment changed during publication")
+                }
+            }
+        }
     }
 
     /** Same-definition check for a prepare replay (decoded structures, not bytes). */
