@@ -261,6 +261,9 @@ class HogliteCatalogStore(
      * resolver failure fails the call.
      */
     override fun listCatalogs(visible: Set<String>?): List<CatalogInfo> {
+        // TODO(wiring): a null visible set ("all catalogs") comes with auth off and from operator callers.
+        // This adapter keeps no catalog list, so it refuses that request. The wiring PR must design
+        // the answer, for example a catalog list from the routing source.
         val names =
             visible ?: throw HoglakeException.Validation(
                 "the hoglite backend keeps no list of catalogs; name the catalogs to list",

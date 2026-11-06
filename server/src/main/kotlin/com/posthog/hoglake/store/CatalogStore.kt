@@ -57,7 +57,10 @@ interface CatalogStore {
 
     fun getCatalog(name: String): CatalogInfo
 
-    /** All catalogs when [visible] is null, else only the named catalogs that exist. */
+    /**
+     * All catalogs when [visible] is null, else only the named catalogs that exist.
+     * The hoglite adapter refuses a null [visible]. See TODO(wiring) there.
+     */
     fun listCatalogs(visible: Set<String>? = null): List<CatalogInfo>
 
     fun dropCatalog(
