@@ -117,7 +117,8 @@ fun Application.installApiRoutes(
                 // null and the filter is "everything", i.e. today's behaviour.
                 val listing = selector.forListing(call)
                 val catalogs = listing.store
-                val totals = catalogTotals()
+                // The sampler reads PostgreSQL only. Catalog names are not unique across backends.
+                val totals = if (listing.usePostgresTotals) catalogTotals() else emptyMap()
                 val visible =
                     when (val auth = call.hoglakeAuth) {
                         is AuthState.Off -> null

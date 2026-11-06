@@ -43,9 +43,13 @@ class CatalogStoreSelector(
         val caller = call.hoglakeAuth.callerOrNull
         val routing = caller?.routing
         return if (routing != null) {
-            Listing(routed(call, routing), setOf(routing.catalog))
+            Listing(
+                routed(call, routing),
+                setOf(routing.catalog),
+                usePostgresTotals = routing.backend == BackendKind.POSTGRES,
+            )
         } else {
-            Listing(fallback(""), caller?.visibleCatalogs())
+            Listing(fallback(""), caller?.visibleCatalogs(), usePostgresTotals = true)
         }
     }
 
@@ -144,5 +148,10 @@ class CatalogStoreSelector(
             HogliteClient.fromConfig(checkNotNull(cfg).hogliteBackends.getValue(it))
         }
 
-    data class Listing(val store: CatalogStore, val catalogs: Set<String>?)
+    data class Listing(
+        val store: CatalogStore,
+        val catalogs: Set<String>?,
+        /** Only PostgreSQL catalogs can use the PostgreSQL sampler's name-keyed totals. */
+        val usePostgresTotals: Boolean,
+    )
 }

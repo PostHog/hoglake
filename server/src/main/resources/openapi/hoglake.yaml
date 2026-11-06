@@ -120,6 +120,9 @@ paths:
     get:
       operationId: listCatalogs
       summary: List catalogs
+      description: >
+        Sampler totals describe PostgreSQL catalogs only. Hoglite-routed catalogs
+        omit table_count, live_rows, live_size_bytes, and oldest_snapshot_time.
       responses:
         "200":
           description: Catalogs
