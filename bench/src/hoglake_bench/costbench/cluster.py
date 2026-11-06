@@ -231,7 +231,6 @@ class Cluster:
             root = Path(scratch)
             password = secrets.token_hex(32)
             tls_password = secrets.token_hex(32)
-            (root / "tls-password").write_text(tls_password)
             namespace = self.config["namespace"]
             # One temporary self-signed trust anchor, mounted only into this
             # fixture. SANs cover the in-cluster endpoint and local inspection.
@@ -269,10 +268,12 @@ class Cluster:
                     "-in",
                     str(root / "ca.crt"),
                     "-passout",
-                    f"file:{root / 'tls-password'}",
+                    "stdin",
                     "-out",
                     str(root / "keystore.p12"),
                 ],
+                input=tls_password + "\n",
+                text=True,
                 check=True,
                 capture_output=True,
             )

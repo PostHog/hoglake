@@ -282,9 +282,13 @@ def test_tls_and_password_secrets_are_created_without_secrets_in_command_argumen
     monkeypatch.setattr(cluster, "apply", applied.extend)
     actual = subprocess.run
     commands = []
+    passphrases = []
 
     def run(command, **kwargs):
         commands.append(command)
+        if "pkcs12" in command:
+            assert command[command.index("-passout") + 1] == "stdin"
+            passphrases.append(kwargs["input"])
         return actual(command, **kwargs)
 
     monkeypatch.setattr(cluster_module.subprocess, "run", run)
@@ -298,6 +302,7 @@ def test_tls_and_password_secrets_are_created_without_secrets_in_command_argumen
         for key, value in applied[0]["data"].items()
     }
     user, iterations, salt, digest = auth["password.db"].strip().split(":")
+    assert passphrases == [auth["tls-password"] + "\n"]
     assert user == "benchmark"
     assert (
         hashlib.pbkdf2_hmac(
