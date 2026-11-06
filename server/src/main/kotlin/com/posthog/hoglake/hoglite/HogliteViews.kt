@@ -3,6 +3,7 @@ package com.posthog.hoglake.hoglite
 import com.posthog.hoglake.model.CommitResult
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.ViewInfo
+import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.service.Identifiers
 import com.posthog.hoglake.service.ViewBackend
 import com.posthog.hoglake.service.requireOperationMetadata
@@ -27,68 +28,77 @@ internal class HogliteViews(
         author: String?,
         message: String?,
     ): ViewInfo =
-        store.catalogOperation(catalog) {
-            Identifiers.validate("view", name)
-            if (sql.isBlank()) throw HoglakeException.Validation("view sql must not be blank")
-            if (dialect.isBlank()) throw HoglakeException.Validation("view dialect must not be blank")
-            val ns = store.liveNamespace(catalog, namespace)
+        Audit.audited(
+            "view_create",
+            catalog,
+            "$namespace.$name",
+            detail = { "dialect=$dialect" },
+            actor = { author },
+            message = { message },
+        ) {
+            store.catalogOperation(catalog) {
+                Identifiers.validate("view", name)
+                if (sql.isBlank()) throw HoglakeException.Validation("view sql must not be blank")
+                if (dialect.isBlank()) throw HoglakeException.Validation("view dialect must not be blank")
+                val ns = store.liveNamespace(catalog, namespace)
 
-            val tx = HogliteTx()
-            // The namespace read above is a preflight: a dropNamespace that
-            // passed its no-live-views check and committed since would
-            // leave this insert pointing at a dropped id, acknowledged but
-            // unreachable by get/list/drop (even after a recreate, which
-            // mints a new id). Re-assert liveness of THAT id in-tx, as
-            // createTable does.
-            tx.expectOne(
-                "SELECT COUNT(*) FROM namespaces WHERE id = ? AND dropped_snapshot IS NULL",
-                ns.namespaceId,
-            ) { HoglakeException.NotFound("namespace '$namespace' in catalog '$catalog'") }
-            tx.expectZero(
-                "SELECT COUNT(*) FROM views WHERE namespace_id = ? AND name = ? AND dropped_snapshot IS NULL",
-                ns.namespaceId,
-                name,
-            ) { HoglakeException.AlreadyExists("view '$name' already exists in namespace '$namespace'") }
-            tx.allocateDdlSnapshot()
-            tx.insertSnapshotRow(author, message)
-            tx.affectOne(
-                "UPDATE meta SET next_view_id = next_view_id + 1 WHERE id = 1",
-            ) { HoglakeException.NotFound("catalog (meta row missing)") }
-            // The readback answers the snapshot AND the view id this tx
-            // allocated (the insert below binds the same subselect).
-            tx.add(
-                "INSERT INTO changes(snapshot_id, kind, object_id) " +
-                    "VALUES (${HogliteSchema.HEAD_SQL}, 'view_created', " +
-                    "(SELECT next_view_id - 1 FROM meta WHERE id = 1))",
-            )
-            val viewUuid = UUID.randomUUID()
-            tx.add(
-                "INSERT INTO views(id, namespace_id, namespace, name, view_uuid, " +
-                    "dialect, sql_text, created_snapshot) " +
-                    "VALUES ((SELECT next_view_id - 1 FROM meta WHERE id = 1), ?, ?, ?, ?, ?, ?, " +
-                    "${HogliteSchema.HEAD_SQL})",
-                ns.namespaceId,
-                namespace,
-                name,
-                viewUuid.toString(),
-                dialect,
-                sql,
-            )
-            val readback =
+                val tx = HogliteTx()
+                // The namespace read above is a preflight: a dropNamespace that
+                // passed its no-live-views check and committed since would
+                // leave this insert pointing at a dropped id, acknowledged but
+                // unreachable by get/list/drop (even after a recreate, which
+                // mints a new id). Re-assert liveness of THAT id in-tx, as
+                // createTable does.
+                tx.expectOne(
+                    "SELECT COUNT(*) FROM namespaces WHERE id = ? AND dropped_snapshot IS NULL",
+                    ns.namespaceId,
+                ) { HoglakeException.NotFound("namespace '$namespace' in catalog '$catalog'") }
+                tx.expectZero(
+                    "SELECT COUNT(*) FROM views WHERE namespace_id = ? AND name = ? AND dropped_snapshot IS NULL",
+                    ns.namespaceId,
+                    name,
+                ) { HoglakeException.AlreadyExists("view '$name' already exists in namespace '$namespace'") }
+                tx.allocateDdlSnapshot()
+                tx.insertSnapshotRow(author, message)
+                tx.affectOne(
+                    "UPDATE meta SET next_view_id = next_view_id + 1 WHERE id = 1",
+                ) { HoglakeException.NotFound("catalog (meta row missing)") }
+                // The readback answers the snapshot AND the view id this tx
+                // allocated (the insert below binds the same subselect).
                 tx.add(
-                    "SELECT (SELECT next_snapshot - 1 FROM meta WHERE id = 1), " +
-                        "(SELECT next_view_id - 1 FROM meta WHERE id = 1)",
+                    "INSERT INTO changes(snapshot_id, kind, object_id) " +
+                        "VALUES (${HogliteSchema.HEAD_SQL}, 'view_created', " +
+                        "(SELECT next_view_id - 1 FROM meta WHERE id = 1))",
                 )
-            val results = store.runTx(catalog, HogliteCatalogStore.freshTxid("view-create"), null, tx)
-            val viewId = results[readback].firstRow()!![1].asLong()
-            return ViewInfo(
-                viewId = viewId,
-                viewUuid = viewUuid,
-                namespace = namespace,
-                name = name,
-                dialect = dialect,
-                sql = sql,
-            )
+                val viewUuid = UUID.randomUUID()
+                tx.add(
+                    "INSERT INTO views(id, namespace_id, namespace, name, view_uuid, " +
+                        "dialect, sql_text, created_snapshot) " +
+                        "VALUES ((SELECT next_view_id - 1 FROM meta WHERE id = 1), ?, ?, ?, ?, ?, ?, " +
+                        "${HogliteSchema.HEAD_SQL})",
+                    ns.namespaceId,
+                    namespace,
+                    name,
+                    viewUuid.toString(),
+                    dialect,
+                    sql,
+                )
+                val readback =
+                    tx.add(
+                        "SELECT (SELECT next_snapshot - 1 FROM meta WHERE id = 1), " +
+                            "(SELECT next_view_id - 1 FROM meta WHERE id = 1)",
+                    )
+                val results = store.runTx(catalog, HogliteCatalogStore.freshTxid("view-create"), null, tx)
+                val viewId = results[readback].firstRow()!![1].asLong()
+                return@catalogOperation ViewInfo(
+                    viewId = viewId,
+                    viewUuid = viewUuid,
+                    namespace = namespace,
+                    name = name,
+                    dialect = dialect,
+                    sql = sql,
+                )
+            }
         }
 
     override fun get(
@@ -132,30 +142,39 @@ internal class HogliteViews(
         author: String?,
         message: String?,
     ): CommitResult =
-        store.catalogOperation(catalog) {
-            requireOperationMetadata(author, message)
-            val ns = store.liveNamespace(catalog, namespace)
-            val view =
-                viewRow(catalog, ns.namespaceId, namespace, name)
-                    ?: throw HoglakeException.NotFound("view '$namespace.$name' in catalog '$catalog'")
+        Audit.audited(
+            "view_drop",
+            catalog,
+            "$namespace.$name",
+            detail = { "snapshot=${it.snapshotId}" },
+            actor = { author },
+            message = { message },
+        ) {
+            store.catalogOperation(catalog) {
+                requireOperationMetadata(author, message)
+                val ns = store.liveNamespace(catalog, namespace)
+                val view =
+                    viewRow(catalog, ns.namespaceId, namespace, name)
+                        ?: throw HoglakeException.NotFound("view '$namespace.$name' in catalog '$catalog'")
 
-            val tx = HogliteTx()
-            tx.allocateDdlSnapshot()
-            tx.insertSnapshotRow(author, message)
-            tx.add(
-                "INSERT INTO changes(snapshot_id, kind, object_id) " +
-                    "VALUES (${HogliteSchema.HEAD_SQL}, 'view_dropped', ?)",
-                view.viewId,
-            )
-            tx.affectOne(
-                "UPDATE views SET dropped_snapshot = ${HogliteSchema.HEAD_SQL} " +
-                    "WHERE id = ? AND dropped_snapshot IS NULL",
-                view.viewId,
-            ) { HoglakeException.NotFound("view '$namespace.$name' in catalog '$catalog'") }
-            val readback = tx.add(HogliteSql.READBACK_DDL)
-            val results = store.runTx(catalog, HogliteCatalogStore.freshTxid("view-drop"), null, tx)
-            val row = results[readback].firstRow()!!
-            return CommitResult(snapshotId = row[0].asLong(), schemaVersion = row[1].asLong())
+                val tx = HogliteTx()
+                tx.allocateDdlSnapshot()
+                tx.insertSnapshotRow(author, message)
+                tx.add(
+                    "INSERT INTO changes(snapshot_id, kind, object_id) " +
+                        "VALUES (${HogliteSchema.HEAD_SQL}, 'view_dropped', ?)",
+                    view.viewId,
+                )
+                tx.affectOne(
+                    "UPDATE views SET dropped_snapshot = ${HogliteSchema.HEAD_SQL} " +
+                        "WHERE id = ? AND dropped_snapshot IS NULL",
+                    view.viewId,
+                ) { HoglakeException.NotFound("view '$namespace.$name' in catalog '$catalog'") }
+                val readback = tx.add(HogliteSql.READBACK_DDL)
+                val results = store.runTx(catalog, HogliteCatalogStore.freshTxid("view-drop"), null, tx)
+                val row = results[readback].firstRow()!!
+                return@catalogOperation CommitResult(snapshotId = row[0].asLong(), schemaVersion = row[1].asLong())
+            }
         }
 
     private fun viewRow(
