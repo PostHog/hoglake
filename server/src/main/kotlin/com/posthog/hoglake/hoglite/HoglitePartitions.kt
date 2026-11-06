@@ -1,8 +1,8 @@
 package com.posthog.hoglake.hoglite
 
 import com.posthog.hoglake.compaction.CompactionGrouping
-import com.posthog.hoglake.model.Column
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.MAX_COLUMN_NESTING_DEPTH
 import com.posthog.hoglake.model.PartitionDebt
 import com.posthog.hoglake.model.PartitionGroup
 import com.posthog.hoglake.model.PartitionListing
@@ -145,57 +145,42 @@ internal class HoglitePartitions(
         return byKey.values.toList()
     }
 
-    /** (table, spec) -> field display names, PartitionFieldLabels' rule: identity names the column path, others suffix the transform. */
+    /** Every spec vintage, using the live source-column version or its latest retained version. */
     private fun fieldNames(
         catalog: String,
         tableIds: Collection<Long>,
-    ): Map<Pair<Long, Long>, List<String>> {
-        if (tableIds.isEmpty()) return emptyMap()
-        val out = mutableMapOf<Pair<Long, Long>, MutableList<Pair<Int, String>>>()
-        for (tableId in tableIds) {
-            val head = store.meta(catalog).head
-            val paths = columnPaths(store.columnsAt(catalog, tableId, head))
-            val specs =
-                store.queryCatalog(
-                    catalog,
-                    "SELECT spec_id, fields_json FROM partition_specs WHERE table_id = ? " +
-                        "AND begin_snapshot <= ? AND (end_snapshot IS NULL OR end_snapshot > ?)",
-                    tableId,
-                    head,
-                    head,
-                ).rows
-            for (row in specs) {
-                val specId = row[0].asLong()
-                val fields =
-                    store.json.readValue(
-                        row[1].asString(),
-                        Array<com.posthog.hoglake.model.PartitionFieldDef>::class.java,
-                    )
-                val names =
-                    fields.mapIndexed { i, f ->
-                        val column = paths[f.sourceFieldId] ?: "field_${f.sourceFieldId}"
-                        i to if (f.transform.wire == "identity") column else "${column}_${f.transform.wire}"
-                    }
-                out[tableId to specId] = names.toMutableList()
+    ): Map<Pair<Long, Long>, List<String>> =
+        tableIds.flatMap { tableId ->
+            fieldDefs(catalog, tableId).map { (specId, fields) -> (tableId to specId) to fields.map { it.first } }
+        }.toMap()
+
+    /** PartitionFieldLabels' live-or-latest rule, including retained parents of dropped nested sources. */
+    private fun columnPaths(
+        catalog: String,
+        tableId: Long,
+    ): Map<Long, String> {
+        data class Node(val name: String, val parent: Long?)
+        val nodes =
+            store.queryCatalog(
+                catalog,
+                "SELECT field_id, name, parent_field_id FROM (" +
+                    "SELECT field_id, name, parent_field_id, ROW_NUMBER() OVER (PARTITION BY field_id " +
+                    "ORDER BY (end_snapshot IS NULL) DESC, begin_snapshot DESC) AS rank " +
+                    "FROM columns WHERE table_id = ?) WHERE rank = 1",
+                tableId,
+            ).rows.associate { it[0].asLong() to Node(it[1].asString(), it[2].asLongOrNull()) }
+        return nodes.mapValues { (fieldId, _) ->
+            val segments = mutableListOf<String>()
+            var cursor: Long? = fieldId
+            var hops = 0
+            while (cursor != null && hops <= MAX_COLUMN_NESTING_DEPTH) {
+                val node = nodes[cursor] ?: break
+                segments += node.name
+                cursor = node.parent
+                hops++
             }
+            segments.reversed().joinToString(".")
         }
-        return out.mapValues { (_, v) -> v.sortedBy { it.first }.map { it.second } }
-    }
-
-    /** field_id -> dotted column path, from the forest. */
-    private fun columnPaths(columns: List<Column>): Map<Long, String> {
-        val out = mutableMapOf<Long, String>()
-
-        fun walk(
-            col: Column,
-            prefix: String,
-        ) {
-            val path = if (prefix.isEmpty()) col.def.name else "$prefix.${col.def.name}"
-            out[col.fieldId] = path
-            col.children.forEach { walk(it, path) }
-        }
-        columns.forEach { walk(it, "") }
-        return out
     }
 
     /** The live head spec per table (for stale-spec counting and the listing's summary). */
@@ -396,16 +381,12 @@ internal class HoglitePartitions(
         catalog: String,
         tableId: Long,
     ): Map<Long, List<Triple<String, String, Int?>>> {
-        val head = store.meta(catalog).head
-        val paths = columnPaths(store.columnsAt(catalog, tableId, head))
+        val paths = columnPaths(catalog, tableId)
         val rows =
             store.queryCatalog(
                 catalog,
-                "SELECT spec_id, fields_json FROM partition_specs WHERE table_id = ? " +
-                    "AND begin_snapshot <= ? AND (end_snapshot IS NULL OR end_snapshot > ?)",
+                "SELECT spec_id, fields_json FROM partition_specs WHERE table_id = ?",
                 tableId,
-                head,
-                head,
             ).rows
         return rows.associate { row ->
             val fields =

@@ -568,4 +568,57 @@ class HoglitePartitionParityIntegrationTest {
     private companion object {
         const val TARGET = 1000L
     }
+
+    @ParameterizedTest(name = "{displayName} [{index}] {0}")
+    @EnumSource(Backend::class)
+    fun `retired specs retain their transforms labels and dropped source names`(backend: Backend) =
+        fixture(backend) { f ->
+            f.alter.alterTable(
+                f.cat,
+                "ns",
+                "t",
+                listOf(
+                    AlterOp.SetPartitionSpec(listOf(PartitionFieldDef(2, Transform.DAY))),
+                ),
+            )
+            raw(f, listOf(RawGroup(2, listOf("1"), 100)))
+            f.alter.alterTable(
+                f.cat,
+                "ns",
+                "t",
+                listOf(
+                    AlterOp.SetPartitionSpec(listOf(PartitionFieldDef(2, Transform.MONTH))),
+                ),
+            )
+            raw(f, listOf(RawGroup(3, listOf("1"), 100)))
+            f.alter.alterTable(f.cat, "ns", "t", listOf(AlterOp.RenameColumn("ts", "event_time")))
+            val listed = f.listing.listPartitions(f.cat, "ns", "t")
+            assertThat(
+                listed.partitions.map { it.values.single().field },
+            ).containsExactly("event_time_day", "event_time_month")
+            assertThat(listed.partitions.map { it.values.single().decoded }).containsExactly("1970-01-02", "1970-02")
+            assertThat(
+                f.listing.listPartitions(
+                    f.cat,
+                    "ns",
+                    "t",
+                    filters =
+                        listOf(
+                            PartitionListingService.Filter(0, "1970-01-02"),
+                        ),
+                ).partitions.single().values.single().field,
+            ).isEqualTo("event_time_day")
+            f.alter.alterTable(
+                f.cat,
+                "ns",
+                "t",
+                listOf(AlterOp.SetPartitionSpec(emptyList()), AlterOp.DropColumn("event_time")),
+            )
+            assertThat(f.listing.listPartitions(f.cat, "ns", "t").partitions.map { it.values.single().field })
+                .containsExactly("event_time_day", "event_time_month")
+            assertThat(
+                f.stats.partitionStats(f.cat, "ns", "t", 20).partitions.map { it.partitionValues!!.single().field },
+            )
+                .containsExactlyInAnyOrder("event_time_day", "event_time_month")
+        }
 }
