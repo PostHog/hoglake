@@ -22,9 +22,9 @@ import com.posthog.hoglake.service.TableMetadata
 import com.posthog.hoglake.stats.IcebergSingleValue
 import java.util.UUID
 
-// Only runTx may return this exact rollback marker; never classify prose/status as it.
+// Only runTx may return these exact rollback markers; never classify prose/status as them.
 private val ALTER_SCHEMA_CHANGED = HoglakeException.CommitConflict("table schema changed while planning alter")
-private val ALTER_STATS_CHANGED = HoglakeException.CommitConflict("file stats changed while planning alter")
+private val ALTER_FILE_SET_CHANGED = HoglakeException.CommitConflict("file set changed while planning alter")
 
 /**
  * [AlterBackend] on hoglite: [com.posthog.hoglake.service.AlterService]'s
@@ -219,7 +219,7 @@ internal class HogliteAlters(
                         store.json.writeValueAsString(rewrite.stats),
                         fileId,
                         rewrite.originalJson,
-                    ) { ALTER_STATS_CHANGED }
+                    ) { HoglakeException.CommitConflict("file stats changed under the alter") }
                 }
 
                 val readback = tx.add(HogliteSql.READBACK_DDL)
@@ -227,7 +227,7 @@ internal class HogliteAlters(
                     try {
                         store.runTx(catalog, HogliteCatalogStore.freshTxid("alter"), null, tx)
                     } catch (e: HoglakeException.CommitConflict) {
-                        if (e !== ALTER_SCHEMA_CHANGED && e !== ALTER_STATS_CHANGED) throw e
+                        if (e !== ALTER_SCHEMA_CHANGED && e !== ALTER_FILE_SET_CHANGED) throw e
                         if (attempt == 1 || (e === ALTER_SCHEMA_CHANGED && readSnapshot != null)) {
                             throw HoglakeException.CommitConflict(
                                 "table $namespace.$table changed under the alter; re-read and retry",
@@ -604,7 +604,7 @@ internal class HogliteAlters(
             val nextFile =
                 store.queryCatalog(catalog, "SELECT next_file_id FROM meta WHERE id = 1")
                     .firstRow()!![0].asLong()
-            tx.expectScalar(nextFile, "SELECT next_file_id FROM meta WHERE id = 1") { ALTER_STATS_CHANGED }
+            tx.expectScalar(nextFile, "SELECT next_file_id FROM meta WHERE id = 1") { ALTER_FILE_SET_CHANGED }
             val rows =
                 store.queryCatalog(
                     catalog,
