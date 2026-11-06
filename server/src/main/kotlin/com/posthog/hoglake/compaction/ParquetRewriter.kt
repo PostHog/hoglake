@@ -9,7 +9,6 @@ import com.posthog.hoglake.model.SortFieldDef
 import com.posthog.hoglake.model.allNodes
 import com.posthog.hoglake.model.maxUnsignedParquetWidth
 import com.posthog.hoglake.service.Identifiers
-import org.apache.parquet.column.Dictionary
 import org.apache.parquet.example.data.Group
 import org.apache.parquet.example.data.simple.convert.GroupRecordConverter
 import org.apache.parquet.hadoop.ParquetFileReader
@@ -154,27 +153,17 @@ class InvalidDataException(message: String) : IllegalArgumentException(message)
  * degenerate merge: its chunk is sorted and written straight to the
  * output, and nothing touches disk.
  *
- * Budgets. parquet-java's `readNextRowGroup()` allocates a reader's WHOLE
- * compressed row group, and each column reader then holds one decoded
- * page, so a run costs its largest row group plus a page per leaf plus
- * its stream buffer — the formula, exact from a footer and estimated
- * before one, is in [ExternalMergeSort]'s doc. Trusted runs are outputs
- * written at the 128 MiB default block; spill files are written at
- * [SortSpill.spillBlockBytes] with small pages and a row-group size
- * check on every few rows, so the block actually bounds them. [SortSpill.mergeBudgetBytes] bounds both
- * phases, which never overlap. Before any data is read, trusted inputs
- * are admitted LARGEST FIRST while the projected merge cost — admitted
- * runs plus every spilled run the other survivors will make — fits; the
- * rest are DEMOTED to the spill path (and the smallest admitted runs are
- * shed when a later demotion's rows no longer fit beside them), which
- * changes work, never correctness. Admitted runs' footers are then read and their EXACT cost
- * re-checked, demoting again, still before any row group is read. A
- * group that does not fit even fully demoted is refused
- * ([MergeBudgetExceededException]); so is one whose spill would pass
- * [SortSpill.spillBudgetBytes] ([SpillBudgetExceededException]), from
- * the registered sizes up front and from the bytes actually written
- * mid-run, because an emptyDir overrun evicts the pod instead of failing
- * the write.
+ * Budgets. The sorted decoder charges actual nodes and payload bytes before copying them.
+ * It flushes byte-full chunks before the advisory row ceiling when necessary.
+ * Footer checks charge full chunks before page allocation.
+ * Exact merge charges include dictionaries, materialized heads, and replacement rows.
+ * Budget-derived writer settings reserve space for writer buffers and transient allocations.
+ *
+ * Metadata admission predicts work.
+ * Runtime checks can still refuse rows, pages, or extra runs.
+ * [MergeBudgetExceededException] reports heap refusals.
+ * [SpillBudgetExceededException] reports local spill-byte refusals.
+ * The rewrite performs no multi-pass merging.
  *
  * Order. The merge key is the sort keys, then row id ascending; row ids
  * are unique per table and each key comparison is total per physical
@@ -668,14 +657,7 @@ object ParquetRewriter {
         val filesUnranged: Int = 0,
     )
 
-    /**
-     * How a writer's row groups are bounded, when the default (128 MiB
-     * row groups, default pages, parquet-java's size-check cadence) is
-     * not the bound wanted. Only spill files ask: reading one back holds a
-     * whole row group, so the block must actually bound it, which
-     * parquet-java's check cadence does not ensure on its own (see
-     * [ExternalMergeSort.SPILL_MAX_ROWS_PER_SIZE_CHECK]).
-     */
+    /** Select row-group targets, page targets, and size-check cadence for sorted output and spill writers. */
     internal class WriterTuning(
         val rowGroupBytes: Long,
         val pageBytes: Int,
@@ -699,39 +681,52 @@ object ParquetRewriter {
         val rowId: Long,
         val key: Array<Any?> = NO_KEY,
         val plan: RowPlan? = null,
+        val retainedBytes: Long = 0,
     )
 
     private val NO_KEY = emptyArray<Any?>()
 
     /**
-     * One row's node allowance, spent as the row is DECODED.
-     *
-     * "Decoded" is the load-bearing word and it was missing. The first
-     * version of this charged only the copy, which runs after
-     * `recordReader.read()` has already built the whole source row — so
-     * the budget was a report on an allocation that had already
-     * happened, and a row big enough to exhaust the heap did so before
-     * anything consulted it. The bound is only real if it is spent
-     * inside the record materializer, which is what
-     * [budgetedMaterializer] is for.
-     *
-     * [reset] is called once per row, by the root converter's `start`.
+     * Charge node events and retained bytes before the materializer allocates them.
+     * Renew both allowances at each root converter's start.
+     * Preserve the separate invalid-data refusal for excessive node counts.
      */
-    internal class NodeBudget(private val limit: Int, private val source: String) {
+    internal class NodeBudget(
+        private val limit: Int,
+        private val source: String,
+        private val byteLimit: Long = Long.MAX_VALUE,
+    ) {
         private var spent = 0
+        var retainedBytes = 0L
+            private set
 
         fun reset() {
             spent = 0
+            retainedBytes = SortMemory.NODE_BYTES
         }
 
-        fun spend() {
-            spent++
-            if (spent > limit) {
+        fun spend(bytes: Long = SortMemory.NODE_BYTES) {
+            if (spent >= limit) {
                 throw InvalidDataException(
-                    "a row in $source materializes more than $limit nodes; refusing the group " +
-                        "rather than risking a process-fatal OOM in the compaction loop",
+                    "a row in $source materializes more than $limit nodes. " +
+                        "Compaction refuses the group before further allocation.",
                 )
             }
+            spent++
+            charge(bytes)
+        }
+
+        fun charge(bytes: Long) {
+            if (bytes < 0 || bytes > byteLimit - retainedBytes) {
+                throw MergeBudgetExceededException(
+                    "a row in $source needs more than $byteLimit materialized bytes. " +
+                        "Compaction refuses the group before allocation.",
+                    0,
+                    0,
+                    0,
+                )
+            }
+            retainedBytes += bytes
         }
     }
 
@@ -778,7 +773,7 @@ object ParquetRewriter {
         budget: NodeBudget,
     ): RecordMaterializer<Group> {
         val delegate = GroupRecordConverter(schema)
-        val root = CountingGroupConverter(delegate.rootConverter, budget, isRoot = true)
+        val root = CountingGroupConverter(delegate.rootConverter, budget, schema, isRoot = true)
         return object : RecordMaterializer<Group>() {
             override fun getCurrentRecord(): Group = delegate.currentRecord
 
@@ -791,6 +786,7 @@ object ParquetRewriter {
     private class CountingGroupConverter(
         private val delegate: GroupConverter,
         private val budget: NodeBudget,
+        private val type: GroupType,
         private val isRoot: Boolean = false,
     ) : GroupConverter() {
         private val children = HashMap<Int, Converter>()
@@ -799,14 +795,16 @@ object ParquetRewriter {
             children.getOrPut(fieldIndex) {
                 when (val c = delegate.getConverter(fieldIndex)) {
                     is PrimitiveConverter -> CountingPrimitiveConverter(c, budget)
-                    else -> CountingGroupConverter(c.asGroupConverter(), budget)
+                    else -> CountingGroupConverter(c.asGroupConverter(), budget, type.getType(fieldIndex).asGroupType())
                 }
             }
 
         override fun start() {
-            // The root's start is the row boundary: the allowance is per
-            // ROW and per PHASE, so the decode's renews here.
             if (isRoot) budget.reset() else budget.spend()
+            // SimpleGroup allocates field lists even for absent fields.
+            // Converters allocate separate objects for populated values.
+            // Charge containers and populated values.
+            budget.charge(SortMemory.NODE_BYTES * type.fieldCount)
             delegate.start()
         }
 
@@ -817,17 +815,12 @@ object ParquetRewriter {
         private val delegate: PrimitiveConverter,
         private val budget: NodeBudget,
     ) : PrimitiveConverter() {
-        override fun hasDictionarySupport(): Boolean = delegate.hasDictionarySupport()
-
-        override fun setDictionary(dictionary: Dictionary) = delegate.setDictionary(dictionary)
-
-        override fun addValueFromDictionary(dictionaryId: Int) {
-            budget.spend()
-            delegate.addValueFromDictionary(dictionaryId)
-        }
+        // Route dictionary values through typed callbacks so each row pays its decoded payload charge.
+        override fun hasDictionarySupport(): Boolean = false
 
         override fun addBinary(value: Binary) {
-            budget.spend()
+            // Reserve binary sort-key copies before the decoder copies the payload.
+            budget.spend(SortMemory.NODE_BYTES + 3L * value.length())
             delegate.addBinary(unpinned(value))
         }
 
@@ -1308,6 +1301,7 @@ object ParquetRewriter {
         private val shape: OutputShape,
         /** The sorted path's keys, extracted per row; null on the unsorted path. */
         private val keys: SortKeys? = null,
+        private val memory: SortMemory? = null,
     ) : Iterator<Row> {
         // From the reader the caller already opened, not a second open of
         // its own. This used to be `readSchema(input.source)` followed by
@@ -1353,7 +1347,7 @@ object ParquetRewriter {
         // columns. (Before D2 the copy was charged from a fresh
         // allowance too; sharing one across both phases had charged the
         // same graph twice and halved the advertised ceiling.)
-        private val budget = NodeBudget(shape.maxNodesPerRow, input.label)
+        private val budget = NodeBudget(shape.maxNodesPerRow, input.label, memory?.rowBytes ?: Long.MAX_VALUE)
         private val rowPlan = RowPlan(plan, shape)
         private val boundKeys = keys?.bind(rowPlan)
         private val columnIO = ColumnIOFactory().getColumnIO(schema)
@@ -1362,6 +1356,7 @@ object ParquetRewriter {
         private var ordinal = 0L
         private var applied = 0L
         private var pending: Row? = null
+        private var checkedMemory = false
 
         override fun hasNext(): Boolean {
             if (pending == null) pending = advance()
@@ -1376,6 +1371,10 @@ object ParquetRewriter {
         private fun advance(): Row? {
             while (true) {
                 while (leftInRowGroup == 0L) {
+                    if (!checkedMemory) {
+                        memory?.checkReader(reader.footer.blocks, schema, input.label)
+                        checkedMemory = true
+                    }
                     val pages = reader.readNextRowGroup()
                     if (pages == null) {
                         val expected = input.deletes?.cardinality ?: 0L
@@ -1424,8 +1423,9 @@ object ParquetRewriter {
                 } else {
                     input.rowIdStart + position
                 }
+            budget.charge(SortMemory.NODE_BYTES * (1L + (keys?.fields?.size ?: 0)))
             val key = boundKeys?.extract(src, input.label) ?: NO_KEY
-            return Row(src, rowId, key, rowPlan)
+            return Row(src, rowId, key, rowPlan, budget.retainedBytes)
         }
     }
 

@@ -373,90 +373,32 @@ data class CompactionConfig(
      */
     val commitLockTimeoutMs: Long = 0,
     /**
-     * How far the sorted rewrite's CHUNK is shrunk for a table with nested
-     * columns (HOGLAKE_COMPACTION_NESTED_SORT_EXPANSION).
-     *
-     * A chunk holds its rows as parquet-java `Group` objects so it can
-     * sort them. For NESTED rows that object graph runs far ahead of the
-     * bytes: a measured `list<long>` table with five elements per row
-     * peaked at 343 MiB of heap from a 4.6 MiB compressed input — **70x**
-     * — because every element becomes its own `SimpleGroup` with its own
-     * object header, field array and boxed value, and compression that
-     * packs an int64 column 10:1 does nothing for object headers.
-     *
-     * A nested row's node count is not knowable from the catalog (list
-     * lengths are data), so [spillChunkRows]' per-node accounting cannot
-     * see it. This expansion is what covers the gap: for a table with BOTH
-     * nested columns and a live sort order the chunk's row count is
-     * divided by it. 64 is deliberately near the top of the measured
-     * 30-70x range — erring large costs more, smaller spill files, erring
-     * small costs an OOM in a background loop.
-     *
-     * That is its ONLY role since hoglake#134. It used to size GROUPS (the
-     * sorted row ceiling, and before that a derated byte target), because
-     * the sort held the whole group; a group is now bounded by
-     * [targetBytes] alone and only the chunk is materialized.
-     *
-     * It bounds the sorted path's CHUNK only: one pathological ROW (a
-     * million-element list) still materializes whole on either path, and
-     * nothing here changes that — that is [maxNodesPerRow]'s job.
+     * Derate the advisory chunk-row ceiling for nested schemas.
+     * The catalog cannot predict repeated element counts.
+     * The decoder independently charges actual nodes and payload bytes.
+     * Groups still pack to [targetBytes].
      */
     val nestedSortExpansion: Int = DEFAULT_NESTED_SORT_EXPANSION,
     /**
-     * How much HEAP one sorted rewrite may hold, PER PHASE
-     * (HOGLAKE_COMPACTION_SORTED_HEAP_BYTES), divided by
-     * [parallelGroups] ([sortedHeapBytesPerGroup]).
+     * Set the sorted rewrite's heap allowance before [parallelGroups] divides it.
+     * The external merge sort enforces byte limits during decoding and before page allocation.
+     * [spillChunkRows] supplies an additional advisory row ceiling.
      *
-     * A sorted rewrite is an external merge sort (hoglake#134;
-     * `ParquetRewriter`'s class doc and `ExternalMergeSort`'s carry the
-     * mechanics) with two phases that never overlap, and this one number
-     * bounds each of them:
+     * [SortMemory] reserves one quarter for the chunk and one quarter for the current input reader.
+     * It limits each materialized row to one sixteenth of the allowance.
+     * The merge reserves half for readers, materialized heads, and replacement rows.
+     * Writers reserve one quarter through conservative live-leaf and buffer charges.
+     * Additional headroom covers sorting arrays and transient allocations.
      *
-     *  - **CHUNK phase.** Survivors of every input not read as a trusted
-     *    run are read into a chunk of [spillChunkRows] rows, sorted, and
-     *    spilled to [spillDir]. The chunk's object graph is what this
-     *    bounds, through the measured per-node cost
-     *    ([SORTED_HEAP_BYTES_PER_NODE]) and, for nested tables,
-     *    [nestedSortExpansion].
-     *  - **MERGE phase.** Every run — a trusted input read in place, or a
-     *    spill file — holds one row group while it is read. Trusted
-     *    inputs are ADMITTED largest first while the projected cost of
-     *    all runs fits this budget; the rest are demoted to the spill
-     *    path. A group whose spilled runs alone exceed it is refused in
-     *    metadata (`merge_budget_exceeded`), which only configuration can
-     *    cause.
+     * Metadata admission predicts work from registered sizes and row counts.
+     * The rewrite checks exact footer charges and actual chunk counts again.
+     * Large rows, large pages, or too many runs can produce a typed merge refusal.
+     * The rewrite does not perform multi-pass merging.
      *
-     * What it no longer does is bound the GROUP. A sorted group packs to
-     * [targetBytes] like any other; this knob decides how many spill files
-     * that takes and how many trusted runs fit beside them, i.e. how much
-     * local disk work a group costs, never whether it forms.
-     *
-     * # The default, and the pod it assumes
-     *
-     * 1 GiB, which fits the 4 GiB maintenance pod (~2.8 GiB of heap at
-     * the image's `MaxRAMPercentage=70`, server/build.gradle.kts). The
-     * honest per-process peak is the larger of two phases, + the
-     * hydrator's 256 MiB whole-object ceiling if it fires in the same tick:
-     * the MERGE, `sortedHeapBytes` (the admitted runs at their charge) +
-     * per group in flight the OUTPUT writer's buffered row group (flat at
-     * ~140 MiB, ~1.1x the 128 MiB output row group) and the 16 MiB S3
-     * part buffer; and the CHUNK phase, the chunk (~0.79x its charge,
-     * flat ~82 MB at 50k-row chunks however large the group) + the
-     * input's row group (up to a target-sized 512 MiB) + the spill
-     * writer's block and the sort's reference array. With a target-sized
-     * single-row-group input the chunk phase is the larger, and the
-     * default's peak is ~1614 MiB, 56% of that heap. The writer term used
-     * to grow ~40 MB per million rows (643 MB at 8M rows) because its
-     * statistics pinned input pages; the materializer's copy of every
-     * binary value removed that (see ParquetRewriter's `unpinned`). The
-     * merge's per-run charge is conservative (~17.4 MiB charged against
-     * ~6.6 MB measured per spilled run). server/README.md carries the
-     * measurements and the pod table.
-     *
-     * Bigger pods take a bigger value, which buys larger chunks (fewer
-     * spill files) and more trusted runs read in place. Raising it WITHOUT
-     * raising the pod is how the OOM this bound exists to prevent comes
-     * back.
+     * The default remains 1 GiB.
+     * The allowance does not cover every server allocation, parsed footer, or object-store buffer.
+     * Size the process heap for concurrent groups and other services.
+     * Historical fixed-row measurements do not prove a worst-case process peak.
      */
     val sortedHeapBytes: Long = DEFAULT_SORTED_HEAP_BYTES,
     /**
@@ -722,51 +664,17 @@ data class CompactionConfig(
                 .toInt()
 
     /**
-     * The sorted path's heap budget for ONE group, after the division
-     * [parallelGroups] forces.
-     *
-     * [sortedHeapBytes] is a statement about this PROCESS's heap, and N
-     * groups each sized to the whole heap is N times the heap. So it is
-     * DIVIDED, not gated: every sorted group gets 1/N of it for its chunk
-     * and for its merge, and N of them together are exactly the old
-     * bound. The arithmetic is evaluated in metadata at planning time
-     * (the merge-budget refusal) and again by the rewrite itself, so the
-     * bound holds no matter how the sweep interleaves — no semaphore, no
-     * permit held across object-store IO.
-     *
-     * The price is per group, and since hoglake#134 it is WORK, not size:
-     * a smaller budget means smaller chunks (more spill files to merge)
-     * and fewer trusted runs read in place. At the default parallelGroups
-     * of 1 this is [sortedHeapBytes] unchanged.
+     * Divide the process's sorted allowance between [parallelGroups] concurrent groups.
+     * Each group applies independent byte limits during decoding, reading, writing, and merging.
      */
     val sortedHeapBytesPerGroup: Long
         get() = maxOf(1L, sortedHeapBytes / parallelGroups)
 
     /**
-     * How many ROWS of [columns] one CHUNK of the sorted rewrite holds —
-     * the chunk phase's heap bound ([sortedHeapBytesPerGroup]) in the unit
-     * the heap actually holds. Only the arithmetic of the former sorted
-     * row ceiling survives here: it used to bound a whole GROUP, and now
-     * bounds one chunk (hoglake#134).
-     *
-     * A materialized row is not its bytes; it is a `SimpleGroup`, a
-     * `List<Object>[]` field array, and then an `ArrayList` plus that
-     * list's backing `Object[]` plus one boxed value for every populated
-     * field. Measured at **151.6 bytes per node** for the flat event
-     * shape this catalog holds (`SortedHeapMeasurement`, steady-state
-     * retained heap over 200k rows);
-     * [SORTED_HEAP_BYTES_PER_NODE] rounds that up, because erring large
-     * costs smaller chunks and erring small costs an OOM in a background
-     * loop — the same asymmetry [nestedSortExpansion] is calibrated on.
-     *
-     * Nodes are counted off the LIVE schema (every node of the forest,
-     * plus one for the `_hog_row_id` carrier every output writes), which
-     * is exact for flat tables and a floor for nested ones — hence the
-     * [nestedSortExpansion] division, which is the only thing standing in
-     * for list lengths the catalog cannot know. A VARIANT is one catalog
-     * node but a Parquet group of up to thousands ([VariantLayout.shape]),
-     * so it counts as its layout's nodes, and as nested when that layout
-     * holds a list.
+     * Estimate an advisory row ceiling from schema nodes and [nestedSortExpansion].
+     * Runtime byte charges can flush a chunk before this ceiling.
+     * Schema nodes cannot predict variable-width payloads or repeated element counts.
+     * Count VARIANT layouts and the row-ID carrier in the estimate.
      */
     fun spillChunkRows(columns: List<Column>): Long {
         val variants = columns.allNodes().filter { it.def.type == ColType.VARIANT }
@@ -802,26 +710,12 @@ data class CompactionConfig(
          */
         const val DEFAULT_NESTED_SORT_EXPANSION = 64
 
-        /**
-         * Heap cost of one materialized parquet-java node, for
-         * [spillChunkRows].
-         *
-         * Measured 151.6 B/node (`SortedHeapMeasurement`: 200k flat
-         * 11-field event rows retained 333.5 MB, 1667 B/row); 192 rounds
-         * up by a quarter to cover the less-settled samples, allocator
-         * variance and the reference array `sortedWith` copies. A node is
-         * one populated field: its `ArrayList`, that list's backing array
-         * and one boxed value.
-         */
-        const val SORTED_HEAP_BYTES_PER_NODE = 192L
+        /** Use the decoder's node charge for the advisory row estimate. */
+        const val SORTED_HEAP_BYTES_PER_NODE = SortMemory.NODE_BYTES
 
         /**
-         * See [sortedHeapBytes]. 1 GiB: worst-case process peak ~1614 MiB
-         * (the larger of the chunk phase with a target-sized input row
-         * group and the merge with the flat ~140 MiB output writer, plus
-         * the hydrator's whole-object ceiling), 56% of the 4 GiB
-         * maintenance pod's ~2.8 GiB heap. server/README.md has the pod
-         * table.
+         * Keep the existing 1 GiB default.
+         * Runtime limits reserve reader and writer headroom.
          */
         const val DEFAULT_SORTED_HEAP_BYTES = 1024L * 1024 * 1024
 
@@ -2973,28 +2867,10 @@ class CompactionService(
     private enum class BudgetRefusal { SPILL, MERGE }
 
     /**
-     * Whether a SORTED group would be refused by the rewrite's own
-     * budgets, decided from registered sizes and survivor counts before
-     * any IO: [BudgetRefusal.SPILL] when the bytes its spill path would
-     * read exceed [SortSpill.spillBudgetBytes], [BudgetRefusal.MERGE]
-     * when its spilled runs alone exceed [SortSpill.mergeBudgetBytes].
-     * Null = attempt it.
-     *
-     * THE REWRITER'S ARITHMETIC, NOT A COPY OF IT: this calls
-     * [ExternalMergeSort.admit] with the same trust predicate, sizes and
-     * survivors [compactGroup] hands the rewrite, so the planner cannot
-     * refuse a group the rewrite would take or wave through one it would
-     * refuse in the same way. The rewrite still checks for itself — from
-     * the footers it opens and the bytes it actually writes — and those
-     * hard stops reach [executeGroup]'s arms as the same two exceptions.
-     *
-     * WORST CASE about sortedness: only metadata-trusted files count as
-     * runs here; every other file is assumed to spill. The rewrite's
-     * pre-pass may VERIFY some of them as already sorted and read them in
-     * place, and the planner cannot know which without reading them. So
-     * this refuses only groups that would need more spill (or more
-     * spilled runs) than the budgets allow even if nothing verified; a
-     * group it admits can only do better at execution, never worse.
+     * Apply the rewrite's shared metadata admission before any file I/O.
+     * Treat unverified inputs as spill candidates.
+     * Refuse predicted spill bytes or merge charges that exceed their allowances.
+     * Runtime checks can refuse additional payload expansion, page sizes, or byte-driven chunks.
      */
     private fun budgetRefusal(
         ctx: TableContext,
@@ -3009,7 +2885,11 @@ class CompactionService(
             } catch (_: SpillBudgetExceededException) {
                 return BudgetRefusal.SPILL
             }
-        return if (admission.projectedBytes > spill.mergeBudgetBytes) BudgetRefusal.MERGE else null
+        return if (admission.projectedBytes > SortMemory(spill.mergeBudgetBytes).mergeBytes) {
+            BudgetRefusal.MERGE
+        } else {
+            null
+        }
     }
 
     /**

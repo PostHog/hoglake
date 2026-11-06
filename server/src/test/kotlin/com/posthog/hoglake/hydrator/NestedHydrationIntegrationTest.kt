@@ -277,7 +277,8 @@ class NestedHydrationIntegrationTest {
                 targetBytes = 1L shl 20,
                 minInputFiles = 2,
                 maxGroupsPerRun = 4,
-                sortedHeapBytes = 128L shl 20,
+                // Reserve enough merge allowance for four one-row spills.
+                sortedHeapBytes = 512L shl 20,
                 nestedSortExpansion = Int.MAX_VALUE,
                 spillDir = spillDir,
             )

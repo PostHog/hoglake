@@ -8,6 +8,8 @@ import com.posthog.hoglake.compaction.ParquetRewriter.RewriteResult
 import com.posthog.hoglake.compaction.ParquetRewriter.Row
 import com.posthog.hoglake.compaction.ParquetRewriter.SortKeys
 import com.posthog.hoglake.compaction.ParquetRewriter.SurvivorReader
+import com.posthog.hoglake.compaction.SortMemory.Companion.add
+import com.posthog.hoglake.compaction.SortMemory.Companion.multiply
 import io.github.oshai.kotlinlogging.KotlinLogging
 import org.apache.parquet.column.ParquetProperties
 import org.apache.parquet.example.data.Group
@@ -61,17 +63,10 @@ class SpillBudgetExceededException(
 ) : RuntimeException(message)
 
 /**
- * A sorted group whose merge would buffer more heap than
- * [SortSpill.mergeBudgetBytes] allows even with every trusted input
- * demoted to the spill path: too many spilled runs, each of which holds
- * a whole row group while it is read. Refused before any data is read —
- * from the registered survivor counts — or at the spill whose exact cost
- * makes the runs exceed it.
- *
- * Reachable only by configuration (a heap budget small against the byte
- * target), and there is deliberately no multi-pass merge to absorb it:
- * that would double the spill disk and add a second code path for a
- * misconfiguration.
+ * Refuse a sorted rewrite before a row, reader, or merge exceeds its heap allowance.
+ * Exact footer charges and byte-driven chunk counts can reject a metadata-admitted group.
+ * The rewrite does not perform multi-pass merging.
+ * [SortedRewrite.run] attaches authoritative work counters before the exception escapes.
  */
 class MergeBudgetExceededException(
     message: String,
@@ -108,15 +103,21 @@ interface RunCandidate {
  * Required for any non-empty sort order.
  */
 data class SortSpill(
-    /** Rows per chunk: the chunk phase's heap bound, in the unit the heap holds. */
+    /**
+     * Limit rows per chunk.
+     * The decoder also limits retained bytes.
+     */
     val chunkRows: Long,
-    /** Heap the merge may hold across all open runs. */
+    /** Set the group's sorted heap allowance for both phases. */
     val mergeBudgetBytes: Long,
     /** Local bytes one rewrite may spill. */
     val spillBudgetBytes: Long,
     /** Parent of the per-rewrite `hoglake-compaction-spill-<uuid>` directory. */
     val spillDir: Path,
-    /** Row-group size spill files are written with: a spilled run's predicted compressed cost. */
+    /**
+     * Cap the spill writer's row-group target.
+     * Runtime charges use the resulting footer.
+     */
     val spillBlockBytes: Int = SPILL_BLOCK_BYTES,
     /** Per-trusted-run stream buffer charged on top of its row group. */
     val readaheadBytes: Int = S3InputFile.DEFAULT_READAHEAD_BYTES,
@@ -139,82 +140,49 @@ data class SortSpill(
 
     companion object {
         /**
-         * 16 MiB. Spill files are written at this row-group size so
-         * reading one back holds about this much compressed: small enough
-         * that a merge of dozens of spilled runs fits a 1 GiB group budget,
-         * large enough that a column chunk is still one sequential read.
+         * Cap spill row-group targets at 16 MiB.
+         * The heap allowance can select a smaller target.
          */
         const val SPILL_BLOCK_BYTES: Int = 16 * 1024 * 1024
     }
 }
 
 /**
- * The sorted rewrite's external merge sort: admission, the chunk phase,
- * the spill files, the merge, and the arithmetic that bounds them. The
- * design is in [ParquetRewriter]'s class doc; this object is called only
- * by [ParquetRewriter.rewrite], which owns the per-input pipeline and the
- * output writer it reuses.
+ * Bound sorted rewrites through byte-charged chunks and exact run admission.
  *
- * # What a run costs while it is merged
- *
- * Reading a run holds, at once: the row group's COMPRESSED column chunks
- * (`readNextRowGroup()` allocates all of them), one DECOMPRESSED data
- * page plus the decoded dictionary page per leaf column (each column
- * reader decodes one page at a time), and the stream's buffer. So:
- *
- *  - from a footer (exact): `max over row groups of (compressedSize +
- *    Σ leaves min(uncompressed chunk size, per-leaf page cap))` + buffer.
- *    A page is part of its chunk, so a column whose whole chunk is
- *    smaller than the cap costs only the chunk.
- *  - before the footer (estimate): the row-group bound (`min(file size,
- *    128 MiB output block)` for a trusted run, the spill block for a
- *    spilled one) + `leaves × per-leaf page cap` + buffer.
- *
- * The per-leaf cap is parquet-java's default data page plus dictionary
- * page ([TRUSTED_PAGE_BYTES_PER_LEAF], 2 MiB) for trusted runs, which
- * compaction writes at the defaults, and [SPILL_PAGE_BYTES_PER_LEAF]
- * (128 KiB) for spill files, which this object writes with small pages
- * so that a wide table's spilled runs stay cheap. The buffer is the
- * readahead for a trusted (S3) run and zero for a spill file
- * (`LocalInputFile` reads through an unbuffered `RandomAccessFile`).
- * What the formula does not cover is a single VALUE larger than a page:
- * parquet-java writes it as one page of that size, and the per-row bound
- * on that is [ParquetRewriter.DEFAULT_MAX_NODES_PER_ROW]'s node count,
- * not bytes.
+ * Footer charges include full compressed and uncompressed column chunks.
+ * Page targets cannot bound a page that contains an oversized value.
+ * Additional value-count charges cover decoded dictionaries and column-reader arrays.
+ * Merge charges also reserve materialized heads and transient replacement rows.
+ * The decoder separately charges actual nodes and binary payloads before allocation.
  */
 internal object ExternalMergeSort {
     private val log = KotlinLogging.logger {}
 
     /**
-     * parquet-java's default row-group size, which every compaction
-     * output is written at: the ceiling of a trusted run's largest row
-     * group before its footer is read.
+     * Cap output row-group targets at parquet-java's default.
+     * Smaller allowances select smaller targets.
      */
     const val OUTPUT_BLOCK_BYTES: Long = ParquetWriter.DEFAULT_BLOCK_SIZE.toLong()
 
-    /** Decoded data page + dictionary page per leaf, at parquet-java's defaults. */
+    /**
+     * Estimate data and dictionary pages for metadata admission.
+     * Exact checks do not trust page targets.
+     */
     const val TRUSTED_PAGE_BYTES_PER_LEAF: Long =
         ParquetProperties.DEFAULT_PAGE_SIZE.toLong() + ParquetProperties.DEFAULT_DICTIONARY_PAGE_SIZE
 
     /** Data and dictionary page size spill files are written with. */
     const val SPILL_PAGE_BYTES: Int = 64 * 1024
 
-    /** Decoded data page + dictionary page per leaf of a spill file. */
+    /**
+     * Estimate spill pages during metadata admission.
+     * Exact checks charge full chunks.
+     */
     const val SPILL_PAGE_BYTES_PER_LEAF: Long = 2L * SPILL_PAGE_BYTES
 
-    /**
-     * The most rows a spill writer buffers between row-group size checks.
-     * parquet-java checks the buffered size only every 100 rows at first
-     * and up to every 10,000 later, so with 200 KB rows a "16 MiB" row
-     * group came out near 100 MiB — and reading it back allocates all of
-     * it. The minimum is 1 (set beside this), so the check adapts to the
-     * average row from the first row; the average is what this cap is
-     * for: rows that turn fat after a run of small ones are scheduled as
-     * if small, and the overshoot is then this many fat rows. Ten keeps
-     * it to ten rows; a check is a sum over the column writers, which is
-     * noise beside materializing the rows.
-     */
-    const val SPILL_MAX_ROWS_PER_SIZE_CHECK: Int = 10
+    /** Check writer sizes after each row to limit row-group overshoot. */
+    const val SPILL_MAX_ROWS_PER_SIZE_CHECK: Int = 1
 
     /**
      * Spill files are read once, locally, moments after they are written;
@@ -246,7 +214,10 @@ internal object ExternalMergeSort {
         spill: SortSpill,
     ): Boolean = input.fileSizeBytes > 0 && input.fileSizeBytes >= spill.verifyMinBytes
 
-    /** Spilled runs [rows] survivors make at [SortSpill.chunkRows] per chunk. */
+    /**
+     * Predict runs from the advisory row ceiling.
+     * Runtime byte flushes can produce more runs.
+     */
     fun spillRuns(
         rows: Long,
         spill: SortSpill,
@@ -264,7 +235,7 @@ internal object ExternalMergeSort {
         trustedBytes: Long,
         spilledRuns: Long,
         spilledBytes: Long,
-    ): Long = if (isSingleChunk(trustedRuns, spilledRuns)) 0 else trustedBytes + spilledBytes
+    ): Long = if (isSingleChunk(trustedRuns, spilledRuns)) 0 else add(trustedBytes, spilledBytes)
 
     /** No trusted run and at most one chunk: no merge, no spill file. */
     fun isSingleChunk(
@@ -278,26 +249,23 @@ internal object ExternalMergeSort {
         leaves: Int,
         spill: SortSpill,
     ): Long =
-        (if (input.fileSizeBytes > 0) minOf(input.fileSizeBytes, OUTPUT_BLOCK_BYTES) else OUTPUT_BLOCK_BYTES) +
-            leaves * TRUSTED_PAGE_BYTES_PER_LEAF + spill.readaheadBytes
+        add(
+            if (input.fileSizeBytes > 0) minOf(input.fileSizeBytes, OUTPUT_BLOCK_BYTES) else OUTPUT_BLOCK_BYTES,
+            multiply(leaves.toLong(), TRUSTED_PAGE_BYTES_PER_LEAF),
+            spill.readaheadBytes.toLong(),
+        )
 
     /** A spilled run's cost before it is written (see the object doc). */
     fun predictedSpilledRunBytes(
         leaves: Int,
         spill: SortSpill,
-    ): Long = spill.spillBlockBytes + leaves * SPILL_PAGE_BYTES_PER_LEAF
+    ): Long = add(spill.spillBlockBytes.toLong(), multiply(leaves.toLong(), SPILL_PAGE_BYTES_PER_LEAF))
 
     /**
      * What reading the run [footer] describes holds at its largest row
      * group, before the stream buffer (see the object doc).
      */
-    fun footerRunBytes(
-        footer: ParquetMetadata,
-        pageBytesPerLeaf: Long,
-    ): Long =
-        footer.blocks.maxOfOrNull { rowGroup ->
-            rowGroup.compressedSize + rowGroup.columns.sumOf { minOf(it.totalUncompressedSize, pageBytesPerLeaf) }
-        } ?: 0L
+    fun footerRunBytes(footer: ParquetMetadata): Long = footer.blocks.maxOfOrNull { SortMemory.readerCharge(it) } ?: 0L
 
     /**
      * The catalog-only half of admission. [admitted] is largest first;
@@ -340,7 +308,11 @@ internal object ExternalMergeSort {
         spill: SortSpill,
         leaves: Int,
     ): Admission<T> {
-        val untrustedRows = inputs.filterNot { it.trustedSorted }.sumOf { it.survivingRecords }
+        val untrustedRows =
+            inputs.filterNot { it.trustedSorted }.fold(
+                0L,
+            ) { sum, input -> add(sum, input.survivingRecords) }
+        val mergeAllowance = SortMemory(spill.mergeBudgetBytes).mergeBytes
         val perSpilledRun = predictedSpilledRunBytes(leaves, spill)
 
         fun cost(
@@ -349,7 +321,7 @@ internal object ExternalMergeSort {
             spilledRows: Long,
         ): Long {
             val runs = spillRuns(spilledRows, spill)
-            return mergeCost(admittedRuns, admittedBytes, runs, runs * perSpilledRun)
+            return mergeCost(admittedRuns, admittedBytes, runs, multiply(runs, perSpilledRun))
         }
 
         // sortedByDescending is stable: equal sizes keep input order, so
@@ -361,21 +333,21 @@ internal object ExternalMergeSort {
         val demoted = ArrayList<T>()
         for (candidate in candidates) {
             val estimate = estimatedTrustedRunBytes(candidate, leaves, spill)
-            val projected = cost(admitted.size + 1, admittedBytes + estimate, untrustedRows + demotedRows)
-            if (projected <= spill.mergeBudgetBytes) {
+            val projected = cost(admitted.size + 1, add(admittedBytes, estimate), add(untrustedRows, demotedRows))
+            if (projected <= mergeAllowance) {
                 admitted += candidate
-                admittedBytes += estimate
+                admittedBytes = add(admittedBytes, estimate)
             } else {
                 demoted += candidate
-                demotedRows += candidate.survivingRecords
+                demotedRows = add(demotedRows, candidate.survivingRecords)
             }
         }
         while (admitted.isNotEmpty() &&
-            cost(admitted.size, admittedBytes, untrustedRows + demotedRows) > spill.mergeBudgetBytes
+            cost(admitted.size, admittedBytes, add(untrustedRows, demotedRows)) > mergeAllowance
         ) {
             val shed = admitted.removeAt(admitted.size - 1)
             admittedBytes -= estimatedTrustedRunBytes(shed, leaves, spill)
-            demotedRows += shed.survivingRecords
+            demotedRows = add(demotedRows, shed.survivingRecords)
             demoted += shed
         }
         // The bytes the spill path will READ, as registered. Compressed
@@ -384,8 +356,8 @@ internal object ExternalMergeSort {
         // no IO. Not for a group that will never spill: one chunk and no
         // trusted run is sorted in memory and touches no disk.
         val spilledInputBytes =
-            inputs.filterNot { it.trustedSorted }.sumOf { it.fileSizeBytes } + demoted.sumOf { it.fileSizeBytes }
-        val willSpill = !isSingleChunk(admitted.size, spillRuns(untrustedRows + demotedRows, spill))
+            (inputs.filterNot { it.trustedSorted } + demoted).fold(0L) { sum, input -> add(sum, input.fileSizeBytes) }
+        val willSpill = !isSingleChunk(admitted.size, spillRuns(add(untrustedRows, demotedRows), spill))
         if (willSpill && spilledInputBytes > spill.spillBudgetBytes) {
             throw SpillBudgetExceededException(
                 "sorted rewrite would spill $spilledInputBytes registered input bytes, past the " +
@@ -401,7 +373,7 @@ internal object ExternalMergeSort {
             demoted,
             untrustedRows,
             demotedRows,
-            cost(admitted.size, admittedBytes, untrustedRows + demotedRows),
+            cost(admitted.size, admittedBytes, add(untrustedRows, demotedRows)),
         )
     }
 
@@ -414,10 +386,10 @@ internal object ExternalMergeSort {
         runsSpilled: Int,
         runsDemoted: Int,
     ) = MergeBudgetExceededException(
-        "sorted merge of $trustedRuns trusted and $spilledRuns spilled runs would buffer $bytes B, " +
-            "past the merge budget of ${spill.mergeBudgetBytes} B; the per-group sorted heap budget " +
-            "(HOGLAKE_COMPACTION_SORTED_HEAP_BYTES / parallel groups) is too small for the group size " +
-            "(HOGLAKE_COMPACTION_TARGET_BYTES)",
+        "sorted merge of $trustedRuns trusted and $spilledRuns spilled runs needs $bytes B. " +
+            "The merge allowance is ${SortMemory(spill.mergeBudgetBytes).mergeBytes} B. " +
+            "HOGLAKE_COMPACTION_SORTED_HEAP_BYTES / parallel groups cannot support this " +
+            "HOGLAKE_COMPACTION_TARGET_BYTES group.",
         spillBytes,
         runsSpilled,
         runsDemoted,
@@ -459,49 +431,47 @@ internal object ExternalMergeSort {
     )
 
     /**
-     * A spill file read back as the `Group`s it holds. Its schema is the
-     * output schema by construction, so there is no column plan — rows
-     * are written by the shape's identity plan — and no second
-     * `maxNodesPerRow` charge: those rows were bounded when they were
-     * first decoded. Each row's sort key is extracted again rather than
-     * persisted: the file stays the output schema, and the extraction is
-     * one leaf read per key. The reader belongs to the caller; [label]
-     * names the file in a refusal.
+     * Read a spill file back as materialized groups.
+     * Spill files use the output schema.
+     * Rows use the identity plan.
+     * The decoder enforces the same byte allowance during spill readback.
      *
-     * A spilled row is never re-checked against deletion-vector state,
-     * and needs no check: DVs are applied ONCE, in the chunk phase, by
-     * the [SurvivorReader] that fed the chunk, so a spill file holds
-     * survivors only — there is no position left in it for a vector to
-     * name. A DV superseded between plan and commit is not this merge's
-     * to catch either: the rewrite applied the PLANNED vectors by
-     * design, and `CompactionService.commitGroup` re-reads each input's
-     * live `delete_file_id` under the catalog lock and refuses the group
-     * (`dv_superseded`) when it moved.
+     * Extract sort keys again during readback.
+     * Extraction reads one leaf per key.
+     * The caller owns the reader.
+     * [label] identifies the file in refusals.
+     *
+     * Spill files contain surviving rows only.
+     * [SurvivorReader] applies deletion vectors during chunking.
+     * Spill readback does not apply them again.
+     * Spill files have no source positions for deletion vectors.
+     *
+     * The rewrite uses the planned deletion vectors.
+     * `CompactionService.commitGroup` checks each live `delete_file_id` under the catalog lock.
+     * The commit refuses changed vectors with `dv_superseded`.
      */
     private class SpillRows(
         private val reader: ParquetFileReader,
         private val shape: OutputShape,
         keys: SortKeys,
         private val label: String,
+        private val memory: SortMemory,
     ) : Iterator<Row> {
         private val schema: MessageType = shape.schema
         private val rowIdIndex = shape.rowIdIndex
         private val plan = shape.identityPlan
+        private val keyCount = keys.fields.size
         private val keys = keys.bind(plan)
         private val columnIO = ColumnIOFactory().getColumnIO(schema)
         private var records: org.apache.parquet.io.RecordReader<Group>? = null
         private var leftInRowGroup = 0L
-        private val unbounded = ParquetRewriter.NodeBudget(Int.MAX_VALUE, label)
+        private val budget = ParquetRewriter.NodeBudget(Int.MAX_VALUE, label, memory.rowBytes)
 
         override fun hasNext(): Boolean {
             while (leftInRowGroup == 0L) {
                 val pages = reader.readNextRowGroup() ?: return false
-                // The rewrite's own materializer, for its binaries: a
-                // spilled row goes straight to the output writer, which
-                // must not keep a reference into this file's pages. The
-                // budget is unbounded — these rows were bounded when first
-                // decoded.
-                records = columnIO.getRecordReader(pages, ParquetRewriter.budgetedMaterializer(schema, unbounded))
+                // Copy binaries without retaining the spill reader's pages.
+                records = columnIO.getRecordReader(pages, ParquetRewriter.budgetedMaterializer(schema, budget))
                 leftInRowGroup = pages.rowCount
             }
             return true
@@ -511,7 +481,8 @@ internal object ExternalMergeSort {
             if (!hasNext()) throw NoSuchElementException("spill file is exhausted")
             leftInRowGroup--
             val group = records!!.read()
-            return Row(group, group.getLong(rowIdIndex, 0), keys.extract(group, label), plan)
+            budget.charge(SortMemory.NODE_BYTES * (1L + keyCount))
+            return Row(group, group.getLong(rowIdIndex, 0), keys.extract(group, label), plan, budget.retainedBytes)
         }
     }
 
@@ -527,7 +498,7 @@ internal object ExternalMergeSort {
             private set
 
         fun charge(bytes: Long) {
-            if (written + bytes > budget) {
+            if (bytes < 0 || bytes > budget - written) {
                 throw SpillBudgetExceededException(
                     "sorted rewrite reached its spill budget of $budget B mid-run " +
                         "($written B written, ${written + bytes} B needed); stopping before the spill " +
@@ -614,6 +585,7 @@ internal object ExternalMergeSort {
         private val appendFloorBytes: Long,
     ) {
         private val leaves = shape.schema.columns.size
+        private val memory = SortMemory(spill.mergeBudgetBytes)
 
         /** The first key's range in each spill file, in [spillFiles] order (see [chooseAppended]). */
         private val spillRanges = ArrayList<ParquetRewriter.KeyRange>()
@@ -626,6 +598,7 @@ internal object ExternalMergeSort {
         private var spilledBytes = 0L
 
         private var chunk = ArrayList<Row>()
+        private var chunkBytes = 0L
 
         /** Labels of the inputs the current chunk holds rows of, for its errors. */
         private val chunkLabels = LinkedHashSet<String>()
@@ -686,23 +659,27 @@ internal object ExternalMergeSort {
             val admission = admit(candidates, spill, leaves)
             demoted = admission.demoted.size
             val kept = confirmFooters(admission)
-            trustedBytes = kept.sumOf { it.bytes }
+            trustedBytes = kept.fold(0L) { sum, run -> add(sum, run.bytes) }
             // Built before the chunk phase spends anything: a trusted
             // input whose schema the live one cannot take is refused
             // here, not after the group has been spilled.
-            val readers = kept.map { SurvivorReader(it.input, it.reader, shape, keys) }
+            val readers = kept.map { SurvivorReader(it.input, it.reader, shape, keys, memory) }
             trustedRuns = readers
 
             val trusted = java.util.Collections.newSetFromMap(java.util.IdentityHashMap<Input, Boolean>())
             kept.mapTo(trusted) { it.input }
             val spillPath = candidates.filterNot { it in trusted }
             ParquetRewriter.forEachOpenedInput(spillPath, parallelism) { input, reader ->
-                for (row in SurvivorReader(input, reader, shape, keys)) {
-                    // Flush when the NEXT row arrives, not when the chunk
-                    // fills: a group of exactly chunkRows survivors is
-                    // then still one chunk, and takes the no-spill path.
-                    if (chunk.size >= spill.chunkRows) spillChunk()
+                for (row in SurvivorReader(input, reader, shape, keys, memory)) {
+                    // Wait for the next row so a complete, bounded chunk can avoid spilling.
+                    if (chunk.isNotEmpty() &&
+                        (chunk.size >= spill.chunkRows || row.retainedBytes + 32 > memory.chunkBytes - chunkBytes)
+                    ) {
+                        spillChunk()
+                    }
                     chunk.add(row)
+                    // Reserve reference arrays for the chunk and its in-place sort.
+                    chunkBytes += row.retainedBytes + 32
                     chunkLabels.add(input.label)
                 }
             }
@@ -722,14 +699,19 @@ internal object ExternalMergeSort {
             for ((path, label) in spillFiles) {
                 val reader = ParquetReaders.open(LocalInputFile(path))
                 open += reader
-                runs += SpillRows(reader, shape, keys, label)
+                runs += SpillRows(reader, shape, keys, label, memory)
             }
             var written = 0L
             var minRowId: Long? = null
             var appendedGroups = 0
             var appendedBytes = 0L
             val (_, footer) =
-                ParquetRewriter.writingTo(output, shape.schema, codec) { writer ->
+                ParquetRewriter.writingTo(
+                    output,
+                    shape.schema,
+                    codec,
+                    memory.writerTuning(OUTPUT_BLOCK_BYTES, leaves),
+                ) { writer ->
                     var nextBlock = 0
 
                     // An appended run's rows are one contiguous span of the
@@ -883,7 +865,7 @@ internal object ExternalMergeSort {
                 ParquetRewriter.forEachOpenedInput(checked, parallelism) { input, reader ->
                     val counter = counters[next]
                     val index = candidates[next++].index
-                    val sorted = SortednessCheck.isSorted(input, reader, keys.fields)
+                    val sorted = SortednessCheck.isSorted(input, reader, keys.fields, memory)
                     if (sorted) {
                         passed[index] = true
                         verified++
@@ -921,24 +903,34 @@ internal object ExternalMergeSort {
                 readers += reader
             }
             val perSpilledRun = predictedSpilledRunBytes(leaves, spill)
-            var pendingEstimates = admission.admitted.sumOf { estimatedTrustedRunBytes(it, leaves, spill) }
+            val pending = LongArray(admission.admitted.size + 1)
+            for (index in admission.admitted.indices.reversed()) {
+                pending[index] =
+                    add(pending[index + 1], estimatedTrustedRunBytes(admission.admitted[index], leaves, spill))
+            }
             var demotedRows = admission.demotedRows
             var keptBytes = 0L
             val kept = ArrayList<Confirmed>()
-            for ((input, reader) in admission.admitted.zip(readers)) {
-                val exact = footerRunBytes(reader.footer, TRUSTED_PAGE_BYTES_PER_LEAF) + spill.readaheadBytes
-                pendingEstimates -= estimatedTrustedRunBytes(input, leaves, spill)
-                val runs = spillRuns(admission.untrustedRows + demotedRows, spill)
+            for ((index, pair) in admission.admitted.zip(readers).withIndex()) {
+                val (input, reader) = pair
+                val exact = memory.runBytes(reader.footer, spill.readaheadBytes.toLong(), keys.fields.size)
+                val pendingEstimates = pending[index + 1]
+                val runs = spillRuns(add(admission.untrustedRows, demotedRows), spill)
                 val projected =
-                    mergeCost(kept.size + 1, keptBytes + exact + pendingEstimates, runs, runs * perSpilledRun)
-                if (projected <= spill.mergeBudgetBytes) {
+                    mergeCost(
+                        kept.size + 1,
+                        add(keptBytes, exact, pendingEstimates),
+                        runs,
+                        multiply(runs, perSpilledRun),
+                    )
+                if (projected <= memory.mergeBytes) {
                     kept += Confirmed(input, reader, exact, keys.footerRange(reader.footer))
-                    keptBytes += exact
+                    keptBytes = add(keptBytes, exact)
                 } else {
                     open.remove(reader)
                     runCatching { reader.close() }
                     demoted++
-                    demotedRows += input.survivingRecords
+                    demotedRows = add(demotedRows, input.survivingRecords)
                 }
             }
             // Each check above assumed the runs after it would be kept at
@@ -946,9 +938,9 @@ internal object ExternalMergeSort {
             // path, so the final shape is checked once more as a whole.
             // It is also where a group admission could not fit is refused:
             // admission shed every run, so nothing above was opened.
-            val runs = spillRuns(admission.untrustedRows + demotedRows, spill)
-            val exactCost = mergeCost(kept.size, keptBytes, runs, runs * perSpilledRun)
-            if (exactCost > spill.mergeBudgetBytes) {
+            val runs = spillRuns(add(admission.untrustedRows, demotedRows), spill)
+            val exactCost = mergeCost(kept.size, keptBytes, runs, multiply(runs, perSpilledRun))
+            if (exactCost > memory.mergeBytes) {
                 throw mergeRefusal(exactCost, kept.size, runs, spill, meter.written, spillFiles.size, demoted)
             }
             return kept
@@ -959,7 +951,12 @@ internal object ExternalMergeSort {
             sortChunk()
             var minRowId: Long? = null
             val (_, footer) =
-                ParquetRewriter.writingTo(output, shape.schema, codec) { writer ->
+                ParquetRewriter.writingTo(
+                    output,
+                    shape.schema,
+                    codec,
+                    memory.writerTuning(OUTPUT_BLOCK_BYTES, leaves),
+                ) { writer ->
                     for (row in chunk) {
                         writer.write(row)
                         minRowId = minOf(minRowId ?: row.rowId, row.rowId)
@@ -996,14 +993,11 @@ internal object ExternalMergeSort {
                     MeteredSpillFile(path, meter),
                     shape.schema,
                     SPILL_CODEC,
-                    ParquetRewriter.WriterTuning(
-                        rowGroupBytes = spill.spillBlockBytes.toLong(),
-                        pageBytes = SPILL_PAGE_BYTES,
-                        maxRowsPerSizeCheck = SPILL_MAX_ROWS_PER_SIZE_CHECK,
-                    ),
+                    memory.writerTuning(spill.spillBlockBytes.toLong(), leaves),
                 ) { writer -> for (row in chunk) writer.write(row) }
             spillFiles += path to "spill-$n (${describe(chunkLabels)})"
             chunk.clear()
+            chunkBytes = 0
             chunkLabels.clear()
             // The EXACT cost of the run just written, off its own footer:
             // the predicted cost was the block, and the merge will hold
@@ -1011,9 +1005,9 @@ internal object ExternalMergeSort {
             // the merge opens anything, so a run count the registered
             // survivors under-predicted is caught at the run that breaks it.
             val footer = written ?: ParquetReaders.open(LocalInputFile(path)).use { it.footer }
-            spilledBytes += footerRunBytes(footer, SPILL_PAGE_BYTES_PER_LEAF)
+            spilledBytes = add(spilledBytes, memory.runBytes(footer, keyCount = keys.fields.size))
             val cost = mergeCost(trustedRuns.size, trustedBytes, n.toLong(), spilledBytes)
-            if (cost > spill.mergeBudgetBytes) {
+            if (cost > memory.mergeBytes) {
                 throw mergeRefusal(cost, trustedRuns.size, n.toLong(), spill, meter.written, spillFiles.size, demoted)
             }
         }

@@ -5,7 +5,6 @@ import com.posthog.hoglake.compaction.ParquetRewriter.Row
 import com.posthog.hoglake.compaction.ParquetRewriter.SortKeys
 import com.posthog.hoglake.hydrator.FooterStats
 import com.posthog.hoglake.model.SortFieldDef
-import org.apache.parquet.example.data.simple.convert.GroupRecordConverter
 import org.apache.parquet.hadoop.ParquetFileReader
 import org.apache.parquet.io.ColumnIOFactory
 import org.apache.parquet.io.InputFile
@@ -71,6 +70,7 @@ internal object SortednessCheck {
         input: Input,
         reader: ParquetFileReader,
         sortFields: List<SortFieldDef>,
+        memory: SortMemory? = null,
     ): Boolean {
         val schema = reader.footer.fileMetaData.schema
         if (FooterStats.missingFieldIds(schema)) return false
@@ -105,12 +105,19 @@ internal object SortednessCheck {
             }
         val carrierIndex = if (carrier == null) null else projection.getFieldIndex(ParquetRewriter.ROW_ID_COLUMN)
         reader.setRequestedSchema(projection)
+        memory?.checkReader(reader.footer.blocks, projection, input.label)
         val columnIO = ColumnIOFactory().getColumnIO(projection)
+        val budget =
+            ParquetRewriter.NodeBudget(
+                ParquetRewriter.DEFAULT_MAX_NODES_PER_ROW,
+                input.label,
+                memory?.rowBytes ?: Long.MAX_VALUE,
+            )
         var previous: Row? = null
         var position = 0L
         while (true) {
             val pages = reader.readNextRowGroup() ?: return true
-            val records = columnIO.getRecordReader(pages, GroupRecordConverter(projection))
+            val records = columnIO.getRecordReader(pages, ParquetRewriter.budgetedMaterializer(projection, budget))
             // A Long count, not toIntExact: a row group past 2^31 rows is
             // legal parquet, and an ArithmeticException here would fail the
             // group every sweep rather than check it.
@@ -129,6 +136,7 @@ internal object SortednessCheck {
                         group.getLong(carrierIndex, 0)
                     }
                 position++
+                budget.charge(SortMemory.NODE_BYTES * (1L + keys.fields.size))
                 val row = Row(group, rowId, keys.extract(group, input.label))
                 if (previous != null && keys.comparator.compare(previous!!, row) > 0) return false
                 previous = row

@@ -498,39 +498,17 @@ class CompactionConfigTest {
     }
 
     @Test
-    fun `the default is sized for the pod the maintenance deployment actually has`() {
-        // The knob is only honest if its default is safe on the pod that
-        // exists. 4 GiB at MaxRAMPercentage=70 is ~2.8 GiB of heap. The
-        // worst-case process peak since the external merge sort
-        // (hoglake#134) is the LARGER of its two phases, plus the
-        // hydrator's 256 MiB whole-object ceiling firing in the same tick:
-        // the MERGE — the admitted runs charged up to the budget, the
-        // OUTPUT writer's buffered row group (measured flat at ~147 MB,
-        // SortedRewriteHeapMeasurement, since the materializer stopped its
-        // statistics pinning input pages) and the 16 MiB S3 part buffer —
-        // and the CHUNK phase — the chunk at ~0.79x the budget, a
-        // target-sized 512 MiB input row group, the spill writer's slabs
-        // and the sort's reference array (~37 MiB).
-        //
-        // Pinned as an inequality against the REAL heap rather than as
-        // an equality on the constant: the failure this guards is
-        // someone raising the default (or a term growing) without the
-        // charts change that makes it survivable. The honest formula puts
-        // the default at 56%, stated in server/README.md.
+    fun `the default allowance leaves process headroom on the maintenance pod`() {
         val mib = 1024.0 * 1024
         val heap = 4.0 * 1024 * mib * 0.70
-        val budget = CompactionConfig.DEFAULT_SORTED_HEAP_BYTES.toDouble()
-        val outputWriter = 147_502.0 * 1024
-        val merge = budget + outputWriter + 16 * mib
-        val chunk = 0.79 * budget + 512 * mib + 37 * mib
-        val peak = maxOf(merge, chunk) + 256 * mib
-        assertThat(peak / heap)
-            .describedAs(
-                "worst-case peak %.0f MiB against a %.0f MiB heap — raise the pod before the knob",
-                peak / mib,
-                heap / mib,
-            )
-            .isLessThan(0.7)
+        val budget = CompactionConfig.DEFAULT_SORTED_HEAP_BYTES
+        val memory = SortMemory(budget)
+        assertThat(memory.chunkBytes + memory.readerBytes + memory.rowBytes).isLessThan(budget)
+        assertThat(memory.mergeBytes).isEqualTo(budget / 2)
+        // Reserve additional space for the hydrator and object-store buffers.
+        // This inequality checks the configured allowance, not a universal process-peak guarantee.
+        val configured = budget + 256 * mib + 16 * mib
+        assertThat(configured / heap).isLessThan(0.7)
     }
 
     @Test
@@ -642,17 +620,17 @@ class CompactionConfigTest {
 
     @Test
     fun `N concurrent sorted groups cannot exceed the heap one group was allowed`() {
-        // THE heap-gating property, stated as the arithmetic it is: the
-        // budget is DIVIDED, so N groups each at their ceiling cost what
-        // one group used to. Asserted in the unit the heap holds — rows
-        // times the per-node cost — rather than on the knob, because the
-        // knob is not what OOMs.
+        // Divide advisory ceilings and enforced allowances across concurrent groups.
         val heap = 1024L * 1024 * 1024
         val one = CompactionConfig(targetBytes = target, maxGroupsPerRun = 1, sortedHeapBytes = heap)
         val nodesPlusCarrier = flatColumns.size + 1
         val perRowBytes = CompactionConfig.SORTED_HEAP_BYTES_PER_NODE * nodesPlusCarrier
         for (n in listOf(1, 2, 4, 8, 64)) {
             val many = one.copy(parallelGroups = n)
+            assertThat(SortMemory(many.sortedHeapBytesPerGroup).chunkBytes * n)
+                .isLessThanOrEqualTo(SortMemory(heap).chunkBytes)
+            assertThat(SortMemory(many.sortedHeapBytesPerGroup).readerBytes * n)
+                .isLessThanOrEqualTo(SortMemory(heap).readerBytes)
             val concurrentBytes = many.spillChunkRows(flatColumns) * perRowBytes * n
             assertThat(concurrentBytes)
                 .describedAs("%d concurrent sorted chunks", n)

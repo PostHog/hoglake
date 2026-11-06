@@ -1655,26 +1655,44 @@ by row id when every trusted input was itself written that way — true of
 every output this rewriter writes — and otherwise deterministically but
 unspecified (outputs written before #134 broke ties in input order).
 
-`HOGLAKE_COMPACTION_SORTED_HEAP_BYTES` (default **1 GiB**, divided by
-`HOGLAKE_COMPACTION_PARALLEL_GROUPS`) bounds BOTH phases of one group.
-The chunk is that budget in rows: the live schema's node count at
-~192 B per materialized node (measured 151.6, rounded up), divided again
-by `HOGLAKE_COMPACTION_NESTED_SORT_EXPANSION` (default 64) for a table
-with nested columns, whose object graph measured 30-70x its compressed
-bytes. That is the old row ceiling's arithmetic; it now sizes a chunk,
-never a group. The merge is that budget in buffered bytes: parquet-java's
-`readNextRowGroup()` holds a reader's whole compressed row group, so a
-run costs its largest row group plus a page per leaf plus its stream
-buffer — a trusted run up to the 128 MiB output block (exact from its
-footer, which is read before any data), a spilled run ~16 MiB plus
-128 KiB per leaf. Trusted inputs are ADMITTED largest first while the
-projected cost of every run fits; the rest are DEMOTED to the spill path,
-which changes work and never correctness.
+`HOGLAKE_COMPACTION_SORTED_HEAP_BYTES` defaults to **1 GiB**.
+The rewrite divides this allowance by `HOGLAKE_COMPACTION_PARALLEL_GROUPS`.
+The schema-based row ceiling remains advisory.
+Runtime decoding charges actual repeated nodes, field containers, and binary payload bytes before allocation.
+The chunk flushes when its retained-byte allowance fills, even below that row ceiling.
 
-Two refusals remain, both typed, counted, decided by the planner in
-METADATA with the rewriter's own arithmetic (`ExternalMergeSort.admit`)
-and re-checked by the rewrite itself, and neither charged to the run's
-group budget:
+Each group reserves one quarter of its allowance for retained chunk rows.
+It reserves another quarter for the current projected input reader.
+Each decoded row may consume at most one sixteenth.
+The merge reserves half for readers, materialized heads, and replacement rows.
+
+Writers reserve one quarter through conservative live-leaf and buffer estimates.
+Writer charges include null-filled output columns and the row-ID carrier.
+The estimate reserves 32 KiB per leaf, twice the row-group target, and 32 times aggregate page targets.
+These estimates cover dictionary IDs, writer objects, dictionary maps, page stores, and codec buffers.
+The writer refuses if its allowance cannot fund 64-byte pages.
+
+Additional headroom covers sort arrays and transient copies.
+The allowance does not cover every server allocation, parsed footer, or object-store buffer.
+
+Reader charges include complete compressed and uncompressed chunks, decoded dictionaries, and column-reader arrays.
+Page-size targets do not bound oversized values.
+The rewrite checks projected footers before allocating input pages.
+Merge charges include each run's largest reader charge and two bounded materialized rows.
+Head bounds account for repeated dictionary values within one row.
+
+Trusted inputs enter largest-first admission.
+Rejected candidates use the spill path.
+
+Metadata admission predicts spill counts from the advisory row ceiling.
+The rewrite rechecks exact footers and actual byte-driven chunk counts.
+Runtime checks can therefore refuse a group that passed metadata admission.
+Groups still pack to the byte target.
+
+Two typed refusals remain.
+The planner and rewrite share `ExternalMergeSort.admit` for metadata checks.
+The rewrite also checks actual allocations and spill work.
+Neither refusal consumes the sweep's successful-group budget:
 
 - `spill_budget_exceeded` /
   `hoglake_compaction_skipped_total{reason="spill_budget"}`: the
@@ -1689,11 +1707,13 @@ group budget:
   group of zstd client inputs spills under ~0.9 GiB (snappy spill of
   zstd input runs ~1.6x its bytes).
 - `merge_budget_exceeded` /
-  `hoglake_compaction_skipped_total{reason="merge_budget"}`: the
-  group's spilled runs ALONE exceed the merge budget. Only configuration
-  reaches it — a heap budget small against the byte target — and there
-  is deliberately no multi-pass merge to absorb it (twice the spill disk,
-  and a second code path, for a misconfiguration).
+  `hoglake_compaction_skipped_total{reason="merge_budget"}`:
+  a row, projected input reader, or complete one-pass merge exceeds its heap allowance.
+  Variable-width payloads, repeated values, oversized pages, or additional byte-driven chunks can trigger this refusal.
+  The rewrite reports work already spent and removes its spill directory.
+  Conservative full-chunk charges can reject legal files that a page-header-aware reader could process.
+  The rewrite does not perform intermediate or multi-pass merges.
+  Such merging remains future scope, not part of this safety fix.
 
 `heap_budget_exceeded` (`reason="heap_budget"`) is HISTORICAL: nothing
 produces it any more. It stays on the wire and in the ledger, reading 0.
@@ -1793,84 +1813,22 @@ is the byte rate.
 
 ### Sizing it against the pod
 
-Measured (`SortedRewriteHeapMeasurement`, flat event rows, 50,000-row
-chunks, retained heap at a full GC):
+Treat the sorted allowance as a per-process allocation budget, not a measured process-peak guarantee.
+Divide it across concurrent groups before applying the runtime allowances above.
+Reserve additional heap for the service, parsed footers, output metadata, and object-store buffers.
+Raise the allowance only when the process heap can support it.
 
-| group rows | spilled runs | output writer alone (unsorted path) | chunk phase | merge phase (runs + writer) |
-|---|---|---|---|---|
-| 3,200,000 | 64 | 148 MB | 82 MB | 567 MB |
-| 6,400,000 | 128 | 147 MB | 82 MB | 992 MB |
-| 8,000,000 | 160 | 147 MB | 82 MB | 1,206 MB |
+The previous sizing model used 192 bytes per schema node and fixed row-count chunks.
+It omitted binary payload growth and repeated-node counts.
+Its page-size caps also omitted legal oversized pages.
+The previous 0.79 expansion factor and 1614 MiB process-peak estimate do not describe the byte-accounted implementation.
+Do not use those historical estimates to size a deployment.
 
-The chunk phase is FLAT in group size. The merge held ~6.6 MB per
-spilled run (above the writer) against the ~17.4 MiB each is charged.
-The OUTPUT writer is FLAT too: parquet-java keeps the row group it is
-building in memory until the row group closes, which is a constant —
-about 1.1x the 128 MiB output row group plus buffer slack, ~140 MiB.
-
-It used to grow, by ~40 MB per million rows with no plateau (310 MB at
-3.2M rows, 519 MB at 6.4M, 643 MB at 8M), and the cause was not the
-writer's own buffering. The reader decodes plain-encoded strings as
-slices of the decoded input PAGE, `Binary.copy()` returns such a slice
-unchanged, and the output writer's column statistics and per-page column
-index keep a min and a max per page until the footer — so each kept value
-pinned a whole input page. The rewrite now copies every binary value into
-its own array when the row is materialized (the materializer every input,
-trusted run and spill file is read through), and nothing the writer keeps
-can pin a page. Measured with `SortedRewriteHeapMeasurement` before and
-after; the class histogram at the old peak was ~500 MB of `byte[]` under
-~80k live `ByteBufferBackedBinary`.
-
-The CHUNK phase holds, besides the chunk itself: the current input's
-whole compressed row group (a client file's own block size, bounded only
-by the file's size, which is under the target), the spill writer's
-16 MiB block (up to ~2x that in buffer slabs), the sort's temporary
-reference array (at most half the chunk's references, ~1 MiB per 500,000
-rows), and the admitted trusted readers' parsed footers (KiB each). The
-chunk is charged at 192 B a node and measured at 151.6 (0.79x,
-`SortedHeapMeasurement`), so those terms ride in the remaining 0.21x of
-the budget (215 MiB at 1 GiB) unless an input's row group is larger than
-~175 MiB. With a target-sized single-row-group input the chunk phase is
-at most 809 + 512 + 32 + ~5 MiB = ~1,360 MiB at the default, which is now
-MORE than the merge phase's 1,024 + 156 MiB, so the peak is the larger
-of the two. The one path that holds a chunk AND the output writer, the
-single-chunk in-memory sort, holds no spill writer and no input row
-group, so it is at most 0.79x the budget plus the writer.
-
-So the honest worst-case process peak is
-
-```
-max( SORTED_HEAP_BYTES + parallelGroups x (140 MiB + 16 MiB),   (merge: admitted runs at their charge; output writer, flat; S3 part buffer)
-     0.79 x SORTED_HEAP_BYTES + 512 MiB + 37 MiB )             (chunk: chunk graph; a target-sized input row group; spill writer + sort array)
-+ 256 MiB                                                       (the hydrator's whole-object ceiling, same tick)
-```
-
-against a heap that is 70% of the pod (`MaxRAMPercentage=70`). The table
-below is for `parallelGroups = 1` and a ten-column flat event table
-(11 nodes a row with the row-id carrier, so 2,112 B per chunk row); the
-spill-file counts are for a full 512 MiB group of zstd (~70 B/row) and of
-snappy (~119 B/row) client input, and the merge charge is the zstd case's
-spilled runs at 17.4 MiB each:
-
-| pod | heap | `SORTED_HEAP_BYTES` | peak | chunk rows | spill files zstd / snappy | merge charge (zstd) |
-|---|---|---|---|---|---|---|
-| 4 GiB (today) | 2.8 GiB | **1 GiB** (default) | 1614 MiB, 56% | 508,400 | 16 / 9 | 278 MiB |
-| 8 GiB | 5.6 GiB | 2 GiB | 2460 MiB, 43% | 1,016,800 | 8 / 5 | 139 MiB |
-| 16 GiB | 11.2 GiB | 4 GiB | 4508 MiB, 39% | 2,033,601 | 4 / 3 | 70 MiB |
-| 32 GiB | 22.4 GiB | 8 GiB | 8604 MiB, 38% | 4,067,203 | 2 / 2 | 35 MiB |
-| 64 GiB | 44.8 GiB | 16 GiB | 16796 MiB, 37% | 8,134,407 | 1 / 1 (no spill) | 0 |
-
-Every row reaches the full 512 MiB target; the knob buys fewer, larger
-spill files and room to read more trusted runs in place, not bigger
-groups. **The default fits today's 4 GiB pod**: 56% of the heap in the
-worst case, before the rest of the server. That bound assumes a
-target-sized single-row-group input during the chunk phase (or, in the
-merge, the full charge — ~2.6x what a spilled run measured), plus the
-hydrator's ceiling; a realistic zstd group at the default merges 16
-spilled runs (~106 MB measured, 278 MiB charged). Raising the knob
-without the pod is how the OOM comes back; at 512 MiB the bound is 42%.
-Gigahog runs the last row with `parallelGroups` above 1, which adds
-156 MiB per extra group to the merge term (6 groups: 17576 MiB, 38%).
+The child-JVM regressions use 26-column synthetic rows and 64 or 96 MiB sorted allowances.
+A repeated-payload fixture spills early and completes under `-Xmx192m`.
+A larger incompressible fixture refuses its one-pass merge without exhausting that heap.
+An indivisible oversized input page refuses before decompression.
+These tests establish those outcomes, not a universal process-peak estimate.
 
 ### The multipart upload needs a lifecycle rule
 
@@ -1893,44 +1851,29 @@ process lifetime, bounded by the compaction target.
 plenty, since a live upload finishes in minutes. Without one the leak is
 permanent and unobservable.
 
-Group bytes are close to column-count independent: the budget divides by
-node count and multiplies by bytes-per-row, and both scale with the
-number of columns. A 20-column table whose rows really do carry twice
-the bytes lands in the same 34-58 MiB band. The exception is a wide
-table whose extra columns are nearly free (low-cardinality, dictionary
-encoded): those add nodes without adding bytes, and the same 1 GiB
-budget yields 17.8 MiB (zstd) / 30.2 MiB (snappy).
+The previous fixed-row model produced similar group sizes across several column counts.
+Those measurements do not bound byte-driven chunks or output writer memory.
+Wide schemas can trigger a typed refusal even when projected input rows stay small.
 
-`HOGLAKE_COMPACTION_MAX_NODES_PER_ROW` (default **1,000,000**) bounds
-one ROW's materialized object graph, which no group-level budget can:
-both rewrite paths materialize a row whole, so a single row holding a
-hundred-million-element list is an OOM, and an OOM in a background loop
-takes the request path down with it. A row past the budget is refused
-as `invalid_data` — one counted skip instead of a process kill. The
-allowance is spent inside the parquet record materializer as the row is
-decoded; counting it after `read()` returned would only have reported
-the allocation that already happened. Nothing else is charged: the
-output record is written straight from the decoded row into parquet's
-record consumer (hoglake#134 package D2), which visits each decoded node
-at most once and allocates none, so it cannot exceed what the decode
-was allowed. And the decode reads only what the output keeps: every input is
-read PROJECTED (parquet's requested schema) to the columns its plan maps
-plus the row-id carrier, so a column the live schema has dropped is never
-decoded or held — which is what keeps a sorted chunk, sized from the LIVE
-schema's node count, inside its budget for files written before the drop
-(and took a rewrite of inputs carrying ten dropped string columns from
-1,526 to 940 ms, `SortedRewriteCpuMeasurement dropped`).
+`HOGLAKE_COMPACTION_MAX_NODES_PER_ROW` (default **1,000,000**) limits actual node events while either rewrite path decodes a row.
+The materializer refuses the next node before it exceeds this limit.
+The skip reason is `invalid_data`.
 
-Calibrate in NODES, not elements: a scalar column costs 1 per row, a
-list element costs 2 (its synthetic entry group plus the value), a map
-entry 3. The default therefore admits roughly half a million list
-elements in a single row — far above any honest row, and far below what
-a heap holds at ~50-100 bytes a node.
+The decoder reads only projected live values and the row-ID carrier.
+Dropped input columns consume no decoded-node allowance.
+The sorted path also charges retained bytes and binary payloads.
+Null-filled output columns still consume writer memory.
+Writer admission charges those columns before constructing a writer.
 
-Peak live heap is one decoded row, **1x** the budget. It was up to 2x
-while every row was copied into a second, output-shaped graph before
-being written; measured then, a 999,999-node row rewrote under
-`-Xmx192m`.
+Count nodes, not logical elements.
+A scalar value consumes one node event.
+A list element includes its entry group and its value.
+A map entry includes its group, key, and value.
+The default admits roughly half a million scalar list elements without other populated values.
+Byte checks can refuse a sorted row before that node ceiling.
+
+The old copying implementation rewrote a 999,999-node row under `-Xmx192m`.
+That historical result does not bound binary payloads, writer state, or concurrent groups.
 
 Three non-success outcomes carry a counter, all under
 `hoglake_compaction_skipped_total{catalog, reason}` (beside the sorted

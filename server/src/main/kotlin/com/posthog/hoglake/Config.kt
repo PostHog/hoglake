@@ -1110,15 +1110,10 @@ data class Config(
             "${com.posthog.hoglake.compaction.CompactionConfig.DEFAULT_PLAN_STATEMENT_TIMEOUT_MS}",
         ).toLong(),
     /**
-     * Sorted-path CHUNK derate for NESTED tables: the rows per spill
-     * chunk of a table with both nested columns and a live sort order is
-     * divided by this. A chunk is materialized to be sorted, and a nested
-     * row's node count is not knowable from the catalog (list lengths
-     * are data) — measured at 30-70x its compressed bytes — so the
-     * per-node accounting below cannot see it. 1 disables the derate,
-     * which is the setting to reach for only with a heap sized for it.
-     * Sizes chunks only; groups pack to the byte target. See
-     * CompactionConfig.nestedSortExpansion.
+     * Derate the advisory chunk-row ceiling for nested sorted tables.
+     * The decoder separately charges actual repeated nodes and binary payloads.
+     * Groups still pack to the configured byte target.
+     * See CompactionConfig.nestedSortExpansion.
      */
     val compactionNestedSortExpansion: Int =
         env(
@@ -1126,22 +1121,14 @@ data class Config(
             "${com.posthog.hoglake.compaction.CompactionConfig.DEFAULT_NESTED_SORT_EXPANSION}",
         ).toInt(),
     /**
-     * How much HEAP one sorted rewrite may hold, per phase (divided by
-     * HOGLAKE_COMPACTION_PARALLEL_GROUPS), default 1 GiB. A sorted rewrite
-     * is an external merge sort: it bounds the CHUNK (rows sorted in
-     * memory before each spill, via the live schema's node count) and
-     * the MERGE (one row group per run; trusted runs admitted largest
-     * first, the rest demoted to the spill path). It no longer bounds the
-     * group, which packs to HOGLAKE_COMPACTION_TARGET_BYTES.
+     * Set the sorted rewrite's heap allowance before division by HOGLAKE_COMPACTION_PARALLEL_GROUPS.
+     * The default remains 1 GiB.
+     * The external merge sort limits decoded chunk bytes, individual rows, input readers, and merge runs.
+     * It reserves writer and transient headroom within each group's allowance.
+     * Large pages, large rows, or excessive runs can cause typed merge refusals.
+     * The advisory schema-row estimate does not bound payload bytes.
      *
-     * The default fits the 4 GiB maintenance pod (~2.8 GiB of heap at
-     * the image's MaxRAMPercentage=70): worst-case process peak ~1614
-     * MiB, 56% of that heap — the chunk phase with a target-sized input
-     * row group (or the merge: the budget, the output writer's buffered
-     * row group, flat at ~140 MiB, and the S3 part buffer), plus the
-     * hydrator's whole-object ceiling. Raise it only together
-     * with the pod's memory (server/README.md has the pod table); it buys
-     * fewer spill files and more trusted runs read in place.
+     * Size process memory for concurrent groups and other server allocations.
      * See CompactionConfig.sortedHeapBytes.
      */
     val compactionSortedHeapBytes: Long =
