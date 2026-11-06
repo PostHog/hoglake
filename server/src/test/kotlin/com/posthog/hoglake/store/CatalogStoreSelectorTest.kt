@@ -64,7 +64,13 @@ class CatalogStoreSelectorTest {
     @Test
     fun `verified placements select request scoped stores and never enumerate the engine`() =
         testApplication {
-            val cfg = config("none")
+            val cfg =
+                config("none").copy(
+                    removalLedgerRetentionSeconds = 12_345,
+                    compactionTargetBytes = 64L * 1024 * 1024,
+                    compactionMinInputFiles = 3,
+                    compactionMaxInputFiles = 17,
+                )
             val selector = CatalogStoreSelector(postgres, cfg)
             val stores = mutableListOf<CatalogStore>()
             application {
@@ -88,6 +94,24 @@ class CatalogStoreSelectorTest {
                         val listing = selector.forListing(call)
                         assertThat(listing.store).isInstanceOf(HogliteCatalogStore::class.java)
                         assertThat(selector.forCatalog(call, "lake")).isSameAs(listing.store)
+                        val hoglite = listing.store as HogliteCatalogStore
+                        assertThat(hoglite.ledgerRetentionSeconds).isEqualTo(cfg.removalLedgerRetentionSeconds)
+                        assertThat(hoglite.smallFileThresholdBytes).isEqualTo(cfg.compactionTargetBytes)
+                        assertThat(hoglite.minInputFiles).isEqualTo(cfg.compactionMinInputFiles)
+                        assertThat(hoglite.maxInputFiles).isEqualTo(cfg.compactionMaxInputFiles)
+                        assertThat(selector.uploads(call, "lake", hoglite.uploads)).isSameAs(hoglite.uploads)
+                        assertThat(selector.tableCreations(call, "lake", hoglite.tableCreations))
+                            .isSameAs(hoglite.tableCreations)
+                        assertThat(selector.alters(call, "lake", hoglite.alters)).isSameAs(hoglite.alters)
+                        assertThat(selector.views(call, "lake", hoglite.views)).isSameAs(hoglite.views)
+                        assertThat(
+                            selector.partitionStats(call, "lake", hoglite.partitions),
+                        ).isSameAs(hoglite.partitions)
+                        assertThat(
+                            selector.partitionListing(call, "lake", hoglite.partitions),
+                        ).isSameAs(hoglite.partitions)
+                        assertThat(selector.partitionLookup(call, "lake", hoglite.partitionLookup))
+                            .isSameAs(hoglite.partitionLookup)
                         stores.add(listing.store)
                         call.respondText(listing.catalogs!!.single())
                     }

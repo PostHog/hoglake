@@ -7,6 +7,13 @@ import com.posthog.hoglake.hoglite.HogliteCatalogStore
 import com.posthog.hoglake.hoglite.HogliteClient
 import com.posthog.hoglake.hoglite.HogliteTenantResolver
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.service.AlterBackend
+import com.posthog.hoglake.service.PartitionListingBackend
+import com.posthog.hoglake.service.PartitionLookupBackend
+import com.posthog.hoglake.service.PartitionStatsBackend
+import com.posthog.hoglake.service.TableCreationBackend
+import com.posthog.hoglake.service.UploadBackend
+import com.posthog.hoglake.service.ViewBackend
 import io.ktor.server.application.ApplicationCall
 import io.ktor.util.AttributeKey
 import java.util.UUID
@@ -39,6 +46,49 @@ class CatalogStoreSelector(
             Listing(fallback(""), caller?.visibleCatalogs())
         }
     }
+
+    /** Resolve sub-backends through the same request-scoped store and default policy. */
+    fun uploads(
+        call: ApplicationCall,
+        catalog: String,
+        postgres: UploadBackend,
+    ): UploadBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.uploads ?: postgres
+
+    fun tableCreations(
+        call: ApplicationCall,
+        catalog: String,
+        postgres: TableCreationBackend,
+    ): TableCreationBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.tableCreations ?: postgres
+
+    fun alters(
+        call: ApplicationCall,
+        catalog: String,
+        postgres: AlterBackend,
+    ): AlterBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.alters ?: postgres
+
+    fun views(
+        call: ApplicationCall,
+        catalog: String,
+        postgres: ViewBackend,
+    ): ViewBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.views ?: postgres
+
+    fun partitionStats(
+        call: ApplicationCall,
+        catalog: String,
+        postgres: PartitionStatsBackend,
+    ): PartitionStatsBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.partitions ?: postgres
+
+    fun partitionListing(
+        call: ApplicationCall,
+        catalog: String,
+        postgres: PartitionListingBackend,
+    ): PartitionListingBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.partitions ?: postgres
+
+    fun partitionLookup(
+        call: ApplicationCall,
+        catalog: String,
+        postgres: PartitionLookupBackend,
+    ): PartitionLookupBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.partitionLookup ?: postgres
 
     /** Maintenance is PostgreSQL-only. Resolve placement before any service or body work. */
     fun requirePostgres(

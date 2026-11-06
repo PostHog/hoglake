@@ -1,7 +1,8 @@
 package com.posthog.hoglake.api
 
 import com.posthog.hoglake.auth.actorOrRefuse
-import com.posthog.hoglake.service.AlterService
+import com.posthog.hoglake.service.AlterBackend
+import com.posthog.hoglake.store.CatalogStoreSelector
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
 import io.ktor.server.plugins.BadRequestException
@@ -17,9 +18,13 @@ import io.ktor.server.routing.routing
  * request's structural contract (minItems 1, op discriminator shape ->
  * 400); semantics live in AlterService, mapped by ErrorMapping.
  */
-fun Application.installAlterRoutes(alter: AlterService) {
+fun Application.installAlterRoutes(
+    alter: AlterBackend,
+    selector: CatalogStoreSelector? = null,
+) {
     routing {
         post("/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/alter") {
+            val alter = selector?.alters(call, call.catalog(), alter) ?: alter
             val req = call.receive<AlterTableRequestDto>()
             if (req.ops.isEmpty()) {
                 throw BadRequestException("ops must contain at least one operation")

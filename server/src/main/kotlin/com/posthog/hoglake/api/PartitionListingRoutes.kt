@@ -6,7 +6,9 @@ import com.posthog.hoglake.model.PartitionListing
 import com.posthog.hoglake.model.PartitionListingValue
 import com.posthog.hoglake.model.PartitionSpecField
 import com.posthog.hoglake.model.PartitionSpecSummary
+import com.posthog.hoglake.service.PartitionListingBackend
 import com.posthog.hoglake.service.PartitionListingService
+import com.posthog.hoglake.store.CatalogStoreSelector
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
 import io.ktor.server.plugins.BadRequestException
@@ -38,9 +40,13 @@ import java.time.Instant
  * exactly, and a default `limit` because a sample listing has no
  * historical unbounded caller to keep working.
  */
-fun Application.installPartitionListingRoutes(listings: PartitionListingService) {
+fun Application.installPartitionListingRoutes(
+    listings: PartitionListingBackend,
+    selector: CatalogStoreSelector? = null,
+) {
     routing {
         get("/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/partitions") {
+            val listings = selector?.partitionListing(call, call.catalog(), listings) ?: listings
             call.respond(
                 listings.listPartitions(
                     call.catalog(),

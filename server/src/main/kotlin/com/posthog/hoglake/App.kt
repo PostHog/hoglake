@@ -432,13 +432,15 @@ class App private constructor(
         )
         app.installTableCreationRoutes(
             TableCreationService(jdbi, catalogService, commitService, cfg.commitLockTimeoutMs),
+            selector = catalogSelector,
         )
         app.installUploadRoutes(
             com.posthog.hoglake.service.UploadService(jdbi, cfg.removalLedgerRetentionSeconds),
+            selector = catalogSelector,
         )
-        app.installAlterRoutes(alterService)
+        app.installAlterRoutes(alterService, selector = catalogSelector)
         app.installScanRoutes(catalogSelector)
-        app.installViewRoutes(viewService)
+        app.installViewRoutes(viewService, selector = catalogSelector)
         app.installMaintenanceRoutes(
             optionsService,
             expiryService,
@@ -449,9 +451,9 @@ class App private constructor(
             DatabaseHealthService(jdbi, reindexService),
             selector = catalogSelector,
         )
-        app.installPartitionStatsRoutes(partitionStatsService)
-        app.installPartitionListingRoutes(partitionListingService)
-        app.installPartitionLookupRoutes(partitionLookupService)
+        app.installPartitionStatsRoutes(partitionStatsService, selector = catalogSelector)
+        app.installPartitionListingRoutes(partitionListingService, selector = catalogSelector)
+        app.installPartitionLookupRoutes(partitionLookupService, selector = catalogSelector)
         app.installPublicationRoutes(catalogSelector)
         app.installDebugRoutes()
     }

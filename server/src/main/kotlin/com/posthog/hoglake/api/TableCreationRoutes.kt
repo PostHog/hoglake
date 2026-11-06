@@ -7,8 +7,9 @@ import com.posthog.hoglake.auth.hoglakeAuth
 import com.posthog.hoglake.auth.requireScopedNamespaces
 import com.posthog.hoglake.service.ReplacementTarget
 import com.posthog.hoglake.service.TableCreation
+import com.posthog.hoglake.service.TableCreationBackend
 import com.posthog.hoglake.service.TableCreationDefinition
-import com.posthog.hoglake.service.TableCreationService
+import com.posthog.hoglake.store.CatalogStoreSelector
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
 import io.ktor.server.plugins.BadRequestException
@@ -62,18 +63,26 @@ private fun TableCreation.toDto() =
         writePath, state, expiresAt, snapshotId, schemaVersion, reason,
     )
 
-fun Application.installTableCreationRoutes(creations: TableCreationService) {
+fun Application.installTableCreationRoutes(
+    creations: TableCreationBackend,
+    selector: CatalogStoreSelector? = null,
+) {
+    fun ApplicationCall.creationBackend(): TableCreationBackend =
+        selector?.tableCreations(this, creationCatalog(), creations) ?: creations
+
     routing {
         route("/v1/catalogs/{catalog}/table-creations/{operation}") {
-            put { call.prepareCreation(creations, partitioned = false) }
-            put("/partitioned") { call.prepareCreation(creations, partitioned = true) }
-            put("/sorted") { call.prepareCreation(creations, partitioned = false, sorted = true) }
-            put("/metadata") { call.prepareCreation(creations, partitioned = false, metadata = true) }
+            put { call.prepareCreation(call.creationBackend(), partitioned = false) }
+            put("/partitioned") { call.prepareCreation(call.creationBackend(), partitioned = true) }
+            put("/sorted") { call.prepareCreation(call.creationBackend(), partitioned = false, sorted = true) }
+            put("/metadata") { call.prepareCreation(call.creationBackend(), partitioned = false, metadata = true) }
             get {
+                val creations = call.creationBackend()
                 call.requireScopedCreation(creations)
                 call.respond(creations.status(call.creationCatalog(), call.creationOperation()).toDto())
             }
             post("/commit") {
+                val creations = call.creationBackend()
                 call.requireScopedCreation(creations)
                 val request = call.receive<PublishTableCreationDto>()
                 call.respond(
@@ -87,6 +96,7 @@ fun Application.installTableCreationRoutes(creations: TableCreationService) {
                 )
             }
             post("/commit/uploads") {
+                val creations = call.creationBackend()
                 call.requireScopedCreation(creations)
                 val request = call.receive<PublishTableCreationDto>()
                 call.respond(
@@ -98,6 +108,7 @@ fun Application.installTableCreationRoutes(creations: TableCreationService) {
                 )
             }
             post("/abort") {
+                val creations = call.creationBackend()
                 call.requireScopedCreation(creations)
                 call.respond(creations.abort(call.creationCatalog(), call.creationOperation()).toDto())
             }
@@ -106,7 +117,7 @@ fun Application.installTableCreationRoutes(creations: TableCreationService) {
 }
 
 private suspend fun ApplicationCall.prepareCreation(
-    creations: TableCreationService,
+    creations: TableCreationBackend,
     partitioned: Boolean,
     sorted: Boolean = false,
     metadata: Boolean = false,
@@ -169,7 +180,7 @@ private fun ApplicationCall.creationOperation(): UUID =
  * pointed elsewhere after the check. A creation that does not exist answers
  * 404 as it would for anyone.
  */
-private fun ApplicationCall.requireScopedCreation(creations: TableCreationService) {
+private fun ApplicationCall.requireScopedCreation(creations: TableCreationBackend) {
     if (hoglakeAuth.callerOrNull?.kind != Caller.Kind.SCOPED) return
     val creation = creations.status(creationCatalog(), creationOperation())
     requireScopedNamespaces(creationCatalog(), listOf(creation.definition.namespace))
