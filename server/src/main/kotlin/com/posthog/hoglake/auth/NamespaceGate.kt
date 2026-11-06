@@ -4,7 +4,9 @@ import com.posthog.hoglake.api.BlockingDispatchPhase
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.NamespaceContainment
 import com.posthog.hoglake.observability.Metrics
+import com.posthog.hoglake.store.CatalogStoreSelector
 import io.ktor.server.application.Application
+import io.ktor.server.application.ApplicationCall
 import io.ktor.server.application.ApplicationCallPipeline
 import io.ktor.server.application.call
 import io.ktor.server.request.httpMethod
@@ -47,6 +49,36 @@ fun Application.installNamespaceGate(
     dataPath: (catalog: String) -> String? = { null },
     containment: (catalog: String, namespace: String) -> NamespaceContainment?,
 ) {
+    installCallNamespaceGate(
+        dataPath = { _, catalog -> dataPath(catalog) },
+        containment = { _, catalog, namespace -> containment(catalog, namespace) },
+    )
+}
+
+/** Resolve both scoped lookups through the current request's verified placement. */
+fun Application.installNamespaceGate(selector: CatalogStoreSelector) {
+    installCallNamespaceGate(
+        dataPath = { call, catalog ->
+            try {
+                selector.forCatalog(call, catalog).getCatalog(catalog).dataPath
+            } catch (_: HoglakeException.NotFound) {
+                null
+            }
+        },
+        containment = {
+                call,
+                catalog,
+                namespace,
+            ->
+            selector.forCatalog(call, catalog).liveContainment(catalog, namespace)
+        },
+    )
+}
+
+private fun Application.installCallNamespaceGate(
+    dataPath: (ApplicationCall, String) -> String?,
+    containment: (ApplicationCall, String, String) -> NamespaceContainment?,
+) {
     // After the blocking dispatcher, so the read runs admitted on it. An
     // application without one (a test harness) gets the gate right after
     // Plugins, which is still before routing.
@@ -60,7 +92,7 @@ fun Application.installNamespaceGate(
         val pending = call.attributes.getOrNull(PendingNamespaceKey) ?: return@intercept
         val caller = call.hoglakeAuth.callerOrNull
         val service = call.application.attributes[AuthServiceKey]
-        val held = containment(pending.catalog, pending.namespace)
+        val held = containment(call, pending.catalog, pending.namespace)
         if (caller != null && held != null &&
             caller.mayUseContained(pending.catalog, held.field, held.value, pending.required)
         ) {

@@ -18,6 +18,7 @@ import com.posthog.hoglake.service.ColumnTrees
 import com.posthog.hoglake.service.Identifiers
 import com.posthog.hoglake.service.ScanService
 import com.posthog.hoglake.store.CatalogStore
+import com.posthog.hoglake.store.CatalogStoreSelector
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
@@ -35,6 +36,18 @@ import java.time.Instant
 import java.time.format.DateTimeParseException
 import java.util.UUID
 
+/** Install the default PostgreSQL-only API without extra backend configuration. */
+fun Application.installApiRoutes(
+    store: CatalogStore,
+    instanceName: String = "",
+    instanceTotals: () -> InstanceTotals? = { null },
+    catalogTotals: () -> Map<String, CatalogTotals> = { emptyMap() },
+    uiTheme: String = "",
+) = installApiRoutes(CatalogStoreSelector(store), instanceName, instanceTotals, catalogTotals, uiTheme)
+
+/** Install the default PostgreSQL-only scan route. */
+fun Application.installScanRoutes(scan: CatalogStore) = installScanRoutes(CatalogStoreSelector(scan))
+
 /**
  * The /v1 routes, one-to-one with openapi/hoglake.yaml. Handlers only
  * translate wire <-> model and pick status codes; behavior (locking,
@@ -42,7 +55,7 @@ import java.util.UUID
  * whose HoglakeExceptions are mapped by ErrorMapping.
  */
 fun Application.installApiRoutes(
-    store: CatalogStore,
+    selector: CatalogStoreSelector,
     instanceName: String = "",
     instanceTotals: () -> InstanceTotals? = { null },
     catalogTotals: () -> Map<String, CatalogTotals> = { emptyMap() },
@@ -51,8 +64,6 @@ fun Application.installApiRoutes(
     // The handlers keep the receiver names `catalogs.` and `commits.`.
     // CommitConflictSpecParityTest and CatalogDropSpecParityTest count call
     // sites by these names. Both names refer to the one CatalogStore.
-    val catalogs: CatalogStore = store
-    val commits: CatalogStore = store
     routing {
         get("/v1/info") {
             // Totals come from the metrics sampler's last pass — never
@@ -104,13 +115,16 @@ fun Application.installApiRoutes(
                 // token reads the whole fleet's catalog roster off the first
                 // request it makes. Under HOGLAKE_AUTH_MODE=off the caller is
                 // null and the filter is "everything", i.e. today's behaviour.
-                val totals = catalogTotals()
+                val listing = selector.forListing(call)
+                val catalogs = listing.store
+                // The sampler reads PostgreSQL only. Catalog names are not unique across backends.
+                val totals = if (listing.usePostgresTotals) catalogTotals() else emptyMap()
                 val visible =
                     when (val auth = call.hoglakeAuth) {
                         is AuthState.Off -> null
                         // Only reachable in `warn`, which lets a refusal through.
                         is AuthState.Anonymous -> emptySet()
-                        is AuthState.Authenticated -> auth.caller.visibleCatalogs()
+                        is AuthState.Authenticated -> listing.catalogs
                     }
                 // Totals are catalog-wide, so a scoped caller gets none.
                 val scoped = (call.hoglakeAuth as? AuthState.Authenticated)?.caller?.kind == Caller.Kind.SCOPED
@@ -118,6 +132,7 @@ fun Application.installApiRoutes(
             }
             post {
                 val req = call.receive<CreateCatalogRequestDto>()
+                val catalogs = selector.forCatalog(call, req.name)
                 call.respond(
                     HttpStatusCode.Created,
                     catalogs.createCatalog(req.name, req.dataPath, call.actorOrRefuse(req.author), req.message).toDto(),
@@ -126,9 +141,11 @@ fun Application.installApiRoutes(
 
             route("/{catalog}") {
                 get {
+                    val catalogs = selector.forCatalog(call, call.catalog())
                     call.respond(catalogs.getCatalog(call.catalog()).toDto())
                 }
                 delete {
+                    val catalogs = selector.forCatalog(call, call.catalog())
                     call.respond(
                         catalogs.dropCatalog(
                             call.catalog(),
@@ -139,6 +156,7 @@ fun Application.installApiRoutes(
                 }
 
                 get("/storage-usage") {
+                    val catalogs = selector.forCatalog(call, call.catalog())
                     // A footprint has no read snapshot: historical/dropped registrations
                     // remain tracked until their manifest rows are physically removed.
                     if (call.request.queryParameters.contains("snapshot") ||
@@ -151,6 +169,7 @@ fun Application.installApiRoutes(
 
                 route("/namespaces") {
                     get {
+                        val catalogs = selector.forCatalog(call, call.catalog())
                         val catalog = call.catalog()
                         // A scoped caller sees only the contained namespaces
                         // it may use (AuthPolicy.SCOPED_ROUTES); everyone
@@ -170,6 +189,7 @@ fun Application.installApiRoutes(
                         )
                     }
                     post {
+                        val catalogs = selector.forCatalog(call, call.catalog())
                         val req = call.receive<CreateNamespaceRequestDto>()
                         call.respond(
                             HttpStatusCode.Created,
@@ -182,11 +202,13 @@ fun Application.installApiRoutes(
                         )
                     }
                     get("/{namespace}") {
+                        val catalogs = selector.forCatalog(call, call.catalog())
                         call.respond(
                             catalogs.getNamespace(call.catalog(), call.namespace()).toDto(),
                         )
                     }
                     delete("/{namespace}") {
+                        val catalogs = selector.forCatalog(call, call.catalog())
                         call.respond(
                             catalogs.dropNamespace(
                                 call.catalog(),
@@ -202,6 +224,7 @@ fun Application.installApiRoutes(
                     }
                     // Containment (V33): operator-only in AuthPolicy.
                     put("/{namespace}/containment") {
+                        val catalogs = selector.forCatalog(call, call.catalog())
                         val req = call.receive<NamespaceContainmentDto>()
                         call.respond(
                             catalogs.setNamespaceContainment(
@@ -213,6 +236,7 @@ fun Application.installApiRoutes(
                         )
                     }
                     delete("/{namespace}/containment") {
+                        val catalogs = selector.forCatalog(call, call.catalog())
                         call.respond(
                             catalogs.setNamespaceContainment(
                                 call.catalog(),
@@ -224,6 +248,7 @@ fun Application.installApiRoutes(
                     }
                     route("/{namespace}/tables") {
                         get {
+                            val catalogs = selector.forCatalog(call, call.catalog())
                             call.respond(
                                 catalogs.listTables(
                                     call.catalog(),
@@ -234,6 +259,7 @@ fun Application.installApiRoutes(
                             )
                         }
                         post {
+                            val catalogs = selector.forCatalog(call, call.catalog())
                             val req = call.receive<CreateTableRequestDto>()
                             call.respond(
                                 HttpStatusCode.Created,
@@ -250,6 +276,7 @@ fun Application.installApiRoutes(
 
                         route("/{table}") {
                             get {
+                                val catalogs = selector.forCatalog(call, call.catalog())
                                 call.respond(
                                     catalogs.getTable(
                                         call.catalog(),
@@ -269,6 +296,7 @@ fun Application.installApiRoutes(
                                 )
                             }
                             delete {
+                                val catalogs = selector.forCatalog(call, call.catalog())
                                 call.respond(
                                     catalogs.dropTable(
                                         call.catalog(),
@@ -281,6 +309,7 @@ fun Application.installApiRoutes(
                                 )
                             }
                             post("/truncate") {
+                                val catalogs = selector.forCatalog(call, call.catalog())
                                 val expected =
                                     call.expectedTableUuid()
                                         ?: throw BadRequestException("expected_table_uuid is required")
@@ -310,6 +339,7 @@ fun Application.installApiRoutes(
                                 )
                             }
                             get("/files") {
+                                val catalogs = selector.forCatalog(call, call.catalog())
                                 val sort =
                                     call.request.queryParameters["sort"]?.let {
                                         FileRepo.FileSortColumn.fromWire(it)
@@ -393,6 +423,7 @@ fun Application.installApiRoutes(
                                 )
                             }
                             get("/partitions/values") {
+                                val catalogs = selector.forCatalog(call, call.catalog())
                                 call.respond(
                                     catalogs.partitionValues(
                                         call.catalog(),
@@ -404,6 +435,7 @@ fun Application.installApiRoutes(
                                 )
                             }
                             get("/files/{fileId}/stats") {
+                                val catalogs = selector.forCatalog(call, call.catalog())
                                 call.respond(
                                     catalogs.fileStats(
                                         call.catalog(),
@@ -416,6 +448,7 @@ fun Application.installApiRoutes(
                                 )
                             }
                             get("/changes") {
+                                val catalogs = selector.forCatalog(call, call.catalog())
                                 val from =
                                     call.longQuery("from_snapshot")
                                         ?: throw BadRequestException(
@@ -436,6 +469,7 @@ fun Application.installApiRoutes(
                 }
 
                 get("/snapshots/resolve") {
+                    val catalogs = selector.forCatalog(call, call.catalog())
                     val at =
                         call.instantQuery("at_timestamp")
                             ?: throw BadRequestException("query parameter 'at_timestamp' is required")
@@ -443,6 +477,7 @@ fun Application.installApiRoutes(
                 }
 
                 get("/snapshots") {
+                    val catalogs = selector.forCatalog(call, call.catalog())
                     val after = call.longQuery("after") ?: 0L
                     val before = call.longQuery("before")
                     val limit = (call.intQuery("limit") ?: 1000).coerceAtMost(10_000)
@@ -454,6 +489,7 @@ fun Application.installApiRoutes(
                 // Dedicated endpoint prevents old servers silently ignoring the
                 // new request key and degrading retries to at-least-once.
                 post("/commit/prepared") {
+                    val commits = selector.forCatalog(call, call.catalog())
                     val req = call.receiveCommit()
                     if (req.idempotencyKey == null) {
                         throw com.posthog.hoglake.model.HoglakeException.Validation("idempotency_key is required")
@@ -465,6 +501,7 @@ fun Application.installApiRoutes(
 
                 // Distinct endpoint fences replicas that predate the DELETE contract.
                 post("/commit/deletes/prepared") {
+                    val commits = selector.forCatalog(call, call.catalog())
                     val req = call.receiveCommit()
                     if (req.idempotencyKey == null || req.readSnapshot == null || req.appends.isNotEmpty() ||
                         req.deletes.isEmpty() || req.deletes.any { it.expectedTableUuid == null }
@@ -485,6 +522,7 @@ fun Application.installApiRoutes(
                 // A separate endpoint fences old replicas and includes the stronger
                 // conflict contract in the durable full-payload receipt.
                 post("/commit/mutations/prepared") {
+                    val commits = selector.forCatalog(call, call.catalog())
                     val req = call.receiveCommit()
                     if (req.idempotencyKey == null || req.readSnapshot == null || req.deletes.isEmpty() ||
                         req.deletes.any { it.expectedTableUuid == null } ||
@@ -504,6 +542,7 @@ fun Application.installApiRoutes(
                 }
 
                 post("/commit/uploads") {
+                    val commits = selector.forCatalog(call, call.catalog())
                     val req = call.receiveCommit()
                     if (req.idempotencyKey == null || req.readSnapshot == null ||
                         req.appends.any { it.expectedTableUuid == null } ||
@@ -529,6 +568,7 @@ fun Application.installApiRoutes(
                 // append-only transaction keeps the ordinary DDL-only
                 // conflict rule and does not 409 on a concurrent INSERT.
                 post("/commit/transaction") {
+                    val commits = selector.forCatalog(call, call.catalog())
                     val req = call.receiveCommit()
                     if (req.idempotencyKey == null || req.readSnapshot == null ||
                         req.appends.any { it.expectedTableUuid == null } ||
@@ -549,6 +589,7 @@ fun Application.installApiRoutes(
                 }
 
                 get("/commit/receipts/{operation}") {
+                    val commits = selector.forCatalog(call, call.catalog())
                     val operation =
                         try {
                             UUID.fromString(call.parameters["operation"])
@@ -560,6 +601,7 @@ fun Application.installApiRoutes(
                 }
 
                 post("/commit") {
+                    val commits = selector.forCatalog(call, call.catalog())
                     val req = call.receiveCommit()
                     call.respond(
                         commits.commit(call.catalog(), req.toModel(), call.request.userAgent()).toDto(),
@@ -567,6 +609,7 @@ fun Application.installApiRoutes(
                 }
 
                 get("/consumers") {
+                    val catalogs = selector.forCatalog(call, call.catalog())
                     call.respond(
                         catalogs.listConsumers(call.catalog()).toConsumerListDto(),
                     )
@@ -574,12 +617,14 @@ fun Application.installApiRoutes(
 
                 route("/consumers/{consumer}/offsets") {
                     get {
+                        val catalogs = selector.forCatalog(call, call.catalog())
                         call.respond(
                             catalogs.listOffsets(call.catalog(), call.consumer())
                                 .map { it.toDto() },
                         )
                     }
                     get("/{tableUuid}") {
+                        val catalogs = selector.forCatalog(call, call.catalog())
                         call.respond(
                             catalogs.getOffset(
                                 call.catalog(),
@@ -589,6 +634,7 @@ fun Application.installApiRoutes(
                         )
                     }
                     put("/{tableUuid}") {
+                        val catalogs = selector.forCatalog(call, call.catalog())
                         val tableUuid = call.uuidPath("tableUuid")
                         val req = call.receive<CommitOffsetRequestDto>()
                         call.respond(
@@ -614,9 +660,11 @@ fun Application.installApiRoutes(
  * stored row-group start offsets. Installed separately so App.kt wires
  * it with its own CatalogStore.
  */
-fun Application.installScanRoutes(scan: CatalogStore) {
+fun Application.installScanRoutes(selector: CatalogStoreSelector) {
     routing {
         get("/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/scan") {
+            val scan = selector.forCatalog(call, call.catalog())
+
             // getAll, joined: Parameters[...] is only the FIRST occurrence,
             // so a repeated `stats_fields=3&stats_fields=7` would silently
             // drop field 7's bounds and a second, misspelt `include` would

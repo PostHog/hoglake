@@ -82,12 +82,7 @@ fun interface HogliteTenantResolver {
  * tenant holds a catalog. Cross-catalog rules (unique names, disjoint
  * data paths) belong to the component that owns the catalogs.
  *
- * It implements [CatalogStore], the seam the core routes call. It is not
- * wired into the server yet: nothing constructs this class outside tests.
- *
- * Not verified against a live engine. No production path uses this class.
- * Conformance tests against a real hoglited must pass before the server
- * uses it.
+ * It implements [CatalogStore], the seam used by the request-scoped backend selector.
  */
 class HogliteCatalogStore(
     internal val client: HogliteClient,
@@ -95,6 +90,11 @@ class HogliteCatalogStore(
     private val tenants: HogliteTenantResolver,
     /** CommitService's blind-partitioned-append enforcement flag, for the commit port. */
     internal val refuseBlindPartitionedAppends: Boolean = false,
+    internal val ledgerRetentionSeconds: Long = com.posthog.hoglake.service.CleanupService.LEDGER_RETENTION_SECONDS,
+    internal val smallFileThresholdBytes: Long = 512L * 1024 * 1024,
+    internal val minInputFiles: Int = com.posthog.hoglake.compaction.CompactionGrouping.DEFAULT_MIN_INPUT_FILES,
+    internal val maxInputFiles: Int = com.posthog.hoglake.compaction.CompactionGrouping.DEFAULT_MAX_INPUT_FILES,
+    internal val partitionLookupAdmission: HoglitePartitionLookupAdmission = HoglitePartitionLookupAdmission(),
 ) : CatalogStore {
     internal val json: ObjectMapper = jacksonObjectMapper()
 
@@ -153,6 +153,7 @@ class HogliteCatalogStore(
         binding.missing?.let { throw it }
     }
 
+    /** Run blocking work only. Never suspend or change threads inside [body]. */
     internal inline fun <T> catalogOperation(
         catalog: String,
         creating: Boolean = false,
@@ -264,7 +265,7 @@ class HogliteCatalogStore(
      */
     override fun listCatalogs(visible: Set<String>?): List<CatalogInfo> {
         // TODO(wiring): a null visible set ("all catalogs") comes with auth off and from operator callers.
-        // This adapter keeps no catalog list, so it refuses that request. The wiring PR must design
+        // This adapter keeps no catalog list, so it refuses that request. A later change must design
         // the answer, for example a catalog list from the routing source.
         val names =
             visible ?: throw HoglakeException.Validation(
@@ -919,11 +920,11 @@ class HogliteCatalogStore(
      * hoglite has no per-statement timeout. The bound is a deadline of
      * [CatalogService.CONTAINMENT_SCAN_TIMEOUT_MS], checked before each
      * read, so one read can run past it by the client's retry budget. An
-     * expired deadline refuses the mark with ContainmentUnverified (503
-     * `containment_unverified`). So does a BackendUnavailable from a scan
-     * read: the engine's query guard (504 `query_timeout`, 413
-     * `result_too_large`, 507 `out_of_memory`) and a client timeout
-     * both surface as one. The namespace is never marked unverified.
+     * expired local deadline refuses the mark with ContainmentUnverified
+     * (503 `containment_unverified`). Transport uncertainty has the same result.
+     * Deterministic engine limits (`query_timeout`, `result_too_large`,
+     * `out_of_memory`) remain final 422 refusals, including during this scan.
+     * No failed scan marks the namespace.
      */
     private fun foreignPathUnderPrefix(
         catalog: String,
@@ -1514,24 +1515,60 @@ class HogliteCatalogStore(
                     " AND EXISTS (SELECT 1 FROM json_each(f.partition_values_json) pv " +
                         "WHERE pv.key = $keyIndex AND pv.value = ?)"
                 }
-            val sql =
+            val prefix =
                 "SELECT ${HogliteSql.FILE_COLUMNS} FROM files f WHERE f.table_id = ? " +
-                    "AND f.begin_snapshot <= ? AND (f.end_snapshot IS NULL OR f.end_snapshot > ?)" +
-                    partitionWhere + " ORDER BY $orderBy" +
-                    if (limit != null) " LIMIT ? OFFSET ?" else ""
-            val args =
+                    "AND f.begin_snapshot <= ? AND (f.end_snapshot IS NULL OR f.end_snapshot > ?)" + partitionWhere
+            val baseArgs =
                 buildList<Any?> {
                     add(t.tableId)
                     add(at)
                     add(at)
                     partitionFilter.entries.sortedBy { it.key }.forEach { add(it.value) }
-                    if (limit != null) {
-                        add(limit)
-                        add(offset)
-                    }
                 }
-            val page =
-                queryCatalog(catalog, sql, *args.toTypedArray()).rows.map { toFileRow(it) }
+            val page = mutableListOf<FileRow>()
+            var last: List<Any?>? = null
+            var remaining = limit ?: Int.MAX_VALUE
+            while (remaining > 0) {
+                val cursor = last
+                val cursorArgs = mutableListOf<Any?>()
+                val after =
+                    if (cursor == null) {
+                        ""
+                    } else if (sort == null) {
+                        cursorArgs.addAll(listOf(cursor[14], cursor[7], cursor[0]))
+                        " AND (f.begin_snapshot, f.row_id_start, f.id) > (?, ?, ?)"
+                    } else {
+                        val key =
+                            cursor[
+                                when (sort) {
+                                    FileRepo.FileSortColumn.ID -> 0
+                                    FileRepo.FileSortColumn.PATH -> 2
+                                    FileRepo.FileSortColumn.RECORD_COUNT -> 4
+                                    FileRepo.FileSortColumn.SIZE -> 5
+                                    FileRepo.FileSortColumn.STATS -> 11
+                                    FileRepo.FileSortColumn.BEGIN_SNAPSHOT -> 14
+                                },
+                            ]
+                        cursorArgs.addAll(listOf(key, key, cursor[0]))
+                        val comparison = if (desc) "<" else ">"
+                        " AND (${sortColumnSql(sort)} $comparison ? OR (${sortColumnSql(sort)} = ? AND f.id > ?))"
+                    }
+                val count = minOf(remaining, SCAN_PAGE_SIZE)
+                val initialOffset = if (last == null && limit != null) offset else 0
+                val rows =
+                    queryCatalog(
+                        catalog,
+                        prefix + after + " ORDER BY $orderBy LIMIT ? OFFSET ?",
+                        *(baseArgs + cursorArgs + listOf(count, initialOffset)).toTypedArray(),
+                    ).rows
+                page.addAll(rows.map { toFileRow(it) })
+                remaining -= rows.size
+                if (rows.size < count) break
+                last = rows.last()
+            }
+            if (meta(catalog).earliestSnapshotId > at) {
+                throw HoglakeException.Expired("snapshot $at expired while listing files")
+            }
             return withOrderingBounds(catalog, t.tableId, at, page)
         }
 
@@ -1671,38 +1708,88 @@ class HogliteCatalogStore(
                 )
             }
             // Compaction outputs rewrite rows that consumers already receive through the original files.
-            val files =
-                queryCatalog(
-                    catalog,
-                    "SELECT ${HogliteSql.CHANGEFEED_FILE_COLUMNS} FROM files f " +
-                        "WHERE f.table_id = ? AND f.begin_snapshot > ? AND f.begin_snapshot <= ? " +
-                        "AND NOT EXISTS (SELECT 1 FROM changes c WHERE c.snapshot_id = f.begin_snapshot " +
-                        "AND c.kind = 'table_compacted' AND c.object_id = f.table_id) " +
-                        "ORDER BY f.begin_snapshot, f.id",
-                    t.tableId,
-                    fromSnapshot,
-                    to,
-                ).rows.map { toDataFile(it) }
-            val dvs =
-                queryCatalog(
-                    catalog,
-                    "SELECT delete_file_id, data_file_id, path, delete_count, file_size_bytes, begin_snapshot " +
-                        "FROM dvs WHERE table_id = ? AND begin_snapshot > ? AND begin_snapshot <= ? " +
-                        "ORDER BY begin_snapshot, delete_file_id",
-                    t.tableId,
-                    fromSnapshot,
-                    to,
-                ).rows.map { r ->
-                    DeleteFile(
-                        deleteFileId = r[0].asLong(),
-                        dataFileId = r[1].asLong(),
-                        path = r[2].asString(),
-                        fileFormat = "puffin",
-                        deleteCount = r[3].asLong(),
-                        fileSizeBytes = r[4].asLong(),
-                        beginSnapshot = r[5].asLong(),
-                    )
-                }
+            val files = mutableListOf<DataFile>()
+            var fileCursor: Pair<Long, Long>? = null
+            while (true) {
+                val cursor = fileCursor
+                val lower =
+                    if (cursor == null) {
+                        "f.begin_snapshot > ?"
+                    } else {
+                        "(f.begin_snapshot, f.id) > (?, ?)"
+                    }
+                val args =
+                    buildList<Any?> {
+                        add(t.tableId)
+                        if (cursor == null) {
+                            add(fromSnapshot)
+                        } else {
+                            add(cursor.first)
+                            add(cursor.second)
+                        }
+                        add(to)
+                        add(SCAN_PAGE_SIZE)
+                    }
+                val rows =
+                    queryCatalog(
+                        catalog,
+                        "SELECT ${HogliteSql.CHANGEFEED_FILE_COLUMNS} FROM files f " +
+                            "WHERE f.table_id = ? AND $lower AND f.begin_snapshot <= ? " +
+                            "AND NOT EXISTS (SELECT 1 FROM changes c WHERE c.snapshot_id = f.begin_snapshot " +
+                            "AND c.kind = 'table_compacted' AND c.object_id = f.table_id)" +
+                            " ORDER BY f.begin_snapshot, f.id LIMIT ?",
+                        *args.toTypedArray(),
+                    ).rows
+                files.addAll(rows.map { toDataFile(it) })
+                if (rows.size < SCAN_PAGE_SIZE) break
+                fileCursor = rows.last().let { it[14].asLong() to it[0].asLong() }
+            }
+            val dvs = mutableListOf<DeleteFile>()
+            var dvCursor: Pair<Long, Long>? = null
+            while (true) {
+                val cursor = dvCursor
+                val lower =
+                    if (cursor == null) {
+                        "begin_snapshot > ?"
+                    } else {
+                        "(begin_snapshot, delete_file_id) > (?, ?)"
+                    }
+                val args =
+                    buildList<Any?> {
+                        add(t.tableId)
+                        if (cursor == null) {
+                            add(fromSnapshot)
+                        } else {
+                            add(cursor.first)
+                            add(cursor.second)
+                        }
+                        add(to)
+                        add(SCAN_PAGE_SIZE)
+                    }
+                val rows =
+                    queryCatalog(
+                        catalog,
+                        "SELECT delete_file_id, data_file_id, path, delete_count, file_size_bytes, begin_snapshot " +
+                            "FROM dvs WHERE table_id = ? AND $lower AND begin_snapshot <= ?" +
+                            " ORDER BY begin_snapshot, delete_file_id LIMIT ?",
+                        *args.toTypedArray(),
+                    ).rows
+                dvs.addAll(
+                    rows.map { r ->
+                        DeleteFile(
+                            deleteFileId = r[0].asLong(),
+                            dataFileId = r[1].asLong(),
+                            path = r[2].asString(),
+                            fileFormat = "puffin",
+                            deleteCount = r[3].asLong(),
+                            fileSizeBytes = r[4].asLong(),
+                            beginSnapshot = r[5].asLong(),
+                        )
+                    },
+                )
+                if (rows.size < SCAN_PAGE_SIZE) break
+                dvCursor = rows.last().let { it[5].asLong() to it[0].asLong() }
+            }
             // Expiry can purge barriers or ended files/DVs between these reads.
             // Their snapshots precede the floor. Recheck the exclusive lower bound before returning.
             requireRetained(meta(catalog).earliestSnapshotId)
@@ -2461,6 +2548,13 @@ class HogliteCatalogStore(
             at,
         ).firstRow()?.get(0)?.asLong()
 
+    /** table_id -> live object-prefix field id, for every table whose option is on at head (LayoutRepo.live). */
+    internal fun liveLayouts(catalog: String): Map<Long, Long> =
+        queryCatalog(
+            catalog,
+            "SELECT table_id, object_prefix_field_id FROM table_layouts WHERE end_snapshot IS NULL",
+        ).rows.associate { it[0].asLong() to it[1].asLong() }
+
     /**
      * The tenant the CURRENT operation on [catalog] is bound to. Only
      * valid inside [catalogOperation]; a value derived from it (a cursor
@@ -2570,6 +2664,75 @@ class HogliteCatalogStore(
         }
     }
 
+    // ---- backends over the same tenant -------------------------------------
+
+    /** Upload claims (claim/renew/abandon/expiry sweep) on this store's tenant tables. */
+    internal val uploads: HogliteUploads by lazy { HogliteUploads(this, ledgerRetentionSeconds) }
+
+    /** Atomic table creations (prepare/publish/abort receipts) on this store's tenant tables. */
+    internal val tableCreations: HogliteTableCreations by lazy { HogliteTableCreations(this) }
+
+    /** ALTER TABLE on this store's tenant tables. */
+    internal val alters: HogliteAlters by lazy { HogliteAlters(this) }
+    internal val views: HogliteViews by lazy { HogliteViews(this) }
+
+    /**
+     * One table-creation receipt, with lazy expiry applied: a `prepared`
+     * receipt past its expires_at is aborted with reason `expired` on
+     * the touch (the Postgres path's `load`, verbatim).
+     */
+    internal fun loadCreationOrThrow(
+        catalog: String,
+        operationId: UUID,
+    ): com.posthog.hoglake.service.TableCreation {
+        val now = HogliteSchema.now()
+        runTx(
+            catalog,
+            freshTxid("creation-expire"),
+            null,
+            HogliteTx().apply {
+                add(
+                    "UPDATE table_creations SET state = 'aborted', reason = 'expired' " +
+                        "WHERE operation = ? AND state = 'prepared' AND expires_at <= ?",
+                    operationId.toString(),
+                    now,
+                )
+            },
+        )
+        val row =
+            queryCatalog(
+                catalog,
+                "SELECT table_uuid, definition_json, write_path, state, expires_at, snapshot_id, " +
+                    "schema_version, reason FROM table_creations WHERE operation = ?",
+                operationId.toString(),
+            ).firstRow()
+                ?: throw HoglakeException.NotFound("table creation operation '$operationId'")
+        val definition =
+            com.posthog.hoglake.service.TableCreationDefinitionCodec.decode(
+                row[1].asString(),
+                "table creation operation $operationId",
+            )
+        return com.posthog.hoglake.service.TableCreation(
+            operationId,
+            UUID.fromString(row[0].asString()),
+            definition,
+            com.posthog.hoglake.model.initialColumns(definition.columns),
+            row[2].asString(),
+            row[3].asString(),
+            HogliteSchema.parse(row[4].asString()),
+            row[5].asLongOrNull(),
+            row[6].asLongOrNull(),
+            row[7] as? String,
+        )
+    }
+
+    internal val partitions: HoglitePartitions by lazy {
+        HoglitePartitions(this, smallFileThresholdBytes, minInputFiles, maxInputFiles)
+    }
+    internal val partitionLookup: HoglitePartitionLookup by lazy {
+        HoglitePartitionLookup(this, admission = partitionLookupAdmission)
+    }
+
     // ---- transports --------------------------------------------------------
 
     /**
@@ -2666,29 +2829,27 @@ class HogliteCatalogStore(
     internal fun mapRejected(
         catalog: String,
         r: HogliteRejected,
-    ): HoglakeException =
-        when (r.status) {
-            404 -> missingCatalog(catalog)
-            // A 422 reaching here is hoglite's labelled `refused`: a SQL
-            // error (constraint violation, malformed statement) that
-            // rolled back. The client turns an unlabelled 422 into
-            // CommitOutcomeUnknown, so this arm never sees a commit that
-            // may be durable. Both causes are this store's bug or a bad
-            // input the guards should have named; surface as Validation
-            // with the engine's message rather than a bare 500.
-            422 -> {
-                // The body is hoglite's {"error": "..."}; surface the
-                // engine's message, not raw JSON, into the API error.
-                val detail =
-                    try {
-                        json.readTree(r.body).get("error")?.asText()
-                    } catch (_: Exception) {
-                        null
-                    }
-                HoglakeException.Validation("hoglite refused the statement: ${detail ?: r.body}")
-            }
-            else -> HoglakeException.BackendUnavailable("hoglite answered ${r.status}: ${r.body}")
+    ): HoglakeException {
+        val body = runCatching { json.readTree(r.body) }.getOrNull()
+        val code = body?.get("code")?.asText()
+        val detail = body?.get("error")?.asText() ?: r.body
+        return when {
+            r.status == 404 -> missingCatalog(catalog)
+            code == "result_too_large" ->
+                HoglakeException.BackendResultTooLarge(
+                    "hoglite result exceeds the engine limit; narrow the request: $detail",
+                )
+            code == "query_timeout" ->
+                HoglakeException.BackendQueryTimeout(
+                    "hoglite query exceeded the engine deadline; narrow the request: $detail",
+                )
+            // /query's bare 409 is SQL refusal; readTx also normalizes refused 422 to 409.
+            code in setOf("refused", "out_of_memory") || r.status in setOf(400, 409, 422) ->
+                HoglakeException.Validation("hoglite refused the statement: $detail")
+            // An unclassified engine/proxy server failure is not a deterministic request refusal.
+            else -> HoglakeException.BackendUnavailable("hoglite answered ${r.status}: $detail")
         }
+    }
 
     /**
      * hoglite's 404 for a tenant with no manifest. Matched on the engine's

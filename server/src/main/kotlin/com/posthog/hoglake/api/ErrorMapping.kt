@@ -80,6 +80,11 @@ private val log = KotlinLogging.logger("com.posthog.hoglake.api.ErrorMapping")
 
 internal fun errorBody(cause: HoglakeException): Pair<HttpStatusCode, ApiErrorDto> =
     when (cause) {
+        is HoglakeException.NotSupported -> HttpStatusCode.NotImplemented to apiError("not_supported_on_backend", cause)
+        is HoglakeException.BackendResultTooLarge ->
+            HttpStatusCode.UnprocessableEntity to apiError("backend_result_too_large", cause)
+        is HoglakeException.BackendQueryTimeout ->
+            HttpStatusCode.UnprocessableEntity to apiError("backend_query_timeout", cause)
         is PartitionLookupInvalidRequest -> HttpStatusCode.BadRequest to apiError("bad_request", cause)
         is PartitionLookupUnavailable ->
             HttpStatusCode.ServiceUnavailable to

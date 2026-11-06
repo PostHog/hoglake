@@ -636,8 +636,9 @@ class HogliteClient(
                     backoff()
                 }
                 else -> {
-                    // Deterministic: the pool answered and the answer is
-                    // final.
+                    // Surface other statuses without another transport attempt.
+                    // Operation-specific classification distinguishes request
+                    // refusals, unknown read failures, and ambiguous writes.
                     return finalAnswer(resp.statusCode(), resp.body())
                 }
             }
@@ -918,6 +919,19 @@ class HogliteClient(
     }
 
     companion object {
+        fun fromConfig(backend: HogliteBackend): HogliteClient =
+            HogliteClient(
+                standardUrl = backend.url,
+                whaleUrl = backend.whaleUrl,
+                ownerUrlPattern = backend.ownerUrlPattern,
+                connectTimeoutMs = backend.connectTimeoutMs,
+                readTimeoutMs = backend.readTimeoutMs,
+                commitTimeoutMs = backend.commitTimeoutMs,
+                retryBudgetMs = backend.retryBudgetMs,
+                circuitFailureThreshold = backend.circuitFailureThreshold,
+                circuitOpenMs = backend.circuitOpenMs,
+            )
+
         /** hoglite's label for a deterministic refusal (422). */
         const val CODE_REFUSED = "refused"
 

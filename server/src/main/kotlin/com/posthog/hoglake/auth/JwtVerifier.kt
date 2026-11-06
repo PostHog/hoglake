@@ -2,6 +2,7 @@ package com.posthog.hoglake.auth
 
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
+import com.posthog.hoglake.store.BackendKind
 import io.github.oshai.kotlinlogging.KotlinLogging
 import java.net.URI
 import java.net.http.HttpClient
@@ -11,6 +12,7 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.security.interfaces.ECPublicKey
 import java.time.Duration
+import java.util.UUID
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicLong
@@ -101,6 +103,7 @@ class JwksSigningKeys internal constructor(
     private val fetch: () -> ByteArray,
     private val describe: String,
     private val minRefreshIntervalMs: Long = DEFAULT_MIN_REFRESH_INTERVAL_MS,
+    private val backends: Map<UUID, BackendKind> = emptyMap(),
     private val clock: () -> Long = System::currentTimeMillis,
     private val runAsync: (() -> Unit) -> Unit = ::runOnRefreshThread,
 ) : SigningKeys {
@@ -294,6 +297,7 @@ class JwtVerifier(
      * these in `prd`. Empty means scoped tokens are refused outright.
      */
     private val predicateFields: Set<String> = emptySet(),
+    private val backends: Map<UUID, BackendKind> = emptyMap(),
     private val clock: () -> Long = { System.currentTimeMillis() / 1000 },
 ) {
     init {
@@ -363,7 +367,7 @@ class JwtVerifier(
         }
         // A token issued far in the future is not a clock-skew artifact; it is a
         // forged or mis-provisioned credential, and accepting it would let a
-        // 10-minute token be re-dated to outlive its TTL.
+        // 15-minute token be re-dated to outlive its TTL.
         val iat = claims.get("iat")?.takeIf { it.isIntegralNumber }?.asLong()
         if (iat != null && iat > now + skewSeconds) {
             throw JwtViolation(JwtViolation.NOT_YET_VALID, "token was issued ${iat - now}s in the future")
@@ -395,19 +399,21 @@ class JwtVerifier(
         val tokenId = Jwt.text(claims, "jti")
         val kindText = Jwt.text(claims, "ten")
         val clientName = Jwt.textOrNull(claims, "cli")
+        val routing = routing(claims)
 
         return when (kindText) {
             "operator" ->
                 Caller(
                     subject = subject,
-                    orgId = null,
+                    orgId = if (claims.has("rtg")) Jwt.textOrNull(claims, "org") else null,
                     kind = Caller.Kind.OPERATOR,
                     catalogScopes = emptyMap(),
                     tokenId = tokenId,
                     clientName = clientName,
+                    routing = routing,
                 )
 
-            "scoped" -> scopedCaller(claims, subject, tokenId, clientName)
+            "scoped" -> scopedCaller(claims, subject, tokenId, clientName, routing)
 
             "tenant" -> {
                 val orgId = Jwt.text(claims, "org")
@@ -442,6 +448,7 @@ class JwtVerifier(
                     tokenId = tokenId,
                     clientName = clientName,
                     delegates = delegates,
+                    routing = routing,
                 )
             }
 
@@ -450,6 +457,42 @@ class JwtVerifier(
                 "claim 'ten' must be 'tenant', 'scoped' or 'operator', got '$kindText'",
             )
         }
+    }
+
+    /** A present placement must be understood in full before it can route a request. */
+    private fun routing(claims: JsonNode): Routing? {
+        val rtg = claims.get("rtg") ?: return null
+
+        fun malformed(detail: String): Nothing = throw JwtViolation(JwtViolation.MALFORMED, detail)
+        if (!rtg.isObject) malformed("claim 'rtg' must be an object")
+        val backend =
+            BackendKind.entries.firstOrNull { rtg.get("b")?.isTextual == true && it.wire == rtg.get("b").asText() }
+                ?: malformed("rtg.b must be hoglite or postgres")
+        val expected = if (backend == BackendKind.HOGLITE) setOf("b", "be", "t") else setOf("b", "be")
+        if (rtg.properties().map { it.key }.toSet() != expected) malformed("rtg has invalid fields")
+        val idText = rtg.get("be")?.takeIf { it.isTextual }?.asText() ?: malformed("rtg.be must be a UUID string")
+        val id =
+            try {
+                UUID.fromString(idText)
+            } catch (_: IllegalArgumentException) {
+                malformed("rtg.be must be a canonical lowercase UUID")
+            }
+        if (id.toString() != idText) malformed("rtg.be must be a canonical lowercase UUID")
+        val cat = claims.get("cat")
+        if (cat == null || !cat.isObject || cat.size() != 1) malformed("rtg requires exactly one cat entry")
+        val catalog = cat.fieldNames().next()
+        val tenant =
+            if (backend == BackendKind.HOGLITE) {
+                val value = rtg.get("t")?.takeIf { it.isTextual }?.asText() ?: malformed("rtg.t must be a string")
+                if (!Regex("[A-Za-z0-9._-]{1,128}").matches(value) || value.startsWith('.') || ".." in value) {
+                    malformed("rtg.t is not a valid tenant id")
+                }
+                value
+            } else {
+                null
+            }
+        if (backends[id] != backend) throw JwtViolation(JwtViolation.UNKNOWN_BACKEND, "rtg backend is not configured")
+        return Routing(catalog, backend, id, tenant)
     }
 
     /** Optional and strictly boolean: `"dlg": "false"` is a malformed token, not a truthy string. */
@@ -477,6 +520,7 @@ class JwtVerifier(
         subject: String,
         tokenId: String,
         clientName: String?,
+        routing: Routing?,
     ): Caller {
         if (predicateFields.isEmpty()) {
             throw JwtViolation(JwtViolation.INVALID_PREDICATE, "this instance accepts no scoped tokens")
@@ -534,6 +578,7 @@ class JwtVerifier(
             delegates = delegates(claims),
             predicates = predicates(claims.get("prd")),
             user = user,
+            routing = routing,
         )
     }
 

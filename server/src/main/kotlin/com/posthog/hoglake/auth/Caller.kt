@@ -1,5 +1,8 @@
 package com.posthog.hoglake.auth
 
+import com.posthog.hoglake.store.BackendKind
+import java.util.UUID
+
 /**
  * The authenticated caller for one request, resolved from a verified token.
  *
@@ -18,7 +21,7 @@ package com.posthog.hoglake.auth
 data class Caller(
     /** `sub`: the client id (`client:…`) or service-account subject (`sa:…`). */
     val subject: String,
-    /** The org this caller acts for; null for [Kind.OPERATOR]. */
+    /** The org this caller acts for. Legacy operator tokens have none. */
     val orgId: String?,
     val kind: Kind,
     /** Catalog name -> the scopes held on it. Empty for [Kind.OPERATOR]. */
@@ -41,6 +44,8 @@ data class Caller(
     val predicates: Map<String, PredicateGrant> = emptyMap(),
     /** `usr`: an opaque end-user name for the audit log. Grants nothing. */
     val user: String? = null,
+    /** Verified placement for one catalog. Endpoints come only from server configuration. */
+    val routing: Routing? = null,
 ) {
     enum class Kind {
         /** A tenant. Every catalog it may touch is enumerated in [catalogScopes]. */
@@ -212,3 +217,11 @@ sealed interface AuthDecision {
         val required: Scope,
     ) : AuthDecision
 }
+
+/** A placement verified against the server's backend allowlist. */
+data class Routing(
+    val catalog: String,
+    val backend: BackendKind,
+    val backendId: UUID,
+    val tenant: String?,
+)

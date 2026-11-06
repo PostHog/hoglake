@@ -7,7 +7,8 @@ import com.posthog.hoglake.model.PartitionLookup
 import com.posthog.hoglake.model.PartitionLookupInvalidRequest
 import com.posthog.hoglake.model.PartitionLookupStatsState
 import com.posthog.hoglake.model.validatePartitionLookupValues
-import com.posthog.hoglake.service.PartitionLookupService
+import com.posthog.hoglake.service.PartitionLookupBackend
+import com.posthog.hoglake.store.CatalogStoreSelector
 import com.posthog.hoglake.wireObjectMapper
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
@@ -37,11 +38,15 @@ private val PartitionLookupBodyLimit =
         }
     }
 
-fun Application.installPartitionLookupRoutes(lookups: PartitionLookupService) {
+fun Application.installPartitionLookupRoutes(
+    lookups: PartitionLookupBackend,
+    selector: CatalogStoreSelector? = null,
+) {
     routing {
         route("/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/partitions/lookup") {
             install(PartitionLookupBodyLimit)
             post {
+                val lookups = selector?.partitionLookup(call, call.catalog(), lookups) ?: lookups
                 if (call.request.queryParameters.contains("at_timestamp")) {
                     throw PartitionLookupInvalidRequest("at_timestamp is unsupported; use snapshot")
                 }

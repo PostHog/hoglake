@@ -95,6 +95,7 @@ class AuthService(
                         audience = audience,
                         keys = keys,
                         skewSeconds = cfg.authClockSkewSeconds,
+                        backends = cfg.backendKinds,
                         predicateFields =
                             cfg.authPredicateFields.split(',').map { it.trim() }.filter { it.isNotEmpty() }.toSet(),
                     ),
