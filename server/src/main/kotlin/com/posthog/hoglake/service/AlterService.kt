@@ -54,16 +54,16 @@ import java.util.UUID
  * row is deleted instead of ended — it was never visible at any
  * snapshot, and end == begin would violate the schema CHECK.
  */
-class AlterService(private val jdbi: Jdbi) {
-    fun alterTable(
+class AlterService(private val jdbi: Jdbi) : AlterBackend {
+    override fun alterTable(
         catalog: String,
         namespace: String,
         table: String,
         ops: List<AlterOp>,
-        expectedTableUuid: UUID? = null,
-        readSnapshot: Long? = null,
-        author: String? = null,
-        message: String? = null,
+        expectedTableUuid: UUID?,
+        readSnapshot: Long?,
+        author: String?,
+        message: String?,
     ): TableInfo =
         Audit.audited(
             "table_alter",
