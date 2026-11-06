@@ -15,6 +15,7 @@ import com.posthog.hoglake.model.CommitRequest
 import com.posthog.hoglake.model.CommitResult
 import com.posthog.hoglake.model.ConsumerOffset
 import com.posthog.hoglake.model.ConsumerTableOffset
+import com.posthog.hoglake.model.Containment
 import com.posthog.hoglake.model.DataFile
 import com.posthog.hoglake.model.DeleteFile
 import com.posthog.hoglake.model.DroppedCatalog
@@ -22,6 +23,7 @@ import com.posthog.hoglake.model.FileColumnStats
 import com.posthog.hoglake.model.FileOrderingBounds
 import com.posthog.hoglake.model.FileStats
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.NamespaceContainment
 import com.posthog.hoglake.model.NamespaceInfo
 import com.posthog.hoglake.model.PartitionFieldDef
 import com.posthog.hoglake.model.PartitionFieldValues
@@ -578,19 +580,21 @@ class HogliteCatalogStore(
                 if (snapshot == null && atTimestamp == null) {
                     queryCatalog(
                         catalog,
-                        "SELECT id, name FROM namespaces WHERE dropped_snapshot IS NULL ORDER BY name",
+                        "SELECT $NAMESPACE_COLUMNS FROM namespaces WHERE dropped_snapshot IS NULL ORDER BY name",
                     )
                 } else {
                     val at = resolveRead(catalog, m, snapshot, atTimestamp)
+                    // The containment columns are not versioned: a pinned
+                    // read gets the current containment, as on Postgres.
                     queryCatalog(
                         catalog,
-                        "SELECT id, name FROM namespaces WHERE created_snapshot <= ? " +
+                        "SELECT $NAMESPACE_COLUMNS FROM namespaces WHERE created_snapshot <= ? " +
                             "AND (dropped_snapshot IS NULL OR dropped_snapshot > ?) ORDER BY name",
                         at,
                         at,
                     )
                 }
-            return rows.rows.map { NamespaceInfo(it[0].asLong(), it[1].asString()) }
+            return rows.rows.map { namespaceInfo(it) }
         }
 
     override fun getNamespace(
@@ -603,8 +607,11 @@ class HogliteCatalogStore(
         }
 
     /**
-     * [mayDropContained] has no effect here. This backend does not store
-     * namespace containment, so no namespace is contained.
+     * A contained namespace needs [mayDropContained]. The pre-flight row
+     * refuses first. Postgres reads containment under the commit lock that
+     * marking also takes. Here a guard in the drop transaction stands in
+     * for that lock, so a mark that lands after the pre-flight read still
+     * refuses the drop.
      */
     override fun dropNamespace(
         catalog: String,
@@ -622,7 +629,18 @@ class HogliteCatalogStore(
                     "namespace '$namespace' no longer has the expected identity",
                 )
             }
+            val containedRefusal = {
+                HoglakeException.Forbidden("namespace '$namespace' is contained; only an operator may drop it")
+            }
+            if (ns.containment != null && !mayDropContained) throw containedRefusal()
             val tx = HogliteTx()
+            if (!mayDropContained) {
+                tx.expectZero(
+                    "SELECT COUNT(*) FROM namespaces WHERE id = ? AND contained_field IS NOT NULL",
+                    ns.namespaceId,
+                    failure = containedRefusal,
+                )
+            }
             // Emptiness under hoglite's per-tenant serialization: the guard
             // runs IN the transaction that flips the flag, so the live set
             // it counts is the live set the drop commits against.
@@ -662,6 +680,390 @@ class HogliteCatalogStore(
             val row = results[readback].firstRow()!!
             return CommitResult(snapshotId = row[0].asLong(), schemaVersion = row[1].asLong())
         }
+
+    // ==================== namespace containment ============================
+
+    /**
+     * CatalogService.setNamespaceContainment on hoglite: the same
+     * refusals, with the same messages, in the same order.
+     *
+     * Postgres runs an unlocked pre-flight transaction with the prefix
+     * scan, then re-checks under the commit lock. Here the pre-flight is
+     * reads: one [readCatalog] snapshot, then the paged scan
+     * ([foreignPathUnderPrefix]). The re-check is the guards of ONE
+     * transaction. Its statements, after the drop fence:
+     *
+     *  - 0: the namespace is live, else NotFound.
+     *  - A mark, 1: the namespace is still uncontained, else CommitConflict
+     *    ("clear it first").
+     *  - A mark, 2-4: the namespace never held a table or a view, and no
+     *    other namespace has had its name.
+     *  - A mark, 5: no file, DV or undrained removal registered after the
+     *    scan sits under the prefix ([prefixRaceArms]).
+     *  - A mark, 6: no other live namespace holds the same containment,
+     *    else AlreadyExists. A unique-index violation would surface as a
+     *    422 Validation, so this guard names the refusal. The
+     *    `namespaces_live_containment` index stays as the backstop.
+     *  - A clear, 1-2: no live table or view.
+     *  - Last: the UPDATE.
+     *
+     * A clear has no state guard. Under the lock, Postgres clears the
+     * containment the namespace has at that time, and an UPDATE to NULL
+     * gives the same result. A mark that finds the namespace contained
+     * with the same value by a concurrent mark refuses with the
+     * "clear it first" conflict. Postgres returns the namespace for that
+     * race.
+     *
+     * A mark or a clear allocates no snapshot and writes no change row:
+     * on Postgres it is a plain UPDATE too. This store audits no
+     * operation, so the namespace_containment_set and _clear events stay
+     * with CatalogService.
+     */
+    override fun setNamespaceContainment(
+        catalog: String,
+        namespace: String,
+        containment: NamespaceContainment?,
+        author: String?,
+    ): NamespaceInfo =
+        catalogOperation(catalog) {
+            containment?.let {
+                if (!CONTAINMENT_FIELD.matches(it.field)) {
+                    throw HoglakeException.Validation("containment field must match ${CONTAINMENT_FIELD.pattern}")
+                }
+                if (it.value <= 0) throw HoglakeException.Validation("containment value must be a positive id")
+            }
+            val liveId = "(SELECT id FROM namespaces WHERE name = ? AND dropped_snapshot IS NULL)"
+            val pre =
+                readCatalog(
+                    catalog,
+                    listOf(
+                        HogliteStatement(metaSql),
+                        HogliteStatement(
+                            "SELECT $NAMESPACE_COLUMNS FROM namespaces WHERE name = ? AND dropped_snapshot IS NULL",
+                            listOf(namespace),
+                        ),
+                        // The scan watermark, read BEFORE the scan, so every
+                        // row the scan cannot see sits above it.
+                        HogliteStatement(
+                            "SELECT (SELECT next_file_id FROM meta WHERE id = 1), " +
+                                "(SELECT COALESCE(MAX(rowid), 0) FROM dvs), " +
+                                "(SELECT COALESCE(MAX(id), 0) FROM removals)",
+                        ),
+                        HogliteStatement(
+                            "SELECT (SELECT COUNT(*) FROM table_versions WHERE namespace_id = $liveId) + " +
+                                "(SELECT COUNT(*) FROM views WHERE namespace_id = $liveId)",
+                            listOf(namespace, namespace),
+                        ),
+                        HogliteStatement(
+                            "SELECT COUNT(*) FROM namespaces WHERE name = ? AND id <> $liveId",
+                            listOf(namespace, namespace),
+                        ),
+                    ),
+                )
+            val meta = metaRow(pre[0].firstRow() ?: throw HoglakeException.NotFound("catalog '$catalog'"))
+            val ns =
+                pre[1].firstRow()?.let { namespaceInfo(it) }
+                    ?: throw HoglakeException.NotFound("namespace '$namespace' in catalog '$catalog'")
+            if (ns.containment == containment) return ns
+            if (containment != null && ns.containment != null) throw alreadyContained(namespace, ns.containment)
+            val tx = HogliteTx()
+            tx.expectOne(
+                "SELECT COUNT(*) FROM namespaces WHERE id = ? AND dropped_snapshot IS NULL",
+                ns.namespaceId,
+            ) { HoglakeException.NotFound("namespace '$namespace' in catalog '$catalog'") }
+            if (containment != null) {
+                // The cheap refusals first, as on Postgres: a namespace that
+                // held tables is told so, not that its own files sit under
+                // its prefix.
+                if (pre[3].firstRow()!![0].asLong() > 0) throw heldRefusal(namespace)
+                if (pre[4].firstRow()!![0].asLong() > 0) throw nameReusedRefusal(namespace)
+                foreignPathUnderPrefix(catalog, meta.dataPath, namespace)?.let { throw prefixTaken(namespace, it) }
+
+                tx.expectZero(
+                    "SELECT COUNT(*) FROM namespaces WHERE id = ? AND contained_field IS NOT NULL",
+                    ns.namespaceId,
+                ) {
+                    // Runs after the rollback: this read sees the containment
+                    // that refused the mark. An if, not an Elvis: see
+                    // HogliteTx.classify.
+                    val now =
+                        queryCatalog(
+                            catalog,
+                            "SELECT contained_field, contained_value FROM namespaces WHERE id = ?",
+                            ns.namespaceId,
+                        ).firstRow()?.takeIf { it[0] != null }
+                    if (now != null) {
+                        alreadyContained(namespace, NamespaceContainment(now[0].asString(), now[1].asLong()))
+                    } else {
+                        HoglakeException.CommitConflict(
+                            "namespace '$namespace' changed containment while it was being marked; retry",
+                        )
+                    }
+                }
+                tx.expectZero("SELECT COUNT(*) FROM table_versions WHERE namespace_id = ?", ns.namespaceId) {
+                    heldRefusal(namespace)
+                }
+                tx.expectZero("SELECT COUNT(*) FROM views WHERE namespace_id = ?", ns.namespaceId) {
+                    heldRefusal(namespace)
+                }
+                tx.expectZero("SELECT COUNT(*) FROM namespaces WHERE name = ? AND id <> ?", namespace, ns.namespaceId) {
+                    nameReusedRefusal(namespace)
+                }
+                val watermark = pre[2].firstRow()!!
+                val arms =
+                    prefixRaceArms(
+                        meta.dataPath,
+                        namespace,
+                        fromFileId = watermark[0].asLong(),
+                        fromDvRowid = watermark[1].asLong(),
+                        fromRemovalId = watermark[2].asLong(),
+                    )
+                tx.expectZero(
+                    "SELECT " + arms.joinToString(" + ") { "(SELECT COUNT(*) FROM ${it.first})" },
+                    *arms.flatMap { it.second }.toTypedArray(),
+                ) {
+                    val hit =
+                        queryCatalog(
+                            catalog,
+                            arms.joinToString(" UNION ALL ") { "SELECT path FROM ${it.first}" } + " LIMIT 1",
+                            *arms.flatMap { it.second }.toTypedArray(),
+                        ).firstRow()?.get(0)?.asString()
+                    if (hit != null) {
+                        prefixTaken(namespace, hit)
+                    } else {
+                        HoglakeException.CommitConflict(
+                            "cannot mark namespace '$namespace' contained: a file was registered under its prefix " +
+                                "while it was being marked",
+                        )
+                    }
+                }
+                tx.expectZero(
+                    "SELECT COUNT(*) FROM namespaces WHERE contained_field = ? AND contained_value = ? " +
+                        "AND dropped_snapshot IS NULL AND id <> ?",
+                    containment.field,
+                    containment.value,
+                    ns.namespaceId,
+                ) {
+                    HoglakeException.AlreadyExists(
+                        "another namespace is already contained for ${containment.field} = ${containment.value}",
+                    )
+                }
+            } else {
+                val notEmpty = {
+                    HoglakeException.NamespaceNotEmpty(
+                        "namespace '$namespace' still holds tables or views; containment can only be " +
+                            "cleared from an empty namespace",
+                    )
+                }
+                tx.expectZero(
+                    "SELECT COUNT(*) FROM tables WHERE namespace_id = ? AND dropped_snapshot IS NULL",
+                    ns.namespaceId,
+                    failure = notEmpty,
+                )
+                tx.expectZero(
+                    "SELECT COUNT(*) FROM views WHERE namespace_id = ? AND dropped_snapshot IS NULL",
+                    ns.namespaceId,
+                    failure = notEmpty,
+                )
+            }
+            tx.affectOne(
+                "UPDATE namespaces SET contained_field = ?, contained_value = ? " +
+                    "WHERE id = ? AND dropped_snapshot IS NULL",
+                containment?.field,
+                containment?.value,
+                ns.namespaceId,
+            ) { HoglakeException.NotFound("namespace '$namespace' in catalog '$catalog'") }
+            runTx(catalog, freshTxid("ns-containment"), null, tx)
+            return ns.copy(containment = containment)
+        }
+
+    /**
+     * The namespace gate's read (auth/NamespaceGate.kt): one probe of the
+     * `namespaces_live` index. Null when the catalog or the namespace is
+     * missing, as CatalogService.liveContainment answers. The catch is
+     * outside the operation: a bound tenant's 404 poisons the operation,
+     * and its end raises that NotFound again.
+     */
+    override fun liveContainment(
+        catalog: String,
+        namespace: String,
+    ): NamespaceContainment? =
+        try {
+            catalogOperation(catalog) {
+                queryCatalog(
+                    catalog,
+                    "SELECT contained_field, contained_value FROM namespaces " +
+                        "WHERE name = ? AND dropped_snapshot IS NULL",
+                    namespace,
+                ).firstRow()?.takeIf { it[0] != null }?.let { NamespaceContainment(it[0].asString(), it[1].asLong()) }
+            }
+        } catch (_: HoglakeException.NotFound) {
+            null
+        }
+
+    /**
+     * Another table's file, DV, live upload claim or undrained removal
+     * under [namespace]'s prefix, in any spelling that
+     * [Containment.segments] resolves to it, or null. The unlocked pass of
+     * CatalogService's foreignFileUnderPrefix.
+     *
+     * The literal prefix is one range read per table: SQLite's BINARY
+     * collation keeps byte order, so `path >= p AND path < p'` walks the
+     * path index. SQLite has no regex, so the escaped spellings are a
+     * paged walk in path order over the paths under the root that hold a
+     * `%`. Kotlin then keeps the paths that [Containment.segments]
+     * resolves to [namespace]. The commit check uses the same decoder.
+     * Pages resume at the last path, not at an id: the path index gives
+     * the order, and a path repeated past a page edge has one verdict.
+     *
+     * hoglite has no per-statement timeout. The bound is a deadline of
+     * [CatalogService.CONTAINMENT_SCAN_TIMEOUT_MS], checked before each
+     * read, so one read can run past it by the client's retry budget. An
+     * expired deadline refuses the mark with ContainmentUnverified (503
+     * `containment_unverified`). So does a BackendUnavailable from a scan
+     * read: the engine's query guard (504 `query_timeout`, 413
+     * `result_too_large`, 507 `out_of_memory`) and a client timeout
+     * both surface as one. The namespace is never marked unverified.
+     */
+    private fun foreignPathUnderPrefix(
+        catalog: String,
+        dataPath: String,
+        namespace: String,
+    ): String? {
+        val root = dataPath.trimEnd('/') + "/"
+        val prefix = root + "data/" + namespace + "/"
+        val deadline = System.nanoTime() + CatalogService.CONTAINMENT_SCAN_TIMEOUT_MS * 1_000_000
+
+        fun unverified(cause: Throwable?) =
+            HoglakeException.ContainmentUnverified(
+                "could not check $prefix for other tables' files within its time bound; " +
+                    "the namespace was not marked",
+            ).also { e -> cause?.let { e.initCause(it) } }
+
+        fun <T> bounded(read: () -> T): T {
+            if (System.nanoTime() - deadline > 0) throw unverified(null)
+            return try {
+                read()
+            } catch (e: HoglakeException.BackendUnavailable) {
+                throw unverified(e)
+            }
+        }
+        // (table, the predicate that keeps its rows in scope). Claims and
+        // removals count only while their object can still be there.
+        val sources =
+            listOf(
+                "files" to "",
+                "dvs" to "",
+                "uploads" to " AND state = 'active'",
+                "removals" to " AND drained_at IS NULL",
+            )
+        val literal =
+            bounded {
+                readCatalog(
+                    catalog,
+                    sources.map { (table, live) ->
+                        HogliteStatement(
+                            "SELECT path FROM $table WHERE path >= ? AND path < ?$live LIMIT 1",
+                            listOf(prefix, pastPrefix(prefix)),
+                        )
+                    },
+                )
+            }
+        literal.firstNotNullOfOrNull { it.firstRow()?.get(0)?.asString() }?.let { return it }
+        for ((table, live) in sources) {
+            var after: String? = null
+            while (true) {
+                val page =
+                    bounded {
+                        queryCatalog(
+                            catalog,
+                            "SELECT path FROM $table WHERE path ${if (after == null) ">=" else ">"} ? " +
+                                "AND path < ?$live AND instr(path, '%') > 0 ORDER BY path LIMIT $CONTAINMENT_SCAN_PAGE",
+                            after ?: root,
+                            pastPrefix(root),
+                        ).rows.map { it[0].asString() }
+                    }
+                page.firstOrNull { namespace in Containment.segments(dataPath, it) }?.let { return it }
+                if (page.size < CONTAINMENT_SCAN_PAGE) break
+                after = page.last()
+            }
+        }
+        return null
+    }
+
+    /**
+     * The mark transaction's prefix guard: (FROM clause, its arguments)
+     * per arm. It closes the window between the scan and the transaction.
+     * Postgres closes it with the locked pass of foreignFileUnderPrefix.
+     *
+     * The literal arms take every row under the prefix. The scan found
+     * none, so each one there now is new. They walk the path indexes.
+     *
+     * No Kotlin runs between the statements of a hoglite transaction, so
+     * the escaped arms are a SQL superset: any path under the root that
+     * holds a `%`, on a row above the watermark. A hit refuses the mark,
+     * and a retry scans again with a new watermark. The unary `+` keeps
+     * SQLite off the path indexes: the id range is the narrow one. DVs
+     * have no index on delete_file_id, so their arm uses rowid. A
+     * rowid only grows while nothing deletes the DV with the largest
+     * rowid, and no hoglite code deletes DV rows. Claims are not
+     * re-read, as on Postgres: a claim cannot register a file into the
+     * prefix, because the commit check refuses it.
+     */
+    private fun prefixRaceArms(
+        dataPath: String,
+        namespace: String,
+        fromFileId: Long,
+        fromDvRowid: Long,
+        fromRemovalId: Long,
+    ): List<Pair<String, List<Any?>>> {
+        val root = dataPath.trimEnd('/') + "/"
+        val prefix = root + "data/" + namespace + "/"
+        val literal = listOf(prefix, pastPrefix(prefix))
+        val escaped = "+path >= ? AND +path < ? AND instr(path, '%') > 0"
+        return listOf(
+            "files WHERE path >= ? AND path < ?" to literal,
+            "dvs WHERE path >= ? AND path < ?" to literal,
+            "removals WHERE drained_at IS NULL AND path >= ? AND path < ?" to literal,
+            "files WHERE id >= ? AND $escaped" to listOf(fromFileId, root, pastPrefix(root)),
+            "dvs WHERE rowid > ? AND $escaped" to listOf(fromDvRowid, root, pastPrefix(root)),
+            "removals WHERE drained_at IS NULL AND id > ? AND $escaped" to
+                listOf(fromRemovalId, root, pastPrefix(root)),
+        )
+    }
+
+    /** The least string above every string that starts with [prefix], which ends in `/`. */
+    private fun pastPrefix(prefix: String): String {
+        check(prefix.endsWith('/')) { "prefix '$prefix' must end with '/'" }
+        // '0' follows '/' in byte order.
+        return prefix.dropLast(1) + '0'
+    }
+
+    private fun alreadyContained(
+        namespace: String,
+        current: NamespaceContainment,
+    ) = HoglakeException.CommitConflict(
+        "namespace '$namespace' is already contained for ${current.field} = ${current.value}; clear it first",
+    )
+
+    private fun heldRefusal(namespace: String) =
+        HoglakeException.NamespaceNotEmpty(
+            "namespace '$namespace' has held a table or view; only a namespace that never has can be " +
+                "marked contained",
+        )
+
+    private fun nameReusedRefusal(namespace: String) =
+        HoglakeException.CommitConflict(
+            "namespace name '$namespace' has belonged to another, dropped namespace in this catalog; " +
+                "only a name no other namespace has had can be marked contained",
+        )
+
+    private fun prefixTaken(
+        namespace: String,
+        path: String,
+    ) = HoglakeException.CommitConflict(
+        "cannot mark namespace '$namespace' contained: '$path' is already registered or claimed under its prefix",
+    )
 
     // ==================== tables ===========================================
 
@@ -849,12 +1251,12 @@ class HogliteCatalogStore(
                 } else {
                     queryCatalog(
                         catalog,
-                        "SELECT id, name FROM namespaces WHERE name = ? AND created_snapshot <= ? " +
+                        "SELECT $NAMESPACE_COLUMNS FROM namespaces WHERE name = ? AND created_snapshot <= ? " +
                             "AND (dropped_snapshot IS NULL OR dropped_snapshot > ?)",
                         namespace,
                         at,
                         at,
-                    ).firstRow()?.let { NamespaceInfo(it[0].asLong(), it[1].asString()) }
+                    ).firstRow()?.let { namespaceInfo(it) }
                         ?: throw HoglakeException.NotFound(
                             "namespace '$namespace' in catalog '$catalog' at snapshot $at",
                         )
@@ -1851,10 +2253,18 @@ class HogliteCatalogStore(
     ): NamespaceInfo =
         queryCatalog(
             catalog,
-            "SELECT id, name FROM namespaces WHERE name = ? AND dropped_snapshot IS NULL",
+            "SELECT $NAMESPACE_COLUMNS FROM namespaces WHERE name = ? AND dropped_snapshot IS NULL",
             namespace,
-        ).firstRow()?.let { NamespaceInfo(it[0].asLong(), it[1].asString()) }
+        ).firstRow()?.let { namespaceInfo(it) }
             ?: throw HoglakeException.NotFound("namespace '$namespace' in catalog '$catalog'")
+
+    /** A namespace row read with [NAMESPACE_COLUMNS]. */
+    private fun namespaceInfo(row: List<Any?>): NamespaceInfo =
+        NamespaceInfo(
+            row[0].asLong(),
+            row[1].asString(),
+            row[2]?.let { NamespaceContainment(it.asString(), row[3].asLong()) },
+        )
 
     /** A live table row as the store uses one. */
     internal class TableRow(
@@ -2344,6 +2754,23 @@ class HogliteCatalogStore(
         internal const val SCAN_MAX_METADATA_BYTES = 64L * 1024 * 1024
 
         private val CATALOG_NAME_REGEX = Regex(Identifiers.CATALOG_NAME_PATTERN)
+
+        /** The namespace columns [namespaceInfo] reads, in its order. */
+        private const val NAMESPACE_COLUMNS = "id, name, contained_field, contained_value"
+
+        /**
+         * CatalogService's containment field rule (its CONTAINMENT_FIELD is
+         * private). Keep the two the same: the hoglite CHECK has no regex,
+         * so this is the only check of the field on this backend.
+         */
+        private val CONTAINMENT_FIELD = Regex("^[a-z][a-z0-9_]{0,62}$")
+
+        /**
+         * Rows per page of the escaped-spelling pass of the containment
+         * scan. hoglite refuses a large result (413), and a path can be
+         * about 1 KiB.
+         */
+        internal const val CONTAINMENT_SCAN_PAGE = 256
 
         /** [storageUsage]'s read: no live-row predicate on files or DVs. */
         internal const val STORAGE_USAGE_SQL =

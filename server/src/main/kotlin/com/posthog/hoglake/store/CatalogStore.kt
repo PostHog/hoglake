@@ -10,6 +10,7 @@ import com.posthog.hoglake.model.ConsumerTableOffset
 import com.posthog.hoglake.model.DataFile
 import com.posthog.hoglake.model.DroppedCatalog
 import com.posthog.hoglake.model.FileStats
+import com.posthog.hoglake.model.NamespaceContainment
 import com.posthog.hoglake.model.NamespaceInfo
 import com.posthog.hoglake.model.PartitionValues
 import com.posthog.hoglake.model.ScanFile
@@ -42,8 +43,8 @@ import java.util.UUID
  * route that leaves out an argument thus gets the same value as before.
  *
  * The surface contains only operations that both implementations have.
- * Routes for backend-specific features (namespace containment, alters,
- * uploads, table creations, views, maintenance) keep their own services.
+ * Routes for backend-specific features (alters, uploads, table creations,
+ * views, maintenance) keep their own services.
  */
 interface CatalogStore {
     // ---- catalogs -------------------------------------------------------
@@ -100,6 +101,27 @@ interface CatalogStore {
         message: String? = null,
         mayDropContained: Boolean = true,
     ): CommitResult
+
+    /**
+     * Mark [namespace] contained for `field = value`, or clear it with a
+     * null [containment]. Operator-only: AuthPolicy refuses other callers.
+     */
+    fun setNamespaceContainment(
+        catalog: String,
+        namespace: String,
+        containment: NamespaceContainment?,
+        author: String? = null,
+    ): NamespaceInfo
+
+    /**
+     * The live containment of [namespace], or null. Also null when the
+     * catalog or the namespace does not exist: the namespace gate
+     * (auth/NamespaceGate.kt) then answers 404 with its own error shape.
+     */
+    fun liveContainment(
+        catalog: String,
+        namespace: String,
+    ): NamespaceContainment?
 
     // ---- tables ----------------------------------------------------------
 

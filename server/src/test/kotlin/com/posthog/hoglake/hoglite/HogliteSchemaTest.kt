@@ -27,6 +27,27 @@ class HogliteSchemaTest {
     }
 
     /**
+     * Namespace containment (Postgres V33): two nullable columns, the
+     * both-or-neither CHECK, and at most one live namespace per value.
+     * The index's WHERE matches the guards' terms, so they can use it.
+     */
+    @Test
+    fun `namespaces carry containment with its shape check and live unique index`() {
+        val ddl = normalized(HogliteSchema.DDL.single { it.contains("CREATE TABLE IF NOT EXISTS namespaces(") })
+        assertThat(ddl).contains("contained_field TEXT,", "contained_value INTEGER,")
+        assertThat(ddl).contains(
+            "CHECK ((contained_field IS NULL AND contained_value IS NULL) OR (contained_field IS NOT NULL " +
+                "AND contained_value IS NOT NULL AND contained_value > 0))",
+        )
+
+        val index = HogliteSchema.DDL.map(::normalized).filter { it.contains("namespaces_live_containment") }
+        assertThat(index).containsExactly(
+            "CREATE UNIQUE INDEX IF NOT EXISTS namespaces_live_containment ON namespaces(contained_field, " +
+                "contained_value) WHERE dropped_snapshot IS NULL AND contained_field IS NOT NULL",
+        )
+    }
+
+    /**
      * A column after a large value (stats_json is kilobytes on a wide
      * table) sits on that row's overflow pages, and SQLite walks the
      * overflow chain to read it. The visibility predicates read

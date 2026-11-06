@@ -14,6 +14,7 @@ import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnStats
 import com.posthog.hoglake.model.CommitRequest
 import com.posthog.hoglake.model.CommitResult
+import com.posthog.hoglake.model.Containment
 import com.posthog.hoglake.model.DeleteFileRegistration
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.HoglakeException
@@ -486,6 +487,18 @@ internal object HogliteCommit {
                 throw ObjectPrefixRules.violation(append.namespace, append.table, meta.dataPath, layout, violations)
             }
         }
+        // Namespace containment (CommitService step 4a'), on every
+        // registered path, data and DV, after the object-prefix check of
+        // the appends. The containment was read with the plan. The guard
+        // below refuses a namespace marked since then.
+        val containmentNames =
+            containmentNames(
+                meta.dataPath,
+                order.values.map { it.namespace },
+                allPaths.keys.toList(),
+            )
+        val contained = plan.contained().intersect(containmentNames.toSet())
+        containmentRefusal(meta.dataPath, appends, deletes, contained)?.let { throw it }
         // Deletion vectors on an option-on table live under their TARGET's
         // prefix. Computed here from immutable facts (a staged target's
         // planned values; a durable target's own spec and values), and
@@ -673,6 +686,41 @@ internal object HogliteCommit {
                             "re-prepare against current table info, replaying this request cannot succeed",
                         tables = listOf(qname),
                         readSnapshot = readSnapshot,
+                    )
+                }
+            }
+        }
+
+        // 2d. Containment marked since the plan. Postgres reads it under
+        // the commit lock that marking also takes. Here the names the
+        // plan saw uncontained must still be uncontained. The names it saw
+        // contained need no guard: a clear removes refusals and cannot
+        // add one. In practice only a foreign segment can trip this
+        // guard. The target namespaces hold the commit's tables, so a
+        // mark refuses them.
+        val uncontained = containmentNames.filter { it !in contained }
+        if (uncontained.isNotEmpty()) {
+            tx.expectZero(
+                "SELECT COUNT(*) FROM namespaces WHERE dropped_snapshot IS NULL AND contained_field IS NOT NULL " +
+                    "AND name IN (SELECT value FROM json_each(?))",
+                store.json.writeValueAsString(uncontained),
+            ) {
+                // Runs after the rollback: read the containment that
+                // refused the commit, and name the path it refuses.
+                val now =
+                    store.queryCatalog(
+                        catalog,
+                        "SELECT name FROM namespaces WHERE dropped_snapshot IS NULL " +
+                            "AND contained_field IS NOT NULL AND name IN (SELECT value FROM json_each(?))",
+                        store.json.writeValueAsString(containmentNames),
+                    ).rows.map { it[0].asString() }.toSet()
+                // An if, not an Elvis: see HogliteTx.classify.
+                val refusal = containmentRefusal(meta.dataPath, appends, deletes, now)
+                if (refusal != null) {
+                    refusal
+                } else {
+                    HoglakeException.CommitConflict(
+                        "a namespace this commit names changed containment during the commit; retry",
                     )
                 }
             }
@@ -1108,6 +1156,7 @@ internal object HogliteCommit {
         private var retainedAt: Int? = null
         private var conflictsAt: Int? = null
         private var durableAt: Int? = null
+        private var containedAt = -1
 
         private fun add(
             sql: String,
@@ -1169,6 +1218,13 @@ internal object HogliteCommit {
             }
             return ObjectPrefixLayout(fieldId, name, type)
         }
+
+        /**
+         * The live contained namespaces among the names the commit may
+         * reach. A superset of [containmentNames]: the caller intersects
+         * it with that exact set.
+         */
+        fun contained(): Set<String> = results[containedAt].rows.map { it[0].asString() }.toSet()
 
         /** The upload rows of the commit's paths. */
         fun claims(): List<List<Any?>> = claimsAt?.let { results[it].rows } ?: emptyList()
@@ -1276,6 +1332,22 @@ internal object HogliteCommit {
                 val paths = LinkedHashSet<String>()
                 appends.forEach { a -> a.files.forEach { paths += it.path } }
                 deletes.forEach { d -> d.files.forEach { paths += it.path } }
+                // The data_path is in the meta row of this same batch, so
+                // the exact names are unknown here. Every split of a path
+                // at a `/` is a candidate data_path, and the names under
+                // all of them are a superset of the exact names.
+                val candidates =
+                    touched.map { it.namespace } +
+                        paths.flatMap { path ->
+                            path.indices.filter { path[it] == '/' }
+                                .flatMap { Containment.segments(path.substring(0, it), path) }
+                        }
+                p.containedAt =
+                    p.add(
+                        "SELECT name FROM namespaces WHERE dropped_snapshot IS NULL AND contained_field IS NOT NULL " +
+                            "AND name IN (SELECT value FROM json_each(?))",
+                        listOf(store.json.writeValueAsString(candidates.distinct())),
+                    )
                 if (paths.isNotEmpty()) {
                     val inList = "SELECT value FROM json_each(?)"
                     val pathJson = store.json.writeValueAsString(paths)
@@ -1367,6 +1439,47 @@ internal object HogliteCommit {
             "WHERE name = json_extract(requested.value, '$[0]') AND dropped_snapshot IS NULL) " +
             "AND v.name = json_extract(requested.value, '$[1]') " +
             "AND v.end_snapshot IS NULL AND t.dropped_snapshot IS NULL) FROM json_each(?) requested"
+
+    /**
+     * The namespace names a commit must know the containment of: its
+     * targets' and its paths' segments. CommitService.containmentNames,
+     * which is private there.
+     */
+    private fun containmentNames(
+        dataPath: String,
+        namespaces: List<String>,
+        paths: List<String>,
+    ): List<String> = (namespaces + paths.flatMap { Containment.segments(dataPath, it) }).distinct()
+
+    /**
+     * CommitService.checkContainment over every table of the commit, in
+     * its order (appends, then deletes): the refusal of the first table
+     * with a refused path, or null. Returned, not thrown, so a guard
+     * failure can return it too.
+     */
+    private fun containmentRefusal(
+        dataPath: String,
+        appends: List<TableAppend>,
+        deletes: List<TableDeletes>,
+        contained: Set<String>,
+    ): HoglakeException.ContainmentViolation? {
+        if (contained.isEmpty()) return null
+        val tables =
+            appends.map { a -> Triple(a.namespace, a.table, a.files.map { it.path }) } +
+                deletes.map { d -> Triple(d.namespace, d.table, d.files.map { it.path }) }
+        for ((namespace, table, paths) in tables) {
+            val refused =
+                paths.mapNotNull { p -> Containment.violation(dataPath, namespace, p, contained)?.let { p to it } }
+            if (refused.isEmpty()) continue
+            val (first, why) = refused.first()
+            return HoglakeException.ContainmentViolation(
+                "$why; refused $namespace.$table path '$first'" +
+                    (if (refused.size > 1) " (+${refused.size - 1} more)" else ""),
+                "$namespace.$table",
+            )
+        }
+        return null
+    }
 
     /** The tables a guarded request's CONTENT window covers: delete targets when requireUnchangedTables. */
     private fun unchangedIds(

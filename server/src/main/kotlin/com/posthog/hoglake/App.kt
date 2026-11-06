@@ -7,7 +7,6 @@ import com.posthog.hoglake.api.installBlockingDispatch
 import com.posthog.hoglake.api.installDebugRoutes
 import com.posthog.hoglake.api.installErrorMapping
 import com.posthog.hoglake.api.installMaintenanceRoutes
-import com.posthog.hoglake.api.installNamespaceContainmentRoutes
 import com.posthog.hoglake.api.installPartitionListingRoutes
 import com.posthog.hoglake.api.installPartitionLookupRoutes
 import com.posthog.hoglake.api.installPartitionStatsRoutes
@@ -369,7 +368,7 @@ class App private constructor(
                     null
                 }
             },
-            containment = catalogService::liveContainment,
+            containment = catalogStore::liveContainment,
         )
         app.install(ContentNegotiation) {
             // One definition, shared with the tests that pin this
@@ -434,7 +433,6 @@ class App private constructor(
             catalogTotals = { catalogMetrics.latestByCatalog },
             uiTheme = cfg.uiTheme,
         )
-        app.installNamespaceContainmentRoutes(catalogService)
         app.installTableCreationRoutes(
             TableCreationService(jdbi, catalogService, commitService, cfg.commitLockTimeoutMs),
         )

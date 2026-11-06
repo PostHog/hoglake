@@ -11,6 +11,7 @@ import com.posthog.hoglake.model.ConsumerTableOffset
 import com.posthog.hoglake.model.DataFile
 import com.posthog.hoglake.model.DroppedCatalog
 import com.posthog.hoglake.model.FileStats
+import com.posthog.hoglake.model.NamespaceContainment
 import com.posthog.hoglake.model.NamespaceInfo
 import com.posthog.hoglake.model.PartitionValues
 import com.posthog.hoglake.model.ScanFile
@@ -82,6 +83,18 @@ class PostgresCatalogStore(
         message: String?,
         mayDropContained: Boolean,
     ): CommitResult = catalogs.dropNamespace(catalog, namespace, expectedNamespaceId, author, message, mayDropContained)
+
+    override fun setNamespaceContainment(
+        catalog: String,
+        namespace: String,
+        containment: NamespaceContainment?,
+        author: String?,
+    ): NamespaceInfo = catalogs.setNamespaceContainment(catalog, namespace, containment, author)
+
+    override fun liveContainment(
+        catalog: String,
+        namespace: String,
+    ): NamespaceContainment? = catalogs.liveContainment(catalog, namespace)
 
     override fun createTable(
         catalog: String,
