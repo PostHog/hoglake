@@ -7,6 +7,7 @@ import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.persistence.FileRepo
 import com.posthog.hoglake.service.CatalogService
+import com.posthog.hoglake.testing.ExplainPlan
 import com.posthog.hoglake.testing.PgTestSupport
 import com.zaxxer.hikari.HikariConfig
 import com.zaxxer.hikari.HikariDataSource
@@ -31,38 +32,54 @@ import java.sql.DriverManager
  *
  * The external database is created as `scope_plan` and kept, so a rerun
  * at the same size reuses it; the size is recorded only after the seed's
- * last step, so an interrupted seed is never reused. Real rows, not planner statistics: Postgres
- * estimates a table's rows as its density times its ACTUAL pages, so a
- * faked `reltuples` does not make a small table plan like a big one.
+ * last step, so an interrupted seed is never reused (drop `scope_plan` to
+ * reseed). Real rows, not planner statistics: Postgres estimates a table's
+ * rows as its density times its ACTUAL pages, so a faked `reltuples` does
+ * not make a small table plan like a big one.
  *
  * # The catalog
- * One catalog, the shape of `millrace-<env>`: `ingest.events` (90% of the
- * files; spec 1 identity(team_id), month(ts) for its oldest tenth, spec 2
- * identity(team_id), day(ts) after), `sidecar` (8%, the same values, so a
- * value probe is catalog-wide), and `reordered` (2%, half of it under
- * spec 2 day(ts), identity(team_id), the two-arm shape). Team 2 holds 5%
- * of the files; the rest spread over 20,000 teams whose ids overlap the
- * day ordinals. 1% pending, 0.2% quarantined, 3% ended, one live DV per
- * 50 files.
+ * One catalog, the shape of `millrace-<env>`: `ingest.events` (88% of the
+ * files; spec 1 identity(team_id), month(ts) for the oldest tenth of the
+ * ids, spec 2 identity(team_id), day(ts) after), `sidecar` (10%, the same
+ * spec), and `reordered` (2%, half of it under spec 2 day(ts),
+ * identity(team_id): the two-arm shape). Team 2 holds 5% of the files; the
+ * rest spread over 19,997 teams (a prime modulus, so every team has files
+ * in every table and state) whose ids overlap the day ordinals
+ * 19000-19999. 1% pending, 0.2% quarantined, 3% ended, one live DV per 50
+ * files.
  *
  * # The property
  * In the custom and the generic plan: each arm's ids come from
  * `hog_file_partition_value_lookup` as an InitPlan (index-only, or a
  * bitmap scan for a whale's share of the catalog), the manifest is read
- * on `hog_data_file_pkey` with `data_file_id = ANY(...)` and on no other
- * index, and nothing scans `hog_data_file` or `hog_file_partition_value`
- * sequentially. With ANALYZE, a scan reads about 20 buffers per file it
- * returns plus 2 per id its arms collect, not a number set by the table.
+ * on `hog_data_file_pkey` with `data_file_id = ANY((InitPlan n))` as one
+ * Index Cond per arm and on no other index, and no node is a sequential
+ * scan, a hash or a merge. With ANALYZE, the scan returns at most what its
+ * arms collect and reads at most 6 buffers per collected id plus 12 per
+ * returned file (measured: about 5 per scattered collected id for its
+ * primary-key probe and heap page, about 8 per returned file for its DV
+ * and partition-value probes, well under 1 per id for a contiguous run).
+ *
+ * With two or more arms the manifest is reached through a BitmapOr, and
+ * the heap scan's filter re-tests each row against its arm's array. A
+ * Param array is not hashed, so that test is linear in the array: the
+ * cost grows as rows x ids, which a whale would make unbounded. Only a
+ * table whose specs put the field at different keys has two arms; the
+ * events table has one.
  *
  * # Measured (postgres:18.6, 2026-11-09)
  * At 41M files (`hog_data_file` 744,515 heap pages, 13 GB; 82M partition
- * values, 11 GB), every plan below, custom and generic, had the shape:
+ * values, 11 GB), with the first fixture (team id mod 20000, so each team
+ * sat in one table and one state), every plan below, custom and generic,
+ * had the shape and is within the bound above:
  *  - small team: 2,050 ids collected, 1,988 returned, 26,189 buffers;
  *  - reordered, two arms: 4,100 collected, 1,987 returned, 36,475 buffers;
  *  - reordered, team 19500 = a day ordinal: the key-1 arm collected the
- *    whole day, 43,050 ids for 1,988 returned, 27,542 buffers;
+ *    whole day, 42,640 ids (43,050 with key 0) for 1,988 returned,
+ *    27,542 buffers;
  *  - whale team (5%) and a 2,001-value org: the same shape (no ANALYZE).
- * At 200k files the small team collects 10 ids and reads about 100.
+ * At 10M files with this fixture: small team 471 collected, 397 returned,
+ * 5,077 buffers; reordered 952 / 22 / 2,918; team 19500 10,475 / 10 / 2,326.
  *
  * The statement is ScanService.planScan's with the scope ANDed in, as 1.3
  * will serve it; 1.3 swaps the copy below for the real statement.
@@ -82,7 +99,7 @@ class ReadScopePlanIntegrationTest {
         val DATA_PATH = "s3://$CATALOG/$FILES"
 
         /** team_id of file g; the same expression in every statement below. */
-        const val TEAM = "(CASE WHEN g % 20 = 1 THEN 2 ELSE 1000 + (g * 7919) % 20000 END)"
+        const val TEAM = "(CASE WHEN g % 20 = 1 THEN 2 ELSE 1000 + (g * 7919) % 19997 END)"
     }
 
     private val external: HikariDataSource? = EXTERNAL?.let { externalDataSource(it) }
@@ -132,7 +149,12 @@ class ReadScopePlanIntegrationTest {
                 }
             if (!exists) conn.createStatement().use { it.execute("CREATE DATABASE $name") }
         }
-        val ds = HikariDataSource(HikariConfig().apply { jdbcUrl = url.replace("/postgres?", "/$name?") })
+        val target = url.replace("/postgres?", "/$name?")
+        // The seed drops the manifest's indexes: never run it on the database the URL names.
+        require(
+            target != url,
+        ) { "HOGLAKE_SCOPE_PLAN_JDBC_URL must name the postgres database: ...:<port>/postgres?..." }
+        val ds = HikariDataSource(HikariConfig().apply { jdbcUrl = target })
         Database.migrate(ds)
         return ds
     }
@@ -372,11 +394,11 @@ class ReadScopePlanIntegrationTest {
     ) {
         assertThat(
             plan,
-        ).doesNotContain("Seq Scan on hog_data_file").doesNotContain("Seq Scan on hog_file_partition_value")
+        ).doesNotContain("Seq Scan").doesNotContain("Hash").doesNotContain("Merge")
         val manifestIndexes = Regex("""hog_data_file_\w+""").findAll(plan).map { it.value }.toSet()
         assertThat(manifestIndexes).describedAs(plan).containsExactly("hog_data_file_pkey")
-        assertThat(Regex("""Index Cond: .*data_file_id = ANY \(""").containsMatchIn(plan))
-            .describedAs(plan).isTrue()
+        assertThat(Regex("""Index Cond: .*data_file_id = ANY \(\(InitPlan \d+\)""").findAll(plan).count())
+            .describedAs(plan).isEqualTo(scope.arms.size)
         // An index-only, index or bitmap scan of the lookup index: each names it once.
         assertThat(Regex("""(?:Scan using|Index Scan on) hog_file_partition_value_lookup\b""").findAll(plan).count())
             .describedAs(plan).isEqualTo(scope.arms.size)
@@ -386,18 +408,20 @@ class ReadScopePlanIntegrationTest {
 
     /** Rows the plan's root returned. */
     private fun returned(plan: String): Long =
-        Regex("""actual rows=([\d.]+)""").find(plan.lines().first())!!.groupValues[1].toDouble().toLong()
+        ExplainPlan.nodes(plan).first().line.let { root ->
+            Regex("""actual rows=([\d.]+)""").find(root)!!.groupValues[1].toDouble().toLong()
+        }
 
-    /** The work bound: per returned file its probes, per collected id its PK descent. */
-    private fun bound(
+    /** Buffers the plan's root reports, hit and read (its whole cost). */
+    private fun rootBuffers(plan: String): Long = ExplainPlan.nodes(plan).first().buffers
+
+    /** At most what the arms collect is returned, and the work is per collected id and returned file. */
+    private fun assertBounded(
         plan: String,
         collected: Long,
-    ): Long = 20 * returned(plan) + 2 * collected + 200
-
-    /** Buffers the plan's root reports, hit and read. */
-    private fun rootBuffers(plan: String): Long {
-        val line = plan.lines().first { it.trim().startsWith("Buffers:") }
-        return Regex("""\b(?:hit|read)=(\d+)""").findAll(line).sumOf { it.groupValues[1].toLong() }
+    ) {
+        assertThat(returned(plan)).describedAs(plan).isLessThanOrEqualTo(collected)
+        assertThat(rootBuffers(plan)).describedAs(plan).isLessThanOrEqualTo(6 * collected + 12 * returned(plan) + 200)
     }
 
     /** Files in the catalog with one of [teams] at [key]: what the arm's InitPlan collects. */
@@ -413,7 +437,27 @@ class ReadScopePlanIntegrationTest {
                 .mapTo(Long::class.java).one()
         }
 
-    private val smallTeam = 1000L + (2L * 7919) % 20000
+    private val smallTeam = 1000L + (2L * 7919) % 19997
+
+    /** A team with a live, proven file of [table] under [spec], read off the fixture. */
+    private fun teamWithFile(
+        table: String,
+        spec: Long,
+        key: Int,
+    ): Long =
+        jdbi.withHandleUnchecked { h ->
+            h.createQuery(
+                """
+                SELECT v.value::bigint FROM hog_data_file f
+                  JOIN hog_file_partition_value v ON v.catalog_id = f.catalog_id AND v.data_file_id = f.data_file_id
+                 WHERE f.catalog_id = :c AND f.table_id = :t AND f.spec_id = :s AND v.key_index = :k
+                   AND f.end_snapshot IS NULL AND f.stats_state = 'provided' AND NOT f.prefix_quarantined
+                   AND v.value <> '$WHALE'
+                 ORDER BY f.data_file_id LIMIT 1
+                """,
+            ).bind("c", catalogId).bind("t", tables.getValue(table)).bind("s", spec).bind("k", key)
+                .mapTo(Long::class.java).one()
+        }
 
     /** Rows the scoped scan returns for [teams] on [table]. */
     private fun admittedCount(
@@ -438,33 +482,39 @@ class ReadScopePlanIntegrationTest {
         assertScoped(explainGeneric(scope), scope)
         val collected = collected(listOf(smallTeam), 0)
         assertThat(collected).isGreaterThan(0)
-        // Per collected file: a primary-key probe, its heap page, its partition values and its DV probe.
-        assertThat(rootBuffers(plan)).describedAs(plan).isLessThanOrEqualTo(bound(plan, collected))
-        println("ReadScopePlan files=$FILES small team: collected=$collected buffers=${rootBuffers(plan)}\n$plan")
+        assertBounded(plan, collected)
+        println(
+            "ReadScopePlan files=$FILES small team: collected=$collected returned=${returned(plan)} " +
+                "buffers=${rootBuffers(plan)}\n$plan",
+        )
         println("ReadScopePlan files=$FILES small team, generic:\n${explainGeneric(scope)}")
     }
 
     /**
-     * Team 12900's files are g = 100 (mod 20000): all under `reordered`'s
-     * spec 2, its value at key 1. Team 19500 is also a day ordinal, so the
-     * key-1 arm collects that whole day across the catalog and the filter
-     * drops it: the cost of a reordered spec, bounded by what it collects.
+     * Two teams read off the fixture, one per arm of `reordered`, so both
+     * arms return rows. Team 19500 is also a day ordinal, so the key-1 arm
+     * collects that whole day across the catalog and the filter drops it:
+     * the cost of a reordered spec, bounded by what it collects.
      */
     @Test
     fun `the two-arm shape of a reordered spec plans the same way`() {
-        for (teams in listOf(listOf(smallTeam, 12_900L), listOf(19_500L))) {
+        val byArm = listOf(teamWithFile("reordered", 1, 0), teamWithFile("reordered", 2, 1))
+        assertThat(admittedCount("reordered", byArm)).isGreaterThanOrEqualTo(2)
+        for (teams in listOf(byArm, listOf(19_500L))) {
             val scope = scope("reordered", teams, PredicateGrant.All(Scope.READ))
             assertThat(scope.arms).hasSize(2)
+            val started = System.nanoTime()
             val plan = explain("reordered", scope, analyze = true)
+            val millis = (System.nanoTime() - started) / 1_000_000
             assertScoped(plan, scope)
             assertScoped(explainGeneric(scope), scope)
             val collected = collected(teams, 0) + collected(teams, 1)
-            assertThat(rootBuffers(plan)).describedAs(plan).isLessThanOrEqualTo(bound(plan, collected))
+            assertBounded(plan, collected)
             println(
-                "ReadScopePlan files=$FILES reordered $teams: collected=$collected buffers=${rootBuffers(plan)}\n$plan",
+                "ReadScopePlan files=$FILES reordered $teams: collected=$collected returned=${returned(plan)} " +
+                    "buffers=${rootBuffers(plan)} ms=$millis\n$plan",
             )
         }
-        assertThat(admittedCount("reordered", listOf(12_900L))).isGreaterThan(0)
     }
 
     @Test

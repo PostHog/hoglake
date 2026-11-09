@@ -43,16 +43,21 @@ import org.jdbi.v3.core.statement.SqlStatement
  * collect, catalog-wide, not the table: ReadScopePlanIntegrationTest at
  * 41M files read 26,189 buffers for a team whose arm collected 2,050 ids
  * (12.8 per file), and 27,542 for a reordered spec whose key-1 arm
- * collected a whole day (43,050 ids for 1,988 returned). The InitPlan's
+ * collected a whole day (42,640 ids for 1,988 returned). The InitPlan's
  * array is built whole before the scan starts, about 32 bytes per id
  * (2M ids for a team with 5% of a 41M-file catalog), so a LIMIT on the
- * statement does not bound it; a deadline does.
+ * statement does not bound it; a deadline does. With two or more arms the
+ * manifest is read through a BitmapOr whose heap filter re-tests each row
+ * against its arm's array, linearly (a Param array is never hashed), so
+ * that shape costs rows x ids; only specs that put the field at different
+ * keys produce it, and the events table's do not.
  *
  * THE TABLE'S LAYOUT IS THE MOUNT'S FIELD at the read snapshot, or the
  * read is refused ([MountIntegrityError]). The option is set once, on an
  * empty table, and never unset, so every file visible at that snapshot
- * was committed under it and proven by its stats, and every spec since
- * keeps the identity field.
+ * was committed under it (its path checked), and every spec since keeps
+ * the identity field; the stats proof is the `provided AND NOT
+ * prefix_quarantined` term.
  *
  * A MISSING SPEC cannot occur for those files: they were committed after
  * #479, from which expiry never deletes a spec row, and the option itself

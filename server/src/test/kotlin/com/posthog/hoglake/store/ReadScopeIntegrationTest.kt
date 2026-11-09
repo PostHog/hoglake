@@ -29,7 +29,8 @@ import org.junit.jupiter.api.TestInstance
  *    day(ts), identity(team_id); spec 3 = bucket(team_id), another transform.
  *  - Day values equal to the team id 42 under both orders, a null value, an
  *    unpartitioned file, pending, failed and quarantined files, a file
- *    ended at snapshot 3, and files of teams 7 and 99.
+ *    ended at snapshot 3, files of teams 7 and 99, and a file bound to a
+ *    spec id the table does not have (left out, never guessed).
  *
  * `other`, a second table in the catalog, with the same spec id, the same
  * key and the colliding value 42. `broken` has a spec row with no fields.
@@ -165,6 +166,7 @@ class ReadScopeIntegrationTest {
             file(11, events, 1, "42", "19000", end = 3)
             file(12, events, 1, "99", "19000")
             file(13, events, 1, "7", "19000")
+            file(14, events, 9, "42", "19000") // no spec 9: matches no arm
             file(21, other, 1, "42", "19000") // another table, same spec id, key and value
             file(1, events, 1, "42", "19000", cat = otherCatalog) // another catalog, same ids
             file(13, events, 1, "42", "19000", cat = otherCatalog) // rs's file 13 is team 7
