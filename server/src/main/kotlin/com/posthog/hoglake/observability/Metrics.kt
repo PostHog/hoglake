@@ -793,7 +793,9 @@ object Metrics {
      *
      * Outcomes: `ok` (authorized), `missing` (no token presented),
      * `invalid` (a token that did not verify), `forbidden` (verified, but
-     * short of a scope or not entitled), `unmapped` (no rule for the path).
+     * short of a scope; answered 403), `not_entitled` (answered 404),
+     * `unmapped` (no rule for the path), `other` (any other refusal, such
+     * as a mount placed on hoglite).
      *
      * `client` is a closed class read from `User-Agent` (see
      * `auth.clientClass`): the enforce flip is gated on zero refusals per
@@ -829,6 +831,18 @@ object Metrics {
         scope: String,
         reason: String,
     ) = increment("hoglake_auth_denials_total", 1.0, "catalog", catalog, "scope", scope, "reason", reason)
+
+    /**
+     * hoglake_mount_refusals_total{catalog,reason}: requests refused on a
+     * mount (store/Mounts.kt), by the error code they were answered with.
+     * `catalog` is only a name the registry holds (`<orgID>-events`), so a
+     * client cannot add series. A mount's team ids are its read scope and
+     * are never labels.
+     */
+    fun mountRefused(
+        catalog: String,
+        reason: String,
+    ) = increment("hoglake_mount_refusals_total", 1.0, "catalog", catalog, "reason", reason)
 
     /**
      * hoglake_auth_signing_keys — keys the token verifier holds right now.
