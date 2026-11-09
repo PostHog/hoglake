@@ -5,6 +5,7 @@ import com.posthog.hoglake.auth.Caller
 import com.posthog.hoglake.auth.Requirement
 import com.posthog.hoglake.auth.Scope
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.observability.Metrics
 import io.ktor.server.application.ApplicationCall
 import io.ktor.server.request.httpMethod
 import io.ktor.server.request.path
@@ -96,16 +97,21 @@ fun interface CatalogRegistry {
  * else gets a 404 worded as a missing catalog. A token that places the mount
  * on hoglite is refused: a mount is never hoglite-backed. (A routed token
  * names one catalog, which the `cat` check has just shown is the mount.)
+ * A refusal is counted against the mount.
  */
 internal fun requireMountReader(
     caller: Caller?,
-    mount: String,
+    mount: MountRecord,
 ) {
-    if (caller?.kind != Caller.Kind.SCOPED || !caller.catalogClaimAllows(mount, Scope.READ)) {
-        throw HoglakeException.NotFound("catalog '$mount'")
+    if (caller?.kind != Caller.Kind.SCOPED || !caller.catalogClaimAllows(mount.name, Scope.READ)) {
+        throw refused(mount, "not_found", HoglakeException.NotFound("catalog '${mount.name}'"))
     }
     if (caller.routing?.backend == BackendKind.HOGLITE) {
-        throw HoglakeException.NotSupported("a mount is never served from a hoglite backend")
+        throw refused(
+            mount,
+            "not_supported_on_backend",
+            HoglakeException.NotSupported("a mount is never served from a hoglite backend"),
+        )
     }
 }
 
@@ -127,11 +133,30 @@ internal fun requireMountWriter(
  * The refusal for a route that has no mount implementation, chosen before any
  * service call: a write is never allowed on a mount, and a read waits for the
  * mount reader. The route's class comes from the route table, which covers
- * every served path; an unmatched path is refused as a write.
+ * every served path; an unmatched path is refused as a write. Building it
+ * counts it against the mount, so build it only to throw it.
  */
-internal fun mountRefusal(call: ApplicationCall): HoglakeException =
+internal fun mountRefusal(
+    call: ApplicationCall,
+    mount: MountRecord,
+): HoglakeException =
     if (AuthPolicy.match(call.request.httpMethod, call.request.path())?.requirement == Requirement.READ) {
-        HoglakeException.MountOperationUnavailable("this operation is not available on a mount")
+        refused(
+            mount,
+            "mount_operation_unavailable",
+            HoglakeException.MountOperationUnavailable("this operation is not available on a mount"),
+        )
     } else {
-        HoglakeException.ReadOnlyCatalog("a mount is read-only")
+        refused(mount, "read_only_catalog", HoglakeException.ReadOnlyCatalog("a mount is read-only"))
     }
+
+/**
+ * Count [failure] against [mount], by the error code it is answered with.
+ * Only a record the registry returned reaches here, so request input cannot
+ * add a series. Each refusal ends its request, so a request is counted once.
+ */
+private fun refused(
+    mount: MountRecord,
+    reason: String,
+    failure: HoglakeException,
+): HoglakeException = failure.also { Metrics.mountRefused(mount.name, reason) }

@@ -810,6 +810,19 @@ a canonical lowercase UUID (`MountNames.PATTERN`).
   (§6.4) gives the class. `AuthPolicy` does not list mounts: under `warn` and
   `enforce` it answers a scoped caller 403 `forbidden` on routes outside its
   scoped set or beyond its `cat` scope, before dispatch.
+- **Read scope.** `ReadScope` (`store/ReadScope.kt`) compiles what a mount
+  read may see: the table's files visible at the read snapshot whose
+  identity partition value on the mount's field is in the caller's `prd`
+  values intersected with the mount's (`*` means the mount's values), and
+  whose stats prove it (`provided AND NOT prefix_quarantined`). An empty set
+  compiles to `FALSE`. The read is refused, and
+  `hoglake_mount_integrity_errors_total` counts it, when the table's
+  object-prefix field at the read snapshot is not the mount's, or on
+  corruption (a spec row with no fields or with key indexes other than
+  0..n-1, no spec with the identity field, a negative mount value). A file
+  bound to an absent spec row cannot exist on such a table (expiry keeps
+  spec rows since #479, which predates the option); it would be left out.
+  No route uses it yet.
 - **The switch.** `hog_mount_switch` (V34) is off by default, and it is read
   only for a name `hog_mount` holds enabled. To turn it on:
   `UPDATE hog_mount_switch SET enabled = true;` (`false` turns it off). It has
@@ -841,6 +854,17 @@ a canonical lowercase UUID (`MountNames.PATTERN`).
     whose mounts may serve; `*` means all of them. It is empty by default, and
     then no mount name is looked up at all. It gates serving only, so a mount
     can always be disabled.
+- **Metrics.** Each of the binding's four refusals (`not_found`,
+  `not_supported_on_backend`, `read_only_catalog`,
+  `mount_operation_unavailable`; not the plugin's 403) counts once in
+  `hoglake_mount_refusals_total{catalog,reason}`, by its error code. The label
+  is only a name the registry holds, so request input cannot add a series;
+  team ids are never labels. For a scoped caller on a namespaced route, the
+  gate counts the request's `hoglake_auth_requests_total` outcome when its
+  lookup answers: `ok` for a reader on a route the mount does not serve (as
+  the plugin counts it on the routes it allows outright) and `other` for a mount
+  placed on hoglite; for any catalog, a 404 because no backend holds it
+  (#554's `none` default) counts `not_entitled`.
 
 ### 6.6 Client-supplied authority fields must die
 
@@ -1244,6 +1268,7 @@ New metrics (Prometheus, existing `observability/Metrics.kt` idiom):
 | `hoglake_auth_requests_total{mode,listener,outcome,client}` | the `warn`-mode onboarding checklist; `client` is a closed class from `User-Agent`, and the enforce gate is zero refusals per class on `listener="api"` (`listener="public"` is the internet-facing port, §6.7, where refusals are expected) |
 | `hoglake_auth_signing_keys` | keys the verifier holds; alert on 0 (boot refuses an empty source, this catches a rotation that never lands) |
 | `hoglake_auth_denials_total{catalog,scope,reason}` | distinguishes "client misconfigured" from "attack" by `reason` |
+| `hoglake_mount_refusals_total{catalog,reason}` | refusals on a mount (§6.5a) by error code; `catalog` is a mount the registry holds |
 | `hoglake_token_issued_total{grant_type}`, `_failures_total` | token endpoint health; not built (issuance is hogtower's) |
 | `hoglake_sts_assume_total{catalog,outcome}`, `_duration_seconds` | the vending path is now on the critical path of a read; it needs a latency histogram; not built (vending is hogtower's) |
 | `hoglake_sts_cache_hit_ratio` | if this drops, every scan pays an STS round trip; not built |
