@@ -249,6 +249,10 @@ class MountDispatchIntegrationTest {
         assertThat(body)
             .contains(""""data_path":"s3://bucket/$mount"""", "atomic-table-creation-v1")
             .doesNotContain("read_only")
+        // and its listing shows that catalog once, never a mount.
+        val listed = withRecord.getValue("scoped GET /v1/catalogs").second
+        assertThat(names(listed)).containsExactly(mount)
+        assertThat(listed).doesNotContain("read_only")
     }
 
     private fun reads(port: Int): Map<String, Pair<Int, String>> =
@@ -294,6 +298,9 @@ class MountDispatchIntegrationTest {
                 assertThat(send(port, HttpMethod.Get, "/v1/catalogs", reader).body()).isEqualTo("[${mountBody()}]")
                 assertThat(send(port, HttpMethod.Get, "/v1/catalogs/$mount", reader).body()).isEqualTo(mountBody())
                 assertThat(send(port, HttpMethod.Get, "/v1/catalogs/$mount", null).statusCode()).isEqualTo(404)
+                // A reserved name in `cat` that no mount holds is not listed as one.
+                val unheld = scoped("""{"0190f3c4-1b2a-4c3d-8e4f-a5b6c7d8e9f1-events":["read"]}""")
+                assertThat(send(port, HttpMethod.Get, "/v1/catalogs", unheld).body()).doesNotContain("read_only")
                 // A scoped caller whose `cat` does not name the mount.
                 val other = scoped("""{"lake":["read"]}""")
                 assertThat(send(port, HttpMethod.Get, "/v1/catalogs/$mount", other).statusCode()).isEqualTo(404)
