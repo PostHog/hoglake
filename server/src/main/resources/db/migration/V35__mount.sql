@@ -11,8 +11,7 @@
 SET LOCAL lock_timeout = '5s';
 
 CREATE TABLE IF NOT EXISTS hog_mount (
-    mount_id     bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    name         text    NOT NULL UNIQUE
+    name         text    PRIMARY KEY
         CHECK (name ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-events$'),
     revision     bigint  NOT NULL CHECK (revision > 0),
     enabled      boolean NOT NULL,

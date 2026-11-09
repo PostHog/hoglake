@@ -945,8 +945,7 @@ INSERT INTO hog_mount_switch DEFAULT VALUES;
 -- V35: mounts, written only through PUT /v1/mounts/{name} under CAS on
 -- `revision`, never deleted. `mount_values` is ascending and distinct.
 CREATE TABLE hog_mount (
-    mount_id     bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    name         text    NOT NULL UNIQUE
+    name         text    PRIMARY KEY
         CHECK (name ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-events$'),
     revision     bigint  NOT NULL CHECK (revision > 0),
     enabled      boolean NOT NULL,

@@ -738,6 +738,7 @@ As shipped; `auth/AuthPolicy.kt` is the authoritative table.
 | `…/publications*` | `read` (GET) / `maintenance` (POST, DELETE) | ✓ |
 | `/v1/maintenance/status`, `/runs` | operator only (§7.1) | ✓ |
 | `/v1/database/health` | operator only | ✓ |
+| `/v1/mounts*` | operator only; `PUT` only for `HOGLAKE_MOUNT_WRITER_SUBJECT` (§6.5a) | ✓ |
 | `/v1/debug/*` | operator only | ✓ |
 | `/v1/info` | public; **totals projected onto the caller's catalogs, omitted when anonymous** | all |
 | `/livez`, `/healthz`, `/openapi.yaml` | public | n/a |
@@ -820,16 +821,21 @@ a canonical lowercase UUID (`MountNames.PATTERN`).
     A mount that was never written reads as revision 0.
   - `PUT /v1/mounts/{name}` replaces a mount. Only the operator token whose
     `sub` is `HOGLAKE_MOUNT_WRITER_SUBJECT` (hogtower's events mount loop) may
-    call it, in every auth mode. Any other caller gets 403, including other
-    operators, `platform:admin`, and no caller at all. Empty (the default)
-    means nobody may.
+    call it, in every auth mode. Every other caller is refused, including
+    other operators and `platform:admin`. A missing token gets 401 under
+    `enforce` and 403 under `off` or `warn`. Empty (the default) means nobody
+    may write. The subject must be one that no other operator token carries.
+    Every hogtower operator token is `hogtower:provisioner` today, so the loop
+    needs a subject of its own.
   - A write is CAS on the revision the writer read, and moves the mount to
     the next revision. A stale write gets 409 `mount_revision_conflict`. The
     write gets 422 for a name that any `hog_catalog` row holds, more than
     10,000 values, or a negative or repeated value. A mount is never deleted,
     so its revision never resets.
-  - Every write attempt is one `mount_write` audit line: the actor, the `jti`,
-    and the values added and removed.
+  - Every write attempt that reaches the handler is one `mount_write` audit
+    line. It carries the actor and the `jti`, and a write that lands also
+    carries the values added and removed, the first 100 of each. A refusal
+    by the route table is an `auth_refused` line instead.
   - `HOGLAKE_MOUNT_ALLOWLIST` lists the org ids (the `<id>` of `<id>-events`)
     whose mounts may serve; `*` means all of them. It is empty by default, and
     then no mount name is looked up at all. It gates serving only, so a mount
@@ -1517,7 +1523,8 @@ the `RoleSessionName` argument and the rotation/revocation design transfer
 unchanged; the endpoint hosting them does not.
 
 **Superseded — §10 (schema).** No `hog_tenant`, no `hog_client`, no signing-key
-table, no `hog_grant`. hoglake gains no tables from this work.
+table, no `hog_grant`. hoglake gains no tables from this work. (Amended: the
+events mounts add `hog_mount`, written only by hogtower's mount loop; §6.5a.)
 
 **Superseded — §14 (work breakdown).** Phases 2, 3 and 4 move to hogtower and
 no longer gate anything here.

@@ -16,7 +16,7 @@ import io.ktor.server.routing.routing
 
 /** One mount value; `retention_months` has no source yet (plan 5.6), so it is always null. */
 data class MountValueDto(
-    val value: Long,
+    val value: Long?,
     val retentionMonths: Int? = null,
 )
 
@@ -27,11 +27,15 @@ data class MountDto(
     val values: List<MountValueDto>,
 )
 
-/** The whole mount at [revision] + 1; [revision] is the one the writer read (0: never written). */
+/**
+ * The whole mount at [revision] + 1; [revision] is the one the writer read
+ * (0: never written). Nullable so a missing field is refused rather than read
+ * as 0 or false; null [values] is empty, as a Go nil slice marshals.
+ */
 data class PutMountRequestDto(
-    val revision: Long,
-    val enabled: Boolean,
-    val values: List<MountValueDto>,
+    val revision: Long?,
+    val enabled: Boolean?,
+    val values: List<MountValueDto>? = null,
 )
 
 private fun MountRecord.toDto() = MountDto(name, revision, enabled, values.map { MountValueDto(it) })
@@ -58,15 +62,21 @@ fun Application.installMountRoutes(
                         "mount_write",
                         name,
                         null,
-                        detail = { w -> auditDetail(w, caller?.tokenId) },
+                        detail = ::auditDetail,
                         actor = { caller?.actor },
+                        // On refusals too: the jti is what ties an attempt to its token.
+                        message = { caller?.let { "jti=${it.tokenId}" } },
                     ) {
                         requireMountWriter(caller, writer)
                         val req = call.receive<PutMountRequestDto>()
-                        if (req.values.any { it.retentionMonths != null }) {
+                        val values = req.values.orEmpty()
+                        if (req.revision == null || req.enabled == null || values.any { it.value == null }) {
+                            throw HoglakeException.Validation("revision, enabled and every value are required")
+                        }
+                        if (values.any { it.retentionMonths != null }) {
                             throw HoglakeException.Validation("retention_months has no source yet and must be null")
                         }
-                        mounts().put(name, req.revision, req.enabled, req.values.map { it.value })
+                        mounts().put(name, req.revision, req.enabled, values.map { it.value!! })
                     }
                 call.respond(write.after.toDto())
             }
@@ -74,13 +84,12 @@ fun Application.installMountRoutes(
     }
 }
 
-/** From and to, and the values that came and went: what an incident asks of the trail. */
-private fun auditDetail(
-    w: MountStore.Write,
-    jti: String?,
-): String {
+/** From and to, and the values that came and went (the first 100 of each): what an incident asks. */
+private fun auditDetail(w: MountStore.Write): String {
     val before = w.before?.values.orEmpty()
+
+    fun List<Long>.capped() = if (size <= 100) toString() else "${take(100)}+${size - 100}"
     return "revision=${w.before?.revision ?: 0}->${w.after.revision} enabled=${w.after.enabled} " +
-        "values=${w.after.values.size} added=${w.after.values - before.toSet()} " +
-        "removed=${before - w.after.values.toSet()} jti=$jti"
+        "values=${w.after.values.size} added=${(w.after.values - before.toSet()).capped()} " +
+        "removed=${(before - w.after.values.toSet()).capped()}"
 }

@@ -24,12 +24,12 @@ class MountStore(
     private val admitted: (String) -> Boolean,
 ) : MountRegistry {
     override fun find(name: String): MountRecord? =
-        if (admitted(name)) jdbi().withHandleUnchecked { read(it, name, lock = false) }?.takeIf { it.enabled } else null
+        if (admitted(name)) jdbi().withHandleUnchecked { read(it, name) }?.takeIf { it.enabled } else null
 
     /** [name] as written, or the defaults of a mount never written. */
     fun get(name: String): MountRecord {
         requireName(name)
-        return jdbi().withHandleUnchecked { read(it, name, lock = false) } ?: MountRecord(name)
+        return jdbi().withHandleUnchecked { read(it, name) } ?: MountRecord(name)
     }
 
     /** Every mount, enabled or not, by name. */
@@ -69,10 +69,13 @@ class MountStore(
             if (CatalogRepo.findByName(h, name) != null) {
                 throw HoglakeException.Validation("'$name' is a catalog's name, so it cannot be a mount")
             }
-            val before = read(h, name, lock = true)
+            // Unlocked: a revision is never repeated, so if the guarded
+            // write below lands, the row was still [before] when it did.
+            val before = read(h, name)
             if ((before?.revision ?: 0) != revision) throw conflict(name, before?.revision ?: 0, revision)
-            // The guard covers what the lock cannot: a first write racing
-            // another first write, which then finds the row and leaves it.
+            // The guard is the CAS: a writer racing from the same revision
+            // waits on the winner's row (or its unique entry, for a first
+            // write), then finds it moved and writes nothing.
             val written =
                 h.createUpdate(
                     """
@@ -109,9 +112,8 @@ class MountStore(
         private fun read(
             h: Handle,
             name: String,
-            lock: Boolean,
         ): MountRecord? =
-            h.createQuery("SELECT $COLUMNS FROM hog_mount WHERE name = :name" + if (lock) " FOR UPDATE" else "")
+            h.createQuery("SELECT $COLUMNS FROM hog_mount WHERE name = :name")
                 .bind("name", name)
                 .map(MAPPER)
                 .findOne()

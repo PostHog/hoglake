@@ -19,6 +19,7 @@ import io.ktor.server.netty.Netty
 import kotlinx.coroutines.runBlocking
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
+import org.jdbi.v3.core.Handle
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
@@ -31,6 +32,7 @@ import java.net.http.HttpResponse
 import java.nio.file.Files
 import java.util.concurrent.Callable
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 /**
  * The mount API (plan 1.4) through the real application and its migrated
@@ -199,6 +201,10 @@ class MountApiIntegrationTest {
             assertThat(put(port, name, 1, true, listOf(666), token = null).statusCode()).isEqualTo(403)
             assertThat(put(port, name, 1, true, listOf(666), operator("hogtower:provisioner")).statusCode())
                 .isEqualTo(403)
+            // The writer's subject is not enough: it must be on an operator token.
+            val tenant = TestTokens.tenantClaims(sub = WRITER, catalogs = mapOf(name to listOf("admin")))
+            assertThat(put(port, name, 1, true, listOf(666), TestTokens.mint(pair, tenant)).statusCode())
+                .isEqualTo(403)
         }
         // off verifies no one, so no one may write; reads are served as on every route.
         withServer(mode = AuthMode.OFF) { port ->
@@ -239,8 +245,16 @@ class MountApiIntegrationTest {
             assertThat(put(port, name, 0, true, max + MountStore.MAX_VALUES.toLong()).statusCode()).isEqualTo(422)
             assertThat(put(port, name, 0, true, listOf(3, -1)).statusCode()).isEqualTo(422)
             assertThat(put(port, name, 0, true, listOf(3, 8, 3)).statusCode()).isEqualTo(422)
-            val months = """{"revision":0,"enabled":true,"values":[{"value":3,"retention_months":12}]}"""
-            assertThat(send(port, "PUT", "/v1/mounts/$name", operator(WRITER), months).statusCode()).isEqualTo(422)
+            for (body in listOf(
+                """{"revision":0,"enabled":true,"values":[{"value":3,"retention_months":12}]}""",
+                """{"enabled":true,"values":[]}""",
+                """{"revision":0,"values":[]}""",
+                """{"revision":0,"enabled":true,"values":[{}]}""",
+            )) {
+                assertThat(send(port, "PUT", "/v1/mounts/$name", operator(WRITER), body).statusCode())
+                    .describedAs(body)
+                    .isEqualTo(422)
+            }
             for (bad in listOf("lake", "${org(4).uppercase()}-events", "${org(4)}-events2")) {
                 assertThat(put(port, bad, 0, true, listOf(3)).statusCode()).describedAs(bad).isEqualTo(422)
                 assertThat(send(port, "GET", "/v1/mounts/$bad", operator(WRITER)).statusCode()).isEqualTo(422)
@@ -249,6 +263,10 @@ class MountApiIntegrationTest {
             val full = put(port, name, 0, true, max.reversed())
             assertThat(full.statusCode()).describedAs(full.body()).isEqualTo(200)
             assertThat(full.tree().mountValues()).isEqualTo(max)
+            // A Go nil slice marshals as null: #138's repair pass sends one to disable.
+            val nil = """{"revision":1,"enabled":false,"values":null}"""
+            assertThat(send(port, "PUT", "/v1/mounts/$name", operator(WRITER), nil).statusCode()).isEqualTo(200)
+            assertThat(row(name)).isEqualTo(MountRecord(name, 2, false, emptyList()))
         }
     }
 
@@ -275,6 +293,48 @@ class MountApiIntegrationTest {
             assertThat(store.get(name).revision).isEqualTo(revision + 1)
         }
     }
+
+    @Test
+    fun `a writer racing from a revision another writer is leaving writes nothing`() {
+        val name = mount(10)
+        // A first write: the loser reads no row, then waits on the winner's unique entry.
+        raced(name, 0) { it.execute("INSERT INTO hog_mount VALUES (?, 1, true, '{1}')", name) }
+        assertThat(store.get(name)).isEqualTo(MountRecord(name, 1, true, listOf(1)))
+        // A later write: the loser reads revision 1, then waits on the winner's row.
+        raced(name, 1) { it.execute("UPDATE hog_mount SET revision = 2, mount_values = '{2}' WHERE name = ?", name) }
+        assertThat(store.get(name)).isEqualTo(MountRecord(name, 2, true, listOf(2)))
+    }
+
+    /** [winner] runs uncommitted until a put from [revision] is blocked on it; that put must then lose. */
+    private fun raced(
+        name: String,
+        revision: Long,
+        winner: (Handle) -> Unit,
+    ) = db.jdbi.open().use { h ->
+        h.begin()
+        winner(h)
+        val pool = Executors.newSingleThreadExecutor()
+        try {
+            val loser = pool.submit(Callable { runCatching { store.put(name, revision, true, listOf(99)) } })
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30)
+            while (lockWaiters() == 0) {
+                check(System.nanoTime() < deadline) { "the racing write never waited on the winner" }
+                Thread.sleep(20)
+            }
+            h.commit()
+            assertThat(loser.get(30, TimeUnit.SECONDS).exceptionOrNull())
+                .isInstanceOf(HoglakeException.MountRevisionConflict::class.java)
+        } finally {
+            pool.shutdownNow()
+        }
+    }
+
+    private fun lockWaiters(): Int =
+        db.jdbi.withHandle<Int, Exception> {
+            it.createQuery(
+                "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'",
+            ).mapTo(Int::class.java).one()
+        }
 
     @Test
     fun `a written mount serves only while enabled, allowlisted and switched on`() {
@@ -336,10 +396,12 @@ class MountApiIntegrationTest {
             assertThat(lines.map { it.formattedMessage })
                 .containsExactly("mount_write ok", "mount_write ok", "mount_write forbidden", "mount_write conflict")
             val second = lines[1].argumentArray.map { it.toString() }
-            assertThat(second).contains("actor=operator:$WRITER", "catalog=$name")
+            assertThat(second).contains("actor=operator:$WRITER", "catalog=$name", "operation_message=jti=jti-op")
             assertThat(second.single { it.startsWith("detail=") })
-                .isEqualTo("detail=revision=1->2 enabled=true values=2 added=[12] removed=[4] jti=jti-op")
-            assertThat(lines[2].argumentArray.map { it.toString() }).contains("actor=operator:platform:admin")
+                .isEqualTo("detail=revision=1->2 enabled=true values=2 added=[12] removed=[4]")
+            // A refusal carries the jti too: it is what ties the attempt to its token.
+            assertThat(lines[2].argumentArray.map { it.toString() })
+                .contains("actor=operator:platform:admin", "operation_message=jti=jti-op")
         } finally {
             audit.detachAppender(capture)
         }

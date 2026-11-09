@@ -2555,7 +2555,7 @@ sealed class HoglakeException(message: String) : RuntimeException(message) {
     class MountOperationUnavailable(detail: String) : HoglakeException(detail)
 
     /** A mount write at a revision the mount is not at -> 409 `mount_revision_conflict`. */
-    class MountRevisionConflict(detail: String) : CommitConflict(detail)
+    class MountRevisionConflict(detail: String) : HoglakeException(detail)
 
     /** Narrow the result before retrying. This refusal is not backend unavailability. */
     class BackendResultTooLarge(detail: String) : HoglakeException(detail)

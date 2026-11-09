@@ -61,8 +61,8 @@ object HogSchemaColumns {
             "hog_snapshot_change" to setOf("catalog_id", "snapshot_id", "kind", "object_id"),
             // V34: MountRegistry.postgresSwitch reads `enabled`.
             "hog_mount_switch" to setOf("singleton", "enabled"),
-            // V35: MountStore. `mount_id` is the key; nothing reads it yet.
-            "hog_mount" to setOf("mount_id", "name", "revision", "enabled", "mount_values"),
+            // V35: MountStore.
+            "hog_mount" to setOf("name", "revision", "enabled", "mount_values"),
             // NamespaceRepo.
             // V33: contained_field/contained_value, read by NamespaceRepo and
             // CommitTail.READ_SQL's `contained` CTE.

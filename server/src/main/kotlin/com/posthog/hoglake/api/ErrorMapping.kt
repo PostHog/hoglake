@@ -87,7 +87,6 @@ internal fun errorBody(cause: HoglakeException): Pair<HttpStatusCode, ApiErrorDt
         is HoglakeException.ReadOnlyCatalog -> HttpStatusCode.Forbidden to apiError("read_only_catalog", cause)
         is HoglakeException.MountOperationUnavailable ->
             HttpStatusCode.NotImplemented to apiError("mount_operation_unavailable", cause)
-        // Before CommitConflict, its base: the mount API's only 409.
         is HoglakeException.MountRevisionConflict ->
             HttpStatusCode.Conflict to apiError("mount_revision_conflict", cause)
         is HoglakeException.BackendResultTooLarge ->
