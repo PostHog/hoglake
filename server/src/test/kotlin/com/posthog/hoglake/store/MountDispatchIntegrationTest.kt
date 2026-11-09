@@ -4,7 +4,6 @@ import com.posthog.hoglake.App
 import com.posthog.hoglake.Config
 import com.posthog.hoglake.auth.AuthMode
 import com.posthog.hoglake.auth.AuthPolicy
-import com.posthog.hoglake.auth.MountRoute
 import com.posthog.hoglake.auth.Requirement
 import com.posthog.hoglake.auth.TestTokens
 import com.posthog.hoglake.configureApiListener
@@ -45,7 +44,7 @@ class MountDispatchIntegrationTest {
     private val http = HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1).build()
     private val mount = "0190f3c4-1b2a-4c3d-8e4f-a5b6c7d8e9f0-events"
     private val source = "millrace-dev"
-    private val registry = MountRegistry { if (it == mount) MountRecord(it, source) else null }
+    private val registry = MountRegistry { if (it == mount) MountRecord(it) else null }
 
     /** As migrated, before any test writes it. */
     private val migratedSwitch: Boolean =
@@ -78,10 +77,12 @@ class MountDispatchIntegrationTest {
     private fun <T> withServer(
         mounts: MountRegistry = registry,
         mode: AuthMode = AuthMode.ENFORCE,
+        sourceCatalog: String = source,
         block: (port: Int) -> T,
     ): T {
         val cfg =
             Config(port = 0, hydratorIntervalMs = 0).copy(
+                mountSourceCatalog = sourceCatalog,
                 authMode = mode.wire,
                 authIssuer = TestTokens.ISSUER,
                 authJwksFile = keyFile.toString(),
@@ -205,7 +206,7 @@ class MountDispatchIntegrationTest {
                     // column's routes; elsewhere the plugin lets it reach the
                     // binding on its own routes, and refuses it on the rest.
                     val scoped = send(port, rule.method, path, scoped())
-                    if (rule.mount == MountRoute.SCOPED) {
+                    if ((rule.method to rule.pattern) in AuthPolicy.MOUNT_ROUTES) {
                         assertThat(scoped.statusCode()).describedAs("%s %s", rule.method.value, path).isEqualTo(200)
                         assertThat(scoped.body()).isEqualTo(mountBody())
                         continue
@@ -278,6 +279,10 @@ class MountDispatchIntegrationTest {
                 assertThat(send(port, HttpMethod.Get, "/v1/catalogs", reader).body()).isEqualTo("[${mountBody()}]")
                 assertThat(send(port, HttpMethod.Get, "/v1/catalogs/$mount", reader).body()).isEqualTo(mountBody())
                 assertThat(send(port, HttpMethod.Get, "/v1/catalogs/$mount", null).statusCode()).isEqualTo(404)
+                // A scoped caller whose `cat` does not name the mount.
+                val other = scoped("""{"lake":["read"]}""")
+                assertThat(send(port, HttpMethod.Get, "/v1/catalogs/$mount", other).statusCode()).isEqualTo(404)
+                assertThat(names(send(port, HttpMethod.Get, "/v1/catalogs", other).body())).containsExactly("lake")
             }
         } finally {
             switch(false)
@@ -285,15 +290,19 @@ class MountDispatchIntegrationTest {
     }
 
     @Test
-    fun `a mount whose source is missing answers 500 without naming the source`() {
+    fun `a mount with no source catalog answers 500, never a 404 naming another catalog`() {
         switch(true)
         try {
-            withServer(MountRegistry { if (it == mount) MountRecord(it, "gone") else null }) { port ->
-                for (path in listOf("/v1/catalogs/$mount", "/v1/catalogs")) {
-                    val response = send(port, HttpMethod.Get, path, scoped())
-                    assertThat(response.statusCode()).describedAs(path).isEqualTo(500)
-                    assertThat(response.body())
-                        .isEqualTo("""{"error":"internal_error","detail":"internal server error"}""")
+            for (configured in listOf("gone", "")) {
+                withServer(sourceCatalog = configured) { port ->
+                    for (path in listOf("/v1/catalogs/$mount", "/v1/catalogs")) {
+                        val response = send(port, HttpMethod.Get, path, scoped())
+                        assertThat(response.statusCode()).describedAs("%s %s", configured, path).isEqualTo(500)
+                        assertThat(response.body())
+                            .isEqualTo("""{"error":"internal_error","detail":"internal server error"}""")
+                    }
+                    // A caller who sees no mount never needs the source.
+                    assertThat(send(port, HttpMethod.Get, "/v1/catalogs", operator()).statusCode()).isEqualTo(200)
                 }
             }
         } finally {

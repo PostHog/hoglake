@@ -604,9 +604,10 @@ contract vector is `scoped_team` in `oauth/contract-vectors.json`.
 - **A value's permission** is the lower of its own and `cat`'s for the catalog.
 - **Fails closed.** A scoped caller may use `AUTHENTICATED` routes (listings,
   filtered to `cat`, with catalog totals withheld) and, in a catalog it names,
-  only the routes listed in `AuthPolicy.SCOPED_ROUTES`. Every other catalog
-  route answers `403`, under `warn` too, and a route added to the table stays
-  closed to scoped callers until it is listed.
+  only the routes listed in `AuthPolicy.SCOPED_ROUTES` (and, on a mount-shaped
+  name, `AuthPolicy.MOUNT_ROUTES`: §6.5a). Every other catalog route answers
+  `403`, under `warn` too, and a route added to the table stays closed to
+  scoped callers until it is listed.
 - **Reads, by namespace.** The listed routes are the namespace-scoped reads (a
   namespace, its tables and views, and a table's metadata, files, scan plan,
   partitions, changes and file stats) and the namespace listing. A
@@ -790,8 +791,8 @@ a canonical lowercase UUID (`MountNames.PATTERN`).
   created through it can take a mount's name. A PostgreSQL name taken earlier
   is for the mount write to refuse; a hoglite one is kept out by the issuer's
   `cat` grammar. Where both exist, the mount resolves first on every
-  `{catalog}` route, and `GET /v1/catalogs` lists the mount, never the
-  catalog.
+  `{catalog}` route, and `GET /v1/catalogs` hides the catalog from every
+  caller.
 - **One choke point.** `CatalogStoreSelector.resolve` is #291's
   `CatalogRegistry.resolve`. It runs before token placement picks a store. Every
   catalog route and the namespace gate reach it through `forCatalog`. A name
@@ -805,18 +806,23 @@ a canonical lowercase UUID (`MountNames.PATTERN`).
   gets 501 `not_supported_on_backend`.
 - **What it serves.** Its catalog: `GET /v1/catalogs/{catalog}`, and the
   listing, which shows a caller the reserved names in its own `cat` that it
-  may read as mounts (`mountVisibility`; never a mount to anyone else). The
-  body is the source catalog's row under the mount's name (data path,
-  snapshot clock), `read_only: true`, no capabilities (each one gates a
-  write) and no sampler totals. Every other route refuses before any service
-  call: a non-read route with 403 `read_only_catalog`, a read route with 501
-  `mount_operation_unavailable`. The route table (§6.4) gives the class.
-- **The mount column.** Each `AuthPolicy` entry has one, `UNAVAILABLE` by
-  default; `SCOPED` routes are those the mount serves. On such a route a
-  reserved name is open to a scoped caller by its `cat` alone; the binding
-  decides the rest. Elsewhere, under `warn` and `enforce`, `AuthPolicy`
-  answers a scoped caller 403 `forbidden` on routes outside its scoped set or
-  beyond its `cat` scope, before dispatch.
+  may read as mounts (`mountVisibility`); no one else sees a mount. The body
+  is the row of the instance's source catalog (`HOGLAKE_MOUNT_SOURCE_CATALOG`:
+  data path, snapshot clock) under the mount's name, with `read_only: true`,
+  no capabilities (each one gates a write) and no sampler totals; unset or
+  missing, the mount answers 500. Every other route refuses before any
+  service call: a non-read route with 403 `read_only_catalog`, a read route
+  with 501 `mount_operation_unavailable`. The route table (§6.4) gives the
+  class.
+- **The mount column.** `AuthPolicy.MOUNT_ROUTES` lists the routes a mount
+  serves; every other route is unavailable on a mount. On a listed route a
+  mount-shaped name is open to a scoped caller by its `cat` alone, and the
+  binding serves the mount (a reserved name that is no mount is served as
+  the catalog it is, which shows the caller what its listing already does).
+  So no route narrowed per namespace or per body is listed. Elsewhere, under
+  `warn` and `enforce`, `AuthPolicy` answers a scoped caller 403 `forbidden`
+  on routes outside its scoped set or beyond its `cat` scope, before
+  dispatch.
 - **The switch.** `hog_mount_switch` (V34) is off by default, and it is read
   only for a name the registry holds. To turn it on:
   `UPDATE hog_mount_switch SET enabled = true;` (`false` turns it off). The

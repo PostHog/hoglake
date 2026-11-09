@@ -89,23 +89,27 @@ class CatalogStoreSelector(
         }
     }
 
-    /** True when a mount takes [catalog]'s name, so a listing must not show the catalog. */
-    fun shadowed(catalog: String): Boolean = record(catalog) != null
-
-    /** The mounts [listing] shows: its visibility set, through the gate [resolve] uses. */
-    fun mounts(listing: Listing): List<MountRecord> = listing.mounts.mapNotNull(::record)
+    /**
+     * Which of [names] are mounts, through the gate [resolve] uses, each name
+     * read once: a listing hides catalogs and shows mounts from one answer.
+     */
+    fun mountsAmong(names: Collection<String>): Set<String> = names.toSet().filterTo(HashSet()) { record(it) != null }
 
     /**
-     * The source catalog's row, which a mount presents under its own name. A
-     * missing source is a broken record, not a missing catalog, and its name
-     * must not reach the caller: a 500.
+     * The row every mount presents under its own name: the instance's
+     * source catalog (`HOGLAKE_MOUNT_SOURCE_CATALOG`). Unset or missing, the
+     * instance is broken, not the mount absent: a 500, never a 404 that
+     * names another catalog.
      */
-    fun mountSource(mount: MountRecord): CatalogInfo =
-        try {
-            checkNotNull(defaultPostgres()).getCatalog(mount.sourceCatalog)
+    fun mountSource(): CatalogInfo {
+        val source = cfg?.mountSourceCatalog.orEmpty()
+        check(source.isNotEmpty()) { "a mount resolved, but HOGLAKE_MOUNT_SOURCE_CATALOG is not set" }
+        return try {
+            checkNotNull(defaultPostgres()).getCatalog(source)
         } catch (_: HoglakeException.NotFound) {
-            error("mount '${mount.name}': its source catalog does not exist")
+            error("HOGLAKE_MOUNT_SOURCE_CATALOG names no catalog")
         }
+    }
 
     /** Resolve sub-backends through the same request-scoped store and default policy. */
     fun uploads(

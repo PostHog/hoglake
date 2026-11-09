@@ -336,11 +336,15 @@ class AuthPolicyTest {
     @Test
     fun `the mount column is unavailable by default and opens only reads, on a mount's name, by cat`() {
         // The routes a mount serves; binding dispatch refuses every other one.
-        val served = AuthPolicy.rules.filter { it.mount == MountRoute.SCOPED }
-        assertThat(served.map { it.method to it.pattern })
-            .containsExactly(HttpMethod.Get to "/v1/catalogs/{catalog}")
-        assertThat(served).allSatisfy { assertThat(it.requirement).isEqualTo(Requirement.READ) }
-        assertThat(AuthPolicy.Entry(HttpMethod.Get, "/x", Requirement.READ).mount).isEqualTo(MountRoute.UNAVAILABLE)
+        assertThat(AuthPolicy.MOUNT_ROUTES).containsExactly(HttpMethod.Get to "/v1/catalogs/{catalog}")
+        for ((method, pattern) in AuthPolicy.MOUNT_ROUTES) {
+            val rule = AuthPolicy.rules.single { it.method == method && it.pattern == pattern }
+            assertThat(rule.requirement).describedAs(pattern).isEqualTo(Requirement.READ)
+            // Open by `cat` alone, so never a route the gate or the handler
+            // narrows per namespace.
+            assertThat(pattern).doesNotContain("{namespace}")
+            assertThat(method to pattern).isNotIn(AuthPolicy.SCOPED_ROUTES + AuthPolicy.BODY_SCOPED_ROUTES)
+        }
 
         val mount = "0190f3c4-1b2a-4c3d-8e4f-a5b6c7d8e9f0-events"
         val other = "0190f3c4-1b2a-4c3d-8e4f-a5b6c7d8e9f1-events"

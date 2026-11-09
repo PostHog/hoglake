@@ -77,7 +77,7 @@ class MountDispatchTest {
         )
     }
 
-    private val oneMount = MountRegistry { if (it == mount) MountRecord(it, "millrace-dev") else null }
+    private val oneMount = MountRegistry { if (it == mount) MountRecord(it) else null }
 
     private fun mounts(
         switchOn: () -> Boolean = { true },

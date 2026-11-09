@@ -43,13 +43,6 @@ enum class Requirement {
         }
 }
 
-/**
- * What a route does on a mount (#291 §5): [SCOPED] routes serve the mount's
- * scoped reader; every other route is refused by binding dispatch
- * (`mountRefusal`), which, not this table, enforces it in every auth mode.
- */
-enum class MountRoute { SCOPED, UNAVAILABLE }
-
 /** What [AuthPolicy] concluded about a request path. */
 data class RouteMatch(
     val requirement: Requirement,
@@ -68,8 +61,6 @@ data class RouteMatch(
     val namespace: String? = null,
     /** The rule's method (HEAD matches as GET). Null only in hand-built matches. */
     val method: HttpMethod? = null,
-    /** The rule's mount column. */
-    val mount: MountRoute = MountRoute.UNAVAILABLE,
 )
 
 /**
@@ -156,7 +147,7 @@ object AuthPolicy {
             Entry(HttpMethod.Get, "/v1/maintenance/status", Requirement.OPERATOR),
             Entry(HttpMethod.Get, "/v1/maintenance/runs", Requirement.OPERATOR),
             // ---- one catalog ---------------------------------------------
-            Entry(HttpMethod.Get, "/v1/catalogs/$CATALOG", Requirement.READ, MountRoute.SCOPED),
+            Entry(HttpMethod.Get, "/v1/catalogs/$CATALOG", Requirement.READ),
             Entry(HttpMethod.Delete, "/v1/catalogs/$CATALOG", Requirement.ADMIN),
             Entry(HttpMethod.Get, "/v1/catalogs/$CATALOG/storage-usage", Requirement.READ),
             Entry(HttpMethod.Get, "/v1/catalogs/$CATALOG/options", Requirement.READ),
@@ -371,7 +362,7 @@ object AuthPolicy {
                         }
                 }
             }
-            if (ok) return RouteMatch(entry.requirement, catalog, entry.pattern, namespace, entry.method, entry.mount)
+            if (ok) return RouteMatch(entry.requirement, catalog, entry.pattern, namespace, entry.method)
         }
         return null
     }
@@ -421,12 +412,11 @@ object AuthPolicy {
         return if (path.endsWith('/')) segments + "" else segments
     }
 
-    /** One row of the table. [mount] is UNAVAILABLE unless a mount serves the route. */
+    /** One row of the table. */
     data class Entry(
         val method: HttpMethod,
         val pattern: String,
         val requirement: Requirement,
-        val mount: MountRoute = MountRoute.UNAVAILABLE,
     ) {
         val segments: List<String> get() = pattern.split('/').filter { it.isNotEmpty() }
 
@@ -506,7 +496,7 @@ object AuthPolicy {
      *   ([BODY_SCOPED_ROUTES]).
      *
      * Routes that name their namespaces in the body are [BODY_SCOPED_ROUTES].
-     * On a mount's name, a [MountRoute.SCOPED] route is open by `cat` alone.
+     * On a mount's name, the [MOUNT_ROUTES] are open by `cat` alone.
      */
     internal val SCOPED_ROUTES: Set<Pair<HttpMethod, String>> =
         setOf(
@@ -559,24 +549,36 @@ object AuthPolicy {
             HttpMethod.Put to "/v1/catalogs/$CATALOG/uploads/{upload}",
         )
 
+    /**
+     * The mount column (#291 §5): the routes a mount serves its scoped
+     * reader. Every route not listed is UNAVAILABLE on a mount, and binding
+     * dispatch refuses it there (`mountRefusal`) in every auth mode; this
+     * table only lets the reader reach the binding. On a reserved-shape name
+     * a listed route is open by `cat` alone, so a route narrowed per
+     * namespace or per body must not be listed (AuthPolicyTest pins it).
+     */
+    internal val MOUNT_ROUTES: Set<Pair<HttpMethod, String>> =
+        setOf(HttpMethod.Get to "/v1/catalogs/$CATALOG")
+
     private fun authorizeScoped(
         caller: Caller,
         catalog: String,
         match: RouteMatch,
     ): AuthDecision {
         val required = match.requirement.scopeOrNull()
-        // A mount's own route: the name's shape is all this table can see,
-        // so `cat` is the test here and binding dispatch decides the rest
-        // (a reserved name that is no mount is served as the catalog it is).
-        if (required != null && match.mount == MountRoute.SCOPED && MountNames.isReserved(catalog)) {
+        val method = match.method
+        val route = method?.let { it to match.pattern }
+        // A mount's route on a mount-shaped name: the shape is all this table
+        // can see, so it checks `cat`, and binding dispatch serves the mount.
+        // A reserved name that is no mount is served as the catalog it is,
+        // which shows the caller only what its catalog listing does.
+        if (required != null && route in MOUNT_ROUTES && MountNames.isReserved(catalog)) {
             return if (caller.catalogClaimAllows(catalog, required)) {
                 AuthDecision.Allow
             } else {
                 AuthDecision.InsufficientScope(catalog, required)
             }
         }
-        val method = match.method
-        val route = method?.let { it to match.pattern }
         if (required == null || route == null || (route !in SCOPED_ROUTES && route !in BODY_SCOPED_ROUTES)) {
             return AuthDecision.NotPredicated(catalog, match.pattern)
         }

@@ -31,8 +31,6 @@ object MountNames {
 /** One mount. The read scope (source table, field, values, revision) comes with the mount table. */
 data class MountRecord(
     val name: String,
-    /** The PostgreSQL catalog the mount reads; its row is the mount's catalog DTO. */
-    val sourceCatalog: String,
 )
 
 /** Mount records by name. Production has none until the mount table and its operator API exist. */

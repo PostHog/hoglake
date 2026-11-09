@@ -133,10 +133,13 @@ fun Application.installApiRoutes(
                 // A catalog a mount shadows answers as the mount on every
                 // route, so it is not listed. The caller's own mounts follow,
                 // unsorted: re-sorting could reorder the backend's listing.
+                val listed = catalogs.listCatalogs(visible)
+                val mounts = selector.mountsAmong(listed.map { it.name } + listing.mounts)
                 val local =
-                    catalogs.listCatalogs(visible).filterNot { selector.shadowed(it.name) }
-                        .map { it.toDto(if (scoped) null else totals[it.name]) }
-                call.respond(local + selector.mounts(listing).map { selector.mountSource(it).toMountDto(it.name) })
+                    listed.filterNot { it.name in mounts }.map { it.toDto(if (scoped) null else totals[it.name]) }
+                val shown = listing.mounts.filter { it in mounts }
+                val source = if (shown.isEmpty()) null else selector.mountSource()
+                call.respond(local + shown.map { checkNotNull(source).toMountDto(it) })
             }
             post {
                 val req = call.receive<CreateCatalogRequestDto>()
@@ -154,11 +157,10 @@ fun Application.installApiRoutes(
 
             route("/{catalog}") {
                 get {
-                    // The one route a mount serves so far (AuthPolicy's mount column).
+                    // The one route a mount serves so far (AuthPolicy.MOUNT_ROUTES).
                     when (val binding = selector.resolve(call, call.catalog())) {
                         is CatalogBinding.Local -> call.respond(binding.store.getCatalog(call.catalog()).toDto())
-                        is CatalogBinding.Mount ->
-                            call.respond(selector.mountSource(binding.mount).toMountDto(binding.mount.name))
+                        is CatalogBinding.Mount -> call.respond(selector.mountSource().toMountDto(binding.mount.name))
                     }
                 }
                 delete {

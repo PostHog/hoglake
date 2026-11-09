@@ -22,6 +22,12 @@ data class Config(
     val defaultBackend: String = env("HOGLAKE_DEFAULT_BACKEND", "postgres"),
     /** Optional allowlist id for this process's PostgreSQL backend. */
     val postgresBackendId: String = env("HOGLAKE_POSTGRES_BACKEND_ID", ""),
+    /**
+     * The PostgreSQL catalog every mount reads (one per instance, e.g.
+     * `millrace-dev`); its row is each mount's catalog. Empty (the default):
+     * none, so a mount that resolves answers 500 rather than a catalog.
+     */
+    val mountSourceCatalog: String = env("HOGLAKE_MOUNT_SOURCE_CATALOG", ""),
     val port: Int = env("HOGLAKE_PORT", "8080").toInt(),
     /**
      * The infra listener's port (docs/auth-tenancy.md §6.7): `GET /metrics`

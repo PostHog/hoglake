@@ -41,10 +41,10 @@ info:
     on the other routes open to scoped callers within its `cat` scope, 403
     `read_only_catalog` for a write and 501 `mount_operation_unavailable`
     for a read not served yet. When its `rtg` places the mount on hoglite,
-    each of those routes answers 501 `not_supported_on_backend`. Other
-    routes refuse it as any scoped caller (403 `forbidden`). Other callers
-    are answered as for any catalog: where they would reach it, 404; no
-    listing shows them a mount.
+    every `{catalog}` route answers it 501 `not_supported_on_backend`, and
+    its listing leaves the mount out. Other routes refuse it as any scoped
+    caller (403 `forbidden`). Other callers are answered as for any
+    catalog: where they would reach it, 404; no listing shows them a mount.
 
     Two refusals are worth distinguishing, because they mean different
     things to a client:
@@ -179,8 +179,9 @@ paths:
       summary: Catalog info (head snapshot, schema version, data path)
       description: >
         On a mount, served only to a scoped caller whose `cat` names it: the
-        source catalog's data path, head snapshot and schema version under
-        the mount's name, `read_only: true`, no capabilities and no totals.
+        source catalog's data_path, head_snapshot_id, schema_version and
+        earliest_snapshot_time under the mount's name, `read_only: true` and
+        no capabilities.
       parameters: [ { $ref: "#/components/parameters/catalog" } ]
       responses:
         "200":
@@ -3686,9 +3687,9 @@ components:
         read_only:
           type: boolean
           description: >
-            true on a mount: a read-only catalog over a source catalog in
-            this instance, whose data_path, head_snapshot_id,
-            schema_version and earliest_snapshot_time are the source's.
+            true on a mount: a read-only catalog over this instance's
+            source catalog, whose data_path, head_snapshot_id,
+            schema_version and earliest_snapshot_time it carries.
             No write route serves it, and it carries none of the sampler
             totals below. Absent on every other catalog.
         head_snapshot_id: { type: integer, format: int64 }
