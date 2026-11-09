@@ -18,8 +18,9 @@ import org.jdbi.v3.core.Jdbi
  * placement selects a backend, so no catalog created through it can take a
  * mount's name. A PostgreSQL name taken before the reservation is the mount
  * write's to refuse; a hoglite one is kept out by the issuer's `cat` grammar.
- * Where both exist, the mount resolves first on every `{catalog}` route.
- * Only names of this shape reach mount resolution.
+ * Where both exist, the mount resolves first on every `{catalog}` route,
+ * and `GET /v1/catalogs` hides the catalog. Only names of this shape reach
+ * mount resolution.
  */
 object MountNames {
     const val PATTERN = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-events$"
@@ -128,6 +129,23 @@ internal fun requireMountWriter(
         throw HoglakeException.Forbidden("only the configured mount writer may write a mount")
     }
 }
+
+private fun mayReadMount(
+    caller: Caller?,
+    mount: String,
+): Boolean = caller?.kind == Caller.Kind.SCOPED && caller.catalogClaimAllows(mount, Scope.READ)
+
+/**
+ * The names a catalog listing may show [caller] as mounts: those in its own
+ * `cat` that [requireMountReader] would let it read. Never null and never
+ * "every mount": no caller, a tenant and an operator see none.
+ */
+internal fun mountVisibility(caller: Caller?): Set<String> =
+    if (caller == null || caller.routing?.backend == BackendKind.HOGLITE) {
+        emptySet()
+    } else {
+        caller.catalogScopes.keys.filterTo(sortedSetOf()) { MountNames.isReserved(it) && mayReadMount(caller, it) }
+    }
 
 /**
  * The refusal for a route that has no mount implementation, chosen before any

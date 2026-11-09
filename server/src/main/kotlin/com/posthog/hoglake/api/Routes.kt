@@ -17,6 +17,7 @@ import com.posthog.hoglake.persistence.FileRepo
 import com.posthog.hoglake.service.ColumnTrees
 import com.posthog.hoglake.service.Identifiers
 import com.posthog.hoglake.service.ScanService
+import com.posthog.hoglake.store.CatalogBinding
 import com.posthog.hoglake.store.CatalogStore
 import com.posthog.hoglake.store.CatalogStoreSelector
 import com.posthog.hoglake.store.MountNames
@@ -129,7 +130,20 @@ fun Application.installApiRoutes(
                     }
                 // Totals are catalog-wide, so a scoped caller gets none.
                 val scoped = (call.hoglakeAuth as? AuthState.Authenticated)?.caller?.kind == Caller.Kind.SCOPED
-                call.respond(catalogs.listCatalogs(visible).map { it.toDto(if (scoped) null else totals[it.name]) })
+                // A catalog a mount shadows answers as the mount on every
+                // route, so it is not listed. The caller's own mounts follow,
+                // unsorted: re-sorting could reorder the backend's listing.
+                val listed = catalogs.listCatalogs(visible)
+                val mounts = selector.mountsAmong(listed.map { it.name } + listing.mounts)
+                val local =
+                    listed.filterNot { it.name in mounts }.map { it.toDto(if (scoped) null else totals[it.name]) }
+                val shown = listing.mounts.filter { it in mounts }
+                if (shown.isEmpty()) {
+                    call.respond(local)
+                } else {
+                    val source = selector.mountSource()
+                    call.respond(local + shown.map { source.toMountDto(it) })
+                }
             }
             post {
                 val req = call.receive<CreateCatalogRequestDto>()
@@ -147,8 +161,11 @@ fun Application.installApiRoutes(
 
             route("/{catalog}") {
                 get {
-                    val catalogs = selector.forCatalog(call, call.catalog())
-                    call.respond(catalogs.getCatalog(call.catalog()).toDto())
+                    // The one route a mount serves so far (AuthPolicy.MOUNT_ROUTES).
+                    when (val binding = selector.resolve(call, call.catalog())) {
+                        is CatalogBinding.Local -> call.respond(binding.store.getCatalog(call.catalog()).toDto())
+                        is CatalogBinding.Mount -> call.respond(selector.mountSource().toMountDto(binding.mount.name))
+                    }
                 }
                 delete {
                     val catalogs = selector.forCatalog(call, call.catalog())

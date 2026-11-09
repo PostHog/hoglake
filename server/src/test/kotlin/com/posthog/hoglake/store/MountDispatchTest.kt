@@ -4,6 +4,8 @@ import com.posthog.hoglake.Config
 import com.posthog.hoglake.api.installApiRoutes
 import com.posthog.hoglake.api.installErrorMapping
 import com.posthog.hoglake.api.installScanRoutes
+import com.posthog.hoglake.api.toDto
+import com.posthog.hoglake.api.toMountDto
 import com.posthog.hoglake.auth.AuthMode
 import com.posthog.hoglake.auth.AuthService
 import com.posthog.hoglake.auth.Caller
@@ -15,6 +17,7 @@ import com.posthog.hoglake.auth.TestTokens
 import com.posthog.hoglake.auth.installAuth
 import com.posthog.hoglake.auth.installNamespaceGate
 import com.posthog.hoglake.configureHoglakeWire
+import com.posthog.hoglake.model.CatalogInfo
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.observability.Metrics
 import io.ktor.client.request.get
@@ -43,6 +46,7 @@ import java.lang.reflect.Proxy
 import java.nio.file.Files
 import java.nio.file.Path
 import java.security.interfaces.ECPublicKey
+import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -240,13 +244,16 @@ class MountDispatchTest {
                 )
                 // A body-scoped write: the handler resolves the catalog first.
                 assertRefused(commit(scoped("write")), HttpStatusCode.Forbidden, "read_only_catalog")
-                // A token that places the mount on hoglite.
+                // A token that places the mount on hoglite, on a read the
+                // mount refuses and on the one it serves.
                 val routed = """{"b":"hoglite","be":"$hogliteId","t":"t_1"}"""
-                assertRefused(
-                    get("/v1/catalogs/$mount/namespaces", scoped(rtg = routed)),
-                    HttpStatusCode.NotImplemented,
-                    "not_supported_on_backend",
-                )
+                for (path in listOf("/v1/catalogs/$mount/namespaces", "/v1/catalogs/$mount")) {
+                    assertRefused(
+                        get(path, scoped(rtg = routed)),
+                        HttpStatusCode.NotImplemented,
+                        "not_supported_on_backend",
+                    )
+                }
                 // A PostgreSQL placement is this process's PostgreSQL: still a mount.
                 val local = """{"b":"postgres","be":"$postgresId"}"""
                 assertRefused(
@@ -257,6 +264,50 @@ class MountDispatchTest {
             }
         }
         assertThat(reached.get()).isZero()
+    }
+
+    @Test
+    fun `a listing shows a caller as mounts only the reserved names its own cat lets it read`() {
+        val other = "0190f3c4-1b2a-4c3d-8e4f-a5b6c7d8e9f1-events"
+        val cat = mapOf(mount to setOf(Scope.READ), other to setOf(Scope.WRITE), "lake" to setOf(Scope.READ))
+
+        fun caller(
+            kind: Caller.Kind,
+            scopes: Map<String, Set<Scope>> = cat,
+            routing: Routing? = null,
+        ) = Caller("sub", null, kind, scopes, "jti", null, routing = routing)
+
+        assertThat(mountVisibility(caller(Caller.Kind.SCOPED))).containsExactly(mount, other)
+        assertThat(mountVisibility(caller(Caller.Kind.SCOPED, mapOf(mount to emptySet())))).isEmpty()
+        val local = Routing(mount, BackendKind.POSTGRES, postgresId, null)
+        assertThat(mountVisibility(caller(Caller.Kind.SCOPED, routing = local))).containsExactly(mount, other)
+        val hoglite = Routing(mount, BackendKind.HOGLITE, hogliteId, "t_1")
+        assertThat(mountVisibility(caller(Caller.Kind.SCOPED, routing = hoglite))).isEmpty()
+        assertThat(mountVisibility(caller(Caller.Kind.TENANT))).isEmpty()
+        assertThat(mountVisibility(caller(Caller.Kind.OPERATOR, emptyMap()))).isEmpty()
+        assertThat(mountVisibility(null)).isEmpty()
+    }
+
+    @Test
+    fun `a mount's catalog is its source's row, read-only, with no capability and no totals`() {
+        val source =
+            CatalogInfo(
+                catalogId = 9,
+                name = "millrace-dev",
+                dataPath = "s3://bucket/millrace/millrace-dev",
+                headSnapshotId = 41,
+                schemaVersion = 7,
+                earliestSnapshotTime = Instant.parse("2026-11-01T00:00:00Z"),
+            )
+        val dto = source.toMountDto(mount)
+        val writes = source.toDto().capabilities
+        assertThat(writes).isNotEmpty()
+        assertThat(dto).isEqualTo(source.toDto().copy(name = mount, capabilities = emptyList(), readOnly = true))
+        assertThat(dto.capabilities).doesNotContainAnyElementsOf(writes)
+        assertThat(listOf(dto.tableCount, dto.liveRows, dto.liveSizeBytes, dto.oldestSnapshotTime))
+            .containsOnlyNulls()
+        // Every other catalog carries no `read_only` at all.
+        assertThat(source.toDto().readOnly).isNull()
     }
 
     @Test
