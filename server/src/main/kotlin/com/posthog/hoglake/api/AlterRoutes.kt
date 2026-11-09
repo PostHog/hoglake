@@ -21,10 +21,15 @@ import io.ktor.server.routing.routing
 fun Application.installAlterRoutes(
     alter: AlterBackend,
     selector: CatalogStoreSelector? = null,
+) = installAlterRoutes({ alter }, selector)
+
+fun Application.installAlterRoutes(
+    alter: () -> AlterBackend,
+    selector: CatalogStoreSelector? = null,
 ) {
     routing {
         post("/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/alter") {
-            val alter = selector?.alters(call, call.catalog(), alter) ?: alter
+            val alter = selector?.alters(call, call.catalog(), alter) ?: alter()
             val req = call.receive<AlterTableRequestDto>()
             if (req.ops.isEmpty()) {
                 throw BadRequestException("ops must contain at least one operation")

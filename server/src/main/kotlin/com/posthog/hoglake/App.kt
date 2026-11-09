@@ -44,6 +44,7 @@ import com.posthog.hoglake.service.RemovalStore
 import com.posthog.hoglake.service.RetirementService
 import com.posthog.hoglake.service.ScanService
 import com.posthog.hoglake.service.TableCreationService
+import com.posthog.hoglake.service.UploadService
 import com.posthog.hoglake.service.ViewService
 import com.posthog.hoglake.store.CatalogStore
 import com.posthog.hoglake.store.CatalogStoreSelector
@@ -74,7 +75,9 @@ import org.jdbi.v3.core.Jdbi
  */
 class App private constructor(
     val cfg: Config,
-    val jdbi: Jdbi,
+    private val jdbiProvider: () -> Jdbi,
+    private val postgresReady: () -> Boolean,
+    private val postgresRuntime: PostgresRuntime? = null,
     /**
      * `/healthz`'s own one-connection probe (#218). Injected so a test
      * can point it at a database it is allowed to stop; defaulted from
@@ -83,6 +86,9 @@ class App private constructor(
      */
     val healthProbe: HealthProbe,
 ) : AutoCloseable {
+    /** Access from a PostgreSQL request only; probes must use [postgresReady]. */
+    val jdbi: Jdbi get() = jdbiProvider()
+
     /**
      * The bounded pool every route handler's blocking work runs on.
      * Installed once, in [module], by [installBlockingDispatch] — see
@@ -100,46 +106,83 @@ class App private constructor(
      */
     val auth: com.posthog.hoglake.auth.AuthService by lazy { com.posthog.hoglake.auth.AuthService.fromConfig(cfg) }
 
-    private val catalogService = CatalogService(jdbi)
-    private val commitService =
+    private val catalogService by lazy {
+        CatalogService(jdbi)
+    }
+
+    private val commitService by lazy {
         CommitService(
             jdbi,
             commitLockTimeoutMs = cfg.commitLockTimeoutMs,
             refuseBlindPartitionedAppends = cfg.refuseBlindPartitionedAppends,
         )
-    private val alterService = AlterService(jdbi)
-    private val scanService = ScanService(jdbi)
+    }
+
+    private val alterService by lazy {
+        AlterService(jdbi)
+    }
+
+    private val scanService by lazy {
+        ScanService(jdbi)
+    }
 
     /** The default store stays PostgreSQL. Verified placement selects additional backends per request. */
-    private val catalogStore: CatalogStore = PostgresCatalogStore(catalogService, commitService, scanService)
-    private val catalogSelector = CatalogStoreSelector(catalogStore, cfg)
-    private val partitionLookupService = PartitionLookupService(jdbi)
-    private val viewService = ViewService(jdbi)
-    private val optionsService = OptionsService(jdbi)
-    private val expiryService = ExpiryService(jdbi, cfg)
+    private val catalogStore: CatalogStore by lazy {
+        PostgresCatalogStore({ catalogService }, { commitService }, { scanService })
+    }
+
+    private val catalogSelector by lazy {
+        CatalogStoreSelector(catalogStore, cfg)
+    }
+
+    private val partitionLookupService by lazy {
+        PartitionLookupService(jdbi)
+    }
+
+    private val viewService by lazy {
+        ViewService(jdbi)
+    }
+
+    private val tableCreationService by lazy {
+        TableCreationService(jdbi, catalogService, commitService, cfg.commitLockTimeoutMs)
+    }
+    private val uploadService by lazy { UploadService(jdbi, cfg.removalLedgerRetentionSeconds) }
+
+    private val optionsService by lazy {
+        OptionsService(jdbi)
+    }
+
+    private val expiryService by lazy {
+        ExpiryService(jdbi, cfg)
+    }
 
     /** Same threshold CompactionService plans with: debt == sweepable files. */
-    private val partitionStatsService =
+    private val partitionStatsService by lazy {
         PartitionStatsService(
             jdbi,
             smallFileThresholdBytes = cfg.compactionTargetBytes,
             minInputFiles = cfg.compactionMinInputFiles,
             maxInputFiles = cfg.compactionMaxInputFiles,
         )
+    }
 
     /**
      * The per-table partitions tab, over the same published sample and
      * the same policy the debt ranking uses — a sample computed under a
      * different compaction policy is unusable for both.
      */
-    private val partitionListingService =
+    private val partitionListingService by lazy {
         PartitionListingService(
             jdbi,
             smallFileThresholdBytes = cfg.compactionTargetBytes,
             minInputFiles = cfg.compactionMinInputFiles,
             maxInputFiles = cfg.compactionMaxInputFiles,
         )
-    private val removalStore = RemovalStore(cfg)
+    }
+
+    private val removalStore by lazy {
+        RemovalStore(cfg)
+    }
 
     /**
      * Every cleanup knob comes from `CleanupService`'s own `Config`
@@ -149,7 +192,9 @@ class App private constructor(
      * same predicate the refusal prices on, and stating it at this call
      * site is how the two could quietly diverge.
      */
-    private val cleanupService = CleanupService(jdbi, removalStore, cfg)
+    private val cleanupService by lazy {
+        CleanupService(jdbi, removalStore, cfg)
+    }
 
     /**
      * Paced retirement of dropped tables' file rows — the other half of
@@ -157,7 +202,7 @@ class App private constructor(
      * maintenance workload alone, because a batch takes the per-catalog
      * commit lock.
      */
-    private val retirementService =
+    private val retirementService by lazy {
         RetirementService(
             jdbi,
             batchSize = cfg.retirementBatch,
@@ -166,24 +211,28 @@ class App private constructor(
             queueCeiling = cfg.retirementQueueCeiling,
             commitLockTimeoutMs = cfg.commitLockTimeoutMs,
         )
+    }
 
     /**
      * The hourly index-bloat check + REINDEX (#268). Built on every pod:
      * the health page uses its estimate. The loop, and the
      * `hoglake_index_bloat_bytes` gauge, belong to the pod that runs it.
      */
-    private val reindexService =
+    private val reindexService by lazy {
         ReindexService(
             jdbi,
             publishGauge = cfg.reindexIntervalMs > 0,
             purgeWaitWindows = cfg.reindexPurgeWaitWindows,
         )
+    }
 
     /** Shared read/put store: hydrator footer reads + compaction rewrites. */
-    private val objectStore = ObjectStore(cfg)
+    private val objectStore by lazy {
+        ObjectStore(cfg)
+    }
 
     /** One hydrator: the background sweep loop AND the rehydrate route. */
-    private val hydrator =
+    private val hydrator by lazy {
         Hydrator(
             jdbi,
             objectStore,
@@ -191,11 +240,14 @@ class App private constructor(
             claimTimeoutMs = cfg.hydratorClaimTimeoutMs,
             minFileBytes = cfg.hydratorMinFileBytes,
         )
+    }
 
     /** This pod's name, for the compaction planner's cursor spread and loop jitter. */
-    private val plannerIdentity = CompactionService.defaultPlannerIdentity()
+    private val plannerIdentity by lazy {
+        CompactionService.defaultPlannerIdentity()
+    }
 
-    private val compactionService =
+    private val compactionService by lazy {
         CompactionService(
             jdbi,
             objectStore,
@@ -231,9 +283,10 @@ class App private constructor(
             // constructor's default is no seeding, for the tests' sake.
             plannerIdentity = plannerIdentity,
         )
+    }
 
     /** The run ledger's read side: status + history routes (webui maintenance page). */
-    private val maintenanceStatusService =
+    private val maintenanceStatusService by lazy {
         MaintenanceStatusService(
             jdbi,
             hydratorIntervalMs = cfg.hydratorIntervalMs,
@@ -246,8 +299,9 @@ class App private constructor(
             minInputFiles = cfg.compactionMinInputFiles,
             maxInputFiles = cfg.compactionMaxInputFiles,
         )
+    }
 
-    private val maintenanceSummarySampler =
+    private val maintenanceSummarySampler by lazy {
         MaintenanceSummarySampler(
             jdbi,
             cfg.compactionTargetBytes,
@@ -255,6 +309,7 @@ class App private constructor(
             cfg.compactionMaxInputFiles,
             cfg.maintenanceSummaryRefreshSeconds,
         )
+    }
 
     /**
      * The process meter registry: Ktor http server metrics land here via
@@ -274,7 +329,7 @@ class App private constructor(
         }
 
     /** Catalog-health gauge sampler; tests drive [CatalogMetrics.sampleOnce] directly. */
-    val catalogMetrics =
+    val catalogMetrics by lazy {
         CatalogMetrics(
             jdbi,
             meterRegistry,
@@ -283,8 +338,62 @@ class App private constructor(
             // not each republish the same instance-wide series.
             extendedGroups = cfg.maintenanceSummaryIntervalMs > 0,
         )
+    }
+
+    init {
+        if (postgresReady()) initializePostgresServices()
+    }
+
+    /** Keep eager-mode service construction and gauges at boot, as before. */
+    private fun initializePostgresServices() {
+        catalogService
+        commitService
+        alterService
+        scanService
+        catalogStore
+        catalogSelector
+        partitionLookupService
+        viewService
+        optionsService
+        expiryService
+        partitionStatsService
+        partitionListingService
+        removalStore
+        cleanupService
+        retirementService
+        reindexService
+        objectStore
+        hydrator
+        plannerIdentity
+        compactionService
+        maintenanceStatusService
+        maintenanceSummarySampler
+        catalogMetrics
+    }
 
     companion object {
+        /** Production boot: the default keeps the existing eager migration order. */
+        fun build(cfg: Config): App {
+            val postgres = PostgresRuntime(cfg)
+            try {
+                if (cfg.defaultBackend == "postgres") postgres.get()
+                val app = App(cfg, postgres::get, { postgres.isInitialized }, postgres, HealthProbe.fromConfig(cfg))
+                app.bindMetrics(null)
+                postgres.onInitialized = { pool ->
+                    Metrics.registerDbPoolGauges(app.meterRegistry, pool)
+                    app.startBackgroundIfReady()
+                }
+                // Eager initialization ran before the callback was installed.
+                if (postgres.isInitialized) {
+                    postgres.notifyInitialized()
+                }
+                return app
+            } catch (e: Exception) {
+                postgres.close()
+                throw e
+            }
+        }
+
         /**
          * @param dataSource the REQUEST pool, when the caller has it —
          *   `Main.kt` does. It is only ever read through its MXBean, to
@@ -300,17 +409,21 @@ class App private constructor(
             dataSource: HikariDataSource? = null,
             healthProbe: HealthProbe = HealthProbe.fromConfig(cfg),
         ): App =
-            App(cfg, jdbi, healthProbe).also {
-                Metrics.bind(it.meterRegistry)
-                Metrics.registerRequestPoolGauges(it.meterRegistry, it.requestDispatcher)
-                Metrics.registerHealthProbeGauge(it.meterRegistry) { it.healthProbe.outstandingAttempts }
-                // Every pod, not only the loop's: a manual run spills too.
-                val spillDir = java.nio.file.Path.of(cfg.compactionSpillDir)
-                Metrics.registerSpillDirGauge(it.meterRegistry) {
-                    com.posthog.hoglake.compaction.SpillDirectory.measuredBytes(spillDir)
-                }
-                if (dataSource != null) Metrics.registerDbPoolGauges(it.meterRegistry, dataSource)
+            App(cfg, { jdbi }, { true }, healthProbe = healthProbe).also {
+                it.bindMetrics(dataSource)
             }
+    }
+
+    private fun bindMetrics(dataSource: HikariDataSource?) {
+        Metrics.bind(meterRegistry)
+        Metrics.registerRequestPoolGauges(meterRegistry, requestDispatcher)
+        Metrics.registerHealthProbeGauge(meterRegistry) { healthProbe.outstandingAttempts }
+        // Every pod, not only the loop's: a manual run spills too.
+        val spillDir = java.nio.file.Path.of(cfg.compactionSpillDir)
+        Metrics.registerSpillDirGauge(meterRegistry) {
+            com.posthog.hoglake.compaction.SpillDirectory.measuredBytes(spillDir)
+        }
+        if (dataSource != null) Metrics.registerDbPoolGauges(meterRegistry, dataSource)
     }
 
     /**
@@ -408,7 +521,7 @@ class App private constructor(
             // pool nor a full request dispatcher can delay it.
             get("/healthz") {
                 val ok =
-                    healthProbe.reachable() &&
+                    (!postgresReady() || healthProbe.reachable()) &&
                         kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
                             catalogSelector.reachable()
                         }
@@ -426,34 +539,34 @@ class App private constructor(
         app.installApiRoutes(
             catalogSelector,
             cfg.instanceName,
-            instanceTotals = { catalogMetrics.latestTotals },
-            catalogTotals = { catalogMetrics.latestByCatalog },
+            instanceTotals = { if (postgresReady()) catalogMetrics.latestTotals else null },
+            catalogTotals = { if (postgresReady()) catalogMetrics.latestByCatalog else emptyMap() },
             uiTheme = cfg.uiTheme,
         )
         app.installTableCreationRoutes(
-            TableCreationService(jdbi, catalogService, commitService, cfg.commitLockTimeoutMs),
+            { tableCreationService },
             selector = catalogSelector,
         )
         app.installUploadRoutes(
-            com.posthog.hoglake.service.UploadService(jdbi, cfg.removalLedgerRetentionSeconds),
+            { uploadService },
             selector = catalogSelector,
         )
-        app.installAlterRoutes(alterService, selector = catalogSelector)
+        app.installAlterRoutes({ alterService }, selector = catalogSelector)
         app.installScanRoutes(catalogSelector)
-        app.installViewRoutes(viewService, selector = catalogSelector)
+        app.installViewRoutes({ viewService }, selector = catalogSelector)
         app.installMaintenanceRoutes(
-            optionsService,
-            expiryService,
-            cleanupService,
-            compactionService,
-            hydrator,
-            maintenanceStatusService,
-            DatabaseHealthService(jdbi, reindexService),
+            { optionsService },
+            { expiryService },
+            { cleanupService },
+            { compactionService },
+            { hydrator },
+            { maintenanceStatusService },
+            { DatabaseHealthService(jdbi, reindexService) },
             selector = catalogSelector,
         )
-        app.installPartitionStatsRoutes(partitionStatsService, selector = catalogSelector)
-        app.installPartitionListingRoutes(partitionListingService, selector = catalogSelector)
-        app.installPartitionLookupRoutes(partitionLookupService, selector = catalogSelector)
+        app.installPartitionStatsRoutes({ partitionStatsService }, selector = catalogSelector)
+        app.installPartitionListingRoutes({ partitionListingService }, selector = catalogSelector)
+        app.installPartitionLookupRoutes({ partitionLookupService }, selector = catalogSelector)
         app.installPublicationRoutes(catalogSelector)
         app.installDebugRoutes()
     }
@@ -464,7 +577,32 @@ class App private constructor(
      * close, per-loop failure isolation, `intervalMs <= 0` = disabled.
      * The returned handle stops every loop and closes the stores.
      */
+    private val backgroundLock = Any()
+    private var backgroundRequested = false
+    private var backgroundClosed = false
+    private var background: AutoCloseable? = null
+
     fun startBackground(): AutoCloseable {
+        synchronized(backgroundLock) { backgroundRequested = true }
+        startBackgroundIfReady()
+        return AutoCloseable { closeBackground() }
+    }
+
+    private fun startBackgroundIfReady() =
+        synchronized(backgroundLock) {
+            if (backgroundRequested && !backgroundClosed && background == null && postgresReady()) {
+                background = startPostgresBackground()
+            }
+        }
+
+    private fun closeBackground() =
+        synchronized(backgroundLock) {
+            backgroundClosed = true
+            background?.close()
+            background = null
+        }
+
+    private fun startPostgresBackground(): AutoCloseable {
         // BEFORE any loop starts, once, and only where the compaction loop
         // runs: a previous container in this pod may have been killed
         // mid-rewrite, and its `hoglake-compaction-spill-*` directories are on an emptyDir
@@ -545,6 +683,8 @@ class App private constructor(
      */
     override fun close() {
         requestDispatcher.close()
+        closeBackground()
         healthProbe.close()
+        postgresRuntime?.close()
     }
 }

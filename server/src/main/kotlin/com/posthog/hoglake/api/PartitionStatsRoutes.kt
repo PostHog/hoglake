@@ -26,10 +26,15 @@ import java.util.UUID
 fun Application.installPartitionStatsRoutes(
     stats: PartitionStatsBackend,
     selector: CatalogStoreSelector? = null,
+) = installPartitionStatsRoutes({ stats }, selector)
+
+fun Application.installPartitionStatsRoutes(
+    stats: () -> PartitionStatsBackend,
+    selector: CatalogStoreSelector? = null,
 ) {
     routing {
         get("/v1/catalogs/{catalog}/stats/partitions") {
-            val stats = selector?.partitionStats(call, call.catalog(), stats) ?: stats
+            val stats = selector?.partitionStats(call, call.catalog(), stats) ?: stats()
             call.respond(
                 stats.partitionStats(
                     call.catalog(),

@@ -44,7 +44,34 @@ fun Application.installMaintenanceRoutes(
     status: MaintenanceStatusService,
     databaseHealth: DatabaseHealthService,
     selector: CatalogStoreSelector? = null,
+) = installMaintenanceRoutes(
+    { options },
+    { expiry },
+    { cleanup },
+    { compaction },
+    { hydrator },
+    { status },
+    { databaseHealth },
+    selector,
+)
+
+fun Application.installMaintenanceRoutes(
+    optionsProvider: () -> OptionsService,
+    expiryProvider: () -> ExpiryService,
+    cleanupProvider: () -> CleanupService,
+    compactionProvider: () -> CompactionService,
+    hydratorProvider: () -> Hydrator,
+    statusProvider: () -> MaintenanceStatusService,
+    databaseHealthProvider: () -> DatabaseHealthService,
+    selector: CatalogStoreSelector? = null,
 ) {
+    val options by lazy(optionsProvider)
+    val expiry by lazy(expiryProvider)
+    val cleanup by lazy(cleanupProvider)
+    val compaction by lazy(compactionProvider)
+    val hydrator by lazy(hydratorProvider)
+    val status by lazy(statusProvider)
+    val databaseHealth by lazy(databaseHealthProvider)
     routing {
         route("/v1/catalogs/{catalog}") {
             route("/options") {

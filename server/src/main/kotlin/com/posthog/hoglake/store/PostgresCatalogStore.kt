@@ -1,5 +1,6 @@
 package com.posthog.hoglake.store
 
+import com.posthog.hoglake.Config
 import com.posthog.hoglake.commit.CommitService
 import com.posthog.hoglake.model.CatalogInfo
 import com.posthog.hoglake.model.ChangesPlan
@@ -23,6 +24,7 @@ import com.posthog.hoglake.model.TableSummaryInfo
 import com.posthog.hoglake.persistence.FileRepo
 import com.posthog.hoglake.service.CatalogService
 import com.posthog.hoglake.service.ScanService
+import org.jdbi.v3.core.Jdbi
 import java.time.Instant
 import java.util.UUID
 
@@ -34,10 +36,23 @@ import java.util.UUID
  * locks and validation stay in the services.
  */
 class PostgresCatalogStore(
-    private val catalogs: CatalogService,
-    private val commits: CommitService,
-    private val scans: ScanService,
+    catalogProvider: () -> CatalogService,
+    commitProvider: () -> CommitService,
+    scanProvider: () -> ScanService,
 ) : CatalogStore {
+    constructor(catalogs: CatalogService, commits: CommitService, scans: ScanService) :
+        this({ catalogs }, { commits }, { scans })
+
+    constructor(jdbi: () -> Jdbi, cfg: Config) : this(
+        { CatalogService(jdbi()) },
+        { CommitService(jdbi(), cfg.commitLockTimeoutMs, cfg.refuseBlindPartitionedAppends) },
+        { ScanService(jdbi()) },
+    )
+
+    private val catalogs by lazy(catalogProvider)
+    private val commits by lazy(commitProvider)
+    private val scans by lazy(scanProvider)
+
     override fun createCatalog(
         name: String,
         dataPath: String,

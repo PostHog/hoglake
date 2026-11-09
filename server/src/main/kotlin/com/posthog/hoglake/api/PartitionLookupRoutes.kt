@@ -41,12 +41,17 @@ private val PartitionLookupBodyLimit =
 fun Application.installPartitionLookupRoutes(
     lookups: PartitionLookupBackend,
     selector: CatalogStoreSelector? = null,
+) = installPartitionLookupRoutes({ lookups }, selector)
+
+fun Application.installPartitionLookupRoutes(
+    lookups: () -> PartitionLookupBackend,
+    selector: CatalogStoreSelector? = null,
 ) {
     routing {
         route("/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/partitions/lookup") {
             install(PartitionLookupBodyLimit)
             post {
-                val lookups = selector?.partitionLookup(call, call.catalog(), lookups) ?: lookups
+                val lookups = selector?.partitionLookup(call, call.catalog(), lookups) ?: lookups()
                 if (call.request.queryParameters.contains("at_timestamp")) {
                     throw PartitionLookupInvalidRequest("at_timestamp is unsupported; use snapshot")
                 }

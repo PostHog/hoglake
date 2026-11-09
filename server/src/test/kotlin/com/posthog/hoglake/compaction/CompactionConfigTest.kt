@@ -445,7 +445,8 @@ class CompactionConfigTest {
         val app = Files.readString(Path.of("src/main/kotlin/com/posthog/hoglake/App.kt"))
         assertThat(app)
             .containsPattern(
-                """(?s)fun startBackground\(\): AutoCloseable \{.{0,900}if \(cfg\.compactionIntervalMs > 0\) \{\s*""" +
+                """(?s)fun startPostgresBackground\(\): AutoCloseable \{.{0,900}""" +
+                    """if \(cfg\.compactionIntervalMs > 0\) \{\s*""" +
                     """com\.posthog\.hoglake\.compaction\.SpillDirectory\.sweepLeftovers""" +
                     """.{0,200}val loops = BackgroundLoops\(\)""",
             )

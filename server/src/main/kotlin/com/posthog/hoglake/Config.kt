@@ -18,7 +18,7 @@ data class Config(
      * Entries contain endpoints, never credentials. Each id must be unique and canonical.
      */
     val backendsFile: String = env("HOGLAKE_BACKENDS_FILE", ""),
-    /** PostgreSQL is the only default backend. `none` disables fallback, not PostgreSQL startup. */
+    /** PostgreSQL is the only default backend. `none` disables fallback and opens PostgreSQL only on a routed request. */
     val defaultBackend: String = env("HOGLAKE_DEFAULT_BACKEND", "postgres"),
     /** Optional allowlist id for this process's PostgreSQL backend. */
     val postgresBackendId: String = env("HOGLAKE_POSTGRES_BACKEND_ID", ""),
@@ -52,9 +52,10 @@ data class Config(
     val instanceName: String = env("HOGLAKE_INSTANCE_NAME", ""),
     /** Color theme for the webui. Empty keeps the default palette. */
     val uiTheme: String = env("HOGLAKE_UI_THEME", ""),
-    val jdbcUrl: String = env("HOGLAKE_JDBC_URL", "jdbc:postgresql://localhost:5432/hoglake"),
-    val dbUser: String = env("HOGLAKE_DB_USER", "hoglake"),
-    val dbPassword: String = env("HOGLAKE_DB_PASSWORD", "hoglake"),
+    val jdbcUrl: String =
+        env("HOGLAKE_JDBC_URL", if (defaultBackend == "postgres") "jdbc:postgresql://localhost:5432/hoglake" else ""),
+    val dbUser: String = env("HOGLAKE_DB_USER", if (defaultBackend == "postgres") "hoglake" else ""),
+    val dbPassword: String = env("HOGLAKE_DB_PASSWORD", if (defaultBackend == "postgres") "hoglake" else ""),
     val dbPoolSize: Int = env("HOGLAKE_DB_POOL_SIZE", "10").toInt(),
     /**
      * How many threads serve blocking route handlers (#218).
@@ -1282,6 +1283,11 @@ data class Config(
             }
 
     init {
+        if (defaultBackend == "none" && postgresBackendId.isNotEmpty()) {
+            require(jdbcUrl.isNotBlank()) { "HOGLAKE_JDBC_URL is required for a PostgreSQL backend" }
+            require(dbUser.isNotBlank()) { "HOGLAKE_DB_USER is required for a PostgreSQL backend" }
+            require(dbPassword.isNotEmpty()) { "HOGLAKE_DB_PASSWORD is required for a PostgreSQL backend" }
+        }
         require(defaultBackend == "postgres" || defaultBackend == "none") {
             "HOGLAKE_DEFAULT_BACKEND must be postgres or none; hoglite cannot be a default backend"
         }
