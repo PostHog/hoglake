@@ -530,8 +530,7 @@ prefix_quarantined`: pending, failed and quarantined files stay out.
 No endpoint is such a reader yet (a mount's `ReadScope` compiles the
 predicate, docs/auth-tenancy.md §6.5a, but no route serves it): nothing
 clears the flag, it is on no response, and GET /scan returns a quarantined
-file as `provided`. The DDL
-keeps the layout true: the option is set only on an EMPTY table whose
+file as `provided`. The DDL keeps the layout true: the option is set only on an EMPTY table whose
 spec has exactly one identity field on the column, once (the same field
 again changes nothing, though the request still commits its DDL
 snapshot like every alter, and there is no unset); while it is on, a spec change must

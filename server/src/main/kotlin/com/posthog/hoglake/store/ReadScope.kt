@@ -11,11 +11,12 @@ import org.jdbi.v3.core.statement.SqlStatement
 
 /**
  * The files one mount read may see (#291 §6-§7, `ReadScope`): the files
- * of one table, visible at the statement's snapshot, whose identity partition value on the mount's field
- * is in [values], and whose stats prove it (`stats_state = 'provided' AND
- * NOT prefix_quarantined`, [ObjectPrefix]). Every statement a mount
- * serves ANDs [sql] in, before limits, stats and totals, so nothing a
- * mount returns comes from a file outside it.
+ * of one table, visible at the statement's snapshot, whose identity
+ * partition value on the mount's field is in [values], and whose stats
+ * prove it (`stats_state = 'provided' AND NOT prefix_quarantined`,
+ * [ObjectPrefix]). Every statement a mount serves ANDs [sql] in, before
+ * limits, stats and totals, so nothing a mount returns comes from a file
+ * outside it.
  *
  * [values] are the caller's `prd` values that grant read, intersected with
  * the mount's; `*` means the mount's (#147 D5, D6). A token never widens
