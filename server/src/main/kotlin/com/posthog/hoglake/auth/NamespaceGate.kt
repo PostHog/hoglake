@@ -92,7 +92,28 @@ private fun Application.installCallNamespaceGate(
         val pending = call.attributes.getOrNull(PendingNamespaceKey) ?: return@intercept
         val caller = call.hoglakeAuth.callerOrNull
         val service = call.application.attributes[AuthServiceKey]
-        val held = containment(call, pending.catalog, pending.namespace)
+        val held =
+            try {
+                containment(call, pending.catalog, pending.namespace)
+            } catch (failure: HoglakeException) {
+                // The lookup answered the request itself; the error mapping
+                // sends the answer, and this counts the request's one auth
+                // outcome. An outage is not an auth outcome.
+                when (failure) {
+                    // A mount reader on a route the mount does not serve
+                    // (store/Mounts.kt): authorized, as the plugin counts it
+                    // on the scoped routes it allows outright.
+                    is HoglakeException.ReadOnlyCatalog, is HoglakeException.MountOperationUnavailable ->
+                        Metrics.authRequest(service.mode.wire, service.listener, "ok", clientClass(call))
+                    // A mount placed on hoglite, or a catalog no backend holds.
+                    is HoglakeException.NotSupported, is HoglakeException.NotFound -> {
+                        val match = AuthPolicy.match(call.request.httpMethod, call.request.path())
+                        countRefusal(service, clientClass(call), caller, match, failure, enforced = true)
+                    }
+                    else -> Unit
+                }
+                throw failure
+            }
         if (caller != null && held != null &&
             caller.mayUseContained(pending.catalog, held.field, held.value, pending.required)
         ) {

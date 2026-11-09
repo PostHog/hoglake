@@ -42,7 +42,7 @@ class CatalogStoreSelector(
     ): CatalogStore =
         when (val binding = resolve(call, catalog)) {
             is CatalogBinding.Local -> binding.store
-            is CatalogBinding.Mount -> throw mountRefusal(call)
+            is CatalogBinding.Mount -> throw mountRefusal(call, binding.mount)
         }
 
     /** A mount name resolves first, then verified placement, then the default backend. */
@@ -64,7 +64,7 @@ class CatalogStoreSelector(
     ): CatalogBinding.Mount? {
         if (!MountNames.isReserved(catalog) || defaultPostgres() == null) return null
         val record = mounts.find(catalog) ?: return null
-        requireMountReader(call.hoglakeAuth.callerOrNull, catalog)
+        requireMountReader(call.hoglakeAuth.callerOrNull, record)
         return CatalogBinding.Mount(record)
     }
 

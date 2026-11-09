@@ -16,6 +16,7 @@ import com.posthog.hoglake.auth.installAuth
 import com.posthog.hoglake.auth.installNamespaceGate
 import com.posthog.hoglake.configureHoglakeWire
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.observability.Metrics
 import io.ktor.client.request.get
 import io.ktor.client.request.header
 import io.ktor.client.request.post
@@ -32,8 +33,10 @@ import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.server.plugins.statuspages.StatusPages
 import io.ktor.server.testing.ApplicationTestBuilder
 import io.ktor.server.testing.testApplication
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
+import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.lang.reflect.Proxy
@@ -74,6 +77,16 @@ class MountDispatchTest {
     }
 
     private val oneMount = MountRegistry { if (it == mount) MountRecord(it) else null }
+
+    @AfterEach
+    fun unbindMetrics() = Metrics.clear()
+
+    /** `name`'s counts by the values of [tag]; one series per value. */
+    private fun SimpleMeterRegistry.counts(
+        name: String,
+        tag: String,
+    ): Map<String, Double> =
+        find(name).counters().groupBy { it.id.getTag(tag)!! }.mapValues { (_, c) -> c.sumOf { it.count() } }
 
     private fun mounts(
         switchOn: () -> Boolean = { true },
@@ -182,12 +195,13 @@ class MountDispatchTest {
             cat: Map<String, Set<Scope>> = mapOf(mount to setOf(Scope.READ)),
             routing: Routing? = null,
         ) = Caller("sub", null, kind, cat, "jti", null, routing = routing)
+        val record = MountRecord(mount)
 
-        requireMountReader(caller(Caller.Kind.SCOPED), mount)
-        requireMountReader(caller(Caller.Kind.SCOPED, mapOf(mount to setOf(Scope.WRITE))), mount)
+        requireMountReader(caller(Caller.Kind.SCOPED), record)
+        requireMountReader(caller(Caller.Kind.SCOPED, mapOf(mount to setOf(Scope.WRITE))), record)
         requireMountReader(
             caller(Caller.Kind.SCOPED, routing = Routing(mount, BackendKind.POSTGRES, postgresId, null)),
-            mount,
+            record,
         )
         for (refused in listOf(
             null,
@@ -195,7 +209,7 @@ class MountDispatchTest {
             caller(Caller.Kind.OPERATOR, emptyMap()),
             caller(Caller.Kind.SCOPED, mapOf("lake" to setOf(Scope.READ))),
         )) {
-            assertThatThrownBy { requireMountReader(refused, mount) }
+            assertThatThrownBy { requireMountReader(refused, record) }
                 .describedAs("%s", refused?.kind)
                 .isInstanceOf(HoglakeException.NotFound::class.java)
                 .hasMessage("catalog '$mount'")
@@ -203,7 +217,7 @@ class MountDispatchTest {
         assertThatThrownBy {
             requireMountReader(
                 caller(Caller.Kind.SCOPED, routing = Routing(mount, BackendKind.HOGLITE, hogliteId, "t_1")),
-                mount,
+                record,
             )
         }.isInstanceOf(HoglakeException.NotSupported::class.java)
     }
@@ -317,5 +331,93 @@ class MountDispatchTest {
             )
         }
         assertThat(reached.get()).isEqualTo(3)
+    }
+
+    @Test
+    fun `each mount refusal is counted once by its error code, for mounts the registry holds only`() {
+        val registry = SimpleMeterRegistry().also { Metrics.bind(it) }
+        val routed = """{"b":"hoglite","be":"$hogliteId","t":"t_1"}"""
+        val other = "0190f3c4-1b2a-4c3d-8e4f-a5b6c7d8e9f1-events"
+        dispatch(AuthMode.ENFORCE) {
+            assertRefused(
+                get("/v1/catalogs/$mount/namespaces", scoped()),
+                HttpStatusCode.NotImplemented,
+                "mount_operation_unavailable",
+            )
+            assertRefused(commit(scoped("write")), HttpStatusCode.Forbidden, "read_only_catalog")
+            assertRefused(
+                get("/v1/catalogs/$mount/namespaces", scoped(rtg = routed)),
+                HttpStatusCode.NotImplemented,
+                "not_supported_on_backend",
+            )
+            assertRefused(get("/v1/catalogs/$mount", tenant()), HttpStatusCode.NotFound, "not_found")
+            // MUTATION: count before the registry holds the name and these
+            // add series: a reserved name that is not a mount, and a held
+            // one reached through the store with the switch off, below.
+            get("/v1/catalogs/$other", operator())
+        }
+        dispatch(AuthMode.ENFORCE, mounts(switchOn = { false })) { get("/v1/catalogs/$mount", tenant()) }
+        assertThat(registry.counts("hoglake_mount_refusals_total", "reason")).isEqualTo(
+            mapOf(
+                "mount_operation_unavailable" to 1.0,
+                "read_only_catalog" to 1.0,
+                "not_supported_on_backend" to 1.0,
+                "not_found" to 1.0,
+            ),
+        )
+        val ids = registry.find("hoglake_mount_refusals_total").counters().map { it.id }
+        assertThat(ids.map { it.getTag("catalog") }.toSet()).containsExactly(mount)
+        assertThat(ids.flatMap { id -> id.tags.map { it.key } }.toSet()).containsExactlyInAnyOrder("catalog", "reason")
+    }
+
+    @Test
+    fun `the gate counts the request's one auth outcome when its lookup answers, and none for an outage`() {
+        val registry = SimpleMeterRegistry().also { Metrics.bind(it) }
+        val table = "namespaces/ingest/tables/events"
+        val scan = "$table/scan"
+        val routed = """{"b":"hoglite","be":"$hogliteId","t":"t_1"}"""
+        dispatch(AuthMode.ENFORCE) {
+            assertRefused(
+                get("/v1/catalogs/$mount/$scan", scoped()),
+                HttpStatusCode.NotImplemented,
+                "mount_operation_unavailable",
+            )
+            assertRefused(
+                get("/v1/catalogs/$mount/$scan", scoped(rtg = routed)),
+                HttpStatusCode.NotImplemented,
+                "not_supported_on_backend",
+            )
+            // A scoped writer on a namespaced write route.
+            val truncate =
+                client.post("/v1/catalogs/$mount/$table/truncate") {
+                    header(HttpHeaders.Authorization, "Bearer ${scoped("write")}")
+                }
+            assertRefused(truncate, HttpStatusCode.Forbidden, "read_only_catalog")
+            // MUTATION: count every exception and this outage (the routed
+            // engine is down) is counted as a refusal.
+            assertRefused(
+                get("/v1/catalogs/lake/$scan", scoped(catalog = "lake", rtg = routed)),
+                HttpStatusCode.ServiceUnavailable,
+                "backend_unavailable",
+            )
+        }
+        dispatch(AuthMode.ENFORCE, default = "none") {
+            // No backend holds the catalog: the lookup's 404 is the refusal.
+            assertRefused(
+                get("/v1/catalogs/lake/$scan", scoped(catalog = "lake")),
+                HttpStatusCode.NotFound,
+                "not_found",
+            )
+        }
+        // A mount reader on a route the mount does not serve is authorized,
+        // as the plugin counts it on the routes it allows outright.
+        // MUTATION: drop the gate's catch and none of these has an outcome.
+        assertThat(registry.counts("hoglake_auth_requests_total", "outcome"))
+            .isEqualTo(mapOf("ok" to 2.0, "other" to 1.0, "not_entitled" to 1.0))
+        // Each refused mount request also counts once against the mount.
+        assertThat(registry.counts("hoglake_mount_refusals_total", "reason")).isEqualTo(
+            mapOf("mount_operation_unavailable" to 1.0, "not_supported_on_backend" to 1.0, "read_only_catalog" to 1.0),
+        )
+        assertThat(reached.get()).isZero()
     }
 }

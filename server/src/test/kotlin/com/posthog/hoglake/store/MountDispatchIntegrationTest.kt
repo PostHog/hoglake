@@ -127,6 +127,11 @@ class MountDispatchIntegrationTest {
                     .replace(Regex("\\{[a-zA-Z]+}"), "x")
         }
 
+    /** The labels of one exposition line. */
+    private fun labels(line: String): Map<String, String> =
+        Regex("""(\w+)="([^"]*)"""").findAll(line.substringAfter('{').substringBefore('}'))
+            .associate { it.groupValues[1] to it.groupValues[2] }
+
     /** A content hash of every `hog_` table: a refused request must leave all of them unchanged. */
     private fun fingerprint(): Map<String, String> =
         db.jdbi.withHandle<Map<String, String>, Exception> { h ->
@@ -171,6 +176,7 @@ class MountDispatchIntegrationTest {
         try {
             withServer { port ->
                 val before = fingerprint()
+                val refusals = mutableMapOf<String, Int>()
                 for ((rule, path) in catalogRoutes()) {
                     // An operator passes the plugin everywhere; only the binding stops it.
                     val operator = send(port, rule.method, path, operator())
@@ -178,6 +184,7 @@ class MountDispatchIntegrationTest {
                         .isEqualTo(404)
                     assertThat(operator.body()).describedAs(path)
                         .isEqualTo("""{"error":"not_found","detail":"catalog '$mount'"}""")
+                    refusals.merge("not_found", 1, Int::plus)
                     // A scoped caller naming the mount: the plugin lets it reach
                     // the binding on its own routes, and refuses it elsewhere.
                     val scoped = send(port, rule.method, path, scoped())
@@ -192,8 +199,18 @@ class MountDispatchIntegrationTest {
                     assertThat(scoped.statusCode() to scoped.body().substringAfter("\"error\":\"").substringBefore('"'))
                         .describedAs("%s %s: %s", rule.method.value, path, scoped.body())
                         .isEqualTo(expected)
+                    if (scopedRoute) refusals.merge(expected.second, 1, Int::plus)
                 }
                 assertThat(fingerprint()).isEqualTo(before)
+                // One count per refused request, by its code, labelled with the
+                // mount's name only: no team id from the token's `prd`.
+                val series =
+                    send(port, HttpMethod.Get, "/metrics", operator()).body().lines()
+                        .filter { it.startsWith("hoglake_mount_refusals_total{") }
+                assertThat(
+                    series.associate { labels(it).getValue("reason") to it.substringAfterLast(' ').toDouble().toInt() },
+                ).isEqualTo(refusals)
+                assertThat(series.map { labels(it) - "reason" }.toSet()).containsExactly(mapOf("catalog" to mount))
             }
         } finally {
             switch(false)
