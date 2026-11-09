@@ -274,7 +274,7 @@ class MountApiIntegrationTest {
     }
 
     @Test
-    fun `of writers racing from one revision, exactly one wins`() {
+    fun `of eight writers from one revision, one lands (a smoke test, raced below is the proof)`() {
         val name = mount(5)
         for (revision in 0L..2L) {
             val pool = Executors.newFixedThreadPool(8)

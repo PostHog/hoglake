@@ -73,9 +73,10 @@ class MountStore(
             // write below lands, the row was still [before] when it did.
             val before = read(h, name)
             if ((before?.revision ?: 0) != revision) throw conflict(name, before?.revision ?: 0, revision)
-            // The guard is the CAS: a writer racing from the same revision
-            // waits on the winner's row (or its unique entry, for a first
-            // write), then finds it moved and writes nothing.
+            // The read above is the only check for a mount never written
+            // (the INSERT has no guard). Once a row exists the guard is the
+            // CAS: a racing writer waits on the winner's row (or its unique
+            // entry), then finds it moved and writes nothing.
             val written =
                 h.createUpdate(
                     """

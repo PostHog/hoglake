@@ -43,8 +43,8 @@ private fun MountRecord.toDto() = MountDto(name, revision, enabled, values.map {
 /**
  * The mount API (operator only, `auth/AuthPolicy.kt`). Reads serve any
  * operator; a write serves only the token whose `sub` is [writer]
- * (HOGLAKE_MOUNT_WRITER_SUBJECT), checked before the body is read, in every
- * auth mode. Every write attempt is one `mount_write` audit line.
+ * (HOGLAKE_MOUNT_WRITER_SUBJECT), verified and checked before the body is
+ * read, in every auth mode. Every write attempt is one `mount_write` audit line.
  */
 fun Application.installMountRoutes(
     mounts: () -> MountStore,

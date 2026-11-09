@@ -821,9 +821,10 @@ a canonical lowercase UUID (`MountNames.PATTERN`).
     A mount that was never written reads as revision 0.
   - `PUT /v1/mounts/{name}` replaces a mount. Only the operator token whose
     `sub` is `HOGLAKE_MOUNT_WRITER_SUBJECT` (hogtower's events mount loop) may
-    call it, in every auth mode. Every other caller is refused, including
-    other operators and `platform:admin`. A missing token gets 401 under
-    `enforce` and 403 under `off` or `warn`. Empty (the default) means nobody
+    call it, and only with a verified token, so under `off` nobody may. Every
+    other caller is refused, including other operators and `platform:admin`.
+    A missing token gets 401 under `enforce` and 403 under `off` or `warn`.
+    Empty (the default) means nobody
     may write. The subject must be one that no other operator token carries.
     Every hogtower operator token is `hogtower:provisioner` today, so the loop
     needs a subject of its own.
@@ -833,9 +834,9 @@ a canonical lowercase UUID (`MountNames.PATTERN`).
     10,000 values, or a negative or repeated value. A mount is never deleted,
     so its revision never resets.
   - Every write attempt that reaches the handler is one `mount_write` audit
-    line. It carries the actor and the `jti`, and a write that lands also
-    carries the values added and removed, the first 100 of each. A refusal
-    by the route table is an `auth_refused` line instead.
+    line. It carries the actor and, when there is a token, the `jti`. A write
+    that lands also carries the values added and removed, the first 100 of
+    each. A refusal by the route table is an `auth_refused` line instead.
   - `HOGLAKE_MOUNT_ALLOWLIST` lists the org ids (the `<id>` of `<id>-events`)
     whose mounts may serve; `*` means all of them. It is empty by default, and
     then no mount name is looked up at all. It gates serving only, so a mount

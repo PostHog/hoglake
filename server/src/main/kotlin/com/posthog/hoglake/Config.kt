@@ -241,8 +241,8 @@ data class Config(
     val mountAllowlist: Set<String> = nameList(env("HOGLAKE_MOUNT_ALLOWLIST", "")),
     /**
      * The `sub` of the one operator token that may write mounts
-     * (`PUT /v1/mounts/{name}`), in every auth mode: hogtower's events mount
-     * loop. Empty (the default): no caller may.
+     * (`PUT /v1/mounts/{name}`), verified, so under `off` none may: hogtower's
+     * events mount loop. Empty (the default): no caller may.
      */
     val mountWriterSubject: String = env("HOGLAKE_MOUNT_WRITER_SUBJECT", ""),
     /**

@@ -111,7 +111,7 @@ internal fun requireMountReader(
 
 /**
  * A mount write is the configured writer's alone ([writer], hogtower's events
- * mount loop), in every auth mode. Another operator, `platform:admin`, a
+ * mount loop), verified in every auth mode. Another operator, `platform:admin`, a
  * tenant, and no caller (under `off`, or `warn` without a token) get 403.
  */
 internal fun requireMountWriter(

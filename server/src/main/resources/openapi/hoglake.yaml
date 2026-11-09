@@ -1567,9 +1567,9 @@ paths:
       summary: Replace a mount, at the revision the writer read (mount writer only)
       description: >
         Only the operator token whose `sub` is the server's
-        HOGLAKE_MOUNT_WRITER_SUBJECT may write, in every auth mode. Every
-        other caller is refused: 401 without a verified token under
-        enforce, 403 otherwise. The write succeeds only while the mount is
+        HOGLAKE_MOUNT_WRITER_SUBJECT may write, and only verified, so under
+        auth mode off nobody may. Every other caller is refused: 401 without
+        a verified token under enforce, 403 otherwise. The write succeeds only while the mount is
         at `revision` (0: never written) and moves it to `revision + 1`;
         otherwise 409 `mount_revision_conflict`, the only 409 here: read
         the mount again. Null `values` is empty. 422 for a missing
@@ -3729,13 +3729,14 @@ components:
 
     PutMountRequest:
       type: object
-      required: [revision, enabled, values]
+      required: [revision, enabled]
       properties:
         revision: { type: integer, format: int64, minimum: 0, description: "The revision the writer read." }
         enabled: { type: boolean }
         values:
           type: array
           nullable: true
+          description: Absent or null is empty.
           maxItems: 10000
           items: { $ref: "#/components/schemas/MountValue" }
 
