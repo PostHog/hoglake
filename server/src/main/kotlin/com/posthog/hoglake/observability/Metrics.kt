@@ -405,6 +405,17 @@ object Metrics {
     fun hydratorTransientError() = increment("hoglake_hydrator_transient_errors_total", 1.0)
 
     /**
+     * hoglake_mount_integrity_errors_total — mount reads refused because
+     * the mount's table cannot be scoped reliably (`ReadScope`: the
+     * table's object-prefix field at the read snapshot is not the mount's,
+     * a spec row has no readable fields (none, or key indexes other than
+     * 0..n-1), no spec has the identity field, or a mount value is not a
+     * canonical decimal). Each is a misbound mount or corruption, never
+     * load.
+     */
+    fun mountIntegrityError() = increment("hoglake_mount_integrity_errors_total", 1.0)
+
+    /**
      * hoglake_hydrator_claim_timeouts_total{catalog} — sweeps in which
      * this catalog's claim exceeded the hydrator's claim timeout and
      * was skipped (#269: the catalog lost its share of that sweep; no

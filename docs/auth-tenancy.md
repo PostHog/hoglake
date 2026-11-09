@@ -808,6 +808,19 @@ a canonical lowercase UUID (`MountNames.PATTERN`).
   (§6.4) gives the class. `AuthPolicy` does not list mounts: under `warn` and
   `enforce` it answers a scoped caller 403 `forbidden` on routes outside its
   scoped set or beyond its `cat` scope, before dispatch.
+- **Read scope.** `ReadScope` (`store/ReadScope.kt`) compiles what a mount
+  read may see: the table's files visible at the read snapshot whose
+  identity partition value on the mount's field is in the caller's `prd`
+  values intersected with the mount's (`*` means the mount's values), and
+  whose stats prove it (`provided AND NOT prefix_quarantined`). An empty set
+  compiles to `FALSE`. The read is refused, and
+  `hoglake_mount_integrity_errors_total` counts it, when the table's
+  object-prefix field at the read snapshot is not the mount's, or on
+  corruption (a spec row with no fields or with key indexes other than
+  0..n-1, no spec with the identity field, a negative mount value). A file
+  bound to an absent spec row cannot exist on such a table (expiry keeps
+  spec rows since #479, which predates the option); it would be left out.
+  No route uses it yet.
 - **The switch.** `hog_mount_switch` (V34) is off by default, and it is read
   only for a name the registry holds. To turn it on:
   `UPDATE hog_mount_switch SET enabled = true;` (`false` turns it off). The
