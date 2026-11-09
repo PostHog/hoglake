@@ -46,6 +46,44 @@ object SpecRepo {
     }
 
     /**
+     * Every spec row of the table, live or retired, by spec_id, each with
+     * its fields by key_index: the specs a file of the table can name.
+     * A spec row with no field rows comes back with no fields, for the
+     * caller to refuse ([com.posthog.hoglake.store.ReadScope]).
+     */
+    fun boundSpecs(
+        h: Handle,
+        catalogId: Long,
+        tableId: Long,
+    ): List<PartitionSpec> =
+        h.createQuery(
+            """
+            SELECT s.spec_id, f.source_field_id, f.transform, f.transform_param
+            FROM hog_partition_spec s
+            LEFT JOIN hog_partition_field f
+              ON f.catalog_id = s.catalog_id AND f.table_id = s.table_id AND f.spec_id = s.spec_id
+            WHERE s.catalog_id = :catalogId AND s.table_id = :tableId
+            ORDER BY s.spec_id, f.key_index
+            """,
+        )
+            .bind("catalogId", catalogId)
+            .bind("tableId", tableId)
+            .map { rs, _ ->
+                val field =
+                    rs.getObject("source_field_id")?.let {
+                        PartitionFieldDef(
+                            sourceFieldId = (it as Number).toLong(),
+                            transform = Transform.fromWire(rs.getString("transform")),
+                            transformParam = rs.getObject("transform_param")?.let { p -> (p as Number).toInt() },
+                        )
+                    }
+                rs.getLong("spec_id") to field
+            }
+            .list()
+            .groupBy({ it.first }, { it.second })
+            .map { (specId, fields) -> PartitionSpec(specId, fields.filterNotNull()) }
+
+    /**
      * The fields of the table's spec [specId], by key_index, whether the
      * spec is live or retired (retired specs are never cleared): what a
      * file written under it names by `spec_id`.
