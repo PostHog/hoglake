@@ -33,7 +33,8 @@ import java.sql.DriverManager
  * The external database is created as `scope_plan` and kept, so a rerun
  * at the same size reuses it; the size is recorded only after the seed's
  * last step, so an interrupted seed is never reused (drop `scope_plan` to
- * reseed). Real rows, not planner statistics: Postgres estimates a table's
+ * reseed). A 41M build needs about 30 GiB free on the host. Real rows,
+ * not planner statistics: Postgres estimates a table's
  * rows as its density times its ACTUAL pages, so a faked `reltuples` does
  * not make a small table plan like a big one.
  *
@@ -43,8 +44,8 @@ import java.sql.DriverManager
  * ids, spec 2 identity(team_id), day(ts) after), `sidecar` (10%, the same
  * spec), and `reordered` (2%, half of it under spec 2 day(ts),
  * identity(team_id): the two-arm shape). Team 2 holds 5% of the files; the
- * rest spread over 19,997 teams (a prime modulus, so every team has files
- * in every table and state) whose ids overlap the day ordinals
+ * rest spread over 19,997 teams (a prime modulus, so from about 10M files
+ * every team has files in every table and state) whose ids overlap the day ordinals
  * 19000-19999. 1% pending, 0.2% quarantined, 3% ended, one live DV per 50
  * files.
  *
@@ -56,7 +57,7 @@ import java.sql.DriverManager
  * Index Cond per arm and on no other index, and no node is a sequential
  * scan, a hash or a merge. With ANALYZE, the scan returns at most what its
  * arms collect and reads at most 6 buffers per collected id plus 12 per
- * returned file (measured: about 5 per scattered collected id for its
+ * returned file plus 200 (measured: about 5 per scattered collected id for its
  * primary-key probe and heap page, about 8 per returned file for its DV
  * and partition-value probes, well under 1 per id for a contiguous run).
  *
@@ -141,6 +142,11 @@ class ReadScopePlanIntegrationTest {
 
     private fun externalDataSource(url: String): HikariDataSource {
         val name = "scope_plan"
+        val target = url.replace("/postgres?", "/$name?")
+        // The seed drops the manifest's indexes: never run it on the database the URL names.
+        require(
+            target != url,
+        ) { "HOGLAKE_SCOPE_PLAN_JDBC_URL must name the postgres database: ...:<port>/postgres?..." }
         DriverManager.getConnection(url).use { conn ->
             val exists =
                 conn.prepareStatement("SELECT 1 FROM pg_database WHERE datname = ?").use {
@@ -149,11 +155,6 @@ class ReadScopePlanIntegrationTest {
                 }
             if (!exists) conn.createStatement().use { it.execute("CREATE DATABASE $name") }
         }
-        val target = url.replace("/postgres?", "/$name?")
-        // The seed drops the manifest's indexes: never run it on the database the URL names.
-        require(
-            target != url,
-        ) { "HOGLAKE_SCOPE_PLAN_JDBC_URL must name the postgres database: ...:<port>/postgres?..." }
         val ds = HikariDataSource(HikariConfig().apply { jdbcUrl = target })
         Database.migrate(ds)
         return ds
@@ -459,17 +460,17 @@ class ReadScopePlanIntegrationTest {
                 .mapTo(Long::class.java).one()
         }
 
-    /** Rows the scoped scan returns for [teams] on [table]. */
-    private fun admittedCount(
+    /** The spec ids of the files the scoped scan returns for [teams] on [table]. */
+    private fun admittedSpecs(
         table: String,
         teams: List<Long>,
-    ): Int {
+    ): Set<Long> {
         val scope = scope(table, teams, PredicateGrant.All(Scope.READ))
         return jdbi.withHandleUnchecked { h ->
             scope.bind(h.createQuery(scanSql(scope)))
                 .bind("catalogId", catalogId).bind("tableId", tables.getValue(table))
                 .bind("snapshot", head).bind("splitOffsets", false)
-                .mapToMap().list().size
+                .map { rs, _ -> rs.getLong("spec_id") }.set()
         }
     }
 
@@ -499,7 +500,7 @@ class ReadScopePlanIntegrationTest {
     @Test
     fun `the two-arm shape of a reordered spec plans the same way`() {
         val byArm = listOf(teamWithFile("reordered", 1, 0), teamWithFile("reordered", 2, 1))
-        assertThat(admittedCount("reordered", byArm)).isGreaterThanOrEqualTo(2)
+        assertThat(admittedSpecs("reordered", byArm)).containsExactlyInAnyOrder(1, 2)
         for (teams in listOf(byArm, listOf(19_500L))) {
             val scope = scope("reordered", teams, PredicateGrant.All(Scope.READ))
             assertThat(scope.arms).hasSize(2)

@@ -10,8 +10,8 @@ import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.statement.SqlStatement
 
 /**
- * The files one mount read may see (#291 §6-§7, `ReadScope`): the live
- * files of one table whose identity partition value on the mount's field
+ * The files one mount read may see (#291 §6-§7, `ReadScope`): the files
+ * of one table, visible at the statement's snapshot, whose identity partition value on the mount's field
  * is in [values], and whose stats prove it (`stats_state = 'provided' AND
  * NOT prefix_quarantined`, [ObjectPrefix]). Every statement a mount
  * serves ANDs [sql] in, before limits, stats and totals, so nothing a
@@ -42,11 +42,13 @@ import org.jdbi.v3.core.statement.SqlStatement
  * reached from them on its primary key. Its work is what the arms
  * collect, catalog-wide, not the table: ReadScopePlanIntegrationTest at
  * 41M files read 26,189 buffers for a team whose arm collected 2,050 ids
- * (12.8 per file), and 27,542 for a reordered spec whose key-1 arm
+ * (12.8 per collected id), and 27,542 for a reordered spec whose key-1 arm
  * collected a whole day (42,640 ids for 1,988 returned). The InitPlan's
  * array is built whole before the scan starts, about 32 bytes per id
- * (2M ids for a team with 5% of a 41M-file catalog), so a LIMIT on the
- * statement does not bound it; a deadline does. With two or more arms the
+ * (2M ids for a team with 5% of a 41M-file catalog). Nothing in the
+ * statement bounds it: its size is the granted values' files across the
+ * catalog, up to Postgres's 1 GB array limit; a LIMIT does not bound it,
+ * and a deadline bounds the time, not the memory. With two or more arms the
  * manifest is read through a BitmapOr whose heap filter re-tests each row
  * against its arm's array, linearly (a Param array is never hashed), so
  * that shape costs rows x ids; only specs that put the field at different
@@ -63,8 +65,9 @@ import org.jdbi.v3.core.statement.SqlStatement
  * #479, from which expiry never deletes a spec row, and the option itself
  * (#481) came later. A file bound to an absent spec row would match no
  * arm and stay out (fail-closed); finding one per read would scan the
- * whole table. A spec row without fields, or no spec with the identity
- * field, can only be corruption, and is refused.
+ * whole table. A spec row without fields or with key_indexes other than
+ * 0..n-1 ([SpecRepo.boundSpecs]), or no spec with the identity field, can
+ * only be corruption, and is refused.
  */
 class ReadScope private constructor(
     val catalogId: Long,
@@ -155,7 +158,7 @@ class ReadScope private constructor(
                 integrity("table $tableId's object-prefix field is ${layoutFieldId ?: "unset"}, not $sourceFieldId")
             }
             specs.firstOrNull { it.fields.isEmpty() }?.let {
-                integrity("spec ${it.specId} of table $tableId has no fields")
+                integrity("spec ${it.specId} of table $tableId has no readable fields")
             }
             mountValues.firstOrNull { it < 0 }?.let { integrity("mount value $it is not a canonical decimal") }
             val arms =

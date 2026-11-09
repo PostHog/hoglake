@@ -33,7 +33,9 @@ import org.junit.jupiter.api.TestInstance
  *    spec id the table does not have (left out, never guessed).
  *
  * `other`, a second table in the catalog, with the same spec id, the same
- * key and the colliding value 42. `broken` has a spec row with no fields.
+ * key and the colliding value 42. `broken` has a spec row with no fields,
+ * and `gapped` a spec whose key_indexes are 0 and 2. Every spec's fields
+ * are inserted in reverse key order, so nothing here relies on insert order.
  *
  * `rs2`, a second catalog: ids are allocated per catalog, so its `events`
  * has the same table and spec ids, and its files 1 and 13 hold 42 where
@@ -49,6 +51,7 @@ class ReadScopeIntegrationTest {
     private val events: Long
     private val other: Long
     private val broken: Long
+    private val gapped: Long
     private val team: Long
     private val otherCatalog: Long
 
@@ -61,6 +64,7 @@ class ReadScopeIntegrationTest {
         val ts = info.columns.single { it.def.name == "ts" }.fieldId
         other = catalogs.createTable("rs", "ingest", "other", columns).tableId
         broken = catalogs.createTable("rs", "ingest", "broken", columns).tableId
+        gapped = catalogs.createTable("rs", "ingest", "gapped", columns).tableId
         catalogs.createCatalog("rs2", "s3://bucket/rs2")
         catalogs.createNamespace("rs2", "ingest")
         check(catalogs.createTable("rs2", "ingest", "events", columns).tableId == events)
@@ -86,7 +90,8 @@ class ReadScopeIntegrationTest {
                     table,
                     spec,
                 )
-                fields.forEachIndexed { key, (source, transform) ->
+                fields.withIndex().reversed().forEach { (key, field) ->
+                    val (source, transform) = field
                     h.execute(
                         "INSERT INTO hog_partition_field (catalog_id, table_id, spec_id, key_index, source_field_id, " +
                             "transform, transform_param) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -107,7 +112,20 @@ class ReadScopeIntegrationTest {
             spec(broken, 1, team to "identity")
             spec(broken, 2)
             spec(events, 1, team to "identity", ts to "day", cat = otherCatalog)
-            for ((cat, table) in listOf(events, other, broken).map { catalogId to it } + (otherCatalog to events)) {
+            spec(gapped, 1)
+            for ((key, source, transform) in listOf(Triple(0, ts, "day"), Triple(2, team, "identity"))) {
+                h.execute(
+                    "INSERT INTO hog_partition_field (catalog_id, table_id, spec_id, key_index, source_field_id, " +
+                        "transform) VALUES (?, ?, 1, ?, ?, ?)",
+                    catalogId,
+                    gapped,
+                    key,
+                    source,
+                    transform,
+                )
+            }
+            for ((cat, table) in listOf(events, other, broken, gapped).map { catalogId to it } +
+                (otherCatalog to events)) {
                 h.execute(
                     "INSERT INTO hog_table_layout (catalog_id, table_id, begin_snapshot, object_prefix_field_id) " +
                         "VALUES (?, ?, 1, ?)",
@@ -239,10 +257,11 @@ class ReadScopeIntegrationTest {
     }
 
     /**
-     * #147's vector (`tests/oauth/contract-vectors.json`, "a value outside
-     * the mount ... filtered out"), on the token hogtower mints: the
-     * `scoped_team` vector's caller holds teams 42 and 7, and the mount
-     * holds 42 alone.
+     * #147's planned vector "a value outside the mount ... filtered out".
+     * hogtower's `tests/oauth/contract-vectors.json` does not carry it yet
+     * (#147: "added once mounts exist"), so it is built here on the token
+     * hogtower mints today: the `scoped_team` vector's caller holds teams
+     * 42 and 7, and the mount holds 42 alone.
      */
     @Test
     fun `hogtower's scoped token reads only its values inside the mount`() {
@@ -274,7 +293,14 @@ class ReadScopeIntegrationTest {
     fun `a spec row without fields is refused`() {
         assertThatThrownBy { load(listOf(42), PredicateGrant.All(Scope.READ), table = broken) }
             .isInstanceOf(MountIntegrityError::class.java)
-            .hasMessageContaining("spec 2 of table $broken has no fields")
+            .hasMessageContaining("spec 2 of table $broken has no readable fields")
+    }
+
+    @Test
+    fun `a spec whose keys are not 0 to n-1 is refused, not read by position`() {
+        assertThatThrownBy { load(listOf(42), PredicateGrant.All(Scope.READ), table = gapped) }
+            .isInstanceOf(MountIntegrityError::class.java)
+            .hasMessageContaining("spec 1 of table $gapped has no readable fields")
     }
 
     @Test

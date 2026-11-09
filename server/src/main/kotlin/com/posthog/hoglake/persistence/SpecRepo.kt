@@ -48,8 +48,10 @@ object SpecRepo {
     /**
      * Every spec row of the table, live or retired, by spec_id, each with
      * its fields by key_index: the specs a file of the table can name.
-     * A spec row with no field rows comes back with no fields, for the
-     * caller to refuse ([com.posthog.hoglake.store.ReadScope]).
+     * Partition values are stored by key_index and read by position, so a
+     * spec whose key_indexes are not exactly 0..n-1 (every writer writes
+     * them so), or that has no field rows, comes back with no fields, for
+     * the caller to refuse ([com.posthog.hoglake.store.ReadScope]).
      */
     fun boundSpecs(
         h: Handle,
@@ -58,12 +60,12 @@ object SpecRepo {
     ): List<PartitionSpec> =
         h.createQuery(
             """
-            SELECT s.spec_id, f.source_field_id, f.transform, f.transform_param
+            SELECT s.spec_id, f.key_index, f.source_field_id, f.transform, f.transform_param
             FROM hog_partition_spec s
             LEFT JOIN hog_partition_field f
               ON f.catalog_id = s.catalog_id AND f.table_id = s.table_id AND f.spec_id = s.spec_id
             WHERE s.catalog_id = :catalogId AND s.table_id = :tableId
-            ORDER BY s.spec_id, f.key_index
+            ORDER BY s.spec_id
             """,
         )
             .bind("catalogId", catalogId)
@@ -71,17 +73,23 @@ object SpecRepo {
             .map { rs, _ ->
                 val field =
                     rs.getObject("source_field_id")?.let {
-                        PartitionFieldDef(
-                            sourceFieldId = (it as Number).toLong(),
-                            transform = Transform.fromWire(rs.getString("transform")),
-                            transformParam = rs.getObject("transform_param")?.let { p -> (p as Number).toInt() },
-                        )
+                        rs.getInt("key_index") to
+                            PartitionFieldDef(
+                                sourceFieldId = (it as Number).toLong(),
+                                transform = Transform.fromWire(rs.getString("transform")),
+                                transformParam = rs.getObject("transform_param")?.let { p -> (p as Number).toInt() },
+                            )
                     }
                 rs.getLong("spec_id") to field
             }
             .list()
             .groupBy({ it.first }, { it.second })
-            .map { (specId, fields) -> PartitionSpec(specId, fields.filterNotNull()) }
+            .map { (specId, rows) ->
+                // Placed by their stored key_index, never by row order.
+                val byKey = rows.filterNotNull().toMap()
+                val dense = byKey.keys == (0 until byKey.size).toSet()
+                PartitionSpec(specId, if (dense) (0 until byKey.size).map(byKey::getValue) else emptyList())
+            }
 
     /**
      * The fields of the table's spec [specId], by key_index, whether the

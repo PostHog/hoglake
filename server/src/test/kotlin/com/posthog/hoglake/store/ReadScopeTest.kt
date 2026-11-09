@@ -111,7 +111,7 @@ class ReadScopeTest {
     fun `a spec without fields is refused, whatever the caller holds`() {
         assertThatThrownBy { compile(null, specs = listOf(teamDay, PartitionSpec(2, emptyList()))) }
             .isInstanceOf(MountIntegrityError::class.java)
-            .hasMessageContaining("spec 2 of table 11 has no fields")
+            .hasMessageContaining("spec 2 of table 11 has no readable fields")
     }
 
     @Test
