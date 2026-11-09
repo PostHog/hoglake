@@ -28,12 +28,21 @@ object MountNames {
     fun isReserved(name: String): Boolean = regex.matches(name)
 }
 
-/** One mount. The read scope (source table, field, values, revision) comes with the mount table. */
+/**
+ * One mount as `hog_mount` holds it (V35). The defaults are a mount never
+ * written, which is how `GET /v1/mounts/{name}` answers for one. The table it
+ * reads is the instance's, not the record's: every mount reads the same one.
+ */
 data class MountRecord(
     val name: String,
+    /** One more on every write; 0 means never written. */
+    val revision: Long = 0,
+    val enabled: Boolean = false,
+    /** The values it admits: ascending, distinct, non-negative. */
+    val values: List<Long> = emptyList(),
 )
 
-/** Mount records by name. Production has none until the mount table and its operator API exist. */
+/** The serving mount for a name: production's is [MountStore]. */
 fun interface MountRegistry {
     fun find(name: String): MountRecord?
 
@@ -103,6 +112,20 @@ internal fun requireMountReader(
             "not_supported_on_backend",
             HoglakeException.NotSupported("a mount is never served from a hoglite backend"),
         )
+    }
+}
+
+/**
+ * A mount write is the configured writer's alone ([writer], hogtower's events
+ * mount loop), verified in every auth mode. Another operator, `platform:admin`, a
+ * tenant, and no caller (under `off`, or `warn` without a token) get 403.
+ */
+internal fun requireMountWriter(
+    caller: Caller?,
+    writer: String,
+) {
+    if (writer.isEmpty() || caller?.kind != Caller.Kind.OPERATOR || caller.subject != writer) {
+        throw HoglakeException.Forbidden("only the configured mount writer may write a mount")
     }
 }
 

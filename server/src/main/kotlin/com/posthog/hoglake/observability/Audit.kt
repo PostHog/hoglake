@@ -171,6 +171,7 @@ object Audit {
             is HoglakeException.DdlSinceReadSnapshot -> "ddl_since_read_snapshot"
             is HoglakeException.TableRecreated -> "table_recreated"
             is HoglakeException.CommitConflict -> "conflict"
+            is HoglakeException.MountRevisionConflict -> "conflict"
             is HoglakeException.OffsetRegression -> "regression"
             is HoglakeException.CommitQueueTimeout -> "timeout"
             is HoglakeException.Validation -> "validation"
