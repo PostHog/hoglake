@@ -30,21 +30,36 @@ import org.jdbi.v3.core.statement.SqlStatement
  * `hog_file_partition_value` has no `table_id` or `spec_id`, so an arm's
  * InitPlan collects every file of the catalog with a matching value at
  * that key_index, another table's or a day ordinal equal to a team id
- * included; the arm's spec ids and the shared `table_id` drop them. Null
- * values, unpartitioned files and other transforms match no arm. The plan
- * is `CompactionService.candidateSql`'s: the ids come from
- * `hog_file_partition_value_lookup`, and the manifest is reached from them
- * on its primary key.
+ * included; the arm's spec ids and the shared `table_id` drop them. Ids
+ * are allocated per catalog, so both `catalog_id` terms are what keep
+ * another catalog's ids out. Null values, unpartitioned files and other
+ * transforms match no arm.
  *
- * THE TABLE'S LAYOUT IS THE MOUNT'S FIELD, or the read is refused
- * ([MountIntegrityError]). The option is set once, on an empty table, and
- * never unset, so every file visible at the read snapshot was committed
- * under it and proven by its stats, and every spec since keeps the
- * identity field. Those files were committed after #479, which keeps
- * every spec row, so the one way left for a spec to go missing is a spec
- * row without fields, which is refused too. A file bound to an absent spec
- * row would match no arm and stay out; finding one per read would scan
- * the whole table.
+ * THE PLAN is `CompactionService.candidateSql`'s, custom and generic
+ * alike (the manifest side is costed from a Param array's default size,
+ * not the values): each arm's ids come from
+ * `hog_file_partition_value_lookup` as an InitPlan, and the manifest is
+ * reached from them on its primary key. Its work is what the arms
+ * collect, catalog-wide, not the table: ReadScopePlanIntegrationTest at
+ * 41M files read 26,189 buffers for a team whose arm collected 2,050 ids
+ * (12.8 per file), and 27,542 for a reordered spec whose key-1 arm
+ * collected a whole day (43,050 ids for 1,988 returned). The InitPlan's
+ * array is built whole before the scan starts, about 32 bytes per id
+ * (2M ids for a team with 5% of a 41M-file catalog), so a LIMIT on the
+ * statement does not bound it; a deadline does.
+ *
+ * THE TABLE'S LAYOUT IS THE MOUNT'S FIELD at the read snapshot, or the
+ * read is refused ([MountIntegrityError]). The option is set once, on an
+ * empty table, and never unset, so every file visible at that snapshot
+ * was committed under it and proven by its stats, and every spec since
+ * keeps the identity field.
+ *
+ * A MISSING SPEC cannot occur for those files: they were committed after
+ * #479, from which expiry never deletes a spec row, and the option itself
+ * (#481) came later. A file bound to an absent spec row would match no
+ * arm and stay out (fail-closed); finding one per read would scan the
+ * whole table. A spec row without fields, or no spec with the identity
+ * field, can only be corruption, and is refused.
  */
 class ReadScope private constructor(
     val catalogId: Long,
@@ -122,7 +137,7 @@ class ReadScope private constructor(
          * snapshot, and [specs] every spec row of the table, live or
          * retired. A null [grant] grants nothing.
          */
-        fun compile(
+        internal fun compile(
             catalogId: Long,
             tableId: Long,
             sourceFieldId: Long,

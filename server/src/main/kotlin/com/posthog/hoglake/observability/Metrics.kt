@@ -407,9 +407,10 @@ object Metrics {
     /**
      * hoglake_mount_integrity_errors_total — mount reads refused because
      * the mount's table cannot be scoped reliably (`ReadScope`: the
-     * table's object-prefix field is not the mount's, a spec row has no
-     * fields, no spec has the identity field, or a mount value is not a
-     * canonical decimal). Each is a broken invariant, never load.
+     * table's object-prefix field at the read snapshot is not the mount's,
+     * a spec row has no fields, no spec has the identity field, or a mount
+     * value is not a canonical decimal). Each is a misbound mount or
+     * corruption, never load.
      */
     fun mountIntegrityError() = increment("hoglake_mount_integrity_errors_total", 1.0)
 

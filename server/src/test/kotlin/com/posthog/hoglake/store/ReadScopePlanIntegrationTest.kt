@@ -30,7 +30,8 @@ import java.sql.DriverManager
  *     ./gradlew :test --tests '*ReadScopePlanIntegrationTest' --rerun
  *
  * The external database is created as `scope_plan` and kept, so a rerun
- * at the same size reuses it. Real rows, not planner statistics: Postgres
+ * at the same size reuses it; the size is recorded only after the seed's
+ * last step, so an interrupted seed is never reused. Real rows, not planner statistics: Postgres
  * estimates a table's rows as its density times its ACTUAL pages, so a
  * faked `reltuples` does not make a small table plan like a big one.
  *
@@ -50,8 +51,18 @@ import java.sql.DriverManager
  * bitmap scan for a whale's share of the catalog), the manifest is read
  * on `hog_data_file_pkey` with `data_file_id = ANY(...)` and on no other
  * index, and nothing scans `hog_data_file` or `hog_file_partition_value`
- * sequentially. With ANALYZE, a small team's scan reads a number of
- * buffers bounded by the files its arm collects, not by the table.
+ * sequentially. With ANALYZE, a scan reads about 20 buffers per file it
+ * returns plus 2 per id its arms collect, not a number set by the table.
+ *
+ * # Measured (postgres:18.6, 2026-11-09)
+ * At 41M files (`hog_data_file` 744,515 heap pages, 13 GB; 82M partition
+ * values, 11 GB), every plan below, custom and generic, had the shape:
+ *  - small team: 2,050 ids collected, 1,988 returned, 26,189 buffers;
+ *  - reordered, two arms: 4,100 collected, 1,987 returned, 36,475 buffers;
+ *  - reordered, team 19500 = a day ordinal: the key-1 arm collected the
+ *    whole day, 43,050 ids for 1,988 returned, 27,542 buffers;
+ *  - whale team (5%) and a 2,001-value org: the same shape (no ANALYZE).
+ * At 200k files the small team collects 10 ids and reads about 100.
  *
  * The statement is ScanService.planScan's with the scope ANDed in, as 1.3
  * will serve it; 1.3 swaps the copy below for the real statement.
@@ -128,7 +139,7 @@ class ReadScopePlanIntegrationTest {
 
     private fun seed() {
         val catalogs = CatalogService(jdbi)
-        catalogs.createCatalog(CATALOG, DATA_PATH)
+        catalogs.createCatalog(CATALOG, "s3://$CATALOG/seeding")
         catalogs.createNamespace(CATALOG, "ingest")
         val columns = listOf(ColumnDef("team_id", ColType.LONG), ColumnDef("ts", ColType.LONG))
         var ts = 0L
@@ -179,6 +190,9 @@ class ReadScopePlanIntegrationTest {
             h.execute("RESET session_replication_role")
             indexes.forEach { (_, def) -> h.execute(def) }
             manifest.forEach { h.execute("VACUUM (ANALYZE) $it") }
+            // Last: what a rerun checks before reusing the fixture.
+            h.createUpdate("UPDATE hog_catalog SET data_path = :p WHERE catalog_id = :c")
+                .bind("p", DATA_PATH).bind("c", catalogId).execute()
         }
     }
 
@@ -366,10 +380,19 @@ class ReadScopePlanIntegrationTest {
         // An index-only, index or bitmap scan of the lookup index: each names it once.
         assertThat(Regex("""(?:Scan using|Index Scan on) hog_file_partition_value_lookup\b""").findAll(plan).count())
             .describedAs(plan).isEqualTo(scope.arms.size)
-        assertThat(
-            Regex("""InitPlan""").findAll(plan).count(),
-        ).describedAs(plan).isGreaterThanOrEqualTo(scope.arms.size)
+        assertThat(Regex("""(?m)^\s*InitPlan \d+\s*$""").findAll(plan).count())
+            .describedAs(plan).isEqualTo(scope.arms.size)
     }
+
+    /** Rows the plan's root returned. */
+    private fun returned(plan: String): Long =
+        Regex("""actual rows=([\d.]+)""").find(plan.lines().first())!!.groupValues[1].toDouble().toLong()
+
+    /** The work bound: per returned file its probes, per collected id its PK descent. */
+    private fun bound(
+        plan: String,
+        collected: Long,
+    ): Long = 20 * returned(plan) + 2 * collected + 200
 
     /** Buffers the plan's root reports, hit and read. */
     private fun rootBuffers(plan: String): Long {
@@ -416,7 +439,7 @@ class ReadScopePlanIntegrationTest {
         val collected = collected(listOf(smallTeam), 0)
         assertThat(collected).isGreaterThan(0)
         // Per collected file: a primary-key probe, its heap page, its partition values and its DV probe.
-        assertThat(rootBuffers(plan)).describedAs(plan).isLessThanOrEqualTo(20 * collected + 200)
+        assertThat(rootBuffers(plan)).describedAs(plan).isLessThanOrEqualTo(bound(plan, collected))
         println("ReadScopePlan files=$FILES small team: collected=$collected buffers=${rootBuffers(plan)}\n$plan")
         println("ReadScopePlan files=$FILES small team, generic:\n${explainGeneric(scope)}")
     }
@@ -436,7 +459,7 @@ class ReadScopePlanIntegrationTest {
             assertScoped(plan, scope)
             assertScoped(explainGeneric(scope), scope)
             val collected = collected(teams, 0) + collected(teams, 1)
-            assertThat(rootBuffers(plan)).describedAs(plan).isLessThanOrEqualTo(20 * collected + 200)
+            assertThat(rootBuffers(plan)).describedAs(plan).isLessThanOrEqualTo(bound(plan, collected))
             println(
                 "ReadScopePlan files=$FILES reordered $teams: collected=$collected buffers=${rootBuffers(plan)}\n$plan",
             )

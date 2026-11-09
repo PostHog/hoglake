@@ -33,6 +33,10 @@ import org.junit.jupiter.api.TestInstance
  *
  * `other`, a second table in the catalog, with the same spec id, the same
  * key and the colliding value 42. `broken` has a spec row with no fields.
+ *
+ * `rs2`, a second catalog: ids are allocated per catalog, so its `events`
+ * has the same table and spec ids, and its files 1 and 13 hold 42 where
+ * `rs`'s file 13 is team 7.
  */
 @Tag("integration")
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
@@ -45,6 +49,7 @@ class ReadScopeIntegrationTest {
     private val other: Long
     private val broken: Long
     private val team: Long
+    private val otherCatalog: Long
 
     init {
         catalogs.createCatalog("rs", "s3://bucket/rs")
@@ -55,20 +60,28 @@ class ReadScopeIntegrationTest {
         val ts = info.columns.single { it.def.name == "ts" }.fieldId
         other = catalogs.createTable("rs", "ingest", "other", columns).tableId
         broken = catalogs.createTable("rs", "ingest", "broken", columns).tableId
-        catalogId =
+        catalogs.createCatalog("rs2", "s3://bucket/rs2")
+        catalogs.createNamespace("rs2", "ingest")
+        check(catalogs.createTable("rs2", "ingest", "events", columns).tableId == events)
+
+        fun idOf(name: String) =
             db.jdbi.withHandleUnchecked { h ->
-                h.createQuery("SELECT catalog_id FROM hog_catalog WHERE name = 'rs'").mapTo(Long::class.java).one()
+                h.createQuery("SELECT catalog_id FROM hog_catalog WHERE name = :n").bind("n", name)
+                    .mapTo(Long::class.java).one()
             }
+        catalogId = idOf("rs")
+        otherCatalog = idOf("rs2")
         db.jdbi.useHandleUnchecked { h ->
             fun spec(
                 table: Long,
                 spec: Long,
                 vararg fields: Pair<Long, String>,
+                cat: Long = catalogId,
             ) {
                 h.execute(
                     "INSERT INTO hog_partition_spec (catalog_id, table_id, spec_id, begin_snapshot) " +
                         "VALUES (?, ?, ?, 0)",
-                    catalogId,
+                    cat,
                     table,
                     spec,
                 )
@@ -76,7 +89,7 @@ class ReadScopeIntegrationTest {
                     h.execute(
                         "INSERT INTO hog_partition_field (catalog_id, table_id, spec_id, key_index, source_field_id, " +
                             "transform, transform_param) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        catalogId,
+                        cat,
                         table,
                         spec,
                         key,
@@ -92,11 +105,12 @@ class ReadScopeIntegrationTest {
             spec(other, 1, team to "identity", ts to "day")
             spec(broken, 1, team to "identity")
             spec(broken, 2)
-            for (table in listOf(events, other, broken)) {
+            spec(events, 1, team to "identity", ts to "day", cat = otherCatalog)
+            for ((cat, table) in listOf(events, other, broken).map { catalogId to it } + (otherCatalog to events)) {
                 h.execute(
                     "INSERT INTO hog_table_layout (catalog_id, table_id, begin_snapshot, object_prefix_field_id) " +
                         "VALUES (?, ?, 1, ?)",
-                    catalogId,
+                    cat,
                     table,
                     team,
                 )
@@ -110,13 +124,14 @@ class ReadScopeIntegrationTest {
                 state: String = "provided",
                 quarantined: Boolean = false,
                 end: Long? = null,
+                cat: Long = catalogId,
             ) {
                 h.execute(
                     "INSERT INTO hog_data_file (catalog_id, data_file_id, table_id, begin_snapshot, end_snapshot, " +
                         "path, record_count, file_size_bytes, row_id_start, spec_id, stats_state, " +
                         "prefix_quarantined) " +
                         "VALUES (?, ?, ?, 1, ?, ?, 1, 1, ?, ?, ?, ?)",
-                    catalogId,
+                    cat,
                     id,
                     table,
                     end,
@@ -130,7 +145,7 @@ class ReadScopeIntegrationTest {
                     h.execute(
                         "INSERT INTO hog_file_partition_value (catalog_id, data_file_id, key_index, value) " +
                             "VALUES (?, ?, ?, ?)",
-                        catalogId,
+                        cat,
                         id,
                         key,
                         value,
@@ -151,6 +166,8 @@ class ReadScopeIntegrationTest {
             file(12, events, 1, "99", "19000")
             file(13, events, 1, "7", "19000")
             file(21, other, 1, "42", "19000") // another table, same spec id, key and value
+            file(1, events, 1, "42", "19000", cat = otherCatalog) // another catalog, same ids
+            file(13, events, 1, "42", "19000", cat = otherCatalog) // rs's file 13 is team 7
         }
     }
 
@@ -184,6 +201,19 @@ class ReadScopeIntegrationTest {
         val scope = load(listOf(42, 99), PredicateGrant.Values(mapOf(42L to Scope.READ, 7L to Scope.READ)))
         assertThat(scope.arms).containsExactly(ReadScope.Arm(0, listOf(1)), ReadScope.Arm(1, listOf(2)))
         assertThat(admitted(scope)).containsExactly(1, 4)
+    }
+
+    @Test
+    fun `another catalog's colliding ids admit nothing here`() {
+        val counts =
+            db.jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    "SELECT count(*) FROM hog_file_partition_value WHERE catalog_id = :c AND value = '42' " +
+                        "AND data_file_id IN (1, 13)",
+                ).bind("c", otherCatalog).mapTo(Long::class.java).one()
+            }
+        assertThat(counts).isEqualTo(2)
+        assertThat(admitted(load(listOf(42), PredicateGrant.All(Scope.READ)))).containsExactly(1, 4)
     }
 
     @Test

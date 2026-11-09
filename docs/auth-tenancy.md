@@ -814,9 +814,11 @@ a canonical lowercase UUID (`MountNames.PATTERN`).
   (`*` means the mount's values), and whose stats prove it
   (`provided AND NOT prefix_quarantined`). An empty set compiles to `FALSE`.
   The read is refused, and `hoglake_mount_integrity_errors_total` counts it,
-  when the table's object-prefix field is not the mount's, a spec row has no
-  fields, no spec has the identity field, or a mount value is negative. No
-  route uses it yet.
+  when the table's object-prefix field at the read snapshot is not the
+  mount's, or on corruption (a spec row with no fields, no spec with the
+  identity field, a negative mount value). A file bound to an absent spec row
+  cannot exist on such a table (expiry keeps spec rows since #479, which
+  predates the option); it would be left out. No route uses it yet.
 - **The switch.** `hog_mount_switch` (V34) is off by default, and it is read
   only for a name the registry holds. To turn it on:
   `UPDATE hog_mount_switch SET enabled = true;` (`false` turns it off). The
