@@ -7,6 +7,7 @@ import com.posthog.hoglake.hoglite.HogliteCatalogStore
 import com.posthog.hoglake.hoglite.HogliteClient
 import com.posthog.hoglake.hoglite.HoglitePartitionLookupAdmission
 import com.posthog.hoglake.hoglite.HogliteTenantResolver
+import com.posthog.hoglake.model.CatalogInfo
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.service.AlterBackend
 import com.posthog.hoglake.service.PartitionListingBackend
@@ -62,26 +63,49 @@ class CatalogStoreSelector(
         call: ApplicationCall,
         catalog: String,
     ): CatalogBinding.Mount? {
-        if (!MountNames.isReserved(catalog) || defaultPostgres() == null) return null
-        val record = mounts.find(catalog) ?: return null
+        val record = record(catalog) ?: return null
         requireMountReader(call.hoglakeAuth.callerOrNull, catalog)
         return CatalogBinding.Mount(record)
     }
+
+    /** The mount [catalog] names, whoever asks: the one gate for dispatch and the listing. */
+    private fun record(catalog: String): MountRecord? =
+        if (MountNames.isReserved(catalog) && defaultPostgres() != null) mounts.find(catalog) else null
 
     /** A hoglite listing must carry the token's single catalog as an explicit filter. */
     fun forListing(call: ApplicationCall): Listing {
         val caller = call.hoglakeAuth.callerOrNull
         val routing = caller?.routing
+        val mounts = mountVisibility(caller)
         return if (routing != null) {
             Listing(
                 routed(call, routing),
                 setOf(routing.catalog),
                 usePostgresTotals = routing.backend == BackendKind.POSTGRES,
+                mounts = mounts,
             )
         } else {
-            Listing(fallback(""), caller?.visibleCatalogs(), usePostgresTotals = true)
+            Listing(fallback(""), caller?.visibleCatalogs(), usePostgresTotals = true, mounts = mounts)
         }
     }
+
+    /** True when a mount takes [catalog]'s name, so a listing must not show the catalog. */
+    fun shadowed(catalog: String): Boolean = record(catalog) != null
+
+    /** The mounts [listing] shows: its visibility set, through the gate [resolve] uses. */
+    fun mounts(listing: Listing): List<MountRecord> = listing.mounts.mapNotNull(::record)
+
+    /**
+     * The source catalog's row, which a mount presents under its own name. A
+     * missing source is a broken record, not a missing catalog, and its name
+     * must not reach the caller: a 500.
+     */
+    fun mountSource(mount: MountRecord): CatalogInfo =
+        try {
+            checkNotNull(defaultPostgres()).getCatalog(mount.sourceCatalog)
+        } catch (_: HoglakeException.NotFound) {
+            error("mount '${mount.name}': its source catalog does not exist")
+        }
 
     /** Resolve sub-backends through the same request-scoped store and default policy. */
     fun uploads(
@@ -226,5 +250,7 @@ class CatalogStoreSelector(
         val catalogs: Set<String>?,
         /** Only PostgreSQL catalogs can use the PostgreSQL sampler's name-keyed totals. */
         val usePostgresTotals: Boolean,
+        /** The names the caller may see as mounts ([mountVisibility]): required, and never "all". */
+        val mounts: Set<String>,
     )
 }

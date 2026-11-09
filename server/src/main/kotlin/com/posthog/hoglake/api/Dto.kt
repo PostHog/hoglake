@@ -140,6 +140,8 @@ data class CatalogDto(
      * An instant, not an age: the client renders "3 days ago" live.
      */
     val oldestSnapshotTime: Instant? = null,
+    /** True on a mount, which serves reads only; absent (NON_NULL) on every other catalog. */
+    val readOnly: Boolean? = null,
 )
 
 /**
@@ -165,6 +167,13 @@ fun CatalogInfo.toDto(totals: CatalogTotals? = null) =
         liveSizeBytes = totals?.liveBytes,
         oldestSnapshotTime = totals?.oldestSnapshotTime,
     )
+
+/**
+ * A mount's catalog: its source's row (data path, snapshot clock) under the
+ * mount's [name]. No capability, since every one advertised gates a write,
+ * and no sampler totals, which count the whole source.
+ */
+fun CatalogInfo.toMountDto(name: String) = toDto().copy(name = name, capabilities = emptyList(), readOnly = true)
 
 data class CreateCatalogRequestDto(
     val name: String,

@@ -334,6 +334,43 @@ class AuthPolicyTest {
     }
 
     @Test
+    fun `the mount column is unavailable by default and opens only reads, on a mount's name, by cat`() {
+        // The routes a mount serves; binding dispatch refuses every other one.
+        val served = AuthPolicy.rules.filter { it.mount == MountRoute.SCOPED }
+        assertThat(served.map { it.method to it.pattern })
+            .containsExactly(HttpMethod.Get to "/v1/catalogs/{catalog}")
+        assertThat(served).allSatisfy { assertThat(it.requirement).isEqualTo(Requirement.READ) }
+        assertThat(AuthPolicy.Entry(HttpMethod.Get, "/x", Requirement.READ).mount).isEqualTo(MountRoute.UNAVAILABLE)
+
+        val mount = "0190f3c4-1b2a-4c3d-8e4f-a5b6c7d8e9f0-events"
+        val other = "0190f3c4-1b2a-4c3d-8e4f-a5b6c7d8e9f1-events"
+
+        fun scoped(vararg cat: Pair<String, Set<Scope>>) =
+            Caller("hlc_team", "org-1", Caller.Kind.SCOPED, mapOf(*cat), "jti", null)
+
+        fun get(path: String) = AuthPolicy.match(HttpMethod.Get, path)!!
+        val reader = scoped(mount to setOf(Scope.READ), "lake" to setOf(Scope.READ))
+        assertThat(AuthPolicy.authorize(reader, get("/v1/catalogs/$mount"))).isEqualTo(AuthDecision.Allow)
+        // HEAD is GET here too.
+        assertThat(AuthPolicy.authorize(reader, AuthPolicy.match(HttpMethod.Head, "/v1/catalogs/$mount")!!))
+            .isEqualTo(AuthDecision.Allow)
+        // `cat` must hold the route's scope on that very name.
+        assertThat(AuthPolicy.authorize(scoped(mount to emptySet()), get("/v1/catalogs/$mount")))
+            .isEqualTo(AuthDecision.InsufficientScope(mount, Scope.READ))
+        assertThat(AuthPolicy.authorize(reader, get("/v1/catalogs/$other")))
+            .isEqualTo(AuthDecision.UnknownCatalog(other))
+        // Not the reserved shape: refused to a scoped caller as before.
+        assertThat(AuthPolicy.authorize(reader, get("/v1/catalogs/lake")))
+            .isEqualTo(AuthDecision.NotPredicated("lake", "/v1/catalogs/{catalog}"))
+        // An unavailable route on the mount's name: as before.
+        assertThat(AuthPolicy.authorize(reader, get("/v1/catalogs/$mount/storage-usage")))
+            .isEqualTo(AuthDecision.NotPredicated(mount, "/v1/catalogs/{catalog}/storage-usage"))
+        // Other kinds: unchanged; binding dispatch refuses them on a mount.
+        assertThat(AuthPolicy.authorize(tenant(read = listOf(mount)), get("/v1/catalogs/$mount")))
+            .isEqualTo(AuthDecision.Allow)
+    }
+
+    @Test
     fun `a scoped caller's permission on a value is the lower of its predicate and its catalog`() {
         fun caller(
             cat: Set<Scope>,

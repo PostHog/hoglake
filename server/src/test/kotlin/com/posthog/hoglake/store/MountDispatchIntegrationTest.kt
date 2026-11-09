@@ -4,6 +4,7 @@ import com.posthog.hoglake.App
 import com.posthog.hoglake.Config
 import com.posthog.hoglake.auth.AuthMode
 import com.posthog.hoglake.auth.AuthPolicy
+import com.posthog.hoglake.auth.MountRoute
 import com.posthog.hoglake.auth.Requirement
 import com.posthog.hoglake.auth.TestTokens
 import com.posthog.hoglake.configureApiListener
@@ -43,7 +44,8 @@ class MountDispatchIntegrationTest {
         Files.createTempFile("hoglake-mounts-", ".json").also { Files.writeString(it, TestTokens.jwks(pair)) }
     private val http = HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1).build()
     private val mount = "0190f3c4-1b2a-4c3d-8e4f-a5b6c7d8e9f0-events"
-    private val registry = MountRegistry { if (it == mount) MountRecord(it) else null }
+    private val source = "millrace-dev"
+    private val registry = MountRegistry { if (it == mount) MountRecord(it, source) else null }
 
     /** As migrated, before any test writes it. */
     private val migratedSwitch: Boolean =
@@ -56,6 +58,11 @@ class MountDispatchIntegrationTest {
         catalogs.createCatalog(mount, "s3://bucket/$mount")
         catalogs.createNamespace(mount, "ingest")
         catalogs.createTable(mount, "ingest", "events", listOf(ColumnDef("team_id", ColType.LONG)))
+        // The mount's source, a step ahead of the shadowed catalog's clock.
+        catalogs.createCatalog(source, "s3://bucket/millrace/$source")
+        catalogs.createNamespace(source, "ingest")
+        catalogs.createNamespace(source, "other")
+        catalogs.createCatalog("lake", "s3://bucket/lake")
     }
 
     @AfterAll
@@ -93,10 +100,26 @@ class MountDispatchIntegrationTest {
 
     private fun operator() = TestTokens.mint(pair, TestTokens.operatorClaims())
 
-    private fun scoped(): String {
+    private fun scoped(catalogs: String = """{"$mount":["write"]}"""): String {
         val iat = System.currentTimeMillis() / 1000 - 5
-        return TestTokens.mint(pair, TestTokens.scopedClaims(catalogs = """{"$mount":["write"]}""", iat = iat))
+        return TestTokens.mint(pair, TestTokens.scopedClaims(catalogs = catalogs, iat = iat))
     }
+
+    private fun tenant(): String {
+        val cat = mapOf(mount to listOf("admin"), "lake" to listOf("read"))
+        return TestTokens.mint(pair, TestTokens.tenantClaims(catalogs = cat))
+    }
+
+    /** The mount as its scoped reader sees it: the source's row under the mount's name. */
+    private fun mountBody(): String {
+        val row = CatalogService(db.jdbi).getCatalog(source)
+        return """{"name":"$mount","data_path":"s3://bucket/millrace/$source",""" +
+            """"head_snapshot_id":${row.headSnapshotId},"schema_version":${row.schemaVersion},""" +
+            """"capabilities":[],"read_only":true}"""
+    }
+
+    private fun names(body: String): List<String> =
+        Regex(""""name":"([^"]+)"""").findAll(body).map { it.groupValues[1] }.toList()
 
     private fun send(
         port: Int,
@@ -166,7 +189,7 @@ class MountDispatchIntegrationTest {
     }
 
     @Test
-    fun `every catalog route on a mount is refused before any service call`() {
+    fun `every catalog route on a mount answers as its mount column says, before any service call`() {
         switch(true)
         try {
             withServer { port ->
@@ -178,9 +201,15 @@ class MountDispatchIntegrationTest {
                         .isEqualTo(404)
                     assertThat(operator.body()).describedAs(path)
                         .isEqualTo("""{"error":"not_found","detail":"catalog '$mount'"}""")
-                    // A scoped caller naming the mount: the plugin lets it reach
-                    // the binding on its own routes, and refuses it elsewhere.
+                    // A scoped caller naming the mount: served on the mount
+                    // column's routes; elsewhere the plugin lets it reach the
+                    // binding on its own routes, and refuses it on the rest.
                     val scoped = send(port, rule.method, path, scoped())
+                    if (rule.mount == MountRoute.SCOPED) {
+                        assertThat(scoped.statusCode()).describedAs("%s %s", rule.method.value, path).isEqualTo(200)
+                        assertThat(scoped.body()).isEqualTo(mountBody())
+                        continue
+                    }
                     val route = rule.method to rule.pattern
                     val scopedRoute = route in AuthPolicy.SCOPED_ROUTES || route in AuthPolicy.BODY_SCOPED_ROUTES
                     val expected =
@@ -212,12 +241,65 @@ class MountDispatchIntegrationTest {
     private fun reads(port: Int): Map<String, Pair<Int, String>> =
         catalogRoutes()
             .filter { (rule, _) -> rule.requirement == Requirement.READ }
-            .flatMap { (rule, path) ->
-                listOf("operator" to operator(), "scoped" to scoped()).map { (who, token) ->
-                    val response = send(port, rule.method, path, token)
-                    "$who ${rule.method.value} $path" to (response.statusCode() to response.body())
+            .map { (rule, path) -> rule.method to path }
+            .plus(HttpMethod.Get to "/v1/catalogs")
+            .flatMap { (method, path) ->
+                listOf("operator" to operator(), "scoped" to scoped(), "tenant" to tenant()).map { (who, token) ->
+                    val response = send(port, method, path, token)
+                    "$who ${method.value} $path" to (response.statusCode() to response.body())
                 }
             }.toMap()
+
+    @Test
+    fun `the listing shows a mount only to its scoped reader, and never the catalog it shadows`() {
+        switch(true)
+        try {
+            withServer { port ->
+                val reader = scoped("""{"$mount":["read"],"lake":["read"]}""")
+                val listed = send(port, HttpMethod.Get, "/v1/catalogs", reader)
+                assertThat(listed.statusCode()).isEqualTo(200)
+                assertThat(names(listed.body())).containsExactly("lake", mount)
+                // The mount entry is exactly what GET answers for it, after the local catalogs.
+                assertThat(listed.body()).endsWith(",${mountBody()}]")
+                assertThat(send(port, HttpMethod.Get, "/v1/catalogs/$mount", reader).body()).isEqualTo(mountBody())
+                // Everyone else: no mount, and not the catalog it shadows.
+                val all = send(port, HttpMethod.Get, "/v1/catalogs", operator()).body()
+                assertThat(names(all)).contains("lake", source).doesNotContain(mount)
+                assertThat(all).doesNotContain("read_only")
+                assertThat(names(send(port, HttpMethod.Get, "/v1/catalogs", tenant()).body())).containsExactly("lake")
+            }
+            withServer(mode = AuthMode.OFF) { port ->
+                val body = send(port, HttpMethod.Get, "/v1/catalogs", null).body()
+                assertThat(names(body)).contains("lake", source).doesNotContain(mount)
+                assertThat(body).doesNotContain("read_only")
+            }
+            withServer(mode = AuthMode.WARN) { port ->
+                val reader = scoped("""{"$mount":["read"]}""")
+                assertThat(send(port, HttpMethod.Get, "/v1/catalogs", reader).body()).isEqualTo("[${mountBody()}]")
+                assertThat(send(port, HttpMethod.Get, "/v1/catalogs/$mount", reader).body()).isEqualTo(mountBody())
+                assertThat(send(port, HttpMethod.Get, "/v1/catalogs/$mount", null).statusCode()).isEqualTo(404)
+            }
+        } finally {
+            switch(false)
+        }
+    }
+
+    @Test
+    fun `a mount whose source is missing answers 500 without naming the source`() {
+        switch(true)
+        try {
+            withServer(MountRegistry { if (it == mount) MountRecord(it, "gone") else null }) { port ->
+                for (path in listOf("/v1/catalogs/$mount", "/v1/catalogs")) {
+                    val response = send(port, HttpMethod.Get, path, scoped())
+                    assertThat(response.statusCode()).describedAs(path).isEqualTo(500)
+                    assertThat(response.body())
+                        .isEqualTo("""{"error":"internal_error","detail":"internal server error"}""")
+                }
+            }
+        } finally {
+            switch(false)
+        }
+    }
 
     @Test
     fun `no backend can create a catalog with a mount's name, whatever the switch says`() {

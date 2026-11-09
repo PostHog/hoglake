@@ -572,7 +572,7 @@ samplers start only after PostgreSQL initializes; a hoglite-only process never s
 | No `rtg`, or a different catalog | PostgreSQL default, or 404 when the default is `none` |
 | Hoglite catalog listing | Only the token's routed catalog |
 | Maintenance or publications on hoglite | 501 `not_supported_on_backend` |
-| A mount name (§6.5a) | Resolved first, and refused: never a store |
+| A mount name (§6.5a) | Resolved first: never a store |
 
 Authorization still runs before store selection. Fleet metrics and `/v1/info` remain PostgreSQL-only.
 
@@ -790,7 +790,8 @@ a canonical lowercase UUID (`MountNames.PATTERN`).
   created through it can take a mount's name. A PostgreSQL name taken earlier
   is for the mount write to refuse; a hoglite one is kept out by the issuer's
   `cat` grammar. Where both exist, the mount resolves first on every
-  `{catalog}` route; `GET /v1/catalogs` does not list mounts yet.
+  `{catalog}` route, and `GET /v1/catalogs` lists the mount, never the
+  catalog.
 - **One choke point.** `CatalogStoreSelector.resolve` is #291's
   `CatalogRegistry.resolve`. It runs before token placement picks a store. Every
   catalog route and the namespace gate reach it through `forCatalog`. A name
@@ -802,12 +803,20 @@ a canonical lowercase UUID (`MountNames.PATTERN`).
   404 worded as a missing catalog. Under `off` no caller is verified, so a
   mount serves no one. A scoped reader whose `rtg` places the mount on hoglite
   gets 501 `not_supported_on_backend`.
-- **What it serves.** Nothing yet. A non-read route answers 403
-  `read_only_catalog`; a read route answers 501
-  `mount_operation_unavailable`; both before any service call. The route table
-  (§6.4) gives the class. `AuthPolicy` does not list mounts: under `warn` and
-  `enforce` it answers a scoped caller 403 `forbidden` on routes outside its
-  scoped set or beyond its `cat` scope, before dispatch.
+- **What it serves.** Its catalog: `GET /v1/catalogs/{catalog}`, and the
+  listing, which shows a caller the reserved names in its own `cat` that it
+  may read as mounts (`mountVisibility`; never a mount to anyone else). The
+  body is the source catalog's row under the mount's name (data path,
+  snapshot clock), `read_only: true`, no capabilities (each one gates a
+  write) and no sampler totals. Every other route refuses before any service
+  call: a non-read route with 403 `read_only_catalog`, a read route with 501
+  `mount_operation_unavailable`. The route table (§6.4) gives the class.
+- **The mount column.** Each `AuthPolicy` entry has one, `UNAVAILABLE` by
+  default; `SCOPED` routes are those the mount serves. On such a route a
+  reserved name is open to a scoped caller by its `cat` alone; the binding
+  decides the rest. Elsewhere, under `warn` and `enforce`, `AuthPolicy`
+  answers a scoped caller 403 `forbidden` on routes outside its scoped set or
+  beyond its `cat` scope, before dispatch.
 - **The switch.** `hog_mount_switch` (V34) is off by default, and it is read
   only for a name the registry holds. To turn it on:
   `UPDATE hog_mount_switch SET enabled = true;` (`false` turns it off). The
