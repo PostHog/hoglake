@@ -113,7 +113,7 @@ class ReadScopeIntegrationTest {
             spec(broken, 2)
             spec(events, 1, team to "identity", ts to "day", cat = otherCatalog)
             spec(gapped, 1)
-            for ((key, source, transform) in listOf(Triple(0, ts, "day"), Triple(2, team, "identity"))) {
+            for ((key, source, transform) in listOf(Triple(2, team, "identity"), Triple(0, ts, "day"))) {
                 h.execute(
                     "INSERT INTO hog_partition_field (catalog_id, table_id, spec_id, key_index, source_field_id, " +
                         "transform) VALUES (?, ?, 1, ?, ?, ?)",
@@ -244,7 +244,7 @@ class ReadScopeIntegrationTest {
 
     @Test
     fun `visibility is the statement's own snapshot`() {
-        assertThat(admitted(load(listOf(42), PredicateGrant.All(Scope.READ), snapshot = 2), snapshot = 2))
+        assertThat(admitted(load(listOf(42), PredicateGrant.All(Scope.READ), snapshot = 5), snapshot = 2))
             .containsExactly(1, 4, 11)
     }
 

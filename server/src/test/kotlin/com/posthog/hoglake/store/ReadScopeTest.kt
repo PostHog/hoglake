@@ -57,7 +57,7 @@ class ReadScopeTest {
     }
 
     @Test
-    fun `an empty intersection reads no file and binds nothing`() {
+    fun `an empty intersection compiles to FALSE`() {
         for (scope in listOf(
             compile(values(7L to Scope.READ)),
             compile(null),

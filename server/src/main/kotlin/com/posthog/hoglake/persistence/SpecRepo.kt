@@ -48,10 +48,13 @@ object SpecRepo {
     /**
      * Every spec row of the table, live or retired, by spec_id, each with
      * its fields by key_index: the specs a file of the table can name.
-     * Partition values are stored by key_index and read by position, so a
-     * spec whose key_indexes are not exactly 0..n-1 (every writer writes
-     * them so), or that has no field rows, comes back with no fields, for
-     * the caller to refuse ([com.posthog.hoglake.store.ReadScope]).
+     * Commit writes a file's values by position but proves the prefix
+     * value at the field's stored key_index; the two agree only when the
+     * key_indexes are exactly 0..n-1, as every writer writes them. So a
+     * spec whose key_indexes are not, or that has no field rows, comes back
+     * with no fields, for the caller to refuse
+     * ([com.posthog.hoglake.store.ReadScope]): read by position, it could
+     * name an unproven value.
      */
     fun boundSpecs(
         h: Handle,

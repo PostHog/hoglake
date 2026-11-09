@@ -69,18 +69,23 @@ import java.sql.DriverManager
  * events table has one.
  *
  * # Measured (postgres:18.6, 2026-11-09)
- * At 41M files (`hog_data_file` 744,515 heap pages, 13 GB; 82M partition
- * values, 11 GB), with the first fixture (team id mod 20000, so each team
- * sat in one table and one state), every plan below, custom and generic,
- * had the shape and is within the bound above:
+ * At 41M files (`hog_data_file` 744,515 heap pages, 13 GB with its
+ * indexes; 82M partition values, 11 GB), with the first fixture (team id
+ * mod 20000, so each team sat in one table and one state) and that
+ * revision's looser checks (no hash or merge ban, no per-arm counts),
+ * every plan passed. The five plans recorded (small team custom and
+ * generic, both reordered customs, the whale org custom) also pass the
+ * checks above; the other five (whale team, the generics of the whale org
+ * and of the reordered cases) were not recorded:
  *  - small team: 2,050 ids collected, 1,988 returned, 26,189 buffers;
  *  - reordered, two arms: 4,100 collected, 1,987 returned, 36,475 buffers;
  *  - reordered, team 19500 = a day ordinal: the key-1 arm collected the
  *    whole day, 42,640 ids (43,050 with key 0) for 1,988 returned,
  *    27,542 buffers;
  *  - whale team (5%) and a 2,001-value org: the same shape (no ANALYZE).
- * At 10M files with this fixture: small team 471 collected, 397 returned,
- * 5,077 buffers; reordered 952 / 22 / 2,918; team 19500 10,475 / 10 / 2,326.
+ * At 10M files with this fixture, every plan passed the checks above:
+ * small team 471 collected, 397 returned, 5,077 buffers; reordered
+ * 952 / 22 / 2,918; team 19500 10,475 / 10 / 2,326.
  *
  * The statement is ScanService.planScan's with the scope ANDed in, as 1.3
  * will serve it; 1.3 swaps the copy below for the real statement.
