@@ -22,17 +22,22 @@ import io.ktor.server.routing.routing
 fun Application.installViewRoutes(
     views: ViewBackend,
     selector: CatalogStoreSelector? = null,
+) = installViewRoutes({ views }, selector)
+
+fun Application.installViewRoutes(
+    views: () -> ViewBackend,
+    selector: CatalogStoreSelector? = null,
 ) {
     routing {
         route("/v1/catalogs/{catalog}/namespaces/{namespace}/views") {
             get {
-                val views = selector?.views(call, call.catalog(), views) ?: views
+                val views = selector?.views(call, call.catalog(), views) ?: views()
                 call.respond(
                     views.list(call.catalog(), call.namespace()).map { it.toDto() },
                 )
             }
             post {
-                val views = selector?.views(call, call.catalog(), views) ?: views
+                val views = selector?.views(call, call.catalog(), views) ?: views()
                 val req = call.receive<CreateViewRequestDto>()
                 call.respond(
                     HttpStatusCode.Created,
@@ -49,13 +54,13 @@ fun Application.installViewRoutes(
             }
             route("/{view}") {
                 get {
-                    val views = selector?.views(call, call.catalog(), views) ?: views
+                    val views = selector?.views(call, call.catalog(), views) ?: views()
                     call.respond(
                         views.get(call.catalog(), call.namespace(), call.view()).toDto(),
                     )
                 }
                 delete {
-                    val views = selector?.views(call, call.catalog(), views) ?: views
+                    val views = selector?.views(call, call.catalog(), views) ?: views()
                     call.respond(
                         views.drop(
                             call.catalog(),

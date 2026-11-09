@@ -548,7 +548,23 @@ Optional endpoint and timeout keys are documented in `Config`.
 This file contains server-controlled endpoints, not secrets.
 It requires auth mode `warn` or `enforce`.
 `HOGLAKE_DEFAULT_BACKEND` accepts `postgres` or `none`. Hoglite cannot be the default.
-PostgreSQL still opens at startup, even with no request fallback.
+The default is `postgres`. In that mode, startup opens PostgreSQL, applies migrations,
+and starts the PostgreSQL maintenance loops as before. This keeps Gigahog unchanged.
+
+With `none`, startup does not create a PostgreSQL pool or Jdbi instance and does not
+apply migrations. If `HOGLAKE_POSTGRES_BACKEND_ID` is set, `HOGLAKE_JDBC_URL`,
+`HOGLAKE_DB_USER`, and `HOGLAKE_DB_PASSWORD` are required at startup. The first
+request routed to that backend opens one pool, applies migrations, and creates Jdbi.
+Concurrent requests share this initialization. Later requests reuse the pool.
+A failed open or migration closes the failed pool and returns 503 `backend_unavailable`;
+a later request can retry. If no PostgreSQL backend is configured, no PostgreSQL
+connection settings are needed. A PostgreSQL placement then returns 401 `unknown_backend`.
+
+`/livez` never checks a backend. `/healthz` checks all configured hoglite backends,
+but skips PostgreSQL until it has initialized. The probe itself never opens the request
+pool or runs migrations. After initialization, it also checks PostgreSQL through its
+separate bounded probe connection. PostgreSQL background loops and catalog metrics
+samplers start only after PostgreSQL initializes; a hoglite-only process never starts them.
 
 | Request | Store |
 | --- | --- |

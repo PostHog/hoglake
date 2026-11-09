@@ -66,9 +66,14 @@ private fun TableCreation.toDto() =
 fun Application.installTableCreationRoutes(
     creations: TableCreationBackend,
     selector: CatalogStoreSelector? = null,
+) = installTableCreationRoutes({ creations }, selector)
+
+fun Application.installTableCreationRoutes(
+    creations: () -> TableCreationBackend,
+    selector: CatalogStoreSelector? = null,
 ) {
     fun ApplicationCall.creationBackend(): TableCreationBackend =
-        selector?.tableCreations(this, creationCatalog(), creations) ?: creations
+        selector?.tableCreations(this, creationCatalog(), creations) ?: creations()
 
     routing {
         route("/v1/catalogs/{catalog}/table-creations/{operation}") {

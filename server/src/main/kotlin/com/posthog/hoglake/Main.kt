@@ -25,14 +25,7 @@ internal fun NettyApplicationEngine.Configuration.configureApiListener(cfg: Conf
 
 fun main() {
     val cfg = Config.fromEnv()
-    val ds = Database.dataSource(cfg)
-    Database.migrate(ds)
-    val jdbi = Database.jdbi(ds)
-
-    // `ds` is handed over only so the hoglake_db_pool_* saturation
-    // gauges have an MXBean to read (#218); everything else goes
-    // through Jdbi as before.
-    val app = App.build(cfg, jdbi, dataSource = ds)
+    val app = App.build(cfg)
     val background = app.startBackground()
     val server =
         embeddedServer(

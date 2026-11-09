@@ -43,10 +43,15 @@ import java.time.Instant
 fun Application.installPartitionListingRoutes(
     listings: PartitionListingBackend,
     selector: CatalogStoreSelector? = null,
+) = installPartitionListingRoutes({ listings }, selector)
+
+fun Application.installPartitionListingRoutes(
+    listings: () -> PartitionListingBackend,
+    selector: CatalogStoreSelector? = null,
 ) {
     routing {
         get("/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/partitions") {
-            val listings = selector?.partitionListing(call, call.catalog(), listings) ?: listings
+            val listings = selector?.partitionListing(call, call.catalog(), listings) ?: listings()
             call.respond(
                 listings.listPartitions(
                     call.catalog(),

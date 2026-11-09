@@ -58,43 +58,85 @@ class CatalogStoreSelector(
         call: ApplicationCall,
         catalog: String,
         postgres: UploadBackend,
-    ): UploadBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.uploads ?: postgres
+    ): UploadBackend = uploads(call, catalog) { postgres }
+
+    fun uploads(
+        call: ApplicationCall,
+        catalog: String,
+        postgres: () -> UploadBackend,
+    ): UploadBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.uploads ?: postgres()
 
     fun tableCreations(
         call: ApplicationCall,
         catalog: String,
         postgres: TableCreationBackend,
-    ): TableCreationBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.tableCreations ?: postgres
+    ): TableCreationBackend = tableCreations(call, catalog) { postgres }
+
+    fun tableCreations(
+        call: ApplicationCall,
+        catalog: String,
+        postgres: () -> TableCreationBackend,
+    ): TableCreationBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.tableCreations ?: postgres()
 
     fun alters(
         call: ApplicationCall,
         catalog: String,
         postgres: AlterBackend,
-    ): AlterBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.alters ?: postgres
+    ): AlterBackend = alters(call, catalog) { postgres }
+
+    fun alters(
+        call: ApplicationCall,
+        catalog: String,
+        postgres: () -> AlterBackend,
+    ): AlterBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.alters ?: postgres()
 
     fun views(
         call: ApplicationCall,
         catalog: String,
         postgres: ViewBackend,
-    ): ViewBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.views ?: postgres
+    ): ViewBackend = views(call, catalog) { postgres }
+
+    fun views(
+        call: ApplicationCall,
+        catalog: String,
+        postgres: () -> ViewBackend,
+    ): ViewBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.views ?: postgres()
 
     fun partitionStats(
         call: ApplicationCall,
         catalog: String,
         postgres: PartitionStatsBackend,
-    ): PartitionStatsBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.partitions ?: postgres
+    ): PartitionStatsBackend = partitionStats(call, catalog) { postgres }
+
+    fun partitionStats(
+        call: ApplicationCall,
+        catalog: String,
+        postgres: () -> PartitionStatsBackend,
+    ): PartitionStatsBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.partitions ?: postgres()
 
     fun partitionListing(
         call: ApplicationCall,
         catalog: String,
         postgres: PartitionListingBackend,
-    ): PartitionListingBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.partitions ?: postgres
+    ): PartitionListingBackend = partitionListing(call, catalog) { postgres }
+
+    fun partitionListing(
+        call: ApplicationCall,
+        catalog: String,
+        postgres: () -> PartitionListingBackend,
+    ): PartitionListingBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.partitions ?: postgres()
 
     fun partitionLookup(
         call: ApplicationCall,
         catalog: String,
         postgres: PartitionLookupBackend,
-    ): PartitionLookupBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.partitionLookup ?: postgres
+    ): PartitionLookupBackend = partitionLookup(call, catalog) { postgres }
+
+    fun partitionLookup(
+        call: ApplicationCall,
+        catalog: String,
+        postgres: () -> PartitionLookupBackend,
+    ): PartitionLookupBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.partitionLookup ?: postgres()
 
     /** Maintenance is PostgreSQL-only. Resolve placement before any service or body work. */
     fun requirePostgres(
