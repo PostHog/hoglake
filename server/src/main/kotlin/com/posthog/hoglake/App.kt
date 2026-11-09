@@ -7,6 +7,7 @@ import com.posthog.hoglake.api.installBlockingDispatch
 import com.posthog.hoglake.api.installDebugRoutes
 import com.posthog.hoglake.api.installErrorMapping
 import com.posthog.hoglake.api.installMaintenanceRoutes
+import com.posthog.hoglake.api.installMountRoutes
 import com.posthog.hoglake.api.installPartitionListingRoutes
 import com.posthog.hoglake.api.installPartitionLookupRoutes
 import com.posthog.hoglake.api.installPartitionStatsRoutes
@@ -49,6 +50,7 @@ import com.posthog.hoglake.service.ViewService
 import com.posthog.hoglake.store.CatalogStore
 import com.posthog.hoglake.store.CatalogStoreSelector
 import com.posthog.hoglake.store.MountRegistry
+import com.posthog.hoglake.store.MountStore
 import com.posthog.hoglake.store.PostgresCatalogStore
 import com.zaxxer.hikari.HikariDataSource
 import io.ktor.http.ContentType
@@ -86,8 +88,8 @@ class App private constructor(
      * second connection until something asks.
      */
     val healthProbe: HealthProbe,
-    /** Mount records; none until the mount table exists. Tests inject them. */
-    private val mountRegistry: MountRegistry = MountRegistry.NONE,
+    /** Mount records; null is this instance's `hog_mount` ([mountStore]). Tests inject them. */
+    private val mountRegistry: MountRegistry? = null,
 ) : AutoCloseable {
     /** Access from a PostgreSQL request only; probes must use [postgresReady]. */
     val jdbi: Jdbi get() = jdbiProvider()
@@ -134,11 +136,13 @@ class App private constructor(
         PostgresCatalogStore({ catalogService }, { commitService }, { scanService })
     }
 
+    private val mountStore by lazy { MountStore({ jdbi }, cfg::mountAdmitted) }
+
     private val catalogSelector by lazy {
         CatalogStoreSelector(
             catalogStore,
             cfg,
-            MountRegistry.behindSwitch(MountRegistry.postgresSwitch { jdbi }, mountRegistry),
+            MountRegistry.behindSwitch(MountRegistry.postgresSwitch { jdbi }, mountRegistry ?: mountStore),
         )
     }
 
@@ -415,7 +419,7 @@ class App private constructor(
             jdbi: Jdbi,
             dataSource: HikariDataSource? = null,
             healthProbe: HealthProbe = HealthProbe.fromConfig(cfg),
-            mountRegistry: MountRegistry = MountRegistry.NONE,
+            mountRegistry: MountRegistry? = null,
         ): App =
             App(cfg, { jdbi }, { true }, mountRegistry = mountRegistry, healthProbe = healthProbe).also {
                 it.bindMetrics(dataSource)
@@ -576,6 +580,7 @@ class App private constructor(
         app.installPartitionListingRoutes({ partitionListingService }, selector = catalogSelector)
         app.installPartitionLookupRoutes({ partitionLookupService }, selector = catalogSelector)
         app.installPublicationRoutes(catalogSelector)
+        app.installMountRoutes({ mountStore }, cfg.mountWriterSubject)
         app.installDebugRoutes()
     }
 

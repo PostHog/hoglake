@@ -795,8 +795,9 @@ a canonical lowercase UUID (`MountNames.PATTERN`).
   `CatalogRegistry.resolve`. It runs before token placement picks a store. Every
   catalog route and the namespace gate reach it through `forCatalog`. A name
   resolves to a mount only if it has the reserved shape, PostgreSQL is the
-  default backend, the mount registry holds it, and `hog_mount_switch.enabled`
-  is true. Otherwise the request is served as before.
+  default backend, its org is in `HOGLAKE_MOUNT_ALLOWLIST`, `hog_mount` holds
+  it enabled, and `hog_mount_switch.enabled` is true. Otherwise the request is
+  served as before.
 - **Who it serves.** Only a verified `ten: scoped` caller whose `cat` names the
   mount, in every auth mode. Any other caller that gets past the plugin gets a
   404 worded as a missing catalog. Under `off` no caller is verified, so a
@@ -809,10 +810,30 @@ a canonical lowercase UUID (`MountNames.PATTERN`).
   `enforce` it answers a scoped caller 403 `forbidden` on routes outside its
   scoped set or beyond its `cat` scope, before dispatch.
 - **The switch.** `hog_mount_switch` (V34) is off by default, and it is read
-  only for a name the registry holds. To turn it on:
-  `UPDATE hog_mount_switch SET enabled = true;` (`false` turns it off). The
-  registry is empty until the mount table exists, so nothing reads the switch
-  yet.
+  only for a name `hog_mount` holds enabled. To turn it on:
+  `UPDATE hog_mount_switch SET enabled = true;` (`false` turns it off). It has
+  no API.
+- **The mounts.** `hog_mount` (V35) holds each mount's revision, `enabled`
+  flag and values (the identity-partition values it admits: team ids). The
+  table a mount reads is the instance's, not the row's.
+  - Operators read mounts with `GET /v1/mounts` and `GET /v1/mounts/{name}`.
+    A mount that was never written reads as revision 0.
+  - `PUT /v1/mounts/{name}` replaces a mount. Only the operator token whose
+    `sub` is `HOGLAKE_MOUNT_WRITER_SUBJECT` (hogtower's events mount loop) may
+    call it, in every auth mode. Any other caller gets 403, including other
+    operators, `platform:admin`, and no caller at all. Empty (the default)
+    means nobody may.
+  - A write is CAS on the revision the writer read, and moves the mount to
+    the next revision. A stale write gets 409 `mount_revision_conflict`. The
+    write gets 422 for a name that any `hog_catalog` row holds, more than
+    10,000 values, or a negative or repeated value. A mount is never deleted,
+    so its revision never resets.
+  - Every write attempt is one `mount_write` audit line: the actor, the `jti`,
+    and the values added and removed.
+  - `HOGLAKE_MOUNT_ALLOWLIST` lists the org ids (the `<id>` of `<id>-events`)
+    whose mounts may serve; `*` means all of them. It is empty by default, and
+    then no mount name is looked up at all. It gates serving only, so a mount
+    can always be disabled.
 
 ### 6.6 Client-supplied authority fields must die
 

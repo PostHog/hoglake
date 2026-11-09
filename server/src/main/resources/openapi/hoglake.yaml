@@ -1528,6 +1528,69 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
 
+  /mounts:
+    get:
+      operationId: listMounts
+      summary: Every mount, enabled or not, by name (operator only)
+      description: >
+        A mount is a read-only catalog name `<orgID>-events` over this
+        instance's events table. Its values are the identity-partition
+        values it admits (team ids). Mounts are never deleted.
+      responses:
+        "200":
+          description: The mounts
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Mount" }
+
+  /mounts/{mount}:
+    parameters:
+      - name: mount
+        in: path
+        required: true
+        schema: { type: string, pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-events$' }
+    get:
+      operationId: getMount
+      summary: One mount (operator only)
+      description: A mount never written answers 200 with revision 0, enabled false and no values.
+      responses:
+        "200":
+          description: The mount
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Mount" }
+        "422": { $ref: "#/components/responses/Validation" }
+    put:
+      operationId: putMount
+      summary: Replace a mount, at the revision the writer read (mount writer only)
+      description: >
+        Only the operator token whose `sub` is the server's
+        HOGLAKE_MOUNT_WRITER_SUBJECT may write, in every auth mode; any
+        other caller gets 403. The write succeeds only while the mount is
+        at `revision` (0: never written) and moves it to `revision + 1`;
+        otherwise 409 `mount_revision_conflict`, the only 409 here: read
+        the mount again. 422 for a name that is not a mount name, or that
+        any catalog holds; more than 10,000 values, a negative or repeated
+        value, or a non-null `retention_months`. A mount serves only while
+        enabled, its org is in HOGLAKE_MOUNT_ALLOWLIST and the instance's
+        mount switch is on.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PutMountRequest" }
+      responses:
+        "200":
+          description: The mount, at revision + 1
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Mount" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/Validation" }
+
   /catalogs/{catalog}/maintenance/status:
     get:
       operationId: getMaintenanceStatus
@@ -3638,6 +3701,39 @@ components:
             Present only on 409 catalog_not_empty: the first failing
             precondition of the catalog drop, in resolution order. See
             dropCatalog for what each one asks the caller to do.
+
+    MountValue:
+      type: object
+      required: [value]
+      properties:
+        value: { type: integer, format: int64, minimum: 0 }
+        retention_months:
+          type: integer
+          nullable: true
+          description: No source yet; must be null, and responses omit it.
+
+    Mount:
+      type: object
+      required: [name, revision, enabled, values]
+      properties:
+        name: { type: string }
+        revision: { type: integer, format: int64, description: "One more on every write; 0 = never written." }
+        enabled: { type: boolean }
+        values:
+          type: array
+          description: Ascending and distinct.
+          items: { $ref: "#/components/schemas/MountValue" }
+
+    PutMountRequest:
+      type: object
+      required: [revision, enabled, values]
+      properties:
+        revision: { type: integer, format: int64, minimum: 0, description: "The revision the writer read." }
+        enabled: { type: boolean }
+        values:
+          type: array
+          maxItems: 10000
+          items: { $ref: "#/components/schemas/MountValue" }
 
     DroppedCatalog:
       type: object

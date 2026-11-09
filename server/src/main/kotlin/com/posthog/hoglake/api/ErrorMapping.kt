@@ -26,6 +26,7 @@ private val log = KotlinLogging.logger("com.posthog.hoglake.api.ErrorMapping")
  * - NotFound            -> 404
  * - ReadOnlyCatalog     -> 403 `read_only_catalog` (any non-read route on a mount)
  * - MountOperationUnavailable -> 501 `mount_operation_unavailable`
+ * - MountRevisionConflict -> 409 `mount_revision_conflict` (a stale mount write)
  * - AlreadyExists       -> 409
  * - CommitConflict      -> 409
  * - OffsetRegression    -> 409
@@ -86,6 +87,9 @@ internal fun errorBody(cause: HoglakeException): Pair<HttpStatusCode, ApiErrorDt
         is HoglakeException.ReadOnlyCatalog -> HttpStatusCode.Forbidden to apiError("read_only_catalog", cause)
         is HoglakeException.MountOperationUnavailable ->
             HttpStatusCode.NotImplemented to apiError("mount_operation_unavailable", cause)
+        // Before CommitConflict, its base: the mount API's only 409.
+        is HoglakeException.MountRevisionConflict ->
+            HttpStatusCode.Conflict to apiError("mount_revision_conflict", cause)
         is HoglakeException.BackendResultTooLarge ->
             HttpStatusCode.UnprocessableEntity to apiError("backend_result_too_large", cause)
         is HoglakeException.BackendQueryTimeout ->
