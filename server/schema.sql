@@ -932,3 +932,12 @@ CREATE INDEX hog_compaction_claim_expiry
 -- 1,157 MiB at 5M rows, 243 bytes/row.
 CREATE INDEX hog_data_file_path ON hog_data_file (catalog_id, path);
 CREATE INDEX hog_delete_file_path ON hog_delete_file (catalog_id, path);
+
+-- V34: the instance-wide mount switch. One row, off by default; while it
+-- is off no catalog name resolves to a mount.
+CREATE TABLE hog_mount_switch (
+    singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+    enabled   boolean NOT NULL DEFAULT false
+);
+
+INSERT INTO hog_mount_switch DEFAULT VALUES;

@@ -19,6 +19,7 @@ import com.posthog.hoglake.service.Identifiers
 import com.posthog.hoglake.service.ScanService
 import com.posthog.hoglake.store.CatalogStore
 import com.posthog.hoglake.store.CatalogStoreSelector
+import com.posthog.hoglake.store.MountNames
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
@@ -132,6 +133,11 @@ fun Application.installApiRoutes(
             }
             post {
                 val req = call.receive<CreateCatalogRequestDto>()
+                // Before placement picks a backend, so no backend can create
+                // a catalog that shares a name with a mount.
+                if (MountNames.isReserved(req.name)) {
+                    throw HoglakeException.Validation("catalog name '${req.name}' is reserved for mounts")
+                }
                 val catalogs = selector.forCatalog(call, req.name)
                 call.respond(
                     HttpStatusCode.Created,

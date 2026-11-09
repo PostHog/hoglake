@@ -24,6 +24,8 @@ private val log = KotlinLogging.logger("com.posthog.hoglake.api.ErrorMapping")
  * (the spec's schema); Ktor's default HTML pages never escape.
  *
  * - NotFound            -> 404
+ * - ReadOnlyCatalog     -> 403 `read_only_catalog` (any non-read route on a mount)
+ * - MountOperationUnavailable -> 501 `mount_operation_unavailable`
  * - AlreadyExists       -> 409
  * - CommitConflict      -> 409
  * - OffsetRegression    -> 409
@@ -81,6 +83,9 @@ private val log = KotlinLogging.logger("com.posthog.hoglake.api.ErrorMapping")
 internal fun errorBody(cause: HoglakeException): Pair<HttpStatusCode, ApiErrorDto> =
     when (cause) {
         is HoglakeException.NotSupported -> HttpStatusCode.NotImplemented to apiError("not_supported_on_backend", cause)
+        is HoglakeException.ReadOnlyCatalog -> HttpStatusCode.Forbidden to apiError("read_only_catalog", cause)
+        is HoglakeException.MountOperationUnavailable ->
+            HttpStatusCode.NotImplemented to apiError("mount_operation_unavailable", cause)
         is HoglakeException.BackendResultTooLarge ->
             HttpStatusCode.UnprocessableEntity to apiError("backend_result_too_large", cause)
         is HoglakeException.BackendQueryTimeout ->

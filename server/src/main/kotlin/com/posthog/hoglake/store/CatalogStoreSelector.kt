@@ -24,18 +24,48 @@ import java.util.concurrent.ConcurrentHashMap
 class CatalogStoreSelector(
     private val postgres: CatalogStore?,
     private val cfg: Config? = null,
-) {
+    /** Mount records, consulted only for reserved names. */
+    private val mounts: MountRegistry = MountRegistry.NONE,
+) : CatalogRegistry {
     private val clients = ConcurrentHashMap<UUID, HogliteClient>()
     private val lookupAdmissions = ConcurrentHashMap<UUID, HoglitePartitionLookupAdmission>()
     private val requestStore = AttributeKey<HogliteCatalogStore>("HoglakeCatalogStore")
 
-    /** Return one request-scoped hoglite store, or the process's PostgreSQL singleton. */
+    /**
+     * Return one request-scoped hoglite store, or the process's PostgreSQL
+     * singleton. Every catalog route calls this before any service or body
+     * work, so a mount is refused here on every route it has no reader for.
+     */
     fun forCatalog(
         call: ApplicationCall,
         catalog: String,
-    ): CatalogStore {
+    ): CatalogStore =
+        when (val binding = resolve(call, catalog)) {
+            is CatalogBinding.Local -> binding.store
+            is CatalogBinding.Mount -> throw mountRefusal(call)
+        }
+
+    /** A mount name resolves first, then verified placement, then the default backend. */
+    override fun resolve(
+        call: ApplicationCall,
+        catalog: String,
+    ): CatalogBinding {
+        mount(call, catalog)?.let { return it }
         val routing = call.hoglakeAuth.callerOrNull?.routing
-        return if (routing != null && routing.catalog == catalog) routed(call, routing) else fallback(catalog)
+        return CatalogBinding.Local(
+            if (routing != null && routing.catalog == catalog) routed(call, routing) else fallback(catalog),
+        )
+    }
+
+    /** A mount reads this process's PostgreSQL, so it exists only where PostgreSQL is the default. */
+    private fun mount(
+        call: ApplicationCall,
+        catalog: String,
+    ): CatalogBinding.Mount? {
+        if (!MountNames.isReserved(catalog) || defaultPostgres() == null) return null
+        val record = mounts.find(catalog) ?: return null
+        requireMountReader(call.hoglakeAuth.callerOrNull, catalog)
+        return CatalogBinding.Mount(record)
     }
 
     /** A hoglite listing must carry the token's single catalog as an explicit filter. */
@@ -152,8 +182,9 @@ class CatalogStoreSelector(
     fun reachable(): Boolean = cfg?.hogliteBackends?.keys?.all { client(it).reachable() } ?: true
 
     private fun fallback(catalog: String): CatalogStore =
-        postgres?.takeIf { cfg == null || cfg.defaultBackend == "postgres" }
-            ?: throw HoglakeException.NotFound("catalog '$catalog'")
+        defaultPostgres() ?: throw HoglakeException.NotFound("catalog '$catalog'")
+
+    private fun defaultPostgres(): CatalogStore? = postgres?.takeIf { cfg == null || cfg.defaultBackend == "postgres" }
 
     private fun routed(
         call: ApplicationCall,

@@ -48,6 +48,7 @@ import com.posthog.hoglake.service.UploadService
 import com.posthog.hoglake.service.ViewService
 import com.posthog.hoglake.store.CatalogStore
 import com.posthog.hoglake.store.CatalogStoreSelector
+import com.posthog.hoglake.store.MountRegistry
 import com.posthog.hoglake.store.PostgresCatalogStore
 import com.zaxxer.hikari.HikariDataSource
 import io.ktor.http.ContentType
@@ -85,6 +86,8 @@ class App private constructor(
      * second connection until something asks.
      */
     val healthProbe: HealthProbe,
+    /** Mount records; none until the mount table exists. Tests inject them. */
+    private val mountRegistry: MountRegistry = MountRegistry.NONE,
 ) : AutoCloseable {
     /** Access from a PostgreSQL request only; probes must use [postgresReady]. */
     val jdbi: Jdbi get() = jdbiProvider()
@@ -132,7 +135,11 @@ class App private constructor(
     }
 
     private val catalogSelector by lazy {
-        CatalogStoreSelector(catalogStore, cfg)
+        CatalogStoreSelector(
+            catalogStore,
+            cfg,
+            MountRegistry.behindSwitch(MountRegistry.postgresSwitch { jdbi }, mountRegistry),
+        )
     }
 
     private val partitionLookupService by lazy {
@@ -408,8 +415,9 @@ class App private constructor(
             jdbi: Jdbi,
             dataSource: HikariDataSource? = null,
             healthProbe: HealthProbe = HealthProbe.fromConfig(cfg),
+            mountRegistry: MountRegistry = MountRegistry.NONE,
         ): App =
-            App(cfg, { jdbi }, { true }, healthProbe = healthProbe).also {
+            App(cfg, { jdbi }, { true }, mountRegistry = mountRegistry, healthProbe = healthProbe).also {
                 it.bindMetrics(dataSource)
             }
     }
