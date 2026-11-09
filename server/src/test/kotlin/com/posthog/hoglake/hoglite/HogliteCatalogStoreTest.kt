@@ -615,14 +615,20 @@ class HogliteCatalogStoreTest {
     }
 
     @Test
-    fun `an engine query guard refusal during the scan is containment_unverified`() {
+    fun `deterministic engine limits during containment scans stay nonretryable and do not mark the namespace`() {
         seedNamespaces()
-        scanAnswer = 504 to mapOf("error" to "query timed out", "code" to "query_timeout")
-
-        assertThat(catchThrowable { store.setNamespaceContainment("wh", "team_42", team42, null) })
-            .isInstanceOf(HoglakeException.ContainmentUnverified::class.java)
-            .hasMessageContaining("s3://bucket/wh/data/team_42/")
-        assertThat(writes()).isEmpty()
+        val limits =
+            listOf(
+                Triple(504, "query_timeout", HoglakeException.BackendQueryTimeout::class.java),
+                Triple(413, "result_too_large", HoglakeException.BackendResultTooLarge::class.java),
+                Triple(507, "out_of_memory", HoglakeException.Validation::class.java),
+            )
+        for ((status, code, type) in limits) {
+            scanAnswer = status to mapOf("error" to "engine refused the scan", "code" to code)
+            assertThat(catchThrowable { store.setNamespaceContainment("wh", "team_42", team42, null) })
+                .isExactlyInstanceOf(type)
+            assertThat(writes()).isEmpty()
+        }
     }
 
     @Test

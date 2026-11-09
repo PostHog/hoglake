@@ -79,6 +79,9 @@ internal object HogliteSchema {
             "CREATE INDEX IF NOT EXISTS dvs_ended ON dvs(end_snapshot) WHERE end_snapshot IS NOT NULL",
             // Both ordering keys matter: compaction can reuse row_id_start.
             "CREATE INDEX IF NOT EXISTS files_scan ON files(table_id, row_id_start, id)",
+            // First-release ordering indexes avoid a later tenant migration.
+            "CREATE INDEX IF NOT EXISTS files_listing ON files(table_id, begin_snapshot, row_id_start, id)",
+            "CREATE INDEX IF NOT EXISTS dvs_changes ON dvs(table_id, begin_snapshot, delete_file_id)",
         )
 
     /** At most one live deletion vector per data file. */

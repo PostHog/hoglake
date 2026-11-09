@@ -65,7 +65,7 @@ class TableCreationService(
     private val catalogs: CatalogService,
     private val commits: CommitService,
     private val lockTimeoutMs: Long = CommitService.DEFAULT_COMMIT_LOCK_TIMEOUT_MS,
-) {
+) : TableCreationBackend {
     private val log = io.github.oshai.kotlinlogging.KotlinLogging.logger {}
 
     private val mapper =
@@ -73,7 +73,7 @@ class TableCreationService(
             SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS,
         )
 
-    fun prepare(
+    override fun prepare(
         catalog: String,
         operationId: UUID,
         definition: TableCreationDefinition,
@@ -165,7 +165,7 @@ class TableCreationService(
             dataPath.trimEnd('/') + "/data/$uuid/"
         }
 
-    fun status(
+    override fun status(
         catalog: String,
         operationId: UUID,
     ): TableCreation =
@@ -174,7 +174,7 @@ class TableCreationService(
             load(h, cat.catalogId, operationId)
         }
 
-    fun abort(
+    override fun abort(
         catalog: String,
         operationId: UUID,
     ): TableCreation {
@@ -192,7 +192,7 @@ class TableCreationService(
         }
     }
 
-    fun publish(
+    override fun publish(
         catalog: String,
         operationId: UUID,
         files: List<FileRegistration>,

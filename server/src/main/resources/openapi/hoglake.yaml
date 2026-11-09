@@ -23,6 +23,18 @@ info:
     nested so that `admin` implies all of them and `maintenance`
     implies `write`.
 
+    Optional `rtg` selects a configured backend for the single `cat` catalog.
+    Hoglite uses exactly `b`, `be`, and `t`; PostgreSQL uses `b` and `be`.
+    Backend ids are canonical lowercase UUIDs. Unknown ids or kind mismatches
+    return 401 `unknown_backend`. Claims carry no endpoints or secrets.
+    Invalid shapes, unknown routing keys, and multiple catalogs return 401
+    `invalid_token`. Hoglite listings include only the routed catalog.
+
+    Hoglite maintenance and publications return 501 `not_supported_on_backend`.
+    Engine result limits return 422 `backend_result_too_large`; query deadlines
+    return 422 `backend_query_timeout`. Narrow the query before retrying.
+    These deterministic refusals do not carry Retry-After.
+
     Two refusals are worth distinguishing, because they mean different
     things to a client:
 
@@ -85,7 +97,7 @@ paths:
         Readiness — the catalog database must answer (SELECT 1 on the
         probe's own dedicated connection, not through the request pool,
         bounded by HOGLAKE_HEALTH_PROBE_TIMEOUT_MS). A busy request
-        pool reads 200; only a database that does not answer reads 503.
+        pool reads 200. Every configured hoglite backend must also answer.
         Use as the Kubernetes readiness probe.
       responses:
         "200":
@@ -108,6 +120,9 @@ paths:
     get:
       operationId: listCatalogs
       summary: List catalogs
+      description: >
+        Sampler totals describe PostgreSQL catalogs only. Hoglite-routed catalogs
+        omit table_count, live_rows, live_size_bytes, and oldest_snapshot_time.
       responses:
         "200":
           description: Catalogs
@@ -116,6 +131,9 @@ paths:
               schema:
                 type: array
                 items: { $ref: "#/components/schemas/Catalog" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+        "422": { $ref: "#/components/responses/BackendQueryRefused" }
+
     post:
       operationId: createCatalog
       summary: Create a catalog
@@ -136,6 +154,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /catalogs/{catalog}:
     get:
@@ -149,6 +168,9 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Catalog" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+        "422": { $ref: "#/components/responses/BackendQueryRefused" }
+
     delete:
       operationId: dropCatalog
       summary: Drop an empty catalog (metadata only; the data path is not touched)
@@ -205,6 +227,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
         "422": { $ref: "#/components/responses/Validation" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /catalogs/{catalog}/storage-usage:
     get:
@@ -251,6 +274,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "422": { $ref: "#/components/responses/BackendQueryRefused" }
 
   /catalogs/{catalog}/namespaces:
     get:
@@ -275,6 +299,8 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
         "410": { $ref: "#/components/responses/Gone" }
         "422": { $ref: "#/components/responses/Validation" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+
     post:
       operationId: createNamespace
       parameters: [ { $ref: "#/components/parameters/catalog" } ]
@@ -303,6 +329,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /catalogs/{catalog}/namespaces/{namespace}:
     get:
@@ -317,6 +344,9 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Namespace" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+        "422": { $ref: "#/components/responses/BackendQueryRefused" }
+
     delete:
       operationId: dropNamespace
       summary: Drop a namespace (DDL commit; produces a snapshot)
@@ -343,6 +373,7 @@ paths:
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/Conflict" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /catalogs/{catalog}/namespaces/{namespace}/containment:
     put:
@@ -399,6 +430,8 @@ paths:
               schema: { $ref: "#/components/schemas/Namespace" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/Conflict" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+        "422": { $ref: "#/components/responses/BackendQueryRefused" }
 
   /catalogs/{catalog}/namespaces/{namespace}/tables:
     get:
@@ -440,6 +473,8 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
         "410": { $ref: "#/components/responses/Gone" }
         "422": { $ref: "#/components/responses/Validation" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+
     post:
       operationId: createTable
       summary: Create a table (DDL commit; produces a snapshot)
@@ -464,6 +499,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /catalogs/{catalog}/namespaces/{namespace}/tables/{table}:
     get:
@@ -511,6 +547,9 @@ paths:
               schema: { $ref: "#/components/schemas/ApiError" }
         "404": { $ref: "#/components/responses/NotFound" }
         "410": { $ref: "#/components/responses/Gone" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+        "422": { $ref: "#/components/responses/BackendQueryRefused" }
+
     delete:
       operationId: dropTable
       summary: Drop a table (DDL commit; produces a snapshot)
@@ -546,6 +585,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/truncate:
     post:
@@ -598,6 +638,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/alter:
     post:
@@ -688,6 +729,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/scan:
     get:
@@ -813,6 +855,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/files:
     get:
@@ -887,6 +930,7 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
         "410": { $ref: "#/components/responses/Gone" }
         "422": { $ref: "#/components/responses/Validation" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/partitions:
     get:
@@ -975,6 +1019,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/partitions/lookup:
     post:
@@ -1108,6 +1153,8 @@ paths:
               schema: { $ref: "#/components/schemas/PartitionValues" }
         "404": { $ref: "#/components/responses/NotFound" }
         "410": { $ref: "#/components/responses/Gone" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+        "422": { $ref: "#/components/responses/BackendQueryRefused" }
 
   /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/files/{fileId}/stats:
     get:
@@ -1149,6 +1196,8 @@ paths:
               schema: { $ref: "#/components/schemas/FileStats" }
         "404": { $ref: "#/components/responses/NotFound" }
         "410": { $ref: "#/components/responses/Gone" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+        "422": { $ref: "#/components/responses/BackendQueryRefused" }
 
   /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/changes:
     get:
@@ -1195,6 +1244,8 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+        "422": { $ref: "#/components/responses/BackendQueryRefused" }
 
   /catalogs/{catalog}/options:
     get:
@@ -1207,6 +1258,8 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/CatalogOptions" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "501": { $ref: "#/components/responses/NotSupportedOnBackend" }
+
     patch:
       operationId: patchCatalogOptions
       summary: >
@@ -1244,6 +1297,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "501": { $ref: "#/components/responses/NotSupportedOnBackend" }
 
   /catalogs/{catalog}/maintenance/expire:
     post:
@@ -1262,6 +1316,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ExpiryResult" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "501": { $ref: "#/components/responses/NotSupportedOnBackend" }
 
   /catalogs/{catalog}/maintenance/compact:
     post:
@@ -1299,6 +1354,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/CompactionResult" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "501": { $ref: "#/components/responses/NotSupportedOnBackend" }
 
   /catalogs/{catalog}/maintenance/rehydrate:
     post:
@@ -1336,6 +1392,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "501": { $ref: "#/components/responses/NotSupportedOnBackend" }
 
   /catalogs/{catalog}/maintenance/cleanup:
     post:
@@ -1367,6 +1424,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/CleanupResult" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "501": { $ref: "#/components/responses/NotSupportedOnBackend" }
 
   /database/health:
     get:
@@ -1497,6 +1555,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/MaintenanceStatus" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "501": { $ref: "#/components/responses/NotSupportedOnBackend" }
 
   /catalogs/{catalog}/maintenance/runs:
     get:
@@ -1541,6 +1600,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "501": { $ref: "#/components/responses/NotSupportedOnBackend" }
 
   /catalogs/{catalog}/stats/partitions:
     get:
@@ -1601,6 +1661,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /catalogs/{catalog}/namespaces/{namespace}/views:
     get:
@@ -1616,6 +1677,9 @@ paths:
               schema:
                 type: array
                 items: { $ref: "#/components/schemas/View" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+        "422": { $ref: "#/components/responses/BackendQueryRefused" }
+
     post:
       operationId: createView
       summary: Create a view (DDL commit; view SQL is stored verbatim with its dialect)
@@ -1644,6 +1708,8 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/View" }
         "409": { $ref: "#/components/responses/Conflict" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+        "422": { $ref: "#/components/responses/BackendQueryRefused" }
 
   /catalogs/{catalog}/namespaces/{namespace}/views/{view}:
     get:
@@ -1662,6 +1728,9 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/View" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+        "422": { $ref: "#/components/responses/BackendQueryRefused" }
+
     delete:
       operationId: dropView
       parameters:
@@ -1681,6 +1750,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/CommitResult" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /catalogs/{catalog}/snapshots/resolve:
     get:
@@ -1713,6 +1783,8 @@ paths:
               schema: { $ref: "#/components/schemas/ApiError" }
         "404": { $ref: "#/components/responses/NotFound" }
         "410": { $ref: "#/components/responses/Gone" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+        "422": { $ref: "#/components/responses/BackendQueryRefused" }
 
   /catalogs/{catalog}/snapshots:
     get:
@@ -1747,6 +1819,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /catalogs/{catalog}/table-creations/{operation}:
     put:
@@ -2197,6 +2270,8 @@ paths:
         "400":
           description: Invalid operation UUID
         "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+        "422": { $ref: "#/components/responses/BackendQueryRefused" }
 
   /catalogs/{catalog}/commit/prepared:
     post:
@@ -2335,6 +2410,7 @@ paths:
                   expires_at: { type: string, format: date-time }
         "409": { description: Upload identity reused with different intent }
         "422": { description: Invalid prefix or file kind }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /catalogs/{catalog}/uploads/renew:
     post:
@@ -2360,6 +2436,8 @@ paths:
           content:
             application/json:
               schema: { type: object, properties: { renewed: { type: integer } } }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+        "422": { $ref: "#/components/responses/BackendQueryRefused" }
 
   /catalogs/{catalog}/uploads/abandon:
     post:
@@ -2383,6 +2461,8 @@ paths:
           content:
             application/json:
               schema: { type: object, properties: { abandoned: { type: integer } } }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+        "422": { $ref: "#/components/responses/BackendQueryRefused" }
 
   /catalogs/{catalog}/uploads/schedule-expired:
     post:
@@ -2416,6 +2496,7 @@ paths:
             application/json:
               schema: { type: object, properties: { scheduled: { type: integer } } }
         "422": { description: Limit outside allowed range }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /catalogs/{catalog}/commit/uploads:
     post:
@@ -2983,7 +3064,7 @@ paths:
               schema:
                 type: array
                 items: { $ref: "#/components/schemas/Publication" }
-        "501": { $ref: "#/components/responses/NotImplemented" }
+        "501": { $ref: "#/components/responses/NotSupportedOnBackend" }
     post:
       operationId: createPublication
       parameters: [ { $ref: "#/components/parameters/catalog" } ]
@@ -2998,7 +3079,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Publication" }
-        "501": { $ref: "#/components/responses/NotImplemented" }
+        "501": { $ref: "#/components/responses/NotSupportedOnBackend" }
 
   /catalogs/{catalog}/publications/{publication}:
     get:
@@ -3015,7 +3096,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Publication" }
-        "501": { $ref: "#/components/responses/NotImplemented" }
+        "501": { $ref: "#/components/responses/NotSupportedOnBackend" }
     delete:
       operationId: dropPublication
       parameters:
@@ -3026,7 +3107,7 @@ paths:
           schema: { type: string }
       responses:
         "204": { description: Removed (its consumer offset is released) }
-        "501": { $ref: "#/components/responses/NotImplemented" }
+        "501": { $ref: "#/components/responses/NotSupportedOnBackend" }
 
   # ---- DR / export (SPECIFIED, NOT YET IMPLEMENTED: returns 501) ----
   # The consistent-export half of the DR story (README "PITR + consistent
@@ -3051,7 +3132,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ExportManifest" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "501": { $ref: "#/components/responses/NotImplemented" }
+        "501": { $ref: "#/components/responses/NotSupportedOnBackend" }
 
   /debug/decode-bound:
     post:
@@ -3210,6 +3291,8 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ConsumerList" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+        "422": { $ref: "#/components/responses/BackendQueryRefused" }
 
   /catalogs/{catalog}/consumers/{consumer}/offsets:
     get:
@@ -3226,6 +3309,8 @@ paths:
                 type: array
                 items: { $ref: "#/components/schemas/ConsumerOffset" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+        "422": { $ref: "#/components/responses/BackendQueryRefused" }
 
   /catalogs/{catalog}/consumers/{consumer}/offsets/{tableUuid}:
     get:
@@ -3245,6 +3330,9 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ConsumerOffset" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+        "422": { $ref: "#/components/responses/BackendQueryRefused" }
+
     put:
       operationId: commitConsumerOffset
       summary: >
@@ -3285,6 +3373,8 @@ paths:
               schema: { $ref: "#/components/schemas/ConsumerOffset" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/Conflict" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
+        "422": { $ref: "#/components/responses/BackendQueryRefused" }
 
 components:
   securitySchemes:
@@ -3374,7 +3464,7 @@ components:
         No credential, or one that does not verify. `error` is a closed
         vocabulary (`invalid_request`, `invalid_token`, `token_expired`,
         `not_yet_valid`, `invalid_signature`, `unknown_signing_key`,
-        `invalid_audience`, `invalid_issuer`, `unsupported_algorithm`),
+        `invalid_audience`, `invalid_issuer`, `unsupported_algorithm`, `unknown_backend`),
         and the same value appears in the `WWW-Authenticate` challenge.
       headers:
         WWW-Authenticate:
@@ -3388,6 +3478,29 @@ components:
         The credential verifies and the catalog is the caller's own, but it
         does not hold the scope this route requires. A catalog the caller is
         NOT entitled to is 404, never 403 — a 403 would confirm it exists.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
+    NotSupportedOnBackend:
+      description: >
+        This backend does not support the operation (501 not_supported_on_backend).
+        Publications and export may instead return not_implemented on PostgreSQL.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
+    Validation:
+      description: >
+        Semantic validation failed (422 validation). Engine result limits may
+        return backend_result_too_large, and query deadlines may return
+        backend_query_timeout. These deterministic refusals have no Retry-After.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
+    BackendQueryRefused:
+      description: >
+        The engine refused the query. backend_result_too_large requires a smaller
+        result; backend_query_timeout requires a narrower query. Both return 422
+        without Retry-After. Deterministic SQL and request failures return validation.
       content:
         application/json:
           schema: { $ref: "#/components/schemas/ApiError" }
@@ -3425,7 +3538,9 @@ components:
         did not answer, and nothing was applied that the server knows of.
         `commit_outcome_unknown`: a commit that the backend may or may not
         have applied. A retry with the same `idempotency_key` is
-        exactly-once. A retry without a key can apply the commit a second
+        exactly-once. PostgreSQL admission failures may return commit_queue_timeout;
+        containment verification may return containment_unverified. Both are retryable.
+        A retry without a key can apply the commit a second
         time, as after a lost COMMIT acknowledgement on PostgreSQL.
       headers:
         Retry-After:
@@ -3436,6 +3551,32 @@ components:
           schema: { $ref: "#/components/schemas/ApiError" }
 
   schemas:
+    RoutingClaim:
+      description: Verified single-catalog placement in the signed rtg claim. Not a request-body parameter.
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [b, be, t]
+          properties:
+            b: { type: string, enum: [hoglite] }
+            be:
+              type: string
+              format: uuid
+              pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+            t:
+              type: string
+              minLength: 1
+              maxLength: 128
+              pattern: '^(?!\.)(?!.*\.\.)[A-Za-z0-9._-]+$'
+        - type: object
+          additionalProperties: false
+          required: [b, be]
+          properties:
+            b: { type: string, enum: [postgres] }
+            be:
+              type: string
+              format: uuid
+              pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
     OperationAuthor:
       type: [string, "null"]
       description: Caller-supplied author recorded on the snapshot and audit actor; not an authenticated identity.

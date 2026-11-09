@@ -15,8 +15,8 @@ import io.ktor.util.AttributeKey
  * data_path, null when the catalog is missing.
  */
 internal class ScopedLookups(
-    val containment: (catalog: String, namespace: String) -> NamespaceContainment?,
-    val dataPath: (catalog: String) -> String?,
+    val containment: (call: ApplicationCall, catalog: String, namespace: String) -> NamespaceContainment?,
+    val dataPath: (call: ApplicationCall, catalog: String) -> String?,
 )
 
 /** Present on the application once [installNamespaceGate] ran with its lookups. */
@@ -64,7 +64,7 @@ internal fun ApplicationCall.requireScopedNamespaces(
         throw refusal
     }
     for (namespace in namespaces.distinct()) {
-        val held = lookups.containment(catalog, namespace)
+        val held = lookups.containment(this, catalog, namespace)
         if (held == null || !caller.mayUseContained(catalog, held.field, held.value, pending.required)) {
             val refusal = HoglakeException.NotFound("namespace '$namespace' in catalog '$catalog'")
             countRefusal(service, clientClass(this), caller, match, refusal, enforced = true)
@@ -88,7 +88,7 @@ internal fun ApplicationCall.requireScopedUploadPrefix(
     val caller = hoglakeAuth.callerOrNull
     if (caller == null || caller.kind != Caller.Kind.SCOPED) return
     val dataPath =
-        application.attributes.getOrNull(ScopedLookupsKey)?.dataPath?.invoke(catalog)
+        application.attributes.getOrNull(ScopedLookupsKey)?.dataPath?.invoke(this, catalog)
             ?: throw HoglakeException.NotFound("catalog '$catalog'")
     // The claim's path is `<prefix>/trino-upload/<uuid>.<ext>`: its namespace
     // segment is the prefix's second, or the path's when the prefix is `data`.

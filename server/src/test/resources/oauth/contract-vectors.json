@@ -35,7 +35,7 @@
       },
       "audience": "hoglake",
       "jti": "00000000-0000-4000-8000-000000000001",
-      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6IjAzNGYxMDIzNmE4YWNkMDgifQ.eyJpc3MiOiJodHRwczovL2hvZ3Rvd2VyLmNvbnRyYWN0LnRlc3QiLCJhdWQiOiJob2dsYWtlIiwic3ViIjoiaGxjXzAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2NyIsImp0aSI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMSIsInRlbiI6InRlbmFudCIsIm9yZyI6IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiIsImNhdCI6eyIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wYzFkMmUzZjRhNWIiOlsicmVhZCJdfSwiY2xpIjoicHlob2dsYWtlLXJlYWRlciIsImV4cCI6MTc2NzIyNjUwMCwiaWF0IjoxNzY3MjI1NjAwLCJuYmYiOjE3NjcyMjU2MDB9.32W_w4nCdV3CSOy77sRL51pkHuZe2MsSSzAM1EQWb2B2uLUXrdbFQv99HmJew60oorecxuBXNyG2M98aKZAN5w",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6IjAzNGYxMDIzNmE4YWNkMDgifQ.eyJpc3MiOiJodHRwczovL2hvZ3Rvd2VyLmNvbnRyYWN0LnRlc3QiLCJhdWQiOiJob2dsYWtlIiwic3ViIjoiaGxjXzAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2NyIsImp0aSI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMSIsInRlbiI6InRlbmFudCIsIm9yZyI6IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiIsImNhdCI6eyIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wYzFkMmUzZjRhNWIiOlsicmVhZCJdfSwiY2xpIjoicHlob2dsYWtlLXJlYWRlciIsImV4cCI6MTc2NzIyNjUwMCwiaWF0IjoxNzY3MjI1NjAwLCJuYmYiOjE3NjcyMjU2MDB9.pW51I4-k035kq3Rlfc5WiASCzJUnwBjaQU9lkiTh3AFKJJHiB2MFj3iQQhP4DDHS62jtVNZHw1-D5AVdH-J0yA",
       "header": {
         "alg": "ES256",
         "kid": "034f10236a8acd08",
@@ -71,7 +71,7 @@
       },
       "audience": "hoglake",
       "jti": "00000000-0000-4000-8000-000000000002",
-      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6IjAzNGYxMDIzNmE4YWNkMDgifQ.eyJpc3MiOiJodHRwczovL2hvZ3Rvd2VyLmNvbnRyYWN0LnRlc3QiLCJhdWQiOiJob2dsYWtlIiwic3ViIjoiaGxjXzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZiIsImp0aSI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMiIsInRlbiI6InRlbmFudCIsIm9yZyI6IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiIsImNhdCI6eyIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wYzFkMmUzZjRhNWIiOlsid3JpdGUiXX0sImNsaSI6InRyaW5vLXBvb2wiLCJkbGciOnRydWUsImV4cCI6MTc2NzIyNjUwMCwiaWF0IjoxNzY3MjI1NjAwLCJuYmYiOjE3NjcyMjU2MDB9.IRi2c_ZFwhhAvVilmI2_KkBPfCL88EjqIFk8pTjdOOSZpNCqzy5Mdpa-dARZrJneDwS7H2V_QcroT72Of8Xnkw",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6IjAzNGYxMDIzNmE4YWNkMDgifQ.eyJpc3MiOiJodHRwczovL2hvZ3Rvd2VyLmNvbnRyYWN0LnRlc3QiLCJhdWQiOiJob2dsYWtlIiwic3ViIjoiaGxjXzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZiIsImp0aSI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMiIsInRlbiI6InRlbmFudCIsIm9yZyI6IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiIsImNhdCI6eyIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wYzFkMmUzZjRhNWIiOlsid3JpdGUiXX0sImNsaSI6InRyaW5vLXBvb2wiLCJkbGciOnRydWUsImV4cCI6MTc2NzIyNjUwMCwiaWF0IjoxNzY3MjI1NjAwLCJuYmYiOjE3NjcyMjU2MDB9.DIip7pzm3ofXuhweUt9rQiUpBrsCGgq27aXfnbXXCK9LPDl3CPJypxTxtcuemh3jcDqzu25FDHW5triijuX9KA",
       "header": {
         "alg": "ES256",
         "kid": "034f10236a8acd08",
@@ -108,7 +108,7 @@
       },
       "audience": "hogtower-vend",
       "jti": "00000000-0000-4000-8000-000000000003",
-      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6IjAzNGYxMDIzNmE4YWNkMDgifQ.eyJpc3MiOiJodHRwczovL2hvZ3Rvd2VyLmNvbnRyYWN0LnRlc3QiLCJhdWQiOiJob2d0b3dlci12ZW5kIiwic3ViIjoiaGxjX2ZlZGNiYTk4NzY1NDMyMTBmZWRjYmE5OCIsImp0aSI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMyIsInRlbiI6InRlbmFudCIsIm9yZyI6IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiIsImNhdCI6eyIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wYzFkMmUzZjRhNWIiOlsid3JpdGUiXX0sImNsaSI6ImR1Y2tkYi1jbGllbnQiLCJleHAiOjE3NjcyMjY1MDAsImlhdCI6MTc2NzIyNTYwMCwibmJmIjoxNzY3MjI1NjAwfQ.G2uQfcBodpCy8LumNp7POwILPhoZiINd6bHPVqtmgwKQ4nOBhFWEJOj32FfaB715Y-Mdt_WNLzKiRLeKChiUvw",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6IjAzNGYxMDIzNmE4YWNkMDgifQ.eyJpc3MiOiJodHRwczovL2hvZ3Rvd2VyLmNvbnRyYWN0LnRlc3QiLCJhdWQiOiJob2d0b3dlci12ZW5kIiwic3ViIjoiaGxjX2ZlZGNiYTk4NzY1NDMyMTBmZWRjYmE5OCIsImp0aSI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMyIsInRlbiI6InRlbmFudCIsIm9yZyI6IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiIsImNhdCI6eyIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wYzFkMmUzZjRhNWIiOlsid3JpdGUiXX0sImNsaSI6ImR1Y2tkYi1jbGllbnQiLCJleHAiOjE3NjcyMjY1MDAsImlhdCI6MTc2NzIyNTYwMCwibmJmIjoxNzY3MjI1NjAwfQ.AtivlLvtXPkv7AcojzBzUUNhxvvWVAbKXJPHn1l6WyOr7IAIz_x4j3jU71h7tZQ4MYuDIJVl0y2ELl5zWp0p6A",
       "header": {
         "alg": "ES256",
         "kid": "034f10236a8acd08",
@@ -141,7 +141,7 @@
       },
       "audience": "hoglake",
       "jti": "00000000-0000-4000-8000-000000000004",
-      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6IjAzNGYxMDIzNmE4YWNkMDgifQ.eyJpc3MiOiJodHRwczovL2hvZ3Rvd2VyLmNvbnRyYWN0LnRlc3QiLCJhdWQiOiJob2dsYWtlIiwic3ViIjoiaG9ndG93ZXI6cHJvdmlzaW9uZXIiLCJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDQiLCJ0ZW4iOiJvcGVyYXRvciIsImNsaSI6ImhvZ3Rvd2VyIiwiZXhwIjoxNzY3MjI1OTAwLCJpYXQiOjE3NjcyMjU2MDAsIm5iZiI6MTc2NzIyNTYwMH0.PSzswYQjV7c14Jx8PDbZjybHSA-0ptL4P6_2PIRyMytOc7oaZTyquL0Pp9--XskgofLu5PhJbJEhvp6Y1YiUBQ",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6IjAzNGYxMDIzNmE4YWNkMDgifQ.eyJpc3MiOiJodHRwczovL2hvZ3Rvd2VyLmNvbnRyYWN0LnRlc3QiLCJhdWQiOiJob2dsYWtlIiwic3ViIjoiaG9ndG93ZXI6cHJvdmlzaW9uZXIiLCJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDQiLCJ0ZW4iOiJvcGVyYXRvciIsImNsaSI6ImhvZ3Rvd2VyIiwiZXhwIjoxNzY3MjI1OTAwLCJpYXQiOjE3NjcyMjU2MDAsIm5iZiI6MTc2NzIyNTYwMH0.sse5DeCUvAHyiSgfdng5beC0uq7gZohUZ37c5i438s2ghSW9IV_SgOdg5rzMss-VGeWdj5jg-1EYh-vThPh12g",
       "header": {
         "alg": "ES256",
         "kid": "034f10236a8acd08",
@@ -176,7 +176,7 @@
       },
       "audience": "hoglake",
       "jti": "00000000-0000-4000-8000-000000000005",
-      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6IjAzNGYxMDIzNmE4YWNkMDgifQ.eyJpc3MiOiJodHRwczovL2hvZ3Rvd2VyLmNvbnRyYWN0LnRlc3QiLCJhdWQiOiJob2dsYWtlIiwic3ViIjoiaGxjXzAwMTEyMjMzNDQ1NTY2Nzc4ODk5YWFiYiIsImp0aSI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwNSIsInRlbiI6InNjb3BlZCIsIm9yZyI6IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiIsImNhdCI6eyIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wYzFkMmUzZjRhNWIiOlsid3JpdGUiXX0sInByZCI6eyJ0ZWFtX2lkIjp7IjQyIjoid3JpdGUiLCI3IjoicmVhZCJ9fSwiY2xpIjoibGFwdG9wIiwidXNyIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMDAwMDAwMDAwMDQyIiwiZXhwIjoxNzY3MjI2NTAwLCJpYXQiOjE3NjcyMjU2MDAsIm5iZiI6MTc2NzIyNTYwMH0.KyX-GYqrHG5HiU5kfLQ9JMNBMNemE0AfY_fypISiD1B0DgECotyKrUxNnbXSRHDIGbL3wlEnhw6p8SaHK0sGIg",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6IjAzNGYxMDIzNmE4YWNkMDgifQ.eyJpc3MiOiJodHRwczovL2hvZ3Rvd2VyLmNvbnRyYWN0LnRlc3QiLCJhdWQiOiJob2dsYWtlIiwic3ViIjoiaGxjXzAwMTEyMjMzNDQ1NTY2Nzc4ODk5YWFiYiIsImp0aSI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwNSIsInRlbiI6InNjb3BlZCIsIm9yZyI6IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiIsImNhdCI6eyIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wYzFkMmUzZjRhNWIiOlsid3JpdGUiXX0sInByZCI6eyJ0ZWFtX2lkIjp7IjQyIjoid3JpdGUiLCI3IjoicmVhZCJ9fSwiY2xpIjoibGFwdG9wIiwidXNyIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMDAwMDAwMDAwMDQyIiwiZXhwIjoxNzY3MjI2NTAwLCJpYXQiOjE3NjcyMjU2MDAsIm5iZiI6MTc2NzIyNTYwMH0.nFEVoGv9l6oKrAvZFVID2nSEeH-CZISwBipr76ZeKDDOiQbKpcFMriJjaka_cjKFwgXy3y5Du49Y5kDdNcWmXg",
       "header": {
         "alg": "ES256",
         "kid": "034f10236a8acd08",
@@ -205,6 +205,158 @@
         "sub": "hlc_00112233445566778899aabb",
         "ten": "scoped",
         "usr": "0190a1b2-c3d4-7e5f-8a9b-000000000042"
+      }
+    },
+    {
+      "name": "tenant_routed",
+      "description": "An org credential with recorded Hoglite placement; t includes the catalog incarnation.",
+      "client": {
+        "credential_id": "hlc_0123456789abcdef01234567",
+        "name": "pyhoglake-reader",
+        "org": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+        "scope": "read",
+        "delegates": false,
+        "placement": {
+          "backend_type": "hoglite",
+          "backend_id": "7c9e2a14-3f51-4b8d-9e60-2d5a1f8c44aa",
+          "tenant_id": "t_3fa8c1d9e2",
+          "incarnation": 1
+        }
+      },
+      "audience": "hoglake",
+      "jti": "00000000-0000-4000-8000-000000000006",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6IjAzNGYxMDIzNmE4YWNkMDgifQ.eyJpc3MiOiJodHRwczovL2hvZ3Rvd2VyLmNvbnRyYWN0LnRlc3QiLCJhdWQiOiJob2dsYWtlIiwic3ViIjoiaGxjXzAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2NyIsImp0aSI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwNiIsInRlbiI6InRlbmFudCIsIm9yZyI6IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiIsImNhdCI6eyIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wYzFkMmUzZjRhNWIiOlsicmVhZCJdfSwiY2xpIjoicHlob2dsYWtlLXJlYWRlciIsInJ0ZyI6eyJiIjoiaG9nbGl0ZSIsImJlIjoiN2M5ZTJhMTQtM2Y1MS00YjhkLTllNjAtMmQ1YTFmOGM0NGFhIiwidCI6InRfM2ZhOGMxZDllMl8xIn0sImV4cCI6MTc2NzIyNjUwMCwiaWF0IjoxNzY3MjI1NjAwLCJuYmYiOjE3NjcyMjU2MDB9.P2aWxarD21t8pfPh1y6u_pxfI9SvcAIgdb5YQyvGRBUMWh9GZxVm-RZY9RvEwH5yeXxZkLeQU0_--pkK96g1eg",
+      "header": {
+        "alg": "ES256",
+        "kid": "034f10236a8acd08",
+        "typ": "JWT"
+      },
+      "claims": {
+        "aud": "hoglake",
+        "cat": {
+          "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b": [
+            "read"
+          ]
+        },
+        "cli": "pyhoglake-reader",
+        "exp": 1767226500,
+        "iat": 1767225600,
+        "iss": "https://hogtower.contract.test",
+        "jti": "00000000-0000-4000-8000-000000000006",
+        "nbf": 1767225600,
+        "org": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+        "rtg": {
+          "b": "hoglite",
+          "be": "7c9e2a14-3f51-4b8d-9e60-2d5a1f8c44aa",
+          "t": "t_3fa8c1d9e2_1"
+        },
+        "sub": "hlc_0123456789abcdef01234567",
+        "ten": "tenant"
+      }
+    },
+    {
+      "name": "scoped_routed",
+      "description": "A scoped credential carries routing without changing its team predicates or enabling delegation.",
+      "client": {
+        "credential_id": "hlc_00112233445566778899aabb",
+        "name": "laptop",
+        "org": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+        "scope": "write",
+        "delegates": false,
+        "owner_user_uuid": "0190a1b2-c3d4-7e5f-8a9b-000000000042",
+        "teams": {
+          "42": "write",
+          "7": "read"
+        },
+        "placement": {
+          "backend_type": "hoglite",
+          "backend_id": "7c9e2a14-3f51-4b8d-9e60-2d5a1f8c44aa",
+          "tenant_id": "t_3fa8c1d9e2",
+          "incarnation": 1
+        }
+      },
+      "audience": "hoglake",
+      "jti": "00000000-0000-4000-8000-000000000007",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6IjAzNGYxMDIzNmE4YWNkMDgifQ.eyJpc3MiOiJodHRwczovL2hvZ3Rvd2VyLmNvbnRyYWN0LnRlc3QiLCJhdWQiOiJob2dsYWtlIiwic3ViIjoiaGxjXzAwMTEyMjMzNDQ1NTY2Nzc4ODk5YWFiYiIsImp0aSI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwNyIsInRlbiI6InNjb3BlZCIsIm9yZyI6IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiIsImNhdCI6eyIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wYzFkMmUzZjRhNWIiOlsid3JpdGUiXX0sInByZCI6eyJ0ZWFtX2lkIjp7IjQyIjoid3JpdGUiLCI3IjoicmVhZCJ9fSwiY2xpIjoibGFwdG9wIiwidXNyIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMDAwMDAwMDAwMDQyIiwicnRnIjp7ImIiOiJob2dsaXRlIiwiYmUiOiI3YzllMmExNC0zZjUxLTRiOGQtOWU2MC0yZDVhMWY4YzQ0YWEiLCJ0IjoidF8zZmE4YzFkOWUyXzEifSwiZXhwIjoxNzY3MjI2NTAwLCJpYXQiOjE3NjcyMjU2MDAsIm5iZiI6MTc2NzIyNTYwMH0.zajCgKe3TSwklfh8NkFomTnUOx1F6wOLorHP_d9-XfPlYFjK3FFjqCBYjpj8eJUarRsbJpSnQ9wjdzfC374R_Q",
+      "header": {
+        "alg": "ES256",
+        "kid": "034f10236a8acd08",
+        "typ": "JWT"
+      },
+      "claims": {
+        "aud": "hoglake",
+        "cat": {
+          "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b": [
+            "write"
+          ]
+        },
+        "cli": "laptop",
+        "exp": 1767226500,
+        "iat": 1767225600,
+        "iss": "https://hogtower.contract.test",
+        "jti": "00000000-0000-4000-8000-000000000007",
+        "nbf": 1767225600,
+        "org": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+        "prd": {
+          "team_id": {
+            "42": "write",
+            "7": "read"
+          }
+        },
+        "rtg": {
+          "b": "hoglite",
+          "be": "7c9e2a14-3f51-4b8d-9e60-2d5a1f8c44aa",
+          "t": "t_3fa8c1d9e2_1"
+        },
+        "sub": "hlc_00112233445566778899aabb",
+        "ten": "scoped",
+        "usr": "0190a1b2-c3d4-7e5f-8a9b-000000000042"
+      }
+    },
+    {
+      "name": "operator_routed",
+      "description": "A provisioning operator targets one recorded catalog; org, cat and rtg route create and drop requests.",
+      "operator": {
+        "subject": "hogtower:provisioner",
+        "client": "hogtower",
+        "org": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+        "catalog": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+        "placement": {
+          "backend_type": "hoglite",
+          "backend_id": "7c9e2a14-3f51-4b8d-9e60-2d5a1f8c44aa",
+          "tenant_id": "t_3fa8c1d9e2",
+          "incarnation": 1
+        }
+      },
+      "audience": "hoglake",
+      "jti": "00000000-0000-4000-8000-000000000008",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6IjAzNGYxMDIzNmE4YWNkMDgifQ.eyJpc3MiOiJodHRwczovL2hvZ3Rvd2VyLmNvbnRyYWN0LnRlc3QiLCJhdWQiOiJob2dsYWtlIiwic3ViIjoiaG9ndG93ZXI6cHJvdmlzaW9uZXIiLCJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDgiLCJ0ZW4iOiJvcGVyYXRvciIsIm9yZyI6IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiIsImNhdCI6eyIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wYzFkMmUzZjRhNWIiOlsiYWRtaW4iXX0sImNsaSI6ImhvZ3Rvd2VyIiwicnRnIjp7ImIiOiJob2dsaXRlIiwiYmUiOiI3YzllMmExNC0zZjUxLTRiOGQtOWU2MC0yZDVhMWY4YzQ0YWEiLCJ0IjoidF8zZmE4YzFkOWUyXzEifSwiZXhwIjoxNzY3MjI1OTAwLCJpYXQiOjE3NjcyMjU2MDAsIm5iZiI6MTc2NzIyNTYwMH0.yF6_s3Kawk35Qkrr1KEUylFv6n9wVSeWHst5H-bv6RhUrAnrT3ukpgW3lwcC2_lu9SAymktGDnpBZ9Ce6eSI3g",
+      "header": {
+        "alg": "ES256",
+        "kid": "034f10236a8acd08",
+        "typ": "JWT"
+      },
+      "claims": {
+        "aud": "hoglake",
+        "cat": {
+          "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b": [
+            "admin"
+          ]
+        },
+        "cli": "hogtower",
+        "exp": 1767225900,
+        "iat": 1767225600,
+        "iss": "https://hogtower.contract.test",
+        "jti": "00000000-0000-4000-8000-000000000008",
+        "nbf": 1767225600,
+        "org": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+        "rtg": {
+          "b": "hoglite",
+          "be": "7c9e2a14-3f51-4b8d-9e60-2d5a1f8c44aa",
+          "t": "t_3fa8c1d9e2_1"
+        },
+        "sub": "hogtower:provisioner",
+        "ten": "operator"
       }
     }
   ]

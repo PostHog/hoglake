@@ -2,11 +2,13 @@ package com.posthog.hoglake.auth
 
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
+import com.posthog.hoglake.store.BackendKind
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.DynamicTest
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestFactory
+import java.util.UUID
 
 /**
  * Tokens hogtower actually mints, checked by the verifier that will receive
@@ -33,7 +35,16 @@ class ContractVectorsTest {
         predicateFields: Set<String> = setOf("team_id"),
     ): JwtVerifier {
         val (kid, key) = keys.entries.single()
-        return JwtVerifier(root["issuer"].asText(), audience, StaticSigningKeys(kid, key), 60, predicateFields) { now }
+        return JwtVerifier(
+            root["issuer"].asText(),
+            audience,
+            StaticSigningKeys(kid, key),
+            60,
+            predicateFields,
+            backends =
+                vectors().mapNotNull { it["claims"]["rtg"]?.get("be")?.asText() }
+                    .associate { UUID.fromString(it) to BackendKind.HOGLITE },
+        ) { now }
     }
 
     private fun vectors(): List<JsonNode> = root["vectors"].toList()
@@ -77,7 +88,7 @@ class ContractVectorsTest {
 
     @Test
     fun `the provisioner's operator token verifies as an operator with no tenant scope`() {
-        val vector = vectors().single { it["claims"]["ten"].asText() == "operator" }
+        val vector = vectors().single { it["name"].asText() == "operator_provisioner" }
         val claims = vector["claims"]
         val caller = verifier().verify(vector["token"].asText())
 
@@ -125,6 +136,34 @@ class ContractVectorsTest {
                 assertThat(it.reason).isEqualTo(JwtViolation.WRONG_AUDIENCE)
             }
     }
+
+    @TestFactory
+    fun `routing vectors pin single catalog placement for every token kind`(): List<DynamicTest> =
+        vectors().filter { it["audience"].asText() == "hoglake" }.map { vector ->
+            DynamicTest.dynamicTest("placement: " + vector["name"].asText()) {
+                val claims = vector["claims"]
+                val caller = verifier().verify(vector["token"].asText())
+                val rtg = claims["rtg"]
+                if (rtg == null) {
+                    assertThat(caller.routing).isNull()
+                } else {
+                    assertThat(rtg.properties().map { it.key }).containsExactlyInAnyOrder("b", "be", "t")
+                    assertThat(caller.routing).isEqualTo(
+                        Routing(
+                            claims["cat"].fieldNames().next(),
+                            BackendKind.HOGLITE,
+                            UUID.fromString(rtg["be"].asText()),
+                            rtg["t"].asText(),
+                        ),
+                    )
+                    assertThat(caller.orgId).isEqualTo(claims["org"].asText())
+                    if (claims["ten"].asText() == "operator") {
+                        assertThat(caller.kind).isEqualTo(Caller.Kind.OPERATOR)
+                        assertThat(caller.catalogScopes).isEmpty()
+                    }
+                }
+            }
+        }
 
     @Test
     fun `the vectors expire on the lifetime hogtower states`() {

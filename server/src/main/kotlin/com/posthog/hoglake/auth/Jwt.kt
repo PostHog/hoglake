@@ -40,6 +40,7 @@ class JwtViolation(
 
         const val MALFORMED = "invalid_token"
         const val UNSUPPORTED_ALG = "unsupported_algorithm"
+        const val UNKNOWN_BACKEND = "unknown_backend"
         const val UNKNOWN_KEY = "unknown_signing_key"
         const val BAD_SIGNATURE = "invalid_signature"
         const val EXPIRED = "token_expired"
