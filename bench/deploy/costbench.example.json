@@ -1,0 +1,14 @@
+{
+  "context": "<kubernetes-context>",
+  "namespace": "costbench-example",
+  "service_account": "costbench",
+  "region": "us-east-1",
+  "zone": "us-east-1a",
+  "data_path": "s3://<benchmark-bucket>/costbench/example/data/",
+  "bench_image": "<your-registry>/hoglake-bench@sha256:<image-digest>",
+  "hourly_usd": "<total-hourly-compute-usd>",
+  "worker_node_selector": {},
+  "coordinator_node_selector": {},
+  "support_node_selector": {},
+  "tolerations": []
+}
