@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.JsonParser
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.posthog.hoglake.hoglite.HogliteBackend
 import com.posthog.hoglake.store.BackendKind
+import com.posthog.hoglake.store.MountNames
 import java.net.URI
 import java.nio.file.Files
 import java.nio.file.Path
@@ -236,6 +237,20 @@ data class Config(
      * in its `prd` claim. Empty (the default) refuses every scoped token.
      */
     val authPredicateFields: String = env("HOGLAKE_AUTH_PREDICATE_FIELDS", ""),
+    /**
+     * The orgs whose mount may serve, comma-separated: the `<id>` of each
+     * mount `<id>-events`, as hogtower's HOGTOWER_EVENTS_ORG_ALLOWLIST lists
+     * them. `*` admits every mount. Empty (the default) admits none, and no
+     * mount name is then looked up at all. Writes are not gated by it, so a
+     * mount can always be disabled.
+     */
+    val mountAllowlist: Set<String> = nameList(env("HOGLAKE_MOUNT_ALLOWLIST", "")),
+    /**
+     * The `sub` of the one operator token that may write mounts
+     * (`PUT /v1/mounts/{name}`), verified, so under `off` none may: hogtower's
+     * events mount loop. Empty (the default): no caller may.
+     */
+    val mountWriterSubject: String = env("HOGLAKE_MOUNT_WRITER_SUBJECT", ""),
     /**
      * Hydrator poll interval; 0 disables the background loop (tests drive
      * it directly).
@@ -1288,7 +1303,14 @@ data class Config(
                 mapOf(canonicalBackendId(postgresBackendId) to BackendKind.POSTGRES)
             }
 
+    /** Whether [HOGLAKE_MOUNT_ALLOWLIST][mountAllowlist] admits the mount [name]. */
+    fun mountAdmitted(name: String): Boolean =
+        MountNames.isReserved(name) && ("*" in mountAllowlist || name.removeSuffix("-events") in mountAllowlist)
+
     init {
+        require(mountAllowlist.all { it == "*" || MountNames.isReserved("$it-events") }) {
+            "HOGLAKE_MOUNT_ALLOWLIST takes org ids (canonical lowercase UUIDs) or *, got $mountAllowlist"
+        }
         if (defaultBackend == "none" && postgresBackendId.isNotEmpty()) {
             require(jdbcUrl.isNotBlank()) { "HOGLAKE_JDBC_URL is required for a PostgreSQL backend" }
             require(dbUser.isNotBlank()) { "HOGLAKE_DB_USER is required for a PostgreSQL backend" }

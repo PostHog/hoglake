@@ -146,6 +146,12 @@ object AuthPolicy {
             // and need no filtering at all.
             Entry(HttpMethod.Get, "/v1/maintenance/status", Requirement.OPERATOR),
             Entry(HttpMethod.Get, "/v1/maintenance/runs", Requirement.OPERATOR),
+            // ---- mounts (docs/auth-tenancy.md §6.5a) ----------------------
+            // A write also needs the one configured subject, which its
+            // handler checks in every mode (store/Mounts.kt requireMountWriter).
+            Entry(HttpMethod.Get, "/v1/mounts", Requirement.OPERATOR),
+            Entry(HttpMethod.Get, "/v1/mounts/{mount}", Requirement.OPERATOR),
+            Entry(HttpMethod.Put, "/v1/mounts/{mount}", Requirement.OPERATOR),
             // ---- one catalog ---------------------------------------------
             Entry(HttpMethod.Get, "/v1/catalogs/$CATALOG", Requirement.READ),
             Entry(HttpMethod.Delete, "/v1/catalogs/$CATALOG", Requirement.ADMIN),

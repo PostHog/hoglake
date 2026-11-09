@@ -739,6 +739,7 @@ As shipped; `auth/AuthPolicy.kt` is the authoritative table.
 | `…/publications*` | `read` (GET) / `maintenance` (POST, DELETE) | ✓ |
 | `/v1/maintenance/status`, `/runs` | operator only (§7.1) | ✓ |
 | `/v1/database/health` | operator only | ✓ |
+| `/v1/mounts*` | operator only; `PUT` only for `HOGLAKE_MOUNT_WRITER_SUBJECT` (§6.5a) | ✓ |
 | `/v1/debug/*` | operator only | ✓ |
 | `/v1/info` | public; **totals projected onto the caller's catalogs, omitted when anonymous** | all |
 | `/livez`, `/healthz`, `/openapi.yaml` | public | n/a |
@@ -798,8 +799,9 @@ a canonical lowercase UUID (`MountNames.PATTERN`).
   catalog route and the namespace gate reach it through `forCatalog`, except
   `GET /v1/catalogs/{catalog}`, which calls it directly to serve a mount. A name
   resolves to a mount only if it has the reserved shape, PostgreSQL is the
-  default backend, the mount registry holds it, and `hog_mount_switch.enabled`
-  is true. Otherwise the request is served as before.
+  default backend, its org is in `HOGLAKE_MOUNT_ALLOWLIST`, `hog_mount` holds
+  it enabled, and `hog_mount_switch.enabled` is true. Otherwise the request is
+  served as before.
 - **Who it serves.** Only a verified `ten: scoped` caller whose `cat` names the
   mount, in every auth mode. Any other caller that gets past the plugin gets a
   404 worded as a missing catalog. Under `off` no caller is verified, so a
@@ -824,11 +826,61 @@ a canonical lowercase UUID (`MountNames.PATTERN`).
   `warn` and `enforce`, `AuthPolicy` answers a scoped caller 403 `forbidden`
   on routes outside its scoped set or beyond its `cat` scope, before
   dispatch.
+- **Read scope.** `ReadScope` (`store/ReadScope.kt`) compiles what a mount
+  read may see: the table's files visible at the read snapshot whose
+  identity partition value on the mount's field is in the caller's `prd`
+  values intersected with the mount's (`*` means the mount's values), and
+  whose stats prove it (`provided AND NOT prefix_quarantined`). An empty set
+  compiles to `FALSE`. The read is refused, and
+  `hoglake_mount_integrity_errors_total` counts it, when the table's
+  object-prefix field at the read snapshot is not the mount's, or on
+  corruption (a spec row with no fields or with key indexes other than
+  0..n-1, no spec with the identity field, a negative mount value). A file
+  bound to an absent spec row cannot exist on such a table (expiry keeps
+  spec rows since #479, which predates the option); it would be left out.
+  No route uses it yet.
 - **The switch.** `hog_mount_switch` (V34) is off by default, and it is read
-  only for a name the registry holds. To turn it on:
-  `UPDATE hog_mount_switch SET enabled = true;` (`false` turns it off). The
-  registry is empty until the mount table exists, so nothing reads the switch
-  yet.
+  only for a name `hog_mount` holds enabled. To turn it on:
+  `UPDATE hog_mount_switch SET enabled = true;` (`false` turns it off). It has
+  no API.
+- **The mounts.** `hog_mount` (V35) holds each mount's revision, `enabled`
+  flag and values (the identity-partition values it admits: team ids). The
+  table a mount reads is the instance's, not the row's.
+  - Operators read mounts with `GET /v1/mounts` and `GET /v1/mounts/{name}`.
+    A mount that was never written reads as revision 0.
+  - `PUT /v1/mounts/{name}` replaces a mount. Only the operator token whose
+    `sub` is `HOGLAKE_MOUNT_WRITER_SUBJECT` (hogtower's events mount loop) may
+    call it, and only with a verified token, so under `off` nobody may. Every
+    other caller is refused, including other operators and `platform:admin`.
+    A missing token gets 401 under `enforce` and 403 under `off` or `warn`.
+    Empty (the default) means nobody
+    may write. The subject must be one that no other operator token carries.
+    Every hogtower operator token is `hogtower:provisioner` today, so the loop
+    needs a subject of its own.
+  - A write is CAS on the revision the writer read, and moves the mount to
+    the next revision. A stale write gets 409 `mount_revision_conflict`. The
+    write gets 422 for a name that any `hog_catalog` row holds, more than
+    10,000 values, or a negative or repeated value. A mount is never deleted,
+    so its revision never resets.
+  - Every write attempt that reaches the handler is one `mount_write` audit
+    line. It carries the actor and, when there is a token, the `jti`. A write
+    that lands also carries the values added and removed, the first 100 of
+    each. A refusal by the route table is an `auth_refused` line instead.
+  - `HOGLAKE_MOUNT_ALLOWLIST` lists the org ids (the `<id>` of `<id>-events`)
+    whose mounts may serve; `*` means all of them. It is empty by default, and
+    then no mount name is looked up at all. It gates serving only, so a mount
+    can always be disabled.
+- **Metrics.** Each of the binding's four refusals (`not_found`,
+  `not_supported_on_backend`, `read_only_catalog`,
+  `mount_operation_unavailable`; not the plugin's 403) counts once in
+  `hoglake_mount_refusals_total{catalog,reason}`, by its error code. The label
+  is only a name the registry holds, so request input cannot add a series;
+  team ids are never labels. For a scoped caller on a namespaced route, the
+  gate counts the request's `hoglake_auth_requests_total` outcome when its
+  lookup answers: `ok` for a reader on a route the mount does not serve (as
+  the plugin counts it on the routes it allows outright) and `other` for a mount
+  placed on hoglite; for any catalog, a 404 because no backend holds it
+  (#554's `none` default) counts `not_entitled`.
 
 ### 6.6 Client-supplied authority fields must die
 
@@ -1232,6 +1284,7 @@ New metrics (Prometheus, existing `observability/Metrics.kt` idiom):
 | `hoglake_auth_requests_total{mode,listener,outcome,client}` | the `warn`-mode onboarding checklist; `client` is a closed class from `User-Agent`, and the enforce gate is zero refusals per class on `listener="api"` (`listener="public"` is the internet-facing port, §6.7, where refusals are expected) |
 | `hoglake_auth_signing_keys` | keys the verifier holds; alert on 0 (boot refuses an empty source, this catches a rotation that never lands) |
 | `hoglake_auth_denials_total{catalog,scope,reason}` | distinguishes "client misconfigured" from "attack" by `reason` |
+| `hoglake_mount_refusals_total{catalog,reason}` | refusals on a mount (§6.5a) by error code; `catalog` is a mount the registry holds |
 | `hoglake_token_issued_total{grant_type}`, `_failures_total` | token endpoint health; not built (issuance is hogtower's) |
 | `hoglake_sts_assume_total{catalog,outcome}`, `_duration_seconds` | the vending path is now on the critical path of a read; it needs a latency histogram; not built (vending is hogtower's) |
 | `hoglake_sts_cache_hit_ratio` | if this drops, every scan pays an STS round trip; not built |
@@ -1512,7 +1565,8 @@ the `RoleSessionName` argument and the rotation/revocation design transfer
 unchanged; the endpoint hosting them does not.
 
 **Superseded — §10 (schema).** No `hog_tenant`, no `hog_client`, no signing-key
-table, no `hog_grant`. hoglake gains no tables from this work.
+table, no `hog_grant`. hoglake gains no tables from this work. (Amended: the
+events mounts add `hog_mount`, written only by hogtower's mount loop; §6.5a.)
 
 **Superseded — §14 (work breakdown).** Phases 2, 3 and 4 move to hogtower and
 no longer gate anything here.
