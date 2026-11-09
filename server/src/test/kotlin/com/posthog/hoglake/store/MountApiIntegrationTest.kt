@@ -148,6 +148,8 @@ class MountApiIntegrationTest {
             assertThat(fresh.tree().get("enabled").asBoolean()).isFalse()
             assertThat(fresh.tree().mountValues()).isEmpty()
 
+            // A revision it was never at is stale, written or not.
+            assertThat(put(port, name, 3, true, listOf(4)).statusCode()).isEqualTo(409)
             val created = put(port, name, 0, true, listOf(9, 4, 42))
             assertThat(created.statusCode()).describedAs(created.body()).isEqualTo(200)
             assertThat(created.tree().get("revision").asLong()).isEqualTo(1)
@@ -214,6 +216,7 @@ class MountApiIntegrationTest {
         // No subject configured: not even the loop's token.
         withServer(writer = "") { port ->
             assertThat(put(port, name, 1, true, listOf(666)).statusCode()).isEqualTo(403)
+            assertThat(put(port, name, 1, true, listOf(666), operator("")).statusCode()).isEqualTo(403)
         }
         assertThat(row(name)).isEqualTo(MountRecord(name, 1, true, listOf(1)))
     }
