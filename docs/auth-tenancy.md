@@ -826,6 +826,17 @@ a canonical lowercase UUID (`MountNames.PATTERN`).
   `UPDATE hog_mount_switch SET enabled = true;` (`false` turns it off). The
   registry is empty until the mount table exists, so nothing reads the switch
   yet.
+- **Metrics.** Each of the binding's four refusals (`not_found`,
+  `not_supported_on_backend`, `read_only_catalog`,
+  `mount_operation_unavailable`; not the plugin's 403) counts once in
+  `hoglake_mount_refusals_total{catalog,reason}`, by its error code. The label
+  is only a name the registry holds, so request input cannot add a series;
+  team ids are never labels. For a scoped caller on a namespaced route, the
+  gate counts the request's `hoglake_auth_requests_total` outcome when its
+  lookup answers: `ok` for a reader on a route the mount does not serve (as
+  the plugin counts it on the routes it allows outright) and `other` for a mount
+  placed on hoglite; for any catalog, a 404 because no backend holds it
+  (#554's `none` default) counts `not_entitled`.
 
 ### 6.6 Client-supplied authority fields must die
 
@@ -1229,6 +1240,7 @@ New metrics (Prometheus, existing `observability/Metrics.kt` idiom):
 | `hoglake_auth_requests_total{mode,listener,outcome,client}` | the `warn`-mode onboarding checklist; `client` is a closed class from `User-Agent`, and the enforce gate is zero refusals per class on `listener="api"` (`listener="public"` is the internet-facing port, §6.7, where refusals are expected) |
 | `hoglake_auth_signing_keys` | keys the verifier holds; alert on 0 (boot refuses an empty source, this catches a rotation that never lands) |
 | `hoglake_auth_denials_total{catalog,scope,reason}` | distinguishes "client misconfigured" from "attack" by `reason` |
+| `hoglake_mount_refusals_total{catalog,reason}` | refusals on a mount (§6.5a) by error code; `catalog` is a mount the registry holds |
 | `hoglake_token_issued_total{grant_type}`, `_failures_total` | token endpoint health; not built (issuance is hogtower's) |
 | `hoglake_sts_assume_total{catalog,outcome}`, `_duration_seconds` | the vending path is now on the critical path of a read; it needs a latency histogram; not built (vending is hogtower's) |
 | `hoglake_sts_cache_hit_ratio` | if this drops, every scan pays an STS round trip; not built |
