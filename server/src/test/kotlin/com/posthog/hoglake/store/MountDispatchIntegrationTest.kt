@@ -44,6 +44,7 @@ class MountDispatchIntegrationTest {
     private val http = HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1).build()
     private val mount = "0190f3c4-1b2a-4c3d-8e4f-a5b6c7d8e9f0-events"
     private val source = "millrace-dev"
+    private val postgresId = "7b0c6d0e-1f2a-4b3c-9d4e-5f6a7b8c9d0e"
     private val registry = MountRegistry { if (it == mount) MountRecord(it) else null }
 
     /** As migrated, before any test writes it. */
@@ -83,6 +84,7 @@ class MountDispatchIntegrationTest {
         val cfg =
             Config(port = 0, hydratorIntervalMs = 0).copy(
                 mountSourceCatalog = sourceCatalog,
+                postgresBackendId = postgresId,
                 authMode = mode.wire,
                 authIssuer = TestTokens.ISSUER,
                 authJwksFile = keyFile.toString(),
@@ -101,9 +103,12 @@ class MountDispatchIntegrationTest {
 
     private fun operator() = TestTokens.mint(pair, TestTokens.operatorClaims())
 
-    private fun scoped(catalogs: String = """{"$mount":["write"]}"""): String {
+    private fun scoped(
+        catalogs: String = """{"$mount":["write"]}""",
+        extra: String = "",
+    ): String {
         val iat = System.currentTimeMillis() / 1000 - 5
-        return TestTokens.mint(pair, TestTokens.scopedClaims(catalogs = catalogs, iat = iat))
+        return TestTokens.mint(pair, TestTokens.scopedClaims(catalogs = catalogs, iat = iat, extra = extra))
     }
 
     private fun tenant(): String {
@@ -263,6 +268,9 @@ class MountDispatchIntegrationTest {
                 // The mount entry is exactly what GET answers for it, after the local catalogs.
                 assertThat(listed.body()).endsWith(",${mountBody()}]")
                 assertThat(send(port, HttpMethod.Get, "/v1/catalogs/$mount", reader).body()).isEqualTo(mountBody())
+                // A token that places the mount on this PostgreSQL: the routed listing shows it too.
+                val placed = scoped("""{"$mount":["read"]}""", ""","rtg":{"b":"postgres","be":"$postgresId"}""")
+                assertThat(send(port, HttpMethod.Get, "/v1/catalogs", placed).body()).isEqualTo("[${mountBody()}]")
                 // Everyone else: no mount, and not the catalog it shadows.
                 val all = send(port, HttpMethod.Get, "/v1/catalogs", operator()).body()
                 assertThat(names(all)).contains("lake", source).doesNotContain(mount)

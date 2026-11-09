@@ -138,8 +138,12 @@ fun Application.installApiRoutes(
                 val local =
                     listed.filterNot { it.name in mounts }.map { it.toDto(if (scoped) null else totals[it.name]) }
                 val shown = listing.mounts.filter { it in mounts }
-                val source = if (shown.isEmpty()) null else selector.mountSource()
-                call.respond(local + shown.map { checkNotNull(source).toMountDto(it) })
+                if (shown.isEmpty()) {
+                    call.respond(local)
+                } else {
+                    val source = selector.mountSource()
+                    call.respond(local + shown.map { source.toMountDto(it) })
+                }
             }
             post {
                 val req = call.receive<CreateCatalogRequestDto>()

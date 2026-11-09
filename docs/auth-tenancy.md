@@ -795,7 +795,8 @@ a canonical lowercase UUID (`MountNames.PATTERN`).
   caller.
 - **One choke point.** `CatalogStoreSelector.resolve` is #291's
   `CatalogRegistry.resolve`. It runs before token placement picks a store. Every
-  catalog route and the namespace gate reach it through `forCatalog`. A name
+  catalog route and the namespace gate reach it through `forCatalog`, except
+  `GET /v1/catalogs/{catalog}`, which calls it directly to serve a mount. A name
   resolves to a mount only if it has the reserved shape, PostgreSQL is the
   default backend, the mount registry holds it, and `hog_mount_switch.enabled`
   is true. Otherwise the request is served as before.
@@ -810,7 +811,7 @@ a canonical lowercase UUID (`MountNames.PATTERN`).
   is the row of the instance's source catalog (`HOGLAKE_MOUNT_SOURCE_CATALOG`:
   data path, snapshot clock) under the mount's name, with `read_only: true`,
   no capabilities (each one gates a write) and no sampler totals; unset or
-  missing, the mount answers 500. Every other route refuses before any
+  missing, the mount and its reader's listing answer 500. Every other route refuses before any
   service call: a non-read route with 403 `read_only_catalog`, a read route
   with 501 `mount_operation_unavailable`. The route table (§6.4) gives the
   class.
