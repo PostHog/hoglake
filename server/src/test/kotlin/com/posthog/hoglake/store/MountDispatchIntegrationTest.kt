@@ -242,6 +242,13 @@ class MountDispatchIntegrationTest {
         val without = withServer(MountRegistry.NONE) { port -> reads(port) }
         assertThat(withRecord).isEqualTo(without)
         assertThat(withRecord.values.map { it.first }).contains(200)
+        // The one change for a reserved name that is no mount: its scoped
+        // reader gets the catalog as its listing shows it (main: 403).
+        val (status, body) = withRecord.getValue("scoped GET /v1/catalogs/$mount")
+        assertThat(status).isEqualTo(200)
+        assertThat(body)
+            .contains(""""data_path":"s3://bucket/$mount"""", "atomic-table-creation-v1")
+            .doesNotContain("read_only")
     }
 
     private fun reads(port: Int): Map<String, Pair<Int, String>> =
