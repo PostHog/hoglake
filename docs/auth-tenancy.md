@@ -572,6 +572,7 @@ samplers start only after PostgreSQL initializes; a hoglite-only process never s
 | No `rtg`, or a different catalog | PostgreSQL default, or 404 when the default is `none` |
 | Hoglite catalog listing | Only the token's routed catalog |
 | Maintenance or publications on hoglite | 501 `not_supported_on_backend` |
+| A mount name (§6.5a) | Resolved first, and refused: never a store |
 
 Authorization still runs before store selection. Fleet metrics and `/v1/info` remain PostgreSQL-only.
 
@@ -777,6 +778,41 @@ and the repository layer asserts `catalog_id == TenantContext.catalogId` for the
 catalog it resolved — a cheap invariant, one `require`. Cost is zero on the happy
 path and it turns "a new route forgot the plugin" into a 500 in tests rather than
 a cross-tenant read in production.
+
+### 6.5a Mount dispatch
+
+A mount is a read-only catalog name over a table in this instance's PostgreSQL
+catalogs (#291, self-mount only). Its name is `<orgID>-events`, with the org id
+a canonical lowercase UUID (`MountNames.PATTERN`).
+
+- **Reserved names.** `POST /v1/catalogs` refuses that shape with 422 before
+  placement selects a backend, whatever the switch below says. So no catalog
+  created through it can take a mount's name. A PostgreSQL name taken earlier
+  is for the mount write to refuse; a hoglite one is kept out by the issuer's
+  `cat` grammar. Where both exist, the mount resolves first on every
+  `{catalog}` route; `GET /v1/catalogs` does not list mounts yet.
+- **One choke point.** `CatalogStoreSelector.resolve` is #291's
+  `CatalogRegistry.resolve`. It runs before token placement picks a store. Every
+  catalog route and the namespace gate reach it through `forCatalog`. A name
+  resolves to a mount only if it has the reserved shape, PostgreSQL is the
+  default backend, the mount registry holds it, and `hog_mount_switch.enabled`
+  is true. Otherwise the request is served as before.
+- **Who it serves.** Only a verified `ten: scoped` caller whose `cat` names the
+  mount, in every auth mode. Any other caller that gets past the plugin gets a
+  404 worded as a missing catalog. Under `off` no caller is verified, so a
+  mount serves no one. A scoped reader whose `rtg` places the mount on hoglite
+  gets 501 `not_supported_on_backend`.
+- **What it serves.** Nothing yet. A non-read route answers 403
+  `read_only_catalog`; a read route answers 501
+  `mount_operation_unavailable`; both before any service call. The route table
+  (§6.4) gives the class. `AuthPolicy` does not list mounts: under `warn` and
+  `enforce` it answers a scoped caller 403 `forbidden` on routes outside its
+  scoped set or beyond its `cat` scope, before dispatch.
+- **The switch.** `hog_mount_switch` (V34) is off by default, and it is read
+  only for a name the registry holds. To turn it on:
+  `UPDATE hog_mount_switch SET enabled = true;` (`false` turns it off). The
+  registry is empty until the mount table exists, so nothing reads the switch
+  yet.
 
 ### 6.6 Client-supplied authority fields must die
 

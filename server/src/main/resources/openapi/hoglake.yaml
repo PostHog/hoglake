@@ -35,6 +35,14 @@ info:
     return 422 `backend_query_timeout`. Narrow the query before retrying.
     These deterministic refusals do not carry Retry-After.
 
+    A mount (`<orgID>-events`) is read-only. A scoped caller whose `cat`
+    names it gets, on the routes open to scoped callers within its `cat`
+    scope, 403 `read_only_catalog` for a write and 501
+    `mount_operation_unavailable` for a read not served yet, or 501
+    `not_supported_on_backend` when its `rtg` places the mount on hoglite;
+    other routes refuse it as any scoped caller (403 `forbidden`). Other
+    callers are answered as for any catalog: where they would reach it, 404.
+
     Two refusals are worth distinguishing, because they mean different
     things to a client:
 
@@ -150,7 +158,9 @@ paths:
               schema: { $ref: "#/components/schemas/Catalog" }
         "409": { $ref: "#/components/responses/Conflict" }
         "422":
-          description: Validation failure (bad name, blank data_path)
+          description: >-
+            Validation failure (bad name, blank data_path, or a name reserved
+            for mounts: a canonical lowercase UUID followed by `-events`)
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }

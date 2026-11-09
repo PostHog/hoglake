@@ -2548,6 +2548,12 @@ sealed class HoglakeException(message: String) : RuntimeException(message) {
     /** The selected backend does not implement this operation. */
     class NotSupported(detail: String) : HoglakeException(detail)
 
+    /** Any non-read route on a mount, which is read-only -> 403 `read_only_catalog`. */
+    class ReadOnlyCatalog(detail: String) : HoglakeException(detail)
+
+    /** A read route a mount does not serve -> 501 `mount_operation_unavailable`. */
+    class MountOperationUnavailable(detail: String) : HoglakeException(detail)
+
     /** Narrow the result before retrying. This refusal is not backend unavailability. */
     class BackendResultTooLarge(detail: String) : HoglakeException(detail)
 
