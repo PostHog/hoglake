@@ -909,6 +909,73 @@ def test_nested_field_ids_are_still_compared_arm_by_arm(kind):
     assert not prepared_schema_matches(_wrap(moved), annotated)
 
 
+def test_a_remembered_verdict_speaks_for_the_same_ipc_bytes_only():
+    """prepared_schema_matches remembers its verdict by the two schemas'
+    IPC bytes. A schema that is ``==`` to a remembered one (Arrow's equality
+    ignores field metadata) but numbers a nested field otherwise has other
+    bytes, so it gets its own verdict: still a refusal."""
+    from pyhoglake import parquet_schema as ps
+    from pyhoglake.parquet_schema import prepared_schema_matches
+
+    ps._SCHEMA_MATCHES.clear()
+    annotated = _wrap(_container("struct", annotated=True))
+    assert prepared_schema_matches(annotated, annotated)
+    assert len(ps._SCHEMA_MATCHES) == 1
+    assert prepared_schema_matches(annotated, annotated)  # the verdict, remembered
+    assert len(ps._SCHEMA_MATCHES) == 1
+    inner = annotated.field(0).type
+    moved = _wrap(
+        pa.struct([inner.field(0).with_metadata({PARQUET_FIELD_ID_KEY: b"99"})])
+    )
+    assert moved == annotated and moved.serialize() != annotated.serialize()
+    assert not prepared_schema_matches(moved, annotated)
+    assert len(ps._SCHEMA_MATCHES) == 2
+    # The verdict of a pair is computed on the schemas, never by deserialising
+    # the key: the remembered True is for annotated with itself only.
+    assert not prepared_schema_matches(annotated, moved)
+
+
+def test_a_remembered_verdict_is_confirmed_by_equality_not_ipc_bytes_alone():
+    """An extension field and its storage type carrying the extension's
+    metadata serialise to the same IPC bytes, so the bytes alone would
+    serve one's verdict to the other: the hit is confirmed by ``equals``
+    with metadata, and the twin gets its own verdict, a refusal as before.
+    ``_stored_schema``, remembered the same way, gives the twin its own
+    (string) type too."""
+    from pyhoglake import parquet_schema as ps
+    from pyhoglake.parquet_schema import prepared_schema_matches
+    from pyhoglake.writer import _STORED_SCHEMAS, _stored_schema
+
+    ps._SCHEMA_MATCHES.clear()
+    _STORED_SCHEMAS.clear()
+    extension = pa.schema(
+        [pa.field("c", pa.json_(), metadata={PARQUET_FIELD_ID_KEY: b"1"})]
+    )
+    twin = pa.schema(
+        [
+            pa.field(
+                "c",
+                pa.string(),
+                # In the order the IPC writer spells an extension field's.
+                metadata={
+                    PARQUET_FIELD_ID_KEY: b"1",
+                    b"ARROW:extension:metadata": b"",
+                    b"ARROW:extension:name": b"arrow.json",
+                },
+            )
+        ]
+    )
+    assert extension.serialize().to_pybytes() == twin.serialize().to_pybytes()
+    assert not extension.equals(twin, check_metadata=True)
+    assert prepared_schema_matches(extension, extension)
+    assert not prepared_schema_matches(twin, extension)
+    assert not prepared_schema_matches(extension, twin)
+    assert prepared_schema_matches(twin, twin)
+    assert _stored_schema(extension).field(0).type == pa.json_()
+    assert _stored_schema(twin).field(0).type == pa.string()
+    assert _stored_schema(extension).field(0).type == pa.json_()
+
+
 def test_uuid_normalization_keeps_every_other_container_property():
     """Unwrapping the uuid extension must not quietly unify anything
     ELSE about a container. A map's keys_sorted, a fixed-size list's
