@@ -49,10 +49,12 @@ import com.posthog.hoglake.service.UploadService
 import com.posthog.hoglake.service.ViewService
 import com.posthog.hoglake.store.CatalogStore
 import com.posthog.hoglake.store.CatalogStoreSelector
+import com.posthog.hoglake.store.MountHostResolver
 import com.posthog.hoglake.store.MountReadService
 import com.posthog.hoglake.store.MountRegistry
 import com.posthog.hoglake.store.MountStore
 import com.posthog.hoglake.store.PostgresCatalogStore
+import com.posthog.hoglake.store.StaticMountHosts
 import com.zaxxer.hikari.HikariDataSource
 import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
@@ -139,11 +141,19 @@ class App private constructor(
 
     private val mountStore by lazy { MountStore({ jdbi }, cfg::mountAdmitted) }
 
+    /**
+     * Client mode (plan row 1.3c): the remote hosts this server proxies
+     * mounts to (HOGLAKE_MOUNT_HOSTS_FILE). With none configured nothing is
+     * built and no name resolves to a host.
+     */
+    private val mountHosts = lazy { cfg.mountHosts.takeIf { it.isNotEmpty() }?.let(::StaticMountHosts) }
+
     private val catalogSelector by lazy {
         CatalogStoreSelector(
             catalogStore,
             cfg,
             MountRegistry.behindSwitch(MountRegistry.postgresSwitch { jdbi }, mountRegistry ?: mountStore),
+            mountHosts.value ?: MountHostResolver.NONE,
         )
     }
 
@@ -717,6 +727,7 @@ class App private constructor(
      * both.
      */
     override fun close() {
+        if (mountHosts.isInitialized()) mountHosts.value?.close()
         requestDispatcher.close()
         closeBackground()
         healthProbe.close()

@@ -2586,6 +2586,41 @@ sealed class HoglakeException(message: String) : RuntimeException(message) {
      */
     class MountScanBusy(detail: String) : HoglakeException(detail)
 
+    /**
+     * On a mount Client (HOGLAKE_MOUNT_HOSTS_FILE): the Host could not be
+     * reached, or did not answer inside the deadline -> 503
+     * `mount_host_unavailable` + Retry-After. Nothing was refused.
+     */
+    class MountHostUnavailable(detail: String) : HoglakeException(detail)
+
+    /**
+     * On a mount Client: the Host answered with something that is not its
+     * contract (a redirect, a body that is not JSON, an error without a
+     * code, a body over the cap) -> 502 `mount_host_invalid_response`. The
+     * detail never carries what the Host sent.
+     */
+    class MountHostInvalidResponse(detail: String) : HoglakeException(detail)
+
+    /**
+     * On a mount Client: the host's cap over proxied requests in flight is
+     * full -> 503 `mount_proxy_busy` + Retry-After. Non-blocking, as
+     * [MountScanBusy] is on the Host.
+     */
+    class MountProxyBusy(detail: String) : HoglakeException(detail)
+
+    /**
+     * On a mount Client: the Host's own typed refusal, answered to the
+     * caller with the Host's [status], [code] and detail (and Retry-After
+     * when the Host sent one). [code] has passed the error-code grammar and
+     * the detail is capped, so nothing of an unexpected shape gets through.
+     */
+    class MountHostRefused(
+        val status: Int,
+        val code: String,
+        detail: String,
+        val retryAfterSeconds: Long? = null,
+    ) : HoglakeException(detail)
+
     /** Narrow the result before retrying. This refusal is not backend unavailability. */
     class BackendResultTooLarge(detail: String) : HoglakeException(detail)
 
