@@ -1,0 +1,400 @@
+{
+  "cases": {
+    "append:deferred=False": {
+      "payload": {
+        "appends": [
+          {
+            "expected_table_uuid": "0b8ee9ba-79a1-4f3e-b7e5-6a0b6ab6f012",
+            "files": [
+              {
+                "column_stats": [
+                  {
+                    "field_id": 1,
+                    "lower_bound": "BwAAAAAAAAA=",
+                    "null_count": 0,
+                    "size_bytes": 98,
+                    "upper_bound": "BwAAAAAAAAA=",
+                    "value_count": 2
+                  },
+                  {
+                    "field_id": 2,
+                    "lower_bound": "APALVVJHBgA=",
+                    "null_count": 0,
+                    "size_bytes": 106,
+                    "upper_bound": "AFDjcmZHBgA=",
+                    "value_count": 2
+                  },
+                  {
+                    "field_id": 3,
+                    "lower_bound": "di0w",
+                    "null_count": 0,
+                    "size_bytes": 74,
+                    "upper_bound": "di0x",
+                    "value_count": 2
+                  }
+                ],
+                "file_size_bytes": 1267,
+                "footer_size": 977,
+                "partition_values": [
+                  "7",
+                  "672"
+                ],
+                "path": "s3://bkt/lake/data/ns1/events/00000000-0000-4000-8000-000000000001.parquet",
+                "record_count": 2
+              },
+              {
+                "column_stats": [
+                  {
+                    "field_id": 1,
+                    "lower_bound": "CQAAAAAAAAA=",
+                    "null_count": 0,
+                    "size_bytes": 98,
+                    "upper_bound": "CQAAAAAAAAA=",
+                    "value_count": 1
+                  },
+                  {
+                    "field_id": 2,
+                    "lower_bound": "APALVVJHBgA=",
+                    "null_count": 0,
+                    "size_bytes": 98,
+                    "upper_bound": "APALVVJHBgA=",
+                    "value_count": 1
+                  },
+                  {
+                    "field_id": 3,
+                    "lower_bound": "di0w",
+                    "null_count": 0,
+                    "size_bytes": 67,
+                    "upper_bound": "di0w",
+                    "value_count": 1
+                  }
+                ],
+                "file_size_bytes": 1251,
+                "footer_size": 976,
+                "partition_values": [
+                  "9",
+                  "672"
+                ],
+                "path": "s3://bkt/lake/data/ns1/events/00000000-0000-4000-8000-000000000002.parquet",
+                "record_count": 1
+              }
+            ],
+            "namespace": "ns1",
+            "table": "events"
+          }
+        ],
+        "read_snapshot": 88
+      },
+      "uploaded": {
+        "bkt/lake/data/ns1/events/00000000-0000-4000-8000-000000000001.parquet": "1369b22a10379785cc6e9146519287f05c368c5a8780d21e820f381821662d5b",
+        "bkt/lake/data/ns1/events/00000000-0000-4000-8000-000000000002.parquet": "2a7a3a031965debdea3746345f77516132e9f9a470f43e49cac8f5cfc893eee8"
+      }
+    },
+    "append:deferred=True": {
+      "payload": {
+        "appends": [
+          {
+            "expected_table_uuid": "0b8ee9ba-79a1-4f3e-b7e5-6a0b6ab6f012",
+            "files": [
+              {
+                "file_size_bytes": 1267,
+                "footer_size": 977,
+                "partition_values": [
+                  "7",
+                  "672"
+                ],
+                "path": "s3://bkt/lake/data/ns1/events/00000000-0000-4000-8000-000000000001.parquet",
+                "record_count": 2
+              },
+              {
+                "file_size_bytes": 1251,
+                "footer_size": 976,
+                "partition_values": [
+                  "9",
+                  "672"
+                ],
+                "path": "s3://bkt/lake/data/ns1/events/00000000-0000-4000-8000-000000000002.parquet",
+                "record_count": 1
+              }
+            ],
+            "namespace": "ns1",
+            "table": "events"
+          }
+        ],
+        "read_snapshot": 88
+      },
+      "uploaded": {
+        "bkt/lake/data/ns1/events/00000000-0000-4000-8000-000000000001.parquet": "1369b22a10379785cc6e9146519287f05c368c5a8780d21e820f381821662d5b",
+        "bkt/lake/data/ns1/events/00000000-0000-4000-8000-000000000002.parquet": "2a7a3a031965debdea3746345f77516132e9f9a470f43e49cac8f5cfc893eee8"
+      }
+    },
+    "prepare_append_files:deferred=False": {
+      "payload": {
+        "appends": [
+          {
+            "expected_table_uuid": "0b8ee9ba-79a1-4f3e-b7e5-6a0b6ab6f012",
+            "files": [
+              {
+                "column_stats": [
+                  {
+                    "field_id": 1,
+                    "lower_bound": "BwAAAAAAAAA=",
+                    "null_count": 0,
+                    "size_bytes": 98,
+                    "upper_bound": "BwAAAAAAAAA=",
+                    "value_count": 2
+                  },
+                  {
+                    "field_id": 2,
+                    "lower_bound": "APALVVJHBgA=",
+                    "null_count": 0,
+                    "size_bytes": 106,
+                    "upper_bound": "AFDjcmZHBgA=",
+                    "value_count": 2
+                  },
+                  {
+                    "field_id": 3,
+                    "lower_bound": "di0w",
+                    "null_count": 0,
+                    "size_bytes": 74,
+                    "upper_bound": "di0x",
+                    "value_count": 2
+                  }
+                ],
+                "file_size_bytes": 1267,
+                "footer_size": 977,
+                "partition_values": [
+                  "7",
+                  "672"
+                ],
+                "path": "s3://bkt/lake/data/ns1/events/00000000-0000-4000-8000-00000000abcd/00000000-0000-4000-8000-000000000001-0.parquet",
+                "record_count": 2
+              },
+              {
+                "column_stats": [
+                  {
+                    "field_id": 1,
+                    "lower_bound": "CQAAAAAAAAA=",
+                    "null_count": 0,
+                    "size_bytes": 98,
+                    "upper_bound": "CQAAAAAAAAA=",
+                    "value_count": 1
+                  },
+                  {
+                    "field_id": 2,
+                    "lower_bound": "APALVVJHBgA=",
+                    "null_count": 0,
+                    "size_bytes": 98,
+                    "upper_bound": "APALVVJHBgA=",
+                    "value_count": 1
+                  },
+                  {
+                    "field_id": 3,
+                    "lower_bound": "di0w",
+                    "null_count": 0,
+                    "size_bytes": 67,
+                    "upper_bound": "di0w",
+                    "value_count": 1
+                  }
+                ],
+                "file_size_bytes": 1251,
+                "footer_size": 976,
+                "partition_values": [
+                  "9",
+                  "672"
+                ],
+                "path": "s3://bkt/lake/data/ns1/events/00000000-0000-4000-8000-00000000abcd/00000000-0000-4000-8000-000000000002-1.parquet",
+                "record_count": 1
+              }
+            ],
+            "namespace": "ns1",
+            "table": "events"
+          }
+        ],
+        "idempotency_key": "00000000-0000-4000-8000-00000000abcd",
+        "read_snapshot": 88
+      },
+      "uploaded": {
+        "bkt/lake/data/ns1/events/00000000-0000-4000-8000-00000000abcd/00000000-0000-4000-8000-000000000001-0.parquet": "1369b22a10379785cc6e9146519287f05c368c5a8780d21e820f381821662d5b",
+        "bkt/lake/data/ns1/events/00000000-0000-4000-8000-00000000abcd/00000000-0000-4000-8000-000000000002-1.parquet": "2a7a3a031965debdea3746345f77516132e9f9a470f43e49cac8f5cfc893eee8"
+      }
+    },
+    "prepare_append_files:deferred=True": {
+      "payload": {
+        "appends": [
+          {
+            "expected_table_uuid": "0b8ee9ba-79a1-4f3e-b7e5-6a0b6ab6f012",
+            "files": [
+              {
+                "file_size_bytes": 1267,
+                "footer_size": 977,
+                "partition_values": [
+                  "7",
+                  "672"
+                ],
+                "path": "s3://bkt/lake/data/ns1/events/00000000-0000-4000-8000-00000000abcd/00000000-0000-4000-8000-000000000001-0.parquet",
+                "record_count": 2
+              },
+              {
+                "file_size_bytes": 1251,
+                "footer_size": 976,
+                "partition_values": [
+                  "9",
+                  "672"
+                ],
+                "path": "s3://bkt/lake/data/ns1/events/00000000-0000-4000-8000-00000000abcd/00000000-0000-4000-8000-000000000002-1.parquet",
+                "record_count": 1
+              }
+            ],
+            "namespace": "ns1",
+            "table": "events"
+          }
+        ],
+        "idempotency_key": "00000000-0000-4000-8000-00000000abcd",
+        "read_snapshot": 88
+      },
+      "uploaded": {
+        "bkt/lake/data/ns1/events/00000000-0000-4000-8000-00000000abcd/00000000-0000-4000-8000-000000000001-0.parquet": "1369b22a10379785cc6e9146519287f05c368c5a8780d21e820f381821662d5b",
+        "bkt/lake/data/ns1/events/00000000-0000-4000-8000-00000000abcd/00000000-0000-4000-8000-000000000002-1.parquet": "2a7a3a031965debdea3746345f77516132e9f9a470f43e49cac8f5cfc893eee8"
+      }
+    },
+    "prepare_append_tables:deferred=False": {
+      "payload": {
+        "appends": [
+          {
+            "expected_table_uuid": "0b8ee9ba-79a1-4f3e-b7e5-6a0b6ab6f012",
+            "files": [
+              {
+                "column_stats": [
+                  {
+                    "field_id": 1,
+                    "lower_bound": "BwAAAAAAAAA=",
+                    "null_count": 0,
+                    "size_bytes": 98,
+                    "upper_bound": "BwAAAAAAAAA=",
+                    "value_count": 2
+                  },
+                  {
+                    "field_id": 2,
+                    "lower_bound": "APALVVJHBgA=",
+                    "null_count": 0,
+                    "size_bytes": 106,
+                    "upper_bound": "AFDjcmZHBgA=",
+                    "value_count": 2
+                  },
+                  {
+                    "field_id": 3,
+                    "lower_bound": "di0w",
+                    "null_count": 0,
+                    "size_bytes": 74,
+                    "upper_bound": "di0x",
+                    "value_count": 2
+                  }
+                ],
+                "file_size_bytes": 1267,
+                "footer_size": 977,
+                "partition_values": [
+                  "7",
+                  "672"
+                ],
+                "path": "s3://bkt/lake/data/ns1/events/00000000-0000-4000-8000-00000000abcd/00000000-0000-4000-8000-000000000001-0.parquet",
+                "record_count": 2
+              },
+              {
+                "column_stats": [
+                  {
+                    "field_id": 1,
+                    "lower_bound": "CQAAAAAAAAA=",
+                    "null_count": 0,
+                    "size_bytes": 98,
+                    "upper_bound": "CQAAAAAAAAA=",
+                    "value_count": 1
+                  },
+                  {
+                    "field_id": 2,
+                    "lower_bound": "APALVVJHBgA=",
+                    "null_count": 0,
+                    "size_bytes": 98,
+                    "upper_bound": "APALVVJHBgA=",
+                    "value_count": 1
+                  },
+                  {
+                    "field_id": 3,
+                    "lower_bound": "di0w",
+                    "null_count": 0,
+                    "size_bytes": 67,
+                    "upper_bound": "di0w",
+                    "value_count": 1
+                  }
+                ],
+                "file_size_bytes": 1251,
+                "footer_size": 976,
+                "partition_values": [
+                  "9",
+                  "672"
+                ],
+                "path": "s3://bkt/lake/data/ns1/events/00000000-0000-4000-8000-00000000abcd/00000000-0000-4000-8000-000000000002-1.parquet",
+                "record_count": 1
+              }
+            ],
+            "namespace": "ns1",
+            "table": "events"
+          }
+        ],
+        "idempotency_key": "00000000-0000-4000-8000-00000000abcd",
+        "read_snapshot": 88
+      },
+      "uploaded": {
+        "bkt/lake/data/ns1/events/00000000-0000-4000-8000-00000000abcd/00000000-0000-4000-8000-000000000001-0.parquet": "1369b22a10379785cc6e9146519287f05c368c5a8780d21e820f381821662d5b",
+        "bkt/lake/data/ns1/events/00000000-0000-4000-8000-00000000abcd/00000000-0000-4000-8000-000000000002-1.parquet": "2a7a3a031965debdea3746345f77516132e9f9a470f43e49cac8f5cfc893eee8"
+      }
+    },
+    "prepare_append_tables:deferred=True": {
+      "payload": {
+        "appends": [
+          {
+            "expected_table_uuid": "0b8ee9ba-79a1-4f3e-b7e5-6a0b6ab6f012",
+            "files": [
+              {
+                "file_size_bytes": 1267,
+                "footer_size": 977,
+                "partition_values": [
+                  "7",
+                  "672"
+                ],
+                "path": "s3://bkt/lake/data/ns1/events/00000000-0000-4000-8000-00000000abcd/00000000-0000-4000-8000-000000000001-0.parquet",
+                "record_count": 2
+              },
+              {
+                "file_size_bytes": 1251,
+                "footer_size": 976,
+                "partition_values": [
+                  "9",
+                  "672"
+                ],
+                "path": "s3://bkt/lake/data/ns1/events/00000000-0000-4000-8000-00000000abcd/00000000-0000-4000-8000-000000000002-1.parquet",
+                "record_count": 1
+              }
+            ],
+            "namespace": "ns1",
+            "table": "events"
+          }
+        ],
+        "idempotency_key": "00000000-0000-4000-8000-00000000abcd",
+        "read_snapshot": 88
+      },
+      "uploaded": {
+        "bkt/lake/data/ns1/events/00000000-0000-4000-8000-00000000abcd/00000000-0000-4000-8000-000000000001-0.parquet": "1369b22a10379785cc6e9146519287f05c368c5a8780d21e820f381821662d5b",
+        "bkt/lake/data/ns1/events/00000000-0000-4000-8000-00000000abcd/00000000-0000-4000-8000-000000000002-1.parquet": "2a7a3a031965debdea3746345f77516132e9f9a470f43e49cac8f5cfc893eee8"
+      }
+    }
+  },
+  "description": "The wire payloads pyhoglake's three writers produce on a table WITHOUT",
+  "recorded_from": {
+    "commit": "232c4badd830c6026901314604cdd42efa992e42",
+    "pyarrow": "26.0.0",
+    "pyhoglake_file": "pyhoglake/src/pyhoglake/__init__.py",
+    "pyhoglake_version": "1.4.9.dev0",
+    "python": "3.13.13"
+  }
+}
