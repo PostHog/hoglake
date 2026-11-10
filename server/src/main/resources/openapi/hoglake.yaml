@@ -56,6 +56,27 @@ info:
     callers are answered as for any catalog: where they would reach it, 404;
     no listing shows them a mount.
 
+    A server may instead be a mount Client (HOGLAKE_MOUNT_HOSTS_FILE): each
+    configured host serves the mount names its entry matches, and this
+    server forwards that mount's reader to it. The reader is checked here
+    first, exactly as above, so a caller the mount would not serve, a write
+    and an unserved read are refused here with the same statuses and codes
+    and nothing is sent. For the reader, the catalog route and the five read
+    routes are sent to the host with the caller's own bearer token and
+    X-Request-Id, and the host's answer comes back unchanged: the same
+    bodies, `data_path` and per-file `team_id`, and the host's own refusals
+    with their status, `error`, `detail` and Retry-After (a 401 keeps its
+    `WWW-Authenticate` challenge). GET /v1/catalogs asks each host once and
+    lists the mounts it returns for the names in the caller's `cat`. The
+    Client adds three answers of its own: 503 `mount_host_unavailable` (the
+    host could not be reached, or did not answer inside the deadline) and
+    503 `mount_proxy_busy` (the cap on proxied requests in flight is full),
+    both with Retry-After, and 502 `mount_host_invalid_response` (the host
+    answered with something that is not this contract). A namespace or
+    table name outside the identifier grammar is 404 here. A large answer is
+    streamed; if it fails part-way, or passes the size cap, the connection
+    is closed instead of the body being finished.
+
     Two refusals are worth distinguishing, because they mean different
     things to a client:
 
@@ -148,7 +169,10 @@ paths:
         mounts) follow the catalogs, with `read_only: true`; while the
         instance's mount source is unset or missing, that caller's listing
         answers 500. A catalog whose name a mount takes is not listed, as
-        every route answers for the mount instead.
+        every route answers for the mount instead. On a mount Client the
+        mounts are the entries its hosts list for those names, as the hosts
+        wrote them; while a host is unreachable, that caller's listing
+        answers 503 `mount_host_unavailable`.
       responses:
         "200":
           description: Catalogs

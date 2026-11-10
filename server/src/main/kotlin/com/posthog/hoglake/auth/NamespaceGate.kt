@@ -76,8 +76,10 @@ fun Application.installNamespaceGate(selector: CatalogStoreSelector) {
         // A mount (export) resolves here as it does on the handler, cached
         // per request; its isolation is ReadScope in the scan, not
         // containment, so the gate lets every namespace through (plan row
-        // 1.3h: "calls resolve and skips containment for an export").
-        isExport = { call, catalog -> selector.resolve(call, catalog) is CatalogBinding.Mount },
+        // 1.3h: "calls resolve and skips containment for an export"). A
+        // mount Client's remote binding is the same case one hop early:
+        // the Client holds no namespaces, and the Host scopes the read.
+        isExport = { call, catalog -> selector.resolve(call, catalog) !is CatalogBinding.Local },
     )
 }
 
