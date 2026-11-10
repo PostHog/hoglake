@@ -27,6 +27,9 @@ private val log = KotlinLogging.logger("com.posthog.hoglake.api.ErrorMapping")
  * - ReadOnlyCatalog     -> 403 `read_only_catalog` (any non-read route on a mount)
  * - MountOperationUnavailable -> 501 `mount_operation_unavailable`
  * - MountRevisionConflict -> 409 `mount_revision_conflict` (a stale mount write)
+ * - MountScanTooManyFiles -> 422 `mount_scan_too_many_files` (scoped scan over the file budget)
+ * - MountScanTimeout    -> 503 `mount_scan_timeout` + Retry-After (scoped scan past the deadline)
+ * - MountScanBusy       -> 503 `mount_scan_busy` + Retry-After (export-scan concurrency cap full)
  * - AlreadyExists       -> 409
  * - CommitConflict      -> 409
  * - OffsetRegression    -> 409
@@ -89,6 +92,12 @@ internal fun errorBody(cause: HoglakeException): Pair<HttpStatusCode, ApiErrorDt
             HttpStatusCode.NotImplemented to apiError("mount_operation_unavailable", cause)
         is HoglakeException.MountRevisionConflict ->
             HttpStatusCode.Conflict to apiError("mount_revision_conflict", cause)
+        is HoglakeException.MountScanTooManyFiles ->
+            HttpStatusCode.UnprocessableEntity to apiError("mount_scan_too_many_files", cause)
+        is HoglakeException.MountScanTimeout ->
+            HttpStatusCode.ServiceUnavailable to apiError("mount_scan_timeout", cause)
+        is HoglakeException.MountScanBusy ->
+            HttpStatusCode.ServiceUnavailable to apiError("mount_scan_busy", cause)
         is HoglakeException.BackendResultTooLarge ->
             HttpStatusCode.UnprocessableEntity to apiError("backend_result_too_large", cause)
         is HoglakeException.BackendQueryTimeout ->
@@ -186,6 +195,8 @@ fun StatusPagesConfig.installErrorMapping() {
         val (status, body) = errorBody(cause)
         if (cause is HoglakeException.CommitQueueTimeout ||
             cause is HoglakeException.BackendUnavailable ||
+            cause is HoglakeException.MountScanTimeout ||
+            cause is HoglakeException.MountScanBusy ||
             cause is PartitionLookupUnavailable
         ) {
             call.response.headers.append(HttpHeaders.RetryAfter, RETRY_AFTER_SECONDS)

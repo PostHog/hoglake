@@ -63,6 +63,30 @@ object Metrics {
         private val lockHold = ConcurrentHashMap<Pair<String, String>, Timer>()
         private val lockWaiting = ConcurrentHashMap<String, AtomicInteger>()
         private val lockHeld = ConcurrentHashMap<String, AtomicInteger>()
+        private val mountScan = ConcurrentHashMap<String, Timer>()
+        private val mountScanInFlight = ConcurrentHashMap<String, AtomicInteger>()
+
+        fun mountScan(catalog: String): Timer =
+            mountScan.computeIfAbsent(catalog) { name ->
+                Timer.builder("hoglake_mount_scans")
+                    .description("Per-mount scoped scan latency, grant of the shared cap to the served plan")
+                    .tag("catalog", name)
+                    .publishPercentileHistogram()
+                    // A whale org's cold scan is minutes, which the default 30 s ceiling would fold into +Inf.
+                    .maximumExpectedValue(Duration.ofMinutes(10))
+                    .register(registry)
+            }
+
+        fun mountScanInFlight(catalog: String): AtomicInteger =
+            mountScanInFlight.computeIfAbsent(catalog) { name ->
+                AtomicInteger().also { n ->
+                    Gauge.builder("hoglake_mount_scans_in_flight", n) { it.get().toDouble() }
+                        .description("Scoped scans of this mount in flight on this process right now")
+                        .tag("catalog", name)
+                        .strongReference(true)
+                        .register(registry)
+                }
+            }
 
         fun commitLockHold(
             catalog: String,
@@ -854,6 +878,31 @@ object Metrics {
         catalog: String,
         reason: String,
     ) = increment("hoglake_mount_refusals_total", 1.0, "catalog", catalog, "reason", reason)
+
+    /**
+     * hoglake_mount_scans_total{catalog} and the hoglake_mount_scans_seconds
+     * histogram (plan row 1.3h): one count and one timing per scoped scan
+     * the mount SERVED, recorded after the plan is in hand (a refused scan
+     * is on [mountRefused] instead). [nanos] is measured from the grant of
+     * the shared concurrency cap, so it includes the SQL but not the wait
+     * for the cap. `catalog` is the mount name, an opaque id.
+     */
+    fun mountScanServed(
+        catalog: String,
+        nanos: Long,
+    ) {
+        increment("hoglake_mount_scans_total", 1.0, "catalog", catalog)
+        timers?.mountScan(catalog)?.record(nanos, TimeUnit.NANOSECONDS)
+    }
+
+    /**
+     * `hoglake_mount_scans_in_flight{catalog}` gauge (plan row 1.3h): the
+     * counter behind it, or null with no registry bound. The CALLER
+     * increments on grant and decrements in a `finally`, holding the one
+     * instance across both so a registry rebound between them cannot
+     * decrement a fresh counter below zero (as [commitLockWaiting] does).
+     */
+    fun mountScanInFlight(catalog: String): AtomicInteger? = timers?.mountScanInFlight(catalog)
 
     /**
      * hoglake_auth_signing_keys — keys the token verifier holds right now.

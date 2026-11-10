@@ -49,6 +49,7 @@ import com.posthog.hoglake.service.UploadService
 import com.posthog.hoglake.service.ViewService
 import com.posthog.hoglake.store.CatalogStore
 import com.posthog.hoglake.store.CatalogStoreSelector
+import com.posthog.hoglake.store.MountReadService
 import com.posthog.hoglake.store.MountRegistry
 import com.posthog.hoglake.store.MountStore
 import com.posthog.hoglake.store.PostgresCatalogStore
@@ -145,6 +146,23 @@ class App private constructor(
             MountRegistry.behindSwitch(MountRegistry.postgresSwitch { jdbi }, mountRegistry ?: mountStore),
         )
     }
+
+    /** The mount (export) read surface (plan row 1.3h): the five scoped read routes over the pinned source table. */
+    private val mountReadService by lazy {
+        MountReadService(
+            jdbi,
+            { catalogStore },
+            sourceCatalog = cfg.mountSourceCatalog,
+            sourceTableUuid = cfg.mountSourceTableUuidOrNull,
+            sourceFieldId = cfg.mountSourceFieldIdOrNull,
+            fileBudget = cfg.mountScanFileBudget,
+            scanDeadlineMs = cfg.mountScanDeadlineMs,
+            maxConcurrentScans = cfg.mountScanMaxConcurrent,
+        )
+    }
+
+    /** The mount read service, for tests that drive its cap and deadline directly. */
+    internal val mountReadServiceForTest get() = mountReadService
 
     private val partitionLookupService by lazy {
         PartitionLookupService(jdbi)
@@ -554,6 +572,10 @@ class App private constructor(
             instanceTotals = { if (postgresReady()) catalogMetrics.latestTotals else null },
             catalogTotals = { if (postgresReady()) catalogMetrics.latestByCatalog else emptyMap() },
             uiTheme = cfg.uiTheme,
+            // A provider, not the instance: forcing the lazy here would open
+            // PG at wiring time and break the PG-free / lazy-boot paths. It is
+            // built only when a mount actually resolves (PG is the default then).
+            mountRead = { mountReadService },
         )
         app.installTableCreationRoutes(
             { tableCreationService },
@@ -564,7 +586,7 @@ class App private constructor(
             selector = catalogSelector,
         )
         app.installAlterRoutes({ alterService }, selector = catalogSelector)
-        app.installScanRoutes(catalogSelector)
+        app.installScanRoutes(catalogSelector, { mountReadService })
         app.installViewRoutes({ viewService }, selector = catalogSelector)
         app.installMaintenanceRoutes(
             { optionsService },

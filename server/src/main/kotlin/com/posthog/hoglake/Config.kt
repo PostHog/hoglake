@@ -29,6 +29,44 @@ data class Config(
      * none, so a mount that resolves answers 500 rather than a catalog.
      */
     val mountSourceCatalog: String = env("HOGLAKE_MOUNT_SOURCE_CATALOG", ""),
+    /**
+     * The one table every mount reads, pinned by its `table_uuid` (#291
+     * decision 3; hoglake#557's `hog_mount` stores no source table). Empty
+     * (the default): no table pinned, so a mount's read routes answer 500.
+     * The reader resolves the uuid to its live (namespace, name) per request,
+     * so a drop/recreate of the source needs a new value here.
+     */
+    val mountSourceTableUuid: String = env("HOGLAKE_MOUNT_SOURCE_TABLE_UUID", ""),
+    /**
+     * The field id of the mount's source (partition) field — `team_id` —
+     * that `ReadScope` (1.2) scopes on and that each scanned file carries.
+     * Empty (the default): unset, so a mount's read routes answer 500.
+     */
+    val mountSourceFieldId: String = env("HOGLAKE_MOUNT_SOURCE_FIELD_ID", ""),
+    /**
+     * The most files one mount scan's scoped plan may return before it is
+     * refused with 422 `mount_scan_too_many_files` (plan row 1.3h / M10):
+     * a whale org's cold scan is bounded rather than allowed to build an
+     * unbounded result in memory. The scope is the token's, so a caller
+     * cannot narrow it; this is a Host protection.
+     */
+    val mountScanFileBudget: Int = env("HOGLAKE_MOUNT_SCAN_FILE_BUDGET", "2000000").toInt(),
+    /**
+     * The deadline (ms) one mount scan's SQL may run before it is refused
+     * with 503 `mount_scan_timeout` (`SET LOCAL statement_timeout`); 0
+     * disables it. This bounds the time, the file budget the returned rows;
+     * the Postgres InitPlan array ReadScope collects is bounded by neither.
+     */
+    val mountScanDeadlineMs: Long = env("HOGLAKE_MOUNT_SCAN_DEADLINE_MS", "60000").toLong(),
+    /**
+     * The one shared cap over ALL export (mount) scans in flight, on the
+     * scan route only (plan row 1.3h, 1.6's deferred cap): a non-blocking
+     * `tryAcquire` answers 503 `mount_scan_busy` when it is full, so Trino
+     * reads cannot starve ingest writers on the shared request dispatcher.
+     * Org fairness comes from Trino resource groups, not from this cap
+     * (user, 2026-11-09). 0 disables the cap.
+     */
+    val mountScanMaxConcurrent: Int = env("HOGLAKE_MOUNT_SCAN_MAX_CONCURRENT", "8").toInt(),
     val port: Int = env("HOGLAKE_PORT", "8080").toInt(),
     /**
      * The infra listener's port (docs/auth-tenancy.md §6.7): `GET /metrics`
@@ -1307,9 +1345,27 @@ data class Config(
     fun mountAdmitted(name: String): Boolean =
         MountNames.isReserved(name) && ("*" in mountAllowlist || name.removeSuffix("-events") in mountAllowlist)
 
+    /** The pinned source [table_uuid][mountSourceTableUuid], or null when unset. */
+    val mountSourceTableUuidOrNull: UUID? = mountSourceTableUuid.takeIf { it.isNotBlank() }?.let(UUID::fromString)
+
+    /** The pinned source [field id][mountSourceFieldId], or null when unset. */
+    val mountSourceFieldIdOrNull: Long? = mountSourceFieldId.takeIf { it.isNotBlank() }?.toLong()
+
     init {
         require(mountAllowlist.all { it == "*" || MountNames.isReserved("$it-events") }) {
             "HOGLAKE_MOUNT_ALLOWLIST takes org ids (canonical lowercase UUIDs) or *, got $mountAllowlist"
+        }
+        // Parsed eagerly so a malformed pin fails at boot, not on the first scan.
+        require(mountSourceTableUuid.isBlank() || mountSourceTableUuidOrNull != null) {
+            "HOGLAKE_MOUNT_SOURCE_TABLE_UUID must be a UUID, got '$mountSourceTableUuid'"
+        }
+        require(mountSourceFieldId.isBlank() || (mountSourceFieldIdOrNull?.let { it >= 0 } == true)) {
+            "HOGLAKE_MOUNT_SOURCE_FIELD_ID must be a non-negative integer, got '$mountSourceFieldId'"
+        }
+        require(mountScanFileBudget >= 1) { "HOGLAKE_MOUNT_SCAN_FILE_BUDGET must be >= 1, got $mountScanFileBudget" }
+        require(mountScanDeadlineMs >= 0) { "HOGLAKE_MOUNT_SCAN_DEADLINE_MS must be >= 0, got $mountScanDeadlineMs" }
+        require(mountScanMaxConcurrent >= 0) {
+            "HOGLAKE_MOUNT_SCAN_MAX_CONCURRENT must be >= 0, got $mountScanMaxConcurrent"
         }
         if (defaultBackend == "none" && postgresBackendId.isNotEmpty()) {
             require(jdbcUrl.isNotBlank()) { "HOGLAKE_JDBC_URL is required for a PostgreSQL backend" }

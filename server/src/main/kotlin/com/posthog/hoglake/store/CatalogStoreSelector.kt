@@ -33,6 +33,14 @@ class CatalogStoreSelector(
     private val requestStore = AttributeKey<HogliteCatalogStore>("HoglakeCatalogStore")
 
     /**
+     * The binding resolved for this request's `{catalog}`, cached so the
+     * namespace gate and the handler resolve a mount once (plan row 1.3h:
+     * "cache the binding per request"). A request names one catalog, so a
+     * single entry suffices; only a successful resolution is cached.
+     */
+    private val boundCatalog = AttributeKey<Pair<String, CatalogBinding>>("HoglakeCatalogBinding")
+
+    /**
      * Return one request-scoped hoglite store, or the process's PostgreSQL
      * singleton. Every catalog route calls this before any service or body
      * work, so a mount is refused here on every route it has no reader for.
@@ -51,11 +59,16 @@ class CatalogStoreSelector(
         call: ApplicationCall,
         catalog: String,
     ): CatalogBinding {
-        mount(call, catalog)?.let { return it }
-        val routing = call.hoglakeAuth.callerOrNull?.routing
-        return CatalogBinding.Local(
-            if (routing != null && routing.catalog == catalog) routed(call, routing) else fallback(catalog),
-        )
+        call.attributes.getOrNull(boundCatalog)?.let { (name, binding) -> if (name == catalog) return binding }
+        val binding =
+            mount(call, catalog) ?: run {
+                val routing = call.hoglakeAuth.callerOrNull?.routing
+                CatalogBinding.Local(
+                    if (routing != null && routing.catalog == catalog) routed(call, routing) else fallback(catalog),
+                )
+            }
+        call.attributes.put(boundCatalog, catalog to binding)
+        return binding
     }
 
     /** A mount reads this process's PostgreSQL, so it exists only where PostgreSQL is the default. */
