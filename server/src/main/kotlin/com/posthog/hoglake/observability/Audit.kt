@@ -170,6 +170,7 @@ object Audit {
             // "conflict" would be the same as having no arm.
             is HoglakeException.DdlSinceReadSnapshot -> "ddl_since_read_snapshot"
             is HoglakeException.TableRecreated -> "table_recreated"
+            is HoglakeException.PartitionSpecMismatch -> "partition_spec_mismatch"
             is HoglakeException.CommitConflict -> "conflict"
             is HoglakeException.MountRevisionConflict -> "conflict"
             is HoglakeException.OffsetRegression -> "regression"

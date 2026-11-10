@@ -3055,6 +3055,133 @@ paths:
         "503":
           description: Commit admission timed out; retry the identical request
 
+  /catalogs/{catalog}/commit/replacements/prepared:
+    post:
+      operationId: commitPreparedReplacement
+      summary: Atomically end whole live data files of a table and append their replacements in one snapshot
+      description: >
+        Requires atomic-partition-replacement-v1, which a server that lacks
+        answers with 404 for this path. A dedicated endpoint, so an older
+        server never ignores `file_ends` and publishes only the appends.
+
+
+        Ends the live data files of a table, each with its live deletion
+        vector, and applies `appends` in the same snapshot: a reader at an
+        earlier snapshot sees the old files, a reader at this one sees only
+        the new ones, and none sees a day missing or doubled. Nothing is
+        deleted at commit; ended files follow the ordinary retention,
+        expiry and cleanup.
+
+
+        Requires idempotency_key, read_snapshot, author, message and
+        `file_ends`; refused with 400 when `deletes` or
+        `require_unchanged_tables: true` is present. `appends` may be empty,
+        which only ends files. Each `file_ends` entry names a table with its
+        `expected_table_uuid` and exactly one of `partitions` (non-empty
+        tuples, each as long as the live partition spec, in the encoding of
+        `partition_values`: a `day` transform is the days since the epoch as
+        a decimal string) or `all_files: true`. A tuple that matches no live
+        file ends nothing and is not an error. A table may appear in one
+        entry only. Files appended by this request are never ended by it.
+
+
+        A table named in `file_ends` must be unchanged since read_snapshot,
+        including inserts, deletes, ended files and DDL, or the request is a
+        409 `commit_conflict`: re-read, replan and send again. Compaction
+        does not conflict; it moves rows between files, and the files ended
+        are those live at commit. A compaction that planned against an ended
+        file skips it. The commit is recorded as `table_deleted_from` (and
+        `table_inserted_into` with appends) on the table, so guarded writers
+        that read before it conflict. A changefeed window that crosses it is
+        409 `reconciliation_required`, as it is for a truncate; a file ended
+        at the very snapshot of the retention floor is not detected.
+
+
+        Replay of the same key and request returns the original snapshot
+        without writing, and `GET /commit/receipts/{operation}` serves it; a
+        replay omits `ended_files`. A changed payload under the same key is
+        422.
+      parameters: [ { $ref: "#/components/parameters/catalog" } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - { $ref: "#/components/schemas/CommitRequest" }
+                - type: object
+                  required: [idempotency_key, read_snapshot, author, message, file_ends]
+                  properties:
+                    file_ends:
+                      type: array
+                      minItems: 1
+                      items: { $ref: "#/components/schemas/TableFileEnds" }
+      responses:
+        "200":
+          description: Committed, or the original result of an identical replay
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CommitResult" }
+        "400":
+          description: >
+            The body is malformed, or carries `deletes` or
+            `require_unchanged_tables: true`.
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: >
+            Conflict. `commit_conflict` is RETRYABLE: a data change landed on
+            a table named in file_ends since read_snapshot. Refresh
+            read_snapshot, replan and send again.
+
+
+            `ddl_since_read_snapshot` is NOT: DDL landed on a touched table
+            after read_snapshot. Re-prepare against current table info;
+            replaying this payload cannot succeed. The body names `tables`,
+            `read_snapshot` and `retry: re-prepare`.
+
+
+            `table_recreated` is the same family: an expected_table_uuid that
+            is not the live table's. The body names `tables` and
+            `retry: re-prepare`.
+
+
+            `partition_spec_mismatch`: the table still has live files written
+            under a partition spec other than the live one, so partitions
+            cannot address them. Rewrite or compact them, or end the files
+            with `all_files`. Not retryable as sent.
+
+
+            `table_dropped` likewise cannot be retried.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "410":
+          description: >
+            read_snapshot is below the catalog's expiry floor: its conflict
+            window is no longer retained. Re-read the table and prepare a new
+            request. Never a replay.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "422":
+          description: >
+            Invalid request: a missing key, read_snapshot, author or message;
+            file_ends that is empty, names a table twice, sets both or neither
+            of partitions and all_files, or has tuples that are empty, of
+            different lengths or not as long as the live spec; a key reused
+            with another payload.
+            `object_prefix_violation` when a touched table has the
+            object-prefix layout (Table.object_prefix_field) and an appended
+            data file is not under `<field>=<value>/` for its identity
+            partition value; the body names `tables` and
+            `retry: re-prepare`, because a payload written to the wrong
+            place cannot succeed on replay.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "503":
+          description: Commit admission timed out; retry the identical request
+
   /catalogs/{catalog}/commit:
     post:
       operationId: commit
@@ -3819,7 +3946,7 @@ components:
       properties:
         name: { type: string }
         data_path: { type: string }
-        capabilities: { type: array, items: { type: string }, description: "Includes atomic-table-creation-v1, idempotent-append-v1, idempotent-delete-v1, idempotent-mutation-v1, guarded-table-lifecycle-v1, atomic-table-replacement-v1 guarded-schema-evolution-v1 recursive-write-schema-v1 atomic-partitioned-table-creation-v1 atomic-sorted-table-creation-v1 and versioned-table-metadata-v1 and claimed-uploads-v1 and atomic-dml-transactions-v1 and object-prefix-layout-v1 when supported. Each gates a write, so a mount (read_only) lists none." }
+        capabilities: { type: array, items: { type: string }, description: "Includes atomic-table-creation-v1, idempotent-append-v1, idempotent-delete-v1, idempotent-mutation-v1, guarded-table-lifecycle-v1, atomic-table-replacement-v1 guarded-schema-evolution-v1 recursive-write-schema-v1 atomic-partitioned-table-creation-v1 atomic-sorted-table-creation-v1 and versioned-table-metadata-v1 and claimed-uploads-v1 and atomic-dml-transactions-v1 and object-prefix-layout-v1 and atomic-partition-replacement-v1 when supported. Each gates a write, so a mount (read_only) lists none." }
         read_only:
           type: boolean
           description: >
@@ -4557,6 +4684,35 @@ components:
         author: { type: string }
         message: { type: string }
 
+    TableFileEnds:
+      type: object
+      required: [namespace, table, expected_table_uuid]
+      description: >
+        The live data files of one table that a replacement ends. Exactly one
+        of `partitions` and `all_files: true`.
+      properties:
+        namespace: { type: string }
+        table: { type: string }
+        expected_table_uuid:
+          type: string
+          format: uuid
+          description: Required. A mismatch is 409 `table_recreated`.
+        partitions:
+          type: array
+          minItems: 1
+          description: >
+            Partition tuples whose live files are ended. Each tuple has one
+            value per field of the live partition spec, in the encoding of
+            FileRegistration.partition_values (null is a null value). A tuple
+            that matches no live file ends nothing.
+          items:
+            type: array
+            items: { type: string, nullable: true }
+        all_files:
+          type: boolean
+          default: false
+          description: End every live data file of the table, whatever its spec.
+
     DeleteFileRegistration:
       type: object
       required: [data_file_id, path, delete_count, file_size_bytes]
@@ -4814,6 +4970,13 @@ components:
       properties:
         snapshot_id: { type: integer, format: int64 }
         schema_version: { type: integer, format: int64 }
+        ended_files:
+          type: integer
+          format: int64
+          description: >
+            Only on POST /commit/replacements/prepared: the data files the
+            commit ended, summed over its tables. Omitted on every other
+            endpoint and on a replay.
 
     DataFile:
       type: object

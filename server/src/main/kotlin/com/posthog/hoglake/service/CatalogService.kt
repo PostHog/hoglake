@@ -1614,7 +1614,8 @@ class CatalogService(private val jdbi: Jdbi) {
                         "table '$namespace.$table' in catalog '$catalog' at snapshot $to",
                     )
             // TRUNCATE and replacement have no newly registered DV to carry its deletion through this
-            // append-oriented feed. The paired change kinds identify its DDL barrier.
+            // append-oriented feed. The paired change kinds identify its DDL barrier; a file-ending
+            // replacement is identified by the files it ended.
             val truncated =
                 h.createQuery(
                     """
@@ -1622,10 +1623,19 @@ class CatalogService(private val jdbi: Jdbi) {
                     WHERE c.catalog_id = :catalogId AND c.object_id = :tableId
                       AND c.kind = 'table_deleted_from'
                       AND c.snapshot_id > :fromSnapshot AND c.snapshot_id <= :toSnapshot
-                      AND EXISTS (
-                        SELECT 1 FROM hog_snapshot_change ddl
-                        WHERE ddl.catalog_id = c.catalog_id AND ddl.object_id = c.object_id
-                          AND ddl.snapshot_id = c.snapshot_id AND ddl.kind = 'table_altered')
+                      AND (
+                        EXISTS (
+                          SELECT 1 FROM hog_snapshot_change ddl
+                          WHERE ddl.catalog_id = c.catalog_id AND ddl.object_id = c.object_id
+                            AND ddl.snapshot_id = c.snapshot_id AND ddl.kind = 'table_altered')
+                        -- A replacement ends whole files and registers no deletion
+                        -- vector, so its 'table_deleted_from' is the only trace.
+                        -- Retention can reclaim a row ended AT the floor snapshot,
+                        -- so that one snapshot of the window is not covered.
+                        OR EXISTS (
+                          SELECT 1 FROM hog_data_file f
+                          WHERE f.catalog_id = c.catalog_id AND f.table_id = c.object_id
+                            AND f.end_snapshot = c.snapshot_id))
                     ORDER BY c.snapshot_id LIMIT 1
                     """,
                 ).bind("catalogId", cat.catalogId)

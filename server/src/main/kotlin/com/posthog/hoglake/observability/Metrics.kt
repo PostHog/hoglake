@@ -1109,6 +1109,7 @@ object Metrics {
             // would be indistinguishable from having no arm at all.
             is HoglakeException.DdlSinceReadSnapshot -> "ddl_since_read_snapshot"
             is HoglakeException.TableRecreated -> "table_recreated"
+            is HoglakeException.PartitionSpecMismatch -> "partition_spec_mismatch"
             is HoglakeException.CommitConflict -> "conflict"
             is HoglakeException.Validation -> "validation"
             // Distinct, so "which writers still miss the object-prefix

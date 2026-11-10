@@ -2745,6 +2745,45 @@ with the same authenticated deployment boundary and catalog authorization as
 `/commit`; catalog scoping alone is not authentication. This change does not
 introduce an authentication framework or authorize any deployment.
 
+### Atomic partition replacement
+
+`atomic-partition-replacement-v1` adds `POST /v1/catalogs/{catalog}/commit/replacements/prepared`:
+the commit request plus `file_ends`, which ends whole live data files of a table
+and applies `appends` in **one snapshot** with the usual durable idempotency
+receipt (`GET /commit/receipts/{operation}` serves it). It is the commit a
+day-at-a-time backfill needs: a reader at the old snapshot sees the old day, a
+reader at the new one sees only the replacement, and none sees a day missing or
+doubled. It is a dedicated endpoint so an older server answers 404 instead of
+ignoring `file_ends` and publishing only the appends.
+
+Each `file_ends` entry names a table with its required `expected_table_uuid` and
+exactly one of `partitions` (non-empty tuples, as long as the live partition spec
+and spelled as `partition_values` are, so a `day` transform is the days since the
+epoch as a decimal string) or `all_files: true`. A tuple that matches no live
+file ends nothing and is not an error. The request needs `idempotency_key`,
+`read_snapshot`, `author` and `message`, and is refused with 400 when `deletes` or
+`require_unchanged_tables` is present. `appends` may be empty. The response is the
+commit result plus `ended_files`, the data files ended; a replay omits it.
+
+Under the commit lock the server checks the incarnation, then the conflict window
+(a table named in `file_ends` must be unchanged since `read_snapshot`, as a delete
+target is: inserts, deletes, ends and DDL conflict; **compaction does not**, since
+the files ended are those live at commit and a compaction planned against one
+skips it), then that no live file of the table was written under another partition
+spec (409 `partition_spec_mismatch`; `all_files` is exempt), then ends every
+matching live file and its live deletion vector, then appends. Files appended by
+the request are never ended by it. Nothing is deleted: ended files follow the
+normal retention, expiry and cleanup, as a truncate's do. The commit records
+`table_deleted_from` (and `table_inserted_into` with appends) on each table, which
+is what makes guarded writers that read earlier conflict. A changefeed window that
+crosses it is 409 `reconciliation_required`, as for a truncate; a file ended at
+exactly the retention floor's snapshot is not detected, because its row may already
+be reclaimed.
+
+Partition tuples are matched through the `(key_index, value)` lookup index on the
+first key, then compared in full. The spec-mismatch probe stops at the first
+offending live file but reads every live file of the table when there is none.
+
 ### Atomic DML transaction publication
 
 `atomic-dml-transactions-v1` adds `POST /v1/catalogs/{catalog}/commit/transaction`.

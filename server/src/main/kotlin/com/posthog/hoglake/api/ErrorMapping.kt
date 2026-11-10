@@ -48,6 +48,8 @@ private val log = KotlinLogging.logger("com.posthog.hoglake.api.ErrorMapping")
  * - TableRecreated      -> 409 `table_recreated` (the expected
  *                          table_uuid is not the live one), same
  *                          `retry: re-prepare` family
+ * - PartitionSpecMismatch -> 409 `partition_spec_mismatch` (a partition-based
+ *                          file end on a table with live files under another spec)
  * - DdlSinceReadSnapshot -> 409 `ddl_since_read_snapshot`, the fullest
  *                          re-prepare body: it also names `tables`,
  *                          `read_snapshot` and `retry: re-prepare`,
@@ -152,6 +154,10 @@ internal fun errorBody(cause: HoglakeException): Pair<HttpStatusCode, ApiErrorDt
                     tables = listOf(cause.table),
                     retry = RETRY_RE_PREPARE,
                 )
+        // The table still has live files under another partition spec, so a
+        // partition tuple cannot address them; not retryable as sent.
+        is HoglakeException.PartitionSpecMismatch ->
+            HttpStatusCode.Conflict to apiError("partition_spec_mismatch", cause)
         // AFTER its subclass above: DdlSinceReadSnapshot IS a
         // CommitConflict (so an isinstance-ladder client keeps working),
         // and a `when` would otherwise answer the base code for it.

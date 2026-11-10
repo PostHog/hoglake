@@ -1692,9 +1692,12 @@ class HogliteCatalogStore(
                 queryCatalog(
                     catalog,
                     "SELECT c.snapshot_id FROM changes c WHERE c.object_id = ? AND c.kind = 'table_deleted_from' " +
-                        "AND c.snapshot_id > ? AND c.snapshot_id <= ? AND EXISTS (" +
+                        "AND c.snapshot_id > ? AND c.snapshot_id <= ? AND (EXISTS (" +
                         "SELECT 1 FROM changes d WHERE d.object_id = c.object_id " +
                         "AND d.snapshot_id = c.snapshot_id AND d.kind = 'table_altered') " +
+                        // A replacement ends whole files and registers no DV: the files it ended are its trace.
+                        "OR EXISTS (SELECT 1 FROM files ended WHERE ended.table_id = c.object_id " +
+                        "AND ended.end_snapshot = c.snapshot_id)) " +
                         "ORDER BY c.snapshot_id LIMIT 1",
                     t.tableId,
                     fromSnapshot,

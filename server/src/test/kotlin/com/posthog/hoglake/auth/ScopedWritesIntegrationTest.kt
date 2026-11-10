@@ -152,7 +152,7 @@ class ScopedWritesIntegrationTest {
 
     private val commitRoutes =
         listOf("/commit", "/commit/prepared", "/commit/deletes/prepared", "/commit/mutations/prepared")
-            .plus(listOf("/commit/transaction", "/commit/uploads"))
+            .plus(listOf("/commit/transaction", "/commit/uploads", "/commit/replacements/prepared"))
 
     @Test
     fun `path-named writes follow the namespace's value`() {
@@ -224,6 +224,40 @@ class ScopedWritesIntegrationTest {
             // A tenant is unaffected.
             assertThat(call(port, tenant(), "POST", "/commit", """{"appends":[${append("main")}]}""").statusCode())
                 .isEqualTo(200)
+        }
+    }
+
+    @Test
+    fun `a replacement is held to the namespaces whose files it ends`() {
+        withServer(AuthMode.ENFORCE) { port ->
+            val token = scoped()
+            val route = "/commit/replacements/prepared"
+
+            fun ends(ns: String) =
+                """{"namespace":"$ns","table":"t","expected_table_uuid":"${tableUuid(ns)}","all_files":true}"""
+
+            fun replacement(
+                vararg ns: String,
+                appends: String = "",
+            ) = """{"read_snapshot":1,"message":"m","idempotency_key":"${UUID.randomUUID()}",""" +
+                appends + """"file_ends":[${ns.joinToString(",") { ends(it) }}]}"""
+            // Ending files is a write to the namespace, even with no append naming it.
+            for (ns in listOf("team_7", "team_9", "main")) {
+                assertMissing(call(port, token, "POST", route, replacement(ns), pattern = route), "ends $ns")
+                assertMissing(call(port, token, "POST", route, replacement("team_42", ns)), "ends team_42+$ns")
+                val appended = """"appends":[${append("team_42", tableUuid("team_42"))}],"""
+                assertMissing(call(port, token, "POST", route, replacement(ns, appends = appended)), "append+ends $ns")
+            }
+            // Its own namespace works, and a tenant is unaffected.
+            val head = catalogs.getCatalog(cat).headSnapshotId
+            val own = replacement("team_42").replace("\"read_snapshot\":1", "\"read_snapshot\":$head")
+            val done = call(port, token, "POST", route, own)
+            assertThat(done.statusCode()).describedAs(done.body()).isEqualTo(200)
+            assertThat(json.readTree(done.body()).path("ended_files").asLong()).isGreaterThanOrEqualTo(0)
+            val headNow = catalogs.getCatalog(cat).headSnapshotId
+            val tenantBody = replacement("main").replace("\"read_snapshot\":1", "\"read_snapshot\":$headNow")
+            val tenantDone = call(port, tenant(), "POST", route, tenantBody)
+            assertThat(tenantDone.statusCode()).describedAs(tenantDone.body()).isEqualTo(200)
         }
     }
 

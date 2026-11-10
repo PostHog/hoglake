@@ -586,6 +586,27 @@ fun Application.installApiRoutes(
                     )
                 }
 
+                // Ends whole live files and appends in ONE snapshot. A dedicated
+                // endpoint, so an older server answers 404 instead of ignoring
+                // `file_ends` and publishing only the appends (a doubled day).
+                post("/commit/replacements/prepared") {
+                    val commits = selector.forCatalog(call, call.catalog())
+                    val req = call.receiveReplacement()
+                    if (req.deletes.isNotEmpty() || req.requireUnchangedTables == true) {
+                        throw BadRequestException(
+                            "a replacement cannot carry deletes or require_unchanged_tables",
+                        )
+                    }
+                    if (req.idempotencyKey == null || req.readSnapshot == null || req.fileEnds.isNullOrEmpty()) {
+                        throw com.posthog.hoglake.model.HoglakeException.Validation(
+                            "a replacement requires idempotency_key, read_snapshot and file_ends",
+                        )
+                    }
+                    call.respond(
+                        commits.commit(call.catalog(), req.toModel(), call.request.userAgent()).toDto(),
+                    )
+                }
+
                 // Distinct endpoint fences replicas that predate the DELETE contract.
                 post("/commit/deletes/prepared") {
                     val commits = selector.forCatalog(call, call.catalog())
@@ -1083,6 +1104,19 @@ internal fun parseExpectedTableUuid(raw: String): UUID =
 internal suspend fun ApplicationCall.receiveCommit(): CommitRequestDto =
     receive<CommitRequestDto>().attributed(hoglakeAuth).also { req ->
         requireScopedNamespaces(catalog(), req.appends.map { it.namespace } + req.deletes.map { it.namespace })
+    }
+
+/**
+ * A replacement's body, attributed and held to a scoped caller's namespaces:
+ * the namespaces of its appends AND of the tables whose files it ends.
+ */
+internal suspend fun ApplicationCall.receiveReplacement(): ReplacementRequestDto =
+    receive<ReplacementRequestDto>().let { it.copy(author = resolveActor(hoglakeAuth, it.author)) }.also { req ->
+        requireScopedNamespaces(
+            catalog(),
+            req.appends.map { it.namespace } + req.deletes.map { it.namespace } +
+                req.fileEnds.orEmpty().map { it.namespace },
+        )
     }
 
 internal fun CommitRequestDto.attributed(auth: AuthState): CommitRequestDto = copy(author = resolveActor(auth, author))

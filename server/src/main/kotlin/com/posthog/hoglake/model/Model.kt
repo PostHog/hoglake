@@ -1319,11 +1319,42 @@ data class CommitRequest(
     val requireUnchangedTables: Boolean = false,
     @get:com.fasterxml.jackson.annotation.JsonInclude(com.fasterxml.jackson.annotation.JsonInclude.Include.NON_DEFAULT)
     val allowPendingDeletes: Boolean = false,
+    /**
+     * Whole live data files to end in the same snapshot as [appends]
+     * (`POST /commit/replacements/prepared` only). LAST, and nullable, so a
+     * request without it serializes exactly as before: the receipt
+     * fingerprint is a persisted format (see COMMIT_FINGERPRINT_VERSION),
+     * and a property declared earlier or a non-null default would change
+     * every existing key's digest.
+     */
+    val fileEnds: List<TableFileEnds>? = null,
+)
+
+/**
+ * The live data files of one table a replacement ends: those whose
+ * partition tuple is in [partitions], or every live file when [allFiles].
+ * Exactly one of the two is set; [CommitService] and the hoglite commit
+ * enforce it, as they enforce every other shape rule of a request.
+ *
+ * A tuple holds one value per field of the live partition spec, in the
+ * encoding of [FileRegistration.partitionValues] (a `day` transform is the
+ * days since the epoch as a decimal string; null is a null partition
+ * value). A tuple that matches no live file ends nothing and is not an
+ * error. [expectedTableUuid] is required: ending files is never blind.
+ */
+data class TableFileEnds(
+    val namespace: String,
+    val table: String,
+    val expectedTableUuid: UUID,
+    val partitions: List<List<String?>>? = null,
+    val allFiles: Boolean = false,
 )
 
 data class CommitResult(
     val snapshotId: Long,
     val schemaVersion: Long,
+    /** Data files ended by a replacement; null on every other commit, and on a replay of one. */
+    val endedFiles: Long? = null,
 )
 
 data class ConsumerOffset(
@@ -2637,6 +2668,16 @@ sealed class HoglakeException(message: String) : RuntimeException(message) {
 
     /** A changefeed window crosses a deletion it cannot represent; never blindly retry or skip it. */
     class ReconciliationRequired(detail: String) : HoglakeException(detail)
+
+    /**
+     * A partition-based file end on a table that still has live files
+     * written under another partition spec -> HTTP 409
+     * `partition_spec_mismatch`. A tuple means different things under
+     * different specs, so the ends cannot be addressed by partition;
+     * `all_files` still works. Not retryable as sent: the table has to be
+     * compacted or rewritten onto the live spec first.
+     */
+    class PartitionSpecMismatch(detail: String) : HoglakeException(detail)
 
     /**
      * OPEN, for [DdlSinceReadSnapshot] alone. Subclassing is what keeps
