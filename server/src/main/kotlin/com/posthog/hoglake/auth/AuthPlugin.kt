@@ -411,6 +411,8 @@ private val CLIENT_CLASSES =
         "hedgerow" to "hedgerow",
         "duckdb" to "duckdb",
         "hogtower" to "hogtower",
+        // A mount Client forwarding a reader's request to its Host (store/MountHostClient.kt).
+        "hoglake-server" to "hoglake",
         "go-http-client" to "hogtower",
         "prometheus" to "prometheus",
         "kube-probe" to "probe",

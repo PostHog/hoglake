@@ -140,13 +140,19 @@ fun Application.installApiRoutes(
                 // A catalog a mount shadows answers as the mount on every
                 // route, so it is not listed. The caller's own mounts follow,
                 // unsorted: re-sorting could reorder the backend's listing.
-                val listed = catalogs.listCatalogs(visible)
-                val mounts = selector.mountsAmong(listed.map { it.name } + listing.mounts)
+                val listed = catalogs?.listCatalogs(visible).orEmpty()
+                val mounts = selector.mountsAmong(call, listed.map { it.name } + listing.mounts)
                 val local =
                     listed.filterNot { it.name in mounts }.map { it.toDto(if (scoped) null else totals[it.name]) }
                 val shown = listing.mounts.filter { it in mounts }
+                // A mount Client asks each host once, with the caller's
+                // token, and shows the entries the host returns for these
+                // names as the host wrote them.
+                val remote = if (shown.isEmpty()) null else selector.remoteCatalogs(call, shown)
                 if (shown.isEmpty()) {
                     call.respond(local)
+                } else if (remote != null) {
+                    call.respond<List<Any>>(local + remote)
                 } else {
                     val source = selector.mountSource()
                     call.respond(local + shown.map { source.toMountDto(it) })
@@ -172,6 +178,7 @@ fun Application.installApiRoutes(
                     when (val binding = selector.resolve(call, call.catalog())) {
                         is CatalogBinding.Local -> call.respond(binding.store.getCatalog(call.catalog()).toDto())
                         is CatalogBinding.Mount -> call.respond(selector.mountSource().toMountDto(binding.mount.name))
+                        is CatalogBinding.Remote -> binding.host.catalog(call, binding.name)
                     }
                 }
                 delete {
@@ -209,6 +216,7 @@ fun Application.installApiRoutes(
                                         call.instantQuery("at_timestamp"),
                                     ).map { it.toDto() },
                                 )
+                            is CatalogBinding.Remote -> binding.host.namespaces(call, binding.name)
                             is CatalogBinding.Local -> {
                                 val catalogs = binding.store
                                 // A scoped caller sees only the contained
@@ -253,6 +261,7 @@ fun Application.installApiRoutes(
                                         call.instantQuery("at_timestamp"),
                                     ).toDto(),
                                 )
+                            is CatalogBinding.Remote -> binding.host.namespace(call, binding.name, call.namespace())
                             is CatalogBinding.Local ->
                                 call.respond(binding.store.getNamespace(call.catalog(), call.namespace()).toDto())
                         }
@@ -310,6 +319,7 @@ fun Application.installApiRoutes(
                                             call.instantQuery("at_timestamp"),
                                         ).map { it.toDto() },
                                     )
+                                is CatalogBinding.Remote -> binding.host.tables(call, binding.name, call.namespace())
                                 is CatalogBinding.Local ->
                                     call.respond(
                                         binding.store.listTables(
@@ -350,6 +360,8 @@ fun Application.installApiRoutes(
                                                 call.instantQuery("at_timestamp"),
                                             ).toDto(),
                                         )
+                                    is CatalogBinding.Remote ->
+                                        binding.host.table(call, binding.name, call.namespace(), call.table())
                                     is CatalogBinding.Local ->
                                         call.respond(
                                             binding.store.getTable(
@@ -746,9 +758,15 @@ fun Application.installScanRoutes(
             // drop field 7's bounds and a second, misspelt `include` would
             // be ignored rather than refused.
             fun joined(name: String) = call.request.queryParameters.getAll(name)?.joinToString(",")
+            // A mount Client relays the request as it came (plan row 1.3c):
+            // the Host parses it, plans the scoped scan and applies its caps.
+            selector.remote(call, call.catalog())?.let { remote ->
+                return@get remote.host.scan(call, remote.name, call.namespace(), call.table())
+            }
             val request = parseScanRequest(joined("include"), joined("stats_fields"))
             val files =
                 when (val binding = selector.resolve(call, call.catalog())) {
+                    is CatalogBinding.Remote -> error("a remote binding is relayed before the scan is parsed")
                     is CatalogBinding.Local ->
                         binding.store.planScan(
                             call.catalog(),

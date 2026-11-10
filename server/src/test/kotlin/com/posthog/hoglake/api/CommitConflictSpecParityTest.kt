@@ -302,8 +302,12 @@ class CommitConflictSpecParityTest {
         val args =
             ctor.parameters.map { parameter ->
                 when (parameter.type.classifier) {
-                    String::class -> "detail"
+                    // MountHostRefused relays a host's own code: no arm of its
+                    // own to fall out of, so it gets a code no arm answers.
+                    String::class -> if (parameter.name == "code") "relayed_by_a_mount_host" else "detail"
                     Long::class -> 1L
+                    // MountHostRefused's relayed status.
+                    Int::class -> 503
                     java.util.UUID::class -> java.util.UUID.randomUUID()
                     List::class -> listOf("ns.t")
                     // CatalogNotEmpty's reason. One wire code for every
