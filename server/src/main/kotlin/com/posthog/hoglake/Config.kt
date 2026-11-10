@@ -4,6 +4,8 @@ import com.fasterxml.jackson.core.JsonParser
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.posthog.hoglake.hoglite.HogliteBackend
 import com.posthog.hoglake.store.BackendKind
+import com.posthog.hoglake.store.MountHost
+import com.posthog.hoglake.store.MountMatch
 import com.posthog.hoglake.store.MountNames
 import java.net.URI
 import java.nio.file.Files
@@ -67,6 +69,28 @@ data class Config(
      * (user, 2026-11-09). 0 disables the cap.
      */
     val mountScanMaxConcurrent: Int = env("HOGLAKE_MOUNT_SCAN_MAX_CONCURRENT", "8").toInt(),
+    /**
+     * Client mode (plan row 1.3c). Optional JSON file naming the remote
+     * hosts this server proxies mounts to, and which catalog names each one
+     * serves:
+     * {"hosts": [{"id": UUID, "match": {"type": "events"}, "kind": "hoglake",
+     * "url": HTTP_URL, "auth": "forward"}]}.
+     * `match` is {"type": "events"} (every mount name, `<orgID>-events`) or
+     * {"type": "catalog", "name": NAME} (one mount name). `kind` is what the
+     * host speaks (only `hoglake`), `auth` how this server authenticates to
+     * it (only `forward`: the caller's bearer token, unchanged). Optional
+     * keys: timeout_ms, max_response_bytes, max_concurrent. Entries contain
+     * endpoints, never credentials; each id must be unique and canonical,
+     * each URL a bare http(s) origin, and no name may match two entries.
+     *
+     * Empty (the default), or an empty list: no proxy, today's behaviour.
+     * With hosts, a request for a matched name is checked here as a mount
+     * reader's and then sent to that host and nowhere else. Refused at boot
+     * with [mountAllowlist] (a server is a Host or a Client), under
+     * `HOGLAKE_AUTH_MODE=off`, or without [authPredicateFields] (a mount
+     * serves only verified scoped tokens).
+     */
+    val mountHostsFile: String = env("HOGLAKE_MOUNT_HOSTS_FILE", ""),
     val port: Int = env("HOGLAKE_PORT", "8080").toInt(),
     /**
      * The infra listener's port (docs/auth-tenancy.md §6.7): `GET /metrics`
@@ -1351,6 +1375,9 @@ data class Config(
     /** The pinned source [field id][mountSourceFieldId], or null when unset. */
     val mountSourceFieldIdOrNull: Long? = mountSourceFieldId.takeIf { it.isNotBlank() }?.toLong()
 
+    /** The remote hosts of [mountHostsFile]; empty when this server is not a mount Client. */
+    val mountHosts: List<MountHost> = readMountHosts(mountHostsFile)
+
     init {
         require(mountAllowlist.all { it == "*" || MountNames.isReserved("$it-events") }) {
             "HOGLAKE_MOUNT_ALLOWLIST takes org ids (canonical lowercase UUIDs) or *, got $mountAllowlist"
@@ -1366,6 +1393,20 @@ data class Config(
         require(mountScanDeadlineMs >= 0) { "HOGLAKE_MOUNT_SCAN_DEADLINE_MS must be >= 0, got $mountScanDeadlineMs" }
         require(mountScanMaxConcurrent >= 0) {
             "HOGLAKE_MOUNT_SCAN_MAX_CONCURRENT must be >= 0, got $mountScanMaxConcurrent"
+        }
+        if (mountHosts.isNotEmpty()) {
+            require(mountAllowlist.isEmpty()) {
+                "HOGLAKE_MOUNT_HOSTS_FILE (this server is a mount Client) cannot be set with " +
+                    "HOGLAKE_MOUNT_ALLOWLIST (this server is a mount Host): a server is one or the other"
+            }
+            require(authMode.trim().lowercase() in setOf("warn", "enforce")) {
+                "HOGLAKE_MOUNT_HOSTS_FILE requires HOGLAKE_AUTH_MODE warn or enforce: " +
+                    "a mount serves only verified callers"
+            }
+            require(authPredicateFields.split(',').any { it.isNotBlank() }) {
+                "HOGLAKE_MOUNT_HOSTS_FILE requires HOGLAKE_AUTH_PREDICATE_FIELDS (the hosts' own): a mount serves " +
+                    "only scoped tokens, and none verifies without them"
+            }
         }
         if (defaultBackend == "none" && postgresBackendId.isNotEmpty()) {
             require(jdbcUrl.isNotBlank()) { "HOGLAKE_JDBC_URL is required for a PostgreSQL backend" }
@@ -1934,4 +1975,104 @@ private fun readBackends(file: String): Map<UUID, HogliteBackend> {
             )
     }
     return result
+}
+
+/**
+ * Parse HOGLAKE_MOUNT_HOSTS_FILE, as strictly as [readBackends] parses its
+ * file: an unknown key, kind, auth mode or matcher is refused, so a host
+ * this server cannot serve correctly never boots half-understood.
+ */
+private fun readMountHosts(file: String): List<MountHost> {
+    if (file.isBlank()) return emptyList()
+    val json = jacksonObjectMapper().enable(JsonParser.Feature.STRICT_DUPLICATE_DETECTION)
+    val root = Files.newBufferedReader(Path.of(file)).use { json.readTree(it) }
+    require(root != null && root.isObject && root.properties().map { it.key }.toSet() == setOf("hosts")) {
+        "HOGLAKE_MOUNT_HOSTS_FILE must contain only a hosts array"
+    }
+    val entries = root.get("hosts")
+    require(entries.isArray) { "hosts must be an array" }
+    val hosts = mutableListOf<MountHost>()
+    for (entry in entries) {
+        require(entry.isObject) { "mount host entry must be an object" }
+        val keys = setOf("id", "match", "kind", "url", "auth", "timeout_ms", "max_response_bytes", "max_concurrent")
+        require(entry.properties().all { it.key in keys }) { "mount host entry has unknown fields" }
+
+        fun text(
+            node: com.fasterxml.jackson.databind.JsonNode,
+            key: String,
+        ): String {
+            val value = node.get(key)
+            require(value != null && value.isTextual) { "mount host requires a string $key" }
+            return value.asText()
+        }
+
+        fun positive(
+            key: String,
+            default: Long,
+        ): Long {
+            val node = entry.get(key) ?: return default
+            require(node.isIntegralNumber && node.canConvertToLong() && node.asLong() > 0) {
+                "mount host $key must be positive"
+            }
+            return node.asLong()
+        }
+        val id =
+            try {
+                canonicalBackendId(text(entry, "id"))
+            } catch (_: IllegalArgumentException) {
+                throw IllegalArgumentException("mount host id must be a canonical lowercase UUID")
+            }
+        require(hosts.none { it.id == id }) { "duplicate mount host id" }
+        val matcher = entry.get("match")
+        require(matcher != null && matcher.isObject) { "mount host requires a match object" }
+        val match =
+            when (val type = text(matcher, "type")) {
+                "events" -> {
+                    require(matcher.size() == 1) { "an events match takes no other field" }
+                    MountMatch.Events
+                }
+                "catalog" -> {
+                    require(matcher.properties().map { it.key }.toSet() == setOf("type", "name")) {
+                        "a catalog match takes exactly a name"
+                    }
+                    MountMatch.Catalog(text(matcher, "name"))
+                }
+                else -> throw IllegalArgumentException("mount host match type must be events or catalog, got '$type'")
+            }
+        val kindText = text(entry, "kind")
+        val kind =
+            requireNotNull(MountHost.Kind.entries.firstOrNull { it.wire == kindText }) {
+                "mount host kind '$kindText' is not supported: only ${MountHost.Kind.entries.map { it.wire }}"
+            }
+        val authText = text(entry, "auth")
+        val auth =
+            requireNotNull(MountHost.Auth.entries.firstOrNull { it.wire == authText }) {
+                "mount host auth '$authText' is not supported: only ${MountHost.Auth.entries.map { it.wire }}"
+            }
+        val origin =
+            requireNotNull(MountHost.origin(text(entry, "url"))) {
+                "mount host url must be http(s)://host[:port], with no user-info, path, query or fragment"
+            }
+        val concurrent = positive("max_concurrent", MountHost.DEFAULT_MAX_CONCURRENT.toLong())
+        require(concurrent <= MountHost.MAX_CONCURRENT_CEILING) {
+            "mount host max_concurrent must be at most ${MountHost.MAX_CONCURRENT_CEILING}"
+        }
+        val timeout = positive("timeout_ms", MountHost.DEFAULT_TIMEOUT_MS)
+        require(timeout <= MountHost.TIMEOUT_CEILING_MS) {
+            "mount host timeout_ms must be at most ${MountHost.TIMEOUT_CEILING_MS}"
+        }
+        hosts +=
+            MountHost(
+                id = id,
+                match = match,
+                kind = kind,
+                origin = origin,
+                auth = auth,
+                timeoutMs = timeout,
+                maxResponseBytes = positive("max_response_bytes", MountHost.DEFAULT_MAX_RESPONSE_BYTES),
+                maxConcurrent = concurrent.toInt(),
+            )
+    }
+    MountHost.requireDisjoint(hosts)
+    return hosts
 }

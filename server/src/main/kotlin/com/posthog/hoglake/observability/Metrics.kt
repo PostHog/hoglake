@@ -77,6 +77,19 @@ object Metrics {
                     .register(registry)
             }
 
+        private val mountProxy = ConcurrentHashMap<String, Timer>()
+
+        fun mountProxy(catalog: String): Timer =
+            mountProxy.computeIfAbsent(catalog) { name ->
+                Timer.builder("hoglake_mount_proxy_requests")
+                    .description("Per-mount proxied request latency on a mount Client, send to the Host's last byte")
+                    .tag("catalog", name)
+                    .publishPercentileHistogram()
+                    // The Host's scan deadline is a minute; the default 30 s ceiling would fold it into +Inf.
+                    .maximumExpectedValue(Duration.ofMinutes(10))
+                    .register(registry)
+            }
+
         fun mountScanInFlight(catalog: String): AtomicInteger =
             mountScanInFlight.computeIfAbsent(catalog) { name ->
                 AtomicInteger().also { n ->
@@ -870,9 +883,9 @@ object Metrics {
     /**
      * hoglake_mount_refusals_total{catalog,reason}: requests refused on a
      * mount (store/Mounts.kt), by the error code they were answered with.
-     * `catalog` is only a name the registry holds (`<orgID>-events`), so a
-     * client cannot add series. A mount's team ids are its read scope and
-     * are never labels.
+     * `catalog` is only a name the registry holds (`<orgID>-events`) or, on a
+     * mount Client, one a verified token's `cat` names, so a client cannot
+     * add series. A mount's team ids are its read scope and are never labels.
      */
     fun mountRefused(
         catalog: String,
@@ -903,6 +916,38 @@ object Metrics {
      * decrement a fresh counter below zero (as [commitLockWaiting] does).
      */
     fun mountScanInFlight(catalog: String): AtomicInteger? = timers?.mountScanInFlight(catalog)
+
+    /**
+     * hoglake_mount_proxy_requests_total{catalog} and the
+     * hoglake_mount_proxy_requests_seconds histogram (plan row 1.3c): one
+     * count and one timing per request a mount Client sent to a host,
+     * whatever came back. A listing is one request to the host and is
+     * counted against each mount name it asked about. [nanos] runs from
+     * the send to the last byte of the answer (or the failure). `catalog`
+     * is written only for a request
+     * that passed the Client's own reader check, so it is a name from a
+     * verified token's `cat`, never raw request input.
+     */
+    fun mountProxied(
+        catalog: String,
+        nanos: Long,
+    ) {
+        increment("hoglake_mount_proxy_requests_total", 1.0, "catalog", catalog)
+        timers?.mountProxy(catalog)?.record(nanos, TimeUnit.NANOSECONDS)
+    }
+
+    /**
+     * hoglake_mount_proxy_upstream_errors_total{catalog,reason}: proxied
+     * requests the Host did not serve. `reason` is closed: `unavailable`
+     * (no connection, or it broke), `timeout`, `invalid_response`,
+     * `response_too_large`, or `http_<status>` for a typed refusal the
+     * Client relayed (statuses from a fixed list). `http_401` on a token the
+     * Client had just verified is the Host failing to verify it.
+     */
+    fun mountProxyUpstreamError(
+        catalog: String,
+        reason: String,
+    ) = increment("hoglake_mount_proxy_upstream_errors_total", 1.0, "catalog", catalog, "reason", reason)
 
     /**
      * hoglake_auth_signing_keys — keys the token verifier holds right now.
