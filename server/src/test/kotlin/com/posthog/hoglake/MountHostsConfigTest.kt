@@ -1,7 +1,10 @@
 package com.posthog.hoglake
 
+import com.posthog.hoglake.store.ClientSecret
+import com.posthog.hoglake.store.MountExchange
 import com.posthog.hoglake.store.MountHost
 import com.posthog.hoglake.store.MountMatch
+import com.posthog.hoglake.store.SecretSource
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.Test
@@ -29,11 +32,16 @@ class MountHostsConfigTest {
         extra: String = "",
     ) = """{"id":"$id","match":$match,"kind":"$kind","url":"$url","auth":"$auth"$extra}"""
 
+    private val secretVariable = "HOGLAKE_MOUNT_EXCHANGE_CLIENT_SECRET"
+    private val secret = "a-client-secret-of-forty-bytes-0123456789"
+    private val clientId = "hls_0123456789abcdef01234567"
+
     private fun config(
         hosts: String,
         authMode: String = "enforce",
         predicateFields: String = "team_id",
         allowlist: Set<String> = emptySet(),
+        secrets: Map<String, String> = mapOf(secretVariable to secret),
     ): Config {
         val file = Files.writeString(dir.resolve("hosts-${UUID.randomUUID()}.json"), hosts)
         return Config(
@@ -41,8 +49,17 @@ class MountHostsConfigTest {
             authMode = authMode,
             authPredicateFields = predicateFields,
             mountAllowlist = allowlist,
+            mountSecrets = SecretSource { secrets[it] },
         )
     }
+
+    /** An entry of auth mode `exchange`, with [exchange] as its settings object (null leaves it out). */
+    private fun exchanging(
+        exchange: String? =
+            """{"token_url":"http://hogtower.internal:8080/oauth/token","client_id":"$clientId",""" +
+                """"client_secret_env":"$secretVariable"}""",
+        auth: String = "exchange",
+    ) = entry(auth = auth, extra = exchange?.let { ""","exchange":$it""" } ?: "")
 
     private fun refused(
         hosts: String,
@@ -182,6 +199,137 @@ class MountHostsConfigTest {
         refused("""{"hosts":{}}""", "hosts must be an array")
         refused("""{"hosts":["x"]}""", "entry must be an object")
         refused("""{"hosts":[{"id":"$id"}]}""", "requires a match object")
+    }
+
+    @Test
+    fun `an exchange entry is its token endpoint, its client id and a secret read from the named variable`() {
+        val cfg = config("""{"hosts":[${exchanging()}]}""")
+        val host = cfg.mountHosts.single()
+        assertThat(host.auth).isEqualTo(MountHost.Auth.EXCHANGE)
+        assertThat(host.exchange).isEqualTo(
+            MountExchange(
+                tokenUrl = URI("http://hogtower.internal:8080/oauth/token"),
+                clientId = clientId,
+                clientSecret = ClientSecret(secret),
+                timeoutMs = 5_000,
+            ),
+        )
+        // Nothing that prints the configuration prints the secret.
+        assertThat("$cfg $host ${host.exchange} ${cfg.mountHosts}").doesNotContain(secret).contains("[redacted]")
+        val tuned =
+            exchanging(
+                """{"token_url":"https://hogtower.internal/oauth/token","client_id":"$clientId",""" +
+                    """"client_secret_env":"HOGLAKE_MOUNT_EXCHANGE_OTHER","timeout_ms":1500}""",
+            )
+        val otherSecret = "another-client-secret-of-enough-bytes-000"
+        val read = config("""{"hosts":[$tuned]}""", secrets = mapOf("HOGLAKE_MOUNT_EXCHANGE_OTHER" to otherSecret))
+        assertThat(read.mountHosts.single().exchange!!.timeoutMs).isEqualTo(1500)
+        assertThat(read.mountHosts.single().exchange!!.clientSecret).isEqualTo(ClientSecret(otherSecret))
+        // A forwarding entry beside it is as it was.
+        val forward = entry(id = otherId, match = """{"type":"catalog","name":"$other"}""")
+        val both =
+            config(
+                """{"hosts":[${exchanging().replace(
+                    """{"type":"events"}""",
+                    """{"type":"catalog","name":"$mount"}""",
+                )},$forward]}""",
+            )
+        assertThat(both.mountHosts.map { it.auth }).containsExactly(MountHost.Auth.EXCHANGE, MountHost.Auth.FORWARD)
+        assertThat(both.mountHosts.last().exchange).isNull()
+        // The process environment is where a secret is read by default, and it holds none of these names.
+        assertThatThrownBy {
+            Config(mountHostsFile = cfg.mountHostsFile, authMode = "enforce", authPredicateFields = "team_id")
+        }
+            .isInstanceOf(IllegalArgumentException::class.java)
+            .hasMessageContaining("$secretVariable is not set")
+    }
+
+    @Test
+    fun `exchange settings that are not the contract's are refused, and no refusal shows the secret`() {
+        fun refusedExchange(
+            exchange: String?,
+            message: String,
+            auth: String = "exchange",
+            secrets: Map<String, String> = mapOf(secretVariable to secret),
+        ) {
+            val hosts = """{"hosts":[${exchanging(exchange, auth)}]}"""
+            assertThatThrownBy { config(hosts, secrets = secrets) }
+                .describedAs(hosts)
+                .isInstanceOf(IllegalArgumentException::class.java)
+                .hasMessageContaining(message)
+                .satisfies({ failure ->
+                    secrets.values.filter { it.isNotEmpty() }.forEach {
+                        assertThat(
+                            failure.toString(),
+                        ).doesNotContain(it)
+                    }
+                })
+        }
+
+        fun settings(
+            url: String = "http://hogtower.internal:8080/oauth/token",
+            id: String = clientId,
+            variable: String = secretVariable,
+            extra: String = "",
+        ) = """{"token_url":"$url","client_id":"$id","client_secret_env":"$variable"$extra}"""
+        // The object goes with the mode, and only with it.
+        refusedExchange(null, "takes an exchange object exactly when its auth is 'exchange'")
+        refusedExchange(settings(), "takes an exchange object exactly when its auth is 'exchange'", auth = "forward")
+        refusedExchange("\"x\"", "exchange must be an object")
+        refusedExchange(
+            """{"token_url":"http://h/oauth/token","client_id":"$clientId"}""",
+            "requires a string client_secret_env",
+        )
+        refusedExchange(settings(extra = ""","client_secret":"$secret""""), "unknown fields")
+        refusedExchange(settings(extra = ""","audience":"x""""), "unknown fields")
+        for (url in listOf(
+            "http://hogtower.internal:8080",
+            "http://hogtower.internal:8080/",
+            "http://user:pw@hogtower.internal/oauth/token",
+            "http://hogtower.internal/oauth/token?x=1",
+            "http://hogtower.internal/oauth/token#f",
+            "http://hogtower.internal/oauth/../admin",
+            "ftp://hogtower.internal/oauth/token",
+            "/oauth/token",
+            "",
+        )) {
+            refusedExchange(settings(url = url), "token_url must be http(s)://host[:port]/path")
+        }
+        for (id in listOf(
+            "",
+            "trino-pool",
+            "svc_0123456789abcdef01234567",
+            "hlc_0123456789abcdef01234567",
+            "hls_XYZ",
+        )) {
+            refusedExchange(settings(id = id), "client_id is hls_ followed by 24 lowercase hex")
+        }
+        // The file may name only this feature's own variables: never another secret of the process.
+        for (variable in listOf(
+            "HOGLAKE_DB_PASSWORD",
+            "AWS_SECRET_ACCESS_KEY",
+            "hoglake_mount_exchange_x",
+            "HOGLAKE_MOUNT_EXCHANGE_",
+            "",
+        )) {
+            refusedExchange(
+                settings(variable = variable),
+                "client_secret_env must name a variable matching",
+                secrets = mapOf(variable to secret, secretVariable to secret),
+            )
+        }
+        refusedExchange(settings(), "$secretVariable is not set", secrets = emptyMap())
+        refusedExchange(settings(), "$secretVariable is not set", secrets = mapOf(secretVariable to ""))
+        for (bad in listOf("too-short-a-secret-0123456789ab", "x".repeat(257))) {
+            refusedExchange(
+                settings(),
+                "$secretVariable must be 32 to 256 bytes",
+                secrets = mapOf(secretVariable to bad),
+            )
+        }
+        for (timeout in listOf("0", "-1", "30001", "\"5\"", "1.5")) {
+            refusedExchange(settings(extra = ""","timeout_ms":$timeout"""), "exchange timeout_ms must be 1..30000")
+        }
     }
 
     @Test

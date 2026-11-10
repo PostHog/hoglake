@@ -1,5 +1,9 @@
 package com.posthog.hoglake.store
 
+import ch.qos.logback.classic.Level
+import ch.qos.logback.classic.Logger
+import ch.qos.logback.classic.spi.ILoggingEvent
+import ch.qos.logback.core.read.ListAppender
 import com.posthog.hoglake.App
 import com.posthog.hoglake.Config
 import com.posthog.hoglake.auth.AuthPolicy
@@ -8,6 +12,7 @@ import com.posthog.hoglake.configureApiListener
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.service.CatalogService
+import com.posthog.hoglake.store.FakeTokenEndpoint.Companion.error
 import com.posthog.hoglake.testing.PgTestSupport
 import com.posthog.hoglake.wireObjectMapper
 import io.ktor.http.HttpMethod
@@ -21,6 +26,7 @@ import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
+import org.slf4j.LoggerFactory
 import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
@@ -221,6 +227,107 @@ class MountClientIntegrationTest {
     }
 
     private fun operator() = TestTokens.mint(pair, TestTokens.operatorClaims())
+
+    // ---- auth mode `exchange` (hogtower#181) -------------------------------------------------
+
+    private val orgId = mount.removeSuffix("-events")
+    private val otherOrgId = otherMount.removeSuffix("-events")
+    private val unfederatedOrgId = "0190f3c4-1b2a-4c3d-8e4f-a5b6c7d8e9f2"
+    private val hogliteId = "5b0c6d0e-1f2a-4b3c-9d4e-5f6a7b8c9d0e"
+    private val secretVariable = "HOGLAKE_MOUNT_EXCHANGE_CLIENT_SECRET"
+
+    /**
+     * The issuer, as the Client sees it. [orgId]'s federated teams are 7, 42 and 99 (of the export's
+     * 7, 42, 49, 99); [otherOrgId] is federated too, but the Host holds no mount for it.
+     */
+    private fun tokenEndpoint() =
+        FakeTokenEndpoint(pair, federated = mapOf(orgId to setOf(7L, 42L, 99L), otherOrgId to setOf(7L)))
+
+    /** A real reader's token: scoped, naming its org's catalog, with [life] seconds left. */
+    private fun orgReader(
+        org: String = orgId,
+        prd: String = """{"team_id":{"7":"read","42":"read"}}""",
+        catalogs: String = """{"$org":["read"]}""",
+        life: Long = 890,
+        routed: Boolean = false,
+    ): String {
+        val now = System.currentTimeMillis() / 1000
+        val rtg = if (routed) ""","rtg":{"b":"hoglite","be":"$hogliteId","t":"t_1"}""" else ""
+        return TestTokens.mint(
+            pair,
+            """{"iss":"${TestTokens.ISSUER}","aud":"${TestTokens.AUDIENCE}","sub":"hlc_team",""" +
+                """"jti":"jti-${java.util.UUID.randomUUID()}","ten":"scoped","org":"$org","cli":"laptop",""" +
+                """"usr":"user-1","iat":${now - 5},"exp":${now + life},"cat":$catalogs,"prd":$prd$rtg}""",
+        )
+    }
+
+    /** A hosts file sending every mount name to the Host at [hostPort], with tokens exchanged at [endpoint]. */
+    private fun exchangeHostsFile(
+        hostPort: Int,
+        endpoint: FakeTokenEndpoint,
+    ): String =
+        Files.createTempFile("hoglake-mount-hosts-", ".json").also {
+            it.toFile().deleteOnExit()
+            Files.writeString(
+                it,
+                """{"hosts":[{"id":"3c0c6d0e-1f2a-4b3c-9d4e-5f6a7b8c9d0e","match":{"type":"events"},""" +
+                    """"kind":"hoglake","url":"http://127.0.0.1:$hostPort","auth":"exchange",""" +
+                    """"exchange":{"token_url":"${endpoint.tokenUrl}","client_id":"${endpoint.clientId}",""" +
+                    """"client_secret_env":"$secretVariable","timeout_ms":2000}}]}""",
+            )
+        }.toString()
+
+    /** A Client of the Host at [hostPort] whose host entry is `auth: exchange`; [secret] is what it is configured with. */
+    private fun exchangeClient(
+        hostPort: Int,
+        endpoint: FakeTokenEndpoint,
+        secret: String = endpoint.clientSecret,
+    ): Running =
+        start(
+            App.build(
+                authConfig().copy(
+                    mountHostsFile = exchangeHostsFile(hostPort, endpoint),
+                    mountSecrets = SecretSource { name -> secret.takeIf { name == secretVariable } },
+                ),
+                clientDb.jdbi,
+            ),
+        )
+
+    /** The same with no PostgreSQL and a hoglite backend allowlisted, as the customer hoglake is. */
+    private fun hogliteExchangeClient(
+        hostPort: Int,
+        endpoint: FakeTokenEndpoint,
+    ): Running {
+        val backends =
+            Files.createTempFile("hoglake-backends-", ".json").also {
+                it.toFile().deleteOnExit()
+                Files.writeString(
+                    it,
+                    """{"backends":[{"id":"$hogliteId","kind":"hoglite","url":"http://127.0.0.1:9",""" +
+                        """"retry_budget_ms":1}]}""",
+                )
+            }
+        return start(
+            App.build(
+                authConfig().copy(
+                    defaultBackend = "none",
+                    backendsFile = backends.toString(),
+                    jdbcUrl = "jdbc:no-such-driver:must-not-open",
+                    dbUser = "",
+                    dbPassword = "",
+                    mountHostsFile = exchangeHostsFile(hostPort, endpoint),
+                    mountSecrets = SecretSource { name -> endpoint.clientSecret.takeIf { name == secretVariable } },
+                ),
+            ),
+        )
+    }
+
+    private fun teams(body: String): List<Long> = mapper.readTree(body).map { it["team_id"].asLong() }
+
+    private fun fileIds(body: String): List<Long> =
+        mapper.readTree(
+            body,
+        ).map { it["data_file"]["data_file_id"].asLong() }
 
     private fun tenant(catalog: String) =
         TestTokens.mint(pair, TestTokens.tenantClaims(catalogs = mapOf(catalog to listOf("admin"))))
@@ -531,6 +638,377 @@ class MountClientIntegrationTest {
                 ).isEqualTo(403)
                 assertThat(host.received.get()).isEqualTo(before)
             }
+        }
+    }
+
+    @Test
+    fun `exchange - an org-token reader for teams 7 and 42 gets exactly those teams' files`() {
+        host().use { host ->
+            tokenEndpoint().use { endpoint ->
+                exchangeClient(host.port, endpoint).use { client ->
+                    val token = orgReader()
+                    val response = get(client.port, scan, token)
+                    assertThat(response.statusCode()).isEqualTo(200)
+                    assertThat(fileIds(response.body())).containsExactlyInAnyOrder(1L, 2L, 3L)
+                    assertThat(teams(response.body()).toSet()).containsExactlyInAnyOrder(7L, 42L)
+                    // The token the Host was given names the mount, at read, for the reader's federated teams.
+                    val claims =
+                        mapper.readTree(
+                            java.util.Base64.getUrlDecoder().decode(endpoint.minted.single().split('.')[1]),
+                        )
+                    assertThat(claims["cat"].toString()).isEqualTo("""{"$mount":["read"]}""")
+                    assertThat(claims["prd"].toString()).isEqualTo("""{"team_id":{"7":"read","42":"read"}}""")
+                    assertThat(claims.has("rtg")).isFalse()
+                    // Every served route: the bytes the Host answers a reader holding that mount token directly.
+                    val direct = reader()
+                    for (path in listOf(
+                        "/v1/catalogs/$mount",
+                        "/v1/catalogs/$mount/namespaces",
+                        "/v1/catalogs/$mount/namespaces/ingest",
+                        "/v1/catalogs/$mount/namespaces/ingest/tables",
+                        "/v1/catalogs/$mount/namespaces/ingest/tables/events_v2",
+                        scan,
+                        "$scan?include=column_stats&snapshot=1",
+                        "$scan?snapshot=999999",
+                        "/v1/catalogs/$mount/namespaces/other",
+                    )) {
+                        val fromHost = get(host.port, path, direct)
+                        val proxied = get(client.port, path, token)
+                        assertThat(proxied.statusCode()).describedAs(path).isEqualTo(fromHost.statusCode())
+                        assertThat(proxied.body()).describedAs(path).isEqualTo(fromHost.body())
+                    }
+                    // The listing is the Host's entry for the reader's mount, as the Host wrote it.
+                    val entry = get(host.port, "/v1/catalogs/$mount", direct).body()
+                    assertThat(get(client.port, "/v1/catalogs", token).body()).isEqualTo("[$entry]")
+                    // All of that on one exchange.
+                    assertThat(endpoint.seen).hasSize(1)
+
+                    // What the reader may see is the issuer's to narrow and the Host's to apply: a team
+                    // that is not federated (13) is not in the minted token, `*` is the federated teams.
+                    val narrowed = get(client.port, scan, orgReader(prd = """{"team_id":{"7":"read","13":"read"}}"""))
+                    assertThat(teams(narrowed.body())).containsExactly(7L)
+                    val star = get(client.port, scan, orgReader(prd = """{"team_id":{"*":"read"}}"""))
+                    assertThat(teams(star.body()).toSet()).containsExactlyInAnyOrder(7L, 42L, 99L)
+                    // No team in common: no mount for this reader, worded as a catalog that is not there.
+                    val none = get(client.port, scan, orgReader(prd = """{"team_id":{"13":"read"}}"""))
+                    assertThat(none.statusCode() to error(none.body())).isEqualTo(404 to "not_found")
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `exchange - a reader of one org is refused another org's mount with no exchange and no host call`() {
+        host().use { host ->
+            tokenEndpoint().use { endpoint ->
+                exchangeClient(host.port, endpoint).use { client ->
+                    val before = host.received.get()
+                    val callers =
+                        mapOf(
+                            "another org's reader" to orgReader(org = otherOrgId),
+                            "a reader whose org claim is another org's" to
+                                orgReader(org = otherOrgId, catalogs = """{"$orgId":["read"]}"""),
+                            "a scoped token for another catalog" to orgReader(catalogs = """{"lake":["read"]}"""),
+                            "a token that names the mount itself" to reader(),
+                            "a tenant of the org catalog" to tenant(orgId),
+                            "a tenant naming the mount" to tenant(mount),
+                            "an operator" to operator(),
+                            "nobody" to null,
+                        )
+                    for ((who, token) in callers) {
+                        for ((rule, path) in catalogRoutes(mount)) {
+                            val response = send(client.port, rule.method, path, token)
+                            assertThat(response.statusCode()).describedAs("%s %s %s", who, rule.method.value, path)
+                                .isIn(401, 403, 404)
+                        }
+                    }
+                    val refused = get(client.port, scan, orgReader(org = otherOrgId))
+                    assertThat(refused.statusCode()).isEqualTo(404)
+                    assertThat(
+                        refused.body(),
+                    ).isEqualTo("""{"error":"not_found","detail":"catalog '$mount' not found"}""")
+                    // The answer a mount-named token gets here is the same one, word for word.
+                    assertThat(get(client.port, scan, reader()).body()).isEqualTo(refused.body())
+                    assertThat(endpoint.seen).isEmpty()
+                    assertThat(host.received.get()).isEqualTo(before)
+
+                    // The other org's reader on its OWN mount: exchanged (its right), and the Host, which
+                    // holds no such mount, answers as for any catalog it does not have.
+                    val own = get(client.port, scan.replace(mount, otherMount), orgReader(org = otherOrgId))
+                    assertThat(own.statusCode()).isEqualTo(404)
+                    assertThat(
+                        endpoint.seen.single().field("resource"),
+                    ).isEqualTo("urn:posthog:hoglake:catalog:$otherMount")
+                    // An org with no federated team: the issuer's refusal, and the Host is not asked.
+                    val hostCalls = host.received.get()
+                    val unfederated =
+                        get(client.port, "/v1/catalogs/$unfederatedOrgId-events", orgReader(org = unfederatedOrgId))
+                    assertThat(unfederated.statusCode() to error(unfederated.body())).isEqualTo(404 to "not_found")
+                    assertThat(host.received.get()).isEqualTo(hostCalls)
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `exchange - every other route on the mount is refused at the client as the host refuses the mount token`() {
+        host().use { host ->
+            tokenEndpoint().use { endpoint ->
+                exchangeClient(host.port, endpoint).use { client ->
+                    // The Host's own answers to a read-only mount token are what an org reader gets here,
+                    // whatever its org catalog's scope: the mount token is read-only.
+                    val direct = reader()
+                    for (cat in listOf("read", "write")) {
+                        val token = orgReader(catalogs = """{"$orgId":["$cat"]}""")
+                        for ((rule, path) in catalogRoutes(mount)) {
+                            val fromHost = send(host.port, rule.method, path, direct)
+                            val before = host.received.get()
+                            val proxied = send(client.port, rule.method, path, token)
+                            val what = "${rule.method.value} $path ($cat)"
+                            assertThat(proxied.statusCode()).describedAs(what).isEqualTo(fromHost.statusCode())
+                            assertThat(error(proxied.body())).describedAs(what).isEqualTo(error(fromHost.body()))
+                            if (rule.method == HttpMethod.Get && rule.pattern in served) {
+                                assertThat(proxied.statusCode()).describedAs(what).isEqualTo(200)
+                                assertThat(host.received.get()).describedAs(what).isEqualTo(before + 1)
+                            } else {
+                                assertThat(error(proxied.body())).describedAs(what)
+                                    .isIn("mount_operation_unavailable", "forbidden")
+                                assertThat(host.received.get()).describedAs(what).isEqualTo(before)
+                            }
+                        }
+                    }
+                    // One exchange per subject token, however many routes it asked.
+                    assertThat(endpoint.seen).hasSize(2)
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `exchange - one subject token is one exchange, and two subject tokens never share a minted token`() {
+        host().use { host ->
+            tokenEndpoint().use { endpoint ->
+                exchangeClient(host.port, endpoint).use { client ->
+                    val seven = orgReader(prd = """{"team_id":{"7":"read"}}""")
+                    val fortyTwo = orgReader(prd = """{"team_id":{"42":"read"}}""")
+                    repeat(12) {
+                        assertThat(teams(get(client.port, scan, seven).body())).containsExactly(7L)
+                    }
+                    assertThat(endpoint.seen).hasSize(1)
+                    // Interleaved: each reader is answered from the token minted from its own.
+                    repeat(6) {
+                        assertThat(teams(get(client.port, scan, fortyTwo).body())).containsExactly(42L, 42L)
+                        assertThat(teams(get(client.port, scan, seven).body())).containsExactly(7L)
+                    }
+                    assertThat(endpoint.seen.map { it.field("subject_token") }).containsExactly(seven, fortyTwo)
+                    assertThat(endpoint.minted).hasSize(2).doesNotHaveDuplicates()
+                    // Concurrent first requests of one new reader share one exchange.
+                    val fresh = orgReader()
+                    val pool = java.util.concurrent.Executors.newFixedThreadPool(8)
+                    try {
+                        val answers = (1..8).map { pool.submit<Int> { get(client.port, scan, fresh).statusCode() } }
+                        assertThat(answers.map { it.get() }).containsOnly(200)
+                    } finally {
+                        pool.shutdownNow()
+                    }
+                    assertThat(endpoint.seen.count { it.field("subject_token") == fresh }).isEqualTo(1)
+                    // Counted on the Client's own metrics, with no token, client or reader in a label.
+                    val metrics = get(client.port, "/metrics", operator()).body().lines()
+                    assertThat(
+                        metrics.single { it.startsWith("hoglake_mount_exchange_requests_total") },
+                    ).endsWith(" 3.0")
+                    assertThat(
+                        metrics.single { it.startsWith("hoglake_mount_exchange_cache_total{") && "\"miss\"" in it },
+                    )
+                        .endsWith(" 3.0")
+                    assertThat(
+                        metrics.filter { it.startsWith("hoglake_mount_exchange_requests_seconds_count") },
+                    ).hasSize(1)
+                    val exchangeLines = metrics.filter { it.startsWith("hoglake_mount_exchange") }.joinToString("\n")
+                    assertThat(exchangeLines).doesNotContain("catalog=", "hls_", "hlc_", orgId, "user-1", "jti")
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `exchange - an entry near its expiry is exchanged again, and a reader's token near its own is refused`() {
+        host().use { host ->
+            tokenEndpoint().use { endpoint ->
+                exchangeClient(host.port, endpoint).use { client ->
+                    // The issuer states 32 s: usable for 2 s, the rest is the margin.
+                    endpoint.statedLifetime = MountTokenExchange.MARGIN_SECONDS + 2
+                    val token = orgReader()
+                    assertThat(get(client.port, scan, token).statusCode()).isEqualTo(200)
+                    assertThat(get(client.port, scan, token).statusCode()).isEqualTo(200)
+                    assertThat(endpoint.seen).hasSize(1)
+                    Thread.sleep(2_500)
+                    assertThat(get(client.port, scan, token).statusCode()).isEqualTo(200)
+                    assertThat(endpoint.seen).hasSize(2)
+                    assertThat(endpoint.minted).hasSize(2).doesNotHaveDuplicates()
+
+                    // A reader's token with less than the margin left: its to renew, and nothing is sent.
+                    endpoint.statedLifetime = null
+                    val hostCalls = host.received.get()
+                    val expiring = get(client.port, scan, orgReader(life = 20))
+                    assertThat(expiring.statusCode() to error(expiring.body())).isEqualTo(401 to "token_expired")
+                    assertThat(
+                        expiring.headers().firstValue("WWW-Authenticate"),
+                    ).hasValue("Bearer error=\"token_expired\"")
+                    assertThat(endpoint.seen).hasSize(2)
+                    assertThat(host.received.get()).isEqualTo(hostCalls)
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `exchange - the issuer down is a typed 503, a refused client a typed 500, and neither reaches the host`() {
+        host().use { host ->
+            val endpoint = tokenEndpoint()
+            val before = host.received.get()
+            exchangeClient(host.port, endpoint).use { client ->
+                val cached = orgReader()
+                assertThat(get(client.port, scan, cached).statusCode()).isEqualTo(200)
+                endpoint.close()
+                for (path in listOf(scan, "/v1/catalogs/$mount")) {
+                    val response = get(client.port, path, orgReader())
+                    assertThat(response.statusCode() to error(response.body())).describedAs(path)
+                        .isEqualTo(503 to "mount_exchange_unavailable")
+                    assertThat(response.headers().firstValue("Retry-After")).isPresent()
+                    assertThat(response.body()).doesNotContain("127.0.0.1", "${endpoint.port}", "oauth", "hls_")
+                }
+                // A listing cannot tell whether this reader has a mount: it answers, without it, and counts.
+                val listing = get(client.port, "/v1/catalogs", orgReader())
+                assertThat(listing.statusCode() to listing.body()).isEqualTo(200 to "[]")
+                // A reader whose mount token is in hand is still served: the issuer is not asked again.
+                assertThat(get(client.port, scan, cached).statusCode()).isEqualTo(200)
+                assertThat(host.received.get()).isEqualTo(before + 2)
+                // The Client's own catalog and probes do not depend on the issuer.
+                assertThat(get(client.port, "/v1/catalogs/lake", operator()).statusCode()).isEqualTo(200)
+                assertThat(get(client.port, "/livez", null).statusCode()).isEqualTo(200)
+                val metrics = get(client.port, "/metrics", operator()).body().lines()
+                assertThat(metrics.single { it.startsWith("hoglake_mount_exchange_errors_total{") })
+                    .contains("""reason="unavailable"""").endsWith(" 3.0")
+                assertThat(
+                    metrics.single { it.startsWith("hoglake_mount_exchange_listing_omitted_total") },
+                ).endsWith(" 1.0")
+                // Only a mount the issuer minted a token for has a series of its own.
+                assertThat(metrics.filter { it.startsWith("hoglake_mount_proxy_requests_total{") }).hasSize(1)
+            }
+            tokenEndpoint().use { other ->
+                exchangeClient(host.port, other, secret = "not-the-secret-the-issuer-knows-0123456789").use { client ->
+                    val calls = host.received.get()
+                    val response = get(client.port, scan, orgReader())
+                    assertThat(response.statusCode() to error(response.body()))
+                        .isEqualTo(500 to "mount_exchange_misconfigured")
+                    assertThat(response.headers().firstValue("WWW-Authenticate")).isEmpty()
+                    assertThat(response.body()).doesNotContain("not-the-secret", "hls_", "oauth")
+                    // Shortly after, nothing is even sent: one refused attempt, however many readers ask.
+                    repeat(5) { assertThat(get(client.port, scan, orgReader()).statusCode()).isEqualTo(500) }
+                    assertThat(other.seen).hasSize(1)
+                    assertThat(host.received.get()).isEqualTo(calls)
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `exchange - a client with no postgres serves a reader whose token places its org catalog on hoglite`() {
+        host().use { host ->
+            tokenEndpoint().use { endpoint ->
+                hogliteExchangeClient(host.port, endpoint).use { client ->
+                    val token = orgReader(routed = true)
+                    val direct = reader()
+                    for (path in listOf(
+                        "/v1/catalogs/$mount",
+                        "/v1/catalogs/$mount/namespaces",
+                        "/v1/catalogs/$mount/namespaces/ingest",
+                        "/v1/catalogs/$mount/namespaces/ingest/tables",
+                        "/v1/catalogs/$mount/namespaces/ingest/tables/events_v2",
+                        scan,
+                    )) {
+                        val proxied = get(client.port, path, token)
+                        assertThat(proxied.statusCode()).describedAs(path).isEqualTo(200)
+                        assertThat(proxied.body()).describedAs(path).isEqualTo(get(host.port, path, direct).body())
+                    }
+                    assertThat(endpoint.seen).hasSize(1)
+                    // The Host would have answered that reader's own token 501; it never saw it.
+                    assertThat(get(host.port, scan, token).statusCode()).isIn(401, 404, 501)
+                    val before = host.received.get()
+                    assertThat(
+                        get(client.port, scan, orgReader(org = otherOrgId, routed = true)).statusCode(),
+                    ).isEqualTo(404)
+                    assertThat(send(client.port, HttpMethod.Post, "/v1/catalogs/$mount/commit", token).statusCode())
+                        .isEqualTo(403)
+                    assertThat(host.received.get()).isEqualTo(before)
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `exchange - the secret and the tokens are in no log line and no response`() {
+        val capture = ListAppender<ILoggingEvent>().apply { start() }
+        val root = LoggerFactory.getLogger(org.slf4j.Logger.ROOT_LOGGER_NAME) as Logger
+        val level = root.level
+        root.level = Level.DEBUG
+        root.addAppender(capture)
+        val bodies = mutableListOf<String>()
+        val tokens = mutableListOf<String>()
+
+        fun ask(
+            port: Int,
+            path: String,
+            token: String,
+        ) {
+            tokens += token
+            val response = get(port, path, token)
+            bodies += response.body() + response.headers().map().toString()
+        }
+        try {
+            host().use { host ->
+                tokenEndpoint().use { endpoint ->
+                    exchangeClient(host.port, endpoint).use { client ->
+                        ask(client.port, scan, orgReader())
+                        ask(client.port, "/v1/catalogs", orgReader())
+                        ask(client.port, scan, orgReader(prd = """{"team_id":{"13":"read"}}"""))
+                        ask(client.port, scan, orgReader(life = 20))
+                        ask(client.port, "$scan?snapshot=999999", orgReader())
+                        endpoint.answer = { e, _ -> e.error(400, "invalid_request") }
+                        ask(client.port, scan, orgReader())
+                    }
+                    endpoint.answer = null
+                    exchangeClient(host.port, endpoint, secret = "a-wrong-secret-that-is-long-enough-0123").use {
+                            client ->
+                        ask(client.port, scan, orgReader())
+                        tokens += "a-wrong-secret-that-is-long-enough-0123"
+                    }
+                    endpoint.close()
+                    exchangeClient(host.port, endpoint).use { client -> ask(client.port, scan, orgReader()) }
+                    val secrets =
+                        tokens + endpoint.minted + listOf(endpoint.clientSecret, endpoint.basic.removePrefix("Basic "))
+                    val lines =
+                        capture.list.map { event ->
+                            event.formattedMessage + " " +
+                                generateSequence(event.throwableProxy) { it.cause }
+                                    .joinToString(" ") { "${it.className}: ${it.message}" }
+                        }
+                    // The exchange's failures were logged, so there is something to search.
+                    assertThat(lines.filter { "token exchange failed" in it }).hasSizeGreaterThanOrEqualTo(3)
+                    assertThat(endpoint.minted).isNotEmpty()
+                    for (secret in secrets) {
+                        assertThat(lines).describedAs("log lines").noneMatch { secret in it }
+                        assertThat(bodies).describedAs("responses").noneMatch { secret in it }
+                    }
+                    assertThat(
+                        lines.filter { "token exchange" in it },
+                    ).noneMatch { "oauth" in it || endpoint.clientId in it }
+                }
+            }
+        } finally {
+            root.detachAppender(capture)
+            root.level = level
         }
     }
 }

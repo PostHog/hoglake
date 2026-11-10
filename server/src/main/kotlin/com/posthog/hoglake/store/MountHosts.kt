@@ -2,6 +2,7 @@ package com.posthog.hoglake.store
 
 import com.posthog.hoglake.auth.Caller
 import java.net.URI
+import java.security.MessageDigest
 import java.util.UUID
 
 /**
@@ -43,7 +44,8 @@ sealed interface MountMatch {
  * One remote host a mount Client proxies to (plan row 1.3c), as server
  * configuration states it (HOGLAKE_MOUNT_HOSTS_FILE): which names it serves,
  * what it is, where it is and how the Client authenticates to it. Endpoints
- * only, never credentials.
+ * only, never credentials: an exchange host's client secret is named here
+ * by the environment variable that holds it ([MountExchange]).
  */
 data class MountHost(
     /**
@@ -64,6 +66,8 @@ data class MountHost(
     val maxResponseBytes: Long = DEFAULT_MAX_RESPONSE_BYTES,
     /** The cap over this host's proxied requests in flight. */
     val maxConcurrent: Int = DEFAULT_MAX_CONCURRENT,
+    /** Where and as whom this server exchanges tokens for the host; set exactly when [auth] is [Auth.EXCHANGE]. */
+    val exchange: MountExchange? = null,
 ) {
     /** What the host speaks. Each kind needs its own reader; only a hoglake's exists. */
     enum class Kind(val wire: String) {
@@ -83,11 +87,25 @@ data class MountHost(
          * business seeing; it needs an auth mode of its own.
          */
         FORWARD("forward"),
+
+        /**
+         * A token this server gets for the caller from the issuer's token
+         * endpoint (hogtower#181), in exchange for the caller's own, and
+         * presents in its place ([MountExchange], [MountTokenExchange]).
+         * For a reader whose token names its org catalog, which the host
+         * would not accept: the reader keeps one token, and the mount
+         * token never leaves this server. Who may be served this way is
+         * [MountEntitlement]'s to say.
+         */
+        EXCHANGE("exchange"),
     }
 
     init {
         require(origin.scheme in setOf("http", "https") && !origin.host.isNullOrEmpty()) {
             "a mount host must be an http(s) origin"
+        }
+        require((auth == Auth.EXCHANGE) == (exchange != null)) {
+            "a mount host has exchange settings exactly when its auth is '${Auth.EXCHANGE.wire}'"
         }
         require(timeoutMs >= 1) { "timeout_ms must be >= 1, got $timeoutMs" }
         require(maxResponseBytes >= 1) { "max_response_bytes must be >= 1, got $maxResponseBytes" }
@@ -156,6 +174,105 @@ data class MountHost(
                 is MountMatch.Events -> "events"
                 is MountMatch.Catalog -> "catalog '${match.name}'"
             }
+    }
+}
+
+/**
+ * How this server exchanges a caller's token for one a host accepts
+ * ([MountHost.Auth.EXCHANGE]): the issuer's token endpoint, and the client
+ * this server authenticates as. The wire contract is [MountTokenExchange]'s.
+ */
+data class MountExchange(
+    /** The token endpoint, whole: scheme, host, optional port and path. The only address an exchange contacts. */
+    val tokenUrl: URI,
+    val clientId: String,
+    val clientSecret: ClientSecret,
+    /** The deadline for one exchange, send to the last byte of the answer. */
+    val timeoutMs: Long = DEFAULT_TIMEOUT_MS,
+) {
+    init {
+        require(tokenUrl(tokenUrl.toString()) == tokenUrl) {
+            "a token endpoint must be an http(s) URL with a path and no user-info, query or fragment"
+        }
+        require(MountTokenExchange.isClientId(clientId)) { MountTokenExchange.CLIENT_ID_RULE }
+        require(timeoutMs in 1..TIMEOUT_CEILING_MS) { "exchange timeout_ms must be 1..$TIMEOUT_CEILING_MS" }
+    }
+
+    companion object {
+        const val DEFAULT_TIMEOUT_MS = 5_000L
+
+        /** A reader waits on the exchange before its request is even sent: kept to seconds. */
+        const val TIMEOUT_CEILING_MS = 30_000L
+
+        /**
+         * A token endpoint URL, or null when [value] is anything else: an
+         * http(s) URL with a host and a plain path (unreserved characters,
+         * no dot segments), and no user-info, query or fragment
+         * (parameters, the secret above all, go in the body). Rebuilt from
+         * its parts, so nothing else of [value] survives.
+         */
+        fun tokenUrl(value: String): URI? {
+            val uri =
+                try {
+                    URI(value)
+                } catch (_: java.net.URISyntaxException) {
+                    return null
+                }
+            val path = uri.rawPath.orEmpty()
+            val plain =
+                uri.scheme in setOf("http", "https") && !uri.host.isNullOrEmpty() && uri.rawUserInfo == null &&
+                    PATH.matches(path) && path.split('/').none { it == "." || it == ".." } &&
+                    uri.rawQuery == null && uri.rawFragment == null
+            return if (plain) URI(uri.scheme, null, uri.host, uri.port, path, null, null) else null
+        }
+
+        private val PATH = Regex("^(/[A-Za-z0-9._~-]+)+$")
+    }
+}
+
+/**
+ * A client secret held in memory. It is not a data class and prints as
+ * `[redacted]`, so no log line, error message or `toString()` of a
+ * configuration object can carry it; its one reader is the exchange, which
+ * builds the request's credentials from it ([reveal]).
+ */
+class ClientSecret(
+    private val value: String,
+) {
+    init {
+        require(value.toByteArray(Charsets.UTF_8).size in MountTokenExchange.SECRET_BYTES) {
+            "a mount exchange client secret must be ${MountTokenExchange.SECRET_BYTES.first} to " +
+                "${MountTokenExchange.SECRET_BYTES.last} bytes"
+        }
+    }
+
+    /** The secret itself, for the request's credentials and nothing else. */
+    internal fun reveal(): String = value
+
+    override fun toString(): String = "[redacted]"
+
+    override fun equals(other: Any?): Boolean =
+        other is ClientSecret && MessageDigest.isEqual(other.value.toByteArray(), value.toByteArray())
+
+    override fun hashCode(): Int = value.hashCode()
+}
+
+/**
+ * Where a secret named in configuration is read from: the process
+ * environment, or a fixed map in a test. Prints nothing of what it holds.
+ */
+class SecretSource(
+    private val lookup: (name: String) -> String?,
+) {
+    operator fun get(name: String): String? = lookup(name)
+
+    override fun toString(): String = "SecretSource"
+
+    companion object {
+        val ENVIRONMENT = SecretSource(System::getenv)
+
+        /** The names a hosts file may point at: this feature's own variables, and no other secret of the process. */
+        val NAME = Regex("^HOGLAKE_MOUNT_EXCHANGE_[A-Z0-9_]{1,64}$")
     }
 }
 

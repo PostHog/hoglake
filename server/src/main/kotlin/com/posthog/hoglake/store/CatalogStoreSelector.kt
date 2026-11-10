@@ -2,6 +2,7 @@ package com.posthog.hoglake.store
 
 import com.fasterxml.jackson.databind.JsonNode
 import com.posthog.hoglake.Config
+import com.posthog.hoglake.auth.Caller
 import com.posthog.hoglake.auth.Routing
 import com.posthog.hoglake.auth.hoglakeAuth
 import com.posthog.hoglake.hoglite.HogliteCatalogStore
@@ -87,9 +88,10 @@ class CatalogStoreSelector(
     /**
      * A name a mount host serves ([MountHostResolver]) is that host's
      * whatever backends this server has: the binding is by the name alone,
-     * with no record here. The caller is held to the mount reader's rule
-     * first, so one the host would refuse that way is refused here and
-     * nothing is sent. A refusal is counted against the name only once the
+     * with no record here. The caller is held to the host's reader rule
+     * first ([mayReadRemote]), so one the host would refuse that way is
+     * refused here and nothing is sent, to the host or to a token
+     * endpoint. A refusal is counted against the name only once the
      * caller's verified `cat` is known to hold it; before that the name is
      * raw request input and would mint a series per probe.
      */
@@ -98,12 +100,40 @@ class CatalogStoreSelector(
         catalog: String,
     ): CatalogBinding.Remote? {
         val caller = call.hoglakeAuth.callerOrNull
-        val host = mountHosts.resolve(caller, catalog) ?: return null
-        requireMountReader(caller, catalog) { reason ->
-            if (reason != "not_found") Metrics.mountRefused(catalog, reason)
+        val host = mountHosts.resolve(caller, catalog)
+        if (host == null) {
+            // The route table opened this name as the caller's exchange
+            // mount; with no host behind it, it is nothing, and must not
+            // fall through to a catalog that happens to have the name.
+            if (caller?.exchangeMount == catalog) throw HoglakeException.NotFound("catalog '$catalog' not found")
+            return null
+        }
+        when (host.host.auth) {
+            MountHost.Auth.FORWARD ->
+                requireMountReader(caller, catalog) { reason ->
+                    if (reason != "not_found") Metrics.mountRefused(catalog, reason)
+                }
+            // The reader holds its org catalog's token, not the mount's:
+            // the rule is MountEntitlement's, read from the token's own
+            // claims. A token that names the mount itself is not one.
+            MountHost.Auth.EXCHANGE ->
+                if (!MountEntitlement.mayRead(caller, catalog)) {
+                    throw HoglakeException.NotFound("catalog '$catalog' not found")
+                }
         }
         return CatalogBinding.Remote(catalog, host)
     }
+
+    /** Would [remote] bind [mount] on [host] for [caller]? The listing's form of the same rule. */
+    private fun mayReadRemote(
+        caller: Caller?,
+        host: MountHostClient,
+        mount: String,
+    ): Boolean =
+        when (host.host.auth) {
+            MountHost.Auth.FORWARD -> mount in mountVisibility(caller?.copy(exchangeMount = null))
+            MountHost.Auth.EXCHANGE -> MountEntitlement.mayRead(caller, mount)
+        }
 
     /** A mount reads this process's PostgreSQL, so it exists only where PostgreSQL is the default. */
     private fun mount(
@@ -158,8 +188,10 @@ class CatalogStoreSelector(
      * The entries the mount hosts list for [mounts] (names the caller's
      * own `cat` holds, [mountVisibility]), as each host wrote them: one
      * upstream listing per host that serves any of them, so the fan-out is
-     * bounded by configuration, never by the token. Null when no host
-     * serves any of [mounts], which is a server that is not their Client.
+     * bounded by configuration, never by the token. A host reached by
+     * token exchange is asked about one name at most, the caller's own
+     * mount. Null when no host serves any of [mounts], which is a server
+     * that is not their Client.
      */
     suspend fun remoteCatalogs(
         call: ApplicationCall,
@@ -168,7 +200,12 @@ class CatalogStoreSelector(
         val caller = call.hoglakeAuth.callerOrNull
         val byHost = LinkedHashMap<MountHostClient, MutableSet<String>>()
         for (mount in mounts) {
-            mountHosts.resolve(caller, mount)?.let { byHost.getOrPut(it) { LinkedHashSet() }.add(mount) }
+            val host = mountHosts.resolve(caller, mount) ?: continue
+            // A host is asked only about names it would serve this caller:
+            // an exchange host about the caller's one exchange mount, a
+            // forwarding host about the names in the caller's `cat`.
+            val names = byHost.getOrPut(host) { LinkedHashSet() }
+            if (mayReadRemote(caller, host, mount)) names.add(mount)
         }
         if (byHost.isEmpty()) return null
         return byHost.flatMap { (host, names) -> host.catalogs(call, names) }

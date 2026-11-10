@@ -2621,6 +2621,29 @@ sealed class HoglakeException(message: String) : RuntimeException(message) {
         val retryAfterSeconds: Long? = null,
     ) : HoglakeException(detail)
 
+    /**
+     * On a mount Client whose host is reached with an exchanged token
+     * (`auth: exchange`): the issuer's token endpoint could not be
+     * reached, did not answer in time, or is shedding load -> 503
+     * `mount_exchange_unavailable` + Retry-After. Nothing was refused.
+     */
+    class MountExchangeUnavailable(detail: String) : HoglakeException(detail)
+
+    /**
+     * On a mount Client: the issuer refused this server's own client
+     * credentials or its exchange request -> 500
+     * `mount_exchange_misconfigured`. The reader did nothing wrong and a
+     * retry will not help; it is this deployment's configuration to fix.
+     */
+    class MountExchangeMisconfigured(detail: String) : HoglakeException(detail)
+
+    /**
+     * On a mount Client: the token endpoint answered with something that
+     * is not its contract -> 502 `mount_exchange_invalid_response`. The
+     * detail never carries what it sent.
+     */
+    class MountExchangeInvalidResponse(detail: String) : HoglakeException(detail)
+
     /** Narrow the result before retrying. This refusal is not backend unavailability. */
     class BackendResultTooLarge(detail: String) : HoglakeException(detail)
 

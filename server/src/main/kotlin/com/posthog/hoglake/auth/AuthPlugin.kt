@@ -5,6 +5,8 @@ import com.posthog.hoglake.api.errorBody
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
+import com.posthog.hoglake.store.MountEntitlement
+import com.posthog.hoglake.store.MountHost
 import io.github.oshai.kotlinlogging.KotlinLogging
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpMethod
@@ -38,6 +40,14 @@ class AuthService(
      * (maintenance, debug, /metrics) are not a public surface.
      */
     val tenantOnly: Boolean = false,
+    /**
+     * Mount Client, auth mode `exchange`: the mount a verified caller is
+     * served through a token exchange, or null (`store/MountEntitlement.kt`,
+     * narrowed to the names an exchange host serves). The plugin attaches
+     * it to the caller ([Caller.exchangeMount]) so the route table, which
+     * reads nothing but the caller, opens that mount's routes to it.
+     */
+    val exchangeMount: (Caller) -> String? = { null },
 ) {
     /**
      * The `listener` label on hoglake_auth_requests_total: internet scanners
@@ -62,7 +72,7 @@ class AuthService(
             requireNotNull(verifier) {
                 "HOGLAKE_PUBLIC_PORT requires HOGLAKE_AUTH_MODE warn or enforce: the public listener always enforces"
             }
-        return AuthService(AuthMode.ENFORCE, v, tenantOnly = true)
+        return AuthService(AuthMode.ENFORCE, v, tenantOnly = true, exchangeMount = exchangeMount)
     }
 
     companion object {
@@ -99,7 +109,20 @@ class AuthService(
                         predicateFields =
                             cfg.authPredicateFields.split(',').map { it.trim() }.filter { it.isNotEmpty() }.toSet(),
                     ),
+                exchangeMount = exchangeMounts(cfg.mountHosts),
             )
+        }
+
+        /**
+         * The caller's mount ([MountEntitlement.mountOf]) when one of
+         * [hosts] serves it by exchange; with no such host, no caller has one.
+         */
+        internal fun exchangeMounts(hosts: List<MountHost>): (Caller) -> String? {
+            val exchanging = hosts.filter { it.auth == MountHost.Auth.EXCHANGE }
+            if (exchanging.isEmpty()) return { null }
+            return { caller ->
+                MountEntitlement.mountOf(caller)?.takeIf { mount -> exchanging.any { it.match.matches(mount) } }
+            }
         }
 
         private fun signingKeys(cfg: com.posthog.hoglake.Config): SigningKeys {
@@ -274,7 +297,10 @@ val HoglakeAuth =
 
             if (token != null) {
                 try {
-                    caller = service.verifier!!.verify(token)
+                    caller =
+                        service.verifier!!.verify(token).let { verified ->
+                            service.exchangeMount(verified)?.let { verified.copy(exchangeMount = it) } ?: verified
+                        }
                 } catch (v: JwtViolation) {
                     // Detail to the log, reason to the client; see JwtViolation.
                     AuthLog.debug(v) { "token refused for ${call.request.path()}" }
@@ -495,7 +521,7 @@ private fun Requirement.wire(): String = scopeOrNull()?.wire ?: name.lowercase()
  * itself must contain no whitespace, which for a compact JWS is a free structural
  * check that rejects a header like `Bearer a b` before the parser sees it.
  */
-private fun bearerToken(call: ApplicationCall): String? {
+internal fun bearerToken(call: ApplicationCall): String? {
     val header = call.request.headers[HttpHeaders.Authorization] ?: return null
     val trimmed = header.trim()
     if (trimmed.length < 8) return null

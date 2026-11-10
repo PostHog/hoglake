@@ -90,6 +90,13 @@ object Metrics {
                     .register(registry)
             }
 
+        val mountExchange: Timer by lazy {
+            Timer.builder("hoglake_mount_exchange_requests")
+                .description("Latency of a mount Client's token exchanges, send to the issuer's answer")
+                .publishPercentileHistogram()
+                .register(registry)
+        }
+
         fun mountScanInFlight(catalog: String): AtomicInteger =
             mountScanInFlight.computeIfAbsent(catalog) { name ->
                 AtomicInteger().also { n ->
@@ -948,6 +955,46 @@ object Metrics {
         catalog: String,
         reason: String,
     ) = increment("hoglake_mount_proxy_upstream_errors_total", 1.0, "catalog", catalog, "reason", reason)
+
+    /**
+     * hoglake_mount_exchange_requests_total and the
+     * hoglake_mount_exchange_requests_seconds histogram: one count and one
+     * timing per token exchange a mount Client sent to the issuer, whatever
+     * came back. No label: the token, the client and the reader are never
+     * one, and the mount is the reader's org.
+     */
+    fun mountExchangeSent(nanos: Long) {
+        increment("hoglake_mount_exchange_requests_total", 1.0)
+        timers?.mountExchange?.record(nanos, TimeUnit.NANOSECONDS)
+    }
+
+    /**
+     * hoglake_mount_exchange_cache_total{result}: how each request for a
+     * mount token was met. `hit` (a cached answer), `shared` (it joined an
+     * exchange in flight for the same subject token), `miss` (it sent one).
+     */
+    fun mountExchangeCache(result: String) = increment("hoglake_mount_exchange_cache_total", 1.0, "result", result)
+
+    /**
+     * hoglake_mount_exchange_errors_total{reason}: requests for a mount
+     * token that got none, counted once where the answer was made (a
+     * cached refusal is a cache hit, not a second error). `reason` is
+     * closed. The reader's: `invalid_target`, `invalid_grant`,
+     * `near_expiry`, `subject_too_large`. This deployment's:
+     * `invalid_client`, `unauthorized_client`, `unsupported_grant_type`,
+     * `invalid_request`, and `paused` (not sent, shortly after one of
+     * those or a `rate_limited`). The issuer's: `rate_limited`,
+     * `temporarily_unavailable`, `unavailable`, `timeout`,
+     * `invalid_response`. This server's cap: `busy`.
+     */
+    fun mountExchangeError(reason: String) = increment("hoglake_mount_exchange_errors_total", 1.0, "reason", reason)
+
+    /**
+     * hoglake_mount_exchange_listing_omitted_total: catalog listings that
+     * left a reader's mount out because the exchange could not be made, so
+     * whether it has one was unknown. The listing itself answered 200.
+     */
+    fun mountExchangeListingOmitted() = increment("hoglake_mount_exchange_listing_omitted_total", 1.0)
 
     /**
      * hoglake_auth_signing_keys — keys the token verifier holds right now.

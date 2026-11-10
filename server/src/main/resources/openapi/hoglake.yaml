@@ -77,6 +77,24 @@ info:
     streamed; if it fails part-way, or passes the size cap, the connection
     is closed instead of the body being finished.
 
+    A host entry may instead be reached by token exchange (`auth: exchange`),
+    which is how a reader that holds only its org catalog's token reads its
+    org's mount `<orgID>-events`: this server trades the reader's token at
+    the issuer for one that names the mount and calls the host with that.
+    The reader is a verified scoped caller whose `org` is `<orgID>` and
+    whose `cat` names the catalog `<orgID>` with read; anyone else, a token
+    that names the mount itself included, is 404 with nothing sent. The
+    mount is read-only whatever that catalog's scope (a write is 403
+    `forbidden`). When the issuer has no mount for the reader the answer is
+    the same 404 `not_found`; a reader token with under 30 seconds left is
+    401 `token_expired`. Three more answers are this server's own: 503
+    `mount_exchange_unavailable` with Retry-After (the token endpoint could
+    not be reached, did not answer in time, or is shedding load), 500
+    `mount_exchange_misconfigured` (the issuer refused this server's own
+    client or request) and 502 `mount_exchange_invalid_response` (the token
+    endpoint answered with something that is not its contract). A host's
+    401 to the exchanged token is 502 `mount_host_invalid_response`.
+
     Two refusals are worth distinguishing, because they mean different
     things to a client:
 
@@ -172,7 +190,10 @@ paths:
         every route answers for the mount instead. On a mount Client the
         mounts are the entries its hosts list for those names, as the hosts
         wrote them; while a host is unreachable, that caller's listing
-        answers 503 `mount_host_unavailable`.
+        answers 503 `mount_host_unavailable`. For a host reached by token
+        exchange the one candidate is the caller's own org's mount; it is
+        left out when the issuer has none for the caller, and also while
+        the exchange cannot be made (the listing still answers 200).
       responses:
         "200":
           description: Catalogs

@@ -3,6 +3,8 @@ package com.posthog.hoglake.store
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.posthog.hoglake.BuildInfo
+import com.posthog.hoglake.auth.bearerToken
+import com.posthog.hoglake.auth.hoglakeAuth
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.observability.REQUEST_ID_HEADER
@@ -50,10 +52,12 @@ import kotlin.coroutines.resumeWithException
  *
  * It decides nothing about isolation. The caller is checked as a mount
  * reader before a binding to this client exists
- * ([CatalogStoreSelector.resolve]); here the caller's `Authorization`
- * header goes to the Host unchanged, and the Host verifies the token again
- * and applies its own `ReadScope`. The Client holds no team values and
- * filters nothing.
+ * ([CatalogStoreSelector.resolve]). Then, by the host's auth mode, either
+ * the caller's `Authorization` header goes to the Host unchanged
+ * (`forward`), or the caller's token is traded at the issuer for the
+ * mount's and that one goes instead (`exchange`, [MountTokenExchange]).
+ * Either way the Host verifies the token it is given and applies its own
+ * `ReadScope`. The Client holds no team values and filters nothing.
  *
  * What it does own:
  * - **Where a request goes.** Only the host's origin. Every path is built here from
@@ -93,6 +97,9 @@ class MountHostClient(
     private val log = KotlinLogging.logger {}
     private val base = URI(host.origin.scheme, null, host.origin.host, host.origin.port, null, null, null).toString()
     private val permits = Semaphore(host.maxConcurrent)
+
+    /** The token exchange of a host of auth mode `exchange`; null for one that is forwarded to. */
+    internal val tokens: MountTokenExchange? = host.exchange?.let { MountTokenExchange(host.id, it) }
 
     /**
      * Where this host's blocking body reads run: as many threads as it has
@@ -166,13 +173,93 @@ class MountHostClient(
         mounts: Set<String>,
     ): List<JsonNode> {
         if (mounts.isEmpty()) return emptyList()
-        return exchange(call, mounts, URI.create("$base/v1/catalogs")) { body, deadline ->
+        val credential = listingCredential(call, mounts) ?: return emptyList()
+        return exchange(call, mounts, URI.create("$base/v1/catalogs"), credential) { body, deadline ->
             val bytes = read(body, LISTING_BYTES, mounts, deadline)
             if (bytes.size > LISTING_BYTES) throw tooLarge(mounts)
             val root = runCatching { json.readTree(bytes) }.getOrNull()
             if (root == null || !root.isArray) throw invalid(mounts, "a catalog listing that is not a JSON array")
             root.filter { it.isObject && it.get("name")?.takeIf(JsonNode::isTextual)?.asText() in mounts }
                 .distinctBy { it.get("name").asText() }
+        }
+    }
+
+    /** What the Host is given as the caller's credential, and how to disown it if the Host refuses it. */
+    private class Credential(
+        val authorization: String,
+        /** Called when the Host answers 401 to [authorization]; null when that answer is the caller's own. */
+        val refusedByHost: (() -> Unit)? = null,
+    )
+
+    /**
+     * The credential for a request about [mount], by the host's auth mode.
+     * In `exchange` mode this is where the issuer is asked (or the cache
+     * answers), and where a reader it refuses is answered: before the cap,
+     * before any per-mount metric, and with nothing sent to the Host.
+     */
+    private suspend fun credential(
+        call: ApplicationCall,
+        mount: String,
+    ): Credential =
+        when (host.auth) {
+            // The caller's own credential, exactly as it arrived and as
+            // the auth plugin verified it. Right only because this host
+            // verifies the same issuer's tokens (MountHost.Auth.FORWARD).
+            MountHost.Auth.FORWARD ->
+                Credential(
+                    call.request.headers[HttpHeaders.Authorization]
+                        ?: throw HoglakeException.NotFound("catalog '$mount'"),
+                )
+            MountHost.Auth.EXCHANGE -> {
+                val subject = subject(call, mount) ?: throw HoglakeException.NotFound("catalog '$mount' not found")
+                val exchange = checkNotNull(tokens)
+                exchanged(MountTokenExchange.orThrow(exchange.token(subject, mount), mount), subject, mount)
+            }
+        }
+
+    /**
+     * The caller's own token, to trade for [mount]'s, or null when the
+     * caller is not that mount's reader. The binding has already held the
+     * caller to this rule ([CatalogStoreSelector.remote]); it is asked
+     * again here because this is where this server's own credential is
+     * spent, and that must never depend on who called this class.
+     */
+    private fun subject(
+        call: ApplicationCall,
+        mount: String,
+    ): String? = bearerToken(call)?.takeIf { MountEntitlement.mayRead(call.hoglakeAuth.callerOrNull, mount) }
+
+    private fun exchanged(
+        token: String,
+        subject: String,
+        mount: String,
+    ) = Credential("Bearer $token") { checkNotNull(tokens).forget(subject, mount) }
+
+    /**
+     * The credential for the Host's listing of [mounts], or null when the
+     * listing shows none of them. A forwarded token always asks. An
+     * exchanged one asks only once the issuer has minted it: a refusal
+     * means this caller has no mount, and an exchange that could not be
+     * made leaves that unknown, so the mount is left out (and counted)
+     * rather than failing a listing that every scoped reader of this
+     * server makes, mount or no mount. With a token in hand the Host's
+     * failure is the listing's failure, as in `forward` mode.
+     */
+    private suspend fun listingCredential(
+        call: ApplicationCall,
+        mounts: Set<String>,
+    ): Credential? {
+        if (host.auth != MountHost.Auth.EXCHANGE) return credential(call, mounts.first())
+        // An exchange is for one mount: the caller's own (MountEntitlement).
+        val mount = mounts.singleOrNull() ?: return null
+        val subject = subject(call, mount) ?: return null
+        return when (val outcome = checkNotNull(tokens).token(subject, mount)) {
+            is MountTokenExchange.Outcome.Minted -> exchanged(outcome.token, subject, mount)
+            is MountTokenExchange.Outcome.Refused -> null
+            is MountTokenExchange.Outcome.Failed -> {
+                Metrics.mountExchangeListingOmitted()
+                null
+            }
         }
     }
 
@@ -183,7 +270,8 @@ class MountHostClient(
         vararg tail: String,
     ) {
         val mounts = setOf(mount)
-        exchange(call, mounts, URI.create(base + path(mount, tail.asList()) + query(call))) { body, deadline ->
+        val uri = URI.create(base + path(mount, tail.asList()) + query(call))
+        exchange(call, mounts, uri, credential(call, mount)) { body, deadline ->
             val head = read(body, prebufferBytes, mounts, deadline)
             if (head.size > maxResponseBytes) throw tooLarge(mounts)
             if (head.size <= prebufferBytes) {
@@ -234,24 +322,17 @@ class MountHostClient(
      * One request to the Host under the cap and the deadline. [onOk] gets
      * the body of a 200 JSON answer; every other answer is thrown as the
      * typed error the caller is given. Counted and timed against [mounts],
-     * which the caller's verified `cat` names.
+     * which the caller's verified `cat` names (or, by exchange, the issuer
+     * has just minted a token for).
      */
     private suspend fun <T> exchange(
         call: ApplicationCall,
         mounts: Set<String>,
         uri: URI,
+        credential: Credential,
         onOk: suspend (body: InputStream, deadline: Deadline) -> T,
     ): T {
         check(mounts.isNotEmpty() && mounts.all(MountNames::isReserved)) { "not a mount name" }
-        val authorization =
-            when (host.auth) {
-                // The caller's own credential, exactly as it arrived and as
-                // the auth plugin verified it. Right only because this host
-                // verifies the same issuer's tokens (MountHost.Auth.FORWARD).
-                MountHost.Auth.FORWARD ->
-                    call.request.headers[HttpHeaders.Authorization]
-                        ?: throw HoglakeException.NotFound("catalog '${mounts.first()}'")
-            }
         if (!permits.tryAcquire()) {
             mounts.forEach { Metrics.mountRefused(it, "mount_proxy_busy") }
             throw HoglakeException.MountProxyBusy("too many mount requests are in flight on this server; retry shortly")
@@ -265,7 +346,7 @@ class MountHostClient(
                         .GET()
                         .header(HttpHeaders.Accept, "application/json")
                         .header(HttpHeaders.UserAgent, USER_AGENT)
-                        .header(HttpHeaders.Authorization, authorization)
+                        .header(HttpHeaders.Authorization, credential.authorization)
                         .also { builder -> call.requestId?.let { builder.header(REQUEST_ID_HEADER, it) } }
                         .build()
                 } catch (_: IllegalArgumentException) {
@@ -292,6 +373,19 @@ class MountHostClient(
                             if (!isJson(response)) throw invalid(mounts, "a 200 that is not JSON")
                             if (!isFramed(response)) throw invalid(mounts, "a 200 body with no length and no chunking")
                             onOk(body, deadline)
+                        } else if (response.statusCode() == HttpStatusCode.Unauthorized.value &&
+                            credential.refusedByHost != null
+                        ) {
+                            // The Host refused a token this server got for
+                            // the caller, which the caller never held: not
+                            // the caller's 401 to act on. The token is not
+                            // presented again.
+                            credential.refusedByHost.invoke()
+                            mounts.forEach { Metrics.mountProxyUpstreamError(it, "http_401") }
+                            log.warn { "mount host ${host.id} refused the token this server exchanged for it" }
+                            throw HoglakeException.MountHostInvalidResponse(
+                                "the mount host refused this server's credential for the mount",
+                            )
                         } else {
                             throw refusal(mounts, response, read(body, ERROR_BODY_BYTES, mounts, deadline))
                         }
@@ -475,6 +569,7 @@ class MountHostClient(
     override fun close() {
         watchdog.shutdownNow()
         http.shutdownNow()
+        tokens?.close()
     }
 
     internal companion object {

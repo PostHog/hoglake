@@ -4,9 +4,13 @@ import com.fasterxml.jackson.core.JsonParser
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.posthog.hoglake.hoglite.HogliteBackend
 import com.posthog.hoglake.store.BackendKind
+import com.posthog.hoglake.store.ClientSecret
+import com.posthog.hoglake.store.MountExchange
 import com.posthog.hoglake.store.MountHost
 import com.posthog.hoglake.store.MountMatch
 import com.posthog.hoglake.store.MountNames
+import com.posthog.hoglake.store.MountTokenExchange
+import com.posthog.hoglake.store.SecretSource
 import java.net.URI
 import java.nio.file.Files
 import java.nio.file.Path
@@ -78,10 +82,16 @@ data class Config(
      * `match` is {"type": "events"} (every mount name, `<orgID>-events`) or
      * {"type": "catalog", "name": NAME} (one mount name). `kind` is what the
      * host speaks (only `hoglake`), `auth` how this server authenticates to
-     * it (only `forward`: the caller's bearer token, unchanged). Optional
-     * keys: timeout_ms, max_response_bytes, max_concurrent. Entries contain
-     * endpoints, never credentials; each id must be unique and canonical,
-     * each URL a bare http(s) origin, and no name may match two entries.
+     * it: `forward` (the caller's bearer token, unchanged) or `exchange`
+     * (a token this server gets for the caller from the issuer's token
+     * endpoint, hogtower#181), which takes
+     * "exchange": {"token_url": HTTP_URL, "client_id": "hls_...",
+     * "client_secret_env": "HOGLAKE_MOUNT_EXCHANGE_..."} and an optional
+     * timeout_ms there. Optional keys: timeout_ms, max_response_bytes,
+     * max_concurrent. Entries contain endpoints, never credentials: the
+     * client secret is named by the environment variable that holds it
+     * ([mountSecrets]). Each id must be unique and canonical, each URL a
+     * bare http(s) origin, and no name may match two entries.
      *
      * Empty (the default), or an empty list: no proxy, today's behaviour.
      * With hosts, a request for a matched name is checked here as a mount
@@ -91,6 +101,11 @@ data class Config(
      * serves only verified scoped tokens).
      */
     val mountHostsFile: String = env("HOGLAKE_MOUNT_HOSTS_FILE", ""),
+    /**
+     * Where a secret that [mountHostsFile] names is read: the process
+     * environment. A parameter so a test can supply one; it prints nothing.
+     */
+    val mountSecrets: SecretSource = SecretSource.ENVIRONMENT,
     val port: Int = env("HOGLAKE_PORT", "8080").toInt(),
     /**
      * The infra listener's port (docs/auth-tenancy.md §6.7): `GET /metrics`
@@ -1376,7 +1391,7 @@ data class Config(
     val mountSourceFieldIdOrNull: Long? = mountSourceFieldId.takeIf { it.isNotBlank() }?.toLong()
 
     /** The remote hosts of [mountHostsFile]; empty when this server is not a mount Client. */
-    val mountHosts: List<MountHost> = readMountHosts(mountHostsFile)
+    val mountHosts: List<MountHost> = readMountHosts(mountHostsFile, mountSecrets)
 
     init {
         require(mountAllowlist.all { it == "*" || MountNames.isReserved("$it-events") }) {
@@ -1982,7 +1997,10 @@ private fun readBackends(file: String): Map<UUID, HogliteBackend> {
  * file: an unknown key, kind, auth mode or matcher is refused, so a host
  * this server cannot serve correctly never boots half-understood.
  */
-private fun readMountHosts(file: String): List<MountHost> {
+private fun readMountHosts(
+    file: String,
+    secrets: SecretSource,
+): List<MountHost> {
     if (file.isBlank()) return emptyList()
     val json = jacksonObjectMapper().enable(JsonParser.Feature.STRICT_DUPLICATE_DETECTION)
     val root = Files.newBufferedReader(Path.of(file)).use { json.readTree(it) }
@@ -1994,7 +2012,10 @@ private fun readMountHosts(file: String): List<MountHost> {
     val hosts = mutableListOf<MountHost>()
     for (entry in entries) {
         require(entry.isObject) { "mount host entry must be an object" }
-        val keys = setOf("id", "match", "kind", "url", "auth", "timeout_ms", "max_response_bytes", "max_concurrent")
+        val keys =
+            setOf(
+                "id", "match", "kind", "url", "auth", "exchange", "timeout_ms", "max_response_bytes", "max_concurrent",
+            )
         require(entry.properties().all { it.key in keys }) { "mount host entry has unknown fields" }
 
         fun text(
@@ -2049,6 +2070,11 @@ private fun readMountHosts(file: String): List<MountHost> {
             requireNotNull(MountHost.Auth.entries.firstOrNull { it.wire == authText }) {
                 "mount host auth '$authText' is not supported: only ${MountHost.Auth.entries.map { it.wire }}"
             }
+        val exchangeNode = entry.get("exchange")
+        require((auth == MountHost.Auth.EXCHANGE) == (exchangeNode != null)) {
+            "a mount host takes an exchange object exactly when its auth is '${MountHost.Auth.EXCHANGE.wire}'"
+        }
+        val exchange = exchangeNode?.let { readMountExchange(it, secrets) }
         val origin =
             requireNotNull(MountHost.origin(text(entry, "url"))) {
                 "mount host url must be http(s)://host[:port], with no user-info, path, query or fragment"
@@ -2071,8 +2097,54 @@ private fun readMountHosts(file: String): List<MountHost> {
                 timeoutMs = timeout,
                 maxResponseBytes = positive("max_response_bytes", MountHost.DEFAULT_MAX_RESPONSE_BYTES),
                 maxConcurrent = concurrent.toInt(),
+                exchange = exchange,
             )
     }
     MountHost.requireDisjoint(hosts)
     return hosts
+}
+
+/**
+ * A host entry's `exchange` object: the token endpoint, the client id, and
+ * the NAME of the environment variable that holds the client secret. The
+ * secret is read here, once, and no message this function throws carries
+ * it: a refusal names the variable.
+ */
+private fun readMountExchange(
+    node: com.fasterxml.jackson.databind.JsonNode,
+    secrets: SecretSource,
+): MountExchange {
+    require(node.isObject) { "mount host exchange must be an object" }
+    val keys = setOf("token_url", "client_id", "client_secret_env", "timeout_ms")
+    require(node.properties().all { it.key in keys }) { "mount host exchange has unknown fields" }
+
+    fun text(key: String): String {
+        val value = node.get(key)
+        require(value != null && value.isTextual) { "mount host exchange requires a string $key" }
+        return value.asText()
+    }
+    val tokenUrl =
+        requireNotNull(MountExchange.tokenUrl(text("token_url"))) {
+            "mount host exchange token_url must be http(s)://host[:port]/path, with no user-info, query or fragment"
+        }
+    val clientId = text("client_id")
+    require(MountTokenExchange.isClientId(clientId)) { MountTokenExchange.CLIENT_ID_RULE }
+    val variable = text("client_secret_env")
+    require(SecretSource.NAME.matches(variable)) {
+        "mount host exchange client_secret_env must name a variable matching ${SecretSource.NAME.pattern}"
+    }
+    val secret = secrets[variable]
+    require(!secret.isNullOrEmpty()) { "$variable is not set: a mount host's exchange names it as its client secret" }
+    require(secret.toByteArray(Charsets.UTF_8).size in MountTokenExchange.SECRET_BYTES) {
+        "$variable must be ${MountTokenExchange.SECRET_BYTES.first} to ${MountTokenExchange.SECRET_BYTES.last} bytes"
+    }
+    val timeout =
+        node.get("timeout_ms")?.let {
+            val inRange = it.canConvertToLong() && it.asLong() in 1..MountExchange.TIMEOUT_CEILING_MS
+            require(it.isIntegralNumber && inRange) {
+                "mount host exchange timeout_ms must be 1..${MountExchange.TIMEOUT_CEILING_MS}"
+            }
+            it.asLong()
+        } ?: MountExchange.DEFAULT_TIMEOUT_MS
+    return MountExchange(tokenUrl, clientId, ClientSecret(secret), timeout)
 }

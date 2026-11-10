@@ -578,8 +578,11 @@ object AuthPolicy {
         // can see, so it checks `cat`, and binding dispatch serves the mount.
         // A reserved name that is no mount is served as the catalog it is,
         // which shows the caller only what its catalog listing does.
+        // A caller's exchange mount (Caller.exchangeMount) counts as a mount
+        // it holds `read` on, here and below: the reader of a mount host of
+        // auth mode `exchange` holds only its org catalog's token.
         if (required != null && route in MOUNT_ROUTES && MountNames.isReserved(catalog)) {
-            return if (caller.catalogClaimAllows(catalog, required)) {
+            return if (caller.routeAllows(catalog, required)) {
                 AuthDecision.Allow
             } else {
                 AuthDecision.InsufficientScope(catalog, required)
@@ -588,7 +591,7 @@ object AuthPolicy {
         if (required == null || route == null || (route !in SCOPED_ROUTES && route !in BODY_SCOPED_ROUTES)) {
             return AuthDecision.NotPredicated(catalog, match.pattern)
         }
-        if (!caller.catalogClaimAllows(catalog, required)) return AuthDecision.InsufficientScope(catalog, required)
+        if (!caller.routeAllows(catalog, required)) return AuthDecision.InsufficientScope(catalog, required)
         if (route in BODY_SCOPED_ROUTES) return AuthDecision.ByBody(catalog, required)
         val namespace = match.namespace ?: return AuthDecision.Allow
         return AuthDecision.ByNamespace(catalog, namespace, required)

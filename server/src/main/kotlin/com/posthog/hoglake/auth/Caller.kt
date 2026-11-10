@@ -46,6 +46,16 @@ data class Caller(
     val user: String? = null,
     /** Verified placement for one catalog. Endpoints come only from server configuration. */
     val routing: Routing? = null,
+    /**
+     * The one mount this server serves the caller through a token exchange
+     * (`store/MountEntitlement.kt`), or null. It is NOT a claim: the server
+     * derives it from the token's own `org` and `cat` when a mount host of
+     * auth mode `exchange` serves that name, and attaches it after the
+     * token verified. It opens the mount's routes in [AuthPolicy] at
+     * `read` and nothing else; binding dispatch decides again from the
+     * claims, and the issuer and the host after it.
+     */
+    val exchangeMount: String? = null,
 ) {
     enum class Kind {
         /** A tenant. Every catalog it may touch is enumerated in [catalogScopes]. */
@@ -82,7 +92,8 @@ data class Caller(
      * catalog exists, which turns an org UUID the caller was never given into an
      * enumeration oracle.
      */
-    fun knowsCatalog(catalog: String): Boolean = kind.isOperator() || catalogScopes.containsKey(catalog)
+    fun knowsCatalog(catalog: String): Boolean =
+        kind.isOperator() || catalogScopes.containsKey(catalog) || catalog == exchangeMount
 
     /** Holder of [scope] on [catalog], by [Scope.satisfies]. */
     fun holds(
@@ -126,6 +137,17 @@ data class Caller(
         catalog: String,
         scope: Scope,
     ): Boolean = catalogScopes[catalog]?.any { it.satisfies(scope) } == true
+
+    /**
+     * [catalogClaimAllows], or [catalog] is this caller's [exchangeMount]
+     * and [scope] is `read`. For the route table only ([AuthPolicy]): it
+     * lets the caller reach binding dispatch, which serves the mount or
+     * refuses.
+     */
+    internal fun routeAllows(
+        catalog: String,
+        scope: Scope,
+    ): Boolean = catalogClaimAllows(catalog, scope) || (catalog == exchangeMount && Scope.READ.satisfies(scope))
 
     /** Every catalog name this caller may read — the filter for fleet-wide listings. */
     fun visibleCatalogs(): Set<String>? = if (kind.isOperator()) null else catalogScopes.keys

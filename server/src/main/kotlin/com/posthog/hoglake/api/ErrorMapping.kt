@@ -35,6 +35,12 @@ private val log = KotlinLogging.logger("com.posthog.hoglake.api.ErrorMapping")
  * - MountProxyBusy      -> 503 `mount_proxy_busy` + Retry-After (a mount Client's proxy cap full)
  * - MountHostInvalidResponse -> 502 `mount_host_invalid_response` (the Host broke its contract)
  * - MountHostRefused    -> the Host's own status and code, on a mount Client
+ * - MountExchangeUnavailable -> 503 `mount_exchange_unavailable` + Retry-After (a mount Client's
+ *                          token endpoint is unreachable, late or shedding load)
+ * - MountExchangeMisconfigured -> 500 `mount_exchange_misconfigured` (the issuer refused this
+ *                          server's own client or request)
+ * - MountExchangeInvalidResponse -> 502 `mount_exchange_invalid_response` (the token endpoint
+ *                          broke its contract)
  * - AlreadyExists       -> 409
  * - CommitConflict      -> 409
  * - OffsetRegression    -> 409
@@ -112,6 +118,12 @@ internal fun errorBody(cause: HoglakeException): Pair<HttpStatusCode, ApiErrorDt
         // The Host's refusal, as the Host worded it (store/MountHostClient.kt).
         is HoglakeException.MountHostRefused ->
             HttpStatusCode.fromValue(cause.status) to apiError(cause.code, cause)
+        is HoglakeException.MountExchangeUnavailable ->
+            HttpStatusCode.ServiceUnavailable to apiError("mount_exchange_unavailable", cause)
+        is HoglakeException.MountExchangeMisconfigured ->
+            HttpStatusCode.InternalServerError to apiError("mount_exchange_misconfigured", cause)
+        is HoglakeException.MountExchangeInvalidResponse ->
+            HttpStatusCode.BadGateway to apiError("mount_exchange_invalid_response", cause)
         is HoglakeException.BackendResultTooLarge ->
             HttpStatusCode.UnprocessableEntity to apiError("backend_result_too_large", cause)
         is HoglakeException.BackendQueryTimeout ->
@@ -225,6 +237,7 @@ fun StatusPagesConfig.installErrorMapping() {
             cause is HoglakeException.MountScanBusy ||
             cause is HoglakeException.MountHostUnavailable ||
             cause is HoglakeException.MountProxyBusy ||
+            cause is HoglakeException.MountExchangeUnavailable ||
             cause is PartitionLookupUnavailable
         ) {
             call.response.headers.append(HttpHeaders.RetryAfter, RETRY_AFTER_SECONDS)

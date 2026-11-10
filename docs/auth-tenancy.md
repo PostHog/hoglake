@@ -904,7 +904,8 @@ requests go through the Client.
   bounds: `timeout_ms` (75,000; at most 600,000), `max_response_bytes`
   (1 GiB), `max_concurrent` (16; at most 256). A request holds its permit
   for at most `timeout_ms` plus 10 s for a slow caller. Endpoints only,
-  never credentials. Checked at boot:
+  never credentials (an exchange host names the variable that holds its
+  secret). Checked at boot:
   ids are unique, no name matches two entries, each `url` is a bare http(s)
   origin (no user-info, path, query or fragment), unknown keys are refused.
   No file, or an empty list, is a server that is not a Client.
@@ -914,13 +915,15 @@ requests go through the Client.
   grammar, `AuthPolicy.MOUNT_ROUTES` and the listing are all keyed on the
   mount shape, and any other name could be a catalog on a token-routed
   backend.
-- **Kind and auth.** `kind` is `hoglake` only. `auth` is `forward` only: the
-  caller's bearer token, unchanged. That is sound only for a host that
-  verifies the same issuer's tokens for the same audience as this server:
-  the Client has verified the token, the host verifies it again and scopes
-  by its claims, and the Client holds no credential of its own. A host
-  under another authority, or one that is not a hoglake, needs its own auth
-  mode and reader; any other value is refused at boot.
+- **Kind and auth.** `kind` is `hoglake` only. `auth` is `forward` or
+  `exchange` (below). `forward` is the caller's bearer token, unchanged.
+  That is sound only for a host that verifies the same issuer's tokens for
+  the same audience as this server: the Client has verified the token, the
+  host verifies it again and scopes by its claims, and the Client holds no
+  credential of its own. It serves only a caller whose token names the
+  mount, which no reader's does: a reader's token names its org catalog. A
+  host under another authority, or one that is not a hoglake, needs its
+  own auth mode and reader; any other value is refused at boot.
 - **One seam.** `MountHostResolver.resolve(caller, catalog)` answers the
   reader of the host that serves a name, or nothing. `CatalogStoreSelector`
   asks it before the mount registry and before any backend lookup, and the
@@ -931,8 +934,8 @@ requests go through the Client.
   `HOGLAKE_MOUNT_ALLOWLIST`, under `HOGLAKE_AUTH_MODE=off`, or without
   `HOGLAKE_AUTH_PREDICATE_FIELDS` (the hosts' own fields: no scoped token
   verifies without them).
-- **Checked here first.** The binding applies the mount reader's rule of
-  §6.5a before anything is sent: only a verified scoped caller whose `cat`
+- **Checked here first.** For a `forward` host the binding applies the
+  mount reader's rule of §6.5a before anything is sent: only a verified scoped caller whose `cat`
   names the mount with `read`. Everyone else gets the same 404, a reader
   whose `rtg` is hoglite the same 501, a write the same 403
   `read_only_catalog` and an unserved read the same 501
@@ -974,6 +977,132 @@ requests go through the Client.
   `hoglake_mount_refusals_total`. The `catalog` label is written only after
   the reader check has passed, so it is a name from a verified `cat`. Logs
   name a host by its `id`, never its URL.
+
+#### Auth mode `exchange`
+
+A reader holds one token, for its org catalog: `cat` names `<orgID>` and
+`rtg` places it on hoglite. The Host serves `<orgID>-events` only to a token
+whose `cat` names the mount, and answers 501 to one placed on hoglite. So
+for a real reader the Client trades the reader's token for the mount's at
+the issuer (hogtower's "Events mount exchange", PostHog/hogtower#181) and
+calls the Host with that. The reader never sees the mount token.
+
+```json
+{"hosts": [{"id": "3c0c6d0e-1f2a-4b3c-9d4e-5f6a7b8c9d0e",
+            "match": {"type": "events"},
+            "kind": "hoglake",
+            "url": "http://gigahog-server.gigahog:8080",
+            "auth": "exchange",
+            "exchange": {"token_url": "http://hogtower.internal:8080/oauth/token",
+                         "client_id": "hls_0123456789abcdef01234567",
+                         "client_secret_env": "HOGLAKE_MOUNT_EXCHANGE_CLIENT_SECRET"}}]}
+```
+
+- **Settings.** `exchange` is required with `"auth": "exchange"` and refused
+  without it. `token_url` is the issuer's token endpoint on its in-cluster
+  listener: http(s), a host, a plain path, no user-info, query or fragment.
+  `client_id` is the fleet client's (`hls_` and 24 lowercase hex
+  characters). `client_secret_env` is the NAME of the environment variable
+  that holds the secret; it must start with `HOGLAKE_MOUNT_EXCHANGE_`, so
+  the file cannot point at another secret of the process. The secret
+  itself is never in the file. Boot refuses a variable that is unset or not
+  32 to 256 bytes, naming the variable and not its value. Optional
+  `timeout_ms` (5,000; at most 30,000) is the deadline for one exchange.
+- **Rotation** is by restart. hogtower accepts older secrets as fallbacks:
+  add the new secret there with the old one as a fallback, roll this server
+  with the new value, then drop the fallback.
+- **Who is served.** Only the mount's own org's reader: a verified scoped
+  caller whose `org` is `<orgID>` and whose `cat` names the catalog
+  `<orgID>` with `read`. Everyone else is the 404 a missing catalog gets,
+  with nothing sent to the issuer or the Host: another org's reader, a
+  tenant, an operator, no token, and a token that names the mount itself
+  (mount tokens are this server's, never a reader's). The rule and the
+  name mapping are `store/MountEntitlement.kt` and nothing else; `rtg` is
+  not looked at. The mount is read-only whatever the org catalog's scope:
+  a write is 403 `forbidden` and an unserved read 501
+  `mount_operation_unavailable`, both answered here.
+- **How it is decided.** The auth plugin attaches the caller's one mount
+  (`Caller.exchangeMount`: derived, not a claim, and only when an exchange
+  host serves that name), which opens the mount's routes to it in
+  `AuthPolicy` at `read`. Binding dispatch decides again from the token's
+  own claims. The issuer decides a third time (it re-reads the reader's
+  teams) and the Host a fourth (`ReadScope`).
+- **The exchange.** `POST token_url`, HTTP Basic as the client, form fields
+  `grant_type=urn:ietf:params:oauth:grant-type:token-exchange`,
+  `subject_token=<the reader's token>`,
+  `subject_token_type=urn:ietf:params:oauth:token-type:access_token`,
+  `resource=urn:posthog:hoglake:catalog:<orgID>-events`, `audience=hoglake`.
+  Only that URL is contacted: no redirects, no proxy. The wire contract is
+  one file, `store/MountTokenExchange.kt`.
+- **The cache.** Keyed by the SHA-256 of the signed part of the reader's
+  token (`header.payload`) and the mount name, so a token minted from one
+  reader's token is never used for another's. The signature's spelling is
+  not in the key, so one token is one entry however its signature is
+  encoded. At most 10,000 entries per host, least recently used first
+  out. An entry is used only while more than **30 s** of the lifetime the
+  issuer stated remain, then exchanged again. Thirty seconds covers the
+  time from the cache check to the Host's own verification and the clock
+  difference between the issuer and the Host, and is under the 60 s at
+  which pyhoglake and the DuckDB client renew a token. Concurrent requests
+  with one reader token share one exchange. A refusal is kept for 30 s (a
+  newly federated org sees its mount at most that late); a failure is
+  never kept. At most 32 exchanges are in flight; while the issuer does
+  not answer, that many requests wait out the deadline and the rest are
+  answered at once.
+- **What a reader is answered.**
+
+  | the issuer says | the reader gets |
+  | --- | --- |
+  | a token | the Host's answer, as in `forward` mode |
+  | `invalid_target` (no such mount for this org) | 404 `not_found`, as for any catalog it may not see |
+  | `invalid_grant` (revoked, or no federated team in common) | the same 404 |
+  | (not asked) the reader's token has under 30 s left | 401 `token_expired`: renew it |
+  | 401, `unauthorized_client`, `unsupported_grant_type`, `invalid_request` | 500 `mount_exchange_misconfigured` |
+  | 429, 503, no answer inside the deadline | 503 `mount_exchange_unavailable` + Retry-After |
+  | anything else (a redirect, not JSON, no usable token) | 502 `mount_exchange_invalid_response` |
+
+  `mount_exchange_misconfigured` is this deployment's to fix (the client id
+  or secret, or the exchange not enabled at the issuer): alert on it. After
+  one, no exchange is sent for 10 s, so a wrong secret does not drain the
+  failure budget the issuer keeps per source address; after a 429, none for
+  its Retry-After. A Host 401 to a token this server exchanged is 502
+  `mount_host_invalid_response`, not the reader's 401, and that token is
+  dropped. No answer names the token endpoint, the client or a token.
+- **The listing.** `GET /v1/catalogs` shows a reader its own org's mount as
+  the Host lists it: at most one exchange and one Host listing. A refusal
+  means no mount and the listing leaves it out. If the exchange cannot be
+  made (issuer down, credentials refused), whether the reader has a mount
+  is unknown: the listing answers without it and counts
+  `hoglake_mount_exchange_listing_omitted_total`, because every scoped
+  reader of this server lists catalogs, mount or no mount. Once a token is
+  in hand the mount is known to exist, and a Host failure fails the
+  listing as in `forward` mode. A request for the mount itself always gets
+  the typed error.
+- **Metrics.** `hoglake_mount_exchange_requests_total` and the
+  `hoglake_mount_exchange_requests_seconds` histogram (exchanges sent);
+  `hoglake_mount_exchange_cache_total{result}` (`hit`, `miss`, `shared`);
+  `hoglake_mount_exchange_errors_total{reason}` (`invalid_target`,
+  `invalid_grant`, `near_expiry`, `subject_too_large`, `invalid_client`,
+  `unauthorized_client`, `unsupported_grant_type`, `invalid_request`,
+  `paused`, `rate_limited`, `temporarily_unavailable`, `unavailable`,
+  `timeout`, `invalid_response`, `busy`), counted where an answer is made:
+  a refusal served from the cache is a cache `hit`, not a second error.
+  None carries a token, the client, the reader or the org. The per-mount `hoglake_mount_proxy_*` series are
+  written only after a token was minted.
+- **What the secret is worth.** With it, and a reader's valid token, the
+  issuer mints that reader's own org's mount token: at most 15 minutes,
+  never past the reader token's expiry, `read`, for teams the reader
+  already holds. It cannot name another org's mount or mint without a
+  reader's token, and the exchange is reachable only in-cluster. This
+  server exchanges only tokens it verified, for the mount of the token's
+  own org. Minted tokens are held in memory until they expire; a reader
+  revoked at the issuer keeps the mount until its cached token does.
+- **Limits.** The hosts file is deployment configuration, trusted as the
+  secret's own binding is: whoever can write it chooses where
+  `token_url` points, and so where the client's credentials are sent. A
+  Host that refuses every exchanged token (its keys lag a rotation) turns
+  each reader request into one exchange, bounded by the issuer's budget
+  for this client. Exchanges are capped per host, not per org.
 
 ### 6.6 Client-supplied authority fields must die
 

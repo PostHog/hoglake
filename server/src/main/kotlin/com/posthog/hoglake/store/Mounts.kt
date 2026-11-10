@@ -158,15 +158,20 @@ private fun mayReadMount(
 
 /**
  * The names a catalog listing may show [caller] as mounts: those in its own
- * `cat` that [requireMountReader] would let it read. Never null and never
- * "every mount": no caller, a tenant and an operator see none.
+ * `cat` that [requireMountReader] would let it read, and the one it is
+ * served through a token exchange ([Caller.exchangeMount]). Never null and
+ * never "every mount": no caller, a tenant and an operator see none.
  */
-internal fun mountVisibility(caller: Caller?): Set<String> =
-    if (caller == null || caller.routing?.backend == BackendKind.HOGLITE) {
-        emptySet()
-    } else {
-        caller.catalogScopes.keys.filterTo(sortedSetOf()) { MountNames.isReserved(it) && mayReadMount(caller, it) }
-    }
+internal fun mountVisibility(caller: Caller?): Set<String> {
+    if (caller == null) return emptySet()
+    val named =
+        if (caller.routing?.backend == BackendKind.HOGLITE) {
+            emptySet()
+        } else {
+            caller.catalogScopes.keys.filterTo(sortedSetOf()) { MountNames.isReserved(it) && mayReadMount(caller, it) }
+        }
+    return caller.exchangeMount?.let { named + it } ?: named
+}
 
 /**
  * The refusal for a route that has no mount implementation, chosen before any
