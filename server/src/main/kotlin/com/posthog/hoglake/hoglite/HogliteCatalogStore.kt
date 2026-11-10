@@ -1161,40 +1161,15 @@ class HogliteCatalogStore(
         totals: Boolean,
     ): TableInfo =
         catalogOperation(catalog) {
+            if (snapshot == null && atTimestamp == null) return headTable(catalog, namespace, table, totals)
             val m = meta(catalog)
             val at = resolveRead(catalog, m, snapshot, atTimestamp)
             val ns = liveNamespace(catalog, namespace)
             val t = tableAt(catalog, ns.namespaceId, namespace, table, at)
-            val headRead = snapshot == null && atTimestamp == null
-            var recordCount: Long? = null
-            var fileCount: Long? = null
-            var fileSizeBytes: Long? = null
-            if (totals) {
-                // Exact, maintained transactionally by every commit — the
-                // hoglite backend has no sampler lag, so head totals are
-                // not a sample and carry no freshness fields (null, per
-                // the TableInfo KDoc: freshness fields are for samples).
-                // So they must describe `at`. The head comes back in the
-                // SAME statement; if a write moved it since meta(), the
-                // totals are from a later snapshot and the read below
-                // aggregates the files visible at `at` instead.
-                val head =
-                    if (headRead) {
-                        queryCatalog(
-                            catalog,
-                            "SELECT tt.record_count, tt.file_count, tt.file_size_bytes, h.head " +
-                                "FROM (SELECT ${HogliteSchema.HEAD_SQL} AS head) h " +
-                                "LEFT JOIN table_totals tt ON tt.table_id = ?",
-                            t.tableId,
-                        ).firstRow()!!.takeIf { it[3].asLong() == at }
-                    } else {
-                        null
-                    }
-                if (head != null) {
-                    recordCount = head[0].asLongOrNull() ?: 0
-                    fileCount = head[1].asLongOrNull() ?: 0
-                    fileSizeBytes = head[2].asLongOrNull() ?: 0
-                } else {
+            // table_totals is exact at head only, so a pinned read
+            // aggregates the files visible at `at`.
+            val counts =
+                if (totals) {
                     val row =
                         queryCatalog(
                             catalog,
@@ -1205,35 +1180,103 @@ class HogliteCatalogStore(
                             at,
                             at,
                         ).firstRow()!!
-                    recordCount = row[0].asLong()
-                    fileCount = row[1].asLong()
-                    fileSizeBytes = row[2].asLong()
+                    listOf(row[0].asLong(), row[1].asLong(), row[2].asLong())
+                } else {
+                    null
                 }
-            }
-            val columns = columnsAt(catalog, t.tableId, at)
-            return TableInfo(
-                tableId = t.tableId,
-                tableUuid = t.tableUuid,
-                namespace = namespace,
-                name = table,
-                columns = columns,
-                readSnapshotId = at,
-                recordCount = recordCount,
-                fileCount = fileCount,
-                fileSizeBytes = fileSizeBytes,
-                partitionSpec = specAt(catalog, t.tableId, at),
-                sortSpec = sortSpecAt(catalog, t.tableId, at),
-                comment = t.comment,
-                properties = t.properties,
-                // The option as it was at `at`, named by the column at `at`
-                // (CatalogService.getTable): the field is top-level and can
-                // be neither dropped nor renamed while the option is on.
-                objectPrefixField =
-                    layoutAt(catalog, t.tableId, at)?.let { id ->
-                        columns.single { it.fieldId == id }.def.name
-                    },
-            )
+            return tableInfo(catalog, namespace, table, t, at, counts)
         }
+
+    /**
+     * A head getTable: meta, the live namespace and the table row (with its
+     * table_totals) in ONE read-only transaction, so from one engine
+     * snapshot (#537). The head (meta.next_snapshot) and table_totals are
+     * the only reads that no begin/end snapshot pins, so only the snapshot
+     * that read the head can serve totals that describe it. Every `at` in
+     * the table statement is the head inlined, and the namespace id is a
+     * subselect, so no argument carries a value from another snapshot.
+     * The reads after it are pinned at the returned head, so a later
+     * /query of each returns what this snapshot would have.
+     */
+    private fun headTable(
+        catalog: String,
+        namespace: String,
+        table: String,
+        totals: Boolean,
+    ): TableInfo {
+        val head = HogliteSchema.HEAD_SQL
+        val (metaResult, nsResult, tableResult) =
+            readCatalog(
+                catalog,
+                listOf(
+                    HogliteStatement(metaSql),
+                    HogliteStatement(LIVE_NAMESPACE_SQL, listOf(namespace)),
+                    // Column 9 is the head the statement saw; the totals follow it.
+                    HogliteStatement(
+                        "SELECT t.id, t.table_uuid, v.namespace_id, v.namespace, v.name, v.comment, " +
+                            "v.properties_json, t.next_row_id, t.schema_version, $head" +
+                            (if (totals) ", tt.record_count, tt.file_count, tt.file_size_bytes" else "") +
+                            " FROM table_versions v JOIN tables t ON t.id = v.table_id " +
+                            (if (totals) "LEFT JOIN table_totals tt ON tt.table_id = t.id " else "") +
+                            "WHERE v.namespace_id = $LIVE_NAMESPACE_ID_SQL AND v.name = ? " +
+                            "AND v.begin_snapshot <= $head AND (v.end_snapshot IS NULL OR v.end_snapshot > $head) " +
+                            "AND t.created_snapshot <= $head " +
+                            "AND (t.dropped_snapshot IS NULL OR t.dropped_snapshot > $head)",
+                        listOf(namespace, table),
+                    ),
+                ),
+            )
+        val m = metaRow(metaResult.firstRow() ?: throw HoglakeException.NotFound("catalog '$catalog'"))
+        val at = resolveRead(catalog, m, null, null)
+        nsResult.firstRow() ?: throw HoglakeException.NotFound("namespace '$namespace' in catalog '$catalog'")
+        val row =
+            tableResult.firstRow()
+                ?: throw HoglakeException.NotFound("table '$namespace.$table' in catalog '$catalog' at snapshot $at")
+        // One transaction is one engine snapshot, so a statement head that
+        // differs from the meta row is an engine defect, never a race.
+        check(row[9].asLong() == at) { "head read saw head ${row[9]} beside meta head $at in one transaction" }
+        // Exact, maintained transactionally by every commit — the hoglite
+        // backend has no sampler lag, so head totals are not a sample and
+        // carry no freshness fields (null, per the TableInfo KDoc:
+        // freshness fields are for samples). A table with no files has no
+        // table_totals row.
+        val counts = if (totals) (10..12).map { row[it].asLongOrNull() ?: 0L } else null
+        return tableInfo(catalog, namespace, table, tableRowOf(row.subList(0, 9)), at, counts)
+    }
+
+    /** The rest of a getTable at [at]: each read is pinned at [at]. [counts] is record, file and byte totals. */
+    private fun tableInfo(
+        catalog: String,
+        namespace: String,
+        table: String,
+        t: TableRow,
+        at: Long,
+        counts: List<Long>?,
+    ): TableInfo {
+        val columns = columnsAt(catalog, t.tableId, at)
+        return TableInfo(
+            tableId = t.tableId,
+            tableUuid = t.tableUuid,
+            namespace = namespace,
+            name = table,
+            columns = columns,
+            readSnapshotId = at,
+            recordCount = counts?.get(0),
+            fileCount = counts?.get(1),
+            fileSizeBytes = counts?.get(2),
+            partitionSpec = specAt(catalog, t.tableId, at),
+            sortSpec = sortSpecAt(catalog, t.tableId, at),
+            comment = t.comment,
+            properties = t.properties,
+            // The option as it was at `at`, named by the column at `at`
+            // (CatalogService.getTable): the field is top-level and can
+            // be neither dropped nor renamed while the option is on.
+            objectPrefixField =
+                layoutAt(catalog, t.tableId, at)?.let { id ->
+                    columns.single { it.fieldId == id }.def.name
+                },
+        )
+    }
 
     override fun listTables(
         catalog: String,
@@ -1242,54 +1285,43 @@ class HogliteCatalogStore(
         atTimestamp: Instant?,
     ): List<TableSummaryInfo> =
         catalogOperation(catalog) {
+            if (snapshot == null && atTimestamp == null) return headListing(catalog, namespace)
             val m = meta(catalog)
             val at = resolveRead(catalog, m, snapshot, atTimestamp)
-            val headRead = snapshot == null && atTimestamp == null
             // A pinned listing resolves the namespace incarnation at its snapshot.
             val ns =
-                if (headRead) {
-                    liveNamespace(catalog, namespace)
-                } else {
-                    queryCatalog(
-                        catalog,
-                        "SELECT $NAMESPACE_COLUMNS FROM namespaces WHERE name = ? AND created_snapshot <= ? " +
-                            "AND (dropped_snapshot IS NULL OR dropped_snapshot > ?)",
-                        namespace,
-                        at,
-                        at,
-                    ).firstRow()?.let { namespaceInfo(it) }
-                        ?: throw HoglakeException.NotFound(
-                            "namespace '$namespace' in catalog '$catalog' at snapshot $at",
-                        )
-                }
+                queryCatalog(
+                    catalog,
+                    "SELECT $NAMESPACE_COLUMNS FROM namespaces WHERE name = ? AND created_snapshot <= ? " +
+                        "AND (dropped_snapshot IS NULL OR dropped_snapshot > ?)",
+                    namespace,
+                    at,
+                    at,
+                ).firstRow()?.let { namespaceInfo(it) }
+                    ?: throw HoglakeException.NotFound(
+                        "namespace '$namespace' in catalog '$catalog' at snapshot $at",
+                    )
             // Totals are the files visible at `at`, as Postgres's listing
-            // rolls them up at its snapshot: a head listing serves the
-            // transactionally maintained table_totals (exact at head, see
-            // getTable), and a PINNED listing aggregates the manifest at
-            // `at` per table, never the head counters.
+            // rolls them up at its snapshot: a PINNED listing aggregates the
+            // manifest at `at` per table, never the head counters
+            // (table_totals is exact at head only, see headListing).
             val visible =
                 "FROM files f WHERE f.table_id = t.id AND f.begin_snapshot <= ? " +
                     "AND (f.end_snapshot IS NULL OR f.end_snapshot > ?)"
-
-            // A head listing returns the head in the SAME statement. If a
-            // write moved it since meta(), table_totals is from a later
-            // snapshot, and the listing runs again with totals at `at`.
-            fun listing(headTotals: Boolean): HogliteQueryResult {
-                val totalsSql =
-                    if (headTotals) {
-                        "COALESCE(tt.record_count,0), COALESCE(tt.file_count,0), COALESCE(tt.file_size_bytes,0)"
-                    } else {
-                        "(SELECT COALESCE(SUM(f.record_count),0) $visible), (SELECT COUNT(*) $visible), " +
-                            "(SELECT COALESCE(SUM(f.file_size_bytes),0) $visible)"
-                    }
-                val totalsArgs: Array<Any?> = if (headTotals) emptyArray() else arrayOf(at, at, at, at, at, at)
-                // snapshotCount/earliestSnapshotId count RETAINED change rows, so
-                // the window opens at the expiry floor — read from meta so the
-                // day expiry lands the read is already right.
-                // Object ids overlap across tables, namespaces, and views.
-                val tableKinds = ChangeKind.TABLE_SCOPED.map { it.wire }.toTypedArray()
-                val kindParams = tableKinds.joinToString(",") { "?" }
-                return queryCatalog(
+            val totalsSql =
+                "(SELECT COALESCE(SUM(f.record_count),0) $visible), (SELECT COUNT(*) $visible), " +
+                    "(SELECT COALESCE(SUM(f.file_size_bytes),0) $visible)"
+            // snapshotCount/earliestSnapshotId count RETAINED change rows, so
+            // the window opens at the expiry floor — read from meta so the
+            // day expiry lands the read is already right.
+            // Object ids overlap across tables, namespaces, and views.
+            val tableKinds = ChangeKind.TABLE_SCOPED.map { it.wire }.toTypedArray()
+            val kindParams = tableKinds.joinToString(",") { "?" }
+            // Column 9 (the head) and the table_totals join are unused here.
+            // They keep the pinned statement as it was before the head
+            // listing moved to its own transaction (#537).
+            val rows =
+                queryCatalog(
                     catalog,
                     """SELECT t.id, t.table_uuid, v.name, v.comment, $totalsSql,
                               (SELECT COUNT(DISTINCT c.snapshot_id) FROM changes c
@@ -1306,7 +1338,12 @@ class HogliteCatalogStore(
                         WHERE v.namespace_id = ?
                           AND t.created_snapshot <= ? AND (t.dropped_snapshot IS NULL OR t.dropped_snapshot > ?)
                         ORDER BY v.name""",
-                    *totalsArgs,
+                    at,
+                    at,
+                    at,
+                    at,
+                    at,
+                    at,
                     *tableKinds,
                     m.earliestSnapshotId,
                     at,
@@ -1319,25 +1356,81 @@ class HogliteCatalogStore(
                     at,
                     at,
                 )
-            }
-            val headListing = listing(headTotals = headRead)
-            // Column 9 is the head the statement saw.
-            val headMoved = headRead && headListing.rows.any { it[9].asLong() != at }
-            val rows = if (headMoved) listing(headTotals = false) else headListing
-            return rows.rows.map { r ->
-                TableSummaryInfo(
-                    tableId = r[0].asLong(),
-                    tableUuid = UUID.fromString(r[1].asString()),
-                    name = r[2].asString(),
-                    comment = r[3] as? String,
-                    recordCount = r[4].asLong(),
-                    fileCount = r[5].asLong(),
-                    fileSizeBytes = r[6].asLong(),
-                    snapshotCount = r[7].asLong(),
-                    earliestSnapshotId = r[8].asLongOrNull(),
-                )
-            }
+            return rows.rows.map { tableSummaryOf(it) }
         }
+
+    /**
+     * A head listTables: meta, the live namespace and the listing in ONE
+     * read-only transaction, so from one engine snapshot (#537). As in
+     * [headTable], the head and table_totals are the only reads that no
+     * begin/end snapshot pins, so they must come from the same snapshot.
+     * Every `at`, the namespace id and the expiry floor are subselects in
+     * the listing, so no argument carries a value from another snapshot.
+     * The namespace statement tells a missing namespace (NotFound) from
+     * an empty one (no rows).
+     */
+    private fun headListing(
+        catalog: String,
+        namespace: String,
+    ): List<TableSummaryInfo> {
+        val head = HogliteSchema.HEAD_SQL
+        // snapshotCount/earliestSnapshotId count RETAINED change rows, so the
+        // window opens at the expiry floor. Object ids overlap across tables,
+        // namespaces, and views.
+        val floor = "(SELECT earliest_snapshot_id FROM meta WHERE id = 1)"
+        val tableKinds = ChangeKind.TABLE_SCOPED.map { it.wire }
+        val kindParams = tableKinds.joinToString(",") { "?" }
+        val (metaResult, nsResult, listing) =
+            readCatalog(
+                catalog,
+                listOf(
+                    HogliteStatement(metaSql),
+                    HogliteStatement(LIVE_NAMESPACE_SQL, listOf(namespace)),
+                    // Column 9 is the head the statement saw.
+                    HogliteStatement(
+                        """SELECT t.id, t.table_uuid, v.name, v.comment,
+                                  COALESCE(tt.record_count,0), COALESCE(tt.file_count,0), COALESCE(tt.file_size_bytes,0),
+                                  (SELECT COUNT(DISTINCT c.snapshot_id) FROM changes c
+                                    WHERE c.object_id = t.id AND c.kind IN ($kindParams)
+                                      AND c.snapshot_id >= $floor AND c.snapshot_id <= $head),
+                                  (SELECT MIN(c.snapshot_id) FROM changes c
+                                    WHERE c.object_id = t.id AND c.kind IN ($kindParams)
+                                      AND c.snapshot_id >= $floor AND c.snapshot_id <= $head),
+                                  $head
+                             FROM tables t
+                             JOIN table_versions v ON v.table_id = t.id
+                              AND v.begin_snapshot <= $head AND (v.end_snapshot IS NULL OR v.end_snapshot > $head)
+                             LEFT JOIN table_totals tt ON tt.table_id = t.id
+                            WHERE v.namespace_id = $LIVE_NAMESPACE_ID_SQL
+                              AND t.created_snapshot <= $head AND (t.dropped_snapshot IS NULL OR t.dropped_snapshot > $head)
+                            ORDER BY v.name""",
+                        tableKinds + tableKinds + namespace,
+                    ),
+                ),
+            )
+        val m = metaRow(metaResult.firstRow() ?: throw HoglakeException.NotFound("catalog '$catalog'"))
+        nsResult.firstRow() ?: throw HoglakeException.NotFound("namespace '$namespace' in catalog '$catalog'")
+        // One transaction is one engine snapshot, so a statement head that
+        // differs from the meta row is an engine defect, never a race.
+        check(listing.rows.all { it[9].asLong() == m.head }) {
+            "head listing saw a head other than meta head ${m.head} in one transaction"
+        }
+        return listing.rows.map { tableSummaryOf(it) }
+    }
+
+    /** One listing row: columns 0-8 of the head and the pinned listing alike. */
+    private fun tableSummaryOf(r: List<Any?>): TableSummaryInfo =
+        TableSummaryInfo(
+            tableId = r[0].asLong(),
+            tableUuid = UUID.fromString(r[1].asString()),
+            name = r[2].asString(),
+            comment = r[3] as? String,
+            recordCount = r[4].asLong(),
+            fileCount = r[5].asLong(),
+            fileSizeBytes = r[6].asLong(),
+            snapshotCount = r[7].asLong(),
+            earliestSnapshotId = r[8].asLongOrNull(),
+        )
 
     override fun dropTable(
         catalog: String,
@@ -2918,6 +3011,12 @@ class HogliteCatalogStore(
 
         /** The namespace columns [namespaceInfo] reads, in its order. */
         private const val NAMESPACE_COLUMNS = "id, name, contained_field, contained_value"
+        private const val LIVE_NAMESPACE_SQL =
+            "SELECT $NAMESPACE_COLUMNS FROM namespaces WHERE name = ? AND dropped_snapshot IS NULL"
+
+        /** The live namespace's id as a subselect of one `?` (the name), for a statement in the same snapshot. */
+        private const val LIVE_NAMESPACE_ID_SQL =
+            "(SELECT id FROM namespaces WHERE name = ? AND dropped_snapshot IS NULL)"
 
         /**
          * CatalogService's containment field rule (its CONTAINMENT_FIELD is
