@@ -702,6 +702,47 @@ is any lowercase identifier, the value a positive id, and the convention that
 - **Nothing changes until something is marked.** A catalog with no contained
   namespace refuses nothing it refused before.
 
+### 6.2c Reserved namespace names
+
+`HOGLAKE_RESERVED_NAMESPACES` (comma-separated) lists namespace names that no
+caller may create in any catalog on the server. Empty, the default, reserves
+none. PostHog's customer hoglake sets `posthog`: its Trino connector shows the
+org's events mount (`<orgID>-events`, §6.5a/§6.5b) as the read-only schema
+`posthog` inside the org's catalog, so user data must never sit under that name.
+hoglake reserves no name itself.
+
+- **One path.** `POST /v1/catalogs/{c}/namespaces` is the only way a namespace
+  is created: there is no rename, and table, view, commit and table-creation
+  routes need an existing namespace (404 otherwise). The handler refuses a
+  reserved name after the body is read and before the store is called, so
+  no snapshot is allocated and nothing reaches PostgreSQL or a hoglite engine.
+  Every client (Trino, DuckDB, pyhoglake, the web UI) goes through it.
+- **Every caller.** Operators, tenants and auth `off` alike; a scoped token
+  cannot create namespaces at all (403 before the handler).
+- **Matching.** Equal after folding ASCII `A`-`Z` to lowercase; nothing else
+  is folded, trimmed or prefix-matched (`PostHog` is refused, `posthog_raw` is
+  not). Both backends compare namespace names case-sensitively, and Trino folds
+  identifiers to lowercase and lets the mount shadow any case variant of
+  `posthog`, so an exact match would let a direct client create a namespace
+  Trino hides.
+- **The error.** 422 `validation`, "namespace name '<name>' is reserved on this
+  server", as `POST /v1/catalogs` refuses a mount-shaped catalog name.
+- **Boot.** Each entry must match the namespace identifier pattern, else the
+  server does not start.
+- **Existing namespaces are left alone.** One created before its name was
+  reserved stays listed, readable, writable and droppable; once dropped, no
+  case variant of it can be created again. The server does not look for them
+  at boot (that would scan every catalog, and open every hoglite engine). Before
+  setting the variable, look once on PostgreSQL:
+  `SELECT c.name, n.name FROM hog_namespace n JOIN hog_catalog c USING (catalog_id) WHERE NOT n.dropped AND lower(n.name) = 'posthog';`
+  and in each hoglite-placed catalog:
+  `SELECT name FROM namespaces WHERE dropped_snapshot IS NULL AND lower(name) = 'posthog';`
+- **Mounts.** A mount or mount Client catalog refuses every write first
+  (403 `read_only_catalog`), so it never reaches this check.
+- **Reserve only names nobody provisions.** The provisioner's `team_<id>`
+  namespaces (§6.2b) are created by an operator token, which the guard does not
+  exempt.
+
 ### 6.3 Scope vocabulary
 
 | Scope | Grants |

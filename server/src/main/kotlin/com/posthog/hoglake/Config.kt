@@ -3,6 +3,7 @@ package com.posthog.hoglake
 import com.fasterxml.jackson.core.JsonParser
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.posthog.hoglake.hoglite.HogliteBackend
+import com.posthog.hoglake.service.ReservedNamespaces
 import com.posthog.hoglake.store.BackendKind
 import com.posthog.hoglake.store.MountHost
 import com.posthog.hoglake.store.MountMatch
@@ -313,6 +314,13 @@ data class Config(
      * events mount loop. Empty (the default): no caller may.
      */
     val mountWriterSubject: String = env("HOGLAKE_MOUNT_WRITER_SUBJECT", ""),
+    /**
+     * Namespace names no caller may create in any catalog, comma-separated,
+     * matched ignoring ASCII case ([ReservedNamespaces]). Empty (the default)
+     * reserves none. PostHog's customer hoglake reserves `posthog`, the
+     * schema its Trino connector serves from the org's events mount.
+     */
+    val reservedNamespaceNames: Set<String> = nameList(env("HOGLAKE_RESERVED_NAMESPACES", "")),
     /**
      * Hydrator poll interval; 0 disables the background loop (tests drive
      * it directly).
@@ -1374,6 +1382,9 @@ data class Config(
 
     /** The pinned source [field id][mountSourceFieldId], or null when unset. */
     val mountSourceFieldIdOrNull: Long? = mountSourceFieldId.takeIf { it.isNotBlank() }?.toLong()
+
+    /** [reservedNamespaceNames], checked at boot: each must be a valid namespace name. */
+    val reservedNamespaces: ReservedNamespaces = ReservedNamespaces(reservedNamespaceNames)
 
     /** The remote hosts of [mountHostsFile]; empty when this server is not a mount Client. */
     val mountHosts: List<MountHost> = readMountHosts(mountHostsFile)
