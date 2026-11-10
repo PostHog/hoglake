@@ -17,6 +17,7 @@ from datetime import UTC, date, datetime, time
 from decimal import Decimal
 from functools import partial
 from pathlib import Path
+from time import perf_counter
 from types import MappingProxyType
 
 import pyarrow as pa
@@ -633,6 +634,99 @@ def test_a_compiled_declaration_is_not_validated_again(monkeypatch):
     with pytest.raises(UnsupportedShreddingError, match="does not know"):
         codec.compile_plan({"type": "blob"})
     assert codec.compile_plan(None) is codec.UNSHREDDED_PLAN
+
+
+def _dag(depth: int) -> dict:
+    """An object of two fields a level, both children one shared dict: a
+    declaration of ``depth`` dicts that json, or any walk that visits a
+    child once for each path to it, expands to 2**depth nodes."""
+    node: dict = {"type": "string"}
+    for _ in range(depth):
+        node = {
+            "type": "object",
+            "fields": [{"name": "a", **node}, {"name": "b", **node}],
+        }
+    return node
+
+
+@pytest.mark.parametrize("depth", [18, 30, 200])
+def test_a_shared_children_dag_is_refused_promptly_and_never_kept(depth):
+    """compile_plan serialises nothing until a bounded walk has found the
+    declaration about the size of one the grammar accepts: a DAG that json
+    would expand exponentially skips the fast path and goes to the grammar,
+    whose depth-first walk refuses it at once with its usual message (at 18
+    levels, the one the baseline took 0.2 s to give; at 30 it never
+    finished). Nothing of it is kept."""
+    from pyhoglake.errors import ValidationError
+
+    codec._PLANS.clear()
+    declaration = _dag(depth)
+    assert not codec._within_bounds(declaration)
+    started = perf_counter()
+    with pytest.raises(ValidationError, match=r"\$(\.a){16} is nested more than 16"):
+        codec.compile_plan(declaration)
+    assert perf_counter() - started < 2.0
+    assert len(codec._PLANS) == 0
+
+
+@pytest.mark.parametrize(
+    ("declaration", "why"),
+    [
+        # One megabyte of text, shared: 20 MiB as json would write it.
+        (
+            {"type": "string", "junk": ["x" * 2**20] * 20},
+            "more text than any declaration",
+        ),
+        ({"type": "string", "junk": [[[]]]}, "fine: shallow and small"),
+    ],
+)
+def test_the_bounds_walk_refuses_text_and_depth_the_grammar_never_accepts(
+    declaration, why
+):
+    from pyhoglake.errors import ValidationError
+
+    assert codec._within_bounds(declaration) == why.startswith("fine")
+    # A long unknown type is within the text bound, and refused as unknown.
+    assert codec._within_bounds({"type": "x" * 10_000})
+    cycle: dict = {"type": "object", "fields": []}
+    cycle["fields"].append(cycle)
+    assert not codec._within_bounds(cycle)
+    deep: list = []
+    for _ in range(50):
+        deep = [deep]
+    assert not codec._within_bounds({"type": "string", "junk": deep})
+    # Each is refused by the grammar as ever, promptly, under its own message.
+    for bad in (declaration, cycle, {"type": "string", "junk": deep}):
+        with pytest.raises(ValidationError, match="unknown key|without a name"):
+            codec.compile_plan(bad)
+
+
+def test_normal_declarations_take_the_fast_path_past_the_bounds_walk(monkeypatch):
+    from pyhoglake import variant
+
+    codec._PLANS.clear()
+    plan = codec.compile_plan(DECL)
+    monkeypatch.setattr(
+        variant, "validate_shredding", lambda *a, **k: pytest.fail("walked")
+    )
+    assert codec._within_bounds(DECL)
+    assert codec.compile_plan(DECL) is plan
+    # Legitimately shared children (one element dict under two arrays) are a
+    # tree to json, within bounds, and take the fast path too.
+    element = {"type": "string"}
+    shared = {
+        "type": "object",
+        "fields": [
+            {"name": "a", "type": "array", "element": element},
+            {"name": "b", "type": "array", "element": element},
+        ],
+    }
+    monkeypatch.undo()
+    first = codec.compile_plan(shared)
+    monkeypatch.setattr(
+        variant, "validate_shredding", lambda *a, **k: pytest.fail("walked")
+    )
+    assert codec.compile_plan(shared) is first
 
 
 def test_a_plan_is_served_to_its_own_declaration_only(monkeypatch):

@@ -853,15 +853,23 @@ def compile_plan(shredding: Shredding | None) -> Plan:
     # variant.py imports this module, and the grammar lives there.
     from .variant import _canonical_json, _plain, validate_shredding
 
-    try:
-        canonical: str | None = _canonical_json(shredding)
-    except (TypeError, ValueError, RecursionError):
-        canonical = None  # not JSON as given: validated below, as ever
-    if canonical is not None:
-        plan = _PLANS.get(canonical)
-        if plan is not None and plan.shredding == shredding:
-            return plan
-    _refuse_unknown_types(shredding, "$", 0)
+    # Nothing walks the declaration whole until it is known to be about the
+    # size of one the grammar accepts: json, and _refuse_unknown_types,
+    # visit a shared child once for each path to it, and a caller's DAG of
+    # thirty levels (or a cycle, or a huge value under a key the grammar
+    # refuses) would take them forever. validate_shredding is depth-first
+    # and stops at the grammar's limits, so it refuses one promptly.
+    bounded = _within_bounds(shredding)
+    if bounded:
+        try:
+            canonical: str | None = _canonical_json(shredding)
+        except (TypeError, ValueError, RecursionError):
+            canonical = None  # not JSON as given: validated below, as ever
+        if canonical is not None:
+            plan = _PLANS.get(canonical)
+            if plan is not None and plan.shredding == shredding:
+                return plan
+        _refuse_unknown_types(shredding, "$", 0)
     validate_shredding(shredding)
     # The grammar takes any Mapping and tuple, as variant_field does; json
     # serialises only dicts and lists, so a mappingproxy would fail here.
@@ -876,6 +884,51 @@ def compile_plan(shredding: Shredding | None) -> Plan:
 #: Plans by the canonical JSON of their validated declaration: only one
 #: that passed validate_shredding gets in, so a hit skips the grammar walk.
 _PLANS: Memo[str, Plan] = Memo(256)
+
+#: What _within_bounds allows, above anything the grammar accepts
+#: (variant.MAX_SHREDDING_DEPTH 16 levels, MAX_SHREDDING_FIELDS 1000, names
+#: of MAX_PATH_NAME_BYTES 1024): containers nest two a level (a node, its
+#: fields list) plus the leaves; the items are every container, key and
+#: value, at most a few hundred a field with its element chain; the text is
+#: every key's and string's, as json would write it, so that an unknown
+#: type of thousands of characters is still refused as unknown (its message
+#: cuts it), and a value of megabytes under a key the grammar refuses is
+#: not written at all.
+_BOUND_DEPTH: Final = 2 * (16 + 1) + 4
+_BOUND_ITEMS: Final = 256 * (1000 + 1)
+_BOUND_TEXT: Final = 16 * 1024 * 1024
+
+
+def _within_bounds(node: object) -> bool:
+    """Whether ``node`` is a tree small enough to serialise and walk whole:
+    no deeper, no larger and with no more text (shared children counted
+    once for each path to them, as json writes them) than the bounds above.
+    Iterative, and done the moment a bound is passed."""
+    if not isinstance(node, (Mapping, list, tuple)):
+        return not isinstance(node, str) or len(node) <= _BOUND_TEXT
+    items = text = 0
+    stack: list[tuple[Mapping[Any, Any] | list[Any] | tuple[Any, ...], int]] = [
+        (node, 1)
+    ]
+    while stack:
+        at, depth = stack.pop()
+        if isinstance(at, Mapping):
+            items += 2 * len(at)
+            text += sum(len(key) for key in at if isinstance(key, str))
+            values: Iterable[Any] = at.values()
+        else:
+            items += len(at)
+            values = at
+        if items > _BOUND_ITEMS or depth > _BOUND_DEPTH:
+            return False
+        for value in values:
+            if isinstance(value, str):
+                text += len(value)
+            elif isinstance(value, (Mapping, list, tuple)):
+                stack.append((value, depth + 1))
+        if text > _BOUND_TEXT:
+            return False
+    return True
 
 
 def _refuse_unknown_types(node: object, path: str, depth: int) -> None:

@@ -265,6 +265,27 @@ def test_write_part_checks_the_structure_of_each_storage_once(monkeypatch):
     assert len(checked) == 2, "the Python codec's output is checked"
 
 
+def test_encoded_by_names_the_codec_of_one_call_and_merge_leaves_it():
+    """encode_python is the reference codec's always, so its report says
+    ``python``; encode_json's says whose output it returned; a report that
+    gathers several calls keeps its own (None, when nothing set it)."""
+    from pyhoglake import _variant_backend
+
+    columns = _columns()
+    by_python = variant.encode_python([{"a": 1}, None], columns[2]).report
+    assert by_python.encoded_by == "python"
+    rust = _variant_backend.MODE != "python" and _variant_backend.native()[0]
+    by_json = variant.encode_json(PROPS, columns[2]).report
+    assert by_json.encoded_by == ("rust" if rust else "python")
+    gathered = VariantReport()
+    gathered.merge(by_python)
+    gathered.merge(by_json)
+    assert gathered.encoded_by is None
+    assert gathered.rows == by_python.rows + by_json.rows
+    # Not compared: two codecs' reports of one input are otherwise equal.
+    assert VariantReport(encoded_by="rust") == VariantReport(encoded_by="python")
+
+
 def _rust_said(monkeypatch, how: str) -> None:
     """The backend arranged so that Rust's result is not the one returned
     (``type`` fallback, shadow ``mismatch``, ``auto`` routed to Python for

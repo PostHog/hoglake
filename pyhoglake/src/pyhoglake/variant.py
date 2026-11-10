@@ -516,6 +516,8 @@ def encode_python(
         nullable=target_nullable,
         on_invalid=on_invalid,
     )
+    # The reference codec, always: Python values go to no other.
+    report.encoded_by = "python"
     return EncodedVariant(_one_array(chunks, plan), report)
 
 
