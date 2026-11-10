@@ -1163,9 +1163,10 @@ class HogliteCatalogStore(
         catalogOperation(catalog) {
             val m = meta(catalog)
             val at = resolveRead(catalog, m, snapshot, atTimestamp)
-            val ns = liveNamespace(catalog, namespace)
-            val t = tableAt(catalog, ns.namespaceId, namespace, table, at)
             val headRead = snapshot == null && atTimestamp == null
+            // A pinned read resolves the namespace incarnation at its snapshot, as listTables does.
+            val ns = if (headRead) liveNamespace(catalog, namespace) else namespaceAt(catalog, namespace, at)
+            val t = tableAt(catalog, ns.namespaceId, namespace, table, at)
             var recordCount: Long? = null
             var fileCount: Long? = null
             var fileSizeBytes: Long? = null
@@ -2344,6 +2345,22 @@ class HogliteCatalogStore(
             namespace,
         ).firstRow()?.let { namespaceInfo(it) }
             ?: throw HoglakeException.NotFound("namespace '$namespace' in catalog '$catalog'")
+
+    /** The namespace incarnation alive at [at]: created at or before it, not dropped by it. */
+    private fun namespaceAt(
+        catalog: String,
+        namespace: String,
+        at: Long,
+    ): NamespaceInfo =
+        queryCatalog(
+            catalog,
+            "SELECT $NAMESPACE_COLUMNS FROM namespaces WHERE name = ? AND created_snapshot <= ? " +
+                "AND (dropped_snapshot IS NULL OR dropped_snapshot > ?)",
+            namespace,
+            at,
+            at,
+        ).firstRow()?.let { namespaceInfo(it) }
+            ?: throw HoglakeException.NotFound("namespace '$namespace' in catalog '$catalog' at snapshot $at")
 
     /** A namespace row read with [NAMESPACE_COLUMNS]. */
     private fun namespaceInfo(row: List<Any?>): NamespaceInfo =
