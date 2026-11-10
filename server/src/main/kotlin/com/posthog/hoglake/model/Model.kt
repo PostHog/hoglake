@@ -1174,6 +1174,13 @@ data class DeleteFile(
 data class ScanFile(
     val dataFile: DataFile,
     val deleteFile: DeleteFile?,
+    /**
+     * The file's team id — its proven partition value on a mount's source
+     * field (`team_id`). Set only by a mount's scoped scan (plan row
+     * 1.3h), so the Client can vend a per-team credential for each file;
+     * null on every ordinary (non-mount) scan.
+     */
+    val teamId: Long? = null,
 )
 
 data class ColumnStats(
@@ -2556,6 +2563,28 @@ sealed class HoglakeException(message: String) : RuntimeException(message) {
 
     /** A mount write at a revision the mount is not at -> 409 `mount_revision_conflict`. */
     class MountRevisionConflict(detail: String) : HoglakeException(detail)
+
+    /**
+     * A mount scan whose scoped plan would return more files than the
+     * instance's file-count budget -> 422 `mount_scan_too_many_files`. The
+     * scope is the token's, so the caller cannot narrow it; the budget
+     * protects the Host from a whale org's cold scan (plan row 1.3h, M10).
+     */
+    class MountScanTooManyFiles(detail: String) : HoglakeException(detail)
+
+    /**
+     * A mount scan that ran past the instance's scan deadline -> 503
+     * `mount_scan_timeout` + Retry-After. Retryable backpressure: the DB
+     * was slow, not the scan unbounded (the file budget bounds that).
+     */
+    class MountScanTimeout(detail: String) : HoglakeException(detail)
+
+    /**
+     * A mount scan refused because the one shared export-scan concurrency
+     * cap is full -> 503 `mount_scan_busy` + Retry-After. Non-blocking, so
+     * Trino reads cannot starve ingest writers on the request dispatcher.
+     */
+    class MountScanBusy(detail: String) : HoglakeException(detail)
 
     /** Narrow the result before retrying. This refusal is not backend unavailability. */
     class BackendResultTooLarge(detail: String) : HoglakeException(detail)

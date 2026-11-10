@@ -344,7 +344,11 @@ class MountApiIntegrationTest {
         val name = mount(6)
         val reader = scoped(name, "read")
 
-        fun dispatch(port: Int) = send(port, "GET", "/v1/catalogs/$name/namespaces", reader).statusCode()
+        // A read the mount does not serve: 501 when the mount resolves, 404
+        // when it does not (the five served reads would need the pinned source
+        // configured; this probe only needs the mount to dispatch).
+        fun dispatch(port: Int) =
+            send(port, "GET", "/v1/catalogs/$name/namespaces/ingest/tables/events/files", reader).statusCode()
 
         fun switch(on: Boolean) =
             db.jdbi.useHandle<Exception> { it.execute("UPDATE hog_mount_switch SET enabled = ?", on) }
@@ -353,7 +357,7 @@ class MountApiIntegrationTest {
             withServer(allowlist = setOf(org(6))) { port ->
                 assertThat(dispatch(port)).describedAs("never written").isEqualTo(404)
                 assertThat(put(port, name, 0, true, listOf(42)).statusCode()).isEqualTo(200)
-                // 1.1a's answer for a mount read it has no reader for yet.
+                // The mount resolves: a read it does not serve answers 501.
                 assertThat(dispatch(port)).describedAs("enabled").isEqualTo(501)
                 assertThat(put(port, name, 1, false, emptyList()).statusCode()).isEqualTo(200)
                 assertThat(dispatch(port)).describedAs("disabled").isEqualTo(404)

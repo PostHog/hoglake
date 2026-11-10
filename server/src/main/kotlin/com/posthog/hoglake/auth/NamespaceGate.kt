@@ -4,6 +4,7 @@ import com.posthog.hoglake.api.BlockingDispatchPhase
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.NamespaceContainment
 import com.posthog.hoglake.observability.Metrics
+import com.posthog.hoglake.store.CatalogBinding
 import com.posthog.hoglake.store.CatalogStoreSelector
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
@@ -72,12 +73,18 @@ fun Application.installNamespaceGate(selector: CatalogStoreSelector) {
             ->
             selector.forCatalog(call, catalog).liveContainment(catalog, namespace)
         },
+        // A mount (export) resolves here as it does on the handler, cached
+        // per request; its isolation is ReadScope in the scan, not
+        // containment, so the gate lets every namespace through (plan row
+        // 1.3h: "calls resolve and skips containment for an export").
+        isExport = { call, catalog -> selector.resolve(call, catalog) is CatalogBinding.Mount },
     )
 }
 
 private fun Application.installCallNamespaceGate(
     dataPath: (ApplicationCall, String) -> String?,
     containment: (ApplicationCall, String, String) -> NamespaceContainment?,
+    isExport: (ApplicationCall, String) -> Boolean = { _, _ -> false },
 ) {
     // After the blocking dispatcher, so the read runs admitted on it. An
     // application without one (a test harness) gets the gate right after
@@ -94,6 +101,12 @@ private fun Application.installCallNamespaceGate(
         val service = call.application.attributes[AuthServiceKey]
         val held =
             try {
+                if (isExport(call, pending.catalog)) {
+                    // An export serves every namespace to a verified scoped
+                    // reader; ReadScope, not the gate, bounds what it sees.
+                    Metrics.authRequest(service.mode.wire, service.listener, "ok", clientClass(call))
+                    return@intercept
+                }
                 containment(call, pending.catalog, pending.namespace)
             } catch (failure: HoglakeException) {
                 // The lookup answered the request itself; the error mapping

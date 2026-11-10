@@ -21,6 +21,7 @@ import com.posthog.hoglake.store.CatalogBinding
 import com.posthog.hoglake.store.CatalogStore
 import com.posthog.hoglake.store.CatalogStoreSelector
 import com.posthog.hoglake.store.MountNames
+import com.posthog.hoglake.store.MountReadService
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
@@ -62,6 +63,12 @@ fun Application.installApiRoutes(
     instanceTotals: () -> InstanceTotals? = { null },
     catalogTotals: () -> Map<String, CatalogTotals> = { emptyMap() },
     uiTheme: String = "",
+    /**
+     * Serves a mount's five scoped read routes (plan row 1.3h). A provider,
+     * not the instance, so a PG-free boot never forces it (it builds a
+     * PostgreSQL-backed reader); it resolves to null where no mount can serve.
+     */
+    mountRead: () -> MountReadService? = { null },
 ) {
     // The handlers keep the receiver names `catalogs.` and `commits.`.
     // CommitConflictSpecParityTest and CatalogDropSpecParityTest count call
@@ -192,24 +199,36 @@ fun Application.installApiRoutes(
 
                 route("/namespaces") {
                     get {
-                        val catalogs = selector.forCatalog(call, call.catalog())
                         val catalog = call.catalog()
-                        // A scoped caller sees only the contained namespaces
-                        // it may use (AuthPolicy.SCOPED_ROUTES); everyone
-                        // else, everything.
-                        val scoped = call.hoglakeAuth.callerOrNull?.takeIf { it.kind == Caller.Kind.SCOPED }
-                        call.respond(
-                            catalogs.listNamespaces(
-                                catalog,
-                                call.longQuery("snapshot"),
-                                call.instantQuery("at_timestamp"),
-                            ).filter { ns ->
-                                scoped == null ||
-                                    ns.containment?.let {
-                                        scoped.mayUseContained(catalog, it.field, it.value, Scope.READ)
-                                    } == true
-                            }.map { it.toDto() },
-                        )
+                        when (val binding = selector.resolve(call, catalog)) {
+                            // A mount lists only the pinned table's namespace (plan row 1.3h).
+                            is CatalogBinding.Mount ->
+                                call.respond(
+                                    checkNotNull(mountRead()).namespaces(
+                                        call.longQuery("snapshot"),
+                                        call.instantQuery("at_timestamp"),
+                                    ).map { it.toDto() },
+                                )
+                            is CatalogBinding.Local -> {
+                                val catalogs = binding.store
+                                // A scoped caller sees only the contained
+                                // namespaces it may use (AuthPolicy.SCOPED_ROUTES);
+                                // everyone else, everything.
+                                val scoped = call.hoglakeAuth.callerOrNull?.takeIf { it.kind == Caller.Kind.SCOPED }
+                                call.respond(
+                                    catalogs.listNamespaces(
+                                        catalog,
+                                        call.longQuery("snapshot"),
+                                        call.instantQuery("at_timestamp"),
+                                    ).filter { ns ->
+                                        scoped == null ||
+                                            ns.containment?.let {
+                                                scoped.mayUseContained(catalog, it.field, it.value, Scope.READ)
+                                            } == true
+                                    }.map { it.toDto() },
+                                )
+                            }
+                        }
                     }
                     post {
                         val catalogs = selector.forCatalog(call, call.catalog())
@@ -225,10 +244,18 @@ fun Application.installApiRoutes(
                         )
                     }
                     get("/{namespace}") {
-                        val catalogs = selector.forCatalog(call, call.catalog())
-                        call.respond(
-                            catalogs.getNamespace(call.catalog(), call.namespace()).toDto(),
-                        )
+                        when (val binding = selector.resolve(call, call.catalog())) {
+                            is CatalogBinding.Mount ->
+                                call.respond(
+                                    checkNotNull(mountRead()).namespace(
+                                        call.namespace(),
+                                        call.longQuery("snapshot"),
+                                        call.instantQuery("at_timestamp"),
+                                    ).toDto(),
+                                )
+                            is CatalogBinding.Local ->
+                                call.respond(binding.store.getNamespace(call.catalog(), call.namespace()).toDto())
+                        }
                     }
                     delete("/{namespace}") {
                         val catalogs = selector.forCatalog(call, call.catalog())
@@ -271,15 +298,28 @@ fun Application.installApiRoutes(
                     }
                     route("/{namespace}/tables") {
                         get {
-                            val catalogs = selector.forCatalog(call, call.catalog())
-                            call.respond(
-                                catalogs.listTables(
-                                    call.catalog(),
-                                    call.namespace(),
-                                    call.longQuery("snapshot"),
-                                    call.instantQuery("at_timestamp"),
-                                ).map { it.toDto() },
-                            )
+                            when (val binding = selector.resolve(call, call.catalog())) {
+                                // The pinned table only, with SCOPED totals (plan row 1.3h).
+                                is CatalogBinding.Mount ->
+                                    call.respond(
+                                        checkNotNull(mountRead()).tables(
+                                            call.hoglakeAuth.callerOrNull,
+                                            binding.mount,
+                                            call.namespace(),
+                                            call.longQuery("snapshot"),
+                                            call.instantQuery("at_timestamp"),
+                                        ).map { it.toDto() },
+                                    )
+                                is CatalogBinding.Local ->
+                                    call.respond(
+                                        binding.store.listTables(
+                                            call.catalog(),
+                                            call.namespace(),
+                                            call.longQuery("snapshot"),
+                                            call.instantQuery("at_timestamp"),
+                                        ).map { it.toDto() },
+                                    )
+                            }
                         }
                         post {
                             val catalogs = selector.forCatalog(call, call.catalog())
@@ -299,24 +339,36 @@ fun Application.installApiRoutes(
 
                         route("/{table}") {
                             get {
-                                val catalogs = selector.forCatalog(call, call.catalog())
-                                call.respond(
-                                    catalogs.getTable(
-                                        call.catalog(),
-                                        call.namespace(),
-                                        call.table(),
-                                        call.longQuery("snapshot"),
-                                        call.instantQuery("at_timestamp"),
-                                        // Defaults TRUE: the field set a
-                                        // client already gets does not
-                                        // shrink because a parameter was
-                                        // added. `totals=false` is the
-                                        // identity read (#232), which no
-                                        // client in this tree sends yet —
-                                        // see CatalogService.getTable.
-                                        totals = call.boolQuery("totals") ?: true,
-                                    ).toDto(),
-                                )
+                                when (val binding = selector.resolve(call, call.catalog())) {
+                                    // A mount serves the pinned table only, totals omitted (plan row 1.3h).
+                                    is CatalogBinding.Mount ->
+                                        call.respond(
+                                            checkNotNull(mountRead()).table(
+                                                call.namespace(),
+                                                call.table(),
+                                                call.longQuery("snapshot"),
+                                                call.instantQuery("at_timestamp"),
+                                            ).toDto(),
+                                        )
+                                    is CatalogBinding.Local ->
+                                        call.respond(
+                                            binding.store.getTable(
+                                                call.catalog(),
+                                                call.namespace(),
+                                                call.table(),
+                                                call.longQuery("snapshot"),
+                                                call.instantQuery("at_timestamp"),
+                                                // Defaults TRUE: the field set a
+                                                // client already gets does not
+                                                // shrink because a parameter was
+                                                // added. `totals=false` is the
+                                                // identity read (#232), which no
+                                                // client in this tree sends yet —
+                                                // see CatalogService.getTable.
+                                                totals = call.boolQuery("totals") ?: true,
+                                            ).toDto(),
+                                        )
+                                }
                             }
                             delete {
                                 val catalogs = selector.forCatalog(call, call.catalog())
@@ -683,28 +735,46 @@ fun Application.installApiRoutes(
  * stored row-group start offsets. Installed separately so App.kt wires
  * it with its own CatalogStore.
  */
-fun Application.installScanRoutes(selector: CatalogStoreSelector) {
+fun Application.installScanRoutes(
+    selector: CatalogStoreSelector,
+    mountRead: () -> MountReadService? = { null },
+) {
     routing {
         get("/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/scan") {
-            val scan = selector.forCatalog(call, call.catalog())
-
             // getAll, joined: Parameters[...] is only the FIRST occurrence,
             // so a repeated `stats_fields=3&stats_fields=7` would silently
             // drop field 7's bounds and a second, misspelt `include` would
             // be ignored rather than refused.
             fun joined(name: String) = call.request.queryParameters.getAll(name)?.joinToString(",")
             val request = parseScanRequest(joined("include"), joined("stats_fields"))
-            call.respond(
-                scan.planScan(
-                    call.catalog(),
-                    call.namespace(),
-                    call.table(),
-                    call.longQuery("snapshot"),
-                    call.instantQuery("at_timestamp"),
-                    columnStats = request.columnStats,
-                    splitOffsets = request.splitOffsets,
-                ).map { it.toDto() },
-            )
+            val files =
+                when (val binding = selector.resolve(call, call.catalog())) {
+                    is CatalogBinding.Local ->
+                        binding.store.planScan(
+                            call.catalog(),
+                            call.namespace(),
+                            call.table(),
+                            call.longQuery("snapshot"),
+                            call.instantQuery("at_timestamp"),
+                            columnStats = request.columnStats,
+                            splitOffsets = request.splitOffsets,
+                        )
+                    // The export's scoped scan (plan row 1.3h): ReadScope in
+                    // SQL, each file its team id, under the shared cap, the
+                    // file budget and the deadline.
+                    is CatalogBinding.Mount ->
+                        checkNotNull(mountRead()).scan(
+                            call.hoglakeAuth.callerOrNull,
+                            binding.mount,
+                            call.namespace(),
+                            call.table(),
+                            call.longQuery("snapshot"),
+                            call.instantQuery("at_timestamp"),
+                            columnStats = request.columnStats,
+                            splitOffsets = request.splitOffsets,
+                        )
+                }
+            call.respond(files.map { it.toDto() })
         }
     }
 }
