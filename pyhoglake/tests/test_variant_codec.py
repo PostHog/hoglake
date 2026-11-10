@@ -598,6 +598,75 @@ def test_plans_are_cached_on_canonical_json():
     assert codec.compile_plan(same_nodes) is codec.compile_plan(DECL)
 
 
+def test_a_compiled_declaration_is_not_validated_again(monkeypatch):
+    """A declaration whose canonical JSON was compiled before, and which
+    equals the plan's own, is its plan at once, the grammar not walked: the
+    same dict, or another dict of the same JSON. A spelling that is not
+    equal to the plan's plain dicts and lists (a tuple where a list was) or
+    that json does not take (a mappingproxy) is validated, as ever, and
+    then gets the one plan; one the grammar refuses is refused every time,
+    never kept; one of a type this version does not know is refused before
+    the grammar, as ever."""
+    from pyhoglake import variant
+    from pyhoglake.errors import UnsupportedShreddingError, ValidationError
+
+    codec._PLANS.clear()
+    plan = codec.compile_plan(DECL)
+
+    def walked(*args, **kwargs):
+        raise AssertionError("validate_shredding ran on a compiled declaration")
+
+    monkeypatch.setattr(variant, "validate_shredding", walked)
+    assert codec.compile_plan(DECL) is plan
+    assert codec.compile_plan(json.loads(json.dumps(DECL))) is plan
+    with pytest.raises(AssertionError, match="ran on a compiled"):
+        codec.compile_plan({**DECL, "fields": tuple(DECL["fields"])})
+    with pytest.raises(AssertionError, match="ran on a compiled"):
+        codec.compile_plan(MappingProxyType(DECL))
+    monkeypatch.undo()
+    assert codec.compile_plan({**DECL, "fields": tuple(DECL["fields"])}) is plan
+    assert codec.compile_plan(MappingProxyType(DECL)) is plan
+    for _ in range(2):
+        with pytest.raises(ValidationError, match="has no element"):
+            codec.compile_plan({"type": "array"})
+    assert len(codec._PLANS) == 1
+    with pytest.raises(UnsupportedShreddingError, match="does not know"):
+        codec.compile_plan({"type": "blob"})
+    assert codec.compile_plan(None) is codec.UNSHREDDED_PLAN
+
+
+def test_a_plan_is_served_to_its_own_declaration_only(monkeypatch):
+    """The hit is confirmed by equality with the plan's declaration, so a
+    plan put under a canonical JSON that is not its own (which no spelling
+    json takes can make, but the memo is checked, not trusted) is walked
+    past and the declaration compiled."""
+    from pyhoglake.variant import _canonical_json
+
+    codec._PLANS.clear()
+    other = {"type": "object", "fields": [{"name": "x", "type": "int64"}]}
+    codec._PLANS.put(_canonical_json(DECL), codec.compile_plan(other))
+    assert codec.compile_plan(DECL).shredding == DECL
+    assert codec.compile_plan(DECL).write_type != codec.compile_plan(other).write_type
+
+
+def test_the_plans_kept_are_bounded(monkeypatch):
+    monkeypatch.setattr(codec._PLANS, "kept", 2)
+    codec._PLANS.clear()
+
+    def declare(i):
+        return {"type": "object", "fields": [{"name": f"f{i}", "type": "string"}]}
+
+    plans = [codec.compile_plan(declare(i)) for i in range(3)]
+    assert len(codec._PLANS) == 2
+    assert codec.compile_plan(declare(2)) is plans[2]
+    assert codec.compile_plan(declare(0)) is not plans[0], "the least used dropped"
+    assert codec.compile_plan(declare(0)).write_type == plans[0].write_type
+    # Least recently used, not first in: 2 was used after 1 came in, so 1 goes.
+    assert codec.compile_plan(declare(2)) is plans[2]
+    assert codec.compile_plan(declare(1)) is not plans[1]
+    assert codec.compile_plan(declare(2)) is plans[2]
+
+
 def test_storage_type_forms():
     with pytest.raises(ValueError, match="'write' or 'read'"):
         variant.storage_type(DECL, form="parquet")

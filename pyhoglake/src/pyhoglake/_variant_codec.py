@@ -30,13 +30,13 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Context, Decimal, Inexact, Rounded
-from functools import lru_cache
 from itertools import accumulate, pairwise
 from typing import TYPE_CHECKING, Any, Final, Literal, TypeAlias
 
 import pyarrow as pa
 import pyarrow.compute as pc
 
+from ._memo import Memo
 from .errors import UnsupportedShreddingError, VariantEncodingError
 
 if TYPE_CHECKING:
@@ -836,17 +836,46 @@ def compile_plan(shredding: Shredding | None) -> Plan:
     A node type this client does not know raises UnsupportedShreddingError
     (a newer server's grammar: fail closed, upgrade); any other fault is the
     ValidationError :func:`pyhoglake.variant.validate_shredding` raises.
+
+    A declaration compiled before is found by its canonical JSON without
+    being validated again: a declaration is immutable once its column
+    exists, and the writer compiles each column's three times a file
+    (schema, encode, write), for every partition group of a flush. The hit
+    is confirmed by equality with the plan's own declaration (the plain
+    dicts and lists the canonical JSON reads back as), so a spelling json
+    takes but the grammar reads otherwise could not be served the plan: a
+    declaration with tuples, or one json does not take at all (a Mapping
+    that is no dict), is validated as ever, and finds the plan by the
+    canonical JSON of its plain copy.
     """
     if shredding is None:
         return UNSHREDDED_PLAN
-    _refuse_unknown_types(shredding, "$", 0)
     # variant.py imports this module, and the grammar lives there.
     from .variant import _canonical_json, _plain, validate_shredding
 
+    try:
+        canonical: str | None = _canonical_json(shredding)
+    except (TypeError, ValueError, RecursionError):
+        canonical = None  # not JSON as given: validated below, as ever
+    if canonical is not None:
+        plan = _PLANS.get(canonical)
+        if plan is not None and plan.shredding == shredding:
+            return plan
+    _refuse_unknown_types(shredding, "$", 0)
     validate_shredding(shredding)
     # The grammar takes any Mapping and tuple, as variant_field does; json
     # serialises only dicts and lists, so a mappingproxy would fail here.
-    return _compile_canonical(_canonical_json(_plain(shredding)))
+    plain = _plain(shredding)
+    canonical = _canonical_json(plain)
+    plan = _PLANS.get(canonical)
+    if plan is not None and plan.shredding == plain:
+        return plan
+    return _PLANS.put(canonical, _compile_canonical(canonical))
+
+
+#: Plans by the canonical JSON of their validated declaration: only one
+#: that passed validate_shredding gets in, so a hit skips the grammar walk.
+_PLANS: Memo[str, Plan] = Memo(256)
 
 
 def _refuse_unknown_types(node: object, path: str, depth: int) -> None:
@@ -873,7 +902,6 @@ def _refuse_unknown_types(node: object, path: str, depth: int) -> None:
     _refuse_unknown_types(node.get("element"), f"{path}[*]", depth + 1)
 
 
-@lru_cache(maxsize=256)
 def _compile_canonical(canonical: str) -> Plan:
     decl = json.loads(canonical)
     if decl["type"] == "variant":

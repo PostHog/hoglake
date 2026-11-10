@@ -16,6 +16,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
+from ._memo import Memo
 from .errors import ValidationError, VariantEncodingError
 from .models import Column
 from .parquet_schema import (
@@ -277,11 +278,24 @@ def write_part(
 
 def _stored_schema(schema: pa.Schema) -> pa.Schema:
     """``schema`` as its Parquet file reads back: every ``timestamp[s]``, at
-    any depth, as milliseconds (Parquet has no seconds unit)."""
-    return pa.schema(
+    any depth, as milliseconds (Parquet has no seconds unit). Remembered by
+    the schema's IPC bytes, the hit confirmed by ``equals`` with metadata
+    (an extension type and its storage under the extension's metadata
+    serialise alike): the writer asks this of one destination for every
+    group."""
+    key = schema.serialize().to_pybytes()
+    hit = _STORED_SCHEMAS.get(key)
+    if hit is not None and schema.equals(hit[0], check_metadata=True):
+        return hit[1]
+    stored = pa.schema(
         [field.with_type(_stored_type(field.type)) for field in schema],
         metadata=schema.metadata,
     )
+    return _STORED_SCHEMAS.put(key, (schema, stored))[1]
+
+
+#: (schema, its stored form) by the schema's IPC bytes.
+_STORED_SCHEMAS: Memo[bytes, tuple[pa.Schema, pa.Schema]] = Memo(64)
 
 
 def _stored_type(kind: pa.DataType) -> pa.DataType:
@@ -393,8 +407,12 @@ def _write_variant_part(
     ``structure_fault`` and integer view: no null pyarrow would write as
     other bytes), not by :func:`pyhoglake.variant.verify`, which decodes
     every row in Python at the encoder's cost and would undo what encoding
-    elsewhere saves. Its bytes are the caller's to verify.
+    elsewhere saves. Its bytes are the caller's to verify. Storage the Rust
+    codec encoded here (``VariantReport.encoded_by``) was held to
+    ``structure_fault`` as the backend accepted it, and is not checked a
+    second time; the Python codec's is, as before.
     """
+    checked: set[str] = set()
     for column in variants:
         index = data.schema.get_field_index(column.name)
         field, values = data.schema.field(index), data.column(index)
@@ -403,12 +421,18 @@ def _write_variant_part(
         encoded = encode_json(values, column, on_invalid=on_invalid)
         if report is not None:
             report.merge(encoded.report)
+        if encoded.report.encoded_by == "rust":
+            checked.add(column.name)
         data = data.set_column(
             index, field.with_type(encoded.array.type), encoded.array
         )
     try:
         return write_variant_parquet(
-            data, columns, row_group_size=row_group_size, write_options=write_options
+            data,
+            columns,
+            row_group_size=row_group_size,
+            write_options=write_options,
+            _structure_checked=checked,
         )
     except _RefusedTable as error:
         # The caller's table: a field that is not its column's, or storage
