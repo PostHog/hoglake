@@ -734,3 +734,121 @@ def test_write_part_returns_a_prepared_part():
     assert isinstance(part, PreparedPart)
     assert isinstance(part.body, pa.Buffer)
     assert part.metadata.num_rows == 5
+
+
+# -- the narrowed stats walk is the full walk's, per wanted id -------------------
+
+
+def _metadata_of(table: pa.Table, **options) -> pq.FileMetaData:
+    sink = pa.BufferOutputStream()
+    pq.write_table(table, sink, **options)
+    return pq.read_metadata(pa.BufferReader(sink.getvalue()))
+
+
+_HOLDING_CASES = [
+    (
+        "struct-beside-its-own-dotted-name",
+        (
+            Column(
+                name="a",
+                type="struct",
+                field_id=1,
+                ordinal=0,
+                children=(Column(name="b", type="long", field_id=2, ordinal=0),),
+            ),
+            Column(name="a.b", type="string", field_id=3, ordinal=1),
+        ),
+        lambda: _metadata_of(
+            pa.table(
+                {
+                    "a": pa.array([{"b": 1}, {"b": 2}], pa.struct([("b", pa.int64())])),
+                    "a.b": pa.array(["x", "y"]),
+                }
+            )
+        ),
+    ),
+    (
+        "legacy-list-beside-a-dotted-sibling",
+        (
+            Column(
+                name="l",
+                type="list",
+                field_id=1,
+                ordinal=0,
+                children=(Column(name="element", type="long", field_id=2, ordinal=0),),
+            ),
+            Column(name="l.x.y", type="string", field_id=3, ordinal=1),
+        ),
+        lambda: _metadata_of(
+            pa.table(
+                {
+                    "l": pa.array([[1, 2], [3]], pa.list_(pa.int64())),
+                    "l.x.y": pa.array(["p", "q"]),
+                }
+            ),
+            use_compliant_nested_type=False,
+        ),
+    ),
+    (
+        "legacy-list-alone",
+        (
+            Column(
+                name="l",
+                type="list",
+                field_id=1,
+                ordinal=0,
+                children=(Column(name="element", type="long", field_id=2, ordinal=0),),
+            ),
+            Column(name="k", type="long", field_id=3, ordinal=1),
+        ),
+        lambda: _metadata_of(
+            pa.table(
+                {
+                    "l": pa.array([[1, 2], [3]], pa.list_(pa.int64())),
+                    "k": pa.array([1, 2]),
+                }
+            ),
+            use_compliant_nested_type=False,
+        ),
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("columns", "metadata"),
+    [(c, m) for _, c, m in _HOLDING_CASES],
+    ids=[n for n, _, _ in _HOLDING_CASES],
+)
+def test_narrowed_stats_walk_matches_the_full_walk_for_every_wanted_set(
+    columns, metadata
+):
+    """``_registration`` walks ``_columns_holding`` instead of every column
+    when ``stats_field_ids`` is given. For every one- and two-id set over
+    the columns' trees, the rows it yields for the wanted ids must be the
+    full walk's, filtered — including where ``_resolve_leaves``' legacy
+    dotted-name fallback makes a leaf's binding depend on which other
+    columns are walked (a top-level ``a.b`` or ``l.x.y`` beside a nested
+    column of head ``a`` / ``l``; dots the server forbids in a column
+    name, but ``PreparedPart.registration`` takes any columns)."""
+    import itertools
+
+    md = metadata()
+    full = extract_column_stats(md, columns)
+    ids: set[int] = set()
+
+    def walk(column):
+        ids.add(column.field_id)
+        for child in column.children or ():
+            walk(child)
+
+    for column in columns:
+        walk(column)
+    for r in (1, 2):
+        for combo in itertools.combinations(sorted(ids), r):
+            wanted = set(combo)
+            narrowed = extract_column_stats(
+                md, tuple(writer_module._columns_holding(columns, wanted))
+            )
+            assert [s.to_wire() for s in narrowed if s.field_id in wanted] == [
+                s.to_wire() for s in full if s.field_id in wanted
+            ], f"wanted {wanted}"

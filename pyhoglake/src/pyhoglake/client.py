@@ -16,7 +16,7 @@ import uuid as _uuid
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Literal, Self
+from typing import Any, Final, Literal, Self
 from urllib.parse import quote
 
 import httpx
@@ -24,6 +24,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
+from . import object_prefix
 from .errors import (
     AlreadyExistsError,
     CatalogFilesPendingExpiryError,
@@ -83,6 +84,7 @@ from .parquet_schema import (
     prepared_schema_matches,
     validate_variant_file,
 )
+from .stats import extract_column_stats
 from .transforms import partition_source_array, transform_strings
 from .types import (
     _is_variant_storage,
@@ -209,6 +211,17 @@ _RESERVED_COLUMN_PREFIX = "_hog"
 # writer's flush path). Anything else writes files compaction fails on
 # every sweep; brotli was the case that proved it.
 _PARQUET_CODECS = frozenset({"none", "snappy", "zstd"})
+
+#: The file size, in bytes, from which a deferred-stats registration on an
+#: object-prefix table carries every stat instead of the prefix field's
+#: alone: the default of ``footer_stats_min_bytes`` on ``Table.append`` and
+#: the ``prepare_append_*`` calls. 1 MiB, the server's own
+#: ``HOGLAKE_HYDRATOR_MIN_FILE_BYTES`` default: the size below which the
+#: hydrator writes no stats for a pending file either, so a file under it
+#: loses nothing to the prefix-only registration, and a file at or over it
+#: gets at commit what the hydrator would have given it later.
+DEFAULT_FOOTER_STATS_MIN_BYTES: Final = 1 << 20
+
 # zstd levels a writer may choose. The floor matches the server's own
 # zstd range (ParquetRewriter.MIN_ZSTD_LEVEL); pyarrow accepts down to
 # -131072, where the output is effectively uncompressed but labelled
@@ -1851,6 +1864,7 @@ class Table:
         compression_level: int | None = None,
         variant_on_invalid: Literal["raise", "null"] = "raise",
         variant_report: VariantReport | None = None,
+        footer_stats_min_bytes: int = DEFAULT_FOOTER_STATS_MIN_BYTES,
     ) -> AppendResult:
         """Write ``data`` to the catalog's data path and register it via a
         footer-shipping commit: one parquet file for an unpartitioned
@@ -1929,6 +1943,31 @@ class Table:
         added to it; the row of an invalid value, in it or in an error, is
         the row's in its partition group. A variant column has no
         ``column_stats``.
+
+        **Object-prefix tables.** While ``TableInfo.object_prefix_field``
+        is set (see :mod:`pyhoglake.object_prefix`), each group's file is
+        placed under its value's prefix,
+        ``<data_path>/data/<ns>/<table>/<field>=<value>/<uuid>.parquet``,
+        value the group's identity partition value for the field, and its
+        own footer stats must prove every row holds it, as the server
+        checks at commit; a group with a null value (a row with no value
+        in the field) cannot be placed and is refused, before any write,
+        with a :class:`ValidationError` naming the table and the field.
+        Each file is proven on its footer just before its own upload, so
+        the files are still written as their uploads come (a proof that
+        fails on a later group orphans the earlier groups' objects, as a
+        failed upload in the loop always has). ``deferred_stats`` on such
+        a table never registers a file ``pending``: a file at or over
+        ``footer_stats_min_bytes`` (default
+        :data:`DEFAULT_FOOTER_STATS_MIN_BYTES`, 1 MiB, the server's
+        ``HOGLAKE_HYDRATOR_MIN_FILE_BYTES`` default) registers every stat,
+        and a smaller one the prefix field's alone (``stats_field_ids``),
+        so either is ``provided`` at commit, mountable and compactable
+        without the hydrator; the small one has no stats for its other
+        columns until compaction rewrites it, as the hydrator would have
+        left it. ``0`` registers every stat for every file. The threshold
+        is checked before any request and ignored on a table without the
+        option.
         """
         catalog = self._namespace._catalog
         client = catalog._client
@@ -1939,6 +1978,7 @@ class Table:
         _check_reserved_columns(data.schema)
         write_options = parquet_write_options(compression, compression_level)
         _check_variant_on_invalid(variant_on_invalid)
+        _check_footer_stats_min_bytes(footer_stats_min_bytes)
 
         if expected_table_uuid is UNGUARDED:
             expected = None
@@ -2017,6 +2057,9 @@ class Table:
                 else self._namespace._catalog.refresh().head_snapshot_id
             )
 
+        # Against the same info the basis comes from, before any encode: a
+        # layout no file can be placed under costs nothing.
+        placement = _placement(info)
         variants = _variant_columns(info.columns, variant_on_invalid)
         target_schema = columns_to_arrow_schema(info.columns, variant="json")
         for column in variants:
@@ -2040,6 +2083,15 @@ class Table:
         else:
             groups = [(None, data)]
 
+        # Every group's prefix value before any write: a null group (rows
+        # with no value in the field) cannot be placed, and refusing it
+        # here costs no encode and orphans nothing.
+        prefix_values: list[int | None] = (
+            [None] * len(groups)
+            if placement is None
+            else [_prefix_value(info, placement, values) for values, _ in groups]
+        )
+
         def write(part: pa.Table) -> PreparedPart:
             return write_part(
                 part,
@@ -2054,14 +2106,28 @@ class Table:
         # With variant columns every group is encoded and written before the
         # first upload, as on the prepared path: an invalid row in the last
         # partition must not leave the files of the ones before it orphaned.
-        # Without, each file is written as its upload comes, as it always was.
+        # Without, each file is written as its upload comes, as it always
+        # was — on an object-prefix table too: its proof is made on the
+        # footer just written, inside the loop, and a proof that fails on a
+        # later group orphans the earlier ones' objects exactly as a failed
+        # upload in the loop always has. Holding every group's bytes for
+        # the proof would have bought nothing but the memory.
         parts: Iterable[PreparedPart] = (
             [write(part) for part in tables] if variants else map(write, tables)
         )
 
         file_regs: list[dict[str, Any]] = []
         appended: list[AppendedFile] = []
-        for (partition_values, _), prepared in zip(groups, parts, strict=True):
+        for (partition_values, _), prepared, value in zip(
+            groups, parts, prefix_values, strict=True
+        ):
+            prefix = (
+                None
+                if placement is None or value is None
+                else _placed_prefix(
+                    prepared, info, placement, value, data_path=catalog.data_path
+                )
+            )
             reg = _upload_one_file(
                 prepared,
                 info,
@@ -2069,6 +2135,9 @@ class Table:
                 client,
                 deferred_stats=deferred_stats,
                 partition_values=partition_values,
+                placement=placement,
+                prefix=prefix,
+                footer_stats_min_bytes=footer_stats_min_bytes,
             )
             file_regs.append(reg)
             appended.append(
@@ -2122,6 +2191,7 @@ class Table:
         allow_optional_fields: bool = False,
         concurrency: int | None = None,
         deferred_stats: bool = False,
+        footer_stats_min_bytes: int = DEFAULT_FOOTER_STATS_MIN_BYTES,
     ) -> dict[str, Any]:
         """Upload already partitioned/sorted local Parquet without loading it in RAM.
 
@@ -2158,6 +2228,33 @@ class Table:
         ``record_count`` and ``footer_size`` — so what this saves is the
         server's per-file stats work under the per-catalog commit lock and
         the client's stats extraction, not the footer read.
+
+        **Object-prefix tables.** While ``TableInfo.object_prefix_field``
+        is set (see :mod:`pyhoglake.object_prefix`), each file is placed
+        under its value's prefix,
+        ``<data_path>/data/<ns>/<table>/<field>=<value>/<idempotency_key>/<uuid>-<i>.parquet``,
+        value the file's identity partition value for the field, read
+        from its partition tuple; the footer already read here must prove
+        every row holds it (both bounds equal to the value, no nulls), as
+        the server checks at commit. A file whose value is null, not the
+        canonical decimal of the field's type, or not proven by its footer
+        is refused with a :class:`ValidationError` naming the table and
+        the field, before any upload. ``deferred_stats`` on such a table
+        never registers a file ``pending``, so the bullets above do not
+        apply: a file at or over ``footer_stats_min_bytes`` (default
+        :data:`DEFAULT_FOOTER_STATS_MIN_BYTES`, 1 MiB, the server's
+        ``HOGLAKE_HYDRATOR_MIN_FILE_BYTES`` default) registers every stat,
+        and a smaller one the prefix field's alone (``stats_field_ids``);
+        either is ``provided`` at commit, mountable and compactable
+        without the hydrator, and the small one has no stats for its
+        other columns until compaction rewrites it, as the hydrator would
+        have left it. ``0`` registers every stat for every file; the
+        threshold is checked before any request and ignored on a table
+        without the option. One request's files then sit in as many
+        ``<field>=<value>/<idempotency_key>/`` directories as the request
+        has values — the orphan accounting below is by uri, as it always
+        was, and anything that swept one ``<idempotency_key>/`` directory
+        per request would miss all but one of them.
 
         Each file is read only when its own upload runs — whole, by the
         uploading thread, when it is at or under
@@ -2213,6 +2310,7 @@ class Table:
             allow_optional_fields=allow_optional_fields,
             concurrency=concurrency,
             deferred_stats=deferred_stats,
+            footer_stats_min_bytes=footer_stats_min_bytes,
         )
 
     def prepare_append_tables(
@@ -2228,6 +2326,7 @@ class Table:
         deferred_stats: bool = False,
         variant_on_invalid: Literal["raise", "null"] = "raise",
         variant_report: VariantReport | None = None,
+        footer_stats_min_bytes: int = DEFAULT_FOOTER_STATS_MIN_BYTES,
     ) -> dict[str, Any]:
         """:meth:`prepare_append_files` without the disk: encode each
         already-partitioned Arrow table straight to a parquet buffer,
@@ -2309,6 +2408,13 @@ class Table:
         write (``cannot write VARIANT columns: ...``). The comparison above
         then runs over the whole written file, each variant field in its
         read form, with the same error.
+
+        **Object-prefix tables** are written as :meth:`prepare_append_files`
+        writes them: each group's file under its value's prefix, proven by
+        the footer this encodes, a null or unprovable value refused before
+        any upload, and ``deferred_stats`` registering every stat at or
+        over ``footer_stats_min_bytes`` and the prefix field's alone under
+        it, so the file is ``provided`` at commit either way.
         """
         return self._prepare_append(
             groups,
@@ -2323,6 +2429,7 @@ class Table:
             deferred_stats=deferred_stats,
             variant_on_invalid=variant_on_invalid,
             variant_report=variant_report,
+            footer_stats_min_bytes=footer_stats_min_bytes,
         )
 
     def _prepare_append(
@@ -2340,6 +2447,7 @@ class Table:
         deferred_stats: bool = False,
         variant_on_invalid: Literal["raise", "null"] = "raise",
         variant_report: VariantReport | None = None,
+        footer_stats_min_bytes: int = DEFAULT_FOOTER_STATS_MIN_BYTES,
     ) -> dict[str, Any]:
         """The prepared-append path both public entry points are: resolve,
         validate every group, upload them all, build the commit request.
@@ -2363,6 +2471,7 @@ class Table:
             # file's codec is whatever its writer chose.
             write_options = parquet_write_options(compression, compression_level)
             _check_variant_on_invalid(variant_on_invalid)
+            _check_footer_stats_min_bytes(footer_stats_min_bytes)
             catalog = self._namespace._catalog
             client = catalog._client
             expected = expected_table_uuid or self.table_uuid
@@ -2380,19 +2489,38 @@ class Table:
                 # _prepared_read).
                 read_snapshot = catalog.refresh().head_snapshot_id
                 info = self._check_incarnation(expected)
+            # The object-prefix field is part of the layout: a plan made
+            # against a table without it writes under the table root.
             if expected_table_info is not None and (
                 info.columns,
                 info.partition_spec,
                 info.sort_spec,
+                info.object_prefix_field,
             ) != (
                 expected_table_info.columns,
                 expected_table_info.partition_spec,
                 expected_table_info.sort_spec,
+                expected_table_info.object_prefix_field,
             ):
                 raise ValidationError(
                     "prepared append destination layout changed", status_code=None
                 )
             has_variant = any(c.type == "variant" for c in info.columns)
+            # Against the same info the basis comes from, before any encode
+            # or footer read: a layout no file can be placed under costs
+            # nothing, and neither does a group whose value names no prefix
+            # (a null) when its arity is right; a wrong arity is the loop's
+            # refusal, in its words.
+            placement = _placement(info)
+            arity = len(info.partition_spec.fields) if info.partition_spec else 0
+            prefix_values: list[int | None] = [
+                _prefix_value(info, placement, partition)
+                if placement is not None
+                and partition is not None
+                and len(partition) == arity
+                else None
+                for _, partition in groups
+            ]
             # Without the variant columns: a prepared file's are checked by
             # validate_variant_file. An Arrow table's are write_part's.
             schema = _stored_schema(
@@ -2426,7 +2554,6 @@ class Table:
                         variant_on_invalid=variant_on_invalid,
                         variant_report=variant_report,
                     )
-                arity = len(info.partition_spec.fields) if info.partition_spec else 0
                 if (arity and (partition is None or len(partition) != arity)) or (
                     not arity and partition is not None
                 ):
@@ -2438,7 +2565,33 @@ class Table:
                     raise ValidationError(
                         "prepared file must contain rows", status_code=None
                     )
-                uri = f"{catalog.data_path.rstrip('/')}/data/{info.namespace}/{info.name}/{idempotency_key}/{_uuid.uuid4()}-{index}.parquet"
+                stats_field_ids: set[int] | None = None
+                if placement is None:
+                    base = f"{catalog.data_path.rstrip('/')}/data/{info.namespace}/{info.name}/"
+                    stats = not deferred_stats
+                else:
+                    # Under its value's prefix, once the footer this
+                    # registration reads proves the value (the pre-pass
+                    # parsed it; a wrong arity never got this far).
+                    # Deferred stats register every stat at or over the
+                    # threshold and the prefix field's alone under it: the
+                    # file is provided (mountable, compactable) at commit,
+                    # not pending for the hydrator.
+                    value = prefix_values[index]
+                    assert value is not None  # the arity check above
+                    base = _placed_prefix(
+                        part, info, placement, value, data_path=catalog.data_path
+                    )
+                    stats, stats_field_ids = _prefix_stats(
+                        placement,
+                        part.size,
+                        deferred_stats=deferred_stats,
+                        footer_stats_min_bytes=footer_stats_min_bytes,
+                    )
+                # The idempotency-key directory stays under the prefix (one
+                # per value the request holds), so orphan accounting and
+                # retries read as they always did: by uri.
+                uri = f"{base}{idempotency_key}/{_uuid.uuid4()}-{index}.parquet"
                 uploads.append(
                     Upload(uri=uri, size=part.size, path=part.path)
                     if isinstance(part, _PreparedFile)
@@ -2446,7 +2599,7 @@ class Table:
                 )
                 registrations.append(
                     _registration(
-                        part, uri, info.columns, not deferred_stats, partition
+                        part, uri, info.columns, stats, partition, stats_field_ids
                     )
                 )
             if not registrations:
@@ -2769,6 +2922,201 @@ def _json_off_string_view(values: pa.ChunkedArray) -> pa.ChunkedArray:
     )
 
 
+# -- object-prefix placement -----------------------------------------------------
+
+
+def _check_footer_stats_min_bytes(value: Any) -> int:
+    """``value`` as the threshold, or a :class:`ValidationError`: a
+    non-negative integer (``0`` registers every stat for every file), not
+    a ``bool``. Pure, so a caller can refuse a bad setting before any
+    request, as :func:`parquet_write_options` lets it."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValidationError(
+            f"footer_stats_min_bytes must be a non-negative integer, got {value!r}",
+            status_code=None,
+        )
+    return value
+
+
+@dataclass(frozen=True)
+class _Placement:
+    """Where an object-prefix table's files go (``TableInfo.object_prefix_field``
+    set): under ``object_prefix.prefix(data_path, info, value)``, ``value`` a
+    file's partition value at ``key_index``, with the file's own footer
+    stats for ``column`` proving every row holds it. The server makes the
+    same checks at commit (``ObjectPrefixViolationError``); made here, a file
+    that would fail them is refused before it is uploaded."""
+
+    column: Column
+    key_index: int
+
+    @property
+    def field(self) -> str:
+        return self.column.name
+
+    @property
+    def field_id(self) -> int:
+        return self.column.field_id
+
+    @property
+    def type(self) -> str:
+        return self.column.type
+
+
+def _placement(info: TableInfo) -> _Placement | None:
+    """The placement ``info`` calls for, or None while its object-prefix
+    option is off.
+
+    ``info`` is the TableInfo the payload's ``read_snapshot`` comes from,
+    so the field's type and the spec are the ones the commit is checked
+    against. A field that is not a top-level column of a type in
+    :data:`object_prefix.MAX_VALUE`, or that has no single identity field
+    in the live spec, is a layout the server itself refuses to install;
+    seen here, it is refused as a :class:`ValidationError` before any
+    encode, since no file could be placed under it.
+    """
+    name = info.object_prefix_field
+    if name is None:
+        return None
+    where = f"{info.namespace}.{info.name}"
+    column = next((c for c in info.columns if c.name == name), None)
+    if column is None or column.type not in object_prefix.MAX_VALUE:
+        found = "no top-level column" if column is None else f"a {column.type!r} column"
+        raise ValidationError(
+            f"object-prefix field {name!r} of {where} is {found}, not one of "
+            f"{sorted(object_prefix.MAX_VALUE)}; no file can be placed under it",
+            status_code=None,
+        )
+    spec = info.partition_spec
+    index = (
+        None if spec is None else object_prefix.key_index(spec.fields, column.field_id)
+    )
+    if index is None:
+        raise ValidationError(
+            f"object-prefix field {name!r} of {where} has no single identity "
+            "field in the live partition spec; no file can be placed under it",
+            status_code=None,
+        )
+    return _Placement(column, index)
+
+
+def _prefix_value(
+    info: TableInfo, placement: _Placement, partition: Sequence[str | None] | None
+) -> int:
+    """The object-prefix value a group's ``partition`` tuple names.
+
+    A null value (a row with no value in the field; Iceberg's null
+    partition) names no prefix, so the group cannot be placed: it is a
+    :class:`ValidationError` naming the table and the field, raised before
+    anything is encoded or uploaded. The caller drops or routes such rows
+    before writing. A value that is not the canonical decimal of the
+    field's type (``042``, ``+4``, out of range) is refused the same way,
+    as the server would refuse it at commit.
+    """
+    where = f"{info.namespace}.{info.name}"
+    raw = (
+        partition[placement.key_index]
+        if partition is not None and placement.key_index < len(partition)
+        else None
+    )
+    if raw is not None and not isinstance(raw, str):
+        raise ValidationError(
+            f"partition value {raw!r} of {placement.field!r} is not a wire "
+            "string; partition values are the transforms' string forms",
+            status_code=None,
+        )
+    value = object_prefix.parse_value(raw, placement.type)
+    if value is None:
+        if raw is None:
+            raise ValidationError(
+                f"a group of {where} has a null {placement.field!r}: a null "
+                "names no object prefix, so its rows cannot be placed; drop "
+                "or route rows with a null value before writing",
+                status_code=None,
+            )
+        raise ValidationError(
+            f"partition value {raw!r} of {placement.field!r} names no object "
+            f"prefix of {where}: not a canonical {placement.type} in range",
+            status_code=None,
+        )
+    return value
+
+
+def _placed_prefix(
+    part: Any,
+    info: TableInfo,
+    placement: _Placement,
+    value: int,
+    *,
+    data_path: str,
+) -> str:
+    """The prefix a written file registers under, once its own footer stats
+    for the prefix field prove ``value``: the proof the server makes at
+    commit (both bounds equal to the value, no nulls), made here before the
+    upload. ``part`` is a :class:`~pyhoglake.writer.PreparedPart` or a
+    :class:`_PreparedFile`; either way its ``metadata`` is the footer the
+    registration's stats come from, so what passes here is what the
+    commit sees.
+
+    Only the prefix column's stats are extracted here (a top-level integer
+    column, so its leaf is the exact path of its name): the registration
+    extracts what it registers itself, and extracting every leaf twice
+    cost more than the proof on a wide table. Every refusal is a
+    :class:`ValidationError`, the ``ValueError`` / ``TypeError`` of
+    :mod:`object_prefix` (a name outside the catalog's grammar, a value no
+    prefix can name) included, so a caller classifies one error type.
+    """
+    stats = next(
+        (
+            s
+            for s in extract_column_stats(part.metadata, (placement.column,))
+            if s.field_id == placement.field_id
+        ),
+        None,
+    )
+    where = f"{info.namespace}.{info.name}"
+    try:
+        verdict = object_prefix.check_field_stats(info, value, stats)
+        if verdict != "OK":
+            raise ValidationError(
+                f"the file for {placement.field}={value} of {where} does not "
+                f"prove its object prefix ({verdict}): its footer stats for "
+                "the field must show every row holds the value",
+                status_code=None,
+            )
+        return object_prefix.prefix(data_path, info, value)
+    except (ValueError, TypeError) as error:
+        raise ValidationError(
+            f"the file for {placement.field}={value} of {where} cannot be "
+            f"placed under an object prefix: {error}",
+            status_code=None,
+        ) from error
+
+
+def _prefix_stats(
+    placement: _Placement,
+    size: int,
+    *,
+    deferred_stats: bool,
+    footer_stats_min_bytes: int,
+) -> tuple[bool, set[int] | None]:
+    """The ``(stats, stats_field_ids)`` a file of ``size`` bytes registers
+    with on an object-prefix table: every stat unless ``deferred_stats``
+    and the file is under ``footer_stats_min_bytes``, then the prefix
+    field's alone. Never ``stats=False``: the file is ``provided`` at
+    commit either way, as millrace registers its files.
+
+    A provided file is never hydrated, and compaction never takes an input
+    at or over its target size, so a large file registered prefix-only
+    would have no other stats for good; a small one gets them when
+    compaction rewrites it, which is what the hydrator's own size floor
+    (the threshold's default) would have left it with anyway.
+    """
+    if deferred_stats and size < footer_stats_min_bytes:
+        return True, {placement.field_id}
+    return True, None
+
+
 def _upload_one_file(
     part: PreparedPart,
     info: TableInfo,
@@ -2777,21 +3125,45 @@ def _upload_one_file(
     *,
     deferred_stats: bool,
     partition_values: tuple[str | None, ...] | None,
+    placement: _Placement | None = None,
+    prefix: str | None = None,
+    footer_stats_min_bytes: int = DEFAULT_FOOTER_STATS_MIN_BYTES,
 ) -> dict[str, Any]:
     """``Table.append``'s half of one file: upload the part
     :func:`~pyhoglake.writer.write_part` wrote under the catalog's data
-    path, and return its FileRegistration wire dict."""
+    path, and return its FileRegistration wire dict.
+
+    With a ``placement`` the file goes under ``prefix``, its value's object
+    prefix as :func:`_placed_prefix` proved it, and ``deferred_stats``
+    registers the file as :func:`_prefix_stats` says — every stat at or
+    over ``footer_stats_min_bytes``, the prefix field's alone under it —
+    instead of none: the file is ``provided`` at commit, not ``pending``."""
     data_path = catalog.data_path
     if not data_path.endswith("/"):
         data_path += "/"
-    file_uri = f"{data_path}data/{info.namespace}/{info.name}/{_uuid.uuid4()}.parquet"
+    stats_field_ids: set[int] | None = None
+    if placement is None:
+        file_uri = (
+            f"{data_path}data/{info.namespace}/{info.name}/{_uuid.uuid4()}.parquet"
+        )
+        stats = not deferred_stats
+    else:
+        assert prefix is not None  # proved with the placement
+        file_uri = f"{prefix}{_uuid.uuid4()}.parquet"
+        stats, stats_field_ids = _prefix_stats(
+            placement,
+            part.size,
+            deferred_stats=deferred_stats,
+            footer_stats_min_bytes=footer_stats_min_bytes,
+        )
     # Stats before the upload, as before the core: a file whose stats fail
     # is refused without leaving an object behind.
     reg = part.registration(
         file_uri,
         info.columns,
-        stats=not deferred_stats,
+        stats=stats,
         partition_values=partition_values,
+        stats_field_ids=stats_field_ids,
     )
     _upload(client._filesystem(), file_uri, part.body)
     return reg

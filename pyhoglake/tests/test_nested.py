@@ -1249,10 +1249,16 @@ def test_extract_column_stats_production_callers_are_known():
     # File and call text, not line numbers: a line number pins where the
     # call sits, which every edit above moves, and the claim is about
     # WHICH callers exist.
-    # ONE call since the writer core: writer._registration builds every
-    # registration, a footer this process wrote and a prepared file's alike.
+    # TWO calls since the object-prefix placement: writer._registration
+    # builds every registration, a footer this process wrote and a prepared
+    # file's alike (over the columns asked for, every one or those holding
+    # a wanted id), and client._placed_prefix reads the SAME footer first,
+    # for the prefix field's stats proof, over that one top-level column.
+    # Both see the same part.metadata, so neither widens what a foreign
+    # file can reach.
     assert callers == [
-        "writer.py: found = extract_column_stats(part.metadata, tuple(columns))",
+        "client.py: for s in extract_column_stats(part.metadata, (placement.column,))",
+        "writer.py: found = extract_column_stats(",
     ], f"unexpected caller(s) of extract_column_stats: {callers}"
 
 

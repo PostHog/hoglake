@@ -156,6 +156,24 @@ def rename_table(new_name: str) -> AlterOp:
     return AlterOp("rename_table", {"new_name": new_name})
 
 
+def set_object_prefix_field(name: str) -> AlterOp:
+    """Set the table's object-prefix field (see :mod:`pyhoglake.object_prefix`):
+    every later data file registers under
+    ``<data_path>/data/<ns>/<table>/<name>=<value>/``, and pyhoglake's
+    writers place their files there.
+
+    The server's rules, not checked here: ``name`` is a top-level column of
+    an integer type in :data:`~pyhoglake.object_prefix.MAX_VALUE`; the
+    partition spec has exactly one identity field on it (ops apply in
+    order, so ``[set_partition_spec([...identity...]),
+    set_object_prefix_field(name)]`` works in one request); the table is
+    empty; the option is set once, with no unset, and the same field again
+    changes nothing. Operator-only on a server enforcing auth. An older
+    server answers 400 ``unknown alter op``.
+    """
+    return AlterOp("set_object_prefix_field", {"name": name})
+
+
 def partition_field(
     source_field_id: int, transform: str, transform_param: int | None = None
 ) -> PartitionField:

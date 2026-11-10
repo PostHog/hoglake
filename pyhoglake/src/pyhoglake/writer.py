@@ -72,11 +72,15 @@ class PreparedPart:
         A file registered with ``stats_field_ids`` is ``provided`` and is
         never hydrated: it has no stats for any other column, so nothing
         prunes it on them, until compaction rewrites it. That is the trade
-        an object-prefix writer makes for a small file (millrace, below its
+        an object-prefix writer makes to defer a SMALL file's stats
+        (millrace, and ``Table.append`` / ``prepare_append_*`` with
+        ``deferred_stats=True``, for a file below their
         ``footer_stats_min_bytes``): the prefix field's stats alone, which
         the server checks at commit, make it mountable and compactable at
-        once, without the hydrator. A file at or above that size carries
-        every stat.
+        once, without the hydrator, and compaction gives it the rest when
+        it rewrites it. A file at or over that size registers every stat:
+        compaction never takes an input at or over its target, so a large
+        file registered prefix-only would stay without them for good.
 
         ``stats_field_ids`` is a ``ValidationError`` without ``stats`` (the
         file would register ``pending``), when empty, when it holds a
@@ -116,10 +120,8 @@ def _registration(
             status_code=None,
         )
     if stats:
-        found = extract_column_stats(part.metadata, tuple(columns))
+        wanted: set[int] | None = None
         if stats_field_ids is not None:
-            # Refused, not skipped: a provided file is never hydrated, so a
-            # stat asked for and left out would be missing for good.
             wanted = _field_ids(stats_field_ids)
             if not wanted:
                 raise ValidationError(
@@ -127,6 +129,21 @@ def _registration(
                     "stats=False and no ids",
                     status_code=None,
                 )
+        # Only the columns that can hold a wanted id are walked (an
+        # object-prefix writer's one integer column, not the 100-odd
+        # leaves beside it): a leaf's stats do not depend on which other
+        # columns were asked for, so the rows are the ones the full walk
+        # would have kept. The variant columns stay in, for the path
+        # prefixes the walk excludes by (``_resolve_leaves``).
+        found = extract_column_stats(
+            part.metadata,
+            tuple(columns)
+            if wanted is None
+            else tuple(_columns_holding(columns, wanted)),
+        )
+        if wanted is not None:
+            # Refused, not skipped: a provided file is never hydrated, so a
+            # stat asked for and left out would be missing for good.
             unknown = wanted - {stat.field_id for stat in found}
             if unknown:
                 raise ValidationError(
@@ -138,6 +155,38 @@ def _registration(
     if partition_values is not None:
         reg["partition_values"] = list(partition_values)
     return reg
+
+
+def _columns_holding(columns: Sequence[Column], wanted: set[int]) -> list[Column]:
+    """The top-level ``columns`` to walk for the stats of ``wanted``: the
+    ones whose tree holds a wanted id (a nested leaf's id counts for its
+    root), every variant column, and every column whose name's first
+    dotted segment is a kept column's. The walk over these yields, for
+    each wanted id, the row the walk over every column would have.
+
+    Why the other two. A variant yields no stats but its name excludes
+    its storage's chunk paths from the walk, and a scalar literally named
+    ``<variant>.value`` must not claim them just because the variant was
+    left out. And ``_resolve_leaves`` reconciles a nested leaf whose
+    predicted path is not in the footer (a list spelled ``l.list.item``
+    by another writer) against the footer's unclaimed paths with the same
+    head and depth — so a top-level column named ``l.x.y``, left out,
+    would stop claiming the chunk the kept list's leaf then takes.
+    Unreachable with a real TableInfo (the server forbids dots in column
+    names), but ``PreparedPart.registration`` is public and takes any
+    ``columns``, so the rule is kept by name rather than assumed away.
+    """
+
+    def holds(column: Column) -> bool:
+        return column.field_id in wanted or any(
+            holds(child) for child in column.children or ()
+        )
+
+    kept = [c for c in columns if c.type == "variant" or holds(c)]
+    heads = {c.name.split(".", 1)[0] for c in kept}
+    # One pass is enough: a column added by its head has that head, which
+    # is already in the set.
+    return [c for c in columns if c in kept or c.name.split(".", 1)[0] in heads]
 
 
 def _field_ids(ids: Collection[int]) -> set[int]:
