@@ -28,7 +28,10 @@ import java.util.Base64
  * issuer conforms to it: an issuer's own suite mints each vector's
  * `client`/`operator` input and compares header and claims with the file,
  * and hoglake's suite ([ContractVectorsTest]) checks that its verifier gives
- * every vector the verdict its `expect` states. A change to the contract is a
+ * every vector the verdict its `expect` states. A vector carrying `mutation`
+ * is verifier-only: it is the named input minted as usual and then changed as
+ * `mutation` describes, which no conforming issuer produces, so an issuer's
+ * suite skips it and only hoglake's checks it. A change to the contract is a
  * change here, regenerated with `just server contract-vectors`; the file is
  * never edited by hand, and [ContractVectorsTest] reds when it no longer
  * matches what this object would write.
@@ -90,6 +93,8 @@ object ContractVectors {
                 "(just server contract-vectors). Do not edit by hand.",
             "An issuer conforms by minting each vector's client/operator input at issued_at and matching header " +
                 "and claims; hoglake's suite checks every token against its verifier and the vector's expect.",
+            "A vector with a mutation field is verifier-only: its input minted as usual, then changed as the " +
+                "mutation says. No conforming issuer produces it; an issuer's suite skips it.",
             "expect is the verdict at verify_at for HOGLAKE_AUTH_ISSUER=issuer, HOGLAKE_AUTH_AUDIENCE=hoglake, " +
                 "HOGLAKE_AUTH_PREDICATE_FIELDS=team_id, the default scoped lifetime cap (900s), and the rtg " +
                 "backends configured as hoglite.",
@@ -210,6 +215,11 @@ object ContractVectors {
         val expect: ObjectNode,
         val audience: String = AUDIENCE,
         val ttl: Long = TENANT_TTL,
+        /**
+         * Set on a verifier-only vector: the change applied to the minted token
+         * that no conforming issuer makes. Rendered as `mutation`.
+         */
+        val mutation: String? = null,
         /** Claims between `jti` and `exp`, in the order the token carries them. */
         val body: List<Pair<String, JsonNode>>,
     ) {
@@ -232,6 +242,7 @@ object ContractVectors {
                 set<JsonNode>(inputKey, input)
                 put("audience", audience)
                 put("jti", jtiText)
+                mutation?.let { put("mutation", it) }
                 set<JsonNode>("expect", expect)
                 put("token", sign(header, mapper.createObjectNode().setAll<ObjectNode>(claims)))
                 set<JsonNode>("header", header)
@@ -411,6 +422,7 @@ object ContractVectors {
                 tenantInput(reader, "pyhoglake-reader", "read", false),
                 9,
                 accept("tenant"),
+                mutation = "the ten claim is omitted",
                 body =
                     listOf(
                         "sub" to text(reader),
@@ -426,6 +438,7 @@ object ContractVectors {
                 scopedInput(),
                 10,
                 refuse(JwtViolation.MALFORMED),
+                mutation = "the ten claim is omitted",
                 body =
                     listOf(
                         "sub" to text(team),
@@ -444,6 +457,7 @@ object ContractVectors {
                 11,
                 refuse(JwtViolation.MISSING_CLAIM),
                 ttl = OPERATOR_TTL,
+                mutation = "the ten claim is omitted",
                 body =
                     listOf(
                         "sub" to text("issuer:provisioner"),
@@ -458,6 +472,7 @@ object ContractVectors {
                 12,
                 refuse(JwtViolation.MALFORMED),
                 ttl = 901,
+                mutation = "exp is iat + 901, one second past the default scoped cap",
                 body =
                     listOf(
                         "sub" to text(team),

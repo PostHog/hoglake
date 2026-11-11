@@ -1,9 +1,11 @@
 """Bearer authentication for the hoglake API.
 
-hoglake verifies tokens; it does not mint them. The issuer is the
-managed-warehouse control plane (hogtower's ``POST /oauth/token``), and a
-client authenticates to it with the client id and secret it was given.
-Pass one of these as ``HoglakeClient(..., auth=...)``.
+hoglake verifies tokens; it does not mint them. The issuer is whatever the
+deployment runs: any OAuth 2.0 token endpoint that emits hoglake's token
+contract (docs/auth.md). In PostHog's managed warehouse that is hogtower's
+``POST /oauth/token``. A client authenticates to it with the client id and
+secret it was given. Pass one of these as ``HoglakeClient(..., auth=...)``,
+or any other ``httpx.Auth`` for a different grant.
 """
 
 from __future__ import annotations
