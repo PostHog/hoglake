@@ -273,10 +273,16 @@ class JwksSigningKeys internal constructor(
             if (!keys.isArray) throw IllegalArgumentException("jwks 'keys' is not an array")
             val out = LinkedHashMap<String, PublicKey>()
             keys.forEach { jwk ->
+                // Purpose first, then `kid`: an entry this verifier skips (an
+                // encryption key, another algorithm) need not carry a kid at
+                // all (RFC 7517 §4.5 makes it optional), and a standard JWKS
+                // with such an entry must still load. A usable signing key
+                // without one is unaddressable by any token and refused.
+                if (!Jwt.isUsableSigningJwk(jwk)) return@forEach
                 val kid =
                     jwk.get("kid")?.takeIf { it.isTextual }?.asText()
-                        ?: throw IllegalArgumentException("jwks entry has no 'kid'")
-                if (Jwt.isUsableSigningJwk(jwk)) out[kid] = Jwt.publicKey(jwk)
+                        ?: throw IllegalArgumentException("jwks signing entry has no 'kid'")
+                out[kid] = Jwt.publicKey(jwk)
             }
             return out
         }

@@ -143,6 +143,30 @@ class StandardIdpTokenTest {
     }
 
     @Test
+    fun `a skipped entry need not carry a kid, but a usable signing key must`() {
+        // RFC 7517 §4.5 makes kid optional, and identity providers publish
+        // encryption keys without one next to their signing keys. The purpose
+        // filter runs before the kid requirement, so such a file still loads.
+        val encNoKid =
+            TestTokens.rsaJwk(
+                otherRsa,
+                "drop",
+                ""","use":"enc","alg":"RSA-OAEP"""",
+            ).replace(""""kid":"drop",""", "")
+        assertThat(encNoKid).doesNotContain("kid")
+        val idp = """{"keys":[""" + encNoKid + "," + TestTokens.rsaJwk(rsa, "rsa-1") + "]}"
+        assertThat(JwksSigningKeys.parseJwks(idp.toByteArray()).keys).containsExactly("rsa-1")
+        assertThat(verifier(jwks = idp).verify(rs256(TestTokens.tenantClaims())).kind).isEqualTo(Caller.Kind.TENANT)
+
+        // A signing key this verifier would use but that no token can name is a
+        // misconfiguration, still refused at load.
+        val sigNoKid = TestTokens.rsaJwk(rsa, "drop").replace(""""kid":"drop",""", "")
+        assertThatThrownBy { JwksSigningKeys.parseJwks("""{"keys":[$sigNoKid]}""".toByteArray()) }
+            .isInstanceOf(IllegalArgumentException::class.java)
+            .hasMessageContaining("kid")
+    }
+
+    @Test
     fun `a signing key of a type this verifier cannot use is refused at load, not skipped`() {
         val oct = """{"keys":[{"kty":"oct","kid":"h","k":"c2VjcmV0"}]}"""
         assertThatThrownBy { JwksSigningKeys.parseJwks(oct.toByteArray()) }
