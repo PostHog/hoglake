@@ -13,9 +13,16 @@ import com.posthog.hoglake.model.CatalogInfo
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.service.AlterBackend
+import com.posthog.hoglake.service.CleanupBackend
+import com.posthog.hoglake.service.CompactionBackend
+import com.posthog.hoglake.service.ExpiryBackend
+import com.posthog.hoglake.service.HydratorMaintenanceBackend
+import com.posthog.hoglake.service.MaintenanceStatusBackend
+import com.posthog.hoglake.service.OptionsBackend
 import com.posthog.hoglake.service.PartitionListingBackend
 import com.posthog.hoglake.service.PartitionLookupBackend
 import com.posthog.hoglake.service.PartitionStatsBackend
+import com.posthog.hoglake.service.RetirementBackend
 import com.posthog.hoglake.service.TableCreationBackend
 import com.posthog.hoglake.service.UploadBackend
 import com.posthog.hoglake.service.ViewBackend
@@ -275,6 +282,100 @@ class CatalogStoreSelector(
         catalog: String,
         postgres: () -> PartitionLookupBackend,
     ): PartitionLookupBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.partitionLookup ?: postgres()
+
+    /** Resolve catalog maintenance before the PostgreSQL provider runs. Hoglite stays unsupported. */
+    fun options(
+        call: ApplicationCall,
+        catalog: String,
+        postgres: OptionsBackend,
+    ): OptionsBackend = options(call, catalog) { postgres }
+
+    fun options(
+        call: ApplicationCall,
+        catalog: String,
+        postgres: () -> OptionsBackend,
+    ): OptionsBackend = postgresMaintenance(call, catalog, postgres)
+
+    fun expiry(
+        call: ApplicationCall,
+        catalog: String,
+        postgres: ExpiryBackend,
+    ): ExpiryBackend = expiry(call, catalog) { postgres }
+
+    fun expiry(
+        call: ApplicationCall,
+        catalog: String,
+        postgres: () -> ExpiryBackend,
+    ): ExpiryBackend = postgresMaintenance(call, catalog, postgres)
+
+    fun cleanup(
+        call: ApplicationCall,
+        catalog: String,
+        postgres: CleanupBackend,
+    ): CleanupBackend = cleanup(call, catalog) { postgres }
+
+    fun cleanup(
+        call: ApplicationCall,
+        catalog: String,
+        postgres: () -> CleanupBackend,
+    ): CleanupBackend = postgresMaintenance(call, catalog, postgres)
+
+    fun compaction(
+        call: ApplicationCall,
+        catalog: String,
+        postgres: CompactionBackend,
+    ): CompactionBackend = compaction(call, catalog) { postgres }
+
+    fun compaction(
+        call: ApplicationCall,
+        catalog: String,
+        postgres: () -> CompactionBackend,
+    ): CompactionBackend = postgresMaintenance(call, catalog, postgres)
+
+    fun retirement(
+        call: ApplicationCall,
+        catalog: String,
+        postgres: RetirementBackend,
+    ): RetirementBackend = retirement(call, catalog) { postgres }
+
+    fun retirement(
+        call: ApplicationCall,
+        catalog: String,
+        postgres: () -> RetirementBackend,
+    ): RetirementBackend = postgresMaintenance(call, catalog, postgres)
+
+    fun hydratorMaintenance(
+        call: ApplicationCall,
+        catalog: String,
+        postgres: HydratorMaintenanceBackend,
+    ): HydratorMaintenanceBackend = hydratorMaintenance(call, catalog) { postgres }
+
+    fun hydratorMaintenance(
+        call: ApplicationCall,
+        catalog: String,
+        postgres: () -> HydratorMaintenanceBackend,
+    ): HydratorMaintenanceBackend = postgresMaintenance(call, catalog, postgres)
+
+    fun maintenanceStatus(
+        call: ApplicationCall,
+        catalog: String,
+        postgres: MaintenanceStatusBackend,
+    ): MaintenanceStatusBackend = maintenanceStatus(call, catalog) { postgres }
+
+    fun maintenanceStatus(
+        call: ApplicationCall,
+        catalog: String,
+        postgres: () -> MaintenanceStatusBackend,
+    ): MaintenanceStatusBackend = postgresMaintenance(call, catalog, postgres)
+
+    private fun <T> postgresMaintenance(
+        call: ApplicationCall,
+        catalog: String,
+        postgres: () -> T,
+    ): T {
+        requirePostgres(call, catalog)
+        return postgres()
+    }
 
     /** Maintenance is PostgreSQL-only. Resolve placement before any service or body work. */
     fun requirePostgres(
