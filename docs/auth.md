@@ -263,6 +263,9 @@ was retired for the reasons in [auth-tenancy.md §17.2](auth-tenancy.md).
 
 ## Status
 
+The cross-repository checklist of what is left is
+[auth-roadmap.md](auth-roadmap.md).
+
 Built: `off`, `warn`, `enforce`; ES256 verification against a JWKS file or URL;
 the four scopes and the route table; scoped tokens with `prd`; `rtg`; the
 public and metrics listeners; client credentials and fixed tokens in pyhoglake,
