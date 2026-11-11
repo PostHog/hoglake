@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode
 import com.posthog.hoglake.Config
 import com.posthog.hoglake.auth.Routing
 import com.posthog.hoglake.auth.hoglakeAuth
+import com.posthog.hoglake.auth.verifiedBackendToken
 import com.posthog.hoglake.hoglite.HogliteCatalogStore
 import com.posthog.hoglake.hoglite.HogliteClient
 import com.posthog.hoglake.hoglite.HoglitePartitionLookupAdmission
@@ -302,7 +303,7 @@ class CatalogStoreSelector(
             BackendKind.HOGLITE ->
                 call.attributes.computeIfAbsent(requestStore) {
                     HogliteCatalogStore(
-                        client(routing.backendId),
+                        client(routing.backendId).forRequest(call.verifiedBackendToken),
                         HogliteTenantResolver { catalog ->
                             if (catalog == routing.catalog) {
                                 checkNotNull(routing.tenant)
@@ -319,6 +320,7 @@ class CatalogStoreSelector(
                             lookupAdmissions.computeIfAbsent(routing.backendId) {
                                 HoglitePartitionLookupAdmission()
                             },
+                        operatorAuthority = call.hoglakeAuth.callerOrNull?.kind?.isOperator() != false,
                     )
                 }
         }

@@ -103,10 +103,22 @@ change no conforming issuer makes, which an issuer's suite skips.
   identity providers publish for encryption) is skipped and needs no `kid`.
 - `iss` must equal `HOGLAKE_AUTH_ISSUER`; `aud` must be, or contain,
   `HOGLAKE_AUTH_AUDIENCE`.
+  Hogtower's Hoglite-routed metadata grants explicitly carry `["hoglake","hoglite"]`.
+  This generic verifier applies no issuer-specific audience policy.
+  Hoglite independently requires its configured metadata audience pair.
+  Hogtower vending requires the separate single-string audience `hogtower-vend`.
 - `exp` is required. `nbf` and `iat` are optional; an `iat` in the future is
   refused.
 
 ### Claims
+
+Hoglake forwards only the current request's verified JWT to its configured Hoglite backend.
+Request-local client wrappers share transport and routing state, never mutable caller credentials.
+Ordinary reads and writes do not provision tenants or bootstrap schemas.
+Catalog-bound operator requests perform provisioning and deletion.
+Hoglite rejects scoped or predicate-constrained authority because raw SQL cannot preserve those constraints.
+Existing single-audience metadata tokens remain valid at Hoglake until expiry.
+Drain their remaining fifteen-minute lifetime before enabling Hoglite enforcement.
 
 The core, which every issuer must emit:
 

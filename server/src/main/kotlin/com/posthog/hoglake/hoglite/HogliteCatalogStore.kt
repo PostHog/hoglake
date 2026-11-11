@@ -95,6 +95,7 @@ class HogliteCatalogStore(
     internal val minInputFiles: Int = com.posthog.hoglake.compaction.CompactionGrouping.DEFAULT_MIN_INPUT_FILES,
     internal val maxInputFiles: Int = com.posthog.hoglake.compaction.CompactionGrouping.DEFAULT_MAX_INPUT_FILES,
     internal val partitionLookupAdmission: HoglitePartitionLookupAdmission = HoglitePartitionLookupAdmission(),
+    private val operatorAuthority: Boolean = true,
 ) : CatalogStore {
     internal val json: ObjectMapper = jacksonObjectMapper()
 
@@ -212,7 +213,7 @@ class HogliteCatalogStore(
             validateCatalogName(name)
             CatalogService.validateDataPath(dataPath)
             val tenantId = boundTenant(name)
-            client.createTenant(tenantId)
+            backendCall(name) { client.createTenant(tenantId) }
             val boot = HogliteTx()
             // The schema is bootstrapped in ONE transaction, so the meta
             // table exists exactly when an earlier create committed.
@@ -320,7 +321,9 @@ class HogliteCatalogStore(
         // the slowest chunk's latency, not their sum.
         val chunkAnswers =
             parallelReads(chunks.indices.toList()) { c ->
-                client.queryBatch(chunks[c].map { HogliteClient.BatchRead(bound[it].second, sql) })
+                backendCall(bound[chunks[c].first()].first) {
+                    client.queryBatch(chunks[c].map { HogliteClient.BatchRead(bound[it].second, sql) })
+                }
             }
         for ((chunk, answers) in chunks.zip(chunkAnswers)) {
             if (answers == null) {
@@ -332,6 +335,8 @@ class HogliteCatalogStore(
                 when {
                     a.status == 200 -> out[i] = a.result!!.firstRow()
                     a.status == 404 -> out[i] = null
+                    a.status == 401 || a.status == 403 ->
+                        throw mapRejected(bound[i].first, HogliteRejected(a.status, a.body))
                     else -> retry += i
                 }
             }
@@ -399,6 +404,9 @@ class HogliteCatalogStore(
         author: String?,
         message: String?,
     ): DroppedCatalog {
+        if (!operatorAuthority) {
+            throw HoglakeException.Forbidden("hoglite catalog deletion requires operator authority")
+        }
         val binding = operationBindings.get()?.get(catalog)
         binding?.missing?.let { throw it }
         val tenantId = binding?.tenant ?: tenants.tenantFor(catalog)
@@ -498,7 +506,7 @@ class HogliteCatalogStore(
         var deleted = false
         for (attempt in 0 until 3) {
             if (attempt > 0) Thread.sleep(200)
-            client.release(tenantId)
+            backendCall(catalog) { client.release(tenantId) }
             try {
                 client.deleteTenant(tenantId)
                 deleted = true
@@ -2770,34 +2778,54 @@ class HogliteCatalogStore(
     internal val views: HogliteViews by lazy { HogliteViews(this) }
 
     /**
-     * One table-creation receipt, with lazy expiry applied: a `prepared`
-     * receipt past its expires_at is aborted with reason `expired` on
-     * the touch (the Postgres path's `load`, verbatim).
+     * Load a receipt with logical expiry.
+     * Write-side callers also persist lazy expiry.
+     * Status reads never require write authority.
      */
     internal fun loadCreationOrThrow(
         catalog: String,
         operationId: UUID,
+        persistExpiry: Boolean = true,
     ): com.posthog.hoglake.service.TableCreation {
-        val now = HogliteSchema.now()
-        runTx(
-            catalog,
-            freshTxid("creation-expire"),
-            null,
-            HogliteTx().apply {
-                add(
-                    "UPDATE table_creations SET state = 'aborted', reason = 'expired' " +
-                        "WHERE operation = ? AND state = 'prepared' AND expires_at <= ?",
-                    operationId.toString(),
-                    now,
-                )
-            },
-        )
+        if (persistExpiry) {
+            runTx(
+                catalog,
+                freshTxid("creation-expire"),
+                null,
+                HogliteTx().apply {
+                    add(
+                        "UPDATE table_creations SET state = 'aborted', reason = 'expired' " +
+                            "WHERE operation = ? AND state = 'prepared' " +
+                            "AND julianday(expires_at) <= ${HogliteSchema.CREATION_NOW_SQL}",
+                        operationId.toString(),
+                    )
+                },
+            )
+        }
+        // Complete the clock read before the receipt's snapshot can be pinned.
+        // A later clock over an older prepared snapshot could falsely report terminal expiry.
+        val expiryCut =
+            if (persistExpiry) {
+                null
+            } else {
+                (queryCatalog(catalog, "SELECT ${HogliteSchema.CREATION_NOW_SQL}").firstRow()!![0] as Number).toDouble()
+            }
+        val expiryView =
+            if (expiryCut == null) {
+                "0"
+            } else {
+                "CASE WHEN state = 'prepared' AND julianday(expires_at) <= ? THEN 1 ELSE 0 END"
+            }
         val row =
             queryCatalog(
                 catalog,
                 "SELECT table_uuid, definition_json, write_path, state, expires_at, snapshot_id, " +
-                    "schema_version, reason FROM table_creations WHERE operation = ?",
-                operationId.toString(),
+                    "schema_version, reason, $expiryView FROM table_creations WHERE operation = ?",
+                *if (expiryCut == null) {
+                    arrayOf<Any?>(operationId.toString())
+                } else {
+                    arrayOf<Any?>(expiryCut, operationId.toString())
+                },
             ).firstRow()
                 ?: throw HoglakeException.NotFound("table creation operation '$operationId'")
         val definition =
@@ -2805,17 +2833,19 @@ class HogliteCatalogStore(
                 row[1].asString(),
                 "table creation operation $operationId",
             )
+        val expires = HogliteSchema.parse(row[4].asString())
+        val expired = row[8].asLong() == 1L
         return com.posthog.hoglake.service.TableCreation(
             operationId,
             UUID.fromString(row[0].asString()),
             definition,
             com.posthog.hoglake.model.initialColumns(definition.columns),
             row[2].asString(),
-            row[3].asString(),
-            HogliteSchema.parse(row[4].asString()),
+            if (expired) "aborted" else row[3].asString(),
+            expires,
             row[5].asLongOrNull(),
             row[6].asLongOrNull(),
-            row[7] as? String,
+            if (expired) "expired" else row[7] as? String,
         )
     }
 
@@ -2919,6 +2949,17 @@ class HogliteCatalogStore(
         }
     }
 
+    private inline fun <T> backendCall(
+        catalog: String,
+        call: () -> T,
+    ): T =
+        try {
+            call()
+        } catch (r: HogliteRejected) {
+            if (r.status == 401 || r.status == 403) throw mapRejected(catalog, r)
+            throw r
+        }
+
     internal fun mapRejected(
         catalog: String,
         r: HogliteRejected,
@@ -2927,6 +2968,8 @@ class HogliteCatalogStore(
         val code = body?.get("code")?.asText()
         val detail = body?.get("error")?.asText() ?: r.body
         return when {
+            r.status == 401 -> HoglakeException.Unauthenticated("invalid_token", "backend refused request authority")
+            r.status == 403 -> HoglakeException.Forbidden("backend refused request authority")
             r.status == 404 -> missingCatalog(catalog)
             code == "result_too_large" ->
                 HoglakeException.BackendResultTooLarge(

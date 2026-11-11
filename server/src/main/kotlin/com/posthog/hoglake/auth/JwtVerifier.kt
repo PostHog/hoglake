@@ -407,7 +407,16 @@ class JwtVerifier(
         val audiences =
             when {
                 aud.isTextual -> listOf(aud.asText())
-                aud.isArray -> aud.map { it.takeIf(JsonNode::isTextual)?.asText() }.filterNotNull()
+                aud.isArray ->
+                    aud.map {
+                        if (!it.isTextual) {
+                            throw JwtViolation(
+                                JwtViolation.MALFORMED,
+                                "audience entries must be strings",
+                            )
+                        }
+                        it.asText()
+                    }
                 else -> throw JwtViolation(JwtViolation.MALFORMED, "claim 'aud' is neither a string nor an array")
             }
         if (audience !in audiences) {
