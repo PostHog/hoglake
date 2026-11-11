@@ -29,6 +29,8 @@ import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
+import org.junit.jupiter.params.ParameterizedTest
+import org.junit.jupiter.params.provider.ValueSource
 import java.nio.file.Files
 import java.security.interfaces.ECPublicKey
 import java.time.Instant
@@ -170,6 +172,59 @@ class HogliteOptionsIntegrationTest {
             val end = Instant.parse(run[6].asString())
             assertThat(start).isAfterOrEqualTo(started.truncatedTo(java.time.temporal.ChronoUnit.MILLIS))
             assertThat(end).isAfterOrEqualTo(start)
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = ["fence", "delete", "replace"])
+    fun `a ledger-only drop never replaces the successful task result or records in a replacement tenant`(
+        drop: String,
+    ) {
+        val c = freshCatalog()
+        val original = HogliteConformanceEngine.TENANTS.tenantFor(c)
+        var tenant = original
+        HogliteInterposer(engine.url()).use { proxy ->
+            val routed = HogliteCatalogStore(proxy.client, HogliteTenantResolver { tenant })
+            var taskFinished = false
+            val hook =
+                proxy.hook({ m, p, b ->
+                    HogliteInterposer.isWriteTx(m, p, b) && "INSERT INTO maintenance_runs" in b
+                }) {
+                    assertThat(taskFinished).isTrue()
+                    if (drop == "fence") {
+                        engine.client.tx(
+                            original,
+                            UUID.randomUUID().toString(),
+                            null,
+                            listOf(HogliteStatement("UPDATE meta SET dropping = 1 WHERE id = 1")),
+                        )
+                    } else {
+                        store.dropCatalog(c, "test", "ledger race")
+                        if (drop == "replace") {
+                            tenant = "replacement-${UUID.randomUUID()}"
+                            HogliteCatalogStore(engine.client, HogliteTenantResolver { tenant })
+                                .createCatalog(c, "s3://hoglake-it/$c")
+                        }
+                    }
+                }
+            val result = mapOf("files_removed" to 3)
+            val outcome =
+                runCatching {
+                    routed.recorded(c, MaintenanceTask.CLEANUP, MaintenanceTrigger.MANUAL) {
+                        routed.meta(c)
+                        taskFinished = true
+                        result
+                    }
+                }
+            assertThat(hook.fired).describedAs(drop).isTrue()
+            assertThat(outcome.exceptionOrNull()).describedAs(drop).isNull()
+            assertThat(outcome.getOrThrow()).isSameAs(result)
+            if (drop != "delete") {
+                assertThat(
+                    engine.client.query(tenant, "SELECT COUNT(*) FROM maintenance_runs").firstRow()!![0].asLong(),
+                ).describedAs(drop).isZero()
+            }
+            if (drop == "replace") assertThat(routed.getCatalog(c).name).isEqualTo(c)
         }
     }
 

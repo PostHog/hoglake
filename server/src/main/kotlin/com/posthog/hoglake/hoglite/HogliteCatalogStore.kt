@@ -2806,24 +2806,31 @@ class HogliteCatalogStore(
         error: String?,
         result: Any?,
     ) {
-        runCatching {
-            val tx = HogliteTx()
-            tx.add(
-                "INSERT INTO maintenance_runs(task, run_trigger, started_at, finished_at, status, error, " +
-                    "result_json) " +
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                task.wire,
-                trigger.wire,
-                HogliteSchema.fmt(startedAt),
-                HogliteSchema.fmt(finishedAt),
-                status.wire,
-                error,
-                result?.let { ledgerJson.writeValueAsString(it) },
-            )
-            runTx(catalog, freshTxid("ledger"), null, tx)
-        }.onFailure { e ->
-            io.github.oshai.kotlinlogging.KotlinLogging.logger {}
-                .warn(e) { "maintenance ledger: failed to record $task run for catalog '$catalog'" }
+        val binding = operationBindings.get()?.get(catalog)
+        val taskMissing = binding?.missing
+        try {
+            runCatching {
+                val tx = HogliteTx()
+                tx.add(
+                    "INSERT INTO maintenance_runs(task, run_trigger, started_at, finished_at, status, error, " +
+                        "result_json) " +
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    task.wire,
+                    trigger.wire,
+                    HogliteSchema.fmt(startedAt),
+                    HogliteSchema.fmt(finishedAt),
+                    status.wire,
+                    error,
+                    result?.let { ledgerJson.writeValueAsString(it) },
+                )
+                runTx(catalog, freshTxid("ledger"), null, tx)
+            }.onFailure { e ->
+                io.github.oshai.kotlinlogging.KotlinLogging.logger {}
+                    .warn(e) { "maintenance ledger: failed to record $task run for catalog '$catalog'" }
+            }
+        } finally {
+            // Keep the tenant binding and any task-level absence. Do not retain absence found only by the ledger.
+            binding?.missing = taskMissing
         }
     }
 
