@@ -2,15 +2,15 @@ package com.posthog.hoglake.api
 
 import com.fasterxml.jackson.databind.JsonNode
 import com.posthog.hoglake.auth.actorOrRefuse
-import com.posthog.hoglake.compaction.CompactionService
-import com.posthog.hoglake.hydrator.Hydrator
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.MaintenanceTask
-import com.posthog.hoglake.service.CleanupService
+import com.posthog.hoglake.service.CleanupBackend
+import com.posthog.hoglake.service.CompactionBackend
 import com.posthog.hoglake.service.DatabaseHealthService
-import com.posthog.hoglake.service.ExpiryService
+import com.posthog.hoglake.service.ExpiryBackend
+import com.posthog.hoglake.service.HydratorMaintenanceBackend
 import com.posthog.hoglake.service.MaintenanceStatusService
-import com.posthog.hoglake.service.OptionsService
+import com.posthog.hoglake.service.OptionsBackend
 import com.posthog.hoglake.store.CatalogStoreSelector
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.Application
@@ -36,11 +36,11 @@ import io.ktor.server.routing.routing
  * Config).
  */
 fun Application.installMaintenanceRoutes(
-    options: OptionsService,
-    expiry: ExpiryService,
-    cleanup: CleanupService,
-    compaction: CompactionService,
-    hydrator: Hydrator,
+    options: OptionsBackend,
+    expiry: ExpiryBackend,
+    cleanup: CleanupBackend,
+    compaction: CompactionBackend,
+    hydrator: HydratorMaintenanceBackend,
     status: MaintenanceStatusService,
     databaseHealth: DatabaseHealthService,
     selector: CatalogStoreSelector? = null,
@@ -56,11 +56,11 @@ fun Application.installMaintenanceRoutes(
 )
 
 fun Application.installMaintenanceRoutes(
-    optionsProvider: () -> OptionsService,
-    expiryProvider: () -> ExpiryService,
-    cleanupProvider: () -> CleanupService,
-    compactionProvider: () -> CompactionService,
-    hydratorProvider: () -> Hydrator,
+    optionsProvider: () -> OptionsBackend,
+    expiryProvider: () -> ExpiryBackend,
+    cleanupProvider: () -> CleanupBackend,
+    compactionProvider: () -> CompactionBackend,
+    hydratorProvider: () -> HydratorMaintenanceBackend,
     statusProvider: () -> MaintenanceStatusService,
     databaseHealthProvider: () -> DatabaseHealthService,
     selector: CatalogStoreSelector? = null,
@@ -76,14 +76,16 @@ fun Application.installMaintenanceRoutes(
         route("/v1/catalogs/{catalog}") {
             route("/options") {
                 get {
-                    selector?.requirePostgres(call, call.maintenanceCatalog())
-                    call.respond(options.get(call.maintenanceCatalog()).toDto())
+                    val backend = selector?.options(call, call.maintenanceCatalog()) { options } ?: options
+                    call.respond(backend.get(call.maintenanceCatalog()).toDto())
                 }
                 patch {
+                    // Refuse unsupported placement before parsing. Build PostgreSQL options only after a valid body.
                     selector?.requirePostgres(call, call.maintenanceCatalog())
                     val req = OptionsPatchRequest.from(call.receive<JsonNode>())
+                    val backend = selector?.options(call, call.maintenanceCatalog()) { options } ?: options
                     call.respond(
-                        options.patch(
+                        backend.patch(
                             call.maintenanceCatalog(),
                             req.snapshotRetentionSeconds,
                             req.consumerFloor,
@@ -94,18 +96,18 @@ fun Application.installMaintenanceRoutes(
                 }
             }
             post("/maintenance/expire") {
-                selector?.requirePostgres(call, call.maintenanceCatalog())
+                val backend = selector?.expiry(call, call.maintenanceCatalog()) { expiry } ?: expiry
                 call.respond(
-                    expiry.runOnce(
+                    backend.runOnce(
                         call.maintenanceCatalog(),
                         call.batchQuery() ?: DEFAULT_EXPIRE_BATCH,
                     ).toDto(),
                 )
             }
             post("/maintenance/cleanup") {
-                selector?.requirePostgres(call, call.maintenanceCatalog())
+                val backend = selector?.cleanup(call, call.maintenanceCatalog()) { cleanup } ?: cleanup
                 call.respond(
-                    cleanup.runOnce(
+                    backend.runOnce(
                         call.maintenanceCatalog(),
                         call.batchQuery() ?: DEFAULT_CLEANUP_BATCH,
                     ).toDto(),
@@ -114,9 +116,9 @@ fun Application.installMaintenanceRoutes(
             // `batch` = groups rewritten this run (default: the config knob,
             // 1 — compaction takes tiny bites by construction).
             post("/maintenance/compact") {
-                selector?.requirePostgres(call, call.maintenanceCatalog())
+                val backend = selector?.compaction(call, call.maintenanceCatalog()) { compaction } ?: compaction
                 call.respond(
-                    compaction.runOnce(
+                    backend.runOnce(
                         call.maintenanceCatalog(),
                         call.batchQuery(),
                     ).toDto(),
@@ -127,9 +129,9 @@ fun Application.installMaintenanceRoutes(
             // table via ?namespace=..&table=.. — both together or
             // neither).
             post("/maintenance/rehydrate") {
-                selector?.requirePostgres(call, call.maintenanceCatalog())
+                val backend = selector?.hydratorMaintenance(call, call.maintenanceCatalog()) { hydrator } ?: hydrator
                 call.respond(
-                    hydrator.rehydrateFailed(
+                    backend.rehydrateFailed(
                         call.maintenanceCatalog(),
                         call.request.queryParameters["namespace"],
                         call.request.queryParameters["table"],
@@ -139,13 +141,13 @@ fun Application.installMaintenanceRoutes(
             // The read side of the run ledger: per-task status (loop
             // cadence + live backlog + last run) and the paged history.
             get("/maintenance/status") {
-                selector?.requirePostgres(call, call.maintenanceCatalog())
-                call.respond(status.status(call.maintenanceCatalog()).toDto())
+                val backend = selector?.maintenanceStatus(call, call.maintenanceCatalog()) { status } ?: status
+                call.respond(backend.status(call.maintenanceCatalog()).toDto())
             }
             get("/maintenance/runs") {
-                selector?.requirePostgres(call, call.maintenanceCatalog())
+                val backend = selector?.maintenanceStatus(call, call.maintenanceCatalog()) { status } ?: status
                 call.respond(
-                    status.runs(
+                    backend.runs(
                         call.maintenanceCatalog(),
                         call.taskQuery(),
                         call.beforeQuery(),

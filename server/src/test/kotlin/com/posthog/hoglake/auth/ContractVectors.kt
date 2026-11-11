@@ -227,7 +227,17 @@ object ContractVectors {
             val jtiText = "00000000-0000-4000-8000-%012d".format(jti)
             val claims = linkedMapOf<String, JsonNode>()
             claims["iss"] = mapper.valueToTree(ISSUER)
-            claims["aud"] = mapper.valueToTree(audience)
+            claims["aud"] =
+                if (audience == AUDIENCE &&
+                    (
+                        input["placement"]?.get("backend_type")?.asText() == "hoglite" ||
+                            (inputKey == "operator" && input["placement"] == null)
+                    )
+                ) {
+                    mapper.valueToTree(listOf(AUDIENCE, "hoglite"))
+                } else {
+                    mapper.valueToTree(audience)
+                }
             body.firstOrNull { it.first == "sub" }?.let { claims["sub"] = it.second }
             claims["jti"] = mapper.valueToTree(jtiText)
             body.filter { it.first != "sub" }.forEach { (k, v) -> claims[k] = v }
