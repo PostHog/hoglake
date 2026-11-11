@@ -298,6 +298,11 @@ class JwtVerifier(
      */
     private val predicateFields: Set<String> = emptySet(),
     private val backends: Map<UUID, BackendKind> = emptyMap(),
+    /**
+     * The most a scoped token may live, `exp - iat`
+     * (`HOGLAKE_AUTH_SCOPED_MAX_LIFETIME_SECONDS`).
+     */
+    private val scopedMaxLifetimeSeconds: Long = DEFAULT_SCOPED_MAX_LIFETIME_SECONDS,
     private val clock: () -> Long = { System.currentTimeMillis() / 1000 },
 ) {
     init {
@@ -307,6 +312,9 @@ class JwtVerifier(
         require(issuer.isNotBlank()) { "auth issuer must be configured when auth is not off" }
         require(audience.isNotBlank()) { "auth audience must be configured when auth is not off" }
         require(skewSeconds in 0..600) { "auth clock skew must be 0..600s, got $skewSeconds" }
+        require(scopedMaxLifetimeSeconds > 0) {
+            "auth scoped max lifetime must be positive, got $scopedMaxLifetimeSeconds"
+        }
     }
 
     /**
@@ -397,7 +405,10 @@ class JwtVerifier(
     private fun toCaller(claims: JsonNode): Caller {
         val subject = Jwt.text(claims, "sub")
         val tokenId = Jwt.text(claims, "jti")
-        val kindText = Jwt.text(claims, "ten")
+        // An absent `ten` means `tenant`, so an issuer with one kind of token
+        // need not spell it. Absent only: a `ten` that is present but not a
+        // string is still refused, and a scoped or operator token must say so.
+        val kindText = if (claims.has("ten")) Jwt.text(claims, "ten") else null
         val clientName = Jwt.textOrNull(claims, "cli")
         val routing = routing(claims)
 
@@ -415,7 +426,13 @@ class JwtVerifier(
 
             "scoped" -> scopedCaller(claims, subject, tokenId, clientName, routing)
 
-            "tenant" -> {
+            "tenant", null -> {
+                // A token that carries a predicate but no `ten` is a scoped
+                // token that forgot to say so. Reading it as a tenant token
+                // would drop the predicate, i.e. widen it to the whole catalog.
+                if (kindText == null && claims.has("prd")) {
+                    throw JwtViolation(JwtViolation.MALFORMED, "a token carrying 'prd' must declare ten 'scoped'")
+                }
                 val orgId = Jwt.text(claims, "org")
                 val cat =
                     claims.get("cat")
@@ -530,10 +547,10 @@ class JwtVerifier(
         val iat =
             claims.get("iat")?.takeIf { it.isIntegralNumber }?.asLong()
                 ?: throw JwtViolation(JwtViolation.MISSING_CLAIM, "a scoped token must carry an integer 'iat'")
-        if (Jwt.seconds(claims, "exp") - iat > MAX_SCOPED_LIFETIME_SECONDS) {
+        if (Jwt.seconds(claims, "exp") - iat > scopedMaxLifetimeSeconds) {
             throw JwtViolation(
                 JwtViolation.MALFORMED,
-                "a scoped token may live at most ${MAX_SCOPED_LIFETIME_SECONDS}s",
+                "a scoped token may live at most ${scopedMaxLifetimeSeconds}s",
             )
         }
         val orgId = Jwt.text(claims, "org")
@@ -620,8 +637,12 @@ class JwtVerifier(
         /** The most values one predicate field may enumerate. */
         const val MAX_PREDICATE_VALUES = 200
 
-        /** `exp - iat` ceiling for a scoped token: hogtower mints 15 minutes. */
-        const val MAX_SCOPED_LIFETIME_SECONDS = 900L
+        /**
+         * Default `exp - iat` ceiling for a scoped token, 15 minutes; an issuer
+         * that mints longer-lived scoped tokens needs
+         * `HOGLAKE_AUTH_SCOPED_MAX_LIFETIME_SECONDS` raised.
+         */
+        const val DEFAULT_SCOPED_MAX_LIFETIME_SECONDS = 900L
 
         private const val MAX_USER_LENGTH = 200
         private const val ALL = "*"
