@@ -6,6 +6,7 @@ import com.posthog.hoglake.api.installPublicationRoutes
 import com.posthog.hoglake.auth.AuthMode
 import com.posthog.hoglake.auth.AuthService
 import com.posthog.hoglake.auth.JwtVerifier
+import com.posthog.hoglake.auth.Routing
 import com.posthog.hoglake.auth.StaticSigningKeys
 import com.posthog.hoglake.auth.TestTokens
 import com.posthog.hoglake.auth.installAuth
@@ -25,6 +26,7 @@ import io.ktor.server.routing.get
 import io.ktor.server.routing.routing
 import io.ktor.server.testing.testApplication
 import org.assertj.core.api.Assertions.assertThat
+import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.lang.reflect.Proxy
@@ -64,6 +66,26 @@ class CatalogStoreSelectorTest {
         val placement = if (routed) """, "rtg":{"b":"hoglite","be":"$backendId","t":"opaque_1"}""" else ""
         val claims = TestTokens.operatorClaims().dropLast(1) + """, "cat":{"lake":["admin"]}$placement}"""
         return TestTokens.mint(pair, claims)
+    }
+
+    @Test
+    fun `explicit placement uses the routed constructor without a request or fallback`() {
+        val cfg = config("none").copy(removalLedgerRetentionSeconds = 12345)
+        val selector = CatalogStoreSelector(postgres, cfg)
+        val routing = Routing("lake", BackendKind.HOGLITE, id, "opaque_1")
+        val first = selector.forPlacement(routing) as HogliteCatalogStore
+        val second = selector.forPlacement(routing) as HogliteCatalogStore
+        assertThat(first).isNotSameAs(second)
+        assertThat(first.client).isSameAs(second.client)
+        assertThat(first.partitionLookupAdmission).isSameAs(second.partitionLookupAdmission)
+        assertThat(first.ledgerRetentionSeconds).isEqualTo(12345)
+        assertThat(first.catalogOperation("lake") { first.boundTenant("lake") }).isEqualTo("opaque_1")
+        assertThatThrownBy { first.catalogOperation("other") { first.boundTenant("other") } }
+            .isInstanceOf(com.posthog.hoglake.model.HoglakeException.NotFound::class.java)
+        val pg = Routing("lake", BackendKind.POSTGRES, id, null)
+        assertThat(selector.forPlacement(pg)).isSameAs(postgres)
+        assertThatThrownBy { CatalogStoreSelector(null, cfg).forPlacement(pg) }
+            .isInstanceOf(com.posthog.hoglake.model.HoglakeException.NotFound::class.java)
     }
 
     @Test
@@ -117,6 +139,8 @@ class CatalogStoreSelectorTest {
                         ).isSameAs(hoglite.partitions)
                         assertThat(selector.partitionLookup(call, "lake", hoglite.partitionLookup))
                             .isSameAs(hoglite.partitionLookup)
+                        assertThat(selector.options(call, "lake") { error("must not construct PostgreSQL options") })
+                            .isSameAs(hoglite.options)
                         stores.add(listing.store)
                         call.respondText(listing.catalogs!!.single())
                     }

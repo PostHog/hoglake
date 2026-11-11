@@ -16,6 +16,7 @@ import com.posthog.hoglake.model.TableAppend
 import com.posthog.hoglake.model.TableDeletes
 import com.posthog.hoglake.model.Transform
 import com.posthog.hoglake.observability.Metrics
+import com.posthog.hoglake.service.PatchField
 import com.posthog.hoglake.wireObjectMapper
 import com.sun.net.httpserver.HttpServer
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry
@@ -2051,5 +2052,148 @@ class HogliteExtendedGuardRaceIntegrationTest {
         assertThat(store.listNamespaces(c, null, null)).isEmpty()
         // and a new operation (old tenant now unfenced) proceeds
         assertThat(pstore.createNamespace(c, "a").name).isEqualTo("a")
+    }
+
+    private fun optionsAudit(body: (List<com.fasterxml.jackson.databind.JsonNode>) -> Unit) {
+        val events = CopyOnWriteArrayList<com.fasterxml.jackson.databind.JsonNode>()
+        val logger =
+            org.slf4j.LoggerFactory.getLogger(com.posthog.hoglake.observability.Audit.LOGGER_NAME)
+                as ch.qos.logback.classic.Logger
+        val encoder =
+            net.logstash.logback.encoder.LogstashEncoder().apply {
+                context = logger.loggerContext
+                setIncludeMdc(false)
+                start()
+            }
+        val capture =
+            object : ch.qos.logback.core.AppenderBase<ch.qos.logback.classic.spi.ILoggingEvent>() {
+                override fun append(event: ch.qos.logback.classic.spi.ILoggingEvent) {
+                    events.add(wireObjectMapper().readTree(encoder.encode(event)))
+                }
+            }.apply {
+                context = logger.loggerContext
+                start()
+            }
+        logger.addAppender(capture)
+        try {
+            body(events)
+        } finally {
+            logger.detachAppender(capture)
+            capture.stop()
+            encoder.stop()
+        }
+    }
+
+    @Test
+    fun `options attribution uses the policy inside its write transaction`() {
+        optionsAudit { events ->
+            for (competing in listOf(100L, null)) {
+                val c = freshCatalog()
+                HogliteOptions(store).patch(c, PatchField.Set(10L), null, "test", "initial")
+                val oldHead = head(c)
+                val hook =
+                    Hook({ m, p, b -> isTx(m, p, b) && "UPDATE meta SET snapshot_retention_seconds" in b }, before = {
+                        HogliteOptions(store).patch(c, PatchField.Set(competing), null, "test", "competing")
+                    })
+                hooks += hook
+                val failure =
+                    runCatching {
+                        HogliteOptions(pstore).patch(c, PatchField.Set(20L), false, null, null)
+                    }.exceptionOrNull()
+                assertThat(hook.remaining).isZero()
+                assertThat(failure).isExactlyInstanceOf(HoglakeException.Validation::class.java)
+                    .hasMessage("author is required and must not be blank")
+                val actual = HogliteOptions(store).get(c)
+                assertThat(actual.snapshotRetentionSeconds).isEqualTo(competing)
+                assertThat(actual.consumerFloor).isTrue()
+                assertThat(actual.earliestSnapshotId).isZero()
+                assertThat(head(c)).isEqualTo(oldHead)
+                assertThat(n(c, "SELECT COUNT(*) FROM receipts")).isZero()
+                val ownEvents = events.filter { it["catalog"]?.asText() == c && it["actor"]?.asText() == "anonymous" }
+                assertThat(ownEvents).hasSize(1)
+                assertThat(ownEvents.single()["action"].asText()).isEqualTo("options_patch")
+                assertThat(ownEvents.single()["outcome"].asText()).isEqualTo("validation")
+            }
+        }
+    }
+
+    @Test
+    fun `options permits an increase after a competing attributed reduction`() {
+        val c = freshCatalog()
+        HogliteOptions(store).patch(c, PatchField.Set(100L), null, "test", "initial")
+        val old = HogliteConformanceEngine.TENANTS.tenantFor(c)
+        val hook =
+            Hook({ _, p, b -> "/v1/t/$old/query" in p && "FROM meta" in b }, after = {
+                HogliteOptions(store).patch(c, PatchField.Set(10L), null, "test", "competing")
+            })
+        hooks += hook
+        val result = runCatching { HogliteOptions(pstore).patch(c, PatchField.Set(20L), null, null, null) }
+        assertThat(hook.remaining).isZero()
+        assertThat(result.exceptionOrNull()).isNull()
+        assertThat(result.getOrThrow().snapshotRetentionSeconds).isEqualTo(20L)
+    }
+
+    @Test
+    fun `options equality and still-increasing concurrent policy do not conflict`() {
+        for (competing in listOf(15L, 20L)) {
+            val c = freshCatalog()
+            HogliteOptions(store).patch(c, PatchField.Set(10L), null, "test", "initial")
+            val hook =
+                Hook({ m, p, b -> isTx(m, p, b) && "UPDATE meta SET snapshot_retention_seconds" in b }, before = {
+                    HogliteOptions(store).patch(c, PatchField.Set(competing), false, "test", "competing")
+                })
+            hooks += hook
+            val result = runCatching { HogliteOptions(pstore).patch(c, PatchField.Set(20L), null, "\u0085", "\u2003") }
+            assertThat(hook.remaining).isZero()
+            assertThat(result.exceptionOrNull()).isNull()
+            assertThat(result.getOrThrow().snapshotRetentionSeconds).isEqualTo(20L)
+            assertThat(result.getOrThrow().consumerFloor).isFalse()
+        }
+    }
+
+    @Test
+    fun `options response records its own transaction before a subsequent patch`() {
+        optionsAudit { events ->
+            val c = freshCatalog()
+            val hook =
+                Hook({ m, p, b -> isTx(m, p, b) && "UPDATE meta SET snapshot_retention_seconds" in b }, after = {
+                    HogliteOptions(store).patch(c, PatchField.Set(100L), false, "test", "later")
+                })
+            hooks += hook
+            val result = HogliteOptions(pstore).patch(c, PatchField.Set(20L), null, "first", "first")
+            assertThat(hook.remaining).isZero()
+            assertThat(result.snapshotRetentionSeconds).isEqualTo(20L)
+            assertThat(result.consumerFloor).isTrue()
+            assertThat(HogliteOptions(store).get(c).snapshotRetentionSeconds).isEqualTo(100L)
+            val ownEvents = events.filter { it["catalog"]?.asText() == c && it["actor"]?.asText() == "first" }
+            assertThat(ownEvents).hasSize(1)
+            assertThat(ownEvents.single()["outcome"].asText()).isEqualTo("ok")
+            assertThat(ownEvents.single()["detail"].asText())
+                .isEqualTo("snapshot_retention_seconds=20 consumer_floor=true")
+        }
+    }
+
+    @Test
+    fun `options attribution cannot conceal a competing drop fence`() {
+        val c = freshCatalog()
+        HogliteOptions(store).patch(c, PatchField.Set(10L), null, "test", "initial")
+        val old = HogliteConformanceEngine.TENANTS.tenantFor(c)
+        val hook =
+            Hook({ m, p, b -> isTx(m, p, b) && "UPDATE meta SET snapshot_retention_seconds" in b }, before = {
+                client.tx(
+                    old,
+                    UUID.randomUUID().toString(),
+                    null,
+                    listOf(
+                        HogliteStatement("UPDATE meta SET dropping = 1, snapshot_retention_seconds = 100 WHERE id = 1"),
+                    ),
+                )
+            })
+        hooks += hook
+        val result = runCatching { HogliteOptions(pstore).patch(c, PatchField.Set(20L), false, null, null) }
+        assertThat(hook.remaining).isZero()
+        assertThat(result.exceptionOrNull()).isExactlyInstanceOf(HoglakeException.NotFound::class.java)
+        val row = client.query(old, "SELECT snapshot_retention_seconds, consumer_floor FROM meta").firstRow()!!
+        assertThat(row.map { it.asLong() }).containsExactly(100L, 1L)
     }
 }
