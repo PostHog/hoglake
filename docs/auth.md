@@ -186,10 +186,12 @@ chosen per deployment:
 
 | provider | how the server's jobs get S3 credentials |
 | --- | --- |
-| `ambient` (default) | the SDK's default chain: a pod identity in Kubernetes, an instance profile, or the environment. What hoglake does today, so an existing install changes nothing |
-| `static` | `HOGLAKE_S3_ACCESS_KEY` and `HOGLAKE_S3_SECRET_KEY`: MinIO, local development, CI |
+| `ambient` (default) | the SDK's default chain: a pod identity in Kubernetes, an instance profile, or the environment |
+| `static` | `HOGLAKE_S3_ACCESS_KEY` and `HOGLAKE_S3_SECRET_KEY`: MinIO, local development, CI, the compose quickstart |
 | `broker` (planned) | an HTTP call to a configured URL, authenticated with hoglake's own client credential against a configured token URL: `POST <url>` with `{"catalog", "prefix", "access": "read" \| "write"}`, answered with `{"access_key_id", "secret_access_key", "session_token", "expiration"}`, STS's shape. One session per job, scoped to one catalog, held in memory and refreshed before it expires; never written to the metadata store |
 
+`ambient` and `static` are what hoglake does today (static keys when both are
+set, otherwise the SDK chain), so an existing install changes nothing.
 `broker` is how a deployment puts the server's own S3 access behind the same
 authority as its clients' access: the server then holds no cloud identity of
 its own, and every session it uses is one the broker chose to grant and can
@@ -198,8 +200,12 @@ front of their own STS wrapper or a secrets engine. Under `ambient` the
 server's role reaches every catalog it serves, which is the normal trade for a
 single-org install.
 
-Whatever the provider, it is used only by the server's own jobs. The request
-path never calls it, never reads S3, and never fetches credentials for a
+Whatever the provider, it serves only the server's own work: the background
+jobs, and the same work when a caller with `maintenance` scope triggers it
+through `POST /v1/catalogs/{catalog}/maintenance/compact` or
+`…/maintenance/cleanup`, which run compaction or cleanup inline and read and
+rewrite S3 with the server's credentials. Ordinary metadata requests never
+call the provider and never read S3, and nothing fetches credentials for a
 client.
 
 A deployment that wants storage access gated by the same authority as the
