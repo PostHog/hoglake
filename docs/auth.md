@@ -70,16 +70,20 @@ listener.
 | `HOGLAKE_AUTH_CLOCK_SKEW_SECONDS` | tolerance on `exp`, `nbf` and `iat`; default 60, at most 600 |
 | `HOGLAKE_AUTH_PREDICATE_FIELDS` | the fields a scoped token's `prd` may name; empty means scoped tokens are refused |
 
-One issuer and one key set per server. A deployment that needs several issuers
-runs them behind one JWKS, or waits for multi-issuer support (tracked).
+One issuer and one key set per server: every token's `iss` must equal
+`HOGLAKE_AUTH_ISSUER`. Several signing services can share one JWKS only if they
+also share that one issuer identity; distinct issuers need separate servers
+until multi-issuer verification exists (tracked).
 
 ## The token contract
 
 hoglake owns this contract. The test vectors that pin it, signed tokens with
-their expected verification results, are generated in this repository from the
-verifier (`server/src/test/resources/oauth/contract-vectors.json`), and every
-issuer conforms to them, hogtower included. An issuer that wants a new claim
-changes the contract here first.
+their expected verification results, live in
+`server/src/test/resources/oauth/contract-vectors.json`, and every issuer
+conforms to them, hogtower included; an issuer that wants a new claim changes
+the contract here first. That is the intended ownership. Today the file is
+still generated on the hogtower side and copied here; generating it from
+hoglake's verifier, with a neutral issuer, is tracked in #574.
 
 ### Wire format
 
@@ -101,7 +105,8 @@ The core, which every issuer must emit:
 | `iss`, `aud`, `sub`, `exp` | yes | as above; `sub` becomes the audit actor |
 | `jti` | yes | token id, for correlating an audit line with a token |
 | `ten` | yes today; absent will mean `tenant` (planned) | the token kind: `tenant`, `scoped` or `operator` |
-| `cat` | tenant and scoped | `{"<catalog>": ["read", "write", …]}`: the catalogs the token may use and the scopes on each. An unknown scope word is dropped, not refused |
+| `org` | tenant and scoped, today | the tenant the token belongs to, for the audit log only; hoglake does not authorize on it. Required by the verifier today; making it optional is tracked |
+| `cat` | tenant and scoped | `{"<catalog>": ["read", "write", …]}`: the catalogs the token may use and the scopes on each. On a tenant token an unknown scope word is dropped, not refused; a scoped token is stricter, below |
 
 Authorization is per catalog. The scope vocabulary is ordered,
 `read < write < maintenance < admin`: `write` includes `read`, `maintenance`
@@ -118,16 +123,31 @@ deployment needs them; hoglake applies them without knowing what they mean:
 
 | claim | meaning |
 | --- | --- |
-| `org` | the tenant the token belongs to, for the audit log only; hoglake does not authorize on it |
 | `cli` | a human-readable client name, for logs |
 | `dlg` | the caller may set `author` on a commit to a name other than its own `sub` |
 | `prd` | on a `scoped` token: `{"<field>": {"<value>": "read" \| "write", …}}`, or `{"<field>": {"*": …}}`. The field must be one of `HOGLAKE_AUTH_PREDICATE_FIELDS`. hoglake filters metadata by `field ∈ values` and refuses commits whose files are attributed to a value the token may not write. This is how a multi-tenant issuer narrows one catalog to one tenant; PostHog's field is `team_id` |
 | `usr` | on a `scoped` token: an opaque end-user name for access logs, never used for authorization |
 | `rtg` | verified placement of the single catalog the token names on a configured backend (`b`, `be`, and `t` for hoglite); mismatches answer 401 `unknown_backend` |
 
-A `scoped` token's lifetime (`exp − iat`) is capped at 900 seconds today. The
-cap becomes configuration (tracked); an issuer that mints longer-lived scoped
-tokens must raise it.
+### Scoped tokens, exactly
+
+A `scoped` token is a tenant token narrowed to some values of a field, and the
+verifier is strict about it. An issuer that wants its scoped tokens accepted
+must emit all of the following:
+
+- an integer `iat`, and `exp − iat ≤ 900` (the cap becomes configuration,
+  tracked; an issuer that mints longer-lived scoped tokens must raise it);
+- a non-empty `cat` whose scopes are only `read` or `write`; any other scope
+  word refuses the token rather than being dropped;
+- a `prd` object naming **exactly** the server's `HOGLAKE_AUTH_PREDICATE_FIELDS`,
+  no more and no fewer. A server with no predicate fields refuses every scoped
+  token;
+- for each field, a non-empty object of at most 200 entries whose keys are
+  canonical decimal ids that fit a signed 64-bit integer, each mapped to `read`
+  or `write`; or the single key `*`. `*` may not be mixed with values.
+
+A refusal names its reason in `WWW-Authenticate` (`missing_claim`,
+`invalid_predicate`, …).
 
 An `operator` token bypasses per-catalog checks and may create catalogs,
 manage mounts and containment, and read operator-only routes. Operator tokens
