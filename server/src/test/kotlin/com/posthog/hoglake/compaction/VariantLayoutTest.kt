@@ -141,6 +141,68 @@ class VariantLayoutTest {
     }
 
     @Test
+    fun `a file's subtree canonicalizes to the layout the output writes, and equal layouts to equal groups`() {
+        val group = VariantLayout.groupType(column(DECLARATION), Type.Repetition.OPTIONAL)
+        // The declared layout is its own canonical form.
+        assertThat(VariantLayout.canonical(group, column(DECLARATION))).isEqualTo(group)
+        // A file's wider spelling — renamed, REQUIRED, legacy TIME_MICROS,
+        // ids below the top — canonicalizes to the declared group exactly:
+        // the relation layoutMismatch passes is equality here.
+        val wider =
+            parse(
+                """
+                required group old_name (VARIANT(1)) = 9 {
+                  required binary metadata = 10;
+                  optional binary value = 11;
+                  optional group typed_value = 12 {
+                    required group t { optional binary value; optional int64 typed_value (TIME(MICROS,false)); }
+                    required group tags {
+                      optional binary value;
+                      optional group typed_value (LIST) {
+                        repeated group list {
+                          required group element { optional binary value; optional binary typed_value (STRING); }
+                        }
+                      }
+                    }
+                  }
+                }
+                """,
+            )
+        assertThat(VariantLayout.layoutMismatch(wider, group)).isNull()
+        assertThat(VariantLayout.canonical(wider, column(DECLARATION))).isEqualTo(group)
+        // Another layout is another group, and fingerprints follow.
+        val other = parse("optional group v (VARIANT(1)) { required binary metadata; required binary value; }")
+        val canonicalOther = VariantLayout.canonical(other, column(DECLARATION))!!
+        assertThat(canonicalOther).isNotEqualTo(group)
+        assertThat(canonicalOther).isEqualTo(VariantLayout.groupType(column(null), Type.Repetition.OPTIONAL))
+        assertThat(VariantLayout.fingerprint(mapOf(7L to canonicalOther)))
+            .isNotEqualTo(VariantLayout.fingerprint(mapOf(7L to group)))
+            .isEqualTo(
+                VariantLayout.fingerprint(mapOf(7L to VariantLayout.groupType(column(null), Type.Repetition.OPTIONAL))),
+            )
+        // The canonical form is what the output writes a NOT NULL column as, too.
+        assertThat(VariantLayout.withRepetition(group, Type.Repetition.REQUIRED))
+            .isEqualTo(VariantLayout.groupType(column(DECLARATION, nullable = false), Type.Repetition.REQUIRED))
+        assertThat(VariantLayout.withRepetition(group, Type.Repetition.OPTIONAL)).isSameAs(group)
+    }
+
+    @Test
+    fun `what is no VARIANT group has no canonical layout`() {
+        val unshredded = "required binary metadata; required binary value;"
+        val variant = "optional group v (VARIANT(1)) = 7"
+        for ((case, field) in listOf(
+            "a leaf" to "optional binary v = 7;",
+            "a repeated group" to "repeated group v (VARIANT(1)) = 7 { $unshredded }",
+            "no VARIANT annotation" to "optional group v = 7 { $unshredded }",
+            "no metadata first" to "$variant { required binary value; required binary metadata; }",
+            "optional metadata" to "$variant { optional binary metadata; required binary value; }",
+        )) {
+            val type = MessageTypeParser.parseMessageType("message m { $field }").getType(0)
+            assertThat(VariantLayout.canonical(type, column(DECLARATION))).describedAs(case).isNull()
+        }
+    }
+
+    @Test
     fun `a refusal names the two differing nodes on one line, never their subtrees`() {
         // The grammar's widest object: its subtree printed is ~120 KB, in a
         // warning logged for the group on every sweep.

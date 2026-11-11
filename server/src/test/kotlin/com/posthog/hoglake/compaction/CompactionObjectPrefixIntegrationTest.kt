@@ -571,4 +571,149 @@ class CompactionObjectPrefixIntegrationTest {
         dv(prefix(cat, 4) + "dv-${UUID.randomUUID()}.puffin")
         assertThat(liveFiles(cat).single().id).isEqualTo(output.id)
     }
+
+    @Test
+    fun `a variant table's layouts each compact under the group's prefix, each output proven`() {
+        // A VARIANT column whose declaration changed: two files hold `v`
+        // unshredded (the old declaration), two shredded on `a` (the live
+        // one), all under team_id=7. Compaction rewrites each layout on its
+        // own (VariantLayoutGroups); both outputs land under the group's
+        // prefix and prove their value off their own footers.
+        val cat = "prefix-variant-${counter.incrementAndGet()}"
+        catalogs.createCatalog(cat, "s3://$BUCKET/$cat")
+        catalogs.createNamespace(cat, "ns")
+        val shredded =
+            mapOf(
+                "shredding" to mapOf("type" to "object", "fields" to listOf(mapOf("name" to "a", "type" to "string"))),
+            )
+        catalogs.createTable(
+            cat,
+            "ns",
+            "t",
+            listOf(ColumnDef("team_id", ColType.LONG), ColumnDef("v", ColType.VARIANT, shredded)),
+        )
+        alter.alterTable(
+            cat,
+            "ns",
+            "t",
+            listOf(
+                AlterOp.SetPartitionSpec(listOf(PartitionFieldDef(1, Transform.IDENTITY))),
+                AlterOp.SetObjectPrefixField("team_id"),
+            ),
+        )
+        val live = com.posthog.hoglake.model.Column(2, 1, ColumnDef("v", ColType.VARIANT, shredded))
+        val declared = VariantLayout.groupType(live, org.apache.parquet.schema.Type.Repetition.OPTIONAL)
+        val unshredded =
+            VariantLayout.groupType(
+                live.copy(def = live.def.copy(typeParams = null)),
+                org.apache.parquet.schema.Type.Repetition.OPTIONAL,
+            )
+        val old = (1..2).map { registerVariant(cat, 7, unshredded, shredded = false) }
+        val new = (1..2).map { registerVariant(cat, 7, declared, shredded = true) }
+        Hydrator(db.jdbi, store).runOnce()
+        assertThat(liveFiles(cat)).hasSize(4).allSatisfy { assertThat(it.statsState).isEqualTo("provided") }
+
+        val on = cfg.copy(variantCompaction = true)
+        assertThat(svc.planTable(cat, "ns", "t", on).groups).describedAs("one group in metadata").hasSize(1)
+        val result = svc.runOnce(cat, on, MaintenanceTrigger.LOOP)
+        assertThat(result.groupsCompacted).describedAs("%s", result).isEqualTo(2)
+        assertThat(result.invalidData + result.unconvertibleSchema + result.failedGroups).isZero()
+        val outputs = liveFiles(cat)
+        assertThat(outputs).hasSize(2).allSatisfy {
+            assertThat(it.path).startsWith(prefix(cat, 7))
+            assertThat(it.explicitRowIds).isTrue()
+            assertThat(it.statsState).isEqualTo("provided")
+            assertThat(it.quarantined).isFalse()
+            assertThat(it.values).containsExactly("7")
+            assertThat(it.records).isEqualTo(10)
+            // The footer's proof: every row holds 7.
+            assertThat(it.teamLower).isEqualTo(le8(7))
+            assertThat(it.teamUpper).isEqualTo(le8(7))
+            assertThat(it.teamNulls).isZero()
+        }
+        assertThat(outputs.map { it.id }).doesNotContainAnyElementsOf(old + new)
+        // One output per layout, each in its inputs' layout, with the catalog's field id on the group.
+        val layouts =
+            outputs.map { out ->
+                val tmp = Files.createTempFile("prefix-variant", ".parquet")
+                try {
+                    Files.write(tmp, store.get(out.path))
+                    org.apache.parquet.hadoop.ParquetFileReader.open(org.apache.parquet.io.LocalInputFile(tmp)).use {
+                        it.footer.fileMetaData.schema.getType("v")
+                    }
+                } finally {
+                    Files.deleteIfExists(tmp)
+                }
+            }
+        assertThat(layouts).containsExactlyInAnyOrder(declared, unshredded)
+        assertThat(stagingRows(cat).map { it.second }).containsOnly("registered")
+    }
+
+    /**
+     * Uploads a five-row file under `team_id=[team]/` holding `v` in
+     * [layout] — every row a Variant with empty metadata, `a` = "x" when
+     * [shredded], a Variant null otherwise — and commits it with inline
+     * stats proving [team]. Returns its data_file_id.
+     */
+    private fun registerVariant(
+        cat: String,
+        team: Long,
+        layout: org.apache.parquet.schema.GroupType,
+        shredded: Boolean,
+    ): Long {
+        val schema = MessageType("t", Types.optional(INT64).id(1).named("team_id"), layout)
+        val tmp = Files.createTempFile("prefix-variant", ".parquet")
+        val bytes =
+            try {
+                Files.delete(tmp)
+                val factory = SimpleGroupFactory(schema)
+                ExampleParquetWriter.builder(LocalOutputFile(tmp))
+                    .withType(schema)
+                    .withCompressionCodec(CompressionCodecName.UNCOMPRESSED)
+                    .build()
+                    .use { w ->
+                        repeat(5) { i ->
+                            val row = factory.newGroup().append("team_id", team)
+                            val v = row.addGroup("v")
+                            // Version 1, empty dictionary.
+                            v.add(
+                                "metadata",
+                                org.apache.parquet.io.api.Binary.fromConstantByteArray(byteArrayOf(1, 0, 0)),
+                            )
+                            if (shredded) {
+                                v.addGroup(
+                                    "typed_value",
+                                ).addGroup("a").add("typed_value", org.apache.parquet.io.api.Binary.fromString("x$i"))
+                            } else {
+                                v.add("value", org.apache.parquet.io.api.Binary.fromConstantByteArray(byteArrayOf(0)))
+                            }
+                            w.write(row)
+                        }
+                    }
+                Files.readAllBytes(tmp)
+            } finally {
+                Files.deleteIfExists(tmp)
+            }
+        val path = prefix(cat, team) + "${UUID.randomUUID()}.parquet"
+        store.put(path, bytes)
+        val file =
+            FileRegistration(
+                path,
+                5,
+                bytes.size.toLong(),
+                footerSize = ByteBuffer.wrap(bytes, bytes.size - 8, 4).order(ByteOrder.LITTLE_ENDIAN).int.toLong(),
+                columnStats = listOf(ColumnStats(1, 5, 0, null, null, le8(team), le8(team))),
+                partitionValues = listOf(team.toString()),
+            )
+        commits.commit(
+            cat,
+            CommitRequest(readSnapshot = db.head(cat), appends = listOf(TableAppend("ns", "t", listOf(file)))),
+        )
+        return db.jdbi.withHandleUnchecked { h ->
+            h.createQuery(
+                "SELECT f.data_file_id FROM hog_data_file f JOIN hog_catalog c USING (catalog_id) " +
+                    "WHERE c.name = :c AND f.path = :p",
+            ).bind("c", cat).bind("p", path).mapTo(Long::class.java).one()
+        }
+    }
 }

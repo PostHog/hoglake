@@ -33,6 +33,8 @@ import com.posthog.hoglake.persistence.TableRepo
 import com.posthog.hoglake.persistence.TierTotalsRepo
 import com.posthog.hoglake.persistence.bindBigintArrayOrNull
 import io.github.oshai.kotlinlogging.KotlinLogging
+import org.apache.parquet.hadoop.metadata.ParquetMetadata
+import org.apache.parquet.schema.GroupType
 import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.Jdbi
 import org.jdbi.v3.core.kotlin.inTransactionUnchecked
@@ -1216,6 +1218,13 @@ class CompactionService(
     /** [lastBudgetRefusal]'s twin for the object-prefix refusals in [pack], keyed the same way. */
     private val lastPrefixRefusal = java.util.concurrent.ConcurrentHashMap<Pair<Long, Long>, String>()
 
+    /**
+     * The variant layouts of files this process has probed, so [pack]
+     * can keep a VARIANT table's files of different layouts apart without
+     * reading a footer: see [VariantLayoutGroups] and [layoutParts].
+     */
+    internal val variantLayouts = VariantLayoutMemory()
+
     /** Everything execution needs beyond the group list. */
     private data class TableContext(
         val catalogId: Long,
@@ -1302,7 +1311,7 @@ class CompactionService(
 
     /** How one group's execution+commit resolved (the sweep's accounting unit). */
     internal sealed class GroupOutcome {
-        data class Committed(val snapshotId: Long, val bytesOut: Long) : GroupOutcome()
+        data class Committed(val snapshotId: Long, val bytesOut: Long, val dataFileId: Long) : GroupOutcome()
 
         /**
          * Every input was dead — the rewrite read each one through its
@@ -1818,8 +1827,9 @@ class CompactionService(
             truncated: Boolean = false,
         ) = CandidateFetch(ctx, budget, emptyMap(), 0, 0, available, truncated)
         // A VARIANT table compacts only with HOGLAKE_COMPACTION_VARIANT on
-        // for its catalog, which copies each variant as its declared layout
-        // (ParquetRewriter's class doc). Off, do not enqueue work the
+        // for its catalog, which copies each variant in the layout its
+        // group's files share (ParquetRewriter's class doc,
+        // VariantLayoutGroups). Off, do not enqueue work the
         // rewriter refuses on every sweep. allNodes, not the top level: a
         // variant nested inside a struct is still a variant, and `struct{v:
         // variant}` has no top-level one. #77's check predates
@@ -3053,18 +3063,37 @@ class CompactionService(
         // like an unsorted one.
         val grouping = CompactionGrouping.of(fetched.budget)
         val out = mutableListOf<CompactionGroup>()
+        // A VARIANT table's files pack BY LAYOUT where this process has
+        // learned one ([variantLayouts], filled by [layoutParts]'s probe):
+        // a file remembered in a layout other than the declared packs only
+        // with its own kind, a DuckDB-written one packs with nothing, and
+        // the rest — the declared layout's and the never-probed — pack
+        // together as every file did before. The planner reads no footer
+        // for this; a group it packs wrong is split by the probe once and
+        // remembered. Null when the table has no variant or the flag is
+        // off: nothing to keep apart.
+        val declaredFingerprint =
+            if (ctx.variantCompaction && ctx.columns.allNodes().any { it.def.type == ColType.VARIANT }) {
+                runCatching { VariantLayout.fingerprint(VariantLayout.declared(ctx.columns)) }.getOrNull()
+            } else {
+                null
+            }
         for ((bucket, candidates) in fetched.byBucket) {
-            val packed =
-                grouping.groups(
-                    candidates,
-                    cfg.minInputFiles,
-                    // THE FAN-IN SCALES WITH THE FILES IT IS CAPPING.
-                    // Computed per bucket from the rows just fetched, so
-                    // a bucket of 12 KiB files gets thousands of inputs
-                    // and a bucket of 200 MB files still gets a handful.
-                    cfg.effectiveMaxInputFiles(candidates.map { it.fileSizeBytes }),
-                ) { it.fileSizeBytes }
-            for (take in packed) out += CompactionGroup(rowIdOrder(take), bucket.specId, bucket.values)
+            // THE FAN-IN SCALES WITH THE FILES IT IS CAPPING. Computed per
+            // bucket from the rows just fetched, so a bucket of 12 KiB
+            // files gets thousands of inputs and a bucket of 200 MB files
+            // still gets a handful.
+            val fanIn = cfg.effectiveMaxInputFiles(candidates.map { it.fileSizeBytes })
+            val populations =
+                if (declaredFingerprint == null) {
+                    listOf(candidates)
+                } else {
+                    variantLayouts.populations(ctx.catalogId, declaredFingerprint, candidates).first
+                }
+            for (population in populations) {
+                val packed = grouping.groups(population, cfg.minInputFiles, fanIn) { it.fileSizeBytes }
+                for (take in packed) out += CompactionGroup(rowIdOrder(take), bucket.specId, bucket.values)
+            }
         }
         // OBJECT-PREFIX LAYOUT: a group whose prefix cannot be named — no
         // spec, no single identity key on the field, a missing or
@@ -3316,7 +3345,8 @@ class CompactionService(
                     "buckets_considered=${r.bucketsConsidered}/${r.bucketsAvailable} " +
                     "buckets_skipped_claimed=${r.bucketsSkippedClaimed} " +
                     "candidates_truncated=${r.candidatesTruncated} plan_ms=${r.planMs} " +
-                    "object_prefix_unresolvable=${r.objectPrefixUnresolvable}"
+                    "object_prefix_unresolvable=${r.objectPrefixUnresolvable} " +
+                    "layout_probe_only=${r.layoutProbeOnly}"
             },
         ) {
             if (cfg.maxGroupsPerRun <= 0) {
@@ -3349,6 +3379,7 @@ class CompactionService(
             // GOOD news: it is duplicated work that did not happen.
             Metrics.compactionSkipped(catalog, "claimed_elsewhere", result.claimedElsewhere)
             Metrics.compactionSkipped(catalog, "object_prefix_unresolvable", result.objectPrefixUnresolvable)
+            Metrics.compactionSkipped(catalog, "layout_probe_only", result.layoutProbeOnly)
             // Buckets, not groups, so not a `skipped` reason: a bucket
             // can hold any number of groups, and summing the two in one
             // series would make neither readable.
@@ -3393,6 +3424,13 @@ class CompactionService(
         val claimedElsewhere: Long = 0,
         /** Refused in metadata by the planner, so not in [attempts]; see [CompactionPlan.objectPrefixUnresolvableGroups]. */
         val objectPrefixUnresolvable: Long = 0,
+        /**
+         * Groups of a VARIANT table whose layout probe read every input's
+         * footer and found no partition worth a rewrite (each layout too
+         * few files, or every file DuckDB's): IO spent, nothing compacted,
+         * so IN [attempts]. See [layoutParts].
+         */
+        val layoutProbeOnly: Long = 0,
         /**
          * What sorted rewrites DID, summed over every rewrite that
          * returned — committed or not, since the work was spent either
@@ -3483,7 +3521,7 @@ class CompactionService(
             get() =
                 (
                     groupsCompacted + groupsRetired + skippedConflicts + dvSuperseded +
-                        unconvertibleSchema + invalidData + failedGroups
+                        unconvertibleSchema + invalidData + failedGroups + layoutProbeOnly
                 ).toInt()
 
         operator fun plus(other: GroupTally) =
@@ -3502,6 +3540,7 @@ class CompactionService(
                 failedGroups + other.failedGroups,
                 claimedElsewhere + other.claimedElsewhere,
                 objectPrefixUnresolvable + other.objectPrefixUnresolvable,
+                layoutProbeOnly + other.layoutProbeOnly,
                 runsTrusted + other.runsTrusted,
                 runsSpilled + other.runsSpilled,
                 runsDemoted + other.runsDemoted,
@@ -4033,6 +4072,7 @@ class CompactionService(
             planMs = planMs,
             bucketsSkippedClaimed = bucketsSkippedClaimed,
             objectPrefixUnresolvable = objectPrefixUnresolvable,
+            layoutProbeOnly = layoutProbeOnly,
         )
 
     /**
@@ -4218,6 +4258,11 @@ class CompactionService(
      * loses that group's accounting, leaves its claim held for a full
      * lease, and — before [shutdown] — let the rest of the queue keep
      * running behind a sweep that had already returned.
+     *
+     * A group of a VARIANT table may be MORE THAN ONE rewrite: its inputs
+     * are probed and partitioned by variant layout first ([layoutParts]),
+     * and each partition worth a rewrite is compacted on its own, in its
+     * own layout, through its own [attempt].
      */
     private fun executeGroup(
         catalog: String,
@@ -4246,85 +4291,184 @@ class CompactionService(
             return GroupTally(claimedElsewhere = 1)
         }
 
-        // ONE bad-group path, reached from TWO catch arms, and it has to
-        // be a function rather than a shared arm because of what a
-        // `throw` inside a catch block does: it leaves the try
-        // statement, so the SIBLING arms — including the `Throwable` one
-        // below, which is the whole failure-isolation mechanism — never
-        // see it. The `UnableToExecuteStatementException` arm used to
-        // rethrow a non-lock-timeout straight out of `executeGroup`,
-        // where nothing caught it: `f.get()` in [executeWave] surfaced
-        // it as an `ExecutionException` and the ENTIRE sweep aborted
-        // with an empty ledger result, losing the accounting of every
-        // group that had not started yet (on gigahog-prod-us, 2026-09-30:
-        // one group's `statement_timeout` took ~58 others with it and
-        // the run recorded `{}`). A statement that dies for a reason
-        // this code has no rule for is ONE failed group, like any other.
-        fun failGroup(e: Throwable): GroupTally {
-            // AN INTERRUPT IN DISGUISE STILL HAS TO SET THE FLAG.
-            //
-            // `e is InterruptedException` was not enough. The object
-            // store's client, the HTTP stack under it and NIO all
-            // translate an interrupt into something else — a
-            // `ClosedByInterruptException`, an SDK exception wrapping
-            // one, an `IOException` with it somewhere down the cause
-            // chain — and several of them CLEAR the flag on the way
-            // past. On the sequential path this frame runs on the
-            // sweep's own thread, so a cancellation that arrives as a
-            // wrapped exception and leaves the flag down is a sweep
-            // that was asked to stop, counted the group as an ordinary
-            // failure, and carried on to the next one.
-            if (wasInterrupt(e)) Thread.currentThread().interrupt()
-            log.error(e) {
-                "compaction group of ${group.files.size} files failed for " +
-                    "$catalog/${ctx.namespace}.${ctx.table}; continuing"
-            }
-            return GroupTally(failedGroups = 1)
-        }
         var committed = false
-        // What the rewrite did, whatever the commit then decides: the
-        // runs and the spill were spent either way.
-        var work = GroupTally()
+        // The inputs that died under this item's claim: all of the group's
+        // for the one part a group ordinarily is; the committed parts' for a
+        // variant group the probe split, whose other files are still live
+        // candidates the committed claim must not hold.
+        val dead = mutableListOf<Long>()
         try {
-            val outcome =
-                compactGroup(ctx, group) { r ->
-                    work =
-                        GroupTally(
-                            runsTrusted = r.runsTrusted.toLong(),
-                            runsSpilled = r.runsSpilled.toLong(),
-                            runsDemoted = r.runsDemoted.toLong(),
-                            spillBytes = r.spillBytes,
-                            spillCleanupFailures = if (r.spillCleanupFailed) 1 else 0,
-                            filesVerified = r.filesVerified.toLong(),
-                            filesUnsorted = r.filesUnsorted.toLong(),
-                            filesUnchecked = r.filesUnchecked.toLong(),
-                            rowGroupsAppended = r.rowGroupsAppended.toLong(),
-                            bytesAppended = r.bytesAppended,
-                            filesUnranged = r.filesUnranged.toLong(),
-                        )
-                    Metrics.compactionSortCheckBytes(catalog, r.sortCheckBytes)
+            // THE VARIANT-LAYOUT PROBE, as its own attempt. A table with
+            // no variant is one part, the group as planned, and nothing is
+            // read here. A variant table's inputs are read footer by footer
+            // and partitioned by layout ([layoutParts]); the probe's own
+            // refusals (a shape no layout can be derived from, an object
+            // store error) resolve the whole group through the same arms a
+            // rewrite's would, and nothing below runs.
+            var decided: LayoutParts? = null
+            var tally =
+                attempt(catalog, ctx, group, cfg, heapExhausted) {
+                    decided = layoutParts(ctx, group, cfg)
+                    GroupTally()
                 }
-            return work +
-                when (outcome) {
-                    is GroupOutcome.Committed -> {
-                        committed = true
-                        GroupTally(
-                            groupsCompacted = 1,
-                            filesIn = group.files.size.toLong(),
-                            bytesIn = group.totalBytes,
-                            bytesOut = outcome.bytesOut,
-                        )
+            val planned = decided ?: return tally
+            // A probe that read every footer and found nothing worth a
+            // rewrite still spent a group's IO: charged as one attempt
+            // (`layout_probe_only`), so a sweep over a backlog of such
+            // groups is bounded by maxGroupsPerRun like any other.
+            if (planned.probed && planned.parts.isEmpty()) return tally + GroupTally(layoutProbeOnly = 1)
+            // ONE REWRITE PER PART, each resolved on its own: a part that
+            // fails after another committed must not take the committed
+            // one's accounting with it, which is why the arms wrap each
+            // attempt and not the loop. A split group spends one attempt
+            // per part, so a sweep may run past `maxGroupsPerRun` by the
+            // extra parts of its last wave — at most (layouts - 1) x
+            // parallelGroups attempts, spent on work the planner meant to
+            // do. The FIRST part always runs: a group that got this far is
+            // in flight, and the wave's contract is that an in-flight group
+            // runs to completion (executeWave); only the parts after it
+            // yield to a heap exhausted by a sibling or to cancellation.
+            for ((index, part) in planned.parts.withIndex()) {
+                if (yieldsBeforePart(index, heapExhausted.get(), Thread.currentThread().isInterrupted)) break
+                tally +=
+                    attempt(catalog, ctx, part.group, cfg, heapExhausted) { work ->
+                        val outcome =
+                            compactGroup(ctx, part.group, part.layouts, part.footers) { r ->
+                                work.tally =
+                                    GroupTally(
+                                        runsTrusted = r.runsTrusted.toLong(),
+                                        runsSpilled = r.runsSpilled.toLong(),
+                                        runsDemoted = r.runsDemoted.toLong(),
+                                        spillBytes = r.spillBytes,
+                                        spillCleanupFailures = if (r.spillCleanupFailed) 1 else 0,
+                                        filesVerified = r.filesVerified.toLong(),
+                                        filesUnsorted = r.filesUnsorted.toLong(),
+                                        filesUnchecked = r.filesUnchecked.toLong(),
+                                        rowGroupsAppended = r.rowGroupsAppended.toLong(),
+                                        bytesAppended = r.bytesAppended,
+                                        filesUnranged = r.filesUnranged.toLong(),
+                                    )
+                                Metrics.compactionSortCheckBytes(catalog, r.sortCheckBytes)
+                            }
+                        work.tally +
+                            when (outcome) {
+                                is GroupOutcome.Committed -> {
+                                    committed = true
+                                    dead += part.group.files.map { it.dataFileId }
+                                    compactedAway(ctx, planned, part, outcome.dataFileId)
+                                    GroupTally(
+                                        groupsCompacted = 1,
+                                        filesIn = part.group.files.size.toLong(),
+                                        bytesIn = part.group.totalBytes,
+                                        bytesOut = outcome.bytesOut,
+                                    )
+                                }
+                                is GroupOutcome.Retired -> {
+                                    // Committed for the claim's purposes: the
+                                    // inputs are dead, exactly as after a
+                                    // rewrite, and a sibling's older plan still
+                                    // names them.
+                                    committed = true
+                                    dead += part.group.files.map { it.dataFileId }
+                                    compactedAway(ctx, planned, part, outputId = null)
+                                    GroupTally(groupsRetired = 1)
+                                }
+                                GroupOutcome.SkippedConflict -> GroupTally(skippedConflicts = 1)
+                                GroupOutcome.SkippedDvSuperseded -> GroupTally(dvSuperseded = 1)
+                            }
                     }
-                    is GroupOutcome.Retired -> {
-                        // Committed for the claim's purposes: the inputs
-                        // are dead, exactly as after a rewrite, and a
-                        // sibling's older plan still names them.
-                        committed = true
-                        GroupTally(groupsRetired = 1)
+                // The probe's footers for this part are spent either way.
+                part.dropFooters()
+            }
+            return tally
+        } finally {
+            // RELEASED ONLY IF THE GROUP DID NOT COMMIT, and that
+            // asymmetry is the point.
+            //
+            // A group that did NOT commit — skipped, failed, refused —
+            // leaves files that are still live candidates, and the next
+            // maintainer to plan them should be free to try immediately;
+            // holding the claim for the rest of its lease would just
+            // delay the retry.
+            //
+            // A group that DID commit leaves the opposite situation. Its
+            // inputs are end-snapshotted, so no future plan can include
+            // them — but a plan another maintainer formed BEFORE the
+            // commit still names them, and that maintainer is about to
+            // arrive, acquire the freshly-released claim, and spend a
+            // full rewrite and upload on files that are already dead
+            // before its own commit re-verification refuses it. That is
+            // exactly the lost race the claims exist to remove, arriving
+            // one step later. Keeping the claim in place turns it into a
+            // counted claimed_elsewhere.
+            //
+            // It is kept on a SHORT lease, not the full one
+            // (CompactionConfig.committedClaimTtlSeconds): the only
+            // reader it has left is a sibling's plan that predates this
+            // commit, and a plan is at most one sweep old. Holding the
+            // row for the full rewrite lease instead would leave roughly
+            // committed-groups-per-sweep x lease/interval rows per
+            // table, every one of whose input-id arrays the planner then
+            // reads on every pass.
+            //
+            // Best-effort either way — the lease is the backstop for a
+            // release that never runs at all (a killed pod), so a failed
+            // DELETE is a delay and never a leak.
+            if (claimKey != null) {
+                runCatching {
+                    jdbi.withHandleUnchecked { h ->
+                        if (committed) {
+                            CompactionClaimRepo.shortenToCommitted(
+                                h,
+                                ctx.catalogId,
+                                ctx.tableId,
+                                claimKey,
+                                item.claimant,
+                                cfg.committedClaimTtlSeconds,
+                                // Narrowed to the dead inputs when the group
+                                // was split: the files left behind are live
+                                // candidates, free to be planned again now.
+                                inputFileIds = dead.takeIf { it.size < group.files.size },
+                            )
+                        } else {
+                            CompactionClaimRepo.release(h, ctx.catalogId, ctx.tableId, claimKey, item.claimant)
+                        }
                     }
-                    GroupOutcome.SkippedConflict -> GroupTally(skippedConflicts = 1)
-                    GroupOutcome.SkippedDvSuperseded -> GroupTally(dvSuperseded = 1)
+                }.onFailure { e ->
+                    log.warn(e) {
+                        "could not settle the compaction claim for " +
+                            "$catalog/${ctx.namespace}.${ctx.table}; it expires in " +
+                            "${cfg.claimTtlSeconds}s"
+                    }
                 }
+            }
+            settleBucketClaim(item)
+        }
+    }
+
+    /** What a rewrite did before it resolved — the runs and the spill were spent whatever the commit then decides — for the arms of [attempt] that count it. */
+    private class RewriteWork {
+        var tally = GroupTally()
+    }
+
+    /**
+     * Run [body] — one rewrite of [group], or the probe that decides what
+     * the rewrites are — and convert every way it can end into a
+     * [GroupTally]. NOTHING escapes, `Throwable` included: see
+     * [executeGroup] for why, and [failGroup] for the one bad-group path
+     * two of the arms share.
+     */
+    private fun attempt(
+        catalog: String,
+        ctx: TableContext,
+        group: CompactionGroup,
+        cfg: CompactionConfig,
+        heapExhausted: java.util.concurrent.atomic.AtomicBoolean,
+        body: (RewriteWork) -> GroupTally,
+    ): GroupTally {
+        val work = RewriteWork()
+        try {
+            return body(work)
         } catch (e: HoglakeException.CommitQueueTimeout) {
             // The commit could not get the catalog lock inside the
             // admission bound. Race-class, not failure-class: nothing is
@@ -4359,7 +4503,7 @@ class CompactionService(
             // ANYTHING ELSE IS AN ORDINARY FAILED GROUP, and it takes
             // [failGroup] rather than a `throw` — see that function for
             // the sweep this arm's rethrow used to kill.
-            if (!Pg.isLockTimeout(e)) return failGroup(e)
+            if (!Pg.isLockTimeout(e)) return failGroup(e, catalog, ctx, group)
             log.warn {
                 "compaction group of ${group.files.size} files for " +
                     "$catalog/${ctx.namespace}.${ctx.table} hit the commit transaction's " +
@@ -4412,7 +4556,7 @@ class CompactionService(
                     "(${e.message}); skipping"
             }
             Metrics.compactionSortCheckBytes(catalog, e.sortCheckBytes)
-            return work +
+            return work.tally +
                 stoppedWork(
                     e.spillBytes,
                     e.runsSpilled,
@@ -4429,7 +4573,7 @@ class CompactionService(
                     "(${e.message}); skipping"
             }
             Metrics.compactionSortCheckBytes(catalog, e.sortCheckBytes)
-            return work +
+            return work.tally +
                 stoppedWork(
                     e.spillBytes,
                     e.runsSpilled,
@@ -4480,66 +4624,201 @@ class CompactionService(
             // wedges the sweep — but it IS counted: an uncounted
             // swallow is a silently-dead compactor with a green run
             // ledger (the NoSuchBucket incident).
-            return failGroup(e)
-        } finally {
-            // RELEASED ONLY IF THE GROUP DID NOT COMMIT, and that
-            // asymmetry is the point.
-            //
-            // A group that did NOT commit — skipped, failed, refused —
-            // leaves files that are still live candidates, and the next
-            // maintainer to plan them should be free to try immediately;
-            // holding the claim for the rest of its lease would just
-            // delay the retry.
-            //
-            // A group that DID commit leaves the opposite situation. Its
-            // inputs are end-snapshotted, so no future plan can include
-            // them — but a plan another maintainer formed BEFORE the
-            // commit still names them, and that maintainer is about to
-            // arrive, acquire the freshly-released claim, and spend a
-            // full rewrite and upload on files that are already dead
-            // before its own commit re-verification refuses it. That is
-            // exactly the lost race the claims exist to remove, arriving
-            // one step later. Keeping the claim in place turns it into a
-            // counted claimed_elsewhere.
-            //
-            // It is kept on a SHORT lease, not the full one
-            // (CompactionConfig.committedClaimTtlSeconds): the only
-            // reader it has left is a sibling's plan that predates this
-            // commit, and a plan is at most one sweep old. Holding the
-            // row for the full rewrite lease instead would leave roughly
-            // committed-groups-per-sweep x lease/interval rows per
-            // table, every one of whose input-id arrays the planner then
-            // reads on every pass.
-            //
-            // Best-effort either way — the lease is the backstop for a
-            // release that never runs at all (a killed pod), so a failed
-            // DELETE is a delay and never a leak.
-            if (claimKey != null) {
-                runCatching {
-                    jdbi.withHandleUnchecked { h ->
-                        if (committed) {
-                            CompactionClaimRepo.shortenToCommitted(
-                                h,
-                                ctx.catalogId,
-                                ctx.tableId,
-                                claimKey,
-                                item.claimant,
-                                cfg.committedClaimTtlSeconds,
-                            )
-                        } else {
-                            CompactionClaimRepo.release(h, ctx.catalogId, ctx.tableId, claimKey, item.claimant)
-                        }
-                    }
-                }.onFailure { e ->
-                    log.warn(e) {
-                        "could not settle the compaction claim for " +
-                            "$catalog/${ctx.namespace}.${ctx.table}; it expires in " +
-                            "${cfg.claimTtlSeconds}s"
-                    }
-                }
-            }
-            settleBucketClaim(item)
+            return failGroup(e, catalog, ctx, group)
         }
+    }
+
+    /**
+     * ONE bad-group path, reached from TWO of [attempt]'s catch arms, and
+     * it has to be a function rather than a shared arm because of what a
+     * `throw` inside a catch block does: it leaves the try statement, so
+     * the SIBLING arms — including the `Throwable` one, which is the
+     * whole failure-isolation mechanism — never see it. The
+     * `UnableToExecuteStatementException` arm used to rethrow a
+     * non-lock-timeout straight out of `executeGroup`, where nothing
+     * caught it: `f.get()` in [executeWave] surfaced it as an
+     * `ExecutionException` and the ENTIRE sweep aborted with an empty
+     * ledger result, losing the accounting of every group that had not
+     * started yet (on gigahog-prod-us, 2026-09-30: one group's
+     * `statement_timeout` took ~58 others with it and the run recorded
+     * `{}`). A statement that dies for a reason this code has no rule for
+     * is ONE failed group, like any other.
+     */
+    private fun failGroup(
+        e: Throwable,
+        catalog: String,
+        ctx: TableContext,
+        group: CompactionGroup,
+    ): GroupTally {
+        // AN INTERRUPT IN DISGUISE STILL HAS TO SET THE FLAG.
+        //
+        // `e is InterruptedException` was not enough. The object
+        // store's client, the HTTP stack under it and NIO all
+        // translate an interrupt into something else — a
+        // `ClosedByInterruptException`, an SDK exception wrapping
+        // one, an `IOException` with it somewhere down the cause
+        // chain — and several of them CLEAR the flag on the way
+        // past. On the sequential path this frame runs on the
+        // sweep's own thread, so a cancellation that arrives as a
+        // wrapped exception and leaves the flag down is a sweep
+        // that was asked to stop, counted the group as an ordinary
+        // failure, and carried on to the next one.
+        if (wasInterrupt(e)) Thread.currentThread().interrupt()
+        log.error(e) {
+            "compaction group of ${group.files.size} files failed for " +
+                "$catalog/${ctx.namespace}.${ctx.table}; continuing"
+        }
+        return GroupTally(failedGroups = 1)
+    }
+
+    /**
+     * How [group] is rewritten: as planned, for a table with no VARIANT
+     * (or the flag off, which never plans one); for a variant table, per
+     * layout — see [VariantLayoutGroups] for the whole account.
+     *
+     * The probe reads every input's footer (the tail read the rewrite's
+     * open would make; the footer is handed on so it is not made twice,
+     * within [VariantLayoutGroups.FOOTER_RETENTION_BYTES]) and takes each
+     * variant column's layout off it by the rewrite's own plan walk
+     * ([ParquetRewriter.variantLayoutsOf]), so what it accepts the rewrite
+     * accepts, and its refusals are the rewrite's, typed. What it learns
+     * is remembered ([variantLayouts]) so the planner packs these files
+     * by layout from now on, and a partition too small to rewrite is not
+     * planned again until it has company.
+     */
+    private fun layoutParts(
+        ctx: TableContext,
+        group: CompactionGroup,
+        cfg: CompactionConfig,
+    ): LayoutParts {
+        if (!ctx.variantCompaction || ctx.columns.allNodes().none { it.def.type == ColType.VARIANT }) {
+            return LayoutParts(listOf(VariantLayoutGroups.LayoutPart(group, emptyMap(), emptyMap())), probed = false)
+        }
+        val declared = VariantLayout.declared(ctx.columns)
+        val declaredFingerprint = VariantLayout.fingerprint(declared)
+        val probed = probeLayouts(ctx, group)
+        val split =
+            VariantLayoutGroups.split(
+                group,
+                probed,
+                declared,
+                CompactionGrouping.of(cfg.targetBytes),
+                cfg.minInputFiles,
+            )
+        for (p in probed) {
+            // How the file deviates from THIS declaration, under its
+            // fingerprint: a column the file predates deviates in nothing,
+            // and a later declaration makes the entry stale (see
+            // VariantLayoutMemory).
+            variantLayouts.remember(
+                ctx.catalogId,
+                p.file.dataFileId,
+                declaredFingerprint,
+                if (p.duckdb) {
+                    VariantLayoutMemory.DUCKDB
+                } else {
+                    VariantLayout.fingerprint(VariantLayoutGroups.deviations(p.layouts, declared))
+                },
+            )
+        }
+        // The counters. `split` once per group the probe found mixed, so
+        // its rate is how often the planner's metadata picture was wrong;
+        // `duckdb` per file excluded, as the refusal it still is; the files
+        // left behind per file, each once — the memory keeps them out of
+        // the next plan, so the count is files set aside, not sweeps.
+        if (split.layoutCount > 1) Metrics.compactionVariantLayoutMismatch(ctx.catalog, "split")
+        Metrics.compactionVariantLayoutMismatch(ctx.catalog, "duckdb", split.duckdb.size.toLong())
+        Metrics.compactionVariantLayoutFilesLeft(ctx.catalog, split.leftBehind.size.toLong())
+        if (split.mixed || split.leftBehind.isNotEmpty()) {
+            log.info {
+                "compaction group of ${group.files.size} files for ${ctx.catalog}/${ctx.namespace}.${ctx.table} " +
+                    "holds ${split.layoutCount} variant layout(s)" +
+                    (if (split.duckdb.isNotEmpty()) " and ${split.duckdb.size} DuckDB-written file(s)" else "") +
+                    ": rewriting ${split.parts.size} part(s) of " +
+                    split.parts.joinToString { "${it.group.files.size}${if (it.declared) " (declared)" else ""}" } +
+                    " file(s); ${split.leftBehind.size} file(s) left for want of company in their layout" +
+                    (
+                        if (split.duckdb.isNotEmpty()) {
+                            "; excluded (data_file_id): " + split.duckdb.joinToString { "${it.file.dataFileId}" }
+                        } else {
+                            ""
+                        }
+                    )
+            }
+        }
+        return LayoutParts(split.parts, probed = true, declaredFingerprint = declaredFingerprint)
+    }
+
+    /** What [layoutParts] decided: the rewrites, whether a probe read the inputs' footers to decide, and under which declaration. */
+    private class LayoutParts(
+        val parts: List<VariantLayoutGroups.LayoutPart>,
+        val probed: Boolean,
+        val declaredFingerprint: Long = 0,
+    )
+
+    /**
+     * Every input of [group] opened for its footer, [TableContext.inputOpenParallelism]
+     * at a time, and read for its variant layouts: see [layoutParts].
+     */
+    private fun probeLayouts(
+        ctx: TableContext,
+        group: CompactionGroup,
+    ): List<VariantLayoutGroups.Probed> {
+        val inputs =
+            group.files.map { f ->
+                ParquetRewriter.Input(
+                    S3InputFile(store, f.path, f.fileSizeBytes, f.footerSize),
+                    f.path,
+                    f.rowIdStart,
+                    fileSizeBytes = f.fileSizeBytes,
+                )
+            }
+        val probed = ArrayList<VariantLayoutGroups.Probed>(inputs.size)
+        var retained = 0L
+        ParquetRewriter.forEachOpenedInput(inputs, ctx.inputOpenParallelism) { input, reader ->
+            val file = group.files[probed.size]
+            val footer = reader.footer
+            val layouts = ParquetRewriter.variantLayoutsOf(footer, ctx.columns, input.label)
+            // Kept for the rewrite while the serialized footer bytes of
+            // those kept so far fit the retention budget (see the constant):
+            // the footer's own measure, not the registered hint.
+            val bytes = VariantLayoutGroups.footerBytes(footer, file.fileSizeBytes)
+            val keep = retained + bytes <= VariantLayoutGroups.FOOTER_RETENTION_BYTES
+            if (keep) retained += bytes
+            probed +=
+                VariantLayoutGroups.Probed(
+                    file,
+                    if (keep) footer else null,
+                    layouts,
+                    footer.fileMetaData.createdBy?.startsWith("DuckDB") == true,
+                )
+        }
+        return probed
+    }
+
+    /**
+     * A part's inputs are dead: forget their layouts, count the output's,
+     * and remember the output ([outputId], null for a retirement) as what
+     * was just written — its deviations are the part's — so it is not
+     * probed on the next sweep to learn what this sweep knew.
+     */
+    private fun compactedAway(
+        ctx: TableContext,
+        parts: LayoutParts,
+        part: VariantLayoutGroups.LayoutPart,
+        outputId: Long?,
+    ) {
+        if (!parts.probed) return
+        variantLayouts.forget(ctx.catalogId, part.group.files.map { it.dataFileId })
+        if (outputId != null) {
+            variantLayouts.remember(
+                ctx.catalogId,
+                outputId,
+                parts.declaredFingerprint,
+                VariantLayout.fingerprint(part.deviations),
+            )
+        }
+        Metrics.compactionVariantLayoutOutputs(ctx.catalog, if (part.declared) "declared" else "other")
     }
 
     /** What a sorted rewrite spent before a budget hard stop (carried on the exception). */
@@ -4658,10 +4937,17 @@ class CompactionService(
 
     /**
      * Rewrite one group (all IO outside any transaction) and commit it.
+     *
+     * [variantLayouts] is the subtree each VARIANT column is written in
+     * (empty = the declared layouts), and [footers] the inputs' footers
+     * the probe already read, by data_file_id — both from
+     * [layoutParts]; the test surface [compactPlannedGroup] passes neither.
      */
     private fun compactGroup(
         ctx: TableContext,
         group: CompactionGroup,
+        variantLayouts: Map<Long, GroupType> = emptyMap(),
+        footers: Map<Long, ParquetMetadata> = emptyMap(),
         onRewritten: (ParquetRewriter.RewriteResult) -> Unit = {},
     ): GroupOutcome {
         // The OBJECT-PREFIX value, before any IO. The planner refuses a
@@ -4735,6 +5021,9 @@ class CompactionService(
                             f.footerSize,
                             readaheadBytes = S3InputFile.KEY_COLUMN_READAHEAD_BYTES,
                         ),
+                    // The probe's footer, when it kept one: the rewrite's
+                    // open then costs no tail read ([ParquetRewriter.open]).
+                    footer = footers[f.dataFileId],
                 )
             }
         // Bare UUID, deliberately indistinguishable from an ingested
@@ -4804,6 +5093,7 @@ class CompactionService(
                 ctx.sortSpill,
                 appendFloorBytes,
                 ctx.variantCompaction,
+                variantLayouts,
             )
         onRewritten(rewritten)
         check(rewritten.rowsWritten == group.survivingRecords) {
@@ -5458,7 +5748,7 @@ class CompactionService(
                     .execute()
             check(settled == 1) { "compaction staging ticket $stagingId vanished mid-commit" }
 
-            GroupOutcome.Committed(snapshotId, outputBytes)
+            GroupOutcome.Committed(snapshotId, outputBytes, dataFileId)
         }
 
     /**
@@ -5676,6 +5966,20 @@ class CompactionService(
     }
 
     internal companion object {
+        /**
+         * Whether [executeGroup] yields before the part at [index] of a
+         * split group: never before the FIRST part — a group past its claim
+         * refresh is in flight, and the wave's contract (executeWave) is
+         * that an in-flight group runs to completion, as every group did
+         * before groups had parts — and before a later part only when a
+         * sibling exhausted the heap or the sweep was cancelled.
+         */
+        fun yieldsBeforePart(
+            index: Int,
+            heapExhausted: Boolean,
+            interrupted: Boolean,
+        ): Boolean = index > 0 && (heapExhausted || interrupted)
+
         /** Inputs named with their path in an output-proof refusal; the rest by id only. */
         const val MAX_NAMED_INPUT_PATHS = 20
 

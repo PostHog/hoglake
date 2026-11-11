@@ -216,6 +216,8 @@ class MaintenanceLedgerIntegrationTest {
                 "files_unranged",
                 // And the object-prefix planner refusal (2.1d).
                 "object_prefix_unresolvable",
+                // And the variant-layout probe that found nothing to rewrite.
+                "layout_probe_only",
             )
         for (counter in mergeSortCounters) {
             assertThat(result[counter]?.asLong())

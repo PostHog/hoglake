@@ -1009,9 +1009,12 @@ lose the annotation.
 VARIANT columns cannot be partition or sort keys, and have no whole-column
 statistics. Shredded child statistics are not published as catalog bounds.
 The server skips VARIANT tables during compaction unless it sets
-`HOGLAKE_COMPACTION_VARIANT`; then it copies files whose VARIANT layout is the
-one their declaration gives, which every file `Table.append` writes has
+`HOGLAKE_COMPACTION_VARIANT`; then it copies each file's VARIANT storage as it
+is, rewriting a group's files per layout: files in the layout their declaration
+gives, which every file `Table.append` writes has
 (`tests/vectors/variant_layout_vectors.json` pins the server's port of that
-layout to `Plan.expected_elements`), and skips any compaction group holding a
-file in another layout or written by DuckDB, with that group's other files.
+layout to `Plan.expected_elements`), together, and files sharing any other
+layout (an earlier declaration's, or `prepare_append_files`' own) together, each
+output in its inputs' layout. A file written by DuckDB is left uncompacted on
+its own, without holding up the rest of its group.
 Reader interoperability and the buffered-ingestion coordinator are separate work.

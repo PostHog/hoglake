@@ -1976,28 +1976,98 @@ variant's storage leaf by leaf as plain Parquet groups, never through
 parquet-java's Variant reader (hoglake#70), into the layout the column's
 `type_params.shredding` declares (`compaction/VariantLayout.kt`, pinned
 to pyhoglake's by `pyhoglake/tests/vectors/variant_layout_vectors.json`).
-The copy is positional, so a group holding a file in any other layout,
-or one DuckDB wrote (Trino reads its top-level Variant nulls as SQL NULL
-by `created_by`), is refused as `unconvertible_schema` and also counted
-in `hoglake_compaction_variant_layout_mismatch_total{catalog,
-reason="layout"|"duckdb"}`. Such a group is refused again every sweep
-until its files change, and each refusal spends one of the sweep's
-`HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN` slots after rewriting every input
-ahead of the refused one (an input is checked when the rewrite reaches
-it, and the partial output is discarded); tables plan in name order, so
-refused groups can starve the catalog's other tables. Enable the flag
-only for catalogs whose variant tables pyhoglake or the Trino connector
-write (the allowlist), not one holding DuckDB-written variant files
-(hedgerow). A group refused at a variant column of a DuckDB-written
-input counts as `duckdb`, whatever that column's layout. The warning
-logged with each refusal names the table, column and input file: a
-`layout` refusal of a
-file that pyhoglake's `Table.append` or `prepare_append_tables` or the
-connector wrote means the layout port has drifted, and the flag should
-go off; one of a file registered from another writer
-(`prepare_append_files`) is just another layout. A variant's chunk in
-the sorted rewrite is sized by its layout's Parquet nodes, not as one
-catalog node.
+The copy is positional, so every input of one rewrite must hold the
+layout its output is written in. A group whose inputs hold MORE THAN ONE
+layout — the files a partition holds after `set_variant_shredding`
+changed a declaration, or files a writer laid out itself
+(`prepare_append_files`) — is rewritten PER LAYOUT rather than refused
+(`compaction/VariantLayoutGroups.kt`): before the rewrite, the service
+reads every input's footer (the tail read the rewrite's open would make;
+the footer is handed on so it is read once, up to 16 MiB of registered
+`footer_size` per group) and partitions the inputs by the layout of
+every variant column. Each partition that still meets the group-size
+rule (`minInputFiles`, scaled as `CompactionGrouping` scales it) is
+rewritten on its own, its output in ITS layout — the declared layout's
+partition first, so data converges on the catalog's layout as old files
+age out; a partition in a layout the declaration no longer names still
+compacts, into that layout, with no decoding and no re-shredding. A
+partition too small is left alone, uncompacted and unrefused, and a file
+DuckDB wrote (Trino reads its top-level Variant nulls as SQL NULL by
+`created_by`, which an output does not keep) is excluded on its own and
+never blocks the rest. Only a variant field that is no VARIANT group at
+all (a leaf, a REPEATED group, no annotation) still refuses its group as
+`unconvertible_schema`.
+
+Not starving the sweep: a mixed group whose every partition is too small
+would spend one of the sweep's `HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN`
+slots and compact nothing, every sweep, because the planner packs in
+metadata and cannot see a layout. So the service REMEMBERS, in its own
+heap, every file it has probed: how its layouts DEVIATE from the
+declaration (the variant columns whose subtree is not the declared one),
+as a fingerprint, together with a fingerprint of the declaration it was
+judged against. The planner then packs files it knows to deviate only
+with files deviating the same way, drops files it knows DuckDB wrote,
+and packs the rest — the declared layout's, the never-probed, and any
+entry judged against an older declaration — together as before. A
+remembered remainder forms no group until enough files of its layout are
+known. Deviations rather than whole layouts, so a file written before a
+variant column was added (which the rewrite null-fills) packs with later
+files of its layout; the declaration's fingerprint, so DDL
+(`set_variant_shredding`, a variant column added or renamed) makes every
+entry of the table unknown again and each file is probed once more
+rather than stranded. A compaction output is entered as it is
+registered — its layout is what was just written — so it is not probed
+on the next sweep to learn it. The memory is per process (empty after a
+restart, so each file is probed once per restart), bounded at 250k
+entries, and cleared of a file when it is compacted away; it is correct
+without it — the probe splits any group — and only the repeat depends on
+it. Not a column on `hog_data_file`: the hydrator never sees a file
+registered with inline stats (pyhoglake's), so the planner would need
+this fallback anyway.
+
+What a probe costs. For a variant table the probe's footer read replaces
+the one the rewrite's open would make: the footer is handed on
+(`ParquetRewriter.Input.footer`) while the serialized footer bytes kept
+so far — measured off each footer, not the registered `footer_size`
+hint — stay under 16 MiB per group, and released as each part's rewrite
+ends; beyond that the rewrite re-reads the tail as it always did. A
+parsed footer is several times its serialized length, so this is up to
+a few hundred MB of heap at worst, beside (not inside)
+`HOGLAKE_COMPACTION_SORTED_HEAP_BYTES`, which bounds the sorted
+rewrite's chunk and merge; size the pod with that headroom. A probe that
+finds nothing worth a rewrite (one file per layout; only DuckDB files)
+still read every footer, so it is charged as one attempt against
+`HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN`, counted in the ledger as
+`layout_probe_only` and in
+`hoglake_compaction_skipped_total{reason="layout_probe_only"}`; a
+steady rate of it means the memory is being lost (restarts, or its
+capacity). A group split into N parts spends N attempts, so a sweep can
+run past `HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN` by at most
+(layouts − 1) × `HOGLAKE_COMPACTION_PARALLEL_GROUPS` in its last wave;
+the first part of a group always runs (an in-flight group completes),
+later parts yield to a sibling's heap exhaustion or a cancellation.
+After a split group commits, its claim is narrowed to the inputs that
+died, so the files left behind are free to be planned again at once.
+
+Counted in `hoglake_compaction_variant_layout_mismatch_total{catalog,
+reason}`: `split`, one per group the probe found in more than one layout
+(expected for a while after a declaration change; a steady rate long
+after means a writer not honouring the declaration); `duckdb`, one per
+DuckDB-written file excluded; `layout`, one per group refused as no
+VARIANT group. Convergence is
+`hoglake_compaction_variant_layout_outputs_total{catalog,
+layout="declared"|"other"}` — outputs per layout, `other` falling to
+zero as the old layout's files consolidate and age out — and
+`hoglake_compaction_variant_layout_files_left_total{catalog}`, files set
+aside for want of company in their layout (each once, since the memory
+keeps them out of the next plan). A `layout` refusal, or a `split` on a
+table only pyhoglake's `Table.append` or `prepare_append_tables` or the
+connector write, means the layout port has drifted from theirs
+(`pyhoglake/tests/vectors/variant_layout_vectors.json` pins the two),
+and the flag should go off. A variant's chunk in the sorted rewrite is
+sized by its layout's Parquet nodes, not as one catalog node; a
+partition in another layout is sized by the declared one's, an estimate
+the merge admission corrects from the footers it opens.
 
 Each table's candidate list is fixed before rewriting starts, so an
 output cannot feed another group in the **same run**. Input bytes only

@@ -1831,6 +1831,20 @@ data class CompactionResult(
      */
     @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
     val objectPrefixUnresolvable: Long = 0,
+    /**
+     * Groups of a VARIANT table (HOGLAKE_COMPACTION_VARIANT) whose
+     * layout probe read every input's footer and found nothing worth a
+     * rewrite: each variant layout among the inputs held too few files
+     * for one, or every input was DuckDB-written. The files are left as
+     * they are and the compactor remembers their layouts, so the same
+     * group is not planned again until files of its layouts arrive; but
+     * the footers were read, so this IS charged to
+     * HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN. Also
+     * `hoglake_compaction_skipped_total{reason="layout_probe_only"}`.
+     * `NON_DEFAULT`, for [claimedElsewhere]'s stored-payload reason.
+     */
+    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    val layoutProbeOnly: Long = 0,
 )
 
 /**
