@@ -5,6 +5,7 @@ disposable: catalog ``pyhog-<runid>`` with data under
 ``s3://pyhog-itest/<runid>/``.
 """
 
+import json
 import struct
 import time
 import uuid
@@ -22,12 +23,16 @@ from pyhoglake import (
     DroppedCatalog,
     HoglakeClient,
     NotFoundError,
+    ObjectPrefixViolationError,
     OffsetRegressionError,
     S3Config,
     ops,
+    parquet_write_options,
     variant,
     variant_field,
+    write_part,
 )
+from pyhoglake.client import _upload
 from pyhoglake.parquet_schema import _schema_elements, _top_level
 from pyhoglake.types import columns_to_arrow_schema
 
@@ -917,6 +922,267 @@ def test_create_table_with_initial_partition_and_sort_fields(catalog, ns):
             _part_schema(),
             partition_fields=[ops.NamedPartitionField("team_id")],
         )
+
+
+def _needs_object_prefix(catalog):
+    """Skip, not fail, on a server too old for the layout: the tests below
+    are about pyhoglake's placement against a server that enforces it."""
+    if "object-prefix-layout-v1" not in catalog.info.capabilities:
+        pytest.skip("the server does not declare object-prefix-layout-v1")
+
+
+def _compact_until_quiet(catalog, rounds=5):
+    for _ in range(rounds):
+        result = catalog._client._request(
+            "POST", catalog._path("/maintenance/compact"), params={"batch": 10}
+        )
+        if result["groups_compacted"] == 0:
+            break
+
+
+def _file_stats(catalog, table, data_file_id, snapshot):
+    """GET .../files/{id}/stats: the server's stored rows, bounds decoded."""
+    return catalog._client._request(
+        "GET",
+        table._path(f"/files/{data_file_id}/stats"),
+        params={"snapshot": snapshot},
+    )
+
+
+def _prefixed_batch(table, rows_per: dict[tuple[int, int], int]) -> pa.Table:
+    """``_part_batch`` with a variant ``props`` column, in the table's write
+    schema (``pa.json_()`` for the variant)."""
+    plain = _part_batch(rows_per)
+    props = [
+        json.dumps({"team": team, "i": i, "tags": ["a", None]})
+        for i, team in enumerate(plain.column("team_id").to_pylist())
+    ]
+    return pa.table(
+        {
+            "team_id": plain.column("team_id"),
+            "ts": plain.column("ts"),
+            "val": plain.column("val"),
+            "props": pa.array(props, pa.string()).cast(pa.json_()),
+        },
+        schema=columns_to_arrow_schema(table.columns, variant="json"),
+    )
+
+
+def test_object_prefix_table_places_files_the_server_accepts(catalog, ns, s3config):
+    """An object-prefix table (``identity(team_id), month(ts)``, then
+    ``set_object_prefix_field``): ``append`` and ``prepare_append_tables`` +
+    ``commit_prepared`` over several teams and months commit, every object
+    sits under ``team_id=<v>/``, a deferred file is ``provided`` at commit
+    (the prefix field's stats alone, not ``pending`` for the hydrator), and
+    a variant column in the same table round-trips."""
+    _needs_object_prefix(catalog)
+    table = ns.create_table(
+        "prefixed_events",
+        pa.schema(
+            [
+                pa.field("team_id", pa.int64(), nullable=False),
+                pa.field("ts", pa.timestamp("us")),
+                pa.field("val", pa.string()),
+                variant_field("props"),
+            ]
+        ),
+        partition_fields=[
+            ops.NamedPartitionField("team_id"),
+            ops.NamedPartitionField("ts", "month"),
+        ],
+        sort_fields=[ops.NamedSortField("ts")],
+    )
+    info = table.alter([ops.set_object_prefix_field("team_id")])
+    assert info.object_prefix_field == "team_id"
+    assert ns.table("prefixed_events").info().object_prefix_field == "team_id"
+    fid = {c.name: c.field_id for c in table.columns}
+    root = f"s3://{BUCKET}/{RUN_ID}/data/ns1/prefixed_events/"
+
+    def expected(counts):
+        return {(str(team), _month_str(m)): n for (team, m), n in counts.items()}
+
+    # append: full stats, one commit, every file under its team's prefix
+    counts = {(101, 1): 2, (101, 2): 3, (202, 1): 4, (303, 3): 1}
+    res = table.append(
+        _prefixed_batch(table, counts), compression="zstd", compression_level=3
+    )
+    files = table.files(snapshot=res.snapshot_id)
+    assert {f.partition_values: f.record_count for f in files} == expected(counts)
+    for f in files:
+        assert f.path.startswith(f"{root}team_id={f.partition_values[0]}/")
+        assert f.stats_state == "provided"
+
+    # append with deferred stats: provided at commit, not pending
+    deferred = {(101, 3): 2, (404, 1): 1}
+    res = table.append(_prefixed_batch(table, deferred), deferred_stats=True)
+    new = [
+        f
+        for f in table.files(snapshot=res.snapshot_id)
+        if f.begin_snapshot == res.snapshot_id
+    ]
+    assert {f.partition_values: f.record_count for f in new} == expected(deferred)
+    assert all(f.stats_state == "provided" for f in new)
+    assert all(
+        f.path.startswith(f"{root}team_id={f.partition_values[0]}/") for f in new
+    )
+
+    # prepared, deferred: the request carries the prefix field's stats alone,
+    # under <prefix><key>/, and the commit lands them provided
+    prepared = {(202, 2): 3, (303, 1): 2, (505, 2): 1}
+    groups = [
+        (_prefixed_batch(table, {(team, m): n}), (str(team), _month_str(m)))
+        for (team, m), n in prepared.items()
+    ]
+    key = str(uuid.uuid4())
+    request = table.prepare_append_tables(
+        groups,
+        idempotency_key=key,
+        deferred_stats=True,
+        compression="zstd",
+        compression_level=3,
+    )
+    for reg in request["appends"][0]["files"]:
+        assert [s["field_id"] for s in reg["column_stats"]] == [fid["team_id"]]
+        assert reg["path"].startswith(
+            f"{root}team_id={reg['partition_values'][0]}/{key}/"
+        )
+    result = table.commit_prepared(request)
+    new = [
+        f
+        for f in table.files(snapshot=result.snapshot_id)
+        if f.begin_snapshot == result.snapshot_id
+    ]
+    assert {f.partition_values: f.record_count for f in new} == expected(prepared)
+    assert all(f.stats_state == "provided" for f in new)
+    assert {f.path for f in new} == {r["path"] for r in request["appends"][0]["files"]}
+
+    # every live object is under a team prefix, and the variant round-trips
+    fs = s3config.filesystem()
+    by_name = {c.name: c for c in table.columns}
+    for f in table.files(snapshot=result.snapshot_id):
+        team = int(f.partition_values[0])
+        assert f.path.startswith(f"{root}team_id={team}/")
+        back = pq.read_table(
+            pa.BufferReader(fs.open_input_file(f.path[len("s3://") :]).read())
+        )
+        assert set(back.column("team_id").to_pylist()) == {team}
+        for value in variant.to_python(back.column("props"), by_name["props"]):
+            assert value["team"] == team and value["tags"] == ["a", None]
+    total = sum(counts.values()) + sum(deferred.values()) + sum(prepared.values())
+    assert _info_at_head(catalog, table).record_count == total
+
+
+def test_object_prefix_table_refuses_a_file_under_the_table_root(catalog, ns, s3config):
+    """Negative control for the placement: the same file pyhoglake would
+    write, registered by hand under the table root (where every writer
+    put its files before), is refused by the server with 422
+    object_prefix_violation naming the prefix it belongs under. This is
+    the refusal pyhoglake's placement exists to avoid."""
+    _needs_object_prefix(catalog)
+    table = ns.create_table(
+        "prefixed_negative",
+        _part_schema(),
+        partition_fields=[
+            ops.NamedPartitionField("team_id"),
+            ops.NamedPartitionField("ts", "month"),
+        ],
+    )
+    table.alter([ops.set_object_prefix_field("team_id")])
+    info = table.info()
+    rows = _part_batch({(7, 1): 3})
+    # The writer core wants the destination's schema, field ids included.
+    with_ids = pa.Table.from_arrays(
+        [rows.column(c.name) for c in info.columns],
+        schema=columns_to_arrow_schema(info.columns),
+    )
+    part = write_part(
+        with_ids, info.columns, write_options=parquet_write_options(None, None)
+    )
+    root = f"s3://{BUCKET}/{RUN_ID}/data/ns1/prefixed_negative/"
+    uri = f"{root}{uuid.uuid4()}.parquet"
+    registration = part.registration(
+        uri, info.columns, stats=True, partition_values=("7", _month_str(1))
+    )
+    _upload(s3config.filesystem(), uri, part.body)
+    with pytest.raises(ObjectPrefixViolationError) as ei:
+        catalog._commit(
+            {
+                "appends": [
+                    {
+                        "namespace": "ns1",
+                        "table": "prefixed_negative",
+                        "files": [registration],
+                    }
+                ],
+                "read_snapshot": info.read_snapshot_id,
+            },
+            table=table,
+        )
+    assert ei.value.status_code == 422
+    assert ei.value.re_prepare and not ei.value.retryable
+    assert "team_id=7/" in (ei.value.detail or "")
+    assert table.files(snapshot=catalog.refresh().head_snapshot_id) == []
+    # The placing writer, same rows, same table: accepted.
+    result = table.append(rows)
+    (placed,) = table.files(snapshot=result.snapshot_id)
+    assert placed.path.startswith(f"{root}team_id=7/")
+
+
+def test_compaction_restores_full_stats_to_prefix_only_files(catalog, ns):
+    """D4's other half: small deferred files on an object-prefix table are
+    registered with the prefix field's stats alone. Compaction (the
+    server's, HOGLAKE_COMPACTION_* as ci/live-python.sh runs it) takes
+    them as inputs, writes its output under the same prefix, registers it
+    provided, and the output carries stats for the other columns — ts
+    bounds included — which the inputs never had."""
+    _needs_object_prefix(catalog)
+    table = ns.create_table(
+        "prefixed_compact",
+        _part_schema(),
+        partition_fields=[
+            ops.NamedPartitionField("team_id"),
+            ops.NamedPartitionField("ts", "month"),
+        ],
+    )
+    table.alter([ops.set_object_prefix_field("team_id")])
+    fid = {c.name: c.field_id for c in table.columns}
+    root = f"s3://{BUCKET}/{RUN_ID}/data/ns1/prefixed_compact/"
+    # Eight files per partition, over HOGLAKE_COMPACTION_MIN_INPUT_FILES=5
+    # (default), each under the 1 MiB threshold: prefix-only stats.
+    inputs: set[str] = set()
+    for _ in range(8):
+        appended = table.append(
+            _part_batch({(7, 1): 3, (8, 1): 2}), deferred_stats=True
+        )
+        inputs |= {f.path for f in appended.files}
+    files = table.files(snapshot=appended.snapshot_id)
+    assert len(files) == 16
+    for f in files:
+        assert f.stats_state == "provided"
+        assert f.path.startswith(f"{root}team_id={f.partition_values[0]}/")
+        stats = _file_stats(catalog, table, f.data_file_id, appended.snapshot_id)
+        assert [c["field_id"] for c in stats["columns"]] == [fid["team_id"]]
+
+    _compact_until_quiet(catalog)
+
+    head = catalog.refresh().head_snapshot_id
+    after = table.files(snapshot=head)
+    assert not inputs & {f.path for f in after}
+    assert len(after) < 16
+    assert sum(f.record_count for f in after) == 8 * 5
+    for f in after:
+        team = f.partition_values[0]
+        assert f.path.startswith(f"{root}team_id={team}/")
+        assert f.stats_state == "provided"
+        stats = _file_stats(catalog, table, f.data_file_id, head)
+        by_id = {c["field_id"]: c for c in stats["columns"]}
+        assert set(by_id) == {fid["team_id"], fid["ts"], fid["val"]}
+        ts = by_id[fid["ts"]]
+        assert ts["lower_bound"] is not None and ts["upper_bound"] is not None
+        assert ts["lower_bound"] <= ts["upper_bound"]
+        prefix = by_id[fid["team_id"]]
+        assert prefix["lower_bound"] == prefix["upper_bound"]
+        assert str(prefix["lower_bound"]) == team
 
 
 def test_partitioned_compaction_groups_within_partition(catalog, ns):

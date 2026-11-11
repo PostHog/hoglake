@@ -7,6 +7,7 @@ from . import object_prefix, ops, transforms, upload, variant, writer
 from .auth import BearerToken, ClientCredentials
 from .bounds import decode_bound, encode_bound
 from .client import (
+    DEFAULT_FOOTER_STATS_MIN_BYTES,
     UNGUARDED,
     Catalog,
     HoglakeClient,
@@ -89,6 +90,7 @@ __version__ = importlib.metadata.version("pyhoglake")
 logging.getLogger("pyhoglake").addHandler(logging.NullHandler())
 
 __all__ = [
+    "DEFAULT_FOOTER_STATS_MIN_BYTES",
     "UNGUARDED",
     "VARIANT_NULL",
     "AlreadyExistsError",

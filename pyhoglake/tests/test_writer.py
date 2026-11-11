@@ -125,29 +125,162 @@ def _golden_rows() -> pa.Table:
     return pa.Table.from_pylist(rows, schema=columns_to_arrow_schema(_golden_columns()))
 
 
-# The pre-refactor paths' arguments, by case.
+# The pre-refactor paths' arguments, by case: the path, its keyword
+# arguments, and the table (the plain golden one, or test_variant_write's
+# two variant columns, whose cases pin the stamped footer and the storage
+# bytes as the writer first wrote them, before its per-file caches).
 GOLDEN_CASES = {
     "append-zstd-row-groups": (
         "append",
         {"compression": "zstd", "compression_level": 3, "row_group_size": 2},
+        "plain",
     ),
-    "append-default-codec": ("append", {}),
-    "prepare-zstd": ("prepare", {"compression": "zstd", "compression_level": 3}),
+    "append-default-codec": ("append", {}, "plain"),
+    "prepare-zstd": (
+        "prepare",
+        {"compression": "zstd", "compression_level": 3},
+        "plain",
+    ),
+    "append-variant-zstd-row-groups": (
+        "append",
+        {"compression": "zstd", "compression_level": 3, "row_group_size": 2},
+        "variant",
+    ),
+    "prepare-variant-zstd": (
+        "prepare",
+        {"compression": "zstd", "compression_level": 3},
+        "variant",
+    ),
+    # The core alone (append and prepare take no page index): decimal4 and
+    # decimal16 leaves (DECIMAL stamps on INT32 and FIXED), an array of
+    # objects, a NOT NULL unshredded column, two row groups, page index on.
+    "core-shredded-page-index": (
+        "core",
+        {
+            "compression": "zstd",
+            "compression_level": 3,
+            "row_group_size": 2,
+            "write_page_index": True,
+        },
+        "shredded",
+    ),
 }
 
+SHREDDED_COLUMNS = [
+    _col("id", "long", 1, 0, nullable=False),
+    _col(
+        "money",
+        "variant",
+        2,
+        1,
+        type_params={
+            "shredding": {
+                "type": "object",
+                "fields": [
+                    {"name": "cents", "type": "decimal4", "precision": 9, "scale": 2},
+                    {"name": "big", "type": "decimal16", "precision": 38, "scale": 0},
+                    {
+                        "name": "items",
+                        "type": "array",
+                        "element": {
+                            "type": "object",
+                            "fields": [
+                                {"name": "sku", "type": "string"},
+                                {"name": "qty", "type": "int64"},
+                            ],
+                        },
+                    },
+                ],
+            }
+        },
+    ),
+    _col("blob", "variant", 3, 2, nullable=False),
+]
+SHREDDED_MONEY = [
+    '{"cents": 12.5, "big": 18446744073709551616, "items": [{"sku": "a", "qty": 1}, {"sku": "b"}]}',
+    '{"cents": "x", "items": [], "extra": null}',
+    None,
+    '{"big": -1, "items": [{"qty": 2}, null, {"sku": 7}]}',
+    '"text"',
+]
+SHREDDED_BLOB = ["1", '{"k": [true, 1.5]}', "null", '"x"', "[]"]
 
-def _write_through(path: str, httpx_mock, kwargs) -> tuple[bytes, dict]:
+
+def _shredded_columns() -> tuple[Column, ...]:
+    return tuple(Column.from_wire(c) for c in SHREDDED_COLUMNS)
+
+
+def _shredded_rows() -> pa.Table:
+    return pa.table(
+        {
+            "id": list(range(len(SHREDDED_MONEY))),
+            "money": pa.array(SHREDDED_MONEY, pa.string()).cast(pa.json_()),
+            "blob": pa.array(SHREDDED_BLOB, pa.string()).cast(pa.json_()),
+        },
+        schema=columns_to_arrow_schema(_shredded_columns(), variant="json"),
+    )
+
+
+def _golden_case_table(kind: str) -> tuple[pa.Table, tuple[Column, ...], dict]:
+    """A case's rows, columns and table wire."""
+    if kind == "variant":
+        return _json_table(), _columns(), WIRE
+    if kind == "shredded":
+        return (
+            _shredded_rows(),
+            _shredded_columns(),
+            {**WIRE, "columns": SHREDDED_COLUMNS},
+        )
+    return _golden_rows(), _golden_columns(), GOLDEN_WIRE
+
+
+def _core_write(
+    rows: pa.Table, columns: tuple[Column, ...], kwargs: dict
+) -> PreparedPart:
+    """write_part as a case's arguments ask: the codec settings and the
+    page index are write options, the row-group size its own argument."""
+    kwargs = dict(kwargs)
+    options = parquet_write_options(
+        kwargs.pop("compression", None), kwargs.pop("compression_level", None)
+    )
+    if kwargs.pop("write_page_index", False):
+        options["write_page_index"] = True
+    return write_part(rows, columns, write_options=options, **kwargs)
+
+
+def _cold() -> None:
+    """Every cache the writer keeps between files, emptied: what a process's
+    first file gets."""
+    from pyhoglake import _variant_backend
+    from pyhoglake import _variant_codec as codec_module
+    from pyhoglake import parquet_schema as ps
+
+    codec_module._PLANS.clear()
+    ps._STAMPED_FOOTERS.clear()
+    ps._SCHEMA_MATCHES.clear()
+    ps._plan_integer_view.cache_clear()
+    ps._expected_elements.cache_clear()
+    writer_module._STORED_SCHEMAS.clear()
+    _variant_backend._plan.cache_clear()
+
+
+def _write_through(path: str, httpx_mock, kwargs, kind: str) -> tuple[bytes, dict]:
+    rows, columns, wire = _golden_case_table(kind)
+    if path == "core":
+        part = _core_write(rows, columns, kwargs)
+        reg = part.registration("s3://b/f.parquet", columns, stats=True)
+        return part.body.to_pybytes(), reg
     if path == "append":
         store = FakeS3()
-        table = _append_table(httpx_mock, store, GOLDEN_WIRE)
-        table.append(_golden_rows(), read_snapshot=5, **kwargs)
+        table = _append_table(httpx_mock, store, wire)
+        table.append(rows, read_snapshot=5, **kwargs)
         (reg,) = _committed(httpx_mock)
         (body,) = store.files.values()
     else:
         recording = RecordingS3()
-        table = resolved_table(httpx_mock, recording, GOLDEN_WIRE)
+        table = resolved_table(httpx_mock, recording, wire)
         request = table.prepare_append_tables(
-            [(_golden_rows(), None)], idempotency_key=str(uuid.uuid4()), **kwargs
+            [(rows, None)], idempotency_key=str(uuid.uuid4()), **kwargs
         )
         (reg,) = request["appends"][0]["files"]
         body = recording.files[reg["path"].removeprefix("s3://")]
@@ -186,8 +319,8 @@ def _golden() -> dict:
 
 @pytest.mark.parametrize("case", sorted(GOLDEN_CASES))
 def test_convenience_paths_write_the_golden_bytes(httpx_mock, case):
-    path, kwargs = GOLDEN_CASES[case]
-    body, reg = _write_through(path, httpx_mock, kwargs)
+    path, kwargs, kind = GOLDEN_CASES[case]
+    body, reg = _write_through(path, httpx_mock, kwargs, kind)
     if RECAPTURE:
         golden = _golden() if GOLDEN.exists() else {}
         golden["created_by"] = pq.read_metadata(pa.BufferReader(body)).created_by
@@ -200,27 +333,158 @@ def test_convenience_paths_write_the_golden_bytes(httpx_mock, case):
     # The fixture is not one the test rebuilds: it holds every case, and
     # the cases are not trivially the same file.
     assert sorted(golden["cases"]) == sorted(GOLDEN_CASES)
-    assert len({c["body"] for c in golden["cases"].values()}) == 3
+    assert len({c["body"] for c in golden["cases"].values()}) == len(GOLDEN_CASES)
 
 
 @pytest.mark.parametrize("case", sorted(GOLDEN_CASES))
 def test_write_part_writes_the_golden_bytes(case):
     """The core itself, called as an ingester calls it, writes what the
-    pre-refactor paths wrote: the body, its sizes and the stats."""
-    _, kwargs = GOLDEN_CASES[case]
-    kwargs = dict(kwargs)
-    options = parquet_write_options(
-        kwargs.pop("compression", None), kwargs.pop("compression_level", None)
-    )
-    part = write_part(
-        _golden_rows(), _golden_columns(), write_options=options, **kwargs
-    )
-    reg = part.registration("s3://b/f.parquet", _golden_columns(), stats=True)
+    pre-refactor paths wrote: the body, its sizes and the stats. Twice in a
+    row, so the second file, with the plan, the footer's schema list and
+    the schema verdict remembered from the first, is the same bytes."""
+    _, kwargs, kind = GOLDEN_CASES[case]
+    rows, columns, _ = _golden_case_table(kind)
+    golden = _golden()
+    for _ in range(2):
+        part = _core_write(rows, columns, kwargs)
+        reg = part.registration("s3://b/f.parquet", columns, stats=True)
+        assert (
+            _golden_entry(_recorded(part.body.to_pybytes(), golden), reg)
+            == golden["cases"][case]
+        )
+
+
+@pytest.mark.parametrize(
+    "case", [c for c, (_, _, kind) in sorted(GOLDEN_CASES.items()) if kind != "plain"]
+)
+def test_write_part_writes_the_golden_bytes_from_a_cold_start(case):
+    """The variant golden bytes with every writer cache empty: what a
+    process's first file gets, which the warm run above then has to match."""
+    _, kwargs, kind = GOLDEN_CASES[case]
+    rows, columns, _ = _golden_case_table(kind)
+    _cold()
+    part = _core_write(rows, columns, kwargs)
+    reg = part.registration("s3://b/f.parquet", columns, stats=True)
     golden = _golden()
     assert (
         _golden_entry(_recorded(part.body.to_pybytes(), golden), reg)
         == golden["cases"][case]
     )
+
+
+def _shapes() -> list[tuple[pa.Table, tuple[Column, ...]]]:
+    """One declaration under every field id and nullability the writer
+    tells apart, and other declarations beside it: more schemas than a
+    small cache keeps."""
+    shapes = []
+    for i in range(6):
+        declaration = {
+            "type": "object",
+            "fields": [
+                {"name": f"f{i % 3}", "type": "int64"},
+                {"name": "p", "type": "decimal8", "precision": 18, "scale": i % 4},
+            ],
+        }
+        for field_id, nullable in ((2, True), (9, True), (2, False), (9, False)):
+            columns = (
+                Column("id", "long", 1, 0, False),
+                Column(
+                    "v", "variant", field_id, 1, nullable, {"shredding": declaration}
+                ),
+            )
+            rows = [f'{{"f{i % 3}": {j}, "p": 1.5}}' for j in range(5)]
+            table = pa.table(
+                {"id": list(range(5)), "v": pa.array(rows).cast(pa.json_())},
+                schema=columns_to_arrow_schema(columns, variant="json"),
+            )
+            shapes.append((table, columns))
+    return shapes
+
+
+def _small_caches(monkeypatch, kept: int) -> None:
+    from pyhoglake import _variant_codec as codec_module
+    from pyhoglake import parquet_schema as ps
+
+    for memo in (
+        codec_module._PLANS,
+        ps._STAMPED_FOOTERS,
+        ps._SCHEMA_MATCHES,
+        writer_module._STORED_SCHEMAS,
+    ):
+        monkeypatch.setattr(memo, "kept", kept)
+
+
+@pytest.mark.parametrize("kept", [1, 2, 64])
+def test_interleaved_shapes_write_their_cold_bytes_through_small_caches(
+    monkeypatch, kept
+):
+    """Shapes written in turn, one declaration under two field ids and both
+    nullabilities among them, each get the bytes a cold process writes
+    them: a cache entry serves its own shape only, and one evicted (every
+    cache held to ``kept``) is derived again to the same bytes."""
+    shapes = _shapes()
+    cold = []
+    for table, columns in shapes:
+        _cold()
+        cold.append(write_part(table, columns, write_options={}).body.to_pybytes())
+    assert len(set(cold)) == len(cold), "the shapes are told apart"
+    _small_caches(monkeypatch, kept)
+    _cold()
+    for _round in range(3):
+        for (table, columns), want in zip(shapes, cold, strict=True):
+            assert (
+                write_part(table, columns, write_options={}).body.to_pybytes() == want
+            )
+        for (table, columns), want in zip(
+            reversed(shapes), reversed(cold), strict=True
+        ):
+            assert (
+                write_part(table, columns, write_options={}).body.to_pybytes() == want
+            )
+
+
+def test_threads_write_their_cold_bytes_through_small_caches(monkeypatch):
+    """Threads writing more shapes than each cache keeps, evicting under
+    one another: no exception escapes, and every file is the bytes a cold
+    process writes its shape (an eviction racing a lookup in a plain dict
+    would raise KeyError or RuntimeError out of write_part)."""
+    import sys
+    import threading
+
+    shapes = _shapes()
+    cold = []
+    for table, columns in shapes:
+        _cold()
+        cold.append(write_part(table, columns, write_options={}).body.to_pybytes())
+    _small_caches(monkeypatch, 2)
+    _cold()
+    errors: list[BaseException] = []
+    drift: list[int] = []
+
+    def worker(offset: int) -> None:
+        for round_ in range(40):
+            index = (offset * 7 + round_ * 5) % len(shapes)
+            table, columns = shapes[index]
+            try:
+                body = write_part(table, columns, write_options={}).body.to_pybytes()
+            except BaseException as error:
+                errors.append(error)
+            else:
+                if body != cold[index]:
+                    drift.append(index)
+
+    interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        threads = [threading.Thread(target=worker, args=(k,)) for k in range(6)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    finally:
+        sys.setswitchinterval(interval)
+    assert errors == []
+    assert drift == []
 
 
 # -- registration -------------------------------------------------------------------
@@ -734,3 +998,121 @@ def test_write_part_returns_a_prepared_part():
     assert isinstance(part, PreparedPart)
     assert isinstance(part.body, pa.Buffer)
     assert part.metadata.num_rows == 5
+
+
+# -- the narrowed stats walk is the full walk's, per wanted id -------------------
+
+
+def _metadata_of(table: pa.Table, **options) -> pq.FileMetaData:
+    sink = pa.BufferOutputStream()
+    pq.write_table(table, sink, **options)
+    return pq.read_metadata(pa.BufferReader(sink.getvalue()))
+
+
+_HOLDING_CASES = [
+    (
+        "struct-beside-its-own-dotted-name",
+        (
+            Column(
+                name="a",
+                type="struct",
+                field_id=1,
+                ordinal=0,
+                children=(Column(name="b", type="long", field_id=2, ordinal=0),),
+            ),
+            Column(name="a.b", type="string", field_id=3, ordinal=1),
+        ),
+        lambda: _metadata_of(
+            pa.table(
+                {
+                    "a": pa.array([{"b": 1}, {"b": 2}], pa.struct([("b", pa.int64())])),
+                    "a.b": pa.array(["x", "y"]),
+                }
+            )
+        ),
+    ),
+    (
+        "legacy-list-beside-a-dotted-sibling",
+        (
+            Column(
+                name="l",
+                type="list",
+                field_id=1,
+                ordinal=0,
+                children=(Column(name="element", type="long", field_id=2, ordinal=0),),
+            ),
+            Column(name="l.x.y", type="string", field_id=3, ordinal=1),
+        ),
+        lambda: _metadata_of(
+            pa.table(
+                {
+                    "l": pa.array([[1, 2], [3]], pa.list_(pa.int64())),
+                    "l.x.y": pa.array(["p", "q"]),
+                }
+            ),
+            use_compliant_nested_type=False,
+        ),
+    ),
+    (
+        "legacy-list-alone",
+        (
+            Column(
+                name="l",
+                type="list",
+                field_id=1,
+                ordinal=0,
+                children=(Column(name="element", type="long", field_id=2, ordinal=0),),
+            ),
+            Column(name="k", type="long", field_id=3, ordinal=1),
+        ),
+        lambda: _metadata_of(
+            pa.table(
+                {
+                    "l": pa.array([[1, 2], [3]], pa.list_(pa.int64())),
+                    "k": pa.array([1, 2]),
+                }
+            ),
+            use_compliant_nested_type=False,
+        ),
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("columns", "metadata"),
+    [(c, m) for _, c, m in _HOLDING_CASES],
+    ids=[n for n, _, _ in _HOLDING_CASES],
+)
+def test_narrowed_stats_walk_matches_the_full_walk_for_every_wanted_set(
+    columns, metadata
+):
+    """``_registration`` walks ``_columns_holding`` instead of every column
+    when ``stats_field_ids`` is given. For every one- and two-id set over
+    the columns' trees, the rows it yields for the wanted ids must be the
+    full walk's, filtered — including where ``_resolve_leaves``' legacy
+    dotted-name fallback makes a leaf's binding depend on which other
+    columns are walked (a top-level ``a.b`` or ``l.x.y`` beside a nested
+    column of head ``a`` / ``l``; dots the server forbids in a column
+    name, but ``PreparedPart.registration`` takes any columns)."""
+    import itertools
+
+    md = metadata()
+    full = extract_column_stats(md, columns)
+    ids: set[int] = set()
+
+    def walk(column):
+        ids.add(column.field_id)
+        for child in column.children or ():
+            walk(child)
+
+    for column in columns:
+        walk(column)
+    for r in (1, 2):
+        for combo in itertools.combinations(sorted(ids), r):
+            wanted = set(combo)
+            narrowed = extract_column_stats(
+                md, tuple(writer_module._columns_holding(columns, wanted))
+            )
+            assert [s.to_wire() for s in narrowed if s.field_id in wanted] == [
+                s.to_wire() for s in full if s.field_id in wanted
+            ], f"wanted {wanted}"

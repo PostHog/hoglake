@@ -2,6 +2,7 @@ package com.posthog.hoglake.auth
 
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
+import com.posthog.hoglake.service.Identifiers
 import com.posthog.hoglake.store.BackendKind
 import io.github.oshai.kotlinlogging.KotlinLogging
 import java.net.URI
@@ -10,7 +11,7 @@ import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.nio.file.Files
 import java.nio.file.Path
-import java.security.interfaces.ECPublicKey
+import java.security.PublicKey
 import java.time.Duration
 import java.util.UUID
 import java.util.concurrent.ExecutorService
@@ -44,7 +45,7 @@ import java.util.concurrent.atomic.AtomicReference
  */
 interface SigningKeys {
     /** The key named [keyId], or null when this source does not have it. */
-    fun byKeyId(keyId: String?): ECPublicKey?
+    fun byKeyId(keyId: String?): PublicKey?
 
     /** How many keys the source holds now; exported as `hoglake_auth_signing_keys`. */
     val keyCount: Int
@@ -74,12 +75,12 @@ interface SigningKeys {
  */
 class StaticSigningKeys(
     private val keyId: String,
-    private val key: ECPublicKey,
+    private val key: PublicKey,
 ) : SigningKeys {
     // A token with no `kid` names no key, even in a one-key deployment. Saying
     // otherwise here would be the verifier's only path to accepting a token the
     // issuer never labelled.
-    override fun byKeyId(keyId: String?): ECPublicKey? = if (keyId == this.keyId) key else null
+    override fun byKeyId(keyId: String?): PublicKey? = if (keyId == this.keyId) key else null
 
     override val keyCount: Int = 1
 
@@ -108,12 +109,12 @@ class JwksSigningKeys internal constructor(
     private val runAsync: (() -> Unit) -> Unit = ::runOnRefreshThread,
 ) : SigningKeys {
     private val log = KotlinLogging.logger {}
-    private val keys = AtomicReference<Map<String, ECPublicKey>>(emptyMap())
+    private val keys = AtomicReference<Map<String, PublicKey>>(emptyMap())
 
     /** When the last background re-read was REQUESTED, for [minRefreshIntervalMs]. */
     private val lastRefreshRequestAt = AtomicLong(0)
 
-    override fun byKeyId(keyId: String?): ECPublicKey? {
+    override fun byKeyId(keyId: String?): PublicKey? {
         if (keyId == null) return null
         return keys.get()[keyId]
     }
@@ -257,19 +258,31 @@ class JwksSigningKeys internal constructor(
          * during a two-key overlap the same kid would mean different keys before
          * and after a reload, so a token's validity would depend on when it
          * arrived.
+         *
+         * EC P-256 (ES256) and RSA (RS256) keys may be mixed in one document.
+         * An entry that declares a purpose this verifier does not serve — an
+         * encryption key, or a signing key for another algorithm — is skipped
+         * ([Jwt.isUsableSigningJwk]), because standard identity providers
+         * publish such keys alongside their signing keys.
          */
-        fun parseJwks(bytes: ByteArray): Map<String, ECPublicKey> {
+        fun parseJwks(bytes: ByteArray): Map<String, PublicKey> {
             val root = ObjectMapper().readTree(bytes)
             val keys =
                 root.get("keys")
                     ?: throw IllegalArgumentException("jwks document has no 'keys' array")
             if (!keys.isArray) throw IllegalArgumentException("jwks 'keys' is not an array")
-            val out = LinkedHashMap<String, ECPublicKey>()
+            val out = LinkedHashMap<String, PublicKey>()
             keys.forEach { jwk ->
+                // Purpose first, then `kid`: an entry this verifier skips (an
+                // encryption key, another algorithm) need not carry a kid at
+                // all (RFC 7517 §4.5 makes it optional), and a standard JWKS
+                // with such an entry must still load. A usable signing key
+                // without one is unaddressable by any token and refused.
+                if (!Jwt.isUsableSigningJwk(jwk)) return@forEach
                 val kid =
                     jwk.get("kid")?.takeIf { it.isTextual }?.asText()
-                        ?: throw IllegalArgumentException("jwks entry has no 'kid'")
-                out[kid] = Jwt.ecPublicKey(jwk)
+                        ?: throw IllegalArgumentException("jwks signing entry has no 'kid'")
+                out[kid] = Jwt.publicKey(jwk)
             }
             return out
         }
@@ -298,6 +311,11 @@ class JwtVerifier(
      */
     private val predicateFields: Set<String> = emptySet(),
     private val backends: Map<UUID, BackendKind> = emptyMap(),
+    /**
+     * The most a scoped token may live, `exp - iat`
+     * (`HOGLAKE_AUTH_SCOPED_MAX_LIFETIME_SECONDS`).
+     */
+    private val scopedMaxLifetimeSeconds: Long = DEFAULT_SCOPED_MAX_LIFETIME_SECONDS,
     private val clock: () -> Long = { System.currentTimeMillis() / 1000 },
 ) {
     init {
@@ -307,6 +325,9 @@ class JwtVerifier(
         require(issuer.isNotBlank()) { "auth issuer must be configured when auth is not off" }
         require(audience.isNotBlank()) { "auth audience must be configured when auth is not off" }
         require(skewSeconds in 0..600) { "auth clock skew must be 0..600s, got $skewSeconds" }
+        require(scopedMaxLifetimeSeconds > 0) {
+            "auth scoped max lifetime must be positive, got $scopedMaxLifetimeSeconds"
+        }
     }
 
     /**
@@ -397,7 +418,10 @@ class JwtVerifier(
     private fun toCaller(claims: JsonNode): Caller {
         val subject = Jwt.text(claims, "sub")
         val tokenId = Jwt.text(claims, "jti")
-        val kindText = Jwt.text(claims, "ten")
+        // An absent `ten` means `tenant`, so an issuer with one kind of token
+        // need not spell it. Absent only: a `ten` that is present but not a
+        // string is still refused, and a scoped or operator token must say so.
+        val kindText = if (claims.has("ten")) Jwt.text(claims, "ten") else null
         val clientName = Jwt.textOrNull(claims, "cli")
         val routing = routing(claims)
 
@@ -415,30 +439,20 @@ class JwtVerifier(
 
             "scoped" -> scopedCaller(claims, subject, tokenId, clientName, routing)
 
-            "tenant" -> {
+            "tenant", null -> {
+                // A token that carries a predicate but no `ten` is a scoped
+                // token that forgot to say so. Reading it as a tenant token
+                // would drop the predicate, i.e. widen it to the whole catalog.
+                if (kindText == null && claims.has("prd")) {
+                    throw JwtViolation(JwtViolation.MALFORMED, "a token carrying 'prd' must declare ten 'scoped'")
+                }
                 val orgId = Jwt.text(claims, "org")
-                val cat =
-                    claims.get("cat")
-                        ?: throw JwtViolation(JwtViolation.MISSING_CLAIM, "a tenant token must carry 'cat'")
-                if (!cat.isObject) {
-                    throw JwtViolation(JwtViolation.MALFORMED, "claim 'cat' is not an object")
-                }
-                val scopes = LinkedHashMap<String, Set<Scope>>()
-                cat.fields().forEach { (catalog, value) ->
-                    if (!value.isArray) {
-                        throw JwtViolation(JwtViolation.MALFORMED, "cat['$catalog'] is not an array")
-                    }
-                    val names = value.mapNotNull { it.takeIf(JsonNode::isTextual)?.asText() }
-                    val parsed = Scope.parseAll(names)
-                    // A catalog entry naming no scope we recognise is dropped, not
-                    // carried as an empty grant: present-but-empty and absent must
-                    // not be two spellings of the same thing, because `knowsCatalog`
-                    // reads presence.
-                    if (parsed.isNotEmpty()) scopes[catalog] = parsed
-                }
-                if (scopes.isEmpty()) {
-                    throw JwtViolation(JwtViolation.MISSING_CLAIM, "a tenant token must grant at least one catalog")
-                }
+                val scopes =
+                    grants(
+                        cat = claims.get("cat")?.let(::tenantCat),
+                        scope = scopeClaim(claims, strict = false),
+                        kind = "tenant",
+                    )
                 val delegates = delegates(claims)
                 Caller(
                     subject = subject,
@@ -457,6 +471,132 @@ class JwtVerifier(
                 "claim 'ten' must be 'tenant', 'scoped' or 'operator', got '$kindText'",
             )
         }
+    }
+
+    /**
+     * A tenant token's `cat`, LENIENT about scope words: an unknown word is
+     * dropped (see [Scope.parseAll]), and a catalog left with no scope we
+     * recognise is dropped with it, not carried as an empty grant —
+     * present-but-empty and absent must not be two spellings of the same thing,
+     * because `knowsCatalog` reads presence.
+     */
+    private fun tenantCat(cat: JsonNode): Map<String, Set<Scope>> {
+        if (!cat.isObject) {
+            throw JwtViolation(JwtViolation.MALFORMED, "claim 'cat' is not an object")
+        }
+        val scopes = LinkedHashMap<String, Set<Scope>>()
+        cat.properties().forEach { (catalog, value) ->
+            if (!value.isArray) {
+                throw JwtViolation(JwtViolation.MALFORMED, "cat['$catalog'] is not an array")
+            }
+            val parsed = Scope.parseAll(value.mapNotNull { it.takeIf(JsonNode::isTextual)?.asText() })
+            if (parsed.isNotEmpty()) scopes[catalog] = parsed
+        }
+        return scopes
+    }
+
+    /** A scoped token's `cat`, STRICT: only `read` and `write`, never empty. */
+    private fun scopedCat(cat: JsonNode): Map<String, Set<Scope>> {
+        if (!cat.isObject) {
+            throw JwtViolation(JwtViolation.MISSING_CLAIM, "a scoped token must carry an object 'cat'")
+        }
+        val scopes = LinkedHashMap<String, Set<Scope>>()
+        cat.properties().forEach { (catalog, value) ->
+            if (!value.isArray || value.isEmpty) {
+                throw JwtViolation(JwtViolation.MALFORMED, "cat['$catalog'] is not a non-empty array")
+            }
+            scopes[catalog] =
+                value.map { word ->
+                    word.takeIf { it.isTextual }?.asText()?.let(::predicateScope)
+                        ?: throw JwtViolation(
+                            JwtViolation.MALFORMED,
+                            "a scoped token's cat['$catalog'] may hold only 'read' and 'write'",
+                        )
+                }.toSet()
+        }
+        return scopes
+    }
+
+    /**
+     * The catalog grants carried in the standard OAuth `scope` claim
+     * (RFC 6749 §3.3, RFC 8693 §4.2): a space-separated string whose
+     * `hoglake:<catalog>:<scope>` values are the same grants `cat` expresses.
+     * This is the form an off-the-shelf identity provider can emit.
+     *
+     * Values not starting with `hoglake:` belong to other audiences sharing the
+     * claim (`openid`, `profile`, …) and are ignored. Returns null when no
+     * value is ours, so a token whose `scope` carries only foreign values is
+     * treated as if it had no `scope` at all.
+     *
+     * A value in our namespace must be exactly three `:`-separated parts with a
+     * valid catalog name (which can never contain `:`), or the token is
+     * refused. The scope word follows `cat`'s rule for the token kind: dropped
+     * when unknown on a tenant token ([strict] false), refused unless `read` or
+     * `write` on a scoped one.
+     */
+    private fun scopeClaim(
+        claims: JsonNode,
+        strict: Boolean,
+    ): Map<String, Set<Scope>>? {
+        val claim = claims.get("scope") ?: return null
+        if (!claim.isTextual) {
+            throw JwtViolation(JwtViolation.MALFORMED, "claim 'scope' is not a space-separated string")
+        }
+        val grants = LinkedHashMap<String, MutableSet<Scope>>()
+        var ours = false
+        claim.asText().split(' ').filter { it.startsWith(SCOPE_PREFIX) }.forEach { value ->
+            ours = true
+            val parts = value.split(':')
+            if (parts.size != 3 || !CATALOG_NAME.matches(parts[1])) {
+                throw JwtViolation(
+                    JwtViolation.MALFORMED,
+                    "scope value '$value' is not hoglake:<catalog>:<scope> with a valid catalog name",
+                )
+            }
+            val (_, catalog, word) = parts
+            val scope =
+                if (strict) {
+                    predicateScope(word) ?: throw JwtViolation(
+                        JwtViolation.MALFORMED,
+                        "a scoped token's scope for '$catalog' may be only 'read' or 'write'",
+                    )
+                } else {
+                    Scope.fromWire(word)
+                }
+            if (scope != null) grants.getOrPut(catalog) { LinkedHashSet() }.add(scope)
+        }
+        return if (ours) grants else null
+    }
+
+    /**
+     * Reconcile the two spellings of a token's catalog grants.
+     *
+     * Either may be present alone. When BOTH are, they must describe the same
+     * grants after each has applied its own parsing rules — a token whose `cat`
+     * and `scope` disagree has no single meaning, and picking either one would
+     * let an issuer bug widen access, so it is refused. Neither present is the
+     * missing-`cat` refusal it has always been.
+     */
+    private fun grants(
+        cat: Map<String, Set<Scope>>?,
+        scope: Map<String, Set<Scope>>?,
+        kind: String,
+    ): Map<String, Set<Scope>> {
+        val resolved =
+            when {
+                cat == null && scope == null ->
+                    throw JwtViolation(JwtViolation.MISSING_CLAIM, "a $kind token must carry 'cat' or 'scope'")
+                cat != null && scope != null && cat != scope ->
+                    throw JwtViolation(
+                        JwtViolation.MALFORMED,
+                        "claims 'cat' and 'scope' grant different catalogs or scopes",
+                    )
+                else -> cat ?: scope!!
+            }
+        if (resolved.isEmpty()) {
+            throw JwtViolation(JwtViolation.MISSING_CLAIM, "a $kind token must grant at least one catalog")
+        }
+        return resolved
     }
 
     /** A present placement must be understood in full before it can route a request. */
@@ -530,33 +670,19 @@ class JwtVerifier(
         val iat =
             claims.get("iat")?.takeIf { it.isIntegralNumber }?.asLong()
                 ?: throw JwtViolation(JwtViolation.MISSING_CLAIM, "a scoped token must carry an integer 'iat'")
-        if (Jwt.seconds(claims, "exp") - iat > MAX_SCOPED_LIFETIME_SECONDS) {
+        if (Jwt.seconds(claims, "exp") - iat > scopedMaxLifetimeSeconds) {
             throw JwtViolation(
                 JwtViolation.MALFORMED,
-                "a scoped token may live at most ${MAX_SCOPED_LIFETIME_SECONDS}s",
+                "a scoped token may live at most ${scopedMaxLifetimeSeconds}s",
             )
         }
         val orgId = Jwt.text(claims, "org")
-        val cat =
-            claims.get("cat")?.takeIf { it.isObject }
-                ?: throw JwtViolation(JwtViolation.MISSING_CLAIM, "a scoped token must carry an object 'cat'")
-        val scopes = LinkedHashMap<String, Set<Scope>>()
-        cat.properties().forEach { (catalog, value) ->
-            if (!value.isArray || value.isEmpty) {
-                throw JwtViolation(JwtViolation.MALFORMED, "cat['$catalog'] is not a non-empty array")
-            }
-            scopes[catalog] =
-                value.map { word ->
-                    word.takeIf { it.isTextual }?.asText()?.let(::predicateScope)
-                        ?: throw JwtViolation(
-                            JwtViolation.MALFORMED,
-                            "a scoped token's cat['$catalog'] may hold only 'read' and 'write'",
-                        )
-                }.toSet()
-        }
-        if (scopes.isEmpty()) {
-            throw JwtViolation(JwtViolation.MISSING_CLAIM, "a scoped token must grant at least one catalog")
-        }
+        val scopes =
+            grants(
+                cat = claims.get("cat")?.let(::scopedCat),
+                scope = scopeClaim(claims, strict = true),
+                kind = "scoped",
+            )
         val user =
             when (val usr = claims.get("usr")) {
                 null -> null
@@ -620,8 +746,12 @@ class JwtVerifier(
         /** The most values one predicate field may enumerate. */
         const val MAX_PREDICATE_VALUES = 200
 
-        /** `exp - iat` ceiling for a scoped token: hogtower mints 15 minutes. */
-        const val MAX_SCOPED_LIFETIME_SECONDS = 900L
+        /**
+         * Default `exp - iat` ceiling for a scoped token, 15 minutes; an issuer
+         * that mints longer-lived scoped tokens needs
+         * `HOGLAKE_AUTH_SCOPED_MAX_LIFETIME_SECONDS` raised.
+         */
+        const val DEFAULT_SCOPED_MAX_LIFETIME_SECONDS = 900L
 
         private const val MAX_USER_LENGTH = 200
         private const val ALL = "*"
@@ -630,6 +760,10 @@ class JwtVerifier(
         // the 19-digit values past Long.MAX_VALUE.
         private val CANONICAL_ID = Regex("^[1-9][0-9]{0,18}$")
         private val FIELD_NAME = Regex("^[a-z][a-z0-9_]{0,62}$")
+
+        /** The namespace of hoglake's values in the OAuth `scope` claim. */
+        private const val SCOPE_PREFIX = "hoglake:"
+        private val CATALOG_NAME = Regex(Identifiers.CATALOG_NAME_PATTERN)
 
         /** A predicate permission: `read` or `write`, nothing stronger. */
         private fun predicateScope(word: String): Scope? =

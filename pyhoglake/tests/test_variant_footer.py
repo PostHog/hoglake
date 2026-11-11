@@ -787,6 +787,75 @@ def test_write_variant_parquet_round_trips_the_corpus_and_measures_after_the_pat
         assert repr(got) == repr(want), column.name
 
 
+def test_write_variant_parquet_stamps_a_schema_list_seen_before_as_the_oracle_does():
+    """Files of one Arrow schema start their footers with the same bytes
+    (the version, then the schema list), and the second is stamped from
+    the first's Thrift walk: still the oracle's bytes, whatever its rows,
+    row groups and page index. A footer whose schema list differs (a
+    column more, under the same stamps) is walked anew; and a footer
+    handed to stamp_variant_footer itself is always walked."""
+    import pyhoglake.parquet_schema as ps
+
+    ps._STAMPED_FOOTERS.clear()
+    table, columns = _corpus()
+    stamps = _stamps(columns)
+    first = write_variant_parquet(table, columns)
+    assert first.body.to_pybytes() == footer_oracle.stamp(_pyarrow_bytes(table), stamps)
+    assert len(ps._STAMPED_FOOTERS.get(tuple(stamps))) == 1
+    part = table.slice(1, 3)
+    options = {"write_page_index": True, "compression": "zstd"}
+    second = write_variant_parquet(
+        part, columns, row_group_size=1, write_options=options
+    )
+    assert second.body.to_pybytes() == footer_oracle.stamp(
+        _pyarrow_bytes(part, row_group_size=1, **options), stamps
+    )
+    assert second.footer_size == struct.unpack("<I", second.body[-8:-4].to_pybytes())[0]
+    assert len(ps._STAMPED_FOOTERS.get(tuple(stamps))) == 1, "the first's walk served"
+    extra = (
+        pa.field("n", pa.int64(), metadata={b"PARQUET:field_id": b"99"}),
+        pa.array(range(len(table)), pa.int64()),
+    )
+    wider = _table(columns, [table.column(c.name) for c in columns], [extra])
+    third = write_variant_parquet(wider, columns)
+    assert third.body.to_pybytes() == footer_oracle.stamp(_pyarrow_bytes(wider), stamps)
+    assert len(ps._STAMPED_FOOTERS.get(tuple(stamps))) == 2, "another schema list"
+    walked = []
+    real = ps._stamp_footer
+    try:
+        ps._stamp_footer = lambda footer, stamps: (
+            walked.append(1) or real(footer, stamps)
+        )
+        patched, _ = ps._stamped_footer(_footer(_pyarrow_bytes(table)), stamps)
+        assert not walked and bytes(first.body)[-len(patched) - 8 : -8] == patched
+        stamp_variant_footer(_pyarrow_bytes(table), stamps)
+        assert walked == [1]
+    finally:
+        ps._stamp_footer = real
+
+
+def test_write_variant_parquet_skips_the_structure_check_it_is_told_was_made(
+    monkeypatch,
+):
+    """The writer's ``_structure_checked`` names columns whose storage was
+    held to structure_fault already (after the Rust codec accepted it):
+    those are not checked again, every other column is."""
+    import pyhoglake.parquet_schema as ps
+
+    checked = []
+    real = ps.structure_fault
+    monkeypatch.setattr(
+        ps, "structure_fault", lambda array: checked.append(len(array)) or real(array)
+    )
+    table, columns = _many_columns()
+    plain = write_variant_parquet(table, columns)
+    assert len(checked) == 4
+    checked.clear()
+    told = write_variant_parquet(table, columns, _structure_checked={"a", "c"})
+    assert len(checked) == 2
+    assert told.body.to_pybytes() == plain.body.to_pybytes()
+
+
 def test_write_variant_parquet_metadata_is_the_files_for_the_stats():
     """The metadata is the writer's own, collected as it closed, not read
     off the body: its chunk paths, value counts, sizes and null counts are
