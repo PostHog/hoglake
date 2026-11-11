@@ -1802,8 +1802,8 @@ ran on the local stack and what it showed.
 - **Auth**: the ENFORCEMENT layer has landed — JWT verification, the
   route-to-scope table ([server/src/main/kotlin/com/posthog/hoglake/auth/AuthPolicy.kt](server/src/main/kotlin/com/posthog/hoglake/auth/AuthPolicy.kt)),
   per-catalog scopes, the `HOGLAKE_AUTH_MODE=off|warn|enforce` flag. It is
-  `off` by default, i.e. today's behaviour. TOKEN ISSUANCE does not exist
-  yet, so `enforce` in a real cluster refuses everything; deploy `warn`
+  `off` by default, i.e. today's behaviour. `enforce` refuses every caller
+  that has no token from the configured issuer, so deploy `warn` first
   and watch `hoglake_auth_requests_total{outcome="missing"}` until it is
   zero for every `client` class. `warn` PERMITS EVERYTHING `enforce` WOULD REFUSE, including
   `DELETE /v1/catalogs/{catalog}` and the maintenance routes: it is a
@@ -1811,13 +1811,14 @@ ran on the local stack and what it showed.
   writes freely while it is on. Deploy it where that is acceptable, which
   is anywhere the current behaviour is already "no auth at all". `/metrics` on the main port is operator-only; set
   `HOGLAKE_METRICS_PORT` before `enforce` and scrape that infra listener,
-  which serves the same registry with no auth and needs no token. Issuance and per-tenant S3 credential
-  vending live in `PostHog/hogtower`, not here: it already holds the
-  tenant→catalog→IAM-role→bucket mapping, an `sts:AssumeRole` broker and the
-  warehouse-scoped machine credentials. hoglake is a resource server — set
-  `HOGLAKE_AUTH_ISSUER` and `HOGLAKE_AUTH_JWKS_URL` to hogtower's, then flip
-  the mode. [docs/auth-tenancy.md](docs/auth-tenancy.md) §17 has the
-  reasoning and the two-repo stack.
+  which serves the same registry with no auth and needs no token. hoglake is
+  a resource server: it issues nothing on the request path and calls nothing
+  to decide a request. Set `HOGLAKE_AUTH_ISSUER` and `HOGLAKE_AUTH_JWKS_URL`
+  (or `_FILE`) to whichever issuer the deployment runs — any identity
+  provider that emits the token contract in [docs/auth.md](docs/auth.md);
+  PostHog's is hogtower — then flip the mode. hoglake owns the contract and
+  its test vectors; issuers conform to them. Never add code that names
+  hogtower or PostHog teams: the PostHog behaviour is configuration.
 - pyhoglake implements `truncate[W]` partition transforms; the server's
   Transform vocabulary doesn't include truncate yet (client-ready,
   server gap).

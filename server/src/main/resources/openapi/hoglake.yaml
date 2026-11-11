@@ -14,11 +14,14 @@ info:
 
     Every operation except the four marked `security: []` below
     (`/livez`, `/healthz`, `/metrics`, `/info`) requires
-    `Authorization: Bearer <jwt>`; `/metrics` requires an OPERATOR
-    credential rather than none. The token is an ES256 compact JWS
-    issued by this instance, carrying the
+    `Authorization: Bearer <jwt>` when `HOGLAKE_AUTH_MODE` is `warn` or
+    `enforce`; `/metrics` requires an OPERATOR credential rather than
+    none. The token is an ES256 compact JWS issued by the issuer this
+    server is configured to trust (`HOGLAKE_AUTH_ISSUER`, verified
+    against its JWKS; this server issues nothing itself), carrying the
     caller's kind (`ten`), org (`org`), and — for a tenant — a `cat`
-    map from catalog name to the scopes held on it. Scopes are
+    map from catalog name to the scopes held on it. The contract is
+    docs/auth.md. Scopes are
     PER-CATALOG, not global: `read`, `write`, `maintenance`, `admin`,
     nested so that `admin` implies all of them and `maintenance`
     implies `write`.
