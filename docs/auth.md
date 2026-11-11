@@ -24,9 +24,9 @@ The issuer is a deployment choice, not a hoglake dependency:
 
 | deployment | issuer | storage credentials |
 | --- | --- | --- |
-| single-tenant, internal | none (`HOGLAKE_AUTH_MODE=off`), or hoglake's own local key (`local`, planned) | the server's and each client's own AWS identity |
-| your own identity provider | any issuer that emits the [token contract](#the-token-contract) and publishes a JWKS | the same; or whatever your issuer hands clients |
-| PostHog's managed warehouse | hogtower, PostHog's control plane, which mints tokens for PostHog's tenants and hands out scoped S3 sessions with them | vended by hogtower alongside the token |
+| single-tenant, internal | none (`HOGLAKE_AUTH_MODE=off`), or hoglake's own local key (`local`, planned) | each client's own AWS identity; the server's own (`ambient`) for its jobs |
+| your own identity provider | any issuer that emits the [token contract](#the-token-contract) and publishes a JWKS | the same; or whatever your issuer hands clients, and a `broker` in front of your own STS for the server's jobs |
+| PostHog's managed warehouse | hogtower, PostHog's control plane, which mints tokens for PostHog's tenants and hands out scoped S3 sessions with them | vended by hogtower: to clients alongside the token, to the server's jobs through the `broker` provider |
 
 hoglake's code carries no PostHog concepts. Catalog names, namespaces, the
 `team_id` predicate and the fifteen-minute scoped-token cap are all
@@ -170,7 +170,8 @@ is an operator.
   no policy service. A compromised hoglake can serve the catalogs it was already
   allowed to serve and nothing more.
 - **Hold users or passwords.** Authorization is carried by the token.
-- **Vend storage credentials.** See the next section.
+- **Vend storage credentials.** See the next section: it may *fetch* them for
+  its own jobs, through a configured provider, but never hands any out.
 
 ## Storage credentials
 
@@ -180,9 +181,32 @@ static keys, an instance or pod identity, or short-lived credentials its issuer
 handed it.
 
 The server's own jobs, the hydrator, compaction, snapshot expiry, quarantine and
-cleanup, use the server's own identity: `HOGLAKE_S3_ACCESS_KEY` and
-`HOGLAKE_S3_SECRET_KEY`, or the SDK's default chain (a pod identity in
-Kubernetes). hoglake does not fetch storage credentials from anyone.
+cleanup, get their storage credentials from a **storage credential provider**,
+chosen per deployment:
+
+| provider | how the server's jobs get S3 credentials |
+| --- | --- |
+| `ambient` (default) | the SDK's default chain: a pod identity in Kubernetes, an instance profile, or the environment |
+| `static` | `HOGLAKE_S3_ACCESS_KEY` and `HOGLAKE_S3_SECRET_KEY`: MinIO, local development, CI, the compose quickstart |
+| `broker` (planned) | an HTTP call to a configured URL, authenticated with hoglake's own client credential against a configured token URL: `POST <url>` with `{"catalog", "prefix", "access": "read" \| "write"}`, answered with `{"access_key_id", "secret_access_key", "session_token", "expiration"}`, STS's shape. One session per job, scoped to one catalog, held in memory and refreshed before it expires; never written to the metadata store |
+
+`ambient` and `static` are what hoglake does today (static keys when both are
+set, otherwise the SDK chain), so an existing install changes nothing.
+`broker` is how a deployment puts the server's own S3 access behind the same
+authority as its clients' access: the server then holds no cloud identity of
+its own, and every session it uses is one the broker chose to grant and can
+audit. PostHog runs it, pointed at hogtower; anyone can implement the shape in
+front of their own STS wrapper or a secrets engine. Under `ambient` the
+server's role reaches every catalog it serves, which is the normal trade for a
+single-org install.
+
+Whatever the provider, it serves only the server's own work: the background
+jobs, and the same work when a caller with `maintenance` scope triggers it
+through `POST /v1/catalogs/{catalog}/maintenance/compact` or
+`…/maintenance/cleanup`, which run compaction or cleanup inline and read and
+rewrite S3 with the server's credentials. Ordinary metadata requests never
+call the provider and never read S3, and nothing fetches credentials for a
+client.
 
 A deployment that wants storage access gated by the same authority as the
 tokens does it on the issuer side: the issuer returns scoped, short-lived
@@ -244,7 +268,7 @@ the four scopes and the route table; scoped tokens with `prd`; `rtg`; the
 public and metrics listeners; client credentials and fixed tokens in pyhoglake,
 the DuckDB extension, hedgerow and the Trino connector.
 
-Tracked in [#574](https://github.com/PostHog/hoglake/issues/574): hoglake-generated contract vectors;
+Tracked in [#574](https://github.com/PostHog/hoglake/issues/574): the `broker` storage provider; hoglake-generated contract vectors;
 RS256; the `scope` claim; a configurable scoped-token cap; `ten` defaulting to
 `tenant`; the local issuer and `hoglake token mint`; a fixed-token option in the
 Trino connector; client credentials in millrace; removing the issuer-specific
