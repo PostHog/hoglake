@@ -284,3 +284,10 @@ implementations together.
 ## License
 
 [MIT](LICENSE)
+
+## Internal Hoglite boundary
+
+Hoglite is a private raw-SQL backend for trusted callers.
+Customer metadata grants can address their own backend tenant directly.
+JWT authentication does not make Hoglite a public SQL API or provide TLS.
+S3 permissions remain unchanged.

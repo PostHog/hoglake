@@ -160,14 +160,17 @@
         "verdict": "accept",
         "kind": "operator"
       },
-      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6ImhvZ2xha2UiLCJzdWIiOiJpc3N1ZXI6cHJvdmlzaW9uZXIiLCJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDQiLCJ0ZW4iOiJvcGVyYXRvciIsImNsaSI6InByb3Zpc2lvbmVyIiwiZXhwIjoxNzY3MjI1OTAwLCJpYXQiOjE3NjcyMjU2MDAsIm5iZiI6MTc2NzIyNTYwMH0.GuFZ9SaDp1WaQKbzrR3dXwWQyyNZw5g9zWKq0m94RZQyVYJbQI12FxIfPKZZYn51w8RBBMNSkNY5IIqMVedmqA",
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6WyJob2dsYWtlIiwiaG9nbGl0ZSJdLCJzdWIiOiJpc3N1ZXI6cHJvdmlzaW9uZXIiLCJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDQiLCJ0ZW4iOiJvcGVyYXRvciIsImNsaSI6InByb3Zpc2lvbmVyIiwiZXhwIjoxNzY3MjI1OTAwLCJpYXQiOjE3NjcyMjU2MDAsIm5iZiI6MTc2NzIyNTYwMH0.LmrYb6tIq7jgeMSFOsRwU020UQJdb6KaJareuKHTRGRhfcYS9nnx936w-7S3PZe2TD_5MYodWJJBnUDF4nsc2Q",
       "header": {
         "alg": "ES256",
         "kid": "cc10b5ab649c34a4",
         "typ": "JWT"
       },
       "claims": {
-        "aud": "hoglake",
+        "aud": [
+          "hoglake",
+          "hoglite"
+        ],
         "cli": "provisioner",
         "exp": 1767225900,
         "iat": 1767225600,
@@ -252,14 +255,17 @@
         "verdict": "accept",
         "kind": "tenant"
       },
-      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6ImhvZ2xha2UiLCJzdWIiOiJobGNfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3IiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDA2IiwidGVuIjoidGVuYW50Iiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJyZWFkIl19LCJjbGkiOiJweWhvZ2xha2UtcmVhZGVyIiwicnRnIjp7ImIiOiJob2dsaXRlIiwiYmUiOiI3YzllMmExNC0zZjUxLTRiOGQtOWU2MC0yZDVhMWY4YzQ0YWEiLCJ0IjoidF8zZmE4YzFkOWUyXzEifSwiZXhwIjoxNzY3MjI2NTAwLCJpYXQiOjE3NjcyMjU2MDAsIm5iZiI6MTc2NzIyNTYwMH0.dUOunki3KT5BgfkhDVhtH4WexI8mrvpau0i_GkDs1k8OT-BXJ-_M19xR9JP543R_iqwdBLUG7q3BwKYvBWlNaQ",
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6WyJob2dsYWtlIiwiaG9nbGl0ZSJdLCJzdWIiOiJobGNfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3IiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDA2IiwidGVuIjoidGVuYW50Iiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJyZWFkIl19LCJjbGkiOiJweWhvZ2xha2UtcmVhZGVyIiwicnRnIjp7ImIiOiJob2dsaXRlIiwiYmUiOiI3YzllMmExNC0zZjUxLTRiOGQtOWU2MC0yZDVhMWY4YzQ0YWEiLCJ0IjoidF8zZmE4YzFkOWUyXzEifSwiZXhwIjoxNzY3MjI2NTAwLCJpYXQiOjE3NjcyMjU2MDAsIm5iZiI6MTc2NzIyNTYwMH0.naF4bJl1nr9XYkSPLT7nCpcFGHFLV1g1AeyJyt6jwtfli9mhlTPAtao_nBQKNkYMRwjkeQ97egvdAMd1Pvu5iw",
       "header": {
         "alg": "ES256",
         "kid": "cc10b5ab649c34a4",
         "typ": "JWT"
       },
       "claims": {
-        "aud": "hoglake",
+        "aud": [
+          "hoglake",
+          "hoglite"
+        ],
         "cat": {
           "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b": [
             "read"
@@ -308,14 +314,17 @@
         "verdict": "accept",
         "kind": "scoped"
       },
-      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6ImhvZ2xha2UiLCJzdWIiOiJobGNfMDAxMTIyMzM0NDU1NjY3Nzg4OTlhYWJiIiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDA3IiwidGVuIjoic2NvcGVkIiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJ3cml0ZSJdfSwicHJkIjp7InRlYW1faWQiOnsiNDIiOiJ3cml0ZSIsIjciOiJyZWFkIn19LCJjbGkiOiJsYXB0b3AiLCJ1c3IiOiIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wMDAwMDAwMDAwNDIiLCJydGciOnsiYiI6ImhvZ2xpdGUiLCJiZSI6IjdjOWUyYTE0LTNmNTEtNGI4ZC05ZTYwLTJkNWExZjhjNDRhYSIsInQiOiJ0XzNmYThjMWQ5ZTJfMSJ9LCJleHAiOjE3NjcyMjY1MDAsImlhdCI6MTc2NzIyNTYwMCwibmJmIjoxNzY3MjI1NjAwfQ.QOPUkwtrMFHRCb0khKCsRpP4Z-YUFuB3OhkOWEK3mmh5LesfcQg24zQaC1X1mn9fXjRmnaEHD3zK2lBsThpMmw",
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6WyJob2dsYWtlIiwiaG9nbGl0ZSJdLCJzdWIiOiJobGNfMDAxMTIyMzM0NDU1NjY3Nzg4OTlhYWJiIiwianRpIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDA3IiwidGVuIjoic2NvcGVkIiwib3JnIjoiMDE5MGExYjItYzNkNC03ZTVmLThhOWItMGMxZDJlM2Y0YTViIiwiY2F0Ijp7IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiI6WyJ3cml0ZSJdfSwicHJkIjp7InRlYW1faWQiOnsiNDIiOiJ3cml0ZSIsIjciOiJyZWFkIn19LCJjbGkiOiJsYXB0b3AiLCJ1c3IiOiIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wMDAwMDAwMDAwNDIiLCJydGciOnsiYiI6ImhvZ2xpdGUiLCJiZSI6IjdjOWUyYTE0LTNmNTEtNGI4ZC05ZTYwLTJkNWExZjhjNDRhYSIsInQiOiJ0XzNmYThjMWQ5ZTJfMSJ9LCJleHAiOjE3NjcyMjY1MDAsImlhdCI6MTc2NzIyNTYwMCwibmJmIjoxNzY3MjI1NjAwfQ.RVx9Na8uFFUw6mZ8ccXCVnHOnzsaHX6CgwULD-j9nQP4wqPkKJdhNsEwpReqBkFQYSF8w3hvd3yZgGXGEcpn-w",
       "header": {
         "alg": "ES256",
         "kid": "cc10b5ab649c34a4",
         "typ": "JWT"
       },
       "claims": {
-        "aud": "hoglake",
+        "aud": [
+          "hoglake",
+          "hoglite"
+        ],
         "cat": {
           "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b": [
             "write"
@@ -365,14 +374,17 @@
         "verdict": "accept",
         "kind": "operator"
       },
-      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6ImhvZ2xha2UiLCJzdWIiOiJpc3N1ZXI6cHJvdmlzaW9uZXIiLCJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDgiLCJ0ZW4iOiJvcGVyYXRvciIsIm9yZyI6IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiIsImNhdCI6eyIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wYzFkMmUzZjRhNWIiOlsiYWRtaW4iXX0sImNsaSI6InByb3Zpc2lvbmVyIiwicnRnIjp7ImIiOiJob2dsaXRlIiwiYmUiOiI3YzllMmExNC0zZjUxLTRiOGQtOWU2MC0yZDVhMWY4YzQ0YWEiLCJ0IjoidF8zZmE4YzFkOWUyXzEifSwiZXhwIjoxNzY3MjI1OTAwLCJpYXQiOjE3NjcyMjU2MDAsIm5iZiI6MTc2NzIyNTYwMH0.bGiu8OsO94ZeLjhbftzlOMV4EPDajSwVsAtMYjefmzs-OAcB774TosBYn2RtfNmIA1M0boTPwBW7Zuv057JnUA",
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6WyJob2dsYWtlIiwiaG9nbGl0ZSJdLCJzdWIiOiJpc3N1ZXI6cHJvdmlzaW9uZXIiLCJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDgiLCJ0ZW4iOiJvcGVyYXRvciIsIm9yZyI6IjAxOTBhMWIyLWMzZDQtN2U1Zi04YTliLTBjMWQyZTNmNGE1YiIsImNhdCI6eyIwMTkwYTFiMi1jM2Q0LTdlNWYtOGE5Yi0wYzFkMmUzZjRhNWIiOlsiYWRtaW4iXX0sImNsaSI6InByb3Zpc2lvbmVyIiwicnRnIjp7ImIiOiJob2dsaXRlIiwiYmUiOiI3YzllMmExNC0zZjUxLTRiOGQtOWU2MC0yZDVhMWY4YzQ0YWEiLCJ0IjoidF8zZmE4YzFkOWUyXzEifSwiZXhwIjoxNzY3MjI1OTAwLCJpYXQiOjE3NjcyMjU2MDAsIm5iZiI6MTc2NzIyNTYwMH0.WE4mgsbJrLq90R19Shccr2fmZ6XlOLlPaoK93WesNuxVSZx4ugqLX_vvhIT8bMjtOxiDSGtHxabUUF6xfzcVmQ",
       "header": {
         "alg": "ES256",
         "kid": "cc10b5ab649c34a4",
         "typ": "JWT"
       },
       "claims": {
-        "aud": "hoglake",
+        "aud": [
+          "hoglake",
+          "hoglite"
+        ],
         "cat": {
           "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b": [
             "admin"
@@ -500,14 +512,17 @@
         "verdict": "refuse",
         "reason": "missing_claim"
       },
-      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6ImhvZ2xha2UiLCJzdWIiOiJpc3N1ZXI6cHJvdmlzaW9uZXIiLCJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMTEiLCJjbGkiOiJwcm92aXNpb25lciIsImV4cCI6MTc2NzIyNTkwMCwiaWF0IjoxNzY3MjI1NjAwLCJuYmYiOjE3NjcyMjU2MDB9.j4COM0tFcv8Vt26QdEeygskTHKxsedas5AuRFAVAS3YCU14SnO9WFmt2ArJKu-xNuXpZos9GLOhIJ79fN5_Cgw",
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImNjMTBiNWFiNjQ5YzM0YTQiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2hvZ2xha2UuY29udHJhY3QudGVzdCIsImF1ZCI6WyJob2dsYWtlIiwiaG9nbGl0ZSJdLCJzdWIiOiJpc3N1ZXI6cHJvdmlzaW9uZXIiLCJqdGkiOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMTEiLCJjbGkiOiJwcm92aXNpb25lciIsImV4cCI6MTc2NzIyNTkwMCwiaWF0IjoxNzY3MjI1NjAwLCJuYmYiOjE3NjcyMjU2MDB9.c27nOdbAPvbtM6INDgxJHYnOJvPJxhxXOmnoErtsQ7stl3FeFYOGQZZOU1C-_51VIzILk-58g0dg7pYVrJYQWA",
       "header": {
         "alg": "ES256",
         "kid": "cc10b5ab649c34a4",
         "typ": "JWT"
       },
       "claims": {
-        "aud": "hoglake",
+        "aud": [
+          "hoglake",
+          "hoglite"
+        ],
         "cli": "provisioner",
         "exp": 1767225900,
         "iat": 1767225600,

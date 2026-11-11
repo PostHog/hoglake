@@ -164,6 +164,7 @@ sealed interface AuthState {
     /** Resolved, with a verified token. */
     data class Authenticated(
         val caller: Caller,
+        internal val backendAuthority: VerifiedBackendAuthority? = null,
     ) : AuthState
 
     val callerOrNull: Caller?
@@ -184,6 +185,14 @@ sealed interface AuthState {
  */
 val ApplicationCall.hoglakeAuth: AuthState
     get() = attributes.getOrNull(AuthStateKey) ?: AuthState.Off
+
+/** Only the auth plugin constructs this request-local, redacted credential holder. */
+class VerifiedBackendAuthority internal constructor(internal val token: String) {
+    override fun toString(): String = "VerifiedBackendAuthority(redacted)"
+}
+
+internal val ApplicationCall.verifiedBackendToken: String?
+    get() = (hoglakeAuth as? AuthState.Authenticated)?.backendAuthority?.token
 
 /**
  * The audit `actor` for a request, or a refusal.
@@ -301,7 +310,9 @@ val HoglakeAuth =
             // `enforce` must be distinguishable from a request in `off`.
             call.attributes.put(
                 AuthStateKey,
-                caller?.let { AuthState.Authenticated(it) } ?: AuthState.Anonymous,
+                caller?.let {
+                    AuthState.Authenticated(it, token?.let(::VerifiedBackendAuthority))
+                } ?: AuthState.Anonymous,
             )
 
             // One decision, for every mode and every route shape. A PUBLIC route
