@@ -208,10 +208,9 @@ A top-level `variant` column may declare in `type_params.shredding` the
 layout that writers which shred VARIANT values (the Trino connector, and
 pyhoglake's own write paths) give it: which object fields and array
 elements get Parquet columns of their own, and the Variant type of each.
-Readers use each file's own layout, so a declaration changes no read,
-and it is fixed once the column exists — no alter op changes it, so a
-different layout is a new column. pyhoglake declares one in either DDL
-call:
+Readers use each file's own layout, so a declaration changes no read.
+pyhoglake declares one in either DDL call, and replaces or clears one
+with `ops.set_variant_shredding` (below):
 
 ```python
 from pyhoglake import ops, variant
@@ -240,6 +239,38 @@ events = ns.create_table(
     ),
 )
 events.alter([ops.add_column("extra", "variant", shredding={"type": "string"})])
+```
+
+Once the column exists, `ops.set_variant_shredding(name, decl)` replaces
+its declaration and `ops.set_variant_shredding(name, None)` clears it
+(the column then has no `type_params`), under the same rules and with
+the same local check; the server refuses it on a column of another type
+or a nested variant, worded as at `create_table`. The declaration is a
+target for the writers that honour one (`Table.append`,
+`prepare_append_tables`, `write_part`, the Trino connector, millrace) and
+for compaction, not a rule the catalog holds files to: files written
+under the old declaration keep the layout their footers record, and
+every file this client writes after the alter is laid out in the new
+one. Reading the older files: `variant.to_python(array)` with neither
+`column=` nor `shredding=` reads any layout from the storage's own
+types; `to_python(array, column)` and `verify(storage, column)` check the
+storage against the LIVE column's declaration and refuse another layout
+(`invalid_shredding`), so for a file written before the alter pass the
+declaration it was written under (`shredding=old_decl`), or none.
+A changed declaration is a DDL snapshot: a request prepared before it is
+refused at `commit_prepared` with `DdlSinceReadSnapshotError`, and the
+re-prepare writes the new layout. Re-applying the declaration the column
+already has (compared as JSON values; `None`, `{}` and
+`{"shredding": None}` all mean none) is a no-op: nothing is written, no
+snapshot is minted, and prepared requests stay committable — a reconcile
+script may apply declarations on every deploy. Requires
+`mutable-variant-shredding-v1` in `catalog.info.capabilities`; an older
+server answers 400 `unknown alter op`.
+
+```python
+narrower = {**decl, "fields": decl["fields"][:1]}
+events.alter([ops.set_variant_shredding("properties", narrower)])
+events.alter([ops.set_variant_shredding("extra", None)])  # unshredded from here on
 ```
 
 `variant_field` is a `pa.json_()` field whose metadata carries
@@ -520,7 +551,9 @@ of:
   `columns_to_arrow_schema(table.columns, variant="storage")`. It is
   checked by structure (no null where its declaration has none), not byte
   by byte: `variant.verify(storage, column)` decodes every row, at about
-  the encoder's cost, and is the caller's to run.
+  the encoder's cost, and is the caller's to run (against the LIVE
+  declaration; storage encoded under one `set_variant_shredding` has since
+  replaced is checked with `shredding=` that declaration).
 
 Anything else is refused, naming these. The JSON is encoded after the
 partition split, one group at a time, so the encoder's output never goes
@@ -575,7 +608,8 @@ naming the row in the table given, before anything is written.
 `variant_report`, when given, has every group's counts added to it
 (`rows`, `sql_null_rows`, `invalid_rows`, `invalid_by_reason`, and
 `typed` / `fallback` / `variant_null` per declared path), which says how
-well an immutable declaration fits the data. A variant nested in a
+well the declaration fits the data — the evidence for replacing it with
+`ops.set_variant_shredding`. A variant nested in a
 struct, list or map is refused (`UnsupportedTypeError`): no writer
 shreds one (D17).
 
@@ -586,7 +620,12 @@ reads the files, but folds a Variant null (JSON `null`) into SQL NULL;
 the hoglake DuckDB extension refuses a variant table at bind (#87).
 polars cannot open a file with a VARIANT column. pyarrow reads the
 storage as a plain struct, which
-`variant.to_python(table.column(name), column)` turns back into values.
+`variant.to_python(table.column(name), column)` turns back into values —
+checking the storage against the live column's declaration as it does;
+for a file written under a declaration `set_variant_shredding` has since
+replaced, pass `shredding=` that declaration, or call
+`to_python(table.column(name))` with neither to read whatever layout the
+file has.
 
 ### Identifiers and reserved names
 

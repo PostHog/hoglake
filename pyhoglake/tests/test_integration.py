@@ -651,6 +651,148 @@ def test_variant_append_round_trips_through_pyarrow(catalog, ns, s3config):
     ]
 
 
+def test_set_variant_shredding_relays_out_later_files_only(catalog, ns, s3config):
+    """``ops.set_variant_shredding`` on a declared column: the server stores
+    the new declaration, the file appended before keeps its layout and the
+    file appended after is laid out in the new one (each footer checked
+    against its own declaration with the writer's layout oracle), both read
+    back through ``to_python``; a request prepared under the old
+    declaration is refused at commit, and the re-prepare writes the new
+    layout."""
+    from dataclasses import replace
+
+    from pyhoglake._variant_codec import compile_plan
+    from pyhoglake.errors import DdlSinceReadSnapshotError
+    from pyhoglake.parquet_schema import variant_layout_fault
+
+    if "mutable-variant-shredding-v1" not in catalog.info.capabilities:
+        pytest.skip("the server does not declare mutable-variant-shredding-v1")
+
+    d1 = {
+        "type": "object",
+        "fields": [
+            {"name": "$browser", "type": "string"},
+            {"name": "price", "type": "decimal8", "precision": 18, "scale": 2},
+        ],
+    }
+    d2 = {
+        "type": "object",
+        "fields": [
+            {"name": "$browser", "type": "string"},
+            {"name": "$os", "type": "string"},
+            {"name": "tags", "type": "array", "element": {"type": "string"}},
+        ],
+    }
+    table = ns.create_table(
+        "variant_relayout",
+        pa.schema(
+            [
+                pa.field("id", pa.int64(), nullable=False),
+                variant_field("properties", d1),
+            ]
+        ),
+    )
+    rows = [
+        '{"$browser": "Chrome", "$os": "mac", "price": 9.5, "tags": ["a", "b"]}',
+        "null",
+        None,
+    ]
+    want = [
+        {"$browser": "Chrome", "$os": "mac", "price": 9.5, "tags": ["a", "b"]},
+        variant.VARIANT_NULL,
+        None,
+    ]
+
+    def data(ids):
+        return pa.table(
+            {
+                "id": pa.array(ids, pa.int64()),
+                "properties": pa.array(rows, pa.string()).cast(pa.json_()),
+            },
+            schema=columns_to_arrow_schema(table.columns, variant="json"),
+        )
+
+    first = table.append(data([1, 2, 3]), compression="zstd", compression_level=3)
+    (f1,) = table.files(snapshot=first.snapshot_id)
+    # Prepared under d1, published after the alter: refused, and the
+    # uploads of the refused request are never registered.
+    stale = table.prepare_append_tables(
+        [(data([4, 5, 6]), None)],
+        idempotency_key=str(uuid.uuid4()),
+        compression="zstd",
+        compression_level=3,
+    )
+
+    info = table.alter([ops.set_variant_shredding("properties", d2)])
+    column = next(c for c in info.columns if c.name == "properties")
+    assert column.type_params == {"shredding": d2}
+    fresh = ns.table("variant_relayout")
+    assert fresh.columns[1].type_params == {"shredding": d2}
+    assert fresh.columns[1].field_id == column.field_id
+    with pytest.raises(DdlSinceReadSnapshotError):
+        table.commit_prepared(stale)
+    assert table.files(snapshot=info.snapshot_id) == [f1]
+
+    # Re-applying the declaration the column has is a no-op: no snapshot,
+    # and a request prepared before it still commits.
+    prepared = table.prepare_append_tables(
+        [(data([4, 5, 6]), None)],
+        idempotency_key=str(uuid.uuid4()),
+        compression="zstd",
+        compression_level=3,
+    )
+    same = table.alter([ops.set_variant_shredding("properties", dict(d2))])
+    assert same.snapshot_id == info.snapshot_id
+    assert same.read_snapshot_id == info.snapshot_id
+    assert ns.table("variant_relayout").columns[1].type_params == {"shredding": d2}
+    second = table.commit_prepared(prepared)
+    (f2,) = [f for f in table.files(snapshot=second.snapshot_id) if f.path != f1.path]
+    assert f2.path == prepared["appends"][0]["files"][0]["path"]
+
+    fs = s3config.filesystem()
+    under_d1 = replace(column, type_params={"shredding": d1})
+    under_d2 = column
+    for f, declared, other in ((f1, under_d1, under_d2), (f2, under_d2, under_d1)):
+        body = fs.open_input_file(f.path[len("s3://") :]).read()
+        elements = _schema_elements(body)
+        (start,) = [i for e, _, i in _top_level(elements) if e.get(4) == "properties"]
+        plan = compile_plan(declared.type_params["shredding"])
+        assert variant_layout_fault(elements, start, declared, plan) is None, f.path
+        # ...and the check tells the layouts apart.
+        assert (
+            variant_layout_fault(
+                elements, start, other, compile_plan(other.type_params["shredding"])
+            )
+            is not None
+        )
+        back = pq.read_table(pa.BufferReader(body))
+        assert variant.to_python(back.column("properties"), declared) == want
+
+    # Cleared: the next file is unshredded (metadata + value only).
+    cleared = table.alter([ops.set_variant_shredding("properties", None)])
+    assert cleared.columns[1].type_params is None
+    third = table.append(data([7, 8, 9]), compression="zstd", compression_level=3)
+    (f3,) = [
+        f
+        for f in table.files(snapshot=third.snapshot_id)
+        if f.path not in (f1.path, f2.path)
+    ]
+    body = fs.open_input_file(f3.path[len("s3://") :]).read()
+    elements = _schema_elements(body)
+    (start,) = [i for e, _, i in _top_level(elements) if e.get(4) == "properties"]
+    assert (
+        variant_layout_fault(elements, start, cleared.columns[1], compile_plan(None))
+        is None
+    )
+    assert (
+        variant.to_python(
+            pq.read_table(pa.BufferReader(body)).column("properties"),
+            cleared.columns[1],
+        )
+        == want
+    )
+
+
 def test_alter_add_column_then_append(catalog, ns):
     table = ns.create_table(
         "evolving",

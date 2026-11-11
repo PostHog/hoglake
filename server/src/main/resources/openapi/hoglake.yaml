@@ -782,7 +782,11 @@ paths:
             different field than the one already set; and, while the
             option is on, a set_partition_spec without exactly one
             identity field on it, a drop_column or rename_column of it,
-            and a rename_table.
+            and a rename_table. And the set_variant_shredding refusals:
+            a column of another type, a variant nested in a struct, list
+            or map, or a declaration that breaks the grammar of
+            ColumnDef.type_params — the same messages a create_table or
+            add_column with that declaration meets.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
@@ -3819,7 +3823,7 @@ components:
       properties:
         name: { type: string }
         data_path: { type: string }
-        capabilities: { type: array, items: { type: string }, description: "Includes atomic-table-creation-v1, idempotent-append-v1, idempotent-delete-v1, idempotent-mutation-v1, guarded-table-lifecycle-v1, atomic-table-replacement-v1 guarded-schema-evolution-v1 recursive-write-schema-v1 atomic-partitioned-table-creation-v1 atomic-sorted-table-creation-v1 and versioned-table-metadata-v1 and claimed-uploads-v1 and atomic-dml-transactions-v1 and object-prefix-layout-v1 when supported. Each gates a write, so a mount (read_only) lists none." }
+        capabilities: { type: array, items: { type: string }, description: "Includes atomic-table-creation-v1, idempotent-append-v1, idempotent-delete-v1, idempotent-mutation-v1, guarded-table-lifecycle-v1, atomic-table-replacement-v1 guarded-schema-evolution-v1 recursive-write-schema-v1 atomic-partitioned-table-creation-v1 atomic-sorted-table-creation-v1 and versioned-table-metadata-v1 and claimed-uploads-v1 and atomic-dml-transactions-v1 and object-prefix-layout-v1 and mutable-variant-shredding-v1 when supported. Each gates a write, so a mount (read_only) lists none." }
         read_only:
           type: boolean
           description: >
@@ -4086,9 +4090,13 @@ components:
             `{"shredding": {"type": "object", "fields": [{"name":
             "$browser", "type": "string"}, {"name": "price", "type":
             "decimal8", "precision": 18, "scale": 2}]}}`.
-            `"shredding": null` declares nothing. A declaration is fixed
-            when its column is defined: no alter op changes it, so a
-            different layout is a new column.
+            `"shredding": null` declares nothing. The alter op
+            `set_variant_shredding` replaces or clears a declaration
+            after the column exists (capability
+            mutable-variant-shredding-v1). A declaration is a target for
+            the writers that honour one and for compaction, never a rule
+            the catalog holds files to: files written under an earlier
+            declaration, or none, keep their layout and keep reading.
 
             Each of these is a 422 naming the column, and inside a
             declaration the path of the node at fault (`$.price`,
@@ -4743,12 +4751,51 @@ components:
         the column (ops apply in order, so a set_partition_spec earlier
         in the same request counts). Setting the field already set
         changes nothing (the request still commits its DDL snapshot, as
-        every alter does); another field is a 422, and there is no
-        unset. While it
+        every alter but an equal set_variant_shredding does); another
+        field is a 422, and there is no unset. While it
         is on, set_partition_spec must keep exactly one identity field
         on it, and drop_column/rename_column of it and rename_table are
         refused. A server without capability object-prefix-layout-v1
         answers 400 unknown alter op.
+
+        `set_variant_shredding` (`name`, a top-level column of type
+        variant; `shredding`, a declaration as ColumnDef.type_params
+        describes one, or null — or absent — to clear) replaces the
+        shredded layout the column declares. The declaration is held to
+        the same rules as at create_table and add_column, and a column
+        of another type or a variant nested in a struct, list or map is
+        refused as it would be there, with the same messages. It is a
+        writer's and compaction's target, not a rule on files: no file
+        is checked against it or rewritten for it, each file's footer
+        carries its own layout and readers use that, so files written
+        under the old declaration stay as they are and keep reading;
+        writers that honour a declaration (pyhoglake, the Trino
+        connector, millrace through pyhoglake) lay out files they write
+        after re-reading the column in the new one, and compaction
+        copies each file's leaves in that file's own layout, grouping
+        inputs by layout with the declared one preferred. Cleared, the
+        column carries no `type_params`. A CHANGED declaration commits
+        like every alter: a DDL snapshot, which a writer holding an
+        older read_snapshot meets as 409 ddl_since_read_snapshot and
+        re-reads for. Re-declaring what the column already declares is
+        a no-op, unlike set_column_comment and set_object_prefix_field:
+        it writes no column row and mints no snapshot, so no writer is
+        refused for it. "Already declares" compares JSON values, not
+        spellings: object key order and number spelling do not matter,
+        and a STORED `type_params` that is absent, `{}` or
+        `{"shredding": null}` declares nothing, so `shredding: null` on
+        such a column is a no-op. The op's own `shredding` has one
+        spelling for "none", null or absent; `{}` and
+        `{"shredding": null}` as the value are declarations, and invalid
+        ones (422, `$ has no type`). A request made only of such ops
+        answers 200 with the table at the unmoved head (`snapshot_id`
+        and `read_snapshot_id` = head) and, as a head GET does, the
+        sampler's totals with `totals_snapshot_id` / `totals_as_of`, or
+        none while the sampler has none — not the exact totals a
+        changing alter's receipt carries; in a request with other ops
+        those commit while the equal declaration writes nothing. A
+        server without capability mutable-variant-shredding-v1 answers
+        400 unknown alter op.
       properties:
         comment: { type: [string, "null"], maxLength: 16384, description: "set_table_comment or set_column_comment; null or absent removes the comment." }
         properties: { $ref: "#/components/schemas/CustomProperties" }
@@ -4757,7 +4804,7 @@ components:
           enum: [add_column, drop_column, rename_column, promote_column,
                  rename_table, set_partition_spec, set_sort_order, add_column_with_metadata,
                  set_table_comment, set_column_comment, set_properties,
-                 set_object_prefix_field]
+                 set_object_prefix_field, set_variant_shredding]
         column:                       # add_column
           allOf: [{ $ref: "#/components/schemas/ColumnDef" }]
           description: >
@@ -4775,7 +4822,15 @@ components:
             Dotted path of an existing STRUCT to append the new field
             to (new field id, ordinal = max sibling + 1). Absent = a new
             top-level column. Naming a list or a map here is a 422.
-        name: { type: string }        # drop_column, promote_column, set_column_comment, set_object_prefix_field
+        name: { type: string }        # drop_column, promote_column, set_column_comment, set_object_prefix_field, set_variant_shredding
+        shredding:                    # set_variant_shredding
+          type: [object, "null"]
+          description: >
+            The declaration to set on the top-level variant column
+            `name`, in the grammar ColumnDef.type_params gives for
+            `shredding`; null or absent clears it (the column then has
+            no `type_params`). Every rule of the grammar is a 422 naming
+            the column and the path at fault, as at create_table.
         from: { type: string }        # rename_column
         to:
           type: string

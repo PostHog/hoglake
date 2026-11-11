@@ -608,11 +608,53 @@ server back below this version once a table has the option.
 `rename_table`, `set_partition_spec`, `set_sort_order`, the V11
 metadata ops `add_column_with_metadata`, `set_table_comment`,
 `set_column_comment`, `set_properties` (`versioned-table-metadata-v1`),
-and `set_object_prefix_field` (see Partitioning) — applied **in
+`set_object_prefix_field` (see Partitioning) and `set_variant_shredding`
+(`mutable-variant-shredding-v1`, below) — applied **in
 order, atomically, as one DDL commit** (one snapshot, one
 `table_altered` change row, one schema-version bump). Renames keep the
 `field_id` (end the old row, begin a new one with the same id), so
-files written before a rename still bind correctly. Type promotion is
+files written before a rename still bind correctly.
+
+`set_variant_shredding` (`name`, `shredding`) replaces the layout a
+top-level `variant` column declares in `type_params.shredding`, or
+clears it (`shredding: null`; the column then has no `type_params`).
+The declaration is held to the rules of `service/VariantShredding.kt`
+exactly as at `create_table` and `add_column` (grammar, at most 1000
+fields and arrays, 1024 bytes of names on a path, 16 levels), and a
+column of another type or a nested variant is refused with the same
+messages. It is a **writer's and compaction's target, not a rule on
+files**: the catalog checks no file against it and rewrites none for
+it; each file's footer carries its own layout and readers use that, so
+files written under the old declaration stay as they are and keep
+reading. Writers that honour a declaration (pyhoglake, the Trino
+connector, millrace through pyhoglake) read it from the live column and
+lay out the files they write after re-reading in the new one — the
+alter's DDL snapshot refuses a commit whose `read_snapshot` predates it
+(`ddl_since_read_snapshot`), which is what makes them re-read — and
+compaction copies each file's variant leaves in that file's own layout,
+grouping its inputs by layout (the declared one preferred), so files in
+an older layout compact among themselves (see Compaction). Re-declaring
+what the column already declares is a **no-op**: it writes no row and
+mints no snapshot, so writers holding an older read are not refused and
+a reconcile script may apply declarations on every deploy. "Already
+declares" compares JSON values, not spellings — key order and number
+spelling do not matter, and a STORED `type_params` that is absent, `{}`
+or `{"shredding": null}` declares nothing, so `shredding: null` on such
+a column is a no-op; the op's own `shredding` has one spelling for
+"none", `null`/absent — `{}` and `{"shredding": null}` as the argument
+are declarations, and invalid ones (`$ has no type`). A request of only
+such ops answers 200 with the table at the unmoved head and, like a head
+GET, the sampler's totals with their freshness fields (or none while the
+sampler has none) — never the exact aggregate under the commit lock that
+a changing alter's receipt pays for; in a request with other ops those
+commit while the equal declaration writes nothing. (This departs from
+`set_column_comment` / `set_object_prefix_field`, which commit a
+snapshot for a no-change request.) Both catalog backends
+(`service/AlterService.kt`, `hoglite/HogliteAlters.kt`) implement it
+identically: the column keeps its `field_id`, the live row ends and a
+replacement begins at the alter's snapshot, carrying a full copy of the
+declaration in its `type_params` — one row per change, at operator
+frequency, so the copies are not a storage concern. Type promotion is
 a strict widening lattice (`int8→int16→int→long` and `uint8→uint16→uint32`, any rung to any
 higher one, plus `float→double`) chosen so
 existing files remain readable under the new schema — and a promote
