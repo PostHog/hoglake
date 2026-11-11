@@ -360,6 +360,91 @@ class CatalogServiceIntegrationTest {
             .isEqualTo(v1.tableUuid)
     }
 
+    // A pinned getTable resolves the namespace incarnation at its snapshot, as a pinned listTables does.
+
+    @Test
+    fun `a pinned getTable resolves the namespace incarnation at its snapshot`() {
+        val catalog = "pinned-ns-recreate-cat"
+        svc.createCatalog(catalog, "s3://bucket/pnr")
+        val first = svc.createNamespace(catalog, "ns")
+        val table = svc.createTable(catalog, "ns", "t", listOf(idCol))
+        val pinned = table.snapshotId!!
+        assertThat(svc.getTable(catalog, "ns", "t", snapshot = pinned).tableUuid).isEqualTo(table.tableUuid)
+
+        // A namespace drops only when empty; the recreate is a new incarnation.
+        svc.dropTable(catalog, "ns", "t", expectedTableUuid = table.tableUuid, author = "test", message = "drop")
+        val dropped = svc.dropNamespace(catalog, "ns", author = "test", message = "drop").snapshotId
+        val second = svc.createNamespace(catalog, "ns")
+        assertThat(second.namespaceId).isNotEqualTo(first.namespaceId)
+        val t2 = svc.createTable(catalog, "ns", "t2", listOf(idCol))
+        assertThat(svc.getTable(catalog, "ns", "t2").tableUuid).isEqualTo(t2.tableUuid)
+
+        val read = svc.getTable(catalog, "ns", "t", snapshot = pinned)
+        assertThat(read.tableUuid).isEqualTo(table.tableUuid)
+        assertThat(read.readSnapshotId).isEqualTo(pinned)
+        assertThat(svc.listTables(catalog, "ns", snapshot = pinned).map { it.name }).containsExactly("t")
+
+        // At the drop snapshot no incarnation is alive: the old one is dropped, the new one not yet created.
+        assertThatThrownBy { svc.getTable(catalog, "ns", "t", snapshot = dropped) }
+            .isInstanceOf(HoglakeException.NotFound::class.java)
+            .hasMessageContaining("namespace 'ns' in catalog '$catalog' at snapshot $dropped")
+    }
+
+    @Test
+    fun `a pinned getTable picks the incarnation at its snapshot when both hold the same table name`() {
+        val catalog = "pinned-ns-same-name-cat"
+        svc.createCatalog(catalog, "s3://bucket/pns")
+        svc.createNamespace(catalog, "ns")
+        val first = svc.createTable(catalog, "ns", "t", listOf(idCol))
+        val pinned = first.snapshotId!!
+
+        svc.dropTable(catalog, "ns", "t", expectedTableUuid = first.tableUuid, author = "test", message = "drop")
+        svc.dropNamespace(catalog, "ns", author = "test", message = "drop")
+        svc.createNamespace(catalog, "ns")
+        val recreated = svc.getCatalog(catalog).headSnapshotId
+        val second = svc.createTable(catalog, "ns", "t", listOf(idCol))
+        assertThat(second.tableUuid).isNotEqualTo(first.tableUuid)
+
+        assertThat(svc.getTable(catalog, "ns", "t").tableUuid).isEqualTo(second.tableUuid)
+        val read = svc.getTable(catalog, "ns", "t", snapshot = pinned)
+        assertThat(read.tableUuid).isEqualTo(first.tableUuid)
+        assertThat(read.readSnapshotId).isEqualTo(pinned)
+        assertThat(svc.listTables(catalog, "ns", snapshot = pinned).map { it.name }).containsExactly("t")
+
+        // The new incarnation is alive at its creation snapshot, but its "t" comes later: the table is missing.
+        assertThatThrownBy { svc.getTable(catalog, "ns", "t", snapshot = recreated) }
+            .isInstanceOf(HoglakeException.NotFound::class.java)
+            .hasMessageContaining("table 'ns.t' in catalog '$catalog' at snapshot $recreated")
+    }
+
+    @Test
+    fun `a pinned getTable finds a table whose namespace was dropped and never recreated`() {
+        val catalog = "pinned-ns-dropped-cat"
+        svc.createCatalog(catalog, "s3://bucket/pnd")
+        svc.createNamespace(catalog, "ns")
+        val table = svc.createTable(catalog, "ns", "t", listOf(idCol))
+        val pinned = table.snapshotId!!
+        svc.dropTable(catalog, "ns", "t", expectedTableUuid = table.tableUuid, author = "test", message = "drop")
+        svc.dropNamespace(catalog, "ns", author = "test", message = "drop")
+
+        // Unlike a live lookup, which is NotFound, a pinned read sees the table as it was at its snapshot.
+        assertThatThrownBy { svc.getTable(catalog, "ns", "t") }.isInstanceOf(HoglakeException.NotFound::class.java)
+        assertThat(svc.getTable(catalog, "ns", "t", snapshot = pinned).tableUuid).isEqualTo(table.tableUuid)
+    }
+
+    @Test
+    fun `a pinned getTable before the namespace existed is not found at that snapshot`() {
+        val catalog = "pinned-ns-before-cat"
+        svc.createCatalog(catalog, "s3://bucket/pnb")
+        val before = svc.getCatalog(catalog).headSnapshotId
+        svc.createNamespace(catalog, "ns")
+        svc.createTable(catalog, "ns", "t", listOf(idCol))
+
+        assertThatThrownBy { svc.getTable(catalog, "ns", "t", snapshot = before) }
+            .isInstanceOf(HoglakeException.NotFound::class.java)
+            .hasMessageContaining("namespace 'ns' in catalog '$catalog' at snapshot $before")
+    }
+
     @Test
     fun `snapshot parameter out of range is a validation error`() {
         svc.createCatalog("range-cat", "s3://bucket/rg")

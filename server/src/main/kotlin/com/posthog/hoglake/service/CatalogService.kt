@@ -1167,12 +1167,6 @@ class CatalogService(private val jdbi: Jdbi) {
         jdbi.withHandleUnchecked { h ->
             val cat = requireCatalog(h, catalog)
             val at = resolveReadSnapshot(h, cat, snapshot, atTimestamp)
-            val ns = requireNamespace(h, cat, namespace)
-            val t =
-                TableRepo.findAt(h, cat.catalogId, ns.namespaceId, table, at)
-                    ?: throw HoglakeException.NotFound(
-                        "table '$namespace.$table' in catalog '$catalog' at snapshot $at",
-                    )
             // Asked for by the CALLER, not derived from `at`:
             // resolveReadSnapshot returns head when neither parameter is
             // given, so `at` alone cannot tell a head read from a
@@ -1180,6 +1174,22 @@ class CatalogService(private val jdbi: Jdbi) {
             // must answer differently, one from the sample and one from
             // the manifest.
             val timeTravel = snapshot != null || atTimestamp != null
+            // The namespace AT the snapshot, not the live one: a pinned
+            // reader must still see a namespace dropped after its pin.
+            val ns =
+                if (!timeTravel) {
+                    requireNamespace(h, cat, namespace)
+                } else {
+                    NamespaceRepo.findAt(h, cat.catalogId, namespace, at)
+                        ?: throw HoglakeException.NotFound(
+                            "namespace '$namespace' in catalog '$catalog' at snapshot $at",
+                        )
+                }
+            val t =
+                TableRepo.findAt(h, cat.catalogId, ns.namespaceId, table, at)
+                    ?: throw HoglakeException.NotFound(
+                        "table '$namespace.$table' in catalog '$catalog' at snapshot $at",
+                    )
             val sampled =
                 if (totals && !timeTravel) {
                     sampledTotals(h, cat.catalogId, t.tableId)
