@@ -1801,11 +1801,10 @@ class CompactionServiceIntegrationTest {
             assertThat(svc.runOnce(cat, three).groupsCompacted).isEqualTo(1)
             val declaredOutput = catalogs.listFiles(cat, "ns", "t").single { it.explicitRowIds }
 
-            // `props` is re-declared as the layout other_a holds (the alter
-            // op is another change's; the catalog row is what the planner
-            // reads). Everything remembered was judged against the old
-            // declaration and is unknown again.
-            redeclareProps(cat, VariantFixtures.other[1].def.typeParams!!)
+            // `props` is re-declared as the layout other_a holds. Everything
+            // remembered was judged against the old declaration and is
+            // unknown again.
+            alter.alterTable(cat, "ns", "t", listOf(AlterOp.SetVariantShredding("props", otherDeclaration)))
             val more = addFiles(cat, files.size, "other_b", "mismatch")
             val result = svc.runOnce(cat, three)
             assertThat(result.groupsCompacted).describedAs("%s", result).isEqualTo(1)
@@ -1830,23 +1829,202 @@ class CompactionServiceIntegrationTest {
         }
     }
 
-    /** `props` re-declared in place on the live catalog row, as `set_variant_shredding` leaves it. */
-    private fun redeclareProps(
-        cat: String,
-        typeParams: Map<String, Any?>,
-    ) {
-        val updated =
-            db.jdbi.withHandleUnchecked { h ->
-                h.createUpdate(
-                    """
-                    UPDATE hog_column c SET type_params = CAST(:p AS jsonb)
-                      FROM hog_catalog k
-                     WHERE k.catalog_id = c.catalog_id AND k.name = :cat AND c.name = 'props' AND c.end_snapshot IS NULL
-                    """,
-                ).bind("p", com.posthog.hoglake.persistence.Pg.toJson(typeParams)).bind("cat", cat).execute()
-            }
-        assertThat(updated).isEqualTo(1)
+    @Test
+    fun `set_variant_shredding end to end - each declaration's files compact among themselves, D2's as declared`() {
+        // The two changes together: a table written under one declaration
+        // (D1, columns.json), re-declared through the alter op (D2,
+        // other.json), written under D2 into the same partition, then
+        // swept. In metadata the six files are one group; the probe splits
+        // them by layout and each part compacts into ITS layout, D2's as
+        // the declared one and first. Nothing is refused, the split is
+        // counted once and never again, an equal re-declaration between
+        // sweeps mints no snapshot and disturbs nothing, later D2 arrivals
+        // join D2's output, and every row of every input survives, byte
+        // for byte, under its row id.
+        withVariantMetrics { registry ->
+            val d1Props = VariantLayout.groupType(VariantFixtures.live[1], Type.Repetition.OPTIONAL)
+            val d2Props = VariantLayout.groupType(VariantFixtures.other[1], Type.Repetition.OPTIONAL)
+            val (cat, d1Files) = variantTable("changeable", "b", "b", "b")
+            val catalogId = catalogs.getCatalog(cat).catalogId
+
+            // D1 -> D2 through the op: a DDL snapshot, the column keeping
+            // its field id, the live row carrying D2.
+            val beforeAlter = catalogs.getCatalog(cat).headSnapshotId
+            val altered =
+                alter.alterTable(
+                    cat,
+                    "ns",
+                    "t",
+                    listOf(AlterOp.SetVariantShredding("props", otherDeclaration)),
+                )
+            assertThat(altered.snapshotId).isEqualTo(beforeAlter + 1)
+            assertThat(catalogs.getCatalog(cat).headSnapshotId).isEqualTo(beforeAlter + 1)
+            val props = catalogs.getTable(cat, "ns", "t").columns.single { it.def.name == "props" }
+            assertThat(props.fieldId).isEqualTo(VariantFixtures.live[1].fieldId)
+            assertThat(props.def.typeParams).isEqualTo(VariantFixtures.other[1].def.typeParams)
+            // No file was checked or touched for it.
+            assertThat(catalogs.listFiles(cat, "ns", "t")).containsExactlyInAnyOrderElementsOf(d1Files)
+
+            val d2Files = addFiles(cat, d1Files.size, "other_b", "other_b", "mismatch")
+
+            // The planner, in metadata, sees one group of six.
+            assertThat(svc.planTable(cat, "ns", "t", variantOn).groups)
+                .singleElement()
+                .satisfies({ assertThat(it.files).hasSize(6) })
+
+            val first = svc.runOnce(cat, variantOn)
+            assertThat(first.groupsCompacted).describedAs("%s", first).isEqualTo(2)
+            assertThat(first.filesIn).isEqualTo(6)
+            assertThat(first.unconvertibleSchema).describedAs("nothing refused").isZero()
+            assertThat(first.failedGroups).isZero()
+            assertThat(first.layoutProbeOnly).isZero()
+
+            val outputs = catalogs.listFiles(cat, "ns", "t")
+            assertThat(outputs).hasSize(2).allSatisfy { assertThat(it.explicitRowIds).isTrue() }
+            assertThat(outputs.map { it.path }).doesNotContainAnyElementsOf((d1Files + d2Files).map { it.path })
+            val layouts = outputs.map { it to VariantFixtures.read(fetch(it.path)).first.getType("props") }
+            assertThat(layouts.map { it.second }).containsExactlyInAnyOrder(d1Props, d2Props)
+            val d1Output = layouts.single { it.second == d1Props }.first
+            val d2Output = layouts.single { it.second == d2Props }.first
+            // D1's files compacted among themselves, into D1...
+            assertThat(VariantFixtures.rows(fetch(d1Output.path)))
+                .isEqualTo(
+                    VariantFixtures.expected(
+                        *d1Files.map {
+                            VariantFixtures.Source(
+                                VariantFixtures.path("b"),
+                                it.rowIdStart,
+                            )
+                        }.toTypedArray(),
+                    ),
+                )
+            // ...D2's into D2, the declared layout, and first.
+            assertThat(VariantFixtures.rows(fetch(d2Output.path)))
+                .isEqualTo(
+                    VariantFixtures.expected(
+                        VariantFixtures.Source(VariantFixtures.path("other_b"), d2Files[0].rowIdStart),
+                        VariantFixtures.Source(VariantFixtures.path("other_b"), d2Files[1].rowIdStart),
+                        VariantFixtures.Source(VariantFixtures.path("mismatch"), d2Files[2].rowIdStart),
+                    ),
+                )
+            assertThat(d2Output.dataFileId).isLessThan(d1Output.dataFileId)
+            assertThat(svc.variantLayouts.recall(catalogId, d2Output.dataFileId))
+                .describedAs("D2's output is the declared layout, remembered as written")
+                .isEqualTo(
+                    VariantLayoutMemory.Known(
+                        VariantLayout.fingerprint(VariantLayout.declared(VariantFixtures.other)),
+                        VariantLayoutMemory.NONE,
+                    ),
+                )
+            assertThat(svc.variantLayouts.recall(catalogId, d1Output.dataFileId))
+                .describedAs("D1's output deviates in `props` alone")
+                .isEqualTo(
+                    VariantLayoutMemory.Known(
+                        VariantLayout.fingerprint(VariantLayout.declared(VariantFixtures.other)),
+                        VariantLayout.fingerprint(mapOf(props.fieldId to d1Props)),
+                    ),
+                )
+
+            fun split() =
+                counter(
+                    registry,
+                    "hoglake_compaction_variant_layout_mismatch_total",
+                    cat,
+                    "reason" to "split",
+                )
+
+            fun outputs(layout: String) =
+                counter(registry, "hoglake_compaction_variant_layout_outputs_total", cat, "layout" to layout)
+            assertThat(split()).isEqualTo(1.0)
+            assertThat(counter(registry, "hoglake_compaction_variant_layout_mismatch_total", cat, "reason" to "layout"))
+                .isNull()
+            assertThat(counter(registry, "hoglake_compaction_variant_layout_mismatch_total", cat, "reason" to "duckdb"))
+                .isNull()
+            assertThat(outputs("declared")).isEqualTo(1.0)
+            assertThat(outputs("other")).isEqualTo(1.0)
+            assertThat(counter(registry, "hoglake_compaction_variant_layout_files_left_total", cat)).isNull()
+
+            // An equal re-declaration between sweeps, spelled differently
+            // (key order): no row, no snapshot, and the memory — keyed by
+            // the declaration's fingerprint — stays valid, so the two
+            // outputs are still kept apart and nothing is re-probed.
+            val head = catalogs.getCatalog(cat).headSnapshotId
+            val respelled = linkedMapOf("fields" to otherDeclaration.getValue("fields"), "type" to "object")
+            val same = alter.alterTable(cat, "ns", "t", listOf(AlterOp.SetVariantShredding("props", respelled)))
+            assertThat(same.snapshotId).isEqualTo(head)
+            assertThat(same.readSnapshotId).isEqualTo(head)
+            assertThat(catalogs.getCatalog(cat).headSnapshotId).isEqualTo(head)
+            assertThat(catalogs.getTable(cat, "ns", "t").columns.single { it.def.name == "props" }).isEqualTo(props)
+            assertThat(svc.planTable(cat, "ns", "t", variantOn).groups).isEmpty()
+            val second = svc.runOnce(cat, variantOn)
+            assertThat(
+                second.groupsCompacted + second.unconvertibleSchema + second.failedGroups + second.layoutProbeOnly,
+            )
+                .describedAs("%s", second)
+                .isZero()
+            assertThat(split()).describedAs("not counted again").isEqualTo(1.0)
+            assertThat(catalogs.listFiles(cat, "ns", "t")).containsExactlyInAnyOrder(d1Output, d2Output)
+
+            // More D2 files: they pack with D2's output (D1's, remembered as
+            // deviating, is kept apart), the probe finds one layout and
+            // splits nothing, and the output is D2 again.
+            val more = addFiles(cat, d1Files.size + d2Files.size, "other_b", "mismatch")
+            val third = svc.runOnce(cat, variantOn)
+            assertThat(third.groupsCompacted).describedAs("%s", third).isEqualTo(1)
+            assertThat(third.filesIn).isEqualTo(3)
+            assertThat(third.unconvertibleSchema + third.failedGroups + third.layoutProbeOnly).isZero()
+            assertThat(split()).describedAs("still not counted again").isEqualTo(1.0)
+            assertThat(outputs("declared")).isEqualTo(2.0)
+            assertThat(outputs("other")).isEqualTo(1.0)
+
+            val live = catalogs.listFiles(cat, "ns", "t")
+            assertThat(live).hasSize(2).contains(d1Output)
+            val d2Again = live.single { it.path != d1Output.path }
+            assertThat(VariantFixtures.read(fetch(d2Again.path)).first.getType("props")).isEqualTo(d2Props)
+            assertThat(VariantFixtures.rows(fetch(d2Again.path)))
+                .isEqualTo(
+                    VariantFixtures.expected(
+                        VariantFixtures.Source(VariantFixtures.path("other_b"), d2Files[0].rowIdStart),
+                        VariantFixtures.Source(VariantFixtures.path("other_b"), d2Files[1].rowIdStart),
+                        VariantFixtures.Source(VariantFixtures.path("mismatch"), d2Files[2].rowIdStart),
+                        VariantFixtures.Source(VariantFixtures.path("other_b"), more[0].rowIdStart),
+                        VariantFixtures.Source(VariantFixtures.path("mismatch"), more[1].rowIdStart),
+                    ),
+                )
+
+            // What a reader sees: the two outputs, no delete files, and
+            // between them every row of every input ever appended.
+            val scan = scans.planScan(cat, "ns", "t")
+            assertThat(scan.map { it.dataFile.path }).containsExactlyInAnyOrder(d1Output.path, d2Again.path)
+            assertThat(scan).allSatisfy { assertThat(it.deleteFile).isNull() }
+            val everyRow = live.flatMap { VariantFixtures.rows(fetch(it.path)).entries }.associate { it.toPair() }
+            assertThat(everyRow)
+                .isEqualTo(
+                    VariantFixtures.expected(
+                        *(
+                            d1Files.map { VariantFixtures.Source(VariantFixtures.path("b"), it.rowIdStart) } +
+                                listOf(
+                                    VariantFixtures.Source(VariantFixtures.path("other_b"), d2Files[0].rowIdStart),
+                                    VariantFixtures.Source(VariantFixtures.path("other_b"), d2Files[1].rowIdStart),
+                                    VariantFixtures.Source(VariantFixtures.path("mismatch"), d2Files[2].rowIdStart),
+                                    VariantFixtures.Source(VariantFixtures.path("other_b"), more[0].rowIdStart),
+                                    VariantFixtures.Source(VariantFixtures.path("mismatch"), more[1].rowIdStart),
+                                )
+                        ).toTypedArray(),
+                    ),
+                )
+            assertThat(everyRow).hasSize(
+                live.sumOf { it.recordCount.toInt() },
+            )
+        }
     }
+
+    /** `props`' declaration in other.json — what `mismatch`, `other_a` and `other_b` were written under — as the op takes it. */
+    private val otherDeclaration: Map<String, Any?>
+        get() {
+            @Suppress("UNCHECKED_CAST")
+            return VariantFixtures.other[1].def.typeParams!!.getValue("shredding") as Map<String, Any?>
+        }
 
     private val variantOn get() = cfg.copy(targetBytes = 1L shl 20, variantCompaction = true)
 
