@@ -585,7 +585,7 @@ class CleanupService(
      * page, which makes the budget's stop observable without sleeping.
      */
     private val receiptPurgeBudgetMs: Long = RECEIPT_PURGE_BUDGET_MS,
-) {
+) : CleanupBackend {
     /**
      * The production wiring, and the ONLY place the service's knobs are
      * derived from [Config].
@@ -688,10 +688,10 @@ class CleanupService(
      * audit event — app-log debug only, so idle background loops stay out
      * of the audit stream.
      */
-    fun runOnce(
+    override fun runOnce(
         catalog: String,
         batchSize: Int,
-        trigger: MaintenanceTrigger = MaintenanceTrigger.MANUAL,
+        trigger: MaintenanceTrigger,
     ): CleanupResult =
         drainCatalog(catalog, batchSize, trigger, receiptPurgeDeadline()).also {
             // ONCE PER RUN, after the drain: the retention purge is
