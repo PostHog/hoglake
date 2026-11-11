@@ -131,7 +131,7 @@ typed instead of killing the instance.
 
 The bearer-auth cases are a separate script, because they need the server in
 `HOGLAKE_AUTH_MODE=enforce` (or `warn`) trusting the contract vectors' key
-(`HOGLAKE_AUTH_ISSUER=https://hogtower.contract.test`, `HOGLAKE_AUTH_JWKS_FILE`
+(`HOGLAKE_AUTH_ISSUER=https://hoglake.contract.test`, `HOGLAKE_AUTH_JWKS_FILE`
 holding the `jwks` object of `server/src/test/resources/oauth/contract-vectors.json`):
 
 ```bash

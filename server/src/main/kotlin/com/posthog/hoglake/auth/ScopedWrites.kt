@@ -60,18 +60,18 @@ internal fun ApplicationCall.requireScopedNamespaces(
             HoglakeException.Forbidden(
                 "a scoped credential cannot use route ${match?.pattern ?: "?"} on '$catalog'",
             )
-        countRefusal(service, clientClass(this), caller, match, refusal, enforced = true)
+        countRefusal(service, service.clientClass(this), caller, match, refusal, enforced = true)
         throw refusal
     }
     for (namespace in namespaces.distinct()) {
         val held = lookups.containment(this, catalog, namespace)
         if (held == null || !caller.mayUseContained(catalog, held.field, held.value, pending.required)) {
             val refusal = HoglakeException.NotFound("namespace '$namespace' in catalog '$catalog'")
-            countRefusal(service, clientClass(this), caller, match, refusal, enforced = true)
+            countRefusal(service, service.clientClass(this), caller, match, refusal, enforced = true)
             throw refusal
         }
     }
-    Metrics.authRequest(service.mode.wire, service.listener, "ok", clientClass(this))
+    Metrics.authRequest(service.mode.wire, service.listener, "ok", service.clientClass(this))
 }
 
 /**
@@ -100,7 +100,7 @@ internal fun ApplicationCall.requireScopedUploadPrefix(
             HoglakeException.Forbidden(
                 "a scoped credential's upload must be claimed under ${dataPath.trimEnd('/')}/data/<namespace>/",
             )
-        countRefusal(service, clientClass(this), caller, match, refusal, enforced = true)
+        countRefusal(service, service.clientClass(this), caller, match, refusal, enforced = true)
         throw refusal
     }
     requireScopedNamespaces(catalog, listOf(namespace))
