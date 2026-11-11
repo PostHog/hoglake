@@ -1,5 +1,6 @@
 package com.posthog.hoglake.compaction
 
+import com.posthog.hoglake.persistence.bindBigintArrayOrNull
 import org.jdbi.v3.core.Handle
 import java.security.MessageDigest
 import java.util.UUID
@@ -422,6 +423,12 @@ internal object CompactionClaimRepo {
      * it: after our own lease expired, another maintainer may hold this
      * key, and shortening ITS lease would be the one thing a release
      * must never do.
+     *
+     * [inputFileIds] narrows the row to the inputs that actually DIED:
+     * a group of a VARIANT table is rewritten per layout
+     * (`VariantLayoutGroups`), and the files its probe left behind are
+     * still live candidates whose next plan must not read them as held
+     * for the committed lease. Null keeps the row's ids as claimed.
      */
     fun shortenToCommitted(
         h: Handle,
@@ -430,11 +437,13 @@ internal object CompactionClaimRepo {
         groupKey: String,
         claimant: UUID,
         ttlSeconds: Long,
+        inputFileIds: List<Long>? = null,
     ): Int =
         h.createUpdate(
             """
             UPDATE hog_compaction_claim
-               SET expires_at = now() + make_interval(secs => :ttlSeconds)
+               SET expires_at = now() + make_interval(secs => :ttlSeconds),
+                   input_file_ids = COALESCE(:inputFileIds, input_file_ids)
              WHERE catalog_id = :catalogId AND table_id = :tableId
                AND group_key = :groupKey AND claimant = :claimant
             """,
@@ -444,6 +453,7 @@ internal object CompactionClaimRepo {
             .bind("groupKey", groupKey)
             .bind("claimant", claimant)
             .bind("ttlSeconds", ttlSeconds.toDouble())
+            .bindBigintArrayOrNull("inputFileIds", inputFileIds)
             .execute()
 
     /**

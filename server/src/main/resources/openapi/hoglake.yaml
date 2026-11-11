@@ -4012,10 +4012,11 @@ components:
             VARIANT has no whole-column statistics and cannot be a partition or
             sort source. Compaction skips tables containing VARIANT unless
             the server enables it (HOGLAKE_COMPACTION_VARIANT); then it copies
-            each VARIANT in the layout its declaration gives it, and skips
-            any compaction group holding a file in another VARIANT layout or
-            written by DuckDB, so that group's other files stay uncompacted
-            with it.
+            each VARIANT's storage as it is, rewriting a group's files per
+            VARIANT layout — files in the declared layout together, files
+            in any other layout they share together, each output in its
+            inputs' layout — and leaving a file DuckDB wrote uncompacted
+            on its own.
             A top-level VARIANT may declare the shredded layout of the files
             written to it in `type_params.shredding`.
 
@@ -5763,8 +5764,10 @@ components:
             produced from an input file's parquet type (outside identity
             and the int->long / float->double promotions). With
             HOGLAKE_COMPACTION_VARIANT on, also groups holding a VARIANT
-            input not in its declared layout or written by DuckDB, which
-            hoglake_compaction_variant_layout_mismatch_total counts apart.
+            input whose field is no VARIANT group at all, which
+            hoglake_compaction_variant_layout_mismatch_total counts apart
+            (a group whose inputs hold several layouts is rewritten per
+            layout instead, and is not counted here).
         invalid_data:
           type: integer
           format: int64
@@ -6126,6 +6129,20 @@ components:
             the API, and the group is refused again on every sweep. Not charged to
             HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN. Also
             hoglake_compaction_skipped_total{reason="object_prefix_unresolvable"}.
+            Optional, for claimed_elsewhere's reason.
+        layout_probe_only:
+          type: integer
+          format: int64
+          description: >
+            Groups of a VARIANT table (HOGLAKE_COMPACTION_VARIANT) whose
+            layout probe read every input's footer and found nothing worth
+            a rewrite: each variant layout among the inputs held too few
+            files for one, or every input was written by DuckDB. The files
+            are left as they are, and the compactor remembers their
+            layouts so the group is not planned again until files of its
+            layouts arrive. The footers were read, so this IS charged to
+            HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN. Also
+            hoglake_compaction_skipped_total{reason="layout_probe_only"}.
             Optional, for claimed_elsewhere's reason.
     RetirementResult:
       type: object
