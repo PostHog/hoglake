@@ -1,5 +1,13 @@
 # Auth, tenancy and S3 data-plane entitlement
 
+> **Superseded as a description of the design.** [docs/auth.md](auth.md) is
+> canonical: hoglake is a resource server that verifies tokens from whichever
+> issuer the deployment configures, owns the token contract and its vectors,
+> and depends on no particular issuer. Where this document says hogtower is
+> *the* authority, read "PostHog's issuer, for PostHog's deployment". It is
+> kept for the threat model and the reasoning; §0–§16 describe a design that
+> was not built.
+
 **Status:** the hoglake side has shipped.
 [#460](https://github.com/PostHog/hoglake/pull/460) is the enforcement layer:
 `HOGLAKE_AUTH_MODE=off|warn|enforce`, ES256 JWT verification against a JWKS file
@@ -1562,7 +1570,7 @@ control plane — shows that six of the seven decisions above put machinery in t
 wrong repo. This section is what the stack should actually be, and it is
 smaller, not larger.
 
-The short version: **hoglake is a resource server. hogtower is the authority.**
+The short version: **hoglake is a resource server; the issuer is outside it.** For PostHog's deployment that issuer is hogtower.
 hoglake verifies a token and authorizes catalog metadata, which is what the
 first PR already does. hogtower mints the token and vends the S3 credentials,
 because it already holds every input, already assumes the tenant roles, and is

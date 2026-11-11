@@ -28,7 +28,7 @@ Authentication, for a server running `HOGLAKE_AUTH_MODE=warn|enforce`:
 ```sql
 -- client credentials, minted and refreshed by the extension
 ATTACH 'hoglake:my_catalog' AS lake (ENDPOINT 'http://hoglake:8080',
-    TOKEN_URL 'http://hogtower:8080/oauth/token', CLIENT_ID 'hlc_…', CLIENT_SECRET '…');
+    TOKEN_URL 'https://issuer.example/oauth/token', CLIENT_ID '…', CLIENT_SECRET '…');
 -- or a token you already hold (not refreshed; a 401 is final)
 ATTACH 'hoglake:my_catalog' AS lake (ENDPOINT 'http://hoglake:8080', TOKEN '…');
 ```
@@ -130,8 +130,8 @@ strings, and both directions of the reserved-field-id contract refuse
 typed instead of killing the instance.
 
 The bearer-auth cases are a separate script, because they need the server in
-`HOGLAKE_AUTH_MODE=enforce` (or `warn`) trusting hogtower's contract key
-(`HOGLAKE_AUTH_ISSUER=https://hogtower.contract.test`, `HOGLAKE_AUTH_JWKS_FILE`
+`HOGLAKE_AUTH_MODE=enforce` (or `warn`) trusting the contract vectors' key
+(`HOGLAKE_AUTH_ISSUER=https://hoglake.contract.test`, `HOGLAKE_AUTH_JWKS_FILE`
 holding the `jwks` object of `server/src/test/resources/oauth/contract-vectors.json`):
 
 ```bash
