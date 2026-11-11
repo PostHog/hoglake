@@ -1,6 +1,9 @@
 package com.posthog.hoglake.service
 
+import com.posthog.hoglake.model.ColType
+import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.HoglakeException
+import java.math.BigDecimal
 import java.math.BigInteger
 
 /**
@@ -93,6 +96,63 @@ object VariantShredding {
     ) {
         Walk(column).visit(declaration, "$", 0, 0, emptySet())
     }
+
+    /**
+     * The `type_params` that `set_variant_shredding` leaves on an existing
+     * column, or the refusal a column definition with the same declaration
+     * would meet (ColumnTrees.validateShredding): [def] must be a variant
+     * (else [notVariant]) at top level (else [nested], whether or not
+     * [declaration] is null, since a nested variant can declare nothing),
+     * and a non-null [declaration] must follow the grammar. [path] is the
+     * column's dotted path, resolved against stored names and so bounded.
+     *
+     * A null declaration clears: the column then carries no `type_params`
+     * at all, the shape of a variant created without one, because a
+     * variant takes no other parameter. The result is the writers' and
+     * compaction's new target; files written under the old one are not
+     * touched, and readers never consult it.
+     */
+    fun alteredTypeParams(
+        def: ColumnDef,
+        path: String,
+        nested: Boolean,
+        declaration: Any?,
+    ): Map<String, Any?>? {
+        if (def.type != ColType.VARIANT) throw notVariant(path, def.type.wire)
+        if (nested) throw nested(path)
+        if (declaration == null) return null
+        validate(declaration, path)
+        return mapOf(KEY to declaration)
+    }
+
+    /**
+     * Whether [declaration] is the one a column with [typeParams] already
+     * declares, so that `set_variant_shredding` has nothing to write.
+     *
+     * Compared as JSON VALUES, the way the grammar reads them: object key
+     * order does not matter, a number is its value whatever Java type the
+     * mapper or the store decoded it to (`18`, `18L`, a BigInteger, or
+     * `18.0` from a store that spells integers so), and "no declaration" is
+     * one thing however it is spelt — `type_params` absent, `{}`, or
+     * `{"shredding": null}`. Strings compare exactly: field names keep
+     * their case, which is their identity to the reader.
+     */
+    fun same(
+        typeParams: Map<String, Any?>?,
+        declaration: Any?,
+    ): Boolean = canonical(typeParams?.get(KEY)) == canonical(declaration)
+
+    private fun canonical(node: Any?): Any? =
+        when (node) {
+            null -> null
+            is Map<*, *> ->
+                node.entries.associateTo(sortedMapOf<String, Any?>()) { (k, v) -> k.toString() to canonical(v) }
+            is List<*> -> node.map { canonical(it) }
+            is BigDecimal -> node.stripTrailingZeros()
+            is Float, is Double -> BigDecimal((node as Number).toDouble()).stripTrailingZeros()
+            is Number -> BigDecimal(node.toString()).stripTrailingZeros()
+            else -> node
+        }
 
     /** The refusal for a declaration on a column whose type has no shredded layout. */
     fun notVariant(

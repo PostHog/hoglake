@@ -98,8 +98,13 @@ MILLRACE_VARIANT_SOURCES=properties_sv=properties
 ```
 
 The shredded layout comes from the live column's
-`type_params.shredding` only (no alter changes it), never from millrace
-configuration. A live variant column is not reported as a difference
+`type_params.shredding` only, never from millrace configuration. An
+operator changes it with `ops.set_variant_shredding(name, decl)`: the
+alter is a DDL snapshot, so the next commit built on the cached shape is
+refused `ddl_since_read_snapshot`, millrace re-reads the table and
+rebuilds that flush on the new declaration, and every file from then on
+is laid out in it. Files already written keep their layout (the server
+holds no file to the declaration; readers use each file's own footer). A live variant column is not reported as a difference
 from `MILLRACE_TABLE_COLUMNS`, which cannot name one, so the operator
 adds it without touching that knob.
 
@@ -191,8 +196,9 @@ never from payload keys):
 - `millrace_variant_invalid_total{column, reason}`;
 - `millrace_variant_values_total{column, path, outcome}`, per declared
   path, outcome `typed`, `fallback` (kept in `value`: the type did not
-  match) or `variant_null`. A high fallback share means the immutable
-  declaration does not fit the data;
+  match) or `variant_null`. A high fallback share means the declaration
+  does not fit the data — the case for replacing it with
+  `ops.set_variant_shredding` (VARIANT columns, above);
 - `millrace_variant_encode_seconds_total{column, backend}`, the wall
   seconds of the column's encode calls, less `PYHOGLAKE_VARIANT_SHADOW`'s,
   under the process's codec (`native` or `python`; calls `auto` gives

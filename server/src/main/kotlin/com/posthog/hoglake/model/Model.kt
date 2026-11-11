@@ -648,6 +648,21 @@ sealed class AlterOp {
      * no unset: see AlterService.setObjectPrefixField.
      */
     data class SetObjectPrefixField(val name: String) : AlterOp()
+
+    /**
+     * Replace the shredded layout the top-level variant column [name]
+     * declares in `type_params.shredding` ([shredding] is the JSON
+     * declaration as the wire mapper decodes it; null clears it, and the
+     * column then carries no `type_params`). The declaration is the
+     * target writers and compaction lay the column out in; no file is
+     * checked against it or rewritten for it. Validated as a column
+     * definition's declaration is (VariantShredding), refused on a
+     * column of another type or a nested variant. Re-declaring what the
+     * column already declares (compared as JSON values) writes nothing,
+     * and a request of only such ops mints no snapshot: see
+     * AlterService.setVariantShredding.
+     */
+    data class SetVariantShredding(val name: String, val shredding: Any?) : AlterOp()
 }
 
 data class CatalogInfo(

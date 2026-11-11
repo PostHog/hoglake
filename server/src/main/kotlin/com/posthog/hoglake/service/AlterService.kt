@@ -29,6 +29,7 @@ import com.posthog.hoglake.persistence.SnapshotRepo
 import com.posthog.hoglake.persistence.SortRepo
 import com.posthog.hoglake.persistence.SpecRepo
 import com.posthog.hoglake.persistence.TableRepo
+import com.posthog.hoglake.persistence.TableRow
 import com.posthog.hoglake.stats.IcebergSingleValue
 import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.Jdbi
@@ -129,7 +130,35 @@ class AlterService(private val jdbi: Jdbi) : AlterBackend {
                         )
                     }
                 }
+                // Live shape as of the head, read under the lock: no commit
+                // or DDL can move it until this transaction ends, so it is
+                // the pre-alter head whether or not a snapshot is minted.
+                val head = CatalogRepo.findByName(h, catalog)!!.headSnapshotId
+                val state =
+                    TableState(
+                        cols = TableRepo.columnsAt(h, cat.catalogId, t.tableId, head),
+                        name = t.name,
+                        comment = t.comment,
+                        properties = t.properties,
+                        spec = SpecRepo.specAt(h, cat.catalogId, t.tableId, head),
+                        sortSpec = SortRepo.sortSpecAt(h, cat.catalogId, t.tableId, head),
+                        objectPrefixFieldId = LayoutRepo.layoutAt(h, cat.catalogId, t.tableId, head),
+                    )
+
+                // A request of nothing but set_variant_shredding ops that
+                // each re-declare what their column already declares mints
+                // NO snapshot: see setVariantShredding. Decided here, before
+                // the allocation, because every other op writes under the
+                // allocated snapshot; and exact, because no op in such a
+                // request changes the state the next one is judged against.
+                // Each op is still resolved and validated, so a bad one is
+                // the same 422 it would be in a request that commits.
+                if (ops.all { it is AlterOp.SetVariantShredding && unchangedVariantShredding(state, it) }) {
+                    return@inTransactionUnchecked receipt(h, cat.catalogId, t, ns.name, state, head, exact = false)
+                }
+
                 val alloc = CatalogRepo.allocateSnapshot(h, cat.catalogId)
+                check(alloc.snapshotId == head + 1) { "head moved under the commit lock: $head -> ${alloc.snapshotId}" }
                 SnapshotRepo.insert(h, cat.catalogId, alloc.snapshotId, alloc.schemaVersion, author, message)
                 SnapshotRepo.insertChange(
                     h,
@@ -138,57 +167,72 @@ class AlterService(private val jdbi: Jdbi) : AlterBackend {
                     ChangeKind.TABLE_ALTERED,
                     t.tableId,
                 )
-
-                // Live shape as of the pre-alter head (read under the lock).
-                val state =
-                    TableState(
-                        cols = TableRepo.columnsAt(h, cat.catalogId, t.tableId, alloc.snapshotId - 1),
-                        name = t.name,
-                        comment = t.comment,
-                        properties = t.properties,
-                        spec = SpecRepo.specAt(h, cat.catalogId, t.tableId, alloc.snapshotId - 1),
-                        sortSpec = SortRepo.sortSpecAt(h, cat.catalogId, t.tableId, alloc.snapshotId - 1),
-                        objectPrefixFieldId = LayoutRepo.layoutAt(h, cat.catalogId, t.tableId, alloc.snapshotId - 1),
-                    )
                 for (op in ops) {
                     applyOp(h, cat.catalogId, t.tableId, ns.namespaceId, namespace, alloc.snapshotId, state, op)
                 }
-
-                // STAYS EXACT, deliberately (#232). This is the only
-                // other server caller of `aggregateAt`, and it cannot
-                // use the maintenance sampler's totals: the snapshot it
-                // must answer for was allocated in THIS transaction, so
-                // no published generation can have seen it. It is also
-                // the right trade on cost — a DDL receipt is rare (a
-                // schema change, not a flush) and already pays for the
-                // per-catalog commit lock, beside which one aggregate is
-                // noise. The freshness fields stay null: an exact
-                // number has no age.
-                val agg = FileRepo.aggregateAt(h, cat.catalogId, t.tableId, alloc.snapshotId)
-                TableInfo(
-                    tableId = t.tableId,
-                    tableUuid = t.tableUuid,
-                    namespace = ns.name,
-                    name = state.name,
-                    comment = state.comment,
-                    properties = state.properties,
-                    columns = state.cols.sortedBy { it.ordinal },
-                    // The alter's own snapshot, which is what this
-                    // TableInfo is resolved at.
-                    readSnapshotId = alloc.snapshotId,
-                    recordCount = agg.recordCount,
-                    fileCount = agg.fileCount,
-                    fileSizeBytes = agg.fileSizeBytes,
-                    partitionSpec = state.spec,
-                    sortSpec = state.sortSpec,
-                    // Top-level by construction, and present: the field can
-                    // be neither dropped nor renamed while the option is on.
-                    objectPrefixField =
-                        state.objectPrefixFieldId?.let { id -> state.cols.single { it.fieldId == id }.def.name },
-                    snapshotId = alloc.snapshotId,
-                )
+                receipt(h, cat.catalogId, t, ns.name, state, alloc.snapshotId, exact = true)
             }
         }
+
+    /**
+     * The alter's receipt: the table as [state] left it, resolved at
+     * [snapshot] — the alter's own snapshot, or the unmoved head when the
+     * request changed nothing.
+     *
+     * [exact] totals (a changing alter) are `FileRepo.aggregateAt`, which
+     * STAYS EXACT, deliberately (#232): this is the only other server
+     * caller of it, and it cannot use the maintenance sampler's totals,
+     * because the snapshot it must answer for was allocated in THIS
+     * transaction, so no published generation can have seen it. It is
+     * also the right trade on cost — a DDL receipt is rare (a schema
+     * change, not a flush) and already pays for the per-catalog commit
+     * lock, beside which one aggregate is noise. The freshness fields
+     * stay null: an exact number has no age.
+     *
+     * A no-op receipt (`exact = false`) has neither justification: it
+     * answers for the head a GET would answer for, and a reconcile script
+     * is invited to issue it on every deploy — a scan of every live file
+     * row under the commit lock, with every commit on the catalog waiting,
+     * for a request that changed nothing. So it answers as a head GET
+     * does: the sampler's totals with their freshness fields
+     * ([sampledTotals], one indexed row read), or no totals at all while
+     * the sampler has none — null, never 0.
+     */
+    private fun receipt(
+        h: Handle,
+        catalogId: Long,
+        t: TableRow,
+        namespace: String,
+        state: TableState,
+        snapshot: Long,
+        exact: Boolean,
+    ): TableInfo {
+        val agg = if (exact) FileRepo.aggregateAt(h, catalogId, t.tableId, snapshot) else null
+        val sampled = if (exact) null else sampledTotals(h, catalogId, t.tableId)
+        return TableInfo(
+            tableId = t.tableId,
+            tableUuid = t.tableUuid,
+            namespace = namespace,
+            name = state.name,
+            comment = state.comment,
+            properties = state.properties,
+            columns = state.cols.sortedBy { it.ordinal },
+            // The snapshot this TableInfo is resolved at.
+            readSnapshotId = snapshot,
+            recordCount = agg?.recordCount ?: sampled?.recordCount,
+            fileCount = agg?.fileCount ?: sampled?.fileCount,
+            fileSizeBytes = agg?.fileSizeBytes ?: sampled?.fileSizeBytes,
+            totalsSnapshotId = sampled?.snapshotId,
+            totalsAsOf = sampled?.asOf,
+            partitionSpec = state.spec,
+            sortSpec = state.sortSpec,
+            // Top-level by construction, and present: the field can
+            // be neither dropped nor renamed while the option is on.
+            objectPrefixField =
+                state.objectPrefixFieldId?.let { id -> state.cols.single { it.fieldId == id }.def.name },
+            snapshotId = snapshot,
+        )
+    }
 
     /** Audit-detail summary of an op list: op kinds with counts, in order of first appearance. */
     private fun summarize(ops: List<AlterOp>): String =
@@ -242,6 +286,7 @@ class AlterService(private val jdbi: Jdbi) : AlterBackend {
         is AlterOp.SetPartitionSpec -> setPartitionSpec(h, catalogId, tableId, snapshot, state, op)
         is AlterOp.SetSortOrder -> setSortOrder(h, catalogId, tableId, snapshot, state, op)
         is AlterOp.SetObjectPrefixField -> setObjectPrefixField(h, catalogId, tableId, snapshot, state, op)
+        is AlterOp.SetVariantShredding -> setVariantShredding(h, catalogId, tableId, snapshot, state, op)
         is AlterOp.SetColumnComment -> {
             TableMetadata.validateComment(op.comment)
             val located = requireColumn(state, op.name)
@@ -1149,6 +1194,85 @@ class AlterService(private val jdbi: Jdbi) : AlterBackend {
                     )
         }
         return Located(current!!, parent)
+    }
+
+    /**
+     * Replace (or, with a null declaration, clear) the shredded layout a
+     * top-level variant column declares. The column keeps its field id,
+     * the way a comment change or a rename does: the row is ended and a
+     * replacement with the new `type_params` begins at [snapshot].
+     *
+     * Nothing about the table's FILES is checked or changed. The
+     * declaration is the target that writers which honour one (pyhoglake,
+     * the Trino connector) lay the column out in and that compaction
+     * copies into; each file's footer carries its own layout and readers
+     * use that, so files written under the old declaration stay as they
+     * are and keep reading.
+     *
+     * Re-declaring what the column already declares — compared as JSON
+     * values, [VariantShredding.same] — writes NOTHING: no column row, and
+     * when the whole request is such ops, no snapshot either (alterTable).
+     * This departs from set_column_comment and set_object_prefix_field,
+     * which commit a snapshot for a no-change request, deliberately: a
+     * setup or reconcile script re-applies declarations on every deploy,
+     * and a DDL snapshot it did not need would refuse every in-flight
+     * prepared commit (ddl_since_read_snapshot) for a change nobody made.
+     * A changed declaration commits like any other alter: a DDL snapshot,
+     * which a writer holding an older read_snapshot meets as
+     * ddl_since_read_snapshot and re-reads for.
+     */
+    private fun setVariantShredding(
+        h: Handle,
+        catalogId: Long,
+        tableId: Long,
+        snapshot: Long,
+        state: TableState,
+        op: AlterOp.SetVariantShredding,
+    ) {
+        val (located, params) = resolveVariantShredding(state, op)
+        val col = located.column
+        if (VariantShredding.same(col.def.typeParams, op.shredding)) return
+        val updated = col.copy(def = col.def.copy(typeParams = params))
+        endOrDeleteColumnRow(h, catalogId, tableId, col.fieldId, snapshot)
+        TableRepo.insertColumns(
+            h,
+            catalogId,
+            tableId,
+            snapshot,
+            listOf(updated.copy(children = emptyList())),
+            located.parent?.fieldId,
+        )
+        state.cols = replaceNode(state.cols, col.fieldId) { updated }
+    }
+
+    /**
+     * The column a set_variant_shredding op addresses and the `type_params`
+     * it asks for, or the refusal: unknown path, not a variant, nested, or
+     * a declaration outside the grammar. Shared by the write and by the
+     * no-op decision, so both refuse identically.
+     */
+    private fun resolveVariantShredding(
+        state: TableState,
+        op: AlterOp.SetVariantShredding,
+    ): Pair<Located, Map<String, Any?>?> {
+        val located = requireColumn(state, op.name)
+        val params =
+            VariantShredding.alteredTypeParams(
+                located.column.def,
+                op.name,
+                nested = located.parent != null,
+                op.shredding,
+            )
+        return located to params
+    }
+
+    /** Whether [op], validated, re-declares what its column declares in [state] (so it writes nothing). */
+    private fun unchangedVariantShredding(
+        state: TableState,
+        op: AlterOp.SetVariantShredding,
+    ): Boolean {
+        val (located, _) = resolveVariantShredding(state, op)
+        return VariantShredding.same(located.column.def.typeParams, op.shredding)
     }
 
     /** Resolve a dotted path that must name an existing struct (add_column's `parent`). */
