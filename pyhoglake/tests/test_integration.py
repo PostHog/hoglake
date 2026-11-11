@@ -1478,6 +1478,151 @@ def test_compaction_copies_a_declared_variant_table(catalog, ns, s3config):
     assert values() == before
 
 
+def test_compaction_after_set_variant_shredding_compacts_each_layout_apart(
+    catalog, ns, s3config
+):
+    """Writer, alter, writer, compaction: files ``Table.append`` wrote under
+    one declaration (D1), ``ops.set_variant_shredding`` to D2, more files
+    under D2 into the same partition, then the server's sweeps
+    (HOGLAKE_COMPACTION_VARIANT on, as ci/live-python.sh sets it). The
+    sweeps compact D1's files among themselves into D1 and D2's into D2,
+    refuse nothing, and every row reads back as before; an equal
+    re-declaration before the sweeps mints no snapshot."""
+    from dataclasses import replace
+
+    from pyhoglake._variant_codec import compile_plan
+    from pyhoglake.parquet_schema import variant_layout_fault
+
+    if "mutable-variant-shredding-v1" not in catalog.info.capabilities:
+        pytest.skip("the server does not declare mutable-variant-shredding-v1")
+
+    d1 = {
+        "type": "object",
+        "fields": [
+            {"name": "$browser", "type": "string"},
+            {"name": "$os", "type": "string"},
+        ],
+    }
+    d2 = {
+        "type": "object",
+        "fields": [
+            {"name": "$browser", "type": "string"},
+            {"name": "price", "type": "decimal8", "precision": 18, "scale": 2},
+            {"name": "tags", "type": "array", "element": {"type": "string"}},
+        ],
+    }
+    table = ns.create_table(
+        "variant_relayout_compact",
+        pa.schema(
+            [
+                pa.field("id", pa.int64(), nullable=False),
+                variant_field("properties", d1),
+            ]
+        ),
+    )
+    rows = [
+        '{"$browser": "Chrome", "$os": "mac", "price": 9.5, "tags": ["a", "b"]}',
+        '{"$browser": 5, "$os": {"v": 1}, "price": "free"}',
+        '{"tags": [1, null], "extra": {"deep": [true]}}',
+        "{}",
+        "null",
+        None,
+        '"text"',
+        "[1, 2]",
+    ]
+    schema = columns_to_arrow_schema(table.columns, variant="json")
+    # Over the server's default HOGLAKE_COMPACTION_MIN_INPUT_FILES=5 for
+    # EACH layout, so both have the files for a rewrite.
+    per_layout = 6
+
+    def append(index: int) -> tuple[str, set[int]]:
+        ids = list(range(index * len(rows), (index + 1) * len(rows)))
+        texts = rows[index % len(rows) :] + rows[: index % len(rows)]
+        data = pa.table(
+            {"id": ids, "properties": pa.array(texts, pa.string()).cast(pa.json_())},
+            schema=schema,
+        )
+        (f,) = table.append(data).files
+        return f.path, set(ids)
+
+    d1_inputs = dict(append(i) for i in range(per_layout))
+    d1_ids = set().union(*d1_inputs.values())
+
+    info = table.alter([ops.set_variant_shredding("properties", d2)])
+    column = next(c for c in info.columns if c.name == "properties")
+    assert column.type_params == {"shredding": d2}
+    d2_inputs = dict(append(i) for i in range(per_layout, 2 * per_layout))
+    d2_ids = set().union(*d2_inputs.values())
+    inputs = {**d1_inputs, **d2_inputs}
+    assert len(inputs) == 2 * per_layout
+
+    # An equal re-declaration, before the sweeps: no snapshot.
+    head = catalog.refresh().head_snapshot_id
+    same = table.alter([ops.set_variant_shredding("properties", dict(d2))])
+    assert same.snapshot_id == head
+    assert catalog.refresh().head_snapshot_id == head
+
+    under = {
+        "d1": (replace(column, type_params={"shredding": d1}), compile_plan(d1)),
+        "d2": (column, compile_plan(d2)),
+    }
+    fs = s3config.filesystem()
+
+    def layout_of(body: bytes) -> str:
+        elements = _schema_elements(body)
+        (start,) = [i for e, _, i in _top_level(elements) if e.get(4) == "properties"]
+        held = [
+            name
+            for name, (col, plan) in under.items()
+            if variant_layout_fault(elements, start, col, plan) is None
+        ]
+        assert len(held) == 1, held
+        return held[0]
+
+    def read_all() -> tuple[dict[int, object], dict[str, tuple[str, set[int]]]]:
+        """Every row's value by id, and each live file's layout and ids."""
+        values: dict[int, object] = {}
+        files: dict[str, tuple[str, set[int]]] = {}
+        for f in table.files(snapshot=catalog.refresh().head_snapshot_id):
+            body = fs.open_input_file(f.path[len("s3://") :]).read()
+            back = pq.read_table(pa.BufferReader(body))
+            ids = back.column("id").to_pylist()
+            # Neither column nor shredding: read whatever layout the file has.
+            props = variant.to_python(back.column("properties"))
+            values.update(zip(ids, props, strict=True))
+            files[f.path] = (layout_of(body), set(ids))
+        return values, files
+
+    before, files_before = read_all()
+    assert len(before) == 2 * per_layout * len(rows)
+    assert {path: ids for path, (_, ids) in files_before.items()} == inputs
+    assert {files_before[p][0] for p in d1_inputs} == {"d1"}
+    assert {files_before[p][0] for p in d2_inputs} == {"d2"}
+
+    compacted = 0
+    for _ in range(5):
+        result = catalog._client._request(
+            "POST", catalog._path("/maintenance/compact"), params={"batch": 10}
+        )
+        assert result["unconvertible_schema"] == 0, result
+        assert result["failed_groups"] == 0, result
+        if result["groups_compacted"] == 0:
+            break
+        compacted += result["groups_compacted"]
+    assert compacted >= 2
+
+    after, files_after = read_all()
+    assert after == before
+    assert not set(files_after) & set(inputs), "every input was compacted away"
+    assert len(files_after) < len(inputs)
+    by_layout: dict[str, set[int]] = {"d1": set(), "d2": set()}
+    for layout, ids in files_after.values():
+        by_layout[layout] |= ids
+    # D1's files compacted among themselves, into D1; D2's into D2, the
+    # declared layout — no output mixes the two.
+    assert by_layout == {"d1": d1_ids, "d2": d2_ids}
+
+
 def test_drop_table(catalog, ns):
     table = ns.create_table("droppable", _events_schema())
     assert "droppable" in [t.name for t in ns.list_tables()]
