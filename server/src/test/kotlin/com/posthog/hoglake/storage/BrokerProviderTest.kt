@@ -189,20 +189,23 @@ class BrokerProviderTest {
         provider().use { p ->
             val write = p.credentialsFor("acme", "s3://b/acme/", StorageAccess.WRITE)
             val read = p.credentialsFor("acme", "s3://b/acme/", StorageAccess.READ)
+            val delete = p.credentialsFor("acme", "s3://b/acme/", StorageAccess.DELETE)
             val other = p.credentialsFor("other", "s3://b/other/", StorageAccess.READ)
 
             repeat(3) { write.resolveCredentials() }
             assertThat(broker.vendRequests).hasSize(1)
             read.resolveCredentials()
+            delete.resolveCredentials()
             other.resolveCredentials()
-            assertThat(broker.vendRequests).hasSize(3)
+            assertThat(broker.vendRequests).hasSize(4)
             assertThat(broker.vendRequests.map { broker.json.readTree(it.body).get("access").asText() })
-                .containsExactly("write", "read", "read")
+                .containsExactly("write", "read", "delete", "read")
             assertThat(broker.tokenRequests).hasSize(1)
             assertThat(p.held().keys.map { it.catalog to it.access })
                 .containsExactlyInAnyOrder(
                     "acme" to StorageAccess.WRITE,
                     "acme" to StorageAccess.READ,
+                    "acme" to StorageAccess.DELETE,
                     "other" to StorageAccess.READ,
                 )
         }

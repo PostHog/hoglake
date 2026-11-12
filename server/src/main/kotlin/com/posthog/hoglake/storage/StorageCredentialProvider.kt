@@ -10,16 +10,18 @@ import java.net.URI
 import java.time.Duration
 
 /**
- * What a job asks the provider for. The server's own work is either a
- * read (the hydrator's footer fetches) or a rewrite (compaction's
- * multipart uploads, cleanup's deletes): [WRITE] INCLUDES DELETE, so a
- * broker that grants `write` grants `s3:DeleteObject` on the prefix too.
- * There is no delete-only level because nothing needs one — cleanup is
- * the only deleter and the staging outputs it reaps are compaction's.
+ * What a job asks the provider for, each level including the one
+ * before: [READ] (the hydrator's footer fetches), [WRITE] (compaction's
+ * reads plus its put and multipart uploads — and NO delete, so a leaked
+ * or buggy compaction session cannot remove a tenant's referenced
+ * files), [DELETE] (cleanup's drain of `hog_file_removal`, the one job
+ * that deletes). A broker grants `s3:DeleteObject` on the prefix only
+ * for `delete`.
  */
 enum class StorageAccess(val wire: String) {
     READ("read"),
     WRITE("write"),
+    DELETE("delete"),
 }
 
 /**

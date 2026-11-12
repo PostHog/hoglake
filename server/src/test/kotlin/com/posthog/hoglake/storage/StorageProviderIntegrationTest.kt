@@ -293,7 +293,7 @@ class StorageProviderIntegrationTest {
         assertThat(output.path).isNotIn(inputs)
         assertThat(seed.get(output.path)).describedAs("the output is really there").isNotEmpty()
         val vends = vendsFor(cat)
-        assertThat(vends.map { it.access }).containsOnly("write")
+        assertThat(vends.map { it.access }).describedAs("compaction never asks for delete").containsOnly("write")
         assertThat(vends.map { it.prefix }).containsOnly("s3://$BUCKET/$cat")
         assertThat(vends).describedAs("one write session per catalog, cached across groups").hasSize(1)
     }
@@ -324,7 +324,7 @@ class StorageProviderIntegrationTest {
         assertThat(seedRemovals.exists(gone)).isFalse()
         val vends = vendsFor(cat)
         assertThat(vends).hasSize(1)
-        assertThat(vends.single().access).isEqualTo("write")
+        assertThat(vends.single().access).describedAs("cleanup is the one job that deletes").isEqualTo("delete")
         assertThat(vends.single().prefix).isEqualTo("s3://$BUCKET/$cat")
         // The token was exchanged once for the whole provider, not per vend.
         assertThat(broker.tokens.get()).isEqualTo(1)

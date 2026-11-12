@@ -165,12 +165,13 @@ open class RemovalStore private constructor(
      * so a fault-injecting test store keeps injecting), a thin view over
      * this store's client that signs each request with the catalog's own
      * session under `broker`, cached for the life of the base store.
-     * Deletes need [StorageAccess.WRITE]; there is no delete-only grant.
+     * Deletes need [StorageAccess.DELETE], the one level that carries
+     * `s3:DeleteObject`; cleanup is the only job that asks for it.
      */
     fun forCatalog(
         catalog: String,
         prefix: String,
-        access: StorageAccess = StorageAccess.WRITE,
+        access: StorageAccess = StorageAccess.DELETE,
     ): RemovalStore {
         if (!provider.scoped) return this
         check(credentials == null) { "forCatalog on a catalog view" }
@@ -866,7 +867,7 @@ class CleanupService(
         // session the provider granted for exactly these objects, under
         // the unscoped providers the shared store itself. One view per
         // run, shared by every worker.
-        val objects = store.forCatalog(catalog, catalogInfo.dataPath, StorageAccess.WRITE)
+        val objects = store.forCatalog(catalog, catalogInfo.dataPath, StorageAccess.DELETE)
         // What this run has already handled. A still-referenced row (and
         // a row whose delete failed) has its claim RELEASED so the next
         // run, and an operator reading the queue, can see it — which also
