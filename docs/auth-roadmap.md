@@ -80,10 +80,11 @@ means the PR has review approval and is waiting on CI or a merge.
       --scope … --ttl … [--operator]`, offline, no HTTP endpoint
 - [x] **hoglake** The standalone path documented end to end: `local`, a
       minted fixed token in each client, the client's own storage credentials
-- [ ] **hoglake** The storage provider interface behind the hydrator,
+- [x] **hoglake** The storage provider interface behind the hydrator,
       compaction, snapshot expiry, quarantine and cleanup, and the manual
       maintenance routes: `HOGLAKE_STORAGE_PROVIDER=ambient|static|broker`
-- [ ] **hoglake** `broker`: `POST <url>` with `{catalog, prefix, access}` under
+      (expiry and storage usage touch no S3; quarantine is the hydrator's)
+- [x] **hoglake** `broker`: `POST <url>` with `{catalog, prefix, access}` under
       OAuth client credentials, answered with an STS-shaped session; one
       session per job, one catalog, in memory, refreshed before expiry
 - [ ] **hogtower** The broker's server side: a service credential per hoglake

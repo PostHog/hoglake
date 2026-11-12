@@ -47,6 +47,7 @@ import com.posthog.hoglake.service.ScanService
 import com.posthog.hoglake.service.TableCreationService
 import com.posthog.hoglake.service.UploadService
 import com.posthog.hoglake.service.ViewService
+import com.posthog.hoglake.storage.StorageCredentialProviders
 import com.posthog.hoglake.store.CatalogStore
 import com.posthog.hoglake.store.CatalogStoreSelector
 import com.posthog.hoglake.store.MountHostResolver
@@ -219,8 +220,18 @@ class App private constructor(
         )
     }
 
+    /**
+     * Where the server's own jobs get S3 credentials — ONE provider,
+     * shared by the read/put store and the delete store, so under
+     * `broker` the token and the per-catalog sessions are fetched once,
+     * not once per store.
+     */
+    private val storageProvider by lazy {
+        StorageCredentialProviders.fromConfig(cfg)
+    }
+
     private val removalStore by lazy {
-        RemovalStore(cfg)
+        RemovalStore(cfg, storageProvider)
     }
 
     /**
@@ -267,7 +278,7 @@ class App private constructor(
 
     /** Shared read/put store: hydrator footer reads + compaction rewrites. */
     private val objectStore by lazy {
-        ObjectStore(cfg)
+        ObjectStore(cfg, storageProvider)
     }
 
     /** One hydrator: the background sweep loop AND the rehydrate route. */

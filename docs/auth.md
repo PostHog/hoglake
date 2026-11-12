@@ -226,10 +226,28 @@ chosen per deployment:
 | --- | --- |
 | `ambient` (default) | the SDK's default chain: a pod identity in Kubernetes, an instance profile, or the environment |
 | `static` | `HOGLAKE_S3_ACCESS_KEY` and `HOGLAKE_S3_SECRET_KEY`: MinIO, local development, CI, the compose quickstart |
-| `broker` (planned) | an HTTP call to a configured URL, authenticated with hoglake's own client credential against a configured token URL: `POST <url>` with `{"catalog", "prefix", "access": "read" \| "write"}`, answered with `{"access_key_id", "secret_access_key", "session_token", "expiration"}`, STS's shape. One session per job, scoped to one catalog, held in memory and refreshed before it expires; never written to the metadata store |
+| `broker` | an HTTP call to `HOGLAKE_STORAGE_BROKER_URL`, authenticated with hoglake's own client credential (`HOGLAKE_STORAGE_BROKER_CLIENT_ID` / `_CLIENT_SECRET`) exchanged at `HOGLAKE_STORAGE_BROKER_TOKEN_URL`: `POST <url>` with `{"catalog", "prefix", "access": "read" \| "write"}`, answered with `{"access_key_id", "secret_access_key", "session_token", "expiration"}`, STS's shape (`session_token` may be absent for a broker that vends expiring keys instead). One session per catalog and access, held in memory and refreshed `HOGLAKE_STORAGE_BROKER_REFRESH_MARGIN_SECONDS` (default 300) before it expires; never written to the metadata store |
 
-`ambient` and `static` are what hoglake does today (static keys when both are
-set, otherwise the SDK chain), so an existing install changes nothing.
+`HOGLAKE_STORAGE_PROVIDER` selects one. Unset, it is `static` when both keys
+are set and `ambient` otherwise — what hoglake did before the knob existed, so
+an existing install changes nothing. The combination is checked at boot: an
+explicit `static` without both keys, an explicit `ambient` or `broker` beside
+keys, or a `broker` missing a setting refuses to start.
+
+`access` has two values and `write` includes delete: compaction reads its
+inputs and uploads its output, cleanup deletes, and nothing needs a
+delete-only grant. The hydrator asks for `read`. The token request is the
+clients' client-credentials form, `grant_type=client_credentials` with
+`audience` = `HOGLAKE_STORAGE_BROKER_AUDIENCE` (default `hoglake`). Both
+URLs must be `https` — the client secret and every vended key cross that
+hop — with `http` accepted only for `localhost`, `127.0.0.1` or `[::1]`,
+the dev stack's and the test suite's in-process brokers; anything else
+refuses to start. The refresh lead is the margin or half the credential's
+lifetime, whichever is shorter, for the session and for the bearer token
+alike, so a 300-second session is still cached for 150 seconds rather than
+re-vended on every request. A refresh that fails is not retried by the
+next request: while the held session is valid the provider waits 5 seconds
+before trying again, doubling to a minute, and resets on success.
 `broker` is how a deployment puts the server's own S3 access behind the same
 authority as its clients' access: the server then holds no cloud identity of
 its own, and every session it uses is one the broker chose to grant and can
@@ -242,9 +260,16 @@ Whatever the provider, it serves only the server's own work: the background
 jobs, and the same work when a caller with `maintenance` scope triggers it
 through `POST /v1/catalogs/{catalog}/maintenance/compact` or
 `…/maintenance/cleanup`, which run compaction or cleanup inline and read and
-rewrite S3 with the server's credentials. Ordinary metadata requests never
-call the provider and never read S3, and nothing fetches credentials for a
-client.
+rewrite S3 with the server's credentials. Every one of those paths takes its
+S3 client for ONE catalog: a compaction run and a cleanup drain are per
+catalog by construction, and the hydrator's sweep, which claims files from
+every catalog at once, holds one read session per catalog it touches. Under
+`broker` a session is cached for the life of the process and refreshed in
+place; a refresh that fails keeps the session already held for as long as it
+is valid, and only a job with nothing valid to use fails. A client built
+without a catalog refuses to do IO under `broker` rather than reaching for a
+credential it has no grant for. Ordinary metadata requests never call the
+provider and never read S3, and nothing fetches credentials for a client.
 
 A deployment that wants storage access gated by the same authority as the
 tokens does it on the issuer side: the issuer returns scoped, short-lived
@@ -343,10 +368,11 @@ Built: `off`, `warn`, `enforce`; ES256 and RS256 verification against a JWKS
 file or URL; the four scopes and the route table; the `scope` claim; scoped
 tokens with `prd` and a configurable lifetime cap; `ten` defaulting to
 `tenant`; `rtg`; the public and metrics listeners; contract vectors generated
-here; the local issuer (`local`, `hoglake token keygen` and `mint`); client
-credentials and fixed tokens in pyhoglake, the DuckDB extension, hedgerow and
-the Trino connector.
+here; the `ambient`, `static` and `broker` storage providers behind the
+server's own jobs; the local issuer (`local`, `hoglake token keygen` and
+`mint`); client credentials and fixed tokens in pyhoglake, the DuckDB
+extension, hedgerow and the Trino connector.
 
-Tracked in [#574](https://github.com/PostHog/hoglake/issues/574): the `broker` storage provider; a fixed-token
+Tracked in [#574](https://github.com/PostHog/hoglake/issues/574): a fixed-token
 option in the Trino connector; client credentials in millrace; the `jti` and
 multi-issuer decisions.
