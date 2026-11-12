@@ -11,7 +11,7 @@ import org.jdbi.v3.core.mapper.RowMapper
 
 /**
  * `hog_mount` (V35), the mounts of this instance's PostgreSQL. Only
- * `PUT /v1/mounts/{name}` writes it (hogtower's events mount loop, plan 3.5),
+ * `PUT /v1/mounts/{name}` writes it (the configured mount writer, an issuer's loop),
  * with CAS on the revision the writer read. A row is never deleted, so a
  * revision never resets.
  *

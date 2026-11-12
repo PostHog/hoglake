@@ -45,8 +45,8 @@ class MaintenanceStatusService(
     private val minInputFiles: Int = CompactionGrouping.DEFAULT_MIN_INPUT_FILES,
     private val maxInputFiles: Int = CompactionGrouping.DEFAULT_MAX_INPUT_FILES,
     private val runStore: MaintenanceRunStore = MaintenanceRunStore(jdbi),
-) {
-    fun status(catalog: String): MaintenanceStatus =
+) : MaintenanceStatusBackend {
+    override fun status(catalog: String): MaintenanceStatus =
         jdbi.inTransactionUnchecked { h ->
             h.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
             val cat = CatalogRepo.require(h, catalog)
@@ -231,7 +231,7 @@ class MaintenanceStatusService(
         )
     }
 
-    fun runs(
+    override fun runs(
         catalog: String,
         task: MaintenanceTask?,
         before: Long?,

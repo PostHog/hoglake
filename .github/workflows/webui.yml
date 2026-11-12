@@ -108,7 +108,7 @@ jobs:
           case "$code" in 502|504) : ;; *) echo "expected 502/504"; exit 1 ;; esac
 
   deploy:
-    # GATED ON CI — see server.yml's deploy job for the decision note.
+    # GHCR publication requires the web UI test suite.
     needs: [webui-test]
     if: github.event_name == 'push' && github.repository == 'PostHog/hoglake'
     runs-on: ubuntu-latest
@@ -148,49 +148,3 @@ jobs:
             ghcr.io/posthog/hoglake-webui:latest
           cache-from: type=gha,scope=webui
           cache-to: type=gha,scope=webui,mode=max
-
-      - name: Get image digest
-        id: digest
-        run: |
-          digest=$(docker buildx imagetools inspect --raw ghcr.io/posthog/hoglake-webui:${{ github.sha }} | sha256sum | awk '{print "sha256:"$1}')
-          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
-
-      - name: Get deployer token
-        id: deployer
-        uses: getsentry/action-github-app-token@5c1e90706fe007857338ac1bfbd7a4177db2f789 # v4.0.0
-        with:
-          app_id: ${{ secrets.GH_APP_CHARTS_DEPLOYER_APP_ID }}
-          private_key: ${{ secrets.GH_APP_CHARTS_DEPLOYER_PRIVATE_KEY }}
-
-      # Same trim as server.yml's deploy: repository_dispatch caps
-      # client_payload at ~64KB and a squash-merge message is the PR
-      # title plus its whole body (#69's was 74KB, rejecting the
-      # dispatch). Message via env, never interpolated into run:.
-      - name: Trim dispatch commit
-        id: dispatch_commit
-        env:
-          HEAD_COMMIT: ${{ toJson(github.event.head_commit) }}
-        run: |
-          trimmed=$(printf '%s' "$HEAD_COMMIT" | jq -c \
-            '{id, timestamp, author, committer, message: (.message | split("\n")[0] | .[0:200])}')
-          printf 'json=%s\n' "$trimmed" >> "$GITHUB_OUTPUT"
-
-      - name: Trigger deployment via Charts repo
-        uses: peter-evans/repository-dispatch@28959ce8df70de7be546dd1250a005dd32156697 # v4.0.1
-        with:
-          token: ${{ steps.deployer.outputs.token }}
-          repository: PostHog/charts
-          event-type: commit_state_update
-          client-payload: |
-            {
-              "values": {
-                "image": {
-                  "sha": "${{ github.sha }}@${{ steps.digest.outputs.digest }}"
-                }
-              },
-              "release": "gigahog-webui",
-              "commit": ${{ steps.dispatch_commit.outputs.json }},
-              "repository": ${{ toJson(github.repository) }},
-              "labels": [],
-              "timestamp": "${{ github.event.head_commit.timestamp }}"
-            }

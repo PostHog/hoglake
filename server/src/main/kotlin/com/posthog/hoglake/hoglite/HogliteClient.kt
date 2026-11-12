@@ -15,6 +15,7 @@ import java.net.http.HttpResponse
 import java.time.Duration
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 
 /** One statement of a hoglite transaction (`/v1/t/{tid}/tx`), or the single statement of a `/query`. */
 data class HogliteStatement(
@@ -149,10 +150,12 @@ class HogliteClient(
     private val readTimeoutMs: Long = 5_000,
     private val commitTimeoutMs: Long = 10_000,
     private val retryBudgetMs: Long = 8_000,
-    circuitFailureThreshold: Int = 10,
-    circuitOpenMs: Long = 5_000,
+    private val circuitFailureThreshold: Int = 10,
+    private val circuitOpenMs: Long = 5_000,
     /** Test hook: the retry sleep. Production sleeps the thread. */
     private val sleeper: (Long) -> Unit = { Thread.sleep(it) },
+    private val shared: HogliteClient? = null,
+    private val bearerToken: String? = null,
 ) : AutoCloseable {
     init {
         require(connectTimeoutMs > 0) { "connectTimeoutMs=$connectTimeoutMs must be positive" }
@@ -164,11 +167,12 @@ class HogliteClient(
     private val log = KotlinLogging.logger {}
 
     private val http: HttpClient =
-        HttpClient.newBuilder()
+        shared?.http ?: HttpClient.newBuilder()
             .connectTimeout(Duration.ofMillis(connectTimeoutMs))
+            .followRedirects(HttpClient.Redirect.NEVER)
             .build()
 
-    private val json: ObjectMapper = jacksonObjectMapper()
+    private val json: ObjectMapper = shared?.json ?: jacksonObjectMapper()
 
     /** Which pool a URL belongs to; breakers and metrics key on it. */
     enum class Pool { STANDARD, WHALE }
@@ -182,12 +186,20 @@ class HogliteClient(
         data class Owner(val url: String) : Route()
     }
 
-    private val tenantRoutes = ConcurrentHashMap<String, Route>()
+    private val tenantRoutes: ConcurrentHashMap<String, Route> = shared?.tenantRoutes ?: ConcurrentHashMap()
 
-    private val breakers =
-        mapOf(
+    private val breakers: Map<Pool, CircuitBreaker> =
+        shared?.breakers ?: mapOf(
             Pool.STANDARD to CircuitBreaker(circuitFailureThreshold, circuitOpenMs),
             Pool.WHALE to CircuitBreaker(circuitFailureThreshold, circuitOpenMs),
+        )
+
+    /** Bind immutable request authority. Share transport, routing pins, and breakers. */
+    internal fun forRequest(token: String?): HogliteClient =
+        HogliteClient(
+            standardUrl, whaleUrl, ownerUrlPattern, connectTimeoutMs, readTimeoutMs,
+            commitTimeoutMs, retryBudgetMs, circuitFailureThreshold, circuitOpenMs,
+            sleeper, shared = shared ?: this, bearerToken = token,
         )
 
     // ---- public API -------------------------------------------------------
@@ -239,7 +251,7 @@ class HogliteClient(
                 errorCode(bytes) in GUARD_REFUSAL_CODES -> throw HogliteRejected(status, String(bytes))
                 // Never applied: the tenant does not exist, or the request
                 // was malformed before anything ran.
-                status == 400 || status == 404 -> throw HogliteRejected(status, String(bytes))
+                status in setOf(400, 401, 403, 404) -> throw HogliteRejected(status, String(bytes))
                 // 422 is a refusal only when the engine labels it one.
                 status == 422 ->
                     if (errorCode(bytes) == CODE_REFUSED) {
@@ -372,7 +384,7 @@ class HogliteClient(
     fun queryBatch(reads: List<BatchRead>): List<BatchAnswer>? {
         require(reads.size <= MAX_BATCH_READS) { "at most $MAX_BATCH_READS reads per batch, got ${reads.size}" }
         if (reads.isEmpty()) return emptyList()
-        if (System.nanoTime() < batchUnsupportedUntilNanos) return null
+        if (System.nanoTime() < batchUnsupportedUntilNanos.get()) return null
         val body =
             json.writeValueAsBytes(
                 mapOf("queries" to reads.map { mapOf("tenant" to it.tenant, "sql" to it.sql, "args" to it.args) }),
@@ -401,7 +413,7 @@ class HogliteClient(
                 // mux answers an unknown route with plain text.
                 (status == 404 || status == 405) && errorCode(bytes) == null &&
                     runCatching { json.readValue<Map<String, Any?>>(bytes)["error"] }.getOrNull() == null -> {
-                    batchUnsupportedUntilNanos = System.nanoTime() + BATCH_UNSUPPORTED_RECHECK_MS * 1_000_000
+                    batchUnsupportedUntilNanos.set(System.nanoTime() + BATCH_UNSUPPORTED_RECHECK_MS * 1_000_000)
                     log.info { "hoglite does not serve /v1/query-batch; reading tenants one by one" }
                     null
                 }
@@ -410,8 +422,8 @@ class HogliteClient(
         }
     }
 
-    @Volatile
-    private var batchUnsupportedUntilNanos = Long.MIN_VALUE
+    private val batchUnsupportedUntilNanos: AtomicLong =
+        shared?.batchUnsupportedUntilNanos ?: AtomicLong(Long.MIN_VALUE)
 
     /**
      * Create [tenant], idempotently: 200 is "created" and a 409/422
@@ -632,7 +644,7 @@ class HogliteClient(
                     // about to move (lease wait-out), so this arm backs off
                     // like the others instead of spinning hot.
                     outcomes.misdirected(repin(tenant, resp.body()))
-                    lastFailure = HogliteRejected(421, String(resp.body()))
+                    lastFailure = HogliteRejected(421, "owner handoff")
                     backoff()
                 }
                 else -> {
@@ -661,7 +673,16 @@ class HogliteClient(
         val hint =
             runCatching { json.readValue<Map<String, Any?>>(body) }.getOrNull()
         val hintClass = hint?.get("class") as? String
-        val owner = hint?.get("owner") as? String
+        val rawOwner = hint?.get("owner")
+        // Accept a DNS label and an optional per-boot nonce, never URL syntax.
+        val owner =
+            (rawOwner as? String)?.takeIf {
+                it.matches(Regex("[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-zA-Z0-9_-]{1,128})?"))
+            }?.substringBefore('.')
+        if (rawOwner != null && owner == null) {
+            if (hintClass == "whale") tenantRoutes[tenant] = Route.Whale else tenantRoutes.remove(tenant)
+            return null
+        }
         when {
             hintClass == "whale" -> tenantRoutes[tenant] = Route.Whale
             // Owner-direct routing needs the chart's headless-name pattern;
@@ -669,12 +690,11 @@ class HogliteClient(
             !owner.isNullOrBlank() && ownerUrlPattern.isNotBlank() -> {
                 // Per-boot ids carry a ".nonce" suffix; the stable pod name
                 // is what the headless service resolves.
-                val stable = owner.substringBefore('.')
-                tenantRoutes[tenant] = Route.Owner(ownerUrlPattern.replace("{owner}", stable))
+                tenantRoutes[tenant] = Route.Owner(ownerUrlPattern.replace("{owner}", owner))
             }
             else -> tenantRoutes.remove(tenant)
         }
-        return owner?.takeIf { it.isNotBlank() }?.substringBefore('.')
+        return owner
     }
 
     /**
@@ -755,6 +775,7 @@ class HogliteClient(
             HttpRequest.newBuilder(URI.create(base.trimEnd('/') + path))
                 .timeout(Duration.ofMillis(timeoutMs))
                 .header("Content-Type", "application/json")
+        bearerToken?.let { builder.header("Authorization", "Bearer $it") }
         when (method) {
             "GET" -> builder.GET()
             "DELETE" -> builder.DELETE()

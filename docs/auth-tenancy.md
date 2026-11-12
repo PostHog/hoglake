@@ -1,5 +1,13 @@
 # Auth, tenancy and S3 data-plane entitlement
 
+> **Superseded as a description of the design.** [docs/auth.md](auth.md) is
+> canonical: hoglake is a resource server that verifies tokens from whichever
+> issuer the deployment configures, owns the token contract and its vectors,
+> and depends on no particular issuer. Where this document says hogtower is
+> *the* authority, read "PostHog's issuer, for PostHog's deployment". It is
+> kept for the threat model and the reasoning; §0–§16 describe a design that
+> was not built.
+
 **Status:** the hoglake side has shipped.
 [#460](https://github.com/PostHog/hoglake/pull/460) is the enforcement layer:
 `HOGLAKE_AUTH_MODE=off|warn|enforce`, ES256 JWT verification against a JWKS file
@@ -701,6 +709,47 @@ is any lowercase identifier, the value a positive id, and the convention that
   namespace to be empty.
 - **Nothing changes until something is marked.** A catalog with no contained
   namespace refuses nothing it refused before.
+
+### 6.2c Reserved namespace names
+
+`HOGLAKE_RESERVED_NAMESPACES` (comma-separated) lists namespace names that no
+caller may create in any catalog on the server. Empty, the default, reserves
+none. PostHog's customer hoglake sets `posthog`: its Trino connector shows the
+org's events mount (`<orgID>-events`, §6.5a/§6.5b) as the read-only schema
+`posthog` inside the org's catalog, so user data must never sit under that name.
+hoglake reserves no name itself.
+
+- **One path.** `POST /v1/catalogs/{c}/namespaces` is the only way a namespace
+  is created: there is no rename, and table, view, commit and table-creation
+  routes need an existing namespace (404 otherwise). The handler refuses a
+  reserved name after the body is read and before the store is called, so
+  no snapshot is allocated and nothing reaches PostgreSQL or a hoglite engine.
+  Every client (Trino, DuckDB, pyhoglake, the web UI) goes through it.
+- **Every caller.** Operators, tenants and auth `off` alike; a scoped token
+  cannot create namespaces at all (403 before the handler).
+- **Matching.** Equal after folding ASCII `A`-`Z` to lowercase; nothing else
+  is folded, trimmed or prefix-matched (`PostHog` is refused, `posthog_raw` is
+  not). Both backends compare namespace names case-sensitively, and Trino folds
+  identifiers to lowercase and lets the mount shadow any case variant of
+  `posthog`, so an exact match would let a direct client create a namespace
+  Trino hides.
+- **The error.** 422 `validation`, "namespace name '<name>' is reserved on this
+  server", as `POST /v1/catalogs` refuses a mount-shaped catalog name.
+- **Boot.** Each entry must match the namespace identifier pattern, else the
+  server does not start.
+- **Existing namespaces are left alone.** One created before its name was
+  reserved stays listed, readable, writable and droppable; once dropped, no
+  case variant of it can be created again. The server does not look for them
+  at boot (that would scan every catalog, and open every hoglite engine). Before
+  setting the variable, look once on PostgreSQL:
+  `SELECT c.name, n.name FROM hog_namespace n JOIN hog_catalog c USING (catalog_id) WHERE NOT n.dropped AND lower(n.name) = 'posthog';`
+  and in each hoglite-placed catalog:
+  `SELECT name FROM namespaces WHERE dropped_snapshot IS NULL AND lower(name) = 'posthog';`
+- **Mounts.** A mount or mount Client catalog refuses every write first
+  (403 `read_only_catalog`), so it never reaches this check.
+- **Reserve only names nobody provisions.** The provisioner's `team_<id>`
+  namespaces (§6.2b) are created by an operator token, which the guard does not
+  exempt.
 
 ### 6.3 Scope vocabulary
 
@@ -1521,7 +1570,7 @@ control plane — shows that six of the seven decisions above put machinery in t
 wrong repo. This section is what the stack should actually be, and it is
 smaller, not larger.
 
-The short version: **hoglake is a resource server. hogtower is the authority.**
+The short version: **hoglake is a resource server; the issuer is outside it.** For PostHog's deployment that issuer is hogtower.
 hoglake verifies a token and authorizes catalog metadata, which is what the
 first PR already does. hogtower mints the token and vends the S3 credentials,
 because it already holds every input, already assumes the tenant roles, and is

@@ -258,13 +258,13 @@ class ReadScopeIntegrationTest {
 
     /**
      * #147's planned vector "a value outside the mount ... filtered out".
-     * hogtower's `tests/oauth/contract-vectors.json` does not carry it yet
-     * (#147: "added once mounts exist"), so it is built here on the token
-     * hogtower mints today: the `scoped_team` vector's caller holds teams
+     * The contract vectors (`oauth/contract-vectors.json`) do not carry it
+     * (#147: "added once mounts exist"), so it is built here on the
+     * contract's scoped token: the `scoped_team` vector's caller holds teams
      * 42 and 7, and the mount holds 42 alone.
      */
     @Test
-    fun `hogtower's scoped token reads only its values inside the mount`() {
+    fun `the contract's scoped token reads only its values inside the mount`() {
         val root =
             ObjectMapper().readTree(
                 javaClass.getResourceAsStream("/oauth/contract-vectors.json") ?: error("contract vectors missing"),

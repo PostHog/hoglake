@@ -54,6 +54,7 @@ internal class HogliteTableCreations(
     private val store: HogliteCatalogStore,
 ) : TableCreationBackend {
     private val mapper = jacksonObjectMapper()
+    private val preparedAndLive = "state = 'prepared' AND julianday(expires_at) > ${HogliteSchema.CREATION_NOW_SQL}"
 
     override fun prepare(
         catalog: String,
@@ -156,7 +157,7 @@ internal class HogliteTableCreations(
         operationId: UUID,
     ): TableCreation =
         store.catalogOperation(catalog) {
-            store.loadCreationOrThrow(catalog, operationId)
+            store.loadCreationOrThrow(catalog, operationId, persistExpiry = false)
         }
 
     override fun abort(
@@ -174,7 +175,9 @@ internal class HogliteTableCreations(
                 val tx = HogliteTx()
                 val update =
                     tx.add(
-                        "UPDATE table_creations SET state = 'aborted', reason = 'client_abort' " +
+                        "UPDATE table_creations SET state = 'aborted', " +
+                            "reason = CASE WHEN julianday(expires_at) <= ${HogliteSchema.CREATION_NOW_SQL} " +
+                            "THEN 'expired' ELSE 'client_abort' END " +
                             "WHERE operation = ? AND state = 'prepared'",
                         operationId.toString(),
                     )
@@ -268,17 +271,18 @@ internal class HogliteTableCreations(
                     // the payload before the rejection branches).
                     val tx = HogliteTx()
                     tx.affectOne(
-                        "UPDATE table_creations SET files_json = ? WHERE operation = ? AND state = 'prepared'",
+                        "UPDATE table_creations SET files_json = ? WHERE operation = ? AND $preparedAndLive",
                         encodedFiles,
                         operationId.toString(),
                     ) {
                         throw PublishRace(store.loadCreationOrThrow(catalog, operationId))
                     }
-                    tx.add(
-                        "UPDATE table_creations SET state = 'rejected', reason = ? WHERE operation = ?",
+                    tx.affectOne(
+                        "UPDATE table_creations SET state = 'rejected', reason = ? " +
+                            "WHERE operation = ? AND $preparedAndLive",
                         rejectReason,
                         operationId.toString(),
-                    )
+                    ) { throw PublishRace(store.loadCreationOrThrow(catalog, operationId)) }
                     try {
                         store.runTx(catalog, HogliteCatalogStore.freshTxid("publish-reject"), null, tx)
                     } catch (race: PublishRace) {
@@ -299,7 +303,7 @@ internal class HogliteTableCreations(
                 val tx = HogliteTx()
                 guardContainment(catalog, tx, meta.dataPath, definition.namespace, definition.name, files)
                 tx.affectOne(
-                    "UPDATE table_creations SET files_json = ? WHERE operation = ? AND state = 'prepared'",
+                    "UPDATE table_creations SET files_json = ? WHERE operation = ? AND $preparedAndLive",
                     encodedFiles,
                     operationId.toString(),
                 ) {
@@ -568,11 +572,12 @@ internal class HogliteTableCreations(
                         }
                     }
                 }
-                tx.add(
+                tx.affectOne(
                     "UPDATE table_creations SET state = 'committed', snapshot_id = ${HogliteSchema.HEAD_SQL}, " +
-                        "schema_version = (SELECT schema_version FROM meta WHERE id = 1) WHERE operation = ?",
+                        "schema_version = (SELECT schema_version FROM meta WHERE id = 1) " +
+                        "WHERE operation = ? AND $preparedAndLive",
                     operationId.toString(),
-                )
+                ) { throw PublishRace(store.loadCreationOrThrow(catalog, operationId)) }
                 try {
                     store.runTx(catalog, HogliteCatalogStore.freshTxid("publish"), null, tx)
                 } catch (race: PublishRace) {
@@ -623,15 +628,15 @@ internal class HogliteTableCreations(
     ): TableCreation {
         val tx = HogliteTx()
         tx.affectOne(
-            "UPDATE table_creations SET files_json = ? WHERE operation = ? AND state = 'prepared'",
+            "UPDATE table_creations SET files_json = ? WHERE operation = ? AND $preparedAndLive",
             encodedFiles,
             operationId.toString(),
         ) { throw PublishRace(store.loadCreationOrThrow(catalog, operationId)) }
-        tx.add(
-            "UPDATE table_creations SET state = 'rejected', reason = ? WHERE operation = ?",
+        tx.affectOne(
+            "UPDATE table_creations SET state = 'rejected', reason = ? WHERE operation = ? AND $preparedAndLive",
             reason,
             operationId.toString(),
-        )
+        ) { throw PublishRace(store.loadCreationOrThrow(catalog, operationId)) }
         try {
             store.runTx(catalog, HogliteCatalogStore.freshTxid("publish-reject"), null, tx)
         } catch (race: PublishRace) {

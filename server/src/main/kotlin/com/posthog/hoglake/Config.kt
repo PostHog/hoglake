@@ -2,7 +2,10 @@ package com.posthog.hoglake
 
 import com.fasterxml.jackson.core.JsonParser
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import com.posthog.hoglake.auth.JwtVerifier
+import com.posthog.hoglake.auth.RESERVED_CLIENT_CLASSES
 import com.posthog.hoglake.hoglite.HogliteBackend
+import com.posthog.hoglake.service.ReservedNamespaces
 import com.posthog.hoglake.store.BackendKind
 import com.posthog.hoglake.store.MountHost
 import com.posthog.hoglake.store.MountMatch
@@ -300,19 +303,48 @@ data class Config(
      */
     val authPredicateFields: String = env("HOGLAKE_AUTH_PREDICATE_FIELDS", ""),
     /**
+     * The longest a `ten: scoped` token may live, `exp - iat`, in seconds.
+     *
+     * A scoped token's predicate is a snapshot of its holder's access, and
+     * this bounds how stale that snapshot can get. 900 (15 minutes) by
+     * default; an issuer that mints longer-lived scoped tokens needs it
+     * raised. Must be positive: zero or less is refused at boot.
+     */
+    val authScopedMaxLifetimeSeconds: Long =
+        env("HOGLAKE_AUTH_SCOPED_MAX_LIFETIME_SECONDS", "${JwtVerifier.DEFAULT_SCOPED_MAX_LIFETIME_SECONDS}").let {
+            it.trim().toLongOrNull()
+                ?: throw IllegalArgumentException(
+                    "HOGLAKE_AUTH_SCOPED_MAX_LIFETIME_SECONDS must be an integer, got '$it'",
+                )
+        },
+    /**
+     * Extra `client` label classes for `hoglake_auth_requests_total`,
+     * comma-separated User-Agent product tokens (`name` of `name/1.0`), each
+     * counted under its own name rather than `other`: e.g. an issuer's own
+     * provisioner. Lowercase, at most $MAX_AUTH_CLIENT_CLASSES, never `none` or
+     * `other`. Empty (the default): only the built-in generic classes.
+     */
+    val authClientClasses: Set<String> = nameList(env("HOGLAKE_AUTH_CLIENT_CLASSES", "")),
+    /**
      * The orgs whose mount may serve, comma-separated: the `<id>` of each
-     * mount `<id>-events`, as hogtower's HOGTOWER_EVENTS_ORG_ALLOWLIST lists
-     * them. `*` admits every mount. Empty (the default) admits none, and no
+     * mount `<id>-events`, matching the orgs the mount writer manages. `*` admits every mount. Empty (the default) admits none, and no
      * mount name is then looked up at all. Writes are not gated by it, so a
      * mount can always be disabled.
      */
     val mountAllowlist: Set<String> = nameList(env("HOGLAKE_MOUNT_ALLOWLIST", "")),
     /**
      * The `sub` of the one operator token that may write mounts
-     * (`PUT /v1/mounts/{name}`), verified, so under `off` none may: hogtower's
-     * events mount loop. Empty (the default): no caller may.
+     * (`PUT /v1/mounts/{name}`), verified, so under `off` none may: the
+     * issuer's events mount loop. Empty (the default): no caller may.
      */
     val mountWriterSubject: String = env("HOGLAKE_MOUNT_WRITER_SUBJECT", ""),
+    /**
+     * Namespace names no caller may create in any catalog, comma-separated,
+     * matched ignoring ASCII case ([ReservedNamespaces]). Empty (the default)
+     * reserves none. PostHog's customer hoglake reserves `posthog`, the
+     * schema its Trino connector serves from the org's events mount.
+     */
+    val reservedNamespaceNames: Set<String> = nameList(env("HOGLAKE_RESERVED_NAMESPACES", "")),
     /**
      * Hydrator poll interval; 0 disables the background loop (tests drive
      * it directly).
@@ -1375,10 +1407,23 @@ data class Config(
     /** The pinned source [field id][mountSourceFieldId], or null when unset. */
     val mountSourceFieldIdOrNull: Long? = mountSourceFieldId.takeIf { it.isNotBlank() }?.toLong()
 
+    /** [reservedNamespaceNames], checked at boot: each must be a valid namespace name. */
+    val reservedNamespaces: ReservedNamespaces = ReservedNamespaces(reservedNamespaceNames)
+
     /** The remote hosts of [mountHostsFile]; empty when this server is not a mount Client. */
     val mountHosts: List<MountHost> = readMountHosts(mountHostsFile)
 
     init {
+        require(
+            authClientClasses.size <= MAX_AUTH_CLIENT_CLASSES &&
+                authClientClasses.all { CLIENT_CLASS.matches(it) && it !in RESERVED_CLIENT_CLASSES },
+        ) {
+            "HOGLAKE_AUTH_CLIENT_CLASSES takes at most $MAX_AUTH_CLIENT_CLASSES lowercase User-Agent product " +
+                "tokens ([a-z][a-z0-9._-]{0,31}, not 'none' or 'other'), got $authClientClasses"
+        }
+        require(authScopedMaxLifetimeSeconds > 0) {
+            "HOGLAKE_AUTH_SCOPED_MAX_LIFETIME_SECONDS must be positive, got $authScopedMaxLifetimeSeconds"
+        }
         require(mountAllowlist.all { it == "*" || MountNames.isReserved("$it-events") }) {
             "HOGLAKE_MOUNT_ALLOWLIST takes org ids (canonical lowercase UUIDs) or *, got $mountAllowlist"
         }
@@ -1748,6 +1793,11 @@ data class Config(
          * fail, and the whole point of a page is that it finishes.
          */
         const val MAX_EXPIRY_PURGE_PAGE = 50_000
+
+        /** The most extra `client` label classes `HOGLAKE_AUTH_CLIENT_CLASSES` may name: a label is a series. */
+        const val MAX_AUTH_CLIENT_CLASSES = 16
+
+        private val CLIENT_CLASS = Regex("[a-z][a-z0-9._-]{0,31}")
 
         /**
          * The default `HOGLAKE_RETIREMENT_QUEUE_CEILING`, named here so
