@@ -20,6 +20,8 @@ import org.jdbi.v3.core.kotlin.inTransactionUnchecked
 import org.jdbi.v3.core.kotlin.useTransactionUnchecked
 import org.jdbi.v3.core.kotlin.withHandleUnchecked
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider
+import software.amazon.awssdk.awscore.AwsRequest
+import software.amazon.awssdk.awscore.AwsRequestOverrideConfiguration
 import software.amazon.awssdk.core.client.config.ClientOverrideConfiguration
 import software.amazon.awssdk.regions.Region
 import software.amazon.awssdk.services.s3.S3Client
@@ -52,7 +54,7 @@ import java.util.concurrent.Executors
  * it — that row stays queued with `attempts + 1` while its siblings
  * settle — is exactly what a test has to pin.
  */
-open class RemovalStore(
+open class RemovalStore private constructor(
     private val endpoint: String?,
     private val region: String,
     private val pathStyle: Boolean,
@@ -64,15 +66,29 @@ open class RemovalStore(
      * [callBoundFor] for what the call bound still derives from it, now
      * that a drain holds no lock. 0 means an unbounded wait.
      */
-    private val commitLockTimeoutMs: Long = com.posthog.hoglake.commit.CommitService.DEFAULT_COMMIT_LOCK_TIMEOUT_MS,
+    private val commitLockTimeoutMs: Long,
     /**
-     * Non-null on a catalog VIEW ([forCatalog]): the grant this client
-     * signs with. Null on the base store, which signs with
+     * Non-null on a catalog VIEW ([forCatalog]): the base store's client,
+     * shared rather than rebuilt — one HTTP connection pool per store,
+     * however many catalogs it drains (see `ObjectStore`).
+     */
+    shared: S3Client?,
+    /**
+     * Non-null on a catalog VIEW: the grant this view signs with, applied
+     * per request. Null on the base store, whose client signs with
      * [StorageCredentialProvider.unscoped] — the shared keys under
      * `ambient`/`static`, a refusal under `broker`.
      */
-    private val credentials: AwsCredentialsProvider? = null,
+    private val credentials: AwsCredentialsProvider?,
 ) : AutoCloseable {
+    constructor(
+        endpoint: String?,
+        region: String,
+        pathStyle: Boolean,
+        provider: StorageCredentialProvider,
+        commitLockTimeoutMs: Long = com.posthog.hoglake.commit.CommitService.DEFAULT_COMMIT_LOCK_TIMEOUT_MS,
+    ) : this(endpoint, region, pathStyle, provider, commitLockTimeoutMs, shared = null, credentials = null)
+
     /**
      * The key-pair shape every test fixture builds: static keys when both
      * are given, otherwise the SDK chain — the rule the server applied
@@ -95,10 +111,7 @@ open class RemovalStore(
 
     constructor(
         config: Config,
-        provider: StorageCredentialProvider =
-            StorageCredentialProviders.fromConfig(
-                config,
-            ),
+        provider: StorageCredentialProvider = StorageCredentialProviders.fromConfig(config),
     ) : this(
         endpoint = config.s3Endpoint.ifBlank { null },
         region = config.s3Region,
@@ -113,19 +126,32 @@ open class RemovalStore(
     /** Half [apiCallTimeout] — see [callBoundFor] for what that buys. */
     val apiCallAttemptTimeout: Duration = apiCallTimeout.dividedBy(2)
 
+    /** True on the base store, which built [s3] and closes it; a view borrows it. */
+    private val ownsClient: Boolean = shared == null
+
     private val s3: S3Client =
-        S3Client.builder()
-            .region(Region.of(region))
-            .overrideConfiguration(
-                ClientOverrideConfiguration.builder()
-                    .apiCallTimeout(apiCallTimeout)
-                    .apiCallAttemptTimeout(apiCallAttemptTimeout)
-                    .build(),
-            )
-            .credentialsProvider(credentials ?: provider.unscoped())
-            .apply { if (endpoint != null) endpointOverride(URI.create(endpoint)) }
-            .forcePathStyle(pathStyle)
-            .build()
+        shared
+            ?: S3Client.builder()
+                .region(Region.of(region))
+                .overrideConfiguration(
+                    ClientOverrideConfiguration.builder()
+                        .apiCallTimeout(apiCallTimeout)
+                        .apiCallAttemptTimeout(apiCallAttemptTimeout)
+                        .build(),
+                )
+                .credentialsProvider(provider.unscoped())
+                .apply { if (endpoint != null) endpointOverride(URI.create(endpoint)) }
+                .forcePathStyle(pathStyle)
+                .build()
+
+    /** The per-request override a view stamps on every request: the catalog's own credentials. */
+    private val override: AwsRequestOverrideConfiguration? =
+        credentials?.let { AwsRequestOverrideConfiguration.builder().credentialsProvider(it).build() }
+
+    private fun <B : AwsRequest.Builder> B.scoped(): B = apply { override?.let { overrideConfiguration(it) } }
+
+    /** The client this store sends with; a view's is its base store's. For tests. */
+    internal val client: S3Client get() = s3
 
     /** True under a provider whose credentials differ per catalog ([forCatalog] is then mandatory before IO). */
     val scoped: Boolean get() = provider.scoped
@@ -136,10 +162,10 @@ open class RemovalStore(
     /**
      * The store to delete [catalog]'s objects under [prefix] with: this
      * very store under an unscoped provider (same client, same subclass,
-     * so a fault-injecting test store keeps injecting), a client on the
-     * catalog's own session under `broker`, cached for the life of the
-     * base store. Deletes need [StorageAccess.WRITE]; there is no
-     * delete-only grant.
+     * so a fault-injecting test store keeps injecting), a thin view over
+     * this store's client that signs each request with the catalog's own
+     * session under `broker`, cached for the life of the base store.
+     * Deletes need [StorageAccess.WRITE]; there is no delete-only grant.
      */
     fun forCatalog(
         catalog: String,
@@ -155,6 +181,7 @@ open class RemovalStore(
                 pathStyle,
                 provider,
                 commitLockTimeoutMs,
+                s3,
                 provider.credentialsFor(catalog, prefix, access),
             )
         }
@@ -168,7 +195,7 @@ open class RemovalStore(
     fun exists(pathUri: String): Boolean {
         val loc = ObjectStore.parse(pathUri)
         return try {
-            s3.headObject(HeadObjectRequest.builder().bucket(loc.bucket).key(loc.key).build())
+            s3.headObject(HeadObjectRequest.builder().bucket(loc.bucket).key(loc.key).scoped().build())
             true
         } catch (_: NoSuchKeyException) {
             false
@@ -207,7 +234,7 @@ open class RemovalStore(
     open fun deleteIfExists(pathUri: String): Outcome {
         if (!exists(pathUri)) return Outcome.MISSING
         val loc = ObjectStore.parse(pathUri)
-        s3.deleteObject(DeleteObjectRequest.builder().bucket(loc.bucket).key(loc.key).build())
+        s3.deleteObject(DeleteObjectRequest.builder().bucket(loc.bucket).key(loc.key).scoped().build())
         return Outcome.REMOVED
     }
 
@@ -297,6 +324,7 @@ open class RemovalStore(
                                 .quiet(true)
                                 .build(),
                         )
+                        .scoped()
                         .build(),
                 )
             return failuresFor(bucket, chunk, response.errors())
@@ -345,11 +373,12 @@ open class RemovalStore(
         return failures
     }
 
+    /** A view holds nothing of its own; the base store closes the client and the provider. */
     override fun close() {
-        views.values.forEach { it.close() }
+        if (!ownsClient) return
         views.clear()
         s3.close()
-        if (credentials == null) provider.close()
+        provider.close()
     }
 
     companion object {

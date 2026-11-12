@@ -7,6 +7,8 @@ import com.posthog.hoglake.storage.StorageCredentialProvider
 import com.posthog.hoglake.storage.StorageCredentialProviders
 import io.github.oshai.kotlinlogging.KotlinLogging
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider
+import software.amazon.awssdk.awscore.AwsRequest
+import software.amazon.awssdk.awscore.AwsRequestOverrideConfiguration
 import software.amazon.awssdk.core.sync.RequestBody
 import software.amazon.awssdk.regions.Region
 import software.amazon.awssdk.services.s3.S3Client
@@ -35,20 +37,35 @@ import java.util.concurrent.ConcurrentHashMap
  * OOM-leak verification). A real S3 cannot be asked to throw an
  * OutOfMemoryError on the third call.
  */
-open class ObjectStore(
+open class ObjectStore private constructor(
     private val endpoint: String?,
     private val region: String,
     private val pathStyle: Boolean,
     /** Where this store's credentials come from; shared by every view it makes. */
     private val provider: StorageCredentialProvider,
     /**
-     * Non-null on a catalog VIEW ([forCatalog]): the grant this client
-     * signs with. Null on the base store, which signs with
-     * [StorageCredentialProvider.unscoped] — the shared keys under
-     * `ambient`/`static`, a refusal under `broker`.
+     * Non-null on a catalog VIEW ([forCatalog]): the base store's client,
+     * which the view shares rather than building its own. One client per
+     * store, however many catalogs it serves: an S3Client owns an HTTP
+     * connection pool, and a process serving every tenant's catalog must
+     * not grow one pool per catalog.
      */
-    private val credentials: AwsCredentialsProvider? = null,
+    shared: S3Client?,
+    /**
+     * Non-null on a catalog VIEW: the grant this view signs with, applied
+     * PER REQUEST through the SDK's request override. Null on the base
+     * store, whose client signs with [StorageCredentialProvider.unscoped]
+     * — the shared keys under `ambient`/`static`, a refusal under `broker`.
+     */
+    private val credentials: AwsCredentialsProvider?,
 ) : AutoCloseable {
+    constructor(
+        endpoint: String?,
+        region: String,
+        pathStyle: Boolean,
+        provider: StorageCredentialProvider,
+    ) : this(endpoint, region, pathStyle, provider, shared = null, credentials = null)
+
     /**
      * The key-pair shape every test fixture builds: static keys when both
      * are given, otherwise the SDK chain — the rule the server applied
@@ -69,10 +86,7 @@ open class ObjectStore(
 
     constructor(
         config: Config,
-        provider: StorageCredentialProvider =
-            StorageCredentialProviders.fromConfig(
-                config,
-            ),
+        provider: StorageCredentialProvider = StorageCredentialProviders.fromConfig(config),
     ) : this(
         endpoint = config.s3Endpoint.ifBlank { null },
         region = config.s3Region,
@@ -80,13 +94,30 @@ open class ObjectStore(
         provider = provider,
     )
 
+    /** True on the base store, which built [s3] and closes it; a view borrows it. */
+    private val ownsClient: Boolean = shared == null
+
     private val s3: S3Client =
-        S3Client.builder()
-            .region(Region.of(region))
-            .credentialsProvider(credentials ?: provider.unscoped())
-            .apply { if (endpoint != null) endpointOverride(URI.create(endpoint)) }
-            .forcePathStyle(pathStyle)
-            .build()
+        shared
+            ?: S3Client.builder()
+                .region(Region.of(region))
+                .credentialsProvider(provider.unscoped())
+                .apply { if (endpoint != null) endpointOverride(URI.create(endpoint)) }
+                .forcePathStyle(pathStyle)
+                .build()
+
+    /**
+     * The per-request override a view stamps on every request it makes:
+     * the catalog's own credentials, resolved by the SDK at send time, so
+     * a refreshing session is followed without touching the client.
+     */
+    private val override: AwsRequestOverrideConfiguration? =
+        credentials?.let { AwsRequestOverrideConfiguration.builder().credentialsProvider(it).build() }
+
+    private fun <B : AwsRequest.Builder> B.scoped(): B = apply { override?.let { overrideConfiguration(it) } }
+
+    /** The client this store sends with; a view's is its base store's. For tests. */
+    internal val client: S3Client get() = s3
 
     /** True under a provider whose credentials differ per catalog ([forCatalog] is then mandatory before IO). */
     val scoped: Boolean get() = provider.scoped
@@ -99,9 +130,9 @@ open class ObjectStore(
      * `data_path`) with. Under an unscoped provider that is this very
      * store — same client, same keys, and the same subclass, so a
      * fault-injecting test store keeps injecting. Under `broker` it is a
-     * client built on that catalog's own session, cached here for the
-     * life of the base store; the session refreshes underneath it, so the
-     * client is never rebuilt.
+     * thin view over THIS store's client that signs each request with the
+     * catalog's own session, cached here for the life of the base store;
+     * the session refreshes underneath it, so nothing is rebuilt.
      */
     fun forCatalog(
         catalog: String,
@@ -111,7 +142,7 @@ open class ObjectStore(
         if (!provider.scoped) return this
         check(credentials == null) { "forCatalog on a catalog view" }
         return views.computeIfAbsent(Triple(catalog, prefix, access)) {
-            ObjectStore(endpoint, region, pathStyle, provider, provider.credentialsFor(catalog, prefix, access))
+            ObjectStore(endpoint, region, pathStyle, provider, s3, provider.credentialsFor(catalog, prefix, access))
         }
     }
 
@@ -123,7 +154,7 @@ open class ObjectStore(
     open fun get(pathUri: String): ByteArray {
         val loc = parse(pathUri)
         return s3.getObjectAsBytes(
-            GetObjectRequest.builder().bucket(loc.bucket).key(loc.key).build(),
+            GetObjectRequest.builder().bucket(loc.bucket).key(loc.key).scoped().build(),
         ).asByteArray()
     }
 
@@ -169,6 +200,7 @@ open class ObjectStore(
                 .bucket(loc.bucket)
                 .key(loc.key)
                 .range(range)
+                .scoped()
                 .build(),
         ).asByteArrayUnsafe()
     }
@@ -179,7 +211,7 @@ open class ObjectStore(
     ) {
         val loc = parse(pathUri)
         s3.putObject(
-            PutObjectRequest.builder().bucket(loc.bucket).key(loc.key).build(),
+            PutObjectRequest.builder().bucket(loc.bucket).key(loc.key).scoped().build(),
             RequestBody.fromBytes(bytes),
         )
     }
@@ -207,7 +239,7 @@ open class ObjectStore(
     open fun startMultipartUpload(pathUri: String): String {
         val loc = parse(pathUri)
         return s3.createMultipartUpload(
-            CreateMultipartUploadRequest.builder().bucket(loc.bucket).key(loc.key).build(),
+            CreateMultipartUploadRequest.builder().bucket(loc.bucket).key(loc.key).scoped().build(),
         ).uploadId()
     }
 
@@ -228,6 +260,7 @@ open class ObjectStore(
             UploadPartRequest.builder()
                 .bucket(loc.bucket).key(loc.key)
                 .uploadId(uploadId).partNumber(partNumber)
+                .scoped()
                 .build(),
             RequestBody.fromInputStream(bytes.inputStream(0, length), length.toLong()),
         ).eTag()
@@ -249,6 +282,7 @@ open class ObjectStore(
             CompleteMultipartUploadRequest.builder()
                 .bucket(loc.bucket).key(loc.key).uploadId(uploadId)
                 .multipartUpload(CompletedMultipartUpload.builder().parts(parts).build())
+                .scoped()
                 .build(),
         )
     }
@@ -276,7 +310,7 @@ open class ObjectStore(
         runCatching {
             s3.abortMultipartUpload(
                 AbortMultipartUploadRequest.builder()
-                    .bucket(loc.bucket).key(loc.key).uploadId(uploadId).build(),
+                    .bucket(loc.bucket).key(loc.key).uploadId(uploadId).scoped().build(),
             )
         }.onFailure { e ->
             Metrics.multipartAbortFailed()
@@ -298,11 +332,12 @@ open class ObjectStore(
         }
     }
 
+    /** A view holds nothing of its own; the base store closes the client and the provider. */
     override fun close() {
-        views.values.forEach { it.close() }
+        if (!ownsClient) return
         views.clear()
         s3.close()
-        if (credentials == null) provider.close()
+        provider.close()
     }
 
     companion object {
