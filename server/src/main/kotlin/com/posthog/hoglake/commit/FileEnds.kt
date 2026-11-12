@@ -3,6 +3,7 @@ package com.posthog.hoglake.commit
 import com.posthog.hoglake.model.CommitRequest
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.TableFileEnds
+import com.posthog.hoglake.model.Transform
 import com.posthog.hoglake.service.requireOperationMetadata
 import com.posthog.hoglake.wireObjectMapper
 
@@ -76,6 +77,44 @@ internal object FileEnds {
                 "file_ends partitions for $name must have $fieldCount value(s) per tuple, " +
                     "one per field of the live spec",
             )
+        }
+    }
+
+    /**
+     * The 422 for an appended path the catalog already records as a data
+     * file, live or ended; one text for both backends.
+     */
+    fun recordedPathRefusal(path: String): HoglakeException.Validation =
+        HoglakeException.Validation(
+            "appended path $path is already recorded as a data file of this catalog, live or ended; " +
+                "write the replacement to a new path",
+        )
+
+    private val INTEGER = Regex("-?[0-9]+")
+
+    /**
+     * Each value of a date or bucket field must be the base-10 integer a
+     * writer registers (`20401` for a day, not `2025-11-10`): a tuple is
+     * matched as a literal string, so a differently encoded value ends
+     * nothing and the replacement doubles the day. [transforms] are the
+     * live spec's, in key order; null values and the other transforms
+     * (identity) are not checked. Run after [checkArity].
+     */
+    fun checkEncoding(
+        end: TableFileEnds,
+        transforms: List<Transform>,
+    ) {
+        for (tuple in end.partitions.orEmpty()) {
+            tuple.forEachIndexed { i, value ->
+                val transform = transforms[i]
+                if (value != null && transform != Transform.IDENTITY && !INTEGER.matches(value)) {
+                    throw HoglakeException.Validation(
+                        "file_ends partitions for ${end.namespace}.${end.table}: field $i (${transform.wire}) " +
+                            "value '$value' is not a base-10 integer; date and bucket partition values are " +
+                            "registered as integers, such as 20401 for a day",
+                    )
+                }
+            }
         }
     }
 

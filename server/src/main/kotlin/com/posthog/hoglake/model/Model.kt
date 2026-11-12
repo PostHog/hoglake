@@ -349,6 +349,7 @@ enum class ChangeKind {
     TABLE_INSERTED_INTO,
     TABLE_DELETED_FROM,
     TABLE_COMPACTED,
+    TABLE_REPLACED,
     VIEW_CREATED,
     VIEW_DROPPED,
     ;
@@ -390,13 +391,14 @@ enum class ChangeKind {
                 TABLE_INSERTED_INTO,
                 TABLE_DELETED_FROM,
                 TABLE_COMPACTED,
+                TABLE_REPLACED,
             )
 
         /**
          * The kinds whose `object_id` is NOT a table id.
          *
          * Its only purpose is to make [TABLE_SCOPED] a decision about
-         * every kind rather than about six of them: the two sets must
+         * every kind rather than about seven of them: the two sets must
          * partition the vocabulary exactly, which is what the
          * vocabulary test asserts. A new kind that lands in neither
          * reds, and the author has to say which it is.
@@ -1353,7 +1355,7 @@ data class TableFileEnds(
 data class CommitResult(
     val snapshotId: Long,
     val schemaVersion: Long,
-    /** Data files ended by a replacement; null on every other commit, and on a replay of one. */
+    /** Data files ended by a replacement; null on every other commit, and on a receipt written before it was stored. */
     val endedFiles: Long? = null,
 )
 
@@ -2858,7 +2860,7 @@ sealed class HoglakeException(message: String) : RuntimeException(message) {
      *
      * Not all of [CommitService.checkConflicts]' refusals are this:
      * ROW-CONTENT conflicts ('table_created' / 'table_inserted_into' /
-     * 'table_deleted_from' on a guarded request's delete targets) stay
+     * 'table_deleted_from' / 'table_replaced' on a guarded request's delete targets) stay
      * [CommitConflict], because re-reading and replanning IS the
      * recovery there and the same payload can succeed on the next try.
      * A refusal that mixes both is the conservative answer, i.e. also

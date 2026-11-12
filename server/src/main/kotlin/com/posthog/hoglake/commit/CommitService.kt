@@ -13,6 +13,7 @@ import com.posthog.hoglake.model.ObjectPrefixLayout
 import com.posthog.hoglake.model.StatsSanity
 import com.posthog.hoglake.model.TableAppend
 import com.posthog.hoglake.model.TableFileEnds
+import com.posthog.hoglake.model.Transform
 import com.posthog.hoglake.model.pathStaysUnder
 import com.posthog.hoglake.model.validateFooterSize
 import com.posthog.hoglake.model.validateSplitOffsets
@@ -83,7 +84,7 @@ import java.util.UUID
  *
  * requireUnchangedTables adds the read-set rule ON TOP of that, and only
  * for the tables the request DELETES from: those additionally conflict
- * with 'table_created' / 'table_inserted_into' / 'table_deleted_from'
+ * with 'table_created' / 'table_inserted_into' / 'table_deleted_from' / 'table_replaced'
  * since readSnapshot, because a delete is planned against a read of the
  * target's rows. A table a guarded request only APPENDS to keeps the
  * DDL-only rule — appends never conflict with appends, inside a
@@ -307,12 +308,18 @@ class CommitService(
         jdbi.withHandle<CommitResult, RuntimeException> { h ->
             h.createQuery(
                 """
-                SELECT r.snapshot_id, r.schema_version FROM hog_commit_receipt r
+                SELECT r.snapshot_id, r.schema_version, r.ended_files FROM hog_commit_receipt r
                 JOIN hog_catalog c USING (catalog_id)
                 WHERE c.name = :catalog AND r.idempotency_key = :operation
                 """,
             ).bind("catalog", catalog).bind("operation", operation)
-                .map { rs, _ -> CommitResult(rs.getLong("snapshot_id"), rs.getLong("schema_version")) }
+                .map { rs, _ ->
+                    CommitResult(
+                        rs.getLong("snapshot_id"),
+                        rs.getLong("schema_version"),
+                        rs.getObject("ended_files") as Long?,
+                    )
+                }
                 .findOne().orElseThrow { HoglakeException.NotFound("commit receipt '$operation'") }
         }
 
@@ -537,19 +544,23 @@ class CommitService(
         // thing appends have never done.
         //
         // A table whose files this request ends is read like an appended one
-        // (its live spec decides the tuples' arity) and is UNCHANGED-guarded
-        // like a delete target: ending files is planned against a read of the
-        // table's rows, so an insert, delete or end since readSnapshot is a
-        // conflict. Compaction is not: it moves rows between files and the
-        // ends below match the files live at commit, so it cannot make them
-        // end the wrong rows.
+        // (its live spec decides the tuples' arity). An `all_files` end is
+        // UNCHANGED-guarded like a delete target: ending files is planned
+        // against a read of the table's rows, so an insert, delete, end or
+        // replacement since readSnapshot is a conflict. A `partitions` end is
+        // guarded per tuple instead ([tupleConflicts]): an append to another
+        // partition cannot change what it ends, and refusing it would livelock
+        // a replacement under continuous appends. Compaction conflicts with
+        // neither: it moves rows between files and the ends below match the
+        // files live at commit, so it cannot make them end the wrong rows.
         val tableKeys =
             (mergedAppends.keys + mergedDeletes.keys + mergedEnds.keys).map { key ->
                 CommitTail.TableKey(
                     namespace = key.first,
                     table = key.second,
                     appending = key in mergedAppends || key in mergedEnds,
-                    unchanged = (req.requireUnchangedTables && key in mergedDeletes) || key in mergedEnds,
+                    unchanged =
+                        (req.requireUnchangedTables && key in mergedDeletes) || mergedEnds[key]?.allFiles == true,
                 )
             }
         val ordOf = tableKeys.withIndex().associate { (i, k) -> (k.namespace to k.table) to i + 1 }
@@ -594,7 +605,7 @@ class CommitService(
         // enforces (`HOGLAKE_RECEIPT_RETENTION_SECONDS`, 7 days; see
         // CleanupService.purgeCommitReceipts for why a receipt has to
         // outlive any payload a client may still replay).
-        read.receipt?.let { return replayedReceipt(catalogName, it, requestJson, fingerprint) }
+        read.receipt?.let { return replayedReceipt(h, catalogId, catalogName, it, requestJson, fingerprint, req) }
 
         if (req.idempotencyKey != null) validatePathsUnderDataPath(dataPath, req)
 
@@ -824,7 +835,9 @@ class CommitService(
             resolvedAppends.forEach { names[it.tableId] = "${it.namespace}.${it.table}" }
             resolvedDeletes.forEach { names[it.tableId] = "${it.namespace}.${it.table}" }
             resolvedEnds.forEach { names[it.tableId] = "${it.end.namespace}.${it.end.table}" }
-            checkConflicts(readSnapshot, read.conflicts, names)
+            val tuple =
+                resolvedEnds.filter { it.end.partitions != null && tupleConflicts(h, catalogId, readSnapshot, it) }
+            checkConflicts(readSnapshot, read.conflicts + tuple.map { CommitTail.Conflict(it.tableId, false) }, names)
         }
 
         // 4. Structural validation. Nothing is written unless all of it
@@ -835,6 +848,9 @@ class CommitService(
         // the spec it was written for.
         resolvedEnds.forEach { ended ->
             FileEnds.checkArity(ended.end, ended.fieldCount)
+            if (ended.end.partitions != null && ended.specId != null) {
+                FileEnds.checkEncoding(ended.end, liveTransforms(h, catalogId, ended.tableId, ended.specId))
+            }
             if (ended.end.partitions != null && ended.specId != null &&
                 hasLiveFileOutsideSpec(h, catalogId, ended.tableId, ended.specId)
             ) {
@@ -845,30 +861,25 @@ class CommitService(
                 )
             }
         }
-        // 3c. A path appended here that is a live file of a table this request
-        // ends would be re-registered while its old row is ended: expiry would
-        // queue the path for removal with the new row still referencing it.
+        // 3c. A replacement never re-registers a path the catalog has recorded,
+        // live or ended. Paths are deterministic, so A ending Y and appending X,
+        // then B ending X and appending Y, would overwrite Y's bytes while
+        // snapshots before A still read Y: time travel would return wrong
+        // bytes, and cleanup of the ended row would hit a live reference.
         if (resolvedEnds.isNotEmpty() && mergedAppends.isNotEmpty()) {
             val reused =
                 h.createQuery(
                     """
                     SELECT path FROM hog_data_file
-                     WHERE catalog_id = :catalogId AND table_id = ANY(CAST(:tableIds AS bigint[]))
-                       AND end_snapshot IS NULL AND path = ANY(CAST(:paths AS text[]))
+                     WHERE catalog_id = :catalogId AND path = ANY(CAST(:paths AS text[]))
                      LIMIT 1
                     """,
                 )
                     .bind("catalogId", catalogId)
-                    .bindArray("tableIds", java.lang.Long::class.java, resolvedEnds.map { it.tableId })
                     .bindArray("paths", String::class.java, mergedAppends.values.flatMap { f -> f.map { it.path } })
                     .mapTo(String::class.java)
                     .findFirst()
-            if (reused.isPresent) {
-                throw HoglakeException.Validation(
-                    "appended path ${reused.get()} is a live data file of a table this request ends; " +
-                        "write the replacement to a new path",
-                )
-            }
+            if (reused.isPresent) throw FileEnds.recordedPathRefusal(reused.get())
         }
         val validatedAppends = resolvedAppends.map { validateFiles(it, read.columns[it.tableId].orEmpty()) }
         validateDeleteRegistrations(resolvedDeletes)
@@ -1001,12 +1012,29 @@ class CommitService(
         // everything that began in it: the files this commit appended are
         // not the ones it replaces. One transaction, under the lock, so no
         // reader sees a day without its replacement.
-        val ended =
-            if (resolvedEnds.isEmpty()) {
-                null
-            } else {
-                resolvedEnds.sumOf { endFiles(h, catalogId, it, snapshotId) }
+        if (resolvedEnds.isEmpty()) return CommitResult(snapshotId, schemaVersion, null)
+        var ended = 0L
+        for (end in resolvedEnds) {
+            val count = endFiles(h, catalogId, end, snapshotId)
+            ended += count
+            // The barrier a changefeed raises reconciliation on, written only
+            // for a table whose files this commit really ended: a replacement
+            // that ended nothing changed no row a consumer has seen.
+            if (count > 0) {
+                h.createUpdate(
+                    """
+                    INSERT INTO hog_snapshot_change (catalog_id, snapshot_id, kind, object_id)
+                    VALUES (:catalogId, :snapshotId, 'table_replaced', :tableId)
+                    """,
+                ).bind("catalogId", catalogId).bind("snapshotId", snapshotId).bind("tableId", end.tableId).execute()
             }
+        }
+        if (req.idempotencyKey != null) {
+            h.createUpdate(
+                "UPDATE hog_commit_receipt SET ended_files = :ended WHERE catalog_id = :catalogId " +
+                    "AND idempotency_key = :key",
+            ).bind("ended", ended).bind("catalogId", catalogId).bind("key", req.idempotencyKey).execute()
+        }
         return CommitResult(snapshotId, schemaVersion, ended)
     }
 
@@ -1019,16 +1047,32 @@ class CommitService(
 
     /**
      * Whether a live data file of the table was written under a spec other
-     * than [specId] (or none). Only asked when the table's spec history
-     * could make the answer yes; the probe stops at the first such file.
+     * than [specId] (or none). The scan reads every live file of the table,
+     * so it is skipped when the table's spec history cannot make the answer
+     * yes: one spec ever, begun with the table, means every file was written
+     * under it. Otherwise the probe stops at the first such file.
      */
     private fun hasLiveFileOutsideSpec(
         h: Handle,
         catalogId: Long,
         tableId: Long,
         specId: Long,
-    ): Boolean =
-        h.createQuery(
+    ): Boolean {
+        val singleSpec =
+            h.createQuery(
+                """
+                SELECT count(*) = 1 AND coalesce(bool_and(s.begin_snapshot <= t.created_snapshot), false)
+                  FROM hog_partition_spec s
+                  JOIN hog_table t ON t.catalog_id = s.catalog_id AND t.table_id = s.table_id
+                 WHERE s.catalog_id = :catalogId AND s.table_id = :tableId
+                """,
+            )
+                .bind("catalogId", catalogId)
+                .bind("tableId", tableId)
+                .mapTo(Boolean::class.javaObjectType)
+                .one()
+        if (singleSpec) return false
+        return h.createQuery(
             """
             SELECT EXISTS (
                 SELECT 1 FROM hog_data_file
@@ -1042,6 +1086,80 @@ class CommitService(
             .bind("specId", specId)
             .mapTo(Boolean::class.javaObjectType)
             .one()
+    }
+
+    /** The transforms of spec [specId]'s fields, in key order. */
+    private fun liveTransforms(
+        h: Handle,
+        catalogId: Long,
+        tableId: Long,
+        specId: Long,
+    ): List<Transform> =
+        h.createQuery(
+            """
+            SELECT transform FROM hog_partition_field
+             WHERE catalog_id = :catalogId AND table_id = :tableId AND spec_id = :specId
+             ORDER BY key_index
+            """,
+        )
+            .bind("catalogId", catalogId)
+            .bind("tableId", tableId)
+            .bind("specId", specId)
+            .map { rs, _ -> Transform.fromWire(rs.getString("transform")) }
+            .list()
+
+    /**
+     * Whether another commit touched the tuples [ended] targets since
+     * [readSnapshot]: it began or ended a data file of the table in one of
+     * them, or registered a deletion vector against such a file. DDL is the
+     * conflict scan's, and compaction is excluded as everywhere: it rewrites
+     * files without changing the rows, and the ends below match whatever is
+     * live at commit.
+     */
+    private fun tupleConflicts(
+        h: Handle,
+        catalogId: Long,
+        readSnapshot: Long,
+        ended: ResolvedEnds,
+    ): Boolean {
+        val compactedAt =
+            """
+            EXISTS (SELECT 1 FROM hog_snapshot_change c
+                     WHERE c.catalog_id = :catalogId AND c.object_id = :tableId
+                       AND c.kind = 'table_compacted' AND c.snapshot_id = %s)
+            """
+        val tupleOf =
+            """
+            (SELECT jsonb_agg(v.value ORDER BY v.key_index) FROM hog_file_partition_value v
+              WHERE v.catalog_id = f.catalog_id AND v.data_file_id = f.data_file_id)
+              IN (SELECT jsonb_array_elements(CAST(:tuples AS jsonb)))
+            """
+        return h.createQuery(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM hog_data_file f
+                 WHERE f.catalog_id = :catalogId AND f.table_id = :tableId
+                   AND ((f.begin_snapshot > :readSnapshot AND NOT ${compactedAt.format("f.begin_snapshot")})
+                     OR (f.end_snapshot > :readSnapshot AND NOT ${compactedAt.format("f.end_snapshot")}))
+                   AND $tupleOf
+            ) OR EXISTS (
+                SELECT 1 FROM hog_delete_file d
+                  JOIN hog_data_file f
+                    ON f.catalog_id = d.catalog_id AND f.data_file_id = d.data_file_id
+                 WHERE d.catalog_id = :catalogId AND d.table_id = :tableId
+                   AND d.begin_snapshot > :readSnapshot
+                   AND NOT ${compactedAt.format("d.begin_snapshot")}
+                   AND $tupleOf
+            )
+            """,
+        )
+            .bind("catalogId", catalogId)
+            .bind("tableId", ended.tableId)
+            .bind("readSnapshot", readSnapshot)
+            .bind("tuples", "[" + FileEnds.tupleJson(ended.end).joinToString(",") + "]")
+            .mapTo(Boolean::class.javaObjectType)
+            .one()
+    }
 
     /**
      * End [ended]'s files and their live deletion vectors at [snapshotId];
@@ -1049,10 +1167,10 @@ class CommitService(
      * ordinary retention, expiry and cleanup, as truncate's do.
      *
      * A partition tuple is matched as the JSON array of the file's
-     * partition values, in key order. The candidates come from the
-     * (key_index, value) lookup index on the FIRST key, so a day's ends do
-     * not read every live file of the table; the full tuple is compared
-     * after.
+     * partition values, in key order. The candidates are the table's own
+     * live files, narrowed by their first key, so the statement is bounded
+     * by the table and not by the catalog's partition values; the full tuple
+     * is compared after.
      */
     private fun endFiles(
         h: Handle,
@@ -1069,12 +1187,13 @@ class CommitService(
             } else {
                 """
                 AND f.data_file_id IN (
-                    SELECT v.data_file_id FROM hog_file_partition_value v
-                      JOIN hog_data_file c
-                        ON c.catalog_id = v.catalog_id AND c.data_file_id = v.data_file_id
-                     WHERE v.catalog_id = :catalogId AND v.key_index = 0
-                       AND c.table_id = :tableId AND c.end_snapshot IS NULL
-                       AND (v.value = ANY(CAST(:firstValues AS text[])) OR (:matchNull AND v.value IS NULL))
+                    SELECT c.data_file_id FROM hog_data_file c
+                     WHERE c.catalog_id = :catalogId AND c.table_id = :tableId AND c.end_snapshot IS NULL
+                       AND EXISTS (
+                           SELECT 1 FROM hog_file_partition_value v
+                            WHERE v.catalog_id = c.catalog_id AND v.data_file_id = c.data_file_id
+                              AND v.key_index = 0
+                              AND (v.value = ANY(CAST(:firstValues AS text[])) OR (:matchNull AND v.value IS NULL)))
                 )
                 AND (SELECT jsonb_agg(v.value ORDER BY v.key_index) FROM hog_file_partition_value v
                       WHERE v.catalog_id = f.catalog_id AND v.data_file_id = f.data_file_id)
@@ -1117,10 +1236,13 @@ class CommitService(
      * same key.
      */
     private fun replayedReceipt(
+        h: Handle,
+        catalogId: Long,
         catalogName: String,
         receipt: CommitTail.Receipt,
         requestJson: String?,
         fingerprint: ByteArray?,
+        req: CommitRequest,
     ): CommitResult {
         val stored = receipt.fingerprint
         val same =
@@ -1182,7 +1304,19 @@ class CommitService(
         if (!same) {
             throw HoglakeException.Validation("idempotency_key reused with a different request")
         }
-        return CommitResult(receipt.snapshotId, receipt.schemaVersion)
+        // Only a replacement's receipt carries a count, and the request just compared equal to
+        // the one that wrote it. A separate probe keeps every other replay's read as it was.
+        val ended =
+            if (req.fileEnds == null) {
+                null
+            } else {
+                h.createQuery(
+                    "SELECT ended_files FROM hog_commit_receipt " +
+                        "WHERE catalog_id = :catalogId AND idempotency_key = :key",
+                ).bind("catalogId", catalogId).bind("key", req.idempotencyKey)
+                    .map { rs, _ -> rs.getObject("ended_files") as Long? }.findOne().orElse(null)
+            }
+        return CommitResult(receipt.snapshotId, receipt.schemaVersion, ended)
     }
 
     /** The namespace names a commit must know the containment of: its targets' and its paths' segments. */
@@ -2055,7 +2189,7 @@ class CommitService(
      * request, see CommitRequest.requireUnchangedTables — additionally
      * require that nothing changed their ROW CONTENT, because the delete
      * was planned against a read of it: 'table_created',
-     * 'table_inserted_into' and 'table_deleted_from'. Legacy writes mark
+     * 'table_inserted_into', 'table_deleted_from' and 'table_replaced'. Legacy writes mark
      * none and retain the per-file DV staleness checks in [planDeletes].
      *
      * 'table_compacted' is deliberately NOT in that list, and never was

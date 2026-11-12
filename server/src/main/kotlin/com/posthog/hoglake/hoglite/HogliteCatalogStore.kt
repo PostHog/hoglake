@@ -1787,18 +1787,16 @@ class HogliteCatalogStore(
             val ns = liveNamespace(catalog, namespace)
             val t = tableAt(catalog, ns.namespaceId, namespace, table, to)
             // TRUNCATE / replacement barrier: a window that crosses a
-            // table_altered + table_deleted_from pair cannot be represented
-            // by an append-oriented feed.
+            // table_altered + table_deleted_from pair, or a table_replaced
+            // row, cannot be represented by an append-oriented feed.
             val truncated =
                 queryCatalog(
                     catalog,
-                    "SELECT c.snapshot_id FROM changes c WHERE c.object_id = ? AND c.kind = 'table_deleted_from' " +
-                        "AND c.snapshot_id > ? AND c.snapshot_id <= ? AND (EXISTS (" +
+                    "SELECT c.snapshot_id FROM changes c WHERE c.object_id = ? " +
+                        "AND c.snapshot_id > ? AND c.snapshot_id <= ? AND (c.kind = 'table_replaced' " +
+                        "OR (c.kind = 'table_deleted_from' AND EXISTS (" +
                         "SELECT 1 FROM changes d WHERE d.object_id = c.object_id " +
-                        "AND d.snapshot_id = c.snapshot_id AND d.kind = 'table_altered') " +
-                        // A replacement ends whole files and registers no DV: the files it ended are its trace.
-                        "OR EXISTS (SELECT 1 FROM files ended WHERE ended.table_id = c.object_id " +
-                        "AND ended.end_snapshot = c.snapshot_id)) " +
+                        "AND d.snapshot_id = c.snapshot_id AND d.kind = 'table_altered'))) " +
                         "ORDER BY c.snapshot_id LIMIT 1",
                     t.tableId,
                     fromSnapshot,

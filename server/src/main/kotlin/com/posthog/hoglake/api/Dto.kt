@@ -587,7 +587,12 @@ data class ReplacementRequestDto(
         )
 }
 
-data class CommitReceiptDto(val operationId: UUID, val snapshotId: Long, val schemaVersion: Long)
+data class CommitReceiptDto(
+    val operationId: UUID,
+    val snapshotId: Long,
+    val schemaVersion: Long,
+    val endedFiles: Long? = null,
+)
 
 /** [endedFiles] is NON_NULL on the wire: only a replacement reports it. */
 data class CommitResultDto(val snapshotId: Long, val schemaVersion: Long, val endedFiles: Long? = null)

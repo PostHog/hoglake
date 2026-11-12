@@ -248,16 +248,21 @@ class ScopedWritesIntegrationTest {
                 val appended = """"appends":[${append("team_42", tableUuid("team_42"))}],"""
                 assertMissing(call(port, token, "POST", route, replacement(ns, appends = appended)), "append+ends $ns")
             }
-            // Its own namespace works, and a tenant is unaffected.
+            // Its own namespace works, and a tenant is unaffected. One live file each, so a
+            // replacement that ended the wrong namespace's files would show in the count.
+            val seeded =
+                call(port, tenant(), "POST", "/commit", "{\"appends\":[${append("team_42")},${append("main")}]}")
+            assertThat(seeded.statusCode()).describedAs(seeded.body()).isEqualTo(200)
             val head = catalogs.getCatalog(cat).headSnapshotId
             val own = replacement("team_42").replace("\"read_snapshot\":1", "\"read_snapshot\":$head")
             val done = call(port, token, "POST", route, own)
             assertThat(done.statusCode()).describedAs(done.body()).isEqualTo(200)
-            assertThat(json.readTree(done.body()).path("ended_files").asLong()).isGreaterThanOrEqualTo(0)
+            assertThat(json.readTree(done.body()).path("ended_files").asLong()).isEqualTo(1)
             val headNow = catalogs.getCatalog(cat).headSnapshotId
             val tenantBody = replacement("main").replace("\"read_snapshot\":1", "\"read_snapshot\":$headNow")
             val tenantDone = call(port, tenant(), "POST", route, tenantBody)
             assertThat(tenantDone.statusCode()).describedAs(tenantDone.body()).isEqualTo(200)
+            assertThat(json.readTree(tenantDone.body()).path("ended_files").asLong()).isEqualTo(1)
         }
     }
 

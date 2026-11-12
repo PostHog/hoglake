@@ -710,7 +710,9 @@ fun Application.installApiRoutes(
                             throw BadRequestException("invalid operation UUID")
                         }
                     val receipt = commits.receipt(call.catalog(), operation)
-                    call.respond(CommitReceiptDto(operation, receipt.snapshotId, receipt.schemaVersion))
+                    call.respond(
+                        CommitReceiptDto(operation, receipt.snapshotId, receipt.schemaVersion, receipt.endedFiles),
+                    )
                 }
 
                 post("/commit") {

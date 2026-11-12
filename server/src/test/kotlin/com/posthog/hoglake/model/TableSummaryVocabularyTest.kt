@@ -70,7 +70,7 @@ class TableSummaryVocabularyTest {
     }
 
     @Test
-    fun `TABLE_SCOPED holds the six kinds whose object_id is a table id`() {
+    fun `TABLE_SCOPED holds the seven kinds whose object_id is a table id`() {
         // The literal set, written out. This is the one assertion in the
         // file that a reviewer has to check against the schema by
         // reading it — deliberately, because it is the one fact no
@@ -84,6 +84,7 @@ class TableSummaryVocabularyTest {
                 "table_inserted_into",
                 "table_deleted_from",
                 "table_compacted",
+                "table_replaced",
             )
     }
 }

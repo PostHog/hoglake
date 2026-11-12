@@ -1613,29 +1613,24 @@ class CatalogService(private val jdbi: Jdbi) {
                     ?: throw HoglakeException.NotFound(
                         "table '$namespace.$table' in catalog '$catalog' at snapshot $to",
                     )
-            // TRUNCATE and replacement have no newly registered DV to carry its deletion through this
-            // append-oriented feed. The paired change kinds identify its DDL barrier; a file-ending
-            // replacement is identified by the files it ended.
+            // TRUNCATE and replacement end files and register no deletion vector for
+            // this append-oriented feed to carry the deletion. Truncate is the
+            // 'table_altered' + 'table_deleted_from' pair of one snapshot; a
+            // replacement that ended files of the table is its 'table_replaced'
+            // row. Both are change rows, which retention keeps for exactly the
+            // snapshots it keeps, so the barrier holds at the floor too.
             val truncated =
                 h.createQuery(
                     """
                     SELECT c.snapshot_id FROM hog_snapshot_change c
                     WHERE c.catalog_id = :catalogId AND c.object_id = :tableId
-                      AND c.kind = 'table_deleted_from'
                       AND c.snapshot_id > :fromSnapshot AND c.snapshot_id <= :toSnapshot
                       AND (
-                        EXISTS (
+                        c.kind = 'table_replaced'
+                        OR (c.kind = 'table_deleted_from' AND EXISTS (
                           SELECT 1 FROM hog_snapshot_change ddl
                           WHERE ddl.catalog_id = c.catalog_id AND ddl.object_id = c.object_id
-                            AND ddl.snapshot_id = c.snapshot_id AND ddl.kind = 'table_altered')
-                        -- A replacement ends whole files and registers no deletion
-                        -- vector, so its 'table_deleted_from' is the only trace.
-                        -- Retention can reclaim a row ended AT the floor snapshot,
-                        -- so that one snapshot of the window is not covered.
-                        OR EXISTS (
-                          SELECT 1 FROM hog_data_file f
-                          WHERE f.catalog_id = c.catalog_id AND f.table_id = c.object_id
-                            AND f.end_snapshot = c.snapshot_id))
+                            AND ddl.snapshot_id = c.snapshot_id AND ddl.kind = 'table_altered')))
                     ORDER BY c.snapshot_id LIMIT 1
                     """,
                 ).bind("catalogId", cat.catalogId)

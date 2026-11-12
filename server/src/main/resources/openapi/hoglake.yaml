@@ -2403,6 +2403,12 @@ paths:
                   operation_id: { type: string, format: uuid }
                   snapshot_id: { type: integer, format: int64 }
                   schema_version: { type: integer, format: int64 }
+                  ended_files:
+                    type: integer
+                    format: int64
+                    description: >
+                      Only for a receipt of POST /commit/replacements/prepared
+                      written since it was stored: the data files it ended.
         "400":
           description: Invalid operation UUID
         "404": { $ref: "#/components/responses/NotFound" }
@@ -3092,28 +3098,40 @@ paths:
         which only ends files. Each `file_ends` entry names a table with its
         `expected_table_uuid` and exactly one of `partitions` (non-empty
         tuples, each as long as the live partition spec, in the encoding of
-        `partition_values`: a `day` transform is the days since the epoch as
-        a decimal string) or `all_files: true`. A tuple that matches no live
-        file ends nothing and is not an error. A table may appear in one
+        `partition_values`: a `year`, `month`, `day`, `hour` or `bucket`
+        value is a base-10 integer string, such as 20401 for a day, and any
+        other encoding is a 422; null is allowed) or `all_files: true`. A
+        tuple that matches no live file ends nothing and is not an error. A table may appear in one
         entry only. Files appended by this request are never ended by it.
 
 
-        A table named in `file_ends` must be unchanged since read_snapshot,
-        including inserts, deletes, ended files and DDL, or the request is a
-        409 `commit_conflict`: re-read, replan and send again. Compaction
-        does not conflict; it moves rows between files, and the files ended
-        are those live at commit. A compaction that planned against an ended
-        file skips it. The commit is recorded as `table_deleted_from` (and
-        `table_inserted_into` with appends) on the table, so guarded writers
-        that read before it conflict. A changefeed window that crosses it is
-        409 `reconciliation_required`, as it is for a truncate; a file ended
-        at the very snapshot of the retention floor is not detected.
+        With `all_files`, the table must be unchanged since read_snapshot,
+        including inserts, deletes, ended files, replacements and DDL, or the
+        request is a 409 `commit_conflict`: re-read, replan and send again.
+        With `partitions`, only the target tuples must be unchanged: another
+        commit that began or ended a data file in one of them, or registered a
+        deletion vector against such a file, since read_snapshot is a 409
+        `commit_conflict`, as is any DDL on the table; appends to other
+        partitions do not conflict. Compaction never conflicts; it moves rows
+        between files, and the files ended are those live at commit. A
+        compaction that planned against an ended file skips it. The commit is
+        recorded as `table_deleted_from` (and `table_inserted_into` with
+        appends) on the table, and as `table_replaced` when it ended at least
+        one data file of it, so guarded writers that read before it conflict.
+        A changefeed window that crosses a `table_replaced` is 409
+        `reconciliation_required`, as it is for a truncate, whatever the
+        retention floor.
 
 
-        Replay of the same key and request returns the original snapshot
-        without writing, and `GET /commit/receipts/{operation}` serves it; a
-        replay omits `ended_files`. A changed payload under the same key is
-        422.
+        An appended path the catalog already records as a data file, live or
+        ended, is refused (422): ended files stay readable at earlier
+        snapshots, so their bytes cannot be overwritten.
+
+
+        Replay of the same key and request returns the original snapshot and
+        `ended_files` without writing, and `GET /commit/receipts/{operation}`
+        serves both; a receipt written before `ended_files` was stored omits
+        it. A changed payload under the same key is 422.
       parameters: [ { $ref: "#/components/parameters/catalog" } ]
       requestBody:
         required: true
@@ -3165,6 +3183,10 @@ paths:
 
 
             `table_dropped` likewise cannot be retried.
+
+
+            An appended path that is queued for removal is a 409 too: claim a
+            fresh path and retry.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
@@ -3181,7 +3203,12 @@ paths:
             Invalid request: a missing key, read_snapshot, author or message;
             file_ends that is empty, names a table twice, sets both or neither
             of partitions and all_files, or has tuples that are empty, of
-            different lengths or not as long as the live spec; a key reused
+            different lengths or not as long as the live spec; tuples for a
+            table that has no partition spec ("has no partition spec: end its
+            files with all_files"); a year, month, day, hour or bucket value
+            that is not a base-10 integer (the message names the table, field
+            and value); an appended path the catalog already records as a data
+            file, live or ended (the message names the path); a key reused
             with another payload.
             `object_prefix_violation` when a touched table has the
             object-prefix layout (Table.object_prefix_field) and an appended
@@ -4343,7 +4370,8 @@ components:
             the listed snapshot, whose change row
             names this table (the table-scoped change kinds —
             table_created / table_dropped / table_altered /
-            table_inserted_into / table_deleted_from / table_compacted).
+            table_inserted_into / table_deleted_from / table_compacted /
+            table_replaced).
             It SHRINKS as expiry advances the floor: it is what a reader
             can still time-travel to, not the table's lifetime commit
             count.
@@ -4989,9 +5017,10 @@ components:
           type: integer
           format: int64
           description: >
-            Only on POST /commit/replacements/prepared: the data files the
-            commit ended, summed over its tables. Omitted on every other
-            endpoint and on a replay.
+            Only for POST /commit/replacements/prepared: the data files the
+            commit ended, summed over its tables, also on a replay and on
+            GET /commit/receipts/{operation}. Omitted on every other
+            endpoint and on a receipt written before it was stored.
 
     DataFile:
       type: object
@@ -7302,7 +7331,10 @@ components:
           description: >
             Typed change rows. kind is the closed conflict vocabulary:
             namespace_created/dropped, table_created/dropped/altered,
-            table_inserted_into, table_deleted_from, table_compacted
+            table_inserted_into, table_deleted_from, table_replaced (a
+            replacement that ended data files of the table; recorded beside
+            table_deleted_from, and a changefeed barrier like a truncate),
+            table_compacted
             (a maintenance rewrite — object_id is the table; never a
             conflict for any writer, guarded or not, since it changes
             which files back a table and not which rows are visible in

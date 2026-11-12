@@ -2764,31 +2764,51 @@ ignoring `file_ends` and publishing only the appends.
 
 Each `file_ends` entry names a table with its required `expected_table_uuid` and
 exactly one of `partitions` (non-empty tuples, as long as the live partition spec
-and spelled as `partition_values` are, so a `day` transform is the days since the
-epoch as a decimal string) or `all_files: true`. A tuple that matches no live
-file ends nothing and is not an error. The request needs `idempotency_key`,
-`read_snapshot`, `author` and `message`, and is refused with 400 when `deletes` or
-`require_unchanged_tables` is present. `appends` may be empty. The response is the
-commit result plus `ended_files`, the data files ended; a replay omits it.
+and spelled as `partition_values` are) or `all_files: true`. A `year`, `month`,
+`day`, `hour` or `bucket` value must be a base-10 integer string (`20401` for a
+day, not `2025-11-10`; null is allowed, identity values are not checked), else 422
+naming the table, field and value: a tuple is matched as a literal string, so a
+date spelled another way would end nothing and double the day. A tuple that
+matches no live file ends nothing and is not an error. The request needs
+`idempotency_key`, `read_snapshot`, `author` and `message`, and is refused with 400
+when `deletes` or `require_unchanged_tables` is present. `appends` may be empty.
+The response is the commit result plus `ended_files`, the data files ended; the
+receipt stores it, so a replay and `GET /commit/receipts/{operation}` return it too
+(a receipt written before it was stored omits it).
 
-Under the commit lock the server checks the incarnation, then the conflict window
-(a table named in `file_ends` must be unchanged since `read_snapshot`, as a delete
-target is: inserts, deletes, ends and DDL conflict; **compaction does not**, since
-the files ended are those live at commit and a compaction planned against one
-skips it), then that no live file of the table was written under another partition
-spec (409 `partition_spec_mismatch`; `all_files` is exempt), then ends every
-matching live file and its live deletion vector, then appends. Files appended by
-the request are never ended by it. Nothing is deleted: ended files follow the
-normal retention, expiry and cleanup, as a truncate's do. The commit records
-`table_deleted_from` (and `table_inserted_into` with appends) on each table, which
-is what makes guarded writers that read earlier conflict. A changefeed window that
-crosses it is 409 `reconciliation_required`, as for a truncate; a file ended at
-exactly the retention floor's snapshot is not detected, because its row may already
-be reclaimed.
+Under the commit lock the server checks the incarnation, then the conflict window,
+then that no live file of the table was written under another partition spec (409
+`partition_spec_mismatch`; `all_files` is exempt; skipped without a scan when the
+table has only ever had one spec), then ends every matching live file and its live
+deletion vector, then appends. The conflict window depends on the end:
 
-Partition tuples are matched through the `(key_index, value)` lookup index on the
-first key, then compared in full. The spec-mismatch probe stops at the first
-offending live file but reads every live file of the table when there is none.
+- `all_files`: the table must be unchanged since `read_snapshot`, as a delete
+  target is. Inserts, deletes, ends, replacements and DDL conflict.
+- `partitions`: only the target tuples must be unchanged. Another commit that
+  began or ended a data file in one of them, or registered a deletion vector
+  against such a file, is a 409 `commit_conflict`, and so is any DDL on the table.
+  Appends to other partitions do not conflict, so a replacement does not livelock
+  under continuous appends elsewhere in the table.
+- **Compaction never conflicts**, in either case: the files ended are those live
+  at commit and a compaction planned against one skips it.
+
+Files appended by the request are never ended by it. A path the catalog already
+records as a data file, live or ended, cannot be appended here (422 naming the
+path): paths are deterministic, and overwriting an ended file's bytes would break
+every snapshot that still reads it. Nothing is deleted: ended files follow the
+normal retention, expiry and cleanup, as a truncate's do.
+
+The commit records `table_deleted_from` (and `table_inserted_into` with appends) on
+each table, which is what makes guarded writers that read earlier conflict. For a
+table whose files it really ended it also records `table_replaced`; a commit that
+ended nothing records none. The changefeed raises 409 `reconciliation_required`
+for a window that crosses a `table_replaced` (as for a truncate), on that row
+rather than on the ended files, which retention reclaims: the barrier holds at the
+retention floor too.
+
+Partition tuples are matched against the table's own live files, narrowed by the
+first key and then compared in full. The conflict probe for a `partitions` end
+reads the files and deletion vectors recorded since `read_snapshot`.
 
 ### Atomic DML transaction publication
 

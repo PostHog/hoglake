@@ -113,9 +113,11 @@ class ReplacementApiIntegrationTest {
                 // A replay returns the original snapshot, and the receipt serves it.
                 val replay = tree(post("/commit/replacements/prepared", request(read)))
                 assertThat(replay["snapshot_id"].asLong()).isEqualTo(read + 1)
-                assertThat(replay.has("ended_files")).isFalse()
+                assertThat(replay["ended_files"].asLong()).isEqualTo(1)
                 assertThat(head()).isEqualTo(read + 1)
-                assertThat(tree(client.get("$base/commit/receipts/$key"))["snapshot_id"].asLong()).isEqualTo(read + 1)
+                val receipt = tree(client.get("$base/commit/receipts/$key"))
+                assertThat(receipt["snapshot_id"].asLong()).isEqualTo(read + 1)
+                assertThat(receipt["ended_files"].asLong()).isEqualTo(1)
 
                 // The old routes refuse the new field rather than ignoring it.
                 val unknown = post("/commit/prepared", request(read))
