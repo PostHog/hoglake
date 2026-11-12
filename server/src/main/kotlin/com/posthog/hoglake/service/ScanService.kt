@@ -202,9 +202,10 @@ class ScanService(private val jdbi: Jdbi) {
                     }
                 }
             }
-            val ns =
-                NamespaceRepo.findLiveByName(h, cat.catalogId, namespace)
-                    ?: throw HoglakeException.NotFound("namespace '$namespace' in catalog '$catalog'")
+            // A pinned plan resolves the namespace incarnation alive at the
+            // pin, as CatalogService's pinned reads do.
+            val pinned = snapshot != null || atTimestamp != null
+            val ns = NamespaceRepo.requireForRead(h, cat, namespace, at, pinned)
             val t =
                 TableRepo.findAt(h, cat.catalogId, ns.namespaceId, table, at)
                     ?: throw HoglakeException.NotFound(
