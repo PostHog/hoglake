@@ -102,23 +102,15 @@ change no conforming issuer makes, which an issuer's suite skips.
   purpose (`use` other than `sig`, or an `alg` hoglake does not verify, as
   identity providers publish for encryption) is skipped and needs no `kid`.
 - `iss` must equal `HOGLAKE_AUTH_ISSUER`; `aud` must be, or contain,
-  `HOGLAKE_AUTH_AUDIENCE`.
-  Hogtower's Hoglite-routed metadata grants explicitly carry `["hoglake","hoglite"]`.
-  This generic verifier applies no issuer-specific audience policy.
-  Hoglite independently requires its configured metadata audience pair.
-  Hogtower vending requires the separate single-string audience `hogtower-vend`.
+  `HOGLAKE_AUTH_AUDIENCE`. A token the server will forward to a backend that
+  verifies it independently (a hoglite backend, [below](#backends-that-verify-the-token-themselves))
+  carries that backend's audience as well, `["hoglake", "hoglite"]`; hoglake
+  checks only that its own audience is present and applies no other audience
+  policy.
 - `exp` is required. `nbf` and `iat` are optional; an `iat` in the future is
   refused.
 
 ### Claims
-
-Hoglake forwards only the current request's verified JWT to its configured Hoglite backend.
-Request-local client wrappers share transport and routing state, never mutable caller credentials.
-Ordinary reads and writes do not provision tenants or bootstrap schemas.
-Catalog-bound operator requests perform provisioning and deletion.
-Hoglite rejects scoped or predicate-constrained authority because raw SQL cannot preserve those constraints.
-Existing single-audience metadata tokens remain valid at Hoglake until expiry.
-Drain their remaining fifteen-minute lifetime before enabling Hoglite enforcement.
 
 The core, which every issuer must emit:
 
@@ -156,6 +148,22 @@ deployment needs them; hoglake applies them without knowing what they mean:
 | `prd` | on a `scoped` token: `{"<field>": {"<value>": "read" \| "write", …}}`, or `{"<field>": {"*": …}}`. The field must be one of `HOGLAKE_AUTH_PREDICATE_FIELDS`. hoglake filters metadata by `field ∈ values` and refuses commits whose files are attributed to a value the token may not write. This is how a multi-tenant issuer narrows one catalog to one tenant; PostHog's field is `team_id` |
 | `usr` | on a `scoped` token: an opaque end-user name for access logs, never used for authorization |
 | `rtg` | verified placement of the single catalog the token names on a configured backend (`b`, `be`, and `t` for hoglite); mismatches answer 401 `unknown_backend` |
+
+### Backends that verify the token themselves
+
+A catalog placed on a hoglite backend (`HOGLAKE_BACKENDS_FILE`; it requires
+`warn` or `enforce`) is served by a separate process that verifies the token
+on its own. hoglake forwards the current request's verified JWT to that
+backend unchanged and nothing else: no credential of hoglake's own, and no
+caller credential shared across requests. The backend verifies it offline
+against the same JWKS, requires its own audience to be present, and binds the
+request to the backend and tenant the `rtg` claim names. It refuses `scoped`
+tokens and any `prd` constraint, because raw SQL cannot preserve them.
+Ordinary reads and writes never provision a tenant or bootstrap a schema
+there; only a catalog-bound `operator` request provisions or deletes. An
+issuer that starts adding the backend audience to tokens it already mints
+should let the older single-audience tokens expire before the backend
+enforces.
 
 ### Scoped tokens, exactly
 
