@@ -138,18 +138,10 @@ jobs:
           HOGLITE_REQUIRED: "1"
         run: ./gradlew --no-daemon :test --tests 'com.posthog.hoglake.hoglite.*IntegrationTest'
 
-      # The fail-closed proof: the live classes ran, and none skipped.
+      # The fail-closed proof: the live classes ran, and none skipped. The
+      # same script closes the local run (ci/hoglite-live-local.sh).
       - name: Require executed live tests
-        working-directory: server/build/test-results/test
-        run: |
-          shopt -s nullglob
-          reports=(TEST-com.posthog.hoglake.hoglite.*IntegrationTest.xml)
-          test ${#reports[@]} -gt 0
-          sum() { cat "${reports[@]}" | grep -o "<testsuite [^>]*" | grep -o " $1=\"[0-9]*\"" | tr -dc '0-9\n' | awk '{ n += $1 } END { print n + 0 }'; }
-          tests=$(sum tests)
-          skipped=$(sum skipped)
-          echo "hoglite live: $tests tests in ${#reports[@]} classes, $skipped skipped against $HOGLITE_BUILD"
-          test "$tests" -gt 0 && test "$skipped" -eq 0
+        run: ci/check-hoglite-live.sh
 
       - name: Upload test reports
         if: failure()

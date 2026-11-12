@@ -24,7 +24,9 @@ import java.util.UUID
  * The binary comes from HOGLITE_BINARY, else from `hoglited` on PATH.
  * Without a binary the tests skip, so a plain `:test` stays green on a
  * machine without the engine. When HOGLITE_REQUIRED=1 (the hoglite-live
- * CI job), a missing binary is a failure, not a skip.
+ * CI job, `just test-hoglite`), a missing binary is a failure, not a skip.
+ * hoglited ships for Linux only; on macOS `just test-hoglite` runs these
+ * classes in a Linux container (ci/hoglite-live-local.sh).
  */
 internal class HogliteConformanceEngine(private val authArgs: List<String> = emptyList()) : AutoCloseable {
     private lateinit var minio: MinIOContainer
@@ -155,7 +157,9 @@ internal class HogliteConformanceEngine(private val authArgs: List<String> = emp
                     )}')"
                 }
             }
-            assumeTrue(binary != null) { "no hoglited binary (set HOGLITE_BINARY); skipping hoglite live tests" }
+            assumeTrue(binary != null) {
+                "no hoglited binary (set HOGLITE_BINARY, or run `just test-hoglite`); skipping hoglite live tests"
+            }
             return binary!!
         }
     }

@@ -11,10 +11,20 @@ mod millrace
 default:
     @just --list
 
-# Server and pyhoglake tests. Also run `just live-python` for required live checks.
+# Server and pyhoglake tests. Also run `just live-python` and
+# `just test-hoglite` for required live checks.
 test-all:
     just server test
     just pyhoglake test
+
+# CI's hoglite-live (a required check) locally: `just server test` skips
+# these classes for want of a Linux hoglited, so this runs them in a Linux
+# container on the newest tested build (ci/hoglite-live-local.sh). Needs
+# docker and an authenticated gh. Optional Gradle --tests filter, e.g.
+# `just test-hoglite 'com.posthog.hoglake.hoglite.HoglitePinned*'`.
+# The hoglite live tests in a Linux container; fails on skips.
+test-hoglite filter='com.posthog.hoglake.hoglite.*IntegrationTest':
+    ci/hoglite-live-local.sh '{{filter}}'
 
 # Style gates: ktlint (server) + ruff check/format (pyhoglake, hedgerow,
 # millrace), every tool pinned. bench is not wired in yet — it passes
