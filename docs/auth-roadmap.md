@@ -56,7 +56,7 @@ means the PR has review approval and is waiting on CI or a merge.
 - [x] **hogtower** `storage` returned alongside the token in the
       `/oauth/token` response with `include_storage=true`, behind a flag;
       `exp` never later than the session; bounded wait so the public listener
-      always answers — [PostHog/hogtower#186](https://github.com/PostHog/hogtower/pull/186), 
+      always answers — [PostHog/hogtower#186](https://github.com/PostHog/hogtower/pull/186)
 - [x] **hoglake** `docs/auth.md` refreshed once the two hoglake PRs land:
       RS256, `scope`, `ten`-optional, the configurable cap and
       hoglake-generated vectors from "planned" to "built"; `cat` and `scope`
@@ -66,10 +66,10 @@ means the PR has review approval and is waiting on CI or a merge.
 - [x] **hogtower** Conform to hoglake's contract vectors instead of
       generating them: the copied file plus a test that it matches, with
       hoglake's issuer, kid, foreign audience, operator subject and `expect`
-      fields
+      fields — [PostHog/hogtower#197](https://github.com/PostHog/hogtower/pull/197)
 - [x] **charts** `HOGLAKE_AUTH_CLIENT_CLASSES=hogtower` on every hoglake
       deployment, so the `client="hogtower"` metric series survives the
-      issuer-neutral User-Agent map — [PostHog/charts#20181](https://github.com/PostHog/charts/pull/20181) — [PostHog/hogtower#197](https://github.com/PostHog/hogtower/pull/197)
+      issuer-neutral User-Agent map — [PostHog/charts#20181](https://github.com/PostHog/charts/pull/20181)
 
 ## Phase 1, wave 2 — standalone hoglake, and storage through the broker
 
