@@ -388,7 +388,14 @@ paths:
               schema: { $ref: "#/components/schemas/Namespace" }
         "409": { $ref: "#/components/responses/Conflict" }
         "422":
-          description: Name fails the identifier pattern.
+          description: >-
+            Name fails the identifier pattern, or is reserved on this server
+            (`HOGLAKE_RESERVED_NAMESPACES`, matched ignoring ASCII case),
+            error `validation`. A reserved name is refused for every caller
+            and every backend, before any write (a mount catalog answers its
+            own 403 `read_only_catalog` first); a namespace created before
+            its name was reserved keeps working but cannot be created again
+            once dropped.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
