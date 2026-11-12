@@ -228,7 +228,16 @@ keys, or a `broker` missing a setting refuses to start.
 inputs and uploads its output, cleanup deletes, and nothing needs a
 delete-only grant. The hydrator asks for `read`. The token request is the
 clients' client-credentials form, `grant_type=client_credentials` with
-`audience` = `HOGLAKE_STORAGE_BROKER_AUDIENCE` (default `hoglake`).
+`audience` = `HOGLAKE_STORAGE_BROKER_AUDIENCE` (default `hoglake`). Both
+URLs must be `https` — the client secret and every vended key cross that
+hop — with `http` accepted only for `localhost`, `127.0.0.1` or `[::1]`,
+the dev stack's and the test suite's in-process brokers; anything else
+refuses to start. The refresh lead is the margin or half the credential's
+lifetime, whichever is shorter, for the session and for the bearer token
+alike, so a 300-second session is still cached for 150 seconds rather than
+re-vended on every request. A refresh that fails is not retried by the
+next request: while the held session is valid the provider waits 5 seconds
+before trying again, doubling to a minute, and resets on success.
 `broker` is how a deployment puts the server's own S3 access behind the same
 authority as its clients' access: the server then holds no cloud identity of
 its own, and every session it uses is one the broker chose to grant and can

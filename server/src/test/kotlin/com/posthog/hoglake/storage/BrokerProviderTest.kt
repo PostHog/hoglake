@@ -50,6 +50,9 @@ class BrokerProviderTest {
         @Volatile
         var expiration: String = "2030-01-01T00:00:00Z"
 
+        @Volatile
+        var tokenExpiresIn: Long = 600
+
         /** Bearers the vend endpoint accepts; empty = any. */
         val acceptedBearers = CopyOnWriteArrayList<String>()
 
@@ -78,7 +81,11 @@ class BrokerProviderTest {
                     } else {
                         val n = tokenSerial.incrementAndGet()
                         acceptedBearers += "tok$n"
-                        reply(ex, 200, """{"access_token":"tok$n","token_type":"Bearer","expires_in":600}""")
+                        reply(
+                            ex,
+                            200,
+                            """{"access_token":"tok$n","token_type":"Bearer","expires_in":$tokenExpiresIn}""",
+                        )
                     }
                 }
                 createContext("/storage") { ex ->
@@ -229,10 +236,15 @@ class BrokerProviderTest {
             broker.vendStatus = 503
             clock.advance(Duration.ofMinutes(27)) // 3 min left: refresh due, broker down
             assertThat((creds.resolveCredentials() as AwsSessionCredentials).accessKeyId()).isEqualTo("AKIA1")
-            // Every request inside the margin retries the broker; none of
-            // them throws while the session is still good.
+            assertThat(broker.vendRequests).hasSize(2)
+            // The next requests inside the backoff reuse the held session
+            // without calling the broker; the one after the backoff tries.
             creds.resolveCredentials()
-            assertThat(broker.vendRequests.size).isGreaterThanOrEqualTo(3)
+            creds.resolveCredentials()
+            assertThat(broker.vendRequests).hasSize(2)
+            clock.advance(BrokerProvider.BACKOFF_INITIAL)
+            assertThat((creds.resolveCredentials() as AwsSessionCredentials).accessKeyId()).isEqualTo("AKIA1")
+            assertThat(broker.vendRequests).hasSize(3)
 
             clock.advance(Duration.ofMinutes(4)) // past expiry: nothing valid to hand out
             assertThatThrownBy { creds.resolveCredentials() }
@@ -339,5 +351,105 @@ class BrokerProviderTest {
             assertThat(broker.vendRequests).hasSize(1)
             assertThat(broker.tokenRequests).hasSize(1)
         }
+    }
+
+    @Test
+    fun `a session no longer than the margin is still cached for half its life`() {
+        broker.expiration = "2029-12-31T23:03:20Z" // 200 s from the clock, under the 300 s margin
+        provider(margin = Duration.ofMinutes(5)).use { p ->
+            val creds = p.credentialsFor("acme", "s3://b/acme/", StorageAccess.READ)
+            repeat(5) { creds.resolveCredentials() }
+            clock.advance(Duration.ofSeconds(90))
+            repeat(5) { creds.resolveCredentials() }
+            assertThat(broker.vendRequests).describedAs("one vend for the first 100 s").hasSize(1)
+
+            broker.expiration = "2029-12-31T23:08:00Z"
+            clock.advance(Duration.ofSeconds(15)) // 105 s in: past half the life
+            creds.resolveCredentials()
+            assertThat(broker.vendRequests).hasSize(2)
+        }
+    }
+
+    @Test
+    fun `a token no longer than the margin is still cached for half its life`() {
+        broker.tokenExpiresIn = 200
+        provider(margin = Duration.ofMinutes(5)).use { p ->
+            val a = p.credentialsFor("a", "s3://b/a/", StorageAccess.READ)
+            val b = p.credentialsFor("b", "s3://b/b/", StorageAccess.READ)
+            val c = p.credentialsFor("c", "s3://b/c/", StorageAccess.READ)
+            a.resolveCredentials()
+            clock.advance(Duration.ofSeconds(90))
+            b.resolveCredentials()
+            assertThat(broker.tokenRequests).describedAs("one token serves vends inside the first 100 s").hasSize(1)
+            clock.advance(Duration.ofSeconds(15))
+            c.resolveCredentials()
+            assertThat(broker.tokenRequests).hasSize(2)
+        }
+    }
+
+    @Test
+    fun `concurrent requests during a broker outage cost one attempt per backoff window`() {
+        broker.expiration = "2029-12-31T23:30:00Z"
+        provider(margin = Duration.ofMinutes(5)).use { p ->
+            val creds = p.credentialsFor("acme", "s3://b/acme/", StorageAccess.WRITE)
+            creds.resolveCredentials()
+            assertThat(broker.vendRequests).hasSize(1)
+
+            broker.vendStatus = 503
+            clock.advance(Duration.ofMinutes(26)) // inside the margin, broker down
+
+            fun storm(): Int {
+                val ok = AtomicInteger(0)
+                val threads =
+                    (1..8).map {
+                        Thread {
+                            creds.resolveCredentials()
+                            ok.incrementAndGet()
+                        }
+                    }
+                threads.forEach { it.start() }
+                threads.forEach { it.join() }
+                return ok.get()
+            }
+            assertThat(storm()).isEqualTo(8)
+            assertThat(broker.vendRequests).describedAs("one failed attempt, seven reuses").hasSize(2)
+
+            // Inside the 5 s backoff: no attempt at all.
+            clock.advance(Duration.ofSeconds(4))
+            assertThat(storm()).isEqualTo(8)
+            assertThat(broker.vendRequests).hasSize(2)
+            // Past it: one more attempt; the delay then doubles to 10 s.
+            clock.advance(Duration.ofSeconds(2))
+            assertThat(storm()).isEqualTo(8)
+            assertThat(broker.vendRequests).hasSize(3)
+            clock.advance(Duration.ofSeconds(6))
+            assertThat(storm()).isEqualTo(8)
+            assertThat(broker.vendRequests).hasSize(3)
+            clock.advance(Duration.ofSeconds(5))
+            assertThat(storm()).isEqualTo(8)
+            assertThat(broker.vendRequests).hasSize(4)
+
+            // The broker recovers: the next attempt succeeds and the delay resets.
+            broker.vendStatus = 200
+            broker.expiration = "2030-01-01T01:00:00Z"
+            clock.advance(Duration.ofSeconds(20))
+            assertThat((creds.resolveCredentials() as AwsSessionCredentials).accessKeyId()).isEqualTo("AKIA2")
+            assertThat(broker.vendRequests).hasSize(5)
+        }
+    }
+
+    @Test
+    fun `plain http is refused except to the loopback host`() {
+        assertThatThrownBy {
+            BrokerProvider(
+                brokerUrl = URI.create("http://broker.example/storage"),
+                tokenUrl = broker.tokenUrl,
+                clientId = "c",
+                clientSecret = "s",
+                audience = "hoglake",
+                refreshMargin = Duration.ofMinutes(5),
+            )
+        }.isInstanceOf(IllegalArgumentException::class.java).hasMessageContaining("https")
+        provider().use { p -> assertThat(p.toString()).contains("127.0.0.1") }
     }
 }

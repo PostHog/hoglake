@@ -64,29 +64,63 @@ class StorageProviderConfigTest {
             .isInstanceOf(IllegalArgumentException::class.java)
             .hasMessageContaining("HOGLAKE_STORAGE_BROKER_URL")
             .hasMessageContaining("HOGLAKE_STORAGE_BROKER_CLIENT_SECRET")
-        assertThatThrownBy { broker(storageBrokerClientSecret = "") }
+        assertThatThrownBy { broker(storageBrokerClientSecret = "")() }
             .isInstanceOf(IllegalArgumentException::class.java)
             .hasMessageContaining("HOGLAKE_STORAGE_PROVIDER=broker")
-        assertThatThrownBy { broker(s3AccessKey = "k", s3SecretKey = "s") }
+        for (leftover in listOf(
+            broker(s3AccessKey = "k", s3SecretKey = "s"),
+            broker(s3AccessKey = "k"),
+            broker(s3SecretKey = "s"),
+        )) {
+            assertThatThrownBy { leftover() }
+                .isInstanceOf(IllegalArgumentException::class.java)
+                .hasMessageContaining("HOGLAKE_S3_ACCESS_KEY")
+        }
+        assertThatThrownBy { broker(storageBrokerUrl = "ftp://broker/vend")() }
             .isInstanceOf(IllegalArgumentException::class.java)
-            .hasMessageContaining("HOGLAKE_S3_ACCESS_KEY")
-        assertThatThrownBy { broker(storageBrokerUrl = "ftp://broker/vend") }
-            .isInstanceOf(IllegalArgumentException::class.java)
-            .hasMessageContaining("HOGLAKE_STORAGE_BROKER_URL must be an http(s) URL")
-        assertThatThrownBy { broker(storageBrokerTokenUrl = "not a url") }
+            .hasMessageContaining("HOGLAKE_STORAGE_BROKER_URL must be an https URL")
+        assertThatThrownBy { broker(storageBrokerTokenUrl = "not a url")() }
             .isInstanceOf(IllegalArgumentException::class.java)
             .hasMessageContaining("HOGLAKE_STORAGE_BROKER_TOKEN_URL")
-        assertThatThrownBy { broker(storageBrokerRefreshMarginSeconds = -1) }
+        assertThatThrownBy { broker(storageBrokerRefreshMarginSeconds = -1)() }
             .isInstanceOf(IllegalArgumentException::class.java)
             .hasMessageContaining("HOGLAKE_STORAGE_BROKER_REFRESH_MARGIN_SECONDS")
-        assertThatThrownBy { broker(storageBrokerAudience = " ") }
+        assertThatThrownBy { broker(storageBrokerAudience = " ")() }
             .isInstanceOf(IllegalArgumentException::class.java)
             .hasMessageContaining("HOGLAKE_STORAGE_BROKER_AUDIENCE")
     }
 
     @Test
+    fun `broker urls are https, or http to the loopback host, and are trimmed`() {
+        assertThatThrownBy { broker(storageBrokerUrl = "http://broker.example/storage")() }
+            .isInstanceOf(IllegalArgumentException::class.java)
+            .hasMessageContaining("HOGLAKE_STORAGE_BROKER_URL must be an https URL (http only for localhost)")
+        assertThatThrownBy { broker(storageBrokerTokenUrl = "http://10.0.0.5/oauth/token")() }
+            .isInstanceOf(IllegalArgumentException::class.java)
+            .hasMessageContaining("HOGLAKE_STORAGE_BROKER_TOKEN_URL")
+        for (dev in listOf(
+            "http://localhost:8081/storage",
+            "http://127.0.0.1:8081/storage",
+            "http://[::1]:8081/storage",
+        )) {
+            assertThat(
+                broker(storageBrokerUrl = dev)().effectiveStorageProvider,
+            ).isEqualTo(Config.StorageProviderKind.BROKER)
+        }
+        // Whitespace around a value passes the boot check AND builds.
+        val padded =
+            broker(
+                storageBrokerUrl = "  https://broker.example/storage \n",
+                storageBrokerTokenUrl = " https://issuer.example/oauth/token ",
+            )()
+        StorageCredentialProviders.fromConfig(padded).use { provider ->
+            assertThat(provider.toString()).isEqualTo("broker(https://broker.example/storage)")
+        }
+    }
+
+    @Test
     fun `a complete broker configuration builds the broker provider`() {
-        val cfg = broker()
+        val cfg = broker()()
         assertThat(cfg.effectiveStorageProvider).isEqualTo(Config.StorageProviderKind.BROKER)
         assertThat(cfg.storageBrokerAudience).isEqualTo("hoglake")
         assertThat(cfg.storageBrokerRefreshMarginSeconds).isEqualTo(300)
@@ -98,6 +132,7 @@ class StorageProviderConfigTest {
         }
     }
 
+    /** A broker config as a thunk, so a refusal is raised inside the assertion that expects it. */
     private fun broker(
         storageBrokerUrl: String = "https://broker.example/storage",
         storageBrokerTokenUrl: String = "https://issuer.example/oauth/token",
@@ -107,15 +142,18 @@ class StorageProviderConfigTest {
         storageBrokerRefreshMarginSeconds: Long = 300,
         s3AccessKey: String = "",
         s3SecretKey: String = "",
-    ) = Config(
-        storageProvider = "broker",
-        storageBrokerUrl = storageBrokerUrl,
-        storageBrokerTokenUrl = storageBrokerTokenUrl,
-        storageBrokerClientId = storageBrokerClientId,
-        storageBrokerClientSecret = storageBrokerClientSecret,
-        storageBrokerAudience = storageBrokerAudience,
-        storageBrokerRefreshMarginSeconds = storageBrokerRefreshMarginSeconds,
-        s3AccessKey = s3AccessKey,
-        s3SecretKey = s3SecretKey,
-    )
+    ): () -> Config =
+        {
+            Config(
+                storageProvider = "broker",
+                storageBrokerUrl = storageBrokerUrl,
+                storageBrokerTokenUrl = storageBrokerTokenUrl,
+                storageBrokerClientId = storageBrokerClientId,
+                storageBrokerClientSecret = storageBrokerClientSecret,
+                storageBrokerAudience = storageBrokerAudience,
+                storageBrokerRefreshMarginSeconds = storageBrokerRefreshMarginSeconds,
+                s3AccessKey = s3AccessKey,
+                s3SecretKey = s3SecretKey,
+            )
+        }
 }

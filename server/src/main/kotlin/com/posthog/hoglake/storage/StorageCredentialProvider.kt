@@ -144,8 +144,8 @@ object StorageCredentialProviders {
             Config.StorageProviderKind.STATIC -> StaticProvider(cfg.s3AccessKey, cfg.s3SecretKey)
             Config.StorageProviderKind.BROKER ->
                 BrokerProvider(
-                    brokerUrl = URI.create(cfg.storageBrokerUrl),
-                    tokenUrl = URI.create(cfg.storageBrokerTokenUrl),
+                    brokerUrl = BrokerUrls.require("HOGLAKE_STORAGE_BROKER_URL", cfg.storageBrokerUrl),
+                    tokenUrl = BrokerUrls.require("HOGLAKE_STORAGE_BROKER_TOKEN_URL", cfg.storageBrokerTokenUrl),
                     clientId = cfg.storageBrokerClientId,
                     clientSecret = cfg.storageBrokerClientSecret,
                     audience = cfg.storageBrokerAudience,
@@ -162,4 +162,35 @@ object StorageCredentialProviders {
         secretKey: String?,
     ): StorageCredentialProvider =
         if (accessKey != null && secretKey != null) StaticProvider(accessKey, secretKey) else AmbientProvider()
+}
+
+/**
+ * The one rule for the broker's two URLs, applied at boot (`Config`) and
+ * again where the provider is built: `https`, because the client secret
+ * and every vended key cross this hop; `http` only to the loopback host
+ * a dev stack or an in-test server listens on. Surrounding whitespace is
+ * trimmed, so a value that passed the boot check builds too.
+ */
+object BrokerUrls {
+    private val loopback = setOf("localhost", "127.0.0.1", "[::1]", "::1")
+
+    fun require(
+        name: String,
+        raw: String,
+    ): URI {
+        val trimmed = raw.trim()
+        val uri =
+            runCatching { URI.create(trimmed) }.getOrElse {
+                throw IllegalArgumentException("$name must be an https URL, got '$raw'")
+            }
+        val host = uri.host?.lowercase()
+        val ok =
+            when (uri.scheme) {
+                "https" -> host != null
+                "http" -> host != null && host in loopback
+                else -> false
+            }
+        require(ok) { "$name must be an https URL (http only for localhost), got '$raw'" }
+        return uri
+    }
 }

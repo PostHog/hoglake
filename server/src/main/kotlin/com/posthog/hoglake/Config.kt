@@ -6,6 +6,7 @@ import com.posthog.hoglake.auth.JwtVerifier
 import com.posthog.hoglake.auth.RESERVED_CLIENT_CLASSES
 import com.posthog.hoglake.hoglite.HogliteBackend
 import com.posthog.hoglake.service.ReservedNamespaces
+import com.posthog.hoglake.storage.BrokerUrls
 import com.posthog.hoglake.store.BackendKind
 import com.posthog.hoglake.store.MountHost
 import com.posthog.hoglake.store.MountMatch
@@ -1496,17 +1497,12 @@ data class Config(
                         "HOGLAKE_STORAGE_BROKER_TOKEN_URL, HOGLAKE_STORAGE_BROKER_CLIENT_ID and " +
                         "HOGLAKE_STORAGE_BROKER_CLIENT_SECRET"
                 }
-                require(!s3Keys) {
+                require(s3AccessKey.isBlank() && s3SecretKey.isBlank()) {
                     "HOGLAKE_STORAGE_PROVIDER=broker vends every session; unset " +
                         "HOGLAKE_S3_ACCESS_KEY and HOGLAKE_S3_SECRET_KEY"
                 }
-                for ((name, value) in listOf(
-                    "HOGLAKE_STORAGE_BROKER_URL" to storageBrokerUrl,
-                    "HOGLAKE_STORAGE_BROKER_TOKEN_URL" to storageBrokerTokenUrl,
-                )) {
-                    val scheme = runCatching { java.net.URI.create(value.trim()).scheme }.getOrNull()
-                    require(scheme == "https" || scheme == "http") { "$name must be an http(s) URL, got '$value'" }
-                }
+                BrokerUrls.require("HOGLAKE_STORAGE_BROKER_URL", storageBrokerUrl)
+                BrokerUrls.require("HOGLAKE_STORAGE_BROKER_TOKEN_URL", storageBrokerTokenUrl)
                 require(storageBrokerAudience.isNotBlank()) { "HOGLAKE_STORAGE_BROKER_AUDIENCE must not be blank" }
                 require(storageBrokerRefreshMarginSeconds >= 0) {
                     "HOGLAKE_STORAGE_BROKER_REFRESH_MARGIN_SECONDS must not be negative, " +
