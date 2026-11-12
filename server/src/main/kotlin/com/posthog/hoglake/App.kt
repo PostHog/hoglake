@@ -575,6 +575,18 @@ class App private constructor(
                 val spec = javaClass.getResource("/openapi/hoglake.yaml")!!.readText()
                 call.respondText(spec, ContentType.parse("application/yaml"))
             }
+            // The local issuer's public key (HOGLAKE_AUTH_MODE=local), the
+            // way any issuer publishes one. Read from the API listener's
+            // service on purpose: the public listener's copy is the same key,
+            // and a key is the one thing both doors may hand out.
+            get("/.well-known/jwks.json") {
+                val jwks = this@App.auth.localJwks
+                if (jwks == null) {
+                    call.respondText("not found", status = HttpStatusCode.NotFound)
+                } else {
+                    call.respondText(jwks, ContentType.Application.Json)
+                }
+            }
         }
         app.installApiRoutes(
             catalogSelector,

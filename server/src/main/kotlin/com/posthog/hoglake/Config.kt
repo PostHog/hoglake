@@ -15,6 +15,21 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.util.UUID
 
+/**
+ * A configuration value that must not print: `toString` redacts it, so a
+ * data-class dump, a log line or an exception message that interpolates the
+ * config shows `<redacted>` and not the secret. Equality is by value.
+ */
+class SecretString(
+    val value: String,
+) {
+    override fun toString(): String = if (value.isEmpty()) "" else "<redacted>"
+
+    override fun equals(other: Any?): Boolean = other is SecretString && other.value == value
+
+    override fun hashCode(): Int = value.hashCode()
+}
+
 /** Process configuration, with an optional backend allowlist file. */
 data class Config(
     /**
@@ -325,6 +340,17 @@ data class Config(
      * `other`. Empty (the default): only the built-in generic classes.
      */
     val authClientClasses: Set<String> = nameList(env("HOGLAKE_AUTH_CLIENT_CLASSES", "")),
+    /**
+     * The server's own ES256 signing key, for `HOGLAKE_AUTH_MODE=local` only
+     * (docs/auth.md, "Local issuer"): a private P-256 JWK, base64url, as
+     * `hoglake token keygen` prints it. ENV-ONLY by decision — no key file and
+     * nothing persisted — so the one place a standalone install's key lives is
+     * the environment the server and the minting shell share. Refused outside
+     * `local` (a key the server would ignore is a deployment that believes it
+     * is local and is not) and required under it. Held as a [SecretString] so
+     * no `toString` of this config prints it.
+     */
+    val authSigningKey: SecretString = SecretString(env("HOGLAKE_AUTH_SIGNING_KEY", "")),
     /**
      * The orgs whose mount may serve, comma-separated: the `<id>` of each
      * mount `<id>-events`, matching the orgs the mount writer manages. `*` admits every mount. Empty (the default) admits none, and no
@@ -1444,8 +1470,8 @@ data class Config(
                 "HOGLAKE_MOUNT_HOSTS_FILE (this server is a mount Client) cannot be set with " +
                     "HOGLAKE_MOUNT_ALLOWLIST (this server is a mount Host): a server is one or the other"
             }
-            require(authMode.trim().lowercase() in setOf("warn", "enforce")) {
-                "HOGLAKE_MOUNT_HOSTS_FILE requires HOGLAKE_AUTH_MODE warn or enforce: " +
+            require(authMode.trim().lowercase() in setOf("warn", "enforce", "local")) {
+                "HOGLAKE_MOUNT_HOSTS_FILE requires HOGLAKE_AUTH_MODE warn, enforce or local: " +
                     "a mount serves only verified callers"
             }
             require(authPredicateFields.split(',').any { it.isNotBlank() }) {
@@ -1461,8 +1487,26 @@ data class Config(
         require(defaultBackend == "postgres" || defaultBackend == "none") {
             "HOGLAKE_DEFAULT_BACKEND must be postgres or none; hoglite cannot be a default backend"
         }
-        require(backendsFile.isBlank() || authMode.trim().lowercase() in setOf("warn", "enforce")) {
-            "HOGLAKE_BACKENDS_FILE requires HOGLAKE_AUTH_MODE warn or enforce: hoglite needs auth"
+        require(backendsFile.isBlank() || authMode.trim().lowercase() in setOf("warn", "enforce", "local")) {
+            "HOGLAKE_BACKENDS_FILE requires HOGLAKE_AUTH_MODE warn, enforce or local: hoglite needs auth"
+        }
+        // The local issuer's key goes with its mode and with nothing else. Checked
+        // here, by name, before AuthService decodes it: every message names the
+        // variable an operator has to set or unset, and none echoes the key.
+        if (authMode.trim().lowercase() == "local") {
+            require(authSigningKey.value.isNotBlank()) {
+                "HOGLAKE_AUTH_MODE=local requires HOGLAKE_AUTH_SIGNING_KEY: run `hoglake token keygen` " +
+                    "and export the line it prints"
+            }
+            require(authJwksFile.isBlank() && authJwksUrl.isBlank()) {
+                "HOGLAKE_AUTH_MODE=local derives its JWKS from HOGLAKE_AUTH_SIGNING_KEY: " +
+                    "unset HOGLAKE_AUTH_JWKS_FILE and HOGLAKE_AUTH_JWKS_URL"
+            }
+        } else {
+            require(authSigningKey.value.isBlank()) {
+                "HOGLAKE_AUTH_SIGNING_KEY is read only under HOGLAKE_AUTH_MODE=local (it is set, and the mode is " +
+                    "'${authMode.trim()}'): unset it, or set the mode"
+            }
         }
         require(postgresBackendId.isEmpty() || canonicalBackendId(postgresBackendId) !in hogliteBackends) {
             "HOGLAKE_POSTGRES_BACKEND_ID duplicates a hoglite backend id"
@@ -1575,7 +1619,7 @@ data class Config(
                 "and HOGLAKE_METRICS_PORT=$metricsPort"
         }
         require(publicPort == 0 || authMode.trim().lowercase() != "off") {
-            "HOGLAKE_PUBLIC_PORT=$publicPort requires HOGLAKE_AUTH_MODE warn or enforce: the public listener " +
+            "HOGLAKE_PUBLIC_PORT=$publicPort requires HOGLAKE_AUTH_MODE warn, enforce or local: the public listener " +
                 "always enforces, so it needs HOGLAKE_AUTH_ISSUER and a JWKS source"
         }
         // Netty refuses a group of zero with an IllegalArgumentException

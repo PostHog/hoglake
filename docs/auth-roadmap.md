@@ -73,12 +73,12 @@ means the PR has review approval and is waiting on CI or a merge.
 
 ## Phase 1, wave 2 — standalone hoglake, and storage through the broker
 
-- [ ] **hoglake** `HOGLAKE_AUTH_MODE=local`: the server trusts its own
+- [x] **hoglake** `HOGLAKE_AUTH_MODE=local`: the server trusts its own
       signing key (`HOGLAKE_AUTH_SIGNING_KEY`) and serves its public half at
       `/.well-known/jwks.json`
-- [ ] **hoglake** `hoglake token keygen` and `hoglake token mint --catalog …
+- [x] **hoglake** `hoglake token keygen` and `hoglake token mint --catalog …
       --scope … --ttl … [--operator]`, offline, no HTTP endpoint
-- [ ] **hoglake** The standalone path documented end to end: `local`, a
+- [x] **hoglake** The standalone path documented end to end: `local`, a
       minted fixed token in each client, the client's own storage credentials
 - [ ] **hoglake** The storage provider interface behind the hydrator,
       compaction, snapshot expiry, quarantine and cleanup, and the manual
