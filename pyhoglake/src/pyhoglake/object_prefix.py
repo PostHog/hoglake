@@ -16,9 +16,11 @@ write its canonical decimal themselves, so a file's key and its stats
 name one value. :func:`parse_value` reads a partition value into it.
 
 pyhoglake's own writers (``Table.append``, ``prepare_append_tables``,
-``prepare_append_files``) do not use this: they write under the table
-root, so the server refuses them on such a table. A writer of one builds
-its keys here.
+``prepare_append_files``) build their keys here while the field is set:
+each file under :func:`prefix` for its identity partition value, proven by
+:func:`check_field_stats` on its own footer before the upload, a null or
+non-canonical value refused before any write. A writer of its own
+(millrace) builds its keys here too.
 
 Held to ``tests/vectors/object_prefix_vectors.json`` as the server is;
 containment (``isUnder``) stays the server's.

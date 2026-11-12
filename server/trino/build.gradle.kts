@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "com.posthog.hoglake"
-version = "1.4.9-dev"
+version = "1.4.10-dev"
 
 repositories {
     mavenCentral()

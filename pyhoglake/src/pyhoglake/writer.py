@@ -16,6 +16,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
+from ._memo import Memo
 from .errors import ValidationError, VariantEncodingError
 from .models import Column
 from .parquet_schema import (
@@ -72,11 +73,15 @@ class PreparedPart:
         A file registered with ``stats_field_ids`` is ``provided`` and is
         never hydrated: it has no stats for any other column, so nothing
         prunes it on them, until compaction rewrites it. That is the trade
-        an object-prefix writer makes for a small file (millrace, below its
+        an object-prefix writer makes to defer a SMALL file's stats
+        (millrace, and ``Table.append`` / ``prepare_append_*`` with
+        ``deferred_stats=True``, for a file below their
         ``footer_stats_min_bytes``): the prefix field's stats alone, which
         the server checks at commit, make it mountable and compactable at
-        once, without the hydrator. A file at or above that size carries
-        every stat.
+        once, without the hydrator, and compaction gives it the rest when
+        it rewrites it. A file at or over that size registers every stat:
+        compaction never takes an input at or over its target, so a large
+        file registered prefix-only would stay without them for good.
 
         ``stats_field_ids`` is a ``ValidationError`` without ``stats`` (the
         file would register ``pending``), when empty, when it holds a
@@ -116,10 +121,8 @@ def _registration(
             status_code=None,
         )
     if stats:
-        found = extract_column_stats(part.metadata, tuple(columns))
+        wanted: set[int] | None = None
         if stats_field_ids is not None:
-            # Refused, not skipped: a provided file is never hydrated, so a
-            # stat asked for and left out would be missing for good.
             wanted = _field_ids(stats_field_ids)
             if not wanted:
                 raise ValidationError(
@@ -127,6 +130,21 @@ def _registration(
                     "stats=False and no ids",
                     status_code=None,
                 )
+        # Only the columns that can hold a wanted id are walked (an
+        # object-prefix writer's one integer column, not the 100-odd
+        # leaves beside it): a leaf's stats do not depend on which other
+        # columns were asked for, so the rows are the ones the full walk
+        # would have kept. The variant columns stay in, for the path
+        # prefixes the walk excludes by (``_resolve_leaves``).
+        found = extract_column_stats(
+            part.metadata,
+            tuple(columns)
+            if wanted is None
+            else tuple(_columns_holding(columns, wanted)),
+        )
+        if wanted is not None:
+            # Refused, not skipped: a provided file is never hydrated, so a
+            # stat asked for and left out would be missing for good.
             unknown = wanted - {stat.field_id for stat in found}
             if unknown:
                 raise ValidationError(
@@ -138,6 +156,38 @@ def _registration(
     if partition_values is not None:
         reg["partition_values"] = list(partition_values)
     return reg
+
+
+def _columns_holding(columns: Sequence[Column], wanted: set[int]) -> list[Column]:
+    """The top-level ``columns`` to walk for the stats of ``wanted``: the
+    ones whose tree holds a wanted id (a nested leaf's id counts for its
+    root), every variant column, and every column whose name's first
+    dotted segment is a kept column's. The walk over these yields, for
+    each wanted id, the row the walk over every column would have.
+
+    Why the other two. A variant yields no stats but its name excludes
+    its storage's chunk paths from the walk, and a scalar literally named
+    ``<variant>.value`` must not claim them just because the variant was
+    left out. And ``_resolve_leaves`` reconciles a nested leaf whose
+    predicted path is not in the footer (a list spelled ``l.list.item``
+    by another writer) against the footer's unclaimed paths with the same
+    head and depth — so a top-level column named ``l.x.y``, left out,
+    would stop claiming the chunk the kept list's leaf then takes.
+    Unreachable with a real TableInfo (the server forbids dots in column
+    names), but ``PreparedPart.registration`` is public and takes any
+    ``columns``, so the rule is kept by name rather than assumed away.
+    """
+
+    def holds(column: Column) -> bool:
+        return column.field_id in wanted or any(
+            holds(child) for child in column.children or ()
+        )
+
+    kept = [c for c in columns if c.type == "variant" or holds(c)]
+    heads = {c.name.split(".", 1)[0] for c in kept}
+    # One pass is enough: a column added by its head has that head, which
+    # is already in the set.
+    return [c for c in columns if c in kept or c.name.split(".", 1)[0] in heads]
 
 
 def _field_ids(ids: Collection[int]) -> set[int]:
@@ -228,11 +278,24 @@ def write_part(
 
 def _stored_schema(schema: pa.Schema) -> pa.Schema:
     """``schema`` as its Parquet file reads back: every ``timestamp[s]``, at
-    any depth, as milliseconds (Parquet has no seconds unit)."""
-    return pa.schema(
+    any depth, as milliseconds (Parquet has no seconds unit). Remembered by
+    the schema's IPC bytes, the hit confirmed by ``equals`` with metadata
+    (an extension type and its storage under the extension's metadata
+    serialise alike): the writer asks this of one destination for every
+    group."""
+    key = schema.serialize().to_pybytes()
+    hit = _STORED_SCHEMAS.get(key)
+    if hit is not None and schema.equals(hit[0], check_metadata=True):
+        return hit[1]
+    stored = pa.schema(
         [field.with_type(_stored_type(field.type)) for field in schema],
         metadata=schema.metadata,
     )
+    return _STORED_SCHEMAS.put(key, (schema, stored))[1]
+
+
+#: (schema, its stored form) by the schema's IPC bytes.
+_STORED_SCHEMAS: Memo[bytes, tuple[pa.Schema, pa.Schema]] = Memo(64)
 
 
 def _stored_type(kind: pa.DataType) -> pa.DataType:
@@ -344,8 +407,12 @@ def _write_variant_part(
     ``structure_fault`` and integer view: no null pyarrow would write as
     other bytes), not by :func:`pyhoglake.variant.verify`, which decodes
     every row in Python at the encoder's cost and would undo what encoding
-    elsewhere saves. Its bytes are the caller's to verify.
+    elsewhere saves. Its bytes are the caller's to verify. Storage the Rust
+    codec encoded here (``VariantReport.encoded_by``) was held to
+    ``structure_fault`` as the backend accepted it, and is not checked a
+    second time; the Python codec's is, as before.
     """
+    checked: set[str] = set()
     for column in variants:
         index = data.schema.get_field_index(column.name)
         field, values = data.schema.field(index), data.column(index)
@@ -354,12 +421,18 @@ def _write_variant_part(
         encoded = encode_json(values, column, on_invalid=on_invalid)
         if report is not None:
             report.merge(encoded.report)
+        if encoded.report.encoded_by == "rust":
+            checked.add(column.name)
         data = data.set_column(
             index, field.with_type(encoded.array.type), encoded.array
         )
     try:
         return write_variant_parquet(
-            data, columns, row_group_size=row_group_size, write_options=write_options
+            data,
+            columns,
+            row_group_size=row_group_size,
+            write_options=write_options,
+            _structure_checked=checked,
         )
     except _RefusedTable as error:
         # The caller's table: a field that is not its column's, or storage

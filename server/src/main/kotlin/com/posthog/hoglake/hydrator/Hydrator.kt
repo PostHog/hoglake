@@ -20,6 +20,7 @@ import com.posthog.hoglake.persistence.NamespaceRepo
 import com.posthog.hoglake.persistence.SpecRepo
 import com.posthog.hoglake.persistence.TableRepo
 import com.posthog.hoglake.persistence.bindBigintArrayOrNull
+import com.posthog.hoglake.service.HydratorMaintenanceBackend
 import io.github.oshai.kotlinlogging.KotlinLogging
 import org.apache.parquet.hadoop.metadata.ParquetMetadata
 import org.apache.parquet.io.InputFile
@@ -153,7 +154,7 @@ class Hydrator(
      * fixtures keep their rows; `App` passes the configured floor.
      */
     private val minFileBytes: Long = 0,
-) {
+) : HydratorMaintenanceBackend {
     init {
         require(minFileBytes >= 0) { "minFileBytes=$minFileBytes must not be negative" }
     }
@@ -574,10 +575,10 @@ class Hydrator(
      * registration corrected, cap raised). Recorded in the run ledger as
      * a manual hydrator run.
      */
-    fun rehydrateFailed(
+    override fun rehydrateFailed(
         catalog: String,
-        namespace: String? = null,
-        table: String? = null,
+        namespace: String?,
+        table: String?,
     ): RehydrateResult =
         runStore.recorded(catalog, MaintenanceTask.HYDRATOR, MaintenanceTrigger.MANUAL) {
             rehydrateFailedAudited(catalog, namespace, table)

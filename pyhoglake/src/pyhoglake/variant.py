@@ -331,10 +331,19 @@ class VariantReport:
     #: Wall time the shadow spent encoding in Python again
     #: (``PYHOGLAKE_VARIANT_SHADOW``), not in encode_seconds. Transitional.
     shadow_seconds: float = 0.0
+    #: Which codec's output one encode call returned: ``rust``, whose
+    #: result the backend accepted (held to its plan's type and to
+    #: ``structure_fault``, and where shadowed, agreed with Python's), or
+    #: ``python``, the reference's, whether chosen, routed to or fallen back
+    #: to. Set by the call that made this report; ``merge`` leaves a
+    #: report's own, so a report that gathers several calls' says nothing
+    #: here. Not compared: two codecs' reports of one input are otherwise
+    #: equal. Transitional.
+    encoded_by: Literal["rust", "python"] | None = _field(default=None, compare=False)
 
     def merge(self, other: VariantReport) -> None:
         """Adds ``other``'s counts to this report. The first invalid row
-        stays this report's when it has one."""
+        stays this report's when it has one; ``encoded_by`` stays as it is."""
         self.rows += other.rows
         self.sql_null_rows += other.sql_null_rows
         self.invalid_rows += other.invalid_rows
@@ -507,6 +516,8 @@ def encode_python(
         nullable=target_nullable,
         on_invalid=on_invalid,
     )
+    # The reference codec, always: Python values go to no other.
+    report.encoded_by = "python"
     return EncodedVariant(_one_array(chunks, plan), report)
 
 

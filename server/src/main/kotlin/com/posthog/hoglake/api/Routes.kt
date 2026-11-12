@@ -16,6 +16,7 @@ import com.posthog.hoglake.observability.instanceTotalsFor
 import com.posthog.hoglake.persistence.FileRepo
 import com.posthog.hoglake.service.ColumnTrees
 import com.posthog.hoglake.service.Identifiers
+import com.posthog.hoglake.service.ReservedNamespaces
 import com.posthog.hoglake.service.ScanService
 import com.posthog.hoglake.store.CatalogBinding
 import com.posthog.hoglake.store.CatalogStore
@@ -69,6 +70,8 @@ fun Application.installApiRoutes(
      * PostgreSQL-backed reader); it resolves to null where no mount can serve.
      */
     mountRead: () -> MountReadService? = { null },
+    /** Names `POST .../namespaces` refuses for every caller (HOGLAKE_RESERVED_NAMESPACES). */
+    reservedNamespaces: ReservedNamespaces = ReservedNamespaces.NONE,
 ) {
     // The handlers keep the receiver names `catalogs.` and `commits.`.
     // CommitConflictSpecParityTest and CatalogDropSpecParityTest count call
@@ -241,6 +244,8 @@ fun Application.installApiRoutes(
                     post {
                         val catalogs = selector.forCatalog(call, call.catalog())
                         val req = call.receive<CreateNamespaceRequestDto>()
+                        // Before the store: the only path that creates a namespace, on every backend.
+                        reservedNamespaces.refuse(req.name)
                         call.respond(
                             HttpStatusCode.Created,
                             catalogs.createNamespace(

@@ -106,7 +106,7 @@ private fun Application.installCallNamespaceGate(
                 if (isExport(call, pending.catalog)) {
                     // An export serves every namespace to a verified scoped
                     // reader; ReadScope, not the gate, bounds what it sees.
-                    Metrics.authRequest(service.mode.wire, service.listener, "ok", clientClass(call))
+                    Metrics.authRequest(service.mode.wire, service.listener, "ok", service.clientClass(call))
                     return@intercept
                 }
                 containment(call, pending.catalog, pending.namespace)
@@ -119,11 +119,11 @@ private fun Application.installCallNamespaceGate(
                     // (store/Mounts.kt): authorized, as the plugin counts it
                     // on the scoped routes it allows outright.
                     is HoglakeException.ReadOnlyCatalog, is HoglakeException.MountOperationUnavailable ->
-                        Metrics.authRequest(service.mode.wire, service.listener, "ok", clientClass(call))
+                        Metrics.authRequest(service.mode.wire, service.listener, "ok", service.clientClass(call))
                     // A mount placed on hoglite, or a catalog no backend holds.
                     is HoglakeException.NotSupported, is HoglakeException.NotFound -> {
                         val match = AuthPolicy.match(call.request.httpMethod, call.request.path())
-                        countRefusal(service, clientClass(call), caller, match, failure, enforced = true)
+                        countRefusal(service, service.clientClass(call), caller, match, failure, enforced = true)
                     }
                     else -> Unit
                 }
@@ -132,13 +132,13 @@ private fun Application.installCallNamespaceGate(
         if (caller != null && held != null &&
             caller.mayUseContained(pending.catalog, held.field, held.value, pending.required)
         ) {
-            Metrics.authRequest(service.mode.wire, service.listener, "ok", clientClass(call))
+            Metrics.authRequest(service.mode.wire, service.listener, "ok", service.clientClass(call))
             return@intercept
         }
         val refusal =
             HoglakeException.NotFound("namespace '${pending.namespace}' in catalog '${pending.catalog}'")
         val match = AuthPolicy.match(call.request.httpMethod, call.request.path())
-        countRefusal(service, clientClass(call), caller, match, refusal, enforced = true)
+        countRefusal(service, service.clientClass(call), caller, match, refusal, enforced = true)
         call.respondRefusal(refusal)
         finish()
     }
