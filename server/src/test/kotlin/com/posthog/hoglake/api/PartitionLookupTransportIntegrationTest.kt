@@ -2,7 +2,11 @@ package com.posthog.hoglake.api
 
 import com.posthog.hoglake.App
 import com.posthog.hoglake.Config
+import com.posthog.hoglake.SecretString
 import com.posthog.hoglake.auth.AuthMode
+import com.posthog.hoglake.auth.LocalIssuer
+import com.posthog.hoglake.auth.LocalSigningKey
+import com.posthog.hoglake.auth.Scope
 import com.posthog.hoglake.auth.TestTokens
 import com.posthog.hoglake.configureApiListener
 import com.posthog.hoglake.testing.PartitionLookupFixture
@@ -133,10 +137,28 @@ class PartitionLookupTransportIntegrationTest {
         Files.writeString(keyFile, TestTokens.jwks(pair))
         val reader = TestTokens.mint(pair, TestTokens.tenantClaims(catalogs = mapOf(f.name to listOf("read"))))
         val foreign = TestTokens.mint(pair, TestTokens.tenantClaims(catalogs = mapOf("other" to listOf("read"))))
+        // `local` is its own issuer: the same matrix, with the server's own key
+        // in place of the JWKS file and tokens minted by LocalIssuer. It must
+        // keep enforce's route semantics exactly.
+        val localKey = LocalSigningKey.generate()
+        val localIssuer = LocalIssuer(localKey, TestTokens.ISSUER)
+        val localReader = localIssuer.tenant("hlc_local_reader", "org", mapOf(f.name to Scope.READ), "test", 900)
+        val localForeign = localIssuer.tenant("hlc_local_foreign", "org", mapOf("other" to Scope.READ), "test", 900)
         try {
             for (mode in AuthMode.entries) {
                 val authCfg =
-                    cfg.copy(authMode = mode.wire, authIssuer = TestTokens.ISSUER, authJwksFile = keyFile.toString())
+                    if (mode == AuthMode.LOCAL) {
+                        cfg.copy(
+                            authMode = mode.wire,
+                            authIssuer = TestTokens.ISSUER,
+                            authSigningKey = SecretString(localKey.encode()),
+                        )
+                    } else {
+                        cfg.copy(authMode = mode.wire, authIssuer = TestTokens.ISSUER, authJwksFile = keyFile.toString())
+                    }
+                val reader = if (mode == AuthMode.LOCAL) localReader else reader
+                val foreign = if (mode == AuthMode.LOCAL) localForeign else foreign
+                val enforcing = mode.isEnforcing
                 val authApp = App.build(authCfg, db.jdbi)
                 val authServer =
                     embeddedServer(Netty, configure = { configureApiListener(authCfg) }) { authApp.module(this) }
@@ -146,12 +168,12 @@ class PartitionLookupTransportIntegrationTest {
                     assertThat(post("[null, null]", authPort, token = reader).statusCode())
                         .describedAs("%s reader lookup", mode).isEqualTo(200)
                     assertThat(post("[null, null]", authPort).statusCode())
-                        .describedAs("%s missing token", mode).isEqualTo(if (mode == AuthMode.ENFORCE) 401 else 200)
+                        .describedAs("%s missing token", mode).isEqualTo(if (enforcing) 401 else 200)
                     assertThat(post("[null, null]", authPort, token = foreign).statusCode())
-                        .describedAs("%s foreign catalog", mode).isEqualTo(if (mode == AuthMode.ENFORCE) 404 else 200)
+                        .describedAs("%s foreign catalog", mode).isEqualTo(if (enforcing) 404 else 200)
                     val alter = f.url.removeSuffix("/partitions/lookup") + "/alter"
                     assertThat(post("{}", authPort, alter, reader).statusCode())
-                        .describedAs("%s reader mutation", mode).isEqualTo(if (mode == AuthMode.ENFORCE) 403 else 400)
+                        .describedAs("%s reader mutation", mode).isEqualTo(if (enforcing) 403 else 400)
                 } finally {
                     authServer.stop(0, 1000)
                     authApp.close()
