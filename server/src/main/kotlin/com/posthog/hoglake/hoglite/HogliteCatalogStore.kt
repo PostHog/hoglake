@@ -1298,18 +1298,7 @@ class HogliteCatalogStore(
             val m = meta(catalog)
             val at = resolveRead(catalog, m, snapshot, atTimestamp)
             // A pinned listing resolves the namespace incarnation at its snapshot.
-            val ns =
-                queryCatalog(
-                    catalog,
-                    "SELECT $NAMESPACE_COLUMNS FROM namespaces WHERE name = ? AND created_snapshot <= ? " +
-                        "AND (dropped_snapshot IS NULL OR dropped_snapshot > ?)",
-                    namespace,
-                    at,
-                    at,
-                ).firstRow()?.let { namespaceInfo(it) }
-                    ?: throw HoglakeException.NotFound(
-                        "namespace '$namespace' in catalog '$catalog' at snapshot $at",
-                    )
+            val ns = namespaceAt(catalog, namespace, at)
             // Totals are the files visible at `at`, as Postgres's listing
             // rolls them up at its snapshot: a PINNED listing aggregates the
             // manifest at `at` per table, never the head counters
@@ -1588,7 +1577,7 @@ class HogliteCatalogStore(
         catalogOperation(catalog) {
             val m = meta(catalog)
             val at = resolveRead(catalog, m, snapshot, atTimestamp)
-            val ns = liveNamespace(catalog, namespace)
+            val ns = namespaceForRead(catalog, namespace, at, headRead = snapshot == null && atTimestamp == null)
             val t = tableAt(catalog, ns.namespaceId, namespace, table, at)
             if (partitionFilter.isNotEmpty()) {
                 // A filter on a key the table does not partition by at `at`
@@ -1684,7 +1673,7 @@ class HogliteCatalogStore(
         catalogOperation(catalog) {
             val m = meta(catalog)
             val at = resolveRead(catalog, m, snapshot, atTimestamp)
-            val ns = liveNamespace(catalog, namespace)
+            val ns = namespaceForRead(catalog, namespace, at, headRead = snapshot == null && atTimestamp == null)
             val t = tableAt(catalog, ns.namespaceId, namespace, table, at)
             val spec = specAt(catalog, t.tableId, at) ?: return PartitionValues(-1, emptyList())
             val fields =
@@ -1727,7 +1716,7 @@ class HogliteCatalogStore(
         catalogOperation(catalog) {
             val m = meta(catalog)
             val at = resolveRead(catalog, m, snapshot, atTimestamp)
-            val ns = liveNamespace(catalog, namespace)
+            val ns = namespaceForRead(catalog, namespace, at, headRead = snapshot == null && atTimestamp == null)
             val t = tableAt(catalog, ns.namespaceId, namespace, table, at)
             val row =
                 queryCatalog(
@@ -1785,7 +1774,9 @@ class HogliteCatalogStore(
                 }
             }
             requireRetained(m.earliestSnapshotId)
-            val ns = liveNamespace(catalog, namespace)
+            // An explicit to_snapshot pins the feed: its table and namespace
+            // are the ones alive at `to`, as for every other pinned read.
+            val ns = namespaceForRead(catalog, namespace, to, headRead = toSnapshot == null)
             val t = tableAt(catalog, ns.namespaceId, namespace, table, to)
             // TRUNCATE / replacement barrier: a window that crosses a
             // table_altered + table_deleted_from pair cannot be represented
@@ -1990,7 +1981,7 @@ class HogliteCatalogStore(
         catalogOperation(catalog) {
             val m = meta(catalog)
             val at = resolveRead(catalog, m, snapshot, atTimestamp)
-            val ns = liveNamespace(catalog, namespace)
+            val ns = namespaceForRead(catalog, namespace, at, headRead = snapshot == null && atTimestamp == null)
             val t = tableAt(catalog, ns.namespaceId, namespace, table, at)
             // The DV join picks the newest epoch VISIBLE AT the pin: history-
             // preserving supersession means a pinned scan sees the vector
@@ -2462,6 +2453,25 @@ class HogliteCatalogStore(
             at,
         ).firstRow()?.let { namespaceInfo(it) }
             ?: throw HoglakeException.NotFound("namespace '$namespace' in catalog '$catalog' at snapshot $at")
+
+    /**
+     * The namespace a READ resolves [namespace] to: the live one for a
+     * head read, else the incarnation alive at [at] ([namespaceAt]). A
+     * pinned reader must still see a namespace dropped after its pin, and
+     * must not see one recreated under the same name after it. The reads
+     * that serve head and pinned requests from one body (listFiles,
+     * partitionValues, fileStats, changes, planScan) resolve through here;
+     * getTable and listTables, whose head requests take their own path
+     * (headTable, headListing), call [namespaceAt] directly. So every
+     * pinned read agrees on the incarnation. [at] alone cannot tell a head
+     * read from a pinned read that names head, hence the flag.
+     */
+    private fun namespaceForRead(
+        catalog: String,
+        namespace: String,
+        at: Long,
+        headRead: Boolean,
+    ): NamespaceInfo = if (headRead) liveNamespace(catalog, namespace) else namespaceAt(catalog, namespace, at)
 
     /** A namespace row read with [NAMESPACE_COLUMNS]. */
     private fun namespaceInfo(row: List<Any?>): NamespaceInfo =
