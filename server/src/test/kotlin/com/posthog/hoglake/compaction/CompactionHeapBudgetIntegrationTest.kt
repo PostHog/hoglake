@@ -113,7 +113,7 @@ class CompactionHeapBudgetIntegrationTest {
         db.close()
     }
 
-    /** A heap budget whose CHUNK is exactly [rows] rows of the fixture shape. */
+    /** Size the advisory row ceiling for the fixture shape. */
     private fun heapBytesFor(rows: Long) = CompactionConfig.SORTED_HEAP_BYTES_PER_NODE * NODES_PER_ROW * rows
 
     /** A private spill directory, so "empty afterwards" is about this test alone. */
@@ -128,18 +128,6 @@ class CompactionHeapBudgetIntegrationTest {
 
     @Test
     fun `a dense sorted table the row ceiling refused compacts to the FULL target in one rewrite`() {
-        // THE PRODUCTION CASE. On gigahog-prod-us's `ingest.events_raw` a
-        // byte-sized group was ~2.9M rows against a sorted row ceiling of
-        // 552,336, so groups were packed short or refused and the table
-        // never reached its target. Here: eight 50,000-row files under a
-        // heap budget whose old ceiling (= today's chunk) is 100,000 rows,
-        // so the old planner closed every group at two files. Now ONE
-        // group takes all eight, and the rewrite sorts it in four chunks.
-        //
-        // Why 100,000 and not something tinier: the same budget bounds the
-        // MERGE, and each spilled run is charged its 16 MiB read block, so
-        // four runs need ~66 MiB — which is 100,000 rows of this shape. A
-        // smaller budget is the merge refusal tested below.
         val rowsPerFile = 50_000L
         val files = 8
         val chunk = 100_000L
@@ -149,14 +137,11 @@ class CompactionHeapBudgetIntegrationTest {
                 targetBytes = 256L * 1024 * 1024,
                 minInputFiles = 2,
                 maxGroupsPerRun = 1,
-                sortedHeapBytes = heapBytesFor(chunk),
+                sortedHeapBytes = CompactionConfig.DEFAULT_SORTED_HEAP_BYTES,
                 spillDir = dir,
             )
-        assertThat(cfg.spillChunkRows(fixtureLiveColumns)).isEqualTo(chunk)
+        assertThat(cfg.spillChunkRows(fixtureLiveColumns)).isGreaterThan(chunk)
         val svc = CompactionService(db.jdbi, store, cfg)
-        // Every file's ids DESCENDING and interleaved with every other
-        // file's, so the output order is the sort's work and no input or
-        // chunk is accidentally already in order.
         val contents = (0 until files).map { f -> (0 until rowsPerFile).map { it * files + f }.reversed() }
         val cat = realSortedTableOf("full-target", contents)
 
@@ -166,31 +151,29 @@ class CompactionHeapBudgetIntegrationTest {
         assertThat(group.survivingRecords)
             .describedAs("four times what the old row ceiling admitted into a group")
             .isEqualTo(files * rowsPerFile)
-            .isGreaterThan(cfg.spillChunkRows(fixtureLiveColumns) * 3)
+            .isLessThan(cfg.spillChunkRows(fixtureLiveColumns))
         assertThat(plan.spillRefusedGroups + plan.mergeRefusedGroups).isZero()
 
         val result = svc.runOnce(cat, cfg, MaintenanceTrigger.LOOP)
         assertThat(result.groupsCompacted).describedAs("%s", result).isEqualTo(1)
         assertThat(result.failedGroups).isZero()
-        assertThat(result.runsSpilled).describedAs("400k rows at 100k a chunk").isEqualTo(4)
+        assertThat(
+            result.runsSpilled,
+        ).describedAs("byte-full chunks spill below the advisory row ceiling").isGreaterThan(1)
         assertThat(result.runsTrusted).describedAs("client files are never trusted").isZero()
         assertThat(result.runsDemoted).isZero()
         assertThat(result.spillBytes).isGreaterThan(0)
         assertThat(result.spillBytes).isLessThanOrEqualTo(cfg.spillBytes)
         assertThat(result.spillBudgetExceeded).isZero()
         assertThat(result.mergeBudgetExceeded).isZero()
-        // HISTORICAL: nothing produces heap_budget_exceeded since #134; it
-        // stays on the wire reading 0, which is all this states.
         assertThat(result.heapBudgetExceeded).isZero()
         assertThat(result.spillCleanupFailures).isZero()
         assertThat(spillEntries(dir)).describedAs("the spill directory is removed afterwards").isEmpty()
 
-        // The ledger row carries the counters, under their wire names.
         val ledger = com.fasterxml.jackson.databind.ObjectMapper().readTree(lastLedgerResult(cat))
-        assertThat(ledger["runs_spilled"].asLong()).isEqualTo(4)
+        assertThat(ledger["runs_spilled"].asLong()).isEqualTo(result.runsSpilled)
         assertThat(ledger["spill_bytes"].asLong()).isEqualTo(result.spillBytes)
 
-        // And the output is the whole table, sorted.
         val ids = readIds(livePaths(cat).single())
         assertThat(ids).hasSize((files * rowsPerFile).toInt())
         assertThat(ids).isSorted()
@@ -215,7 +198,7 @@ class CompactionHeapBudgetIntegrationTest {
                 targetBytes = 256L * 1024 * 1024,
                 minInputFiles = 2,
                 maxGroupsPerRun = 1,
-                sortedHeapBytes = heapBytesFor(100_000),
+                sortedHeapBytes = 256L shl 20,
                 spillBytes = registered,
                 spillDir = dir,
             )
@@ -267,7 +250,7 @@ class CompactionHeapBudgetIntegrationTest {
                 targetBytes = 256L * 1024 * 1024,
                 minInputFiles = 2,
                 maxGroupsPerRun = 1,
-                sortedHeapBytes = heapBytesFor(10_000),
+                sortedHeapBytes = 64L shl 20,
                 spillDir = dir,
             )
         val svc = CompactionService(db.jdbi, store, cfg)
@@ -440,18 +423,15 @@ class CompactionHeapBudgetIntegrationTest {
 
     @Test
     fun `small files are not checked - they spill into a few runs, whatever their order`() {
-        // Fifty sorted files of 3,000 rows (~30 KB each) under the default
-        // 16 MiB floor: none is checked, and the 150,000 rows are three
-        // spilled runs, not fifty one-file runs.
         val dir = spillDir()
-        val chunk = 70_000L
+
         val cfg =
             smallFileConfig().copy(
                 targetBytes = 256L * 1024 * 1024,
                 maxInputFiles = 64,
                 maxFanIn = 64,
                 spillDir = dir,
-                sortedHeapBytes = heapBytesFor(chunk),
+                sortedHeapBytes = 256L shl 20,
             )
         assertThat(cfg.verifyMinBytes).isEqualTo(CompactionConfig.DEFAULT_VERIFY_MIN_BYTES)
         val svc = CompactionService(db.jdbi, store, cfg)
@@ -462,14 +442,12 @@ class CompactionHeapBudgetIntegrationTest {
         assertThat(result.groupsCompacted).describedAs("%s", result).isEqualTo(1)
         assertThat(result.filesUnchecked).isEqualTo(files.toLong())
         assertThat(result.filesVerified + result.filesUnsorted).isZero()
-        assertThat(result.runsSpilled).describedAs("150k rows at 70k a chunk").isEqualTo(3)
+        assertThat(result.runsSpilled).isGreaterThan(1).isLessThan(files.toLong())
         assertThat(result.spillBytes).isPositive()
         assertThat(readIds(livePaths(cat).single())).hasSize(files * 3_000).isSorted()
         val ledger = com.fasterxml.jackson.databind.ObjectMapper().readTree(lastLedgerResult(cat))
         assertThat(ledger["files_unchecked"].asLong()).isEqualTo(files.toLong())
     }
-
-    // ---- what the planner still refuses, in metadata -----------------------
 
     @Test
     fun `a group whose spill exceeds the spill budget is refused in metadata and spends no IO`() {
@@ -510,10 +488,6 @@ class CompactionHeapBudgetIntegrationTest {
 
     @Test
     fun `a group whose spilled runs alone exceed the merge budget is refused in metadata and spends no IO`() {
-        // Same four files under the same 1,000-row chunk, default spill
-        // budget: four spilled runs at ~16.5 MiB each against a merge
-        // budget of 768 KB. Reachable only by configuration, which is what
-        // the log line says.
         val cfg =
             CompactionConfig(
                 targetBytes = 65536,
@@ -535,17 +509,12 @@ class CompactionHeapBudgetIntegrationTest {
         assertThat(result.failedGroups).isZero()
         assertThat(removalRows(cat)).isEmpty()
 
-        // The boundary, from the rewriter's own arithmetic. Two spilled
-        // runs cost exactly 2 x the predicted run, and a heap budget of
-        // exactly that has a chunk of half of 80,000 rows give or take, so
-        // the merge is two runs: admitted at the budget (the comparison is
-        // `>`), refused one byte under it.
-        val edge = sortedTable("merge-edge", files = 4, bytesEach = 1024, recordsEach = 20_000)
+        val edge = sortedTable("merge-edge", files = 4, bytesEach = 1024, recordsEach = 40_000)
         val leaves = ParquetRewriter.outputLeafCount(fixtureLiveColumns)
         val twoRuns = 2 * ExternalMergeSort.predictedSpilledRunBytes(leaves, cfg.sortSpill(fixtureLiveColumns))
-        for ((budget, refused) in listOf(twoRuns to 0L, twoRuns - 1 to 1L)) {
+        for ((budget, refused) in listOf(2 * twoRuns to 0L, 2 * twoRuns - 1 to 1L)) {
             val at = cfg.copy(sortedHeapBytes = budget)
-            val runs = ExternalMergeSort.spillRuns(80_000, at.sortSpill(fixtureLiveColumns))
+            val runs = ExternalMergeSort.spillRuns(160_000, at.sortSpill(fixtureLiveColumns))
             assertThat(runs).describedAs("the fixture must be a two-run merge at %d B", budget).isEqualTo(2)
             assertThat(svc.planTable(edge, "ns", "t", at).mergeRefusedGroups)
                 .describedAs("heap budget %d B against a two-run merge of %d B", budget, twoRuns)
@@ -683,10 +652,6 @@ class CompactionHeapBudgetIntegrationTest {
 
     @Test
     fun `two sorted groups in flight spill to separate directories and both are removed`() {
-        // Two groups of four files, two workers. The store holds a read
-        // on each worker, once its own group has started spilling, until
-        // the OTHER group's directory exists too — so both are on disk at
-        // once and must be distinct, and both must be gone afterwards.
         val dir = spillDir()
         val rowsPerFile = 50_000L
         val cfg =
@@ -698,13 +663,10 @@ class CompactionHeapBudgetIntegrationTest {
                 maxGroupsPerRun = 2,
                 parallelGroups = 2,
                 inputOpenParallelism = 1,
-                // Per group (divided by 2): a 100,000-row chunk, so each
-                // 200,000-row group is two spilled runs, which the same
-                // per-group budget can merge (two 16.5 MiB read blocks).
-                sortedHeapBytes = 2 * heapBytesFor(100_000),
+                sortedHeapBytes = 2 * (256L shl 20),
                 spillDir = dir,
             )
-        assertThat(cfg.spillChunkRows(fixtureLiveColumns)).isEqualTo(2 * rowsPerFile)
+        assertThat(cfg.sortedHeapBytesPerGroup).isEqualTo(256L shl 20)
         val cat =
             realSortedTableOf("two-dirs", (0 until 8).map { f -> (0 until rowsPerFile).map { it * 8 + f }.reversed() })
         val seen = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
@@ -730,7 +692,9 @@ class CompactionHeapBudgetIntegrationTest {
         val result = CompactionService(db.jdbi, waitingStore, cfg).runOnce(cat, cfg, MaintenanceTrigger.LOOP)
         waitingStore.close()
         assertThat(result.groupsCompacted).describedAs("%s", result).isEqualTo(2)
-        assertThat(result.runsSpilled).describedAs("two per group").isEqualTo(4)
+        assertThat(
+            result.runsSpilled,
+        ).describedAs("both groups spill multiple byte-full chunks").isGreaterThanOrEqualTo(4)
         assertThat(maxConcurrent.get()).describedAs("both groups' spill directories existed at once").isEqualTo(2)
         assertThat(seen).hasSize(2)
         assertThat(spillEntries(dir)).describedAs("and both are gone").isEmpty()

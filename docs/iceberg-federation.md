@@ -331,36 +331,36 @@ flat table either: a flat 11-column event row costs about 1.7 KiB of
 materialized heap against 119 bytes of snappy input (14x), and
 compaction's own zstd outputs are 1.70x denser again (24x).
 
-So the sorted path is an EXTERNAL MERGE SORT (hoglake#134), and a group
-packs to the byte target like any other. The rewrite reads the
-survivors of every input it cannot trust into a CHUNK — the
-`HOGLAKE_COMPACTION_SORTED_HEAP_BYTES` budget (default 1 GiB, divided by
-the parallel group count) over the live schema's node count, ~192 B per
-node measured, divided again by `HOGLAKE_COMPACTION_NESTED_SORT_EXPANSION`
-(default 64, near the top of the measured 30-70x range) for a nested
-table, whose node count is data rather than schema — sorts it, and spills
-it as a local parquet run under `HOGLAKE_COMPACTION_SPILL_DIR` (default
-`java.io.tmpdir`). It then k-way merges the spilled runs with the
-TRUSTED ones: compaction outputs registered under the live sort spec,
-read in place without a check (each was written sorted by the spec it
-was planned under; the commit refuses a group whose spec moved during the
-rewrite), and every other file of at least
-`HOGLAKE_COMPACTION_VERIFY_MIN_BYTES` (default 16 MiB) that a pre-pass
-over its sort-key columns found already in order — a client's DECLARED
-order is advisory and never believed, but its rows are checked, so a writer that
-sorts its files is merged without a spill. The same budget bounds the
-merge's buffered row groups; trusted inputs beyond it are demoted to the
-spill path.
+The sorted path uses an external merge sort.
+Groups pack to the byte target.
+`HOGLAKE_COMPACTION_SORTED_HEAP_BYTES` defaults to 1 GiB and divides across parallel groups.
+The schema-node estimate supplies an advisory row ceiling.
+Runtime decoding separately charges actual nodes, field containers, and variable-width payload bytes before allocation.
+`HOGLAKE_COMPACTION_NESTED_SORT_EXPANSION` still derates the advisory ceiling for nested schemas.
 
-What can still refuse a sorted group is configuration, in metadata,
-before any IO: `spill_budget_exceeded` when the bytes it would spill
-exceed `HOGLAKE_COMPACTION_SPILL_BYTES` (default 4 GiB per group — the
-spill volume is an emptyDir whose overrun evicts the pod, so the bound is
-in-process), and `merge_budget_exceeded` when its spilled runs alone
-cannot fit the heap budget. `heap_budget_exceeded`, the in-memory sort's
-refusal, is historical and reads 0. The per-ROW bound is still the node
-budget above. server/README.md §Sort orders and compaction carries the
-arithmetic and the pod table.
+The rewrite reserves separate allowances for chunks, individual rows, input readers, merge heads, writers, and transient copies.
+It flushes byte-full chunks under `HOGLAKE_COMPACTION_SPILL_DIR`.
+The default directory remains `java.io.tmpdir`.
+It merges these runs with admitted trusted or verified inputs.
+A client's declared sortedness remains advisory.
+The pre-pass checks eligible input keys before trusting their order.
+
+Reader admission charges full compressed and uncompressed chunks, dictionaries, and column-reader arrays.
+It checks projected footers before page allocation.
+The merge also reserves materialized heads and replacement rows.
+Repeated dictionary values contribute their decoded payload charge.
+Page-size targets cannot establish a bound for oversized values.
+
+`spill_budget_exceeded` reports excessive registered or written spill bytes.
+`HOGLAKE_COMPACTION_SPILL_BYTES` defaults to 4 GiB per group.
+`merge_budget_exceeded` reports excessive row, reader, or complete one-pass merge charges.
+Runtime byte-driven chunks can exceed the metadata run prediction and cause a safe refusal.
+Legal oversized pages can also cause conservative refusals.
+The rewrite does not perform intermediate or multi-pass merges.
+
+`heap_budget_exceeded` remains historical and reads zero.
+The existing node-count limit still protects both sorted and unsorted materializers.
+See server/README.md for current allowances and limitations.
 
 A group's inputs are opened through a window of
 `HOGLAKE_COMPACTION_PARALLEL_INPUT_OPENS` (default 8) concurrent opens.

@@ -549,8 +549,8 @@ class ExternalMergeSortTest {
         val budget =
             when (case.demotion) {
                 0 -> Long.MAX_VALUE / 4
-                1 -> maxOf(1, allSpilled + trustedBytes / 2)
-                else -> maxOf(1, allSpilled)
+                1 -> maxOf(64L shl 20, 4 * allSpilled + trustedBytes)
+                else -> maxOf(64L shl 20, 4 * allSpilled)
             }
         val out = fresh("prop-out.parquet")
         val result =
@@ -651,7 +651,7 @@ class ExternalMergeSortTest {
     }
 
     @Test
-    fun `a footer costs its largest row group plus each leaf's page, capped by the leaf's chunk`() {
+    fun `a footer charges full chunks and decoded dictionary entries`() {
         fun column(
             name: String,
             compressed: Long,
@@ -674,15 +674,17 @@ class ExternalMergeSortTest {
             org.apache.parquet.hadoop.metadata.ParquetMetadata(
                 null,
                 listOf(
-                    // 100 compressed; leaves capped at 50: 30 + 50.
+                    // Charge every uncompressed byte, even when a page target would be smaller.
                     rowGroup(column("a", 40, 30), column("b", 60, 900)),
-                    // 300 compressed; 10 + 20.
+                    // Select the largest total reader charge.
                     rowGroup(column("a", 290, 10), column("b", 10, 20)),
                 ),
             )
-        assertThat(ExternalMergeSort.footerRunBytes(footer, 50)).isEqualTo(maxOf(100L + 30 + 50, 300L + 10 + 20))
         assertThat(
-            ExternalMergeSort.footerRunBytes(org.apache.parquet.hadoop.metadata.ParquetMetadata(null, emptyList()), 50),
+            ExternalMergeSort.footerRunBytes(footer),
+        ).isEqualTo(maxOf(2 * 100L + 2 * (30 + 900) + 2 * 64, 2 * 300L + 2 * (10 + 20) + 2 * 64))
+        assertThat(
+            ExternalMergeSort.footerRunBytes(org.apache.parquet.hadoop.metadata.ParquetMetadata(null, emptyList())),
         ).isZero()
     }
 
@@ -718,6 +720,18 @@ class ExternalMergeSortTest {
 
     // ---- admission (pure) -------------------------------------------------------------
 
+    @Test
+    fun `admission saturates survivor and spill-byte sums`() {
+        val bounds = spill(tmp, chunkRows = 1)
+        val rows = listOf(fake("a", 0, Long.MAX_VALUE, false), fake("b", 0, Long.MAX_VALUE, false))
+        assertThat(admit(rows, bounds).untrustedRows).isEqualTo(Long.MAX_VALUE)
+        assertThat(admit(rows, bounds).projectedBytes).isEqualTo(Long.MAX_VALUE)
+        val bytes = listOf(fake("a", Long.MAX_VALUE, 2, false), fake("b", Long.MAX_VALUE, 2, false))
+        assertThatThrownBy { admit(bytes, bounds.copy(spillBudgetBytes = Long.MAX_VALUE - 1)) }
+            .isInstanceOf(SpillBudgetExceededException::class.java)
+        assertThat(ExternalMergeSort.mergeCost(1, Long.MAX_VALUE, 1, 1)).isEqualTo(Long.MAX_VALUE)
+    }
+
     /** An input admission can cost but nothing will open. */
     private fun fake(
         name: String,
@@ -746,7 +760,7 @@ class ExternalMergeSortTest {
         val medium = fake("medium", 1_000, 100)
         val small = fake("small", 100, 5)
         // Room for large + small + medium's one spilled run, not for medium as a run.
-        val result = admit(listOf(small, medium, large), spill(tmp, mergeBudget = 3_000 + 100 + 1))
+        val result = admit(listOf(small, medium, large), spill(tmp, mergeBudget = 2 * (3_000 + 100 + 1)))
         assertThat(result.admitted).containsExactly(large, small)
         assertThat(result.demoted).containsExactly(medium)
         assertThat(result.projectedBytes).isEqualTo(3_101)
@@ -758,7 +772,7 @@ class ExternalMergeSortTest {
         val result =
             admit(
                 listOf(fake("big", 4_000, 100), fake("small", 1_500, 30)),
-                spill(tmp, chunkRows = 10, mergeBudget = 5_500, block = 1_000),
+                spill(tmp, chunkRows = 10, mergeBudget = 2 * 5_500, block = 1_000),
             )
         assertThat(result.admitted).hasSize(2)
         assertThat(result.demoted).isEmpty()
@@ -769,7 +783,7 @@ class ExternalMergeSortTest {
         fun admitted(readahead: Int) =
             admit(
                 listOf(fake("t", 1_000, 10)),
-                spill(tmp, mergeBudget = 1_100).copy(readaheadBytes = readahead),
+                spill(tmp, mergeBudget = 2 * 1_100).copy(readaheadBytes = readahead),
             ).admitted
         assertThat(admitted(100)).hasSize(1)
         assertThat(admitted(101)).isEmpty()
@@ -782,7 +796,7 @@ class ExternalMergeSortTest {
         val result =
             admit(
                 listOf(fake("large", 1L shl 40, 30), fake("small", 500, 5)),
-                spill(tmp, chunkRows = 10, mergeBudget = 500 + 2_000, block = 1_000),
+                spill(tmp, chunkRows = 10, mergeBudget = 2 * (500 + 2_000), block = 1_000),
             )
         assertThat(result.admitted).isEmpty()
         assertThat(result.projectedBytes).describedAs("4 runs").isEqualTo(4_000)
@@ -795,7 +809,7 @@ class ExternalMergeSortTest {
         // leaves one chunk and no run at all, which fits anything.
         val big = fake("big", 1_000, 3)
         val little = fake("little", 600, 2)
-        val result = admit(listOf(big, little), spill(tmp, mergeBudget = 1_001, block = 1_000_000))
+        val result = admit(listOf(big, little), spill(tmp, mergeBudget = 2 * 1_001, block = 1_000_000))
         assertThat(result.admitted).isEmpty()
         assertThat(result.demoted).containsExactlyInAnyOrder(big, little)
         assertThat(result.projectedBytes).isZero()
@@ -808,7 +822,7 @@ class ExternalMergeSortTest {
         val l1 = fake("l1", 3_000, 300)
         val l2 = fake("l2", 2_000, 100)
         val s = fake("s", 1_500, 20)
-        val result = admit(listOf(s, l2, l1), spill(tmp, mergeBudget = 3_000 + 2_000 + 1, block = 1_000))
+        val result = admit(listOf(s, l2, l1), spill(tmp, mergeBudget = 2 * (3_000 + 2_000 + 1), block = 1_000))
         assertThat(result.admitted).containsExactly(l1)
         assertThat(result.demoted).containsExactlyInAnyOrder(s, l2)
     }
@@ -880,7 +894,7 @@ class ExternalMergeSortTest {
         readahead: Int,
     ): Long =
         ParquetFileReader.open(LocalInputFile(path)).use {
-            ExternalMergeSort.footerRunBytes(it.footer, ExternalMergeSort.TRUSTED_PAGE_BYTES_PER_LEAF)
+            ExternalMergeSort.footerRunBytes(it.footer)
         } + readahead
 
     @Test
@@ -901,7 +915,7 @@ class ExternalMergeSortTest {
             )
         val bounds = spill(spillParent())
         // Room for the largest as a run beside the others' one spilled run.
-        val budget = estimate(inputs[2], bounds) + ExternalMergeSort.predictedSpilledRunBytes(kvLeaves, bounds)
+        val budget = 2 * (estimate(inputs[2], bounds) + ExternalMergeSort.predictedSpilledRunBytes(kvLeaves, bounds))
         val out = fresh("adm-out.parquet")
         val result = rewrite(inputs, out, bounds.copy(mergeBudgetBytes = budget))
         assertThat(result.runsTrusted).isEqualTo(1)
@@ -914,7 +928,7 @@ class ExternalMergeSortTest {
     }
 
     @Test
-    fun `a run whose exact footer cost breaks the budget is demoted before any data is read`() {
+    fun `an oversized footer demotes its run and refuses before data allocation`() {
         // The registered size UNDERSTATES the file, so the estimate
         // admits it; its footer's row group does not fit.
         val file = CountingInputFile(fatTrusted)
@@ -935,32 +949,56 @@ class ExternalMergeSortTest {
                 input(client, "client", rowIdStart = 1_000, survivors = 2),
             )
         val bounds = spill(spillParent())
-        val budget = estimate(inputs[0], bounds) + ExternalMergeSort.predictedSpilledRunBytes(kvLeaves, bounds)
+        val budget = 2 * (estimate(inputs[0], bounds) + ExternalMergeSort.predictedSpilledRunBytes(kvLeaves, bounds))
         assertThat(exactTrusted(fatTrusted, 0)).isGreaterThan(budget)
-        val result = rewrite(inputs, fresh("footer-out.parquet"), bounds.copy(mergeBudgetBytes = budget))
-        assertThat(result.runsTrusted).isZero()
-        assertThat(result.runsDemoted).isEqualTo(1)
-        assertThat(file.opened.get()).describedAs("footer read, then re-opened for the chunk phase").isEqualTo(2)
-        assertThat(dataReadsAtDemotion).describedAs("row-group reads before demotion").isZero()
-        assertThat(closedAtDemotion).describedAs("footer reader closed at demotion").isEqualTo(1)
+        assertThatThrownBy { rewrite(inputs, fresh("footer-out.parquet"), bounds.copy(mergeBudgetBytes = budget)) }
+            .isInstanceOf(MergeBudgetExceededException::class.java)
+        assertThat(file.opened.get()).isEqualTo(2)
+        assertThat(dataReadsAtDemotion).isZero()
+        assertThat(closedAtDemotion).isEqualTo(1)
         assertThat(file.openStreams()).isZero()
-        assertThat(result.rowsWritten).isEqualTo(102)
     }
 
     @Test
-    fun `a run whose exact footer cost, readahead included, equals the budget is kept`() {
-        val readahead = 1_000
-        val exact = exactTrusted(fatTrusted, readahead)
+    fun `exact run charges include readahead and both materialized rows`() {
+        ParquetFileReader.open(LocalInputFile(fatTrusted)).use { reader ->
+            val memory = SortMemory(128L shl 20)
+            val charge = ExternalMergeSort.footerRunBytes(reader.footer)
+            assertThat(memory.runBytes(reader.footer, 1000))
+                .isEqualTo(charge + 2 * memory.headBytes(reader.footer) + 1000)
+            assertThat(memory.runBytes(reader.footer, 1001)).isEqualTo(memory.runBytes(reader.footer, 1000) + 1)
+        }
+    }
 
-        fun at(budget: Long) =
-            rewrite(
-                // Size understated, so admission passes and the footer decides.
-                listOf(input(LocalInputFile(fatTrusted), "t", trusted = true, fileSizeBytes = 1, survivors = 100)),
-                fresh("footer-exact-out.parquet"),
-                spill(spillParent(), mergeBudget = budget).copy(readaheadBytes = readahead),
+    @Test
+    fun `a byte-appended run bypasses the decoded-reader allowance`() {
+        val prior = fresh("append-large-prior.parquet")
+        rewrite(
+            listOf(input(LocalInputFile(fatTrusted), "source", trusted = true)),
+            prior,
+            spill(spillParent()),
+            sort = emptyList(),
+        )
+        val budget = 100L shl 20
+        ParquetFileReader.open(LocalInputFile(prior)).use { reader ->
+            assertThatThrownBy {
+                SortMemory(budget).checkReader(reader.footer.blocks, reader.footer.fileMetaData.schema, "prior")
+            }.isInstanceOf(MergeBudgetExceededException::class.java)
+        }
+
+        fun at(floor: Long) =
+            ParquetRewriter.rewrite(
+                listOf(input(LocalInputFile(prior), "prior", trusted = true)),
+                kv,
+                byK,
+                LocalDiscardableOutput(fresh("append-large-out.parquet")),
+                spill = spill(spillParent(), mergeBudget = budget),
+                appendFloorBytes = floor,
             )
-        assertThat(at(exact).runsTrusted).isEqualTo(1)
-        assertThat(at(exact - 1).runsDemoted).isEqualTo(1)
+        val appended = at(1)
+        assertThat(appended.rowGroupsAppended).isEqualTo(1)
+        assertThat(appended.rowsWritten).isEqualTo(100)
+        assertThatThrownBy { at(Long.MAX_VALUE) }.isInstanceOf(MergeBudgetExceededException::class.java)
     }
 
     @Test
@@ -1073,7 +1111,7 @@ class ExternalMergeSortTest {
             rewrite(
                 listOf(input(LocalInputFile(a), "a", survivors = 3), input(LocalInputFile(b), "b", 10, survivors = 3)),
                 out,
-                bounds.copy(mergeBudgetBytes = 3 * perSpill(bounds)),
+                bounds.copy(mergeBudgetBytes = 2 * 3 * perSpill(bounds)),
             )
         assertThat(result.runsSpilled).isEqualTo(3)
         assertThat(readKv(out).map { it.first }).containsExactly(1, 2, 3, 4, 5, 6)
@@ -1119,7 +1157,7 @@ class ExternalMergeSortTest {
             rewrite(
                 listOf(input(LocalInputFile(clientKv("one", keys)), "one", survivors = 4)),
                 out,
-                spill(spillParent(), chunkRows = 4, mergeBudget = 1, block = 1_000),
+                spill(spillParent(), chunkRows = 4, mergeBudget = 1L shl 20, block = 1_000),
             )
         assertThat(result.runsSpilled).isZero()
         assertThat(result.spillBytes).isZero()
@@ -1290,22 +1328,15 @@ class ExternalMergeSortTest {
     }
 
     @Test
-    fun `the mid-run merge check is exact at its boundary`() {
-        // The exact cost of four spill files, measured from their own
-        // footers as the merge's output is created (every spill exists,
-        // none is deleted yet); then the same group at, and one byte
-        // under, that cost.
-        val path = clientKv("boundary", (1L..8L).toList())
+    fun `the exact merge check includes heads at its boundary`() {
+        val path = clientKv("boundary", (1L..128L).toList())
 
         fun run(budget: Long): Long {
             val parent = spillParent()
             var measured = 0L
             val sink = RecordingOutput(LocalDiscardableOutput(fresh("boundary-out.parquet")))
             sink.onCreate = {
-                measured =
-                    spillFooters(parent).sumOf {
-                        ExternalMergeSort.footerRunBytes(it, ExternalMergeSort.SPILL_PAGE_BYTES_PER_LEAF)
-                    }
+                measured = spillFooters(parent).sumOf { SortMemory(budget).runBytes(it, keyCount = byK.size) }
             }
             ParquetRewriter.rewrite(
                 listOf(input(LocalInputFile(path), "a")),
@@ -1316,9 +1347,9 @@ class ExternalMergeSortTest {
             )
             return measured
         }
-        val exact = run(Long.MAX_VALUE / 4)
-        assertThat(run(exact)).isEqualTo(exact)
-        assertThatThrownBy { run(exact - 1) }.isInstanceOf(MergeBudgetExceededException::class.java)
+        val exact = run(64L shl 20)
+        assertThat(run(2 * exact)).isEqualTo(exact)
+        assertThatThrownBy { run(2 * exact - 1) }.isInstanceOf(MergeBudgetExceededException::class.java)
     }
 
     @Test
@@ -2065,7 +2096,7 @@ class ExternalMergeSortTest {
                 ),
                 fresh("dem-out.parquet"),
                 // No room for a run: every row goes through one chunk.
-                bounds.copy(mergeBudgetBytes = 1),
+                bounds.copy(mergeBudgetBytes = 1L shl 20),
             )
         assertThat(result.filesVerified).isEqualTo(1)
         assertThat(result.runsDemoted).isEqualTo(1)
