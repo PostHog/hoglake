@@ -1172,7 +1172,8 @@ class HogliteCatalogStore(
             if (snapshot == null && atTimestamp == null) return headTable(catalog, namespace, table, totals)
             val m = meta(catalog)
             val at = resolveRead(catalog, m, snapshot, atTimestamp)
-            val ns = liveNamespace(catalog, namespace)
+            // A pinned read resolves the namespace incarnation at its snapshot, as listTables does.
+            val ns = namespaceAt(catalog, namespace, at)
             val t = tableAt(catalog, ns.namespaceId, namespace, table, at)
             // table_totals is exact at head only, so a pinned read
             // aggregates the files visible at `at`.
@@ -2445,6 +2446,22 @@ class HogliteCatalogStore(
             namespace,
         ).firstRow()?.let { namespaceInfo(it) }
             ?: throw HoglakeException.NotFound("namespace '$namespace' in catalog '$catalog'")
+
+    /** The namespace incarnation alive at [at]: created at or before it, not dropped by it. */
+    private fun namespaceAt(
+        catalog: String,
+        namespace: String,
+        at: Long,
+    ): NamespaceInfo =
+        queryCatalog(
+            catalog,
+            "SELECT $NAMESPACE_COLUMNS FROM namespaces WHERE name = ? AND created_snapshot <= ? " +
+                "AND (dropped_snapshot IS NULL OR dropped_snapshot > ?)",
+            namespace,
+            at,
+            at,
+        ).firstRow()?.let { namespaceInfo(it) }
+            ?: throw HoglakeException.NotFound("namespace '$namespace' in catalog '$catalog' at snapshot $at")
 
     /** A namespace row read with [NAMESPACE_COLUMNS]. */
     private fun namespaceInfo(row: List<Any?>): NamespaceInfo =
