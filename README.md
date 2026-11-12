@@ -271,6 +271,7 @@ implementations together.
 |---|---|
 | [docs/iceberg-federation.md](docs/iceberg-federation.md) | What the Iceberg REST facade requires of v1: field ids, type mapping, transforms, delete encoding, bounds |
 | [docs/auth.md](docs/auth.md) | Authentication and authorization: the resource-server model, the modes, the token contract hoglake owns, storage credentials, and what every client supports |
+| [docs/auth-roadmap.md](docs/auth-roadmap.md) | The cross-repository checklist of what is left to do on auth, ticked as it lands |
 | [docs/auth-tenancy.md](docs/auth-tenancy.md) | Design history behind docs/auth.md: the threat model, per-catalog scopes, and why issuance and S3 vending live outside hoglake |
 | [docs/trino-integration.md](docs/trino-integration.md) | The native connector, and the commit shapes that keep Trino writes a translation away |
 | [docs/operational-notes.md](docs/operational-notes.md) | What hoglake changes operationally and what it does not; sizing, and the ceilings to watch |
@@ -283,3 +284,10 @@ implementations together.
 ## License
 
 [MIT](LICENSE)
+
+## Internal Hoglite boundary
+
+Hoglite is a private raw-SQL backend for trusted callers.
+Customer metadata grants can address their own backend tenant directly.
+JWT authentication does not make Hoglite a public SQL API or provide TLS.
+S3 permissions remain unchanged.

@@ -2721,6 +2721,7 @@ just test       # full suite (Docker required)
 just unit       # no Docker
 just one 'com.posthog.hoglake.commit.*'
 just schema-check
+(cd .. && just test-hoglite)  # the hoglite live classes, in a Linux container (see Testing)
 just compose-up # Postgres 18 + MinIO (ports overridable via HOGLAKE_*_PORT)
 just run        # server on :8080
 just docs       # OpenAPI spec in Swagger UI on :8090 (HOGLAKE_SWAGGER_PORT)
@@ -2766,6 +2767,12 @@ must set it by hand.
   - `observability/` — metrics, audit, request ids.
   - `api/` — Ktor routes implementing the spec.
   - `auth/` — token verification, the route authorization table, auth modes.
+    Tokens are ES256 or RS256 compact JWS verified against a JWKS that may
+    mix EC P-256 and RSA keys (encryption keys and keys for other algorithms
+    are skipped), so an off-the-shelf identity provider can issue them.
+    Catalog grants come from the `cat` object or, equivalently, from
+    `hoglake:<catalog>:<scope>` values in the standard OAuth `scope` claim;
+    a token carrying both must have them agree.
 
 ## Testing
 
@@ -2775,6 +2782,26 @@ JUnit 5 + AssertJ; property tests via kotest-property (strategy:
 (`docker-java.properties` in test resources pins the Docker API version
 for recent daemons). The schema-equivalence test and an OCC concurrency
 torture suite run with everything else in `just test`.
+
+The hoglite live classes (`com.posthog.hoglake.hoglite.*IntegrationTest`,
+through `HogliteConformanceEngine`) run a real `hoglited` on a MinIO
+container. The binary comes from `HOGLITE_BINARY` (else `hoglited` on
+PATH); without one they SKIP, and with `HOGLITE_REQUIRED=1` they fail
+instead. hoglite ships Linux binaries only, so on a Mac `just test`
+always skips them; CI's `hoglite-live` job runs them on the newest
+tested build. Locally, `just test-hoglite [filter]` (repo root) does
+the same in a Linux container: `../ci/hoglite-live-local.sh` fetches
+the build for the Docker daemon's architecture (`../ci/fetch-hoglited.sh`,
+checksum and `-version` provenance verified), runs `:test` under
+`eclipse-temurin:25` with the daemon's socket mounted and the host
+network (the engine reaches MinIO at `127.0.0.1:<mapped port>`), keeps
+its Linux Gradle state in `~/.cache/hoglake/hoglite-live/`
+(`HOGLITE_LIVE_CACHE`), and closes with `../ci/check-hoglite-live.sh`,
+the fail-closed check CI runs. That check reads the reports of the
+hoglite `*IntegrationTest` classes only, so a filter must match only
+those (`'com.posthog.hoglake.hoglite.HoglitePinned*'`, say); a run of
+anything else ends with "no report" whatever its result. Needs `docker`
+and an authenticated `gh`.
 
 
 ## Atomic CREATE / CTAS

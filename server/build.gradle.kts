@@ -208,6 +208,9 @@ tasks.test {
     // `./gradlew :test -PpgImage=postgres:19`. Unset, the harness pins
     // the version production runs.
     (project.findProperty("pgImage") as String?)?.let { systemProperty("pgImage", it) }
+    // `just server contract-vectors`: regenerate oauth/contract-vectors.json
+    // (ContractVectorsGenerator), which every other run only checks.
+    if (project.hasProperty("updateContractVectors")) systemProperty("hoglake.updateContractVectors", "true")
     if (project.hasProperty("unitOnly")) {
         exclude("**/*IntegrationTest*")
     }
@@ -220,7 +223,9 @@ tasks.test {
         .withPropertyName("sharedVectors")
         .withPathSensitivity(PathSensitivity.RELATIVE)
     // The hoglite live tests skip without HOGLITE_BINARY, and fail instead
-    // with HOGLITE_REQUIRED=1 (the hoglite-live CI job). Both are inputs,
+    // with HOGLITE_REQUIRED=1 (the hoglite-live CI job, and locally
+    // `just test-hoglite`: ci/hoglite-live-local.sh, a Linux container,
+    // since hoglited ships for Linux only). Both are inputs,
     // so a change of engine, or of the switch, re-runs :test instead of
     // leaving UP-TO-DATE reports from another engine (or from none).
     val hogliteBinary = providers.environmentVariable("HOGLITE_BINARY").orNull.orEmpty()
@@ -297,6 +302,7 @@ val fuzzSoakTargets =
         "TableCreationDefinitionCodecFuzzTest",
         "CommitReceiptFuzzTest",
         "VariantShreddingFuzzTest",
+        "JwtAudienceFuzzTest",
     )
 
 val fuzzSweepTargets =

@@ -37,6 +37,7 @@ just hedgerow unit
 just millrace unit
 just live-python    # builds this checkout, starts isolated services, fails on skips
 just millrace live  # the Kafka-ingestion live stack (PG + MinIO + Kafka), fails on skips
+just test-hoglite   # the hoglite live classes on the newest hoglited, in a Linux container, fails on skips
 just webui test
 just webui build
 ```
@@ -76,6 +77,19 @@ The server builds through the **checked-in Gradle wrapper**
 `server/gradle/wrapper/gradle-wrapper.properties`) — never a
 system-installed gradle. The `just server ...` recipes route through it
 too, so `just test-all` (server + pyhoglake) stays equivalent.
+
+The hoglite live classes (`com.posthog.hoglake.hoglite.*IntegrationTest`,
+`HogliteConformanceEngine`) need a `hoglited`, which hoglite ships for
+Linux only, so `just server test` SKIPS them on a Mac and that green does
+not cover them; CI's `hoglite-live` (in the required `server-checks`
+gate) runs them against the newest tested build. `just test-hoglite
+[filter]` is the local equivalent: `ci/hoglite-live-local.sh` fetches
+that build for the daemon's arch (`ci/fetch-hoglited.sh`, checksum and
+provenance verified), runs the classes under a Linux JDK container on
+the host's Docker daemon and network, with its own Gradle cache under
+`~/.cache/hoglake/hoglite-live/`, and ends with `ci/check-hoglite-live.sh`,
+the fail-closed check CI runs: classes ran, none skipped. It is not in
+`just test-all` (a container, the GitHub API and a few minutes).
 
 The DuckDB extension is built and tested separately (it is not in
 `just`): `cd duckdb-client && ./test/run-live-tests.sh`, which needs

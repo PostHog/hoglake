@@ -69,6 +69,8 @@ listener.
 | `HOGLAKE_AUTH_AUDIENCE` | the `aud` the server accepts; default `hoglake` |
 | `HOGLAKE_AUTH_CLOCK_SKEW_SECONDS` | tolerance on `exp`, `nbf` and `iat`; default 60, at most 600 |
 | `HOGLAKE_AUTH_PREDICATE_FIELDS` | the fields a scoped token's `prd` may name; empty means scoped tokens are refused |
+| `HOGLAKE_AUTH_SCOPED_MAX_LIFETIME_SECONDS` | the longest a scoped token may live, `exp − iat`; default 900; must be positive |
+| `HOGLAKE_AUTH_CLIENT_CLASSES` | comma-separated User-Agent product tokens, each counted under its own `client` label on `hoglake_auth_requests_total` instead of `other`; at most 16, lowercase, never `none` or `other`. A deployment names its own clients here, so the server knows no issuer by name |
 
 One issuer and one key set per server: every token's `iss` must equal
 `HOGLAKE_AUTH_ISSUER`. Several signing services can share one JWKS only if they
@@ -81,22 +83,42 @@ hoglake owns this contract. The test vectors that pin it, signed tokens with
 their expected verification results, live in
 `server/src/test/resources/oauth/contract-vectors.json`, and every issuer
 conforms to them, hogtower included; an issuer that wants a new claim changes
-the contract here first. That is the intended ownership. Today the file is
-still generated on the hogtower side and copied here; generating it from
-hoglake's verifier, with a neutral issuer, is tracked in #574.
+the contract here first. The file is generated from hoglake's verifier
+(`ContractVectors.kt`, `just server contract-vectors`) under a neutral issuer,
+`https://hoglake.contract.test`, and each vector carries an `expect` verdict.
+An issuer's suite mints each vector's `client` or `operator` input and
+compares header and claims; a vector marked `mutation` is verifier-only, a
+change no conforming issuer makes, which an issuer's suite skips.
 
 ### Wire format
 
 - A compact JWS in `Authorization: Bearer`.
-- `alg` is `ES256` today. RS256 is planned so that off-the-shelf identity
-  providers work unchanged (tracked).
-- A `kid` header is required, and must name a key in the configured JWKS.
+- `alg` is `ES256` or `RS256`; `none`, HMAC and every other algorithm are
+  refused before any key is looked up. The key the `kid` names must be of the
+  type the `alg` needs (an EC P-256 key for ES256, an RSA key of at least 2048
+  bits for RS256), so a header cannot steer a key into the wrong verifier.
+- A `kid` header is required, and must name a key in the configured JWKS. The
+  JWKS may hold EC and RSA keys together; an entry that declares another
+  purpose (`use` other than `sig`, or an `alg` hoglake does not verify, as
+  identity providers publish for encryption) is skipped and needs no `kid`.
 - `iss` must equal `HOGLAKE_AUTH_ISSUER`; `aud` must be, or contain,
   `HOGLAKE_AUTH_AUDIENCE`.
+  Hogtower's Hoglite-routed metadata grants explicitly carry `["hoglake","hoglite"]`.
+  This generic verifier applies no issuer-specific audience policy.
+  Hoglite independently requires its configured metadata audience pair.
+  Hogtower vending requires the separate single-string audience `hogtower-vend`.
 - `exp` is required. `nbf` and `iat` are optional; an `iat` in the future is
   refused.
 
 ### Claims
+
+Hoglake forwards only the current request's verified JWT to its configured Hoglite backend.
+Request-local client wrappers share transport and routing state, never mutable caller credentials.
+Ordinary reads and writes do not provision tenants or bootstrap schemas.
+Catalog-bound operator requests perform provisioning and deletion.
+Hoglite rejects scoped or predicate-constrained authority because raw SQL cannot preserve those constraints.
+Existing single-audience metadata tokens remain valid at Hoglake until expiry.
+Drain their remaining fifteen-minute lifetime before enabling Hoglite enforcement.
 
 The core, which every issuer must emit:
 
@@ -104,9 +126,9 @@ The core, which every issuer must emit:
 | --- | --- | --- |
 | `iss`, `aud`, `sub`, `exp` | yes | as above; `sub` becomes the audit actor |
 | `jti` | yes | token id, for correlating an audit line with a token |
-| `ten` | yes today; absent will mean `tenant` (planned) | the token kind: `tenant`, `scoped` or `operator` |
+| `ten` | no; absent means `tenant` | the token kind: `tenant`, `scoped` or `operator`. A token without `ten` that carries `prd` is refused rather than read as a tenant token |
 | `org` | tenant and scoped, today | the tenant the token belongs to, for the audit log only; hoglake does not authorize on it. Required by the verifier today; making it optional is tracked |
-| `cat` | tenant and scoped | `{"<catalog>": ["read", "write", …]}`: the catalogs the token may use and the scopes on each. On a tenant token an unknown scope word is dropped, not refused; a scoped token is stricter, below |
+| `cat`, or `scope` | tenant and scoped, one or both | `cat` is `{"<catalog>": ["read", "write", …]}`: the catalogs the token may use and the scopes on each. On a tenant token an unknown scope word is dropped, not refused; a scoped token is stricter, below. `scope` is the standard form, next paragraph |
 
 Authorization is per catalog. The scope vocabulary is ordered,
 `read < write < maintenance < admin`: `write` includes `read`, `maintenance`
@@ -114,9 +136,15 @@ Authorization is per catalog. The scope vocabulary is ordered,
 `admin` (drop the catalog) includes everything. A catalog the token does not
 name answers 404, not 403, so a token cannot enumerate catalogs it may not see.
 
-Planned, so that standard identity providers can express the same thing: a
-`scope` claim of space-separated `hoglake:<catalog>:<scope>` values, accepted
-as equivalent to `cat` (tracked).
+So that standard identity providers can express the same thing, the OAuth
+`scope` claim is accepted as an alternative: a space-separated string whose
+`hoglake:<catalog>:<scope>` values carry the same grants as `cat`. Values that
+do not start with `hoglake:` belong to other audiences and are ignored; a
+`hoglake:` value that is not exactly three parts with a valid catalog name
+refuses the token. When both `cat` and `scope` are present they must describe
+the same grants after each has applied its own rules, or the token is
+refused. One limit: a routed (`rtg`) token still needs exactly one `cat`
+entry.
 
 Profile extensions, optional and generic. An issuer uses them when its
 deployment needs them; hoglake applies them without knowing what they mean:
@@ -135,10 +163,10 @@ A `scoped` token is a tenant token narrowed to some values of a field, and the
 verifier is strict about it. An issuer that wants its scoped tokens accepted
 must emit all of the following:
 
-- an integer `iat`, and `exp − iat ≤ 900` (the cap becomes configuration,
-  tracked; an issuer that mints longer-lived scoped tokens must raise it);
-- a non-empty `cat` whose scopes are only `read` or `write`; any other scope
-  word refuses the token rather than being dropped;
+- an integer `iat`, and `exp − iat` at most `HOGLAKE_AUTH_SCOPED_MAX_LIFETIME_SECONDS`
+  (default 900; an issuer that mints longer-lived scoped tokens must raise it);
+- a non-empty `cat` (or `scope`) whose scopes are only `read` or `write`; any
+  other scope word refuses the token rather than being dropped;
 - a `prd` object naming **exactly** the server's `HOGLAKE_AUTH_PREDICATE_FIELDS`,
   no more and no fewer. A server with no predicate fields refuses every scoped
   token;
@@ -263,13 +291,16 @@ was retired for the reasons in [auth-tenancy.md §17.2](auth-tenancy.md).
 
 ## Status
 
-Built: `off`, `warn`, `enforce`; ES256 verification against a JWKS file or URL;
-the four scopes and the route table; scoped tokens with `prd`; `rtg`; the
-public and metrics listeners; client credentials and fixed tokens in pyhoglake,
-the DuckDB extension, hedgerow and the Trino connector.
+The cross-repository checklist of what is left is
+[auth-roadmap.md](auth-roadmap.md).
 
-Tracked in [#574](https://github.com/PostHog/hoglake/issues/574): the `broker` storage provider; hoglake-generated contract vectors;
-RS256; the `scope` claim; a configurable scoped-token cap; `ten` defaulting to
-`tenant`; the local issuer and `hoglake token mint`; a fixed-token option in the
-Trino connector; client credentials in millrace; removing the issuer-specific
-strings that remain in server comments and tests.
+Built: `off`, `warn`, `enforce`; ES256 and RS256 verification against a JWKS
+file or URL; the four scopes and the route table; the `scope` claim; scoped
+tokens with `prd` and a configurable lifetime cap; `ten` defaulting to
+`tenant`; `rtg`; the public and metrics listeners; contract vectors generated
+here; client credentials and fixed tokens in pyhoglake, the DuckDB extension,
+hedgerow and the Trino connector.
+
+Tracked in [#574](https://github.com/PostHog/hoglake/issues/574): the `broker` storage provider; the local issuer and
+`hoglake token mint`; a fixed-token option in the Trino connector; client
+credentials in millrace; the `jti` and multi-issuer decisions.

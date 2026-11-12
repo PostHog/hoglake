@@ -45,6 +45,7 @@ import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.util.UUID
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
 /** Compare the emitted JSON contract, not merely logger invocation counts. */
@@ -308,6 +309,8 @@ class HogliteMutationAuditIntegrationTest {
         if (mode != "prepare") f.creations.prepare(f.catalog, op, definition)
         val hook = AtomicReference<(() -> Unit)?>(null)
         val hookFailure = AtomicReference<Throwable?>(null)
+        val hookTransitions = CopyOnWriteArrayList<List<String>>()
+        val lazyExpiryBeforeHook = AtomicInteger()
         val win: () -> Unit = {
             when (mode) {
                 "prepare" -> f.creations.prepare(f.catalog, op, definition)
@@ -342,15 +345,30 @@ class HogliteMutationAuditIntegrationTest {
         proxy.createContext("/") { ex ->
             try {
                 val bytes = ex.requestBody.readBytes()
-                val body = bytes.decodeToString()
-                if (ex.requestURI.path.endsWith("/tx") &&
-                    (
-                        "INSERT INTO table_creations" in body || "SET files_json =" in body ||
-                            "reason = 'client_abort'" in body
-                    )
+                val statements = json.readTree(bytes)["statements"]?.map { it["sql"].asText() }.orEmpty()
+                val transitions =
+                    statements.filter { sql ->
+                        sql.startsWith("INSERT INTO table_creations") ||
+                            sql.startsWith("UPDATE table_creations SET files_json =") ||
+                            (
+                                sql.startsWith("UPDATE table_creations SET state = 'aborted'") &&
+                                    "'client_abort'" in sql
+                            )
+                    }
+                if (ex.requestURI.path.endsWith("/tx") && hook.get() != null &&
+                    statements.any { sql ->
+                        sql.startsWith("UPDATE table_creations SET state = 'aborted'") &&
+                            "'client_abort'" !in sql
+                    }
                 ) {
+                    lazyExpiryBeforeHook.incrementAndGet()
+                }
+                if (ex.requestURI.path.endsWith("/tx") && transitions.isNotEmpty()) {
                     try {
-                        hook.getAndSet(null)?.invoke()
+                        hook.getAndSet(null)?.let { pending ->
+                            hookTransitions.add(transitions)
+                            pending()
+                        }
                     } catch (failure: Throwable) {
                         hookFailure.set(failure)
                         throw failure
@@ -384,6 +402,14 @@ class HogliteMutationAuditIntegrationTest {
                     next()
                     assertThat(hook.get() == null).isTrue()
                     assertThat(hookFailure.get()).isNull()
+                    assertThat(hookTransitions).hasSize(if (mode == "guard_reject") 2 else 1)
+                    if (mode == "abort") {
+                        assertThat(lazyExpiryBeforeHook.get()).isPositive()
+                        assertThat(hookTransitions.single()).hasSize(1)
+                        val sql = hookTransitions.single().single()
+                        assertThat(sql).startsWith("UPDATE table_creations SET state = 'aborted'")
+                        assertThat(sql).contains("CASE", "'client_abort'")
+                    }
                     val winner =
                         when (mode) {
                             "prepare" -> "prepared"
