@@ -24,7 +24,7 @@ The issuer is a deployment choice, not a hoglake dependency:
 
 | deployment | issuer | storage credentials |
 | --- | --- | --- |
-| single-tenant, internal | none (`HOGLAKE_AUTH_MODE=off`), or hoglake's own local key (`local`, planned) | each client's own AWS identity; the server's own (`ambient`) for its jobs |
+| single-tenant, internal | none (`HOGLAKE_AUTH_MODE=off`), or hoglake's own key (`local`): `hoglake token keygen` once, `hoglake token mint` per client, no issuer service | each client's own AWS identity; the server's own (`ambient`) for its jobs |
 | your own identity provider | any issuer that emits the [token contract](#the-token-contract) and publishes a JWKS | the same; or whatever your issuer hands clients, and a `broker` in front of your own STS for the server's jobs |
 | PostHog's managed warehouse | hogtower, PostHog's control plane, which mints tokens for PostHog's tenants and hands out scoped S3 sessions with them | vended by hogtower: to clients alongside the token, to the server's jobs through the `broker` provider |
 
@@ -42,7 +42,7 @@ one issuer among possible issuers.
 | `off` (default) | no verification; every request is accepted and the caller-supplied `author` is trusted | local development, CI, a single-tenant install on a trusted network |
 | `warn` | tokens are verified and decisions are computed and counted, but nothing is refused, except a verified scoped token, which is filtered as in `enforce` | measuring before a cutover: watch `hoglake_auth_requests_total{outcome="missing"}` reach zero per client class |
 | `enforce` | deny by default; a route without a verified, sufficient token gets 401 or 403 | production |
-| `local` (planned) | `enforce`, with the server's own signing key as the issuer; see [Local issuer](#local-issuer-planned) | a standalone install that wants real authentication and no extra service |
+| `local` | `enforce`, with the server's own signing key as the issuer; see [Local issuer](#local-issuer) | a standalone install that wants real authentication and no extra service |
 
 Some features refuse `off` because they rely on the token: the public listener
 (`HOGLAKE_PUBLIC_PORT`), hoglite backends and mounts.
@@ -57,7 +57,8 @@ Listeners:
   authentication, for a scraper inside the trust boundary.
 
 `/livez`, `/healthz`, `/openapi.yaml` and `/v1/info` need no token on any
-listener.
+listener; nor does `/.well-known/jwks.json`, which serves the public key
+under `local` and 404s otherwise.
 
 ## Configuration
 
@@ -69,6 +70,7 @@ listener.
 | `HOGLAKE_AUTH_AUDIENCE` | the `aud` the server accepts; default `hoglake` |
 | `HOGLAKE_AUTH_CLOCK_SKEW_SECONDS` | tolerance on `exp`, `nbf` and `iat`; default 60, at most 600 |
 | `HOGLAKE_AUTH_PREDICATE_FIELDS` | the fields a scoped token's `prd` may name; empty means scoped tokens are refused |
+| `HOGLAKE_AUTH_SIGNING_KEY` | `local` only, and required there: the server's own ES256 key, a private P-256 JWK base64url-encoded, as `hoglake token keygen` prints it. Env-only — no key file, nothing persisted. Refused under any other mode. The issuer defaults to `hoglake` under `local` |
 | `HOGLAKE_AUTH_SCOPED_MAX_LIFETIME_SECONDS` | the longest a scoped token may live, `exp − iat`; default 900; must be positive |
 | `HOGLAKE_AUTH_CLIENT_CLASSES` | comma-separated User-Agent product tokens, each counted under its own `client` label on `hoglake_auth_requests_total` instead of `other`; at most 16, lowercase, never `none` or `other`. A deployment names its own clients here, so the server knows no issuer by name |
 
@@ -308,22 +310,57 @@ identity provider's SDK, or an exchange of some other credential, implements
 one of those and nothing else changes. hogtower appears in the clients only as
 the example token URL in their READMEs.
 
-## Local issuer (planned)
+## Local issuer
 
-For an install that wants real authentication and no extra service:
+For an install that wants real authentication and no extra service, the
+server is its own issuer — holding one key and no clients, verify-only at
+runtime. This is deliberately not an OAuth server inside hoglake; the earlier
+design that put one there was retired for the reasons in
+[auth-tenancy.md §17.2](auth-tenancy.md).
 
-- `HOGLAKE_AUTH_MODE=local` makes the server trust a key it holds itself,
-  from `HOGLAKE_AUTH_SIGNING_KEY` or generated at first start and persisted in
-  the metadata store, and publishes its public half at
-  `/.well-known/jwks.json`.
-- `hoglake token mint --catalog <name> --scope <read|write|maintenance|admin>
-  --ttl <duration> [--operator]` signs a token offline with that key, from the
-  command line, for an operator to hand to a client as a fixed token.
-- Nothing listens for token requests. The runtime stays verify-only.
+- `HOGLAKE_AUTH_MODE=local` is `enforce` with the public half of
+  `HOGLAKE_AUTH_SIGNING_KEY` as the only trusted key. The key is env-only: a
+  private EC P-256 JWK, base64url-encoded, that `hoglake token keygen` prints
+  and the server never writes anywhere. A JWKS file or URL beside it is a
+  boot error, as is the mode without the key. `HOGLAKE_AUTH_ISSUER` defaults
+  to `hoglake` (an explicit value wins), `HOGLAKE_AUTH_AUDIENCE` to `hoglake`.
+- The public half is served at `/.well-known/jwks.json`, so a hoglite backend
+  or a sibling that verifies the same tokens fetches it the way it would any
+  issuer's. The `kid` is the RFC 7638 thumbprint of the key, first eight
+  bytes in hex — the same rule the contract vectors use.
+- `hoglake token mint` signs a token offline with that key. It is an issuer
+  like any other: its claims are checked against the contract vectors in the
+  test suite, so a token it mints is exactly what the verifier next door
+  accepts.
+- Nothing listens for token requests, and the signing key is never loaded by
+  the server for anything but its public half.
 
-This is deliberately not an OAuth server inside hoglake: it holds one key and
-no clients, and the earlier design that put an authorization server in hoglake
-was retired for the reasons in [auth-tenancy.md §17.2](auth-tenancy.md).
+### Standalone, end to end
+
+```bash
+# 1. One key for the install. Keep the line somewhere the server and your
+#    shell both read it (an env file, a secret manager).
+hoglake token keygen            # prints HOGLAKE_AUTH_SIGNING_KEY=<value>
+export HOGLAKE_AUTH_SIGNING_KEY=<value>
+
+# 2. Start the server as its own issuer.
+HOGLAKE_AUTH_MODE=local hoglake-server
+
+# 3. Mint a token per client, offline, from the same environment.
+hoglake token mint --catalog demo --scope write --sub analytics-job --ttl 7d
+hoglake token mint --operator                                  # fleet-wide admin
+hoglake token mint --operator --catalog demo --org local       # bound to one catalog
+```
+
+`hoglake` here is the server binary (`bin/hoglake-server token …` from the
+distribution, `just server token …` from a checkout). The token goes into the
+client's fixed-token setting — `BearerToken` in pyhoglake, `TOKEN` in the
+DuckDB extension, `hoglake.auth.token` in the Trino connector — and the
+client brings its own storage credentials, as it does under every issuer.
+`--catalog` repeats, `name=scope` sets a catalog's scope, and `--ttl` takes
+`90s`, `15m`, `24h` (the default) or `7d`. Scoped tokens (`prd`) are not
+minted here: a standalone install has no second authority to narrow a token
+by.
 
 ## Status
 
@@ -335,9 +372,10 @@ file or URL; the four scopes and the route table; the `scope` claim; scoped
 tokens with `prd` and a configurable lifetime cap; `ten` defaulting to
 `tenant`; `rtg`; the public and metrics listeners; contract vectors generated
 here; the `ambient`, `static` and `broker` storage providers behind the
-server's own jobs; client credentials and fixed tokens in pyhoglake, the
-DuckDB extension, hedgerow and the Trino connector.
+server's own jobs; the local issuer (`local`, `hoglake token keygen` and
+`mint`); client credentials and fixed tokens in pyhoglake, the DuckDB
+extension, hedgerow and the Trino connector.
 
-Tracked in [#574](https://github.com/PostHog/hoglake/issues/574): the local issuer and
-`hoglake token mint`; a fixed-token option in the Trino connector; client
-credentials in millrace; the `jti` and multi-issuer decisions.
+Tracked in [#574](https://github.com/PostHog/hoglake/issues/574): a fixed-token
+option in the Trino connector; client credentials in millrace; the `jti` and
+multi-issuer decisions.

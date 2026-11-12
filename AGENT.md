@@ -1815,7 +1815,9 @@ ran on the local stack and what it showed.
   conforms (typed bounds, Iceberg transforms, DV-only deletes).
 - **Auth**: the ENFORCEMENT layer has landed — JWT verification, the
   route-to-scope table ([server/src/main/kotlin/com/posthog/hoglake/auth/AuthPolicy.kt](server/src/main/kotlin/com/posthog/hoglake/auth/AuthPolicy.kt)),
-  per-catalog scopes, the `HOGLAKE_AUTH_MODE=off|warn|enforce` flag. It is
+  per-catalog scopes, the `HOGLAKE_AUTH_MODE=off|warn|enforce|local` flag
+  (`local`: the server is its own issuer, key in `HOGLAKE_AUTH_SIGNING_KEY`,
+  tokens from `hoglake token mint`; docs/auth.md "Local issuer"). It is
   `off` by default, i.e. today's behaviour. `enforce` refuses every caller
   that has no token from the configured issuer, so deploy `warn` first
   and watch `hoglake_auth_requests_total{outcome="missing"}` until it is
