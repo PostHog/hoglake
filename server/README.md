@@ -2766,6 +2766,12 @@ must set it by hand.
   - `observability/` — metrics, audit, request ids.
   - `api/` — Ktor routes implementing the spec.
   - `auth/` — token verification, the route authorization table, auth modes.
+    Tokens are ES256 or RS256 compact JWS verified against a JWKS that may
+    mix EC P-256 and RSA keys (encryption keys and keys for other algorithms
+    are skipped), so an off-the-shelf identity provider can issue them.
+    Catalog grants come from the `cat` object or, equivalently, from
+    `hoglake:<catalog>:<scope>` values in the standard OAuth `scope` claim;
+    a token carrying both must have them agree.
 
 ## Testing
 

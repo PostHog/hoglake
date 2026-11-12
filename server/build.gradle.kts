@@ -208,6 +208,9 @@ tasks.test {
     // `./gradlew :test -PpgImage=postgres:19`. Unset, the harness pins
     // the version production runs.
     (project.findProperty("pgImage") as String?)?.let { systemProperty("pgImage", it) }
+    // `just server contract-vectors`: regenerate oauth/contract-vectors.json
+    // (ContractVectorsGenerator), which every other run only checks.
+    if (project.hasProperty("updateContractVectors")) systemProperty("hoglake.updateContractVectors", "true")
     if (project.hasProperty("unitOnly")) {
         exclude("**/*IntegrationTest*")
     }
@@ -297,6 +300,7 @@ val fuzzSoakTargets =
         "TableCreationDefinitionCodecFuzzTest",
         "CommitReceiptFuzzTest",
         "VariantShreddingFuzzTest",
+        "JwtAudienceFuzzTest",
     )
 
 val fuzzSweepTargets =

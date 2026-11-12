@@ -36,7 +36,7 @@ import java.util.concurrent.TimeUnit
 
 /**
  * The mount API (plan 1.4) through the real application and its migrated
- * database, driven with the request shapes hogtower's events mount loop
+ * database, driven with the request shapes an issuer's events mount loop
  * (#138) sends: GET, then PUT `{revision, enabled, values}` at the revision
  * it read, and a list on repair passes.
  */
@@ -168,7 +168,7 @@ class MountApiIntegrationTest {
             // #138's repair pass on an org no longer federated: empty and disabled.
             val disabled = put(port, name, 1, false, emptyList())
             assertThat(disabled.statusCode()).describedAs(disabled.body()).isEqualTo(200)
-            val read = send(port, "GET", "/v1/mounts/$name", operator("hogtower:provisioner")).tree()
+            val read = send(port, "GET", "/v1/mounts/$name", operator("issuer:provisioner")).tree()
             assertThat(read.get("revision").asLong()).isEqualTo(2)
             assertThat(read.get("enabled").asBoolean()).isFalse()
 
@@ -185,7 +185,7 @@ class MountApiIntegrationTest {
             assertThat(put(port, name, 0, true, listOf(1)).statusCode()).isEqualTo(200)
             val refused =
                 mapOf(
-                    "the provisioner" to operator("hogtower:provisioner"),
+                    "the provisioner" to operator("issuer:provisioner"),
                     "platform:admin" to operator("platform:admin"),
                     "the webui" to operator("webui"),
                     "a tenant naming the mount" to
@@ -201,7 +201,7 @@ class MountApiIntegrationTest {
         // warn lets the route table's refusals through; the handler's holds.
         withServer(mode = AuthMode.WARN) { port ->
             assertThat(put(port, name, 1, true, listOf(666), token = null).statusCode()).isEqualTo(403)
-            assertThat(put(port, name, 1, true, listOf(666), operator("hogtower:provisioner")).statusCode())
+            assertThat(put(port, name, 1, true, listOf(666), operator("issuer:provisioner")).statusCode())
                 .isEqualTo(403)
             // The writer's subject is not enough: it must be on an operator token.
             val tenant = TestTokens.tenantClaims(sub = WRITER, catalogs = mapOf(name to listOf("admin")))
@@ -430,6 +430,6 @@ class MountApiIntegrationTest {
     }
 
     private companion object {
-        const val WRITER = "hogtower:events-mounts"
+        const val WRITER = "issuer:events-mounts"
     }
 }

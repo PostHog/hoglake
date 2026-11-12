@@ -26,7 +26,7 @@ import java.util.UUID
  * machine without the engine. When HOGLITE_REQUIRED=1 (the hoglite-live
  * CI job), a missing binary is a failure, not a skip.
  */
-internal class HogliteConformanceEngine : AutoCloseable {
+internal class HogliteConformanceEngine(private val authArgs: List<String> = emptyList()) : AutoCloseable {
     private lateinit var minio: MinIOContainer
     private var process: Process? = null
     private lateinit var builder: ProcessBuilder
@@ -60,6 +60,7 @@ internal class HogliteConformanceEngine : AutoCloseable {
                 "-id", "it-1",
                 "-class", "standard",
             ).redirectErrorStream(true).redirectOutput(log)
+        builder.command().addAll(authArgs)
         builder.environment().putAll(
             mapOf(
                 "AWS_ENDPOINT_URL" to s3Endpoint(),

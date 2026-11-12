@@ -371,6 +371,34 @@ class HogliteBackendIntegrationTest {
             .isInstanceOf(HoglakeException.NotFound::class.java)
     }
 
+    /**
+     * A head read resolves the namespace in the same transaction as the
+     * listing, whose namespace id is a subselect (#537). The subselect alone
+     * makes a missing namespace an empty listing, so only the namespace
+     * statement tells "missing" (NotFound) from "empty" (no rows).
+     */
+    @Test
+    fun `head reads refuse a missing or dropped namespace and list an empty one`() {
+        val catalog = freshCatalog()
+        store.createNamespace(catalog, "empty")
+        store.createNamespace(catalog, "gone")
+        store.dropNamespace(catalog, "gone", author = "test", message = "drop")
+        val head = store.getCatalog(catalog).headSnapshotId
+
+        assertThat(store.listTables(catalog, "empty")).isEmpty()
+        for (ns in listOf("missing", "gone")) {
+            assertThatThrownBy { store.listTables(catalog, ns) }
+                .isInstanceOf(HoglakeException.NotFound::class.java)
+                .hasMessage("namespace '$ns' in catalog '$catalog'")
+            assertThatThrownBy { store.getTable(catalog, ns, "t") }
+                .isInstanceOf(HoglakeException.NotFound::class.java)
+                .hasMessage("namespace '$ns' in catalog '$catalog'")
+        }
+        assertThatThrownBy { store.getTable(catalog, "empty", "t", totals = true) }
+            .isInstanceOf(HoglakeException.NotFound::class.java)
+            .hasMessage("table 'empty.t' in catalog '$catalog' at snapshot $head")
+    }
+
     @Test
     fun `commit appends land with row lineage and replay idempotently`() {
         val catalog = freshCatalog()
