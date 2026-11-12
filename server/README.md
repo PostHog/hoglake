@@ -2629,7 +2629,9 @@ just run
 ```
 
 (`HOGLAKE_S3_PATH_STYLE` already defaults to `true`, which MinIO
-requires.) When the server runs in a container instead, use
+requires.) Both keys set selects the `static` storage provider; see
+`HOGLAKE_STORAGE_PROVIDER` in docs/auth.md ("Storage credentials") for
+`ambient` and `broker`. When the server runs in a container instead, use
 `http://host.docker.internal:9000` — or `http://minio:9000` with the
 container attached to the compose network — as the endpoint.
 
