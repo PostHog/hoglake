@@ -2,9 +2,11 @@ package com.posthog.hoglake.hydrator
 
 import com.posthog.hoglake.Config
 import com.posthog.hoglake.observability.Metrics
+import com.posthog.hoglake.storage.StorageAccess
+import com.posthog.hoglake.storage.StorageCredentialProvider
+import com.posthog.hoglake.storage.StorageCredentialProviders
 import io.github.oshai.kotlinlogging.KotlinLogging
-import software.amazon.awssdk.auth.credentials.AwsBasicCredentials
-import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider
+import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider
 import software.amazon.awssdk.core.sync.RequestBody
 import software.amazon.awssdk.regions.Region
 import software.amazon.awssdk.services.s3.S3Client
@@ -20,6 +22,7 @@ import software.amazon.awssdk.services.s3.model.GetObjectRequest
 import software.amazon.awssdk.services.s3.model.PutObjectRequest
 import software.amazon.awssdk.services.s3.model.UploadPartRequest
 import java.net.URI
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Thin S3/MinIO wrapper for the hydrator. Speaks `s3://bucket/key` URIs
@@ -33,33 +36,84 @@ import java.net.URI
  * OutOfMemoryError on the third call.
  */
 open class ObjectStore(
-    endpoint: String?,
-    region: String,
-    accessKey: String?,
-    secretKey: String?,
-    pathStyle: Boolean,
+    private val endpoint: String?,
+    private val region: String,
+    private val pathStyle: Boolean,
+    /** Where this store's credentials come from; shared by every view it makes. */
+    private val provider: StorageCredentialProvider,
+    /**
+     * Non-null on a catalog VIEW ([forCatalog]): the grant this client
+     * signs with. Null on the base store, which signs with
+     * [StorageCredentialProvider.unscoped] — the shared keys under
+     * `ambient`/`static`, a refusal under `broker`.
+     */
+    private val credentials: AwsCredentialsProvider? = null,
 ) : AutoCloseable {
-    constructor(config: Config) : this(
+    /**
+     * The key-pair shape every test fixture builds: static keys when both
+     * are given, otherwise the SDK chain — the rule the server applied
+     * before `HOGLAKE_STORAGE_PROVIDER` existed.
+     */
+    constructor(
+        endpoint: String?,
+        region: String,
+        accessKey: String?,
+        secretKey: String?,
+        pathStyle: Boolean,
+    ) : this(
+        endpoint = endpoint,
+        region = region,
+        pathStyle = pathStyle,
+        provider = StorageCredentialProviders.staticOrAmbient(accessKey, secretKey),
+    )
+
+    constructor(
+        config: Config,
+        provider: StorageCredentialProvider =
+            StorageCredentialProviders.fromConfig(
+                config,
+            ),
+    ) : this(
         endpoint = config.s3Endpoint.ifBlank { null },
         region = config.s3Region,
-        accessKey = config.s3AccessKey.ifBlank { null },
-        secretKey = config.s3SecretKey.ifBlank { null },
         pathStyle = config.s3PathStyle,
+        provider = provider,
     )
 
     private val s3: S3Client =
         S3Client.builder()
             .region(Region.of(region))
-            .apply {
-                if (endpoint != null) endpointOverride(URI.create(endpoint))
-                if (accessKey != null && secretKey != null) {
-                    credentialsProvider(
-                        StaticCredentialsProvider.create(AwsBasicCredentials.create(accessKey, secretKey)),
-                    )
-                }
-            }
+            .credentialsProvider(credentials ?: provider.unscoped())
+            .apply { if (endpoint != null) endpointOverride(URI.create(endpoint)) }
             .forcePathStyle(pathStyle)
             .build()
+
+    /** True under a provider whose credentials differ per catalog ([forCatalog] is then mandatory before IO). */
+    val scoped: Boolean get() = provider.scoped
+
+    /** The catalog views this base store has built, one per (catalog, prefix, access). */
+    private val views = ConcurrentHashMap<Triple<String, String, StorageAccess>, ObjectStore>()
+
+    /**
+     * The store to do [access] on [catalog]'s objects under [prefix] (its
+     * `data_path`) with. Under an unscoped provider that is this very
+     * store — same client, same keys, and the same subclass, so a
+     * fault-injecting test store keeps injecting. Under `broker` it is a
+     * client built on that catalog's own session, cached here for the
+     * life of the base store; the session refreshes underneath it, so the
+     * client is never rebuilt.
+     */
+    fun forCatalog(
+        catalog: String,
+        prefix: String,
+        access: StorageAccess,
+    ): ObjectStore {
+        if (!provider.scoped) return this
+        check(credentials == null) { "forCatalog on a catalog view" }
+        return views.computeIfAbsent(Triple(catalog, prefix, access)) {
+            ObjectStore(endpoint, region, pathStyle, provider, provider.credentialsFor(catalog, prefix, access))
+        }
+    }
 
     private val log = KotlinLogging.logger {}
 
@@ -244,7 +298,12 @@ open class ObjectStore(
         }
     }
 
-    override fun close() = s3.close()
+    override fun close() {
+        views.values.forEach { it.close() }
+        views.clear()
+        s3.close()
+        if (credentials == null) provider.close()
+    }
 
     companion object {
         private const val SCHEME = "s3://"

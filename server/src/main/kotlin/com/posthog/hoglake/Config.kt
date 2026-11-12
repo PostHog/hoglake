@@ -249,6 +249,34 @@ data class Config(
     val s3SecretKey: String = env("HOGLAKE_S3_SECRET_KEY", ""),
     val s3PathStyle: Boolean = boolEnv("HOGLAKE_S3_PATH_STYLE", true),
     /**
+     * Where the server's OWN jobs get S3 credentials (docs/auth.md,
+     * "Storage credentials"): `ambient` | `static` | `broker`. Empty —
+     * the default — is `static` when both S3 keys are set and `ambient`
+     * otherwise, which is exactly what the server did before the knob
+     * existed. Resolved by [effectiveStorageProvider]; the combination is
+     * validated at boot.
+     */
+    val storageProvider: String = env("HOGLAKE_STORAGE_PROVIDER", ""),
+    /** `broker` only: the URL that vends a session for `{catalog, prefix, access}`. */
+    val storageBrokerUrl: String = env("HOGLAKE_STORAGE_BROKER_URL", ""),
+    /** `broker` only: the OAuth token URL the server's client credential is exchanged at. */
+    val storageBrokerTokenUrl: String = env("HOGLAKE_STORAGE_BROKER_TOKEN_URL", ""),
+    val storageBrokerClientId: String = env("HOGLAKE_STORAGE_BROKER_CLIENT_ID", ""),
+    val storageBrokerClientSecret: String = env("HOGLAKE_STORAGE_BROKER_CLIENT_SECRET", ""),
+    /**
+     * `broker` only: the `audience` the token request asks for. The
+     * default is the one the clients use; a broker that wants its own
+     * audience on the bearer it receives sets it here.
+     */
+    val storageBrokerAudience: String = env("HOGLAKE_STORAGE_BROKER_AUDIENCE", "hoglake"),
+    /**
+     * `broker` only: how long before a session's expiry it is refreshed.
+     * A refresh that fails keeps the held session for the rest of this
+     * window, so it is also how much broker downtime a running job rides
+     * through.
+     */
+    val storageBrokerRefreshMarginSeconds: Long = env("HOGLAKE_STORAGE_BROKER_REFRESH_MARGIN_SECONDS", "300").toLong(),
+    /**
      * Authentication at the HTTP boundary (docs/auth-tenancy.md):
      * `off` | `warn` | `enforce` (§11).
      *
@@ -1413,7 +1441,79 @@ data class Config(
     /** The remote hosts of [mountHostsFile]; empty when this server is not a mount Client. */
     val mountHosts: List<MountHost> = readMountHosts(mountHostsFile)
 
+    /** The storage credential provider kinds `HOGLAKE_STORAGE_PROVIDER` names. */
+    enum class StorageProviderKind(val wire: String) {
+        AMBIENT("ambient"),
+        STATIC("static"),
+        BROKER("broker"),
+        ;
+
+        companion object {
+            fun parse(raw: String): StorageProviderKind =
+                entries.firstOrNull { it.wire == raw.trim().lowercase() }
+                    ?: throw IllegalArgumentException(
+                        "HOGLAKE_STORAGE_PROVIDER must be one of ${entries.joinToString { it.wire }}, got '$raw'",
+                    )
+        }
+    }
+
+    /**
+     * [storageProvider] resolved: the named kind, or — unset — the
+     * pre-knob rule, `static` when both keys are set and `ambient`
+     * otherwise.
+     */
+    val effectiveStorageProvider: StorageProviderKind =
+        if (storageProvider.isBlank()) {
+            if (s3AccessKey.isNotBlank() && s3SecretKey.isNotBlank()) {
+                StorageProviderKind.STATIC
+            } else {
+                StorageProviderKind.AMBIENT
+            }
+        } else {
+            StorageProviderKind.parse(storageProvider)
+        }
+
     init {
+        val s3Keys = s3AccessKey.isNotBlank() && s3SecretKey.isNotBlank()
+        when (effectiveStorageProvider) {
+            StorageProviderKind.STATIC ->
+                require(s3Keys) {
+                    "HOGLAKE_STORAGE_PROVIDER=static needs both HOGLAKE_S3_ACCESS_KEY and HOGLAKE_S3_SECRET_KEY"
+                }
+            // Keys beside an explicit `ambient` are not a preference to
+            // resolve: whoever set both believes the keys are in use.
+            StorageProviderKind.AMBIENT ->
+                require(storageProvider.isBlank() || !(s3AccessKey.isNotBlank() || s3SecretKey.isNotBlank())) {
+                    "HOGLAKE_STORAGE_PROVIDER=ambient uses the SDK's credential chain; unset " +
+                        "HOGLAKE_S3_ACCESS_KEY and HOGLAKE_S3_SECRET_KEY, or select static"
+                }
+            StorageProviderKind.BROKER -> {
+                require(
+                    storageBrokerUrl.isNotBlank() && storageBrokerTokenUrl.isNotBlank() &&
+                        storageBrokerClientId.isNotBlank() && storageBrokerClientSecret.isNotBlank(),
+                ) {
+                    "HOGLAKE_STORAGE_PROVIDER=broker needs HOGLAKE_STORAGE_BROKER_URL, " +
+                        "HOGLAKE_STORAGE_BROKER_TOKEN_URL, HOGLAKE_STORAGE_BROKER_CLIENT_ID and " +
+                        "HOGLAKE_STORAGE_BROKER_CLIENT_SECRET"
+                }
+                require(!s3Keys) {
+                    "HOGLAKE_STORAGE_PROVIDER=broker vends every session; unset " +
+                        "HOGLAKE_S3_ACCESS_KEY and HOGLAKE_S3_SECRET_KEY"
+                }
+                for ((name, value) in listOf(
+                    "HOGLAKE_STORAGE_BROKER_URL" to storageBrokerUrl,
+                    "HOGLAKE_STORAGE_BROKER_TOKEN_URL" to storageBrokerTokenUrl,
+                )) {
+                    val scheme = runCatching { java.net.URI.create(value.trim()).scheme }.getOrNull()
+                    require(scheme == "https" || scheme == "http") { "$name must be an http(s) URL, got '$value'" }
+                }
+                require(storageBrokerAudience.isNotBlank()) { "HOGLAKE_STORAGE_BROKER_AUDIENCE must not be blank" }
+                require(storageBrokerRefreshMarginSeconds >= 0) {
+                    "HOGLAKE_STORAGE_BROKER_REFRESH_MARGIN_SECONDS must not be negative, " +
+                        "got $storageBrokerRefreshMarginSeconds"
+                }
+            }
+        }
         require(
             authClientClasses.size <= MAX_AUTH_CLIENT_CLASSES &&
                 authClientClasses.all { CLIENT_CLASS.matches(it) && it !in RESERVED_CLIENT_CLASSES },

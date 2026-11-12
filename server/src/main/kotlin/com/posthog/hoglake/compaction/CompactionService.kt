@@ -33,6 +33,7 @@ import com.posthog.hoglake.persistence.TableRepo
 import com.posthog.hoglake.persistence.TierTotalsRepo
 import com.posthog.hoglake.persistence.bindBigintArrayOrNull
 import com.posthog.hoglake.service.CompactionBackend
+import com.posthog.hoglake.storage.StorageAccess
 import io.github.oshai.kotlinlogging.KotlinLogging
 import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.Jdbi
@@ -4665,6 +4666,11 @@ class CompactionService(
         group: CompactionGroup,
         onRewritten: (ParquetRewriter.RewriteResult) -> Unit = {},
     ): GroupOutcome {
+        // The store scoped to THIS catalog's prefix: under `broker` a
+        // write session the provider granted for exactly these objects,
+        // under the unscoped providers the shared store itself. Every
+        // read and write of the group goes through it.
+        val store = this.store.forCatalog(ctx.catalog, ctx.dataPath, StorageAccess.WRITE)
         // The OBJECT-PREFIX value, before any IO. The planner refuses a
         // group without one ([pack]); this surface is also reached from
         // [compactPlannedGroup], which is handed a group, so it fails
