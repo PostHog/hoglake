@@ -2685,7 +2685,11 @@ checksum and `-version` provenance verified), runs `:test` under
 network (the engine reaches MinIO at `127.0.0.1:<mapped port>`), keeps
 its Linux Gradle state in `~/.cache/hoglake/hoglite-live/`
 (`HOGLITE_LIVE_CACHE`), and closes with `../ci/check-hoglite-live.sh`,
-the fail-closed check CI runs. Needs `docker` and an authenticated `gh`.
+the fail-closed check CI runs. That check reads the reports of the
+hoglite `*IntegrationTest` classes only, so a filter must match only
+those (`'com.posthog.hoglake.hoglite.HoglitePinned*'`, say); a run of
+anything else ends with "no report" whatever its result. Needs `docker`
+and an authenticated `gh`.
 
 
 ## Atomic CREATE / CTAS

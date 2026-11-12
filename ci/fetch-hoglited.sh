@@ -10,13 +10,14 @@
 # unverified engine.
 #
 # Usage: ci/fetch-hoglited.sh <output-dir> [arch]
-# arch is amd64 or arm64; default: the host's. A binary already in
-# <output-dir> that matches the newest build's checksum is kept, not
-# downloaded again (the local runner calls this on every run).
-# Prints the binary path and writes the tag to <output-dir>/BUILD. In
-# GitHub Actions it also sets HOGLITE_BINARY and HOGLITE_BUILD in
-# $GITHUB_ENV. Needs gh (GH_TOKEN in Actions), curl, jq and sha256sum
-# (or shasum).
+# arch is amd64 or arm64; default: the host's. The binary lands in
+# <output-dir>/<tag>/, one directory per build, so a directory never
+# changes meaning: a verified binary already there is kept, not
+# downloaded again (the local runner calls this on every run, and two
+# runs may overlap), and downloads land under a temporary name and are
+# renamed into place. Prints the binary path. In GitHub Actions it also
+# sets HOGLITE_BINARY and HOGLITE_BUILD in $GITHUB_ENV. Needs gh
+# (GH_TOKEN in Actions), curl, jq and sha256sum (or shasum).
 #
 # HOGLITE_EXEC: a command prefix that runs the binary for the -version
 # check, for a host that cannot execute it (ci/hoglite-live-local.sh
@@ -48,13 +49,18 @@ tag=$(jq -r .tag_name <<<"$release")
 commit=${tag#build-}
 echo "hoglite build: $tag (published $(jq -r .published_at <<<"$release"), immutable: $(jq -r '.immutable // false' <<<"$release"))" >&2
 
-mkdir -p "$out"
-out=$(cd "$out" && pwd)
+mkdir -p "$out/$tag"
+out=$(cd "$out/$tag" && pwd)
+# Into a temporary name first; rename publishes a whole file, so a
+# concurrent run never reads or executes a partial one.
+tmp=$out/.fetch.$$
+trap 'rm -f "$tmp"' EXIT
 download() {
     url=$(jq -r --arg name "$1" '.assets[] | select(.name == $name) | .browser_download_url' <<<"$release")
-    curl -fsSL --retry 3 -o "$out/$1" "$url"
+    curl -fsSL --retry 3 -o "$tmp" "$url"
 }
 download checksums.txt
+mv -f "$tmp" "$out/checksums.txt"
 
 # Exactly one checksum line for the asset, verified with the binary's own name.
 line=$(grep -E "^[0-9a-f]{64}  $asset\$" "$out/checksums.txt" || true)
@@ -68,20 +74,21 @@ sha256() {
     if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1
 }
 # The download is skipped only when the binary on disk already IS this
-# build's; a different or damaged one is fetched again and verified.
+# build's; a damaged one is fetched again and verified before it
+# replaces the old file (which another run may be executing).
 if [[ -f "$out/$asset" && $(sha256 "$out/$asset") == "$expected_sha" ]]; then
     echo "$asset of $tag is already in $out" >&2
 else
     download "$asset"
-    actual_sha=$(sha256 "$out/$asset")
+    actual_sha=$(sha256 "$tmp")
     if [[ "$actual_sha" != "$expected_sha" ]]; then
         echo "checksum mismatch for $asset of $tag: $actual_sha, checksums.txt says $expected_sha" >&2
-        rm -f "$out/$asset"
         exit 1
     fi
+    chmod +x "$tmp"
+    mv -f "$tmp" "$out/$asset"
     echo "$asset: sha256 $actual_sha verified" >&2
 fi
-chmod +x "$out/$asset"
 
 read -ra exec_prefix <<<"${HOGLITE_EXEC:-}"
 version=$("${exec_prefix[@]+"${exec_prefix[@]}"}" "$out/$asset" -version)
@@ -90,8 +97,6 @@ if [[ "$version" != "$expected" ]]; then
     echo "provenance mismatch: binary reports '$version', expected '$expected'" >&2
     exit 1
 fi
-echo "$tag" >"$out/BUILD"
-
 if [[ -n "${GITHUB_ENV:-}" ]]; then
     echo "HOGLITE_BINARY=$out/$asset" >>"$GITHUB_ENV"
     echo "HOGLITE_BUILD=$tag" >>"$GITHUB_ENV"

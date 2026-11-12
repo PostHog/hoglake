@@ -21,7 +21,8 @@ test-all:
 # these classes for want of a Linux hoglited, so this runs them in a Linux
 # container on the newest tested build (ci/hoglite-live-local.sh). Needs
 # docker and an authenticated gh. Optional Gradle --tests filter, e.g.
-# `just test-hoglite 'com.posthog.hoglake.hoglite.HoglitePinned*'`.
+# `just test-hoglite 'com.posthog.hoglake.hoglite.HoglitePinned*'`; it must
+# match only hoglite *IntegrationTest classes, the ones the check reads.
 # The hoglite live tests in a Linux container; fails on skips.
 test-hoglite filter='com.posthog.hoglake.hoglite.*IntegrationTest':
     ci/hoglite-live-local.sh '{{filter}}'

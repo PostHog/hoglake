@@ -14,13 +14,18 @@
 # Usage: ci/hoglite-live-local.sh [test-pattern ...]
 # Each pattern is a Gradle --tests filter; the default is every
 # com.posthog.hoglake.hoglite.*IntegrationTest. `just test-hoglite`.
+# A pattern must match only *IntegrationTest classes of that package:
+# the check reads those reports alone, so a run of anything else ends
+# with "no report" even when its tests passed.
 #
-# Needs docker, gh (authenticated), jq, curl, sha256sum on the host.
+# Needs docker, gh (authenticated), jq, curl, sha256sum or shasum on
+# the host.
 #
 # Environment:
 #   HOGLITE_LIVE_CACHE   persistent state, default
 #                        ${XDG_CACHE_HOME:-~/.cache}/hoglake/hoglite-live:
-#                        bin/<arch>/ (the engine), gradle/ (a Linux
+#                        bin/<arch>/<build tag>/ (the engines; old tags
+#                        are not pruned, 25 MB each), gradle/ (a Linux
 #                        GRADLE_USER_HOME: never the host's ~/.gradle),
 #                        project-cache/<checkout>/ (--project-cache-dir,
 #                        in place of server/.gradle, per worktree)
@@ -44,9 +49,10 @@ fi
 case "$repo_dir$cache" in
     *[[:space:]]*) echo "the checkout and cache paths must not contain whitespace: '$repo_dir', '$cache'" >&2; exit 1 ;;
 esac
-for tool in docker gh jq curl sha256sum; do
+for tool in docker gh jq curl; do
     command -v "$tool" >/dev/null || { echo "$tool is required on the host" >&2; exit 1; }
 done
+command -v sha256sum >/dev/null || command -v shasum >/dev/null || { echo "sha256sum or shasum is required on the host" >&2; exit 1; }
 
 # ---- the Docker daemon ----------------------------------------------------
 # Inside the container, Testcontainers wants /var/run/docker.sock. A unix
@@ -70,7 +76,14 @@ if [[ -n "$socket" ]]; then
         echo "Docker socket $socket does not exist; is the daemon running?" >&2
         exit 1
     fi
-    docker_env=(-v "$socket:/var/run/docker.sock")
+    # The daemon resolves a bind source on ITS filesystem. On macOS that
+    # is the VM, where the host-side socket (Docker Desktop's
+    # ~/.docker/run, colima's ssh-forwarded one) may not exist or bind,
+    # but /var/run/docker.sock is the daemon's own; on Linux the paths
+    # are one filesystem.
+    source=$socket
+    if [[ $(uname -s) == Darwin ]]; then source=/var/run/docker.sock; fi
+    docker_env=(-v "$source:/var/run/docker.sock")
 elif [[ ${#docker_env[@]} -eq 0 ]]; then
     echo "no Docker daemon found: set DOCKER_HOST" >&2
     exit 1
@@ -86,14 +99,24 @@ case "$arch" in
 esac
 platform=linux/$arch
 
-# On Linux the container would otherwise write the build tree and the
+# On Linux a rootful daemon would otherwise write the build tree and the
 # cache as root; run as the caller, with the daemon's group for the
-# socket. macOS daemons map ownership to the host user already.
+# socket. A rootless daemon (socket under XDG_RUNTIME_DIR, or the
+# caller's) already maps container root to the caller, and the caller's
+# uid inside it would be an unprivileged subordinate id. macOS daemons
+# map ownership to the host user already.
 user_args=()
 if [[ $(uname -s) == Linux ]]; then
-    user_args=(--user "$(id -u):$(id -g)" -e "HOME=$cache/home")
-    mkdir -p "$cache/home"
-    if [[ -n "$socket" ]]; then user_args+=(--group-add "$(stat -c %g "$socket")"); fi
+    rootless=false
+    if [[ -n "$socket" ]]; then
+        case "$socket" in "${XDG_RUNTIME_DIR:-/nonexistent}"/*) rootless=true ;; esac
+        if [[ $(stat -c %u "$socket") == "$(id -u)" ]]; then rootless=true; fi
+    fi
+    if [[ $rootless == false ]]; then
+        user_args=(--user "$(id -u):$(id -g)" -e "HOME=$cache/home")
+        mkdir -p "$cache/home"
+        if [[ -n "$socket" ]]; then user_args+=(--group-add "$(stat -c %g "$socket")"); fi
+    fi
 fi
 
 # ---- the engine -----------------------------------------------------------
@@ -107,10 +130,14 @@ if [[ -n "${HOGLITE_LIVE_BINARY:-}" ]]; then
 else
     # The host cannot run a Linux binary, so the fetch's provenance check
     # (`hoglited -version`) runs in the container, bin_dir at its own path.
+    # The fetch files each build under bin_dir/<tag>/; only that build's
+    # directory is mounted, so the engine run IS the one named, however
+    # many runs overlap.
     binary=$(HOGLITE_EXEC="docker run --rm --platform $platform -v $bin_dir:$bin_dir:ro $image" \
         "$repo_dir/ci/fetch-hoglited.sh" "$bin_dir" "$arch")
-    mounts=(-v "$bin_dir:$bin_dir:ro")
-    HOGLITE_BUILD=$(cat "$bin_dir/BUILD")
+    build_dir=$(dirname "$binary")
+    mounts=(-v "$build_dir:$build_dir:ro")
+    HOGLITE_BUILD=$(basename "$build_dir")
     export HOGLITE_BUILD
 fi
 
