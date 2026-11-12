@@ -32,9 +32,9 @@ means the PR has review approval and is waiting on CI or a merge.
       the request path: [#565](https://github.com/PostHog/hoglake/pull/565)
       and [PostHog/hogtower#181](https://github.com/PostHog/hogtower/pull/181)
       closed; a mount host receives the caller's own token
-- [ ] **hogtower** The PostHog profile doc, and the design docs amended
+- [x] **hogtower** The PostHog profile doc, and the design docs amended
       (broker kept, status refreshed, stale "no authentication" claims
-      corrected) — [PostHog/hogtower#185](https://github.com/PostHog/hogtower/pull/185), approved
+      corrected) — [PostHog/hogtower#185](https://github.com/PostHog/hogtower/pull/185)
 - [x] Tracking: [#574](https://github.com/PostHog/hoglake/issues/574),
       [PostHog/millpond#165](https://github.com/PostHog/millpond/issues/165),
       and this file
@@ -53,23 +53,23 @@ means the PR has review approval and is waiting on CI or a merge.
       `scope` claim (`hoglake:<catalog>:<scope>`) accepted as equivalent to
       `cat` and refused when the two disagree —
       [#576](https://github.com/PostHog/hoglake/pull/576)
-- [ ] **hogtower** `storage` returned alongside the token in the
+- [x] **hogtower** `storage` returned alongside the token in the
       `/oauth/token` response with `include_storage=true`, behind a flag;
       `exp` never later than the session; bounded wait so the public listener
-      always answers — [PostHog/hogtower#186](https://github.com/PostHog/hogtower/pull/186), approved
+      always answers — [PostHog/hogtower#186](https://github.com/PostHog/hogtower/pull/186), 
 - [x] **hoglake** `docs/auth.md` refreshed once the two hoglake PRs land:
       RS256, `scope`, `ten`-optional, the configurable cap and
       hoglake-generated vectors from "planned" to "built"; `cat` and `scope`
       must agree; a routed (`rtg`) token still needs exactly one `cat` entry;
       JWKS entries with `use` ≠ `sig` or a foreign `alg` are skipped; the two
       new variables in the environment table
-- [ ] **hogtower** Conform to hoglake's contract vectors instead of
+- [x] **hogtower** Conform to hoglake's contract vectors instead of
       generating them: the copied file plus a test that it matches, with
       hoglake's issuer, kid, foreign audience, operator subject and `expect`
       fields
 - [x] **charts** `HOGLAKE_AUTH_CLIENT_CLASSES=hogtower` on every hoglake
       deployment, so the `client="hogtower"` metric series survives the
-      issuer-neutral User-Agent map — [PostHog/charts#20181](https://github.com/PostHog/charts/pull/20181)
+      issuer-neutral User-Agent map — [PostHog/charts#20181](https://github.com/PostHog/charts/pull/20181) — [PostHog/hogtower#197](https://github.com/PostHog/hogtower/pull/197)
 
 ## Phase 1, wave 2 — standalone hoglake, and storage through the broker
 
