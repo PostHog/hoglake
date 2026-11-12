@@ -12,6 +12,8 @@ import com.posthog.hoglake.auth.TestTokens
 import com.posthog.hoglake.auth.installAuth
 import com.posthog.hoglake.configureHoglakeWire
 import com.posthog.hoglake.hoglite.HogliteCatalogStore
+import com.posthog.hoglake.hoglite.HogliteClient
+import com.sun.net.httpserver.HttpServer
 import io.ktor.client.request.get
 import io.ktor.client.request.header
 import io.ktor.client.statement.bodyAsText
@@ -27,13 +29,16 @@ import io.ktor.server.routing.routing
 import io.ktor.server.testing.testApplication
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
+import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.lang.reflect.Proxy
+import java.net.InetSocketAddress
 import java.nio.file.Files
 import java.nio.file.Path
 import java.security.interfaces.ECPublicKey
 import java.util.UUID
+import java.util.concurrent.CopyOnWriteArrayList
 
 class CatalogStoreSelectorTest {
     @TempDir
@@ -41,6 +46,18 @@ class CatalogStoreSelectorTest {
     private val id = UUID.fromString("5b0c6d0e-1f2a-4b3c-9d4e-5f6a7b8c9d0e")
     private val otherId = UUID.fromString("6b0c6d0e-1f2a-4b3c-9d4e-5f6a7b8c9d0e")
     private val pair = TestTokens.keyPair()
+    private var backend: HttpServer? = null
+
+    @AfterEach
+    fun stopBackend() {
+        backend?.stop(0)
+    }
+
+    private fun clientState(
+        client: HogliteClient,
+        field: String,
+    ): Any? = HogliteClient::class.java.getDeclaredField(field).apply { isAccessible = true }.get(client)
+
     private val postgres =
         Proxy.newProxyInstance(
             CatalogStore::class.java.classLoader,
@@ -52,9 +69,10 @@ class CatalogStoreSelectorTest {
     private fun config(
         default: String,
         backendIds: List<UUID> = listOf(id),
+        backendUrl: String = "http://localhost:1",
     ): Config {
         val file = dir.resolve("backends.json")
-        val entries = backendIds.joinToString(",") { """{"id":"$it","kind":"hoglite","url":"http://localhost:1"}""" }
+        val entries = backendIds.joinToString(",") { """{"id":"$it","kind":"hoglite","url":"$backendUrl"}""" }
         Files.writeString(file, """{"backends":[$entries]}""")
         return Config(backendsFile = file.toString(), defaultBackend = default, authMode = "enforce")
     }
@@ -62,9 +80,10 @@ class CatalogStoreSelectorTest {
     private fun token(
         routed: Boolean = true,
         backendId: UUID = id,
+        subject: String = "sa:selection",
     ): String {
         val placement = if (routed) """, "rtg":{"b":"hoglite","be":"$backendId","t":"opaque_1"}""" else ""
-        val claims = TestTokens.operatorClaims().dropLast(1) + """, "cat":{"lake":["admin"]}$placement}"""
+        val claims = TestTokens.operatorClaims(sub = subject).dropLast(1) + """, "cat":{"lake":["admin"]}$placement}"""
         return TestTokens.mint(pair, claims)
     }
 
@@ -91,8 +110,19 @@ class CatalogStoreSelectorTest {
     @Test
     fun `verified placements share backend admission without sharing request scoped stores`() =
         testApplication {
+            val observed = CopyOnWriteArrayList<String?>()
+            val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+            backend = server
+            server.createContext("/") { exchange ->
+                exchange.requestBody.readBytes()
+                observed.add(exchange.requestHeaders.getFirst("Authorization"))
+                val body = """{"cols":["x"],"rows":[[1]],"affected":0}""".toByteArray()
+                exchange.sendResponseHeaders(200, body.size.toLong())
+                exchange.responseBody.use { it.write(body) }
+            }
+            server.start()
             val cfg =
-                config("none", listOf(id, otherId)).copy(
+                config("none", listOf(id, otherId), "http://127.0.0.1:${server.address.port}").copy(
                     removalLedgerRetentionSeconds = 12_345,
                     compactionTargetBytes = 64L * 1024 * 1024,
                     compactionMinInputFiles = 3,
@@ -150,15 +180,31 @@ class CatalogStoreSelectorTest {
                     }
                 }
             }
-            repeat(2) {
-                val listing = client.get("/v1/catalogs") { header(HttpHeaders.Authorization, "Bearer ${token()}") }
+            val credentials = listOf(token(subject = "sa:first"), token(subject = "sa:second"))
+            for (credential in credentials) {
+                val listing = client.get("/v1/catalogs") { header(HttpHeaders.Authorization, "Bearer $credential") }
                 assertThat(listing.status).isEqualTo(HttpStatusCode.OK)
                 assertThat(listing.bodyAsText()).isEqualTo("lake")
             }
             assertThat(stores[0]).isNotSameAs(stores[1])
             val first = stores[0] as HogliteCatalogStore
             val second = stores[1] as HogliteCatalogStore
-            assertThat(first.client).isSameAs(second.client)
+            assertThat(first.client).isNotSameAs(second.client)
+            val sharedFields = listOf("http", "tenantRoutes", "breakers", "batchUnsupportedUntilNanos")
+            for (field in sharedFields) {
+                assertThat(clientState(first.client, field)).isSameAs(clientState(second.client, field))
+            }
+            val shared = clientState(first.client, "shared") as HogliteClient
+            assertThat(shared).isSameAs(clientState(second.client, "shared"))
+            first.client.query("opaque_1", "SELECT 1")
+            second.client.query("opaque_1", "SELECT 1")
+            first.client.query("opaque_1", "SELECT 1")
+            shared.query("opaque_1", "SELECT 1")
+            val expected =
+                listOf("Bearer ${credentials[0]}", "Bearer ${credentials[1]}", "Bearer ${credentials[0]}", null)
+            assertThat(observed).hasSize(4)
+            assertThat(observed.mapIndexed { index, value -> value == expected[index] })
+                .containsExactly(true, true, true, true)
             assertThat(first.partitionLookupAdmission).isSameAs(second.partitionLookupAdmission)
             val otherListing =
                 client.get("/v1/catalogs") {
@@ -167,6 +213,9 @@ class CatalogStoreSelectorTest {
             assertThat(otherListing.status).isEqualTo(HttpStatusCode.OK)
             val other = stores[2] as HogliteCatalogStore
             assertThat(other).isNotSameAs(first)
+            for (field in sharedFields) {
+                assertThat(clientState(other.client, field)).isNotSameAs(clientState(first.client, field))
+            }
             assertThat(other.partitionLookupAdmission).isNotSameAs(first.partitionLookupAdmission)
             val publication =
                 client.get("/v1/catalogs/lake/publications") {

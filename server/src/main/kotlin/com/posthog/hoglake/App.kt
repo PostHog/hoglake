@@ -586,6 +586,7 @@ class App private constructor(
             // PG at wiring time and break the PG-free / lazy-boot paths. It is
             // built only when a mount actually resolves (PG is the default then).
             mountRead = { mountReadService },
+            reservedNamespaces = cfg.reservedNamespaces,
         )
         app.installTableCreationRoutes(
             { tableCreationService },

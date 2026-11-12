@@ -21,6 +21,7 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.security.interfaces.ECPublicKey
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 
 class PostgresFreeHogliteBootTest {
     @TempDir
@@ -31,12 +32,14 @@ class PostgresFreeHogliteBootTest {
         val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
         val healthy = AtomicInteger(200)
         val probes = AtomicInteger()
+        val forwardedAuthority = AtomicReference<String?>()
         server.createContext("/v1/healthz") { exchange ->
             probes.incrementAndGet()
             exchange.sendResponseHeaders(healthy.get(), -1)
             exchange.close()
         }
         server.createContext("/v1/query-batch") { exchange ->
+            forwardedAuthority.set(exchange.requestHeaders.getFirst("Authorization"))
             exchange.requestBody.use { it.readBytes() }
             val answer =
                 (
@@ -87,6 +90,7 @@ class PostgresFreeHogliteBootTest {
                                 header(HttpHeaders.Authorization, "Bearer $token")
                             }
                         assertThat(listed.status).isEqualTo(HttpStatusCode.OK)
+                        assertThat(forwardedAuthority.get() == "Bearer $token").isTrue()
                         assertThat(listed.bodyAsText()).contains("s3://bucket/lake")
                         val maintenance =
                             client.post("/v1/catalogs/lake/maintenance/expire") {

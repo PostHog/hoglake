@@ -45,6 +45,9 @@ internal object HogliteSchema {
     /** head = next_snapshot - 1, as an SQL expression over the meta row. */
     const val HEAD_SQL = "(SELECT next_snapshot - 1 FROM meta WHERE id = 1)"
 
+    /** Numeric storage-execution time, using SQLite's timestamp parser. */
+    const val CREATION_NOW_SQL = "julianday('now')"
+
     /*
      * The object-prefix layout (`set_object_prefix_field`), Postgres V29's
      * hog_table_layout: versioned like the spec rows, at most one live row

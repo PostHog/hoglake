@@ -71,8 +71,16 @@ object FuzzSeedGenerator {
         seedTableCreationCodecTarget(root)
         seedCommitReceiptTarget(root)
         seedVariantShreddingTarget(root)
+        seedJwtAudienceTarget(root)
 
         println("fuzz seed corpus written under $root")
+    }
+
+    private fun seedJwtAudienceTarget(root: Path) {
+        val out = dir(root, "JwtAudienceFuzzTest", "audienceMembershipRequiresStrings")
+        for (value in 0..7) {
+            write(out, "choice-$value", ByteArray(16) { value.toByte() })
+        }
     }
 
     private fun dir(

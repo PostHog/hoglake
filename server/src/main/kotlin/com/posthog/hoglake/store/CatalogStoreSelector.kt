@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode
 import com.posthog.hoglake.Config
 import com.posthog.hoglake.auth.Routing
 import com.posthog.hoglake.auth.hoglakeAuth
+import com.posthog.hoglake.auth.verifiedBackendToken
 import com.posthog.hoglake.hoglite.HogliteCatalogStore
 import com.posthog.hoglake.hoglite.HogliteClient
 import com.posthog.hoglake.hoglite.HoglitePartitionLookupAdmission
@@ -402,7 +403,11 @@ class CatalogStoreSelector(
             BackendKind.POSTGRES -> postgres ?: throw HoglakeException.NotFound("catalog '${routing.catalog}'")
             BackendKind.HOGLITE ->
                 call.attributes.computeIfAbsent(requestStore) {
-                    forPlacement(routing) as HogliteCatalogStore
+                    hogliteStore(
+                        routing,
+                        client(routing.backendId).forRequest(call.verifiedBackendToken),
+                        operatorAuthority = call.hoglakeAuth.callerOrNull?.kind?.isOperator() != false,
+                    )
                 }
         }
 
@@ -410,27 +415,35 @@ class CatalogStoreSelector(
     fun forPlacement(placement: Routing): CatalogStore =
         when (placement.backend) {
             BackendKind.POSTGRES -> postgres ?: throw HoglakeException.NotFound("catalog '${placement.catalog}'")
-            BackendKind.HOGLITE ->
-                HogliteCatalogStore(
-                    client(placement.backendId),
-                    HogliteTenantResolver { catalog ->
-                        if (catalog == placement.catalog) {
-                            checkNotNull(placement.tenant)
-                        } else {
-                            throw HoglakeException.NotFound("catalog '$catalog'")
-                        }
-                    },
-                    refuseBlindPartitionedAppends = checkNotNull(cfg).refuseBlindPartitionedAppends,
-                    ledgerRetentionSeconds = cfg.removalLedgerRetentionSeconds,
-                    smallFileThresholdBytes = cfg.compactionTargetBytes,
-                    minInputFiles = cfg.compactionMinInputFiles,
-                    maxInputFiles = cfg.compactionMaxInputFiles,
-                    partitionLookupAdmission =
-                        lookupAdmissions.computeIfAbsent(placement.backendId) {
-                            HoglitePartitionLookupAdmission()
-                        },
-                )
+            BackendKind.HOGLITE -> hogliteStore(placement, client(placement.backendId), operatorAuthority = true)
         }
+
+    /** Share store construction without sharing request authority. */
+    private fun hogliteStore(
+        placement: Routing,
+        client: HogliteClient,
+        operatorAuthority: Boolean,
+    ): HogliteCatalogStore =
+        HogliteCatalogStore(
+            client,
+            HogliteTenantResolver { catalog ->
+                if (catalog == placement.catalog) {
+                    checkNotNull(placement.tenant)
+                } else {
+                    throw HoglakeException.NotFound("catalog '$catalog'")
+                }
+            },
+            refuseBlindPartitionedAppends = checkNotNull(cfg).refuseBlindPartitionedAppends,
+            ledgerRetentionSeconds = cfg.removalLedgerRetentionSeconds,
+            smallFileThresholdBytes = cfg.compactionTargetBytes,
+            minInputFiles = cfg.compactionMinInputFiles,
+            maxInputFiles = cfg.compactionMaxInputFiles,
+            partitionLookupAdmission =
+                lookupAdmissions.computeIfAbsent(placement.backendId) {
+                    HoglitePartitionLookupAdmission()
+                },
+            operatorAuthority = operatorAuthority,
+        )
 
     private fun client(id: UUID): HogliteClient =
         clients.computeIfAbsent(id) {
