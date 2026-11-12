@@ -53,6 +53,7 @@ class StoreViewsTest {
             val a = base.forCatalog("a", "s3://b/a")
             val b = base.forCatalog("b", "s3://b/b")
             assertThat(a).isNotSameAs(base)
+            assertThat(base.forCatalog("a", "s3://b/a", StorageAccess.DELETE)).isSameAs(a)
             assertThat(a.client).isSameAs(base.client)
             assertThat(b.client).isSameAs(base.client)
             assertThat(base.forCatalog("a", "s3://b/a")).isSameAs(a)

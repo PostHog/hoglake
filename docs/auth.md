@@ -224,7 +224,7 @@ chosen per deployment:
 | --- | --- |
 | `ambient` (default) | the SDK's default chain: a pod identity in Kubernetes, an instance profile, or the environment |
 | `static` | `HOGLAKE_S3_ACCESS_KEY` and `HOGLAKE_S3_SECRET_KEY`: MinIO, local development, CI, the compose quickstart |
-| `broker` | an HTTP call to `HOGLAKE_STORAGE_BROKER_URL`, authenticated with hoglake's own client credential (`HOGLAKE_STORAGE_BROKER_CLIENT_ID` / `_CLIENT_SECRET`) exchanged at `HOGLAKE_STORAGE_BROKER_TOKEN_URL`: `POST <url>` with `{"catalog", "prefix", "access": "read" \| "write"}`, answered with `{"access_key_id", "secret_access_key", "session_token", "expiration"}`, STS's shape (`session_token` may be absent for a broker that vends expiring keys instead). One session per catalog and access, held in memory and refreshed `HOGLAKE_STORAGE_BROKER_REFRESH_MARGIN_SECONDS` (default 300) before it expires; never written to the metadata store |
+| `broker` | an HTTP call to `HOGLAKE_STORAGE_BROKER_URL`, authenticated with hoglake's own client credential (`HOGLAKE_STORAGE_BROKER_CLIENT_ID` / `_CLIENT_SECRET`) exchanged at `HOGLAKE_STORAGE_BROKER_TOKEN_URL`: `POST <url>` with `{"catalog", "prefix", "access": "read" \| "write" \| "delete"}`, answered with `{"access_key_id", "secret_access_key", "session_token", "expiration"}`, STS's shape (`session_token` may be absent for a broker that vends expiring keys instead). One session per catalog and access, held in memory and refreshed `HOGLAKE_STORAGE_BROKER_REFRESH_MARGIN_SECONDS` (default 300) before it expires; never written to the metadata store |
 
 `HOGLAKE_STORAGE_PROVIDER` selects one. Unset, it is `static` when both keys
 are set and `ambient` otherwise — what hoglake did before the knob existed, so
@@ -232,9 +232,12 @@ an existing install changes nothing. The combination is checked at boot: an
 explicit `static` without both keys, an explicit `ambient` or `broker` beside
 keys, or a `broker` missing a setting refuses to start.
 
-`access` has two values and `write` includes delete: compaction reads its
-inputs and uploads its output, cleanup deletes, and nothing needs a
-delete-only grant. The hydrator asks for `read`. The token request is the
+`access` has three values, each including the one before: `read` (the
+hydrator's footer fetches), `write` (compaction: its inputs' reads plus the
+put and multipart upload of its output — and no delete, so a leaked or buggy
+compaction session cannot remove a tenant's referenced files), and `delete`
+(cleanup's drain of the removal queue, the one job that deletes). A broker
+grants `s3:DeleteObject` only for `delete`. The token request is the
 clients' client-credentials form, `grant_type=client_credentials` with
 `audience` = `HOGLAKE_STORAGE_BROKER_AUDIENCE` (default `hoglake`). Both
 URLs must be `https` — the client secret and every vended key cross that
