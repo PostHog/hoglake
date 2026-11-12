@@ -221,7 +221,8 @@ management console, a native Trino connector, a DuckDB extension and a
 benchmark harness. Everything is tested, and it is deployed as Gigahog in three
 environments — dev, prod-us and prod-eu. Authentication is opt-in: the server
 verifies bearer JWTs against a configured issuer's JWKS and authorizes per
-catalog when `HOGLAKE_AUTH_MODE` is `warn` or `enforce`, and is unauthenticated
+catalog when `HOGLAKE_AUTH_MODE` is `warn` or `enforce`, is its own issuer at
+`local` (one key, `hoglake token mint` for each client), and is unauthenticated
 at `off`, which is the default. hoglake is a resource server: it issues nothing
 on the request path and calls nothing to decide a request. The issuer is a
 deployment choice — any identity provider that emits hoglake's token contract;

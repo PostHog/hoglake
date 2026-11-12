@@ -114,6 +114,10 @@ object AuthPolicy {
             // ones — deliberate, and the reason this line exists rather than the
             // omission being an accident nobody noticed.
             Entry(HttpMethod.Get, "/openapi.yaml", Requirement.PUBLIC),
+            // PUBLIC because it is public-key material and nothing else: the
+            // local issuer's JWKS (docs/auth.md, "Local issuer"). 404 in every
+            // other mode, from the handler, so the table and the routes agree.
+            Entry(HttpMethod.Get, "/.well-known/jwks.json", Requirement.PUBLIC),
             // Gated because it carries per-catalog labels, i.e. the tenant
             // roster: AUTHENTICATED would hand the fleet's catalog names to any
             // tenant that asks. The listener split (docs/auth-tenancy.md §6.7) is
