@@ -154,7 +154,11 @@ class PartitionLookupTransportIntegrationTest {
                             authSigningKey = SecretString(localKey.encode()),
                         )
                     } else {
-                        cfg.copy(authMode = mode.wire, authIssuer = TestTokens.ISSUER, authJwksFile = keyFile.toString())
+                        cfg.copy(
+                            authMode = mode.wire,
+                            authIssuer = TestTokens.ISSUER,
+                            authJwksFile = keyFile.toString(),
+                        )
                     }
                 val reader = if (mode == AuthMode.LOCAL) localReader else reader
                 val foreign = if (mode == AuthMode.LOCAL) localForeign else foreign
