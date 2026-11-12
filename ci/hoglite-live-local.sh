@@ -81,9 +81,13 @@ if [[ -n "$socket" ]]; then
     # ~/.docker/run, colima's ssh-forwarded one) may not exist or bind,
     # but /var/run/docker.sock is the daemon's own; on Linux the paths
     # are one filesystem.
+    # Ryuk is a sibling container, so its socket bind is resolved on the
+    # daemon's filesystem too: tell Testcontainers the daemon-side path,
+    # not the /var/run/docker.sock it sees in here (absent, or another
+    # daemon's, under rootless Docker at /run/user/<uid>/docker.sock).
     source=$socket
     if [[ $(uname -s) == Darwin ]]; then source=/var/run/docker.sock; fi
-    docker_env=(-v "$source:/var/run/docker.sock")
+    docker_env=(-v "$source:/var/run/docker.sock" -e "TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=$source")
 elif [[ ${#docker_env[@]} -eq 0 ]]; then
     echo "no Docker daemon found: set DOCKER_HOST" >&2
     exit 1
