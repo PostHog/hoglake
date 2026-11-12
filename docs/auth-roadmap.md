@@ -87,9 +87,9 @@ means the PR has review approval and is waiting on CI or a merge.
 - [x] **hoglake** `broker`: `POST <url>` with `{catalog, prefix, access}` under
       OAuth client credentials, answered with an STS-shaped session; one
       session per job, one catalog, in memory, refreshed before expiry
-- [ ] **hogtower** The broker's server side: a service credential per hoglake
+- [x] **hogtower** The broker's server side: a service credential per hoglake
       deployment bound to its id; the vend refuses a catalog that does not
-      live on the calling hoglake and never returns more than one catalog
+      live on the calling hoglake and never returns more than one catalog — [PostHog/hogtower#198](https://github.com/PostHog/hogtower/pull/198); `delete` as its own access level, cleanup only — [#597](https://github.com/PostHog/hoglake/pull/597)
 - [ ] **hoglake** Decide whether `jti` stays required; multi-issuer
       verification, or document running issuers behind one `iss`
 
