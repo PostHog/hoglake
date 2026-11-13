@@ -88,7 +88,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+      - uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
         with:
           distribution: temurin
           java-version: "25"
@@ -120,7 +120,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+      - uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
         with:
           distribution: temurin
           java-version: "25"
@@ -138,18 +138,10 @@ jobs:
           HOGLITE_REQUIRED: "1"
         run: ./gradlew --no-daemon :test --tests 'com.posthog.hoglake.hoglite.*IntegrationTest'
 
-      # The fail-closed proof: the live classes ran, and none skipped.
+      # The fail-closed proof: the live classes ran, and none skipped. The
+      # same script closes the local run (ci/hoglite-live-local.sh).
       - name: Require executed live tests
-        working-directory: server/build/test-results/test
-        run: |
-          shopt -s nullglob
-          reports=(TEST-com.posthog.hoglake.hoglite.*IntegrationTest.xml)
-          test ${#reports[@]} -gt 0
-          sum() { cat "${reports[@]}" | grep -o "<testsuite [^>]*" | grep -o " $1=\"[0-9]*\"" | tr -dc '0-9\n' | awk '{ n += $1 } END { print n + 0 }'; }
-          tests=$(sum tests)
-          skipped=$(sum skipped)
-          echo "hoglite live: $tests tests in ${#reports[@]} classes, $skipped skipped against $HOGLITE_BUILD"
-          test "$tests" -gt 0 && test "$skipped" -eq 0
+        run: ci/check-hoglite-live.sh
 
       - name: Upload test reports
         if: failure()
@@ -177,7 +169,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+      - uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
         with:
           distribution: temurin
           java-version: "25"
@@ -293,7 +285,7 @@ jobs:
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to GHCR
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}

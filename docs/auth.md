@@ -24,7 +24,7 @@ The issuer is a deployment choice, not a hoglake dependency:
 
 | deployment | issuer | storage credentials |
 | --- | --- | --- |
-| single-tenant, internal | none (`HOGLAKE_AUTH_MODE=off`), or hoglake's own local key (`local`, planned) | each client's own AWS identity; the server's own (`ambient`) for its jobs |
+| single-tenant, internal | none (`HOGLAKE_AUTH_MODE=off`), or hoglake's own key (`local`): `hoglake token keygen` once, `hoglake token mint` per client, no issuer service | each client's own AWS identity; the server's own (`ambient`) for its jobs |
 | your own identity provider | any issuer that emits the [token contract](#the-token-contract) and publishes a JWKS | the same; or whatever your issuer hands clients, and a `broker` in front of your own STS for the server's jobs |
 | PostHog's managed warehouse | hogtower, PostHog's control plane, which mints tokens for PostHog's tenants and hands out scoped S3 sessions with them | vended by hogtower: to clients alongside the token, to the server's jobs through the `broker` provider |
 
@@ -42,7 +42,7 @@ one issuer among possible issuers.
 | `off` (default) | no verification; every request is accepted and the caller-supplied `author` is trusted | local development, CI, a single-tenant install on a trusted network |
 | `warn` | tokens are verified and decisions are computed and counted, but nothing is refused, except a verified scoped token, which is filtered as in `enforce` | measuring before a cutover: watch `hoglake_auth_requests_total{outcome="missing"}` reach zero per client class |
 | `enforce` | deny by default; a route without a verified, sufficient token gets 401 or 403 | production |
-| `local` (planned) | `enforce`, with the server's own signing key as the issuer; see [Local issuer](#local-issuer-planned) | a standalone install that wants real authentication and no extra service |
+| `local` | `enforce`, with the server's own signing key as the issuer; see [Local issuer](#local-issuer) | a standalone install that wants real authentication and no extra service |
 
 Some features refuse `off` because they rely on the token: the public listener
 (`HOGLAKE_PUBLIC_PORT`), hoglite backends and mounts.
@@ -57,7 +57,8 @@ Listeners:
   authentication, for a scraper inside the trust boundary.
 
 `/livez`, `/healthz`, `/openapi.yaml` and `/v1/info` need no token on any
-listener.
+listener; nor does `/.well-known/jwks.json`, which serves the public key
+under `local` and 404s otherwise.
 
 ## Configuration
 
@@ -69,13 +70,17 @@ listener.
 | `HOGLAKE_AUTH_AUDIENCE` | the `aud` the server accepts; default `hoglake` |
 | `HOGLAKE_AUTH_CLOCK_SKEW_SECONDS` | tolerance on `exp`, `nbf` and `iat`; default 60, at most 600 |
 | `HOGLAKE_AUTH_PREDICATE_FIELDS` | the fields a scoped token's `prd` may name; empty means scoped tokens are refused |
+| `HOGLAKE_AUTH_SIGNING_KEY` | `local` only, and required there: the server's own ES256 key, a private P-256 JWK base64url-encoded, as `hoglake token keygen` prints it. Env-only — no key file, nothing persisted. Refused under any other mode. The issuer defaults to `hoglake` under `local` |
 | `HOGLAKE_AUTH_SCOPED_MAX_LIFETIME_SECONDS` | the longest a scoped token may live, `exp − iat`; default 900; must be positive |
 | `HOGLAKE_AUTH_CLIENT_CLASSES` | comma-separated User-Agent product tokens, each counted under its own `client` label on `hoglake_auth_requests_total` instead of `other`; at most 16, lowercase, never `none` or `other`. A deployment names its own clients here, so the server knows no issuer by name |
 
-One issuer and one key set per server: every token's `iss` must equal
-`HOGLAKE_AUTH_ISSUER`. Several signing services can share one JWKS only if they
-also share that one issuer identity; distinct issuers need separate servers
-until multi-issuer verification exists (tracked).
+One issuer and one key set per server, by decision: every token's `iss` must
+equal `HOGLAKE_AUTH_ISSUER`. Several signing services can share one server
+only by sharing that issuer identity and publishing their keys in one JWKS
+under distinct `kid`s; a deployment with genuinely distinct issuers runs one
+hoglake per issuer. Multi-issuer verification is not planned: one issuer per
+server is what keeps a token's authority traceable to one trust decision, and
+nothing in [the deployments above](#the-model-in-one-paragraph) needs more.
 
 ## The token contract
 
@@ -102,30 +107,22 @@ change no conforming issuer makes, which an issuer's suite skips.
   purpose (`use` other than `sig`, or an `alg` hoglake does not verify, as
   identity providers publish for encryption) is skipped and needs no `kid`.
 - `iss` must equal `HOGLAKE_AUTH_ISSUER`; `aud` must be, or contain,
-  `HOGLAKE_AUTH_AUDIENCE`.
-  Hogtower's Hoglite-routed metadata grants explicitly carry `["hoglake","hoglite"]`.
-  This generic verifier applies no issuer-specific audience policy.
-  Hoglite independently requires its configured metadata audience pair.
-  Hogtower vending requires the separate single-string audience `hogtower-vend`.
+  `HOGLAKE_AUTH_AUDIENCE`. A token the server will forward to a backend that
+  verifies it independently (a hoglite backend, [below](#backends-that-verify-the-token-themselves))
+  carries that backend's audience as well, `["hoglake", "hoglite"]`; hoglake
+  checks only that its own audience is present and applies no other audience
+  policy.
 - `exp` is required. `nbf` and `iat` are optional; an `iat` in the future is
   refused.
 
 ### Claims
-
-Hoglake forwards only the current request's verified JWT to its configured Hoglite backend.
-Request-local client wrappers share transport and routing state, never mutable caller credentials.
-Ordinary reads and writes do not provision tenants or bootstrap schemas.
-Catalog-bound operator requests perform provisioning and deletion.
-Hoglite rejects scoped or predicate-constrained authority because raw SQL cannot preserve those constraints.
-Existing single-audience metadata tokens remain valid at Hoglake until expiry.
-Drain their remaining fifteen-minute lifetime before enabling Hoglite enforcement.
 
 The core, which every issuer must emit:
 
 | claim | required | meaning |
 | --- | --- | --- |
 | `iss`, `aud`, `sub`, `exp` | yes | as above; `sub` becomes the audit actor |
-| `jti` | yes | token id, for correlating an audit line with a token |
+| `jti` | yes, by decision | token id, for correlating an audit line with a token. Required because the audit log and the access log name tokens by it; an identity provider that does not emit one is fronted by a small issuer that does (every provider named in this document emits it) |
 | `ten` | no; absent means `tenant` | the token kind: `tenant`, `scoped` or `operator`. A token without `ten` that carries `prd` is refused rather than read as a tenant token |
 | `org` | tenant and scoped, today | the tenant the token belongs to, for the audit log only; hoglake does not authorize on it. Required by the verifier today; making it optional is tracked |
 | `cat`, or `scope` | tenant and scoped, one or both | `cat` is `{"<catalog>": ["read", "write", …]}`: the catalogs the token may use and the scopes on each. On a tenant token an unknown scope word is dropped, not refused; a scoped token is stricter, below. `scope` is the standard form, next paragraph |
@@ -156,6 +153,22 @@ deployment needs them; hoglake applies them without knowing what they mean:
 | `prd` | on a `scoped` token: `{"<field>": {"<value>": "read" \| "write", …}}`, or `{"<field>": {"*": …}}`. The field must be one of `HOGLAKE_AUTH_PREDICATE_FIELDS`. hoglake filters metadata by `field ∈ values` and refuses commits whose files are attributed to a value the token may not write. This is how a multi-tenant issuer narrows one catalog to one tenant; PostHog's field is `team_id` |
 | `usr` | on a `scoped` token: an opaque end-user name for access logs, never used for authorization |
 | `rtg` | verified placement of the single catalog the token names on a configured backend (`b`, `be`, and `t` for hoglite); mismatches answer 401 `unknown_backend` |
+
+### Backends that verify the token themselves
+
+A catalog placed on a hoglite backend (`HOGLAKE_BACKENDS_FILE`; it requires
+`warn` or `enforce`) is served by a separate process that verifies the token
+on its own. hoglake forwards the current request's verified JWT to that
+backend unchanged and nothing else: no credential of hoglake's own, and no
+caller credential shared across requests. The backend verifies it offline
+against the same JWKS, requires its own audience to be present, and binds the
+request to the backend and tenant the `rtg` claim names. It refuses `scoped`
+tokens and any `prd` constraint, because raw SQL cannot preserve them.
+Ordinary reads and writes never provision a tenant or bootstrap a schema
+there; only a catalog-bound `operator` request provisions or deletes. An
+issuer that starts adding the backend audience to tokens it already mints
+should let the older single-audience tokens expire before the backend
+enforces.
 
 ### Scoped tokens, exactly
 
@@ -216,10 +229,31 @@ chosen per deployment:
 | --- | --- |
 | `ambient` (default) | the SDK's default chain: a pod identity in Kubernetes, an instance profile, or the environment |
 | `static` | `HOGLAKE_S3_ACCESS_KEY` and `HOGLAKE_S3_SECRET_KEY`: MinIO, local development, CI, the compose quickstart |
-| `broker` (planned) | an HTTP call to a configured URL, authenticated with hoglake's own client credential against a configured token URL: `POST <url>` with `{"catalog", "prefix", "access": "read" \| "write"}`, answered with `{"access_key_id", "secret_access_key", "session_token", "expiration"}`, STS's shape. One session per job, scoped to one catalog, held in memory and refreshed before it expires; never written to the metadata store |
+| `broker` | an HTTP call to `HOGLAKE_STORAGE_BROKER_URL`, authenticated with hoglake's own client credential (`HOGLAKE_STORAGE_BROKER_CLIENT_ID` / `_CLIENT_SECRET`) exchanged at `HOGLAKE_STORAGE_BROKER_TOKEN_URL`: `POST <url>` with `{"catalog", "prefix", "access": "read" \| "write" \| "delete"}`, answered with `{"access_key_id", "secret_access_key", "session_token", "expiration"}`, STS's shape (`session_token` may be absent for a broker that vends expiring keys instead). One session per catalog and access, held in memory and refreshed `HOGLAKE_STORAGE_BROKER_REFRESH_MARGIN_SECONDS` (default 300) before it expires; never written to the metadata store |
 
-`ambient` and `static` are what hoglake does today (static keys when both are
-set, otherwise the SDK chain), so an existing install changes nothing.
+`HOGLAKE_STORAGE_PROVIDER` selects one. Unset, it is `static` when both keys
+are set and `ambient` otherwise — what hoglake did before the knob existed, so
+an existing install changes nothing. The combination is checked at boot: an
+explicit `static` without both keys, an explicit `ambient` or `broker` beside
+keys, or a `broker` missing a setting refuses to start.
+
+`access` has three values, each including the one before: `read` (the
+hydrator's footer fetches), `write` (compaction: its inputs' reads plus the
+put and multipart upload of its output — and no delete, so a leaked or buggy
+compaction session cannot remove a tenant's referenced files), and `delete`
+(cleanup's drain of the removal queue, the one job that deletes). A broker
+grants `s3:DeleteObject` only for `delete`. The token request is the
+clients' client-credentials form, `grant_type=client_credentials` with
+`audience` = `HOGLAKE_STORAGE_BROKER_AUDIENCE` (default `hoglake`). Both
+URLs must be `https` — the client secret and every vended key cross that
+hop — with `http` accepted only for `localhost`, `127.0.0.1` or `[::1]`,
+the dev stack's and the test suite's in-process brokers; anything else
+refuses to start. The refresh lead is the margin or half the credential's
+lifetime, whichever is shorter, for the session and for the bearer token
+alike, so a 300-second session is still cached for 150 seconds rather than
+re-vended on every request. A refresh that fails is not retried by the
+next request: while the held session is valid the provider waits 5 seconds
+before trying again, doubling to a minute, and resets on success.
 `broker` is how a deployment puts the server's own S3 access behind the same
 authority as its clients' access: the server then holds no cloud identity of
 its own, and every session it uses is one the broker chose to grant and can
@@ -232,9 +266,16 @@ Whatever the provider, it serves only the server's own work: the background
 jobs, and the same work when a caller with `maintenance` scope triggers it
 through `POST /v1/catalogs/{catalog}/maintenance/compact` or
 `…/maintenance/cleanup`, which run compaction or cleanup inline and read and
-rewrite S3 with the server's credentials. Ordinary metadata requests never
-call the provider and never read S3, and nothing fetches credentials for a
-client.
+rewrite S3 with the server's credentials. Every one of those paths takes its
+S3 client for ONE catalog: a compaction run and a cleanup drain are per
+catalog by construction, and the hydrator's sweep, which claims files from
+every catalog at once, holds one read session per catalog it touches. Under
+`broker` a session is cached for the life of the process and refreshed in
+place; a refresh that fails keeps the session already held for as long as it
+is valid, and only a job with nothing valid to use fails. A client built
+without a catalog refuses to do IO under `broker` rather than reaching for a
+credential it has no grant for. Ordinary metadata requests never call the
+provider and never read S3, and nothing fetches credentials for a client.
 
 A deployment that wants storage access gated by the same authority as the
 tokens does it on the issuer side: the issuer returns scoped, short-lived
@@ -272,22 +313,57 @@ identity provider's SDK, or an exchange of some other credential, implements
 one of those and nothing else changes. hogtower appears in the clients only as
 the example token URL in their READMEs.
 
-## Local issuer (planned)
+## Local issuer
 
-For an install that wants real authentication and no extra service:
+For an install that wants real authentication and no extra service, the
+server is its own issuer — holding one key and no clients, verify-only at
+runtime. This is deliberately not an OAuth server inside hoglake; the earlier
+design that put one there was retired for the reasons in
+[auth-tenancy.md §17.2](auth-tenancy.md).
 
-- `HOGLAKE_AUTH_MODE=local` makes the server trust a key it holds itself,
-  from `HOGLAKE_AUTH_SIGNING_KEY` or generated at first start and persisted in
-  the metadata store, and publishes its public half at
-  `/.well-known/jwks.json`.
-- `hoglake token mint --catalog <name> --scope <read|write|maintenance|admin>
-  --ttl <duration> [--operator]` signs a token offline with that key, from the
-  command line, for an operator to hand to a client as a fixed token.
-- Nothing listens for token requests. The runtime stays verify-only.
+- `HOGLAKE_AUTH_MODE=local` is `enforce` with the public half of
+  `HOGLAKE_AUTH_SIGNING_KEY` as the only trusted key. The key is env-only: a
+  private EC P-256 JWK, base64url-encoded, that `hoglake token keygen` prints
+  and the server never writes anywhere. A JWKS file or URL beside it is a
+  boot error, as is the mode without the key. `HOGLAKE_AUTH_ISSUER` defaults
+  to `hoglake` (an explicit value wins), `HOGLAKE_AUTH_AUDIENCE` to `hoglake`.
+- The public half is served at `/.well-known/jwks.json`, so a hoglite backend
+  or a sibling that verifies the same tokens fetches it the way it would any
+  issuer's. The `kid` is the RFC 7638 thumbprint of the key, first eight
+  bytes in hex — the same rule the contract vectors use.
+- `hoglake token mint` signs a token offline with that key. It is an issuer
+  like any other: its claims are checked against the contract vectors in the
+  test suite, so a token it mints is exactly what the verifier next door
+  accepts.
+- Nothing listens for token requests, and the signing key is never loaded by
+  the server for anything but its public half.
 
-This is deliberately not an OAuth server inside hoglake: it holds one key and
-no clients, and the earlier design that put an authorization server in hoglake
-was retired for the reasons in [auth-tenancy.md §17.2](auth-tenancy.md).
+### Standalone, end to end
+
+```bash
+# 1. One key for the install. Keep the line somewhere the server and your
+#    shell both read it (an env file, a secret manager).
+hoglake token keygen            # prints HOGLAKE_AUTH_SIGNING_KEY=<value>
+export HOGLAKE_AUTH_SIGNING_KEY=<value>
+
+# 2. Start the server as its own issuer.
+HOGLAKE_AUTH_MODE=local hoglake-server
+
+# 3. Mint a token per client, offline, from the same environment.
+hoglake token mint --catalog demo --scope write --sub analytics-job --ttl 7d
+hoglake token mint --operator                                  # fleet-wide admin
+hoglake token mint --operator --catalog demo --org local       # bound to one catalog
+```
+
+`hoglake` here is the server binary (`bin/hoglake-server token …` from the
+distribution, `just server token …` from a checkout). The token goes into the
+client's fixed-token setting — `BearerToken` in pyhoglake, `TOKEN` in the
+DuckDB extension, `hoglake.auth.token` in the Trino connector — and the
+client brings its own storage credentials, as it does under every issuer.
+`--catalog` repeats, `name=scope` sets a catalog's scope, and `--ttl` takes
+`90s`, `15m`, `24h` (the default) or `7d`. Scoped tokens (`prd`) are not
+minted here: a standalone install has no second authority to narrow a token
+by.
 
 ## Status
 
@@ -298,9 +374,14 @@ Built: `off`, `warn`, `enforce`; ES256 and RS256 verification against a JWKS
 file or URL; the four scopes and the route table; the `scope` claim; scoped
 tokens with `prd` and a configurable lifetime cap; `ten` defaulting to
 `tenant`; `rtg`; the public and metrics listeners; contract vectors generated
-here; client credentials and fixed tokens in pyhoglake, the DuckDB extension,
-hedgerow and the Trino connector.
+here; the `ambient`, `static` and `broker` storage providers behind the
+server's own jobs; the local issuer (`local`, `hoglake token keygen` and
+`mint`); client credentials and fixed tokens in pyhoglake, the DuckDB
+extension, hedgerow and the Trino connector.
 
-Tracked in [#574](https://github.com/PostHog/hoglake/issues/574): the `broker` storage provider; the local issuer and
-`hoglake token mint`; a fixed-token option in the Trino connector; client
-credentials in millrace; the `jti` and multi-issuer decisions.
+Tracked in [#574](https://github.com/PostHog/hoglake/issues/574): a fixed-token
+option in the Trino connector; client credentials in millrace; a token for the
+web UI.
+
+Decided, not tracked: `jti` stays required, and the server verifies one issuer
+(both above).
