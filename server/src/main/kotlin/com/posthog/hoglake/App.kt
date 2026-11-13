@@ -47,11 +47,15 @@ import com.posthog.hoglake.service.ScanService
 import com.posthog.hoglake.service.TableCreationService
 import com.posthog.hoglake.service.UploadService
 import com.posthog.hoglake.service.ViewService
+import com.posthog.hoglake.storage.StorageCredentialProviders
 import com.posthog.hoglake.store.CatalogStore
 import com.posthog.hoglake.store.CatalogStoreSelector
+import com.posthog.hoglake.store.MountHostResolver
+import com.posthog.hoglake.store.MountReadService
 import com.posthog.hoglake.store.MountRegistry
 import com.posthog.hoglake.store.MountStore
 import com.posthog.hoglake.store.PostgresCatalogStore
+import com.posthog.hoglake.store.StaticMountHosts
 import com.zaxxer.hikari.HikariDataSource
 import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
@@ -138,13 +142,38 @@ class App private constructor(
 
     private val mountStore by lazy { MountStore({ jdbi }, cfg::mountAdmitted) }
 
+    /**
+     * Client mode (plan row 1.3c): the remote hosts this server proxies
+     * mounts to (HOGLAKE_MOUNT_HOSTS_FILE). With none configured nothing is
+     * built and no name resolves to a host.
+     */
+    private val mountHosts = lazy { cfg.mountHosts.takeIf { it.isNotEmpty() }?.let(::StaticMountHosts) }
+
     private val catalogSelector by lazy {
         CatalogStoreSelector(
             catalogStore,
             cfg,
             MountRegistry.behindSwitch(MountRegistry.postgresSwitch { jdbi }, mountRegistry ?: mountStore),
+            mountHosts.value ?: MountHostResolver.NONE,
         )
     }
+
+    /** The mount (export) read surface (plan row 1.3h): the five scoped read routes over the pinned source table. */
+    private val mountReadService by lazy {
+        MountReadService(
+            jdbi,
+            { catalogStore },
+            sourceCatalog = cfg.mountSourceCatalog,
+            sourceTableUuid = cfg.mountSourceTableUuidOrNull,
+            sourceFieldId = cfg.mountSourceFieldIdOrNull,
+            fileBudget = cfg.mountScanFileBudget,
+            scanDeadlineMs = cfg.mountScanDeadlineMs,
+            maxConcurrentScans = cfg.mountScanMaxConcurrent,
+        )
+    }
+
+    /** The mount read service, for tests that drive its cap and deadline directly. */
+    internal val mountReadServiceForTest get() = mountReadService
 
     private val partitionLookupService by lazy {
         PartitionLookupService(jdbi)
@@ -191,8 +220,18 @@ class App private constructor(
         )
     }
 
+    /**
+     * Where the server's own jobs get S3 credentials — ONE provider,
+     * shared by the read/put store and the delete store, so under
+     * `broker` the token and the per-catalog sessions are fetched once,
+     * not once per store.
+     */
+    private val storageProvider by lazy {
+        StorageCredentialProviders.fromConfig(cfg)
+    }
+
     private val removalStore by lazy {
-        RemovalStore(cfg)
+        RemovalStore(cfg, storageProvider)
     }
 
     /**
@@ -239,7 +278,7 @@ class App private constructor(
 
     /** Shared read/put store: hydrator footer reads + compaction rewrites. */
     private val objectStore by lazy {
-        ObjectStore(cfg)
+        ObjectStore(cfg, storageProvider)
     }
 
     /** One hydrator: the background sweep loop AND the rehydrate route. */
@@ -547,6 +586,18 @@ class App private constructor(
                 val spec = javaClass.getResource("/openapi/hoglake.yaml")!!.readText()
                 call.respondText(spec, ContentType.parse("application/yaml"))
             }
+            // The local issuer's public key (HOGLAKE_AUTH_MODE=local), the
+            // way any issuer publishes one. Read from the API listener's
+            // service on purpose: the public listener's copy is the same key,
+            // and a key is the one thing both doors may hand out.
+            get("/.well-known/jwks.json") {
+                val jwks = this@App.auth.localJwks
+                if (jwks == null) {
+                    call.respondText("not found", status = HttpStatusCode.NotFound)
+                } else {
+                    call.respondText(jwks, ContentType.Application.Json)
+                }
+            }
         }
         app.installApiRoutes(
             catalogSelector,
@@ -554,6 +605,11 @@ class App private constructor(
             instanceTotals = { if (postgresReady()) catalogMetrics.latestTotals else null },
             catalogTotals = { if (postgresReady()) catalogMetrics.latestByCatalog else emptyMap() },
             uiTheme = cfg.uiTheme,
+            // A provider, not the instance: forcing the lazy here would open
+            // PG at wiring time and break the PG-free / lazy-boot paths. It is
+            // built only when a mount actually resolves (PG is the default then).
+            mountRead = { mountReadService },
+            reservedNamespaces = cfg.reservedNamespaces,
         )
         app.installTableCreationRoutes(
             { tableCreationService },
@@ -564,7 +620,7 @@ class App private constructor(
             selector = catalogSelector,
         )
         app.installAlterRoutes({ alterService }, selector = catalogSelector)
-        app.installScanRoutes(catalogSelector)
+        app.installScanRoutes(catalogSelector, { mountReadService })
         app.installViewRoutes({ viewService }, selector = catalogSelector)
         app.installMaintenanceRoutes(
             { optionsService },
@@ -695,6 +751,7 @@ class App private constructor(
      * both.
      */
     override fun close() {
+        if (mountHosts.isInitialized()) mountHosts.value?.close()
         requestDispatcher.close()
         closeBackground()
         healthProbe.close()

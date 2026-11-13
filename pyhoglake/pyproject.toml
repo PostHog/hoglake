@@ -1,6 +1,6 @@
 [project]
 name = "pyhoglake"
-version = "1.4.9.dev0"
+version = "1.4.10.dev0"
 description = "Python client for hoglake, the Postgres-native lakehouse-catalog control plane"
 readme = "README.md"
 license = "MIT"
@@ -147,6 +147,7 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 markers = [
     "integration: tests that require a live hoglake server (HOGLAKE_URL)",
+    "bench: scale checks that print numbers; skipped unless PYHOGLAKE_BENCH=1",
 ]
 testpaths = ["tests"]
 # qe_*.py: QE/property-based fuzzing suites live alongside test_*.py

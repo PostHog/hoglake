@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: hoglake
-  version: 1.4.9-dev
+  version: 1.4.10-dev
   description: |
     The hoglake control plane: a Postgres-native lakehouse catalog.
     Clients never touch the backing Postgres; parquet lives in object
@@ -14,14 +14,20 @@ info:
 
     Every operation except the four marked `security: []` below
     (`/livez`, `/healthz`, `/metrics`, `/info`) requires
-    `Authorization: Bearer <jwt>`; `/metrics` requires an OPERATOR
-    credential rather than none. The token is an ES256 compact JWS
-    issued by this instance, carrying the
+    `Authorization: Bearer <jwt>` when `HOGLAKE_AUTH_MODE` is `warn` or
+    `enforce`; `/metrics` requires an OPERATOR credential rather than
+    none. The token is an ES256 or RS256 compact JWS issued by the issuer
+    this server is configured to trust (`HOGLAKE_AUTH_ISSUER`, verified
+    against its JWKS; this server issues nothing itself), carrying the
     caller's kind (`ten`), org (`org`), and — for a tenant — a `cat`
-    map from catalog name to the scopes held on it. Scopes are
+    map from catalog name to the scopes held on it. The contract is
+    docs/auth.md. Scopes are
     PER-CATALOG, not global: `read`, `write`, `maintenance`, `admin`,
     nested so that `admin` implies all of them and `maintenance`
-    implies `write`.
+    implies `write`. The same grants may instead be carried in the
+    standard OAuth `scope` claim as space-separated
+    `hoglake:<catalog>:<scope>` values; a token carrying both must
+    have them agree.
 
     Optional `rtg` selects a configured backend for the single `cat` catalog.
     Hoglite uses exactly `b`, `be`, and `t`; PostgreSQL uses `b` and `be`.
@@ -37,14 +43,45 @@ info:
 
     A mount (`<orgID>-events`) is read-only and serves only a scoped caller
     whose `cat` names it. That caller gets the mount from
-    GET /v1/catalogs/{catalog} and in GET /v1/catalogs (`read_only: true`);
-    on the other routes open to scoped callers within its `cat` scope, 403
-    `read_only_catalog` for a write and 501 `mount_operation_unavailable`
-    for a read not served yet. When its `rtg` places the mount on hoglite,
-    each of those routes answers it 501 `not_supported_on_backend` instead,
-    and its listing leaves the mount out. Other routes refuse it as any
-    scoped caller (403 `forbidden`). Other callers are answered as for any
-    catalog: where they would reach it, 404; no listing shows them a mount.
+    GET /v1/catalogs/{catalog} and in GET /v1/catalogs (`read_only: true`),
+    and reads its one pinned source table through five scoped routes:
+    namespaces, namespace, tables, table and scan. Every file the scan plans
+    is scoped to the caller's `prd.team_id` intersected with the export's
+    values, and each carries its `team_id`. The table's totals are omitted
+    and the tables listing's totals are over that scope, never the whole
+    source. A scan may be refused with 422 `mount_scan_too_many_files` (the
+    scoped plan is over the file budget), 503 `mount_scan_timeout` (it ran
+    past the deadline) or 503 `mount_scan_busy` (the one shared export-scan
+    cap is full); the two 503s carry Retry-After. On the other routes open to
+    scoped callers within its `cat` scope, 403 `read_only_catalog` for a
+    write and 501 `mount_operation_unavailable` for a read a mount does not
+    serve (files, partitions, changes, stats). When its `rtg` places the
+    mount on hoglite, each of those routes answers it 501
+    `not_supported_on_backend` instead, and its listing leaves the mount out.
+    Other routes refuse it as any scoped caller (403 `forbidden`). Other
+    callers are answered as for any catalog: where they would reach it, 404;
+    no listing shows them a mount.
+
+    A server may instead be a mount Client (HOGLAKE_MOUNT_HOSTS_FILE): each
+    configured host serves the mount names its entry matches, and this
+    server forwards that mount's reader to it. The reader is checked here
+    first, exactly as above, so a caller the mount would not serve, a write
+    and an unserved read are refused here with the same statuses and codes
+    and nothing is sent. For the reader, the catalog route and the five read
+    routes are sent to the host with the caller's own bearer token and
+    X-Request-Id, and the host's answer comes back unchanged: the same
+    bodies, `data_path` and per-file `team_id`, and the host's own refusals
+    with their status, `error`, `detail` and Retry-After (a 401 keeps its
+    `WWW-Authenticate` challenge). GET /v1/catalogs asks each host once and
+    lists the mounts it returns for the names in the caller's `cat`. The
+    Client adds three answers of its own: 503 `mount_host_unavailable` (the
+    host could not be reached, or did not answer inside the deadline) and
+    503 `mount_proxy_busy` (the cap on proxied requests in flight is full),
+    both with Retry-After, and 502 `mount_host_invalid_response` (the host
+    answered with something that is not this contract). A namespace or
+    table name outside the identifier grammar is 404 here. A large answer is
+    streamed; if it fails part-way, or passes the size cap, the connection
+    is closed instead of the body being finished.
 
     Two refusals are worth distinguishing, because they mean different
     things to a client:
@@ -84,6 +121,31 @@ paths:
   # an unready pod leaves the Service). The webui serves its own static
   # /health for its probes and proxies /healthz, /metrics and
   # /openapi.yaml through to the server.
+  /.well-known/jwks.json:
+    servers: [{ url: / }]
+    security: []
+    get:
+      operationId: localJwks
+      summary: >
+        The local issuer's public key (HOGLAKE_AUTH_MODE=local), as a JWKS
+        document — what a backend or a sibling that verifies the same tokens
+        fetches, the way it would fetch any issuer's. 404 in every other mode:
+        the server publishes no key it does not own. See docs/auth.md,
+        "Local issuer".
+      responses:
+        "200":
+          description: The one signing key, public half.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [keys]
+                properties:
+                  keys:
+                    type: array
+                    items: { type: object, additionalProperties: true }
+        "404":
+          description: Not the local issuer (`HOGLAKE_AUTH_MODE` is not `local`).
   /livez:
     servers: [{ url: / }]
     security: []
@@ -138,7 +200,10 @@ paths:
         mounts) follow the catalogs, with `read_only: true`; while the
         instance's mount source is unset or missing, that caller's listing
         answers 500. A catalog whose name a mount takes is not listed, as
-        every route answers for the mount instead.
+        every route answers for the mount instead. On a mount Client the
+        mounts are the entries its hosts list for those names, as the hosts
+        wrote them; while a host is unreachable, that caller's listing
+        answers 503 `mount_host_unavailable`.
       responses:
         "200":
           description: Catalogs
@@ -348,7 +413,14 @@ paths:
               schema: { $ref: "#/components/schemas/Namespace" }
         "409": { $ref: "#/components/responses/Conflict" }
         "422":
-          description: Name fails the identifier pattern.
+          description: >-
+            Name fails the identifier pattern, or is reserved on this server
+            (`HOGLAKE_RESERVED_NAMESPACES`, matched ignoring ASCII case),
+            error `validation`. A reserved name is refused for every caller
+            and every backend, before any write (a mount catalog answers its
+            own 403 `read_only_catalog` first); a namespace created before
+            its name was reserved keeps working but cannot be created again
+            once dropped.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
@@ -3472,11 +3544,13 @@ components:
       scheme: bearer
       bearerFormat: JWT
       description: >
-        An ES256 compact JWS issued by this instance. Minimum claim
+        An ES256 or RS256 compact JWS from this instance's configured
+        issuer. Minimum claim
         set: `iss` (this instance), `aud`, `sub` (client id or
         service-account subject), `jti`, `exp`, `iat`, `ten`
         (`tenant` | `operator`), and for a tenant `org` plus a `cat`
-        map from catalog name to the scopes held on it. A token NEVER
+        map from catalog name to the scopes held on it (or the same
+        grants as `hoglake:<catalog>:<scope>` values in `scope`). A token NEVER
         carries an object-store credential: S3 access is vended
         separately as short-lived, prefix-confined STS credentials, so
         a leaked control-plane token cannot be replayed against the
@@ -4580,6 +4654,14 @@ components:
       properties:
         data_file: { $ref: "#/components/schemas/DataFile" }
         delete_file: { $ref: "#/components/schemas/DeleteFile" }
+        team_id:
+          type: integer
+          format: int64
+          description: >
+            The file's team id — its proven value on a mount's source field.
+            Present ONLY on a mount's (export's) scoped scan, so the Client can
+            vend a per-team S3 credential for each file; absent on every
+            ordinary scan.
 
     PartitionField:
       type: object

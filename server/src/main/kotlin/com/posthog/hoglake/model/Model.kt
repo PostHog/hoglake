@@ -1174,6 +1174,13 @@ data class DeleteFile(
 data class ScanFile(
     val dataFile: DataFile,
     val deleteFile: DeleteFile?,
+    /**
+     * The file's team id — its proven partition value on a mount's source
+     * field (`team_id`). Set only by a mount's scoped scan (plan row
+     * 1.3h), so the Client can vend a per-team credential for each file;
+     * null on every ordinary (non-mount) scan.
+     */
+    val teamId: Long? = null,
 )
 
 data class ColumnStats(
@@ -2556,6 +2563,63 @@ sealed class HoglakeException(message: String) : RuntimeException(message) {
 
     /** A mount write at a revision the mount is not at -> 409 `mount_revision_conflict`. */
     class MountRevisionConflict(detail: String) : HoglakeException(detail)
+
+    /**
+     * A mount scan whose scoped plan would return more files than the
+     * instance's file-count budget -> 422 `mount_scan_too_many_files`. The
+     * scope is the token's, so the caller cannot narrow it; the budget
+     * protects the Host from a whale org's cold scan (plan row 1.3h, M10).
+     */
+    class MountScanTooManyFiles(detail: String) : HoglakeException(detail)
+
+    /**
+     * A mount scan that ran past the instance's scan deadline -> 503
+     * `mount_scan_timeout` + Retry-After. Retryable backpressure: the DB
+     * was slow, not the scan unbounded (the file budget bounds that).
+     */
+    class MountScanTimeout(detail: String) : HoglakeException(detail)
+
+    /**
+     * A mount scan refused because the one shared export-scan concurrency
+     * cap is full -> 503 `mount_scan_busy` + Retry-After. Non-blocking, so
+     * Trino reads cannot starve ingest writers on the request dispatcher.
+     */
+    class MountScanBusy(detail: String) : HoglakeException(detail)
+
+    /**
+     * On a mount Client (HOGLAKE_MOUNT_HOSTS_FILE): the Host could not be
+     * reached, or did not answer inside the deadline -> 503
+     * `mount_host_unavailable` + Retry-After. Nothing was refused.
+     */
+    class MountHostUnavailable(detail: String) : HoglakeException(detail)
+
+    /**
+     * On a mount Client: the Host answered with something that is not its
+     * contract (a redirect, a body that is not JSON, an error without a
+     * code, a body over the cap) -> 502 `mount_host_invalid_response`. The
+     * detail never carries what the Host sent.
+     */
+    class MountHostInvalidResponse(detail: String) : HoglakeException(detail)
+
+    /**
+     * On a mount Client: the host's cap over proxied requests in flight is
+     * full -> 503 `mount_proxy_busy` + Retry-After. Non-blocking, as
+     * [MountScanBusy] is on the Host.
+     */
+    class MountProxyBusy(detail: String) : HoglakeException(detail)
+
+    /**
+     * On a mount Client: the Host's own typed refusal, answered to the
+     * caller with the Host's [status], [code] and detail (and Retry-After
+     * when the Host sent one). [code] has passed the error-code grammar and
+     * the detail is capped, so nothing of an unexpected shape gets through.
+     */
+    class MountHostRefused(
+        val status: Int,
+        val code: String,
+        detail: String,
+        val retryAfterSeconds: Long? = null,
+    ) : HoglakeException(detail)
 
     /** Narrow the result before retrying. This refusal is not backend unavailability. */
     class BackendResultTooLarge(detail: String) : HoglakeException(detail)

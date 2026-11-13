@@ -27,6 +27,14 @@ private val log = KotlinLogging.logger("com.posthog.hoglake.api.ErrorMapping")
  * - ReadOnlyCatalog     -> 403 `read_only_catalog` (any non-read route on a mount)
  * - MountOperationUnavailable -> 501 `mount_operation_unavailable`
  * - MountRevisionConflict -> 409 `mount_revision_conflict` (a stale mount write)
+ * - MountScanTooManyFiles -> 422 `mount_scan_too_many_files` (scoped scan over the file budget)
+ * - MountScanTimeout    -> 503 `mount_scan_timeout` + Retry-After (scoped scan past the deadline)
+ * - MountScanBusy       -> 503 `mount_scan_busy` + Retry-After (export-scan concurrency cap full)
+ * - MountHostUnavailable -> 503 `mount_host_unavailable` + Retry-After (a mount Client's Host
+ *                          is unreachable or past the deadline)
+ * - MountProxyBusy      -> 503 `mount_proxy_busy` + Retry-After (a mount Client's proxy cap full)
+ * - MountHostInvalidResponse -> 502 `mount_host_invalid_response` (the Host broke its contract)
+ * - MountHostRefused    -> the Host's own status and code, on a mount Client
  * - AlreadyExists       -> 409
  * - CommitConflict      -> 409
  * - OffsetRegression    -> 409
@@ -89,6 +97,21 @@ internal fun errorBody(cause: HoglakeException): Pair<HttpStatusCode, ApiErrorDt
             HttpStatusCode.NotImplemented to apiError("mount_operation_unavailable", cause)
         is HoglakeException.MountRevisionConflict ->
             HttpStatusCode.Conflict to apiError("mount_revision_conflict", cause)
+        is HoglakeException.MountScanTooManyFiles ->
+            HttpStatusCode.UnprocessableEntity to apiError("mount_scan_too_many_files", cause)
+        is HoglakeException.MountScanTimeout ->
+            HttpStatusCode.ServiceUnavailable to apiError("mount_scan_timeout", cause)
+        is HoglakeException.MountScanBusy ->
+            HttpStatusCode.ServiceUnavailable to apiError("mount_scan_busy", cause)
+        is HoglakeException.MountHostUnavailable ->
+            HttpStatusCode.ServiceUnavailable to apiError("mount_host_unavailable", cause)
+        is HoglakeException.MountProxyBusy ->
+            HttpStatusCode.ServiceUnavailable to apiError("mount_proxy_busy", cause)
+        is HoglakeException.MountHostInvalidResponse ->
+            HttpStatusCode.BadGateway to apiError("mount_host_invalid_response", cause)
+        // The Host's refusal, as the Host worded it (store/MountHostClient.kt).
+        is HoglakeException.MountHostRefused ->
+            HttpStatusCode.fromValue(cause.status) to apiError(cause.code, cause)
         is HoglakeException.BackendResultTooLarge ->
             HttpStatusCode.UnprocessableEntity to apiError("backend_result_too_large", cause)
         is HoglakeException.BackendQueryTimeout ->
@@ -183,15 +206,39 @@ internal fun errorBody(cause: HoglakeException): Pair<HttpStatusCode, ApiErrorDt
 /** Installs [errorBody] plus the malformed-input and catch-all handlers. */
 fun StatusPagesConfig.installErrorMapping() {
     exception<HoglakeException> { call, cause ->
+        // A mount Client's relayed body can fail after its 200 is on the
+        // wire. The proxy has already cut the connection and logged it;
+        // there is no response left to write (store/MountHostClient.kt).
+        // Anything else that fails after it answered is still worth a line.
+        if (call.response.isCommitted) {
+            val relayed =
+                cause is HoglakeException.MountHostUnavailable || cause is HoglakeException.MountHostInvalidResponse
+            if (!relayed) {
+                log.warn(cause) { "exception after the response was sent for ${call.request.httpMethod.value}" }
+            }
+            return@exception
+        }
         val (status, body) = errorBody(cause)
         if (cause is HoglakeException.CommitQueueTimeout ||
             cause is HoglakeException.BackendUnavailable ||
+            cause is HoglakeException.MountScanTimeout ||
+            cause is HoglakeException.MountScanBusy ||
+            cause is HoglakeException.MountHostUnavailable ||
+            cause is HoglakeException.MountProxyBusy ||
             cause is PartitionLookupUnavailable
         ) {
             call.response.headers.append(HttpHeaders.RetryAfter, RETRY_AFTER_SECONDS)
         }
         if (cause is HoglakeException.Unauthenticated) {
             call.response.headers.append(HttpHeaders.WWWAuthenticate, bearerChallenge(cause))
+        }
+        // A mount Client relays the Host's refusal with the headers a
+        // caller acts on: when to retry, and (401) the bearer challenge.
+        if (cause is HoglakeException.MountHostRefused) {
+            cause.retryAfterSeconds?.let { call.response.headers.append(HttpHeaders.RetryAfter, it.toString()) }
+            if (cause.status == HttpStatusCode.Unauthorized.value) {
+                call.response.headers.append(HttpHeaders.WWWAuthenticate, "Bearer error=\"${cause.code}\"")
+            }
         }
         call.respond(status, body)
     }

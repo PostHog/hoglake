@@ -82,6 +82,17 @@ sealed interface CatalogBinding {
     data class Mount(
         val mount: MountRecord,
     ) : CatalogBinding
+
+    /**
+     * A mount another hoglake serves (#291's `RemoteCatalog`, plan row
+     * 1.3c): this server is its Client and [host] its Host. [name] is all
+     * the Client holds; whether the mount serves, and what it shows, is
+     * the Host's to say.
+     */
+    data class Remote(
+        val name: String,
+        val host: MountHostClient,
+    ) : CatalogBinding
 }
 
 /** #291's `CatalogRegistry.resolve`: a mount name resolves before any backend lookup. */
@@ -103,21 +114,31 @@ fun interface CatalogRegistry {
 internal fun requireMountReader(
     caller: Caller?,
     mount: MountRecord,
+) = requireMountReader(caller, mount.name) { reason -> Metrics.mountRefused(mount.name, reason) }
+
+/**
+ * The same rule for a mount [name], reporting each refusal's reason to
+ * [refused] before it is thrown. A mount Client applies it to a remote
+ * binding before anything is sent to the Host, so a caller the Host would
+ * refuse this way never reaches it.
+ */
+internal fun requireMountReader(
+    caller: Caller?,
+    name: String,
+    refused: (reason: String) -> Unit,
 ) {
-    if (caller?.kind != Caller.Kind.SCOPED || !caller.catalogClaimAllows(mount.name, Scope.READ)) {
-        throw refused(mount, "not_found", HoglakeException.NotFound("catalog '${mount.name}'"))
+    if (caller?.kind != Caller.Kind.SCOPED || !caller.catalogClaimAllows(name, Scope.READ)) {
+        refused("not_found")
+        throw HoglakeException.NotFound("catalog '$name'")
     }
     if (caller.routing?.backend == BackendKind.HOGLITE) {
-        throw refused(
-            mount,
-            "not_supported_on_backend",
-            HoglakeException.NotSupported("a mount is never served from a hoglite backend"),
-        )
+        refused("not_supported_on_backend")
+        throw HoglakeException.NotSupported("a mount is never served from a hoglite backend")
     }
 }
 
 /**
- * A mount write is the configured writer's alone ([writer], hogtower's events
+ * A mount write is the configured writer's alone ([writer], e.g. an issuer's events
  * mount loop), verified in every auth mode. Another operator, `platform:admin`, a
  * tenant, and no caller (under `off`, or `warn` without a token) get 403.
  */
@@ -152,11 +173,12 @@ internal fun mountVisibility(caller: Caller?): Set<String> =
  * service call: a write is never allowed on a mount, and a read waits for the
  * mount reader. The route's class comes from the route table, which covers
  * every served path; an unmatched path is refused as a write. Building it
- * counts it against the mount, so build it only to throw it.
+ * counts it against the mount, so build it only to throw it. A mount Client
+ * refuses the same routes the same way, without asking its Host.
  */
 internal fun mountRefusal(
     call: ApplicationCall,
-    mount: MountRecord,
+    mount: String,
 ): HoglakeException =
     if (AuthPolicy.match(call.request.httpMethod, call.request.path())?.requirement == Requirement.READ) {
         refused(
@@ -170,11 +192,13 @@ internal fun mountRefusal(
 
 /**
  * Count [failure] against [mount], by the error code it is answered with.
- * Only a record the registry returned reaches here, so request input cannot
- * add a series. Each refusal ends its request, so a request is counted once.
+ * Only a resolved binding's name reaches here (a record the registry
+ * returned or, on a mount Client, a name its reader's verified `cat`
+ * holds), so request input cannot add a series. Each refusal ends its
+ * request, so a request is counted once.
  */
 private fun refused(
-    mount: MountRecord,
+    mount: String,
     reason: String,
     failure: HoglakeException,
-): HoglakeException = failure.also { Metrics.mountRefused(mount.name, reason) }
+): HoglakeException = failure.also { Metrics.mountRefused(mount, reason) }

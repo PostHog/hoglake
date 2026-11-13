@@ -825,12 +825,19 @@ fun DeleteFile.toDto() =
 data class ScanFileDto(
     val dataFile: DataFileDto,
     val deleteFile: DeleteFileDto? = null,
+    /**
+     * The file's team id, carried only by a mount's scoped scan (plan row
+     * 1.3h) so the Client can vend a per-team credential for it; NON_NULL
+     * omits it on every ordinary scan.
+     */
+    val teamId: Long? = null,
 )
 
 fun ScanFile.toDto() =
     ScanFileDto(
         dataFile = dataFile.toDto(),
         deleteFile = deleteFile?.toDto(),
+        teamId = teamId,
     )
 
 data class ChangePlanDto(

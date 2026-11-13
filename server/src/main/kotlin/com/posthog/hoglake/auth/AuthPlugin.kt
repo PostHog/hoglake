@@ -38,7 +38,20 @@ class AuthService(
      * (maintenance, debug, /metrics) are not a public surface.
      */
     val tenantOnly: Boolean = false,
+    /** The deployment's extra client classes (`HOGLAKE_AUTH_CLIENT_CLASSES`); see [clientClass]. */
+    val clientClasses: Set<String> = emptySet(),
+    /**
+     * Under [AuthMode.LOCAL], the public JWKS document derived from
+     * `HOGLAKE_AUTH_SIGNING_KEY`, served at `/.well-known/jwks.json` so a
+     * backend or a sibling that verifies the same tokens can fetch the key the
+     * way it would fetch any issuer's. Null in every other mode: the server
+     * publishes no key it does not own.
+     */
+    val localJwks: String? = null,
 ) {
+    /** This request's `client` label: [clientClass] with this deployment's extra classes. */
+    fun clientClass(call: ApplicationCall): String = clientClass(call, clientClasses)
+
     /**
      * The `listener` label on hoglake_auth_requests_total: internet scanners
      * refused on the public listener must not land in the series the enforce
@@ -62,7 +75,7 @@ class AuthService(
             requireNotNull(verifier) {
                 "HOGLAKE_PUBLIC_PORT requires HOGLAKE_AUTH_MODE warn or enforce: the public listener always enforces"
             }
-        return AuthService(AuthMode.ENFORCE, v, tenantOnly = true)
+        return AuthService(AuthMode.ENFORCE, v, tenantOnly = true, clientClasses = clientClasses, localJwks = localJwks)
     }
 
     companion object {
@@ -73,7 +86,8 @@ class AuthService(
          */
         fun fromConfig(cfg: com.posthog.hoglake.Config): AuthService {
             val mode = AuthMode.parse("HOGLAKE_AUTH_MODE", cfg.authMode)
-            if (mode == AuthMode.OFF) return AuthService(mode, null)
+            if (mode == AuthMode.OFF) return AuthService(mode, null, clientClasses = cfg.authClientClasses)
+            if (mode == AuthMode.LOCAL) return local(cfg)
 
             val issuer = cfg.authIssuer.trim()
             require(issuer.isNotEmpty()) {
@@ -89,12 +103,51 @@ class AuthService(
             Metrics.authSigningKeys { keys.keyCount }
             return AuthService(
                 mode = mode,
+                clientClasses = cfg.authClientClasses,
                 verifier =
                     JwtVerifier(
                         issuer = issuer,
                         audience = audience,
                         keys = keys,
                         skewSeconds = cfg.authClockSkewSeconds,
+                        scopedMaxLifetimeSeconds = cfg.authScopedMaxLifetimeSeconds,
+                        backends = cfg.backendKinds,
+                        predicateFields =
+                            cfg.authPredicateFields.split(',').map { it.trim() }.filter { it.isNotEmpty() }.toSet(),
+                    ),
+            )
+        }
+
+        /**
+         * `local`: the key IS the configuration. The issuer defaults to
+         * [LocalIssuer.DEFAULT_LOCAL_ISSUER] because a standalone install has
+         * no second instance to keep a token from replaying at; an operator who
+         * sets one anyway gets it. Config already refused a JWKS file or URL
+         * beside the key, and a missing key, naming the variable.
+         */
+        private fun local(cfg: com.posthog.hoglake.Config): AuthService {
+            val key =
+                try {
+                    LocalSigningKey.decode(cfg.authSigningKey.value)
+                } catch (e: IllegalArgumentException) {
+                    throw IllegalArgumentException("HOGLAKE_AUTH_MODE=local: ${e.message}", e)
+                }
+            val issuer = cfg.authIssuer.trim().ifEmpty { LocalIssuer.DEFAULT_LOCAL_ISSUER }
+            val audience = cfg.authAudience.trim()
+            require(audience.isNotEmpty()) { "HOGLAKE_AUTH_AUDIENCE must not be blank" }
+            val keys = key.signingKeys()
+            Metrics.authSigningKeys { keys.keyCount }
+            return AuthService(
+                mode = AuthMode.LOCAL,
+                clientClasses = cfg.authClientClasses,
+                localJwks = key.publicJwks(),
+                verifier =
+                    JwtVerifier(
+                        issuer = issuer,
+                        audience = audience,
+                        keys = keys,
+                        skewSeconds = cfg.authClockSkewSeconds,
+                        scopedMaxLifetimeSeconds = cfg.authScopedMaxLifetimeSeconds,
                         backends = cfg.backendKinds,
                         predicateFields =
                             cfg.authPredicateFields.split(',').map { it.trim() }.filter { it.isNotEmpty() }.toSet(),
@@ -157,6 +210,7 @@ sealed interface AuthState {
     /** Resolved, with a verified token. */
     data class Authenticated(
         val caller: Caller,
+        internal val backendAuthority: VerifiedBackendAuthority? = null,
     ) : AuthState
 
     val callerOrNull: Caller?
@@ -177,6 +231,14 @@ sealed interface AuthState {
  */
 val ApplicationCall.hoglakeAuth: AuthState
     get() = attributes.getOrNull(AuthStateKey) ?: AuthState.Off
+
+/** Only the auth plugin constructs this request-local, redacted credential holder. */
+class VerifiedBackendAuthority internal constructor(internal val token: String) {
+    override fun toString(): String = "VerifiedBackendAuthority(redacted)"
+}
+
+internal val ApplicationCall.verifiedBackendToken: String?
+    get() = (hoglakeAuth as? AuthState.Authenticated)?.backendAuthority?.token
 
 /**
  * The audit `actor` for a request, or a refusal.
@@ -294,7 +356,9 @@ val HoglakeAuth =
             // `enforce` must be distinguishable from a request in `off`.
             call.attributes.put(
                 AuthStateKey,
-                caller?.let { AuthState.Authenticated(it) } ?: AuthState.Anonymous,
+                caller?.let {
+                    AuthState.Authenticated(it, token?.let(::VerifiedBackendAuthority))
+                } ?: AuthState.Anonymous,
             )
 
             // One decision, for every mode and every route shape. A PUBLIC route
@@ -307,7 +371,7 @@ val HoglakeAuth =
             if (decision is AuthDecision.Allow) {
                 // The token was still parsed, so a valid one still yields its
                 // caller and its per-tenant totals.
-                Metrics.authRequest(service.mode.wire, service.listener, "ok", clientClass(call))
+                Metrics.authRequest(service.mode.wire, service.listener, "ok", service.clientClass(call))
                 return@onCall
             }
             // A scoped caller on a namespaced route: decided by the gate, on
@@ -335,7 +399,7 @@ val HoglakeAuth =
                     if (service.mode.isEnforcing) {
                         call.respondMethodNotAllowed(allowed)
                     } else {
-                        Metrics.authRequest(service.mode.wire, service.listener, "unmapped", clientClass(call))
+                        Metrics.authRequest(service.mode.wire, service.listener, "unmapped", service.clientClass(call))
                     }
                     return@onCall
                 }
@@ -355,7 +419,7 @@ val HoglakeAuth =
             // new, and letting it through would hand a team-scoped credential
             // the whole catalog.
             val enforced = service.mode.isEnforcing || caller?.kind == Caller.Kind.SCOPED
-            countRefusal(service, clientClass(call), caller, match, refusal, enforced)
+            countRefusal(service, service.clientClass(call), caller, match, refusal, enforced)
             if (enforced) {
                 call.respondRefusal(refusal)
                 return@onCall
@@ -391,16 +455,35 @@ private suspend fun ApplicationCall.respondMethodNotAllowed(allowed: Set<HttpMet
  * Which kind of client sent a request, for the `client` metric label.
  *
  * The enforce flip is gated on zero refusals PER CLIENT CLASS — the Trino
- * connector, the provisioner, the SDKs, the console, the scrape — and an
- * unauthenticated request has no identity to label it by, so the class comes
- * from `User-Agent`. A closed allowlist rather than the raw header: the header
- * is caller-chosen, and a free-text label is a cardinality attack. Anything
- * unrecognised is `other`, which is itself a signal worth chasing before a flip.
+ * connector, the SDKs, the console, the scrape, an issuer's provisioner — and
+ * an unauthenticated request has no identity to label it by, so the class comes
+ * from `User-Agent`. A closed set rather than the raw header: the header is
+ * caller-chosen, and a free-text label is a cardinality attack. The set is the
+ * built-in generic clients below plus the product tokens a deployment names in
+ * `HOGLAKE_AUTH_CLIENT_CLASSES` ([extra]), each its own label, so an issuer's
+ * own client (its provisioner, say) is counted by name without this code
+ * knowing any issuer. Anything unrecognised is `other`, which is itself a
+ * signal worth chasing before a flip.
  */
-internal fun clientClass(call: ApplicationCall): String {
-    val ua = call.request.headers[HttpHeaders.UserAgent]?.trim()?.lowercase() ?: return "none"
+internal fun clientClass(
+    call: ApplicationCall,
+    extra: Set<String> = emptySet(),
+): String = clientClass(call.request.headers[HttpHeaders.UserAgent], extra)
+
+/** [clientClass] of a raw `User-Agent` value. */
+internal fun clientClass(
+    userAgent: String?,
+    extra: Set<String> = emptySet(),
+): String {
+    val ua = userAgent?.trim()?.lowercase()?.takeIf { it.isNotEmpty() } ?: return "none"
+    // The product token: `name/1.2 (comment)` names `name`.
+    val product = ua.substringBefore(' ').substringBefore('/')
+    if (product in extra) return product
     return CLIENT_CLASSES.firstOrNull { (prefix, _) -> ua.startsWith(prefix) }?.second ?: "other"
 }
+
+/** The labels [clientClass] reserves for itself; a configured class may not reuse them. */
+internal val RESERVED_CLIENT_CLASSES = setOf("none", "other")
 
 private val CLIENT_CLASSES =
     listOf(
@@ -410,8 +493,10 @@ private val CLIENT_CLASSES =
         "python-httpx" to "pyhoglake",
         "hedgerow" to "hedgerow",
         "duckdb" to "duckdb",
-        "hogtower" to "hogtower",
-        "go-http-client" to "hogtower",
+        // A mount Client forwarding a reader's request to its Host (store/MountHostClient.kt).
+        "hoglake-server" to "hoglake",
+        // Go's default client: a Go service that sets no User-Agent of its own.
+        "go-http-client" to "go",
         "prometheus" to "prometheus",
         "kube-probe" to "probe",
         "mozilla" to "browser",

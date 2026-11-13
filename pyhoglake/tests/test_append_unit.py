@@ -411,17 +411,35 @@ def test_append_rebind_after_preflight_is_409d_by_the_server(
     assert len(fake_s3.files) == 1  # parquet orphaned in the bucket
 
 
-def test_append_to_an_object_prefix_table_is_refused_once_not_retried(
+def test_append_to_an_object_prefix_table_without_its_identity_field_is_refused(
     table, httpx_mock, fake_s3
 ):
-    """Table.append writes under the table root, so on a table with the
-    object-prefix option the server refuses it. The refusal says
-    re-prepare, which only a writer that places its files can act on;
-    append raises it after its one commit and does not try again."""
-    from pyhoglake import ObjectPrefixViolationError
-
+    """An object-prefix field with no single identity field in the live
+    spec is a layout the server never installs; read anyway (an
+    unpartitioned table claiming one), append refuses it before any write
+    or commit, as a ValidationError of its own, not the server's 422.
+    Placement itself is tests/test_object_prefix_write.py's."""
     prefixed = {**TABLE_WIRE, "object_prefix_field": "id"}
     httpx_mock.add_response(method="GET", url=_WRITER_TABLES_URL, json=prefixed)
+    with pytest.raises(ValidationError, match="no single identity field"):
+        table.append(pa.table({"id": [1], "name": ["a"]}))
+    assert not fake_s3.files
+    assert not [r for r in httpx_mock.get_requests() if r.method == "POST"]
+
+
+def test_append_on_a_422_object_prefix_violation_raises_once_and_does_not_retry(
+    table, httpx_mock, fake_s3
+):
+    """The option set between append's resolve and its commit: the read
+    said no object-prefix field, so the file went under the table root,
+    and the server refuses the commit with 422 object_prefix_violation.
+    append raises it after its one commit and does not try again; the
+    refusal says re-prepare, which a writer that re-reads the table can
+    act on (the fresh read carries the field, and the next append places
+    its files)."""
+    from pyhoglake import ObjectPrefixViolationError
+
+    httpx_mock.add_response(method="GET", url=_WRITER_TABLES_URL, json=TABLE_WIRE)
     httpx_mock.add_response(
         method="POST",
         url=_COMMIT_URL,
@@ -438,7 +456,7 @@ def test_append_to_an_object_prefix_table_is_refused_once_not_retried(
     assert (ei.value.status_code, ei.value.table) == (422, "ns1.events")
     assert ei.value.re_prepare and not ei.value.retryable
     ((key, _),) = fake_s3.files.items()
-    assert "/id=" not in key  # the table root, not the prefix
+    assert "/id=" not in key  # the table root, as the stale read said
     assert len([r for r in httpx_mock.get_requests() if r.method == "POST"]) == 1
 
 

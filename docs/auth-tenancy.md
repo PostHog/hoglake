@@ -1,5 +1,13 @@
 # Auth, tenancy and S3 data-plane entitlement
 
+> **Superseded as a description of the design.** [docs/auth.md](auth.md) is
+> canonical: hoglake is a resource server that verifies tokens from whichever
+> issuer the deployment configures, owns the token contract and its vectors,
+> and depends on no particular issuer. Where this document says hogtower is
+> *the* authority, read "PostHog's issuer, for PostHog's deployment". It is
+> kept for the threat model and the reasoning; §0–§16 describe a design that
+> was not built.
+
 **Status:** the hoglake side has shipped.
 [#460](https://github.com/PostHog/hoglake/pull/460) is the enforcement layer:
 `HOGLAKE_AUTH_MODE=off|warn|enforce`, ES256 JWT verification against a JWKS file
@@ -573,6 +581,7 @@ samplers start only after PostgreSQL initializes; a hoglite-only process never s
 | Hoglite catalog listing | Only the token's routed catalog |
 | Maintenance or publications on hoglite | 501 `not_supported_on_backend` |
 | A mount name (§6.5a) | Resolved first: never a store |
+| A name a mount host serves (§6.5b) | Resolved before that: forwarded to the host |
 
 Authorization still runs before store selection. Fleet metrics and `/v1/info` remain PostgreSQL-only.
 
@@ -700,6 +709,47 @@ is any lowercase identifier, the value a positive id, and the convention that
   namespace to be empty.
 - **Nothing changes until something is marked.** A catalog with no contained
   namespace refuses nothing it refused before.
+
+### 6.2c Reserved namespace names
+
+`HOGLAKE_RESERVED_NAMESPACES` (comma-separated) lists namespace names that no
+caller may create in any catalog on the server. Empty, the default, reserves
+none. PostHog's customer hoglake sets `posthog`: its Trino connector shows the
+org's events mount (`<orgID>-events`, §6.5a/§6.5b) as the read-only schema
+`posthog` inside the org's catalog, so user data must never sit under that name.
+hoglake reserves no name itself.
+
+- **One path.** `POST /v1/catalogs/{c}/namespaces` is the only way a namespace
+  is created: there is no rename, and table, view, commit and table-creation
+  routes need an existing namespace (404 otherwise). The handler refuses a
+  reserved name after the body is read and before the store is called, so
+  no snapshot is allocated and nothing reaches PostgreSQL or a hoglite engine.
+  Every client (Trino, DuckDB, pyhoglake, the web UI) goes through it.
+- **Every caller.** Operators, tenants and auth `off` alike; a scoped token
+  cannot create namespaces at all (403 before the handler).
+- **Matching.** Equal after folding ASCII `A`-`Z` to lowercase; nothing else
+  is folded, trimmed or prefix-matched (`PostHog` is refused, `posthog_raw` is
+  not). Both backends compare namespace names case-sensitively, and Trino folds
+  identifiers to lowercase and lets the mount shadow any case variant of
+  `posthog`, so an exact match would let a direct client create a namespace
+  Trino hides.
+- **The error.** 422 `validation`, "namespace name '<name>' is reserved on this
+  server", as `POST /v1/catalogs` refuses a mount-shaped catalog name.
+- **Boot.** Each entry must match the namespace identifier pattern, else the
+  server does not start.
+- **Existing namespaces are left alone.** One created before its name was
+  reserved stays listed, readable, writable and droppable; once dropped, no
+  case variant of it can be created again. The server does not look for them
+  at boot (that would scan every catalog, and open every hoglite engine). Before
+  setting the variable, look once on PostgreSQL:
+  `SELECT c.name, n.name FROM hog_namespace n JOIN hog_catalog c USING (catalog_id) WHERE NOT n.dropped AND lower(n.name) = 'posthog';`
+  and in each hoglite-placed catalog:
+  `SELECT name FROM namespaces WHERE dropped_snapshot IS NULL AND lower(name) = 'posthog';`
+- **Mounts.** A mount or mount Client catalog refuses every write first
+  (403 `read_only_catalog`), so it never reaches this check.
+- **Reserve only names nobody provisions.** The provisioner's `team_<id>`
+  namespaces (§6.2b) are created by an operator token, which the guard does not
+  exempt.
 
 ### 6.3 Scope vocabulary
 
@@ -881,6 +931,98 @@ a canonical lowercase UUID (`MountNames.PATTERN`).
   the plugin counts it on the routes it allows outright) and `other` for a mount
   placed on hoglite; for any catalog, a 404 because no backend holds it
   (#554's `none` default) counts `not_entitled`.
+
+### 6.5b Mount Client
+
+A server with `HOGLAKE_MOUNT_HOSTS_FILE` is a mount **Client** (#291's
+`RemoteCatalog`): it forwards a mount's reader to the **Host** that serves the
+mount (§6.5a). Readers keep reading the Host's objects directly; only catalog
+requests go through the Client.
+
+```json
+{"hosts": [{"id": "3c0c6d0e-1f2a-4b3c-9d4e-5f6a7b8c9d0e",
+            "match": {"type": "events"},
+            "kind": "hoglake",
+            "url": "http://gigahog-server.gigahog:8080",
+            "auth": "forward"}]}
+```
+
+- **The mapping.** Each entry is one host: a stable `id` (a canonical
+  lowercase UUID, as a hoglite backend's), the names it serves, what it is,
+  where it is and how the Client authenticates to it. Optional per-host
+  bounds: `timeout_ms` (75,000; at most 600,000), `max_response_bytes`
+  (1 GiB), `max_concurrent` (16; at most 256). A request holds its permit
+  for at most `timeout_ms` plus 10 s for a slow caller. Endpoints only,
+  never credentials. Checked at boot:
+  ids are unique, no name matches two entries, each `url` is a bare http(s)
+  origin (no user-info, path, query or fragment), unknown keys are refused.
+  No file, or an empty list, is a server that is not a Client.
+- **Matchers.** `{"type": "events"}` is every mount name (`<orgID>-events`).
+  `{"type": "catalog", "name": "<orgID>-events"}` is one mount name. A name
+  that is not a mount's is refused at boot: reservation, the issuer's `cat`
+  grammar, `AuthPolicy.MOUNT_ROUTES` and the listing are all keyed on the
+  mount shape, and any other name could be a catalog on a token-routed
+  backend.
+- **Kind and auth.** `kind` is `hoglake` only. `auth` is `forward` only: the
+  caller's bearer token, unchanged. That is sound only for a host that
+  verifies the same issuer's tokens for the same audience as this server:
+  the Client has verified the token, the host verifies it again and scopes
+  by its claims, and the Client holds no credential of its own. A host
+  under another authority, or one that is not a hoglake, needs its own auth
+  mode and reader; any other value is refused at boot.
+- **One seam.** `MountHostResolver.resolve(caller, catalog)` answers the
+  reader of the host that serves a name, or nothing. `CatalogStoreSelector`
+  asks it before the mount registry and before any backend lookup, and the
+  proxy (`MountHostClient`) knows only the host it was built for. The
+  resolver is static configuration today; it takes the verified caller so
+  that a routing claim naming a host `id` can be honoured later.
+- **A Host or a Client.** Refused at boot together with
+  `HOGLAKE_MOUNT_ALLOWLIST`, under `HOGLAKE_AUTH_MODE=off`, or without
+  `HOGLAKE_AUTH_PREDICATE_FIELDS` (the hosts' own fields: no scoped token
+  verifies without them).
+- **Checked here first.** The binding applies the mount reader's rule of
+  §6.5a before anything is sent: only a verified scoped caller whose `cat`
+  names the mount with `read`. Everyone else gets the same 404, a reader
+  whose `rtg` is hoglite the same 501, a write the same 403
+  `read_only_catalog` and an unserved read the same 501
+  `mount_operation_unavailable`, with no upstream call. A token needs no
+  `rtg`: the name alone selects the host, whatever backends the Client has.
+  The namespace gate skips containment for a remote binding, as for a mount.
+- **Not trusted for isolation.** The Client holds no team values and filters
+  nothing. The Host verifies the forwarded token again and applies its own
+  `ReadScope`; a Client that forwarded a request it should have refused
+  would be refused by the Host.
+- **What is forwarded.** `GET` for the catalog route and the five read
+  routes, with the caller's `Authorization` header and `X-Request-Id`, to a
+  path built from the mount name and identifier-grammar namespace and table
+  names (anything else is a local 404), with the query parameters
+  re-encoded. Redirects are not followed and no proxy is used. A 200 comes
+  back byte for byte (one with no length and no chunking, or with a content
+  encoding, is refused); `GET /v1/catalogs` asks each host once and keeps
+  the entries it returns for the names in the caller's `cat`.
+- **Limits.** The cap is per host, not per org: fairness between orgs is the
+  query engine's resource groups, as for the Host's scan cap. `forward`
+  sends the whole token, including any other catalog its `cat` names. A
+  caller that disconnects does not cancel its upstream request, which ends
+  at the host's answer or the deadline.
+- **Errors.** The Host's typed refusal passes through with its status, code,
+  detail and Retry-After. Unreachable or past the deadline: 503
+  `mount_host_unavailable`. The cap on requests in flight is full: 503
+  `mount_proxy_busy`. Anything else from the Host: 502
+  `mount_host_invalid_response`. None names the Host's address or echoes
+  what it sent. A large body is streamed; on a failure part-way, or a body
+  over the size cap, the caller's connection is closed instead of the body
+  being finished.
+- **Metrics.** `hoglake_mount_proxy_requests_total{catalog}` and the
+  `hoglake_mount_proxy_requests_seconds` histogram count and time every
+  request sent to a host; `hoglake_mount_proxy_upstream_errors_total{catalog,reason}`
+  counts those it did not serve (`unavailable`, `timeout`,
+  `invalid_response`, `response_too_large`, `http_<status>`). `http_401` is
+  a host refusing a token this server had just verified: its keys or issuer
+  differ. A shed request is `mount_proxy_busy` on
+  `hoglake_mount_refusals_total`. The `catalog` label is written only after
+  the reader check has passed, so it is a name from a verified `cat`. Logs
+  name a host by its `id`, never its URL.
 
 ### 6.6 Client-supplied authority fields must die
 
@@ -1296,7 +1438,8 @@ New metrics (Prometheus, existing `observability/Metrics.kt` idiom):
 | `hoglake_auth_requests_total{mode,listener,outcome,client}` | the `warn`-mode onboarding checklist; `client` is a closed class from `User-Agent`, and the enforce gate is zero refusals per class on `listener="api"` (`listener="public"` is the internet-facing port, §6.7, where refusals are expected) |
 | `hoglake_auth_signing_keys` | keys the verifier holds; alert on 0 (boot refuses an empty source, this catches a rotation that never lands) |
 | `hoglake_auth_denials_total{catalog,scope,reason}` | distinguishes "client misconfigured" from "attack" by `reason` |
-| `hoglake_mount_refusals_total{catalog,reason}` | refusals on a mount (§6.5a) by error code; `catalog` is a mount the registry holds |
+| `hoglake_mount_refusals_total{catalog,reason}` | refusals on a mount (§6.5a) by error code; `catalog` is a mount the registry holds, or on a mount Client one a verified `cat` names |
+| `hoglake_mount_proxy_requests_total{catalog}`, `_seconds`, `hoglake_mount_proxy_upstream_errors_total{catalog,reason}` | a mount Client's requests to its hosts (§6.5b): count, latency, and the ones a host did not serve, by a closed `reason` |
 | `hoglake_token_issued_total{grant_type}`, `_failures_total` | token endpoint health; not built (issuance is hogtower's) |
 | `hoglake_sts_assume_total{catalog,outcome}`, `_duration_seconds` | the vending path is now on the critical path of a read; it needs a latency histogram; not built (vending is hogtower's) |
 | `hoglake_sts_cache_hit_ratio` | if this drops, every scan pays an STS round trip; not built |
@@ -1439,7 +1582,7 @@ control plane — shows that six of the seven decisions above put machinery in t
 wrong repo. This section is what the stack should actually be, and it is
 smaller, not larger.
 
-The short version: **hoglake is a resource server. hogtower is the authority.**
+The short version: **hoglake is a resource server; the issuer is outside it.** For PostHog's deployment that issuer is hogtower.
 hoglake verifies a token and authorizes catalog metadata, which is what the
 first PR already does. hogtower mints the token and vends the S3 credentials,
 because it already holds every input, already assumes the tenant roles, and is

@@ -53,6 +53,10 @@ class MountDispatchIntegrationTest {
             it.createQuery("SELECT enabled FROM hog_mount_switch").mapTo(Boolean::class.java).one()
         }
 
+    /** The pinned source table and its `team_id` field id (HOGLAKE_MOUNT_SOURCE_*). */
+    private val sourceTableUuid: java.util.UUID
+    private val teamFieldId: Long
+
     init {
         val catalogs = CatalogService(db.jdbi)
         catalogs.createCatalog(mount, "s3://bucket/$mount")
@@ -62,8 +66,49 @@ class MountDispatchIntegrationTest {
         catalogs.createCatalog(source, "s3://bucket/millrace/$source")
         catalogs.createNamespace(source, "ingest")
         catalogs.createNamespace(source, "other")
+        // The pinned source table the mount reads: object-prefix layout on
+        // team_id and one identity spec, so ReadScope compiles. No files, so
+        // every read is served but empty (the switch/dispatch totality test
+        // only needs a served 200, not rows).
+        val events = catalogs.createTable(source, "ingest", "events", listOf(ColumnDef("team_id", ColType.LONG)))
+        sourceTableUuid = events.tableUuid
+        teamFieldId = events.columns.single { it.def.name == "team_id" }.fieldId
+        db.jdbi.useHandle<Exception> { h ->
+            val catId =
+                h.createQuery("SELECT catalog_id FROM hog_catalog WHERE name = :n").bind("n", source)
+                    .mapTo(Long::class.java).one()
+            h.execute(
+                "INSERT INTO hog_table_layout (catalog_id, table_id, begin_snapshot, object_prefix_field_id) " +
+                    "VALUES (?, ?, 1, ?)",
+                catId,
+                events.tableId,
+                teamFieldId,
+            )
+            h.execute(
+                "INSERT INTO hog_partition_spec (catalog_id, table_id, spec_id, begin_snapshot) VALUES (?, ?, 1, 0)",
+                catId,
+                events.tableId,
+            )
+            h.execute(
+                "INSERT INTO hog_partition_field (catalog_id, table_id, spec_id, key_index, source_field_id, " +
+                    "transform) VALUES (?, ?, 1, 0, ?, 'identity')",
+                catId,
+                events.tableId,
+                teamFieldId,
+            )
+        }
         catalogs.createCatalog("lake", "s3://bucket/lake")
     }
+
+    /** The five scoped read routes a mount serves (plan row 1.3h), by (method, pattern). */
+    private val servedReadRoutes =
+        setOf(
+            HttpMethod.Get to "/v1/catalogs/{catalog}/namespaces",
+            HttpMethod.Get to "/v1/catalogs/{catalog}/namespaces/{namespace}",
+            HttpMethod.Get to "/v1/catalogs/{catalog}/namespaces/{namespace}/tables",
+            HttpMethod.Get to "/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}",
+            HttpMethod.Get to "/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/scan",
+        )
 
     @AfterAll
     fun close() {
@@ -84,6 +129,8 @@ class MountDispatchIntegrationTest {
         val cfg =
             Config(port = 0, hydratorIntervalMs = 0).copy(
                 mountSourceCatalog = sourceCatalog,
+                mountSourceTableUuid = sourceTableUuid.toString(),
+                mountSourceFieldId = teamFieldId.toString(),
                 postgresBackendId = postgresId,
                 authMode = mode.wire,
                 authIssuer = TestTokens.ISSUER,
@@ -221,6 +268,15 @@ class MountDispatchIntegrationTest {
                     if ((rule.method to rule.pattern) in AuthPolicy.MOUNT_ROUTES) {
                         assertThat(scoped.statusCode()).describedAs("%s %s", rule.method.value, path).isEqualTo(200)
                         assertThat(scoped.body()).isEqualTo(mountBody())
+                        continue
+                    }
+                    // The five scoped read routes a mount serves (plan row
+                    // 1.3h): 200 (the pinned source is set up above; here with
+                    // empty scope, so the bodies are empty/structural). They
+                    // are not refusals, so they do not touch the counter.
+                    if ((rule.method to rule.pattern) in servedReadRoutes) {
+                        assertThat(scoped.statusCode()).describedAs("%s %s: %s", rule.method.value, path, scoped.body())
+                            .isEqualTo(200)
                         continue
                     }
                     val route = rule.method to rule.pattern

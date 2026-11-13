@@ -85,8 +85,8 @@ source:
     secret_key: hoglake123
     path_style: true
   auth:                             # optional; required once hoglake enforces auth
-    token_url: https://hogtower.example/oauth/token
-    client_id: hlc_...
+    token_url: https://issuer.example/oauth/token   # PostHog: hogtower's /oauth/token
+    client_id: ...
     client_secret: ...              # prefer HEDGEROW__SOURCE__AUTH__CLIENT_SECRET
     # audience: hoglake             # default
 

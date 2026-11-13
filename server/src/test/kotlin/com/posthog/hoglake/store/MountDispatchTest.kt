@@ -230,24 +230,16 @@ class MountDispatchTest {
     fun `a scoped caller naming the mount is refused before any service call in warn and enforce`() {
         for (mode in listOf(AuthMode.WARN, AuthMode.ENFORCE)) {
             dispatch(mode) {
-                // The namespace listing: a scoped route the plugin allows outright.
-                assertRefused(
-                    get("/v1/catalogs/$mount/namespaces", scoped()),
-                    HttpStatusCode.NotImplemented,
-                    "mount_operation_unavailable",
-                )
-                // A namespaced read: the gate resolves the catalog and gets the refusal.
-                assertRefused(
-                    get("/v1/catalogs/$mount/namespaces/ingest/tables/events/scan", scoped()),
-                    HttpStatusCode.NotImplemented,
-                    "mount_operation_unavailable",
-                )
+                // A read the mount does not serve (the gate resolves the mount,
+                // skips containment, and the handler gets the binding's refusal);
+                // /scan and the four metadata reads are served (MountReadIntegrationTest).
+                val unserved = "/v1/catalogs/$mount/namespaces/ingest/tables/events/files"
+                assertRefused(get(unserved, scoped()), HttpStatusCode.NotImplemented, "mount_operation_unavailable")
                 // A body-scoped write: the handler resolves the catalog first.
                 assertRefused(commit(scoped("write")), HttpStatusCode.Forbidden, "read_only_catalog")
-                // A token that places the mount on hoglite, on a read the
-                // mount refuses and on the one it serves.
+                // A token that places the mount on hoglite: a mount is never hoglite-backed.
                 val routed = """{"b":"hoglite","be":"$hogliteId","t":"t_1"}"""
-                for (path in listOf("/v1/catalogs/$mount/namespaces", "/v1/catalogs/$mount")) {
+                for (path in listOf(unserved, "/v1/catalogs/$mount")) {
                     assertRefused(
                         get(path, scoped(rtg = routed)),
                         HttpStatusCode.NotImplemented,
@@ -257,7 +249,7 @@ class MountDispatchTest {
                 // A PostgreSQL placement is this process's PostgreSQL: still a mount.
                 val local = """{"b":"postgres","be":"$postgresId"}"""
                 assertRefused(
-                    get("/v1/catalogs/$mount/namespaces", scoped(rtg = local)),
+                    get(unserved, scoped(rtg = local)),
                     HttpStatusCode.NotImplemented,
                     "mount_operation_unavailable",
                 )
@@ -389,15 +381,12 @@ class MountDispatchTest {
         val registry = SimpleMeterRegistry().also { Metrics.bind(it) }
         val routed = """{"b":"hoglite","be":"$hogliteId","t":"t_1"}"""
         val other = "0190f3c4-1b2a-4c3d-8e4f-a5b6c7d8e9f1-events"
+        val unserved = "/v1/catalogs/$mount/namespaces/ingest/tables/events/files"
         dispatch(AuthMode.ENFORCE) {
-            assertRefused(
-                get("/v1/catalogs/$mount/namespaces", scoped()),
-                HttpStatusCode.NotImplemented,
-                "mount_operation_unavailable",
-            )
+            assertRefused(get(unserved, scoped()), HttpStatusCode.NotImplemented, "mount_operation_unavailable")
             assertRefused(commit(scoped("write")), HttpStatusCode.Forbidden, "read_only_catalog")
             assertRefused(
-                get("/v1/catalogs/$mount/namespaces", scoped(rtg = routed)),
+                get(unserved, scoped(rtg = routed)),
                 HttpStatusCode.NotImplemented,
                 "not_supported_on_backend",
             )
@@ -426,15 +415,17 @@ class MountDispatchTest {
         val registry = SimpleMeterRegistry().also { Metrics.bind(it) }
         val table = "namespaces/ingest/tables/events"
         val scan = "$table/scan"
+        // /scan is served on a mount now (1.3h); /files is a read it still refuses.
+        val files = "$table/files"
         val routed = """{"b":"hoglite","be":"$hogliteId","t":"t_1"}"""
         dispatch(AuthMode.ENFORCE) {
             assertRefused(
-                get("/v1/catalogs/$mount/$scan", scoped()),
+                get("/v1/catalogs/$mount/$files", scoped()),
                 HttpStatusCode.NotImplemented,
                 "mount_operation_unavailable",
             )
             assertRefused(
-                get("/v1/catalogs/$mount/$scan", scoped(rtg = routed)),
+                get("/v1/catalogs/$mount/$files", scoped(rtg = routed)),
                 HttpStatusCode.NotImplemented,
                 "not_supported_on_backend",
             )
