@@ -2072,21 +2072,29 @@ with files deviating the same way, drops files it knows DuckDB wrote,
 and packs the rest — the declared layout's, the never-probed, and any
 entry judged against an older declaration — together as before. A
 remembered remainder forms no group until enough files of its layout are
-known, except by a LOAN: while the rest (declared and never-probed)
-form no group of their own, remembered populations are tried largest
-first, and the first is lent the shortest prefix of the never-probed
-files in candidate order, at most `minInputFiles − 1`, such that the planner's packing
-of population + loan forms a group that holds every lent file and a
-population file the population's own packing left out, and that passes
-the sorted-budget shape admission (below). So a population at or past
-the minimum can borrow to complete one of its size bands, and one whose
-layout the budgets refuse is passed over (a loan merely considered is
-not counted as a refusal). Only prefixes are tried, which keeps the
-search bounded and the same every sweep, so a completer queued behind a
-file that doesn't complete is skipped until the candidate order changes.
-The probe sorts the lent files out; at most
-one loan per bucket per sweep, and a lent file is probed and
-remembered, so never lent again. Deviations
+known, except by a LOAN. A never-probed file is IDLE when it is in no
+group of the rest (declared and never-probed) that the planner would
+run: a main group the declared estimate's budget admission (the
+`spill_budget` / `merge_budget` check below) refuses is no work, this
+sweep or any other, so its never-probed files are as idle as those in
+no group, while a group it admits keeps every file it holds. Remembered
+populations are tried largest first, and the first is lent the shortest
+prefix of the idle files in candidate order, at most
+`minInputFiles − 1`, such that the planner's packing of population + loan
+forms a group that holds every lent file and a population file the
+population's own packing left out, and that passes the sorted-budget
+shape admission (below). So a population at or past the minimum can borrow to complete
+one of its size bands, and one whose layout the budgets refuse is passed
+over (a loan merely considered is not counted as a refusal). Only
+prefixes are tried, which keeps the search bounded and the same every
+sweep, so a completer queued behind a file that doesn't complete is
+skipped until the candidate order changes. The probe sorts the lent
+files out; at most one loan per bucket per sweep, and a lent file is
+probed and remembered, so never lent again. A loan that proves to be
+another layout leaves every file of its group where it was, the lent
+file now remembered where it belongs, and is charged as one
+`layout_probe_only` attempt (below): the one speculation a bucket makes
+a sweep, paid once per arrival, never twice for the same file. Deviations
 rather than whole layouts, so a file written before a
 variant column was added (which the rewrite null-fills) packs with later
 files of its layout; the declaration's fingerprint, so DDL
@@ -2116,9 +2124,11 @@ wider than the declaration is refused on its real leaf count without a
 re-probe. A layout the
 budgets refuse is probed and charged once (`layout_probe_only`, below),
 and on every later sweep refused by the planner without reading a
-footer: counted as `spill_budget_exceeded` / `merge_budget_exceeded`
-(ledger and `hoglake_compaction_skipped_total`) like the planner's other
-budget refusals, and not charged to
+footer: counted like the planner's other budget refusals — in the ledger
+as `spill_budget_exceeded` / `merge_budget_exceeded`, in Prometheus as
+`hoglake_compaction_skipped_total{reason="spill_budget"}` /
+`{reason="merge_budget"}` (the metric's labels drop the `_exceeded`; the
+budget section above maps the two) — and not charged to
 `HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN`. Admission is recomputed every
 plan from the current inputs and budgets, so raising
 `HOGLAKE_COMPACTION_SORTED_HEAP_BYTES` / `HOGLAKE_COMPACTION_SPILL_BYTES`
@@ -2146,11 +2156,20 @@ footer, so it is charged as one attempt against
 `layout_probe_only` and in
 `hoglake_compaction_skipped_total{reason="layout_probe_only"}`. A
 budget-refused layout is charged this way only at its first probe; after
-that it recurs as a planner `spill_budget_exceeded` /
-`merge_budget_exceeded` (above), whose levers are
+that it recurs as a planner refusal — ledger `spill_budget_exceeded` /
+`merge_budget_exceeded`, Prometheus
+`hoglake_compaction_skipped_total{reason="spill_budget"}` /
+`{reason="merge_budget"}` (above) — whose levers are
 `HOGLAKE_COMPACTION_SORTED_HEAP_BYTES` / `HOGLAKE_COMPACTION_SPILL_BYTES`.
-So a steady `layout_probe_only` rate means the memory is being lost
-(restarts, its 250k-entry capacity, or shape eviction).
+A recurring `layout_probe_only` rate has one ORDINARY cause: a loan that
+did not pay off. A remembered remainder borrows an arrival (above), the
+probe finds it in another layout, nothing runs, and the attempt is
+charged — once per such arrival, since the arrival is then remembered
+and never lent again, so the rate is bounded by the arrival rate into
+buckets that hold a short remainder, and the remainder's own files are
+not counted again in `files_left` (below). Read a rate past what
+arrivals explain as the memory being lost (restarts, its 250k-entry
+capacity, or shape eviction).
 A group split into N parts spends N attempts, so a sweep can
 run past `HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN` by at most
 (layouts − 1) × `HOGLAKE_COMPACTION_PARALLEL_GROUPS` in its last wave;
@@ -2173,8 +2192,16 @@ layout="declared"|"other"}` — outputs per layout. It measures rewrites
 only: a falling `other` rate means less rewriting in old layouts, not
 that an old layout is gone — and
 `hoglake_compaction_variant_layout_files_left_total{catalog}`, files set
-aside for want of company in their layout (each once, since the memory
-keeps them out of the next plan).
+aside for want of company in their layout: each once per time the memory
+LEARNS it is set aside (the entry records it), since the memory keeps it
+out of the next plan. A remembered file probed again — a remainder as
+the company of a loan that proves to be another layout, a declared file
+beside arrivals that prove so — and left exactly as it was is not
+counted again; the lent file, or the arrivals, are, once, as they are
+learned. Accumulated observations, not distinct live files: a file
+probed again after a restart or an eviction of its entry is learned anew
+and counted anew, so the counter's rate is "files newly set aside", and
+the files still waiting are the maintenance summary's debt.
 
 **A `split` after `set_variant_shredding` is EXPECTED**, for as long as
 files written under the previous declaration remain in a partition beside
@@ -2209,7 +2236,10 @@ a LIST or MAP layer counts as nested, so its chunk is divided by
 `HOGLAKE_COMPACTION_NESTED_SORT_EXPANSION` like a nested column's. Each part is
 re-admitted against its own bounds before its rewrite; a part the wider
 rows push over a budget the declared estimate fit is refused, counted
-with the planner's `spill_budget_exceeded` / `merge_budget_exceeded`.
+with the planner's budget refusals (ledger `spill_budget_exceeded` /
+`merge_budget_exceeded`, Prometheus
+`hoglake_compaction_skipped_total{reason="spill_budget"}` /
+`{reason="merge_budget"}`).
 The refusal is uncharged when another part of the group ran; when no
 part ran, the probe is charged as one `layout_probe_only` attempt
 (above). A part whose output leaf count cannot be computed skips the

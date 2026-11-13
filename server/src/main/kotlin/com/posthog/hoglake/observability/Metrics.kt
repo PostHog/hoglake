@@ -698,10 +698,17 @@ object Metrics {
      * hoglake_compaction_variant_layout_files_left_total{catalog} — inputs
      * of a probed group left uncompacted because too few of its files
      * shared their variant layout to be worth a rewrite
-     * (CompactionGrouping's minimum). Each file counts once: the compactor
-     * remembers its layout and does not plan it again until enough files
-     * of that layout are known, so this is files set aside, not sweeps
-     * spent. They are debt the maintenance summary still reports.
+     * (CompactionGrouping's minimum). Each file counts once per time the
+     * compactor LEARNS it is set aside (VariantLayoutMemory.Known.setAside):
+     * it remembers the file's layout and does not plan it again until
+     * enough files of that layout are known, and a file probed again — a
+     * remainder as the company of a loan (VariantLayoutGroups.borrow) that
+     * proved to be another layout, a declared file beside arrivals that
+     * did — and left again is not counted again. So this is files set
+     * aside, not sweeps spent and not loans missed — but not distinct files
+     * either: one probed again after a restart or an eviction is learned,
+     * and counted, anew. They are debt the maintenance summary still
+     * reports.
      */
     fun compactionVariantLayoutFilesLeft(
         catalog: String,

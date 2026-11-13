@@ -389,6 +389,69 @@ class VariantLayoutGroupsTest {
     }
 
     @Test
+    fun `a main group the budgets refuse reserves no unknowns, and one they admit keeps every file it holds`() {
+        // Four remembered old-layout files, one remembered declared and four
+        // unknowns, all of 100 bytes, at a minimum of five: the main
+        // population packs into one group of five. ADMITTED, that group is
+        // the planner's work and keeps its unknowns (the test above).
+        // REFUSED — the declared estimate puts it past the merge budget, say
+        // for an arrival with more rows than the rest together — it is no
+        // work this sweep or any other, so the four remembered files, which
+        // fit their own shape, borrow from it as if it had never formed.
+        val memory = VariantLayoutMemory()
+        val declared = VariantLayout.fingerprint(DECLARED)
+        val old = VariantLayout.fingerprint(VariantLayoutGroups.deviations(OLD, DECLARED))
+        (1L..4L).forEach { memory.remember(1, it, declared, old) }
+        memory.remember(1, 5, declared, VariantLayoutMemory.NONE)
+        val small = (1..9).map { candidate(it.toLong()) }
+
+        fun divide(
+            files: List<CompactionCandidate>,
+            admitMain: (List<CompactionCandidate>) -> Boolean,
+        ): Pair<List<Long>, VariantLayoutMemory.Populations> {
+            val divided = memory.populations(1, declared, files)
+            val lent = VariantLayoutGroups.borrow(divided, grouping, 5, 64, admitMain = admitMain) { it.fileSizeBytes }
+            return lent.map { it.dataFileId } to divided
+        }
+        val judged = mutableListOf<List<Long>>()
+        val (lent, divided) =
+            divide(small) { group ->
+                judged += group.map { it.dataFileId }
+                false
+            }
+        assertThat(
+            judged,
+        ).describedAs("main's one group, as the planner packs it").containsExactly(listOf(5L, 6L, 7L, 8L, 9L))
+        assertThat(lent).containsExactly(6L)
+        assertThat(divided.main.map { it.dataFileId }).containsExactly(5L, 7L, 8L, 9L)
+        assertThat(divided.unknown.map { it.dataFileId }).containsExactly(7L, 8L, 9L)
+        assertThat(divided.others.single().files.map { it.dataFileId }).containsExactly(1L, 2L, 3L, 4L, 6L)
+        assertThat(divide(small) { true }.first).describedAs("admitted: its files are its own").isEmpty()
+
+        // Two bands in main: the 100-byte files above and five unknown
+        // 4000-byte files, which the dominance split packs apart (three and
+        // two, each a group at this target). Refusing only the large band's
+        // groups lends nothing: their files are idle, but pack apart from
+        // the four 100-byte files too, so no loan would be probed with them.
+        // Refusing only the small band lends from it, and the large band's
+        // files, unknown but in admitted groups, stay where they are.
+        val large = (10..14).map { candidate(it.toLong(), bytes = 4_000) }
+        val both = small + large
+        assertThat(
+            grouping.groups(memory.populations(1, declared, both).main, 5, 64) { it.fileSizeBytes }
+                .map { group -> group.map { it.dataFileId } },
+        ).containsExactly(listOf(5L, 6L, 7L, 8L, 9L), listOf(10L, 11L, 12L), listOf(13L, 14L))
+        val (none, untouched) = divide(both) { group -> group.none { it.fileSizeBytes >= 4_000 } }
+        assertThat(none).isEmpty()
+        assertThat(untouched.unknown.map { it.dataFileId }).containsExactly(6L, 7L, 8L, 9L, 10L, 11L, 12L, 13L, 14L)
+        val (fromSmall, reserved) = divide(both) { group -> group.any { it.fileSizeBytes >= 4_000 } }
+        assertThat(fromSmall).containsExactly(6L)
+        assertThat(reserved.main.map { it.dataFileId }).containsExactly(5L, 7L, 8L, 9L, 10L, 11L, 12L, 13L, 14L)
+        assertThat(reserved.unknown.map { it.dataFileId }).containsExactly(7L, 8L, 9L, 10L, 11L, 12L, 13L, 14L)
+        assertThat(reserved.others.single().files.map { it.dataFileId }).containsExactly(1L, 2L, 3L, 4L, 6L)
+    }
+
+    @Test
     fun `a loan is every file of a prefix or nothing, and only prefixes of the candidate order are tried`() {
         // Two remembered stranded files of 1000 at a minimum of three (a
         // group of files this size needs all three). Unknowns, in candidate
