@@ -258,7 +258,8 @@ dependency change, `uv lock` (from any member, or `just pyhoglake lock`)
 rewrites the one lock. All of them need Python 3.12 or newer.
 
 [AGENT.md](AGENT.md) holds the pre-push checklist, the repository invariants
-and the working conventions.
+and the working conventions. `main` accepts only signed commits; see
+[CONTRIBUTING.md](CONTRIBUTING.md#signed-commits) for the setup.
 
 The wire contract is
 [`openapi/hoglake.yaml`](server/src/main/resources/openapi/hoglake.yaml), and
