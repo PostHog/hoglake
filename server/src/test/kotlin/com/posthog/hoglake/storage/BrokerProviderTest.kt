@@ -454,5 +454,15 @@ class BrokerProviderTest {
             )
         }.isInstanceOf(IllegalArgumentException::class.java).hasMessageContaining("https")
         provider().use { p -> assertThat(p.toString()).contains("127.0.0.1") }
+        // The operator's opt-in: http to any host, no request sent here.
+        BrokerProvider(
+            brokerUrl = URI.create("http://hogtower.hogtower.svc.cluster.local:8080/oauth/credentials"),
+            tokenUrl = URI.create("http://hogtower.hogtower.svc.cluster.local:8080/oauth/token"),
+            clientId = "c",
+            clientSecret = "s",
+            audience = "hoglake",
+            refreshMargin = Duration.ofMinutes(5),
+            allowHttp = true,
+        ).use { p -> assertThat(p.toString()).contains("svc.cluster.local") }
     }
 }
