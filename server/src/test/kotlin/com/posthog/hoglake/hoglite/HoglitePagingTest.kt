@@ -39,6 +39,7 @@ class HoglitePagingTest {
                         sql.startsWith(
                             "SELECT name, data_path,",
                         ) -> listOf(listOf("cat", "s3://b", 4, 0, floor, null, null, 0))
+                        sql == "SELECT earliest_snapshot_id FROM meta WHERE id = 1" -> listOf(listOf(floor))
                         sql.startsWith("SELECT id, name, contained_field") -> listOf(listOf(1, "ns", null, null))
                         sql.startsWith(
                             "SELECT t.id, t.table_uuid, v.namespace_id",

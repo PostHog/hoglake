@@ -1403,9 +1403,12 @@ paths:
     post:
       operationId: runExpiry
       summary: >
-        Run one incremental expiry sweep now (the background loop calls
-        the same path). Bounded per run; never expires head; respects
-        the consumer floor when enabled.
+        Run one incremental expiry sweep now. PostgreSQL background
+        sweeps use the same operation. Hoglite supports manual sweeps
+        through token placement, without a background loop.
+        Each sweep is bounded, preserves head, and respects the enabled
+        consumer floor. Ended file rows enter the removal ledger;
+        expiry does not delete their objects.
       parameters:
         - { $ref: "#/components/parameters/catalog" }
         - { $ref: "#/components/parameters/maintenanceBatch" }

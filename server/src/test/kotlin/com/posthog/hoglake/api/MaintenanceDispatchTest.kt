@@ -76,7 +76,6 @@ class MaintenanceDispatchTest {
             )
         val probes =
             listOf(
-                HttpMethod.Post to "/maintenance/expire?batch=bad",
                 HttpMethod.Post to "/maintenance/cleanup?batch=bad",
                 HttpMethod.Post to "/maintenance/compact?batch=bad",
                 HttpMethod.Get to "/maintenance/status",
@@ -103,6 +102,18 @@ class MaintenanceDispatchTest {
                         assertThat(response.bodyAsText()).contains("\"error\":\"$code\"")
                         assertThat(response.headers[HttpHeaders.RetryAfter]).isNull()
                     }
+                }
+                for ((catalog, status) in listOf(
+                    "lake" to HttpStatusCode.BadRequest,
+                    "other" to HttpStatusCode.NotFound,
+                )) {
+                    val response =
+                        client.request("/v1/catalogs/$catalog/maintenance/expire?batch=bad") {
+                            method = HttpMethod.Post
+                            header(HttpHeaders.Authorization, "Bearer $token")
+                        }
+                    assertThat(response.status).isEqualTo(status)
+                    assertThat(response.headers[HttpHeaders.RetryAfter]).isNull()
                 }
                 val malformedOptions =
                     client.request("/v1/catalogs/lake/options") {

@@ -136,10 +136,9 @@ internal class HogliteAlters(
                             // plan made against a stale value.
                             objectPrefixFieldId = store.layoutAt(catalog, t.tableId, meta.head),
                             // The spec-id allocator is MAX(spec_id) + 1 over EVERY
-                            // spec row, retired ones included (expiry never clears
-                            // them), so the receipt's id is planned from the same
-                            // max — pinned by the schema fence, which every spec
-                            // change bumps — not from the live spec's id.
+                            // spec row, retired ones included, not from the live spec.
+                            // The schema fence protects partition allocation. A separate
+                            // maximum guard also protects sort allocation from expiry.
                             maxSpecId =
                                 store.queryCatalog(
                                     catalog,
@@ -251,6 +250,14 @@ internal class HogliteAlters(
                                 "read_snapshot $readSnapshot is below the expiry floor; re-read the table and re-issue",
                             )
                         }
+                    }
+                    if (ops.any { it is AlterOp.SetSortOrder }) {
+                        // Expiry can remove ended sort specs without changing the schema fence.
+                        tx.expectScalar(
+                            state.maxSortId,
+                            "SELECT COALESCE(MAX(spec_id), 0) FROM sort_specs WHERE table_id = ?",
+                            t.tableId,
+                        ) { ALTER_SCHEMA_CHANGED }
                     }
                     tx.allocateDdlSnapshot()
                     tx.insertSnapshotRow(author, message)

@@ -749,13 +749,17 @@ the newest and both ancestors must go. Same-consumer is load-bearing:
 another consumer that has not reconciled keeps its position and keeps
 pinning.
 
-Two scope notes. The sweep's release is **not** gated on
-`consumer_floor` — the rows are dead either way, and `GET /consumers`
-should not show them — but it *is* gated on
-`snapshot_retention_seconds` being set, because it runs inside the
-sweep; a catalog with retention disabled releases only through
-`commitOffset`. And a released row **disappears from `GET /consumers`**,
-which is a visible contract change from "offsets outlive drops".
+The sweep releases superseded offsets even when retention or consumer
+protection is disabled. A released row disappears from `GET /consumers`.
+An unreconciled consumer keeps its position.
+
+Hoglite supports `POST /v1/catalogs/{catalog}/maintenance/expire` through
+the token's placement. Each call runs one bounded sweep for that catalog.
+The operation advances the retention floor, purges expired metadata,
+and queues ended files in the removal ledger. It does not delete objects.
+`HOGLAKE_EXPIRY_PURGE_PAGE` and `HOGLAKE_EXPIRY_PURGE_BUDGET_MS` bound the
+purge. PostgreSQL keeps its background sweeps. Hoglite has no background
+sweep, catalog registry, or loop lease.
 
 The lineage is **recorded, not derived**: V14 adds
 `hog_table.replaced_table_id`, written by `CatalogService.createTable`
