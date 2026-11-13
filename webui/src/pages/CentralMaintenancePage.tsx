@@ -6,6 +6,7 @@ import type {
   MaintenanceTaskStatus,
 } from "../api/types";
 import { ErrorBox } from "../components/ErrorBox";
+import { OperatorTokenNotice, isOperatorRefusal } from "../components/Auth";
 import { SkeletonRows } from "../components/Skeleton";
 import {
   LedgerUnavailableNotice,
@@ -217,12 +218,16 @@ export function CentralMaintenancePage() {
     queryFn: ({ pageParam }) => getInstanceMaintenanceStatus({ after: pageParam }),
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (page) => page.has_more ? page.next_after : undefined,
-    refetchInterval: 5_000,
+    // Stop polling a route this caller may not read: every 5s refusal
+    // would be one more counted auth failure for nothing. Signing in
+    // resets the query, which starts it again.
+    refetchInterval: (query) => (isOperatorRefusal(query.state.error) ? false : 5_000),
     refetchIntervalInBackground: false,
   });
   const catalogs = status.data?.pages.flatMap((page) => page.catalogs) ?? [];
 
   const ledgerUnavailable = status.isError && isLedgerUnavailable(status.error);
+  const operatorOnly = status.isError && isOperatorRefusal(status.error);
 
   // One cadence per column, from the ledger. A sweep visits every
   // catalog, so the loop keeps the same rhythm for all of them, and the
@@ -244,6 +249,8 @@ export function CentralMaintenancePage() {
       {status.isError &&
         (ledgerUnavailable ? (
           <LedgerUnavailableNotice />
+        ) : operatorOnly ? (
+          <OperatorTokenNotice routes="/v1/maintenance/status and /v1/maintenance/runs" />
         ) : (
           <ErrorBox error={status.error} />
         ))}
