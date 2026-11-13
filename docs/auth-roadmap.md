@@ -96,14 +96,16 @@ means the PR has review approval and is waiting on CI or a merge.
 
 ## Phase 2 — every client authenticates
 
-- [ ] **trino** A fixed-token option (`hoglake.auth.token` / `token-file`)
-      beside client credentials
-- [ ] **millpond** `HOGLAKE_AUTH_*` settings for client credentials or a fixed
-      token, and the auth path in the startup probe —
-      [PostHog/millpond#165](https://github.com/PostHog/millpond/issues/165)
+- [x] **trino** A fixed-token option (`hoglake.auth.token` / `token-file`)
+      beside client credentials; exactly one auth source per catalog —
+      [PostHog/trino#198](https://github.com/PostHog/trino/pull/198)
+- [x] **millpond** `HOGLAKE_AUTH_*` settings for client credentials or a fixed
+      token (through pyhoglake, plus a re-reading token file) —
+      [PostHog/millpond#168](https://github.com/PostHog/millpond/pull/168)
 - [x] **hoglake** millrace: client credentials or a fixed token through
       pyhoglake (`HOGLAKE_AUTH_*`)
-- [ ] **hoglake** webui: a way to present a token —
+- [x] **hoglake** webui: a pasted token, held in sessionStorage and sent as a
+      bearer on every call; SSO/redirect sign-in is a later item —
       [#560](https://github.com/PostHog/hoglake/pull/560)
 - [x] **hoglake** pyhoglake, the DuckDB extension and hedgerow: issuer-neutral
       docs and the extension point described —
@@ -113,8 +115,11 @@ means the PR has review approval and is waiting on CI or a merge.
 
 - [ ] **hogtower** Trino per-login tokens on the hogtower side: PostHog-user
       logins, with a membership version in the cache key
-- [ ] **trino** Per-session tokens: exchange the catalog credential plus the
-      session user at the token URI (RFC 8693), cached per user
+- [ ] **trino** Per-session tokens for the org catalog: exchange the catalog
+      credential plus the session user at the token URI (RFC 8693), cached per
+      user. Built today for the `posthog` schema only
+      (`HoglakeLoginTokenSource`); the catalog's own schemas still present the
+      catalog's token
 - [ ] **trino** Per-session storage: hand the session's vended credentials to
       workers as extra credentials instead of the catalog's static filesystem
       credentials
