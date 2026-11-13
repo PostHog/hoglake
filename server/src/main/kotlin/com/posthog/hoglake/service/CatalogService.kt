@@ -1167,12 +1167,6 @@ class CatalogService(private val jdbi: Jdbi) {
         jdbi.withHandleUnchecked { h ->
             val cat = requireCatalog(h, catalog)
             val at = resolveReadSnapshot(h, cat, snapshot, atTimestamp)
-            val ns = requireNamespace(h, cat, namespace)
-            val t =
-                TableRepo.findAt(h, cat.catalogId, ns.namespaceId, table, at)
-                    ?: throw HoglakeException.NotFound(
-                        "table '$namespace.$table' in catalog '$catalog' at snapshot $at",
-                    )
             // Asked for by the CALLER, not derived from `at`:
             // resolveReadSnapshot returns head when neither parameter is
             // given, so `at` alone cannot tell a head read from a
@@ -1180,6 +1174,12 @@ class CatalogService(private val jdbi: Jdbi) {
             // must answer differently, one from the sample and one from
             // the manifest.
             val timeTravel = snapshot != null || atTimestamp != null
+            val ns = NamespaceRepo.requireForRead(h, cat, namespace, at, pinned = timeTravel)
+            val t =
+                TableRepo.findAt(h, cat.catalogId, ns.namespaceId, table, at)
+                    ?: throw HoglakeException.NotFound(
+                        "table '$namespace.$table' in catalog '$catalog' at snapshot $at",
+                    )
             val sampled =
                 if (totals && !timeTravel) {
                     sampledTotals(h, cat.catalogId, t.tableId)
@@ -1315,13 +1315,7 @@ class CatalogService(private val jdbi: Jdbi) {
                 TableRepo.listLiveSummaries(h, cat.catalogId, ns.namespaceId)
             } else {
                 val at = resolveReadSnapshot(h, cat, snapshot, atTimestamp)
-                // The namespace AT the snapshot, not the live one: a pinned
-                // reader must still list a namespace dropped after its pin.
-                val ns =
-                    NamespaceRepo.findAt(h, cat.catalogId, namespace, at)
-                        ?: throw HoglakeException.NotFound(
-                            "namespace '$namespace' in catalog '$catalog' at snapshot $at",
-                        )
+                val ns = NamespaceRepo.requireForRead(h, cat, namespace, at, pinned = true)
                 TableRepo.listLiveSummaries(h, cat.catalogId, ns.namespaceId, at)
             }
         }
@@ -1343,7 +1337,8 @@ class CatalogService(private val jdbi: Jdbi) {
         jdbi.withHandleUnchecked { h ->
             val cat = requireCatalog(h, catalog)
             val at = resolveReadSnapshot(h, cat, snapshot, atTimestamp)
-            val ns = requireNamespace(h, cat, namespace)
+            val pinned = snapshot != null || atTimestamp != null
+            val ns = NamespaceRepo.requireForRead(h, cat, namespace, at, pinned)
             val t =
                 TableRepo.findAt(h, cat.catalogId, ns.namespaceId, table, at)
                     ?: throw HoglakeException.NotFound(
@@ -1393,7 +1388,8 @@ class CatalogService(private val jdbi: Jdbi) {
         jdbi.withHandleUnchecked { h ->
             val cat = requireCatalog(h, catalog)
             val at = resolveReadSnapshot(h, cat, snapshot, atTimestamp)
-            val ns = requireNamespace(h, cat, namespace)
+            val pinned = snapshot != null || atTimestamp != null
+            val ns = NamespaceRepo.requireForRead(h, cat, namespace, at, pinned)
             val t =
                 TableRepo.findAt(h, cat.catalogId, ns.namespaceId, table, at)
                     ?: throw HoglakeException.NotFound(
@@ -1537,7 +1533,8 @@ class CatalogService(private val jdbi: Jdbi) {
         jdbi.withHandleUnchecked { h ->
             val cat = requireCatalog(h, catalog)
             val at = resolveReadSnapshot(h, cat, snapshot, atTimestamp)
-            val ns = requireNamespace(h, cat, namespace)
+            val pinned = snapshot != null || atTimestamp != null
+            val ns = NamespaceRepo.requireForRead(h, cat, namespace, at, pinned)
             val t =
                 TableRepo.findAt(h, cat.catalogId, ns.namespaceId, table, at)
                     ?: throw HoglakeException.NotFound(
@@ -1607,7 +1604,9 @@ class CatalogService(private val jdbi: Jdbi) {
                         "snapshot instead of consuming this feed",
                 )
             }
-            val ns = requireNamespace(h, cat, namespace)
+            // An explicit to_snapshot pins the feed: its table and namespace
+            // are the ones alive at `to`, as for every other pinned read.
+            val ns = NamespaceRepo.requireForRead(h, cat, namespace, to, pinned = toSnapshot != null)
             val t =
                 TableRepo.findAt(h, cat.catalogId, ns.namespaceId, table, to)
                     ?: throw HoglakeException.NotFound(

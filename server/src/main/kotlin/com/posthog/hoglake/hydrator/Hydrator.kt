@@ -20,6 +20,8 @@ import com.posthog.hoglake.persistence.NamespaceRepo
 import com.posthog.hoglake.persistence.SpecRepo
 import com.posthog.hoglake.persistence.TableRepo
 import com.posthog.hoglake.persistence.bindBigintArrayOrNull
+import com.posthog.hoglake.service.HydratorMaintenanceBackend
+import com.posthog.hoglake.storage.StorageAccess
 import io.github.oshai.kotlinlogging.KotlinLogging
 import org.apache.parquet.hadoop.metadata.ParquetMetadata
 import org.apache.parquet.io.InputFile
@@ -153,7 +155,7 @@ class Hydrator(
      * fixtures keep their rows; `App` passes the configured floor.
      */
     private val minFileBytes: Long = 0,
-) {
+) : HydratorMaintenanceBackend {
     init {
         require(minFileBytes >= 0) { "minFileBytes=$minFileBytes must not be negative" }
     }
@@ -386,6 +388,12 @@ class Hydrator(
                     for ((catalogId, files) in pending.groupBy { it.catalogId }) {
                         tallies[catalogId] = mutableListOf(files.size.toLong(), 0, 0, 0, 0, 0)
                     }
+                    // One store view per catalog the sweep touches, built
+                    // on first use: under `broker` that is one READ
+                    // session per catalog, held for this sweep's reads of
+                    // its files; under the unscoped providers it is the
+                    // shared store and the map stays empty.
+                    val stores = HashMap<Long, ObjectStore>()
                     val prefixFields = prefixFields(h, pending)
                     val keyIndexes = HashMap<Triple<Long, Long, Long>, Int?>()
                     for (file in pending) {
@@ -397,7 +405,7 @@ class Hydrator(
                                 prefixFields[file.catalogId to file.tableId]?.let { fieldId ->
                                     PrefixClaim(fieldId, prefixValue(h, file, fieldId, keyIndexes))
                                 }
-                            val outcome = hydrate(h, file, prefix)
+                            val outcome = hydrate(h, file, prefix, storeFor(h, file.catalogId, stores))
                             if (outcome == Outcome.FAILED) {
                                 tally[2]++
                             } else {
@@ -574,10 +582,10 @@ class Hydrator(
      * registration corrected, cap raised). Recorded in the run ledger as
      * a manual hydrator run.
      */
-    fun rehydrateFailed(
+    override fun rehydrateFailed(
         catalog: String,
-        namespace: String? = null,
-        table: String? = null,
+        namespace: String?,
+        table: String?,
     ): RehydrateResult =
         runStore.recorded(catalog, MaintenanceTask.HYDRATOR, MaintenanceTrigger.MANUAL) {
             rehydrateFailedAudited(catalog, namespace, table)
@@ -672,8 +680,9 @@ class Hydrator(
         h: Handle,
         file: PendingFile,
         prefix: PrefixClaim?,
+        objects: ObjectStore,
     ): Outcome {
-        val footer = readFooter(file)
+        val footer = readFooter(file, objects)
         // The field-id contract check rides the footer we already hold.
         val missingFieldIds = FooterStats.missingFieldIds(footer.fileMetaData.schema)
         val footerRows = footer.blocks.sumOf { it.rowCount }
@@ -926,7 +935,35 @@ class Hydrator(
 
     // ---- footer fetch ------------------------------------------------------
 
-    private fun readFooter(file: PendingFile): ParquetMetadata {
+    /**
+     * The store to read [catalogId]'s files with: the shared store under
+     * an unscoped provider, else a view on the catalog's own read grant,
+     * resolved once per catalog per sweep from its `data_path`. The
+     * lookup runs inside the sweep transaction, under the file's
+     * savepoint, so the one way it can fail — a row that vanished after
+     * the claim, which the claim's locks rule out — marks that file and
+     * nothing else.
+     */
+    private fun storeFor(
+        h: Handle,
+        catalogId: Long,
+        stores: MutableMap<Long, ObjectStore>,
+    ): ObjectStore {
+        if (!store.scoped) return store
+        return stores.getOrPut(catalogId) {
+            val cat =
+                h.createQuery("SELECT name, data_path FROM hog_catalog WHERE catalog_id = :id")
+                    .bind("id", catalogId)
+                    .map { rs, _ -> rs.getString("name") to rs.getString("data_path") }
+                    .one()
+            store.forCatalog(cat.first, cat.second, StorageAccess.READ)
+        }
+    }
+
+    private fun readFooter(
+        file: PendingFile,
+        objects: ObjectStore,
+    ): ParquetMetadata {
         val footerSize = file.footerSize
         if (footerSize != null && footerSize > 0 && footerSize + FOOTER_SUFFIX < file.fileSizeBytes) {
             try {
@@ -938,7 +975,7 @@ class Hydrator(
                 // can trip the size cap and wrongly fail a good registration.
                 val tail =
                     try {
-                        store.getTail(file.path, tailStart)
+                        objects.getTail(file.path, tailStart)
                     } catch (e: Exception) {
                         throw classifyFetchFailure(e, file.path)
                     }
@@ -972,7 +1009,7 @@ class Hydrator(
         }
         val bytes =
             try {
-                store.get(file.path)
+                objects.get(file.path)
             } catch (e: Exception) {
                 throw classifyFetchFailure(e, file.path)
             }

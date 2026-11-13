@@ -220,14 +220,14 @@ A feature-complete control plane, with a Python client, a replication daemon, a
 management console, a native Trino connector, a DuckDB extension and a
 benchmark harness. Everything is tested, and it is deployed as Gigahog in three
 environments — dev, prod-us and prod-eu. Authentication is opt-in: the server
-verifies ES256 bearer tokens and authorizes per catalog when
-`HOGLAKE_AUTH_MODE` is `warn` or `enforce`, and is unauthenticated at `off`,
-which is the default and today's behaviour. Token issuance and per-tenant S3
-credential vending live in
-[`PostHog/hogtower`](https://github.com/PostHog/hogtower), which already owns
-the tenant→IAM-role→bucket mapping and the `sts:AssumeRole` broker; hoglake is
-the resource server that verifies what hogtower mints — see
-[docs/auth-tenancy.md](docs/auth-tenancy.md) §17.
+verifies bearer JWTs against a configured issuer's JWKS and authorizes per
+catalog when `HOGLAKE_AUTH_MODE` is `warn` or `enforce`, is its own issuer at
+`local` (one key, `hoglake token mint` for each client), and is unauthenticated
+at `off`, which is the default. hoglake is a resource server: it issues nothing
+on the request path and calls nothing to decide a request. The issuer is a
+deployment choice — any identity provider that emits hoglake's token contract;
+in PostHog's managed warehouse it is hogtower, PostHog's control plane. See
+[docs/auth.md](docs/auth.md).
 
 Known gaps are tracked as [issues](https://github.com/PostHog/hoglake/issues).
 The larger ones: [#235](https://github.com/PostHog/hoglake/issues/235) (the
@@ -271,7 +271,9 @@ implementations together.
 | Doc | What |
 |---|---|
 | [docs/iceberg-federation.md](docs/iceberg-federation.md) | What the Iceberg REST facade requires of v1: field ids, type mapping, transforms, delete encoding, bounds |
-| [docs/auth-tenancy.md](docs/auth-tenancy.md) | Auth, tenancy and S3 data-plane entitlement: the threat model, per-catalog scopes, STS credential vending, and the phased plan |
+| [docs/auth.md](docs/auth.md) | Authentication and authorization: the resource-server model, the modes, the token contract hoglake owns, storage credentials, and what every client supports |
+| [docs/auth-roadmap.md](docs/auth-roadmap.md) | The cross-repository checklist of what is left to do on auth, ticked as it lands |
+| [docs/auth-tenancy.md](docs/auth-tenancy.md) | Design history behind docs/auth.md: the threat model, per-catalog scopes, and why issuance and S3 vending live outside hoglake |
 | [docs/trino-integration.md](docs/trino-integration.md) | The native connector, and the commit shapes that keep Trino writes a translation away |
 | [docs/operational-notes.md](docs/operational-notes.md) | What hoglake changes operationally and what it does not; sizing, and the ceilings to watch |
 | [docs/kafka-ingestion.md](docs/kafka-ingestion.md) | Kafka ingestion via staged keying: the design obligations millrace implements |
@@ -283,3 +285,10 @@ implementations together.
 ## License
 
 [MIT](LICENSE)
+
+## Internal Hoglite boundary
+
+Hoglite is a private raw-SQL backend for trusted callers.
+Customer metadata grants can address their own backend tenant directly.
+JWT authentication does not make Hoglite a public SQL API or provide TLS.
+S3 permissions remain unchanged.

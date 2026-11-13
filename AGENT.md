@@ -37,6 +37,7 @@ just hedgerow unit
 just millrace unit
 just live-python    # builds this checkout, starts isolated services, fails on skips
 just millrace live  # the Kafka-ingestion live stack (PG + MinIO + Kafka), fails on skips
+just test-hoglite   # the hoglite live classes on the newest hoglited, in a Linux container, fails on skips
 just webui test
 just webui build
 ```
@@ -76,6 +77,19 @@ The server builds through the **checked-in Gradle wrapper**
 `server/gradle/wrapper/gradle-wrapper.properties`) — never a
 system-installed gradle. The `just server ...` recipes route through it
 too, so `just test-all` (server + pyhoglake) stays equivalent.
+
+The hoglite live classes (`com.posthog.hoglake.hoglite.*IntegrationTest`,
+`HogliteConformanceEngine`) need a `hoglited`, which hoglite ships for
+Linux only, so `just server test` SKIPS them on a Mac and that green does
+not cover them; CI's `hoglite-live` (in the required `server-checks`
+gate) runs them against the newest tested build. `just test-hoglite
+[filter]` is the local equivalent: `ci/hoglite-live-local.sh` fetches
+that build for the daemon's arch (`ci/fetch-hoglited.sh`, checksum and
+provenance verified), runs the classes under a Linux JDK container on
+the host's Docker daemon and network, with its own Gradle cache under
+`~/.cache/hoglake/hoglite-live/`, and ends with `ci/check-hoglite-live.sh`,
+the fail-closed check CI runs: classes ran, none skipped. It is not in
+`just test-all` (a container, the GitHub API and a few minutes).
 
 The DuckDB extension is built and tested separately (it is not in
 `just`): `cd duckdb-client && ./test/run-live-tests.sh`, which needs
@@ -1801,9 +1815,11 @@ ran on the local stack and what it showed.
   conforms (typed bounds, Iceberg transforms, DV-only deletes).
 - **Auth**: the ENFORCEMENT layer has landed — JWT verification, the
   route-to-scope table ([server/src/main/kotlin/com/posthog/hoglake/auth/AuthPolicy.kt](server/src/main/kotlin/com/posthog/hoglake/auth/AuthPolicy.kt)),
-  per-catalog scopes, the `HOGLAKE_AUTH_MODE=off|warn|enforce` flag. It is
-  `off` by default, i.e. today's behaviour. TOKEN ISSUANCE does not exist
-  yet, so `enforce` in a real cluster refuses everything; deploy `warn`
+  per-catalog scopes, the `HOGLAKE_AUTH_MODE=off|warn|enforce|local` flag
+  (`local`: the server is its own issuer, key in `HOGLAKE_AUTH_SIGNING_KEY`,
+  tokens from `hoglake token mint`; docs/auth.md "Local issuer"). It is
+  `off` by default, i.e. today's behaviour. `enforce` refuses every caller
+  that has no token from the configured issuer, so deploy `warn` first
   and watch `hoglake_auth_requests_total{outcome="missing"}` until it is
   zero for every `client` class. `warn` PERMITS EVERYTHING `enforce` WOULD REFUSE, including
   `DELETE /v1/catalogs/{catalog}` and the maintenance routes: it is a
@@ -1811,13 +1827,14 @@ ran on the local stack and what it showed.
   writes freely while it is on. Deploy it where that is acceptable, which
   is anywhere the current behaviour is already "no auth at all". `/metrics` on the main port is operator-only; set
   `HOGLAKE_METRICS_PORT` before `enforce` and scrape that infra listener,
-  which serves the same registry with no auth and needs no token. Issuance and per-tenant S3 credential
-  vending live in `PostHog/hogtower`, not here: it already holds the
-  tenant→catalog→IAM-role→bucket mapping, an `sts:AssumeRole` broker and the
-  warehouse-scoped machine credentials. hoglake is a resource server — set
-  `HOGLAKE_AUTH_ISSUER` and `HOGLAKE_AUTH_JWKS_URL` to hogtower's, then flip
-  the mode. [docs/auth-tenancy.md](docs/auth-tenancy.md) §17 has the
-  reasoning and the two-repo stack.
+  which serves the same registry with no auth and needs no token. hoglake is
+  a resource server: it issues nothing on the request path and calls nothing
+  to decide a request. Set `HOGLAKE_AUTH_ISSUER` and `HOGLAKE_AUTH_JWKS_URL`
+  (or `_FILE`) to whichever issuer the deployment runs — any identity
+  provider that emits the token contract in [docs/auth.md](docs/auth.md);
+  PostHog's is hogtower — then flip the mode. hoglake owns the contract and
+  its test vectors; issuers conform to them. Never add code that names
+  hogtower or PostHog teams: the PostHog behaviour is configuration.
 - pyhoglake implements `truncate[W]` partition transforms; the server's
   Transform vocabulary doesn't include truncate yet (client-ready,
   server gap).

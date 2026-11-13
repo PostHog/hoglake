@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link, Outlet, useParams } from "react-router-dom";
 import { checkHealth, getInstanceInfo } from "../api/client";
+import { AuthStatus, SignInPanel } from "./Auth";
 import { formatBytes, formatCompactCount, formatCount } from "../lib/format";
 import {
   applyColorTheme,
@@ -298,11 +299,13 @@ export function Layout() {
           <a href="/openapi.yaml" target="_blank" rel="noreferrer">
             openapi.yaml
           </a>
+          <AuthStatus />
           <ThemeToggle />
           <ColorThemePicker />
           <HealthIndicator />
         </div>
       </header>
+      <SignInPanel />
       <Breadcrumbs />
       <main className="content">
         <Outlet />

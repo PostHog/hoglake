@@ -47,6 +47,7 @@ import com.posthog.hoglake.service.ScanService
 import com.posthog.hoglake.service.TableCreationService
 import com.posthog.hoglake.service.UploadService
 import com.posthog.hoglake.service.ViewService
+import com.posthog.hoglake.storage.StorageCredentialProviders
 import com.posthog.hoglake.store.CatalogStore
 import com.posthog.hoglake.store.CatalogStoreSelector
 import com.posthog.hoglake.store.MountHostResolver
@@ -219,8 +220,18 @@ class App private constructor(
         )
     }
 
+    /**
+     * Where the server's own jobs get S3 credentials — ONE provider,
+     * shared by the read/put store and the delete store, so under
+     * `broker` the token and the per-catalog sessions are fetched once,
+     * not once per store.
+     */
+    private val storageProvider by lazy {
+        StorageCredentialProviders.fromConfig(cfg)
+    }
+
     private val removalStore by lazy {
-        RemovalStore(cfg)
+        RemovalStore(cfg, storageProvider)
     }
 
     /**
@@ -267,7 +278,7 @@ class App private constructor(
 
     /** Shared read/put store: hydrator footer reads + compaction rewrites. */
     private val objectStore by lazy {
-        ObjectStore(cfg)
+        ObjectStore(cfg, storageProvider)
     }
 
     /** One hydrator: the background sweep loop AND the rehydrate route. */
@@ -575,6 +586,18 @@ class App private constructor(
                 val spec = javaClass.getResource("/openapi/hoglake.yaml")!!.readText()
                 call.respondText(spec, ContentType.parse("application/yaml"))
             }
+            // The local issuer's public key (HOGLAKE_AUTH_MODE=local), the
+            // way any issuer publishes one. Read from the API listener's
+            // service on purpose: the public listener's copy is the same key,
+            // and a key is the one thing both doors may hand out.
+            get("/.well-known/jwks.json") {
+                val jwks = this@App.auth.localJwks
+                if (jwks == null) {
+                    call.respondText("not found", status = HttpStatusCode.NotFound)
+                } else {
+                    call.respondText(jwks, ContentType.Application.Json)
+                }
+            }
         }
         app.installApiRoutes(
             catalogSelector,
@@ -586,6 +609,7 @@ class App private constructor(
             // PG at wiring time and break the PG-free / lazy-boot paths. It is
             // built only when a mount actually resolves (PG is the default then).
             mountRead = { mountReadService },
+            reservedNamespaces = cfg.reservedNamespaces,
         )
         app.installTableCreationRoutes(
             { tableCreationService },

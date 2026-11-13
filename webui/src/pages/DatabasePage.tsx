@@ -10,6 +10,7 @@ import {
   type ReplicationSlot,
 } from "../api/client";
 import { ErrorBox } from "../components/ErrorBox";
+import { OperatorTokenNotice, isOperatorRefusal } from "../components/Auth";
 import { SkeletonBlock } from "../components/Skeleton";
 import { formatBytes, formatCount, formatTime } from "../lib/format";
 import { applySort, cmpText, int64Column, nextSort, textColumn } from "../lib/sort";
@@ -416,6 +417,9 @@ export function DatabasePage() {
     refetchOnWindowFocus: false,
   });
 
+  if (error && isOperatorRefusal(error)) {
+    return <OperatorTokenNotice routes="/v1/database/health" />;
+  }
   if (error) return <ErrorBox error={error} />;
   if (isPending) return <SkeletonBlock />;
 

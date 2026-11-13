@@ -14,14 +14,20 @@ info:
 
     Every operation except the four marked `security: []` below
     (`/livez`, `/healthz`, `/metrics`, `/info`) requires
-    `Authorization: Bearer <jwt>`; `/metrics` requires an OPERATOR
-    credential rather than none. The token is an ES256 compact JWS
-    issued by this instance, carrying the
+    `Authorization: Bearer <jwt>` when `HOGLAKE_AUTH_MODE` is `warn` or
+    `enforce`; `/metrics` requires an OPERATOR credential rather than
+    none. The token is an ES256 or RS256 compact JWS issued by the issuer
+    this server is configured to trust (`HOGLAKE_AUTH_ISSUER`, verified
+    against its JWKS; this server issues nothing itself), carrying the
     caller's kind (`ten`), org (`org`), and — for a tenant — a `cat`
-    map from catalog name to the scopes held on it. Scopes are
+    map from catalog name to the scopes held on it. The contract is
+    docs/auth.md. Scopes are
     PER-CATALOG, not global: `read`, `write`, `maintenance`, `admin`,
     nested so that `admin` implies all of them and `maintenance`
-    implies `write`.
+    implies `write`. The same grants may instead be carried in the
+    standard OAuth `scope` claim as space-separated
+    `hoglake:<catalog>:<scope>` values; a token carrying both must
+    have them agree.
 
     Optional `rtg` selects a configured backend for the single `cat` catalog.
     Hoglite uses exactly `b`, `be`, and `t`; PostgreSQL uses `b` and `be`.
@@ -115,6 +121,31 @@ paths:
   # an unready pod leaves the Service). The webui serves its own static
   # /health for its probes and proxies /healthz, /metrics and
   # /openapi.yaml through to the server.
+  /.well-known/jwks.json:
+    servers: [{ url: / }]
+    security: []
+    get:
+      operationId: localJwks
+      summary: >
+        The local issuer's public key (HOGLAKE_AUTH_MODE=local), as a JWKS
+        document — what a backend or a sibling that verifies the same tokens
+        fetches, the way it would fetch any issuer's. 404 in every other mode:
+        the server publishes no key it does not own. See docs/auth.md,
+        "Local issuer".
+      responses:
+        "200":
+          description: The one signing key, public half.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [keys]
+                properties:
+                  keys:
+                    type: array
+                    items: { type: object, additionalProperties: true }
+        "404":
+          description: Not the local issuer (`HOGLAKE_AUTH_MODE` is not `local`).
   /livez:
     servers: [{ url: / }]
     security: []
@@ -382,7 +413,14 @@ paths:
               schema: { $ref: "#/components/schemas/Namespace" }
         "409": { $ref: "#/components/responses/Conflict" }
         "422":
-          description: Name fails the identifier pattern.
+          description: >-
+            Name fails the identifier pattern, or is reserved on this server
+            (`HOGLAKE_RESERVED_NAMESPACES`, matched ignoring ASCII case),
+            error `validation`. A reserved name is refused for every caller
+            and every backend, before any write (a mount catalog answers its
+            own 403 `read_only_catalog` first); a namespace created before
+            its name was reserved keeps working but cannot be created again
+            once dropped.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
@@ -3506,11 +3544,13 @@ components:
       scheme: bearer
       bearerFormat: JWT
       description: >
-        An ES256 compact JWS issued by this instance. Minimum claim
+        An ES256 or RS256 compact JWS from this instance's configured
+        issuer. Minimum claim
         set: `iss` (this instance), `aud`, `sub` (client id or
         service-account subject), `jti`, `exp`, `iat`, `ten`
         (`tenant` | `operator`), and for a tenant `org` plus a `cat`
-        map from catalog name to the scopes held on it. A token NEVER
+        map from catalog name to the scopes held on it (or the same
+        grants as `hoglake:<catalog>:<scope>` values in `scope`). A token NEVER
         carries an object-store credential: S3 access is vended
         separately as short-lived, prefix-confined STS credentials, so
         a leaked control-plane token cannot be replayed against the

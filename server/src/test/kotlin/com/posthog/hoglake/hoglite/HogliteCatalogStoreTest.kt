@@ -12,6 +12,8 @@ import org.assertj.core.api.Assertions.catchThrowable
 import org.assertj.core.api.Assertions.entry
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.params.ParameterizedTest
+import org.junit.jupiter.params.provider.ValueSource
 import java.net.InetSocketAddress
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
@@ -79,6 +81,7 @@ class HogliteCatalogStoreTest {
 
     /** When set, a containment scan read answers with this (status, body). */
     private var scanAnswer: Pair<Int, Map<String, Any?>>? = null
+    private var authorityRefusal: Pair<String, Int>? = null
 
     private val server: HttpServer =
         HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0).apply {
@@ -110,6 +113,8 @@ class HogliteCatalogStoreTest {
         requests += "${ex.requestMethod} $path" + (first?.let { " :: $it" } ?: "")
         val (status, answer) =
             when {
+                path == authorityRefusal?.first ->
+                    authorityRefusal!!.second to mapOf("code" to "refused", "error" to "authority refused")
                 ex.requestMethod == "PUT" -> {
                     tenants.putIfAbsent(tenantId, Tenant())
                     200 to mapOf("ok" to true)
@@ -438,6 +443,43 @@ class HogliteCatalogStoreTest {
     }
 
     // ---- namespace containment -------------------------------------------
+
+    @ParameterizedTest
+    @ValueSource(ints = [401, 403])
+    fun `release authority refusal retains its definite API type`(status: Int) {
+        seed("t-wh-1", "wh")
+        authorityRefusal = "/v1/t/t-wh-1/release" to status
+        val expected =
+            if (status == 401) HoglakeException.Unauthenticated::class.java else HoglakeException.Forbidden::class.java
+        assertThat(catchThrowable { store.dropCatalog("wh", null, null) }).isInstanceOf(expected)
+        assertThat(requests.none { it.startsWith("DELETE") }).isTrue()
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = [404, 409, 413])
+    fun `release preserves existing non-authentication refusal semantics`(status: Int) {
+        seed("t-wh-1", "wh")
+        authorityRefusal = "/v1/t/t-wh-1/release" to status
+        val failure = catchThrowable { store.dropCatalog("wh", null, null) }
+        if (status == 409) {
+            assertThat(failure).isNull()
+            assertThat(requests.any { it.startsWith("DELETE") }).isTrue()
+        } else {
+            assertThat(failure).isExactlyInstanceOf(HogliteRejected::class.java)
+            assertThat((failure as HogliteRejected).status).isEqualTo(status)
+            assertThat(requests.none { it.startsWith("DELETE") }).isTrue()
+        }
+    }
+
+    @Test
+    fun `tenant lifecycle refusal precedes every storage call and fence`() {
+        seed("t-wh-1", "wh")
+        val tenantStore = HogliteCatalogStore(client, { "t-wh-1" }, operatorAuthority = false)
+        assertThat(catchThrowable { tenantStore.dropCatalog("wh", null, null) })
+            .isInstanceOf(HoglakeException.Forbidden::class.java)
+        assertThat(requests).isEmpty()
+        assertThat(tenants["t-wh-1"]!!.dropping).isFalse()
+    }
 
     private val team42 = NamespaceContainment("team_id", 42)
 

@@ -245,6 +245,121 @@ class MaintenanceApiTest {
             )
         }
 
+    @Test
+    fun `options rolls back retention when the floor update fails`() =
+        api { client ->
+            val catalog = "mnt-options-rollback"
+            client.createCatalog(catalog)
+            db.jdbi.useHandleUnchecked { h ->
+                h.execute(
+                    """
+                    CREATE FUNCTION reject_options_floor() RETURNS trigger LANGUAGE plpgsql AS ${'$'}${'$'}
+                    BEGIN
+                        RAISE EXCEPTION 'options-floor-probe';
+                    END
+                    ${'$'}${'$'}
+                    """,
+                )
+                h.execute(
+                    """
+                    CREATE TRIGGER reject_options_floor AFTER UPDATE OF consumer_floor ON hog_catalog
+                    FOR EACH STATEMENT EXECUTE FUNCTION reject_options_floor()
+                    """,
+                )
+            }
+            val patch = """{"snapshot_retention_seconds":60,"consumer_floor":false,
+                "author":"integration-test","message":"Configure retention"}"""
+            try {
+                assertApiError(
+                    client.patchJson("/v1/catalogs/$catalog/options", patch),
+                    HttpStatusCode.InternalServerError,
+                    "internal_error",
+                )
+                val unchanged = body(client.get("/v1/catalogs/$catalog/options"))
+                assertThat(unchanged.has("snapshot_retention_seconds")).isFalse()
+                assertThat(unchanged["consumer_floor"].asBoolean()).isTrue()
+            } finally {
+                db.jdbi.useHandleUnchecked { h ->
+                    h.execute("DROP TRIGGER reject_options_floor ON hog_catalog")
+                    h.execute("DROP FUNCTION reject_options_floor()")
+                }
+            }
+            val retried = body(client.patchJson("/v1/catalogs/$catalog/options", patch))
+            assertThat(retried["snapshot_retention_seconds"].asLong()).isEqualTo(60)
+            assertThat(retried["consumer_floor"].asBoolean()).isFalse()
+        }
+
+    @Test
+    fun `rehydrate rolls back failed updates and records the failure before a retry`() =
+        api { client ->
+            val catalog = "mnt-rehydrate-rollback"
+            client.createCatalog(catalog)
+            db.jdbi.useHandleUnchecked { h ->
+                val catalogId =
+                    h.createQuery("SELECT catalog_id FROM hog_catalog WHERE name = :catalog")
+                        .bind("catalog", catalog).mapTo(Long::class.java).one()
+                h.execute(
+                    "INSERT INTO hog_table (catalog_id, table_id, created_snapshot) VALUES (?, 1, 0)",
+                    catalogId,
+                )
+                h.execute(
+                    """
+                    INSERT INTO hog_data_file (catalog_id, data_file_id, table_id, begin_snapshot,
+                        path, record_count, file_size_bytes, row_id_start, stats_state)
+                    SELECT ?, n, 1, 0, 's3://b/rollback-' || n || '.parquet', 10, 100, (n - 1) * 10, 'failed'
+                    FROM generate_series(1, 2) AS n
+                    """,
+                    catalogId,
+                )
+                h.execute(
+                    """
+                    CREATE FUNCTION reject_rehydrate() RETURNS trigger LANGUAGE plpgsql AS ${'$'}${'$'}
+                    BEGIN
+                        RAISE EXCEPTION 'rehydrate-update-probe';
+                    END
+                    ${'$'}${'$'}
+                    """,
+                )
+                h.execute(
+                    """
+                    CREATE TRIGGER reject_rehydrate AFTER UPDATE OF stats_state ON hog_data_file
+                    FOR EACH STATEMENT EXECUTE FUNCTION reject_rehydrate()
+                    """,
+                )
+            }
+            try {
+                assertApiError(
+                    client.postJson("/v1/catalogs/$catalog/maintenance/rehydrate"),
+                    HttpStatusCode.InternalServerError,
+                    "internal_error",
+                )
+                db.jdbi.useHandleUnchecked { h ->
+                    val states =
+                        h.createQuery(
+                            """
+                            SELECT stats_state FROM hog_data_file
+                            WHERE catalog_id = (SELECT catalog_id FROM hog_catalog WHERE name = :catalog)
+                            """,
+                        ).bind("catalog", catalog).mapTo(String::class.java).list()
+                    assertThat(states).containsExactly("failed", "failed")
+                }
+                val failed = body(client.get("/v1/catalogs/$catalog/maintenance/runs?task=hydrator"))["runs"].single()
+                assertThat(failed["trigger"].asText()).isEqualTo("manual")
+                assertThat(failed["status"].asText()).isEqualTo("failed")
+                assertThat(failed["error"].asText()).contains("rehydrate-update-probe")
+            } finally {
+                db.jdbi.useHandleUnchecked { h ->
+                    h.execute("DROP TRIGGER reject_rehydrate ON hog_data_file")
+                    h.execute("DROP FUNCTION reject_rehydrate()")
+                }
+            }
+            val retry = client.postJson("/v1/catalogs/$catalog/maintenance/rehydrate")
+            assertThat(retry.status).isEqualTo(HttpStatusCode.OK)
+            assertThat(body(retry)["requeued"].asLong()).isEqualTo(2)
+            val history = body(client.get("/v1/catalogs/$catalog/maintenance/runs?task=hydrator"))["runs"]
+            assertThat(history.map { it["status"].asText() }).containsExactly("ok", "failed")
+        }
+
     // ---- maintenance/expire ------------------------------------------------
 
     @Test

@@ -4,6 +4,7 @@ import com.posthog.hoglake.model.HoglakeException
 import com.sun.net.httpserver.HttpServer
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
+import org.assertj.core.api.Assertions.catchThrowable
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.ValueSource
@@ -13,6 +14,14 @@ import java.util.concurrent.atomic.AtomicInteger
 /** Deterministic engine refusals must not invite unchanged retries. */
 class HogliteRefusalMappingTest {
     private val store = HogliteCatalogStore(HogliteClient("http://unused.invalid"), { "opaque_1" })
+
+    @Test
+    fun `backend authority refusals retain authentication semantics`() {
+        assertThat(store.mapRejected("cat", HogliteRejected(401, """{"code":"refused"}""")))
+            .isInstanceOf(HoglakeException.Unauthenticated::class.java)
+        assertThat(store.mapRejected("cat", HogliteRejected(403, """{"code":"refused"}""")))
+            .isInstanceOf(HoglakeException.Forbidden::class.java)
+    }
 
     @ParameterizedTest
     @ValueSource(ints = [400, 409, 422])
@@ -116,6 +125,97 @@ class HogliteRefusalMappingTest {
             assertThat(calls.get()).isEqualTo(2)
         } finally {
             server.stop(0)
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = [401, 403])
+    fun `create batch and fallback boundaries preserve definite authority refusals`(status: Int) {
+        for (mode in listOf("create", "batch", "batch-item", "batch-fallback")) {
+            val calls = AtomicInteger()
+            val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+            server.createContext("/") { ex ->
+                ex.requestBody.readBytes()
+                calls.incrementAndGet()
+                val batch = ex.requestURI.path == "/v1/query-batch"
+                val body =
+                    when {
+                        batch && mode == "batch-fallback" -> "{}"
+                        batch && mode == "batch-item" ->
+                            """{"results":[{"status":$status,"body":{"code":"refused"}}]}"""
+                        else -> """{"code":"refused"}"""
+                    }.toByteArray()
+                val responseStatus =
+                    when {
+                        batch && mode == "batch-fallback" -> 404
+                        batch && mode == "batch-item" -> 200
+                        else -> status
+                    }
+                ex.sendResponseHeaders(responseStatus, body.size.toLong())
+                ex.responseBody.use { it.write(body) }
+            }
+            server.start()
+            try {
+                HogliteClient("http://127.0.0.1:${server.address.port}").use { client ->
+                    val selected = HogliteCatalogStore(client, { "opaque_1" })
+                    val expected =
+                        if (status == 401) {
+                            HoglakeException.Unauthenticated::class.java
+                        } else {
+                            HoglakeException.Forbidden::class.java
+                        }
+                    assertThatThrownBy {
+                        if (mode == "create") {
+                            selected.createCatalog("cat", "s3://bucket/cat", null, null)
+                        } else {
+                            selected.listCatalogs(setOf("cat"))
+                        }
+                    }.isInstanceOf(expected)
+                    assertThat(calls.get()).isEqualTo(if (mode == "batch-fallback") 2 else 1)
+                }
+            } finally {
+                server.stop(0)
+            }
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = [404, 409, 413])
+    fun `new authority wrappers preserve non-authentication rejection semantics`(status: Int) {
+        for (mode in listOf("create", "batch")) {
+            val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+            val body = """{"code":"result_too_large","error":"whole request rejected"}"""
+            server.createContext("/") { ex ->
+                ex.requestBody.readBytes()
+                val bytes = body.toByteArray()
+                ex.sendResponseHeaders(status, bytes.size.toLong())
+                ex.responseBody.use { it.write(bytes) }
+            }
+            server.start()
+            try {
+                HogliteClient("http://127.0.0.1:${server.address.port}").use { client ->
+                    val selected = HogliteCatalogStore(client, { "opaque_$it" })
+                    val failure =
+                        catchThrowable {
+                            if (mode == "create") {
+                                selected.createCatalog("cat", "s3://bucket/cat", null, null)
+                            } else {
+                                selected.listCatalogs(setOf("first", "second"))
+                            }
+                        }
+                    if (status == 409 && mode == "create") {
+                        // Creation's idempotent 409 proceeds to its existing bootstrap guard classification.
+                        assertThat(failure).isExactlyInstanceOf(HoglakeException.CommitConflict::class.java)
+                    } else {
+                        assertThat(failure).isExactlyInstanceOf(HogliteRejected::class.java)
+                        val refused = failure as HogliteRejected
+                        assertThat(refused.status).isEqualTo(status)
+                        assertThat(refused.body).isEqualTo(body)
+                    }
+                }
+            } finally {
+                server.stop(0)
+            }
         }
     }
 }
