@@ -5,10 +5,15 @@ import com.posthog.hoglake.Config
 import com.posthog.hoglake.auth.Routing
 import com.posthog.hoglake.auth.hoglakeAuth
 import com.posthog.hoglake.auth.verifiedBackendToken
+import com.posthog.hoglake.compaction.CompactionConfig
+import com.posthog.hoglake.compaction.ParquetRewriter
 import com.posthog.hoglake.hoglite.HogliteCatalogStore
 import com.posthog.hoglake.hoglite.HogliteClient
+import com.posthog.hoglake.hoglite.HogliteCompaction
+import com.posthog.hoglake.hoglite.HogliteCompactionCursors
 import com.posthog.hoglake.hoglite.HoglitePartitionLookupAdmission
 import com.posthog.hoglake.hoglite.HogliteTenantResolver
+import com.posthog.hoglake.hydrator.ObjectStore
 import com.posthog.hoglake.model.CatalogInfo
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.observability.Metrics
@@ -44,9 +49,12 @@ class CatalogStoreSelector(
      * Client (Config refuses both at boot).
      */
     private val mountHosts: MountHostResolver = MountHostResolver.NONE,
+    /** The server owns this store. Compaction borrows it for one request. */
+    private val objectStore: () -> ObjectStore = { error("compaction object store is not configured") },
 ) : CatalogRegistry {
     private val clients = ConcurrentHashMap<UUID, HogliteClient>()
     private val lookupAdmissions = ConcurrentHashMap<UUID, HoglitePartitionLookupAdmission>()
+    private val compactionCursors = ConcurrentHashMap<UUID, HogliteCompactionCursors>()
     private val requestStore = AttributeKey<HogliteCatalogStore>("HoglakeCatalogStore")
 
     /**
@@ -330,7 +338,16 @@ class CatalogStoreSelector(
         call: ApplicationCall,
         catalog: String,
         postgres: () -> CompactionBackend,
-    ): CompactionBackend = postgresMaintenance(call, catalog, postgres)
+    ): CompactionBackend =
+        (forCatalog(call, catalog) as? HogliteCatalogStore)?.let {
+            HogliteCompaction(
+                it, objectStore(), hogliteCompactionConfig(),
+                cursors =
+                    compactionCursors.computeIfAbsent(checkNotNull(call.hoglakeAuth.callerOrNull?.routing).backendId) {
+                        HogliteCompactionCursors()
+                    },
+            )
+        } ?: postgres()
 
     fun retirement(
         call: ApplicationCall,
@@ -447,6 +464,36 @@ class CatalogStoreSelector(
             expiryPurgePage = cfg.expiryPurgePage,
             expiryPurgeBudgetMs = cfg.expiryPurgeBudgetMs,
         )
+
+    private fun hogliteCompactionConfig(): CompactionConfig {
+        val c = checkNotNull(cfg)
+        return CompactionConfig(
+            targetBytes = c.compactionTargetBytes,
+            minInputFiles = c.compactionMinInputFiles,
+            maxInputFiles = c.compactionMaxInputFiles,
+            maxGroupsPerRun = c.compactionMaxGroupsPerRun,
+            candidateHeadroom = c.compactionCandidateHeadroom,
+            maxCandidates = c.compactionMaxCandidates,
+            maxFanIn = c.compactionMaxFanIn,
+            parallelGroups = c.compactionParallelGroups,
+            inputOpenParallelism = c.compactionParallelInputOpens,
+            claimsEnabled = c.compactionClaimsEnabled,
+            claimTtlSeconds = c.compactionClaimTtlSeconds,
+            nestedSortExpansion = c.compactionNestedSortExpansion,
+            sortedHeapBytes = c.compactionSortedHeapBytes,
+            spillBytes = c.compactionSpillBytes,
+            spillDir = java.nio.file.Path.of(c.compactionSpillDir),
+            verifyMinBytes = c.compactionVerifyMinBytes,
+            maxNodesPerRow = c.compactionMaxNodesPerRow,
+            codec =
+                ParquetRewriter.OutputCodec.parse(
+                    c.compactionCodec,
+                    c.compactionZstdLevel,
+                ),
+            variantCompaction = c.compactionVariant,
+            variantCompactionCatalogs = c.compactionVariantCatalogs,
+        )
+    }
 
     private fun client(id: UUID): HogliteClient =
         clients.computeIfAbsent(id) {

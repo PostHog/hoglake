@@ -36,8 +36,11 @@ info:
     Invalid shapes, unknown routing keys, and multiple catalogs return 401
     `invalid_token`. Hoglite listings include only the routed catalog.
 
-    Hoglite supports catalog options. Other maintenance operations and publications
+    Hoglite supports catalog options, manual expiry, retirement, compaction,
+    and failed-file requeue. Other maintenance operations and publications
     return 501 `not_supported_on_backend`.
+    Manual compaction uses the server's object-store configuration.
+    It does not start background work.
     Engine result limits return 422 `backend_result_too_large`; query deadlines
     return 422 `backend_query_timeout`. Narrow the query before retrying.
     These deterministic refusals do not carry Retry-After.

@@ -16,6 +16,9 @@ import com.posthog.hoglake.model.TableDeletes
 import com.posthog.hoglake.model.Transform
 import com.posthog.hoglake.persistence.PartialResult
 import com.posthog.hoglake.testing.TestImages
+import io.ktor.client.request.header
+import io.ktor.client.request.post
+import io.ktor.client.statement.bodyAsText
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.BeforeAll
@@ -796,6 +799,75 @@ class HogliteCompactionIntegrationTest {
         assertThat(result.failedGroups).isEqualTo(1)
         assertThat(result.groupsCompacted).isEqualTo(1)
         assertLedger(cat, result)
+    }
+
+    @Test
+    fun `manual compaction uses token placement configured budgets and the shared object store without PostgreSQL`() {
+        val cat = fixture()
+        appendReal(cat, "a.parquet", 4)
+        appendReal(cat, "b.parquet", 4)
+        val backend = UUID.randomUUID()
+        val file = Files.createTempFile("compaction-backends", ".json")
+        Files.writeString(file, """{"backends":[{"id":"$backend","kind":"hoglite","url":"${engine.url()}"}]}""")
+        val config =
+            cfg().copy(
+                defaultBackend = "none",
+                backendsFile = file.toString(),
+                authMode = "enforce",
+                jdbcUrl = "jdbc:no-such-driver:must-not-open",
+                compactionTargetBytes = 1L shl 30,
+                compactionMinInputFiles = 2,
+                compactionMaxInputFiles = 2,
+                compactionMaxFanIn = 2,
+            )
+        val pair = com.posthog.hoglake.auth.TestTokens.keyPair()
+        val auth =
+            com.posthog.hoglake.auth.AuthService(
+                com.posthog.hoglake.auth.AuthMode.ENFORCE,
+                com.posthog.hoglake.auth.JwtVerifier(
+                    com.posthog.hoglake.auth.TestTokens.ISSUER,
+                    com.posthog.hoglake.auth.TestTokens.AUDIENCE,
+                    com.posthog.hoglake.auth.StaticSigningKeys(
+                        com.posthog.hoglake.auth.TestTokens.KID,
+                        pair.public as java.security.interfaces.ECPublicKey,
+                    ),
+                    backends = config.backendKinds,
+                ),
+            )
+        val tenant = HogliteConformanceEngine.TENANTS.tenantFor(cat)
+        val token =
+            com.posthog.hoglake.auth.TestTokens.mint(
+                pair,
+                com.posthog.hoglake.auth.TestTokens.operatorClaims().dropLast(1) +
+                    """, "cat":{"$cat":["admin"]}, "rtg":{"b":"hoglite","be":"$backend","t":"$tenant"}}""",
+            )
+        try {
+            com.posthog.hoglake.App.build(config).use { app ->
+                io.ktor.server.testing.testApplication {
+                    application { app.module(this, auth) }
+                    val response =
+                        client.post("/v1/catalogs/$cat/maintenance/compact?batch=1") {
+                            header(io.ktor.http.HttpHeaders.Authorization, "Bearer $token")
+                        }
+                    assertThat(response.status).isEqualTo(io.ktor.http.HttpStatusCode.OK)
+                    assertThat(store.json.readTree(response.bodyAsText())["groups_compacted"].asLong()).isEqualTo(1)
+                    val foreign =
+                        client.post("/v1/catalogs/another/maintenance/compact") {
+                            header(io.ktor.http.HttpHeaders.Authorization, "Bearer $token")
+                        }
+                    assertThat(foreign.status).isEqualTo(io.ktor.http.HttpStatusCode.NotFound)
+                    val invalid =
+                        client.post("/v1/catalogs/$cat/maintenance/compact?batch=0") {
+                            header(io.ktor.http.HttpHeaders.Authorization, "Bearer $token")
+                        }
+                    assertThat(invalid.status).isEqualTo(io.ktor.http.HttpStatusCode.UnprocessableEntity)
+                }
+            }
+        } finally {
+            Files.deleteIfExists(file)
+        }
+        val output = q(cat, "SELECT path FROM files WHERE end_snapshot IS NULL").rows.single()[0].asString()
+        assertThat(rowIds(output)).containsExactly(0L, 1L, 2L, 3L)
     }
 
     @Test
