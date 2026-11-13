@@ -90,8 +90,9 @@ means the PR has review approval and is waiting on CI or a merge.
 - [x] **hogtower** The broker's server side: a service credential per hoglake
       deployment bound to its id; the vend refuses a catalog that does not
       live on the calling hoglake and never returns more than one catalog — [PostHog/hogtower#198](https://github.com/PostHog/hogtower/pull/198); `delete` as its own access level, cleanup only — [#597](https://github.com/PostHog/hoglake/pull/597)
-- [ ] **hoglake** Decide whether `jti` stays required; multi-issuer
-      verification, or document running issuers behind one `iss`
+- [x] **hoglake** Decided: `jti` stays required (the audit and access logs
+      name tokens by it); one issuer per server, several signers behind one
+      `iss` and one JWKS, no multi-issuer verification — `docs/auth.md`
 
 ## Phase 2 — every client authenticates
 
