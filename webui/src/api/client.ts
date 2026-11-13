@@ -1,5 +1,12 @@
 // The single typed API client. All requests are same-origin; the Vite dev
 // server proxies /v1, /healthz and /openapi.yaml to the hoglake server.
+//
+// Every authenticated call goes through `authorized` below, which adds
+// `Authorization: Bearer` when the user has signed in (src/lib/auth.ts) and
+// hands a 401 back to the sign-in state. The two calls that bypass it are
+// deliberate: /healthz is PUBLIC and polled every 10s, so a credential on it
+// buys nothing; /openapi.yaml is a plain link (PUBLIC too), and a link cannot
+// carry a header.
 
 import type {
   ApiErrorBody,
@@ -27,6 +34,7 @@ import type {
   TableSummary,
 } from "./types";
 import { parseInt64Json } from "./int64";
+import { challengeError, currentToken, unauthorized } from "../lib/auth";
 
 export class ApiError extends Error {
   readonly status: number;
@@ -79,15 +87,56 @@ async function parseError(res: Response): Promise<ApiError> {
   return new ApiError(res.status, body, res.headers.get("Retry-After") ?? undefined);
 }
 
-async function request<T>(url: string, init?: RequestInit): Promise<T> {
+/**
+ * `fetch` with the held bearer token, if any. With no token the request is
+ * exactly what it was before auth existed, which is the whole of the `off`
+ * path. A 401 is reported to the sign-in state with the token that was sent
+ * and the challenge's reason (`WWW-Authenticate` first: it is the RFC 6750
+ * contract; the body's `error` carries the same code).
+ */
+async function authorized(
+  url: string,
+  init: RequestInit & { headers: Record<string, string> },
+): Promise<Response> {
+  const token = currentToken();
   const res = await fetch(url, {
     ...init,
-    headers: {
-      Accept: "application/json",
-      ...(init?.body ? { "Content-Type": "application/json" } : {}),
-      ...init?.headers,
-    },
+    headers: token ? { ...init.headers, Authorization: `Bearer ${token}` } : init.headers,
   });
+  if (res.status === 401) {
+    const reason =
+      challengeError(res.headers.get("WWW-Authenticate")) ??
+      (await bodyError(res.clone()));
+    unauthorized(token, reason);
+  }
+  return res;
+}
+
+async function bodyError(res: Response): Promise<string | undefined> {
+  try {
+    const json = (await res.json()) as unknown;
+    if (json && typeof json === "object" && "error" in json) {
+      const error = (json as { error: unknown }).error;
+      return typeof error === "string" ? error : undefined;
+    }
+  } catch {
+    // Not JSON.
+  }
+  return undefined;
+}
+
+async function request<T>(url: string, init?: RequestInit): Promise<T> {
+  const res = await authorized(
+    url,
+    {
+      ...init,
+      headers: {
+        Accept: "application/json",
+        ...(init?.body ? { "Content-Type": "application/json" } : {}),
+        ...(init?.headers as Record<string, string> | undefined),
+      },
+    },
+  );
   if (!res.ok) throw await parseError(res);
   // Parse from the raw text so int64 fields survive exactly (never rounded
   // through a double). See src/api/int64.ts.
@@ -458,9 +507,12 @@ export function getInstanceInfo(): Promise<InstanceInfo> {
  * src/lib/prometheus.ts.
  */
 export async function fetchMetricsText(): Promise<string> {
-  const res = await fetch("/metrics", { headers: { Accept: "text/plain" } });
+  // OPERATOR on the server (auth/AuthPolicy.kt), so it carries the token.
+  const res = await authorized("/metrics", { headers: { Accept: "text/plain" } });
   if (!res.ok) {
-    throw new Error(`GET /metrics failed: HTTP ${res.status}`);
+    // A typed error, so the page can tell an operator refusal (401/403)
+    // from an outage and stop polling a route this caller may not read.
+    throw await parseError(res);
   }
   return res.text();
 }

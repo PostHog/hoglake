@@ -121,6 +121,31 @@ paths:
   # an unready pod leaves the Service). The webui serves its own static
   # /health for its probes and proxies /healthz, /metrics and
   # /openapi.yaml through to the server.
+  /.well-known/jwks.json:
+    servers: [{ url: / }]
+    security: []
+    get:
+      operationId: localJwks
+      summary: >
+        The local issuer's public key (HOGLAKE_AUTH_MODE=local), as a JWKS
+        document — what a backend or a sibling that verifies the same tokens
+        fetches, the way it would fetch any issuer's. 404 in every other mode:
+        the server publishes no key it does not own. See docs/auth.md,
+        "Local issuer".
+      responses:
+        "200":
+          description: The one signing key, public half.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [keys]
+                properties:
+                  keys:
+                    type: array
+                    items: { type: object, additionalProperties: true }
+        "404":
+          description: Not the local issuer (`HOGLAKE_AUTH_MODE` is not `local`).
   /livez:
     servers: [{ url: / }]
     security: []
