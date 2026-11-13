@@ -80,8 +80,8 @@ fun Application.installMaintenanceRoutes(
                     call.respond(backend.get(call.maintenanceCatalog()).toDto())
                 }
                 patch {
-                    // Refuse unsupported placement before parsing. Build PostgreSQL options only after a valid body.
-                    selector?.requirePostgres(call, call.maintenanceCatalog())
+                    // Resolve placement before parsing. Build PostgreSQL options only after a valid body.
+                    selector?.forCatalog(call, call.maintenanceCatalog())
                     val req = OptionsPatchRequest.from(call.receive<JsonNode>())
                     val backend = selector?.options(call, call.maintenanceCatalog()) { options } ?: options
                     call.respond(

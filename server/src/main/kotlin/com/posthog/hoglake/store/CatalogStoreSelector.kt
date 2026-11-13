@@ -283,7 +283,7 @@ class CatalogStoreSelector(
         postgres: () -> PartitionLookupBackend,
     ): PartitionLookupBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.partitionLookup ?: postgres()
 
-    /** Resolve catalog maintenance before the PostgreSQL provider runs. Hoglite stays unsupported. */
+    /** Resolve options through the same request-scoped store as catalog operations. */
     fun options(
         call: ApplicationCall,
         catalog: String,
@@ -294,7 +294,7 @@ class CatalogStoreSelector(
         call: ApplicationCall,
         catalog: String,
         postgres: () -> OptionsBackend,
-    ): OptionsBackend = postgresMaintenance(call, catalog, postgres)
+    ): OptionsBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.options ?: postgres()
 
     fun expiry(
         call: ApplicationCall,
@@ -403,28 +403,47 @@ class CatalogStoreSelector(
             BackendKind.POSTGRES -> postgres ?: throw HoglakeException.NotFound("catalog '${routing.catalog}'")
             BackendKind.HOGLITE ->
                 call.attributes.computeIfAbsent(requestStore) {
-                    HogliteCatalogStore(
+                    hogliteStore(
+                        routing,
                         client(routing.backendId).forRequest(call.verifiedBackendToken),
-                        HogliteTenantResolver { catalog ->
-                            if (catalog == routing.catalog) {
-                                checkNotNull(routing.tenant)
-                            } else {
-                                throw HoglakeException.NotFound("catalog '$catalog'")
-                            }
-                        },
-                        refuseBlindPartitionedAppends = checkNotNull(cfg).refuseBlindPartitionedAppends,
-                        ledgerRetentionSeconds = cfg.removalLedgerRetentionSeconds,
-                        smallFileThresholdBytes = cfg.compactionTargetBytes,
-                        minInputFiles = cfg.compactionMinInputFiles,
-                        maxInputFiles = cfg.compactionMaxInputFiles,
-                        partitionLookupAdmission =
-                            lookupAdmissions.computeIfAbsent(routing.backendId) {
-                                HoglitePartitionLookupAdmission()
-                            },
                         operatorAuthority = call.hoglakeAuth.callerOrNull?.kind?.isOperator() != false,
                     )
                 }
         }
+
+    /** Build a store from trusted placement. This method does not discover catalogs or start background work. */
+    fun forPlacement(placement: Routing): CatalogStore =
+        when (placement.backend) {
+            BackendKind.POSTGRES -> postgres ?: throw HoglakeException.NotFound("catalog '${placement.catalog}'")
+            BackendKind.HOGLITE -> hogliteStore(placement, client(placement.backendId), operatorAuthority = true)
+        }
+
+    /** Share store construction without sharing request authority. */
+    private fun hogliteStore(
+        placement: Routing,
+        client: HogliteClient,
+        operatorAuthority: Boolean,
+    ): HogliteCatalogStore =
+        HogliteCatalogStore(
+            client,
+            HogliteTenantResolver { catalog ->
+                if (catalog == placement.catalog) {
+                    checkNotNull(placement.tenant)
+                } else {
+                    throw HoglakeException.NotFound("catalog '$catalog'")
+                }
+            },
+            refuseBlindPartitionedAppends = checkNotNull(cfg).refuseBlindPartitionedAppends,
+            ledgerRetentionSeconds = cfg.removalLedgerRetentionSeconds,
+            smallFileThresholdBytes = cfg.compactionTargetBytes,
+            minInputFiles = cfg.compactionMinInputFiles,
+            maxInputFiles = cfg.compactionMaxInputFiles,
+            partitionLookupAdmission =
+                lookupAdmissions.computeIfAbsent(placement.backendId) {
+                    HoglitePartitionLookupAdmission()
+                },
+            operatorAuthority = operatorAuthority,
+        )
 
     private fun client(id: UUID): HogliteClient =
         clients.computeIfAbsent(id) {
