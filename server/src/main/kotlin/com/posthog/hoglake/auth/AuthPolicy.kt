@@ -274,6 +274,7 @@ object AuthPolicy {
             // ---- commits ---------------------------------------------------
             Entry(HttpMethod.Post, "/v1/catalogs/$CATALOG/commit", Requirement.WRITE),
             Entry(HttpMethod.Post, "/v1/catalogs/$CATALOG/commit/prepared", Requirement.WRITE),
+            Entry(HttpMethod.Post, "/v1/catalogs/$CATALOG/commit/replacements/prepared", Requirement.WRITE),
             Entry(HttpMethod.Post, "/v1/catalogs/$CATALOG/commit/deletes/prepared", Requirement.WRITE),
             Entry(HttpMethod.Post, "/v1/catalogs/$CATALOG/commit/mutations/prepared", Requirement.WRITE),
             Entry(HttpMethod.Post, "/v1/catalogs/$CATALOG/commit/transaction", Requirement.WRITE),
@@ -544,6 +545,7 @@ object AuthPolicy {
         setOf(
             HttpMethod.Post to "/v1/catalogs/$CATALOG/commit",
             HttpMethod.Post to "/v1/catalogs/$CATALOG/commit/prepared",
+            HttpMethod.Post to "/v1/catalogs/$CATALOG/commit/replacements/prepared",
             HttpMethod.Post to "/v1/catalogs/$CATALOG/commit/deletes/prepared",
             HttpMethod.Post to "/v1/catalogs/$CATALOG/commit/mutations/prepared",
             HttpMethod.Post to "/v1/catalogs/$CATALOG/commit/transaction",

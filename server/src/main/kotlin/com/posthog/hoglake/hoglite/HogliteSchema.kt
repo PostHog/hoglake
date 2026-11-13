@@ -48,6 +48,18 @@ internal object HogliteSchema {
     /** Numeric storage-execution time, using SQLite's timestamp parser. */
     const val CREATION_NOW_SQL = "julianday('now')"
 
+    /**
+     * The data files a replacement ended, by its idempotency key: what a replay and
+     * GET /commit/receipts answer with. A table of its own because tenants have no
+     * migrations, so the column Postgres added to its receipts is not available;
+     * every replacement creates it if missing, and a reader checks it exists.
+     */
+    const val RECEIPT_ENDED_DDL =
+        """CREATE TABLE IF NOT EXISTS receipt_ended(
+                idempotency_key TEXT PRIMARY KEY,
+                ended_files INTEGER NOT NULL
+            )"""
+
     /*
      * The object-prefix layout (`set_object_prefix_field`), Postgres V29's
      * hog_table_layout: versioned like the spec rows, at most one live row
@@ -311,6 +323,7 @@ internal object HogliteSchema {
                 schema_version INTEGER NOT NULL,
                 created_at TEXT NOT NULL
             )""",
+            RECEIPT_ENDED_DDL,
             """CREATE TABLE IF NOT EXISTS offsets(
                 consumer_id TEXT NOT NULL,
                 table_uuid TEXT NOT NULL,

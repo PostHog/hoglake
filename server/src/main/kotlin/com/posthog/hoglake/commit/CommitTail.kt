@@ -255,7 +255,7 @@ internal object CommitTail {
                AND c.snapshot_id > CAST(:readSnapshot AS bigint)
                AND c.object_id = ANY(ARRAY(SELECT table_id FROM resolved))
                AND (c.kind IN ('table_dropped', 'table_altered') OR
-                    (c.kind IN ('table_created', 'table_inserted_into', 'table_deleted_from')
+                    (c.kind IN ('table_created', 'table_inserted_into', 'table_deleted_from', 'table_replaced')
                      AND c.object_id = ANY(ARRAY(SELECT table_id FROM resolved WHERE unchanged))))
         ),
         claims AS MATERIALIZED (
@@ -510,7 +510,10 @@ internal object CommitTail {
         val table: String,
         /** Appended to: its spec, live columns and next_row_id are read. */
         val appending: Boolean,
-        /** A delete target of a guarded request: row-content changes conflict too. */
+        /**
+         * A delete target of a guarded request, or a table whose files an
+         * `all_files` replacement ends: row-content changes conflict too.
+         */
         val unchanged: Boolean,
     )
 

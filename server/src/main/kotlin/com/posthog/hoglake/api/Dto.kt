@@ -31,6 +31,7 @@ import com.posthog.hoglake.model.SnapshotResolution
 import com.posthog.hoglake.model.StatsState
 import com.posthog.hoglake.model.TableAppend
 import com.posthog.hoglake.model.TableDeletes
+import com.posthog.hoglake.model.TableFileEnds
 import com.posthog.hoglake.model.TableInfo
 import com.posthog.hoglake.model.TableSummaryInfo
 import com.posthog.hoglake.model.ViewInfo
@@ -107,6 +108,7 @@ data class CatalogDto(
             "claimed-uploads-v1",
             "atomic-dml-transactions-v1",
             "object-prefix-layout-v1",
+            "atomic-partition-replacement-v1",
         ),
     /**
      * Live totals from the metrics sampler's last pass — display
@@ -545,11 +547,57 @@ data class CommitRequestDto(
         )
 }
 
-data class CommitReceiptDto(val operationId: UUID, val snapshotId: Long, val schemaVersion: Long)
+data class TableFileEndsDto(
+    val namespace: String,
+    val table: String,
+    val expectedTableUuid: UUID,
+    val partitions: List<List<String?>>? = null,
+    val allFiles: Boolean = false,
+) {
+    fun toModel() = TableFileEnds(namespace, table, expectedTableUuid, partitions, allFiles)
+}
 
-data class CommitResultDto(val snapshotId: Long, val schemaVersion: Long)
+/**
+ * The body of `POST /commit/replacements/prepared`: a [CommitRequestDto] plus
+ * [fileEnds]. A separate type so the older commit routes keep rejecting
+ * `file_ends` as an unknown property rather than ignoring it. `deletes` and
+ * `require_unchanged_tables` are accepted only so the route can refuse them
+ * with the 400 the contract names, instead of a parse error that says less.
+ */
+data class ReplacementRequestDto(
+    val readSnapshot: Long? = null,
+    val appends: List<TableAppendDto> = emptyList(),
+    val deletes: List<TableDeletesDto> = emptyList(),
+    @JsonDeserialize(using = OperationTextDeserializer::class)
+    val author: String? = null,
+    @JsonDeserialize(using = OperationTextDeserializer::class)
+    val message: String? = null,
+    val idempotencyKey: UUID? = null,
+    val requireUnchangedTables: Boolean? = null,
+    val fileEnds: List<TableFileEndsDto>? = null,
+) {
+    fun toModel() =
+        CommitRequest(
+            readSnapshot = readSnapshot,
+            appends = appends.map { it.toModel() },
+            author = author,
+            message = message,
+            idempotencyKey = idempotencyKey,
+            fileEnds = fileEnds?.map { it.toModel() },
+        )
+}
 
-fun CommitResult.toDto() = CommitResultDto(snapshotId, schemaVersion)
+data class CommitReceiptDto(
+    val operationId: UUID,
+    val snapshotId: Long,
+    val schemaVersion: Long,
+    val endedFiles: Long? = null,
+)
+
+/** [endedFiles] is NON_NULL on the wire: only a replacement reports it. */
+data class CommitResultDto(val snapshotId: Long, val schemaVersion: Long, val endedFiles: Long? = null)
+
+fun CommitResult.toDto() = CommitResultDto(snapshotId, schemaVersion, endedFiles)
 
 // ---- files + changefeed --------------------------------------------------
 

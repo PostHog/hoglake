@@ -21,7 +21,7 @@ object HogSchemaColumns {
             "hog_commit_receipt" to
                 setOf(
                     "catalog_id", "idempotency_key", "request", "fingerprint",
-                    "snapshot_id", "schema_version", "created_at",
+                    "snapshot_id", "schema_version", "created_at", "ended_files",
                 ),
             // MaintenanceSummarySampler: published samples + durable scan
             // checkpoints, and the published generation's live totals
