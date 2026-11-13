@@ -6,6 +6,7 @@ import com.posthog.hoglake.auth.Routing
 import com.posthog.hoglake.auth.hoglakeAuth
 import com.posthog.hoglake.auth.verifiedBackendToken
 import com.posthog.hoglake.hoglite.HogliteCatalogStore
+import com.posthog.hoglake.hoglite.HogliteCleanup
 import com.posthog.hoglake.hoglite.HogliteClient
 import com.posthog.hoglake.hoglite.HoglitePartitionLookupAdmission
 import com.posthog.hoglake.hoglite.HogliteTenantResolver
@@ -22,6 +23,7 @@ import com.posthog.hoglake.service.OptionsBackend
 import com.posthog.hoglake.service.PartitionListingBackend
 import com.posthog.hoglake.service.PartitionLookupBackend
 import com.posthog.hoglake.service.PartitionStatsBackend
+import com.posthog.hoglake.service.RemovalStore
 import com.posthog.hoglake.service.RetirementBackend
 import com.posthog.hoglake.service.TableCreationBackend
 import com.posthog.hoglake.service.UploadBackend
@@ -44,6 +46,8 @@ class CatalogStoreSelector(
      * Client (Config refuses both at boot).
      */
     private val mountHosts: MountHostResolver = MountHostResolver.NONE,
+    /** The server owns this store. Request-scoped cleanup backends only borrow it. */
+    private val removalStore: () -> RemovalStore = { error("cleanup object store is not configured") },
 ) : CatalogRegistry {
     private val clients = ConcurrentHashMap<UUID, HogliteClient>()
     private val lookupAdmissions = ConcurrentHashMap<UUID, HoglitePartitionLookupAdmission>()
@@ -283,7 +287,7 @@ class CatalogStoreSelector(
         postgres: () -> PartitionLookupBackend,
     ): PartitionLookupBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.partitionLookup ?: postgres()
 
-    /** Resolve catalog maintenance before the PostgreSQL provider runs. Hoglite stays unsupported. */
+    /** Resolve options through the same request-scoped store as catalog operations. */
     fun options(
         call: ApplicationCall,
         catalog: String,
@@ -294,7 +298,7 @@ class CatalogStoreSelector(
         call: ApplicationCall,
         catalog: String,
         postgres: () -> OptionsBackend,
-    ): OptionsBackend = postgresMaintenance(call, catalog, postgres)
+    ): OptionsBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.options ?: postgres()
 
     fun expiry(
         call: ApplicationCall,
@@ -306,7 +310,7 @@ class CatalogStoreSelector(
         call: ApplicationCall,
         catalog: String,
         postgres: () -> ExpiryBackend,
-    ): ExpiryBackend = postgresMaintenance(call, catalog, postgres)
+    ): ExpiryBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.expiry ?: postgres()
 
     fun cleanup(
         call: ApplicationCall,
@@ -318,7 +322,10 @@ class CatalogStoreSelector(
         call: ApplicationCall,
         catalog: String,
         postgres: () -> CleanupBackend,
-    ): CleanupBackend = postgresMaintenance(call, catalog, postgres)
+    ): CleanupBackend =
+        (forCatalog(call, catalog) as? HogliteCatalogStore)?.let {
+            HogliteCleanup(checkNotNull(cfg), it, removalStore())
+        } ?: postgres()
 
     fun compaction(
         call: ApplicationCall,
@@ -342,7 +349,7 @@ class CatalogStoreSelector(
         call: ApplicationCall,
         catalog: String,
         postgres: () -> RetirementBackend,
-    ): RetirementBackend = postgresMaintenance(call, catalog, postgres)
+    ): RetirementBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.retirement ?: postgres()
 
     fun hydratorMaintenance(
         call: ApplicationCall,
@@ -354,7 +361,8 @@ class CatalogStoreSelector(
         call: ApplicationCall,
         catalog: String,
         postgres: () -> HydratorMaintenanceBackend,
-    ): HydratorMaintenanceBackend = postgresMaintenance(call, catalog, postgres)
+    ): HydratorMaintenanceBackend =
+        (forCatalog(call, catalog) as? HogliteCatalogStore)?.hydratorMaintenance ?: postgres()
 
     fun maintenanceStatus(
         call: ApplicationCall,
@@ -403,28 +411,49 @@ class CatalogStoreSelector(
             BackendKind.POSTGRES -> postgres ?: throw HoglakeException.NotFound("catalog '${routing.catalog}'")
             BackendKind.HOGLITE ->
                 call.attributes.computeIfAbsent(requestStore) {
-                    HogliteCatalogStore(
+                    hogliteStore(
+                        routing,
                         client(routing.backendId).forRequest(call.verifiedBackendToken),
-                        HogliteTenantResolver { catalog ->
-                            if (catalog == routing.catalog) {
-                                checkNotNull(routing.tenant)
-                            } else {
-                                throw HoglakeException.NotFound("catalog '$catalog'")
-                            }
-                        },
-                        refuseBlindPartitionedAppends = checkNotNull(cfg).refuseBlindPartitionedAppends,
-                        ledgerRetentionSeconds = cfg.removalLedgerRetentionSeconds,
-                        smallFileThresholdBytes = cfg.compactionTargetBytes,
-                        minInputFiles = cfg.compactionMinInputFiles,
-                        maxInputFiles = cfg.compactionMaxInputFiles,
-                        partitionLookupAdmission =
-                            lookupAdmissions.computeIfAbsent(routing.backendId) {
-                                HoglitePartitionLookupAdmission()
-                            },
                         operatorAuthority = call.hoglakeAuth.callerOrNull?.kind?.isOperator() != false,
                     )
                 }
         }
+
+    /** Build a store from trusted placement. This method does not discover catalogs or start background work. */
+    fun forPlacement(placement: Routing): CatalogStore =
+        when (placement.backend) {
+            BackendKind.POSTGRES -> postgres ?: throw HoglakeException.NotFound("catalog '${placement.catalog}'")
+            BackendKind.HOGLITE -> hogliteStore(placement, client(placement.backendId), operatorAuthority = true)
+        }
+
+    /** Share store construction without sharing request authority. */
+    private fun hogliteStore(
+        placement: Routing,
+        client: HogliteClient,
+        operatorAuthority: Boolean,
+    ): HogliteCatalogStore =
+        HogliteCatalogStore(
+            client,
+            HogliteTenantResolver { catalog ->
+                if (catalog == placement.catalog) {
+                    checkNotNull(placement.tenant)
+                } else {
+                    throw HoglakeException.NotFound("catalog '$catalog'")
+                }
+            },
+            refuseBlindPartitionedAppends = checkNotNull(cfg).refuseBlindPartitionedAppends,
+            ledgerRetentionSeconds = cfg.removalLedgerRetentionSeconds,
+            smallFileThresholdBytes = cfg.compactionTargetBytes,
+            minInputFiles = cfg.compactionMinInputFiles,
+            maxInputFiles = cfg.compactionMaxInputFiles,
+            partitionLookupAdmission =
+                lookupAdmissions.computeIfAbsent(placement.backendId) {
+                    HoglitePartitionLookupAdmission()
+                },
+            operatorAuthority = operatorAuthority,
+            expiryPurgePage = cfg.expiryPurgePage,
+            expiryPurgeBudgetMs = cfg.expiryPurgeBudgetMs,
+        )
 
     private fun client(id: UUID): HogliteClient =
         clients.computeIfAbsent(id) {

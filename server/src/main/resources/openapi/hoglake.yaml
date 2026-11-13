@@ -36,7 +36,9 @@ info:
     Invalid shapes, unknown routing keys, and multiple catalogs return 401
     `invalid_token`. Hoglite listings include only the routed catalog.
 
-    Hoglite maintenance and publications return 501 `not_supported_on_backend`.
+    Hoglite supports catalog options, manual expiry, manual cleanup, and manual requeue.
+    Retirement runs before expiry; there is no public retirement trigger.
+    Other maintenance operations and publications return 501 `not_supported_on_backend`.
     Engine result limits return 422 `backend_result_too_large`; query deadlines
     return 422 `backend_query_timeout`. Narrow the query before retrying.
     These deterministic refusals do not carry Retry-After.
@@ -1402,9 +1404,12 @@ paths:
     post:
       operationId: runExpiry
       summary: >
-        Run one incremental expiry sweep now (the background loop calls
-        the same path). Bounded per run; never expires head; respects
-        the consumer floor when enabled.
+        Run one incremental expiry sweep now. PostgreSQL background
+        sweeps use the same operation. Hoglite supports manual sweeps
+        through token placement, without a background loop.
+        Each sweep is bounded, preserves head, and respects the enabled
+        consumer floor. Ended file rows enter the removal ledger;
+        expiry does not delete their objects.
       parameters:
         - { $ref: "#/components/parameters/catalog" }
         - { $ref: "#/components/parameters/maintenanceBatch" }
@@ -1467,6 +1472,12 @@ paths:
         supplying BOTH namespace and table (supplying only one is a
         422). Transient object-store failures never need this: they
         leave files 'pending' and retry on their own.
+      description: >
+        PostgreSQL and hoglite support this manual requeue operation.
+        The operation changes metadata only. It does not read object data.
+        The hoglite backend does not start a hydration sweep.
+        One transaction updates all matching failed live files.
+        The operation excludes ended files and dropped tables.
       parameters:
         - { $ref: "#/components/parameters/catalog" }
         - name: namespace
@@ -1491,7 +1502,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
-        "501": { $ref: "#/components/responses/NotSupportedOnBackend" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /catalogs/{catalog}/maintenance/cleanup:
     post:
@@ -1513,6 +1524,8 @@ paths:
         HOGLAKE_CLEANUP_WORKERS when this pod's cleanup loop is disabled,
         so a hand-triggered drain cannot take more of the connection pool
         than the pod's configuration reserved for it.
+        Hoglite runs one bounded drain for the routed catalog. It uses the server's
+        object-store configuration, with one worker and no background sweep.
       parameters:
         - { $ref: "#/components/parameters/catalog" }
         - { $ref: "#/components/parameters/maintenanceBatch" }
@@ -1523,7 +1536,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/CleanupResult" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "501": { $ref: "#/components/responses/NotSupportedOnBackend" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /database/health:
     get:
@@ -6179,10 +6192,14 @@ components:
             sorted table was refused by the sorted budgets for its
             layout's shape. The files are left as they are, and the
             compactor remembers their layouts. A layout short of files is
-            not planned again until files of it arrive. A budget-refused
+            not planned again until files of it arrive; an arrival lent to
+            it that proves to be another layout is counted here too, once,
+            and never lent again. A budget-refused
             layout is counted here only on that first probe; later sweeps
             refuse it from metadata as spill_budget_exceeded or
-            merge_budget_exceeded, which is how to tell the cases apart,
+            merge_budget_exceeded (Prometheus
+            hoglake_compaction_skipped_total{reason="spill_budget"} /
+            {reason="merge_budget"}), which is how to tell the cases apart,
             and raising HOGLAKE_COMPACTION_SORTED_HEAP_BYTES or
             HOGLAKE_COMPACTION_SPILL_BYTES admits the existing files on
             the next plan with no new arrivals. The footers were read, so this IS charged to

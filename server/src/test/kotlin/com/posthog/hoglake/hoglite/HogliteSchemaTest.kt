@@ -78,4 +78,30 @@ class HogliteSchemaTest {
             "CREATE INDEX IF NOT EXISTS dvs_changes ON dvs(table_id, begin_snapshot, delete_file_id)",
         )
     }
+
+    @Test
+    fun `receipt retention has a non-partial covering index for cutoff and ordering`() {
+        val indexes = HogliteSchema.DDL.map(::normalized).filter { it.contains(" ON receipts(") }
+        assertThat(indexes).containsExactly(
+            "CREATE INDEX IF NOT EXISTS receipts_created_at ON receipts(created_at, idempotency_key)",
+        )
+    }
+
+    @Test
+    fun `ledger retention indexes match the cutoff ordering and cover row ids`() {
+        assertThat(HogliteSchema.DDL.map(::normalized)).contains(
+            "CREATE INDEX IF NOT EXISTS removals_drained_at ON removals(drained_at, id) WHERE drained_at IS NOT NULL",
+            "CREATE INDEX IF NOT EXISTS maintenance_runs_started_at ON maintenance_runs(started_at, id)",
+        )
+    }
+
+    @Test
+    fun `queue arm indexes walk only their own undrained id range`() {
+        assertThat(HogliteSchema.DDL.map(::normalized)).contains(
+            "CREATE INDEX IF NOT EXISTS removals_staging_queue ON removals(id) " +
+                "WHERE drained_at IS NULL AND reason = 'compaction_staging'",
+            "CREATE INDEX IF NOT EXISTS removals_bulk_queue ON removals(id) " +
+                "WHERE drained_at IS NULL AND (reason IS NULL OR reason <> 'compaction_staging')",
+        )
+    }
 }

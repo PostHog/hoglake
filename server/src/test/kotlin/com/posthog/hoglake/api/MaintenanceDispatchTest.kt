@@ -30,7 +30,21 @@ class MaintenanceDispatchTest {
     lateinit var dir: Path
 
     @Test
-    fun `all catalog maintenance routes refuse hoglite before PostgreSQL or malformed input`() {
+    fun `retirement trigger remains absent without auth or PostgreSQL`() {
+        App.build(
+            Config(defaultBackend = "none", authMode = "off", jdbcUrl = "jdbc:no-such-driver:must-not-open"),
+        ).use {
+                app ->
+            testApplication {
+                application { app.module(this) }
+                val response = client.request("/v1/catalogs/lake/maintenance/retire") { method = HttpMethod.Post }
+                assertThat(response.status).isEqualTo(HttpStatusCode.NotFound)
+            }
+        }
+    }
+
+    @Test
+    fun `unsupported maintenance routes refuse hoglite before PostgreSQL or malformed input`() {
         val id = "5b0c6d0e-1f2a-4b3c-9d4e-5f6a7b8c9d0e"
         val backends = dir.resolve("backends.json")
         Files.writeString(backends, """{"backends":[{"id":"$id","kind":"hoglite","url":"http://localhost:1"}]}""")
@@ -62,12 +76,7 @@ class MaintenanceDispatchTest {
             )
         val probes =
             listOf(
-                HttpMethod.Get to "/options",
-                HttpMethod.Patch to "/options",
-                HttpMethod.Post to "/maintenance/expire?batch=bad",
-                HttpMethod.Post to "/maintenance/cleanup?batch=bad",
                 HttpMethod.Post to "/maintenance/compact?batch=bad",
-                HttpMethod.Post to "/maintenance/rehydrate?namespace=ns",
                 HttpMethod.Get to "/maintenance/status",
                 HttpMethod.Get to "/maintenance/runs?before=bad&task=bad&limit=bad",
             )
@@ -93,6 +102,36 @@ class MaintenanceDispatchTest {
                         assertThat(response.headers[HttpHeaders.RetryAfter]).isNull()
                     }
                 }
+                for (operation in listOf("expire", "cleanup")) {
+                    for ((catalog, status) in listOf(
+                        "lake" to HttpStatusCode.BadRequest,
+                        "other" to HttpStatusCode.NotFound,
+                    )) {
+                        val response =
+                            client.request("/v1/catalogs/$catalog/maintenance/$operation?batch=bad") {
+                                method = HttpMethod.Post
+                                header(HttpHeaders.Authorization, "Bearer $token")
+                            }
+                        assertThat(response.status).describedAs("$catalog $operation").isEqualTo(status)
+                        assertThat(response.headers[HttpHeaders.RetryAfter]).isNull()
+                    }
+                }
+                val malformedOptions =
+                    client.request("/v1/catalogs/lake/options") {
+                        method = HttpMethod.Patch
+                        header(HttpHeaders.Authorization, "Bearer $token")
+                        contentType(ContentType.Application.Json)
+                        setBody("{")
+                    }
+                assertThat(malformedOptions.status).isEqualTo(HttpStatusCode.BadRequest)
+                val otherOptions =
+                    client.request("/v1/catalogs/other/options") {
+                        method = HttpMethod.Patch
+                        header(HttpHeaders.Authorization, "Bearer $token")
+                        contentType(ContentType.Application.Json)
+                        setBody("{")
+                    }
+                assertThat(otherOptions.status).isEqualTo(HttpStatusCode.NotFound)
             }
         }
     }

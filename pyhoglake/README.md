@@ -260,10 +260,15 @@ declaration it was written under (`shredding=old_decl`), or none.
 A changed declaration is a DDL snapshot: a request prepared before it is
 refused at `commit_prepared` with `DdlSinceReadSnapshotError`, and the
 re-prepare writes the new layout. Re-applying the declaration the column
-already has (compared as JSON values; `None`, `{}` and
-`{"shredding": None}` all mean none) is a no-op: nothing is written, no
-snapshot is minted, and prepared requests stay committable — a reconcile
-script may apply declarations on every deploy. Requires
+already has is a no-op: nothing is written, no snapshot is minted, and
+prepared requests stay committable — a reconcile script may apply
+declarations on every deploy. "Already has" is decided on JSON values,
+and on the STORED `type_params`: a column whose `type_params` is absent,
+`{}` or `{"shredding": null}` has no declaration, so
+`set_variant_shredding(name, None)` on it is a no-op. The ARGUMENT has
+one spelling for none, `None`: `{}` and `{"shredding": None}` passed as
+`shredding` are declarations, and invalid ones — the local check raises
+`ValidationError` (`$ has no type`) before any request. Requires
 `mutable-variant-shredding-v1` in `catalog.info.capabilities`; an older
 server answers 400 `unknown alter op`.
 

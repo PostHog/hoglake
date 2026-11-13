@@ -1943,6 +1943,15 @@ def test_set_variant_shredding_checks_the_declaration_locally():
                 "fields": [{"name": f"f{i}", "type": "string"} for i in range(1001)],
             },
         )
+    # The argument has ONE spelling for "none". The two forms a stored
+    # type_params may take for it are declarations here, and invalid ones:
+    # a reconcile script clears a declaration with None, never with these.
+    for stored_form in ({}, {"shredding": None}):
+        with pytest.raises(ValidationError) as empty:
+            ops.set_variant_shredding("properties", stored_form)
+        assert str(empty.value) == (
+            "variant column 'properties' has an invalid type_params.shredding: $ has no type"
+        )
     # A dotted path and a non-variant name pass: the server resolves them.
     assert ops.set_variant_shredding("r.x", {"type": "string"}).to_wire() == {
         "op": "set_variant_shredding",
