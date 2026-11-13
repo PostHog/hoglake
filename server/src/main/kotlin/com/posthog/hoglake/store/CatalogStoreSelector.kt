@@ -306,7 +306,7 @@ class CatalogStoreSelector(
         call: ApplicationCall,
         catalog: String,
         postgres: () -> ExpiryBackend,
-    ): ExpiryBackend = postgresMaintenance(call, catalog, postgres)
+    ): ExpiryBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.expiry ?: postgres()
 
     fun cleanup(
         call: ApplicationCall,
@@ -443,6 +443,8 @@ class CatalogStoreSelector(
                     HoglitePartitionLookupAdmission()
                 },
             operatorAuthority = operatorAuthority,
+            expiryPurgePage = cfg.expiryPurgePage,
+            expiryPurgeBudgetMs = cfg.expiryPurgeBudgetMs,
         )
 
     private fun client(id: UUID): HogliteClient =
