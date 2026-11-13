@@ -1,15 +1,14 @@
 name: signed-commits
 
 # main's ruleset requires verified signatures, but the only signal a
-# contributor gets from that is the merge box. This fails early and comments
-# with the commits to fix and how (CONTRIBUTING.md#signed-commits).
+# contributor gets from that is the merge box. This fails early and puts the
+# commits to fix and how (CONTRIBUTING.md#signed-commits) in the failure
+# message and the job summary.
 #
-# pull_request_target so a fork's pull request gets a token that can comment.
-# Safe because nothing from the pull request is checked out or run: the job
-# reads commit metadata through the API only, and the comment carries no
-# PR-authored text (shas and verification reasons only).
-on: # zizmor: ignore[dangerous-triggers] no checkout, no PR-authored text in the comment
-  pull_request_target:
+# pull_request, not pull_request_target: a fork's pull request gets a
+# read-only token, so this can't comment, but it needs nothing more.
+on:
+  pull_request:
     types: [opened, synchronize, reopened]
 
 permissions: {}
@@ -23,81 +22,58 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
-      pull-requests: write
+      pull-requests: read
     steps:
       - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             const { owner, repo } = context.repo;
             const pr = context.payload.pull_request;
-            const issue_number = pr.number;
-            const marker = '<!-- signed-commits -->';
             // listCommits returns at most 250 commits.
             const commits = await github.paginate(github.rest.pulls.listCommits, {
-              owner, repo, pull_number: issue_number, per_page: 100,
+              owner, repo, pull_number: pr.number, per_page: 100,
             });
             // pr.commits is frozen in the event payload; a re-run after a
             // force-push would see fewer live commits, so only trust it at the cap.
             const truncated = commits.length >= 250 && pr.commits > commits.length;
             const unsigned = commits.filter((c) => !c.commit.verification.verified);
-            const comments = await github.paginate(github.rest.issues.listComments, {
-              owner, repo, issue_number, per_page: 100,
-            });
-            const existing = comments.find(
-              (c) => c.user.type === 'Bot' && c.body.startsWith(marker),
-            );
-            const post = async (body) => {
-              if (existing) {
-                await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
-              } else {
-                await github.rest.issues.createComment({ owner, repo, issue_number, body });
-              }
-            };
-
-            if (unsigned.length === 0 && !truncated) {
-              if (existing) await post(`${marker}\nEvery commit is signed. Thanks!`);
-              return;
-            }
+            if (unsigned.length === 0 && !truncated) return;
 
             const guide = `https://github.com/${owner}/${repo}/blob/main/CONTRIBUTING.md#signed-commits`;
             // Re-signing doesn't fix these: the committer email isn't one
             // GitHub can match to a verified address on the signer's account.
             const emailReasons = new Set(['bad_email', 'unverified_email', 'no_user']);
-            const list = unsigned
-              .map((c) => `- \`${c.sha.slice(0, 8)}\` (\`${c.commit.verification.reason}\`)`)
-              .join('\n');
-            const body = [
-              marker,
-              truncated
-                ? `This pull request has ${pr.commits} commits; only the first ${commits.length} could be checked. Unsigned among those:`
-                : `\`main\` accepts only signed commits, so this pull request can't merge yet. Unsigned:`,
-              '',
-              list || '- none found in the checked commits',
-              '',
-              ...(truncated
-                ? [
-                    `The rest can't be checked here; split the pull request, or confirm every commit is signed with \`git log --format='%h %G?' FETCH_HEAD..\` (each should show \`G\`) after the fetch below.`,
-                    '',
-                  ]
-                : []),
-              ...(unsigned.some((c) => emailReasons.has(c.commit.verification.reason))
-                ? [
-                    'An email reason means your `git config user.email` must be a verified email on your GitHub account before re-signing helps.',
-                    '',
-                  ]
-                : []),
-              `To fix: set up signing once ([CONTRIBUTING.md](${guide})), then re-sign and force-push:`,
-              '',
-              '```bash',
+            const fix = [
               `git fetch https://github.com/${owner}/${repo}.git main`,
               "git rebase --exec 'git commit --amend --no-edit -S' FETCH_HEAD",
               'git push --force-with-lease',
-              '```',
             ].join('\n');
 
-            await post(body);
-            core.setFailed(
+            const summary = core.summary.addHeading('Unsigned commits', 3).addRaw(
               truncated
-                ? `more than ${commits.length} commits; ${unsigned.length} unsigned among those checked`
-                : `${unsigned.length} unsigned commit(s); see ${guide}`,
+                ? `This pull request has ${pr.commits} commits; only the first ${commits.length} could be checked. Split it, or confirm the rest locally with \`git log --format='%h %G?' FETCH_HEAD..\` after the fetch below (each should show \`G\`).\n\n`
+                : '`main` accepts only signed commits, so this pull request can\'t merge yet.\n\n',
+            );
+            if (unsigned.length > 0) {
+              summary.addTable([
+                [{ data: 'Commit', header: true }, { data: 'Reason', header: true }],
+                ...unsigned.map((c) => [c.sha.slice(0, 8), c.commit.verification.reason]),
+              ]);
+            }
+            if (unsigned.some((c) => emailReasons.has(c.commit.verification.reason))) {
+              summary.addRaw('An email reason means your `git config user.email` must be a verified email on your GitHub account before re-signing helps.\n\n');
+            }
+            await summary
+              .addRaw(`To fix: set up signing once ([CONTRIBUTING.md](${guide})), then re-sign and force-push:\n\n`)
+              .addCodeBlock(fix, 'bash')
+              .write();
+
+            for (const c of unsigned) {
+              core.error(`${c.sha.slice(0, 8)} is unsigned (${c.commit.verification.reason})`);
+            }
+            core.setFailed(
+              (truncated
+                ? `more than ${commits.length} commits; ${unsigned.length} unsigned among those checked. `
+                : `${unsigned.length} unsigned commit(s). `)
+              + `Set up signing (${guide}), then:\n${fix}`,
             );

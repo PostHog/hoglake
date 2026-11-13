@@ -8,7 +8,8 @@ the repository invariants.
 
 `main` accepts only commits with a verified signature, and a pull request with
 an unsigned commit can't merge. The `signed-commits` check fails on such a
-pull request and comments with the commits to fix.
+pull request and lists the commits to fix, with the commands below, in its
+failure message and job summary.
 
 ### One-time setup (SSH signing)
 
