@@ -64,6 +64,7 @@ class HogliteCleanupLifecycleIntegrationTest {
         sleeper: (Long) -> Unit = {},
         afterApply: (String) -> Unit = {},
         beforeApply: (String) -> Unit = {},
+        observe: (String, SimpleMeterRegistry) -> Unit = { _, _ -> },
         body: (HogliteCatalogStore, String, String) -> Unit,
     ) {
         val running = engine
@@ -109,6 +110,7 @@ class HogliteCleanupLifecycleIntegrationTest {
             val tenant = store.catalogOperation(cat) { store.boundTenant(cat) }
             attempts.clear()
             body(store, cat, tenant)
+            observe(cat, meters)
         } finally {
             Metrics.clear()
             meters.close()
@@ -266,7 +268,11 @@ class HogliteCleanupLifecycleIntegrationTest {
 
     @Test
     fun `bulk and staging have separate budgets and staging distinguishes absent objects`() =
-        fixture { store, cat, _ ->
+        fixture(observe = { cat, meters ->
+            assertThat(
+                meters.find("hoglake_files_removed_total").tags("catalog", cat).counter()?.count(),
+            ).isEqualTo(3.0)
+        }) { store, cat, _ ->
             val paths = (0..3).map { "s3://hoglake-it/$cat/object$it" }
             engine.s3Client().use { s3 ->
                 for (path in paths.take(3)) {
@@ -290,6 +296,7 @@ class HogliteCleanupLifecycleIntegrationTest {
                 assertThat(second.removed).isEqualTo(1)
                 assertThat(second.missing).isEqualTo(1)
                 assertThat(second.objectsRemoved).isEqualTo(1)
+                assertThat(cleanup.runOnce(cat, 10).objectsRemoved).isZero()
             }
             engine.s3Client().use { s3 ->
                 assertThat(s3.listObjectsV2 { it.bucket("hoglake-it").prefix("$cat/") }.contents()).isEmpty()
@@ -534,6 +541,44 @@ class HogliteCleanupLifecycleIntegrationTest {
                 val detail = plan.rows.joinToString(" ") { it[3].asString() }
                 assertThat(detail).contains("SEARCH receipts USING COVERING INDEX receipts_created_at (created_at<?)")
                     .doesNotContain("SCAN receipts", "USE TEMP B-TREE")
+            }
+        }
+
+    @ParameterizedTest
+    @ValueSource(strings = ["removals", "maintenance_runs"])
+    fun `ledger retention pages use a covering cutoff range at one hundred thousand rows`(table: String) =
+        fixture { store, cat, _ ->
+            val (columns, values, purge, index) =
+                if (table == "removals") {
+                    listOf(
+                        "path,file_kind,queued_snapshot,queued_at,drained_at",
+                        "'s3://b/key-'||i,'data',0,'2000-01-01T00:00:00.000Z'," +
+                            "CASE WHEN i%100=0 THEN '2000-01-01T00:00:00.000Z' ELSE '2030-01-01T00:00:00.000Z' END",
+                        HogliteCleanup.PURGE_DRAINED_SQL,
+                        "removals_drained_at",
+                    )
+                } else {
+                    listOf(
+                        "task,run_trigger,finished_at,status,started_at",
+                        "'cleanup','manual','2030-01-01T00:00:00.000Z','ok'," +
+                            "CASE WHEN i%100=0 THEN '2000-01-01T00:00:00.000Z' ELSE '2030-01-01T00:00:00.000Z' END",
+                        HogliteCleanup.PURGE_MAINTENANCE_SQL,
+                        "maintenance_runs_started_at",
+                    )
+                }
+            write(
+                store,
+                cat,
+                "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<100000) " +
+                    "INSERT INTO $table($columns) SELECT $values FROM n",
+            )
+            assertThat(rows(store, cat, "SELECT COUNT(*) FROM $table").single()[0].asLong()).isEqualTo(100_000)
+            // Recently drained / run rows must not be rescanned when no row qualifies.
+            for (cutoff in listOf("2020-01-01T00:00:00.000Z", "1990-01-01T00:00:00.000Z")) {
+                val plan = write(store, cat, "EXPLAIN QUERY PLAN $purge", cutoff, 1000).single()
+                val detail = plan.rows.joinToString(" ") { it[3].asString() }
+                assertThat(detail).contains("SEARCH $table USING COVERING INDEX $index")
+                    .doesNotContain("SCAN $table", "USE TEMP B-TREE")
             }
         }
 

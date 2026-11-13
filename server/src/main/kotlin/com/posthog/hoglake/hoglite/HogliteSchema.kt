@@ -381,6 +381,7 @@ internal object HogliteSchema {
                 drained_outcome TEXT
             )""",
             "CREATE INDEX IF NOT EXISTS removals_unclaimed ON removals(claimed_at)",
+            "CREATE INDEX IF NOT EXISTS removals_drained_at ON removals(drained_at, id) WHERE drained_at IS NOT NULL",
             """CREATE TABLE IF NOT EXISTS views(
                 id INTEGER PRIMARY KEY,
                 namespace_id INTEGER NOT NULL,
@@ -427,6 +428,7 @@ internal object HogliteSchema {
                 result_json TEXT
             )""",
             "CREATE INDEX IF NOT EXISTS maintenance_runs_task ON maintenance_runs(task, id)",
+            "CREATE INDEX IF NOT EXISTS maintenance_runs_started_at ON maintenance_runs(started_at, id)",
         ) + SCALE_INDEXES
 
     private val TS_FORMAT: DateTimeFormatter =

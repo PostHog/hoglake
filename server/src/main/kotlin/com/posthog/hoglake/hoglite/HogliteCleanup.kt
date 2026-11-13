@@ -79,7 +79,7 @@ internal class HogliteCleanup(
         trigger: MaintenanceTrigger,
     ): CleanupResult =
         store.recorded(catalog, MaintenanceTask.CLEANUP, trigger) {
-            doRunOnce(catalog, batchSize)
+            doRunOnce(catalog, batchSize).also { Metrics.filesRemoved(catalog, it.objectsRemoved) }
         }
 
     private fun doRunOnce(
@@ -533,8 +533,7 @@ internal class HogliteCleanup(
         while (System.nanoTime() < deadline) {
             val tx = HogliteTx()
             tx.add(
-                "DELETE FROM maintenance_runs WHERE id IN (" +
-                    "SELECT id FROM maintenance_runs WHERE started_at < ? ORDER BY id LIMIT ?)",
+                PURGE_MAINTENANCE_SQL,
                 cutoff,
                 LEDGER_PURGE_PAGE,
             )
@@ -567,9 +566,7 @@ internal class HogliteCleanup(
                 try {
                     val tx = HogliteTx()
                     tx.add(
-                        "DELETE FROM receipts WHERE idempotency_key IN (" +
-                            "SELECT idempotency_key FROM receipts WHERE created_at < ? " +
-                            "ORDER BY created_at LIMIT ?)",
+                        PURGE_RECEIPTS_SQL,
                         cutoff,
                         receiptPurgePage,
                     )
@@ -588,7 +585,7 @@ internal class HogliteCleanup(
         return ReceiptPurge(purged, failures)
     }
 
-    /** The drained-ledger retention: paged from the bottom of the key, budgeted. */
+    /** The drained-ledger retention: paged from the oldest eligible cutoff key, budgeted. */
     private fun purgeDrainedLedger(catalog: String): Exception? =
         try {
             val cutoff = HogliteSchema.fmt(Instant.now().minusSeconds(removalLedgerRetentionSeconds))
@@ -596,9 +593,7 @@ internal class HogliteCleanup(
             while (System.nanoTime() < deadline) {
                 val tx = HogliteTx()
                 tx.add(
-                    "DELETE FROM removals WHERE id IN (" +
-                        "SELECT id FROM removals WHERE drained_at IS NOT NULL AND drained_at < ? " +
-                        "ORDER BY id LIMIT ?)",
+                    PURGE_DRAINED_SQL,
                     cutoff,
                     LEDGER_PURGE_PAGE,
                 )
@@ -620,12 +615,24 @@ internal class HogliteCleanup(
             e
         }
 
-    private companion object {
-        const val STAGING_SUB_BATCH = CleanupService.STAGING_SUB_BATCH
-        const val LEDGER_PURGE_PAGE = CleanupService.LEDGER_PURGE_PAGE
-        const val LEDGER_PURGE_BUDGET_MS = CleanupService.LEDGER_PURGE_BUDGET_MS
-        const val RECEIPT_PURGE_PAGE = CleanupService.RECEIPT_PURGE_PAGE
-        const val RECEIPT_PURGE_BUDGET_MS = CleanupService.RECEIPT_PURGE_BUDGET_MS
-        const val RECEIPT_FLOOR_CEILING_SECONDS = CleanupService.RECEIPT_FLOOR_CEILING_SECONDS
+    companion object {
+        internal const val PURGE_MAINTENANCE_SQL =
+            "DELETE FROM maintenance_runs WHERE id IN (" +
+                "SELECT id FROM maintenance_runs WHERE started_at < ? ORDER BY started_at, id LIMIT ?)"
+        internal const val PURGE_RECEIPTS_SQL =
+            "DELETE FROM receipts WHERE idempotency_key IN (" +
+                "SELECT idempotency_key FROM receipts WHERE created_at < ? " +
+                "ORDER BY created_at LIMIT ?)"
+        internal const val PURGE_DRAINED_SQL =
+            "DELETE FROM removals WHERE id IN (" +
+                "SELECT id FROM removals WHERE drained_at IS NOT NULL AND drained_at < ? " +
+                "ORDER BY drained_at, id LIMIT ?)"
+
+        private const val STAGING_SUB_BATCH = CleanupService.STAGING_SUB_BATCH
+        private const val LEDGER_PURGE_PAGE = CleanupService.LEDGER_PURGE_PAGE
+        private const val LEDGER_PURGE_BUDGET_MS = CleanupService.LEDGER_PURGE_BUDGET_MS
+        private const val RECEIPT_PURGE_PAGE = CleanupService.RECEIPT_PURGE_PAGE
+        private const val RECEIPT_PURGE_BUDGET_MS = CleanupService.RECEIPT_PURGE_BUDGET_MS
+        private const val RECEIPT_FLOOR_CEILING_SECONDS = CleanupService.RECEIPT_FLOOR_CEILING_SECONDS
     }
 }

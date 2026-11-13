@@ -86,4 +86,12 @@ class HogliteSchemaTest {
             "CREATE INDEX IF NOT EXISTS receipts_created_at ON receipts(created_at, idempotency_key)",
         )
     }
+
+    @Test
+    fun `ledger retention indexes match the cutoff ordering and cover row ids`() {
+        assertThat(HogliteSchema.DDL.map(::normalized)).contains(
+            "CREATE INDEX IF NOT EXISTS removals_drained_at ON removals(drained_at, id) WHERE drained_at IS NOT NULL",
+            "CREATE INDEX IF NOT EXISTS maintenance_runs_started_at ON maintenance_runs(started_at, id)",
+        )
+    }
 }
