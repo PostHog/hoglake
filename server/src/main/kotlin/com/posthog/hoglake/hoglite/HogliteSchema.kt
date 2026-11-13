@@ -75,6 +75,9 @@ internal object HogliteSchema {
     val SCALE_INDEXES =
         listOf(
             "CREATE INDEX IF NOT EXISTS files_path ON files(path)",
+            "CREATE INDEX IF NOT EXISTS files_compaction_bucket ON files(" +
+                "table_id, COALESCE(spec_id, -1), COALESCE(partition_values_json, ''), file_size_bytes, id) " +
+                "WHERE end_snapshot IS NULL",
             "CREATE INDEX IF NOT EXISTS maintenance_runs_status ON maintenance_runs(task, status, id)",
             "CREATE INDEX IF NOT EXISTS dvs_path ON dvs(path)",
             "CREATE INDEX IF NOT EXISTS removals_undrained_path ON removals(path) WHERE drained_at IS NULL",
@@ -402,8 +405,8 @@ internal object HogliteSchema {
                 ON views(namespace, name) WHERE dropped_snapshot IS NULL""",
             /*
              * Compaction claims (Postgres's hog_compaction_claim): one row
-             * per claimed group, keyed by (table, sorted input ids), with a
-             * lease. A claim is efficiency — the commit's liveness guards
+             * per reserved input, keyed by (table, "file:<id>"), with a
+             * lease. A group acquires all its inputs in one transaction. A claim is efficiency — the commit's liveness guards
              * are correctness — so a lost claim race wastes one rewrite,
              * never corrupts one.
              */

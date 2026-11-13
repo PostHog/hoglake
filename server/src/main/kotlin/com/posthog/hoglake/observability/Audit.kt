@@ -1,6 +1,7 @@
 package com.posthog.hoglake.observability
 
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.persistence.partialHoglakeCause
 import net.logstash.logback.argument.StructuredArgument
 import net.logstash.logback.argument.StructuredArguments.kv
 import org.slf4j.LoggerFactory
@@ -147,7 +148,7 @@ object Audit {
 
     /** Failure outcome vocabulary for audit lines (ErrorMapping's cousin). */
     fun failureOutcome(e: Throwable): String =
-        when (e) {
+        when (e.partialHoglakeCause() ?: e) {
             is HoglakeException.CommitOutcomeUnknown -> "commit_outcome_unknown"
             is HoglakeException.BackendUnavailable -> "backend_unavailable"
             is HoglakeException.BackendResultTooLarge -> "backend_result_too_large"

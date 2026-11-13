@@ -76,7 +76,6 @@ class MaintenanceDispatchTest {
             )
         val probes =
             listOf(
-                HttpMethod.Post to "/maintenance/compact?batch=bad",
                 HttpMethod.Get to "/maintenance/status",
                 HttpMethod.Get to "/maintenance/runs?before=bad&task=bad&limit=bad",
             )
@@ -102,7 +101,7 @@ class MaintenanceDispatchTest {
                         assertThat(response.headers[HttpHeaders.RetryAfter]).isNull()
                     }
                 }
-                for (operation in listOf("expire", "cleanup")) {
+                for (operation in listOf("expire", "cleanup", "compact")) {
                     for ((catalog, status) in listOf(
                         "lake" to HttpStatusCode.BadRequest,
                         "other" to HttpStatusCode.NotFound,

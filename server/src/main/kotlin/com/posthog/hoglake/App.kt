@@ -155,6 +155,7 @@ class App private constructor(
             cfg,
             MountRegistry.behindSwitch(MountRegistry.postgresSwitch { jdbi }, mountRegistry ?: mountStore),
             mountHosts.value ?: MountHostResolver.NONE,
+            objectStore = { objectStore },
             removalStore = { removalStore },
         )
     }
@@ -277,8 +278,12 @@ class App private constructor(
     }
 
     /** Shared read/put store: hydrator footer reads + compaction rewrites. */
-    private val objectStore by lazy {
-        ObjectStore(cfg, storageProvider)
+    private val objectStoreResource = lazy { ObjectStore(cfg, storageProvider) }
+    private val objectStore get() = objectStoreResource.value
+    private val objectStoreClosed = java.util.concurrent.atomic.AtomicBoolean()
+
+    private fun closeObjectStore() {
+        if (objectStoreResource.isInitialized() && objectStoreClosed.compareAndSet(false, true)) objectStore.close()
     }
 
     /** One hydrator: the background sweep loop AND the rehydrate route. */
@@ -723,7 +728,7 @@ class App private constructor(
         return AutoCloseable {
             loops.close()
             removalStore.close()
-            objectStore.close()
+            closeObjectStore()
         }
     }
 
@@ -757,6 +762,7 @@ class App private constructor(
         closeBackground()
         // A manual hoglite run can create the store without starting PostgreSQL loops.
         if (!hadBackground && removalStoreResource.isInitialized()) removalStore.close()
+        closeObjectStore()
         healthProbe.close()
         postgresRuntime?.close()
     }
