@@ -1,5 +1,6 @@
 package com.posthog.hoglake.hoglite
 
+import com.posthog.hoglake.api.toDto
 import com.posthog.hoglake.model.AlterOp
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnDef
@@ -15,6 +16,7 @@ import com.posthog.hoglake.model.TableDeletes
 import com.posthog.hoglake.model.Transform
 import com.posthog.hoglake.persistence.PartialResult
 import com.posthog.hoglake.service.PatchField
+import com.posthog.hoglake.wireObjectMapper
 import com.sun.net.httpserver.HttpServer
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
@@ -852,5 +854,160 @@ class HogliteExpiryIntegrationTest {
         assertThat(result.offsetsReleased).isEqualTo(1)
         assertThat(store.getOffset(c, "unreconciled", old.tableUuid).committedSnapshot).isEqualTo(pin)
         assertThat(store.getOffset(c, "reconciled", replacement.tableUuid).committedSnapshot).isEqualTo(head(c))
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = ["pinned", "head", "files", "scan", "stats", "listing", "partition-values"])
+    fun `metadata reads refuse expiry after their initial floor check`(mode: String) {
+        val (c, _) = setup()
+        val sort =
+            AlterOp.SetSortOrder(
+                listOf(
+                    com.posthog.hoglake.model.SortFieldDef(
+                        1,
+                        com.posthog.hoglake.model.SortDirection.ASC,
+                        com.posthog.hoglake.model.NullOrder.NULLS_LAST,
+                    ),
+                ),
+            )
+        store.alters.alterTable(c, "ns", "t", listOf(sort))
+        val req = appendReq(c, "retained.parquet")
+        val append = req.appends.single()
+        store.commit(
+            c,
+            req.copy(
+                appends =
+                    listOf(
+                        append.copy(
+                            files =
+                                listOf(
+                                    append.files.single().copy(
+                                        columnStats =
+                                            listOf(
+                                                com.posthog.hoglake.model.ColumnStats(1, 10, 0, null, null, null, null),
+                                            ),
+                                    ),
+                                ),
+                        ),
+                    ),
+            ),
+        )
+        val at = head(c)
+        val file = store.listFiles(c, "ns", "t").single()
+        shortRetention(c)
+        val marker =
+            when (mode) {
+                "files" -> "FROM sort_specs WHERE"
+                "listing" -> "SELECT t.id, t.table_uuid, v.name"
+                "partition-values" -> "FROM partition_specs WHERE"
+                else -> "FROM columns WHERE"
+            }
+        val hook =
+            Hook({ m, p, b -> m == "POST" && p.endsWith("/query") && marker in b }, before = {
+                store.alters.alterTable(c, "ns", "t", listOf(AlterOp.RenameColumn("id", "renamed")))
+                store.commit(c, appendReq(c, "new-head.parquet"))
+                ageSnapshots(c)
+                HogliteExpiry(store, 100, 10_000).runOnce(c, 100)
+            })
+        hooks += hook
+        assertThatThrownBy {
+            when (mode) {
+                "pinned" -> pstore.getTable(c, "ns", "t", snapshot = at)
+                "head" -> pstore.getTable(c, "ns", "t")
+                "files" -> pstore.listFiles(c, "ns", "t", snapshot = at)
+                "scan" ->
+                    pstore.planScan(
+                        c,
+                        "ns",
+                        "t",
+                        snapshot = at,
+                        columnStats = com.posthog.hoglake.service.ScanService.ColumnStatsRequest(),
+                    )
+                "stats" -> pstore.fileStats(c, "ns", "t", file.dataFileId, snapshot = at)
+                "listing" -> pstore.listTables(c, "ns", snapshot = at)
+                else -> pstore.partitionValues(c, "ns", "t", snapshot = at)
+            }
+        }.isExactlyInstanceOf(HoglakeException.Expired::class.java)
+        assertThat(hook.remaining).isZero()
+        assertThat(store.getCatalog(c).earliestSnapshotId).isGreaterThan(at)
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = ["head", "pinned", "expired"])
+    fun `expiry cannot change a sort allocator between an alter plan and its receipt`(mode: String) {
+        val (c, _) = setup()
+        val sort =
+            AlterOp.SetSortOrder(
+                listOf(
+                    com.posthog.hoglake.model.SortFieldDef(
+                        1,
+                        com.posthog.hoglake.model.SortDirection.ASC,
+                        com.posthog.hoglake.model.NullOrder.NULLS_LAST,
+                    ),
+                ),
+            )
+        store.alters.alterTable(c, "ns", "t", listOf(sort))
+        store.alters.alterTable(c, "ns", "t", listOf(AlterOp.SetSortOrder(emptyList())))
+        val at = head(c)
+        shortRetention(c)
+        ageSnapshots(c)
+        val hook =
+            Hook({ m, p, b -> isTx(m, p, b) && "INSERT INTO sort_specs" in b }, before = {
+                if (mode == "expired") {
+                    store.commit(c, appendReq(c, "advance-floor.parquet"))
+                    ageSnapshots(c)
+                }
+                HogliteExpiry(store, 100, 10_000).runOnce(c, 100)
+            })
+        hooks += hook
+        val outcome =
+            runCatching {
+                pstore.alters.alterTable(c, "ns", "t", listOf(sort), readSnapshot = at.takeUnless { mode == "head" })
+            }
+        assertThat(hook.remaining).isZero()
+        if (mode == "expired") {
+            assertThat(store.getCatalog(c).earliestSnapshotId).isGreaterThan(at)
+            assertThat(outcome.exceptionOrNull()).isExactlyInstanceOf(HoglakeException.Expired::class.java)
+        } else if (mode == "pinned") {
+            assertThat(outcome.exceptionOrNull()).isInstanceOf(HoglakeException.CommitConflict::class.java)
+            assertThat(n(c, "SELECT COUNT(*) FROM sort_specs WHERE end_snapshot IS NULL")).isZero()
+        } else {
+            val receipt = outcome.getOrThrow()
+            val persisted = store.getTable(c, "ns", "t").sortSpec!!
+            assertThat(receipt.sortSpec).isEqualTo(persisted)
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = ["floor", "count"])
+    fun `failed purge probes preserve an unknown backlog in the result and ledger`(probe: String) {
+        val (c, t) = setup()
+        store.commit(c, appendReq(c, "ended.parquet"))
+        store.truncateTable(c, "ns", "t", t.tableUuid, "test", "end history")
+        shortRetention(c)
+        ageSnapshots(c)
+        HogliteExpiry(store, 1, 0).runOnce(c, 100)
+        store.options.patch(c, PatchField.Set(null), null)
+        var metadataReads = 0
+        val hook =
+            Hook({ m, p, b ->
+                m == "POST" && p.endsWith("/query") &&
+                    if (probe == "count") {
+                        "SELECT (SELECT COUNT(*) FROM (SELECT 1 FROM files" in b
+                    } else {
+                        store.metaSql in b && ++metadataReads == 2
+                    }
+            }, shortCircuit = 400)
+        hooks += hook
+        val result = HogliteExpiry(pstore, 1, 0).runOnce(c, 100)
+        assertThat(hook.remaining).isZero()
+        assertThat(result.purgeTruncated).isTrue()
+        assertThat(result.purgeRemaining).isNull()
+        val body = wireObjectMapper().readTree(wireObjectMapper().writeValueAsString(result.toDto()))
+        assertThat(body.has("purge_remaining")).isFalse()
+        assertThat(n(c, "SELECT COUNT(*) FROM files")).isEqualTo(1)
+        val run = q(c, "SELECT result_json FROM maintenance_runs ORDER BY id DESC LIMIT 1").firstRow()!!
+        val json = store.json.readTree(run[0].asString())
+        assertThat(json["purge_remaining"]?.isNull != false).isTrue()
     }
 }

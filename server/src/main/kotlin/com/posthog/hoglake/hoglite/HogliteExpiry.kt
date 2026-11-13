@@ -313,7 +313,7 @@ internal class HogliteExpiry(
         val pages: Long,
         val failures: Long,
         val truncated: Boolean,
-        val remaining: Long,
+        val remaining: Long?,
         val floor: Long,
     )
 
@@ -326,7 +326,7 @@ internal class HogliteExpiry(
         // row's end_snapshot >= 1, so nothing is eligible.
         val floor =
             runCatching { store.meta(catalog).earliestSnapshotId }.getOrNull()
-                ?: return Purge(0, 0, 0, 1, truncated = true, remaining = 0, floor = knownFloor)
+                ?: return Purge(0, 0, 0, 1, truncated = true, remaining = null, floor = knownFloor)
         if (floor <= 0) return Purge(0, 0, 0, 0, truncated = false, remaining = 0, floor = floor)
 
         val started = System.nanoTime()
@@ -479,7 +479,7 @@ internal class HogliteExpiry(
                         floor,
                         cap,
                     ).firstRow()!![0].asLong()
-                }.getOrDefault(0L)
+                }.getOrNull()
             } else {
                 0L
             }

@@ -40,6 +40,7 @@ class HogliteHeadTotalsTest {
         when {
             sql.startsWith("SELECT name, data_path,") ->
                 listOf("wh", "s3://b/wh", if (tx) 6 else 5, 0, 0, null, null, 0)
+            sql == "SELECT earliest_snapshot_id FROM meta WHERE id = 1" -> listOf(0)
             sql.startsWith("SELECT id, name, contained_field, contained_value FROM namespaces") ->
                 listOf(1, "ns", null, null)
             // The head table read: the table row, the head it saw, then its table_totals.
