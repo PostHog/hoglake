@@ -702,7 +702,10 @@ class HogliteCatalogStore(
      * scan, then re-checks under the commit lock. Here the pre-flight is
      * reads: one [readCatalog] snapshot, then the paged scan
      * ([foreignPathUnderPrefix]). The re-check is the guards of ONE
-     * transaction. Its statements, after the drop fence:
+     * transaction. A mark first runs the two index-upgrade DDL statements
+     * ([HogliteSchema.CONTAINMENT_INDEX_UPGRADE]), so a tenant created with
+     * the old unique index upgrades on its first mark. Its guards, after
+     * the drop fence:
      *
      *  - 0: the namespace is live, else NotFound.
      *  - A mark, 1: the namespace is still uncontained, else CommitConflict
@@ -711,10 +714,8 @@ class HogliteCatalogStore(
      *    other namespace has had its name.
      *  - A mark, 5: no file, DV or undrained removal registered after the
      *    scan sits under the prefix ([prefixRaceArms]).
-     *  - A mark, 6: no other live namespace holds the same containment,
-     *    else AlreadyExists. A unique-index violation would surface as a
-     *    422 Validation, so this guard names the refusal. The
-     *    `namespaces_live_containment` index stays as the backstop.
+     *  - A mark has no uniqueness guard: several live namespaces may be
+     *    contained for one value.
      *  - A clear, 1-2: no live table or view.
      *  - Last: the UPDATE.
      *
@@ -778,6 +779,9 @@ class HogliteCatalogStore(
             if (ns.containment == containment) return ns
             if (containment != null && ns.containment != null) throw alreadyContained(namespace, ns.containment)
             val tx = HogliteTx()
+            // Lazy upgrade of a tenant created with the unique containment
+            // index (see HogliteSchema): several namespaces may share a value.
+            if (containment != null) HogliteSchema.CONTAINMENT_INDEX_UPGRADE.forEach { tx.add(it) }
             tx.expectOne(
                 "SELECT COUNT(*) FROM namespaces WHERE id = ? AND dropped_snapshot IS NULL",
                 ns.namespaceId,
@@ -847,17 +851,6 @@ class HogliteCatalogStore(
                                 "while it was being marked",
                         )
                     }
-                }
-                tx.expectZero(
-                    "SELECT COUNT(*) FROM namespaces WHERE contained_field = ? AND contained_value = ? " +
-                        "AND dropped_snapshot IS NULL AND id <> ?",
-                    containment.field,
-                    containment.value,
-                    ns.namespaceId,
-                ) {
-                    HoglakeException.AlreadyExists(
-                        "another namespace is already contained for ${containment.field} = ${containment.value}",
-                    )
                 }
             } else {
                 val notEmpty = {

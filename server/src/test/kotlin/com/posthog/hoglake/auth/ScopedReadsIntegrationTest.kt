@@ -46,12 +46,12 @@ class ScopedReadsIntegrationTest {
 
     init {
         catalogs.createCatalog(cat, "s3://bucket/$cat")
-        for ((ns, value) in listOf("team_42" to 42L, "team_7" to 7L, "team_9" to 9L)) {
+        for ((ns, value) in listOf("team_42" to 42L, "imports_42" to 42L, "team_7" to 7L, "team_9" to 9L)) {
             catalogs.createNamespace(cat, ns)
             catalogs.setNamespaceContainment(cat, ns, NamespaceContainment("team_id", value))
         }
         catalogs.createNamespace(cat, "main")
-        for (ns in listOf("team_42", "team_9", "main")) catalogs.createTable(cat, ns, "t", columns)
+        for (ns in listOf("team_42", "imports_42", "team_9", "main")) catalogs.createTable(cat, ns, "t", columns)
         com.posthog.hoglake.service.ViewService(db.jdbi).create(cat, "team_42", "v", "SELECT 1")
     }
 
@@ -124,7 +124,7 @@ class ScopedReadsIntegrationTest {
                 // The listing holds only what it may use: team_9 is another
                 // team's, main is not contained.
                 assertThat(names(call(port, token, "/namespaces"))).describedAs("%s", mode)
-                    .containsExactly("team_42", "team_7")
+                    .containsExactly("imports_42", "team_42", "team_7")
                 // Its own namespace's reads, read-only value included.
                 for (path in listOf(
                     "/namespaces/team_42",
@@ -167,11 +167,32 @@ class ScopedReadsIntegrationTest {
     }
 
     @Test
+    fun `several namespaces contained for one value are all visible to that value and to nobody else`() {
+        withServer(AuthMode.ENFORCE) { port ->
+            val team42 = scoped(prd = """{"team_id":{"42":"read"}}""")
+            assertThat(names(call(port, team42, "/namespaces"))).containsExactly("imports_42", "team_42")
+            for (ns in listOf("team_42", "imports_42")) {
+                for (path in listOf("", "/tables", "/tables/t", "/tables/t/files")) {
+                    val r = call(port, team42, "/namespaces/$ns$path")
+                    assertThat(r.statusCode()).describedAs("%s%s", ns, path).isEqualTo(200)
+                }
+            }
+            val team7 = scoped(prd = """{"team_id":{"7":"read"}}""")
+            assertThat(names(call(port, team7, "/namespaces"))).containsExactly("team_7")
+            for (ns in listOf("team_42", "imports_42")) {
+                assertThat(call(port, team7, "/namespaces/$ns/tables/t").statusCode()).describedAs(ns).isEqualTo(404)
+            }
+        }
+    }
+
+    @Test
     fun `every value, a read-only catalog, and a tenant beside it`() {
         withServer(AuthMode.ENFORCE) { port ->
             // `*`: every contained namespace for the field, still not main.
             val all = scoped(prd = """{"team_id":{"*":"read"}}""")
-            assertThat(names(call(port, all, "/namespaces"))).containsExactly("team_42", "team_7", "team_9")
+            assertThat(
+                names(call(port, all, "/namespaces")),
+            ).containsExactly("imports_42", "team_42", "team_7", "team_9")
             assertThat(call(port, all, "/namespaces/team_9/tables/t").statusCode()).isEqualTo(200)
             assertThat(call(port, all, "/namespaces/main").statusCode()).isEqualTo(404)
             // `cat: read` is enough for reads.

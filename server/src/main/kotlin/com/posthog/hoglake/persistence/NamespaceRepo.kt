@@ -202,8 +202,8 @@ object NamespaceRepo {
     /**
      * Set (or, with null, clear) a live namespace's containment. The
      * caller holds the catalog commit lock and has checked the
-     * preconditions; the live-containment unique index backstops "one
-     * namespace per value" -> [HoglakeException.AlreadyExists].
+     * preconditions. Several namespaces may share a value, so nothing
+     * here refuses a duplicate.
      */
     fun setContainment(
         handle: Handle,
@@ -211,26 +211,17 @@ object NamespaceRepo {
         namespaceId: Long,
         containment: NamespaceContainment?,
     ) {
-        try {
-            handle.createUpdate(
-                """
-                UPDATE hog_namespace SET contained_field = :field, contained_value = :value
-                WHERE catalog_id = :catalogId AND namespace_id = :namespaceId AND NOT dropped
-                """,
-            )
-                .bind("catalogId", catalogId)
-                .bind("namespaceId", namespaceId)
-                .bind("field", containment?.field)
-                .bind("value", containment?.value)
-                .execute()
-        } catch (e: UnableToExecuteStatementException) {
-            if (Pg.isUniqueViolation(e)) {
-                throw HoglakeException.AlreadyExists(
-                    "another namespace is already contained for ${containment?.field} = ${containment?.value}",
-                )
-            }
-            throw e
-        }
+        handle.createUpdate(
+            """
+            UPDATE hog_namespace SET contained_field = :field, contained_value = :value
+            WHERE catalog_id = :catalogId AND namespace_id = :namespaceId AND NOT dropped
+            """,
+        )
+            .bind("catalogId", catalogId)
+            .bind("namespaceId", namespaceId)
+            .bind("field", containment?.field)
+            .bind("value", containment?.value)
+            .execute()
     }
 
     /**
