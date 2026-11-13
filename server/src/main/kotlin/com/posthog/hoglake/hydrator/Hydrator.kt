@@ -80,9 +80,11 @@ import java.time.Instant
  *
  * Failure taxonomy: TRANSIENT object-store failures (throttle/5xx,
  * connection, timeout — anything but a definitive 404/NoSuchKey) leave
- * the file 'pending' (logged + `hoglake_hydrator_transient_errors_total`)
- * for the next sweep; STRUCTURAL ones (object missing, unparseable
- * footer, registration mismatch, over-cap) mark it 'failed'. 'failed' is
+ * the file 'pending' for the next sweep. The log line and
+ * `hoglake_hydrator_transient_errors_total` are emitted only after the
+ * sweep commits, so a rolled-back sweep does not count the retry twice
+ * (#488). STRUCTURAL failures (object missing, unparseable footer,
+ * registration mismatch, over-cap) mark it 'failed'. 'failed' is
  * terminal to the sweep but operator-recoverable: [rehydrateFailed]
  * (POST /maintenance/rehydrate) flips failed rows back to pending.
  *
@@ -366,6 +368,10 @@ class Hydrator(
      * processed (transient failures included — they were claimed and
      * attempted). Each file's writes ride a savepoint so one file's DB
      * failure never poisons the sweep transaction for the rest.
+     * Per-file counters and log lines are collected during that
+     * transaction and emitted only after it commits ([CommittedSignals]):
+     * a commit that rolls back leaves the claimed files pending, and
+     * counting them would count the retry as well (#488).
      *
      * The sweep spans every catalog, so its ledger rows fan out per catalog:
      * one hog_maintenance_run row per catalog the sweep claimed files for,
@@ -378,9 +384,11 @@ class Hydrator(
      */
     fun runOnce(limit: Int = DEFAULT_SWEEP_LIMIT): Int {
         val startedAt = Instant.now()
-        // Per-catalog outcome tallies, accumulated inside the sweep
-        // transaction and recorded after it commits.
+        // Per-catalog outcome tallies and per-file signals, accumulated
+        // inside the sweep transaction and recorded only after it commits.
+        // A rollback discards [signals]: those files stayed pending (#488).
         val tallies = mutableMapOf<Long, MutableList<Long>>()
+        val signals = CommittedSignals()
         val processed =
             try {
                 jdbi.inTransaction<Int, Exception> { h ->
@@ -405,7 +413,7 @@ class Hydrator(
                                 prefixFields[file.catalogId to file.tableId]?.let { fieldId ->
                                     PrefixClaim(fieldId, prefixValue(h, file, fieldId, keyIndexes))
                                 }
-                            val outcome = hydrate(h, file, prefix, storeFor(h, file.catalogId, stores))
+                            val outcome = hydrate(h, file, prefix, storeFor(h, file.catalogId, stores), signals)
                             if (outcome == Outcome.FAILED) {
                                 tally[2]++
                             } else {
@@ -416,20 +424,26 @@ class Hydrator(
                         } catch (e: TransientFetchException) {
                             h.rollbackToSavepoint(FILE_SAVEPOINT)
                             // Transient: the file STAYS pending; the next sweep
-                            // retries it. The counter is the throttle-storm trace.
-                            Metrics.hydratorTransientError()
-                            tally[3]++
-                            log.warn(e) {
-                                "transient object-store failure hydrating file ${file.dataFileId} " +
-                                    "(${file.path}); leaving pending for the next sweep"
+                            // retries it. The counter is the throttle-storm trace,
+                            // emitted with the rest of the sweep's signals so a
+                            // rolled-back sweep does not count the retry twice.
+                            signals.afterCommit {
+                                Metrics.hydratorTransientError()
+                                log.warn(e) {
+                                    "transient object-store failure hydrating file ${file.dataFileId} " +
+                                        "(${file.path}); leaving pending for the next sweep"
+                                }
                             }
+                            tally[3]++
                         } catch (e: Exception) {
                             h.rollbackToSavepoint(FILE_SAVEPOINT)
                             // Structural: one bad file must not wedge the sweep.
-                            log.error(e) {
-                                "hydration failed for file ${file.dataFileId} (${file.path}); marking failed"
+                            signals.afterCommit {
+                                log.error(e) {
+                                    "hydration failed for file ${file.dataFileId} (${file.path}); marking failed"
+                                }
                             }
-                            markFailed(h, file)
+                            markFailed(h, file, signals = signals)
                             tally[2]++
                         }
                     }
@@ -438,11 +452,13 @@ class Hydrator(
             } catch (e: Throwable) {
                 // The transaction rolled back. Record the sweep failure
                 // for ALL claimed catalogs, never partial success tallies.
+                // [signals] is discarded with it: the files stayed pending.
                 for (catalogId in tallies.keys) {
                     runStore.recordSweepById(catalogId, MaintenanceTask.HYDRATOR, startedAt, Instant.now(), null, e)
                 }
                 throw e
             }
+        signals.emit()
         val finishedAt = Instant.now()
         for ((catalogId, tally) in tallies) {
             runStore.recordSweepById(
@@ -681,18 +697,21 @@ class Hydrator(
         file: PendingFile,
         prefix: PrefixClaim?,
         objects: ObjectStore,
+        signals: CommittedSignals,
     ): Outcome {
         val footer = readFooter(file, objects)
         // The field-id contract check rides the footer we already hold.
         val missingFieldIds = FooterStats.missingFieldIds(footer.fileMetaData.schema)
         val footerRows = footer.blocks.sumOf { it.rowCount }
         if (footerRows != file.recordCount) {
-            log.error {
-                "REGISTRATION MISMATCH for file ${file.dataFileId} (${file.path}): " +
-                    "parquet footer has $footerRows rows but hog_data_file.record_count " +
-                    "is ${file.recordCount}; marking failed, writing no stats"
+            signals.afterCommit {
+                log.error {
+                    "REGISTRATION MISMATCH for file ${file.dataFileId} (${file.path}): " +
+                        "parquet footer has $footerRows rows but hog_data_file.record_count " +
+                        "is ${file.recordCount}; marking failed, writing no stats"
+                }
             }
-            markFailed(h, file, missingFieldIds)
+            markFailed(h, file, missingFieldIds, signals)
             return Outcome.FAILED
         }
         // Column binding: id-bearing files map by field id, a stable
@@ -758,29 +777,38 @@ class Hydrator(
                 .bind("dataFileId", file.dataFileId)
                 .execute()
         if (flipped == 0) {
-            log.warn {
-                "file ${file.dataFileId} left 'pending' concurrently; stats upserted anyway"
+            signals.afterCommit {
+                log.warn {
+                    "file ${file.dataFileId} left 'pending' concurrently; stats upserted anyway"
+                }
             }
         }
-        Metrics.statsHydrated(if (quarantined) "quarantined" else "provided")
+        val hydratedResult = if (quarantined) "quarantined" else "provided"
+        signals.afterCommit { Metrics.statsHydrated(hydratedResult) }
         if (mismatch != null) {
-            log.warn {
-                "file ${file.dataFileId} (${file.path}) quarantined: its footer does not prove every row " +
-                    "holds its object-prefix value ($mismatch)"
+            signals.afterCommit {
+                log.warn {
+                    "file ${file.dataFileId} (${file.path}) quarantined: its footer does not prove every row " +
+                        "holds its object-prefix value ($mismatch)"
+                }
             }
         }
         if (missingFieldIds) {
-            log.warn {
-                "file ${file.dataFileId} (${file.path}) has leaves without parquet field ids; " +
-                    "flagged missing_field_ids (add_column/rename_column on its table are refused while it is live)"
+            signals.afterCommit {
+                log.warn {
+                    "file ${file.dataFileId} (${file.path}) has leaves without parquet field ids; " +
+                        "flagged missing_field_ids (add_column/rename_column on its table are refused while it is live)"
+                }
             }
         }
-        log.debug {
-            if (belowFloor) {
-                "hydrated file ${file.dataFileId} (${file.path}) without stats rows: " +
-                    "${file.fileSizeBytes} bytes is under the $minFileBytes-byte floor"
-            } else {
-                "hydrated file ${file.dataFileId} (${file.path}): ${aggs.size} column stats"
+        signals.afterCommit {
+            log.debug {
+                if (belowFloor) {
+                    "hydrated file ${file.dataFileId} (${file.path}) without stats rows: " +
+                        "${file.fileSizeBytes} bytes is under the $minFileBytes-byte floor"
+                } else {
+                    "hydrated file ${file.dataFileId} (${file.path}): ${aggs.size} column stats"
+                }
             }
         }
         return when {
@@ -828,14 +856,16 @@ class Hydrator(
      * Flip to 'failed'; when the footer WAS parsed (record-count
      * mismatch), [missingFieldIds] still records the contract check.
      * Rides the sweep transaction's handle (after a rollback to the
-     * per-file savepoint the transaction is healthy again).
+     * per-file savepoint the transaction is healthy again). The
+     * `failed` counter waits for the sweep to commit ([signals]).
      */
     private fun markFailed(
         h: Handle,
         file: PendingFile,
         missingFieldIds: Boolean? = null,
+        signals: CommittedSignals,
     ) {
-        Metrics.statsHydrated("failed")
+        signals.afterCommit { Metrics.statsHydrated("failed") }
         try {
             h.createUpdate(
                 """
@@ -857,7 +887,32 @@ class Hydrator(
                 .bind("dataFileId", file.dataFileId)
                 .execute()
         } catch (e: Exception) {
-            log.error(e) { "could not mark file ${file.dataFileId} failed" }
+            signals.afterCommit {
+                log.error(e) { "could not mark file ${file.dataFileId} failed" }
+            }
+        }
+    }
+
+    /**
+     * Per-file metrics and log lines a sweep has earned. [emit] runs only
+     * after the sweep transaction commits. Discarding the list is how a
+     * rolled-back sweep stays silent: the files are still pending, and
+     * the retry is the attempt that should count and log them (#488).
+     *
+     * Lambdas, not a typed event list: each call site keeps the log line
+     * it already had, and nothing here interprets the text. One sweep
+     * holds at most a handful of lines per claimed file, and a sweep
+     * claims at most [runOnce]'s limit.
+     */
+    private class CommittedSignals {
+        private val actions = ArrayList<() -> Unit>()
+
+        fun afterCommit(action: () -> Unit) {
+            actions.add(action)
+        }
+
+        fun emit() {
+            for (action in actions) action()
         }
     }
 
