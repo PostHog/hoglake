@@ -96,6 +96,8 @@ class HogliteCatalogStore(
     internal val maxInputFiles: Int = com.posthog.hoglake.compaction.CompactionGrouping.DEFAULT_MAX_INPUT_FILES,
     internal val partitionLookupAdmission: HoglitePartitionLookupAdmission = HoglitePartitionLookupAdmission(),
     private val operatorAuthority: Boolean = true,
+    internal val expiryPurgePage: Int = com.posthog.hoglake.service.ExpiryService.PURGE_PAGE,
+    internal val expiryPurgeBudgetMs: Long = com.posthog.hoglake.service.ExpiryService.PURGE_BUDGET_MS,
 ) : CatalogStore {
     internal val json: ObjectMapper = jacksonObjectMapper()
 
@@ -2928,6 +2930,7 @@ class HogliteCatalogStore(
     internal val alters: HogliteAlters by lazy { HogliteAlters(this) }
     internal val views: HogliteViews by lazy { HogliteViews(this) }
     internal val options: HogliteOptions by lazy { HogliteOptions(this) }
+    internal val expiry: HogliteExpiry by lazy { HogliteExpiry(this, expiryPurgePage, expiryPurgeBudgetMs) }
 
     /**
      * Load a receipt with logical expiry.
