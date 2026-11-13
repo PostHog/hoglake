@@ -1247,6 +1247,18 @@ honest options:
 
 Recommend **(i)** in this plan, **(ii)** as a separate decision.
 
+**What the webui does today.** It accepts a pasted access token: a JWT the user
+gets from hogtower's `/oauth/token` with a hoglake credential created in PostHog.
+The token is kept in `sessionStorage` for the tab, sent as `Authorization: Bearer`
+on every `/v1` call and on `/metrics`, and dropped on a 401 or once its `exp`
+passes. The header shows its subject and expiry, decoded in the browser for
+display only. `/v1/info` does not report the auth mode, so the console never
+prompts up front: the sign-in panel opens on the first 401, and a "sign in"
+control is always in the header. Under `off` nothing else changes. Page
+JavaScript can read a token held in `sessionStorage`, which is acceptable for a
+token that lives 15 minutes. Option (ii), an SSO/redirect login with a server-side
+session that keeps the token out of JS, is still a separate decision.
+
 ---
 
 ## 9. Server-side background jobs
