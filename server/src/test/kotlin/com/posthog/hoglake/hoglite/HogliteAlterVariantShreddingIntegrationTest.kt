@@ -349,8 +349,14 @@ class HogliteAlterVariantShreddingIntegrationTest {
             val proxied = HogliteAlters(proxy.store)
             val cat = fixture()
             val before = head(cat)
+            // The read transaction that carries the META row (the head): a
+            // read of the table apart from the head would be another request,
+            // which the hook would let through, and the concurrent alter
+            // would land between the two reads unseen.
             proxy.hook({ method, path, body ->
-                method == "POST" && path.endsWith("/tx") && "\"txid\":\"${HogliteClient.READ_TXID_PREFIX}" in body
+                method == "POST" && path.endsWith("/tx") &&
+                    "\"txid\":\"${HogliteClient.READ_TXID_PREFIX}" in body &&
+                    "consumer_floor FROM meta WHERE id = 1" in body
             }) {
                 // Straight to the engine: renames `t` and re-declares `properties`.
                 alters.alterTable(

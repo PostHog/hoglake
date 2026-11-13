@@ -49,6 +49,7 @@ import org.apache.parquet.io.LocalOutputFile
 import org.apache.parquet.io.api.Binary
 import org.apache.parquet.schema.LogicalTypeAnnotation
 import org.apache.parquet.schema.MessageType
+import org.apache.parquet.schema.MessageTypeParser
 import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName
 import org.apache.parquet.schema.Type
 import org.apache.parquet.schema.Types
@@ -1489,7 +1490,22 @@ class CompactionServiceIntegrationTest {
                 .singleElement()
                 .satisfies({ assertThat(it.files).hasSize(4) })
 
-            val result = svc.runOnce(cat, variantOn)
+            // The probe's view, through its seam: the two `b`s share ONE
+            // interned layout tree, and so do the two `other_b`s — the probe
+            // holds a tree per distinct layout, not per input.
+            var probed: List<VariantLayoutGroups.Probed> = emptyList()
+            svc.afterProbe = { probed = it }
+            val result =
+                try {
+                    svc.runOnce(cat, variantOn)
+                } finally {
+                    svc.afterProbe = {}
+                }
+            assertThat(probed).hasSize(4)
+            val byPath = probed.associateBy { it.file.path }
+            assertThat(byPath.getValue(files[0].path).layouts).isSameAs(byPath.getValue(files[1].path).layouts)
+            assertThat(byPath.getValue(files[2].path).layouts).isSameAs(byPath.getValue(files[3].path).layouts)
+            assertThat(byPath.getValue(files[0].path).layouts).isNotSameAs(byPath.getValue(files[2].path).layouts)
             assertThat(result.groupsCompacted).describedAs("%s", result).isEqualTo(2)
             assertThat(result.filesIn).isEqualTo(4)
             assertThat(result.unconvertibleSchema).isZero()
@@ -2311,6 +2327,151 @@ class CompactionServiceIntegrationTest {
             return i
         }
         return -1
+    }
+
+    @Test
+    fun `a sorted part the wide layout pushes past the merge budget is refused on re-admission, the probe charged`() {
+        // The same files and declaration as above, under a heap budget that
+        // the DECLARED estimate fits (the planner admits one group of twelve)
+        // and the files' wide layout breaks: four rows a chunk makes 36
+        // spilled runs, each charged its read block, far past the merge
+        // budget. The part is refused in metadata before any rewrite —
+        // counted with the planner's refusals, no output, every input live
+        // — and the probe that found it is charged as the one attempt the
+        // group made, so a backlog of such groups is bounded by
+        // maxGroupsPerRun rather than re-probed uncharged every sweep.
+        withVariantMetrics { _ ->
+            val (cat, files) =
+                variantTable("wide-refused", "a", "a", "a", "a", "a", "a", "b", "b", "b", "b", "b", "b")
+            alter.alterTable(
+                cat,
+                "ns",
+                "t",
+                listOf(
+                    AlterOp.SetSortOrder(listOf(SortFieldDef(1, SortDirection.ASC, NullOrder.NULLS_LAST))),
+                    AlterOp.SetVariantShredding("rich", null),
+                ),
+            )
+            val narrow = catalogs.getTable(cat, "ns", "t").columns
+            val wide =
+                ParquetFileReader.open(LocalInputFile(VariantFixtures.path("a"))).use {
+                    ParquetRewriter.variantLayoutsOf(it.footer, narrow, "a")
+                }
+            val rowNodes =
+                narrow.allNodes().size + 1L +
+                    VariantFixtures.live.allNodes().filter { it.def.type == ColType.VARIANT }.sumOf { column ->
+                        val shape = wide[column.fieldId]?.let { VariantLayout.shape(it) } ?: VariantLayout.shape(column)
+                        shape!!.first - 1L
+                    }
+            val heap =
+                CompactionConfig.SORTED_HEAP_BYTES_PER_NODE * rowNodes *
+                    CompactionConfig.DEFAULT_NESTED_SORT_EXPANSION * 4
+            val sorted = variantOn.copy(sortedHeapBytes = heap, minInputFiles = 2, maxGroupsPerRun = 1)
+            assertThat(
+                sorted.spillChunkRows(narrow),
+            ).describedAs("the declaration's estimate: one chunk").isGreaterThan(144)
+            val wideSpill = sorted.sortSpill(narrow, wide)
+            assertThat(wideSpill.chunkRows).isEqualTo(4)
+            assertThat(ExternalMergeSort.spillRuns(144, wideSpill)).isEqualTo(36)
+            val leaves = ParquetRewriter.outputLeafCount(narrow, wide)
+            assertThat(36 * ExternalMergeSort.predictedSpilledRunBytes(leaves, wideSpill))
+                .describedAs("the runs' merge cost is past the budget")
+                .isGreaterThan(wideSpill.mergeBudgetBytes)
+
+            val plan = svc.planTable(cat, "ns", "t", sorted)
+            assertThat(plan.groups).describedAs("admitted against the declared estimate").hasSize(1)
+            assertThat(plan.mergeRefusedGroups + plan.spillRefusedGroups).isZero()
+            val result = svc.runOnce(cat, sorted)
+            assertThat(result.mergeBudgetExceeded).describedAs("%s", result).isEqualTo(1)
+            assertThat(result.spillBudgetExceeded).isZero()
+            assertThat(result.groupsCompacted).isZero()
+            assertThat(result.failedGroups).isZero()
+            assertThat(result.unconvertibleSchema).isZero()
+            assertThat(
+                result.layoutProbeOnly,
+            ).describedAs("the probe's footer reads are the group's one attempt").isEqualTo(1)
+            assertThat(catalogs.listFiles(cat, "ns", "t").map { it.path })
+                .describedAs("every input live, no output")
+                .containsExactlyInAnyOrderElementsOf(files.map { it.path })
+        }
+    }
+
+    @Test
+    fun `a file with a REPEATED variant child refuses its group as layout, counted, and every input stays live`() {
+        // The data-loss shape end to end: the probe refuses the whole group
+        // (there is no layout such a file could be copied into), the
+        // refusal is `unconvertible_schema` and counted `layout`, nothing is
+        // written and the inputs are exactly as they were.
+        withVariantMetrics { registry ->
+            val (cat, files) = variantTable("repeated-child", "b", "b")
+            val schema =
+                MessageTypeParser.parseMessageType(
+                    "message m { required int64 id = 1; " +
+                        "optional group props (VARIANT(1)) = 2 { required binary metadata; repeated binary value; } }",
+                )
+            val rows = 1500L
+            val bytes =
+                customParquetBytes(
+                    schema,
+                    (0 until rows.toInt()).map {
+                            r ->
+                        { g: Group ->
+                            g.add("id", r.toLong())
+                            val props = g.addGroup("props")
+                            props.add("metadata", Binary.fromConstantByteArray(byteArrayOf(1, 0, 0)))
+                            props.add("value", Binary.fromConstantByteArray(byteArrayOf(0)))
+                            props.add("value", Binary.fromConstantByteArray(byteArrayOf(12, (r % 100).toByte())))
+                        }
+                    },
+                )
+            assertThat(bytes.size).isBetween(files[0].fileSizeBytes.toInt() / 2, files[0].fileSizeBytes.toInt() * 2)
+            val path = "s3://$BUCKET/$cat/data/ns/t/repeated.parquet"
+            store.put(path, bytes)
+            commits.commit(
+                cat,
+                CommitRequest(
+                    appends =
+                        listOf(
+                            TableAppend(
+                                "ns",
+                                "t",
+                                listOf(
+                                    FileRegistration(
+                                        path,
+                                        rows,
+                                        bytes.size.toLong(),
+                                        columnStats =
+                                            listOf(
+                                                ColumnStats(
+                                                    1,
+                                                    rows,
+                                                    0,
+                                                    null,
+                                                    null,
+                                                    IcebergSingleValue.encodeLong(0),
+                                                    IcebergSingleValue.encodeLong(rows - 1),
+                                                ),
+                                            ),
+                                    ),
+                                ),
+                            ),
+                        ),
+                ),
+            )
+            assertThat(svc.planTable(cat, "ns", "t", variantOn).groups).singleElement().satisfies({
+                assertThat(it.files).hasSize(3)
+            })
+            val result = svc.runOnce(cat, variantOn)
+            assertThat(result.unconvertibleSchema).describedAs("%s", result).isEqualTo(1)
+            assertThat(result.groupsCompacted + result.failedGroups + result.layoutProbeOnly).isZero()
+            assertThat(counter(registry, "hoglake_compaction_variant_layout_mismatch_total", cat, "reason" to "layout"))
+                .isEqualTo(1.0)
+            assertThat(
+                counter(registry, "hoglake_compaction_variant_layout_mismatch_total", cat, "reason" to "split"),
+            ).isNull()
+            assertThat(catalogs.listFiles(cat, "ns", "t").map { it.path })
+                .containsExactlyInAnyOrderElementsOf(files.map { it.path } + path)
+        }
     }
 
     private val variantOn get() = cfg.copy(targetBytes = 1L shl 20, variantCompaction = true)

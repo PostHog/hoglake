@@ -289,6 +289,45 @@ class VariantLayoutTest {
     }
 
     @Test
+    fun `a layout holding a map is nested, as one holding a list is, and its chunk is derated like one`() {
+        // The declaration grammar lays out lists only, so the declared
+        // shape is nested by its list; a file's own layout may hold a MAP,
+        // whose entries per row the node count cannot know any more than a
+        // list's. Both derate the sorted chunk by nestedSortExpansion.
+        val variant = "optional group v (VARIANT(1)) = 7"
+        val withMap =
+            parse(
+                "$variant { required binary metadata; optional binary value; optional group m (MAP) { " +
+                    "repeated group key_value { required binary key; optional binary value; } } }",
+            )
+        val flat = parse("$variant { required binary metadata; optional binary value; }")
+        assertThat(VariantLayout.shape(withMap)).isEqualTo(7 to true)
+        assertThat(VariantLayout.shape(flat)).isEqualTo(3 to false)
+        assertThat(VariantLayout.shape(VariantLayout.groupType(column(DECLARATION), Type.Repetition.OPTIONAL)).second)
+            .describedAs("the declaration's list")
+            .isTrue()
+
+        // The chunk: an unshredded declaration (3 nodes, flat) under a file
+        // layout with the map (7 nodes, nested) is derated by the expansion
+        // on top of its extra nodes.
+        val live = listOf(Column(1, 0, ColumnDef("id", ColType.LONG)), column(null))
+        val cfg =
+            CompactionConfig(
+                targetBytes = 1L shl 30,
+                maxGroupsPerRun = 1,
+                sortedHeapBytes = 1L shl 30,
+                nestedSortExpansion = 16,
+            )
+        val nodesFlat = 2 + 1 + (3 - 1)
+        val nodesMap = 2 + 1 + (7 - 1)
+        assertThat(
+            cfg.spillChunkRows(live),
+        ).isEqualTo((1L shl 30) / (CompactionConfig.SORTED_HEAP_BYTES_PER_NODE * nodesFlat))
+        assertThat(cfg.spillChunkRows(live, mapOf(7L to withMap)))
+            .isEqualTo((1L shl 30) / (CompactionConfig.SORTED_HEAP_BYTES_PER_NODE * nodesMap) / 16)
+    }
+
+    @Test
     fun `a refusal names the two differing nodes on one line, never their subtrees`() {
         // The grammar's widest object: its subtree printed is ~120 KB, in a
         // warning logged for the group on every sweep.

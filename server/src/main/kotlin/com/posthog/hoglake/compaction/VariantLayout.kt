@@ -110,15 +110,25 @@ object VariantLayout {
      */
     fun shape(group: GroupType): Pair<Int, Boolean> {
         var nodes = 0
-        var list = false
+        var nested = false
 
         fun walk(type: Type) {
             nodes++
-            if (type.logicalTypeAnnotation is LogicalTypeAnnotation.ListLogicalTypeAnnotation) list = true
+            // A LIST or a MAP layer holds any number of entries per row: the
+            // node count below it is a floor, and `nestedSortExpansion`
+            // stands in for the lengths (CompactionConfig.spillChunkRows).
+            // The declaration grammar lays out lists only; a file's own
+            // layout ([canonical]) may hold a map.
+            when (type.logicalTypeAnnotation) {
+                is LogicalTypeAnnotation.ListLogicalTypeAnnotation,
+                is LogicalTypeAnnotation.MapLogicalTypeAnnotation,
+                -> nested = true
+                else -> {}
+            }
             if (!type.isPrimitive) type.asGroupType().fields.forEach(::walk)
         }
         walk(group)
-        return nodes to list
+        return nodes to nested
     }
 
     /**

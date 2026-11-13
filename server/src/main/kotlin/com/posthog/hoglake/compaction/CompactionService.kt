@@ -1444,6 +1444,14 @@ class CompactionService(
     internal var beforeRewrite: (List<ParquetRewriter.Input>) -> Unit = {}
 
     /**
+     * A hook [layoutParts] calls with what the variant-layout probe read of
+     * a group's inputs, before they are partitioned: a test's view of the
+     * probe's own memory (that equal layouts are one interned tree).
+     * Default is a no-op; nothing but a test sets it.
+     */
+    internal var afterProbe: (List<VariantLayoutGroups.Probed>) -> Unit = {}
+
+    /**
      * The smallest input row group the rewrite appends byte for byte
      * ([ParquetRewriter.APPEND_MIN_ROW_GROUP_BYTES], a constant, not a
      * knob). A var only so an integration test can append kilobyte
@@ -3213,7 +3221,8 @@ class CompactionService(
                 "compaction refused ${mergeRefused.size} sorted group(s) of ${ctx.namespace}.${ctx.table} " +
                     "whose merge cannot fit the sorted heap budget even with every trusted input " +
                     "spilled: the largest holds ${worstMerge.survivingRecords} surviving row(s), " +
-                    "${cfg.spillChunkRows(ctx.columns)} row(s) per spill file, against " +
+                    "${cfg.spillChunkRows(ctx.columns)} row(s) per spill file (the declared layout's estimate; " +
+                    "a part in another variant layout is re-judged by its own at execution), against " +
                     "${cfg.sortedHeapBytesPerGroup} B per group (HOGLAKE_COMPACTION_SORTED_HEAP_BYTES " +
                     "${cfg.sortedHeapBytes} B / HOGLAKE_COMPACTION_PARALLEL_GROUPS " +
                     "${cfg.parallelGroups}). Each spilled run holds a row group while it is merged, " +
@@ -4337,11 +4346,15 @@ class CompactionService(
                     GroupTally()
                 }
             val planned = decided ?: return tally
-            // A probe that read every footer and found nothing worth a
-            // rewrite still spent a group's IO: charged as one attempt
-            // (`layout_probe_only`), so a sweep over a backlog of such
-            // groups is bounded by maxGroupsPerRun like any other.
-            if (planned.probed && planned.parts.isEmpty()) return tally + GroupTally(layoutProbeOnly = 1)
+            // How many parts reached a rewrite. A probe that read every
+            // footer and ran none — nothing worth a rewrite, or every part
+            // refused on its own re-admission below — still spent a group's
+            // IO: charged as one attempt (`layout_probe_only`) after the
+            // loop, so a sweep over a backlog of such groups is bounded by
+            // maxGroupsPerRun like any other. (The budget refusals are not
+            // attempts, as the planner's are not; without this the probe's
+            // footer reads would repeat every sweep, uncounted.)
+            var ran = 0
             // ONE REWRITE PER PART, each resolved on its own: a part that
             // fails after another committed must not take the committed
             // one's accounting with it, which is why the arms wrap each
@@ -4375,6 +4388,17 @@ class CompactionService(
                         }
                     }
                 if (partSpill != null && part.layouts.isNotEmpty()) {
+                    // The leaf count is the part's output schema's. That schema
+                    // cannot fail to build for a planned part: every layout in
+                    // it is one the probe's walk accepted, and the live
+                    // columns are the ones the planner built the declared
+                    // output schema from (a live schema no output schema can
+                    // be made of — a `_hog_row_id` collision, a corrupt
+                    // container row — is unreachable through the API, and
+                    // [pack] leaves such a table for the rewrite to refuse,
+                    // typed, before any IO). Kept total on the same terms as
+                    // [pack]: no count, no budget check, and the rewrite's own
+                    // refusal counts the part.
                     val leaves = runCatching { ParquetRewriter.outputLeafCount(ctx.columns, part.layouts) }.getOrNull()
                     val refusal = leaves?.let { budgetRefusal(ctx, partSpill, it, part.group) }
                     if (refusal != null) {
@@ -4383,7 +4407,8 @@ class CompactionService(
                                 "$catalog/${ctx.namespace}.${ctx.table} in a variant layout of " +
                                 "${partSpill.chunkRows} rows per chunk is refused by the " +
                                 "sorted rewrite's ${refusal.name.lowercase()} budget; the planner admitted the group " +
-                                "against the declared layout's shape. Levers as for the planner's refusals"
+                                "against the declared layout's estimate of ${ctx.sortSpill?.chunkRows} rows per " +
+                                "chunk. Levers as for the planner's refusals"
                         }
                         tally +=
                             when (refusal) {
@@ -4394,8 +4419,9 @@ class CompactionService(
                         continue
                     }
                 }
+                ran++
                 tally +=
-                    attempt(catalog, ctx, part.group, cfg, heapExhausted) { work ->
+                    attempt(catalog, ctx, part.group, cfg, heapExhausted, partSpill) { work ->
                         val outcome =
                             compactGroup(ctx, part.group, part.layouts, part.footers, partSpill) { r ->
                                 work.tally =
@@ -4444,6 +4470,7 @@ class CompactionService(
                 // The probe's footers for this part are spent either way.
                 part.dropFooters()
             }
+            if (planned.probed && ran == 0) tally += GroupTally(layoutProbeOnly = 1)
             return tally
         } finally {
             // RELEASED ONLY IF THE GROUP DID NOT COMMIT, and that
@@ -4528,6 +4555,8 @@ class CompactionService(
         group: CompactionGroup,
         cfg: CompactionConfig,
         heapExhausted: java.util.concurrent.atomic.AtomicBoolean,
+        /** The sorted bounds this rewrite runs under (a part's own, see executeGroup), for the heap arm's message. */
+        spill: SortSpill? = ctx.sortSpill,
         body: (RewriteWork) -> GroupTally,
     ): GroupTally {
         val work = RewriteWork()
@@ -4674,7 +4703,7 @@ class CompactionService(
                 "compaction group of ${group.files.size} files " +
                     "(${group.survivingRecords} survivors) exhausted the heap for " +
                     "$catalog/${ctx.namespace}.${ctx.table}; ending the sweep. A sorted rewrite " +
-                    "holds one chunk of ${cfg.spillChunkRows(ctx.columns)} rows or its admitted " +
+                    "holds one chunk of ${spill?.chunkRows ?: cfg.spillChunkRows(ctx.columns)} rows or its admitted " +
                     "merge runs, each bounded by ${cfg.sortedHeapBytesPerGroup} B per group, so " +
                     "the chunk accounting (per-node heap estimate, nested expansion) or the merge " +
                     "admission under-counted this table's shape. Lower " +
@@ -4761,6 +4790,7 @@ class CompactionService(
         val declared = VariantLayout.declared(ctx.columns)
         val declaredFingerprint = VariantLayout.fingerprint(declared)
         val probed = probeLayouts(ctx, group)
+        afterProbe(probed)
         val split =
             VariantLayoutGroups.split(
                 group,

@@ -341,10 +341,16 @@ class VariantPassthroughTest {
                 assertThat(it.reason).isEqualTo("layout")
                 assertThat(it.message).contains("`props.value` is REPEATED outside a LIST or MAP layer")
             }
-        // The rewrite, under the declared layout and under an explicitly
-        // named one alike: there is no layout this can be written in.
-        for (layouts in listOf(emptyMap(), probe("a"))) {
-            val out = tmp.resolve("repeated-out-${layouts.size}.parquet")
+        // The rewrite, under the declared layout, under another named
+        // layout, and under the file's OWN subtree named as the layout
+        // (what a probe that let it through would have handed the rewrite):
+        // there is no layout this can be written in, and the last case is
+        // the one only the subtree check refuses — layoutMismatch passes a
+        // subtree against itself.
+        val own = mapOf(2L to schema.getType("props").asGroupType())
+        assertThat(VariantLayout.layoutMismatch(schema.getType("props"), own.getValue(2L))).isNull()
+        for ((label, layouts) in listOf("declared" to emptyMap(), "other" to probe("a"), "own" to own)) {
+            val out = tmp.resolve("repeated-out-$label.parquet")
             assertThatThrownBy {
                 ParquetRewriter.rewrite(
                     listOf(localInput(path, 0)),
@@ -354,9 +360,13 @@ class VariantPassthroughTest {
                     variantCompaction = true,
                     variantLayouts = layouts,
                 )
-            }.isInstanceOfSatisfying(
-                VariantLayoutMismatchException::class.java,
-            ) { assertThat(it.reason).isEqualTo("layout") }
+            }.describedAs(label)
+                .isInstanceOfSatisfying(VariantLayoutMismatchException::class.java) {
+                    assertThat(it.reason).describedAs(label).isEqualTo("layout")
+                    assertThat(
+                        it.message,
+                    ).describedAs(label).contains("`props.value` is REPEATED outside a LIST or MAP layer")
+                }
             assertThat(out).doesNotExist()
         }
     }
