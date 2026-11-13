@@ -23,7 +23,7 @@ arrow-buffer = "59.3"
 arrow-data = "59.3"
 arrow-schema = "59.3"
 pyo3 = { version = "0.30.1", features = ["abi3-py312"], optional = true }
-pyo3-arrow = { version = "0.20.0", optional = true }
+pyo3-arrow = { version = "0.21.0", optional = true }
 
 [dev-dependencies]
 # An independent decoder to read the output, and the JSON to compare it to.
