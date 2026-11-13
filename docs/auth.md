@@ -229,7 +229,7 @@ chosen per deployment:
 | --- | --- |
 | `ambient` (default) | the SDK's default chain: a pod identity in Kubernetes, an instance profile, or the environment |
 | `static` | `HOGLAKE_S3_ACCESS_KEY` and `HOGLAKE_S3_SECRET_KEY`: MinIO, local development, CI, the compose quickstart |
-| `broker` | an HTTP call to `HOGLAKE_STORAGE_BROKER_URL`, authenticated with hoglake's own client credential (`HOGLAKE_STORAGE_BROKER_CLIENT_ID` / `_CLIENT_SECRET`) exchanged at `HOGLAKE_STORAGE_BROKER_TOKEN_URL`: `POST <url>` with `{"catalog", "prefix", "access": "read" \| "write" \| "delete"}`, answered with `{"access_key_id", "secret_access_key", "session_token", "expiration"}`, STS's shape (`session_token` may be absent for a broker that vends expiring keys instead). One session per catalog and access, held in memory and refreshed `HOGLAKE_STORAGE_BROKER_REFRESH_MARGIN_SECONDS` (default 300) before it expires; never written to the metadata store |
+| `broker` | an HTTP call to `HOGLAKE_STORAGE_BROKER_URL`, authenticated with hoglake's own client credential (`HOGLAKE_STORAGE_BROKER_CLIENT_ID` / `_CLIENT_SECRET`) exchanged at `HOGLAKE_STORAGE_BROKER_TOKEN_URL`: `POST <url>` with `{"catalog", "prefix", "access": "read" \| "write" \| "delete"}`, answered with `{"access_key_id", "secret_access_key", "session_token", "expiration"}`, STS's shape (`session_token` may be absent for a broker that vends expiring keys instead). One session per catalog and access, held in memory and refreshed `HOGLAKE_STORAGE_BROKER_REFRESH_MARGIN_SECONDS` (default 300) before it expires; never written to the metadata store. `HOGLAKE_STORAGE_BROKER_ALLOW_HTTP=true` accepts `http` URLs to any host |
 
 `HOGLAKE_STORAGE_PROVIDER` selects one. Unset, it is `static` when both keys
 are set and `ambient` otherwise — what hoglake did before the knob existed, so
@@ -248,7 +248,12 @@ clients' client-credentials form, `grant_type=client_credentials` with
 URLs must be `https` — the client secret and every vended key cross that
 hop — with `http` accepted only for `localhost`, `127.0.0.1` or `[::1]`,
 the dev stack's and the test suite's in-process brokers; anything else
-refuses to start. The refresh lead is the margin or half the credential's
+refuses to start, naming the one way around it:
+`HOGLAKE_STORAGE_BROKER_ALLOW_HTTP=true`, which accepts `http` to any host
+and is the operator's statement that the hop to the broker runs inside a
+network they already trust — a broker's in-cluster listener reached by its
+Service name, for instance. It is a knob, not a hostname pattern, so that
+statement lives in the values file. The refresh lead is the margin or half the credential's
 lifetime, whichever is shorter, for the session and for the bearer token
 alike, so a 300-second session is still cached for 150 seconds rather than
 re-vended on every request. A refresh that fails is not retried by the
