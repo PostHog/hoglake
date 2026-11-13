@@ -6,6 +6,7 @@ import com.posthog.hoglake.auth.Routing
 import com.posthog.hoglake.auth.hoglakeAuth
 import com.posthog.hoglake.auth.verifiedBackendToken
 import com.posthog.hoglake.hoglite.HogliteCatalogStore
+import com.posthog.hoglake.hoglite.HogliteCleanup
 import com.posthog.hoglake.hoglite.HogliteClient
 import com.posthog.hoglake.hoglite.HoglitePartitionLookupAdmission
 import com.posthog.hoglake.hoglite.HogliteTenantResolver
@@ -22,6 +23,7 @@ import com.posthog.hoglake.service.OptionsBackend
 import com.posthog.hoglake.service.PartitionListingBackend
 import com.posthog.hoglake.service.PartitionLookupBackend
 import com.posthog.hoglake.service.PartitionStatsBackend
+import com.posthog.hoglake.service.RemovalStore
 import com.posthog.hoglake.service.RetirementBackend
 import com.posthog.hoglake.service.TableCreationBackend
 import com.posthog.hoglake.service.UploadBackend
@@ -44,6 +46,8 @@ class CatalogStoreSelector(
      * Client (Config refuses both at boot).
      */
     private val mountHosts: MountHostResolver = MountHostResolver.NONE,
+    /** The server owns this store. Request-scoped cleanup backends only borrow it. */
+    private val removalStore: () -> RemovalStore = { error("cleanup object store is not configured") },
 ) : CatalogRegistry {
     private val clients = ConcurrentHashMap<UUID, HogliteClient>()
     private val lookupAdmissions = ConcurrentHashMap<UUID, HoglitePartitionLookupAdmission>()
@@ -318,7 +322,10 @@ class CatalogStoreSelector(
         call: ApplicationCall,
         catalog: String,
         postgres: () -> CleanupBackend,
-    ): CleanupBackend = postgresMaintenance(call, catalog, postgres)
+    ): CleanupBackend =
+        (forCatalog(call, catalog) as? HogliteCatalogStore)?.let {
+            HogliteCleanup(checkNotNull(cfg), it, removalStore())
+        } ?: postgres()
 
     fun compaction(
         call: ApplicationCall,
