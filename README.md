@@ -221,7 +221,8 @@ management console, a native Trino connector, a DuckDB extension and a
 benchmark harness. Everything is tested, and it is deployed as Gigahog in three
 environments — dev, prod-us and prod-eu. Authentication is opt-in: the server
 verifies bearer JWTs against a configured issuer's JWKS and authorizes per
-catalog when `HOGLAKE_AUTH_MODE` is `warn` or `enforce`, and is unauthenticated
+catalog when `HOGLAKE_AUTH_MODE` is `warn` or `enforce`, is its own issuer at
+`local` (one key, `hoglake token mint` for each client), and is unauthenticated
 at `off`, which is the default. hoglake is a resource server: it issues nothing
 on the request path and calls nothing to decide a request. The issuer is a
 deployment choice — any identity provider that emits hoglake's token contract;
@@ -257,7 +258,8 @@ dependency change, `uv lock` (from any member, or `just pyhoglake lock`)
 rewrites the one lock. All of them need Python 3.12 or newer.
 
 [AGENT.md](AGENT.md) holds the pre-push checklist, the repository invariants
-and the working conventions.
+and the working conventions. `main` accepts only signed commits; see
+[CONTRIBUTING.md](CONTRIBUTING.md#signed-commits) for the setup.
 
 The wire contract is
 [`openapi/hoglake.yaml`](server/src/main/resources/openapi/hoglake.yaml), and

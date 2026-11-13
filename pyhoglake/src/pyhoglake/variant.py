@@ -5,8 +5,9 @@ the layout that writers which shred VARIANT values give it in their
 Parquet files: which object fields and array elements get Parquet
 columns of their own, and the Variant type of each. Readers never need
 it, because each file's footer records its own layout, so a declaration
-steers only the writers that honour it. It is fixed when the column is
-defined; no alter op changes it.
+steers only the writers that honour it. :func:`pyhoglake.ops.set_variant_shredding`
+replaces or clears it once the column exists; files already written keep
+their layout, and later writes follow the new declaration.
 
 A declaration is a tree of JSON objects, each with a ``type``::
 
@@ -184,9 +185,10 @@ def validate_shredding(
 def json_unshreddable_paths(shredding: Shredding | None) -> list[tuple[str, str]]:
     """``(path, reason)`` for the declared leaves JSON text fills rarely or never.
 
-    A declaration is immutable, so a leaf that data written from JSON
-    can never reach is a column that stays empty for the life of the
-    table. The report follows the rules by which pyhoglake's write paths
+    A declaration is in force for every file written until
+    :func:`pyhoglake.ops.set_variant_shredding` replaces it, so a leaf
+    that data written from JSON can never reach is a column that stays
+    empty in all of them. The report follows the rules by which pyhoglake's write paths
     encode JSON text (from 1.4.8): an integer within the int64 range is
     the smallest integer type that holds it, a larger one decimal16
     with scale 0, any other number a double, a string a string. A value
@@ -292,7 +294,8 @@ class VariantReport:
     1024 characters, ``...`` marking the cut. ``typed``, ``fallback`` and
     ``variant_null`` are keyed by ``(column, declared path)`` for every
     declared node with a type (not ``variant``), and say how well a
-    declaration fits the data, which matters because it is immutable:
+    declaration fits the data, which is what decides whether to replace it
+    (:func:`pyhoglake.ops.set_variant_shredding`):
 
     - ``typed``: values that went to ``typed_value``; an object counts
       there with or without a residual;

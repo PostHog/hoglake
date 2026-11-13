@@ -40,6 +40,14 @@ class AuthService(
     val tenantOnly: Boolean = false,
     /** The deployment's extra client classes (`HOGLAKE_AUTH_CLIENT_CLASSES`); see [clientClass]. */
     val clientClasses: Set<String> = emptySet(),
+    /**
+     * Under [AuthMode.LOCAL], the public JWKS document derived from
+     * `HOGLAKE_AUTH_SIGNING_KEY`, served at `/.well-known/jwks.json` so a
+     * backend or a sibling that verifies the same tokens can fetch the key the
+     * way it would fetch any issuer's. Null in every other mode: the server
+     * publishes no key it does not own.
+     */
+    val localJwks: String? = null,
 ) {
     /** This request's `client` label: [clientClass] with this deployment's extra classes. */
     fun clientClass(call: ApplicationCall): String = clientClass(call, clientClasses)
@@ -67,7 +75,7 @@ class AuthService(
             requireNotNull(verifier) {
                 "HOGLAKE_PUBLIC_PORT requires HOGLAKE_AUTH_MODE warn or enforce: the public listener always enforces"
             }
-        return AuthService(AuthMode.ENFORCE, v, tenantOnly = true, clientClasses = clientClasses)
+        return AuthService(AuthMode.ENFORCE, v, tenantOnly = true, clientClasses = clientClasses, localJwks = localJwks)
     }
 
     companion object {
@@ -79,6 +87,7 @@ class AuthService(
         fun fromConfig(cfg: com.posthog.hoglake.Config): AuthService {
             val mode = AuthMode.parse("HOGLAKE_AUTH_MODE", cfg.authMode)
             if (mode == AuthMode.OFF) return AuthService(mode, null, clientClasses = cfg.authClientClasses)
+            if (mode == AuthMode.LOCAL) return local(cfg)
 
             val issuer = cfg.authIssuer.trim()
             require(issuer.isNotEmpty()) {
@@ -95,6 +104,43 @@ class AuthService(
             return AuthService(
                 mode = mode,
                 clientClasses = cfg.authClientClasses,
+                verifier =
+                    JwtVerifier(
+                        issuer = issuer,
+                        audience = audience,
+                        keys = keys,
+                        skewSeconds = cfg.authClockSkewSeconds,
+                        scopedMaxLifetimeSeconds = cfg.authScopedMaxLifetimeSeconds,
+                        backends = cfg.backendKinds,
+                        predicateFields =
+                            cfg.authPredicateFields.split(',').map { it.trim() }.filter { it.isNotEmpty() }.toSet(),
+                    ),
+            )
+        }
+
+        /**
+         * `local`: the key IS the configuration. The issuer defaults to
+         * [LocalIssuer.DEFAULT_LOCAL_ISSUER] because a standalone install has
+         * no second instance to keep a token from replaying at; an operator who
+         * sets one anyway gets it. Config already refused a JWKS file or URL
+         * beside the key, and a missing key, naming the variable.
+         */
+        private fun local(cfg: com.posthog.hoglake.Config): AuthService {
+            val key =
+                try {
+                    LocalSigningKey.decode(cfg.authSigningKey.value)
+                } catch (e: IllegalArgumentException) {
+                    throw IllegalArgumentException("HOGLAKE_AUTH_MODE=local: ${e.message}", e)
+                }
+            val issuer = cfg.authIssuer.trim().ifEmpty { LocalIssuer.DEFAULT_LOCAL_ISSUER }
+            val audience = cfg.authAudience.trim()
+            require(audience.isNotEmpty()) { "HOGLAKE_AUTH_AUDIENCE must not be blank" }
+            val keys = key.signingKeys()
+            Metrics.authSigningKeys { keys.keyCount }
+            return AuthService(
+                mode = AuthMode.LOCAL,
+                clientClasses = cfg.authClientClasses,
+                localJwks = key.publicJwks(),
                 verifier =
                     JwtVerifier(
                         issuer = issuer,

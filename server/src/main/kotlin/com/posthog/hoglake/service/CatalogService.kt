@@ -1167,12 +1167,6 @@ class CatalogService(private val jdbi: Jdbi) {
         jdbi.withHandleUnchecked { h ->
             val cat = requireCatalog(h, catalog)
             val at = resolveReadSnapshot(h, cat, snapshot, atTimestamp)
-            val ns = requireNamespace(h, cat, namespace)
-            val t =
-                TableRepo.findAt(h, cat.catalogId, ns.namespaceId, table, at)
-                    ?: throw HoglakeException.NotFound(
-                        "table '$namespace.$table' in catalog '$catalog' at snapshot $at",
-                    )
             // Asked for by the CALLER, not derived from `at`:
             // resolveReadSnapshot returns head when neither parameter is
             // given, so `at` alone cannot tell a head read from a
@@ -1180,6 +1174,12 @@ class CatalogService(private val jdbi: Jdbi) {
             // must answer differently, one from the sample and one from
             // the manifest.
             val timeTravel = snapshot != null || atTimestamp != null
+            val ns = NamespaceRepo.requireForRead(h, cat, namespace, at, pinned = timeTravel)
+            val t =
+                TableRepo.findAt(h, cat.catalogId, ns.namespaceId, table, at)
+                    ?: throw HoglakeException.NotFound(
+                        "table '$namespace.$table' in catalog '$catalog' at snapshot $at",
+                    )
             val sampled =
                 if (totals && !timeTravel) {
                     sampledTotals(h, cat.catalogId, t.tableId)
@@ -1226,60 +1226,6 @@ class CatalogService(private val jdbi: Jdbi) {
             )
         }
 
-    /** A usable per-table sample: the three totals plus what dates them. */
-    private data class SampledTotals(
-        val recordCount: Long,
-        val fileCount: Long,
-        val fileSizeBytes: Long,
-        val snapshotId: Long,
-        val asOf: Instant,
-    )
-
-    /**
-     * The published generation's totals for one table, or null when that
-     * generation is not an answer for it — the three cases enumerated in
-     * [getTable]'s KDoc, in the order they are checked here.
-     *
-     * NO COMPACTION-POLICY CHECK, unlike `PartitionListingService` and
-     * `PartitionStatsService`, which both discard a sample computed
-     * under a different `targetBytes` / min / max. Those read
-     * `small_count`, `small_bytes` and `selected`, which ARE the policy's
-     * output. `file_count`, `record_count` and `total_bytes` are counts
-     * of files, rows and bytes: the policy cannot change them, so
-     * discarding a sample over it would throw away a correct answer.
-     * That is also why this service needs no policy knobs in its
-     * constructor.
-     */
-    private fun sampledTotals(
-        h: Handle,
-        catalogId: Long,
-        tableId: Long,
-    ): SampledTotals? {
-        // 1. the sampler has no row for the catalog at all (warm-up),
-        //    or it has one with no published sample, or with a sample
-        //    this build cannot parse — the sampler's own lenient read,
-        //    because a newer replica's shape must degrade the numbers
-        //    rather than 500 a request path.
-        val tier = TierTotalsRepo.totalsFor(h, catalogId, tableId) ?: return null
-        val sample = tier.sample ?: return null
-        // 2. the scan never saw this table.
-        if (tier.createdSnapshot > sample.snapshotId) return null
-        // 3. rows may be undercounted for the whole generation.
-        if (!tier.measured) return null
-        return SampledTotals(
-            recordCount = tier.recordCount,
-            fileCount = tier.fileCount,
-            fileSizeBytes = tier.fileSizeBytes,
-            snapshotId = sample.snapshotId,
-            // startedAt, NOT the summary row's sampled_at: a generation
-            // runs for tens of minutes, so the publish instant is up to
-            // that far after the numbers were true. `startedAt` is when
-            // `snapshotId` was captured, so the pair makes ONE claim —
-            // the distinction PartitionListing's own comment records.
-            asOf = sample.startedAt,
-        )
-    }
-
     /**
      * Live tables at head, each with its comment, its file rollup and
      * its retained-history counts.
@@ -1315,13 +1261,7 @@ class CatalogService(private val jdbi: Jdbi) {
                 TableRepo.listLiveSummaries(h, cat.catalogId, ns.namespaceId)
             } else {
                 val at = resolveReadSnapshot(h, cat, snapshot, atTimestamp)
-                // The namespace AT the snapshot, not the live one: a pinned
-                // reader must still list a namespace dropped after its pin.
-                val ns =
-                    NamespaceRepo.findAt(h, cat.catalogId, namespace, at)
-                        ?: throw HoglakeException.NotFound(
-                            "namespace '$namespace' in catalog '$catalog' at snapshot $at",
-                        )
+                val ns = NamespaceRepo.requireForRead(h, cat, namespace, at, pinned = true)
                 TableRepo.listLiveSummaries(h, cat.catalogId, ns.namespaceId, at)
             }
         }
@@ -1343,7 +1283,8 @@ class CatalogService(private val jdbi: Jdbi) {
         jdbi.withHandleUnchecked { h ->
             val cat = requireCatalog(h, catalog)
             val at = resolveReadSnapshot(h, cat, snapshot, atTimestamp)
-            val ns = requireNamespace(h, cat, namespace)
+            val pinned = snapshot != null || atTimestamp != null
+            val ns = NamespaceRepo.requireForRead(h, cat, namespace, at, pinned)
             val t =
                 TableRepo.findAt(h, cat.catalogId, ns.namespaceId, table, at)
                     ?: throw HoglakeException.NotFound(
@@ -1393,7 +1334,8 @@ class CatalogService(private val jdbi: Jdbi) {
         jdbi.withHandleUnchecked { h ->
             val cat = requireCatalog(h, catalog)
             val at = resolveReadSnapshot(h, cat, snapshot, atTimestamp)
-            val ns = requireNamespace(h, cat, namespace)
+            val pinned = snapshot != null || atTimestamp != null
+            val ns = NamespaceRepo.requireForRead(h, cat, namespace, at, pinned)
             val t =
                 TableRepo.findAt(h, cat.catalogId, ns.namespaceId, table, at)
                     ?: throw HoglakeException.NotFound(
@@ -1537,7 +1479,8 @@ class CatalogService(private val jdbi: Jdbi) {
         jdbi.withHandleUnchecked { h ->
             val cat = requireCatalog(h, catalog)
             val at = resolveReadSnapshot(h, cat, snapshot, atTimestamp)
-            val ns = requireNamespace(h, cat, namespace)
+            val pinned = snapshot != null || atTimestamp != null
+            val ns = NamespaceRepo.requireForRead(h, cat, namespace, at, pinned)
             val t =
                 TableRepo.findAt(h, cat.catalogId, ns.namespaceId, table, at)
                     ?: throw HoglakeException.NotFound(
@@ -1607,7 +1550,9 @@ class CatalogService(private val jdbi: Jdbi) {
                         "snapshot instead of consuming this feed",
                 )
             }
-            val ns = requireNamespace(h, cat, namespace)
+            // An explicit to_snapshot pins the feed: its table and namespace
+            // are the ones alive at `to`, as for every other pinned read.
+            val ns = NamespaceRepo.requireForRead(h, cat, namespace, to, pinned = toSnapshot != null)
             val t =
                 TableRepo.findAt(h, cat.catalogId, ns.namespaceId, table, to)
                     ?: throw HoglakeException.NotFound(
@@ -1928,4 +1873,61 @@ class CatalogService(private val jdbi: Jdbi) {
         }
         return at
     }
+}
+
+/** A usable per-table sample: the three totals plus what dates them. */
+internal data class SampledTotals(
+    val recordCount: Long,
+    val fileCount: Long,
+    val fileSizeBytes: Long,
+    val snapshotId: Long,
+    val asOf: Instant,
+)
+
+/**
+ * The published generation's totals for one table, or null when that
+ * generation is not an answer for it — the three cases enumerated in
+ * [CatalogService.getTable]'s KDoc, in the order they are checked here.
+ * One indexed row read, never a file scan: what a head GET answers with,
+ * and what an alter that changed nothing answers with (AlterService),
+ * since neither has a snapshot of its own to be exact for.
+ *
+ * NO COMPACTION-POLICY CHECK, unlike `PartitionListingService` and
+ * `PartitionStatsService`, which both discard a sample computed
+ * under a different `targetBytes` / min / max. Those read
+ * `small_count`, `small_bytes` and `selected`, which ARE the policy's
+ * output. `file_count`, `record_count` and `total_bytes` are counts
+ * of files, rows and bytes: the policy cannot change them, so
+ * discarding a sample over it would throw away a correct answer.
+ * That is also why CatalogService needs no policy knobs in its
+ * constructor.
+ */
+internal fun sampledTotals(
+    h: Handle,
+    catalogId: Long,
+    tableId: Long,
+): SampledTotals? {
+    // 1. the sampler has no row for the catalog at all (warm-up),
+    //    or it has one with no published sample, or with a sample
+    //    this build cannot parse — the sampler's own lenient read,
+    //    because a newer replica's shape must degrade the numbers
+    //    rather than 500 a request path.
+    val tier = TierTotalsRepo.totalsFor(h, catalogId, tableId) ?: return null
+    val sample = tier.sample ?: return null
+    // 2. the scan never saw this table.
+    if (tier.createdSnapshot > sample.snapshotId) return null
+    // 3. rows may be undercounted for the whole generation.
+    if (!tier.measured) return null
+    return SampledTotals(
+        recordCount = tier.recordCount,
+        fileCount = tier.fileCount,
+        fileSizeBytes = tier.fileSizeBytes,
+        snapshotId = sample.snapshotId,
+        // startedAt, NOT the summary row's sampled_at: a generation
+        // runs for tens of minutes, so the publish instant is up to
+        // that far after the numbers were true. `startedAt` is when
+        // `snapshotId` was captured, so the pair makes ONE claim —
+        // the distinction PartitionListing's own comment records.
+        asOf = sample.startedAt,
+    )
 }

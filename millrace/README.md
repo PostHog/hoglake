@@ -57,6 +57,23 @@ shape behavior:
 | `MILLRACE_VARIANT_SOURCES` | unset | `column=payload_key,…`: the variant columns filled from a payload key's JSON text (see "VARIANT columns") |
 | `MILLRACE_STAGE_REPIN_FROM` | unset | the old `table_uuid`, for one rollout that moves `MILLRACE_TABLE` to a new table: each stage pinned to it re-pins and drains into the new table instead of halting (exit 3). Remove it once every pod has rolled |
 
+### Authenticating to hoglake
+
+A hoglake server running `HOGLAKE_AUTH_MODE=warn`, `enforce` or `local`
+needs a bearer on every request (hoglake's `docs/auth.md`). millrace reads
+one credential from the environment and hands it to pyhoglake; set exactly
+one source, or none for an `off` server:
+
+| Variables | Meaning |
+|---|---|
+| `HOGLAKE_AUTH_TOKEN_URL`, `HOGLAKE_AUTH_CLIENT_ID`, `HOGLAKE_AUTH_CLIENT_SECRET` (+ `HOGLAKE_AUTH_AUDIENCE`, default `hoglake`) | OAuth 2.0 client credentials against the token endpoint that issues hoglake tokens; pyhoglake mints, caches and refreshes the token, and re-mints once on a 401. The normal choice for a long-running daemon |
+| `HOGLAKE_AUTH_TOKEN` | a fixed token, sent as is until it expires (then every call fails with 401 and the pod must be restarted with a new one) |
+| `HOGLAKE_AUTH_TOKEN_FILE` | the same, read once at startup from a file — for a standalone server whose operator minted a token with `hoglake-server token mint` |
+
+Two sources set at once is a configuration error (exit 2), never a
+precedence rule, so a leftover variable can never silently choose the
+credential. The credential needs `write` on the destination catalog.
+
 ## Destination
 
 Created from configuration at startup when missing
@@ -98,8 +115,13 @@ MILLRACE_VARIANT_SOURCES=properties_sv=properties
 ```
 
 The shredded layout comes from the live column's
-`type_params.shredding` only (no alter changes it), never from millrace
-configuration. A live variant column is not reported as a difference
+`type_params.shredding` only, never from millrace configuration. An
+operator changes it with `ops.set_variant_shredding(name, decl)`: the
+alter is a DDL snapshot, so the next commit built on the cached shape is
+refused `ddl_since_read_snapshot`, millrace re-reads the table and
+rebuilds that flush on the new declaration, and every file from then on
+is laid out in it. Files already written keep their layout (the server
+holds no file to the declaration; readers use each file's own footer). A live variant column is not reported as a difference
 from `MILLRACE_TABLE_COLUMNS`, which cannot name one, so the operator
 adds it without touching that knob.
 
@@ -191,8 +213,9 @@ never from payload keys):
 - `millrace_variant_invalid_total{column, reason}`;
 - `millrace_variant_values_total{column, path, outcome}`, per declared
   path, outcome `typed`, `fallback` (kept in `value`: the type did not
-  match) or `variant_null`. A high fallback share means the immutable
-  declaration does not fit the data;
+  match) or `variant_null`. A high fallback share means the declaration
+  does not fit the data — the case for replacing it with
+  `ops.set_variant_shredding` (VARIANT columns, above);
 - `millrace_variant_encode_seconds_total{column, backend}`, the wall
   seconds of the column's encode calls, less `PYHOGLAKE_VARIANT_SHADOW`'s,
   under the process's codec (`native` or `python`; calls `auto` gives

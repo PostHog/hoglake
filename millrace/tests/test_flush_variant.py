@@ -658,3 +658,86 @@ async def test_a_column_added_under_a_running_flusher_is_written_sql_null(
     rows = parquet_rows(store, registration["path"])
     assert sv(rows) == [None, None, None]
     assert flusher.stats().variant_rows == {}
+
+
+@component
+async def test_a_declaration_changed_under_a_running_flusher_relays_out_the_next_flush(
+    httpx_mock: Any,
+    stage_factory: Any,
+    fake_clock: Any,
+    flusher_factory: Any,
+    store: FakeObjectStore,
+) -> None:
+    """The operator replaces the live column's declaration
+    (``ops.set_variant_shredding``) while millrace runs. millrace reads the
+    declaration from the live column only, through its shape cache: the
+    commit built on the cached (old) shape is refused
+    ``ddl_since_read_snapshot``, the shape is dropped and re-read, and the
+    rebuild encodes the same rows in the NEW declaration — the file it
+    registers carries the new fields and none of the old-only ones — with
+    nothing dropped and nothing stuck."""
+    from millrace.stage import StagedRecord
+
+    old_only = "$referring_domain"
+    new_only = "$plugins_succeeded"
+    assert any(f["name"] == old_only for f in DECLARATION["fields"])
+    changed = {
+        "type": "object",
+        "fields": [
+            {"name": "$browser", "type": "string"},
+            {"name": new_only, "type": "array", "element": {"type": "string"}},
+        ],
+    }
+    relaid = [
+        *COLUMNS_WIRE,
+        PROPERTIES,
+        {**PROPERTIES_SV, "type_params": {"shredding": changed}},
+    ]
+    payload = event_payload(
+        7,
+        NOW,
+        properties=json.dumps(
+            {"$browser": "Firefox", new_only: ["a", "b"], old_only: "x"}
+        ),
+    )
+
+    stage = await stage_factory()
+    await stage.stage_batch(
+        [
+            StagedRecord(group=team_group(7), offset=i, payload=payload)
+            for i in range(3)
+        ],
+        now_us=fake_clock(),
+    )
+    script_options(httpx_mock)
+    ddl = commit_refusal(409, "ddl_since_read_snapshot", "set_variant_shredding")
+    capture = CommitCapture(httpx_mock, [ddl, commit_ok(96)])
+    flusher = flusher_factory(
+        store=store,
+        cfg=make_config(variant_sources=(("properties_sv", "properties"),)),
+        table=table_wire(columns=VARIANT_WIRE),
+    )
+    script_table_refresh(
+        httpx_mock, table=table_wire(columns=relaid, read_snapshot_id=95)
+    )
+
+    report = await flush_group(flusher, stage, team_group(7), "size")
+
+    assert (report.outcome, report.records, report.dropped) == ("committed", 3, 0)
+    assert [p["read_snapshot"] for p in capture.payloads] == [88, 95]
+    (registration,) = capture.payloads[1]["appends"][0]["files"]
+    parquet = pq.ParquetFile(
+        pa.BufferReader(store.files[registration["path"].removeprefix("s3://")])
+    )
+    schema = str(parquet.schema)
+    assert "properties_sv (Variant(1))" in schema
+    assert new_only in schema and old_only not in schema  # the NEW declaration's layout
+    live = Column.from_wire({**PROPERTIES_SV, "type_params": {"shredding": changed}})
+    assert (
+        to_python(parquet.read().column("properties_sv"), live)
+        == [{"$browser": "Firefox", new_only: ["a", "b"], old_only: "x"}] * 3
+    )
+    # Both builds encoded the three rows, the second under the new paths.
+    stats = flusher.stats()
+    assert stats.variant_rows[("properties_sv", "encoded")] == 6
+    assert stats.variant_values[("properties_sv", f"$.{new_only}", "typed")] == 3

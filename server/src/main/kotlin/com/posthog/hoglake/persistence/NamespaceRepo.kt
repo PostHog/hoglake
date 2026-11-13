@@ -1,5 +1,6 @@
 package com.posthog.hoglake.persistence
 
+import com.posthog.hoglake.model.CatalogInfo
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.NamespaceContainment
 import com.posthog.hoglake.model.NamespaceInfo
@@ -143,6 +144,33 @@ object NamespaceRepo {
             .map(::namespaceRow)
             .findOne()
             .orElse(null)
+
+    /**
+     * The namespace a READ of [cat] resolves [name] to, or NotFound. A
+     * head read ([pinned] false) resolves the live namespace. A pinned
+     * read (`snapshot` / `at_timestamp` given) resolves the incarnation
+     * alive at [at] ([findAt]): a pinned reader must still see a
+     * namespace dropped after its pin, and must not see one recreated
+     * under the same name after it. Every read that takes a pin
+     * (getTable, listTables, listFiles, partitionValues, fileStats,
+     * changes, planScan) resolves through here, so they agree on the
+     * incarnation; [at] alone cannot tell a head read from a pinned read
+     * that names head, hence the flag.
+     */
+    fun requireForRead(
+        handle: Handle,
+        cat: CatalogInfo,
+        name: String,
+        at: Long,
+        pinned: Boolean,
+    ): NamespaceInfo =
+        if (!pinned) {
+            findLiveByName(handle, cat.catalogId, name)
+                ?: throw HoglakeException.NotFound("namespace '$name' in catalog '${cat.name}'")
+        } else {
+            findAt(handle, cat.catalogId, name, at)
+                ?: throw HoglakeException.NotFound("namespace '$name' in catalog '${cat.name}' at snapshot $at")
+        }
 
     fun listLive(
         handle: Handle,

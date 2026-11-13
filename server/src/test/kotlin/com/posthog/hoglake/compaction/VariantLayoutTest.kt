@@ -141,6 +141,193 @@ class VariantLayoutTest {
     }
 
     @Test
+    fun `a file's subtree canonicalizes to the layout the output writes, and equal layouts to equal groups`() {
+        val group = VariantLayout.groupType(column(DECLARATION), Type.Repetition.OPTIONAL)
+        // The declared layout is its own canonical form.
+        assertThat(VariantLayout.canonical(group, column(DECLARATION))).isEqualTo(group)
+        // A file's wider spelling — renamed, REQUIRED, legacy TIME_MICROS,
+        // ids below the top — canonicalizes to the declared group exactly:
+        // the relation layoutMismatch passes is equality here.
+        val wider =
+            parse(
+                """
+                required group old_name (VARIANT(1)) = 9 {
+                  required binary metadata = 10;
+                  optional binary value = 11;
+                  optional group typed_value = 12 {
+                    required group t { optional binary value; optional int64 typed_value (TIME(MICROS,false)); }
+                    required group tags {
+                      optional binary value;
+                      optional group typed_value (LIST) {
+                        repeated group list {
+                          required group element { optional binary value; optional binary typed_value (STRING); }
+                        }
+                      }
+                    }
+                  }
+                }
+                """,
+            )
+        assertThat(VariantLayout.layoutMismatch(wider, group)).isNull()
+        assertThat(VariantLayout.canonical(wider, column(DECLARATION))).isEqualTo(group)
+        // Another layout is another group, and fingerprints follow.
+        val other = parse("optional group v (VARIANT(1)) { required binary metadata; required binary value; }")
+        val canonicalOther = VariantLayout.canonical(other, column(DECLARATION))!!
+        assertThat(canonicalOther).isNotEqualTo(group)
+        assertThat(canonicalOther).isEqualTo(VariantLayout.groupType(column(null), Type.Repetition.OPTIONAL))
+        assertThat(VariantLayout.fingerprint(mapOf(7L to canonicalOther)))
+            .isNotEqualTo(VariantLayout.fingerprint(mapOf(7L to group)))
+            .isEqualTo(
+                VariantLayout.fingerprint(mapOf(7L to VariantLayout.groupType(column(null), Type.Repetition.OPTIONAL))),
+            )
+        // The canonical form is what the output writes a NOT NULL column as, too.
+        assertThat(VariantLayout.withRepetition(group, Type.Repetition.REQUIRED))
+            .isEqualTo(VariantLayout.groupType(column(DECLARATION, nullable = false), Type.Repetition.REQUIRED))
+        assertThat(VariantLayout.withRepetition(group, Type.Repetition.OPTIONAL)).isSameAs(group)
+    }
+
+    @Test
+    fun `what is no VARIANT group has no canonical layout`() {
+        val unshredded = "required binary metadata; required binary value;"
+        val variant = "optional group v (VARIANT(1)) = 7"
+        for ((case, field) in listOf(
+            "a leaf" to "optional binary v = 7;",
+            "a repeated group" to "repeated group v (VARIANT(1)) = 7 { $unshredded }",
+            "no VARIANT annotation" to "optional group v = 7 { $unshredded }",
+            "no metadata at all" to "$variant { required binary value; required binary meta; }",
+            "optional metadata" to "$variant { optional binary metadata; required binary value; }",
+            "a group named metadata" to
+                "$variant { required group metadata { required binary m; } required binary value; }",
+        )) {
+            val type = MessageTypeParser.parseMessageType("message m { $field }").getType(0)
+            assertThat(VariantLayout.canonical(type, column(DECLARATION))).describedAs(case).isNull()
+            assertThat(VariantLayout.layoutOf(type, column(DECLARATION)))
+                .describedAs(case)
+                .isInstanceOfSatisfying(VariantLayout.Layout.Refused::class.java) {
+                    assertThat(it.reason).contains("not one VARIANT group")
+                }
+        }
+    }
+
+    @Test
+    fun `metadata is found by name, and the source order of the children is kept`() {
+        // Spark writes `value` before `metadata`; the specification fixes no
+        // order. The canonical form keeps the file's order, since the copy
+        // is positional and the output is written in this very layout.
+        val valueFirst = parse("optional group v (VARIANT(1)) = 7 { required binary value; required binary metadata; }")
+        val canonical = VariantLayout.canonical(valueFirst, column(DECLARATION))!!
+        assertThat(canonical.fields.map { it.name }).containsExactly("value", "metadata")
+        assertThat(render(canonical))
+            .isEqualTo("optional group v (VARIANT(1)) = 7 { required binary value; required binary metadata; }")
+        assertThat(VariantLayout.layoutMismatch(valueFirst, canonical)).isNull()
+        // Another layout than metadata-first, so the two never share a part.
+        assertThat(canonical).isNotEqualTo(VariantLayout.groupType(column(null), Type.Repetition.OPTIONAL))
+    }
+
+    @Test
+    fun `a subtree the positional copy cannot carry whole is refused, naming the node`() {
+        // identityStep copies a REPEATED node only as the repeated group of
+        // a LIST (one child) or a MAP (two); any other repetition is read at
+        // its first value and the rest are lost — with the row count right,
+        // so the output would commit. Refused before it can be a layout.
+        val variant = "optional group v (VARIANT(1)) = 7"
+        val refused =
+            mapOf(
+                "a repeated value" to "$variant { required binary metadata; repeated binary value; }",
+                "a repeated typed_value leaf" to
+                    "$variant { required binary metadata; optional binary value; repeated int64 typed_value; }",
+                "a repeated field group" to
+                    "$variant { required binary metadata; optional binary value; optional group typed_value { " +
+                    "repeated group t { optional binary value; optional binary typed_value; } } }",
+                "a repeated leaf inside a field group" to
+                    "$variant { required binary metadata; optional binary value; optional group typed_value { " +
+                    "required group t { optional binary value; repeated binary typed_value; } } }",
+                "a LIST with no repeated layer" to
+                    "$variant { required binary metadata; optional binary value; optional group typed_value (LIST) { " +
+                    "required group element { optional binary value; } } }",
+                "a LIST whose layer has two children" to
+                    "$variant { required binary metadata; optional binary value; optional group typed_value (LIST) { " +
+                    "repeated group list { required group element { optional binary value; } optional binary x; } } }",
+                "a MAP whose key is optional" to
+                    "$variant { required binary metadata; optional group m (MAP) { repeated group key_value { " +
+                    "optional binary key; optional binary value; } } }",
+                "a repeated leaf inside a list element" to
+                    "$variant { required binary metadata; optional binary value; optional group typed_value (LIST) { " +
+                    "repeated group list { required group element { repeated binary value; } } } }",
+            )
+        for ((case, schema) in refused) {
+            val layout = VariantLayout.layoutOf(parse(schema), column(DECLARATION))
+            assertThat(layout).describedAs(case).isInstanceOf(VariantLayout.Layout.Refused::class.java)
+            assertThat((layout as VariantLayout.Layout.Refused).reason).describedAs(case).contains("v.")
+            assertThat(VariantLayout.canonical(parse(schema), column(DECLARATION))).describedAs(case).isNull()
+        }
+        assertThat(
+            (
+                VariantLayout.layoutOf(
+                    parse(refused.getValue("a repeated value")),
+                    column(DECLARATION),
+                ) as VariantLayout.Layout.Refused
+            ).reason,
+        )
+            .contains("`v.value` is REPEATED outside a LIST or MAP layer")
+        // The shapes the copy DOES carry: the declared layout's list, a map.
+        assertThat(
+            VariantLayout.layoutOf(
+                VariantLayout.groupType(column(DECLARATION), Type.Repetition.OPTIONAL),
+                column(DECLARATION),
+            ),
+        )
+            .isInstanceOf(VariantLayout.Layout.Of::class.java)
+        val withMap =
+            parse(
+                "$variant { required binary metadata; optional binary value; optional group m (MAP) { " +
+                    "repeated group key_value { required binary key; optional binary value; } } }",
+            )
+        assertThat(
+            VariantLayout.layoutOf(withMap, column(DECLARATION)),
+        ).isInstanceOf(VariantLayout.Layout.Of::class.java)
+    }
+
+    @Test
+    fun `a layout holding a map is nested, as one holding a list is, and its chunk is derated like one`() {
+        // The declaration grammar lays out lists only, so the declared
+        // shape is nested by its list; a file's own layout may hold a MAP,
+        // whose entries per row the node count cannot know any more than a
+        // list's. Both derate the sorted chunk by nestedSortExpansion.
+        val variant = "optional group v (VARIANT(1)) = 7"
+        val withMap =
+            parse(
+                "$variant { required binary metadata; optional binary value; optional group m (MAP) { " +
+                    "repeated group key_value { required binary key; optional binary value; } } }",
+            )
+        val flat = parse("$variant { required binary metadata; optional binary value; }")
+        assertThat(VariantLayout.shape(withMap)).isEqualTo(7 to true)
+        assertThat(VariantLayout.shape(flat)).isEqualTo(3 to false)
+        assertThat(VariantLayout.shape(VariantLayout.groupType(column(DECLARATION), Type.Repetition.OPTIONAL)).second)
+            .describedAs("the declaration's list")
+            .isTrue()
+
+        // The chunk: an unshredded declaration (3 nodes, flat) under a file
+        // layout with the map (7 nodes, nested) is derated by the expansion
+        // on top of its extra nodes.
+        val live = listOf(Column(1, 0, ColumnDef("id", ColType.LONG)), column(null))
+        val cfg =
+            CompactionConfig(
+                targetBytes = 1L shl 30,
+                maxGroupsPerRun = 1,
+                sortedHeapBytes = 1L shl 30,
+                nestedSortExpansion = 16,
+            )
+        val nodesFlat = 2 + 1 + (3 - 1)
+        val nodesMap = 2 + 1 + (7 - 1)
+        assertThat(
+            cfg.spillChunkRows(live),
+        ).isEqualTo((1L shl 30) / (CompactionConfig.SORTED_HEAP_BYTES_PER_NODE * nodesFlat))
+        assertThat(cfg.spillChunkRows(live, mapOf(7L to withMap)))
+            .isEqualTo((1L shl 30) / (CompactionConfig.SORTED_HEAP_BYTES_PER_NODE * nodesMap) / 16)
+    }
+
+    @Test
     fun `a refusal names the two differing nodes on one line, never their subtrees`() {
         // The grammar's widest object: its subtree printed is ~120 KB, in a
         // warning logged for the group on every sweep.

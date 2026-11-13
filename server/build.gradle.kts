@@ -11,7 +11,7 @@ repositories {
     mavenCentral()
 }
 
-val ktorVersion = "3.5.2"
+val ktorVersion = "3.6.1"
 val jdbiVersion = "3.55.0"
 // Current stable, looked up on Maven Central rather than recalled (the
 // 11.8.2 this replaced was 16 months old). Anything before ~11.10 warns
@@ -25,10 +25,10 @@ val jdbiVersion = "3.55.0"
 // the transactional lock through the typed configuration extension. See
 // the comment there — losing that setting HANGS every migration rather
 // than failing it.
-val flywayVersion = "13.11.1"
+val flywayVersion = "13.12.1"
 // >= 1.21.1: older versions pin Docker API 1.32, which OrbStack's Docker 29 rejects.
 val testcontainersVersion = "1.21.4"
-val awsSdkVersion = "2.57.4"
+val awsSdkVersion = "2.57.10"
 
 dependencies {
     // Background loops (BackgroundLoops.kt): explicit pin of the
@@ -99,7 +99,7 @@ dependencies {
     // Compaction applies DVs at rewrite time (PuffinDeletionVector.kt), and
     // the Java RoaringBitmap serialize/deserialize format IS the portable
     // interoperable format the spec requires.
-    implementation("org.roaringbitmap:RoaringBitmap:1.6.27")
+    implementation("org.roaringbitmap:RoaringBitmap:1.6.29")
 
     // Logging + observability
     implementation("ch.qos.logback:logback-classic:1.6.6")
@@ -223,7 +223,9 @@ tasks.test {
         .withPropertyName("sharedVectors")
         .withPathSensitivity(PathSensitivity.RELATIVE)
     // The hoglite live tests skip without HOGLITE_BINARY, and fail instead
-    // with HOGLITE_REQUIRED=1 (the hoglite-live CI job). Both are inputs,
+    // with HOGLITE_REQUIRED=1 (the hoglite-live CI job, and locally
+    // `just test-hoglite`: ci/hoglite-live-local.sh, a Linux container,
+    // since hoglited ships for Linux only). Both are inputs,
     // so a change of engine, or of the switch, re-runs :test instead of
     // leaving UP-TO-DATE reports from another engine (or from none).
     val hogliteBinary = providers.environmentVariable("HOGLITE_BINARY").orNull.orEmpty()

@@ -838,8 +838,9 @@ def compile_plan(shredding: Shredding | None) -> Plan:
     ValidationError :func:`pyhoglake.variant.validate_shredding` raises.
 
     A declaration compiled before is found by its canonical JSON without
-    being validated again: a declaration is immutable once its column
-    exists, and the writer compiles each column's three times a file
+    being validated again: the key is the declaration itself, so a column
+    whose declaration an alter replaced simply compiles afresh under the
+    new key, and the writer compiles each column's three times a file
     (schema, encode, write), for every partition group of a flush. The hit
     is confirmed by equality with the plan's own declaration (the plain
     dicts and lists the canonical JSON reads back as), so a spelling json

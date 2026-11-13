@@ -1882,8 +1882,10 @@ class HogliteExtendedGuardRaceIntegrationTest {
 
     /**
      * The liveTable read carries the table's schema fence.
-     * An alter sends it as a `/query`.
-     * A commit includes it and the meta read in one read-only `/tx`.
+     * A commit includes it and the meta read in one read-only `/tx`; so
+     * does an alter (HogliteCatalogStore.headTableRow), whose statement
+     * also selects the head beside the fence. Matched on the two
+     * fragments every spelling of the read shares.
      */
     private fun isLiveTableRead(
         m: String,
@@ -1891,7 +1893,8 @@ class HogliteExtendedGuardRaceIntegrationTest {
         b: String,
     ) = m == "POST" &&
         (p.endsWith("/query") || (p.endsWith("/tx") && isReadBatch(b))) &&
-        "t.next_row_id, t.schema_version FROM table_versions v" in b
+        "t.next_row_id, t.schema_version" in b &&
+        "FROM table_versions v" in b
 
     @Test
     fun `a commit plans with one read-only transaction, not one query per read`() {

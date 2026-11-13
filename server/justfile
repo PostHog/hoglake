@@ -55,6 +55,12 @@ run:
 clean:
     {{_gradle}} clean --console=plain
 
+# The local issuer's shell: `just token keygen`, `just token mint --catalog demo --scope write`.
+# Offline; reads HOGLAKE_AUTH_SIGNING_KEY from the environment. The installed
+# binary runs the same thing as `bin/hoglake-server token …`.
+token *args:
+    {{_gradle}} -q run --args="token {{args}}" --console=plain
+
 # Swagger UI over the OpenAPI spec, live-reloading on file edits
 # (volume mount). http://localhost:8090 — HOGLAKE_SWAGGER_PORT overrides.
 docs:
