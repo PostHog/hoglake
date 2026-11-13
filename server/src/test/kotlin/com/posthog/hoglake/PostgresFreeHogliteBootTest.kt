@@ -8,7 +8,6 @@ import com.posthog.hoglake.auth.TestTokens
 import com.sun.net.httpserver.HttpServer
 import io.ktor.client.request.get
 import io.ktor.client.request.header
-import io.ktor.client.request.post
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
@@ -93,7 +92,7 @@ class PostgresFreeHogliteBootTest {
                         assertThat(forwardedAuthority.get() == "Bearer $token").isTrue()
                         assertThat(listed.bodyAsText()).contains("s3://bucket/lake")
                         val maintenance =
-                            client.post("/v1/catalogs/lake/maintenance/cleanup") {
+                            client.get("/v1/catalogs/lake/maintenance/status") {
                                 header(HttpHeaders.Authorization, "Bearer $token")
                             }
                         assertThat(maintenance.status).isEqualTo(HttpStatusCode.NotImplemented)

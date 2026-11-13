@@ -1012,6 +1012,14 @@ the API pods' pool connections — with RDS idle at 8% CPU the whole time.
 Shortening the sweep interval to 15 s shortens each hold and leaves the
 duty cycle where it was.
 
+Hoglite supports `POST /v1/catalogs/{catalog}/maintenance/cleanup` for the
+catalog in the token's placement. Each call drains bounded bulk and staging
+queues, then purges old run records, receipts, and drained removals.
+The drain checks live and historical file references and active uploads.
+It uses the server's object-store configuration, as PostgreSQL cleanup does.
+Per-call AWS identity remains separate work. Hoglite has no cleanup loop,
+catalog registry, or loop lease.
+
 Hoglite supports `POST /v1/catalogs/{catalog}/maintenance/compact` for the
 catalog in the token's placement. The call plans groups, reserves their inputs,
 rewrites Parquet through the shared data plane, and publishes with transaction-local guards.
@@ -1022,8 +1030,7 @@ A bounded process-local cursor cache rotates capped windows across manual calls.
 A process restart can repeat a window. Claims and publication remain correct without this cache.
 Hoglite installs the live bucket/size-order index when it creates a tenant schema.
 Without that index, a plan uses one capped read instead of repeated sorted pages.
-Staged-output cleanup depends on the cleanup port in #606. Until that port lands,
-undrained staging tickets can fill retirement's queue ceiling.
+Run manual cleanup to drain old staged-output tickets.
 The server owns the shared object store and its configured credential provider.
 Per-call AWS identity remains separate work. Hoglite has no compaction loop,
 catalog registry, fleet sweep, or loop lease.

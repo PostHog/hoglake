@@ -314,6 +314,8 @@ internal object HogliteSchema {
                 schema_version INTEGER NOT NULL,
                 created_at TEXT NOT NULL
             )""",
+            // First-release DDL. Drop and recreate development tenants instead of adding migration code.
+            "CREATE INDEX IF NOT EXISTS receipts_created_at ON receipts(created_at, idempotency_key)",
             """CREATE TABLE IF NOT EXISTS offsets(
                 consumer_id TEXT NOT NULL,
                 table_uuid TEXT NOT NULL,
@@ -382,6 +384,12 @@ internal object HogliteSchema {
                 drained_outcome TEXT
             )""",
             "CREATE INDEX IF NOT EXISTS removals_unclaimed ON removals(claimed_at)",
+            // Each ordered claim walk ignores the opposite arm's backlog.
+            "CREATE INDEX IF NOT EXISTS removals_staging_queue ON removals(id) " +
+                "WHERE drained_at IS NULL AND reason = 'compaction_staging'",
+            "CREATE INDEX IF NOT EXISTS removals_bulk_queue ON removals(id) " +
+                "WHERE drained_at IS NULL AND (reason IS NULL OR reason <> 'compaction_staging')",
+            "CREATE INDEX IF NOT EXISTS removals_drained_at ON removals(drained_at, id) WHERE drained_at IS NOT NULL",
             """CREATE TABLE IF NOT EXISTS views(
                 id INTEGER PRIMARY KEY,
                 namespace_id INTEGER NOT NULL,
@@ -428,6 +436,7 @@ internal object HogliteSchema {
                 result_json TEXT
             )""",
             "CREATE INDEX IF NOT EXISTS maintenance_runs_task ON maintenance_runs(task, id)",
+            "CREATE INDEX IF NOT EXISTS maintenance_runs_started_at ON maintenance_runs(started_at, id)",
         ) + SCALE_INDEXES
 
     private val TS_FORMAT: DateTimeFormatter =
