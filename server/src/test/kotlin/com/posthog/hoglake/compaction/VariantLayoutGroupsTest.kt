@@ -452,6 +452,199 @@ class VariantLayoutGroupsTest {
     }
 
     @Test
+    fun `a loan that would repack an admitted main group is not made, and one that leaves it intact is`() {
+        // Four remembered old-layout files and ten unknowns, all of 2000
+        // bytes at a target of 10 000 and a minimum of five: main packs into
+        // two groups of five in candidate order, [5..9] refused (6 is the
+        // file over budget) and [10..14] admitted. Lending 5 to the four
+        // would leave nine, which the planner repacks smallest first as
+        // [6..10] — refused still, for 6 — and [11..14]: four files stranded
+        // until something arrives, an admitted rewrite traded for a
+        // stranded remainder. Not lent.
+        val memory = VariantLayoutMemory()
+        val declared = VariantLayout.fingerprint(DECLARED)
+        val old = VariantLayout.fingerprint(VariantLayoutGroups.deviations(OLD, DECLARED))
+        (1L..4L).forEach { memory.remember(1, it, declared, old) }
+        val files = (1..14).map { candidate(it.toLong(), bytes = 2_000) }
+
+        fun packed(main: List<CompactionCandidate>) =
+            grouping.groups(main, 5, 64) {
+                it.fileSizeBytes
+            }.map { g -> g.map { it.dataFileId } }
+        val sixOverBudget = { group: List<CompactionCandidate> -> group.none { it.dataFileId == 6L } }
+        val divided = memory.populations(1, declared, files)
+        assertThat(packed(divided.main)).containsExactly((5L..9L).toList(), (10L..14L).toList())
+        assertThat(packed(files.drop(5)))
+            .describedAs("main without 5: the admitted five are no group any more")
+            .containsExactly((6L..10L).toList())
+        assertThat(VariantLayoutGroups.borrow(divided, grouping, 5, 64, admitMain = sixOverBudget) { it.fileSizeBytes })
+            .isEmpty()
+        assertThat(divided.main.map { it.dataFileId }).containsExactlyElementsOf((5L..14L).toList())
+        assertThat(divided.others.single().files.map { it.dataFileId }).containsExactly(1L, 2L, 3L, 4L)
+
+        // The group, not its files: with a fifteenth file, over budget too,
+        // trailing after the admitted five, lending 5 repacks the rest as
+        // [6..10] and [11..15] — every admitted file is in a group again, and
+        // both groups are refused. Still not lent.
+        val trailing = files + candidate(15, bytes = 2_000)
+        val sixAndFifteen = { group: List<CompactionCandidate> ->
+            group.none { it.dataFileId == 6L || it.dataFileId == 15L }
+        }
+        val withTrailing = memory.populations(1, declared, trailing)
+        assertThat(packed(withTrailing.main)).containsExactly((5L..9L).toList(), (10L..14L).toList())
+        assertThat(packed(trailing.drop(5))).containsExactly((6L..10L).toList(), (11L..15L).toList())
+        assertThat(
+            VariantLayoutGroups.borrow(withTrailing, grouping, 5, 64, admitMain = sixAndFifteen) { it.fileSizeBytes },
+        ).isEmpty()
+        assertThat(withTrailing.main.map { it.dataFileId }).containsExactlyElementsOf((5L..15L).toList())
+
+        // And with the fifteenth file WITHIN budget: lending 5 repacks the
+        // rest as [6..10], refused, and [11..15], admitted — as many admitted
+        // groups as before, but not the same one, and 10 is stranded in the
+        // refused group. Still not lent.
+        val withinBudget = memory.populations(1, declared, trailing)
+        assertThat(packed(withinBudget.main)).containsExactly((5L..9L).toList(), (10L..14L).toList())
+        assertThat(
+            VariantLayoutGroups.borrow(withinBudget, grouping, 5, 64, admitMain = sixOverBudget) { it.fileSizeBytes },
+        ).isEmpty()
+        assertThat(withinBudget.main.map { it.dataFileId }).containsExactlyElementsOf((5L..15L).toList())
+
+        // Without the admitted group the same loan is made: [5..9] alone
+        // leaves [6..9], and no admitted group held them.
+        val alone = memory.populations(1, declared, files.take(9))
+        assertThat(
+            VariantLayoutGroups.borrow(alone, grouping, 5, 64, admitMain = sixOverBudget) { it.fileSizeBytes }
+                .map { it.dataFileId },
+        ).containsExactly(5L)
+
+        // The refused band AFTER the admitted one in size order: [5..9] at
+        // 2000 is admitted and closes first, [10..14] at 2400 (11 over
+        // budget) is refused and closes after it. Lending 10 leaves [5..9]
+        // exactly as it was and [11..14] a refused group of four (a group of
+        // 2400-byte files needs 10 000 / 2400 = 4). Lent.
+        val bands = files.take(9) + (10..14).map { candidate(it.toLong(), bytes = 2_400) }
+        val elevenOverBudget = { group: List<CompactionCandidate> -> group.none { it.dataFileId == 11L } }
+        val ordered = memory.populations(1, declared, bands)
+        assertThat(packed(ordered.main)).containsExactly((5L..9L).toList(), (10L..14L).toList())
+        assertThat(
+            VariantLayoutGroups.borrow(ordered, grouping, 5, 64, admitMain = elevenOverBudget) { it.fileSizeBytes }
+                .map { it.dataFileId },
+        ).containsExactly(10L)
+        assertThat(ordered.main.map { it.dataFileId }).containsExactly(5L, 6L, 7L, 8L, 9L, 11L, 12L, 13L, 14L)
+        assertThat(packed(ordered.main)).containsExactly((5L..9L).toList(), (11L..14L).toList())
+    }
+
+    @Test
+    fun `the loan search is bounded - a fan-in of idle files in candidate order, the largest populations only`() {
+        val declared = VariantLayout.fingerprint(DECLARED)
+        val old = VariantLayout.fingerprint(VariantLayoutGroups.deviations(OLD, DECLARED))
+        val refused = { _: List<CompactionCandidate> -> false }
+
+        // THE CANDIDATE CAP. Four remembered 100-byte files at a minimum of
+        // five, the main population refused outright. Its unknowns, in
+        // candidate order: a fan-in (eight) of 2000-byte files, which the
+        // dominance split keeps apart from the four, then one of 100 bytes
+        // that would complete them. Only the first fan-in of idle files is
+        // offered, so the completer is not seen; one place earlier, it is.
+        val memory = VariantLayoutMemory()
+        (1L..4L).forEach { memory.remember(1, it, declared, old) }
+        val four = (1..4).map { candidate(it.toLong()) }
+        val big = (5..12).map { candidate(it.toLong(), bytes = 2_000) }
+        val completer = candidate(13)
+        val beyond = memory.populations(1, declared, four + big + completer)
+        assertThat(
+            VariantLayoutGroups.borrow(beyond, grouping, 5, 8, admitMain = refused) { it.fileSizeBytes },
+        ).isEmpty()
+        assertThat(beyond.unknown).hasSize(9)
+        val within = memory.populations(1, declared, four + big.dropLast(1) + completer + big.last())
+        assertThat(
+            VariantLayoutGroups.borrow(within, grouping, 5, 8, admitMain = refused) { it.fileSizeBytes }
+                .map { it.dataFileId },
+        ).containsExactly(13L)
+
+        // THE POPULATION CAP counts populations with something to complete.
+        // Eight remembered populations of five 100-byte files, each a group
+        // on its own, beside a ninth of four 2000-byte files that one of two
+        // 2000-byte unknowns completes: the eight have nothing to complete
+        // and take no slot, so the ninth, the smallest, is tried and borrows.
+        val many = VariantLayoutMemory()
+        var id = 100L
+
+        fun population(
+            count: Int,
+            fingerprint: Long,
+            bytes: Long,
+        ) = (1..count).map {
+            candidate(
+                id++,
+                bytes = bytes,
+            ).also { many.remember(1, it.dataFileId, declared, fingerprint) }
+        }
+        val cap = VariantLayoutGroups.LOAN_POPULATIONS_TRIED
+        val selfPacking = (1..cap).flatMap { population(5, 1_000L + it, 100) }
+        val short = population(4, 2_000L, 2_000)
+        val arrivals = (1..2).map { candidate(id++, bytes = 2_000) }
+        val unblocked = many.populations(1, declared, selfPacking + short + arrivals)
+        assertThat(unblocked.others).hasSize(cap + 1)
+        assertThat(
+            VariantLayoutGroups.borrow(unblocked, grouping, 5, 64, admitMain = refused) { it.fileSizeBytes }
+                .map { it.dataFileId },
+        ).containsExactly(arrivals[0].dataFileId)
+
+        // Eight populations WITH a stranded file take the eight slots: six
+        // files each, five of 100 bytes that pack and one of 9000 that the
+        // dominance split sets apart — and apart from the 2000-byte unknowns
+        // too, so none of the eight borrows. Largest first, they are tried
+        // before the ninth of four, which is not tried; with one fewer, it is.
+        val blockers = (1..cap).flatMap { population(5, 3_000L + it, 100) + population(1, 3_000L + it, 9_000) }
+        val blocked = many.populations(1, declared, blockers + short + arrivals)
+        assertThat(blocked.others).hasSize(cap + 1)
+        assertThat(blocked.others.take(cap)).allSatisfy { assertThat(it.files).hasSize(6) }
+        assertThat(
+            VariantLayoutGroups.borrow(blocked, grouping, 5, 64, admitMain = refused) { it.fileSizeBytes },
+        ).isEmpty()
+        val fewer = many.populations(1, declared, blockers.drop(6) + short + arrivals)
+        assertThat(
+            VariantLayoutGroups.borrow(fewer, grouping, 5, 64, admitMain = refused) { it.fileSizeBytes }
+                .map { it.dataFileId },
+        ).containsExactly(arrivals[0].dataFileId)
+    }
+
+    @Test
+    fun `the loan search's work is bounded by its caps, not by the backlog`() {
+        // A refused main population of 4000 unknowns beside a hundred
+        // remembered layouts of three stranded files each, none completable:
+        // one packing of main, one of each tried population's own files and
+        // a bounded tail, measured as calls to `size`. The real search makes
+        // ~19k; without the population cap ~46k, without the candidate cap
+        // ~150k, without either ~1.7M (one pass over the backlog per layout
+        // at the least). The bound sits between the first two.
+        val declared = VariantLayout.fingerprint(DECLARED)
+        val refused = { _: List<CompactionCandidate> -> false }
+        val wide = VariantLayoutMemory()
+        var id = 10_000L
+        val layouts =
+            (1..100).flatMap { i ->
+                (1..3).map { candidate(id++).also { wide.remember(1, it.dataFileId, declared, 5_000L + i) } }
+            }
+        val backlog = (1..4_000).map { candidate(id++, bytes = 2_000) }
+        var sized = 0L
+        val lent =
+            VariantLayoutGroups.borrow(
+                wide.populations(1, declared, layouts + backlog),
+                grouping,
+                5,
+                64,
+                admitMain = refused,
+            ) {
+                sized++
+                it.fileSizeBytes
+            }
+        assertThat(lent).isEmpty()
+        assertThat(sized).describedAs("size() calls").isLessThan(30_000L)
+    }
+
+    @Test
     fun `a loan is every file of a prefix or nothing, and only prefixes of the candidate order are tried`() {
         // Two remembered stranded files of 1000 at a minimum of three (a
         // group of files this size needs all three). Unknowns, in candidate

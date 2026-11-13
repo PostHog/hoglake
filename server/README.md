@@ -2090,7 +2090,22 @@ prefixes are tried, which keeps the search bounded and the same every
 sweep, so a completer queued behind a file that doesn't complete is
 skipped until the candidate order changes. The probe sorts the lent
 files out; at most one loan per bucket per sweep, and a lent file is
-probed and remembered, so never lent again. A loan that proves to be
+probed and remembered, so never lent again. A loan is made only if the
+planner's packing of the rest WITHOUT it still holds every admitted main
+group with the same files: a file lent from a refused band of files no
+larger than an admitted band's would otherwise shift the smallest-first
+packing, close the refused remainder with the admitted band's first file
+and strand its other four until something arrived. And the search is
+bounded per bucket whatever the backlog: only the first fan-in
+(`effectiveMaxInputFiles`) of idle files in candidate order is offered,
+and only the eight largest remembered populations WITH a stranded file
+are tried (`VariantLayoutGroups.LOAN_POPULATIONS_TRIED`; one whose files
+all pack has nothing to complete and takes no slot), so a bucket of
+thousands of refused unknowns beside dozens of layouts costs one packing
+of its main population, one of each remembered population's own files,
+a bounded tail per population tried, and one more packing of main per
+loan found and checked against the admitted groups (at most eight) —
+not a packing of the backlog per layout every sweep. A loan that proves to be
 another layout leaves every file of its group where it was, the lent
 file now remembered where it belongs, and is charged as one
 `layout_probe_only` attempt (below): the one speculation a bucket makes
