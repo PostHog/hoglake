@@ -317,8 +317,9 @@ class VariantLayoutGroupsTest {
         assertThat(last!!.unknown.map { it.dataFileId }).containsExactly(8L, 9L)
         assertThat(last!!.main.map { it.dataFileId }).containsExactly(5L, 8L, 9L)
 
-        // Bounded: the LARGEST short population only; a population at the
-        // minimum borrows nothing.
+        // Bounded: one loan a bucket, the largest population tried first;
+        // a population whose files all pack already borrows nothing,
+        // however many idle unknowns there are.
         val other = VariantLayout.fingerprint(mapOf(W.fieldId to OLD.getValue(V.fieldId)))
         memory.remember(1, 10, declared, other)
         memory.remember(1, 11, declared, other)
@@ -341,6 +342,157 @@ class VariantLayoutGroupsTest {
                 p.map { it.dataFileId }
             },
         ).containsExactly(listOf(5L), listOf(1L, 2L, 3L, 4L))
+    }
+
+    @Test
+    fun `a population the budgets refuse is passed over for the next one that a loan completes`() {
+        // Four remembered wide-layout files, three remembered narrow-layout
+        // files, two unknown arrivals, at a minimum of five. The wide
+        // population is the larger, but the sorted budgets refuse its
+        // shape: lent an arrival regardless, the planner would refuse the
+        // completed group in metadata, the arrival would stay unknown, and
+        // the same loan would repeat every sweep while the five compatible
+        // narrow files never compacted. The loan is judged by the same
+        // admission as the group it would form, and the next population
+        // is tried.
+        val memory = VariantLayoutMemory()
+        val declared = VariantLayout.fingerprint(DECLARED)
+        val wide = VariantLayout.fingerprint(VariantLayoutGroups.deviations(OLD, DECLARED))
+        val narrow = VariantLayout.fingerprint(mapOf(W.fieldId to OLD.getValue(V.fieldId)))
+        (1L..4L).forEach { memory.remember(1, it, declared, wide) }
+        (5L..7L).forEach { memory.remember(1, it, declared, narrow) }
+        val files = (1..9).map { candidate(it.toLong()) }
+
+        fun divide(admit: (Long, List<CompactionCandidate>) -> Boolean): Pair<List<Long>, List<List<Long>>> {
+            val divided = memory.populations(1, declared, files)
+            val lent = VariantLayoutGroups.borrow(divided, grouping, 5, 64, admit) { it.fileSizeBytes }
+            return lent.map { it.dataFileId } to divided.all().map { p -> p.map { it.dataFileId } }
+        }
+        // Everything admitted: the larger population is completed, by one file.
+        assertThat(divide { _, _ -> true })
+            .isEqualTo(listOf(8L) to listOf(listOf(9L), listOf(1L, 2L, 3L, 4L, 8L), listOf(5L, 6L, 7L)))
+        // The wide layout refused: judged once, on exactly the group its
+        // loan would form, then passed over; the narrow one is completed
+        // by two, and both arrivals leave the main population.
+        val judged = mutableListOf<Pair<Long, List<Long>>>()
+        val (lent, populations) =
+            divide { deviations, group ->
+                judged += deviations to group.map { it.dataFileId }
+                deviations != wide
+            }
+        assertThat(lent).containsExactly(8L, 9L)
+        assertThat(populations).containsExactly(listOf(1L, 2L, 3L, 4L), listOf(5L, 6L, 7L, 8L, 9L))
+        assertThat(judged).containsExactly(wide to listOf(1L, 2L, 3L, 4L, 8L), narrow to listOf(5L, 6L, 7L, 8L, 9L))
+        // Both refused: nothing is lent, and the arrivals stay unknown.
+        assertThat(divide { _, _ -> false })
+            .isEqualTo(emptyList<Long>() to listOf(listOf(8L, 9L), listOf(1L, 2L, 3L, 4L), listOf(5L, 6L, 7L)))
+    }
+
+    @Test
+    fun `a loan is every file of a prefix or nothing, and only prefixes of the candidate order are tried`() {
+        // Two remembered stranded files of 1000 at a minimum of three (a
+        // group of files this size needs all three). Unknowns, in candidate
+        // order: 5500, 500, 500. All three idle together pack with the two
+        // into one group (the 5500 is not twice what is held by then), so
+        // every unknown is a candidate for the loan. But the prefixes:
+        //  - [5500]: packs apart from the two by dominance; nothing forms.
+        //  - [5500, 500]: {500, 1000, 1000} forms, the 5500 apart — a group
+        //    holding a stranded file, but NOT every lent file. Lending both
+        //    would probe the 5500 alone, which the rule forbids.
+        // So nothing is lent, although the two 500s on their own would have
+        // completed the pair: a prefix search skips a completer behind a
+        // non-completer, by design (bounded, deterministic).
+        val memory = VariantLayoutMemory()
+        val declared = VariantLayout.fingerprint(DECLARED)
+        val old = VariantLayout.fingerprint(VariantLayoutGroups.deviations(OLD, DECLARED))
+        memory.remember(1, 1, declared, old)
+        memory.remember(1, 2, declared, old)
+        val files =
+            listOf(
+                candidate(1, bytes = 1_000),
+                candidate(2, bytes = 1_000),
+                candidate(3, bytes = 5_500),
+                candidate(4, bytes = 500),
+                candidate(5, bytes = 500),
+            )
+        val divided = memory.populations(1, declared, files)
+        assertThat(grouping.groups(divided.main, 3, 64) { it.fileSizeBytes }).describedAs("idle").isEmpty()
+        assertThat(grouping.groups(files, 3, 64) { it.fileSizeBytes }.map { g -> g.map { it.dataFileId } })
+            .describedAs("everything together: one group, the 5500 included")
+            .containsExactly(listOf(1L, 2L, 3L, 4L, 5L))
+        assertThat(
+            grouping.groups(files.take(4), 3, 64) { it.fileSizeBytes }.map { g -> g.map { it.dataFileId } },
+        ).describedAs("the two-file prefix: a group without the 5500").containsExactly(listOf(1L, 2L, 4L))
+        assertThat(VariantLayoutGroups.borrow(divided, grouping, 3, 64) { it.fileSizeBytes }).isEmpty()
+        assertThat(divided.unknown.map { it.dataFileId }).containsExactly(3L, 4L, 5L)
+        assertThat(divided.others.single().files.map { it.dataFileId }).containsExactly(1L, 2L)
+    }
+
+    @Test
+    fun `one loan a bucket, to the largest population, although another could be completed too`() {
+        // Four remembered in one layout, three in another, three unknowns at
+        // a minimum of five: one unknown completes the four, the other two
+        // would complete the three. Only the larger population borrows;
+        // the two the smaller would have taken stay unknown, in the main
+        // population, for a later sweep.
+        val memory = VariantLayoutMemory()
+        val declared = VariantLayout.fingerprint(DECLARED)
+        val one = VariantLayout.fingerprint(VariantLayoutGroups.deviations(OLD, DECLARED))
+        val two = VariantLayout.fingerprint(mapOf(W.fieldId to OLD.getValue(V.fieldId)))
+        (1L..4L).forEach { memory.remember(1, it, declared, one) }
+        (5L..7L).forEach { memory.remember(1, it, declared, two) }
+        val files = (1..10).map { candidate(it.toLong()) }
+        val divided = memory.populations(1, declared, files)
+        val lent = VariantLayoutGroups.borrow(divided, grouping, 5, 64) { it.fileSizeBytes }
+        assertThat(lent.map { it.dataFileId }).containsExactly(8L)
+        assertThat(divided.main.map { it.dataFileId }).containsExactly(9L, 10L)
+        assertThat(divided.unknown.map { it.dataFileId }).containsExactly(9L, 10L)
+        assertThat(divided.others.map { o -> o.files.map { it.dataFileId } })
+            .containsExactly(listOf(1L, 2L, 3L, 4L, 8L), listOf(5L, 6L, 7L))
+    }
+
+    @Test
+    fun `a population past the minimum whose packing leaves a size band short borrows for that band`() {
+        // A 512 MiB target and a minimum of five. Five 1 MiB files and five
+        // 50 MiB files, each band three old-layout and two declared, all
+        // probed and remembered. The dominance split packs the bands apart,
+        // so the six remembered old-layout files form no group — three and
+        // three — although six is past the minimum. Two more 50 MiB
+        // old-layout files arrive: the three 50 MiB and the two arrivals
+        // are a five-file rewrite, and the loan is what finds it.
+        val grouping = CompactionGrouping.of(512L shl 20)
+        val memory = VariantLayoutMemory()
+        val declared = VariantLayout.fingerprint(DECLARED)
+        val old = VariantLayout.fingerprint(VariantLayoutGroups.deviations(OLD, DECLARED))
+        val mib = 1L shl 20
+        val small = (1..5).map { candidate(it.toLong(), bytes = mib) }
+        val large = (6..10).map { candidate(it.toLong(), bytes = 50 * mib) }
+        listOf(1L, 2L, 3L, 6L, 7L, 8L).forEach { memory.remember(1, it, declared, old) }
+        listOf(4L, 5L, 9L, 10L).forEach { memory.remember(1, it, declared, VariantLayoutMemory.NONE) }
+
+        fun packed(files: List<CompactionCandidate>) =
+            grouping.groups(files, 5, 64) { it.fileSizeBytes }.map { group -> group.map { it.dataFileId } }
+        val settled = memory.populations(1, declared, small + large)
+        assertThat(settled.all().flatMap { packed(it) }).describedAs("two bands of three each: no work").isEmpty()
+        assertThat(VariantLayoutGroups.borrow(settled, grouping, 5, 64) { it.fileSizeBytes }).isEmpty()
+
+        // One 50 MiB arrival completes nothing (four in the band): not lent.
+        val one = memory.populations(1, declared, small + large + candidate(11, bytes = 50 * mib))
+        assertThat(VariantLayoutGroups.borrow(one, grouping, 5, 64) { it.fileSizeBytes }).isEmpty()
+        assertThat(one.unknown.map { it.dataFileId }).containsExactly(11L)
+
+        val arrivals = (11..12).map { candidate(it.toLong(), bytes = 50 * mib) }
+        val divided = memory.populations(1, declared, small + large + arrivals)
+        assertThat(packed(divided.main)).describedAs("the declared population is idle").isEmpty()
+        val lent = VariantLayoutGroups.borrow(divided, grouping, 5, 64) { it.fileSizeBytes }
+        assertThat(lent.map { it.dataFileId }).containsExactly(11L, 12L)
+        assertThat(divided.main.map { it.dataFileId }).containsExactly(4L, 5L, 9L, 10L)
+        assertThat(divided.unknown).isEmpty()
+        val oldFiles = divided.others.single().files
+        assertThat(oldFiles.map { it.dataFileId }).containsExactly(1L, 2L, 3L, 6L, 7L, 8L, 11L, 12L)
+        assertThat(packed(oldFiles))
+            .describedAs("the 50 MiB band completed; the 1 MiB band still waits")
+            .containsExactly(listOf(6L, 7L, 8L, 11L, 12L))
     }
 
     @Test

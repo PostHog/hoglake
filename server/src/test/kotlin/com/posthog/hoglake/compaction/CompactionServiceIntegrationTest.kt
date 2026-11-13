@@ -2156,6 +2156,85 @@ class CompactionServiceIntegrationTest {
     }
 
     @Test
+    fun `a loan is judged by the admission of the group it would form, so a refused layout cannot hoard arrivals`() {
+        // Under a declaration narrowed on `rich`, four `a` files are one
+        // deviating population (rich wide) and three `mismatch` files
+        // another (rich wide, props from the other declaration). At a
+        // minimum of five, one probe remembers all seven, with their
+        // shapes, and leaves them. Two more `mismatch` files arrive. Under
+        // a heap that refuses the wide population's rows (51 in several
+        // runs) but admits the small one's (15 rows, one run), lending an
+        // arrival to the larger, wide population would have it refused in
+        // metadata before any probe, the arrival unknown still, and the
+        // same choice repeating every sweep while five compatible files
+        // sat uncompacted. The loan is judged as the group would be: the
+        // wide population is passed over, uncounted, and the small one
+        // borrows both arrivals and compacts.
+        withVariantMetrics { _ ->
+            val five = variantOn.copy(minInputFiles = 5)
+            val (cat, files) = variantTable("loan-admission", "a", "a", "a", "a", "mismatch", "mismatch", "mismatch")
+            alter.alterTable(
+                cat,
+                "ns",
+                "t",
+                listOf(
+                    AlterOp.SetSortOrder(listOf(SortFieldDef(1, SortDirection.ASC, NullOrder.NULLS_LAST))),
+                    AlterOp.SetVariantShredding("rich", null),
+                ),
+            )
+            val narrow = catalogs.getTable(cat, "ns", "t").columns
+
+            fun layoutsOf(name: String) =
+                ParquetFileReader.open(LocalInputFile(VariantFixtures.path(name))).use {
+                    ParquetRewriter.variantLayoutsOf(it.footer, narrow, name)
+                }
+            val wide = layoutsOf("a")
+            val small = layoutsOf("mismatch")
+            assertThat(wide).isNotEqualTo(small)
+            val probe = svc.runOnce(cat, five)
+            assertThat(probe.layoutProbeOnly).describedAs("%s", probe).isEqualTo(1)
+            assertThat(probe.groupsCompacted).isZero()
+            assertThat(svc.planTable(cat, "ns", "t", five).groups).isEmpty()
+
+            val arrivals = addFiles(cat, files.size, "mismatch", "mismatch")
+            // A heap under which a five-file wide group (four `a` and one
+            // loan: 51 rows) spills runs whose merge is past the budget,
+            // while five `mismatch` files (15 rows) sort in one chunk.
+            val tight =
+                heapWhere(five, from = 1L shl 20, to = 512L shl 20, step = 1L shl 20) { candidate ->
+                    val spill = candidate.sortSpill(narrow, wide)
+                    val runs = ExternalMergeSort.spillRuns(51, spill)
+                    val leaves = ParquetRewriter.outputLeafCount(narrow, wide)
+                    runs > 1 &&
+                        runs * ExternalMergeSort.predictedSpilledRunBytes(leaves, spill) > spill.mergeBudgetBytes &&
+                        ExternalMergeSort.spillRuns(15, candidate.sortSpill(narrow, small)) == 1L
+                }
+            assertThat(
+                tight,
+            ).describedAs("a budget between the two populations' costs exists for these fixtures").isNotNull()
+            val plan = svc.planTable(cat, "ns", "t", tight!!)
+            assertThat(plan.groups).describedAs("the small population, completed by both arrivals").hasSize(1)
+            assertThat(plan.groups.single().files.map { it.path })
+                .containsExactlyInAnyOrderElementsOf(files.drop(4).map { it.path } + arrivals.map { it.path })
+            assertThat(
+                plan.mergeRefusedGroups + plan.spillRefusedGroups,
+            ).describedAs("a loan only considered is not a refusal").isZero()
+            val result = svc.runOnce(cat, tight)
+            assertThat(result.groupsCompacted).describedAs("%s", result).isEqualTo(1)
+            assertThat(result.filesIn).isEqualTo(5)
+            assertThat(result.layoutProbeOnly + result.mergeBudgetExceeded + result.spillBudgetExceeded).isZero()
+            val live = catalogs.listFiles(cat, "ns", "t")
+            assertThat(live.map { it.path })
+                .containsAll(files.take(4).map { it.path })
+                .doesNotContainAnyElementsOf(files.drop(4).map { it.path } + arrivals.map { it.path })
+            val output = live.single { it.explicitRowIds }
+            assertThat(output.recordCount).isEqualTo(15)
+            assertThat(VariantFixtures.read(fetch(output.path)).first.getType("props"))
+                .isEqualTo(VariantLayout.groupType(VariantFixtures.other[1], Type.Repetition.OPTIONAL))
+        }
+    }
+
+    @Test
     fun `a DuckDB-written file holding no variant column compacts, null-filled, like any other`() {
         // Scalar files DuckDB wrote before the variant columns existed:
         // there is no Variant null in them for Trino to read as SQL NULL,

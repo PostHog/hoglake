@@ -6173,12 +6173,19 @@ components:
           format: int64
           description: >
             Groups of a VARIANT table (HOGLAKE_COMPACTION_VARIANT) whose
-            layout probe read every input's footer and found nothing worth
-            a rewrite: each variant layout among the inputs held too few
-            files for one, or every input was written by DuckDB. The files
-            are left as they are, and the compactor remembers their
-            layouts so the group is not planned again until files of its
-            layouts arrive. The footers were read, so this IS charged to
+            layout probe read every input's footer and ran no rewrite:
+            each variant layout among the inputs held too few files for
+            one, every input was written by DuckDB, or every part of a
+            sorted table was refused by the sorted budgets for its
+            layout's shape. The files are left as they are, and the
+            compactor remembers their layouts. A layout short of files is
+            not planned again until files of it arrive. A budget-refused
+            layout is counted here only on that first probe; later sweeps
+            refuse it from metadata as spill_budget_exceeded or
+            merge_budget_exceeded, which is how to tell the cases apart,
+            and raising HOGLAKE_COMPACTION_SORTED_HEAP_BYTES or
+            HOGLAKE_COMPACTION_SPILL_BYTES admits the existing files on
+            the next plan with no new arrivals. The footers were read, so this IS charged to
             HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN. Also
             hoglake_compaction_skipped_total{reason="layout_probe_only"}.
             Optional, for claimed_elsewhere's reason.

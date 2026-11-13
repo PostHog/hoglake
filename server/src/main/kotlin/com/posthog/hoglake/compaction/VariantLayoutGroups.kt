@@ -243,49 +243,117 @@ internal object VariantLayoutGroups {
     }
 
     /**
-     * Let a remembered deviating population SHORT of [minInputFiles]
-     * borrow unknown candidates from the main population, so that a late
-     * arrival in its layout can be found: otherwise four remembered
-     * old-layout files and one unprobed fifth sit in two populations
-     * neither of which forms a group, for as long as nothing else arrives.
-     * The borrowed files are probed with the population; those in its
-     * layout compact with it, the rest are remembered where they belong
-     * and never borrowed again.
+     * Let a remembered deviating population borrow unknown candidates from
+     * the main population, so that a late arrival in its layout can be
+     * found: otherwise four remembered old-layout files and one unprobed
+     * fifth sit in two populations neither of which forms a group, for as
+     * long as nothing else arrives. The borrowed files are probed with the
+     * population; those in its layout compact with it, the rest are
+     * remembered where they belong and never borrowed again.
+     *
+     * ONE RULE decides a loan, the planner's own: a population is lent the
+     * fewest unknowns, among prefixes of the candidate order, such that
+     * [grouping]'s packing of (population + loan) forms a group that holds
+     * every lent file and a population file the population's OWN packing
+     * left out, and that [admit] passes. Every way a loan could be wasted
+     * is a case of that rule failing, not a case of its own:
+     *
+     *  - a population whose files already all pack has nothing to
+     *    complete, however few or many they are, so a loan would only buy
+     *    a probe: not lent;
+     *  - a population of six whose packing splits into two size bands of
+     *    three IS short, in each band, although six is past the minimum:
+     *    the band the arrivals fit is completed;
+     *  - a loan the packing sets apart from the population (a dominance
+     *    split) would be probed alone: not lent;
+     *  - a population whose remembered layout the sorted budgets refuse
+     *    ([admit], the planner's shape admission) would be refused before
+     *    its loan was probed, leaving the arrival unknown and the choice
+     *    repeating every sweep: not lent, and the next population is tried.
+     *
+     * PREFIXES ONLY, not every subset. The loans tried are the prefixes of
+     * the candidate order, shortest first, over the unknowns that one
+     * packing of everything idle puts with a stranded file. That keeps the
+     * search bounded (at most `minInputFiles - 1` packings a population)
+     * and deterministic (the same candidates make the same loan every
+     * sweep). The cost is that a completer behind a non-completer in the
+     * order is skipped: with two stranded files and unknowns [large, small,
+     * small], the large alone packs apart from them, the large and one
+     * small still pack apart, and the two smalls, which would complete
+     * them, are never tried on their own. A skipped completer is retried on
+     * a later sweep only if the candidate order changes (an arrival, a
+     * compaction, a fetch cut differently); the memory records nothing
+     * about loans.
      *
      * BOUNDED, and only when it costs nothing: the main population must
-     * form no group of its own under [grouping]'s rule (its unknowns are
-     * idle, so a probe of them is the only thing that happens to them this
-     * sweep), the largest short population alone is completed, with the
-     * fewest unknowns that complete it, and only when the completed
-     * population actually forms a group holding a borrowed file under the
-     * same rule (a dominance split, say, would leave the loan unprobed).
-     * So a bucket speculates on at most one group's probe a sweep, each
-     * unknown is speculated on at most once, and a declared arrival that
-     * had a group to join is never diverted from it. Returns the files
-     * borrowed.
+     * form no group of its own (its unknowns are idle, so a probe of them
+     * is the only thing that happens to them this sweep), populations are
+     * tried largest first and the first loan is the bucket's only one, at
+     * most `minInputFiles - 1` files. So a bucket speculates on at most one
+     * group's probe a sweep, each unknown is speculated on at most once,
+     * and a declared arrival that had a group to join is never diverted
+     * from it. Returns the files borrowed.
      */
     fun borrow(
         populations: VariantLayoutMemory.Populations,
         grouping: CompactionGrouping,
         minInputFiles: Int,
         maxInputFiles: Int,
+        admit: (deviations: Long, group: List<CompactionCandidate>) -> Boolean = { _, _ -> true },
         size: (CompactionCandidate) -> Long,
     ): List<CompactionCandidate> {
-        val short =
-            populations.others.map { it.files }.filter { it.size < minInputFiles }.maxByOrNull { it.size }
-                ?: return emptyList()
         if (populations.unknown.isEmpty()) return emptyList()
         if (grouping.groups(populations.main, minInputFiles, maxInputFiles, size).isNotEmpty()) return emptyList()
-        val borrowed = populations.unknown.take(minInputFiles - short.size)
-        val trial = grouping.groups(short + borrowed, minInputFiles, maxInputFiles, size)
-        val lent = borrowed.filter { file -> trial.any { group -> file in group } }
-        if (lent.isEmpty()) return emptyList()
-        // Lent files leave the main population AND its unknowns: they are
-        // the short population's now, and nothing may lend them twice.
-        short += lent
-        populations.main -= lent.toSet()
-        populations.unknown -= lent.toSet()
-        return lent
+        for (other in populations.others.sortedByDescending { it.files.size }) {
+            val lent =
+                loanFor(other, populations.unknown, grouping, minInputFiles, maxInputFiles, admit, size) ?: continue
+            // Lent files leave the main population AND its unknowns: they
+            // are the borrowing population's now, and nothing may lend them
+            // twice.
+            other.files += lent
+            populations.main -= lent.toSet()
+            populations.unknown -= lent.toSet()
+            return lent
+        }
+        return emptyList()
+    }
+
+    /** The loan [borrow] makes [other] from [unknown], under its rule; null when no loan would form an admitted group. */
+    private fun loanFor(
+        other: VariantLayoutMemory.Other,
+        unknown: List<CompactionCandidate>,
+        grouping: CompactionGrouping,
+        minInputFiles: Int,
+        maxInputFiles: Int,
+        admit: (deviations: Long, group: List<CompactionCandidate>) -> Boolean,
+        size: (CompactionCandidate) -> Long,
+    ): List<CompactionCandidate>? {
+        val files = other.files
+        val packedAlone = grouping.groups(files, minInputFiles, maxInputFiles, size).flatten().toSet()
+        val stranded = files.filterNot { it in packedAlone }.toSet()
+        if (stranded.isEmpty()) return null
+        // Which unknowns pack with a stranded file at all, in one packing
+        // of everything idle; then the fewest of those, in candidate order,
+        // that complete a group on their own — the packing is not
+        // monotone in its inputs, so the loan is confirmed on exactly the
+        // files it would be.
+        val idle = unknown.toSet()
+        val company =
+            grouping
+                .groups(files + unknown, minInputFiles, maxInputFiles, size)
+                .filter { group -> group.any { it in idle } && group.any { it in stranded } }
+                .maxByOrNull { it.size } ?: return null
+        val wanted = unknown.filter { it in company }
+        for (count in 1..minOf(wanted.size, minInputFiles - 1)) {
+            val loan = wanted.take(count)
+            val group =
+                grouping
+                    .groups(files + loan, minInputFiles, maxInputFiles, size)
+                    .firstOrNull { group -> loan.all { it in group } && group.any { it in stranded } }
+                    ?: continue
+            return if (admit(other.deviations, group)) loan else null
+        }
+        return null
     }
 
     /** The footers to hand the rewrite, by data_file_id, of the inputs that kept one (see [FOOTER_RETENTION_BYTES]). */

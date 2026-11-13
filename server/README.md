@@ -2060,11 +2060,21 @@ with files deviating the same way, drops files it knows DuckDB wrote,
 and packs the rest — the declared layout's, the never-probed, and any
 entry judged against an older declaration — together as before. A
 remembered remainder forms no group until enough files of its layout are
-known, except that when the rest form no group of their own, the largest
-short remainder takes as many never-probed files as it is short, in
-candidate order, and borrows those that land in a group with it; the
-probe sorts them out (at most one such loan per bucket per sweep; a
-probed file is remembered, so never lent again). Deviations
+known, except by a LOAN: while the rest (declared and never-probed)
+form no group of their own, remembered populations are tried largest
+first, and the first is lent the shortest prefix of the never-probed
+files in candidate order, at most `minInputFiles − 1`, such that the planner's packing
+of population + loan forms a group that holds every lent file and a
+population file the population's own packing left out, and that passes
+the sorted-budget shape admission (below). So a population at or past
+the minimum can borrow to complete one of its size bands, and one whose
+layout the budgets refuse is passed over (a loan merely considered is
+not counted as a refusal). Only prefixes are tried, which keeps the
+search bounded and the same every sweep, so a completer queued behind a
+file that doesn't complete is skipped until the candidate order changes.
+The probe sorts the lent files out; at most
+one loan per bucket per sweep, and a lent file is probed and
+remembered, so never lent again. Deviations
 rather than whole layouts, so a file written before a
 variant column was added (which the rewrite null-fills) packs with later
 files of its layout; the declaration's fingerprint, so DDL

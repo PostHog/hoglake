@@ -3157,16 +3157,27 @@ class CompactionService(
             }
         }
 
+        // The budgets' verdict on a group in a known layout: null admits.
+        // Pure, so that a loan the planner only CONSIDERS (borrow, below)
+        // can be judged without being counted a refusal.
+        fun refusalOfKnown(
+            group: CompactionGroup,
+            shapes: Map<Long, VariantLayoutMemory.Shape>,
+        ): BudgetRefusal? {
+            if (spill == null) return null
+            val leaves = declaredLeaves ?: return null
+            val partLeaves =
+                leaves - shapes.keys.sumOf { declaredVariantLeaves[it] ?: 0 } + shapes.values.sumOf { it.leaves }
+            return budgetRefusal(ctx, cfg.sortSpillOfShapes(ctx.columns, shapes), partLeaves, group)
+        }
+
         fun admitKnown(
             group: CompactionGroup,
             shapes: Map<Long, VariantLayoutMemory.Shape>,
         ): Boolean {
-            if (spill == null) return true
-            val leaves = declaredLeaves ?: return true
-            val partLeaves =
-                leaves - shapes.keys.sumOf { declaredVariantLeaves[it] ?: 0 } + shapes.values.sumOf { it.leaves }
+            if (spill == null || declaredLeaves == null) return true
             judgedByShape += group
-            return when (budgetRefusal(ctx, cfg.sortSpillOfShapes(ctx.columns, shapes), partLeaves, group)) {
+            return when (refusalOfKnown(group, shapes)) {
                 BudgetRefusal.SPILL -> false.also { spillRefused += group }
                 BudgetRefusal.MERGE -> false.also { mergeRefused += group }
                 null -> true
@@ -3184,9 +3195,22 @@ class CompactionService(
                 continue
             }
             val divided = variantLayouts.populations(ctx.catalogId, declaredFingerprint, candidates)
-            // A remembered remainder short of the minimum may borrow idle
-            // unknowns to find company (VariantLayoutGroups.borrow).
-            VariantLayoutGroups.borrow(divided, grouping, cfg.minInputFiles, fanIn) { it.fileSizeBytes }
+            // A remembered population with a short remainder may borrow idle
+            // unknowns to complete it (VariantLayoutGroups.borrow), under
+            // the packing below and the same shape admission: a loan to a
+            // group the budgets would refuse is never made, so the arrival
+            // is free for a population they admit.
+            VariantLayoutGroups.borrow(
+                divided,
+                grouping,
+                cfg.minInputFiles,
+                fanIn,
+                admit = { deviations, take ->
+                    val shapes = variantLayouts.shapeOf(deviations)
+                    shapes == null ||
+                        refusalOfKnown(CompactionGroup(rowIdOrder(take), bucket.specId, bucket.values), shapes) == null
+                },
+            ) { it.fileSizeBytes }
             for (take in grouping.groups(divided.main, cfg.minInputFiles, fanIn) { it.fileSizeBytes }) {
                 out += CompactionGroup(rowIdOrder(take), bucket.specId, bucket.values)
             }
