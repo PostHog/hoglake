@@ -304,7 +304,7 @@ Every hoglake client supports the same two shapes:
 | DuckDB extension | `ATTACH … (TOKEN_URL, CLIENT_ID, CLIENT_SECRET)` | `ATTACH … (TOKEN '…')` |
 | hedgerow | `auth: {token_url, client_id, client_secret}` per side | through pyhoglake |
 | Trino connector (PostHog/trino) | `hoglake.auth.token-uri`, `hoglake.auth.client-id`, `hoglake.auth.client-secret` | planned (tracked) |
-| millrace | planned ([#574](https://github.com/PostHog/hoglake/issues/574)) | planned ([#574](https://github.com/PostHog/hoglake/issues/574)) |
+| millrace | `HOGLAKE_AUTH_TOKEN_URL`, `HOGLAKE_AUTH_CLIENT_ID`, `HOGLAKE_AUTH_CLIENT_SECRET` (+ `HOGLAKE_AUTH_AUDIENCE`), through pyhoglake | `HOGLAKE_AUTH_TOKEN` or `HOGLAKE_AUTH_TOKEN_FILE` |
 | webui | — | sign in with a pasted token (in review) |
 
 pyhoglake accepts any `httpx.Auth`, and the Trino connector's token source is an
@@ -377,11 +377,11 @@ tokens with `prd` and a configurable lifetime cap; `ten` defaulting to
 here; the `ambient`, `static` and `broker` storage providers behind the
 server's own jobs; the local issuer (`local`, `hoglake token keygen` and
 `mint`); client credentials and fixed tokens in pyhoglake, the DuckDB
-extension, hedgerow and the Trino connector.
+extension, hedgerow, the Trino connector and millrace.
 
 Tracked in [#574](https://github.com/PostHog/hoglake/issues/574): a fixed-token
-option in the Trino connector; client credentials in millrace; a token for the
-web UI.
+option in the Trino connector; a token for the web UI
+([#560](https://github.com/PostHog/hoglake/pull/560)).
 
 Decided, not tracked: `jti` stays required, and the server verifies one issuer
 (both above).
