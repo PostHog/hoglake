@@ -703,7 +703,15 @@ is any lowercase identifier, the value a positive id, and the convention that
   contained prefix and write bytes there. It can't register them (the
   commit check refuses), and a tenant token already has the whole catalog.
   A scoped caller's claim is held to its contained namespaces (§6.2a).
-- **One live namespace per `(catalog, field, value)`** (`already_exists`).
+- **Several namespaces may be contained for the same `(catalog, field,
+  value)`**, e.g. `team_42` (backfilled events) and `imports_42` (data
+  imports), both contained for `team_id = 42`. This is safe because
+  attribution runs from namespace to value: authorization asks "which
+  containment does this namespace have?", never "which namespace is for this
+  value?", and each contained namespace still owns its own prefix and its own
+  name (the checks above are per namespace). A scoped token for `team_id =
+  42` is held to every namespace contained for 42 and sees no namespace
+  contained for another value.
 - **Operators only.** Marking and clearing are operator routes; a tenant
   token cannot drop a contained namespace (403). Clearing requires the
   namespace to be empty.

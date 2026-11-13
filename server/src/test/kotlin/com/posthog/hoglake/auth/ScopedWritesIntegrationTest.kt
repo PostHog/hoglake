@@ -55,12 +55,18 @@ class ScopedWritesIntegrationTest {
 
     init {
         catalogs.createCatalog(cat, dataPath)
-        for ((ns, value) in listOf("team_42" to 42L, "team_7" to 7L, "team_9" to 9L)) {
+        for ((ns, value) in listOf("team_42" to 42L, "imports_42" to 42L, "team_7" to 7L, "team_9" to 9L)) {
             catalogs.createNamespace(cat, ns)
             catalogs.setNamespaceContainment(cat, ns, NamespaceContainment("team_id", value))
         }
         catalogs.createNamespace(cat, "main")
-        for (ns in listOf("team_42", "team_7", "team_9", "main")) catalogs.createTable(cat, ns, "t", columns)
+        for (ns in listOf(
+            "team_42",
+            "imports_42",
+            "team_7",
+            "team_9",
+            "main",
+        )) catalogs.createTable(cat, ns, "t", columns)
     }
 
     @AfterAll
@@ -224,6 +230,31 @@ class ScopedWritesIntegrationTest {
             // A tenant is unaffected.
             assertThat(call(port, tenant(), "POST", "/commit", """{"appends":[${append("main")}]}""").statusCode())
                 .isEqualTo(200)
+        }
+    }
+
+    @Test
+    fun `a token for a value commits into every namespace contained for it, each held to its own prefix`() {
+        withServer(AuthMode.ENFORCE) { port ->
+            val token = scoped()
+            for (ns in listOf("team_42", "imports_42")) {
+                val ok = call(port, token, "POST", "/commit", """{"appends":[${append(ns)}]}""")
+                assertThat(ok.statusCode()).describedAs("%s: %s", ns, ok.body()).isEqualTo(200)
+            }
+            // A file of one namespace under the other's prefix is refused,
+            // both ways: the token reaches both, containment still holds the paths.
+            for ((into, under) in listOf("team_42" to "imports_42", "imports_42" to "team_42")) {
+                val stray =
+                    """{"appends":[{"namespace":"$into","table":"t","files":[""" +
+                        """{"path":"$dataPath/data/$under/x.parquet","record_count":1,"file_size_bytes":10}]}]}"""
+                val r = call(port, token, "POST", "/commit", stray)
+                assertThat(r.statusCode()).describedAs("%s under %s: %s", into, under, r.body()).isEqualTo(422)
+            }
+            // A token for another value reaches neither.
+            val team7 = scoped(prd = """{"team_id":{"7":"write"}}""")
+            for (ns in listOf("team_42", "imports_42")) {
+                assertMissing(call(port, team7, "POST", "/commit", """{"appends":[${append(ns)}]}"""), "team 7 $ns")
+            }
         }
     }
 

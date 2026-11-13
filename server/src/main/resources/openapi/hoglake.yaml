@@ -484,7 +484,9 @@ paths:
         table or view can be marked, and only while no other table's file
         or deletion vector (live or retained), live upload claim or
         undrained removal sits under its prefix, in any percent-escaped
-        spelling that decodes to it (409 otherwise). At most one live namespace per (field, value) (409).
+        spelling that decodes to it (409 otherwise). Several namespaces may
+        be contained for the same (field, value): each still owns its own
+        prefix and name.
         Marking the same containment again is a no-op; to change it, clear
         it first. A contained namespace can be dropped only by an operator.
         The prefix check reads the catalog's file rows under a time bound;

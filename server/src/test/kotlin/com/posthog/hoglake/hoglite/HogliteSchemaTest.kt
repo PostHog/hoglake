@@ -32,7 +32,7 @@ class HogliteSchemaTest {
      * The index's WHERE matches the guards' terms, so they can use it.
      */
     @Test
-    fun `namespaces carry containment with its shape check and live unique index`() {
+    fun `namespaces carry containment with its shape check and a non-unique live index`() {
         val ddl = normalized(HogliteSchema.DDL.single { it.contains("CREATE TABLE IF NOT EXISTS namespaces(") })
         assertThat(ddl).contains("contained_field TEXT,", "contained_value INTEGER,")
         assertThat(ddl).contains(
@@ -40,10 +40,15 @@ class HogliteSchemaTest {
                 "AND contained_value IS NOT NULL AND contained_value > 0))",
         )
 
-        val index = HogliteSchema.DDL.map(::normalized).filter { it.contains("namespaces_live_containment") }
+        val index = HogliteSchema.DDL.map(::normalized).filter { it.contains("contained_field, contained_value)") }
         assertThat(index).containsExactly(
-            "CREATE UNIQUE INDEX IF NOT EXISTS namespaces_live_containment ON namespaces(contained_field, " +
+            "CREATE INDEX IF NOT EXISTS namespaces_contained ON namespaces(contained_field, " +
                 "contained_value) WHERE dropped_snapshot IS NULL AND contained_field IS NOT NULL",
+        )
+        // A tenant bootstrapped with the first release's unique index is upgraded at its first mark.
+        assertThat(HogliteSchema.CONTAINMENT_INDEX_UPGRADE.map(::normalized)).containsExactly(
+            "DROP INDEX IF EXISTS namespaces_live_containment",
+            index.single(),
         )
     }
 

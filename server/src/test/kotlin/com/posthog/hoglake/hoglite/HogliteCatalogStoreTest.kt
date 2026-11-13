@@ -541,20 +541,22 @@ class HogliteCatalogStoreTest {
         assertThat(t.byId(1).field).isEqualTo("team_id")
         assertThat(t.byId(1).value).isEqualTo(42)
         val tx = writes().single()
-        // The drop fence, then the guards in CatalogService's order, then the UPDATE.
-        assertThat(tx.map { it.substringBefore(" WHERE") }).containsExactly(
+        // The drop fence, the containment-index upgrade (a tenant created with the old unique
+        // index takes several namespaces per value from its first mark), then the guards in
+        // CatalogService's order, then the UPDATE. There is no per-value uniqueness guard.
+        assertThat(tx.map { it.substringBefore(" WHERE").substringBefore("\n") }).containsExactly(
             "SELECT COUNT(*) FROM meta",
+            "DROP INDEX IF EXISTS namespaces_live_containment",
+            "CREATE INDEX IF NOT EXISTS namespaces_contained",
             "SELECT COUNT(*) FROM namespaces",
             "SELECT COUNT(*) FROM namespaces",
             "SELECT COUNT(*) FROM table_versions",
             "SELECT COUNT(*) FROM views",
             "SELECT COUNT(*) FROM namespaces",
             "SELECT (SELECT COUNT(*) FROM files",
-            "SELECT COUNT(*) FROM namespaces",
             "UPDATE namespaces SET contained_field = ?, contained_value = ?",
         )
-        assertThat(tx[2]).contains("contained_field IS NOT NULL")
-        assertThat(tx[7]).contains("contained_field = ? AND contained_value = ?")
+        assertThat(tx[4]).contains("contained_field IS NOT NULL")
     }
 
     @Test
@@ -700,16 +702,6 @@ class HogliteCatalogStoreTest {
             .isInstanceOf(HoglakeException.CommitConflict::class.java)
             .hasMessageContaining("cannot mark namespace 'team_42' contained")
 
-        t.raceHits = 0
-        beforeWrite = {
-            it.byId(2).apply {
-                field = "team_id"
-                value = 42
-            }
-        }
-        assertThat(catchThrowable { store.setNamespaceContainment("wh", "team_42", team42, null) })
-            .isInstanceOf(HoglakeException.AlreadyExists::class.java)
-            .hasMessage("another namespace is already contained for team_id = 42")
         assertThat(t.byId(1).field).isNull()
     }
 

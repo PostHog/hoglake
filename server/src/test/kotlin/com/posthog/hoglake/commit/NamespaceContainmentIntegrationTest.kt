@@ -296,12 +296,15 @@ class NamespaceContainmentIntegrationTest {
     }
 
     @Test
-    fun `one live namespace per value, marking is idempotent, and changing means clearing first`() {
+    fun `several namespaces may share a value, marking is idempotent, and changing means clearing first`() {
         val cat = fixture()
         assertThat(catalogs.setNamespaceContainment(cat, "team_42", team42).containment).isEqualTo(team42)
         catalogs.createNamespace(cat, "other")
-        assertThatThrownBy { catalogs.setNamespaceContainment(cat, "other", team42) }
-            .isInstanceOf(HoglakeException.AlreadyExists::class.java)
+        // A second namespace takes the same value, and each keeps its own prefix.
+        assertThat(catalogs.setNamespaceContainment(cat, "other", team42).containment).isEqualTo(team42)
+        assertThat(catalogs.listNamespaces(cat).filter { it.containment == team42 }.map { it.name })
+            .containsExactlyInAnyOrder("team_42", "other")
+        catalogs.setNamespaceContainment(cat, "other", null)
         assertThatThrownBy { catalogs.setNamespaceContainment(cat, "team_42", NamespaceContainment("team_id", 43)) }
             .isInstanceOf(HoglakeException.CommitConflict::class.java)
         for (bad in listOf(

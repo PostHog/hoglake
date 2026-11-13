@@ -34,10 +34,34 @@ import java.time.format.DateTimeFormatter
  * There are no tenant migrations. [DDL] is the first released schema.
  * The first schema change after release must also upgrade the tenants
  * that exist, before any operation reads the new shape.
+ *
+ * The one such change so far: the live-containment index was UNIQUE
+ * (one namespace per value) and is now a plain index under a new name,
+ * since several namespaces may be contained for one value. New tenants
+ * get the plain index from [DDL]. An existing tenant still has the
+ * unique one, which would refuse a second namespace for a value, so the
+ * containment-marking transaction runs [CONTAINMENT_INDEX_UPGRADE] first:
+ * the upgrade is lazy, in the same transaction as the first mark that
+ * relies on the new shape, and idempotent (a tenant already upgraded, or
+ * created after the change, finds nothing to drop and the index there).
+ * Nothing else reads or writes the index by name.
  */
 internal object HogliteSchema {
     /** The `meta` row's fixed id — one catalog, one row. */
     const val META_ID = 1L
+
+    /** The non-unique live-containment lookup index. */
+    const val CONTAINMENT_INDEX_DDL =
+        """CREATE INDEX IF NOT EXISTS namespaces_contained
+                ON namespaces(contained_field, contained_value)
+                WHERE dropped_snapshot IS NULL AND contained_field IS NOT NULL"""
+
+    /**
+     * Statements, in order, that bring a tenant created with the unique
+     * `namespaces_live_containment` index to the current shape.
+     */
+    val CONTAINMENT_INDEX_UPGRADE: List<String> =
+        listOf("DROP INDEX IF EXISTS namespaces_live_containment", CONTAINMENT_INDEX_DDL)
 
     /** Snapshot 0: the empty catalog, as hoglake's createCatalog writes it. */
     const val SNAPSHOT_ZERO = 0L
@@ -133,12 +157,14 @@ internal object HogliteSchema {
             )""",
             """CREATE UNIQUE INDEX IF NOT EXISTS namespaces_live
                 ON namespaces(name) WHERE dropped_snapshot IS NULL""",
-            // At most one live namespace per containment (V33's
-            // hog_namespace_live_containment). A query uses it only when
-            // its WHERE repeats both terms of the index's WHERE.
-            """CREATE UNIQUE INDEX IF NOT EXISTS namespaces_live_containment
-                ON namespaces(contained_field, contained_value)
-                WHERE dropped_snapshot IS NULL AND contained_field IS NOT NULL""",
+            // The lookup index for a containment (V36's
+            // hog_namespace_live_containment). NOT unique: several live
+            // namespaces may be contained for one value. A query uses it
+            // only when its WHERE repeats both terms of the index's WHERE.
+            // The first release made it UNIQUE under the name
+            // namespaces_live_containment; CONTAINMENT_INDEX_UPGRADE
+            // replaces that on a tenant's first containment mark.
+            CONTAINMENT_INDEX_DDL,
             """CREATE TABLE IF NOT EXISTS tables(
                 id INTEGER PRIMARY KEY,
                 namespace_id INTEGER NOT NULL,

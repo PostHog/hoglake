@@ -125,8 +125,9 @@ CREATE TABLE hog_namespace (
 );
 CREATE UNIQUE INDEX hog_namespace_live_name
     ON hog_namespace (catalog_id, name) WHERE NOT dropped;
--- V33: one live contained namespace per (catalog, field, value).
-CREATE UNIQUE INDEX hog_namespace_live_containment
+-- V33/V36: lookup of a catalog's live contained namespaces by value. Not
+-- unique: several namespaces may be contained for one value.
+CREATE INDEX hog_namespace_live_containment
     ON hog_namespace (catalog_id, contained_field, contained_value)
     WHERE NOT dropped AND contained_field IS NOT NULL;
 

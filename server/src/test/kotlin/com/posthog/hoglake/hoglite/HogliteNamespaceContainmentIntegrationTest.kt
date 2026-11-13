@@ -76,11 +76,19 @@ class HogliteNamespaceContainmentIntegrationTest {
         assertThat(store.liveContainment(HogliteConformanceEngine.uniqueName("absent"), "team_42")).isNull()
         assertThat(store.getNamespace(c, "team_42").containment).isEqualTo(team42)
         assertThat(store.listNamespaces(c, null, null).single { it.name == "team_42" }.containment).isEqualTo(team42)
-        // Marking again is a no-op. A second namespace cannot take the same value.
+        // Marking again is a no-op.
         assertThat(store.setNamespaceContainment(c, "team_42", team42, null).containment).isEqualTo(team42)
-        store.createNamespace(c, "team_x", null, null)
-        assertThatThrownBy { store.setNamespaceContainment(c, "team_x", team42, null) }
-            .isInstanceOf(HoglakeException.AlreadyExists::class.java)
+        // A second namespace takes the same value, and each keeps its own prefix.
+        store.createNamespace(c, "imports_42", null, null)
+        assertThat(store.setNamespaceContainment(c, "imports_42", team42, null).containment).isEqualTo(team42)
+        assertThat(store.liveContainment(c, "imports_42")).isEqualTo(team42)
+        assertThat(store.listNamespaces(c, null, null).filter { it.containment == team42 }.map { it.name })
+            .containsExactlyInAnyOrder("team_42", "imports_42")
+        store.createTable(c, "imports_42", "t", listOf(ColumnDef("id", ColType.LONG)), null, null)
+        append(c, "imports_42", "data/imports_42/t/a.parquet")
+        refused { append(c, "imports_42", "data/team_42/t/b.parquet") }
+        store.dropTable(c, "imports_42", "t", null, "op", "drop")
+        store.setNamespaceContainment(c, "imports_42", null, null)
         // A namespace that holds a table cannot be marked.
         assertThatThrownBy { store.setNamespaceContainment(c, "main", NamespaceContainment("team_id", 1), null) }
             .isInstanceOf(HoglakeException.NamespaceNotEmpty::class.java)
@@ -103,6 +111,37 @@ class HogliteNamespaceContainmentIntegrationTest {
         assertThat(store.liveContainment(c, "team_42")).isNull()
         store.dropNamespace(c, "team_42", null, "me", "drop", mayDropContained = false)
     }
+
+    @Test
+    fun `a tenant created with the unique containment index upgrades at its first mark`() {
+        val c = catalog()
+        store.createNamespace(c, "team_42", null, null)
+        store.createNamespace(c, "imports_42", null, null)
+        // The first release's shape: the unique index, not the plain one.
+        val old = HogliteTx()
+        old.add("DROP INDEX IF EXISTS namespaces_contained")
+        old.add(
+            "CREATE UNIQUE INDEX IF NOT EXISTS namespaces_live_containment ON namespaces(contained_field, " +
+                "contained_value) WHERE dropped_snapshot IS NULL AND contained_field IS NOT NULL",
+        )
+        store.catalogOperation(c) {
+            store.runTx(c, HogliteCatalogStore.freshTxid("old-index"), null, old)
+        }
+        assertThat(indexNames(c)).contains("namespaces_live_containment").doesNotContain("namespaces_contained")
+
+        assertThat(store.setNamespaceContainment(c, "team_42", team42, null).containment).isEqualTo(team42)
+        assertThat(store.setNamespaceContainment(c, "imports_42", team42, null).containment).isEqualTo(team42)
+        assertThat(indexNames(c)).contains("namespaces_contained").doesNotContain("namespaces_live_containment")
+        // The upgrade is idempotent: another mark finds nothing left to drop.
+        store.createNamespace(c, "imports_43", null, null)
+        store.setNamespaceContainment(c, "imports_43", NamespaceContainment("team_id", 43), null)
+        assertThat(indexNames(c)).contains("namespaces_contained").doesNotContain("namespaces_live_containment")
+    }
+
+    private fun indexNames(c: String): List<String> =
+        store.catalogOperation(c) {
+            store.queryCatalog(c, "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'namespaces'")
+        }.rows.map { it[0].asString() }
 
     @Test
     fun `a foreign file under the prefix refuses the mark, in a literal or an escaped spelling`() {

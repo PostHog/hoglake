@@ -426,8 +426,9 @@ class CatalogService(private val jdbi: Jdbi) {
      *   any of its tables registers from now on is checked;
      * - no other table's file, DV, live upload claim or undrained removal
      *   to sit under `<data_path>/data/<namespace>/` (or a percent-escaped
-     *   spelling of it), so the prefix is the namespace's alone;
-     * - no other live namespace to hold the same `field = value`.
+     *   spelling of it), so the prefix is the namespace's alone.
+     *
+     * Several live namespaces may hold the same `field = value`.
      *
      * Marking the same containment again is a no-op; changing it means
      * clearing first. Clearing requires no live table or view.
