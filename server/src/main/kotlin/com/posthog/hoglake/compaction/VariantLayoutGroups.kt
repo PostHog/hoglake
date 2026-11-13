@@ -271,15 +271,20 @@ internal object VariantLayoutGroups {
         maxInputFiles: Int,
         size: (CompactionCandidate) -> Long,
     ): List<CompactionCandidate> {
-        val short = populations.others.filter { it.size < minInputFiles }.maxByOrNull { it.size } ?: return emptyList()
+        val short =
+            populations.others.map { it.files }.filter { it.size < minInputFiles }.maxByOrNull { it.size }
+                ?: return emptyList()
         if (populations.unknown.isEmpty()) return emptyList()
         if (grouping.groups(populations.main, minInputFiles, maxInputFiles, size).isNotEmpty()) return emptyList()
         val borrowed = populations.unknown.take(minInputFiles - short.size)
         val trial = grouping.groups(short + borrowed, minInputFiles, maxInputFiles, size)
         val lent = borrowed.filter { file -> trial.any { group -> file in group } }
         if (lent.isEmpty()) return emptyList()
+        // Lent files leave the main population AND its unknowns: they are
+        // the short population's now, and nothing may lend them twice.
         short += lent
         populations.main -= lent.toSet()
+        populations.unknown -= lent.toSet()
         return lent
     }
 
@@ -416,12 +421,51 @@ internal class VariantLayoutMemory(
      */
     class Populations(
         val main: MutableList<CompactionCandidate>,
-        val unknown: List<CompactionCandidate>,
-        val others: List<MutableList<CompactionCandidate>>,
+        /** The never-probed among [main]; a file [VariantLayoutGroups.borrow] lends leaves both. */
+        val unknown: MutableList<CompactionCandidate>,
+        val others: List<Other>,
         val duckdb: Int,
     ) {
-        fun all(): List<List<CompactionCandidate>> = (listOf(main) + others).filter { it.isNotEmpty() }
+        fun all(): List<List<CompactionCandidate>> = (listOf(main) + others.map { it.files }).filter { it.isNotEmpty() }
     }
+
+    /** The files remembered under one [deviations] fingerprint, whose remembered [Shape]s [shapeOf] gives. */
+    class Other(val deviations: Long, val files: MutableList<CompactionCandidate>)
+
+    /**
+     * What the planner needs of a deviating column's layout to admit a
+     * sorted group of it against the budgets without a probe: the node
+     * count and nestedness that size its chunk ([VariantLayout.shape]) and
+     * the leaves it adds to the output schema ([VariantLayout.leaves]).
+     */
+    data class Shape(val nodes: Int, val nested: Boolean, val leaves: Int)
+
+    /**
+     * Per deviations fingerprint, the [Shape] of each deviating column:
+     * one entry per distinct layout this process has met, not per file,
+     * bounded by [SHAPE_CAPACITY], LEAST RECENTLY USED out — a shape the
+     * planner still looks up every sweep stays, however old; one evicted
+     * is probed once more, as before it was remembered. Access-ordered,
+     * so a `get` reorders: every call goes through the synchronized
+     * wrapper, one call at a time.
+     */
+    private val shapes =
+        Collections.synchronizedMap(
+            object : LinkedHashMap<Long, Map<Long, Shape>>(16, 0.75f, true) {
+                override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Long, Map<Long, Shape>>): Boolean =
+                    size > SHAPE_CAPACITY
+            },
+        )
+
+    fun rememberShape(
+        deviations: Long,
+        shape: Map<Long, Shape>,
+    ) {
+        shapes[deviations] = shape
+    }
+
+    /** The remembered shape of a deviating layout, or null for one never probed (or evicted). */
+    fun shapeOf(deviations: Long): Map<Long, Shape>? = shapes[deviations]
 
     /**
      * [candidates] of one bucket as the planner should pack them, under a
@@ -447,7 +491,11 @@ internal class VariantLayoutMemory(
         for (candidate in candidates) {
             val entry = recall(catalogId, candidate.dataFileId)
             when {
-                entry == null || (!entry.duckdb && entry.declared != declared) -> {
+                // Judged against another declaration: unknown again, a
+                // DuckDB entry INCLUDED — whether a DuckDB file holds a live
+                // variant column's data at all is a question about the live
+                // columns (one dropped, one added), so it is asked again.
+                entry == null || entry.declared != declared -> {
                     main += candidate
                     unknown += candidate
                 }
@@ -456,7 +504,7 @@ internal class VariantLayoutMemory(
                 else -> others.getOrPut(entry.deviations) { mutableListOf() } += candidate
             }
         }
-        return Populations(main, unknown, others.values.toList(), duckdb)
+        return Populations(main, unknown, others.map { (deviations, files) -> Other(deviations, files) }, duckdb)
     }
 
     val size: Int get() = known.size
@@ -467,6 +515,9 @@ internal class VariantLayoutMemory(
 
         /** The fingerprint of no deviation at all: a file in the declared layout. */
         val NONE: Long = VariantLayout.fingerprint(emptyMap())
+
+        /** Distinct deviating layouts whose shapes are kept: far more than any fleet of tables has declared. */
+        const val SHAPE_CAPACITY = 4_096
 
         /**
          * 250k entries, ~30 MB of heap at ~120 B an entry. What the memory

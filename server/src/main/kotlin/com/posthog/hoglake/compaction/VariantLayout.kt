@@ -100,6 +100,17 @@ object VariantLayout {
         return shape(group)
     }
 
+    /** The leaves (primitive nodes) of a layout group: what an output schema holding it adds to its column count. */
+    fun leaves(group: GroupType): Int {
+        var leaves = 0
+
+        fun walk(type: Type) {
+            if (type.isPrimitive) leaves++ else type.asGroupType().fields.forEach(::walk)
+        }
+        walk(group)
+        return leaves
+    }
+
     /**
      * [shape] of a layout as a group — a file's [canonical] subtree, which
      * is what a rewrite of files in another layout decodes a row of, and

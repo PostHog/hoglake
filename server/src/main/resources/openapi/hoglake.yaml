@@ -5801,7 +5801,8 @@ components:
             produced from an input file's parquet type (outside identity
             and the int->long / float->double promotions). With
             HOGLAKE_COMPACTION_VARIANT on, also groups holding a VARIANT
-            input whose field is no VARIANT group at all, which
+            input whose field is no VARIANT group at all or holds a
+            REPEATED node outside a LIST or MAP layer, which
             hoglake_compaction_variant_layout_mismatch_total counts apart
             (a group whose inputs hold several layouts is rewritten per
             layout instead, and is not counted here).

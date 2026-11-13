@@ -2030,15 +2030,23 @@ the footer is handed on so it is read once, up to 16 MiB of registered
 every variant column. Each partition that still meets the group-size
 rule (`minInputFiles`, scaled as `CompactionGrouping` scales it) is
 rewritten on its own, its output in ITS layout — the declared layout's
-partition first, so data converges on the catalog's layout as old files
-age out; a partition in a layout the declaration no longer names still
-compacts, into that layout, with no decoding and no re-shredding. A
+partition first; a partition in a layout the declaration no longer names
+still compacts, into that layout, with no decoding and no re-shredding.
+Compaction CONSOLIDATES WITHIN each layout and never converts rows from
+one to another: an output is a new live file in its inputs' layout, and
+expiry removes only ended files, so an old layout's rows stay in it
+until they are deleted or rewritten by a writer. A
 partition too small is left alone, uncompacted and unrefused, and a file
 DuckDB wrote (Trino reads its top-level Variant nulls as SQL NULL by
 `created_by`, which an output does not keep) is excluded on its own and
 never blocks the rest. Only a variant field that is no VARIANT group at
-all (a leaf, a REPEATED group, no annotation) still refuses its group as
-`unconvertible_schema`.
+all (a leaf, a REPEATED group, no annotation, no REQUIRED BINARY
+`metadata`), or one holding a REPEATED node outside a LIST or MAP layer,
+still refuses its group as `unconvertible_schema`. `metadata` is found
+by name, so it may come before or after `value`; the layout keeps the
+file's field order, so a `value`-first file (Spark's) never matches the
+declared layout, which lays out `metadata` first, and compacts only with
+files of its own order.
 
 Not starving the sweep: a mixed group whose every partition is too small
 would spend one of the sweep's `HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN`
@@ -2052,12 +2060,20 @@ with files deviating the same way, drops files it knows DuckDB wrote,
 and packs the rest — the declared layout's, the never-probed, and any
 entry judged against an older declaration — together as before. A
 remembered remainder forms no group until enough files of its layout are
-known. Deviations rather than whole layouts, so a file written before a
+known, except that when the rest form no group of their own, the largest
+short remainder takes as many never-probed files as it is short, in
+candidate order, and borrows those that land in a group with it; the
+probe sorts them out (at most one such loan per bucket per sweep; a
+probed file is remembered, so never lent again). Deviations
+rather than whole layouts, so a file written before a
 variant column was added (which the rewrite null-fills) packs with later
 files of its layout; the declaration's fingerprint, so DDL
-(`set_variant_shredding`, a variant column added or renamed) makes every
-entry of the table unknown again and each file is probed once more
-rather than stranded. A compaction output is entered as it is
+(`set_variant_shredding`, a variant column added, dropped or renamed)
+makes every entry of the table unknown again and each file is probed
+once more rather than stranded — a DuckDB entry included, since whether
+a DuckDB file holds live variant data depends on the live columns, so a
+DuckDB file that no longer does compacts, null-filled, after that one
+re-probe. A compaction output is entered as it is
 registered — its layout is what was just written — so it is not probed
 on the next sweep to learn it. The memory is per process (empty after a
 restart, so each file is probed once per restart), bounded at 250k
@@ -2066,6 +2082,30 @@ without it — the probe splits any group — and only the repeat depends on
 it. Not a column on `hog_data_file`: the hydrator never sees a file
 registered with inline stats (pyhoglake's), so the planner would need
 this fallback anyway.
+
+Beside each deviating layout's fingerprint the probe also remembers its
+SHAPE (`VariantLayoutMemory.Shape`: node count, nestedness, output
+leaves). The planner admits a sorted group of a remembered deviating
+layout against the sorted budgets with THAT shape alone, in metadata,
+where every other group is admitted against the declared one; the
+declared estimate is not applied to it as well. So a narrower layout
+left by a since-widened declaration still compacts, and a known layout
+wider than the declaration is refused on its real leaf count without a
+re-probe. A layout the
+budgets refuse is probed and charged once (`layout_probe_only`, below),
+and on every later sweep refused by the planner without reading a
+footer: counted as `spill_budget_exceeded` / `merge_budget_exceeded`
+(ledger and `hoglake_compaction_skipped_total`) like the planner's other
+budget refusals, and not charged to
+`HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN`. Admission is recomputed every
+plan from the current inputs and budgets, so raising
+`HOGLAKE_COMPACTION_SORTED_HEAP_BYTES` / `HOGLAKE_COMPACTION_SPILL_BYTES`
+admits the group on the next plan without a re-probe; a declaration
+change makes the files' entries stale, so they are probed once more.
+Shapes are kept one per distinct deviating layout, not per file, at most
+4096 (`SHAPE_CAPACITY`), least recently used evicted first (the
+planner's lookup counts as a use, so a shape still planned every sweep
+stays); a group of an evicted layout is probed once more.
 
 What a probe costs. For a variant table the probe's footer read replaces
 the one the rewrite's open would make: the footer is handed on
@@ -2077,17 +2117,24 @@ parsed footer is several times its serialized length, so this is up to
 a few hundred MB of heap at worst, beside (not inside)
 `HOGLAKE_COMPACTION_SORTED_HEAP_BYTES`, which bounds the sorted
 rewrite's chunk and merge; size the pod with that headroom. A probe that
-finds nothing worth a rewrite (one file per layout; only DuckDB files)
-still read every footer, so it is charged as one attempt against
+finds nothing worth a rewrite (one file per layout; only DuckDB files),
+or whose every part is refused on re-admission (below), still read every
+footer, so it is charged as one attempt against
 `HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN`, counted in the ledger as
 `layout_probe_only` and in
-`hoglake_compaction_skipped_total{reason="layout_probe_only"}`; a
-steady rate of it means the memory is being lost (restarts, or its
-capacity). A group split into N parts spends N attempts, so a sweep can
+`hoglake_compaction_skipped_total{reason="layout_probe_only"}`. A
+budget-refused layout is charged this way only at its first probe; after
+that it recurs as a planner `spill_budget_exceeded` /
+`merge_budget_exceeded` (above), whose levers are
+`HOGLAKE_COMPACTION_SORTED_HEAP_BYTES` / `HOGLAKE_COMPACTION_SPILL_BYTES`.
+So a steady `layout_probe_only` rate means the memory is being lost
+(restarts, its 250k-entry capacity, or shape eviction).
+A group split into N parts spends N attempts, so a sweep can
 run past `HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN` by at most
 (layouts − 1) × `HOGLAKE_COMPACTION_PARALLEL_GROUPS` in its last wave;
-the first part of a group always runs (an in-flight group completes),
-later parts yield to a sibling's heap exhaustion or a cancellation.
+the first part of a group never yields (an in-flight group completes),
+though it can still be refused on re-admission; later parts yield to a
+sibling's heap exhaustion or a cancellation.
 After a split group commits, its claim is narrowed to the inputs that
 died, so the files left behind are free to be planned again at once.
 
@@ -2098,10 +2145,11 @@ live variant column — scalars written before the column was added —
 is not excluded: it compacts, null-filled); `layout`, one per group
 refused because a variant field is no VARIANT group, or one whose
 subtree the copy could not carry whole (a REPEATED node outside a LIST or
-MAP layer). Convergence is
+MAP layer). Rewrite activity per layout is
 `hoglake_compaction_variant_layout_outputs_total{catalog,
-layout="declared"|"other"}` — outputs per layout, `other` falling to
-zero as the old layout's files consolidate and age out — and
+layout="declared"|"other"}` — outputs per layout. It measures rewrites
+only: a falling `other` rate means less rewriting in old layouts, not
+that an old layout is gone — and
 `hoglake_compaction_variant_layout_files_left_total{catalog}`, files set
 aside for want of company in their layout (each once, since the memory
 keeps them out of the next plan).
@@ -2109,12 +2157,20 @@ keeps them out of the next plan).
 **A `split` after `set_variant_shredding` is EXPECTED**, for as long as
 files written under the previous declaration remain in a partition beside
 files written under the new one: that is the case this mechanism exists
-for, and the table converges without any operator action. Do not turn
+for, and each layout keeps compacting among its own files without any
+operator action. Do not turn
 `HOGLAKE_COMPACTION_VARIANT` off on seeing it — that stops the very
-compaction that drains the old layout and lets small files pile up.
-Before reading a `split` as drift, check the table's declaration history
-(the `table_altered` changes carrying `set_variant_shredding`, or
-`layout="other"` outputs appearing only after one): a `split` with NO
+compaction that consolidates the old layout's files and lets small files
+pile up. Before reading a `split` as drift, check the table's declaration
+history. A change row holds only `kind` and `object_id`, and every alter
+records the same `table_altered`, so the change log narrows the
+candidates and the table's own reads decide: page
+`GET /catalogs/{catalog}/snapshots` for `table_altered` changes whose
+`object_id` is the table's `hog_table.table_id`, and for each such
+snapshot S compare the variant column's `type_params.shredding` in
+`GET .../tables/{table}?snapshot=S` and `?snapshot=S-1`. A snapshot
+below the catalog's retained floor answers 410, so a change since
+expired cannot be found and the cause stays unknown. A `split` with NO
 declaration change behind it, on a table only pyhoglake's `Table.append`
 or `prepare_append_tables` or the connector write, and likewise a
 `layout` refusal of such a file, means the layout port has drifted from
@@ -2126,11 +2182,17 @@ nodes, not as one catalog node, and a part in another layout is sized by
 THAT layout's nodes (`CompactionConfig.spillChunkRows` with the part's
 layouts), not the declaration's: a declaration since cleared or narrowed
 leaves files far wider than the catalog says, and a chunk sized for the
-narrow rows would hold too many wide ones for the heap. Each part is
+narrow rows would hold too many wide ones for the heap. A layout holding
+a LIST or MAP layer counts as nested, so its chunk is divided by
+`HOGLAKE_COMPACTION_NESTED_SORT_EXPANSION` like a nested column's. Each part is
 re-admitted against its own bounds before its rewrite; a part the wider
-rows push over a budget the declared estimate fit is refused uncharged,
-counted with the planner's `spill_budget_exceeded` /
-`merge_budget_exceeded`.
+rows push over a budget the declared estimate fit is refused, counted
+with the planner's `spill_budget_exceeded` / `merge_budget_exceeded`.
+The refusal is uncharged when another part of the group ran; when no
+part ran, the probe is charged as one `layout_probe_only` attempt
+(above). A part whose output leaf count cannot be computed skips the
+check and goes to the rewrite, which refuses it as
+`unconvertible_schema`.
 
 Each table's candidate list is fixed before rewriting starts, so an
 output cannot feed another group in the **same run**. Input bytes only
@@ -2768,9 +2830,10 @@ requires.) Both keys set selects the `static` storage provider; see
 `http://host.docker.internal:9000` — or `http://minio:9000` with the
 container attached to the compose network — as the endpoint.
 
-pyhoglake's `test_compaction_copies_a_declared_variant_table` needs
-`HOGLAKE_COMPACTION_VARIANT=true` on the server it runs against; it
-fails, not skips, without it. `ci/live-python.sh` sets it; a dev server
+pyhoglake's `test_compaction_copies_a_declared_variant_table` and
+`test_compaction_after_set_variant_shredding_compacts_each_layout_apart`
+need `HOGLAKE_COMPACTION_VARIANT=true` on the server they run against;
+they fail, not skip, without it. `ci/live-python.sh` sets it; a dev server
 must set it by hand.
 
 

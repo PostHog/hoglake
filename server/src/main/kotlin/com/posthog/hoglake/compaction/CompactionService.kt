@@ -782,14 +782,26 @@ data class CompactionConfig(
     fun spillChunkRows(
         columns: List<Column>,
         variantLayouts: Map<Long, GroupType> = emptyMap(),
+    ): Long = spillChunkRowsOf(columns) { column -> variantLayouts[column.fieldId]?.let { VariantLayout.shape(it) } }
+
+    /**
+     * [spillChunkRows] for a part whose layouts the planner holds only as
+     * remembered SHAPES ([VariantLayoutMemory.Shape], node count and
+     * nestedness per deviating column), not as groups: what lets the
+     * planner refuse a known-over-budget layout in metadata, before another
+     * footer probe.
+     */
+    internal fun spillChunkRowsOfShapes(
+        columns: List<Column>,
+        shapes: Map<Long, VariantLayoutMemory.Shape>,
+    ): Long = spillChunkRowsOf(columns) { column -> shapes[column.fieldId]?.let { it.nodes to it.nested } }
+
+    private fun spillChunkRowsOf(
+        columns: List<Column>,
+        shapeOf: (Column) -> Pair<Int, Boolean>?,
     ): Long {
         val variants = columns.allNodes().filter { it.def.type == ColType.VARIANT }
-        val layouts =
-            variants.map { column ->
-                variantLayouts[column.fieldId]?.let { VariantLayout.shape(it) }
-                    ?: VariantLayout.shape(column)
-                    ?: (1 to false)
-            }
+        val layouts = variants.map { column -> shapeOf(column) ?: VariantLayout.shape(column) ?: (1 to false) }
         // + the _hog_row_id carrier, and each variant's nodes beyond the one counted
         val nodes = columns.allNodes().size + 1L + layouts.sumOf { (n, _) -> n - 1L }
         val perRow = SORTED_HEAP_BYTES_PER_NODE * nodes
@@ -797,6 +809,12 @@ data class CompactionConfig(
         val nested = columns.allNodes().any { it.def.type.isNested } || layouts.any { (_, list) -> list }
         return maxOf(1L, if (nested) ceiling / nestedSortExpansion else ceiling)
     }
+
+    /** [sortSpill] from remembered shapes; see [spillChunkRowsOfShapes]. */
+    internal fun sortSpillOfShapes(
+        columns: List<Column>,
+        shapes: Map<Long, VariantLayoutMemory.Shape>,
+    ): SortSpill = sortSpill(columns).copy(chunkRows = spillChunkRowsOfShapes(columns, shapes))
 
     /**
      * The bounds a sorted rewrite of a table shaped [columns] runs under:
@@ -3108,25 +3126,76 @@ class CompactionService(
             } else {
                 null
             }
+        // A SORTED group of a remembered deviating layout is admitted against
+        // THAT layout's shape here, in metadata — the probe that first met
+        // the layout remembered its node, nesting and leaf counts beside its
+        // fingerprint (VariantLayoutMemory.Shape) — so a layout the budgets
+        // refuse is refused before another footer is read, uncharged and
+        // counted with the planner's refusals below, instead of re-probed
+        // and charged every sweep. Admission is recomputed each plan from
+        // the current inputs and the current budgets, and a declaration
+        // change makes the entries stale (re-probed once).
+        val spill = ctx.sortSpill
+        val spillRefused = mutableListOf<CompactionGroup>()
+        val mergeRefused = mutableListOf<CompactionGroup>()
+        // Groups admitted against their KNOWN shape: that verdict is the
+        // whole admission, so the declared-estimate filter below passes them
+        // through. Judged against the declared estimate as well, a group of
+        // files in a NARROWER historical layout (a declaration since
+        // widened) would be refused — uncharged, and for good — for rows it
+        // does not hold.
+        val judgedByShape = java.util.Collections.newSetFromMap(java.util.IdentityHashMap<CompactionGroup, Boolean>())
+        val declaredLeaves by lazy { runCatching { ParquetRewriter.outputLeafCount(ctx.columns) }.getOrNull() }
+        val declaredVariantLeaves by lazy {
+            ctx.columns.allNodes().filter { it.def.type == ColType.VARIANT }.associate { column ->
+                column.fieldId to
+                    runCatching {
+                        VariantLayout.leaves(
+                            VariantLayout.groupType(column, org.apache.parquet.schema.Type.Repetition.OPTIONAL),
+                        )
+                    }.getOrDefault(0)
+            }
+        }
+
+        fun admitKnown(
+            group: CompactionGroup,
+            shapes: Map<Long, VariantLayoutMemory.Shape>,
+        ): Boolean {
+            if (spill == null) return true
+            val leaves = declaredLeaves ?: return true
+            val partLeaves =
+                leaves - shapes.keys.sumOf { declaredVariantLeaves[it] ?: 0 } + shapes.values.sumOf { it.leaves }
+            judgedByShape += group
+            return when (budgetRefusal(ctx, cfg.sortSpillOfShapes(ctx.columns, shapes), partLeaves, group)) {
+                BudgetRefusal.SPILL -> false.also { spillRefused += group }
+                BudgetRefusal.MERGE -> false.also { mergeRefused += group }
+                null -> true
+            }
+        }
         for ((bucket, candidates) in fetched.byBucket) {
             // THE FAN-IN SCALES WITH THE FILES IT IS CAPPING. Computed per
             // bucket from the rows just fetched, so a bucket of 12 KiB
             // files gets thousands of inputs and a bucket of 200 MB files
             // still gets a handful.
             val fanIn = cfg.effectiveMaxInputFiles(candidates.map { it.fileSizeBytes })
-            val populations =
-                if (declaredFingerprint == null) {
-                    listOf(candidates)
-                } else {
-                    val divided = variantLayouts.populations(ctx.catalogId, declaredFingerprint, candidates)
-                    // A remembered remainder short of the minimum may borrow
-                    // idle unknowns to find company (VariantLayoutGroups.borrow).
-                    VariantLayoutGroups.borrow(divided, grouping, cfg.minInputFiles, fanIn) { it.fileSizeBytes }
-                    divided.all()
-                }
-            for (population in populations) {
-                val packed = grouping.groups(population, cfg.minInputFiles, fanIn) { it.fileSizeBytes }
+            if (declaredFingerprint == null) {
+                val packed = grouping.groups(candidates, cfg.minInputFiles, fanIn) { it.fileSizeBytes }
                 for (take in packed) out += CompactionGroup(rowIdOrder(take), bucket.specId, bucket.values)
+                continue
+            }
+            val divided = variantLayouts.populations(ctx.catalogId, declaredFingerprint, candidates)
+            // A remembered remainder short of the minimum may borrow idle
+            // unknowns to find company (VariantLayoutGroups.borrow).
+            VariantLayoutGroups.borrow(divided, grouping, cfg.minInputFiles, fanIn) { it.fileSizeBytes }
+            for (take in grouping.groups(divided.main, cfg.minInputFiles, fanIn) { it.fileSizeBytes }) {
+                out += CompactionGroup(rowIdOrder(take), bucket.specId, bucket.values)
+            }
+            for (other in divided.others) {
+                val shapes = variantLayouts.shapeOf(other.deviations)
+                for (take in grouping.groups(other.files, cfg.minInputFiles, fanIn) { it.fileSizeBytes }) {
+                    val group = CompactionGroup(rowIdOrder(take), bucket.specId, bucket.values)
+                    if (shapes == null || admitKnown(group, shapes)) out += group
+                }
             }
         }
         // OBJECT-PREFIX LAYOUT: a group whose prefix cannot be named — no
@@ -3149,21 +3218,22 @@ class CompactionService(
         // re-plan and re-refuse every sweep until an operator moves a knob.
         // The leaf count is the output schema's; a live schema the rewrite
         // cannot shape at all has no count, and its groups are left for
-        // the rewrite to refuse with its own typed reason.
-        val spill = ctx.sortSpill
-        val leaves = spill?.let { runCatching { ParquetRewriter.outputLeafCount(ctx.columns) }.getOrNull() }
-        val spillRefused = mutableListOf<CompactionGroup>()
-        val mergeRefused = mutableListOf<CompactionGroup>()
+        // the rewrite to refuse with its own typed reason. A group already
+        // judged against its known layout's shape ([judgedByShape]) is not
+        // judged again against the declared estimate: its rows are its
+        // layout's, wider or narrower than the declaration says.
+        val leaves = spill?.let { declaredLeaves }
         val fits =
             if (spill == null || leaves == null) {
                 resolvable
             } else {
                 resolvable.filter { group ->
-                    when (budgetRefusal(ctx, spill, leaves, group)) {
-                        BudgetRefusal.SPILL -> false.also { spillRefused += group }
-                        BudgetRefusal.MERGE -> false.also { mergeRefused += group }
-                        null -> true
-                    }
+                    group in judgedByShape ||
+                        when (budgetRefusal(ctx, spill, leaves, group)) {
+                            BudgetRefusal.SPILL -> false.also { spillRefused += group }
+                            BudgetRefusal.MERGE -> false.also { mergeRefused += group }
+                            null -> true
+                        }
                 }
             }
         logBudgetRefusals(ctx, cfg, spillRefused, mergeRefused)
@@ -4363,10 +4433,12 @@ class CompactionService(
             // per part, so a sweep may run past `maxGroupsPerRun` by the
             // extra parts of its last wave — at most (layouts - 1) x
             // parallelGroups attempts, spent on work the planner meant to
-            // do. The FIRST part always runs: a group that got this far is
+            // do. The FIRST part never yields: a group that got this far is
             // in flight, and the wave's contract is that an in-flight group
             // runs to completion (executeWave); only the parts after it
             // yield to a heap exhausted by a sibling or to cancellation.
+            // Any part, the first included, can still be refused on
+            // re-admission below.
             for ((index, part) in planned.parts.withIndex()) {
                 if (yieldsBeforePart(index, heapExhausted.get(), Thread.currentThread().isInterrupted)) break
                 // A SORTED part is bounded by ITS layout, not the declared
@@ -4804,16 +4876,25 @@ class CompactionService(
             // How the file deviates from THIS declaration, under its
             // fingerprint: a column the file predates deviates in nothing,
             // and a later declaration makes the entry stale (see
-            // VariantLayoutMemory).
+            // VariantLayoutMemory). A deviating layout's SHAPE is remembered
+            // beside the fingerprint, so the planner can admit a group of it
+            // against the sorted budgets without another probe.
+            val deviations = if (p.duckdb) emptyMap() else VariantLayoutGroups.deviations(p.layouts, declared)
+            val deviationFingerprint = VariantLayout.fingerprint(deviations)
+            if (!p.duckdb && deviations.isNotEmpty()) {
+                variantLayouts.rememberShape(
+                    deviationFingerprint,
+                    deviations.mapValues { (_, layout) ->
+                        val (nodes, nested) = VariantLayout.shape(layout)
+                        VariantLayoutMemory.Shape(nodes, nested, VariantLayout.leaves(layout))
+                    },
+                )
+            }
             variantLayouts.remember(
                 ctx.catalogId,
                 p.file.dataFileId,
                 declaredFingerprint,
-                if (p.duckdb) {
-                    VariantLayoutMemory.DUCKDB
-                } else {
-                    VariantLayout.fingerprint(VariantLayoutGroups.deviations(p.layouts, declared))
-                },
+                if (p.duckdb) VariantLayoutMemory.DUCKDB else deviationFingerprint,
             )
         }
         // The counters. `split` once per group the probe found mixed, so
@@ -4859,6 +4940,13 @@ class CompactionService(
         ctx: TableContext,
         group: CompactionGroup,
     ): List<VariantLayoutGroups.Probed> {
+        // The SAME catalog-scoped view [compactGroup] rewrites through —
+        // WRITE, not READ: under `broker` the base store holds no session
+        // for the catalog's objects at all, and a READ view would mint and
+        // cache a second session per catalog for footers the WRITE session
+        // the rewrite needs moments later reads just as well. One view,
+        // one session, probe and rewrite alike.
+        val store = this.store.forCatalog(ctx.catalog, ctx.dataPath, StorageAccess.WRITE)
         val inputs =
             group.files.map { f ->
                 ParquetRewriter.Input(

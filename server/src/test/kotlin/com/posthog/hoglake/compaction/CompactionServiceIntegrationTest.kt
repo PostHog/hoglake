@@ -2393,7 +2393,204 @@ class CompactionServiceIntegrationTest {
             assertThat(catalogs.listFiles(cat, "ns", "t").map { it.path })
                 .describedAs("every input live, no output")
                 .containsExactlyInAnyOrderElementsOf(files.map { it.path })
+
+            // KNOWN NOW. The probe remembered the layout's shape beside its
+            // fingerprint, so the planner admits the group against that
+            // shape in metadata: refused before any footer is read,
+            // uncharged, counted with the planner's refusals — and the
+            // sweep's one slot is free for the next table.
+            createVariantTable(cat, "u")
+            val later = addFiles(cat, 0, "b", "b", table = "u")
+            // Only t's files count: u's group is probed before its rewrite,
+            // as every variant group is.
+            val tPaths = files.map { it.path }.toSet()
+            var probes = 0
+            svc.afterProbe = { probed -> probes += probed.count { it.file.path in tPaths } }
+            val second =
+                try {
+                    val plan = svc.planTable(cat, "ns", "t", sorted)
+                    assertThat(plan.groups).describedAs("refused in metadata").isEmpty()
+                    assertThat(plan.mergeRefusedGroups).isEqualTo(1)
+                    svc.runOnce(cat, sorted)
+                } finally {
+                    svc.afterProbe = {}
+                }
+            assertThat(probes).describedAs("t's group was refused without reading a footer").isZero()
+            assertThat(second.mergeBudgetExceeded).describedAs("%s", second).isEqualTo(1)
+            assertThat(second.layoutProbeOnly).describedAs("nothing was probed, nothing charged").isZero()
+            assertThat(second.groupsCompacted).describedAs("the slot went to u").isEqualTo(1)
+            assertThat(second.filesIn).isEqualTo(2)
+            assertThat(
+                catalogs.listFiles(cat, "ns", "u").map { it.path },
+            ).doesNotContainAnyElementsOf(later.map { it.path })
+            assertThat(catalogs.listFiles(cat, "ns", "t").map { it.path })
+                .containsExactlyInAnyOrderElementsOf(files.map { it.path })
+
+            // THE LEAVES COUNT TOO. A budget in the window where the known
+            // layout's chunking spills a few runs whose cost at the DECLARED
+            // leaf count fits the merge budget but at the wide layout's leaf
+            // count (each spilled run is charged a page per leaf) does not:
+            // the planner refuses on the leaves alone, still without a probe.
+            val windowed =
+                heapWhere(sorted, from = 16L shl 20, to = 512L shl 20, step = 1L shl 20) { candidate ->
+                    val spill = candidate.sortSpill(narrow, wide)
+                    val runs = ExternalMergeSort.spillRuns(144, spill)
+                    val declaredLeaves = ParquetRewriter.outputLeafCount(narrow)
+                    val budget = spill.mergeBudgetBytes
+
+                    fun merged(leafCount: Int) = runs * ExternalMergeSort.predictedSpilledRunBytes(leafCount, spill)
+
+                    runs > 1 && merged(declaredLeaves) <= budget && merged(leaves) > budget
+                }
+            assertThat(
+                windowed,
+            ).describedAs("a budget between the two leaf counts' costs exists for this fixture").isNotNull()
+            probes = 0
+            svc.afterProbe = { probed -> probes += probed.count { it.file.path in tPaths } }
+            val byLeaves =
+                try {
+                    svc.planTable(cat, "ns", "t", windowed!!)
+                } finally {
+                    svc.afterProbe = {}
+                }
+            assertThat(byLeaves.groups).describedAs("refused on the wide layout's leaves").isEmpty()
+            assertThat(byLeaves.mergeRefusedGroups).isEqualTo(1)
+            assertThat(probes).isZero()
+
+            // A budget the wide layout fits (the budget of the test above)
+            // re-admits it on the next plan, no re-probe needed for that
+            // either: admission is recomputed from the remembered shape and
+            // the current budgets.
+            val roomier = sorted.copy(sortedHeapBytes = heap * 18)
+            assertThat(roomier.sortSpill(narrow, wide).chunkRows).isEqualTo(72)
+            val reAdmitted = svc.planTable(cat, "ns", "t", roomier)
+            assertThat(reAdmitted.groups).hasSize(1)
+            assertThat(reAdmitted.mergeRefusedGroups + reAdmitted.spillRefusedGroups).isZero()
+            val third = svc.runOnce(cat, roomier)
+            assertThat(third.groupsCompacted).describedAs("%s", third).isEqualTo(1)
+            assertThat(third.filesIn).isEqualTo(12)
+            assertThat(third.runsSpilled).describedAs("chunked by the wide layout").isEqualTo(2)
+            assertThat(third.mergeBudgetExceeded + third.spillBudgetExceeded + third.layoutProbeOnly).isZero()
+            assertThat(catalogs.listFiles(cat, "ns", "t")).singleElement().satisfies({
+                assertThat(it.explicitRowIds).isTrue()
+                assertThat(it.recordCount).isEqualTo(144)
+            })
         }
+    }
+
+    @Test
+    fun `old files in a NARROWER layout than a widened declaration compact by their own shape, not the estimate`() {
+        // The mirror image of the wide-layout tests: the table is declared
+        // narrow (other.json's two-field `props`), files are written to it,
+        // then the declaration is widened to a hundred fields. The files
+        // still hold the narrow subtree. Once their layout is known, a
+        // group of them is admitted against THAT shape, and the declared
+        // estimate — which would refuse it for rows it does not hold — is
+        // not consulted again.
+        withVariantMetrics { _ ->
+            val cat = "compact-variant-widened-${counter.incrementAndGet()}"
+            catalogs.createCatalog(cat, "s3://$BUCKET/$cat")
+            catalogs.createNamespace(cat, "ns")
+            catalogs.createTable(cat, "ns", "t", VariantFixtures.other.map { it.def })
+            val first = addFiles(cat, 0, "other_b", "other_b", "other_b", "other_b", "other_b", "other_b")
+            val hundred =
+                mapOf("type" to "object", "fields" to (1..100).map { mapOf("name" to "f$it", "type" to "string") })
+            alter.alterTable(
+                cat,
+                "ns",
+                "t",
+                listOf(
+                    AlterOp.SetSortOrder(listOf(SortFieldDef(1, SortDirection.ASC, NullOrder.NULLS_LAST))),
+                    AlterOp.SetVariantShredding("props", hundred),
+                ),
+            )
+            val live = catalogs.getTable(cat, "ns", "t").columns
+            val narrow =
+                ParquetFileReader.open(LocalInputFile(VariantFixtures.path("other_b"))).use {
+                    ParquetRewriter.variantLayoutsOf(it.footer, live, "other_b")
+                }
+            assertThat(
+                narrow.getValue(2L),
+            ).isEqualTo(VariantLayout.groupType(VariantFixtures.other[1], Type.Repetition.OPTIONAL))
+            assertThat(VariantLayout.shape(narrow.getValue(2L)).first)
+                .isLessThan(VariantLayout.shape(live.single { it.def.name == "props" })!!.first)
+            // A budget under which the declared (hundred-field) estimate
+            // admits six files' 72 rows and refuses twelve files' 144, while
+            // the narrow shape admits the 144.
+            val budget =
+                heapWhere(
+                    variantOn.copy(minInputFiles = 2),
+                    from = 16L shl 20,
+                    to = 1024L shl 20,
+                    step = 1L shl 20,
+                ) { c ->
+                    val declaredSpill = c.sortSpill(live)
+                    val declaredLeaves = ParquetRewriter.outputLeafCount(live)
+                    val narrowSpill = c.sortSpill(live, narrow)
+                    val narrowLeaves = ParquetRewriter.outputLeafCount(live, narrow)
+
+                    fun cost(
+                        rows: Long,
+                        spill: SortSpill,
+                        leaves: Int,
+                    ): Long {
+                        val runs = ExternalMergeSort.spillRuns(rows, spill)
+                        return if (runs <= 1) 0 else runs * ExternalMergeSort.predictedSpilledRunBytes(leaves, spill)
+                    }
+                    cost(72, declaredSpill, declaredLeaves) <= declaredSpill.mergeBudgetBytes &&
+                        cost(144, declaredSpill, declaredLeaves) > declaredSpill.mergeBudgetBytes &&
+                        cost(144, narrowSpill, narrowLeaves) <= narrowSpill.mergeBudgetBytes
+                }
+            assertThat(budget).describedAs("such a budget exists for this fixture").isNotNull()
+            val cfg = budget!!
+
+            // Sweep 1: six unknown files, admitted against the declared
+            // estimate, probed, found narrow, compacted in their layout — and
+            // the output remembered as deviating, its layout's shape known.
+            val one = svc.runOnce(cat, cfg)
+            assertThat(one.groupsCompacted).describedAs("%s", one).isEqualTo(1)
+            assertThat(one.filesIn).isEqualTo(6)
+            // Six more narrow files: the same again.
+            addFiles(cat, first.size, "other_b", "other_b", "other_b", "other_b", "other_b", "other_b")
+            val two = svc.runOnce(cat, cfg)
+            assertThat(two.groupsCompacted).describedAs("%s", two).isEqualTo(1)
+            assertThat(two.filesIn).isEqualTo(6)
+            val outputs = catalogs.listFiles(cat, "ns", "t")
+            assertThat(outputs).hasSize(2).allSatisfy { assertThat(it.explicitRowIds).isTrue() }
+
+            // Sweep 3: the two outputs, 144 narrow rows, are a KNOWN deviating
+            // population. The declared estimate would refuse them; their own
+            // shape admits them, and that verdict is the admission.
+            val plan = svc.planTable(cat, "ns", "t", cfg)
+            assertThat(plan.groups).describedAs("admitted by the known narrow shape").hasSize(1)
+            assertThat(plan.mergeRefusedGroups + plan.spillRefusedGroups).isZero()
+            val three = svc.runOnce(cat, cfg)
+            assertThat(three.groupsCompacted).describedAs("%s", three).isEqualTo(1)
+            assertThat(three.filesIn).isEqualTo(2)
+            assertThat(three.mergeBudgetExceeded + three.spillBudgetExceeded + three.layoutProbeOnly).isZero()
+            val output = catalogs.listFiles(cat, "ns", "t").single()
+            assertThat(output.recordCount).isEqualTo(144)
+            val (schema, rows) = VariantFixtures.read(fetch(output.path))
+            assertThat(schema.getType("props")).describedAs("still the narrow layout").isEqualTo(narrow.getValue(2L))
+            assertThat(rows.map { it.getLong("id", 0) }).isSorted().hasSize(144)
+        }
+    }
+
+    /** The smallest `sortedHeapBytes` in [from, to] by [step] under which [ok] holds for [base], or null. */
+    private fun heapWhere(
+        base: CompactionConfig,
+        from: Long,
+        to: Long,
+        step: Long,
+        ok: (CompactionConfig) -> Boolean,
+    ): CompactionConfig? {
+        var heap = from
+        while (heap <= to) {
+            val candidate = base.copy(sortedHeapBytes = heap)
+            if (ok(candidate)) return candidate
+            heap += step
+        }
+        return null
     }
 
     @Test

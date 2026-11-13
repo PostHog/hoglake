@@ -251,27 +251,31 @@ class VariantLayoutGroupsTest {
     }
 
     @Test
-    fun `an entry judged against another declaration is unknown again, except a DuckDB file`() {
+    fun `an entry judged against another declaration is unknown again, a DuckDB entry included`() {
         // After set_variant_shredding, or a variant column added or renamed,
         // what "deviating" means has changed: every remembered file packs
         // with the declared population and is probed once more. A DuckDB
-        // file stays one whatever the declaration.
+        // exclusion is no exception: whether a DuckDB file holds a live
+        // variant column's data is a question about the live columns, and
+        // files remembered while `v` was live would otherwise stay excluded
+        // after `v` was dropped and `w` added, holding no variant data at all.
         val memory = VariantLayoutMemory()
         val before = VariantLayout.fingerprint(DECLARED)
         val after = VariantLayout.fingerprint(DECLARED + (W.fieldId to OLD.getValue(V.fieldId)))
         val old = VariantLayout.fingerprint(VariantLayoutGroups.deviations(OLD, DECLARED))
-        val files = (1..4).map { candidate(it.toLong()) }
+        val files = (1..5).map { candidate(it.toLong()) }
         memory.remember(1, 1, before, old)
         memory.remember(1, 2, after, old)
         memory.remember(1, 3, before, VariantLayoutMemory.DUCKDB)
+        memory.remember(1, 5, after, VariantLayoutMemory.DUCKDB)
         val divided = memory.populations(1, after, files)
-        assertThat(divided.duckdb).isEqualTo(1)
-        assertThat(divided.all().map { p -> p.map { it.dataFileId } }).containsExactly(listOf(1L, 4L), listOf(2L))
+        assertThat(divided.duckdb).describedAs("only the DuckDB entry judged against THIS declaration").isEqualTo(1)
+        assertThat(divided.all().map { p -> p.map { it.dataFileId } }).containsExactly(listOf(1L, 3L, 4L), listOf(2L))
         assertThat(
             divided.unknown.map {
                 it.dataFileId
             },
-        ).describedAs("the stale entry is unknown again").containsExactly(1L, 4L)
+        ).describedAs("the stale entries are unknown again, the stale DuckDB one too").containsExactly(1L, 3L, 4L)
     }
 
     @Test
@@ -289,22 +293,29 @@ class VariantLayoutGroupsTest {
         // 6, 7, 8 unprobed; 9 judged against another declaration (stale: unknown again).
         memory.remember(1, 9, declared + 1, old)
 
+        var last: VariantLayoutMemory.Populations? = null
+
         fun divide(
             candidates: List<CompactionCandidate>,
             min: Int = 5,
         ): Pair<List<CompactionCandidate>, List<List<Long>>> {
             val divided = memory.populations(1, declared, candidates)
             val lent = VariantLayoutGroups.borrow(divided, grouping, min, 64) { it.fileSizeBytes }
+            last = divided
             return lent to divided.all().map { p -> p.map { it.dataFileId } }
         }
         // The main population (5 files, 4 of them unknown) forms a group of
         // its own at this minimum: nothing is borrowed from work it has.
         assertThat(divide(files).second).containsExactly(listOf(5L, 6L, 7L, 8L, 9L), listOf(1L, 2L, 3L, 4L))
+        assertThat(last!!.unknown.map { it.dataFileId }).containsExactly(6L, 7L, 8L, 9L)
         // At a minimum of 6 the main population is idle; the short one
         // borrows the two unknowns that complete it, in candidate order.
         val (lent, populations) = divide(files, min = 6)
         assertThat(lent.map { it.dataFileId }).containsExactly(6L, 7L)
         assertThat(populations).containsExactly(listOf(5L, 8L, 9L), listOf(1L, 2L, 3L, 4L, 6L, 7L))
+        // The loan leaves the unknowns too: nothing could lend 6 and 7 again.
+        assertThat(last!!.unknown.map { it.dataFileId }).containsExactly(8L, 9L)
+        assertThat(last!!.main.map { it.dataFileId }).containsExactly(5L, 8L, 9L)
 
         // Bounded: the LARGEST short population only; a population at the
         // minimum borrows nothing.
@@ -330,6 +341,55 @@ class VariantLayoutGroupsTest {
                 p.map { it.dataFileId }
             },
         ).containsExactly(listOf(5L), listOf(1L, 2L, 3L, 4L))
+    }
+
+    @Test
+    fun `a deviating layout's shape is remembered under its fingerprint, and the populations name it`() {
+        val memory = VariantLayoutMemory()
+        val declared = VariantLayout.fingerprint(DECLARED)
+        val deviations = VariantLayoutGroups.deviations(OLD, DECLARED)
+        val old = VariantLayout.fingerprint(deviations)
+        assertThat(memory.shapeOf(old)).isNull()
+        val shape =
+            deviations.mapValues { (_, layout) ->
+                val (nodes, nested) = VariantLayout.shape(layout)
+                VariantLayoutMemory.Shape(nodes, nested, VariantLayout.leaves(layout))
+            }
+        memory.rememberShape(old, shape)
+        assertThat(memory.shapeOf(old)).isEqualTo(mapOf(V.fieldId to VariantLayoutMemory.Shape(3, false, 2)))
+        // The population carries the fingerprint the planner looks the shape up by.
+        (1L..2L).forEach { memory.remember(1, it, declared, old) }
+        val divided = memory.populations(1, declared, (1..3).map { candidate(it.toLong()) })
+        assertThat(divided.others).singleElement().satisfies({
+            assertThat(it.deviations).isEqualTo(old)
+            assertThat(it.files.map { f -> f.dataFileId }).containsExactly(1L, 2L)
+        })
+        assertThat(memory.shapeOf(divided.others.single().deviations)).isEqualTo(shape)
+        // Bounded, least recently USED out: `old` is the oldest entry but is
+        // looked up every sweep, so it stays; the first of the fillers,
+        // never read again, is what goes.
+        // Filler keys well apart from the two fresh keys below (7 and 8), so
+        // every insert is an insertion and never a replacement.
+        val filler = 1_000_000L
+        repeat(VariantLayoutMemory.SHAPE_CAPACITY - 1) { memory.rememberShape(filler + it, shape) }
+        assertThat(memory.shapeOf(old)).isEqualTo(shape)
+        memory.rememberShape(7L, shape)
+        assertThat(memory.shapeOf(old)).describedAs("used, so kept").isEqualTo(shape)
+        assertThat(memory.shapeOf(filler)).describedAs("the least recently used filler went").isNull()
+        // ONE eviction, not a clearing: the second-eldest filler survives it.
+        assertThat(
+            memory.shapeOf(filler + 1),
+        ).describedAs("the next filler survives a single eviction").isEqualTo(shape)
+        assertThat(memory.shapeOf(7L)).isEqualTo(shape)
+        // Recency, not age. Reading filler+1 above made it recent; filler+2
+        // is now the eldest unread. Read filler+3, insert once more:
+        // filler+2 goes, filler+3 — older than the newest but read — stays.
+        assertThat(memory.shapeOf(filler + 3)).isEqualTo(shape)
+        memory.rememberShape(8L, shape)
+        assertThat(memory.shapeOf(filler + 2)).describedAs("older and unread: evicted").isNull()
+        assertThat(
+            memory.shapeOf(filler + 3),
+        ).describedAs("older than the newest but recently read: kept").isEqualTo(shape)
     }
 
     @Test
