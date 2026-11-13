@@ -510,7 +510,9 @@ export async function fetchMetricsText(): Promise<string> {
   // OPERATOR on the server (auth/AuthPolicy.kt), so it carries the token.
   const res = await authorized("/metrics", { headers: { Accept: "text/plain" } });
   if (!res.ok) {
-    throw new Error(`GET /metrics failed: HTTP ${res.status}`);
+    // A typed error, so the page can tell an operator refusal (401/403)
+    // from an outage and stop polling a route this caller may not read.
+    throw await parseError(res);
   }
   return res.text();
 }
