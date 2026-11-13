@@ -207,8 +207,6 @@ internal class HogliteCompaction(
 
     private fun planTable(
         catalog: String,
-        namespace: String,
-        table: String,
         tableId: Long,
         cfg: CompactionConfig,
         indexed: Boolean,
@@ -218,12 +216,13 @@ internal class HogliteCompaction(
         val state =
             store.queryCatalog(
                 catalog,
-                "SELECT m.next_snapshot - 1, t.schema_version, m.data_path FROM tables t CROSS JOIN meta m " +
+                "SELECT m.next_snapshot - 1, t.schema_version, m.data_path, v.namespace, v.name FROM tables t " +
+                    "JOIN table_versions v ON v.table_id = t.id AND v.end_snapshot IS NULL CROSS JOIN meta m " +
                     "WHERE t.id = ? AND t.dropped_snapshot IS NULL AND m.id = 1",
                 tableId,
             ).firstRow() ?: return null
         val m = PlanningState(state[0].asLong(), state[1].asLong(), state[2].asString())
-        val ctx = tableContext(catalog, m, namespace, table, tableId, cfg) ?: return null
+        val ctx = tableContext(catalog, m, state[3].asString(), state[4].asString(), tableId, cfg) ?: return null
         val verifiedOnly =
             if (ctx.objectPrefixFieldId != null) {
                 "AND f.stats_state = 'provided' AND f.prefix_quarantined = 0 "
@@ -491,8 +490,9 @@ internal class HogliteCompaction(
         tally: Tally,
     ): CompactionResult {
         store.meta(catalog)
-        runCatching { purgeExpiredClaims(catalog) }
-            .onFailure { log.warn(it) { "compaction claim purge failed; continuing" } }
+        bestEffortCompactionPurge({ purgeExpiredClaims(catalog) }) {
+            log.warn(it) { "compaction claim purge failed; continuing" }
+        }
         val indexed =
             store.queryCatalog(
                 catalog,
@@ -526,7 +526,7 @@ internal class HogliteCompaction(
             val (namespace, table, tableId) = Triple(t[0].asString(), t[1].asString(), t[2].asLong())
             val planned =
                 try {
-                    planTable(catalog, namespace, table, tableId, cfg, indexed)
+                    planTable(catalog, tableId, cfg, indexed)
                 } catch (e: Exception) {
                     if (e is InterruptedException || Thread.currentThread().isInterrupted) throw e
                     if (e is HoglakeException.NotFound || e is HoglakeException.BackendUnavailable ||
@@ -1178,5 +1178,20 @@ internal class HogliteCompactionCursors {
 
     companion object {
         val START = Position(-1, 0)
+    }
+}
+
+internal fun bestEffortCompactionPurge(
+    purge: () -> Unit,
+    onFailure: (Throwable) -> Unit,
+) {
+    try {
+        purge()
+    } catch (e: Throwable) {
+        if (e is InterruptedException || Thread.currentThread().isInterrupted) {
+            Thread.currentThread().interrupt()
+            throw e
+        }
+        onFailure(e)
     }
 }

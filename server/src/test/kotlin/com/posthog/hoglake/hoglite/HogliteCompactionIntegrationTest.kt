@@ -1,6 +1,9 @@
 package com.posthog.hoglake.hoglite
 
+import com.posthog.hoglake.api.installErrorMapping
+import com.posthog.hoglake.api.installMaintenanceRoutes
 import com.posthog.hoglake.compaction.CompactionConfig
+import com.posthog.hoglake.configureHoglakeWire
 import com.posthog.hoglake.hydrator.ObjectStore
 import com.posthog.hoglake.model.AlterOp
 import com.posthog.hoglake.model.ColType
@@ -19,6 +22,8 @@ import com.posthog.hoglake.testing.TestImages
 import io.ktor.client.request.header
 import io.ktor.client.request.post
 import io.ktor.client.statement.bodyAsText
+import io.ktor.serialization.jackson.jackson
+import io.ktor.server.application.install
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.BeforeAll
@@ -1219,6 +1224,86 @@ class HogliteCompactionIntegrationTest {
             ),
         )
         return path
+    }
+
+    @Test
+    fun `planning names and the schema fence come from one snapshot after a rename`() {
+        val cat = fixture()
+        appendPlain(cat, "a.parquet")
+        appendPlain(cat, "b.parquet")
+        HogliteInterposer(engine.url()).use { proxy ->
+            val hook =
+                proxy.hook({ _, _, body ->
+                    body.contains("SELECT m.next_snapshot - 1, t.schema_version, m.data_path") &&
+                        store.json.readTree(body)["args"][0].asLong() == 2L
+                }) { alters.alterTable(cat, "ingest", "plain", listOf(AlterOp.RenameTable("renamed"))) }
+            val result =
+                HogliteCompaction(
+                    proxy.store,
+                    objects,
+                    defaults(),
+                ).runOnce(cat, null, MaintenanceTrigger.MANUAL)
+            assertThat(hook.fired).isTrue()
+            assertThat(result.groupsCompacted).isEqualTo(1)
+            assertThat(result.skippedConflicts).isZero()
+            assertThat(store.listFiles(cat, "ingest", "renamed").single().path).startsWith(root(cat, "renamed"))
+        }
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = ["unknown", "missing"])
+    fun `partial real compaction failures retain HTTP status retry headers and audit outcome`(kind: String) {
+        val cat = fixture()
+        for (team in listOf(4L, 6L)) {
+            appendReal(cat, "$team-a.parquet", team)
+            appendReal(cat, "$team-b.parquet", team)
+        }
+        val terminal =
+            if (kind == "unknown") {
+                com.posthog.hoglake.model.HoglakeException.CommitOutcomeUnknown("partial-tx", "answer lost")
+            } else {
+                com.posthog.hoglake.model.HoglakeException.NotFound("catalog dropped")
+            }
+        val code = if (kind == "unknown") "commit_outcome_unknown" else "not_found"
+        var calls = 0
+        val backend = compaction { _, _ -> if (++calls == 2) throw terminal }
+        val capture =
+            ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent>()
+                .apply { start() }
+        val audit =
+            org.slf4j.LoggerFactory.getLogger(com.posthog.hoglake.observability.Audit.LOGGER_NAME)
+                as ch.qos.logback.classic.Logger
+        audit.addAppender(capture)
+        try {
+            io.ktor.server.testing.testApplication {
+                application {
+                    install(io.ktor.server.plugins.contentnegotiation.ContentNegotiation) {
+                        jackson { configureHoglakeWire() }
+                    }
+                    install(io.ktor.server.plugins.statuspages.StatusPages) { installErrorMapping() }
+                    installMaintenanceRoutes(
+                        optionsProvider = { error("unused") },
+                        expiryProvider = { error("unused") },
+                        cleanupProvider = { error("unused") },
+                        hydratorProvider = { error("unused") },
+                        statusProvider = { error("unused") },
+                        databaseHealthProvider = { error("unused") },
+                        compactionProvider = { backend },
+                    )
+                }
+                val response = client.post("/v1/catalogs/$cat/maintenance/compact")
+                assertThat(response.status.value).isEqualTo(if (kind == "unknown") 503 else 404)
+                assertThat(response.bodyAsText()).contains("\"error\":\"$code\"")
+                assertThat(response.headers[io.ktor.http.HttpHeaders.RetryAfter])
+                    .isEqualTo(if (kind == "unknown") "1" else null)
+            }
+            assertThat(calls).isEqualTo(2)
+            assertThat(capture.list.single { it.formattedMessage == "compaction $code" }).isNotNull()
+            assertThat(store.listFiles(cat, "ingest", "events")).hasSize(3)
+        } finally {
+            audit.detachAppender(capture)
+            capture.stop()
+        }
     }
 
     private val parquetSchema =
