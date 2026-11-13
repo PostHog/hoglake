@@ -171,6 +171,17 @@ class CatalogStoreSelectorTest {
                             .isSameAs(hoglite.partitionLookup)
                         assertThat(selector.options(call, "lake") { error("must not construct PostgreSQL options") })
                             .isSameAs(hoglite.options)
+                        assertThat(
+                            selector.retirement(call, "lake") { error("must not construct PostgreSQL retirement") },
+                        )
+                            .isSameAs(hoglite.retirement)
+                        assertThat(
+                            selector.hydratorMaintenance(
+                                call,
+                                "lake",
+                            ) { error("must not construct PostgreSQL hydrator") },
+                        )
+                            .isSameAs(hoglite.hydratorMaintenance)
                         stores.add(listing.store)
                         call.respondText(listing.catalogs!!.single())
                     }

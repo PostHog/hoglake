@@ -342,7 +342,7 @@ class CatalogStoreSelector(
         call: ApplicationCall,
         catalog: String,
         postgres: () -> RetirementBackend,
-    ): RetirementBackend = postgresMaintenance(call, catalog, postgres)
+    ): RetirementBackend = (forCatalog(call, catalog) as? HogliteCatalogStore)?.retirement ?: postgres()
 
     fun hydratorMaintenance(
         call: ApplicationCall,
@@ -354,7 +354,8 @@ class CatalogStoreSelector(
         call: ApplicationCall,
         catalog: String,
         postgres: () -> HydratorMaintenanceBackend,
-    ): HydratorMaintenanceBackend = postgresMaintenance(call, catalog, postgres)
+    ): HydratorMaintenanceBackend =
+        (forCatalog(call, catalog) as? HogliteCatalogStore)?.hydratorMaintenance ?: postgres()
 
     fun maintenanceStatus(
         call: ApplicationCall,

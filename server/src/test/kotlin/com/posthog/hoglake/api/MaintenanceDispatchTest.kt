@@ -30,6 +30,20 @@ class MaintenanceDispatchTest {
     lateinit var dir: Path
 
     @Test
+    fun `retirement trigger remains absent without auth or PostgreSQL`() {
+        App.build(
+            Config(defaultBackend = "none", authMode = "off", jdbcUrl = "jdbc:no-such-driver:must-not-open"),
+        ).use {
+                app ->
+            testApplication {
+                application { app.module(this) }
+                val response = client.request("/v1/catalogs/lake/maintenance/retire") { method = HttpMethod.Post }
+                assertThat(response.status).isEqualTo(HttpStatusCode.NotFound)
+            }
+        }
+    }
+
+    @Test
     fun `unsupported maintenance routes refuse hoglite before PostgreSQL or malformed input`() {
         val id = "5b0c6d0e-1f2a-4b3c-9d4e-5f6a7b8c9d0e"
         val backends = dir.resolve("backends.json")
@@ -65,7 +79,6 @@ class MaintenanceDispatchTest {
                 HttpMethod.Post to "/maintenance/expire?batch=bad",
                 HttpMethod.Post to "/maintenance/cleanup?batch=bad",
                 HttpMethod.Post to "/maintenance/compact?batch=bad",
-                HttpMethod.Post to "/maintenance/rehydrate?namespace=ns",
                 HttpMethod.Get to "/maintenance/status",
                 HttpMethod.Get to "/maintenance/runs?before=bad&task=bad&limit=bad",
             )

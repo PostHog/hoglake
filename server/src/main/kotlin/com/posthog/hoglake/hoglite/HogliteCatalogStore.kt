@@ -2928,6 +2928,8 @@ class HogliteCatalogStore(
     internal val alters: HogliteAlters by lazy { HogliteAlters(this) }
     internal val views: HogliteViews by lazy { HogliteViews(this) }
     internal val options: HogliteOptions by lazy { HogliteOptions(this) }
+    internal val retirement: HogliteRetirement by lazy { HogliteRetirement(this) }
+    internal val hydratorMaintenance: HogliteHydrator by lazy { HogliteHydrator(this) }
 
     /**
      * Load a receipt with logical expiry.
