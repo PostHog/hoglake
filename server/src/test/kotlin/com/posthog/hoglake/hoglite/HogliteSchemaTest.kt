@@ -78,4 +78,12 @@ class HogliteSchemaTest {
             "CREATE INDEX IF NOT EXISTS dvs_changes ON dvs(table_id, begin_snapshot, delete_file_id)",
         )
     }
+
+    @Test
+    fun `receipt retention has a non-partial covering index for cutoff and ordering`() {
+        val indexes = HogliteSchema.DDL.map(::normalized).filter { it.contains(" ON receipts(") }
+        assertThat(indexes).containsExactly(
+            "CREATE INDEX IF NOT EXISTS receipts_created_at ON receipts(created_at, idempotency_key)",
+        )
+    }
 }

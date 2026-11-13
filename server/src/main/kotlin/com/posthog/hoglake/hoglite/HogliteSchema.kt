@@ -311,6 +311,8 @@ internal object HogliteSchema {
                 schema_version INTEGER NOT NULL,
                 created_at TEXT NOT NULL
             )""",
+            // First-release DDL. Drop and recreate development tenants instead of adding migration code.
+            "CREATE INDEX IF NOT EXISTS receipts_created_at ON receipts(created_at, idempotency_key)",
             """CREATE TABLE IF NOT EXISTS offsets(
                 consumer_id TEXT NOT NULL,
                 table_uuid TEXT NOT NULL,

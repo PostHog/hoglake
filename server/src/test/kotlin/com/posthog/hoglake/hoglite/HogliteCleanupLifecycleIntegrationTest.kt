@@ -511,6 +511,32 @@ class HogliteCleanupLifecycleIntegrationTest {
         }
     }
 
+    /** The 200-row production purge must not scan or sort a 100,000-receipt ledger. */
+    @Test
+    fun `receipt retention uses a covering range without sorting at one hundred thousand rows`() =
+        fixture { store, cat, _ ->
+            write(
+                store,
+                cat,
+                "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<100000) " +
+                    "INSERT INTO receipts(idempotency_key,fingerprint,snapshot_id,schema_version,created_at) " +
+                    "SELECT printf('key-%06d',100001-i),'fp',i,0, " +
+                    "CASE WHEN i%100=0 THEN '2000-01-01T00:00:00.000Z' " +
+                    "ELSE '2030-01-01T00:00:00.000Z' END FROM n",
+            )
+            assertThat(rows(store, cat, "SELECT COUNT(*) FROM receipts").single()[0].asLong()).isEqualTo(100_000)
+            val purge =
+                "DELETE FROM receipts WHERE idempotency_key IN (" +
+                    "SELECT idempotency_key FROM receipts WHERE created_at < ? ORDER BY created_at LIMIT ?)"
+            // Both a populated range and an empty range must avoid walking the retained ledger.
+            for (cutoff in listOf("2020-01-01T00:00:00.000Z", "1990-01-01T00:00:00.000Z")) {
+                val plan = write(store, cat, "EXPLAIN QUERY PLAN $purge", cutoff, 200).single()
+                val detail = plan.rows.joinToString(" ") { it[3].asString() }
+                assertThat(detail).contains("SEARCH receipts USING COVERING INDEX receipts_created_at (created_at<?)")
+                    .doesNotContain("SCAN receipts", "USE TEMP B-TREE")
+            }
+        }
+
     @Test
     fun `hygiene walks multiple bounded pages and counts actual receipt deletions`() =
         fixture { store, cat, _ ->
