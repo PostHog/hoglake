@@ -100,8 +100,8 @@ means the PR has review approval and is waiting on CI or a merge.
 - [ ] **millpond** `HOGLAKE_AUTH_*` settings for client credentials or a fixed
       token, and the auth path in the startup probe —
       [PostHog/millpond#165](https://github.com/PostHog/millpond/issues/165)
-- [ ] **hoglake** millrace: client credentials or a fixed token through
-      pyhoglake
+- [x] **hoglake** millrace: client credentials or a fixed token through
+      pyhoglake (`HOGLAKE_AUTH_*`)
 - [ ] **hoglake** webui: a way to present a token —
       [#560](https://github.com/PostHog/hoglake/pull/560)
 - [x] **hoglake** pyhoglake, the DuckDB extension and hedgerow: issuer-neutral
