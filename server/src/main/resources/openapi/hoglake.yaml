@@ -36,7 +36,8 @@ info:
     Invalid shapes, unknown routing keys, and multiple catalogs return 401
     `invalid_token`. Hoglite listings include only the routed catalog.
 
-    Hoglite supports catalog options, manual expiry, and manual cleanup.
+    Hoglite supports catalog options, manual expiry, manual cleanup, and manual requeue.
+    Retirement runs before expiry; there is no public retirement trigger.
     Other maintenance operations and publications return 501 `not_supported_on_backend`.
     Engine result limits return 422 `backend_result_too_large`; query deadlines
     return 422 `backend_query_timeout`. Narrow the query before retrying.
@@ -1471,6 +1472,12 @@ paths:
         supplying BOTH namespace and table (supplying only one is a
         422). Transient object-store failures never need this: they
         leave files 'pending' and retry on their own.
+      description: >
+        PostgreSQL and hoglite support this manual requeue operation.
+        The operation changes metadata only. It does not read object data.
+        The hoglite backend does not start a hydration sweep.
+        One transaction updates all matching failed live files.
+        The operation excludes ended files and dropped tables.
       parameters:
         - { $ref: "#/components/parameters/catalog" }
         - name: namespace
@@ -1495,7 +1502,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
-        "501": { $ref: "#/components/responses/NotSupportedOnBackend" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /catalogs/{catalog}/maintenance/cleanup:
     post:

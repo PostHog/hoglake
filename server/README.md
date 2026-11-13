@@ -2374,6 +2374,14 @@ The catalog reports on itself instead of waiting for ops SQL:
 - **`POST /maintenance/rehydrate`** — the operator requeue for the
   hydrator's structural failures (above): flips `failed` → `pending`,
   catalog-wide or scoped to one namespace+table.
+  Hoglite uses the token's placement and excludes ended files and dropped tables.
+  The manual action changes metadata only; it does not start a hydration sweep.
+  One transaction updates all matching files, subject to the engine's write limits.
+  Full hydration still needs the existing server-side `ObjectStore` path and per-run AWS identity.
+  Hoglite retirement is available through the backend seam for trusted placement.
+  It has no HTTP trigger or background driver.
+  Each retirement batch queues current vector and data paths before it deletes their rows.
+  Candidate and victim reads use bounded keyset pages.
 - **`GET /stats/partitions`** (`service/PartitionStatsService.kt`) —
   leaf partitions ranked by compaction debt: `debt_score` is the
   small-file count under exactly the threshold the compactor plans
