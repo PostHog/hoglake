@@ -74,10 +74,13 @@ under `local` and 404s otherwise.
 | `HOGLAKE_AUTH_SCOPED_MAX_LIFETIME_SECONDS` | the longest a scoped token may live, `exp − iat`; default 900; must be positive |
 | `HOGLAKE_AUTH_CLIENT_CLASSES` | comma-separated User-Agent product tokens, each counted under its own `client` label on `hoglake_auth_requests_total` instead of `other`; at most 16, lowercase, never `none` or `other`. A deployment names its own clients here, so the server knows no issuer by name |
 
-One issuer and one key set per server: every token's `iss` must equal
-`HOGLAKE_AUTH_ISSUER`. Several signing services can share one JWKS only if they
-also share that one issuer identity; distinct issuers need separate servers
-until multi-issuer verification exists (tracked).
+One issuer and one key set per server, by decision: every token's `iss` must
+equal `HOGLAKE_AUTH_ISSUER`. Several signing services can share one server
+only by sharing that issuer identity and publishing their keys in one JWKS
+under distinct `kid`s; a deployment with genuinely distinct issuers runs one
+hoglake per issuer. Multi-issuer verification is not planned: one issuer per
+server is what keeps a token's authority traceable to one trust decision, and
+nothing in [the deployments above](#the-model-in-one-paragraph) needs more.
 
 ## The token contract
 
@@ -119,7 +122,7 @@ The core, which every issuer must emit:
 | claim | required | meaning |
 | --- | --- | --- |
 | `iss`, `aud`, `sub`, `exp` | yes | as above; `sub` becomes the audit actor |
-| `jti` | yes | token id, for correlating an audit line with a token |
+| `jti` | yes, by decision | token id, for correlating an audit line with a token. Required because the audit log and the access log name tokens by it; an identity provider that does not emit one is fronted by a small issuer that does (every provider named in this document emits it) |
 | `ten` | no; absent means `tenant` | the token kind: `tenant`, `scoped` or `operator`. A token without `ten` that carries `prd` is refused rather than read as a tenant token |
 | `org` | tenant and scoped, today | the tenant the token belongs to, for the audit log only; hoglake does not authorize on it. Required by the verifier today; making it optional is tracked |
 | `cat`, or `scope` | tenant and scoped, one or both | `cat` is `{"<catalog>": ["read", "write", …]}`: the catalogs the token may use and the scopes on each. On a tenant token an unknown scope word is dropped, not refused; a scoped token is stricter, below. `scope` is the standard form, next paragraph |
@@ -377,5 +380,8 @@ server's own jobs; the local issuer (`local`, `hoglake token keygen` and
 extension, hedgerow, the Trino connector and millrace.
 
 Tracked in [#574](https://github.com/PostHog/hoglake/issues/574): a fixed-token
-option in the Trino connector; the `jti` and
-multi-issuer decisions.
+option in the Trino connector; a token for the web UI
+([#560](https://github.com/PostHog/hoglake/pull/560)).
+
+Decided, not tracked: `jti` stays required, and the server verifies one issuer
+(both above).
