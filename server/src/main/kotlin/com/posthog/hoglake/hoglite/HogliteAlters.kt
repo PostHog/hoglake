@@ -20,6 +20,7 @@ import com.posthog.hoglake.service.AlterService
 import com.posthog.hoglake.service.ColumnTrees
 import com.posthog.hoglake.service.Identifiers
 import com.posthog.hoglake.service.TableMetadata
+import com.posthog.hoglake.service.VariantShredding
 import com.posthog.hoglake.stats.IcebergSingleValue
 import java.util.UUID
 
@@ -66,8 +67,15 @@ internal class HogliteAlters(
                 if (ops.isEmpty()) throw HoglakeException.Validation("ops must contain at least one operation")
                 var original: Triple<Long, Long, UUID>? = null
                 for (attempt in 0..1) {
-                    val ns = store.liveNamespace(catalog, namespace)
-                    val t = store.liveTable(catalog, namespace, table)
+                    // ONE read-only transaction for the head, the namespace
+                    // and the table's version row AT that head
+                    // (HogliteCatalogStore.headTableRow): the identity and
+                    // every versioned row read at meta.head below describe one
+                    // snapshot. Read apart, a rename and a declaration change
+                    // landing between a live-row read and the head read made
+                    // the no-op receipt report the old name with the new
+                    // head's columns.
+                    val (meta, ns, t) = store.headTableRow(catalog, namespace, table)
                     val target = Triple(ns.namespaceId, t.tableId, t.tableUuid)
                     val first = original
                     if (first == null) {
@@ -80,14 +88,13 @@ internal class HogliteAlters(
                             currentTableUuid = t.tableUuid,
                         )
                     }
-                    // Head AFTER the table's fence (t.schemaVersion): the shape
-                    // below is read at meta.head, and a head read before the fence
-                    // could miss DDL the fence already includes, so the schema
-                    // guard would pass a plan made against older definitions (e.g.
-                    // set_object_prefix_field approved against a spec a concurrent
-                    // alter just replaced). Read after, DDL the fence admits is
-                    // visible at head, and any later DDL trips the fence.
-                    val meta = store.meta(catalog)
+                    // The head and the table's fence (t.schemaVersion) come from
+                    // the same snapshot: the shape below is read at meta.head,
+                    // which includes every DDL the fence counts and nothing
+                    // later, so the schema guard cannot pass a plan made against
+                    // older definitions (e.g. set_object_prefix_field approved
+                    // against a spec a concurrent alter just replaced), and any
+                    // later DDL trips the fence.
                     if (expectedTableUuid != null && t.tableUuid != expectedTableUuid) {
                         throw HoglakeException.TableRecreated(
                             "table '$namespace.$table' no longer has the expected UUID: it was " +
@@ -153,6 +160,43 @@ internal class HogliteAlters(
                     // pre-tx row, so without this the second AddColumn's guard would
                     // always trip on the first's bump).
                     val plannedNextFieldId = longArrayOf(-1L)
+
+                    // Nothing but re-declarations of what each column already
+                    // declares: no tx at all, as AlterService mints no
+                    // snapshot (see its setVariantShredding). Validated op by
+                    // op first, so a bad one is the same 422 either way.
+                    if (ops.all { it is AlterOp.SetVariantShredding && unchangedVariantShredding(state, it) }) {
+                        val agg =
+                            store.queryCatalog(
+                                catalog,
+                                "SELECT COALESCE(SUM(record_count),0), COUNT(*), COALESCE(SUM(file_size_bytes),0) " +
+                                    "FROM files WHERE table_id = ? AND begin_snapshot <= ? " +
+                                    "AND (end_snapshot IS NULL OR end_snapshot > ?)",
+                                t.tableId,
+                                meta.head,
+                                meta.head,
+                            ).firstRow()!!
+                        return@catalogOperation TableInfo(
+                            tableId = t.tableId,
+                            tableUuid = t.tableUuid,
+                            namespace = namespace,
+                            name = state.name,
+                            comment = state.comment,
+                            properties = state.properties,
+                            columns = state.cols.sortedBy { it.ordinal },
+                            readSnapshotId = meta.head,
+                            recordCount = agg[0].asLong(),
+                            fileCount = agg[1].asLong(),
+                            fileSizeBytes = agg[2].asLong(),
+                            partitionSpec = state.spec,
+                            sortSpec = state.sortSpec,
+                            snapshotId = meta.head,
+                            objectPrefixField =
+                                state.objectPrefixFieldId?.let { id ->
+                                    state.cols.single { it.fieldId == id }.def.name
+                                },
+                        )
+                    }
 
                     val tx = HogliteTx()
                     tx.expectOne(
@@ -357,6 +401,20 @@ internal class HogliteAlters(
             is AlterOp.SetPartitionSpec -> setPartitionSpec(tx, t, state, op)
             is AlterOp.SetSortOrder -> setSortOrder(tx, t, state, op)
             is AlterOp.SetObjectPrefixField -> setObjectPrefixField(catalog, tx, t, state, op)
+            is AlterOp.SetVariantShredding -> {
+                // AlterService.setVariantShredding on hoglite's column
+                // rows: the same resolution, the same refusals
+                // (VariantShredding.alteredTypeParams), the same ended
+                // row and replacement under the field id, and the same
+                // nothing-written when the declaration is already there.
+                val (located, params) = resolveVariantShredding(state, op)
+                val col = located.column
+                if (VariantShredding.same(col.def.typeParams, op.shredding)) return
+                val updated = col.copy(def = col.def.copy(typeParams = params))
+                endOrDeleteColumnRow(tx, t.tableId, col.fieldId)
+                insertColumnVersion(tx, t.tableId, updated, located.parent?.fieldId)
+                state.cols = replaceNode(state.cols, col.fieldId) { updated }
+            }
             is AlterOp.SetColumnComment -> {
                 TableMetadata.validateComment(op.comment)
                 val located = requireColumn(state, op.name)
@@ -1070,6 +1128,31 @@ internal class HogliteAlters(
                     )
         }
         return Located(current!!, parent)
+    }
+
+    /** AlterService.resolveVariantShredding: the addressed column and its new `type_params`, or the refusal. */
+    private fun resolveVariantShredding(
+        state: TableState,
+        op: AlterOp.SetVariantShredding,
+    ): Pair<Located, Map<String, Any?>?> {
+        val located = requireColumn(state, op.name)
+        val params =
+            VariantShredding.alteredTypeParams(
+                located.column.def,
+                op.name,
+                nested = located.parent != null,
+                op.shredding,
+            )
+        return located to params
+    }
+
+    /** Whether [op], validated, re-declares what its column declares in [state]. */
+    private fun unchangedVariantShredding(
+        state: TableState,
+        op: AlterOp.SetVariantShredding,
+    ): Boolean {
+        val (located, _) = resolveVariantShredding(state, op)
+        return VariantShredding.same(located.column.def.typeParams, op.shredding)
     }
 
     private fun requireStructParent(

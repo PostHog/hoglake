@@ -609,6 +609,12 @@ object Metrics {
      * object-prefix layout refused in metadata because their prefix
      * cannot be named (CompactionResult.objectPrefixUnresolvable): a
      * broken invariant that re-refuses every sweep, so it needs a line.
+     *
+     * `layout_probe_only` counts variant-table groups whose layout probe
+     * read every footer and found nothing worth a rewrite
+     * (CompactionResult.layoutProbeOnly): charged IO with no output, and
+     * self-healing (the compactor remembers the layouts), so a steady
+     * rate means the memory is being lost — restarts, or its capacity.
      */
     fun compactionSkipped(
         catalog: String,
@@ -629,27 +635,81 @@ object Metrics {
 
     /**
      * hoglake_compaction_variant_layout_mismatch_total{catalog, reason} —
-     * groups refused because a VARIANT column's storage in an input is
-     * not the layout compaction copies it as (`reason="layout"`), or the
-     * input was written by DuckDB (`reason="duckdb"`, whatever its
-     * layout); see VariantLayoutMismatchException.
+     * what the variant-layout probe of a planned group found that the
+     * planner's metadata could not show (`compaction/VariantLayoutGroups.kt`):
+     *
+     *  - `split`: one per group whose inputs held MORE THAN ONE variant
+     *    layout, so it was rewritten per layout rather than as planned.
+     *    Expected for a while after `set_variant_shredding`; a steady rate
+     *    long after means a writer not honouring the declaration.
+     *  - `duckdb`: one per DuckDB-written input excluded from its group's
+     *    rewrites (Trino reads its top-level Variant nulls as SQL NULL by
+     *    `created_by`, which an output does not keep). The rest of the
+     *    group compacts; the file itself never does while the flag is on.
+     *  - `layout`: one per group REFUSED (`unconvertible_schema`) because
+     *    a variant column's input field is no VARIANT group at all — a
+     *    leaf, a REPEATED group, a group without the annotation — or, as
+     *    a backstop, because a rewrite met an input in another layout
+     *    after all (VariantLayoutMismatchException). The warning logged
+     *    with it names the table, column and input file.
      *
      * Its own series rather than a reason of
-     * `hoglake_compaction_skipped_total`, because those groups are already
-     * in that one's `unconvertible_schema`, and a second reason for them
-     * would count each twice in its sum. The compaction warning logged
-     * with each one names the table, column and input file. A `layout`
-     * refusal of a file pyhoglake's Table.append or prepare_append_tables
-     * or the Trino connector wrote means the server's layout port has
-     * drifted from theirs: turn HOGLAKE_COMPACTION_VARIANT off. One of a
-     * file registered from another writer (prepare_append_files) is just
-     * another layout.
+     * `hoglake_compaction_skipped_total`, because a `layout` group is
+     * already in that one's `unconvertible_schema`, and `split` and
+     * `duckdb` refuse no group. The outputs each split produced are
+     * [compactionVariantLayoutOutputs]; the files it left behind,
+     * [compactionVariantLayoutFilesLeft].
      */
     fun compactionVariantLayoutMismatch(
         catalog: String,
         reason: String,
+        count: Long = 1,
     ) {
-        increment("hoglake_compaction_variant_layout_mismatch_total", 1.0, "catalog", catalog, "reason", reason)
+        if (count > 0) {
+            increment(
+                "hoglake_compaction_variant_layout_mismatch_total",
+                count.toDouble(),
+                "catalog",
+                catalog,
+                "reason",
+                reason,
+            )
+        }
+    }
+
+    /**
+     * hoglake_compaction_variant_layout_outputs_total{catalog, layout} —
+     * compaction outputs of a VARIANT table (retirements included), by
+     * whether they were written in the DECLARED layout of every variant
+     * column (`layout="declared"`) or in a layout the inputs shared that
+     * the declaration does not name (`layout="other"`). The convergence
+     * signal after `set_variant_shredding`: `other` is the old layout's
+     * files being consolidated among themselves, and it falls to zero as
+     * they age out; `declared` is the steady state.
+     */
+    fun compactionVariantLayoutOutputs(
+        catalog: String,
+        layout: String,
+    ) {
+        increment("hoglake_compaction_variant_layout_outputs_total", 1.0, "catalog", catalog, "layout", layout)
+    }
+
+    /**
+     * hoglake_compaction_variant_layout_files_left_total{catalog} — inputs
+     * of a probed group left uncompacted because too few of its files
+     * shared their variant layout to be worth a rewrite
+     * (CompactionGrouping's minimum). Each file counts once: the compactor
+     * remembers its layout and does not plan it again until enough files
+     * of that layout are known, so this is files set aside, not sweeps
+     * spent. They are debt the maintenance summary still reports.
+     */
+    fun compactionVariantLayoutFilesLeft(
+        catalog: String,
+        count: Long,
+    ) {
+        if (count > 0) {
+            increment("hoglake_compaction_variant_layout_files_left_total", count.toDouble(), "catalog", catalog)
+        }
     }
 
     /**

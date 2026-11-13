@@ -1226,60 +1226,6 @@ class CatalogService(private val jdbi: Jdbi) {
             )
         }
 
-    /** A usable per-table sample: the three totals plus what dates them. */
-    private data class SampledTotals(
-        val recordCount: Long,
-        val fileCount: Long,
-        val fileSizeBytes: Long,
-        val snapshotId: Long,
-        val asOf: Instant,
-    )
-
-    /**
-     * The published generation's totals for one table, or null when that
-     * generation is not an answer for it — the three cases enumerated in
-     * [getTable]'s KDoc, in the order they are checked here.
-     *
-     * NO COMPACTION-POLICY CHECK, unlike `PartitionListingService` and
-     * `PartitionStatsService`, which both discard a sample computed
-     * under a different `targetBytes` / min / max. Those read
-     * `small_count`, `small_bytes` and `selected`, which ARE the policy's
-     * output. `file_count`, `record_count` and `total_bytes` are counts
-     * of files, rows and bytes: the policy cannot change them, so
-     * discarding a sample over it would throw away a correct answer.
-     * That is also why this service needs no policy knobs in its
-     * constructor.
-     */
-    private fun sampledTotals(
-        h: Handle,
-        catalogId: Long,
-        tableId: Long,
-    ): SampledTotals? {
-        // 1. the sampler has no row for the catalog at all (warm-up),
-        //    or it has one with no published sample, or with a sample
-        //    this build cannot parse — the sampler's own lenient read,
-        //    because a newer replica's shape must degrade the numbers
-        //    rather than 500 a request path.
-        val tier = TierTotalsRepo.totalsFor(h, catalogId, tableId) ?: return null
-        val sample = tier.sample ?: return null
-        // 2. the scan never saw this table.
-        if (tier.createdSnapshot > sample.snapshotId) return null
-        // 3. rows may be undercounted for the whole generation.
-        if (!tier.measured) return null
-        return SampledTotals(
-            recordCount = tier.recordCount,
-            fileCount = tier.fileCount,
-            fileSizeBytes = tier.fileSizeBytes,
-            snapshotId = sample.snapshotId,
-            // startedAt, NOT the summary row's sampled_at: a generation
-            // runs for tens of minutes, so the publish instant is up to
-            // that far after the numbers were true. `startedAt` is when
-            // `snapshotId` was captured, so the pair makes ONE claim —
-            // the distinction PartitionListing's own comment records.
-            asOf = sample.startedAt,
-        )
-    }
-
     /**
      * Live tables at head, each with its comment, its file rollup and
      * its retained-history counts.
@@ -1927,4 +1873,61 @@ class CatalogService(private val jdbi: Jdbi) {
         }
         return at
     }
+}
+
+/** A usable per-table sample: the three totals plus what dates them. */
+internal data class SampledTotals(
+    val recordCount: Long,
+    val fileCount: Long,
+    val fileSizeBytes: Long,
+    val snapshotId: Long,
+    val asOf: Instant,
+)
+
+/**
+ * The published generation's totals for one table, or null when that
+ * generation is not an answer for it — the three cases enumerated in
+ * [CatalogService.getTable]'s KDoc, in the order they are checked here.
+ * One indexed row read, never a file scan: what a head GET answers with,
+ * and what an alter that changed nothing answers with (AlterService),
+ * since neither has a snapshot of its own to be exact for.
+ *
+ * NO COMPACTION-POLICY CHECK, unlike `PartitionListingService` and
+ * `PartitionStatsService`, which both discard a sample computed
+ * under a different `targetBytes` / min / max. Those read
+ * `small_count`, `small_bytes` and `selected`, which ARE the policy's
+ * output. `file_count`, `record_count` and `total_bytes` are counts
+ * of files, rows and bytes: the policy cannot change them, so
+ * discarding a sample over it would throw away a correct answer.
+ * That is also why CatalogService needs no policy knobs in its
+ * constructor.
+ */
+internal fun sampledTotals(
+    h: Handle,
+    catalogId: Long,
+    tableId: Long,
+): SampledTotals? {
+    // 1. the sampler has no row for the catalog at all (warm-up),
+    //    or it has one with no published sample, or with a sample
+    //    this build cannot parse — the sampler's own lenient read,
+    //    because a newer replica's shape must degrade the numbers
+    //    rather than 500 a request path.
+    val tier = TierTotalsRepo.totalsFor(h, catalogId, tableId) ?: return null
+    val sample = tier.sample ?: return null
+    // 2. the scan never saw this table.
+    if (tier.createdSnapshot > sample.snapshotId) return null
+    // 3. rows may be undercounted for the whole generation.
+    if (!tier.measured) return null
+    return SampledTotals(
+        recordCount = tier.recordCount,
+        fileCount = tier.fileCount,
+        fileSizeBytes = tier.fileSizeBytes,
+        snapshotId = sample.snapshotId,
+        // startedAt, NOT the summary row's sampled_at: a generation
+        // runs for tens of minutes, so the publish instant is up to
+        // that far after the numbers were true. `startedAt` is when
+        // `snapshotId` was captured, so the pair makes ONE claim —
+        // the distinction PartitionListing's own comment records.
+        asOf = sample.startedAt,
+    )
 }

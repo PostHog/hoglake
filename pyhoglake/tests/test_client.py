@@ -1873,6 +1873,89 @@ def test_comment_and_properties_ops_wire_shape(client, httpx_mock):
     }
 
 
+def test_set_variant_shredding_wire_shape(client, httpx_mock):
+    """The op carries the name and the declaration as plain JSON, a copy
+    of the caller's; ``None`` goes as an explicit null, which clears."""
+    t = _table(client, httpx_mock)
+    url = f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events/alter"
+    httpx_mock.add_response(
+        method="POST", url=url, json=dict(TABLE_WIRE, snapshot_id=12)
+    )
+    decl = {
+        "type": "object",
+        "fields": (
+            {"name": "$browser", "type": "string"},
+            {"name": "price", "type": "decimal8", "precision": 18, "scale": 2},
+        ),
+    }
+    op = ops.set_variant_shredding("properties", decl)
+    decl["fields"] = ()  # the op holds a copy
+    t.alter([op, ops.set_variant_shredding("raw", None)])
+    body = json.loads(httpx_mock.get_requests()[-1].content)
+    assert body == {
+        "ops": [
+            {
+                "op": "set_variant_shredding",
+                "name": "properties",
+                "shredding": {
+                    "type": "object",
+                    "fields": [
+                        {"name": "$browser", "type": "string"},
+                        {
+                            "name": "price",
+                            "type": "decimal8",
+                            "precision": 18,
+                            "scale": 2,
+                        },
+                    ],
+                },
+            },
+            {"op": "set_variant_shredding", "name": "raw", "shredding": None},
+        ]
+    }
+
+
+def test_set_variant_shredding_checks_the_declaration_locally():
+    """The server's grammar and limits, in its words, before any request;
+    whether the column is a top-level variant is left to the server."""
+    with pytest.raises(ValidationError) as unknown:
+        ops.set_variant_shredding("properties", {"type": "text"})
+    assert str(unknown.value) == (
+        "variant column 'properties' has an invalid type_params.shredding: "
+        "$ has an unknown type 'text'"
+    )
+    assert unknown.value.status_code is None
+    with pytest.raises(ValidationError, match=r"\$\.price has precision 18"):
+        ops.set_variant_shredding(
+            "properties",
+            {
+                "type": "object",
+                "fields": [
+                    {"name": "price", "type": "decimal4", "precision": 18, "scale": 2}
+                ],
+            },
+        )
+    with pytest.raises(ValidationError, match="more than 1000 fields and arrays"):
+        ops.set_variant_shredding(
+            "properties",
+            {
+                "type": "object",
+                "fields": [{"name": f"f{i}", "type": "string"} for i in range(1001)],
+            },
+        )
+    # A dotted path and a non-variant name pass: the server resolves them.
+    assert ops.set_variant_shredding("r.x", {"type": "string"}).to_wire() == {
+        "op": "set_variant_shredding",
+        "name": "r.x",
+        "shredding": {"type": "string"},
+    }
+    assert ops.set_variant_shredding("id", None).to_wire() == {
+        "op": "set_variant_shredding",
+        "name": "id",
+        "shredding": None,
+    }
+
+
 def test_table_comment_and_properties_parse_from_wire(client, httpx_mock):
     commented = dict(
         TABLE_WIRE,

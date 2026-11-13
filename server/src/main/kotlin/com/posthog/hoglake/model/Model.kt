@@ -648,6 +648,21 @@ sealed class AlterOp {
      * no unset: see AlterService.setObjectPrefixField.
      */
     data class SetObjectPrefixField(val name: String) : AlterOp()
+
+    /**
+     * Replace the shredded layout the top-level variant column [name]
+     * declares in `type_params.shredding` ([shredding] is the JSON
+     * declaration as the wire mapper decodes it; null clears it, and the
+     * column then carries no `type_params`). The declaration is the
+     * target writers and compaction lay the column out in; no file is
+     * checked against it or rewritten for it. Validated as a column
+     * definition's declaration is (VariantShredding), refused on a
+     * column of another type or a nested variant. Re-declaring what the
+     * column already declares (compared as JSON values) writes nothing,
+     * and a request of only such ops mints no snapshot: see
+     * AlterService.setVariantShredding.
+     */
+    data class SetVariantShredding(val name: String, val shredding: Any?) : AlterOp()
 }
 
 data class CatalogInfo(
@@ -1831,6 +1846,20 @@ data class CompactionResult(
      */
     @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
     val objectPrefixUnresolvable: Long = 0,
+    /**
+     * Groups of a VARIANT table (HOGLAKE_COMPACTION_VARIANT) whose
+     * layout probe read every input's footer and found nothing worth a
+     * rewrite: each variant layout among the inputs held too few files
+     * for one, or every input was DuckDB-written. The files are left as
+     * they are and the compactor remembers their layouts, so the same
+     * group is not planned again until files of its layouts arrive; but
+     * the footers were read, so this IS charged to
+     * HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN. Also
+     * `hoglake_compaction_skipped_total{reason="layout_probe_only"}`.
+     * `NON_DEFAULT`, for [claimedElsewhere]'s stored-payload reason.
+     */
+    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    val layoutProbeOnly: Long = 0,
 )
 
 /**

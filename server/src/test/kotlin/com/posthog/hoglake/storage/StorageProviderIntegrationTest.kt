@@ -299,6 +299,73 @@ class StorageProviderIntegrationTest {
     }
 
     @Test
+    fun `compaction probes a mixed-layout variant group through the catalog's write session`() {
+        // A VARIANT table whose group holds two layouts: before the rewrite,
+        // the service reads every input's footer (the layout probe,
+        // VariantLayoutGroups). Those reads must go through the catalog's
+        // scoped view like the rewrite's — the base store has no session
+        // for the objects under `broker`, so a probe through it fails the
+        // group — and through the SAME write view, so one cached session
+        // serves probe and rewrite alike rather than a read session being
+        // minted beside it.
+        val cat = "broker-variant-${counter.incrementAndGet()}"
+        catalogs.createCatalog(cat, "s3://$BUCKET/$cat")
+        catalogs.createNamespace(cat, "ns")
+        catalogs.createTable(cat, "ns", "t", com.posthog.hoglake.compaction.VariantFixtures.live.map { it.def })
+        // Registered WITH inline stats (the id column's; the fixtures hold
+        // the odd ids 1..23), so no hydration runs and this catalog has
+        // asked the broker for nothing before the sweep: every session the
+        // sweep needs is a vend of its own. A probe asking for READ would
+        // then show as a read vend beside the rewrite's write — whereas
+        // after a hydration it would reuse the provider's cached READ
+        // session for the catalog and vend nothing, proving nothing.
+        val inputs =
+            listOf("b", "b", "other_b", "other_b").mapIndexed { i, name ->
+                val bytes = com.posthog.hoglake.compaction.VariantFixtures.bytes(name)
+                val path = "s3://$BUCKET/$cat/data/ns/t/$i-$name.parquet"
+                seed.put(path, bytes)
+                FileRegistration(
+                    path,
+                    12,
+                    bytes.size.toLong(),
+                    columnStats =
+                        listOf(
+                            ColumnStats(
+                                1,
+                                12,
+                                0,
+                                null,
+                                null,
+                                IcebergSingleValue.encodeLong(1),
+                                IcebergSingleValue.encodeLong(23),
+                            ),
+                        ),
+                )
+            }
+        commits.commit(cat, CommitRequest(appends = listOf(TableAppend("ns", "t", inputs))))
+        assertThat(catalogs.listFiles(cat, "ns", "t").map { it.statsState.wire }).containsOnly("provided")
+        assertThat(vendsFor(cat)).describedAs("nothing asked for yet").isEmpty()
+        val cfg =
+            CompactionConfig(targetBytes = 1L shl 20, minInputFiles = 2, maxGroupsPerRun = 10, variantCompaction = true)
+
+        val before = broker.vends.size
+        val result = CompactionService(jdbi, objects, cfg).runOnce(cat, cfg)
+
+        assertThat(result.groupsCompacted).describedAs("%s", result).isEqualTo(2)
+        assertThat(result.filesIn).isEqualTo(4)
+        assertThat(result.failedGroups + result.unconvertibleSchema + result.layoutProbeOnly).isZero()
+        val outputs = catalogs.listFiles(cat, "ns", "t")
+        assertThat(outputs).hasSize(2).allSatisfy { assertThat(it.explicitRowIds).isTrue() }
+        assertThat(outputs.map { it.path }).doesNotContainAnyElementsOf(inputs.map { it.path })
+        outputs.forEach { assertThat(seed.get(it.path)).describedAs("the output is really there").isNotEmpty() }
+        val sweep = broker.vends.drop(before).filter { it.catalog == cat }
+        assertThat(sweep.map { it.access })
+            .describedAs("the sweep's own vends: one write session for the probe and both rewrites, no read")
+            .containsExactly("write")
+        assertThat(sweep.map { it.prefix }).containsOnly("s3://$BUCKET/$cat")
+    }
+
+    @Test
     fun `cleanup deletes with a write session for the catalog`() {
         val cat = "cleanup-${counter.incrementAndGet()}"
         val catalogId =

@@ -389,8 +389,21 @@ column below them.
 
 Trino SQL declares a layout with the connector's `shredding` column property, in
 `CREATE TABLE` and `ALTER TABLE ... ADD COLUMN`; other clients declare one through
-the REST API. A declaration is fixed when its column is defined; no alter op
-changes it, so a different layout is a new column.
+the REST API. After the column exists, the alter op `set_variant_shredding`
+(`name`, `shredding`; capability `mutable-variant-shredding-v1`) replaces the
+declaration, or clears it with `shredding: null`, under the same rules; the
+connector has no SQL for it yet, so it is issued through the REST API or
+pyhoglake's `ops.set_variant_shredding`. The declaration is a writer's and
+compaction's target, not a rule the catalog holds files to: existing files keep
+the layout their footers record and keep reading, the connector (which reads the
+column's declaration on each write) lays out files it writes after the change in
+the new layout, and compaction copies each file's leaves in that file's own
+layout, grouping inputs by layout with the declared one preferred, so files in an
+older layout compact among themselves. A changed declaration is a DDL snapshot,
+so a writer whose `read_snapshot` predates it is refused
+`ddl_since_read_snapshot` and re-reads the column; re-applying the declaration
+the column already has (compared as JSON values) is a no-op that mints no
+snapshot and refuses nobody.
 
 pyhoglake declares a layout too, with `variant.variant_field` in a `create_table`
 schema or `ops.add_column(..., "variant", shredding=...)`, and checks it locally
@@ -408,10 +421,12 @@ decimal parameters. Hedgerow compares `type_params` exactly, so it refuses a
 destination variant that has a declaration as a schema mismatch; it writes
 through DuckDB, which honours no declaration. Compaction skips every table with a
 VARIANT column (#70) unless the server sets `HOGLAKE_COMPACTION_VARIANT`. With it,
-compaction copies each VARIANT's storage as it is, in the layout the declaration
-gives it (the connector's, and pyhoglake's), and skips a group holding a file in
-any other layout, or one DuckDB wrote: the connector reads a DuckDB file's top-level
-Variant null as SQL NULL by its `created_by`, which a compacted file does not keep.
+compaction copies each VARIANT's storage as it is, rewriting a group's files per
+layout: files in the declared layout (the connector's, and pyhoglake's) together,
+files sharing any other layout together, each output in its inputs' layout. A file
+DuckDB wrote is left uncompacted on its own: the connector reads a DuckDB file's
+top-level Variant null as SQL NULL by its `created_by`, which a compacted file does
+not keep.
 A read-back of compacted variant files (parquet-mr's `created_by`, `TIME_MICROS`
 beside time leaves) through the connector is not yet in the harness either.
 

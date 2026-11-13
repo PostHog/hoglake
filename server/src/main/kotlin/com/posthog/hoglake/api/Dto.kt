@@ -107,6 +107,7 @@ data class CatalogDto(
             "claimed-uploads-v1",
             "atomic-dml-transactions-v1",
             "object-prefix-layout-v1",
+            "mutable-variant-shredding-v1",
         ),
     /**
      * Live totals from the metrics sampler's last pass — display
