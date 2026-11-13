@@ -1471,6 +1471,12 @@ paths:
         supplying BOTH namespace and table (supplying only one is a
         422). Transient object-store failures never need this: they
         leave files 'pending' and retry on their own.
+      description: >
+        PostgreSQL and hoglite support this manual requeue operation.
+        The operation changes metadata only. It does not read object data.
+        The hoglite backend does not start a hydration sweep.
+        One transaction updates all matching failed live files.
+        The operation excludes ended files and dropped tables.
       parameters:
         - { $ref: "#/components/parameters/catalog" }
         - name: namespace
@@ -1495,7 +1501,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
-        "501": { $ref: "#/components/responses/NotSupportedOnBackend" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /catalogs/{catalog}/maintenance/cleanup:
     post:
