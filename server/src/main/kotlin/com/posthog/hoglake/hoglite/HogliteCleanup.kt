@@ -206,24 +206,12 @@ internal class HogliteCleanup(
     ): List<Entry> {
         val now = HogliteSchema.now()
         val leaseCutoff = HogliteSchema.fmt(Instant.now().minusSeconds(claimLeaseSeconds))
-        val reasonClause =
-            if (staging) {
-                "reason = 'compaction_staging' AND scheduled_at < '${
-                    HogliteSchema.fmt(Instant.now().minusSeconds(stagingGraceSeconds))
-                }'"
-            } else {
-                "(reason IS NULL OR reason <> 'compaction_staging')"
-            }
+        val parameters = mutableListOf<Any?>()
+        if (staging) parameters += HogliteSchema.fmt(Instant.now().minusSeconds(stagingGraceSeconds))
+        parameters.addAll(listOf(leaseCutoff, afterId, want))
         // Bound the candidate read. The UPDATE rechecks the lease after the read/write gap.
         val candidates =
-            store.queryCatalog(
-                catalog,
-                "SELECT id, path, reason FROM removals WHERE drained_at IS NULL AND $reasonClause " +
-                    "AND (claimed_at IS NULL OR claimed_at < ?) AND id > ? ORDER BY id LIMIT ?",
-                leaseCutoff,
-                afterId,
-                want,
-            ).rows
+            store.queryCatalog(catalog, candidateSql(staging), *parameters.toTypedArray()).rows
         if (candidates.isEmpty()) return emptyList()
         val ids = candidates.map { it[0].asLong() }
         val tx = HogliteTx()
@@ -616,6 +604,17 @@ internal class HogliteCleanup(
         }
 
     companion object {
+        internal fun candidateSql(staging: Boolean): String {
+            val reasonClause =
+                if (staging) {
+                    "reason = 'compaction_staging' AND scheduled_at < ?"
+                } else {
+                    "(reason IS NULL OR reason <> 'compaction_staging')"
+                }
+            return "SELECT id, path, reason FROM removals WHERE drained_at IS NULL AND $reasonClause " +
+                "AND (claimed_at IS NULL OR claimed_at < ?) AND id > ? ORDER BY id LIMIT ?"
+        }
+
         internal const val PURGE_MAINTENANCE_SQL =
             "DELETE FROM maintenance_runs WHERE id IN (" +
                 "SELECT id FROM maintenance_runs WHERE started_at < ? ORDER BY started_at, id LIMIT ?)"

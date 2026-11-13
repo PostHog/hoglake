@@ -381,6 +381,11 @@ internal object HogliteSchema {
                 drained_outcome TEXT
             )""",
             "CREATE INDEX IF NOT EXISTS removals_unclaimed ON removals(claimed_at)",
+            // Each ordered claim walk ignores the opposite arm's backlog.
+            "CREATE INDEX IF NOT EXISTS removals_staging_queue ON removals(id) " +
+                "WHERE drained_at IS NULL AND reason = 'compaction_staging'",
+            "CREATE INDEX IF NOT EXISTS removals_bulk_queue ON removals(id) " +
+                "WHERE drained_at IS NULL AND (reason IS NULL OR reason <> 'compaction_staging')",
             "CREATE INDEX IF NOT EXISTS removals_drained_at ON removals(drained_at, id) WHERE drained_at IS NOT NULL",
             """CREATE TABLE IF NOT EXISTS views(
                 id INTEGER PRIMARY KEY,

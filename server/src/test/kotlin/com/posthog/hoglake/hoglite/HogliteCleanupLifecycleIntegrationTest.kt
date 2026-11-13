@@ -132,9 +132,10 @@ class HogliteCleanupLifecycleIntegrationTest {
         store: HogliteCatalogStore,
         cat: String,
         sql: String,
+        vararg args: Any?,
     ): List<List<Any?>> =
         store.catalogOperation(cat) {
-            store.queryCatalog(cat, sql).rows
+            store.queryCatalog(cat, sql, *args).rows
         }
 
     private fun seed(
@@ -581,6 +582,44 @@ class HogliteCleanupLifecycleIntegrationTest {
                     .doesNotContain("SCAN $table", "USE TEMP B-TREE")
             }
         }
+
+    @ParameterizedTest
+    @CsvSource("true,false", "true,true", "false,false", "false,true")
+    fun `queue arm selection skips one hundred thousand opposite arm rows`(
+        staging: Boolean,
+        withCandidates: Boolean,
+    ) = fixture { store, cat, _ ->
+        val oppositeReason = if (staging) "NULL" else "'compaction_staging'"
+        write(
+            store,
+            cat,
+            "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<100000) " +
+                "INSERT INTO removals(path,file_kind,queued_snapshot,queued_at,scheduled_at,reason) " +
+                "SELECT 's3://b/key-'||i,'data',0,'2000-01-01T00:00:00.000Z'," +
+                "'2000-01-01T00:00:00.000Z',$oppositeReason FROM n",
+        )
+        assertThat(rows(store, cat, "SELECT COUNT(*) FROM removals").single()[0].asLong()).isEqualTo(100_000)
+        val expected = mutableListOf<Long>()
+        if (withCandidates) {
+            queue(store, cat, "s3://b/wanted", if (staging) "compaction_staging" else null)
+            expected += 100_001L
+            if (!staging) {
+                queue(store, cat, "s3://b/expiry", "expiry")
+                expected += 100_002L
+            }
+        }
+        val sql = HogliteCleanup.candidateSql(staging)
+        val parameters = mutableListOf<Any?>()
+        if (staging) parameters += HogliteSchema.now()
+        parameters.addAll(listOf(HogliteSchema.now(), 0L, 25))
+        val plan = rows(store, cat, "EXPLAIN QUERY PLAN $sql", *parameters.toTypedArray())
+        val detail = plan.joinToString(" ") { it[3].asString() }
+        val index = if (staging) "removals_staging_queue" else "removals_bulk_queue"
+        assertThat(detail).contains("SEARCH removals USING INDEX $index (id>?)")
+            .doesNotContain("SCAN removals", "INTEGER PRIMARY KEY", "USE TEMP B-TREE")
+        val selected = rows(store, cat, sql, *parameters.toTypedArray()).map { it[0].asLong() }
+        assertThat(selected).containsExactlyElementsOf(expected)
+    }
 
     @Test
     fun `hygiene walks multiple bounded pages and counts actual receipt deletions`() =

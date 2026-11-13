@@ -94,4 +94,14 @@ class HogliteSchemaTest {
             "CREATE INDEX IF NOT EXISTS maintenance_runs_started_at ON maintenance_runs(started_at, id)",
         )
     }
+
+    @Test
+    fun `queue arm indexes walk only their own undrained id range`() {
+        assertThat(HogliteSchema.DDL.map(::normalized)).contains(
+            "CREATE INDEX IF NOT EXISTS removals_staging_queue ON removals(id) " +
+                "WHERE drained_at IS NULL AND reason = 'compaction_staging'",
+            "CREATE INDEX IF NOT EXISTS removals_bulk_queue ON removals(id) " +
+                "WHERE drained_at IS NULL AND (reason IS NULL OR reason <> 'compaction_staging')",
+        )
+    }
 }
