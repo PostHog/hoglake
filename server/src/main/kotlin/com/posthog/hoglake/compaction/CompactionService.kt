@@ -3199,7 +3199,14 @@ class CompactionService(
             // unknowns to complete it (VariantLayoutGroups.borrow), under
             // the packing below and the same shape admission: a loan to a
             // group the budgets would refuse is never made, so the arrival
-            // is free for a population they admit.
+            // is free for a population they admit. Idle means in no main
+            // group the declared estimate admits — the admission `fits`
+            // applies below, applied here first and uncounted, so that a
+            // main group the budgets refuse (no work this sweep or any
+            // other) does not keep its unknowns from a population that
+            // could use them. The object-prefix refusal (below) needs no
+            // such check: it depends only on the bucket, so a bucket it
+            // refuses refuses every group, loans included.
             VariantLayoutGroups.borrow(
                 divided,
                 grouping,
@@ -3209,6 +3216,11 @@ class CompactionService(
                     val shapes = variantLayouts.shapeOf(deviations)
                     shapes == null ||
                         refusalOfKnown(CompactionGroup(rowIdOrder(take), bucket.specId, bucket.values), shapes) == null
+                },
+                admitMain = { take ->
+                    val leaves = spill?.let { declaredLeaves }
+                    val group = CompactionGroup(rowIdOrder(take), bucket.specId, bucket.values)
+                    spill == null || leaves == null || budgetRefusal(ctx, spill, leaves, group) == null
                 },
             ) { it.fileSizeBytes }
             for (take in grouping.groups(divided.main, cfg.minInputFiles, fanIn) { it.fileSizeBytes }) {
@@ -4896,6 +4908,19 @@ class CompactionService(
                 CompactionGrouping.of(cfg.targetBytes),
                 cfg.minInputFiles,
             )
+        val leftBehind = split.leftBehind.mapTo(HashSet()) { it.file.dataFileId }
+        // The files left behind that the memory did not already hold as set
+        // aside, under this declaration: what `files_left` counts. A
+        // remembered file is probed again as the company of a loan
+        // (VariantLayoutGroups.borrow) that proves to be another layout, or
+        // as the declared file beside arrivals that prove so, and either
+        // leaves it exactly as it was; counting it again would count the
+        // same four files on every arrival that disappointed them. A file
+        // learned anew — after a restart, an eviction, a declaration change
+        // — is counted anew, and a compaction output, remembered at its
+        // registration and never yet set aside, is counted the first time a
+        // probe leaves it.
+        var newlyLeft = 0L
         for (p in probed) {
             // How the file deviates from THIS declaration, under its
             // fingerprint: a column the file predates deviates in nothing,
@@ -4914,21 +4939,24 @@ class CompactionService(
                     },
                 )
             }
-            variantLayouts.remember(
-                ctx.catalogId,
-                p.file.dataFileId,
-                declaredFingerprint,
-                if (p.duckdb) VariantLayoutMemory.DUCKDB else deviationFingerprint,
-            )
+            val known =
+                VariantLayoutMemory.Known(
+                    declaredFingerprint,
+                    if (p.duckdb) VariantLayoutMemory.DUCKDB else deviationFingerprint,
+                    setAside = p.file.dataFileId in leftBehind,
+                )
+            if (known.setAside && variantLayouts.recall(ctx.catalogId, p.file.dataFileId) != known) newlyLeft++
+            variantLayouts.remember(ctx.catalogId, p.file.dataFileId, known.declared, known.deviations, known.setAside)
         }
         // The counters. `split` once per group the probe found mixed, so
         // its rate is how often the planner's metadata picture was wrong;
         // `duckdb` per file excluded, as the refusal it still is; the files
-        // left behind per file, each once — the memory keeps them out of
-        // the next plan, so the count is files set aside, not sweeps.
+        // left behind per file, each once per time the memory learns it —
+        // the memory keeps them out of the next plan, so the count is files
+        // set aside, not sweeps, and not a loan's disappointments.
         if (split.layoutCount > 1) Metrics.compactionVariantLayoutMismatch(ctx.catalog, "split")
         Metrics.compactionVariantLayoutMismatch(ctx.catalog, "duckdb", split.duckdb.size.toLong())
-        Metrics.compactionVariantLayoutFilesLeft(ctx.catalog, split.leftBehind.size.toLong())
+        Metrics.compactionVariantLayoutFilesLeft(ctx.catalog, newlyLeft)
         if (split.mixed || split.leftBehind.isNotEmpty()) {
             log.info {
                 "compaction group of ${group.files.size} files for ${ctx.catalog}/${ctx.namespace}.${ctx.table} " +
