@@ -1174,56 +1174,58 @@ class CatalogService(private val jdbi: Jdbi) {
             // must answer differently, one from the sample and one from
             // the manifest.
             val timeTravel = snapshot != null || atTimestamp != null
-            val ns = NamespaceRepo.requireForRead(h, cat, namespace, at, pinned = timeTravel)
-            val t =
-                TableRepo.findAt(h, cat.catalogId, ns.namespaceId, table, at)
-                    ?: throw HoglakeException.NotFound(
-                        "table '$namespace.$table' in catalog '$catalog' at snapshot $at",
-                    )
-            val sampled =
-                if (totals && !timeTravel) {
-                    sampledTotals(h, cat.catalogId, t.tableId)
-                } else {
-                    null
-                }
-            val exact =
-                if (totals && timeTravel) {
-                    FileRepo.aggregateAt(h, cat.catalogId, t.tableId, at)
-                } else {
-                    null
-                }
-            val columns = TableRepo.columnsAt(h, cat.catalogId, t.tableId, at)
-            TableInfo(
-                tableId = t.tableId,
-                tableUuid = t.tableUuid,
-                comment = t.comment,
-                properties = t.properties,
-                namespace = ns.name,
-                name = t.name,
-                columns = columns,
-                // The snapshot every field above was resolved at, which
-                // a writer sends back as a commit's read_snapshot.
-                readSnapshotId = at,
-                recordCount = exact?.recordCount ?: sampled?.recordCount,
-                fileCount = exact?.fileCount ?: sampled?.fileCount,
-                fileSizeBytes = exact?.fileSizeBytes ?: sampled?.fileSizeBytes,
-                // Only a SAMPLE is dated. An exact aggregate carries no
-                // freshness, and stamping it would tell a client the
-                // number might be stale when it cannot be.
-                totalsSnapshotId = sampled?.snapshotId,
-                totalsAsOf = sampled?.asOf,
-                // The specs visible at the requested snapshot (null =
-                // unpartitioned/unsorted there); listTables skips both.
-                partitionSpec = SpecRepo.specAt(h, cat.catalogId, t.tableId, at),
-                sortSpec = SortRepo.sortSpecAt(h, cat.catalogId, t.tableId, at),
-                // The option as it was at `at`, named by the column at `at`:
-                // the field is top-level, and while the option is on it can
-                // be neither dropped nor renamed, so the lookup cannot miss.
-                objectPrefixField =
-                    LayoutRepo.layoutAt(h, cat.catalogId, t.tableId, at)?.let { id ->
-                        columns.single { it.fieldId == id }.def.name
-                    },
-            )
+            retainedPinnedRead(h, cat, at, timeTravel) {
+                val ns = NamespaceRepo.requireForRead(h, cat, namespace, at, pinned = timeTravel)
+                val t =
+                    TableRepo.findAt(h, cat.catalogId, ns.namespaceId, table, at)
+                        ?: throw HoglakeException.NotFound(
+                            "table '$namespace.$table' in catalog '$catalog' at snapshot $at",
+                        )
+                val sampled =
+                    if (totals && !timeTravel) {
+                        sampledTotals(h, cat.catalogId, t.tableId)
+                    } else {
+                        null
+                    }
+                val exact =
+                    if (totals && timeTravel) {
+                        FileRepo.aggregateAt(h, cat.catalogId, t.tableId, at)
+                    } else {
+                        null
+                    }
+                val columns = TableRepo.columnsAt(h, cat.catalogId, t.tableId, at)
+                TableInfo(
+                    tableId = t.tableId,
+                    tableUuid = t.tableUuid,
+                    comment = t.comment,
+                    properties = t.properties,
+                    namespace = ns.name,
+                    name = t.name,
+                    columns = columns,
+                    // The snapshot every field above was resolved at, which
+                    // a writer sends back as a commit's read_snapshot.
+                    readSnapshotId = at,
+                    recordCount = exact?.recordCount ?: sampled?.recordCount,
+                    fileCount = exact?.fileCount ?: sampled?.fileCount,
+                    fileSizeBytes = exact?.fileSizeBytes ?: sampled?.fileSizeBytes,
+                    // Only a SAMPLE is dated. An exact aggregate carries no
+                    // freshness, and stamping it would tell a client the
+                    // number might be stale when it cannot be.
+                    totalsSnapshotId = sampled?.snapshotId,
+                    totalsAsOf = sampled?.asOf,
+                    // The specs visible at the requested snapshot (null =
+                    // unpartitioned/unsorted there); listTables skips both.
+                    partitionSpec = SpecRepo.specAt(h, cat.catalogId, t.tableId, at),
+                    sortSpec = SortRepo.sortSpecAt(h, cat.catalogId, t.tableId, at),
+                    // The option as it was at `at`, named by the column at `at`:
+                    // the field is top-level, and while the option is on it can
+                    // be neither dropped nor renamed, so the lookup cannot miss.
+                    objectPrefixField =
+                        LayoutRepo.layoutAt(h, cat.catalogId, t.tableId, at)?.let { id ->
+                            columns.single { it.fieldId == id }.def.name
+                        },
+                )
+            }
         }
 
     /**
@@ -1261,8 +1263,10 @@ class CatalogService(private val jdbi: Jdbi) {
                 TableRepo.listLiveSummaries(h, cat.catalogId, ns.namespaceId)
             } else {
                 val at = resolveReadSnapshot(h, cat, snapshot, atTimestamp)
-                val ns = NamespaceRepo.requireForRead(h, cat, namespace, at, pinned = true)
-                TableRepo.listLiveSummaries(h, cat.catalogId, ns.namespaceId, at)
+                retainedPinnedRead(h, cat, at, pinned = true) {
+                    val ns = NamespaceRepo.requireForRead(h, cat, namespace, at, pinned = true)
+                    TableRepo.listLiveSummaries(h, cat.catalogId, ns.namespaceId, at)
+                }
             }
         }
 
@@ -1833,6 +1837,20 @@ class CatalogService(private val jdbi: Jdbi) {
         }
         return s
     }
+
+    /** Only pinned reads need a final floor check after their dependent metadata statements. */
+    private inline fun <T> retainedPinnedRead(
+        h: Handle,
+        cat: CatalogInfo,
+        at: Long,
+        pinned: Boolean,
+        body: () -> T,
+    ): T =
+        try {
+            body()
+        } finally {
+            if (pinned) resolveReadSnapshot(h, cat, at, null)
+        }
 
     /**
      * Point-in-time read target for getTable/listFiles: at most one of
