@@ -1123,11 +1123,17 @@ class HogliteCompactionIntegrationTest {
 
     @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(booleans = [true, false])
-    fun `planner uses one bounded fallback read when the size index is absent`(indexed: Boolean) {
+    fun `planner uses one bounded fallback read when the bucket index is absent`(indexed: Boolean) {
         val cat = fixture()
         appendReal(cat, "a.parquet", 4)
         appendReal(cat, "b.parquet", 4)
-        if (!indexed) rawWrite(cat, "DROP INDEX files_compaction")
+        if (!indexed) {
+            rawWrite(
+                cat,
+                "DROP INDEX files_compaction_bucket",
+                "CREATE INDEX files_compaction ON files(table_id, file_size_bytes, id) WHERE end_snapshot IS NULL",
+            )
+        }
         val config = defaults().copy(maxGroupsPerRun = 1000)
         HogliteInterposer(engine.url()).use { proxy ->
             val result = HogliteCompaction(proxy.store, objects, config).runOnce(cat, null, MaintenanceTrigger.MANUAL)
@@ -1143,9 +1149,9 @@ class HogliteCompactionIntegrationTest {
                 explain(cat, statement["sql"].asText(), *args.toTypedArray())
                     .rows.joinToString { it.last().asString() }
             if (indexed) {
-                assertThat(plan).contains("files_compaction").doesNotContain("TEMP B-TREE")
+                assertThat(plan).contains("files_compaction_bucket").doesNotContain("TEMP B-TREE")
             } else {
-                assertThat(plan).doesNotContain("files_compaction").contains("TEMP B-TREE")
+                assertThat(plan).doesNotContain("files_compaction_bucket").contains("TEMP B-TREE")
             }
         }
     }
@@ -1304,6 +1310,69 @@ class HogliteCompactionIntegrationTest {
             audit.detachAppender(capture)
             capture.stop()
         }
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = [true, false])
+    fun `repeated bounded calls drain interleaved compactable partitions`(indexed: Boolean) {
+        val cat = fixture()
+        for ((name, team) in listOf("a1" to 4L, "b1" to 6L, "a2" to 4L, "b2" to 6L)) {
+            appendReal(cat, "$name.parquet", team)
+        }
+        assertThat(
+            q(
+                cat,
+                "SELECT partition_values_json FROM files WHERE table_id = 1 " +
+                    "ORDER BY file_size_bytes, id",
+            ).rows.map { it[0].asString() },
+        )
+            .containsExactly("[\"4\"]", "[\"6\"]", "[\"4\"]", "[\"6\"]")
+        if (!indexed) rawWrite(cat, "DROP INDEX files_compaction_bucket")
+        val config = defaults().copy(maxGroupsPerRun = 1, maxCandidates = 2, candidateHeadroom = 1)
+        val cursors = HogliteCompactionCursors()
+        var compacted = 0L
+        for (call in 1..12) {
+            val result =
+                HogliteCompaction(store, objects, config, cursors = cursors)
+                    .runOnce(cat, null, MaintenanceTrigger.MANUAL)
+            assertThat(result.candidatesFetched).isLessThanOrEqualTo(2)
+            compacted += result.groupsCompacted
+            if (compacted == 2L) break
+        }
+        assertThat(compacted).isEqualTo(2)
+        assertThat(store.listFiles(cat, "ingest", "events")).hasSize(2)
+            .allSatisfy { assertThat(it.recordCount).isEqualTo(4) }
+    }
+
+    @Test
+    fun `a trailing incomplete bucket meets its later files across a bounded window`() {
+        val cat = fixture()
+        for ((name, team) in listOf("a1" to 4L, "b1" to 6L, "a2" to 4L, "b2" to 6L, "b3" to 6L)) {
+            appendReal(cat, "$name.parquet", team)
+        }
+        val config =
+            defaults().copy(
+                minInputFiles = 3,
+                maxInputFiles = 3,
+                maxFanIn = 3,
+                maxGroupsPerRun = 1,
+                maxCandidates = 3,
+                candidateHeadroom = 1,
+            )
+        val cursors = HogliteCompactionCursors()
+        var compacted = 0L
+        for (call in 1..12) {
+            val result =
+                HogliteCompaction(store, objects, config, cursors = cursors)
+                    .runOnce(cat, null, MaintenanceTrigger.MANUAL)
+            assertThat(result.candidatesFetched).isLessThanOrEqualTo(3)
+            compacted += result.groupsCompacted
+            if (compacted == 1L) break
+        }
+        assertThat(compacted).isEqualTo(1)
+        val live = store.listFiles(cat, "ingest", "events")
+        assertThat(live).hasSize(3)
+        assertThat(live.map { it.recordCount }).containsExactlyInAnyOrder(2, 2, 6)
     }
 
     private val parquetSchema =

@@ -232,12 +232,12 @@ internal class HogliteCompaction(
         val rows = mutableListOf<List<Any?>>()
         val cursorKey = store.boundTenant(catalog) to tableId
         val start = cursors.get(cursorKey)
-        var afterSize = start.bytes
-        var afterId = start.fileId
+        var after = start
         val budget = cfg.candidateBudget
+        val candidateIndex = if (indexed) " INDEXED BY files_compaction_bucket" else ""
         var exhausted = false
         while (rows.size < budget) {
-            // Old tenants have no size-order index. One capped read avoids
+            // Old tenants have no bucket-order index. One capped read avoids
             // re-walking and re-sorting their full history for every page.
             val limit = if (indexed) minOf(PAGE_SIZE, budget - rows.size) else budget - rows.size
             interrupted()
@@ -247,16 +247,22 @@ internal class HogliteCompaction(
                     "SELECT f.id, f.path, f.record_count, f.file_size_bytes, f.footer_size, " +
                         "f.row_id_start, f.explicit_row_ids, f.begin_snapshot, f.spec_id, " +
                         "f.partition_values_json, d.delete_file_id, d.path, d.delete_count " +
-                        "FROM files f LEFT JOIN dvs d ON d.data_file_id = f.id AND d.end_snapshot IS NULL " +
+                        "FROM files f$candidateIndex LEFT JOIN dvs d ON d.data_file_id = f.id " +
+                        "AND d.end_snapshot IS NULL " +
                         "WHERE f.table_id = ? AND f.end_snapshot IS NULL AND f.file_size_bytes < ? " +
                         "AND f.begin_snapshot <= ? " +
                         verifiedOnly +
-                        "AND (f.file_size_bytes, f.id) > (?, ?) ORDER BY f.file_size_bytes, f.id LIMIT ?",
+                        "AND (COALESCE(f.spec_id, -1), COALESCE(f.partition_values_json, ''), " +
+                        "f.file_size_bytes, f.id) > (?, ?, ?, ?) " +
+                        "ORDER BY COALESCE(f.spec_id, -1), COALESCE(f.partition_values_json, ''), " +
+                        "f.file_size_bytes, f.id LIMIT ?",
                     tableId,
                     cfg.targetBytes,
                     m.head,
-                    afterSize,
-                    afterId,
+                    after.specId,
+                    after.valuesJson,
+                    after.bytes,
+                    after.fileId,
                     limit,
                 ).rows
             rows.addAll(page)
@@ -264,19 +270,8 @@ internal class HogliteCompaction(
                 exhausted = true
                 break
             }
-            afterSize = page.last()[3].asLong()
-            afterId = page.last()[0].asLong()
+            after = candidatePosition(page.last())
         }
-        // Move even when this window only holds refusals or incomplete buckets.
-        // A bounded cursor cache survives manual requests, but does not discover catalogs.
-        cursors.put(
-            cursorKey,
-            if (exhausted) {
-                HogliteCompactionCursors.START
-            } else {
-                HogliteCompactionCursors.Position(afterSize, afterId)
-            },
-        )
         val truncated = if (exhausted) 0L else 1L
         val candidates =
             rows.map { r ->
@@ -330,6 +325,21 @@ internal class HogliteCompaction(
                 groups += CompactionGroup(take.sortedBy { it.rowIdStart }, bucket.first, bucket.second)
             }
         }
+        // Buckets are contiguous in the read order. Retain only the unfinished
+        // tail, bounded by minInputFiles - 1, so its files can meet the next page.
+        // Packed-but-refused groups advance normally; they must not pin a window.
+        var next = if (exhausted) HogliteCompactionCursors.START else candidatePosition(rows.last())
+        if (!exhausted) {
+            val packedIds = groups.flatMap { it.files }.mapTo(hashSetOf()) { it.dataFileId }
+            val tail =
+                byBucket.getValue(candidates.last().second)
+                    .asReversed().takeWhile { it.dataFileId !in packedIds }.take(cfg.minInputFiles - 1)
+            if (tail.isNotEmpty()) {
+                val first = rows.indexOfFirst { it[0].asLong() == tail.last().dataFileId }
+                next = if (first == 0) start else candidatePosition(rows[first - 1])
+            }
+        }
+        cursors.put(cursorKey, next)
         val (resolvable, unresolvable) =
             if (ctx.objectPrefixFieldId == null) {
                 groups to emptyList()
@@ -385,6 +395,14 @@ internal class HogliteCompaction(
             truncated,
         )
     }
+
+    private fun candidatePosition(row: List<Any?>) =
+        HogliteCompactionCursors.Position(
+            row[8].asLongOrNull() ?: -1,
+            row[9] as? String ?: "",
+            row[3].asLong(),
+            row[0].asLong(),
+        )
 
     private fun trustedSorted(
         ctx: TableContext,
@@ -496,9 +514,9 @@ internal class HogliteCompaction(
         val indexed =
             store.queryCatalog(
                 catalog,
-                "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'files_compaction' LIMIT 1",
+                "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'files_compaction_bucket' LIMIT 1",
             ).rows.isNotEmpty()
-        if (!indexed) log.warn { "compaction has no size-order index; using one bounded read per table" }
+        if (!indexed) log.warn { "compaction has no bucket-order index; using one bounded read per table" }
         val claimant = UUID.randomUUID()
         var attempts = 0
         val maxGroups = cfg.maxGroupsPerRun
@@ -1158,7 +1176,7 @@ internal class HogliteCompaction(
 
 /** Bounded, best-effort planning progress. Losing a cursor only repeats metadata work. */
 internal class HogliteCompactionCursors {
-    data class Position(val bytes: Long, val fileId: Long)
+    data class Position(val specId: Long, val valuesJson: String, val bytes: Long, val fileId: Long)
 
     private val positions =
         object : LinkedHashMap<Pair<String, Long>, Position>(16, 0.75f, true) {
@@ -1177,7 +1195,7 @@ internal class HogliteCompactionCursors {
     }
 
     companion object {
-        val START = Position(-1, 0)
+        val START = Position(-1, "", -1, 0)
     }
 }
 

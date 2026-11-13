@@ -1015,10 +1015,12 @@ duty cycle where it was.
 Hoglite supports `POST /v1/catalogs/{catalog}/maintenance/compact` for the
 catalog in the token's placement. The call plans groups, reserves their inputs,
 rewrites Parquet through the shared data plane, and publishes with transaction-local guards.
-Each table plan reads at most `CompactionConfig.candidateBudget` candidates, in size order.
+Each table plan reads at most `CompactionConfig.candidateBudget` candidates, in bucket and size order.
+A trailing incomplete group overlaps the next window by at most `minInputFiles - 1` files.
+Thus bounded windows do not strand a static backlog split across partitions.
 A bounded process-local cursor cache rotates capped windows across manual calls.
 A process restart can repeat a window. Claims and publication remain correct without this cache.
-Hoglite installs the live size-order index when it creates a tenant schema.
+Hoglite installs the live bucket/size-order index when it creates a tenant schema.
 Without that index, a plan uses one capped read instead of repeated sorted pages.
 Staged-output cleanup depends on the cleanup port in #606. Until that port lands,
 undrained staging tickets can fill retirement's queue ceiling.
