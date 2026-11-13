@@ -1757,7 +1757,10 @@ object ParquetRewriter {
      * counted in. The planner calls this so its metadata refusals cost
      * runs exactly as the rewrite will.
      */
-    internal fun outputLeafCount(liveColumns: List<Column>): Int = outputSchema(liveColumns).columns.size
+    internal fun outputLeafCount(
+        liveColumns: List<Column>,
+        variantLayouts: Map<Long, GroupType> = emptyMap(),
+    ): Int = outputSchema(liveColumns, variantLayouts).columns.size
 
     /**
      * The output schema is the LIVE schema: every live column in
@@ -2235,11 +2238,17 @@ object ParquetRewriter {
                         "writes for it: $detail",
                     reason,
                 )
-            // No VARIANT group at all is not another layout: there is no
-            // output it could be copied into. Both policies refuse it.
+            // No VARIANT group at all, or one whose subtree the positional
+            // copy cannot carry whole (a REPEATED node outside the list and
+            // map layers identityStep walks), is not another layout: there
+            // is no output it could be copied into without losing values.
+            // Both policies refuse it, BEFORE the subtree can become a
+            // part's output layout.
             val canonical =
-                VariantLayout.canonical(src, column)
-                    ?: mismatch("the input field is `${VariantLayout.describe(src)}`, not one VARIANT group")
+                when (val layout = VariantLayout.layoutOf(src, column)) {
+                    is VariantLayout.Layout.Of -> layout.group
+                    is VariantLayout.Layout.Refused -> mismatch(layout.reason)
+                }
             when (variants) {
                 is VariantPolicy.Collect -> variants.into[column.fieldId] = canonical
                 is VariantPolicy.Expect -> {

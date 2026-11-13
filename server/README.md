@@ -2092,24 +2092,45 @@ After a split group commits, its claim is narrowed to the inputs that
 died, so the files left behind are free to be planned again at once.
 
 Counted in `hoglake_compaction_variant_layout_mismatch_total{catalog,
-reason}`: `split`, one per group the probe found in more than one layout
-(expected for a while after a declaration change; a steady rate long
-after means a writer not honouring the declaration); `duckdb`, one per
-DuckDB-written file excluded; `layout`, one per group refused as no
-VARIANT group. Convergence is
+reason}`: `split`, one per group the probe found in more than one layout;
+`duckdb`, one per DuckDB-written file excluded (a DuckDB file holding no
+live variant column — scalars written before the column was added —
+is not excluded: it compacts, null-filled); `layout`, one per group
+refused because a variant field is no VARIANT group, or one whose
+subtree the copy could not carry whole (a REPEATED node outside a LIST or
+MAP layer). Convergence is
 `hoglake_compaction_variant_layout_outputs_total{catalog,
 layout="declared"|"other"}` — outputs per layout, `other` falling to
 zero as the old layout's files consolidate and age out — and
 `hoglake_compaction_variant_layout_files_left_total{catalog}`, files set
 aside for want of company in their layout (each once, since the memory
-keeps them out of the next plan). A `layout` refusal, or a `split` on a
-table only pyhoglake's `Table.append` or `prepare_append_tables` or the
-connector write, means the layout port has drifted from theirs
-(`pyhoglake/tests/vectors/variant_layout_vectors.json` pins the two),
-and the flag should go off. A variant's chunk in the sorted rewrite is
-sized by its layout's Parquet nodes, not as one catalog node; a
-partition in another layout is sized by the declared one's, an estimate
-the merge admission corrects from the footers it opens.
+keeps them out of the next plan).
+
+**A `split` after `set_variant_shredding` is EXPECTED**, for as long as
+files written under the previous declaration remain in a partition beside
+files written under the new one: that is the case this mechanism exists
+for, and the table converges without any operator action. Do not turn
+`HOGLAKE_COMPACTION_VARIANT` off on seeing it — that stops the very
+compaction that drains the old layout and lets small files pile up.
+Before reading a `split` as drift, check the table's declaration history
+(the `table_altered` changes carrying `set_variant_shredding`, or
+`layout="other"` outputs appearing only after one): a `split` with NO
+declaration change behind it, on a table only pyhoglake's `Table.append`
+or `prepare_append_tables` or the connector write, and likewise a
+`layout` refusal of such a file, means the layout port has drifted from
+theirs (`pyhoglake/tests/vectors/variant_layout_vectors.json` pins the
+two) — then the flag should go off until the port is fixed.
+
+A variant's chunk in the sorted rewrite is sized by its layout's Parquet
+nodes, not as one catalog node, and a part in another layout is sized by
+THAT layout's nodes (`CompactionConfig.spillChunkRows` with the part's
+layouts), not the declaration's: a declaration since cleared or narrowed
+leaves files far wider than the catalog says, and a chunk sized for the
+narrow rows would hold too many wide ones for the heap. Each part is
+re-admitted against its own bounds before its rewrite; a part the wider
+rows push over a budget the declared estimate fit is refused uncharged,
+counted with the planner's `spill_budget_exceeded` /
+`merge_budget_exceeded`.
 
 Each table's candidate list is fixed before rewriting starts, so an
 output cannot feed another group in the **same run**. Input bytes only

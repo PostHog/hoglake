@@ -2,7 +2,7 @@ package com.posthog.hoglake.compaction
 
 import org.apache.parquet.hadoop.metadata.ParquetMetadata
 import org.apache.parquet.schema.GroupType
-import java.util.concurrent.ConcurrentHashMap
+import java.util.Collections
 
 /**
  * How a planned group of a VARIANT table is rewritten when its inputs do
@@ -71,14 +71,36 @@ import java.util.concurrent.ConcurrentHashMap
  * layout the declaration no longer names is copied as it is.
  */
 internal object VariantLayoutGroups {
-    /** One input as the probe read it. */
+    /**
+     * One input as the probe read it.
+     *
+     * What a probe holds, and for how long: every input's [layouts]
+     * (interned, so one tree per distinct layout the group holds, not
+     * per input), every input's [footer] within [FOOTER_RETENTION_BYTES]
+     * of serialized footer, and the rest of each footer's parse only
+     * while the walk runs. None of it is charged to
+     * `CompactionConfig.sortedHeapBytesPerGroup`, which bounds the sorted
+     * rewrite's chunk and merge: this is headroom beside it, bounded by
+     * the retention budget and the fan-in cap
+     * (`CompactionConfig.effectiveMaxInputFiles`).
+     */
     class Probed(
         val file: CompactionCandidate,
         /** The footer the probe read, kept for the rewrite's open when it fits [FOOTER_RETENTION_BYTES]. */
         val footer: ParquetMetadata?,
-        /** Every variant column's layout in this file, by field id ([ParquetRewriter.variantLayoutsOf]). */
+        /**
+         * Every variant column's layout in this file, by field id
+         * ([ParquetRewriter.variantLayoutsOf]); empty for a file holding no
+         * live variant column, and for a DuckDB file whose variant field
+         * the walk refused (excluded either way when [duckdb]).
+         */
         val layouts: Map<Long, GroupType>,
-        /** The file's `created_by` names DuckDB. */
+        /**
+         * Excluded as DuckDB's: the file's `created_by` names DuckDB AND it
+         * holds a live variant column's data. A DuckDB file with no variant
+         * data (scalars written before the column existed) is an input
+         * like any other, null-filled.
+         */
         val duckdb: Boolean,
     )
 
@@ -208,7 +230,7 @@ internal object VariantLayoutGroups {
      * `hashCode`, so a `GroupType` carrying one hashes by identity and two
      * equal layouts read off two footers would land in two buckets.
      */
-    private class LayoutKey(val layouts: Map<Long, GroupType>) {
+    class LayoutKey(val layouts: Map<Long, GroupType>) {
         private val hash =
             layouts.entries.sumOf {
                     (fieldId, layout) ->
@@ -218,6 +240,47 @@ internal object VariantLayoutGroups {
         override fun equals(other: Any?): Boolean = other is LayoutKey && other.layouts == layouts
 
         override fun hashCode(): Int = hash
+    }
+
+    /**
+     * Let a remembered deviating population SHORT of [minInputFiles]
+     * borrow unknown candidates from the main population, so that a late
+     * arrival in its layout can be found: otherwise four remembered
+     * old-layout files and one unprobed fifth sit in two populations
+     * neither of which forms a group, for as long as nothing else arrives.
+     * The borrowed files are probed with the population; those in its
+     * layout compact with it, the rest are remembered where they belong
+     * and never borrowed again.
+     *
+     * BOUNDED, and only when it costs nothing: the main population must
+     * form no group of its own under [grouping]'s rule (its unknowns are
+     * idle, so a probe of them is the only thing that happens to them this
+     * sweep), the largest short population alone is completed, with the
+     * fewest unknowns that complete it, and only when the completed
+     * population actually forms a group holding a borrowed file under the
+     * same rule (a dominance split, say, would leave the loan unprobed).
+     * So a bucket speculates on at most one group's probe a sweep, each
+     * unknown is speculated on at most once, and a declared arrival that
+     * had a group to join is never diverted from it. Returns the files
+     * borrowed.
+     */
+    fun borrow(
+        populations: VariantLayoutMemory.Populations,
+        grouping: CompactionGrouping,
+        minInputFiles: Int,
+        maxInputFiles: Int,
+        size: (CompactionCandidate) -> Long,
+    ): List<CompactionCandidate> {
+        val short = populations.others.filter { it.size < minInputFiles }.maxByOrNull { it.size } ?: return emptyList()
+        if (populations.unknown.isEmpty()) return emptyList()
+        if (grouping.groups(populations.main, minInputFiles, maxInputFiles, size).isNotEmpty()) return emptyList()
+        val borrowed = populations.unknown.take(minInputFiles - short.size)
+        val trial = grouping.groups(short + borrowed, minInputFiles, maxInputFiles, size)
+        val lent = borrowed.filter { file -> trial.any { group -> file in group } }
+        if (lent.isEmpty()) return emptyList()
+        short += lent
+        populations.main -= lent.toSet()
+        return lent
     }
 
     /** The footers to hand the rewrite, by data_file_id, of the inputs that kept one (see [FOOTER_RETENTION_BYTES]). */
@@ -294,8 +357,9 @@ internal object VariantLayoutGroups {
  * was just written), so what stays is the files left behind for want of
  * company: a handful per partition per layout. [capacity] is the backstop
  * for everything else (files of dropped tables, files a sibling replica
- * compacted): over it, the memory is cleared and every file is probed
- * again once.
+ * compacted): over it, the OLDEST entry is evicted for each new one, so
+ * crossing the cap costs one re-probe per entry evicted, spread over the
+ * sweeps that evict them, never every file at once.
  */
 internal class VariantLayoutMemory(
     private val capacity: Int = DEFAULT_CAPACITY,
@@ -307,7 +371,17 @@ internal class VariantLayoutMemory(
         val duckdb: Boolean get() = deviations == DUCKDB
     }
 
-    private val known = ConcurrentHashMap<Key, Known>()
+    /**
+     * Insertion-ordered so the eldest entry is the one evicted, under one
+     * lock: the planner and the executing groups touch it from several
+     * threads, each for a handful of entries per call.
+     */
+    private val known =
+        Collections.synchronizedMap(
+            object : LinkedHashMap<Key, Known>(16, 0.75f, false) {
+                override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Key, Known>): Boolean = size > capacity
+            },
+        )
 
     fun remember(
         catalogId: Long,
@@ -315,7 +389,6 @@ internal class VariantLayoutMemory(
         declared: Long,
         deviations: Long,
     ) {
-        if (known.size >= capacity) known.clear()
         known[Key(catalogId, dataFileId)] = Known(declared, deviations)
     }
 
@@ -333,36 +406,57 @@ internal class VariantLayoutMemory(
     }
 
     /**
+     * One bucket's candidates as [populations] divides them: [main] — the
+     * declared layout's and the [unknown] (never probed, or judged against
+     * another declaration) — then one list per remembered deviation
+     * ([others]); [duckdb] files were dropped. [all] is what the planner
+     * packs, each list on its own. Mutable so that
+     * [VariantLayoutGroups.borrow] can move an unknown from [main] into a
+     * short [others] population.
+     */
+    class Populations(
+        val main: MutableList<CompactionCandidate>,
+        val unknown: List<CompactionCandidate>,
+        val others: List<MutableList<CompactionCandidate>>,
+        val duckdb: Int,
+    ) {
+        fun all(): List<List<CompactionCandidate>> = (listOf(main) + others).filter { it.isNotEmpty() }
+    }
+
+    /**
      * [candidates] of one bucket as the planner should pack them, under a
      * declaration whose fingerprint is [declared]: a file remembered as
      * deviating from it packs only with files deviating the same way; a
      * file remembered as DuckDB's is dropped (it compacts under no
-     * layout); every other file — the declared layout's, the never-probed,
-     * and those judged against another declaration — packs together, since
-     * a writer honouring the catalog produces the declared layout and a
-     * group that proves otherwise is split by the probe and remembered.
-     * Returns the populations to pack separately and how many DuckDB files
-     * were dropped.
+     * layout, whatever the declaration); every other file — the declared
+     * layout's, the never-probed, and those judged against another
+     * declaration — packs together, since a writer honouring the catalog
+     * produces the declared layout and a group that proves otherwise is
+     * split by the probe and remembered. See [VariantLayoutGroups.borrow]
+     * for the one way an unknown leaves the main population before a probe.
      */
     fun populations(
         catalogId: Long,
         declared: Long,
         candidates: List<CompactionCandidate>,
-    ): Pair<List<List<CompactionCandidate>>, Int> {
-        if (known.isEmpty()) return listOf(candidates) to 0
+    ): Populations {
         val main = mutableListOf<CompactionCandidate>()
+        val unknown = mutableListOf<CompactionCandidate>()
         val others = LinkedHashMap<Long, MutableList<CompactionCandidate>>()
         var duckdb = 0
         for (candidate in candidates) {
             val entry = recall(catalogId, candidate.dataFileId)
             when {
-                entry == null -> main += candidate
+                entry == null || (!entry.duckdb && entry.declared != declared) -> {
+                    main += candidate
+                    unknown += candidate
+                }
                 entry.duckdb -> duckdb++
-                entry.declared != declared || entry.deviations == NONE -> main += candidate
+                entry.deviations == NONE -> main += candidate
                 else -> others.getOrPut(entry.deviations) { mutableListOf() } += candidate
             }
         }
-        return (listOf(main) + others.values).filter { it.isNotEmpty() } to duckdb
+        return Populations(main, unknown, others.values.toList(), duckdb)
     }
 
     val size: Int get() = known.size

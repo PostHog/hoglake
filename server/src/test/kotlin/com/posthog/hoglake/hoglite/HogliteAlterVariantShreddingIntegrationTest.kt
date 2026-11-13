@@ -23,6 +23,7 @@ import org.assertj.core.api.Assertions.catchThrowable
 import org.jdbi.v3.core.kotlin.withHandleUnchecked
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.Tag
+import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.Arguments
@@ -330,6 +331,73 @@ class HogliteAlterVariantShreddingIntegrationTest {
         // And the snapshot IS DDL, for the comment: a stale writer is refused.
         assertThatThrownBy { append(cat, read = before) }
             .isExactlyInstanceOf(HoglakeException.DdlSinceReadSnapshot::class.java)
+    }
+
+    @Test
+    fun `a hoglite no-op receipt describes one snapshot when a rename and a declaration change land under it`() {
+        // The alter's identity, head and versioned rows come from ONE read
+        // transaction (HogliteCatalogStore.headTableRow). Read apart — a
+        // live-row read, then the head — a rename and a declaration change
+        // committing between the two produced a no-op receipt carrying the
+        // OLD name beside the NEW head and its columns: a table state that
+        // existed at no snapshot. Through the interposer the concurrent
+        // alter lands just before the one read, which is the only place it
+        // can land now; what the receipt then says is consistent either way.
+        select(Backend.HOGLITE)
+        val engine = live!!
+        HogliteInterposer(engine.url()).use { proxy ->
+            val proxied = HogliteAlters(proxy.store)
+            val cat = fixture()
+            val before = head(cat)
+            proxy.hook({ method, path, body ->
+                method == "POST" && path.endsWith("/tx") && "\"txid\":\"${HogliteClient.READ_TXID_PREFIX}" in body
+            }) {
+                // Straight to the engine: renames `t` and re-declares `properties`.
+                alters.alterTable(
+                    cat,
+                    "ns",
+                    "t",
+                    listOf(AlterOp.RenameTable("t2"), AlterOp.SetVariantShredding("properties", second)),
+                    null,
+                    null,
+                    "concurrent",
+                    null,
+                )
+            }
+            // Named by the name it no longer has at the head the read sees:
+            // not found, never the old name on a receipt for the new head.
+            assertThatThrownBy {
+                proxied.alterTable(
+                    cat,
+                    "ns",
+                    "t",
+                    listOf(AlterOp.SetVariantShredding("properties", second)),
+                    null,
+                    null,
+                    null,
+                    null,
+                )
+            }.isInstanceOf(HoglakeException.NotFound::class.java)
+            assertThat(head(cat)).describedAs("only the concurrent alter minted a snapshot").isEqualTo(before + 1)
+            // Re-read under its name: the no-op receipt names the table and
+            // the declaration as they are at the head it reports.
+            val info =
+                proxied.alterTable(
+                    cat,
+                    "ns",
+                    "t2",
+                    listOf(AlterOp.SetVariantShredding("properties", second)),
+                    null,
+                    null,
+                    null,
+                    null,
+                )
+            assertThat(info.name).isEqualTo("t2")
+            assertThat(info.snapshotId).isEqualTo(before + 1)
+            assertThat(info.readSnapshotId).isEqualTo(before + 1)
+            assertThat(info.columns.single { it.def.name == "properties" }.def.typeParams).isEqualTo(params(second))
+            assertThat(head(cat)).isEqualTo(before + 1)
+        }
     }
 
     @ParameterizedTest(name = "{0}")

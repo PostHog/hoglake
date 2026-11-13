@@ -228,7 +228,7 @@ class VariantLayoutGroupsTest {
         val old = VariantLayout.fingerprint(VariantLayoutGroups.deviations(OLD, DECLARED))
         val files = (1..8).map { candidate(it.toLong()) }
         // Nothing remembered: one population, as before this existed.
-        assertThat(memory.populations(1, declared, files)).isEqualTo(listOf(files) to 0)
+        assertThat(memory.populations(1, declared, files).all()).isEqualTo(listOf(files))
 
         memory.remember(1, 1, declared, old)
         memory.remember(1, 2, declared, old)
@@ -236,10 +236,11 @@ class VariantLayoutGroupsTest {
         memory.remember(1, 4, declared, VariantLayoutMemory.DUCKDB)
         // Another catalog's file 5 is not this catalog's.
         memory.remember(2, 5, declared, old)
-        val (populations, ducks) = memory.populations(1, declared, files)
-        assertThat(ducks).isEqualTo(1)
-        assertThat(populations.map { p -> p.map { it.dataFileId } })
+        val divided = memory.populations(1, declared, files)
+        assertThat(divided.duckdb).isEqualTo(1)
+        assertThat(divided.all().map { p -> p.map { it.dataFileId } })
             .containsExactly(listOf(3L, 5L, 6L, 7L, 8L), listOf(1L, 2L))
+        assertThat(divided.unknown.map { it.dataFileId }).containsExactly(5L, 6L, 7L, 8L)
 
         // Compacted away: forgotten.
         memory.forget(1, listOf(1L, 2L))
@@ -263,20 +264,89 @@ class VariantLayoutGroupsTest {
         memory.remember(1, 1, before, old)
         memory.remember(1, 2, after, old)
         memory.remember(1, 3, before, VariantLayoutMemory.DUCKDB)
-        val (populations, ducks) = memory.populations(1, after, files)
-        assertThat(ducks).isEqualTo(1)
-        assertThat(populations.map { p -> p.map { it.dataFileId } }).containsExactly(listOf(1L, 4L), listOf(2L))
+        val divided = memory.populations(1, after, files)
+        assertThat(divided.duckdb).isEqualTo(1)
+        assertThat(divided.all().map { p -> p.map { it.dataFileId } }).containsExactly(listOf(1L, 4L), listOf(2L))
+        assertThat(
+            divided.unknown.map {
+                it.dataFileId
+            },
+        ).describedAs("the stale entry is unknown again").containsExactly(1L, 4L)
     }
 
     @Test
-    fun `over capacity the memory clears rather than growing`() {
+    fun `a remembered population short of the minimum borrows idle unknown arrivals, boundedly`() {
+        // Four remembered old-layout files and a fifth, unprobed, in the same
+        // layout: apart, neither population forms a group of 5, ever. The
+        // short population borrows what would complete it; the borrowed
+        // file is probed with it and, in its layout, compacts with it.
+        val memory = VariantLayoutMemory()
+        val declared = VariantLayout.fingerprint(DECLARED)
+        val old = VariantLayout.fingerprint(VariantLayoutGroups.deviations(OLD, DECLARED))
+        val files = (1..9).map { candidate(it.toLong()) }
+        (1L..4L).forEach { memory.remember(1, it, declared, old) }
+        memory.remember(1, 5, declared, VariantLayoutMemory.NONE)
+        // 6, 7, 8 unprobed; 9 judged against another declaration (stale: unknown again).
+        memory.remember(1, 9, declared + 1, old)
+
+        fun divide(
+            candidates: List<CompactionCandidate>,
+            min: Int = 5,
+        ): Pair<List<CompactionCandidate>, List<List<Long>>> {
+            val divided = memory.populations(1, declared, candidates)
+            val lent = VariantLayoutGroups.borrow(divided, grouping, min, 64) { it.fileSizeBytes }
+            return lent to divided.all().map { p -> p.map { it.dataFileId } }
+        }
+        // The main population (5 files, 4 of them unknown) forms a group of
+        // its own at this minimum: nothing is borrowed from work it has.
+        assertThat(divide(files).second).containsExactly(listOf(5L, 6L, 7L, 8L, 9L), listOf(1L, 2L, 3L, 4L))
+        // At a minimum of 6 the main population is idle; the short one
+        // borrows the two unknowns that complete it, in candidate order.
+        val (lent, populations) = divide(files, min = 6)
+        assertThat(lent.map { it.dataFileId }).containsExactly(6L, 7L)
+        assertThat(populations).containsExactly(listOf(5L, 8L, 9L), listOf(1L, 2L, 3L, 4L, 6L, 7L))
+
+        // Bounded: the LARGEST short population only; a population at the
+        // minimum borrows nothing.
+        val other = VariantLayout.fingerprint(mapOf(W.fieldId to OLD.getValue(V.fieldId)))
+        memory.remember(1, 10, declared, other)
+        memory.remember(1, 11, declared, other)
+        val more = files + (10..11).map { candidate(it.toLong()) }
+        assertThat(divide(more, min = 6).second)
+            .containsExactly(listOf(5L, 8L, 9L), listOf(1L, 2L, 3L, 4L, 6L, 7L), listOf(10L, 11L))
+        (6L..8L).forEach { memory.remember(1, it, declared, old) }
+        assertThat(divide(files, min = 6).second).containsExactly(listOf(5L, 9L), listOf(1L, 2L, 3L, 4L, 6L, 7L, 8L))
+
+        // Not lent when the loan would not be probed: a file the packing
+        // rule's dominance split would set apart from the short population.
+        val memory2 = VariantLayoutMemory()
+        (1L..4L).forEach { memory2.remember(1, it, declared, old) }
+        val smallAndHuge = (1..4).map { candidate(it.toLong(), bytes = 100) } + candidate(5, bytes = 4_000)
+        val divided = memory2.populations(1, declared, smallAndHuge)
+        assertThat(VariantLayoutGroups.borrow(divided, grouping, 5, 64) { it.fileSizeBytes }).isEmpty()
+        assertThat(
+            divided.all().map {
+                    p ->
+                p.map { it.dataFileId }
+            },
+        ).containsExactly(listOf(5L), listOf(1L, 2L, 3L, 4L))
+    }
+
+    @Test
+    fun `over capacity the memory evicts its eldest entry, one for each new one`() {
         val memory = VariantLayoutMemory(capacity = 3)
         repeat(3) { memory.remember(1, it.toLong(), 7, 42) }
         assertThat(memory.size).isEqualTo(3)
         memory.remember(1, 99, 7, 42)
-        assertThat(memory.size).isEqualTo(1)
+        // Not cleared: the eldest went, the rest stayed.
+        assertThat(memory.size).isEqualTo(3)
         assertThat(memory.recall(1, 0)).isNull()
+        assertThat(memory.recall(1, 1)).isNotNull()
+        assertThat(memory.recall(1, 2)).isNotNull()
         assertThat(memory.recall(1, 99)).isEqualTo(VariantLayoutMemory.Known(7, 42))
+        memory.remember(1, 100, 7, 42)
+        assertThat(memory.recall(1, 1)).isNull()
+        assertThat(memory.size).isEqualTo(3)
     }
 
     // ---- fixtures --------------------------------------------------------------

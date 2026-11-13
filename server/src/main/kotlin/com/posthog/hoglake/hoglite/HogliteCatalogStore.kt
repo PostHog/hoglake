@@ -1197,6 +1197,53 @@ class HogliteCatalogStore(
         }
 
     /**
+     * The alter path's view of a table: meta (the head), the live namespace
+     * and the table's version row AT that head, in ONE read-only
+     * transaction, so from one engine snapshot — [headTable]'s read without
+     * the totals. Read apart (a live-row read, then a meta read), a rename
+     * and a declaration change committing between the two gave a no-op
+     * receipt the table's OLD name and properties beside the NEW head's
+     * columns: a state that existed at no snapshot. The identity, the
+     * head, and every versioned row then read at that head agree.
+     */
+    internal fun headTableRow(
+        catalog: String,
+        namespace: String,
+        table: String,
+    ): Triple<MetaRow, NamespaceInfo, TableRow> {
+        val head = HogliteSchema.HEAD_SQL
+        val (metaResult, nsResult, tableResult) =
+            readCatalog(
+                catalog,
+                listOf(
+                    HogliteStatement(metaSql),
+                    HogliteStatement(LIVE_NAMESPACE_SQL, listOf(namespace)),
+                    HogliteStatement(
+                        "SELECT t.id, t.table_uuid, v.namespace_id, v.namespace, v.name, v.comment, " +
+                            "v.properties_json, t.next_row_id, t.schema_version, $head" +
+                            " FROM table_versions v JOIN tables t ON t.id = v.table_id " +
+                            "WHERE v.namespace_id = $LIVE_NAMESPACE_ID_SQL AND v.name = ? " +
+                            "AND v.begin_snapshot <= $head AND (v.end_snapshot IS NULL OR v.end_snapshot > $head) " +
+                            "AND t.created_snapshot <= $head " +
+                            "AND (t.dropped_snapshot IS NULL OR t.dropped_snapshot > $head)",
+                        listOf(namespace, table),
+                    ),
+                ),
+            )
+        val m = metaRow(metaResult.firstRow() ?: throw HoglakeException.NotFound("catalog '$catalog'"))
+        val ns =
+            nsResult.firstRow()?.let { namespaceInfo(it) }
+                ?: throw HoglakeException.NotFound("namespace '$namespace' in catalog '$catalog'")
+        val row =
+            tableResult.firstRow()
+                ?: throw HoglakeException.NotFound("table '$namespace.$table' in catalog '$catalog'")
+        check(
+            row[9].asLong() == m.head,
+        ) { "head read saw head ${row[9]} beside meta head ${m.head} in one transaction" }
+        return Triple(m, ns, tableRowOf(row.subList(0, 9)))
+    }
+
+    /**
      * A head getTable: meta, the live namespace and the table row (with its
      * table_totals) in ONE read-only transaction, so from one engine
      * snapshot (#537). The head (meta.next_snapshot) and table_totals are

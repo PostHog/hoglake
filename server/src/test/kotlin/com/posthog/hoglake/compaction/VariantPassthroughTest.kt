@@ -12,6 +12,7 @@ import org.apache.parquet.hadoop.ParquetFileReader
 import org.apache.parquet.hadoop.example.ExampleParquetWriter
 import org.apache.parquet.io.LocalInputFile
 import org.apache.parquet.io.LocalOutputFile
+import org.apache.parquet.io.api.Binary
 import org.apache.parquet.schema.MessageTypeParser
 import org.apache.parquet.schema.Type
 import org.assertj.core.api.Assertions.assertThat
@@ -312,6 +313,103 @@ class VariantPassthroughTest {
                 assertThat(it.reason).isEqualTo("layout")
                 assertThat(it.message).contains("not one VARIANT group")
             }
+    }
+
+    @Test
+    fun `a variant whose value is REPEATED is refused by the probe and by the rewrite, so no value is lost`() {
+        // Two values per row in a repeated child: the copy would keep the
+        // first, drop the second, and commit with the row count intact.
+        val schema =
+            MessageTypeParser.parseMessageType(
+                "message m { required int64 id = 1; " +
+                    "optional group props (VARIANT(1)) = 2 { required binary metadata; repeated binary value; } }",
+            )
+        val path = tmp.resolve("repeated-value.parquet")
+        ExampleParquetWriter.builder(LocalOutputFile(path)).withType(schema).build().use { w ->
+            val factory = SimpleGroupFactory(schema)
+            for (i in 0 until 3) {
+                val row = factory.newGroup().append("id", i.toLong())
+                val props = row.addGroup("props")
+                props.add("metadata", Binary.fromConstantByteArray(byteArrayOf(1, 0, 0)))
+                props.add("value", Binary.fromConstantByteArray(byteArrayOf(0)))
+                props.add("value", Binary.fromConstantByteArray(byteArrayOf(12, 1)))
+                w.write(row)
+            }
+        }
+        assertThatThrownBy { probe(path) }
+            .isInstanceOfSatisfying(VariantLayoutMismatchException::class.java) {
+                assertThat(it.reason).isEqualTo("layout")
+                assertThat(it.message).contains("`props.value` is REPEATED outside a LIST or MAP layer")
+            }
+        // The rewrite, under the declared layout and under an explicitly
+        // named one alike: there is no layout this can be written in.
+        for (layouts in listOf(emptyMap(), probe("a"))) {
+            val out = tmp.resolve("repeated-out-${layouts.size}.parquet")
+            assertThatThrownBy {
+                ParquetRewriter.rewrite(
+                    listOf(localInput(path, 0)),
+                    live,
+                    emptyList(),
+                    LocalDiscardableOutput(out),
+                    variantCompaction = true,
+                    variantLayouts = layouts,
+                )
+            }.isInstanceOfSatisfying(
+                VariantLayoutMismatchException::class.java,
+            ) { assertThat(it.reason).isEqualTo("layout") }
+            assertThat(out).doesNotExist()
+        }
+    }
+
+    @Test
+    fun `a variant written value-before-metadata is a layout of its own, probed and copied in its order`() {
+        // Spark's order. The probe reads it as a layout (metadata is found
+        // by name), and a group of such files rewrites into that very order,
+        // every leaf byte for byte.
+        val schema =
+            MessageTypeParser.parseMessageType(
+                "message m { required int64 id = 1; " +
+                    "optional group props (VARIANT(1)) = 2 { required binary value; required binary metadata; } }",
+            )
+        val path = tmp.resolve("value-first.parquet")
+        ExampleParquetWriter.builder(LocalOutputFile(path)).withType(schema).build().use { w ->
+            val factory = SimpleGroupFactory(schema)
+            for (i in 0 until 4) {
+                val row = factory.newGroup().append("id", i.toLong())
+                if (i != 2) {
+                    val props = row.addGroup("props")
+                    props.add("value", Binary.fromConstantByteArray(byteArrayOf(12, i.toByte())))
+                    props.add("metadata", Binary.fromConstantByteArray(byteArrayOf(1, 0, 0)))
+                }
+                w.write(row)
+            }
+        }
+        val layouts = probe(path)
+        assertThat(layouts.getValue(2L).fields.map { it.name }).containsExactly("value", "metadata")
+        val out = tmp.resolve("value-first-out.parquet")
+        val result =
+            ParquetRewriter.rewrite(
+                listOf(localInput(path, 0, dv(1)), localInput(path, 100)),
+                live.take(2),
+                emptyList(),
+                LocalDiscardableOutput(out),
+                variantCompaction = true,
+                variantLayouts = layouts,
+            )
+        assertThat(result.rowsWritten).isEqualTo(7)
+        val written = read(out)
+        assertThat(written.first.getType("props")).isEqualTo(layouts.getValue(2L))
+        val expectedRows = VariantFixtures.read(path).second
+        val byId = written.second.associateBy { it.getLong(ParquetRewriter.ROW_ID_COLUMN, 0) }
+        for ((position, source) in expectedRows.withIndex()) {
+            for (start in listOf(0L, 100L)) {
+                if (start == 0L && position == 1) continue
+                val got = byId.getValue(start + position)
+                assertThat(VariantFixtures.render(got, got.type.getFieldIndex("props")))
+                    .describedAs("row $position from $start")
+                    .isEqualTo(VariantFixtures.render(source, source.type.getFieldIndex("props")))
+            }
+        }
     }
 
     @Test

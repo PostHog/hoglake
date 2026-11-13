@@ -19,6 +19,7 @@ import com.posthog.hoglake.model.SortDirection
 import com.posthog.hoglake.model.SortFieldDef
 import com.posthog.hoglake.model.TableAppend
 import com.posthog.hoglake.model.TableDeletes
+import com.posthog.hoglake.model.allNodes
 import com.posthog.hoglake.persistence.getBigintListOrNull
 import com.posthog.hoglake.service.AlterService
 import com.posthog.hoglake.service.CatalogService
@@ -2025,6 +2026,292 @@ class CompactionServiceIntegrationTest {
             @Suppress("UNCHECKED_CAST")
             return VariantFixtures.other[1].def.typeParams!!.getValue("shredding") as Map<String, Any?>
         }
+
+    @Test
+    fun `a sorted part in a wider historical layout is chunked by that layout, not the narrowed declaration`() {
+        // `rich` is declared wide (columns.json: twenty fields, a list, a
+        // nested object), the files are written under it, then the
+        // declaration is CLEARED. The files still hold the wide subtree. A
+        // chunk sized from the live declaration (three nodes for `rich`)
+        // would hold far more of those rows than the heap budget meant; the
+        // part's chunk is sized from the layout its rows actually hold.
+        withVariantMetrics { _ ->
+            val (cat, files) =
+                variantTable("wide-chunk", "a", "a", "a", "a", "a", "a", "b", "b", "b", "b", "b", "b")
+            alter.alterTable(
+                cat,
+                "ns",
+                "t",
+                listOf(
+                    AlterOp.SetSortOrder(listOf(SortFieldDef(1, SortDirection.ASC, NullOrder.NULLS_LAST))),
+                    AlterOp.SetVariantShredding("rich", null),
+                ),
+            )
+            val narrow = catalogs.getTable(cat, "ns", "t").columns
+            assertThat(narrow.single { it.def.name == "rich" }.def.typeParams).isNull()
+            // The files' layouts, off one footer: `rich` as it was declared.
+            val wide =
+                ParquetFileReader.open(LocalInputFile(VariantFixtures.path("a"))).use {
+                    ParquetRewriter.variantLayoutsOf(it.footer, narrow, "a")
+                }
+            assertThat(
+                wide.getValue(3L),
+            ).isEqualTo(VariantLayout.groupType(VariantFixtures.live[2], Type.Repetition.OPTIONAL))
+            // A heap budget under which the WIDE rows spill into two runs
+            // (72 rows a chunk of the 144) while the narrow estimate holds
+            // every row in one chunk: the difference the fix makes. Twelve
+            // files rather than two so that the same budget, which also
+            // bounds the merge, admits the two spilled runs it makes.
+            val wideNodes = VariantLayout.shape(wide.getValue(3L)).first
+            val rowNodes =
+                narrow.allNodes().size + 1L +
+                    VariantFixtures.live.allNodes().filter { it.def.type == ColType.VARIANT }.sumOf { column ->
+                        val shape = wide[column.fieldId]?.let { VariantLayout.shape(it) } ?: VariantLayout.shape(column)
+                        shape!!.first - 1L
+                    }
+            assertThat(rowNodes).isGreaterThan(wideNodes.toLong())
+            val heap =
+                CompactionConfig.SORTED_HEAP_BYTES_PER_NODE * rowNodes *
+                    CompactionConfig.DEFAULT_NESTED_SORT_EXPANSION * 72
+            val sorted = variantOn.copy(sortedHeapBytes = heap, minInputFiles = 2)
+            assertThat(
+                sorted.spillChunkRows(narrow),
+            ).describedAs("the declaration's estimate: one chunk").isGreaterThan(144)
+            val wideSpill = sorted.sortSpill(narrow, wide)
+            assertThat(wideSpill.chunkRows).describedAs("the layout's: two").isEqualTo(72)
+            assertThat(ExternalMergeSort.spillRuns(144, wideSpill)).isEqualTo(2)
+
+            assertThat(svc.planTable(cat, "ns", "t", sorted).groups).hasSize(1)
+            val result = svc.runOnce(cat, sorted)
+            assertThat(result.groupsCompacted).describedAs("%s", result).isEqualTo(1)
+            assertThat(result.filesIn).isEqualTo(12)
+            assertThat(result.failedGroups + result.spillBudgetExceeded + result.mergeBudgetExceeded).isZero()
+            assertThat(
+                result.runsSpilled,
+            ).describedAs("chunked by the wide layout, not the narrow estimate").isEqualTo(2)
+            val output = catalogs.listFiles(cat, "ns", "t").single()
+            assertThat(output.explicitRowIds).isTrue()
+            val (schema, rows) = VariantFixtures.read(fetch(output.path))
+            assertThat(schema.getType("rich")).isEqualTo(wide.getValue(3L))
+            assertThat(rows.map { it.getLong("id", 0) }).isSorted().hasSize(144)
+            assertThat(files.map { it.path }).doesNotContain(output.path)
+        }
+    }
+
+    @Test
+    fun `an arrival in a remembered remainder's layout completes it, although alone it is below the minimum`() {
+        // Four old-layout files and one declared, at a minimum of five: the
+        // probe leaves all five behind, remembered. One more old-layout file
+        // arrives, unprobed. Apart, the four and the one never form a group;
+        // the planner lends the short population the unknown, probes it with
+        // them, and the five compact.
+        withVariantMetrics { registry ->
+            val five = variantOn.copy(minInputFiles = 5)
+            val (cat, files) = variantTable("completion", "other_b", "other_b", "other_b", "other_b", "b")
+            val probe = svc.runOnce(cat, five)
+            assertThat(probe.layoutProbeOnly).describedAs("%s", probe).isEqualTo(1)
+            assertThat(probe.groupsCompacted).isZero()
+            assertThat(counter(registry, "hoglake_compaction_variant_layout_files_left_total", cat)).isEqualTo(5.0)
+            assertThat(svc.planTable(cat, "ns", "t", five).groups).isEmpty()
+
+            val arrival = addFiles(cat, files.size, "other_b").single()
+            val plan = svc.planTable(cat, "ns", "t", five).groups
+            assertThat(plan).hasSize(1)
+            assertThat(plan.single().files.map { it.path })
+                .describedAs("the four remembered and the borrowed arrival; the declared file stays apart")
+                .containsExactlyInAnyOrderElementsOf(files.take(4).map { it.path } + arrival.path)
+            val result = svc.runOnce(cat, five)
+            assertThat(result.groupsCompacted).describedAs("%s", result).isEqualTo(1)
+            assertThat(result.filesIn).isEqualTo(5)
+            assertThat(result.layoutProbeOnly).isZero()
+            val live = catalogs.listFiles(cat, "ns", "t")
+            assertThat(
+                live.map {
+                    it.path
+                },
+            ).contains(files[4].path).doesNotContainAnyElementsOf(files.take(4).map { it.path } + arrival.path)
+            val output = live.single { it.explicitRowIds }
+            assertThat(VariantFixtures.read(fetch(output.path)).first.getType("props"))
+                .isEqualTo(VariantLayout.groupType(VariantFixtures.other[1], Type.Repetition.OPTIONAL))
+            assertThat(
+                counter(registry, "hoglake_compaction_variant_layout_outputs_total", cat, "layout" to "other"),
+            ).isEqualTo(1.0)
+        }
+    }
+
+    @Test
+    fun `a DuckDB-written file holding no variant column compacts, null-filled, like any other`() {
+        // Scalar files DuckDB wrote before the variant columns existed:
+        // there is no Variant null in them for Trino to read as SQL NULL,
+        // so excluding them would strand every pre-existing file of the
+        // table. They compact; the variant columns null-fill.
+        withVariantMetrics { registry ->
+            val (cat, _) = variantTable("duck-scalars")
+            val idOnly = MessageType("t", Types.required(PrimitiveTypeName.INT64).id(1).named("id"))
+            val files =
+                (0 until 3).map { i ->
+                    val bytes =
+                        duckStamped(
+                            customParquetBytes(
+                                idOnly,
+                                (0 until 4).map {
+                                        r ->
+                                    { g: Group -> g.add("id", (i * 4 + r).toLong()) }
+                                },
+                            ),
+                        )
+                    val path = "s3://$BUCKET/$cat/data/ns/t/duck-$i.parquet"
+                    store.put(path, bytes)
+                    commits.commit(
+                        cat,
+                        CommitRequest(
+                            appends =
+                                listOf(
+                                    TableAppend("ns", "t", listOf(FileRegistration(path, 4, bytes.size.toLong()))),
+                                ),
+                        ),
+                    )
+                    path
+                }
+            Hydrator(db.jdbi, store).runOnce()
+            val result = svc.runOnce(cat, variantOn)
+            assertThat(result.groupsCompacted).describedAs("%s", result).isEqualTo(1)
+            assertThat(result.filesIn).isEqualTo(3)
+            assertThat(
+                counter(registry, "hoglake_compaction_variant_layout_mismatch_total", cat, "reason" to "duckdb"),
+            ).isNull()
+            val output = catalogs.listFiles(cat, "ns", "t").single()
+            assertThat(output.explicitRowIds).isTrue()
+            assertThat(files).doesNotContain(output.path)
+            val (schema, rows) = VariantFixtures.read(fetch(output.path))
+            assertThat(
+                schema.getType("props"),
+            ).isEqualTo(VariantLayout.groupType(VariantFixtures.live[1], Type.Repetition.OPTIONAL))
+            assertThat(rows).hasSize(12)
+            assertThat(rows.map { it.getLong("id", 0) }).containsExactlyInAnyOrderElementsOf((0L until 12L).toList())
+            assertThat(
+                rows,
+            ).allSatisfy { assertThat(it.getFieldRepetitionCount("props")).describedAs("null-filled").isZero() }
+        }
+    }
+
+    @Test
+    fun `a DuckDB-written file whose variant field is no VARIANT group is excluded, not a refusal of its group`() {
+        // Its created_by is read before its layout: whatever DuckDB put
+        // under the variant column's id, the file is set aside on its own
+        // and the rest of the group compacts.
+        withVariantMetrics { registry ->
+            val (cat, files) = variantTable("duck-leaf", "b", "b")
+            val leaf =
+                MessageType(
+                    "t",
+                    Types.required(PrimitiveTypeName.INT64).id(1).named("id"),
+                    Types.optional(PrimitiveTypeName.BINARY).id(2).named("props"),
+                )
+            // Enough rows to be b's size, or the planner's dominance split
+            // would set the file apart before any probe saw it.
+            val rows = 1500L
+            val bytes =
+                duckStamped(
+                    customParquetBytes(
+                        leaf,
+                        (0 until rows.toInt()).map {
+                                r ->
+                            { g: Group ->
+                                g.add("id", r.toLong())
+                                g.add("props", Binary.fromString("x$r"))
+                            }
+                        },
+                    ),
+                )
+            assertThat(bytes.size).isBetween(files[0].fileSizeBytes.toInt() / 2, files[0].fileSizeBytes.toInt() * 2)
+            val path = "s3://$BUCKET/$cat/data/ns/t/duck-leaf.parquet"
+            store.put(path, bytes)
+            // Registered with inline stats, as a writer of its own files
+            // would: the hydrator reads no such file, so only the probe ever
+            // sees what is under the variant column's id.
+            commits.commit(
+                cat,
+                CommitRequest(
+                    appends =
+                        listOf(
+                            TableAppend(
+                                "ns",
+                                "t",
+                                listOf(
+                                    FileRegistration(
+                                        path,
+                                        rows,
+                                        bytes.size.toLong(),
+                                        columnStats =
+                                            listOf(
+                                                ColumnStats(
+                                                    1,
+                                                    rows,
+                                                    0,
+                                                    null,
+                                                    null,
+                                                    IcebergSingleValue.encodeLong(0),
+                                                    IcebergSingleValue.encodeLong(rows - 1),
+                                                ),
+                                            ),
+                                    ),
+                                ),
+                            ),
+                        ),
+                ),
+            )
+            assertThat(svc.planTable(cat, "ns", "t", variantOn).groups).singleElement().satisfies({
+                assertThat(it.files).hasSize(3)
+            })
+            val result = svc.runOnce(cat, variantOn)
+            assertThat(result.groupsCompacted).describedAs("%s", result).isEqualTo(1)
+            assertThat(result.filesIn).isEqualTo(2)
+            assertThat(result.unconvertibleSchema).describedAs("excluded, not refused").isZero()
+            assertThat(
+                counter(registry, "hoglake_compaction_variant_layout_mismatch_total", cat, "reason" to "duckdb"),
+            ).isEqualTo(1.0)
+            assertThat(
+                counter(registry, "hoglake_compaction_variant_layout_mismatch_total", cat, "reason" to "layout"),
+            ).isNull()
+            assertThat(
+                catalogs.listFiles(cat, "ns", "t").map {
+                    it.path
+                },
+            ).contains(path).doesNotContainAnyElementsOf(files.map { it.path })
+            assertThat(svc.planTable(cat, "ns", "t", variantOn).groups).isEmpty()
+        }
+    }
+
+    /** [bytes] with the footer's `created_by` overwritten in place, at the same length, to DuckDB's — the fixture technique of `duckdb.parquet`. */
+    private fun duckStamped(bytes: ByteArray): ByteArray {
+        val tmp = Files.createTempFile("duck-stamp", ".parquet")
+        try {
+            Files.write(tmp, bytes)
+            val createdBy = ParquetFileReader.open(LocalInputFile(tmp)).use { it.footer.fileMetaData.createdBy }
+            val stamp = createdBy.toByteArray()
+            val duck = "DuckDB version v1.5.6 (build x)".toByteArray()
+            check(duck.size <= stamp.size) { "created_by '$createdBy' is shorter than DuckDB's" }
+            val replacement = duck + ByteArray(stamp.size - duck.size) { ' '.code.toByte() }
+            val at = indexOf(bytes, stamp)
+            check(at >= 0 && indexOf(bytes, stamp, at + 1) < 0) { "created_by must occur exactly once" }
+            return bytes.copyOf().also { replacement.copyInto(it, at) }
+        } finally {
+            Files.deleteIfExists(tmp)
+        }
+    }
+
+    private fun indexOf(
+        haystack: ByteArray,
+        needle: ByteArray,
+        from: Int = 0,
+    ): Int {
+        outer@ for (i in from..haystack.size - needle.size) {
+            for (j in needle.indices) if (haystack[i + j] != needle[j]) continue@outer
+            return i
+        }
+        return -1
+    }
 
     private val variantOn get() = cfg.copy(targetBytes = 1L shl 20, variantCompaction = true)
 

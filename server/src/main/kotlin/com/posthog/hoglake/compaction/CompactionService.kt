@@ -770,10 +770,25 @@ data class CompactionConfig(
      * node but a Parquet group of up to thousands ([VariantLayout.shape]),
      * so it counts as its layout's nodes, and as nested when that layout
      * holds a list.
+     *
+     * [variantLayouts], by field id, is the subtree a rewrite actually
+     * writes a variant column in where that is not the declared one — the
+     * layout a group's inputs share (`VariantLayoutGroups`). A row of
+     * files written under a wider declaration since cleared or narrowed
+     * holds that wider subtree, and a chunk sized by the declaration would
+     * hold too many of them for the heap.
      */
-    fun spillChunkRows(columns: List<Column>): Long {
+    fun spillChunkRows(
+        columns: List<Column>,
+        variantLayouts: Map<Long, GroupType> = emptyMap(),
+    ): Long {
         val variants = columns.allNodes().filter { it.def.type == ColType.VARIANT }
-        val layouts = variants.map { VariantLayout.shape(it) ?: (1 to false) }
+        val layouts =
+            variants.map { column ->
+                variantLayouts[column.fieldId]?.let { VariantLayout.shape(it) }
+                    ?: VariantLayout.shape(column)
+                    ?: (1 to false)
+            }
         // + the _hog_row_id carrier, and each variant's nodes beyond the one counted
         val nodes = columns.allNodes().size + 1L + layouts.sumOf { (n, _) -> n - 1L }
         val perRow = SORTED_HEAP_BYTES_PER_NODE * nodes
@@ -787,11 +802,16 @@ data class CompactionConfig(
      * [spillChunkRows], [sortedHeapBytesPerGroup] for the merge,
      * [spillBytes] and [spillDir]. One function, called by the planner's
      * metadata refusals and by the rewrite alike, so the two cannot
-     * disagree about a group.
+     * disagree about a group. [variantLayouts] as [spillChunkRows] takes
+     * it: a part of a variant table's group is bounded by ITS layout's
+     * shape, re-admitted against these bounds before its rewrite.
      */
-    fun sortSpill(columns: List<Column>): SortSpill =
+    fun sortSpill(
+        columns: List<Column>,
+        variantLayouts: Map<Long, GroupType> = emptyMap(),
+    ): SortSpill =
         SortSpill(
-            chunkRows = spillChunkRows(columns),
+            chunkRows = spillChunkRows(columns, variantLayouts),
             mergeBudgetBytes = sortedHeapBytesPerGroup,
             spillBudgetBytes = spillBytes,
             spillDir = spillDir,
@@ -3089,7 +3109,11 @@ class CompactionService(
                 if (declaredFingerprint == null) {
                     listOf(candidates)
                 } else {
-                    variantLayouts.populations(ctx.catalogId, declaredFingerprint, candidates).first
+                    val divided = variantLayouts.populations(ctx.catalogId, declaredFingerprint, candidates)
+                    // A remembered remainder short of the minimum may borrow
+                    // idle unknowns to find company (VariantLayoutGroups.borrow).
+                    VariantLayoutGroups.borrow(divided, grouping, cfg.minInputFiles, fanIn) { it.fileSizeBytes }
+                    divided.all()
                 }
             for (population in populations) {
                 val packed = grouping.groups(population, cfg.minInputFiles, fanIn) { it.fileSizeBytes }
@@ -4331,10 +4355,49 @@ class CompactionService(
             // yield to a heap exhausted by a sibling or to cancellation.
             for ((index, part) in planned.parts.withIndex()) {
                 if (yieldsBeforePart(index, heapExhausted.get(), Thread.currentThread().isInterrupted)) break
+                // A SORTED part is bounded by ITS layout, not the declared
+                // one: the chunk is sized from the subtree its rows actually
+                // hold (a declaration since cleared or narrowed leaves files
+                // far wider than the catalog says), and the part is
+                // re-admitted against those bounds in metadata, as the
+                // planner admitted the group against the declared ones —
+                // refused uncharged, the planner's way, when the wider rows
+                // break a budget the declared estimate fit.
+                val partSpill =
+                    ctx.sortSpill?.let {
+                        if (part.layouts.isEmpty()) {
+                            it
+                        } else {
+                            cfg.sortSpill(
+                                ctx.columns,
+                                part.layouts,
+                            )
+                        }
+                    }
+                if (partSpill != null && part.layouts.isNotEmpty()) {
+                    val leaves = runCatching { ParquetRewriter.outputLeafCount(ctx.columns, part.layouts) }.getOrNull()
+                    val refusal = leaves?.let { budgetRefusal(ctx, partSpill, it, part.group) }
+                    if (refusal != null) {
+                        log.warn {
+                            "compaction part of ${part.group.files.size} files for " +
+                                "$catalog/${ctx.namespace}.${ctx.table} in a variant layout of " +
+                                "${partSpill.chunkRows} rows per chunk is refused by the " +
+                                "sorted rewrite's ${refusal.name.lowercase()} budget; the planner admitted the group " +
+                                "against the declared layout's shape. Levers as for the planner's refusals"
+                        }
+                        tally +=
+                            when (refusal) {
+                                BudgetRefusal.SPILL -> GroupTally(spillBudgetExceeded = 1)
+                                BudgetRefusal.MERGE -> GroupTally(mergeBudgetExceeded = 1)
+                            }
+                        part.dropFooters()
+                        continue
+                    }
+                }
                 tally +=
                     attempt(catalog, ctx, part.group, cfg, heapExhausted) { work ->
                         val outcome =
-                            compactGroup(ctx, part.group, part.layouts, part.footers) { r ->
+                            compactGroup(ctx, part.group, part.layouts, part.footers, partSpill) { r ->
                                 work.tally =
                                     GroupTally(
                                         runsTrusted = r.runsTrusted.toLong(),
@@ -4776,10 +4839,32 @@ class CompactionService(
             }
         val probed = ArrayList<VariantLayoutGroups.Probed>(inputs.size)
         var retained = 0L
+        // INTERNED: one canonical tree per distinct layout tuple, however
+        // many inputs hold it. Each footer's walk builds a fresh tree (a
+        // thousand-field declaration is a few thousand nodes), and holding
+        // one per input would scale the probe's heap with fan-in x layout
+        // width; held per distinct layout it scales with the layouts a
+        // group holds, which is what the rest of the probe already costs.
+        val interned = HashMap<VariantLayoutGroups.LayoutKey, Map<Long, GroupType>>()
         ParquetRewriter.forEachOpenedInput(inputs, ctx.inputOpenParallelism) { input, reader ->
             val file = group.files[probed.size]
             val footer = reader.footer
-            val layouts = ParquetRewriter.variantLayoutsOf(footer, ctx.columns, input.label)
+            // created_by FIRST. A DuckDB-written file is excluded from every
+            // part whatever its variant field holds, so a shape the walk
+            // would refuse (`layout`) must not refuse the whole group on its
+            // account; and a DuckDB file holding NO live variant column
+            // (scalars written before the column existed) is an ordinary
+            // input the rewrite null-fills — Trino's SQL-NULL reading of
+            // DuckDB's Variant nulls has nothing to read in it.
+            val duck = footer.fileMetaData.createdBy?.startsWith("DuckDB") == true
+            val layouts =
+                try {
+                    ParquetRewriter.variantLayoutsOf(footer, ctx.columns, input.label)
+                        .let { interned.getOrPut(VariantLayoutGroups.LayoutKey(it)) { it } }
+                } catch (e: VariantLayoutMismatchException) {
+                    if (!duck) throw e
+                    null
+                }
             // Kept for the rewrite while the serialized footer bytes of
             // those kept so far fit the retention budget (see the constant):
             // the footer's own measure, not the registered hint.
@@ -4790,8 +4875,8 @@ class CompactionService(
                 VariantLayoutGroups.Probed(
                     file,
                     if (keep) footer else null,
-                    layouts,
-                    footer.fileMetaData.createdBy?.startsWith("DuckDB") == true,
+                    layouts ?: emptyMap(),
+                    duckdb = duck && (layouts == null || layouts.isNotEmpty()),
                 )
         }
         return probed
@@ -4949,6 +5034,8 @@ class CompactionService(
         group: CompactionGroup,
         variantLayouts: Map<Long, GroupType> = emptyMap(),
         footers: Map<Long, ParquetMetadata> = emptyMap(),
+        /** The sorted rewrite's bounds for THIS group's layout (executeGroup sizes a part's from [variantLayouts]). */
+        spill: SortSpill? = ctx.sortSpill,
         onRewritten: (ParquetRewriter.RewriteResult) -> Unit = {},
     ): GroupOutcome {
         // The OBJECT-PREFIX value, before any IO. The planner refuses a
@@ -5091,7 +5178,7 @@ class CompactionService(
                 ctx.maxNodesPerRow,
                 ctx.codec,
                 ctx.inputOpenParallelism,
-                ctx.sortSpill,
+                spill,
                 appendFloorBytes,
                 ctx.variantCompaction,
                 variantLayouts,

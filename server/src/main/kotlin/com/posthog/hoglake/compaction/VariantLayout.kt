@@ -97,6 +97,18 @@ object VariantLayout {
      */
     fun shape(column: Column): Pair<Int, Boolean>? {
         val group = runCatching { groupType(column, Type.Repetition.OPTIONAL) }.getOrNull() ?: return null
+        return shape(group)
+    }
+
+    /**
+     * [shape] of a layout as a group — a file's [canonical] subtree, which
+     * is what a rewrite of files in another layout decodes a row of, and
+     * so what sizes THAT rewrite's chunk (`CompactionConfig.spillChunkRows`
+     * with the part's layouts): the declared layout's shape would size the
+     * chunk for a narrower row than the one held after a declaration was
+     * cleared or narrowed.
+     */
+    fun shape(group: GroupType): Pair<Int, Boolean> {
         var nodes = 0
         var list = false
 
@@ -166,31 +178,104 @@ object VariantLayout {
      * by layout with `==`, and [groupType]'s own output canonicalizes to
      * itself.
      *
-     * Null when [src] is no VARIANT group at all — a leaf, a REPEATED
-     * group, a group without the VARIANT annotation, or one whose first
-     * field is not the REQUIRED BINARY `metadata` every Variant layout
-     * begins with: not another layout, a shape the copy cannot carry
-     * under any output, refused as `layout` by the rewriter.
+     * Null when [layoutOf] refuses [src]: no VARIANT group at all, or a
+     * subtree the copy cannot carry whole.
      */
     fun canonical(
         src: Type,
         column: Column,
-    ): GroupType? {
-        if (src.isPrimitive || src.isRepetition(Type.Repetition.REPEATED)) return null
+    ): GroupType? = (layoutOf(src, column) as? Layout.Of)?.group
+
+    /** [layoutOf]'s answer: the canonical layout, or why there is none. */
+    sealed interface Layout {
+        class Of(val group: GroupType) : Layout
+
+        class Refused(val reason: String) : Layout
+    }
+
+    /**
+     * [canonical], with the reason when there is no layout. Refused when
+     * [src] is no VARIANT group at all — a leaf, a REPEATED group, a group
+     * without the VARIANT annotation, or one without the REQUIRED BINARY
+     * `metadata` field every Variant layout holds (found by NAME: the
+     * specification fixes no order, and Spark writes `value` first) — or
+     * when any node of its subtree is one the rewrite's positional copy
+     * cannot carry WHOLE: a REPEATED node anywhere but as the single
+     * repeated group of a LIST (one child) or a MAP (a REQUIRED key and a
+     * value), the two container layers `ParquetRewriter.identityStep`
+     * walks. Every other repetition the copy would read at its first
+     * value only, and the output — right in row count, short in values —
+     * would commit. Such a shape is not another layout: there is no
+     * output it could be copied into, so it is refused as `layout`,
+     * whichever policy met it, before it can become a part's layout.
+     */
+    fun layoutOf(
+        src: Type,
+        column: Column,
+    ): Layout {
+        fun refused(detail: String) = Layout.Refused("the input field is `${describe(src)}`, $detail")
+        if (src.isPrimitive || src.isRepetition(Type.Repetition.REPEATED)) return refused("not one VARIANT group")
         val group = src.asGroupType()
         val annotation =
-            group.logicalTypeAnnotation as? LogicalTypeAnnotation.VariantLogicalTypeAnnotation ?: return null
-        val first = group.fields.firstOrNull() ?: return null
-        if (!first.isPrimitive || first.name != "metadata" || !first.isRepetition(Type.Repetition.REQUIRED) ||
-            first.asPrimitiveType().primitiveTypeName != PrimitiveTypeName.BINARY
+            group.logicalTypeAnnotation as? LogicalTypeAnnotation.VariantLogicalTypeAnnotation
+                ?: return refused("not one VARIANT group")
+        val metadata = group.fields.firstOrNull { it.name == "metadata" }
+        if (metadata == null || !metadata.isPrimitive || !metadata.isRepetition(Type.Repetition.REQUIRED) ||
+            metadata.asPrimitiveType().primitiveTypeName != PrimitiveTypeName.BINARY
         ) {
-            return null
+            return refused("not one VARIANT group: it has no REQUIRED BINARY `metadata` field")
         }
-        return Types.buildGroup(Type.Repetition.OPTIONAL)
-            .`as`(annotation)
-            .addFields(*group.fields.map(::rebuild).toTypedArray())
-            .id(Math.toIntExact(column.fieldId))
-            .named(column.def.name)
+        group.fields.forEach {
+                field ->
+            uncopyable(field, "${column.def.name}.${field.name}")?.let { return refused(it) }
+        }
+        return Layout.Of(
+            Types.buildGroup(Type.Repetition.OPTIONAL)
+                .`as`(annotation)
+                .addFields(*group.fields.map(::rebuild).toTypedArray())
+                .id(Math.toIntExact(column.fieldId))
+                .named(column.def.name),
+        )
+    }
+
+    /**
+     * Why the positional copy cannot carry [type] (at [path]) whole, or
+     * null when it can: the shapes [ParquetRewriter.identityStep] walks
+     * and nothing else. A REPEATED node is admitted only as the repeated
+     * group of a LIST (exactly one child) or a MAP (exactly two, the key
+     * REQUIRED); a group annotated LIST or MAP must hold exactly that; any
+     * other REPEATED node, leaf or group, is a value the copy would
+     * truncate to its first.
+     */
+    private fun uncopyable(
+        type: Type,
+        path: String,
+    ): String? {
+        if (type.isRepetition(Type.Repetition.REPEATED)) {
+            return "and `$path` is REPEATED outside a LIST or MAP layer, which the copy would read at its first " +
+                "value only"
+        }
+        if (type.isPrimitive) return null
+        val group = type.asGroupType()
+        val entry =
+            when (group.logicalTypeAnnotation) {
+                is LogicalTypeAnnotation.ListLogicalTypeAnnotation -> 1
+                is LogicalTypeAnnotation.MapLogicalTypeAnnotation -> 2
+                else -> null
+            }
+        if (entry == null) return group.fields.firstNotNullOfOrNull { uncopyable(it, "$path.${it.name}") }
+        val layer = group.fields.singleOrNull()
+        if (layer == null || layer.isPrimitive || !layer.isRepetition(Type.Repetition.REPEATED) ||
+            layer.asGroupType().fieldCount != entry
+        ) {
+            return "and `$path` is annotated ${group.logicalTypeAnnotation} without the one repeated group of " +
+                "$entry field(s) that encoding has"
+        }
+        val children = layer.asGroupType().fields
+        if (entry == 2 && !children[0].isRepetition(Type.Repetition.REQUIRED)) {
+            return "and `$path` is a MAP whose key is not REQUIRED"
+        }
+        return children.firstNotNullOfOrNull { uncopyable(it, "$path.${layer.name}.${it.name}") }
     }
 
     /** [layout] (a [canonical] or [groupType] group) with [repetition] on its top group and nothing else changed. */

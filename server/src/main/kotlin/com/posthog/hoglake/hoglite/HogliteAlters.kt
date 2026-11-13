@@ -67,8 +67,15 @@ internal class HogliteAlters(
                 if (ops.isEmpty()) throw HoglakeException.Validation("ops must contain at least one operation")
                 var original: Triple<Long, Long, UUID>? = null
                 for (attempt in 0..1) {
-                    val ns = store.liveNamespace(catalog, namespace)
-                    val t = store.liveTable(catalog, namespace, table)
+                    // ONE read-only transaction for the head, the namespace
+                    // and the table's version row AT that head
+                    // (HogliteCatalogStore.headTableRow): the identity and
+                    // every versioned row read at meta.head below describe one
+                    // snapshot. Read apart, a rename and a declaration change
+                    // landing between a live-row read and the head read made
+                    // the no-op receipt report the old name with the new
+                    // head's columns.
+                    val (meta, ns, t) = store.headTableRow(catalog, namespace, table)
                     val target = Triple(ns.namespaceId, t.tableId, t.tableUuid)
                     val first = original
                     if (first == null) {
@@ -81,14 +88,13 @@ internal class HogliteAlters(
                             currentTableUuid = t.tableUuid,
                         )
                     }
-                    // Head AFTER the table's fence (t.schemaVersion): the shape
-                    // below is read at meta.head, and a head read before the fence
-                    // could miss DDL the fence already includes, so the schema
-                    // guard would pass a plan made against older definitions (e.g.
-                    // set_object_prefix_field approved against a spec a concurrent
-                    // alter just replaced). Read after, DDL the fence admits is
-                    // visible at head, and any later DDL trips the fence.
-                    val meta = store.meta(catalog)
+                    // The head and the table's fence (t.schemaVersion) come from
+                    // the same snapshot: the shape below is read at meta.head,
+                    // which includes every DDL the fence counts and nothing
+                    // later, so the schema guard cannot pass a plan made against
+                    // older definitions (e.g. set_object_prefix_field approved
+                    // against a spec a concurrent alter just replaced), and any
+                    // later DDL trips the fence.
                     if (expectedTableUuid != null && t.tableUuid != expectedTableUuid) {
                         throw HoglakeException.TableRecreated(
                             "table '$namespace.$table' no longer has the expected UUID: it was " +
