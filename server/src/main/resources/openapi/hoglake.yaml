@@ -36,7 +36,7 @@ info:
     Invalid shapes, unknown routing keys, and multiple catalogs return 401
     `invalid_token`. Hoglite listings include only the routed catalog.
 
-    Hoglite supports catalog options. Other maintenance operations and publications
+    Hoglite supports catalog options and manual cleanup. Other maintenance operations and publications
     return 501 `not_supported_on_backend`.
     Engine result limits return 422 `backend_result_too_large`; query deadlines
     return 422 `backend_query_timeout`. Narrow the query before retrying.
@@ -1514,6 +1514,8 @@ paths:
         HOGLAKE_CLEANUP_WORKERS when this pod's cleanup loop is disabled,
         so a hand-triggered drain cannot take more of the connection pool
         than the pod's configuration reserved for it.
+        Hoglite runs one bounded drain for the routed catalog. It uses the server's
+        object-store configuration, with one worker and no background sweep.
       parameters:
         - { $ref: "#/components/parameters/catalog" }
         - { $ref: "#/components/parameters/maintenanceBatch" }
@@ -1524,7 +1526,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/CleanupResult" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "501": { $ref: "#/components/responses/NotSupportedOnBackend" }
+        "503": { $ref: "#/components/responses/BackendUnavailable" }
 
   /database/health:
     get:

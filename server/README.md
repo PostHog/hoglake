@@ -1008,6 +1008,14 @@ the API pods' pool connections — with RDS idle at 8% CPU the whole time.
 Shortening the sweep interval to 15 s shortens each hold and leaves the
 duty cycle where it was.
 
+Hoglite supports `POST /v1/catalogs/{catalog}/maintenance/cleanup` for the
+catalog in the token's placement. Each call drains bounded bulk and staging
+queues, then purges old run records, receipts, and drained removals.
+The drain checks live and historical file references and active uploads.
+It uses the server's object-store configuration, as PostgreSQL cleanup does.
+Per-call AWS identity remains separate work. Hoglite has no cleanup loop,
+catalog registry, or loop lease.
+
 Physical deletion is decoupled and paranoid
 (`service/CleanupService.kt`): the queue is a *suggestion*. At drain
 time every path is re-checked against live references — a

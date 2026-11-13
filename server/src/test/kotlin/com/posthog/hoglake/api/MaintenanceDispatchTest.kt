@@ -63,7 +63,6 @@ class MaintenanceDispatchTest {
         val probes =
             listOf(
                 HttpMethod.Post to "/maintenance/expire?batch=bad",
-                HttpMethod.Post to "/maintenance/cleanup?batch=bad",
                 HttpMethod.Post to "/maintenance/compact?batch=bad",
                 HttpMethod.Post to "/maintenance/rehydrate?namespace=ns",
                 HttpMethod.Get to "/maintenance/status",
@@ -91,6 +90,18 @@ class MaintenanceDispatchTest {
                         assertThat(response.headers[HttpHeaders.RetryAfter]).isNull()
                     }
                 }
+                val malformedCleanup =
+                    client.request("/v1/catalogs/lake/maintenance/cleanup?batch=bad") {
+                        method = HttpMethod.Post
+                        header(HttpHeaders.Authorization, "Bearer $token")
+                    }
+                assertThat(malformedCleanup.status).isEqualTo(HttpStatusCode.BadRequest)
+                val otherCleanup =
+                    client.request("/v1/catalogs/other/maintenance/cleanup?batch=bad") {
+                        method = HttpMethod.Post
+                        header(HttpHeaders.Authorization, "Bearer $token")
+                    }
+                assertThat(otherCleanup.status).isEqualTo(HttpStatusCode.NotFound)
                 val malformedOptions =
                     client.request("/v1/catalogs/lake/options") {
                         method = HttpMethod.Patch
