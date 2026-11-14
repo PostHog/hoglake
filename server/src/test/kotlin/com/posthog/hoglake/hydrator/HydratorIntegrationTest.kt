@@ -1,5 +1,9 @@
 package com.posthog.hoglake.hydrator
 
+import ch.qos.logback.classic.Level
+import ch.qos.logback.classic.Logger
+import ch.qos.logback.classic.spi.ILoggingEvent
+import ch.qos.logback.core.read.ListAppender
 import com.posthog.hoglake.commit.CommitService
 import com.posthog.hoglake.model.AlterOp
 import com.posthog.hoglake.model.ColType
@@ -9,6 +13,7 @@ import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.TableAppend
 import com.posthog.hoglake.observability.CatalogMetrics
+import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.persistence.getBigintListOrNull
 import com.posthog.hoglake.service.AlterService
 import com.posthog.hoglake.service.CatalogService
@@ -17,6 +22,8 @@ import com.posthog.hoglake.testing.PgTestSupport
 import com.posthog.hoglake.testing.TestImages
 import com.posthog.hoglake.testing.ThriftRowGroupStarts
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry
+import io.micrometer.prometheusmetrics.PrometheusConfig
+import io.micrometer.prometheusmetrics.PrometheusMeterRegistry
 import org.apache.parquet.example.data.simple.SimpleGroupFactory
 import org.apache.parquet.hadoop.example.ExampleParquetWriter
 import org.apache.parquet.hadoop.metadata.CompressionCodecName
@@ -30,6 +37,7 @@ import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.awaitility.Awaitility.await
 import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
+import org.slf4j.LoggerFactory
 import org.testcontainers.containers.MinIOContainer
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -465,6 +473,122 @@ class HydratorIntegrationTest {
             }
         }
     }
+
+    /**
+     * MUTATION: increment `hoglake_stats_hydrated_total` or log the per-file
+     * WARN/ERROR inside the sweep transaction, before commit, and the
+     * rolled-back half goes red — the deferred trigger undoes the flip and
+     * the file stays pending (#488). Skipping the post-commit emit makes
+     * the committed half red.
+     */
+    @Test
+    fun `a rolled-back sweep does not count or log files that stayed pending`() {
+        val registry = PrometheusMeterRegistry(PrometheusConfig.DEFAULT)
+        Metrics.bind(registry)
+        val capture = ListAppender<ILoggingEvent>().apply { start() }
+        val logger = LoggerFactory.getLogger(Hydrator::class.java) as Logger
+        logger.addAppender(capture)
+        try {
+            val providedId = seedCatalogAndTable()
+            val providedPath = "s3://$BUCKET/rollback-metrics-provided.parquet"
+            store.put(providedPath, parquetBytes)
+            seedDataFile(providedId, 1, providedPath, ROWS.toLong(), parquetBytes.size.toLong(), footerSize)
+            installDeferredReject("rollback-metrics-provided", "provided")
+            try {
+                assertThatThrownBy { hydrator.runOnce() }
+                    .rootCause().hasMessageContaining("rollback-metrics-provided")
+                assertThat(statsState(providedId, 1)).isEqualTo("pending")
+                assertThat(hydratedCount(registry, "provided")).isZero()
+                assertThat(hydratedCount(registry, "failed")).isZero()
+                assertThat(hydratedCount(registry, "quarantined")).isZero()
+                assertThat(outcomeLines(capture)).isEmpty()
+            } finally {
+                dropDeferredReject()
+            }
+
+            capture.list.clear()
+            assertThat(hydrator.runOnce()).isEqualTo(1)
+            assertThat(statsState(providedId, 1)).isEqualTo("provided")
+            assertThat(hydratedCount(registry, "provided")).isEqualTo(1.0)
+            assertThat(outcomeLines(capture)).isEmpty()
+
+            val failedId = seedCatalogAndTable()
+            val failedPath = "s3://$BUCKET/rollback-metrics-failed.parquet"
+            store.put(failedPath, parquetBytes)
+            // Registration lies about the row count, so the sweep marks the file failed.
+            seedDataFile(failedId, 1, failedPath, ROWS + 1L, parquetBytes.size.toLong(), null)
+            capture.list.clear()
+            installDeferredReject("rollback-metrics-failed", "failed")
+            try {
+                assertThatThrownBy { hydrator.runOnce() }
+                    .rootCause().hasMessageContaining("rollback-metrics-failed")
+                assertThat(statsState(failedId, 1)).isEqualTo("pending")
+                assertThat(hydratedCount(registry, "failed")).isZero()
+                assertThat(outcomeLines(capture)).isEmpty()
+            } finally {
+                dropDeferredReject()
+            }
+
+            capture.list.clear()
+            assertThat(hydrator.runOnce()).isEqualTo(1)
+            assertThat(statsState(failedId, 1)).isEqualTo("failed")
+            assertThat(hydratedCount(registry, "failed")).isEqualTo(1.0)
+            assertThat(outcomeLines(capture).joinToString("\n") { it.formattedMessage })
+                .contains("REGISTRATION MISMATCH")
+        } finally {
+            capture.stop()
+            logger.detachAppender(capture)
+            Metrics.clear()
+            dropDeferredReject()
+        }
+    }
+
+    /**
+     * Deferred constraint trigger: the named flip commits as a ROLLBACK.
+     * [pathFragment] and [statsState] are fixed literals from this class.
+     */
+    private fun installDeferredReject(
+        pathFragment: String,
+        statsState: String,
+    ) {
+        val fragment = pathFragment.replace("'", "")
+        val state = statsState.replace("'", "")
+        jdbi.useHandle<Exception> { h ->
+            h.execute(
+                """
+                CREATE FUNCTION reject_hydration_commit() RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN
+                    IF NEW.path LIKE '%/$fragment%' AND NEW.stats_state = '$state' THEN
+                        RAISE EXCEPTION '$fragment';
+                    END IF;
+                    RETURN NULL;
+                END $$
+                """,
+            )
+            h.execute(
+                """
+                CREATE CONSTRAINT TRIGGER reject_hydration_commit
+                AFTER UPDATE ON hog_data_file DEFERRABLE INITIALLY DEFERRED
+                FOR EACH ROW EXECUTE FUNCTION reject_hydration_commit()
+                """,
+            )
+        }
+    }
+
+    private fun dropDeferredReject() {
+        jdbi.useHandle<Exception> { h ->
+            h.execute("DROP TRIGGER IF EXISTS reject_hydration_commit ON hog_data_file")
+            h.execute("DROP FUNCTION IF EXISTS reject_hydration_commit()")
+        }
+    }
+
+    private fun hydratedCount(
+        registry: PrometheusMeterRegistry,
+        result: String,
+    ): Double = registry.find("hoglake_stats_hydrated_total").tags("result", result).counter()?.count() ?: 0.0
+
+    private fun outcomeLines(capture: ListAppender<ILoggingEvent>): List<ILoggingEvent> =
+        capture.list.filter { it.level == Level.WARN || it.level == Level.ERROR }
 
     @Test
     fun `a missing object fails without wedging the next file`() {
