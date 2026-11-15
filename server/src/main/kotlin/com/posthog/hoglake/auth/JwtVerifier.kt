@@ -432,6 +432,10 @@ class JwtVerifier(
     }
 
     private fun toCaller(claims: JsonNode): Caller {
+        // The session profile's gate runs before any other claim rule, so a
+        // token carrying the profile where it is off is refused for THAT
+        // reason, never for whatever the ordinary contract notices first.
+        SessionProfile.refuseIfDisabled(claims, sessionProfile)
         val subject = Jwt.text(claims, "sub")
         val tokenId = Jwt.text(claims, "jti")
         // An absent `ten` means `tenant`, so an issuer with one kind of token
@@ -443,7 +447,7 @@ class JwtVerifier(
 
         // The profile is checked for EVERY kind, operator included, so an
         // operator token carrying credentials is refused rather than ignored.
-        if (kindText == "operator") SessionProfile.validate(claims, sessionProfile, kindText, emptyMap())
+        if (kindText == "operator") SessionProfile.validate(claims, sessionProfile, kindText)
 
         return when (kindText) {
             "operator" ->
@@ -474,7 +478,7 @@ class JwtVerifier(
                         kind = "tenant",
                     )
                 val delegates = delegates(claims)
-                val profile = SessionProfile.validate(claims, sessionProfile, kindText, scopes)
+                val profile = SessionProfile.validate(claims, sessionProfile, kindText)
                 Caller(
                     subject = subject,
                     orgId = orgId,
@@ -716,7 +720,7 @@ class JwtVerifier(
                             "claim 'usr' is not a non-blank string of at most $MAX_USER_LENGTH characters",
                         )
             }
-        val profile = SessionProfile.validate(claims, sessionProfile, "scoped", scopes)
+        val profile = SessionProfile.validate(claims, sessionProfile, "scoped")
         return Caller(
             subject = subject,
             orgId = orgId,

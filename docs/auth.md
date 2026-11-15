@@ -201,8 +201,8 @@ it must carry all of the following, or it is refused (`invalid_token`):
 | `profile` | the marker that selects this parser: exactly `storage-session`. A credential object without it is a token nobody declared the meaning of |
 | `version` | exactly `1`; an unknown version is refused, never parsed as the one the server knows |
 | `purpose` | exactly `user-session`; this profile is for a caller's own work, so an `operator` token may not carry it |
-| `primary_catalog` | the one catalog the session is about; it must be the single key of `cat`. A routed token (`rtg`) routes only this catalog |
-| `remote_schemas` | optional: `{"<schema>": ["read"], …}`, at most 16, names valid identifiers. The read-only schemas of the primary catalog this session may use, served from another hoglake deployment that verifies the same token. Read-only by construction: any other word, or an empty list, refuses the token |
+| `primary_catalog` | the one catalog the session is about; it must be the single key of the `cat` object as written — a second `cat` entry refuses the token even when a plain tenant token would have dropped its unknown scope words, and the `scope` spelling alone does not carry the profile. A routed token (`rtg`) routes only this catalog |
+| `remote_schemas` | optional: `{"<schema>": ["read"], …}`, at most 16, names valid identifiers. The read-only schemas of the primary catalog this session may use, served from another hoglake deployment that verifies the same token. Read-only by construction and parsed strictly: any other word, a non-string entry, a non-array value or an empty list refuses the token; nothing is dropped |
 | `aws` | the credential bundle: non-empty strings `access_key_id`, `secret_access_key`, `session_token`, `region`, and integer `expires_at`. The token may not outlive its credentials: `exp ≤ aws.expires_at` |
 | `sid`, `generation`, `session_deadline`, `grants` | optional, for the engine that refreshes the session: a non-empty string, a positive integer, integer seconds with `aws.expires_at ≤ session_deadline`, and an array. The server checks their types and the ordering, nothing more |
 
@@ -213,7 +213,8 @@ wants a distinct audience for session tokens sets `HOGLAKE_AUTH_AUDIENCE`
 accordingly; the verifier does not special-case one.
 
 With the profile `off`, a token carrying any of its claims is refused as
-`profile_not_enabled` — never accepted as a plain metadata token, because an
+`profile_not_enabled`, and that check runs before every other claim rule so
+the reason is never shadowed — never accepted as a plain metadata token, because an
 older or unconfigured hoglake granting on a token whose other half it does
 not understand is the same widening the strict `prd` rule exists to prevent.
 `hoglake_auth_session_profile_total{outcome}` counts `accepted`,

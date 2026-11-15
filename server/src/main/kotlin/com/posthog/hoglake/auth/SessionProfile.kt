@@ -39,29 +39,43 @@ internal object SessionProfile {
         val remoteSchemas: Set<String>,
     )
 
+    /** Does [claims] carry any of the profile's claims? Any one of them selects this parser. */
+    fun carried(claims: JsonNode): Boolean =
+        claims.has("profile") || claims.has("aws") || claims.has("primary_catalog") || claims.has("remote_schemas")
+
+    /**
+     * The gate, run BEFORE the ordinary contract's rules: a token carrying the
+     * profile where it is off is refused as [JwtViolation.PROFILE_NOT_ENABLED],
+     * and no other rule gets to name a different reason first. The reason and
+     * the metric are what tell an operator a rollout gap from a bad issuer.
+     */
+    fun refuseIfDisabled(
+        claims: JsonNode,
+        enabled: Boolean,
+    ) {
+        if (enabled || !carried(claims)) return
+        Metrics.authSessionProfile("refused_disabled")
+        throw JwtViolation(
+            JwtViolation.PROFILE_NOT_ENABLED,
+            "this instance does not accept the session profile (HOGLAKE_AUTH_SESSION_PROFILE=off)",
+        )
+    }
+
     /**
      * Validate the profile claims of [claims], or return null when the token
-     * carries none. [enabled] is the gate; [kindText] is `ten` as spelled (null
-     * when absent); [catalogs] is the token's `cat`, already parsed.
+     * carries none. [enabled] is the gate ([refuseIfDisabled] has normally run
+     * already; it is re-checked here so no path can skip it); [kindText] is
+     * `ten` as spelled (null when absent).
      */
     fun validate(
         claims: JsonNode,
         enabled: Boolean,
         kindText: String?,
-        catalogs: Map<String, Set<Scope>>,
     ): Grant? {
+        if (!carried(claims)) return null
+        refuseIfDisabled(claims, enabled)
         val marker = claims.get("profile")
         val credentials = claims.get("aws")
-        if (marker == null && credentials == null && !claims.has("primary_catalog") && !claims.has("remote_schemas")) {
-            return null
-        }
-        if (!enabled) {
-            Metrics.authSessionProfile("refused_disabled")
-            throw JwtViolation(
-                JwtViolation.PROFILE_NOT_ENABLED,
-                "this instance does not accept the session profile (HOGLAKE_AUTH_SESSION_PROFILE=off)",
-            )
-        }
 
         fun malformed(detail: String): Nothing {
             Metrics.authSessionProfile("refused_invalid")
@@ -86,10 +100,18 @@ internal object SessionProfile {
         }
         if (kindText == "operator") malformed("an operator token may not carry the session profile")
 
-        // One primary catalog, and it is the one the metadata grants name.
+        // One primary catalog, and it is the single key of the RAW `cat`
+        // object: not of the parsed grants, which drop a catalog whose scope
+        // words the server does not know — a second `cat` key the issuer
+        // meant something by must refuse, not vanish. The `scope` spelling
+        // alone does not carry the profile.
         val primary = claims.get("primary_catalog")
         if (primary == null || !primary.isTextual) malformed("the session profile requires a string 'primary_catalog'")
-        if (catalogs.keys != setOf(primary.asText())) {
+        val cat = claims.get("cat")
+        if (cat == null || !cat.isObject || cat.size() != 1) {
+            malformed("the session profile requires 'cat' to be an object naming exactly one catalog")
+        }
+        if (cat.fieldNames().next() != primary.asText()) {
             malformed("'primary_catalog' must be the single catalog 'cat' names")
         }
 
@@ -105,9 +127,14 @@ internal object SessionProfile {
             }
             node.properties().forEach { (name, scopes) ->
                 if (!SCHEMA_NAME.matches(name)) malformed("remote_schemas names an invalid schema")
-                val words = scopes.takeIf { it.isArray }?.mapNotNull { it.takeIf(JsonNode::isTextual)?.asText() }
-                if (words == null || words.isEmpty() || words.any { it != Scope.READ.wire }) {
-                    malformed("remote_schemas['$name'] may grant only [\"read\"]")
+                // Strict, like a scoped token's cat: a non-array, an empty
+                // array, a non-string entry or any word but read refuses the
+                // token. Nothing is dropped on the way to a grant.
+                if (!scopes.isArray || scopes.isEmpty) malformed("remote_schemas['$name'] must be a non-empty array")
+                scopes.forEach { word ->
+                    if (!word.isTextual || word.asText() != Scope.READ.wire) {
+                        malformed("remote_schemas['$name'] may grant only [\"read\"]")
+                    }
                 }
                 remote.add(name)
             }

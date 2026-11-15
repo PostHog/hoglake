@@ -1,7 +1,11 @@
 package com.posthog.hoglake.auth
 
+import com.posthog.hoglake.observability.Metrics
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
+import org.junit.jupiter.api.AfterEach
+import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 
 /**
@@ -11,6 +15,21 @@ import org.junit.jupiter.api.Test
 class SessionProfileTest {
     private val pair = TestTokens.keyPair()
     private val keys = StaticSigningKeys(TestTokens.KID, pair.public)
+    private val registry = SimpleMeterRegistry()
+
+    @BeforeEach
+    fun bind() = Metrics.bind(registry)
+
+    @AfterEach
+    fun unbind() = Metrics.clear()
+
+    private fun outcomes(outcome: String): Double =
+        registry.find("hoglake_auth_session_profile_total").tag("outcome", outcome).counter()?.count() ?: 0.0
+
+    /** A minimal tenant claim set with [body] spliced in before the closing brace. */
+    private fun bare(body: String): String =
+        """{"iss":"${TestTokens.ISSUER}","aud":"${TestTokens.AUDIENCE}","sub":"client:x","jti":"j","ten":"tenant",""" +
+            """"org":"o","iat":1700000000,"exp":1700000900,$body}"""
 
     private fun verifier(on: Boolean) =
         JwtVerifier(
@@ -58,6 +77,55 @@ class SessionProfileTest {
             profiled(extra = """"primary_catalog":"lake"""", marker = ""),
             on = false,
             reason = JwtViolation.PROFILE_NOT_ENABLED,
+        )
+    }
+
+    @Test
+    fun `the gate runs before every other claim rule, so its reason is never shadowed`() {
+        // A token missing cat AND carrying the profile, off: the ordinary
+        // contract would say missing_claim; the gate speaks first.
+        refusedWith(TestTokens.mint(pair, bare(aws)), on = false, reason = JwtViolation.PROFILE_NOT_ENABLED)
+        // ... and a scoped token with a malformed prd, likewise.
+        val badPrd = TestTokens.scopedClaims(prd = "\"nope\"", extra = ",$aws")
+        refusedWith(TestTokens.mint(pair, badPrd), on = false, reason = JwtViolation.PROFILE_NOT_ENABLED)
+    }
+
+    @Test
+    fun `each outcome is counted once per token under its own label`() {
+        verifier(true).verify(profiled())
+        assertThat(outcomes("accepted")).isEqualTo(1.0)
+        refusedWith(profiled(), on = false, reason = JwtViolation.PROFILE_NOT_ENABLED)
+        assertThat(outcomes("refused_disabled")).isEqualTo(1.0)
+        refusedWith(profiled(marker = marker(2)), on = true, reason = JwtViolation.MALFORMED)
+        assertThat(outcomes("refused_invalid")).isEqualTo(1.0)
+        // A plain token touches none of them.
+        verifier(true).verify(TestTokens.mint(pair, TestTokens.tenantClaims()))
+        assertThat(outcomes("accepted") + outcomes("refused_disabled") + outcomes("refused_invalid")).isEqualTo(3.0)
+    }
+
+    @Test
+    fun `primary_catalog is checked against cat as written, not as parsed`() {
+        // A second cat entry with only an unknown scope word: a plain tenant
+        // token drops it, so the parsed grants name one catalog — but the
+        // issuer meant something by it, and the profile refuses it.
+        val twoCats = """"cat":{"lake":["read"],"other":["bogus"]},${marker()},$aws,"primary_catalog":"lake""""
+        refusedWith(TestTokens.mint(pair, bare(twoCats)), on = true, reason = JwtViolation.MALFORMED)
+        // Grants spelled only in `scope` carry no profile either.
+        val scopeOnly = """"scope":"hoglake:lake:read",${marker()},$aws,"primary_catalog":"lake""""
+        refusedWith(TestTokens.mint(pair, bare(scopeOnly)), on = true, reason = JwtViolation.MALFORMED)
+    }
+
+    @Test
+    fun `remote schema scopes are parsed strictly, nothing dropped`() {
+        refusedWith(
+            profiled(extra = """$aws,"primary_catalog":"lake","remote_schemas":{"shared":["read",42]}"""),
+            on = true,
+            reason = JwtViolation.MALFORMED,
+        )
+        refusedWith(
+            profiled(extra = """$aws,"primary_catalog":"lake","remote_schemas":{"shared":"read"}"""),
+            on = true,
+            reason = JwtViolation.MALFORMED,
         )
     }
 

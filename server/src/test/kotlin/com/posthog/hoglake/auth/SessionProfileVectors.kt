@@ -197,6 +197,51 @@ object SessionProfileVectors {
                 body = profileBody(tenantBody, primaryCatalog = "another-catalog"),
             ),
             ContractVectors.Spec(
+                "session_remote_schema_non_text",
+                "A remote schema whose scope array holds a non-string entry: refused, never read as [\"read\"] " +
+                    "with the entry dropped.",
+                "client",
+                readerInput(),
+                109,
+                ContractVectors.refuse(JwtViolation.MALFORMED),
+                mutation = "$added; remote_schemas.shared is [\"read\", 42]",
+                body =
+                    profileBody(
+                        tenantBody,
+                        remote =
+                            mapper.createObjectNode().apply {
+                                putArray("shared").apply {
+                                    add("read")
+                                    add(42)
+                                }
+                            },
+                    ),
+            ),
+            ContractVectors.Spec(
+                "session_second_cat_entry",
+                "cat names a second catalog with only an unknown scope word, which a plain tenant token would " +
+                    "drop: with the profile, primary_catalog must be the single key of cat as written, so refused.",
+                "client",
+                readerInput(),
+                110,
+                ContractVectors.refuse(JwtViolation.MALFORMED),
+                mutation = "$added; cat gains a second entry {\"another-catalog\": [\"bogus\"]}",
+                body =
+                    profileBody(
+                        tenantBody.map { (k, v) ->
+                            if (k == "cat") {
+                                k to
+                                    mapper.createObjectNode().apply {
+                                        putArray(org).add("read")
+                                        putArray("another-catalog").add("bogus")
+                                    }
+                            } else {
+                                k to v
+                            }
+                        },
+                    ),
+            ),
+            ContractVectors.Spec(
                 "session_bundle_without_marker",
                 "A credential object without the profile marker: a token nobody declared the meaning of, refused.",
                 "client",
