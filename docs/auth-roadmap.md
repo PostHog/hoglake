@@ -122,11 +122,11 @@ specs carry the burndown for the PostHog-specific pieces — a single stateless
 token that carries the caller's storage session, and Remote Schemas replacing
 mounts — so this list keeps only what hoglake owns and what has no other home.
 
-- [ ] **hoglake** Session profile with embedded storage credentials: the
+- [x] **hoglake** Session profile with embedded storage credentials: the
       contract section, the verifier gate (`off` refuses any token carrying a
       storage session) and the vectors, so an issuer that mints such tokens
       conforms to hoglake's contract rather than defining it — the design is
-      PostHog/hogtower `docs/jwt-aws-session-design.md`
+      PostHog/hogtower `docs/jwt-aws-session-design.md` — [#622](https://github.com/PostHog/hoglake/pull/622)
 - [ ] **hoglake** Remote Schemas: a read-only namespace in one catalog served
       by forwarding the caller's verified token to another hoglake deployment
       (`docs/remote_schema.md` D3/D4; this is what the mount feature becomes)

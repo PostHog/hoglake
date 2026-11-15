@@ -59,6 +59,15 @@ class JwtViolation(
          * scoped tokens at all.
          */
         const val INVALID_PREDICATE = "invalid_predicate"
+
+        /**
+         * The token carries the session profile (a `profile` marker, a
+         * credential object, or the profile's other claims) and this instance
+         * is not configured to accept it (`HOGLAKE_AUTH_SESSION_PROFILE=off`).
+         * Distinct from [MALFORMED] so an operator can tell a rollout gap from
+         * a bad issuer.
+         */
+        const val PROFILE_NOT_ENABLED = "profile_not_enabled"
     }
 }
 
