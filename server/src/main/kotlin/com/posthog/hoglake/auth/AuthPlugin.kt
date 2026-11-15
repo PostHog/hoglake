@@ -114,6 +114,7 @@ class AuthService(
                         backends = cfg.backendKinds,
                         predicateFields =
                             cfg.authPredicateFields.split(',').map { it.trim() }.filter { it.isNotEmpty() }.toSet(),
+                        sessionProfile = cfg.authSessionProfileEnabled,
                     ),
             )
         }
@@ -151,6 +152,7 @@ class AuthService(
                         backends = cfg.backendKinds,
                         predicateFields =
                             cfg.authPredicateFields.split(',').map { it.trim() }.filter { it.isNotEmpty() }.toSet(),
+                        sessionProfile = cfg.authSessionProfileEnabled,
                     ),
             )
         }

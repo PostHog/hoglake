@@ -380,6 +380,14 @@ data class Config(
      */
     val authClientClasses: Set<String> = nameList(env("HOGLAKE_AUTH_CLIENT_CLASSES", "")),
     /**
+     * Whether the verifier accepts tokens carrying the session profile
+     * (docs/auth.md, "Session profile with embedded storage credentials"):
+     * `off` (the default) refuses them with `profile_not_enabled`; `on`
+     * validates the profile and records its read-only remote schemas. hoglake
+     * never uses the credentials such a token carries.
+     */
+    val authSessionProfile: String = env("HOGLAKE_AUTH_SESSION_PROFILE", "off"),
+    /**
      * The server's own ES256 signing key, for `HOGLAKE_AUTH_MODE=local` only
      * (docs/auth.md, "Local issuer"): a private P-256 JWK, base64url, as
      * `hoglake token keygen` prints it. ENV-ONLY by decision — no key file and
@@ -1454,6 +1462,9 @@ data class Config(
 ) {
     val hogliteBackends: Map<UUID, HogliteBackend> = readBackends(backendsFile)
 
+    /** [authSessionProfile] resolved: true for `on`. */
+    val authSessionProfileEnabled: Boolean = authSessionProfile.trim().lowercase() == "on"
+
     val backendKinds: Map<UUID, BackendKind> =
         hogliteBackends.keys.associateWith { BackendKind.HOGLITE } +
             if (postgresBackendId.isEmpty()) {
@@ -1552,6 +1563,9 @@ data class Config(
         ) {
             "HOGLAKE_AUTH_CLIENT_CLASSES takes at most $MAX_AUTH_CLIENT_CLASSES lowercase User-Agent product " +
                 "tokens ([a-z][a-z0-9._-]{0,31}, not 'none' or 'other'), got $authClientClasses"
+        }
+        require(authSessionProfile.trim().lowercase() in setOf("off", "on")) {
+            "HOGLAKE_AUTH_SESSION_PROFILE must be off or on, got '$authSessionProfile'"
         }
         require(authScopedMaxLifetimeSeconds > 0) {
             "HOGLAKE_AUTH_SCOPED_MAX_LIFETIME_SECONDS must be positive, got $authScopedMaxLifetimeSeconds"

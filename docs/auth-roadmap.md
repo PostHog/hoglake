@@ -132,3 +132,9 @@ means the PR has review approval and is waiting on CI or a merge.
       `enforce` in dev; the Trino token URL everywhere; the customer hoglake
       service in prod; prod from `off` to `warn` to `enforce` once millpond,
       millrace and the webui authenticate
+- [x] **hoglake** Session profile with embedded storage credentials
+      (`profile`/`version`/`purpose`, `primary_catalog`, read-only
+      `remote_schemas`, the `aws` bundle; `HOGLAKE_AUTH_SESSION_PROFILE`, off
+      by default; `session-profile-vectors.json`): hoglake owns the contract
+      the issuer's proposal conforms to — this PR. Routing to remote schemas
+      and any issuer minting it are not part of it

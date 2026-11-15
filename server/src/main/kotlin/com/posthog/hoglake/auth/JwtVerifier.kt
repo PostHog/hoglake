@@ -316,6 +316,13 @@ class JwtVerifier(
      * (`HOGLAKE_AUTH_SCOPED_MAX_LIFETIME_SECONDS`).
      */
     private val scopedMaxLifetimeSeconds: Long = DEFAULT_SCOPED_MAX_LIFETIME_SECONDS,
+    /**
+     * Whether tokens carrying the session profile (docs/auth.md, "Session
+     * profile with embedded storage credentials") are accepted
+     * (`HOGLAKE_AUTH_SESSION_PROFILE`). Off, such a token is refused with
+     * `profile_not_enabled`, never read as a plain metadata token.
+     */
+    private val sessionProfile: Boolean = false,
     private val clock: () -> Long = { System.currentTimeMillis() / 1000 },
 ) {
     init {
@@ -434,6 +441,10 @@ class JwtVerifier(
         val clientName = Jwt.textOrNull(claims, "cli")
         val routing = routing(claims)
 
+        // The profile is checked for EVERY kind, operator included, so an
+        // operator token carrying credentials is refused rather than ignored.
+        if (kindText == "operator") SessionProfile.validate(claims, sessionProfile, kindText, emptyMap())
+
         return when (kindText) {
             "operator" ->
                 Caller(
@@ -463,6 +474,7 @@ class JwtVerifier(
                         kind = "tenant",
                     )
                 val delegates = delegates(claims)
+                val profile = SessionProfile.validate(claims, sessionProfile, kindText, scopes)
                 Caller(
                     subject = subject,
                     orgId = orgId,
@@ -472,6 +484,7 @@ class JwtVerifier(
                     clientName = clientName,
                     delegates = delegates,
                     routing = routing,
+                    remoteSchemas = profile?.remoteSchemas ?: emptySet(),
                 )
             }
 
@@ -703,6 +716,7 @@ class JwtVerifier(
                             "claim 'usr' is not a non-blank string of at most $MAX_USER_LENGTH characters",
                         )
             }
+        val profile = SessionProfile.validate(claims, sessionProfile, "scoped", scopes)
         return Caller(
             subject = subject,
             orgId = orgId,
@@ -714,6 +728,7 @@ class JwtVerifier(
             predicates = predicates(claims.get("prd")),
             user = user,
             routing = routing,
+            remoteSchemas = profile?.remoteSchemas ?: emptySet(),
         )
     }
 

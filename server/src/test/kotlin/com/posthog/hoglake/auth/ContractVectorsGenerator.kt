@@ -6,7 +6,8 @@ import java.nio.file.Files
 import java.nio.file.Path
 
 /**
- * Regenerates `oauth/contract-vectors.json` from [ContractVectors].
+ * Regenerates `oauth/contract-vectors.json` from [ContractVectors] and
+ * `oauth/session-profile-vectors.json` from [SessionProfileVectors].
  *
  * Skipped unless `-Dhoglake.updateContractVectors=true`, which
  * `just server contract-vectors` passes (through Gradle's
@@ -22,5 +23,7 @@ class ContractVectorsGenerator {
             "run from the server project directory: ${path.toAbsolutePath().parent} does not exist"
         }
         Files.writeString(path, ContractVectors.render(ContractVectors.document()))
+        // The session profile's vectors live beside the contract's, same shape, own gate.
+        Files.writeString(Path.of(SessionProfileVectors.PATH), ContractVectors.render(SessionProfileVectors.document()))
     }
 }
