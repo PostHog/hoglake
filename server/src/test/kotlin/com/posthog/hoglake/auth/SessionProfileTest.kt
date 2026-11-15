@@ -35,7 +35,8 @@ class SessionProfileTest {
         exp: Long = 1_700_000_900L,
     ): String {
         val base = TestTokens.tenantClaims(catalogs = mapOf("lake" to listOf("read")), exp = exp)
-        val claims = base.removeSuffix("}") + "," + listOf(marker, extra).filter { it.isNotEmpty() }.joinToString(",") + "}"
+        val tail = listOf(marker, extra).filter { it.isNotEmpty() }.joinToString(",")
+        val claims = base.removeSuffix("}") + "," + tail + "}"
         return TestTokens.mint(pair, claims)
     }
 

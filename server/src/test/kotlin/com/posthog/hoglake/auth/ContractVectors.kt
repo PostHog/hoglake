@@ -520,7 +520,8 @@ object ContractVectors {
                 tenantInput(reader, "pyhoglake-reader", "read", false),
                 13,
                 refuse(JwtViolation.PROFILE_NOT_ENABLED),
-                mutation = "profile, version, purpose, primary_catalog, remote_schemas and a fictional aws object are added",
+                mutation =
+                    "profile, version, purpose, primary_catalog, remote_schemas and a fictional aws object are added",
                 body =
                     SessionProfileVectors.profileBody(
                         listOf(
