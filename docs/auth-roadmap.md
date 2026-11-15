@@ -134,7 +134,7 @@ mounts — so this list keeps only what hoglake owns and what has no other home.
 - [ ] **charts** `HOGLAKE_STORAGE_PROVIDER=broker` and its settings on
       PostHog's hoglake deployments — hogtower side live in dev
       ([PostHog/hogtower#201](https://github.com/PostHog/hogtower/pull/201),
-      [#202](https://github.com/PostHog/hogtower/pull/202)); the hoglake values
+      [PostHog/hogtower#202](https://github.com/PostHog/hogtower/pull/202)); the hoglake values
       and the backend credential remain
 - [ ] **charts**, **hogtower** Rollout: the shared hoglake from `warn` to
       `enforce` in dev; the Trino token URL everywhere; the customer hoglake
