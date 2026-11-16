@@ -948,6 +948,15 @@ object Metrics {
     ) = increment("hoglake_auth_denials_total", 1.0, "catalog", catalog, "scope", scope, "reason", reason)
 
     /**
+     * hoglake_auth_session_profile_total{outcome}: tokens carrying the session
+     * profile (auth/SessionProfile.kt), by what became of them — `accepted`,
+     * `refused_disabled` (the profile is off here: a rollout gap, not a bad
+     * issuer) or `refused_invalid`. A closed set; nothing from the token is a
+     * label.
+     */
+    fun authSessionProfile(outcome: String) = increment("hoglake_auth_session_profile_total", 1.0, "outcome", outcome)
+
+    /**
      * hoglake_mount_refusals_total{catalog,reason}: requests refused on a
      * mount (store/Mounts.kt), by the error code they were answered with.
      * `catalog` is only a name the registry holds (`<orgID>-events`) or, on a
@@ -1176,6 +1185,7 @@ object Metrics {
             // would be indistinguishable from having no arm at all.
             is HoglakeException.DdlSinceReadSnapshot -> "ddl_since_read_snapshot"
             is HoglakeException.TableRecreated -> "table_recreated"
+            is HoglakeException.PartitionSpecMismatch -> "partition_spec_mismatch"
             is HoglakeException.CommitConflict -> "conflict"
             is HoglakeException.Validation -> "validation"
             // Distinct, so "which writers still miss the object-prefix
