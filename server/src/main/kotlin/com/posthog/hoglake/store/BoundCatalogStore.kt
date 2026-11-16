@@ -274,6 +274,7 @@ internal class BoundCatalogStore(
         grant.open(catalog)
         for (append in request.appends) grant.write(catalog, append.namespace)
         for (delete in request.deletes) grant.write(catalog, delete.namespace)
+        for (ends in request.fileEnds.orEmpty()) grant.write(catalog, ends.namespace)
         return inner.commit(catalog, request, userAgent)
     }
 

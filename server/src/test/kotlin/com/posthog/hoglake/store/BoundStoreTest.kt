@@ -13,6 +13,7 @@ import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.NamespaceContainment
 import com.posthog.hoglake.model.TableAppend
 import com.posthog.hoglake.model.TableDeletes
+import com.posthog.hoglake.model.TableFileEnds
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.service.AlterBackend
 import com.posthog.hoglake.service.PartitionStatsBackend
@@ -484,19 +485,30 @@ class BoundStoreTest {
         fun append(namespace: String) = TableAppend(namespace, "t", emptyList())
 
         fun delete(namespace: String) = TableDeletes(namespace, "t", emptyList())
+
+        fun ends(namespace: String) = TableFileEnds(namespace, "t", UUID(0, 2), allFiles = true)
         request(AuthMode.ENFORCE, scoped(), stores) { views ->
             val store = views.view<CatalogStore>()
-            store.commit("alpha", CommitRequest(appends = listOf(append("mine")), deletes = listOf(delete("mine"))))
-            // MUTATION: check the appends only, or the first namespace only, and these two commit.
+            val own = listOf(append("mine"))
+            val mine = CommitRequest(appends = own, deletes = listOf(delete("mine")), fileEnds = listOf(ends("mine")))
+            store.commit("alpha", mine)
+            // MUTATION: check the appends only, the first namespace only, or not the
+            // tables whose files a replacement ends, and one of these commits.
             for (request in listOf(
-                CommitRequest(appends = listOf(append("mine")), deletes = listOf(delete("theirs"))),
+                CommitRequest(appends = own, deletes = listOf(delete("theirs"))),
                 CommitRequest(appends = listOf(append("mine"), append("shared"))),
+                CommitRequest(appends = own, fileEnds = listOf(ends("theirs"))),
+                CommitRequest(appends = own, fileEnds = listOf(ends("mine"), ends("shared"))),
             )) {
                 refusals += runCatching { store.commit("alpha", request) }.exceptionOrNull()
             }
         }
-        assertThat(refusals.map { it?.message })
-            .containsExactly("namespace 'theirs' in catalog 'alpha'", "namespace 'shared' in catalog 'alpha'")
+        assertThat(refusals.map { it?.message }).containsExactly(
+            "namespace 'theirs' in catalog 'alpha'",
+            "namespace 'shared' in catalog 'alpha'",
+            "namespace 'theirs' in catalog 'alpha'",
+            "namespace 'shared' in catalog 'alpha'",
+        )
         assertThat(refusals).allMatch { it is HoglakeException.NotFound }
         assertThat(stores.count("CatalogStore.commit")).isEqualTo(1)
     }

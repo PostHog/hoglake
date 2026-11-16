@@ -579,7 +579,7 @@ samplers start only after PostgreSQL initializes; a hoglite-only process never s
 | Matching catalog and verified `rtg` | The configured backend and opaque tenant from the token |
 | No `rtg`, or a different catalog | PostgreSQL default, or 404 when the default is `none` |
 | Hoglite catalog listing | Only the token's routed catalog |
-| Maintenance or publications on hoglite | 501 `not_supported_on_backend` |
+| Publications or the maintenance export on hoglite | 501 `not_supported_on_backend` |
 | A mount name (§6.5a) | Resolved first: never a store |
 | A name a mount host serves (§6.5b) | Resolved before that: forwarded to the host |
 
@@ -871,9 +871,9 @@ catalog and the namespace the handler passed:
 - A scoped caller: a namespace must be live, contained, and contained for a value
   the token holds for the operation: read or write, the lower of `prd` and `cat`.
   The route table is not asked. Any other namespace gets the gate's 404 for a
-  missing namespace. This covers a namespace in the path, in a body (a commit, a
-  table creation, the prefix of an upload claim) and behind an id (a table
-  creation's operation).
+  missing namespace. This covers a namespace in the path, in a body (a commit's
+  appends, deletes and the tables whose files it ends, a table creation, the
+  prefix of an upload claim) and behind an id (a table creation's operation).
 - A table creation in a namespace the caller may not use answers the 404 of a
   creation that does not exist, here and in the route's own check, so neither its
   existence nor its namespace shows. The audit names the namespace.

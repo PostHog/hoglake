@@ -54,6 +54,9 @@ class ScopedRouteHandlersIntegrationTest {
     private val cat = "alpha"
     private val dataPath = "s3://bucket/$cat"
     private val ns = "team_7"
+
+    /** Another team's namespace, which the token does not hold. */
+    private val theirs = "team_9"
     private val columns = """[{"name":"v","type":"long"}]"""
 
     init {
@@ -61,6 +64,9 @@ class ScopedRouteHandlersIntegrationTest {
         catalogs.createNamespace(cat, ns)
         catalogs.setNamespaceContainment(cat, ns, NamespaceContainment("team_id", 7))
         catalogs.createTable(cat, ns, "t", listOf(ColumnDef("v", ColType.LONG)))
+        catalogs.createNamespace(cat, theirs)
+        catalogs.setNamespaceContainment(cat, theirs, NamespaceContainment("team_id", 9))
+        catalogs.createTable(cat, theirs, "t", listOf(ColumnDef("v", ColType.LONG)))
         ViewService(db.jdbi).create(cat, ns, "v", "SELECT 1")
     }
 
@@ -102,7 +108,29 @@ class ScopedRouteHandlersIntegrationTest {
         }
     }
 
-    private fun tableUuid(table: String): UUID = catalogs.getTable(cat, ns, table).tableUuid
+    private fun tableUuid(
+        table: String,
+        namespace: String = ns,
+    ): UUID = catalogs.getTable(cat, namespace, table).tableUuid
+
+    private fun exchange(
+        port: Int,
+        token: String,
+        method: String,
+        path: String,
+        body: String? = null,
+    ): HttpResponse<String> =
+        http.send(
+            HttpRequest.newBuilder(URI.create("http://127.0.0.1:$port/v1/catalogs/$cat$path"))
+                .header("Authorization", "Bearer $token")
+                .header("Content-Type", "application/json")
+                .method(
+                    method,
+                    body?.let { HttpRequest.BodyPublishers.ofString(it) } ?: HttpRequest.BodyPublishers.noBody(),
+                )
+                .build(),
+            HttpResponse.BodyHandlers.ofString(),
+        )
 
     private fun file(prefix: String = "$dataPath/data/$ns") =
         """{"path":"$prefix/${UUID.randomUUID()}.parquet","record_count":1,"file_size_bytes":10}"""
@@ -121,6 +149,30 @@ class ScopedRouteHandlersIntegrationTest {
         assertThat(driven).containsExactlyInAnyOrderElementsOf(scopedRoutes.map { (m, pattern) -> m.value to pattern })
     }
 
+    @Test
+    fun `a replacement that ends another namespace's files is refused by the route's own check`() {
+        val (response, lines) =
+            auditRefusals {
+                withServer { port ->
+                    fun table(namespace: String) =
+                        """"namespace":"$namespace","table":"t","expected_table_uuid":"${tableUuid("t", namespace)}""""
+                    val own = """{${table(ns)},"files":[${file()}]}"""
+                    val ends = """{${table(theirs)},"all_files":true}"""
+                    val head = catalogs.getCatalog(cat).headSnapshotId
+                    val body =
+                        """{"appends":[$own],"file_ends":[$ends],"message":"r",""" +
+                            """"read_snapshot":$head,"idempotency_key":"${UUID.randomUUID()}"}"""
+                    exchange(port, scoped(), "POST", "/commit/replacements/prepared", body)
+                }
+            }
+        assertThat(response.statusCode()).describedAs(response.body()).isEqualTo(404)
+        assertThat(response.body()).contains("namespace '$theirs' in catalog '$cat'")
+        // MUTATION: leave the ended files out of the route's own check and the
+        // view refuses them instead, audited `at=store`.
+        assertThat(lines).hasSize(1)
+        assertThat(lines.single()).contains("namespace '$theirs'").doesNotContain("at=store")
+    }
+
     private fun driveEveryRoute(
         port: Int,
         answers: MutableList<String>,
@@ -135,19 +187,7 @@ class ScopedRouteHandlersIntegrationTest {
             body: String? = null,
         ): HttpResponse<String> {
             driven += method to "/v1/catalogs/{catalog}$pattern"
-            val response =
-                http.send(
-                    HttpRequest.newBuilder(URI.create("http://127.0.0.1:$port/v1/catalogs/$cat$path"))
-                        .header("Authorization", "Bearer $token")
-                        .header("Content-Type", "application/json")
-                        .method(
-                            method,
-                            body?.let { HttpRequest.BodyPublishers.ofString(it) }
-                                ?: HttpRequest.BodyPublishers.noBody(),
-                        )
-                        .build(),
-                    HttpResponse.BodyHandlers.ofString(),
-                )
+            val response = exchange(port, token, method, path, body)
             answers += "${response.statusCode()} $method $path ${response.body().take(300)}"
             return response
         }
@@ -216,6 +256,9 @@ class ScopedRouteHandlersIntegrationTest {
         val mutation = """"appends":[${append()}],"deletes":[$delete]"""
         send("POST", "/commit/mutations/prepared", "/commit/mutations/prepared", guarded(mutation))
         send("POST", "/commit/transaction", "/commit/transaction", guarded(""""appends":[${append()}]"""))
+        val ends = """"file_ends":[{"namespace":"$ns","table":"t","expected_table_uuid":"$uuid","all_files":true}]"""
+        val replacement = guarded(""""message":"r","appends":[${append()}],$ends""")
+        send("POST", "/commit/replacements/prepared", "/commit/replacements/prepared", replacement)
         val claimed = guarded(""""appends":[${append(uploaded.asText())}]""", owner)
         send("POST", "/commit/uploads", "/commit/uploads", claimed)
         send("POST", "/uploads/renew", "/uploads/renew", """{"owner":"$owner"}""")
