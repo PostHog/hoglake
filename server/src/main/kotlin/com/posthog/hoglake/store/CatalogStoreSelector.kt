@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode
 import com.posthog.hoglake.Config
 import com.posthog.hoglake.auth.Routing
 import com.posthog.hoglake.auth.hoglakeAuth
+import com.posthog.hoglake.auth.requireCatalogEntitlement
 import com.posthog.hoglake.auth.verifiedBackendToken
 import com.posthog.hoglake.compaction.CompactionConfig
 import com.posthog.hoglake.compaction.ParquetRewriter
@@ -88,14 +89,18 @@ class CatalogStoreSelector(
     /**
      * A mount name resolves first (to the Host's mount on a Client, else to
      * this instance's own), then verified placement, then the default backend.
+     * Whatever [catalog] a handler passes, it resolves only when the caller's
+     * token allows that name (auth/StoreEntitlement.kt).
      */
     override fun resolve(
         call: ApplicationCall,
         catalog: String,
     ): CatalogBinding {
         call.attributes.getOrNull(boundCatalog)?.let { (name, binding) -> if (name == catalog) return binding }
+        // Before any binding: a name resolves only when the caller's token allows it.
+        call.requireCatalogEntitlement(catalog)
         val binding =
-            remote(call, catalog) ?: mount(call, catalog) ?: run {
+            remoteBinding(call, catalog) ?: mount(call, catalog) ?: run {
                 val routing = call.hoglakeAuth.callerOrNull?.routing
                 CatalogBinding.Local(
                     if (routing != null && routing.catalog == catalog) routed(call, routing) else fallback(catalog),
@@ -113,8 +118,19 @@ class CatalogStoreSelector(
      * nothing is sent. A refusal is counted against the name only once the
      * caller's verified `cat` is known to hold it; before that the name is
      * raw request input and would mint a series per probe.
+     *
+     * The scan route asks here before [resolve], so the token is checked
+     * here as it is there (auth/StoreEntitlement.kt).
      */
     fun remote(
+        call: ApplicationCall,
+        catalog: String,
+    ): CatalogBinding.Remote? {
+        call.requireCatalogEntitlement(catalog)
+        return remoteBinding(call, catalog)
+    }
+
+    private fun remoteBinding(
         call: ApplicationCall,
         catalog: String,
     ): CatalogBinding.Remote? {
@@ -447,8 +463,12 @@ class CatalogStoreSelector(
                 }
         }
 
-    /** Build a store from trusted placement. This method does not discover catalogs or start background work. */
-    fun forPlacement(placement: Routing): CatalogStore =
+    /**
+     * Build a store from trusted placement. This method does not discover
+     * catalogs or start background work. It checks no token, so it is not
+     * part of the public surface: nothing in the server calls it.
+     */
+    internal fun forPlacement(placement: Routing): CatalogStore =
         when (placement.backend) {
             BackendKind.POSTGRES -> postgres ?: throw HoglakeException.NotFound("catalog '${placement.catalog}'")
             BackendKind.HOGLITE -> hogliteStore(placement, client(placement.backendId), operatorAuthority = true)

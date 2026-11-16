@@ -831,6 +831,32 @@ catalog it resolved — a cheap invariant, one `require`. Cost is zero on the ha
 path and it turns "a new route forgot the plugin" into a 500 in tests rather than
 a cross-tenant read in production.
 
+**The store is bound to the token as well** (built, at the catalog level). The
+plugin decides on the catalog the request path names. `CatalogStoreSelector`, which
+every catalog route and the namespace gate go through to get a store, asks the
+plugin's rules again for the name the handler passes, before it resolves a remote
+binding, a mount or a store (`auth/StoreEntitlement.kt`):
+
+- A request with no caller gets 401.
+- A name the token does not name (`Caller.knowsCatalog`; an operator knows every
+  catalog) gets the plugin's 404.
+- A name the token holds without the scope the route asks for gets the plugin's
+  403, so a write route is not served from a catalog held only for read.
+- The modes are the plugin's: no check under `off`; under `warn` the refusal is
+  counted and let through, except for a scoped caller.
+- A refusal is counted in `hoglake_auth_requests_total` (and a 403 in
+  `hoglake_auth_denials_total`) and audited as `auth_refused` with `at=store` and
+  the catalog that was refused. A request adds at most one, and none when the
+  plugin already counted a refusal for it under `warn` and let it through. When
+  the plugin allowed the path's catalog and the store then refuses the handler's,
+  the request has the plugin's `ok` and the store's refusal: the plugin counts
+  before the handler runs, and the pair shows a handler that asked for a name
+  other than the path's.
+
+This covers catalogs only. A scoped caller's namespaces are the gate's and the
+handlers'. The PostgreSQL store that is handed out takes a catalog name again on
+each call and is not bound to the name that was checked.
+
 ### 6.5a Mount dispatch
 
 A mount is a read-only catalog name over a table in this instance's PostgreSQL
