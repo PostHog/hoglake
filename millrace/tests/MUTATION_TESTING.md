@@ -77,7 +77,8 @@ x__decode_group_at__mutmut_8 (`pos += 1` → `pos = 1`) is killed by
 `b"\xff"` → `b"\xFF"` in `prefix_successor` (the same byte) is no longer
 generated: mutmut 3.8.1's string-case mutator leaves `\xHH` escapes
 alone. Dropping it renumbered that function's mutants, so the name it
-had, `x_prefix_successor__mutmut_5`, now denotes `if not stripped` →
+had, x_prefix_successor__mutmut_5 (left unquoted so the gate does not
+parse it as a survivor), now denotes `if not stripped` →
 `if stripped`, which is killed. The gate matches survivors by name, so a
 mutmut bump re-reads every ledgered survivor's `mutmut show` against its
 description here (done for 3.8.1: all 18 unchanged).
