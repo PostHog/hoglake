@@ -9,6 +9,7 @@ import com.posthog.hoglake.persistence.PartialResult
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.AfterAll
+import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
@@ -18,14 +19,21 @@ import java.time.Instant
 @Tag("integration")
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class HogliteMaintenanceStatusIntegrationTest {
-    private val engine by lazy { HogliteConformanceEngine() }
+    private lateinit var engine: HogliteConformanceEngine
     private val store get() = engine.store
 
     private fun backend(source: HogliteCatalogStore = store) =
         HogliteMaintenanceStatus(source, 101, 102, 103, 104, 105, 1000)
 
+    @BeforeAll
+    fun start() {
+        engine = HogliteConformanceEngine()
+    }
+
     @AfterAll
-    fun close() = engine.close()
+    fun close() {
+        if (::engine.isInitialized) engine.close()
+    }
 
     private fun catalog(): String =
         HogliteConformanceEngine.uniqueName("status").also {

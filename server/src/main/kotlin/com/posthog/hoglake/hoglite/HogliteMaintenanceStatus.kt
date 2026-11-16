@@ -9,6 +9,7 @@ import com.posthog.hoglake.model.MaintenanceRunStatus
 import com.posthog.hoglake.model.MaintenanceStatus
 import com.posthog.hoglake.model.MaintenanceTask
 import com.posthog.hoglake.model.MaintenanceTaskStatus
+import com.posthog.hoglake.model.MaintenanceTrigger
 import com.posthog.hoglake.service.MaintenanceStatusBackend
 import java.time.Duration
 import java.time.Instant
@@ -230,10 +231,7 @@ internal class HogliteMaintenanceStatus(
             runId = row[0].asLong(),
             catalog = catalog,
             taskName = row[1].asString(),
-            trigger =
-                com.posthog.hoglake.model.MaintenanceTrigger.entries.first {
-                    it.wire == row[2].asString()
-                },
+            trigger = MaintenanceTrigger.fromWire(row[2].asString()),
             startedAt = HogliteSchema.parse(row[3].asString()),
             finishedAt = HogliteSchema.parse(row[4].asString()),
             status =
