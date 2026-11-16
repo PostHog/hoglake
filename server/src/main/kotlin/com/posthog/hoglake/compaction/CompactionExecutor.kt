@@ -25,6 +25,7 @@ import com.posthog.hoglake.model.ObjectPrefix
 import com.posthog.hoglake.model.allNodes
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
+import com.posthog.hoglake.persistence.PartialResult
 import com.posthog.hoglake.storage.StorageAccess
 import io.github.oshai.kotlinlogging.KotlinLogging
 import org.apache.parquet.hadoop.metadata.ParquetMetadata
@@ -36,6 +37,8 @@ import java.util.concurrent.TimeUnit
 internal class CompactionExecutor(
     private val storage: CompactionStorage,
     private val store: ObjectStore,
+    /** Request-scoped adapters can retain the bounded layout cache between calls. */
+    internal val variantLayouts: VariantLayoutMemory = VariantLayoutMemory(),
 ) {
     private val log = KotlinLogging.logger(CompactionService::class.java.name)
 
@@ -251,6 +254,7 @@ internal class CompactionExecutor(
             try {
                 source.liveClaimedFileIds(ctx)
             } catch (e: Exception) {
+                if (storage.isTerminalFailure(e)) throw e
                 log.warn(e) {
                     "compaction claim read failed for ${ctx.namespace}.${ctx.table}; " +
                         "planning as if unclaimed (a claim is an optimization, and the " +
@@ -383,13 +387,6 @@ internal class CompactionExecutor(
 
     /** [lastBudgetRefusal]'s twin for the object-prefix refusals in [pack], keyed the same way. */
     private val lastPrefixRefusal = java.util.concurrent.ConcurrentHashMap<Pair<Long, Long>, String>()
-
-    /**
-     * The variant layouts of files this process has probed, so [pack]
-     * can keep a VARIANT table's files of different layouts apart without
-     * reading a footer: see [VariantLayoutGroups] and [layoutParts].
-     */
-    internal val variantLayouts = VariantLayoutMemory()
 
     /**
      * The canonical value of [ctx]'s object-prefix field that names
@@ -960,6 +957,10 @@ internal class CompactionExecutor(
         val candidatesTruncated: Long = 0,
         val planMs: Long = 0,
         val bucketsSkippedClaimed: Long = 0,
+        /** Planning failures spend no object-store attempt. */
+        val planningFailures: Long = 0,
+        /** Workers return terminal failures after all outcomes in their wave settle. */
+        val terminalFailure: Throwable? = null,
     ) {
         /**
          * What this tally has spent of `maxGroupsPerRun`.
@@ -1032,6 +1033,8 @@ internal class CompactionExecutor(
                 candidatesTruncated + other.candidatesTruncated,
                 planMs + other.planMs,
                 bucketsSkippedClaimed + other.bucketsSkippedClaimed,
+                planningFailures + other.planningFailures,
+                terminalFailure ?: other.terminalFailure,
             )
 
         companion object {
@@ -1110,10 +1113,9 @@ internal class CompactionExecutor(
         // that did nothing wrong. The
         // purge is a DELETE of expired rows: harmless when there are
         // none, and the only thing that cleans up after the flip.
-        runCatching {
-            storage.purgeExpired(catalog)
+        bestEffortCompactionPurge({ storage.purgeExpired(catalog) }, storage::isTerminalFailure) { e ->
+            log.warn(e) { "compaction claim purge failed for '$catalog'; continuing" }
         }
-            .onFailure { e -> log.warn(e) { "compaction claim purge failed for '$catalog'; continuing" } }
         val tables = storage.liveTables(catalog)
 
         // PLAN AND EXECUTE PER TABLE, in name order — the loop order
@@ -1152,14 +1154,21 @@ internal class CompactionExecutor(
                 // asked to stop and five of them committed afterwards.
                 stopIfInterrupted(tally)
                 val (plan, items) =
-                    planAndClaim(
-                        catalog,
-                        namespace,
-                        table,
-                        cfg,
-                        cfg.maxGroupsPerRun - tally.attempts,
-                        claimant,
-                    )
+                    try {
+                        planAndClaim(
+                            catalog,
+                            namespace,
+                            table,
+                            cfg,
+                            cfg.maxGroupsPerRun - tally.attempts,
+                            claimant,
+                        )
+                    } catch (e: Throwable) {
+                        if (!storage.isRecoverablePlanningFailure(e)) throw e
+                        tally += GroupTally(planningFailures = 1)
+                        log.error(e) { "compaction could not plan $catalog/$namespace.$table; continuing" }
+                        continue
+                    }
                 pending = items
                 // Sorted groups the spill or merge budget refused in
                 // METADATA, and groups another maintainer holds. Counted but deliberately NOT
@@ -1204,6 +1213,13 @@ internal class CompactionExecutor(
                         (0 until minOf(room.toLong(), cfg.parallelGroups.toLong()).toInt())
                             .mapNotNull { queue.removeFirstOrNull() }
                     tally += executeWave(catalog, wave, cfg, pool, heapExhausted)
+                    tally.terminalFailure?.let { failure ->
+                        if (wasInterrupt(failure) || Thread.currentThread().isInterrupted) {
+                            Thread.currentThread().interrupt()
+                            throw SweepInterrupted(tally.toResult()).also { it.initCause(failure) }
+                        }
+                        throw SweepFailed(failure, tally.toResult())
+                    }
                     // Between waves as well as between tables: one wave
                     // is up to `parallelGroups` rewrites, which is
                     // minutes of work to do after being told to stop.
@@ -1221,6 +1237,15 @@ internal class CompactionExecutor(
             if (e is SweepInterrupted) throw e
             Thread.currentThread().interrupt()
             throw SweepInterrupted(tally.toResult()).also { it.initCause(e) }
+        } catch (e: Throwable) {
+            if (storage.isTerminalFailure(e)) {
+                if (wasInterrupt(e) || Thread.currentThread().isInterrupted) {
+                    Thread.currentThread().interrupt()
+                    throw SweepInterrupted(tally.toResult()).also { it.initCause(e) }
+                }
+                throw SweepFailed(e, tally.toResult())
+            }
+            throw e
         } finally {
             shutdown(pool, interrupted = Thread.currentThread().isInterrupted)
             releaseQueuedClaims(pending)
@@ -1261,7 +1286,7 @@ internal class CompactionExecutor(
             dvSuperseded = dvSuperseded,
             unconvertibleSchema = unconvertibleSchema,
             invalidData = invalidData,
-            failedGroups = failedGroups,
+            failedGroups = failedGroups + planningFailures,
             claimedElsewhere = claimedElsewhere,
             runsTrusted = runsTrusted,
             runsSpilled = runsSpilled,
@@ -1286,6 +1311,25 @@ internal class CompactionExecutor(
             objectPrefixUnresolvable = objectPrefixUnresolvable,
             layoutProbeOnly = layoutProbeOnly,
         )
+
+    /** Terminal adapters preserve completed publication counters. */
+    private class SweepFailed(
+        cause: Throwable,
+        override val partial: CompactionResult,
+    ) : RuntimeException(cause.message, cause), PartialResult
+
+    private fun terminalAwareGroup(
+        catalog: String,
+        item: WorkItem,
+        cfg: CompactionConfig,
+        heapExhausted: java.util.concurrent.atomic.AtomicBoolean,
+    ): GroupTally =
+        try {
+            executeGroup(catalog, item, cfg, heapExhausted)
+        } catch (e: Throwable) {
+            if (!storage.isTerminalFailure(e)) throw e
+            GroupTally(terminalFailure = e)
+        }
 
     /**
      * The sweep's worker pool, or null at
@@ -1433,13 +1477,13 @@ internal class CompactionExecutor(
         if (items.isEmpty()) return GroupTally()
         if (pool == null) {
             var tally = GroupTally()
-            for (item in items) tally += executeGroup(catalog, item, cfg, heapExhausted)
+            for (item in items) tally += terminalAwareGroup(catalog, item, cfg, heapExhausted)
             return tally
         }
         val futures =
             items.map { item ->
                 pool.submit(
-                    java.util.concurrent.Callable { executeGroup(catalog, item, cfg, heapExhausted) },
+                    java.util.concurrent.Callable { terminalAwareGroup(catalog, item, cfg, heapExhausted) },
                 )
             }
         return try {
@@ -1478,6 +1522,7 @@ internal class CompactionExecutor(
         runCatching {
             storage.refreshClaim(ctx, claimKey, bucketKeys, claimant, cfg)
         }.getOrElse { e ->
+            if (storage.isTerminalFailure(e)) throw e
             log.warn(
                 e,
             ) { "compaction claim refresh failed for ${ctx.namespace}.${ctx.table}; continuing without a claim" }
@@ -1518,7 +1563,16 @@ internal class CompactionExecutor(
         // Refresh the reservation before file I/O. A lost lease spends no I/O.
         val claimKey = item.claimant?.let { CompactionClaimKey.groupKey(group) }
         val liveBuckets = item.planBuckets.filter { it.outstanding.get() > 0 }.map { it.key }
-        if (claimKey != null && !refreshClaim(ctx, claimKey, liveBuckets, item.claimant, cfg)) {
+        val refreshed =
+            try {
+                claimKey == null || refreshClaim(ctx, claimKey, liveBuckets, checkNotNull(item.claimant), cfg)
+            } catch (e: Throwable) {
+                if (!storage.isTerminalFailure(e)) throw e
+                runCatching { storage.releaseClaim(ctx, checkNotNull(claimKey), checkNotNull(item.claimant)) }
+                settleBucketClaim(item)
+                throw e
+            }
+        if (!refreshed) {
             log.debug {
                 "compaction group of ${group.files.size} files for " +
                     "$catalog/${ctx.namespace}.${ctx.table} is claimed by another maintainer; " +
@@ -1574,6 +1628,7 @@ internal class CompactionExecutor(
             // Any part, the first included, can still be refused on
             // re-admission below.
             for ((index, part) in planned.parts.withIndex()) {
+                if (tally.terminalFailure != null) break
                 if (yieldsBeforePart(index, heapExhausted.get(), Thread.currentThread().isInterrupted)) break
                 // A SORTED part is bounded by ITS layout, not the declared
                 // one: the chunk is sized from the subtree its rows actually
@@ -1882,6 +1937,7 @@ internal class CompactionExecutor(
             }
             return GroupTally(failedGroups = 1)
         } catch (e: Throwable) {
+            if (storage.isTerminalFailure(e)) return GroupTally(terminalFailure = e)
             // The backend identifies statement lock timeouts. Every other statement error follows the failed-group path.
             if (storage.isStatementLockTimeout(e)) {
                 log.warn {

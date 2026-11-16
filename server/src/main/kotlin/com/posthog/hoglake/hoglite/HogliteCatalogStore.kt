@@ -110,11 +110,34 @@ class HogliteCatalogStore(
      * If catalog work ever moves to another thread, its binding must be carried
      * explicitly rather than starting another operation there.
      */
-    private class CatalogOperation(val tenant: String) {
+    internal class CatalogOperation(val tenant: String) {
+        @Volatile
         var missing: HoglakeException.NotFound? = null
     }
 
     private val operationBindings = ThreadLocal<MutableMap<String, CatalogOperation>>()
+
+    /** Capture the existing incarnation. Worker threads never resolve the catalog name again. */
+    internal fun captureCatalogOperation(catalog: String): CatalogOperation =
+        checkNotNull(operationBindings.get()?.get(catalog)) { "catalog '$catalog' has no operation binding" }
+
+    /** Install the captured binding for one blocking storage operation. Restore the caller's scope afterward. */
+    internal fun <T> withCatalogOperation(
+        catalog: String,
+        operation: CatalogOperation,
+        body: () -> T,
+    ): T {
+        val previous = operationBindings.get()
+        val existing = previous?.get(catalog)
+        check(existing == null || existing === operation) { "catalog operation binding differs" }
+        if (existing === operation) return catalogOperation(catalog, body = body)
+        operationBindings.set((previous?.toMutableMap() ?: mutableMapOf()).apply { put(catalog, operation) })
+        try {
+            return catalogOperation(catalog, body = body)
+        } finally {
+            if (previous == null) operationBindings.remove() else operationBindings.set(previous)
+        }
+    }
 
     /**
      * Bind [catalog] to ONE tenant id for the whole operation. The id is
