@@ -153,8 +153,45 @@ class HogliteExpiryRouteIntegrationTest {
                         client.get("/v1/catalogs/$c/maintenance/status") {
                             header(HttpHeaders.Authorization, "Bearer $token")
                         }
-                    assertThat(status.status).isEqualTo(HttpStatusCode.NotImplemented)
-                    assertThat(status.bodyAsText()).contains("not_supported_on_backend")
+                    assertThat(status.status).isEqualTo(HttpStatusCode.OK)
+                    assertThat(store.json.readTree(status.bodyAsText())["catalog"].asText()).isEqualTo(c)
+                    val runs =
+                        client.get("/v1/catalogs/$c/maintenance/runs?task=expiry&limit=1") {
+                            header(HttpHeaders.Authorization, "Bearer $token")
+                        }
+                    assertThat(runs.status).isEqualTo(HttpStatusCode.OK)
+                    val page = store.json.readTree(runs.bodyAsText())
+                    assertThat(page["has_more"].asBoolean()).isTrue()
+                    assertThat(page["runs"].single()["result"]["purge_remaining"].asLong()).isEqualTo(1)
+                    val before = page["runs"].single()["run_id"].asLong()
+                    val previous =
+                        client.get("/v1/catalogs/$c/maintenance/runs?before=$before") {
+                            header(HttpHeaders.Authorization, "Bearer $token")
+                        }
+                    val older = store.json.readTree(previous.bodyAsText())
+                    assertThat(older["has_more"].asBoolean()).isFalse()
+                    assertThat(older["runs"].single()["status"].asText()).isEqualTo("failed")
+                    assertThat(older["runs"].single()["result"].isNull).isTrue()
+                    for ((suffix, expected) in listOf(
+                        "?limit=0" to HttpStatusCode.UnprocessableEntity,
+                        "?task=unknown" to HttpStatusCode.UnprocessableEntity,
+                        "?before=bad" to HttpStatusCode.BadRequest,
+                    )) {
+                        val invalidRun =
+                            client.get("/v1/catalogs/$c/maintenance/runs$suffix") {
+                                header(HttpHeaders.Authorization, "Bearer $token")
+                            }
+                        assertThat(invalidRun.status).describedAs(suffix).isEqualTo(expected)
+                    }
+                    for (surface in listOf("status", "runs")) {
+                        assertThat(client.get("/v1/catalogs/$c/maintenance/$surface").status)
+                            .isEqualTo(HttpStatusCode.Unauthorized)
+                        val other =
+                            client.get("/v1/catalogs/other/maintenance/$surface") {
+                                header(HttpHeaders.Authorization, "Bearer $token")
+                            }
+                        assertThat(other.status).isEqualTo(HttpStatusCode.NotFound)
+                    }
                     assertThat(rows(c)).hasSize(2)
                     assertThat(rows(c)[0].take(3).map { it.asString() }).containsExactly("expiry", "manual", "failed")
                     assertThat(rows(c)[1].take(3).map { it.asString() }).containsExactly("expiry", "manual", "ok")

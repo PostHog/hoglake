@@ -114,6 +114,7 @@ class AuthService(
                         backends = cfg.backendKinds,
                         predicateFields =
                             cfg.authPredicateFields.split(',').map { it.trim() }.filter { it.isNotEmpty() }.toSet(),
+                        sessionProfile = cfg.authSessionProfileEnabled,
                     ),
             )
         }
@@ -151,6 +152,7 @@ class AuthService(
                         backends = cfg.backendKinds,
                         predicateFields =
                             cfg.authPredicateFields.split(',').map { it.trim() }.filter { it.isNotEmpty() }.toSet(),
+                        sessionProfile = cfg.authSessionProfileEnabled,
                     ),
             )
         }
@@ -329,6 +331,8 @@ val HoglakeAuth =
             val method = call.request.httpMethod
             val path = call.request.path()
             val match = AuthPolicy.match(method, path)
+            // Kept for the store's check (StoreEntitlement.kt), which asks for what this route demands.
+            match?.let { call.attributes.put(RouteMatchKey, it) }
             val token = bearerToken(call)
 
             var caller: Caller? = null
@@ -427,6 +431,7 @@ val HoglakeAuth =
             // WARN: counted above, and let through. The caller (when the token
             // verified) is already attached, so the burn-in period produces the
             // attribution `enforce` will rely on.
+            call.attributes.put(RefusalCountedKey, Unit)
         }
     }
 
@@ -511,6 +516,10 @@ internal fun countRefusal(
     failure: HoglakeException,
     /** Whether the refusal was answered, which `warn` does for scoped callers too: the audit says what happened. */
     enforced: Boolean,
+    /** The catalog that was refused, when it is not the path's: the name a handler asked the store for. */
+    catalog: String? = match?.catalog,
+    /** Where it was decided, when not by the plugin or a gate: `store` (StoreEntitlement.kt). Audit detail only. */
+    at: String? = null,
 ) {
     val outcome =
         when (failure) {
@@ -521,18 +530,17 @@ internal fun countRefusal(
             else -> "other"
         }
     Metrics.authRequest(service.mode.wire, service.listener, outcome, client)
-    val catalog = match?.catalog ?: ""
     if (failure is HoglakeException.Forbidden) {
-        Metrics.authDenial(catalog, match?.requirement?.wire() ?: "", outcome)
+        Metrics.authDenial(catalog ?: "", match?.requirement?.wire() ?: "", outcome)
     }
     Audit.event(
         action = "auth_refused",
-        catalog = match?.catalog,
+        catalog = catalog,
         obj = null,
         outcome = if (enforced) "refused" else "warn_allowed",
         detail =
             "${failure::class.simpleName}: ${failure.message} pattern=${match?.pattern} " +
-                "listener=${service.listener}",
+                "listener=${service.listener}" + (at?.let { " at=$it" } ?: ""),
         actor = caller?.actor,
         tenant = caller?.orgId,
     )
@@ -548,12 +556,8 @@ private fun failureFor(
         is AuthDecision.Unauthenticated -> HoglakeException.Unauthenticated(JwtViolation.NO_TOKEN, decision.reason)
         // 404, not 403: an unentitled tenant must not learn that the catalog exists.
         // The wording matches a genuinely missing catalog on purpose.
-        is AuthDecision.UnknownCatalog -> HoglakeException.NotFound("catalog '${decision.catalog}' not found")
-        is AuthDecision.InsufficientScope ->
-            HoglakeException.Forbidden(
-                "this credential does not hold '${decision.required.wire}' on '${decision.catalog}' " +
-                    "(route ${match?.pattern ?: "?"})",
-            )
+        is AuthDecision.UnknownCatalog -> unknownCatalog(decision.catalog)
+        is AuthDecision.InsufficientScope -> insufficientScope(decision.catalog, decision.required, match)
         is AuthDecision.NotPredicated ->
             HoglakeException.Forbidden(
                 "a scoped credential cannot use route ${decision.pattern} on '${decision.catalog}'",
@@ -568,6 +572,31 @@ private fun failureFor(
                 "a scoped credential cannot use route ${match?.pattern ?: "?"} on '${decision.catalog}'",
             )
     }
+
+/** The one answer for a catalog the caller's token does not name, from the plugin and from the store. */
+internal fun unknownCatalog(catalog: String): HoglakeException =
+    HoglakeException.NotFound("catalog '$catalog' not found")
+
+/** The one answer for a catalog the token names without the scope the route asks for, likewise. */
+internal fun insufficientScope(
+    catalog: String,
+    required: Scope,
+    match: RouteMatch?,
+): HoglakeException =
+    HoglakeException.Forbidden(
+        "this credential does not hold '${required.wire}' on '$catalog' (route ${match?.pattern ?: "?"})",
+    )
+
+/**
+ * Present on a call that went on after a refusal was counted for it: by the
+ * plugin, which let it through under `warn`, or by the store's check. The
+ * store counts a refusal only when this is absent, so a request adds at most
+ * one.
+ */
+internal val RefusalCountedKey = AttributeKey<Unit>("HoglakeAuthRefusalCounted")
+
+/** The route table's match for this request's path, as the plugin decided on it. Absent for an unlisted path. */
+internal val RouteMatchKey = AttributeKey<RouteMatch>("HoglakeAuthRouteMatch")
 
 private fun Requirement.wire(): String = scopeOrNull()?.wire ?: name.lowercase()
 

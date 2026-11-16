@@ -7,6 +7,7 @@ import com.posthog.hoglake.commit.CommitService.Companion.BLIND_PARTITIONED_REFU
 import com.posthog.hoglake.commit.CommitService.Companion.MAX_FILE_RECORD_COUNT
 import com.posthog.hoglake.commit.CommitService.Companion.MAX_WARNED_BLIND_PARTITIONED
 import com.posthog.hoglake.commit.CommitService.Companion.blindPartitionedRefusal
+import com.posthog.hoglake.commit.FileEnds
 import com.posthog.hoglake.commit.ObjectPrefixRules
 import com.posthog.hoglake.commit.commitFingerprint
 import com.posthog.hoglake.commit.commitFingerprintDigest
@@ -79,7 +80,7 @@ internal object HogliteCommit {
     // Shared now: ObjectPrefixRules, MAX_FILE_RECORD_COUNT, MAX_WARNED_BLIND_PARTITIONED,
     // BLIND_PARTITIONED_REFUSAL, StatsSanity and the scan column-stats cap.
 
-    private const val CONTENT_KINDS = "('table_created','table_inserted_into','table_deleted_from')"
+    private const val CONTENT_KINDS = "('table_created','table_inserted_into','table_deleted_from','table_replaced')"
     private const val DDL_KINDS = "('table_dropped','table_altered')"
 
     fun commit(
@@ -88,6 +89,7 @@ internal object HogliteCommit {
         request: CommitRequest,
     ): CommitResult {
         // Match CommitService's transaction admission before any planning or writes.
+        FileEnds.validate(request)
         if (request.allowPendingDeletes &&
             (
                 request.idempotencyKey == null || request.readSnapshot == null ||
@@ -129,7 +131,7 @@ internal object HogliteCommit {
         catalog: String,
         request: CommitRequest,
     ): CommitResult {
-        if (request.appends.isEmpty() && request.deletes.isEmpty()) {
+        if (request.appends.isEmpty() && request.deletes.isEmpty() && request.fileEnds.isNullOrEmpty()) {
             throw HoglakeException.Validation("at least one of appends/deletes must be non-empty")
         }
         if (request.deletes.isNotEmpty() && request.readSnapshot == null) {
@@ -173,6 +175,15 @@ internal object HogliteCommit {
                 )
             }
 
+        // A table whose files this request ends is touched like a delete
+        // target: guarded by incarnation and by the unchanged-since-read rule.
+        val ends = request.fileEnds.orEmpty()
+        for (end in ends) {
+            val t = touch(end.namespace, end.table, end.expectedTableUuid)
+            t.ends = true
+            t.endsAll = end.allFiles
+        }
+
         // Every read this attempt plans against, as ONE read-only
         // transaction (see PlanReads). Resolve identities before consuming
         // conflicts. Conflicts precede live-file validation and claims.
@@ -186,7 +197,7 @@ internal object HogliteCommit {
         if (request.idempotencyKey != null) {
             val existing = plan.receipt()
             if (existing != null) {
-                return replayedReceipt(catalog, request.idempotencyKey, fingerprintBytes, existing)
+                return replayedReceipt(store, catalog, request.idempotencyKey, fingerprintBytes, existing)
             }
         }
 
@@ -256,12 +267,18 @@ internal object HogliteCommit {
         // with content conflicts FIRST so a mixed window answers
         // commit_conflict, never the non-retryable one).
         if (readSnapshot != null) {
-            val conflicts = plan.conflicts()
-            if (conflicts.rows.isNotEmpty()) {
+            // (table id, is DDL): the window's rows, then the tables a `partitions`
+            // end found its own tuples touched in, which are content conflicts.
+            val rows =
+                plan.conflicts().rows.map { it[0].asLong() to (it[1].asLong() == 1L) } +
+                    ends.filter { it.partitions != null }
+                        .map { resolved.getValue("${it.namespace}.${it.table}") }
+                        .filter { plan.tupleConflict(it) }
+                        .map { it.tableId to false }
+            if (rows.isNotEmpty()) {
                 val nameById = resolved.entries.associate { it.value.tableId to it.key }
-                val names = conflicts.rows.mapNotNull { nameById[it[0].asLong()] }.distinct().sorted()
-                val allDdl = conflicts.rows.all { it[1].asLong() == 1L }
-                if (allDdl) {
+                val names = rows.mapNotNull { nameById[it.first] }.distinct().sorted()
+                if (rows.all { it.second }) {
                     throw HoglakeException.DdlSinceReadSnapshot(
                         "concurrent DDL since snapshot $readSnapshot on table(s): " +
                             names.joinToString(", ") +
@@ -275,6 +292,14 @@ internal object HogliteCommit {
                         names.joinToString(", "),
                 )
             }
+        }
+
+        // What a partition-based end needs of the live spec, after the
+        // conflicts (the cause before the symptom, as in CommitService).
+        for (end in ends) {
+            val spec = plan.spec(resolved.getValue("${end.namespace}.${end.table}"))
+            FileEnds.checkArity(end, spec?.fields?.size)
+            if (end.partitions != null) FileEnds.checkEncoding(end, checkNotNull(spec).fields.map { it.transform })
         }
 
         // The snapshot every definition below (spec, layout) is read at
@@ -661,14 +686,44 @@ internal object HogliteCommit {
         if (readSnapshot != null) {
             val unchanged = unchangedIds(order, resolved, request)
             if (unchanged.isNotEmpty()) {
+                val unchangedJson = store.json.writeValueAsString(unchanged)
                 tx.expectZero(
                     "SELECT COUNT(*) FROM changes WHERE snapshot_id > ? AND kind IN $CONTENT_KINDS " +
                         "AND object_id IN (SELECT value FROM json_each(?))",
                     readSnapshot,
-                    store.json.writeValueAsString(unchanged),
+                    unchangedJson,
+                ) {
+                    // Runs after the rollback: name the tables whose content changed.
+                    val ids =
+                        store.queryCatalog(
+                            catalog,
+                            "SELECT DISTINCT object_id FROM changes WHERE snapshot_id > ? " +
+                                "AND kind IN $CONTENT_KINDS AND object_id IN (SELECT value FROM json_each(?))",
+                            readSnapshot,
+                            unchangedJson,
+                        ).rows.map { it[0].asLong() }.toSet()
+                    val names = resolved.filter { it.value.tableId in ids }.keys.sorted()
+                    HoglakeException.CommitConflict(
+                        "concurrent table change since snapshot $readSnapshot on table(s): " +
+                            names.joinToString(", "),
+                    )
+                }
+            }
+            // A `partitions` end conflicts on its own tuples only.
+            for (end in ends) {
+                if (end.partitions == null) continue
+                val table = resolved.getValue("${end.namespace}.${end.table}")
+                tx.expectZero(
+                    tupleConflictSql("?"),
+                    *tupleConflictArgs(
+                        listOf(table.tableId),
+                        store.json.writeValueAsString(FileEnds.tupleJson(end)),
+                        readSnapshot,
+                    ).toTypedArray(),
                 ) {
                     HoglakeException.CommitConflict(
-                        "concurrent table change since snapshot $readSnapshot on a delete target",
+                        "concurrent table change since snapshot $readSnapshot on table(s): " +
+                            "${end.namespace}.${end.table}",
                     )
                 }
             }
@@ -685,6 +740,48 @@ internal object HogliteCommit {
                         readSnapshot = readSnapshot,
                     )
                 }
+            }
+        }
+
+        // 2c'. A partition tuple is only comparable under the spec it was
+        // written for: a live file under another spec refuses a partition-based end.
+        for (end in ends) {
+            if (end.partitions == null) continue
+            val table = resolved.getValue("${end.namespace}.${end.table}")
+            // The scan reads every live file of the table: skipped when the table has only ever
+            // had this spec (a spec change bumps the schema fence above, which replans).
+            if (plan.singleSpec(table)) continue
+            val specId = checkNotNull(plan.spec(table)).specId
+            tx.expectZero(
+                "SELECT COUNT(*) FROM files WHERE table_id = ? AND end_snapshot IS NULL " +
+                    "AND (spec_id IS NULL OR spec_id <> ?)",
+                table.tableId,
+                specId,
+            ) {
+                HoglakeException.PartitionSpecMismatch(
+                    "table '${end.namespace}.${end.table}' has live files written under a partition spec " +
+                        "other than the live one ($specId); partitions cannot address them. " +
+                        "Rewrite or compact them first, or end the files with all_files",
+                )
+            }
+        }
+
+        // 2c''. A replacement never re-registers a path the catalog has recorded, live or
+        // ended: paths are deterministic, so the bytes of an ended file would be overwritten
+        // under snapshots that still read it.
+        if (ends.isNotEmpty() && plannedAppends.isNotEmpty()) {
+            val pathsJson = store.json.writeValueAsString(plannedAppends.map { it.file.path })
+            tx.expectZero(
+                "SELECT COUNT(*) FROM files WHERE path IN (SELECT value FROM json_each(?))",
+                pathsJson,
+            ) {
+                val recorded =
+                    store.queryCatalog(
+                        catalog,
+                        "SELECT path FROM files WHERE path IN (SELECT value FROM json_each(?)) LIMIT 1",
+                        pathsJson,
+                    ).firstRow()?.get(0)?.asString() ?: plannedAppends.first().file.path
+                FileEnds.recordedPathRefusal(recorded)
             }
         }
 
@@ -861,6 +958,49 @@ internal object HogliteCommit {
 
         fun allocatedId(offset: Int): String = "(SELECT next_file_id - $totalFiles + $offset FROM meta WHERE id = 1)"
 
+        // 4b. End the files, BEFORE this commit's own file rows exist, and
+        // never one that began in this snapshot. The totals, the DVs and the
+        // files read the same live set, so the order is totals, DVs, files.
+        // Nothing is queued for removal: ended rows follow retention,
+        // expiry and cleanup, as truncate's do.
+        val endedCountAt = ArrayList<Int>()
+        for (end in ends) {
+            val table = resolved.getValue("${end.namespace}.${end.table}")
+            val byTuple =
+                if (end.partitions != null) " AND f.partition_values_json IN (SELECT value FROM json_each(?))" else ""
+            val live = "f.table_id = ? AND f.end_snapshot IS NULL AND f.begin_snapshot < ${HogliteSchema.HEAD_SQL}"
+            val match = live + byTuple
+            val matchArgs: Array<Any?> =
+                if (end.partitions != null) {
+                    arrayOf(table.tableId, store.json.writeValueAsString(FileEnds.tupleJson(end)))
+                } else {
+                    arrayOf(table.tableId)
+                }
+            endedCountAt += tx.add("SELECT COUNT(*) FROM files f WHERE $match", *matchArgs)
+            val ended = "FROM files f WHERE $match"
+            tx.add(
+                "UPDATE table_totals SET " +
+                    "record_count = record_count - (SELECT COALESCE(SUM(f.record_count), 0) $ended), " +
+                    "file_count = file_count - (SELECT COUNT(*) $ended), " +
+                    "file_size_bytes = file_size_bytes - (SELECT COALESCE(SUM(f.file_size_bytes), 0) $ended) " +
+                    "WHERE table_id = ?",
+                *matchArgs,
+                *matchArgs,
+                *matchArgs,
+                table.tableId,
+            )
+            tx.add(
+                "UPDATE dvs SET end_snapshot = ${HogliteSchema.HEAD_SQL} WHERE end_snapshot IS NULL " +
+                    "AND data_file_id IN (SELECT f.id FROM files f WHERE $match)",
+                *matchArgs,
+            )
+            tx.add(
+                "UPDATE files SET end_snapshot = ${HogliteSchema.HEAD_SQL} WHERE id IN " +
+                    "(SELECT f.id FROM files f WHERE $match)",
+                *matchArgs,
+            )
+        }
+
         // 5. Appends: file rows with server-assigned row lineage.
         val appendedIdByIndex = mutableMapOf<Int, String>()
         plannedAppends.forEachIndexed { i, p ->
@@ -978,15 +1118,33 @@ internal object HogliteCommit {
                     table.tableId,
                 )
             }
-            if (t.deletes) {
+            if (t.deletes || t.ends) {
                 tx.add(
                     "INSERT INTO changes(snapshot_id, kind, object_id) " +
                         "VALUES (${HogliteSchema.HEAD_SQL}, 'table_deleted_from', ?)",
                     table.tableId,
                 )
             }
+            if (t.ends) {
+                // Only for a table whose files this commit really ended (step 4b ran first).
+                tx.add(
+                    "INSERT INTO changes(snapshot_id, kind, object_id) " +
+                        "SELECT ${HogliteSchema.HEAD_SQL}, 'table_replaced', ? WHERE EXISTS " +
+                        "(SELECT 1 FROM files WHERE table_id = ? AND end_snapshot = ${HogliteSchema.HEAD_SQL})",
+                    table.tableId,
+                    table.tableId,
+                )
+            }
         }
         tx.insertSnapshotRow(request.author, request.message)
+        if (request.idempotencyKey != null && ends.isNotEmpty()) {
+            tx.add(HogliteSchema.RECEIPT_ENDED_DDL)
+            tx.add(
+                "INSERT INTO receipt_ended(idempotency_key, ended_files) VALUES " +
+                    "(?, (SELECT COUNT(*) FROM files WHERE end_snapshot = ${HogliteSchema.HEAD_SQL}))",
+                request.idempotencyKey.toString(),
+            )
+        }
         if (request.idempotencyKey != null) {
             tx.add(
                 "INSERT INTO receipts(idempotency_key, fingerprint, snapshot_id, schema_version, created_at) " +
@@ -1014,7 +1172,7 @@ internal object HogliteCommit {
                         "SELECT fingerprint, snapshot_id, schema_version FROM receipts WHERE idempotency_key = ?",
                         key.toString(),
                     ).firstRow()
-                if (existing != null) return replayedReceipt(catalog, key, fingerprintBytes, existing)
+                if (existing != null) return replayedReceipt(store, catalog, key, fingerprintBytes, existing)
                 // Cleanup removed the receipt. Only the shared budget permits a replan.
                 throw e
             }
@@ -1023,13 +1181,35 @@ internal object HogliteCommit {
             check(result.cols.size == 2 && result.rows.size == 1) { "invalid commit readback shape" }
             val row = result.rows.single()
             check(row.size == 2 && row.all { it is Int || it is Long }) { "invalid commit readback integers" }
-            return CommitResult(snapshotId = row[0].asLong(), schemaVersion = row[1].asLong())
+            val ended =
+                if (endedCountAt.isEmpty()) null else endedCountAt.sumOf { results[it].firstRow()!![0].asLong() }
+            return CommitResult(snapshotId = row[0].asLong(), schemaVersion = row[1].asLong(), endedFiles = ended)
         } catch (e: Exception) {
             throw HoglakeException.CommitOutcomeUnknown(txid, "invalid commit readback: ${e.message}")
         }
     }
 
+    /** The data files a replacement ended under [key]; null when it recorded none, or the tenant has no such table. */
+    private fun endedFilesOf(
+        store: HogliteCatalogStore,
+        catalog: String,
+        key: UUID,
+    ): Long? {
+        val exists =
+            store.queryCatalog(
+                catalog,
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'receipt_ended'",
+            ).firstRow()!![0].asLong() > 0
+        if (!exists) return null
+        return store.queryCatalog(
+            catalog,
+            "SELECT ended_files FROM receipt_ended WHERE idempotency_key = ?",
+            key.toString(),
+        ).firstRow()?.get(0)?.asLong()
+    }
+
     private fun replayedReceipt(
+        store: HogliteCatalogStore,
         catalog: String,
         key: UUID,
         fingerprint: ByteArray,
@@ -1050,7 +1230,7 @@ internal object HogliteCommit {
         } else {
             Metrics.commitReceiptUnknownDigestVersion(catalog)
         }
-        return CommitResult(row[1].asLong(), row[2].asLong())
+        return CommitResult(row[1].asLong(), row[2].asLong(), endedFilesOf(store, catalog, key))
     }
 
     /** The durable publication receipt, as GET /commit/receipts/{operation} serves it. */
@@ -1069,7 +1249,11 @@ internal object HogliteCommit {
                 ?: throw HoglakeException.NotFound(
                     "no commit receipt for operation $operation in catalog '$catalog'",
                 )
-        return CommitResult(snapshotId = row[0].asLong(), schemaVersion = row[1].asLong())
+        return CommitResult(
+            snapshotId = row[0].asLong(),
+            schemaVersion = row[1].asLong(),
+            endedFiles = endedFilesOf(store, catalog, operation),
+        )
     }
 
     // ---- internals ----------------------------------------------------------
@@ -1081,6 +1265,10 @@ internal object HogliteCommit {
         val expectedUuids = linkedSetOf<UUID>()
         var appends: Boolean = false
         var deletes: Boolean = false
+        var ends: Boolean = false
+
+        /** An `all_files` end: guarded table-wide, like a delete target. */
+        var endsAll: Boolean = false
     }
 
     /** One append planned against its table, with the running row offset within the commit. */
@@ -1149,6 +1337,8 @@ internal object HogliteCommit {
         private val specAt = HashMap<String, Int>()
         private val columnTypesAt = HashMap<String, Int>()
         private val layoutAt = HashMap<String, Int>()
+        private val singleSpecAt = HashMap<String, Int>()
+        private val tupleConflictAt = HashMap<String, Int>()
         private var claimsAt: Int? = null
         private var retainedAt: Int? = null
         private var conflictsAt: Int? = null
@@ -1183,6 +1373,14 @@ internal object HogliteCommit {
                     ?: throw HoglakeException.NotFound("table '${t.namespace}.${t.table}' in catalog '$catalog'")
             return store.tableRowOf(row)
         }
+
+        /** Whether [table] has only ever had one partition spec, begun with the table. */
+        fun singleSpec(table: HogliteCatalogStore.TableRow): Boolean =
+            results[singleSpecAt.getValue(key(table.namespace, table.name))].firstRow()!![0].asLong() == 1L
+
+        /** Whether another commit touched the tuples a `partitions` end of [table] targets since the read. */
+        fun tupleConflict(table: HogliteCatalogStore.TableRow): Boolean =
+            results[tupleConflictAt.getValue(key(table.namespace, table.name))].firstRow()!![0].asLong() > 0L
 
         /** The live partition spec at the plan head of an appended table ([HogliteCatalogStore.specAt]). */
         fun spec(table: HogliteCatalogStore.TableRow): PartitionSpec? =
@@ -1294,7 +1492,21 @@ internal object HogliteCommit {
                                 "AND v.end_snapshot IS NULL AND t.dropped_snapshot IS NULL",
                             id,
                         )
-                    if (t.appends) {
+                    if (t.ends &&
+                        request.fileEnds.orEmpty().any {
+                            it.namespace == t.namespace && it.table == t.table && it.partitions != null
+                        }
+                    ) {
+                        // Whether the table has only ever had its one live spec, begun with it.
+                        p.singleSpecAt[key] =
+                            p.add(
+                                "SELECT CASE WHEN COUNT(*) = 1 AND MAX(s.begin_snapshot) <= " +
+                                    "(SELECT created_snapshot FROM tables WHERE id = $LIVE_TABLE_ID_SQL) " +
+                                    "THEN 1 ELSE 0 END FROM partition_specs s WHERE s.table_id = $LIVE_TABLE_ID_SQL",
+                                id + id,
+                            )
+                    }
+                    if (t.appends || t.ends) {
                         p.specAt[key] =
                             p.add(
                                 "SELECT spec_id, fields_json FROM partition_specs " +
@@ -1303,6 +1515,8 @@ internal object HogliteCommit {
                                     "ORDER BY spec_id DESC LIMIT 1",
                                 id,
                             )
+                    }
+                    if (t.appends) {
                         p.columnTypesAt[key] =
                             p.add(
                                 "SELECT field_id, type FROM columns WHERE table_id = $LIVE_TABLE_ID_SQL " +
@@ -1367,7 +1581,8 @@ internal object HogliteCommit {
                     // content arm (an empty IN-list is not SQL) only the
                     // unchanged delete targets.
                     val all = touched.toList()
-                    val unchanged = if (request.requireUnchangedTables) all.filter { it.deletes } else emptyList()
+                    val unchanged =
+                        all.filter { it.endsAll || (request.requireUnchangedTables && it.deletes) }
                     val contentArm =
                         if (unchanged.isEmpty()) {
                             ""
@@ -1390,6 +1605,24 @@ internal object HogliteCommit {
                         )
                 }
 
+                // A `partitions` end conflicts only on its own tuples: statements
+                // answered in the same snapshot as the window above.
+                if (readSnapshot != null) {
+                    for (end in request.fileEnds.orEmpty()) {
+                        if (end.partitions == null) continue
+                        val id = listOf(end.namespace, end.table)
+                        p.tupleConflictAt[key(end.namespace, end.table)] =
+                            p.add(
+                                tupleConflictSql(LIVE_TABLE_ID_SQL),
+                                tupleConflictArgs(
+                                    id,
+                                    store.json.writeValueAsString(FileEnds.tupleJson(end)),
+                                    readSnapshot,
+                                ),
+                            )
+                    }
+                }
+
                 // Durable DV targets, for the object-prefix check on layout
                 // tables; by primary key, filtered to the DV's table in Kotlin.
                 val targets =
@@ -1410,6 +1643,31 @@ internal object HogliteCommit {
             }
         }
     }
+
+    /**
+     * The count of commits' traces on the tuples of a `partitions` end since a read snapshot: a data
+     * file of the table in one of them that began or ended, or a deletion vector registered against
+     * one, outside compaction snapshots (which rewrite files and no rows). [tableExpr] names the
+     * table; its `?`s are bound first by [tupleConflictArgs].
+     */
+    private fun tupleConflictSql(tableExpr: String): String {
+        fun compactedAt(column: String) =
+            "EXISTS (SELECT 1 FROM changes c WHERE c.snapshot_id = $column " +
+                "AND c.kind = 'table_compacted' AND c.object_id = f.table_id)"
+        val tuples = "f.partition_values_json IN (SELECT value FROM json_each(?))"
+        return "SELECT (SELECT COUNT(*) FROM files f WHERE f.table_id = $tableExpr AND $tuples " +
+            "AND ((f.begin_snapshot > ? AND NOT ${compactedAt("f.begin_snapshot")}) " +
+            "OR (f.end_snapshot > ? AND NOT ${compactedAt("f.end_snapshot")}))) + " +
+            "(SELECT COUNT(*) FROM dvs d JOIN files f ON f.id = d.data_file_id " +
+            "WHERE f.table_id = $tableExpr AND d.table_id = f.table_id AND $tuples " +
+            "AND d.begin_snapshot > ? AND NOT ${compactedAt("d.begin_snapshot")})"
+    }
+
+    private fun tupleConflictArgs(
+        tableArgs: List<Any?>,
+        tuplesJson: String,
+        readSnapshot: Long,
+    ): List<Any?> = tableArgs + tuplesJson + readSnapshot + readSnapshot + tableArgs + tuplesJson + readSnapshot
 
     /** The live namespace id of a name, as [HogliteCatalogStore.liveNamespace] resolves it. One `?`: the name. */
     private const val LIVE_NAMESPACE_ID_SQL = "SELECT id FROM namespaces WHERE name = ? AND dropped_snapshot IS NULL"
@@ -1484,9 +1742,8 @@ internal object HogliteCommit {
         resolved: Map<String, HogliteCatalogStore.TableRow>,
         request: CommitRequest,
     ): List<Long> {
-        if (!request.requireUnchangedTables) return emptyList()
         return order.values
-            .filter { it.deletes }
+            .filter { it.endsAll || (request.requireUnchangedTables && it.deletes) }
             .map { resolved.getValue("${it.namespace}.${it.table}").tableId }
     }
 

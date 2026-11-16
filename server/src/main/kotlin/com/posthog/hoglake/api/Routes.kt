@@ -24,12 +24,15 @@ import com.posthog.hoglake.store.CatalogStoreSelector
 import com.posthog.hoglake.store.MountNames
 import com.posthog.hoglake.store.MountReadService
 import io.ktor.http.HttpStatusCode
+import io.ktor.http.Parameters
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
 import io.ktor.server.plugins.BadRequestException
 import io.ktor.server.request.receive
 import io.ktor.server.request.userAgent
 import io.ktor.server.response.respond
+import io.ktor.server.routing.RoutingCall
+import io.ktor.server.routing.RoutingPipelineCall
 import io.ktor.server.routing.delete
 import io.ktor.server.routing.get
 import io.ktor.server.routing.post
@@ -591,6 +594,27 @@ fun Application.installApiRoutes(
                     )
                 }
 
+                // Ends whole live files and appends in ONE snapshot. A dedicated
+                // endpoint, so an older server answers 404 instead of ignoring
+                // `file_ends` and publishing only the appends (a doubled day).
+                post("/commit/replacements/prepared") {
+                    val commits = selector.forCatalog(call, call.catalog())
+                    val req = call.receiveReplacement()
+                    if (req.deletes.isNotEmpty() || req.requireUnchangedTables == true) {
+                        throw BadRequestException(
+                            "a replacement cannot carry deletes or require_unchanged_tables",
+                        )
+                    }
+                    if (req.idempotencyKey == null || req.readSnapshot == null || req.fileEnds.isNullOrEmpty()) {
+                        throw com.posthog.hoglake.model.HoglakeException.Validation(
+                            "a replacement requires idempotency_key, read_snapshot and file_ends",
+                        )
+                    }
+                    call.respond(
+                        commits.commit(call.catalog(), req.toModel(), call.request.userAgent()).toDto(),
+                    )
+                }
+
                 // Distinct endpoint fences replicas that predate the DELETE contract.
                 post("/commit/deletes/prepared") {
                     val commits = selector.forCatalog(call, call.catalog())
@@ -684,12 +708,14 @@ fun Application.installApiRoutes(
                     val commits = selector.forCatalog(call, call.catalog())
                     val operation =
                         try {
-                            UUID.fromString(call.parameters["operation"])
+                            UUID.fromString(call.pathParam("operation"))
                         } catch (_: IllegalArgumentException) {
                             throw BadRequestException("invalid operation UUID")
                         }
                     val receipt = commits.receipt(call.catalog(), operation)
-                    call.respond(CommitReceiptDto(operation, receipt.snapshotId, receipt.schemaVersion))
+                    call.respond(
+                        CommitReceiptDto(operation, receipt.snapshotId, receipt.schemaVersion, receipt.endedFiles),
+                    )
                 }
 
                 post("/commit") {
@@ -988,8 +1014,24 @@ internal fun parseStatsFields(raw: String): Set<Long> {
 // ---- parameter helpers ---------------------------------------------------
 // internal (not private): ViewRoutes.kt shares them.
 
+/**
+ * A route value: the `{name}` segment of the path this call matched. Route
+ * values come from the path only, the same path the route table reads
+ * (auth/AuthPolicy.kt). The call's merged parameters also hold the query
+ * string's, so no handler reads a route value from them; a query value is
+ * read from `request.queryParameters`. RoutePathValuesTest holds every file
+ * under `api/` to this.
+ */
 internal fun ApplicationCall.pathParam(name: String): String =
-    parameters[name] ?: throw BadRequestException("missing path parameter '$name'")
+    pathValues()[name] ?: throw BadRequestException("missing path parameter '$name'")
+
+/** The matched route's path parameters; only a call inside a route handler has them. */
+private fun ApplicationCall.pathValues(): Parameters =
+    when (this) {
+        is RoutingCall -> pathParameters
+        is RoutingPipelineCall -> pathParameters
+        else -> error("a route value was read outside a route handler")
+    }
 
 internal fun ApplicationCall.catalog() = pathParam("catalog")
 
@@ -1088,6 +1130,19 @@ internal fun parseExpectedTableUuid(raw: String): UUID =
 internal suspend fun ApplicationCall.receiveCommit(): CommitRequestDto =
     receive<CommitRequestDto>().attributed(hoglakeAuth).also { req ->
         requireScopedNamespaces(catalog(), req.appends.map { it.namespace } + req.deletes.map { it.namespace })
+    }
+
+/**
+ * A replacement's body, attributed and held to a scoped caller's namespaces:
+ * the namespaces of its appends AND of the tables whose files it ends.
+ */
+internal suspend fun ApplicationCall.receiveReplacement(): ReplacementRequestDto =
+    receive<ReplacementRequestDto>().let { it.copy(author = resolveActor(hoglakeAuth, it.author)) }.also { req ->
+        requireScopedNamespaces(
+            catalog(),
+            req.appends.map { it.namespace } + req.deletes.map { it.namespace } +
+                req.fileEnds.orEmpty().map { it.namespace },
+        )
     }
 
 internal fun CommitRequestDto.attributed(auth: AuthState): CommitRequestDto = copy(author = resolveActor(auth, author))

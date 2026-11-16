@@ -51,7 +51,7 @@ object ContractVectors {
     /** Where the generator writes, relative to the server project (Gradle's test working directory). */
     const val PATH = "src/test/resources/oauth/contract-vectors.json"
 
-    private const val ORG = "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b"
+    internal const val ORG = "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b"
     private const val TENANT_TTL = 15 * 60L
     private const val OPERATOR_TTL = 5 * 60L
 
@@ -96,8 +96,10 @@ object ContractVectors {
             "A vector with a mutation field is verifier-only: its input minted as usual, then changed as the " +
                 "mutation says. No conforming issuer produces it; an issuer's suite skips it.",
             "expect is the verdict at verify_at for HOGLAKE_AUTH_ISSUER=issuer, HOGLAKE_AUTH_AUDIENCE=hoglake, " +
-                "HOGLAKE_AUTH_PREDICATE_FIELDS=team_id, the default scoped lifetime cap (900s), and the rtg " +
-                "backends configured as hoglite.",
+                "HOGLAKE_AUTH_PREDICATE_FIELDS=team_id, the default scoped lifetime cap (900s), the rtg " +
+                "backends configured as hoglite, and HOGLAKE_AUTH_SESSION_PROFILE=off (the default).",
+            "The session profile's own vectors, verified with HOGLAKE_AUTH_SESSION_PROFILE=on, are in " +
+                "session-profile-vectors.json beside this file.",
             "ES256 signatures are randomised: re-minting gives the same header and claims segments, " +
                 "a different signature.",
             "The key is a test constant; test_private_key_d is published on purpose.",
@@ -154,7 +156,7 @@ object ContractVectors {
         return copy
     }
 
-    private fun tenantInput(
+    internal fun tenantInput(
         credential: String,
         name: String,
         scope: String,
@@ -168,7 +170,7 @@ object ContractVectors {
             put("delegates", delegates)
         }
 
-    private fun placement(): ObjectNode =
+    internal fun placement(): ObjectNode =
         mapper.createObjectNode().apply {
             put("backend_type", "hoglite")
             put("backend_id", BACKEND_ID)
@@ -176,37 +178,51 @@ object ContractVectors {
             put("incarnation", 1)
         }
 
-    private fun teams(): ObjectNode =
+    internal fun teams(): ObjectNode =
         mapper.createObjectNode().apply {
             put("42", "write")
             put("7", "read")
         }
 
-    private fun cat(scope: String): ObjectNode = mapper.createObjectNode().apply { putArray(ORG).add(scope) }
+    internal fun cat(scope: String): ObjectNode = mapper.createObjectNode().apply { putArray(ORG).add(scope) }
 
-    private fun rtg(): ObjectNode =
+    internal fun rtg(): ObjectNode =
         mapper.createObjectNode().apply {
             put("b", "hoglite")
             put("be", BACKEND_ID)
             put("t", "t_3fa8c1d9e2_1")
         }
 
-    private fun prd(): ObjectNode = mapper.createObjectNode().apply { set<JsonNode>(PREDICATE_FIELD, teams()) }
+    internal fun prd(): ObjectNode = mapper.createObjectNode().apply { set<JsonNode>(PREDICATE_FIELD, teams()) }
 
-    private fun accept(kind: String): ObjectNode =
+    internal fun accept(kind: String): ObjectNode =
         mapper.createObjectNode().apply {
             put("verdict", "accept")
             put("kind", kind)
         }
 
-    private fun refuse(reason: String): ObjectNode =
+    internal fun refuse(reason: String): ObjectNode =
         mapper.createObjectNode().apply {
             put("verdict", "refuse")
             put("reason", reason)
         }
 
+    /** The JWKS entry every vector file publishes for the shared test key. */
+    internal fun jwk(): ObjectNode =
+        mapper.createObjectNode().apply {
+            put("kty", "EC")
+            put("crv", "P-256")
+            put("x", KEY_X)
+            put("y", KEY_Y)
+            put("use", "sig")
+            put("alg", "ES256")
+            put("kid", KID)
+        }
+
+    internal const val TEST_PRIVATE_KEY_D = KEY_D
+
     /** One vector: the issuer-side input, and the claims (in token order) it mints to. */
-    private class Spec(
+    internal class Spec(
         val name: String,
         val description: String,
         val inputKey: String,
@@ -494,10 +510,33 @@ object ContractVectors {
                         "usr" to text(owner),
                     ),
             ),
+            Spec(
+                "tenant_session_profile_disabled",
+                "A tenant token carrying the session profile (docs/auth.md, \"Session profile with embedded " +
+                    "storage credentials\") presented to a verifier with HOGLAKE_AUTH_SESSION_PROFILE=off: " +
+                    "refused as profile_not_enabled, never read as a plain metadata token. The on-side vectors " +
+                    "are in session-profile-vectors.json.",
+                "client",
+                tenantInput(reader, "pyhoglake-reader", "read", false),
+                13,
+                refuse(JwtViolation.PROFILE_NOT_ENABLED),
+                mutation =
+                    "profile, version, purpose, primary_catalog, remote_schemas and a fictional aws object are added",
+                body =
+                    SessionProfileVectors.profileBody(
+                        listOf(
+                            "sub" to text(reader),
+                            "ten" to text("tenant"),
+                            "org" to text(ORG),
+                            "cat" to cat("read"),
+                            "cli" to text("pyhoglake-reader"),
+                        ),
+                    ),
+            ),
         )
     }
 
-    private fun sign(
+    internal fun sign(
         header: JsonNode,
         claims: JsonNode,
     ): String {

@@ -67,7 +67,7 @@ class HogliteOptionsIntegrationTest {
         ).rows
 
     @Test
-    fun `manual options routes use token placement without PostgreSQL and status stays unsupported`() {
+    fun `manual options routes use token placement without PostgreSQL`() {
         val c = freshCatalog()
         val id = UUID.randomUUID()
         val file = Files.createTempFile("options-backends", ".json")
@@ -124,8 +124,8 @@ class HogliteOptionsIntegrationTest {
                         client.get("/v1/catalogs/$c/maintenance/status") {
                             header(HttpHeaders.Authorization, "Bearer $token")
                         }
-                    assertThat(status.status).isEqualTo(HttpStatusCode.NotImplemented)
-                    assertThat(status.bodyAsText()).contains("not_supported_on_backend")
+                    assertThat(status.status).isEqualTo(HttpStatusCode.OK)
+                    assertThat(store.json.readTree(status.bodyAsText())["catalog"].asText()).isEqualTo(c)
                     assertThat(rows(c)).isEmpty()
                 }
             }

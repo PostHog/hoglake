@@ -1846,6 +1846,20 @@ ran on the local stack and what it showed.
   (add the `lint` recipe) as its own change, so the
   reformat lands as a reviewable diff rather than noise inside another.
 
+## Cross-repo specs for PostHog's deployment
+
+hoglake is issuer-neutral and `docs/auth.md` stays that way. The specs for
+how PostHog deploys it — the shared `hoglake` catalog on its Trino pools,
+Remote Schemas to its internal `gigahog` deployment, the session token with
+embedded storage credentials, and the cross-repo burndown lists — live in
+PostHog/hogtower under `docs/` (indexed in that repo's `AGENTS.md`):
+`docs/remote_schema.md`, `docs/truffle-hoglake-catalog-routing.md`,
+`docs/gigahog-imports-and-partitioning.md`, `docs/jwt-aws-session-design.md`,
+`docs/hoglake-auth-posthog-profile.md`. Read the relevant one before changing
+a cross-service contract; a design change goes into that spec first, and the
+contract itself into `docs/auth.md` here (hoglake owns the token contract;
+issuers conform to it).
+
 ## Doc index
 
 Reference docs live in [docs/](docs/); [README.md](README.md) is the

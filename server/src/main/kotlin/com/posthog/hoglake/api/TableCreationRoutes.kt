@@ -168,12 +168,11 @@ private suspend fun ApplicationCall.prepareCreation(
     )
 }
 
-private fun ApplicationCall.creationCatalog(): String =
-    parameters["catalog"] ?: throw BadRequestException("missing catalog")
+private fun ApplicationCall.creationCatalog(): String = pathParam("catalog")
 
 private fun ApplicationCall.creationOperation(): UUID =
     try {
-        UUID.fromString(parameters["operation"])
+        UUID.fromString(pathParam("operation"))
     } catch (_: IllegalArgumentException) {
         throw BadRequestException("invalid operation UUID")
     }
