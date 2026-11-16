@@ -1170,7 +1170,7 @@ variant-codec = [{ name = "pyhoglake-variant-codec", editable = "pyhoglake-varia
 
 [[package]]
 name = "pyhoglake-variant-codec"
-version = "0.1.0"
+version = "0.1.1"
 source = { editable = "pyhoglake-variant-codec" }
 
 [[package]]
