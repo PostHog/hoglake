@@ -388,7 +388,7 @@ class Hydrator(
         // inside the sweep transaction and recorded only after it commits.
         // A rollback discards [signals]: those files stayed pending (#488).
         val tallies = mutableMapOf<Long, MutableList<Long>>()
-        val signals = CommittedSignals()
+        val signals = CommittedSignals(startedAt)
         val processed =
             try {
                 jdbi.inTransaction<Int, Exception> { h ->
@@ -424,15 +424,15 @@ class Hydrator(
                         } catch (e: TransientFetchException) {
                             h.rollbackToSavepoint(FILE_SAVEPOINT)
                             // Transient: the file STAYS pending; the next sweep
-                            // retries it. The counter is the throttle-storm trace,
-                            // emitted with the rest of the sweep's signals so a
-                            // rolled-back sweep does not count the retry twice.
-                            signals.afterCommit {
-                                Metrics.hydratorTransientError()
-                                log.warn(e) {
-                                    "transient object-store failure hydrating file ${file.dataFileId} " +
-                                        "(${file.path}); leaving pending for the next sweep"
-                                }
+                            // retries it. The counter and the warning describe an
+                            // object-store event (a throttle or 5xx), not database
+                            // state: the attempt really happened, so they are
+                            // immediate and a rolled-back sweep still shows the
+                            // throttle storm (#488).
+                            Metrics.hydratorTransientError()
+                            log.warn(e) {
+                                "transient object-store failure hydrating file ${file.dataFileId} " +
+                                    "(${file.path}); leaving pending for the next sweep"
                             }
                             tally[3]++
                         } catch (e: Exception) {
@@ -440,7 +440,8 @@ class Hydrator(
                             // Structural: one bad file must not wedge the sweep.
                             signals.afterCommit {
                                 log.error(e) {
-                                    "hydration failed for file ${file.dataFileId} (${file.path}); marking failed"
+                                    "hydration failed for file ${file.dataFileId} (${file.path}); marking failed " +
+                                        "(sweep started ${signals.sweepStartedAt})"
                                 }
                             }
                             markFailed(h, file, signals = signals)
@@ -458,7 +459,6 @@ class Hydrator(
                 }
                 throw e
             }
-        signals.emit()
         val finishedAt = Instant.now()
         for ((catalogId, tally) in tallies) {
             runStore.recordSweepById(
@@ -476,6 +476,9 @@ class Hydrator(
                 ),
             )
         }
+        // After the ledger: the rows for work that DID commit are never
+        // skipped because a deferred signal threw.
+        signals.emit()
         return processed
     }
 
@@ -708,7 +711,8 @@ class Hydrator(
                 log.error {
                     "REGISTRATION MISMATCH for file ${file.dataFileId} (${file.path}): " +
                         "parquet footer has $footerRows rows but hog_data_file.record_count " +
-                        "is ${file.recordCount}; marking failed, writing no stats"
+                        "is ${file.recordCount}; marking failed, writing no stats " +
+                        "(sweep started ${signals.sweepStartedAt})"
                 }
             }
             markFailed(h, file, missingFieldIds, signals)
@@ -857,7 +861,8 @@ class Hydrator(
      * mismatch), [missingFieldIds] still records the contract check.
      * Rides the sweep transaction's handle (after a rollback to the
      * per-file savepoint the transaction is healthy again). The
-     * `failed` counter waits for the sweep to commit ([signals]).
+     * `failed` counter waits for the sweep to commit ([signals]); the
+     * "could not mark failed" error does not (see the catch below).
      */
     private fun markFailed(
         h: Handle,
@@ -887,9 +892,11 @@ class Hydrator(
                 .bind("dataFileId", file.dataFileId)
                 .execute()
         } catch (e: Exception) {
-            signals.afterCommit {
-                log.error(e) { "could not mark file ${file.dataFileId} failed" }
-            }
+            // Immediate, not deferred: this UPDATE fails inside a transaction
+            // Postgres has already aborted, so the sweep's COMMIT becomes a
+            // ROLLBACK and a deferred line would be discarded with it, leaving
+            // the operator the sweep-level failure without its cause (#488).
+            log.error(e) { "could not mark file ${file.dataFileId} failed" }
         }
     }
 
@@ -903,8 +910,22 @@ class Hydrator(
      * it already had, and nothing here interprets the text. One sweep
      * holds at most a handful of lines per claimed file, and a sweep
      * claims at most [runOnce]'s limit.
+     *
+     * Only signals that describe COMMITTED state belong here: the
+     * `provided`/`quarantined`/`failed` outcomes and the per-file outcome
+     * lines. Object-store events (the transient-error counter and warning)
+     * and the "could not mark failed" error are emitted immediately, since
+     * they happened whether or not the sweep commits.
+     *
+     * Trade-offs: a structural `hydration failed` stack trace is lost when
+     * its sweep rolls back; that is acceptable because a deterministic
+     * failure is logged again on the retry. Deferred lines appear at the end
+     * of the sweep, up to a sweep-limit of files later, so their timestamps
+     * do not say when a file was processed; the structural-failure and
+     * registration-mismatch lines therefore carry [sweepStartedAt].
+     * [emit] isolates each action, so one that throws cannot skip the rest.
      */
-    private class CommittedSignals {
+    private inner class CommittedSignals(val sweepStartedAt: Instant) {
         private val actions = ArrayList<() -> Unit>()
 
         fun afterCommit(action: () -> Unit) {
@@ -912,7 +933,13 @@ class Hydrator(
         }
 
         fun emit() {
-            for (action in actions) action()
+            for (action in actions) {
+                try {
+                    action()
+                } catch (e: Exception) {
+                    log.warn(e) { "a post-commit hydrator signal failed" }
+                }
+            }
         }
     }
 
