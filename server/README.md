@@ -1020,6 +1020,24 @@ It uses the server's object-store configuration, as PostgreSQL cleanup does.
 Per-call AWS identity remains separate work. Hoglite has no cleanup loop,
 catalog registry, or loop lease.
 
+Hoglite supports `POST /v1/catalogs/{catalog}/maintenance/compact` for the
+catalog in the token's placement. Its `CompactionStorage` adapter uses the same
+`CompactionExecutor` as PostgreSQL. The executor owns packing, VARIANT layout
+probing, budget admission, Parquet rewriting, and result aggregation.
+The adapter reserves individual inputs and publishes with transaction-local guards.
+Each table plan reads at most `CompactionConfig.candidateBudget` candidates,
+in bucket, size, and file-ID order. The next window overlaps the trailing bucket
+by at most `minInputFiles - 1` files. This overlap prevents interleaved partitions
+from permanently stranding a static backlog.
+A bounded process-local cache retains fetch cursors and shared VARIANT layout observations across manual calls.
+A process restart can repeat work. Correct claims and publication do not depend on this cache.
+New tenant schemas include the live bucket-order index.
+Without that index, each plan uses one capped read instead of repeated sorted pages.
+Run manual cleanup to drain old staged-output tickets.
+The server owns the shared object store and its configured credential provider.
+Per-call AWS identity remains separate work. Hoglite has no compaction loop,
+catalog registry, fleet sweep, or loop lease.
+
 Physical deletion is decoupled and paranoid
 (`service/CleanupService.kt`): the queue is a *suggestion*. At drain
 time every path is re-checked against live references — a
@@ -2072,21 +2090,44 @@ with files deviating the same way, drops files it knows DuckDB wrote,
 and packs the rest — the declared layout's, the never-probed, and any
 entry judged against an older declaration — together as before. A
 remembered remainder forms no group until enough files of its layout are
-known, except by a LOAN: while the rest (declared and never-probed)
-form no group of their own, remembered populations are tried largest
-first, and the first is lent the shortest prefix of the never-probed
-files in candidate order, at most `minInputFiles − 1`, such that the planner's packing
-of population + loan forms a group that holds every lent file and a
-population file the population's own packing left out, and that passes
-the sorted-budget shape admission (below). So a population at or past
-the minimum can borrow to complete one of its size bands, and one whose
-layout the budgets refuse is passed over (a loan merely considered is
-not counted as a refusal). Only prefixes are tried, which keeps the
-search bounded and the same every sweep, so a completer queued behind a
-file that doesn't complete is skipped until the candidate order changes.
-The probe sorts the lent files out; at most
-one loan per bucket per sweep, and a lent file is probed and
-remembered, so never lent again. Deviations
+known, except by a LOAN. A never-probed file is IDLE when it is in no
+group of the rest (declared and never-probed) that the planner would
+run: a main group the declared estimate's budget admission (the
+`spill_budget` / `merge_budget` check below) refuses is no work, this
+sweep or any other, so its never-probed files are as idle as those in
+no group, while a group it admits keeps every file it holds. Remembered
+populations are tried largest first, and the first is lent the shortest
+prefix of the idle files in candidate order, at most
+`minInputFiles − 1`, such that the planner's packing of population + loan
+forms a group that holds every lent file and a population file the
+population's own packing left out, and that passes the sorted-budget
+shape admission (below). So a population at or past the minimum can borrow to complete
+one of its size bands, and one whose layout the budgets refuse is passed
+over (a loan merely considered is not counted as a refusal). Only
+prefixes are tried, which keeps the search bounded and the same every
+sweep, so a completer queued behind a file that doesn't complete is
+skipped until the candidate order changes. The probe sorts the lent
+files out; at most one loan per bucket per sweep, and a lent file is
+probed and remembered, so never lent again. A loan is made only if the
+planner's packing of the rest WITHOUT it still holds every admitted main
+group with the same files: a file lent from a refused band of files no
+larger than an admitted band's would otherwise shift the smallest-first
+packing, close the refused remainder with the admitted band's first file
+and strand its other four until something arrived. And the search is
+bounded per bucket whatever the backlog: only the first fan-in
+(`effectiveMaxInputFiles`) of idle files in candidate order is offered,
+and only the eight largest remembered populations WITH a stranded file
+are tried (`VariantLayoutGroups.LOAN_POPULATIONS_TRIED`; one whose files
+all pack has nothing to complete and takes no slot), so a bucket of
+thousands of refused unknowns beside dozens of layouts costs one packing
+of its main population, one of each remembered population's own files,
+a bounded tail per population tried, and one more packing of main per
+loan found and checked against the admitted groups (at most eight) —
+not a packing of the backlog per layout every sweep. A loan that proves to be
+another layout leaves every file of its group where it was, the lent
+file now remembered where it belongs, and is charged as one
+`layout_probe_only` attempt (below): the one speculation a bucket makes
+a sweep, paid once per arrival, never twice for the same file. Deviations
 rather than whole layouts, so a file written before a
 variant column was added (which the rewrite null-fills) packs with later
 files of its layout; the declaration's fingerprint, so DDL
@@ -2116,9 +2157,11 @@ wider than the declaration is refused on its real leaf count without a
 re-probe. A layout the
 budgets refuse is probed and charged once (`layout_probe_only`, below),
 and on every later sweep refused by the planner without reading a
-footer: counted as `spill_budget_exceeded` / `merge_budget_exceeded`
-(ledger and `hoglake_compaction_skipped_total`) like the planner's other
-budget refusals, and not charged to
+footer: counted like the planner's other budget refusals — in the ledger
+as `spill_budget_exceeded` / `merge_budget_exceeded`, in Prometheus as
+`hoglake_compaction_skipped_total{reason="spill_budget"}` /
+`{reason="merge_budget"}` (the metric's labels drop the `_exceeded`; the
+budget section above maps the two) — and not charged to
 `HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN`. Admission is recomputed every
 plan from the current inputs and budgets, so raising
 `HOGLAKE_COMPACTION_SORTED_HEAP_BYTES` / `HOGLAKE_COMPACTION_SPILL_BYTES`
@@ -2146,11 +2189,20 @@ footer, so it is charged as one attempt against
 `layout_probe_only` and in
 `hoglake_compaction_skipped_total{reason="layout_probe_only"}`. A
 budget-refused layout is charged this way only at its first probe; after
-that it recurs as a planner `spill_budget_exceeded` /
-`merge_budget_exceeded` (above), whose levers are
+that it recurs as a planner refusal — ledger `spill_budget_exceeded` /
+`merge_budget_exceeded`, Prometheus
+`hoglake_compaction_skipped_total{reason="spill_budget"}` /
+`{reason="merge_budget"}` (above) — whose levers are
 `HOGLAKE_COMPACTION_SORTED_HEAP_BYTES` / `HOGLAKE_COMPACTION_SPILL_BYTES`.
-So a steady `layout_probe_only` rate means the memory is being lost
-(restarts, its 250k-entry capacity, or shape eviction).
+A recurring `layout_probe_only` rate has one ORDINARY cause: a loan that
+did not pay off. A remembered remainder borrows an arrival (above), the
+probe finds it in another layout, nothing runs, and the attempt is
+charged — once per such arrival, since the arrival is then remembered
+and never lent again, so the rate is bounded by the arrival rate into
+buckets that hold a short remainder, and the remainder's own files are
+not counted again in `files_left` (below). Read a rate past what
+arrivals explain as the memory being lost (restarts, its 250k-entry
+capacity, or shape eviction).
 A group split into N parts spends N attempts, so a sweep can
 run past `HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN` by at most
 (layouts − 1) × `HOGLAKE_COMPACTION_PARALLEL_GROUPS` in its last wave;
@@ -2173,8 +2225,16 @@ layout="declared"|"other"}` — outputs per layout. It measures rewrites
 only: a falling `other` rate means less rewriting in old layouts, not
 that an old layout is gone — and
 `hoglake_compaction_variant_layout_files_left_total{catalog}`, files set
-aside for want of company in their layout (each once, since the memory
-keeps them out of the next plan).
+aside for want of company in their layout: each once per time the memory
+LEARNS it is set aside (the entry records it), since the memory keeps it
+out of the next plan. A remembered file probed again — a remainder as
+the company of a loan that proves to be another layout, a declared file
+beside arrivals that prove so — and left exactly as it was is not
+counted again; the lent file, or the arrivals, are, once, as they are
+learned. Accumulated observations, not distinct live files: a file
+probed again after a restart or an eviction of its entry is learned anew
+and counted anew, so the counter's rate is "files newly set aside", and
+the files still waiting are the maintenance summary's debt.
 
 **A `split` after `set_variant_shredding` is EXPECTED**, for as long as
 files written under the previous declaration remain in a partition beside
@@ -2209,7 +2269,10 @@ a LIST or MAP layer counts as nested, so its chunk is divided by
 `HOGLAKE_COMPACTION_NESTED_SORT_EXPANSION` like a nested column's. Each part is
 re-admitted against its own bounds before its rewrite; a part the wider
 rows push over a budget the declared estimate fit is refused, counted
-with the planner's `spill_budget_exceeded` / `merge_budget_exceeded`.
+with the planner's budget refusals (ledger `spill_budget_exceeded` /
+`merge_budget_exceeded`, Prometheus
+`hoglake_compaction_skipped_total{reason="spill_budget"}` /
+`{reason="merge_budget"}`).
 The refusal is uncharged when another part of the group ran; when no
 part ran, the probe is charged as one `layout_probe_only` attempt
 (above). A part whose output leaf count cannot be computed skips the
@@ -2999,6 +3062,65 @@ under `enforce` this lookup needs `read` on the catalog. Under `off`, protect it
 with the same authenticated deployment boundary and catalog authorization as
 `/commit`; catalog scoping alone is not authentication. This change does not
 introduce an authentication framework or authorize any deployment.
+
+### Atomic partition replacement
+
+`atomic-partition-replacement-v1` adds `POST /v1/catalogs/{catalog}/commit/replacements/prepared`:
+the commit request plus `file_ends`, which ends whole live data files of a table
+and applies `appends` in **one snapshot** with the usual durable idempotency
+receipt (`GET /commit/receipts/{operation}` serves it). It is the commit a
+day-at-a-time backfill needs: a reader at the old snapshot sees the old day, a
+reader at the new one sees only the replacement, and none sees a day missing or
+doubled. It is a dedicated endpoint so an older server answers 404 instead of
+ignoring `file_ends` and publishing only the appends.
+
+Each `file_ends` entry names a table with its required `expected_table_uuid` and
+exactly one of `partitions` (non-empty tuples, as long as the live partition spec
+and spelled as `partition_values` are) or `all_files: true`. A `year`, `month`,
+`day`, `hour` or `bucket` value must be a base-10 integer string (`20401` for a
+day, not `2025-11-10`; null is allowed, identity values are not checked), else 422
+naming the table, field and value: a tuple is matched as a literal string, so a
+date spelled another way would end nothing and double the day. A tuple that
+matches no live file ends nothing and is not an error. The request needs
+`idempotency_key`, `read_snapshot`, `author` and `message`, and is refused with 400
+when `deletes` or `require_unchanged_tables` is present. `appends` may be empty.
+The response is the commit result plus `ended_files`, the data files ended; the
+receipt stores it, so a replay and `GET /commit/receipts/{operation}` return it too
+(a receipt written before it was stored omits it).
+
+Under the commit lock the server checks the incarnation, then the conflict window,
+then that no live file of the table was written under another partition spec (409
+`partition_spec_mismatch`; `all_files` is exempt; skipped without a scan when the
+table has only ever had one spec), then ends every matching live file and its live
+deletion vector, then appends. The conflict window depends on the end:
+
+- `all_files`: the table must be unchanged since `read_snapshot`, as a delete
+  target is. Inserts, deletes, ends, replacements and DDL conflict.
+- `partitions`: only the target tuples must be unchanged. Another commit that
+  began or ended a data file in one of them, or registered a deletion vector
+  against such a file, is a 409 `commit_conflict`, and so is any DDL on the table.
+  Appends to other partitions do not conflict, so a replacement does not livelock
+  under continuous appends elsewhere in the table.
+- **Compaction never conflicts**, in either case: the files ended are those live
+  at commit and a compaction planned against one skips it.
+
+Files appended by the request are never ended by it. A path the catalog already
+records as a data file, live or ended, cannot be appended here (422 naming the
+path): paths are deterministic, and overwriting an ended file's bytes would break
+every snapshot that still reads it. Nothing is deleted: ended files follow the
+normal retention, expiry and cleanup, as a truncate's do.
+
+The commit records `table_deleted_from` (and `table_inserted_into` with appends) on
+each table, which is what makes guarded writers that read earlier conflict. For a
+table whose files it really ended it also records `table_replaced`; a commit that
+ended nothing records none. The changefeed raises 409 `reconciliation_required`
+for a window that crosses a `table_replaced` (as for a truncate), on that row
+rather than on the ended files, which retention reclaims: the barrier holds at the
+retention floor too.
+
+Partition tuples are matched against the table's own live files, narrowed by the
+first key and then compared in full. The conflict probe for a `partitions` end
+reads the files and deletion vectors recorded since `read_snapshot`.
 
 ### Atomic DML transaction publication
 

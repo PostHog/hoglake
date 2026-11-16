@@ -51,5 +51,4 @@ fun Application.installAlterRoutes(
     }
 }
 
-private fun ApplicationCall.alterPathParam(name: String): String =
-    parameters[name] ?: throw BadRequestException("missing path parameter '$name'")
+private fun ApplicationCall.alterPathParam(name: String): String = pathParam(name)

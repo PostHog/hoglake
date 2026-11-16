@@ -285,14 +285,53 @@ internal object VariantLayoutGroups {
      * compaction, a fetch cut differently); the memory records nothing
      * about loans.
      *
-     * BOUNDED, and only when it costs nothing: the main population must
-     * form no group of its own (its unknowns are idle, so a probe of them
-     * is the only thing that happens to them this sweep), populations are
-     * tried largest first and the first loan is the bucket's only one, at
-     * most `minInputFiles - 1` files. So a bucket speculates on at most one
-     * group's probe a sweep, each unknown is speculated on at most once,
-     * and a declared arrival that had a group to join is never diverted
-     * from it. Returns the files borrowed.
+     * BOUNDED, and only when it costs nothing: only IDLE unknowns are
+     * lent — those in no main group the planner would run, so a probe of
+     * them is the only thing that happens to them this sweep — populations
+     * are tried largest first and the first loan is the bucket's only one,
+     * at most `minInputFiles - 1` files. So a bucket speculates on at most
+     * one group's probe a sweep, each unknown is speculated on at most
+     * once, and a declared arrival that had a group to join is never
+     * diverted from it.
+     *
+     * "A group the planner would run" is one [admitMain] passes: the
+     * planner's budget admission of a main group against the declared
+     * estimate, before the group is counted. A main group the budgets
+     * refuse is no work, so its unknowns are as idle as those in no group,
+     * and the refusal is what makes the loan matter: four remembered
+     * narrow files and four declared beside them, then one narrow arrival
+     * with more rows than the rest together, make a main group of five
+     * that the declared estimate refuses, every sweep, without a probe —
+     * while the five narrow files it strands fit their own remembered
+     * shape. A group [admitMain] passes keeps every file it holds — AS A
+     * GROUP, not only file by file: the planner packs main again without
+     * the loan, smallest first, and a file lent from a refused band of
+     * files no larger than an admitted band's shifts the sequence, so that
+     * the refused remainder closes with the admitted band's first file and
+     * strands its other four (two groups of five, the refused one first in
+     * size order, become five and four). A loan is made only if every
+     * admitted group is a group of that repacking, with the same files;
+     * otherwise the population is passed over, as if nothing completed it.
+     *
+     * WORK PER BUCKET PER SWEEP is bounded independently of the backlog:
+     * at most the first [maxInputFiles] idle files in candidate order are
+     * offered (a loan is a prefix of that order and at most
+     * `minInputFiles - 1` long, so this loses only a completer that sits
+     * behind a fan-in's worth of non-completers), and at most
+     * [LOAN_POPULATIONS_TRIED] populations WITH A STRANDED FILE are tried,
+     * largest first — a population whose files all pack has nothing to
+     * complete and takes no slot, or eight self-packing layouts would hide
+     * a ninth with a remainder; telling the two apart costs one packing of
+     * the population's own files, which `pack` makes again anyway. So a
+     * bucket whose refused main population holds thousands of unknowns
+     * beside dozens of remembered layouts costs one packing of main, one
+     * of each population's own files until eight with a remainder are
+     * found, at most [LOAN_POPULATIONS_TRIED] x `minInputFiles` packings
+     * of a population plus a fan-in of files, and one more packing of main
+     * for each loan found and checked against the admitted groups (at most
+     * [LOAN_POPULATIONS_TRIED]: 1 + 8 packings of main in the worst case)
+     * — never a packing of the whole backlog per layout. Returns the files
+     * borrowed.
      */
     fun borrow(
         populations: VariantLayoutMemory.Populations,
@@ -300,13 +339,35 @@ internal object VariantLayoutGroups {
         minInputFiles: Int,
         maxInputFiles: Int,
         admit: (deviations: Long, group: List<CompactionCandidate>) -> Boolean = { _, _ -> true },
+        admitMain: (group: List<CompactionCandidate>) -> Boolean = { true },
         size: (CompactionCandidate) -> Long,
     ): List<CompactionCandidate> {
         if (populations.unknown.isEmpty()) return emptyList()
-        if (grouping.groups(populations.main, minInputFiles, maxInputFiles, size).isNotEmpty()) return emptyList()
+        // Main as the planner packs it: the groups it would run keep their
+        // files, and nothing in one of them is idle. A refused group is
+        // repacked without its loan, and judged again, by `pack`.
+        val admitted =
+            grouping.groups(populations.main, minInputFiles, maxInputFiles, size)
+                .filter(admitMain)
+                .map { it.toSet() }
+        val reserved = admitted.flatten().toSet()
+        val idle = populations.unknown.filter { it !in reserved }.take(maxInputFiles)
+        if (idle.isEmpty()) return emptyList()
+        var tried = 0
         for (other in populations.others.sortedByDescending { it.files.size }) {
-            val lent =
-                loanFor(other, populations.unknown, grouping, minInputFiles, maxInputFiles, admit, size) ?: continue
+            if (tried == LOAN_POPULATIONS_TRIED) break
+            // What the population's own packing leaves out. Nothing: it has
+            // nothing to complete, and takes no slot.
+            val stranded = strandedOf(other.files, grouping, minInputFiles, maxInputFiles, size)
+            if (stranded.isEmpty()) continue
+            tried++
+            val lent = loanFor(other, stranded, idle, grouping, minInputFiles, maxInputFiles, admit, size) ?: continue
+            // What `pack` will make of main without the loan: every admitted
+            // group must still be there, file for file, or the loan would
+            // trade an admitted rewrite for a stranded remainder.
+            val repacked =
+                grouping.groups(populations.main - lent.toSet(), minInputFiles, maxInputFiles, size).map { it.toSet() }
+            if (!admitted.all { it in repacked }) continue
             // Lent files leave the main population AND its unknowns: they
             // are the borrowing population's now, and nothing may lend them
             // twice.
@@ -318,9 +379,26 @@ internal object VariantLayoutGroups {
         return emptyList()
     }
 
-    /** The loan [borrow] makes [other] from [unknown], under its rule; null when no loan would form an admitted group. */
+    /** The files of a population that its own packing leaves out: what a loan completes. */
+    private fun strandedOf(
+        files: List<CompactionCandidate>,
+        grouping: CompactionGrouping,
+        minInputFiles: Int,
+        maxInputFiles: Int,
+        size: (CompactionCandidate) -> Long,
+    ): Set<CompactionCandidate> {
+        val packedAlone = grouping.groups(files, minInputFiles, maxInputFiles, size).flatten().toSet()
+        return files.filterNot { it in packedAlone }.toSet()
+    }
+
+    /**
+     * The loan [borrow] makes [other], whose own packing leaves [stranded]
+     * out, from [unknown], under its rule; null when no loan would form an
+     * admitted group.
+     */
     private fun loanFor(
         other: VariantLayoutMemory.Other,
+        stranded: Set<CompactionCandidate>,
         unknown: List<CompactionCandidate>,
         grouping: CompactionGrouping,
         minInputFiles: Int,
@@ -329,9 +407,6 @@ internal object VariantLayoutGroups {
         size: (CompactionCandidate) -> Long,
     ): List<CompactionCandidate>? {
         val files = other.files
-        val packedAlone = grouping.groups(files, minInputFiles, maxInputFiles, size).flatten().toSet()
-        val stranded = files.filterNot { it in packedAlone }.toSet()
-        if (stranded.isEmpty()) return null
         // Which unknowns pack with a stranded file at all, in one packing
         // of everything idle; then the fewest of those, in candidate order,
         // that complete a group on their own — the packing is not
@@ -398,6 +473,16 @@ internal object VariantLayoutGroups {
      * rewrite always paid for the rest.
      */
     const val FOOTER_RETENTION_BYTES: Long = 16L * 1024 * 1024
+
+    /**
+     * The most remembered populations [borrow] tries for a loan in one
+     * bucket, largest first. A bucket holds one remembered population per
+     * layout its files have been written in — a declaration the table has
+     * had, a writer that laid files out itself — and the largest are the
+     * ones a loan is likeliest to complete; eight is more than any table
+     * has had, and bounds the search against a bucket where it is not.
+     */
+    const val LOAN_POPULATIONS_TRIED = 8
 }
 
 /**
@@ -439,8 +524,25 @@ internal class VariantLayoutMemory(
 ) {
     private data class Key(val catalogId: Long, val dataFileId: Long)
 
-    /** [declared] the declaration's fingerprint at probe time; [deviations] the file's, or [DUCKDB]. */
-    data class Known(val declared: Long, val deviations: Long) {
+    /**
+     * [declared] the declaration's fingerprint at probe time; [deviations]
+     * the file's, or [DUCKDB]; [setAside] whether a probe has left the file
+     * behind for want of company in its layout — what the `files_left`
+     * counter counts, once per entry, so that a file probed again (a
+     * remainder lent an arrival that proved to be another layout; a
+     * declared file beside arrivals that did) and left again is not
+     * counted again. False for an entry made at registration (a compaction
+     * output), and never read by the planner.
+     *
+     * RESET BY EVERY PROBE, not sticky: a probe that puts the file in a
+     * part remembers it as not set aside, whether or not that part then
+     * compacts. A part refused on re-admission or failed leaves the file
+     * live and remembered as company found, so a later probe that leaves
+     * it again counts it again — the memory had unlearned it, and learns
+     * it anew, as after an eviction. Sticky, the flag would under-count by
+     * exactly those files, and nothing would ever clear it but a commit.
+     */
+    data class Known(val declared: Long, val deviations: Long, val setAside: Boolean = false) {
         val duckdb: Boolean get() = deviations == DUCKDB
     }
 
@@ -461,8 +563,9 @@ internal class VariantLayoutMemory(
         dataFileId: Long,
         declared: Long,
         deviations: Long,
+        setAside: Boolean = false,
     ) {
-        known[Key(catalogId, dataFileId)] = Known(declared, deviations)
+        known[Key(catalogId, dataFileId)] = Known(declared, deviations, setAside)
     }
 
     /** What is remembered of a file, or null for one never probed (or forgotten). */

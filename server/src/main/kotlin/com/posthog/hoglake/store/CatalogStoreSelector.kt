@@ -4,12 +4,19 @@ import com.fasterxml.jackson.databind.JsonNode
 import com.posthog.hoglake.Config
 import com.posthog.hoglake.auth.Routing
 import com.posthog.hoglake.auth.hoglakeAuth
+import com.posthog.hoglake.auth.requireCatalogEntitlement
 import com.posthog.hoglake.auth.verifiedBackendToken
+import com.posthog.hoglake.compaction.CompactionConfig
+import com.posthog.hoglake.compaction.ParquetRewriter
 import com.posthog.hoglake.hoglite.HogliteCatalogStore
 import com.posthog.hoglake.hoglite.HogliteCleanup
 import com.posthog.hoglake.hoglite.HogliteClient
+import com.posthog.hoglake.hoglite.HogliteCompaction
+import com.posthog.hoglake.hoglite.HogliteCompactionCursors
+import com.posthog.hoglake.hoglite.HogliteMaintenanceStatus
 import com.posthog.hoglake.hoglite.HoglitePartitionLookupAdmission
 import com.posthog.hoglake.hoglite.HogliteTenantResolver
+import com.posthog.hoglake.hydrator.ObjectStore
 import com.posthog.hoglake.model.CatalogInfo
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.observability.Metrics
@@ -46,11 +53,14 @@ class CatalogStoreSelector(
      * Client (Config refuses both at boot).
      */
     private val mountHosts: MountHostResolver = MountHostResolver.NONE,
+    /** The server owns this store. Compaction borrows it for one request. */
+    private val objectStore: () -> ObjectStore = { error("compaction object store is not configured") },
     /** The server owns this store. Request-scoped cleanup backends only borrow it. */
     private val removalStore: () -> RemovalStore = { error("cleanup object store is not configured") },
 ) : CatalogRegistry {
     private val clients = ConcurrentHashMap<UUID, HogliteClient>()
     private val lookupAdmissions = ConcurrentHashMap<UUID, HoglitePartitionLookupAdmission>()
+    private val compactionCursors = ConcurrentHashMap<UUID, HogliteCompactionCursors>()
     private val requestStore = AttributeKey<HogliteCatalogStore>("HoglakeCatalogStore")
 
     /**
@@ -79,14 +89,18 @@ class CatalogStoreSelector(
     /**
      * A mount name resolves first (to the Host's mount on a Client, else to
      * this instance's own), then verified placement, then the default backend.
+     * Whatever [catalog] a handler passes, it resolves only when the caller's
+     * token allows that name (auth/StoreEntitlement.kt).
      */
     override fun resolve(
         call: ApplicationCall,
         catalog: String,
     ): CatalogBinding {
         call.attributes.getOrNull(boundCatalog)?.let { (name, binding) -> if (name == catalog) return binding }
+        // Before any binding: a name resolves only when the caller's token allows it.
+        call.requireCatalogEntitlement(catalog)
         val binding =
-            remote(call, catalog) ?: mount(call, catalog) ?: run {
+            remoteBinding(call, catalog) ?: mount(call, catalog) ?: run {
                 val routing = call.hoglakeAuth.callerOrNull?.routing
                 CatalogBinding.Local(
                     if (routing != null && routing.catalog == catalog) routed(call, routing) else fallback(catalog),
@@ -104,8 +118,19 @@ class CatalogStoreSelector(
      * nothing is sent. A refusal is counted against the name only once the
      * caller's verified `cat` is known to hold it; before that the name is
      * raw request input and would mint a series per probe.
+     *
+     * The scan route asks here before [resolve], so the token is checked
+     * here as it is there (auth/StoreEntitlement.kt).
      */
     fun remote(
+        call: ApplicationCall,
+        catalog: String,
+    ): CatalogBinding.Remote? {
+        call.requireCatalogEntitlement(catalog)
+        return remoteBinding(call, catalog)
+    }
+
+    private fun remoteBinding(
         call: ApplicationCall,
         catalog: String,
     ): CatalogBinding.Remote? {
@@ -337,7 +362,16 @@ class CatalogStoreSelector(
         call: ApplicationCall,
         catalog: String,
         postgres: () -> CompactionBackend,
-    ): CompactionBackend = postgresMaintenance(call, catalog, postgres)
+    ): CompactionBackend =
+        (forCatalog(call, catalog) as? HogliteCatalogStore)?.let {
+            HogliteCompaction(
+                it, objectStore(), hogliteCompactionConfig(),
+                cursors =
+                    compactionCursors.computeIfAbsent(checkNotNull(call.hoglakeAuth.callerOrNull?.routing).backendId) {
+                        HogliteCompactionCursors()
+                    },
+            )
+        } ?: postgres()
 
     fun retirement(
         call: ApplicationCall,
@@ -374,18 +408,28 @@ class CatalogStoreSelector(
         call: ApplicationCall,
         catalog: String,
         postgres: () -> MaintenanceStatusBackend,
-    ): MaintenanceStatusBackend = postgresMaintenance(call, catalog, postgres)
+    ): MaintenanceStatusBackend =
+        (forCatalog(call, catalog) as? HogliteCatalogStore)?.let {
+            val config = checkNotNull(cfg)
+            HogliteMaintenanceStatus(
+                it,
+                config.hydratorIntervalMs,
+                config.expiryIntervalMs,
+                config.cleanupIntervalMs,
+                config.compactionIntervalMs,
+                config.retirementIntervalMs,
+                config.compactionTargetBytes,
+            )
+        } ?: postgres()
 
-    private fun <T> postgresMaintenance(
-        call: ApplicationCall,
-        catalog: String,
-        postgres: () -> T,
-    ): T {
-        requirePostgres(call, catalog)
-        return postgres()
+    /** Fleet reads require a configured PostgreSQL backend, not a tenant placement. */
+    fun requirePostgresInstance() {
+        if (cfg != null && cfg.defaultBackend == "none" && cfg.postgresBackendId.isEmpty()) {
+            throw HoglakeException.NotSupported("this operation requires a PostgreSQL backend")
+        }
     }
 
-    /** Maintenance is PostgreSQL-only. Resolve placement before any service or body work. */
+    /** Refuse PostgreSQL-only operations before any service or body work. */
     fun requirePostgres(
         call: ApplicationCall,
         catalog: String,
@@ -419,8 +463,12 @@ class CatalogStoreSelector(
                 }
         }
 
-    /** Build a store from trusted placement. This method does not discover catalogs or start background work. */
-    fun forPlacement(placement: Routing): CatalogStore =
+    /**
+     * Build a store from trusted placement. This method does not discover
+     * catalogs or start background work. It checks no token, so it is not
+     * part of the public surface: nothing in the server calls it.
+     */
+    internal fun forPlacement(placement: Routing): CatalogStore =
         when (placement.backend) {
             BackendKind.POSTGRES -> postgres ?: throw HoglakeException.NotFound("catalog '${placement.catalog}'")
             BackendKind.HOGLITE -> hogliteStore(placement, client(placement.backendId), operatorAuthority = true)
@@ -454,6 +502,36 @@ class CatalogStoreSelector(
             expiryPurgePage = cfg.expiryPurgePage,
             expiryPurgeBudgetMs = cfg.expiryPurgeBudgetMs,
         )
+
+    private fun hogliteCompactionConfig(): CompactionConfig {
+        val c = checkNotNull(cfg)
+        return CompactionConfig(
+            targetBytes = c.compactionTargetBytes,
+            minInputFiles = c.compactionMinInputFiles,
+            maxInputFiles = c.compactionMaxInputFiles,
+            maxGroupsPerRun = c.compactionMaxGroupsPerRun,
+            candidateHeadroom = c.compactionCandidateHeadroom,
+            maxCandidates = c.compactionMaxCandidates,
+            maxFanIn = c.compactionMaxFanIn,
+            parallelGroups = c.compactionParallelGroups,
+            inputOpenParallelism = c.compactionParallelInputOpens,
+            claimsEnabled = c.compactionClaimsEnabled,
+            claimTtlSeconds = c.compactionClaimTtlSeconds,
+            nestedSortExpansion = c.compactionNestedSortExpansion,
+            sortedHeapBytes = c.compactionSortedHeapBytes,
+            spillBytes = c.compactionSpillBytes,
+            spillDir = java.nio.file.Path.of(c.compactionSpillDir),
+            verifyMinBytes = c.compactionVerifyMinBytes,
+            maxNodesPerRow = c.compactionMaxNodesPerRow,
+            codec =
+                ParquetRewriter.OutputCodec.parse(
+                    c.compactionCodec,
+                    c.compactionZstdLevel,
+                ),
+            variantCompaction = c.compactionVariant,
+            variantCompactionCatalogs = c.compactionVariantCatalogs,
+        )
+    }
 
     private fun client(id: UUID): HogliteClient =
         clients.computeIfAbsent(id) {

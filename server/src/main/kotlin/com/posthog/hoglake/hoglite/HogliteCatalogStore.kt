@@ -110,11 +110,34 @@ class HogliteCatalogStore(
      * If catalog work ever moves to another thread, its binding must be carried
      * explicitly rather than starting another operation there.
      */
-    private class CatalogOperation(val tenant: String) {
+    internal class CatalogOperation(val tenant: String) {
+        @Volatile
         var missing: HoglakeException.NotFound? = null
     }
 
     private val operationBindings = ThreadLocal<MutableMap<String, CatalogOperation>>()
+
+    /** Capture the existing incarnation. Worker threads never resolve the catalog name again. */
+    internal fun captureCatalogOperation(catalog: String): CatalogOperation =
+        checkNotNull(operationBindings.get()?.get(catalog)) { "catalog '$catalog' has no operation binding" }
+
+    /** Install the captured binding for one blocking storage operation. Restore the caller's scope afterward. */
+    internal fun <T> withCatalogOperation(
+        catalog: String,
+        operation: CatalogOperation,
+        body: () -> T,
+    ): T {
+        val previous = operationBindings.get()
+        val existing = previous?.get(catalog)
+        check(existing == null || existing === operation) { "catalog operation binding differs" }
+        if (existing === operation) return catalogOperation(catalog, body = body)
+        operationBindings.set((previous?.toMutableMap() ?: mutableMapOf()).apply { put(catalog, operation) })
+        try {
+            return catalogOperation(catalog, body = body)
+        } finally {
+            if (previous == null) operationBindings.remove() else operationBindings.set(previous)
+        }
+    }
 
     /**
      * Bind [catalog] to ONE tenant id for the whole operation. The id is
@@ -1836,15 +1859,16 @@ class HogliteCatalogStore(
             val ns = namespaceForRead(catalog, namespace, to, headRead = toSnapshot == null)
             val t = tableAt(catalog, ns.namespaceId, namespace, table, to)
             // TRUNCATE / replacement barrier: a window that crosses a
-            // table_altered + table_deleted_from pair cannot be represented
-            // by an append-oriented feed.
+            // table_altered + table_deleted_from pair, or a table_replaced
+            // row, cannot be represented by an append-oriented feed.
             val truncated =
                 queryCatalog(
                     catalog,
-                    "SELECT c.snapshot_id FROM changes c WHERE c.object_id = ? AND c.kind = 'table_deleted_from' " +
-                        "AND c.snapshot_id > ? AND c.snapshot_id <= ? AND EXISTS (" +
+                    "SELECT c.snapshot_id FROM changes c WHERE c.object_id = ? " +
+                        "AND c.snapshot_id > ? AND c.snapshot_id <= ? AND (c.kind = 'table_replaced' " +
+                        "OR (c.kind = 'table_deleted_from' AND EXISTS (" +
                         "SELECT 1 FROM changes d WHERE d.object_id = c.object_id " +
-                        "AND d.snapshot_id = c.snapshot_id AND d.kind = 'table_altered') " +
+                        "AND d.snapshot_id = c.snapshot_id AND d.kind = 'table_altered'))) " +
                         "ORDER BY c.snapshot_id LIMIT 1",
                     t.tableId,
                     fromSnapshot,

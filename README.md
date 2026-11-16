@@ -80,13 +80,20 @@ table = ns.create_table(
 
 result = table.append(pa.table({"id": [1, 2], "name": ["a", None]}))
 print(result.snapshot_id)
+
+# Read the append back at the snapshot it returned.
+for f in table.files(snapshot=result.snapshot_id):
+    print(f.path, f.record_count)
 ```
 
 The client writes the parquet itself — field ids embedded in the parquet
 schema — extracts the footer statistics, and registers the file in one commit.
 Reads are metadata-only planning: `table.files()` returns paths and statistics
-and you fetch the data yourself. See [pyhoglake/](pyhoglake/README.md) for
-schema evolution, time travel, the changefeed and maintenance calls.
+and you fetch the data yourself. A handle that created or altered a table keeps
+reading that DDL snapshot, so after an append pass the returned `snapshot_id`,
+as above; a new handle from `ns.table(name)` reads the current head. See
+[pyhoglake/](pyhoglake/README.md) for schema evolution, time travel, the
+changefeed and maintenance calls.
 
 ## Components
 

@@ -698,10 +698,17 @@ object Metrics {
      * hoglake_compaction_variant_layout_files_left_total{catalog} — inputs
      * of a probed group left uncompacted because too few of its files
      * shared their variant layout to be worth a rewrite
-     * (CompactionGrouping's minimum). Each file counts once: the compactor
-     * remembers its layout and does not plan it again until enough files
-     * of that layout are known, so this is files set aside, not sweeps
-     * spent. They are debt the maintenance summary still reports.
+     * (CompactionGrouping's minimum). Each file counts once per time the
+     * compactor LEARNS it is set aside (VariantLayoutMemory.Known.setAside):
+     * it remembers the file's layout and does not plan it again until
+     * enough files of that layout are known, and a file probed again — a
+     * remainder as the company of a loan (VariantLayoutGroups.borrow) that
+     * proved to be another layout, a declared file beside arrivals that
+     * did — and left again is not counted again. So this is files set
+     * aside, not sweeps spent and not loans missed — but not distinct files
+     * either: one probed again after a restart or an eviction is learned,
+     * and counted, anew. They are debt the maintenance summary still
+     * reports.
      */
     fun compactionVariantLayoutFilesLeft(
         catalog: String,
@@ -941,6 +948,15 @@ object Metrics {
     ) = increment("hoglake_auth_denials_total", 1.0, "catalog", catalog, "scope", scope, "reason", reason)
 
     /**
+     * hoglake_auth_session_profile_total{outcome}: tokens carrying the session
+     * profile (auth/SessionProfile.kt), by what became of them — `accepted`,
+     * `refused_disabled` (the profile is off here: a rollout gap, not a bad
+     * issuer) or `refused_invalid`. A closed set; nothing from the token is a
+     * label.
+     */
+    fun authSessionProfile(outcome: String) = increment("hoglake_auth_session_profile_total", 1.0, "outcome", outcome)
+
+    /**
      * hoglake_mount_refusals_total{catalog,reason}: requests refused on a
      * mount (store/Mounts.kt), by the error code they were answered with.
      * `catalog` is only a name the registry holds (`<orgID>-events`) or, on a
@@ -1169,6 +1185,7 @@ object Metrics {
             // would be indistinguishable from having no arm at all.
             is HoglakeException.DdlSinceReadSnapshot -> "ddl_since_read_snapshot"
             is HoglakeException.TableRecreated -> "table_recreated"
+            is HoglakeException.PartitionSpecMismatch -> "partition_spec_mismatch"
             is HoglakeException.CommitConflict -> "conflict"
             is HoglakeException.Validation -> "validation"
             // Distinct, so "which writers still miss the object-prefix

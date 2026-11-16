@@ -1646,6 +1646,39 @@ class CompactionServiceIntegrationTest {
             assertThat(counter(registry, "hoglake_compaction_variant_layout_outputs_total", cat, "layout" to "other"))
                 .isEqualTo(1.0)
             assertThat(counter(registry, "hoglake_compaction_variant_layout_files_left_total", cat)).isEqualTo(2.0)
+
+            // LEARNED ANEW UNDER A NEW DECLARATION, COUNTED ANEW. A third
+            // declaration of `props` makes every entry stale, the three live
+            // files unknown and one group at a minimum of three, and the
+            // probe leaves all three: the declared output now deviates, and
+            // `other_a` and the other output deviate exactly as before — the
+            // SAME fingerprint, only the declaration's changed — so the two
+            // files set aside under the old declaration are set aside again
+            // under this one, and counted again, as a re-probe after a
+            // restart would be.
+            alter.alterTable(
+                cat,
+                "ns",
+                "t",
+                listOf(
+                    AlterOp.SetVariantShredding(
+                        "props",
+                        mapOf("type" to "object", "fields" to listOf(mapOf("name" to "\$os", "type" to "string"))),
+                    ),
+                ),
+            )
+            val three = variantOn.copy(minInputFiles = 3)
+            assertThat(svc.planTable(cat, "ns", "t", three).groups)
+                .describedAs("every entry stale: one group of the three")
+                .singleElement()
+                .satisfies({ assertThat(it.files).hasSize(3) })
+            val stale = svc.runOnce(cat, three)
+            assertThat(stale.layoutProbeOnly).describedAs("%s", stale).isEqualTo(1)
+            assertThat(stale.groupsCompacted + stale.unconvertibleSchema + stale.failedGroups).isZero()
+            assertThat(catalogs.listFiles(cat, "ns", "t")).hasSize(3)
+            assertThat(counter(registry, "hoglake_compaction_variant_layout_files_left_total", cat))
+                .describedAs("three left, each learned under the new declaration")
+                .isEqualTo(5.0)
         }
     }
 
@@ -2231,6 +2264,276 @@ class CompactionServiceIntegrationTest {
             assertThat(output.recordCount).isEqualTo(15)
             assertThat(VariantFixtures.read(fetch(output.path)).first.getType("props"))
                 .isEqualTo(VariantLayout.groupType(VariantFixtures.other[1], Type.Repetition.OPTIONAL))
+        }
+    }
+
+    @Test
+    fun `a loan that proves another layout is one probe, and counts the lent file left behind, not the four again`() {
+        // Four old-layout files and one declared, remembered at a minimum of
+        // five (files_left 5). A DECLARED arrival is lent to the four, probed
+        // with them and found to be no company: nothing compacts, the probe
+        // is the sweep's one `layout_probe_only`, and `files_left` rises by
+        // ONE — the arrival, learned now — not by five: the four were set
+        // aside already and are exactly as they were. A second such arrival
+        // is the same again (an unsuccessful loan is an ordinary cause of a
+        // recurring `layout_probe_only`, paid once per arrival, never twice
+        // for one file); an arrival in the old layout completes the four.
+        // Then the mirror image: the three declared files, each set aside
+        // once already, pack with two unknown arrivals of the old layout and
+        // are probed again — the arrivals count, once each; the three not
+        // again.
+        withVariantMetrics { registry ->
+            val filesLeft = "hoglake_compaction_variant_layout_files_left_total"
+            val five = variantOn.copy(minInputFiles = 5)
+            val (cat, files) = variantTable("loan-miss", "other_b", "other_b", "other_b", "other_b", "b")
+            val catalogId = catalogs.getCatalog(cat).catalogId
+            val probe = svc.runOnce(cat, five)
+            assertThat(probe.layoutProbeOnly).describedAs("%s", probe).isEqualTo(1)
+            assertThat(counter(registry, filesLeft, cat)).isEqualTo(5.0)
+            val old = files.take(4).map { it.path }
+
+            var from = files.size
+            for (miss in 1..2) {
+                val arrival = addFiles(cat, from++, "b").single()
+                assertThat(svc.planTable(cat, "ns", "t", five).groups)
+                    .describedAs("the four borrow the arrival")
+                    .singleElement()
+                    .satisfies({
+                        assertThat(
+                            it.files.map {
+                                    f ->
+                                f.path
+                            },
+                        ).containsExactlyInAnyOrderElementsOf(old + arrival.path)
+                    })
+                val result = svc.runOnce(cat, five)
+                assertThat(result.layoutProbeOnly).describedAs("miss $miss: %s", result).isEqualTo(1)
+                assertThat(result.groupsCompacted + result.mergeBudgetExceeded + result.spillBudgetExceeded).isZero()
+                assertThat(counter(registry, filesLeft, cat))
+                    .describedAs("miss $miss: the arrival once; the four not again")
+                    .isEqualTo(5.0 + miss)
+                assertThat(svc.variantLayouts.recall(catalogId, arrival.dataFileId)?.deviations)
+                    .describedAs("remembered where it belongs")
+                    .isEqualTo(VariantLayoutMemory.NONE)
+                assertThat(svc.planTable(cat, "ns", "t", five).groups).describedAs("nothing left to lend").isEmpty()
+            }
+
+            val company = addFiles(cat, from, "other_b").single()
+            val result = svc.runOnce(cat, five)
+            assertThat(result.groupsCompacted).describedAs("%s", result).isEqualTo(1)
+            assertThat(result.filesIn).isEqualTo(5)
+            assertThat(result.layoutProbeOnly).isZero()
+            assertThat(
+                counter(registry, filesLeft, cat),
+            ).describedAs("a completed loan sets nothing aside").isEqualTo(7.0)
+            assertThat(
+                catalogs.listFiles(cat, "ns", "t").map { it.path },
+            ).doesNotContainAnyElementsOf(old + company.path)
+
+            // Three declared files remain, remembered and set aside, beside
+            // the output in the old layout. Two old-layout arrivals, unknown,
+            // pack with the three into a main group of five, which is probed:
+            // neither layout has five, everything is left — the two arrivals
+            // newly, the three declared not for the first time.
+            val arrivals = addFiles(cat, from + 1, "other_b", "other_b")
+            assertThat(svc.planTable(cat, "ns", "t", five).groups)
+                .singleElement()
+                .satisfies({ assertThat(it.files).hasSize(5).anyMatch { f -> f.path == arrivals[0].path } })
+            val again = svc.runOnce(cat, five)
+            assertThat(again.layoutProbeOnly).describedAs("%s", again).isEqualTo(1)
+            assertThat(again.groupsCompacted).isZero()
+            assertThat(counter(registry, filesLeft, cat))
+                .describedAs("the two arrivals once; the three declared files, set aside before, not again")
+                .isEqualTo(9.0)
+        }
+    }
+
+    @Test
+    fun `a probe that finds a set-aside file company unlearns it, so a failed part leaves it to count again`() {
+        // `set_aside` is reset by every probe, not sticky. A declared file
+        // and an other-layout file are probed and both set aside (two). A
+        // declared arrival packs with the declared file; the probe puts the
+        // two in a part, so the file is company found and no longer set
+        // aside — then the rewrite fails before it writes. Both stay live,
+        // remembered as not set aside. At a minimum of three an other-layout
+        // arrival packs with them, the probe leaves all three, and all three
+        // are counted: the once-set-aside file again, because the memory had
+        // unlearned it.
+        withVariantMetrics { registry ->
+            val filesLeft = "hoglake_compaction_variant_layout_files_left_total"
+            val (cat, files) = variantTable("set-aside-reset", "b", "other_b")
+            val catalogId = catalogs.getCatalog(cat).catalogId
+            val probe = svc.runOnce(cat, variantOn)
+            assertThat(probe.layoutProbeOnly).describedAs("%s", probe).isEqualTo(1)
+            assertThat(counter(registry, filesLeft, cat)).isEqualTo(2.0)
+            assertThat(svc.variantLayouts.recall(catalogId, files[0].dataFileId)?.setAside).isTrue()
+
+            val declared = addFiles(cat, files.size, "b").single()
+            svc.beforeRewrite = { throw IllegalStateException("injected: the part's rewrite fails before writing") }
+            val failed =
+                try {
+                    svc.runOnce(cat, variantOn)
+                } finally {
+                    svc.beforeRewrite = {}
+                }
+            assertThat(failed.failedGroups).describedAs("%s", failed).isEqualTo(1)
+            assertThat(failed.groupsCompacted + failed.layoutProbeOnly).isZero()
+            assertThat(counter(registry, filesLeft, cat)).describedAs("in a part: nothing set aside").isEqualTo(2.0)
+            assertThat(svc.variantLayouts.recall(catalogId, files[0].dataFileId)?.setAside)
+                .describedAs("company found: no longer set aside, though the part failed")
+                .isFalse()
+            assertThat(svc.variantLayouts.recall(catalogId, declared.dataFileId)?.setAside).isFalse()
+            assertThat(catalogs.listFiles(cat, "ns", "t")).hasSize(3)
+
+            val three = variantOn.copy(minInputFiles = 3)
+            val arrival = addFiles(cat, files.size + 1, "mismatch").single()
+            assertThat(svc.planTable(cat, "ns", "t", three).groups)
+                .singleElement()
+                .satisfies({
+                    assertThat(it.files.map { f -> f.path })
+                        .containsExactlyInAnyOrder(files[0].path, declared.path, arrival.path)
+                })
+            val again = svc.runOnce(cat, three)
+            assertThat(again.layoutProbeOnly).describedAs("%s", again).isEqualTo(1)
+            assertThat(again.groupsCompacted + again.failedGroups).isZero()
+            assertThat(counter(registry, filesLeft, cat))
+                .describedAs("the two newly, and the once-set-aside file again")
+                .isEqualTo(5.0)
+            assertThat(svc.variantLayouts.recall(catalogId, files[0].dataFileId)?.setAside).isTrue()
+        }
+    }
+
+    @Test
+    fun `a main group the declared estimate refuses lends its arrival, and the five narrow files compact`() {
+        // Four files in a NARROWER layout than the declaration (other_b's
+        // two-field `props` under columns.json's seven) and four declared,
+        // probed at a minimum of five: eight remembered, two populations of
+        // four. Then one narrow arrival with far more rows than the eight
+        // together. It packs with the four declared into a main group of
+        // five, which the declared estimate refuses on the merge budget —
+        // every sweep, without a probe, the arrival unknown still — while the
+        // five narrow files fit their remembered shape. The refused group is
+        // no work, so its arrival is idle, and the narrow population borrows
+        // it.
+        withVariantMetrics { _ ->
+            val (cat, files) =
+                variantTable("refused-main", "other_b", "other_b", "other_b", "other_b", "b", "b", "b", "b")
+            alter.alterTable(
+                cat,
+                "ns",
+                "t",
+                listOf(AlterOp.SetSortOrder(listOf(SortFieldDef(1, SortDirection.ASC, NullOrder.NULLS_LAST)))),
+            )
+            val live = catalogs.getTable(cat, "ns", "t").columns
+            val (narrowSchema, narrow) =
+                ParquetFileReader.open(LocalInputFile(VariantFixtures.path("other_b"))).use {
+                    it.footer.fileMetaData.schema to ParquetRewriter.variantLayoutsOf(it.footer, live, "other_b")
+                }
+            assertThat(VariantLayout.shape(narrow.getValue(2L)).first)
+                .isLessThan(VariantLayout.shape(live.single { it.def.name == "props" })!!.first)
+            val narrowFiles = files.take(4)
+            val declaredFiles = files.drop(4)
+
+            // The arrival: other_b's schema, so exactly its layout, with a
+            // thousand rows; sized like the fixtures, so the packing keeps
+            // it with the four declared files rather than apart.
+            val rows = 1000L
+            val bytes =
+                customParquetBytes(
+                    narrowSchema,
+                    (0 until rows.toInt()).map { r ->
+                        { g: Group ->
+                            g.add("id", r.toLong())
+                            g.addGroup("props").add("metadata", Binary.fromConstantByteArray(byteArrayOf(1, 0, 0)))
+                            g.addGroup("raw").apply {
+                                add("metadata", Binary.fromConstantByteArray(byteArrayOf(1, 0, 0)))
+                                add("value", Binary.fromConstantByteArray(byteArrayOf(12, (r % 100).toByte())))
+                            }
+                        }
+                    },
+                )
+            assertThat(bytes.size.toLong())
+                .describedAs("neither dominated by the declared files nor dominating them")
+                .isBetween(declaredFiles.maxOf { it.fileSizeBytes } / 2, declaredFiles.sumOf { it.fileSizeBytes } * 2)
+            val initialRows = files.sumOf { it.recordCount }
+            val mainRows = declaredFiles.sumOf { it.recordCount } + rows
+            val declaredLeaves = ParquetRewriter.outputLeafCount(live)
+            val narrowLeaves = ParquetRewriter.outputLeafCount(live, narrow)
+
+            fun cost(
+                survivors: Long,
+                spill: SortSpill,
+                leaves: Int,
+            ): Long {
+                val runs = ExternalMergeSort.spillRuns(survivors, spill)
+                return if (runs <= 1) 0 else runs * ExternalMergeSort.predictedSpilledRunBytes(leaves, spill)
+            }
+            // A budget under which the declared estimate admits the eight
+            // (96 rows) and refuses the declared four plus the arrival, while
+            // the narrow shape admits the narrow four plus the arrival.
+            val budget =
+                heapWhere(
+                    variantOn.copy(minInputFiles = 5),
+                    from = 16L shl 20,
+                    to = 1024L shl 20,
+                    step = 1L shl 20,
+                ) { c ->
+                    val declaredSpill = c.sortSpill(live)
+                    val narrowSpill = c.sortSpill(live, narrow)
+                    cost(initialRows, declaredSpill, declaredLeaves) <= declaredSpill.mergeBudgetBytes &&
+                        cost(mainRows, declaredSpill, declaredLeaves) > declaredSpill.mergeBudgetBytes &&
+                        cost(mainRows, narrowSpill, narrowLeaves) <= narrowSpill.mergeBudgetBytes
+                }
+            assertThat(budget).describedAs("such a budget exists for these fixtures").isNotNull()
+            val cfg = budget!!
+
+            // Sweep 1: the eight, one group, probed: two layouts of four, all left.
+            val probe = svc.runOnce(cat, cfg)
+            assertThat(probe.layoutProbeOnly).describedAs("%s", probe).isEqualTo(1)
+            assertThat(probe.groupsCompacted + probe.mergeBudgetExceeded + probe.spillBudgetExceeded).isZero()
+            assertThat(svc.planTable(cat, "ns", "t", cfg).groups).isEmpty()
+
+            val path = "s3://$BUCKET/$cat/data/ns/t/${files.size}-narrow-long.parquet"
+            store.put(path, bytes)
+            commits.commit(
+                cat,
+                CommitRequest(
+                    appends = listOf(TableAppend("ns", "t", listOf(FileRegistration(path, rows, bytes.size.toLong())))),
+                ),
+            )
+            Hydrator(db.jdbi, store).runOnce()
+            // What the planner sees: with the arrival, the declared four are
+            // a main group of five the merge budget refuses. Without the
+            // loan, that refusal — and the arrival, unknown — would repeat
+            // every sweep.
+            val plan = svc.planTable(cat, "ns", "t", cfg)
+            assertThat(plan.groups)
+                .describedAs("the narrow four, completed by the arrival")
+                .singleElement()
+                .satisfies({
+                    assertThat(
+                        it.files.map {
+                                f ->
+                            f.path
+                        },
+                    ).containsExactlyInAnyOrderElementsOf(narrowFiles.map { f -> f.path } + path)
+                })
+            assertThat(plan.mergeRefusedGroups + plan.spillRefusedGroups)
+                .describedAs("the declared four alone are no group: nothing is refused")
+                .isZero()
+            val result = svc.runOnce(cat, cfg)
+            assertThat(result.groupsCompacted).describedAs("%s", result).isEqualTo(1)
+            assertThat(result.filesIn).isEqualTo(5)
+            assertThat(
+                result.layoutProbeOnly + result.mergeBudgetExceeded + result.spillBudgetExceeded + result.failedGroups,
+            ).isZero()
+            val after = catalogs.listFiles(cat, "ns", "t")
+            assertThat(after.map { it.path })
+                .containsAll(declaredFiles.map { it.path })
+                .doesNotContainAnyElementsOf(narrowFiles.map { it.path } + path)
+            val output = after.single { it.explicitRowIds }
+            assertThat(output.recordCount).isEqualTo(mainRows)
+            assertThat(VariantFixtures.read(fetch(output.path)).first.getType("props")).isEqualTo(narrow.getValue(2L))
         }
     }
 
