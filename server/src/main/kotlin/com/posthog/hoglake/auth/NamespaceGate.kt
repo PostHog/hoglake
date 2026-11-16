@@ -60,8 +60,10 @@ fun Application.installNamespaceGate(
 fun Application.installNamespaceGate(selector: CatalogStoreSelector) {
     installCallNamespaceGate(
         dataPath = { call, catalog ->
+            // Outside the catch: a refusal by the selector is the request's answer, not a missing catalog.
+            val store = selector.forCatalog(call, catalog)
             try {
-                selector.forCatalog(call, catalog).getCatalog(catalog).dataPath
+                store.getCatalog(catalog).dataPath
             } catch (_: HoglakeException.NotFound) {
                 null
             }
