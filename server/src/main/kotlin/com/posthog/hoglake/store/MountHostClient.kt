@@ -61,7 +61,9 @@ import kotlin.coroutines.resumeWithException
  *   namespace and table names that pass the identifier grammar, each
  *   percent-encoded as one segment; a name outside the grammar is the 404 a
  *   missing one gets, with nothing sent. Query parameters are re-encoded one
- *   by one. Redirects are not followed and no proxy is used.
+ *   by one; one named `catalog`, `namespace` or `table` (in any letter case)
+ *   is not sent, because those are route values and come from the path only.
+ *   Redirects are not followed and no proxy is used.
  * - **Bounds.** One cap over the host's requests in flight (non-blocking:
  *   503 `mount_proxy_busy`), a connect timeout, one deadline per request
  *   covering the wait for the Host and its whole body, and a byte cap on a
@@ -535,14 +537,25 @@ class MountHostClient(
             tail: List<String>,
         ): String = (listOf("v1", "catalogs", mount) + tail).joinToString("") { "/" + pathSegment(it) }
 
-        /** The caller's query parameters, each name and value re-encoded; empty when there are none. */
+        /**
+         * The caller's query parameters, each name and value re-encoded;
+         * empty when there are none. A parameter that has the name of a
+         * route value ([ROUTE_VALUE_NAMES], in any letter case, as parameter
+         * names are matched) is left out: no relayed route takes one, and
+         * the Host reads those values from the path.
+         */
         fun query(call: ApplicationCall): String {
             val pairs =
-                call.request.queryParameters.entries().flatMap { (name, values) ->
-                    values.map { encode(name, QUERY_SAFE) + "=" + encode(it, QUERY_SAFE) }
-                }
+                call.request.queryParameters.entries()
+                    .filterNot { it.key.lowercase() in ROUTE_VALUE_NAMES }
+                    .flatMap { (name, values) ->
+                        values.map { encode(name, QUERY_SAFE) + "=" + encode(it, QUERY_SAFE) }
+                    }
             return if (pairs.isEmpty()) "" else "?" + pairs.joinToString("&")
         }
+
+        /** The path segments of the relayed routes: never query parameters on them. */
+        private val ROUTE_VALUE_NAMES = setOf("catalog", "namespace", "table")
 
         /** `,` and `:` stay literal in a query value: lists and timestamps would triple in length otherwise. */
         private const val QUERY_SAFE = ",:"
