@@ -91,4 +91,10 @@ internal interface CompactionStorage {
 
     /** Classify a driver statement failure. Preserve the original exception for logging and cancellation checks. */
     fun isStatementLockTimeout(error: Throwable): Boolean
+
+    /** Stop the sweep for a terminal backend failure. PostgreSQL retains group isolation. */
+    fun isTerminalFailure(error: Throwable): Boolean = false
+
+    /** Skip a corrupt table plan. PostgreSQL retains its existing planning failure behavior. */
+    fun isRecoverablePlanningFailure(error: Throwable): Boolean = false
 }
