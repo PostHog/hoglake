@@ -392,9 +392,10 @@
   "description": "The wire payloads pyhoglake's three writers produce on a table WITHOUT",
   "recorded_from": {
     "commit": "232c4badd830c6026901314604cdd42efa992e42",
+    "parquet_created_by": "parquet-cpp-arrow version 26.0.0",
     "pyarrow": "26.0.0",
     "pyhoglake_file": "pyhoglake/src/pyhoglake/__init__.py",
-    "pyhoglake_version": "1.4.9.dev0",
+    "pyhoglake_version": "1.4.11.dev0",
     "python": "3.13.13"
   }
 }
