@@ -201,8 +201,7 @@ private const val DEFAULT_EXPIRE_BATCH = 10_000
 /** Default `?batch` for POST /maintenance/cleanup (Config's cleanupBatchSize default). */
 private const val DEFAULT_CLEANUP_BATCH = 2_000
 
-private fun ApplicationCall.maintenanceCatalog(): String =
-    parameters["catalog"] ?: throw BadRequestException("missing path parameter 'catalog'")
+private fun ApplicationCall.maintenanceCatalog(): String = pathParam("catalog")
 
 private fun ApplicationCall.batchQuery(): Int? =
     request.queryParameters["batch"]?.let {

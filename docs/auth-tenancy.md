@@ -996,7 +996,9 @@ requests go through the Client.
   routes, with the caller's `Authorization` header and `X-Request-Id`, to a
   path built from the mount name and identifier-grammar namespace and table
   names (anything else is a local 404), with the query parameters
-  re-encoded. Redirects are not followed and no proxy is used. A 200 comes
+  re-encoded. A query parameter named `catalog`, `namespace` or `table` (in
+  any letter case) is not forwarded: those are route values and come from
+  the path only. Redirects are not followed and no proxy is used. A 200 comes
   back byte for byte (one with no length and no chunking, or with a content
   encoding, is refused); `GET /v1/catalogs` asks each host once and keeps
   the entries it returns for the names in the caller's `cat`.
