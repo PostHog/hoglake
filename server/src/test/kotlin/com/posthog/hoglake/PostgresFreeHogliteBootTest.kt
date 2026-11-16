@@ -92,7 +92,7 @@ class PostgresFreeHogliteBootTest {
                         assertThat(forwardedAuthority.get() == "Bearer $token").isTrue()
                         assertThat(listed.bodyAsText()).contains("s3://bucket/lake")
                         val maintenance =
-                            client.get("/v1/catalogs/lake/maintenance/status") {
+                            client.get("/v1/maintenance/status") {
                                 header(HttpHeaders.Authorization, "Bearer $token")
                             }
                         assertThat(maintenance.status).isEqualTo(HttpStatusCode.NotImplemented)

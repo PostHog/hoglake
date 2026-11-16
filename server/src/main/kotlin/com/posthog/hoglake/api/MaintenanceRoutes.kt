@@ -181,15 +181,18 @@ fun Application.installMaintenanceRoutes(
         // ledger feed. Same query-parameter conventions as the
         // per-catalog routes.
         get("/v1/maintenance/status") {
+            selector?.requirePostgresInstance()
             call.respond(status.instanceStatus(call.request.queryParameters["after"], call.limitQuery()).toDto())
         }
         // The backing store's own health. Instance-level, not per
         // catalog: the manifest tables, the vacuum horizon and the
         // connection budget are shared by every catalog in the database.
         get("/v1/database/health") {
+            selector?.requirePostgresInstance()
             call.respond(databaseHealth.report().toDto())
         }
         get("/v1/maintenance/runs") {
+            selector?.requirePostgresInstance()
             call.respond(
                 status.instanceRuns(
                     call.taskQuery(),

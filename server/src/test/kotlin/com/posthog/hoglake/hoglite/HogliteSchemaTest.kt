@@ -104,4 +104,15 @@ class HogliteSchemaTest {
                 "WHERE drained_at IS NULL AND (reason IS NULL OR reason <> 'compaction_staging')",
         )
     }
+
+    @Test
+    fun `status indexes cover live backlogs and bounded loop reads`() {
+        assertThat(HogliteSchema.DDL.map(::normalized)).contains(
+            "CREATE INDEX IF NOT EXISTS files_live_stats ON files(stats_state) WHERE end_snapshot IS NULL",
+            "CREATE INDEX IF NOT EXISTS files_live_size ON files(file_size_bytes) WHERE end_snapshot IS NULL",
+            "CREATE INDEX IF NOT EXISTS removals_queued_at ON removals(queued_at) WHERE drained_at IS NULL",
+            "CREATE INDEX IF NOT EXISTS maintenance_runs_loop ON maintenance_runs(task, id, started_at) " +
+                "WHERE run_trigger = 'loop'",
+        )
+    }
 }
