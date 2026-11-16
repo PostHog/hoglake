@@ -1020,6 +1020,24 @@ It uses the server's object-store configuration, as PostgreSQL cleanup does.
 Per-call AWS identity remains separate work. Hoglite has no cleanup loop,
 catalog registry, or loop lease.
 
+Hoglite supports `POST /v1/catalogs/{catalog}/maintenance/compact` for the
+catalog in the token's placement. Its `CompactionStorage` adapter uses the same
+`CompactionExecutor` as PostgreSQL. The executor owns packing, VARIANT layout
+probing, budget admission, Parquet rewriting, and result aggregation.
+The adapter reserves individual inputs and publishes with transaction-local guards.
+Each table plan reads at most `CompactionConfig.candidateBudget` candidates,
+in bucket, size, and file-ID order. The next window overlaps the trailing bucket
+by at most `minInputFiles - 1` files. This overlap prevents interleaved partitions
+from permanently stranding a static backlog.
+A bounded process-local cache retains fetch cursors and shared VARIANT layout observations across manual calls.
+A process restart can repeat work. Correct claims and publication do not depend on this cache.
+New tenant schemas include the live bucket-order index.
+Without that index, each plan uses one capped read instead of repeated sorted pages.
+Run manual cleanup to drain old staged-output tickets.
+The server owns the shared object store and its configured credential provider.
+Per-call AWS identity remains separate work. Hoglite has no compaction loop,
+catalog registry, fleet sweep, or loop lease.
+
 Physical deletion is decoupled and paranoid
 (`service/CleanupService.kt`): the queue is a *suggestion*. At drain
 time every path is re-checked against live references — a
