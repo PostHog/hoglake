@@ -4,7 +4,7 @@
 name = "pyhoglake-variant-codec"
 # Its own version, released only when the codec changes (ci-python.yml
 # holds a change to a new or a .dev version); pyhoglake's extra pins one.
-version = "0.1.0"
+version = "0.1.1"
 description = "pyhoglake's VARIANT value codec (private to pyhoglake)"
 readme = "README.md"
 license = "MIT"
