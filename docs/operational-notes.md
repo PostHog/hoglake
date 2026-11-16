@@ -99,6 +99,12 @@ no entry in either:
    silent loss; hoglake's is bounded staleness + a page. Correct
    tradeoff, but at 2PB the pinned-storage bill grows faster.
 
+## Maintenance scheduling
+
+The in-process PostgreSQL maintenance loops predate the hogtower-scheduled
+model used for Hoglite. A tracked follow-up covers the PostgreSQL move to
+that model. This change deliberately keeps the PostgreSQL loops in-process.
+
 ## The migration note
 
 2PB doesn't move — the converter is metadata-only (paths carried,

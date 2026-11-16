@@ -12,6 +12,7 @@ import com.posthog.hoglake.hoglite.HogliteCleanup
 import com.posthog.hoglake.hoglite.HogliteClient
 import com.posthog.hoglake.hoglite.HogliteCompaction
 import com.posthog.hoglake.hoglite.HogliteCompactionCursors
+import com.posthog.hoglake.hoglite.HogliteMaintenanceStatus
 import com.posthog.hoglake.hoglite.HoglitePartitionLookupAdmission
 import com.posthog.hoglake.hoglite.HogliteTenantResolver
 import com.posthog.hoglake.hydrator.ObjectStore
@@ -391,18 +392,28 @@ class CatalogStoreSelector(
         call: ApplicationCall,
         catalog: String,
         postgres: () -> MaintenanceStatusBackend,
-    ): MaintenanceStatusBackend = postgresMaintenance(call, catalog, postgres)
+    ): MaintenanceStatusBackend =
+        (forCatalog(call, catalog) as? HogliteCatalogStore)?.let {
+            val config = checkNotNull(cfg)
+            HogliteMaintenanceStatus(
+                it,
+                config.hydratorIntervalMs,
+                config.expiryIntervalMs,
+                config.cleanupIntervalMs,
+                config.compactionIntervalMs,
+                config.retirementIntervalMs,
+                config.compactionTargetBytes,
+            )
+        } ?: postgres()
 
-    private fun <T> postgresMaintenance(
-        call: ApplicationCall,
-        catalog: String,
-        postgres: () -> T,
-    ): T {
-        requirePostgres(call, catalog)
-        return postgres()
+    /** Fleet reads require a configured PostgreSQL backend, not a tenant placement. */
+    fun requirePostgresInstance() {
+        if (cfg != null && cfg.defaultBackend == "none" && cfg.postgresBackendId.isEmpty()) {
+            throw HoglakeException.NotSupported("this operation requires a PostgreSQL backend")
+        }
     }
 
-    /** Maintenance is PostgreSQL-only. Resolve placement before any service or body work. */
+    /** Refuse PostgreSQL-only operations before any service or body work. */
     fun requirePostgres(
         call: ApplicationCall,
         catalog: String,

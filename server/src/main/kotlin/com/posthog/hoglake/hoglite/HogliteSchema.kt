@@ -78,6 +78,11 @@ internal object HogliteSchema {
             "CREATE INDEX IF NOT EXISTS files_compaction_bucket ON files(" +
                 "table_id, COALESCE(spec_id, -1), COALESCE(partition_values_json, ''), file_size_bytes, id) " +
                 "WHERE end_snapshot IS NULL",
+            "CREATE INDEX IF NOT EXISTS files_live_stats ON files(stats_state) WHERE end_snapshot IS NULL",
+            "CREATE INDEX IF NOT EXISTS files_live_size ON files(file_size_bytes) WHERE end_snapshot IS NULL",
+            "CREATE INDEX IF NOT EXISTS removals_queued_at ON removals(queued_at) WHERE drained_at IS NULL",
+            "CREATE INDEX IF NOT EXISTS maintenance_runs_loop ON maintenance_runs(task, id, started_at) " +
+                "WHERE run_trigger = 'loop'",
             "CREATE INDEX IF NOT EXISTS maintenance_runs_status ON maintenance_runs(task, status, id)",
             "CREATE INDEX IF NOT EXISTS dvs_path ON dvs(path)",
             "CREATE INDEX IF NOT EXISTS removals_undrained_path ON removals(path) WHERE drained_at IS NULL",
