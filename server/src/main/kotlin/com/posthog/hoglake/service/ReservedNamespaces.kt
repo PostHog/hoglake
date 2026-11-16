@@ -4,7 +4,8 @@ import com.posthog.hoglake.model.HoglakeException
 
 /**
  * Namespace names no caller may create in any catalog on this server
- * (`HOGLAKE_RESERVED_NAMESPACES`). Empty reserves nothing.
+ * (`HOGLAKE_RESERVED_NAMESPACES`, plus every remote schema the hosts file
+ * configures). Empty reserves nothing.
  *
  * A deployment reserves a name that something else serves under it, for
  * example a query engine that shows a mount as a schema of that name: user
@@ -22,7 +23,9 @@ import com.posthog.hoglake.model.HoglakeException
  * creates a namespace (there is no rename and no implicit creation), for
  * every caller and every backend, before the store is called. A namespace
  * created before its name was reserved is left alone: readable, writable
- * and droppable, but once dropped it cannot be created again.
+ * and droppable, but once dropped it cannot be created again. (One that has
+ * a remote schema's name is hidden instead, by the catalog binding, not
+ * here.)
  */
 class ReservedNamespaces(names: Collection<String>) {
     private val folded: Set<String> =
@@ -48,7 +51,8 @@ class ReservedNamespaces(names: Collection<String>) {
     companion object {
         val NONE = ReservedNamespaces(emptyList())
 
-        private fun fold(name: String): String =
+        /** [name] with ASCII `A`-`Z` lowered and nothing else changed: how a reserved name is compared. */
+        internal fun fold(name: String): String =
             buildString(name.length) {
                 for (c in name) append(if (c in 'A'..'Z') c + ('a' - 'A') else c)
             }

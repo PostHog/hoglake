@@ -3,8 +3,11 @@ package com.posthog.hoglake.api
 import com.fasterxml.jackson.databind.annotation.JsonDeserialize
 import com.posthog.hoglake.auth.Caller
 import com.posthog.hoglake.auth.actorOrRefuse
+import com.posthog.hoglake.auth.guardsRemoteSchemas
 import com.posthog.hoglake.auth.hoglakeAuth
+import com.posthog.hoglake.auth.refuseRemoteSchemas
 import com.posthog.hoglake.auth.requireScopedNamespaces
+import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.service.ReplacementTarget
 import com.posthog.hoglake.service.TableCreation
 import com.posthog.hoglake.service.TableCreationBackend
@@ -183,9 +186,20 @@ private fun ApplicationCall.creationOperation(): UUID =
  * publish re-checks against the live namespace's id, so a creation cannot be
  * pointed elsewhere after the check. A creation that does not exist answers
  * 404 as it would for anyone.
+ *
+ * On a server that configures remote schemas the creation is looked up for
+ * every caller: one prepared for a namespace before its name became a remote
+ * schema must not be read, published or aborted afterwards. The request
+ * named an operation and no namespace, so a caller the schema is not for
+ * gets the 404 of an operation that does not exist, in the backends' words.
  */
 private fun ApplicationCall.requireScopedCreation(creations: TableCreationBackend) {
-    if (hoglakeAuth.callerOrNull?.kind != Caller.Kind.SCOPED) return
-    val creation = creations.status(creationCatalog(), creationOperation())
-    requireScopedNamespaces(creationCatalog(), listOf(creation.definition.namespace))
+    if (hoglakeAuth.callerOrNull?.kind != Caller.Kind.SCOPED && !guardsRemoteSchemas) return
+    val namespaces = listOf(creations.status(creationCatalog(), creationOperation()).definition.namespace)
+    try {
+        refuseRemoteSchemas(creationCatalog(), namespaces)
+    } catch (_: HoglakeException.NotFound) {
+        throw HoglakeException.NotFound("table creation operation '${creationOperation()}'")
+    }
+    requireScopedNamespaces(creationCatalog(), namespaces)
 }

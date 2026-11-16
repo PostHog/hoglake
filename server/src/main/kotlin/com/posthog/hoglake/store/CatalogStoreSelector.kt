@@ -2,9 +2,12 @@ package com.posthog.hoglake.store
 
 import com.fasterxml.jackson.databind.JsonNode
 import com.posthog.hoglake.Config
+import com.posthog.hoglake.auth.AuthPolicy
 import com.posthog.hoglake.auth.Routing
 import com.posthog.hoglake.auth.hoglakeAuth
+import com.posthog.hoglake.auth.remoteSchemasAmong
 import com.posthog.hoglake.auth.requireCatalogEntitlement
+import com.posthog.hoglake.auth.requireRemoteSchemaEntitlement
 import com.posthog.hoglake.auth.verifiedBackendToken
 import com.posthog.hoglake.compaction.CompactionConfig
 import com.posthog.hoglake.compaction.ParquetRewriter
@@ -35,6 +38,8 @@ import com.posthog.hoglake.service.TableCreationBackend
 import com.posthog.hoglake.service.UploadBackend
 import com.posthog.hoglake.service.ViewBackend
 import io.ktor.server.application.ApplicationCall
+import io.ktor.server.request.httpMethod
+import io.ktor.server.request.path
 import io.ktor.util.AttributeKey
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -73,7 +78,8 @@ class CatalogStoreSelector(
     /**
      * Return one request-scoped hoglite store, or the process's PostgreSQL
      * singleton. Every catalog route calls this before any service or body
-     * work, so a mount is refused here on every route it has no reader for.
+     * work, so a mount is refused here on every route it has no reader for,
+     * and so is a remote schema the route's path names.
      */
     fun forCatalog(
         call: ApplicationCall,
@@ -83,13 +89,18 @@ class CatalogStoreSelector(
             is CatalogBinding.Local -> binding.store
             is CatalogBinding.Mount -> throw mountRefusal(call, binding.mount.name)
             is CatalogBinding.Remote -> throw mountRefusal(call, binding.name)
+            is CatalogBinding.RemoteSchema -> throw remoteSchemaRefusal(call, binding.schema)
         }
 
     /**
      * A mount name resolves first (to the Host's mount on a Client, else to
-     * this instance's own), then verified placement, then the default backend.
+     * this instance's own), then verified placement, then the default
+     * backend. In a catalog this server holds, a remote schema the request's
+     * path names then takes the store's place, so the store is never asked
+     * about that namespace.
      * Whatever [catalog] a handler passes, it resolves only when the caller's
-     * token allows that name (auth/StoreEntitlement.kt).
+     * token allows that name, and a remote schema only when the token allows
+     * that too (auth/StoreEntitlement.kt).
      */
     override fun resolve(
         call: ApplicationCall,
@@ -101,9 +112,9 @@ class CatalogStoreSelector(
         val binding =
             remoteBinding(call, catalog) ?: mount(call, catalog) ?: run {
                 val routing = call.hoglakeAuth.callerOrNull?.routing
-                CatalogBinding.Local(
-                    if (routing != null && routing.catalog == catalog) routed(call, routing) else fallback(catalog),
-                )
+                val routed = routing != null && routing.catalog == catalog
+                val store = if (routed) routed(call, checkNotNull(routing)) else fallback(catalog)
+                pathSchema(call, catalog, store) ?: CatalogBinding.Local(store)
             }
         call.attributes.put(boundCatalog, catalog to binding)
         return binding
@@ -139,6 +150,114 @@ class CatalogStoreSelector(
             if (reason != "not_found") Metrics.mountRefused(catalog, reason)
         }
         return CatalogBinding.Remote(catalog, host)
+    }
+
+    /**
+     * The remote schema this request's path names in [catalog], through
+     * [resolve]; null, and nothing resolved, for every other request. A
+     * route that relays before it parses anything asks this, so the token
+     * is checked here for [catalog] as it is in [remote].
+     */
+    fun remoteSchema(
+        call: ApplicationCall,
+        catalog: String,
+    ): CatalogBinding.RemoteSchema? {
+        call.requireCatalogEntitlement(catalog)
+        return if (namedSchema(call, catalog) == null) null else resolve(call, catalog) as? CatalogBinding.RemoteSchema
+    }
+
+    /** The configured remote schema the path's `{namespace}` is, or is a case variant of; the namespace as named. */
+    private fun namedSchema(
+        call: ApplicationCall,
+        catalog: String,
+    ): Pair<RemoteSchemaHost, String>? {
+        val schemas = mountHosts.remoteSchemas()
+        if (schemas.isEmpty()) return null
+        // The route table splits the path exactly as the router does, and
+        // is what mountRefusal reads the route's class from.
+        val match = AuthPolicy.match(call.request.httpMethod, call.request.path())
+        val namespace = match?.namespace?.takeIf { match.catalog == catalog } ?: return null
+        return schemas.firstOrNull { it.match.covers(namespace) }?.let { it to namespace }
+    }
+
+    /**
+     * The binding for a path that names a remote schema, reached only once
+     * the token is known to allow [catalog], [catalog] is not a mount, and
+     * a backend of this server ([store]) is the one that would serve it.
+     * This is the one place the binding is handed out, and it is only when
+     * the token allows the schema too: before the namespace gate lets a
+     * scoped caller on and before any handler, so nothing is sent to the
+     * Host for anyone else.
+     *
+     * A remote schema is a namespace of a catalog this server holds, so
+     * the catalog must exist in [store]: one read, made only for a caller
+     * the token check has passed, once per request (the binding is cached).
+     * A catalog nobody holds is the store's own 404, and nothing is sent.
+     */
+    private fun pathSchema(
+        call: ApplicationCall,
+        catalog: String,
+        store: CatalogStore,
+    ): CatalogBinding.RemoteSchema? {
+        val (schema, namespace) = namedSchema(call, catalog) ?: return null
+        call.requireRemoteSchemaEntitlement(catalog, schema.name, namespace)
+        store.getCatalog(catalog)
+        return CatalogBinding.RemoteSchema(catalog, schema.name, schema.host)
+    }
+
+    /** Whether this server configures any remote schema. */
+    val hasRemoteSchemas: Boolean get() = mountHosts.remoteSchemas().isNotEmpty()
+
+    /** Whether [namespace] is a configured remote schema's name or a case variant: never a local namespace here. */
+    fun isRemoteSchema(namespace: String): Boolean = mountHosts.remoteSchemas().any { it.match.covers(namespace) }
+
+    /** The remote schemas a namespace listing of the local [catalog] shows this caller: those its token allows. */
+    fun visibleRemoteSchemas(
+        call: ApplicationCall,
+        catalog: String,
+    ): List<String> {
+        call.requireCatalogEntitlement(catalog)
+        return call.hoglakeAuth.callerOrNull.remoteSchemasAmong(catalog, mountHosts.remoteSchemas().map { it.name })
+    }
+
+    /**
+     * Refuse a request on the local [catalog] that names a remote schema in
+     * its body or query ([namespaces]): a commit's targets, a table
+     * creation's namespace, a `namespace` parameter. The answer is the one
+     * a path naming it gets: 404 unless the caller's token allows the
+     * schema, then 403 for a write and 501 for a read. A no-op when none of
+     * [namespaces] is a remote schema, and on a server that configures none.
+     */
+    fun refuseRemoteSchemas(
+        call: ApplicationCall,
+        catalog: String,
+        namespaces: Collection<String>,
+    ) {
+        call.requireCatalogEntitlement(catalog)
+        val schemas = mountHosts.remoteSchemas()
+        if (schemas.isEmpty()) return
+        for (namespace in namespaces) {
+            val schema = schemas.firstOrNull { it.match.covers(namespace) } ?: continue
+            if (resolve(call, catalog) !is CatalogBinding.Local) return
+            call.requireRemoteSchemaEntitlement(catalog, schema.name, namespace)
+            throw remoteSchemaRefusal(call, schema.name)
+        }
+    }
+
+    /**
+     * The live tables of the local [catalog] that sit in a namespace a
+     * remote schema hides, by UUID, each with that namespace's name: what a
+     * route that addresses a table by UUID alone checks before it serves.
+     * Empty, and nothing read, on a server that configures no remote schema.
+     */
+    fun hiddenTables(
+        store: CatalogStore,
+        catalog: String,
+    ): Map<UUID, String> {
+        if (!hasRemoteSchemas) return emptyMap()
+        return store.listNamespaces(catalog).map { it.name }.filter(::isRemoteSchema)
+            .flatMap { namespace -> store.listTables(catalog, namespace).map { it.tableUuid to namespace } }
+            .toMap()
     }
 
     /** A mount reads this process's PostgreSQL, so it exists only where PostgreSQL is the default. */

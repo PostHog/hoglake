@@ -130,6 +130,12 @@ fun Application.installMaintenanceRoutes(
             // neither).
             post("/maintenance/rehydrate") {
                 val backend = selector?.hydratorMaintenance(call, call.maintenanceCatalog()) { hydrator } ?: hydrator
+                // The one maintenance route that can name a namespace.
+                selector?.refuseRemoteSchemas(
+                    call,
+                    call.maintenanceCatalog(),
+                    listOfNotNull(call.request.queryParameters["namespace"]),
+                )
                 call.respond(
                     backend.rehydrateFailed(
                         call.maintenanceCatalog(),

@@ -196,9 +196,17 @@ data class OperationMetadataDto(
 
 data class NamespaceDto(
     val name: String,
-    val namespaceId: Long,
+    /** Present on every namespace this server holds; absent on a remote schema, which has no id here. */
+    val namespaceId: Long? = null,
     /** Present when the namespace is contained (V33). */
     val containment: NamespaceContainmentDto? = null,
+    /**
+     * Present, and true, only on a remote schema: a read-only namespace
+     * another hoglake serves (docs/auth-tenancy.md §6.5c). A namespace
+     * listing writes such an entry from configuration and the caller's
+     * token, so it carries a name and this flag and nothing else.
+     */
+    val remote: Boolean? = null,
 )
 
 data class NamespaceContainmentDto(val field: String, val value: Long)

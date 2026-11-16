@@ -582,6 +582,7 @@ samplers start only after PostgreSQL initializes; a hoglite-only process never s
 | Maintenance or publications on hoglite | 501 `not_supported_on_backend` |
 | A mount name (§6.5a) | Resolved first: never a store |
 | A name a mount host serves (§6.5b) | Resolved before that: forwarded to the host |
+| A remote schema named in the path, in a catalog that is none of the two above (§6.5c) | Resolved next, before any store: relayed to its host, or refused |
 
 Authorization still runs before store selection. Fleet metrics and `/v1/info` remain PostgreSQL-only.
 
@@ -747,6 +748,10 @@ hoglake reserves no name itself.
   `SELECT name FROM namespaces WHERE dropped_snapshot IS NULL AND lower(name) = 'posthog';`
 - **Mounts.** A mount or mount Client catalog refuses every write first
   (403 `read_only_catalog`), so it never reaches this check.
+- **Remote schemas.** A name the hosts file configures as a remote schema
+  (§6.5c) is reserved as if it were listed here, with the same matching and
+  the same error. Unlike a listed name, a namespace that already has such a
+  name is not left alone: it is hidden on every route.
 - **Reserve only names nobody provisions.** The provisioner's `team_<id>`
   namespaces (§6.2b) are created by an operator token, which the guard does not
   exempt.
@@ -853,7 +858,9 @@ binding, a mount or a store (`auth/StoreEntitlement.kt`):
   before the handler runs, and the pair shows a handler that asked for a name
   other than the path's.
 
-This covers catalogs only. A scoped caller's namespaces are the gate's and the
+This covers catalogs, and remote schemas (§6.5c): a remote schema's binding is
+handed out by the same file's second check, only to a token that allows the
+schema, in every mode. A scoped caller's other namespaces are the gate's and the
 handlers'. The PostgreSQL store that is handed out takes a catalog name again on
 each call and is not bound to the name that was checked.
 
@@ -1051,6 +1058,152 @@ requests go through the Client.
   `hoglake_mount_refusals_total`. The `catalog` label is written only after
   the reader check has passed, so it is a name from a verified `cat`. Logs
   name a host by its `id`, never its URL.
+
+### 6.5c Remote schemas on the Client
+
+A remote schema is one namespace of a catalog that another hoglake serves,
+read-only. With a remote schema named `analytics`, a reader sees
+`<catalog>.analytics.<table>` beside the catalog's own namespaces, from every
+client, and the data comes from another deployment (the Host). The server
+that holds the catalog is the Client. For readers this replaces the separate
+mount catalog of §6.5a and §6.5b.
+
+**Only the Client side is built.** The Host does not serve the relayed paths
+yet: it has no published schemas, no rule for the `remote_schemas` claim, and
+no org filter. Until it does, a relayed request gets the Host's own refusal.
+The Host verifies the relayed token itself, so it must accept the session
+profile too. Nothing turns this on in any deployment. §6.5a and §6.5b are
+unchanged and still describe the mount.
+
+```json
+{"hosts": [{"id": "5c0c6d0e-1f2a-4b3c-9d4e-5f6a7b8c9d0e",
+            "match": {"type": "namespace", "name": "analytics"},
+            "kind": "hoglake",
+            "url": "https://host-hoglake.example",
+            "auth": "forward"}]}
+```
+
+- **Configuration.** A third matcher in `HOGLAKE_MOUNT_HOSTS_FILE` (§6.5b):
+  `{"type": "namespace", "name": "<schema>"}`. Such an entry matches no
+  catalog name. It applies to every catalog this server holds itself (bound
+  local: not a mount and not a mount Client's name, and present in the
+  backend that serves it). The name must be a namespace name. Two entries may not have the same name, or names that are
+  equal after folding ASCII case. Every other key, bound and boot check of
+  §6.5b applies, so a server with such an entry cannot run with auth `off`.
+  It also refuses to boot unless `HOGLAKE_AUTH_SESSION_PROFILE` is `on`: only
+  a token that carries the session profile can name a remote schema
+  ([auth.md](auth.md#session-profile-with-embedded-storage-credentials)), so
+  with the profile off the name would be reserved and never readable.
+  Its `url` must be `https`. The token relayed for a remote schema can carry
+  storage credentials (the session profile), and `http` would send it without
+  transport encryption, so an `http` URL is refused at boot. An entry may opt
+  in with `"allow_insecure_http": true` (a boolean, default false; for a Host
+  reached only over a trusted network); the server then logs one warning at
+  boot that names the host's `id`. The key is refused on an `events` or
+  `catalog` entry: it is not a general switch.
+  Entries of the `events` and `catalog` types behave as before, with the
+  profile on or off and with `http` or `https`, and one file may hold all
+  three.
+- **The name always means the remote schema.** On a server that configures
+  `analytics`:
+  - creating a namespace of that name is refused (§6.2c), without listing it
+    in `HOGLAKE_RESERVED_NAMESPACES`;
+  - a local namespace of that name, made earlier, is never listed, read or
+    written through any route, whether or not the Host answers;
+  - a Host outage is an error on the schema, never a fallback to local data.
+
+  The same holds for a case variant (`Analytics`): it is not a local namespace
+  and it is not the remote schema either, so every request for it answers 404.
+  Only the exact configured name is relayed.
+- **Caller rule, before anything is sent.** Access is off unless the token
+  allows it. The caller is `scoped`, its `cat` allows `read` on the catalog,
+  and its `remote_schemas` claim names the schema. The claim is part of the
+  session profile, whose `cat` names one catalog, so a token reads a remote
+  schema only in that catalog. Anyone else (a tenant, with or without the
+  claim; an operator; a scoped token without the claim; no caller) gets 404
+  `not_found`, "namespace '<schema>' in catalog '<catalog>'", as for a missing
+  namespace, on every route that names the schema and that the route table
+  (§6.4) opens to that caller. The route table decides first, as on any
+  namespace: a route it closes to the caller's kind answers its own 401 or
+  403 before the schema is looked at (a tenant on the containment routes, a
+  scoped token on a route outside its scoped set or beyond its `cat` scope).
+  The rule is checked where the schema's binding is handed out, after the
+  check that the token names the catalog, so a caller refused for the catalog
+  gets that answer and the schema is never looked at. Unlike that check, it
+  refuses in every auth mode, `warn` included: nothing is behind it to let a
+  request through to. A refusal is counted and audited once per request, as
+  `auth_refused` with `at=remote_schema`. As with the store's check (§6.5),
+  a request the plugin allowed and this rule then refuses has two outcomes
+  in `hoglake_auth_requests_total`: the plugin's `ok`, counted before the
+  handler runs, and this rule's `not_entitled`. That is every refused tenant
+  and operator request. A scoped caller's request has one outcome: the gate
+  or the body check counts it, `not_entitled` when the rule refuses and `ok`
+  when the token allows the schema, whatever the answer then is (the relay,
+  or the 403 or 501 below). Unlike a mount's reader, a token whose `rtg`
+  places the catalog on hoglite is served: the catalog is the caller's own.
+- **Only in a catalog this server holds.** Once the token allows the schema,
+  the server checks that the catalog exists in the backend that serves it
+  (one read per relayed or refused request, none for a caller the rule
+  refuses and none for any other request). A catalog that does not exist, or
+  one no backend of this server holds, answers that backend's 404 for the
+  catalog, and nothing is sent to the Host.
+- **What is relayed.** Four routes, `GET` only: the namespace, its tables, one
+  table, and the scan. The request goes to the Host with the same path
+  (`/v1/catalogs/<catalog>/namespaces/<schema>/...`), the same query and the
+  caller's `Authorization` header, unchanged. As for a mount (§6.5b), a query
+  parameter named `catalog`, `namespace` or `table` is not sent: route values
+  come from the path only. The Client holds no Host-side
+  name and no table list: the Host derives what to serve from the catalog in
+  the path, the schema and the token. A 200 comes back byte for byte. The
+  scan is relayed before this server parses its parameters. Timeouts, the
+  size limit, the concurrency limit and the error mapping are the mount
+  Client's (§6.5b).
+- **Every other route refuses.** For the schema's reader, a write is 403
+  `read_only_catalog` and a read that is not relayed is 501
+  `mount_operation_unavailable`. This covers a namespace named in the path
+  (tables, views, files, partitions, changes, containment, the namespace's
+  drop), in a body (the `appends` and `deletes` of every commit route, a table
+  creation's namespace), in an upload claim's prefix (any caller's, when the
+  prefix lies under `<data_path>/data/<schema>/`, with either segment spelled
+  raw or percent-encoded), behind an id (a table
+  creation prepared before the name was configured; a consumer offset read or
+  committed by the UUID of one of the namespace's live tables), and in a query
+  parameter (`stats/partitions`, `maintenance/rehydrate`). A `namespace`
+  parameter on any other route names nothing: route values come from the path
+  only. A body's namespaces are checked in the order the body gives them,
+  this rule and a scoped caller's containment together, so the first one
+  that fails either is the answer. A request that names an id and no
+  namespace is answered in that route's own words when the caller is not the
+  schema's reader: 404 "table creation operation '<id>'", 404 "no offset for
+  consumer ..." on an offset read, and 422 "unknown table_uuid ..." on an
+  offset commit, which is what each answers for an id the catalog does not
+  have. The catalog-wide partition report and the consumer listings leave the
+  namespace's rows out. The partition report filters after its query, so a
+  page can hold fewer rows than `limit`, and `truncated` and
+  `stale_spec_groups` still count the hidden rows. A scoped token whose `cat`
+  lacks `write` gets the route table's 403 `forbidden` first.
+- **The listing.** `GET /v1/catalogs/{c}/namespaces` returns the local
+  namespaces, without one that has a remote schema's name, then one entry for
+  each remote schema the token allows: `{"name": "<schema>", "remote": true}`.
+  The entry has no `namespace_id`, because the namespace has no id on this
+  server. The listing is built from configuration and the token. No Host is
+  asked, so a Host outage does not fail it.
+- **Not trusted for isolation.** As in §6.5b: the Client filters nothing and
+  holds no org or team values. The Host must verify the forwarded token again
+  and scope the answer.
+- **What a pre-existing namespace still affects.** Routes that name no
+  namespace are unchanged, so for a namespace that had the name before it was
+  configured: `storage-usage` still counts its bytes, catalog-wide maintenance
+  still expires, compacts and cleans its files, `maintenance/rehydrate`
+  without a `namespace` still requeues its failed files with the rest of the
+  catalog's, and `snapshots` still lists its past changes by object id. A
+  consumer offset on a table of the namespace that has since been dropped is
+  still read by its UUID. Look for one before configuring a name, with the
+  queries of §6.2c.
+- **Metrics.** The mount Client's series (§6.5b), with the schema's configured
+  name in the `catalog` label. The label never holds an org, a catalog, or a
+  name taken from a request. A caller the rule refuses is counted as
+  `not_found` on `hoglake_mount_refusals_total`.
 
 ### 6.6 Client-supplied authority fields must die
 
@@ -1466,8 +1619,8 @@ New metrics (Prometheus, existing `observability/Metrics.kt` idiom):
 | `hoglake_auth_requests_total{mode,listener,outcome,client}` | the `warn`-mode onboarding checklist; `client` is a closed class from `User-Agent`, and the enforce gate is zero refusals per class on `listener="api"` (`listener="public"` is the internet-facing port, §6.7, where refusals are expected) |
 | `hoglake_auth_signing_keys` | keys the verifier holds; alert on 0 (boot refuses an empty source, this catches a rotation that never lands) |
 | `hoglake_auth_denials_total{catalog,scope,reason}` | distinguishes "client misconfigured" from "attack" by `reason` |
-| `hoglake_mount_refusals_total{catalog,reason}` | refusals on a mount (§6.5a) by error code; `catalog` is a mount the registry holds, or on a mount Client one a verified `cat` names |
-| `hoglake_mount_proxy_requests_total{catalog}`, `_seconds`, `hoglake_mount_proxy_upstream_errors_total{catalog,reason}` | a mount Client's requests to its hosts (§6.5b): count, latency, and the ones a host did not serve, by a closed `reason` |
+| `hoglake_mount_refusals_total{catalog,reason}` | refusals on a mount (§6.5a) by error code; `catalog` is a mount the registry holds, or on a mount Client one a verified `cat` names, or a remote schema's configured name (§6.5c) |
+| `hoglake_mount_proxy_requests_total{catalog}`, `_seconds`, `hoglake_mount_proxy_upstream_errors_total{catalog,reason}` | a mount Client's requests to its hosts (§6.5b): count, latency, and the ones a host did not serve, by a closed `reason`. For a remote schema (§6.5c) `catalog` holds the schema's configured name |
 | `hoglake_token_issued_total{grant_type}`, `_failures_total` | token endpoint health; not built (issuance is hogtower's) |
 | `hoglake_sts_assume_total{catalog,outcome}`, `_duration_seconds` | the vending path is now on the critical path of a read; it needs a latency histogram; not built (vending is hogtower's) |
 | `hoglake_sts_cache_hit_ratio` | if this drops, every scan pays an STS round trip; not built |
