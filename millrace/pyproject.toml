@@ -48,7 +48,11 @@ dev = [
     # Pinned for the same reason: mutant generation changes between
     # releases. Scoped to the pure core (keyspace, planner); run on
     # changes to those files (docs/kafka-ingestion-plan.md, Phase 1).
-    "mutmut==3.8.0",
+    # 3.8.1 is the first release whose stats collector reads
+    # `item.nodeid`; 3.8.0 read the private `item._nodeid`, which pytest
+    # 9.2 removed, so `mutmut run` died in "Running stats" on every
+    # mutant (boxed/mutmut#615, fixed by #616).
+    "mutmut==3.8.1",
 ]
 
 [tool.uv.sources]

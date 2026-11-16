@@ -17,15 +17,24 @@ request's body (``append`` POSTs it; the prepared calls return it) with
 ``uuid4`` made deterministic, and the sha256 of every object uploaded,
 by uri. Parquet bytes are pinned on purpose: the registration's
 ``file_size_bytes`` and ``footer_size`` are measured on them, so the
-fixture is specific to the locked pyarrow, and a pyarrow bump re-records
-it (with the old pyhoglake, as above).
+fixture is specific to the locked pyarrow — all but one string of it.
+The footer's ``created_by`` (``parquet-cpp-arrow version X.Y.Z``) is
+parquet-cpp's stamp, not pyhoglake's output, and the replay rewrites it
+to the recorded one (``recorded_from.parquet_created_by``) before
+hashing (``restamp``), so a pyarrow release that changes nothing else
+passes: 26.0.0 -> 26.0.1 moved exactly one byte per object, in that
+stamp. A bump that changes any other byte, or the stamp's length (which
+moves ``footer_size`` and ``file_size_bytes`` in the payload), still
+re-records the fixture (with the old pyhoglake, as above).
 """
 
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
+import struct
 import sys
 import tempfile
 import uuid
@@ -154,9 +163,89 @@ def _server(posted: list[Any]):
     return request
 
 
-def record(pyhoglake) -> dict[str, Any]:
-    """Every case's payload and uploaded objects, from the given
-    ``pyhoglake`` package (the one the interpreter imported)."""
+PARQUET_MAGIC = b"PAR1"
+
+
+def created_by_of(body: bytes) -> str:
+    """The ``created_by`` stamp in the footer of a parquet object's bytes."""
+    return pq.read_metadata(io.BytesIO(body)).created_by
+
+
+def _varint(n: int) -> bytes:
+    """Thrift compact protocol's unsigned LEB128 — a string's length prefix."""
+    out = bytearray()
+    while n >= 0x80:
+        out.append((n & 0x7F) | 0x80)
+        n >>= 7
+    out.append(n)
+    return bytes(out)
+
+
+def restamp(body: bytes, created_by: str) -> bytes:
+    """``body`` with the footer's ``created_by`` rewritten to ``created_by``
+    and every other byte as it was.
+
+    The footer is the thrift-compact ``FileMetaData``, its length (u32 LE)
+    and the magic; a string field in it is a varint length and the UTF-8
+    bytes. The stamp pyarrow wrote (``created_by_of``) is located by that
+    encoding, which must occur exactly once in the footer, and the length
+    trailer is recomputed, so a stamp of another length is rewritten
+    correctly too (the payload's ``footer_size`` and ``file_size_bytes``
+    then differ from the recorded ones, and that test fails as it
+    should). Nothing before the footer — the column chunks and their
+    pages — is touched, so a changed data byte still fails the
+    comparison; the test module pins both.
+    """
+    if body[:4] != PARQUET_MAGIC or body[-4:] != PARQUET_MAGIC:
+        raise ValueError("not a parquet file")
+    current = created_by_of(body)
+    if current == created_by:
+        return body
+    (footer_len,) = struct.unpack("<I", body[-8:-4])
+    footer_start = len(body) - 8 - footer_len
+    footer = body[footer_start:-8]
+    old = _varint(len(current.encode())) + current.encode()
+    if footer.count(old) != 1:
+        raise ValueError(
+            f"created_by {current!r} occurs {footer.count(old)} times in the footer"
+        )
+    new = _varint(len(created_by.encode())) + created_by.encode()
+    footer = footer.replace(old, new)
+    out = body[:footer_start] + footer + struct.pack("<I", len(footer)) + PARQUET_MAGIC
+    if created_by_of(out) != created_by:
+        raise ValueError("the restamped footer does not read back as requested")
+    return out
+
+
+def record(pyhoglake, *, created_by: str | None = None) -> dict[str, Any]:
+    """``digest(replay(pyhoglake))``: the fixture's ``cases``, from the
+    given ``pyhoglake`` package (the one the interpreter imported)."""
+    return digest(replay(pyhoglake), created_by=created_by)
+
+
+def digest(cases: dict[str, Any], *, created_by: str | None = None) -> dict[str, Any]:
+    """``replay``'s cases in the fixture's shape: the payload, and the
+    sha256 of every uploaded object by uri — each object first restamped
+    to ``created_by`` when one is given. The replay passes the fixture's
+    ``recorded_from.parquet_created_by``; the recorder hashes the bytes
+    as written."""
+    return {
+        case: {
+            "payload": c["payload"],
+            "uploaded": {
+                uri: hashlib.sha256(
+                    body if created_by is None else restamp(body, created_by)
+                ).hexdigest()
+                for uri, body in c["objects"].items()
+            },
+        }
+        for case, c in cases.items()
+    }
+
+
+def replay(pyhoglake) -> dict[str, Any]:
+    """Every case's payload and the bytes of every object it uploaded, by
+    uri, from the given ``pyhoglake`` package."""
     from pyhoglake.client import HoglakeClient, Namespace
 
     cases: dict[str, Any] = {}
@@ -198,10 +287,7 @@ def record(pyhoglake) -> dict[str, Any]:
                 client.close()
             cases[f"{writer}:deferred={deferred}"] = {
                 "payload": payload,
-                "uploaded": {
-                    uri: hashlib.sha256(body).hexdigest()
-                    for uri, body in sorted(store.files.items())
-                },
+                "objects": dict(sorted(store.files.items())),
             }
     return cases
 
@@ -215,6 +301,16 @@ def main(argv: list[str]) -> int:
         return 2
     import pyhoglake
 
+    cases = replay(pyhoglake)
+    stamps = {
+        created_by_of(body)
+        for case in cases.values()
+        for body in case["objects"].values()
+    }
+    if len(stamps) != 1:
+        print(f"one created_by expected across the objects, got {sorted(stamps)}")
+        return 1
+    (created_by,) = stamps
     fixture = {
         "description": __doc__.strip().splitlines()[0],
         "recorded_from": {
@@ -223,9 +319,12 @@ def main(argv: list[str]) -> int:
             "pyhoglake_file": "/".join(Path(pyhoglake.__file__).parts[-4:]),
             "pyhoglake_version": pyhoglake.__version__,
             "pyarrow": pa.__version__,
+            # The footer stamp the hashes under ``cases`` carry; the replay
+            # restamps its objects to it before hashing (``restamp``).
+            "parquet_created_by": created_by,
             "python": sys.version.split()[0],
         },
-        "cases": record(pyhoglake),
+        "cases": digest(cases),
     }
     Path(argv[1]).write_text(json.dumps(fixture, indent=2, sort_keys=True) + "\n")
     return 0

@@ -1,6 +1,6 @@
 # Mutation testing the pure core — survivor ledger
 
-Scope: `[tool.mutmut]` in `pyproject.toml` (mutmut 3.8.0, pinned).
+Scope: `[tool.mutmut]` in `pyproject.toml` (mutmut 3.8.1, pinned).
 Mutated: `millrace/keyspace.py` (the key codecs) and `millrace/planner.py`
 (the flush predicate). Driver: `tests/test_keyspace.py` +
 `tests/test_planner.py` (`-x -q`). Run from `millrace/`:
@@ -34,13 +34,15 @@ change.
 |---|---|---|---|---|
 | 2026-10-14, simplified keyspace (`rows/` + `meta/fence` only) and one-predicate planner, clean-slate | 247 | 229 | 18 | 0 |
 | 2026-10-14, review round (`meta/table_uuid`, `_decode_group_at` off position 0), clean-slate | 247 | 230 | 17 | 0 |
+| 2026-11-16, mutmut 3.8.0 on the modules as of #514 (the home-stage and repin rounds, #384 and #514, had not re-run this table), clean-slate | 287 | 268 | 19 | 0 |
+| 2026-11-16, mutmut 3.8.1 (pytest 9.2 compatibility), same modules, clean-slate under pytest 9.1.1 and 9.2.0 | 286 | 268 | 18 | 0 |
 
 `planner.py` has no survivors. The first run of this tree left 24; six
 were killed by `test_codec_refusals_name_exactly_what_failed` (exact
 refusal messages for a truncated u16 length, a value running past the
 end, an empty buffer, an all-`0xFF` prefix, an out-of-range offset).
 
-## Surviving mutants — all equivalent (19)
+## Surviving mutants — all equivalent (18)
 
 Arguments are interpreter semantics or a guard upstream of the mutated
 line (CPython ≥ 3.12), not "the tests happen to pass".
@@ -62,16 +64,24 @@ Since Python 3.11 `byteorder` defaults to `"big"` and `signed` to
 - `x_encode_row_key__mutmut_8` — `"big"` dropped (u32 partition)
 - `x_decode_row_key__mutmut_37` — `"big"` dropped (u32 partition)
 
-### E2 — codec and byte-literal spellings (3)
+### E2 — codec spellings (2)
 
 - `x_encode_group__mutmut_17` — `encode("utf-8")` → `encode("UTF-8")`: codec names are case-insensitive
 - `x__decode_group_at__mutmut_49` — `decode("utf-8")` → `decode("UTF-8")`: same
-- `x_prefix_successor__mutmut_5` — `b"\xff"` → `b"\xFF"`: the same byte
 
 ### E3 — retired
 
 x__decode_group_at__mutmut_8 (`pos += 1` → `pos = 1`) is killed by
 `test_decode_group_at_reads_from_its_offset`, which decodes at `pos > 0`.
+
+`b"\xff"` → `b"\xFF"` in `prefix_successor` (the same byte) is no longer
+generated: mutmut 3.8.1's string-case mutator leaves `\xHH` escapes
+alone. Dropping it renumbered that function's mutants, so the name it
+had, x_prefix_successor__mutmut_5 (left unquoted so the gate does not
+parse it as a survivor), now denotes `if not stripped` →
+`if stripped`, which is killed. The gate matches survivors by name, so a
+mutmut bump re-reads every ledgered survivor's `mutmut show` against its
+description here (done for 3.8.1: all 18 unchanged).
 
 ### E4 — `zip(strict=…)` behind an explicit length check (3)
 
